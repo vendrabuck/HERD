@@ -115,6 +115,56 @@ describe("RecipeDraftPanel", () => {
     expect(screen.getByLabelText("Driver name")).toHaveValue("proxmox-clone");
   });
 
+  it("lists the keyed destroy as its own dry-run row (issue #937)", async () => {
+    // The validator reports the keyed destroy under its own label, so both
+    // destroy rows render and React never sees a duplicate row key.
+    const step = (action: string, passed: boolean, error: string | null = null) => ({
+      action,
+      passed,
+      success: true,
+      output: { success: passed },
+      error,
+      duration_ms: 5,
+      transcript: [],
+    });
+    const keyedError = "AttributeError: 'NoneType' object has no attribute 'upper'";
+    const methods = [
+      step("login", true),
+      step("create_instance", true),
+      step("status", true),
+      step("destroy_instance", true),
+      step("destroy_instance (no instance_ref)", false, keyedError),
+      step("logout", true),
+    ];
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      render(<RecipeDraftPanel open onClose={vi.fn()} />);
+      await draftInPanel(
+        draftResponse({
+          valid: false,
+          validation: {
+            valid: false,
+            structural: { passed: true, errors: [] },
+            policy: { passed: true, errors: [] },
+            schema: { present: false, schema: null, error: null },
+            dry_run: { passed: false, methods, error: null },
+          },
+        }),
+      );
+
+      expect(await screen.findByText(/5\/6 lifecycle methods passed/)).toBeInTheDocument();
+      expect(screen.getByText("destroy_instance (no instance_ref)")).toBeInTheDocument();
+      expect(screen.getByText("destroy_instance")).toBeInTheDocument();
+      expect(screen.getByText(new RegExp(`FAILED, ${keyedError}`))).toBeInTheDocument();
+      const duplicateKey = consoleError.mock.calls.some((args) =>
+        String(args[0]).includes("same key"),
+      );
+      expect(duplicateKey).toBe(false);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
   it("approve uploads the package as a Hypervisor driver", async () => {
     mockCreateDriver.mutateAsync.mockResolvedValue({});
     render(<RecipeDraftPanel open onClose={vi.fn()} />);

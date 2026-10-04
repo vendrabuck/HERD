@@ -42,6 +42,7 @@ GATED_EVENTS = TERMINAL_EVENTS + (
     "reservation.created",
     "reservation.updated",
     "reservation.wiring_changed",
+    "reservation.provision_requested",
 )
 STATUSES = ("PENDING", "PENDING_PROVISION", "ACTIVE", "COMPLETED", "CANCELLED", "FAILED")
 
@@ -65,6 +66,10 @@ def _expected_verified(event: str, status: str) -> bool:
         return status not in ("COMPLETED", "CANCELLED", "FAILED")
     if event == "reservation.wiring_changed":
         return status == "ACTIVE"
+    if event == "reservation.provision_requested":
+        # Staged only by a CAS holding PENDING_PROVISION; any later status means
+        # the instances either exist already or must not be created (#937).
+        return status == "PENDING_PROVISION"
     raise AssertionError(f"no oracle entry for event {event!r}")
 
 
@@ -176,11 +181,11 @@ async def test_missing_reservation_id_skips_the_gate():
 
 @pytest.mark.asyncio
 async def test_event_outside_the_table_is_not_gated():
-    """reservation.provision_requested enforces its own preconditions elsewhere
-    (PENDING_PROVISION + a dynamic request) and carries no entry in the gate's
-    table, so it makes no HTTP call."""
+    """An event with no entry in the gate's table makes no HTTP call.
+    (reservation.provision_requested used to be the example here; it joined the
+    table with issue #937.)"""
     client = _FakeGetClient(response=_status_response("ACTIVE"))
-    event_data = {"event": "reservation.provision_requested", "reservation_id": str(uuid.uuid4())}
+    event_data = {"event": "reservation.something_new", "reservation_id": str(uuid.uuid4())}
 
     result = await _verify_reservation_event(event_data, client)
 

@@ -81,7 +81,11 @@ and the mock-driver test pattern wholesale; no parallel execution path.
 "field_data": dict}` where `instance_ref` is the hypervisor-side identity
 (VM id) and `field_data` carries instance attributes (management address,
 etc.) for the materialized device. `destroy_instance` must be idempotent:
-destroying an already-absent instance returns success.
+destroying an already-absent instance returns success. It must also accept
+`instance_ref=None` (the keyed destroy, issue #937): the recipe then finds
+the instance by the name `create_instance` derived from `HERD_request_id`,
+and finding none is success. A successful create with no `instance_ref` is a
+failed create.
 
 ### The hypervisor registry lives in inventory
 
@@ -153,7 +157,12 @@ inventory only through the internal path below.
   mark the row DESTROYED. A driver-result failure ACKs and leaves the row
   ACTIVE as an accurate may-still-exist record (the L3 discipline); a
   transient upstream error NAKs for redelivery. Redelivery is idempotent
-  via the ledger plus `action_already_succeeded`.
+  via the ledger plus `action_already_succeeded`. A row with no
+  `instance_ref` (a create that failed, timed out, or lost its process after
+  touching the hypervisor) gets the keyed destroy, `instance_ref=None` with
+  `HERD_request_id` in the context, under the same failure policy: it stays
+  CREATING when that destroy fails, with the log action
+  `dynamic_instance_keyed_destroy_failed` (issue #937).
 
 ### An instance ledger in the execution schema
 
@@ -162,7 +171,18 @@ hypervisor_id, device_id (nullable until materialized), instance_ref,
 status (CREATING, ACTIVE, DESTROYED), error, timestamps. This is the
 applied-state ledger teardown drives from, the direct peer of
 `VlanAssignment` and `RouteAssignment`. The ledger moves only forward: a DESTROYED row is never
-re-activated, and create updates are compare-and-swap (issue #896).
+re-activated, and create updates are compare-and-swap (issue #896). A row
+becomes DESTROYED only after the driver destroyed the instance or confirmed
+that none exists for its `request_id` (issue #937); a row whose create outcome
+is unknown is never retired as "nothing to destroy". The DESTROYED write is a
+compare-and-swap on the `instance_ref` and `device_id` teardown read, so a
+create landing on another replica during teardown makes it lose, re-read the
+row, and destroy what the row now holds; a create that fails after teardown
+retired its row runs a keyed compensating destroy. Because a failed keyed
+destroy now leaves such a row CREATING, the execution consumer's
+event-corroboration gate refuses a `provision_requested` whose reservation is
+no longer `PENDING_PROVISION`, so a late redelivery cannot create an instance
+for an ended reservation.
 
 ### Secrets delivery and sandbox limits
 

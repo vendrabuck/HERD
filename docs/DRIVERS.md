@@ -1288,18 +1288,33 @@ class Driver:
     def create_instance(self) -> dict:
         """Materialize one instance on the hypervisor.
 
+        MUST name the instance from context["HERD_request_id"] (see Determinism
+        below) and reuse an instance that already carries that name. HERD may
+        kill this call at any point (the recipe timeout, a process death), so a
+        partially created instance must still be findable by that name.
+
         Returns:
             {"success": bool, "instance_ref": str, "field_data": dict}.
             instance_ref is the hypervisor-side identity (e.g. a VM id), persisted
-            immediately so a later failure can still tear the instance down.
+            immediately so a later failure can still tear the instance down. It
+            is REQUIRED on success: a success with a missing or empty
+            instance_ref is treated as a failed create.
             field_data carries instance attributes (management address, etc.)
             that become the materialized device's field_data, merged with the
             request's own parameters.
         """
         ...
 
-    def destroy_instance(self, instance_ref: str) -> dict:
+    def destroy_instance(self, instance_ref: str | None = None, **_) -> dict:
         """Destroy one instance.
+
+        HERD always passes instance_ref as a keyword. When it is None (a KEYED
+        destroy: the create failed, timed out, or lost its process before it
+        reported an instance_ref), the recipe MUST resolve the instance from
+        context["HERD_request_id"] with the same name derivation
+        create_instance uses, destroy it, and return success when no such
+        instance exists. It must never raise or fail merely because
+        instance_ref is None.
 
         MUST be idempotent: destroying an already-absent instance (a redelivered
         teardown, or one that races a manual deletion on the hypervisor) returns
@@ -1324,7 +1339,7 @@ class Driver:
 | Event | Sequence |
 |---|---|
 | `reservation.provision_requested` (a dynamic-carrying reservation enters `PENDING_PROVISION`) | per requested instance: login(), create_instance(), logout() |
-| `reservation.completed` / `.cancelled` / `.failed` | per CREATING/ACTIVE ledger row for the reservation: login(), destroy_instance(instance_ref), logout() |
+| `reservation.completed` / `.cancelled` / `.failed` | per CREATING/ACTIVE ledger row for the reservation: login(), destroy_instance(instance_ref=<ref>), logout(); a row with no recorded instance_ref gets destroy_instance(instance_ref=None), the keyed destroy |
 | `reservation.updated` (devices removed from the reservation) | same as above, restricted to the ledger rows behind the removed devices |
 
 Unlike the four physical-device contracts, a Hypervisor recipe is never invoked on
@@ -1358,6 +1373,32 @@ recipe must land on the same instance the first attempt would have created, not 
 one. For the same reason, `destroy_instance` must be idempotent: a redelivered teardown,
 or one whose instance is already gone, is success, not failure.
 
+The same derivation is what lets teardown destroy an instance whose `instance_ref` HERD
+never learned (issue #937). The ledger records `instance_ref` only after `create_instance`
+returns it, so a create that touched the hypervisor and then failed, timed out under
+`RECIPE_TIMEOUT_SECONDS`, or lost its process leaves a row with no handle. Teardown then
+runs the KEYED destroy: `destroy_instance(instance_ref=None)` with `HERD_request_id` in the
+context. The recipe MUST find the instance by its request-id-derived name and destroy it,
+and MUST return success when no instance with that name exists. `create_instance` must
+therefore be safe to kill at any point: whatever it left behind must carry the derived name.
+
+The ledger row becomes DESTROYED only when that destroy reports success. A keyed destroy
+that returns `{"success": False}` or raises leaves the row CREATING (or ACTIVE) as a
+"may still exist" record, ACKs the event, and logs `dynamic_instance_keyed_destroy_failed`
+(see `docs/TROUBLESHOOTING.md`). A recipe written before this rule that requires an
+`instance_ref` lands there on every such teardown. Note the opposite risk too: a legacy
+recipe that passes `None` straight into its hypervisor API and reads the resulting "not
+found" as an already-absent success would let HERD retire a row whose instance still
+exists. Upgrade such a recipe before relying on dynamic teardown.
+
+There is no capability flag for this: the keyed destroy is part of the Hypervisor contract
+for every recipe. AI-drafted recipes get a dry-run step for it,
+`destroy_instance (no instance_ref)`, but understand what that step proves: under dry-run
+a compliant recipe returns before any hypervisor lookup, so the step shows the recipe
+accepts `instance_ref=None` without raising and answers with an explicit
+`"success": true`. It cannot show that the recipe really finds the instance by its
+derived name; that part is for the reviewing admin to read in the code.
+
 ### Timeout
 
 Recipe actions (`login`, `create_instance`, `destroy_instance`, `logout`) run under
@@ -1372,13 +1413,14 @@ waiting on a remote hypervisor API is wall-clock time, not CPU time.
 |---|---|
 | login | `{"success": bool}` |
 | logout | `{"success": bool}` |
-| create_instance | `{"success": bool, "instance_ref": str, "field_data": dict}` |
-| destroy_instance | `{"success": bool}` |
+| create_instance | `{"success": bool, "instance_ref": str, "field_data": dict}`; `success` must be present and true (a missing key is a failure here, unlike the physical contracts), and `instance_ref` must be a non-empty string, else the create counts as failed |
+| destroy_instance | `{"success": bool}`; `success` must be present and true, as for create; with `instance_ref=None`, success means the request-id-named instance was destroyed or does not exist |
 | status | `{"reachable": bool}` |
 
 `drivers/mock_hypervisor/` is the checked-in reference for this contract: a
 hardware-free recipe that honors dry-run on every method, keys create-side
-idempotency off `HERD_request_id`, and drives the live integration suite
+idempotency off `HERD_request_id`, derives the same name for a keyed destroy
+(reporting `"keyed": true` in that result), and drives the live integration suite
 (the analogue of `drivers/mock_l1`, `mock_l2`, and `mock_l3`).
 
 ## Generated recipes (AI-assisted authoring, issue #28)
@@ -1393,8 +1435,16 @@ draft is ever shown for review:
 - `driver_metadata.json` must declare `supports_dry_run: true`, and every
   mutating method must honor `context["dry_run"]`: the validator executes the
   full lifecycle (`login`, `create_instance`, `status`, `destroy_instance`,
-  `logout`) in the sandbox with `dry_run` set and a synthetic context, so a
-  recipe that skips simulation fails validation.
+  the keyed `destroy_instance` with `instance_ref=None`, reported as the step
+  `destroy_instance (no instance_ref)`, and `logout`) in the sandbox with
+  `dry_run` set and a synthetic context, so a recipe that skips simulation, or
+  raises or fails when called without an `instance_ref`, fails validation.
+  `create_instance` and `destroy_instance` are judged by the execution
+  consumer's own rule (the shared `app.services.recipe_result` predicates): an
+  explicit `"success": true`, plus a non-empty string `instance_ref` from
+  create, so a draft that validates green cannot fail every real provision on
+  either. The keyed step proves signature tolerance and result shape only, not
+  that the recipe resolves the instance by name (see Determinism contract).
 - Standard-library imports only: no `_deps/` vendoring, no
   `requirements.txt`. Package-local modules and the sandbox-provided
   `driver_transcript` helper are allowed (and `record_command` is

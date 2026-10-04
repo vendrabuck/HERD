@@ -11,7 +11,10 @@ materialized) to DESTROYED (destroy_instance plus device delete done). A row
 stuck in CREATING is retried idempotently; the unique request_id makes a
 concurrent insert lose to IntegrityError and re-read the winner. The lifecycle
 only moves forward: set_instance_ref and mark_active are compare-and-swap
-updates that never touch a DESTROYED row (issue #896).
+updates that never touch a DESTROYED row (issue #896). A row becomes DESTROYED
+only after the recipe's destroy_instance reported success, by instance_ref or,
+for a row with none, keyed by HERD_request_id (issue #937); a row whose create
+outcome is unknown is never retired as "nothing to destroy".
 """
 
 import logging
@@ -125,13 +128,40 @@ async def mark_active(db: AsyncSession, request_id, device_id, instance_ref: str
     return result.rowcount == 1
 
 
-async def mark_destroyed(db: AsyncSession, request_id) -> None:
-    """Flip a row to DESTROYED after destroy_instance and the device delete."""
-    row = await get_by_request_id(db, request_id)
-    if row is None:
-        return
-    row.status = "DESTROYED"
+async def mark_destroyed(
+    db: AsyncSession, request_id, *, instance_ref: str | None, device_id
+) -> bool:
+    """Flip a row to DESTROYED, compare-and-swap on the snapshot teardown acted on.
+
+    The caller must hold a successful destroy_instance result for this row (by
+    instance_ref, or keyed by request id when the row has none): DESTROYED means
+    the driver destroyed the instance or confirmed none exists (issue #937).
+
+    Teardown drives the recipe for minutes between reading the row and calling
+    this, and a create on another replica can land in that window (record an
+    instance_ref, materialize a device, flip ACTIVE). So the UPDATE applies only
+    while the row is still live AND its instance_ref and device_id still equal
+    the values teardown read (`instance_ref`, `device_id`; None matches only
+    NULL, the same on Postgres and SQLite). Returns True when this call retired
+    the row; False means the row changed or is gone, and the caller must re-read
+    it and tear down what it holds now, never retire it from the stale snapshot.
+    """
+
+    def _same(column, value):
+        return column.is_(None) if value is None else column == value
+
+    result = await db.execute(
+        update(DynamicInstance)
+        .where(
+            DynamicInstance.request_id == _as_uuid(request_id),
+            DynamicInstance.status.in_(LIVE_STATUSES),
+            _same(DynamicInstance.instance_ref, instance_ref),
+            _same(DynamicInstance.device_id, None if device_id is None else _as_uuid(device_id)),
+        )
+        .values(status="DESTROYED")
+    )
     await db.commit()
+    return result.rowcount == 1
 
 
 async def list_teardown_candidates(db: AsyncSession, reservation_id) -> list[DynamicInstance]:

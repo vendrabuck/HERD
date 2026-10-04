@@ -195,6 +195,103 @@ def test_report_feedback_flattens_all_sections():
     assert "login" not in text
 
 
+# --- keyed destroy requirement (issue #937) ---
+
+_KEYED_STEP = "destroy_instance (no instance_ref)"
+
+
+def _reference_driver_cls():
+    from app.services.recipe_author import _REFERENCE_RECIPE
+
+    namespace: dict = {}
+    exec(compile(_REFERENCE_RECIPE, "reference_recipe.py", "exec"), namespace)
+    return namespace["Driver"]
+
+
+def test_prompt_states_the_keyed_destroy_requirement():
+    """Without this the new validator step fails every draft and burns
+    AI_RECIPE_MAX_ATTEMPTS: the prompt must say destroy_instance is called with
+    instance_ref=None and must then find the instance by the request-id name."""
+    from app.services.recipe_author import RECIPE_SYSTEM_PROMPT
+
+    assert "destroy_instance is also called with instance_ref=None" in RECIPE_SYSTEM_PROMPT
+    assert "same request-id-derived name" in RECIPE_SYSTEM_PROMPT
+    assert 'name the hypervisor-side instance from context["HERD_request_id"]' in (
+        RECIPE_SYSTEM_PROMPT
+    )
+    assert f'"{_KEYED_STEP}"' in RECIPE_SYSTEM_PROMPT
+    # The validator judges create/destroy by the consumer's rule (#937 review).
+    assert 'MUST return an explicit "success": True' in RECIPE_SYSTEM_PROMPT
+    assert "MUST return a non-empty string instance_ref, also under dry-run" in (
+        RECIPE_SYSTEM_PROMPT
+    )
+
+
+def test_prompt_names_the_validator_step_label_execution_reports():
+    """The step label the prompt quotes must be the one execution's validator
+    reports, or the repair feedback names a step the model was never told
+    about. Read from execution's source by AST (separate service, no import)."""
+    import ast
+    from pathlib import Path
+
+    validator = (
+        Path(__file__).resolve().parents[2]
+        / "execution"
+        / "app"
+        / "services"
+        / "package_validator.py"
+    )
+    tree = ast.parse(validator.read_text())
+    labels = [
+        node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "KEYED_DESTROY_STEP" for t in node.targets)
+    ]
+    assert labels == [_KEYED_STEP]
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_reference_recipe_survives_a_keyed_destroy(dry_run):
+    """The reference shape the model is told to match must itself pass the
+    keyed-destroy call the validator makes: instance_ref=None, no raise,
+    success."""
+    driver = _reference_driver_cls()({"HERD_request_id": str(uuid.uuid4()), "dry_run": dry_run})
+    result = driver.destroy_instance(instance_ref=None)
+    assert result["success"] is True
+    by_ref = driver.destroy_instance(instance_ref="vm-1234")
+    assert by_ref["success"] is True
+
+
+def test_reference_recipe_names_create_and_keyed_destroy_alike():
+    request_id = str(uuid.uuid4())
+    driver = _reference_driver_cls()({"HERD_request_id": request_id, "dry_run": True})
+    assert driver._instance_name() == "herd-" + request_id
+    created = driver.create_instance()
+    assert created["success"] is True
+    assert created["instance_ref"] == "sim-herd-" + request_id
+    assert driver.destroy_instance(instance_ref=None)["keyed"] is True
+    assert driver.destroy_instance(instance_ref="sim-x")["keyed"] is False
+
+
+def test_report_feedback_names_the_keyed_destroy_step():
+    report = {
+        "dry_run": {
+            "methods": [
+                {"action": "destroy_instance", "passed": True},
+                {
+                    "action": _KEYED_STEP,
+                    "passed": False,
+                    "error": "AttributeError: 'NoneType' object has no attribute 'upper'",
+                },
+            ]
+        }
+    }
+    assert _report_feedback(report) == (
+        f"dry_run: {_KEYED_STEP} failed: AttributeError: 'NoneType' object has no attribute 'upper'"
+    )
+
+
 # --- author_recipe loop ---
 
 

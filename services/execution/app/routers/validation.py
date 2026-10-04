@@ -87,7 +87,7 @@ async def validate_package_endpoint(
             detail="Only the Hypervisor connection type is supported for package validation",
         )
     try:
-        # The pipeline is blocking (archive extraction plus up to six sandbox
+        # The pipeline is blocking (archive extraction plus up to seven sandbox
         # subprocesses); run it off the event loop.
         report = await asyncio.to_thread(
             validate_package, body.package_b64, body.filename, body.connection_type

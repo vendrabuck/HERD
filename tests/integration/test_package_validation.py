@@ -2,9 +2,10 @@
 
 Drives POST /execution/internal/validate-package through the gateway against
 a running stack: the real drivers/mock_hypervisor package must come back
-fully valid with a five-method dry-run section, a hand-broken variant must
-come back as a red report (200, not an error), and the endpoint must hold
-its internal-token gate. No LLM involvement; the validator is exercised
+fully valid with a six-step dry-run section (the five methods plus the
+keyed destroy_instance of issue #937), a hand-broken variant must come back
+as a red report (200, not an error), and the endpoint must hold its
+internal-token gate. No LLM involvement; the validator is exercised
 directly, which is exactly how ai-orchestrator's drafting loop will call it
 in phase 2.
 """
@@ -68,6 +69,7 @@ async def test_mock_hypervisor_package_validates_live(base_url):
         "create_instance",
         "status",
         "destroy_instance",
+        "destroy_instance (no instance_ref)",
         "logout",
     ]
     assert all(m["passed"] for m in methods)
@@ -75,6 +77,32 @@ async def test_mock_hypervisor_package_validates_live(base_url):
     # without any hypervisor existing anywhere in the test environment.
     create = next(m for m in methods if m["action"] == "create_instance")
     assert create["output"]["instance_ref"]
+    # The keyed destroy (issue #937) resolved the same name from the request id.
+    keyed = next(m for m in methods if m["action"] == "destroy_instance (no instance_ref)")
+    assert keyed["output"]["keyed"] is True
+    assert keyed["output"]["instance_ref"] == create["output"]["instance_ref"]
+
+
+async def test_recipe_that_needs_instance_ref_to_destroy_fails_live(base_url):
+    """A recipe written before issue #937 (destroy assumes a ref) is red."""
+    token = _internal_token()
+    source = (MOCK_HYPERVISOR_DIR / "driver.py").read_text()
+    legacy = source.replace(
+        "        if instance_ref:\n            self._record_op",
+        "        if instance_ref or instance_ref.upper():\n            self._record_op",
+    )
+    assert legacy != source
+    resp = await _post_validate(
+        base_url, token, {"package_b64": _package_b64({"driver.py": legacy})}
+    )
+    assert resp.status_code == 200, resp.text
+    report = resp.json()
+    assert report["valid"] is False
+    by_action = {m["action"]: m for m in report["dry_run"]["methods"]}
+    assert by_action["destroy_instance"]["passed"] is True
+    keyed = by_action["destroy_instance (no instance_ref)"]
+    assert keyed["passed"] is False
+    assert keyed["error"].startswith("AttributeError")
 
 
 async def test_broken_package_returns_red_report_live(base_url):

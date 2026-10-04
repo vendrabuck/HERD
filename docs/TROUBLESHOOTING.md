@@ -194,6 +194,100 @@ The driver method took longer than the configured timeout (`execution_timeout_se
 
 The driver package validation failed. Confirm `driver.py` exists in the package root and defines a class named `Driver` with the required methods for its connection type. See [DRIVERS.md](DRIVERS.md).
 
+### Log action `dynamic_instance_keyed_destroy_failed`
+
+Meaning: a reservation with a dynamic instance ended, and the instance's ledger row had
+no `instance_ref` (its `create_instance` failed, timed out, or lost its process before it
+reported one, so the create may still have left a VM behind). Teardown ran the KEYED
+destroy, `destroy_instance(instance_ref=None)` with `HERD_request_id` in the context, and
+it did not succeed. The ledger row stays `CREATING` (or `ACTIVE`) as a "may still exist"
+record instead of being retired, and the event is acknowledged. The log line carries
+`request_id`, `reservation_id`, `ledger_status`, and a fixed `reason`:
+
+- `destroy_failed`: the recipe returned `{"success": false}` or raised. Most often a
+  recipe written before issue #937 that requires an `instance_ref`; the destroy
+  ExecutionRun row for the reservation (`GET /api/execution/runs?reservation_id=...`)
+  shows the exception class, e.g. `driver raised AttributeError`, and records
+  `method_kwargs` `{"instance_ref": null}`.
+- `login_failed`: the recipe could not log in to the hypervisor.
+- `recipe_load_failed`: the recipe package would not load.
+- `recipe_config_missing`: the template, hypervisor, or secret is gone (404).
+
+Find the affected rows and log lines:
+
+```bash
+docker compose logs execution | grep dynamic_instance_keyed_destroy_failed
+docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
+  "SELECT request_id, reservation_id, status, hypervisor_id, created_at
+     FROM execution.dynamic_instances
+    WHERE instance_ref IS NULL AND status <> 'DESTROYED';"
+```
+
+Find the instance: the Hypervisor contract requires `create_instance` to name the
+instance from `HERD_request_id` (see [DRIVERS.md](DRIVERS.md), Determinism contract), so
+search the hypervisor named by `hypervisor_id` for the name the recipe derives from the
+row's `request_id` (the recipe source shows the derivation; the checked-in mock uses
+`mock-vm-<request_id>`). Delete it by hand if it exists.
+
+Then fix the cause (upgrade the recipe so it accepts `instance_ref=None` and resolves the
+instance by its derived name, or restore the missing config) and retry the teardown by
+re-publishing the reservation's terminal event. The original payload stays in the
+reservations outbox for 7 days after publish. Two ids matter, and they are handled
+differently:
+
+- Keep the payload's `event_id` unchanged. Notifications and integration's webhook
+  consumer key their dedupe on it, so the replay adds no second bell entry and no second
+  webhook delivery. Execution does not skip a terminal event it has seen before (its
+  dedupe key only skips driver actions that already succeeded, and the dynamic teardown
+  records none for a failed destroy), so it runs teardown, and the keyed destroy, again.
+  This is the opposite of the issue #611 advice for test publishes, which want a fresh
+  `event_id` precisely so the consumers do NOT dedupe them.
+- Give the message a FRESH `Nats-Msg-Id` header. JetStream drops a publish whose
+  `Nats-Msg-Id` it saw within the stream's duplicate window (the default 2 minutes; HERD
+  sets none), and the outbox relay used the `event_id` as the original message id, so
+  reusing it can be swallowed by the broker. The `{{ID}}` template below generates a
+  unique id per publish.
+
+The `nats:2.10-alpine` service image ships only `nats-server`, no `nats` CLI, so publish
+from a one-off `natsio/nats-box` container on the stack's network
+(`<compose project>_herd-net`, for example `herd-public_herd-net`):
+
+```bash
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tA -c \
+  "SELECT subject FROM reservations.outbox
+    WHERE payload->>'reservation_id' = '<reservation_id>'
+      AND subject IN ('herd.reservations.cancelled', 'herd.reservations.completed',
+                      'herd.reservations.failed')
+    ORDER BY created_at DESC LIMIT 1;"
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tA -c \
+  "SELECT payload::text FROM reservations.outbox
+    WHERE payload->>'reservation_id' = '<reservation_id>' AND subject = '<subject>'
+    ORDER BY created_at DESC LIMIT 1;" > event.json
+docker run -i --rm --network <compose project>_herd-net natsio/nats-box:0.14.5 \
+  nats --server nats://nats:4222 pub -H 'Nats-Msg-Id:{{ID}}' '<subject>' --force-stdin \
+  < event.json
+```
+
+If the outbox row has been pruned, there is no faithful payload to replay; delete the
+instance by hand as above and leave the row as the record that it existed. A row the keyed
+destroy retires shows `status = 'DESTROYED'`. Nothing retries a failed keyed destroy on a
+timer: only a redelivery of the terminal event (the consumer NAKed it for a transient
+error) or such a re-publish runs teardown again.
+
+### Dynamic reservations fail without any `create_instance` run during a reservations outage
+
+Since issue #937 the execution consumer corroborates `reservation.provision_requested`
+against reservations (`GET /internal/{id}` must report `PENDING_PROVISION`) before it
+creates anything. While reservations is unreachable or answering 5xx, that check NAKs the
+event on the `NATS_NAK_BACKOFF_SECONDS` schedule; an outage that outlasts the five
+deliveries (`max_deliver`; the four delays in between total about 81 seconds at the
+default `1,5,15,60,120`) dead-letters the event on `herd.reservations.dlq.execution`, and
+the best-effort failure callback is lost with reservations still down. The reservation
+then sits in `PENDING_PROVISION` until the provision timeout (`PROVISION_TIMEOUT_SECONDS`,
+default 900) fails it. No ledger row and
+no instance exist, so there is nothing to tear down. Rebook after reservations recovers,
+or replay the dead-lettered event before the timeout fires (`DLQ has messages` below).
+
 ## NATS and inter-service events
 
 ### Reservation created but L1/L2 operations didn't run

@@ -4,7 +4,8 @@ Covers the AST-based structural section (the validator never imports the
 package in-process), the stricter generated-recipe policy contract
 (supports_dry_run required, stdlib-only, no inline credentials, no _deps or
 requirements.txt), the sandboxed dry-run lifecycle including instance_ref
-threading and driver-level failure verdicts, decode errors and the size cap,
+threading, the keyed destroy step (issue #937), and driver-level failure
+verdicts, decode errors and the size cap,
 temp-dir cleanup, the real drivers/mock_hypervisor package end to end, and
 the internal route (auth wording, unsupported connection type, report shape).
 """
@@ -20,6 +21,7 @@ import pytest
 from app.config import settings
 from app.main import app
 from app.services.package_validator import (
+    KEYED_DESTROY_STEP,
     PackageDecodeError,
     validate_package,
 )
@@ -105,7 +107,15 @@ def test_good_package_is_valid_across_all_sections():
     assert report["valid"] is True
 
     actions = [m["action"] for m in report["dry_run"]["methods"]]
-    assert actions == ["login", "create_instance", "status", "destroy_instance", "logout"]
+    assert actions == [
+        "login",
+        "create_instance",
+        "status",
+        "destroy_instance",
+        "destroy_instance (no instance_ref)",
+        "logout",
+    ]
+    assert KEYED_DESTROY_STEP == "destroy_instance (no instance_ref)"
     assert all(m["passed"] for m in report["dry_run"]["methods"])
 
 
@@ -115,6 +125,8 @@ def test_dry_run_threads_instance_ref_from_create_to_destroy():
     ref = by_action["create_instance"]["output"]["instance_ref"]
     assert ref.startswith("sim-")
     assert by_action["destroy_instance"]["output"]["received_ref"] == ref
+    # The keyed step passes instance_ref=None explicitly, the consumer's shape.
+    assert by_action[KEYED_DESTROY_STEP]["output"]["received_ref"] is None
 
 
 def test_schema_is_optional_and_does_not_gate_validity():
@@ -133,6 +145,11 @@ def test_repo_mock_hypervisor_package_validates():
     assert report["structural"]["errors"] == []
     assert report["policy"]["errors"] == []
     assert report["valid"] is True, report["dry_run"]
+    # The mock's keyed destroy names the same instance its create named.
+    by_action = {m["action"]: m for m in report["dry_run"]["methods"]}
+    keyed = by_action[KEYED_DESTROY_STEP]["output"]
+    assert keyed["keyed"] is True
+    assert keyed["instance_ref"] == by_action["create_instance"]["output"]["instance_ref"]
 
 
 # --- structural section (AST only, never imported) ---
@@ -291,6 +308,134 @@ def test_driver_level_failure_verdict_fails_dry_run():
     assert report["valid"] is False
 
 
+# A recipe written to the pre-#937 contract: destroy assumes it always gets a
+# ref. The by-ref step passes; the keyed step must fail validation.
+_LEGACY_DESTROY_RAISES = """
+    def destroy_instance(self, instance_ref=None, **_):
+        return {"success": True, "received_ref": instance_ref.upper()}
+"""
+_LEGACY_DESTROY_REQUIRED_ARG = """
+    def destroy_instance(self, instance_ref):
+        if instance_ref is None:
+            return {"success": False, "error": "instance_ref is required"}
+        return {"success": True, "received_ref": instance_ref}
+"""
+
+
+def _with_destroy(body: str) -> str:
+    original = """
+    def destroy_instance(self, instance_ref=None, **_):
+        return {"success": True, "received_ref": instance_ref}
+"""
+    assert original in GOOD_DRIVER
+    return GOOD_DRIVER.replace(original, body)
+
+
+@pytest.mark.parametrize(
+    "destroy_body, expected_error",
+    [
+        (_LEGACY_DESTROY_RAISES, "AttributeError: 'NoneType' object has no attribute 'upper'"),
+        (
+            _LEGACY_DESTROY_REQUIRED_ARG,
+            'destroy_instance must return "success": true; the execution consumer '
+            "treats a missing or false success as a failed destroy",
+        ),
+    ],
+)
+def test_recipe_that_cannot_destroy_without_instance_ref_fails_validation(
+    destroy_body, expected_error
+):
+    report = run(good_package_b64(**{"driver.py": _with_destroy(destroy_body)}))
+    by_action = {m["action"]: m for m in report["dry_run"]["methods"]}
+    assert by_action["destroy_instance"]["passed"] is True
+    assert by_action[KEYED_DESTROY_STEP]["passed"] is False
+    assert by_action[KEYED_DESTROY_STEP]["error"] == expected_error
+    assert report["dry_run"]["passed"] is False
+    assert report["valid"] is False
+
+
+# --- the validator judges by the consumer's rule (issue #937 review) ---
+
+
+def test_validator_shares_the_consumer_predicates():
+    """One rule, not a copy: the validator and the consumer import the same
+    functions, so they cannot drift."""
+    from app.services import nats_consumer, package_validator
+
+    assert package_validator.recipe_reported_success is nats_consumer._recipe_reported_success
+    assert package_validator.created_instance_ref is nats_consumer._created_instance_ref
+
+
+_CREATE_RULE_TEXT = (
+    'create_instance must return "success": true and a non-empty string "instance_ref"; '
+    "the execution consumer treats anything else as a failed create"
+)
+
+
+@pytest.mark.parametrize(
+    "create_return",
+    [
+        # No success key: _method_passed used to call this a pass.
+        '{"instance_ref": "sim-1", "field_data": {}}',
+        # Success without a usable handle.
+        '{"success": True, "field_data": {}}',
+        '{"success": True, "instance_ref": "", "field_data": {}}',
+        '{"success": True, "instance_ref": 4711, "field_data": {}}',
+    ],
+)
+def test_create_that_the_consumer_would_reject_fails_validation(create_return):
+    original = """        return {
+            "success": True,
+            "instance_ref": ref,
+            "field_data": {"management_ip": "192.0.2.10"},
+        }"""
+    assert original in GOOD_DRIVER
+    driver = GOOD_DRIVER.replace(original, f"        return {create_return}")
+    report = run(good_package_b64(**{"driver.py": driver}))
+    by_action = {m["action"]: m for m in report["dry_run"]["methods"]}
+    assert by_action["create_instance"]["passed"] is False
+    assert by_action["create_instance"]["error"] == _CREATE_RULE_TEXT
+    assert report["valid"] is False
+
+
+def test_destroy_without_a_success_key_fails_validation():
+    report = run(
+        good_package_b64(
+            **{
+                "driver.py": _with_destroy(
+                    """
+    def destroy_instance(self, instance_ref=None, **_):
+        return {"received_ref": instance_ref}
+"""
+                )
+            }
+        )
+    )
+    by_action = {m["action"]: m for m in report["dry_run"]["methods"]}
+    assert by_action["destroy_instance"]["passed"] is False
+    assert by_action[KEYED_DESTROY_STEP]["passed"] is False
+    assert report["valid"] is False
+
+
+def test_keyed_destroy_step_runs_with_request_id_in_context():
+    """The keyed step's only handle is HERD_request_id; a recipe that derives
+    its name from it (as create_instance must) passes."""
+    body = """
+    def destroy_instance(self, instance_ref=None, **_):
+        if instance_ref is None:
+            request_id = self.context["HERD_request_id"]
+            return {"success": True, "keyed_name": "sim-" + request_id[:8]}
+        return {"success": True, "received_ref": instance_ref}
+"""
+    report = run(good_package_b64(**{"driver.py": _with_destroy(body)}))
+    by_action = {m["action"]: m for m in report["dry_run"]["methods"]}
+    assert report["valid"] is True
+    assert (
+        by_action[KEYED_DESTROY_STEP]["output"]["keyed_name"]
+        == by_action["create_instance"]["output"]["instance_ref"]
+    )
+
+
 def test_import_time_failure_surfaces_in_sandbox_not_in_process():
     # Top-level code that raises at import: structurally fine (AST parses,
     # class exists), so it reaches the sandbox, where every method run fails
@@ -412,6 +557,7 @@ async def test_route_happy_path_report_shape(client):
         "create_instance",
         "status",
         "destroy_instance",
+        "destroy_instance (no instance_ref)",
         "logout",
     ]
 

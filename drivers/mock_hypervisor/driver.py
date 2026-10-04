@@ -20,7 +20,11 @@ derived from the request id, plus an image echo when the template supplies
 HERD_image), which inventory merges into the materialized device's field_data.
 destroy_instance is idempotent per the ADR: destroying an already-absent
 instance still returns success (this mock is stateless, so every destroy is an
-acknowledgement).
+acknowledgement). Called with no instance_ref (the KEYED destroy, issue #937:
+teardown of a ledger row whose create never reported a handle), it derives the
+name from HERD_request_id with the same derivation create_instance uses and
+reports {"success": True, "instance_ref": <derived>, "keyed": True}, so a test
+can see on the run row's recorded output that the keyed path ran.
 
 Failure injection (for the FAILED / DLQ / retry integration tests) is read from
 the context dict. For a dynamic template there is no device row yet, so these
@@ -62,6 +66,16 @@ def _derive_mgmt_address(request_id):
     """
     digest = hashlib.sha256(str(request_id).encode()).digest()
     return f"10.66.{digest[0] % 254 + 1}.{digest[1] % 254 + 1}"
+
+
+def _instance_name(request_id):
+    """The hypervisor-side name for a request id.
+
+    The ONE derivation both create_instance and the keyed destroy use: the
+    determinism contract (docs/DRIVERS.md) is what lets a teardown find an
+    instance whose create never reported its instance_ref.
+    """
+    return f"mock-vm-{request_id}"
 
 
 class Driver:
@@ -144,7 +158,7 @@ class Driver:
                 "error": "context HERD_request_id is required to name the instance",
             }
 
-        instance_ref = f"mock-vm-{request_id}"
+        instance_ref = _instance_name(request_id)
         field_data = {"mgmt_address": _derive_mgmt_address(request_id)}
         image = self.context.get("HERD_image")
         if image:
@@ -160,12 +174,30 @@ class Driver:
 
         This mock is stateless, so destroying any instance, including one that
         was never created or is already gone, acknowledges with success=True.
+        With no instance_ref the destroy is keyed by HERD_request_id: the name
+        is derived exactly as create_instance derives it, and the result says
+        so ("keyed": True). A keyed destroy without HERD_request_id cannot name
+        anything and reports a failure rather than a false success.
         """
         injected = self._maybe_inject("destroy_instance")
         if injected is not None:
             return injected
-        self._record_op(f"destroy instance {instance_ref}")
-        return self._flag_simulated({"success": True, "instance_ref": instance_ref})
+        if instance_ref:
+            self._record_op(f"destroy instance {instance_ref}")
+            return self._flag_simulated({"success": True, "instance_ref": instance_ref})
+
+        request_id = self.context.get("HERD_request_id")
+        if not request_id:
+            record_command(
+                "destroy_instance", response="(missing HERD_request_id)", exit_status="error"
+            )
+            return {
+                "success": False,
+                "error": "context HERD_request_id is required for a keyed destroy",
+            }
+        name = _instance_name(request_id)
+        self._record_op(f"destroy instance {name} (keyed by HERD_request_id)")
+        return self._flag_simulated({"success": True, "instance_ref": name, "keyed": True})
 
     def status(self):
         """Reachability check. Never raises (status must always answer)."""

@@ -37,7 +37,19 @@ renders the "Draft with AI" button on the drivers page only when both
    the stricter generated-recipe policy (stdlib-only, no inline credentials,
    dry-run declared), config-schema extraction, and a sandboxed dry-run of
    the full lifecycle against a synthetic context on the reserved `.invalid`
-   TLD. See the generated-recipes section of [DRIVERS.md](DRIVERS.md).
+   TLD. The lifecycle includes a keyed destroy, `destroy_instance` called
+   with `instance_ref=None` and reported as the step
+   `destroy_instance (no instance_ref)` (issue #937): a draft whose destroy
+   raises or fails without an `instance_ref` is red. Under dry-run a compliant
+   draft answers before any lookup, so the step proves the draft accepts the
+   call and returns the right shape, not that it really finds the instance by
+   its request-id-derived name; the reviewing admin checks that in the code.
+   `create_instance` and `destroy_instance` are judged by the execution
+   consumer's own rule: an explicit `"success": true`, and a non-empty string
+   `instance_ref` from create. The drafting prompt tells the model to name
+   instances from `HERD_request_id` and to resolve a keyed destroy by that
+   name. See the generated-recipes section of
+   [DRIVERS.md](DRIVERS.md).
 4. On a red report the errors are flattened and fed back to the model, up to
    `AI_RECIPE_MAX_ATTEMPTS` (default 3) total attempts. The final draft
    persists either way; a red report is presentable and the admin sees
