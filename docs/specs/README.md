@@ -35,7 +35,7 @@ restates the full permission matrix, an ADR's argument, or a how-to.
 | Identity and access | `identity-and-access.md` | Not written |
 | Inventory | `inventory.md` | Not written |
 | Topology | `topology.md` | Not written |
-| Reservations | [`reservations.md`](reservations.md) | Pilot |
+| Reservations | [`reservations.md`](reservations.md) | Pilot; the worked example of the template |
 | Provisioning and wiring | `provisioning-and-wiring.md` | Not written |
 | Dynamic resources | `dynamic-resources.md` | Not written |
 | AI features | `ai-features.md` | Not written |
@@ -45,6 +45,13 @@ restates the full permission matrix, an ADR's argument, or a how-to.
 
 The areas follow the headings of `FEATURES.md`. Provisioning and wiring is split out
 of Reservations because it is large enough to need its own document.
+
+Every specification has the same thirteen sections, in this order: Purpose, Actors and
+permissions, Concepts and data, State model, API surface, Events, Internal API,
+Features, Errors, Interactions with other services, Configuration, Test coverage map,
+and Known limits and gaps. The cross-cutting tables (sections 4 to 7 and 9) come
+before or after the features so each fact has one home; [`TEMPLATE.md`](TEMPLATE.md)
+gives the columns of each.
 
 ## Conventions
 
@@ -56,42 +63,64 @@ not finished.
    from another document. An ADR records a decision at a point in time and the code
    may have moved since.
 2. **Every rule is numbered and has a stable identifier.** The form is
-   `<AREA>-<TOPIC>-<N>`, for example `RES-STATUS-3`. Identifiers are never reused or
-   renumbered; a removed rule keeps its number and is marked withdrawn. Code
-   comments, tests, issues, and reviews can then cite a rule by name.
-3. **Every rule names where it is enforced and what pins it.** "Enforced in" gives a
-   repository path and a symbol (a function, class, or constant). "Pinned by" gives a
-   test file and, where one test carries the rule, the test name. Do not use line
-   numbers: they go stale on the next edit.
-4. **A rule with no test says so.** Write `Pinned by: none` and list the rule under
-   Known limits and gaps. An unpinned rule is a finding, not something to hide.
-5. **A rule states one checkable fact.** "Cancel is refused on a finished
+   `<AREA>-<TOPIC>-<N>`, for example `RES-STATUS-3`: the area prefix from the header,
+   a topic word, and a number. Identifiers are never reused or renumbered. A rule that
+   moves to another section keeps its identifier, so the topic word names where the
+   rule started, not where it lives now. A removed rule keeps its number and is marked
+   withdrawn. Code comments, tests, issues, and reviews can then cite a rule by name.
+3. **Every rule names where it is enforced and what pins it, on one line each.**
+   Directly under the rule, indented two spaces and with no bullet, write
+   `` Enforced in: `path` (`symbol`, `symbol`); `path` (`symbol`) `` and
+   `` Pinned by: `path` (`test_name`) ``. A symbol is a function, class, or constant
+   that appears in that file; a test name is the test function, or for a frontend test
+   the exact test title. Do not use line numbers anywhere in a specification: they go
+   stale on the next edit.
+4. **A rule with no test says so.** Write `Pinned by: none`, optionally followed by
+   the issue in parentheses, and list the rule under "Rules with no test" in the gaps
+   section. An unpinned rule is a finding, not something to hide.
+5. **One home for each fact.** Status transitions live only in the State model
+   (section 4); routes only in the API surface (section 5); events only in Events
+   (section 6); service-to-service routes only in Internal API (section 7); error
+   responses only in Errors (section 9). A feature section cites those by rule id,
+   method and path, or subject, and does not restate them. Every rule id a table cites
+   must exist in the same document.
+6. **A rule states one checkable fact.** "Cancel is refused on a finished
    reservation" is a rule. "Cancellation is handled robustly" is not.
-6. **Say what happens on failure.** For every call to another service or to a driver,
+7. **Say what happens on failure.** For every call to another service or to a driver,
    state whether the feature fails open or fails closed, and what the caller sees.
-7. **Record decisions as decisions.** Where the behavior is a deliberate choice that
-   a reader might mistake for a bug, say "by decision" and link the ADR or issue.
-8. **Defects are not smoothed over.** If the code does something that looks wrong,
-   the specification states what it does, flags it under Known limits and gaps, and
-   links an issue. It does not describe the behavior you wish it had.
-9. **Plain words first.** Each feature opens with what a user can do, in a sentence a
-   non-engineer can follow. Identifiers and code names come after.
-10. **Repository style applies.** No em-dashes, no arrows (write "to"), no
+8. **Record decisions as decisions.** Where the behavior is a deliberate choice that
+   a reader might mistake for a bug, say "by decision" and cite the ADR, document, or
+   issue that records it. If nothing records it, it is not a decision yet: ask the
+   owner and file an issue.
+9. **Defects are not smoothed over.** A rule states what the code does today, even
+   when that is wrong. The defect goes under "Open defects" with its GitHub issue, and
+   the rule carries a short "Known gap, see #NNN." note. The specification does not
+   describe the fix; the issue does.
+10. **Plain words first.** Each feature opens with what a user can do, in a sentence a
+    non-engineer can follow. Identifiers and code names come after.
+11. **Repository style applies.** No em-dashes, no arrows (write "to"), no
     box-drawing characters, no emojis. Tables use markdown table syntax.
 
 ## Keeping a specification current
 
 - A change that alters behavior a specification describes updates that specification
   in the same pull request, the same way it updates `CHANGELOG.md`.
-- `tests/unit/test_spec_references.py` fails when a specification names a repository
-  path that does not exist, so a rename or a deleted test cannot leave a dangling
-  reference unnoticed. It also fails when an "Enforced in" or "Pinned by" symbol no
-  longer appears in the file it names, when a rule identifier repeats or a rule lacks
-  either line, when a relative link does not resolve, or when a template section is
-  missing. Its module docstring defines exactly what counts as a path, a reference
-  line, and a rule. Write references as `` `path` (`symbol`, `symbol`) `` groups
-  separated by `;`, and `Pinned by: none` for an unpinned rule. A withdrawn rule says
-  "withdrawn" in its text and needs no references.
+- `tests/unit/test_spec_references.py` is the drift guard. Its module docstring
+  defines exactly what counts as a path, a reference line, a rule, and a table
+  citation. It fails when a specification:
+  - names a repository path that does not exist, or a relative link that does not
+    resolve;
+  - names an "Enforced in" or "Pinned by" symbol or test name that no longer appears
+    in the file it names, or writes a reference line in any other shape;
+  - repeats a rule identifier, writes one that does not match `<AREA>-<TOPIC>-<N>`,
+    or has a rule without exactly one of each reference line;
+  - cites a rule identifier in the State model, API surface, Events, Internal API, or
+    Errors table that the document does not define;
+  - lists an open defect without an issue, writes an issue reference that is not
+    `#` followed by a number, or lets "Rules with no test" disagree with the rules
+    marked `Pinned by: none`;
+  - leaves out a section heading of the template.
+  A withdrawn rule says "withdrawn" in its text and needs no references.
 - The header's "Verified at" line names the commit the document was last checked
   against in full. A partial update leaves that line alone.
 
