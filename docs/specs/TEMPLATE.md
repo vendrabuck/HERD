@@ -79,6 +79,13 @@ Every event this area publishes. Write "None." when it publishes nothing.
 | Subject | Producer | Staged when | Consumers | Payload keys | Rules |
 |---|---|---|---|---|---|
 
+When the area consumes events another area publishes, add a second table under the
+heading "Events consumed". The publishing area's document owns the event; this table
+records only what this area does with it.
+
+| Subject | Published by | Consumer | What this area does | Rules |
+|---|---|---|---|---|
+
 ## 7. Internal API
 
 Routes this area serves to other services, not to users. Write "None." when there
