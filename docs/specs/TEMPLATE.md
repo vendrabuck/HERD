@@ -105,13 +105,15 @@ subject; their details live in sections 5 to 7.
 Each rule is one checkable statement followed by exactly two reference lines. A
 reference line is indented two spaces, has no bullet, and fits on one line: a path in
 backticks, then its symbols or test names in parentheses, several path groups
-separated by `; `.
+separated by `; `. The last line of the rule's text and the "Enforced in" line each end
+with a space and a backslash, the markdown hard line break, so the three parts render on
+separate lines.
 
-- **XXX-TOPIC-1.** The statement.
-  Enforced in: `path/to/file.py` (`symbol_name`, `other_symbol`); `path/to/other.py` (`symbol`)
+- **XXX-TOPIC-1.** The statement. \
+  Enforced in: `path/to/file.py` (`symbol_name`, `other_symbol`); `path/to/other.py` (`symbol`) \
   Pinned by: `path/to/test_file.py` (`test_name`)
-- **XXX-TOPIC-2.** The statement. By decision; see ADR NNNN or issue #NNN.
-  Enforced in: `path/to/file.py` (`symbol_name`)
+- **XXX-TOPIC-2.** The statement. By decision; see ADR NNNN or issue #NNN. \
+  Enforced in: `path/to/file.py` (`symbol_name`) \
   Pinned by: none (issue #NNN)
 
 **Out of scope.** What this feature deliberately does not do, so a reader does not go

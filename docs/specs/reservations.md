@@ -95,142 +95,142 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
 
 - **RES-CREATE-12.** A booking whose start is more than the grace ahead skips the
   current-status check and is created `PENDING`, with no inventory write, no fork, and
-  no event.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`)
+  no event. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_future_is_pending_and_defers_provisioning`, `test_create_reservation_future_skips_now_availability_check`)
 - **RES-CREATE-13.** A booking that starts now with no exclusive device and no dynamic
   request is created `ACTIVE` directly, with `reservation.created` in the same
-  transaction and no inventory write.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`)
+  transaction and no inventory write. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_non_exclusive_skips_pending_provision`)
 - **RES-CREATE-14.** Otherwise a booking that starts now is committed
   `PENDING_PROVISION` first, then its exclusive devices are set `RESERVED` with three
   attempts (0.5 s initial delay, doubling, 5 s cap), then it moves to `ACTIVE` with
-  `reservation.created` in that transaction.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_claim_provision_transition`)
+  `reservation.created` in that transaction. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_claim_provision_transition`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_exclusive_enqueues_created_event_in_txn`)
 - **RES-CREATE-15.** When the inventory flip exhausts its attempts, the reservation
   moves to `FAILED` with `reservation.failed` in that transaction, the devices that did
   reach `RESERVED` are set back to `AVAILABLE` without the holder check, and the caller
   gets 503. No purpose marker is stamped and no fork archive is requested. Known gap,
-  see #996.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`)
+  see #996. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_fails_when_inventory_exhausts_retries`, `test_create_reservation_reverts_partially_reserved_devices_on_failure`); `tests/integration/test_provisioning_failed.py` (`test_provisioning_failure_lands_failed_and_reverts_devices`)
 - **RES-CREATE-16.** A create whose status compare-and-swap loses to a concurrent
   cancel during the flip stages no event, creates no fork, reverts the devices it
-  flipped (holder-aware), and returns the row as the cancel left it.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_lost_activation_race`, `_revert_flipped_devices_best_effort`)
+  flipped (holder-aware), and returns the row as the cancel left it. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_lost_activation_race`, `_revert_flipped_devices_best_effort`) \
   Pinned by: `services/reservations/tests/test_reservation_status_cas.py` (`test_create_loses_to_cancel_during_flip_stays_cancelled`, `test_lost_create_revert_skips_a_device_a_newer_booking_holds`); `services/reservations/tests/test_reservation_status_cas_live_pg.py` (`test_create_versus_cancel_mid_flip_never_leaves_a_zombie_active`)
 - **RES-DYN-4.** A booking with dynamic requests that starts now never goes straight to
   `ACTIVE`: it stays `PENDING_PROVISION`, stages `reservation.provision_requested`
   (after the exclusive-device flip when there is one, else in the create transaction),
-  and stages no `reservation.created` and creates no fork yet.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_provision_requested_event`)
+  and stages no `reservation.created` and creates no fork yet. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_provision_requested_event`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_dynamic_booking_lands_pending_provision`, `test_dynamic_booking_stages_provision_requested_payload_exactly`, `test_dynamic_booking_no_created_event_no_fork`)
 - **RES-DYN-5.** A scheduled booking with dynamic requests is handled the same way at
   activation: flip, then stage `reservation.provision_requested`, staying
-  `PENDING_PROVISION`.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_activate_pending_reservation`)
+  `PENDING_PROVISION`. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_activate_pending_reservation`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_scheduled_dynamic_claim_gates_activation`)
 - **RES-DYN-6.** The provision-result callback applies only while the reservation is
   `PENDING_PROVISION`; any other status answers 200 with `applied: false` and changes
-  nothing.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`apply_provision_result`)
+  nothing. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`apply_provision_result`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_callback_repeat_success_is_noop`, `test_callback_after_cancel_does_not_retransition`, `test_callback_after_failed_does_not_resurrect`)
 - **RES-DYN-7.** A successful callback attaches the reported `device_ids` (skipping ones
   already booked), moves to `ACTIVE` with `reservation.created` in that transaction, then
-  creates the fork best-effort.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`apply_provision_result`)
+  creates the fork best-effort. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`apply_provision_result`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_callback_success_activates_and_attaches_devices`, `test_dynamic_only_callback_success_attaches_instances`)
 - **RES-DYN-8.** A failed callback moves to `FAILED` with `reservation.failed` and the
   purpose marker in that transaction, then releases exclusive devices (holder-aware) and
-  archives the fork.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`apply_provision_result`)
+  archives the fork. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`apply_provision_result`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_callback_failure_fails_and_stages_failed_event`); `services/reservations/tests/test_fork_archive_reconcile.py` (`test_provision_result_failed_archives_fork`)
 - **RES-DYN-9.** A callback and the timeout backstop racing for one row produce one
-  winner; the loser stages nothing.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_claim_provision_transition`)
+  winner; the loser stages nothing. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_claim_provision_transition`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_success_callback_loses_race_to_backstop_is_clean_noop`, `test_backstop_loses_race_to_success_callback_is_clean_noop`)
 - **RES-SWEEP-1.** A `PENDING` row with `start_time <= now < end_time` is claimed to
   `PENDING_PROVISION` and then activated exactly as a start-now booking (flip, then
-  `ACTIVE` with `reservation.created`, then fork).
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`, `_activate_pending_reservation`)
+  `ACTIVE` with `reservation.created`, then fork). \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`, `_activate_pending_reservation`) \
   Pinned by: `services/reservations/tests/test_expiration.py` (`test_expiration_activates_pending`, `test_activation_emits_created_not_completed`); `services/reservations/tests/test_expiration_hold_invariant.py` (`test_pending_row_still_inside_its_window_is_still_activated`)
 - **RES-SWEEP-2.** When the activation flip exhausts its three attempts, the row goes
   back to `PENDING` by compare-and-swap and all of its exclusive devices are released,
-  holder-aware; a later tick retries. It is never failed for this.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_activate_pending_reservation`)
+  holder-aware; a later tick retries. It is never failed for this. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_activate_pending_reservation`) \
   Pinned by: `services/reservations/tests/test_expiration.py` (`test_activation_inventory_failure_stays_pending`); `services/reservations/tests/test_expiration_hold_invariant.py` (`test_failed_successor_flip_releases_the_device_its_predecessor_skipped`, `test_failed_successor_flip_does_not_release_a_device_a_third_row_holds`)
 - **RES-SWEEP-3.** A `PENDING` row whose `end_time` has passed is moved to `FAILED` by
   compare-and-swap with `reservation.failed` and the purpose marker, logging
   `reservation_window_elapsed`; it is never activated, and no inventory or fork call is
-  made.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`)
+  made. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
   Pinned by: `services/reservations/tests/test_expiration_hold_invariant.py` (`test_expired_pending_row_is_failed_not_activated`, `test_expired_pending_row_logs_fixed_action`)
 - **RES-SWEEP-4.** An `ACTIVE` row with `end_time <= now` is moved to `COMPLETED` by
   compare-and-swap with `reservation.completed` and the purpose marker; a row a
-  concurrent release or cancel already ended is skipped.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_complete_expired_rows`)
+  concurrent release or cancel already ended is skipped. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_complete_expired_rows`) \
   Pinned by: `services/reservations/tests/test_expiration.py` (`test_expiration_completes_expired_active`, `test_expiration_stages_one_completed_event_per_reservation`); `services/reservations/tests/test_expiration_status_cas.py` (`test_auto_complete_loses_to_a_concurrent_release_is_a_noop`)
 - **RES-SWEEP-6.** A `PENDING_PROVISION` row with dynamic requests whose `updated_at` is
   older than `PROVISION_TIMEOUT_SECONDS` (default 900) is moved to `FAILED` by
   compare-and-swap with `reservation.failed` and the purpose marker, then its devices are
   released and its fork archived. `updated_at` moves on any write to the row, for
   example a purpose-category PATCH, so such a write restarts the timeout. Known gap,
-  see #997.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`); `services/reservations/app/models/reservation.py` (`updated_at`)
+  see #997. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`); `services/reservations/app/models/reservation.py` (`updated_at`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_timeout_backstop_fails_stuck_dynamic_reservation`, `test_timeout_backstop_leaves_fresh_dynamic_reservation`); `services/reservations/tests/test_fork_archive_reconcile.py` (`test_timeout_backstop_failed_archives_fork`)
 - **RES-SWEEP-7.** A physical-only `PENDING_PROVISION` row stranded past the same
   deadline is moved back to `PENDING` by compare-and-swap, so a later tick re-activates
   it; nothing is released or torn down. Devices the stranded attempt already set
-  `RESERVED` stay `RESERVED` while the row is `PENDING`. Known gap, see #993.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`)
+  `RESERVED` stay `RESERVED` while the row is `PENDING`. Known gap, see #993. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_restart_backstop_reverts_stranded_physical_reservation`, `test_restart_backstop_reclaims_and_reactivates_across_cycles`, `test_restart_backstop_skips_row_activated_concurrently`)
-- **RES-SWEEP-8.** `PROVISION_TIMEOUT_SECONDS=0` disables both provisioning backstops.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`)
+- **RES-SWEEP-8.** `PROVISION_TIMEOUT_SECONDS=0` disables both provisioning backstops. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_timeout_backstop_disabled_when_zero`, `test_restart_backstop_disabled_when_timeout_zero`)
 - **RES-CANCEL-3.** Cancel on `COMPLETED`, `CANCELLED`, or `FAILED` answers 204 and
-  changes nothing: no event, no inventory write.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`cancel_reservation`)
+  changes nothing: no event, no inventory write. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`cancel_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_cancel_failed_is_terminal_no_release_no_event`); `services/reservations/tests/test_reservations.py` (`test_cancel_already_cancelled`)
 - **RES-CANCEL-4.** Cancel compare-and-swaps from the exact status it read; when the row
   moved, it re-reads and retries, at most three times, then logs
   `reservation_cancel_cas_exhausted` and stages nothing. A row that went terminal
-  meanwhile is a clean no-op.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`cancel_reservation`)
+  meanwhile is a clean no-op. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`cancel_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_status_cas.py` (`test_cancel_retries_with_the_fresh_status_when_the_row_moved_forward`, `test_cancel_cas_exhaustion_warns_with_fixed_action_and_stages_nothing`, `test_cancel_loses_to_a_concurrent_completion_is_a_noop`)
 - **RES-CANCEL-5.** A winning cancel stages `reservation.cancelled` whose `user_id` is
   the owner (also on an admin cancel), stamps the purpose marker, then releases devices
   only if it left `PENDING_PROVISION` or `ACTIVE`, then requests a fork archive (a
-  no-op for a `PENDING` row, which has no fork).
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`cancel_reservation`)
+  no-op for a `PENDING` row, which has no fork). \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`cancel_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_admin_cancel_any_records_canceller`); `services/reservations/tests/test_purpose_classify_marker.py` (`test_cancel_reservation_stamps_marker`); `services/reservations/tests/test_fork_archive_reconcile.py` (`test_cancel_reservation_archives_fork`)
 - **RES-RELEASE-3.** Release on any status other than `ACTIVE` answers 200 with the
-  reservation unchanged.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`release_reservation`)
+  reservation unchanged. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`release_reservation`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_release_non_active_reservation`, `test_release_pending_reservation`)
 - **RES-RELEASE-4.** A winning release compare-and-swaps `ACTIVE` to `COMPLETED`, stages
   `reservation.completed` and the purpose marker in that transaction, then releases
   devices and archives the fork; a release that loses to a cancel or auto-complete is a
-  no-op.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`release_reservation`)
+  no-op. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`release_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_status_cas.py` (`test_release_win_completes_stages_one_event_and_releases`, `test_release_loses_to_a_concurrent_cancel_is_a_noop`); `services/reservations/tests/test_reservation_status_cas_live_pg.py` (`test_auto_complete_versus_release_stages_exactly_one_terminal_event`)
 - **RES-STATUS-1.** A status write is a conditional `UPDATE ... WHERE id = :id AND
   status IN (:expected)` that matches only the statuses its caller expects to leave and
   reports whether it won; only the winner stages an event, writes inventory, or calls
-  cabling, and the loser performs no side effect.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_claim_status_transition`, `_claim_provision_transition`)
+  cabling, and the loser performs no side effect. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_claim_status_transition`, `_claim_provision_transition`) \
   Pinned by: `services/reservations/tests/test_reservation_status_cas.py` (`test_claim_status_transition_matches_only_expected_statuses`, `test_claim_provision_transition_is_the_pending_provision_wrapper`); `services/reservations/tests/test_dynamic_requests.py` (`test_claim_provision_transition_is_single_winner`)
 - **RES-STATUS-2.** A scheduled activation that loses to a cancel during its flip
-  stages nothing and reverts the devices it flipped.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_activate_pending_reservation`)
+  stages nothing and reverts the devices it flipped. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_activate_pending_reservation`) \
   Pinned by: `services/reservations/tests/test_expiration_status_cas.py` (`test_scheduled_activation_loses_to_cancel_during_flip`)
 - **RES-STATUS-3.** The sweep claims due `PENDING` rows with `SELECT ... FOR UPDATE SKIP
   LOCKED` and sets `PENDING_PROVISION` through the ORM, not through
   `_claim_status_transition`; safety against a concurrent cancel rests on the Postgres
   row lock (a concurrent cancel blocks on it, then re-reads and cancels from
-  `PENDING_PROVISION`). On SQLite the lock is a no-op.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`)
+  `PENDING_PROVISION`). On SQLite the lock is a no-op. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
   Pinned by: none (issue #998)
 
 ## 5. API surface
@@ -315,59 +315,59 @@ The status a new booking starts in is RES-CREATE-12 to RES-CREATE-16 (section 4)
 **Rules.**
 
 - **RES-CREATE-1.** `device_ids` holds at most 200 entries; duplicates are dropped
-  before anything else runs.
-  Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationCreate`, `_dedupe_preserve_order`)
+  before anything else runs. \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationCreate`, `_dedupe_preserve_order`) \
   Pinned by: `services/reservations/tests/test_schema_bounds.py` (`test_device_ids_over_cap_rejected`); `services/reservations/tests/test_reservations.py` (`test_create_reservation_duplicate_device_ids`)
-- **RES-CREATE-2.** A booking must name at least one device or one dynamic request.
-  Enforced in: `services/reservations/app/schemas/reservation.py` (`require_device_or_dynamic`)
+- **RES-CREATE-2.** A booking must name at least one device or one dynamic request. \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`require_device_or_dynamic`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_neither_device_nor_dynamic_request_422_wording`)
-- **RES-CREATE-3.** `end_time` must be strictly after `start_time`.
-  Enforced in: `services/reservations/app/schemas/reservation.py` (`end_after_start`)
+- **RES-CREATE-3.** `end_time` must be strictly after `start_time`. \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`end_after_start`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_end_equals_start`)
 - **RES-CREATE-4.** A `start_time` more than `RESERVATION_START_GRACE_SECONDS` (default
-  300) before now is refused.
-  Enforced in: `services/reservations/app/schemas/reservation.py` (`validate_window`)
+  300) before now is refused. \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`validate_window`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_rejects_past_start`)
 - **RES-CREATE-5.** A window longer than `RESERVATION_MAX_DURATION_SECONDS` (default 30
-  days) is refused; 0 disables the cap.
-  Enforced in: `services/reservations/app/schemas/reservation.py` (`validate_window`)
+  days) is refused; 0 disables the cap. \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`validate_window`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_rejects_overlong_duration`)
-- **RES-CREATE-6.** `purpose` is at most 2000 characters.
-  Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationCreate`)
+- **RES-CREATE-6.** `purpose` is at most 2000 characters. \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationCreate`) \
   Pinned by: `services/reservations/tests/test_schema_bounds.py` (`test_purpose_over_cap_rejected`)
 - **RES-CREATE-7.** A non-admin may book only devices inventory reports visible to them;
-  any other device refuses the whole booking with 403. Admins skip the check.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`create_new_reservation`, `_fetch_visible_device_ids`)
+  any other device refuses the whole booking with 403. Admins skip the check. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`create_new_reservation`, `_fetch_visible_device_ids`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_non_admin_invisible_device_rejected`, `test_create_reservation_admin_skips_visibility`)
 - **RES-CREATE-8.** When inventory's visible-devices lookup errors or answers non-200,
   the router skips the RES-CREATE-7 check (by decision, docstring of
   `_fetch_visible_device_ids`), but the booking still cannot include an invisible
   device: the device fetch of RES-CREATE-9 goes through inventory's
   `POST /devices/batch`, which omits every device outside a non-admin's visibility and
-  fails closed, so such a device is refused as not found (422).
-  Enforced in: `services/reservations/app/routers/reservations.py` (`_fetch_visible_device_ids`); `services/reservations/app/services/reservation_service.py` (`_fetch_devices`); `services/inventory/app/routers/devices.py` (`get_devices_batch`)
+  fails closed, so such a device is refused as not found (422). \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`_fetch_visible_device_ids`); `services/reservations/app/services/reservation_service.py` (`_fetch_devices`); `services/inventory/app/routers/devices.py` (`get_devices_batch`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_visibility_fetch_failure_allows`); `services/reservations/tests/test_coverage_gaps.py` (`test_visible_devices_non_200_logs_and_fails_open`); `services/reservations/tests/test_reservation_service_unit.py` (`test_fetch_devices_missing_from_batch_raises_value_error`); `services/inventory/tests/test_devices.py` (`test_batch_non_admin_gets_only_visible_with_passwords_redacted`)
 - **RES-CREATE-9.** Every requested device must exist in inventory, read in one batch
   call with the caller's JWT; a missing device refuses the booking with 422, and an
-  unreachable inventory fails closed with 503.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_fetch_devices`, `create_reservation`)
+  unreachable inventory fails closed with 503. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_fetch_devices`, `create_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_fetch_devices_missing_from_batch_raises_value_error`); `services/reservations/tests/test_reservations.py` (`test_inventory_unreachable_returns_503`)
 - **RES-CREATE-10.** All booked devices must share one topology type (physical and
-  cloud never mix); a dynamic-only booking is `CLOUD`.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`)
+  cloud never mix); a dynamic-only booking is `CLOUD`. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_mixed_topology_type_rejected`); `services/reservations/tests/test_dynamic_requests.py` (`test_dynamic_only_booking_lands_pending_provision_cloud`)
 - **RES-CREATE-11.** A booking that starts now (within the grace) requires every
   exclusive device to be `AVAILABLE` and every non-exclusive device to be `AVAILABLE` or
-  `RESERVED` at request time.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`)
+  `RESERVED` at request time. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_device_not_available`); `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_non_exclusive_reserved_ok`)
 - **RES-CREATE-17.** Once a create lands `ACTIVE`, the fork is created best-effort
-  (RES-FORK-1); its failure never changes the response.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_create_reservation_fork_best_effort`)
+  (RES-FORK-1); its failure never changes the response. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_create_reservation_fork_best_effort`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_invokes_fork_when_topology_present`, `test_fork_best_effort_swallows_exhausted_retries`)
 - **RES-CREATE-18.** `owner_name` is copied from the JWT `username` claim at creation
-  and never refreshed.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`create_new_reservation`)
+  and never refreshed. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`create_new_reservation`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_owner_name_in_list`)
 
 **Out of scope.** The AI-generated "commit a proposal" flow that creates a topology and
@@ -385,25 +385,25 @@ overlapping time. Shared (non-exclusive) devices can be booked by anyone at any 
 
 - **RES-CONFLICT-1.** A requested exclusive device conflicts with any other reservation
   holding it in `PENDING`, `PENDING_PROVISION`, or `ACTIVE` whose window overlaps the
-  requested one; the booking is refused with 409.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_check_conflicts`)
+  requested one; the booking is refused with 409. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_check_conflicts`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_conflict_detection`); `services/reservations/tests/test_reservation_service_unit.py` (`test_check_conflicts_pending_provision_visible`, `test_check_conflicts_cancelled_not_conflicting`)
 - **RES-CONFLICT-2.** Windows are half-open: a reservation ending at T and one starting
-  at T do not conflict.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_check_conflicts`)
+  at T do not conflict. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_check_conflicts`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_adjacent_reservations_allowed`, `test_create_reservation_exact_time_overlap`)
-- **RES-CONFLICT-3.** Non-exclusive devices are never conflict-checked.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_check_conflicts`)
+- **RES-CONFLICT-3.** Non-exclusive devices are never conflict-checked. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_check_conflicts`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_non_exclusive_device_no_conflict`, `test_mixed_exclusive_non_exclusive`)
 - **RES-CONFLICT-4.** Before the conflict check, a create takes one transaction-scoped
   Postgres advisory lock per requested device, in sorted id order, so concurrent creates
   on overlapping device sets serialize; the new row commits before the locks release.
-  On SQLite the lock is a no-op.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_acquire_device_locks`)
+  On SQLite the lock is a no-op. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_acquire_device_locks`) \
   Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_acquire_device_locks_postgres_issues_advisory_locks`); `services/reservations/tests/test_reservation_service_unit.py` (`test_acquire_device_locks_sqlite_noop`)
 - **RES-CONFLICT-5.** A committed `PENDING_PROVISION` row blocks a second create for the
-  same exclusive device while the first is still flipping inventory.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_check_conflicts`)
+  same exclusive device while the first is still flipping inventory. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_check_conflicts`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_pending_provision_blocks_concurrent_create`)
 
 **Out of scope.** Port-level conflicts between forks are cabling's (`topology.md`,
@@ -423,31 +423,31 @@ on the canvas must be part of the booking, and any routing intent must be valid.
 
 - **RES-TOPO-1.** With a `topology_id`, create calls cabling's internal validate route
   with the internal token (not the caller's JWT) and a 20 second timeout; without one,
-  no call is made.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_topology_connectivity`, `_VALIDATE_TOPOLOGY_TIMEOUT_SECONDS`)
+  no call is made. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_topology_connectivity`, `_VALIDATE_TOPOLOGY_TIMEOUT_SECONDS`) \
   Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_validate_topology_connectivity_uses_20s_timeout`); `services/reservations/tests/test_reservations.py` (`test_create_reservation_validation_skipped_without_topology`)
 - **RES-TOPO-2.** A canvas device outside the booking's `device_ids` refuses the booking
-  with a structured 422, checked before connectivity.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_topology_connectivity`, `TopologyDeviceNotMember`)
+  with a structured 422, checked before connectivity. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_topology_connectivity`, `TopologyDeviceNotMember`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_blocked_by_topology_device_not_member`); `services/reservations/tests/test_coverage_gaps.py` (`test_validate_topology_connectivity_membership_checked_before_connectivity`)
 - **RES-TOPO-3.** Unreachable edges with no route problem refuse the booking with a
-  plain-string 422 naming at most five edges.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_topology_connectivity`, `_summarize`)
+  plain-string 422 naming at most five edges. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_topology_connectivity`, `_summarize`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_blocked_by_invalid_topology`); `services/reservations/tests/test_coverage_gaps.py` (`test_validate_topology_connectivity_invalid_edges_and_routes_combined_first_five`)
 - **RES-TOPO-4.** Any invalid routing intent refuses the booking with a structured 422
-  carrying cabling's raw `invalid_routes`.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`TopologyRoutingIntentInvalid`)
+  carrying cabling's raw `invalid_routes`. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`TopologyRoutingIntentInvalid`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_blocked_by_invalid_routing_intent`)
 - **RES-TOPO-5.** A cabling 404 (topology gone) is treated as "nothing to validate" and
   the booking proceeds with that `topology_id`. When it activates, cabling creates the
   fork with an empty (null) canvas, so nothing is wired from the missing topology. By
   decision (the comment at the 404 branch of `_validate_topology_connectivity`); see
-  section 13.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_topology_connectivity`); `services/cabling/app/services/fork_service.py` (`_resolve_parent_canvas`)
+  section 13. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_topology_connectivity`); `services/cabling/app/services/fork_service.py` (`_resolve_parent_canvas`) \
   Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_validate_topology_connectivity_404_is_noop`)
 - **RES-TOPO-6.** Any other cabling status of 400 or above, or a transport error, fails
-  closed with 503.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_topology_connectivity`)
+  closed with 503. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_topology_connectivity`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_cabling_unreachable_is_503`); `services/reservations/tests/test_coverage_gaps.py` (`test_validate_topology_connectivity_503_from_cabling_raises_runtime`)
 
 **Out of scope.** What makes an edge or a route valid is cabling's rule (`topology.md`).
@@ -467,15 +467,15 @@ The transitions are RES-DYN-4 to RES-DYN-9 and RES-SWEEP-6 (section 4).
 **Rules.**
 
 - **RES-DYN-1.** Each dynamic request's template must exist in inventory and have
-  `template_type` `dynamic`; inventory unreachable fails closed with 503.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`, `_fetch_dynamic_templates`)
+  `template_type` `dynamic`; inventory unreachable fails closed with 503. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`, `_fetch_dynamic_templates`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_dynamic_booking_unknown_template_422_wording`, `test_dynamic_booking_non_dynamic_template_422_wording`, `test_dynamic_booking_inventory_unreachable_503_wording`)
-- **RES-DYN-2.** A booking carries at most 50 dynamic requests.
-  Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationCreate`)
+- **RES-DYN-2.** A booking carries at most 50 dynamic requests. \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationCreate`) \
   Pinned by: none (issue #998)
 - **RES-DYN-3.** Listing a template N times books N instances, one row each; there is
-  no dedupe.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`)
+  no dedupe. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_dynamic_booking_creates_one_row_per_instance`)
 
 **Out of scope.** Instance creation, the instance ledger, keyed destroy, and teardown on
@@ -495,47 +495,47 @@ runs after the commit.
 
 - **RES-HOLD-1.** An exclusive device is held by a reservation in `PENDING_PROVISION` or
   `ACTIVE`; a `PENDING` reservation holds nothing, so cancelling it or editing its
-  devices writes no inventory status.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_DEVICE_HOLDING_STATUSES`, `cancel_reservation`, `update_reservation`)
+  devices writes no inventory status. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_DEVICE_HOLDING_STATUSES`, `cancel_reservation`, `update_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_cancel_writes_inventory_only_when_row_held_devices`, `test_patch_add_writes_inventory_only_when_row_holds_devices`, `test_patch_remove_writes_inventory_only_when_row_holds_devices`)
 - **RES-HOLD-2.** Non-exclusive devices are never written to inventory by any
-  reservation path.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_release_exclusive_devices_best_effort`)
+  reservation path. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_release_exclusive_devices_best_effort`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_non_exclusive_device_status_not_changed`, `test_cancel_non_exclusive_skips_status_update`)
 - **RES-HOLD-3.** Cancel, release, provision failure, the dynamic timeout, auto-complete,
   and lost-activation reverts skip any device another `PENDING_PROVISION` or `ACTIVE`
   reservation holds, logging `release_skipped_device_held`. The create-path flip-failure
-  revert (RES-CREATE-15) and PATCH removal (RES-PATCH-10) do not use this check.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`release_devices_not_held_by_others`)
+  revert (RES-CREATE-15) and PATCH removal (RES-PATCH-10) do not use this check. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`release_devices_not_held_by_others`) \
   Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_cancel_skips_a_device_another_live_row_holds`, `test_release_skips_a_device_another_live_row_holds`); `services/reservations/tests/test_expiration_hold_invariant.py` (`test_release_skips_device_a_pending_provision_row_holds`)
 - **RES-HOLD-4.** If the holder lookup itself fails, the release proceeds for every
-  device (fail open toward releasing).
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`release_devices_not_held_by_others`)
+  device (fail open toward releasing). \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`release_devices_not_held_by_others`) \
   Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_holder_lookup_failure_falls_back_to_releasing`)
 - **RES-HOLD-5.** Cancel, release, provision failure, and the dynamic timeout share one
   release helper: a device whose exclusivity cannot be read is treated as exclusive, and
   a device inventory answers 404 for is dropped from the release set. Auto-complete
-  reads exclusivity itself and follows RES-HOLD-9 instead.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_release_exclusive_devices_best_effort`, `_DeviceGoneFromInventory`)
+  reads exclusivity itself and follows RES-HOLD-9 instead. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_release_exclusive_devices_best_effort`, `_DeviceGoneFromInventory`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_cancel_fetch_failure_falls_back_to_exclusive`); `services/reservations/tests/test_reservation_service_unit.py` (`test_release_exclusive_devices_drops_404_fetch_result`)
 - **RES-HOLD-6.** A 404 from inventory when setting a device `AVAILABLE` counts as
-  success; a 404 when setting it `RESERVED` is a failure.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_update_device_statuses`)
+  success; a 404 when setting it `RESERVED` is a failure. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_update_device_statuses`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_update_device_statuses_404_on_release_is_success`, `test_update_device_statuses_404_on_reserved_still_raises`)
 - **RES-HOLD-7.** Releases after a terminal transition run after the commit, with three
   attempts on cancel, release, provision failure, and the timeout path, and a single
   attempt on auto-complete; a release that still fails is logged and the terminal
-  status stands.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_release_exclusive_devices_best_effort`); `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`)
+  status stands. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_release_exclusive_devices_best_effort`); `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_cancel_reservation_retries_and_logs_when_release_fails`, `test_release_reservation_retries_and_logs_when_inventory_fails`)
 - **RES-HOLD-8.** Without `INTERNAL_API_TOKEN` configured, no inventory status write is
-  attempted at all.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_update_device_statuses`)
+  attempted at all. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_update_device_statuses`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_update_device_statuses_no_token`)
 - **RES-HOLD-9.** Auto-complete treats every device whose record it cannot read, a 404
   included, as exclusive and posts `AVAILABLE` for it (holder-aware, RES-HOLD-3); a 404
-  on that post counts as success (RES-HOLD-6).
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`)
+  on that post counts as success (RES-HOLD-6). \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
   Pinned by: `services/reservations/tests/test_expiration.py` (`test_expiration_releases_all_device_ids_without_exclusivity_check`)
 
 **Out of scope.** Wiring teardown on the hardware is execution's
@@ -556,24 +556,24 @@ The transitions are RES-CANCEL-3 to RES-CANCEL-5 and RES-RELEASE-3 to RES-RELEAS
 **Rules.**
 
 - **RES-CANCEL-1.** The owner may cancel; an admin may cancel any reservation; anyone
-  else gets 404, never 403.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`cancel_reservation`)
+  else gets 404, never 403. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`cancel_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_non_admin_cannot_cancel_other_users_reservation`, `test_admin_cancel_any_records_canceller`)
 - **RES-CANCEL-2.** `cancelled_by` is set to the admin only when an admin cancels a
-  reservation they do not own; an owner's cancel leaves it null.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`cancel_reservation`)
+  reservation they do not own; an owner's cancel leaves it null. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`cancel_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_admin_cancel_any_records_canceller`, `test_cancel_reservation_self_cancel_leaves_cancelled_by_null`)
 - **RES-CANCEL-6.** The UI offers Cancel on `PENDING`, `PENDING_PROVISION`, and `ACTIVE`
   to the owner or an admin, and Release on `ACTIVE` to the owner only; the row buttons,
-  the detail modal, and the bulk actions share these two functions.
-  Enforced in: `frontend/src/lib/reservationStatus.ts` (`canCancelAs`, `canReleaseAs`)
+  the detail modal, and the bulk actions share these two functions. \
+  Enforced in: `frontend/src/lib/reservationStatus.ts` (`canCancelAs`, `canReleaseAs`) \
   Pinned by: `frontend/src/test/lib/reservationStatus.test.ts` (`canCancel`, `canRelease`); `frontend/src/test/pages/ReservationsPage.test.tsx` (`an admin sees Cancel but not Release on another user's row`)
-- **RES-RELEASE-1.** Only the owner may release; any other caller gets 404.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`release_reservation`, `get_reservation`)
+- **RES-RELEASE-1.** Only the owner may release; any other caller gets 404. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`release_reservation`, `get_reservation`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_user_b_cannot_release_user_a_reservation`)
 - **RES-RELEASE-2.** An admin who does not own the reservation gets 404 on release too.
-  By decision ([ROLES.md](../ROLES.md); issue #843 aligned the UI to it).
-  Enforced in: `services/reservations/app/routers/reservations.py` (`release_reservation_early`)
+  By decision ([ROLES.md](../ROLES.md); issue #843 aligned the UI to it). \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`release_reservation_early`) \
   Pinned by: none (issue #998)
 
 **Out of scope.** Hardware teardown triggered by the terminal events is execution's
@@ -601,22 +601,22 @@ pending-prune reconcile.
 **Rules.**
 
 - **RES-SWEEP-5.** Within one tick, completed rows' devices are released before claimed
-  rows are activated, so back-to-back bookings (`R2.start == R1.end`) both end correct.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`)
+  rows are activated, so back-to-back bookings (`R2.start == R1.end`) both end correct. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
   Pinned by: `services/reservations/tests/test_expiration_hold_invariant.py` (`test_adjacent_reservations_due_in_one_tick_end_reserved`)
 - **RES-SWEEP-9.** An `ACTIVE` row whose `end_time` is in the future but within
   `EXPIRY_REMINDER_LEAD_SECONDS` (default 3600) gets exactly one
   `reservation.expiring_soon`, deduped by `expiry_reminder_sent_at` stamped in the same
-  transaction; 0 disables reminders.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_reminder_cycle`)
+  transaction; 0 disables reminders. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_reminder_cycle`) \
   Pinned by: `services/reservations/tests/test_expiry_reminder.py` (`test_reminder_not_repeated_across_ticks`, `test_reminder_stamp_and_event_commit_together`, `test_lead_window_zero_disables_reminder`)
 - **RES-SWEEP-10.** A failure in one step of a tick does not stop the loop or the
-  following steps.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`expiration_loop`)
+  following steps. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`expiration_loop`) \
   Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_expiration_loop_runs_both_cycles_and_handles_errors`)
 - **RES-SWEEP-11.** Purpose classification runs on its own task and interval, never
-  inside the expiration loop.
-  Enforced in: `services/reservations/app/main.py` (`lifespan`); `services/reservations/app/tasks/expiration.py` (`purpose_classify_loop`)
+  inside the expiration loop. \
+  Enforced in: `services/reservations/app/main.py` (`lifespan`); `services/reservations/app/tasks/expiration.py` (`purpose_classify_loop`) \
   Pinned by: `services/reservations/tests/test_main_task_lifecycle.py` (`test_lifespan_purpose_classify_task_uses_its_own_interval_setting`); `services/reservations/tests/test_coverage_gaps.py` (`test_expiration_loop_no_longer_drives_purpose_classify_reconcile`)
 
 **Out of scope.** What execution does with the events.
@@ -635,66 +635,66 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
 **Rules.**
 
 - **RES-PATCH-1.** Only `ACTIVE` and `PENDING` reservations can be edited; any other
-  status answers 400 with no side effect.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`)
+  status answers 400 with no side effect. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_completed_reservation_rejected`); `services/reservations/tests/test_reservation_hold_invariant.py` (`test_patch_on_pending_provision_is_refused_with_zero_inventory_calls`)
 - **RES-PATCH-2.** Only the owner can edit; every other caller, an admin included, gets
-  404. By decision ([ROLES.md](../ROLES.md): owner-scoped, no admin bypass).
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `get_reservation`)
+  404. By decision ([ROLES.md](../ROLES.md): owner-scoped, no admin bypass). \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `get_reservation`) \
   Pinned by: none (issue #998)
-- **RES-PATCH-3.** A new `end_time` must be after `start_time` and in the future.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`)
+- **RES-PATCH-3.** A new `end_time` must be after `start_time` and in the future. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_end_time_not_after_start_rejected`, `test_update_reservation_end_time_in_past_rejected`)
 - **RES-PATCH-4.** Extending the end time conflict-checks the added span
   `[old end, new end)` for the booked exclusive devices; when inventory cannot say which
-  devices are exclusive, all are checked.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`)
+  devices are exclusive, all are checked. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_conflict_on_extension`); `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_extend_fetch_failure_falls_back_to_exclusive`)
 - **RES-PATCH-5.** Extending the end time does not apply
   `RESERVATION_MAX_DURATION_SECONDS`; only create applies the cap (RES-CREATE-5). Known
-  gap, see #995.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`)
+  gap, see #995. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: none (issue #998)
 - **RES-PATCH-6.** A new `device_ids` must be non-empty (at most 200, deduped), every
-  device must exist, and all must share one topology type.
-  Enforced in: `services/reservations/app/schemas/reservation.py` (`device_ids_not_empty`); `services/reservations/app/services/reservation_service.py` (`update_reservation`)
+  device must exist, and all must share one topology type. \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`device_ids_not_empty`); `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_empty_device_ids_rejected`, `test_update_reservation_topology_mismatch_rejected`); `services/reservations/tests/test_schema_bounds.py` (`test_update_device_ids_over_cap_rejected`)
 - **RES-PATCH-7.** A non-admin's new `device_ids` must all be visible to them (403
   otherwise). When the visibility lookup fails the router skips this check, as on
   create (RES-CREATE-8), and the device fetch of RES-PATCH-6 still refuses an invisible
-  device as not found (400).
-  Enforced in: `services/reservations/app/routers/reservations.py` (`update_reservation_by_id`, `_fetch_visible_device_ids`); `services/reservations/app/services/reservation_service.py` (`_fetch_devices`)
+  device as not found (400). \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`update_reservation_by_id`, `_fetch_visible_device_ids`); `services/reservations/app/services/reservation_service.py` (`_fetch_devices`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_non_admin_invisible_device_rejected`)
 - **RES-PATCH-8.** On a topology-backed reservation, a device-set change re-runs
   cabling's validation for connectivity and membership with the routing pass skipped
-  (`l3=0`).
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_validate_topology_connectivity`)
+  (`l3=0`). \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_validate_topology_connectivity`) \
   Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_device_change_revalidates_topology`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_device_change_breaks_topology_rejected`)
 - **RES-PATCH-9.** An added exclusive device must currently be `AVAILABLE`, also on a
   `PENDING` reservation, and must not conflict over `[max(now, start), end)`. A create
   for a future window skips the current-status check (RES-CREATE-12). Known gap, see
-  #999.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`)
+  #999. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_patch_add_still_refuses_a_device_that_is_not_available_on_pending`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_conflict_on_added_device`)
 - **RES-PATCH-10.** On an `ACTIVE` row, added exclusive devices are set `RESERVED` and
   removed exclusive devices `AVAILABLE` before the edit commits, each in one attempt
   whose failure is logged and does not stop the edit. Neither write uses the holder
   check, and the commit does not re-check the status the edit read. Known gap, see
-  #994.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_update_device_statuses`)
+  #994. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_update_device_statuses`) \
   Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_add_exclusive_device_marks_reserved`, `test_update_reservation_remove_exclusive_device_marks_available`)
 - **RES-PATCH-11.** Removing devices from an `ACTIVE` reservation records them in
   `pending_fork_prune_device_ids` in the edit's transaction, unioned with any ids still
-  pending, then asks cabling to prune them from the fork (RES-FORK-16).
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_prune_removed_devices_from_fork_best_effort`)
+  pending, then asks cabling to prune them from the fork (RES-FORK-16). \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_prune_removed_devices_from_fork_best_effort`) \
   Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_patch_remove_writes_marker_with_the_edit`, `test_patch_remove_unions_into_existing_marker`)
 - **RES-PATCH-12.** Adding a device wires nothing; its connections are built only by a
-  later fork save. By decision (ADR 0009 Decision 6).
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`)
+  later fork save. By decision (ADR 0009 Decision 6). \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `tests/integration/test_device_set_patch_wiring.py` (`test_patch_add_wires_nothing_until_fork_save_and_remove_releases`)
 - **RES-PATCH-13.** Every successful edit stages `reservation.updated` in its
-  transaction, with `end_time` set only when the end time actually changed.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`)
+  transaction, with `end_time` set only when the end time actually changed. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_update_reservation_metadata_only_omits_end_time`, `test_update_reservation_changed_end_time_is_flagged_and_carried`)
 
 **Out of scope.** The fork prune itself and the wiring release are cabling's and
@@ -713,53 +713,53 @@ section 5).
 **Rules.**
 
 - **RES-LIST-1.** Without `all`, the list holds only the caller's own reservations;
-  `all=true` lists everyone's and is admin-only.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`get_my_reservations`); `services/reservations/app/services/reservation_service.py` (`list_user_reservations`, `list_all_reservations`)
+  `all=true` lists everyone's and is admin-only. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`get_my_reservations`); `services/reservations/app/services/reservation_service.py` (`list_user_reservations`, `list_all_reservations`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_list_all_true_forbidden_for_non_admin`, `test_list_all_true_admin_sees_every_user`, `test_user_b_cannot_list_user_a_reservations`)
 - **RES-LIST-2.** Every filter is ANDed after the visibility clause, so no filter or
-  sort can reveal a row outside the caller's set.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_apply_list_filters`)
+  sort can reveal a row outside the caller's set. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_apply_list_filters`) \
   Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_search_by_id_never_reveals_another_users_row`, `test_visibility_enumeration_non_admin_never_sees_foreign_rows`)
 - **RES-LIST-3.** `sort_by` is one of `start_time`, `end_time`, `status`,
   `purpose_category`, `user_id`, `created_at` (default `created_at`) and `sort_dir` one of
-  `asc`, `desc` (default `desc`); anything else is 422.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`ReservationSortField`, `ReservationSortDir`)
+  `asc`, `desc` (default `desc`); anything else is 422. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`ReservationSortField`, `ReservationSortDir`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_sort_default_matches_todays_ordering`, `test_sort_unknown_sort_by_is_422`, `test_sort_unknown_sort_dir_is_422`)
 - **RES-LIST-4.** Every ordering is tiebroken by id ascending, so pages never overlap or
-  skip.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_reservation_order_by`)
+  skip. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_reservation_order_by`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_sort_tiebreak_keeps_pagination_stable`, `test_sort_pagination_disjoint_and_ordered`)
-- **RES-LIST-5.** `status` sorts alphabetically by the status name on every database.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_reservation_order_by`)
+- **RES-LIST-5.** `status` sorts alphabetically by the status name on every database. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_reservation_order_by`) \
   Pinned by: `services/reservations/tests/test_reservation_sort_live_pg.py` (`test_sort_by_status_ascending_is_alphabetical_on_postgres`)
 - **RES-LIST-6.** `search` (at most 200 characters) is a case-insensitive substring
   match on purpose, with `%` and `_` literal; a term of 8 to 32 hex digits, hyphens
-  ignored, also matches ids starting with it.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_apply_list_filters`, `_id_prefix_term`, `ID_PREFIX_MIN_HEX`)
+  ignored, also matches ids starting with it. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_apply_list_filters`, `_id_prefix_term`, `ID_PREFIX_MIN_HEX`) \
   Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_search_is_case_insensitive_substring_on_purpose`, `test_search_treats_like_metacharacters_literally`, `test_search_matches_short_id_prefix_and_full_id`, `test_id_prefix_term`)
 - **RES-LIST-7.** `purpose_category` must be a configured category or `none` (no
-  category); any other value is 422.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`get_my_reservations`)
+  category); any other value is 422. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`get_my_reservations`) \
   Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_purpose_category_value_and_none`, `test_purpose_category_unknown_is_422_with_pinned_message`)
 - **RES-LIST-8.** Time bounds must carry a timezone; `*_after` is inclusive and
-  `*_before` exclusive, compared by instant.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_apply_list_filters`); `services/reservations/app/routers/reservations.py` (`_as_utc`)
+  `*_before` exclusive, compared by instant. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_apply_list_filters`); `services/reservations/app/routers/reservations.py` (`_as_utc`) \
   Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_window_bounds_are_half_open`, `test_window_bad_or_naive_timestamp_is_422`, `test_window_bound_with_offset_is_compared_by_instant`)
-- **RES-LIST-9.** `total` is the filtered total.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`list_user_reservations`, `list_all_reservations`)
+- **RES-LIST-9.** `total` is the filtered total. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`list_user_reservations`, `list_all_reservations`) \
   Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_total_is_filtered_total_across_pages_and_sort`)
 - **RES-LIST-10.** The page maps Period to bounds from one anchor instant fixed when a
   filter changes: Upcoming is `starts_after`, Current is `starts_before` plus
-  `ends_after`, Past is `ends_before`.
-  Enforced in: `frontend/src/lib/reservationFilters.ts` (`reservationListFilters`)
+  `ends_after`, Past is `ends_before`. \
+  Enforced in: `frontend/src/lib/reservationFilters.ts` (`reservationListFilters`) \
   Pinned by: `frontend/src/test/lib/reservationFilters.test.ts` (`maps each period onto the half-open window at the anchor`); `frontend/src/test/pages/ReservationsPageFilters.test.tsx` (`paging keeps the period anchor fixed`)
 - **RES-LIST-11.** A saved filter value that no longer exists (status, period, or a
-  removed category) falls back to All and is never sent.
-  Enforced in: `frontend/src/lib/reservationFilters.ts` (`parseSavedReservationFilter`, `effectivePurposeCategory`)
+  removed category) falls back to All and is never sent. \
+  Enforced in: `frontend/src/lib/reservationFilters.ts` (`parseSavedReservationFilter`, `effectivePurposeCategory`) \
   Pinned by: `frontend/src/test/lib/reservationFilters.test.ts` (`drops a stale status or period and a non-string field`); `frontend/src/test/pages/ReservationsPageFilters.test.tsx` (`never sends a stale saved value`)
 - **RES-LIST-12.** A heading click cycles ascending, descending, then back to the
-  default, and the choice persists per user.
-  Enforced in: `frontend/src/pages/ReservationsPage.tsx` (`ReservationsPage`)
+  default, and the choice persists per user. \
+  Enforced in: `frontend/src/pages/ReservationsPage.tsx` (`ReservationsPage`) \
   Pinned by: `frontend/src/test/pages/ReservationsPage.test.tsx` (`cycles a heading through ascending, descending, and back to the default on a third click`, `persists the chosen sort through the preferences store`)
 
 **Out of scope.** The `/api/v1` facade forwards only `skip` and `limit` by decision
@@ -777,25 +777,25 @@ and `frontend/src/pages/ReservationCalendarPage.tsx`; routes `GET /{id}` and
 
 **Rules.**
 
-- **RES-VIEW-1.** `GET /{id}` answers only the owner; anyone else gets 404.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`get_reservation`)
+- **RES-VIEW-1.** `GET /{id}` answers only the owner; anyone else gets 404. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`get_reservation`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_user_b_cannot_get_user_a_reservation`)
 - **RES-VIEW-2.** That includes an admin who does not own the reservation. By decision
-  ([ROLES.md](../ROLES.md): owner only for every role).
-  Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_by_id`)
+  ([ROLES.md](../ROLES.md): owner only for every role). \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_by_id`) \
   Pinned by: none (issue #998)
 - **RES-CAL-1.** The calendar returns every user's reservations overlapping
-  `[range_start, range_end)`.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`list_calendar_reservations`)
+  `[range_start, range_end)`. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`list_calendar_reservations`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_returns_cross_user_reservations`, `test_calendar_boundary_exclusion`)
 - **RES-CAL-2.** A window wider than `CALENDAR_MAX_SPAN_DAYS` (default 366) is 422; 0
-  disables the cap.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`list_calendar_reservations`)
+  disables the cap. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`list_calendar_reservations`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_span_over_max_rejected`); `services/reservations/tests/test_reservation_service_unit.py` (`test_list_calendar_span_guard_disabled_when_zero`)
 - **RES-CAL-3.** For a non-admin the calendar keeps only reservations all of whose
   devices are visible to them; when the visibility lookup fails, the calendar is
-  unfiltered and shows every user's reservations. Known gap, see #1000.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`get_calendar_reservations`, `_fetch_visible_device_ids`)
+  unfiltered and shows every user's reservations. Known gap, see #1000. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`get_calendar_reservations`, `_fetch_visible_device_ids`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_non_admin_visibility_filtering`); `services/reservations/tests/test_reservation_service_unit.py` (`test_calendar_visibility_subset_and_empty_set`)
 
 **Out of scope.** Utilization reports (`GET /reports/utilization` and its CSV) live in
@@ -818,67 +818,67 @@ routes in section 5; background work `purpose_classify_loop` every
 **Rules.**
 
 - **RES-PURPOSE-1.** A category, at create or by PATCH, must be in `PURPOSE_CATEGORIES`;
-  the list is a plain string list, so a stored value survives being removed from it.
-  Enforced in: `services/reservations/app/services/purpose_service.py` (`validate_purpose_category`)
+  the list is a plain string list, so a stored value survives being removed from it. \
+  Enforced in: `services/reservations/app/services/purpose_service.py` (`validate_purpose_category`) \
   Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_create_reservation_with_unknown_purpose_category_is_422`, `test_patch_purpose_category_unknown_category_is_422`)
 - **RES-PURPOSE-2.** The owner or an admin may set or clear the category in any status,
-  including terminal; anyone else gets 403 (not 404).
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`set_purpose_category`)
+  including terminal; anyone else gets 403 (not 404). \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`set_purpose_category`) \
   Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_patch_purpose_category_by_admin`, `test_patch_purpose_category_allowed_on_completed_reservation`, `test_patch_purpose_category_by_third_user_is_403`)
 - **RES-PURPOSE-3.** A null category clears the category, its setter, and its time
-  together.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`set_purpose_category`)
+  together. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`set_purpose_category`) \
   Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_patch_purpose_category_null_clears_all_three_fields`)
 - **RES-PURPOSE-4.** `purpose_classify_requested_at` is stamped, once, in the same
   transaction as six terminal transitions: cancel, release, auto-complete,
   provision-result failure, the dynamic timeout, and the elapsed-window failure. The
   create-path flip failure (RES-CREATE-15) does not stamp it. Only a stamped row is ever
   classified by the sweep. Code comments, ADR 0013, and the frontend's
-  `canClassifyPurpose` comment say five sites. Known gap, see #996.
-  Enforced in: `services/reservations/app/services/purpose_service.py` (`stamp_purpose_classify_requested`)
+  `canClassifyPurpose` comment say five sites. Known gap, see #996. \
+  Enforced in: `services/reservations/app/services/purpose_service.py` (`stamp_purpose_classify_requested`) \
   Pinned by: `services/reservations/tests/test_purpose_classify_marker.py` (`test_cancel_reservation_stamps_marker`, `test_release_reservation_stamps_marker`, `test_expiry_autocomplete_stamps_marker`, `test_provision_result_failed_stamps_marker`, `test_timeout_backstop_failed_stamps_marker`, `test_stamp_is_idempotent_on_cancel`); `services/reservations/tests/test_expiration_hold_invariant.py` (`test_expired_pending_row_is_failed_not_activated`)
 - **RES-PURPOSE-5.** Each sweep tick takes up to `PURPOSE_CLASSIFY_BATCH_SIZE` stamped
   rows with no suggestion and fewer than `PURPOSE_CLASSIFY_MAX_ATTEMPTS` attempts,
-  oldest stamp first.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_purpose_classify_reconcile`)
+  oldest stamp first. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_purpose_classify_reconcile`) \
   Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_skips_rows_at_attempt_cap`, `test_reconcile_respects_batch_size`, `test_reconcile_oldest_requested_first`, `test_reconcile_ignores_rows_not_yet_requested`)
 - **RES-PURPOSE-6.** A feature-off answer (403 with the disabled marker, or 404), a
   transient answer (429, 502, 503, 504, or a transport error other than a timeout), or
-  a 403 without the marker ends the tick and counts no attempt.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_PURPOSE_CLASSIFY_TICK_ENDING_OUTCOMES`); `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`)
+  a 403 without the marker ends the tick and counts no attempt. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_PURPOSE_CLASSIFY_TICK_ENDING_OUTCOMES`); `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`) \
   Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_403_structured_marker_ends_tick_without_touching_any_row`, `test_reconcile_transient_status_ends_tick_without_bump`, `test_reconcile_403_bad_token_is_not_feature_off`)
 - **RES-PURPOSE-7.** A timeout, any other non-200, or an unparseable body counts one
-  attempt on that row and the tick continues.
-  Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`, `_bump_purpose_classify_attempts`)
+  attempt on that row and the tick continues. \
+  Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`, `_bump_purpose_classify_attempts`) \
   Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_timeout_bumps_attempts_and_does_not_end_tick`, `test_reconcile_500_increments_attempts`)
 - **RES-PURPOSE-8.** A 200 stores the orchestrator's body verbatim as the suggestion; it
-  never writes `purpose_category`.
-  Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`)
+  never writes `purpose_category`. \
+  Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`) \
   Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_stores_suggestion_on_200`)
 - **RES-PURPOSE-9.** The review list holds rows with an undismissed suggestion whose
-  category is unset or differs from the suggestion's `top_category`.
-  Enforced in: `services/reservations/app/services/purpose_service.py` (`list_purpose_review_items`)
+  category is unset or differs from the suggestion's `top_category`. \
+  Enforced in: `services/reservations/app/services/purpose_service.py` (`list_purpose_review_items`) \
   Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_review_list_excludes_confirmed_agreeing_row`, `test_review_list_includes_confirmed_disagreeing_row`, `test_review_list_excludes_dismissed_row`)
 - **RES-PURPOSE-10.** Accept with a null body takes the suggestion's `top_category`;
-  with a value, that value (validated); the accepting admin becomes the setter.
-  Enforced in: `services/reservations/app/services/purpose_service.py` (`accept_purpose_suggestion`)
+  with a value, that value (validated); the accepting admin becomes the setter. \
+  Enforced in: `services/reservations/app/services/purpose_service.py` (`accept_purpose_suggestion`) \
   Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_accept_with_null_uses_top_category`, `test_accept_with_chosen_value_overrides_top_category`)
 - **RES-PURPOSE-11.** Dismiss sets only `purpose_suggestion_dismissed_at` and keeps the
-  suggestion.
-  Enforced in: `services/reservations/app/services/purpose_service.py` (`dismiss_purpose_suggestion`)
+  suggestion. \
+  Enforced in: `services/reservations/app/services/purpose_service.py` (`dismiss_purpose_suggestion`) \
   Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_dismiss_sets_dismissed_at_and_keeps_suggestion`)
 - **RES-PURPOSE-12.** Backfill stamps every terminal row with no stamp and no
   suggestion, and resets the attempt count of every capped row with no suggestion; it
-  returns the sum.
-  Enforced in: `services/reservations/app/services/purpose_service.py` (`backfill_purpose_classification`)
+  returns the sum. \
+  Enforced in: `services/reservations/app/services/purpose_service.py` (`backfill_purpose_classification`) \
   Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_backfill_marks_terminal_rows_without_suggestion`, `test_backfill_resets_capped_rows_without_suggestion`, `test_backfill_counts_newly_marked_and_reset_rows_together`)
 - **RES-PURPOSE-13.** Classify now runs the same single-row classifier immediately,
   ignores the attempt cap, and answers 200 with the outcome word for every outcome except
-  feature-off.
-  Enforced in: `services/reservations/app/routers/purpose_review.py` (`trigger_purpose_classify`)
+  feature-off. \
+  Enforced in: `services/reservations/app/routers/purpose_review.py` (`trigger_purpose_classify`) \
   Pinned by: `services/reservations/tests/test_purpose_classify_trigger.py` (`test_trigger_ignores_the_attempt_cap`, `test_trigger_200_timeout_bumps_attempts`, `test_trigger_503_feature_off`)
-- **RES-PURPOSE-14.** Every purpose review route is admin-only.
-  Enforced in: `services/reservations/app/routers/purpose_review.py` (`require_admin`)
+- **RES-PURPOSE-14.** Every purpose review route is admin-only. \
+  Enforced in: `services/reservations/app/routers/purpose_review.py` (`require_admin`) \
   Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_review_list_is_admin_only`, `test_accept_is_admin_only`, `test_backfill_is_admin_only`); `services/reservations/tests/test_purpose_classify_trigger.py` (`test_trigger_is_admin_only`)
 
 **Out of scope.** The classifier, its prompt, and its feature gate are
@@ -904,96 +904,96 @@ reconcile on the expiration loop.
 - **RES-FORK-1.** On every transition into `ACTIVE`, a reservation with a parent
   topology asks cabling to create its fork with its own device set as
   `member_device_ids`, three attempts; a reservation with no topology gets no fork until
-  first read.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_create_reservation_fork_best_effort`, `_create_reservation_fork`)
+  first read. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_create_reservation_fork_best_effort`, `_create_reservation_fork`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_fork_posts_to_cabling`, `test_create_reservation_fork_skips_when_no_topology`); `services/reservations/tests/test_expiration.py` (`test_activation_threads_booking_user_into_fork`)
 - **RES-FORK-2.** A cabling 409 or 422 on fork create is final: not retried, logged
   `reservation_fork_membership_refused`, and remembered in process memory so the sweep
-  stops retrying it; the reservation stays `ACTIVE`, unwired.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`ForkMembershipRefused`, `_fork_membership_refused`)
+  stops retrying it; the reservation stays `ACTIVE`, unwired. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`ForkMembershipRefused`, `_fork_membership_refused`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_fork_best_effort_membership_refused_is_not_retried`, `test_fork_best_effort_port_claim_409_is_not_retried`); `services/reservations/tests/test_fork_backstop_giveup.py` (`test_membership_refused_reservation_is_never_retried`)
 - **RES-FORK-3.** After a successful fork create, a delta-less `reservation.wiring_changed`
   for the returned version is staged with the ledger advance, unless the ledger already
-  holds that version or a later one.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_create_reservation_fork_best_effort`, `stage_wiring_changed`)
+  holds that version or a later one. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_create_reservation_fork_best_effort`, `stage_wiring_changed`) \
   Pinned by: `services/reservations/tests/test_wiring_changed_staging.py` (`test_activation_stages_initial_wiring_heal_after_fork_create`, `test_activation_staging_is_ledger_guarded`, `test_activation_stages_nothing_when_fork_create_fails`)
 - **RES-FORK-4.** Every fork and wiring route is owner-or-admin; any other caller gets
-  404 and no upstream call is made.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`_load_owned_or_admin`)
+  404 and no upstream call is made. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`_load_owned_or_admin`) \
   Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_other_user_404_and_no_cabling_call`, `test_get_fork_admin_allowed_for_other_owner`); `services/reservations/tests/test_fork_version_endpoints.py` (`test_restore_other_user_404_and_no_cabling_call`)
 - **RES-FORK-5.** Reading the fork works in any status; on a cabling 404 an `ACTIVE`
   reservation lazily creates the fork (also with no parent topology) and re-reads, while
   any other status answers 404 `Fork not found`. A failed or refused lazy create,
-  including a cabling 409, answers 503.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_fork`); `services/reservations/app/services/reservation_service.py` (`_lazy_create_reservation_fork`)
+  including a cabling 409, answers 503. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_fork`); `services/reservations/app/services/reservation_service.py` (`_lazy_create_reservation_fork`) \
   Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_lazy_creates_on_active_miss`, `test_get_fork_lazy_creates_with_no_parent_topology`, `test_get_fork_ended_reservation_no_fork_404_and_no_lazy_create`)
 - **RES-FORK-6.** Canvas PUT, save, and restore require `ACTIVE`; otherwise 409 and no
-  upstream call.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`FORK_EDIT_REQUIRES_ACTIVE`, `FORK_SAVE_REQUIRES_ACTIVE`, `FORK_RESTORE_REQUIRES_ACTIVE`)
+  upstream call. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`FORK_EDIT_REQUIRES_ACTIVE`, `FORK_SAVE_REQUIRES_ACTIVE`, `FORK_RESTORE_REQUIRES_ACTIVE`) \
   Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_put_canvas_non_active_409_pinned_wording`, `test_save_non_active_409_pinned_wording`); `services/reservations/tests/test_fork_version_endpoints.py` (`test_restore_409_body_is_structured_error_shape`)
 - **RES-FORK-7.** Save stamps `created_by` with the caller and `member_device_ids` with
-  the reservation's devices (not from the client) and forwards with a 20 second timeout.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`save_reservation_fork`, `ForkSaveBody`)
+  the reservation's devices (not from the client) and forwards with a 20 second timeout. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`save_reservation_fork`, `ForkSaveBody`) \
   Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_save_active_forwards_and_stamps_created_by`, `test_save_forwards_at_fork_save_timeout_not_default`)
 - **RES-FORK-8.** After cabling accepts a save, `reservation.wiring_changed` with
   cabling's `released` and `built` arrays is staged with the ledger advance in one
   commit; a staging failure is logged and the save still answers 200 (the sweep heals
-  it). A refused save stages nothing.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`save_reservation_fork`)
+  it). A refused save stages nothing. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`save_reservation_fork`) \
   Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_save_stage_wiring_changed_failure_still_returns_200`); `services/reservations/tests/test_wiring_changed_staging.py` (`test_save_handler_relays_body_and_stages_event`, `test_save_handler_archived_409_stages_nothing`)
-- **RES-FORK-9.** Restore forwards to cabling and stages no event.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`restore_reservation_fork_version`)
+- **RES-FORK-9.** Restore forwards to cabling and stages no event. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`restore_reservation_fork_version`) \
   Pinned by: `services/reservations/tests/test_fork_version_endpoints.py` (`test_restore_does_not_stage_wiring_changed`)
 - **RES-FORK-10.** A cabling 4xx is relayed with its status and unwrapped detail; a 5xx
   becomes 503 carrying cabling's JSON detail when there is one, else `Cabling service is
-  unavailable`; a transport failure is 503.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`_relay_cabling_fork_response`, `_cabling_detail`)
+  unavailable`; a transport failure is 503. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`_relay_cabling_fork_response`, `_cabling_detail`) \
   Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_save_port_conflict_409_structured_passthrough`, `test_get_fork_cabling_5xx_with_structured_json_relays_detail`, `test_get_fork_cabling_5xx_with_non_json_body_keeps_generic_message`, `test_get_fork_cabling_unreachable_maps_to_503`)
 - **RES-FORK-11.** Every transition into `COMPLETED`, `CANCELLED`, or `FAILED` except
   the create-path flip failure and the elapsed-window failure asks cabling to archive the
   fork, three attempts, after the commit; failure is logged and never undoes the
-  transition.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_archive_reservation_fork_best_effort`)
+  transition. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_archive_reservation_fork_best_effort`) \
   Pinned by: `services/reservations/tests/test_fork_archive_reconcile.py` (`test_release_reservation_archives_fork`, `test_expiry_autocomplete_archives_fork`, `test_archive_best_effort_swallows_and_retries`)
 - **RES-FORK-12.** Each tick archives any fork cabling reports `ACTIVE` whose reservation
   is terminal; a fork for a reservation this service does not know is skipped and warned
-  about once per process.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_fork_archive_reconcile`)
+  about once per process. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_fork_archive_reconcile`) \
   Pinned by: `services/reservations/tests/test_fork_archive_reconcile.py` (`test_reconcile_archives_terminal_skips_active_and_unknown`, `test_unknown_reservation_warns_once_per_process_across_ticks`)
 - **RES-FORK-13.** Each tick stages a delta-less `reservation.wiring_changed` for every
   `ACTIVE` reservation whose latest fork version in cabling is greater than its ledger
-  (missing ledger counts as 0).
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_heal_wiring_staging`)
+  (missing ledger counts as 0). \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_heal_wiring_staging`) \
   Pinned by: `services/reservations/tests/test_wiring_changed_staging.py` (`test_heal_stages_when_cabling_exceeds_missing_ledger`, `test_no_heal_when_in_sync`, `test_terminal_reservation_is_not_healed`)
 - **RES-FORK-14.** Each tick creates the fork for every `ACTIVE` reservation with a
   topology that cabling has no fork for, giving up after 5 failed ticks per reservation
-  until the process restarts.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_backstop_missing_forks`, `_FORK_BACKSTOP_MAX_ATTEMPTS`)
+  until the process restarts. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_backstop_missing_forks`, `_FORK_BACKSTOP_MAX_ATTEMPTS`) \
   Pinned by: `services/reservations/tests/test_wiring_changed_staging.py` (`test_sweep_creates_missing_fork_and_stages_initial_wiring`); `services/reservations/tests/test_fork_backstop_giveup.py` (`test_backs_off_after_cap`)
 - **RES-FORK-15.** When cabling's active-fork listing fails, the whole fork reconcile
-  (archive, heal, backstop) is skipped for that tick.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_fork_archive_reconcile`)
+  (archive, heal, backstop) is skipped for that tick. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_fork_archive_reconcile`) \
   Pinned by: `services/reservations/tests/test_fork_archive_reconcile.py` (`test_reconcile_survives_fetch_failure`)
 - **RES-FORK-16.** The removed-device prune stages cabling's `released` delta; a 404
   keeps the marker only while a fork can still appear (ACTIVE with a topology), a 409
-  (archived) clears it, and a 5xx or transport error keeps it.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_prune_removed_devices_from_fork`, `_prune_removed_devices_from_fork_best_effort`, `_fork_may_still_appear`)
+  (archived) clears it, and a 5xx or transport error keeps it. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_prune_removed_devices_from_fork`, `_prune_removed_devices_from_fork_best_effort`, `_fork_may_still_appear`) \
   Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_wrapper_no_fork_keeps_marker_while_fork_may_appear`, `test_wrapper_archived_409_clears_marker`, `test_wrapper_failure_keeps_marker`); `services/reservations/tests/test_wiring_changed_staging.py` (`test_patch_remove_calls_prune_devices_and_stages_released_delta`)
 - **RES-FORK-17.** Each tick retries up to 20 reservations with a pending prune marker,
   oldest `updated_at` first, one attempt each; a marker on a non-ACTIVE reservation is
-  cleared without a prune.
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_pending_prune_reconcile`, `_PENDING_PRUNE_BATCH`)
+  cleared without a prune. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_pending_prune_reconcile`, `_PENDING_PRUNE_BATCH`) \
   Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_sweep_retries_pending_prune_and_clears_on_success`, `test_sweep_terminal_reservation_clears_marker_without_prune`)
 - **RES-FORK-18.** Wiring status is readable in any status; wiring retry is refused with
   409 on `PENDING` and `PENDING_PROVISION`; execution's 4xx is relayed and its 5xx or
-  absence is 503.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_wiring_status`, `retry_reservation_wiring`, `_relay_execution_response`)
+  absence is 503. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_wiring_status`, `retry_reservation_wiring`, `_relay_execution_response`) \
   Pinned by: `services/reservations/tests/test_wiring_proxy_endpoints.py` (`test_status_allowed_for_completed_reservation`, `test_retry_pre_provision_409_pinned_wording`, `test_retry_execution_frozen_409_passthrough`, `test_retry_execution_unreachable_maps_to_503`)
 - **RES-FORK-19.** The detail modal offers Edit topology (an `ACTIVE` reservation) and
   View as-built (an ended one) only to the owner, and only when the reservation has a
   `topology_id`; an admin who does not own the reservation sees neither, although the
-  API would serve them (RES-FORK-4).
-  Enforced in: `frontend/src/components/reservations/ReservationDetailModal.tsx` (`canEditFork`, `canViewAsBuilt`)
+  API would serve them (RES-FORK-4). \
+  Enforced in: `frontend/src/components/reservations/ReservationDetailModal.tsx` (`canEditFork`, `canViewAsBuilt`) \
   Pinned by: `frontend/src/test/components/ReservationDetailModalEditTopology.test.tsx` (`shows Edit topology for the owner of an ACTIVE reservation with a topology_id`, `hides both affordances for a non-owner even with a topology_id`, `hides both affordances when topology_id is null`)
 
 **Out of scope.** Fork contents, save reconcile, port claims, version history, restore
@@ -1017,22 +1017,22 @@ answers.
 
 - **RES-BULK-1.** A row is eligible by the same `canCancelAs` and `canReleaseAs` used
   by the single-row buttons; ineligible rows are skipped with the reason `finished`,
-  `not_active`, or `not_yours` and are never sent.
-  Enforced in: `frontend/src/lib/reservationBulk.ts` (`partitionSelection`)
+  `not_active`, or `not_yours` and are never sent. \
+  Enforced in: `frontend/src/lib/reservationBulk.ts` (`partitionSelection`) \
   Pinned by: `frontend/src/test/lib/reservationBulk.test.ts` (`agrees with the single-row gates for every status, owner and caller kind`, `lets an admin cancel across owners but release only their own`)
 - **RES-BULK-2.** The eligible calls run in parallel with `Promise.allSettled`; every
   fulfilled id leaves the selection and every rejected id stays with its reason. A row
   the backend answers 200 or 204 for without acting (RES-CANCEL-3, RES-RELEASE-3)
-  counts as a success.
-  Enforced in: `frontend/src/api/reservations.ts` (`useBulkReservationAction`); `frontend/src/lib/reservationBulk.ts` (`applySettled`)
+  counts as a success. \
+  Enforced in: `frontend/src/api/reservations.ts` (`useBulkReservationAction`); `frontend/src/lib/reservationBulk.ts` (`applySettled`) \
   Pinned by: `frontend/src/test/lib/reservationBulk.test.ts` (`keeps failed ids selected with the server's reason`); `frontend/src/test/pages/ReservationsPage.test.tsx` (`keeps failed rows selected, reports the counts and reason, and invalidates once`)
 - **RES-BULK-3.** Select-all covers the current page only, and the selection clears when
-  the page, sort, any filter, or the All toggle changes.
-  Enforced in: `frontend/src/pages/ReservationsPage.tsx` (`ReservationsPage`)
+  the page, sort, any filter, or the All toggle changes. \
+  Enforced in: `frontend/src/pages/ReservationsPage.tsx` (`ReservationsPage`) \
   Pinned by: `frontend/src/test/pages/ReservationsPage.test.tsx` (`select-all takes the current page only and goes indeterminate on a partial selection`, `clears the selection when the page changes`, `clears the selection when the sort changes`); `frontend/src/test/pages/ReservationsPageFilters.test.tsx` (`clears the selection on a filter change`)
 - **RES-BULK-4.** An admin can bulk-cancel another user's reservation through the real
-  stack.
-  Enforced in: `frontend/src/lib/reservationBulk.ts` (`partitionSelection`)
+  stack. \
+  Enforced in: `frontend/src/lib/reservationBulk.ts` (`partitionSelection`) \
   Pinned by: `tests/e2e/test_reservations_bulk_playwright.py` (`test_admin_bulk_cancels_another_users_reservation`)
 
 **Out of scope.** There is no bulk endpoint, by decision (issue #843).
@@ -1050,21 +1050,21 @@ caller.
 
 - **RES-EVENT-1.** Every event is written to the outbox in the same database
   transaction as the state change it describes; none is published directly from request
-  code.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`enqueue_event`); `services/reservations/app/tasks/expiration.py` (`enqueue_event`)
+  code. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`enqueue_event`); `services/reservations/app/tasks/expiration.py` (`enqueue_event`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_exclusive_enqueues_created_event_in_txn`); `services/reservations/tests/test_expiry_reminder.py` (`test_reminder_stamp_and_event_commit_together`)
 - **RES-EVENT-2.** `reservation.wiring_changed` exists if and only if the fork wiring
-  ledger advanced: both are written in one commit.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`stage_wiring_changed`)
+  ledger advanced: both are written in one commit. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`stage_wiring_changed`) \
   Pinned by: `services/reservations/tests/test_wiring_changed_staging.py` (`test_atomicity_neither_persists_on_failure_between_writes`)
 - **RES-EVENT-3.** A heal or activation `wiring_changed` carries `released` and `built`
-  as null, not empty lists.
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_wiring_changed_payload`)
+  as null, not empty lists. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_wiring_changed_payload`) \
   Pinned by: `services/reservations/tests/test_wiring_changed_staging.py` (`test_heal_staging_carries_null_delta`)
 - **RES-EVENT-4.** NATS being unreachable at startup is logged and does not stop the
   service or its background tasks; events wait in the outbox and the relay picks up a
-  later connection.
-  Enforced in: `services/reservations/app/main.py` (`lifespan`)
+  later connection. \
+  Enforced in: `services/reservations/app/main.py` (`lifespan`) \
   Pinned by: `services/reservations/tests/test_main_task_lifecycle.py` (`test_lifespan_creates_and_cancels_expiration_and_purpose_classify_tasks`)
 
 **Out of scope.** The relay, deduplication headers, and consumer behavior are shared
@@ -1080,29 +1080,29 @@ user in the flow. The routes, callers, and answers are in section 7.
 
 **Rules.**
 
-- **RES-INTERNAL-1.** A wrong internal token answers 403; a missing header answers 422.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`internal_token_matches`)
+- **RES-INTERNAL-1.** A wrong internal token answers 403; a missing header answers 422. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`internal_token_matches`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_status_bad_token_rejected`, `test_internal_status_missing_token_rejected`, `test_internal_active_bad_token_rejected`, `test_active_users_requires_valid_internal_token`)
 - **RES-INTERNAL-2.** `is_active` is true only when the status is `ACTIVE` and now is
-  within `[start_time, end_time]`.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_internal_status`)
+  within `[start_time, end_time]`. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_internal_status`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_status_active`, `test_internal_status_outside_window_is_not_active`, `test_internal_status_cancelled_is_not_active`)
 - **RES-INTERNAL-3.** `owns_active` is true only when the user owns an `ACTIVE`
-  reservation that contains the device and whose window contains now.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`owns_active_reservation_for_device`)
+  reservation that contains the device and whose window contains now. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`owns_active_reservation_for_device`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_active_owner_with_device_returns_true`, `test_internal_active_non_owner_returns_false`, `test_internal_active_outside_window_returns_false`, `test_internal_active_cancelled_returns_false`)
 - **RES-INTERNAL-4.** `active-users` lists, once each, the owners of `ACTIVE`
-  reservations containing the device whose window contains now.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`list_active_reservation_users_for_device`)
+  reservations containing the device whose window contains now. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`list_active_reservation_users_for_device`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_active_users_dedupes_same_user_multiple_reservations`, `test_active_users_filters_by_time_window`, `test_active_users_filters_by_status`)
 - **RES-INTERNAL-5.** `by-topology` and `by-device` return every reservation that
   references the topology or contains the device, in every status and for every owner,
-  without pagination.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`list_reservations_for_topology`, `list_reservations_for_device`)
+  without pagination. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`list_reservations_for_topology`, `list_reservations_for_device`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_by_topology_returns_matching_reservation`, `test_internal_by_device_returns_matching_reservation`)
 - **RES-INTERNAL-6.** The literal `active`, `active-users`, `by-topology`, and
-  `by-device` segments are never parsed as a reservation id.
-  Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_internal_status`)
+  `by-device` segments are never parsed as a reservation id. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_internal_status`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_active_no_collision_with_int_status_path`, `test_internal_status_no_collision_with_user_get`)
 
 **Out of scope.** How each caller uses the answer is in that caller's area.
