@@ -608,6 +608,14 @@ demotes them back. Activation is in the State model (IAM-ACCT-1, IAM-ACCT-2).
   and disables them on the viewer's own row and on the superadmin's row. \
   Enforced in: `frontend/src/pages/admin/UsersPage.tsx` (`UsersPage`); `frontend/src/components/admin/UserManagementTable.tsx` (`UserManagementTable`) \
   Pinned by: `frontend/src/test/pages/UsersPage.test.tsx` (`enables role controls only for a superadmin`, `renders the heading and table for a regular admin without role controls`); `tests/e2e/test_roles_playwright.py` (`test_superadmin_promotes_then_demotes_user`)
+- **IAM-USER-9.** While `AUTH_METHOD=ldap`, no login yields a superadmin session: the
+  only superadmin accounts are seeded local ones (IAM-USER-3, IAM-BOOT-5), a local
+  account cannot log in (IAM-LDAP-1), and sync never changes a role (IAM-SYNC-18). A
+  role change (IAM-USER-2) then needs a superadmin refresh token issued before the
+  switch or a superadmin API token, because neither refresh nor token exchange checks
+  the mode. \
+  Enforced in: `services/auth/app/services/auth_service.py` (`authenticate_user`, `rotate_refresh_token`); `services/auth/app/services/api_token_service.py` (`exchange_api_token`); `services/auth/app/routers/admin.py` (`update_user_role`) \
+  Pinned by: none
 
 **Out of scope.** The user interface has no activate or deactivate control and no API
 token page; those exist only through the API. Nothing deletes an account.
@@ -661,7 +669,7 @@ user can see (`inventory.md`) and which resources ACL grants open to them (secti
 - **IAM-GROUP-13.** A bulk add that repeats an id counts the repeat as skipped. An id
   with no account fails the whole request on the database's foreign key (an unhandled
   error, 500) and nothing is added; unlike single add (IAM-GROUP-6) there is no 404 for
-  it. \
+  it. Known gap, see #1009. \
   Enforced in: `services/auth/app/services/group_service.py` (`bulk_add_members`) \
   Pinned by: none
 - **IAM-GROUP-9.** Bulk remove takes at most 500 ids and answers `{removed, not_found}`;
@@ -706,7 +714,9 @@ group so the HERD group's membership follows the directory.
   Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_create_mapping_duplicate_dn_is_409`, `test_create_mapping_herd_group_already_mapped_is_409`); `services/auth/tests/test_routers_direct_ldap_admin.py` (`test_create_mapping_direct_duplicate_dn_precheck_409`, `test_create_mapping_direct_group_already_mapped_precheck_409`)
 - **IAM-MAP-3.** The DN is checked against the live directory: a directory that cannot
   be asked answers 503, and a DN the directory proves resolves nothing (no such entry,
-  or invalid DN syntax) answers 422. \
+  or invalid DN syntax) answers 422. The 503 detail is `Directory unavailable, mapping
+  not validated:` followed by the directory client's error text, which can include the
+  text of the underlying exception. Known gap, see #1009. \
   Enforced in: `services/auth/app/routers/ldap_sync.py` (`create_mapping`); `services/auth/app/services/ldap_service.py` (`fetch_group`, `_base_entry`) \
   Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_create_mapping_dangling_dn_is_422`, `test_create_mapping_directory_outage_is_503_not_422`); `services/auth/tests/test_ldap_service_live.py` (`test_fetch_group_nonexistent_dn_is_dangling_none`, `test_fetch_group_invalid_dn_syntax_is_proven_unresolvable`)
 - **IAM-MAP-4.** The stored DN is the canonical DN the directory returned, not the typed
@@ -879,12 +889,15 @@ turned off earlier once they reappear. A circuit breaker stops a mass deactivati
   provenance that are present are to be reactivated. \
   Enforced in: `services/auth/app/services/ldap_sync_service.py` (`_run_deactivation_sweep`) \
   Pinned by: `services/auth/tests/test_ldap_sync_service.py` (`test_sweep_provenance_gate`, `test_sweep_counters_and_detail_apply_to_run_row`)
-- **IAM-SWEEP-7.** The breaker trips only when the deactivation count is strictly
-  greater than `LDAP_SYNC_DEACTIVATION_MAX_PERCENT` percent of all candidates (inactive
-  ones included in the denominator) and strictly greater than
+- **IAM-SWEEP-7.** The breaker trips only when the deactivation count (active LDAP
+  accounts found not present) is strictly greater than
+  `LDAP_SYNC_DEACTIVATION_MAX_PERCENT` percent of every LDAP account, active or inactive
+  and whatever its role (the IAM-SWEEP-6 candidates), and strictly greater than
   `LDAP_SYNC_DEACTIVATION_MIN_COUNT`; a tripped breaker deactivates no one but still
-  applies the reactivations. By decision for the strict comparison and the exempt
-  reactivations; see ADR 0011, phase 4 amendment 1 and Reactivation. \
+  applies the reactivations. By decision: ADR 0011 (as amended 2026-08-12) makes the
+  sweep one pass over all LDAP users, so every candidate is swept and counts in the
+  denominator; phase 4 amendment 1 sets the strict comparison and Reactivation the
+  exempt reactivations. \
   Enforced in: `services/auth/app/services/ldap_sync_service.py` (`_run_deactivation_sweep`) \
   Pinned by: `services/auth/tests/test_ldap_sync_service.py` (`test_sweep_breaker_boundary_equal_min_count_applies`, `test_sweep_breaker_boundary_equal_percent_applies`, `test_sweep_breaker_both_terms_exceeded_aborts_but_still_reactivates`)
 - **IAM-SWEEP-8.** Flips are counted and recorded only after their single commit and
@@ -1329,13 +1342,11 @@ the integration suite, the frontend tests, and the browser suite were read, not 
 
 ## 13. Known limits and gaps
 
-Candidate defects found while writing this document are not listed under Open defects
-below: none has a GitHub issue yet, and this list accepts only numbered issues. They are
-reported to the maintainer for filing.
-
 ### Open defects
 
-None filed.
+- #1009 (IAM-GROUP-13, IAM-MAP-3): a bulk member add with an unknown user id fails the
+  whole request with an unhandled error (500), while a single add answers 404. The
+  mapping-create 503 detail carries the directory exception text.
 
 ### Limits by decision
 
@@ -1362,6 +1373,13 @@ None filed.
   `ldap_sync_loop.py` and ADR 0011 (Audit).
 - The superadmin can be activated by any admin, with no carve-out (IAM-ACCT-2).
   Recorded in the docstring of `deactivate_user` and [ROLES.md](../ROLES.md).
+- The deactivation breaker's denominator is every LDAP account, inactive ones included
+  (IAM-SWEEP-7). Recorded in ADR 0011 (as amended 2026-08-12: one pass over all LDAP
+  users).
+- Three documents disagree with the rules here, tracked as issue #1010: the handbook's
+  superadmin promotion (IAM-USER-3), the FEATURES.md statement that superadmin accounts
+  remain local (IAM-LDAP-1, IAM-USER-9), and the SECURITY.md statement that rotating the
+  secret invalidates every live session (IAM-JWT-1, IAM-SESSION-1).
 
 ### Rules with no test
 
@@ -1382,3 +1400,4 @@ None filed.
 - IAM-LOOP-6: sync-now never prunes.
 - IAM-BOOT-3: trimming of the seed values.
 - IAM-BOOT-5: the seed in LDAP mode.
+- IAM-USER-9: a superadmin session in LDAP mode only from an earlier refresh token or an API token.
