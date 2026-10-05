@@ -102,6 +102,19 @@ not finished.
     non-engineer can follow. Identifiers and code names come after.
 11. **Repository style applies.** No em-dashes, no arrows (write "to"), no
     box-drawing characters, no emojis. Tables use markdown table syntax.
+12. **File the defect before the document merges.** "Open defects" lists only filed
+    issues, and the drift guard rejects a placeholder in place of an issue number. A
+    writer reports candidate defects to the maintainer, who verifies and files them;
+    the entries and the "Known gap, see #NNN." notes are added before the merge.
+13. **Tables cite this document's rules only.** A table in sections 4 to 7 and 9 may
+    cite only rule ids defined in the same document, and "Rules with no test" may name
+    only this document's unpinned rules. Refer to another area's rule in prose, with
+    the document's name.
+14. **A partly pinned rule is two rules.** If a test covers one clause of a rule and
+    nothing covers another, split the rule so each half can say honestly what pins it.
+15. **A test title containing a backtick cannot be cited**, because the reference
+    format uses backticks as delimiters. Cite another test in the same file that
+    covers the rule, or mark the rule unpinned and name the file in the rule text.
 
 ## Keeping a specification current
 
