@@ -87,7 +87,10 @@ OPEN_DEFECTS, _, NO_TEST = GAP_LISTS
 _FENCE = re.compile(r"^```.*?^```", re.MULTILINE | re.DOTALL)
 _CODE_SPAN = re.compile(r"`([^`\n]+)`")
 _PATH_SHAPE = re.compile(r"^(?:" + "|".join(re.escape(d) for d in REPO_DIRS) + r")/[\w./-]*$")
-_REFERENCE_LINE = re.compile(r"^  (Enforced in|Pinned by): (.*)$")
+# A rule's text and its "Enforced in" line each end in a backslash, the markdown hard line
+# break, so the rule, its enforcement, and its tests render on three separate lines.
+_REFERENCE_LINE = re.compile(r"^  (Enforced in|Pinned by): (.*?)(?: \\)?$")
+_HARD_BREAK = " \\"
 _BULLETED_REFERENCE = re.compile(r"^\s*- (?:Enforced in|Pinned by):")
 # One group: a code span, one space, then parenthesized code spans each followed by an
 # optional ", ". Every repetition starts at a backtick and its body excludes backticks,
@@ -177,7 +180,16 @@ def check_links(text: str, doc_path: Path) -> list[str]:
 
 def check_references(text: str, repo_root: Path) -> list[str]:
     problems = []
+    previous = ""
     for line in _strip_fences(text).splitlines():
+        before, previous = previous, line
+        if line.startswith("  Enforced in: ") and not (
+            line.endswith(_HARD_BREAK) and before.endswith(_HARD_BREAK)
+        ):
+            problems.append(
+                "the rule text and its Enforced in line must each end with a backslash "
+                f"line break: {line.strip()}"
+            )
         if _BULLETED_REFERENCE.match(line):
             problems.append(f"reference line must not be a bullet: {line.strip()}")
             continue
@@ -354,8 +366,8 @@ def test_template_names_every_gap_list_and_citing_section():
 
 TEMPLATE = "# X\n\n## 1. Purpose\n\ntext\n\n## 2. Rules\n\ntext\n"
 GOOD_RULE = (
-    "- **XXX-A-1.** A rule.\n"
-    "  Enforced in: `services/svc/app.py` (`real_symbol`)\n"
+    "- **XXX-A-1.** A rule. \\\n"
+    "  Enforced in: `services/svc/app.py` (`real_symbol`) \\\n"
     "  Pinned by: `tests/test_svc.py` (`test_real`)\n"
 )
 
@@ -437,6 +449,18 @@ def test_checker_accepts_several_groups_on_one_line(fake_repo: Path):
         "(`real_symbol`)", "(`real_symbol`); `tests/test_svc.py` (`test_real`, `test_real`)"
     )
     assert _check(fake_repo, _spec(rules=rule)) == []
+
+
+def test_checker_flags_a_rule_without_hard_line_breaks(fake_repo: Path):
+    # Without the two backslashes GitHub renders the rule, its enforcement, and its tests
+    # as one run-on paragraph.
+    for rule in (
+        GOOD_RULE.replace("A rule. \\\n", "A rule.\n"),
+        GOOD_RULE.replace("(`real_symbol`) \\\n", "(`real_symbol`)\n"),
+    ):
+        assert rule != GOOD_RULE
+        problems = _check(fake_repo, _spec(rules=rule))
+        assert any("backslash line break" in p for p in problems), problems
 
 
 def test_checker_flags_the_retired_bulleted_reference_format(fake_repo: Path):

@@ -71,7 +71,9 @@ not finished.
 3. **Every rule names where it is enforced and what pins it, on one line each.**
    Directly under the rule, indented two spaces and with no bullet, write
    `` Enforced in: `path` (`symbol`, `symbol`); `path` (`symbol`) `` and
-   `` Pinned by: `path` (`test_name`) ``. A symbol is a function, class, or constant
+   `` Pinned by: `path` (`test_name`) ``. End the last line of the rule's text and the
+   "Enforced in" line with a space and a backslash (the markdown hard line break), so
+   the rule, its enforcement, and its tests render on three lines. A symbol is a function, class, or constant
    that appears in that file; a test name is the test function, or for a frontend test
    the exact test title. Do not use line numbers anywhere in a specification: they go
    stale on the next edit.
