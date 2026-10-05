@@ -67,7 +67,9 @@ _FENCE = re.compile(r"^```.*?^```", re.MULTILINE | re.DOTALL)
 _CODE_SPAN = re.compile(r"`([^`\n]+)`")
 _PATH_SHAPE = re.compile(r"^(?:" + "|".join(re.escape(d) for d in REPO_DIRS) + r")/[\w./-]*$")
 _REFERENCE_LINE = re.compile(r"^\s*- (Enforced in|Pinned by):\s*(.*)$")
-_REFERENCE_GROUP = re.compile(r"`([^`]+)`\s*\(((?:\s*`[^`]+`\s*,?)+)\)")
+# One code span, then further spans each introduced by exactly one comma, so no input
+# can be split two ways (a nested optional-whitespace form backtracks exponentially).
+_REFERENCE_GROUP = re.compile(r"`([^`]+)`\s*\(\s*(`[^`]+`(?:\s*,\s*`[^`]+`)*)\s*,?\s*\)")
 _RULE_START = re.compile(r"^- \*\*([A-Z][A-Z0-9]*-[A-Z][A-Z0-9]*-\d+)\.\*\*")
 _LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 _HEADING2 = re.compile(r"^## .+$", re.MULTILINE)
