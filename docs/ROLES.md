@@ -670,7 +670,7 @@ GET /api/inventory/templates
 Authorization: Bearer <any-authenticated-token>
 ```
 
-Supports query param `template_type` to filter by "device" or "port".
+Supports query param `template_type` to filter by "device", "port", or "dynamic".
 
 ### Get a template
 
@@ -774,7 +774,7 @@ file: <upload .zip or .tar.gz, max 10 MB>
 ```
 
 Returns HTTP 201. Driver names must be unique (409 on duplicate).
-`connection_type` values: "Management", "Layer 1 Switch", "Layer 2 Switch", "Layer 3 Switch".
+`connection_type` values: "Management", "Layer 1 Switch", "Layer 2 Switch", "Layer 3 Switch", "Hypervisor".
 
 ### Update driver metadata
 

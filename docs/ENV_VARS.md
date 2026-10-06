@@ -314,7 +314,7 @@ Driver packages are stored locally by default. To use MinIO (or any S3-compatibl
 | `MINIO_ENDPOINT` | (empty) | Set to enable MinIO; endpoint like `minio:9000`. |
 | `MINIO_ACCESS_KEY` | (empty) | Required when MinIO is configured. |
 | `MINIO_SECRET_KEY` | (empty) | Required when MinIO is configured. |
-| `MINIO_BUCKET` | `herd-drivers` | Bucket name. Must exist. |
+| `MINIO_BUCKET` | `herd-drivers` | Bucket name. Inventory creates the bucket at startup when it is missing. |
 | `MINIO_USE_SSL` | `false` | TLS for MinIO connection. |
 
 Inventory also hosts the apply-job scheduler that runs scheduled device-config apply jobs:
