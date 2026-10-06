@@ -38,7 +38,7 @@ restates the full permission matrix, an ADR's argument, or a how-to.
 | Reservations | [`reservations.md`](reservations.md) | Pilot; the worked example of the template |
 | Provisioning and wiring | [`provisioning-and-wiring.md`](provisioning-and-wiring.md) | Written |
 | Dynamic resources | [`dynamic-resources.md`](dynamic-resources.md) | Written |
-| AI features | `ai-features.md` | Not written |
+| AI features | [`ai-features.md`](ai-features.md) | Written |
 | Device configuration | `device-configuration.md` | Not written |
 | Operations and observability | `operations-and-observability.md` | Not written |
 | Integration | `integration.md` | Not written |
