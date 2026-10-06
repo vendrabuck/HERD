@@ -377,8 +377,16 @@ def _ledger_row(request_id: str) -> tuple[str, str] | None:
     return status, ref
 
 
+# Final execution_run statuses. A recipe step's row is created PENDING before
+# the sandbox call (RUNNING on the run_driver_action path) and gets its status
+# and `output` only when the call returns, so a row in any other status is
+# still in flight and its `output` is not written yet (issue #1014).
+_TERMINAL_RUN_STATUSES = frozenset({"SUCCESS", "FAILED", "TIMEOUT"})
+
+
 async def _poll_keyed_destroys(client, reservation_id: str, *, timeout: float = 60.0) -> list:
-    """Poll until a keyed destroy_instance run (method_kwargs instance_ref None) exists."""
+    """Poll until a keyed destroy_instance run (method_kwargs instance_ref None)
+    exists and every keyed run has finished, so each one's `output` is final."""
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         runs = await _runs(client, reservation_id, "destroy_instance")
@@ -387,7 +395,7 @@ async def _poll_keyed_destroys(client, reservation_id: str, *, timeout: float = 
             for r in runs
             if (r.get("input_params") or {}).get("method_kwargs") == {"instance_ref": None}
         ]
-        if keyed:
+        if keyed and all(r["status"] in _TERMINAL_RUN_STATUSES for r in keyed):
             return keyed
         await asyncio.sleep(1.0)
     return []
