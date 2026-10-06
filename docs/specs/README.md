@@ -36,7 +36,7 @@ restates the full permission matrix, an ADR's argument, or a how-to.
 | Inventory | `inventory.md` | Not written |
 | Topology | `topology.md` | Not written |
 | Reservations | [`reservations.md`](reservations.md) | Pilot; the worked example of the template |
-| Provisioning and wiring | `provisioning-and-wiring.md` | Not written |
+| Provisioning and wiring | [`provisioning-and-wiring.md`](provisioning-and-wiring.md) | Written |
 | Dynamic resources | `dynamic-resources.md` | Not written |
 | AI features | `ai-features.md` | Not written |
 | Device configuration | `device-configuration.md` | Not written |
