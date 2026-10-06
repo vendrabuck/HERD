@@ -17,8 +17,10 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Local authentication** (Shipped): username and password auth with bcrypt-hashed
   passwords and JWT issuance with refresh-token rotation.
 - **LDAP / Active Directory authentication** (Shipped): pluggable via `AUTH_METHOD=ldap`.
-  Users JIT-provision on first successful bind; superadmin accounts remain local
-  regardless of auth source.
+  Users JIT-provision on first successful bind. The seeded superadmin account stays
+  a local account, and a local account cannot log in while `AUTH_METHOD=ldap`; see
+  the LDAP section of [docs/ADMIN_HANDBOOK.md](docs/ADMIN_HANDBOOK.md) for how role
+  changes work in LDAP mode.
 - **Directory group sync** (Shipped): admin-managed mappings from directory
   groups to HERD groups, an on-demand or interval-scheduled fail-closed
   reconcile of membership (with pre-provisioning of new users), and an opt-in

@@ -1042,8 +1042,11 @@ POST /api/cabling/topologies
 Authorization: Bearer <token>   # any authenticated user may create
 Content-Type: application/json
 
-{ "name": "Lab Topology A", "data": { "nodes": [...], "edges": [...] } }
+{ "name": "Lab Topology A" }
 ```
+
+Create takes `name` only and stores no canvas (`canvas_data` is null); set the canvas
+with an update.
 
 ### Update a topology
 
@@ -1052,8 +1055,11 @@ PUT /api/cabling/topologies/{topology_id}
 Authorization: Bearer <token>   # creator or admin
 Content-Type: application/json
 
-{ "name": "Updated Topology", "data": { "nodes": [...], "edges": [...] } }
+{ "name": "Updated Topology", "canvas_data": { "nodes": [...], "edges": [...] }, "description": "..." }
 ```
+
+Every field is optional. The canvas field is `canvas_data`; an unknown field such as
+`data` is ignored.
 
 ### Delete a topology
 
