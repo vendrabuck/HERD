@@ -33,7 +33,7 @@ restates the full permission matrix, an ADR's argument, or a how-to.
 | Area | Specification | Status |
 |---|---|---|
 | Identity and access | [`identity-and-access.md`](identity-and-access.md) | Written |
-| Inventory | `inventory.md` | Not written |
+| Inventory | [`inventory.md`](inventory.md) | Written |
 | Topology | [`topology.md`](topology.md) | Written |
 | Reservations | [`reservations.md`](reservations.md) | Pilot; the worked example of the template |
 | Provisioning and wiring | [`provisioning-and-wiring.md`](provisioning-and-wiring.md) | Written |
