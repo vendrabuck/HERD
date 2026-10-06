@@ -468,8 +468,9 @@ async def _apply_configs(
     """Call /execution/execute per device with config; never raises.
 
     Per-device failures are captured as result entries. The /execute endpoint
-    is admin-only, so non-admins will see 403 entries rather than a blocked
-    commit. Config is optional, so devices without a config are marked
+    admits an admin, or a non-admin holding an ACL manage grant on the device
+    for the configure action; any other non-admin gets a 403 entry rather than
+    a blocked commit. Config is optional, so devices without a config are marked
     'skipped'.
     """
     url = f"{settings.execution_service_url.rstrip('/')}/execute"

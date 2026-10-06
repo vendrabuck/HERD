@@ -115,3 +115,12 @@ both tools. The `/api/ai/status` key-set pin stays green.
 
 Cross-reservation conversation memory (the issue's related idea), embeddings or a vector
 store, crawling or indexing web sources, and a UI for managing sources.
+
+## As built (2026-10-06)
+
+The web source section above says each prefix and candidate URL is normalized with its
+userinfo dropped. As built, `normalize_url` in
+`services/ai-orchestrator/app/services/docs_web.py` refuses a URL that carries userinfo
+(a user name or password) instead of normalizing it: such a configured prefix is skipped
+with the `docs_web_prefix_invalid` log line, and such a requested URL matches no prefix
+and is not fetched (issue #1041).

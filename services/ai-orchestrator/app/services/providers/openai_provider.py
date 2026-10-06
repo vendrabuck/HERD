@@ -264,8 +264,9 @@ def _safe_json_loads(raw: str | None, *, tool_name: str | None = None) -> dict[s
     model echoed back or hallucinated (e.g. a truncated {"password": "...").
     Only the SHAPE of the failure is logged: the argument string's length,
     the decoder's error position (JSONDecodeError only; other decode
-    failures have none), the exception class, and the tool name, which is
-    HERD-authored (the name of an advertised tool, never model text).
+    failures have none), the exception class, and the tool name. The tool
+    name is the function name from the provider response, logged before any
+    check against the advertised tools, so it is model output too.
     """
     if not raw:
         return {}

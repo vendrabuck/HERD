@@ -26,7 +26,7 @@ Only two services consume the AI environment variables: `ai-orchestrator` (the s
    AI_TLS_VERIFY=false
    ```
 
-   `AI_API_KEY` must be non-empty even for local servers that ignore auth (the AsyncOpenAI SDK rejects blank keys; HERD substitutes the literal `EMPTY` when this is blank for the `openai_compat` provider). `AI_MODEL` is the exact identifier the local server expects: for vLLM that is the HuggingFace path or the alias you launched the server with; for Ollama that is the model tag.
+   `AI_API_KEY` may be left blank for a local server that ignores auth: the AsyncOpenAI SDK rejects a blank key, so HERD substitutes the literal `EMPTY` when it is blank for the `openai_compat` provider. `AI_MODEL` is the exact identifier the local server expects: for vLLM that is the HuggingFace path or the alias you launched the server with; for Ollama that is the model tag.
 
 2. Recreate the two services that read the AI variables:
 

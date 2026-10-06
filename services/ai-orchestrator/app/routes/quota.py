@@ -1,7 +1,7 @@
 """GET /api/ai/quota: the caller's daily AI token budget for the current UTC day.
 
-A lightweight read endpoint so the frontend can show "X of Y tokens used today,
-resets at Z" near the AI entry points and surface the over-quota reason inline.
+A lightweight read endpoint meant for showing "X of Y tokens used today, resets
+at Z" near the AI entry points; no frontend code calls it yet.
 Unlike the billable AI routes, this is not gated on ai_is_configured() (budget
 state is meaningful regardless of provider configuration) and works even when
 the caller is already over quota, since it is a read, not a billable call. When

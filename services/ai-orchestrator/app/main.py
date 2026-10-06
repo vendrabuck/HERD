@@ -6,9 +6,10 @@ questions about active reservations by calling a configurable LLM provider.
 Two backends are supported via AI_PROVIDER: "anthropic" (the AsyncAnthropic
 SDK against Anthropic's API) and "openai_compat" (the AsyncOpenAI SDK
 against any compatible chat-completions endpoint, including vLLM, Ollama,
-LM Studio, OpenAI proper, and Azure OpenAI). All three AI endpoints
-(generate, suggest-identity, reservation-assistant) gate on ai_is_configured()
-and 503 when the provider is not configured. The AI is called with tool_use
+LM Studio, OpenAI proper, and Azure OpenAI). Seven AI routes (generate, the
+buffered and streaming reservation assistant, suggest-identity, recipe draft
+and refine, and the two purpose-classification routes) gate on
+ai_is_configured() and 503 when the provider is not configured. The AI is called with tool_use
 and a strict input_schema so the topology-generation response is structured
 JSON. Proposed roles are validated against the live inventory summary and
 resolved to concrete AVAILABLE devices using the caller's JWT so device

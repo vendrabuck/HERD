@@ -56,9 +56,10 @@ def default_resolver(host: str) -> list[str]:
 def normalize_url(raw: str) -> str | None:
     """Normalize an https URL for prefix matching, or None if it is not one.
 
-    Lowercases the scheme and host, drops userinfo, drops the default port,
-    drops the query and the fragment, and leaves the path exactly as written
-    (percent-encoding included) so matching stays a plain string compare.
+    Refuses (returns None for) a URL that carries userinfo. Lowercases the
+    scheme and host, drops the default port, drops the query and the fragment,
+    and leaves the path exactly as written (percent-encoding included) so
+    matching stays a plain string compare.
     """
     if not raw or not isinstance(raw, str):
         return None
