@@ -1539,7 +1539,7 @@ rules above describe the code; issue #1041 lists each disagreement.
 
 ### Rules with no test
 
-Issue #1040 tracks the tests for AI-RECIPE-3, AI-RECIPE-11, and AI-LOOP-7. A rule named
+Issue #1040 tracks the tests for every rule below that no open defect names. A rule named
 under Open defects gets its test with that defect's fix.
 
 - AI-PROV-20: the anthropic provider's `EMPTY` placeholder.
