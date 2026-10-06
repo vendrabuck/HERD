@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `DYN` (used in rule identifiers, for example `DYN-CREATE-1`) |
-| Verified at | commit `b505402f` (`v0.6.0-77-gb505402f`), 2026-10-06 |
+| Verified at | commit `9562b88e` (`v0.6.0-91-g9562b88e`), 2026-10-06; the execution, reservations, and inventory code is unchanged since `fd589e50` |
 | Owning services | execution (`services/execution/`: the `provision_requested` handler, the `dynamic_instances` ledger, teardown, the recipe result rules); the booking surfaces in `frontend/` |
 | Other services involved | reservations (the `reservation_dynamic_requests` rows, the `provision_requested` event, the provision-result callback, the timeout backstop), inventory (dynamic templates, the hypervisor registry, the internal device create and delete routes, recipe packages), secrets (the hypervisor credential), the Hypervisor recipe driver run in execution's sandbox |
 | Design records | [ADR 0004](../design/0004-dynamic-resources.md) |
@@ -16,9 +16,13 @@ RES-SWEEP-8, RES-STATUS-1). The shared event consumer (corroboration gate, heart
 NAK schedule, dead-letter queue) is specified in `provisioning-and-wiring.md` (rules
 WIRE-GATE-1 to WIRE-GATE-5, WIRE-CONSUME-6, WIRE-CONSUME-9 to WIRE-CONSUME-13,
 WIRE-DISPATCH-2, WIRE-DISPATCH-3). Dynamic templates and the hypervisor registry are in
-`inventory.md`; the driver sandbox, driver loading, and the package validator's dry run
-are in `device-configuration.md`. This document specifies only what is particular to
-dynamic instances.
+`inventory.md`, and so are the two inventory routes that materialize and delete an
+instance device, `POST /devices/internal` and `DELETE /devices/{device_id}/internal`
+(rules INV-DYN-1 to INV-DYN-9, INV-DEL-9, INV-INT-1, INV-STATUS-3); this document
+specifies only what execution sends them and how it treats each answer. The driver
+sandbox, driver loading, and the package validator's dry run are in
+`device-configuration.md`. This document specifies only what is particular to dynamic
+instances.
 
 ## 1. Purpose
 
@@ -38,9 +42,9 @@ section 8.
 | Actor | May | May not |
 |---|---|---|
 | User | Book any dynamic template on a new reservation, alone or with devices (DYN-REQ-6); see the booked requests on their reservation; plan instances as canvas placeholders | Change a reservation's dynamic requests after booking (DYN-REQ-3); create a template or register a hypervisor; see the instance's device unless a user group they belong to has permission on the "No Pool" device group (DYN-DEVICE-10) |
-| Admin | Everything a user may; author dynamic templates and register hypervisors (`inventory.md`) | Create a dynamic instance device through the admin device routes (DYN-DEVICE-7) |
+| Admin | Everything a user may; author dynamic templates and register hypervisors (`inventory.md`) | Create a dynamic instance device through the admin device routes (`inventory.md`, INV-DYN-8) |
 | Superadmin | Same as admin | Same as admin |
-| Another service (internal token) | Execution: create and delete instance devices in inventory (section 7), read templates, hypervisors, and secret values, post the provision result | Delete a non-dynamic device through the internal delete route (DYN-DEVICE-8) |
+| Another service (internal token) | Execution: create and delete instance devices in inventory (section 7), read templates, hypervisors, and secret values, post the provision result | Delete a non-dynamic device through the internal delete route (`inventory.md`, INV-DYN-7) |
 
 ## 3. Concepts and data
 
@@ -161,14 +165,13 @@ reads `reservation_id`, `user_id`, and `dynamic_requests[].id` and `.template_id
 
 ## 7. Internal API
 
-Two inventory routes exist only for this area; execution is their only caller. The
-reservations callback `POST /internal/{reservation_id}/provision-result` is specified in
-`reservations.md` (section 7).
-
-| Method | Path | Auth | Caller | Answers | Rules |
-|---|---|---|---|---|---|
-| POST | `/devices/internal` (inventory) | `X-Internal-Token` | execution, after a successful `create_instance` | 201 with the device, also when the request id already has one | DYN-DEVICE-1 to DYN-DEVICE-6, DYN-DEVICE-12 to DYN-DEVICE-16 |
-| DELETE | `/devices/{device_id}/internal` (inventory) | `X-Internal-Token` | execution, during teardown and compensation | 204 | DYN-DEVICE-1, DYN-DEVICE-8, DYN-DEVICE-12 |
+None of its own. Execution calls two inventory routes that exist only for this area,
+`POST /devices/internal` and `DELETE /devices/{device_id}/internal`; their behavior,
+answers, and errors are specified in `inventory.md` (section 7, rules INV-DYN-1 to
+INV-DYN-9). What execution sends them and how it treats each answer are DYN-CREATE-21
+to DYN-CREATE-23, DYN-DEVICE-9, DYN-DESTROY-6, DYN-DESTROY-11, DYN-DESTROY-12, and
+DYN-COMP-3. The reservations callback `POST /internal/{reservation_id}/provision-result`
+is specified in `reservations.md` (section 7).
 
 ## 8. Features
 
@@ -206,8 +209,9 @@ until the instances exist before it goes live.
   Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_dynamic_only_conflict_detection_unaffected`)
 - **DYN-REQ-6.** A booking with devices and dynamic requests takes its topology type from
-  the devices, and the instances attached on success are `CLOUD` devices (DYN-DEVICE-3),
-  so a booking of physical devices plus instances holds devices of both types. \
+  the devices, and the instances attached on success are `CLOUD` devices (`inventory.md`,
+  INV-STATUS-3), so a booking of physical devices plus instances holds devices of both
+  types. Known gap, see #1030. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `apply_provision_result`); `services/inventory/app/services/inventory_service.py` (`_insert_dynamic_device`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_dynamic_booking_stages_provision_requested_payload_exactly`); `services/inventory/tests/test_devices_internal.py` (`test_internal_create_generates_name`)
 - **DYN-REQ-7.** The template check at booking (RES-DYN-1) reads each distinct template
@@ -254,7 +258,8 @@ goes live.
 - **DYN-CREATE-3.** The reservation's status is checked once, before the event's first
   request; requests are then processed one at a time in payload order with no further
   status check, so a request that had no ledger row when the reservation's teardown read
-  its rows still creates its instance after the reservation ended. \
+  its rows still creates its instance after the reservation ended. Known gap, see
+  #1028. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_handle_provision_requested`) \
   Pinned by: none
 - **DYN-CREATE-4.** An event with no `reservation_id` is logged and acked with no work. \
@@ -317,7 +322,7 @@ goes live.
   Pinned by: none
 - **DYN-CREATE-17.** `login` and `logout` are judged by the sandbox's transport flag
   only: a `login` that returns `{"success": false}` without raising counts as a
-  successful login. \
+  successful login. Known gap, see #1027. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`, `_teardown_attempt`, `_destroy_orphaned_instance`); `services/execution/app/services/recipe_result.py` (`recipe_reported_success`) \
   Pinned by: none
 - **DYN-CREATE-18.** A `create_instance` that fails (DYN-RESULT-1) leaves the row
@@ -341,12 +346,13 @@ goes live.
 - **DYN-CREATE-21.** The instance is materialized through inventory
   `POST /devices/internal` with the body `template_id`, `reservation_id`, `field_data`
   (the create result's `field_data`, or an empty object), and `request_id`, and no
-  `name`. \
+  `name`, so inventory generates the name (`inventory.md`, INV-DYN-2). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_create_dynamic_device`, `_provision_one_instance`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_create_dynamic_device_maps_status_codes`, `test_provision_happy_path_records_runs_ledger_device_and_callback`)
 - **DYN-CREATE-22.** A 5xx or transport error from that call raises
-  `TransientUpstreamError` and a 201 returns the device; any other status returns
-  nothing. \
+  `TransientUpstreamError`; a 201 returns the device, whether inventory created it or
+  returned the one the request id already has (`inventory.md`, INV-DYN-4); any other
+  status, a 200 or a 409 included, returns nothing. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_create_dynamic_device`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_create_dynamic_device_maps_status_codes`, `test_create_dynamic_device_raises_on_transport_error`)
 - **DYN-CREATE-23.** When inventory refuses the device create, the handler raises
@@ -379,7 +385,7 @@ goes live.
   Pinned by: none
 - **DYN-CREATE-29.** The hypervisor's `enabled` flag is read by neither the booking nor
   the create: a template whose hypervisor is disabled is booked and its instances are
-  created like any other. \
+  created like any other. Known gap, see #1033. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_recipe_deps`); `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`) \
   Pinned by: none
 
@@ -415,7 +421,7 @@ the credentials leaking into the process environment or the run records.
 - **DYN-CTX-4.** Run records store the context with every secret key and every
   template field of type `password` replaced by `***REDACTED***`. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`, `_teardown_attempt`); `services/execution/app/services/execution_service.py` (`redact_context_for_logging`, `extract_password_keys`) \
-  Pinned by: none
+  Pinned by: none (issue #1032)
 - **DYN-CTX-5.** Teardown and the compensating destroy build the same context, so the
   keyed destroy receives `HERD_request_id`; teardown reads the template by the row's
   `template_id` and the hypervisor by the row's `hypervisor_id`. \
@@ -464,55 +470,26 @@ physical drivers' looser rule (`provisioning-and-wiring.md`).
 reservation can hold it and the rest of HERD can address it; the device is deleted when
 the instance is destroyed.
 
-**Surfaces.** Inventory `POST /devices/internal` and `DELETE /devices/{device_id}/internal`
-(section 7), in `services/inventory/app/routers/devices.py`.
+**Surfaces.** `_create_dynamic_device` and `_delete_dynamic_device` in
+`services/execution/app/services/nats_consumer.py`, calling inventory's
+`POST /devices/internal` and `DELETE /devices/{device_id}/internal` (section 7). What
+those routes do (the generated name, the `No Pool` group, `field_data` validation, the
+`RESERVED` status, their 422 and 409 answers, and the delete's refusal of a
+non-dynamic device) is specified in `inventory.md` (INV-DYN-1 to INV-DYN-9, INV-DEL-9,
+INV-STATUS-3); this section keeps execution's side and the consequences for the
+reservation, which is why its numbering starts at DYN-DEVICE-9.
 
 **Rules.**
 
-- **DYN-DEVICE-1.** Both internal routes require the internal token: a wrong token
-  answers 403. \
-  Enforced in: `services/inventory/app/routers/devices.py` (`create_dynamic_device_internal`, `delete_dynamic_device_internal`) \
-  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_bad_token_403`, `test_internal_delete_bad_token_403`)
-- **DYN-DEVICE-2.** The create refuses a template whose type is not `dynamic` with
-  422. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`) \
-  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_rejects_non_dynamic_template_422`)
-- **DYN-DEVICE-3.** The created device is `CLOUD` and `RESERVED`; without a `name` it
-  is named `<template name>-<first 8 characters of the reservation id>-<n>`, with `n`
-  counting up from 1 past taken names. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`, `_insert_dynamic_device`, `_MAX_NAME_ATTEMPTS`) \
-  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_generates_name`, `test_internal_create_name_collision_disambiguates`)
-- **DYN-DEVICE-4.** `field_data` may carry keys the template does not define, and
-  template defaults fill missing fields. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`validate_field_data`, `create_dynamic_instance_device`) \
-  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_allows_unknown_field_data`, `test_internal_create_generates_name`)
-- **DYN-DEVICE-5.** A create carrying a `request_id` that already has a device returns
-  that device with 201 and creates nothing; distinct request ids create distinct
-  devices, and without a `request_id` every call creates a device. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`) \
-  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_same_request_id_returns_same_device`, `test_internal_create_different_request_ids_create_different_devices`, `test_internal_create_name_collision_retry_with_request_id_set`, `test_internal_create_omitted_request_id_always_creates`)
-- **DYN-DEVICE-6.** An explicit `name` is used as given and a taken name answers 409,
-  unless the `request_id` already owns that device. Execution never sends a name. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`) \
-  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_explicit_name`, `test_internal_create_explicit_name_same_request_id_returns_existing`, `test_internal_create_explicit_name_collision_new_request_id_409`)
-- **DYN-DEVICE-7.** The admin device-create route refuses a dynamic template with 422,
-  so an instance device can only come from the internal route. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_device`) \
-  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_admin_create_device_rejects_dynamic_template_422`)
-- **DYN-DEVICE-8.** The internal delete answers 204 for an instance device, 404 for an
-  absent device, and 409 for a device whose template is not `dynamic`; it checks no
-  reservation, by decision (the docstring of `delete_dynamic_device_internal`: the
-  reservation driving the delete would always appear as the blocker). \
-  Enforced in: `services/inventory/app/routers/devices.py` (`delete_dynamic_device_internal`); `services/inventory/app/services/inventory_service.py` (`delete_dynamic_instance_device`) \
-  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_delete_204`, `test_internal_delete_absent_404`, `test_internal_delete_non_dynamic_409`)
-- **DYN-DEVICE-9.** Execution treats a delete answer of 204 or 404 as done, raises
-  `TransientUpstreamError` on a 5xx or transport error, and treats any other answer as
-  not deleted. \
+- **DYN-DEVICE-9.** Execution treats a delete answer of 204 or 404 as done (404 meaning
+  already gone), raises `TransientUpstreamError` on a 5xx or transport error, and treats
+  any other answer, a 409 included, as not deleted. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_delete_dynamic_device`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_delete_dynamic_device_maps_status_codes`, `test_delete_dynamic_device_raises_on_transport_error`)
 - **DYN-DEVICE-10.** The instance device joins the "No Pool" device group like every
-  new device, so a non-admin sees it, and may name it in a reservation edit
-  (RES-PATCH-7), only when one of their user groups has permission on that group. \
+  new device (`inventory.md`, INV-DYN-6), so a non-admin owner sees it, and may name it
+  in a reservation edit (RES-PATCH-7), only when one of their user groups has permission
+  on that group. Known gap, see #1030. \
   Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`); `services/inventory/app/services/device_group_service.py` (`add_device_to_no_pool`, `get_visible_device_ids`); `services/reservations/app/routers/reservations.py` (`update_reservation_by_id`) \
   Pinned by: none
 - **DYN-DEVICE-11.** Reservations treats an instance device like any exclusive device
@@ -522,25 +499,6 @@ the instance is destroyed.
   row live. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_release_exclusive_devices_best_effort`); `services/execution/app/services/nats_consumer.py` (`_teardown_attempt`) \
   Pinned by: none
-- **DYN-DEVICE-12.** Either internal route called without the token header answers 422. \
-  Enforced in: `services/inventory/app/routers/devices.py` (`create_dynamic_device_internal`, `delete_dynamic_device_internal`) \
-  Pinned by: none
-- **DYN-DEVICE-13.** The create refuses an unknown template with 422. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`) \
-  Pinned by: none
-- **DYN-DEVICE-14.** A required template field still empty after the defaults refuses
-  the create with 422. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`validate_field_data`) \
-  Pinned by: none
-- **DYN-DEVICE-15.** A create without a name gives up with 409 after 10000 taken
-  generated names. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`, `_MAX_NAME_ATTEMPTS`) \
-  Pinned by: none
-- **DYN-DEVICE-16.** A concurrent create that loses the insert on its `request_id`
-  returns the winner's device. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`, `_insert_dynamic_device`) \
-  Pinned by: none
-
 **Out of scope.** The admin device routes, device groups, and visibility
 (`inventory.md`, `identity-and-access.md`).
 
@@ -567,7 +525,8 @@ instance or device is left behind without a ledger row.
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_teardown_between_instance_ref_and_active_flip_leaves_no_orphan`)
 - **DYN-COMP-3.** In that branch the device delete's answer is not checked: an answer
   other than 204 or 404 still continues to the destroy and the abandon, and a 5xx or
-  transport error raises before the destroy, so the event is nacked. \
+  transport error raises before the destroy, so the event is nacked. Known gap, see
+  #1028. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`) \
   Pinned by: none
 - **DYN-COMP-4.** A create that failed or returned no ref re-reads its row; when
@@ -644,7 +603,7 @@ guidance: [TROUBLESHOOTING.md](../TROUBLESHOOTING.md).
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_teardown_driver_failure_leaves_active_and_acks`, `test_keyed_destroy_that_cannot_run_leaves_row_creating`, `test_keyed_destroy_login_failure_leaves_row_creating`, `test_legacy_recipe_keyed_destroy_raises_row_stays_creating`); `tests/integration/test_dynamic_resources.py` (`test_failed_keyed_destroy_leaves_ledger_row_creating`)
 - **DYN-DESTROY-8.** A recipe package download failure during teardown is handled as in
   DYN-DESTROY-7 (row left live, event acked), unlike the create path, which retries it
-  (DYN-CREATE-13). \
+  (DYN-CREATE-13). Known gap, see #1029. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_attempt`) \
   Pinned by: none
 - **DYN-DESTROY-9.** A row without a ref left live logs
@@ -659,7 +618,7 @@ guidance: [TROUBLESHOOTING.md](../TROUBLESHOOTING.md).
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_attempt`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_by_ref_destroy_failure_does_not_emit_the_keyed_action`)
 - **DYN-DESTROY-11.** A device delete that fails after a successful destroy logs a plain
-  error with no fixed log action, for a row without a ref too. \
+  error with no fixed log action, for a row without a ref too. Known gap, see #1027. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_attempt`) \
   Pinned by: none
 - **DYN-DESTROY-12.** A 5xx or transport error deleting the device after a successful
@@ -778,9 +737,9 @@ reference recipe `drivers/mock_hypervisor/`.
   Pinned by: `tests/unit/test_mock_hypervisor_driver.py` (`test_fail_injection_returns_unsuccessful_result`, `test_raise_injection_raises`, `test_sleep_injection_delays_each_call`, `test_keyed_destroy_honors_dry_run_and_fail_injection`)
 - **DYN-CONTRACT-7.** Because of DYN-CREATE-17, naming `login` in
   `HERD_mock_fail_actions` does not fail a create or a teardown; only
-  `HERD_mock_raise_actions` makes `login` fail there. \
+  `HERD_mock_raise_actions` makes `login` fail there. Known gap, see #1027. \
   Enforced in: `drivers/mock_hypervisor/driver.py` (`_maybe_inject`); `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`) \
-  Pinned by: none
+  Pinned by: none (issue #1032)
 - **DYN-CONTRACT-8.** The reference recipe declares `supports_dry_run`, flags every
   result `simulated` under dry run, and its `status` never raises. \
   Enforced in: `drivers/mock_hypervisor/driver.py` (`_flag_simulated`, `status`); `drivers/mock_hypervisor/driver_metadata.json` (`supports_dry_run`) \
@@ -903,22 +862,11 @@ Admins author dynamic templates in the template editor.
 
 ## 9. Errors
 
-FastAPI validation errors (422) carry `detail` as a list of `{loc, msg, type}`; every
-other error carries `detail` as a string. The booking errors for dynamic requests (an
-unknown or non-dynamic template, inventory unreachable, more than 50 requests) are in
-`reservations.md`, section 9.
-
-| Status | Error key or detail | When | Rule |
-|---|---|---|---|
-| 403 | `Invalid internal token` | either internal instance-device route with a wrong token | DYN-DEVICE-1 |
-| 404 | `Device not found` | internal delete of an absent device (execution counts it as already gone) | DYN-DEVICE-8, DYN-DEVICE-9 |
-| 409 | `Device is not a dynamic instance` | internal delete of a device whose template is not `dynamic` | DYN-DEVICE-8 |
-| 409 | `Device with name '<name>' already exists` | internal create with a taken explicit name and a different request id | DYN-DEVICE-6 |
-| 409 | `Could not generate a unique device name for prefix '<prefix>'` | 10000 generated names taken | DYN-DEVICE-15 |
-| 422 | `Template not found` or `Template is not a dynamic template` | internal create with an unknown or non-dynamic template | DYN-DEVICE-2, DYN-DEVICE-13 |
-| 422 | `Required field missing: <key>` or another field validation detail | internal create whose `field_data` fails the template | DYN-DEVICE-14 |
-| 422 | `Template is not a device template` | admin device create with a dynamic template | DYN-DEVICE-7 |
-| 422 | validation list | either internal route without the token header | DYN-DEVICE-12 |
+None of its own over HTTP. The internal device routes' errors are in `inventory.md`
+(section 9), and how execution treats each answer is DYN-CREATE-22, DYN-CREATE-23, and
+DYN-DEVICE-9. The booking errors for dynamic requests (an unknown or non-dynamic
+template, inventory unreachable, more than 50 requests) are in `reservations.md`,
+section 9.
 
 Event outcomes. Execution answers no caller for an event; the outcome is the
 acknowledgement and the log action.
@@ -974,9 +922,8 @@ Browser refusals (toasts and inline alerts, no request sent):
 Fixed in code, not configurable: five deliveries before a dead letter; three teardown
 passes per row (`DYNAMIC_TEARDOWN_MAX_ATTEMPTS`); three success-callback attempts with a
 0.5 s first delay doubling to a 10 s cap, and one failure-callback attempt; 10 s
-timeouts for reads, deletes, and callbacks and 30 s for the device create; 10000
-generated device names per prefix; at most 50 requests per booking (RES-DYN-2) and per
-browser row.
+timeouts for reads, deletes, and callbacks and 30 s for the device create; at most 50
+requests per booking (RES-DYN-2) and per browser row.
 
 ## 12. Test coverage map
 
@@ -994,12 +941,38 @@ only `tests/unit/` was run.
 
 ## 13. Known limits and gaps
 
-Candidate defects found while writing this document were reported to the maintainer
-and are not filed yet; the rules state today's behavior without a "Known gap" note.
+Four documents disagree with the code this specification describes, tracked as
+documentation in #1031: `docs/ARCHITECTURE.md` (Topology separation) says physical and
+cloud devices are never mixed in one reservation (DYN-REQ-6); ADR 0004 describes port
+sub-templates, request parameters in `field_data`, a redelivery guard through
+`action_already_succeeded`, and a redaction test, none of which exists;
+[DRIVERS.md](../DRIVERS.md) gives `login` and `logout` a `success` result the flows do
+not read (DYN-CREATE-17); and the replay remedy in
+[TROUBLESHOOTING.md](../TROUBLESHOOTING.md) has no caveat that the instance device is
+`AVAILABLE` after release (DYN-DEVICE-11) and may have been booked again, while the
+internal delete checks no reservation by decision (`inventory.md`, INV-DEL-9).
 
 ### Open defects
 
-None.
+- #1027 (DYN-CREATE-17, DYN-CONTRACT-7, DYN-DESTROY-11): the create, teardown, and
+  compensation flows judge a recipe `login` by the sandbox transport flag only, so a
+  login that returns `{"success": false}` is followed by `create_instance` or
+  `destroy_instance`; a device delete that fails after a successful destroy is logged
+  with a plain error and no fixed log action.
+- #1028 (DYN-CREATE-3, DYN-COMP-3): the status is checked once per event and then every
+  request is created, so with several execution replicas a create can land after
+  teardown listed the rows; the lost-`ACTIVE`-flip compensation discards the device
+  delete's answer (a 5xx is raised before the compensating destroy, a 409 is logged as
+  clean).
+- #1029 (DYN-DESTROY-8): teardown catches every recipe load failure, a transient
+  download failure included, and leaves the row live with the event acked, while the
+  create path nacks the same error. Sibling of #1002.
+- #1030 (DYN-REQ-6, DYN-DEVICE-10): mixed bookings are intended, and the `ACTIVE`
+  device-set edit applies the type uniformity check to the whole set, so a mixed
+  reservation cannot change its device set; the instance device joins No Pool, so a
+  non-admin owner whose groups have no permission on No Pool cannot see it or keep it
+  in a device-list edit.
+- #1033 (DYN-CREATE-29): the hypervisor `enabled` flag is written but never read.
 
 ### Limits by decision
 
@@ -1022,21 +995,23 @@ None.
   `docs/TROUBLESHOOTING.md`.
 - A dead-lettered `provision_requested` destroys nothing itself (DYN-DLQ-4). Recorded in
   the docstring of `_maybe_post_provision_failure`.
-- The internal device delete checks no reservation (DYN-DEVICE-8). Recorded in the
-  docstring of `delete_dynamic_device_internal`.
 - Placeholders are never saved with a topology (DYN-UI-13). Recorded in issue #472 and
   the comment in `handleSave` of `frontend/src/pages/TopologyEditorPage.tsx`.
 - A teardown failure on a row with a ref has no fixed log action (DYN-DESTROY-10).
   Recorded in the docstring of
   `test_by_ref_destroy_failure_does_not_emit_the_keyed_action`.
-- Only the reservation's status is corroborated; the `dynamic_requests` in a
-  `provision_requested` payload are not checked against reservations' rows.
-  Recorded in `provisioning-and-wiring.md` (WIRE-GATE-5) and the comment above
-  `_EVENT_CORROBORATION_RULES`.
+- A `provision_requested` event for a reservation that is `PENDING_PROVISION` passes
+  the corroboration check on its status alone, and the `dynamic_requests` it carries
+  are not compared with reservations' rows (DYN-CREATE-1). Recorded in
+  `provisioning-and-wiring.md` (WIRE-GATE-5), the comment above
+  `_EVENT_CORROBORATION_RULES`, and [SECURITY.md](../../SECURITY.md).
 - Hypervisor capacity, quotas, and scheduling across hypervisors are not handled.
   Recorded in ADR 0004 (Out of scope).
 
 ### Rules with no test
+
+Issue #1032 tracks the tests for DYN-CTX-4 and DYN-CONTRACT-7, and the integration
+redelivery test that proves the corroboration gate rather than the ledger (section 12).
 
 - DYN-REQ-3: dynamic requests cannot change after booking.
 - DYN-REQ-7: the booking-time template check has no visibility or ACL component.
@@ -1054,11 +1029,6 @@ None.
 - DYN-RESULT-4: run status `SUCCESS` on a recipe-reported failure.
 - DYN-DEVICE-10: the instance device's visibility to its owner.
 - DYN-DEVICE-11: the instance device `AVAILABLE` between release and delete.
-- DYN-DEVICE-12: the missing token header.
-- DYN-DEVICE-13: an unknown template on the internal create.
-- DYN-DEVICE-14: a required field left empty on the internal create.
-- DYN-DEVICE-15: the generated-name limit.
-- DYN-DEVICE-16: a lost concurrent create on the same request id.
 - DYN-COMP-3: the unchecked device delete in the `ACTIVE`-flip compensation.
 - DYN-COMP-7: a failed `login` in the compensating destroy.
 - DYN-DESTROY-8: a package download failure during teardown.
