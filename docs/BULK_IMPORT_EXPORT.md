@@ -82,9 +82,15 @@ Every import returns a `BulkImportReport`:
   processed. Import is per-row transactional: a rejected row is rolled back and
   leaves no partial write.
 
-With `dry_run=true`, full parsing, validation, and reference resolution run and
-the same report is returned, but nothing is written. Run a dry run first to
-preview a migration.
+With `dry_run=true`, nothing is written and the same report shape is returned.
+For the device and template importers, a dry run performs the schema checks and
+name resolution only; the checks owned by the create and update service
+functions (template kind and hardware identity, `field_data` validation, the template type versus
+driver connection type rule, commit-time unique names) run only on a committing
+import, so a committing import can reject a row the dry run reported as `create`
+or `update`. Whether the dry run should run those checks too is pending under
+issue #1017. Run a dry run first to preview a migration, and read the committing
+import's report as the final answer.
 
 ## File schemas
 

@@ -31,7 +31,7 @@ The frontend chat UI is gated behind `VITE_AI_CHAT_ENABLED` (build-time flag, de
 The opening seed sent to the model is intentionally narrow:
 
 - **Reservation**: id, status, start_time, end_time, topology_id, topology_type, purpose, owner_name
-- **Per device (one line each)**: id, name, template_name, status
+- **Per device (one line each)**: id, name, template_name, template_vendor, template_model, status
 
 For everything else, the model calls one of seven read-only tools, plus the two documentation tools when a documentation source is enabled. Each tool's HTTP call carries your JWT, so existing RBAC and device visibility apply exactly as if you made the call yourself.
 
@@ -84,8 +84,9 @@ so the tool cannot be used to probe the filesystem.
 
 Web fetching, when an operator turns it on, is bounded on every axis:
 
-- the URL must be `https`, and its normalized form (lowercase host, no
-  userinfo, no query) must match one of the configured prefixes as a plain
+- the URL must be `https` with no userinfo (a URL carrying a user name or
+  password is refused, not normalized), and its normalized form (lowercase
+  host, no query) must match one of the configured prefixes as a plain
   string prefix, so end each prefix with `/`;
 - the host is resolved and EVERY address must be public. Loopback, private,
   link-local (where cloud metadata services live), multicast, unspecified,
@@ -211,16 +212,16 @@ The conversation is persisted after the stream completes, so a `conversation_id`
 | Per-hop HTTP timeout | 15 seconds | (hardcoded) |
 | Inventory fetch concurrency | 8 parallel device fetches | (hardcoded) |
 | Conversation idle TTL | 24 hours | `ASSISTANT_CONVERSATION_TTL_HOURS` |
-| Hard turn cap per conversation | 40 (user + assistant + tool messages combined; seed pinned) | `ASSISTANT_MAX_TURNS` |
+| Hard turn cap per conversation | 40 (user + assistant + tool messages combined; the position-0 seed counts toward the cap but is never evicted) | `ASSISTANT_MAX_TURNS` |
 | History token budget per conversation | 60,000 input tokens (chars/4 estimate) | `ASSISTANT_HISTORY_TOKEN_BUDGET` |
 | Per-user daily token quota | disabled (0) | `AI_DAILY_TOKEN_QUOTA` |
 | Sweeper interval | 3600 seconds | `ASSISTANT_SWEEPER_INTERVAL_SECONDS` |
 
-When the iteration cap is hit, the orchestrator makes one final call with `tool_choice={"type": "none"}` and a nudge ("you have exhausted your tool budget; answer with what you know"), and returns the resulting text as a normal 200 response. The user always gets an answer, even if a degraded one.
+When the iteration cap is hit, the orchestrator makes one final call with no tools advertised (`tools=None` with an auto tool choice), the base assistant system prompt (the documentation and write-tool sections are dropped), and a nudge ("you have exhausted your tool budget; answer with what you know"), and returns the resulting text as a normal 200 response. If that final call returns no text, the turn fails with an `AIError` and answers 502, or, when a write tool already produced a side effect in the turn, the 200 `incomplete` response described under [Endpoint](#endpoint).
 
 When either the turn cap or the token budget is exceeded, the repository evicts the oldest user+assistant pair (and any tool-result echo between them) until both bounds are satisfied. The position-0 seed message is pinned and never evicted; without it the model loses its grounding.
 
-The per-conversation budget above is separate from the optional per-user daily quota. `AI_DAILY_TOKEN_QUOTA` (default 0, disabled) caps the input + output tokens one user can spend per UTC day across all AI features (generation, the assistant, and template-identity suggestions). When the running daily total reaches the cap, the next billable call is rejected with HTTP 429 and a `{limit, used, remaining, reset_at}` body before the provider is called; the total resets on the UTC day boundary. `GET /api/ai/quota` returns the caller's current usage. See [ENV_VARS.md](ENV_VARS.md) for the full description.
+The per-conversation budget above is separate from the optional per-user daily quota. `AI_DAILY_TOKEN_QUOTA` (default 0, disabled) caps the input + output tokens one user can spend per UTC day across all AI features (topology generation, the assistant on both transports, template-identity suggestions, recipe drafting and refining, and both purpose-classification routes). When the running daily total reaches the cap, the next billable call is rejected with HTTP 429 and a `{limit, used, remaining, reset_at}` body before the provider is called; the total resets on the UTC day boundary. `GET /api/ai/quota` returns the caller's current usage. See [ENV_VARS.md](ENV_VARS.md) for the full description.
 
 ## Future iterations
 

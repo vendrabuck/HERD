@@ -168,8 +168,8 @@ helper in `services/execution/app/services/execution_service.py` (a present
 `success` key that is falsy means failure; an absent key stays success, see
 the "Return values" section for each connection type). The one deliberate
 exception is the Hypervisor recipe pair `create_instance`/`destroy_instance`,
-judged by `_recipe_reported_success` in
-`services/execution/app/services/nats_consumer.py`: those require a POSITIVE
+judged by `recipe_reported_success` in
+`services/execution/app/services/recipe_result.py`: those require a POSITIVE
 `{"success": True}`, so a missing key is a failure there, because a dynamic
 instance that cannot be proven created must not be recorded in the ledger as
 if it were. A driver that returns
@@ -1300,8 +1300,9 @@ class Driver:
             is REQUIRED on success: a success with a missing or empty
             instance_ref is treated as a failed create.
             field_data carries instance attributes (management address, etc.)
-            that become the materialized device's field_data, merged with the
-            request's own parameters.
+            that become the materialized device's field_data; inventory fills
+            any missing template field from the template's default. A dynamic
+            request carries no parameters of its own, only the template.
         """
         ...
 
@@ -1416,6 +1417,10 @@ waiting on a remote hypervisor API is wall-clock time, not CPU time.
 | create_instance | `{"success": bool, "instance_ref": str, "field_data": dict}`; `success` must be present and true (a missing key is a failure here, unlike the physical contracts), and `instance_ref` must be a non-empty string, else the create counts as failed |
 | destroy_instance | `{"success": bool}`; `success` must be present and true, as for create; with `instance_ref=None`, success means the request-id-named instance was destroyed or does not exist |
 | status | `{"reachable": bool}` |
+
+The dynamic flows stop when a `login` call itself fails to run (the driver raises or its
+process fails), but they do not yet act on a login's returned `success` value (see issue
+#1027).
 
 `drivers/mock_hypervisor/` is the checked-in reference for this contract: a
 hardware-free recipe that honors dry-run on every method, keys create-side

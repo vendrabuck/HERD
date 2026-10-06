@@ -2,11 +2,12 @@
 
 Returns one entry per (user_id, usage_date) over an inclusive UTC date range,
 carrying both the quota-bearing input/output counts and the observability-only
-prompt-cache counters. This backs the AI usage panel on the admin reporting
-page (issue #64). It is a read over the ai_orchestrator schema only and, like
-the other admin reporting endpoints, requires the admin or superadmin role; it
-is not gated on ai_is_configured() since historical usage is meaningful
-regardless of current provider configuration.
+prompt-cache counters. It was added for an AI usage panel on the admin
+reporting page (issue #64); no frontend code calls it yet. It is a read over
+the ai_orchestrator schema only and, like the other admin reporting
+endpoints, requires the admin or superadmin role; it is not gated on
+ai_is_configured() since historical usage is meaningful regardless of current
+provider configuration.
 
 Both query params are optional UTC dates (YYYY-MM-DD). When omitted, end
 defaults to today and start to 30 days before end. The range is inclusive on

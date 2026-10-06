@@ -17,8 +17,10 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Local authentication** (Shipped): username and password auth with bcrypt-hashed
   passwords and JWT issuance with refresh-token rotation.
 - **LDAP / Active Directory authentication** (Shipped): pluggable via `AUTH_METHOD=ldap`.
-  Users JIT-provision on first successful bind; superadmin accounts remain local
-  regardless of auth source.
+  Users JIT-provision on first successful bind. The seeded superadmin account stays
+  a local account, and a local account cannot log in while `AUTH_METHOD=ldap`; see
+  the LDAP section of [docs/ADMIN_HANDBOOK.md](docs/ADMIN_HANDBOOK.md) for how role
+  changes work in LDAP mode.
 - **Directory group sync** (Shipped): admin-managed mappings from directory
   groups to HERD groups, an on-demand or interval-scheduled fail-closed
   reconcile of membership (with pre-provisioning of new users), and an opt-in
@@ -293,9 +295,12 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   cabling graph can actually connect (a deterministic backtracking search over
   candidate devices, feasibility checked through cabling's batch pathfinder),
   re-prompting the model with the unwireable template pairs before failing
-  with a structured 422 `topology_unconnectable` (issue #828). Accept
-  transactionally creates the topology and books the reservation, with
-  optional per-device config push; committing also re-validates the saved
+  with a structured 422 `topology_unconnectable` (issue #828). Committing an
+  accepted proposal creates the topology and then books the reservation, with
+  optional per-device config push. The commit is not transactional across
+  services: when a step after the topology create fails, the committer deletes
+  the topology it created (see the rollback section of
+  [docs/AI_GENERATE.md](docs/AI_GENERATE.md)); committing also re-validates the saved
   canvas against cabling before the reservation is created, failing with a
   structured 422 `topology_unwireable` (or a 503 on a cabling outage) rather
   than only surfacing an unwired edge later (issue #827). Feature-gated by the
@@ -317,8 +322,9 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   confirms before any real apply runs. ACL widening lets reservation owners
   manage their own reserved devices for the duration of the window. Drivers
   must opt into dry-run via a `driver_metadata.json` declaring
-  `supports_dry_run: true`; the inventory schedule endpoint, AI tool, and
-  execution sandbox all refuse dry-runs against drivers that did not opt in.
+  `supports_dry_run: true`; the inventory schedule endpoint and the execution
+  sandbox refuse dry-runs against drivers that did not opt in, and the AI
+  schedule tool, which always requests a dry run, relays inventory's refusal.
 - **Assistant documentation lookup** (Shipped): the reservation assistant can
   search and read reference material instead of answering HERD and vendor
   questions from training data. The published HERD manual ships in the image as

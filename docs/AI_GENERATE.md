@@ -9,7 +9,7 @@ HERD can propose a lab topology from a natural-language prompt by calling the co
 ## Prerequisites
 
 - Your admin must have configured an AI provider. For `AI_PROVIDER=anthropic` that means `AI_API_KEY` is set; for `AI_PROVIDER=openai_compat` that means `AI_BASE_URL` points at a running endpoint. The frontend checks `GET /api/ai/status` on load; when the provider is unconfigured that endpoint reports `{"enabled": false}`, the **Use AI** button is hidden, and `/api/ai/generate` returns 503.
-- You need device visibility: the AI can only propose devices your account can see. If your user group has no device group access, the AI will return "no templates available" and refuse.
+- You need device visibility: the AI can only propose devices your account can see. If no visible template has an available device (for example, your user group has no device group access), `/api/ai/generate` answers 409 "No device templates with available devices in inventory. ..." before any provider call.
 
 ## The flow, step by step
 
@@ -21,8 +21,8 @@ HERD can propose a lab topology from a natural-language prompt by calling the co
 5. Submit. The orchestrator calls the LLM with the current inventory, validates the response, and resolves device ids. You'll see a loading state for a few seconds.
 6. The canvas renders the proposal as **ghost nodes** (dashed border, reduced opacity, "PROPOSED" badge). A floating **AI Proposal Bar** appears above the canvas showing the proposal's purpose, device count, edge count, and notes.
 7. Pick an action from the proposal bar:
-   - **Accept**: commits the ghosts as real nodes and opens the commit dialog for reservation creation.
-   - **Modify**: commits the ghosts as real nodes and dismisses the bar so you can freely edit before saving or committing.
+   - **Accept**: opens the commit dialog for topology and reservation creation. On a successful commit the ghosts are removed and the editor navigates to the new topology; closing the dialog without committing leaves the proposal on the canvas.
+   - **Modify**: keeps the ghosts as real nodes and dismisses the bar so you can freely edit before saving or committing.
    - **Reject**: removes the ghosts and clears the bar; nothing is saved.
 
 ## What the LLM proposes
@@ -31,7 +31,7 @@ The orchestrator constrains the LLM's output via a tool schema built per request
 
 - `role` (unique within the proposal; e.g. `fw-a`, `fw-b`, `core-sw-1`)
 - `template_name` (must match a real template in your inventory exactly; no invented names)
-- `topology_type` (`PHYSICAL` or `CLOUD`, uniform across a single proposal)
+- `topology_type` (`PHYSICAL` or `CLOUD`; generation does not check that a proposal's devices share one type, see issue #1038)
 - `config` (optional; see [Device configs](#device-configs-the-allowlist))
 
 Edges reference roles by name and carry a `layer` (`L1`, `L2`, or `L3`).
@@ -99,7 +99,7 @@ The LLM is allowed to include an optional `config` object per device, meant to b
 | `hostname` | string | Device hostname |
 | `description` | string | Free-text description |
 
-Config schemas exist for the `Management`, `Layer 2 Switch`, and `Layer 3 Switch` connection types (the table above shows the Management keys; L2 carries a `vlan_assignments` shape and L3 carries `interfaces`, `virtual_routers`, and `routes`). Layer 1 switches have no schema, so `config` on those devices is rejected at validation. Note that the required L3 method set does not include `configure` (it is `configure_route`/`remove_route`), so a post-commit apply against an L3 driver works only when the driver also implements `configure` as an optional extra (the checked-in `drivers/mock_l3` is the worked example). Separately, the `routes` array of an L3 device's latest config version is consumed automatically at reservation provisioning time: the execution service installs those routes via `configure_route` when a reservation starts and removes the pinned set on cancel or completion (see the Layer 3 section of [DRIVERS.md](DRIVERS.md)). (Automatic VLAN provisioning for L2 switches also happens via the NATS event flow on reservation creation; both paths are separate from the AI config allowlist.)
+Config schemas exist for the `Management`, `Layer 2 Switch`, and `Layer 3 Switch` connection types (the table above shows the Management keys; L2 carries a `vlan_assignments` shape and L3 carries `interfaces`, `virtual_routers`, and `routes`). Layer 1 switches have no schema, so `config` on those devices is rejected at validation. The post-commit apply itself runs only on `Management` devices: since issues #839 and #870 the `configure` action is gated on the connection type's driver contract, and execution refuses it on any other connection type with 409 `driver_cannot_configure` (reported as that device's failed config result), even when the driver implements `configure`. To apply config to a box that also needs a layer driver, pair it with a Management driver, as `frr_l3` and `frr_mgmt` do. Separately, the `routes` array of an L3 device's latest config version is consumed automatically at reservation provisioning time: the execution service installs those routes via `configure_route` when a reservation starts and removes the pinned set on cancel or completion (see the Layer 3 section of [DRIVERS.md](DRIVERS.md)). (Automatic VLAN provisioning for L2 switches also happens via the NATS event flow on reservation creation; both paths are separate from the AI config allowlist.)
 
 This is deliberate: the allowlist prevents an LLM from surfacing arbitrary kwargs into driver code. The schema registry lives in `services/common/herd_common/device_config.py` (the `config_validator` module in this service is a thin re-export of it). Adding a new allowed key requires a one-line change there.
 

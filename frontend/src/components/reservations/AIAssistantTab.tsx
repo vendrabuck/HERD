@@ -363,8 +363,9 @@ function ChatBubble({ message }: { message: ChatMessage }) {
 export function AIAssistantTab(props: Props) {
   // Branch 3: chat UI behind a feature flag so production can roll forward
   // with a one-line flag flip and roll back to the legacy single-shot in
-  // the same way. The flag is build-time (VITE_AI_CHAT_ENABLED); to flip
-  // without a rebuild, restart the frontend container with the new value.
+  // the same way. The flag is build-time (VITE_AI_CHAT_ENABLED, a frontend
+  // image build argument), so flipping it needs a frontend image rebuild; a
+  // container restart does not change it.
   if (!AI_CHAT_ENABLED) {
     return (
       <AIAssistantTabLegacy

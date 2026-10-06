@@ -300,12 +300,17 @@ By default HERD authenticates against its own bcrypt-hashed password store. To p
 
 1. In the config editor (wrench icon), set `AUTH_METHOD=ldap` and fill in the `LDAP` group: server URL (prefer `ldaps://...:636`), service-account bind DN + password, user search base DN, and optionally the filter / attributes / TLS toggle. Full list with an AD-flavored example: [ENV_VARS.md](ENV_VARS.md#ldap--active-directory).
 2. Click **Apply** so the auth service picks up the new values. Local registration (`POST /api/auth/register`) now returns 409; new HERD accounts are provisioned lazily on the first successful LDAP bind.
-3. Have an admin log in with their directory credentials so their account is created as an LDAP user (`auth_source='ldap'`, no local hash). Promote them via `PUT /api/auth/users/{id}/role` if they need `admin` or `superadmin`.
+3. Have an admin log in with their directory credentials so their account is created as an LDAP user (`auth_source='ldap'`, no local hash). A superadmin promotes them via `PUT /api/auth/users/{id}/role` if they need `admin`. The route is superadmin-only and refuses `superadmin` with HTTP 400 (see [Promoting and demoting users](#promoting-and-demoting-users)), and in LDAP mode a superadmin session comes only from the paths in the bootstrap note below.
 4. Role still lives inside HERD; promote admins by hand as in step 3. `UserGroup` membership can now mirror directory groups: map a directory group to a HERD group at **Admin > LDAP Sync** (`/admin/ldap-sync`), then either trigger a one-off **Sync now** or turn on `LDAP_GROUP_SYNC_ENABLED` for the background interval loop. Unmapped groups still need HERD group membership assigned by hand.
 
 Rolling back: flip `AUTH_METHOD` back to `local` and apply. Pre-existing local accounts resume working; LDAP-sourced rows stay in the table but cannot log in until you switch back to `ldap` (they have no password hash).
 
-Bootstrap gotcha: the seeded `SUPERADMIN_*` account is always `auth_source='local'`. Keep `AUTH_METHOD=local` until at least one directory-backed admin has logged in once, or keep a known-good local superadmin around as a break-glass.
+Bootstrap gotcha: the seeded `SUPERADMIN_*` account is always `auth_source='local'`, and a local account cannot log in while `AUTH_METHOD=ldap`. LDAP accounts are provisioned as `user` and group sync never changes a role, so in LDAP mode no login yields a superadmin session. Token refresh and API token exchange do not check the auth method, so a superadmin access token can still come from either of these:
+
+- A superadmin API token created before the switch (`POST /api/auth/tokens` with the superadmin as principal and role `superadmin`), exchanged at `POST /api/auth/tokens/exchange`. This is the break-glass path; store the raw token like any other privileged credential, and revoke it with `DELETE /api/auth/tokens/{id}` when it is no longer needed.
+- A refresh token from a superadmin login made before the switch. That session survives the switch and keeps renewing until the refresh token expires (`AUTH_REFRESH_TOKEN_EXPIRE_DAYS`) or is revoked by a logout.
+
+Without either, switch `AUTH_METHOD` back to `local` in the config editor, make the role change as the local superadmin, and switch back to `ldap`; LDAP accounts cannot log in while local mode is on.
 
 ## Things you cannot do from the admin UI today
 

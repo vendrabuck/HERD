@@ -273,3 +273,26 @@ status flip).
   (e.g. Proxmox) ships separately once the contract is proven.
 - Health-polling defaults for dynamic instances beyond what their template
   sets.
+
+## As built (2026-10-06)
+
+This section records where today's code differs from the decision text above (issue
+#1031). The decisions themselves stand.
+
+- Ports: inventory's internal create (`create_dynamic_instance_device`) creates no
+  ports. A device or dynamic template carries no embedded port sub-templates, so the
+  instance device is a bare device row, as on the admin create path.
+- `field_data`: a dynamic request carries only a `template_id` (`DynamicRequestSpec`),
+  so there are no request parameters. The instance device's `field_data` is the
+  `field_data` key of the `create_instance` result, with any missing template field
+  filled from the template's default by inventory (`validate_field_data`, which
+  tolerates unknown keys on this path).
+- Redelivery: the recipe flows in execution's `nats_consumer.py` do not call
+  `action_already_succeeded`. Redelivery idempotency comes from the
+  `dynamic_instances` ledger alone (one row per `request_id`, forward-only
+  compare-and-swap updates) together with inventory's `request_id` idempotency on the
+  device create.
+- Redaction test: no test yet pins that plaintext never lands in `ExecutionRun` rows
+  or logs across a full create cycle. A unit run of a full create cycle shows the
+  redaction marker and no plaintext in the run rows; the missing test is tracked in
+  issue #1032.
