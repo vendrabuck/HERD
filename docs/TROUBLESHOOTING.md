@@ -248,6 +248,23 @@ differently:
   reusing it can be swallowed by the broker. The `{{ID}}` template below generates a
   unique id per publish.
 
+Before replaying, check that no newer reservation holds the reservation's instance
+devices. The reservations service releases an instance device to `AVAILABLE` when the
+reservation ends, independently of execution's teardown, so the device can be booked
+again in the meantime, and the teardown a replay drives deletes the device through
+inventory's internal delete, which checks no reservation. For each ledger row of the
+reservation that has a `device_id`, list the live reservations holding that device:
+
+```bash
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
+  "SELECT r.id, r.status FROM reservations.reservations r
+     JOIN reservations.reservation_devices d ON d.reservation_id = r.id
+    WHERE d.device_id = '<device_id>'
+      AND r.status IN ('PENDING', 'PENDING_PROVISION', 'ACTIVE');"
+```
+
+If any row comes back, do not replay; destroy the instance by hand instead.
+
 The `nats:2.10-alpine` service image ships only `nats-server`, no `nats` CLI, so publish
 from a one-off `natsio/nats-box` container on the stack's network
 (`<compose project>_herd-net`, for example `herd-public_herd-net`):

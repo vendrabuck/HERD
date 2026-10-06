@@ -168,10 +168,10 @@ Transitions (from state, to state, trigger):
 
 ## Topology separation
 
-Physical and cloud devices cannot be mixed in a single reservation or topology. Enforced at three levels:
+Physical and cloud devices cannot be mixed in a single topology, and the devices booked into one reservation must all share one topology type. The rule covers the booked physical device set. A reservation may also carry dynamic requests (ADR 0004), and each materialized instance is a CLOUD device, so a reservation can hold physical devices plus dynamic instance devices; that mix is intended (see [USER_GUIDE.md](USER_GUIDE.md) and issue #291), and a dynamic-only booking is CLOUD. Enforced at three levels:
 
 1. **DB**: `topology_type` enum on devices and reservations.
-2. **Service**: `reservation_service` validates all devices match before creating.
+2. **Service**: `reservation_service` validates that all booked devices match before creating.
 3. **UI**: the topology editor blocks cross-type edges with a toast.
 
 ## Topology connectivity validation
