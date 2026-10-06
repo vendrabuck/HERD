@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `AI` (used in rule identifiers, for example `AI-GEN-1`) |
-| Verified at | commit `b505402f` (`v0.6.0-77-gb505402f`), 2026-10-06 |
+| Verified at | commit `9562b88e` (`v0.6.0-91-g9562b88e`), 2026-10-06; written against `b505402f`, and no file this document cites changed between the two (the ai-orchestrator code is unchanged since `fd589e50`) |
 | Owning services | ai-orchestrator (`services/ai-orchestrator/`), and the frontend surfaces that call it |
 | Other services involved | inventory (templates, devices, ports, config versions, apply jobs), cabling (pathfinding, topologies, validation, forks), reservations (reservation reads, reservation create, the purpose sweep that calls this service), execution (`POST /execute`, execution runs, recipe package validation), auth (JWT only), the configured LLM provider (external) |
 | Design records | [ADR 0005](../design/0005-ai-recipe-authoring.md), [ADR 0012](../design/0012-network-element-objects.md), [ADR 0013](../design/0013-lab-purpose-classification.md), [ADR 0015](../design/0015-assistant-docs-lookup.md); ADR 0006 for port choice ([0006](../design/0006-fork-reconcile-and-as-built.md)) |
@@ -235,9 +235,9 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_requires_auth`, `test_generate_rejects_empty_prompt`)
 - **AI-GEN-2.** The inventory summary is read by a request dependency that runs before
   the provider check and the quota check; when it fails the route answers 502
-  `Failed to fetch inventory summary: <error text>`. \
+  `Failed to fetch inventory summary: <error text>`. Known gap, see #1035 and #1036. \
   Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`_inventory_provider`) \
-  Pinned by: none
+  Pinned by: none (issue #1035)
 - **AI-GEN-3.** The summary is one `GET /templates?template_type=device&limit=500` plus one
   `GET /devices` per template counting `AVAILABLE` `dut_only` devices, all with the
   caller's JWT and a 15 second timeout, so a template the caller cannot see, or beyond the
@@ -304,9 +304,9 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   Enforced in: `services/ai-orchestrator/app/services/generator.py` (`generate_topology`); `services/ai-orchestrator/app/routes/generate.py` (`generate`) \
   Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_records_usage_when_quota_enabled`)
 - **AI-GEN-15.** Generation does not check that the proposed `topology_type` values agree
-  with each other or with the resolved devices. \
+  with each other or with the resolved devices. Known gap, see #1038. \
   Enforced in: `services/ai-orchestrator/app/services/generator.py` (`_validate_against_inventory`) \
-  Pinned by: none
+  Pinned by: none (issue #1038)
 - **AI-GEN-16.** The response's `file_summaries` lists each extracted file's `filename`,
   character count, and `truncated` flag. \
   Enforced in: `services/ai-orchestrator/app/services/generator.py` (`generate_topology`) \
@@ -370,9 +370,9 @@ the pure search in `services/ai-orchestrator/app/services/resolver.py`, and cabl
   Enforced in: `services/ai-orchestrator/app/services/generator.py` (`_resolve_devices`) \
   Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_returns_409_when_inventory_shifts`)
 - **AI-RESOLVE-3.** An inventory error or non-2xx during the candidate fetch is not
-  caught, so the route answers 500. \
+  caught, so the route answers 500. Known gap, see #1035. \
   Enforced in: `services/ai-orchestrator/app/services/inventory_client.py` (`fetch_available_devices`); `services/ai-orchestrator/app/routes/generate.py` (`generate`) \
-  Pinned by: none
+  Pinned by: none (issue #1035)
 - **AI-RESOLVE-4.** Only edges whose two ends are device roles constrain the choice; an
   edge touching an element is ignored here, and no pathfind call is made when no
   device-to-device edge remains. \
@@ -583,16 +583,17 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   Enforced in: `services/ai-orchestrator/app/services/reservation_context.py` (`_SEED_RESERVATION_FIELDS`, `_SEED_DEVICE_FIELDS`, `render_seed_block`); `services/ai-orchestrator/app/services/conversation_repo.py` (`create`, `set_seed_with_question`) \
   Pinned by: `services/ai-orchestrator/tests/test_reservation_context.py` (`test_seed_gather_returns_thin_bundle`, `test_seed_gather_skips_missing_devices`, `test_render_seed_emits_xml_blocks_without_topology`); `services/ai-orchestrator/tests/test_conversation_repo.py` (`test_create_persists_seed_as_first_user_message`, `test_set_seed_with_question_wraps_question_in_first_message`)
 - **AI-CONV-3.** Any other non-2xx from reservations or inventory during the seed read is
-  not mapped, so the route answers 500. \
+  not mapped, so the route answers 500. Known gap, see #1035. \
   Enforced in: `services/ai-orchestrator/app/services/reservation_context.py` (`_fetch_reservation`, `_fetch_device`) \
-  Pinned by: none
+  Pinned by: none (issue #1035)
 - **AI-CONV-4.** A turn with a `conversation_id` requires a conversation created by this
   caller for this reservation id; anything else, including another user's conversation,
   answers 404 `Conversation not found`. \
   Enforced in: `services/ai-orchestrator/app/services/conversation_repo.py` (`get_or_404`); `services/ai-orchestrator/app/routes/reservation_assistant.py` (`_prepare_turn`) \
   Pinned by: `services/ai-orchestrator/tests/test_reservation_assistant.py` (`test_second_turn_with_unknown_conversation_id_returns_404`, `test_second_turn_with_other_users_conversation_id_returns_404`, `test_stream_unknown_conversation_id_returns_404`, `test_stream_other_users_conversation_id_returns_404`); `services/ai-orchestrator/tests/test_conversation_repo.py` (`test_get_or_404_returns_none_for_wrong_reservation`)
-- **AI-CONV-5.** A later turn reads neither the reservation nor its devices again, so it
-  is answered whatever the reservation's status is now. \
+- **AI-CONV-5.** A later turn reads neither the reservation nor its devices again. No
+  turn, first or later, is refused because of the reservation's status; each tool call is
+  decided by the owning service (AI-TOOL-2). \
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`_prepare_turn`) \
   Pinned by: none
 - **AI-CONV-6.** A turn is one transaction: the new user message is only flushed, and is
@@ -615,7 +616,7 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
 - **AI-CONV-9.** Every `ASSISTANT_SWEEPER_INTERVAL_SECONDS` the sweeper deletes every
   conversation, with its messages, whose `last_used_at` is older than
   `ASSISTANT_CONVERSATION_TTL_HOURS`, whatever the reservation's status; a failed cycle is
-  logged and the loop continues. \
+  logged and the loop continues. Known gap, see #1039. \
   Enforced in: `services/ai-orchestrator/app/services/conversation_repo.py` (`expire_idle`); `services/ai-orchestrator/app/tasks/conversation_sweeper.py` (`conversation_sweeper_loop`) \
   Pinned by: `services/ai-orchestrator/tests/test_conversation_repo.py` (`test_expire_idle_deletes_old_conversations_and_keeps_recent`, `test_expire_idle_custom_ttl_setting_moves_the_cutoff`); `services/ai-orchestrator/tests/test_conversation_sweeper.py` (`test_run_sweeper_cycle_deletes_idle_conversations`, `test_loop_swallows_cycle_exception_and_keeps_running`)
 - **AI-CONV-10.** `ASSISTANT_CONVERSATION_TTL_HOURS` of 0 or less is refused at startup. \
@@ -658,7 +659,7 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
 - **AI-LOOP-7.** The system prompt gains the write-tools section only when
   `AI_WRITE_TOOLS_ENABLED` is set. \
   Enforced in: `services/ai-orchestrator/app/services/ai_client.py` (`reservation_assistant_system_prompt`, `RESERVATION_ASSISTANT_WRITE_TOOLS_PROMPT`) \
-  Pinned by: none
+  Pinned by: none (issue #1040)
 - **AI-LOOP-8.** The loop appends finished iterations and token counts to objects the route
   passed in, so a later failure still sees what completed. \
   Enforced in: `services/ai-orchestrator/app/services/ai_client.py` (`answer_reservation_question_with_tools`, `answer_reservation_question_streaming`) \
@@ -733,9 +734,9 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant_stream`, `_STREAM_END`) \
   Pinned by: `services/ai-orchestrator/tests/test_reservation_assistant_stream_deadline.py` (`test_stalled_client_with_landed_tool_still_gets_one_done`, `test_consumer_leaving_at_a_yield_closes_inner_generator_without_leaks`); `tests/unit/test_no_yield_inside_cancel_scope.py` (`test_no_service_app_yields_inside_a_cancel_scope`)
 - **AI-STREAM-6.** An exception that is neither a timeout nor an `AIError` (a database
-  error while saving, for example) leaves the stream with no terminal frame. \
+  error while saving, for example) leaves the stream with no terminal frame. Known gap, see #1037. \
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant_stream`) \
-  Pinned by: none
+  Pinned by: none (issue #1037)
 - **AI-STREAM-7.** The turn is saved before its `done` frame is sent, so a streamed
   `conversation_id` can continue on either route. \
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant_stream`, `_persist_turn`) \
@@ -926,7 +927,7 @@ a driver.
 - **AI-RECIPE-3.** The flag is checked before authentication, so with it off a caller with
   no token also gets the 403 disabled detail. \
   Enforced in: `services/ai-orchestrator/app/routes/recipes.py` (`create_draft`, `refine_draft`, `get_draft`) \
-  Pinned by: none
+  Pinned by: none (issue #1040)
 - **AI-RECIPE-4.** Draft and refine check the provider (503) and then the quota (429)
   before any model call; reading a draft checks neither. \
   Enforced in: `services/ai-orchestrator/app/routes/recipes.py` (`_run_authoring`) \
@@ -964,7 +965,7 @@ a driver.
 - **AI-RECIPE-11.** A draft can be read and refined by any admin, not only the one who
   created it. \
   Enforced in: `services/ai-orchestrator/app/routes/recipes.py` (`_get_draft_or_404`) \
-  Pinned by: none
+  Pinned by: none (issue #1040)
 - **AI-RECIPE-12.** The answer carries the draft's id, `valid`, `attempts`, model, prompt,
   hypervisor type, explanation, `driver_py`, metadata, validation report, and
   `package_b64`; nothing in the service uploads a driver. \
@@ -1025,7 +1026,7 @@ preview (section 8.12), and the reservations sweep and Classify now route
   text, the devices, the dynamic templates, each device's config-apply job count and job
   names (never config contents), the fork's wiring counts per layer and version count,
   the status and duration, and, when `AI_PURPOSE_INCLUDE_TRANSCRIPTS` is set, the
-  reservation's assistant transcripts; the body's `topology_id` is not used. \
+  reservation's assistant transcripts; the body's `topology_id` is not used. Known gap, see #1039. \
   Enforced in: `services/ai-orchestrator/app/services/purpose_signals.py` (`gather_internal_signals`, `_gather_config_apply_jobs_block`, `_gather_fork_block`) \
   Pinned by: `services/ai-orchestrator/tests/test_purpose_signals.py` (`test_internal_signals_include_all_structured_signals`, `test_internal_config_apply_jobs_never_include_config_contents`, `test_transcripts_included_when_flag_on`, `test_transcripts_omitted_when_flag_off`)
 - **AI-PURPOSE-7.** A signal fetch that fails with an HTTP error or a malformed body is
@@ -1130,9 +1131,9 @@ and `GET /usage`.
 - **AI-QUOTA-5.** A call that ends in an error records no usage although provider calls
   were made: a generation that fails after its attempts, an assistant turn that is rolled
   back, a recipe run whose validator is unreachable, and a classification with no usable
-  answer. \
+  answer. Known gap, see #1034. \
   Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`generate`); `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant`); `services/ai-orchestrator/app/routes/recipes.py` (`_run_authoring`); `services/ai-orchestrator/app/routes/purpose_classification.py` (`_run_classification`) \
-  Pinned by: none
+  Pinned by: none (issue #1034)
 - **AI-QUOTA-6.** `GET /quota` answers the caller's own `{enabled, limit, used, remaining, reset_at}`
   for any signed-in user, also when over the limit, and is not gated on the provider. \
   Enforced in: `services/ai-orchestrator/app/routes/quota.py` (`get_quota`); `services/ai-orchestrator/app/services/usage_repo.py` (`get_status`) \
@@ -1176,15 +1177,15 @@ log extras is `operations-and-observability.md`.
   Enforced in: `services/ai-orchestrator/app/services/generator.py` (`generate_topology`); `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant`); `services/ai-orchestrator/app/routes/template_identity.py` (`suggest_identity`); `services/ai-orchestrator/app/routes/recipes.py` (`_run_authoring`); `services/ai-orchestrator/app/routes/purpose_classification.py` (`_run_classification`) \
   Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_bare_exception_never_leaks_text`); `services/ai-orchestrator/tests/test_recipes_routes.py` (`test_draft_502_on_ai_error_never_leaks_provider_text`); `services/ai-orchestrator/tests/test_purpose_classification_routes.py` (`test_preview_502_on_ai_error_never_leaks_provider_text`); `services/ai-orchestrator/tests/test_reservation_assistant_coverage.py` (`test_buffered_route_ai_error_maps_to_502_with_generic_detail`)
 - **AI-LOG-5.** The identity route's malformed-suggestion branch logs the model's raw
-  result and puts the schema error text in the 502 detail. \
+  result and puts the schema error text in the 502 detail. Known gap, see #1036. \
   Enforced in: `services/ai-orchestrator/app/routes/template_identity.py` (`suggest_identity`) \
-  Pinned by: none
+  Pinned by: none (issue #1036)
 - **AI-LOG-6.** Some error details carry upstream error text: the inventory summary 502,
   the commit's port-lookup and validate 503s and its 502, a config push's
   `request failed: <error>`, an upload's PDF or archive parse error, and a tool's
-  `HTTP error: <error>` result (which reaches the model and `tool_calls[].error`). \
+  `HTTP error: <error>` result (which reaches the model and `tool_calls[].error`). Known gap, see #1036. \
   Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`_inventory_provider`); `services/ai-orchestrator/app/services/committer.py` (`_fetch_device_ports`, `_validate_topology_wireable`, `_apply_configs`, `commit_proposal`); `services/ai-orchestrator/app/services/extractor.py` (`_extract_pdf`, `_extract_tgz`); `services/ai-orchestrator/app/services/tools.py` (`dispatch`) \
-  Pinned by: none
+  Pinned by: none (issue #1036)
 
 **Out of scope.** Key-name redaction of log extras and the JSON formatter
 (`operations-and-observability.md`).
@@ -1482,12 +1483,28 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
 
 ## 13. Known limits and gaps
 
-Candidate defects found while writing this document that have no issue yet were reported to
-the maintainer and are not listed here; the rules above describe today's behavior.
-
 ### Open defects
 
-None.
+- #1034 (AI-QUOTA-5): usage is recorded only after a successful call in generation, the
+  assistant, recipe authoring, and classification, so the tokens a failed call spent are
+  never counted against the daily quota.
+- #1035 (AI-RESOLVE-3, AI-CONV-3, AI-GEN-2): an inventory or reservations failure during
+  generation or a first assistant turn answers 500, because the HTTP error is raised and
+  nothing maps it; and the generate route reads the inventory summary in a request
+  dependency that runs before the provider and quota checks.
+- #1036 (AI-LOG-5, AI-LOG-6): the template identity route logs the model's raw result and
+  puts the schema error text in its 502 detail; upstream error text, internal URLs
+  included, reaches response details and `tool_calls[].error`.
+- #1037 (AI-STREAM-6): the stream handles only timeouts, an unreachable provider, and
+  `AIError`, so an exception while the turn is saved ends the stream with neither `done`
+  nor `error`.
+- #1038 (AI-GEN-15): nothing in generation checks that a proposal's devices share one
+  topology type; the commit writes PHYSICAL on every device node, and the reservation
+  create's 422 is the only check.
+- #1039 (AI-CONV-9, AI-PURPOSE-6): the idle-conversation sweeper deletes by last use only,
+  so a reservation's transcript can be gone before purpose classification reads it. The
+  issue asks the owner to choose between exempting such conversations and documenting the
+  interaction.
 
 ### Limits by decision
 
@@ -1498,10 +1515,10 @@ None.
 - The resolver judges reachability only and leaves port choice to cabling's fork-save
   resolver (AI-RESOLVE-11): the module docstring of
   `services/ai-orchestrator/app/services/resolver.py`, ADR 0006, issue #531.
-- The web documentation fetch checks the host's addresses and then connects with a second,
-  separate name lookup, so a host that changes its DNS answer between the two could reach
-  a private address (AI-DOCS-11): recorded as a known limitation in ADR 0015 (decision 3)
-  and [AI_ASSISTANT.md](../AI_ASSISTANT.md); the web source ships disabled for this reason.
+- The web fetch's address check and its connection resolve the host name separately, the
+  DNS rebinding window (AI-DOCS-11). Recorded as a known limitation in ADR 0015 (decision
+  3) and [AI_ASSISTANT.md](../AI_ASSISTANT.md); the web source ships disabled and behind an
+  operator allowlist.
 - `GET /status` is unauthenticated and its construction probe is cached for 30 seconds
   (AI-PROV-5, AI-PROV-7): issue #606 and the docstring of `_ProviderConstructionCache`.
 - Usage rows are written only when a quota is configured (AI-QUOTA-1): the comment on
@@ -1517,7 +1534,13 @@ None.
   `VITE_AI_CHAT_ENABLED` row in [ENV_VARS.md](../ENV_VARS.md) and the comment in
   `frontend/src/config/featureFlags.ts`.
 
+Where the AI guides, docstrings, or UI text disagree with the code at this commit, the
+rules above describe the code; issue #1041 lists each disagreement.
+
 ### Rules with no test
+
+Issue #1040 tracks the tests for AI-RECIPE-3, AI-RECIPE-11, and AI-LOOP-7. A rule named
+under Open defects gets its test with that defect's fix.
 
 - AI-PROV-20: the anthropic provider's `EMPTY` placeholder.
 - AI-GEN-2: the inventory summary 502 and its ordering before the provider and quota checks.
