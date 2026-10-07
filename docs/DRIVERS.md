@@ -1311,6 +1311,9 @@ class Driver:
             that become the materialized device's field_data; inventory fills
             any missing template field from the template's default. A dynamic
             request carries no parameters of its own, only the template.
+            Keys are stored as given, including keys the template does not
+            declare, and on read only keys the template declares as password
+            fields are redacted (see "Credentials in returned field_data" below).
         """
         ...
 
@@ -1425,6 +1428,23 @@ waiting on a remote hypervisor API is wall-clock time, not CPU time.
 | create_instance | `{"success": bool, "instance_ref": str, "field_data": dict}`; `success` must be present and true (a missing key is a failure here, unlike the physical contracts), and `instance_ref` must be a non-empty string, else the create counts as failed |
 | destroy_instance | `{"success": bool}`; `success` must be present and true, as for create; with `instance_ref=None`, success means the request-id-named instance was destroyed or does not exist |
 | status | `{"reachable": bool}` |
+
+### Credentials in returned field_data
+
+The `field_data` a `create_instance` call returns is passed to inventory's internal
+device create as given. Inventory keeps keys the dynamic template does not declare
+(unknown keys are allowed on that create), and on every device read it redacts only the
+keys the template declares as `password` fields. Any other key is shown to every account
+that can read the instance device. A recipe that produces a credential for the instance
+(a generated root password, an API key, an SSH private key) must therefore either:
+
+- return it under a key the dynamic template declares as a `password` field, or
+- store it through the secrets service and return no credential at all (at most a
+  reference to the stored secret).
+
+Never return a credential under an undeclared key. No shipped recipe returns one; the
+checked-in `mock_hypervisor` returns only `mgmt_address` and `image`, neither a credential
+(issue #1056).
 
 `login` is judged by the same rule as the physical contracts: a call that raises or whose
 process fails, or a returned object whose `success` key is present and false, is a failed
