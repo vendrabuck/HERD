@@ -2078,3 +2078,37 @@ async def test_stream_rolled_back_turn_meters_tokens_spent(async_client, monkeyp
     events = _parse_sse(resp.text)
     assert [e for e, _ in events] == ["error"]
     assert await _today_total_for(token) == 50
+
+
+# --- AI-CONV-5 (issue #1040): later turns do not re-read the reservation ---
+
+
+async def test_later_turn_reads_neither_the_reservation_nor_its_devices(async_client):
+    """Only a first turn gathers the seed; a turn with a conversation_id
+    replays the stored seed. No turn is refused for the reservation's status
+    (a COMPLETED reservation still gets answers)."""
+    gathers = {"n": 0}
+    completed_seed = _seed()
+    completed_seed.reservation["status"] = "COMPLETED"
+
+    def factory():
+        async def gather() -> ReservationSeed:
+            gathers["n"] += 1
+            return completed_seed
+
+        return gather
+
+    app.dependency_overrides[get_reservation_seed_dep] = factory
+    _override_ai(answer="answer")
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        first = await client.post(_url(), json={"question": "q1"}, headers=headers)
+        assert first.status_code == 200, first.text
+        assert gathers["n"] == 1
+        conv_id = first.json()["conversation_id"]
+        for question in ("q2", "q3"):
+            later = await client.post(
+                _url(), json={"question": question, "conversation_id": conv_id}, headers=headers
+            )
+            assert later.status_code == 200, later.text
+    assert gathers["n"] == 1

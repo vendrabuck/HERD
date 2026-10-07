@@ -169,6 +169,50 @@ describe("AIDialog", () => {
     expect(message).not.toBe("Failed to generate topology");
   });
 
+  it("checks picked files client-side before sending (#1040)", () => {
+    renderDialog();
+    const input = screen.getByLabelText("Reference files (optional)");
+    const big = new File(["x"], "big.txt", { type: "text/plain" });
+    Object.defineProperty(big, "size", { value: 5 * 1024 * 1024 + 1 });
+    const okA = new File(["aaa"], "a.txt", { type: "text/plain" });
+    const okADuplicate = new File(["aaa"], "a.txt", { type: "text/plain" });
+    fireEvent.change(input, {
+      target: {
+        files: [new File(["x"], "tool.exe"), big, okA, okADuplicate],
+      },
+    });
+    // An unaccepted extension and an oversize file are dropped with a toast;
+    // the second a.txt (same name and size) is skipped silently.
+    expect(toastError).toHaveBeenCalledWith("Unsupported file type: tool.exe");
+    expect(toastError).toHaveBeenCalledWith("big.txt exceeds 5 MB limit");
+    expect(toastError).toHaveBeenCalledTimes(2);
+    expect(screen.getAllByRole("button", { name: "Remove" })).toHaveLength(1);
+
+    toastError.mockClear();
+    fireEvent.change(input, {
+      target: {
+        files: ["b", "c", "d", "e", "f"].map((n) => new File([n], `${n}.md`)),
+      },
+    });
+    // Picking stops at five files in all, with one toast.
+    expect(toastError).toHaveBeenCalledWith("Limit is 5 files per request");
+    expect(toastError).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByRole("button", { name: "Remove" })).toHaveLength(5);
+  });
+
+  it("prefixes a 400 with Upload rejected (#1040)", async () => {
+    server.use(
+      http.post("/api/ai/generate", () =>
+        HttpResponse.json({ detail: "Too many files: limit is 5, got 6" }, { status: 400 }),
+      ),
+    );
+    renderDialog();
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "go" } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate" }));
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect(toastError.mock.calls[0][0]).toBe("Upload rejected: Too many files: limit is 5, got 6");
+  });
+
   it("names the templates per type on the mixed-types 422 (#1038)", async () => {
     server.use(
       http.post("/api/ai/generate", () =>

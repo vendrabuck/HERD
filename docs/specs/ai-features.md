@@ -211,7 +211,7 @@ unauthenticated status route whether AI is usable and hides the AI buttons when 
 - **AI-PROV-20.** The anthropic provider can be built with a blank key (a keyless local
   endpoint named by `AI_BASE_URL`); it hands the SDK the placeholder `EMPTY`. \
   Enforced in: `services/ai-orchestrator/app/services/providers/anthropic_provider.py` (`AnthropicProvider`) \
-  Pinned by: none
+  Pinned by: `services/ai-orchestrator/tests/test_anthropic_provider.py` (`test_init_blank_key_hands_the_sdk_the_empty_placeholder`)
 
 **Out of scope.** How the gateway routes `/api/ai` and how JWTs are issued
 (`identity-and-access.md`). Model choice and backend setup are operator guidance
@@ -334,7 +334,7 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_read_uploads_aborts_streaming_read_past_the_per_file_cap`, `test_generate_rejects_oversized_upload`)
 - **AI-UPLOAD-3.** A part with no filename or no bytes is skipped silently. \
   Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`_read_uploads`) \
-  Pinned by: none
+  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_read_uploads_skips_nameless_and_empty_parts`)
 - **AI-UPLOAD-4.** Only `.pdf`, `.txt`, `.md`, `.json`, `.xml`, `.tgz`, and `.tar.gz` are
   accepted; any other extension answers 400 naming the accepted list. \
   Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`SUPPORTED_EXTENSIONS`, `_extract_one`) \
@@ -405,7 +405,7 @@ the pure search in `services/ai-orchestrator/app/services/resolver.py`, and cabl
 - **AI-RESOLVE-7.** Pairs are sent in chunks of 200 per request with the caller's JWT and a
   20 second timeout. \
   Enforced in: `services/ai-orchestrator/app/services/cabling_client.py` (`PATHFIND_BATCH_CHUNK`, `PATHFIND_TIMEOUT_SECONDS`) \
-  Pinned by: none
+  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_pathfind_batch_chunks_at_200_with_the_callers_jwt`)
 - **AI-RESOLVE-8.** A pair result carrying `error`, or without `reachable: true`, counts as
   not reachable. Cabling answers a pair naming a device the caller cannot see with the
   same per-pair error as an unknown device (`topology.md`). \
@@ -615,7 +615,7 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   turn, first or later, is refused because of the reservation's status; each tool call is
   decided by the owning service (AI-TOOL-2). \
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`_prepare_turn`) \
-  Pinned by: none
+  Pinned by: `services/ai-orchestrator/tests/test_reservation_assistant.py` (`test_later_turn_reads_neither_the_reservation_nor_its_devices`)
 - **AI-CONV-6.** A turn is one transaction: the new user message is only flushed, and is
   committed together with the reply; a turn that fails without a side effect leaves no
   conversation row or trailing user message behind. \
@@ -679,7 +679,7 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
 - **AI-LOOP-7.** The system prompt gains the write-tools section only when
   `AI_WRITE_TOOLS_ENABLED` is set. \
   Enforced in: `services/ai-orchestrator/app/services/ai_client.py` (`reservation_assistant_system_prompt`, `RESERVATION_ASSISTANT_WRITE_TOOLS_PROMPT`) \
-  Pinned by: none (issue #1040)
+  Pinned by: `services/ai-orchestrator/tests/test_assistant_system_prompt.py` (`test_system_prompt_has_the_write_tools_section_only_when_enabled`)
 - **AI-LOOP-8.** The loop appends finished iterations and token counts to objects the route
   passed in, so a later failure still sees what completed. \
   Enforced in: `services/ai-orchestrator/app/services/ai_client.py` (`answer_reservation_question_with_tools`, `answer_reservation_question_streaming`) \
@@ -950,7 +950,7 @@ a driver.
 - **AI-RECIPE-3.** The flag is checked before authentication, so with it off a caller with
   no token also gets the 403 disabled detail. \
   Enforced in: `services/ai-orchestrator/app/routes/recipes.py` (`create_draft`, `refine_draft`, `get_draft`) \
-  Pinned by: none (issue #1040)
+  Pinned by: `services/ai-orchestrator/tests/test_recipes_routes.py` (`test_flag_is_checked_before_authentication`)
 - **AI-RECIPE-4.** Draft and refine check the provider (503) and then the quota (429)
   before any model call; reading a draft checks neither. \
   Enforced in: `services/ai-orchestrator/app/routes/recipes.py` (`_run_authoring`) \
@@ -988,7 +988,7 @@ a driver.
 - **AI-RECIPE-11.** A draft can be read and refined by any admin, not only the one who
   created it. \
   Enforced in: `services/ai-orchestrator/app/routes/recipes.py` (`_get_draft_or_404`) \
-  Pinned by: none (issue #1040)
+  Pinned by: `services/ai-orchestrator/tests/test_recipes_routes.py` (`test_any_admin_may_read_and_refine_another_admins_draft`)
 - **AI-RECIPE-12.** The answer carries the draft's id, `valid`, `attempts`, model, prompt,
   hypervisor type, explanation, `driver_py`, metadata, validation report, and
   `package_b64`; nothing in the service uploads a driver. \
@@ -1314,15 +1314,15 @@ named in each rule.
   does not accept or that is over 5 MB, stops at 5 files, and skips a file already picked
   (same name and size); a 400 is shown as `Upload rejected: <detail>`. \
   Enforced in: `frontend/src/components/topology-editor/AIDialog.tsx` (`handleFilesPicked`, `ACCEPTED_EXTENSIONS`) \
-  Pinned by: none
+  Pinned by: `frontend/src/test/components/AIDialog.test.tsx` (`checks picked files client-side before sending (#1040)`, `prefixes a 400 with Upload rejected (#1040)`)
 - **AI-UI-17.** The commit dialog's default window is one to five hours from now, and it
   offers "Apply device configs" only when a resolved device has a non-empty config. \
   Enforced in: `frontend/src/components/topology-editor/AICommitDialog.tsx` (`CommitForm`) \
-  Pinned by: none
+  Pinned by: `frontend/src/test/components/AICommitDialog.test.tsx` (`defaults the window to one to five hours from now`, `offers Apply device configs only when a resolved device has a non-empty config`)
 - **AI-UI-18.** The legacy tab never sends a `conversation_id`, so each question starts a
   new conversation on the server. \
   Enforced in: `frontend/src/components/reservations/AIAssistantTabLegacy.tsx` (`AIAssistantTabLegacy`) \
-  Pinned by: none
+  Pinned by: `frontend/src/test/components/AIAssistantTabLegacy.test.tsx` (`never sends a conversation_id, so each question starts a new conversation`)
 - **AI-UI-19.** On a `topology_mixed_types` 422 the generate dialog shows the server's
   message and one `TYPE: template, template` line per type; `topologyMixedTypesDetail`
   narrows only a 422 whose detail has `error: topology_mixed_types` and an array `groups`. \
@@ -1344,7 +1344,7 @@ wireable on a seeded lab, to tell whether a change to generation helps.
 - **AI-EVAL-1.** The live suite skips unless `HERD_AI_EVAL=1`, and no gate or CI job sets
   it; it never asserts a pass rate. \
   Enforced in: `tests/ai_eval/test_generate_eval.py` (`test_generate_topology_wireability`) \
-  Pinned by: none
+  Pinned by: `tests/unit/test_ai_eval_opt_in.py` (`test_eval_suite_skips_at_module_level_unless_opted_in`, `test_eval_suite_never_asserts_a_pass_rate`, `test_no_workflow_sets_the_opt_in_or_runs_the_target`, `test_only_the_ai_eval_recipe_sets_the_opt_in_and_no_target_depends_on_it`)
 - **AI-EVAL-2.** The harness builds its throwaway canvas with the committer's device node
   and device-to-device edge shapes, skipping element edges. \
   Enforced in: `tests/ai_eval/scoring.py` (`build_canvas_data`) \
@@ -1375,7 +1375,7 @@ reaches the container.
   `AI_RESOLVER_CANDIDATES_PER_TEMPLATE` outside 1 to 50, and
   `AI_RESOLVER_MAX_SEARCH_STEPS` below 1 are refused at startup. \
   Enforced in: `services/ai-orchestrator/app/config.py` (`Settings`) \
-  Pinned by: none
+  Pinned by: `services/ai-orchestrator/tests/test_config.py` (`test_generation_and_resolver_knobs_out_of_range_are_refused`, `test_generation_and_resolver_knobs_accept_their_bounds`)
 
 **Out of scope.** The config service's editor for these values (`operations-and-observability.md`).
 
@@ -1564,18 +1564,4 @@ rules above describe the code; issue #1041 lists each disagreement.
 
 ### Rules with no test
 
-Issue #1040 tracks the tests for every rule below that no open defect names. A rule named
-under Open defects gets its test with that defect's fix.
-
-- AI-PROV-20: the anthropic provider's `EMPTY` placeholder.
-- AI-UPLOAD-3: empty or nameless parts skipped.
-- AI-RESOLVE-7: pathfind chunk size and timeout.
-- AI-CONV-5: later turns do not re-read the reservation.
-- AI-LOOP-7: the write-tools section of the system prompt.
-- AI-RECIPE-3: the recipe flag answers before authentication.
-- AI-RECIPE-11: any admin may read and refine any draft.
-- AI-UI-16: the generate dialog's client-side file checks.
-- AI-UI-17: the commit dialog's default window and the config checkbox condition.
-- AI-UI-18: the legacy tab sends no conversation id.
-- AI-EVAL-1: the evaluation suite's opt-in skip.
-- AI-CONF-2: Settings range checks on the generation and resolver knobs.
+None at this commit: issue #1040 added the tests for the rules this section listed.

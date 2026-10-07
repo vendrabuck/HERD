@@ -1542,3 +1542,59 @@ async def test_generate_topology_type_follows_the_resolved_devices(async_client,
         resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
     assert resp.status_code == 200, resp.text
     assert [d["topology_type"] for d in resp.json()["devices"]] == ["CLOUD", "CLOUD"]
+
+
+# --- issue #1040: rules with no pin ---------------------------------------
+
+
+async def test_read_uploads_skips_nameless_and_empty_parts():
+    """AI-UPLOAD-3: a part with no filename is skipped without being read,
+    and a part with no bytes is skipped silently; neither is an error."""
+    nameless = _CountingUploadFile("", b"ignored")
+    empty = _CountingUploadFile("empty.txt", b"")
+    real = _CountingUploadFile("notes.txt", b"hello")
+
+    extracted = await _read_uploads([nameless, empty, real])
+
+    assert [f.filename for f in extracted] == ["notes.txt"]
+    assert nameless.read_calls == 0
+    assert await _read_uploads([nameless, _CountingUploadFile("e.txt", b"")]) == []
+
+
+async def test_pathfind_batch_chunks_at_200_with_the_callers_jwt(monkeypatch):
+    """AI-RESOLVE-7: pairs go out in chunks of 200 per request, each with
+    the caller's JWT, on a client with a 20 second timeout."""
+    import httpx
+    from app.services import cabling_client
+
+    assert cabling_client.PATHFIND_BATCH_CHUNK == 200
+    assert cabling_client.PATHFIND_TIMEOUT_SECONDS == 20.0
+
+    sizes: list[int] = []
+    auth: list[str] = []
+    timeouts: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        pairs = _json.loads(request.content)["pairs"]
+        sizes.append(len(pairs))
+        auth.append(request.headers["Authorization"])
+        return httpx.Response(200, json={"results": [{"reachable": True} for _ in pairs]})
+
+    real_client = httpx.AsyncClient
+
+    class _Patched(real_client):
+        def __init__(self, *args, **kwargs):
+            timeouts.append(kwargs.get("timeout"))
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(cabling_client.httpx, "AsyncClient", _Patched)
+    pairs = [(f"s{i}", f"t{i}") for i in range(450)]
+    results = await cabling_client.fetch_pathfind_batch("caller-jwt", pairs)
+
+    assert sizes == [200, 200, 50]
+    assert auth == ["Bearer caller-jwt"] * 3
+    assert timeouts == [20.0]
+    assert len(results) == 450
