@@ -27,7 +27,7 @@ from app.models.outbox import OutboxEvent
 from app.models.reservation import Reservation, ReservationStatus, TopologyType
 from app.schemas.reservation import ReservationUpdate
 from app.services import reservation_service as svc
-from app.services.reservation_service import update_reservation
+from app.services.reservation_service import ReservationStatusChanged, update_reservation
 from app.tasks.expiration import _run_expiration_cycle
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -157,6 +157,207 @@ async def _patch(rid, **body):
 
 def _actions(caplog, action):
     return [r for r in caplog.records if getattr(r, "action", None) == action]
+
+
+# --- issue #994: inventory follows the committed edit ---
+
+
+async def test_active_add_reserves_only_after_the_edit_committed(seams):
+    rid = await _insert(ACTIVE, [HELD])
+    seen_committed: list[set[str]] = []
+
+    async def read_committed_set():
+        row = await _row(rid)
+        seen_committed.append({str(d) for d in row.device_ids})
+
+    inv = Inventory(on_reserved=read_committed_set)
+    with patch(f"{SVC}._update_device_statuses", new=inv):
+        out = await _patch(rid, device_ids=[HELD, OTHER])
+    assert inv.calls == [([str(OTHER)], "RESERVED")]
+    assert seen_committed == [{str(HELD), str(OTHER)}]
+    assert {str(d) for d in out.device_ids} == {str(HELD), str(OTHER)}
+    assert await _subjects() == ["herd.reservations.updated"]
+
+
+async def test_active_add_inventory_failure_is_retried_logged_and_the_edit_stands(seams, caplog):
+    rid = await _insert(ACTIVE, [HELD])
+    inv = Inventory(fail=True)
+    with patch(f"{SVC}._update_device_statuses", new=inv), caplog.at_level(logging.ERROR):
+        out = await _patch(rid, device_ids=[HELD, OTHER])
+    assert inv.calls == [([str(OTHER)], "RESERVED")] * 3
+    assert {str(d) for d in out.device_ids} == {str(HELD), str(OTHER)}
+    assert {str(d) for d in (await _row(rid)).device_ids} == {str(HELD), str(OTHER)}
+    assert await _subjects() == ["herd.reservations.updated"]
+    (rec,) = _actions(caplog, "reservation_update_hold_failed")
+    assert rec.device_ids == [str(OTHER)]
+    assert rec.reservation_id == str(rid)
+
+
+async def test_active_remove_inventory_failure_is_retried_logged_and_the_edit_stands(seams, caplog):
+    rid = await _insert(ACTIVE, [HELD, OTHER])
+    inv = Inventory(fail=True)
+    with patch(f"{SVC}._update_device_statuses", new=inv), caplog.at_level(logging.ERROR):
+        out = await _patch(rid, device_ids=[HELD])
+    assert inv.calls == [([str(OTHER)], "AVAILABLE")] * 3
+    assert [str(d) for d in out.device_ids] == [str(HELD)]
+    assert await _subjects() == ["herd.reservations.updated"]
+    (rec,) = _actions(caplog, "reservation_update_release_failed")
+    assert rec.device_ids == [str(OTHER)]
+
+
+async def test_active_remove_skips_a_device_another_live_row_holds(seams, caplog):
+    rid = await _insert(ACTIVE, [HELD, OTHER])
+    await _insert(ACTIVE, [OTHER], user_id=uuid.uuid4())
+    inv = Inventory()
+    with patch(f"{SVC}._update_device_statuses", new=inv), caplog.at_level(logging.INFO):
+        await _patch(rid, device_ids=[HELD])
+    assert inv.calls == []
+    (rec,) = _actions(caplog, "release_skipped_device_held")
+    assert rec.device_id == str(OTHER)
+
+
+async def test_active_remove_of_a_non_exclusive_device_writes_nothing(seams):
+    rid = await _insert(ACTIVE, [HELD, OTHER])
+
+    async def shared(ids):
+        return [_device(d, exclusive=False) for d in ids]
+
+    inv = Inventory()
+    with (
+        patch(f"{SVC}._update_device_statuses", new=inv),
+        patch(f"{SVC}._fetch_devices_best_effort", new=shared),
+    ):
+        await _patch(rid, device_ids=[HELD])
+    assert inv.calls == []
+
+
+async def test_commit_failure_writes_nothing_to_inventory(seams):
+    rid = await _insert(ACTIVE, [HELD, OTHER])
+    inv = Inventory()
+    with patch(f"{SVC}._update_device_statuses", new=inv):
+        async with Session() as db:
+            with (
+                patch.object(db, "commit", side_effect=RuntimeError("commit lost")),
+                pytest.raises(RuntimeError, match="commit lost"),
+            ):
+                await update_reservation(
+                    db, rid, OWNER, ReservationUpdate(device_ids=[HELD, uuid.uuid4()]), token="t"
+                )
+    assert inv.calls == []
+    assert {str(d) for d in (await _row(rid)).device_ids} == {str(HELD), str(OTHER)}
+    assert await _subjects() == []
+
+
+def _racing_claim(rid, winner_status):
+    """Wrap the real CAS so a concurrent winner's write lands first, on a second session."""
+    real = svc._claim_status_transition
+
+    async def wrapper(db, reservation_id, expected, new_status):
+        await _set_status_on_second_session(rid, winner_status)
+        return await real(db, reservation_id, expected, new_status)
+
+    return wrapper
+
+
+@pytest.mark.parametrize(
+    "observed,winner",
+    [(ACTIVE, CANCELLED), (ACTIVE, ReservationStatus.COMPLETED), (PENDING, PROVISION)],
+    ids=["active-vs-cancel", "active-vs-auto-complete", "pending-vs-activation-claim"],
+)
+async def test_patch_losing_its_status_guard_keeps_nothing(seams, caplog, observed, winner):
+    """The winner commits while the PATCH waits on inventory's device fetch.
+
+    The fetch is the PATCH's slow step, before anything is flushed. (The in-memory
+    SQLite engine shares one connection between sessions, so a racing commit after
+    the PATCH flushed would commit the PATCH's own pending SQL too; the real
+    concurrent proof is test_reservation_patch_race_live_pg.py.)
+    """
+    rid = await _insert(observed, [HELD, OTHER])
+    added = uuid.uuid4()
+    inv = Inventory()
+    prune = AsyncMock()
+
+    async def fetch_while_the_winner_commits(ids, token):
+        await _set_status_on_second_session(rid, winner)
+        return [_device(d) for d in ids]
+
+    with (
+        patch(f"{SVC}._update_device_statuses", new=inv),
+        patch(f"{SVC}._fetch_devices", new=fetch_while_the_winner_commits),
+        patch(f"{SVC}._prune_removed_devices_from_fork_best_effort", new=prune),
+        caplog.at_level(logging.WARNING),
+        pytest.raises(ReservationStatusChanged) as info,
+    ):
+        await _patch(rid, device_ids=[HELD, added], purpose="changed")
+    assert str(info.value) == (
+        f"Reservation changed status during the update ({observed.value} to {winner.value}); "
+        "nothing was changed"
+    )
+    assert isinstance(info.value, LookupError)
+    row = await _row(rid)
+    assert row.status == winner
+    assert {str(d) for d in row.device_ids} == {str(HELD), str(OTHER)}
+    assert row.purpose == "t"
+    assert row.pending_fork_prune_device_ids in (None, [])
+    assert inv.calls == []
+    prune.assert_not_called()
+    assert await _subjects() == []
+    assert _actions(caplog, "reservation_update_lost_race")
+
+
+async def test_cancel_committing_after_the_edit_reverts_the_added_hold(seams, caplog):
+    """The cancel released the row's devices before the added one was flipped."""
+    rid = await _insert(ACTIVE, [HELD])
+
+    async def cancel_now():
+        await _set_status_on_second_session(rid, CANCELLED)
+
+    inv = Inventory(on_reserved=cancel_now)
+    with patch(f"{SVC}._update_device_statuses", new=inv), caplog.at_level(logging.WARNING):
+        await _patch(rid, device_ids=[HELD, OTHER])
+    assert inv.calls == [([str(OTHER)], "RESERVED"), ([str(OTHER)], "AVAILABLE")]
+    assert _actions(caplog, "reservation_update_hold_reverted")
+
+
+async def test_patch_route_answers_409_when_the_status_guard_loses(seams):
+    """The router maps the lost guard to 409 with the pinned wording."""
+    from app.database import get_db
+    from app.dependencies.auth import get_current_user_payload
+    from app.main import app
+    from app.routers.reservations import bearer_scheme
+    from httpx import ASGITransport, AsyncClient
+
+    from tests._harness import override_bearer
+
+    rid = await _insert(ACTIVE, [HELD])
+    app.dependency_overrides[get_current_user_payload] = lambda: {
+        "sub": str(OWNER),
+        "username": "u",
+        "role": "admin",
+    }
+    app.dependency_overrides[bearer_scheme] = override_bearer
+    app.dependency_overrides[get_db] = _get_db
+    try:
+        with (
+            patch(f"{SVC}._update_device_statuses", new=Inventory()),
+            patch(f"{SVC}._claim_status_transition", new=_racing_claim(rid, CANCELLED)),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as ac:
+                resp = await ac.patch(f"/{rid}", json={"purpose": "x"})
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 409
+    assert resp.json() == {
+        "detail": (
+            "Reservation changed status during the update (ACTIVE to CANCELLED); "
+            "nothing was changed"
+        )
+    }
+
+
+async def _get_db():
+    async with Session() as s:
+        yield s
 
 
 # --- issue #999: PENDING add behaves like create for a future window ---

@@ -509,7 +509,7 @@ runs after the commit.
   `ACTIVE`; a `PENDING` reservation holds nothing, so cancelling it or editing its
   devices writes no inventory status. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_DEVICE_HOLDING_STATUSES`, `cancel_reservation`, `update_reservation`) \
-  Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_cancel_writes_inventory_only_when_row_held_devices`, `test_patch_add_writes_inventory_only_when_row_holds_devices`, `test_patch_remove_writes_inventory_only_when_row_holds_devices`)
+  Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_cancel_writes_inventory_only_when_row_held_devices`, `test_patch_add_writes_inventory_only_when_row_holds_devices`, `test_patch_remove_writes_inventory_only_when_row_holds_devices`); `services/reservations/tests/test_reservation_patch_hold.py` (`test_pending_add_accepts_a_device_reserved_now_but_free_in_the_window`)
 - **RES-HOLD-2.** Non-exclusive devices are never written to inventory by any
   reservation path. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_release_exclusive_devices_best_effort`) \
@@ -520,7 +520,7 @@ runs after the commit.
   flip-failure revert (RES-CREATE-15). PATCH removal (RES-PATCH-10) does not use this
   check. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`release_devices_not_held_by_others`) \
-  Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_cancel_skips_a_device_another_live_row_holds`, `test_release_skips_a_device_another_live_row_holds`); `services/reservations/tests/test_expiration_hold_invariant.py` (`test_release_skips_device_a_pending_provision_row_holds`)
+  Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_cancel_skips_a_device_another_live_row_holds`, `test_release_skips_a_device_another_live_row_holds`); `services/reservations/tests/test_expiration_hold_invariant.py` (`test_release_skips_device_a_pending_provision_row_holds`); `services/reservations/tests/test_reservation_patch_hold.py` (`test_active_remove_skips_a_device_another_live_row_holds`)
 - **RES-HOLD-4.** If the holder lookup itself fails, the release proceeds for every
   device (fail open toward releasing). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`release_devices_not_held_by_others`) \
@@ -539,7 +539,7 @@ runs after the commit.
 - **RES-HOLD-7.** Releases after a terminal transition run after the commit, with three
   attempts on cancel, release, provision failure, and the timeout path, and a single
   attempt on auto-complete; a release that still fails is logged and the terminal
-  status stands. \
+  status stands. PATCH writes follow the same pattern (RES-PATCH-10). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_release_exclusive_devices_best_effort`); `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_cancel_reservation_retries_and_logs_when_release_fails`, `test_release_reservation_retries_and_logs_when_inventory_fails`)
 - **RES-HOLD-8.** Without `INTERNAL_API_TOKEN` configured, no inventory status write is
@@ -688,19 +688,32 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   (`l3=0`). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_validate_topology_connectivity`) \
   Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_device_change_revalidates_topology`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_device_change_breaks_topology_rejected`)
-- **RES-PATCH-9.** An added exclusive device must currently be `AVAILABLE`, also on a
-  `PENDING` reservation, and must not conflict over `[max(now, start), end)`. A create
-  for a future window skips the current-status check (RES-CREATE-12). Known gap, see
-  #999. \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
-  Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_patch_add_still_refuses_a_device_that_is_not_available_on_pending`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_conflict_on_added_device`)
-- **RES-PATCH-10.** On an `ACTIVE` row, added exclusive devices are set `RESERVED` and
-  removed exclusive devices `AVAILABLE` before the edit commits, each in one attempt
-  whose failure is logged and does not stop the edit. Neither write uses the holder
-  check, and the commit does not re-check the status the edit read. Known gap, see
-  #994. \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_update_device_statuses`) \
-  Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_add_exclusive_device_marks_reserved`, `test_update_reservation_remove_exclusive_device_marks_available`)
+- **RES-PATCH-9.** An added exclusive device must not conflict over
+  `[max(now, start), end)`, checked by the same refusal create uses, with create's
+  wording (`... already reserved in the requested window`). On an `ACTIVE` reservation it
+  must also be `AVAILABLE` now, because the row is about to hold it. On a `PENDING`
+  reservation the current status is not consulted, exactly like a create for a future
+  window (RES-CREATE-12): the row holds nothing until activation, which sets the device
+  `RESERVED` as usual. By decision (issue #999, 2026-10-05). \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_assert_no_window_conflicts`) \
+  Pinned by: `services/reservations/tests/test_reservation_patch_hold.py` (`test_pending_add_accepts_a_device_reserved_now_but_free_in_the_window`, `test_pending_add_refuses_a_device_booked_over_the_window_with_creates_wording`, `test_active_add_still_refuses_a_device_that_is_not_available_now`, `test_device_added_to_a_pending_row_is_reserved_at_activation`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_conflict_on_added_device`)
+- **RES-PATCH-10.** The edit commits under a status guard: a self-transition
+  compare-and-swap on the status the PATCH read. If a cancel, release, auto-complete, or
+  the sweep's activation claim moved the row during the PATCH, nothing of the edit is
+  kept (no device-set change, no event, no inventory write) and the PATCH answers 409
+  `Reservation changed status during the update (<read> to <now>); nothing was changed`
+  (log action `reservation_update_lost_race`). Inventory is written only after the
+  commit and only on an `ACTIVE` row: added exclusive devices are set `RESERVED` with
+  three attempts, then the status is read again and, if the row has left `ACTIVE`
+  meanwhile, the devices this call set are put back to `AVAILABLE` holder-aware
+  (`reservation_update_hold_reverted`); removed devices go through the shared release
+  helper (RES-HOLD-3, RES-HOLD-5) with three attempts. A write that still fails is logged
+  (`reservation_update_hold_failed`, `reservation_update_release_failed`) and the
+  committed edit stands, by decision: no double booking follows, because the conflict
+  check reads reservations' own rows, and the row's next transition writes the device
+  again. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `ReservationStatusChanged`, `_hold_added_devices_after_edit`, `_release_exclusive_devices_best_effort`) \
+  Pinned by: `services/reservations/tests/test_reservation_patch_hold.py` (`test_active_add_reserves_only_after_the_edit_committed`, `test_active_add_inventory_failure_is_retried_logged_and_the_edit_stands`, `test_active_remove_inventory_failure_is_retried_logged_and_the_edit_stands`, `test_commit_failure_writes_nothing_to_inventory`, `test_patch_losing_its_status_guard_keeps_nothing`, `test_cancel_committing_after_the_edit_reverts_the_added_hold`, `test_patch_route_answers_409_when_the_status_guard_loses`); `services/reservations/tests/test_reservation_patch_race_live_pg.py` (`test_cancel_during_the_patch_checks_keeps_nothing_of_the_patch`, `test_cancel_during_the_post_commit_flip_leaves_the_added_device_released`, `test_patch_versus_cancel_jittered_around_the_patch_commit`); `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_add_exclusive_device_marks_reserved`, `test_update_reservation_remove_exclusive_device_marks_available`)
 - **RES-PATCH-11.** Removing devices from an `ACTIVE` reservation records them in
   `pending_fork_prune_device_ids` in the edit's transaction, unioned with any ids still
   pending, then asks cabling to prune them from the fork (RES-FORK-16). \
@@ -1148,7 +1161,8 @@ sweep, and event delivery never return an error to a caller.
 | 404 | `Fork not found` | reading the fork of a non-`ACTIVE` reservation that has none | RES-FORK-5 |
 | 409 | `Time conflict: devices [<ids>] already reserved in the requested window` | create overlaps another live booking of an exclusive device | RES-CONFLICT-1 |
 | 409 | `Time conflict: devices [<ids>] already reserved in the extended window` | PATCH extension overlaps another live booking | RES-PATCH-4 |
-| 409 | `Time conflict: devices [<ids>] already reserved` | PATCH-add overlaps another live booking | RES-PATCH-9 |
+| 409 | `Time conflict: devices [<ids>] already reserved in the requested window` | PATCH-add overlaps another live booking (create's wording) | RES-PATCH-9 |
+| 409 | `Reservation changed status during the update (<read> to <now>); nothing was changed` | PATCH lost its status guard to a concurrent transition | RES-PATCH-10 |
 | 409 | `Reservation has no suggestion to accept` | accept or dismiss with no suggestion (same text on dismiss) | RES-PURPOSE-10, RES-PURPOSE-11 |
 | 409 | `{"error": "not_eligible"}` | Classify now on a row not yet stamped | RES-PURPOSE-13 |
 | 409 | `{"error": "already_suggested"}` | Classify now on a row with a suggestion | RES-PURPOSE-13 |
@@ -1195,7 +1209,7 @@ Calls into this area are in section 7; events are in section 6.
 | Out | inventory | `POST /devices/batch` (caller's JWT) | device existence, visibility, type, exclusivity, status on create and PATCH | Fail closed: 503 on create and on PATCH device changes; on a PATCH end-time extension every device is treated as exclusive |
 | Out | inventory | `GET /templates/{id}` (caller's JWT) | dynamic template check | Fail closed: 503 |
 | Out | inventory | `GET /devices/{id}/internal` (internal token) | exclusivity on release and scheduled activation | Fail toward exclusive: an unreadable device is treated as exclusive; a 404 drops it from a release, except on auto-complete (RES-HOLD-5, RES-HOLD-9) |
-| Out | inventory | `POST /devices/{id}/status` (internal token) | set `RESERVED` or `AVAILABLE` | Create path: three attempts then `FAILED` and 503. Scheduled activation: three attempts then back to `PENDING`. Releases: logged, terminal status stands. PATCH: one attempt, logged, edit stands |
+| Out | inventory | `POST /devices/{id}/status` (internal token) | set `RESERVED` or `AVAILABLE` | Create path: three attempts then `FAILED` and 503. Scheduled activation: three attempts then back to `PENDING`. Releases: logged, terminal status stands. PATCH: after the commit, three attempts, logged, edit stands (RES-PATCH-10) |
 | Out | cabling | `POST /topologies/{id}/validate/internal` (internal token) | topology connectivity, membership, routing intent | 404: treated as nothing to validate (RES-TOPO-5). Other error or transport: fail closed, 503 |
 | Out | cabling | `POST /internal/forks` (internal token) | fork create at activation, by the sweep, or lazily on read | Activation and sweep: three attempts, logged, reservation stays `ACTIVE`; 409 or 422 final. Lazy read: 503 to the caller |
 | Out | cabling | `GET`, `PUT`, `POST` on `/internal/forks/{id}/...` (internal token) | the forwarded fork routes | 4xx relayed; 5xx and transport 503 |
@@ -1254,11 +1268,6 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
 
 ### Open defects
 
-- #994 (RES-PATCH-10, RES-HOLD-3): PATCH writes inventory before the edit commits, in
-  one attempt whose failure is only logged, so an added exclusive device can stay
-  `AVAILABLE` while held. The removal write skips the holder check every other release
-  path uses, and the commit does not re-check the status the edit read, so a cancel or
-  auto-complete racing a PATCH can leave an added device `RESERVED` with no holder.
 - #995 (RES-PATCH-5): a PATCH can extend a reservation past
   `RESERVATION_MAX_DURATION_SECONDS`; only create applies the cap.
 - #999 (RES-PATCH-9): PATCH-add on a `PENDING` reservation requires the added device to

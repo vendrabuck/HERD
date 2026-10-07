@@ -96,6 +96,10 @@ Exclusive device is already held by another reservation during the window you re
 
 `PENDING_PROVISION` reservations also count as conflicts (this is the B2 race-close), so if someone else is mid-creating on the same device, you'll get 409 until their provisioning finishes or fails.
 
+### `409 Reservation changed status during the update (...); nothing was changed`
+
+A PATCH to a reservation lost a race: while it was checking devices, the reservation was cancelled, released, completed by the sweep, or started its activation. The edit was discarded whole (no device change, no event, no inventory write). Reload the reservation and edit again if it is still `ACTIVE` or `PENDING` (issue #994).
+
 ### `422 The following devices are not available`
 
 A device's status is not compatible with the reservation:

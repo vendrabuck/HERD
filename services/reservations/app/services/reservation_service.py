@@ -2341,6 +2341,26 @@ async def get_reservation(
     return result.scalar_one_or_none()
 
 
+class ReservationStatusChanged(LookupError):
+    """A PATCH lost its status guard to a concurrent transition (issue #994).
+
+    The edit read the row in `observed`, did its checks (seconds of inventory and
+    cabling HTTP), and found at commit that a cancel, release, auto-complete, or
+    the sweep's activation claim had moved the row on. Nothing of the edit is kept:
+    no device-set change, no event, no inventory write. A LookupError, so the
+    router answers 409 like every other "the state moved under you" refusal.
+    """
+
+    def __init__(self, observed: ReservationStatus, current: ReservationStatus | None):
+        self.observed = observed
+        self.current = current
+        now = current.value if current is not None else "gone"
+        super().__init__(
+            f"Reservation changed status during the update ({observed.value} to {now}); "
+            "nothing was changed"
+        )
+
+
 async def _assert_no_window_conflicts(
     db: AsyncSession,
     device_ids: list[uuid.UUID],
@@ -2372,6 +2392,73 @@ async def _assert_no_window_conflicts(
         )
 
 
+async def _hold_added_devices_after_edit(
+    db: AsyncSession,
+    reservation_id: uuid.UUID,
+    device_ids: list[uuid.UUID],
+    user_id: uuid.UUID,
+) -> None:
+    """Set devices a committed PATCH added to an ACTIVE row to RESERVED (issue #994).
+
+    Runs AFTER the edit committed, so a failed commit never touches inventory.
+    Three attempts, the create path's retry; a write that still fails is logged
+    (`reservation_update_hold_failed`) and the edit stands, by decision: the edit
+    already committed and the conflict check reads reservations' own rows, so no
+    double booking follows, and reverting a committed device-set change from
+    here would race the owner's next edit. Inventory shows the device AVAILABLE
+    until the next transition of the row writes it.
+
+    Then the status is read again: a cancel or auto-complete that committed
+    between the edit's commit and this flip may already have released the row's
+    devices without these, so a row that no longer holds devices gets exactly
+    the devices this call flipped put back, holder-aware (the same revert a lost
+    create uses). A transition that commits after the re-read releases the
+    device itself, since it is then in the row's committed set.
+    """
+    if not device_ids:
+        return
+    flipped: set[uuid.UUID] = set()
+    try:
+        await retry_with_backoff(
+            lambda: _update_device_statuses(
+                device_ids, "RESERVED", raise_on_failure=True, succeeded=flipped
+            ),
+            attempts=3,
+            initial_delay=0.5,
+            factor=2.0,
+            max_delay=5.0,
+        )
+    except Exception as exc:
+        logger.error(
+            "Reservation %s: inventory hold of added devices failed after retries",
+            reservation_id,
+            extra={
+                "action": "reservation_update_hold_failed",
+                "reservation_id": str(reservation_id),
+                "user_id": str(user_id),
+                "device_ids": [str(d) for d in device_ids],
+            },
+            exc_info=exc,
+        )
+    if not flipped:
+        return
+    current = (
+        await db.execute(select(Reservation.status).where(Reservation.id == reservation_id))
+    ).scalar_one_or_none()
+    if current in _DEVICE_HOLDING_STATUSES:
+        return
+    logger.warning(
+        "Reservation %s left ACTIVE after the edit committed; reverting the added devices",
+        reservation_id,
+        extra={
+            "action": "reservation_update_hold_reverted",
+            "reservation_id": str(reservation_id),
+            "device_ids": [str(d) for d in sorted(flipped)],
+        },
+    )
+    await _revert_flipped_devices_best_effort(reservation_id, sorted(flipped), db=db)
+
+
 async def update_reservation(
     db: AsyncSession,
     reservation_id: uuid.UUID,
@@ -2379,7 +2466,16 @@ async def update_reservation(
     data: ReservationUpdate,
     token: str = "",
 ) -> Reservation | None:
-    """Update an ACTIVE or PENDING reservation (end_time, purpose)."""
+    """Update an ACTIVE or PENDING reservation (end_time, purpose, device_ids).
+
+    Hold rule (issues #897, #994): a PENDING row holds nothing, so an edit of it
+    writes no inventory status. On an ACTIVE row the device-set change commits
+    first, under a status guard (the status this call read must still hold at
+    commit, else ReservationStatusChanged and nothing is kept); only then are the
+    added exclusive devices set RESERVED (three attempts) and the removed ones
+    released through the holder-aware filter (three attempts). An inventory
+    failure after the commit is logged and the edit stands.
+    """
     reservation = await get_reservation(db, reservation_id, user_id)
     if not reservation:
         return None
@@ -2443,6 +2539,7 @@ async def update_reservation(
 
     added_ids: list[uuid.UUID] = []
     removed_ids: list[uuid.UUID] = []
+    added_exclusive_uuids: list[uuid.UUID] = []
 
     if data.device_ids is not None:
         old_set = {str(d) for d in reservation.device_ids}
@@ -2535,28 +2632,7 @@ async def update_reservation(
                     exclusive_device_ids=added_exclusive,
                 )
 
-                # Mark added exclusive devices as RESERVED
                 added_exclusive_uuids = [d for d in added_ids if str(d) in added_exclusive]
-                # Inventory status describes a HOLD (issue #897): only a row in
-                # {PENDING_PROVISION, ACTIVE} holds its devices, and a PENDING row
-                # (a future booking since #132) holds nothing, so a PATCH on it
-                # writes no inventory status. PENDING_PROVISION is refused above.
-                if added_exclusive_uuids and reservation.status in _DEVICE_HOLDING_STATUSES:
-                    await _update_device_statuses(added_exclusive_uuids, "RESERVED")
-
-            # Release removed exclusive devices
-            # Same hold rule as the add half: a PENDING row never flipped these, so
-            # releasing them would clobber another holder's RESERVED (issue #897).
-            if removed_ids and reservation.status in _DEVICE_HOLDING_STATUSES:
-                try:
-                    removed_devices = await _fetch_devices(removed_ids, token)
-                    removed_exclusive = [
-                        uuid.UUID(str(d["id"])) for d in removed_devices if d.get("exclusive", True)
-                    ]
-                except Exception:
-                    removed_exclusive = list(removed_ids)
-                if removed_exclusive:
-                    await _update_device_statuses(removed_exclusive, "AVAILABLE")
 
             # Proxy diffs the membership: delete-orphan removes departed devices,
             # new ones are inserted; all flushed in the single commit below.
@@ -2567,16 +2643,39 @@ async def update_reservation(
     # below stays visible and the expiration sweep's pending-prune reconciler retries
     # it until it converges. Union with any ids a prior failed prune left pending.
     # ACTIVE-only, matching the prune call below: PENDING has no fork to prune.
-    if removed_ids and reservation.status == ReservationStatus.ACTIVE:
+    if removed_ids and observed_status == ReservationStatus.ACTIVE:
         already_pending = set(reservation.pending_fork_prune_device_ids or [])
         reservation.pending_fork_prune_device_ids = sorted(
             already_pending | {str(d) for d in removed_ids}
         )
 
     reservation.modified_by = user_id
-    # Stage reservation.updated in the same transaction as the edit (issue #21).
-    # The device membership diff (added/removed) and any inventory flips above are
-    # already applied to the session; this commits the event atomically with them.
+
+    # Status guard (issue #994): the edit commits only while the row is still in
+    # the status this call read. A self-transition compare-and-swap through the
+    # ONE status helper; a cancel, release, auto-complete, or activation claim
+    # that committed during the checks above wins, and this call keeps nothing.
+    if not await _claim_status_transition(db, reservation.id, (observed_status,), observed_status):
+        # rollback() expires the instance, so only the plain reservation_id is
+        # read from here on.
+        await db.rollback()
+        current = (
+            await db.execute(select(Reservation.status).where(Reservation.id == reservation_id))
+        ).scalar_one_or_none()
+        logger.warning(
+            "Reservation %s changed status during the update; edit discarded",
+            reservation_id,
+            extra={
+                "action": "reservation_update_lost_race",
+                "reservation_id": str(reservation_id),
+                "user_id": str(user_id),
+            },
+        )
+        raise ReservationStatusChanged(observed_status, current)
+
+    # Stage reservation.updated in the same transaction as the edit (issue #21),
+    # atomically with the device membership diff. Inventory is written only after
+    # this commit (issue #994).
     await enqueue_event(
         db,
         OutboxEvent,
@@ -2598,6 +2697,23 @@ async def update_reservation(
     await db.commit()
     await db.refresh(reservation)
 
+    # Inventory follows the committed edit, and only on a row that holds devices
+    # (RES-HOLD-1). PENDING_PROVISION is refused above, so that means ACTIVE.
+    if observed_status in _DEVICE_HOLDING_STATUSES:
+        await _hold_added_devices_after_edit(db, reservation.id, added_exclusive_uuids, user_id)
+        if removed_ids:
+            # The ONE holder-aware release (issue #898): reads exclusivity itself
+            # (unreadable means exclusive, gone means dropped), skips any device
+            # another live row holds, three attempts, failure logged.
+            await _release_exclusive_devices_best_effort(
+                reservation.id,
+                removed_ids,
+                "reservation_update_release_failed",
+                context_label="device removal",
+                user_id=user_id,
+                db=db,
+            )
+
     # Decision 6 REMOVE half (ADR 0009 phase 7): a device removed from an ACTIVE
     # reservation releases its wiring through the fork's saved INTENDED set (cabling's
     # prune-devices endpoint, issue #459), staging the released delta; best-effort
@@ -2606,7 +2722,7 @@ async def update_reservation(
     # sweep until it converges (issue #462). PENDING reservations have no fork (the
     # prune 404s to a no-op) and are skipped outright; the ADD half deliberately
     # wires nothing until a fork save.
-    if removed_ids and reservation.status == ReservationStatus.ACTIVE:
+    if removed_ids and observed_status == ReservationStatus.ACTIVE:
         await _prune_removed_devices_from_fork_best_effort(reservation.id, removed_ids)
 
     logger.info(

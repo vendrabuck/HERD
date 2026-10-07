@@ -1690,19 +1690,20 @@ async def test_update_reservation_remove_non_exclusive_no_status_change():
     async with TestSessionLocal() as db:
         res = await _insert_reservation(db, device_ids=[DEVICE_A, DEVICE_B])
 
-        non_excl_a = _make_device(DEVICE_A, exclusive=False)
-        mock_fetch = AsyncMock(
-            side_effect=[
-                [_make_device(DEVICE_A)],  # fetch for new device set
-                [non_excl_a],  # fetch for removed device check
-            ]
-        )
+        mock_fetch = AsyncMock(return_value=[_make_device(DEVICE_A)])  # new device set
+        # The removal reads exclusivity through the shared release helper's
+        # best-effort fetch (issue #994): the removed DEVICE_B is non-exclusive.
+        mock_best_effort = AsyncMock(return_value=[_make_device(DEVICE_B, exclusive=False)])
         mock_update_statuses = AsyncMock()
 
         with (
             patch(
                 "app.services.reservation_service._fetch_devices",
                 new=mock_fetch,
+            ),
+            patch(
+                "app.services.reservation_service._fetch_devices_best_effort",
+                new=mock_best_effort,
             ),
             patch(
                 "app.services.reservation_service._update_device_statuses",
