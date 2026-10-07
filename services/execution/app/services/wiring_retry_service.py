@@ -126,9 +126,13 @@ logger = logging.getLogger(__name__)
 # last_error starts with either one records an intent that a verbatim apply cannot
 # realize (the recorded switch/port is gone, or the flattened hop set cannot be paired):
 # a hardware retry would re-hit the same wall, so recovery is a fork re-save. The
-# load-error variants ("recorded hop unresolvable: switch <id> not found", etc.) start
-# with the same prefix and are non-retryable for the same reason: there is no resolvable
-# driver to call.
+# load-error variants start with the same prefix only when the failure is permanent:
+# the switch or its template is gone from inventory ("recorded hop unresolvable: switch
+# <id> not found", etc.) or its driver package is broken ("recorded hop unresolvable:
+# driver load failed: DriverPackageError"). A transient load failure (a download that
+# failed while inventory or package storage was unreachable) records the plain
+# "driver load failed: <ClassName>" text instead, which is retryable (issue #1002,
+# nats_consumer._wiring_load_failure).
 # Single-sourced from nats_consumer (issue #491 review): the reconcile's stale-build
 # exclusions use the same tuple, so the two sides cannot drift.
 _NON_RETRYABLE_PREFIXES = NON_RETRYABLE_REASON_PREFIXES

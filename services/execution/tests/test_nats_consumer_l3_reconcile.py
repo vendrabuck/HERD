@@ -717,6 +717,11 @@ async def test_apply_l3_adjacency_template_not_found_parks_provision_failed():
 
 
 async def test_apply_l3_adjacency_driver_load_raises_parks_provision_failed():
+    """A broken package (DriverPackageError) parks the provision FAILED with the
+    pinned non-retryable reason and the sanitized class name, never the message
+    (issue #1002; the transient case is in test_wiring_driver_load_classification)."""
+    from app.services.driver_loader import DriverPackageError
+
     execute_fn, calls = _l3_recorder()
     ctx = _FetchContext(None)
     with (
@@ -726,7 +731,7 @@ async def test_apply_l3_adjacency_driver_load_raises_parks_provision_failed():
         ),
         patch(
             "app.services.driver_loader.load_driver",
-            new=AsyncMock(side_effect=RuntimeError("package corrupt")),
+            new=AsyncMock(side_effect=DriverPackageError("package corrupt")),
         ),
         patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
     ):
@@ -742,8 +747,10 @@ async def test_apply_l3_adjacency_driver_load_raises_parks_provision_failed():
     rows = await _rows()
     assert len(rows) == 1
     assert rows[0].status == "FAILED"
-    assert "driver load failed" in rows[0].last_error
-    assert "package corrupt" in rows[0].last_error
+    assert rows[0].last_error == (
+        "recorded hop unresolvable: driver load failed: DriverPackageError"
+    )
+    assert rows[0].attempts == 0
 
 
 async def test_apply_l3_adjacency_deprovision_switch_not_found_parks_failed():

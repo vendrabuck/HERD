@@ -797,8 +797,9 @@ removes exactly that when the switch is no longer needed.
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`) \
   Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_reconcile_failed_provision_lands_failed_intended_active`, `test_delta_partial_failure_keeps_previous_pin_lands_failed`, `test_delta_mixed_removes_and_adds_in_one_reconcile`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_l3_teardown_driver_failure_keeps_pin_and_lands_failed_released`)
 - **WIRE-L3-11.** A switch inventory reports missing, a missing template, a driver load
-  that raises, or a failed `login` records the switch FAILED in its direction (through
-  `record_route_reconcile_failed` for a delta) with no route call. \
+  that raises (with the reason WIRE-DRIVER-7 gives it), or a failed `login` records the
+  switch FAILED in its direction (through `record_route_reconcile_failed` for a delta)
+  with no route call. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`) \
   Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_apply_l3_adjacency_switch_not_found_parks_provision_failed`, `test_apply_l3_adjacency_template_not_found_parks_provision_failed`, `test_apply_l3_adjacency_driver_load_raises_parks_provision_failed`, `test_apply_l3_adjacency_deprovision_switch_not_found_parks_failed`, `test_reconcile_login_failure_parks_provision_failed_no_configure_call`)
 - **WIRE-L3-12.** On a frozen reservation a delta drives only its removals and records
@@ -816,9 +817,10 @@ removes exactly that when the switch is no longer needed.
   Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_gate_missing_config_version_lands_unconfigured_failed_no_driver_call`, `test_gate_reconcile_failure_keeps_previous_pin_via_reconcile_failed_path`)
 - **WIRE-L3-14.** The gate refuses the whole switch with `l3_vrf_unsupported` when any
   route names a `virtual_router` and the switch's driver, loaded first, does not declare
-  `supports_vrf`; a missing switch, a missing driver, or a package that will not load
-  also refuses, while a failed package download raises `TransientUpstreamError`. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_gate_l3_drive_routes`, `_l3_driver_supports_vrf`) \
+  `supports_vrf`; a missing switch, a missing driver, or a broken package also refuses,
+  while any other load failure (a failed package download) raises
+  `TransientUpstreamError`, judged by `is_permanent_load_failure` (WIRE-DRIVER-7). \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_gate_l3_drive_routes`, `_l3_driver_supports_vrf`); `services/execution/app/services/driver_loader.py` (`is_permanent_load_failure`) \
   Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_vrf_route_fails_switch_with_no_driver_call`, `test_vrf_route_on_delta_fails_via_reconcile_failed_path`, `test_vrf_route_drives_when_the_driver_declares_supports_vrf`, `test_vrf_route_still_fails_when_the_driver_declares_only_dry_run`); `tests/integration/test_l3_intent_execution.py` (`test_vrf_route_on_a_non_declaring_driver_parks_l3_vrf_unsupported`)
 - **WIRE-L3-15.** The gate re-validates only when some route's
   `validated_config_version_id` is missing or differs from the id of the switch's current
@@ -886,12 +888,19 @@ it fails, and counted as done only when the driver's own answer says so.
   `HERD_`, plus the device id, name, connection type, reservation id, and user id. \
   Enforced in: `services/execution/app/services/execution_service.py` (`build_context`) \
   Pinned by: `services/execution/tests/test_execution_service.py` (`test_build_context`)
-- **WIRE-DRIVER-7.** A driver load that raises, including a failed package download,
-  parks the switch's rows under a reason starting `WIRING_UNRESOLVABLE_REASON` followed
-  by `driver load failed:` and the exception text, which neither retry channel retries
-  (WIRE-RETRY-4). Known gap, see #1002. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_apply_wiring_pairs`, `_apply_l2_memberships`, `_apply_l3_adjacency`); `services/execution/app/services/wiring_retry_service.py` (`is_retryable_failure`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_driver_load_raise_parks_pairs_failed_without_nak`); `services/execution/tests/test_wiring_retry_service.py` (`test_is_retryable_classifies_pinned_reasons_not_retryable`)
+- **WIRE-DRIVER-7.** A driver load that raises parks the switch's rows in their own
+  direction with no driver call, classified by the kind of failure. A broken package
+  (`DriverPackageError`) is permanent: the reason is `WIRING_UNRESOLVABLE_REASON` followed
+  by `driver load failed: DriverPackageError`, with no attempt counted, and neither retry
+  channel retries it (WIRE-RETRY-4). Any other load failure, a failed package download
+  in particular, is transient: the reason is `driver load failed: <ClassName>` (the
+  wrapped cause's class, for example `ConnectError`), with one attempt counted, and both
+  retry channels drive the row again in its direction, builds and releases (a teardown's
+  included) alike. A transient failure in the L2 `create_vlan` pre-pass parks the
+  dependent joins under `create_vlan failed: driver load failed: <ClassName>`. The stored
+  text never carries the exception's message, which goes only to the log. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_wiring_load_failure`, `_apply_wiring_pairs`, `_run_vlan_definition_op`, `_apply_l2_memberships`, `_apply_l3_adjacency`); `services/execution/app/services/driver_loader.py` (`is_permanent_load_failure`, `driver_load_failure_text`); `services/execution/app/services/wiring_retry_service.py` (`is_retryable_failure`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_driver_load_raise_parks_pairs_failed_without_nak`); `services/execution/tests/test_wiring_driver_load_classification.py` (`test_wiring_load_failure_reason_and_attempts_by_kind`, `test_l1_transient_download_failure_parks_build_and_release_retryable`, `test_l1_broken_package_parks_build_and_release_permanent`, `test_l2_transient_download_failure_parks_add_and_remove_retryable`, `test_l2_transient_failure_during_vlan_define_parks_the_add_retryable`, `test_l3_transient_download_failure_parks_provision_and_deprovision_retryable`, `test_l3_broken_package_parks_provision_and_deprovision_permanent`, `test_l1_transient_rows_converge_on_the_next_retry_tick`, `test_l2_transient_remove_converges_on_the_next_retry_tick`, `test_l3_transient_rows_converge_on_the_next_retry_tick`, `test_l1_broken_package_rows_are_not_retried_by_the_tick`, `test_teardown_l1_removal_with_transient_download_failure_stays_retryable`); `services/execution/tests/test_wiring_retry_service.py` (`test_is_retryable_classifies_pinned_reasons_not_retryable`)
 
 **Out of scope.** Driver package loading, caching, and validation (`inventory.md`,
 `device-configuration.md`); the driver method contract (`DRIVERS.md`).
@@ -1194,7 +1203,7 @@ Events are in section 6; the internal routes this area serves are in section 7.
 | Out | cabling | `GET /fabric/internal?device_id` (internal token, 10 s) | the fabric of an L2 switch | Fail open: a substitute fabric per switch (WIRE-VLAN-6) |
 | Out | inventory | `GET /devices/{id}/internal`, `GET /templates/{id}/internal` (internal token, 10 s) | classify hop endpoints, load switch drivers | 5xx or transport nacks the event (WIRE-ORDER-11); in a retry the tick logs it and the manual route answers 503; another non-200 reads as missing (WIRE-PAIR-4, WIRE-L1-3) |
 | Out | inventory | `GET /devices/{id}/config-versions/latest/internal` (internal token, 10 s) | L3 config routes and the drive gate | 5xx or transport nacks (WIRE-L3-18); 404 means no config (WIRE-L3-4, WIRE-L3-16) |
-| Out | inventory | `GET /drivers/{id}/internal-download` (through the driver loader) | fetch a driver package on a cache miss | The switch's rows are parked non-retryable (WIRE-DRIVER-7); in the VRF capability check it nacks instead (WIRE-L3-14) |
+| Out | inventory | `GET /drivers/{id}/internal-download` (through the driver loader) | fetch a driver package on a cache miss | The switch's rows are parked FAILED and retryable by both retry channels; a broken package is parked non-retryable (WIRE-DRIVER-7); in the VRF capability check a failed download nacks instead (WIRE-L3-14) |
 | Out | driver package | `login`, `connect_ports`, `disconnect_ports`, `create_vlan`, `delete_vlan`, `add_to_vlan`, `remove_from_vlan`, `configure_route`, `remove_route`, `logout` in the sandbox | change the switch | Three attempts in line, then a FAILED row; never nacks (WIRE-DRIVER-2, WIRE-DRIVER-4) |
 | Out | NATS | `herd.reservations.dlq.execution` publish | dead-letter a message | Logged; the message is still acked (WIRE-CONSUME-12) |
 
@@ -1245,13 +1254,6 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
   frozen, so those routes are never removed. While the reservation is live, the next
   save (the adjacency reconcile) or a build retry provisions the current intent and
   replaces the pin without removing the routes that left it.
-- #1002 (WIRE-DRIVER-7): every driver load failure, a transient package download
-  failure included, is recorded with the non-retryable unresolvable-hop reason, so
-  neither retry channel retries it. For L2 and L3 the next wiring change of any kind
-  re-drives a build-direction row whose switch is still intended, because the full
-  reconcile compares against ACTIVE rows only; a release-direction row parked this way
-  (a teardown's included) is driven again by nothing. An L1 build pair on a contiguous
-  delta waits for a gap, a heal, or the edge being redrawn.
 - #1003 (WIRE-VLAN-6): VLAN uniqueness is checked only among allocations with the same
   fabric id. A failed fabric lookup substitutes the id of a one-switch fabric, exactly
   what cabling computes for an isolated switch, and re-resolves it on every call. The
