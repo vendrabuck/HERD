@@ -16,6 +16,7 @@ import { PortsSection } from "@/components/devices/PortsSection";
 import { DeviceConfigSection } from "@/components/device-config/DeviceConfigSection";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { DeviceInfoPanel } from "@/components/inventory/DeviceInfoPanel";
+import { deviceEditPayload, type DeviceEditFields } from "@/lib/deviceEdit";
 import type { TopologyType, DeviceStatus } from "@/types/device.types";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -50,31 +51,45 @@ export function DevicePage() {
   const [topologyType, setTopologyType] = useState<TopologyType>("PHYSICAL");
   const [status, setStatus] = useState<DeviceStatus>("AVAILABLE");
   const [fieldData, setFieldData] = useState<Record<string, unknown>>({});
-  const [syncedId, setSyncedId] = useState<string | undefined>();
+  // The device as it stood when Edit was clicked (issue #1020). Save sends only
+  // the fields that differ from it, so a value the admin did not touch, such as
+  // a status provisioning changed meanwhile, is never written back stale.
+  const [baseline, setBaseline] = useState<DeviceEditFields | null>(null);
 
-  if (device && device.id !== syncedId) {
-    setSyncedId(device.id);
-    setName(device.name);
-    setTopologyType(device.topology_type);
-    setStatus(device.status);
-    setFieldData(device.field_data);
-  }
+  const startEditing = () => {
+    if (!device) return;
+    const current: DeviceEditFields = {
+      name: device.name,
+      topology_type: device.topology_type,
+      status: device.status,
+      field_data: device.field_data,
+    };
+    setBaseline(current);
+    setName(current.name);
+    setTopologyType(current.topology_type);
+    setStatus(current.status);
+    setFieldData(current.field_data);
+    setEditing(true);
+  };
 
   const handleSave = async () => {
     if (!name.trim()) {
       toast.error("Name is required");
       return;
     }
+    if (!baseline) return;
+    const data = deviceEditPayload(baseline, {
+      name,
+      topology_type: topologyType,
+      status,
+      field_data: fieldData,
+    });
+    if (Object.keys(data).length === 0) {
+      setEditing(false);
+      return;
+    }
     try {
-      await updateDevice.mutateAsync({
-        id: id!,
-        data: {
-          name: name.trim(),
-          topology_type: topologyType,
-          status,
-          field_data: fieldData,
-        },
-      });
+      await updateDevice.mutateAsync({ id: id!, data });
       toast.success("Device updated");
       setEditing(false);
     } catch (err: unknown) {
@@ -100,12 +115,6 @@ export function DevicePage() {
   };
 
   const handleCancel = () => {
-    if (device) {
-      setName(device.name);
-      setTopologyType(device.topology_type);
-      setStatus(device.status);
-      setFieldData(device.field_data);
-    }
     setEditing(false);
   };
 
@@ -171,7 +180,7 @@ export function DevicePage() {
                     Delete
                   </button>
                   <button
-                    onClick={() => setEditing(true)}
+                    onClick={startEditing}
                     className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
                   >
                     Edit
