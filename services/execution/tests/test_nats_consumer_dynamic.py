@@ -2732,3 +2732,50 @@ async def test_recipe_run_status_follows_the_recipe_verdict():
     assert by_action["create_instance"].status == "FAILED"
     assert by_action["create_instance"].error == "driver reported failure"
 
+
+# --- issue #1032: secret values never reach a run row (DYN-CTX-4) -------------
+
+
+async def test_full_recipe_cycle_never_stores_secret_plaintext():
+    """ADR 0004's promised pin: across a full create cycle and its teardown, no
+    hypervisor secret value and no password-typed template default appears in
+    any column of any ExecutionRun row, and the redaction marker does."""
+    template = json.loads(json.dumps(TEMPLATE_DATA))
+    template["sections"][0]["fields"].append(
+        {"key": "vm_password", "type": "password", "default": "tmpl-pw-5150"}
+    )
+    secret = {"username": "svc-hv", "password": "hunter2", "api_token": "tok-8675309"}
+    plaintexts = ["hunter2", "tok-8675309", "tmpl-pw-5150"]
+    calls, execute = _recipe_execute({"create_instance": CREATE_OK, "destroy_instance": DESTROY_OK})
+    with ExitStack() as stack:
+        for p in _create_patches(execute, template=template, secret=secret):
+            stack.enter_context(p)
+        stack.enter_context(
+            patch(
+                "app.services.nats_consumer._delete_dynamic_device",
+                new=AsyncMock(return_value=True),
+            )
+        )
+        stack.enter_context(
+            patch("app.services.nats_consumer._post_provision_result_best_effort", new=AsyncMock())
+        )
+        await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+
+    # The recipe itself did receive the secrets (through the context file).
+    assert calls[0][2]["HERD_secret_password"] == "hunter2"
+    runs = await _runs()
+    assert sorted(r.action for r in runs) == [
+        "create_instance",
+        "destroy_instance",
+        "login",
+        "login",
+        "logout",
+        "logout",
+    ]
+    for run in runs:
+        for column in ExecutionRun.__table__.columns:
+            value = json.dumps(getattr(run, column.name), default=str)
+            for plaintext in plaintexts:
+                assert plaintext not in value, (run.action, column.name)
+        assert "***REDACTED***" in json.dumps(run.input_params, default=str)
