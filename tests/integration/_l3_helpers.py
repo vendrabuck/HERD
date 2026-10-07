@@ -74,7 +74,12 @@ async def create_l3_template(client: httpx.AsyncClient, driver_id: str, name: st
         "sections": [
             {
                 "name": "General",
-                "fields": [{"key": "model", "label": "Model", "type": "string"}],
+                "fields": [
+                    {"key": "model", "label": "Model", "type": "string"},
+                    # The mock_l3 fault knob, so a suite can arm HERD_mock_fail_actions on
+                    # a switch under this template (issue #1001's residue test).
+                    {"key": "mock_fail_actions", "label": "Mock fail", "type": "string"},
+                ],
             }
         ],
     }
