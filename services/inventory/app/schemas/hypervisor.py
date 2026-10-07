@@ -19,6 +19,7 @@ class HypervisorCreate(BaseModel):
     hypervisor_type: str
     secret_id: uuid.UUID
     enabled: bool = True
+    device_group_id: uuid.UUID | None = None
 
     @field_validator("name", "endpoint", "hypervisor_type")
     @classmethod
@@ -35,6 +36,7 @@ class HypervisorUpdate(BaseModel):
     hypervisor_type: str | None = None
     secret_id: uuid.UUID | None = None
     enabled: bool | None = None
+    device_group_id: uuid.UUID | None = None
 
     @field_validator("name", "endpoint", "hypervisor_type")
     @classmethod
@@ -50,6 +52,7 @@ class HypervisorResponse(BaseModel):
     hypervisor_type: str
     secret_id: uuid.UUID
     enabled: bool
+    device_group_id: uuid.UUID | None = None
     created_at: datetime
     updated_at: datetime
     modified_by: uuid.UUID | None = None

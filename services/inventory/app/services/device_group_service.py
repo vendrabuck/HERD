@@ -263,6 +263,26 @@ async def get_visible_device_ids(
     return {row[0] for row in result.all()}
 
 
+async def get_permitted_device_group_ids(
+    db: AsyncSession, user_group_ids: list[uuid.UUID]
+) -> set[uuid.UUID]:
+    """Return the device groups the given user groups hold a permission on.
+
+    The same DeviceGroupPermission rows `get_visible_device_ids` joins through;
+    used for the dynamic-template gate (issue #1053), where a template is
+    visible through its hypervisor's device group rather than through device
+    membership.
+    """
+    if not user_group_ids:
+        return set()
+    result = await db.execute(
+        select(DeviceGroupPermission.device_group_id).where(
+            DeviceGroupPermission.user_group_id.in_(user_group_ids)
+        )
+    )
+    return {row[0] for row in result.all()}
+
+
 async def get_device_groups_for_device(db: AsyncSession, device_id: uuid.UUID) -> list[DeviceGroup]:
     """Return all device groups that contain the given device, with permissions loaded."""
     result = await db.execute(

@@ -15,6 +15,11 @@ from app.schemas.template import (
     TemplateResponse,
     TemplateUpdate,
 )
+from app.services.device_visibility import (
+    dynamic_template_visible,
+    dynamic_templates_exist,
+    resolve_visible_dynamic_hypervisor_ids,
+)
 from app.services.template_service import (
     create_template,
     delete_template,
@@ -58,11 +63,28 @@ async def get_templates(
     template_type: str | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
+    authorization: str | None = Header(None),
     db: AsyncSession = Depends(get_db),
-    _: dict = Depends(get_current_user_payload),
+    payload: dict = Depends(get_current_user_payload),
 ):
-    """List all templates. Available to all authenticated users."""
-    templates, total = await list_templates(db, template_type=template_type, skip=skip, limit=limit)
+    """List templates. Available to all authenticated users.
+
+    A non-admin sees a dynamic template only when it is visible to them through
+    its hypervisor's device group (issue #1053); every other template is listed
+    for everyone. The visibility lookup runs only when the listing can contain a
+    dynamic template (the type filter allows one and at least one exists), and
+    it fails closed (503) when auth cannot answer.
+    """
+    visible_hv = None
+    if template_type in (None, "dynamic") and await dynamic_templates_exist(db):
+        visible_hv = await resolve_visible_dynamic_hypervisor_ids(db, payload, authorization)
+    templates, total = await list_templates(
+        db,
+        template_type=template_type,
+        skip=skip,
+        limit=limit,
+        visible_dynamic_hypervisor_ids=visible_hv,
+    )
     return PaginatedTemplateResponse(
         items=[_template_to_response(t) for t in templates],
         total=total,
@@ -74,13 +96,23 @@ async def get_templates(
 @router.get("/templates/{template_id}", response_model=TemplateResponse)
 async def get_template_by_id(
     template_id: uuid.UUID,
+    authorization: str | None = Header(None),
     db: AsyncSession = Depends(get_db),
-    _: dict = Depends(get_current_user_payload),
+    payload: dict = Depends(get_current_user_payload),
 ):
-    """Get a single template. Available to all authenticated users."""
+    """Get a single template. Available to all authenticated users.
+
+    A dynamic template hidden from a non-admin (issue #1053) answers the same
+    404 and detail as an unknown id, so this read cannot tell the two apart; a
+    reservation naming it is refused as not found for the same reason.
+    """
     template = await get_template(db, template_id)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
+    if template.template_type == "dynamic":
+        visible_hv = await resolve_visible_dynamic_hypervisor_ids(db, payload, authorization)
+        if not dynamic_template_visible(template, visible_hv):
+            raise HTTPException(status_code=404, detail="Template not found")
     return _template_to_response(template)
 
 

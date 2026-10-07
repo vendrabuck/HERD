@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.models.device_group import DeviceGroup
 from app.models.hypervisor import Hypervisor
 from app.models.template import DeviceTemplate
 from app.schemas.hypervisor import HypervisorCreate, HypervisorUpdate
@@ -52,6 +53,12 @@ async def validate_secret_exists(secret_id: uuid.UUID) -> None:
         )
 
 
+async def validate_device_group_exists(db: AsyncSession, device_group_id: uuid.UUID) -> None:
+    """Refuse a hypervisor's device_group_id that names no device group (issue #1053)."""
+    if await db.get(DeviceGroup, device_group_id) is None:
+        raise HTTPException(status_code=422, detail="Device group does not exist")
+
+
 async def list_hypervisors(
     db: AsyncSession, skip: int = 0, limit: int = 50
 ) -> tuple[list[Hypervisor], int]:
@@ -84,6 +91,8 @@ async def create_hypervisor(
     db: AsyncSession, data: HypervisorCreate, modified_by: uuid.UUID | None = None
 ) -> Hypervisor:
     await validate_secret_exists(data.secret_id)
+    if data.device_group_id is not None:
+        await validate_device_group_exists(db, data.device_group_id)
     hypervisor = Hypervisor(
         name=data.name,
         description=data.description,
@@ -91,6 +100,7 @@ async def create_hypervisor(
         hypervisor_type=data.hypervisor_type,
         secret_id=data.secret_id,
         enabled=data.enabled,
+        device_group_id=data.device_group_id,
         modified_by=modified_by,
     )
     db.add(hypervisor)
@@ -119,6 +129,8 @@ async def update_hypervisor(
     # Re-validate the secret only when secret_id actually changes.
     if "secret_id" in update_data and update_data["secret_id"] != hypervisor.secret_id:
         await validate_secret_exists(update_data["secret_id"])
+    if update_data.get("device_group_id") is not None:
+        await validate_device_group_exists(db, update_data["device_group_id"])
     if modified_by is not None:
         hypervisor.modified_by = modified_by
     conflict_name = update_data.get("name", hypervisor.name)
