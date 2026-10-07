@@ -85,7 +85,7 @@ recoverable.
 
 ## Remote access to NATS and Postgres
 
-`docker-compose.yml` publishes NATS (4222, 8222) and Postgres (`POSTGRES_PORT`, default 5433) on loopback only, matching the Traefik dashboard's loopback bind (issue #708): NATS carries no broker authentication at all, and a wide bind on either would be reachable from the LAN or the open internet on a host with no firewall in front of it. The recipes below already reach NATS through `docker compose exec nats nats ...`, which needs no host port at all. From a remote host, either run the same `docker compose exec` commands over SSH, or forward the port first (`ssh -L 4222:localhost:4222 <host>` or `-L 5433:localhost:5433`) and point a local client (the `nats` CLI, `psql`) at `localhost`. Never widen the compose binding to reach either service remotely.
+`docker-compose.yml` publishes NATS (4222, 8222) and Postgres (`POSTGRES_PORT`, default 5433) on loopback only, matching the Traefik dashboard's loopback bind (issue #708): NATS carries no broker authentication at all, and a wide bind on either would be reachable from the LAN or the open internet on a host with no firewall in front of it. The recipes below reach NATS from a one-off `natsio/nats-box` container on the stack's Docker network, which needs no host port at all. From a remote host, either run the same commands over SSH, or forward the port first (`ssh -L 4222:localhost:4222 <host>` or `-L 5433:localhost:5433`) and point a local client (the `nats` CLI, `psql`) at `localhost`. Never widen the compose binding to reach either service remotely.
 
 ## Inspecting the NATS DLQ
 
@@ -97,50 +97,62 @@ Five durable consumers feed off two source streams (`HERD_RESERVATIONS` for `her
 - `integration` webhooks consumer (`integration-webhooks-consumer`), DLQ `herd.reservations.dlq.integration`
 - `integration` webhooks health consumer (`integration-webhooks-health-consumer`, issue #831), DLQ `herd.health.dlq.integration`
 
-Messages that poisoned any consumer (bad JSON or exhausted `max_deliver=5`) land on the consumer's DLQ subject and are retained in `HERD_DLQ` within the stream's `max_age` (see JetStream durability below); on the dev/test path they are retained only until the next container recreate. Inspect with the `nats` CLI (install via `brew install nats-io/nats-tools/nats` or the binary from github.com/nats-io/natscli):
+Messages that poisoned any consumer (bad JSON or exhausted `max_deliver=5`) land on the consumer's DLQ subject and are retained in `HERD_DLQ` within the stream's `max_age` (see JetStream durability below); on the dev/test path they are retained only until the next container recreate.
+
+The compose `nats` service runs `nats:2.10-alpine`, which ships only `nats-server`: there is no `nats` CLI inside it, so running `nats` in that container fails with "executable file not found". Run the CLI from a one-off `natsio/nats-box` container on the stack's network instead, the same form `docs/TROUBLESHOOTING.md` uses. The network is `<compose project>_herd-net` (for example `herd-public_herd-net` for a checkout in `herd-public/`; `docker network ls | grep herd-net` lists it). Every command below goes through this one shell variable; `nats-box:0.14.5` carries natscli 0.1.5, whose flags these commands use:
 
 ```bash
-# List the DLQ stream and its retained messages
-docker compose exec nats nats stream info HERD_DLQ
-
-# Dump the last message per DLQ subject
-docker compose exec nats nats sub 'herd.reservations.dlq.execution' --last-per-subject     # execution
-docker compose exec nats nats sub 'herd.reservations.dlq.notifications' --last-per-subject  # notifications (reservations)
-docker compose exec nats nats sub 'herd.health.dlq.notifications' --last-per-subject        # notifications (health)
-docker compose exec nats nats sub 'herd.reservations.dlq.integration' --last-per-subject    # integration webhooks (reservations)
-docker compose exec nats nats sub 'herd.health.dlq.integration' --last-per-subject          # integration webhooks (health)
-
-# Or use a durable pull consumer to walk messages one at a time
-docker compose exec nats nats consumer add HERD_DLQ dlq-inspector \
-  --filter 'herd.reservations.dlq.execution' --ack none --deliver all --pull
-docker compose exec nats nats consumer next HERD_DLQ dlq-inspector
+NATS="docker run -i --rm --network herd-public_herd-net natsio/nats-box:0.14.5 nats --server nats://nats:4222"
 ```
+
+```bash
+# The DLQ stream: message count, first and last sequence
+$NATS stream info HERD_DLQ
+
+# How many messages each DLQ subject holds
+$NATS stream subjects HERD_DLQ
+
+# The newest message on one DLQ subject
+$NATS stream get HERD_DLQ --last-for 'herd.reservations.dlq.execution'      # execution
+$NATS stream get HERD_DLQ --last-for 'herd.reservations.dlq.notifications'  # notifications (reservations)
+$NATS stream get HERD_DLQ --last-for 'herd.health.dlq.notifications'        # notifications (health)
+$NATS stream get HERD_DLQ --last-for 'herd.reservations.dlq.integration'    # integration webhooks (reservations)
+$NATS stream get HERD_DLQ --last-for 'herd.health.dlq.integration'          # integration webhooks (health)
+
+# Walk the stream one message at a time by sequence (the range is in stream info)
+$NATS stream get HERD_DLQ 1
+```
+
+These are read-only: `stream get` fetches by sequence or subject and creates no consumer, so inspecting leaves no state on the server.
 
 Each DLQ message is a verbatim copy of the original event payload. Reservation events look like `{"event": "reservation.created", "reservation_id": "...", ...}`; health events look like `{"event": "device.health_transition", "device_id": "...", "transition_kind": "bad_news", ...}`.
 
 ### Replaying a DLQ message
 
-Once you understand what made the message fail and have fixed the underlying cause, re-publish it on the original subject. Every durable consumer bound to that subject reprocesses it: for `herd.reservations.*` that is execution, notifications, and integration's webhooks consumer; for `herd.health.*` it is notifications and integration's webhooks health consumer (execution publishes health events, it does not consume them). A `herd.health.*` replay therefore reaches integration's webhook subscribers too, subject to its own delivery ledger: a target the ledger already marked `delivered` for that event is skipped (idempotent on `(subscription_id, event_id)`), but a target marked `dead` is POSTed to again, since only `delivered` short-circuits a redelivery.
+Once you understand what made the message fail and have fixed the underlying cause, re-publish it on the original subject. Every durable consumer bound to that subject receives it: for `herd.reservations.*` that is execution, notifications, and integration's webhooks consumer; for `herd.health.*` it is notifications and integration's webhooks health consumer (execution publishes health events, it does not consume them).
+
+Know what a replay can and cannot do before sending one:
+
+- Broker dedup: JetStream drops a message whose `Nats-Msg-Id` it saw inside the stream's duplicate window, so the command below stamps a fresh id with natscli's `{{ID}}` template. A replay without the header is not deduplicated by the broker at all.
+- Consumer dedup: consumers key idempotency on the payload `event_id`, which the replay keeps. A consumer that already handled the event does not act on it twice (notifications are unique per recipient and event, and integration skips a webhook target its ledger marked `delivered`, though it POSTs again to one marked `dead`). The consumer that dead-lettered the event never recorded it, so it is the one the replay is for.
+- Event corroboration: execution checks every reservation lifecycle event against the reservation's current status before acting (`created` needs `PENDING_PROVISION` or `ACTIVE`, `provision_requested` needs `PENDING_PROVISION`, `wiring_changed` needs `ACTIVE`, `cancelled`, `completed`, and `failed` need a terminal status). A replay whose reservation has moved on is acknowledged and dropped with the log action `nats_event_unverified`, so replaying an old `reservation.created` for a reservation that has since ended does nothing in execution. Replays are meaningful while the reservation still holds the status the event describes, and for terminal events whose teardown failed (see the dynamic-instance teardown section of `docs/TROUBLESHOOTING.md`).
+
+Save the payload from `stream get` (the JSON body only) to `msg.json`, then publish it on the ORIGINAL subject, not the DLQ subject:
 
 ```bash
-docker compose exec nats nats pub 'herd.reservations.created' "$(cat msg.json)"
+$NATS pub -H 'Nats-Msg-Id:{{ID}}' 'herd.reservations.created' --force-stdin < msg.json
 ```
 
 ### Discarding DLQ messages
 
-If the events are stale (e.g. you've already manually fixed the state), purge the relevant DLQ subject:
+If the events are stale (e.g. you've already manually fixed the state), purge the relevant DLQ subject. `--force` skips the confirmation prompt, which cannot be answered through `docker run` without a terminal:
 
 ```bash
-docker compose exec nats nats stream purge HERD_DLQ \
-  --subject 'herd.reservations.dlq.execution'
-docker compose exec nats nats stream purge HERD_DLQ \
-  --subject 'herd.reservations.dlq.notifications'
-docker compose exec nats nats stream purge HERD_DLQ \
-  --subject 'herd.health.dlq.notifications'
-docker compose exec nats nats stream purge HERD_DLQ \
-  --subject 'herd.reservations.dlq.integration'
-docker compose exec nats nats stream purge HERD_DLQ \
-  --subject 'herd.health.dlq.integration'
+$NATS stream purge HERD_DLQ --force --subject 'herd.reservations.dlq.execution'
+$NATS stream purge HERD_DLQ --force --subject 'herd.reservations.dlq.notifications'
+$NATS stream purge HERD_DLQ --force --subject 'herd.health.dlq.notifications'
+$NATS stream purge HERD_DLQ --force --subject 'herd.reservations.dlq.integration'
+$NATS stream purge HERD_DLQ --force --subject 'herd.health.dlq.integration'
 ```
 
 ### JetStream durability
