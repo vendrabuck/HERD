@@ -1688,18 +1688,13 @@ async def create_reservation(
     await _acquire_device_locks(db, data.device_ids)
 
     # 5. Check time-window conflicts (only for exclusive devices)
-    conflicting = await _check_conflicts(
+    await _assert_no_window_conflicts(
         db,
         data.device_ids,
         data.start_time,
         data.end_time,
         exclusive_device_ids=exclusive_ids,
     )
-    if conflicting:
-        raise LookupError(
-            f"Time conflict: devices {[str(d) for d in conflicting]} already reserved "
-            f"in the requested window"
-        )
 
     # 6. Create reservation as PENDING_PROVISION and commit. The row is visible to
     #    _check_conflicts (step 5 in concurrent creates) immediately, which closes the
@@ -2346,6 +2341,37 @@ async def get_reservation(
     return result.scalar_one_or_none()
 
 
+async def _assert_no_window_conflicts(
+    db: AsyncSession,
+    device_ids: list[uuid.UUID],
+    start_time: datetime,
+    end_time: datetime,
+    *,
+    exclusive_device_ids: set[str] | None,
+    exclude_id: uuid.UUID | None = None,
+    window_label: str = "requested window",
+) -> None:
+    """Refuse with LookupError (409) when an exclusive device is booked over the window.
+
+    The ONE window-conflict refusal shared by create, PATCH-add, and the PATCH
+    end-time extension (issue #999): the edit of a device set applies exactly the
+    rule a new booking applies, with the same wording.
+    """
+    conflicting = await _check_conflicts(
+        db,
+        device_ids,
+        start_time,
+        end_time,
+        exclude_id=exclude_id,
+        exclusive_device_ids=exclusive_device_ids,
+    )
+    if conflicting:
+        raise LookupError(
+            f"Time conflict: devices {[str(d) for d in conflicting]} already reserved "
+            f"in the {window_label}"
+        )
+
+
 async def update_reservation(
     db: AsyncSession,
     reservation_id: uuid.UUID,
@@ -2360,6 +2386,7 @@ async def update_reservation(
 
     if reservation.status not in (ReservationStatus.ACTIVE, ReservationStatus.PENDING):
         raise ValueError(f"Cannot update a {reservation.status.value} reservation")
+    observed_status = reservation.status
 
     end_time_changed = False
     if data.end_time is not None:
@@ -2398,19 +2425,15 @@ async def update_reservation(
             except Exception:
                 exclusive_ids = {str(d) for d in device_ids}
 
-            conflicting = await _check_conflicts(
+            await _assert_no_window_conflicts(
                 db,
                 device_ids,
                 reservation.end_time,
                 data.end_time,
                 exclude_id=reservation.id,
                 exclusive_device_ids=exclusive_ids,
+                window_label="extended window",
             )
-            if conflicting:
-                raise LookupError(
-                    f"Time conflict: devices {[str(d) for d in conflicting]} already reserved "
-                    f"in the extended window"
-                )
 
         end_time_changed = new_end != old_end
         reservation.end_time = data.end_time
@@ -2474,13 +2497,21 @@ async def update_reservation(
                 ]
                 added_exclusive = {str(d["id"]) for d in added_devices if d.get("exclusive", True)}
 
-                bad = [
-                    d["name"]
-                    for d in added_devices
-                    if str(d["id"]) in added_exclusive and d["status"] != "AVAILABLE"
-                ]
-                if bad:
-                    raise ValueError(f"The following devices are not available: {', '.join(bad)}")
+                # Current status matters only for a row that is about to HOLD the
+                # device (issue #999, decided 2026-10-05): an ACTIVE row needs it
+                # AVAILABLE now. A PENDING row holds nothing until activation, so,
+                # exactly like a create for a future window (RES-CREATE-12), the
+                # window conflict check below is the only gate.
+                if observed_status in _DEVICE_HOLDING_STATUSES:
+                    bad = [
+                        d["name"]
+                        for d in added_devices
+                        if str(d["id"]) in added_exclusive and d["status"] != "AVAILABLE"
+                    ]
+                    if bad:
+                        raise ValueError(
+                            f"The following devices are not available: {', '.join(bad)}"
+                        )
 
                 await _acquire_device_locks(db, added_ids)
 
@@ -2495,7 +2526,7 @@ async def update_reservation(
                 )
                 check_start = now_naive if now_naive > start_naive else reservation.start_time
 
-                conflicting = await _check_conflicts(
+                await _assert_no_window_conflicts(
                     db,
                     added_ids,
                     check_start,
@@ -2503,10 +2534,6 @@ async def update_reservation(
                     exclude_id=reservation.id,
                     exclusive_device_ids=added_exclusive,
                 )
-                if conflicting:
-                    raise LookupError(
-                        f"Time conflict: devices {[str(d) for d in conflicting]} already reserved"
-                    )
 
                 # Mark added exclusive devices as RESERVED
                 added_exclusive_uuids = [d for d in added_ids if str(d) in added_exclusive]

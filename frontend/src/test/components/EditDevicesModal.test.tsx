@@ -91,7 +91,13 @@ function devicesHandler(available = AVAILABLE) {
   });
 }
 
-function renderModal(overrides: Partial<{ onClose: () => void; onUpdated: () => void }> = {}) {
+function renderModal(
+  overrides: Partial<{
+    onClose: () => void;
+    onUpdated: () => void;
+    reservation: Reservation;
+  }> = {},
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -100,7 +106,7 @@ function renderModal(overrides: Partial<{ onClose: () => void; onUpdated: () => 
   const utils = render(
     <ProvidersWrapper client={client}>
       <EditDevicesModal
-        reservation={RESERVATION}
+        reservation={overrides.reservation ?? RESERVATION}
         open={true}
         onClose={onClose}
         onUpdated={onUpdated}
@@ -220,8 +226,46 @@ describe("EditDevicesModal", () => {
     fireEvent.click(await screen.findByText("switch-gamma"));
     fireEvent.click(screen.getByRole("button", { name: "Save Changes" }));
 
-    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("conflict"));
     expect(onUpdated).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
+  });
+});
+
+describe("EditDevicesModal candidate list (issue #999)", () => {
+  function captureCandidateQuery() {
+    const seen: URLSearchParams[] = [];
+    server.use(
+      http.get("/api/inventory/devices", ({ request }) => {
+        const url = new URL(request.url);
+        if (url.searchParams.get("limit") === "500") {
+          return HttpResponse.json({ items: NAME_MAP, total: NAME_MAP.length, skip: 0, limit: 500 });
+        }
+        seen.push(url.searchParams);
+        return HttpResponse.json({ items: AVAILABLE, total: AVAILABLE.length, skip: 0, limit: 50 });
+      }),
+    );
+    return seen;
+  }
+
+  it("does not filter candidates by current status on a PENDING reservation", async () => {
+    const seen = captureCandidateQuery();
+    renderModal({ reservation: { ...RESERVATION, status: "PENDING" } });
+    await screen.findByText("switch-gamma");
+    expect(seen.length).toBeGreaterThan(0);
+    for (const params of seen) {
+      expect(params.has("status")).toBe(false);
+      expect(params.get("topology_type")).toBe("PHYSICAL");
+    }
+  });
+
+  it("still asks only for AVAILABLE candidates on an ACTIVE reservation", async () => {
+    const seen = captureCandidateQuery();
+    renderModal();
+    await screen.findByText("switch-gamma");
+    expect(seen.length).toBeGreaterThan(0);
+    for (const params of seen) {
+      expect(params.get("status")).toBe("AVAILABLE");
+    }
   });
 });

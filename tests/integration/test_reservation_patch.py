@@ -120,6 +120,80 @@ async def test_patch_nonexistent_reservation_returns_404(admin_client):
     assert resp.status_code == 404
 
 
+async def _create_window(client, device_ids, start, end) -> dict:
+    resp = await client.post(
+        "/reservations/",
+        json={
+            "device_ids": device_ids,
+            "purpose": "patch integration",
+            "start_time": start.isoformat(),
+            "end_time": end.isoformat(),
+        },
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _device_status(client, device_id: str) -> str:
+    resp = await client.get(f"/inventory/devices/{device_id}")
+    resp.raise_for_status()
+    return resp.json()["status"]
+
+
+async def test_patch_add_to_pending_accepts_a_device_busy_now_and_writes_no_status(
+    admin_client, fresh_devices
+):
+    """Issue #999: a device RESERVED now but free in a PENDING row's window can be added,
+    as create would accept it; a PENDING row holds nothing, so inventory is untouched
+    (issue #994, RES-HOLD-1)."""
+    duts = await fresh_devices(2)
+    now = datetime.now(timezone.utc)
+    busy = await _create_reservation(admin_client, [duts[1]["id"]], hours=1)
+    later = await _create_window(
+        admin_client,
+        [duts[0]["id"]],
+        now + timedelta(hours=2),
+        now + timedelta(hours=3),
+    )
+    try:
+        assert later["status"] == "PENDING"
+        assert await _device_status(admin_client, duts[1]["id"]) == "RESERVED"
+        resp = await admin_client.patch(
+            f"/reservations/{later['id']}",
+            json={"device_ids": [duts[0]["id"], duts[1]["id"]]},
+        )
+        assert resp.status_code == 200, resp.text
+        assert sorted(resp.json()["device_ids"]) == sorted([duts[0]["id"], duts[1]["id"]])
+        assert await _device_status(admin_client, duts[1]["id"]) == "RESERVED"
+        assert await _device_status(admin_client, duts[0]["id"]) == "AVAILABLE"
+    finally:
+        await _cancel(admin_client, later["id"])
+        await _cancel(admin_client, busy["id"])
+
+
+async def test_patch_add_to_pending_refuses_a_device_booked_over_the_window(
+    admin_client, fresh_devices
+):
+    """Issue #999: the window conflict check decides, with create's wording."""
+    duts = await fresh_devices(2)
+    now = datetime.now(timezone.utc)
+    start, end = now + timedelta(hours=2), now + timedelta(hours=3)
+    mine = await _create_window(admin_client, [duts[0]["id"]], start, end)
+    theirs = await _create_window(admin_client, [duts[1]["id"]], start, end)
+    try:
+        resp = await admin_client.patch(
+            f"/reservations/{mine['id']}",
+            json={"device_ids": [duts[0]["id"], duts[1]["id"]]},
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == (
+            f"Time conflict: devices ['{duts[1]['id']}'] already reserved in the requested window"
+        )
+    finally:
+        await _cancel(admin_client, mine["id"])
+        await _cancel(admin_client, theirs["id"])
+
+
 async def test_patch_end_time_past_the_maximum_duration_is_refused(admin_client, fresh_devices):
     """Issue #995: PATCH applies RESERVATION_MAX_DURATION_SECONDS (default 30 days)."""
     duts = await fresh_devices(1)

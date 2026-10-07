@@ -159,6 +159,113 @@ def _actions(caplog, action):
     return [r for r in caplog.records if getattr(r, "action", None) == action]
 
 
+# --- issue #999: PENDING add behaves like create for a future window ---
+
+
+async def test_pending_add_accepts_a_device_reserved_now_but_free_in_the_window(seams):
+    """RESERVED today by someone else, free in this row's window: create would accept it,
+    so the edit does too (decided 2026-10-05). A PENDING row holds nothing, so the
+    device's status today says nothing about the window, and no inventory is written."""
+    rid = await _insert(PENDING, [HELD])
+    await _insert(
+        ACTIVE,
+        [OTHER],
+        user_id=uuid.uuid4(),
+        start=NOW - timedelta(hours=1),
+        end=NOW + timedelta(minutes=30),
+    )
+
+    async def busy_now(ids, token):
+        return [_device(d, status="RESERVED") for d in ids]
+
+    inv = Inventory()
+    with (
+        patch(f"{SVC}._update_device_statuses", new=inv),
+        patch(f"{SVC}._fetch_devices", new=busy_now),
+    ):
+        out = await _patch(rid, device_ids=[HELD, OTHER])
+    assert {str(d) for d in out.device_ids} == {str(HELD), str(OTHER)}
+    assert out.status == PENDING
+    assert inv.calls == []
+
+
+async def test_pending_add_refuses_a_device_booked_over_the_window_with_creates_wording(seams):
+    rid = await _insert(PENDING, [HELD])
+    row = await _row(rid)
+    await _insert(
+        PENDING,
+        [OTHER],
+        user_id=uuid.uuid4(),
+        start=row.start_time + timedelta(minutes=30),
+        end=row.end_time + timedelta(hours=1),
+    )
+    inv = Inventory()
+    with (
+        patch(f"{SVC}._update_device_statuses", new=inv),
+        pytest.raises(LookupError) as info,
+    ):
+        await _patch(rid, device_ids=[HELD, OTHER])
+    assert str(info.value) == (
+        f"Time conflict: devices ['{OTHER}'] already reserved in the requested window"
+    )
+    assert inv.calls == []
+    assert [str(d) for d in (await _row(rid)).device_ids] == [str(HELD)]
+
+
+async def test_active_add_still_refuses_a_device_that_is_not_available_now(seams):
+    rid = await _insert(ACTIVE, [HELD])
+
+    async def busy_now(ids, token):
+        return [_device(d, status="RESERVED") for d in ids]
+
+    inv = Inventory()
+    with (
+        patch(f"{SVC}._update_device_statuses", new=inv),
+        patch(f"{SVC}._fetch_devices", new=busy_now),
+        pytest.raises(ValueError, match=r"^The following devices are not available: dev-"),
+    ):
+        await _patch(rid, device_ids=[HELD, OTHER])
+    assert inv.calls == []
+
+
+async def test_device_added_to_a_pending_row_is_reserved_at_activation(seams):
+    rid = await _insert(PENDING, [HELD])
+
+    async def busy_now(ids, token):
+        return [_device(d, status="RESERVED") for d in ids]
+
+    with (
+        patch(f"{SVC}._update_device_statuses", new=Inventory()),
+        patch(f"{SVC}._fetch_devices", new=busy_now),
+    ):
+        await _patch(rid, device_ids=[HELD, OTHER])
+
+    # The window arrives: move the start into the past and run one sweep tick.
+    async with Session() as s:
+        await s.execute(
+            update(Reservation)
+            .where(Reservation.id == rid)
+            .values(start_time=NOW - timedelta(seconds=30))
+        )
+        await s.commit()
+    inv = Inventory()
+
+    async def exclusive(ids):
+        return [{"id": str(i), "exclusive": True} for i in ids]
+
+    with (
+        patch(f"{EXP}._update_device_statuses", new=inv),
+        patch(f"{SVC}._update_device_statuses", new=inv),
+        patch(f"{EXP}._fetch_devices_best_effort", new=exclusive),
+        patch(f"{EXP}._create_reservation_fork_best_effort", new=AsyncMock()),
+        patch(f"{EXP}._archive_reservation_fork_best_effort", new=AsyncMock()),
+    ):
+        await _run_expiration_cycle()
+    assert (await _row(rid)).status == ACTIVE
+    reserved = [set(ids) for ids, st in inv.calls if st == "RESERVED"]
+    assert reserved == [{str(HELD), str(OTHER)}]
+
+
 # --- issue #995: the duration cap applies to the effective window ---
 
 CAP = 7200
