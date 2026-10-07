@@ -2583,3 +2583,152 @@ async def test_insert_or_get_creating_refuses_a_foreign_reservations_row():
     rows = await _rows()
     assert [str(r.reservation_id) for r in rows] == [RES_ID]
 
+
+# --- issue #1027: login results are judged; the post-destroy delete is loud ---
+
+LOGIN_PAYLOAD_FAIL = {
+    "success": True,
+    "output": {"success": False, "error": "auth denied"},
+    "error": None,
+    "duration_ms": 1,
+}
+LOGIN_TRANSPORT_FAIL = {"success": False, "output": None, "error": "denied", "duration_ms": 1}
+
+
+@pytest.mark.parametrize(
+    "result, succeeded",
+    [
+        (LOGIN_OK, True),  # no success key: a bare-data return stays success
+        ({"success": True, "output": {"success": True}, "duration_ms": 1}, True),
+        ({"success": True, "output": None, "duration_ms": 1}, True),
+        (LOGIN_PAYLOAD_FAIL, False),
+        ({"success": True, "output": {"success": 0}, "duration_ms": 1}, False),
+        (LOGIN_TRANSPORT_FAIL, False),
+    ],
+)
+def test_recipe_session_succeeded_is_the_physical_rule(result, succeeded):
+    from app.services.recipe_result import recipe_session_succeeded
+
+    assert recipe_session_succeeded(result) is succeeded
+    assert recipe_session_succeeded(result) is not driver_result_failed(result)[0]
+
+
+async def test_create_login_payload_failure_is_a_failed_create():
+    """A login that answers {"success": false} without raising used to be
+    followed by create_instance and logout, all three runs SUCCESS. It is now a
+    failed create: nothing else runs, the row stays CREATING, the event NAKs,
+    and the login run is FAILED with the recipe's own error text."""
+    calls, execute = _recipe_execute({"login": LOGIN_PAYLOAD_FAIL, "create_instance": CREATE_OK})
+    with ExitStack() as stack:
+        for p in _create_patches(execute):
+            stack.enter_context(p)
+        with pytest.raises(RuntimeError) as excinfo:
+            await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+
+    assert str(excinfo.value) == f"recipe login failed for request {REQUEST_ID}"
+    assert [c[0] for c in calls] == ["login"]
+    rows = await _rows()
+    assert [(r.status, r.instance_ref) for r in rows] == [("CREATING", None)]
+    [run] = await _runs()
+    assert (run.action, run.status, run.error) == ("login", "FAILED", "auth denied")
+
+
+async def test_create_login_transport_failure_runs_nothing_else():
+    calls, execute = _recipe_execute({"login": LOGIN_TRANSPORT_FAIL})
+    with ExitStack() as stack:
+        for p in _create_patches(execute):
+            stack.enter_context(p)
+        with pytest.raises(RuntimeError):
+            await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+    assert [c[0] for c in calls] == ["login"]
+
+
+@pytest.mark.parametrize(
+    "seed, ledger_status, keyed",
+    [(_seed_by_ref_active, "ACTIVE", False), (_seed_creating, "CREATING", True)],
+    ids=["by-ref", "keyed"],
+)
+async def test_teardown_login_payload_failure_leaves_row_live(seed, ledger_status, keyed, caplog):
+    await seed()
+    calls, execute = _recipe_execute({"login": LOGIN_PAYLOAD_FAIL, "destroy_instance": DESTROY_OK})
+    delete = AsyncMock(return_value=True)
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in _teardown_patches(execute, delete=delete):
+            stack.enter_context(p)
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+
+    assert [c[0] for c in calls] == ["login"]
+    delete.assert_not_awaited()
+    assert (await _rows())[0].status == ledger_status
+    records = _formatted(caplog, "dynamic_instance_keyed_destroy_failed")
+    if keyed:
+        [record] = records
+        assert record["reason"] == "login_failed"
+    else:
+        assert records == []
+
+
+@pytest.mark.parametrize(
+    "login", [LOGIN_PAYLOAD_FAIL, LOGIN_TRANSPORT_FAIL], ids=["payload", "transport"]
+)
+async def test_compensation_login_failure_runs_no_destroy(login, caplog):
+    """DYN-COMP-7: a failed compensation login, by payload or by transport,
+    runs neither destroy_instance nor logout and logs the failure action."""
+    calls, execute = _recipe_execute({"login": login, "destroy_instance": DESTROY_OK})
+    with caplog.at_level("INFO"):
+        await _compensate(execute, "vm-100")
+
+    assert [c[0] for c in calls] == ["login"]
+    assert _actions(caplog) == ["dynamic_instance_compensation_failed"]
+
+
+async def _seed_active_without_ref():
+    async with TestSessionLocal() as db:
+        await insert_or_get_creating(db, REQUEST_ID, RES_ID, TEMPLATE_ID, HYPERVISOR_ID)
+        await mark_active(db, REQUEST_ID, DEVICE_ID, None)
+
+
+@pytest.mark.parametrize(
+    "seed", [_seed_by_ref_active, _seed_active_without_ref], ids=["by-ref", "keyed"]
+)
+async def test_device_delete_failure_after_destroy_logs_fixed_action(seed, caplog):
+    """A successful destroy followed by an inventory 409 on the device delete
+    used to log a plain line saying ACTIVE whatever the row held. The row
+    still stays live (retiring it would orphan the device with no record), and
+    the failure now carries a fixed action with the device and the row's real
+    status. The keyed action is not emitted: the keyed destroy succeeded."""
+    await seed()
+    calls, execute = _recipe_execute({"destroy_instance": DESTROY_OK})
+    delete = AsyncMock(return_value=False)
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in _teardown_patches(execute, delete=delete):
+            stack.enter_context(p)
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+
+    assert [c[0] for c in calls] == ["login", "destroy_instance", "logout"]
+    delete.assert_awaited_once()
+    assert (await _rows())[0].status == "ACTIVE"
+    [record] = _formatted(caplog, "dynamic_instance_device_delete_failed")
+    assert record["device_id"] == DEVICE_ID
+    assert record["request_id"] == REQUEST_ID
+    assert record["reservation_id"] == RES_ID
+    assert record["ledger_status"] == "ACTIVE"
+    assert _formatted(caplog, "dynamic_instance_keyed_destroy_failed") == []
+
+
+async def test_recipe_run_status_follows_the_recipe_verdict():
+    """DYN-RESULT-4 as changed by issue #1027: a call that completed but
+    returned success false is recorded FAILED, as physical runs are."""
+    calls, execute = _recipe_execute({"create_instance": CREATE_DRIVER_FAIL})
+    with ExitStack() as stack:
+        for p in _create_patches(execute):
+            stack.enter_context(p)
+        with pytest.raises(RuntimeError):
+            await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+
+    by_action = {r.action: r for r in await _runs()}
+    assert by_action["login"].status == "SUCCESS"
+    assert by_action["logout"].status == "SUCCESS"
+    assert by_action["create_instance"].status == "FAILED"
+    assert by_action["create_instance"].error == "driver reported failure"
+

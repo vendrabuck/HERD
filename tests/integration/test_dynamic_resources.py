@@ -532,12 +532,13 @@ async def test_create_failure_lands_failed_with_no_orphans(
     assert status == "AVAILABLE", f"physical device stuck in {status} after FAILED"
 
     # Every create attempt is auditable and none actually created an instance.
-    # Run-row status is sandbox-level across all consumer flows (the method
-    # executed), so a driver-reported failure is a SUCCESS row whose recorded
-    # output carries success: false; that output is the audit contract here.
+    # A recipe step that completed but returned success: false is a FAILED run
+    # row (issue #1027, the physical runs' rule), and its recorded output still
+    # carries the recipe's verdict.
     creates = await _runs(admin_client, reservation["id"], "create_instance")
     assert creates, "no create_instance runs were recorded"
     for run in creates:
+        assert run["status"] == "FAILED", f"create_instance run {run['id']}: {run['status']}"
         output = json.loads(run["output"]) if run.get("output") else {}
         assert output.get("success") is False, (
             f"create_instance run {run['id']} did not report the injected failure: {output}"

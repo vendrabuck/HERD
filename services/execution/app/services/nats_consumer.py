@@ -33,7 +33,11 @@ from app.models.l2_port_assignment import L2PortAssignment
 from app.models.route_assignment import RouteAssignment
 from app.services.execution_service import driver_result_failed
 from app.services.health_scheduler import apply_reservation_event_tiers
-from app.services.recipe_result import created_instance_ref, recipe_reported_success
+from app.services.recipe_result import (
+    created_instance_ref,
+    recipe_reported_success,
+    recipe_session_succeeded,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from app.services.wiring_claim import WiringRowClaims
@@ -734,6 +738,14 @@ async def _run_recipe_step(
     device yet for a create, so device_id is the hypervisor id: the recipe acts
     on the hypervisor, and create and teardown runs group under it. Recipe steps
     get the long recipe timeout, not the 30s driver default.
+
+    The row's status follows the physical runs' rule (``driver_result_failed``,
+    as in run_driver_action): a call that completed but returned a present,
+    falsy ``success`` is FAILED, with the recipe's own error text, so a login
+    that answered ``{"success": false}`` no longer reads as SUCCESS (issue
+    #1027). Whether a step counts as done is still the caller's decision
+    (``recipe_session_succeeded`` for login, ``recipe_reported_success`` for
+    the instance methods).
     """
     from datetime import datetime, timezone
 
@@ -760,13 +772,18 @@ async def _run_recipe_step(
         password_keys=password_keys,
         timeout=settings.recipe_timeout_seconds,
     )
-    status = "SUCCESS" if result["success"] else "FAILED"
+    result_failed, result_error = driver_result_failed(result)
+    if result["success"]:
+        status = "FAILED" if result_failed else "SUCCESS"
+        error = result_error if result_failed else result.get("error")
+    else:
+        status, error = "FAILED", result.get("error")
     await update_execution_run(
         db,
         run,
         status,
         output=json.dumps(result["output"], default=str) if result.get("output") else None,
-        error=result.get("error"),
+        error=error,
         started_at=started,
         completed_at=datetime.now(timezone.utc),
         duration_ms=result["duration_ms"],
@@ -779,6 +796,7 @@ async def _run_recipe_step(
 # the consumer's historical spellings, kept for its callers and tests.
 _recipe_reported_success = recipe_reported_success
 _created_instance_ref = created_instance_ref
+_recipe_session_succeeded = recipe_session_succeeded
 
 
 async def _create_dynamic_device(
@@ -828,7 +846,7 @@ async def _delete_dynamic_device(client, device_id: str) -> bool:
 
     Raises TransientUpstreamError on a 5xx or transport error so the teardown
     NAKs. An unexpected 4xx returns False; the caller leaves the ledger row
-    ACTIVE rather than falsely recording the instance as destroyed.
+    live rather than falsely recording the instance as destroyed.
     """
     url = f"{settings.inventory_service_url}/devices/{device_id}/internal"
     try:
@@ -988,7 +1006,7 @@ async def _destroy_orphaned_instance(
         password_keys,
     )
     destroy = None
-    if login["success"]:
+    if _recipe_session_succeeded(login):
         destroy = await _run_recipe_step(
             db,
             hypervisor_uuid,
@@ -1103,6 +1121,11 @@ async def _provision_one_instance(
     driver-result failure or sandbox error raises so the message NAKs with the
     row left CREATING for an idempotent retry. A failed create whose row teardown
     retired meanwhile is compensated with a keyed destroy and returns None.
+    After its CREATING row is committed the request re-checks that the
+    reservation is still PENDING_PROVISION and returns None without any recipe
+    call when it is not (issue #1028, a teardown that listed rows before this
+    one existed). A failed login, judged by ``recipe_session_succeeded``, is a
+    failed create (issue #1027).
     """
     from app.services.driver_loader import DriverPackageError, load_driver
     from app.services.dynamic_instance_service import (
@@ -1232,10 +1255,12 @@ async def _provision_one_instance(
             password_keys,
             dedupe_key=dedupe_key,
         )
-        if not login["success"]:
-            raise RuntimeError(
-                f"recipe login failed for request {request_id}: {login.get('error')}"
-            )
+        if not _recipe_session_succeeded(login):
+            # A login that raised or answered {"success": false} (issue #1027) is
+            # a failed create. create_instance never ran in this delivery, so
+            # there is nothing to compensate: NAK with the row CREATING, exactly
+            # like a failed create_instance.
+            raise RuntimeError(f"recipe login failed for request {request_id}")
 
         create = await _run_recipe_step(
             db,
@@ -1488,10 +1513,15 @@ async def _teardown_attempt(
     destroy, instance_ref=None with HERD_request_id in the context, and the
     recipe resolves the instance by the name create_instance derived from that
     id, reporting success when none exists. Any failure (missing recipe config,
-    a load or login failure, a driver-result failure, a raise) does NOT raise:
-    ACK, the row stays in its live status as an accurate may-still-exist record,
-    and the keyed case logs ``dynamic_instance_keyed_destroy_failed``. A
-    TransientUpstreamError raises and NAKs.
+    a broken recipe package, a login or driver-result failure, a raise) does
+    NOT raise: ACK, the row stays in its live status as an accurate
+    may-still-exist record, and the keyed case logs
+    ``dynamic_instance_keyed_destroy_failed``. A device delete that fails after
+    a successful destroy leaves the row live too and logs
+    ``dynamic_instance_device_delete_failed`` (issue #1027). A
+    TransientUpstreamError raises and NAKs, and so does a recipe package that
+    could not be fetched (issue #1029): the cache miss is transient, and a
+    redelivered terminal event is the only thing that would ever retry it.
 
     Returns "destroyed", "left_live" (a failure was logged), or "row_changed"
     when the DESTROYED compare-and-swap lost because the row no longer matches
@@ -1527,8 +1557,9 @@ async def _teardown_attempt(
         _left_live(
             "recipe_config_missing",
             "Cannot load recipe deps to destroy instance for request %s; leaving "
-            "ledger row ACTIVE as a may-still-exist record",
+            "ledger row %s as a may-still-exist record",
             request_id,
+            row.status,
         )
         return "left_live"
 
@@ -1586,11 +1617,12 @@ async def _teardown_attempt(
             context,
             password_keys,
         )
-        if not login["success"]:
+        if not _recipe_session_succeeded(login):
             _left_live(
                 "login_failed",
-                "Recipe login failed during teardown of request %s; leaving ACTIVE",
+                "Recipe login failed during teardown of request %s; leaving ledger row %s",
                 request_id,
+                row.status,
             )
             return "left_live"
 
@@ -1630,8 +1662,9 @@ async def _teardown_attempt(
         _left_live(
             "destroy_failed",
             "destroy_instance did not cleanly succeed for request %s; leaving "
-            "ledger row ACTIVE (instance may still exist)",
+            "ledger row %s (instance may still exist)",
             request_id,
+            row.status,
         )
         return "left_live"
 
@@ -1639,10 +1672,25 @@ async def _teardown_attempt(
     if device_id is not None:
         deleted = await _delete_dynamic_device(client, device_id)
         if not deleted:
+            # The instance is gone but its device is not (inventory refused the
+            # delete with a 4xx other than 404). Keep the row live: retiring it
+            # would leave the device with no record, while a live row lets a
+            # re-published terminal event retry (destroy_instance is idempotent,
+            # then the delete runs again). Same fixed action for a keyed row and
+            # a row with a ref, since the destroy itself succeeded (issue #1027).
             logger.error(
-                "Device delete failed for request %s after destroy_instance; "
-                "leaving ledger row ACTIVE",
+                "Device %s delete failed for request %s after destroy_instance; "
+                "leaving ledger row %s",
+                device_id,
                 request_id,
+                row.status,
+                extra={
+                    "action": "dynamic_instance_device_delete_failed",
+                    "request_id": str(request_id),
+                    "reservation_id": str(reservation_id),
+                    "device_id": device_id,
+                    "ledger_status": row.status,
+                },
             )
             return "left_live"
 
