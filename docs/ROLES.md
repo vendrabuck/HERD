@@ -968,6 +968,12 @@ DELETE /api/inventory/ports/{port_id}
 Authorization: Bearer <admin-token> (PUT, DELETE) or <any-authenticated-token> (GET)
 ```
 
+A port delete, and a PUT that changes the port's name, are refused with 409
+`{"error": "port_cabled", "connection_count", "connection_ids"}` while any cabling
+connection names the port (issue #1023): cabling records a cable's ports by name, so
+the admin removes or re-records the cables first. The check fails closed with 503
+`Could not verify port is not cabled` when cabling cannot answer. There is no force flag.
+
 ---
 
 ## Topology Persistence

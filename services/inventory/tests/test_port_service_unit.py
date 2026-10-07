@@ -25,6 +25,18 @@ TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
 @pytest.fixture(autouse=True)
+def _mock_port_cabling_guard():
+    """Default the issue #1023 port guard to "no cable names the port" so a
+    port delete or rename in this suite never reaches a real cabling service."""
+    from unittest.mock import AsyncMock, patch
+
+    with patch(
+        "app.services.port_service.assert_port_uncabled", new=AsyncMock(return_value=None)
+    ) as guard:
+        yield guard
+
+
+@pytest.fixture(autouse=True)
 async def setup_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

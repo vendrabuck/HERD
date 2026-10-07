@@ -1,4 +1,5 @@
 import {
+  deletePortErrorText,
   formatMixedTypesDetail,
   formatTopologyInUse,
   formatUnconnectableDetail,
@@ -169,5 +170,45 @@ describe("topologyDeleteErrorText (#977)", () => {
     expect(
       topologyDeleteErrorText(axiosLike(409, { error: "topology_in_use" }), "fallback"),
     ).toBe("fallback");
+  });
+});
+
+describe("deletePortErrorText (issue #1023)", () => {
+  it("names the connection count for a port_cabled refusal", () => {
+    expect(
+      deletePortErrorText(
+        axiosLike(409, { error: "port_cabled", connection_count: 1, connection_ids: ["c1"] }),
+      ),
+    ).toBe("Port is still cabled (1 connection) and cannot be deleted. Remove its cables first.");
+    expect(
+      deletePortErrorText(
+        axiosLike(409, { error: "port_cabled", connection_count: 12, connection_ids: [] }),
+      ),
+    ).toBe("Port is still cabled (12 connections) and cannot be deleted. Remove its cables first.");
+  });
+
+  it("drops the count when it is missing or not a positive number", () => {
+    for (const count of [undefined, 0, -1, "3"]) {
+      expect(
+        deletePortErrorText(axiosLike(409, { error: "port_cabled", connection_count: count })),
+      ).toBe("Port is still cabled and cannot be deleted. Remove its cables first.");
+    }
+  });
+
+  it("passes a plain-string detail through (404, the fail-closed 503)", () => {
+    expect(deletePortErrorText(axiosLike(503, "Could not verify port is not cabled"))).toBe(
+      "Could not verify port is not cabled",
+    );
+    expect(deletePortErrorText(axiosLike(404, "Port not found"))).toBe("Port not found");
+  });
+
+  it("falls back for any other shape, never returning an object", () => {
+    expect(deletePortErrorText(axiosLike(409, { error: "device_cabled" }))).toBe(
+      "Failed to delete port",
+    );
+    expect(deletePortErrorText(axiosLike(500, { error: "port_cabled" }))).toBe(
+      "Failed to delete port",
+    );
+    expect(deletePortErrorText(new Error("network"))).toBe("Failed to delete port");
   });
 });

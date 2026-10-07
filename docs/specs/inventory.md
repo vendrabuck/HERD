@@ -142,7 +142,7 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 | POST | `/devices/{id}/ports` | admin | 201 | INV-AUTH-2, INV-PORT-3, INV-PORT-4 |
 | POST | `/devices/{id}/ports/bulk` | admin | 201 | INV-AUTH-2, INV-PORT-3, INV-PORT-5, INV-PORT-6, INV-PORT-9 |
 | GET | `/ports/{id}` | any signed-in user (non-admins: ports of visible devices only) | 200 | INV-AUTH-1, INV-PORT-2, INV-RED-1 |
-| PUT | `/ports/{id}` | admin | 200 | INV-AUTH-2, INV-PORT-7 |
+| PUT | `/ports/{id}` | admin | 200 | INV-AUTH-2, INV-PORT-7, INV-PORT-10 |
 | DELETE | `/ports/{id}` | admin | 204 | INV-AUTH-2, INV-PORT-8 |
 | GET | `/templates` | any signed-in user | 200 | INV-AUTH-1, INV-TPL-1 |
 | GET | `/templates/{id}` | any signed-in user | 200 | INV-AUTH-1, INV-TPL-1, INV-TPL-20 |
@@ -728,14 +728,27 @@ device page; routes under `/devices/{id}/ports` and `/ports/{id}`.
   validated against the port's template. \
   Enforced in: `services/inventory/app/services/port_service.py` (`update_port`) \
   Pinned by: `services/inventory/tests/test_ports.py` (`test_update_port`, `test_update_port_field_data`, `test_update_port_invalid_field_data`)
-- **INV-PORT-8.** A port delete removes the row with no check for cabling connections
-  that name the port. Known gap, see #1023. \
-  Enforced in: `services/inventory/app/services/port_service.py` (`delete_port`) \
-  Pinned by: `services/inventory/tests/test_ports.py` (`test_delete_port`, `test_delete_port_not_found`)
+- **INV-PORT-8.** A port delete is refused while any cabling connection names the port
+  (cabling stores ports by name, with no reference to the port id): inventory asks
+  cabling's by-port lookup (TOPO-CONNINT-2) for (device, current name) and answers 409
+  `{"error": "port_cabled", "connection_count", "connection_ids"}` (the true count and
+  the sorted, capped id sample), or 503 `Could not verify port is not cabled` when
+  cabling is unreachable, answers non-200, or answers a body missing or mistyping either
+  key. The port is untouched on both refusals. An unknown port is 404 without asking
+  cabling. There is no cascade and no force flag; the admin removes the cables first. \
+  Enforced in: `services/inventory/app/services/port_service.py` (`delete_port`); `services/inventory/app/services/port_cabling_guard.py` (`assert_port_uncabled`, `find_connections_naming_port`) \
+  Pinned by: `services/inventory/tests/test_port_cabling_guard.py` (`test_delete_cabled_port_is_409_and_port_survives`, `test_delete_when_cabling_down_is_503_and_port_survives`, `test_delete_uncabled_port_is_204`, `test_delete_unknown_port_is_404_without_asking_cabling`, `test_cabled_port_is_409_port_cabled_with_true_count_and_sorted_ids`, `test_transport_failure_is_503`, `test_non_200_is_503`, `test_unparseable_body_is_503_never_uncabled`, `test_non_json_body_is_503`); `services/inventory/tests/test_ports.py` (`test_delete_port`, `test_delete_port_not_found`); `tests/integration/test_port_cabling_guard.py` (`test_cabled_port_refuses_delete_and_rename_until_the_cable_is_removed`)
 - **INV-PORT-9.** Port names need not be unique on a device; nothing checks for a
   repeat. \
   Enforced in: `services/inventory/app/models/port.py` (`Port`) \
   Pinned by: none
+- **INV-PORT-10.** A port update that changes the name is refused exactly as INV-PORT-8
+  refuses a delete (409 `port_cabled` or 503, asked about the CURRENT name, the one
+  cables reference), and the name stays as it was. An update that repeats the current
+  name or changes only `field_data` never asks cabling, so a cabled port stays editable.
+  The guard runs after the `field_data` validation. \
+  Enforced in: `services/inventory/app/services/port_service.py` (`update_port`); `services/inventory/app/services/port_cabling_guard.py` (`assert_port_uncabled`) \
+  Pinned by: `services/inventory/tests/test_port_cabling_guard.py` (`test_rename_cabled_port_is_409_and_name_unchanged`, `test_rename_when_cabling_down_is_503_and_name_unchanged`, `test_rename_uncabled_port_succeeds`, `test_update_that_is_not_a_rename_never_asks_cabling`); `tests/integration/test_port_cabling_guard.py` (`test_cabled_port_refuses_delete_and_rename_until_the_cable_is_removed`)
 
 **Out of scope.** Cabling connections between ports (`topology.md`).
 
@@ -1310,6 +1323,7 @@ other error carries `detail` as a string or as the object shown.
 | 404 | `Device group not found` | unknown device group on read, update, delete, or a bulk route | INV-GRP-1, INV-GRP-3, INV-GRP-4, INV-GRP-8, INV-GRP-9 |
 | 409 | `{"error": "device_in_use", "reservation_ids", "transit_reservation_ids"}` | delete of a device a live reservation depends on | INV-DEL-3 |
 | 409 | `{"error": "device_cabled", "connection_count", "connection_ids"}` | delete of a device a connection names | INV-DEL-4 |
+| 409 | `{"error": "port_cabled", "connection_count", "connection_ids"}` | delete or rename of a port a connection names | INV-PORT-8, INV-PORT-10 |
 | 409 | `Device with name '<name>' already exists` | duplicate device name | INV-DEV-1, INV-DEV-11, INV-DYN-5 |
 | 409 | `Device violates a database constraint` | a non-unique integrity error on device update | INV-DEV-11 |
 | 409 | `Could not generate a unique device name for prefix '<prefix>'` | the dynamic-instance name search ran out | INV-DYN-9 |
@@ -1339,6 +1353,7 @@ other error carries `detail` as a string or as the object shown.
 | 503 | `auth service unreachable while fetching user groups` or `auth service returned <status> when fetching user groups` | visibility lookup failed | INV-VIS-2, INV-VIS-6, INV-VIS-8, INV-BATCH-5 |
 | 503 | `auth service unreachable while fetching group names` or `auth service returned <status> when fetching group names` | by-device group name lookup failed | INV-GRP-11 |
 | 503 | `Could not verify device is not in use` | the delete guard could not ask reservations or cabling | INV-DEL-5 |
+| 503 | `Could not verify port is not cabled` | the port delete or rename guard could not ask cabling | INV-PORT-8, INV-PORT-10 |
 | 503 | `secrets service unreachable while validating secret` or `secrets service returned <status> while validating secret` | hypervisor secret check failed | INV-HYP-4, INV-HYP-6 |
 | 503 | `fault injection: simulated inventory status-update failure` | the test seam fired | INV-STATUS-6 |
 
@@ -1353,6 +1368,7 @@ A rejected import row is not an HTTP error: it is a `reject` entry with a `reaso
 | inventory to auth | auth | `GET /groups?skip=&limit=500` with the caller's JWT, paged until every wanted id is named | user group names for the by-device group lookup | fail closed: 503 (INV-GRP-11) |
 | inventory to reservations | reservations | `GET /internal/by-device/{id}` (`X-Internal-Token`, 5 s) | delete guard: reservations booking the device | fail closed: 503, a non-JSON 200 included (INV-DEL-5, INV-DEL-6) |
 | inventory to cabling | cabling | `GET /internal/forks/by-device/{id}` (`X-Internal-Token`, 5 s) | delete guard: fork wiring and connections naming the device | fail closed: 503 (INV-DEL-5) |
+| inventory to cabling | cabling | `GET /connections/internal/by-port?device_id&port_name` (`X-Internal-Token`, 5 s) | port delete and rename guard: connections naming the port | fail closed: 503 (INV-PORT-8) |
 | inventory to secrets | secrets | `GET /internal/secrets/{id}/value` (`X-Internal-Token`, 10 s); only the status code is read | hypervisor secret exists | fail closed: 404 is 422, anything else 503 (INV-HYP-3, INV-HYP-4) |
 | inventory to storage | local disk or MinIO | put, get, remove object | driver archives | upload or download failure is unhandled (500); a delete failure is ignored (INV-DRV-12, INV-DRV-13) |
 | inventory to execution, acl, reservations | | config schema, apply, and fire-time checks | device configuration | specified in `device-configuration.md` |
@@ -1410,7 +1426,11 @@ INV-PORT-6, by a throwaway script against the service on SQLite with foreign key
 - The internal dynamic-instance delete skips the delete guard (the
   `delete_dynamic_device_internal` docstring) (INV-DEL-9).
 - The delete guard has no force flag (the `device_delete_guard.py` module docstring)
-  (INV-DEL-7).
+  (INV-DEL-7), and neither has the port delete and rename guard (the
+  `port_cabling_guard.py` module docstring) (INV-PORT-8).
+- The port guard counts plain cabling connections only, not a live fork's wires that
+  name the port (INV-PORT-8, TOPO-CONNINT-2), and its check and the write are not
+  atomic.
 - Unreadable or missing driver metadata reads as no capability (the
   `_parse_driver_metadata` docstring) (INV-DRV-7).
 - An admin status write ignores reservation holds (INV-STATUS-9). The manual's

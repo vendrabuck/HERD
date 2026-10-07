@@ -62,6 +62,13 @@ Inventory refuses an admin device delete while wiring still depends on the devic
 - `409` with `"error": "device_cabled"` (checked after the one above): a cabling connection still names the device on either end. `connection_count` is the true total and `connection_ids` a sample of up to 10. Delete the cables first (Administration, then Connections), then delete the device.
 - `503` "Could not verify device is not in use": the reservations or cabling service could not be asked, or cabling answered without the connection fields (an older cabling image). The delete fails closed; check both services' health, and after an upgrade confirm cabling was rebuilt.
 
+### Deleting or renaming a port is refused with `409 port_cabled` or `503`
+
+Inventory refuses to delete a port, or to change its name, while a cabling connection names it (issue #1023). Cabling records a cable's two ports by name, not by inventory's port id, so a deleted or renamed port would leave the cable naming a port that no longer exists. There is no force flag.
+
+- `409` with `"error": "port_cabled"`: `connection_count` is the true number of connections naming the port on either end, and `connection_ids` a sample of up to 10. Delete those cables first (Administration, then Connections), then delete or rename the port, and record the cables again against the new name if needed. A PUT that keeps the current name, or changes only field data, is never refused.
+- `503` "Could not verify port is not cabled": the cabling service could not be asked, answered an error, or answered without the connection fields (an older cabling image without the by-port lookup). The delete or rename fails closed; check cabling's health, and after an upgrade confirm cabling was rebuilt.
+
 ### Palette is empty but Inventory list has devices
 
 The equipment palette only shows DUTs (`Management` connection type) that aren't already on the canvas. If your inventory is all infrastructure switches, nothing appears in the palette by design.

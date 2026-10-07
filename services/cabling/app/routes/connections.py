@@ -8,14 +8,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import get_db
 from app.dependencies import get_current_user_payload, require_admin
+from app.routes.forks import CONNECTION_ID_SAMPLE_LIMIT
 from app.schemas.connection import (
     ConnectionBulkCreate,
     ConnectionBulkReport,
     ConnectionCreate,
     ConnectionResponse,
+    ConnectionsByPortResponse,
     PaginatedConnectionResponse,
 )
 from app.services.connection_service import (
+    connections_naming_port,
     create_connection,
     create_connections_bulk,
     delete_connection,
@@ -98,6 +101,33 @@ async def list_connections_internal(
         raise HTTPException(status_code=403, detail="Invalid internal token")
     items, total = await list_connections(db, device_id=device_id, skip=skip, limit=limit)
     return PaginatedConnectionResponse(items=items, total=total, skip=skip, limit=limit)
+
+
+@router.get("/internal/by-port", response_model=ConnectionsByPortResponse)
+async def list_connections_by_port_internal(
+    device_id: uuid.UUID = Query(..., description="The device that owns the port"),
+    port_name: str = Query(..., min_length=1, max_length=255),
+    x_internal_token: str = Header(..., alias="X-Internal-Token"),
+    db: AsyncSession = Depends(get_db),
+):
+    """What cabling connections still name one device port (issue #1023).
+
+    Inventory's port DELETE and port rename guard asks this before it removes
+    or renames a port: a `Connection` stores its ports by NAME (`port_a`,
+    `port_b`), with no reference to inventory's port id, so a deleted or renamed
+    port would leave every cable that names it pointing at a port that no
+    longer exists. The port name is a query parameter because port names carry
+    slashes (`ge-0/0/1`). Same answer shape as the connection part of
+    `GET /internal/forks/by-device/{id}`: the true count plus a sorted id sample
+    capped at CONNECTION_ID_SAMPLE_LIMIT. Unknown device or port: zero and
+    empty, never a 404 (absence is an answer here).
+    """
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+    count, ids = await connections_naming_port(
+        db, device_id, port_name, sample_limit=CONNECTION_ID_SAMPLE_LIMIT
+    )
+    return ConnectionsByPortResponse(connection_count=count, connection_ids=ids)
 
 
 @router.get("/{connection_id}", response_model=ConnectionResponse)

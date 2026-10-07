@@ -218,6 +218,7 @@ Every row is guarded by `X-Internal-Token` (TOPO-FORK-1).
 | Method | Path | Auth | Caller | Answers | Rules |
 |---|---|---|---|---|---|
 | GET | `/connections/internal` | `X-Internal-Token` | no caller in `services/` today | the unfiltered connection page | TOPO-CONNINT-1 |
+| GET | `/connections/internal/by-port?device_id&port_name` | `X-Internal-Token` | inventory (port delete and rename guard) | `{connection_count, connection_ids}` | TOPO-CONNINT-2 |
 | GET | `/fabric/internal?device_id` | `X-Internal-Token` | execution (VLAN allocation scope) | `{device_id, fabric_id, component_size}` | TOPO-FABRIC-1 |
 | POST | `/topologies/{id}/validate/internal?l3` | `X-Internal-Token` | reservations (create and device-set PATCH) | `TopologyValidationResponse` | TOPO-VAL-12, TOPO-VAL-14 |
 | POST | `/internal/forks` | `X-Internal-Token` | reservations (activation, sweep backstop, lazy read) | `{fork_id, version_number}` (201) | TOPO-FSTATE-1, TOPO-FVER-1, TOPO-FORK-2 to TOPO-FORK-8 |
@@ -319,10 +320,20 @@ run on.
   user-facing list and answers unfiltered. \
   Enforced in: `services/cabling/app/routes/connections.py` (`list_connections_internal`) \
   Pinned by: `services/cabling/tests/test_connections.py` (`test_internal_list_connections_valid_token`, `test_internal_list_connections_invalid_token_403`, `test_internal_list_connections_missing_token`, `test_internal_list_connections_device_filter`)
+- **TOPO-CONNINT-2.** `GET /connections/internal/by-port` answers how many connections
+  name one device port: a row counts when its A end is (`device_id`, `port_name`) or its
+  B end is, by exact name, a loopback naming the port on both ends once.
+  `connection_count` is the true total and `connection_ids` at most 10 ids sorted by
+  their text; a port no row names, or a device or name cabling has never seen, answers
+  zero and empty, not 404. An empty `port_name` or a missing token header is 422 and a
+  wrong token 403 `Invalid internal token`. \
+  Enforced in: `services/cabling/app/routes/connections.py` (`list_connections_by_port_internal`); `services/cabling/app/services/connection_service.py` (`connections_naming_port`) \
+  Pinned by: `services/cabling/tests/test_connections_by_port.py` (`test_a_end_and_b_end_both_count`, `test_same_port_name_on_another_device_does_not_count`, `test_port_name_match_is_exact`, `test_loopback_naming_the_port_on_both_ends_counts_once`, `test_sample_is_capped_while_count_is_the_true_total`, `test_uncabled_port_is_zero_and_empty`, `test_wrong_token_is_403`, `test_missing_token_is_422`, `test_empty_port_name_is_422`)
 
 **Out of scope.** Ports, devices, and device groups themselves are inventory's
 (`inventory.md`). Inventory's device delete guard reads this area's by-device route
-(TOPO-BYDEV-1) and is specified there.
+(TOPO-BYDEV-1), and its port delete and rename guard reads the by-port route
+(TOPO-CONNINT-2); both guards are specified there.
 
 ### 8.2 The device-group boundary on cabling
 
