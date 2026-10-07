@@ -311,13 +311,16 @@ Copy, delete) and `frontend/src/pages/TemplateEditorPage.tsx` (view and edit); r
   unknown id answers 404. \
   Enforced in: `services/inventory/app/schemas/template.py` (`TemplateUpdate`); `services/inventory/app/services/template_service.py` (`update_template`) \
   Pinned by: `services/inventory/tests/test_templates.py` (`test_update_template`, `test_update_template_icon`, `test_update_template_can_clear_part_number`, `test_update_template_not_found`)
-- **INV-TPL-16.** An update re-checks the driver against the stored template type
-  (INV-TPL-13) only when the body names `driver_id`; it does not re-check the
-  create-time requirements of INV-TPL-9, INV-TPL-11, and INV-TPL-12, so an update can
-  clear a device template's driver or a dynamic template's hypervisor.
-  Known gap, see #1018. \
-  Enforced in: `services/inventory/app/services/template_service.py` (`update_template`) \
-  Pinned by: none
+- **INV-TPL-16.** An update whose body names `driver_id` or `hypervisor_id` re-runs the
+  create-time requirements of INV-TPL-9, INV-TPL-11, and INV-TPL-12 and the
+  connection-type rule of INV-TPL-13 on the merged driver and hypervisor against the
+  stored template type, answering 422 with the create path's words (for example
+  `Device templates must have a driver`, `Dynamic templates must have a hypervisor`,
+  `hypervisor_id is only valid on dynamic templates`), so an update cannot clear a
+  device template's driver or a dynamic template's hypervisor. An update that names
+  neither is not re-checked. \
+  Enforced in: `services/inventory/app/services/template_service.py` (`update_template`, `_validate_driver_and_hypervisor_presence`, `_validate_driver_connection_type`) \
+  Pinned by: `services/inventory/tests/test_dynamic_templates.py` (`test_update_device_template_clearing_driver_is_422`, `test_update_device_template_to_hypervisor_driver_is_422`, `test_update_device_template_adding_hypervisor_is_422`, `test_update_dynamic_template_clearing_hypervisor_or_driver_is_422`, `test_update_template_driver_swap_within_contract_still_succeeds`)
 - **INV-TPL-17.** An update that replaces `sections` keeps at least one section and
   does not re-validate existing devices' `field_data` against the new sections. \
   Enforced in: `services/inventory/app/schemas/template.py` (`TemplateUpdate`); `services/inventory/app/services/template_service.py` (`update_template`) \
@@ -884,10 +887,15 @@ download, delete); routes under `/drivers`. The package format is in
   type (validated as INV-DRV-5); a name clash answers 409. \
   Enforced in: `services/inventory/app/services/driver_service.py` (`update_driver`) \
   Pinned by: `services/inventory/tests/test_drivers.py` (`test_update_driver_metadata`, `test_update_driver_connection_type`, `test_update_driver_duplicate_name`); `services/inventory/tests/test_driver_service_unit.py` (`test_update_driver_invalid_connection_type`)
-- **INV-DRV-11.** Changing a package's connection type does not re-check the templates
-  that use it against INV-TPL-13. Known gap, see #1018. \
-  Enforced in: `services/inventory/app/services/driver_service.py` (`update_driver`) \
-  Pinned by: none
+- **INV-DRV-11.** Changing a package's connection type re-checks the templates that use
+  it against INV-TPL-13: a change to `Hypervisor` while a device template uses the
+  package answers 409 `Cannot change connection_type: device templates use this driver,
+  and device templates cannot use a Hypervisor-type driver`, and a change away from
+  `Hypervisor` while a dynamic template uses it answers 409 `Cannot change
+  connection_type: dynamic templates use this driver, and dynamic templates require a
+  Hypervisor-type driver`. Nothing is changed on a refusal. \
+  Enforced in: `services/inventory/app/services/driver_service.py` (`update_driver`, `_assert_templates_allow_connection_type`) \
+  Pinned by: `services/inventory/tests/test_dynamic_templates.py` (`test_update_driver_used_by_device_template_to_hypervisor_is_409`, `test_update_recipe_used_by_dynamic_template_to_non_hypervisor_is_409`, `test_update_driver_connection_type_within_contract_still_succeeds`)
 - **INV-DRV-12.** Replacing the file stores the new archive, deletes the old one when its
   key differs (a failed delete is ignored), and updates the file name, size, and
   SHA256. \
@@ -1308,6 +1316,7 @@ other error carries `detail` as a string or as the object shown.
 | 409 | `Cannot delete template: devices still reference it` or `... ports still reference it` | template delete while referenced | INV-TPL-19 |
 | 409 | `Driver with name '<name>' already exists` | duplicate driver name on upload or rename | INV-DRV-8, INV-DRV-10 |
 | 409 | `Cannot delete driver: templates still reference it` | driver delete while referenced | INV-DRV-13 |
+| 409 | `Cannot change connection_type: device templates use this driver, ...` or `Cannot change connection_type: dynamic templates use this driver, ...` | a driver connection-type change that breaks a template using it | INV-DRV-11 |
 | 409 | `Hypervisor with name '<name>' already exists` | duplicate hypervisor name | INV-HYP-2 |
 | 409 | `Cannot delete hypervisor: templates still reference it` | hypervisor delete while referenced | INV-HYP-7 |
 | 409 | `Device group '<name>' already exists` | duplicate group name | INV-GRP-2 |
@@ -1316,7 +1325,8 @@ other error carries `detail` as a string or as the object shown.
 | 422 | `Template not found`, `Template is not a device template`, `Template is not a port template`, `Template is not a dynamic template` | device, port, or dynamic-instance create from the wrong template | INV-DEV-2, INV-PORT-3, INV-DYN-1 |
 | 422 | `Template '<name>' has unknown hardware identity. ...` | device create from a template whose vendor or model is `unknown` | INV-DEV-3 |
 | 422 | `Unknown fields: <keys>`, `Required field missing: <key>`, `Field '<key>' must be a string`, `... a number`, `... a boolean`, `... one of: <options>` | `field_data` validation | INV-FIELD-1 to INV-FIELD-6 |
-| 422 | `Dynamic templates require a Hypervisor-type driver` or `Device templates cannot use a Hypervisor-type driver` | template driver of the wrong connection type | INV-TPL-13 |
+| 422 | `Dynamic templates require a Hypervisor-type driver` or `Device templates cannot use a Hypervisor-type driver` | template driver of the wrong connection type, on create or update | INV-TPL-13, INV-TPL-16 |
+| 422 | `Device templates must have a driver`, `Dynamic templates must have a driver`, `Dynamic templates must have a hypervisor`, `hypervisor_id is only valid on dynamic templates`, `driver_id is only valid on device or dynamic templates` | a template update whose merged driver or hypervisor breaks the create-time rules | INV-TPL-16 |
 | 422 | `Referenced hypervisor or driver does not exist` | template with an unknown driver or hypervisor id | INV-TPL-14 |
 | 422 | `Invalid file type: must be one of ...`, `Invalid file name: path separators and traversal segments are not allowed`, `File too large: max <N> bytes`, `Invalid connection_type: must be one of ...` | driver upload, replace, or metadata update | INV-DRV-3, INV-DRV-4, INV-DRV-5, INV-DRV-10 |
 | 422 | `Secret does not exist` | hypervisor with an unknown secret | INV-HYP-3, INV-HYP-6 |
@@ -1385,10 +1395,6 @@ INV-PORT-6, by a throwaway script against the service on SQLite with foreign key
 - #1017 (INV-BULK-18): a dry run skips the create and update service calls, so the
   checks they own (unknown field keys, the template-driver connection-type rule,
   hardware identity) do not run, and the commit can reject a row the dry run accepted.
-- #1018 (INV-TPL-16, INV-DRV-11): a template update re-checks the driver only when the
-  body names `driver_id`, and a null driver returns before any check, so an update can
-  clear a device template's driver. A driver's connection type can change while
-  templates use it.
 - #1020 (INV-DEV-15): the device page saves the status loaded when the page opened, so
   a status change made elsewhere in the meantime is overwritten. The admin status write
   itself ignoring reservation holds is intended (INV-STATUS-9, under Limits by
@@ -1431,7 +1437,6 @@ exist); #1025 tracks the corrections.
 - INV-STATUS-8: create and import create accept any status.
 - INV-STATUS-9: an admin status write ignores reservation holds.
 - INV-TPL-6: a key repeated across sections.
-- INV-TPL-16: a template update does not re-check create-time requirements.
 - INV-TPL-24: a template's type cannot change.
 - INV-DEV-15: the device page saves the status it loaded.
 - INV-RED-4: redaction covers only the template's password keys.
@@ -1442,7 +1447,6 @@ exist); #1025 tracks the corrections.
 - INV-GRP-17: the group name length.
 - INV-DRV-9: the storage key, the store-before-commit order, and the cleanup on a
   duplicate name.
-- INV-DRV-11: a connection type change does not re-check templates.
 - INV-DRV-17: a user-role download and the download content type.
 - INV-DRV-18: capability flags and uploader on a file replacement.
 - INV-HYP-6: a changed secret is re-validated (the test of that name does not assert

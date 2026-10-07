@@ -722,6 +722,11 @@ Content-Type: application/json
 { "name": "EX2300 v2", "sections": [...] }
 ```
 
+An update that names `driver_id` or `hypervisor_id` is checked against the same rules as
+create: a device template keeps a non-Hypervisor driver and no hypervisor, and a dynamic
+template keeps a Hypervisor recipe driver and a hypervisor. A violation answers HTTP 422
+with the create path's message (for example `Device templates must have a driver`).
+
 ### Delete a template
 
 ```
@@ -787,6 +792,10 @@ Content-Type: application/json
 
 { "name": "Renamed Driver", "description": "Updated", "connection_type": "Management" }
 ```
+
+A `connection_type` change is refused with HTTP 409 when it would break a template that
+uses the driver: a change to `Hypervisor` while a device template uses it, or a change
+away from `Hypervisor` while a dynamic template uses it.
 
 ### Replace driver file
 

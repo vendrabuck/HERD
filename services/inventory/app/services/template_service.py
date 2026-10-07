@@ -93,6 +93,27 @@ async def _validate_driver_connection_type(
         )
 
 
+def _validate_driver_and_hypervisor_presence(
+    template_type: str, driver_id: uuid.UUID | None, hypervisor_id: uuid.UUID | None
+) -> None:
+    """The create-time presence rules of TemplateCreate.validate_sections, as a
+    422 with the same words, for a template update's merged driver and
+    hypervisor (issue #1018)."""
+    message = None
+    if hypervisor_id is not None and template_type != "dynamic":
+        message = "hypervisor_id is only valid on dynamic templates"
+    elif driver_id is not None and template_type not in ("device", "dynamic"):
+        message = "driver_id is only valid on device or dynamic templates"
+    elif template_type == "device" and driver_id is None:
+        message = "Device templates must have a driver"
+    elif template_type == "dynamic" and driver_id is None:
+        message = "Dynamic templates must have a driver"
+    elif template_type == "dynamic" and hypervisor_id is None:
+        message = "Dynamic templates must have a hypervisor"
+    if message is not None:
+        raise HTTPException(status_code=422, detail=message)
+
+
 async def list_templates(
     db: AsyncSession, template_type: str | None = None, skip: int = 0, limit: int = 50
 ) -> tuple[list[DeviceTemplate], int]:
@@ -149,10 +170,16 @@ async def update_template(
     if not template:
         return None
     update_data = data.model_dump(exclude_unset=True)
-    # template_type is immutable after create, so re-check the driver against the
-    # existing type whenever driver_id is being changed.
-    if "driver_id" in update_data:
-        await _validate_driver_connection_type(db, template.template_type, update_data["driver_id"])
+    # template_type is immutable after create. Whenever the driver or the
+    # hypervisor changes, re-run the create-time rules (TemplateCreate's
+    # validate_sections plus the connection-type rule) on the MERGED result, so
+    # an update cannot clear a device template's driver or a dynamic template's
+    # hypervisor, or attach a hypervisor to a non-dynamic template (issue #1018).
+    if "driver_id" in update_data or "hypervisor_id" in update_data:
+        driver_id = update_data.get("driver_id", template.driver_id)
+        hypervisor_id = update_data.get("hypervisor_id", template.hypervisor_id)
+        _validate_driver_and_hypervisor_presence(template.template_type, driver_id, hypervisor_id)
+        await _validate_driver_connection_type(db, template.template_type, driver_id)
     if modified_by is not None:
         template.modified_by = modified_by
     if "sections" in update_data and update_data["sections"] is not None:
