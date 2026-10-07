@@ -24,6 +24,7 @@ from app.schemas.group import (
 )
 from app.services.auth_service import get_user_by_id
 from app.services.group_service import (
+    UnknownUsersError,
     add_member,
     bulk_add_members,
     bulk_remove_members,
@@ -193,6 +194,17 @@ async def add_member_endpoint(
     )
 
 
+# How many unknown ids the bulk-add 404 lists before summarizing the rest.
+BULK_UNKNOWN_USERS_LISTED = 10
+
+
+def bulk_unknown_users_detail(user_ids: list[uuid.UUID]) -> str:
+    listed = ", ".join(str(user_id) for user_id in user_ids[:BULK_UNKNOWN_USERS_LISTED])
+    more = len(user_ids) - BULK_UNKNOWN_USERS_LISTED
+    suffix = f" and {more} more" if more > 0 else ""
+    return f"Users not found: {listed}{suffix}"
+
+
 @router.post("/{group_id}/members/bulk", response_model=BulkMemberAddResponse)
 async def bulk_add_members_endpoint(
     group_id: uuid.UUID,
@@ -203,7 +215,16 @@ async def bulk_add_members_endpoint(
     group = await get_group_by_id(db, group_id)
     if not group:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Group not found")
-    added, skipped = await bulk_add_members(db, group_id, body.user_ids)
+    try:
+        added, skipped = await bulk_add_members(db, group_id, body.user_ids)
+    except UnknownUsersError as exc:
+        # Issue #1009: one 404 naming the unknown ids, nothing added, the bulk
+        # twin of the single add's "User not found". A plain string detail, since
+        # the group page shows the detail as its toast text.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=bulk_unknown_users_detail(exc.user_ids),
+        )
     logger.info(
         "Bulk members added to group %s by %s: %d added, %d skipped",
         group.name,

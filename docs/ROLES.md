@@ -310,6 +310,8 @@ Content-Type: application/json
 ```
 
 Returns `{"added": 2, "skipped": 1}`. Skipped members are already in the group.
+Returns 404 `Users not found: <ids>` and adds nobody when any id has no account
+(the first ten unknown ids are listed, the rest counted as `and N more`).
 
 ### Bulk remove members
 

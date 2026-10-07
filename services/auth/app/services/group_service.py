@@ -206,9 +206,31 @@ async def get_user_groups_map(
     return out
 
 
+class UnknownUsersError(Exception):
+    """A bulk member add named user ids with no account (issue #1009).
+
+    ``user_ids`` holds every unknown id once, in request order. Nothing was
+    added: the whole request is refused, matching the single add's 404.
+    """
+
+    def __init__(self, user_ids: list[uuid.UUID]):
+        super().__init__(f"{len(user_ids)} unknown user id(s)")
+        self.user_ids = user_ids
+
+
 async def bulk_add_members(
     db: AsyncSession, group_id: uuid.UUID, user_ids: list[uuid.UUID]
 ) -> tuple[int, int]:
+    # Refuse the whole request before writing anything when any id has no
+    # account (issue #1009): inserting it fails the user foreign key at commit,
+    # which surfaced as an unhandled IntegrityError (500) and added nobody.
+    requested = list(dict.fromkeys(user_ids))
+    if requested:
+        found = await db.execute(select(User.id).where(User.id.in_(requested)))
+        known = set(found.scalars().all())
+        missing = [user_id for user_id in requested if user_id not in known]
+        if missing:
+            raise UnknownUsersError(missing)
     added = 0
     skipped = 0
     added_ids: list[uuid.UUID] = []

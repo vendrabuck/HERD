@@ -666,12 +666,14 @@ user can see (`inventory.md`) and which resources ACL grants open to them (secti
   unknown group answers 404. \
   Enforced in: `services/auth/app/services/group_service.py` (`bulk_add_members`); `services/auth/app/schemas/group.py` (`BulkAddMembersRequest`); `services/auth/app/routers/groups.py` (`bulk_add_members_endpoint`) \
   Pinned by: `services/auth/tests/test_groups.py` (`test_bulk_add_members_success`, `test_bulk_add_members_skips_duplicates`, `test_bulk_add_removes_from_not_grouped`); `services/auth/tests/test_schema_bounds.py` (`test_bulk_add_members_over_cap_rejected`); `services/auth/tests/test_routers_direct.py` (`test_groups_bulk_add_group_not_found`)
-- **IAM-GROUP-13.** A bulk add that repeats an id counts the repeat as skipped. An id
-  with no account fails the whole request on the database's foreign key (an unhandled
-  error, 500) and nothing is added; unlike single add (IAM-GROUP-6) there is no 404 for
-  it. Known gap, see #1009. \
-  Enforced in: `services/auth/app/services/group_service.py` (`bulk_add_members`) \
-  Pinned by: none
+- **IAM-GROUP-13.** A bulk add that repeats an id counts the repeat as skipped. Any id
+  with no account refuses the whole request with 404 `Users not found: <ids>` (each
+  unknown id once, in request order, the first ten listed and the rest counted as
+  `and N more`) and nothing is added, the bulk twin of single add's 404 (IAM-GROUP-6);
+  the ids are checked before any insert, so the refusal never depends on the
+  database's foreign key (issue #1009). \
+  Enforced in: `services/auth/app/services/group_service.py` (`bulk_add_members`, `UnknownUsersError`); `services/auth/app/routers/groups.py` (`bulk_add_members_endpoint`, `bulk_unknown_users_detail`) \
+  Pinned by: `services/auth/tests/test_groups.py` (`test_bulk_add_members_unknown_among_valid_is_404_and_adds_nobody`, `test_bulk_add_members_all_unknown_is_404_naming_each_once`, `test_bulk_add_members_unknown_detail_lists_ten_then_counts`); `services/auth/tests/test_groups_service_unit.py` (`test_bulk_add_members_unknown_id_refuses_all_and_adds_nothing`, `test_bulk_add_members_existing_member_still_skipped_with_known_ids`)
 - **IAM-GROUP-9.** Bulk remove takes at most 500 ids and answers `{removed, not_found}`;
   an unknown group answers 404. \
   Enforced in: `services/auth/app/services/group_service.py` (`bulk_remove_members`); `services/auth/app/routers/groups.py` (`bulk_remove_members_endpoint`) \
@@ -1260,6 +1262,7 @@ other error carries `detail` as a string. A 401 from a bearer check also sends
 | 404 | `Mapping not found` | delete an unknown mapping | IAM-MAP-8 |
 | 404 | `Sync run not found` | read an unknown run | IAM-LOOP-8 |
 | 404 | `Grant not found` | read or delete an unknown grant | IAM-ACL-4 |
+| 404 | `Users not found: <ids>` | bulk add naming an id with no account | IAM-GROUP-13 |
 | 409 | `Local registration is disabled; this deployment uses LDAP authentication.` | register in LDAP mode | IAM-REG-1 |
 | 409 | `Email or username already exists` | register collision | IAM-REG-3 |
 | 409 | `Cannot deactivate your own account` | deactivate oneself | IAM-ACCT-1 |
@@ -1272,7 +1275,6 @@ other error carries `detail` as a string. A 401 from a bearer check also sends
 | 409 | `This grant already exists` | duplicate grant | IAM-ACL-2 |
 | 422 | validation list | registration, login, group, bulk, mapping, token, grant, or check body out of bounds; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-LOGIN-3, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2 |
 | 422 | `group_dn does not resolve in the directory` | mapping DN proven absent | IAM-MAP-3 |
-| 500 | no structured body | bulk add naming an id with no account | IAM-GROUP-13 |
 | 503 | `Directory unavailable, mapping not validated: <directory error>` | mapping create while the directory cannot be asked | IAM-MAP-3 |
 | 503 | `Internal API token not configured` | an internal route with no token configured | IAM-INTERNAL-2 |
 
@@ -1344,9 +1346,8 @@ the integration suite, the frontend tests, and the browser suite were read, not 
 
 ### Open defects
 
-- #1009 (IAM-GROUP-13, IAM-MAP-3): a bulk member add with an unknown user id fails the
-  whole request with an unhandled error (500), while a single add answers 404. The
-  mapping-create 503 detail carries the directory exception text.
+- #1009 (IAM-MAP-3): the mapping-create 503 detail carries the directory exception
+  text. The bulk member add half of the issue (IAM-GROUP-13) is fixed.
 
 ### Limits by decision
 
@@ -1393,7 +1394,6 @@ the integration suite, the frontend tests, and the browser suite were read, not 
 - IAM-APITOK-5: the token name and expiry bounds.
 - IAM-GROUP-5: membership and mapping removal on group delete (the test checks only that the group is gone).
 - IAM-GROUP-11: "Not Grouped" found by name.
-- IAM-GROUP-13: a bulk add with a repeated or unknown id.
 - IAM-SYNC-3: the display-name refresh during a sync.
 - IAM-SYNC-18: sync never changes a role.
 - IAM-SERIAL-3: the connection invalidation after a failed unlock.

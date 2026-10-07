@@ -558,6 +558,73 @@ async def test_bulk_add_members_empty_list(admin_client):
     assert result["skipped"] == 0
 
 
+# Issue #1009: an unknown user id made the bulk add fail the user foreign key
+# at commit, an unhandled IntegrityError (500) that added nobody. It is now one
+# 404 naming the unknown ids, with nothing added.
+@pytest.mark.asyncio
+async def test_bulk_add_members_unknown_among_valid_is_404_and_adds_nobody(admin_client):
+    group = await _seed_group("BulkUnknownMixed")
+    async with TestSessionLocal() as db:
+        u1 = await _seed_user(db, username="bulkmix1", email="bulkmix1@test.com")
+    ghost = uuid.uuid4()
+
+    resp = await admin_client.post(
+        f"/groups/{group.id}/members/bulk",
+        json={"user_ids": [str(u1.id), str(ghost)]},
+    )
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": f"Users not found: {ghost}"}
+    detail = await admin_client.get(f"/groups/{group.id}")
+    assert detail.status_code == 200
+    assert detail.json()["members"] == []
+
+
+@pytest.mark.asyncio
+async def test_bulk_add_members_all_unknown_is_404_naming_each_once(admin_client):
+    group = await _seed_group("BulkUnknownAll")
+    ghost_a, ghost_b = uuid.uuid4(), uuid.uuid4()
+    resp = await admin_client.post(
+        f"/groups/{group.id}/members/bulk",
+        json={"user_ids": [str(ghost_a), str(ghost_b), str(ghost_a)]},
+    )
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": f"Users not found: {ghost_a}, {ghost_b}"}
+
+
+@pytest.mark.asyncio
+async def test_bulk_add_members_unknown_detail_lists_ten_then_counts(admin_client):
+    group = await _seed_group("BulkUnknownMany")
+    ghosts = [uuid.uuid4() for _ in range(13)]
+    resp = await admin_client.post(
+        f"/groups/{group.id}/members/bulk",
+        json={"user_ids": [str(g) for g in ghosts]},
+    )
+    assert resp.status_code == 404
+    listed = ", ".join(str(g) for g in ghosts[:10])
+    assert resp.json() == {"detail": f"Users not found: {listed} and 3 more"}
+
+
+@pytest.mark.asyncio
+async def test_bulk_add_members_unknown_group_still_404s_first(admin_client):
+    resp = await admin_client.post(
+        f"/groups/{uuid.uuid4()}/members/bulk",
+        json={"user_ids": [str(uuid.uuid4())]},
+    )
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Group not found"}
+
+
+@pytest.mark.asyncio
+async def test_bulk_add_members_cap_unchanged(admin_client):
+    # The 500-id cap from issue #129 still applies before any lookup.
+    group = await _seed_group("BulkCapGroup")
+    resp = await admin_client.post(
+        f"/groups/{group.id}/members/bulk",
+        json={"user_ids": [str(uuid.uuid4()) for _ in range(501)]},
+    )
+    assert resp.status_code == 422
+
+
 @pytest.mark.asyncio
 async def test_bulk_add_members_requires_admin(user_client):
     group = await _seed_group("BulkAuthGroup")
