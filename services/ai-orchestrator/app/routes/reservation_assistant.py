@@ -475,6 +475,9 @@ async def reservation_assistant(
         # message history would have two consecutive user messages, causing a 400
         # from the provider and permanently jamming the conversation.
         await db.rollback()
+        # Issue #1034, on every rollback below as well: the turn is discarded
+        # but the provider calls it made are metered, in a fresh transaction.
+        await usage_repo.record_failed_usage(db, user_id, partial_usage)
         raise HTTPException(
             status.HTTP_504_GATEWAY_TIMEOUT,
             f"Assistant did not respond within {settings.assistant_overall_deadline_s:.0f}s",
@@ -496,6 +499,7 @@ async def reservation_assistant(
         # standardization. Caught before AIError (its subclass); rolls back the
         # flushed user turn like the other failure branches so no orphan persists.
         await db.rollback()
+        await usage_repo.record_failed_usage(db, user_id, partial_usage)
         logger.warning("ai_assistant_provider_unreachable: %s", exc)
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -518,6 +522,7 @@ async def reservation_assistant(
         # log the exception detail server-side and return a generic message so a
         # backend exception string is never exposed to the client (CWE-209).
         await db.rollback()
+        await usage_repo.record_failed_usage(db, user_id, partial_usage)
         logger.exception("ai_assistant_failed")
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
@@ -697,6 +702,7 @@ async def reservation_assistant_stream(
                         # flushed user turn so it does not persist without a reply and
                         # wedge the next turn's role alternation.
                         await db.rollback()
+                        await usage_repo.record_failed_usage(db, user_id, partial_usage)
                         yield _sse("error", {"message": "Assistant produced no answer"})
                         return
                 finally:
@@ -720,6 +726,7 @@ async def reservation_assistant_stream(
             # Discard the flushed-but-uncommitted user turn so a timed-out turn
             # leaves no orphan trailing user message.
             await db.rollback()
+            await usage_repo.record_failed_usage(db, user_id, partial_usage)
             yield _sse(
                 "error",
                 {
@@ -749,6 +756,7 @@ async def reservation_assistant_stream(
             # rather than dropping the connection. Roll back the flushed user turn
             # so no orphan persists, exactly as the AIError branch does.
             await db.rollback()
+            await usage_repo.record_failed_usage(db, user_id, partial_usage)
             logger.warning("ai_assistant_stream_provider_unreachable: %s", exc)
             yield _sse("error", {"message": AI_PROVIDER_UNREACHABLE_DETAIL})
         except AIError:
@@ -770,6 +778,7 @@ async def reservation_assistant_stream(
             # (CWE-209 stack-trace exposure). Roll back first so the failed turn's
             # user message never persists.
             await db.rollback()
+            await usage_repo.record_failed_usage(db, user_id, partial_usage)
             logger.exception("ai_assistant_stream_failed")
             yield _sse("error", {"message": ASSISTANT_CALL_FAILED_DETAIL})
         except Exception:
@@ -793,6 +802,7 @@ async def reservation_assistant_stream(
                 yield _sse("done", incomplete_response.model_dump(mode="json"))
                 return
             await db.rollback()
+            await usage_repo.record_failed_usage(db, user_id, partial_usage)
             yield _sse("error", {"message": ASSISTANT_CALL_FAILED_DETAIL})
         else:
             # Issue #904: persist AFTER the deadline-bounded loop, never inside

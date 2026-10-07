@@ -2012,3 +2012,69 @@ async def test_incomplete_log_carries_reason_as_its_own_key(async_client, caplog
     formatted = json.loads(JSONFormatter("ai-orchestrator").format(records[0]))
     assert formatted["message"] == "ai_assistant_incomplete_after_tools"
     assert formatted["reason"] == "timeout"
+
+
+# --- A rolled-back turn is still metered (issue #1034) ---
+
+
+def _override_spending_then_raising_ai(exc: Exception, *, spent: int = 25):
+    """The loop's first provider call answered (and spent tokens, recorded on
+    the shared `usage` object exactly as the real loop does), then a later
+    step raised with no side effect, so the route rolls the turn back."""
+
+    class SpendThenRaise:
+        async def answer_reservation_question_with_tools(self, *, usage=None, **_kw):
+            usage.input_tokens += spent
+            usage.output_tokens += spent
+            raise exc
+
+        async def answer_reservation_question_streaming(self, *, usage=None, **_kw):
+            usage.input_tokens += spent
+            usage.output_tokens += spent
+            raise exc
+            yield  # pragma: no cover  (makes this an async generator)
+
+    app.dependency_overrides[get_ai_client] = lambda: SpendThenRaise()
+
+
+async def _today_total_for(token: str) -> int:
+    async with _TestSessionLocal() as db:
+        return await usage_repo.get_today_total(db, _decode_sub(token))
+
+
+@pytest.mark.parametrize(
+    "exc, status_code",
+    [
+        (AIError("boom"), 502),
+        (AIProviderUnavailableError("refused"), 503),
+        (TimeoutError("deadline"), 504),
+    ],
+)
+async def test_buffered_rolled_back_turn_meters_tokens_spent(
+    async_client, monkeypatch, exc, status_code
+):
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    _override_seed()
+    _override_spending_then_raising_ai(exc)
+    token = _user_token()
+    async with async_client as client:
+        resp = await client.post(
+            _url(), json={"question": "q"}, headers={"Authorization": f"Bearer {token}"}
+        )
+    assert resp.status_code == status_code
+    # The turn is gone, the tokens its provider call spent are not.
+    assert await _today_total_for(token) == 50
+
+
+async def test_stream_rolled_back_turn_meters_tokens_spent(async_client, monkeypatch):
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    _override_seed()
+    _override_spending_then_raising_ai(AIError("boom"))
+    token = _user_token()
+    async with async_client as client:
+        resp = await client.post(
+            _stream_url(), json={"question": "q"}, headers={"Authorization": f"Bearer {token}"}
+        )
+    events = _parse_sse(resp.text)
+    assert [e for e, _ in events] == ["error"]
+    assert await _today_total_for(token) == 50

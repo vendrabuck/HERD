@@ -130,8 +130,11 @@ async def _run_classification(
             ai, categories=categories, signals_block=signals_block
         )
     except PurposeClassifierError as e:
+        # Issue #1034 on every failure branch: meter what the attempts spent.
+        await usage_repo.record_failed_usage(db, user_id, usage_repo.usage_of(e))
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e)) from e
     except AIProviderUnavailableError as e:
+        await usage_repo.record_failed_usage(db, user_id, usage_repo.usage_of(e))
         logger.warning("ai_purpose_classification_provider_unreachable: %s", e)
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, AI_PROVIDER_UNREACHABLE_DETAIL
@@ -140,6 +143,7 @@ async def _run_classification(
         # Fixed detail (issue #713): the provider's status/body text is logged
         # server-side with the traceback and never reaches the client.
         logger.exception("ai_purpose_classification_failed")
+        await usage_repo.record_failed_usage(db, user_id, usage_repo.usage_of(e))
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, AI_CLASSIFICATION_FAILED_DETAIL) from e
 
     await usage_repo.record_usage(db, user_id, usage, fallback_text=signals_block)

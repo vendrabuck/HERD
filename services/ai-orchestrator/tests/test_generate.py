@@ -1377,3 +1377,61 @@ async def test_generate_503_when_inventory_fails_during_candidate_fetch(async_cl
     assert resp.json()["detail"] == INVENTORY_UNAVAILABLE_DETAIL
     # One provider call: an outage is not a modelling mistake to repair.
     assert len(sink) == 1
+
+
+# --- Failed requests are metered (issue #1034) -----------------------------
+
+
+async def test_generate_failed_after_repairs_meters_every_attempt(async_client, monkeypatch):
+    """The issue's reproduction: a proposal the model keeps getting wrong
+    spends three provider calls (default two repairs) and answers 502; the
+    tokens of all three count against the day's quota."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 100)
+    _override_inventory({"EX3400": 4})
+    _override_resolver(monkeypatch)
+    _override_ai(
+        {
+            "purpose": "bad",
+            "devices": [{"role": "a", "template_name": "NotInInventory"}],
+            "edges": [],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        first = await client.post("/generate", data={"prompt": "go"}, headers=headers)
+        assert first.status_code == 502
+        async with _TestSessionLocal() as db:
+            # 3 attempts x Usage(10, 20) = 90.
+            assert await usage_repo.get_today_total(db, uuid.UUID(_USER_ID)) == 90
+        second = await client.post("/generate", data={"prompt": "go"}, headers=headers)
+        assert second.status_code == 502
+        # 180 >= 100: the quota now blocks the third failing request.
+        third = await client.post("/generate", data={"prompt": "go"}, headers=headers)
+    assert third.status_code == 429
+
+
+async def test_generate_ai_error_with_reported_usage_is_metered(async_client, monkeypatch):
+    """A provider that answered without the forced tool call still spent
+    tokens; AIError carries them and the route meters them."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    _override_inventory({"EX3400": 4})
+    _override_ai(raises=AIError("no tool_use", usage=Usage(input_tokens=7, output_tokens=3)))
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "go"}, headers=headers)
+    assert resp.status_code == 502
+    async with _TestSessionLocal() as db:
+        assert await usage_repo.get_today_total(db, uuid.UUID(_USER_ID)) == 10
+
+
+async def test_generate_unreachable_provider_meters_nothing(async_client, monkeypatch):
+    """No answer came back, so nothing is known to have been spent."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    _override_inventory({"EX3400": 4})
+    _override_ai(raises=AIProviderUnavailableError("refused"))
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "go"}, headers=headers)
+    assert resp.status_code == 503
+    async with _TestSessionLocal() as db:
+        assert await usage_repo.get_today_total(db, uuid.UUID(_USER_ID)) == 0

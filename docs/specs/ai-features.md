@@ -304,10 +304,11 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
 - **AI-GEN-13.** A proposal without `elements` is valid and answers `elements: []`. \
   Enforced in: `services/ai-orchestrator/app/schemas/generate.py` (`GenerateResponse`) \
   Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_device_only_proposal_defaults_elements_to_empty`)
-- **AI-GEN-14.** Token usage is summed over every attempt of one request and recorded once,
-  after a successful response. \
-  Enforced in: `services/ai-orchestrator/app/services/generator.py` (`generate_topology`); `services/ai-orchestrator/app/routes/generate.py` (`generate`) \
-  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_records_usage_when_quota_enabled`)
+- **AI-GEN-14.** Token usage is summed over every attempt of one request and recorded once:
+  after a successful response, or, when the request fails, as the total the failed
+  request's attempts reported (AI-QUOTA-5). \
+  Enforced in: `services/ai-orchestrator/app/services/generator.py` (`generate_topology`, `GeneratorError`); `services/ai-orchestrator/app/routes/generate.py` (`generate`) \
+  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_records_usage_when_quota_enabled`, `test_generate_failed_after_repairs_meters_every_attempt`)
 - **AI-GEN-15.** Generation does not check that the proposed `topology_type` values agree
   with each other or with the resolved devices. Known gap, see #1038. \
   Enforced in: `services/ai-orchestrator/app/services/generator.py` (`_validate_against_inventory`) \
@@ -987,9 +988,10 @@ a driver.
   unreachable provider 503; provider text never reaches the client. \
   Enforced in: `services/ai-orchestrator/app/routes/recipes.py` (`_run_authoring`, `RECIPE_DRAFT_AI_FAILED_DETAIL`) \
   Pinned by: `services/ai-orchestrator/tests/test_recipes_routes.py` (`test_draft_502_on_ai_error_never_leaks_provider_text`)
-- **AI-RECIPE-14.** Every attempt's tokens are recorded together after the draft is stored. \
+- **AI-RECIPE-14.** Every attempt's tokens are recorded together after the draft is stored;
+  a run that fails records the tokens its attempts reported (AI-QUOTA-5). \
   Enforced in: `services/ai-orchestrator/app/routes/recipes.py` (`_run_authoring`) \
-  Pinned by: `services/ai-orchestrator/tests/test_recipes_routes.py` (`test_usage_recorded_and_quota_enforced`)
+  Pinned by: `services/ai-orchestrator/tests/test_recipes_routes.py` (`test_usage_recorded_and_quota_enforced`, `test_failed_draft_validator_unreachable_meters_the_attempt`)
 
 **Out of scope.** The driver upload itself (`inventory.md`) and the validator's checks
 (`device-configuration.md`). Recipes for any connection type other than Hypervisor.
@@ -1070,9 +1072,10 @@ preview (section 8.12), and the reservations sweep and Classify now route
   unreachable provider 503, with no provider text. \
   Enforced in: `services/ai-orchestrator/app/routes/purpose_classification.py` (`_run_classification`, `AI_CLASSIFICATION_FAILED_DETAIL`) \
   Pinned by: `services/ai-orchestrator/tests/test_purpose_classification_routes.py` (`test_preview_502_on_ai_error_never_leaks_provider_text`)
-- **AI-PURPOSE-13.** A successful classification's tokens are recorded against the user. \
-  Enforced in: `services/ai-orchestrator/app/routes/purpose_classification.py` (`_run_classification`) \
-  Pinned by: `services/ai-orchestrator/tests/test_purpose_classification_routes.py` (`test_preview_meters_usage`)
+- **AI-PURPOSE-13.** A classification's tokens are recorded against the user, a failed one's
+  as the tokens its attempts reported (AI-QUOTA-5). \
+  Enforced in: `services/ai-orchestrator/app/routes/purpose_classification.py` (`_run_classification`); `services/ai-orchestrator/app/services/purpose_classifier.py` (`PurposeClassifierError`) \
+  Pinned by: `services/ai-orchestrator/tests/test_purpose_classification_routes.py` (`test_preview_meters_usage`, `test_preview_no_usable_distribution_meters_both_attempts`)
 
 **Out of scope.** Storing, reviewing, accepting, or dismissing a suggestion, the sweep's
 schedule and attempt counting, and the Classify now route (`reservations.md`). Reporting by
@@ -1140,12 +1143,16 @@ and `GET /usage`.
   insert-or-update. \
   Enforced in: `services/ai-orchestrator/app/services/usage_repo.py` (`add_tokens`); `services/ai-orchestrator/app/models/ai_usage.py` (`AIUsage`) \
   Pinned by: `services/ai-orchestrator/tests/test_usage_repo.py` (`test_add_tokens_inserts_then_increments`, `test_add_tokens_is_per_user`, `test_prior_day_usage_is_a_separate_total`)
-- **AI-QUOTA-5.** A call that ends in an error records no usage although provider calls
-  were made: a generation that fails after its attempts, an assistant turn that is rolled
-  back, a recipe run whose validator is unreachable, and a classification with no usable
-  answer. Known gap, see #1034. \
-  Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`generate`); `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant`); `services/ai-orchestrator/app/routes/recipes.py` (`_run_authoring`); `services/ai-orchestrator/app/routes/purpose_classification.py` (`_run_classification`) \
-  Pinned by: none (issue #1034)
+- **AI-QUOTA-5.** A request that ends in an error after reaching the provider records the
+  provider-reported tokens its calls spent: a generation that fails after its attempts, an
+  assistant turn that is rolled back (on either route), a recipe run whose validator is
+  unreachable or whose model call fails, a classification with no usable answer, and an
+  identity or other single call whose answer had no usable tool call. Unlike AI-QUOTA-3
+  there is no characters estimate: nothing known spent books nothing (an unreachable
+  provider, for example). A metering failure is logged and never replaces the request's
+  own error. \
+  Enforced in: `services/ai-orchestrator/app/services/usage_repo.py` (`record_failed_usage`, `usage_of`); `services/ai-orchestrator/app/services/llm_provider.py` (`AIError`); `services/ai-orchestrator/app/routes/generate.py` (`generate`); `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant`, `reservation_assistant_stream`); `services/ai-orchestrator/app/routes/recipes.py` (`_run_authoring`); `services/ai-orchestrator/app/routes/purpose_classification.py` (`_run_classification`); `services/ai-orchestrator/app/routes/template_identity.py` (`suggest_identity`) \
+  Pinned by: `services/ai-orchestrator/tests/test_usage_repo.py` (`test_record_failed_usage_books_reported_tokens`, `test_record_failed_usage_zero_or_none_books_nothing`, `test_record_failed_usage_disabled_quota_writes_no_row`, `test_record_failed_usage_swallows_a_metering_failure`); `services/ai-orchestrator/tests/test_generate.py` (`test_generate_failed_after_repairs_meters_every_attempt`, `test_generate_ai_error_with_reported_usage_is_metered`, `test_generate_unreachable_provider_meters_nothing`); `services/ai-orchestrator/tests/test_reservation_assistant.py` (`test_buffered_rolled_back_turn_meters_tokens_spent`, `test_stream_rolled_back_turn_meters_tokens_spent`); `services/ai-orchestrator/tests/test_recipes_routes.py` (`test_failed_draft_validator_unreachable_meters_the_attempt`, `test_failed_draft_ai_error_on_a_later_attempt_meters_earlier_attempts`); `services/ai-orchestrator/tests/test_purpose_classification_routes.py` (`test_preview_no_usable_distribution_meters_both_attempts`); `services/ai-orchestrator/tests/test_template_identity_route.py` (`test_suggest_identity_ai_error_with_reported_usage_is_metered`)
 - **AI-QUOTA-6.** `GET /quota` answers the caller's own `{enabled, limit, used, remaining, reset_at}`
   for any signed-in user, also when over the limit, and is not gated on the provider. \
   Enforced in: `services/ai-orchestrator/app/routes/quota.py` (`get_quota`); `services/ai-orchestrator/app/services/usage_repo.py` (`get_status`) \
@@ -1497,9 +1504,6 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
 
 ### Open defects
 
-- #1034 (AI-QUOTA-5): usage is recorded only after a successful call in generation, the
-  assistant, recipe authoring, and classification, so the tokens a failed call spent are
-  never counted against the daily quota.
 - #1036 (AI-LOG-5, AI-LOG-6): the template identity route logs the model's raw result and
   puts the schema error text in its 502 detail; upstream error text, internal URLs
   included, reaches response details and `tool_calls[].error`.
@@ -1555,7 +1559,6 @@ under Open defects gets its test with that defect's fix.
 - AI-LOOP-7: the write-tools section of the system prompt.
 - AI-RECIPE-3: the recipe flag answers before authentication.
 - AI-RECIPE-11: any admin may read and refine any draft.
-- AI-QUOTA-5: failed calls record no usage.
 - AI-LOG-5: the identity route's malformed branch logs model output.
 - AI-LOG-6: error details that carry upstream error text.
 - AI-UI-16: the generate dialog's client-side file checks.

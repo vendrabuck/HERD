@@ -67,6 +67,11 @@ class GeneratorError(Exception):
     a failure carries machine-readable data the frontend renders (the
     unconnectable-topology 422 below). It stays None for every plain-string
     failure, so the route keeps its existing behavior for all of them.
+
+    `usage` is the token total every provider call of the request spent before
+    the failure (issue #1034); generate_topology sets it on the way out so the
+    route can meter a failed request. Zero when the failure came before any
+    provider answer.
     """
 
     def __init__(self, status_code: int, message: str, detail: object | None = None) -> None:
@@ -74,6 +79,7 @@ class GeneratorError(Exception):
         self.status_code = status_code
         self.message = message
         self.detail = detail
+        self.usage = Usage()
 
 
 class TopologyUnconnectableError(GeneratorError):
@@ -136,12 +142,49 @@ async def generate_topology(
     # non-repairable outcomes of resolution (the 409 inventory race, the 503
     # inventory or cabling outage) are not about the proposal and propagate
     # immediately.
-    repair_feedback = ""
-    response: GenerateResponse | None = None
     # Accumulate token usage across every repair attempt: each attempt is a real
     # provider call that spends tokens, so the quota must see the sum, not just
-    # the final successful call.
+    # the final successful call, and a request that fails is metered too.
     total_usage = Usage()
+    try:
+        response = await _propose_until_valid(
+            prompt=prompt,
+            inventory=inventory,
+            ai=ai,
+            user_bearer_token=user_bearer_token,
+            file_context=file_context,
+            template_names=template_names,
+            total_usage=total_usage,
+        )
+    except GeneratorError as e:
+        # Issue #1034: carry what the failed request spent, so the route
+        # meters it rather than letting a failing request repeat for free.
+        e.usage = total_usage
+        raise
+
+    response.file_summaries = [
+        {"filename": f.filename, "chars": len(f.text), "truncated": f.truncated}
+        for f in extracted_files
+    ]
+    return response, total_usage
+
+
+async def _propose_until_valid(
+    *,
+    prompt: str,
+    inventory: InventorySummary,
+    ai: AIClient,
+    user_bearer_token: str,
+    file_context: str,
+    template_names: list[str],
+    total_usage: Usage,
+) -> GenerateResponse:
+    """The propose, validate, resolve, repair loop. Adds every provider call's
+    usage to `total_usage` as it goes (the caller reads it on success and on
+    failure alike) and returns the first proposal that validates and resolves,
+    or raises GeneratorError."""
+    repair_feedback = ""
+    response: GenerateResponse | None = None
     max_repairs = settings.ai_generate_max_repairs
     for attempt in range(max_repairs + 1):
         try:
@@ -161,7 +204,10 @@ async def generate_topology(
             raise GeneratorError(503, AI_PROVIDER_UNREACHABLE_DETAIL) from e
         except AIError as e:
             # Fixed detail (issue #713): the provider's status/body text stays
-            # in the server log; a client never sees it (CWE-209).
+            # in the server log; a client never sees it (CWE-209). A provider
+            # that answered with no usable tool call still spent tokens.
+            if e.usage is not None:
+                total_usage.add(e.usage)
             logger.exception("ai_error")
             raise GeneratorError(502, AI_NO_USABLE_RESPONSE_DETAIL) from e
         except Exception as e:  # network / rate-limit / auth errors from the SDK
@@ -219,11 +265,7 @@ async def generate_topology(
         break
 
     assert response is not None  # loop either sets response or raises
-    response.file_summaries = [
-        {"filename": f.filename, "chars": len(f.text), "truncated": f.truncated}
-        for f in extracted_files
-    ]
-    return response, total_usage
+    return response
 
 
 def _repair_feedback(error_message: str, template_names: list[str]) -> str:

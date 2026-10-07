@@ -593,7 +593,7 @@ class AIClient:
                 except (ValueError, AttributeError):
                     continue
 
-        raise AIError("AI did not return a tool_use block")
+        raise AIError("AI did not return a tool_use block", usage=resp.usage)
 
     async def suggest_template_identity(
         self,
@@ -646,7 +646,7 @@ class AIClient:
                 result.setdefault("part_number", None)
                 return result, resp.usage
 
-        raise AIError("AI did not return a suggest_identity tool_use block")
+        raise AIError("AI did not return a suggest_identity tool_use block", usage=resp.usage)
 
     async def draft_recipe(
         self,
@@ -716,7 +716,7 @@ class AIClient:
                 )
                 return dict(block.input), resp.usage
 
-        raise AIError("AI did not return a draft_recipe tool_use block")
+        raise AIError("AI did not return a draft_recipe tool_use block", usage=resp.usage)
 
     async def classify_purpose(
         self,
@@ -761,7 +761,7 @@ class AIClient:
                 )
                 return dict(block.input), resp.usage
 
-        raise AIError("AI did not return a classify_purpose tool_use block")
+        raise AIError("AI did not return a classify_purpose tool_use block", usage=resp.usage)
 
     async def answer_reservation_question_with_tools(
         self,

@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.recipe_draft import RecipeDraft
-from app.services.llm_provider import ToolSchema, Usage
+from app.services.llm_provider import AIError, ToolSchema, Usage
 
 if TYPE_CHECKING:
     from app.services.ai_client import AIClient
@@ -187,6 +187,9 @@ class RecipeAuthorError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.message = message
+        # Issue #1034: the tokens the run's attempts spent before it failed,
+        # set by author_recipe on the way out so the route can meter them.
+        self.usage: Usage | None = None
 
 
 def build_metadata(model_metadata: dict, draft_id: uuid.UUID) -> dict:
@@ -285,6 +288,78 @@ async def author_recipe(
     previous_meta = existing.driver_metadata_json if existing else None
     feedback = admin_feedback
 
+    try:
+        driver_py, metadata, explanation, report, attempts = await _draft_until_valid(
+            ai,
+            draft_id=draft_id,
+            prompt=prompt,
+            hypervisor_type=hypervisor_type,
+            previous_py=previous_py,
+            previous_meta=previous_meta,
+            feedback=feedback,
+            total_usage=total_usage,
+        )
+    except (RecipeAuthorError, AIError) as exc:
+        # Issue #1034: attach everything the run spent (earlier attempts plus
+        # whatever the failing call reported) so the route meters it.
+        spent = Usage()
+        spent.add(total_usage)
+        if isinstance(exc, AIError) and exc.usage is not None:
+            spent.add(exc.usage)
+        exc.usage = spent
+        raise
+
+    valid = bool(report and report.get("valid"))
+    if existing:
+        draft = existing
+        draft.prompt = prompt
+        draft.hypervisor_type = hypervisor_type or draft.hypervisor_type
+        draft.driver_py = driver_py
+        draft.driver_metadata_json = json.dumps(metadata)
+        draft.explanation = explanation
+        draft.validation_json = json.dumps(report) if report is not None else None
+        draft.valid = valid
+        draft.attempts = draft.attempts + attempts
+        draft.model = settings.ai_model
+    else:
+        draft = RecipeDraft(
+            id=draft_id,
+            user_id=user_id,
+            prompt=prompt,
+            hypervisor_type=hypervisor_type,
+            driver_py=driver_py,
+            driver_metadata_json=json.dumps(metadata),
+            explanation=explanation,
+            validation_json=json.dumps(report) if report is not None else None,
+            valid=valid,
+            attempts=attempts,
+            model=settings.ai_model,
+        )
+        db.add(draft)
+    await db.commit()
+    await db.refresh(draft)
+
+    logger.info(
+        "recipe draft persisted",
+        extra={"draft_id": str(draft.id), "valid": draft.valid, "attempts": attempts},
+    )
+    return draft, total_usage
+
+
+async def _draft_until_valid(
+    ai: "AIClient",
+    *,
+    draft_id: uuid.UUID,
+    prompt: str,
+    hypervisor_type: str | None,
+    previous_py: str | None,
+    previous_meta: str | None,
+    feedback: str,
+    total_usage: Usage,
+) -> tuple[str, dict, str | None, dict | None, int]:
+    """The draft, validate, repair loop. Adds each attempt's usage to
+    `total_usage` as it goes and returns (driver_py, metadata, explanation,
+    report, attempts) for the last attempt."""
     driver_py = ""
     metadata: dict = {}
     explanation: str | None = None
@@ -324,38 +399,4 @@ async def author_recipe(
             extra={"draft_id": str(draft_id)},
         )
 
-    valid = bool(report and report.get("valid"))
-    if existing:
-        draft = existing
-        draft.prompt = prompt
-        draft.hypervisor_type = hypervisor_type or draft.hypervisor_type
-        draft.driver_py = driver_py
-        draft.driver_metadata_json = json.dumps(metadata)
-        draft.explanation = explanation
-        draft.validation_json = json.dumps(report) if report is not None else None
-        draft.valid = valid
-        draft.attempts = draft.attempts + attempts
-        draft.model = settings.ai_model
-    else:
-        draft = RecipeDraft(
-            id=draft_id,
-            user_id=user_id,
-            prompt=prompt,
-            hypervisor_type=hypervisor_type,
-            driver_py=driver_py,
-            driver_metadata_json=json.dumps(metadata),
-            explanation=explanation,
-            validation_json=json.dumps(report) if report is not None else None,
-            valid=valid,
-            attempts=attempts,
-            model=settings.ai_model,
-        )
-        db.add(draft)
-    await db.commit()
-    await db.refresh(draft)
-
-    logger.info(
-        "recipe draft persisted",
-        extra={"draft_id": str(draft.id), "valid": draft.valid, "attempts": attempts},
-    )
-    return draft, total_usage
+    return driver_py, metadata, explanation, report, attempts

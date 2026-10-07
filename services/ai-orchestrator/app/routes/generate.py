@@ -172,6 +172,9 @@ async def generate(
             extracted_files=extracted,
         )
     except GeneratorError as e:
+        # Issue #1034: meter what the failed request's provider calls spent
+        # before answering the error, so a failing request is not free.
+        await usage_repo.record_failed_usage(db, user_id, e.usage)
         # A GeneratorError carries a structured `detail` only when the failure
         # has machine-readable data the frontend renders (the unconnectable
         # 422's role/template pairs). Every other failure keeps its plain

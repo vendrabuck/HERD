@@ -87,6 +87,9 @@ async def suggest_identity(
     except AIError as e:
         # Fixed detail (issue #713): provider text stays in the server log.
         logger.exception("ai_template_identity_suggestion_failed")
+        # Issue #1034: a provider that answered without the expected tool
+        # call still spent tokens; meter what it reported.
+        await usage_repo.record_failed_usage(db, user_id, usage_repo.usage_of(e))
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
             AI_SUGGESTION_FAILED_DETAIL,

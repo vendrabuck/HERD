@@ -4,9 +4,10 @@ Triple gate on every route, checked in order: the ai_recipe_authoring_enabled
 flag (403, enforced at the boundary like the write tools, not just absent
 from docs), admin role, and for the drafting routes ai_is_configured() (503,
 pinned detail). Drafting is quota-enforced and every attempt's tokens are
-metered through ai_usage. Nothing here uploads a driver; the response carries
-the assembled archive base64-encoded for the admin's explicit upload through
-inventory's existing admin endpoint.
+metered through ai_usage, on a failed run as well (issue #1034). Nothing
+here uploads a driver; the response carries the assembled archive
+base64-encoded for the admin's explicit upload through inventory's existing
+admin endpoint.
 """
 
 import json
@@ -137,14 +138,19 @@ async def _run_authoring(
             admin_feedback=admin_feedback,
         )
     except RecipeAuthorError as e:
+        # Issue #1034 on every failure branch: meter the tokens the run's
+        # attempts spent before the error, so a failing run is not free.
+        await usage_repo.record_failed_usage(db, user_id, usage_repo.usage_of(e))
         raise HTTPException(e.status_code, e.message) from e
     except AIProviderUnavailableError as e:
+        await usage_repo.record_failed_usage(db, user_id, usage_repo.usage_of(e))
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, AI_PROVIDER_UNREACHABLE_DETAIL
         ) from e
     except AIError as e:
         # Fixed detail (issue #713): provider text stays in the server log.
         logger.exception("ai_recipe_drafting_failed")
+        await usage_repo.record_failed_usage(db, user_id, usage_repo.usage_of(e))
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, RECIPE_DRAFT_AI_FAILED_DETAIL) from e
 
     await usage_repo.record_usage(db, user_id, usage, fallback_text=prompt + draft.driver_py)

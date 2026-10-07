@@ -134,3 +134,18 @@ async def test_suggest_identity_502_when_ai_returns_malformed(async_client):
     async with async_client as client:
         resp = await client.post("/templates/suggest-identity", json=body, headers=headers)
     assert resp.status_code == 502
+
+
+async def test_suggest_identity_ai_error_with_reported_usage_is_metered(async_client, monkeypatch):
+    """Issue #1034: an answer without the forced tool call still spent tokens."""
+    from app.services import usage_repo
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    _override_ai_returning(raises=AIError("no tool", usage=Usage(input_tokens=6, output_tokens=4)))
+    headers = {"Authorization": f"Bearer {_token('admin')}"}
+    async with async_client as client:
+        resp = await client.post("/templates/suggest-identity", json={"name": "X"}, headers=headers)
+    assert resp.status_code == 502
+    async with async_sessionmaker(engine, expire_on_commit=False)() as db:
+        assert await usage_repo.get_today_total(db, uuid.UUID(_ADMIN_ID)) == 10

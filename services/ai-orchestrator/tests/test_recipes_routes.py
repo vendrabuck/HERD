@@ -272,3 +272,51 @@ async def test_status_reports_recipe_authoring_flag(async_client, monkeypatch):
         monkeypatch.setattr(config_module.settings, "ai_recipe_authoring_enabled", False)
         off = await client.get("/status")
         assert off.json()["recipe_authoring"] is False
+
+
+# --- failed runs are metered (issue #1034) ---
+
+
+async def _today_total() -> int:
+    from app.services import usage_repo
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    async with async_sessionmaker(engine, expire_on_commit=False)() as db:
+        return await usage_repo.get_today_total(db, uuid.UUID(_ADMIN_ID))
+
+
+async def test_failed_draft_validator_unreachable_meters_the_attempt(async_client, monkeypatch):
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    _stub_ai()
+    with patch(
+        "app.services.recipe_author.validate_with_execution",
+        new=AsyncMock(side_effect=RecipeAuthorError(503, RECIPE_VALIDATOR_UNREACHABLE_DETAIL)),
+    ):
+        async with async_client as client:
+            resp = await client.post("/recipes/draft", json=BODY, headers=_headers("admin"))
+    assert resp.status_code == 503
+    # One attempt reached the provider: Usage(100, 50).
+    assert await _today_total() == 150
+
+
+async def test_failed_draft_ai_error_on_a_later_attempt_meters_earlier_attempts(
+    async_client, monkeypatch
+):
+    """Attempt one answered (and failed validation); attempt two's provider
+    call raised. Attempt one's tokens are still metered."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    stub = _stub_ai()
+    real_draft = stub.draft_recipe
+
+    async def draft_then_fail(**kwargs):
+        if stub.calls:
+            raise AIError("provider 500")
+        return await real_draft(**kwargs)
+
+    stub.draft_recipe = draft_then_fail
+    red = {**GOOD_REPORT, "valid": False}
+    with _patch_validator(red):
+        async with async_client as client:
+            resp = await client.post("/recipes/draft", json=BODY, headers=_headers("admin"))
+    assert resp.status_code == 502
+    assert await _today_total() == 150
