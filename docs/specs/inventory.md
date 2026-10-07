@@ -1057,9 +1057,11 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`) \
   Pinned by: `services/inventory/tests/test_bulk_service_unit.py` (`test_import_devices_unknown_field_rolls_back_via_http_exception`, `test_import_devices_bad_enum_rolls_back_via_validation_error`)
 - **INV-BULK-11.** A dry run writes nothing and returns the same report shape with
-  `dry_run: true`. \
-  Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`, `import_templates`) \
-  Pinned by: `services/inventory/tests/test_bulk.py` (`test_dry_run_writes_nothing`); `tests/integration/test_bulk_import_export.py` (`test_device_import_dry_run_writes_nothing`)
+  `dry_run: true`: it runs on a session joined to the request's connection whose
+  commits are savepoint releases inside one outer transaction, and that transaction is
+  rolled back when the import ends. \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`, `import_templates`, `_rehearsal_session`) \
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_dry_run_writes_nothing`, `test_device_dry_run_report_matches_commit_row_for_row_and_writes_nothing`); `tests/integration/test_bulk_import_export.py` (`test_device_import_dry_run_writes_nothing`)
 - **INV-BULK-12.** A device update row leaves out every column it does not carry or
   leaves empty, so an omitted `field_data`, poll interval, status, or topology type
   keeps its stored value (the template importer's rule, INV-BULK-14). A row that
@@ -1103,12 +1105,13 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   its reason, and it infers the format from the file extension. \
   Enforced in: `frontend/src/components/ui/BulkImportExport.tsx` (`BulkImportExport`) \
   Pinned by: `frontend/src/test/components/BulkImportExport.test.tsx` (`runs a dry-run and shows the per-row reject report`, `infers csv format from the file extension`)
-- **INV-BULK-18.** A dry run validates only the row shape (names, references, and the
-  request schemas); it does not run the create and update checks of INV-BULK-10, so it
-  can report `create` or `update` for a row the committed import rejects.
-  Known gap, see #1017. \
-  Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`, `import_templates`) \
-  Pinned by: none
+- **INV-BULK-18.** A dry run is a full rehearsal: every row goes through the same create
+  and update functions as a committed import (INV-BULK-10, INV-BULK-13), a later row
+  sees an earlier row's create (a name repeated in one file reports `create` then
+  `update`), and a rejected row is rolled back to its savepoint, so the dry-run report
+  equals the committed report row for row on the same starting data. \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`, `import_templates`, `_import_device_rows`, `_import_template_rows`, `_rehearsal_session`) \
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_dry_run_rejects_unknown_field_data_key_like_the_commit`, `test_dry_run_rejects_hypervisor_driver_on_device_template_like_the_commit`, `test_device_dry_run_report_matches_commit_row_for_row_and_writes_nothing`, `test_template_dry_run_duplicate_name_in_file_matches_commit`)
 - **INV-BULK-19.** `format` is `csv` or `json` (default `json`); any other value answers
   422. \
   Enforced in: `services/inventory/app/routers/bulk.py` (`export_devices`, `import_devices_endpoint`); `services/inventory/app/services/bulk_service.py` (`parse_import`) \

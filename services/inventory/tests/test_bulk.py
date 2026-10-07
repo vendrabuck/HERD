@@ -803,3 +803,152 @@ async def test_put_device_explicit_null_status_is_422_naming_the_field(client):
         "Value error, status cannot be null; omit the field to leave it unchanged"
     ]
     assert (await _device_by_name(client, "FW-01"))["status"] == "AVAILABLE"
+
+
+# Dry run is a full rehearsal (issue #1017) -----------------------------------
+
+
+async def _post_import(client, resource: str, items: list, *, dry_run: bool) -> dict:
+    resp = await client.post(
+        f"/{resource}/import",
+        params={"format": "json", "dry_run": "true" if dry_run else "false"},
+        files={"file": ("x.json", io.BytesIO(json.dumps(items).encode()), "application/json")},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+_ONE_SECTION = [{"name": "S", "fields": [{"key": "k", "label": "K", "type": "string"}]}]
+
+
+def _without_flag(report: dict) -> dict:
+    return {k: v for k, v in report.items() if k != "dry_run"}
+
+
+async def _create_named_driver(client, name: str, connection_type: str) -> str:
+    resp = await client.post(
+        "/drivers",
+        data={"name": name, "connection_type": connection_type},
+        files={"file": ("driver.zip", io.BytesIO(b"PK\x03\x04test"), "application/zip")},
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_dry_run_rejects_unknown_field_data_key_like_the_commit(client):
+    """The issue's first repro: dry run reported `create` for a row the
+    committing import rejects in `create_device`'s validate_field_data."""
+    await _create_template(client, name="Firewall")
+    items = [
+        {
+            "name": "BOGUS-01",
+            "template_name": "Firewall",
+            "topology_type": "PHYSICAL",
+            "field_data": {"model": "X", "bogus": 1},
+        }
+    ]
+    dry = await _post_import(client, "devices", items, dry_run=True)
+    assert dry["dry_run"] is True
+    assert dry["rows"] == [
+        {"row": 0, "action": "reject", "identity": "BOGUS-01", "reason": "Unknown fields: bogus"}
+    ]
+    real = await _post_import(client, "devices", items, dry_run=False)
+    assert real["dry_run"] is False
+    assert _without_flag(dry) == _without_flag(real)
+
+
+@pytest.mark.asyncio
+async def test_dry_run_rejects_hypervisor_driver_on_device_template_like_the_commit(client):
+    """The issue's second repro: the template-type versus driver
+    connection-type rule lives in create_template, which a dry run skipped."""
+    await _create_named_driver(client, "Recipe X", "Hypervisor")
+    items = [
+        {
+            "name": "BadDevTpl",
+            "template_type": "device",
+            "driver_name": "Recipe X",
+            "vendor": "V",
+            "model": "M",
+            "sections": _ONE_SECTION,
+        }
+    ]
+    dry = await _post_import(client, "templates", items, dry_run=True)
+    assert dry["rows"][0]["action"] == "reject"
+    assert dry["rows"][0]["reason"] == "Device templates cannot use a Hypervisor-type driver"
+    real = await _post_import(client, "templates", items, dry_run=False)
+    assert _without_flag(dry) == _without_flag(real)
+    templates = (await client.get("/templates")).json()["items"]
+    assert all(t["name"] != "BadDevTpl" for t in templates)
+
+
+@pytest.mark.asyncio
+async def test_device_dry_run_report_matches_commit_row_for_row_and_writes_nothing(client):
+    """A mixed file: a good create, a field-type error, a required-field
+    error, a port template named in a device row, a duplicate name inside the
+    file (the commit creates then updates it), and an update of an existing
+    device. The dry-run report equals the committing report, and the dry run
+    leaves every row, the No Pool membership included, as it was."""
+    template = await _create_template(client, name="Firewall")
+    existing = await _create_device(client, template["id"], name="FW-OLD")
+    port_tpl = await client.post(
+        "/templates",
+        json={"name": "PortTpl", "template_type": "port", "sections": _ONE_SECTION},
+    )
+    assert port_tpl.status_code == 201, port_tpl.text
+    items = [
+        {"name": "OK-1", "template_name": "Firewall", "topology_type": "PHYSICAL",
+         "field_data": {"model": "X"}},
+        {"name": "TYPE-1", "template_name": "Firewall", "topology_type": "PHYSICAL",
+         "field_data": {"model": 5}},
+        {"name": "REQ-1", "template_name": "Firewall", "topology_type": "PHYSICAL",
+         "field_data": {}},
+        {"name": "PORT-1", "template_name": "PortTpl", "topology_type": "PHYSICAL",
+         "field_data": {}},
+        {"name": "OK-1", "template_name": "Firewall", "topology_type": "PHYSICAL",
+         "status": "MAINTENANCE", "field_data": {"model": "Y"}},
+        {"name": "FW-OLD", "template_name": "Firewall", "field_data": {"model": "Z", "bad": 1}},
+        {"name": "FW-OLD", "template_name": "Firewall", "status": "MAINTENANCE"},
+    ]  # fmt: skip
+    before = sorted(
+        (d["name"], d["status"], json.dumps(d["field_data"], sort_keys=True))
+        for d in (await client.get("/devices")).json()["items"]
+    )
+    groups_before = (await client.get("/device-groups")).json()
+
+    dry = await _post_import(client, "devices", items, dry_run=True)
+    assert [r["action"] for r in dry["rows"]] == [
+        "create", "reject", "reject", "reject", "update", "reject", "update",
+    ]  # fmt: skip
+    assert dry["rows"][1]["reason"] == "Field 'model' must be a string"
+    assert dry["rows"][2]["reason"] == "Required field missing: model"
+    assert dry["rows"][3]["reason"] == "Template is not a device template"
+    assert dry["rows"][5]["reason"] == "Unknown fields: bad"
+
+    after_dry = sorted(
+        (d["name"], d["status"], json.dumps(d["field_data"], sort_keys=True))
+        for d in (await client.get("/devices")).json()["items"]
+    )
+    assert after_dry == before
+    assert (await client.get("/device-groups")).json() == groups_before
+
+    real = await _post_import(client, "devices", items, dry_run=False)
+    assert _without_flag(dry) == _without_flag(real)
+    assert (await _device_by_name(client, "OK-1"))["status"] == "MAINTENANCE"
+    assert (await _device_by_name(client, "FW-OLD"))["id"] == existing["id"]
+
+
+@pytest.mark.asyncio
+async def test_template_dry_run_duplicate_name_in_file_matches_commit(client):
+    """Two rows with one new template name: the commit creates the first and
+    updates it with the second, and the rehearsal must say the same."""
+    items = [
+        {"name": "Twice", "template_type": "port", "sections": _ONE_SECTION, "description": "one"},
+        {"name": "Twice", "template_type": "port", "description": "two"},
+    ]
+    dry = await _post_import(client, "templates", items, dry_run=True)
+    assert [r["action"] for r in dry["rows"]] == ["create", "update"]
+    templates = (await client.get("/templates")).json()["items"]
+    assert all(t["name"] != "Twice" for t in templates)
+    real = await _post_import(client, "templates", items, dry_run=False)
+    assert _without_flag(dry) == _without_flag(real)

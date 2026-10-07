@@ -83,14 +83,16 @@ Every import returns a `BulkImportReport`:
   leaves no partial write.
 
 With `dry_run=true`, nothing is written and the same report shape is returned.
-For the device and template importers, a dry run performs the schema checks and
-name resolution only; the checks owned by the create and update service
-functions (template kind and hardware identity, `field_data` validation, the template type versus
-driver connection type rule, commit-time unique names) run only on a committing
-import, so a committing import can reject a row the dry run reported as `create`
-or `update`. Whether the dry run should run those checks too is pending under
-issue #1017. Run a dry run first to preview a migration, and read the committing
-import's report as the final answer.
+For the device and template importers, a dry run is a full rehearsal (issue
+#1017): every row goes through the same create and update service functions a
+committing import runs (template kind and hardware identity, `field_data`
+validation, the template type versus driver connection type rule, unique names),
+inside a database transaction that is rolled back when the import ends. A later
+row sees an earlier row's write, so a name repeated in one file reports `create`
+and then `update`, exactly as the committing import does. On the same starting
+data, the dry-run report equals the committing report row for row. Run a dry run
+first to preview a migration; a committing import can still differ only when the
+data changes between the two runs.
 
 ## File schemas
 
