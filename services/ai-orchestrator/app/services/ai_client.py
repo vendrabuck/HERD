@@ -390,7 +390,8 @@ Rules:
   fully answerable from the seed (such as "when does my reservation end?"),
   answer directly without any tool call.
 - All tools operate within the current reservation. Tools that take a
-  device_id accept only the IDs already listed in <devices>.
+  device_id accept only the IDs of this reservation's devices; any other ID is
+  refused.
 - If a tool returns is_error=true, briefly note the failure and either try a
   different approach or explain what could not be determined. Do not retry
   the same failing call repeatedly.

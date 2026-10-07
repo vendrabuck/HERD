@@ -71,8 +71,8 @@ to `reservations.md`.
 | GET | `/status` | anyone, no token | 200 | AI-PROV-5, AI-PROV-6, AI-PROV-7, AI-PROV-8 |
 | POST | `/generate` | any signed-in user | 200 | AI-PROV-2, AI-GEN-1 to AI-GEN-16, AI-UPLOAD-1 to AI-UPLOAD-7, AI-RESOLVE-1 to AI-RESOLVE-15, AI-QUOTA-2 |
 | POST | `/commit` | any signed-in user; upstream services apply their own rules to the caller's JWT | 200 | AI-COMMIT-1 to AI-COMMIT-19 |
-| POST | `/reservations/{id}/assistant` | the reservation's owner (first turn); the conversation's creator on the same reservation (later turns) | 200 | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-TURN-1 to AI-TURN-8, AI-TOOL-1 to AI-TOOL-10, AI-WRITE-1 to AI-WRITE-3 |
-| POST | `/reservations/{id}/assistant/stream` | as above | 200 (`text/event-stream`) | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-STREAM-1 to AI-STREAM-7, AI-TOOL-1 to AI-TOOL-10, AI-WRITE-1 to AI-WRITE-3 |
+| POST | `/reservations/{id}/assistant` | the reservation's owner (first turn); the conversation's creator on the same reservation (later turns) | 200 | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-TURN-1 to AI-TURN-8, AI-TOOL-1 to AI-TOOL-11, AI-WRITE-1 to AI-WRITE-3 |
+| POST | `/reservations/{id}/assistant/stream` | as above | 200 (`text/event-stream`) | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-STREAM-1 to AI-STREAM-7, AI-TOOL-1 to AI-TOOL-11, AI-WRITE-1 to AI-WRITE-3 |
 | POST | `/templates/suggest-identity` | admin or superadmin | 200 | AI-PROV-2, AI-IDENT-1 to AI-IDENT-4, AI-QUOTA-2 |
 | GET | `/quota` | any signed-in user (own usage) | 200 | AI-QUOTA-7 |
 | GET | `/usage` | admin or superadmin | 200 | AI-QUOTA-8 |
@@ -775,6 +775,20 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   `is_error` result the model can read. \
   Enforced in: `services/ai-orchestrator/app/services/tools.py` (`dispatch`, `_auth_headers`) \
   Pinned by: `services/ai-orchestrator/tests/test_tools.py` (`test_dispatcher_forwards_bearer_token`, `test_dispatch_unknown_tool_returns_is_error`, `test_dispatcher_handles_httpx_failure`)
+- **AI-TOOL-11.** A device-id argument (`device_id`, or `source_device_id` and
+  `target_device_id` on `find_path`) must name one of the reservation's own devices, for
+  read and write tools alike. The check runs at the dispatch boundary before the handler,
+  so a device outside the reservation is refused with the tool error
+  `<argument> is not a device of this reservation` and no call reaches inventory, cabling,
+  or execution. The device list is reservations `GET /{id}` read with the caller's JWT
+  once per turn, on the first call that carries a device argument; it fails closed: a
+  non-200 answer, a transport error, or a body without a list of UUIDs under `device_ids`
+  refuses every device-scoped call with `the reservation's device list could not be read`,
+  and a failed read is retried on the next call rather than cached. A malformed id is
+  refused by AI-TOOL-10 before the read; a call with no device argument (for example
+  `list_executions_for_reservation` with no filter) reads nothing (issue #1054). \
+  Enforced in: `services/ai-orchestrator/app/services/tools.py` (`dispatch`, `_enforce_device_scope`, `_fetch_reservation_devices`, `DEVICE_ID_ARGUMENTS`) \
+  Pinned by: `services/ai-orchestrator/tests/test_tools_device_scope.py` (`test_every_device_id_property_is_scoped`, `test_a_device_outside_the_reservation_is_refused_before_any_downstream_call`, `test_a_device_of_the_reservation_reaches_the_handler`, `test_find_path_refuses_when_only_the_target_is_outside`, `test_the_device_list_is_read_with_the_callers_jwt_once_per_turn`, `test_an_unreadable_device_list_fails_closed`, `test_a_failed_device_list_read_is_retried_on_the_next_call`, `test_list_executions_without_a_device_filter_reads_no_device_list`, `test_a_refusal_is_logged_by_tool_and_argument_only`)
 - **AI-TOOL-3.** A tool result is serialized to JSON and cut at
   `ASSISTANT_TOOL_RESULT_CHAR_CAP` characters with a `... [truncated: N chars omitted]`
   marker. \
@@ -1452,6 +1466,7 @@ Calls into this area are in section 7. All user-path calls forward the caller's 
 | Out | reservations | `POST /` (JWT) | commit's reservation | Relayed status; topology rolled back (AI-COMMIT-11) |
 | Out | execution | `POST /execute` (JWT) | optional config push | Recorded per device as `failed`; commit stands (AI-COMMIT-16) |
 | Out | reservations | `GET /{id}` (JWT) | assistant seed | 404: 404. Deadline: 504. Other: 503 (AI-CONV-3) |
+| Out | reservations | `GET /{id}` (JWT) | assistant tool device scope | Any failure refuses every device-scoped tool call as an `is_error` result; fail closed (AI-TOOL-11) |
 | Out | inventory | `GET /devices/{id}` (JWT) | assistant seed devices | 404: device omitted. Other: 503 (AI-CONV-3) |
 | Out | inventory | device, port, template, config-version, config-schema, and schedule routes (JWT) | assistant tools | Becomes an `is_error` tool result; the turn continues (AI-TOOL-2). The schema proxy fails open to the registry (AI-TOOL-7) |
 | Out | cabling | `POST /pathfind` (JWT) | `find_path` tool | `is_error` tool result |

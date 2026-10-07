@@ -28,6 +28,19 @@ VERSION_ID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 
 
 @pytest.fixture(autouse=True)
+def _reservation_holds_the_test_devices(monkeypatch):
+    """dispatch() refuses a device id outside the reservation (issue #1054) after
+    reading the reservation's device list. This module tests the handlers, so the
+    list is stubbed to hold its devices; tests/test_tools_device_scope.py covers
+    the scope check and the real read."""
+
+    async def _devices(self):
+        return frozenset({DEVICE_ID})
+
+    monkeypatch.setattr(ToolDispatcher, "_fetch_reservation_devices", _devices)
+
+
+@pytest.fixture(autouse=True)
 def _write_tools_enabled(monkeypatch):
     monkeypatch.setattr(settings, "ai_write_tools_enabled", True)
 

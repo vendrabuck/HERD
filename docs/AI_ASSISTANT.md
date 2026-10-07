@@ -35,6 +35,8 @@ The opening seed sent to the model is intentionally narrow:
 
 For everything else, the model calls one of seven read-only tools, plus the two documentation tools when a documentation source is enabled. Each tool's HTTP call carries your JWT, so existing RBAC and device visibility apply exactly as if you made the call yourself.
 
+Every tool that takes a device id (`get_device`, `get_device_ports`, `get_device_current_config`, `list_device_config_history`, `get_device_config_schema`, both ends of `find_path`, the optional filter of `list_executions_for_reservation`, and the two write tools) accepts only the ids of this reservation's own devices. The check runs at the dispatch boundary before the tool does anything: a device outside the reservation is refused with the tool error `<argument> is not a device of this reservation`, and nothing is sent to inventory, cabling, or execution. The device list is read from the reservation once per turn with your JWT; if it cannot be read, every device-scoped tool call in that turn is refused with `the reservation's device list could not be read` rather than allowed. A device removed from the reservation stops being usable from the next turn.
+
 | Tool | Backing endpoint | Returns |
 |---|---|---|
 | `get_device` | `GET /api/inventory/devices/{id}` | Device detail; password-typed `field_data` keys stripped using the template definition |
