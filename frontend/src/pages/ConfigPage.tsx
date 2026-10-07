@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from "react";
 import { Link } from "react-router-dom";
 import toast from "react-hot-toast";
+import { TOAST_CLEARANCE_CLASS } from "@/lib/toastClearance";
 import { ArrowLeft, Eye, EyeOff, ChevronDown, ChevronRight } from "lucide-react";
 import { useConfigStore } from "@/stores/configStore";
 import {
@@ -496,7 +497,11 @@ export function ConfigPage() {
 
   // Config editor
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-50 py-8">
+    // Issue #988: the editor ends in Save, Save and Restart, and Back to login at
+    // the bottom centre; the bottom padding lets them scroll clear of a toast.
+    <div
+      className={`min-h-screen flex items-center justify-center bg-gray-50 pt-8 ${TOAST_CLEARANCE_CLASS}`}
+    >
       <ConfigEditor />
     </div>
   );

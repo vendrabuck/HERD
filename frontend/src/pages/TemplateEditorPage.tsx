@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import toast from "react-hot-toast";
+import { TOAST_CLEARANCE_CLASS } from "@/lib/toastClearance";
 import {
   useTemplate,
   useCreateTemplate,
@@ -316,7 +317,9 @@ export function TemplateEditorPage() {
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="max-w-4xl mx-auto px-6 py-6 space-y-6">
+      {/* Issue #988: the page ends in the full-width "+ Add Section" button at
+          the bottom centre; the bottom padding lets it scroll clear of a toast. */}
+      <div className={`max-w-4xl mx-auto px-6 pt-6 space-y-6 ${TOAST_CLEARANCE_CLASS}`}>
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold text-gray-900">
             {isNew ? "Create Template" : editing ? "Edit Template" : "Template Details"}
