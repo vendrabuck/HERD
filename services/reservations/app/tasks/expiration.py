@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from herd_common.outbox import enqueue_event
 from herd_common.retry import retry_with_backoff
-from sqlalchemy import and_, exists, select
+from sqlalchemy import and_, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -343,6 +343,9 @@ async def _run_expiration_cycle() -> None:
         claimed = result.scalars().all()
         for res in claimed:
             res.status = ReservationStatus.PENDING_PROVISION
+            # The provisioning backstops' clock (issue #997): flushed in the same
+            # UPDATE as the status, under the same row lock.
+            res.provision_started_at = now
             logger.info(
                 "Claimed scheduled reservation %s for activation",
                 res.id,
@@ -399,9 +402,13 @@ async def _run_expiration_cycle() -> None:
 
         # Timeout backstop (ADR 0004): fail dynamic-carrying reservations stuck
         # in PENDING_PROVISION past provision_timeout_seconds, so a lost
-        # provision-result callback never strands a reservation. updated_at is
-        # the transition timestamp: nothing touches a stuck row after it enters
-        # PENDING_PROVISION. reservation.failed drives execution-side instance
+        # provision-result callback never strands a reservation. The clock is
+        # provision_started_at, stamped by every transition INTO PENDING_PROVISION
+        # (issue #997), not updated_at: other writes do touch a stuck row (a
+        # purpose-category PATCH is allowed in every status, and the
+        # self-transition CAS guards rewrite the status), and each would restart
+        # the timeout. Rows that predate migration 0017 have no stamp and fall
+        # back to updated_at. reservation.failed drives execution-side instance
         # teardown. A timeout of 0 disables both backstops rather than instantly
         # reclaiming every in-flight provisioning. Physical-only rows take the
         # revert branch below, not this failing one.
@@ -409,11 +416,14 @@ async def _run_expiration_cycle() -> None:
         reverted: list[Reservation] = []
         if settings.provision_timeout_seconds > 0:
             deadline = now - timedelta(seconds=settings.provision_timeout_seconds)
+            provision_clock = func.coalesce(
+                Reservation.provision_started_at, Reservation.updated_at
+            )
             result = await db.execute(
                 select(Reservation).where(
                     and_(
                         Reservation.status == ReservationStatus.PENDING_PROVISION,
-                        Reservation.updated_at <= deadline,
+                        provision_clock <= deadline,
                         exists().where(ReservationDynamicRequest.reservation_id == Reservation.id),
                     )
                 )
@@ -472,7 +482,7 @@ async def _run_expiration_cycle() -> None:
                 select(Reservation).where(
                     and_(
                         Reservation.status == ReservationStatus.PENDING_PROVISION,
-                        Reservation.updated_at <= deadline,
+                        provision_clock <= deadline,
                         ~exists().where(ReservationDynamicRequest.reservation_id == Reservation.id),
                     )
                 )

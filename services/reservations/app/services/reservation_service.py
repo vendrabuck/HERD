@@ -1716,6 +1716,7 @@ async def create_reservation(
         initial_status = ReservationStatus.PENDING_PROVISION
     else:
         initial_status = ReservationStatus.ACTIVE
+    booked_at = datetime.now(timezone.utc)
     reservation = Reservation(
         user_id=user_id,
         owner_name=username,
@@ -1731,6 +1732,11 @@ async def create_reservation(
         start_time=data.start_time,
         end_time=data.end_time,
         status=initial_status,
+        # The provisioning backstops' clock (issue #997), set in the same INSERT
+        # that enters PENDING_PROVISION.
+        provision_started_at=(
+            booked_at if initial_status == ReservationStatus.PENDING_PROVISION else None
+        ),
     )
     reservation.dynamic_requests = [
         ReservationDynamicRequest(template_id=req.template_id) for req in data.dynamic_requests

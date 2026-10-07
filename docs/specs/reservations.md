@@ -51,6 +51,7 @@ numbered rules in section 8; section 5 names the caller condition for each route
 | Outbox event | A lifecycle event written in the same transaction as the state change, published to NATS later | reservations | `outbox` (`OutboxEvent`) |
 | Purpose suggestion | The AI orchestrator's classification of a finished reservation, stored verbatim and reviewed by an admin | reservations (produced by ai-orchestrator) | `reservations.purpose_suggestion` |
 | Pending prune marker | Device ids removed from an ACTIVE reservation whose fork wiring release has not yet converged | reservations | `reservations.pending_fork_prune_device_ids` |
+| Provision clock | When the row last entered `PENDING_PROVISION`, written in the same statement as each entry (the create path's insert, the sweep's claim) and never cleared; the two provisioning backstops measure their timeout from it. Null on rows that predate migration 0017, which fall back to `updated_at` | reservations | `reservations.provision_started_at` |
 
 ## 4. State model
 
@@ -80,8 +81,8 @@ numbered rules in section 8; section 5 names the caller condition for each route
 | `PENDING` | `FAILED` | expiration sweep | `end_time <= now` | `reservation.failed` | RES-SWEEP-3 |
 | `PENDING_PROVISION` | `ACTIVE` | `POST /internal/{id}/provision-result` | succeeded | `reservation.created` | RES-DYN-6, RES-DYN-7 |
 | `PENDING_PROVISION` | `FAILED` | `POST /internal/{id}/provision-result` | failed | `reservation.failed` | RES-DYN-6, RES-DYN-8 |
-| `PENDING_PROVISION` | `FAILED` | expiration sweep (dynamic timeout backstop) | dynamic requests; `updated_at` older than `PROVISION_TIMEOUT_SECONDS` | `reservation.failed` | RES-SWEEP-6, RES-SWEEP-8 |
-| `PENDING_PROVISION` | `PENDING` | expiration sweep (restart backstop) | no dynamic request; `updated_at` older than `PROVISION_TIMEOUT_SECONDS` | nothing (the row's exclusive devices are released, holder-aware) | RES-SWEEP-7, RES-SWEEP-8 |
+| `PENDING_PROVISION` | `FAILED` | expiration sweep (dynamic timeout backstop) | dynamic requests; `provision_started_at` (else `updated_at`) older than `PROVISION_TIMEOUT_SECONDS` | `reservation.failed` | RES-SWEEP-6, RES-SWEEP-8 |
+| `PENDING_PROVISION` | `PENDING` | expiration sweep (restart backstop) | no dynamic request; `provision_started_at` (else `updated_at`) older than `PROVISION_TIMEOUT_SECONDS` | nothing (the row's exclusive devices are released, holder-aware) | RES-SWEEP-7, RES-SWEEP-8 |
 | `ACTIVE` | `COMPLETED` | expiration sweep (auto-complete) | `end_time <= now` | `reservation.completed` | RES-SWEEP-4 |
 | `ACTIVE` | `COMPLETED` | `PUT /{id}/release` | owner only | `reservation.completed` | RES-RELEASE-3, RES-RELEASE-4 |
 | `PENDING`, `PENDING_PROVISION`, `ACTIVE` | `CANCELLED` | `DELETE /{id}` | owner or admin | `reservation.cancelled` | RES-CANCEL-3, RES-CANCEL-4, RES-CANCEL-5 |
@@ -172,16 +173,19 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
   concurrent release or cancel already ended is skipped. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_complete_expired_rows`) \
   Pinned by: `services/reservations/tests/test_expiration.py` (`test_expiration_completes_expired_active`, `test_expiration_stages_one_completed_event_per_reservation`); `services/reservations/tests/test_expiration_status_cas.py` (`test_auto_complete_loses_to_a_concurrent_release_is_a_noop`)
-- **RES-SWEEP-6.** A `PENDING_PROVISION` row with dynamic requests whose `updated_at` is
-  older than `PROVISION_TIMEOUT_SECONDS` (default 900) is moved to `FAILED` by
-  compare-and-swap with `reservation.failed` and the purpose marker, then its devices are
-  released and its fork archived. `updated_at` moves on any write to the row, for
-  example a purpose-category PATCH, so such a write restarts the timeout. Known gap,
-  see #997. \
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`); `services/reservations/app/models/reservation.py` (`updated_at`) \
-  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_timeout_backstop_fails_stuck_dynamic_reservation`, `test_timeout_backstop_leaves_fresh_dynamic_reservation`); `services/reservations/tests/test_fork_archive_reconcile.py` (`test_timeout_backstop_failed_archives_fork`)
+- **RES-SWEEP-6.** A `PENDING_PROVISION` row with dynamic requests that entered
+  `PENDING_PROVISION` more than `PROVISION_TIMEOUT_SECONDS` (default 900) ago is moved
+  to `FAILED` by compare-and-swap with `reservation.failed` and the purpose marker, then
+  its devices are released and its fork archived. Both provisioning backstops (this one
+  and RES-SWEEP-7) measure the timeout from `provision_started_at`, which every
+  transition into `PENDING_PROVISION` writes in the same statement (the create path's
+  insert, the sweep's claim), so a later write to the row, for example a
+  purpose-category PATCH, does not restart it. A row with no stamp (it predates
+  migration 0017) is measured from `updated_at`. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`); `services/reservations/app/services/reservation_service.py` (`create_reservation`); `services/reservations/app/models/reservation.py` (`provision_started_at`) \
+  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_timeout_backstop_fails_stuck_dynamic_reservation`, `test_timeout_backstop_leaves_fresh_dynamic_reservation`); `services/reservations/tests/test_fork_archive_reconcile.py` (`test_timeout_backstop_failed_archives_fork`); `services/reservations/tests/test_provision_clock.py` (`test_purpose_category_patch_does_not_move_the_backstop_deadline`, `test_backstop_reads_provision_started_at_not_updated_at`, `test_backstop_falls_back_to_updated_at_when_unstamped`, `test_create_stamps_provision_started_at_when_it_enters_pending_provision`, `test_create_leaves_provision_started_at_null_for_pending_and_active`, `test_sweep_claim_stamps_provision_started_at`, `test_every_entry_into_pending_provision_stamps_provision_started_at`, `test_cas_into_pending_provision_is_only_the_self_transition_guard`)
 - **RES-SWEEP-7.** A physical-only `PENDING_PROVISION` row stranded past the same
-  deadline is moved back to `PENDING` by compare-and-swap, so a later tick re-activates
+  deadline (measured the same way) is moved back to `PENDING` by compare-and-swap, so a later tick re-activates
   it; nothing is torn down. Only the writer whose compare-and-swap won then releases
   the row's exclusive devices through the holder-aware filter (RES-HOLD-1: a `PENDING`
   row holds nothing, and a later cancel or elapsed-window failure writes no inventory
@@ -1253,10 +1257,6 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
   `purpose_service.py`, `models/reservation.py`, and the frontend's
   `canClassifyPurpose` comment say five. The same path's revert of partially reserved
   devices does not use the holder check.
-- #997 (RES-SWEEP-6): the dynamic timeout is measured from `updated_at`, which any write
-  to the row moves, for example a purpose-category PATCH during `PENDING_PROVISION`, so
-  such a write restarts the timeout. The comment in `_run_expiration_cycle` saying
-  nothing touches a stuck row is not true.
 - #999 (RES-PATCH-9): PATCH-add on a `PENDING` reservation requires the added device to
   be `AVAILABLE` now, while a create for the same future window skips that check
   (RES-CREATE-12) and relies on the window conflict check.

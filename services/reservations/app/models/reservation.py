@@ -117,6 +117,16 @@ class Reservation(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+    # When the row last ENTERED PENDING_PROVISION (issue #997). Written in the same
+    # statement as every transition into that status (create_reservation's insert
+    # and the expiration sweep's claim); never cleared, since only PENDING_PROVISION
+    # rows read it. The sweep's two provisioning backstops measure
+    # provision_timeout_seconds from it rather than from updated_at, which any
+    # write (a purpose-category PATCH) moves. NULL on rows that predate migration
+    # 0017; the backstops fall back to updated_at for those.
+    provision_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     modified_by: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     # Set only when an admin cancels a reservation they do not own (issue #340).
     # Owner self-cancel leaves this NULL, so a non-null value is the audit record
