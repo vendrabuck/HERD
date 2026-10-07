@@ -1089,6 +1089,20 @@ def _refuse_resurrection(request_id) -> None:
     )
 
 
+def _refuse_disabled_hypervisor(request_id, reservation_id, hypervisor_id) -> None:
+    logger.warning(
+        "Refusing provision for request %s: hypervisor %s is disabled",
+        request_id,
+        hypervisor_id,
+        extra={
+            "action": "dynamic_instance_hypervisor_disabled",
+            "request_id": str(request_id),
+            "reservation_id": str(reservation_id),
+            "hypervisor_id": str(hypervisor_id),
+        },
+    )
+
+
 def _log_lost_to_teardown(request_id) -> None:
     logger.warning(
         "Create for request %s lost its ledger row to teardown; ran the compensation",
@@ -1153,8 +1167,10 @@ async def _provision_one_instance(
     After its CREATING row is committed the request re-checks that the
     reservation is still PENDING_PROVISION and returns None without any recipe
     call when it is not (issue #1028, a teardown that listed rows before this
-    one existed). A failed login, judged by ``recipe_session_succeeded``, is a
-    failed create (issue #1027).
+    one existed). A hypervisor whose `enabled` flag is false is refused after
+    the CREATING row is committed (returns None, nothing created, log action
+    ``dynamic_instance_hypervisor_disabled``, issue #1033). A failed login,
+    judged by ``recipe_session_succeeded``, is a failed create (issue #1027).
     """
     from app.services.driver_loader import DriverPackageError, load_driver
     from app.services.dynamic_instance_service import (
@@ -1205,6 +1221,16 @@ async def _provision_one_instance(
             return str(row.device_id)
         if row.status == "DESTROYED":
             return _refuse_resurrection(request_id)
+
+    # A disabled hypervisor is refused as the second line behind the booking's
+    # check (issue #1033): an admin may disable it after the booking was taken.
+    # The row stays CREATING (a redelivery of an earlier, interrupted delivery
+    # may have touched the hypervisor, so it stays a may-still-exist record for
+    # teardown) and the event is ACKed and abandoned like the resurrection
+    # refusal: the flag will not change by itself, so a NAK would only spend the
+    # retry schedule, and the reservation fails by the provision timeout.
+    if hypervisor.get("enabled") is False:
+        return _refuse_disabled_hypervisor(request_id, reservation_id, hypervisor_id)
 
     # Re-check the reservation now that the row is committed (issue #1028). The
     # event was corroborated once, before the first request, and a teardown on

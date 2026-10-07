@@ -32,7 +32,7 @@ redaction) are numbered rules in section 8.
 | Actor | May | May not |
 |---|---|---|
 | Unauthenticated caller | Nothing (every user-facing route answers 401) | Anything |
-| User | List and read devices and ports visible through their device groups (password values masked); fetch visible devices in a batch; list and read templates; list, read, and download driver packages; read a driver's config schema; look up their own visible device ids; read the device groups of a visible device | Create, edit, or delete anything; see devices outside their groups; list device groups; export or import; see hypervisors |
+| User | List and read devices and ports visible through their device groups (password values masked); fetch visible devices in a batch; list and read templates (a dynamic template only when visible to them, INV-TPL-25); see an instance device their own live reservation holds (INV-VIS-9); list, read, and download driver packages; read a driver's config schema; look up their own visible device ids; read the device groups of a visible device | Create, edit, or delete anything; see devices outside their groups; list device groups; export or import; see hypervisors |
 | Admin | Everything a user may, on every device, with password values in clear; create, edit, and delete devices, ports, templates, driver packages, hypervisors, and device groups; manage group membership and grants; export and import devices and templates; look up any user's visible devices | Delete a device a live reservation depends on or a cable names (INV-DEL-1 to INV-DEL-6); delete a template, driver, or hypervisor something still references |
 | Superadmin | Same as admin | Same as admin |
 | Another service (internal token) | Set a device's status; read a device, template, or hypervisor in full; batch-read device identity and type; resolve device names; list resolved poll intervals; download a driver package; create and delete dynamic-instance devices; list the hypervisors that reference a secret (section 7) | Anything through the user-facing routes |
@@ -50,7 +50,7 @@ redaction) are numbered rules in section 8.
 | Port | A named port on a device, created from a port template, with its own `field_data` | inventory | `ports` (`Port`) |
 | Driver package | An admin-uploaded `.zip` or `.tar.gz` archive with a connection type, SHA256, and two capability flags read from `driver_metadata.json` | inventory | `driver_packages` (`DriverPackage`) plus the archive in local storage or MinIO |
 | Connection type | `Management`, `Layer 1 Switch`, `Layer 2 Switch`, `Layer 3 Switch`, or `Hypervisor`. A device's connection type is its template's driver's; a device is a DUT when that is `Management` | inventory | `driver_packages.connection_type` |
-| Hypervisor | A registered virtualization host: endpoint, type, enabled flag, and a reference to a credential. `secret_id` is a bare secrets-service id, no foreign key | inventory | `hypervisors` (`Hypervisor`) |
+| Hypervisor | A registered virtualization host: endpoint, type, enabled flag, a reference to a credential, and the device group whose users may book its dynamic templates. `secret_id` is a bare secrets-service id, no foreign key; `device_group_id` is a foreign key to `device_groups` | inventory | `hypervisors` (`Hypervisor`) |
 | Device group | A named set of devices, granted to user groups. `user_group_id` is a bare auth-service id, no foreign key | inventory | `device_groups`, `device_group_devices`, `device_group_permissions` |
 | No Pool | The default device group every new device joins | inventory | a `device_groups` row named `No Pool` |
 | Dynamic-instance device | A device materialized from a `dynamic` template by execution; `request_id` is the booking's dynamic-request id, a bare reservations id | inventory (created on execution's request) | `devices.request_id` |
@@ -144,8 +144,8 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 | GET | `/ports/{id}` | any signed-in user (non-admins: ports of visible devices only) | 200 | INV-AUTH-1, INV-PORT-2, INV-RED-1 |
 | PUT | `/ports/{id}` | admin | 200 | INV-AUTH-2, INV-PORT-7, INV-PORT-10 |
 | DELETE | `/ports/{id}` | admin | 204 | INV-AUTH-2, INV-PORT-8 |
-| GET | `/templates` | any signed-in user | 200 | INV-AUTH-1, INV-TPL-1 |
-| GET | `/templates/{id}` | any signed-in user | 200 | INV-AUTH-1, INV-TPL-1, INV-TPL-20 |
+| GET | `/templates` | any signed-in user | 200 | INV-AUTH-1, INV-TPL-1, INV-TPL-25 |
+| GET | `/templates/{id}` | any signed-in user | 200 | INV-AUTH-1, INV-TPL-1, INV-TPL-20, INV-TPL-25 |
 | POST | `/templates` | admin | 201 | INV-AUTH-2, INV-TPL-2 to INV-TPL-14, INV-POLL-1 |
 | PUT | `/templates/{id}` | admin | 200 | INV-AUTH-2, INV-TPL-15 to INV-TPL-18, INV-TPL-24, INV-POLL-1 |
 | DELETE | `/templates/{id}` | admin | 204 | INV-AUTH-2, INV-TPL-19 |
@@ -159,8 +159,8 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 | GET | `/drivers/{id}/config-schema` | any signed-in user | 200 | none here; belongs to `device-configuration.md` |
 | GET | `/hypervisors` | admin | 200 | INV-HYP-1 |
 | GET | `/hypervisors/{id}` | admin | 200 | INV-HYP-1 |
-| POST | `/hypervisors` | admin | 201 | INV-HYP-1 to INV-HYP-4, INV-HYP-11 |
-| PUT | `/hypervisors/{id}` | admin | 200 | INV-HYP-1, INV-HYP-2, INV-HYP-5, INV-HYP-6, INV-HYP-11 |
+| POST | `/hypervisors` | admin | 201 | INV-HYP-1 to INV-HYP-4, INV-HYP-11, INV-HYP-12 |
+| PUT | `/hypervisors/{id}` | admin | 200 | INV-HYP-1, INV-HYP-2, INV-HYP-5, INV-HYP-6, INV-HYP-11, INV-HYP-12 |
 | DELETE | `/hypervisors/{id}` | admin | 204 | INV-HYP-1, INV-HYP-7 |
 | GET | `/device-groups` | admin | 200 | INV-AUTH-2, INV-GRP-1 |
 | POST | `/device-groups` | admin | 201 | INV-AUTH-2, INV-GRP-2, INV-GRP-17 |
@@ -171,7 +171,7 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 | POST | `/device-groups/{id}/devices/bulk-remove` | admin | 200 | INV-AUTH-2, INV-GRP-8, INV-GRP-15 |
 | POST | `/device-groups/{id}/permissions/bulk` | admin | 200 | INV-AUTH-2, INV-GRP-9 |
 | POST | `/device-groups/{id}/permissions/bulk-remove` | admin | 200 | INV-AUTH-2, INV-GRP-9 |
-| GET | `/device-groups/visible-devices?user_id` | the user themself, or any admin | 200 | INV-VIS-8 |
+| GET | `/device-groups/visible-devices?user_id` | the user themself, or any admin | 200 | INV-VIS-8, INV-VIS-9 |
 | GET | `/device-groups/device/{id}` | any signed-in user (non-admins: visible devices only) | 200 | INV-GRP-10 to INV-GRP-13, INV-VIS-6 |
 | GET | `/devices/export`, `/templates/export` | admin | 200 | INV-BULK-1 to INV-BULK-3, INV-BULK-19, INV-CSV-1, INV-CSV-2 |
 | POST | `/devices/import`, `/templates/import` (multipart) | admin | 200 | INV-BULK-4 to INV-BULK-16, INV-BULK-18 to INV-BULK-20, INV-CSV-3 |
@@ -250,8 +250,9 @@ Copy, delete) and `frontend/src/pages/TemplateEditorPage.tsx` (view and edit); r
 
 **Rules.**
 
-- **INV-TPL-1.** Any signed-in user may list and read templates; the list filters by
-  `template_type` when given. \
+- **INV-TPL-1.** Any signed-in user may list and read templates, except dynamic
+  templates hidden from a non-admin (INV-TPL-25); the list filters by `template_type`
+  when given. \
   Enforced in: `services/inventory/app/routers/templates.py` (`get_templates`, `get_template_by_id`); `services/inventory/app/services/template_service.py` (`list_templates`) \
   Pinned by: `services/inventory/tests/test_templates.py` (`test_user_can_list_templates`, `test_user_can_get_template`, `test_list_templates_filter_by_type`)
 - **INV-TPL-2.** `template_type` is `device`, `port`, or `dynamic` and defaults to
@@ -356,6 +357,16 @@ Copy, delete) and `frontend/src/pages/TemplateEditorPage.tsx` (view and edit); r
   never changes after create; a `template_type` sent in the body is ignored. \
   Enforced in: `services/inventory/app/schemas/template.py` (`TemplateUpdate`) \
   Pinned by: none
+- **INV-TPL-25.** A non-admin sees a `dynamic` template only when its hypervisor's
+  `device_group_id` is a device group one of their user groups holds a permission on
+  (the same grants as INV-VIS-1); a hypervisor with no device group makes its templates
+  admin-only. A hidden dynamic template is left out of the list and its `total`, and its
+  read answers the same 404 `Template not found` as an unknown id. The group lookup runs
+  only for a dynamic template read, or a listing whose type filter allows dynamic
+  templates while at least one exists, and fails closed with 503 like INV-VIS-2. Admins
+  are not filtered (issue #1053; `dynamic-resources.md`, DYN-REQ-9). \
+  Enforced in: `services/inventory/app/services/device_visibility.py` (`resolve_visible_dynamic_hypervisor_ids`, `dynamic_template_visible`, `dynamic_templates_exist`); `services/inventory/app/routers/templates.py` (`get_templates`, `get_template_by_id`); `services/inventory/app/services/template_service.py` (`list_templates`) \
+  Pinned by: `services/inventory/tests/test_dynamic_visibility.py` (`test_dynamic_template_visible_through_its_hypervisors_device_group`, `test_hidden_dynamic_template_answers_like_an_unknown_id`, `test_admin_sees_every_dynamic_template_without_a_group_lookup`, `test_physical_template_read_needs_no_group_lookup`, `test_dynamic_template_read_fails_closed_when_auth_cannot_answer`, `test_template_list_hides_invisible_dynamic_templates_and_counts_what_it_shows`, `test_template_list_of_another_type_skips_the_group_lookup`, `test_user_with_no_groups_sees_no_dynamic_template`)
 
 **Out of scope.** The AI identity suggestion in the editor (`ai-features.md`). What a
 dynamic template does at booking time (`dynamic-resources.md`).
@@ -538,6 +549,17 @@ areas call `check_device_read_visibility` for their own device-scoped reads
   `Cannot query visible devices for another user`. An auth failure answers 503. \
   Enforced in: `services/inventory/app/routers/device_groups.py` (`_authorize_subject`, `get_visible_devices_endpoint`) \
   Pinned by: `services/inventory/tests/test_device_groups.py` (`test_visible_devices_foreign_user_forbidden_for_user_role`, `test_visible_devices_self_lookup_allowed_for_user_role`, `test_visible_devices_admin_foreign_user_allowed`, `test_visible_devices_superadmin_foreign_user_allowed`, `test_visible_devices_endpoint_returns_503_when_auth_service_down`)
+- **INV-VIS-9.** A non-admin's visible devices also include each instance device (a
+  device carrying `request_id`) that one of their own `PENDING_PROVISION` or `ACTIVE`
+  reservations holds, read from reservations' internal `GET /internal/held-devices`
+  (`reservations.md`, RES-INTERNAL-8). Physical devices never gain visibility this way.
+  Reservations is asked only when an instance device exists outside the caller's group
+  visibility; a lookup that cannot be answered (no internal token, transport error,
+  non-200, misshapen body) grants nothing and logs `instance_device_grant_unavailable`.
+  Every read gated by `_resolve_visible_device_ids`, `GET /device-groups/visible-devices`
+  included, carries the grant (issue #1030). \
+  Enforced in: `services/inventory/app/services/device_visibility.py` (`_resolve_visible_device_ids`, `_instance_devices_held_by`, `_fetch_held_device_ids`); `services/inventory/app/routers/device_groups.py` (`get_visible_devices_endpoint`) \
+  Pinned by: `services/inventory/tests/test_dynamic_visibility.py` (`test_owner_sees_the_instance_device_their_live_reservation_holds`, `test_instance_device_not_held_by_the_caller_stays_hidden`, `test_physical_device_is_never_granted_through_a_reservation`, `test_unanswerable_grant_lookup_grants_nothing_and_logs`, `test_grant_lookup_without_an_internal_token_grants_nothing`, `test_reservations_is_not_asked_when_no_instance_device_is_hidden`); `tests/integration/test_dynamic_resources.py` (`test_non_admin_owner_sees_and_keeps_their_instance_in_a_mixed_edit`)
 - **INV-RED-1.** Every non-admin device and port read (list, batch, single device, port
   list, single port) replaces the value of each field the template declares as a
   `password` field with `********`, keeping the key. \
@@ -994,6 +1016,15 @@ under `/hypervisors`.
   and on update. \
   Enforced in: `services/inventory/app/schemas/hypervisor.py` (`HypervisorCreate`, `HypervisorUpdate`) \
   Pinned by: none
+- **INV-HYP-12.** A hypervisor's optional `device_group_id` names the device group whose
+  user groups may see and book its dynamic templates (INV-TPL-25); null (the default, and
+  the value of every hypervisor registered before migration 0022) means admins only. A
+  device group that does not exist answers 422 `Device group does not exist` on create and
+  update, an update may clear it with null, and deleting the device group sets it back to
+  null (foreign key `ON DELETE SET NULL`). The hypervisors page offers it as "Bookable by
+  device group" and lists it as "Bookable by" (issue #1053). \
+  Enforced in: `services/inventory/app/models/hypervisor.py` (`Hypervisor`); `services/inventory/app/services/hypervisor_service.py` (`validate_device_group_exists`, `create_hypervisor`, `update_hypervisor`); `frontend/src/pages/admin/HypervisorsPage.tsx` (`HypervisorsPage`) \
+  Pinned by: `services/inventory/tests/test_dynamic_visibility.py` (`test_hypervisor_device_group_is_stored_validated_and_cleared`, `test_hypervisor_create_refuses_an_unknown_device_group`); `frontend/src/test/pages/HypervisorsPage.test.tsx` (`list shows the device group that may book, or Admins only`, `create sends no device group by default (admins only)`, `create sends the chosen device group`, `edit pre-selects the stored device group and can clear it`)
 
 **Out of scope.** Using the hypervisor and its credential to create instances
 (`dynamic-resources.md`); the secrets service's own delete guard (`identity-and-access.md`

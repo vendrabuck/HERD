@@ -885,3 +885,204 @@ async def test_secret_delete_refused_while_hypervisor_references_it(base_url, ad
         assert resp.status_code == 204, resp.text
         resp = await client.get(f"/secrets/secrets/{secret['id']}")
         assert resp.status_code == 404
+
+
+# --- issues #1053, #1033, #1030: who may book, a disabled hypervisor, mixed edits ---
+
+
+@pytest.fixture
+async def gated_dynamic(base_url, admin_client, user_token, hv_secret, hv_driver):
+    """A private hypervisor plus dynamic template, and visibility scaffolding.
+
+    The hypervisor starts with no device group, so its template is admin-only
+    (issue #1053). `device_group_id` names a device group the intuser's own,
+    isolated user group holds a permission on; a test opens the gate by setting
+    it on the hypervisor and adds physical devices to it to make them visible.
+    Private objects, so no other test's shared hypervisor or template changes.
+    """
+    suffix = uuid.uuid4().hex[:8]
+    created: dict = {}
+    try:
+        async with httpx.AsyncClient(
+            base_url=base_url,
+            verify=False,
+            timeout=30.0,
+            headers={"Authorization": f"Bearer {user_token}"},
+        ) as uclient:
+            me = await uclient.get("/auth/me")
+            me.raise_for_status()
+        ug = await admin_client.post(
+            "/auth/groups", json={"name": f"int-dyn-ug-{suffix}", "description": "#1053"}
+        )
+        ug.raise_for_status()
+        created["user_group_id"] = ug.json()["id"]
+        (
+            await admin_client.post(
+                f"/auth/groups/{created['user_group_id']}/members/bulk",
+                json={"user_ids": [me.json()["id"]]},
+            )
+        ).raise_for_status()
+        dg = await admin_client.post(
+            "/inventory/device-groups",
+            json={"name": f"int-dyn-dg-{suffix}", "description": "#1053"},
+        )
+        dg.raise_for_status()
+        created["device_group_id"] = dg.json()["id"]
+        (
+            await admin_client.post(
+                f"/inventory/device-groups/{created['device_group_id']}/permissions/bulk",
+                json={"user_group_ids": [created["user_group_id"]]},
+            )
+        ).raise_for_status()
+        hv = await admin_client.post(
+            "/inventory/hypervisors",
+            json={
+                "name": f"int-gated-hv-{suffix}",
+                "endpoint": "https://gated-hv.example:8006",
+                "hypervisor_type": "mock",
+                "secret_id": hv_secret["id"],
+            },
+        )
+        hv.raise_for_status()
+        created["hypervisor"] = hv.json()
+        assert created["hypervisor"]["device_group_id"] is None
+        tmpl = await admin_client.post(
+            "/inventory/templates",
+            json=_dynamic_template_payload(hv_driver["id"], created["hypervisor"]["id"], []),
+        )
+        tmpl.raise_for_status()
+        created["template"] = tmpl.json()
+        yield created
+    finally:
+        if "template" in created:
+            await admin_client.delete(f"/inventory/templates/{created['template']['id']}")
+        if "hypervisor" in created:
+            await admin_client.delete(f"/inventory/hypervisors/{created['hypervisor']['id']}")
+        if "device_group_id" in created:
+            await admin_client.delete(f"/inventory/device-groups/{created['device_group_id']}")
+        if "user_group_id" in created:
+            await admin_client.delete(f"/auth/groups/{created['user_group_id']}")
+
+
+def _dynamic_only_body(template_id: str) -> dict:
+    now = datetime.now(timezone.utc)
+    return {
+        "device_ids": [],
+        "purpose": "dynamic gating integration test",
+        "start_time": now.isoformat(),
+        "end_time": (now + timedelta(hours=1)).isoformat(),
+        "dynamic_requests": [{"template_id": template_id}],
+    }
+
+
+async def _cancel_dynamic_only(client, reservation_id: str) -> None:
+    """Cancel a dynamic-only booking and wait for its instance device to go.
+
+    The private template is deleted at fixture teardown, which a lingering
+    instance device would refuse.
+    """
+    active = await _poll_reservation_status(client, reservation_id, "ACTIVE", timeout=60.0)
+    await client.delete(f"/reservations/{reservation_id}")
+    if active is not None:
+        for device_id in active["device_ids"]:
+            await _poll_device_gone(client, device_id, timeout=30.0)
+
+
+@pytest.mark.timeout(240)
+async def test_dynamic_template_is_bookable_only_through_its_hypervisors_device_group(
+    admin_client, user_client, gated_dynamic
+):
+    """Issue #1053: a non-admin cannot see or book a dynamic template until its
+    hypervisor names a device group one of their user groups holds a permission
+    on; the refusal is the unknown-template refusal. An admin books it either way."""
+    template_id = gated_dynamic["template"]["id"]
+    hv_id = gated_dynamic["hypervisor"]["id"]
+
+    hidden = await user_client.get(f"/inventory/templates/{template_id}")
+    assert hidden.status_code == 404, hidden.text
+    listing = await user_client.get("/inventory/templates", params={"template_type": "dynamic"})
+    assert template_id not in {t["id"] for t in listing.json()["items"]}
+    refused = await user_client.post("/reservations/", json=_dynamic_only_body(template_id))
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == f"Template {template_id} not found in inventory"
+
+    admin_booking = await admin_client.post("/reservations/", json=_dynamic_only_body(template_id))
+    assert admin_booking.status_code == 201, admin_booking.text
+    await _cancel_dynamic_only(admin_client, admin_booking.json()["id"])
+
+    opened = await admin_client.put(
+        f"/inventory/hypervisors/{hv_id}",
+        json={"device_group_id": gated_dynamic["device_group_id"]},
+    )
+    assert opened.status_code == 200, opened.text
+    assert (await user_client.get(f"/inventory/templates/{template_id}")).status_code == 200
+    booked = await user_client.post("/reservations/", json=_dynamic_only_body(template_id))
+    assert booked.status_code == 201, booked.text
+    await _cancel_dynamic_only(user_client, booked.json()["id"])
+
+
+@pytest.mark.timeout(120)
+async def test_disabled_hypervisor_refuses_the_booking(admin_client, gated_dynamic):
+    """Issue #1033: a template whose hypervisor is disabled is refused at booking
+    with a 422 naming the hypervisor, and books again once it is re-enabled."""
+    hv = gated_dynamic["hypervisor"]
+    template = gated_dynamic["template"]
+    off = await admin_client.put(f"/inventory/hypervisors/{hv['id']}", json={"enabled": False})
+    assert off.status_code == 200, off.text
+    refused = await admin_client.post("/reservations/", json=_dynamic_only_body(template["id"]))
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == (
+        f"Hypervisor '{hv['name']}' is disabled; these dynamic templates cannot be booked "
+        f"until an admin enables it: {template['name']}"
+    )
+
+    on = await admin_client.put(f"/inventory/hypervisors/{hv['id']}", json={"enabled": True})
+    assert on.status_code == 200, on.text
+    booked = await admin_client.post("/reservations/", json=_dynamic_only_body(template["id"]))
+    assert booked.status_code == 201, booked.text
+    await _cancel_dynamic_only(admin_client, booked.json()["id"])
+
+
+@pytest.mark.timeout(240)
+async def test_non_admin_owner_sees_and_keeps_their_instance_in_a_mixed_edit(
+    admin_client, user_client, gated_dynamic, fresh_devices
+):
+    """Issue #1030: a non-admin books one physical device plus one instance; once
+    ACTIVE they can read the instance device, and a device-set edit that adds a
+    second physical device while listing the instance succeeds and keeps it."""
+    first, second = await fresh_devices(2)
+    group = gated_dynamic["device_group_id"]
+    (
+        await admin_client.post(
+            f"/inventory/device-groups/{group}/devices/bulk",
+            json={"device_ids": [first["id"], second["id"]]},
+        )
+    ).raise_for_status()
+    (
+        await admin_client.put(
+            f"/inventory/hypervisors/{gated_dynamic['hypervisor']['id']}",
+            json={"device_group_id": group},
+        )
+    ).raise_for_status()
+
+    reservation = await _reserve_dynamic(user_client, first["id"], gated_dynamic["template"]["id"])
+    instance_id = None
+    try:
+        active = await _poll_reservation_status(user_client, reservation["id"], "ACTIVE")
+        assert active is not None, "reservation never became ACTIVE"
+        instance_id = _dynamic_device_id(active, first["id"])
+
+        seen = await user_client.get(f"/inventory/devices/{instance_id}")
+        assert seen.status_code == 200, seen.text
+        assert seen.json()["topology_type"] == "CLOUD"
+
+        edit = await user_client.patch(
+            f"/reservations/{reservation['id']}",
+            json={"device_ids": [first["id"], second["id"], instance_id]},
+        )
+        assert edit.status_code == 200, edit.text
+        assert set(edit.json()["device_ids"]) == {first["id"], second["id"], instance_id}
+        # The instance was kept, so nothing tore it down.
+        assert (await user_client.get(f"/inventory/devices/{instance_id}")).status_code == 200
+    finally:
+        await _cancel_and_drain(admin_client, reservation["id"], instance_id)

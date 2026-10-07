@@ -290,6 +290,17 @@ class OwnsActiveResponse(BaseModel):
     owns_active: bool
 
 
+class HeldDevicesResponse(BaseModel):
+    """The devices a user's live reservations hold (issue #1030).
+
+    Body of the internal `GET /internal/held-devices`: every device id of the
+    user's PENDING_PROVISION and ACTIVE reservations, deduplicated. Inventory
+    reads it to grant a non-admin owner visibility of their own instance device.
+    """
+
+    device_ids: list[uuid.UUID]
+
+
 class ReservationInternalStatus(BaseModel):
     """Minimal status payload for service-to-service callers (apply scheduler, etc.).
 

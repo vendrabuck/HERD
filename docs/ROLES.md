@@ -654,7 +654,8 @@ Authorization: Bearer <any-authenticated-token>
 ```
 
 Resolves the user's group memberships via the auth service, then returns all device
-IDs accessible through device group permissions.
+IDs accessible through device group permissions, plus the instance devices the user's
+own live reservations hold (see "Instance devices of your own reservation" below).
 
 This endpoint is self-service: a non-admin caller may only query its own `user_id`.
 A request whose `user_id` does not match the caller's token returns 403. Admins and
@@ -666,12 +667,34 @@ acl permission-query endpoints enforce.
 A device group named "No Pool" is automatically created on inventory service startup.
 All new devices are auto-assigned to this group on creation.
 
+### Instance devices of your own reservation
+
+A dynamic instance is materialized as an inventory device (an instance device) that joins
+"No Pool" like every device, a group a non-admin usually has no permission on. Visibility of
+an instance device is also granted through the reservation that holds it (issue #1030): a
+non-admin sees an instance device while one of their own `PENDING_PROVISION` or `ACTIVE`
+reservations holds it, on every device read (`GET /devices/{id}`, `POST /devices/batch`, the
+device list, ports, device groups for a device, config versions, apply jobs) and in the
+visible-devices answer, so the owner can open it and keep it in a device-list edit. Physical
+devices are never granted this way. Inventory asks reservations' internal
+`GET /api/reservations/internal/held-devices` only when an instance device exists outside
+the caller's group visibility; when that lookup cannot be answered the grant is skipped
+(plain group visibility, logged as `instance_device_grant_unavailable`). Admins are
+unfiltered as before.
+
 ---
 
 ## Template Management (Admin Operations)
 
 Templates define the schema for devices and ports. Any authenticated user can list
-and view templates. Creating, updating, and deleting templates requires admin or
+and view templates, except that a non-admin sees a `dynamic` template only when it is
+visible to them (issue #1053): its hypervisor names a device group (`device_group_id`)
+and one of the caller's user groups holds a permission on that device group. A hidden
+dynamic template is left out of the list (and its `total`) and answers
+`GET /templates/{id}` with the same 404 `Template not found` as an unknown id, so a
+reservation naming it is refused as not found too. A hypervisor with no device group
+makes its templates admin-only. When auth cannot answer the group lookup the read fails
+closed with 503. Creating, updating, and deleting templates requires admin or
 superadmin role.
 
 ### List templates
@@ -862,7 +885,8 @@ Content-Type: application/json
   "endpoint": "https://proxmox.lab.internal:8006",
   "hypervisor_type": "proxmox",
   "secret_id": "uuid-of-secret",
-  "enabled": true
+  "enabled": true,
+  "device_group_id": "uuid-of-device-group"
 }
 ```
 
@@ -870,6 +894,20 @@ Returns HTTP 201. Hypervisor names must be unique (409 on duplicate). `secret_id
 reference an existing secret in the secrets service (422 if it does not; 503 if the
 secrets service is unreachable); the credential itself is never accepted inline.
 `hypervisor_type` is a free string in v1 (e.g. `proxmox`, `vsphere`, `libvirt`).
+
+`device_group_id` (optional, default null) decides who may see and book the dynamic
+templates that use this hypervisor (issue #1053): the user groups with a permission on
+that device group. Null means admins only. A device group that does not exist is refused
+with 422 `Device group does not exist`; deleting the device group sets the field back to
+null.
+
+`enabled` (default true) is enforced (issue #1033): while it is false, a booking that
+names a dynamic template of this hypervisor is refused with 422
+`Hypervisor '<name>' is disabled; these dynamic templates cannot be booked until an admin
+enables it: <template names>`, and the execution service refuses to create an instance
+on it for a booking taken before it was disabled (logged as
+`dynamic_instance_hypervisor_disabled`; that reservation fails by the provision timeout).
+Instances that already exist are still torn down.
 
 ### Update a hypervisor
 
@@ -883,6 +921,7 @@ Content-Type: application/json
 
 Any combination of fields can be updated; omitted fields are unchanged. `secret_id` is
 re-validated against the secrets service only when the update actually changes it.
+`"device_group_id": null` clears the device group (admins only from then on).
 
 ### Delete a hypervisor
 
@@ -1441,6 +1480,19 @@ Returns deduped user-ids of every user with an ACTIVE reservation that includes
 the given device. Used by the notifications service to fan out
 `device.health_transition` events to anyone currently using the device.
 Internal-token only.
+
+### List the devices a user's live reservations hold (internal)
+
+```
+GET /api/reservations/internal/held-devices?user_id=<uuid>
+X-Internal-Token: <internal-api-token>
+```
+
+Returns `{"device_ids": [...]}`, every device of the user's `PENDING_PROVISION` and
+`ACTIVE` reservations, deduplicated and sorted. Used by inventory to grant a non-admin
+owner visibility of their own instance device (issue #1030); inventory intersects the
+answer with instance devices, so physical devices gain nothing from it. Internal-token
+only (403 `Invalid internal token` otherwise).
 
 ---
 

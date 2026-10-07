@@ -7,6 +7,7 @@ import {
   useDeleteHypervisor,
 } from "@/api/hypervisors";
 import { useSecrets } from "@/api/secrets";
+import { useDeviceGroups } from "@/api/deviceGroups";
 import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
@@ -20,6 +21,9 @@ interface FormState {
   hypervisorType: string;
   secretId: string;
   enabled: boolean;
+  // Empty string means no device group: the hypervisor's dynamic templates are
+  // admin-only (issue #1053).
+  deviceGroupId: string;
 }
 
 const EMPTY_FORM: FormState = {
@@ -29,6 +33,7 @@ const EMPTY_FORM: FormState = {
   hypervisorType: "",
   secretId: "",
   enabled: true,
+  deviceGroupId: "",
 };
 
 export function HypervisorsPage() {
@@ -38,6 +43,7 @@ export function HypervisorsPage() {
   const hypervisors = data?.items;
   const total = data?.total ?? 0;
   const { data: secrets } = useSecrets();
+  const { data: deviceGroups } = useDeviceGroups();
 
   const createHypervisor = useCreateHypervisor();
   const updateHypervisor = useUpdateHypervisor();
@@ -62,6 +68,7 @@ export function HypervisorsPage() {
       hypervisorType: h.hypervisor_type,
       secretId: h.secret_id,
       enabled: h.enabled,
+      deviceGroupId: h.device_group_id ?? "",
     });
   };
 
@@ -100,6 +107,7 @@ export function HypervisorsPage() {
         hypervisor_type: form.hypervisorType.trim(),
         secret_id: form.secretId,
         enabled: form.enabled,
+        device_group_id: form.deviceGroupId || null,
       });
       toast.success("Hypervisor registered");
       closeCreateModal();
@@ -121,6 +129,7 @@ export function HypervisorsPage() {
           hypervisor_type: form.hypervisorType.trim(),
           secret_id: form.secretId,
           enabled: form.enabled,
+          device_group_id: form.deviceGroupId || null,
         },
       });
       toast.success("Hypervisor updated");
@@ -149,6 +158,16 @@ export function HypervisorsPage() {
     const match = secrets?.find((s) => s.id === id);
     if (match) return match.name;
     return secrets ? `Deleted secret ${id.slice(0, 8)}` : id.slice(0, 8) + "...";
+  };
+
+  // Issue #1053: the device group names who may see and book the hypervisor's
+  // dynamic templates. A group the list does not contain (deleted, or not yet
+  // loaded) keeps a neutral fallback rather than a misleading name.
+  const deviceGroupName = (id: string | null) => {
+    if (!id) return "Admins only";
+    const match = deviceGroups?.find((g) => g.id === id);
+    if (match) return match.name;
+    return id.slice(0, 8) + "...";
   };
 
   const renderForm = (onSubmit: () => void, submitLabel: string, pending: boolean) => (
@@ -236,6 +255,31 @@ export function HypervisorsPage() {
           </p>
         )}
       </div>
+      <div>
+        <label htmlFor="hv-device-group" className="block text-sm font-medium text-gray-700 mb-1">
+          Bookable by device group
+        </label>
+        <select
+          id="hv-device-group"
+          value={form.deviceGroupId}
+          onChange={(e) => setForm((f) => ({ ...f, deviceGroupId: e.target.value }))}
+          className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+        >
+          <option value="">Admins only</option>
+          {form.deviceGroupId && !deviceGroups?.some((g) => g.id === form.deviceGroupId) && (
+            <option value={form.deviceGroupId}>{deviceGroupName(form.deviceGroupId)}</option>
+          )}
+          {deviceGroups?.map((g) => (
+            <option key={g.id} value={g.id}>
+              {g.name}
+            </option>
+          ))}
+        </select>
+        <p className="text-xs text-gray-500 mt-1">
+          Users whose user groups have a permission on this device group can see and book the
+          dynamic templates that use this hypervisor. Admins can always book them.
+        </p>
+      </div>
       <div className="flex items-center gap-2">
         <input
           id="hv-enabled"
@@ -248,6 +292,10 @@ export function HypervisorsPage() {
           Enabled
         </label>
       </div>
+      <p className="text-xs text-gray-500 -mt-2">
+        While disabled, bookings of this hypervisor&apos;s dynamic templates are refused and no new
+        instances are created on it. Instances that already exist are still torn down.
+      </p>
       <div className="flex justify-end gap-2 pt-2">
         <button
           type="button"
@@ -288,13 +336,14 @@ export function HypervisorsPage() {
             <p className="text-sm text-gray-500 px-4 py-4">No hypervisors found</p>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[700px] text-sm text-left">
+              <table className="w-full min-w-[800px] text-sm text-left">
                 <thead className="bg-gray-50 text-gray-600 uppercase text-xs">
                   <tr>
                     <th className="px-4 py-3">Name</th>
                     <th className="px-4 py-3">Type</th>
                     <th className="px-4 py-3">Endpoint</th>
                     <th className="px-4 py-3">Secret</th>
+                    <th className="px-4 py-3">Bookable by</th>
                     <th className="px-4 py-3">Enabled</th>
                     <th className="px-4 py-3">Date</th>
                     <th className="px-4 py-3">Actions</th>
@@ -312,6 +361,9 @@ export function HypervisorsPage() {
                         }`}
                       >
                         {secretName(h.secret_id)}
+                      </td>
+                      <td className="px-4 py-3 text-gray-600">
+                        {deviceGroupName(h.device_group_id)}
                       </td>
                       <td className="px-4 py-3 text-gray-600">{h.enabled ? "Yes" : "No"}</td>
                       <td className="px-4 py-3 text-gray-500">

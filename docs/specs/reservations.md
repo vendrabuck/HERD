@@ -247,7 +247,7 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
 
 | Method | Path | Who may call | Success | Rules |
 |---|---|---|---|---|
-| POST | `/` | any signed-in user; a non-admin only on devices visible to them | 201 | RES-CREATE-1 to RES-CREATE-18, RES-CONFLICT-1 to RES-CONFLICT-5, RES-TOPO-1 to RES-TOPO-6, RES-DYN-1 to RES-DYN-4, RES-PURPOSE-1 |
+| POST | `/` | any signed-in user; a non-admin only on devices and dynamic templates visible to them | 201 | RES-CREATE-1 to RES-CREATE-18, RES-CONFLICT-1 to RES-CONFLICT-5, RES-TOPO-1 to RES-TOPO-6, RES-DYN-1 to RES-DYN-4, RES-DYN-10, RES-PURPOSE-1 |
 | GET | `/` | any signed-in user (own rows); admin with `all=true` (every row) | 200 | RES-LIST-1 to RES-LIST-9 |
 | GET | `/calendar` | any signed-in user | 200 | RES-CAL-1, RES-CAL-2, RES-CAL-3 |
 | GET | `/purpose-categories` | any signed-in user | 200 | RES-PURPOSE-1 |
@@ -305,6 +305,7 @@ area.
 | GET | `/internal/{id}` | `X-Internal-Token` | execution (event corroboration), inventory (apply scheduler), ai-orchestrator (idle-conversation sweeper) | `{id, status, is_active, start_time, end_time, purpose_classification_pending}` | RES-INTERNAL-1, RES-INTERNAL-2, RES-INTERNAL-6, RES-INTERNAL-7 |
 | GET | `/internal/active?user_id&device_id` | `X-Internal-Token` | inventory (reservation-owner widening) | `{owns_active}` | RES-INTERNAL-1, RES-INTERNAL-3 |
 | GET | `/internal/active-users?device_id` | `X-Internal-Token` | notifications (health fan-out) | list of user ids | RES-INTERNAL-1, RES-INTERNAL-4 |
+| GET | `/internal/held-devices?user_id` | `X-Internal-Token` | inventory (instance-device visibility grant) | `{device_ids}` | RES-INTERNAL-1, RES-INTERNAL-8 |
 | GET | `/internal/by-topology/{topology_id}` | `X-Internal-Token` | cabling (topology edit lock and delete guard) | list of `{id, user_id, topology_id, status, end_time}` | RES-INTERNAL-1, RES-INTERNAL-5 |
 | GET | `/internal/by-device/{device_id}` | `X-Internal-Token` | inventory (device delete guard, config restore) | list of `{id, user_id, device_id, status, end_time}` | RES-INTERNAL-1, RES-INTERNAL-5 |
 | POST | `/internal/{id}/provision-result` | `X-Internal-Token` | execution | `{reservation_id, status, applied}` | RES-INTERNAL-1, RES-DYN-6, RES-DYN-7, RES-DYN-8 |
@@ -478,9 +479,12 @@ The transitions are RES-DYN-4 to RES-DYN-9 and RES-SWEEP-6 (section 4).
 **Rules.**
 
 - **RES-DYN-1.** Each dynamic request's template must exist in inventory and have
-  `template_type` `dynamic`; inventory unreachable fails closed with 503. \
+  `template_type` `dynamic`; inventory unreachable fails closed with 503. The template is
+  read with the caller's JWT, so a dynamic template hidden from a non-admin
+  (`dynamic-resources.md`, DYN-REQ-9) is refused with the same `Template <id> not found in
+  inventory` as an unknown id (issue #1053). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`, `_fetch_dynamic_templates`) \
-  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_dynamic_booking_unknown_template_422_wording`, `test_dynamic_booking_non_dynamic_template_422_wording`, `test_dynamic_booking_inventory_unreachable_503_wording`)
+  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_dynamic_booking_unknown_template_422_wording`, `test_dynamic_booking_non_dynamic_template_422_wording`, `test_dynamic_booking_inventory_unreachable_503_wording`); `services/reservations/tests/test_dynamic_gating.py` (`test_hidden_dynamic_template_refused_exactly_like_an_unknown_id`)
 - **RES-DYN-2.** A booking carries at most 50 dynamic requests; the create form's
   `MAX_DYNAMIC_REQUESTS` mirrors the cap. \
   Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationCreate`); `frontend/src/components/reservations/CreateReservationModal.tsx` (`MAX_DYNAMIC_REQUESTS`) \
@@ -489,6 +493,15 @@ The transitions are RES-DYN-4 to RES-DYN-9 and RES-SWEEP-6 (section 4).
   no dedupe. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_dynamic_booking_creates_one_row_per_instance`)
+- **RES-DYN-10.** After the template checks, each distinct hypervisor of the requested
+  templates is read once through inventory's internal route; a disabled hypervisor
+  refuses the booking with 422 naming it and its templates, a hypervisor that no longer
+  exists with 422, and a check that cannot be answered (no internal token, transport
+  error, non-200 other than 404, a body without a boolean `enabled`) fails closed with 503
+  (issue #1033). A hidden template is refused before this check, so its hypervisor's
+  name is never revealed. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`, `_fetch_hypervisor_internal`) \
+  Pinned by: `services/reservations/tests/test_dynamic_gating.py` (`test_disabled_hypervisor_refused_with_422_naming_it`, `test_enabled_hypervisor_books`, `test_each_distinct_hypervisor_is_read_once`, `test_missing_hypervisor_refused_with_422`, `test_unanswerable_hypervisor_check_fails_closed_with_503`, `test_hypervisor_check_without_an_internal_token_fails_closed`, `test_hidden_template_never_reaches_the_hypervisor_check`)
 
 **Out of scope.** Instance creation, the instance ledger, keyed destroy, and teardown on
 `reservation.failed` or cancel are execution's (`dynamic-resources.md`).
@@ -674,9 +687,13 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   Enforced in: `services/reservations/app/schemas/reservation.py` (`check_max_duration`); `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_patch_hold.py` (`test_patch_end_time_is_judged_against_the_cap`, `test_patch_cap_uses_the_stored_start_on_an_active_row`, `test_over_cap_legacy_row_stays_editable_outside_its_window`, `test_over_cap_legacy_row_cannot_set_a_window_still_over_the_cap`, `test_cap_zero_disables_the_patch_check`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_over_max_duration_returns_400`)
 - **RES-PATCH-6.** A new `device_ids` must be non-empty (at most 200, deduped), every
-  device must exist, and all must share one topology type. \
-  Enforced in: `services/reservations/app/schemas/reservation.py` (`device_ids_not_empty`); `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_empty_device_ids_rejected`, `test_update_reservation_topology_mismatch_rejected`); `services/reservations/tests/test_schema_bounds.py` (`test_update_device_ids_over_cap_rejected`)
+  device must exist, and the booked devices must share one topology type. The instance
+  devices the reservation already holds (a held device whose template is one of the
+  reservation's dynamic request templates) are left out of the type check, so a booking
+  of physical devices plus instances can change its physical devices while keeping its
+  instances (issue #1030, decided 2026-10-07). A device not yet held is always judged. \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`device_ids_not_empty`); `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_held_instance_device_ids`) \
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_empty_device_ids_rejected`, `test_update_reservation_topology_mismatch_rejected`); `services/reservations/tests/test_schema_bounds.py` (`test_update_device_ids_over_cap_rejected`); `services/reservations/tests/test_dynamic_gating.py` (`test_mixed_reservation_adds_a_device_and_keeps_its_instance`, `test_mixed_reservation_can_drop_a_physical_device_and_keep_its_instance`, `test_a_cloud_device_the_reservation_does_not_hold_is_still_refused`, `test_a_held_cloud_device_of_another_template_is_still_refused`, `test_without_dynamic_requests_the_whole_set_is_judged`, `test_mixed_patch_through_the_route_is_200`)
 - **RES-PATCH-7.** A non-admin's new `device_ids` must all be visible to them (403
   otherwise). When the visibility lookup cannot be answered the router skips this
   pre-check, as on create (RES-CREATE-8), and the device fetch of RES-PATCH-6 still
@@ -1137,8 +1154,8 @@ user in the flow. The routes, callers, and answers are in section 7.
   without pagination. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`list_reservations_for_topology`, `list_reservations_for_device`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_by_topology_returns_matching_reservation`, `test_internal_by_device_returns_matching_reservation`)
-- **RES-INTERNAL-6.** The literal `active`, `active-users`, `by-topology`, and
-  `by-device` segments are never parsed as a reservation id. \
+- **RES-INTERNAL-6.** The literal `active`, `active-users`, `held-devices`,
+  `by-topology`, and `by-device` segments are never parsed as a reservation id. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_internal_status`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_active_no_collision_with_int_status_path`, `test_internal_status_no_collision_with_user_get`)
 - **RES-INTERNAL-7.** `purpose_classification_pending` is true only when
@@ -1148,6 +1165,12 @@ user in the flow. The routes, callers, and answers are in section 7.
   (issue #1039, `ai-features.md` AI-CONV-13). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_internal_status`); `services/reservations/app/schemas/reservation.py` (`ReservationInternalStatus`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_status_reports_purpose_classification_pending`)
+
+- **RES-INTERNAL-8.** `held-devices` lists, once each and sorted, every device of the
+  user's `PENDING_PROVISION` and `ACTIVE` reservations (the statuses that hold devices),
+  and nothing of a `PENDING` or terminal row or of another user's (issue #1030). \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`list_devices_held_by_user`) \
+  Pinned by: `services/reservations/tests/test_dynamic_gating.py` (`test_held_devices_lists_only_the_users_live_reservations`, `test_held_devices_for_a_user_with_nothing_live_is_empty`, `test_held_devices_refuses_a_wrong_internal_token`)
 
 **Out of scope.** How each caller uses the answer is in that caller's area.
 
@@ -1198,8 +1221,11 @@ sweep, and event delivery never return an error to a caller.
 | 422 | `{"error": "topology_routing_intent_invalid", "invalid_routes": [...], "message": "..."}` | create on a topology with invalid routing intent | RES-TOPO-4 |
 | 422 | `Template <id> not found in inventory` | a dynamic request names an unknown template | RES-DYN-1 |
 | 422 | `The following templates are not dynamic templates: <ids>` | a dynamic request names a non-dynamic template | RES-DYN-1 |
+| 422 | `Hypervisor '<name>' is disabled; these dynamic templates cannot be booked until an admin enables it: <template names>` | a dynamic request names a template whose hypervisor is disabled | RES-DYN-10 |
+| 422 | `The hypervisor of these dynamic templates no longer exists: <template names>` | the hypervisor a dynamic template names is gone | RES-DYN-10 |
 | 422 | `Calendar window cannot exceed <N> days (requested ...)` | calendar window too wide | RES-CAL-2 |
 | 503 | `Failed to contact inventory service: ...` | inventory unreachable on create, PATCH, or the dynamic template check | RES-CREATE-9, RES-PATCH-6, RES-DYN-1 |
+| 503 | `Failed to contact inventory service while checking the hypervisor of a dynamic template` | the hypervisor check of a dynamic request cannot be answered | RES-DYN-10 |
 | 503 | `Could not verify device visibility; reservations were not returned. Retry the request.` | non-admin calendar while the visibility lookup cannot be answered | RES-CAL-3 |
 | 503 | `Failed to reserve devices in inventory after retries: ...` | the create-path inventory flip exhausted its attempts | RES-CREATE-15 |
 | 503 | `Cabling validation returned <status>: ...` or `Failed to contact cabling service: ...` | topology validation failed on create or PATCH | RES-TOPO-6, RES-PATCH-8 |

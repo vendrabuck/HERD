@@ -811,6 +811,7 @@
     "HypervisorCreate": {
       "properties": {
         "description": "anyOf",
+        "device_group_id": "anyOf",
         "enabled": "boolean",
         "endpoint": "string",
         "hypervisor_type": "string",
@@ -848,6 +849,7 @@
       "properties": {
         "created_at": "string",
         "description": "anyOf",
+        "device_group_id": "anyOf",
         "enabled": "boolean",
         "endpoint": "string",
         "hypervisor_type": "string",
@@ -883,6 +885,7 @@
     "HypervisorUpdate": {
       "properties": {
         "description": "anyOf",
+        "device_group_id": "anyOf",
         "enabled": "anyOf",
         "endpoint": "anyOf",
         "hypervisor_type": "anyOf",

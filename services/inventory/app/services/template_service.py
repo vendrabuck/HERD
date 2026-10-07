@@ -1,7 +1,7 @@
 import uuid
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -115,11 +115,29 @@ def _validate_driver_and_hypervisor_presence(
 
 
 async def list_templates(
-    db: AsyncSession, template_type: str | None = None, skip: int = 0, limit: int = 50
+    db: AsyncSession,
+    template_type: str | None = None,
+    skip: int = 0,
+    limit: int = 50,
+    visible_dynamic_hypervisor_ids: set[uuid.UUID] | None = None,
 ) -> tuple[list[DeviceTemplate], int]:
+    """List templates, newest first.
+
+    `visible_dynamic_hypervisor_ids` is the dynamic-template gate (issue #1053):
+    None lists every template (an admin); a set keeps every non-dynamic template
+    and only the dynamic templates whose hypervisor is in the set, in SQL, so
+    `total` counts what the caller may see.
+    """
     query = select(DeviceTemplate).order_by(DeviceTemplate.created_at.desc())
     if template_type:
         query = query.where(DeviceTemplate.template_type == template_type)
+    if visible_dynamic_hypervisor_ids is not None:
+        query = query.where(
+            or_(
+                DeviceTemplate.template_type != "dynamic",
+                DeviceTemplate.hypervisor_id.in_(list(visible_dynamic_hypervisor_ids)),
+            )
+        )
 
     count_query = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_query)).scalar() or 0

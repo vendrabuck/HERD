@@ -77,6 +77,15 @@ Typical workflow:
 
 Changing a template mid-life is fine, but: new required fields without defaults will break existing devices' validation. Prefer adding optional fields.
 
+### Hypervisors
+
+**Admin > Hypervisors** registers the backends dynamic templates create instances on: a name, the endpoint, a free-form type, and the secret that holds its credentials. Two settings decide who may use it:
+
+- **Bookable by device group** (issue #1053). Non-admins see and book a dynamic template only when its hypervisor names a device group and one of their user groups has a permission on that device group, the same permission rows that make devices visible. **Admins only** (no device group) is the default and the value every hypervisor registered before this setting existed has, so open each hypervisor to the right group after upgrading. Admins can always book every template.
+- **Enabled** (issue #1033). While unticked, bookings of the hypervisor's dynamic templates are refused with a message naming the hypervisor, and the execution service creates no new instance on it for bookings taken before you disabled it (those reservations fail at the provision timeout). Instances that already exist are still torn down. Use it while a hypervisor is down for maintenance.
+
+A non-admin owner sees the instance device of their own live reservation without any permission on "No Pool" (issue #1030); see [ROLES.md](ROLES.md#instance-devices-of-your-own-reservation).
+
 ### Devices
 
 **Inventory > Add device**. Pick the template, fill in field data, optionally pick an initial device group. Devices auto-join `No Pool` if you don't pick one.
