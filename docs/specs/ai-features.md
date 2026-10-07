@@ -733,10 +733,13 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   exit. \
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant_stream`, `_STREAM_END`) \
   Pinned by: `services/ai-orchestrator/tests/test_reservation_assistant_stream_deadline.py` (`test_stalled_client_with_landed_tool_still_gets_one_done`, `test_consumer_leaving_at_a_yield_closes_inner_generator_without_leaks`); `tests/unit/test_no_yield_inside_cancel_scope.py` (`test_no_service_app_yields_inside_a_cancel_scope`)
-- **AI-STREAM-6.** An exception that is neither a timeout nor an `AIError` (a database
-  error while saving, for example) leaves the stream with no terminal frame. Known gap, see #1037. \
-  Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant_stream`) \
-  Pinned by: none (issue #1037)
+- **AI-STREAM-6.** Any other exception, raised by the loop, by saving a finished turn (a
+  database error, for example), or by one of the handlers above, still ends the stream in
+  exactly one frame: `error` `Assistant call failed` after a rollback, with the exception
+  logged and never sent. An exception from the loop after a write landed keeps the turn and
+  ends in `done` with `incomplete: "ai_error"` (AI-TURN-6). \
+  Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant_stream`, `ASSISTANT_CALL_FAILED_DETAIL`) \
+  Pinned by: `services/ai-orchestrator/tests/test_reservation_assistant_stream_terminal.py` (`test_unexpected_exception_mid_stream_ends_in_one_error_frame`, `test_unexpected_exception_rolls_back_and_next_turn_succeeds`, `test_unexpected_exception_after_a_landed_write_keeps_the_turn`, `test_persist_failure_after_a_finished_answer_ends_in_one_error_frame`, `test_failure_inside_a_handler_still_ends_in_one_error_frame`)
 - **AI-STREAM-7.** The turn is saved before its `done` frame is sent, so a streamed
   `conversation_id` can continue on either route. \
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant_stream`, `_persist_turn`) \
@@ -1495,9 +1498,6 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
 - #1036 (AI-LOG-5, AI-LOG-6): the template identity route logs the model's raw result and
   puts the schema error text in its 502 detail; upstream error text, internal URLs
   included, reaches response details and `tool_calls[].error`.
-- #1037 (AI-STREAM-6): the stream handles only timeouts, an unreachable provider, and
-  `AIError`, so an exception while the turn is saved ends the stream with neither `done`
-  nor `error`.
 - #1038 (AI-GEN-15): nothing in generation checks that a proposal's devices share one
   topology type; the commit writes PHYSICAL on every device node, and the reservation
   create's 422 is the only check.
@@ -1551,7 +1551,6 @@ under Open defects gets its test with that defect's fix.
 - AI-CONV-3: other seed-read failures answer 500.
 - AI-CONV-5: later turns do not re-read the reservation.
 - AI-LOOP-7: the write-tools section of the system prompt.
-- AI-STREAM-6: an unexpected exception ends a stream with no terminal frame.
 - AI-RECIPE-3: the recipe flag answers before authentication.
 - AI-RECIPE-11: any admin may read and refine any draft.
 - AI-QUOTA-5: failed calls record no usage.
