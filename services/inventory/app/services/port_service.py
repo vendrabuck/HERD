@@ -9,6 +9,7 @@ from app.models.port import Port
 from app.models.template import DeviceTemplate
 from app.schemas.port import BulkPortCreate, PortCreate, PortUpdate
 from app.services.inventory_service import validate_field_data
+from app.services.port_cabling_guard import assert_port_uncabled
 
 
 async def list_ports(db: AsyncSession, device_id: uuid.UUID) -> list[Port]:
@@ -69,6 +70,13 @@ async def update_port(db: AsyncSession, port_id: uuid.UUID, data: PortUpdate) ->
         if template:
             validate_field_data(template, update_data["field_data"])
 
+    # issue #1023: cabling names a port by its name, so a rename is refused
+    # while any connection names the old one (409 port_cabled, 503 when
+    # cabling cannot answer). A PUT that repeats the current name is no rename.
+    new_name = update_data.get("name")
+    if new_name is not None and new_name != port.name:
+        await assert_port_uncabled(port.device_id, port.name)
+
     for field, value in update_data.items():
         setattr(port, field, value)
     await db.commit()
@@ -117,6 +125,8 @@ async def delete_port(db: AsyncSession, port_id: uuid.UUID) -> bool:
     port = await get_port(db, port_id)
     if not port:
         return False
+    # issue #1023: refused while any cabling connection names the port.
+    await assert_port_uncabled(port.device_id, port.name)
     await db.delete(port)
     await db.commit()
     return True

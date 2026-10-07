@@ -3,7 +3,7 @@ import logging
 import uuid
 
 from fastapi import HTTPException
-from sqlalchemy import func, or_, select
+from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -351,3 +351,32 @@ async def delete_connection(db: AsyncSession, connection_id: uuid.UUID) -> bool:
     await db.delete(conn)
     await db.commit()
     return True
+
+
+async def connections_naming_port(
+    db: AsyncSession, device_id: uuid.UUID, port_name: str, *, sample_limit: int
+) -> tuple[int, list[uuid.UUID]]:
+    """Connection rows that name one device port (issue #1023).
+
+    A row names the port when its A end is (device_id, port_name) or its B end
+    is; a loopback row naming the port on both ends counts once. Port names
+    match exactly, the same string comparison pathfinding uses. Returns the
+    true total and a sample of ids sorted by string form, capped at
+    `sample_limit`.
+    """
+    where = or_(
+        and_(Connection.device_a_id == device_id, Connection.port_a == port_name),
+        and_(Connection.device_b_id == device_id, Connection.port_b == port_name),
+    )
+    count = (
+        await db.execute(select(func.count()).select_from(Connection).where(where))
+    ).scalar_one()
+    sample = (
+        await db.execute(
+            select(Connection.id)
+            .where(where)
+            .order_by(cast(Connection.id, String))
+            .limit(sample_limit)
+        )
+    ).all()
+    return count, [c for (c,) in sample]

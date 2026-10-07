@@ -87,6 +87,8 @@ Changing a template mid-life is fine, but: new required fields without defaults 
 
 From an existing device's page, **Add ports**. Pick a port template, fill in field data, submit. Bulk port creation is supported.
 
+**Deleting or renaming a port** is refused with 409 `port_cabled` while any cabling connection names it, because a cable records its ports by name (the response carries `connection_count` and `connection_ids`). Remove the cables on the Connections page first. If cabling cannot be reached the delete or rename fails closed with 503. Editing only a cabled port's field data is allowed. There is no force flag. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#deleting-or-renaming-a-port-is-refused-with-409-port_cabled-or-503).
+
 ## Device groups (visibility)
 
 Device groups control which devices non-admin users can see.

@@ -5,8 +5,10 @@ cross-instance references by natural identity (template by name, driver by
 name), validates each row against the existing Pydantic schemas, and calls the
 existing create/update service functions row by row. Per-row error handling
 means one bad row is rejected with a reason while the rest of the batch
-proceeds. A `dry_run` import runs full validation and reference resolution and
-returns the per-row report without committing.
+proceeds. A `dry_run` import is a full rehearsal (issue #1017): it runs the
+same create/update service functions inside a transaction that is rolled back
+at the end, so the dry-run report matches the committing run row for row and
+nothing is written.
 
 There is no cross-schema bulk path: this lives in the inventory service and only
 touches the inventory schema, matching the service-boundary rule.
@@ -16,6 +18,8 @@ import csv
 import io
 import json
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import HTTPException
@@ -26,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.device import Device
 from app.models.driver_package import DriverPackage
+from app.models.hypervisor import Hypervisor
 from app.models.template import DeviceTemplate
 from app.schemas.bulk import BulkImportReport, RowResult
 from app.schemas.device import DeviceCreate, DeviceUpdate
@@ -50,6 +55,7 @@ TEMPLATE_CSV_COLUMNS = [
     "name",
     "template_type",
     "driver_name",
+    "hypervisor_name",
     "exclusive",
     "icon",
     "description",
@@ -70,6 +76,7 @@ DEVICE_CSV_TEXT_COLUMNS = {"name", "template_name"}
 TEMPLATE_CSV_TEXT_COLUMNS = {
     "name",
     "driver_name",
+    "hypervisor_name",
     "icon",
     "description",
     "vendor",
@@ -121,15 +128,24 @@ def device_to_record(device: Device) -> dict[str, Any]:
     }
 
 
-def template_to_record(template: DeviceTemplate) -> dict[str, Any]:
+def template_to_record(
+    template: DeviceTemplate, hypervisor_names: dict[uuid.UUID, str] | None = None
+) -> dict[str, Any]:
     """Serialize a template to an instance-portable record.
 
-    The driver reference is emitted as `driver_name`, not the raw `driver_id`.
+    The driver reference is emitted as `driver_name`, not the raw `driver_id`,
+    and a dynamic template's hypervisor as `hypervisor_name` (issue #1024),
+    resolved through `hypervisor_names` (id to name, built once by the
+    exporter), so a dynamic template round-trips into another instance.
     """
+    hypervisor_name = None
+    if template.hypervisor_id is not None:
+        hypervisor_name = (hypervisor_names or {}).get(template.hypervisor_id)
     return {
         "name": template.name,
         "template_type": template.template_type,
         "driver_name": template.driver.name if template.driver else None,
+        "hypervisor_name": hypervisor_name,
         "exclusive": template.exclusive,
         "icon": template.icon,
         "description": template.description,
@@ -275,6 +291,37 @@ def _validation_reason(exc: ValidationError) -> str:
     return "; ".join(parts)
 
 
+@asynccontextmanager
+async def _rehearsal_session(db: AsyncSession) -> AsyncIterator[AsyncSession]:
+    """A session whose commits are savepoint releases inside one outer
+    transaction that is always rolled back (issue #1017).
+
+    The create/update service functions commit per row. Run on this session,
+    each `commit()` only releases a savepoint and each `rollback()` only rolls
+    back to it (SQLAlchemy's `join_transaction_mode="create_savepoint"`), so a
+    dry run executes exactly the checks and writes a committing run executes,
+    later rows see earlier rows' writes as they would on commit, and the outer
+    transaction on the caller's connection is rolled back on exit, writing
+    nothing. Dialect gate: pysqlite and aiosqlite emit no BEGIN until the first
+    DML, so a SAVEPOINT would open (and its RELEASE commit) the outermost
+    SQLite transaction; on SQLite an explicit BEGIN opens the outer transaction
+    first. Postgres needs no gate.
+    """
+    conn = await db.connection()
+    if conn.dialect.name == "sqlite":
+        raw = await conn.get_raw_connection()
+        if not raw.driver_connection.in_transaction:
+            await conn.exec_driver_sql("BEGIN")
+    rehearsal = AsyncSession(
+        bind=conn, join_transaction_mode="create_savepoint", expire_on_commit=False
+    )
+    try:
+        yield rehearsal
+    finally:
+        await rehearsal.close()
+        await db.rollback()
+
+
 # Import: devices ------------------------------------------------------------
 
 
@@ -287,7 +334,24 @@ async def import_devices(
     actor_name: str | None,
 ) -> BulkImportReport:
     rows = parse_import(raw, fmt, DEVICE_CSV_COLUMNS, DEVICE_CSV_TEXT_COLUMNS)
-    report = _empty_report(dry_run)
+    if dry_run:
+        async with _rehearsal_session(db) as rehearsal:
+            report = await _import_device_rows(rehearsal, rows, actor_id, actor_name)
+    else:
+        report = await _import_device_rows(db, rows, actor_id, actor_name)
+    report.dry_run = dry_run
+    return report
+
+
+async def _import_device_rows(
+    db: AsyncSession,
+    rows: list[dict[str, Any]],
+    actor_id: uuid.UUID | None,
+    actor_name: str | None,
+) -> BulkImportReport:
+    """Run every device row through the real create/update path on `db`
+    (the request session, or a rehearsal session for a dry run)."""
+    report = _empty_report(False)
 
     # Build a name -> template-id map once so reference resolution is O(1) per
     # row and does not issue a query per row. We store the plain id, not the ORM
@@ -359,8 +423,7 @@ async def import_devices(
                     field_data=field_data,
                     poll_interval_seconds=poll,
                 )
-                if not dry_run:
-                    await create_device(db, create, created_by=actor_id, created_by_name=actor_name)
+                await create_device(db, create, created_by=actor_id, created_by_name=actor_name)
                 report.rows.append(RowResult(row=index, action="create", identity=name))
             else:
                 # Build the update kwargs conditionally, as the template importer
@@ -379,20 +442,17 @@ async def import_devices(
                 if poll is not None:
                     update_kwargs["poll_interval_seconds"] = poll
                 update = DeviceUpdate(**update_kwargs)
-                if not dry_run:
-                    await update_device(
-                        db, existing.id, update, modified_by=actor_id, modified_by_name=actor_name
-                    )
+                await update_device(
+                    db, existing.id, update, modified_by=actor_id, modified_by_name=actor_name
+                )
                 report.rows.append(RowResult(row=index, action="update", identity=name))
         except HTTPException as exc:
-            if not dry_run:
-                await db.rollback()
+            await db.rollback()
             report.rows.append(
                 RowResult(row=index, action="reject", identity=name or None, reason=str(exc.detail))
             )
         except ValidationError as exc:
-            if not dry_run:
-                await db.rollback()
+            await db.rollback()
             report.rows.append(
                 RowResult(
                     row=index,
@@ -402,8 +462,7 @@ async def import_devices(
                 )
             )
         except Exception as exc:
-            if not dry_run:
-                await db.rollback()
+            await db.rollback()
             report.rows.append(
                 RowResult(row=index, action="reject", identity=name or None, reason=str(exc))
             )
@@ -422,7 +481,23 @@ async def import_templates(
     actor_id: uuid.UUID | None,
 ) -> BulkImportReport:
     rows = parse_import(raw, fmt, TEMPLATE_CSV_COLUMNS, TEMPLATE_CSV_TEXT_COLUMNS)
-    report = _empty_report(dry_run)
+    if dry_run:
+        async with _rehearsal_session(db) as rehearsal:
+            report = await _import_template_rows(rehearsal, rows, actor_id)
+    else:
+        report = await _import_template_rows(db, rows, actor_id)
+    report.dry_run = dry_run
+    return report
+
+
+async def _import_template_rows(
+    db: AsyncSession,
+    rows: list[dict[str, Any]],
+    actor_id: uuid.UUID | None,
+) -> BulkImportReport:
+    """Run every template row through the real create/update path on `db`
+    (the request session, or a rehearsal session for a dry run)."""
+    report = _empty_report(False)
 
     # Store the plain driver id, not the ORM instance: a per-row rollback below
     # expires every session-cached instance, so reading an attribute off a
@@ -430,6 +505,9 @@ async def import_templates(
     # raise. Only the id is needed downstream.
     driver_rows = (await db.execute(select(DriverPackage))).scalars().all()
     driver_ids_by_name = {d.name: d.id for d in driver_rows}
+    # issue #1024: a dynamic template's hypervisor resolves by name the same way.
+    hypervisor_rows = (await db.execute(select(Hypervisor.name, Hypervisor.id))).all()
+    hypervisor_ids_by_name = {hv_name: hv_id for hv_name, hv_id in hypervisor_rows}
 
     for index, raw_row in enumerate(rows):
         name = (raw_row.get("name") or "").strip()
@@ -455,6 +533,21 @@ async def import_templates(
                     )
                     continue
 
+            hypervisor_id: uuid.UUID | None = None
+            hypervisor_name = (raw_row.get("hypervisor_name") or "").strip()
+            if hypervisor_name:
+                hypervisor_id = hypervisor_ids_by_name.get(hypervisor_name)
+                if hypervisor_id is None:
+                    report.rows.append(
+                        RowResult(
+                            row=index,
+                            action="reject",
+                            identity=name,
+                            reason=f"hypervisor not found by name: {hypervisor_name!r}",
+                        )
+                    )
+                    continue
+
             sections = _coerce_json_cell(raw_row.get("sections"), [])
             poll = _coerce_int(raw_row.get("poll_interval_seconds"))
             template_type = raw_row.get("template_type") or "device"
@@ -469,6 +562,7 @@ async def import_templates(
                     name=name,
                     template_type=template_type,
                     driver_id=driver_id,
+                    hypervisor_id=hypervisor_id,
                     exclusive=exclusive,
                     icon=raw_row.get("icon") or None,
                     description=raw_row.get("description") or None,
@@ -478,8 +572,7 @@ async def import_templates(
                     sections=sections,
                     poll_interval_seconds=poll,
                 )
-                if not dry_run:
-                    await create_template(db, create)
+                await create_template(db, create)
                 report.rows.append(RowResult(row=index, action="create", identity=name))
             else:
                 # Build the update kwargs conditionally: a field the row omits is
@@ -491,6 +584,8 @@ async def import_templates(
                 update_kwargs: dict[str, Any] = {"name": name}
                 if driver_id is not None:
                     update_kwargs["driver_id"] = driver_id
+                if hypervisor_id is not None:
+                    update_kwargs["hypervisor_id"] = hypervisor_id
                 exclusive_cell = raw_row.get("exclusive")
                 if exclusive_cell is not None and exclusive_cell != "":
                     update_kwargs["exclusive"] = _coerce_bool(exclusive_cell, True)
@@ -503,18 +598,15 @@ async def import_templates(
                 if poll is not None:
                     update_kwargs["poll_interval_seconds"] = poll
                 update = TemplateUpdate(**update_kwargs)
-                if not dry_run:
-                    await update_template(db, existing.id, update, modified_by=actor_id)
+                await update_template(db, existing.id, update, modified_by=actor_id)
                 report.rows.append(RowResult(row=index, action="update", identity=name))
         except HTTPException as exc:
-            if not dry_run:
-                await db.rollback()
+            await db.rollback()
             report.rows.append(
                 RowResult(row=index, action="reject", identity=name or None, reason=str(exc.detail))
             )
         except ValidationError as exc:
-            if not dry_run:
-                await db.rollback()
+            await db.rollback()
             report.rows.append(
                 RowResult(
                     row=index,
@@ -524,8 +616,7 @@ async def import_templates(
                 )
             )
         except Exception as exc:
-            if not dry_run:
-                await db.rollback()
+            await db.rollback()
             report.rows.append(
                 RowResult(row=index, action="reject", identity=name or None, reason=str(exc))
             )

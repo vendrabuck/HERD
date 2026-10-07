@@ -74,6 +74,18 @@ def _mock_minio():
 
 
 @pytest.fixture(autouse=True)
+def _mock_port_cabling_guard():
+    """Default the issue #1023 port guard to "no cable names the port" so a
+    port delete or rename in this suite never reaches a real cabling service."""
+    from unittest.mock import AsyncMock, patch
+
+    with patch(
+        "app.services.port_service.assert_port_uncabled", new=AsyncMock(return_value=None)
+    ) as guard:
+        yield guard
+
+
+@pytest.fixture(autouse=True)
 def _mock_reservation_guard():
     """Default the issue #391 delete guard to "no blocking reservations" so a
     device delete in this suite never reaches a real reservations service."""

@@ -17,6 +17,10 @@
       "/connections/internal"
     ],
     [
+      "GET",
+      "/connections/internal/by-port"
+    ],
+    [
       "DELETE",
       "/connections/{connection_id}"
     ],
@@ -311,6 +315,14 @@
         "port_a",
         "port_b"
       ],
+      "type": "object"
+    },
+    "ConnectionsByPortResponse": {
+      "properties": {
+        "connection_count": "integer",
+        "connection_ids": "array"
+      },
+      "required": [],
       "type": "object"
     },
     "FabricResponse": {

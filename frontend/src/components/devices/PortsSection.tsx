@@ -8,6 +8,7 @@ import { useAllDeviceNames } from "@/api/inventory";
 import { DynamicFieldRenderer } from "@/components/devices/DynamicFieldRenderer";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Modal } from "@/components/ui/Modal";
+import { deletePortErrorText } from "@/lib/errors";
 import type { Port } from "@/types/port.types";
 import type { DeviceTemplate } from "@/types/template.types";
 
@@ -145,10 +146,7 @@ export function PortsSection({ deviceId, isAdmin }: PortsSectionProps) {
       await deletePort.mutateAsync(deleteTarget.id);
       toast.success("Port deleted");
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to delete port";
-      toast.error(msg);
+      toast.error(deletePortErrorText(err));
     }
     setDeleteTarget(null);
   };

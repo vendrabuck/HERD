@@ -803,3 +803,281 @@ async def test_put_device_explicit_null_status_is_422_naming_the_field(client):
         "Value error, status cannot be null; omit the field to leave it unchanged"
     ]
     assert (await _device_by_name(client, "FW-01"))["status"] == "AVAILABLE"
+
+
+# Dry run is a full rehearsal (issue #1017) -----------------------------------
+
+
+async def _post_import(client, resource: str, items: list, *, dry_run: bool) -> dict:
+    resp = await client.post(
+        f"/{resource}/import",
+        params={"format": "json", "dry_run": "true" if dry_run else "false"},
+        files={"file": ("x.json", io.BytesIO(json.dumps(items).encode()), "application/json")},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+_ONE_SECTION = [{"name": "S", "fields": [{"key": "k", "label": "K", "type": "string"}]}]
+
+
+def _without_flag(report: dict) -> dict:
+    return {k: v for k, v in report.items() if k != "dry_run"}
+
+
+async def _create_named_driver(client, name: str, connection_type: str) -> str:
+    resp = await client.post(
+        "/drivers",
+        data={"name": name, "connection_type": connection_type},
+        files={"file": ("driver.zip", io.BytesIO(b"PK\x03\x04test"), "application/zip")},
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_dry_run_rejects_unknown_field_data_key_like_the_commit(client):
+    """The issue's first repro: dry run reported `create` for a row the
+    committing import rejects in `create_device`'s validate_field_data."""
+    await _create_template(client, name="Firewall")
+    items = [
+        {
+            "name": "BOGUS-01",
+            "template_name": "Firewall",
+            "topology_type": "PHYSICAL",
+            "field_data": {"model": "X", "bogus": 1},
+        }
+    ]
+    dry = await _post_import(client, "devices", items, dry_run=True)
+    assert dry["dry_run"] is True
+    assert dry["rows"] == [
+        {"row": 0, "action": "reject", "identity": "BOGUS-01", "reason": "Unknown fields: bogus"}
+    ]
+    real = await _post_import(client, "devices", items, dry_run=False)
+    assert real["dry_run"] is False
+    assert _without_flag(dry) == _without_flag(real)
+
+
+@pytest.mark.asyncio
+async def test_dry_run_rejects_hypervisor_driver_on_device_template_like_the_commit(client):
+    """The issue's second repro: the template-type versus driver
+    connection-type rule lives in create_template, which a dry run skipped."""
+    await _create_named_driver(client, "Recipe X", "Hypervisor")
+    items = [
+        {
+            "name": "BadDevTpl",
+            "template_type": "device",
+            "driver_name": "Recipe X",
+            "vendor": "V",
+            "model": "M",
+            "sections": _ONE_SECTION,
+        }
+    ]
+    dry = await _post_import(client, "templates", items, dry_run=True)
+    assert dry["rows"][0]["action"] == "reject"
+    assert dry["rows"][0]["reason"] == "Device templates cannot use a Hypervisor-type driver"
+    real = await _post_import(client, "templates", items, dry_run=False)
+    assert _without_flag(dry) == _without_flag(real)
+    templates = (await client.get("/templates")).json()["items"]
+    assert all(t["name"] != "BadDevTpl" for t in templates)
+
+
+@pytest.mark.asyncio
+async def test_device_dry_run_report_matches_commit_row_for_row_and_writes_nothing(client):
+    """A mixed file: a good create, a field-type error, a required-field
+    error, a port template named in a device row, a duplicate name inside the
+    file (the commit creates then updates it), and an update of an existing
+    device. The dry-run report equals the committing report, and the dry run
+    leaves every row, the No Pool membership included, as it was."""
+    template = await _create_template(client, name="Firewall")
+    existing = await _create_device(client, template["id"], name="FW-OLD")
+    port_tpl = await client.post(
+        "/templates",
+        json={"name": "PortTpl", "template_type": "port", "sections": _ONE_SECTION},
+    )
+    assert port_tpl.status_code == 201, port_tpl.text
+    items = [
+        {"name": "OK-1", "template_name": "Firewall", "topology_type": "PHYSICAL",
+         "field_data": {"model": "X"}},
+        {"name": "TYPE-1", "template_name": "Firewall", "topology_type": "PHYSICAL",
+         "field_data": {"model": 5}},
+        {"name": "REQ-1", "template_name": "Firewall", "topology_type": "PHYSICAL",
+         "field_data": {}},
+        {"name": "PORT-1", "template_name": "PortTpl", "topology_type": "PHYSICAL",
+         "field_data": {}},
+        {"name": "OK-1", "template_name": "Firewall", "topology_type": "PHYSICAL",
+         "status": "MAINTENANCE", "field_data": {"model": "Y"}},
+        {"name": "FW-OLD", "template_name": "Firewall", "field_data": {"model": "Z", "bad": 1}},
+        {"name": "FW-OLD", "template_name": "Firewall", "status": "MAINTENANCE"},
+    ]  # fmt: skip
+    before = sorted(
+        (d["name"], d["status"], json.dumps(d["field_data"], sort_keys=True))
+        for d in (await client.get("/devices")).json()["items"]
+    )
+    groups_before = (await client.get("/device-groups")).json()
+
+    dry = await _post_import(client, "devices", items, dry_run=True)
+    assert [r["action"] for r in dry["rows"]] == [
+        "create", "reject", "reject", "reject", "update", "reject", "update",
+    ]  # fmt: skip
+    assert dry["rows"][1]["reason"] == "Field 'model' must be a string"
+    assert dry["rows"][2]["reason"] == "Required field missing: model"
+    assert dry["rows"][3]["reason"] == "Template is not a device template"
+    assert dry["rows"][5]["reason"] == "Unknown fields: bad"
+
+    after_dry = sorted(
+        (d["name"], d["status"], json.dumps(d["field_data"], sort_keys=True))
+        for d in (await client.get("/devices")).json()["items"]
+    )
+    assert after_dry == before
+    assert (await client.get("/device-groups")).json() == groups_before
+
+    real = await _post_import(client, "devices", items, dry_run=False)
+    assert _without_flag(dry) == _without_flag(real)
+    assert (await _device_by_name(client, "OK-1"))["status"] == "MAINTENANCE"
+    assert (await _device_by_name(client, "FW-OLD"))["id"] == existing["id"]
+
+
+@pytest.mark.asyncio
+async def test_template_dry_run_duplicate_name_in_file_matches_commit(client):
+    """Two rows with one new template name: the commit creates the first and
+    updates it with the second, and the rehearsal must say the same."""
+    items = [
+        {"name": "Twice", "template_type": "port", "sections": _ONE_SECTION, "description": "one"},
+        {"name": "Twice", "template_type": "port", "description": "two"},
+    ]
+    dry = await _post_import(client, "templates", items, dry_run=True)
+    assert [r["action"] for r in dry["rows"]] == ["create", "update"]
+    templates = (await client.get("/templates")).json()["items"]
+    assert all(t["name"] != "Twice" for t in templates)
+    real = await _post_import(client, "templates", items, dry_run=False)
+    assert _without_flag(dry) == _without_flag(real)
+
+
+# Dynamic templates round-trip through hypervisor_name (issue #1024) ---------
+
+_SECRET_GET = "app.services.hypervisor_service.httpx.AsyncClient.get"
+
+
+async def _create_hypervisor(client, name: str) -> str:
+    from unittest.mock import AsyncMock, patch
+
+    import httpx
+
+    payload = {
+        "name": name,
+        "endpoint": "https://pve.example:8006",
+        "hypervisor_type": "proxmox",
+        "secret_id": "00000000-0000-0000-0000-0000000000aa",
+    }
+    with patch(_SECRET_GET, new=AsyncMock(return_value=httpx.Response(200))):
+        resp = await client.post("/hypervisors", json=payload)
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+async def _create_dynamic_template(client, name: str, hypervisor_name: str) -> dict:
+    driver_id = await _create_named_driver(client, f"Recipe for {name}", "Hypervisor")
+    hid = await _create_hypervisor(client, hypervisor_name)
+    resp = await client.post(
+        "/templates",
+        json={
+            "name": name,
+            "template_type": "dynamic",
+            "driver_id": driver_id,
+            "hypervisor_id": hid,
+            "sections": _ONE_SECTION,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+@pytest.mark.asyncio
+async def test_export_templates_carries_hypervisor_name(client):
+    await _create_dynamic_template(client, "Dyn", "pve-east")
+    await _create_template(client, name="Firewall")
+    items = (await client.get("/templates/export", params={"format": "json"})).json()["items"]
+    by_name = {i["name"]: i for i in items}
+    assert by_name["Dyn"]["hypervisor_name"] == "pve-east"
+    assert "hypervisor_id" not in by_name["Dyn"]
+    assert by_name["Firewall"]["hypervisor_name"] is None
+
+
+@pytest.mark.parametrize("fmt", ["json", "csv"])
+@pytest.mark.asyncio
+async def test_dynamic_template_round_trips_into_an_instance_without_it(client, fmt):
+    """Export, delete the template (the target instance never had it), and
+    re-import: the dynamic template is created bound to the same hypervisor.
+    The hypervisor name starts with a CSV formula trigger, so the CSV leg also
+    proves the column is neutralized on export and restored on import."""
+    tpl = await _create_dynamic_template(client, "Dyn", "=pve-east")
+    exported = (await client.get("/templates/export", params={"format": fmt})).content
+    if fmt == "csv":
+        assert b"'=pve-east" in exported
+    assert (await client.delete(f"/templates/{tpl['id']}")).status_code == 204
+
+    resp = await client.post(
+        "/templates/import",
+        params={"format": fmt},
+        files={"file": (f"t.{fmt}", io.BytesIO(exported), "text/plain")},
+    )
+    report = resp.json()
+    assert report["rows"] == [{"row": 0, "action": "create", "identity": "Dyn", "reason": None}]
+    templates = (await client.get("/templates")).json()["items"]
+    created = next(t for t in templates if t["name"] == "Dyn")
+    assert created["template_type"] == "dynamic"
+    assert created["hypervisor_id"] == tpl["hypervisor_id"]
+
+
+@pytest.mark.asyncio
+async def test_template_import_rejects_unknown_hypervisor_name(client):
+    await _create_named_driver(client, "Recipe Q", "Hypervisor")
+    items = [
+        {
+            "name": "Dyn",
+            "template_type": "dynamic",
+            "driver_name": "Recipe Q",
+            "hypervisor_name": "pve-gone",
+            "sections": _ONE_SECTION,
+        }
+    ]
+    report = await _post_import(client, "templates", items, dry_run=False)
+    assert report["rows"] == [
+        {
+            "row": 0,
+            "action": "reject",
+            "identity": "Dyn",
+            "reason": "hypervisor not found by name: 'pve-gone'",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_template_import_hypervisor_on_device_template_is_rejected(client):
+    await _create_hypervisor(client, "pve-east")
+    await _create_named_driver(client, "Mgmt Q", "Management")
+    items = [
+        {
+            "name": "DevTpl",
+            "template_type": "device",
+            "driver_name": "Mgmt Q",
+            "hypervisor_name": "pve-east",
+            "vendor": "V",
+            "model": "M",
+            "sections": _ONE_SECTION,
+        }
+    ]
+    report = await _post_import(client, "templates", items, dry_run=False)
+    assert report["rejected"] == 1
+    assert "hypervisor_id is only valid on dynamic templates" in report["rows"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_template_reimport_moves_dynamic_template_to_named_hypervisor(client):
+    tpl = await _create_dynamic_template(client, "Dyn", "pve-east")
+    west = await _create_hypervisor(client, "pve-west")
+    items = [{"name": "Dyn", "hypervisor_name": "pve-west"}]
+    report = await _post_import(client, "templates", items, dry_run=False)
+    assert report["updated"] == 1, report
+    assert (await client.get(f"/templates/{tpl['id']}")).json()["hypervisor_id"] == west

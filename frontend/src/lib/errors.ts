@@ -220,3 +220,28 @@ export function topologyDeleteErrorText(err: unknown, fallback: string): string 
   const inUse = topologyInUseDetail(err);
   return inUse ? formatTopologyInUse(inUse) : errorDetail(err, fallback);
 }
+
+/**
+ * The text for a failed port delete (issue #1023). Inventory refuses to delete
+ * a port that a cabling connection still names with a structured 409
+ * {error: "port_cabled", connection_count, connection_ids}; toasting that
+ * object would render nothing readable, so it becomes the cabled wording with
+ * the count, the device delete guard's wording family. Any plain-string detail
+ * (a 404, the fail-closed 503) passes through; anything else is the fallback.
+ */
+export function deletePortErrorText(err: unknown): string {
+  const cabled = structuredDetail<{ connection_count?: unknown }>(
+    err,
+    409,
+    (d) => d.error === "port_cabled",
+  );
+  if (cabled) {
+    const count = cabled.connection_count;
+    if (typeof count === "number" && count > 0) {
+      const noun = count === 1 ? "1 connection" : count + " connections";
+      return "Port is still cabled (" + noun + ") and cannot be deleted. Remove its cables first.";
+    }
+    return "Port is still cabled and cannot be deleted. Remove its cables first.";
+  }
+  return errorDetail(err, "Failed to delete port");
+}

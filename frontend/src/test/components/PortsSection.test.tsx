@@ -226,4 +226,29 @@ describe("PortsSection", () => {
     await waitFor(() => expect(mockDeletePort).toHaveBeenCalledWith("port-1"));
     expect(mockToastSuccess).toHaveBeenCalledWith("Port deleted");
   });
+  it("toasts the cabled wording, never the raw object, when the delete is refused (#1023)", async () => {
+    mockDeletePort.mockRejectedValue({
+      response: {
+        status: 409,
+        data: {
+          detail: { error: "port_cabled", connection_count: 2, connection_ids: ["c1", "c2"] },
+        },
+      },
+    });
+    mockUsePorts.mockReturnValue({ data: [makePort()], isLoading: false });
+    renderWithProviders(<PortsSection deviceId={DEVICE_ID} isAdmin />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    const confirmDialog = screen
+      .getByText("Delete Port")
+      .closest("dialog") as HTMLDialogElement;
+    fireEvent.click(within(confirmDialog).getByText("Delete") as HTMLButtonElement);
+
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith(
+        "Port is still cabled (2 connections) and cannot be deleted. Remove its cables first.",
+      ),
+    );
+    expect(mockToastSuccess).not.toHaveBeenCalledWith("Port deleted");
+  });
 });

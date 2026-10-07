@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from app.schemas._types import OptionalUUIDStr, UUIDStr
+from app.schemas._types import OptionalUUIDStr, UUIDStr, UUIDStrList
 from pydantic import BaseModel, Field
 
 
@@ -37,6 +37,20 @@ class PaginatedConnectionResponse(BaseModel):
     total: int
     skip: int
     limit: int
+
+
+class ConnectionsByPortResponse(BaseModel):
+    """GET /connections/internal/by-port result (issue #1023).
+
+    `connection_count` is the true number of `Connection` rows naming the
+    device port on either end (a loopback row counts once); `connection_ids`
+    is a sorted sample capped at `CONNECTION_ID_SAMPLE_LIMIT`, so the count can
+    exceed the list length. Zero and empty for a port no cable names, including
+    a device or port name cabling has never seen.
+    """
+
+    connection_count: int = 0
+    connection_ids: UUIDStrList = Field(default_factory=list)
 
 
 class ConnectionBulkCreate(BaseModel):
