@@ -1164,7 +1164,10 @@ function TopologyEditorInner() {
   // set that has not yet caught up with this canvas. The fork save replaces
   // the old parent-topology PUT: it appends a fork version and leaves the
   // parent's TopologyVersion history byte-for-byte unchanged.
-  // Blocked when any edge is unreachable; the backend enforces the same rule.
+  // Blocked when the validator reports any invalid edge, including chosen
+  // ports with no cable between them (issue #1007). The fork save itself does
+  // not refuse such an edge: it builds nothing for it and still answers 200,
+  // so this client-side block is the only gate.
   const handleCommitToReservation = useCallback(async () => {
     if (!reservationId) return;
     // LiveEditBar disables the Commit button until forkLoaded, but a

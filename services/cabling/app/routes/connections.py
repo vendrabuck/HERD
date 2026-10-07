@@ -103,12 +103,33 @@ async def list_connections_internal(
 @router.get("/{connection_id}", response_model=ConnectionResponse)
 async def get_connection_endpoint(
     connection_id: uuid.UUID,
-    _: dict = Depends(get_current_user_payload),
+    payload: dict = Depends(get_current_user_payload),
+    authorization: str | None = Header(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get a single backend connection. Available to all authenticated users."""
+    """Get a single backend connection, under the list's visibility rule.
+
+    Admins read any connection. A non-admin reads a connection only when at least
+    one endpoint device is visible to them, the same rule ``list_connections_endpoint``
+    applies (issue #719); a connection with no visible end answers the same 404 an
+    unknown id gets (issue #1008), so hidden and absent are indistinguishable.
+    Visibility is resolved first, through ``resolve_caller_visibility``, so an
+    unanswerable lookup is a 503 for every id and never an existence oracle.
+    """
+    visible_ids = await resolve_caller_visibility(
+        payload,
+        authorization,
+        unavailable_detail=(
+            "Could not verify device visibility; the connection was not returned. "
+            "Retry the request."
+        ),
+    )
     conn = await get_connection(db, connection_id)
-    if not conn:
+    if not conn or (
+        visible_ids is not None
+        and conn.device_a_id not in visible_ids
+        and conn.device_b_id not in visible_ids
+    ):
         raise HTTPException(status_code=404, detail="Connection not found")
     return conn
 

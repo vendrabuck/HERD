@@ -120,6 +120,31 @@ def strip_device_nodes(canvas: dict) -> dict:
     return {**canvas, "nodes": new_nodes}
 
 
+ELEMENT_NODE_TYPE = "networkElementNode"
+
+
+def is_element_node(node: object) -> bool:
+    """True for a network element node (ADR 0012): ``type == "networkElementNode"``.
+
+    The same test ``node_to_element_map`` uses, so every reader classifies an element
+    identically.
+    """
+    return isinstance(node, dict) and node.get("type") == ELEMENT_NODE_TYPE
+
+
+def is_device_node(node: object) -> bool:
+    """True for a device node: an object under ``data.device``, and not an element.
+
+    Shape-based like ``strip_device_nodes`` (a legacy node may carry no ``type``). An
+    element node is never a device node even when it carries a stray ``data.device``
+    (issue #1005: older template saves wrote a role onto element nodes).
+    """
+    if not isinstance(node, dict) or is_element_node(node):
+        return False
+    data = node.get("data")
+    return isinstance(data, dict) and isinstance(data.get("device"), dict)
+
+
 def node_to_device_map(canvas: dict) -> dict[str, uuid.UUID]:
     """Map React Flow node ids to device UUIDs, mirroring the topology validator."""
     nodes = canvas.get("nodes") or []
@@ -149,7 +174,7 @@ def node_to_element_map(canvas: dict) -> dict[str, str]:
     nodes = canvas.get("nodes") or []
     mapping: dict[str, str] = {}
     for node in nodes:
-        if node.get("type") != "networkElementNode":
+        if not is_element_node(node):
             continue
         node_id = node.get("id")
         if not node_id:
@@ -217,6 +242,22 @@ def classify_element_edge(
     return "attachment"
 
 
+def edge_port_constraints(edge: dict) -> tuple[str | None, str | None]:
+    """The (source_port, target_port) an edge is pinned to (issue #531).
+
+    The one reading of ``data.source_port_name``/``data.target_port_name`` shared by
+    ``resolve_canvas_wiring`` (the fork save) and ``validate_canvas_edges`` (its
+    pre-check), so both judge a constrained edge by the same rule (issue #1007). A
+    blank string is treated as absent, same as a missing key.
+    """
+    edge_data = edge.get("data") or {}
+    raw_source_port = edge_data.get("source_port_name")
+    raw_target_port = edge_data.get("target_port_name")
+    source_port = str(raw_source_port) if raw_source_port else None
+    target_port = str(raw_target_port) if raw_target_port else None
+    return source_port, target_port
+
+
 def redact_invisible_device_nodes(
     canvas: dict | None,
     visible_device_ids: set[uuid.UUID],
@@ -260,6 +301,10 @@ def redact_invisible_device_nodes(
 __all__ = [
     "classify_element_edge",
     "DEVICE_NODE_ALLOWED_KEYS",
+    "ELEMENT_NODE_TYPE",
+    "edge_port_constraints",
+    "is_device_node",
+    "is_element_node",
     "node_to_device_map",
     "node_to_element_map",
     "redact_invisible_device_nodes",

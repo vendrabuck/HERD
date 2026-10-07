@@ -53,10 +53,18 @@ import httpx
 
 @dataclass(frozen=True)
 class InternalTokenAuth:
-    """Service-to-service auth: an `X-Internal-Token` header, no acting user."""
+    """Service-to-service auth: an `X-Internal-Token` header.
+
+    `on_behalf_of`, when set, is the acting user's own bearer value, sent as
+    `Authorization` beside the internal token so the callee can scope a read to
+    that user (issue #1008: cabling redacts the fork read to the caller's device
+    visibility). The internal token still authenticates the call; the callee
+    decides what the forwarded identity changes.
+    """
 
     token: str | None
     missing_token_message: str = "internal_api_token not configured"
+    on_behalf_of: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +104,8 @@ async def call_service(
         if not auth.token:
             raise RuntimeError(auth.missing_token_message)
         headers = {"X-Internal-Token": auth.token}
+        if auth.on_behalf_of:
+            headers["Authorization"] = auth.on_behalf_of
     else:
         headers = {"Authorization": auth.authorization}
 

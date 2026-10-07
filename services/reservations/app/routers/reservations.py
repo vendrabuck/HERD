@@ -891,6 +891,7 @@ async def get_reservation_fork(
     reservation_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     payload: dict = Depends(get_current_user_payload),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
     """Return the reservation's editable/as-built fork (ADR 0006 Decision 2).
 
@@ -903,7 +904,14 @@ async def get_reservation_fork(
     draft_restored_from_id (issue #622) whenever the draft was last restored from an
     earlier version and not yet saved, so the frontend can label it "restored from
     version N, unsaved".
+
+    Issue #1008: both reads forward the caller's own bearer to cabling
+    (``on_behalf_of``), so a non-admin owner's wiring comes back with every hop end
+    on a device outside their visibility redacted, and cabling's 503 when it cannot
+    verify visibility relays as a 503. The lazy-create POST stays a plain service
+    call.
     """
+    on_behalf_of = f"Bearer {credentials.credentials}"
     user_id = uuid.UUID(payload["sub"])
     role = payload.get("role", "user")
     reservation = await _load_owned_or_admin(db, reservation_id, user_id, role)
@@ -911,7 +919,9 @@ async def get_reservation_fork(
         raise HTTPException(status_code=404, detail="Reservation not found")
 
     try:
-        resp = await _cabling_fork_call("GET", f"/internal/forks/{reservation_id}")
+        resp = await _cabling_fork_call(
+            "GET", f"/internal/forks/{reservation_id}", on_behalf_of=on_behalf_of
+        )
         if resp.status_code == 404:
             if reservation.status != ReservationStatus.ACTIVE:
                 raise HTTPException(status_code=404, detail="Fork not found")
@@ -927,7 +937,9 @@ async def get_reservation_fork(
                 str(reservation.user_id),
                 list(reservation.device_ids),
             )
-            resp = await _cabling_fork_call("GET", f"/internal/forks/{reservation_id}")
+            resp = await _cabling_fork_call(
+                "GET", f"/internal/forks/{reservation_id}", on_behalf_of=on_behalf_of
+            )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     return _relay_cabling_fork_response(resp)

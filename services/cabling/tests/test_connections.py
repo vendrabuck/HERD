@@ -176,11 +176,73 @@ async def test_user_cannot_delete(user_client_no_admin):
 
 @pytest.mark.asyncio
 async def test_user_can_get_connection(admin_client, user_client):
-    create_resp = await admin_client.post("/connections", json=_connection_body())
+    """A non-admin reads a connection with at least one visible end (issue #1008:
+    the single read follows the list's issue #719 rule, so one visible end is the
+    full row, exactly as the list returns it)."""
+    body = _connection_body()
+    create_resp = await admin_client.post("/connections", json=body)
     conn_id = create_resp.json()["id"]
-    resp = await user_client.get(f"/connections/{conn_id}")
+    fetch = AsyncMock(return_value={uuid.UUID(body["device_a_id"])})
+    with patch("app.services.visible_devices.fetch_visible_device_ids", fetch):
+        resp = await user_client.get(
+            f"/connections/{conn_id}", headers={"Authorization": "Bearer viewer-token"}
+        )
     assert resp.status_code == 200
     assert resp.json()["id"] == conn_id
+    assert resp.json()["device_b_id"] == body["device_b_id"]
+
+
+@pytest.mark.asyncio
+async def test_user_get_connection_with_no_visible_end_is_404(admin_client, user_client):
+    """Issue #1008: a cable whose two ends are both hidden answers byte-for-byte the
+    404 an unknown id gets."""
+    create_resp = await admin_client.post("/connections", json=_connection_body())
+    conn_id = create_resp.json()["id"]
+    fetch = AsyncMock(return_value={uuid.uuid4()})
+    with patch("app.services.visible_devices.fetch_visible_device_ids", fetch):
+        hidden = await user_client.get(
+            f"/connections/{conn_id}", headers={"Authorization": "Bearer viewer-token"}
+        )
+        unknown = await user_client.get(
+            f"/connections/{uuid.uuid4()}", headers={"Authorization": "Bearer viewer-token"}
+        )
+    assert hidden.status_code == 404
+    assert hidden.json() == {"detail": "Connection not found"}
+    assert unknown.status_code == 404
+    assert hidden.content == unknown.content
+
+
+@pytest.mark.asyncio
+async def test_user_get_connection_visibility_unavailable_is_503(admin_client, user_client):
+    """Visibility is resolved before the row is read: an unanswerable lookup is a
+    503 for a real id and an unknown id alike, so it is no existence oracle."""
+    create_resp = await admin_client.post("/connections", json=_connection_body())
+    conn_id = create_resp.json()["id"]
+    fetch = AsyncMock(side_effect=VisibleDevicesUnavailableError("boom"))
+    with patch("app.services.visible_devices.fetch_visible_device_ids", fetch):
+        real = await user_client.get(
+            f"/connections/{conn_id}", headers={"Authorization": "Bearer viewer-token"}
+        )
+        unknown = await user_client.get(
+            f"/connections/{uuid.uuid4()}", headers={"Authorization": "Bearer viewer-token"}
+        )
+    expected = {
+        "detail": "Could not verify device visibility; the connection was not returned. "
+        "Retry the request."
+    }
+    assert real.status_code == 503 and real.json() == expected
+    assert unknown.status_code == 503 and unknown.json() == expected
+
+
+@pytest.mark.asyncio
+async def test_admin_get_connection_never_calls_inventory(admin_client):
+    create_resp = await admin_client.post("/connections", json=_connection_body())
+    conn_id = create_resp.json()["id"]
+    fetch = AsyncMock(return_value=set())
+    with patch("app.services.visible_devices.fetch_visible_device_ids", fetch):
+        resp = await admin_client.get(f"/connections/{conn_id}")
+    assert resp.status_code == 200
+    fetch.assert_not_awaited()
 
 
 @pytest.mark.asyncio

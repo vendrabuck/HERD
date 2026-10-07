@@ -808,3 +808,170 @@ async def test_ownership_gate_precedes_reservation_lock(user_client):
     report = resp.json()
     assert report["rejected"] == 1
     assert report["rows"][0]["reason"] == NOT_OWNED_REASON
+
+
+# CSV port columns (issue #1006) ----------------------------------------------
+
+
+def _editor_canvas():
+    """Two edges between the same devices, built the way the wiring dialog builds
+    them: chosen ports on ``source_port_name``/``target_port_name`` and React Flow
+    handle ids (never port names) on ``sourceHandle``/``targetHandle``."""
+    return {
+        "nodes": [
+            {"id": "n1", "data": {"device": {"id": DEV_A, "name": "switch-a"}}},
+            {"id": "n2", "data": {"device": {"id": DEV_B, "name": "switch-b"}}},
+        ],
+        "edges": [
+            {
+                "id": "e1",
+                "source": "n1",
+                "target": "n2",
+                "sourceHandle": "right",
+                "targetHandle": "left",
+                "data": {
+                    "layer": "L1",
+                    "source_port_name": "eth1",
+                    "target_port_name": "eth1",
+                },
+            },
+            {
+                "id": "e2",
+                "source": "n1",
+                "target": "n2",
+                "sourceHandle": "bottom",
+                "targetHandle": "top",
+                "data": {
+                    "layer": "L1",
+                    "source_port_name": "eth0",
+                    "target_port_name": "eth0",
+                },
+            },
+        ],
+    }
+
+
+async def _seed_second_connection():
+    async with TestSessionLocal() as session:
+        session.add(
+            Connection(
+                device_a_id=uuid.UUID(DEV_A),
+                port_a="eth1",
+                device_b_id=uuid.UUID(DEV_B),
+                port_b="eth1",
+                created_by="seed",
+            )
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_export_csv_writes_editor_port_names_not_handles(admin_client):
+    create = await admin_client.post("/topologies", json={"name": "Editor Lab"})
+    await admin_client.put(
+        f"/topologies/{create.json()['id']}", json={"canvas_data": _editor_canvas()}
+    )
+    resp = await admin_client.get("/topologies/export", params={"format": "csv"})
+    rows = list(csv.DictReader(io.StringIO(resp.text)))
+    assert [(r["source_port"], r["target_port"]) for r in rows] == [
+        ("eth1", "eth1"),
+        ("eth0", "eth0"),
+    ]
+    assert not any(
+        cell in ("right", "left", "top", "bottom")
+        for r in rows
+        for cell in (r["source_port"], r["target_port"])
+    )
+
+
+@pytest.mark.asyncio
+async def test_export_csv_port_precedence_and_empty_cells(admin_client):
+    """``*_port_name`` wins over the legacy ``sourcePort``; an edge with no chosen
+    port exports an empty cell even when it carries a handle id."""
+    canvas = {
+        "nodes": _editor_canvas()["nodes"],
+        "edges": [
+            {
+                "id": "e1",
+                "source": "n1",
+                "target": "n2",
+                "data": {
+                    "source_port_name": "eth1",
+                    "sourcePort": "legacy-src",
+                    "targetPort": "legacy-tgt",
+                },
+            },
+            {
+                "id": "e2",
+                "source": "n1",
+                "target": "n2",
+                "sourceHandle": "right",
+                "targetHandle": "left",
+                "data": {"layer": "L1"},
+            },
+        ],
+    }
+    create = await admin_client.post("/topologies", json={"name": "Precedence Lab"})
+    await admin_client.put(f"/topologies/{create.json()['id']}", json={"canvas_data": canvas})
+    resp = await admin_client.get("/topologies/export", params={"format": "csv"})
+    rows = list(csv.DictReader(io.StringIO(resp.text)))
+    assert [(r["source_port"], r["target_port"]) for r in rows] == [
+        ("eth1", "legacy-tgt"),
+        ("", ""),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_csv_export_import_preserves_ports_through_fork_resolve(admin_client):
+    """Export then import then fork resolve yields the same wires (issue #1006)."""
+    from app.services.fork_save_service import resolve_canvas_wiring
+
+    await _seed_connection()
+    await _seed_second_connection()
+    create = await admin_client.post("/topologies", json={"name": "Port Lab"})
+    tid = create.json()["id"]
+    await admin_client.put(f"/topologies/{tid}", json={"canvas_data": _editor_canvas()})
+
+    async with TestSessionLocal() as session:
+        before = await resolve_canvas_wiring(session, _editor_canvas())
+    before_wires = sorted((s.port_a, s.port_b) for s in before.specs)
+    assert before_wires == [("eth0", "eth0"), ("eth1", "eth1")]
+
+    csv_body = (await admin_client.get("/topologies/export", params={"format": "csv"})).text
+    # Rename the source so the import creates a fresh topology from the CSV alone.
+    await admin_client.put(f"/topologies/{tid}", json={"name": "Port Lab source"})
+    with _resolver({"switch-a": DEV_A, "switch-b": DEV_B}):
+        imported = await admin_client.post(
+            "/topologies/import",
+            params={"format": "csv"},
+            files={"file": ("t.csv", io.BytesIO(csv_body.encode()), "text/csv")},
+        )
+    assert imported.status_code == 200, imported.text
+    assert imported.json()["created"] == 1, imported.text
+
+    listing = (await admin_client.get("/topologies")).json()["items"]
+    new_id = next(t["id"] for t in listing if t["name"] == "Port Lab")
+    canvas = (await admin_client.get(f"/topologies/{new_id}")).json()["canvas_data"]
+    ports = [
+        (e["data"].get("source_port_name"), e["data"].get("target_port_name"))
+        for e in canvas["edges"]
+    ]
+    assert ports == [("eth1", "eth1"), ("eth0", "eth0")]
+    assert all("sourcePort" not in e["data"] for e in canvas["edges"])
+
+    async with TestSessionLocal() as session:
+        after = await resolve_canvas_wiring(session, canvas)
+    assert sorted((s.port_a, s.port_b) for s in after.specs) == before_wires
+
+
+def test_parse_csv_empty_port_cell_leaves_side_unconstrained():
+    from app.services.bulk_service import parse_csv_topologies
+
+    body = (
+        "topology_name,source_device,source_port,target_device,target_port,layer\n"
+        "Lab,switch-a,'=eth0,switch-b,,L1\n"
+    )
+    [record] = parse_csv_topologies(body.encode())
+    data = record["canvas"]["edges"][0]["data"]
+    # The neutralizing quote comes back off (issue #910) and the empty cell is absent.
+    assert data == {"layer": "L1", "source_port_name": "=eth0"}

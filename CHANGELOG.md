@@ -32,6 +32,10 @@
   recipe run rows across a full create and teardown cycle and a live test of a failed
   recipe login; the integration redelivery test's docstring now says it proves the
   corroboration gate (#1032).
+- Fixed: saving a topology as a template no longer turns network elements into device roles (a template stored that way reads and instantiates with the stray role ignored); a taken template name is a 409 from every template write route, never a 500; template names and descriptions take the topology bounds (#1005).
+- Fixed: topology CSV export writes the ports chosen in the editor instead of canvas handle names, and CSV import writes them back where the fork save reads them, so a round trip keeps port assignments (#1006).
+- Fixed: topology validation judges an edge's chosen ports by the fork save's rule and reports `no_port_path` for ports with no cable path, instead of calling valid an edge the save builds nothing for (#1007).
+- Fixed: a non-admin owner's fork read redacts hops on devices outside their visibility, and `GET /connections/{id}` answers a cable with no visible end with the same 404 as an unknown id (#1008).
 - Docs: corrected documentation, docstrings, and comments that the code contradicts, found while writing the specifications; ADR 0004 and ADR 0015 gain dated as-built addenda instead of rewritten decisions (#1010, #1025, #1031, #1041).
 - Docs: specifications under `docs/specs/`, one per feature area, each rule tied to the code that enforces it and the test that pins it. The first is `docs/specs/reservations.md`; `tests/unit/test_spec_references.py` fails when a specification names a path, symbol, test, link, or section that no longer exists.
 - Fixed: ending a reservation no longer leaks a dynamic instance whose create failed,

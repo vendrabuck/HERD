@@ -4,7 +4,7 @@ Moved out of ``routes/topologies.py``'s ``_run_topology_validation`` into two
 composable passes plus one orchestrator:
 
 - ``validate_canvas_edges``: the original edge-BFS pass (missing_device/no_path/
-  element classification against the physical Connection graph). Returns
+  no_port_path/element classification against the physical Connection graph). Returns
   ``invalid_edges`` and ``device_ids``. Never makes an inventory call.
 - ``validate_canvas_l3`` (``l3_validation.py``): the L3 routing-intent pass.
 - ``run_full_topology_validation``: composes both for the two ``/validate`` routes.
@@ -31,7 +31,12 @@ from dataclasses import dataclass, field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.topology import InvalidEdge, InvalidRoute, TopologyValidationResponse
-from app.services.canvas_nodes import classify_element_edge, node_to_device_map, node_to_element_map
+from app.services.canvas_nodes import (
+    classify_element_edge,
+    edge_port_constraints,
+    node_to_device_map,
+    node_to_element_map,
+)
 from app.services.fork_save_service import (
     resolve_canvas_wiring,
     touched_devices_from_specs,
@@ -39,7 +44,11 @@ from app.services.fork_save_service import (
 )
 from app.services.l3_intent import canvas_has_l3, walk_l3_nodes
 from app.services.l3_validation import route_causes_invalid, validate_canvas_l3
-from app.services.pathfind_service import build_adjacency_graph, find_all_shortest_paths_batch_async
+from app.services.pathfind_service import (
+    build_adjacency_graph,
+    find_all_shortest_paths_async,
+    find_all_shortest_paths_batch_async,
+)
 
 
 @dataclass(frozen=True)
@@ -160,6 +169,29 @@ async def validate_canvas_edges(canvas: dict | None, db: AsyncSession) -> EdgeVa
                 layer=layer,
                 reason="missing_device",
             )
+            continue
+
+        # Issue #1007: a port-constrained edge is judged exactly as the fork save
+        # judges it (resolve_canvas_wiring): the path must leave and arrive on the
+        # named ports, with NO fallback to the device pair. Otherwise validation
+        # would call valid an edge the save builds nothing for.
+        source_port, target_port = edge_port_constraints(edge)
+        if source_port is not None or target_port is not None:
+            constrained_paths = await find_all_shortest_paths_async(
+                graph,
+                source_device,
+                target_device,
+                source_port=source_port,
+                target_port=target_port,
+            )
+            if not constrained_paths:
+                edge_results[idx] = InvalidEdge(
+                    edge_id=edge_id,
+                    source_device_id=source_device,
+                    target_device_id=target_device,
+                    layer=layer,
+                    reason="no_port_path",
+                )
             continue
 
         pending.append((idx, edge_id, layer, source_device, target_device))

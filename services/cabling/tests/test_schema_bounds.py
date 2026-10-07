@@ -9,6 +9,12 @@ import uuid
 
 import pytest
 from app.schemas.connection import ConnectionCreate
+from app.schemas.template import (
+    InstantiateRequest,
+    TemplateCreate,
+    TemplateFromTopologyRequest,
+    TemplateUpdate,
+)
 from app.schemas.topology import TopologyClone, TopologyCreate, TopologyUpdate
 from pydantic import ValidationError
 
@@ -83,3 +89,36 @@ def test_connection_notes_over_cap_rejected():
             port_b="Ethernet2",
             notes="n" * 2001,
         )
+
+
+# Topology templates take the topology bounds (issue #1005).
+@pytest.mark.parametrize("model", [TemplateCreate, TemplateFromTopologyRequest])
+def test_template_name_bounds(model):
+    with pytest.raises(ValidationError):
+        model(name="")
+    with pytest.raises(ValidationError):
+        model(name="x" * 101)
+    model(name="x" * 100)
+
+
+@pytest.mark.parametrize("model", [TemplateCreate, TemplateFromTopologyRequest, TemplateUpdate])
+def test_template_description_bounds(model):
+    model(name="ok", description="d" * 2000)
+    with pytest.raises(ValidationError):
+        model(name="ok", description="d" * 2001)
+
+
+def test_template_update_name_bounds():
+    TemplateUpdate(name=None)
+    with pytest.raises(ValidationError):
+        TemplateUpdate(name="")
+    with pytest.raises(ValidationError):
+        TemplateUpdate(name="x" * 101)
+
+
+def test_instantiate_name_bounds():
+    with pytest.raises(ValidationError):
+        InstantiateRequest(name="", role_assignments={})
+    with pytest.raises(ValidationError):
+        InstantiateRequest(name="x" * 101, role_assignments={})
+    InstantiateRequest(name="x" * 100, role_assignments={})

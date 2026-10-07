@@ -216,6 +216,7 @@ async def test_worst_case_virtual_router_round_trips_through_save_and_internal_g
                 detail = await get_fork_internal(
                     reservation_id=reservation_id,
                     x_internal_token="route-key-width-test-token",
+                    authorization=None,
                     db=db,
                 )
 

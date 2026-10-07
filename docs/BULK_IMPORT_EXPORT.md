@@ -219,7 +219,14 @@ import, exactly as the interactive edit path behaves.
 
 CSV is a flat edge list with the column order `topology_name, source_device,
 source_port, target_device, target_port, layer`. Each row is one canvas edge,
-with the endpoint devices named. CSV is a convenience view of the wiring graph:
+with the endpoint devices named. The port cells carry the ports chosen for that
+edge in the editor (`data.source_port_name` and `data.target_port_name`, the keys
+the fork save honors); a canvas saved before those keys existed falls back to the
+legacy `data.sourcePort` and `data.targetPort`, and an edge with no chosen port
+exports empty cells. Import writes a non-empty port cell back to
+`source_port_name` or `target_port_name` and leaves an empty cell's side
+unconstrained, so exporting and re-importing a topology keeps its port
+assignments (issue #1006). CSV is a convenience view of the wiring graph:
 it does not carry isolated nodes (a device node with no edges), so use JSON when
 a topology has unconnected devices.
 

@@ -894,6 +894,7 @@ async def _cabling_fork_call(
     json_body: dict | None = None,
     *,
     timeout: float = 10.0,
+    on_behalf_of: str | None = None,
 ) -> httpx.Response:
     """Issue one X-Internal-Token call to a cabling fork endpoint (issue #25 P3a).
 
@@ -913,6 +914,11 @@ async def _cabling_fork_call(
     fan out to inventory. The save forward is the one caller that needs more
     (issue #759): it passes `_FORK_SAVE_TIMEOUT_SECONDS` explicitly, matching
     `_VALIDATE_TOPOLOGY_TIMEOUT_SECONDS`'s headroom over cabling's L3 pass budget.
+
+    `on_behalf_of` (issue #1008) is the acting user's ``Bearer <token>``, sent beside
+    the internal token on the user-facing fork READ only, so cabling redacts hops on
+    devices outside that user's visibility. Every other caller leaves it unset and
+    gets the unredacted service view.
     """
     try:
         return await call_service(
@@ -926,6 +932,7 @@ async def _cabling_fork_call(
                 missing_token_message=(
                     "internal_api_token not configured; cannot reach cabling forks"
                 ),
+                on_behalf_of=on_behalf_of,
             ),
         )
     except httpx.HTTPError as exc:

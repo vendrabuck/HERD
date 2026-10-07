@@ -147,6 +147,21 @@ def records_to_json(records: list[dict[str, Any]]) -> str:
     return json.dumps({"resource": "topologies", "version": 1, "items": records}, indent=2)
 
 
+def _edge_port_name(edge_data: dict[str, Any], side: str) -> str:
+    """The port name an edge's ``side`` ("source" or "target") is pinned to (issue #1006).
+
+    Precedence: ``<side>_port_name`` (what the editor writes and the fork-save resolver
+    honors, issue #531), else the legacy ``<side>Port`` that pre-#1006 CSV imports wrote,
+    else empty. The React Flow ``<side>Handle`` is a handle id (``top``, ``right``), never
+    a port name, so it is never read.
+    """
+    for key in (f"{side}_port_name", f"{side}Port"):
+        value = edge_data.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
 def topology_to_csv_rows(topology: Topology) -> list[dict[str, Any]]:
     """Flatten a topology's canvas edges into CSV rows keyed by device names."""
     canvas = topology.canvas_data or {}
@@ -173,13 +188,9 @@ def topology_to_csv_rows(topology: Topology) -> list[dict[str, Any]]:
                 # treated as a safe enumeration.
                 "topology_name": csv_safe_cell(topology.name),
                 "source_device": csv_safe_cell(node_to_name.get(edge.get("source"), "")),
-                "source_port": csv_safe_cell(
-                    edge_data.get("sourcePort") or edge.get("sourceHandle") or ""
-                ),
+                "source_port": csv_safe_cell(_edge_port_name(edge_data, "source")),
                 "target_device": csv_safe_cell(node_to_name.get(edge.get("target"), "")),
-                "target_port": csv_safe_cell(
-                    edge_data.get("targetPort") or edge.get("targetHandle") or ""
-                ),
+                "target_port": csv_safe_cell(_edge_port_name(edge_data, "target")),
                 "layer": csv_safe_cell(edge_data.get("layer") or ""),
             }
         )
@@ -247,18 +258,25 @@ def parse_csv_topologies(raw: bytes) -> list[dict[str, Any]]:
                     "data": {"device": {"name": dev}, "label": dev},
                 }
         if src and tgt:
+            edge_data: dict[str, Any] = {
+                "layer": (csv_unsafe_cell(row.get("layer")) or "").strip() or None,
+            }
+            # Port cells land on the keys the editor writes and the fork-save
+            # resolver reads (issue #1006); an empty cell leaves the side
+            # unconstrained, the same as an editor edge with no chosen port.
+            for column, key in (
+                ("source_port", "source_port_name"),
+                ("target_port", "target_port_name"),
+            ):
+                port = (csv_unsafe_cell(row.get(column)) or "").strip()
+                if port:
+                    edge_data[key] = port
             bucket["edges"].append(
                 {
                     "id": f"edge-{len(bucket['edges'])}",
                     "source": f"node-{src}",
                     "target": f"node-{tgt}",
-                    "data": {
-                        "layer": (csv_unsafe_cell(row.get("layer")) or "").strip() or None,
-                        "sourcePort": (csv_unsafe_cell(row.get("source_port")) or "").strip()
-                        or None,
-                        "targetPort": (csv_unsafe_cell(row.get("target_port")) or "").strip()
-                        or None,
-                    },
+                    "data": edge_data,
                 }
             )
     records: list[dict[str, Any]] = []

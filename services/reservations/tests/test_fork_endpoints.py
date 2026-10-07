@@ -88,7 +88,8 @@ async def test_get_fork_owner_forwards_200():
             resp = await ac.get(f"/{rid}/fork")
     assert resp.status_code == 200
     assert resp.json() == fork_body
-    call.assert_awaited_once_with("GET", f"/internal/forks/{rid}")
+    # Issue #1008: the caller's own bearer rides along so cabling redacts hidden hops.
+    call.assert_awaited_once_with("GET", f"/internal/forks/{rid}", on_behalf_of="Bearer fake-token")
 
 
 @pytest.mark.asyncio
@@ -182,6 +183,41 @@ async def test_get_fork_lazy_creates_with_no_parent_topology():
             resp = await ac.get(f"/{rid}/fork")
     assert resp.status_code == 200
     lazy.assert_awaited_once_with(rid, None, OWNER_ID, ANY)
+
+
+@pytest.mark.asyncio
+async def test_get_fork_lazy_create_rereads_on_behalf_of_caller():
+    """Issue #1008: both fork reads (the miss and the re-read after lazy-create)
+    carry the caller's bearer; the lazy-create itself is a plain service call."""
+    rid = await _insert_reservation()
+    call = AsyncMock(side_effect=[_resp(404), _resp(200, {"id": "f"})])
+    with (
+        patch("app.routers.reservations._cabling_fork_call", new=call),
+        patch("app.routers.reservations._lazy_create_reservation_fork", new=AsyncMock()),
+    ):
+        async with _client_as(OWNER_ID) as ac:
+            resp = await ac.get(f"/{rid}/fork")
+    assert resp.status_code == 200
+    assert [c.kwargs for c in call.await_args_list] == [
+        {"on_behalf_of": "Bearer fake-token"},
+        {"on_behalf_of": "Bearer fake-token"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_fork_relays_cabling_visibility_503():
+    """Cabling's fail-closed visibility 503 reaches the owner as a 503 with its
+    wording, never as an unredacted body."""
+    rid = await _insert_reservation()
+    detail = "Could not verify device visibility; the fork was not returned. Retry the request."
+    with patch(
+        "app.routers.reservations._cabling_fork_call",
+        new=AsyncMock(return_value=_resp(503, {"detail": detail})),
+    ):
+        async with _client_as(OWNER_ID) as ac:
+            resp = await ac.get(f"/{rid}/fork")
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": detail}
 
 
 @pytest.mark.asyncio
@@ -480,3 +516,22 @@ async def test_save_stage_wiring_changed_failure_still_returns_200():
     assert resp.json() == result
     staged.assert_awaited_once()
     rollback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cabling_fork_call_sends_on_behalf_of_beside_internal_token(monkeypatch):
+    """Issue #1008: the transport puts the forwarded bearer on InternalTokenAuth and
+    leaves it unset for every other caller."""
+    seen = []
+
+    async def fake_call_service(*args, **kwargs):
+        seen.append(kwargs["auth"])
+        return _resp(200, {})
+
+    monkeypatch.setattr(reservation_service, "call_service", fake_call_service)
+    monkeypatch.setattr(reservation_service.settings, "internal_api_token", "tok")
+    await reservation_service._cabling_fork_call(
+        "GET", "/internal/forks/x", on_behalf_of="Bearer u"
+    )
+    await reservation_service._cabling_fork_call("POST", "/internal/forks/x/archive")
+    assert [(a.token, a.on_behalf_of) for a in seen] == [("tok", "Bearer u"), ("tok", None)]

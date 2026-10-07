@@ -284,10 +284,14 @@ run on.
   the list is ordered newest first. \
   Enforced in: `services/cabling/app/services/connection_service.py` (`list_connections`) \
   Pinned by: `services/cabling/tests/test_connections.py` (`test_filter_connections_by_device_id`, `test_list_connections_pagination`)
-- **TOPO-CONN-9.** `GET /connections/{id}` answers any signed-in user with the full row,
-  with no visibility filter. Known gap, see #1008. \
-  Enforced in: `services/cabling/app/routes/connections.py` (`get_connection_endpoint`) \
-  Pinned by: `services/cabling/tests/test_connections.py` (`test_user_can_get_connection`, `test_get_connection_not_found`)
+- **TOPO-CONN-9.** `GET /connections/{id}` follows the list's visibility rule
+  (TOPO-CONN-7): an admin reads any row; a non-admin reads the full row when at least one
+  end is visible, and a row with no visible end answers the same 404 `Connection not
+  found` an unknown id gets (issue #1008). Visibility is resolved first, so an
+  unanswerable lookup is 503 `Could not verify device visibility; the connection was
+  not returned. Retry the request.` for every id. \
+  Enforced in: `services/cabling/app/routes/connections.py` (`get_connection_endpoint`); `services/cabling/app/services/visible_devices.py` (`resolve_caller_visibility`) \
+  Pinned by: `services/cabling/tests/test_connections.py` (`test_user_can_get_connection`, `test_get_connection_not_found`, `test_user_get_connection_with_no_visible_end_is_404`, `test_user_get_connection_visibility_unavailable_is_503`, `test_admin_get_connection_never_calls_inventory`)
 - **TOPO-CONN-10.** Deleting a connection is admin only; an unknown id is 404. \
   Enforced in: `services/cabling/app/routes/connections.py` (`delete_connection_endpoint`) \
   Pinned by: `services/cabling/tests/test_connections.py` (`test_delete_connection`, `test_user_cannot_delete`, `test_delete_connection_not_found`)
@@ -686,12 +690,15 @@ PUT and restore (TOPO-FORK-11, TOPO-FORK-12).
   `no_path`; one with a path is valid. \
   Enforced in: `services/cabling/app/services/topology_validation.py` (`validate_canvas_edges`) \
   Pinned by: `services/cabling/tests/test_topologies.py` (`test_validate_topology_reachable_edge`, `test_validate_topology_unreachable_edge`)
-- **TOPO-VAL-5.** The edge pass judges the device pair only: it does not read the edge's
-  `source_port_name` or `target_port_name`, so an edge whose named ports have no path is
-  reported valid when any path joins the two devices. Fork wiring does honor the ports
-  and builds nothing for such an edge (TOPO-FORK-18). Known gap, see #1007. \
-  Enforced in: `services/cabling/app/services/topology_validation.py` (`validate_canvas_edges`) \
-  Pinned by: none
+- **TOPO-VAL-5.** The edge pass judges a port-constrained edge by the fork save's rule
+  (TOPO-FORK-17, TOPO-FORK-18): when the edge names `source_port_name` or
+  `target_port_name`, the path must leave and arrive on those ports, with no fallback to
+  the device pair, and an edge no such path satisfies is `no_port_path`. Both judges read
+  the ports through one helper, so validation never calls valid an edge the save builds
+  nothing for (issue #1007). This applies wherever the edge pass runs: both validate
+  routes, reservation create, import, and the fork canvas PUT and restore. \
+  Enforced in: `services/cabling/app/services/topology_validation.py` (`validate_canvas_edges`); `services/cabling/app/services/canvas_nodes.py` (`edge_port_constraints`) \
+  Pinned by: `services/cabling/tests/test_forks.py` (`test_validator_and_save_judge_port_constrained_edges_alike`); `services/cabling/tests/test_topologies.py` (`test_validate_topology_reports_uncabled_chosen_ports`)
 - **TOPO-VAL-6.** `invalid_edges` lists problems in canvas edge order, each with
   `edge_id`, both device ids when known, the edge's `layer`, and `reason`. \
   Enforced in: `services/cabling/app/services/topology_validation.py` (`validate_canvas_edges`); `services/cabling/app/schemas/topology.py` (`InvalidEdge`) \
@@ -955,7 +962,9 @@ RES-FORK-17). Fork status, versions, and the restore marker are section 4.
   Pinned by: `services/cabling/tests/test_forks.py` (`test_save_fork_two_same_pair_edges_with_ports_resolve_to_two_wires`, `test_save_fork_two_same_pair_edges_without_ports_resolve_to_one_wire`, `test_save_fork_empty_string_port_names_treated_as_absent`, `test_save_fork_distinct_source_ports_share_common_final_hop`); `tests/integration/test_fork_save_port_resolution.py` (`test_activation_fork_resolves_two_port_distinct_edges_to_two_connections`)
 - **TOPO-FORK-18.** An edge with no path, or with port constraints no path satisfies,
   contributes no hop and never falls back to an unconstrained path; the save or create
-  still succeeds, and the answer does not name the skipped edge. Known gap, see #1007. \
+  still succeeds, and the answer does not name the skipped edge. Validation reports
+  such an edge before the save (`no_path` or `no_port_path`, TOPO-VAL-5); the save's own
+  answer naming it is still open, see #1007. \
   Enforced in: `services/cabling/app/services/fork_save_service.py` (`resolve_canvas_wiring`) \
   Pinned by: `services/cabling/tests/test_forks.py` (`test_save_fork_unresolvable_port_pair_does_not_fall_back`, `test_create_fork_skips_unreachable_edge`)
 - **TOPO-FORK-19.** A wire's identity is its two `(device, port)` endpoints in canonical
@@ -988,13 +997,18 @@ RES-FORK-17). Fork status, versions, and the restore marker are section 4.
   inventory call. \
   Enforced in: `services/cabling/app/routes/forks.py` (`save_fork_internal`); `services/cabling/app/services/fork_save_service.py` (`save_fork`) \
   Pinned by: `services/cabling/tests/test_fork_l3_routes.py` (`test_save_route_resolves_canvas_wiring_exactly_once`, `test_save_fork_l3_reconcile_reapplies_on_version_race_retry`); `services/cabling/tests/test_forks.py` (`test_save_fork_retries_on_version_conflict`)
-- **TOPO-FORK-25.** The fork read applies no device visibility filter: every connection
-  carries its device ids and port names as stored, transit hops on devices the
-  reservation's owner cannot see included, and reservations relays that body unchanged
-  to the owner. Pathfind redacts the same hops for a non-admin (TOPO-PATH-9). Known gap,
-  see #1008. \
-  Enforced in: `services/cabling/app/routes/forks.py` (`get_fork_internal`); `services/reservations/app/routers/reservations.py` (`get_reservation_fork`, `_relay_cabling_fork_response`) \
-  Pinned by: none
+- **TOPO-FORK-25.** The user-facing fork read is redacted to the caller's device
+  visibility (issue #1008). Reservations forwards the caller's bearer beside the internal
+  token (`on_behalf_of`); for a non-admin, cabling resolves visibility through
+  `resolve_caller_visibility` and every connection end on a hidden device comes back with
+  its device id and port null, the row's `physical_connection_id` null, and `hidden`
+  true, the redaction pathfind applies to a hidden transit hop (TOPO-PATH-9). An admin is
+  unfiltered; an unanswerable lookup is 503 `Could not verify device visibility; the fork
+  was not returned. Retry the request.`, relayed by reservations; a forwarded bearer that
+  does not verify is 401. A service caller that forwards no bearer (execution,
+  ai-orchestrator) gets every row as stored. \
+  Enforced in: `services/cabling/app/routes/forks.py` (`get_fork_internal`, `_redact_fork_connection`, `_decode_on_behalf_of`); `services/reservations/app/routers/reservations.py` (`get_reservation_fork`); `services/reservations/app/services/reservation_service.py` (`_cabling_fork_call`) \
+  Pinned by: `services/cabling/tests/test_forks.py` (`test_get_fork_on_behalf_of_non_admin_redacts_hidden_transit`, `test_get_fork_on_behalf_of_admin_and_service_callers_unredacted`, `test_get_fork_on_behalf_of_visibility_unavailable_is_503`, `test_get_fork_on_behalf_of_bad_bearer_is_401`); `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_owner_forwards_200`, `test_get_fork_lazy_create_rereads_on_behalf_of_caller`, `test_get_fork_relays_cabling_visibility_503`, `test_cabling_fork_call_sends_on_behalf_of_beside_internal_token`)
 - **TOPO-CLAIM-1.** A wire to build whose `(device, port)` endpoint is already in a wire
   of another `ACTIVE` fork refuses the save or create with 409
   `{message, conflicts: [{reservation_id, device_id, port}]}`, conflicts sorted;
@@ -1079,29 +1093,34 @@ editor's Save as Template; the seven `/templates` routes in section 5.
   is 409 `Template name '<name>' already exists`. \
   Enforced in: `services/cabling/app/routes/templates.py` (`create_template`); `services/cabling/app/models/template.py` (`TopologyTemplate`) \
   Pinned by: `services/cabling/tests/test_templates.py` (`test_create_blank_template`, `test_unique_template_name`); `services/cabling/tests/test_route_handlers_direct.py` (`test_template_create_duplicate_name_409`)
-- **TOPO-TMPL-3.** Template `name` and `description` carry no length bound in the request
-  schema; an empty name is accepted. Known gap, see #1005. \
-  Enforced in: `services/cabling/app/schemas/template.py` (`TemplateCreate`, `TemplateUpdate`, `TemplateFromTopologyRequest`) \
-  Pinned by: none
+- **TOPO-TMPL-3.** Template `name` takes the topology name bound (1 to 100 characters)
+  and `description` the topology description bound (2000 characters) on create, update,
+  and from-topology; the instantiate `name` names a topology and takes the same name
+  bound. A value outside the bound is 422. \
+  Enforced in: `services/cabling/app/schemas/template.py` (`TemplateCreate`, `TemplateUpdate`, `TemplateFromTopologyRequest`, `InstantiateRequest`) \
+  Pinned by: `services/cabling/tests/test_schema_bounds.py` (`test_template_name_bounds`, `test_template_description_bounds`, `test_template_update_name_bounds`, `test_instantiate_name_bounds`); `services/cabling/tests/test_templates.py` (`test_template_name_bounds_are_422_on_every_write_route`, `test_template_name_at_cap_accepted`)
 - **TOPO-TMPL-4.** Updating or deleting a template is creator or admin (403 otherwise); an
   update changes only the fields sent and a duplicate name is 409. \
   Enforced in: `services/cabling/app/routes/templates.py` (`update_template`, `delete_template`, `_can_manage`) \
   Pinned by: `services/cabling/tests/test_templates.py` (`test_update_template_owner`, `test_update_template_other_user_forbidden`, `test_update_template_admin_can_edit`, `test_delete_template_owner`, `test_delete_template_other_user_forbidden`); `services/cabling/tests/test_route_handlers_direct.py` (`test_template_update_duplicate_name_409`)
-- **TOPO-TMPL-5.** Any signed-in user may make a template from any topology: every node's
-  `data.device` becomes `{role}`, the role being the device's `template_name` (else the
+- **TOPO-TMPL-5.** Any signed-in user may make a template from any topology: every device
+  node's `data.device` becomes `{role}`, the role being the device's `template_name` (else the
   node label, else `device`) lowercased with spaces as hyphens plus a per-name counter;
   edges are copied unchanged, and a null canvas gives an empty template. \
   Enforced in: `services/cabling/app/routes/templates.py` (`create_template_from_topology`, `_extract_role_template`) \
   Pinned by: `services/cabling/tests/test_templates.py` (`test_from_topology_extracts_roles`, `test_from_topology_not_found`); `services/cabling/tests/test_route_handlers_direct.py` (`test_template_from_topology_empty_canvas`)
-- **TOPO-TMPL-6.** That role rewrite applies to every node, including network element
-  nodes, which come out carrying both `data.element` and a `data.device.role`. Known
-  gap, see #1005. \
-  Enforced in: `services/cabling/app/routes/templates.py` (`_extract_role_template`) \
-  Pinned by: none
-- **TOPO-TMPL-7.** Making a template from a topology under a name that already exists is
-  not caught: the unique constraint's error escapes as a 500. Known gap, see #1005. \
-  Enforced in: `services/cabling/app/routes/templates.py` (`create_template_from_topology`) \
-  Pinned by: none
+- **TOPO-TMPL-6.** Only device nodes become roles (`is_device_node`: an object under
+  `data.device` on a node that is not a network element). Network element nodes and every
+  other node pass through unchanged, so element attachments survive the round trip. A
+  template stored before #1005 may carry a role on an element node: template reads and
+  writes drop that `data.device`, and instantiate neither demands nor assigns a device
+  for it, so no data migration is needed. \
+  Enforced in: `services/cabling/app/routes/templates.py` (`_extract_role_template`, `_instantiate_canvas`, `_normalize_template_canvas`); `services/cabling/app/services/canvas_nodes.py` (`is_device_node`, `is_element_node`) \
+  Pinned by: `services/cabling/tests/test_templates.py` (`test_element_survives_save_as_template_and_instantiate`, `test_legacy_template_role_on_element_is_ignored`)
+- **TOPO-TMPL-7.** Every template write route (create, update, from-topology) answers a
+  taken name with the same 409 `Template name '<name>' already exists`. \
+  Enforced in: `services/cabling/app/routes/templates.py` (`create_template_from_topology`, `_duplicate_name`) \
+  Pinned by: `services/cabling/tests/test_templates.py` (`test_duplicate_name_is_409_from_every_write_route`)
 - **TOPO-TMPL-8.** Instantiate requires an assignment for every role on the canvas (422
   `missing assignment for role '<role>'` otherwise), writes the assigned id into each
   role node's `data.device.id`, leaves nodes without a role unchanged, and creates a
@@ -1142,14 +1161,14 @@ is the user guide.
   names taken from `data.device.name`; nodes with no edge are not exported. \
   Enforced in: `services/cabling/app/services/bulk_service.py` (`records_to_csv`, `topology_to_csv_rows`, `TOPOLOGY_CSV_COLUMNS`) \
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_export_csv_flattens_edges`); `services/cabling/tests/test_route_handlers_direct.py` (`test_records_to_csv_null_canvas_emits_header_only`)
-- **TOPO-BULK-4.** CSV port cells read `data.sourcePort` and `data.targetPort`, else the
-  edge's `sourceHandle` and `targetHandle`; the editor stores port names in
-  `source_port_name` and `target_port_name`, so an editor-drawn edge exports its React
-  Flow handle id (`top`, `right`, `bottom`, `left`) as its port. CSV import writes the
-  port cells into `data.sourcePort` and `data.targetPort`, which the fork resolver does
-  not read (TOPO-FORK-17). Known gap, see #1006. \
-  Enforced in: `services/cabling/app/services/bulk_service.py` (`topology_to_csv_rows`, `parse_csv_topologies`) \
-  Pinned by: none
+- **TOPO-BULK-4.** CSV port cells read the edge's `data.source_port_name` and
+  `data.target_port_name` (what the editor writes and the fork resolver honors,
+  TOPO-FORK-17), else the legacy `data.sourcePort` and `data.targetPort`, else empty; the
+  React Flow `sourceHandle` and `targetHandle` are handle ids, never read. CSV import
+  writes a non-empty port cell to `source_port_name` or `target_port_name` and leaves an
+  empty cell's side unconstrained, so export then import keeps every chosen port. \
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`topology_to_csv_rows`, `_edge_port_name`, `parse_csv_topologies`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_export_csv_writes_editor_port_names_not_handles`, `test_export_csv_port_precedence_and_empty_cells`, `test_csv_export_import_preserves_ports_through_fork_resolve`, `test_parse_csv_empty_port_cell_leaves_side_unconstrained`)
 - **TOPO-BULK-5.** Every CSV text cell is written through `csv_safe_cell` and read back
   through `csv_unsafe_cell`, so a formula-led name is neutralized on export and
   round-trips exactly. \
@@ -1565,7 +1584,7 @@ other error carries `detail` as a string or the object shown.
 | 403 | `Not authorized to validate this topology` | user validate by a non-creator non-admin | TOPO-VAL-9 |
 | 403 | `Not authorized to modify this topology` | version restore by a non-creator non-admin | TOPO-VER-4 |
 | 403 | `Not authorized to modify this template` or `Not authorized to delete this template` | template update or delete by a non-creator non-admin | TOPO-TMPL-4 |
-| 404 | `Connection not found` | read or delete an unknown connection | TOPO-CONN-9, TOPO-CONN-10 |
+| 404 | `Connection not found` | read or delete an unknown connection; a non-admin's read of a connection with no visible end | TOPO-CONN-9, TOPO-CONN-10 |
 | 404 | `Device not found` | a non-admin's pathfind naming a hidden or unknown device | TOPO-PATH-8 |
 | 404 | `Topology not found` | any topology, version, validate, clone, or from-topology route on an unknown topology | TOPO-CRUD-2, TOPO-EDIT-1, TOPO-DEL-1, TOPO-VER-1, TOPO-VAL-9, TOPO-CLONE-1, TOPO-TMPL-5 |
 | 404 | `Version not found` | a topology version of another topology, or a fork version of another fork | TOPO-VER-2, TOPO-FORK-10 |
@@ -1574,7 +1593,7 @@ other error carries `detail` as a string or the object shown.
 | 409 | `{message, reservations: [{id, status, end_time}]}` | topology PUT blocked by another user's live reservation | TOPO-EDIT-4 |
 | 409 | `{message, reservations: [...]}` with message `Topology has active reservations; restore blocked` | topology version restore while any live reservation references it | TOPO-VER-5 |
 | 409 | `{"error": "topology_in_use", "reservation_ids": [...]}` | delete while a live reservation references the topology | TOPO-DEL-2 |
-| 409 | `Template name '<name>' already exists` | template create or update with a taken name | TOPO-TMPL-2, TOPO-TMPL-4 |
+| 409 | `Template name '<name>' already exists` | template create, update, or from-topology with a taken name | TOPO-TMPL-2, TOPO-TMPL-4, TOPO-TMPL-7 |
 | 409 | `Fork is archived and cannot be edited` | canvas PUT, save, restore, or prune on an archived fork | TOPO-FSTATE-3, TOPO-FSTATE-4 |
 | 409 | `{"error": "fork_device_not_member", "device_ids": [...]}` | fork create or save naming a device outside the reservation | TOPO-FORK-3, TOPO-FORK-13 |
 | 409 | `{message, conflicts: [{reservation_id, device_id, port}]}` | fork create or save claiming a port another active fork holds | TOPO-CLAIM-1 |
@@ -1587,8 +1606,7 @@ other error carries `detail` as a string or the object shown.
 | 422 | `{"error": "l3_intent_malformed", "node_id", "message"}` | fork save with malformed routing intent | TOPO-FORK-14 |
 | 422 | validation list | a schema bound: name lengths, bulk item count, pair count, unknown sort or owner value, missing `member_device_ids`, missing internal token header, devices batch size | TOPO-CONN-2, TOPO-CONN-12, TOPO-PATH-7, TOPO-LIST-4, TOPO-CRUD-1, TOPO-FORK-3, TOPO-FORK-13, TOPO-DEVB-1 |
 | 500 | `internal: missing Authorization header while resolving device visibility` | a non-admin request reaching a visibility-filtered route with no header (only a test harness does this) | TOPO-VIS-1 |
-| 500 | unhandled | template from-topology under a taken name | TOPO-TMPL-7 |
-| 503 | the route's own visibility wording, for example `Could not verify device visibility; connections were not returned. Retry the request.` | a non-admin's visibility lookup failed | TOPO-CONN-7, TOPO-PATH-11, TOPO-VAL-11, TOPO-BULK-11 |
+| 503 | the route's own visibility wording, for example `Could not verify device visibility; connections were not returned. Retry the request.` | a non-admin's visibility lookup failed | TOPO-CONN-7, TOPO-CONN-9, TOPO-FORK-25, TOPO-PATH-11, TOPO-VAL-11, TOPO-BULK-11 |
 | 503 | `Could not verify device-group membership for one or more devices in this batch; no connections were created. Retry the request.` | bulk create with an unverifiable device | TOPO-BOUND-4 |
 | 503 | `Could not verify topology is not in use` | delete guard could not read reservations | TOPO-DEL-3 |
 | 503 | `{"error": "l3_config_unavailable"}` | the routing pass could not read inventory in time | TOPO-L3-11, TOPO-BULK-13 |
@@ -1659,18 +1677,8 @@ TOPO-BULK-4.
   two device nodes, as in the seeded "BROKEN - Half-Wired Chain" topology.
 - #985 (TOPO-UILIST-3): on the topologies page, a filter change made before the saved
   preferences load saves an empty search over the saved one.
-- #1006 (TOPO-BULK-4): CSV export fills the port columns from a legacy field or the
-  canvas handle name, not the port names the editor stores, and CSV import writes a
-  field the fork resolver does not read.
-- #1005 (TOPO-TMPL-6, TOPO-TMPL-7, TOPO-TMPL-3): making a template from a topology
-  rewrites network element nodes as device roles; the same route answers 500 for a
-  taken name; template name and description have no bounds.
-- #1007 (TOPO-VAL-5, TOPO-FORK-18): validation judges the device pair only, while the
-  fork save honors per-edge ports and skips an unresolvable constrained edge without
-  reporting it, so validation can call valid an edge the save builds nothing for.
-- #1008 (TOPO-CONN-9, TOPO-FORK-25): the single connection read has no visibility
-  filter, and the fork read returns hops on devices outside a non-admin owner's
-  visibility unredacted, while pathfind redacts the same hops (TOPO-PATH-9).
+- #1007 (TOPO-FORK-18): validation now reports an unresolvable port-constrained edge,
+  but the fork save's own answer still does not name a skipped constrained edge.
 
 ### Limits by decision
 
@@ -1715,16 +1723,10 @@ TOPO-BULK-4.
 ### Rules with no test
 
 - TOPO-CONN-11: deleting a connection that a live fork's wiring uses.
-- TOPO-VAL-5: the edge pass ignoring port names.
 - TOPO-VAL-14: `l3=0` on the internal validate skipping the routing pass (reservations
   pins that it sends `l3=0`; nothing in cabling pins the skip).
 - TOPO-STRIP-4: a PUT differing only in a non-allowlisted device key appending no
   version.
-- TOPO-FORK-25: the fork read returning hidden transit hops unredacted.
-- TOPO-TMPL-3: template names and descriptions unbounded.
-- TOPO-TMPL-6: element nodes given a role by from-topology.
-- TOPO-TMPL-7: from-topology under a taken name.
 - TOPO-TMPL-9: instantiate not checking assigned device ids.
-- TOPO-BULK-4: CSV export of editor-drawn port names.
 - TOPO-UILIST-3: the empty search saved over the stored one (issue #985).
 - TOPO-UI-2: the device-less node crash (issue #989 asks for the test).

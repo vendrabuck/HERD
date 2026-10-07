@@ -98,6 +98,11 @@ class InvalidEdge(BaseModel):
       a network element.
     - ``no_path``: both endpoints are known devices, but the cabling graph has no
       physical path between them.
+    - ``no_port_path`` (issue #1007): both endpoints are known devices and the edge
+      names a port on one or both sides (``source_port_name``/``target_port_name``),
+      but no physical path leaves and arrives on those ports. The fork save builds
+      nothing for such an edge and never falls back to another port pair (issue #531),
+      so validation reports it by the same rule.
     - ``element_to_element`` (ADR 0012 phase 1, issue #22): both endpoints are network
       element nodes. Two elements have no device and no port between them.
     - ``element_edge_no_port`` (ADR 0012 phase 1): one endpoint is a network element
