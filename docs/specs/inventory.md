@@ -610,9 +610,10 @@ filter reads the first 500 device templates.
   Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`falls back to All for a stale saved status, topology, or template and never sends them`, `a stale saved template is dropped from the next write while other fields persist`)
 - **INV-LIST-9.** A saved search applies at once, never through the debounce; typing is
   debounced 300 ms before it is applied and saved. A filter change made before the
-  preferences finish loading saves an empty search. Known gap, see #985. \
-  Enforced in: `frontend/src/pages/InventoryPage.tsx` (`InventoryPage`) \
-  Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`a saved search that loads after mount applies at once and survives a filter change`, `typing after the load still debounces, then applies and persists the typed value`, `debounces user input into the query and persists it as a saved filter`)
+  preferences finish loading is held until they arrive and then saved merged over the
+  loaded filter, so it never saves an empty search over the saved one (issue #985). \
+  Enforced in: `frontend/src/pages/InventoryPage.tsx` (`InventoryPage`); `frontend/src/stores/preferencesStore.ts` (`usePreferencesStore`, `mergePreLoadFilter`) \
+  Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`a filter change made before the preferences load keeps the saved search (issue #985)`, `a saved search that loads after mount applies at once and survives a filter change`, `typing after the load still debounces, then applies and persists the typed value`, `debounces user input into the query and persists it as a saved filter`)
 - **INV-LIST-10.** Clear filters resets the search and every filter, the request, and
   the saved state; an empty filtered result shows a second Clear filters control. \
   Enforced in: `frontend/src/pages/InventoryPage.tsx` (`InventoryPage`) \
@@ -1390,8 +1391,6 @@ INV-PORT-6, by a throwaway script against the service on SQLite with foreign key
 
 ### Open defects
 
-- #985 (INV-LIST-9): a filter change made before the preferences load saves an empty
-  search over the saved one.
 - #1017 (INV-BULK-18): a dry run skips the create and update service calls, so the
   checks they own (unknown field keys, the template-driver connection-type rule,
   hardware identity) do not run, and the commit can reject a row the dry run accepted.

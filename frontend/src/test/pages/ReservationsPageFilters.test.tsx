@@ -107,6 +107,9 @@ beforeEach(() => {
   patchPreferencesMock.mockReset();
   patchPreferencesMock.mockResolvedValue({});
   usePreferencesStore.getState().clear();
+  // These tests model a store whose preferences GET has resolved; a write
+  // made before the load is held until it settles (issue #985).
+  usePreferencesStore.setState({ loaded: true });
 });
 
 describe("ReservationsPage filters (issue #959)", () => {
