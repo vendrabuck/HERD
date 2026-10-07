@@ -829,9 +829,16 @@ async def get_effective_pinned_routes(
 
     The provision path calls this FIRST so a redelivery or a retry re-provisions the
     ORIGINAL pinned set, never a re-derived one (issue #20), even when the prior attempt
-    left the row FAILED rather than ACTIVE. Returns None only when no non-RELEASED row
-    exists (a genuinely fresh provision), whereupon the caller reads the switch's latest
-    config version to establish the pin.
+    left the row FAILED rather than ACTIVE. Returns None when no non-RELEASED row exists
+    (a genuinely fresh provision), whereupon the caller reads the switch's latest config
+    version to establish the pin.
+
+    Also None when the row records no routes (issue #1004). A provision never pins an
+    empty set (a switch whose route source yields nothing is not provisioned), so an
+    empty `routes` list is only ever a drive-gate refusal recorded before anything was
+    applied: it records that nothing is installed, not an applied empty set, and the
+    caller falls back to the configured routes exactly as for a fresh provision (ADR
+    0014 Decision 2). Addendum X4's "keeps its applied set" needs an applied set.
     """
     res_uuid = _as_uuid(reservation_id)
     dev_uuid = _as_uuid(device_id)
@@ -850,7 +857,62 @@ async def get_effective_pinned_routes(
         .scalars()
         .first()
     )
-    return None if row is None else row.routes
+    if row is None or not row.routes:
+        return None
+    return row.routes
+
+
+async def release_unapplied_route_pin(
+    db: AsyncSession,
+    reservation_id: uuid.UUID | str,
+    device_id: uuid.UUID | str,
+    *,
+    row_id: uuid.UUID | None = None,
+) -> RouteAssignment | None:
+    """Settle a FAILED pin that records no routes as RELEASED, with no driver call.
+
+    Issue #1004: a drive-gate refusal on a newly adjacent switch records a FAILED row
+    with no routes. When the switch's routing intent is then removed and its latest
+    config version has no routes either, nothing is installed and nothing is due, so
+    the row would otherwise stay FAILED with a stale refusal reason and the retry tick
+    would select it forever. Releasing it matches WIRE-L3-4 (a switch with no routes
+    from any source holds no pin).
+
+    The row is loaded `with_for_update()` and released only while it is still FAILED
+    and its `routes` are still empty, judged on the locked row: a concurrent writer
+    that recorded routes on it (a provision that drove something) or flipped it ACTIVE
+    wins, and None comes back. A row a retry channel holds a live drive claim on (issue
+    #817) is left alone the same way. `row_id` (the retry channel's row identity, issue #814)
+    narrows the match to the very row the caller loaded; without it the match is this
+    reservation's non-RELEASED row for the switch.
+    """
+    res_uuid = _as_uuid(reservation_id)
+    dev_uuid = _as_uuid(device_id)
+    stmt = select(RouteAssignment).where(
+        RouteAssignment.reservation_id == res_uuid,
+        RouteAssignment.device_id == dev_uuid,
+        RouteAssignment.status == "FAILED",
+        unclaimed(RouteAssignment, datetime.now(timezone.utc)),
+    )
+    if row_id is not None:
+        stmt = stmt.where(RouteAssignment.id == row_id)
+    row = (await db.execute(stmt.with_for_update())).scalars().first()
+    if row is None or row.routes:
+        await db.rollback()
+        return None
+    row.status = "RELEASED"
+    row.intended = "RELEASED"
+    row.last_error = None
+    row.released_at = datetime.now(timezone.utc)
+    row.claimed_until = None
+    await db.commit()
+    logger.info(
+        "Released unapplied route pin for L3 switch %s in reservation %s: no routing "
+        "intent and no configured routes, nothing installed",
+        dev_uuid,
+        res_uuid,
+    )
+    return row
 
 
 async def all_route_assignments_for_reservation(

@@ -1701,3 +1701,167 @@ async def test_rebuild_whose_residue_removal_fails_keeps_the_residue_recorded():
     assert rows[0].status == "FAILED"
     assert rows[0].intended == "ACTIVE"
     assert {r["destination"] for r in rows[0].routes} == {ROUTE_A, ROUTE_B}
+
+
+# --- Issue #1004: a refused intent leaves no applied set behind ---------------
+# A drive-gate refusal on a newly adjacent switch with nothing applied records a FAILED
+# row with no routes. That row records that nothing is installed, so it is not a pin:
+# with no intent the switch falls back to its configured routes (ADR 0014 Decision 2),
+# and a retry never pins an empty set ACTIVE or reports a session that drove no route as
+# reconnected. A switch that had an applied set keeps it (addendum X4, unchanged).
+
+VRF_REFUSED_INTENT = [_intent_route("10.50.0.0/24", "eth2", virtual_router="red")]
+
+
+async def _no_config_routes(device_id, client=None):
+    return {"id": DEFAULT_CFG_VERSION_ID, "config": {"routes": []}}
+
+
+async def _refuse_first_adjacency():
+    """Fork version 1 carries a VRF route the default driver cannot drive: the switch is
+    refused before any driver call and the row records no routes."""
+    calls = await _reconcile(L3_WIRES, fork_version=1, l3_routes={SW_L3: VRF_REFUSED_INTENT})
+    assert calls == []
+    rows = await _rows()
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"
+    assert rows[0].intended == "ACTIVE"
+    assert rows[0].last_error == "l3_vrf_unsupported"
+    assert rows[0].routes == []
+
+
+async def test_refused_intent_then_removed_save_drives_the_configured_routes():
+    await _refuse_first_adjacency()
+
+    calls = await _reconcile(L3_WIRES, fork_version=2, l3_routes={})
+
+    assert {d for a, d in calls if a == "configure_route"} == {r["destination"] for r in ROUTES}
+    rows = await _rows()
+    assert [r.status for r in rows] == ["ACTIVE"]
+    assert rows[0].routes == ROUTES
+
+
+async def test_refused_intent_then_removed_retry_drives_the_configured_routes():
+    """Before the fix the tick drove the row's empty route list: a login and a logout,
+    no route call, the row ACTIVE with no routes, and the outcome reconnected."""
+    await _refuse_first_adjacency()
+
+    execute_fn, calls = _l3_recorder()
+    stats = await _retry_tick(execute_fn, l3_routes={})
+
+    assert {d for a, d in calls if a == "configure_route"} == {r["destination"] for r in ROUTES}
+    assert stats["reconnected"] == 1
+    rows = await _rows()
+    assert [r.status for r in rows] == ["ACTIVE"]
+    assert rows[0].routes == ROUTES
+
+
+async def test_refused_intent_then_fixed_save_drives_the_intent():
+    await _refuse_first_adjacency()
+
+    fixed = [_intent_route("10.50.0.0/24", "eth2")]
+    calls = await _reconcile(L3_WIRES, fork_version=2, l3_routes={SW_L3: fixed})
+
+    route_calls = [(a, d) for a, d in calls if a in ("remove_route", "configure_route")]
+    assert route_calls == [("configure_route", "10.50.0.0/24")]
+    rows = await _rows()
+    assert [r.status for r in rows] == ["ACTIVE"]
+    assert [r["destination"] for r in rows[0].routes] == ["10.50.0.0/24"]
+
+
+async def test_refused_intent_then_fixed_retry_drives_the_intent():
+    await _refuse_first_adjacency()
+
+    execute_fn, calls = _l3_recorder()
+    stats = await _retry_tick(
+        execute_fn, l3_routes={SW_L3: [_intent_route("10.50.0.0/24", "eth2")]}
+    )
+
+    assert stats["reconnected"] == 1
+    route_calls = [(a, d) for a, d in calls if a in ("remove_route", "configure_route")]
+    assert route_calls == [("configure_route", "10.50.0.0/24")]
+    rows = await _rows()
+    assert [r["destination"] for r in rows[0].routes] == ["10.50.0.0/24"]
+
+
+async def test_failed_intent_provision_then_intent_removed_keeps_that_set_not_config():
+    """Addendum X4 for a switch that had an applied set: the intent provision failed
+    after its routes were attempted, so the row records them as possibly installed.
+    Removing the intent re-drives that set on the next save, never the config routes."""
+    intent = [_intent_route(ROUTE_A, "eth1")]
+    execute_fn, calls = _l3_recorder(fail={"configure_route"})
+    await _reconcile(
+        L3_WIRES, fork_version=1, l3_routes={SW_L3: intent}, execute_fn=execute_fn, calls=calls
+    )
+    assert [r["destination"] for r in (await _rows("FAILED"))[0].routes] == [ROUTE_A]
+
+    calls = await _reconcile(L3_WIRES, fork_version=2, l3_routes={})
+
+    assert {d for a, d in calls if a == "configure_route"} == {ROUTE_A}
+    rows = await _rows()
+    assert [r.status for r in rows] == ["ACTIVE"]
+    assert [r["destination"] for r in rows[0].routes] == [ROUTE_A]
+
+
+async def test_failed_intent_provision_then_intent_removed_retry_keeps_that_set():
+    intent = [_intent_route(ROUTE_A, "eth1")]
+    execute_fn, calls = _l3_recorder(fail={"configure_route"})
+    await _reconcile(
+        L3_WIRES, fork_version=1, l3_routes={SW_L3: intent}, execute_fn=execute_fn, calls=calls
+    )
+
+    execute_fn, calls = _l3_recorder()
+    stats = await _retry_tick(execute_fn, l3_routes={})
+
+    assert stats["reconnected"] == 1
+    assert {d for a, d in calls if a == "configure_route"} == {ROUTE_A}
+
+
+async def test_refused_intent_removed_with_no_configured_routes_save_releases_the_row():
+    """No intent and no configured routes: nothing is installed and nothing is due, so
+    the refused row is settled RELEASED with no driver session (WIRE-L3-4: no pin)."""
+    await _refuse_first_adjacency()
+
+    calls = await _reconcile(L3_WIRES, fork_version=2, l3_routes={}, config_fetch=_no_config_routes)
+
+    assert calls == []
+    assert [r.status for r in await _rows()] == ["RELEASED"]
+
+
+async def test_refused_intent_removed_with_no_configured_routes_retry_releases_the_row():
+    await _refuse_first_adjacency()
+
+    execute_fn, calls = _l3_recorder()
+    with ExitStack() as stack:
+        for p in _patches(execute_fn, L3_WIRES, config_fetch=_no_config_routes, l3_routes={}):
+            stack.enter_context(p)
+        from app.services.wiring_retry_service import run_wiring_retry_tick
+
+        stats = await run_wiring_retry_tick(_db_session_factory())
+
+    assert calls == [], "no login and logout around zero route calls"
+    assert stats["reconnected"] == 0
+    assert stats["released"] == 1
+    assert [r.status for r in await _rows()] == ["RELEASED"]
+
+
+async def test_apply_l3_adjacency_provision_with_no_routes_drives_and_records_nothing():
+    """A provision item with no routes has nothing to configure: no login, no logout,
+    and the FAILED row stays as it was rather than being pinned ACTIVE with no routes."""
+    await _refuse_first_adjacency()
+
+    execute_fn, calls = _l3_recorder()
+    with ExitStack() as stack:
+        for p in _patches(execute_fn, L3_WIRES):
+            stack.enter_context(p)
+        await _apply_l3_adjacency(
+            RES_ID,
+            [],
+            [{"device_id": SW_L3, "routes": []}],
+            _FetchContext(None),
+            _db_session_factory(),
+        )
+
+    assert calls == []
+    rows = await _rows()
+    assert [(r.status, r.last_error) for r in rows] == [("FAILED", "l3_vrf_unsupported")]

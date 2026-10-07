@@ -61,6 +61,7 @@
   records `driver load failed: <ClassName>` with one attempt, and both retry channels
   drive the row again in its own direction; a broken package (`DriverPackageError`) stays
   non-retryable. The stored text carries only the class name (#1002).
+- Fixed: removing a Layer 3 routing intent that the drive gate refused before anything was applied now falls back to the switch's configured routes. The refused row records that nothing is installed, so the save and the retry tick drive the configured routes (or release the row when there are none) instead of pinning an empty route set ACTIVE and reporting a login and logout with no route call as reconnected; a switch that had an applied set still keeps it (#1004).
 - Fixed: a Layer 3 route change that partly fails no longer leaves routes on the switch.
   The failed pin now records every route that may still be installed (the previous
   routes whose removal did not confirm plus the routes the change tried to add); a

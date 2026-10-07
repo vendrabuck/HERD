@@ -4091,6 +4091,18 @@ async def _apply_l3_adjacency(
                     if not await route_needs_remove(db, res_uuid, switch_id):
                         continue
             else:
+                # A provision with no routes has nothing to configure. Driving it would
+                # log in and out around zero route calls and pin an empty set ACTIVE,
+                # which a retry then reports as reconnected (issue #1004); every caller
+                # resolves its route source first, so this only guards the invariant.
+                if not routes:
+                    logger.warning(
+                        "L3 provision for switch %s in reservation %s carries no routes; "
+                        "nothing driven or recorded",
+                        switch_id,
+                        reservation_id,
+                    )
+                    continue
                 # A provision over a FAILED pin (a reconcile-time rebuild or a retry)
                 # must first remove what that pin may have left installed and the new
                 # route set no longer names (issue #1001); recording ACTIVE with the new
@@ -4398,6 +4410,7 @@ async def _reconcile_l3_adjacency(
         park_stale_route_build,
         record_route_failed,
         record_route_reconcile_failed,
+        release_unapplied_route_pin,
     )
 
     intended = await _derive_l3_adjacency(intended_wires, ctx, l3_intent)
@@ -4451,6 +4464,9 @@ async def _reconcile_l3_adjacency(
                 continue
             provisions.append({"device_id": switch_id, "routes": clean})
             continue
+        # None also for a FAILED row that records no routes: a gate refusal recorded
+        # before anything was applied is not an applied set, so it falls back to the
+        # configured routes like a fresh provision (issue #1004, ADR 0014 Decision 2).
         async with get_db_session() as db:
             pinned = await get_effective_pinned_routes(db, reservation_id, switch_id)
         if pinned is None:
@@ -4463,6 +4479,10 @@ async def _reconcile_l3_adjacency(
                 switch_id,
                 reservation_id,
             )
+            # Nothing installed and nothing due: an unapplied refused row is settled
+            # rather than left FAILED with a stale reason (issue #1004, WIRE-L3-4).
+            async with get_db_session() as db:
+                await release_unapplied_route_pin(db, reservation_id, switch_id)
             continue
         provisions.append({"device_id": switch_id, "routes": pinned})
 

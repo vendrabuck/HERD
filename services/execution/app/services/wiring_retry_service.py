@@ -732,7 +732,11 @@ async def _reattempt_l3_rows(
     FAILED with the gate's reason and drives nothing for it this tick. A switch whose intent is gone
     (never had any, or it was removed) is driven with the row's own pinned `routes`
     verbatim, unchanged from before phase 3 (addendum X4: intent disappearing is not
-    a teardown signal, so the retry keeps reattempting the applied set).
+    a teardown signal, so the retry keeps reattempting the applied set). A row that
+    records NO routes has no applied set (a gate refusal before anything was applied,
+    issue #1004): it is driven with the switch's configured routes instead, and when
+    those are empty too it is released with no driver call (WIRE-L3-4); a config read
+    transport failure skips only that row.
 
     The gate call is wrapped in its OWN per-row `try/except TransientUpstreamError`
     (review fix, issue #34 phase 3 review): `_gate_l3_drive_routes` re-validates
@@ -758,7 +762,7 @@ async def _reattempt_l3_rows(
         _gate_l3_drive_routes,
         _wired_ports_by_device,
     )
-    from app.services.route_service import record_route_failed
+    from app.services.route_service import record_route_failed, release_unapplied_route_pin
 
     if not rows:
         return []
@@ -855,8 +859,32 @@ async def _reattempt_l3_rows(
                             )
                         continue
                     entry = {"device_id": switch_id, "routes": clean}
+                elif row.routes:
+                    entry = {"device_id": switch_id, "routes": row.routes}
                 else:
-                    entry = {"device_id": switch_id, "routes": row.routes or []}
+                    # Issue #1004: a row with no routes is a gate refusal recorded
+                    # before anything was applied, not an applied empty set, so with no
+                    # intent the switch falls back to its configured routes (ADR 0014
+                    # Decision 2), exactly as the reconcile does. Driving the empty list
+                    # used to log in and out around zero route calls and pin it ACTIVE.
+                    try:
+                        detail = await ctx.get_latest_config(switch_id)
+                    except TransientUpstreamError as exc:
+                        logger.warning(
+                            "wiring retry: cannot read the configured routes for L3 "
+                            "switch %s, reservation %s (%s); row not driven this tick",
+                            switch_id,
+                            res_str,
+                            exc,
+                        )
+                        continue
+                    configured = ((detail or {}).get("config") or {}).get("routes") or []
+                    if not configured:
+                        # Nothing installed and nothing due: settle the row (WIRE-L3-4).
+                        async with get_db_session() as db:
+                            await release_unapplied_route_pin(db, res_str, switch_id, row_id=row.id)
+                        continue
+                    entry = {"device_id": switch_id, "routes": configured}
                 by_res.setdefault(res_str, {"deprovisions": [], "provisions": []})[
                     "provisions"
                 ].append(entry)
