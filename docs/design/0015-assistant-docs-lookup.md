@@ -78,6 +78,9 @@ operator allowlist of trusted vendor hosts.
 symlinks followed and the result required to stay inside the root; anything else is
 refused as not found (no distinction between outside and missing, so the tool is not a
 filesystem oracle). Hidden files and non-text extensions are never indexed or served.
+As-built amendment (issue #1055): the index applies the same containment check, so a
+symlink that leaves the root is never indexed and search never returns its title or a
+snippet.
 
 **5. What does not change.** The seven existing tools, the write tools and their flag,
 the conversation persistence model, the per-tool cap and timeout, the privacy rules (tool

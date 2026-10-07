@@ -48,6 +48,18 @@ def _html(body: str) -> httpx.Response:
         ),
         ("https://docs.example.com", "https://docs.example.com/"),
         ("https://docs.example.com:8443/frr/", "https://docs.example.com:8443/frr/"),
+        (
+            "https://docs.example.com/frr/sub/../routing.html",
+            "https://docs.example.com/frr/routing.html",
+        ),
+        (
+            "https://docs.example.com/frr/./routing.html",
+            "https://docs.example.com/frr/routing.html",
+        ),
+        ("https://docs.example.com/frr/%2E%2e/admin", "https://docs.example.com/admin"),
+        ("https://docs.example.com/../../frr/", "https://docs.example.com/frr/"),
+        ("https://docs.example.com/frr/sub/..", "https://docs.example.com/frr/"),
+        ("https://docs.example.com/frr/a..b.html", "https://docs.example.com/frr/a..b.html"),
     ],
 )
 def test_normalize_url_canonicalizes(raw, expected):
@@ -84,6 +96,14 @@ def test_prefix_match_accepts_a_url_under_the_prefix():
         "https://evil.com/https://docs.example.com/frr/page.html",
         "https://docs.example.com/other/page.html",
         "http://docs.example.com/frr/page.html",
+        # Dot segments are resolved before the compare (issue #1055): the
+        # written path starts with the prefix, the served path does not.
+        "https://docs.example.com/frr/../admin/page.html",
+        "https://docs.example.com/frr/./../admin/page.html",
+        "https://docs.example.com/frr/%2e%2e/admin/page.html",
+        "https://docs.example.com/frr/%2E%2E/admin/page.html",
+        "https://docs.example.com/frr/.%2e/admin/page.html",
+        "https://docs.example.com/frr/..",
     ],
 )
 def test_prefix_match_refuses_lookalikes(candidate):
@@ -129,6 +149,10 @@ def test_invalid_prefix_entries_are_dropped(monkeypatch):
         ("::", "IPv6 unspecified"),
         ("::ffff:127.0.0.1", "IPv4-mapped loopback"),
         ("::ffff:10.0.0.5", "IPv4-mapped private"),
+        ("100.64.0.1", "shared address space, low end"),
+        ("100.100.100.100", "shared address space, Tailscale resolver"),
+        ("100.127.255.254", "shared address space, high end"),
+        ("::ffff:100.64.0.1", "IPv4-mapped shared address space"),
         ("not-an-address", "unparseable"),
     ],
 )
@@ -137,7 +161,15 @@ def test_refused_address_classes(address, why):
 
 
 @pytest.mark.parametrize(
-    "address", ["93.184.216.34", "8.8.8.8", "2606:2800:220:1:248:1893:25c8:1946"]
+    "address",
+    [
+        "93.184.216.34",
+        "8.8.8.8",
+        "2606:2800:220:1:248:1893:25c8:1946",
+        # The neighbours of 100.64.0.0/10 stay public.
+        "100.63.255.255",
+        "100.128.0.1",
+    ],
 )
 def test_public_addresses_are_allowed(address):
     assert docs_web.is_public_address(address) is True
@@ -316,6 +348,52 @@ async def test_redirect_to_a_private_address_is_refused_mid_chain(monkeypatch):
             await docs_web.fetch_web_document(PAGE, client=client, resolver=resolver, window=4000)
 
     assert seen == ["docs.example.com", "internal.example.com"]
+
+
+async def test_fetch_refuses_a_dot_segment_path_that_leaves_the_prefix():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("a URL outside the allowlist must never be fetched")
+
+    async with _client(handler) as client:
+        with pytest.raises(DocsLookupError, match="not in the allowed prefix list"):
+            await docs_web.fetch_web_document(
+                "https://docs.example.com/frr/../admin/index.html",
+                client=client,
+                resolver=_public_resolver,
+                window=4000,
+            )
+
+
+async def test_fetch_requests_the_normalized_path_that_was_matched():
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return _html("<p>ok</p>")
+
+    async with _client(handler) as client:
+        doc = await docs_web.fetch_web_document(
+            "https://docs.example.com/frr/sub/%2e%2e/routing.html",
+            client=client,
+            resolver=_public_resolver,
+            window=4000,
+        )
+
+    assert seen == [PAGE]
+    assert doc["path"] == PAGE
+
+
+async def test_redirect_with_dot_segments_out_of_the_prefix_is_refused():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == PAGE:
+            return httpx.Response(302, headers={"location": "%2e%2e/admin/secret.html"})
+        raise AssertionError("the redirect target must never be fetched")
+
+    async with _client(handler) as client:
+        with pytest.raises(DocsLookupError, match="redirect target is not in the allowed"):
+            await docs_web.fetch_web_document(
+                PAGE, client=client, resolver=_public_resolver, window=4000
+            )
 
 
 async def test_redirect_outside_the_allowlist_is_refused():

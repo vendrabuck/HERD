@@ -877,9 +877,11 @@ documentation sites, instead of answering such questions from memory.
   Pinned by: `services/ai-orchestrator/tests/test_docs_sources.py` (`test_search_ranks_the_more_relevant_document_first`, `test_search_returns_nothing_for_a_query_with_no_overlap`)
 - **AI-DOCS-5.** Only `.md`, `.txt`, and `.html` files with no hidden path component and at
   most 2 MiB are indexed; an index is rebuilt on the first lookup after
-  `AI_DOCS_INDEX_TTL_SECONDS`. \
-  Enforced in: `services/ai-orchestrator/app/services/docs_sources.py` (`_is_indexable`, `_read_file`, `get_index`) \
-  Pinned by: `services/ai-orchestrator/tests/test_docs_sources.py` (`test_search_ignores_non_text_and_hidden_files`, `test_index_is_rebuilt_after_the_ttl_expires`)
+  `AI_DOCS_INDEX_TTL_SECONDS`. The index applies the read rule of AI-DOCS-6: an entry
+  whose resolved path leaves the source root (a symlink pointing out of the corpus) is
+  never indexed, so search never returns its title or a snippet (issue #1055). \
+  Enforced in: `services/ai-orchestrator/app/services/docs_sources.py` (`_is_indexable`, `_read_file`, `get_index`, `_build_index`, `resolve_in_root`) \
+  Pinned by: `services/ai-orchestrator/tests/test_docs_sources.py` (`test_search_ignores_non_text_and_hidden_files`, `test_index_is_rebuilt_after_the_ttl_expires`, `test_search_skips_a_symlink_that_leaves_the_root`, `test_search_keeps_a_symlink_that_stays_inside_the_root`)
 - **AI-DOCS-6.** A corpus `read_doc` path is resolved under the source root with symlinks
   followed; an absolute path, a traversal, a symlink leaving the root, a hidden or
   non-text file, and a missing file all answer the same `document not found` refusal. \
@@ -899,19 +901,21 @@ documentation sites, instead of answering such questions from memory.
   Enforced in: `services/ai-orchestrator/app/services/tools.py` (`_tool_read_doc`) \
   Pinned by: `services/ai-orchestrator/tests/test_docs_tools.py` (`test_dispatch_refuses_a_web_read_while_web_is_disabled`, `test_the_dispatch_gate_refuses_web_before_the_fetch_helper_runs`)
 - **AI-DOCS-10.** A web URL must be https with no user information; it is normalized
-  (lowercase host, default port dropped, query and fragment dropped) and must start with a
-  normalized allowed prefix, a bare-host prefix getting a trailing slash. \
-  Enforced in: `services/ai-orchestrator/app/services/docs_web.py` (`normalize_url`, `normalized_prefixes`, `match_prefix`) \
-  Pinned by: `services/ai-orchestrator/tests/test_docs_web.py` (`test_normalize_url_canonicalizes`, `test_normalize_url_refuses_non_https_and_userinfo`, `test_prefix_match_refuses_lookalikes`, `test_a_bare_host_prefix_gets_a_trailing_slash`, `test_fetch_refuses_a_url_outside_the_allowlist`, `test_fetch_refuses_with_an_empty_allowlist`)
+  (lowercase host, default port dropped, query and fragment dropped, and `.` and `..`
+  path segments resolved, literal or percent-encoded, issue #1055) and must start with a
+  normalized allowed prefix, a bare-host prefix getting a trailing slash. The normalized
+  URL is the one requested, so the path that matched is the path fetched. \
+  Enforced in: `services/ai-orchestrator/app/services/docs_web.py` (`normalize_url`, `remove_dot_segments`, `normalized_prefixes`, `match_prefix`) \
+  Pinned by: `services/ai-orchestrator/tests/test_docs_web.py` (`test_normalize_url_canonicalizes`, `test_normalize_url_refuses_non_https_and_userinfo`, `test_prefix_match_refuses_lookalikes`, `test_a_bare_host_prefix_gets_a_trailing_slash`, `test_fetch_refuses_a_url_outside_the_allowlist`, `test_fetch_refuses_with_an_empty_allowlist`, `test_fetch_refuses_a_dot_segment_path_that_leaves_the_prefix`, `test_fetch_requests_the_normalized_path_that_was_matched`)
 - **AI-DOCS-11.** Every address the host resolves to must be public: loopback, private,
-  link-local, multicast, unspecified, and reserved addresses, their IPv4-mapped forms, and
+  shared address space (100.64.0.0/10, issue #1055), link-local, multicast, unspecified, and reserved addresses, their IPv4-mapped forms, and
   6to4 and Teredo addresses are refused, as is a host that does not resolve. \
   Enforced in: `services/ai-orchestrator/app/services/docs_web.py` (`assert_public_host`, `is_public_address`) \
   Pinned by: `services/ai-orchestrator/tests/test_docs_web.py` (`test_refused_address_classes`, `test_public_addresses_are_allowed`, `test_fetch_refuses_when_any_resolved_address_is_private`, `test_fetch_refuses_when_the_host_does_not_resolve`)
-- **AI-DOCS-12.** Redirects are followed by hand, at most 3, each target re-matched against
-  the prefixes and re-resolved. \
+- **AI-DOCS-12.** Redirects are followed by hand, at most 3, each target normalized as in
+  AI-DOCS-10, re-matched against the prefixes, and re-resolved. \
   Enforced in: `services/ai-orchestrator/app/services/docs_web.py` (`fetch_web_document`, `MAX_REDIRECTS`) \
-  Pinned by: `services/ai-orchestrator/tests/test_docs_web.py` (`test_fetch_follows_an_allowlisted_redirect`, `test_redirect_to_a_private_address_is_refused_mid_chain`, `test_redirect_outside_the_allowlist_is_refused`, `test_redirect_chain_is_bounded`, `test_redirect_without_a_location_is_refused`)
+  Pinned by: `services/ai-orchestrator/tests/test_docs_web.py` (`test_fetch_follows_an_allowlisted_redirect`, `test_redirect_to_a_private_address_is_refused_mid_chain`, `test_redirect_outside_the_allowlist_is_refused`, `test_redirect_chain_is_bounded`, `test_redirect_without_a_location_is_refused`, `test_redirect_with_dot_segments_out_of_the_prefix_is_refused`)
 - **AI-DOCS-13.** The response must be `text/html`, `text/plain`, `text/markdown`, or
   `text/x-markdown` with a status below 400, and is read to at most
   `AI_DOCS_WEB_MAX_BYTES` before being cut. \

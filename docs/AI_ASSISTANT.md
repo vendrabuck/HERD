@@ -80,16 +80,20 @@ separated by newlines); markdown and plain text pass through. Hidden files and
 non-text extensions are never indexed or served, and a `read_doc` path is
 resolved under the source root with symlinks followed: anything that lands
 outside the root answers "not found", exactly like a path that does not exist,
-so the tool cannot be used to probe the filesystem.
+so the tool cannot be used to probe the filesystem. The index applies the same
+rule, so a symlink that points out of a corpus is never searched either.
 
 Web fetching, when an operator turns it on, is bounded on every axis:
 
 - the URL must be `https` with no userinfo (a URL carrying a user name or
   password is refused, not normalized), and its normalized form (lowercase
-  host, no query) must match one of the configured prefixes as a plain
-  string prefix, so end each prefix with `/`;
+  host, no query, `.` and `..` path segments resolved, including
+  percent-encoded ones) must match one of the configured prefixes as a plain
+  string prefix, so end each prefix with `/`. The normalized URL is the one
+  requested, so `/frr/../admin` is matched and fetched as `/admin`;
 - the host is resolved and EVERY address must be public. Loopback, private,
-  link-local (where cloud metadata services live), multicast, unspecified,
+  shared address space (100.64.0.0/10, used by carrier-grade NAT, Tailscale,
+  and some cloud and Kubernetes networks), link-local (where cloud metadata services live), multicast, unspecified,
   reserved, and IPv4-mapped forms of all of them are refused, so an
   allowlisted hostname pointed at a service inside the stack fetches nothing;
 - at most 3 redirects are followed, each re-checked against both the allowlist

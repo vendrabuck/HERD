@@ -4,8 +4,9 @@ This is the only part of the docs tools that reaches the network, and it is
 off unless an operator sets AI_DOCS_WEB_ENABLED and at least one allowed
 prefix. Every fetch is checked twice over:
 
-- the URL must be https, must normalize cleanly, and must match one of the
-  configured prefixes as a plain string prefix;
+- the URL must be https, must normalize cleanly (dot segments in the path
+  resolved first, issue #1055), and must match one of the configured prefixes
+  as a plain string prefix;
 - every address the host resolves to must be public, so an allowlisted
   hostname that happens to resolve to 127.0.0.1, a 10.x address, or a
   link-local address cannot be used to reach a service inside the stack.
@@ -45,6 +46,11 @@ REDIRECT_STATUS = frozenset({301, 302, 303, 307, 308})
 
 Resolver = Callable[[str], list[str]]
 
+# RFC 6598 shared address space (carrier-grade NAT; also Tailscale and some
+# cloud and Kubernetes networks). ipaddress does not count it as private, so it
+# is refused explicitly (issue #1055).
+SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
+
 
 def default_resolver(host: str) -> list[str]:
     """Resolve a hostname to every address it answers with. Sorted so the
@@ -53,13 +59,53 @@ def default_resolver(host: str) -> list[str]:
     return sorted({info[4][0] for info in infos})
 
 
+def _dot_segment(segment: str) -> str | None:
+    """ "." or ".." when the segment is a dot segment, else None.
+
+    Percent-encoded dots count: a server may decode %2e before it collapses
+    segments, so the encoded spellings are resolved here too.
+    """
+    decoded = segment.lower().replace("%2e", ".")
+    return decoded if decoded in (".", "..") else None
+
+
+def remove_dot_segments(path: str) -> str:
+    """Resolve "." and ".." segments in an absolute path (RFC 3986 5.2.4).
+
+    The result is the path the server ends up serving, so the prefix compare
+    runs on that path rather than on the text as written: a written path that
+    starts with an allowlisted prefix and climbs out of it with ".." no longer
+    matches (issue #1055). A ".." at the root stays at the root, and a trailing
+    dot segment leaves a trailing slash, as RFC 3986 specifies.
+    """
+    segments = path.split("/")[1:] if path.startswith("/") else path.split("/")
+    output: list[str] = []
+    for index, segment in enumerate(segments):
+        last = index == len(segments) - 1
+        dot = _dot_segment(segment)
+        if dot == ".":
+            if last:
+                output.append("")
+            continue
+        if dot == "..":
+            if output:
+                output.pop()
+            if last:
+                output.append("")
+            continue
+        output.append(segment)
+    return "/" + "/".join(output)
+
+
 def normalize_url(raw: str) -> str | None:
     """Normalize an https URL for prefix matching, or None if it is not one.
 
     Refuses (returns None for) a URL that carries userinfo. Lowercases the
     scheme and host, drops the default port, drops the query and the fragment,
-    and leaves the path exactly as written (percent-encoding included) so
-    matching stays a plain string compare.
+    and resolves dot segments in the path (literal or percent-encoded), but
+    otherwise leaves the path as written (percent-encoding included) so
+    matching stays a plain string compare. The normalized URL is also the one
+    fetched, so the path that was matched is the path that is requested.
     """
     if not raw or not isinstance(raw, str):
         return None
@@ -83,7 +129,7 @@ def normalize_url(raw: str) -> str | None:
     except ValueError:
         return None
     netloc = host if port in (None, 443) else f"{host}:{port}"
-    path = parts.path or "/"
+    path = remove_dot_segments(parts.path or "/")
     return urlunsplit(("https", netloc, path, "", ""))
 
 
@@ -120,8 +166,9 @@ def match_prefix(url: str, prefixes: list[str]) -> str | None:
 def is_public_address(raw_address: str) -> bool:
     """True only for an address the container may legitimately talk to.
 
-    Refuses loopback, private, link-local (which is where cloud metadata
-    services live), multicast, unspecified, and reserved ranges, plus the
+    Refuses loopback, private, shared address space (100.64.0.0/10),
+    link-local (which is where cloud metadata services live), multicast,
+    unspecified, and reserved ranges, plus the
     IPv4-mapped IPv6 forms of all of them, which is the usual way a private
     address sneaks past a naive IPv4-only check.
     """
@@ -134,6 +181,8 @@ def is_public_address(raw_address: str) -> bool:
             return False
         if address.sixtofour is not None or address.teredo is not None:
             return False
+    elif address in SHARED_ADDRESS_SPACE:
+        return False
     return not (
         address.is_loopback
         or address.is_private
