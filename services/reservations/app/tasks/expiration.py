@@ -274,9 +274,9 @@ async def _complete_expired_rows(
         ):
             continue
         completed.append(res)
-        # One of the five terminal-transition sites (issue #646 phase 2,
-        # ADR 0013 point 8): marks the row eligible for background purpose
-        # classification.
+        # A terminal-transition site (issue #646 phase 2, ADR 0013 point 8;
+        # the full list is in stamp_purpose_classify_requested's docstring):
+        # marks the row eligible for background purpose classification.
         stamp_purpose_classify_requested(res)
         await enqueue_event(
             db,
@@ -441,9 +441,10 @@ async def _run_expiration_cycle() -> None:
                 if not await _claim_provision_transition(db, res.id, ReservationStatus.FAILED):
                     continue
                 stuck.append(res)
-                # One of the five terminal-transition sites (issue #646 phase 2,
-                # ADR 0013 point 8): marks the row eligible for background
-                # purpose classification. The CAS above bypasses the ORM's
+                # A terminal-transition site (issue #646 phase 2, ADR 0013 point
+                # 8; the full list is in stamp_purpose_classify_requested's
+                # docstring): marks the row eligible for background purpose
+                # classification. The CAS above bypasses the ORM's
                 # in-memory status sync, but this column is untouched by it, so
                 # setting it here on `res` and committing below is safe.
                 stamp_purpose_classify_requested(res)

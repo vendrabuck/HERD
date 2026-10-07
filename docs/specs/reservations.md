@@ -111,12 +111,12 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
   Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_claim_provision_transition`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_exclusive_enqueues_created_event_in_txn`)
 - **RES-CREATE-15.** When the inventory flip exhausts its attempts, the reservation
-  moves to `FAILED` with `reservation.failed` in that transaction, the devices that did
-  reach `RESERVED` are set back to `AVAILABLE` without the holder check, and the caller
-  gets 503. No purpose marker is stamped and no fork archive is requested. Known gap,
-  see #996. \
+  moves to `FAILED` with `reservation.failed` and the purpose marker in that
+  transaction, the devices that did reach `RESERVED` are set back to `AVAILABLE` through
+  the holder check (RES-HOLD-3), and the caller gets 503. No fork archive is requested
+  (the row never had a fork). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`) \
-  Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_fails_when_inventory_exhausts_retries`, `test_create_reservation_reverts_partially_reserved_devices_on_failure`); `tests/integration/test_provisioning_failed.py` (`test_provisioning_failure_lands_failed_and_reverts_devices`)
+  Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_fails_when_inventory_exhausts_retries`, `test_create_reservation_reverts_partially_reserved_devices_on_failure`); `tests/integration/test_provisioning_failed.py` (`test_provisioning_failure_lands_failed_and_reverts_devices`); `services/reservations/tests/test_purpose_classify_marker.py` (`test_create_flip_failure_stamps_marker`, `test_create_flip_failure_revert_skips_a_device_another_live_row_holds`)
 - **RES-CREATE-16.** A create whose status compare-and-swap loses to a concurrent
   cancel during the flip stages no event, creates no fork, reverts the devices it
   flipped (holder-aware), and returns the row as the cancel left it. \
@@ -511,8 +511,9 @@ runs after the commit.
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_non_exclusive_device_status_not_changed`, `test_cancel_non_exclusive_skips_status_update`)
 - **RES-HOLD-3.** Cancel, release, provision failure, the dynamic timeout, the restart
   backstop's revert, auto-complete, and lost-activation reverts skip any device another `PENDING_PROVISION` or `ACTIVE`
-  reservation holds, logging `release_skipped_device_held`. The create-path flip-failure
-  revert (RES-CREATE-15) and PATCH removal (RES-PATCH-10) do not use this check. \
+  reservation holds, logging `release_skipped_device_held`; so does the create-path
+  flip-failure revert (RES-CREATE-15). PATCH removal (RES-PATCH-10) does not use this
+  check. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`release_devices_not_held_by_others`) \
   Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_cancel_skips_a_device_another_live_row_holds`, `test_release_skips_a_device_another_live_row_holds`); `services/reservations/tests/test_expiration_hold_invariant.py` (`test_release_skips_device_a_pending_provision_row_holds`)
 - **RES-HOLD-4.** If the holder lookup itself fails, the release proceeds for every
@@ -838,13 +839,13 @@ routes in section 5; background work `purpose_classify_loop` every
   Enforced in: `services/reservations/app/services/reservation_service.py` (`set_purpose_category`) \
   Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_patch_purpose_category_null_clears_all_three_fields`)
 - **RES-PURPOSE-4.** `purpose_classify_requested_at` is stamped, once, in the same
-  transaction as six terminal transitions: cancel, release, auto-complete,
-  provision-result failure, the dynamic timeout, and the elapsed-window failure. The
-  create-path flip failure (RES-CREATE-15) does not stamp it. Only a stamped row is ever
-  classified by the sweep. Code comments, ADR 0013, and the frontend's
-  `canClassifyPurpose` comment say five sites. Known gap, see #996. \
+  transaction as every terminal transition, seven today: cancel, release,
+  auto-complete, provision-result failure, the dynamic timeout, the elapsed-window
+  failure, and the create-path flip failure (RES-CREATE-15). Only a stamped row is ever
+  classified by the sweep. A unit test enumerates every terminal status
+  compare-and-swap in the service and fails when one has no matching stamp. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`stamp_purpose_classify_requested`) \
-  Pinned by: `services/reservations/tests/test_purpose_classify_marker.py` (`test_cancel_reservation_stamps_marker`, `test_release_reservation_stamps_marker`, `test_expiry_autocomplete_stamps_marker`, `test_provision_result_failed_stamps_marker`, `test_timeout_backstop_failed_stamps_marker`, `test_stamp_is_idempotent_on_cancel`); `services/reservations/tests/test_expiration_hold_invariant.py` (`test_expired_pending_row_is_failed_not_activated`)
+  Pinned by: `services/reservations/tests/test_purpose_classify_marker.py` (`test_cancel_reservation_stamps_marker`, `test_release_reservation_stamps_marker`, `test_expiry_autocomplete_stamps_marker`, `test_provision_result_failed_stamps_marker`, `test_timeout_backstop_failed_stamps_marker`, `test_stamp_is_idempotent_on_cancel`, `test_create_flip_failure_stamps_marker`, `test_every_terminal_status_write_stamps_the_marker`, `test_no_terminal_status_is_written_outside_the_cas_helpers`); `services/reservations/tests/test_expiration_hold_invariant.py` (`test_expired_pending_row_is_failed_not_activated`)
 - **RES-PURPOSE-5.** Each sweep tick takes up to `PURPOSE_CLASSIFY_BATCH_SIZE` stamped
   rows with no suggestion and fewer than `PURPOSE_CLASSIFY_MAX_ATTEMPTS` attempts,
   oldest stamp first. \
@@ -1251,12 +1252,6 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
   auto-complete racing a PATCH can leave an added device `RESERVED` with no holder.
 - #995 (RES-PATCH-5): a PATCH can extend a reservation past
   `RESERVATION_MAX_DURATION_SECONDS`; only create applies the cap.
-- #996 (RES-PURPOSE-4, RES-CREATE-15): the create-path flip failure moves a row to
-  `FAILED` without stamping `purpose_classify_requested_at`, so it is never classified
-  unless an admin runs the backfill. There are six stamp sites; ADR 0013,
-  `purpose_service.py`, `models/reservation.py`, and the frontend's
-  `canClassifyPurpose` comment say five. The same path's revert of partially reserved
-  devices does not use the holder check.
 - #999 (RES-PATCH-9): PATCH-add on a `PENDING` reservation requires the added device to
   be `AVAILABLE` now, while a create for the same future window skips that check
   (RES-CREATE-12) and relies on the window conflict check.

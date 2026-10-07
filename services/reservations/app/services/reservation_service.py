@@ -1827,6 +1827,10 @@ async def create_reservation(
             if not await _claim_provision_transition(db, reservation.id, ReservationStatus.FAILED):
                 return await _lost_activation_race(db, reservation, sorted(reserved_ok))
             await db.refresh(reservation)
+            # A terminal-transition site (ADR 0013 point 8): mark the row eligible
+            # for background purpose classification in the same transaction as
+            # the FAILED write (issue #996).
+            stamp_purpose_classify_requested(reservation)
             # Stage reservation.failed in the same transaction that lands the row
             # in FAILED (issue #21), so the event exists iff the failure committed.
             # This is the webhook/notification signal that provisioning gave up
@@ -1844,9 +1848,14 @@ async def create_reservation(
             # status set, so without this the succeeded devices would be orphaned
             # (stuck RESERVED, unbookable) with nothing referencing them. Errors are
             # swallowed and logged; there is no sweeper to clean these up otherwise.
-            if reserved_ok:
+            # Holder-aware like every other release path (issue #996): a device
+            # another live row holds is never flipped to AVAILABLE.
+            releasable = await release_devices_not_held_by_others(
+                reservation.id, sorted(reserved_ok), db=db
+            )
+            if releasable:
                 try:
-                    await _update_device_statuses(sorted(reserved_ok), "AVAILABLE")
+                    await _update_device_statuses(releasable, "AVAILABLE")
                 except Exception:
                     logger.error(
                         "Failed to revert RESERVED devices after provisioning failure: %s",
@@ -1854,7 +1863,7 @@ async def create_reservation(
                         extra={
                             "action": "reservation_provision_revert_failed",
                             "reservation_id": str(reservation.id),
-                            "device_ids": [str(d) for d in sorted(reserved_ok)],
+                            "device_ids": [str(d) for d in releasable],
                         },
                         exc_info=True,
                     )
@@ -2066,9 +2075,8 @@ async def apply_provision_result(
     # The CAS already wrote FAILED; stage reservation.failed in the same
     # transaction so the event commits atomically with the transition. Also
     # stamp the purpose-classification marker in this transaction (issue #646
-    # phase 2, ADR 0013 point 8): this is one of the five terminal-transition
-    # sites, alongside cancel_reservation, release_reservation, and the
-    # expiration task's auto-complete and dynamic-timeout-failure branches.
+    # phase 2, ADR 0013 point 8): one of the terminal-transition sites listed in
+    # stamp_purpose_classify_requested's docstring.
     stamp_purpose_classify_requested(reservation)
     await enqueue_event(
         db,
@@ -2696,8 +2704,9 @@ async def cancel_reservation(
     # self-cancel leaves cancelled_by NULL (issue #340 audit invariant).
     if admin_override:
         reservation.cancelled_by = user_id
-    # One of the five terminal-transition sites (issue #646 phase 2, ADR 0013
-    # point 8): marks the row eligible for background purpose classification.
+    # A terminal-transition site (issue #646 phase 2, ADR 0013 point 8; the
+    # full list is in stamp_purpose_classify_requested's docstring): marks the
+    # row eligible for background purpose classification.
     stamp_purpose_classify_requested(reservation)
     # Stage reservation.cancelled in the same transaction that lands CANCELLED
     # (issue #21). The inventory device release below is best-effort and runs
@@ -2776,8 +2785,9 @@ async def release_reservation(
         return reservation
     await db.refresh(reservation)
     reservation.modified_by = user_id
-    # One of the five terminal-transition sites (issue #646 phase 2, ADR 0013
-    # point 8): marks the row eligible for background purpose classification.
+    # A terminal-transition site (issue #646 phase 2, ADR 0013 point 8; the
+    # full list is in stamp_purpose_classify_requested's docstring): marks the
+    # row eligible for background purpose classification.
     stamp_purpose_classify_requested(reservation)
     # Stage reservation.completed in the same transaction that lands COMPLETED
     # (issue #21), mirroring the auto-expiry path. Inventory device release below

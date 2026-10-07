@@ -81,9 +81,10 @@ class Reservation(Base):
     # than SQL NULL, which would silently break every
     # `purpose_suggestion.is_(None)`/`is_not(None)` filter below (the sweep
     # reconciler's eligibility check, the review-list query, and backfill).
-    # purpose_classify_requested_at is stamped at the five sites where a
-    # reservation transitions into COMPLETED/CANCELLED/FAILED (the same sites
-    # that archive the fork best-effort), if it is not already set; this is
+    # purpose_classify_requested_at is stamped at every site where a
+    # reservation transitions into COMPLETED/CANCELLED/FAILED (seven today; the
+    # list is in stamp_purpose_classify_requested's docstring), if it is not
+    # already set; this is
     # the ONLY way a row becomes eligible for the background classifier, so
     # end-of-reservation classification and admin backfill share one
     # mechanism. purpose_classify_attempts caps sweep retries at
