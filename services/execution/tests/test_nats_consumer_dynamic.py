@@ -353,9 +353,9 @@ async def test_insert_or_get_creating_concurrent_race_returns_winner_row():
     real_get_by_request_id = dynamic_instance_service_module.get_by_request_id
     call_count = {"n": 0}
 
-    async def _interleave_winner_before_first_read(db, request_id):
+    async def _interleave_winner_before_first_read(db, request_id, *, reservation_id=None):
         call_count["n"] += 1
-        result = await real_get_by_request_id(db, request_id)
+        result = await real_get_by_request_id(db, request_id, reservation_id=reservation_id)
         if call_count["n"] == 1:
             # Simulate the concurrent redelivery: a second session wins the
             # race and commits its row between the loser's read and insert.
@@ -403,14 +403,14 @@ async def test_insert_or_get_creating_reraises_when_no_row_found_after_integrity
     real_get_by_request_id = dynamic_instance_service_module.get_by_request_id
     call_count = {"n": 0}
 
-    async def _integrity_error_then_missing_row(db, request_id):
+    async def _integrity_error_then_missing_row(db, request_id, *, reservation_id=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             # First read: a real miss, plus a concurrent winner commits so the
             # loser's own commit below genuinely raises IntegrityError. Built
             # directly (not via insert_or_get_creating) so the winner's own
             # read does not also go through the patched function below.
-            result = await real_get_by_request_id(db, request_id)
+            result = await real_get_by_request_id(db, request_id, reservation_id=reservation_id)
             async with TestSessionLocal() as db_winner:
                 winner_row = DynamicInstance(
                     request_id=uuid.UUID(REQUEST_ID),
@@ -2348,6 +2348,7 @@ async def test_failed_create_after_teardown_retired_the_row_is_compensated(tmp_p
         "dynamic_provision_abandoned",
     ]
 
+
 # --- issue #1029: a transient recipe download failure during teardown NAKs ----
 
 
@@ -2416,4 +2417,169 @@ async def test_teardown_broken_package_still_acks_with_row_live(caplog):
     assert (await _rows())[0].status == "CREATING"
     [record] = _formatted(caplog, "dynamic_instance_keyed_destroy_failed")
     assert record["reason"] == "recipe_load_failed"
+
+
+# --- issue #1028: no create after a teardown that never saw the row ----------
+
+REQUEST_ID_2 = str(uuid.uuid4())
+
+
+async def test_create_for_a_request_teardown_never_listed_creates_nothing(
+    reservation_status, caplog
+):
+    """The losing order from issue #1028 with two replicas: request 1 is
+    ACTIVE, then (before request 2 has a row) the user cancels and another
+    replica's teardown lists and destroys request 1 only. Request 2 must not
+    create an instance or a device: its row is committed, the reservation is
+    re-read, and the create stops there. Before the fix it created both and
+    left them under the cancelled reservation."""
+    calls, execute = _recipe_execute({"create_instance": CREATE_OK, "destroy_instance": DESTROY_OK})
+    real_fetch = AsyncMock(return_value=TEMPLATE_DATA)
+    seen = {"template_reads": 0, "torn_down": False}
+
+    async def _fetch_template_then_cancel(template_id, client=None):
+        seen["template_reads"] += 1
+        if seen["template_reads"] == 2 and not seen["torn_down"]:
+            # Request 2 is about to run and has no ledger row yet: the cancel
+            # commits and the other replica's teardown runs now.
+            seen["torn_down"] = True
+            reservation_status["status"] = "CANCELLED"
+            await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+        return await real_fetch(template_id, client)
+
+    create_dev = AsyncMock(return_value={"id": DEVICE_ID})
+    callback = AsyncMock()
+    patches = _create_patches(execute)
+    patches[0] = patch(
+        "app.services.nats_consumer._fetch_template", new=_fetch_template_then_cancel
+    )
+    patches[-1] = patch("app.services.nats_consumer._create_dynamic_device", new=create_dev)
+    patches.append(
+        patch("app.services.nats_consumer._delete_dynamic_device", new=AsyncMock(return_value=True))
+    )
+    patches.append(
+        patch("app.services.nats_consumer._post_provision_result_best_effort", new=callback)
+    )
+    event = _event(
+        [
+            {"id": REQUEST_ID, "template_id": TEMPLATE_ID},
+            {"id": REQUEST_ID_2, "template_id": TEMPLATE_ID},
+        ]
+    )
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        await _handle_provision_requested(event, _db_session_factory(), dedupe_key="s:1")
+
+    assert seen["torn_down"]
+    creates = [c[2]["HERD_request_id"] for c in calls if c[0] == "create_instance"]
+    assert creates == [REQUEST_ID]
+    create_dev.assert_awaited_once()
+    callback.assert_not_awaited()
+    rows = {str(r.request_id): r for r in await _rows()}
+    assert rows[REQUEST_ID].status == "DESTROYED"
+    assert rows[REQUEST_ID_2].status == "CREATING"
+    assert rows[REQUEST_ID_2].instance_ref is None
+    assert rows[REQUEST_ID_2].device_id is None
+    [record] = _formatted(caplog, "dynamic_instance_create_skipped_reservation_ended")
+    assert record["request_id"] == REQUEST_ID_2
+    assert record["reservation_id"] == RES_ID
+    assert record["reported_status"] == "CANCELLED"
+    assert "dynamic_provision_abandoned" in _actions(caplog)
+
+
+async def test_create_recheck_5xx_naks_before_any_recipe_call(reservation_status):
+    """The per-request re-check fails closed like the event gate: a 5xx from
+    reservations raises TransientUpstreamError (NAK) with the row CREATING and
+    no recipe call."""
+    reservation_status["code"] = 503
+    calls, execute = _recipe_execute({"create_instance": CREATE_OK})
+    with ExitStack() as stack:
+        for p in _create_patches(execute):
+            stack.enter_context(p)
+        with pytest.raises(TransientUpstreamError):
+            await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+
+    assert calls == []
+    rows = await _rows()
+    assert [r.status for r in rows] == ["CREATING"]
+
+
+@pytest.mark.parametrize(
+    "delete_effect",
+    [
+        TransientUpstreamError(f"delete dynamic device {DEVICE_ID}: upstream 503"),
+        False,
+    ],
+    ids=["delete-5xx", "delete-409"],
+)
+async def test_lost_active_flip_destroys_even_when_the_device_delete_fails(delete_effect, caplog):
+    """Issue #1028 (b): teardown retires the row between the device create and
+    the ACTIVE flip, and inventory refuses the compensating device DELETE. The
+    compensating destroy must still run (a 5xx used to raise before it), the
+    handler must not raise (a NAK is refused by the gate on a terminal
+    reservation), and the leftover device is named under a fixed action rather
+    than reported as a clean undo."""
+    calls, execute = _recipe_execute({"create_instance": CREATE_OK, "destroy_instance": DESTROY_OK})
+    if isinstance(delete_effect, Exception):
+        delete = AsyncMock(side_effect=delete_effect)
+    else:
+        delete = AsyncMock(return_value=delete_effect)
+    callback = AsyncMock()
+
+    async def _create_device_then_teardown(client, *args, **kwargs):
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+        return {"id": DEVICE_ID}
+
+    patches = _create_patches(execute)
+    patches[-1] = patch(
+        "app.services.nats_consumer._create_dynamic_device", new=_create_device_then_teardown
+    )
+    patches.append(patch("app.services.nats_consumer._delete_dynamic_device", new=delete))
+    patches.append(
+        patch("app.services.nats_consumer._post_provision_result_best_effort", new=callback)
+    )
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+
+    destroys = [c[1] for c in calls if c[0] == "destroy_instance"]
+    assert destroys == [{"instance_ref": "vm-100"}, {"instance_ref": "vm-100"}]
+    delete.assert_awaited_once()
+    callback.assert_not_awaited()
+    assert (await _rows())[0].status == "DESTROYED"
+    [record] = _formatted(caplog, "dynamic_instance_compensation_device_left")
+    assert record["device_id"] == DEVICE_ID
+    assert record["request_id"] == REQUEST_ID
+    assert record["reservation_id"] == RES_ID
+    assert _actions(caplog) == [
+        "dynamic_instance_compensated",
+        "dynamic_instance_compensation_device_left",
+        "dynamic_instance_create_lost_to_teardown",
+        "dynamic_provision_abandoned",
+    ]
+
+
+async def test_get_by_request_id_scoped_to_reservation():
+    """The create path never trusts a row another reservation wrote under the
+    same request id (issue #1028 hardening)."""
+    async with TestSessionLocal() as db:
+        await insert_or_get_creating(db, REQUEST_ID, RES_ID, TEMPLATE_ID, HYPERVISOR_ID)
+    async with TestSessionLocal() as db:
+        assert await get_by_request_id(db, REQUEST_ID, reservation_id=RES_ID) is not None
+        assert await get_by_request_id(db, REQUEST_ID, reservation_id=str(uuid.uuid4())) is None
+        assert await get_by_request_id(db, REQUEST_ID) is not None
+
+
+async def test_insert_or_get_creating_refuses_a_foreign_reservations_row():
+    async with TestSessionLocal() as db:
+        await insert_or_get_creating(db, REQUEST_ID, RES_ID, TEMPLATE_ID, HYPERVISOR_ID)
+    async with TestSessionLocal() as db:
+        with pytest.raises(IntegrityError):
+            await insert_or_get_creating(
+                db, REQUEST_ID, str(uuid.uuid4()), TEMPLATE_ID, HYPERVISOR_ID
+            )
+    rows = await _rows()
+    assert [str(r.reservation_id) for r in rows] == [RES_ID]
 

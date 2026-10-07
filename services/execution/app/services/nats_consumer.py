@@ -1044,9 +1044,39 @@ def _refuse_resurrection(request_id) -> None:
 
 def _log_lost_to_teardown(request_id) -> None:
     logger.warning(
-        "Create for request %s lost its ledger row to teardown; undid the create",
+        "Create for request %s lost its ledger row to teardown; ran the compensation",
         request_id,
         extra={"action": "dynamic_instance_create_lost_to_teardown"},
+    )
+
+
+async def _delete_compensated_device(client, device_id: str, request_id, reservation_id) -> None:
+    """Delete the device a create materialized after teardown won its row (issue #1028).
+
+    Never raises. A redelivery of the provision_requested event is refused by
+    the corroboration gate (the reservation is terminal), so a NAK would not
+    retry this delete; instead a delete that fails (a 5xx, a transport error,
+    or a 4xx other than 404) logs ``dynamic_instance_compensation_device_left``
+    naming the device, which no ledger row tracks any more and an operator must
+    delete through inventory.
+    """
+    try:
+        deleted = await _delete_dynamic_device(client, device_id)
+    except TransientUpstreamError:
+        deleted = False
+    if deleted:
+        return
+    logger.error(
+        "Could not delete device %s created for request %s after teardown won the "
+        "ledger row; the device is left in inventory with no ledger row",
+        device_id,
+        request_id,
+        extra={
+            "action": "dynamic_instance_compensation_device_left",
+            "request_id": str(request_id),
+            "reservation_id": str(reservation_id),
+            "device_id": str(device_id),
+        },
     )
 
 
@@ -1090,7 +1120,7 @@ async def _provision_one_instance(
     template_id = req.get("template_id")
 
     async with get_db_session() as db:
-        existing = await get_by_request_id(db, request_id)
+        existing = await get_by_request_id(db, request_id, reservation_id=reservation_id)
         if existing is not None and existing.status == "ACTIVE" and existing.device_id is not None:
             logger.info(
                 "Dynamic instance for request %s already ACTIVE (device %s); skipping",
@@ -1123,6 +1153,34 @@ async def _provision_one_instance(
             return str(row.device_id)
         if row.status == "DESTROYED":
             return _refuse_resurrection(request_id)
+
+    # Re-check the reservation now that the row is committed (issue #1028). The
+    # event was corroborated once, before the first request, and a teardown on
+    # another replica lists the rows that exist when it runs. Teardown runs only
+    # after the reservation's terminal status is committed, so either it listed
+    # after this insert (and will destroy whatever this create makes, through
+    # the CAS paths below) or the status read here is already terminal. In the
+    # second case nothing may be created: the row stays CREATING as a
+    # may-still-exist record (no recipe ran for it in this delivery), and a
+    # re-published terminal event retires it with a keyed destroy.
+    still_pending = await _verify_reservation_event(
+        {"event": "reservation.provision_requested", "reservation_id": reservation_id},
+        client,
+    )
+    if still_pending is not None and not still_pending.verified:
+        logger.warning(
+            "Not creating the instance for request %s: reservation %s is no longer "
+            "PENDING_PROVISION",
+            request_id,
+            reservation_id,
+            extra={
+                "action": "dynamic_instance_create_skipped_reservation_ended",
+                "request_id": str(request_id),
+                "reservation_id": str(reservation_id),
+                "reported_status": still_pending.reported_status,
+            },
+        )
+        return None
 
     context, secret_keys = _build_recipe_context(
         template, hypervisor, secret, request_id, reservation_id, user_id
@@ -1219,7 +1277,7 @@ async def _provision_one_instance(
             # into the resurrection refusal or the gate, leaving that instance
             # with no record, so compensate first (issue #937).
             async with get_db_session() as fresh:
-                current = await get_by_request_id(fresh, request_id)
+                current = await get_by_request_id(fresh, request_id, reservation_id=reservation_id)
             if current is not None and current.status == "DESTROYED":
                 await _destroy_orphaned_instance(
                     db,
@@ -1307,7 +1365,9 @@ async def _provision_one_instance(
             # (docs/DRIVERS.md, the same rule a redelivered teardown relies on),
             # and it covers a keyed teardown destroy that found nothing because
             # it ran before create_instance named the instance (issue #937).
-            await _delete_dynamic_device(client, str(device_id))
+            # The destroy runs first and never raises, so a device delete that
+            # fails cannot skip it (issue #1028); the delete's answer is then
+            # acted on rather than discarded.
             await _destroy_orphaned_instance(
                 db,
                 hypervisor_uuid,
@@ -1322,6 +1382,7 @@ async def _provision_one_instance(
                 request_id,
                 instance_ref,
             )
+            await _delete_compensated_device(client, str(device_id), request_id, reservation_id)
             _log_lost_to_teardown(request_id)
             return None
 
