@@ -10,6 +10,7 @@ HERD can propose a lab topology from a natural-language prompt by calling the co
 
 - Your admin must have configured an AI provider. For `AI_PROVIDER=anthropic` that means `AI_API_KEY` is set; for `AI_PROVIDER=openai_compat` that means `AI_BASE_URL` points at a running endpoint. The frontend checks `GET /api/ai/status` on load; when the provider is unconfigured that endpoint reports `{"enabled": false}`, the **Use AI** button is hidden, and `/api/ai/generate` returns 503.
 - You need device visibility: the AI can only propose devices your account can see. If no visible template has an available device (for example, your user group has no device group access), `/api/ai/generate` answers 409 "No device templates with available devices in inventory. ..." before any provider call.
+- The route checks its own gates first, in this order: the provider is configured (503), your daily token quota (429), and the uploaded files (400). Only then does it read the inventory summary, so a refused request costs inventory nothing. If inventory cannot answer, while reading the summary or the resolver's candidates below, the request fails with 503 "Could not read inventory; no topology was generated. Retry the request." and no proposal is returned.
 
 ## The flow, step by step
 

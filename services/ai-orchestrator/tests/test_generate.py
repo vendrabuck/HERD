@@ -17,8 +17,8 @@ from app.services.ai_client import (
     get_ai_client,
 )
 from app.services.cabling_client import CablingUnavailableError
-from app.services.generator import CABLING_UNAVAILABLE_DETAIL
-from app.services.inventory_client import InventorySummary
+from app.services.generator import CABLING_UNAVAILABLE_DETAIL, INVENTORY_UNAVAILABLE_DETAIL
+from app.services.inventory_client import InventorySummary, InventoryUnavailableError
 from app.services.llm_provider import Usage
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
@@ -67,13 +67,19 @@ async def setup_db():
         await conn.run_sync(Base.metadata.drop_all)
 
 
-def _override_inventory(counts: dict[str, int]) -> None:
+def _override_inventory(counts: dict[str, int]) -> dict[str, int]:
+    """Override the route's inventory loader with a canned summary. Returns a
+    counter of how many times the route actually loaded inventory, so a gate
+    test can assert the summary was never read (issue #1035)."""
     ids = {name: f"tpl-{name}" for name in counts}
+    calls = {"n": 0}
 
-    async def _stub() -> InventorySummary:
+    async def _load() -> InventorySummary:
+        calls["n"] += 1
         return InventorySummary(counts, ids)
 
-    app.dependency_overrides[_inventory_provider] = _stub
+    app.dependency_overrides[_inventory_provider] = lambda: _load
+    return calls
 
 
 def _override_ai(response: dict[str, Any] | None = None, *, raises: Exception | None = None):
@@ -1273,3 +1279,101 @@ async def test_generate_ignores_element_edges_in_the_feasibility_check(async_cli
     assert resp.json()["devices"][0]["device"]["id"] == "dev-EX3400-0"
     # No device-to-device edge, so cabling was never asked anything.
     assert asked == []
+
+
+# --- Upstream failures and gate order (issue #1035) ------------------------
+
+
+class _ExplodingAI:
+    async def propose_topology(self, **kwargs):
+        raise AssertionError("the provider must not be called")
+
+
+async def test_generate_unconfigured_makes_no_inventory_call(async_client, monkeypatch):
+    """The provider gate answers 503 before the inventory summary is read."""
+    monkeypatch.setattr(config_module.settings, "ai_api_key", "")
+    monkeypatch.setattr(config_module.settings, "ai_base_url", "")
+    calls = _override_inventory({"EX3400": 10})
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "hi"}, headers=headers)
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == AI_NOT_CONFIGURED_DETAIL
+    assert calls["n"] == 0
+
+
+async def test_generate_over_quota_makes_no_inventory_call(async_client, monkeypatch):
+    """The quota gate answers 429 before the inventory summary is read."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 100)
+    async with _TestSessionLocal() as db:
+        await usage_repo.add_tokens(db, uuid.UUID(_USER_ID), input_tokens=100, output_tokens=0)
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    calls = _override_inventory({"EX3400": 4})
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "anything"}, headers=headers)
+    assert resp.status_code == 429
+    assert calls["n"] == 0
+
+
+async def test_generate_rejected_upload_makes_no_inventory_call(async_client, monkeypatch):
+    """Upload validation is local and runs before the inventory summary too."""
+    monkeypatch.setattr(config_module.settings, "upload_max_files", 1)
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    calls = _override_inventory({"EX3400": 4})
+    files = [
+        ("files", ("a.txt", b"one", "text/plain")),
+        ("files", ("b.txt", b"two", "text/plain")),
+    ]
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, files=files, headers=headers)
+    assert resp.status_code == 400
+    assert calls["n"] == 0
+
+
+async def test_generate_503_when_inventory_summary_fails(async_client, monkeypatch):
+    """The real loader maps an inventory failure to the pinned 503, with no
+    upstream text (the internal URL) in the detail (issues #1035, #1036)."""
+    from app.routes import generate as generate_route
+
+    async def _failing_summary(token: str):
+        raise InventoryUnavailableError("summary", "HTTPStatusError", 503)
+
+    monkeypatch.setattr(generate_route, "fetch_inventory_summary", _failing_summary)
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == INVENTORY_UNAVAILABLE_DETAIL
+    assert INVENTORY_UNAVAILABLE_DETAIL == (
+        "Could not read inventory; no topology was generated. Retry the request."
+    )
+
+
+async def test_generate_503_when_inventory_fails_during_candidate_fetch(async_client, monkeypatch):
+    """Inventory restarting between the summary and the resolver's candidate
+    fetch is a 503, not a 500, and it is not repaired."""
+    _override_inventory({"EX3400": 4})
+
+    async def _failing_candidates(token: str, template_id: str, count: int):
+        raise InventoryUnavailableError("candidates", "ConnectError", None)
+
+    monkeypatch.setattr(generator_module, "fetch_available_devices", _failing_candidates)
+    sink: list[str] = []
+    _override_ai_recording(
+        {
+            "purpose": "one box",
+            "devices": [{"role": "a", "template_name": "EX3400"}],
+            "edges": [],
+        },
+        sink,
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == INVENTORY_UNAVAILABLE_DETAIL
+    # One provider call: an outage is not a modelling mistake to repair.
+    assert len(sink) == 1

@@ -16,7 +16,11 @@ from app.services.ai_client import (
 )
 from app.services.cabling_client import CablingUnavailableError, fetch_pathfind_batch
 from app.services.extractor import render_file_context
-from app.services.inventory_client import InventorySummary, fetch_available_devices
+from app.services.inventory_client import (
+    InventorySummary,
+    InventoryUnavailableError,
+    fetch_available_devices,
+)
 from app.services.llm_provider import Usage
 from app.services.resolver import (
     ResolverEdge,
@@ -45,6 +49,14 @@ AI_SCHEMA_VIOLATION_DETAIL = "AI returned a response that did not match the expe
 # together at all.
 CABLING_UNAVAILABLE_DETAIL = (
     "Could not verify cabling paths; no topology was generated. Retry the request."
+)
+
+# Pinned 503 detail for an inventory failure while reading the summary or the
+# resolver's candidates (issue #1035). Fails closed like the cabling outage
+# above, and never carries the upstream error text, whose str() names the
+# internal inventory URL (issue #1036).
+INVENTORY_UNAVAILABLE_DETAIL = (
+    "Could not read inventory; no topology was generated. Retry the request."
 )
 
 
@@ -122,7 +134,8 @@ async def generate_topology(
     # repairable mistake (unknown template, over-count, duplicate role,
     # dangling edge, or a topology the lab's cabling cannot carry). The
     # non-repairable outcomes of resolution (the 409 inventory race, the 503
-    # cabling outage) are not about the proposal and propagate immediately.
+    # inventory or cabling outage) are not about the proposal and propagate
+    # immediately.
     repair_feedback = ""
     response: GenerateResponse | None = None
     # Accumulate token usage across every repair attempt: each attempt is a real
@@ -347,7 +360,12 @@ async def _resolve_devices(
         # search knob, and reading it as a shortfall would turn a small cap
         # into a bogus "inventory shifted" 409 on a large proposal.
         wanted = max(len(indices), settings.ai_resolver_candidates_per_template)
-        devices = await fetch_available_devices(user_bearer_token, template_id, wanted)
+        try:
+            devices = await fetch_available_devices(user_bearer_token, template_id, wanted)
+        except InventoryUnavailableError as e:
+            # Not about the proposal, so not repairable: it propagates out of
+            # the repair loop untouched, like the cabling outage below.
+            raise GeneratorError(503, INVENTORY_UNAVAILABLE_DETAIL) from e
         if len(devices) < len(indices):
             raise GeneratorError(
                 409,

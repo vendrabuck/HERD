@@ -48,6 +48,7 @@ from app.services.ai_client import (
 from app.services.llm_provider import TextBlock, ToolResultBlock, ToolUseBlock, Usage
 from app.services.reservation_context import (
     ContextDeadlineExceededError,
+    ContextUpstreamUnavailableError,
     ReservationNotFoundError,
     ReservationSeed,
     gather_reservation_seed,
@@ -73,6 +74,13 @@ INCOMPLETE_REASON_AI_ERROR = "ai_error"
 # 502 detail and the streamed `error` frame both carry it. Pinned and neutral,
 # never the exception's own text (CWE-209); the exception is logged instead.
 ASSISTANT_CALL_FAILED_DETAIL = "Assistant call failed"
+
+# Pinned 503 detail for a first-turn seed read that reservations or inventory
+# could not answer (issue #1035). Never the upstream error text, which names
+# the internal service URL (issue #1036).
+RESERVATION_CONTEXT_UNAVAILABLE_DETAIL = (
+    "Could not read the reservation or its devices; retry the request."
+)
 
 # Issue #871 review follow-up: header for the landed-actions list appended to
 # INCOMPLETE_AFTER_TOOLS_ANSWER when a side effect landed but its iteration
@@ -120,6 +128,11 @@ def get_reservation_seed_dep(
             raise HTTPException(
                 status.HTTP_504_GATEWAY_TIMEOUT,
                 "Reservation seed gather exceeded its deadline",
+            ) from exc
+        except ContextUpstreamUnavailableError as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                RESERVATION_CONTEXT_UNAVAILABLE_DETAIL,
             ) from exc
 
     return _gather

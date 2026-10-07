@@ -233,17 +233,22 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   optional `files`; any signed-in user may call it, and no token answers 401. \
   Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`generate`) \
   Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_requires_auth`, `test_generate_rejects_empty_prompt`)
-- **AI-GEN-2.** The inventory summary is read by a request dependency that runs before
-  the provider check and the quota check; when it fails the route answers 502
-  `Failed to fetch inventory summary: <error text>`. Known gap, see #1035 and #1036. \
-  Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`_inventory_provider`) \
-  Pinned by: none (issue #1035)
+- **AI-GEN-2.** The route checks the provider (503), then the quota (429), then the uploads
+  (400), and only then reads the inventory summary, so a refused request makes no inventory
+  call. When inventory cannot answer the summary read (a transport error, a non-2xx, or a
+  body that is not the expected JSON), the route answers 503
+  `Could not read inventory; no topology was generated. Retry the request.`, with no
+  upstream text. \
+  Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`generate`, `_inventory_provider`); `services/ai-orchestrator/app/services/generator.py` (`INVENTORY_UNAVAILABLE_DETAIL`) \
+  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_unconfigured_makes_no_inventory_call`, `test_generate_over_quota_makes_no_inventory_call`, `test_generate_rejected_upload_makes_no_inventory_call`, `test_generate_503_when_inventory_summary_fails`)
 - **AI-GEN-3.** The summary is one `GET /templates?template_type=device&limit=500` plus one
   `GET /devices` per template counting `AVAILABLE` `dut_only` devices, all with the
   caller's JWT and a 15 second timeout, so a template the caller cannot see, or beyond the
-  first 500, is never offered; any non-2xx raises. \
-  Enforced in: `services/ai-orchestrator/app/services/inventory_client.py` (`fetch_inventory_summary`, `TEMPLATES_PAGE_SIZE`) \
-  Pinned by: `services/ai-orchestrator/tests/test_inventory_client.py` (`test_fetch_inventory_summary_aggregates_counts`, `test_fetch_inventory_summary_forwards_bearer_header`, `test_fetch_inventory_summary_raises_on_templates_5xx`, `test_fetch_inventory_summary_raises_on_devices_5xx`)
+  first 500, is never offered; a transport error, any non-2xx, or an unreadable body raises
+  `InventoryUnavailableError`, which carries the operation, the exception class, and the
+  status but never the upstream text. \
+  Enforced in: `services/ai-orchestrator/app/services/inventory_client.py` (`fetch_inventory_summary`, `TEMPLATES_PAGE_SIZE`, `InventoryUnavailableError`) \
+  Pinned by: `services/ai-orchestrator/tests/test_inventory_client.py` (`test_fetch_inventory_summary_aggregates_counts`, `test_fetch_inventory_summary_forwards_bearer_header`, `test_fetch_inventory_summary_raises_on_templates_5xx`, `test_fetch_inventory_summary_raises_on_devices_5xx`, `test_fetch_inventory_summary_non_json_body_is_inventory_unavailable`)
 - **AI-GEN-4.** When no template has an available device, the route answers 409
   `No device templates with available devices in inventory. ...` without calling the
   model. \
@@ -369,10 +374,12 @@ the pure search in `services/ai-orchestrator/app/services/resolver.py`, and cabl
   answers 409 `Inventory shifted ...`; it is not repaired. \
   Enforced in: `services/ai-orchestrator/app/services/generator.py` (`_resolve_devices`) \
   Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_returns_409_when_inventory_shifts`)
-- **AI-RESOLVE-3.** An inventory error or non-2xx during the candidate fetch is not
-  caught, so the route answers 500. Known gap, see #1035. \
-  Enforced in: `services/ai-orchestrator/app/services/inventory_client.py` (`fetch_available_devices`); `services/ai-orchestrator/app/routes/generate.py` (`generate`) \
-  Pinned by: none (issue #1035)
+- **AI-RESOLVE-3.** A transport error, a non-2xx, or an unreadable body during the
+  candidate fetch answers 503
+  `Could not read inventory; no topology was generated. Retry the request.`; it is not
+  repaired. \
+  Enforced in: `services/ai-orchestrator/app/services/inventory_client.py` (`fetch_available_devices`, `InventoryUnavailableError`); `services/ai-orchestrator/app/services/generator.py` (`_resolve_devices`, `INVENTORY_UNAVAILABLE_DETAIL`) \
+  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_503_when_inventory_fails_during_candidate_fetch`); `services/ai-orchestrator/tests/test_inventory_client.py` (`test_fetch_available_devices_raises_on_5xx`, `test_fetch_available_devices_transport_error_is_inventory_unavailable`)
 - **AI-RESOLVE-4.** Only edges whose two ends are device roles constrain the choice; an
   edge touching an element is ignored here, and no pathfind call is made when no
   device-to-device edge remains. \
@@ -582,10 +589,12 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   question as the position-0 user message. \
   Enforced in: `services/ai-orchestrator/app/services/reservation_context.py` (`_SEED_RESERVATION_FIELDS`, `_SEED_DEVICE_FIELDS`, `render_seed_block`); `services/ai-orchestrator/app/services/conversation_repo.py` (`create`, `set_seed_with_question`) \
   Pinned by: `services/ai-orchestrator/tests/test_reservation_context.py` (`test_seed_gather_returns_thin_bundle`, `test_seed_gather_skips_missing_devices`, `test_render_seed_emits_xml_blocks_without_topology`); `services/ai-orchestrator/tests/test_conversation_repo.py` (`test_create_persists_seed_as_first_user_message`, `test_set_seed_with_question_wraps_question_in_first_message`)
-- **AI-CONV-3.** Any other non-2xx from reservations or inventory during the seed read is
-  not mapped, so the route answers 500. Known gap, see #1035. \
-  Enforced in: `services/ai-orchestrator/app/services/reservation_context.py` (`_fetch_reservation`, `_fetch_device`) \
-  Pinned by: none (issue #1035)
+- **AI-CONV-3.** A transport error, any other non-2xx, or a body that is not JSON from
+  reservations or inventory during the seed read answers 503
+  `Could not read the reservation or its devices; retry the request.`, with no upstream
+  text. \
+  Enforced in: `services/ai-orchestrator/app/services/reservation_context.py` (`_get_json`, `ContextUpstreamUnavailableError`); `services/ai-orchestrator/app/routes/reservation_assistant.py` (`get_reservation_seed_dep`, `RESERVATION_CONTEXT_UNAVAILABLE_DETAIL`) \
+  Pinned by: `services/ai-orchestrator/tests/test_reservation_context.py` (`test_seed_gather_reservations_non_2xx_is_upstream_unavailable`, `test_seed_gather_transport_error_is_upstream_unavailable`, `test_seed_gather_device_5xx_is_upstream_unavailable`, `test_seed_gather_non_json_reservation_body_is_upstream_unavailable`); `services/ai-orchestrator/tests/test_reservation_assistant_coverage.py` (`test_seed_dep_maps_upstream_unavailable_to_503`)
 - **AI-CONV-4.** A turn with a `conversation_id` requires a conversation created by this
   caller for this reservation id; anything else, including another user's conversation,
   answers 404 `Conversation not found`. \
@@ -1370,8 +1379,6 @@ stream opens are `error` frames, listed at the end.
 | 422 | `{"error": "topology_unconnectable", "pairs": [...], "message": "..."}` | no wireable device choice after repairs | AI-RESOLVE-14 |
 | 422 | `{"error": "topology_unwireable", "invalid_edges": [...], "message": "..."}` | cabling's validate answered `valid: false` at commit | AI-COMMIT-10 |
 | 429 | `{"limit", "used", "remaining": 0, "reset_at"}` | daily quota reached | AI-QUOTA-2, AI-CONV-12, AI-RECIPE-4, AI-PURPOSE-3 |
-| 500 | (unhandled) | inventory fails during candidate fetch; reservations or inventory answers another non-2xx during the seed read | AI-RESOLVE-3, AI-CONV-3 |
-| 502 | `Failed to fetch inventory summary: <error>` | inventory summary read failed | AI-GEN-2 |
 | 502 | `AI returned no usable response`, `AI call failed`, `AI returned a response that did not match the expected schema` | generation model failure | AI-GEN-7, AI-GEN-8, AI-GEN-9 |
 | 502 | `AI referenced unknown templates: ...`, `AI proposed more devices than are available: ...`, `AI returned duplicate role names: ...`, `Edge references unknown role: ...`, `AI proposed a self-loop edge ...`, `AI proposed an element_to_element edge ...`, `AI proposed a duplicate edge ...` | a proposal mistake left after the last repair | AI-GEN-10, AI-GEN-11 |
 | 502 | `Unexpected upstream failure: <error>` | unexpected exception during commit | AI-COMMIT-12 |
@@ -1382,6 +1389,8 @@ stream opens are `error` frames, listed at the end.
 | 503 | `AI orchestrator is not configured` | provider unconfigured or not constructible | AI-PROV-2, AI-PROV-3 |
 | 503 | `AI provider is unreachable` | provider transport failure | AI-PROV-10, AI-GEN-9, AI-TURN-5, AI-RECIPE-13, AI-PURPOSE-12 |
 | 503 | `Could not verify cabling paths; no topology was generated. Retry the request.` | pathfind batch failed | AI-RESOLVE-6 |
+| 503 | `Could not read inventory; no topology was generated. Retry the request.` | inventory failed the summary or candidate read | AI-GEN-2, AI-RESOLVE-3 |
+| 503 | `Could not read the reservation or its devices; retry the request.` | reservations or inventory failed the first-turn seed read | AI-CONV-3 |
 | 503 | `Failed to fetch ports for device <id>: <error>` | port lookup 5xx or transport at commit | AI-COMMIT-6 |
 | 503 | `Failed to validate topology wireability: ...` | validate unreachable, 5xx, or unreadable | AI-COMMIT-9 |
 | 503 | `Recipe validator is unreachable` | execution validate-package failed | AI-RECIPE-8 |
@@ -1401,15 +1410,15 @@ Calls into this area are in section 7. All user-path calls forward the caller's 
 | Direction | Peer | Call | Purpose | On failure |
 |---|---|---|---|---|
 | Out | LLM provider | the provider SDK (`messages.create`, `messages.stream`, or `chat.completions.create`) | every model call | Unreachable: 503 (or `incomplete` / SSE `error`). Other errors: 502. Timeout inside the assistant: `AIError`, then AI-TURN-5 or AI-TURN-6 |
-| Out | inventory | `GET /templates`, `GET /devices` (JWT) | generation summary | Fail closed: 502 with the error text (AI-GEN-2) |
-| Out | inventory | `GET /devices?template_id&status=AVAILABLE&dut_only` (JWT) | resolver candidates | Not caught: 500 (AI-RESOLVE-3) |
+| Out | inventory | `GET /templates`, `GET /devices` (JWT) | generation summary | Fail closed: 503, pinned detail (AI-GEN-2) |
+| Out | inventory | `GET /devices?template_id&status=AVAILABLE&dut_only` (JWT) | resolver candidates | Fail closed: 503, pinned detail (AI-RESOLVE-3) |
 | Out | cabling | `POST /pathfind/batch` (JWT) | resolver reachability | Fail closed: 503 (AI-RESOLVE-6) |
 | Out | inventory | `GET /devices/{id}/ports` (JWT) | element attachment port at commit | 404 and other 4xx: no ports, attachment dropped. 5xx and transport: fail closed, 503 before anything is written (AI-COMMIT-6) |
 | Out | cabling | `POST /topologies`, `PUT /topologies/{id}`, `POST /topologies/{id}/validate`, `DELETE /topologies/{id}` (JWT) | commit and rollback | Create and save: relayed status. Validate: fail closed, 503. Delete: logged, never raised (AI-COMMIT-13) |
 | Out | reservations | `POST /` (JWT) | commit's reservation | Relayed status; topology rolled back (AI-COMMIT-11) |
 | Out | execution | `POST /execute` (JWT) | optional config push | Recorded per device as `failed`; commit stands (AI-COMMIT-16) |
-| Out | reservations | `GET /{id}` (JWT) | assistant seed | 404: 404. Deadline: 504. Other: 500 (AI-CONV-3) |
-| Out | inventory | `GET /devices/{id}` (JWT) | assistant seed devices | 404: device omitted. Other: 500 |
+| Out | reservations | `GET /{id}` (JWT) | assistant seed | 404: 404. Deadline: 504. Other: 503 (AI-CONV-3) |
+| Out | inventory | `GET /devices/{id}` (JWT) | assistant seed devices | 404: device omitted. Other: 503 (AI-CONV-3) |
 | Out | inventory | device, port, template, config-version, config-schema, and schedule routes (JWT) | assistant tools | Becomes an `is_error` tool result; the turn continues (AI-TOOL-2). The schema proxy fails open to the registry (AI-TOOL-7) |
 | Out | cabling | `POST /pathfind` (JWT) | `find_path` tool | `is_error` tool result |
 | Out | execution | `GET /runs?reservation_id` (JWT) | `list_executions_for_reservation` tool | `is_error` tool result |
@@ -1491,10 +1500,6 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
 - #1034 (AI-QUOTA-5): usage is recorded only after a successful call in generation, the
   assistant, recipe authoring, and classification, so the tokens a failed call spent are
   never counted against the daily quota.
-- #1035 (AI-RESOLVE-3, AI-CONV-3, AI-GEN-2): an inventory or reservations failure during
-  generation or a first assistant turn answers 500, because the HTTP error is raised and
-  nothing maps it; and the generate route reads the inventory summary in a request
-  dependency that runs before the provider and quota checks.
 - #1036 (AI-LOG-5, AI-LOG-6): the template identity route logs the model's raw result and
   puts the schema error text in its 502 detail; upstream error text, internal URLs
   included, reaches response details and `tool_calls[].error`.
@@ -1543,12 +1548,9 @@ Issue #1040 tracks the tests for every rule below that no open defect names. A r
 under Open defects gets its test with that defect's fix.
 
 - AI-PROV-20: the anthropic provider's `EMPTY` placeholder.
-- AI-GEN-2: the inventory summary 502 and its ordering before the provider and quota checks.
 - AI-GEN-15: no agreement check on proposed `topology_type`.
 - AI-UPLOAD-3: empty or nameless parts skipped.
-- AI-RESOLVE-3: inventory failure during candidate fetch answers 500.
 - AI-RESOLVE-7: pathfind chunk size and timeout.
-- AI-CONV-3: other seed-read failures answer 500.
 - AI-CONV-5: later turns do not re-read the reservation.
 - AI-LOOP-7: the write-tools section of the system prompt.
 - AI-RECIPE-3: the recipe flag answers before authentication.
