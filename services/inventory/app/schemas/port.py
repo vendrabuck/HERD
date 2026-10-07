@@ -2,11 +2,13 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+PORT_NAME_MAX_LENGTH = 255
 
 
 class PortCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=255)
+    name: str = Field(min_length=1, max_length=PORT_NAME_MAX_LENGTH)
     template_id: uuid.UUID
     field_data: dict[str, Any] = {}
 
@@ -20,9 +22,23 @@ class BulkPortCreate(BaseModel):
     template_id: uuid.UUID
     field_data: dict[str, Any] = {}
 
+    @model_validator(mode="after")
+    def _final_names_fit_column(self) -> "BulkPortCreate":
+        # The prefix cap alone does not bound the suffix: starting_index has no
+        # upper bound, so the LAST generated name (the longest) is checked
+        # against the column width here, making an oversize request a 422
+        # instead of a database error (issue #1022).
+        last_name = f"{self.name_prefix}{self.starting_index + self.instances - 1}"
+        if len(last_name) > PORT_NAME_MAX_LENGTH:
+            raise ValueError(
+                f"generated port names would exceed {PORT_NAME_MAX_LENGTH} characters; "
+                "use a shorter name_prefix or a smaller starting_index"
+            )
+        return self
+
 
 class PortUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=255)
+    name: str | None = Field(default=None, min_length=1, max_length=PORT_NAME_MAX_LENGTH)
     field_data: dict[str, Any] | None = None
 
 

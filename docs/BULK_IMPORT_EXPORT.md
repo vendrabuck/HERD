@@ -94,6 +94,11 @@ import's report as the final answer.
 
 ## File schemas
 
+Device and template import files must be UTF-8 (a leading byte order mark is
+accepted). A file in any other encoding, such as a CSV saved by a spreadsheet tool
+in Latin-1, is refused as a whole with HTTP 422 `Import file must be UTF-8
+encoded; re-save it as UTF-8 and retry`.
+
 ### Devices
 
 JSON export is an object with a `resource`, a `version`, and an `items` list;

@@ -319,3 +319,34 @@ async def test_find_blocking_reservations_non_200_raises_503():
         with pytest.raises(HTTPException) as excinfo:
             await find_blocking_reservations_for_device(uuid.uuid4())
     assert excinfo.value.status_code == 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(ValueError("Expecting value"), id="not-json"),
+        pytest.param({"items": []}, id="object-not-list"),
+        pytest.param(["ACTIVE"], id="list-of-non-objects"),
+    ],
+)
+async def test_find_blocking_reservations_unparseable_body_raises_503(body):
+    """issue #1022: a 200 whose body is not a JSON list of objects (an HTML
+    page from a proxy, a wrong shape) escaped as a 500. It is now the same
+    fail-closed 503 as a non-200 answer."""
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            if isinstance(body, Exception):
+                raise body
+            return body
+
+    with patch(_RESERVATIONS_GET, new=AsyncMock(return_value=_FakeResponse())):
+        with pytest.raises(HTTPException) as excinfo:
+            await find_blocking_reservations_for_device(uuid.uuid4())
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.detail == (
+        "reservations service returned an unparseable body while checking active reservations"
+    )

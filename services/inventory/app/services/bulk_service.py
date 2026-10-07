@@ -215,7 +215,15 @@ def _parse_json(raw: str) -> list[dict[str, Any]]:
 def parse_import(
     raw: bytes, fmt: str, columns: list[str], text_columns: set[str] | None = None
 ) -> list[dict[str, Any]]:
-    text = raw.decode("utf-8-sig")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        # A file saved in a legacy encoding (Latin-1, Windows-1252) is a client
+        # input error, not a server fault (issue #1022).
+        raise HTTPException(
+            status_code=422,
+            detail="Import file must be UTF-8 encoded; re-save it as UTF-8 and retry",
+        ) from exc
     if fmt == "csv":
         # text_columns applies only to CSV: a JSON import was never run
         # through csv_safe_cell on export, so it carries no quote to strip.

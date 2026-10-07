@@ -1466,8 +1466,8 @@ the sorted subset that holds the device only as a transit hop (always present, e
 none). The check calls reservations' internal `/internal/by-device/{device_id}` lookup and
 cabling's internal `GET /internal/forks/by-device/{device_id}` (non-archived forks whose
 `fork_connections` name the device on either end of any hop) and fails CLOSED: either
-service unreachable or erroring returns HTTP 503 ("Could not verify device is not in
-use") rather than silently letting the delete through. There is no force flag; cancel or
+service unreachable, erroring, or answering with an unparseable body returns HTTP 503
+("Could not verify device is not in use") rather than silently letting the delete through. There is no force flag; cancel or
 let the blocking reservation end first. Issue #940 adds a second refusal, checked AFTER
 the one above (so `device_in_use` wins when both apply): a device that any cabling
 connection still names, on either end, is refused with HTTP 409

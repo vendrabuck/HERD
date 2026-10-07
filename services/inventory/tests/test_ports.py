@@ -763,3 +763,39 @@ async def test_user_cannot_bulk_create_ports(client):
         json=_bulk_payload(pt_id),
     )
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_bulk_create_ports_name_over_column_width_is_422(client):
+    """issue #1022: a huge starting_index made the generated name exceed the
+    255-character column (a database error, 500 on Postgres). The schema now
+    checks the longest generated name and refuses the request with a 422."""
+    dt_id = await _create_device_template(client)
+    dev_id = await _create_device(client, dt_id)
+    pt_id = await _create_port_template(client)
+    resp = await client.post(
+        f"/devices/{dev_id}/ports/bulk",
+        json=_bulk_payload(pt_id, name_prefix="p" * 200, starting_index=10**60),
+    )
+    assert resp.status_code == 422
+    msgs = [e["msg"] for e in resp.json()["detail"]]
+    assert msgs == [
+        "Value error, generated port names would exceed 255 characters; "
+        "use a shorter name_prefix or a smaller starting_index"
+    ]
+    assert (await client.get(f"/devices/{dev_id}/ports")).json() == []
+
+
+@pytest.mark.asyncio
+async def test_bulk_create_ports_last_name_exactly_at_column_width_is_accepted(client):
+    """The boundary: a last generated name of exactly 255 characters fits."""
+    dt_id = await _create_device_template(client)
+    dev_id = await _create_device(client, dt_id)
+    pt_id = await _create_port_template(client)
+    # prefix 200 + a 55-digit index = 255; instances=1 so the last name is the first.
+    resp = await client.post(
+        f"/devices/{dev_id}/ports/bulk",
+        json=_bulk_payload(pt_id, name_prefix="p" * 200, starting_index=10**54, instances=1),
+    )
+    assert resp.status_code == 201, resp.text
+    assert len(resp.json()[0]["name"]) == 255

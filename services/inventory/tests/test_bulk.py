@@ -642,3 +642,26 @@ async def test_template_import_rejects_unknown_driver(client):
     report = resp.json()
     assert report["rejected"] == 1
     assert "driver not found" in report["rows"][0]["reason"]
+
+
+# Encoding (issue #1022) -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/import", "/templates/import"])
+async def test_non_utf8_import_file_is_422_naming_the_encoding(client, path):
+    """issue #1022: a Latin-1 CSV raised UnicodeDecodeError, a 500. It is a
+    client input error: 422 naming the expected encoding, and nothing written."""
+    await _create_template(client, name="Firewall")
+    body = "name,template_name\ncaf\xe9,Firewall\n".encode("latin-1")
+    resp = await client.post(
+        path,
+        params={"format": "csv"},
+        files={"file": ("d.csv", io.BytesIO(body), "text/csv")},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == (
+        "Import file must be UTF-8 encoded; re-save it as UTF-8 and retry"
+    )
+    devices = (await client.get("/devices")).json()["items"]
+    assert devices == []

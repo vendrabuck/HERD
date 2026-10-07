@@ -243,3 +243,29 @@ async def test_cabled_detail_ids_are_sorted_and_count_is_the_true_total():
         "connection_count": 57,
         "connection_ids": CONNECTION_IDS,
     }
+
+
+@pytest.mark.asyncio
+async def test_reservations_unparseable_body_blocks_delete_with_503():
+    """issue #1022: the reservations side of the delete guard now has the
+    unparseable-body case the cabling side already pinned. A non-JSON 200 from
+    reservations' by-device lookup refuses the delete with the guard's 503,
+    never an unhandled 500."""
+
+    class _HtmlResponse:
+        status_code = 200
+
+        def json(self):
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    with (
+        patch(
+            "app.services.reservation_guard.httpx.AsyncClient.get",
+            new=AsyncMock(return_value=_HtmlResponse()),
+        ),
+        _cabling_patch(transit=False, up=True),
+    ):
+        with pytest.raises(HTTPException) as ei:
+            await assert_device_deletable(DEVICE)
+    assert ei.value.status_code == 503
+    assert ei.value.detail == UNVERIFIABLE_DETAIL

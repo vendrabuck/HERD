@@ -710,10 +710,12 @@ device page; routes under `/devices/{id}/ports` and `/ports/{id}`.
   starting index of at least 0, all sharing one template and one `field_data`. \
   Enforced in: `services/inventory/app/schemas/port.py` (`BulkPortCreate`); `services/inventory/app/services/port_service.py` (`create_ports_bulk`) \
   Pinned by: `services/inventory/tests/test_ports.py` (`test_bulk_create_ports`, `test_bulk_create_ports_instances_exceeds_max`, `test_bulk_create_ports_invalid_instances_zero`, `test_bulk_create_ports_negative_starting_index`, `test_bulk_create_ports_empty_prefix`); `services/inventory/tests/test_port_service_unit.py` (`test_create_ports_bulk_naming`)
-- **INV-PORT-6.** The starting index has no upper bound, so a generated name can exceed
-  the 255-character column. Known gap, see #1022. \
-  Enforced in: `services/inventory/app/schemas/port.py` (`BulkPortCreate`) \
-  Pinned by: none
+- **INV-PORT-6.** The longest generated name (the prefix plus the last index) must fit
+  the 255-character column; otherwise the request answers 422 `generated port names
+  would exceed 255 characters; use a shorter name_prefix or a smaller starting_index`
+  and no port is created. \
+  Enforced in: `services/inventory/app/schemas/port.py` (`BulkPortCreate`, `PORT_NAME_MAX_LENGTH`) \
+  Pinned by: `services/inventory/tests/test_ports.py` (`test_bulk_create_ports_name_over_column_width_is_422`, `test_bulk_create_ports_last_name_exactly_at_column_width_is_accepted`)
 - **INV-PORT-7.** A port update changes only its name and `field_data`; `field_data` is
   validated against the port's template. \
   Enforced in: `services/inventory/app/services/port_service.py` (`update_port`) \
@@ -1079,9 +1081,10 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   422. \
   Enforced in: `services/inventory/app/routers/bulk.py` (`export_devices`, `import_devices_endpoint`); `services/inventory/app/services/bulk_service.py` (`parse_import`) \
   Pinned by: `services/inventory/tests/test_bulk_service_unit.py` (`test_parse_import_unknown_format_rejected`)
-- **INV-BULK-20.** A file that is not valid UTF-8 answers 500. Known gap, see #1022. \
+- **INV-BULK-20.** A file that is not valid UTF-8 answers 422 `Import file must be UTF-8
+  encoded; re-save it as UTF-8 and retry` for the whole file, and nothing is written. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`parse_import`) \
-  Pinned by: none
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_non_utf8_import_file_is_422_naming_the_encoding`)
 
 **Out of scope.** Topology import and export (`topology.md`). Ports and device groups
 are not exported or imported.
@@ -1124,10 +1127,13 @@ bulk delete show the refusal (INV-DEV-13, INV-LIST-15).
   `connection_count`, or `connection_ids`. \
   Enforced in: `services/inventory/app/services/device_delete_guard.py` (`assert_device_deletable`, `find_cabling_dependents_for_device`, `UNVERIFIABLE_DETAIL`) \
   Pinned by: `services/inventory/tests/test_device_delete_guard.py` (`test_cabling_non_200_is_503`, `test_cabling_unparseable_body_is_503`, `test_missing_internal_token_is_503`, `test_old_cabling_build_without_new_keys_blocks_delete_with_503`); `services/inventory/tests/test_devices.py` (`test_delete_device_blocked_by_reservation_upstream_unreachable_503`)
-- **INV-DEL-6.** A 200 from reservations whose body is not JSON makes the delete answer
-  500 rather than 503; the device is still not deleted. Known gap, see #1022. \
+- **INV-DEL-6.** A 200 from reservations whose body is not a JSON list of objects is
+  unverifiable like a non-200 answer: the delete answers the 503 of INV-DEL-5 and the
+  device is not deleted. The config-version restore, which asks the same lookup, answers
+  503 `reservations service returned an unparseable body while checking active
+  reservations`. \
   Enforced in: `services/inventory/app/services/reservation_guard.py` (`find_blocking_reservations_for_device`) \
-  Pinned by: none
+  Pinned by: `services/inventory/tests/test_device_delete_guard.py` (`test_reservations_unparseable_body_blocks_delete_with_503`); `services/inventory/tests/test_device_config_restore_reservation_guard.py` (`test_find_blocking_reservations_unparseable_body_raises_503`)
 - **INV-DEL-7.** With both answers empty the device is deleted (204). There is no force
   flag. \
   Enforced in: `services/inventory/app/routers/devices.py` (`delete_device_by_id`) \
@@ -1304,8 +1310,10 @@ other error carries `detail` as a string or as the object shown.
 | 422 | `Invalid file type: must be one of ...`, `Invalid file name: path separators and traversal segments are not allowed`, `File too large: max <N> bytes`, `Invalid connection_type: must be one of ...` | driver upload, replace, or metadata update | INV-DRV-3, INV-DRV-4, INV-DRV-5, INV-DRV-10 |
 | 422 | `Secret does not exist` | hypervisor with an unknown secret | INV-HYP-3, INV-HYP-6 |
 | 422 | `Invalid JSON: ...`, `JSON import must be a list of records or an object with an 'items' list`, `'items' must be a list` | unparseable JSON import | INV-BULK-4 |
+| 422 | `Import file must be UTF-8 encoded; re-save it as UTF-8 and retry` | an import file that is not valid UTF-8 | INV-BULK-20 |
+| 422 | `generated port names would exceed 255 characters; ...` (validation list) | a bulk port create whose last generated name is too long | INV-PORT-6 |
 | 500 | `internal: missing Authorization header while resolving user groups` or `... group names` | a visibility or name lookup with no header to forward | INV-VIS-3 |
-| 500 | unhandled | group bulk add naming a device that does not exist; a non-UTF-8 import file; a non-JSON 200 from reservations during a delete | INV-GRP-7, INV-BULK-20, INV-DEL-6 |
+| 500 | unhandled | group bulk add naming a device that does not exist | INV-GRP-7 |
 | 503 | `auth service unreachable while fetching user groups` or `auth service returned <status> when fetching user groups` | visibility lookup failed | INV-VIS-2, INV-VIS-6, INV-VIS-8, INV-BATCH-5 |
 | 503 | `auth service unreachable while fetching group names` or `auth service returned <status> when fetching group names` | by-device group name lookup failed | INV-GRP-11 |
 | 503 | `Could not verify device is not in use` | the delete guard could not ask reservations or cabling | INV-DEL-5 |
@@ -1321,7 +1329,7 @@ A rejected import row is not an HTTP error: it is a `reject` entry with a `reaso
 |---|---|---|---|---|
 | inventory to auth | auth | `GET /groups/user/{id}` with the caller's JWT | a non-admin's user groups, for visibility | fail closed: 503 (INV-VIS-2) |
 | inventory to auth | auth | `GET /groups` with the caller's JWT | user group names for the by-device group lookup | fail closed: 503 (INV-GRP-11) |
-| inventory to reservations | reservations | `GET /internal/by-device/{id}` (`X-Internal-Token`, 5 s) | delete guard: reservations booking the device | fail closed: 503, or 500 on a non-JSON 200 (INV-DEL-5, INV-DEL-6) |
+| inventory to reservations | reservations | `GET /internal/by-device/{id}` (`X-Internal-Token`, 5 s) | delete guard: reservations booking the device | fail closed: 503, a non-JSON 200 included (INV-DEL-5, INV-DEL-6) |
 | inventory to cabling | cabling | `GET /internal/forks/by-device/{id}` (`X-Internal-Token`, 5 s) | delete guard: fork wiring and connections naming the device | fail closed: 503 (INV-DEL-5) |
 | inventory to secrets | secrets | `GET /internal/secrets/{id}/value` (`X-Internal-Token`, 10 s); only the status code is read | hypervisor secret exists | fail closed: 404 is 422, anything else 503 (INV-HYP-3, INV-HYP-4) |
 | inventory to storage | local disk or MinIO | put, get, remove object | driver archives | upload or download failure is unhandled (500); a delete failure is ignored (INV-DRV-12, INV-DRV-13) |
@@ -1383,9 +1391,6 @@ INV-PORT-6, by a throwaway script against the service on SQLite with foreign key
   itself ignoring reservation holds is intended (INV-STATUS-9, under Limits by
   decision).
 - #1021 (INV-GRP-12): user group names are resolved from auth's first page only.
-- #1022 (INV-PORT-6, INV-BULK-20, INV-DEL-6): 500 where 422 or 503 is meant: an
-  unbounded bulk port starting index, a non-UTF-8 import file, and a non-JSON 200 from
-  reservations during a device delete.
 - #1023 (INV-PORT-8): a port delete has no cabling guard, and neither has a port
   rename (INV-PORT-7 changes the name with no cabling check), so a connection can name
   a port that no longer exists under that name.
@@ -1430,7 +1435,6 @@ exist); #1025 tracks the corrections.
 - INV-DEV-15: the device page saves the status it loaded.
 - INV-RED-4: redaction covers only the template's password keys.
 - INV-BATCH-4: the batch does not force `dut_only`.
-- INV-PORT-6: an unbounded starting index can overflow the port name column.
 - INV-PORT-9: repeated port names on one device.
 - INV-GRP-7: a group bulk add naming a missing device.
 - INV-GRP-12: user group names beyond auth's first page.
@@ -1449,8 +1453,6 @@ exist); #1025 tracks the corrections.
 - INV-BULK-12: a device update row overwrites omitted columns.
 - INV-BULK-15: a dynamic template row cannot be imported.
 - INV-BULK-18: a dry run skips the create and update checks.
-- INV-BULK-20: a non-UTF-8 import file.
-- INV-DEL-6: a non-JSON reservations answer during delete.
 - INV-DEL-8: the guard and the delete are not atomic.
 - INV-DYN-6: dynamic-instance devices join `No Pool`.
 - INV-DYN-9: the generated-name attempt cap.
