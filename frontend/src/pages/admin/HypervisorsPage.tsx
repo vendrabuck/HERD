@@ -292,6 +292,10 @@ export function HypervisorsPage() {
           Enabled
         </label>
       </div>
+      <p className="text-xs text-gray-500 -mt-2">
+        While disabled, bookings of this hypervisor&apos;s dynamic templates are refused and no new
+        instances are created on it. Instances that already exist are still torn down.
+      </p>
       <div className="flex justify-end gap-2 pt-2">
         <button
           type="button"

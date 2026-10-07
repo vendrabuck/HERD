@@ -187,12 +187,59 @@ async def _fetch_dynamic_templates(template_ids: list[uuid.UUID], token: str) ->
         return await asyncio.gather(*[fetch_one(tid) for tid in template_ids])
 
 
-async def _validate_dynamic_requests(dynamic_requests, token: str) -> None:
-    """Validate every dynamic request's template exists and is a dynamic template.
+HYPERVISOR_CHECK_UNAVAILABLE = (
+    "Failed to contact inventory service while checking the hypervisor of a dynamic template"
+)
 
-    Raises ValueError (422) for a missing or wrong-type template and RuntimeError
-    (503) when inventory is unreachable, matching the device-validation
-    error-code conventions on the create path.
+
+async def _fetch_hypervisor_internal(hypervisor_id: str) -> dict | None:
+    """Read one hypervisor's internal record from inventory (issue #1033).
+
+    The user-facing hypervisor routes are admin-only, so the booking reads the
+    internal route with the internal token. Returns None on a 404. Fails closed:
+    no internal token, a transport error, a non-200 other than 404, or a body
+    without a boolean `enabled` all raise RuntimeError (503), since a booking
+    whose hypervisor cannot be checked must not go through.
+    """
+    if not settings.internal_api_token:
+        raise RuntimeError(HYPERVISOR_CHECK_UNAVAILABLE)
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{settings.inventory_service_url}/hypervisors/{hypervisor_id}/internal",
+                headers={"X-Internal-Token": settings.internal_api_token},
+                timeout=10.0,
+            )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(HYPERVISOR_CHECK_UNAVAILABLE) from exc
+    if resp.status_code == 404:
+        return None
+    if resp.status_code != 200:
+        raise RuntimeError(HYPERVISOR_CHECK_UNAVAILABLE)
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(HYPERVISOR_CHECK_UNAVAILABLE) from exc
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        raise RuntimeError(HYPERVISOR_CHECK_UNAVAILABLE)
+    return body
+
+
+async def _validate_dynamic_requests(dynamic_requests, token: str) -> None:
+    """Validate every dynamic request's template, then its hypervisor.
+
+    The template is read with the caller's JWT, so a dynamic template hidden
+    from a non-admin (issue #1053: visible only through its hypervisor's device
+    group) answers 404 exactly like an unknown id and is refused with the same
+    `Template <id> not found in inventory`. A non-dynamic template is refused
+    next. Then each distinct hypervisor is read once through the internal route
+    and a disabled one is refused, naming the hypervisor and the templates that
+    point at it (issue #1033); the visibility check runs first, so a hidden
+    template never reveals its hypervisor's name.
+
+    Raises ValueError (422) for a missing, hidden, wrong-type, or disabled
+    template and RuntimeError (503) when inventory is unreachable, matching the
+    device-validation error-code conventions on the create path.
     """
     unique_ids = list(dict.fromkeys(req.template_id for req in dynamic_requests))
     try:
@@ -207,6 +254,22 @@ async def _validate_dynamic_requests(dynamic_requests, token: str) -> None:
         raise ValueError(
             f"The following templates are not dynamic templates: {', '.join(non_dynamic)}"
         )
+
+    by_hypervisor: dict[str, list[dict]] = {}
+    for template in templates:
+        hypervisor_id = template.get("hypervisor_id")
+        if hypervisor_id:
+            by_hypervisor.setdefault(str(hypervisor_id), []).append(template)
+    for hypervisor_id, hv_templates in by_hypervisor.items():
+        hypervisor = await _fetch_hypervisor_internal(hypervisor_id)
+        names = ", ".join(str(t.get("name") or t["id"]) for t in hv_templates)
+        if hypervisor is None:
+            raise ValueError(f"The hypervisor of these dynamic templates no longer exists: {names}")
+        if hypervisor["enabled"] is not True:
+            raise ValueError(
+                f"Hypervisor '{hypervisor.get('name') or hypervisor_id}' is disabled; "
+                f"these dynamic templates cannot be booked until an admin enables it: {names}"
+            )
 
 
 class TopologyDeviceNotMember(ValueError):
