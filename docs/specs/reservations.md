@@ -1275,15 +1275,8 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
 
 ### Open defects
 
-- #995 (RES-PATCH-5): a PATCH can extend a reservation past
-  `RESERVATION_MAX_DURATION_SECONDS`; only create applies the cap.
-- #999 (RES-PATCH-9): PATCH-add on a `PENDING` reservation requires the added device to
-  be `AVAILABLE` now, while a create for the same future window skips that check
-  (RES-CREATE-12) and relies on the window conflict check.
-- #1000 (RES-CAL-3): when the visibility lookup fails, a non-admin's calendar is
-  unfiltered and shows every user's reservations (purpose, owner name, device ids).
-  Booking stays closed in the same outage (RES-CREATE-8, RES-PATCH-7). Issue #131
-  recorded the fail-open calendar as acceptable; #1000 supersedes that decision.
+None at present.
+
 
 ### Limits by decision
 
