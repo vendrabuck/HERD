@@ -413,9 +413,9 @@ async def test_import_templates_omitting_driver_preserves_existing(db_setup):
 
 
 @pytest.mark.asyncio
-async def test_import_devices_bad_enum_rolls_back_via_generic_except(db_setup):
-    """A bad status enum raises a Pydantic ValidationError (generic Exception
-    branch), rejected with a rollback."""
+async def test_import_devices_bad_enum_rolls_back_via_validation_error(db_setup):
+    """A bad status enum raises a Pydantic ValidationError (its own branch since
+    issue #1016), rejected with a rollback and a reason naming the field."""
     async with TestSessionLocal() as db:
         tmpl = await _seed_template(db, "DevTpl")
         report = await import_devices(
@@ -439,6 +439,7 @@ async def test_import_devices_bad_enum_rolls_back_via_generic_except(db_setup):
         assert tmpl is not None
     assert report.rejected == 1
     assert report.rows[0].action == "reject"
+    assert report.rows[0].reason.startswith("status: Input should be")
 
 
 @pytest.mark.asyncio

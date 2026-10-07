@@ -1029,3 +1029,132 @@ async def test_device_groups_for_device_ungrouped_device_returns_empty_list(clie
     resp = await client.get(f"/device-groups/device/{dev['id']}")
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+# --- issue #1019: bulk add naming devices that do not exist ---
+
+
+@pytest.mark.asyncio
+async def test_bulk_add_devices_mixed_unknown_id_is_422_naming_it_and_adds_nothing(client):
+    template = await _create_template(client)
+    dev1 = await _create_device(client, template["id"], "dev1")
+    dev2 = await _create_device(client, template["id"], "dev2")
+    group = await _create_device_group(client)
+    ghost = "00000000-0000-0000-0000-00000000dead"
+
+    resp = await client.post(
+        f"/device-groups/{group['id']}/devices/bulk",
+        json={"device_ids": [dev1["id"], ghost, dev2["id"]]},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == f"Devices not found: {ghost}"
+    detail = (await client.get(f"/device-groups/{group['id']}")).json()
+    assert detail["device_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_bulk_add_devices_all_unknown_ids_are_422_sorted_and_deduplicated(client):
+    group = await _create_device_group(client)
+    a = "00000000-0000-0000-0000-00000000000a"
+    b = "00000000-0000-0000-0000-00000000000b"
+
+    resp = await client.post(
+        f"/device-groups/{group['id']}/devices/bulk",
+        json={"device_ids": [b, a, b]},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == f"Devices not found: {a}, {b}"
+    detail = (await client.get(f"/device-groups/{group['id']}")).json()
+    assert detail["device_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_bulk_add_devices_empty_list_is_a_no_op(client):
+    group = await _create_device_group(client)
+    resp = await client.post(f"/device-groups/{group['id']}/devices/bulk", json={"device_ids": []})
+    assert resp.status_code == 200
+    assert resp.json() == {"added": 0, "skipped": 0}
+
+
+# --- issue #1021: user group names beyond auth's first page ---
+
+
+def _groups_page(groups: list[tuple[uuid.UUID, str]], total: int):
+    import httpx
+
+    return httpx.Response(
+        200,
+        json={
+            "items": [{"id": str(g), "name": n} for g, n in groups],
+            "total": total,
+            "skip": 0,
+            "limit": 500,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_group_names_pages_until_every_wanted_id_is_named():
+    """issue #1021: a wanted group on auth's second page used to resolve to a
+    null name. The lookup now pages at auth's maximum page size."""
+    from app.routers import device_groups as dg
+
+    first_page = [(uuid.uuid4(), f"g{i}") for i in range(500)]
+    late = uuid.uuid4()
+    early = first_page[3][0]
+    pages = [
+        _groups_page(first_page, total=502),
+        _groups_page([(uuid.uuid4(), "other"), (late, "Late Group")], total=502),
+    ]
+    fake = AsyncMock(side_effect=pages)
+    with patch.object(dg, "call_service", new=fake):
+        name_map = await dg._fetch_user_group_names([early, late], "Bearer t")
+
+    assert name_map == {early: "g3", late: "Late Group"}
+    assert [c.kwargs["params"] for c in fake.await_args_list] == [
+        {"skip": 0, "limit": 500},
+        {"skip": 500, "limit": 500},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_group_names_stops_once_every_wanted_id_is_named():
+    from app.routers import device_groups as dg
+
+    first_page = [(uuid.uuid4(), f"g{i}") for i in range(500)]
+    fake = AsyncMock(return_value=_groups_page(first_page, total=5000))
+    with patch.object(dg, "call_service", new=fake):
+        name_map = await dg._fetch_user_group_names([first_page[0][0]], "Bearer t")
+    assert name_map == {first_page[0][0]: "g0"}
+    assert fake.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_group_names_unknown_id_stops_at_end_of_list_with_no_name():
+    """A deleted user group is absent from every page: the lookup reads to the
+    end of the list and returns no name for it, never looping."""
+    from app.routers import device_groups as dg
+
+    first_page = [(uuid.uuid4(), f"g{i}") for i in range(500)]
+    pages = [_groups_page(first_page, total=500), _groups_page([], total=500)]
+    fake = AsyncMock(side_effect=pages)
+    with patch.object(dg, "call_service", new=fake):
+        name_map = await dg._fetch_user_group_names([uuid.uuid4()], "Bearer t")
+    assert name_map == {}
+    assert fake.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_group_names_second_page_failure_is_503():
+    import httpx
+    from app.routers import device_groups as dg
+    from fastapi import HTTPException
+
+    first_page = [(uuid.uuid4(), f"g{i}") for i in range(500)]
+    pages = [_groups_page(first_page, total=900), httpx.Response(502, text="bad gateway")]
+    fake = AsyncMock(side_effect=pages)
+    with patch.object(dg, "call_service", new=fake):
+        with pytest.raises(HTTPException) as exc:
+            await dg._fetch_user_group_names([uuid.uuid4()], "Bearer t")
+    assert exc.value.status_code == 503
+    assert exc.value.detail == "auth service returned 502 when fetching group names"

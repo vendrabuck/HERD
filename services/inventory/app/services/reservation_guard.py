@@ -40,9 +40,9 @@ async def find_blocking_reservations_for_device(device_id: uuid.UUID) -> list[di
     /internal/by-topology, so the lock sees every reservation on the device
     regardless of who holds it or which device groups the caller can see.
 
-    Raises HTTPException(503) on a transport error or a non-200 response
-    instead of failing open; see the module docstring for why this differs
-    from the topology guard.
+    Raises HTTPException(503) on a transport error, a non-200 response, or a
+    body that is not a JSON list of objects, instead of failing open; see the
+    module docstring for why this differs from the topology guard.
     """
     url = f"{settings.reservations_service_url.rstrip('/')}/internal/by-device/{device_id}"
     headers = {"X-Internal-Token": settings.internal_api_token}
@@ -71,5 +71,22 @@ async def find_blocking_reservations_for_device(device_id: uuid.UUID) -> list[di
             detail="reservations service returned an error while checking active reservations",
         )
 
-    items = resp.json()
+    # A 200 whose body is not a JSON list of objects (an HTML error page from a
+    # proxy, a truncated body) is as unverifiable as a non-200 answer, so it is
+    # the same 503 rather than an unhandled decode error (issue #1022).
+    try:
+        items = resp.json()
+    except ValueError:
+        items = None
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        logger.error(
+            "reservations service returned an unparseable body while checking device %s "
+            "for active reservations",
+            device_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="reservations service returned an unparseable body while checking "
+            "active reservations",
+        )
     return [item for item in items if str(item.get("status") or "").upper() in _BLOCKING_STATUSES]

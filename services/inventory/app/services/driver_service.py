@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.driver_package import VALID_CONNECTION_TYPES, DriverPackage
+from app.models.driver_package import VALID_CONNECTION_TYPES, ConnectionType, DriverPackage
 from app.models.template import DeviceTemplate
 from app.storage import delete_object, download_object, upload_object
 
@@ -180,6 +180,48 @@ async def create_driver(
     return package
 
 
+async def _assert_templates_allow_connection_type(
+    db: AsyncSession, driver_id: uuid.UUID, connection_type: str
+) -> None:
+    """Refuse a connection-type change that breaks a template using the driver.
+
+    The template-driver contract (template_service._validate_driver_connection_type)
+    is checked when a template picks its driver; without this check a driver
+    used by a device template could become a Hypervisor recipe, or a dynamic
+    template's recipe stop being one, after the fact (issue #1018). The refusal
+    is a 409 because the conflict is with other rows, as for a driver delete
+    while templates reference it, and it reuses the create-time rule's words.
+    """
+    template_types = set(
+        (
+            await db.execute(
+                select(DeviceTemplate.template_type)
+                .where(DeviceTemplate.driver_id == driver_id)
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    is_hypervisor = connection_type == ConnectionType.HYPERVISOR.value
+    if is_hypervisor and "device" in template_types:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot change connection_type: device templates use this driver, "
+                "and device templates cannot use a Hypervisor-type driver"
+            ),
+        )
+    if not is_hypervisor and "dynamic" in template_types:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot change connection_type: dynamic templates use this driver, "
+                "and dynamic templates require a Hypervisor-type driver"
+            ),
+        )
+
+
 async def update_driver(
     db: AsyncSession,
     driver_id: uuid.UUID,
@@ -197,6 +239,8 @@ async def update_driver(
         package.description = description
     if connection_type is not None:
         _validate_connection_type(connection_type)
+        if connection_type != package.connection_type:
+            await _assert_templates_allow_connection_type(db, driver_id, connection_type)
         package.connection_type = connection_type
     try:
         await db.commit()

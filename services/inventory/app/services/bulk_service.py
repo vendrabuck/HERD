@@ -20,6 +20,7 @@ from typing import Any
 
 from fastapi import HTTPException
 from herd_common.csv_safety import csv_safe_cell, csv_unsafe_cell
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -215,7 +216,15 @@ def _parse_json(raw: str) -> list[dict[str, Any]]:
 def parse_import(
     raw: bytes, fmt: str, columns: list[str], text_columns: set[str] | None = None
 ) -> list[dict[str, Any]]:
-    text = raw.decode("utf-8-sig")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        # A file saved in a legacy encoding (Latin-1, Windows-1252) is a client
+        # input error, not a server fault (issue #1022).
+        raise HTTPException(
+            status_code=422,
+            detail="Import file must be UTF-8 encoded; re-save it as UTF-8 and retry",
+        ) from exc
     if fmt == "csv":
         # text_columns applies only to CSV: a JSON import was never run
         # through csv_safe_cell on export, so it carries no quote to strip.
@@ -250,6 +259,20 @@ def _coerce_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "y")
+
+
+def _validation_reason(exc: ValidationError) -> str:
+    """A row-rejection reason for a schema error: each failing field by name.
+
+    str(ValidationError) carries the rejected input value, which for a device
+    row is its whole field_data (credentials included), plus a documentation
+    URL. The reason keeps only the field path and the message.
+    """
+    parts = []
+    for err in exc.errors(include_input=False, include_url=False):
+        loc = ".".join(str(p) for p in err["loc"]) or "row"
+        parts.append(f"{loc}: {err['msg']}")
+    return "; ".join(parts)
 
 
 # Import: devices ------------------------------------------------------------
@@ -315,6 +338,19 @@ async def import_devices(
             ).scalar_one_or_none()
 
             if existing is None:
+                # A new device needs a topology type (a NOT NULL column with no
+                # default); name the missing column rather than let the schema
+                # report an enum mismatch on None (issue #1016).
+                if raw_row.get("topology_type") in (None, ""):
+                    report.rows.append(
+                        RowResult(
+                            row=index,
+                            action="reject",
+                            identity=name,
+                            reason="missing required field: topology_type",
+                        )
+                    )
+                    continue
                 create = DeviceCreate(
                     name=name,
                     template_id=template_id,
@@ -327,13 +363,22 @@ async def import_devices(
                     await create_device(db, create, created_by=actor_id, created_by_name=actor_name)
                 report.rows.append(RowResult(row=index, action="create", identity=name))
             else:
-                update = DeviceUpdate(
-                    name=name,
-                    topology_type=raw_row.get("topology_type"),
-                    status=raw_row.get("status"),
-                    field_data=field_data,
-                    poll_interval_seconds=poll,
-                )
+                # Build the update kwargs conditionally, as the template importer
+                # does (issue #283): a column the row omits, or leaves empty, is
+                # left out so update_device's exclude_unset keeps the stored
+                # value. Passing every field explicitly overwrote omitted
+                # field_data with {} (credentials included), cleared the poll
+                # interval, and sent null into NOT NULL columns (issue #1016).
+                update_kwargs: dict[str, Any] = {"name": name}
+                for field in ("topology_type", "status"):
+                    value = raw_row.get(field)
+                    if value not in (None, ""):
+                        update_kwargs[field] = value
+                if raw_row.get("field_data") not in (None, ""):
+                    update_kwargs["field_data"] = field_data
+                if poll is not None:
+                    update_kwargs["poll_interval_seconds"] = poll
+                update = DeviceUpdate(**update_kwargs)
                 if not dry_run:
                     await update_device(
                         db, existing.id, update, modified_by=actor_id, modified_by_name=actor_name
@@ -344,6 +389,17 @@ async def import_devices(
                 await db.rollback()
             report.rows.append(
                 RowResult(row=index, action="reject", identity=name or None, reason=str(exc.detail))
+            )
+        except ValidationError as exc:
+            if not dry_run:
+                await db.rollback()
+            report.rows.append(
+                RowResult(
+                    row=index,
+                    action="reject",
+                    identity=name or None,
+                    reason=_validation_reason(exc),
+                )
             )
         except Exception as exc:
             if not dry_run:
@@ -455,6 +511,17 @@ async def import_templates(
                 await db.rollback()
             report.rows.append(
                 RowResult(row=index, action="reject", identity=name or None, reason=str(exc.detail))
+            )
+        except ValidationError as exc:
+            if not dry_run:
+                await db.rollback()
+            report.rows.append(
+                RowResult(
+                    row=index,
+                    action="reject",
+                    identity=name or None,
+                    reason=_validation_reason(exc),
+                )
             )
         except Exception as exc:
             if not dry_run:

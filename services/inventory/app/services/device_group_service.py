@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.models.device import Device
 from app.models.device_group import DeviceGroup, DeviceGroupDevice, DeviceGroupPermission
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,26 @@ async def _remove_from_no_pool(db: AsyncSession, device_ids: list[uuid.UUID]) ->
 async def bulk_add_devices(
     db: AsyncSession, group_id: uuid.UUID, device_ids: list[uuid.UUID]
 ) -> tuple[int, int]:
+    """Add devices to a group; return (added, skipped as already members).
+
+    Every requested id is resolved against `devices` BEFORE anything is
+    inserted (issue #1019). An unknown id used to fail the foreign key at an
+    autoflush outside any error handling, a 500 that also discarded the valid
+    rows. The response shape is counts only, with no per-row slot to report a
+    missing device in, so the request is all or nothing: any unknown id is a
+    422 naming every unknown id, and nothing is added.
+    """
+    requested = set(device_ids)
+    if requested:
+        found = set(
+            (await db.execute(select(Device.id).where(Device.id.in_(requested)))).scalars().all()
+        )
+        missing = requested - found
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail="Devices not found: " + ", ".join(sorted(str(m) for m in missing)),
+            )
     added = 0
     skipped = 0
     added_ids: list[uuid.UUID] = []

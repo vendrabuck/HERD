@@ -597,7 +597,9 @@ Content-Type: application/json
 { "device_ids": ["uuid-1", "uuid-2"] }
 ```
 
-Returns `{"added": 2, "skipped": 0}`. Skipped devices are already in the group.
+Returns `{"added": 2, "skipped": 0}`. Skipped devices are already in the group. Every id
+is checked first: when any id names no device, the request answers HTTP 422
+`Devices not found: <sorted ids>` and adds nothing.
 
 ### Bulk remove devices
 
@@ -720,6 +722,11 @@ Content-Type: application/json
 { "name": "EX2300 v2", "sections": [...] }
 ```
 
+An update that names `driver_id` or `hypervisor_id` is checked against the same rules as
+create: a device template keeps a non-Hypervisor driver and no hypervisor, and a dynamic
+template keeps a Hypervisor recipe driver and a hypervisor. A violation answers HTTP 422
+with the create path's message (for example `Device templates must have a driver`).
+
 ### Delete a template
 
 ```
@@ -785,6 +792,10 @@ Content-Type: application/json
 
 { "name": "Renamed Driver", "description": "Updated", "connection_type": "Management" }
 ```
+
+A `connection_type` change is refused with HTTP 409 when it would break a template that
+uses the driver: a change to `Hypervisor` while a device template uses it, or a change
+away from `Hypervisor` while a dynamic template uses it.
 
 ### Replace driver file
 
@@ -1466,8 +1477,8 @@ the sorted subset that holds the device only as a transit hop (always present, e
 none). The check calls reservations' internal `/internal/by-device/{device_id}` lookup and
 cabling's internal `GET /internal/forks/by-device/{device_id}` (non-archived forks whose
 `fork_connections` name the device on either end of any hop) and fails CLOSED: either
-service unreachable or erroring returns HTTP 503 ("Could not verify device is not in
-use") rather than silently letting the delete through. There is no force flag; cancel or
+service unreachable, erroring, or answering with an unparseable body returns HTTP 503
+("Could not verify device is not in use") rather than silently letting the delete through. There is no force flag; cancel or
 let the blocking reservation end first. Issue #940 adds a second refusal, checked AFTER
 the one above (so `device_in_use` wins when both apply): a device that any cabling
 connection still names, on either end, is refused with HTTP 409

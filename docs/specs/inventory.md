@@ -311,13 +311,16 @@ Copy, delete) and `frontend/src/pages/TemplateEditorPage.tsx` (view and edit); r
   unknown id answers 404. \
   Enforced in: `services/inventory/app/schemas/template.py` (`TemplateUpdate`); `services/inventory/app/services/template_service.py` (`update_template`) \
   Pinned by: `services/inventory/tests/test_templates.py` (`test_update_template`, `test_update_template_icon`, `test_update_template_can_clear_part_number`, `test_update_template_not_found`)
-- **INV-TPL-16.** An update re-checks the driver against the stored template type
-  (INV-TPL-13) only when the body names `driver_id`; it does not re-check the
-  create-time requirements of INV-TPL-9, INV-TPL-11, and INV-TPL-12, so an update can
-  clear a device template's driver or a dynamic template's hypervisor.
-  Known gap, see #1018. \
-  Enforced in: `services/inventory/app/services/template_service.py` (`update_template`) \
-  Pinned by: none
+- **INV-TPL-16.** An update whose body names `driver_id` or `hypervisor_id` re-runs the
+  create-time requirements of INV-TPL-9, INV-TPL-11, and INV-TPL-12 and the
+  connection-type rule of INV-TPL-13 on the merged driver and hypervisor against the
+  stored template type, answering 422 with the create path's words (for example
+  `Device templates must have a driver`, `Dynamic templates must have a hypervisor`,
+  `hypervisor_id is only valid on dynamic templates`), so an update cannot clear a
+  device template's driver or a dynamic template's hypervisor. An update that names
+  neither is not re-checked. \
+  Enforced in: `services/inventory/app/services/template_service.py` (`update_template`, `_validate_driver_and_hypervisor_presence`, `_validate_driver_connection_type`) \
+  Pinned by: `services/inventory/tests/test_dynamic_templates.py` (`test_update_device_template_clearing_driver_is_422`, `test_update_device_template_to_hypervisor_driver_is_422`, `test_update_device_template_adding_hypervisor_is_422`, `test_update_dynamic_template_clearing_hypervisor_or_driver_is_422`, `test_update_template_driver_swap_within_contract_still_succeeds`)
 - **INV-TPL-17.** An update that replaces `sections` keeps at least one section and
   does not re-validate existing devices' `field_data` against the new sections. \
   Enforced in: `services/inventory/app/schemas/template.py` (`TemplateUpdate`); `services/inventory/app/services/template_service.py` (`update_template`) \
@@ -410,11 +413,14 @@ deleted, and can be booked.
   `modified_by_name`. \
   Enforced in: `services/inventory/app/routers/devices.py` (`update_device_by_id`) \
   Pinned by: `services/inventory/tests/test_device_audit.py` (`test_update_device_records_modified_by_and_name`)
-- **INV-DEV-11.** A database integrity error on update, such as an explicit null status
-  or topology type, answers the same 409 `Device with name '<name>' already exists` as
-  a name clash. Known gap, see #1016. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`update_device`) \
-  Pinned by: none
+- **INV-DEV-11.** An update that sends an explicit null for `name`, `topology_type`,
+  `status`, or `field_data` (NOT NULL columns) answers 422 `<field> cannot be null; omit
+  the field to leave it unchanged`; an omitted field is left unchanged, and a null
+  `poll_interval_seconds` still clears the override. Only a unique violation at commit
+  answers 409 `Device with name '<name>' already exists`; any other integrity error
+  answers 409 `Device violates a database constraint`. \
+  Enforced in: `services/inventory/app/schemas/device.py` (`DeviceUpdate`); `services/inventory/app/services/inventory_service.py` (`update_device`) \
+  Pinned by: `services/inventory/tests/test_schema_bounds.py` (`test_device_update_explicit_null_on_not_null_column_rejected_by_name`, `test_device_update_explicit_null_poll_interval_still_clears_the_override`); `services/inventory/tests/test_inventory_service_unit.py` (`test_update_device_duplicate_name`, `test_update_device_non_unique_integrity_error_is_not_a_name_clash`); `services/inventory/tests/test_bulk.py` (`test_put_device_explicit_null_status_is_422_naming_the_field`)
 - **INV-DEV-12.** Deleting a device removes its ports and its group memberships with it. \
   Enforced in: `services/inventory/app/models/device.py` (`Device`); `services/inventory/app/models/device_group.py` (`DeviceGroupDevice`) \
   Pinned by: `services/inventory/tests/test_ports.py` (`test_delete_device_cascades_ports`); `services/inventory/tests/test_device_groups.py` (`test_delete_device_cascades_from_group`); `services/inventory/tests/test_storage_constraints.py` (`test_delete_device_cascades_device_group_device`)
@@ -710,10 +716,12 @@ device page; routes under `/devices/{id}/ports` and `/ports/{id}`.
   starting index of at least 0, all sharing one template and one `field_data`. \
   Enforced in: `services/inventory/app/schemas/port.py` (`BulkPortCreate`); `services/inventory/app/services/port_service.py` (`create_ports_bulk`) \
   Pinned by: `services/inventory/tests/test_ports.py` (`test_bulk_create_ports`, `test_bulk_create_ports_instances_exceeds_max`, `test_bulk_create_ports_invalid_instances_zero`, `test_bulk_create_ports_negative_starting_index`, `test_bulk_create_ports_empty_prefix`); `services/inventory/tests/test_port_service_unit.py` (`test_create_ports_bulk_naming`)
-- **INV-PORT-6.** The starting index has no upper bound, so a generated name can exceed
-  the 255-character column. Known gap, see #1022. \
-  Enforced in: `services/inventory/app/schemas/port.py` (`BulkPortCreate`) \
-  Pinned by: none
+- **INV-PORT-6.** The longest generated name (the prefix plus the last index) must fit
+  the 255-character column; otherwise the request answers 422 `generated port names
+  would exceed 255 characters; use a shorter name_prefix or a smaller starting_index`
+  and no port is created. \
+  Enforced in: `services/inventory/app/schemas/port.py` (`BulkPortCreate`, `PORT_NAME_MAX_LENGTH`) \
+  Pinned by: `services/inventory/tests/test_ports.py` (`test_bulk_create_ports_name_over_column_width_is_422`, `test_bulk_create_ports_last_name_exactly_at_column_width_is_accepted`)
 - **INV-PORT-7.** A port update changes only its name and `field_data`; `field_data` is
   validated against the port's template. \
   Enforced in: `services/inventory/app/services/port_service.py` (`update_port`) \
@@ -762,11 +770,12 @@ to one or more user groups; that grant is what lets a non-admin see a device.
   unique-constraint conflict instead of answering 500. \
   Enforced in: `services/inventory/app/services/device_group_service.py` (`bulk_add_devices`) \
   Pinned by: `services/inventory/tests/test_device_group_service_unit.py` (`test_bulk_add_devices_concurrent_duplicate_skips_gracefully`)
-- **INV-GRP-7.** Device ids are not checked before insert: an id with no device fails
-  the foreign key, the request answers 500, and no device in that request is added.
-  Known gap, see #1019. \
+- **INV-GRP-7.** Every requested device id is resolved before anything is inserted. When
+  any id names no device the request answers 422 `Devices not found: <ids>` (every
+  unknown id, sorted, comma separated) and no device in that request is added: the
+  `{added, skipped}` answer has no per-row slot, so the add is all or nothing. \
   Enforced in: `services/inventory/app/services/device_group_service.py` (`bulk_add_devices`) \
-  Pinned by: none
+  Pinned by: `services/inventory/tests/test_device_groups.py` (`test_bulk_add_devices_mixed_unknown_id_is_422_naming_it_and_adds_nothing`, `test_bulk_add_devices_all_unknown_ids_are_422_sorted_and_deduplicated`); `services/inventory/tests/test_storage_constraints.py` (`test_group_bulk_add_mixed_unknown_id_is_422_and_adds_nothing_with_fk_on`)
 - **INV-GRP-8.** Bulk remove answers `{removed, not_found}`. \
   Enforced in: `services/inventory/app/services/device_group_service.py` (`bulk_remove_devices`) \
   Pinned by: `services/inventory/tests/test_device_groups.py` (`test_bulk_remove_devices`, `test_bulk_remove_devices_not_found`)
@@ -783,11 +792,12 @@ to one or more user groups; that grant is what lets a non-admin see a device.
   answers 503. \
   Enforced in: `services/inventory/app/routers/device_groups.py` (`get_device_groups_for_device_endpoint`, `_fetch_user_group_names`) \
   Pinned by: `services/inventory/tests/test_device_groups.py` (`test_device_groups_for_device_resolves_names`, `test_device_groups_for_device_returns_503_when_auth_service_down`, `test_fetch_user_group_names_success_maps_wanted_ids`)
-- **INV-GRP-12.** The name lookup sends no paging parameters, so it reads auth's first
-  page only (50 user groups, oldest first); a user group beyond it is listed with a
-  null name. Known gap, see #1021. \
-  Enforced in: `services/inventory/app/routers/device_groups.py` (`_fetch_user_group_names`) \
-  Pinned by: none
+- **INV-GRP-12.** The name lookup pages through auth's group list at auth's maximum
+  page size (500) until every wanted user group is named or the list ends, so a user
+  group on any page gets its name; only a user group auth no longer lists has a null
+  name. A failure on any page answers the 503 of INV-GRP-11. \
+  Enforced in: `services/inventory/app/routers/device_groups.py` (`_fetch_user_group_names`, `_AUTH_GROUP_PAGE_SIZE`) \
+  Pinned by: `services/inventory/tests/test_device_groups.py` (`test_fetch_user_group_names_pages_until_every_wanted_id_is_named`, `test_fetch_user_group_names_stops_once_every_wanted_id_is_named`, `test_fetch_user_group_names_unknown_id_stops_at_end_of_list_with_no_name`, `test_fetch_user_group_names_second_page_failure_is_503`)
 - **INV-GRP-13.** For a non-admin, a hidden device answers the same 404 as an unknown
   one (INV-VIS-6). \
   Enforced in: `services/inventory/app/routers/device_groups.py` (`get_device_groups_for_device_endpoint`) \
@@ -877,10 +887,15 @@ download, delete); routes under `/drivers`. The package format is in
   type (validated as INV-DRV-5); a name clash answers 409. \
   Enforced in: `services/inventory/app/services/driver_service.py` (`update_driver`) \
   Pinned by: `services/inventory/tests/test_drivers.py` (`test_update_driver_metadata`, `test_update_driver_connection_type`, `test_update_driver_duplicate_name`); `services/inventory/tests/test_driver_service_unit.py` (`test_update_driver_invalid_connection_type`)
-- **INV-DRV-11.** Changing a package's connection type does not re-check the templates
-  that use it against INV-TPL-13. Known gap, see #1018. \
-  Enforced in: `services/inventory/app/services/driver_service.py` (`update_driver`) \
-  Pinned by: none
+- **INV-DRV-11.** Changing a package's connection type re-checks the templates that use
+  it against INV-TPL-13: a change to `Hypervisor` while a device template uses the
+  package answers 409 `Cannot change connection_type: device templates use this driver,
+  and device templates cannot use a Hypervisor-type driver`, and a change away from
+  `Hypervisor` while a dynamic template uses it answers 409 `Cannot change
+  connection_type: dynamic templates use this driver, and dynamic templates require a
+  Hypervisor-type driver`. Nothing is changed on a refusal. \
+  Enforced in: `services/inventory/app/services/driver_service.py` (`update_driver`, `_assert_templates_allow_connection_type`) \
+  Pinned by: `services/inventory/tests/test_dynamic_templates.py` (`test_update_driver_used_by_device_template_to_hypervisor_is_409`, `test_update_recipe_used_by_dynamic_template_to_non_hypervisor_is_409`, `test_update_driver_connection_type_within_contract_still_succeeds`)
 - **INV-DRV-12.** Replacing the file stores the new archive, deletes the old one when its
   key differs (a failed delete is ignored), and updates the file name, size, and
   SHA256. \
@@ -1015,24 +1030,28 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`, `import_templates`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_import_existing_device_is_update`, `test_template_reexport_reimport_is_noop_update`)
 - **INV-BULK-9.** A device row without a name, without a template name, or naming a
-  template that does not exist is rejected with that reason. \
+  template that does not exist is rejected with that reason, and so is a new device row
+  without a topology type (`missing required field: topology_type`). A schema error
+  rejects the row with each failing field and its message (`<field>: <message>`), never
+  the row's input values. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`) \
-  Pinned by: `services/inventory/tests/test_bulk.py` (`test_missing_name_is_rejected`, `test_one_bad_row_does_not_abort_batch`); `services/inventory/tests/test_bulk_service_unit.py` (`test_import_devices_missing_template_name_rejected`)
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_missing_name_is_rejected`, `test_one_bad_row_does_not_abort_batch`, `test_device_import_create_without_topology_type_names_the_field`, `test_device_import_schema_error_reason_names_field_and_omits_input`); `services/inventory/tests/test_bulk_service_unit.py` (`test_import_devices_missing_template_name_rejected`)
 - **INV-BULK-10.** A device row goes through the same create or update functions as the
   interactive routes, so their rules (INV-DEV-1 to INV-DEV-3, INV-FIELD-1 to
   INV-FIELD-7, INV-POLL-1) reject it on a committed import. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`) \
-  Pinned by: `services/inventory/tests/test_bulk_service_unit.py` (`test_import_devices_unknown_field_rolls_back_via_http_exception`, `test_import_devices_bad_enum_rolls_back_via_generic_except`)
+  Pinned by: `services/inventory/tests/test_bulk_service_unit.py` (`test_import_devices_unknown_field_rolls_back_via_http_exception`, `test_import_devices_bad_enum_rolls_back_via_validation_error`)
 - **INV-BULK-11.** A dry run writes nothing and returns the same report shape with
   `dry_run: true`. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`, `import_templates`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_dry_run_writes_nothing`); `tests/integration/test_bulk_import_export.py` (`test_device_import_dry_run_writes_nothing`)
-- **INV-BULK-12.** A device update row sets every column it carries and also every
-  column it omits: an omitted `field_data` replaces the stored values with `{}` (then
-  defaults apply), an omitted poll interval clears it, and an omitted status or
-  topology type makes the row fail with the 409 of INV-DEV-11. Known gap, see #1016. \
+- **INV-BULK-12.** A device update row leaves out every column it does not carry or
+  leaves empty, so an omitted `field_data`, poll interval, status, or topology type
+  keeps its stored value (the template importer's rule, INV-BULK-14). A row that
+  carries `field_data` replaces the whole object (INV-DEV-9). An import cannot clear a
+  device's poll interval; the device update route can. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`) \
-  Pinned by: none
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_device_json_reimport_omitting_columns_keeps_stored_values`, `test_device_csv_export_drop_columns_reimport_keeps_omitted_values`, `test_device_csv_name_and_template_only_is_a_no_op_update`, `test_import_existing_device_is_update`)
 - **INV-BULK-13.** A template row resolves its driver by name (rejected when the name is
   unknown) and goes through the template create or update functions. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`import_templates`) \
@@ -1079,9 +1098,10 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   422. \
   Enforced in: `services/inventory/app/routers/bulk.py` (`export_devices`, `import_devices_endpoint`); `services/inventory/app/services/bulk_service.py` (`parse_import`) \
   Pinned by: `services/inventory/tests/test_bulk_service_unit.py` (`test_parse_import_unknown_format_rejected`)
-- **INV-BULK-20.** A file that is not valid UTF-8 answers 500. Known gap, see #1022. \
+- **INV-BULK-20.** A file that is not valid UTF-8 answers 422 `Import file must be UTF-8
+  encoded; re-save it as UTF-8 and retry` for the whole file, and nothing is written. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`parse_import`) \
-  Pinned by: none
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_non_utf8_import_file_is_422_naming_the_encoding`)
 
 **Out of scope.** Topology import and export (`topology.md`). Ports and device groups
 are not exported or imported.
@@ -1124,10 +1144,13 @@ bulk delete show the refusal (INV-DEV-13, INV-LIST-15).
   `connection_count`, or `connection_ids`. \
   Enforced in: `services/inventory/app/services/device_delete_guard.py` (`assert_device_deletable`, `find_cabling_dependents_for_device`, `UNVERIFIABLE_DETAIL`) \
   Pinned by: `services/inventory/tests/test_device_delete_guard.py` (`test_cabling_non_200_is_503`, `test_cabling_unparseable_body_is_503`, `test_missing_internal_token_is_503`, `test_old_cabling_build_without_new_keys_blocks_delete_with_503`); `services/inventory/tests/test_devices.py` (`test_delete_device_blocked_by_reservation_upstream_unreachable_503`)
-- **INV-DEL-6.** A 200 from reservations whose body is not JSON makes the delete answer
-  500 rather than 503; the device is still not deleted. Known gap, see #1022. \
+- **INV-DEL-6.** A 200 from reservations whose body is not a JSON list of objects is
+  unverifiable like a non-200 answer: the delete answers the 503 of INV-DEL-5 and the
+  device is not deleted. The config-version restore, which asks the same lookup, answers
+  503 `reservations service returned an unparseable body while checking active
+  reservations`. \
   Enforced in: `services/inventory/app/services/reservation_guard.py` (`find_blocking_reservations_for_device`) \
-  Pinned by: none
+  Pinned by: `services/inventory/tests/test_device_delete_guard.py` (`test_reservations_unparseable_body_blocks_delete_with_503`); `services/inventory/tests/test_device_config_restore_reservation_guard.py` (`test_find_blocking_reservations_unparseable_body_raises_503`)
 - **INV-DEL-7.** With both answers empty the device is deleted (204). There is no force
   flag. \
   Enforced in: `services/inventory/app/routers/devices.py` (`delete_device_by_id`) \
@@ -1285,27 +1308,32 @@ other error carries `detail` as a string or as the object shown.
 | 404 | `Device group not found` | unknown device group on read, update, delete, or a bulk route | INV-GRP-1, INV-GRP-3, INV-GRP-4, INV-GRP-8, INV-GRP-9 |
 | 409 | `{"error": "device_in_use", "reservation_ids", "transit_reservation_ids"}` | delete of a device a live reservation depends on | INV-DEL-3 |
 | 409 | `{"error": "device_cabled", "connection_count", "connection_ids"}` | delete of a device a connection names | INV-DEL-4 |
-| 409 | `Device with name '<name>' already exists` | duplicate device name; any other integrity error on device update | INV-DEV-1, INV-DEV-11, INV-DYN-5 |
+| 409 | `Device with name '<name>' already exists` | duplicate device name | INV-DEV-1, INV-DEV-11, INV-DYN-5 |
+| 409 | `Device violates a database constraint` | a non-unique integrity error on device update | INV-DEV-11 |
 | 409 | `Could not generate a unique device name for prefix '<prefix>'` | the dynamic-instance name search ran out | INV-DYN-9 |
 | 409 | `Device is not a dynamic instance` | internal delete of a non-dynamic device | INV-DYN-7 |
 | 409 | `Template with name '<name>' already exists` or `Template violates a database constraint` | duplicate template name; another integrity error | INV-TPL-3 |
 | 409 | `Cannot delete template: devices still reference it` or `... ports still reference it` | template delete while referenced | INV-TPL-19 |
 | 409 | `Driver with name '<name>' already exists` | duplicate driver name on upload or rename | INV-DRV-8, INV-DRV-10 |
 | 409 | `Cannot delete driver: templates still reference it` | driver delete while referenced | INV-DRV-13 |
+| 409 | `Cannot change connection_type: device templates use this driver, ...` or `Cannot change connection_type: dynamic templates use this driver, ...` | a driver connection-type change that breaks a template using it | INV-DRV-11 |
 | 409 | `Hypervisor with name '<name>' already exists` | duplicate hypervisor name | INV-HYP-2 |
 | 409 | `Cannot delete hypervisor: templates still reference it` | hypervisor delete while referenced | INV-HYP-7 |
 | 409 | `Device group '<name>' already exists` | duplicate group name | INV-GRP-2 |
-| 422 | validation list | schema violations: name lengths, unknown enum values, poll interval below the floor, template field and section rules, batch over 500 ids, group bulk over 500 ids, port bulk bounds, blank hypervisor fields, bad export or import `format`, missing internal token header | INV-DEV-1, INV-DEV-6, INV-POLL-1, INV-TPL-2, INV-TPL-4 to INV-TPL-12, INV-BATCH-1, INV-GRP-2, INV-GRP-4, INV-GRP-9, INV-GRP-17, INV-PORT-4, INV-PORT-5, INV-HYP-11, INV-BULK-19, INV-INT-1, INV-INT-3 |
+| 422 | validation list | schema violations: name lengths, unknown enum values, an explicit null on a NOT NULL device field (INV-DEV-11), poll interval below the floor, template field and section rules, batch over 500 ids, group bulk over 500 ids, port bulk bounds, blank hypervisor fields, bad export or import `format`, missing internal token header | INV-DEV-1, INV-DEV-6, INV-POLL-1, INV-TPL-2, INV-TPL-4 to INV-TPL-12, INV-BATCH-1, INV-GRP-2, INV-GRP-4, INV-GRP-9, INV-GRP-17, INV-PORT-4, INV-PORT-5, INV-HYP-11, INV-BULK-19, INV-INT-1, INV-INT-3 |
+| 422 | `Devices not found: <ids>` | group bulk add naming a device that does not exist | INV-GRP-7 |
 | 422 | `Template not found`, `Template is not a device template`, `Template is not a port template`, `Template is not a dynamic template` | device, port, or dynamic-instance create from the wrong template | INV-DEV-2, INV-PORT-3, INV-DYN-1 |
 | 422 | `Template '<name>' has unknown hardware identity. ...` | device create from a template whose vendor or model is `unknown` | INV-DEV-3 |
 | 422 | `Unknown fields: <keys>`, `Required field missing: <key>`, `Field '<key>' must be a string`, `... a number`, `... a boolean`, `... one of: <options>` | `field_data` validation | INV-FIELD-1 to INV-FIELD-6 |
-| 422 | `Dynamic templates require a Hypervisor-type driver` or `Device templates cannot use a Hypervisor-type driver` | template driver of the wrong connection type | INV-TPL-13 |
+| 422 | `Dynamic templates require a Hypervisor-type driver` or `Device templates cannot use a Hypervisor-type driver` | template driver of the wrong connection type, on create or update | INV-TPL-13, INV-TPL-16 |
+| 422 | `Device templates must have a driver`, `Dynamic templates must have a driver`, `Dynamic templates must have a hypervisor`, `hypervisor_id is only valid on dynamic templates`, `driver_id is only valid on device or dynamic templates` | a template update whose merged driver or hypervisor breaks the create-time rules | INV-TPL-16 |
 | 422 | `Referenced hypervisor or driver does not exist` | template with an unknown driver or hypervisor id | INV-TPL-14 |
 | 422 | `Invalid file type: must be one of ...`, `Invalid file name: path separators and traversal segments are not allowed`, `File too large: max <N> bytes`, `Invalid connection_type: must be one of ...` | driver upload, replace, or metadata update | INV-DRV-3, INV-DRV-4, INV-DRV-5, INV-DRV-10 |
 | 422 | `Secret does not exist` | hypervisor with an unknown secret | INV-HYP-3, INV-HYP-6 |
 | 422 | `Invalid JSON: ...`, `JSON import must be a list of records or an object with an 'items' list`, `'items' must be a list` | unparseable JSON import | INV-BULK-4 |
+| 422 | `Import file must be UTF-8 encoded; re-save it as UTF-8 and retry` | an import file that is not valid UTF-8 | INV-BULK-20 |
+| 422 | `generated port names would exceed 255 characters; ...` (validation list) | a bulk port create whose last generated name is too long | INV-PORT-6 |
 | 500 | `internal: missing Authorization header while resolving user groups` or `... group names` | a visibility or name lookup with no header to forward | INV-VIS-3 |
-| 500 | unhandled | group bulk add naming a device that does not exist; a non-UTF-8 import file; a non-JSON 200 from reservations during a delete | INV-GRP-7, INV-BULK-20, INV-DEL-6 |
 | 503 | `auth service unreachable while fetching user groups` or `auth service returned <status> when fetching user groups` | visibility lookup failed | INV-VIS-2, INV-VIS-6, INV-VIS-8, INV-BATCH-5 |
 | 503 | `auth service unreachable while fetching group names` or `auth service returned <status> when fetching group names` | by-device group name lookup failed | INV-GRP-11 |
 | 503 | `Could not verify device is not in use` | the delete guard could not ask reservations or cabling | INV-DEL-5 |
@@ -1320,8 +1348,8 @@ A rejected import row is not an HTTP error: it is a `reject` entry with a `reaso
 | Direction | Peer | Call | Purpose | On failure |
 |---|---|---|---|---|
 | inventory to auth | auth | `GET /groups/user/{id}` with the caller's JWT | a non-admin's user groups, for visibility | fail closed: 503 (INV-VIS-2) |
-| inventory to auth | auth | `GET /groups` with the caller's JWT | user group names for the by-device group lookup | fail closed: 503 (INV-GRP-11) |
-| inventory to reservations | reservations | `GET /internal/by-device/{id}` (`X-Internal-Token`, 5 s) | delete guard: reservations booking the device | fail closed: 503, or 500 on a non-JSON 200 (INV-DEL-5, INV-DEL-6) |
+| inventory to auth | auth | `GET /groups?skip=&limit=500` with the caller's JWT, paged until every wanted id is named | user group names for the by-device group lookup | fail closed: 503 (INV-GRP-11) |
+| inventory to reservations | reservations | `GET /internal/by-device/{id}` (`X-Internal-Token`, 5 s) | delete guard: reservations booking the device | fail closed: 503, a non-JSON 200 included (INV-DEL-5, INV-DEL-6) |
 | inventory to cabling | cabling | `GET /internal/forks/by-device/{id}` (`X-Internal-Token`, 5 s) | delete guard: fork wiring and connections naming the device | fail closed: 503 (INV-DEL-5) |
 | inventory to secrets | secrets | `GET /internal/secrets/{id}/value` (`X-Internal-Token`, 10 s); only the status code is read | hypervisor secret exists | fail closed: 404 is 422, anything else 503 (INV-HYP-3, INV-HYP-4) |
 | inventory to storage | local disk or MinIO | put, get, remove object | driver archives | upload or download failure is unhandled (500); a delete failure is ignored (INV-DRV-12, INV-DRV-13) |
@@ -1364,28 +1392,13 @@ INV-PORT-6, by a throwaway script against the service on SQLite with foreign key
 
 - #985 (INV-LIST-9): a filter change made before the preferences load saves an empty
   search over the saved one.
-- #1016 (INV-BULK-12, INV-DEV-11): the device importer's update branch passes every
-  field explicitly, so an omitted column overwrites the stored value: `field_data`
-  becomes `{}` unless the template declares defaults or required fields, and an
-  omitted poll interval is cleared. `update_device` reports every integrity error,
-  an explicit null status or topology type included, as a name clash.
 - #1017 (INV-BULK-18): a dry run skips the create and update service calls, so the
   checks they own (unknown field keys, the template-driver connection-type rule,
   hardware identity) do not run, and the commit can reject a row the dry run accepted.
-- #1018 (INV-TPL-16, INV-DRV-11): a template update re-checks the driver only when the
-  body names `driver_id`, and a null driver returns before any check, so an update can
-  clear a device template's driver. A driver's connection type can change while
-  templates use it.
-- #1019 (INV-GRP-7): a bulk add with one unknown device id fails the foreign key at an
-  autoflush outside the `try`, answers 500, and adds nothing.
 - #1020 (INV-DEV-15): the device page saves the status loaded when the page opened, so
   a status change made elsewhere in the meantime is overwritten. The admin status write
   itself ignoring reservation holds is intended (INV-STATUS-9, under Limits by
   decision).
-- #1021 (INV-GRP-12): user group names are resolved from auth's first page only.
-- #1022 (INV-PORT-6, INV-BULK-20, INV-DEL-6): 500 where 422 or 503 is meant: an
-  unbounded bulk port starting index, a non-UTF-8 import file, and a non-JSON 200 from
-  reservations during a device delete.
 - #1023 (INV-PORT-8): a port delete has no cabling guard, and neither has a port
   rename (INV-PORT-7 changes the name with no cabling check), so a connection can name
   a port that no longer exists under that name.
@@ -1424,33 +1437,24 @@ exist); #1025 tracks the corrections.
 - INV-STATUS-8: create and import create accept any status.
 - INV-STATUS-9: an admin status write ignores reservation holds.
 - INV-TPL-6: a key repeated across sections.
-- INV-TPL-16: a template update does not re-check create-time requirements.
 - INV-TPL-24: a template's type cannot change.
-- INV-DEV-11: an integrity error on device update reads as a name clash.
 - INV-DEV-15: the device page saves the status it loaded.
 - INV-RED-4: redaction covers only the template's password keys.
 - INV-BATCH-4: the batch does not force `dut_only`.
-- INV-PORT-6: an unbounded starting index can overflow the port name column.
 - INV-PORT-9: repeated port names on one device.
-- INV-GRP-7: a group bulk add naming a missing device.
-- INV-GRP-12: user group names beyond auth's first page.
 - INV-GRP-15: a device left in no group is not returned to `No Pool`.
 - INV-GRP-16: renaming or deleting `No Pool`.
 - INV-GRP-17: the group name length.
 - INV-DRV-9: the storage key, the store-before-commit order, and the cleanup on a
   duplicate name.
-- INV-DRV-11: a connection type change does not re-check templates.
 - INV-DRV-17: a user-role download and the download content type.
 - INV-DRV-18: capability flags and uploader on a file replacement.
 - INV-HYP-6: a changed secret is re-validated (the test of that name does not assert
   the call).
 - INV-HYP-11: blank hypervisor fields.
 - INV-BULK-3: export content (clear passwords, no hypervisor).
-- INV-BULK-12: a device update row overwrites omitted columns.
 - INV-BULK-15: a dynamic template row cannot be imported.
 - INV-BULK-18: a dry run skips the create and update checks.
-- INV-BULK-20: a non-UTF-8 import file.
-- INV-DEL-6: a non-JSON reservations answer during delete.
 - INV-DEL-8: the guard and the delete are not atomic.
 - INV-DYN-6: dynamic-instance devices join `No Pool`.
 - INV-DYN-9: the generated-name attempt cap.
