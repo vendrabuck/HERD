@@ -273,7 +273,7 @@ def test_every_entry_into_pending_provision_stamps_provision_started_at():
     sites = _entry_sites()
     assert {(f, fn) for f, fn, _ in sites} == {
         ("services/reservation_service.py", "create_reservation"),
-        ("tasks/expiration.py", "_run_expiration_cycle"),
+        ("tasks/expiration.py", "_claim_due_pending_rows"),
     }, "a new write into PENDING_PROVISION must set provision_started_at (issue #997)"
     assert all(stamps for _, _, stamps in sites), sites
 

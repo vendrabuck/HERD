@@ -235,10 +235,13 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
 - **RES-STATUS-3.** The sweep claims due `PENDING` rows with `SELECT ... FOR UPDATE SKIP
   LOCKED` and sets `PENDING_PROVISION` through the ORM, not through
   `_claim_status_transition`; safety against a concurrent cancel rests on the Postgres
-  row lock (a concurrent cancel blocks on it, then re-reads and cancels from
-  `PENDING_PROVISION`). On SQLite the lock is a no-op. \
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
-  Pinned by: none (issue #998)
+  row lock. When the claim holds the row first, a concurrent cancel blocks on it, then
+  re-reads and cancels from `PENDING_PROVISION` (releasing the devices) and the
+  activation that follows does nothing; when the cancel holds it first, SKIP LOCKED
+  leaves the row out. Either way the row ends `CANCELLED` with one
+  `reservation.cancelled` and no `reservation.created`. On SQLite the lock is a no-op. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_due_pending_stmt`, `_claim_due_pending_rows`) \
+  Pinned by: `services/reservations/tests/test_sweep_claim_cancel_race_live_pg.py` (`test_claim_holds_the_row_first_cancel_blocks_then_cancels_from_provision`, `test_cancel_holds_the_row_first_claim_skips_it`)
 
 ## 5. API surface
 
@@ -477,9 +480,10 @@ The transitions are RES-DYN-4 to RES-DYN-9 and RES-SWEEP-6 (section 4).
   `template_type` `dynamic`; inventory unreachable fails closed with 503. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`, `_fetch_dynamic_templates`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_dynamic_booking_unknown_template_422_wording`, `test_dynamic_booking_non_dynamic_template_422_wording`, `test_dynamic_booking_inventory_unreachable_503_wording`)
-- **RES-DYN-2.** A booking carries at most 50 dynamic requests. \
-  Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationCreate`) \
-  Pinned by: none (issue #998)
+- **RES-DYN-2.** A booking carries at most 50 dynamic requests; the create form's
+  `MAX_DYNAMIC_REQUESTS` mirrors the cap. \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationCreate`); `frontend/src/components/reservations/CreateReservationModal.tsx` (`MAX_DYNAMIC_REQUESTS`) \
+  Pinned by: `services/reservations/tests/test_schema_bounds.py` (`test_dynamic_requests_at_cap_accepted`, `test_dynamic_requests_over_cap_rejected`); `tests/unit/test_dynamic_request_cap_parity.py` (`test_dynamic_request_cap_is_fifty_on_both_sides`)
 - **RES-DYN-3.** Listing a template N times books N instances, one row each; there is
   no dedupe. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`) \
@@ -583,7 +587,7 @@ The transitions are RES-CANCEL-3 to RES-CANCEL-5 and RES-RELEASE-3 to RES-RELEAS
 - **RES-RELEASE-2.** An admin who does not own the reservation gets 404 on release too.
   By decision ([ROLES.md](../ROLES.md); issue #843 aligned the UI to it). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`release_reservation_early`) \
-  Pinned by: none (issue #998)
+  Pinned by: `services/reservations/tests/test_owner_scoped_access.py` (`test_non_owner_admin_release_is_404_and_changes_nothing`)
 
 **Out of scope.** Hardware teardown triggered by the terminal events is execution's
 (`provisioning-and-wiring.md`, `dynamic-resources.md`).
@@ -650,7 +654,7 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
 - **RES-PATCH-2.** Only the owner can edit; every other caller, an admin included, gets
   404. By decision ([ROLES.md](../ROLES.md): owner-scoped, no admin bypass). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `get_reservation`) \
-  Pinned by: none (issue #998)
+  Pinned by: `services/reservations/tests/test_owner_scoped_access.py` (`test_non_owner_admin_patch_is_404_and_changes_nothing`, `test_non_owner_user_patch_is_404_and_changes_nothing`, `test_owner_patch_still_succeeds`)
 - **RES-PATCH-3.** A new `end_time` must be after `start_time` and in the future. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_end_time_not_after_start_rejected`, `test_update_reservation_end_time_in_past_rejected`)
@@ -792,7 +796,7 @@ and `frontend/src/pages/ReservationCalendarPage.tsx`; routes `GET /{id}` and
 - **RES-VIEW-2.** That includes an admin who does not own the reservation. By decision
   ([ROLES.md](../ROLES.md): owner only for every role). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_by_id`) \
-  Pinned by: none (issue #998)
+  Pinned by: `services/reservations/tests/test_owner_scoped_access.py` (`test_non_owner_admin_get_by_id_is_404`)
 - **RES-CAL-1.** The calendar returns every user's reservations overlapping
   `[range_start, range_end)`. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`list_calendar_reservations`) \
@@ -1231,7 +1235,7 @@ before the missing-fork backstop gives up; 20 pending prunes per tick.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/reservations/tests/` (in-memory SQLite); `frontend/src/test/lib/reservationStatus.test.ts`, `frontend/src/test/lib/reservationBulk.test.ts`, `frontend/src/test/lib/reservationFilters.test.ts` | Advisory locks and `SKIP LOCKED` are no-ops on SQLite, so concurrency below the status CAS is not exercised here |
-| Functional (through the service API) | `services/reservations/tests/test_reservations.py`, `test_fork_endpoints.py`, `test_dynamic_requests.py`, `test_reservation_list_filters.py` (httpx against the app); the `*_live_pg.py` suites against a real Postgres: `test_reservation_status_cas_live_pg.py`, `test_reservation_sort_live_pg.py`, `test_reservation_list_filters_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
+| Functional (through the service API) | `services/reservations/tests/test_reservations.py`, `test_fork_endpoints.py`, `test_dynamic_requests.py`, `test_reservation_list_filters.py` (httpx against the app); the `*_live_pg.py` suites against a real Postgres: `test_reservation_status_cas_live_pg.py`, `test_reservation_sort_live_pg.py`, `test_reservation_list_filters_live_pg.py`, `test_sweep_claim_cancel_race_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
 | Integration (running stack) | `tests/integration/test_reservation_lifecycle.py`, `test_reservation_patch.py`, `test_reservation_list_filters.py`, `test_provisioning_failed.py`, `test_dynamic_resources.py`, `test_reservation_fork_flow.py`, `test_device_set_patch_wiring.py`, `test_purpose_category_flow.py`, `test_purpose_review_flow.py` | `test_overlapping_reservation_is_rejected` accepts 409 or 422; the purpose review flow needs an AI provider and never runs in CI |
 | Stress and load | `tests/load/locustfile.py` (`ReservationUser`: list, calendar, create, release) | Create contention on one device is intended; no load test covers the sweep, PATCH, or the fork routes |
 | Browser end-to-end | `tests/e2e/test_reservations.py`, `test_reservation_cancel_ui.py`, `test_reservation_detail.py`, `test_reservations_bulk_playwright.py`, `test_reservations_filters_playwright.py`, `test_reservations_sort_playwright.py`, `test_live_edit_reservation_topology.py` | E2E runs nightly and in the `make master` and `make everything` gates, not per pull request |
@@ -1289,11 +1293,4 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
 
 ### Rules with no test
 
-Issue #998 tracks the tests for all of these.
-
-- RES-DYN-2: the 50-request cap.
-- RES-RELEASE-2: a release from a non-owner admin.
-- RES-STATUS-3: the sweep's row-lock claim against a concurrent cancel on Postgres.
-- RES-PATCH-2: a PATCH from a non-owner, admin or not.
-- RES-PATCH-5: an extension past the duration cap (it currently succeeds).
-- RES-VIEW-2: `GET /{id}` from a non-owner admin.
+- RES-PATCH-5: an extension past the duration cap (it currently succeeds; see #995).

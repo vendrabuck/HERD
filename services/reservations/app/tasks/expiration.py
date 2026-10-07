@@ -300,6 +300,55 @@ async def _complete_expired_rows(
     return completed
 
 
+def _due_pending_stmt(now: datetime):
+    """The sweep's claim query: PENDING rows due now, locked FOR UPDATE SKIP LOCKED.
+
+    skip_locked so concurrent service instances do not double-claim, and so a row a
+    concurrent cancel holds is skipped rather than waited on; it is a no-op on SQLite
+    (unit tests). Split out so the Postgres-live suite can run the REAL query narrowed
+    to its own rows on a used database (issue #998).
+    """
+    return (
+        select(Reservation)
+        .where(
+            and_(
+                Reservation.status == ReservationStatus.PENDING,
+                Reservation.start_time <= now,
+                # A window that already elapsed is never activated (issue
+                # #898): it would emit reservation.created, hold ACTIVE for a
+                # tick, then complete and release, clobbering a successor's
+                # RESERVED. The elapsed rows are failed by the cycle instead.
+                Reservation.end_time > now,
+            )
+        )
+        .with_for_update(skip_locked=True)
+    )
+
+
+async def _claim_due_pending_rows(db: AsyncSession, stmt, now: datetime) -> list[uuid.UUID]:
+    """Move the rows `stmt` selects from PENDING to PENDING_PROVISION; return their ids.
+
+    The one status write that is not a compare-and-swap (rule RES-STATUS-3): an ORM
+    set on rows `stmt` locked FOR UPDATE. It is safe only through that row lock. A
+    concurrent cancel that reaches the row first holds it, so SKIP LOCKED leaves it
+    out; a cancel that arrives while this transaction holds it blocks, then finds
+    PENDING_PROVISION, re-reads, and cancels from there. Pinned against a real
+    concurrent cancel by test_sweep_claim_cancel_race_live_pg.py. The caller commits.
+    """
+    claimed = (await db.execute(stmt)).scalars().all()
+    for res in claimed:
+        res.status = ReservationStatus.PENDING_PROVISION
+        # The provisioning backstops' clock (issue #997): flushed in the same
+        # UPDATE as the status, under the same row lock.
+        res.provision_started_at = now
+        logger.info(
+            "Claimed scheduled reservation %s for activation",
+            res.id,
+            extra={"action": "scheduled_activation_claim", "reservation_id": str(res.id)},
+        )
+    return [res.id for res in claimed]
+
+
 async def _run_expiration_cycle() -> None:
     """Single expiration cycle: activate pending, complete expired.
 
@@ -325,33 +374,7 @@ async def _run_expiration_cycle() -> None:
         # path). skip_locked so concurrent service instances do not double-claim;
         # it is a no-op on SQLite (unit tests). Provisioning runs after this
         # transaction commits and the row lock is released, never during HTTP.
-        result = await db.execute(
-            select(Reservation)
-            .where(
-                and_(
-                    Reservation.status == ReservationStatus.PENDING,
-                    Reservation.start_time <= now,
-                    # A window that already elapsed is never activated (issue
-                    # #898): it would emit reservation.created, hold ACTIVE for a
-                    # tick, then complete and release, clobbering a successor's
-                    # RESERVED. The elapsed rows are failed just below instead.
-                    Reservation.end_time > now,
-                )
-            )
-            .with_for_update(skip_locked=True)
-        )
-        claimed = result.scalars().all()
-        for res in claimed:
-            res.status = ReservationStatus.PENDING_PROVISION
-            # The provisioning backstops' clock (issue #997): flushed in the same
-            # UPDATE as the status, under the same row lock.
-            res.provision_started_at = now
-            logger.info(
-                "Claimed scheduled reservation %s for activation",
-                res.id,
-                extra={"action": "scheduled_activation_claim", "reservation_id": str(res.id)},
-            )
-        activate_ids = [res.id for res in claimed]
+        activate_ids = await _claim_due_pending_rows(db, _due_pending_stmt(now), now)
 
         # Fail PENDING rows whose whole window elapsed before activation (issue
         # #898): a deferred activation (inventory outage) or a long sweep outage.
