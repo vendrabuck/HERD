@@ -7,6 +7,31 @@
 - Fixed: a device import that updates an existing device writes only the columns the row carries, so omitted `field_data`, poll interval, status, and topology type keep their stored values; an explicit null on a NOT NULL device field is a 422 naming the field, and only a real name clash reads as one (#1016).
 - Fixed: the device page's user group names are resolved across every page of auth's group list, not only the first 50 groups (#1021).
 - Fixed: template and driver updates hold the template-driver connection-type contract: a template update cannot clear a required driver or hypervisor (422), and a driver's connection type cannot change in a way that breaks a template using it (409) (#1018).
+- Fixed: a dynamic-instance teardown that hits a transient recipe package download
+  failure (a replica with no cached copy while inventory or package storage is briefly
+  unreachable) now NAKs the terminal event so the redelivery destroys the instance; it
+  used to acknowledge the event with the instance still running and nothing retrying it.
+  A broken package still leaves the row live with `dynamic_instance_keyed_destroy_failed`
+  (#1029).
+- Fixed: a dynamic create can no longer leak an instance and its device after the
+  reservation's teardown has run. Each request re-reads the reservation after its ledger
+  row is committed and creates nothing once it is no longer `PENDING_PROVISION` (log
+  action `dynamic_instance_create_skipped_reservation_ended`), and the create path reads
+  ledger rows scoped to its own reservation. When a create loses its `ACTIVE` flip to
+  teardown, the compensating destroy now always runs, and a device delete that fails is
+  logged as `dynamic_instance_compensation_device_left` instead of being reported as a
+  clean undo (#1028).
+- Fixed: the dynamic recipe flows act on a `login` that returns `{"success": false}`: a
+  create stops before `create_instance` and retries, teardown and the compensating
+  destroy run no `destroy_instance` and keep the ledger row live, and recipe run rows are
+  `FAILED` whenever the recipe reported failure, as physical runs are. A device delete
+  that fails after a successful teardown destroy now logs
+  `dynamic_instance_device_delete_failed` with the device and the row's real status
+  (#1027).
+- Tests: pins for dynamic-resources rules that had none, among them secret redaction in
+  recipe run rows across a full create and teardown cycle and a live test of a failed
+  recipe login; the integration redelivery test's docstring now says it proves the
+  corroboration gate (#1032).
 - Docs: corrected documentation, docstrings, and comments that the code contradicts, found while writing the specifications; ADR 0004 and ADR 0015 gain dated as-built addenda instead of rewritten decisions (#1010, #1025, #1031, #1041).
 - Docs: specifications under `docs/specs/`, one per feature area, each rule tied to the code that enforces it and the test that pins it. The first is `docs/specs/reservations.md`; `tests/unit/test_spec_references.py` fails when a specification names a path, symbol, test, link, or section that no longer exists.
 - Fixed: ending a reservation no longer leaks a dynamic instance whose create failed,

@@ -33,7 +33,11 @@ from app.services.driver_loader import (
     read_driver_metadata,
 )
 from app.services.driver_sandbox import execute_driver_method, extract_config_schema
-from app.services.recipe_result import created_instance_ref, recipe_reported_success
+from app.services.recipe_result import (
+    created_instance_ref,
+    recipe_reported_success,
+    recipe_session_succeeded,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -337,7 +341,9 @@ def _step_verdict(action: str, result: dict) -> tuple[bool, str | None]:
     create_instance and destroy_instance go through the consumer's own
     predicates (app.services.recipe_result), so a recipe that validates green
     cannot fail every real provision on a missing success key or a missing
-    instance_ref (issue #937). The other methods keep _method_passed. Returns
+    instance_ref (issue #937), and login and logout go through the predicate
+    the consumer judges a recipe session with (issue #1027). status keeps
+    _method_passed. Returns
     (passed, rule text to report when the step failed on the rule alone).
     """
     if action == "create_instance":
@@ -346,6 +352,8 @@ def _step_verdict(action: str, result: dict) -> tuple[bool, str | None]:
     if action == "destroy_instance":
         ok = recipe_reported_success(result)
         return ok, None if ok else _DESTROY_RULE
+    if action in ("login", "logout"):
+        return recipe_session_succeeded(result), None
     return _method_passed(result), None
 
 

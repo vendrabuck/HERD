@@ -209,8 +209,12 @@ record instead of being retired, and the event is acknowledged. The log line car
   ExecutionRun row for the reservation (`GET /api/execution/runs?reservation_id=...`)
   shows the exception class, e.g. `driver raised AttributeError`, and records
   `method_kwargs` `{"instance_ref": null}`.
-- `login_failed`: the recipe could not log in to the hypervisor.
-- `recipe_load_failed`: the recipe package would not load.
+- `login_failed`: the recipe could not log in to the hypervisor: `login` raised, or
+  returned `{"success": false}` (the login run row is `FAILED`; issue #1027).
+- `recipe_load_failed`: the recipe package is broken and can never load as uploaded. A
+  package that merely could not be DOWNLOADED (inventory or package storage briefly
+  unreachable on a replica with no cached copy) is not logged here: teardown NAKs the
+  terminal event so it is redelivered and the destroy runs then (issue #1029).
 - `recipe_config_missing`: the template, hypervisor, or secret is gone (404).
 
 Find the affected rows and log lines:
@@ -304,6 +308,39 @@ then sits in `PENDING_PROVISION` until the provision timeout (`PROVISION_TIMEOUT
 default 900) fails it. No ledger row and
 no instance exist, so there is nothing to tear down. Rebook after reservations recovers,
 or replay the dead-lettered event before the timeout fires (`DLQ has messages` below).
+
+### Log action `dynamic_instance_device_delete_failed`
+
+Meaning: teardown destroyed a dynamic instance on the hypervisor, but inventory refused
+to delete the instance's device with a 4xx other than 404 (most often 409 `device_in_use`
+or `device_cabled`). The ledger row stays `ACTIVE` (or `CREATING`) on purpose: retiring it
+would leave the device with no record. The log line carries `request_id`,
+`reservation_id`, `device_id`, and `ledger_status`. Remove the cause (delete the device's
+cables, release the reservation that holds it), then re-publish the reservation's terminal
+event as described under `dynamic_instance_keyed_destroy_failed`: `destroy_instance` is
+idempotent by contract, so the replay destroys nothing twice and deletes the device. A
+5xx on the same delete is not logged here; it NAKs the event and is retried.
+
+### Log action `dynamic_instance_compensation_device_left`
+
+Meaning: a create lost its ledger row to a concurrent teardown after it had already
+materialized the instance's device. The create destroyed its instance (see
+`dynamic_instance_compensated` or `dynamic_instance_compensation_failed` on the same
+request), but inventory refused or failed the device delete, so the device named in
+`device_id` is left in inventory with no ledger row and nothing will retry it (a NAK
+would be refused, the reservation has ended). Check that no live reservation holds the
+device (the query under `dynamic_instance_keyed_destroy_failed`), then delete it through
+inventory as an admin (`DELETE /api/inventory/devices/<device_id>`).
+
+### Log action `dynamic_instance_create_skipped_reservation_ended`
+
+Meaning: execution was creating a reservation's dynamic instances, and before one of
+them started its recipe the reservation had left `PENDING_PROVISION` (cancelled or
+failed while provisioning ran; issue #1028). No instance and no device were created for
+that request. Its ledger row stays `CREATING` with no `instance_ref`, the same
+may-still-exist record a failed create leaves. If the reservation's teardown ran after
+that row was written it has already retired it; otherwise the row is inert, and a
+re-publish of the terminal event retires it with a keyed destroy that finds nothing.
 
 ## NATS and inter-service events
 

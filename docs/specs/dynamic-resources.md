@@ -255,13 +255,19 @@ goes live.
   provision_requested gate outage entry in `docs/TROUBLESHOOTING.md`). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_verify_reservation_event`, `process_reservation_message`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_reservations_5xx_on_the_provision_gate_naks`, `test_reservations_outage_through_max_deliver_dead_letters_without_a_create`)
-- **DYN-CREATE-3.** The reservation's status is checked once, before the event's first
-  request; requests are then processed one at a time in payload order with no further
-  status check, so a request that had no ledger row when the reservation's teardown read
-  its rows still creates its instance after the reservation ended. Known gap, see
-  #1028. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_handle_provision_requested`) \
-  Pinned by: none
+- **DYN-CREATE-3.** Requests are processed one at a time in payload order. After a
+  request's `CREATING` row is committed and before any recipe call, the reservation's
+  status is read again through the same check as DYN-CREATE-1; when it is no longer
+  `PENDING_PROVISION` the request creates nothing, its row stays `CREATING` with no ref,
+  `dynamic_instance_create_skipped_reservation_ended` is logged with the request id,
+  reservation id, and `reported_status`, and the event is abandoned (DYN-CREATE-26). A
+  5xx or transport error on that read raises `TransientUpstreamError`. Because teardown
+  runs only after the terminal status is committed, a teardown that listed the rows
+  before this row existed is always seen by the re-read, so a request with no row when
+  teardown ran can no longer create an instance after the reservation ended (issue
+  #1028). \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`, `_verify_reservation_event`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_create_for_a_request_teardown_never_listed_creates_nothing`, `test_create_recheck_5xx_naks_before_any_recipe_call`)
 - **DYN-CREATE-4.** An event with no `reservation_id` is logged and acked with no work. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_handle_provision_requested`) \
   Pinned by: none
@@ -316,15 +322,17 @@ goes live.
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_run_recipe_step`); `services/execution/app/config.py` (`recipe_timeout_seconds`) \
   Pinned by: none
 - **DYN-CREATE-16.** `logout` runs after `create_instance` whatever create returned;
-  when `login` fails, neither `create_instance` nor `logout` runs and the event is
-  nacked. \
+  when `login` fails (DYN-CREATE-17), neither `create_instance` nor `logout` runs, the
+  row stays `CREATING`, and the event is nacked like a failed create. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`) \
-  Pinned by: none
-- **DYN-CREATE-17.** `login` and `logout` are judged by the sandbox's transport flag
-  only: a `login` that returns `{"success": false}` without raising counts as a
-  successful login. Known gap, see #1027. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`, `_teardown_attempt`, `_destroy_orphaned_instance`); `services/execution/app/services/recipe_result.py` (`recipe_reported_success`) \
-  Pinned by: none
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_create_login_payload_failure_is_a_failed_create`, `test_create_login_transport_failure_runs_nothing_else`, `test_recipe_run_status_follows_the_recipe_verdict`)
+- **DYN-CREATE-17.** A `login` succeeds by the physical drivers' rule: the sandbox call
+  completed and a `success` key, when present in the returned object, is truthy; a
+  missing key counts as success. A `login` that returns `{"success": false}` without
+  raising is therefore a failed login in create, teardown, and the compensating destroy
+  (issue #1027). `logout`'s result is recorded and never acted on. \
+  Enforced in: `services/execution/app/services/recipe_result.py` (`recipe_session_succeeded`); `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`, `_teardown_attempt`, `_destroy_orphaned_instance`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_recipe_session_succeeded_is_the_physical_rule`, `test_create_login_payload_failure_is_a_failed_create`, `test_teardown_login_payload_failure_leaves_row_live`, `test_compensation_login_failure_runs_no_destroy`)
 - **DYN-CREATE-18.** A `create_instance` that fails (DYN-RESULT-1) leaves the row
   `CREATING` with no `instance_ref` and raises, so the event is nacked and the create is
   retried on each delivery up to the fifth (WIRE-CONSUME-10, WIRE-CONSUME-11). \
@@ -370,8 +378,8 @@ goes live.
   timeout backstop (RES-SWEEP-6). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_handle_provision_requested`, `_post_provision_result_best_effort`, `_post_provision_result`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_provision_happy_path_records_runs_ledger_device_and_callback`, `test_callback_retries_then_succeeds`, `test_callback_persistent_failure_is_swallowed`, `test_post_provision_result_posts_body_and_raises_for_status`)
-- **DYN-CREATE-26.** A request that is refused (DYN-CREATE-6) or undone (DYN-COMP-1,
-  DYN-COMP-2, DYN-COMP-4) abandons the event: no callback is posted,
+- **DYN-CREATE-26.** A request that is refused (DYN-CREATE-6), skipped (DYN-CREATE-3),
+  or undone (DYN-COMP-1, DYN-COMP-2, DYN-COMP-4) abandons the event: no callback is posted,
   `dynamic_provision_abandoned` is logged, and the event is acked. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_handle_provision_requested`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_provision_over_every_ledger_state`, `test_teardown_between_create_and_instance_ref_destroys_created_instance`)
@@ -388,6 +396,12 @@ goes live.
   created like any other. Known gap, see #1033. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_recipe_deps`); `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`) \
   Pinned by: none
+- **DYN-CREATE-30.** The create path reads and inserts ledger rows scoped to the event's
+  reservation: a row another reservation holds under the same request id is never
+  returned, so the insert trips the unique request id and the error is raised (issue
+  #1028). \
+  Enforced in: `services/execution/app/services/dynamic_instance_service.py` (`get_by_request_id`, `insert_or_get_creating`); `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_get_by_request_id_scoped_to_reservation`, `test_insert_or_get_creating_refuses_a_foreign_reservations_row`)
 
 **Out of scope.** The consumer's ack, nak, and dead-letter mechanics
 (`provisioning-and-wiring.md`); what reservations does with the callback (RES-DYN-6 to
@@ -421,7 +435,7 @@ the credentials leaking into the process environment or the run records.
 - **DYN-CTX-4.** Run records store the context with every secret key and every
   template field of type `password` replaced by `***REDACTED***`. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`, `_teardown_attempt`); `services/execution/app/services/execution_service.py` (`redact_context_for_logging`, `extract_password_keys`) \
-  Pinned by: none (issue #1032)
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_full_recipe_cycle_never_stores_secret_plaintext`)
 - **DYN-CTX-5.** Teardown and the compensating destroy build the same context, so the
   keyed destroy receives `HERD_request_id`; teardown reads the template by the row's
   `template_id` and the hypervisor by the row's `hypervisor_id`. \
@@ -452,14 +466,17 @@ consumer and the package validator.
   Enforced in: `services/execution/app/services/recipe_result.py` (`created_instance_ref`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_create_success_without_instance_ref_is_a_failed_create`)
 - **DYN-RESULT-3.** The package validator judges `create_instance` and both
-  `destroy_instance` steps with the same two functions. \
-  Enforced in: `services/execution/app/services/package_validator.py` (`recipe_reported_success`, `created_instance_ref`) \
-  Pinned by: `services/execution/tests/test_package_validator.py` (`test_validator_shares_the_consumer_predicates`, `test_create_that_the_consumer_would_reject_fails_validation`, `test_destroy_without_a_success_key_fails_validation`)
-- **DYN-RESULT-4.** A run record's status is `SUCCESS` whenever the sandbox call
-  completed, also when the recipe reported failure; the recipe's verdict is in the
-  stored output. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_run_recipe_step`) \
-  Pinned by: none
+  `destroy_instance` steps with the same two functions, and `login` and `logout` with
+  the consumer's session rule (DYN-CREATE-17). \
+  Enforced in: `services/execution/app/services/package_validator.py` (`_step_verdict`, `recipe_reported_success`, `created_instance_ref`, `recipe_session_succeeded`) \
+  Pinned by: `services/execution/tests/test_package_validator.py` (`test_validator_shares_the_consumer_predicates`, `test_create_that_the_consumer_would_reject_fails_validation`, `test_destroy_without_a_success_key_fails_validation`, `test_login_is_judged_by_the_consumer_session_rule`)
+- **DYN-RESULT-4.** A run record's status follows the physical runs' rule: `FAILED`
+  when the sandbox call failed or the returned object carries a present, falsy
+  `success` (with the recipe's own `error`, or `driver reported failure`), else
+  `SUCCESS`; the output is stored either way (issue #1027). A create or destroy with no
+  `success` key is a `SUCCESS` row that the flows still treat as failed (DYN-RESULT-1). \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_run_recipe_step`); `services/execution/app/services/execution_service.py` (`driver_result_failed`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_recipe_run_status_follows_the_recipe_verdict`, `test_create_login_payload_failure_is_a_failed_create`)
 
 **Out of scope.** The validator's dry-run lifecycle (`device-configuration.md`); the
 physical drivers' looser rule (`provisioning-and-wiring.md`).
@@ -518,17 +535,18 @@ instance or device is left behind without a ledger row.
   `dynamic_instance_create_lost_to_teardown`, and abandons the event (DYN-CREATE-26). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`, `_destroy_orphaned_instance`, `_log_lost_to_teardown`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_teardown_between_create_and_instance_ref_destroys_created_instance`)
-- **DYN-COMP-2.** When the `ACTIVE` flip loses, the create deletes the device it just
-  created, destroys the instance by ref, logs `dynamic_instance_create_lost_to_teardown`,
-  and abandons the event. \
+- **DYN-COMP-2.** When the `ACTIVE` flip loses, the create destroys the instance by ref,
+  then deletes the device it just created, logs
+  `dynamic_instance_create_lost_to_teardown`, and abandons the event. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`, `_delete_dynamic_device`, `_destroy_orphaned_instance`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_teardown_between_instance_ref_and_active_flip_leaves_no_orphan`)
-- **DYN-COMP-3.** In that branch the device delete's answer is not checked: an answer
-  other than 204 or 404 still continues to the destroy and the abandon, and a 5xx or
-  transport error raises before the destroy, so the event is nacked. Known gap, see
-  #1028. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`) \
-  Pinned by: none
+- **DYN-COMP-3.** In that branch the destroy runs before the device delete and never
+  raises, so a failing delete cannot skip it. A delete that answers neither 204 nor 404,
+  or fails with a 5xx or transport error, is not raised (a redelivery would be refused by
+  the corroboration gate): `dynamic_instance_compensation_device_left` is logged with the
+  request id, reservation id, and device id (issue #1028). \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`, `_delete_compensated_device`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_lost_active_flip_destroys_even_when_the_device_delete_fails`)
 - **DYN-COMP-4.** A create that failed or returned no ref re-reads its row; when
   teardown retired it meanwhile, the create runs a keyed compensating destroy, logs
   `dynamic_instance_create_lost_to_teardown`, and abandons the event instead of raising. \
@@ -546,10 +564,11 @@ instance or device is left behind without a ledger row.
   branch of `_provision_one_instance`). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_teardown_between_instance_ref_and_active_flip_leaves_no_orphan`)
-- **DYN-COMP-7.** When the compensation's `login` fails, neither `destroy_instance` nor
-  `logout` runs, and `dynamic_instance_compensation_failed` is logged. \
+- **DYN-COMP-7.** When the compensation's `login` fails (DYN-CREATE-17), neither
+  `destroy_instance` nor `logout` runs, and `dynamic_instance_compensation_failed` is
+  logged. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_destroy_orphaned_instance`) \
-  Pinned by: none
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_compensation_login_failure_runs_no_destroy`)
 
 **Out of scope.** Instances the recipe created under a name not derived from the request
 id: HERD cannot find them (DYN-CONTRACT-3).
@@ -595,17 +614,19 @@ guidance: [TROUBLESHOOTING.md](../TROUBLESHOOTING.md).
   against the snapshot teardown read (DYN-LEDGER-5). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_attempt`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_teardown_happy_path_destroys_and_marks_destroyed`, `test_keyed_destroy_on_active_row_without_ref_destroys_and_deletes_device`); `tests/integration/test_dynamic_resources.py` (`test_cancel_tears_down_the_dynamic_instance`)
-- **DYN-DESTROY-7.** A missing template, hypervisor, or secret, a recipe that will not
-  load for any reason, a failed `login`, a failed or raising `destroy_instance`, or a
-  device delete that answers neither 204 nor 404 leaves the row in its status and the
-  event is acked; nothing is raised. \
+- **DYN-DESTROY-7.** A missing template, hypervisor, or secret, a broken recipe package
+  (`DriverPackageError`), a failed `login` (DYN-CREATE-17), a failed or raising
+  `destroy_instance`, or a device delete that answers neither 204 nor 404 leaves the row
+  in its status and the event is acked; nothing is raised. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_attempt`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_teardown_driver_failure_leaves_active_and_acks`, `test_keyed_destroy_that_cannot_run_leaves_row_creating`, `test_keyed_destroy_login_failure_leaves_row_creating`, `test_legacy_recipe_keyed_destroy_raises_row_stays_creating`); `tests/integration/test_dynamic_resources.py` (`test_failed_keyed_destroy_leaves_ledger_row_creating`)
-- **DYN-DESTROY-8.** A recipe package download failure during teardown is handled as in
-  DYN-DESTROY-7 (row left live, event acked), unlike the create path, which retries it
-  (DYN-CREATE-13). Known gap, see #1029. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_attempt`) \
-  Pinned by: none
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_teardown_driver_failure_leaves_active_and_acks`, `test_keyed_destroy_that_cannot_run_leaves_row_creating`, `test_keyed_destroy_login_failure_leaves_row_creating`, `test_legacy_recipe_keyed_destroy_raises_row_stays_creating`, `test_teardown_broken_package_still_acks_with_row_live`, `test_teardown_login_payload_failure_leaves_row_live`); `tests/integration/test_dynamic_resources.py` (`test_failed_keyed_destroy_leaves_ledger_row_creating`)
+- **DYN-DESTROY-8.** Any other recipe load failure during teardown, a package download
+  failure (`RuntimeError` from `load_driver`) first of all, raises
+  `TransientUpstreamError` with the exception's class name only, before any recipe call
+  and with the row unchanged, so the terminal event is nacked and the redelivery
+  destroys the instance, as the create path retries it (DYN-CREATE-13; issue #1029). \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_attempt`); `services/execution/app/services/driver_loader.py` (`load_driver`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_teardown_recipe_download_failure_naks_then_redelivery_destroys`)
 - **DYN-DESTROY-9.** A row without a ref left live logs
   `dynamic_instance_keyed_destroy_failed` with `request_id`, `reservation_id`,
   `ledger_status`, and a `reason` of `recipe_config_missing`, `recipe_load_failed`,
@@ -617,10 +638,13 @@ guidance: [TROUBLESHOOTING.md](../TROUBLESHOOTING.md).
   `test_by_ref_destroy_failure_does_not_emit_the_keyed_action`). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_attempt`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_by_ref_destroy_failure_does_not_emit_the_keyed_action`)
-- **DYN-DESTROY-11.** A device delete that fails after a successful destroy logs a plain
-  error with no fixed log action, for a row without a ref too. Known gap, see #1027. \
+- **DYN-DESTROY-11.** A device delete that answers neither 204 nor 404 after a
+  successful destroy leaves the row live and logs `dynamic_instance_device_delete_failed`
+  with `request_id`, `reservation_id`, `device_id`, and the row's real `ledger_status`,
+  for a row with or without a ref; the keyed action is not logged, since the destroy
+  succeeded (issue #1027). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_attempt`) \
-  Pinned by: none
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_device_delete_failure_after_destroy_logs_fixed_action`)
 - **DYN-DESTROY-12.** A 5xx or transport error deleting the device after a successful
   destroy raises `TransientUpstreamError`, so the event is nacked and the row is left as
   it was. \
@@ -735,11 +759,11 @@ reference recipe `drivers/mock_hypervisor/`.
   raise), and `HERD_mock_sleep_ms` (every call sleeps), from template field defaults. \
   Enforced in: `drivers/mock_hypervisor/driver.py` (`_maybe_inject`) \
   Pinned by: `tests/unit/test_mock_hypervisor_driver.py` (`test_fail_injection_returns_unsuccessful_result`, `test_raise_injection_raises`, `test_sleep_injection_delays_each_call`, `test_keyed_destroy_honors_dry_run_and_fail_injection`)
-- **DYN-CONTRACT-7.** Because of DYN-CREATE-17, naming `login` in
-  `HERD_mock_fail_actions` does not fail a create or a teardown; only
-  `HERD_mock_raise_actions` makes `login` fail there. Known gap, see #1027. \
-  Enforced in: `drivers/mock_hypervisor/driver.py` (`_maybe_inject`); `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`) \
-  Pinned by: none (issue #1032)
+- **DYN-CONTRACT-7.** Naming `login` in `HERD_mock_fail_actions` fails a create and a
+  teardown (DYN-CREATE-17): no `create_instance` or `destroy_instance` runs, and the
+  login run rows are `FAILED`. \
+  Enforced in: `drivers/mock_hypervisor/driver.py` (`_maybe_inject`); `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`, `_teardown_attempt`) \
+  Pinned by: `tests/integration/test_dynamic_resources.py` (`test_failed_recipe_login_never_creates_and_lands_failed`); `services/execution/tests/test_nats_consumer_dynamic.py` (`test_create_login_payload_failure_is_a_failed_create`)
 - **DYN-CONTRACT-8.** The reference recipe declares `supports_dry_run`, flags every
   result `simulated` under dry run, and its `status` never raises. \
   Enforced in: `drivers/mock_hypervisor/driver.py` (`_flag_simulated`, `status`); `drivers/mock_hypervisor/driver_metadata.json` (`supports_dry_run`) \
@@ -931,7 +955,7 @@ requests per booking (RES-DYN-2) and per browser row.
 |---|---|---|
 | Unit | `services/execution/tests/test_nats_consumer_dynamic.py` (in-memory SQLite, sandbox stubbed, plus a stateful recipe double run through the real sandbox); `services/execution/tests/test_nats_consumer.py`; `services/execution/tests/test_nats_consumer_event_verification.py`; `tests/unit/test_mock_hypervisor_driver.py`; the frontend tests named in section 8.10 | Compare-and-swap races are driven by interleaving inside one process, not by concurrent replicas |
 | Functional (through the service API) | `services/reservations/tests/test_dynamic_requests.py` and `services/inventory/tests/test_devices_internal.py` (httpx against the app) | No live-Postgres suite covers the ledger |
-| Integration (running stack) | `tests/integration/test_dynamic_resources.py` | Uses `drivers/mock_hypervisor/`. `test_provision_requested_redelivery_is_idempotent` replays the event while the reservation is `ACTIVE`, so the corroboration gate refuses it before the ledger is consulted; its docstring credits the ledger |
+| Integration (running stack) | `tests/integration/test_dynamic_resources.py` | Uses `drivers/mock_hypervisor/`. `test_provision_requested_redelivery_is_idempotent` replays the event while the reservation is `ACTIVE`, so the corroboration gate refuses it before the ledger is consulted; its docstring says so and points at the unit pin for the ledger guard (issue #1032) |
 | Stress and load | None | `tests/load/locustfile.py` books no dynamic request; ADR 0004 skipped load testing because creation is bound by the hypervisor |
 | Browser end-to-end | `tests/e2e/test_flows_effects_playwright.py` (`test_reservation_create_dynamic_via_modal`), `tests/e2e/test_dynamic_template_authoring_playwright.py` | The placeholder flow on the canvas has no browser test; nothing checks in a browser that the instance device is deleted after cancel |
 
@@ -941,32 +965,18 @@ only `tests/unit/` was run.
 
 ## 13. Known limits and gaps
 
-Four documents disagree with the code this specification describes, tracked as
+Three documents disagree with the code this specification describes, tracked as
 documentation in #1031: `docs/ARCHITECTURE.md` (Topology separation) says physical and
 cloud devices are never mixed in one reservation (DYN-REQ-6); ADR 0004 describes port
-sub-templates, request parameters in `field_data`, a redelivery guard through
-`action_already_succeeded`, and a redaction test, none of which exists;
-[DRIVERS.md](../DRIVERS.md) gives `login` and `logout` a `success` result the flows do
-not read (DYN-CREATE-17); and the replay remedy in
+sub-templates, request parameters in `field_data`, and a redelivery guard through
+`action_already_succeeded`, none of which exists (its redaction test now exists,
+DYN-CTX-4); and the replay remedy in
 [TROUBLESHOOTING.md](../TROUBLESHOOTING.md) has no caveat that the instance device is
 `AVAILABLE` after release (DYN-DEVICE-11) and may have been booked again, while the
 internal delete checks no reservation by decision (`inventory.md`, INV-DEL-9).
 
 ### Open defects
 
-- #1027 (DYN-CREATE-17, DYN-CONTRACT-7, DYN-DESTROY-11): the create, teardown, and
-  compensation flows judge a recipe `login` by the sandbox transport flag only, so a
-  login that returns `{"success": false}` is followed by `create_instance` or
-  `destroy_instance`; a device delete that fails after a successful destroy is logged
-  with a plain error and no fixed log action.
-- #1028 (DYN-CREATE-3, DYN-COMP-3): the status is checked once per event and then every
-  request is created, so with several execution replicas a create can land after
-  teardown listed the rows; the lost-`ACTIVE`-flip compensation discards the device
-  delete's answer (a 5xx is raised before the compensating destroy, a 409 is logged as
-  clean).
-- #1029 (DYN-DESTROY-8): teardown catches every recipe load failure, a transient
-  download failure included, and leaves the row live with the event acked, while the
-  create path nacks the same error. Sibling of #1002.
 - #1030 (DYN-REQ-6, DYN-DEVICE-10): mixed bookings are intended, and the `ACTIVE`
   device-set edit applies the type uniformity check to the whole set, so a mixed
   reservation cannot change its device set; the instance device joins No Pool, so a
@@ -1010,32 +1020,19 @@ internal delete checks no reservation by decision (`inventory.md`, INV-DEL-9).
 
 ### Rules with no test
 
-Issue #1032 tracks the tests for DYN-CTX-4 and DYN-CONTRACT-7, and the integration
-redelivery test that proves the corroboration gate rather than the ledger (section 12).
-
 - DYN-REQ-3: dynamic requests cannot change after booking.
 - DYN-REQ-7: the booking-time template check has no visibility or ACL component.
-- DYN-CREATE-3: the reservation status is checked once per event, not per request.
 - DYN-CREATE-4: a `provision_requested` without `reservation_id`.
 - DYN-CREATE-9: a missing hypervisor or secret on create.
 - DYN-CREATE-15: the recipe timeout applied to recipe calls.
-- DYN-CREATE-16: `logout` after any create result, and a failed `login` on create.
-- DYN-CREATE-17: `login` and `logout` judged on the transport flag only.
 - DYN-CREATE-23: inventory refusing the device create.
 - DYN-CREATE-27: earlier instances of an event kept when a later one fails.
 - DYN-CREATE-28: an abandoned event skips its remaining requests.
 - DYN-CREATE-29: the hypervisor's `enabled` flag is not read.
-- DYN-CTX-4: secret values redacted in run records.
-- DYN-RESULT-4: run status `SUCCESS` on a recipe-reported failure.
 - DYN-DEVICE-10: the instance device's visibility to its owner.
 - DYN-DEVICE-11: the instance device `AVAILABLE` between release and delete.
-- DYN-COMP-3: the unchecked device delete in the `ACTIVE`-flip compensation.
-- DYN-COMP-7: a failed `login` in the compensating destroy.
-- DYN-DESTROY-8: a package download failure during teardown.
-- DYN-DESTROY-11: a device delete failure after a successful destroy.
 - DYN-DESTROY-16: teardown's run user and run device id.
 - DYN-DESTROY-17: a transient error reading the recipe's configuration in teardown.
 - DYN-CONTRACT-2: `status` never called, `create_instance` called without arguments.
-- DYN-CONTRACT-7: the `login` fail knob has no effect on the dynamic flows.
 - DYN-UI-10: a drop on a live reservation's canvas.
 - DYN-UI-14: placeholders left out of the fork save and autosave.

@@ -249,6 +249,31 @@ async def failing_destroy_dynamic_template(base_url, admin_token, hv_driver, hyp
 
 
 @pytest.fixture(scope="session")
+async def failing_login_dynamic_template(base_url, admin_token, hv_driver, hypervisor):
+    """A dynamic template whose recipe login answers {"success": false} without
+    raising (issue #1027): the mock's HERD_mock_fail_actions=login knob, which
+    the dynamic flows used to ignore."""
+    async with _admin_session_client(base_url, admin_token) as client:
+        payload = _dynamic_template_payload(
+            hv_driver["id"],
+            hypervisor["id"],
+            [
+                {
+                    "key": "mock_fail_actions",
+                    "label": "Mock fail actions",
+                    "type": "string",
+                    "default": "login",
+                },
+            ],
+        )
+        resp = await client.post("/inventory/templates", json=payload)
+        resp.raise_for_status()
+        template = resp.json()
+        yield template
+        await client.delete(f"/inventory/templates/{template['id']}")
+
+
+@pytest.fixture(scope="session")
 async def broken_recipe_driver(base_url, admin_token):
     """Upload a structurally broken Hypervisor recipe (no Driver class).
 
@@ -532,12 +557,13 @@ async def test_create_failure_lands_failed_with_no_orphans(
     assert status == "AVAILABLE", f"physical device stuck in {status} after FAILED"
 
     # Every create attempt is auditable and none actually created an instance.
-    # Run-row status is sandbox-level across all consumer flows (the method
-    # executed), so a driver-reported failure is a SUCCESS row whose recorded
-    # output carries success: false; that output is the audit contract here.
+    # A recipe step that completed but returned success: false is a FAILED run
+    # row (issue #1027, the physical runs' rule), and its recorded output still
+    # carries the recipe's verdict.
     creates = await _runs(admin_client, reservation["id"], "create_instance")
     assert creates, "no create_instance runs were recorded"
     for run in creates:
+        assert run["status"] == "FAILED", f"create_instance run {run['id']}: {run['status']}"
         output = json.loads(run["output"]) if run.get("output") else {}
         assert output.get("success") is False, (
             f"create_instance run {run['id']} did not report the injected failure: {output}"
@@ -629,6 +655,45 @@ async def test_failed_keyed_destroy_leaves_ledger_row_creating(
         _psql(f"DELETE FROM execution.dynamic_instances WHERE request_id = '{request_id}'")
 
 
+@pytest.mark.timeout(300)
+async def test_failed_recipe_login_never_creates_and_lands_failed(
+    admin_client, failing_login_dynamic_template, fresh_device
+):
+    """Issue #1027, live: the recipe login returns {"success": false}. No
+    create_instance may run on any delivery (it used to run right after the
+    failed login), every login run row is FAILED, the event exhausts its
+    deliveries and the reservation lands in FAILED. Teardown's own login fails
+    the same way, so no destroy_instance runs either and the ledger row stays
+    CREATING with no instance_ref as a may-still-exist record."""
+    reservation = await _reserve_dynamic(
+        admin_client, fresh_device["id"], failing_login_dynamic_template["id"]
+    )
+    request_id = reservation["dynamic_requests"][0]["id"]
+    try:
+        failed = await _poll_reservation_status(
+            admin_client, reservation["id"], "FAILED", timeout=240.0, interval=2.0
+        )
+        assert failed is not None, "reservation never landed in FAILED after login failures"
+        # Let teardown's login run land before reading the runs.
+        await asyncio.sleep(3.0)
+
+        assert await _runs(admin_client, reservation["id"], "create_instance") == []
+        assert await _runs(admin_client, reservation["id"], "destroy_instance") == []
+        logins = await _runs(admin_client, reservation["id"], "login")
+        assert logins, "no login runs were recorded"
+        assert {r["status"] for r in logins} == {"FAILED"}, logins
+        assert _ledger_row(request_id) == ("CREATING", "")
+
+        prefix = f"{failing_login_dynamic_template['name']}-{reservation['id'][:8]}"
+        assert await _devices_with_prefix(admin_client, prefix) == []
+        status = await _poll_device_status(admin_client, fresh_device["id"], "AVAILABLE")
+        assert status == "AVAILABLE", f"physical device stuck in {status} after FAILED"
+    finally:
+        # Test garbage on a shared stack: no create ever ran, so the
+        # may-still-exist row is known to be empty here and can go.
+        _psql(f"DELETE FROM execution.dynamic_instances WHERE request_id = '{request_id}'")
+
+
 @pytest.mark.timeout(120)
 async def test_broken_recipe_package_dead_letters_on_first_delivery(
     admin_client, broken_dynamic_template, fresh_device
@@ -702,13 +767,19 @@ async def test_broken_recipe_package_dead_letters_on_first_delivery(
 async def test_provision_requested_redelivery_is_idempotent(
     admin_client, dynamic_template, fresh_device
 ):
-    """Redelivery idempotency: re-publishing the provision_requested event, both
+    """Replay safety: re-publishing the provision_requested event, both
     verbatim (same event_id, new sequence: the relay-republish case) and with a
-    fresh event_id (forcing full reprocessing past any event-level dedupe),
-    must not create a second instance. The ledger keys the create on the
-    request id, so a redelivered create short-circuits before any sandbox step;
-    the observable invariants are a single create_instance SUCCESS run, a
-    single materialized device, and an unchanged ACTIVE reservation."""
+    fresh event_id (past any event-level dedupe), must not create a second
+    instance. The observable invariants are a single create_instance SUCCESS
+    run, a single materialized device, and an unchanged ACTIVE reservation.
+
+    What this proves is the corroboration gate, not the ledger (issue #1032):
+    both replays arrive after the reservation is ACTIVE, and execution's gate
+    requires PENDING_PROVISION for this event, so each replay is acked as
+    unverified before any ledger read. The ledger's own redelivery guard (an
+    ACTIVE row with a device skips the create) is pinned at unit level by
+    services/execution/tests/test_nats_consumer_dynamic.py
+    (test_redelivery_skips_active_row_and_still_reports_success)."""
     nats_error = await probe_nats()
     if nats_error is not None:
         pytest.skip(f"NATS unreachable from test host: {nats_error}")
@@ -727,8 +798,8 @@ async def test_provision_requested_redelivery_is_idempotent(
 
         # Replay 1: verbatim (same payload event_id, new JetStream sequence).
         await publish_raw(_PROVISION_SUBJECT, raw)
-        # Replay 2: fresh event_id, so the consumer fully reprocesses and the
-        # dynamic_instances ledger guard is what must hold.
+        # Replay 2: fresh event_id, so no event-level dedupe applies; the
+        # corroboration gate refuses it (the reservation is ACTIVE).
         mutated = json.loads(raw)
         mutated["event_id"] = str(uuid.uuid4())
         await publish_raw(_PROVISION_SUBJECT, json.dumps(mutated).encode())

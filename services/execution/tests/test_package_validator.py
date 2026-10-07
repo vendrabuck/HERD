@@ -364,6 +364,7 @@ def test_validator_shares_the_consumer_predicates():
 
     assert package_validator.recipe_reported_success is nats_consumer._recipe_reported_success
     assert package_validator.created_instance_ref is nats_consumer._created_instance_ref
+    assert package_validator.recipe_session_succeeded is nats_consumer._recipe_session_succeeded
 
 
 _CREATE_RULE_TEXT = (
@@ -415,6 +416,30 @@ def test_destroy_without_a_success_key_fails_validation():
     assert by_action["destroy_instance"]["passed"] is False
     assert by_action[KEYED_DESTROY_STEP]["passed"] is False
     assert report["valid"] is False
+
+
+@pytest.mark.parametrize(
+    "login_return, passed",
+    [
+        # A present, falsy success is a failed login for the consumer (issue
+        # #1027); _method_passed only refused a literal False.
+        ('{"success": 0}', False),
+        ('{"success": None}', False),
+        ('{"success": False, "error": "auth denied"}', False),
+        # A missing key stays a pass on both sides, so a recipe the validator
+        # approves is never refused by the consumer on a missing key.
+        ('{"session": "abc"}', True),
+    ],
+)
+def test_login_is_judged_by_the_consumer_session_rule(login_return, passed):
+    original = """    def login(self):
+        return {"success": True, "simulated": self.dry_run}"""
+    assert original in GOOD_DRIVER
+    driver = GOOD_DRIVER.replace(original, f"    def login(self):\n        return {login_return}")
+    report = run(good_package_b64(**{"driver.py": driver}))
+    by_action = {m["action"]: m for m in report["dry_run"]["methods"]}
+    assert by_action["login"]["passed"] is passed
+    assert report["valid"] is passed
 
 
 def test_keyed_destroy_step_runs_with_request_id_in_context():

@@ -1418,9 +1418,14 @@ waiting on a remote hypervisor API is wall-clock time, not CPU time.
 | destroy_instance | `{"success": bool}`; `success` must be present and true, as for create; with `instance_ref=None`, success means the request-id-named instance was destroyed or does not exist |
 | status | `{"reachable": bool}` |
 
-The dynamic flows stop when a `login` call itself fails to run (the driver raises or its
-process fails), but they do not yet act on a login's returned `success` value (see issue
-#1027).
+`login` is judged by the same rule as the physical contracts: a call that raises or whose
+process fails, or a returned object whose `success` key is present and false, is a failed
+login (a missing key counts as success). A failed login on create is a failed create (the
+event is retried with the row left `CREATING`; `create_instance` does not run); on
+teardown or the compensating destroy, `destroy_instance` does not run and the ledger row
+stays live. `logout`'s result is recorded on its run row but changes nothing. A recipe
+run row is `FAILED` whenever the call failed by this rule, so a returned
+`{"success": false}` reads as `FAILED` in the run history (issue #1027).
 
 `drivers/mock_hypervisor/` is the checked-in reference for this contract: a
 hardware-free recipe that honors dry-run on every method, keys create-side

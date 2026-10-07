@@ -18,14 +18,30 @@ def recipe_reported_success(result: dict) -> bool:
     here, where ``driver_result_failed``'s bare-data posture counts it as
     success. The delta is deliberate; do not swap one helper for the other
     (a recipe that never acknowledges an instance create must not be treated
-    as provisioned). Login/logout carry no such flag, so callers check
-    result["success"] directly for those.
+    as provisioned). Login and logout are judged by
+    ``recipe_session_succeeded`` instead.
     """
     failed, _ = driver_result_failed(result)
     if failed:
         return False
     output = result.get("output")
     return isinstance(output, dict) and bool(output.get("success"))
+
+
+def recipe_session_succeeded(result: dict) -> bool:
+    """True when a recipe ``login`` or ``logout`` call succeeded (issue #1027).
+
+    The physical drivers' rule, ``driver_result_failed``, unchanged: the sandbox
+    call must have completed, and a PRESENT ``success`` key in the returned
+    object must be truthy, so ``{"success": false}`` returned without raising
+    is a failed login. A missing key stays success (a bare-data return), the
+    posture the package validator has always applied to login and logout, so a
+    recipe that validates green is never refused here on a missing key. Unlike
+    create_instance and destroy_instance there is no instance to prove, so the
+    stricter missing-key rule of ``recipe_reported_success`` does not apply.
+    """
+    failed, _ = driver_result_failed(result)
+    return not failed
 
 
 def created_instance_ref(result: dict) -> str | None:

@@ -32,11 +32,19 @@ logger = logging.getLogger(__name__)
 LIVE_STATUSES = ("CREATING", "ACTIVE")
 
 
-async def get_by_request_id(db: AsyncSession, request_id) -> DynamicInstance | None:
-    """Return the ledger row for a request_id, or None if none exists yet."""
-    result = await db.execute(
-        select(DynamicInstance).where(DynamicInstance.request_id == _as_uuid(request_id))
-    )
+async def get_by_request_id(
+    db: AsyncSession, request_id, *, reservation_id=None
+) -> DynamicInstance | None:
+    """Return the ledger row for a request_id, or None if none exists yet.
+
+    With ``reservation_id`` the row must also belong to that reservation (issue
+    #1028): the create path passes the event's reservation so it never trusts a
+    row another reservation's request wrote under the same id.
+    """
+    stmt = select(DynamicInstance).where(DynamicInstance.request_id == _as_uuid(request_id))
+    if reservation_id is not None:
+        stmt = stmt.where(DynamicInstance.reservation_id == _as_uuid(reservation_id))
+    result = await db.execute(stmt)
     return result.scalar_one_or_none()
 
 
@@ -52,9 +60,12 @@ async def insert_or_get_creating(
     Idempotent under NATS redelivery: an existing row (any status) is returned
     as-is. The unique request_id makes the database the arbiter; a racing
     concurrent insert trips IntegrityError, so we roll back and re-read the
-    winner's row.
+    winner's row. Both reads are scoped to ``reservation_id``, so a row another
+    reservation holds under the same request id is never returned: the insert
+    then trips IntegrityError, the scoped re-read finds nothing, and the error
+    is re-raised (issue #1028).
     """
-    existing = await get_by_request_id(db, request_id)
+    existing = await get_by_request_id(db, request_id, reservation_id=reservation_id)
     if existing is not None:
         return existing
 
@@ -70,7 +81,7 @@ async def insert_or_get_creating(
         await db.commit()
     except IntegrityError:
         await db.rollback()
-        existing = await get_by_request_id(db, request_id)
+        existing = await get_by_request_id(db, request_id, reservation_id=reservation_id)
         if existing is None:
             # The unique violation implies a row exists; a None here is a real
             # anomaly worth surfacing rather than silently retrying forever.
