@@ -40,6 +40,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked
 from ._topology_teardown import delete_topology_checked
 
 pytestmark = pytest.mark.asyncio
@@ -394,3 +395,86 @@ async def test_vlan_ids_are_unique_within_same_fabric(admin_client, l2_template,
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
+
+
+async def _create_trunk(client, switch_a_id: str, switch_b_id: str, port: str) -> dict:
+    """An admin cable between two L2 switches: joins their cabling components."""
+    resp = await client.post(
+        "/cabling/connections",
+        json={
+            "device_a_id": switch_a_id,
+            "port_a": port,
+            "device_b_id": switch_b_id,
+            "port_b": port,
+            "connection_type": "L1",
+        },
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def test_vlan_ids_stay_distinct_across_a_cable_change_between_joins(
+    admin_client, l2_template, fresh_devices
+):
+    """Issue #1003: the uniqueness scope is reachability on the CURRENT cabling graph.
+
+    Reservation A joins switch S1 while S1 and S2 are separate components. An admin
+    then cables S1 to S2, which re-keys the component (cabling's fabric id is a hash of
+    the member set). Reservation B then joins S2. B's switch can now reach S1, where
+    A's VLAN is defined, so B must get a different number even though A's allocation
+    was stored under the old fabric id.
+
+    Limit, stated plainly: each reservation's preferred number is derived from its
+    server-chosen id, so on the pre-fix code this assertion fails only when the two
+    preferred numbers collide. The deterministic pins for the same sequence are the
+    unit tests that force colliding ids (test_vlan_service.py,
+    test_cable_change_between_joins_keeps_numbers_distinct, and
+    test_nats_consumer_l2_reconcile.py,
+    test_cable_change_between_two_reservations_joins_keeps_numbers_distinct).
+    """
+    suffix = uuid.uuid4().hex[:8]
+    s1 = await _create_device(admin_client, l2_template["id"], f"mock-l2-s1-{suffix}")
+    s2 = await _create_device(admin_client, l2_template["id"], f"mock-l2-s2-{suffix}")
+    dut_a, dut_b = await fresh_devices(2)
+    reservations = []
+    connections = []
+    topology_ids = []
+    try:
+        connections.append(await _create_connection(admin_client, dut_a["id"], s1["id"], "eth1"))
+        connections.append(await _create_connection(admin_client, dut_b["id"], s2["id"], "eth1"))
+
+        topo_a = await _create_topology(admin_client, _canvas_edge(dut_a["id"], s1["id"]))
+        topology_ids.append(topo_a)
+        res_a = await _create_reservation(admin_client, [dut_a["id"], s1["id"]], topo_a)
+        reservations.append(res_a)
+        assert await _poll_active(admin_client, res_a["id"]), "reservation A never activated"
+        runs_a = await _poll_success_runs(admin_client, res_a["id"], "add_to_vlan")
+        assert runs_a, "reservation A never joined its VLAN on S1"
+        vlan_a = _vlan_of(runs_a[0])
+
+        # The admin cable change between the two joins: S1 and S2 become one component.
+        connections.append(await _create_trunk(admin_client, s1["id"], s2["id"], "eth9"))
+
+        topo_b = await _create_topology(admin_client, _canvas_edge(dut_b["id"], s2["id"]))
+        topology_ids.append(topo_b)
+        res_b = await _create_reservation(admin_client, [dut_b["id"], s2["id"]], topo_b)
+        reservations.append(res_b)
+        assert await _poll_active(admin_client, res_b["id"]), "reservation B never activated"
+        runs_b = await _poll_success_runs(admin_client, res_b["id"], "add_to_vlan")
+        assert runs_b, "reservation B never joined its VLAN on S2"
+        vlan_b = _vlan_of(runs_b[0])
+
+        assert str(runs_b[0]["device_id"]) == s2["id"]
+        assert 2 <= vlan_a <= 4094 and 2 <= vlan_b <= 4094
+        assert vlan_b != vlan_a, (
+            f"reservation B reused VLAN {vlan_a}, which A holds on S1, reachable from S2"
+        )
+    finally:
+        for res in reservations:
+            await admin_client.delete(f"/reservations/{res['id']}")
+        for tid in topology_ids:
+            await delete_topology_checked(admin_client, tid)
+        for conn in connections:
+            await admin_client.delete(f"/cabling/connections/{conn['id']}")
+        for switch in (s1, s2):
+            await delete_device_checked(admin_client, switch["id"])

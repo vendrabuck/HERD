@@ -45,12 +45,12 @@ owner-or-admin check (RES-FORK-4) and the endpoint matrix is in [ROLES.md](../RO
 | Hop | One recorded physical cable segment between two device ports | cabling | cabling's `fork_connections` |
 | L1 cross-connect assignment | One switch port pair this reservation asked a matrix switch to connect. `reservation_id` and `switch_device_id` are bare ids, no foreign key | execution | `l1_connection_assignments` (`L1ConnectionAssignment` in `services/execution/app/models/l1_connection_assignment.py`) |
 | L2 membership | One (switch, port) this reservation put into its fabric VLAN | execution | `l2_port_assignments` (`L2PortAssignment`) |
-| VLAN allocation | The VLAN number one reservation uses in one fabric, plus the switches the VLAN must be defined on and has been defined on | execution | `vlan_assignments` (`VlanAssignment`); `fabric_id` comes from cabling, bare id |
+| VLAN allocation | The VLAN number one reservation uses in one fabric, plus the switches the VLAN must be defined on and has been defined on | execution | `vlan_assignments` (`VlanAssignment`); `fabric_id` comes from cabling, bare id, and is the component key at creation time only (WIRE-VLAN-2) |
 | L3 route pin | The route list this reservation installed on one L3 switch | execution | `route_assignments` (`RouteAssignment`) |
 | Assignment row fields | `status` (ACTIVE, FAILED, RELEASED), `intended` (ACTIVE or RELEASED: the direction the last write attempted), `attempts`, `last_error`, `claimed_until`, `created_at`, `released_at` | execution | the three ledger tables |
 | Wiring state | Per reservation: the last fork version applied and whether wiring is frozen | execution | `reservation_wiring_state` (`ReservationWiringState`) |
 | Execution run | The audit row of one driver action | execution | `execution_runs` (`operations-and-observability.md`) |
-| Fabric | The set of L2 switches connected to each other, as cabling computes it | cabling | cabling (`GET /fabric/internal`) |
+| Fabric | The connected component of the cabling graph a switch belongs to, transit included, as cabling computes it on the current graph | cabling | cabling (`GET /fabric/internal`) |
 | Switch config version | The latest stored config of an L3 switch (interfaces, virtual routers, routes) | inventory | inventory (`device-configuration.md`) |
 
 ## 4. State model
@@ -92,7 +92,7 @@ No transition leaves `RELEASED` (WIRE-LEDGER-10).
 
 | From | To | Performed by | Guard | Stages | Rule |
 |---|---|---|---|---|---|
-| (none) | `ACTIVE` | `find_or_assign_vlan` | no ACTIVE allocation for (reservation, fabric); number free in the fabric | nothing | WIRE-VLAN-1, WIRE-VLAN-2, WIRE-VLAN-3 |
+| (none) | `ACTIVE` | `find_or_assign_allocation` | no ACTIVE allocation of the reservation reaches the component; number held by no ACTIVE allocation that reaches it | nothing | WIRE-VLAN-1, WIRE-VLAN-2, WIRE-VLAN-3 |
 | `ACTIVE` | `RELEASED` | `_release_orphaned_allocations` | zero ACTIVE memberships reference it | nothing | WIRE-VLAN-4 |
 
 **Wiring state row.** It has no status column; two fields move.
@@ -220,21 +220,35 @@ build recorder re-checks it at record time (WIRE-LEDGER-4).
   route pins are per reservation and never displace each other. \
   Enforced in: `services/execution/app/services/l1_assignment_service.py` (`supersede_release_if_reclaimed`); `services/execution/app/services/l2_membership_service.py` (`supersede_l2_release_if_reclaimed`); `services/execution/app/services/wiring_retry_service.py` (`_reattempt_l3_rows`) \
   Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_retry_supersession_flips_release_row_without_driver_call`, `test_retry_no_supersession_when_active_row_same_reservation_fires_driver`); `services/execution/tests/test_l2_membership_service.py` (`test_supersede_when_other_reservation_active_on_same_port`, `test_supersede_false_when_no_other_reservation`); `services/execution/tests/test_wiring_retry_l3.py` (`test_l3_release_is_not_superseded_by_another_reservation_on_same_switch`)
-- **WIRE-VLAN-1.** `find_or_assign_vlan` returns the VLAN of an existing ACTIVE
-  allocation for (reservation, fabric); otherwise it inserts one ACTIVE allocation. \
-  Enforced in: `services/execution/app/services/vlan_service.py` (`find_or_assign_vlan`) \
-  Pinned by: `services/execution/tests/test_vlan_service.py` (`test_assign_vlan_idempotent`, `test_assign_vlan_concurrent_same_reservation_idempotent`)
-- **WIRE-VLAN-2.** A new allocation takes the reservation's preferred VLAN (derived from
-  its id, 2 to 4094) when free in the fabric, else the lowest free one; no two ACTIVE
-  allocations in one fabric share a number (partial-unique index), and an insert that
-  loses the race recomputes, at most five times, then raises `RuntimeError`. The same
-  number may be used in two fabrics. \
-  Enforced in: `services/execution/app/services/vlan_service.py` (`find_or_assign_vlan`, `_derive_vlan_id`, `_MAX_ASSIGN_RETRIES`); `services/execution/app/models/vlan_assignment.py` (`uq_vlan_active_per_fabric`) \
-  Pinned by: `services/execution/tests/test_vlan_service.py` (`test_derive_vlan_id_range`, `test_assign_vlan_conflict_same_fabric`, `test_assign_vlan_loses_race_retries_onto_free_vlan`, `test_assign_vlan_same_id_different_fabric`); `services/execution/tests/test_vlan_service_edges.py` (`test_assign_vlan_raises_on_persistent_contention`)
-- **WIRE-VLAN-3.** When every number in the fabric is in use, allocation raises
+- **WIRE-VLAN-1.** `find_or_assign_allocation` returns the existing ACTIVE allocation of
+  the reservation that reaches the component being allocated for (WIRE-VLAN-2's
+  reachability test), the oldest when several do, so a cable change never gives one
+  reservation a second number inside one component; otherwise it inserts one ACTIVE
+  allocation. A reservation that already holds a reachable allocation is answered from
+  its own rows without looking up any other reservation's switches. \
+  Enforced in: `services/execution/app/services/vlan_service.py` (`find_or_assign_allocation`, `_reachable_active`) \
+  Pinned by: `services/execution/tests/test_vlan_service.py` (`test_assign_vlan_idempotent`, `test_assign_vlan_concurrent_same_reservation_idempotent`, `test_same_reservation_reuses_reachable_allocation_after_cable_change`, `test_idempotent_path_does_not_walk_other_reservations`); `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_cable_change_keeps_one_allocation_and_scope_for_one_reservation`)
+- **WIRE-VLAN-2.** The uniqueness scope is reachability on the current cabling graph
+  (#1003): a number held by an ACTIVE allocation anywhere in the connected component of
+  the switches being allocated for, transit switches included, is never given to
+  another reservation. An allocation reaches the component when its stored `fabric_id`
+  equals the component's current fabric id, or when cabling's CURRENT fabric id for any
+  of its anchor switches (`switch_device_ids` plus `defined_switch_ids`) does; the
+  stored `fabric_id` is only the key at creation time and is never compared alone. A new
+  allocation takes the reservation's preferred VLAN (derived from its id, 2 to 4094)
+  when no reaching allocation holds it, else the lowest free one. The read, choice, and
+  insert run under one transaction-scoped advisory lock (`herd-execution-vlan-allocation`);
+  the partial-unique index on (fabric_id, vlan_id) stays as a backstop, and an insert
+  that trips it recomputes, at most five times, then raises `RuntimeError`. The same
+  number may be used in two components that share no cable. Fabric lookups are
+  memoized per pass, so one allocation costs one lookup per switch being allocated for
+  plus one per distinct anchor switch of the other live allocations. \
+  Enforced in: `services/execution/app/services/vlan_service.py` (`find_or_assign_allocation`, `allocation_reaches`, `allocation_anchor_switches`, `FabricResolver`, `_derive_vlan_id`, `_MAX_ASSIGN_RETRIES`, `_ALLOCATION_LOCK_KEY`); `services/execution/app/models/vlan_assignment.py` (`uq_vlan_active_per_fabric`) \
+  Pinned by: `services/execution/tests/test_vlan_service.py` (`test_derive_vlan_id_range`, `test_assign_vlan_conflict_same_fabric`, `test_assign_vlan_loses_race_retries_onto_free_vlan`, `test_assign_vlan_same_id_different_fabric`, `test_cable_change_between_joins_keeps_numbers_distinct`, `test_cable_removed_split_components_may_reuse_number`, `test_defined_switch_counts_as_an_anchor`, `test_row_inserted_before_the_lock_is_seen_under_it`); `services/execution/tests/test_vlan_service_edges.py` (`test_assign_vlan_raises_on_persistent_contention`, `test_fabric_resolver_memoizes_and_does_not_cache_failures`); `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_cable_change_between_two_reservations_joins_keeps_numbers_distinct`); `tests/integration/test_vlan_assignment.py` (`test_vlan_ids_stay_distinct_across_a_cable_change_between_joins`)
+- **WIRE-VLAN-3.** When every number in reach is in use, allocation raises
   `PermanentEventError`, so the event is dead-lettered on its first delivery
   (WIRE-CONSUME-9). \
-  Enforced in: `services/execution/app/services/vlan_service.py` (`find_or_assign_vlan`) \
+  Enforced in: `services/execution/app/services/vlan_service.py` (`find_or_assign_allocation`) \
   Pinned by: `services/execution/tests/test_vlan_service_edges.py` (`test_assign_vlan_raises_when_all_in_use`)
 - **WIRE-VLAN-4.** After a membership pass, each allocation that a removal in that pass
   touched is released when it has no ACTIVE membership left; a port moved within one
@@ -677,14 +691,15 @@ goes, the port leaves it.
   allocation and reason `recorded hop unresolvable: no VLAN allocation for fabric`, with
   no driver call. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_reconcile_l2_memberships`, `_resolve_add_allocations`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_reconcile_no_allocation_for_fabric_parks_add_failed_no_driver_call`); `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_resolve_add_allocations_defensive_missing_row_parks_add_failed`)
+  Pinned by: `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_reconcile_no_allocation_for_fabric_parks_add_failed_no_driver_call`)
 
 **Out of scope.** VLAN numbers and definitions are section 8.8.
 
 ### 8.8 VLAN allocation and definition
 
 **What it does.** Each reservation gets its own VLAN number in each fabric it uses, no
-two live reservations in one fabric share a number, and the VLAN is created on every
+two live reservations whose switches can reach each other through cabling share a
+number, and the VLAN is created on every
 switch the traffic crosses and deleted when the last member leaves.
 
 **Surfaces.** `services/execution/app/services/vlan_service.py`;
@@ -697,21 +712,25 @@ WIRE-VLAN-4.
 **Rules.**
 
 - **WIRE-VLAN-5.** Only switches with an addition are allocated for, grouped by the
-  fabric cabling reports, one allocation per fabric. \
+  fabric cabling reports for them now, one allocation per fabric. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_resolve_add_allocations`) \
   Pinned by: `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_allocation_groups_switches_by_fabric`, `test_allocation_shares_one_vlan_within_a_fabric`); `tests/integration/test_vlan_assignment.py` (`test_vlan_ids_are_unique_within_same_fabric`)
-- **WIRE-VLAN-6.** When the fabric lookup answers non-200 or fails in any way, the switch
-  is treated as its own fabric, identified by `uuid5` of its id (the id cabling computes
-  for a switch with no cabled neighbor), re-resolved on every call, and allocation goes
-  on; VLAN numbers are unique only among allocations with the same fabric id. Known gap,
-  see #1003. \
-  Enforced in: `services/execution/app/services/vlan_service.py` (`fetch_fabric_id`); `services/execution/app/services/nats_consumer.py` (`_resolve_add_allocations`, `_refresh_allocation_scopes`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_allocation_falls_back_when_fabric_lookup_fails`); `services/execution/tests/test_vlan_service_edges.py` (`test_fetch_fabric_id_non_200_returns_none`, `test_fetch_fabric_id_exception_returns_none`)
+- **WIRE-VLAN-6.** The fabric lookup fails closed (#1003): any non-200 answer, a
+  transport error, or an unparseable body raises `TransientUpstreamError` with the text
+  `cabling fabric lookup for device <id>: upstream <status>`, `...: transport error
+  <ExceptionClass>`, or `...: unparseable answer`. Nothing is allocated and no stand-in
+  fabric is used: the reconcile nacks the event (WIRE-ORDER-11), the retry tick leaves
+  the rows FAILED, and the manual retry answers 503. A failed lookup is not memoized. \
+  Enforced in: `services/execution/app/services/vlan_service.py` (`fetch_fabric_id`, `FabricResolver`); `services/execution/app/services/nats_consumer.py` (`_resolve_add_allocations`, `_refresh_allocation_scopes`) \
+  Pinned by: `services/execution/tests/test_vlan_service_edges.py` (`test_fetch_fabric_id_non_200_raises_transient`, `test_fetch_fabric_id_transport_error_raises_transient`, `test_fetch_fabric_id_unparseable_answer_raises_transient`); `services/execution/tests/test_vlan_service.py` (`test_outage_during_allocation_raises_and_allocates_nothing`); `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_allocation_fails_closed_when_fabric_lookup_fails`); `services/execution/tests/test_wiring_retry_l2.py` (`test_nil_allocation_build_retry_fabric_outage_fails_closed`)
 - **WIRE-VLAN-7.** The definition scope is every `Layer 2 Switch` on any intended hop,
   trunks included; on every reconcile it replaces `switch_device_ids` on each of the
-  reservation's ACTIVE allocations, by fabric. \
+  reservation's ACTIVE allocations with the scope switches whose current fabric id
+  matches the current fabric id of one of the allocation's anchor switches or its
+  stored `fabric_id` (so a cable change that re-keys the component does not empty the
+  scope). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_derive_l2_definition_scope`, `_refresh_allocation_scopes`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_scope_membership_only_switch`, `test_scope_includes_trunk_transit_switches`, `test_scope_through_l1_hop_credits_only_l2_side`)
+  Pinned by: `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_scope_membership_only_switch`, `test_scope_includes_trunk_transit_switches`, `test_scope_through_l1_hop_credits_only_l2_side`); `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_cable_change_keeps_one_allocation_and_scope_for_one_reservation`)
 - **WIRE-VLAN-8.** Before any membership call, `create_vlan` runs on each scope switch
   not yet in `defined_switch_ids`, each in its own login, call, and logout session; a
   success adds the switch to `defined_switch_ids`. \
@@ -1227,7 +1246,7 @@ Events are in section 6; the internal routes this area serves are in section 7.
 |---|---|---|---|---|
 | Out | reservations | `GET /internal/{id}` (internal token, 10 s) | corroborate an event's status | Fail closed: 5xx or transport nacks; 404 or another non-200 acks without acting (WIRE-GATE-2, WIRE-GATE-3) |
 | Out | cabling | `GET /internal/forks/{id}` (internal token, 10 s) | the intended hops and routing intent | Fail closed: 404 is an empty set; any other non-200 or transport nacks the event (WIRE-ORDER-6), and a retry drives no build row of that reservation (WIRE-RETRY-7) |
-| Out | cabling | `GET /fabric/internal?device_id` (internal token, 10 s) | the fabric of an L2 switch | Fail open: a substitute fabric per switch (WIRE-VLAN-6) |
+| Out | cabling | `GET /fabric/internal?device_id` (internal token, 10 s) | the current fabric of an L2 switch, the reachability test for VLAN uniqueness | Fail closed: any non-200, transport error, or bad body nacks the event; in a retry the tick logs it and the manual route answers 503 (WIRE-VLAN-6) |
 | Out | inventory | `GET /devices/{id}/internal`, `GET /templates/{id}/internal` (internal token, 10 s) | classify hop endpoints, load switch drivers | 5xx or transport nacks the event (WIRE-ORDER-11); in a retry the tick logs it and the manual route answers 503; another non-200 reads as missing (WIRE-PAIR-4, WIRE-L1-3) |
 | Out | inventory | `GET /devices/{id}/config-versions/latest/internal` (internal token, 10 s) | L3 config routes and the drive gate | 5xx or transport nacks (WIRE-L3-18); 404 means no config (WIRE-L3-4, WIRE-L3-16) |
 | Out | inventory | `GET /drivers/{id}/internal-download` (through the driver loader) | fetch a driver package on a cache miss | The switch's rows are parked FAILED and retryable by both retry channels; a broken package is parked non-retryable (WIRE-DRIVER-7); in the VRF capability check a failed download nacks instead (WIRE-L3-14) |
@@ -1275,11 +1294,6 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
 
 ### Open defects
 
-- #1003 (WIRE-VLAN-6): VLAN uniqueness is checked only among allocations with the same
-  fabric id. A failed fabric lookup substitutes the id of a one-switch fabric, exactly
-  what cabling computes for an isolated switch, and re-resolves it on every call. The
-  fabric id itself is computed by cabling from the membership of the connected
-  component (`topology.md`).
 
 ### Limits by decision
 
@@ -1306,10 +1320,11 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
   [DRIVERS.md](../DRIVERS.md) and the docstring of `_define_pending_for_allocations`.
 - An L3 route pin is per reservation and has no supersession settlement
   (WIRE-LEDGER-16). Recorded in the docstring of `_reattempt_l3_rows`.
-- A failed fabric lookup falls back to a per-switch substitute fabric so provisioning
-  never blocks on cabling (WIRE-VLAN-6). Recorded in the docstring of
-  `test_allocation_falls_back_when_fabric_lookup_fails`; the consequence for VLAN
-  uniqueness is #1003 above.
+- VLAN uniqueness is checked when an allocation is made (WIRE-VLAN-2). A cable added
+  later that joins two components already holding the same number, or removed under a
+  live allocation, is not re-checked; there is no reconcile. The release supersession
+  guard (WIRE-VLAN-11) still compares stored fabric ids. Recorded in issue #1003 and the
+  module docstring of `vlan_service.py`.
 
 ### Rules with no test
 

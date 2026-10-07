@@ -437,35 +437,6 @@ async def test_heal_after_converged_apply_is_a_no_op():
     assert set(vas[0].defined_switch_ids) == {SW_L2, SW_MID, SW_L2_B}
 
 
-# --- _resolve_add_allocations: find_or_assign committed but the re-read misses ---
-
-
-async def test_resolve_add_allocations_defensive_missing_row_parks_add_failed():
-    """_resolve_add_allocations re-reads the ACTIVE vlan_assignment right after
-    find_or_assign_vlan returns, purely defensively (find_or_assign_vlan always
-    leaves a matching row committed in practice). If that re-read ever came up
-    empty, the fabric gets no allocation entry, so the switch's add is later parked
-    FAILED with the pinned no-allocation reason rather than silently vanishing."""
-    from app.services import vlan_service as vlan_service_module
-
-    async def fake_find_or_assign(db, reservation_id, fabric_id, switch_device_ids):
-        # Returns a VLAN id without ever inserting the matching row, forcing the
-        # caller's immediate re-read to come up empty.
-        return 123
-
-    execute_fn, calls = _recorder()
-    with patch.object(vlan_service_module, "find_or_assign_vlan", new=fake_find_or_assign):
-        await _reconcile([_wire(DUT1, "eth0", SW_L2, "0/0/1")], execute_fn=execute_fn, calls=calls)
-
-    assert calls == [], "no driver call: the add could not be resolved to an allocation"
-    rows = await _membership_rows()
-    assert len(rows) == 1
-    assert rows[0].status == "FAILED"
-    assert rows[0].intended == "ACTIVE"
-    assert "no VLAN allocation for fabric" in rows[0].last_error
-    assert await _allocation() == [], "no allocation row was ever committed"
-
-
 # --- _release_orphaned_allocations: no matching ACTIVE row to release ---------
 
 

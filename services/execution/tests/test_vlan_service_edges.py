@@ -1,6 +1,7 @@
 """Edge-branch coverage for vlan_service.py.
 
-Covers fetch_fabric_id (network helper, all outcomes), the no-free-VLAN
+Covers fetch_fabric_id (network helper, all outcomes, fail closed per issue
+#1003), the FabricResolver memo, the no-free-VLAN
 exhaustion in find_or_assign_vlan, and the retry-exhaustion guard. The happy
 paths and the IntegrityError-retry race are covered in test_vlan_service.py.
 """
@@ -13,10 +14,11 @@ import pytest
 from app.database import Base
 from app.models.vlan_assignment import VlanAssignment
 from app.services import vlan_service
-from app.services.nats_consumer import PermanentEventError
+from app.services.nats_consumer import PermanentEventError, TransientUpstreamError
 from app.services.vlan_service import (
     VLAN_MAX,
     VLAN_MIN,
+    FabricResolver,
     _derive_vlan_id,
     fetch_fabric_id,
     find_or_assign_vlan,
@@ -84,24 +86,76 @@ async def test_fetch_fabric_id_success(monkeypatch):
     assert result == fabric_id
 
 
+@pytest.mark.parametrize("status", [403, 404, 500, 503])
 @pytest.mark.asyncio
-async def test_fetch_fabric_id_non_200_returns_none(monkeypatch):
+async def test_fetch_fabric_id_non_200_raises_transient(monkeypatch, status):
+    """Any non-200 answer fails closed (issue #1003): no None, no stand-in fabric."""
     monkeypatch.setattr(
         vlan_service.httpx,
         "AsyncClient",
-        lambda *a, **kw: _FakeClient(resp=_resp(404)),
+        lambda *a, **kw: _FakeClient(resp=_resp(status)),
     )
-    assert await fetch_fabric_id(str(uuid.uuid4())) is None
+    device = str(uuid.uuid4())
+    with pytest.raises(TransientUpstreamError) as info:
+        await fetch_fabric_id(device)
+    assert str(info.value) == f"cabling fabric lookup for device {device}: upstream {status}"
 
 
 @pytest.mark.asyncio
-async def test_fetch_fabric_id_exception_returns_none(monkeypatch):
+async def test_fetch_fabric_id_transport_error_raises_transient(monkeypatch):
+    """A transport error fails closed and names only the exception class."""
     monkeypatch.setattr(
         vlan_service.httpx,
         "AsyncClient",
-        lambda *a, **kw: _FakeClient(exc=httpx.ConnectError("down")),
+        lambda *a, **kw: _FakeClient(exc=httpx.ConnectError("down at 10.0.0.9")),
     )
-    assert await fetch_fabric_id(str(uuid.uuid4())) is None
+    device = str(uuid.uuid4())
+    with pytest.raises(TransientUpstreamError) as info:
+        await fetch_fabric_id(device)
+    assert str(info.value) == (
+        f"cabling fabric lookup for device {device}: transport error ConnectError"
+    )
+
+
+@pytest.mark.parametrize("payload", [{}, {"fabric_id": "not-a-uuid"}, {"fabric_id": None}])
+@pytest.mark.asyncio
+async def test_fetch_fabric_id_unparseable_answer_raises_transient(monkeypatch, payload):
+    monkeypatch.setattr(
+        vlan_service.httpx,
+        "AsyncClient",
+        lambda *a, **kw: _FakeClient(resp=_resp(200, payload)),
+    )
+    device = str(uuid.uuid4())
+    with pytest.raises(TransientUpstreamError, match="unparseable answer"):
+        await fetch_fabric_id(device)
+
+
+@pytest.mark.asyncio
+async def test_fabric_resolver_memoizes_and_does_not_cache_failures():
+    calls: list[str] = []
+    fabric = uuid.uuid4()
+    fail_once = {"left": 1}
+
+    async def fetch(switch_id):
+        calls.append(switch_id)
+        if fail_once["left"]:
+            fail_once["left"] -= 1
+            raise TransientUpstreamError("down")
+        return fabric
+
+    resolver = FabricResolver(fetch=fetch)
+    with pytest.raises(TransientUpstreamError):
+        await resolver.fabric_of(SWITCH)
+    assert await resolver.fabric_of(SWITCH) == fabric
+    assert await resolver.fabric_of(uuid.UUID(SWITCH)) == fabric
+    assert calls == [SWITCH, SWITCH]
+
+
+def _resolver():
+    async def fetch(switch_id):
+        return FABRIC
+
+    return FabricResolver(fetch=fetch)
 
 
 # --- find_or_assign_vlan: no free VLAN (line 112) ---
@@ -136,7 +190,7 @@ async def test_assign_vlan_raises_when_all_in_use(db, monkeypatch):
     # (the only value), which is already in use, so the lowest-free scan fails.
     rid = str(uuid.uuid4())
     with pytest.raises(PermanentEventError, match="No free VLAN"):
-        await find_or_assign_vlan(db, rid, FABRIC, [SWITCH])
+        await find_or_assign_vlan(db, rid, FABRIC, [SWITCH], _resolver())
 
 
 # --- find_or_assign_vlan: retry exhaustion (line 143) ---
@@ -166,7 +220,7 @@ async def test_assign_vlan_raises_on_persistent_contention(db, monkeypatch):
 
     rid = str(uuid.uuid4())
     with pytest.raises(RuntimeError, match="persistent contention"):
-        await find_or_assign_vlan(db, rid, FABRIC, [SWITCH])
+        await find_or_assign_vlan(db, rid, FABRIC, [SWITCH], _resolver())
 
     # One rollback per retry attempt.
     assert rollbacks["n"] == vlan_service._MAX_ASSIGN_RETRIES

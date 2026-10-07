@@ -434,6 +434,38 @@ async def test_nil_allocation_build_retry_resolution_failure_makes_no_driver_cal
     assert result["results"][0]["outcome"] == "still_failed"
 
 
+async def test_nil_allocation_build_retry_fabric_outage_fails_closed():
+    """Issue #1003, decision d, on the retry channel: when cabling cannot answer the
+    fabric lookup during re-resolution, nothing is allocated and nothing is driven.
+    The error propagates (the manual route maps it to 503; the tick's per-channel
+    catch leaves the row FAILED), and the row stays FAILED with its attempts."""
+    from app.services.nats_consumer import TransientUpstreamError
+
+    rid = await _seed_l2_failed("0/0/1", "ACTIVE", uuid.UUID(int=0), attempts=2)
+    execute_fn, calls = _vlan_recorder()
+    with _patches(execute_fn):
+        with patch(
+            "app.services.vlan_service.fetch_fabric_id",
+            new=AsyncMock(side_effect=TransientUpstreamError("fabric lookup: upstream 503")),
+        ):
+            with pytest.raises(TransientUpstreamError, match="upstream 503"):
+                await reattempt_reservation(RES_ID, _db_session_factory())
+        with patch(
+            "app.services.vlan_service.fetch_fabric_id",
+            new=AsyncMock(side_effect=TransientUpstreamError("fabric lookup: upstream 503")),
+        ):
+            stats = await run_wiring_retry_tick(_db_session_factory())
+
+    assert calls == [], "no driver call while the fabric is unknown"
+    assert stats["rows_due"] == 1, "the tick did pick the row up"
+    assert stats["l2_rows_retried"] == 0
+    row = await _l2_row(rid)
+    assert row.status == "FAILED"
+    assert row.attempts == 2
+    async with TestSessionLocal() as s:
+        assert (await s.execute(select(VlanAssignment))).scalars().all() == []
+
+
 # --- Build-intent revalidation before a build retry (issue #491) ---
 
 

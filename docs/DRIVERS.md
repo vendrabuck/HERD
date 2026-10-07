@@ -802,7 +802,11 @@ runs in its own session.
 The execution service allocates a conflict-free VLAN ID per L2 fabric: the ID derived
 from the reservation UUID (`int(uuid.UUID(reservation_id).int % 4093) + 2`, range
 2-4094, avoiding VLAN 1) is preferred, and the lowest free ID in the fabric is used when
-the preferred one is taken. No two active reservations in one fabric share a VLAN ID.
+the preferred one is taken. The fabric is everything reachable through the cabling at
+allocation time, transit switches included: an ID held by an active reservation on any
+switch the new reservation's switches can reach is never reused, and IDs repeat only
+across fabrics that share no cable. If the cabling service cannot say which fabric a
+switch is in, nothing is allocated and the wiring event is retried later.
 
 ### Port identity
 

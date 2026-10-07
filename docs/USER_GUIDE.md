@@ -241,7 +241,7 @@ Forgotten passwords: contact an admin. There is no self-serve reset flow today.
 - **Reservation**: A time-window claim on one or more devices, optionally tied to a topology.
 - **Exclusive device**: A device only one reservation can hold at a time. Status toggles on reserve/release.
 - **Non-exclusive / shared device**: Infrastructure that many reservations can share simultaneously. Status does not change.
-- **Fabric**: A connected component of L2 switches and the ports they interconnect. Used for VLAN-conflict avoidance: VLAN ids are unique within a fabric, reusable across isolated fabrics.
+- **Fabric**: A connected component of the cabling graph: every switch and device reachable through cables, transit switches included. Used for VLAN-conflict avoidance: a VLAN id held by a live reservation anywhere in a fabric is never given to another reservation, and ids are reusable across fabrics that share no cable. The check uses the cabling as it is when the VLAN is allocated.
 - **Device group**: A named collection of devices. Device groups control visibility for non-admin users.
 - **User group**: A named collection of users. User groups are granted access to device groups.
 - **No Pool / Not Grouped**: Seeded default groups a new device or user lands in automatically, so nothing is unassigned on creation.
