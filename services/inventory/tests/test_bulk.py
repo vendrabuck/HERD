@@ -952,3 +952,132 @@ async def test_template_dry_run_duplicate_name_in_file_matches_commit(client):
     assert all(t["name"] != "Twice" for t in templates)
     real = await _post_import(client, "templates", items, dry_run=False)
     assert _without_flag(dry) == _without_flag(real)
+
+
+# Dynamic templates round-trip through hypervisor_name (issue #1024) ---------
+
+_SECRET_GET = "app.services.hypervisor_service.httpx.AsyncClient.get"
+
+
+async def _create_hypervisor(client, name: str) -> str:
+    from unittest.mock import AsyncMock, patch
+
+    import httpx
+
+    payload = {
+        "name": name,
+        "endpoint": "https://pve.example:8006",
+        "hypervisor_type": "proxmox",
+        "secret_id": "00000000-0000-0000-0000-0000000000aa",
+    }
+    with patch(_SECRET_GET, new=AsyncMock(return_value=httpx.Response(200))):
+        resp = await client.post("/hypervisors", json=payload)
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+async def _create_dynamic_template(client, name: str, hypervisor_name: str) -> dict:
+    driver_id = await _create_named_driver(client, f"Recipe for {name}", "Hypervisor")
+    hid = await _create_hypervisor(client, hypervisor_name)
+    resp = await client.post(
+        "/templates",
+        json={
+            "name": name,
+            "template_type": "dynamic",
+            "driver_id": driver_id,
+            "hypervisor_id": hid,
+            "sections": _ONE_SECTION,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+@pytest.mark.asyncio
+async def test_export_templates_carries_hypervisor_name(client):
+    await _create_dynamic_template(client, "Dyn", "pve-east")
+    await _create_template(client, name="Firewall")
+    items = (await client.get("/templates/export", params={"format": "json"})).json()["items"]
+    by_name = {i["name"]: i for i in items}
+    assert by_name["Dyn"]["hypervisor_name"] == "pve-east"
+    assert "hypervisor_id" not in by_name["Dyn"]
+    assert by_name["Firewall"]["hypervisor_name"] is None
+
+
+@pytest.mark.parametrize("fmt", ["json", "csv"])
+@pytest.mark.asyncio
+async def test_dynamic_template_round_trips_into_an_instance_without_it(client, fmt):
+    """Export, delete the template (the target instance never had it), and
+    re-import: the dynamic template is created bound to the same hypervisor.
+    The hypervisor name starts with a CSV formula trigger, so the CSV leg also
+    proves the column is neutralized on export and restored on import."""
+    tpl = await _create_dynamic_template(client, "Dyn", "=pve-east")
+    exported = (await client.get("/templates/export", params={"format": fmt})).content
+    if fmt == "csv":
+        assert b"'=pve-east" in exported
+    assert (await client.delete(f"/templates/{tpl['id']}")).status_code == 204
+
+    resp = await client.post(
+        "/templates/import",
+        params={"format": fmt},
+        files={"file": (f"t.{fmt}", io.BytesIO(exported), "text/plain")},
+    )
+    report = resp.json()
+    assert report["rows"] == [{"row": 0, "action": "create", "identity": "Dyn", "reason": None}]
+    templates = (await client.get("/templates")).json()["items"]
+    created = next(t for t in templates if t["name"] == "Dyn")
+    assert created["template_type"] == "dynamic"
+    assert created["hypervisor_id"] == tpl["hypervisor_id"]
+
+
+@pytest.mark.asyncio
+async def test_template_import_rejects_unknown_hypervisor_name(client):
+    await _create_named_driver(client, "Recipe Q", "Hypervisor")
+    items = [
+        {
+            "name": "Dyn",
+            "template_type": "dynamic",
+            "driver_name": "Recipe Q",
+            "hypervisor_name": "pve-gone",
+            "sections": _ONE_SECTION,
+        }
+    ]
+    report = await _post_import(client, "templates", items, dry_run=False)
+    assert report["rows"] == [
+        {
+            "row": 0,
+            "action": "reject",
+            "identity": "Dyn",
+            "reason": "hypervisor not found by name: 'pve-gone'",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_template_import_hypervisor_on_device_template_is_rejected(client):
+    await _create_hypervisor(client, "pve-east")
+    await _create_named_driver(client, "Mgmt Q", "Management")
+    items = [
+        {
+            "name": "DevTpl",
+            "template_type": "device",
+            "driver_name": "Mgmt Q",
+            "hypervisor_name": "pve-east",
+            "vendor": "V",
+            "model": "M",
+            "sections": _ONE_SECTION,
+        }
+    ]
+    report = await _post_import(client, "templates", items, dry_run=False)
+    assert report["rejected"] == 1
+    assert "hypervisor_id is only valid on dynamic templates" in report["rows"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_template_reimport_moves_dynamic_template_to_named_hypervisor(client):
+    tpl = await _create_dynamic_template(client, "Dyn", "pve-east")
+    west = await _create_hypervisor(client, "pve-west")
+    items = [{"name": "Dyn", "hypervisor_name": "pve-west"}]
+    report = await _post_import(client, "templates", items, dry_run=False)
+    assert report["updated"] == 1, report
+    assert (await client.get(f"/templates/{tpl['id']}")).json()["hypervisor_id"] == west

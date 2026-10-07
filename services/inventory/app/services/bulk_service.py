@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.device import Device
 from app.models.driver_package import DriverPackage
+from app.models.hypervisor import Hypervisor
 from app.models.template import DeviceTemplate
 from app.schemas.bulk import BulkImportReport, RowResult
 from app.schemas.device import DeviceCreate, DeviceUpdate
@@ -54,6 +55,7 @@ TEMPLATE_CSV_COLUMNS = [
     "name",
     "template_type",
     "driver_name",
+    "hypervisor_name",
     "exclusive",
     "icon",
     "description",
@@ -74,6 +76,7 @@ DEVICE_CSV_TEXT_COLUMNS = {"name", "template_name"}
 TEMPLATE_CSV_TEXT_COLUMNS = {
     "name",
     "driver_name",
+    "hypervisor_name",
     "icon",
     "description",
     "vendor",
@@ -125,15 +128,24 @@ def device_to_record(device: Device) -> dict[str, Any]:
     }
 
 
-def template_to_record(template: DeviceTemplate) -> dict[str, Any]:
+def template_to_record(
+    template: DeviceTemplate, hypervisor_names: dict[uuid.UUID, str] | None = None
+) -> dict[str, Any]:
     """Serialize a template to an instance-portable record.
 
-    The driver reference is emitted as `driver_name`, not the raw `driver_id`.
+    The driver reference is emitted as `driver_name`, not the raw `driver_id`,
+    and a dynamic template's hypervisor as `hypervisor_name` (issue #1024),
+    resolved through `hypervisor_names` (id to name, built once by the
+    exporter), so a dynamic template round-trips into another instance.
     """
+    hypervisor_name = None
+    if template.hypervisor_id is not None:
+        hypervisor_name = (hypervisor_names or {}).get(template.hypervisor_id)
     return {
         "name": template.name,
         "template_type": template.template_type,
         "driver_name": template.driver.name if template.driver else None,
+        "hypervisor_name": hypervisor_name,
         "exclusive": template.exclusive,
         "icon": template.icon,
         "description": template.description,
@@ -493,6 +505,9 @@ async def _import_template_rows(
     # raise. Only the id is needed downstream.
     driver_rows = (await db.execute(select(DriverPackage))).scalars().all()
     driver_ids_by_name = {d.name: d.id for d in driver_rows}
+    # issue #1024: a dynamic template's hypervisor resolves by name the same way.
+    hypervisor_rows = (await db.execute(select(Hypervisor.name, Hypervisor.id))).all()
+    hypervisor_ids_by_name = {hv_name: hv_id for hv_name, hv_id in hypervisor_rows}
 
     for index, raw_row in enumerate(rows):
         name = (raw_row.get("name") or "").strip()
@@ -518,6 +533,21 @@ async def _import_template_rows(
                     )
                     continue
 
+            hypervisor_id: uuid.UUID | None = None
+            hypervisor_name = (raw_row.get("hypervisor_name") or "").strip()
+            if hypervisor_name:
+                hypervisor_id = hypervisor_ids_by_name.get(hypervisor_name)
+                if hypervisor_id is None:
+                    report.rows.append(
+                        RowResult(
+                            row=index,
+                            action="reject",
+                            identity=name,
+                            reason=f"hypervisor not found by name: {hypervisor_name!r}",
+                        )
+                    )
+                    continue
+
             sections = _coerce_json_cell(raw_row.get("sections"), [])
             poll = _coerce_int(raw_row.get("poll_interval_seconds"))
             template_type = raw_row.get("template_type") or "device"
@@ -532,6 +562,7 @@ async def _import_template_rows(
                     name=name,
                     template_type=template_type,
                     driver_id=driver_id,
+                    hypervisor_id=hypervisor_id,
                     exclusive=exclusive,
                     icon=raw_row.get("icon") or None,
                     description=raw_row.get("description") or None,
@@ -553,6 +584,8 @@ async def _import_template_rows(
                 update_kwargs: dict[str, Any] = {"name": name}
                 if driver_id is not None:
                     update_kwargs["driver_id"] = driver_id
+                if hypervisor_id is not None:
+                    update_kwargs["hypervisor_id"] = hypervisor_id
                 exclusive_cell = raw_row.get("exclusive")
                 if exclusive_cell is not None and exclusive_cell != "":
                     update_kwargs["exclusive"] = _coerce_bool(exclusive_cell, True)

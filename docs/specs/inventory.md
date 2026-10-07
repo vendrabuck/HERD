@@ -1016,13 +1016,14 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   Enforced in: `services/inventory/app/routers/bulk.py` (`export_devices`, `import_devices_endpoint`, `export_templates`, `import_templates_endpoint`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_export_requires_admin`, `test_import_requires_admin`)
 - **INV-BULK-2.** A device record carries `template_name` instead of the template id,
-  and a template record carries `driver_name` instead of the driver id; JSON export is
+  and a template record carries `driver_name` instead of the driver id and
+  `hypervisor_name` instead of the hypervisor id (null when the template has none);
+  JSON export is
   `{resource, version: 1, items}`. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`device_to_record`, `template_to_record`, `records_to_json`) \
-  Pinned by: `services/inventory/tests/test_bulk.py` (`test_export_devices_json_carries_template_name_not_uuid`, `test_export_templates_json_carries_driver_name`)
-- **INV-BULK-3.** A device export includes `field_data` with password values in clear;
-  a template export carries no `hypervisor_id`. Known gap, see #1024. \
-  Enforced in: `services/inventory/app/services/bulk_service.py` (`device_to_record`, `template_to_record`) \
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_export_devices_json_carries_template_name_not_uuid`, `test_export_templates_json_carries_driver_name`, `test_export_templates_carries_hypervisor_name`)
+- **INV-BULK-3.** A device export includes `field_data` with password values in clear. \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`device_to_record`) \
   Pinned by: none
 - **INV-BULK-4.** Import accepts a JSON list or an object with an `items` list; invalid
   JSON, any other shape, or a non-list `items` answers 422 for the whole file. \
@@ -1078,16 +1079,22 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   value. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`import_templates`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_template_reimport_omitting_vendor_model_preserves_them`); `services/inventory/tests/test_bulk_service_unit.py` (`test_import_templates_omitting_exclusive_preserves_existing`, `test_import_templates_omitting_driver_preserves_existing`)
-- **INV-BULK-15.** A template row cannot carry a hypervisor, so a `dynamic` template row
-  is rejected on create. Known gap, see #1024. \
-  Enforced in: `services/inventory/app/services/bulk_service.py` (`import_templates`) \
-  Pinned by: none
+- **INV-BULK-15.** A template row resolves its hypervisor by `hypervisor_name` the way it
+  resolves its driver (rejected `hypervisor not found by name: '<name>'` when the name is
+  unknown), so a dynamic template exported from one instance is created on another that
+  has a hypervisor and a recipe driver of the same names. The template rules then apply
+  as on the interactive routes: a hypervisor on a non-dynamic template, or a dynamic row
+  with none, is rejected. An update row that names a hypervisor moves the template to
+  it; one that omits the column keeps the stored hypervisor. \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`import_templates`, `template_to_record`); `services/inventory/app/routers/bulk.py` (`export_templates`) \
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_dynamic_template_round_trips_into_an_instance_without_it`, `test_template_import_rejects_unknown_hypervisor_name`, `test_template_import_hypervisor_on_device_template_is_rejected`, `test_template_reimport_moves_dynamic_template_to_named_hypervisor`)
 - **INV-BULK-16.** The CSV `exclusive` cell reads true for `1`, `true`, `yes`, or `y`
   (any case) and false for any other non-empty value. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`_coerce_bool`) \
   Pinned by: `services/inventory/tests/test_bulk_service_unit.py` (`test_coerce_bool_string_truthiness`, `test_coerce_bool_empty_returns_default`)
 - **INV-CSV-1.** CSV export passes each free-text cell (device `name` and
-  `template_name`; template `name`, `driver_name`, `icon`, `description`, `vendor`,
+  `template_name`; template `name`, `driver_name`, `hypervisor_name`, `icon`,
+  `description`, `vendor`,
   `model`, `part_number`) through `csv_safe_cell`, which prefixes one quote when the
   first non-space character is `=`, `+`, `-`, `@`, a tab, or a carriage return. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`records_to_csv`, `DEVICE_CSV_TEXT_COLUMNS`, `TEMPLATE_CSV_TEXT_COLUMNS`); `services/common/herd_common/csv_safety.py` (`csv_safe_cell`) \
@@ -1411,14 +1418,7 @@ INV-PORT-6, by a throwaway script against the service on SQLite with foreign key
 
 ### Open defects
 
-- #1017 (INV-BULK-18): a dry run skips the create and update service calls, so the
-  checks they own (unknown field keys, the template-driver connection-type rule,
-  hardware identity) do not run, and the commit can reject a row the dry run accepted.
-- #1023 (INV-PORT-8): a port delete has no cabling guard, and neither has a port
-  rename (INV-PORT-7 changes the name with no cabling check), so a connection can name
-  a port that no longer exists under that name.
-- #1024 (INV-BULK-15, INV-BULK-3): a dynamic template cannot be created through import,
-  because a template row has no hypervisor column and the export writes none.
+None at present.
 
 ### Limits by decision
 
@@ -1470,9 +1470,7 @@ exist); #1025 tracks the corrections.
 - INV-HYP-6: a changed secret is re-validated (the test of that name does not assert
   the call).
 - INV-HYP-11: blank hypervisor fields.
-- INV-BULK-3: export content (clear passwords, no hypervisor).
-- INV-BULK-15: a dynamic template row cannot be imported.
-- INV-BULK-18: a dry run skips the create and update checks.
+- INV-BULK-3: export content (clear passwords).
 - INV-DEL-8: the guard and the delete are not atomic.
 - INV-DYN-6: dynamic-instance devices join `No Pool`.
 - INV-DYN-9: the generated-name attempt cap.

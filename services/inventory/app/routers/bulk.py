@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.dependencies.auth import require_admin
 from app.models.device import Device
+from app.models.hypervisor import Hypervisor
 from app.models.template import DeviceTemplate
 from app.schemas.bulk import BulkImportReport
 from app.services.bulk_service import (
@@ -98,7 +99,11 @@ async def export_templates(
     templates = (
         (await db.execute(select(DeviceTemplate).order_by(DeviceTemplate.name))).scalars().all()
     )
-    records = [template_to_record(t) for t in templates]
+    hypervisor_names = {
+        hv_id: hv_name
+        for hv_id, hv_name in (await db.execute(select(Hypervisor.id, Hypervisor.name)))
+    }
+    records = [template_to_record(t, hypervisor_names) for t in templates]
     return _export_response(
         records, TEMPLATE_CSV_COLUMNS, "templates", format, TEMPLATE_CSV_TEXT_COLUMNS
     )
