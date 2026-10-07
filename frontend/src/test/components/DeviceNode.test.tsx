@@ -112,4 +112,19 @@ describe("DeviceNode", () => {
     expect(badge.className).toContain("bg-red-600");
     expect(badge.className).not.toContain("bg-slate-600");
   });
+
+  // Issue #989: a stored node typed deviceNode with no `data.device`.
+  it("renders an unknown-device placeholder with its handles when data has no device", () => {
+    renderNode({} as DeviceNodeData);
+    expect(screen.getByTestId("unknown-device-node")).toBeTruthy();
+    expect(screen.getByText("Unknown device")).toBeTruthy();
+    // Four handles, so the edges that reference the node still draw.
+    expect(screen.getAllByTestId("rf-handle")).toHaveLength(4);
+  });
+
+  it("renders the placeholder for a null device too", () => {
+    renderNode({ device: null } as unknown as DeviceNodeData);
+    expect(screen.getByText("Unknown device")).toBeTruthy();
+  });
 });
+

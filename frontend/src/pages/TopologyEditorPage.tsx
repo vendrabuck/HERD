@@ -141,6 +141,10 @@ const nodeTypes = {
 };
 const edgeTypes = { layerEdge: LayerEdge, bundledEdge: BundledEdge };
 
+// Issue #989: the refusal shown when a connection touches a node with no device.
+const DEVICE_LESS_NODE_MESSAGE =
+  "This node has no device: remove it or replace it with a device from the browser";
+
 // React Flow annotates edges it manages as a controlled component with its
 // own transient fields (selected, animated, style, zIndex); none of these
 // are application data HERD ever intentionally sets (LayerEdge computes its
@@ -720,6 +724,16 @@ function TopologyEditorInner() {
         });
         return false;
       }
+      // Issue #989: a stored node can carry no device (data without `device`).
+      // It has no ports, so nothing may be wired to it; refuse here rather than
+      // read `.device` below.
+      const deviceLess = [sourceNode, targetNode].some(
+        (n) => !isNetworkElement(n) && !isDeviceNode(n),
+      );
+      if (deviceLess) {
+        toast.error(DEVICE_LESS_NODE_MESSAGE, { id: "device-less-node" });
+        return false;
+      }
       if (isNetworkElement(sourceNode) || isNetworkElement(targetNode)) {
         return true;
       }
@@ -844,6 +858,9 @@ function TopologyEditorInner() {
       // isValidConnection already refuses these with a toast; guard again so a
       // placeholder can never reach the port-selection modal.
       if (isDynamicPlaceholder(sourceNode) || isDynamicPlaceholder(targetNode)) return;
+      // Issue #989: isValidConnection refuses a device-less node with a toast;
+      // guard again so neither dialog ever reads `.device` off one.
+      if ([sourceNode, targetNode].some((n) => !isNetworkElement(n) && !isDeviceNode(n))) return;
 
       // ADR 0012 "Editing surface": device-to-element opens ElementAttachDialog.
       // isValidConnection already refuses element-to-element with a toast;
