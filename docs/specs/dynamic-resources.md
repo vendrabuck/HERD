@@ -354,7 +354,11 @@ goes live.
 - **DYN-CREATE-21.** The instance is materialized through inventory
   `POST /devices/internal` with the body `template_id`, `reservation_id`, `field_data`
   (the create result's `field_data`, or an empty object), and `request_id`, and no
-  `name`, so inventory generates the name (`inventory.md`, INV-DYN-2). \
+  `name`, so inventory generates the name (`inventory.md`, INV-DYN-2). The returned
+  `field_data` is stored as given, keys the template does not declare included
+  (INV-DYN-3), and reads redact only the template's `password` keys, so a recipe must
+  return a credential only under a declared password key or keep it in the secrets
+  service ([DRIVERS.md](../DRIVERS.md), Credentials in returned field_data; issue #1056). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_create_dynamic_device`, `_provision_one_instance`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_create_dynamic_device_maps_status_codes`, `test_provision_happy_path_records_runs_ledger_device_and_callback`)
 - **DYN-CREATE-22.** A 5xx or transport error from that call raises

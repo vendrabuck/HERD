@@ -71,8 +71,8 @@ to `reservations.md`.
 | GET | `/status` | anyone, no token | 200 | AI-PROV-5, AI-PROV-6, AI-PROV-7, AI-PROV-8 |
 | POST | `/generate` | any signed-in user | 200 | AI-PROV-2, AI-GEN-1 to AI-GEN-16, AI-UPLOAD-1 to AI-UPLOAD-7, AI-RESOLVE-1 to AI-RESOLVE-15, AI-QUOTA-2 |
 | POST | `/commit` | any signed-in user; upstream services apply their own rules to the caller's JWT | 200 | AI-COMMIT-1 to AI-COMMIT-19 |
-| POST | `/reservations/{id}/assistant` | the reservation's owner (first turn); the conversation's creator on the same reservation (later turns) | 200 | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-TURN-1 to AI-TURN-8, AI-TOOL-1 to AI-TOOL-10, AI-WRITE-1 to AI-WRITE-3 |
-| POST | `/reservations/{id}/assistant/stream` | as above | 200 (`text/event-stream`) | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-STREAM-1 to AI-STREAM-7, AI-TOOL-1 to AI-TOOL-10, AI-WRITE-1 to AI-WRITE-3 |
+| POST | `/reservations/{id}/assistant` | the reservation's owner (first turn); the conversation's creator on the same reservation (later turns) | 200 | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-TURN-1 to AI-TURN-8, AI-TOOL-1 to AI-TOOL-11, AI-WRITE-1 to AI-WRITE-3 |
+| POST | `/reservations/{id}/assistant/stream` | as above | 200 (`text/event-stream`) | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-STREAM-1 to AI-STREAM-7, AI-TOOL-1 to AI-TOOL-11, AI-WRITE-1 to AI-WRITE-3 |
 | POST | `/templates/suggest-identity` | admin or superadmin | 200 | AI-PROV-2, AI-IDENT-1 to AI-IDENT-4, AI-QUOTA-2 |
 | GET | `/quota` | any signed-in user (own usage) | 200 | AI-QUOTA-7 |
 | GET | `/usage` | admin or superadmin | 200 | AI-QUOTA-8 |
@@ -635,10 +635,22 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   Pinned by: `services/ai-orchestrator/tests/test_conversation_repo.py` (`test_evict_to_budget_drops_oldest_pair_when_over_turn_cap`, `test_evict_to_budget_respects_token_budget`)
 - **AI-CONV-9.** Every `ASSISTANT_SWEEPER_INTERVAL_SECONDS` the sweeper deletes every
   conversation, with its messages, whose `last_used_at` is older than
-  `ASSISTANT_CONVERSATION_TTL_HOURS`, whatever the reservation's status; a failed cycle is
-  logged and the loop continues. Known gap, see #1039. \
+  `ASSISTANT_CONVERSATION_TTL_HOURS`; a failed cycle is logged and the loop continues.
+  The delete re-applies the cutoff, so a conversation used during the cycle survives. \
   Enforced in: `services/ai-orchestrator/app/services/conversation_repo.py` (`expire_idle`); `services/ai-orchestrator/app/tasks/conversation_sweeper.py` (`conversation_sweeper_loop`) \
-  Pinned by: `services/ai-orchestrator/tests/test_conversation_repo.py` (`test_expire_idle_deletes_old_conversations_and_keeps_recent`, `test_expire_idle_custom_ttl_setting_moves_the_cutoff`); `services/ai-orchestrator/tests/test_conversation_sweeper.py` (`test_run_sweeper_cycle_deletes_idle_conversations`, `test_loop_swallows_cycle_exception_and_keeps_running`)
+  Pinned by: `services/ai-orchestrator/tests/test_conversation_repo.py` (`test_expire_idle_deletes_old_conversations_and_keeps_recent`, `test_expire_idle_custom_ttl_setting_moves_the_cutoff`); `services/ai-orchestrator/tests/test_conversation_sweeper.py` (`test_run_sweeper_cycle_deletes_idle_conversations`, `test_loop_swallows_cycle_exception_and_keeps_running`); `services/ai-orchestrator/tests/test_transcript_retention.py` (`test_a_conversation_used_during_the_lookups_is_not_deleted`)
+- **AI-CONV-13.** While `AI_PURPOSE_CLASSIFICATION_ENABLED` and
+  `AI_PURPOSE_INCLUDE_TRANSCRIPTS` are both on, the sweeper keeps an idle conversation
+  whose reservation is not terminal, or is terminal with `purpose_classification_pending`
+  true (requested and no suggestion yet), so the end pass can read the transcript
+  (AI-PURPOSE-6). It asks reservations `GET /internal/{id}` with the internal token once
+  per reservation per cycle, 8 at a time, after its read transaction ends, and fails
+  closed: a transport error, a missing token, a non-200 other than 404, a malformed body,
+  or an unknown status keeps the conversation and logs
+  `conversation_retention_lookup_failed`; a 404 releases it. With either flag off no
+  lookup is made and AI-CONV-9 applies unchanged (issue #1039). \
+  Enforced in: `services/ai-orchestrator/app/services/conversation_repo.py` (`expire_idle`); `services/ai-orchestrator/app/services/transcript_retention.py` (`reservation_keeps_transcript`, `transcripts_owed_to_classifier`) \
+  Pinned by: `services/ai-orchestrator/tests/test_transcript_retention.py` (`test_a_live_reservation_keeps_its_transcript`, `test_a_terminal_reservation_awaiting_classification_keeps_its_transcript`, `test_a_terminal_reservation_already_classified_releases_its_transcript`, `test_an_unknown_reservation_releases_its_transcript`, `test_an_unclear_answer_keeps_the_transcript`, `test_an_unreachable_reservations_service_keeps_the_transcript`, `test_a_missing_internal_token_keeps_the_transcript`, `test_the_sweep_keeps_only_what_the_classifier_still_owes`, `test_the_sweep_asks_once_per_reservation`, `test_without_a_transcript_reader_the_plain_ttl_applies_with_no_lookup`, `test_a_failed_lookup_is_logged_by_reason_and_status`)
 - **AI-CONV-10.** `ASSISTANT_CONVERSATION_TTL_HOURS` of 0 or less is refused at startup. \
   Enforced in: `services/ai-orchestrator/app/config.py` (`_validate_assistant_conversation_ttl_hours`) \
   Pinned by: `services/ai-orchestrator/tests/test_config.py` (`test_zero_or_negative_ttl_hours_rejected`)
@@ -775,6 +787,20 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   `is_error` result the model can read. \
   Enforced in: `services/ai-orchestrator/app/services/tools.py` (`dispatch`, `_auth_headers`) \
   Pinned by: `services/ai-orchestrator/tests/test_tools.py` (`test_dispatcher_forwards_bearer_token`, `test_dispatch_unknown_tool_returns_is_error`, `test_dispatcher_handles_httpx_failure`)
+- **AI-TOOL-11.** A device-id argument (`device_id`, or `source_device_id` and
+  `target_device_id` on `find_path`) must name one of the reservation's own devices, for
+  read and write tools alike. The check runs at the dispatch boundary before the handler,
+  so a device outside the reservation is refused with the tool error
+  `<argument> is not a device of this reservation` and no call reaches inventory, cabling,
+  or execution. The device list is reservations `GET /{id}` read with the caller's JWT
+  once per turn, on the first call that carries a device argument; it fails closed: a
+  non-200 answer, a transport error, or a body without a list of UUIDs under `device_ids`
+  refuses every device-scoped call with `the reservation's device list could not be read`,
+  and a failed read is retried on the next call rather than cached. A malformed id is
+  refused by AI-TOOL-10 before the read; a call with no device argument (for example
+  `list_executions_for_reservation` with no filter) reads nothing (issue #1054). \
+  Enforced in: `services/ai-orchestrator/app/services/tools.py` (`dispatch`, `_enforce_device_scope`, `_fetch_reservation_devices`, `DEVICE_ID_ARGUMENTS`) \
+  Pinned by: `services/ai-orchestrator/tests/test_tools_device_scope.py` (`test_every_device_id_property_is_scoped`, `test_a_device_outside_the_reservation_is_refused_before_any_downstream_call`, `test_a_device_of_the_reservation_reaches_the_handler`, `test_find_path_refuses_when_only_the_target_is_outside`, `test_the_device_list_is_read_with_the_callers_jwt_once_per_turn`, `test_an_unreadable_device_list_fails_closed`, `test_a_failed_device_list_read_is_retried_on_the_next_call`, `test_list_executions_without_a_device_filter_reads_no_device_list`, `test_a_refusal_is_logged_by_tool_and_argument_only`)
 - **AI-TOOL-3.** A tool result is serialized to JSON and cut at
   `ASSISTANT_TOOL_RESULT_CHAR_CAP` characters with a `... [truncated: N chars omitted]`
   marker. \
@@ -877,9 +903,11 @@ documentation sites, instead of answering such questions from memory.
   Pinned by: `services/ai-orchestrator/tests/test_docs_sources.py` (`test_search_ranks_the_more_relevant_document_first`, `test_search_returns_nothing_for_a_query_with_no_overlap`)
 - **AI-DOCS-5.** Only `.md`, `.txt`, and `.html` files with no hidden path component and at
   most 2 MiB are indexed; an index is rebuilt on the first lookup after
-  `AI_DOCS_INDEX_TTL_SECONDS`. \
-  Enforced in: `services/ai-orchestrator/app/services/docs_sources.py` (`_is_indexable`, `_read_file`, `get_index`) \
-  Pinned by: `services/ai-orchestrator/tests/test_docs_sources.py` (`test_search_ignores_non_text_and_hidden_files`, `test_index_is_rebuilt_after_the_ttl_expires`)
+  `AI_DOCS_INDEX_TTL_SECONDS`. The index applies the read rule of AI-DOCS-6: an entry
+  whose resolved path leaves the source root (a symlink pointing out of the corpus) is
+  never indexed, so search never returns its title or a snippet (issue #1055). \
+  Enforced in: `services/ai-orchestrator/app/services/docs_sources.py` (`_is_indexable`, `_read_file`, `get_index`, `_build_index`, `resolve_in_root`) \
+  Pinned by: `services/ai-orchestrator/tests/test_docs_sources.py` (`test_search_ignores_non_text_and_hidden_files`, `test_index_is_rebuilt_after_the_ttl_expires`, `test_search_skips_a_symlink_that_leaves_the_root`, `test_search_keeps_a_symlink_that_stays_inside_the_root`)
 - **AI-DOCS-6.** A corpus `read_doc` path is resolved under the source root with symlinks
   followed; an absolute path, a traversal, a symlink leaving the root, a hidden or
   non-text file, and a missing file all answer the same `document not found` refusal. \
@@ -899,19 +927,21 @@ documentation sites, instead of answering such questions from memory.
   Enforced in: `services/ai-orchestrator/app/services/tools.py` (`_tool_read_doc`) \
   Pinned by: `services/ai-orchestrator/tests/test_docs_tools.py` (`test_dispatch_refuses_a_web_read_while_web_is_disabled`, `test_the_dispatch_gate_refuses_web_before_the_fetch_helper_runs`)
 - **AI-DOCS-10.** A web URL must be https with no user information; it is normalized
-  (lowercase host, default port dropped, query and fragment dropped) and must start with a
-  normalized allowed prefix, a bare-host prefix getting a trailing slash. \
-  Enforced in: `services/ai-orchestrator/app/services/docs_web.py` (`normalize_url`, `normalized_prefixes`, `match_prefix`) \
-  Pinned by: `services/ai-orchestrator/tests/test_docs_web.py` (`test_normalize_url_canonicalizes`, `test_normalize_url_refuses_non_https_and_userinfo`, `test_prefix_match_refuses_lookalikes`, `test_a_bare_host_prefix_gets_a_trailing_slash`, `test_fetch_refuses_a_url_outside_the_allowlist`, `test_fetch_refuses_with_an_empty_allowlist`)
+  (lowercase host, default port dropped, query and fragment dropped, and `.` and `..`
+  path segments resolved, literal or percent-encoded, issue #1055) and must start with a
+  normalized allowed prefix, a bare-host prefix getting a trailing slash. The normalized
+  URL is the one requested, so the path that matched is the path fetched. \
+  Enforced in: `services/ai-orchestrator/app/services/docs_web.py` (`normalize_url`, `remove_dot_segments`, `normalized_prefixes`, `match_prefix`) \
+  Pinned by: `services/ai-orchestrator/tests/test_docs_web.py` (`test_normalize_url_canonicalizes`, `test_normalize_url_refuses_non_https_and_userinfo`, `test_prefix_match_refuses_lookalikes`, `test_a_bare_host_prefix_gets_a_trailing_slash`, `test_fetch_refuses_a_url_outside_the_allowlist`, `test_fetch_refuses_with_an_empty_allowlist`, `test_fetch_refuses_a_dot_segment_path_that_leaves_the_prefix`, `test_fetch_requests_the_normalized_path_that_was_matched`)
 - **AI-DOCS-11.** Every address the host resolves to must be public: loopback, private,
-  link-local, multicast, unspecified, and reserved addresses, their IPv4-mapped forms, and
+  shared address space (100.64.0.0/10, issue #1055), link-local, multicast, unspecified, and reserved addresses, their IPv4-mapped forms, and
   6to4 and Teredo addresses are refused, as is a host that does not resolve. \
   Enforced in: `services/ai-orchestrator/app/services/docs_web.py` (`assert_public_host`, `is_public_address`) \
   Pinned by: `services/ai-orchestrator/tests/test_docs_web.py` (`test_refused_address_classes`, `test_public_addresses_are_allowed`, `test_fetch_refuses_when_any_resolved_address_is_private`, `test_fetch_refuses_when_the_host_does_not_resolve`)
-- **AI-DOCS-12.** Redirects are followed by hand, at most 3, each target re-matched against
-  the prefixes and re-resolved. \
+- **AI-DOCS-12.** Redirects are followed by hand, at most 3, each target normalized as in
+  AI-DOCS-10, re-matched against the prefixes, and re-resolved. \
   Enforced in: `services/ai-orchestrator/app/services/docs_web.py` (`fetch_web_document`, `MAX_REDIRECTS`) \
-  Pinned by: `services/ai-orchestrator/tests/test_docs_web.py` (`test_fetch_follows_an_allowlisted_redirect`, `test_redirect_to_a_private_address_is_refused_mid_chain`, `test_redirect_outside_the_allowlist_is_refused`, `test_redirect_chain_is_bounded`, `test_redirect_without_a_location_is_refused`)
+  Pinned by: `services/ai-orchestrator/tests/test_docs_web.py` (`test_fetch_follows_an_allowlisted_redirect`, `test_redirect_to_a_private_address_is_refused_mid_chain`, `test_redirect_outside_the_allowlist_is_refused`, `test_redirect_chain_is_bounded`, `test_redirect_without_a_location_is_refused`, `test_redirect_with_dot_segments_out_of_the_prefix_is_refused`)
 - **AI-DOCS-13.** The response must be `text/html`, `text/plain`, `text/markdown`, or
   `text/x-markdown` with a status below 400, and is read to at most
   `AI_DOCS_WEB_MAX_BYTES` before being cut. \
@@ -1050,7 +1080,8 @@ preview (section 8.12), and the reservations sweep and Classify now route
   text, the devices, the dynamic templates, each device's config-apply job count and job
   names (never config contents), the fork's wiring counts per layer and version count,
   the status and duration, and, when `AI_PURPOSE_INCLUDE_TRANSCRIPTS` is set, the
-  reservation's assistant transcripts; the body's `topology_id` is not used. Known gap, see #1039. \
+  reservation's assistant transcripts (kept for this read by AI-CONV-13); the body's
+  `topology_id` is not used. \
   Enforced in: `services/ai-orchestrator/app/services/purpose_signals.py` (`gather_internal_signals`, `_gather_config_apply_jobs_block`, `_gather_fork_block`) \
   Pinned by: `services/ai-orchestrator/tests/test_purpose_signals.py` (`test_internal_signals_include_all_structured_signals`, `test_internal_config_apply_jobs_never_include_config_contents`, `test_transcripts_included_when_flag_on`, `test_transcripts_omitted_when_flag_off`)
 - **AI-PURPOSE-7.** A signal fetch that fails with an HTTP error or a malformed body is
@@ -1448,6 +1479,8 @@ Calls into this area are in section 7. All user-path calls forward the caller's 
 | Out | reservations | `POST /` (JWT) | commit's reservation | Relayed status; topology rolled back (AI-COMMIT-11) |
 | Out | execution | `POST /execute` (JWT) | optional config push | Recorded per device as `failed`; commit stands (AI-COMMIT-16) |
 | Out | reservations | `GET /{id}` (JWT) | assistant seed | 404: 404. Deadline: 504. Other: 503 (AI-CONV-3) |
+| Out | reservations | `GET /internal/{id}` (internal token, 10 s) | idle-conversation sweeper retention | Fail closed: the conversation is kept; a 404 releases it (AI-CONV-13) |
+| Out | reservations | `GET /{id}` (JWT) | assistant tool device scope | Any failure refuses every device-scoped tool call as an `is_error` result; fail closed (AI-TOOL-11) |
 | Out | inventory | `GET /devices/{id}` (JWT) | assistant seed devices | 404: device omitted. Other: 503 (AI-CONV-3) |
 | Out | inventory | device, port, template, config-version, config-schema, and schedule routes (JWT) | assistant tools | Becomes an `is_error` tool result; the turn continues (AI-TOOL-2). The schema proxy fails open to the registry (AI-TOOL-7) |
 | Out | cabling | `POST /pathfind` (JWT) | `find_path` tool | `is_error` tool result |
@@ -1527,10 +1560,7 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
 
 ### Open defects
 
-- #1039 (AI-CONV-9, AI-PURPOSE-6): the idle-conversation sweeper deletes by last use only,
-  so a reservation's transcript can be gone before purpose classification reads it. The
-  issue asks the owner to choose between exempting such conversations and documenting the
-  interaction.
+None at this commit: #1039 is resolved by AI-CONV-13.
 
 ### Limits by decision
 
@@ -1545,6 +1575,10 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
   DNS rebinding window (AI-DOCS-11). Recorded as a known limitation in ADR 0015 (decision
   3) and [AI_ASSISTANT.md](../AI_ASSISTANT.md); the web source ships disabled and behind an
   operator allowlist.
+- A terminal reservation whose classification never yields a suggestion (attempt cap
+  reached, no Classify now) stays pending, so its idle conversations are kept until it is
+  classified or either transcript flag is turned off (AI-CONV-13): Lane's decision on
+  #1039 (E(a)), recorded in [AI_PURPOSE_CLASSIFICATION.md](../AI_PURPOSE_CLASSIFICATION.md).
 - `GET /status` is unauthenticated and its construction probe is cached for 30 seconds
   (AI-PROV-5, AI-PROV-7): issue #606 and the docstring of `_ProviderConstructionCache`.
 - Usage rows are written only when a quota is configured (AI-QUOTA-1): the comment on

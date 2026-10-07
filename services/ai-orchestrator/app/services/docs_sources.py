@@ -395,6 +395,12 @@ def _build_index(source: CorpusSource) -> CorpusIndex:
             continue
         if not _is_indexable(relative):
             continue
+        # The read rule, applied at index time (issue #1055): rglob hands back
+        # a symlink as a file of the corpus even when it points outside the
+        # root, and search would then return that file's title and a snippet.
+        # resolve_in_root refuses it on read, so it is skipped here too.
+        if resolve_in_root(source.root, relative.as_posix()) is None:
+            continue
         raw = _read_file(absolute)
         if raw is None:
             continue

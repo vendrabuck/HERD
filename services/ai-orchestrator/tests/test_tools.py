@@ -17,6 +17,19 @@ VERSION_ID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 TOKEN = "test-token"
 
 
+@pytest.fixture(autouse=True)
+def _reservation_holds_the_test_devices(monkeypatch):
+    """dispatch() refuses a device id outside the reservation (issue #1054) after
+    reading the reservation's device list. This module tests the handlers, so the
+    list is stubbed to hold its devices; tests/test_tools_device_scope.py covers
+    the scope check and the real read."""
+
+    async def _devices(self):
+        return frozenset({DEVICE_A, DEVICE_B})
+
+    monkeypatch.setattr(ToolDispatcher, "_fetch_reservation_devices", _devices)
+
+
 def _make_handler(routes):
     """Construct an httpx.MockTransport handler from a list of (predicate, response) pairs."""
 

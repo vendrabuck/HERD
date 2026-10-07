@@ -4,7 +4,9 @@ Exposes a curated set of read-only HERD endpoints as Anthropic tools the
 assistant can call during a tool-use loop. The reservation_id is captured at
 construction time and injected server-side into any tool that takes it, so
 the model cannot peek across reservations no matter what arguments it
-supplies.
+supplies. Likewise every device-id argument must name one of the
+reservation's own devices, which dispatch() checks before any handler runs
+(issue #1054).
 
 JWT forwarding mirrors reservation_context.py: a shared httpx.AsyncClient
 with the caller's Bearer token. Device fetches are bounded by a Semaphore.
@@ -352,6 +354,27 @@ WRITE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
 WRITE_TOOL_NAMES: frozenset[str] = frozenset(d["name"] for d in WRITE_TOOL_DEFINITIONS)
 
 
+# Device-id arguments per tool (issue #1054). dispatch() refuses any of these
+# that is not a device of the turn's reservation before the handler runs, so no
+# HTTP call is made for a device outside the reservation, read and write tools
+# alike. A unit test fails if a tool definition gains a *device_id property
+# that is missing here.
+DEVICE_ID_ARGUMENTS: dict[str, tuple[str, ...]] = {
+    "get_device": ("device_id",),
+    "get_device_ports": ("device_id",),
+    "get_device_current_config": ("device_id",),
+    "list_device_config_history": ("device_id",),
+    "get_device_config_schema": ("device_id",),
+    "find_path": ("source_device_id", "target_device_id"),
+    "list_executions_for_reservation": ("device_id",),
+    "propose_config_change": ("device_id",),
+    "schedule_config_apply": ("device_id",),
+}
+
+DEVICE_OUTSIDE_RESERVATION_ERROR = "{key} is not a device of this reservation"
+DEVICE_SET_UNAVAILABLE_ERROR = "the reservation's device list could not be read"
+
+
 def get_active_tool_definitions() -> list[dict[str, Any]]:
     """Return the tool set the assistant should advertise, honoring both
     feature gates. The seven read-only reservation tools are always present;
@@ -443,6 +466,11 @@ class ToolDispatcher:
         # device_id -> resolved schema response, or None on lookup failure
         self._schema_cache: dict[str, dict[str, Any] | None] = {}
         self._device_fetch_semaphore = asyncio.Semaphore(DEVICE_FETCH_CONCURRENCY)
+        # The reservation's device ids, read once per dispatcher (one turn) on
+        # the first device-scoped call; None until a read succeeds, so a failed
+        # read is retried on the next call rather than cached (issue #1054).
+        self._reservation_device_ids: frozenset[uuid.UUID] | None = None
+        self._device_scope_lock = asyncio.Lock()
         self.call_log: list[ToolCallRecord] = []
         # Side-effects produced by write tools (e.g. scheduled dry-run apply).
         # The route handler reads the most recent scheduled_apply entry and
@@ -478,7 +506,9 @@ class ToolDispatcher:
         documentation tools carry the same gate: a docs call with every source
         disabled is refused here, and a read_doc naming the web source while
         AI_DOCS_WEB_ENABLED is false is refused in the handler for the same
-        reason. The
+        reason. A device-id argument outside the reservation's device list is
+        refused here too, before the handler runs (_enforce_device_scope,
+        issue #1054). The
         ToolError flows through the except branch into an is_error result the
         model can recover from; the finally block records all attempts (success,
         error, write-gate rejection) in call_log so the route can surface the
@@ -509,6 +539,7 @@ class ToolDispatcher:
             handler = getattr(self, f"_tool_{tool_name}", None)
             if handler is None:
                 raise ToolError(f"unknown tool: {tool_name}")
+            await self._enforce_device_scope(tool_name, tool_input)
             content = await handler(tool_input)
         except ToolError as exc:
             error = str(exc)
@@ -540,6 +571,58 @@ class ToolDispatcher:
             truncated = len(body) - self._char_cap
             body = body[: self._char_cap] + f"\n... [truncated: {truncated} chars omitted]"
         return {"content": body, "is_error": error is not None}
+
+    # --- Device scope (issue #1054) ---
+
+    async def _enforce_device_scope(self, tool_name: str, args: dict[str, Any]) -> None:
+        """Refuse a device-id argument that is not a device of the reservation.
+
+        Runs at the dispatch boundary for every tool listed in
+        DEVICE_ID_ARGUMENTS, before the handler, so the refusal holds whatever
+        the handler does. Only arguments present are checked: a missing
+        required one is refused by the handler's own _require_uuid. A
+        malformed id is refused first, without any HTTP call. The device list
+        comes from reservations GET /{id} with the caller's JWT and fails
+        closed: when it cannot be read, every device-scoped call is refused.
+        """
+        keys = [key for key in DEVICE_ID_ARGUMENTS.get(tool_name, ()) if key in args]
+        if not keys:
+            return
+        requested = [(key, _require_uuid(args, key)) for key in keys]
+        allowed = await self._reservation_devices()
+        for key, device_id in requested:
+            if device_id not in allowed:
+                logger.warning(
+                    "ai_tool_device_outside_reservation",
+                    extra={"tool": tool_name, "argument": key},
+                )
+                raise ToolError(DEVICE_OUTSIDE_RESERVATION_ERROR.format(key=key))
+
+    async def _reservation_devices(self) -> frozenset[uuid.UUID]:
+        async with self._device_scope_lock:
+            if self._reservation_device_ids is None:
+                self._reservation_device_ids = await self._fetch_reservation_devices()
+            return self._reservation_device_ids
+
+    async def _fetch_reservation_devices(self) -> frozenset[uuid.UUID]:
+        url = f"{settings.reservations_service_url.rstrip('/')}/{self._reservation_id}"
+        status_code: int | None = None
+        try:
+            resp = await self._http.get(url, headers=self._auth_headers)
+            status_code = resp.status_code
+            if status_code != 200:
+                raise ValueError("non-200 answer")
+            body = resp.json()
+            raw_ids = body.get("device_ids") if isinstance(body, dict) else None
+            if not isinstance(raw_ids, list):
+                raise ValueError("device_ids missing")
+            return frozenset(uuid.UUID(str(raw)) for raw in raw_ids)
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            logger.warning(
+                "ai_tool_device_scope_unavailable",
+                extra={"error_class": type(exc).__name__, "status_code": status_code},
+            )
+            raise ToolError(DEVICE_SET_UNAVAILABLE_ERROR) from exc
 
     # --- Tool handlers ---
 

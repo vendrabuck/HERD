@@ -431,6 +431,7 @@
         "end_time": "string",
         "id": "string",
         "is_active": "boolean",
+        "purpose_classification_pending": "boolean",
         "start_time": "string",
         "status": "#/components/schemas/ReservationStatus"
       },
@@ -438,6 +439,7 @@
         "end_time",
         "id",
         "is_active",
+        "purpose_classification_pending",
         "start_time",
         "status"
       ],

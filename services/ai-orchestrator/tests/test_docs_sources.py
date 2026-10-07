@@ -351,6 +351,29 @@ def test_read_document_refuses_a_symlink_escape(tmp_path, monkeypatch):
         docs_sources.read_document("kb", "escape.md", offset=0, window=100)
 
 
+def test_search_skips_a_symlink_that_leaves_the_root(tmp_path, monkeypatch):
+    """Issue #1055: the index applies the read rule, so a symlink pointing out
+    of the corpus never surfaces its title or a snippet through search."""
+    outside = _write(tmp_path, "outside.md", "# Outside title\n\nzebracorn secret material")
+    root = _corpus(tmp_path, monkeypatch, {"a.md": "# Inside\n\nzebracorn inside body"})
+    (root / "escape.md").symlink_to(outside)
+
+    hits = docs_sources.search("zebracorn")
+
+    assert [h["path"] for h in hits] == ["a.md"]
+    assert all("secret" not in h["snippet"] for h in hits)
+    assert all(h["title"] != "Outside title" for h in hits)
+
+
+def test_search_keeps_a_symlink_that_stays_inside_the_root(tmp_path, monkeypatch):
+    root = _corpus(tmp_path, monkeypatch, {"real/a.md": "zebracorn inside body"})
+    (root / "alias.md").symlink_to(root / "real" / "a.md")
+
+    hits = docs_sources.search("zebracorn")
+
+    assert sorted(h["path"] for h in hits) == ["alias.md", "real/a.md"]
+
+
 def test_read_document_refuses_a_non_text_extension(tmp_path, monkeypatch):
     root = _corpus(tmp_path, monkeypatch, {"a.md": "body"})
     _write(root, "notes.pdf", "not really a pdf")
