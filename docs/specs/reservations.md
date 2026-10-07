@@ -350,14 +350,14 @@ The status a new booking starts in is RES-CREATE-12 to RES-CREATE-16 (section 4)
   any other device refuses the whole booking with 403. Admins skip the check. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`create_new_reservation`, `_fetch_visible_device_ids`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_non_admin_invisible_device_rejected`, `test_create_reservation_admin_skips_visibility`)
-- **RES-CREATE-8.** When inventory's visible-devices lookup errors or answers non-200,
-  the router skips the RES-CREATE-7 check (by decision, docstring of
-  `_fetch_visible_device_ids`), but the booking still cannot include an invisible
+- **RES-CREATE-8.** When inventory's visible-devices lookup errors, answers non-200, or
+  answers a misshapen body, the router skips the RES-CREATE-7 pre-check (by decision,
+  docstring of `_fetch_visible_device_ids`), but the booking still cannot include an invisible
   device: the device fetch of RES-CREATE-9 goes through inventory's
   `POST /devices/batch`, which omits every device outside a non-admin's visibility and
   fails closed, so such a device is refused as not found (422). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`_fetch_visible_device_ids`); `services/reservations/app/services/reservation_service.py` (`_fetch_devices`); `services/inventory/app/routers/devices.py` (`get_devices_batch`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_visibility_fetch_failure_allows`); `services/reservations/tests/test_coverage_gaps.py` (`test_visible_devices_non_200_logs_and_fails_open`); `services/reservations/tests/test_reservation_service_unit.py` (`test_fetch_devices_missing_from_batch_raises_value_error`); `services/inventory/tests/test_devices.py` (`test_batch_non_admin_gets_only_visible_with_passwords_redacted`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_visibility_fetch_failure_allows`, `test_create_visibility_precheck_still_skips_on_a_misshapen_answer`); `services/reservations/tests/test_coverage_gaps.py` (`test_visible_devices_non_200_logs_and_fails_open`); `services/reservations/tests/test_reservation_service_unit.py` (`test_fetch_devices_missing_from_batch_raises_value_error`); `services/inventory/tests/test_devices.py` (`test_batch_non_admin_gets_only_visible_with_passwords_redacted`)
 - **RES-CREATE-9.** Every requested device must exist in inventory, read in one batch
   call with the caller's JWT; a missing device refuses the booking with 422, and an
   unreachable inventory fails closed with 503. \
@@ -678,9 +678,10 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   Enforced in: `services/reservations/app/schemas/reservation.py` (`device_ids_not_empty`); `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_empty_device_ids_rejected`, `test_update_reservation_topology_mismatch_rejected`); `services/reservations/tests/test_schema_bounds.py` (`test_update_device_ids_over_cap_rejected`)
 - **RES-PATCH-7.** A non-admin's new `device_ids` must all be visible to them (403
-  otherwise). When the visibility lookup fails the router skips this check, as on
-  create (RES-CREATE-8), and the device fetch of RES-PATCH-6 still refuses an invisible
-  device as not found (400). \
+  otherwise). When the visibility lookup cannot be answered the router skips this
+  pre-check, as on create (RES-CREATE-8), and the device fetch of RES-PATCH-6 still
+  refuses an invisible device as not found (400). The calendar, which returns rows,
+  fails closed instead (RES-CAL-3). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`update_reservation_by_id`, `_fetch_visible_device_ids`); `services/reservations/app/services/reservation_service.py` (`_fetch_devices`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_non_admin_invisible_device_rejected`)
 - **RES-PATCH-8.** On a topology-backed reservation, a device-set change re-runs
@@ -824,10 +825,15 @@ and `frontend/src/pages/ReservationCalendarPage.tsx`; routes `GET /{id}` and
   Enforced in: `services/reservations/app/services/reservation_service.py` (`list_calendar_reservations`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_span_over_max_rejected`); `services/reservations/tests/test_reservation_service_unit.py` (`test_list_calendar_span_guard_disabled_when_zero`)
 - **RES-CAL-3.** For a non-admin the calendar keeps only reservations all of whose
-  devices are visible to them; when the visibility lookup fails, the calendar is
-  unfiltered and shows every user's reservations. Known gap, see #1000. \
-  Enforced in: `services/reservations/app/routers/reservations.py` (`get_calendar_reservations`, `_fetch_visible_device_ids`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_non_admin_visibility_filtering`); `services/reservations/tests/test_reservation_service_unit.py` (`test_calendar_visibility_subset_and_empty_set`)
+  devices are visible to them. When the visibility lookup cannot be answered (transport
+  error, non-200, or a body that is not `{"device_ids": [<str>, ...]}`) the calendar
+  fails closed: 503 `Could not verify device visibility; reservations were not returned.
+  Retry the request.` and no rows. Admins are unfiltered and never trigger the lookup.
+  By decision (issue #1000, 2026-10-05, superseding the fail-open accepted in #131). The
+  calendar page shows a could-not-load state on the refusal, not the empty-range
+  message. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`get_calendar_reservations`, `_fetch_visible_device_ids_strict`); `frontend/src/pages/ReservationCalendarPage.tsx` (`ReservationCalendarPage`) \
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_non_admin_visibility_filtering`, `test_calendar_non_admin_fails_closed_when_visibility_is_unanswerable`, `test_calendar_admin_is_unfiltered_and_never_asks_for_visibility`, `test_calendar_non_admin_with_a_real_answer_is_filtered`); `services/reservations/tests/test_reservation_service_unit.py` (`test_calendar_visibility_subset_and_empty_set`); `frontend/src/test/pages/ReservationCalendarPage.test.tsx` (`ReservationCalendarPage`)
 
 **Out of scope.** Utilization reports (`GET /reports/utilization` and its CSV) live in
 this service but belong to `operations-and-observability.md`.
@@ -1187,6 +1193,7 @@ sweep, and event delivery never return an error to a caller.
 | 422 | `The following templates are not dynamic templates: <ids>` | a dynamic request names a non-dynamic template | RES-DYN-1 |
 | 422 | `Calendar window cannot exceed <N> days (requested ...)` | calendar window too wide | RES-CAL-2 |
 | 503 | `Failed to contact inventory service: ...` | inventory unreachable on create, PATCH, or the dynamic template check | RES-CREATE-9, RES-PATCH-6, RES-DYN-1 |
+| 503 | `Could not verify device visibility; reservations were not returned. Retry the request.` | non-admin calendar while the visibility lookup cannot be answered | RES-CAL-3 |
 | 503 | `Failed to reserve devices in inventory after retries: ...` | the create-path inventory flip exhausted its attempts | RES-CREATE-15 |
 | 503 | `Cabling validation returned <status>: ...` or `Failed to contact cabling service: ...` | topology validation failed on create or PATCH | RES-TOPO-6, RES-PATCH-8 |
 | 503 | `{"error": "purpose_classification_disabled"}` | Classify now with the feature off | RES-PURPOSE-13 |
@@ -1205,7 +1212,7 @@ Calls into this area are in section 7; events are in section 6.
 
 | Direction | Peer | Call | Purpose | On failure |
 |---|---|---|---|---|
-| Out | inventory | `GET /device-groups/visible-devices` (caller's JWT) | non-admin visibility on create, PATCH, calendar | Fail open: the filter is skipped. Create and PATCH still refuse an invisible device through the batch fetch below (RES-CREATE-8, RES-PATCH-7); the calendar shows every reservation (RES-CAL-3) |
+| Out | inventory | `GET /device-groups/visible-devices` (caller's JWT) | non-admin visibility on create, PATCH, calendar | Create and PATCH: the pre-check is skipped, and an invisible device is still refused through the batch fetch below (RES-CREATE-8, RES-PATCH-7). Calendar: fail closed, 503 and no rows (RES-CAL-3) |
 | Out | inventory | `POST /devices/batch` (caller's JWT) | device existence, visibility, type, exclusivity, status on create and PATCH | Fail closed: 503 on create and on PATCH device changes; on a PATCH end-time extension every device is treated as exclusive |
 | Out | inventory | `GET /templates/{id}` (caller's JWT) | dynamic template check | Fail closed: 503 |
 | Out | inventory | `GET /devices/{id}/internal` (internal token) | exclusivity on release and scheduled activation | Fail toward exclusive: an unreadable device is treated as exclusive; a 404 drops it from a release, except on auto-complete (RES-HOLD-5, RES-HOLD-9) |
