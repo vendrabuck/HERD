@@ -58,7 +58,7 @@ The images below are design-system mockups rendered from the HERD UI kit, not ca
 - Utilization reporting dashboard (by user, device, topology type, day, and group) with CSV export, plus a fleet utilization section: per-device utilization rate against the full window, idle-device view, and fleet-wide summary
 - AI-assisted topology generation (feature-gated by a configured LLM provider; ships with Anthropic and OpenAI-compatible backends, the latter covers vLLM, Ollama, LM Studio, OpenAI, and Azure OpenAI): natural-language prompts + optional file attachments propose a topology rendered as ghost nodes with Accept/Modify/Reject human-in-the-loop review
 - AI-assisted recipe authoring (dark by default behind `AI_RECIPE_AUTHORING_ENABLED`): an admin describes a dynamic-resource recipe in plain language, the AI drafts the driver package, the execution sandbox validates it (structure, policy, simulated dry-run) with bounded auto-repair, and a review panel gates the explicit admin approval that uploads it (see [docs/AI_RECIPES.md](docs/AI_RECIPES.md))
-- Device group visibility controls: non-admin users only see devices in their assigned groups
+- Device group visibility controls: non-admin users only see devices in their assigned groups (plus the instance devices of their own live reservations), and a dynamic template only when its hypervisor's device group grants them
 - Local or LDAP/Active Directory authentication (pluggable via `AUTH_METHOD`); LDAP users JIT-provision in HERD on first bind
 - Per-user preferences (saved filters, page sizes, notification settings) with a Settings page under the user menu
 - Notifications driven by durable NATS consumers on reservation lifecycle and device-health events, with an in-app bell + unread badge plus opt-in email, chat, and outbound-webhook channels (HMAC-signed), an upcoming-expiry reminder, and per-channel and per-event opt-outs
@@ -223,7 +223,7 @@ make frontend-dev    # Run frontend dev server
 
 ### Device ports
 - Ports are children of devices, typed by port templates
-- Full CRUD including bulk creation
+- Full CRUD including bulk creation; deleting or renaming a port that a cable still names is refused with 409 (`port_cabled`), since cables record ports by name
 - Deleting a device cascades to its ports; an admin delete is refused with 409 while a live reservation's wiring depends on the device (`device_in_use`) or a cable still names it (`device_cabled`)
 
 ### Exclusive vs non-exclusive reservations
@@ -241,7 +241,8 @@ make frontend-dev    # Run frontend dev server
 ### Device groups and visibility
 - Device groups control which devices non-admin users can see and reserve
 - User groups are assigned permissions on device groups
-- Admins see all devices; regular users see only devices in their assigned groups
+- Admins see all devices; regular users see only devices in their assigned groups, plus the instance devices of their own `PENDING_PROVISION` or `ACTIVE` reservations
+- A hypervisor's device group decides who may see and book its dynamic templates (none means admins only)
 - "No Pool" default group: new devices are auto-assigned on creation
 
 ### User groups
@@ -258,13 +259,13 @@ make frontend-dev    # Run frontend dev server
 - Wiring tab: per-connection status grouped by layer (L1/L2/L3), with manual retry for
   failed rows
 - Schedule tab: inline editing of end time and purpose
-- Edit Resources: search, add, and remove devices with availability filtering
-- Backend PATCH endpoint validates topology uniformity, checks conflicts for added devices, and publishes NATS events for driver execution
+- Edit Resources: search, add, and remove devices; on an active reservation an added device must be available now, while on a pending one only its own window has to be free
+- Backend PATCH endpoint validates topology uniformity over the booked devices, checks added devices against the window like a new booking, commits only if the reservation's status did not change during the edit (409 otherwise), and publishes NATS events for driver execution
 - Edit topology (live-edit mode): while a reservation is ACTIVE its owner (or an admin) re-wires the reservation's editable topology fork; edits autosave as drafts and committing reconciles the fork (release-before-build) and leaves the master topology's history untouched. A commit that would claim a port held by another active reservation is refused with a conflict naming the blocker. After the reservation ends the fork is a read-only as-built record (ADR 0006)
 
 ### Reservation calendar
 - Gantt-style timeline with day, week, and month views
-- Cross-user visibility with status filters
+- Cross-user visibility, filtered to the devices you can see, with status filters; if your visibility cannot be checked the calendar refuses (503) rather than show unfiltered rows
 - Click-to-view reservation details with cancel/release actions; the Reservations list sorts by Owner, Status, Period, and Purpose and offers a bulk Cancel and Release on selected rows
 
 ### Pathfinding
@@ -340,7 +341,8 @@ full LDAP knob set.
 Device templates, devices, ports, driver packages, and device groups with permission-based
 visibility. Template and device CRUD with field validation. Device search by name
 (case-insensitive partial match). Reads available to all authenticated users (non-admin
-users filtered by device group visibility); writes require admin or superadmin role.
+users filtered by device group visibility; a dynamic template is visible only through its
+hypervisor's device group); writes require admin or superadmin role.
 
 ### Reservations Service
 Time-window reservations with topology-type enforcement (physical and cloud devices
@@ -356,7 +358,8 @@ cancelled, completed, and updated events.
 Connection persistence (PostgreSQL-backed) between device ports and topology canvas
 persistence. On-demand BFS shortest-path computation through L1 switch
 infrastructure for cable route visualization. Connections can be filtered by device ID.
-Reads available to all authenticated users; writes require admin or superadmin role.
+Reads available to all authenticated users (a non-admin sees only cables with at least one
+end on a device they can see); writes require admin or superadmin role.
 
 ### ACL Service
 Resource-level access control via group-based grants for devices, topologies,
@@ -381,7 +384,7 @@ JSON.
 
 A NATS consumer listens for reservation lifecycle events and triggers:
 - **L1 switch operations**: connect/disconnect port pairs, grouped per switch for batched login/logout sessions
-- **L2 VLAN provisioning**: derive VLAN ID from reservation UUID, create VLAN, add ports on reservation creation; remove ports and delete VLAN on cancellation/completion
+- **L2 VLAN provisioning**: allocate a VLAN ID that no other live reservation holds anywhere in the connected cabling component (the ID derived from the reservation UUID is preferred), create the VLAN and add ports as the fork's wiring is built; remove ports and delete the VLAN on cancellation/completion. If cabling cannot say which component a switch is in, nothing is allocated and the event is retried
 
 A periodic health-poll scheduler runs each opted-in device through the same
 `login`/`status`/`logout` sequence on its configured `poll_interval_seconds` cadence.
