@@ -1147,14 +1147,14 @@ is the user guide.
   names taken from `data.device.name`; nodes with no edge are not exported. \
   Enforced in: `services/cabling/app/services/bulk_service.py` (`records_to_csv`, `topology_to_csv_rows`, `TOPOLOGY_CSV_COLUMNS`) \
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_export_csv_flattens_edges`); `services/cabling/tests/test_route_handlers_direct.py` (`test_records_to_csv_null_canvas_emits_header_only`)
-- **TOPO-BULK-4.** CSV port cells read `data.sourcePort` and `data.targetPort`, else the
-  edge's `sourceHandle` and `targetHandle`; the editor stores port names in
-  `source_port_name` and `target_port_name`, so an editor-drawn edge exports its React
-  Flow handle id (`top`, `right`, `bottom`, `left`) as its port. CSV import writes the
-  port cells into `data.sourcePort` and `data.targetPort`, which the fork resolver does
-  not read (TOPO-FORK-17). Known gap, see #1006. \
-  Enforced in: `services/cabling/app/services/bulk_service.py` (`topology_to_csv_rows`, `parse_csv_topologies`) \
-  Pinned by: none
+- **TOPO-BULK-4.** CSV port cells read the edge's `data.source_port_name` and
+  `data.target_port_name` (what the editor writes and the fork resolver honors,
+  TOPO-FORK-17), else the legacy `data.sourcePort` and `data.targetPort`, else empty; the
+  React Flow `sourceHandle` and `targetHandle` are handle ids, never read. CSV import
+  writes a non-empty port cell to `source_port_name` or `target_port_name` and leaves an
+  empty cell's side unconstrained, so export then import keeps every chosen port. \
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`topology_to_csv_rows`, `_edge_port_name`, `parse_csv_topologies`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_export_csv_writes_editor_port_names_not_handles`, `test_export_csv_port_precedence_and_empty_cells`, `test_csv_export_import_preserves_ports_through_fork_resolve`, `test_parse_csv_empty_port_cell_leaves_side_unconstrained`)
 - **TOPO-BULK-5.** Every CSV text cell is written through `csv_safe_cell` and read back
   through `csv_unsafe_cell`, so a formula-led name is neutralized on export and
   round-trips exactly. \
@@ -1663,9 +1663,6 @@ TOPO-BULK-4.
   two device nodes, as in the seeded "BROKEN - Half-Wired Chain" topology.
 - #985 (TOPO-UILIST-3): on the topologies page, a filter change made before the saved
   preferences load saves an empty search over the saved one.
-- #1006 (TOPO-BULK-4): CSV export fills the port columns from a legacy field or the
-  canvas handle name, not the port names the editor stores, and CSV import writes a
-  field the fork resolver does not read.
 - #1007 (TOPO-VAL-5, TOPO-FORK-18): validation judges the device pair only, while the
   fork save honors per-edge ports and skips an unresolvable constrained edge without
   reporting it, so validation can call valid an edge the save builds nothing for.
@@ -1723,6 +1720,5 @@ TOPO-BULK-4.
   version.
 - TOPO-FORK-25: the fork read returning hidden transit hops unredacted.
 - TOPO-TMPL-9: instantiate not checking assigned device ids.
-- TOPO-BULK-4: CSV export of editor-drawn port names.
 - TOPO-UILIST-3: the empty search saved over the stored one (issue #985).
 - TOPO-UI-2: the device-less node crash (issue #989 asks for the test).

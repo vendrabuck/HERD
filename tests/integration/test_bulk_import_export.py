@@ -9,6 +9,7 @@ Requires a running stack (`make test-integration`). Not run in the stack-free
 unit tier.
 """
 
+import csv
 import io
 import json
 import uuid
@@ -220,5 +221,79 @@ async def test_topology_export_roundtrips_isolated_node(admin_client, fresh_devi
         dupes = [t for t in listing.json()["items"] if t["name"] == name]
         assert len(dupes) == 1, "re-import must update the original, not duplicate it"
         assert dupes[0]["id"] == tid
+    finally:
+        await delete_topology_checked(admin_client, tid)
+
+
+@pytest.mark.asyncio
+async def test_topology_csv_roundtrip_preserves_chosen_ports(admin_client, fresh_devices):
+    """Issue #1006: CSV export writes the ports the editor stored (never a React Flow
+    handle id), and importing that CSV writes them back where the fork-save resolver
+    reads them, so a round trip keeps every port assignment."""
+    a, b = await fresh_devices(2)
+    for port in ("eth1", "eth2"):
+        cable = await admin_client.post(
+            "/cabling/connections",
+            json={
+                "device_a_id": a["id"],
+                "port_a": port,
+                "device_b_id": b["id"],
+                "port_b": port,
+                "connection_type": "L1",
+            },
+        )
+        assert cable.status_code == 201, cable.text
+    name = f"int-bulk-ports-{uuid.uuid4().hex[:8]}"
+    canvas = {
+        "nodes": [
+            {"id": "n1", "data": {"device": {"id": a["id"], "name": a["name"]}}},
+            {"id": "n2", "data": {"device": {"id": b["id"], "name": b["name"]}}},
+        ],
+        "edges": [
+            {
+                "id": f"e-{port}",
+                "source": "n1",
+                "target": "n2",
+                "sourceHandle": "right",
+                "targetHandle": "left",
+                "data": {"layer": "L1", "source_port_name": port, "target_port_name": port},
+            }
+            for port in ("eth1", "eth2")
+        ],
+    }
+    create = await admin_client.post("/cabling/topologies", json={"name": name})
+    assert create.status_code == 201, create.text
+    tid = create.json()["id"]
+    try:
+        upd = await admin_client.put(f"/cabling/topologies/{tid}", json={"canvas_data": canvas})
+        assert upd.status_code == 200, upd.text
+
+        exported = await admin_client.get("/cabling/topologies/export", params={"format": "csv"})
+        assert exported.status_code == 200
+        rows = [r for r in csv.DictReader(io.StringIO(exported.text)) if r["topology_name"] == name]
+        assert [(r["source_port"], r["target_port"]) for r in rows] == [
+            ("eth1", "eth1"),
+            ("eth2", "eth2"),
+        ]
+
+        body = "topology_name,source_device,source_port,target_device,target_port,layer\n"
+        body += "".join(
+            f"{name},{r['source_device']},{r['source_port']},{r['target_device']},"
+            f"{r['target_port']},{r['layer']}\n"
+            for r in rows
+        )
+        resp = await admin_client.post(
+            "/cabling/topologies/import",
+            params={"format": "csv"},
+            files={"file": ("t.csv", io.BytesIO(body.encode()), "text/csv")},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["updated"] == 1, resp.text
+
+        detail = await admin_client.get(f"/cabling/topologies/{tid}")
+        edges = detail.json()["canvas_data"]["edges"]
+        assert [
+            (e["data"].get("source_port_name"), e["data"].get("target_port_name")) for e in edges
+        ] == [("eth1", "eth1"), ("eth2", "eth2")]
     finally:
         await delete_topology_checked(admin_client, tid)
