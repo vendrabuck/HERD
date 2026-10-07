@@ -1436,7 +1436,7 @@ async def _teardown_attempt(
     when the DESTROYED compare-and-swap lost because the row no longer matches
     this snapshot; _teardown_one_instance then re-reads and goes again.
     """
-    from app.services.driver_loader import load_driver
+    from app.services.driver_loader import DriverPackageError, load_driver
     from app.services.dynamic_instance_service import mark_destroyed
     from app.services.execution_service import (
         extract_password_keys,
@@ -1491,14 +1491,26 @@ async def _teardown_attempt(
             driver_path = await load_driver(
                 db, driver_id, driver_sha256, driver_filename, connection_type
             )
-        except Exception as e:
+        except DriverPackageError as e:
+            # A structurally broken package can never load; retrying the event
+            # would not help, so ACK with the row live (the keyed-destroy
+            # failure path).
             _left_live(
                 "recipe_load_failed",
-                "Failed to load recipe to destroy request %s: %s; leaving ACTIVE",
+                "Failed to load recipe to destroy request %s: %s; leaving ledger row %s",
                 request_id,
                 e,
+                row.status,
             )
             return "left_live"
+        except Exception as e:
+            # Anything else, a download failure (RuntimeError from load_driver)
+            # first of all, is transient (issue #1029): NAK so the terminal event
+            # is redelivered and the destroy actually runs, as the create path
+            # does (DYN-CREATE-13). Class name only in the raised text.
+            raise TransientUpstreamError(
+                f"recipe load failed for teardown of request {request_id}: {type(e).__name__}"
+            ) from e
 
         login = await _run_recipe_step(
             db,

@@ -2347,3 +2347,73 @@ async def test_failed_create_after_teardown_retired_the_row_is_compensated(tmp_p
         "dynamic_instance_create_lost_to_teardown",
         "dynamic_provision_abandoned",
     ]
+
+# --- issue #1029: a transient recipe download failure during teardown NAKs ----
+
+
+async def _seed_by_ref_active():
+    await _seed_active()
+
+
+@pytest.mark.parametrize(
+    "seed, ledger_status",
+    [(_seed_by_ref_active, "ACTIVE"), (_seed_creating, "CREATING")],
+    ids=["by-ref", "keyed"],
+)
+async def test_teardown_recipe_download_failure_naks_then_redelivery_destroys(
+    seed, ledger_status, caplog
+):
+    """load_driver's RuntimeError (the download step: a cache miss while
+    inventory or package storage is unreachable) is transient. Teardown used
+    to ACK it with the row left live and nothing ever retrying; it now raises
+    TransientUpstreamError (the NAK path) with no recipe call and no row
+    change, and the redelivered terminal event destroys the instance."""
+    await seed()
+    calls, execute = _recipe_execute({"destroy_instance": DESTROY_OK})
+    load = AsyncMock(
+        side_effect=[RuntimeError("Failed to download driver x: ConnectError"), "/tmp/recipe"]
+    )
+    delete = AsyncMock(return_value=True)
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in _teardown_patches(execute, delete=delete):
+            stack.enter_context(p)
+        stack.enter_context(patch("app.services.driver_loader.load_driver", new=load))
+        with pytest.raises(TransientUpstreamError) as excinfo:
+            await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+
+        assert str(excinfo.value) == (
+            f"recipe load failed for teardown of request {REQUEST_ID}: RuntimeError"
+        )
+        assert calls == []
+        assert (await _rows())[0].status == ledger_status
+        assert _formatted(caplog, "dynamic_instance_keyed_destroy_failed") == []
+
+        # The redelivery: the package downloads this time and the destroy runs.
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+
+    assert [c[0] for c in calls] == ["login", "destroy_instance", "logout"]
+    assert (await _rows())[0].status == "DESTROYED"
+
+
+async def test_teardown_broken_package_still_acks_with_row_live(caplog):
+    """The permanent half of the split stays as it was: a DriverPackageError
+    can never load, so teardown ACKs, leaves the row live, and logs the keyed
+    action with reason recipe_load_failed."""
+    await _seed_creating()
+    calls, execute = _recipe_execute({"destroy_instance": DESTROY_OK})
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in _teardown_patches(execute):
+            stack.enter_context(p)
+        stack.enter_context(
+            patch(
+                "app.services.driver_loader.load_driver",
+                new=AsyncMock(side_effect=DriverPackageError("broken")),
+            )
+        )
+        await _execute_dynamic_teardown(RES_ID, USER_ID, _db_session_factory(), AsyncMock())
+
+    assert calls == []
+    assert (await _rows())[0].status == "CREATING"
+    [record] = _formatted(caplog, "dynamic_instance_keyed_destroy_failed")
+    assert record["reason"] == "recipe_load_failed"
+
