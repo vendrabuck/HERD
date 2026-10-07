@@ -18,6 +18,8 @@ test engine so the run it finalizes is the same one the GET endpoints read.
 """
 
 import asyncio
+import json
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -28,6 +30,7 @@ from app.models.ldap_sync_run import LdapSyncRun
 from app.models.user import Role
 from app.routers.ldap_sync import NO_MEMBERS_WARNING
 from app.services import ldap_service, ldap_sync_service
+from herd_common.logging import JSONFormatter
 
 from tests._harness import TestSessionLocal, mock_user
 
@@ -166,7 +169,29 @@ async def test_create_mapping_directory_outage_is_503_not_422(monkeypatch, admin
     group_id = await _create_herd_group(admin_client)
     resp = await _create_mapping(admin_client, group_id)
     assert resp.status_code == 503
-    assert "not validated" in resp.json()["detail"]
+    assert resp.json()["detail"] == "Directory unavailable, mapping not validated"
+
+
+@pytest.mark.asyncio
+async def test_create_mapping_503_detail_never_carries_directory_text(
+    monkeypatch, admin_client, caplog
+):
+    # Issue #1009: the directory client's text can carry the underlying
+    # exception (server address, bind result). It reaches the log message,
+    # never the response.
+    secret_text = "LDAP connection failed: ldaps://10.9.8.7:636 socket refused"
+    _stub_fetch_group(monkeypatch, error=ldap_service.LdapUnavailableError(secret_text))
+    group_id = await _create_herd_group(admin_client)
+    with caplog.at_level(logging.WARNING, logger="app.routers.ldap_sync"):
+        resp = await _create_mapping(admin_client, group_id)
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "Directory unavailable, mapping not validated"}
+    assert "10.9.8.7" not in resp.text
+    records = [r for r in caplog.records if r.name == "app.routers.ldap_sync"]
+    assert len(records) == 1
+    rendered = JSONFormatter("auth").format(records[0])
+    assert secret_text in json.loads(rendered)["message"]
+    assert json.loads(rendered)["action"] == "ldap_mapping_directory_unavailable"
 
 
 @pytest.mark.asyncio

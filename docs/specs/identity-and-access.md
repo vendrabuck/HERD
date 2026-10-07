@@ -716,11 +716,11 @@ group so the HERD group's membership follows the directory.
   Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_create_mapping_duplicate_dn_is_409`, `test_create_mapping_herd_group_already_mapped_is_409`); `services/auth/tests/test_routers_direct_ldap_admin.py` (`test_create_mapping_direct_duplicate_dn_precheck_409`, `test_create_mapping_direct_group_already_mapped_precheck_409`)
 - **IAM-MAP-3.** The DN is checked against the live directory: a directory that cannot
   be asked answers 503, and a DN the directory proves resolves nothing (no such entry,
-  or invalid DN syntax) answers 422. The 503 detail is `Directory unavailable, mapping
-  not validated:` followed by the directory client's error text, which can include the
-  text of the underlying exception. Known gap, see #1009. \
-  Enforced in: `services/auth/app/routers/ldap_sync.py` (`create_mapping`); `services/auth/app/services/ldap_service.py` (`fetch_group`, `_base_entry`) \
-  Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_create_mapping_dangling_dn_is_422`, `test_create_mapping_directory_outage_is_503_not_422`); `services/auth/tests/test_ldap_service_live.py` (`test_fetch_group_nonexistent_dn_is_dangling_none`, `test_fetch_group_invalid_dn_syntax_is_proven_unresolvable`)
+  or invalid DN syntax) answers 422. The 503 detail is the fixed string `Directory
+  unavailable, mapping not validated`; the directory client's error text, which can
+  carry the underlying exception, goes only to the log message (issue #1009). \
+  Enforced in: `services/auth/app/routers/ldap_sync.py` (`create_mapping`, `MAPPING_DIRECTORY_UNAVAILABLE_DETAIL`); `services/auth/app/services/ldap_service.py` (`fetch_group`, `_base_entry`) \
+  Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_create_mapping_dangling_dn_is_422`, `test_create_mapping_directory_outage_is_503_not_422`, `test_create_mapping_503_detail_never_carries_directory_text`); `services/auth/tests/test_ldap_service_live.py` (`test_fetch_group_nonexistent_dn_is_dangling_none`, `test_fetch_group_invalid_dn_syntax_is_proven_unresolvable`)
 - **IAM-MAP-4.** The stored DN is the canonical DN the directory returned, not the typed
   one; the cached display name is the group's `LDAP_GROUP_NAME_ATTRIBUTE` cut to 255
   characters, or the DN when the attribute is missing. \
@@ -1275,7 +1275,7 @@ other error carries `detail` as a string. A 401 from a bearer check also sends
 | 409 | `This grant already exists` | duplicate grant | IAM-ACL-2 |
 | 422 | validation list | registration, login, group, bulk, mapping, token, grant, or check body out of bounds; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-LOGIN-3, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2 |
 | 422 | `group_dn does not resolve in the directory` | mapping DN proven absent | IAM-MAP-3 |
-| 503 | `Directory unavailable, mapping not validated: <directory error>` | mapping create while the directory cannot be asked | IAM-MAP-3 |
+| 503 | `Directory unavailable, mapping not validated` | mapping create while the directory cannot be asked | IAM-MAP-3 |
 | 503 | `Internal API token not configured` | an internal route with no token configured | IAM-INTERNAL-2 |
 
 Codes that are success but do nothing: logout with an unknown refresh token answers
@@ -1346,8 +1346,7 @@ the integration suite, the frontend tests, and the browser suite were read, not 
 
 ### Open defects
 
-- #1009 (IAM-MAP-3): the mapping-create 503 detail carries the directory exception
-  text. The bulk member add half of the issue (IAM-GROUP-13) is fixed.
+None at present.
 
 ### Limits by decision
 
