@@ -782,5 +782,56 @@ async def test_dispatcher_handles_httpx_failure():
     async with ToolDispatcher(token=TOKEN, reservation_id=RESERVATION_ID, http_client=client) as d:
         result = await d.dispatch("get_device", {"device_id": str(DEVICE_A)})
     assert result["is_error"] is True
-    assert "HTTP error" in json.loads(result["content"])["message"]
-    assert d.call_log[0].error and "HTTP error" in d.call_log[0].error
+    # Issue #1036: a fixed message keyed on the class, never str(exc).
+    expected = "upstream service unreachable (ConnectError)"
+    assert json.loads(result["content"])["message"] == expected
+    assert d.call_log[0].error == expected
+    assert "no network" not in result["content"]
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_http_status_error_carries_no_url(caplog):
+    """Issue #1036: an upstream 5xx becomes a fixed tool error keyed on the
+    status. The internal URL that str(HTTPStatusError) carries reaches neither
+    the tool result (sent to the provider), tool_calls[].error, nor the log."""
+    from herd_common.logging import JSONFormatter
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"detail": "inventory db down"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with caplog.at_level("WARNING", logger="app.services.tools"):
+        async with ToolDispatcher(
+            token=TOKEN, reservation_id=RESERVATION_ID, http_client=client
+        ) as d:
+            result = await d.dispatch("get_device", {"device_id": str(DEVICE_A)})
+
+    assert result["is_error"] is True
+    message = json.loads(result["content"])["message"]
+    assert message == "upstream service answered HTTP 503"
+    assert d.call_log[0].error == message
+    for text in (result["content"], d.call_log[0].error):
+        assert "http://" not in text
+        assert "inventory db down" not in text
+
+    logged = [r for r in caplog.records if r.getMessage() == "ai_tool_call_failed"]
+    assert len(logged) == 1
+    formatted = JSONFormatter("ai-orchestrator").format(logged[0])
+    assert "http://" not in formatted
+    assert '"status_code": 503' in formatted
+    assert '"tool": "get_device"' in formatted
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_unexpected_exception_carries_only_the_class(monkeypatch):
+    secret = "internal detail http://inventory:8000/devices"
+    async with ToolDispatcher(token=TOKEN, reservation_id=RESERVATION_ID) as d:
+
+        async def boom(_args):
+            raise ValueError(secret)
+
+        monkeypatch.setattr(d, "_tool_get_device", boom)
+        result = await d.dispatch("get_device", {"device_id": str(DEVICE_A)})
+    assert json.loads(result["content"])["message"] == "tool failed (ValueError)"
+    assert d.call_log[0].error == "tool failed (ValueError)"
+    assert secret not in result["content"]

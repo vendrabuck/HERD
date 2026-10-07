@@ -93,13 +93,17 @@ def test_extract_tgz_pulls_text_members():
 
 
 def test_extract_tgz_invalid_archive_raises():
-    with pytest.raises(ExtractionError, match="tgz"):
+    with pytest.raises(ExtractionError, match="tgz") as exc:
         extract_files([("broken.tgz", b"not a real tgz")])
+    assert str(exc.value) == "Failed to read tgz archive (ReadError)"
 
 
 def test_extract_pdf_raises_for_garbage():
-    with pytest.raises(ExtractionError, match="PDF"):
+    with pytest.raises(ExtractionError, match="PDF") as exc:
         extract_files([("doc.pdf", b"not really a pdf")])
+    # Issue #1036: the parser's own text stays out of the 400 detail.
+    assert str(exc.value).startswith("Failed to parse PDF (")
+    assert str(exc.value).endswith(")")
 
 
 def test_render_file_context_empty():

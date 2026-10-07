@@ -7,7 +7,10 @@ import pytest
 from app import config as config_module
 from app.database import Base, engine
 from app.main import app
-from app.routes.template_identity import AI_SUGGESTION_FAILED_DETAIL
+from app.routes.template_identity import (
+    AI_SUGGESTION_FAILED_DETAIL,
+    AI_SUGGESTION_MALFORMED_DETAIL,
+)
 from app.services.ai_client import AIError, get_ai_client
 from app.services.llm_provider import Usage
 from httpx import ASGITransport, AsyncClient
@@ -134,6 +137,43 @@ async def test_suggest_identity_502_when_ai_returns_malformed(async_client):
     async with async_client as client:
         resp = await client.post("/templates/suggest-identity", json=body, headers=headers)
     assert resp.status_code == 502
+    assert resp.json()["detail"] == AI_SUGGESTION_MALFORMED_DETAIL
+
+
+async def test_suggest_identity_malformed_never_logs_or_returns_model_output(async_client, caplog):
+    """Issue #1036 (the #887 rule): the malformed-suggestion branch logs only
+    the shape of the failure and answers a fixed detail. The model's invalid
+    values reach neither the formatted log line nor the response."""
+    from herd_common.logging import JSONFormatter
+
+    secret = "hunter2-model-echoed-credential"
+    _override_ai_returning(
+        {
+            "vendor": f"vendor {secret}",
+            "model": "EX4300",
+            "confidence": f"certain {secret}",  # not one of low, medium, high
+            "reasoning": f"because {secret}",
+        }
+    )
+    headers = {"Authorization": f"Bearer {_token('admin')}"}
+    with caplog.at_level("WARNING", logger="app.routes.template_identity"):
+        async with async_client as client:
+            resp = await client.post(
+                "/templates/suggest-identity", json={"name": "X"}, headers=headers
+            )
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "AI returned a malformed suggestion"
+    assert secret not in resp.text
+
+    logged = [
+        r for r in caplog.records if r.getMessage() == "ai_template_identity_suggestion_malformed"
+    ]
+    assert len(logged) == 1
+    formatted = JSONFormatter("ai-orchestrator").format(logged[0])
+    assert secret not in formatted
+    # The shape is there: which field failed and how.
+    assert "confidence" in formatted
+    assert "literal_error" in formatted
 
 
 async def test_suggest_identity_ai_error_with_reported_usage_is_metered(async_client, monkeypatch):

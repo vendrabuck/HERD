@@ -61,7 +61,8 @@ def _extract_pdf(data: bytes) -> str:
                 if text:
                     parts.append(text)
     except Exception as e:
-        raise ExtractionError(f"Failed to parse PDF: {e}") from e
+        # Issue #1036: the parser's own text stays out of the 400 detail.
+        raise ExtractionError(f"Failed to parse PDF ({type(e).__name__})") from e
     return "\n\n".join(parts)
 
 
@@ -90,7 +91,7 @@ def _extract_tgz(data: bytes, remaining_budget: int) -> str:
                 parts.append(chunk)
                 used += len(chunk)
     except tarfile.TarError as e:
-        raise ExtractionError(f"Failed to read tgz archive: {e}") from e
+        raise ExtractionError(f"Failed to read tgz archive ({type(e).__name__})") from e
     return "\n\n".join(parts)
 
 

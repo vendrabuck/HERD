@@ -397,6 +397,29 @@ def _flatten_password_keys_present(payload: Any, password_keys: set[str]) -> set
     return found
 
 
+def _http_error_message(exc: httpx.HTTPError) -> str:
+    """The tool-result text for an upstream HTTP failure (issue #1036): the
+    status for an answered request, the exception class for a transport
+    failure, and never the exception's own text."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"upstream service answered HTTP {exc.response.status_code}"
+    return f"upstream service unreachable ({type(exc).__name__})"
+
+
+def _log_tool_failure(tool_name: str, exc: Exception) -> None:
+    """Log a failed tool call by shape only: tool name, exception class, and
+    status when there is one (issue #1036)."""
+    status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+    logger.warning(
+        "ai_tool_call_failed",
+        extra={
+            "tool": tool_name,
+            "error_class": type(exc).__name__,
+            "status_code": status_code,
+        },
+    )
+
+
 class ToolDispatcher:
     def __init__(
         self,
@@ -491,10 +514,15 @@ class ToolDispatcher:
             error = str(exc)
             content = {"is_error": True, "message": error}
         except httpx.HTTPError as exc:
-            error = f"HTTP error: {exc}"
+            # Issue #1036: a fixed message keyed on the status or the class,
+            # never str(exc), which names the internal service URL and would
+            # reach both the provider prompt and tool_calls[].error.
+            error = _http_error_message(exc)
+            _log_tool_failure(tool_name, exc)
             content = {"is_error": True, "message": error}
         except Exception as exc:  # noqa: BLE001
-            error = f"Unexpected error: {type(exc).__name__}: {exc}"
+            error = f"tool failed ({type(exc).__name__})"
+            _log_tool_failure(tool_name, exc)
             content = {"is_error": True, "message": error}
         finally:
             duration_ms = int((time.monotonic() - started) * 1000)

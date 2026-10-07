@@ -358,8 +358,9 @@ async def test_apply_configs_records_request_exception_as_failed():
             )
     assert len(results) == 1
     assert results[0].status == "failed"
-    assert results[0].error.startswith("request failed: ")
-    assert "execution unreachable" in results[0].error
+    # Issue #1036: the class only, never the transport error's text.
+    assert results[0].error == "request failed (ConnectError)"
+    assert "execution unreachable" not in results[0].error
 
 
 async def test_apply_configs_handles_non_json_success_body():
@@ -533,7 +534,8 @@ async def test_commit_unexpected_error_rolls_back_and_wraps_502(monkeypatch):
             await committer.commit_proposal(_req(), "user-bearer", "user-1")
 
     assert exc.value.status_code == 502
-    assert "Unexpected upstream failure" in exc.value.message
+    # Issue #1036: the class only, never the exception's text.
+    assert exc.value.message == "Unexpected upstream failure (KeyError)"
     assert rollback.called
 
 
