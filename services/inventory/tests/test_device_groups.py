@@ -1029,3 +1029,48 @@ async def test_device_groups_for_device_ungrouped_device_returns_empty_list(clie
     resp = await client.get(f"/device-groups/device/{dev['id']}")
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+# --- issue #1019: bulk add naming devices that do not exist ---
+
+
+@pytest.mark.asyncio
+async def test_bulk_add_devices_mixed_unknown_id_is_422_naming_it_and_adds_nothing(client):
+    template = await _create_template(client)
+    dev1 = await _create_device(client, template["id"], "dev1")
+    dev2 = await _create_device(client, template["id"], "dev2")
+    group = await _create_device_group(client)
+    ghost = "00000000-0000-0000-0000-00000000dead"
+
+    resp = await client.post(
+        f"/device-groups/{group['id']}/devices/bulk",
+        json={"device_ids": [dev1["id"], ghost, dev2["id"]]},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == f"Devices not found: {ghost}"
+    detail = (await client.get(f"/device-groups/{group['id']}")).json()
+    assert detail["device_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_bulk_add_devices_all_unknown_ids_are_422_sorted_and_deduplicated(client):
+    group = await _create_device_group(client)
+    a = "00000000-0000-0000-0000-00000000000a"
+    b = "00000000-0000-0000-0000-00000000000b"
+
+    resp = await client.post(
+        f"/device-groups/{group['id']}/devices/bulk",
+        json={"device_ids": [b, a, b]},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == f"Devices not found: {a}, {b}"
+    detail = (await client.get(f"/device-groups/{group['id']}")).json()
+    assert detail["device_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_bulk_add_devices_empty_list_is_a_no_op(client):
+    group = await _create_device_group(client)
+    resp = await client.post(f"/device-groups/{group['id']}/devices/bulk", json={"device_ids": []})
+    assert resp.status_code == 200
+    assert resp.json() == {"added": 0, "skipped": 0}

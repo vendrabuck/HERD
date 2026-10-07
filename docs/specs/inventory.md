@@ -764,11 +764,12 @@ to one or more user groups; that grant is what lets a non-admin see a device.
   unique-constraint conflict instead of answering 500. \
   Enforced in: `services/inventory/app/services/device_group_service.py` (`bulk_add_devices`) \
   Pinned by: `services/inventory/tests/test_device_group_service_unit.py` (`test_bulk_add_devices_concurrent_duplicate_skips_gracefully`)
-- **INV-GRP-7.** Device ids are not checked before insert: an id with no device fails
-  the foreign key, the request answers 500, and no device in that request is added.
-  Known gap, see #1019. \
+- **INV-GRP-7.** Every requested device id is resolved before anything is inserted. When
+  any id names no device the request answers 422 `Devices not found: <ids>` (every
+  unknown id, sorted, comma separated) and no device in that request is added: the
+  `{added, skipped}` answer has no per-row slot, so the add is all or nothing. \
   Enforced in: `services/inventory/app/services/device_group_service.py` (`bulk_add_devices`) \
-  Pinned by: none
+  Pinned by: `services/inventory/tests/test_device_groups.py` (`test_bulk_add_devices_mixed_unknown_id_is_422_naming_it_and_adds_nothing`, `test_bulk_add_devices_all_unknown_ids_are_422_sorted_and_deduplicated`); `services/inventory/tests/test_storage_constraints.py` (`test_group_bulk_add_mixed_unknown_id_is_422_and_adds_nothing_with_fk_on`)
 - **INV-GRP-8.** Bulk remove answers `{removed, not_found}`. \
   Enforced in: `services/inventory/app/services/device_group_service.py` (`bulk_remove_devices`) \
   Pinned by: `services/inventory/tests/test_device_groups.py` (`test_bulk_remove_devices`, `test_bulk_remove_devices_not_found`)
@@ -1302,6 +1303,7 @@ other error carries `detail` as a string or as the object shown.
 | 409 | `Cannot delete hypervisor: templates still reference it` | hypervisor delete while referenced | INV-HYP-7 |
 | 409 | `Device group '<name>' already exists` | duplicate group name | INV-GRP-2 |
 | 422 | validation list | schema violations: name lengths, unknown enum values, poll interval below the floor, template field and section rules, batch over 500 ids, group bulk over 500 ids, port bulk bounds, blank hypervisor fields, bad export or import `format`, missing internal token header | INV-DEV-1, INV-DEV-6, INV-POLL-1, INV-TPL-2, INV-TPL-4 to INV-TPL-12, INV-BATCH-1, INV-GRP-2, INV-GRP-4, INV-GRP-9, INV-GRP-17, INV-PORT-4, INV-PORT-5, INV-HYP-11, INV-BULK-19, INV-INT-1, INV-INT-3 |
+| 422 | `Devices not found: <ids>` | group bulk add naming a device that does not exist | INV-GRP-7 |
 | 422 | `Template not found`, `Template is not a device template`, `Template is not a port template`, `Template is not a dynamic template` | device, port, or dynamic-instance create from the wrong template | INV-DEV-2, INV-PORT-3, INV-DYN-1 |
 | 422 | `Template '<name>' has unknown hardware identity. ...` | device create from a template whose vendor or model is `unknown` | INV-DEV-3 |
 | 422 | `Unknown fields: <keys>`, `Required field missing: <key>`, `Field '<key>' must be a string`, `... a number`, `... a boolean`, `... one of: <options>` | `field_data` validation | INV-FIELD-1 to INV-FIELD-6 |
@@ -1313,7 +1315,6 @@ other error carries `detail` as a string or as the object shown.
 | 422 | `Import file must be UTF-8 encoded; re-save it as UTF-8 and retry` | an import file that is not valid UTF-8 | INV-BULK-20 |
 | 422 | `generated port names would exceed 255 characters; ...` (validation list) | a bulk port create whose last generated name is too long | INV-PORT-6 |
 | 500 | `internal: missing Authorization header while resolving user groups` or `... group names` | a visibility or name lookup with no header to forward | INV-VIS-3 |
-| 500 | unhandled | group bulk add naming a device that does not exist | INV-GRP-7 |
 | 503 | `auth service unreachable while fetching user groups` or `auth service returned <status> when fetching user groups` | visibility lookup failed | INV-VIS-2, INV-VIS-6, INV-VIS-8, INV-BATCH-5 |
 | 503 | `auth service unreachable while fetching group names` or `auth service returned <status> when fetching group names` | by-device group name lookup failed | INV-GRP-11 |
 | 503 | `Could not verify device is not in use` | the delete guard could not ask reservations or cabling | INV-DEL-5 |
@@ -1384,8 +1385,6 @@ INV-PORT-6, by a throwaway script against the service on SQLite with foreign key
   body names `driver_id`, and a null driver returns before any check, so an update can
   clear a device template's driver. A driver's connection type can change while
   templates use it.
-- #1019 (INV-GRP-7): a bulk add with one unknown device id fails the foreign key at an
-  autoflush outside the `try`, answers 500, and adds nothing.
 - #1020 (INV-DEV-15): the device page saves the status loaded when the page opened, so
   a status change made elsewhere in the meantime is overwritten. The admin status write
   itself ignoring reservation holds is intended (INV-STATUS-9, under Limits by
@@ -1436,7 +1435,6 @@ exist); #1025 tracks the corrections.
 - INV-RED-4: redaction covers only the template's password keys.
 - INV-BATCH-4: the batch does not force `dut_only`.
 - INV-PORT-9: repeated port names on one device.
-- INV-GRP-7: a group bulk add naming a missing device.
 - INV-GRP-12: user group names beyond auth's first page.
 - INV-GRP-15: a device left in no group is not returned to `No Pool`.
 - INV-GRP-16: renaming or deleting `No Pool`.

@@ -167,3 +167,34 @@ async def test_device_defaults_to_available_status():
         await session.commit()
         await session.refresh(dev)
         assert dev.status == DeviceStatus.AVAILABLE
+
+
+# --- issue #1019: group bulk add with an unknown device id, foreign keys ON ---
+
+
+@pytest.mark.asyncio
+async def test_group_bulk_add_mixed_unknown_id_is_422_and_adds_nothing_with_fk_on():
+    """issue #1019 at the production constraint level: with the foreign key
+    enforced, one unknown id among real ones used to fail at an autoflush (500)
+    and drop the valid rows. Now every id is resolved first: 422 naming the
+    unknown id, nothing added, and the session is still usable."""
+    from app.services.device_group_service import bulk_add_devices
+    from fastapi import HTTPException
+
+    async with SessionLocal() as session:
+        tpl = await _make_template(session)
+        dev = Device(name="real", template_id=tpl.id, topology_type=TopologyType.PHYSICAL)
+        group = DeviceGroup(name="G")
+        session.add_all([dev, group])
+        await session.commit()
+        ghost = uuid.UUID("00000000-0000-0000-0000-00000000dead")
+
+        with pytest.raises(HTTPException) as ei:
+            await bulk_add_devices(session, group.id, [dev.id, ghost])
+        assert ei.value.status_code == 422
+        assert ei.value.detail == f"Devices not found: {ghost}"
+
+        rows = (await session.execute(select(DeviceGroupDevice))).scalars().all()
+        assert rows == []
+        # The valid id on its own still adds cleanly afterwards.
+        assert await bulk_add_devices(session, group.id, [dev.id]) == (1, 0)

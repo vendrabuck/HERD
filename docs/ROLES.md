@@ -597,7 +597,9 @@ Content-Type: application/json
 { "device_ids": ["uuid-1", "uuid-2"] }
 ```
 
-Returns `{"added": 2, "skipped": 0}`. Skipped devices are already in the group.
+Returns `{"added": 2, "skipped": 0}`. Skipped devices are already in the group. Every id
+is checked first: when any id names no device, the request answers HTTP 422
+`Devices not found: <sorted ids>` and adds nothing.
 
 ### Bulk remove devices
 
