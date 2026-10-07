@@ -24,7 +24,7 @@ Check with `make logs` or `docker compose logs <service>`; the startup error mes
 ### Login succeeds but every API call returns 401
 
 Either:
-- The `AUTH_SECRET_KEY` changed after tokens were issued. Users need to log in again.
+- The `AUTH_SECRET_KEY` changed after tokens were issued. Access tokens signed with the old key are refused everywhere, but refresh tokens do not depend on the key, so the client's silent refresh normally recovers on its own; a user needs to log in again only when the refresh fails too. See [SECURITY.md](../SECURITY.md) for ending sessions after a rotation.
 - Clock skew between the client and the backend is larger than the token lifetime.
 - The bearer token expired (30 min default). The auth client should refresh automatically; if it's stuck, clear local storage and log in fresh.
 

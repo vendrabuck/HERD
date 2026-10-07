@@ -293,7 +293,11 @@ async def test_commit_validate_5xx_fails_closed_with_503(async_client):
             resp = await client.post("/commit", json=_commit_body(), headers=headers)
 
     assert resp.status_code == 503
-    assert "cabling db unavailable" in resp.json()["detail"]
+    # Issue #1036: the status, never the upstream body.
+    assert resp.json()["detail"] == (
+        "Failed to validate topology wireability: cabling answered HTTP 503"
+    )
+    assert "cabling db unavailable" not in resp.text
     assert rollback.called
 
 
@@ -304,7 +308,9 @@ async def test_commit_validate_transport_failure_fails_closed_with_503(async_cli
     with respx.mock(assert_all_called=True) as mock:
         mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})
         mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(200, json={})
-        mock.post(VALIDATE_URL).mock(side_effect=httpx.ConnectError("cabling unreachable"))
+        mock.post(VALIDATE_URL).mock(
+            side_effect=httpx.ConnectError("connect failed to http://cabling:8000")
+        )
         rollback = mock.delete(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(204)
 
         headers = {"Authorization": f"Bearer {_user_token()}"}
@@ -312,6 +318,9 @@ async def test_commit_validate_transport_failure_fails_closed_with_503(async_cli
             resp = await client.post("/commit", json=_commit_body(), headers=headers)
 
     assert resp.status_code == 503
+    # Issue #1036: a fixed detail, never the transport error's URL-bearing text.
+    assert resp.json()["detail"] == ("Failed to validate topology wireability: cabling unreachable")
+    assert "http://cabling" not in resp.text
     assert "cabling unreachable" in resp.json()["detail"]
     assert rollback.called
 
@@ -360,7 +369,10 @@ async def test_commit_aborts_with_503_when_ports_fetch_hits_5xx(async_client):
             resp = await client.post("/commit", json=body, headers=headers)
 
     assert resp.status_code == 503
-    assert "inventory unavailable" in resp.json()["detail"]
+    # Issue #1036: the HERD device id and the status, never the upstream body.
+    assert resp.json()["detail"].endswith(": inventory answered HTTP 503")
+    assert resp.json()["detail"].startswith("Failed to fetch ports for device ")
+    assert "inventory unavailable" not in resp.text
 
 
 async def test_commit_apply_configs_calls_execution_per_device(async_client):

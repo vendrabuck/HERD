@@ -17,8 +17,8 @@ from app.services.ai_client import (
     get_ai_client,
 )
 from app.services.cabling_client import CablingUnavailableError
-from app.services.generator import CABLING_UNAVAILABLE_DETAIL
-from app.services.inventory_client import InventorySummary
+from app.services.generator import CABLING_UNAVAILABLE_DETAIL, INVENTORY_UNAVAILABLE_DETAIL
+from app.services.inventory_client import InventorySummary, InventoryUnavailableError
 from app.services.llm_provider import Usage
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
@@ -67,13 +67,19 @@ async def setup_db():
         await conn.run_sync(Base.metadata.drop_all)
 
 
-def _override_inventory(counts: dict[str, int]) -> None:
+def _override_inventory(counts: dict[str, int]) -> dict[str, int]:
+    """Override the route's inventory loader with a canned summary. Returns a
+    counter of how many times the route actually loaded inventory, so a gate
+    test can assert the summary was never read (issue #1035)."""
     ids = {name: f"tpl-{name}" for name in counts}
+    calls = {"n": 0}
 
-    async def _stub() -> InventorySummary:
+    async def _load() -> InventorySummary:
+        calls["n"] += 1
         return InventorySummary(counts, ids)
 
-    app.dependency_overrides[_inventory_provider] = _stub
+    app.dependency_overrides[_inventory_provider] = lambda: _load
+    return calls
 
 
 def _override_ai(response: dict[str, Any] | None = None, *, raises: Exception | None = None):
@@ -1273,3 +1279,322 @@ async def test_generate_ignores_element_edges_in_the_feasibility_check(async_cli
     assert resp.json()["devices"][0]["device"]["id"] == "dev-EX3400-0"
     # No device-to-device edge, so cabling was never asked anything.
     assert asked == []
+
+
+# --- Upstream failures and gate order (issue #1035) ------------------------
+
+
+class _ExplodingAI:
+    async def propose_topology(self, **kwargs):
+        raise AssertionError("the provider must not be called")
+
+
+async def test_generate_unconfigured_makes_no_inventory_call(async_client, monkeypatch):
+    """The provider gate answers 503 before the inventory summary is read."""
+    monkeypatch.setattr(config_module.settings, "ai_api_key", "")
+    monkeypatch.setattr(config_module.settings, "ai_base_url", "")
+    calls = _override_inventory({"EX3400": 10})
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "hi"}, headers=headers)
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == AI_NOT_CONFIGURED_DETAIL
+    assert calls["n"] == 0
+
+
+async def test_generate_over_quota_makes_no_inventory_call(async_client, monkeypatch):
+    """The quota gate answers 429 before the inventory summary is read."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 100)
+    async with _TestSessionLocal() as db:
+        await usage_repo.add_tokens(db, uuid.UUID(_USER_ID), input_tokens=100, output_tokens=0)
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    calls = _override_inventory({"EX3400": 4})
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "anything"}, headers=headers)
+    assert resp.status_code == 429
+    assert calls["n"] == 0
+
+
+async def test_generate_rejected_upload_makes_no_inventory_call(async_client, monkeypatch):
+    """Upload validation is local and runs before the inventory summary too."""
+    monkeypatch.setattr(config_module.settings, "upload_max_files", 1)
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    calls = _override_inventory({"EX3400": 4})
+    files = [
+        ("files", ("a.txt", b"one", "text/plain")),
+        ("files", ("b.txt", b"two", "text/plain")),
+    ]
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, files=files, headers=headers)
+    assert resp.status_code == 400
+    assert calls["n"] == 0
+
+
+async def test_generate_503_when_inventory_summary_fails(async_client, monkeypatch):
+    """The real loader maps an inventory failure to the pinned 503, with no
+    upstream text (the internal URL) in the detail (issues #1035, #1036)."""
+    from app.routes import generate as generate_route
+
+    async def _failing_summary(token: str):
+        raise InventoryUnavailableError("summary", "HTTPStatusError", 503)
+
+    monkeypatch.setattr(generate_route, "fetch_inventory_summary", _failing_summary)
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == INVENTORY_UNAVAILABLE_DETAIL
+    assert INVENTORY_UNAVAILABLE_DETAIL == (
+        "Could not read inventory; no topology was generated. Retry the request."
+    )
+
+
+async def test_generate_503_when_inventory_fails_during_candidate_fetch(async_client, monkeypatch):
+    """Inventory restarting between the summary and the resolver's candidate
+    fetch is a 503, not a 500, and it is not repaired."""
+    _override_inventory({"EX3400": 4})
+
+    async def _failing_candidates(token: str, template_id: str, count: int):
+        raise InventoryUnavailableError("candidates", "ConnectError", None)
+
+    monkeypatch.setattr(generator_module, "fetch_available_devices", _failing_candidates)
+    sink: list[str] = []
+    _override_ai_recording(
+        {
+            "purpose": "one box",
+            "devices": [{"role": "a", "template_name": "EX3400"}],
+            "edges": [],
+        },
+        sink,
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == INVENTORY_UNAVAILABLE_DETAIL
+    # One provider call: an outage is not a modelling mistake to repair.
+    assert len(sink) == 1
+
+
+# --- Failed requests are metered (issue #1034) -----------------------------
+
+
+async def test_generate_failed_after_repairs_meters_every_attempt(async_client, monkeypatch):
+    """The issue's reproduction: a proposal the model keeps getting wrong
+    spends three provider calls (default two repairs) and answers 502; the
+    tokens of all three count against the day's quota."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 100)
+    _override_inventory({"EX3400": 4})
+    _override_resolver(monkeypatch)
+    _override_ai(
+        {
+            "purpose": "bad",
+            "devices": [{"role": "a", "template_name": "NotInInventory"}],
+            "edges": [],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        first = await client.post("/generate", data={"prompt": "go"}, headers=headers)
+        assert first.status_code == 502
+        async with _TestSessionLocal() as db:
+            # 3 attempts x Usage(10, 20) = 90.
+            assert await usage_repo.get_today_total(db, uuid.UUID(_USER_ID)) == 90
+        second = await client.post("/generate", data={"prompt": "go"}, headers=headers)
+        assert second.status_code == 502
+        # 180 >= 100: the quota now blocks the third failing request.
+        third = await client.post("/generate", data={"prompt": "go"}, headers=headers)
+    assert third.status_code == 429
+
+
+async def test_generate_ai_error_with_reported_usage_is_metered(async_client, monkeypatch):
+    """A provider that answered without the forced tool call still spent
+    tokens; AIError carries them and the route meters them."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    _override_inventory({"EX3400": 4})
+    _override_ai(raises=AIError("no tool_use", usage=Usage(input_tokens=7, output_tokens=3)))
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "go"}, headers=headers)
+    assert resp.status_code == 502
+    async with _TestSessionLocal() as db:
+        assert await usage_repo.get_today_total(db, uuid.UUID(_USER_ID)) == 10
+
+
+async def test_generate_unreachable_provider_meters_nothing(async_client, monkeypatch):
+    """No answer came back, so nothing is known to have been spent."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    _override_inventory({"EX3400": 4})
+    _override_ai(raises=AIProviderUnavailableError("refused"))
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "go"}, headers=headers)
+    assert resp.status_code == 503
+    async with _TestSessionLocal() as db:
+        assert await usage_repo.get_today_total(db, uuid.UUID(_USER_ID)) == 0
+
+
+# --- One topology type per proposal (issue #1038) --------------------------
+
+
+def _override_typed_resolver(monkeypatch, types: dict[str, str]) -> None:
+    """Like _override_resolver, but each template's devices carry the
+    topology_type given in `types` (default PHYSICAL)."""
+
+    async def _fake(token: str, template_id: str, count: int):
+        template_name = template_id.removeprefix("tpl-")
+        return [
+            {
+                "id": f"dev-{template_name}-{i}",
+                "name": f"{template_name}-{i}",
+                "template_id": template_id,
+                "template_name": template_name,
+                "topology_type": types.get(template_name, "PHYSICAL"),
+                "status": "AVAILABLE",
+            }
+            for i in range(count)
+        ]
+
+    monkeypatch.setattr(generator_module, "fetch_available_devices", _fake)
+    _override_pathfind(monkeypatch)
+
+
+_MIXED_PROPOSAL = {
+    "purpose": "mixed",
+    "devices": [
+        {"role": "fw", "template_name": "EX3400"},
+        {"role": "vm", "template_name": "CloudVM"},
+    ],
+    "edges": [],
+}
+
+
+async def test_generate_mixed_types_repairs_then_returns_structured_422(async_client, monkeypatch):
+    _override_inventory({"EX3400": 4, "CloudVM": 4})
+    _override_typed_resolver(monkeypatch, {"CloudVM": "CLOUD"})
+    sink: list[str] = []
+    _override_ai_recording(_MIXED_PROPOSAL, sink)
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "topology_mixed_types"
+    assert detail["groups"] == [
+        {"topology_type": "CLOUD", "roles": ["vm"], "templates": ["CloudVM"]},
+        {"topology_type": "PHYSICAL", "roles": ["fw"], "templates": ["EX3400"]},
+    ]
+    assert detail["message"] == (
+        "The proposal mixes CLOUD and PHYSICAL devices; physical and cloud devices "
+        "cannot share one topology or reservation."
+    )
+    # Default two repairs: three calls, the last two carrying the corrective note.
+    assert len(sink) == 3
+    assert sink[0] == ""
+    assert "templates CloudVM resolved to CLOUD devices" in sink[1]
+    assert "templates EX3400 resolved to PHYSICAL devices" in sink[1]
+
+
+async def test_generate_mixed_types_is_repaired_on_retry(async_client, monkeypatch):
+    _override_inventory({"EX3400": 4, "CloudVM": 4})
+    _override_typed_resolver(monkeypatch, {"CloudVM": "CLOUD"})
+    _override_ai_sequence(
+        [
+            _MIXED_PROPOSAL,
+            {
+                "purpose": "physical only",
+                "devices": [
+                    {"role": "fw", "template_name": "EX3400"},
+                    {"role": "fw2", "template_name": "EX3400"},
+                ],
+                "edges": [],
+            },
+        ]
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert {d["topology_type"] for d in resp.json()["devices"]} == {"PHYSICAL"}
+
+
+async def test_generate_topology_type_follows_the_resolved_devices(async_client, monkeypatch):
+    """A uniform proposal states the resolved devices' real type, not the
+    schema's PHYSICAL default the model left in place."""
+    _override_inventory({"CloudVM": 4})
+    _override_typed_resolver(monkeypatch, {"CloudVM": "CLOUD"})
+    _override_ai(
+        {
+            "purpose": "cloud pair",
+            "devices": [
+                {"role": "a", "template_name": "CloudVM", "topology_type": "PHYSICAL"},
+                {"role": "b", "template_name": "CloudVM"},
+            ],
+            "edges": [],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert [d["topology_type"] for d in resp.json()["devices"]] == ["CLOUD", "CLOUD"]
+
+
+# --- issue #1040: rules with no pin ---------------------------------------
+
+
+async def test_read_uploads_skips_nameless_and_empty_parts():
+    """AI-UPLOAD-3: a part with no filename is skipped without being read,
+    and a part with no bytes is skipped silently; neither is an error."""
+    nameless = _CountingUploadFile("", b"ignored")
+    empty = _CountingUploadFile("empty.txt", b"")
+    real = _CountingUploadFile("notes.txt", b"hello")
+
+    extracted = await _read_uploads([nameless, empty, real])
+
+    assert [f.filename for f in extracted] == ["notes.txt"]
+    assert nameless.read_calls == 0
+    assert await _read_uploads([nameless, _CountingUploadFile("e.txt", b"")]) == []
+
+
+async def test_pathfind_batch_chunks_at_200_with_the_callers_jwt(monkeypatch):
+    """AI-RESOLVE-7: pairs go out in chunks of 200 per request, each with
+    the caller's JWT, on a client with a 20 second timeout."""
+    import httpx
+    from app.services import cabling_client
+
+    assert cabling_client.PATHFIND_BATCH_CHUNK == 200
+    assert cabling_client.PATHFIND_TIMEOUT_SECONDS == 20.0
+
+    sizes: list[int] = []
+    auth: list[str] = []
+    timeouts: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        pairs = _json.loads(request.content)["pairs"]
+        sizes.append(len(pairs))
+        auth.append(request.headers["Authorization"])
+        return httpx.Response(200, json={"results": [{"reachable": True} for _ in pairs]})
+
+    real_client = httpx.AsyncClient
+
+    class _Patched(real_client):
+        def __init__(self, *args, **kwargs):
+            timeouts.append(kwargs.get("timeout"))
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(cabling_client.httpx, "AsyncClient", _Patched)
+    pairs = [(f"s{i}", f"t{i}") for i in range(450)]
+    results = await cabling_client.fetch_pathfind_batch("caller-jwt", pairs)
+
+    assert sizes == [200, 200, 50]
+    assert auth == ["Bearer caller-jwt"] * 3
+    assert timeouts == [20.0]
+    assert len(results) == 450

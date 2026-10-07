@@ -2,7 +2,7 @@ import { http, HttpResponse } from "msw";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeAll, beforeEach } from "vitest";
 
 beforeAll(() => {
   HTMLDialogElement.prototype.showModal = function () {
@@ -250,5 +250,52 @@ describe("AICommitDialog", () => {
         "Commit failed: some other structured problem",
       ),
     );
+  });
+});
+
+
+describe("AICommitDialog defaults (#1040)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("defaults the window to one to five hours from now", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(2026, 2, 10, 10, 0));
+    renderDialog();
+    expect((screen.getByLabelText("Start time") as HTMLInputElement).value).toBe(
+      "2026-03-10T11:00",
+    );
+    expect((screen.getByLabelText("End time") as HTMLInputElement).value).toBe(
+      "2026-03-10T15:00",
+    );
+  });
+
+  it("offers Apply device configs only when a resolved device has a non-empty config", () => {
+    const withConfig = (config: Record<string, unknown> | null, resolved = true) => ({
+      ...PROPOSAL,
+      devices: [
+        { ...PROPOSAL.devices[0], device: resolved ? PROPOSAL.devices[0].device : null, config },
+      ],
+    });
+    const checkbox = () => screen.queryByRole("checkbox", { name: /Apply device configs/ });
+
+    const { unmount } = renderDialog(withConfig(null));
+    expect(checkbox()).toBeNull();
+    unmount();
+
+    const empty = renderDialog(withConfig({}));
+    expect(checkbox()).toBeNull();
+    empty.unmount();
+
+    const unresolved = renderDialog(withConfig({ vlan: 10 }, false));
+    expect(checkbox()).toBeNull();
+    unresolved.unmount();
+
+    renderDialog(withConfig({ vlan: 10 }));
+    expect(checkbox()).not.toBeNull();
+    expect(checkbox()).not.toBeChecked();
+    // #1041: a non-admin with a device manage grant may apply configs too.
+    expect(checkbox()).toHaveAccessibleName(/Needs admin, or a manage grant on each device/);
   });
 });

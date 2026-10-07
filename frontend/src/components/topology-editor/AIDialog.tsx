@@ -4,7 +4,12 @@ import { isAxiosError } from "axios";
 
 import { Modal } from "@/components/ui/Modal";
 import { useAIGenerate } from "@/api/ai";
-import { formatUnconnectableDetail, topologyUnconnectableDetail } from "@/lib/errors";
+import {
+  formatMixedTypesDetail,
+  formatUnconnectableDetail,
+  topologyMixedTypesDetail,
+  topologyUnconnectableDetail,
+} from "@/lib/errors";
 import type { AIGenerateResponse } from "@/types/ai.types";
 
 interface AIDialogProps {
@@ -78,6 +83,15 @@ export function AIDialog({ open, onClose, onProposal }: AIDialogProps) {
       const unconnectable = topologyUnconnectableDetail(err);
       if (unconnectable) {
         toast.error(formatUnconnectableDetail(unconnectable), {
+          style: { whiteSpace: "pre-line" },
+        });
+        return;
+      }
+      // Issue #1038: the proposal's devices resolved to physical and cloud
+      // types, which one topology cannot hold; name the templates per type.
+      const mixed = topologyMixedTypesDetail(err);
+      if (mixed) {
+        toast.error(formatMixedTypesDetail(mixed), {
           style: { whiteSpace: "pre-line" },
         });
         return;

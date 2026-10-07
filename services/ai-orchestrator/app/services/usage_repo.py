@@ -13,6 +13,13 @@ hooks the AI routes call:
 - `record_usage(db, user_id, usage, ...)` runs AFTER the call returns, adding
   the provider-reported tokens, or a chars/4 estimate when the provider omits
   usage (some openai_compat backends do).
+- `record_failed_usage(db, user_id, usage)` runs when a request ENDS IN AN
+  ERROR after provider calls were made (issue #1034): a generation whose
+  repairs ran out, a recipe run whose validator is unreachable, a rolled-back
+  assistant turn, a classification with no usable answer. It books the
+  provider-reported tokens those calls spent, so a caller cannot repeat a
+  failing request without limit under the quota. `usage_of(exc)` reads the
+  tokens a failure carries.
 
 With `settings.ai_daily_token_quota == 0` both hooks short-circuit and no rows
 are written, so a deployment that has not opted in sees zero behavior change.
@@ -22,6 +29,7 @@ reads.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -35,6 +43,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models.ai_usage import AIUsage
 from app.services.llm_provider import Usage
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -230,3 +240,50 @@ async def record_usage(
         cache_creation_input_tokens=getattr(usage, "cache_creation_input_tokens", 0),
         cache_read_input_tokens=getattr(usage, "cache_read_input_tokens", 0),
     )
+
+
+def usage_of(exc: BaseException) -> Usage | None:
+    """The tokens a failure is known to have spent, or None. AIError,
+    GeneratorError, RecipeAuthorError, and PurposeClassifierError all carry a
+    `usage` attribute (issue #1034); anything else carries nothing."""
+    usage = getattr(exc, "usage", None)
+    return usage if isinstance(usage, Usage) else None
+
+
+async def record_failed_usage(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    usage: Usage | None,
+) -> None:
+    """Meter the tokens spent by a request that ended in an error (issue #1034).
+
+    No-op when the quota is disabled, when `usage` is None, or when both counts
+    are zero. Unlike record_usage there is no chars/4 estimate: zero means
+    nothing is known to have been spent (the provider was never reached, or
+    reported nothing), and there is no answer text to estimate from. The
+    quota check itself is unchanged: enforce_quota still runs before the next
+    call, against a total that now includes failed calls.
+
+    Best effort: the caller is about to surface its own error, so a metering
+    failure is logged (class name only), the session is rolled back, and the
+    original error is what the client sees.
+    """
+    if settings.ai_daily_token_quota <= 0 or usage is None:
+        return
+    if usage.input_tokens == 0 and usage.output_tokens == 0:
+        return
+    try:
+        await add_tokens(
+            db,
+            user_id,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_creation_input_tokens=usage.cache_creation_input_tokens,
+            cache_read_input_tokens=usage.cache_read_input_tokens,
+        )
+    except Exception as exc:
+        logger.warning("ai_failed_usage_not_recorded", extra={"error_class": type(exc).__name__})
+        try:
+            await db.rollback()
+        except Exception:
+            logger.warning("ai_failed_usage_rollback_failed")

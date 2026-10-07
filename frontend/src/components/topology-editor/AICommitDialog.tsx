@@ -224,8 +224,8 @@ function CommitForm({ proposal, onClose, onCommitted }: FormProps) {
           />
           <label htmlFor="ai-commit-apply-configs" className="text-sm text-gray-700">
             Apply device configs after commit ({configCount} device
-            {configCount === 1 ? "" : "s"} have suggested config). Requires admin on the
-            execution service; per-device failures are reported, not rolled back.
+            {configCount === 1 ? "" : "s"} have suggested config). Needs admin, or a manage
+            grant on each device; per-device failures are reported, not rolled back.
           </label>
         </div>
       )}

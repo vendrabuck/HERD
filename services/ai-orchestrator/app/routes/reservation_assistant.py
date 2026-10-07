@@ -48,6 +48,7 @@ from app.services.ai_client import (
 from app.services.llm_provider import TextBlock, ToolResultBlock, ToolUseBlock, Usage
 from app.services.reservation_context import (
     ContextDeadlineExceededError,
+    ContextUpstreamUnavailableError,
     ReservationNotFoundError,
     ReservationSeed,
     gather_reservation_seed,
@@ -67,6 +68,19 @@ _STREAM_END = object()
 INCOMPLETE_REASON_TIMEOUT = "timeout"
 INCOMPLETE_REASON_PROVIDER_UNAVAILABLE = "provider_unavailable"
 INCOMPLETE_REASON_AI_ERROR = "ai_error"
+
+# Client-facing text for a turn that failed for any reason other than the
+# deadline, an unreachable provider, or a stream with no result: the buffered
+# 502 detail and the streamed `error` frame both carry it. Pinned and neutral,
+# never the exception's own text (CWE-209); the exception is logged instead.
+ASSISTANT_CALL_FAILED_DETAIL = "Assistant call failed"
+
+# Pinned 503 detail for a first-turn seed read that reservations or inventory
+# could not answer (issue #1035). Never the upstream error text, which names
+# the internal service URL (issue #1036).
+RESERVATION_CONTEXT_UNAVAILABLE_DETAIL = (
+    "Could not read the reservation or its devices; retry the request."
+)
 
 # Issue #871 review follow-up: header for the landed-actions list appended to
 # INCOMPLETE_AFTER_TOOLS_ANSWER when a side effect landed but its iteration
@@ -114,6 +128,11 @@ def get_reservation_seed_dep(
             raise HTTPException(
                 status.HTTP_504_GATEWAY_TIMEOUT,
                 "Reservation seed gather exceeded its deadline",
+            ) from exc
+        except ContextUpstreamUnavailableError as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                RESERVATION_CONTEXT_UNAVAILABLE_DETAIL,
             ) from exc
 
     return _gather
@@ -456,6 +475,9 @@ async def reservation_assistant(
         # message history would have two consecutive user messages, causing a 400
         # from the provider and permanently jamming the conversation.
         await db.rollback()
+        # Issue #1034, on every rollback below as well: the turn is discarded
+        # but the provider calls it made are metered, in a fresh transaction.
+        await usage_repo.record_failed_usage(db, user_id, partial_usage)
         raise HTTPException(
             status.HTTP_504_GATEWAY_TIMEOUT,
             f"Assistant did not respond within {settings.assistant_overall_deadline_s:.0f}s",
@@ -477,6 +499,7 @@ async def reservation_assistant(
         # standardization. Caught before AIError (its subclass); rolls back the
         # flushed user turn like the other failure branches so no orphan persists.
         await db.rollback()
+        await usage_repo.record_failed_usage(db, user_id, partial_usage)
         logger.warning("ai_assistant_provider_unreachable: %s", exc)
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -499,10 +522,11 @@ async def reservation_assistant(
         # log the exception detail server-side and return a generic message so a
         # backend exception string is never exposed to the client (CWE-209).
         await db.rollback()
+        await usage_repo.record_failed_usage(db, user_id, partial_usage)
         logger.exception("ai_assistant_failed")
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
-            "Assistant call failed",
+            ASSISTANT_CALL_FAILED_DETAIL,
         ) from exc
 
     # Issue #904: the overall deadline bounds only the model-and-tool loop
@@ -592,6 +616,41 @@ async def reservation_assistant_stream(
     )
 
     async def _event_stream() -> AsyncIterator[str]:
+        # Issue #1037: every streamed turn ends in exactly one `done` or
+        # `error` frame. The inner handlers below cover the failures they
+        # name; this outer guard covers everything else, including an
+        # exception raised BY one of those handlers or by persistence (a
+        # database failure while committing the turn). `terminal_sent`
+        # records whether a terminal frame already went out, so the guard
+        # never adds a second one.
+        terminal_sent = False
+        frames = _turn_frames()
+        try:
+            async for frame in frames:
+                if frame.startswith(("event: done\n", "event: error\n")):
+                    terminal_sent = True
+                yield frame
+        except Exception:
+            logger.exception("ai_assistant_stream_unexpected_error")
+            try:
+                await db.rollback()
+            except Exception:
+                logger.exception("ai_assistant_stream_rollback_failed")
+            if not terminal_sent:
+                terminal_sent = True
+                yield _sse("error", {"message": ASSISTANT_CALL_FAILED_DETAIL})
+        finally:
+            # Close the inner generator on every exit, a consumer that left
+            # at a yield included, so its own finally (closing the AI
+            # stream) runs now rather than at garbage collection.
+            await frames.aclose()
+        if not terminal_sent:
+            # Defensive: every path of _turn_frames ends in a terminal frame
+            # or raises, so this is unreachable today; it keeps the invariant
+            # if a future branch forgets one.
+            yield _sse("error", {"message": ASSISTANT_CALL_FAILED_DETAIL})
+
+    async def _turn_frames() -> AsyncIterator[str]:
         dispatcher: ToolDispatcher | None = None
         # Issue #871: same shared-mutable-output-param plumbing as the
         # buffered endpoint; see the comment there and AIClient's docstring.
@@ -643,6 +702,7 @@ async def reservation_assistant_stream(
                         # flushed user turn so it does not persist without a reply and
                         # wedge the next turn's role alternation.
                         await db.rollback()
+                        await usage_repo.record_failed_usage(db, user_id, partial_usage)
                         yield _sse("error", {"message": "Assistant produced no answer"})
                         return
                 finally:
@@ -666,6 +726,7 @@ async def reservation_assistant_stream(
             # Discard the flushed-but-uncommitted user turn so a timed-out turn
             # leaves no orphan trailing user message.
             await db.rollback()
+            await usage_repo.record_failed_usage(db, user_id, partial_usage)
             yield _sse(
                 "error",
                 {
@@ -695,6 +756,7 @@ async def reservation_assistant_stream(
             # rather than dropping the connection. Roll back the flushed user turn
             # so no orphan persists, exactly as the AIError branch does.
             await db.rollback()
+            await usage_repo.record_failed_usage(db, user_id, partial_usage)
             logger.warning("ai_assistant_stream_provider_unreachable: %s", exc)
             yield _sse("error", {"message": AI_PROVIDER_UNREACHABLE_DETAIL})
         except AIError:
@@ -716,8 +778,32 @@ async def reservation_assistant_stream(
             # (CWE-209 stack-trace exposure). Roll back first so the failed turn's
             # user message never persists.
             await db.rollback()
+            await usage_repo.record_failed_usage(db, user_id, partial_usage)
             logger.exception("ai_assistant_stream_failed")
-            yield _sse("error", {"message": "Assistant call failed"})
+            yield _sse("error", {"message": ASSISTANT_CALL_FAILED_DETAIL})
+        except Exception:
+            # Issue #1037: an exception class none of the branches above
+            # names (a bug in a tool handler, a database error inside the
+            # loop). Logged in full here; the client gets the same neutral
+            # frame as an AIError. The #871 carve-out holds: a write that
+            # already landed keeps the turn and ends it in `done`.
+            logger.exception("ai_assistant_stream_failed")
+            incomplete_response = await _finalize_incomplete_turn(
+                db=db,
+                conversation=conversation,
+                dispatcher=dispatcher,
+                segments=partial_segments,
+                usage=partial_usage,
+                user_id=user_id,
+                question=body.question,
+                reason=INCOMPLETE_REASON_AI_ERROR,
+            )
+            if incomplete_response is not None:
+                yield _sse("done", incomplete_response.model_dump(mode="json"))
+                return
+            await db.rollback()
+            await usage_repo.record_failed_usage(db, user_id, partial_usage)
+            yield _sse("error", {"message": ASSISTANT_CALL_FAILED_DETAIL})
         else:
             # Issue #904: persist AFTER the deadline-bounded loop, never inside
             # it, so the overall deadline cannot interrupt the commit or make

@@ -104,6 +104,48 @@ export function topologyUnconnectableDetail(err: unknown): TopologyUnconnectable
 }
 
 /**
+ * One topology type in the AI generator's `topology_mixed_types` 422 body
+ * (issue #1038): the roles and templates whose resolved devices are of it.
+ */
+export interface MixedTypeGroup {
+  topology_type: string;
+  roles: string[];
+  templates: string[];
+}
+
+export interface TopologyMixedTypesDetail {
+  error: "topology_mixed_types";
+  groups: MixedTypeGroup[];
+  message: string;
+}
+
+/**
+ * Narrows an axios error's response detail to the AI generator's structured
+ * mixed-types 422: the proposal's devices resolved to more than one topology
+ * type (physical and cloud), which no topology or reservation may hold.
+ * Returns null for any other shape.
+ */
+export function topologyMixedTypesDetail(err: unknown): TopologyMixedTypesDetail | null {
+  return structuredDetail<TopologyMixedTypesDetail>(
+    err,
+    422,
+    (d) => d.error === "topology_mixed_types" && Array.isArray(d.groups),
+  );
+}
+
+/**
+ * Render the mixed-types detail as one toast: the server's sentence, then one
+ * "TYPE: template, template" line per type.
+ */
+export function formatMixedTypesDetail(detail: TopologyMixedTypesDetail): string {
+  const lines = detail.groups.map(
+    (group) => `${group.topology_type}: ${group.templates.join(", ")}`,
+  );
+  const message = detail.message || "The proposal mixes physical and cloud devices.";
+  return lines.length > 0 ? `${message}\n${lines.join("\n")}` : message;
+}
+
+/**
  * Render the detail as the text of one error toast: the server's sentence,
  * then one "source role to target role" line per unwireable pair.
  */

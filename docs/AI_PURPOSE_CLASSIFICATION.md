@@ -315,7 +315,10 @@ content from `USER`/`ASSISTANT` turns, skipping `TOOL`-role echoes and
 Every classify call (including the retry, if one happens) is metered through
 the same `ai_usage` table and `usage_repo.enforce_quota`/`record_usage` hooks
 every other AI feature uses, so it counts against `AI_DAILY_TOKEN_QUOTA` like
-topology generation, the assistant, and recipe drafting. The preview
+topology generation, the assistant, and recipe drafting. A classification
+that fails after reaching the provider (no usable distribution after the
+retry, or a model failure on the retry) books the tokens its attempts
+reported through `usage_repo.record_failed_usage` (issue #1034). The preview
 endpoint meters against the calling user; the internal endpoint meters
 against the reservation's owner (`user_id` in the request body), since there
 is no other acting user for a background call.

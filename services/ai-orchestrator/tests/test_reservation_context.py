@@ -211,3 +211,73 @@ def test_render_seed_handles_no_devices():
     rendered = render_seed_block(seed)
     assert "(no devices)" in rendered
     assert "<topology>" not in rendered
+
+
+# --- Upstream failures during the seed read (issue #1035) ------------------
+
+
+@pytest.mark.parametrize("status_code", [500, 503, 403])
+async def test_seed_gather_reservations_non_2xx_is_upstream_unavailable(monkeypatch, status_code):
+    """A non-2xx other than 404 from reservations is a typed error the route
+    maps to 503, never a raw httpx error (which surfaced as a 500)."""
+    from app.services.reservation_context import ContextUpstreamUnavailableError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"detail": "reservations down"})
+
+    _patch_httpx(monkeypatch, handler)
+    with pytest.raises(ContextUpstreamUnavailableError) as exc:
+        await gather_reservation_seed("test-token", RESERVATION_ID)
+    assert exc.value.service == "reservations"
+    assert exc.value.status_code == status_code
+    assert "reservations:8000" not in str(exc.value)
+
+
+async def test_seed_gather_transport_error_is_upstream_unavailable(monkeypatch):
+    from app.services.reservation_context import ContextUpstreamUnavailableError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    _patch_httpx(monkeypatch, handler)
+    with pytest.raises(ContextUpstreamUnavailableError) as exc:
+        await gather_reservation_seed("test-token", RESERVATION_ID)
+    assert exc.value.error_class == "ConnectError"
+    assert exc.value.status_code is None
+
+
+async def test_seed_gather_device_5xx_is_upstream_unavailable(monkeypatch):
+    """One device read failing fails the seed read (the other device reads
+    are awaited, not left running against a closed client)."""
+    from app.services.reservation_context import ContextUpstreamUnavailableError
+
+    routes = [
+        (
+            lambda r: r.url.path.endswith(f"/{RESERVATION_ID}"),
+            httpx.Response(200, json=_reservation_payload()),
+        ),
+        (
+            lambda r: r.url.path.endswith(f"/devices/{DEVICE_A}"),
+            httpx.Response(200, json=_device_payload(DEVICE_A, "fw-a")),
+        ),
+        (
+            lambda r: r.url.path.endswith(f"/devices/{DEVICE_B}"),
+            httpx.Response(503, json={"detail": "inventory down"}),
+        ),
+    ]
+    _patch_httpx(monkeypatch, _make_handler(routes))
+    with pytest.raises(ContextUpstreamUnavailableError) as exc:
+        await gather_reservation_seed("test-token", RESERVATION_ID)
+    assert exc.value.service == "inventory"
+    assert exc.value.status_code == 503
+
+
+async def test_seed_gather_non_json_reservation_body_is_upstream_unavailable(monkeypatch):
+    from app.services.reservation_context import ContextUpstreamUnavailableError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>bad gateway</html>")
+
+    _patch_httpx(monkeypatch, handler)
+    with pytest.raises(ContextUpstreamUnavailableError):
+        await gather_reservation_seed("test-token", RESERVATION_ID)

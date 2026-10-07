@@ -16,7 +16,11 @@ from app.services.ai_client import (
 )
 from app.services.cabling_client import CablingUnavailableError, fetch_pathfind_batch
 from app.services.extractor import render_file_context
-from app.services.inventory_client import InventorySummary, fetch_available_devices
+from app.services.inventory_client import (
+    InventorySummary,
+    InventoryUnavailableError,
+    fetch_available_devices,
+)
 from app.services.llm_provider import Usage
 from app.services.resolver import (
     ResolverEdge,
@@ -47,6 +51,14 @@ CABLING_UNAVAILABLE_DETAIL = (
     "Could not verify cabling paths; no topology was generated. Retry the request."
 )
 
+# Pinned 503 detail for an inventory failure while reading the summary or the
+# resolver's candidates (issue #1035). Fails closed like the cabling outage
+# above, and never carries the upstream error text, whose str() names the
+# internal inventory URL (issue #1036).
+INVENTORY_UNAVAILABLE_DETAIL = (
+    "Could not read inventory; no topology was generated. Retry the request."
+)
+
 
 class GeneratorError(Exception):
     """Raised for validation failures the caller should surface as 4xx/5xx.
@@ -55,6 +67,11 @@ class GeneratorError(Exception):
     a failure carries machine-readable data the frontend renders (the
     unconnectable-topology 422 below). It stays None for every plain-string
     failure, so the route keeps its existing behavior for all of them.
+
+    `usage` is the token total every provider call of the request spent before
+    the failure (issue #1034); generate_topology sets it on the way out so the
+    route can meter a failed request. Zero when the failure came before any
+    provider answer.
     """
 
     def __init__(self, status_code: int, message: str, detail: object | None = None) -> None:
@@ -62,6 +79,7 @@ class GeneratorError(Exception):
         self.status_code = status_code
         self.message = message
         self.detail = detail
+        self.usage = Usage()
 
 
 class TopologyUnconnectableError(GeneratorError):
@@ -84,6 +102,28 @@ class TopologyUnconnectableError(GeneratorError):
             detail={"error": "topology_unconnectable", "pairs": pairs, "message": message},
         )
         self.pairs = pairs
+        self.repair_feedback = repair_feedback
+
+
+class TopologyMixedTypesError(GeneratorError):
+    """A proposal whose resolved devices mix topology types (422, issue #1038).
+
+    Physical and cloud devices never mix in one topology or reservation:
+    reservations refuses a mixed device set at creation, so a mixed proposal
+    could only fail later, at commit, after the topology was created and
+    deleted again. Treated like the unconnectable case: repairable (the model
+    can choose templates of one type), then a structured 422 once repairs run
+    out. `groups` lists each type with the roles and templates that resolved
+    to it; `repair_feedback` is the corrective note.
+    """
+
+    def __init__(self, groups: list[dict[str, Any]], message: str, repair_feedback: str) -> None:
+        super().__init__(
+            422,
+            message,
+            detail={"error": "topology_mixed_types", "groups": groups, "message": message},
+        )
+        self.groups = groups
         self.repair_feedback = repair_feedback
 
 
@@ -122,13 +162,51 @@ async def generate_topology(
     # repairable mistake (unknown template, over-count, duplicate role,
     # dangling edge, or a topology the lab's cabling cannot carry). The
     # non-repairable outcomes of resolution (the 409 inventory race, the 503
-    # cabling outage) are not about the proposal and propagate immediately.
-    repair_feedback = ""
-    response: GenerateResponse | None = None
+    # inventory or cabling outage) are not about the proposal and propagate
+    # immediately.
     # Accumulate token usage across every repair attempt: each attempt is a real
     # provider call that spends tokens, so the quota must see the sum, not just
-    # the final successful call.
+    # the final successful call, and a request that fails is metered too.
     total_usage = Usage()
+    try:
+        response = await _propose_until_valid(
+            prompt=prompt,
+            inventory=inventory,
+            ai=ai,
+            user_bearer_token=user_bearer_token,
+            file_context=file_context,
+            template_names=template_names,
+            total_usage=total_usage,
+        )
+    except GeneratorError as e:
+        # Issue #1034: carry what the failed request spent, so the route
+        # meters it rather than letting a failing request repeat for free.
+        e.usage = total_usage
+        raise
+
+    response.file_summaries = [
+        {"filename": f.filename, "chars": len(f.text), "truncated": f.truncated}
+        for f in extracted_files
+    ]
+    return response, total_usage
+
+
+async def _propose_until_valid(
+    *,
+    prompt: str,
+    inventory: InventorySummary,
+    ai: AIClient,
+    user_bearer_token: str,
+    file_context: str,
+    template_names: list[str],
+    total_usage: Usage,
+) -> GenerateResponse:
+    """The propose, validate, resolve, repair loop. Adds every provider call's
+    usage to `total_usage` as it goes (the caller reads it on success and on
+    failure alike) and returns the first proposal that validates and resolves,
+    or raises GeneratorError."""
+    repair_feedback = ""
+    response: GenerateResponse | None = None
     max_repairs = settings.ai_generate_max_repairs
     for attempt in range(max_repairs + 1):
         try:
@@ -148,7 +226,10 @@ async def generate_topology(
             raise GeneratorError(503, AI_PROVIDER_UNREACHABLE_DETAIL) from e
         except AIError as e:
             # Fixed detail (issue #713): the provider's status/body text stays
-            # in the server log; a client never sees it (CWE-209).
+            # in the server log; a client never sees it (CWE-209). A provider
+            # that answered with no usable tool call still spent tokens.
+            if e.usage is not None:
+                total_usage.add(e.usage)
             logger.exception("ai_error")
             raise GeneratorError(502, AI_NO_USABLE_RESPONSE_DETAIL) from e
         except Exception as e:  # network / rate-limit / auth errors from the SDK
@@ -202,15 +283,26 @@ async def generate_topology(
             repair_feedback = e.repair_feedback
             continue
 
+        # Issue #1038: the resolved devices must share one topology type.
+        # Repairable for the same reason as the unconnectable case above: the
+        # model can pick templates whose devices are all of one type.
+        try:
+            _check_uniform_topology_type(candidate)
+        except TopologyMixedTypesError as e:
+            if attempt >= max_repairs:
+                raise
+            logger.info(
+                "ai_proposal_mixed_types_retry",
+                extra={"attempt": attempt, "types": len(e.groups)},
+            )
+            repair_feedback = e.repair_feedback
+            continue
+
         response = candidate
         break
 
     assert response is not None  # loop either sets response or raises
-    response.file_summaries = [
-        {"filename": f.filename, "chars": len(f.text), "truncated": f.truncated}
-        for f in extracted_files
-    ]
-    return response, total_usage
+    return response
 
 
 def _repair_feedback(error_message: str, template_names: list[str]) -> str:
@@ -347,7 +439,12 @@ async def _resolve_devices(
         # search knob, and reading it as a shortfall would turn a small cap
         # into a bogus "inventory shifted" 409 on a large proposal.
         wanted = max(len(indices), settings.ai_resolver_candidates_per_template)
-        devices = await fetch_available_devices(user_bearer_token, template_id, wanted)
+        try:
+            devices = await fetch_available_devices(user_bearer_token, template_id, wanted)
+        except InventoryUnavailableError as e:
+            # Not about the proposal, so not repairable: it propagates out of
+            # the repair loop untouched, like the cabling outage below.
+            raise GeneratorError(503, INVENTORY_UNAVAILABLE_DETAIL) from e
         if len(devices) < len(indices):
             raise GeneratorError(
                 409,
@@ -401,6 +498,57 @@ async def _resolve_devices(
     )
     for proposed in response.devices:
         proposed.device = device_by_id[plan.assignment[proposed.role]]
+
+
+def _check_uniform_topology_type(response: GenerateResponse) -> None:
+    """Refuse a proposal whose resolved devices mix topology types (issue
+    #1038), and otherwise set each proposed device's `topology_type` to its
+    resolved device's real type, so the proposal states what was resolved
+    rather than the schema default.
+
+    The type is read from the inventory device record the resolver chose
+    (`device["topology_type"]`); a record without one is not judged.
+    """
+    roles_by_type: dict[str, list[str]] = defaultdict(list)
+    templates_by_type: dict[str, list[str]] = defaultdict(list)
+    for proposed in response.devices:
+        device_type = (proposed.device or {}).get("topology_type")
+        if not isinstance(device_type, str) or not device_type:
+            continue
+        roles_by_type[device_type].append(proposed.role)
+        if proposed.template_name not in templates_by_type[device_type]:
+            templates_by_type[device_type].append(proposed.template_name)
+
+    if len(roles_by_type) > 1:
+        groups = [
+            {
+                "topology_type": device_type,
+                "roles": roles_by_type[device_type],
+                "templates": templates_by_type[device_type],
+            }
+            for device_type in sorted(roles_by_type)
+        ]
+        types = " and ".join(g["topology_type"] for g in groups)
+        message = (
+            f"The proposal mixes {types} devices; physical and cloud devices cannot "
+            "share one topology or reservation."
+        )
+        lines = [
+            f"- templates {', '.join(g['templates'])} resolved to {g['topology_type']} devices"
+            for g in groups
+        ]
+        repair_feedback = (
+            "The proposal mixes device topology types:\n"
+            + "\n".join(lines)
+            + "\nPhysical and cloud devices never share one topology. Propose a topology "
+            "whose devices are all of one type."
+        )
+        raise TopologyMixedTypesError(groups, message, repair_feedback)
+
+    for proposed in response.devices:
+        device_type = (proposed.device or {}).get("topology_type")
+        if isinstance(device_type, str) and device_type:
+            proposed.topology_type = device_type
 
 
 def _unconnectable_error(

@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from herd_common.auth import make_auth_dependencies
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -31,6 +31,11 @@ from app.services.ai_client import (
 logger = logging.getLogger(__name__)
 
 AI_SUGGESTION_FAILED_DETAIL = "AI suggestion failed"
+
+# Pinned 502 detail for a suggestion that does not fit the response schema
+# (issue #1036). The pydantic error text embeds the model's invalid values, so
+# it never reaches the client.
+AI_SUGGESTION_MALFORMED_DETAIL = "AI returned a malformed suggestion"
 
 _get_current_user, require_admin = make_auth_dependencies(
     secret_key=settings.secret_key,
@@ -87,6 +92,9 @@ async def suggest_identity(
     except AIError as e:
         # Fixed detail (issue #713): provider text stays in the server log.
         logger.exception("ai_template_identity_suggestion_failed")
+        # Issue #1034: a provider that answered without the expected tool
+        # call still spent tokens; meter what it reported.
+        await usage_repo.record_failed_usage(db, user_id, usage_repo.usage_of(e))
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
             AI_SUGGESTION_FAILED_DETAIL,
@@ -100,10 +108,13 @@ async def suggest_identity(
     )
 
     try:
-        return SuggestIdentityResponse(**result)
-    except (TypeError, ValueError) as e:
-        logger.warning("ai_template_identity_suggestion_malformed: %s", result)
-        raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY,
-            f"AI returned a malformed suggestion: {e}",
-        ) from e
+        return SuggestIdentityResponse.model_validate(result)
+    except ValidationError as e:
+        # Issue #1036 (the #887 rule): model output never enters a log. Log
+        # only the shape of the failure, the field locations and error types
+        # with the input values dropped; the detail is fixed text.
+        logger.warning(
+            "ai_template_identity_suggestion_malformed",
+            extra={"errors": e.errors(include_input=False, include_url=False)},
+        )
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, AI_SUGGESTION_MALFORMED_DETAIL) from e

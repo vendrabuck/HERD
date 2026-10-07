@@ -484,3 +484,23 @@ async def test_internal_unconfigured_503_never_awaits_gatherer(async_client, mon
         )
     assert resp.status_code == 503
     gather.assert_not_awaited()
+
+
+# --- failed classifications are metered (issue #1034) ---
+
+
+@pytest.mark.asyncio
+async def test_preview_no_usable_distribution_meters_both_attempts(async_client, monkeypatch):
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1_000_000)
+    _stub_ai(
+        [
+            {"distribution": [], "rationale": "bad"},
+            {"distribution": [], "rationale": "still bad"},
+        ]
+    )
+    async with async_client as client:
+        resp = await client.post("/classify-purpose/preview", json=PREVIEW_BODY, headers=_headers())
+    assert resp.status_code == 502
+    async with _TestSessionLocal() as db:
+        # Two attempts x Usage(100, 20).
+        assert await usage_repo.get_today_total(db, uuid.UUID(_USER_ID)) == 240

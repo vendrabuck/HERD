@@ -211,7 +211,7 @@ unauthenticated status route whether AI is usable and hides the AI buttons when 
 - **AI-PROV-20.** The anthropic provider can be built with a blank key (a keyless local
   endpoint named by `AI_BASE_URL`); it hands the SDK the placeholder `EMPTY`. \
   Enforced in: `services/ai-orchestrator/app/services/providers/anthropic_provider.py` (`AnthropicProvider`) \
-  Pinned by: none
+  Pinned by: `services/ai-orchestrator/tests/test_anthropic_provider.py` (`test_init_blank_key_hands_the_sdk_the_empty_placeholder`)
 
 **Out of scope.** How the gateway routes `/api/ai` and how JWTs are issued
 (`identity-and-access.md`). Model choice and backend setup are operator guidance
@@ -233,17 +233,22 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   optional `files`; any signed-in user may call it, and no token answers 401. \
   Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`generate`) \
   Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_requires_auth`, `test_generate_rejects_empty_prompt`)
-- **AI-GEN-2.** The inventory summary is read by a request dependency that runs before
-  the provider check and the quota check; when it fails the route answers 502
-  `Failed to fetch inventory summary: <error text>`. Known gap, see #1035 and #1036. \
-  Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`_inventory_provider`) \
-  Pinned by: none (issue #1035)
+- **AI-GEN-2.** The route checks the provider (503), then the quota (429), then the uploads
+  (400), and only then reads the inventory summary, so a refused request makes no inventory
+  call. When inventory cannot answer the summary read (a transport error, a non-2xx, or a
+  body that is not the expected JSON), the route answers 503
+  `Could not read inventory; no topology was generated. Retry the request.`, with no
+  upstream text. \
+  Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`generate`, `_inventory_provider`); `services/ai-orchestrator/app/services/generator.py` (`INVENTORY_UNAVAILABLE_DETAIL`) \
+  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_unconfigured_makes_no_inventory_call`, `test_generate_over_quota_makes_no_inventory_call`, `test_generate_rejected_upload_makes_no_inventory_call`, `test_generate_503_when_inventory_summary_fails`)
 - **AI-GEN-3.** The summary is one `GET /templates?template_type=device&limit=500` plus one
   `GET /devices` per template counting `AVAILABLE` `dut_only` devices, all with the
   caller's JWT and a 15 second timeout, so a template the caller cannot see, or beyond the
-  first 500, is never offered; any non-2xx raises. \
-  Enforced in: `services/ai-orchestrator/app/services/inventory_client.py` (`fetch_inventory_summary`, `TEMPLATES_PAGE_SIZE`) \
-  Pinned by: `services/ai-orchestrator/tests/test_inventory_client.py` (`test_fetch_inventory_summary_aggregates_counts`, `test_fetch_inventory_summary_forwards_bearer_header`, `test_fetch_inventory_summary_raises_on_templates_5xx`, `test_fetch_inventory_summary_raises_on_devices_5xx`)
+  first 500, is never offered; a transport error, any non-2xx, or an unreadable body raises
+  `InventoryUnavailableError`, which carries the operation, the exception class, and the
+  status but never the upstream text. \
+  Enforced in: `services/ai-orchestrator/app/services/inventory_client.py` (`fetch_inventory_summary`, `TEMPLATES_PAGE_SIZE`, `InventoryUnavailableError`) \
+  Pinned by: `services/ai-orchestrator/tests/test_inventory_client.py` (`test_fetch_inventory_summary_aggregates_counts`, `test_fetch_inventory_summary_forwards_bearer_header`, `test_fetch_inventory_summary_raises_on_templates_5xx`, `test_fetch_inventory_summary_raises_on_devices_5xx`, `test_fetch_inventory_summary_non_json_body_is_inventory_unavailable`)
 - **AI-GEN-4.** When no template has an available device, the route answers 409
   `No device templates with available devices in inventory. ...` without calling the
   model. \
@@ -299,14 +304,21 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
 - **AI-GEN-13.** A proposal without `elements` is valid and answers `elements: []`. \
   Enforced in: `services/ai-orchestrator/app/schemas/generate.py` (`GenerateResponse`) \
   Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_device_only_proposal_defaults_elements_to_empty`)
-- **AI-GEN-14.** Token usage is summed over every attempt of one request and recorded once,
-  after a successful response. \
-  Enforced in: `services/ai-orchestrator/app/services/generator.py` (`generate_topology`); `services/ai-orchestrator/app/routes/generate.py` (`generate`) \
-  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_records_usage_when_quota_enabled`)
-- **AI-GEN-15.** Generation does not check that the proposed `topology_type` values agree
-  with each other or with the resolved devices. Known gap, see #1038. \
-  Enforced in: `services/ai-orchestrator/app/services/generator.py` (`_validate_against_inventory`) \
-  Pinned by: none (issue #1038)
+- **AI-GEN-14.** Token usage is summed over every attempt of one request and recorded once:
+  after a successful response, or, when the request fails, as the total the failed
+  request's attempts reported (AI-QUOTA-5). \
+  Enforced in: `services/ai-orchestrator/app/services/generator.py` (`generate_topology`, `GeneratorError`); `services/ai-orchestrator/app/routes/generate.py` (`generate`) \
+  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_records_usage_when_quota_enabled`, `test_generate_failed_after_repairs_meters_every_attempt`)
+- **AI-GEN-15.** After resolution, the resolved devices' `topology_type` values must agree
+  (a device record without one is not judged). A proposal that mixes types is a repairable
+  mistake: the model is re-prompted with one line per type naming its templates, from the
+  same `AI_GENERATE_MAX_REPAIRS` budget; after it, the route answers 422
+  `{"error": "topology_mixed_types", "groups": [{topology_type, roles, templates}], "message"}`.
+  A uniform proposal answers each device's `topology_type` as its resolved device's type.
+  The committer still writes `topologyType: "PHYSICAL"` on every device node
+  (AI-COMMIT-4). \
+  Enforced in: `services/ai-orchestrator/app/services/generator.py` (`_check_uniform_topology_type`, `TopologyMixedTypesError`, `_propose_until_valid`) \
+  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_mixed_types_repairs_then_returns_structured_422`, `test_generate_mixed_types_is_repaired_on_retry`, `test_generate_topology_type_follows_the_resolved_devices`)
 - **AI-GEN-16.** The response's `file_summaries` lists each extracted file's `filename`,
   character count, and `truncated` flag. \
   Enforced in: `services/ai-orchestrator/app/services/generator.py` (`generate_topology`) \
@@ -322,7 +334,7 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_read_uploads_aborts_streaming_read_past_the_per_file_cap`, `test_generate_rejects_oversized_upload`)
 - **AI-UPLOAD-3.** A part with no filename or no bytes is skipped silently. \
   Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`_read_uploads`) \
-  Pinned by: none
+  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_read_uploads_skips_nameless_and_empty_parts`)
 - **AI-UPLOAD-4.** Only `.pdf`, `.txt`, `.md`, `.json`, `.xml`, `.tgz`, and `.tar.gz` are
   accepted; any other extension answers 400 naming the accepted list. \
   Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`SUPPORTED_EXTENSIONS`, `_extract_one`) \
@@ -369,10 +381,12 @@ the pure search in `services/ai-orchestrator/app/services/resolver.py`, and cabl
   answers 409 `Inventory shifted ...`; it is not repaired. \
   Enforced in: `services/ai-orchestrator/app/services/generator.py` (`_resolve_devices`) \
   Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_returns_409_when_inventory_shifts`)
-- **AI-RESOLVE-3.** An inventory error or non-2xx during the candidate fetch is not
-  caught, so the route answers 500. Known gap, see #1035. \
-  Enforced in: `services/ai-orchestrator/app/services/inventory_client.py` (`fetch_available_devices`); `services/ai-orchestrator/app/routes/generate.py` (`generate`) \
-  Pinned by: none (issue #1035)
+- **AI-RESOLVE-3.** A transport error, a non-2xx, or an unreadable body during the
+  candidate fetch answers 503
+  `Could not read inventory; no topology was generated. Retry the request.`; it is not
+  repaired. \
+  Enforced in: `services/ai-orchestrator/app/services/inventory_client.py` (`fetch_available_devices`, `InventoryUnavailableError`); `services/ai-orchestrator/app/services/generator.py` (`_resolve_devices`, `INVENTORY_UNAVAILABLE_DETAIL`) \
+  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_503_when_inventory_fails_during_candidate_fetch`); `services/ai-orchestrator/tests/test_inventory_client.py` (`test_fetch_available_devices_raises_on_5xx`, `test_fetch_available_devices_transport_error_is_inventory_unavailable`)
 - **AI-RESOLVE-4.** Only edges whose two ends are device roles constrain the choice; an
   edge touching an element is ignored here, and no pathfind call is made when no
   device-to-device edge remains. \
@@ -391,7 +405,7 @@ the pure search in `services/ai-orchestrator/app/services/resolver.py`, and cabl
 - **AI-RESOLVE-7.** Pairs are sent in chunks of 200 per request with the caller's JWT and a
   20 second timeout. \
   Enforced in: `services/ai-orchestrator/app/services/cabling_client.py` (`PATHFIND_BATCH_CHUNK`, `PATHFIND_TIMEOUT_SECONDS`) \
-  Pinned by: none
+  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_pathfind_batch_chunks_at_200_with_the_callers_jwt`)
 - **AI-RESOLVE-8.** A pair result carrying `error`, or without `reachable: true`, counts as
   not reachable. Cabling answers a pair naming a device the caller cannot see with the
   same per-pair error as an unknown device (`topology.md`). \
@@ -477,8 +491,10 @@ route `POST /commit` (body `CommitRequest`); the flow in
   Enforced in: `services/ai-orchestrator/app/services/committer.py` (`_build_canvas_data`, `_select_element_port`, `_natural_port_key`) \
   Pinned by: `services/ai-orchestrator/tests/test_committer_error_paths.py` (`test_build_canvas_element_node_shape`, `test_build_canvas_attachment_edge_has_device_as_source_with_chosen_port`, `test_build_canvas_two_attachments_from_one_device_get_distinct_ports`); `services/ai-orchestrator/tests/test_commit.py` (`test_commit_with_element_produces_canvas_with_element_and_attachment`)
 - **AI-COMMIT-6.** The port lookup answers "no ports" on a 404 or another 4xx, and the
-  attachment is then dropped with a warning; a 5xx or a transport error answers 503 before
-  any topology is created. \
+  attachment is then dropped with a warning; a 5xx answers 503
+  `Failed to fetch ports for device <id>: inventory answered HTTP <status>` and a transport
+  error 503 `Failed to fetch ports for device <id>`, before any topology is created, with no
+  upstream text. \
   Enforced in: `services/ai-orchestrator/app/services/committer.py` (`_fetch_device_ports`) \
   Pinned by: `services/ai-orchestrator/tests/test_committer_error_paths.py` (`test_fetch_device_ports_404_is_treated_as_no_ports`, `test_fetch_device_ports_5xx_raises_commit_error`, `test_fetch_device_ports_transport_failure_raises_commit_error`, `test_build_canvas_device_with_no_ports_skips_attachment_with_warning`); `services/ai-orchestrator/tests/test_commit.py` (`test_commit_aborts_with_503_when_ports_fetch_hits_5xx`)
 - **AI-COMMIT-7.** An edge naming an unknown role, or joining two elements, is dropped
@@ -493,8 +509,10 @@ route `POST /commit` (body `CommitRequest`); the flow in
   Pinned by: `services/ai-orchestrator/tests/test_commit.py` (`test_commit_happy_path_creates_topology_and_reservation`, `test_commit_surfaces_topology_create_failure_without_rollback`)
 - **AI-COMMIT-9.** The wireability check calls cabling's user-facing
   `POST /topologies/{id}/validate` and fails closed: a transport error, a 5xx, a 200 that is
-  not JSON, or a 200 without a boolean `valid` answers 503; another 4xx is relayed; only
-  `valid: true` proceeds. What validate checks is `topology.md`. \
+  not JSON, or a 200 without a boolean `valid` answers 503
+  (`Failed to validate topology wireability: ...` naming which, with the status for a 5xx
+  and `cabling unreachable` for a transport error, never upstream text); another 4xx is
+  relayed; only `valid: true` proceeds. What validate checks is `topology.md`. \
   Enforced in: `services/ai-orchestrator/app/services/committer.py` (`_validate_topology_wireable`) \
   Pinned by: `services/ai-orchestrator/tests/test_commit.py` (`test_commit_validate_5xx_fails_closed_with_503`, `test_commit_validate_transport_failure_fails_closed_with_503`); `services/ai-orchestrator/tests/test_committer_error_paths.py` (`test_commit_validate_non_json_200_body_fails_closed_with_503`, `test_commit_validate_body_missing_valid_key_fails_closed_with_503`)
 - **AI-COMMIT-10.** `valid: false` answers 422
@@ -509,7 +527,7 @@ route `POST /commit` (body `CommitRequest`); the flow in
   Enforced in: `services/ai-orchestrator/app/services/committer.py` (`commit_proposal`) \
   Pinned by: `services/ai-orchestrator/tests/test_commit.py` (`test_commit_rolls_back_topology_when_canvas_save_fails`, `test_commit_rolls_back_topology_when_reservation_fails`, `test_commit_rejects_unwireable_topology_with_structured_detail`)
 - **AI-COMMIT-12.** Any other exception in those three steps also deletes the topology and
-  answers 502 `Unexpected upstream failure: <error text>`. \
+  answers 502 `Unexpected upstream failure (<ExceptionClass>)`; the exception is logged. \
   Enforced in: `services/ai-orchestrator/app/services/committer.py` (`commit_proposal`) \
   Pinned by: `services/ai-orchestrator/tests/test_committer_error_paths.py` (`test_commit_unexpected_error_rolls_back_and_wraps_502`)
 - **AI-COMMIT-13.** The rollback delete never raises; a refusal (status 300 or above, for
@@ -529,7 +547,7 @@ route `POST /commit` (body `CommitRequest`); the flow in
   Enforced in: `services/ai-orchestrator/app/services/committer.py` (`_apply_configs`) \
   Pinned by: `services/ai-orchestrator/tests/test_commit.py` (`test_commit_apply_configs_calls_execution_per_device`)
 - **AI-COMMIT-16.** A config push never fails or rolls back the commit: a transport error
-  records `failed` with `request failed: <error>`; a 4xx or 5xx records `failed` with the
+  records `failed` with `request failed (<ExceptionClass>)`; a 4xx or 5xx records `failed` with the
   detail, except that a 409 `driver_cannot_configure` or `device_has_no_driver` records its
   structured `message`. \
   Enforced in: `services/ai-orchestrator/app/services/committer.py` (`_apply_configs`, `_structured_detail`) \
@@ -582,10 +600,12 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   question as the position-0 user message. \
   Enforced in: `services/ai-orchestrator/app/services/reservation_context.py` (`_SEED_RESERVATION_FIELDS`, `_SEED_DEVICE_FIELDS`, `render_seed_block`); `services/ai-orchestrator/app/services/conversation_repo.py` (`create`, `set_seed_with_question`) \
   Pinned by: `services/ai-orchestrator/tests/test_reservation_context.py` (`test_seed_gather_returns_thin_bundle`, `test_seed_gather_skips_missing_devices`, `test_render_seed_emits_xml_blocks_without_topology`); `services/ai-orchestrator/tests/test_conversation_repo.py` (`test_create_persists_seed_as_first_user_message`, `test_set_seed_with_question_wraps_question_in_first_message`)
-- **AI-CONV-3.** Any other non-2xx from reservations or inventory during the seed read is
-  not mapped, so the route answers 500. Known gap, see #1035. \
-  Enforced in: `services/ai-orchestrator/app/services/reservation_context.py` (`_fetch_reservation`, `_fetch_device`) \
-  Pinned by: none (issue #1035)
+- **AI-CONV-3.** A transport error, any other non-2xx, or a body that is not JSON from
+  reservations or inventory during the seed read answers 503
+  `Could not read the reservation or its devices; retry the request.`, with no upstream
+  text. \
+  Enforced in: `services/ai-orchestrator/app/services/reservation_context.py` (`_get_json`, `ContextUpstreamUnavailableError`); `services/ai-orchestrator/app/routes/reservation_assistant.py` (`get_reservation_seed_dep`, `RESERVATION_CONTEXT_UNAVAILABLE_DETAIL`) \
+  Pinned by: `services/ai-orchestrator/tests/test_reservation_context.py` (`test_seed_gather_reservations_non_2xx_is_upstream_unavailable`, `test_seed_gather_transport_error_is_upstream_unavailable`, `test_seed_gather_device_5xx_is_upstream_unavailable`, `test_seed_gather_non_json_reservation_body_is_upstream_unavailable`); `services/ai-orchestrator/tests/test_reservation_assistant_coverage.py` (`test_seed_dep_maps_upstream_unavailable_to_503`)
 - **AI-CONV-4.** A turn with a `conversation_id` requires a conversation created by this
   caller for this reservation id; anything else, including another user's conversation,
   answers 404 `Conversation not found`. \
@@ -595,7 +615,7 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   turn, first or later, is refused because of the reservation's status; each tool call is
   decided by the owning service (AI-TOOL-2). \
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`_prepare_turn`) \
-  Pinned by: none
+  Pinned by: `services/ai-orchestrator/tests/test_reservation_assistant.py` (`test_later_turn_reads_neither_the_reservation_nor_its_devices`)
 - **AI-CONV-6.** A turn is one transaction: the new user message is only flushed, and is
   committed together with the reply; a turn that fails without a side effect leaves no
   conversation row or trailing user message behind. \
@@ -659,7 +679,7 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
 - **AI-LOOP-7.** The system prompt gains the write-tools section only when
   `AI_WRITE_TOOLS_ENABLED` is set. \
   Enforced in: `services/ai-orchestrator/app/services/ai_client.py` (`reservation_assistant_system_prompt`, `RESERVATION_ASSISTANT_WRITE_TOOLS_PROMPT`) \
-  Pinned by: none (issue #1040)
+  Pinned by: `services/ai-orchestrator/tests/test_assistant_system_prompt.py` (`test_system_prompt_has_the_write_tools_section_only_when_enabled`)
 - **AI-LOOP-8.** The loop appends finished iterations and token counts to objects the route
   passed in, so a later failure still sees what completed. \
   Enforced in: `services/ai-orchestrator/app/services/ai_client.py` (`answer_reservation_question_with_tools`, `answer_reservation_question_streaming`) \
@@ -733,10 +753,13 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   exit. \
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant_stream`, `_STREAM_END`) \
   Pinned by: `services/ai-orchestrator/tests/test_reservation_assistant_stream_deadline.py` (`test_stalled_client_with_landed_tool_still_gets_one_done`, `test_consumer_leaving_at_a_yield_closes_inner_generator_without_leaks`); `tests/unit/test_no_yield_inside_cancel_scope.py` (`test_no_service_app_yields_inside_a_cancel_scope`)
-- **AI-STREAM-6.** An exception that is neither a timeout nor an `AIError` (a database
-  error while saving, for example) leaves the stream with no terminal frame. Known gap, see #1037. \
-  Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant_stream`) \
-  Pinned by: none (issue #1037)
+- **AI-STREAM-6.** Any other exception, raised by the loop, by saving a finished turn (a
+  database error, for example), or by one of the handlers above, still ends the stream in
+  exactly one frame: `error` `Assistant call failed` after a rollback, with the exception
+  logged and never sent. An exception from the loop after a write landed keeps the turn and
+  ends in `done` with `incomplete: "ai_error"` (AI-TURN-6). \
+  Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant_stream`, `ASSISTANT_CALL_FAILED_DETAIL`) \
+  Pinned by: `services/ai-orchestrator/tests/test_reservation_assistant_stream_terminal.py` (`test_unexpected_exception_mid_stream_ends_in_one_error_frame`, `test_unexpected_exception_rolls_back_and_next_turn_succeeds`, `test_unexpected_exception_after_a_landed_write_keeps_the_turn`, `test_persist_failure_after_a_finished_answer_ends_in_one_error_frame`, `test_failure_inside_a_handler_still_ends_in_one_error_frame`)
 - **AI-STREAM-7.** The turn is saved before its `done` frame is sent, so a streamed
   `conversation_id` can continue on either route. \
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant_stream`, `_persist_turn`) \
@@ -927,7 +950,7 @@ a driver.
 - **AI-RECIPE-3.** The flag is checked before authentication, so with it off a caller with
   no token also gets the 403 disabled detail. \
   Enforced in: `services/ai-orchestrator/app/routes/recipes.py` (`create_draft`, `refine_draft`, `get_draft`) \
-  Pinned by: none (issue #1040)
+  Pinned by: `services/ai-orchestrator/tests/test_recipes_routes.py` (`test_flag_is_checked_before_authentication`)
 - **AI-RECIPE-4.** Draft and refine check the provider (503) and then the quota (429)
   before any model call; reading a draft checks neither. \
   Enforced in: `services/ai-orchestrator/app/routes/recipes.py` (`_run_authoring`) \
@@ -965,7 +988,7 @@ a driver.
 - **AI-RECIPE-11.** A draft can be read and refined by any admin, not only the one who
   created it. \
   Enforced in: `services/ai-orchestrator/app/routes/recipes.py` (`_get_draft_or_404`) \
-  Pinned by: none (issue #1040)
+  Pinned by: `services/ai-orchestrator/tests/test_recipes_routes.py` (`test_any_admin_may_read_and_refine_another_admins_draft`)
 - **AI-RECIPE-12.** The answer carries the draft's id, `valid`, `attempts`, model, prompt,
   hypervisor type, explanation, `driver_py`, metadata, validation report, and
   `package_b64`; nothing in the service uploads a driver. \
@@ -975,9 +998,10 @@ a driver.
   unreachable provider 503; provider text never reaches the client. \
   Enforced in: `services/ai-orchestrator/app/routes/recipes.py` (`_run_authoring`, `RECIPE_DRAFT_AI_FAILED_DETAIL`) \
   Pinned by: `services/ai-orchestrator/tests/test_recipes_routes.py` (`test_draft_502_on_ai_error_never_leaks_provider_text`)
-- **AI-RECIPE-14.** Every attempt's tokens are recorded together after the draft is stored. \
+- **AI-RECIPE-14.** Every attempt's tokens are recorded together after the draft is stored;
+  a run that fails records the tokens its attempts reported (AI-QUOTA-5). \
   Enforced in: `services/ai-orchestrator/app/routes/recipes.py` (`_run_authoring`) \
-  Pinned by: `services/ai-orchestrator/tests/test_recipes_routes.py` (`test_usage_recorded_and_quota_enforced`)
+  Pinned by: `services/ai-orchestrator/tests/test_recipes_routes.py` (`test_usage_recorded_and_quota_enforced`, `test_failed_draft_validator_unreachable_meters_the_attempt`)
 
 **Out of scope.** The driver upload itself (`inventory.md`) and the validator's checks
 (`device-configuration.md`). Recipes for any connection type other than Hypervisor.
@@ -1058,9 +1082,10 @@ preview (section 8.12), and the reservations sweep and Classify now route
   unreachable provider 503, with no provider text. \
   Enforced in: `services/ai-orchestrator/app/routes/purpose_classification.py` (`_run_classification`, `AI_CLASSIFICATION_FAILED_DETAIL`) \
   Pinned by: `services/ai-orchestrator/tests/test_purpose_classification_routes.py` (`test_preview_502_on_ai_error_never_leaks_provider_text`)
-- **AI-PURPOSE-13.** A successful classification's tokens are recorded against the user. \
-  Enforced in: `services/ai-orchestrator/app/routes/purpose_classification.py` (`_run_classification`) \
-  Pinned by: `services/ai-orchestrator/tests/test_purpose_classification_routes.py` (`test_preview_meters_usage`)
+- **AI-PURPOSE-13.** A classification's tokens are recorded against the user, a failed one's
+  as the tokens its attempts reported (AI-QUOTA-5). \
+  Enforced in: `services/ai-orchestrator/app/routes/purpose_classification.py` (`_run_classification`); `services/ai-orchestrator/app/services/purpose_classifier.py` (`PurposeClassifierError`) \
+  Pinned by: `services/ai-orchestrator/tests/test_purpose_classification_routes.py` (`test_preview_meters_usage`, `test_preview_no_usable_distribution_meters_both_attempts`)
 
 **Out of scope.** Storing, reviewing, accepting, or dismissing a suggestion, the sweep's
 schedule and attempt counting, and the Classify now route (`reservations.md`). Reporting by
@@ -1089,8 +1114,9 @@ route `POST /templates/suggest-identity`.
 - **AI-IDENT-3.** A model failure answers 502 `AI suggestion failed`. \
   Enforced in: `services/ai-orchestrator/app/routes/template_identity.py` (`suggest_identity`, `AI_SUGGESTION_FAILED_DETAIL`) \
   Pinned by: `services/ai-orchestrator/tests/test_template_identity_route.py` (`test_suggest_identity_502_when_ai_fails`)
-- **AI-IDENT-4.** A suggestion that does not fit the answer's schema answers 502. \
-  Enforced in: `services/ai-orchestrator/app/routes/template_identity.py` (`suggest_identity`) \
+- **AI-IDENT-4.** A suggestion that does not fit the answer's schema answers 502
+  `AI returned a malformed suggestion`. \
+  Enforced in: `services/ai-orchestrator/app/routes/template_identity.py` (`suggest_identity`, `AI_SUGGESTION_MALFORMED_DETAIL`) \
   Pinned by: `services/ai-orchestrator/tests/test_template_identity_route.py` (`test_suggest_identity_502_when_ai_returns_malformed`)
 
 **Out of scope.** Saving the suggested identity, which is an ordinary template update
@@ -1128,12 +1154,16 @@ and `GET /usage`.
   insert-or-update. \
   Enforced in: `services/ai-orchestrator/app/services/usage_repo.py` (`add_tokens`); `services/ai-orchestrator/app/models/ai_usage.py` (`AIUsage`) \
   Pinned by: `services/ai-orchestrator/tests/test_usage_repo.py` (`test_add_tokens_inserts_then_increments`, `test_add_tokens_is_per_user`, `test_prior_day_usage_is_a_separate_total`)
-- **AI-QUOTA-5.** A call that ends in an error records no usage although provider calls
-  were made: a generation that fails after its attempts, an assistant turn that is rolled
-  back, a recipe run whose validator is unreachable, and a classification with no usable
-  answer. Known gap, see #1034. \
-  Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`generate`); `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant`); `services/ai-orchestrator/app/routes/recipes.py` (`_run_authoring`); `services/ai-orchestrator/app/routes/purpose_classification.py` (`_run_classification`) \
-  Pinned by: none (issue #1034)
+- **AI-QUOTA-5.** A request that ends in an error after reaching the provider records the
+  provider-reported tokens its calls spent: a generation that fails after its attempts, an
+  assistant turn that is rolled back (on either route), a recipe run whose validator is
+  unreachable or whose model call fails, a classification with no usable answer, and an
+  identity or other single call whose answer had no usable tool call. Unlike AI-QUOTA-3
+  there is no characters estimate: nothing known spent books nothing (an unreachable
+  provider, for example). A metering failure is logged and never replaces the request's
+  own error. \
+  Enforced in: `services/ai-orchestrator/app/services/usage_repo.py` (`record_failed_usage`, `usage_of`); `services/ai-orchestrator/app/services/llm_provider.py` (`AIError`); `services/ai-orchestrator/app/routes/generate.py` (`generate`); `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant`, `reservation_assistant_stream`); `services/ai-orchestrator/app/routes/recipes.py` (`_run_authoring`); `services/ai-orchestrator/app/routes/purpose_classification.py` (`_run_classification`); `services/ai-orchestrator/app/routes/template_identity.py` (`suggest_identity`) \
+  Pinned by: `services/ai-orchestrator/tests/test_usage_repo.py` (`test_record_failed_usage_books_reported_tokens`, `test_record_failed_usage_zero_or_none_books_nothing`, `test_record_failed_usage_disabled_quota_writes_no_row`, `test_record_failed_usage_swallows_a_metering_failure`); `services/ai-orchestrator/tests/test_generate.py` (`test_generate_failed_after_repairs_meters_every_attempt`, `test_generate_ai_error_with_reported_usage_is_metered`, `test_generate_unreachable_provider_meters_nothing`); `services/ai-orchestrator/tests/test_reservation_assistant.py` (`test_buffered_rolled_back_turn_meters_tokens_spent`, `test_stream_rolled_back_turn_meters_tokens_spent`); `services/ai-orchestrator/tests/test_recipes_routes.py` (`test_failed_draft_validator_unreachable_meters_the_attempt`, `test_failed_draft_ai_error_on_a_later_attempt_meters_earlier_attempts`); `services/ai-orchestrator/tests/test_purpose_classification_routes.py` (`test_preview_no_usable_distribution_meters_both_attempts`); `services/ai-orchestrator/tests/test_template_identity_route.py` (`test_suggest_identity_ai_error_with_reported_usage_is_metered`)
 - **AI-QUOTA-6.** `GET /quota` answers the caller's own `{enabled, limit, used, remaining, reset_at}`
   for any signed-in user, also when over the limit, and is not gated on the provider. \
   Enforced in: `services/ai-orchestrator/app/routes/quota.py` (`get_quota`); `services/ai-orchestrator/app/services/usage_repo.py` (`get_status`) \
@@ -1176,16 +1206,21 @@ log extras is `operations-and-observability.md`.
   assistant, identity, recipe, and purpose routes answer fixed details. \
   Enforced in: `services/ai-orchestrator/app/services/generator.py` (`generate_topology`); `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant`); `services/ai-orchestrator/app/routes/template_identity.py` (`suggest_identity`); `services/ai-orchestrator/app/routes/recipes.py` (`_run_authoring`); `services/ai-orchestrator/app/routes/purpose_classification.py` (`_run_classification`) \
   Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_bare_exception_never_leaks_text`); `services/ai-orchestrator/tests/test_recipes_routes.py` (`test_draft_502_on_ai_error_never_leaks_provider_text`); `services/ai-orchestrator/tests/test_purpose_classification_routes.py` (`test_preview_502_on_ai_error_never_leaks_provider_text`); `services/ai-orchestrator/tests/test_reservation_assistant_coverage.py` (`test_buffered_route_ai_error_maps_to_502_with_generic_detail`)
-- **AI-LOG-5.** The identity route's malformed-suggestion branch logs the model's raw
-  result and puts the schema error text in the 502 detail. Known gap, see #1036. \
+- **AI-LOG-5.** The identity route's malformed-suggestion branch logs only the failing
+  fields' locations and error types, without the model's values, and its 502 detail is
+  fixed text. \
   Enforced in: `services/ai-orchestrator/app/routes/template_identity.py` (`suggest_identity`) \
-  Pinned by: none (issue #1036)
-- **AI-LOG-6.** Some error details carry upstream error text: the inventory summary 502,
-  the commit's port-lookup and validate 503s and its 502, a config push's
-  `request failed: <error>`, an upload's PDF or archive parse error, and a tool's
-  `HTTP error: <error>` result (which reaches the model and `tool_calls[].error`). Known gap, see #1036. \
-  Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`_inventory_provider`); `services/ai-orchestrator/app/services/committer.py` (`_fetch_device_ports`, `_validate_topology_wireable`, `_apply_configs`, `commit_proposal`); `services/ai-orchestrator/app/services/extractor.py` (`_extract_pdf`, `_extract_tgz`); `services/ai-orchestrator/app/services/tools.py` (`dispatch`) \
-  Pinned by: none (issue #1036)
+  Pinned by: `services/ai-orchestrator/tests/test_template_identity_route.py` (`test_suggest_identity_malformed_never_logs_or_returns_model_output`)
+- **AI-LOG-6.** No error detail or tool result carries upstream exception text: the
+  inventory summary and seed-read 503s are fixed text (AI-GEN-2, AI-CONV-3), the commit's
+  port-lookup and validate 503s and its 502 name a status or an exception class, a config
+  push records `request failed (<ExceptionClass>)`, an upload's PDF or archive parse error
+  names the class, and a failed tool call's result (which reaches the model and
+  `tool_calls[].error`) is `upstream service answered HTTP <status>`,
+  `upstream service unreachable (<ExceptionClass>)`, or `tool failed (<ExceptionClass>)`,
+  logged as `ai_tool_call_failed` with the tool, class, and status only. \
+  Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`_inventory_provider`); `services/ai-orchestrator/app/services/committer.py` (`_fetch_device_ports`, `_validate_topology_wireable`, `_apply_configs`, `commit_proposal`); `services/ai-orchestrator/app/services/extractor.py` (`_extract_pdf`, `_extract_tgz`); `services/ai-orchestrator/app/services/tools.py` (`dispatch`, `_http_error_message`, `_log_tool_failure`) \
+  Pinned by: `services/ai-orchestrator/tests/test_tools.py` (`test_dispatcher_handles_httpx_failure`, `test_dispatcher_http_status_error_carries_no_url`, `test_dispatcher_unexpected_exception_carries_only_the_class`); `services/ai-orchestrator/tests/test_commit.py` (`test_commit_validate_5xx_fails_closed_with_503`, `test_commit_validate_transport_failure_fails_closed_with_503`, `test_commit_aborts_with_503_when_ports_fetch_hits_5xx`); `services/ai-orchestrator/tests/test_committer_error_paths.py` (`test_apply_configs_records_request_exception_as_failed`, `test_commit_unexpected_error_rolls_back_and_wraps_502`); `services/ai-orchestrator/tests/test_extractor.py` (`test_extract_pdf_raises_for_garbage`, `test_extract_tgz_invalid_archive_raises`); `services/ai-orchestrator/tests/test_generate.py` (`test_generate_503_when_inventory_summary_fails`)
 
 **Out of scope.** Key-name redaction of log extras and the JSON formatter
 (`operations-and-observability.md`).
@@ -1279,15 +1314,21 @@ named in each rule.
   does not accept or that is over 5 MB, stops at 5 files, and skips a file already picked
   (same name and size); a 400 is shown as `Upload rejected: <detail>`. \
   Enforced in: `frontend/src/components/topology-editor/AIDialog.tsx` (`handleFilesPicked`, `ACCEPTED_EXTENSIONS`) \
-  Pinned by: none
+  Pinned by: `frontend/src/test/components/AIDialog.test.tsx` (`checks picked files client-side before sending (#1040)`, `prefixes a 400 with Upload rejected (#1040)`)
 - **AI-UI-17.** The commit dialog's default window is one to five hours from now, and it
-  offers "Apply device configs" only when a resolved device has a non-empty config. \
+  offers "Apply device configs" only when a resolved device has a non-empty config, with a
+  label saying it needs admin or a manage grant on each device (execution's rule). \
   Enforced in: `frontend/src/components/topology-editor/AICommitDialog.tsx` (`CommitForm`) \
-  Pinned by: none
+  Pinned by: `frontend/src/test/components/AICommitDialog.test.tsx` (`defaults the window to one to five hours from now`, `offers Apply device configs only when a resolved device has a non-empty config`)
 - **AI-UI-18.** The legacy tab never sends a `conversation_id`, so each question starts a
   new conversation on the server. \
   Enforced in: `frontend/src/components/reservations/AIAssistantTabLegacy.tsx` (`AIAssistantTabLegacy`) \
-  Pinned by: none
+  Pinned by: `frontend/src/test/components/AIAssistantTabLegacy.test.tsx` (`never sends a conversation_id, so each question starts a new conversation`)
+- **AI-UI-19.** On a `topology_mixed_types` 422 the generate dialog shows the server's
+  message and one `TYPE: template, template` line per type; `topologyMixedTypesDetail`
+  narrows only a 422 whose detail has `error: topology_mixed_types` and an array `groups`. \
+  Enforced in: `frontend/src/components/topology-editor/AIDialog.tsx` (`AIDialog`); `frontend/src/lib/errors.ts` (`topologyMixedTypesDetail`, `formatMixedTypesDetail`) \
+  Pinned by: `frontend/src/test/components/AIDialog.test.tsx` (`names the templates per type on the mixed-types 422 (#1038)`); `frontend/src/test/lib/errors.test.ts` (`narrows the structured 422 body`, `returns null for the unconnectable 422 and a plain string`, `renders the message then one line per type`)
 
 **Out of scope.** The Purpose Review page and the Classify now button are reservations
 callers (`reservations.md`, RES-PURPOSE-9 to RES-PURPOSE-14).
@@ -1304,7 +1345,7 @@ wireable on a seeded lab, to tell whether a change to generation helps.
 - **AI-EVAL-1.** The live suite skips unless `HERD_AI_EVAL=1`, and no gate or CI job sets
   it; it never asserts a pass rate. \
   Enforced in: `tests/ai_eval/test_generate_eval.py` (`test_generate_topology_wireability`) \
-  Pinned by: none
+  Pinned by: `tests/unit/test_ai_eval_opt_in.py` (`test_eval_suite_skips_at_module_level_unless_opted_in`, `test_eval_suite_never_asserts_a_pass_rate`, `test_no_workflow_sets_the_opt_in_or_runs_the_target`, `test_only_the_ai_eval_recipe_sets_the_opt_in_and_no_target_depends_on_it`)
 - **AI-EVAL-2.** The harness builds its throwaway canvas with the committer's device node
   and device-to-device edge shapes, skipping element edges. \
   Enforced in: `tests/ai_eval/scoring.py` (`build_canvas_data`) \
@@ -1335,7 +1376,7 @@ reaches the container.
   `AI_RESOLVER_CANDIDATES_PER_TEMPLATE` outside 1 to 50, and
   `AI_RESOLVER_MAX_SEARCH_STEPS` below 1 are refused at startup. \
   Enforced in: `services/ai-orchestrator/app/config.py` (`Settings`) \
-  Pinned by: none
+  Pinned by: `services/ai-orchestrator/tests/test_config.py` (`test_generation_and_resolver_knobs_out_of_range_are_refused`, `test_generation_and_resolver_knobs_accept_their_bounds`)
 
 **Out of scope.** The config service's editor for these values (`operations-and-observability.md`).
 
@@ -1349,7 +1390,7 @@ stream opens are `error` frames, listed at the end.
 |---|---|---|---|
 | 400 | `Too many files: limit is <N>, got <M>` | more file parts than `UPLOAD_MAX_FILES` | AI-UPLOAD-1 |
 | 400 | `File '<name>' exceeds limit of <N> bytes` or `Upload total exceeds limit of <N> bytes` | an upload past a size cap | AI-UPLOAD-2 |
-| 400 | `Unsupported file type '<ext>' for <name>. Accepted: ...`, `Failed to parse PDF: ...`, `Failed to read tgz archive: ...` | an upload that cannot be extracted | AI-UPLOAD-4, AI-UPLOAD-5 |
+| 400 | `Unsupported file type '<ext>' for <name>. Accepted: ...`, `Failed to parse PDF (<ExceptionClass>)`, `Failed to read tgz archive (<ExceptionClass>)` | an upload that cannot be extracted | AI-UPLOAD-4, AI-UPLOAD-5 |
 | 400 | `start must not be after end` or `date range too large; max 366 days` | bad usage report range | AI-QUOTA-8 |
 | 401 | `Not authenticated` or `Could not validate credentials` | no token or a bad token on any route but status, health, and version | AI-GEN-1, AI-COMMIT-1, AI-STREAM-1, AI-QUOTA-6, AI-QUOTA-8 |
 | 403 | `Admin or superadmin role required` | identity, usage, or recipe routes as a user | AI-IDENT-1, AI-QUOTA-8, AI-RECIPE-2 |
@@ -1365,21 +1406,22 @@ stream opens are `error` frames, listed at the end.
 | 422 | validation list | a body or form outside its schema (prompt, commit body, question, purpose bounds) | AI-GEN-1, AI-COMMIT-2, AI-CONV-11, AI-PURPOSE-4 |
 | 422 | the config validator's message, prefixed with the role | a commit device config that fails validation | AI-COMMIT-3 |
 | 422 | `{"error": "topology_unconnectable", "pairs": [...], "message": "..."}` | no wireable device choice after repairs | AI-RESOLVE-14 |
+| 422 | `{"error": "topology_mixed_types", "groups": [...], "message": "..."}` | resolved devices of more than one topology type after repairs | AI-GEN-15 |
 | 422 | `{"error": "topology_unwireable", "invalid_edges": [...], "message": "..."}` | cabling's validate answered `valid: false` at commit | AI-COMMIT-10 |
 | 429 | `{"limit", "used", "remaining": 0, "reset_at"}` | daily quota reached | AI-QUOTA-2, AI-CONV-12, AI-RECIPE-4, AI-PURPOSE-3 |
-| 500 | (unhandled) | inventory fails during candidate fetch; reservations or inventory answers another non-2xx during the seed read | AI-RESOLVE-3, AI-CONV-3 |
-| 502 | `Failed to fetch inventory summary: <error>` | inventory summary read failed | AI-GEN-2 |
 | 502 | `AI returned no usable response`, `AI call failed`, `AI returned a response that did not match the expected schema` | generation model failure | AI-GEN-7, AI-GEN-8, AI-GEN-9 |
 | 502 | `AI referenced unknown templates: ...`, `AI proposed more devices than are available: ...`, `AI returned duplicate role names: ...`, `Edge references unknown role: ...`, `AI proposed a self-loop edge ...`, `AI proposed an element_to_element edge ...`, `AI proposed a duplicate edge ...` | a proposal mistake left after the last repair | AI-GEN-10, AI-GEN-11 |
-| 502 | `Unexpected upstream failure: <error>` | unexpected exception during commit | AI-COMMIT-12 |
+| 502 | `Unexpected upstream failure (<ExceptionClass>)` | unexpected exception during commit | AI-COMMIT-12 |
 | 502 | `Assistant call failed` | buffered assistant model failure with no side effect | AI-TURN-5 |
-| 502 | `AI suggestion failed` or `AI returned a malformed suggestion: <error>` | identity model failure or bad answer | AI-IDENT-3, AI-IDENT-4 |
+| 502 | `AI suggestion failed` or `AI returned a malformed suggestion` | identity model failure or bad answer | AI-IDENT-3, AI-IDENT-4 |
 | 502 | `AI recipe drafting failed` | recipe model failure | AI-RECIPE-13 |
 | 502 | `AI classification failed` or `Purpose classifier returned no usable distribution` | purpose model failure | AI-PURPOSE-10, AI-PURPOSE-12 |
 | 503 | `AI orchestrator is not configured` | provider unconfigured or not constructible | AI-PROV-2, AI-PROV-3 |
 | 503 | `AI provider is unreachable` | provider transport failure | AI-PROV-10, AI-GEN-9, AI-TURN-5, AI-RECIPE-13, AI-PURPOSE-12 |
 | 503 | `Could not verify cabling paths; no topology was generated. Retry the request.` | pathfind batch failed | AI-RESOLVE-6 |
-| 503 | `Failed to fetch ports for device <id>: <error>` | port lookup 5xx or transport at commit | AI-COMMIT-6 |
+| 503 | `Could not read inventory; no topology was generated. Retry the request.` | inventory failed the summary or candidate read | AI-GEN-2, AI-RESOLVE-3 |
+| 503 | `Could not read the reservation or its devices; retry the request.` | reservations or inventory failed the first-turn seed read | AI-CONV-3 |
+| 503 | `Failed to fetch ports for device <id>` (transport) or `...: inventory answered HTTP <status>` (5xx) | port lookup 5xx or transport at commit | AI-COMMIT-6 |
 | 503 | `Failed to validate topology wireability: ...` | validate unreachable, 5xx, or unreadable | AI-COMMIT-9 |
 | 503 | `Recipe validator is unreachable` | execution validate-package failed | AI-RECIPE-8 |
 | 504 | `Assistant did not respond within <N>s` | buffered assistant deadline with no side effect | AI-TURN-5 |
@@ -1398,15 +1440,15 @@ Calls into this area are in section 7. All user-path calls forward the caller's 
 | Direction | Peer | Call | Purpose | On failure |
 |---|---|---|---|---|
 | Out | LLM provider | the provider SDK (`messages.create`, `messages.stream`, or `chat.completions.create`) | every model call | Unreachable: 503 (or `incomplete` / SSE `error`). Other errors: 502. Timeout inside the assistant: `AIError`, then AI-TURN-5 or AI-TURN-6 |
-| Out | inventory | `GET /templates`, `GET /devices` (JWT) | generation summary | Fail closed: 502 with the error text (AI-GEN-2) |
-| Out | inventory | `GET /devices?template_id&status=AVAILABLE&dut_only` (JWT) | resolver candidates | Not caught: 500 (AI-RESOLVE-3) |
+| Out | inventory | `GET /templates`, `GET /devices` (JWT) | generation summary | Fail closed: 503, pinned detail (AI-GEN-2) |
+| Out | inventory | `GET /devices?template_id&status=AVAILABLE&dut_only` (JWT) | resolver candidates | Fail closed: 503, pinned detail (AI-RESOLVE-3) |
 | Out | cabling | `POST /pathfind/batch` (JWT) | resolver reachability | Fail closed: 503 (AI-RESOLVE-6) |
 | Out | inventory | `GET /devices/{id}/ports` (JWT) | element attachment port at commit | 404 and other 4xx: no ports, attachment dropped. 5xx and transport: fail closed, 503 before anything is written (AI-COMMIT-6) |
 | Out | cabling | `POST /topologies`, `PUT /topologies/{id}`, `POST /topologies/{id}/validate`, `DELETE /topologies/{id}` (JWT) | commit and rollback | Create and save: relayed status. Validate: fail closed, 503. Delete: logged, never raised (AI-COMMIT-13) |
 | Out | reservations | `POST /` (JWT) | commit's reservation | Relayed status; topology rolled back (AI-COMMIT-11) |
 | Out | execution | `POST /execute` (JWT) | optional config push | Recorded per device as `failed`; commit stands (AI-COMMIT-16) |
-| Out | reservations | `GET /{id}` (JWT) | assistant seed | 404: 404. Deadline: 504. Other: 500 (AI-CONV-3) |
-| Out | inventory | `GET /devices/{id}` (JWT) | assistant seed devices | 404: device omitted. Other: 500 |
+| Out | reservations | `GET /{id}` (JWT) | assistant seed | 404: 404. Deadline: 504. Other: 503 (AI-CONV-3) |
+| Out | inventory | `GET /devices/{id}` (JWT) | assistant seed devices | 404: device omitted. Other: 503 (AI-CONV-3) |
 | Out | inventory | device, port, template, config-version, config-schema, and schedule routes (JWT) | assistant tools | Becomes an `is_error` tool result; the turn continues (AI-TOOL-2). The schema proxy fails open to the registry (AI-TOOL-7) |
 | Out | cabling | `POST /pathfind` (JWT) | `find_path` tool | `is_error` tool result |
 | Out | execution | `GET /runs?reservation_id` (JWT) | `list_executions_for_reservation` tool | `is_error` tool result |
@@ -1485,22 +1527,6 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
 
 ### Open defects
 
-- #1034 (AI-QUOTA-5): usage is recorded only after a successful call in generation, the
-  assistant, recipe authoring, and classification, so the tokens a failed call spent are
-  never counted against the daily quota.
-- #1035 (AI-RESOLVE-3, AI-CONV-3, AI-GEN-2): an inventory or reservations failure during
-  generation or a first assistant turn answers 500, because the HTTP error is raised and
-  nothing maps it; and the generate route reads the inventory summary in a request
-  dependency that runs before the provider and quota checks.
-- #1036 (AI-LOG-5, AI-LOG-6): the template identity route logs the model's raw result and
-  puts the schema error text in its 502 detail; upstream error text, internal URLs
-  included, reaches response details and `tool_calls[].error`.
-- #1037 (AI-STREAM-6): the stream handles only timeouts, an unreachable provider, and
-  `AIError`, so an exception while the turn is saved ends the stream with neither `done`
-  nor `error`.
-- #1038 (AI-GEN-15): nothing in generation checks that a proposal's devices share one
-  topology type; the commit writes PHYSICAL on every device node, and the reservation
-  create's 422 is the only check.
 - #1039 (AI-CONV-9, AI-PURPOSE-6): the idle-conversation sweeper deletes by last use only,
   so a reservation's transcript can be gone before purpose classification reads it. The
   issue asks the owner to choose between exempting such conversations and documenting the
@@ -1534,31 +1560,10 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
   `VITE_AI_CHAT_ENABLED` row in [ENV_VARS.md](../ENV_VARS.md) and the comment in
   `frontend/src/config/featureFlags.ts`.
 
-Where the AI guides, docstrings, or UI text disagree with the code at this commit, the
-rules above describe the code; issue #1041 lists each disagreement.
+Where the AI guides, docstrings, or UI text disagree with the code, the rules above
+describe the code; issue #1041 corrected every disagreement found when this document was
+written.
 
 ### Rules with no test
 
-Issue #1040 tracks the tests for every rule below that no open defect names. A rule named
-under Open defects gets its test with that defect's fix.
-
-- AI-PROV-20: the anthropic provider's `EMPTY` placeholder.
-- AI-GEN-2: the inventory summary 502 and its ordering before the provider and quota checks.
-- AI-GEN-15: no agreement check on proposed `topology_type`.
-- AI-UPLOAD-3: empty or nameless parts skipped.
-- AI-RESOLVE-3: inventory failure during candidate fetch answers 500.
-- AI-RESOLVE-7: pathfind chunk size and timeout.
-- AI-CONV-3: other seed-read failures answer 500.
-- AI-CONV-5: later turns do not re-read the reservation.
-- AI-LOOP-7: the write-tools section of the system prompt.
-- AI-STREAM-6: an unexpected exception ends a stream with no terminal frame.
-- AI-RECIPE-3: the recipe flag answers before authentication.
-- AI-RECIPE-11: any admin may read and refine any draft.
-- AI-QUOTA-5: failed calls record no usage.
-- AI-LOG-5: the identity route's malformed branch logs model output.
-- AI-LOG-6: error details that carry upstream error text.
-- AI-UI-16: the generate dialog's client-side file checks.
-- AI-UI-17: the commit dialog's default window and the config checkbox condition.
-- AI-UI-18: the legacy tab sends no conversation id.
-- AI-EVAL-1: the evaluation suite's opt-in skip.
-- AI-CONF-2: Settings range checks on the generation and resolver knobs.
+None at this commit: issue #1040 added the tests for the rules this section listed.

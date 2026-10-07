@@ -272,3 +272,113 @@ async def test_status_reports_recipe_authoring_flag(async_client, monkeypatch):
         monkeypatch.setattr(config_module.settings, "ai_recipe_authoring_enabled", False)
         off = await client.get("/status")
         assert off.json()["recipe_authoring"] is False
+
+
+# --- failed runs are metered (issue #1034) ---
+
+
+async def _today_total() -> int:
+    from app.services import usage_repo
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    async with async_sessionmaker(engine, expire_on_commit=False)() as db:
+        return await usage_repo.get_today_total(db, uuid.UUID(_ADMIN_ID))
+
+
+async def test_failed_draft_validator_unreachable_meters_the_attempt(async_client, monkeypatch):
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    _stub_ai()
+    with patch(
+        "app.services.recipe_author.validate_with_execution",
+        new=AsyncMock(side_effect=RecipeAuthorError(503, RECIPE_VALIDATOR_UNREACHABLE_DETAIL)),
+    ):
+        async with async_client as client:
+            resp = await client.post("/recipes/draft", json=BODY, headers=_headers("admin"))
+    assert resp.status_code == 503
+    # One attempt reached the provider: Usage(100, 50).
+    assert await _today_total() == 150
+
+
+async def test_failed_draft_ai_error_on_a_later_attempt_meters_earlier_attempts(
+    async_client, monkeypatch
+):
+    """Attempt one answered (and failed validation); attempt two's provider
+    call raised. Attempt one's tokens are still metered."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    stub = _stub_ai()
+    real_draft = stub.draft_recipe
+
+    async def draft_then_fail(**kwargs):
+        if stub.calls:
+            raise AIError("provider 500")
+        return await real_draft(**kwargs)
+
+    stub.draft_recipe = draft_then_fail
+    red = {**GOOD_REPORT, "valid": False}
+    with _patch_validator(red):
+        async with async_client as client:
+            resp = await client.post("/recipes/draft", json=BODY, headers=_headers("admin"))
+    assert resp.status_code == 502
+    assert await _today_total() == 150
+
+
+# --- issue #1040: rules with no pin ---
+
+_RECIPE_ROUTES = [
+    ("POST", "/recipes/draft", BODY),
+    ("POST", f"/recipes/draft/{uuid.uuid4()}/refine", {"feedback": "x"}),
+    ("GET", f"/recipes/draft/{uuid.uuid4()}", None),
+]
+
+
+async def test_flag_is_checked_before_authentication(async_client, monkeypatch):
+    """AI-RECIPE-3: the flag dependency is declared before require_admin, so
+    with the flag off a caller with NO token gets the pinned 403, and with
+    the flag on the same caller gets 401."""
+    _stub_ai()
+    async with async_client as client:
+        monkeypatch.setattr(config_module.settings, "ai_recipe_authoring_enabled", False)
+        for method, url, body in _RECIPE_ROUTES:
+            resp = await client.request(method, url, json=body)
+            assert resp.status_code == 403, url
+            assert resp.json()["detail"] == RECIPE_AUTHORING_DISABLED_DETAIL, url
+
+        monkeypatch.setattr(config_module.settings, "ai_recipe_authoring_enabled", True)
+        for method, url, body in _RECIPE_ROUTES:
+            resp = await client.request(method, url, json=body)
+            assert resp.status_code == 401, url
+
+
+def _other_admin_headers() -> dict:
+    payload = {
+        "sub": str(uuid.uuid4()),
+        "role": "admin",
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+    }
+    token = jwt.encode(
+        payload, config_module.settings.secret_key, algorithm=config_module.settings.algorithm
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def test_any_admin_may_read_and_refine_another_admins_draft(async_client):
+    """AI-RECIPE-11: drafts are admin-scoped working artifacts with no owner
+    filter; a second admin reads and refines the first admin's draft."""
+    _stub_ai()
+    with _patch_validator():
+        async with async_client as client:
+            created = await client.post("/recipes/draft", json=BODY, headers=_headers("admin"))
+            assert created.status_code == 200, created.text
+            draft_id = created.json()["draft_id"]
+
+            other = _other_admin_headers()
+            fetched = await client.get(f"/recipes/draft/{draft_id}", headers=other)
+            assert fetched.status_code == 200, fetched.text
+            assert fetched.json()["draft_id"] == draft_id
+
+            refined = await client.post(
+                f"/recipes/draft/{draft_id}/refine", json={"feedback": "tighten"}, headers=other
+            )
+    assert refined.status_code == 200, refined.text
+    assert refined.json()["draft_id"] == draft_id
+    assert refined.json()["attempts"] == 2

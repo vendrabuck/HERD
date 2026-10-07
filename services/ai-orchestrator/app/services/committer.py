@@ -116,8 +116,13 @@ async def _fetch_device_ports(
     try:
         resp = await client.get(url, headers=headers)
     except Exception as e:
-        logger.warning("ai_commit_device_ports_fetch_failed", extra={"device_id": device_id})
-        raise CommitError(503, f"Failed to fetch ports for device {device_id}: {e}") from e
+        # Issue #1036: the detail names the HERD device id, never the
+        # transport error's text (which names the internal URL).
+        logger.warning(
+            "ai_commit_device_ports_fetch_failed",
+            extra={"device_id": device_id, "error_class": type(e).__name__},
+        )
+        raise CommitError(503, f"Failed to fetch ports for device {device_id}") from e
     if resp.status_code == 404:
         return []
     if resp.status_code >= 500:
@@ -125,7 +130,11 @@ async def _fetch_device_ports(
             "ai_commit_device_ports_fetch_failed",
             extra={"device_id": device_id, "status_code": resp.status_code},
         )
-        raise CommitError(503, f"Failed to fetch ports for device {device_id}: {_detail(resp)}")
+        raise CommitError(
+            503,
+            f"Failed to fetch ports for device {device_id}: inventory answered HTTP "
+            f"{resp.status_code}",
+        )
     if resp.status_code >= 400:
         logger.warning(
             "ai_commit_device_ports_fetch_failed",
@@ -352,14 +361,22 @@ async def _validate_topology_wireable(
     try:
         resp = await client.post(url, headers=headers)
     except Exception as e:
-        logger.warning("ai_commit_validate_unreachable", extra={"topology_id": topology_id})
-        raise CommitError(503, f"Failed to validate topology wireability: {e}") from e
+        logger.warning(
+            "ai_commit_validate_unreachable",
+            extra={"topology_id": topology_id, "error_class": type(e).__name__},
+        )
+        raise CommitError(
+            503, "Failed to validate topology wireability: cabling unreachable"
+        ) from e
     if resp.status_code >= 500:
         logger.warning(
             "ai_commit_validate_failed",
             extra={"topology_id": topology_id, "status_code": resp.status_code},
         )
-        raise CommitError(503, f"Failed to validate topology wireability: {_detail(resp)}")
+        raise CommitError(
+            503,
+            f"Failed to validate topology wireability: cabling answered HTTP {resp.status_code}",
+        )
     if resp.status_code >= 400:
         # Not expected against a topology this same request just created with
         # the same JWT (creator-or-admin is always satisfied), but fail
@@ -496,7 +513,8 @@ async def _apply_configs(
                     role=device.role,
                     device_id=device.device_id,
                     status="failed",
-                    error=f"request failed: {exc}",
+                    # Issue #1036: the class only, never the URL-bearing text.
+                    error=f"request failed ({type(exc).__name__})",
                 )
             )
             continue
@@ -592,7 +610,8 @@ async def commit_proposal(
             raise
         except Exception as e:
             await _delete_topology(client, headers, topology_id)
-            raise CommitError(502, f"Unexpected upstream failure: {e}") from e
+            logger.exception("ai_commit_unexpected_failure")
+            raise CommitError(502, f"Unexpected upstream failure ({type(e).__name__})") from e
 
         config_results: list[DeviceConfigResult] = []
         if req.apply_configs:

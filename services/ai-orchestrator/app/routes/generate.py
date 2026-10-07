@@ -1,5 +1,6 @@
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 from herd_common.auth import make_auth_dependencies
@@ -16,8 +17,16 @@ from app.services.ai_client import (
     get_ai_client,
 )
 from app.services.extractor import ExtractionError, extract_files
-from app.services.generator import GeneratorError, generate_topology
-from app.services.inventory_client import InventorySummary, fetch_inventory_summary
+from app.services.generator import (
+    INVENTORY_UNAVAILABLE_DETAIL,
+    GeneratorError,
+    generate_topology,
+)
+from app.services.inventory_client import (
+    InventorySummary,
+    InventoryUnavailableError,
+    fetch_inventory_summary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,17 +44,32 @@ async def _bearer_token(authorization: str = Header(...)) -> str:
     return authorization.split(" ", 1)[1]
 
 
-async def _inventory_provider(
+InventoryLoader = Callable[[], Awaitable[InventorySummary]]
+
+
+def _inventory_provider(
     token: str = Depends(_bearer_token),
-) -> InventorySummary:
-    try:
-        return await fetch_inventory_summary(token)
-    except Exception as e:
-        logger.exception("inventory_fetch_failed")
-        raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY,
-            f"Failed to fetch inventory summary: {e}",
-        ) from e
+) -> InventoryLoader:
+    """Injectable factory: returns an awaitable the route invokes only AFTER
+    its own gates (provider configured, quota, upload checks) pass, so a
+    refused request makes no inventory call at all (issue #1035, the same
+    ordering issue #709 gave the purpose routes). Tests override this
+    dependency with a loader that returns a canned summary.
+
+    An inventory failure answers 503 with a pinned detail, never the upstream
+    error text, which names the internal inventory URL (issue #1036).
+    """
+
+    async def _load() -> InventorySummary:
+        try:
+            return await fetch_inventory_summary(token)
+        except InventoryUnavailableError as e:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                INVENTORY_UNAVAILABLE_DETAIL,
+            ) from e
+
+    return _load
 
 
 _UPLOAD_READ_CHUNK_BYTES = 64 * 1024
@@ -121,7 +145,7 @@ async def generate(
     files: list[UploadFile] | None = File(None),
     user=Depends(get_current_user),
     token: str = Depends(_bearer_token),
-    inventory: InventorySummary = Depends(_inventory_provider),
+    load_inventory: InventoryLoader = Depends(_inventory_provider),
     ai: AIClient = Depends(get_ai_client),
     db: AsyncSession = Depends(get_db),
 ) -> GenerateResponse:
@@ -136,6 +160,9 @@ async def generate(
 
     extracted = await _read_uploads(files)
 
+    # Only now, with every local gate passed, is inventory read (issue #1035).
+    inventory = await load_inventory()
+
     try:
         response, usage = await generate_topology(
             prompt=prompt,
@@ -145,6 +172,9 @@ async def generate(
             extracted_files=extracted,
         )
     except GeneratorError as e:
+        # Issue #1034: meter what the failed request's provider calls spent
+        # before answering the error, so a failing request is not free.
+        await usage_repo.record_failed_usage(db, user_id, e.usage)
         # A GeneratorError carries a structured `detail` only when the failure
         # has machine-readable data the frontend renders (the unconnectable
         # 422's role/template pairs). Every other failure keeps its plain

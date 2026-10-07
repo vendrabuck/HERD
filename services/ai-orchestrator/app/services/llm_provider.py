@@ -25,7 +25,17 @@ class AIError(Exception):
     Covers: model returned no usable content, malformed tool input, per-call
     timeout, SDK-level errors surfacing as opaque failures. Routes catch this
     and return HTTP 502.
+
+    `usage` (issue #1034) carries the tokens a failed call is known to have
+    spent: set when the provider answered but the answer was unusable (no
+    expected tool call), or when a caller attaches the running total of a
+    multi-attempt loop before re-raising. None means nothing is known (the
+    call never got an answer), and the route meters nothing for it.
     """
+
+    def __init__(self, *args: object, usage: Usage | None = None) -> None:
+        super().__init__(*args)
+        self.usage = usage
 
 
 class AIProviderUnavailableError(AIError):

@@ -18,6 +18,36 @@ TEMPLATES_PAGE_SIZE = 500
 DEVICES_PAGE_SIZE = 1
 
 
+class InventoryUnavailableError(Exception):
+    """Inventory could not answer: a transport error, a non-2xx status, or a
+    body that is not the expected JSON shape (issue #1035).
+
+    Carries only the failing operation, the exception class, and the HTTP
+    status (None for a transport error), never the upstream error text, whose
+    str() names the internal inventory URL (issue #1036). Callers map it to a
+    503 with a pinned detail.
+    """
+
+    def __init__(self, operation: str, error_class: str, status_code: int | None = None) -> None:
+        super().__init__(f"inventory {operation} failed: {error_class} (status {status_code})")
+        self.operation = operation
+        self.error_class = error_class
+        self.status_code = status_code
+
+
+def _unavailable(operation: str, exc: Exception) -> InventoryUnavailableError:
+    status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+    logger.warning(
+        "inventory_unavailable",
+        extra={
+            "operation": operation,
+            "error_class": type(exc).__name__,
+            "status_code": status_code,
+        },
+    )
+    return InventoryUnavailableError(operation, type(exc).__name__, status_code)
+
+
 class InventorySummary:
     """Template name -> available count, plus name -> id and name -> (vendor, model) maps."""
 
@@ -56,6 +86,8 @@ async def fetch_inventory_summary(user_bearer_token: str) -> InventorySummary:
     Makes one /templates call and then one small /devices call per template,
     which is acceptable for the typical <100 templates. A dedicated aggregate
     endpoint can replace this later if the count becomes a bottleneck.
+
+    Raises InventoryUnavailableError when inventory cannot answer.
     """
     headers = {"Authorization": f"Bearer {user_bearer_token}"}
     base = settings.inventory_service_url.rstrip("/")
@@ -63,36 +95,39 @@ async def fetch_inventory_summary(user_bearer_token: str) -> InventorySummary:
     template_ids: dict[str, str] = {}
     template_identity: dict[str, tuple[str, str]] = {}
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        t_resp = await client.get(
-            f"{base}/templates",
-            params={"template_type": "device", "limit": TEMPLATES_PAGE_SIZE},
-            headers=headers,
-        )
-        t_resp.raise_for_status()
-        templates = t_resp.json().get("items", [])
-
-        for tpl in templates:
-            tpl_id = tpl["id"]
-            tpl_name = tpl["name"]
-            d_resp = await client.get(
-                f"{base}/devices",
-                params={
-                    "template_id": tpl_id,
-                    "status": "AVAILABLE",
-                    "dut_only": "true",
-                    "limit": DEVICES_PAGE_SIZE,
-                },
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            t_resp = await client.get(
+                f"{base}/templates",
+                params={"template_type": "device", "limit": TEMPLATES_PAGE_SIZE},
                 headers=headers,
             )
-            d_resp.raise_for_status()
-            total = int(d_resp.json().get("total", 0))
-            template_counts[tpl_name] = total
-            template_ids[tpl_name] = tpl_id
-            template_identity[tpl_name] = (
-                tpl.get("vendor") or "unknown",
-                tpl.get("model") or "unknown",
-            )
+            t_resp.raise_for_status()
+            templates = t_resp.json().get("items", [])
+
+            for tpl in templates:
+                tpl_id = tpl["id"]
+                tpl_name = tpl["name"]
+                d_resp = await client.get(
+                    f"{base}/devices",
+                    params={
+                        "template_id": tpl_id,
+                        "status": "AVAILABLE",
+                        "dut_only": "true",
+                        "limit": DEVICES_PAGE_SIZE,
+                    },
+                    headers=headers,
+                )
+                d_resp.raise_for_status()
+                total = int(d_resp.json().get("total", 0))
+                template_counts[tpl_name] = total
+                template_ids[tpl_name] = tpl_id
+                template_identity[tpl_name] = (
+                    tpl.get("vendor") or "unknown",
+                    tpl.get("model") or "unknown",
+                )
+    except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise _unavailable("summary", exc) from exc
 
     return InventorySummary(template_counts, template_ids, template_identity)
 
@@ -105,6 +140,8 @@ async def fetch_available_devices(
     Uses the caller's JWT so visibility rules apply. The returned dicts are
     the raw `DeviceResponse` payloads from the inventory service, suitable
     for rendering directly as React Flow nodes on the frontend.
+
+    Raises InventoryUnavailableError when inventory cannot answer.
     """
     if count <= 0:
         return []
@@ -112,16 +149,19 @@ async def fetch_available_devices(
     headers = {"Authorization": f"Bearer {user_bearer_token}"}
     base = settings.inventory_service_url.rstrip("/")
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(
-            f"{base}/devices",
-            params={
-                "template_id": template_id,
-                "status": "AVAILABLE",
-                "dut_only": "true",
-                "limit": count,
-            },
-            headers=headers,
-        )
-        resp.raise_for_status()
-        return list(resp.json().get("items", []))
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{base}/devices",
+                params={
+                    "template_id": template_id,
+                    "status": "AVAILABLE",
+                    "dut_only": "true",
+                    "limit": count,
+                },
+                headers=headers,
+            )
+            resp.raise_for_status()
+            return list(resp.json().get("items", []))
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
+        raise _unavailable("candidates", exc) from exc

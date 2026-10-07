@@ -76,3 +76,36 @@ def test_no_warning_when_anthropic_key_blank(monkeypatch, caplog):
         config_module.warn_if_anthropic_api_key_unused()
 
     assert caplog.messages == []
+
+
+# --- AI-CONF-2 (issue #1040): generation and resolver knob ranges ---
+
+
+@pytest.mark.parametrize(
+    "field, bad_value",
+    [
+        ("ai_generate_max_repairs", -1),
+        ("ai_generate_max_repairs", 6),
+        ("ai_resolver_candidates_per_template", 0),
+        ("ai_resolver_candidates_per_template", 51),
+        ("ai_resolver_max_search_steps", 0),
+    ],
+)
+def test_generation_and_resolver_knobs_out_of_range_are_refused(field, bad_value):
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(**{field: bad_value})
+    assert field in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "field, edge_value",
+    [
+        ("ai_generate_max_repairs", 0),
+        ("ai_generate_max_repairs", 5),
+        ("ai_resolver_candidates_per_template", 1),
+        ("ai_resolver_candidates_per_template", 50),
+        ("ai_resolver_max_search_steps", 1),
+    ],
+)
+def test_generation_and_resolver_knobs_accept_their_bounds(field, edge_value):
+    assert getattr(Settings(**{field: edge_value}), field) == edge_value

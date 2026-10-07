@@ -228,6 +228,32 @@ async def test_seed_dep_maps_deadline_to_504():
     assert exc.value.detail == "Reservation seed gather exceeded its deadline"
 
 
+async def test_seed_dep_maps_upstream_unavailable_to_503():
+    """Issue #1035: reservations or inventory failing the seed read answers
+    the pinned 503, not a 500, and never the upstream text."""
+    from app.routes.reservation_assistant import RESERVATION_CONTEXT_UNAVAILABLE_DETAIL
+    from app.services.reservation_context import ContextUpstreamUnavailableError
+
+    gatherer = get_reservation_seed_dep(reservation_id=RESERVATION_ID, token="t")
+
+    async def down(token, reservation_id):
+        raise ContextUpstreamUnavailableError("reservations", "HTTPStatusError", 503)
+
+    ra.gather_reservation_seed = down  # type: ignore[assignment]
+    try:
+        with pytest.raises(HTTPException) as exc:
+            await gatherer()
+    finally:
+        import app.services.reservation_context as rc
+
+        ra.gather_reservation_seed = rc.gather_reservation_seed  # type: ignore[assignment]
+    assert exc.value.status_code == 503
+    assert exc.value.detail == RESERVATION_CONTEXT_UNAVAILABLE_DETAIL
+    assert RESERVATION_CONTEXT_UNAVAILABLE_DETAIL == (
+        "Could not read the reservation or its devices; retry the request."
+    )
+
+
 # --- _prepare_turn: new conversation, then append on existing (lines 110-156) ---
 
 

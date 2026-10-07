@@ -10,6 +10,7 @@ HERD can propose a lab topology from a natural-language prompt by calling the co
 
 - Your admin must have configured an AI provider. For `AI_PROVIDER=anthropic` that means `AI_API_KEY` is set; for `AI_PROVIDER=openai_compat` that means `AI_BASE_URL` points at a running endpoint. The frontend checks `GET /api/ai/status` on load; when the provider is unconfigured that endpoint reports `{"enabled": false}`, the **Use AI** button is hidden, and `/api/ai/generate` returns 503.
 - You need device visibility: the AI can only propose devices your account can see. If no visible template has an available device (for example, your user group has no device group access), `/api/ai/generate` answers 409 "No device templates with available devices in inventory. ..." before any provider call.
+- The route checks its own gates first, in this order: the provider is configured (503), your daily token quota (429), and the uploaded files (400). Only then does it read the inventory summary, so a refused request costs inventory nothing. If inventory cannot answer, while reading the summary or the resolver's candidates below, the request fails with 503 "Could not read inventory; no topology was generated. Retry the request." and no proposal is returned.
 
 ## The flow, step by step
 
@@ -27,11 +28,11 @@ HERD can propose a lab topology from a natural-language prompt by calling the co
 
 ## What the LLM proposes
 
-The orchestrator constrains the LLM's output via a tool schema built per request. The `template_name` field is restricted to an enum of the templates currently visible to you, so a provider that honors schema enums cannot return a name outside your inventory. The orchestrator also validates the response after the fact and, on a repairable mistake (an unknown template, an over-count, a duplicate role across devices or elements, an edge to a role that was never defined, an edge connecting two elements directly, an edge connecting a role to itself, or the same device-to-device connection proposed twice), re-prompts the model with the exact allow-list before giving up. The number of re-prompts is `AI_GENERATE_MAX_REPAIRS` (default 2, range 0-5; see [ENV_VARS.md](ENV_VARS.md)); `0` fails the request on the first repairable mistake instead of spending a second provider call. Each proposed device has:
+The orchestrator constrains the LLM's output via a tool schema built per request. The `template_name` field is restricted to an enum of the templates currently visible to you, so a provider that honors schema enums cannot return a name outside your inventory. The orchestrator also validates the response after the fact and, on a repairable mistake (an unknown template, an over-count, a duplicate role across devices or elements, an edge to a role that was never defined, an edge connecting two elements directly, an edge connecting a role to itself, or the same device-to-device connection proposed twice), re-prompts the model with the exact allow-list before giving up. The number of re-prompts is `AI_GENERATE_MAX_REPAIRS` (default 2, range 0-5; see [ENV_VARS.md](ENV_VARS.md)); `0` fails the request on the first repairable mistake instead of spending a second provider call. Every attempt's provider-reported tokens count against `AI_DAILY_TOKEN_QUOTA` when one is set, including the attempts of a request that ends in an error (issue #1034). Each proposed device has:
 
 - `role` (unique within the proposal; e.g. `fw-a`, `fw-b`, `core-sw-1`)
 - `template_name` (must match a real template in your inventory exactly; no invented names)
-- `topology_type` (`PHYSICAL` or `CLOUD`; generation does not check that a proposal's devices share one type, see issue #1038)
+- `topology_type` (`PHYSICAL` or `CLOUD`; uniform across a single proposal, and after resolution it states the resolved devices' real type, see [One topology type per proposal](#one-topology-type-per-proposal))
 - `config` (optional; see [Device configs](#device-configs-the-allowlist))
 
 Edges reference roles by name and carry a `layer` (`L1`, `L2`, or `L3`).
@@ -70,6 +71,25 @@ When no assignment exists, the orchestrator does not return a flagged proposal a
 ```
 
 The AI dialog renders each pair as a "source role to target role" line so you can see which connection the lab cannot carry.
+
+## One topology type per proposal
+
+Physical and cloud devices never mix in one topology or reservation, so after resolution the orchestrator checks the `topology_type` of every device it chose (issue #1038). A proposal whose devices resolve to more than one type is a repairable mistake: the model is re-prompted with a note naming which templates resolved to which type, from the same `AI_GENERATE_MAX_REPAIRS` budget. Once that budget is exhausted the request fails with HTTP 422 before anything is committed:
+
+```json
+{
+  "detail": {
+    "error": "topology_mixed_types",
+    "groups": [
+      {"topology_type": "CLOUD", "roles": ["vm"], "templates": ["CloudVM"]},
+      {"topology_type": "PHYSICAL", "roles": ["fw"], "templates": ["EX3400"]}
+    ],
+    "message": "The proposal mixes CLOUD and PHYSICAL devices; physical and cloud devices cannot share one topology or reservation."
+  }
+}
+```
+
+The AI dialog shows the message with one line per type listing its templates. A uniform proposal comes back with each device's `topology_type` set to its resolved device's type. The commit still writes `topologyType: "PHYSICAL"` on every canvas node it builds; the reservation create's own check remains the second line of defense.
 
 ## File uploads
 

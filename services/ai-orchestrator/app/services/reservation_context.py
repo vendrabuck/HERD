@@ -60,6 +60,44 @@ class ReservationNotFoundError(ContextError):
     pass
 
 
+class ContextUpstreamUnavailableError(ContextError):
+    """Reservations or inventory could not answer the seed read: a transport
+    error, a non-2xx other than 404, or a body that is not JSON (issue #1035).
+    Carries only the service, the exception class, and the status, never the
+    upstream error text (issue #1036)."""
+
+    def __init__(self, service: str, error_class: str, status_code: int | None = None) -> None:
+        super().__init__(f"{service} seed read failed: {error_class} (status {status_code})")
+        self.service = service
+        self.error_class = error_class
+        self.status_code = status_code
+
+
+async def _get_json(
+    client: httpx.AsyncClient, service: str, url: str, token: str
+) -> tuple[int, Any]:
+    """GET `url` and return (status, parsed body); body is None on a 404.
+    Every other failure raises ContextUpstreamUnavailableError."""
+    status_code: int | None = None
+    try:
+        resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+        status_code = resp.status_code
+        if status_code == 404:
+            return status_code, None
+        resp.raise_for_status()
+        return status_code, resp.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning(
+            "assistant_seed_upstream_unavailable",
+            extra={
+                "service": service,
+                "error_class": type(exc).__name__,
+                "status_code": status_code,
+            },
+        )
+        raise ContextUpstreamUnavailableError(service, type(exc).__name__, status_code) from exc
+
+
 @dataclass
 class ReservationSeed:
     """Thin opening context: reservation metadata + flat device list.
@@ -80,14 +118,12 @@ async def _fetch_reservation(
     client: httpx.AsyncClient, token: str, reservation_id: uuid.UUID
 ) -> dict[str, Any]:
     base = settings.reservations_service_url.rstrip("/")
-    resp = await client.get(
-        f"{base}/{reservation_id}",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    if resp.status_code == 404:
+    _status, body = await _get_json(client, "reservations", f"{base}/{reservation_id}", token)
+    if body is None:
         raise ReservationNotFoundError(str(reservation_id))
-    resp.raise_for_status()
-    return resp.json()
+    if not isinstance(body, dict):
+        raise ContextUpstreamUnavailableError("reservations", type(body).__name__, _status)
+    return body
 
 
 async def _fetch_device(
@@ -98,14 +134,12 @@ async def _fetch_device(
 ) -> dict[str, Any] | None:
     base = settings.inventory_service_url.rstrip("/")
     async with semaphore:
-        resp = await client.get(
-            f"{base}/devices/{device_id}",
-            headers={"Authorization": f"Bearer {token}"},
+        status_code, body = await _get_json(
+            client, "inventory", f"{base}/devices/{device_id}", token
         )
-    if resp.status_code == 404:
-        return None
-    resp.raise_for_status()
-    return resp.json()
+    if body is not None and not isinstance(body, dict):
+        raise ContextUpstreamUnavailableError("inventory", type(body).__name__, status_code)
+    return body
 
 
 async def gather_reservation_seed(token: str, reservation_id: uuid.UUID) -> ReservationSeed:
@@ -113,6 +147,8 @@ async def gather_reservation_seed(token: str, reservation_id: uuid.UUID) -> Rese
 
     Raises ReservationNotFoundError if the caller cannot read the reservation.
     Raises ContextDeadlineExceededError if the gather exceeds GATHER_DEADLINE_SECONDS.
+    Raises ContextUpstreamUnavailableError if reservations or inventory cannot
+    answer (transport error, non-2xx other than 404, or a non-JSON body).
     No topology fetch is performed; the model retrieves topology details
     through the find_path tool.
     """
@@ -133,7 +169,14 @@ async def _gather_seed_inner(token: str, reservation_id: uuid.UUID) -> Reservati
 
         device_ids = reservation_raw.get("device_ids", []) or []
         device_tasks = [_fetch_device(client, token, str(did), semaphore) for did in device_ids]
-        device_raws = await asyncio.gather(*device_tasks) if device_tasks else []
+        # return_exceptions=True so one failed device read waits for its
+        # siblings instead of leaving them running against a closed client;
+        # the first failure is then raised.
+        results = await asyncio.gather(*device_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        device_raws = results
         devices = [_whitelist(dr, _SEED_DEVICE_FIELDS) for dr in device_raws if dr is not None]
 
     return ReservationSeed(reservation=reservation, devices=devices)

@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from app.services.llm_provider import ToolSchema, Usage
+from app.services.llm_provider import AIError, ToolSchema, Usage
 
 if TYPE_CHECKING:
     from app.services.ai_client import AIClient
@@ -39,7 +39,14 @@ read at a glance."""
 
 
 class PurposeClassifierError(Exception):
-    """Raised when no usable distribution was produced after the retry budget."""
+    """Raised when no usable distribution was produced after the retry budget.
+
+    `usage` is what the attempts spent (issue #1034), so the route meters a
+    classification that failed."""
+
+    def __init__(self, message: str, usage: Usage | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage
 
 
 def build_classify_purpose_tool(categories: list[str]) -> ToolSchema:
@@ -128,7 +135,19 @@ async def classify_purpose(
     """
     total_usage = Usage()
     for attempt in range(1, CLASSIFY_PURPOSE_MAX_ATTEMPTS + 1):
-        raw, usage = await ai.classify_purpose(categories=categories, signals_block=signals_block)
+        try:
+            raw, usage = await ai.classify_purpose(
+                categories=categories, signals_block=signals_block
+            )
+        except AIError as exc:
+            # Issue #1034: carry earlier attempts' tokens (and any the failing
+            # call reported) on the error the route maps.
+            spent = Usage()
+            spent.add(total_usage)
+            if exc.usage is not None:
+                spent.add(exc.usage)
+            exc.usage = spent
+            raise
         total_usage.add(usage)
         normalized = normalize_distribution(raw, categories)
         if normalized is not None:
@@ -137,4 +156,4 @@ async def classify_purpose(
             "ai_purpose_classification_unusable_distribution",
             extra={"attempt": attempt},
         )
-    raise PurposeClassifierError(NO_USABLE_DISTRIBUTION_DETAIL)
+    raise PurposeClassifierError(NO_USABLE_DISTRIBUTION_DETAIL, usage=total_usage)

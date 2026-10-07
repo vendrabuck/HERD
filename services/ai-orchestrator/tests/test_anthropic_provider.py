@@ -55,6 +55,18 @@ def test_init_keyless_local_endpoint_does_not_raise():
     assert provider._model == "claude-test"
 
 
+def test_init_blank_key_hands_the_sdk_the_empty_placeholder():
+    """AI-PROV-20 (issue #1040): the SDK receives the literal "EMPTY" for a
+    blank key, the target endpoint is the configured base URL, and a real key
+    passes through unchanged."""
+    keyless = AnthropicProvider(api_key="", base_url="https://vllm:8000", model="m")
+    assert keyless._client.api_key == "EMPTY"
+    assert str(keyless._client.base_url).startswith("https://vllm:8000")
+
+    keyed = AnthropicProvider(api_key="sk-ant-real", model="m")
+    assert keyed._client.api_key == "sk-ant-real"
+
+
 def test_init_sets_explicit_client_timeout():
     """The SDK refuses a non-streaming request when it computes that max_tokens
     could exceed its default-timeout ceiling ("Streaming is required for

@@ -2012,3 +2012,103 @@ async def test_incomplete_log_carries_reason_as_its_own_key(async_client, caplog
     formatted = json.loads(JSONFormatter("ai-orchestrator").format(records[0]))
     assert formatted["message"] == "ai_assistant_incomplete_after_tools"
     assert formatted["reason"] == "timeout"
+
+
+# --- A rolled-back turn is still metered (issue #1034) ---
+
+
+def _override_spending_then_raising_ai(exc: Exception, *, spent: int = 25):
+    """The loop's first provider call answered (and spent tokens, recorded on
+    the shared `usage` object exactly as the real loop does), then a later
+    step raised with no side effect, so the route rolls the turn back."""
+
+    class SpendThenRaise:
+        async def answer_reservation_question_with_tools(self, *, usage=None, **_kw):
+            usage.input_tokens += spent
+            usage.output_tokens += spent
+            raise exc
+
+        async def answer_reservation_question_streaming(self, *, usage=None, **_kw):
+            usage.input_tokens += spent
+            usage.output_tokens += spent
+            raise exc
+            yield  # pragma: no cover  (makes this an async generator)
+
+    app.dependency_overrides[get_ai_client] = lambda: SpendThenRaise()
+
+
+async def _today_total_for(token: str) -> int:
+    async with _TestSessionLocal() as db:
+        return await usage_repo.get_today_total(db, _decode_sub(token))
+
+
+@pytest.mark.parametrize(
+    "exc, status_code",
+    [
+        (AIError("boom"), 502),
+        (AIProviderUnavailableError("refused"), 503),
+        (TimeoutError("deadline"), 504),
+    ],
+)
+async def test_buffered_rolled_back_turn_meters_tokens_spent(
+    async_client, monkeypatch, exc, status_code
+):
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    _override_seed()
+    _override_spending_then_raising_ai(exc)
+    token = _user_token()
+    async with async_client as client:
+        resp = await client.post(
+            _url(), json={"question": "q"}, headers={"Authorization": f"Bearer {token}"}
+        )
+    assert resp.status_code == status_code
+    # The turn is gone, the tokens its provider call spent are not.
+    assert await _today_total_for(token) == 50
+
+
+async def test_stream_rolled_back_turn_meters_tokens_spent(async_client, monkeypatch):
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    _override_seed()
+    _override_spending_then_raising_ai(AIError("boom"))
+    token = _user_token()
+    async with async_client as client:
+        resp = await client.post(
+            _stream_url(), json={"question": "q"}, headers={"Authorization": f"Bearer {token}"}
+        )
+    events = _parse_sse(resp.text)
+    assert [e for e, _ in events] == ["error"]
+    assert await _today_total_for(token) == 50
+
+
+# --- AI-CONV-5 (issue #1040): later turns do not re-read the reservation ---
+
+
+async def test_later_turn_reads_neither_the_reservation_nor_its_devices(async_client):
+    """Only a first turn gathers the seed; a turn with a conversation_id
+    replays the stored seed. No turn is refused for the reservation's status
+    (a COMPLETED reservation still gets answers)."""
+    gathers = {"n": 0}
+    completed_seed = _seed()
+    completed_seed.reservation["status"] = "COMPLETED"
+
+    def factory():
+        async def gather() -> ReservationSeed:
+            gathers["n"] += 1
+            return completed_seed
+
+        return gather
+
+    app.dependency_overrides[get_reservation_seed_dep] = factory
+    _override_ai(answer="answer")
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        first = await client.post(_url(), json={"question": "q1"}, headers=headers)
+        assert first.status_code == 200, first.text
+        assert gathers["n"] == 1
+        conv_id = first.json()["conversation_id"]
+        for question in ("q2", "q3"):
+            later = await client.post(
+                _url(), json={"question": question, "conversation_id": conv_id}, headers=headers
+            )
+            assert later.status_code == 200, later.text
+    assert gathers["n"] == 1

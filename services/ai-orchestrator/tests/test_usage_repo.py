@@ -349,3 +349,54 @@ async def test_prior_day_usage_is_a_separate_total():
 
 def _utc_today() -> date:
     return datetime.now(UTC).date()
+
+
+# --- record_failed_usage: metering a request that ended in an error (#1034) ---
+
+
+async def test_record_failed_usage_books_reported_tokens(set_quota):
+    set_quota(1000)
+    async with TestSessionLocal() as db:
+        await usage_repo.record_failed_usage(
+            db, USER, Usage(input_tokens=40, output_tokens=20, cache_read_input_tokens=7)
+        )
+        assert await usage_repo.get_today_total(db, USER) == 60
+
+
+async def test_record_failed_usage_zero_or_none_books_nothing(set_quota):
+    """Zero means nothing is known to have been spent: no chars/4 estimate,
+    unlike record_usage, and no row."""
+    set_quota(1000)
+    async with TestSessionLocal() as db:
+        await usage_repo.record_failed_usage(db, USER, Usage())
+        await usage_repo.record_failed_usage(db, USER, None)
+        assert await usage_repo.get_today_total(db, USER) == 0
+
+
+async def test_record_failed_usage_disabled_quota_writes_no_row(set_quota):
+    set_quota(0)
+    async with TestSessionLocal() as db:
+        await usage_repo.record_failed_usage(db, USER, Usage(input_tokens=50, output_tokens=50))
+        assert await usage_repo.get_today_total(db, USER) == 0
+
+
+async def test_record_failed_usage_swallows_a_metering_failure(set_quota, monkeypatch):
+    """The caller is about to surface its own error; a metering failure must
+    not replace it."""
+    set_quota(1000)
+
+    async def broken_add_tokens(*_args, **_kwargs):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(usage_repo, "add_tokens", broken_add_tokens)
+    async with TestSessionLocal() as db:
+        await usage_repo.record_failed_usage(db, USER, Usage(input_tokens=5, output_tokens=5))
+
+
+def test_usage_of_reads_only_a_real_usage():
+    from app.services.llm_provider import AIError
+
+    spent = Usage(input_tokens=1)
+    assert usage_repo.usage_of(AIError("x", usage=spent)) is spent
+    assert usage_repo.usage_of(AIError("x")) is None
+    assert usage_repo.usage_of(ValueError("x")) is None

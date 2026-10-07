@@ -67,11 +67,14 @@ renders the "Draft with AI" button on the drivers page only when both
 
 ## Cost and quota
 
-When a draft or refine request succeeds, every attempt it spent (including
-auto-repair rounds) is metered through the `ai_usage` table and counts against
-`AI_DAILY_TOKEN_QUOTA` when a quota is configured. Usage is recorded for
-successful calls only: a request that fails records none (see issue #1034). A
-caller over quota gets 429 before the provider is called.
+Every drafting attempt a draft or refine request spends (including auto-repair
+rounds) is metered through the `ai_usage` table and counts against
+`AI_DAILY_TOKEN_QUOTA` when a quota is configured. That holds when the request
+fails too (issue #1034): the provider-reported tokens of the attempts that ran
+before a validator outage or a model failure are still booked, so a failing
+request cannot be repeated without limit. An attempt whose provider call never
+got an answer books nothing. A caller over quota gets 429 before the provider
+is called.
 
 ## Failure modes
 

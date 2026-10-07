@@ -2,7 +2,11 @@
 
 import httpx
 import pytest
-from app.services.inventory_client import InventorySummary, fetch_inventory_summary
+from app.services.inventory_client import (
+    InventorySummary,
+    InventoryUnavailableError,
+    fetch_inventory_summary,
+)
 
 
 def test_summary_prompt_block_sorted():
@@ -112,8 +116,13 @@ async def test_fetch_inventory_summary_raises_on_templates_5xx(monkeypatch):
         return httpx.Response(404)
 
     _patch_transport(monkeypatch, handler)
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(InventoryUnavailableError) as exc:
         await fetch_inventory_summary("token")
+    assert exc.value.operation == "summary"
+    assert exc.value.error_class == "HTTPStatusError"
+    assert exc.value.status_code in (500, 503)
+    # Issue #1036: the error never carries the internal URL.
+    assert "inventory:8000" not in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -134,8 +143,13 @@ async def test_fetch_inventory_summary_raises_on_devices_5xx(monkeypatch):
         return httpx.Response(404)
 
     _patch_transport(monkeypatch, handler)
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(InventoryUnavailableError) as exc:
         await fetch_inventory_summary("token")
+    assert exc.value.operation == "summary"
+    assert exc.value.error_class == "HTTPStatusError"
+    assert exc.value.status_code in (500, 503)
+    # Issue #1036: the error never carries the internal URL.
+    assert "inventory:8000" not in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -144,8 +158,9 @@ async def test_fetch_inventory_summary_raises_on_auth_failure(monkeypatch):
         return httpx.Response(401, json={"detail": "bad token"})
 
     _patch_transport(monkeypatch, handler)
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(InventoryUnavailableError) as exc:
         await fetch_inventory_summary("bad-token")
+    assert exc.value.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -164,8 +179,39 @@ async def test_fetch_available_devices_raises_on_5xx(monkeypatch):
         return httpx.Response(503, json={"detail": "down"})
 
     _patch_transport(monkeypatch, handler)
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(InventoryUnavailableError) as exc:
         await fetch_available_devices("token", "tpl-1", 2)
+    assert exc.value.operation == "candidates"
+    assert exc.value.status_code == 503
+    assert "inventory:8000" not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_fetch_available_devices_transport_error_is_inventory_unavailable(monkeypatch):
+    """Issue #1035: a transport failure is the same typed error (status None),
+    not a raw httpx exception that would surface as a 500."""
+    from app.services.inventory_client import fetch_available_devices
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused to http://inventory:8000", request=request)
+
+    _patch_transport(monkeypatch, handler)
+    with pytest.raises(InventoryUnavailableError) as exc:
+        await fetch_available_devices("token", "tpl-1", 2)
+    assert exc.value.error_class == "ConnectError"
+    assert exc.value.status_code is None
+    assert "inventory:8000" not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_fetch_inventory_summary_non_json_body_is_inventory_unavailable(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>proxy error</html>")
+
+    _patch_transport(monkeypatch, handler)
+    with pytest.raises(InventoryUnavailableError) as exc:
+        await fetch_inventory_summary("token")
+    assert exc.value.error_class == "JSONDecodeError"
 
 
 @pytest.mark.asyncio
