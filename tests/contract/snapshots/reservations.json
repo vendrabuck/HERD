@@ -54,6 +54,10 @@
     ],
     [
       "GET",
+      "/internal/held-devices"
+    ],
+    [
+      "GET",
       "/internal/{reservation_id}"
     ],
     [
@@ -259,6 +263,15 @@
         "group_name",
         "hours",
         "reservation_count"
+      ],
+      "type": "object"
+    },
+    "HeldDevicesResponse": {
+      "properties": {
+        "device_ids": "array"
+      },
+      "required": [
+        "device_ids"
       ],
       "type": "object"
     },
