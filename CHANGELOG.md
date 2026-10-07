@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+- Fixed: inventory answers 422 or 503 where a 500 escaped: a bulk port create whose last generated name exceeds 255 characters, a device or template import file that is not UTF-8, and a non-JSON 200 from reservations during a device delete or config restore (#1022).
+- Fixed: a device-group bulk add naming a device that does not exist answers 422 `Devices not found: <ids>` and adds nothing, instead of a 500 (#1019).
+- Fixed: a device import that updates an existing device writes only the columns the row carries, so omitted `field_data`, poll interval, status, and topology type keep their stored values; an explicit null on a NOT NULL device field is a 422 naming the field, and only a real name clash reads as one (#1016).
+- Fixed: the device page's user group names are resolved across every page of auth's group list, not only the first 50 groups (#1021).
+- Fixed: template and driver updates hold the template-driver connection-type contract: a template update cannot clear a required driver or hypervisor (422), and a driver's connection type cannot change in a way that breaks a template using it (409) (#1018).
 - Docs: corrected documentation, docstrings, and comments that the code contradicts, found while writing the specifications; ADR 0004 and ADR 0015 gain dated as-built addenda instead of rewritten decisions (#1010, #1025, #1031, #1041).
 - Docs: specifications under `docs/specs/`, one per feature area, each rule tied to the code that enforces it and the test that pins it. The first is `docs/specs/reservations.md`; `tests/unit/test_spec_references.py` fails when a specification names a path, symbol, test, link, or section that no longer exists.
 - Fixed: ending a reservation no longer leaks a dynamic instance whose create failed,
