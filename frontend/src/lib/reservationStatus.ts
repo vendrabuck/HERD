@@ -33,8 +33,8 @@ export function canRelease(status: ReservationStatus): boolean {
  * purpose_review.py, which 409s `not_eligible` while
  * `purpose_classify_requested_at` is null and 409s `already_suggested` once
  * `purpose_suggestion` is set (a dismissed or accepted suggestion stays set,
- * so it also refuses). `purpose_classify_requested_at` is stamped at the five
- * transitions into COMPLETED, CANCELLED, or FAILED and by the admin backfill,
+ * so it also refuses). `purpose_classify_requested_at` is stamped at every
+ * transition into COMPLETED, CANCELLED, or FAILED and by the admin backfill,
  * and the API does not expose it, so terminal status is the closest client
  * signal. The one gap is a reservation that went terminal before the stamp
  * existed and was never backfilled: the button shows and the backend answers

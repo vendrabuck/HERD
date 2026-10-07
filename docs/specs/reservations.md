@@ -51,6 +51,7 @@ numbered rules in section 8; section 5 names the caller condition for each route
 | Outbox event | A lifecycle event written in the same transaction as the state change, published to NATS later | reservations | `outbox` (`OutboxEvent`) |
 | Purpose suggestion | The AI orchestrator's classification of a finished reservation, stored verbatim and reviewed by an admin | reservations (produced by ai-orchestrator) | `reservations.purpose_suggestion` |
 | Pending prune marker | Device ids removed from an ACTIVE reservation whose fork wiring release has not yet converged | reservations | `reservations.pending_fork_prune_device_ids` |
+| Provision clock | When the row last entered `PENDING_PROVISION`, written in the same statement as each entry (the create path's insert, the sweep's claim) and never cleared; the two provisioning backstops measure their timeout from it. Null on rows that predate migration 0017, which fall back to `updated_at` | reservations | `reservations.provision_started_at` |
 
 ## 4. State model
 
@@ -80,8 +81,8 @@ numbered rules in section 8; section 5 names the caller condition for each route
 | `PENDING` | `FAILED` | expiration sweep | `end_time <= now` | `reservation.failed` | RES-SWEEP-3 |
 | `PENDING_PROVISION` | `ACTIVE` | `POST /internal/{id}/provision-result` | succeeded | `reservation.created` | RES-DYN-6, RES-DYN-7 |
 | `PENDING_PROVISION` | `FAILED` | `POST /internal/{id}/provision-result` | failed | `reservation.failed` | RES-DYN-6, RES-DYN-8 |
-| `PENDING_PROVISION` | `FAILED` | expiration sweep (dynamic timeout backstop) | dynamic requests; `updated_at` older than `PROVISION_TIMEOUT_SECONDS` | `reservation.failed` | RES-SWEEP-6, RES-SWEEP-8 |
-| `PENDING_PROVISION` | `PENDING` | expiration sweep (restart backstop) | no dynamic request; `updated_at` older than `PROVISION_TIMEOUT_SECONDS` | nothing | RES-SWEEP-7, RES-SWEEP-8 |
+| `PENDING_PROVISION` | `FAILED` | expiration sweep (dynamic timeout backstop) | dynamic requests; `provision_started_at` (else `updated_at`) older than `PROVISION_TIMEOUT_SECONDS` | `reservation.failed` | RES-SWEEP-6, RES-SWEEP-8 |
+| `PENDING_PROVISION` | `PENDING` | expiration sweep (restart backstop) | no dynamic request; `provision_started_at` (else `updated_at`) older than `PROVISION_TIMEOUT_SECONDS` | nothing (the row's exclusive devices are released, holder-aware) | RES-SWEEP-7, RES-SWEEP-8 |
 | `ACTIVE` | `COMPLETED` | expiration sweep (auto-complete) | `end_time <= now` | `reservation.completed` | RES-SWEEP-4 |
 | `ACTIVE` | `COMPLETED` | `PUT /{id}/release` | owner only | `reservation.completed` | RES-RELEASE-3, RES-RELEASE-4 |
 | `PENDING`, `PENDING_PROVISION`, `ACTIVE` | `CANCELLED` | `DELETE /{id}` | owner or admin | `reservation.cancelled` | RES-CANCEL-3, RES-CANCEL-4, RES-CANCEL-5 |
@@ -110,12 +111,12 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
   Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_claim_provision_transition`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_exclusive_enqueues_created_event_in_txn`)
 - **RES-CREATE-15.** When the inventory flip exhausts its attempts, the reservation
-  moves to `FAILED` with `reservation.failed` in that transaction, the devices that did
-  reach `RESERVED` are set back to `AVAILABLE` without the holder check, and the caller
-  gets 503. No purpose marker is stamped and no fork archive is requested. Known gap,
-  see #996. \
+  moves to `FAILED` with `reservation.failed` and the purpose marker in that
+  transaction, the devices that did reach `RESERVED` are set back to `AVAILABLE` through
+  the holder check (RES-HOLD-3), and the caller gets 503. No fork archive is requested
+  (the row never had a fork). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`) \
-  Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_fails_when_inventory_exhausts_retries`, `test_create_reservation_reverts_partially_reserved_devices_on_failure`); `tests/integration/test_provisioning_failed.py` (`test_provisioning_failure_lands_failed_and_reverts_devices`)
+  Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_fails_when_inventory_exhausts_retries`, `test_create_reservation_reverts_partially_reserved_devices_on_failure`); `tests/integration/test_provisioning_failed.py` (`test_provisioning_failure_lands_failed_and_reverts_devices`); `services/reservations/tests/test_purpose_classify_marker.py` (`test_create_flip_failure_stamps_marker`, `test_create_flip_failure_revert_skips_a_device_another_live_row_holds`)
 - **RES-CREATE-16.** A create whose status compare-and-swap loses to a concurrent
   cancel during the flip stages no event, creates no fork, reverts the devices it
   flipped (holder-aware), and returns the row as the cancel left it. \
@@ -172,20 +173,26 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
   concurrent release or cancel already ended is skipped. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_complete_expired_rows`) \
   Pinned by: `services/reservations/tests/test_expiration.py` (`test_expiration_completes_expired_active`, `test_expiration_stages_one_completed_event_per_reservation`); `services/reservations/tests/test_expiration_status_cas.py` (`test_auto_complete_loses_to_a_concurrent_release_is_a_noop`)
-- **RES-SWEEP-6.** A `PENDING_PROVISION` row with dynamic requests whose `updated_at` is
-  older than `PROVISION_TIMEOUT_SECONDS` (default 900) is moved to `FAILED` by
-  compare-and-swap with `reservation.failed` and the purpose marker, then its devices are
-  released and its fork archived. `updated_at` moves on any write to the row, for
-  example a purpose-category PATCH, so such a write restarts the timeout. Known gap,
-  see #997. \
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`); `services/reservations/app/models/reservation.py` (`updated_at`) \
-  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_timeout_backstop_fails_stuck_dynamic_reservation`, `test_timeout_backstop_leaves_fresh_dynamic_reservation`); `services/reservations/tests/test_fork_archive_reconcile.py` (`test_timeout_backstop_failed_archives_fork`)
+- **RES-SWEEP-6.** A `PENDING_PROVISION` row with dynamic requests that entered
+  `PENDING_PROVISION` more than `PROVISION_TIMEOUT_SECONDS` (default 900) ago is moved
+  to `FAILED` by compare-and-swap with `reservation.failed` and the purpose marker, then
+  its devices are released and its fork archived. Both provisioning backstops (this one
+  and RES-SWEEP-7) measure the timeout from `provision_started_at`, which every
+  transition into `PENDING_PROVISION` writes in the same statement (the create path's
+  insert, the sweep's claim), so a later write to the row, for example a
+  purpose-category PATCH, does not restart it. A row with no stamp (it predates
+  migration 0017) is measured from `updated_at`. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`); `services/reservations/app/services/reservation_service.py` (`create_reservation`); `services/reservations/app/models/reservation.py` (`provision_started_at`) \
+  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_timeout_backstop_fails_stuck_dynamic_reservation`, `test_timeout_backstop_leaves_fresh_dynamic_reservation`); `services/reservations/tests/test_fork_archive_reconcile.py` (`test_timeout_backstop_failed_archives_fork`); `services/reservations/tests/test_provision_clock.py` (`test_purpose_category_patch_does_not_move_the_backstop_deadline`, `test_backstop_reads_provision_started_at_not_updated_at`, `test_backstop_falls_back_to_updated_at_when_unstamped`, `test_create_stamps_provision_started_at_when_it_enters_pending_provision`, `test_create_leaves_provision_started_at_null_for_pending_and_active`, `test_sweep_claim_stamps_provision_started_at`, `test_every_entry_into_pending_provision_stamps_provision_started_at`, `test_cas_into_pending_provision_is_only_the_self_transition_guard`)
 - **RES-SWEEP-7.** A physical-only `PENDING_PROVISION` row stranded past the same
-  deadline is moved back to `PENDING` by compare-and-swap, so a later tick re-activates
-  it; nothing is released or torn down. Devices the stranded attempt already set
-  `RESERVED` stay `RESERVED` while the row is `PENDING`. Known gap, see #993. \
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
-  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_restart_backstop_reverts_stranded_physical_reservation`, `test_restart_backstop_reclaims_and_reactivates_across_cycles`, `test_restart_backstop_skips_row_activated_concurrently`)
+  deadline (measured the same way) is moved back to `PENDING` by compare-and-swap, so a later tick re-activates
+  it; nothing is torn down. Only the writer whose compare-and-swap won then releases
+  the row's exclusive devices through the holder-aware filter (RES-HOLD-1: a `PENDING`
+  row holds nothing, and a later cancel or elapsed-window failure writes no inventory
+  status), after the commit and before the tick's claimed rows activate; a device
+  another live row holds is skipped. A later claim re-flips the devices. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`); `services/reservations/app/services/reservation_service.py` (`_release_exclusive_devices_best_effort`, `release_devices_not_held_by_others`) \
+  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_restart_backstop_reverts_stranded_physical_reservation`, `test_restart_backstop_reclaims_and_reactivates_across_cycles`, `test_restart_backstop_skips_row_activated_concurrently`); `services/reservations/tests/test_restart_backstop_release.py` (`test_restart_backstop_revert_releases_the_rows_devices`, `test_restart_backstop_revert_then_elapsed_window_releases_exactly_once`, `test_restart_backstop_revert_then_cancel_leaves_nothing_reserved`, `test_restart_backstop_release_skips_a_device_another_live_row_holds`, `test_restart_backstop_lost_cas_releases_nothing`)
 - **RES-SWEEP-8.** `PROVISION_TIMEOUT_SECONDS=0` disables both provisioning backstops. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_timeout_backstop_disabled_when_zero`, `test_restart_backstop_disabled_when_timeout_zero`)
@@ -228,10 +235,13 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
 - **RES-STATUS-3.** The sweep claims due `PENDING` rows with `SELECT ... FOR UPDATE SKIP
   LOCKED` and sets `PENDING_PROVISION` through the ORM, not through
   `_claim_status_transition`; safety against a concurrent cancel rests on the Postgres
-  row lock (a concurrent cancel blocks on it, then re-reads and cancels from
-  `PENDING_PROVISION`). On SQLite the lock is a no-op. \
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
-  Pinned by: none (issue #998)
+  row lock. When the claim holds the row first, a concurrent cancel blocks on it, then
+  re-reads and cancels from `PENDING_PROVISION` (releasing the devices) and the
+  activation that follows does nothing; when the cancel holds it first, SKIP LOCKED
+  leaves the row out. Either way the row ends `CANCELLED` with one
+  `reservation.cancelled` and no `reservation.created`. On SQLite the lock is a no-op. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_due_pending_stmt`, `_claim_due_pending_rows`) \
+  Pinned by: `services/reservations/tests/test_sweep_claim_cancel_race_live_pg.py` (`test_claim_holds_the_row_first_cancel_blocks_then_cancels_from_provision`, `test_cancel_holds_the_row_first_claim_skips_it`)
 
 ## 5. API surface
 
@@ -470,9 +480,10 @@ The transitions are RES-DYN-4 to RES-DYN-9 and RES-SWEEP-6 (section 4).
   `template_type` `dynamic`; inventory unreachable fails closed with 503. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`, `_fetch_dynamic_templates`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_dynamic_booking_unknown_template_422_wording`, `test_dynamic_booking_non_dynamic_template_422_wording`, `test_dynamic_booking_inventory_unreachable_503_wording`)
-- **RES-DYN-2.** A booking carries at most 50 dynamic requests. \
-  Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationCreate`) \
-  Pinned by: none (issue #998)
+- **RES-DYN-2.** A booking carries at most 50 dynamic requests; the create form's
+  `MAX_DYNAMIC_REQUESTS` mirrors the cap. \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationCreate`); `frontend/src/components/reservations/CreateReservationModal.tsx` (`MAX_DYNAMIC_REQUESTS`) \
+  Pinned by: `services/reservations/tests/test_schema_bounds.py` (`test_dynamic_requests_at_cap_accepted`, `test_dynamic_requests_over_cap_rejected`); `tests/unit/test_dynamic_request_cap_parity.py` (`test_dynamic_request_cap_is_fifty_on_both_sides`)
 - **RES-DYN-3.** Listing a template N times books N instances, one row each; there is
   no dedupe. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`) \
@@ -502,20 +513,22 @@ runs after the commit.
   reservation path. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_release_exclusive_devices_best_effort`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_non_exclusive_device_status_not_changed`, `test_cancel_non_exclusive_skips_status_update`)
-- **RES-HOLD-3.** Cancel, release, provision failure, the dynamic timeout, auto-complete,
-  and lost-activation reverts skip any device another `PENDING_PROVISION` or `ACTIVE`
-  reservation holds, logging `release_skipped_device_held`. The create-path flip-failure
-  revert (RES-CREATE-15) and PATCH removal (RES-PATCH-10) do not use this check. \
+- **RES-HOLD-3.** Cancel, release, provision failure, the dynamic timeout, the restart
+  backstop's revert, auto-complete, and lost-activation reverts skip any device another `PENDING_PROVISION` or `ACTIVE`
+  reservation holds, logging `release_skipped_device_held`; so does the create-path
+  flip-failure revert (RES-CREATE-15). PATCH removal (RES-PATCH-10) does not use this
+  check. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`release_devices_not_held_by_others`) \
   Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_cancel_skips_a_device_another_live_row_holds`, `test_release_skips_a_device_another_live_row_holds`); `services/reservations/tests/test_expiration_hold_invariant.py` (`test_release_skips_device_a_pending_provision_row_holds`)
 - **RES-HOLD-4.** If the holder lookup itself fails, the release proceeds for every
   device (fail open toward releasing). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`release_devices_not_held_by_others`) \
   Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_holder_lookup_failure_falls_back_to_releasing`)
-- **RES-HOLD-5.** Cancel, release, provision failure, and the dynamic timeout share one
-  release helper: a device whose exclusivity cannot be read is treated as exclusive, and
-  a device inventory answers 404 for is dropped from the release set. Auto-complete
-  reads exclusivity itself and follows RES-HOLD-9 instead. \
+- **RES-HOLD-5.** Cancel, release, provision failure, the dynamic timeout, and the
+  restart backstop's revert share one release helper: a device whose exclusivity cannot
+  be read is treated as exclusive, and a device inventory answers 404 for is dropped
+  from the release set. Auto-complete reads exclusivity itself and follows RES-HOLD-9
+  instead. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_release_exclusive_devices_best_effort`, `_DeviceGoneFromInventory`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_cancel_fetch_failure_falls_back_to_exclusive`); `services/reservations/tests/test_reservation_service_unit.py` (`test_release_exclusive_devices_drops_404_fetch_result`)
 - **RES-HOLD-6.** A 404 from inventory when setting a device `AVAILABLE` counts as
@@ -574,7 +587,7 @@ The transitions are RES-CANCEL-3 to RES-CANCEL-5 and RES-RELEASE-3 to RES-RELEAS
 - **RES-RELEASE-2.** An admin who does not own the reservation gets 404 on release too.
   By decision ([ROLES.md](../ROLES.md); issue #843 aligned the UI to it). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`release_reservation_early`) \
-  Pinned by: none (issue #998)
+  Pinned by: `services/reservations/tests/test_owner_scoped_access.py` (`test_non_owner_admin_release_is_404_and_changes_nothing`)
 
 **Out of scope.** Hardware teardown triggered by the terminal events is execution's
 (`provisioning-and-wiring.md`, `dynamic-resources.md`).
@@ -641,7 +654,7 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
 - **RES-PATCH-2.** Only the owner can edit; every other caller, an admin included, gets
   404. By decision ([ROLES.md](../ROLES.md): owner-scoped, no admin bypass). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `get_reservation`) \
-  Pinned by: none (issue #998)
+  Pinned by: `services/reservations/tests/test_owner_scoped_access.py` (`test_non_owner_admin_patch_is_404_and_changes_nothing`, `test_non_owner_user_patch_is_404_and_changes_nothing`, `test_owner_patch_still_succeeds`)
 - **RES-PATCH-3.** A new `end_time` must be after `start_time` and in the future. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_end_time_not_after_start_rejected`, `test_update_reservation_end_time_in_past_rejected`)
@@ -783,7 +796,7 @@ and `frontend/src/pages/ReservationCalendarPage.tsx`; routes `GET /{id}` and
 - **RES-VIEW-2.** That includes an admin who does not own the reservation. By decision
   ([ROLES.md](../ROLES.md): owner only for every role). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_by_id`) \
-  Pinned by: none (issue #998)
+  Pinned by: `services/reservations/tests/test_owner_scoped_access.py` (`test_non_owner_admin_get_by_id_is_404`)
 - **RES-CAL-1.** The calendar returns every user's reservations overlapping
   `[range_start, range_end)`. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`list_calendar_reservations`) \
@@ -830,13 +843,13 @@ routes in section 5; background work `purpose_classify_loop` every
   Enforced in: `services/reservations/app/services/reservation_service.py` (`set_purpose_category`) \
   Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_patch_purpose_category_null_clears_all_three_fields`)
 - **RES-PURPOSE-4.** `purpose_classify_requested_at` is stamped, once, in the same
-  transaction as six terminal transitions: cancel, release, auto-complete,
-  provision-result failure, the dynamic timeout, and the elapsed-window failure. The
-  create-path flip failure (RES-CREATE-15) does not stamp it. Only a stamped row is ever
-  classified by the sweep. Code comments, ADR 0013, and the frontend's
-  `canClassifyPurpose` comment say five sites. Known gap, see #996. \
+  transaction as every terminal transition, seven today: cancel, release,
+  auto-complete, provision-result failure, the dynamic timeout, the elapsed-window
+  failure, and the create-path flip failure (RES-CREATE-15). Only a stamped row is ever
+  classified by the sweep. A unit test enumerates every terminal status
+  compare-and-swap in the service and fails when one has no matching stamp. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`stamp_purpose_classify_requested`) \
-  Pinned by: `services/reservations/tests/test_purpose_classify_marker.py` (`test_cancel_reservation_stamps_marker`, `test_release_reservation_stamps_marker`, `test_expiry_autocomplete_stamps_marker`, `test_provision_result_failed_stamps_marker`, `test_timeout_backstop_failed_stamps_marker`, `test_stamp_is_idempotent_on_cancel`); `services/reservations/tests/test_expiration_hold_invariant.py` (`test_expired_pending_row_is_failed_not_activated`)
+  Pinned by: `services/reservations/tests/test_purpose_classify_marker.py` (`test_cancel_reservation_stamps_marker`, `test_release_reservation_stamps_marker`, `test_expiry_autocomplete_stamps_marker`, `test_provision_result_failed_stamps_marker`, `test_timeout_backstop_failed_stamps_marker`, `test_stamp_is_idempotent_on_cancel`, `test_create_flip_failure_stamps_marker`, `test_every_terminal_status_write_stamps_the_marker`, `test_no_terminal_status_is_written_outside_the_cas_helpers`); `services/reservations/tests/test_expiration_hold_invariant.py` (`test_expired_pending_row_is_failed_not_activated`)
 - **RES-PURPOSE-5.** Each sweep tick takes up to `PURPOSE_CLASSIFY_BATCH_SIZE` stamped
   rows with no suggestion and fewer than `PURPOSE_CLASSIFY_MAX_ATTEMPTS` attempts,
   oldest stamp first. \
@@ -1222,7 +1235,7 @@ before the missing-fork backstop gives up; 20 pending prunes per tick.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/reservations/tests/` (in-memory SQLite); `frontend/src/test/lib/reservationStatus.test.ts`, `frontend/src/test/lib/reservationBulk.test.ts`, `frontend/src/test/lib/reservationFilters.test.ts` | Advisory locks and `SKIP LOCKED` are no-ops on SQLite, so concurrency below the status CAS is not exercised here |
-| Functional (through the service API) | `services/reservations/tests/test_reservations.py`, `test_fork_endpoints.py`, `test_dynamic_requests.py`, `test_reservation_list_filters.py` (httpx against the app); the `*_live_pg.py` suites against a real Postgres: `test_reservation_status_cas_live_pg.py`, `test_reservation_sort_live_pg.py`, `test_reservation_list_filters_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
+| Functional (through the service API) | `services/reservations/tests/test_reservations.py`, `test_fork_endpoints.py`, `test_dynamic_requests.py`, `test_reservation_list_filters.py` (httpx against the app); the `*_live_pg.py` suites against a real Postgres: `test_reservation_status_cas_live_pg.py`, `test_reservation_sort_live_pg.py`, `test_reservation_list_filters_live_pg.py`, `test_sweep_claim_cancel_race_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
 | Integration (running stack) | `tests/integration/test_reservation_lifecycle.py`, `test_reservation_patch.py`, `test_reservation_list_filters.py`, `test_provisioning_failed.py`, `test_dynamic_resources.py`, `test_reservation_fork_flow.py`, `test_device_set_patch_wiring.py`, `test_purpose_category_flow.py`, `test_purpose_review_flow.py` | `test_overlapping_reservation_is_rejected` accepts 409 or 422; the purpose review flow needs an AI provider and never runs in CI |
 | Stress and load | `tests/load/locustfile.py` (`ReservationUser`: list, calendar, create, release) | Create contention on one device is intended; no load test covers the sweep, PATCH, or the fork routes |
 | Browser end-to-end | `tests/e2e/test_reservations.py`, `test_reservation_cancel_ui.py`, `test_reservation_detail.py`, `test_reservations_bulk_playwright.py`, `test_reservations_filters_playwright.py`, `test_reservations_sort_playwright.py`, `test_live_edit_reservation_topology.py` | E2E runs nightly and in the `make master` and `make everything` gates, not per pull request |
@@ -1236,10 +1249,6 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
 
 ### Open defects
 
-- #993 (RES-SWEEP-7): the physical-only restart backstop returns a row to `PENDING`
-  without releasing devices the stranded attempt already set `RESERVED`. If that row is
-  then cancelled while `PENDING` (RES-HOLD-1), or its window elapses (RES-SWEEP-3 makes
-  no inventory call), those devices stay `RESERVED` with no holder.
 - #994 (RES-PATCH-10, RES-HOLD-3): PATCH writes inventory before the edit commits, in
   one attempt whose failure is only logged, so an added exclusive device can stay
   `AVAILABLE` while held. The removal write skips the holder check every other release
@@ -1247,16 +1256,6 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
   auto-complete racing a PATCH can leave an added device `RESERVED` with no holder.
 - #995 (RES-PATCH-5): a PATCH can extend a reservation past
   `RESERVATION_MAX_DURATION_SECONDS`; only create applies the cap.
-- #996 (RES-PURPOSE-4, RES-CREATE-15): the create-path flip failure moves a row to
-  `FAILED` without stamping `purpose_classify_requested_at`, so it is never classified
-  unless an admin runs the backfill. There are six stamp sites; ADR 0013,
-  `purpose_service.py`, `models/reservation.py`, and the frontend's
-  `canClassifyPurpose` comment say five. The same path's revert of partially reserved
-  devices does not use the holder check.
-- #997 (RES-SWEEP-6): the dynamic timeout is measured from `updated_at`, which any write
-  to the row moves, for example a purpose-category PATCH during `PENDING_PROVISION`, so
-  such a write restarts the timeout. The comment in `_run_expiration_cycle` saying
-  nothing touches a stuck row is not true.
 - #999 (RES-PATCH-9): PATCH-add on a `PENDING` reservation requires the added device to
   be `AVAILABLE` now, while a create for the same future window skips that check
   (RES-CREATE-12) and relies on the window conflict check.
@@ -1294,11 +1293,4 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
 
 ### Rules with no test
 
-Issue #998 tracks the tests for all of these.
-
-- RES-DYN-2: the 50-request cap.
-- RES-RELEASE-2: a release from a non-owner admin.
-- RES-STATUS-3: the sweep's row-lock claim against a concurrent cancel on Postgres.
-- RES-PATCH-2: a PATCH from a non-owner, admin or not.
-- RES-PATCH-5: an extension past the duration cap (it currently succeeds).
-- RES-VIEW-2: `GET /{id}` from a non-owner admin.
+- RES-PATCH-5: an extension past the duration cap (it currently succeeds; see #995).

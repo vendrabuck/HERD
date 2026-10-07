@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from app.schemas.reservation import ReservationCreate, ReservationUpdate
+from app.schemas.reservation import DynamicRequestSpec, ReservationCreate, ReservationUpdate
 from pydantic import ValidationError
 
 _START = datetime.now(timezone.utc) + timedelta(minutes=1)
@@ -54,3 +54,20 @@ def test_update_device_ids_over_cap_rejected():
 def test_update_purpose_over_cap_rejected():
     with pytest.raises(ValidationError):
         ReservationUpdate(purpose="p" * 2001)
+
+
+def _dynamic(n):
+    return [DynamicRequestSpec(template_id=uuid.uuid4()) for _ in range(n)]
+
+
+def test_dynamic_requests_at_cap_accepted():
+    """RES-DYN-2 (issue #998): 50 dynamic requests per reservation."""
+    assert len(_create(device_ids=[], dynamic_requests=_dynamic(50)).dynamic_requests) == 50
+
+
+def test_dynamic_requests_over_cap_rejected():
+    with pytest.raises(ValidationError) as exc:
+        _create(device_ids=[], dynamic_requests=_dynamic(51))
+    errors = exc.value.errors()
+    assert [e["loc"] for e in errors] == [("dynamic_requests",)]
+    assert errors[0]["type"] == "too_long"

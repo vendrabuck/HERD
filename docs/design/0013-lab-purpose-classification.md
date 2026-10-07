@@ -213,11 +213,14 @@ here without rewriting the original text.
    describes the sweep picking up "terminal reservations that have no
    suggestion yet (and, for backfill, rows an admin marked eligible)" as if
    those were separate paths. As delivered, both are the same column:
-   `purpose_classify_requested_at`. Every terminal transition (the five call
-   sites: cancel, release, the provision-result failure branch, the
-   expiration sweep's auto-complete loop, and its dynamic-timeout backstop)
-   stamps it once, idempotently, in the same transaction as the status
-   change. The reconciler's eligibility query is simply "requested, not yet
+   `purpose_classify_requested_at`. Every terminal transition stamps it
+   once, idempotently, in the same transaction as the status change. As
+   delivered there were five call sites (cancel, release, the
+   provision-result failure branch, the expiration sweep's auto-complete
+   loop, and its dynamic-timeout backstop); the elapsed-window failure
+   (issue #898) and the create path's inventory-flip failure (issue #996)
+   make seven, and a unit test in `test_purpose_classify_marker.py` fails
+   when a terminal status write has no matching stamp. The reconciler's eligibility query is simply "requested, not yet
    suggested, under the attempt cap," ordered oldest-requested-first.
    `POST /admin/purpose/backfill` stamps the same column on historical rows
    that predate this feature, so end-of-reservation classification and
@@ -516,8 +519,9 @@ Phase 2 pins, as delivered:
   `purpose_classification` status field. Unit (SQLite, inventory):
   `test_apply_jobs_internal_summary.py` for the new
   `GET /devices/{id}/apply-jobs/internal` signal endpoint.
-- Unit (SQLite, reservations): `test_purpose_classify_marker.py` (all five
-  terminal-transition sites stamp the marker, idempotently);
+- Unit (SQLite, reservations): `test_purpose_classify_marker.py` (every
+  terminal-transition site stamps the marker, idempotently; seven since issue
+  #996, with an enumeration of the terminal status writes);
   `test_purpose_classify_reconcile.py` (a 200 stores a suggestion, a 403 or a
   404 ends the tick without touching any row including a later row in the
   same batch, a 5xx or a transport error increments attempts, a row at the

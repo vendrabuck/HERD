@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from herd_common.outbox import enqueue_event
 from herd_common.retry import retry_with_backoff
-from sqlalchemy import and_, exists, select
+from sqlalchemy import and_, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -274,9 +274,9 @@ async def _complete_expired_rows(
         ):
             continue
         completed.append(res)
-        # One of the five terminal-transition sites (issue #646 phase 2,
-        # ADR 0013 point 8): marks the row eligible for background purpose
-        # classification.
+        # A terminal-transition site (issue #646 phase 2, ADR 0013 point 8;
+        # the full list is in stamp_purpose_classify_requested's docstring):
+        # marks the row eligible for background purpose classification.
         stamp_purpose_classify_requested(res)
         await enqueue_event(
             db,
@@ -298,6 +298,55 @@ async def _complete_expired_rows(
             extra={"action": "auto_complete", "reservation_id": str(res.id)},
         )
     return completed
+
+
+def _due_pending_stmt(now: datetime):
+    """The sweep's claim query: PENDING rows due now, locked FOR UPDATE SKIP LOCKED.
+
+    skip_locked so concurrent service instances do not double-claim, and so a row a
+    concurrent cancel holds is skipped rather than waited on; it is a no-op on SQLite
+    (unit tests). Split out so the Postgres-live suite can run the REAL query narrowed
+    to its own rows on a used database (issue #998).
+    """
+    return (
+        select(Reservation)
+        .where(
+            and_(
+                Reservation.status == ReservationStatus.PENDING,
+                Reservation.start_time <= now,
+                # A window that already elapsed is never activated (issue
+                # #898): it would emit reservation.created, hold ACTIVE for a
+                # tick, then complete and release, clobbering a successor's
+                # RESERVED. The elapsed rows are failed by the cycle instead.
+                Reservation.end_time > now,
+            )
+        )
+        .with_for_update(skip_locked=True)
+    )
+
+
+async def _claim_due_pending_rows(db: AsyncSession, stmt, now: datetime) -> list[uuid.UUID]:
+    """Move the rows `stmt` selects from PENDING to PENDING_PROVISION; return their ids.
+
+    The one status write that is not a compare-and-swap (rule RES-STATUS-3): an ORM
+    set on rows `stmt` locked FOR UPDATE. It is safe only through that row lock. A
+    concurrent cancel that reaches the row first holds it, so SKIP LOCKED leaves it
+    out; a cancel that arrives while this transaction holds it blocks, then finds
+    PENDING_PROVISION, re-reads, and cancels from there. Pinned against a real
+    concurrent cancel by test_sweep_claim_cancel_race_live_pg.py. The caller commits.
+    """
+    claimed = (await db.execute(stmt)).scalars().all()
+    for res in claimed:
+        res.status = ReservationStatus.PENDING_PROVISION
+        # The provisioning backstops' clock (issue #997): flushed in the same
+        # UPDATE as the status, under the same row lock.
+        res.provision_started_at = now
+        logger.info(
+            "Claimed scheduled reservation %s for activation",
+            res.id,
+            extra={"action": "scheduled_activation_claim", "reservation_id": str(res.id)},
+        )
+    return [res.id for res in claimed]
 
 
 async def _run_expiration_cycle() -> None:
@@ -325,30 +374,7 @@ async def _run_expiration_cycle() -> None:
         # path). skip_locked so concurrent service instances do not double-claim;
         # it is a no-op on SQLite (unit tests). Provisioning runs after this
         # transaction commits and the row lock is released, never during HTTP.
-        result = await db.execute(
-            select(Reservation)
-            .where(
-                and_(
-                    Reservation.status == ReservationStatus.PENDING,
-                    Reservation.start_time <= now,
-                    # A window that already elapsed is never activated (issue
-                    # #898): it would emit reservation.created, hold ACTIVE for a
-                    # tick, then complete and release, clobbering a successor's
-                    # RESERVED. The elapsed rows are failed just below instead.
-                    Reservation.end_time > now,
-                )
-            )
-            .with_for_update(skip_locked=True)
-        )
-        claimed = result.scalars().all()
-        for res in claimed:
-            res.status = ReservationStatus.PENDING_PROVISION
-            logger.info(
-                "Claimed scheduled reservation %s for activation",
-                res.id,
-                extra={"action": "scheduled_activation_claim", "reservation_id": str(res.id)},
-            )
-        activate_ids = [res.id for res in claimed]
+        activate_ids = await _claim_due_pending_rows(db, _due_pending_stmt(now), now)
 
         # Fail PENDING rows whose whole window elapsed before activation (issue
         # #898): a deferred activation (inventory outage) or a long sweep outage.
@@ -399,20 +425,28 @@ async def _run_expiration_cycle() -> None:
 
         # Timeout backstop (ADR 0004): fail dynamic-carrying reservations stuck
         # in PENDING_PROVISION past provision_timeout_seconds, so a lost
-        # provision-result callback never strands a reservation. updated_at is
-        # the transition timestamp: nothing touches a stuck row after it enters
-        # PENDING_PROVISION. reservation.failed drives execution-side instance
+        # provision-result callback never strands a reservation. The clock is
+        # provision_started_at, stamped by every transition INTO PENDING_PROVISION
+        # (issue #997), not updated_at: other writes do touch a stuck row (a
+        # purpose-category PATCH is allowed in every status, and the
+        # self-transition CAS guards rewrite the status), and each would restart
+        # the timeout. Rows that predate migration 0017 have no stamp and fall
+        # back to updated_at. reservation.failed drives execution-side instance
         # teardown. A timeout of 0 disables both backstops rather than instantly
         # reclaiming every in-flight provisioning. Physical-only rows take the
         # revert branch below, not this failing one.
         stuck: list[Reservation] = []
+        reverted: list[Reservation] = []
         if settings.provision_timeout_seconds > 0:
             deadline = now - timedelta(seconds=settings.provision_timeout_seconds)
+            provision_clock = func.coalesce(
+                Reservation.provision_started_at, Reservation.updated_at
+            )
             result = await db.execute(
                 select(Reservation).where(
                     and_(
                         Reservation.status == ReservationStatus.PENDING_PROVISION,
-                        Reservation.updated_at <= deadline,
+                        provision_clock <= deadline,
                         exists().where(ReservationDynamicRequest.reservation_id == Reservation.id),
                     )
                 )
@@ -430,9 +464,10 @@ async def _run_expiration_cycle() -> None:
                 if not await _claim_provision_transition(db, res.id, ReservationStatus.FAILED):
                     continue
                 stuck.append(res)
-                # One of the five terminal-transition sites (issue #646 phase 2,
-                # ADR 0013 point 8): marks the row eligible for background
-                # purpose classification. The CAS above bypasses the ORM's
+                # A terminal-transition site (issue #646 phase 2, ADR 0013 point
+                # 8; the full list is in stamp_purpose_classify_requested's
+                # docstring): marks the row eligible for background purpose
+                # classification. The CAS above bypasses the ORM's
                 # in-memory status sync, but this column is untouched by it, so
                 # setting it here on `res` and committing below is safe.
                 stamp_purpose_classify_requested(res)
@@ -459,14 +494,19 @@ async def _run_expiration_cycle() -> None:
             # ACTIVE transition), so no execution provisioning ran and there is
             # nothing to tear down; re-activation re-flips the exclusive devices
             # idempotently. PENDING is in the conflict set, so the window stays
-            # held across the revert. The NOT EXISTS mirrors the dynamic branch's
-            # EXISTS, so the two backstops partition PENDING_PROVISION and never
-            # both touch one row.
+            # held across the revert. A PENDING row holds nothing in inventory
+            # (issue #897), so every later path (cancel, the elapsed-window
+            # failure) assumes there is nothing to release; the devices the
+            # stranded attempt set RESERVED are therefore released below, after
+            # the commit and only for rows whose revert this call won (issue
+            # #993). The NOT EXISTS mirrors the dynamic branch's EXISTS, so the
+            # two backstops partition PENDING_PROVISION and never both touch one
+            # row.
             result = await db.execute(
                 select(Reservation).where(
                     and_(
                         Reservation.status == ReservationStatus.PENDING_PROVISION,
-                        Reservation.updated_at <= deadline,
+                        provision_clock <= deadline,
                         ~exists().where(ReservationDynamicRequest.reservation_id == Reservation.id),
                     )
                 )
@@ -480,6 +520,7 @@ async def _run_expiration_cycle() -> None:
                 # row, i.e. the genuine restart-strand case.
                 if not await _claim_provision_transition(db, res.id, ReservationStatus.PENDING):
                     continue
+                reverted.append(res)
                 logger.warning(
                     "Reclaiming stranded physical reservation %s; reverting to PENDING",
                     res.id,
@@ -520,6 +561,22 @@ async def _run_expiration_cycle() -> None:
         # Freeze the fork as the as-built record now the reservation is COMPLETED
         # (ADR 0006 Decision 5). Best-effort, mirroring the manual release path.
         await _archive_reservation_fork_best_effort(res.id)
+
+    # Release the devices of rows the restart backstop reverted to PENDING (issue
+    # #993). The revert committed above, so the row now holds nothing; leaving its
+    # devices RESERVED would orphan them if the row is then cancelled or its window
+    # elapses, since neither path writes inventory for a PENDING row. Holder-aware
+    # through the shared release helper: a row claimed above (PENDING_PROVISION) or
+    # any other live holder keeps its device. Like the completed release, this runs
+    # BEFORE the claimed rows activate. A later claim of the reverted row re-flips
+    # its devices.
+    for res in reverted:
+        await _release_exclusive_devices_best_effort(
+            res.id,
+            list(res.device_ids),
+            "provision_restart_release",
+            context_label="restart backstop",
+        )
 
     # Provision each claimed reservation now that the claim is committed and the
     # row lock is released: flip inventory, mark ACTIVE, fork, emit

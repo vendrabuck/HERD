@@ -19,7 +19,7 @@ admin review surface use are derived, never stored as a separate column:
 
 A reservation becomes eligible for the background classifier the moment
 `purpose_classify_requested_at` is non-null; `stamp_purpose_classify_requested`
-(called from the five terminal-transition sites) and
+(called from every terminal-transition site) and
 `backfill_purpose_classification` (the admin endpoint) are the only two
 writers of that column, and both are idempotent (they only ever set it from
 null).
@@ -89,10 +89,15 @@ def stamp_purpose_classify_requested(reservation: Reservation) -> None:
     calling this more than once on the same row (a re-fetch, a defensive
     double-call) is a no-op the second time. Called at every transition into
     COMPLETED, CANCELLED, or FAILED, in the SAME transaction as the status
-    change: the five sites are cancel_reservation, release_reservation, and
-    the provision-result failure branch in app/services/reservation_service.py,
-    plus the auto-complete and dynamic-timeout-failure branches of the
-    expiration task's main cycle (app/tasks/expiration.py). This is the ONLY
+    change. The seven sites are cancel_reservation, release_reservation, the
+    provision-result failure branch (apply_provision_result), and the create
+    path's inventory-flip failure (create_reservation, issue #996) in
+    app/services/reservation_service.py, plus the auto-complete
+    (_complete_expired_rows), elapsed-window failure (issue #898), and
+    dynamic-timeout failure of the expiration task (app/tasks/expiration.py).
+    tests/test_purpose_classify_marker.py enumerates every terminal status
+    compare-and-swap in app/ and fails when one has no matching stamp. This is
+    the ONLY
     way a row becomes eligible for the sweep reconciler, so end-of-reservation
     classification and admin backfill (backfill_purpose_classification below)
     share one mechanism.
