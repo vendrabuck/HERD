@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
 
 // Mock HTMLDialogElement methods (jsdom has no native <dialog> support)
@@ -48,7 +48,18 @@ vi.mock("@/api/secrets", () => ({
   useSecrets: () => mockUseSecrets(),
 }));
 
+// Mock device groups hook (populates the "Bookable by device group" picker)
+const mockUseDeviceGroups = vi.fn();
+vi.mock("@/api/deviceGroups", () => ({
+  useDeviceGroups: () => mockUseDeviceGroups(),
+}));
+
 import { HypervisorsPage } from "@/pages/admin/HypervisorsPage";
+
+const SAMPLE_DEVICE_GROUPS = [
+  { id: "g1", name: "Cloud Lab", description: null, created_by: null, created_at: "2026-01-01T00:00:00Z", device_count: 0, user_group_count: 1 },
+  { id: "g2", name: "QA Pool", description: null, created_by: null, created_at: "2026-01-01T00:00:00Z", device_count: 3, user_group_count: 2 },
+];
 
 const SAMPLE_HYPERVISORS = [
   {
@@ -59,6 +70,7 @@ const SAMPLE_HYPERVISORS = [
     hypervisor_type: "proxmox",
     secret_id: "s1",
     enabled: true,
+    device_group_id: "g1",
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",
     modified_by: null,
@@ -71,6 +83,7 @@ const SAMPLE_HYPERVISORS = [
     hypervisor_type: "vsphere",
     secret_id: "s2",
     enabled: false,
+    device_group_id: null,
     created_at: "2026-01-02T00:00:00Z",
     updated_at: "2026-01-02T00:00:00Z",
     modified_by: null,
@@ -90,6 +103,7 @@ describe("HypervisorsPage", () => {
       isLoading: false,
     });
     mockUseSecrets.mockReturnValue({ data: SAMPLE_SECRETS });
+    mockUseDeviceGroups.mockReturnValue({ data: SAMPLE_DEVICE_GROUPS });
   });
 
   it("renders hypervisors table with data", () => {
@@ -374,5 +388,91 @@ describe("HypervisorsPage", () => {
     expect(
       screen.queryByText(/references a secret that no longer exists/),
     ).not.toBeInTheDocument();
+  });
+
+  // Issue #1053: the hypervisor's device group decides who may book its
+  // dynamic templates; issue #1033: the Enabled flag is enforced.
+
+  it("list shows the device group that may book, or Admins only", () => {
+    render(<HypervisorsPage />);
+    expect(screen.getByRole("columnheader", { name: "Bookable by" })).toBeInTheDocument();
+    const table = within(screen.getByRole("table"));
+    expect(table.getByText("Cloud Lab")).toBeInTheDocument();
+    expect(table.getByText("Admins only")).toBeInTheDocument();
+  });
+
+  it("list keeps a neutral truncated id for a device group it cannot name", () => {
+    mockUseDeviceGroups.mockReturnValue({ data: undefined });
+    render(<HypervisorsPage />);
+    expect(within(screen.getByRole("table")).getByText("g1...")).toBeInTheDocument();
+  });
+
+  const fillRequired = () => {
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "New HV" } });
+    fireEvent.change(screen.getByLabelText("Endpoint"), {
+      target: { value: "https://hv.example.local" },
+    });
+    fireEvent.change(screen.getByLabelText("Hypervisor Type"), {
+      target: { value: "proxmox" },
+    });
+    fireEvent.change(screen.getByLabelText("Secret"), { target: { value: "s1" } });
+  };
+
+  const clickSubmit = (label: string) => {
+    const dialog = document.querySelectorAll("dialog")[0];
+    const btn = Array.from(dialog.querySelectorAll("button")).find(
+      (b) => b.textContent === label,
+    )!;
+    fireEvent.click(btn);
+  };
+
+  it("create sends no device group by default (admins only)", () => {
+    render(<HypervisorsPage />);
+    fireEvent.click(screen.getByRole("button", { name: "Register Hypervisor" }));
+    fillRequired();
+    expect((screen.getByLabelText("Bookable by device group") as HTMLSelectElement).value).toBe(
+      "",
+    );
+    clickSubmit("Register");
+    expect(mockCreateHypervisor.mutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({ device_group_id: null }),
+    );
+  });
+
+  it("create sends the chosen device group", () => {
+    render(<HypervisorsPage />);
+    fireEvent.click(screen.getByRole("button", { name: "Register Hypervisor" }));
+    fillRequired();
+    fireEvent.change(screen.getByLabelText("Bookable by device group"), {
+      target: { value: "g2" },
+    });
+    clickSubmit("Register");
+    expect(mockCreateHypervisor.mutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({ device_group_id: "g2" }),
+    );
+  });
+
+  it("edit pre-selects the stored device group and can clear it", async () => {
+    mockUpdateHypervisor.mutateAsync.mockResolvedValue({});
+    render(<HypervisorsPage />);
+    fireEvent.click(screen.getAllByText("Edit")[0]);
+    const select = screen.getByLabelText("Bookable by device group") as HTMLSelectElement;
+    expect(select.value).toBe("g1");
+    fireEvent.change(select, { target: { value: "" } });
+    clickSubmit("Save");
+    await waitFor(() =>
+      expect(mockUpdateHypervisor.mutateAsync).toHaveBeenCalledWith({
+        id: "h1",
+        data: expect.objectContaining({ device_group_id: null }),
+      }),
+    );
+  });
+
+  it("describes the Enabled flag as enforced", () => {
+    render(<HypervisorsPage />);
+    fireEvent.click(screen.getByRole("button", { name: "Register Hypervisor" }));
+    expect(
+      screen.getByText(/While disabled, bookings of this hypervisor's dynamic templates are refused/),
+    ).toBeInTheDocument();
   });
 });

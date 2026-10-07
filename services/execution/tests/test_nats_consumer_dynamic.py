@@ -1466,6 +1466,65 @@ async def test_provision_over_every_ledger_state(
     assert (callback.await_count == 1) is expect_callback
 
 
+@pytest.mark.parametrize("seed", ["absent", "CREATING"])
+async def test_disabled_hypervisor_is_refused_and_the_row_stays_creating(seed, caplog):
+    """Issue #1033: the second line behind the booking's check. A hypervisor an
+    admin disabled after the booking creates nothing: no recipe call, no device,
+    no success callback; the row stays CREATING and the event is abandoned with
+    the fixed action, like the resurrection refusal."""
+    await _seed_status(seed)
+    calls, execute = _recipe_execute({"create_instance": CREATE_OK})
+    callback = AsyncMock()
+    create_device = AsyncMock(return_value={"id": DEVICE_ID})
+    patches = _create_patches(execute, hypervisor={**HYPERVISOR_DATA, "enabled": False})
+    patches.append(
+        patch("app.services.nats_consumer._post_provision_result_best_effort", new=callback)
+    )
+    patches.append(patch("app.services.nats_consumer._create_dynamic_device", new=create_device))
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+
+    assert calls == []
+    assert create_device.await_count == 0
+    assert callback.await_count == 0
+    rows = await _rows()
+    assert [(r.status, r.device_id, r.instance_ref) for r in rows] == [("CREATING", None, None)]
+    assert _actions(caplog) == [
+        "dynamic_instance_hypervisor_disabled",
+        "dynamic_provision_abandoned",
+    ]
+    (rec,) = [r for r in caplog.records if getattr(r, "action", None) == _DISABLED]
+    assert (rec.request_id, rec.reservation_id, rec.hypervisor_id) == (
+        REQUEST_ID,
+        RES_ID,
+        HYPERVISOR_ID,
+    )
+
+
+_DISABLED = "dynamic_instance_hypervisor_disabled"
+
+
+async def test_disabled_hypervisor_does_not_undo_an_instance_already_active(caplog):
+    """A redelivery for a request whose instance already exists still reports it:
+    the refusal guards creation only, never a finished create."""
+    await _seed_status("ACTIVE with device")
+    calls, execute = _recipe_execute({})
+    callback = AsyncMock()
+    patches = _create_patches(execute, hypervisor={**HYPERVISOR_DATA, "enabled": False})
+    patches.append(
+        patch("app.services.nats_consumer._post_provision_result_best_effort", new=callback)
+    )
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+    assert calls == []
+    assert callback.await_count == 1
+    assert _DISABLED not in _actions(caplog)
+
+
 async def test_ledger_cas_refuses_destroyed_row():
     async with TestSessionLocal() as db:
         await insert_or_get_creating(db, REQUEST_ID, RES_ID, TEMPLATE_ID, HYPERVISOR_ID)
