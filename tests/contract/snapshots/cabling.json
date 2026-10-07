@@ -534,6 +534,7 @@
     "ForkSaveResponse": {
       "properties": {
         "built": "array",
+        "constrained_edges_skipped": "array",
         "element_attachments_skipped": "integer",
         "fork_id": "string",
         "l3_routes_built": "integer",
@@ -778,6 +779,23 @@
       "required": [
         "action",
         "row"
+      ],
+      "type": "object"
+    },
+    "SkippedConstrainedEdgeResponse": {
+      "properties": {
+        "edge_id": "anyOf",
+        "source_device_id": "string",
+        "source_port_name": "anyOf",
+        "target_device_id": "string",
+        "target_port_name": "anyOf"
+      },
+      "required": [
+        "edge_id",
+        "source_device_id",
+        "source_port_name",
+        "target_device_id",
+        "target_port_name"
       ],
       "type": "object"
     },
