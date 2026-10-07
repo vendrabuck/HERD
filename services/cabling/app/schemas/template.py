@@ -3,23 +3,24 @@ from datetime import datetime
 from typing import Any
 
 from app.schemas._types import UUIDStr
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
+# Bounds match the topology schemas (app/schemas/topology.py), issue #1005.
 class TemplateCreate(BaseModel):
-    name: str
-    description: str | None = None
+    name: str = Field(min_length=1, max_length=100)
+    description: str | None = Field(default=None, max_length=2000)
     canvas_data: dict[str, Any] | None = None
 
 
 class TemplateFromTopologyRequest(BaseModel):
-    name: str
-    description: str | None = None
+    name: str = Field(min_length=1, max_length=100)
+    description: str | None = Field(default=None, max_length=2000)
 
 
 class TemplateUpdate(BaseModel):
-    name: str | None = None
-    description: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    description: str | None = Field(default=None, max_length=2000)
     canvas_data: dict[str, Any] | None = None
 
 
@@ -47,5 +48,6 @@ class PaginatedTemplateResponse(BaseModel):
 
 
 class InstantiateRequest(BaseModel):
-    name: str
+    # Names the new topology, so it takes the topology name bound.
+    name: str = Field(min_length=1, max_length=100)
     role_assignments: dict[str, uuid.UUID]

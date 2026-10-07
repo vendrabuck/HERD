@@ -20,7 +20,7 @@ from app.schemas.template import (
     TemplateUpdate,
 )
 from app.schemas.topology import TopologyDetail
-from app.services.canvas_nodes import strip_device_nodes
+from app.services.canvas_nodes import is_device_node, is_element_node, strip_device_nodes
 
 router = APIRouter(prefix="/templates", tags=["topology-templates"])
 
@@ -35,12 +35,51 @@ def _can_manage(template: TopologyTemplate, payload: dict) -> bool:
     return str(template.created_by) == payload["sub"]
 
 
+def _duplicate_name(name: str | None) -> HTTPException:
+    """The one 409 every template write route answers for a name collision."""
+    return HTTPException(status_code=409, detail=f"Template name {name!r} already exists")
+
+
+def _without_stray_device(node: dict[str, Any]) -> dict[str, Any]:
+    """Copy of an element node with any ``data.device`` removed (issue #1005).
+
+    Template saves before #1005 wrote ``device: {role: ...}`` onto element nodes; an
+    element is never a role, so every template read and write drops that key.
+    """
+    n = copy.deepcopy(node)
+    data = n.get("data")
+    if isinstance(data, dict):
+        data.pop("device", None)
+    return n
+
+
+def _normalize_template_canvas(canvas_data: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Drop stray ``data.device`` keys from element nodes; everything else untouched."""
+    if not isinstance(canvas_data, dict):
+        return canvas_data
+    nodes = canvas_data.get("nodes")
+    if not isinstance(nodes, list):
+        return canvas_data
+    if not any(
+        is_element_node(n) and isinstance(n.get("data"), dict) and "device" in n["data"]
+        for n in nodes
+    ):
+        return canvas_data
+    return {
+        **canvas_data,
+        "nodes": [_without_stray_device(n) if is_element_node(n) else n for n in nodes],
+    }
+
+
 def _extract_role_template(canvas_data: dict[str, Any]) -> dict[str, Any]:
     """Walk the canvas and replace each device id with an inferred role label.
 
     Roles are derived from `node.data.device.template_name` plus a counter, so
     repeated templates produce stable `<template>-1`, `<template>-2`, etc.
-    Edges are kept verbatim.
+    Only device nodes (``is_device_node``, the same shape test the rest of cabling
+    uses) become roles; network elements and any other node pass through untouched
+    (issue #1005), an element losing only a stray ``data.device``. Edges are kept
+    verbatim, so element attachments survive the round trip.
     """
     if not canvas_data:
         return {"nodes": [], "edges": []}
@@ -51,9 +90,15 @@ def _extract_role_template(canvas_data: dict[str, Any]) -> dict[str, Any]:
     counters: dict[str, int] = {}
     new_nodes: list[dict[str, Any]] = []
     for node in nodes:
+        if is_element_node(node):
+            new_nodes.append(_without_stray_device(node))
+            continue
+        if not is_device_node(node):
+            new_nodes.append(copy.deepcopy(node))
+            continue
         n = copy.deepcopy(node)
-        data = n.setdefault("data", {})
-        device = data.get("device") or {}
+        data = n["data"]
+        device = data["device"]
         template_name = (
             device.get("template_name") or data.get("label") or "device"
         ).strip().lower().replace(" ", "-") or "device"
@@ -74,8 +119,16 @@ def _instantiate_canvas(
 
     new_nodes: list[dict[str, Any]] = []
     for node in canvas_data.get("nodes") or []:
+        if is_element_node(node):
+            # A stored pre-#1005 template may carry a role on an element node;
+            # an element is never a role, so it is neither demanded nor assigned.
+            new_nodes.append(_without_stray_device(node))
+            continue
+        if not is_device_node(node):
+            new_nodes.append(copy.deepcopy(node))
+            continue
         n = copy.deepcopy(node)
-        device = (n.get("data") or {}).get("device") or {}
+        device = n["data"]["device"]
         role = device.get("role")
         if not role:
             new_nodes.append(n)
@@ -129,7 +182,9 @@ async def create_template(
         description=body.description,
         # A caller-authored template canvas is raw input like any other write
         # boundary: strip before it is ever stored.
-        canvas_data=None if body.canvas_data is None else strip_device_nodes(body.canvas_data),
+        canvas_data=None
+        if body.canvas_data is None
+        else strip_device_nodes(_normalize_template_canvas(body.canvas_data)),
         created_by=uuid.UUID(payload["sub"]),
         owner_name=payload.get("username", ""),
     )
@@ -138,7 +193,7 @@ async def create_template(
         await db.commit()
     except IntegrityError:
         await db.rollback()
-        raise HTTPException(status_code=409, detail=f"Template name {body.name!r} already exists")
+        raise _duplicate_name(body.name)
     await db.refresh(template)
     return template
 
@@ -171,7 +226,11 @@ async def create_template_from_topology(
         owner_name=payload.get("username", ""),
     )
     db.add(template)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise _duplicate_name(body.name)
     await db.refresh(template)
     return template
 
@@ -188,7 +247,9 @@ async def get_template(
     # Read-side strip (belt and braces, see routes/topologies.py's
     # get_topology): never mutates the ORM object, only the response value.
     detail = TemplateDetail.model_validate(template)
-    detail.canvas_data = strip_device_nodes(detail.canvas_data)
+    # Also drop a stray pre-#1005 role off element nodes, so a stored legacy
+    # template never lists an element as a role to assign.
+    detail.canvas_data = strip_device_nodes(_normalize_template_canvas(detail.canvas_data))
     return detail
 
 
@@ -210,12 +271,12 @@ async def update_template(
     if body.description is not None:
         template.description = body.description
     if body.canvas_data is not None:
-        template.canvas_data = strip_device_nodes(body.canvas_data)
+        template.canvas_data = strip_device_nodes(_normalize_template_canvas(body.canvas_data))
     try:
         await db.commit()
     except IntegrityError:
         await db.rollback()
-        raise HTTPException(status_code=409, detail=f"Template name {body.name!r} already exists")
+        raise _duplicate_name(body.name)
     await db.refresh(template)
     return template
 

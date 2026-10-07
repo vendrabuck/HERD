@@ -1079,29 +1079,34 @@ editor's Save as Template; the seven `/templates` routes in section 5.
   is 409 `Template name '<name>' already exists`. \
   Enforced in: `services/cabling/app/routes/templates.py` (`create_template`); `services/cabling/app/models/template.py` (`TopologyTemplate`) \
   Pinned by: `services/cabling/tests/test_templates.py` (`test_create_blank_template`, `test_unique_template_name`); `services/cabling/tests/test_route_handlers_direct.py` (`test_template_create_duplicate_name_409`)
-- **TOPO-TMPL-3.** Template `name` and `description` carry no length bound in the request
-  schema; an empty name is accepted. Known gap, see #1005. \
-  Enforced in: `services/cabling/app/schemas/template.py` (`TemplateCreate`, `TemplateUpdate`, `TemplateFromTopologyRequest`) \
-  Pinned by: none
+- **TOPO-TMPL-3.** Template `name` takes the topology name bound (1 to 100 characters)
+  and `description` the topology description bound (2000 characters) on create, update,
+  and from-topology; the instantiate `name` names a topology and takes the same name
+  bound. A value outside the bound is 422. \
+  Enforced in: `services/cabling/app/schemas/template.py` (`TemplateCreate`, `TemplateUpdate`, `TemplateFromTopologyRequest`, `InstantiateRequest`) \
+  Pinned by: `services/cabling/tests/test_schema_bounds.py` (`test_template_name_bounds`, `test_template_description_bounds`, `test_template_update_name_bounds`, `test_instantiate_name_bounds`); `services/cabling/tests/test_templates.py` (`test_template_name_bounds_are_422_on_every_write_route`, `test_template_name_at_cap_accepted`)
 - **TOPO-TMPL-4.** Updating or deleting a template is creator or admin (403 otherwise); an
   update changes only the fields sent and a duplicate name is 409. \
   Enforced in: `services/cabling/app/routes/templates.py` (`update_template`, `delete_template`, `_can_manage`) \
   Pinned by: `services/cabling/tests/test_templates.py` (`test_update_template_owner`, `test_update_template_other_user_forbidden`, `test_update_template_admin_can_edit`, `test_delete_template_owner`, `test_delete_template_other_user_forbidden`); `services/cabling/tests/test_route_handlers_direct.py` (`test_template_update_duplicate_name_409`)
-- **TOPO-TMPL-5.** Any signed-in user may make a template from any topology: every node's
-  `data.device` becomes `{role}`, the role being the device's `template_name` (else the
+- **TOPO-TMPL-5.** Any signed-in user may make a template from any topology: every device
+  node's `data.device` becomes `{role}`, the role being the device's `template_name` (else the
   node label, else `device`) lowercased with spaces as hyphens plus a per-name counter;
   edges are copied unchanged, and a null canvas gives an empty template. \
   Enforced in: `services/cabling/app/routes/templates.py` (`create_template_from_topology`, `_extract_role_template`) \
   Pinned by: `services/cabling/tests/test_templates.py` (`test_from_topology_extracts_roles`, `test_from_topology_not_found`); `services/cabling/tests/test_route_handlers_direct.py` (`test_template_from_topology_empty_canvas`)
-- **TOPO-TMPL-6.** That role rewrite applies to every node, including network element
-  nodes, which come out carrying both `data.element` and a `data.device.role`. Known
-  gap, see #1005. \
-  Enforced in: `services/cabling/app/routes/templates.py` (`_extract_role_template`) \
-  Pinned by: none
-- **TOPO-TMPL-7.** Making a template from a topology under a name that already exists is
-  not caught: the unique constraint's error escapes as a 500. Known gap, see #1005. \
-  Enforced in: `services/cabling/app/routes/templates.py` (`create_template_from_topology`) \
-  Pinned by: none
+- **TOPO-TMPL-6.** Only device nodes become roles (`is_device_node`: an object under
+  `data.device` on a node that is not a network element). Network element nodes and every
+  other node pass through unchanged, so element attachments survive the round trip. A
+  template stored before #1005 may carry a role on an element node: template reads and
+  writes drop that `data.device`, and instantiate neither demands nor assigns a device
+  for it, so no data migration is needed. \
+  Enforced in: `services/cabling/app/routes/templates.py` (`_extract_role_template`, `_instantiate_canvas`, `_normalize_template_canvas`); `services/cabling/app/services/canvas_nodes.py` (`is_device_node`, `is_element_node`) \
+  Pinned by: `services/cabling/tests/test_templates.py` (`test_element_survives_save_as_template_and_instantiate`, `test_legacy_template_role_on_element_is_ignored`)
+- **TOPO-TMPL-7.** Every template write route (create, update, from-topology) answers a
+  taken name with the same 409 `Template name '<name>' already exists`. \
+  Enforced in: `services/cabling/app/routes/templates.py` (`create_template_from_topology`, `_duplicate_name`) \
+  Pinned by: `services/cabling/tests/test_templates.py` (`test_duplicate_name_is_409_from_every_write_route`)
 - **TOPO-TMPL-8.** Instantiate requires an assignment for every role on the canvas (422
   `missing assignment for role '<role>'` otherwise), writes the assigned id into each
   role node's `data.device.id`, leaves nodes without a role unchanged, and creates a
@@ -1574,7 +1579,7 @@ other error carries `detail` as a string or the object shown.
 | 409 | `{message, reservations: [{id, status, end_time}]}` | topology PUT blocked by another user's live reservation | TOPO-EDIT-4 |
 | 409 | `{message, reservations: [...]}` with message `Topology has active reservations; restore blocked` | topology version restore while any live reservation references it | TOPO-VER-5 |
 | 409 | `{"error": "topology_in_use", "reservation_ids": [...]}` | delete while a live reservation references the topology | TOPO-DEL-2 |
-| 409 | `Template name '<name>' already exists` | template create or update with a taken name | TOPO-TMPL-2, TOPO-TMPL-4 |
+| 409 | `Template name '<name>' already exists` | template create, update, or from-topology with a taken name | TOPO-TMPL-2, TOPO-TMPL-4, TOPO-TMPL-7 |
 | 409 | `Fork is archived and cannot be edited` | canvas PUT, save, restore, or prune on an archived fork | TOPO-FSTATE-3, TOPO-FSTATE-4 |
 | 409 | `{"error": "fork_device_not_member", "device_ids": [...]}` | fork create or save naming a device outside the reservation | TOPO-FORK-3, TOPO-FORK-13 |
 | 409 | `{message, conflicts: [{reservation_id, device_id, port}]}` | fork create or save claiming a port another active fork holds | TOPO-CLAIM-1 |
@@ -1587,7 +1592,6 @@ other error carries `detail` as a string or the object shown.
 | 422 | `{"error": "l3_intent_malformed", "node_id", "message"}` | fork save with malformed routing intent | TOPO-FORK-14 |
 | 422 | validation list | a schema bound: name lengths, bulk item count, pair count, unknown sort or owner value, missing `member_device_ids`, missing internal token header, devices batch size | TOPO-CONN-2, TOPO-CONN-12, TOPO-PATH-7, TOPO-LIST-4, TOPO-CRUD-1, TOPO-FORK-3, TOPO-FORK-13, TOPO-DEVB-1 |
 | 500 | `internal: missing Authorization header while resolving device visibility` | a non-admin request reaching a visibility-filtered route with no header (only a test harness does this) | TOPO-VIS-1 |
-| 500 | unhandled | template from-topology under a taken name | TOPO-TMPL-7 |
 | 503 | the route's own visibility wording, for example `Could not verify device visibility; connections were not returned. Retry the request.` | a non-admin's visibility lookup failed | TOPO-CONN-7, TOPO-PATH-11, TOPO-VAL-11, TOPO-BULK-11 |
 | 503 | `Could not verify device-group membership for one or more devices in this batch; no connections were created. Retry the request.` | bulk create with an unverifiable device | TOPO-BOUND-4 |
 | 503 | `Could not verify topology is not in use` | delete guard could not read reservations | TOPO-DEL-3 |
@@ -1662,9 +1666,6 @@ TOPO-BULK-4.
 - #1006 (TOPO-BULK-4): CSV export fills the port columns from a legacy field or the
   canvas handle name, not the port names the editor stores, and CSV import writes a
   field the fork resolver does not read.
-- #1005 (TOPO-TMPL-6, TOPO-TMPL-7, TOPO-TMPL-3): making a template from a topology
-  rewrites network element nodes as device roles; the same route answers 500 for a
-  taken name; template name and description have no bounds.
 - #1007 (TOPO-VAL-5, TOPO-FORK-18): validation judges the device pair only, while the
   fork save honors per-edge ports and skips an unresolvable constrained edge without
   reporting it, so validation can call valid an edge the save builds nothing for.
@@ -1721,9 +1722,6 @@ TOPO-BULK-4.
 - TOPO-STRIP-4: a PUT differing only in a non-allowlisted device key appending no
   version.
 - TOPO-FORK-25: the fork read returning hidden transit hops unredacted.
-- TOPO-TMPL-3: template names and descriptions unbounded.
-- TOPO-TMPL-6: element nodes given a role by from-topology.
-- TOPO-TMPL-7: from-topology under a taken name.
 - TOPO-TMPL-9: instantiate not checking assigned device ids.
 - TOPO-BULK-4: CSV export of editor-drawn port names.
 - TOPO-UILIST-3: the empty search saved over the stored one (issue #985).

@@ -383,8 +383,12 @@ async def test_template_from_topology_extracts_roles():
             payload=_payload(),
             db=db,
         )
-    roles = [n["data"]["device"]["role"] for n in result.canvas_data["nodes"]]
-    assert roles == ["pa-vm-1", "pa-vm-2", "leaf-switch-1"]
+    nodes = result.canvas_data["nodes"]
+    roles = [n["data"]["device"]["role"] for n in nodes[:2]]
+    assert roles == ["pa-vm-1", "pa-vm-2"]
+    # A node with no data.device is not a device node (issue #1005: the same shape
+    # test the rest of cabling uses), so it is not a role and passes through as is.
+    assert nodes[2] == canvas["nodes"][2]
     assert result.canvas_data["edges"] == canvas["edges"]
 
 

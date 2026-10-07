@@ -265,9 +265,8 @@ async def test_unique_template_name(user_client):
     a = await user_client.post("/templates", json={"name": "dup"})
     assert a.status_code == 201
     b = await user_client.post("/templates", json={"name": "dup"})
-    # Sqlite reports unique violation as a 500 unless caught; ensure the API
-    # at least does not silently succeed with two rows.
-    assert b.status_code != 201
+    assert b.status_code == 409
+    assert b.json()["detail"] == "Template name 'dup' already exists"
 
 
 @pytest.mark.asyncio
@@ -277,3 +276,157 @@ async def test_instantiate_not_found(user_client):
         json={"name": "x", "role_assignments": {}},
     )
     assert resp.status_code == 404
+
+
+_DUP_DETAIL = "Template name 'taken' already exists"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_name_is_409_from_every_write_route(user_client):
+    """Issue #1005: create, update, and from-topology answer the same 409."""
+    taken = await user_client.post("/templates", json={"name": "taken"})
+    assert taken.status_code == 201
+
+    create = await user_client.post("/templates", json={"name": "taken"})
+    assert create.status_code == 409
+    assert create.json()["detail"] == _DUP_DETAIL
+
+    other = await user_client.post("/templates", json={"name": "other"})
+    update = await user_client.put(f"/templates/{other.json()['id']}", json={"name": "taken"})
+    assert update.status_code == 409
+    assert update.json()["detail"] == _DUP_DETAIL
+
+    topo = await user_client.post("/topologies", json={"name": "Src"})
+    from_topo = await user_client.post(
+        f"/templates/from-topology/{topo.json()['id']}", json={"name": "taken"}
+    )
+    assert from_topo.status_code == 409
+    assert from_topo.json()["detail"] == _DUP_DETAIL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["", "x" * 101])
+async def test_template_name_bounds_are_422_on_every_write_route(user_client, name):
+    """Issue #1005: names take the topology bound (1 to 100)."""
+    assert (await user_client.post("/templates", json={"name": name})).status_code == 422
+    ok = await user_client.post("/templates", json={"name": "ok"})
+    assert (
+        await user_client.put(f"/templates/{ok.json()['id']}", json={"name": name})
+    ).status_code == 422
+    topo = await user_client.post("/topologies", json={"name": "Src"})
+    assert (
+        await user_client.post(f"/templates/from-topology/{topo.json()['id']}", json={"name": name})
+    ).status_code == 422
+    assert (
+        await user_client.post(
+            f"/templates/{ok.json()['id']}/instantiate",
+            json={"name": name, "role_assignments": {}},
+        )
+    ).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_template_name_at_cap_accepted(user_client):
+    resp = await user_client.post("/templates", json={"name": "x" * 100})
+    assert resp.status_code == 201
+
+
+_ELEMENT_ID = "11111111-1111-1111-1111-111111111111"
+
+
+def _device_element_canvas(device_id: str) -> dict:
+    return {
+        "nodes": [
+            {
+                "id": "d1",
+                "type": "deviceNode",
+                "data": {"device": {"id": device_id, "template_name": "Leaf"}},
+            },
+            {
+                "id": "el1",
+                "type": "networkElementNode",
+                "data": {
+                    "element": {
+                        "id": _ELEMENT_ID,
+                        "element_type": "vlan",
+                        "label": "VLAN 10",
+                        "attrs": {"vlan_id": 10},
+                    }
+                },
+            },
+        ],
+        "edges": [
+            {
+                "id": "att1",
+                "source": "d1",
+                "target": "el1",
+                "data": {"source_port_name": "ge-0/0/1"},
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_element_survives_save_as_template_and_instantiate(user_client):
+    """Issue #1005: an element node is not a role; it round-trips intact."""
+    topo = await user_client.post("/topologies", json={"name": "Src"})
+    topology_id = topo.json()["id"]
+    canvas = _device_element_canvas(str(uuid.uuid4()))
+    await user_client.put(f"/topologies/{topology_id}", json={"canvas_data": canvas})
+
+    saved = await user_client.post(
+        f"/templates/from-topology/{topology_id}", json={"name": "with-element"}
+    )
+    assert saved.status_code == 201
+    nodes = {n["id"]: n for n in saved.json()["canvas_data"]["nodes"]}
+    assert nodes["d1"]["data"]["device"] == {"role": "leaf-1"}
+    assert nodes["el1"] == canvas["nodes"][1]
+    assert saved.json()["canvas_data"]["edges"] == canvas["edges"]
+
+    dev = str(uuid.uuid4())
+    inst = await user_client.post(
+        f"/templates/{saved.json()['id']}/instantiate",
+        json={"name": "Lab", "role_assignments": {"leaf-1": dev}},
+    )
+    assert inst.status_code == 201
+    out = {n["id"]: n for n in inst.json()["canvas_data"]["nodes"]}
+    assert out["d1"]["data"]["device"] == {"role": "leaf-1", "id": dev}
+    assert out["el1"] == canvas["nodes"][1]
+    assert "device" not in out["el1"]["data"]
+    assert inst.json()["canvas_data"]["edges"] == canvas["edges"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_template_role_on_element_is_ignored(user_client):
+    """A pre-#1005 stored template with a role on an element node: reads drop it and
+    instantiate neither demands nor assigns a device for it (no data migration)."""
+    from app.models.template import TopologyTemplate
+
+    legacy = _device_element_canvas("unused")
+    legacy["nodes"][0]["data"]["device"] = {"role": "leaf-1"}
+    legacy["nodes"][1]["data"]["device"] = {"role": "vlan-10-1"}
+    async with TestSessionLocal() as session:
+        row = TopologyTemplate(
+            name="legacy",
+            canvas_data=legacy,
+            created_by=uuid.UUID(USER_ID),
+            owner_name="viewer",
+        )
+        session.add(row)
+        await session.commit()
+        template_id = str(row.id)
+
+    read = await user_client.get(f"/templates/{template_id}")
+    assert read.status_code == 200
+    el = [n for n in read.json()["canvas_data"]["nodes"] if n["id"] == "el1"][0]
+    assert "device" not in el["data"]
+
+    dev = str(uuid.uuid4())
+    inst = await user_client.post(
+        f"/templates/{template_id}/instantiate",
+        json={"name": "Lab", "role_assignments": {"leaf-1": dev}},
+    )
+    assert inst.status_code == 201
+    out = {n["id"]: n for n in inst.json()["canvas_data"]["nodes"]}
+    assert "device" not in out["el1"]["data"]
+    assert out["el1"]["data"]["element"]["id"] == _ELEMENT_ID
