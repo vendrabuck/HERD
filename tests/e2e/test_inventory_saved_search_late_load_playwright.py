@@ -1,4 +1,4 @@
-"""Inventory saved search that loads after mount (issue #982), in a real browser.
+"""Inventory saved search that loads after mount (issues #982 and #985), in a real browser.
 
 On a full load of /inventory the page renders before the user's preferences
 arrive. A saved search that then arrives must apply to the list at once, and a
@@ -131,6 +131,82 @@ def test_late_loading_saved_search_survives_an_immediate_filter_change(pw_page):
         pw_page.reload()
         expect(pw_page.get_by_placeholder("Search devices by name...")).to_have_value(saved_search)
         expect(pw_page.get_by_label("Status", exact=True)).to_have_value("MAINTENANCE")
+    finally:
+        pw_api(
+            pw_page,
+            "PATCH",
+            "/user-profile/preferences",
+            json={"saved_filters": {"inventory": baseline}},
+            allow_errors=True,
+        )
+        restored = _read_inventory_pref(pw_page)
+        if restored != baseline:
+            pytest.fail(f"inventory preference not restored: {restored!r} != {baseline!r}")
+
+
+def _is_prefs_patch(request) -> bool:
+    return request.method == "PATCH" and "/user-profile/preferences" in request.url
+
+
+def test_filter_change_while_preferences_load_is_held_keeps_saved_search(pw_page):
+    """Issue #985: the Status change lands BEFORE the preferences GET returns.
+
+    The page builds that write from the unloaded defaults (an empty search). No
+    preference PATCH may leave the browser while the GET is held, and the one sent
+    after it resolves must carry the saved search plus the changed Status.
+    """
+    pw_login(pw_page)
+    saved_search = f"e2e-985-{uuid.uuid4().hex[:10]}"
+    baseline = _read_inventory_pref(pw_page)
+    held: list = []
+    patches: list = []
+
+    def hold_prefs_get(route):
+        if route.request.method == "GET":
+            held.append(route)
+        else:
+            route.continue_()
+
+    try:
+        pw_api(
+            pw_page,
+            "PATCH",
+            "/user-profile/preferences",
+            json={"saved_filters": {"inventory": {"search": saved_search}}},
+        )
+        assert _read_inventory_pref(pw_page) == {"search": saved_search}
+
+        pw_page.on("request", lambda r: patches.append(r) if _is_prefs_patch(r) else None)
+        pw_page.route(PREFS_GLOB, hold_prefs_get)
+        try:
+            with pw_page.expect_request(_is_page_list_request):
+                pw_page.goto(f"{HOST_BASE_URL}/inventory")
+            status_select = pw_page.get_by_label("Status", exact=True)
+            expect(status_select).to_be_visible()
+            assert held, "the preferences GET was not held"
+
+            status_select.select_option("MAINTENANCE")
+            # Well past the 200 ms preference debounce: a write built from the
+            # unloaded state would have been sent by now.
+            pw_page.wait_for_timeout(600)
+            assert patches == [], "a preference PATCH left while the GET was held"
+
+            with pw_page.expect_response(
+                lambda r: _inventory_patch_with_status(r, "MAINTENANCE")
+            ) as patch_info:
+                for route in held:
+                    route.continue_()
+        finally:
+            pw_page.unroute(PREFS_GLOB, hold_prefs_get)
+
+        sent = json.loads(patch_info.value.request.post_data or "{}")
+        assert sent["saved_filters"]["inventory"] == {
+            "search": saved_search,
+            "status": "MAINTENANCE",
+        }
+        assert _read_inventory_pref(pw_page) == {"search": saved_search, "status": "MAINTENANCE"}
+        expect(pw_page.get_by_placeholder("Search devices by name...")).to_have_value(saved_search)
+        expect(status_select).to_have_value("MAINTENANCE")
     finally:
         pw_api(
             pw_page,

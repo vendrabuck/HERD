@@ -26,7 +26,8 @@ vi.mock("@/api/userProfile", () => ({
 import { server } from "../mocks/server";
 import { InventoryPage } from "@/pages/InventoryPage";
 import { useAuthStore } from "@/stores/authStore";
-import { usePreferencesStore } from "@/stores/preferencesStore";
+import { usePreferencesStore, _flushPendingPatchForTest } from "@/stores/preferencesStore";
+import { getPreferences } from "@/api/userProfile";
 
 function renderWithProviders(node: ReactNode) {
   const client = new QueryClient({
@@ -108,6 +109,9 @@ beforeEach(() => {
     updated_at: "",
   });
   usePreferencesStore.getState().clear();
+  // These tests model a store whose preferences GET has resolved; a write
+  // made before the load is held until it settles (issue #985).
+  usePreferencesStore.setState({ loaded: true });
 });
 
 describe("InventoryPage", () => {
@@ -1117,6 +1121,46 @@ describe("InventoryPage", () => {
       const inRow = within(screen.getByText(/No devices match/).closest("td") as HTMLElement);
       fireEvent.click(inRow.getByRole("button", { name: "Clear filters" }));
       await waitFor(() => expect(screen.getByText("dev-a")).toBeInTheDocument());
+    });
+
+    // Issue #985: a filter change made while the preferences GET is still in
+    // flight. The page builds its write from the unloaded defaults (an empty
+    // search); the store must hold it and save it merged over the loaded value.
+    it("a filter change made before the preferences load keeps the saved search (issue #985)", async () => {
+      let resolveGet!: (value: unknown) => void;
+      (getPreferences as unknown as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+        new Promise((res) => {
+          resolveGet = res;
+        }),
+      );
+      usePreferencesStore.getState().clear();
+      const loading = usePreferencesStore.getState().load();
+      const requests = setup();
+      await ready();
+      pick("Status", "OFFLINE");
+      _flushPendingPatchForTest();
+      expect(patchPreferencesMock).not.toHaveBeenCalled();
+
+      await act(async () => {
+        resolveGet({
+          user_id: "u",
+          saved_filters: { inventory: { search: "foo" } },
+          page_sizes: {},
+          extras: {},
+          updated_at: "",
+        });
+        await loading;
+      });
+      await waitFor(() => expect(last(requests).get("search")).toBe("foo"));
+      expect(last(requests).get("status")).toBe("OFFLINE");
+      expect(
+        (screen.getByPlaceholderText("Search devices by name...") as HTMLInputElement).value,
+      ).toBe("foo");
+      _flushPendingPatchForTest();
+      expect(patchPreferencesMock).toHaveBeenCalledTimes(1);
+      expect(patchPreferencesMock.mock.calls[0][0].saved_filters).toEqual({
+        inventory: { search: "foo", status: "OFFLINE" },
+      });
     });
 
     // Issue #982: the preferences arrive after the first list request, as on a

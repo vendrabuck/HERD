@@ -433,11 +433,12 @@ deleted, and can be booked.
   and reports the true connection total, not the capped id sample. \
   Enforced in: `frontend/src/api/inventory.ts` (`deleteDeviceErrorMessage`) \
   Pinned by: `frontend/src/test/api/deleteDeviceErrorMessage.test.ts` (`names a single transit-only reservation`, `mentions both causes when the device is a member and a transit hop`, `reports the true total, not the capped id sample`)
-- **INV-DEV-15.** The device page's Save sends the name, topology type, status, and
-  `field_data` held in the edit form, including a status read when the page loaded.
-  Known gap, see #1020. \
-  Enforced in: `frontend/src/pages/DevicePage.tsx` (`handleSave`) \
-  Pinned by: none
+- **INV-DEV-15.** Edit copies the device as it stands at that moment into the form, and
+  the device page's Save sends only the fields the admin changed since then (name,
+  topology type, status, or the whole `field_data` object); a status the admin did not
+  touch is never sent, and a save with no change sends nothing (issue #1020). \
+  Enforced in: `frontend/src/lib/deviceEdit.ts` (`deviceEditPayload`); `frontend/src/pages/DevicePage.tsx` (`DevicePage`) \
+  Pinned by: `frontend/src/test/pages/DevicePage.test.tsx` (`a rename does not write back a status that changed server-side after the page loaded`, `Edit starts from the current device, not the copy taken when the page opened`, `saving with nothing changed sends no request and leaves edit mode`); `frontend/src/test/lib/deviceEdit.test.ts` (`sends only the changed name, trimmed, and never the status`)
 
 **Out of scope.** Changing a device's template: the update body has no template
 field. The configuration section of the device page and the ports section's
@@ -610,9 +611,10 @@ filter reads the first 500 device templates.
   Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`falls back to All for a stale saved status, topology, or template and never sends them`, `a stale saved template is dropped from the next write while other fields persist`)
 - **INV-LIST-9.** A saved search applies at once, never through the debounce; typing is
   debounced 300 ms before it is applied and saved. A filter change made before the
-  preferences finish loading saves an empty search. Known gap, see #985. \
-  Enforced in: `frontend/src/pages/InventoryPage.tsx` (`InventoryPage`) \
-  Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`a saved search that loads after mount applies at once and survives a filter change`, `typing after the load still debounces, then applies and persists the typed value`, `debounces user input into the query and persists it as a saved filter`)
+  preferences finish loading is held until they arrive and then saved merged over the
+  loaded filter, so it never saves an empty search over the saved one (issue #985). \
+  Enforced in: `frontend/src/pages/InventoryPage.tsx` (`InventoryPage`); `frontend/src/stores/preferencesStore.ts` (`usePreferencesStore`, `mergePreLoadFilter`) \
+  Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`a filter change made before the preferences load keeps the saved search (issue #985)`, `a saved search that loads after mount applies at once and survives a filter change`, `typing after the load still debounces, then applies and persists the typed value`, `debounces user input into the query and persists it as a saved filter`)
 - **INV-LIST-10.** Clear filters resets the search and every filter, the request, and
   the saved state; an empty filtered result shows a second Clear filters control. \
   Enforced in: `frontend/src/pages/InventoryPage.tsx` (`InventoryPage`) \
@@ -1390,15 +1392,9 @@ INV-PORT-6, by a throwaway script against the service on SQLite with foreign key
 
 ### Open defects
 
-- #985 (INV-LIST-9): a filter change made before the preferences load saves an empty
-  search over the saved one.
 - #1017 (INV-BULK-18): a dry run skips the create and update service calls, so the
   checks they own (unknown field keys, the template-driver connection-type rule,
   hardware identity) do not run, and the commit can reject a row the dry run accepted.
-- #1020 (INV-DEV-15): the device page saves the status loaded when the page opened, so
-  a status change made elsewhere in the meantime is overwritten. The admin status write
-  itself ignoring reservation holds is intended (INV-STATUS-9, under Limits by
-  decision).
 - #1023 (INV-PORT-8): a port delete has no cabling guard, and neither has a port
   rename (INV-PORT-7 changes the name with no cabling check), so a connection can name
   a port that no longer exists under that name.
@@ -1438,7 +1434,6 @@ exist); #1025 tracks the corrections.
 - INV-STATUS-9: an admin status write ignores reservation holds.
 - INV-TPL-6: a key repeated across sections.
 - INV-TPL-24: a template's type cannot change.
-- INV-DEV-15: the device page saves the status it loaded.
 - INV-RED-4: redaction covers only the template's password keys.
 - INV-BATCH-4: the batch does not force `dut_only`.
 - INV-PORT-9: repeated port names on one device.

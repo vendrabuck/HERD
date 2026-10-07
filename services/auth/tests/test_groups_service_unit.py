@@ -4,8 +4,10 @@ import uuid
 
 import pytest
 from app.database import Base
+from app.models.group import GroupMember
 from app.services.auth_service import create_user
 from app.services.group_service import (
+    UnknownUsersError,
     add_member,
     bulk_add_members,
     bulk_remove_members,
@@ -20,6 +22,7 @@ from app.services.group_service import (
     remove_member,
     update_group,
 )
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -322,6 +325,33 @@ async def test_bulk_add_members_all_new():
         added, skipped = await bulk_add_members(db, group.id, [u1.id, u2.id])
         assert added == 2
         assert skipped == 0
+
+
+# Issue #1009: an unknown user id used to be inserted and fail the user foreign
+# key at commit (a 500 on Postgres, which always enforces it). The ids are now
+# checked with one SELECT before any insert, so the refusal does not depend on
+# the database enforcing the key; this in-memory SQLite (keys off) is enough.
+@pytest.mark.asyncio
+async def test_bulk_add_members_unknown_id_refuses_all_and_adds_nothing():
+    async with TestSessionLocal() as db:
+        group = await _make_group(db, "BulkUnknown")
+        u1 = await _make_user(db, "u1@t.com", "user1")
+        ghost_a, ghost_b = uuid.uuid4(), uuid.uuid4()
+        with pytest.raises(UnknownUsersError) as info:
+            await bulk_add_members(db, group.id, [ghost_a, u1.id, ghost_b, ghost_a])
+        # Every unknown id once, in request order.
+        assert info.value.user_ids == [ghost_a, ghost_b]
+        rows = await db.execute(select(GroupMember).where(GroupMember.group_id == group.id))
+        assert rows.scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_bulk_add_members_existing_member_still_skipped_with_known_ids():
+    async with TestSessionLocal() as db:
+        group = await _make_group(db, "BulkKnown")
+        u1 = await _make_user(db, "u1@t.com", "user1")
+        await add_member(db, group.id, u1.id)
+        assert await bulk_add_members(db, group.id, [u1.id, u1.id]) == (0, 2)
 
 
 # --- bulk_remove_members ---

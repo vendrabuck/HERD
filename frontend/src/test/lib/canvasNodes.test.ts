@@ -1,7 +1,13 @@
 import { describe, it, expect } from "vitest";
 import type { Node } from "@xyflow/react";
 
-import { collectCanvasDeviceIds, persistableDevice, persistableCanvasNodes } from "@/lib/canvasNodes";
+import {
+  collectCanvasDeviceIds,
+  isDeviceNode,
+  persistableDevice,
+  persistableCanvasNodes,
+} from "@/lib/canvasNodes";
+import { selectRoutingPanelNode } from "@/lib/l3";
 import type { CanvasNodeData, DeviceNodeData, NetworkElementNodeData } from "@/types/topology.types";
 import type { Device } from "@/types/device.types";
 
@@ -167,5 +173,44 @@ describe("collectCanvasDeviceIds", () => {
   it("dedupes when two device nodes reference the same inventory device", () => {
     const nodes = [deviceNode("n1", "dev-1"), deviceNode("n2", "dev-1")];
     expect(collectCanvasDeviceIds(nodes)).toEqual(new Set(["dev-1"]));
+  });
+});
+
+// Issue #989: a stored node typed deviceNode whose data has no `device` (the
+// seeded "BROKEN - Half-Wired Chain" shape). persistableDevice once ran on it
+// and threw "Cannot use 'in' operator to search for 'id' in undefined".
+describe("a deviceNode-typed node with no device (issue #989)", () => {
+  const deviceLess = (id: string, data: unknown = {}): Node<CanvasNodeData> => ({
+    id,
+    type: "deviceNode",
+    position: { x: 0, y: 0 },
+    data: data as CanvasNodeData,
+  });
+
+  it("is not a device node, whatever empty shape its data has", () => {
+    expect(isDeviceNode(deviceLess("n1"))).toBe(false);
+    expect(isDeviceNode(deviceLess("n2", { device: null }))).toBe(false);
+    expect(isDeviceNode(deviceLess("n3", { device: "dev-1" }))).toBe(false);
+    expect(isDeviceNode(deviceLess("n4", { label: "x" }))).toBe(false);
+  });
+
+  it("a thin device reference still counts as a device node", () => {
+    expect(isDeviceNode(deviceLess("n1", { device: { id: "dev-1" } }))).toBe(true);
+  });
+
+  it("persistableCanvasNodes passes it through untouched instead of throwing", () => {
+    const node = deviceLess("n1");
+    const result = persistableCanvasNodes([deviceNode("n0", "dev-1"), node]);
+    expect(result[1]).toBe(node);
+  });
+
+  it("collectCanvasDeviceIds skips it", () => {
+    expect(collectCanvasDeviceIds([deviceNode("n0", "dev-1"), deviceLess("n1")])).toEqual(
+      new Set(["dev-1"]),
+    );
+  });
+
+  it("selecting it opens no Routing panel", () => {
+    expect(selectRoutingPanelNode([{ ...deviceLess("n1"), selected: true }], false)).toBeNull();
   });
 });

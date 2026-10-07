@@ -54,6 +54,7 @@ vi.mock("@/api/ai", () => ({
 }));
 
 import { TemplateEditorPage } from "@/pages/TemplateEditorPage";
+import { TOAST_CLEARANCE_CLASS } from "@/lib/toastClearance";
 
 const DEVICE_DRIVER = {
   id: "d1",
@@ -104,6 +105,17 @@ describe("TemplateEditorPage (create flow)", () => {
     mockUseTemplate.mockReturnValue({ data: undefined, isLoading: false });
     mockUseDrivers.mockReturnValue({ data: [DEVICE_DRIVER, HYPERVISOR_DRIVER] });
     mockUseHypervisors.mockReturnValue({ data: [HYPERVISOR] });
+  });
+
+  // Issue #988: the page ends in the full-width "+ Add Section" button at the
+  // bottom centre, where toasts appear; the content carries the bottom padding
+  // that lets it scroll clear of a stack of three toasts.
+  it("pads the page end so the last control can scroll clear of the toasts (issue #988)", () => {
+    render(<TemplateEditorPage />);
+    const addSection = screen.getByRole("button", { name: "+ Add Section" });
+    const content = addSection.closest(".max-w-4xl") as HTMLElement;
+    expect(content.className.split(/\s+/)).toContain(TOAST_CLEARANCE_CLASS);
+    expect(TOAST_CLEARANCE_CLASS).toBe("pb-56");
   });
 
   it("offers a Dynamic (Hypervisor) type option", () => {

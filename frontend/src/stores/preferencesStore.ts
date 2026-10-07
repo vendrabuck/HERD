@@ -57,6 +57,70 @@ function scheduleFlush() {
   patchTimer = setTimeout(flush, PATCH_DEBOUNCE_MS);
 }
 
+// Writes made before the preferences GET resolves (issue #985). A page builds
+// its filter object from whatever the store holds, and before the load that is
+// the defaults (an empty search), so sending such an object as it stands would
+// overwrite the saved values with defaults the user never chose. Until `loaded`
+// is true nothing is sent: each write is recorded here, and when the load
+// settles the store applies only what the user changed on top of the loaded
+// value and queues the merged result once.
+interface PreLoadFilterWrite {
+  latest: unknown;
+  // Keys of an object filter the user changed. null means the filter was not
+  // a plain object, so the whole value is the user's choice.
+  touched: Set<string> | null;
+}
+
+let preLoadFilters: Record<string, PreLoadFilterWrite> = {};
+let preLoadPageSizes: Record<string, number> = {};
+let preLoadExtras: Record<string, unknown> = {};
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// Every page filter serializes its defaults as absent or the empty string, so
+// absent, null, and "" are the same unchosen value when comparing writes.
+function isUnset(value: unknown): boolean {
+  return value === undefined || value === null || value === "";
+}
+
+function sameFilterValue(a: unknown, b: unknown): boolean {
+  if (isUnset(a) && isUnset(b)) return true;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function recordPreLoadFilter(page: string, filter: unknown) {
+  const prior = preLoadFilters[page];
+  if (!isPlainObject(filter) || (prior && prior.touched === null)) {
+    preLoadFilters[page] = { latest: filter, touched: null };
+    return;
+  }
+  const previous = prior && isPlainObject(prior.latest) ? prior.latest : {};
+  const touched = new Set(prior?.touched ?? []);
+  for (const key of new Set([...Object.keys(previous), ...Object.keys(filter)])) {
+    if (!sameFilterValue(previous[key], filter[key])) touched.add(key);
+  }
+  preLoadFilters[page] = { latest: filter, touched };
+}
+
+function mergePreLoadFilter(loaded: unknown, write: PreLoadFilterWrite): unknown {
+  if (write.touched === null) return write.latest;
+  const latest = write.latest as Record<string, unknown>;
+  const merged: Record<string, unknown> = isPlainObject(loaded) ? { ...loaded } : {};
+  for (const key of write.touched) {
+    if (key in latest) merged[key] = latest[key];
+    else delete merged[key];
+  }
+  return merged;
+}
+
+function resetPreLoadWrites() {
+  preLoadFilters = {};
+  preLoadPageSizes = {};
+  preLoadExtras = {};
+}
+
 function queuePatch(partial: PreferencesPatch) {
   pendingPatch = {
     saved_filters: { ...(pendingPatch.saved_filters ?? {}), ...(partial.saved_filters ?? {}) },
@@ -73,23 +137,49 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
   loaded: false,
 
   load: async () => {
+    let savedFilters: Record<string, unknown> = {};
+    let pageSizes: Record<string, number> = {};
+    let extras: Record<string, unknown> = {};
     try {
       const prefs = await getPreferences();
-      set({
-        savedFilters: prefs.saved_filters ?? {},
-        pageSizes: prefs.page_sizes ?? {},
-        extras: prefs.extras ?? {},
-        loaded: true,
-      });
+      savedFilters = { ...(prefs.saved_filters ?? {}) };
+      pageSizes = { ...(prefs.page_sizes ?? {}) };
+      extras = { ...(prefs.extras ?? {}) };
     } catch {
-      // If the service is unavailable or returns an error, fall back to defaults.
-      set({ loaded: true });
+      // If the service is unavailable or returns an error, fall back to
+      // defaults; writes made while waiting still go through below.
     }
+    // Apply the writes made while the load was in flight on top of what it
+    // returned, then save the merged values once (issue #985).
+    const filterWrites: Record<string, unknown> = {};
+    for (const [page, write] of Object.entries(preLoadFilters)) {
+      const merged = mergePreLoadFilter(savedFilters[page], write);
+      savedFilters[page] = merged;
+      filterWrites[page] = merged;
+    }
+    Object.assign(pageSizes, preLoadPageSizes);
+    Object.assign(extras, preLoadExtras);
+    const patch: PreferencesPatch = {
+      saved_filters: filterWrites,
+      page_sizes: { ...preLoadPageSizes },
+      extras: { ...preLoadExtras },
+    };
+    const hasWrites =
+      Object.keys(filterWrites).length > 0 ||
+      Object.keys(preLoadPageSizes).length > 0 ||
+      Object.keys(preLoadExtras).length > 0;
+    resetPreLoadWrites();
+    set({ savedFilters, pageSizes, extras, loaded: true });
+    if (hasWrites) queuePatch(patch);
   },
 
   setSavedFilter: (page, filter) => {
     const next = { ...get().savedFilters, [page]: filter };
     set({ savedFilters: next });
+    if (!get().loaded) {
+      recordPreLoadFilter(page, filter);
+      return;
+    }
     queuePatch({ saved_filters: { [page]: filter } });
   },
 
@@ -101,6 +191,10 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
   setPageSize: (page, size) => {
     const next = { ...get().pageSizes, [page]: size };
     set({ pageSizes: next });
+    if (!get().loaded) {
+      preLoadPageSizes[page] = size;
+      return;
+    }
     queuePatch({ page_sizes: { [page]: size } });
   },
 
@@ -116,6 +210,10 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
     // extras merges per key server-side (no delete verb), so clearing back to
     // the default sort still sends the key, just with a null value; getSortState
     // treats a non-SortState value (including null) the same as absent.
+    if (!get().loaded) {
+      preLoadExtras[key] = sort;
+      return;
+    }
     queuePatch({ extras: { [key]: sort } });
   },
 
@@ -125,6 +223,7 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
       patchTimer = null;
     }
     pendingPatch = {};
+    resetPreLoadWrites();
     set({ savedFilters: {}, pageSizes: {}, extras: {}, loaded: false });
   },
 }));

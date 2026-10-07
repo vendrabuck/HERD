@@ -86,6 +86,8 @@ const DEVICE = {
   resolved_poll_interval_seconds: null,
 };
 
+let lastClient: QueryClient | null = null;
+
 const TEMPLATE = {
   id: "tmpl-1",
   name: "PA-Series",
@@ -105,6 +107,7 @@ function renderPage() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
+  lastClient = client;
   return render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[`/inventory/${DEVICE_ID}`]}>
@@ -331,5 +334,93 @@ describe("DevicePage", () => {
     await waitFor(() =>
       expect(toastError).toHaveBeenCalledWith("name already taken"),
     );
+  });
+
+  // Issue #1020: the save used to send every field, including the status the
+  // form copied when the page first opened. A status that provisioning changed
+  // meanwhile was then written back stale.
+  describe("save sends only what the admin changed (issue #1020)", () => {
+    function capturePut() {
+      const bodies: Record<string, unknown>[] = [];
+      server.use(
+        http.put(`/api/inventory/devices/${DEVICE_ID}`, async ({ request }) => {
+          const body = (await request.json()) as Record<string, unknown>;
+          bodies.push(body);
+          return HttpResponse.json({ ...DEVICE, status: "RESERVED", ...body });
+        }),
+      );
+      return bodies;
+    }
+
+    it("a rename does not write back a status that changed server-side after the page loaded", async () => {
+      const bodies = capturePut();
+      renderPage();
+      await screen.findByText("Device Details");
+      // A reservation activates: inventory now holds RESERVED, the page's
+      // cached copy still says AVAILABLE.
+      server.use(
+        http.get(`/api/inventory/devices/${DEVICE_ID}`, () =>
+          HttpResponse.json({ ...DEVICE, status: "RESERVED" }),
+        ),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+      fireEvent.change(screen.getByLabelText("Name"), { target: { value: "renamed-fw" } });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Device updated"));
+      expect(bodies).toEqual([{ name: "renamed-fw" }]);
+    });
+
+    it("Edit starts from the current device, not the copy taken when the page opened", async () => {
+      const bodies = capturePut();
+      renderPage();
+      await screen.findByText("Device Details");
+      server.use(
+        http.get(`/api/inventory/devices/${DEVICE_ID}`, () =>
+          HttpResponse.json({ ...DEVICE, status: "RESERVED", name: "core-fw-01b" }),
+        ),
+      );
+      await lastClient!.invalidateQueries();
+      await screen.findByText("RESERVED");
+      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+      expect((screen.getByLabelText("Status") as HTMLSelectElement).value).toBe("RESERVED");
+      expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("core-fw-01b");
+      fireEvent.change(screen.getByLabelText("Topology Type"), { target: { value: "CLOUD" } });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Device updated"));
+      expect(bodies).toEqual([{ topology_type: "CLOUD" }]);
+    });
+
+    it("a status the admin chose is sent", async () => {
+      const bodies = capturePut();
+      renderPage();
+      await screen.findByText("Device Details");
+      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+      fireEvent.change(screen.getByLabelText("Status"), { target: { value: "MAINTENANCE" } });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Device updated"));
+      expect(bodies).toEqual([{ status: "MAINTENANCE" }]);
+    });
+
+    it("saving with nothing changed sends no request and leaves edit mode", async () => {
+      const bodies = capturePut();
+      renderPage();
+      await screen.findByText("Device Details");
+      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(screen.getByText("Device Details")).toBeInTheDocument());
+      expect(bodies).toEqual([]);
+      expect(toastSuccess).not.toHaveBeenCalled();
+    });
+
+    it("Cancel discards edits, and the next Edit starts from the device again", async () => {
+      capturePut();
+      renderPage();
+      await screen.findByText("Device Details");
+      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+      fireEvent.change(screen.getByLabelText("Name"), { target: { value: "scratch" } });
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+      expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("core-fw-01");
+    });
   });
 });

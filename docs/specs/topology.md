@@ -1277,10 +1277,12 @@ sortable headings, clone, and delete, singly or for several selected rows at onc
   falls back to All. \
   Enforced in: `frontend/src/lib/topologyFilters.ts` (`parseSavedTopologyFilter`, `serializeTopologyFilter`); `frontend/src/pages/TopologyPage.tsx` (`TopologyPage`) \
   Pinned by: `frontend/src/test/pages/TopologyPageListControls.test.tsx` (`search is debounced, trimmed, sent, resets to page 1, and persisted`, `a whitespace-only search sends nothing`, `Owner Mine sends owner=mine and persists it; All removes it`, `a stale saved owner falls back to All and is never sent`)
-- **TOPO-UILIST-3.** A filter change made before the saved preferences load saves an
-  empty search over the saved one. Known gap, see #985. \
-  Enforced in: `frontend/src/pages/TopologyPage.tsx` (`TopologyPage`) \
-  Pinned by: none (issue #985)
+- **TOPO-UILIST-3.** A filter change made before the saved preferences load is held,
+  not sent: when the load settles, only the fields the user changed are applied over the
+  loaded filter and the merged value is saved once, so the saved search survives
+  (issue #985). \
+  Enforced in: `frontend/src/stores/preferencesStore.ts` (`usePreferencesStore`, `mergePreLoadFilter`) \
+  Pinned by: `frontend/src/test/stores/preferencesStore.test.ts` (`a status change before the load keeps the saved search (the issue's observation)`, `a search typed before the load wins over the saved search`, `nothing is sent while the load is pending, however many writes are made`)
 - **TOPO-UILIST-4.** The selection covers the current page only and clears on any page,
   sort, search, or owner change. \
   Enforced in: `frontend/src/pages/TopologyPage.tsx` (`TopologyPage`) \
@@ -1322,10 +1324,13 @@ routes `GET` and `PUT /topologies/{id}`, `POST /pathfind/batch`,
   batch keeps the stored data. \
   Enforced in: `frontend/src/api/inventory.ts` (`hydrateCanvasNodes`); `frontend/src/lib/canvasHydration.ts` (`hydrateAndLoadCanvas`) \
   Pinned by: `frontend/src/test/api/inventory.test.tsx` (`fills thin nodes with the fetched name, topology_type, and label`, `sets type 'deviceNode' on a typeless device node so it renders, not as a blank box`, `sets type 'deviceNode' even when the device is omitted (typeless stale node)`); `frontend/src/test/lib/canvasHydration.test.ts` (`falls back to loading the original canvas when hydrateCanvasNodes rejects`)
-- **TOPO-UI-2.** A stored node with no device, between two device nodes, crashes the
-  editor into its error boundary. Known gap, see #989. \
-  Enforced in: `frontend/src/pages/TopologyEditorPage.tsx` (`TopologyEditorPage`) \
-  Pinned by: none (issue #989)
+- **TOPO-UI-2.** A stored node typed as a device node but with no `data.device` opens
+  in the editor: it is not a device node for any editor logic (`isDeviceNode` requires a
+  device object), renders as an "Unknown device" box with its handles, and a new
+  connection to it is refused with a toast; the validator reports its edges as
+  `missing_device` (issue #989). \
+  Enforced in: `frontend/src/lib/canvasNodes.ts` (`isDeviceNode`); `frontend/src/components/topology-editor/nodes/DeviceNode.tsx` (`DeviceNode`); `frontend/src/pages/TopologyEditorPage.tsx` (`TopologyEditorPage`) \
+  Pinned by: `frontend/src/test/pages/TopologyEditorDeviceLessNode.test.tsx` (`opens the seeded half-wired chain without reaching the error boundary`, `refuses a new connection to the device-less node with a toast instead of throwing`, `selecting, moving, and deleting the node and its edges does not throw`); `frontend/src/test/components/DeviceNode.test.tsx` (`renders an unknown-device placeholder with its handles when data has no device`)
 - **TOPO-UI-3.** The palette lists only `dut_only` devices, hides devices already on the
   canvas, can hide exclusive `RESERVED` devices, refuses to drag an unavailable device,
   and offers dynamic templates and the four network element types as separate sections. \
@@ -1673,10 +1678,6 @@ TOPO-BULK-4.
 
 ### Open defects
 
-- #989 (TOPO-UI-2): the editor crashes on a stored node with no device placed between
-  two device nodes, as in the seeded "BROKEN - Half-Wired Chain" topology.
-- #985 (TOPO-UILIST-3): on the topologies page, a filter change made before the saved
-  preferences load saves an empty search over the saved one.
 - #1007 (TOPO-FORK-18): validation now reports an unresolvable port-constrained edge,
   but the fork save's own answer still does not name a skipped constrained edge.
 
@@ -1728,5 +1729,3 @@ TOPO-BULK-4.
 - TOPO-STRIP-4: a PUT differing only in a non-allowlisted device key appending no
   version.
 - TOPO-TMPL-9: instantiate not checking assigned device ids.
-- TOPO-UILIST-3: the empty search saved over the stored one (issue #985).
-- TOPO-UI-2: the device-less node crash (issue #989 asks for the test).

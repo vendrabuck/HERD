@@ -9,8 +9,51 @@ const TOPOLOGY_COLORS: Record<string, string> = {
   CLOUD: "bg-purple-100 border-purple-400 text-purple-900",
 };
 
+// Issue #989: a stored node can be typed deviceNode with no `data.device` (the
+// seeded "BROKEN - Half-Wired Chain" topology). It renders as a neutral
+// unknown-device box, keeping its handles so the edges that reference it still
+// draw and the validator's missing_device result has something to point at.
+function UnknownDeviceNode({ selected }: { selected?: boolean }) {
+  return (
+    <div
+      data-testid="unknown-device-node"
+      className={`
+        relative rounded-lg border-2 border-dashed border-gray-400 bg-gray-50 p-3 min-w-[140px]
+        text-gray-600 shadow-sm cursor-grab
+        ${selected ? "ring-2 ring-offset-1 ring-yellow-400" : ""}
+      `}
+    >
+      <Handle type="source" id="top" position={Position.Top} className="!bg-gray-500" />
+      <Handle type="source" id="right" position={Position.Right} className="!bg-gray-500" />
+      <div className="flex flex-col items-center gap-1">
+        <span className="inline-block w-8 h-8 bg-gray-200 rounded" />
+        <span className="text-sm font-semibold text-center leading-tight">Unknown device</span>
+        <span className="text-xs text-gray-500">No device on this node</span>
+      </div>
+      <Handle type="source" id="bottom" position={Position.Bottom} className="!bg-gray-500" />
+      <Handle type="source" id="left" position={Position.Left} className="!bg-gray-500" />
+    </div>
+  );
+}
+
 export function DeviceNode({ data, selected }: NodeProps<DeviceNodeType>) {
-  const { device, isProposal, l3ValidationInvalid } = data;
+  const device = data?.device as DeviceNodeType["data"]["device"] | undefined;
+  if (typeof device !== "object" || device === null) {
+    return <UnknownDeviceNode selected={selected} />;
+  }
+  return <KnownDeviceNode data={data} device={device} selected={selected} />;
+}
+
+function KnownDeviceNode({
+  data,
+  device,
+  selected,
+}: {
+  data: DeviceNodeType["data"];
+  device: DeviceNodeType["data"]["device"];
+  selected?: boolean;
+}) {
+  const { isProposal, l3ValidationInvalid } = data;
   const colorClass = TOPOLOGY_COLORS[device.topology_type] ?? "bg-gray-100 border-gray-400";
   // Review fix F6 (issue #34): l3RoutesOf never throws on a malformed
   // persisted/imported `data.l3` ({} or {routes: null}); it reads [] instead

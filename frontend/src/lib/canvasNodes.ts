@@ -23,7 +23,19 @@ export const isNetworkElement = (node: Node<CanvasNodeData>) => node.type === "n
 // pair silently stops being exhaustive if a fourth node type is ever added,
 // while this fails closed (review fix: a networkElementNode reaching a
 // `.device.id` read via an incomplete negation crashed handleAIProposal).
-export const isDeviceNode = (node: Node<CanvasNodeData>) => node.type === "deviceNode";
+// The type alone is not enough (issue #989): a stored node can be typed
+// deviceNode with no `data.device` at all (the seeded "BROKEN - Half-Wired
+// Chain" topology), and reading `.device` off it crashed the editor. Such a
+// node is not a device node for any logic; DeviceNode renders it as an unknown
+// device and the validator reports its edges as missing_device.
+export const isDeviceNode = (node: Node<CanvasNodeData>) =>
+  node.type === "deviceNode" && hasDeviceObject(node.data);
+
+function hasDeviceObject(data: unknown): boolean {
+  if (typeof data !== "object" || data === null) return false;
+  const device = (data as { device?: unknown }).device;
+  return typeof device === "object" && device !== null;
+}
 
 // Pure helper (unit-testable without mounting the page): the set of
 // inventory device ids for every real device node already on the canvas,

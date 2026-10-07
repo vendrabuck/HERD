@@ -17,6 +17,7 @@ vi.mock("react-hot-toast", () => ({
 import { server } from "../mocks/server";
 import { ConfigPage } from "@/pages/ConfigPage";
 import { useConfigStore } from "@/stores/configStore";
+import { TOAST_CLEARANCE_CLASS } from "@/lib/toastClearance";
 
 function renderWithProviders(node: ReactNode) {
   const client = new QueryClient({
@@ -80,5 +81,39 @@ describe("ConfigPage (unauthenticated)", () => {
       expect(toastError).toHaveBeenCalledWith("Invalid config password"),
     );
     expect(useConfigStore.getState().configToken).toBeNull();
+  });
+});
+
+describe("ConfigPage (editor)", () => {
+  // Issue #988: the editor ends in Save, Save and Restart, and Back to login at
+  // the bottom centre, where toasts appear; the page carries the bottom padding
+  // that lets them scroll clear of a stack of three toasts.
+  it("pads the page end so the last controls can scroll clear of the toasts (issue #988)", async () => {
+    server.use(
+      http.get("/api/config/status", () =>
+        HttpResponse.json({ configured: true, password_changed: true }),
+      ),
+      http.get("/api/config/schema", () =>
+        HttpResponse.json({
+          fields: [
+            {
+              key: "LOG_LEVEL",
+              label: "Log level",
+              type: "string",
+              required: false,
+              group: "General",
+              secret: false,
+              description: "",
+            },
+          ],
+        }),
+      ),
+      http.get("/api/config/settings", () => HttpResponse.json({ values: { LOG_LEVEL: "INFO" } })),
+    );
+    useConfigStore.getState().setConfigToken("ct");
+    renderWithProviders(<ConfigPage />);
+    const save = await screen.findByRole("button", { name: "Save and Restart" });
+    const page = save.closest(".min-h-screen") as HTMLElement;
+    expect(page.className.split(/\s+/)).toContain(TOAST_CLEARANCE_CLASS);
   });
 });

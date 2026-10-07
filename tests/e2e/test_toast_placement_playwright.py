@@ -1,4 +1,4 @@
-"""Playwright e2e tests for toast placement (issue #942).
+"""Playwright e2e tests for toast placement (issues #942 and #988).
 
 Toasts render at the bottom centre (`<Toaster position="bottom-center" />` in
 frontend/src/App.tsx). At the old top-right position a toast covered the
@@ -20,13 +20,24 @@ stack changes; the inventory test also deletes any duplicate that slipped
 through, and preference writes are refused at the network layer so no saved
 filter or page size is touched.
 
+Issue #988 adds two pages whose last controls sit at the bottom centre:
+`/templates/new` ("+ Add Section") and `/config` (Save, Save and Restart, Back
+to login). Each is measured scrolled to its end with one toast and a stack of
+three. The template toasts are the page's own client-side "Name is required"
+refusal (no request is sent); the config toasts come from the page's own
+save-failure path with the settings PUT answered 500, so no setting changes.
+
 Needs: the editor test creates and deletes its own empty topology and needs no
-seed. The inventory test needs at least one device in inventory and skips on
+seed. The config test logs in to the config UI and skips when the config
+password is unrotated or differs from CONFIG_ADMIN_PASSWORD (the same rule as
+test_config_playwright.py). The inventory test needs at least one device in inventory and skips on
 an empty one (the pre-seed e2e pass); the seeded pass always has devices.
 """
 
+import os
 import uuid
 
+import httpx
 import pytest
 from playwright.sync_api import expect
 
@@ -252,3 +263,81 @@ def test_inventory_list_toasts_cover_no_control_at_the_bottom(pw_page):
                         pw_page, "DELETE", f"/inventory/devices/{device['id']}", allow_errors=True
                     )
                     log_cleanup_failure("device", device["id"], resp)
+
+
+def _measure_page_end(page, trigger, *, last_control, where: str) -> None:
+    """Raise one toast and then three through `trigger`, measuring at the page end."""
+    for count in (1, 3):
+        for _ in range(count):
+            trigger()
+            page.wait_for_timeout(150)
+        expect(page.locator(TOAST_BARS)).to_have_count(count, timeout=WAIT_MS)
+        _park_on_toast(page)
+        page.evaluate(_SCROLL_TO_END_JS)
+        # Not vacuous: the page's last control is on screen while measured.
+        expect(last_control).to_be_in_viewport()
+        _assert_no_control_covered(
+            page, toasts=count, where=f"{where}, {count} toast(s), scrolled to end"
+        )
+        _drain_toasts(page)
+
+
+def test_template_editor_toasts_cover_no_control_at_the_page_end(pw_page):
+    pw_login(pw_page)
+    save = pw_page.get_by_role("button", name="Save", exact=True)
+    add_section = pw_page.get_by_role("button", name="+ Add Section", exact=True)
+    for width, height in VIEWPORTS:
+        where = f"/templates/new {width}x{height}"
+        pw_page.set_viewport_size({"width": width, "height": height})
+        pw_page.goto(f"{HOST_BASE_URL}/templates/new")
+        expect(add_section).to_be_visible(timeout=WAIT_MS)
+        # The name is empty, so Save raises the page's own "Name is required"
+        # toast and sends nothing.
+        _measure_page_end(
+            pw_page,
+            lambda: save.click(timeout=5_000),
+            last_control=add_section,
+            where=where,
+        )
+
+
+CONFIG_PASSWORD = os.environ.get("CONFIG_ADMIN_PASSWORD") or "admin123!"
+
+
+def _config_login_or_skip(page) -> None:
+    with httpx.Client(base_url=HOST_BASE_URL, verify=False, timeout=15.0) as client:
+        status = client.get("/api/config/status").json()
+        if not status.get("password_changed"):
+            pytest.skip("config password unrotated; write surface locked (issue #256 gate)")
+        if client.post("/api/config/login", json={"password": CONFIG_PASSWORD}).status_code != 200:
+            pytest.skip("config password does not match CONFIG_ADMIN_PASSWORD fallback")
+    page.goto(f"{HOST_BASE_URL}/config")
+    page.fill("#config-password", CONFIG_PASSWORD)
+    page.get_by_role("button", name="Sign in").click()
+
+
+def test_config_toasts_cover_no_control_at_the_page_end(pw_page):
+    _config_login_or_skip(pw_page)
+    save = pw_page.get_by_role("button", name="Save", exact=True)
+    back = pw_page.get_by_role("link", name="Back to login")
+
+    def fail_save(route):
+        if route.request.method == "PUT":
+            route.fulfill(status=500, json={"detail": "injected by the #988 e2e test"})
+        else:
+            route.continue_()
+
+    pw_page.route("**/api/config/settings", fail_save)
+    try:
+        for width, height in VIEWPORTS:
+            where = f"/config {width}x{height}"
+            pw_page.set_viewport_size({"width": width, "height": height})
+            expect(save).to_be_visible(timeout=WAIT_MS)
+            _measure_page_end(
+                pw_page,
+                lambda: save.click(timeout=5_000),
+                last_control=back,
+                where=where,
+            )
+    finally:
+        pw_page.unroute("**/api/config/settings", fail_save)
