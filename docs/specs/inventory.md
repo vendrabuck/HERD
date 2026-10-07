@@ -552,7 +552,7 @@ areas call `check_device_read_visibility` for their own device-scoped reads
 - **INV-VIS-9.** A non-admin's visible devices also include each instance device (a
   device carrying `request_id`) that one of their own `PENDING_PROVISION` or `ACTIVE`
   reservations holds, read from reservations' internal `GET /internal/held-devices`
-  (`reservations.md`, RES-INTERNAL-7). Physical devices never gain visibility this way.
+  (`reservations.md`, RES-INTERNAL-8). Physical devices never gain visibility this way.
   Reservations is asked only when an instance device exists outside the caller's group
   visibility; a lookup that cannot be answered (no internal token, transport error,
   non-200, misshapen body) grants nothing and logs `instance_device_grant_unavailable`.

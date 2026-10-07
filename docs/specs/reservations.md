@@ -305,7 +305,7 @@ area.
 | GET | `/internal/{id}` | `X-Internal-Token` | execution (event corroboration), inventory (apply scheduler), ai-orchestrator (idle-conversation sweeper) | `{id, status, is_active, start_time, end_time, purpose_classification_pending}` | RES-INTERNAL-1, RES-INTERNAL-2, RES-INTERNAL-6, RES-INTERNAL-7 |
 | GET | `/internal/active?user_id&device_id` | `X-Internal-Token` | inventory (reservation-owner widening) | `{owns_active}` | RES-INTERNAL-1, RES-INTERNAL-3 |
 | GET | `/internal/active-users?device_id` | `X-Internal-Token` | notifications (health fan-out) | list of user ids | RES-INTERNAL-1, RES-INTERNAL-4 |
-| GET | `/internal/held-devices?user_id` | `X-Internal-Token` | inventory (instance-device visibility grant) | `{device_ids}` | RES-INTERNAL-1, RES-INTERNAL-7 |
+| GET | `/internal/held-devices?user_id` | `X-Internal-Token` | inventory (instance-device visibility grant) | `{device_ids}` | RES-INTERNAL-1, RES-INTERNAL-8 |
 | GET | `/internal/by-topology/{topology_id}` | `X-Internal-Token` | cabling (topology edit lock and delete guard) | list of `{id, user_id, topology_id, status, end_time}` | RES-INTERNAL-1, RES-INTERNAL-5 |
 | GET | `/internal/by-device/{device_id}` | `X-Internal-Token` | inventory (device delete guard, config restore) | list of `{id, user_id, device_id, status, end_time}` | RES-INTERNAL-1, RES-INTERNAL-5 |
 | POST | `/internal/{id}/provision-result` | `X-Internal-Token` | execution | `{reservation_id, status, applied}` | RES-INTERNAL-1, RES-DYN-6, RES-DYN-7, RES-DYN-8 |
@@ -1166,7 +1166,7 @@ user in the flow. The routes, callers, and answers are in section 7.
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_internal_status`); `services/reservations/app/schemas/reservation.py` (`ReservationInternalStatus`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_status_reports_purpose_classification_pending`)
 
-- **RES-INTERNAL-7.** `held-devices` lists, once each and sorted, every device of the
+- **RES-INTERNAL-8.** `held-devices` lists, once each and sorted, every device of the
   user's `PENDING_PROVISION` and `ACTIVE` reservations (the statuses that hold devices),
   and nothing of a `PENDING` or terminal row or of another user's (issue #1030). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`list_devices_held_by_user`) \
