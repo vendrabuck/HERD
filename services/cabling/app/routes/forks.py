@@ -50,6 +50,7 @@ from app.schemas.fork import (
     ForkSaveResponse,
     ForkVersionDetailResponse,
     ForkVersionSummary,
+    SkippedConstrainedEdgeResponse,
 )
 from app.services.canvas_nodes import strip_device_nodes
 from app.services.fork_save_service import (
@@ -784,6 +785,16 @@ async def save_fork_internal(
         element_attachments_skipped=result.element_attachments_skipped,
         l3_routes_built=result.l3_routes_built,
         l3_routes_released=result.l3_routes_released,
+        constrained_edges_skipped=[
+            SkippedConstrainedEdgeResponse(
+                edge_id=skipped.edge_id,
+                source_device_id=skipped.source_device_id,
+                target_device_id=skipped.target_device_id,
+                source_port_name=skipped.source_port_name,
+                target_port_name=skipped.target_port_name,
+            )
+            for skipped in result.constrained_edges_skipped
+        ],
     )
 
 

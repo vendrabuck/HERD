@@ -1,14 +1,14 @@
 import { useState } from "react";
 
+import { shortId, skippedEdgeText } from "@/lib/forkSaveResult";
 import type { ForkConnectionDelta, ForkSaveResult } from "@/types/reservation.types";
 
 interface ForkSaveResultToastProps {
   result: ForkSaveResult;
   onDismiss: () => void;
-}
-
-function shortId(id: string): string {
-  return id.length > 8 ? id.slice(0, 8) : id;
+  // Device id to display name, from the canvas that was just saved. A device
+  // missing from the map falls back to its short id.
+  deviceLabels?: Record<string, string>;
 }
 
 function DeltaRow({ delta, tone }: { delta: ForkConnectionDelta; tone: "release" | "build" }) {
@@ -26,9 +26,11 @@ function DeltaRow({ delta, tone }: { delta: ForkConnectionDelta; tone: "release"
 
 // Custom react-hot-toast body for a successful fork reconcile (ADR 0006
 // Decision 6). Shows the released/built/unchanged counts, expandable to the
-// per-connection release and build lists.
-export function ForkSaveResultToast({ result, onDismiss }: ForkSaveResultToastProps) {
+// per-connection release and build lists. Lines the save could not wire on
+// their chosen ports (issue #1007) are always listed, never behind the toggle.
+export function ForkSaveResultToast({ result, onDismiss, deviceLabels }: ForkSaveResultToastProps) {
   const [expanded, setExpanded] = useState(false);
+  const skipped = result.constrained_edges_skipped ?? [];
   const hasDetail = result.released.length > 0 || result.built.length > 0;
 
   return (
@@ -45,6 +47,24 @@ export function ForkSaveResultToast({ result, onDismiss }: ForkSaveResultToastPr
               {result.element_attachments_skipped} element attachment
               {result.element_attachments_skipped === 1 ? "" : "s"} recorded (not wired)
             </p>
+          )}
+          {skipped.length > 0 && (
+            <div className="mt-1" role="alert">
+              <p className="text-xs font-semibold text-amber-800">
+                {skipped.length} line{skipped.length === 1 ? "" : "s"} not wired: no cable path on
+                the chosen ports
+              </p>
+              <ul>
+                {skipped.map((edge, i) => (
+                  <li
+                    key={edge.edge_id ?? `skipped-${i}`}
+                    className="text-[11px] font-mono text-amber-800 break-all"
+                  >
+                    {skippedEdgeText(edge, deviceLabels)}
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
           {hasDetail && (
             <button

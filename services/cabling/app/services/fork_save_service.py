@@ -116,6 +116,23 @@ class WireSpec:
     edge_key: str | None = None
 
 
+@dataclass(frozen=True)
+class SkippedConstrainedEdge:
+    """A port-constrained canvas edge no physical path satisfies (issue #1007).
+
+    The resolver never falls back to an unconstrained path for such an edge (issue
+    #531), so it contributes no hop; the save names it in its answer instead of
+    dropping it silently. Ports are the edge's chosen names as read by
+    ``edge_port_constraints`` (None means that side was unconstrained).
+    """
+
+    edge_id: str | None
+    source_device_id: uuid.UUID
+    target_device_id: uuid.UUID
+    source_port_name: str | None
+    target_port_name: str | None
+
+
 @dataclass
 class ForkSaveResult:
     """The reconcile outcome the endpoint returns (ADR 0006 Decision 2 contract)."""
@@ -134,6 +151,9 @@ class ForkSaveResult:
     # routing-intent set reconcile (fork_l3_routes). Additive, default 0.
     l3_routes_built: int = 0
     l3_routes_released: int = 0
+    # Issue #1007: port-constrained edges the save built nothing for. Additive,
+    # default empty.
+    constrained_edges_skipped: tuple[SkippedConstrainedEdge, ...] = ()
 
 
 @dataclass
@@ -195,6 +215,8 @@ class CanvasWiringResolution:
 
     specs: list[WireSpec]
     element_attachments_skipped: int = 0
+    # Issue #1007: port-constrained edges no path satisfies, in canvas edge order.
+    constrained_edges_skipped: tuple[SkippedConstrainedEdge, ...] = ()
 
 
 async def resolve_canvas_wiring(
@@ -230,8 +252,11 @@ async def resolve_canvas_wiring(
     unconstrained device-pair search (older exports, bulk import, the /api/v1 facade).
     An edge whose constrained search finds no path contributes nothing for that edge
     and is logged at INFO; it NEVER falls back to the unconstrained device-pair search,
-    since a fallback would silently wire different ports than the user chose. Layer is
-    deliberately not read from the canvas here; see the module docstring.
+    since a fallback would silently wire different ports than the user chose. Such an
+    edge is returned in ``constrained_edges_skipped`` (issue #1007) so the save can
+    name it; an unconstrained edge with no path is not listed there (validation
+    reports it as ``no_path``). Layer is deliberately not read from the canvas here;
+    see the module docstring.
 
     Network element edges (ADR 0012 phase 1, issue #22): every edge is classified via
     the shared ``classify_element_edge`` helper BEFORE the generic unresolvable-endpoint
@@ -282,6 +307,7 @@ async def resolve_canvas_wiring(
     specs: list[WireSpec] = []
     seen: set[tuple[uuid.UUID, str, uuid.UUID, str, str]] = set()
     element_attachments_skipped = 0
+    constrained_edges_skipped: list[SkippedConstrainedEdge] = []
 
     # First pass: classify every edge and resolve its endpoints/ports, WITHOUT
     # running any BFS yet. S11 review fix, round 2: an unconstrained edge (no
@@ -370,6 +396,15 @@ async def resolve_canvas_wiring(
                     target_device,
                     target_port,
                 )
+                constrained_edges_skipped.append(
+                    SkippedConstrainedEdge(
+                        edge_id=edge_key,
+                        source_device_id=source_device,
+                        target_device_id=target_device,
+                        source_port_name=source_port,
+                        target_port_name=target_port,
+                    )
+                )
             continue
 
         path = paths[0]
@@ -403,7 +438,9 @@ async def resolve_canvas_wiring(
             element_attachments_skipped,
         )
     return CanvasWiringResolution(
-        specs=specs, element_attachments_skipped=element_attachments_skipped
+        specs=specs,
+        element_attachments_skipped=element_attachments_skipped,
+        constrained_edges_skipped=tuple(constrained_edges_skipped),
     )
 
 
@@ -895,6 +932,7 @@ async def save_fork(
         element_attachments_skipped=wiring_resolution.element_attachments_skipped,
         l3_routes_built=result["l3_routes_built"],
         l3_routes_released=result["l3_routes_released"],
+        constrained_edges_skipped=wiring_resolution.constrained_edges_skipped,
     )
 
 

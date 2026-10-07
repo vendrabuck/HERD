@@ -276,6 +276,20 @@ export interface ForkSaveResult {
   // explicitly (declarative attachments never become a wiring hop). Optional
   // since the backend defaults it to 0 and older responses may omit it.
   element_attachments_skipped?: number;
+  // Issue #1007: port-constrained edges the save built nothing for (no cable
+  // path leaves and arrives on the chosen ports, and the save never falls back
+  // to other ports). Optional since older responses omit it.
+  constrained_edges_skipped?: ForkSkippedConstrainedEdge[];
+}
+
+// One canvas line the fork save could not wire on its chosen ports (issue
+// #1007). A null port means that side carried no chosen port.
+export interface ForkSkippedConstrainedEdge {
+  edge_id: string | null;
+  source_device_id: string;
+  target_device_id: string;
+  source_port_name: string | null;
+  target_port_name: string | null;
 }
 
 // One port already claimed by another ACTIVE reservation, from a save 409.

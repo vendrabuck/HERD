@@ -1184,7 +1184,8 @@ function TopologyEditorInner() {
   // Blocked when the validator reports any invalid edge, including chosen
   // ports with no cable between them (issue #1007). The fork save itself does
   // not refuse such an edge: it builds nothing for it and still answers 200,
-  // so this client-side block is the only gate.
+  // naming it in `constrained_edges_skipped`, which the save toast lists (a
+  // cable removed between the validation and the save lands there).
   const handleCommitToReservation = useCallback(async () => {
     if (!reservationId) return;
     // LiveEditBar disables the Commit button until forkLoaded, but a
@@ -1286,9 +1287,26 @@ function TopologyEditorInner() {
       // applies to what is now on the fork (issue #34): clear rather than
       // leave a stale red badge/reason line from before this commit.
       setRouteProblems([]);
-      toast.custom((t) => (
-        <ForkSaveResultToast result={result} onDismiss={() => toast.dismiss(t.id)} />
-      ));
+      // Issue #1007: a line the save could not wire on its chosen ports is
+      // named in the toast by device name, and such a toast stays until
+      // dismissed so the warning is not lost to the auto-hide timer.
+      const deviceLabels: Record<string, string> = {};
+      for (const node of persistableCanvas.nodes) {
+        if (!isDeviceNode(node)) continue;
+        const device = (node.data as DeviceNodeData).device;
+        if (device.name) deviceLabels[device.id] = device.name;
+      }
+      const hasSkippedLines = (result.constrained_edges_skipped?.length ?? 0) > 0;
+      toast.custom(
+        (t) => (
+          <ForkSaveResultToast
+            result={result}
+            deviceLabels={deviceLabels}
+            onDismiss={() => toast.dismiss(t.id)}
+          />
+        ),
+        hasSkippedLines ? { duration: Infinity } : undefined,
+      );
       // Settle the device set to exactly the canvas's, dropping any removed
       // device now that the save is durable. Skipped when the pre-save add
       // above already left the set at exactly allDeviceIds (no removal

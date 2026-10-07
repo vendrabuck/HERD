@@ -209,6 +209,21 @@ class ForkConnectionDelta(BaseModel):
     edge_key: str | None = None
 
 
+class SkippedConstrainedEdgeResponse(BaseModel):
+    """A port-constrained canvas edge the save built nothing for (issue #1007).
+
+    No physical path leaves the source device on ``source_port_name`` and arrives on
+    ``target_port_name`` (a None port means that side was unconstrained), and the
+    resolver never falls back to other ports (issue #531).
+    """
+
+    edge_id: str | None
+    source_device_id: UUIDStr
+    target_device_id: UUIDStr
+    source_port_name: str | None
+    target_port_name: str | None
+
+
 class ForkSaveResponse(BaseModel):
     """POST .../save result: the version appended and the release/build delta."""
 
@@ -225,6 +240,10 @@ class ForkSaveResponse(BaseModel):
     # routing-intent set reconcile (fork_l3_routes), additive and defaulted to 0.
     l3_routes_built: int = 0
     l3_routes_released: int = 0
+    # Issue #1007: port-constrained edges no path satisfies, in canvas edge order.
+    # Additive, defaulted to empty; the save still answers 200 (the no-fallback rule
+    # of issue #531 stands), and this list is how the caller learns what was dropped.
+    constrained_edges_skipped: list[SkippedConstrainedEdgeResponse] = []
 
 
 class ForkPruneRequest(BaseModel):
