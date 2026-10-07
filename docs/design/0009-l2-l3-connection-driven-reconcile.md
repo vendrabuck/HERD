@@ -93,8 +93,9 @@ itself). ADR 0007 open risk 5 closes: an L2/L3-only fork edit provisions.
 
 The five transport-gated sites route through the shared
 `driver_result_failed` helper, and ledger writes key on the gated verdict:
-the same conversion the L1 path received. `_recipe_reported_success`'s
-stricter missing-key rule remains recipe-only. Closes issue #393. The mock
+the same conversion the L1 path received. `recipe_reported_success`'s
+stricter missing-key rule (in `services/execution/app/services/recipe_result.py`)
+remains recipe-only. Closes issue #393. The mock
 drivers' fail/raise knobs make every path integration-testable in the
 `test_execution_result_gating.py` pattern, which today has no L2/L3
 analogue.

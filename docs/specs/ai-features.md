@@ -1316,7 +1316,8 @@ named in each rule.
   Enforced in: `frontend/src/components/topology-editor/AIDialog.tsx` (`handleFilesPicked`, `ACCEPTED_EXTENSIONS`) \
   Pinned by: `frontend/src/test/components/AIDialog.test.tsx` (`checks picked files client-side before sending (#1040)`, `prefixes a 400 with Upload rejected (#1040)`)
 - **AI-UI-17.** The commit dialog's default window is one to five hours from now, and it
-  offers "Apply device configs" only when a resolved device has a non-empty config. \
+  offers "Apply device configs" only when a resolved device has a non-empty config, with a
+  label saying it needs admin or a manage grant on each device (execution's rule). \
   Enforced in: `frontend/src/components/topology-editor/AICommitDialog.tsx` (`CommitForm`) \
   Pinned by: `frontend/src/test/components/AICommitDialog.test.tsx` (`defaults the window to one to five hours from now`, `offers Apply device configs only when a resolved device has a non-empty config`)
 - **AI-UI-18.** The legacy tab never sends a `conversation_id`, so each question starts a
@@ -1559,8 +1560,9 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
   `VITE_AI_CHAT_ENABLED` row in [ENV_VARS.md](../ENV_VARS.md) and the comment in
   `frontend/src/config/featureFlags.ts`.
 
-Where the AI guides, docstrings, or UI text disagree with the code at this commit, the
-rules above describe the code; issue #1041 lists each disagreement.
+Where the AI guides, docstrings, or UI text disagree with the code, the rules above
+describe the code; issue #1041 corrected every disagreement found when this document was
+written.
 
 ### Rules with no test
 

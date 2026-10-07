@@ -295,5 +295,7 @@ describe("AICommitDialog defaults (#1040)", () => {
     renderDialog(withConfig({ vlan: 10 }));
     expect(checkbox()).not.toBeNull();
     expect(checkbox()).not.toBeChecked();
+    // #1041: a non-admin with a device manage grant may apply configs too.
+    expect(checkbox()).toHaveAccessibleName(/Needs admin, or a manage grant on each device/);
   });
 });
