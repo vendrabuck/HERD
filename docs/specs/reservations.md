@@ -302,7 +302,7 @@ area.
 
 | Method | Path | Auth | Caller | Answers | Rules |
 |---|---|---|---|---|---|
-| GET | `/internal/{id}` | `X-Internal-Token` | execution (event corroboration), inventory (apply scheduler) | `{id, status, is_active, start_time, end_time}` | RES-INTERNAL-1, RES-INTERNAL-2, RES-INTERNAL-6 |
+| GET | `/internal/{id}` | `X-Internal-Token` | execution (event corroboration), inventory (apply scheduler), ai-orchestrator (idle-conversation sweeper) | `{id, status, is_active, start_time, end_time, purpose_classification_pending}` | RES-INTERNAL-1, RES-INTERNAL-2, RES-INTERNAL-6, RES-INTERNAL-7 |
 | GET | `/internal/active?user_id&device_id` | `X-Internal-Token` | inventory (reservation-owner widening) | `{owns_active}` | RES-INTERNAL-1, RES-INTERNAL-3 |
 | GET | `/internal/active-users?device_id` | `X-Internal-Token` | notifications (health fan-out) | list of user ids | RES-INTERNAL-1, RES-INTERNAL-4 |
 | GET | `/internal/by-topology/{topology_id}` | `X-Internal-Token` | cabling (topology edit lock and delete guard) | list of `{id, user_id, topology_id, status, end_time}` | RES-INTERNAL-1, RES-INTERNAL-5 |
@@ -1141,6 +1141,13 @@ user in the flow. The routes, callers, and answers are in section 7.
   `by-device` segments are never parsed as a reservation id. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_internal_status`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_active_no_collision_with_int_status_path`, `test_internal_status_no_collision_with_user_get`)
+- **RES-INTERNAL-7.** `purpose_classification_pending` is true only when
+  `purpose_classify_requested_at` is set and `purpose_suggestion` is null, the same
+  predicate the purpose sweep selects on (without its attempt cap). The AI orchestrator's
+  idle-conversation sweeper reads it to keep a transcript the classifier has yet to read
+  (issue #1039, `ai-features.md` AI-CONV-13). \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_internal_status`); `services/reservations/app/schemas/reservation.py` (`ReservationInternalStatus`) \
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_status_reports_purpose_classification_pending`)
 
 **Out of scope.** How each caller uses the answer is in that caller's area.
 

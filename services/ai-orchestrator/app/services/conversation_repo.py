@@ -25,9 +25,11 @@ objects so the AIClient can pass them straight to the provider.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -37,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.conversation import AssistantConversation, AssistantMessage, MessageRole
+from app.services import transcript_retention
 from app.services.llm_provider import (
     ContentBlock,
     Message,
@@ -46,6 +49,9 @@ from app.services.llm_provider import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Answers whether a reservation's idle conversations must be kept (issue #1039).
+KeepReservation = Callable[[uuid.UUID], Awaitable[bool]]
 
 
 # --- Content-block serde ---
@@ -342,25 +348,69 @@ async def touch(db: AsyncSession, *, conversation: AssistantConversation) -> Non
     conversation.last_used_at = datetime.now(UTC)
 
 
-async def expire_idle(db: AsyncSession, *, ttl_hours: int | None = None) -> int:
+async def expire_idle(
+    db: AsyncSession,
+    *,
+    ttl_hours: int | None = None,
+    keep_reservation: KeepReservation | None = None,
+) -> int:
     """Delete conversations idle longer than ttl_hours. Returns count
     deleted so the sweeper task can log it.
+
+    Issue #1039: an idle conversation is kept when `keep_reservation` says its
+    reservation still owes the end-of-reservation purpose classification a
+    read of the transcript. Left as None, the check is
+    transcript_retention.reservation_keeps_transcript while this service would
+    send transcripts to the classifier, and no check at all otherwise. Each
+    reservation is asked once per call, at most LOOKUP_CONCURRENCY at a time,
+    after the read transaction has ended. The delete re-applies the idle
+    cutoff, so a conversation used during the lookups is not deleted.
     """
     ttl_hours = ttl_hours if ttl_hours is not None else settings.assistant_conversation_ttl_hours
     cutoff = datetime.now(UTC) - timedelta(hours=ttl_hours)
+    if keep_reservation is None and transcript_retention.transcripts_owed_to_classifier():
+        keep_reservation = transcript_retention.reservation_keeps_transcript
     result = await db.execute(
-        select(AssistantConversation.id).where(AssistantConversation.last_used_at < cutoff)
+        select(AssistantConversation.id, AssistantConversation.reservation_id).where(
+            AssistantConversation.last_used_at < cutoff
+        )
     )
-    ids = [r for r in result.scalars().all()]
-    if not ids:
+    candidates = [(row[0], row[1]) for row in result.all()]
+    if not candidates:
         return 0
-    await db.execute(delete(AssistantConversation).where(AssistantConversation.id.in_(ids)))
+    retained = 0
+    if keep_reservation is not None:
+        # End the read transaction before the HTTP lookups.
+        await db.commit()
+        reservation_ids = sorted({rid for _cid, rid in candidates}, key=str)
+        semaphore = asyncio.Semaphore(transcript_retention.LOOKUP_CONCURRENCY)
+
+        async def _ask(rid: uuid.UUID) -> bool:
+            async with semaphore:
+                return await keep_reservation(rid)
+
+        answers = await asyncio.gather(*(_ask(rid) for rid in reservation_ids))
+        kept = {rid for rid, keep in zip(reservation_ids, answers, strict=True) if keep}
+        ids = [cid for cid, rid in candidates if rid not in kept]
+        retained = len(candidates) - len(ids)
+    else:
+        ids = [cid for cid, _rid in candidates]
+    deleted = 0
+    if ids:
+        outcome = await db.execute(
+            delete(AssistantConversation).where(
+                AssistantConversation.id.in_(ids),
+                AssistantConversation.last_used_at < cutoff,
+            )
+        )
+        deleted = outcome.rowcount or 0
     await db.commit()
-    logger.info(
-        "conversation_sweeper_expired",
-        extra={"expired_count": len(ids), "ttl_hours": ttl_hours},
-    )
-    return len(ids)
+    if deleted or retained:
+        logger.info(
+            "conversation_sweeper_expired",
+            extra={"expired_count": deleted, "retained_count": retained, "ttl_hours": ttl_hours},
+        )
+    return deleted
 
 
 # --- internal ---

@@ -635,10 +635,22 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   Pinned by: `services/ai-orchestrator/tests/test_conversation_repo.py` (`test_evict_to_budget_drops_oldest_pair_when_over_turn_cap`, `test_evict_to_budget_respects_token_budget`)
 - **AI-CONV-9.** Every `ASSISTANT_SWEEPER_INTERVAL_SECONDS` the sweeper deletes every
   conversation, with its messages, whose `last_used_at` is older than
-  `ASSISTANT_CONVERSATION_TTL_HOURS`, whatever the reservation's status; a failed cycle is
-  logged and the loop continues. Known gap, see #1039. \
+  `ASSISTANT_CONVERSATION_TTL_HOURS`; a failed cycle is logged and the loop continues.
+  The delete re-applies the cutoff, so a conversation used during the cycle survives. \
   Enforced in: `services/ai-orchestrator/app/services/conversation_repo.py` (`expire_idle`); `services/ai-orchestrator/app/tasks/conversation_sweeper.py` (`conversation_sweeper_loop`) \
-  Pinned by: `services/ai-orchestrator/tests/test_conversation_repo.py` (`test_expire_idle_deletes_old_conversations_and_keeps_recent`, `test_expire_idle_custom_ttl_setting_moves_the_cutoff`); `services/ai-orchestrator/tests/test_conversation_sweeper.py` (`test_run_sweeper_cycle_deletes_idle_conversations`, `test_loop_swallows_cycle_exception_and_keeps_running`)
+  Pinned by: `services/ai-orchestrator/tests/test_conversation_repo.py` (`test_expire_idle_deletes_old_conversations_and_keeps_recent`, `test_expire_idle_custom_ttl_setting_moves_the_cutoff`); `services/ai-orchestrator/tests/test_conversation_sweeper.py` (`test_run_sweeper_cycle_deletes_idle_conversations`, `test_loop_swallows_cycle_exception_and_keeps_running`); `services/ai-orchestrator/tests/test_transcript_retention.py` (`test_a_conversation_used_during_the_lookups_is_not_deleted`)
+- **AI-CONV-13.** While `AI_PURPOSE_CLASSIFICATION_ENABLED` and
+  `AI_PURPOSE_INCLUDE_TRANSCRIPTS` are both on, the sweeper keeps an idle conversation
+  whose reservation is not terminal, or is terminal with `purpose_classification_pending`
+  true (requested and no suggestion yet), so the end pass can read the transcript
+  (AI-PURPOSE-6). It asks reservations `GET /internal/{id}` with the internal token once
+  per reservation per cycle, 8 at a time, after its read transaction ends, and fails
+  closed: a transport error, a missing token, a non-200 other than 404, a malformed body,
+  or an unknown status keeps the conversation and logs
+  `conversation_retention_lookup_failed`; a 404 releases it. With either flag off no
+  lookup is made and AI-CONV-9 applies unchanged (issue #1039). \
+  Enforced in: `services/ai-orchestrator/app/services/conversation_repo.py` (`expire_idle`); `services/ai-orchestrator/app/services/transcript_retention.py` (`reservation_keeps_transcript`, `transcripts_owed_to_classifier`) \
+  Pinned by: `services/ai-orchestrator/tests/test_transcript_retention.py` (`test_a_live_reservation_keeps_its_transcript`, `test_a_terminal_reservation_awaiting_classification_keeps_its_transcript`, `test_a_terminal_reservation_already_classified_releases_its_transcript`, `test_an_unknown_reservation_releases_its_transcript`, `test_an_unclear_answer_keeps_the_transcript`, `test_an_unreachable_reservations_service_keeps_the_transcript`, `test_a_missing_internal_token_keeps_the_transcript`, `test_the_sweep_keeps_only_what_the_classifier_still_owes`, `test_the_sweep_asks_once_per_reservation`, `test_without_a_transcript_reader_the_plain_ttl_applies_with_no_lookup`, `test_a_failed_lookup_is_logged_by_reason_and_status`)
 - **AI-CONV-10.** `ASSISTANT_CONVERSATION_TTL_HOURS` of 0 or less is refused at startup. \
   Enforced in: `services/ai-orchestrator/app/config.py` (`_validate_assistant_conversation_ttl_hours`) \
   Pinned by: `services/ai-orchestrator/tests/test_config.py` (`test_zero_or_negative_ttl_hours_rejected`)
@@ -1068,7 +1080,8 @@ preview (section 8.12), and the reservations sweep and Classify now route
   text, the devices, the dynamic templates, each device's config-apply job count and job
   names (never config contents), the fork's wiring counts per layer and version count,
   the status and duration, and, when `AI_PURPOSE_INCLUDE_TRANSCRIPTS` is set, the
-  reservation's assistant transcripts; the body's `topology_id` is not used. Known gap, see #1039. \
+  reservation's assistant transcripts (kept for this read by AI-CONV-13); the body's
+  `topology_id` is not used. \
   Enforced in: `services/ai-orchestrator/app/services/purpose_signals.py` (`gather_internal_signals`, `_gather_config_apply_jobs_block`, `_gather_fork_block`) \
   Pinned by: `services/ai-orchestrator/tests/test_purpose_signals.py` (`test_internal_signals_include_all_structured_signals`, `test_internal_config_apply_jobs_never_include_config_contents`, `test_transcripts_included_when_flag_on`, `test_transcripts_omitted_when_flag_off`)
 - **AI-PURPOSE-7.** A signal fetch that fails with an HTTP error or a malformed body is
@@ -1466,6 +1479,7 @@ Calls into this area are in section 7. All user-path calls forward the caller's 
 | Out | reservations | `POST /` (JWT) | commit's reservation | Relayed status; topology rolled back (AI-COMMIT-11) |
 | Out | execution | `POST /execute` (JWT) | optional config push | Recorded per device as `failed`; commit stands (AI-COMMIT-16) |
 | Out | reservations | `GET /{id}` (JWT) | assistant seed | 404: 404. Deadline: 504. Other: 503 (AI-CONV-3) |
+| Out | reservations | `GET /internal/{id}` (internal token, 10 s) | idle-conversation sweeper retention | Fail closed: the conversation is kept; a 404 releases it (AI-CONV-13) |
 | Out | reservations | `GET /{id}` (JWT) | assistant tool device scope | Any failure refuses every device-scoped tool call as an `is_error` result; fail closed (AI-TOOL-11) |
 | Out | inventory | `GET /devices/{id}` (JWT) | assistant seed devices | 404: device omitted. Other: 503 (AI-CONV-3) |
 | Out | inventory | device, port, template, config-version, config-schema, and schedule routes (JWT) | assistant tools | Becomes an `is_error` tool result; the turn continues (AI-TOOL-2). The schema proxy fails open to the registry (AI-TOOL-7) |
@@ -1546,10 +1560,7 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
 
 ### Open defects
 
-- #1039 (AI-CONV-9, AI-PURPOSE-6): the idle-conversation sweeper deletes by last use only,
-  so a reservation's transcript can be gone before purpose classification reads it. The
-  issue asks the owner to choose between exempting such conversations and documenting the
-  interaction.
+None at this commit: #1039 is resolved by AI-CONV-13.
 
 ### Limits by decision
 
@@ -1564,6 +1575,10 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
   DNS rebinding window (AI-DOCS-11). Recorded as a known limitation in ADR 0015 (decision
   3) and [AI_ASSISTANT.md](../AI_ASSISTANT.md); the web source ships disabled and behind an
   operator allowlist.
+- A terminal reservation whose classification never yields a suggestion (attempt cap
+  reached, no Classify now) stays pending, so its idle conversations are kept until it is
+  classified or either transcript flag is turned off (AI-CONV-13): Lane's decision on
+  #1039 (E(a)), recorded in [AI_PURPOSE_CLASSIFICATION.md](../AI_PURPOSE_CLASSIFICATION.md).
 - `GET /status` is unauthenticated and its construction probe is cached for 30 seconds
   (AI-PROV-5, AI-PROV-7): issue #606 and the docstring of `_ProviderConstructionCache`.
 - Usage rows are written only when a quota is configured (AI-QUOTA-1): the comment on

@@ -303,6 +303,35 @@ A deployment that must not resend user chat text sets
 never includes transcripts regardless of this flag, since no reservation (and
 therefore no transcript) exists yet at that point.
 
+## Transcript retention until classification (issue #1039)
+
+The idle-conversation sweeper normally deletes a conversation once it has gone
+`ASSISTANT_CONVERSATION_TTL_HOURS` (default 24) without use. While this service
+would send transcripts to the classifier (`AI_PURPOSE_CLASSIFICATION_ENABLED`
+and `AI_PURPOSE_INCLUDE_TRANSCRIPTS` both on), the sweeper instead keeps an idle
+conversation when its reservation:
+
+- is not terminal yet (`PENDING`, `PENDING_PROVISION`, or `ACTIVE`), or
+- is terminal (`COMPLETED`, `CANCELLED`, or `FAILED`) and its end-of-reservation
+  classification is still pending: `purpose_classify_requested_at` is set and
+  there is no suggestion yet.
+
+So the transcript the end pass is meant to read is still there when it reads
+it. Once the suggestion is stored, the next sweep after the TTL deletes the
+conversation as usual. The sweeper asks reservations'
+`GET /internal/{id}` (internal token) once per reservation per cycle, which
+reports `status` and `purpose_classification_pending`. The check fails closed:
+when reservations cannot answer (transport error, a non-200 other than 404, a
+malformed body), the conversation is kept until a later cycle gets an answer.
+A 404 means the reservation does not exist, and its conversations are deleted.
+With either flag off nothing reads transcripts, so the plain idle TTL applies
+and the sweeper makes no lookups.
+
+A terminal reservation whose classification never produces a suggestion (the
+sweep's attempt cap was reached and nobody pressed Classify now) stays
+pending, so its idle conversations are kept until it is classified or one of
+the two flags is turned off.
+
 The prompt assembled for either pass never includes credentials, secret
 values, or device configuration contents: `field_data` is never forwarded,
 config versions contribute only their free-text `description` label (never

@@ -575,6 +575,8 @@ async def get_reservation_internal_status(
 
     Guarded by X-Internal-Token. Returns status + is_active boolean (status ACTIVE
     AND within window) so callers do not need to replicate active-window logic.
+    Also reports whether purpose classification is still owed
+    (purpose_classification_pending, issue #1039).
     """
     if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
@@ -596,6 +598,10 @@ async def get_reservation_internal_status(
         is_active=is_active,
         start_time=start,
         end_time=end,
+        purpose_classification_pending=(
+            reservation.purpose_classify_requested_at is not None
+            and reservation.purpose_suggestion is None
+        ),
     )
 
 

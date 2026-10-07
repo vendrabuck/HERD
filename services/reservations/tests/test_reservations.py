@@ -735,6 +735,37 @@ async def test_internal_status_outside_window_is_not_active(internal_client):
     assert resp.json()["is_active"] is False
 
 
+async def _set_purpose_state(rid: str, *, requested: bool, suggested: bool) -> None:
+    async with TestSessionLocal() as session:
+        row = await session.get(Reservation, uuid.UUID(rid))
+        row.purpose_classify_requested_at = datetime.now(timezone.utc) if requested else None
+        row.purpose_suggestion = {"top_category": "testing"} if suggested else None
+        await session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested", "suggested", "pending"),
+    [
+        (False, False, False),
+        (True, False, True),
+        (True, True, False),
+        (False, True, False),
+    ],
+)
+async def test_internal_status_reports_purpose_classification_pending(
+    internal_client, requested, suggested, pending
+):
+    """Issue #1039: pending means requested and no suggestion yet."""
+    rid = await _insert_reservation_row(status=ReservationStatus.COMPLETED)
+    await _set_purpose_state(rid, requested=requested, suggested=suggested)
+    resp = await internal_client.get(
+        f"/internal/{rid}", headers={"X-Internal-Token": INTERNAL_TOKEN}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["purpose_classification_pending"] is pending
+
+
 @pytest.mark.asyncio
 async def test_internal_status_bad_token_rejected(internal_client):
     rid = await _insert_reservation_row()
