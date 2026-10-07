@@ -1679,6 +1679,60 @@ async def test_save_fork_unresolvable_port_pair_does_not_fall_back(client):
 
 
 @pytest.mark.asyncio
+async def test_validator_and_save_judge_port_constrained_edges_alike(client):
+    """Issue #1007: the pre-check judges by the same rule as the save it pre-empts.
+
+    One fixture through both judges: e0 on cabled ports (built), e1 on ports with
+    no cable (the save builds nothing and never falls back), e2 with no chosen
+    ports (unconstrained, today's device-pair search), e3 constrained on the source
+    side only to a cabled port. Every edge the validator accepts must be built, and
+    every edge it rejects must build nothing.
+    """
+    from app.services.topology_validation import validate_canvas_edges
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    canvas = _canvas_with_edge_data(
+        [a, b],
+        [
+            (0, 1, {"source_port_name": "a0", "target_port_name": "b0"}),
+            (0, 1, {"source_port_name": "a9", "target_port_name": "b9"}),
+            (0, 1, {}),
+            (0, 1, {"source_port_name": "a0", "target_port_name": ""}),
+        ],
+    )
+
+    async with TestSessionLocal() as db:
+        validation = await validate_canvas_edges(canvas, db)
+    assert [(e.edge_id, e.reason) for e in validation.invalid_edges] == [("e1", "no_port_path")]
+
+    # The save's judge, edge by edge, on the same fixture.
+    built_by_edge: dict[str, bool] = {}
+    for edge in canvas["edges"]:
+        single = {"nodes": canvas["nodes"], "edges": [edge]}
+        async with TestSessionLocal() as db:
+            built_by_edge[edge["id"]] = bool((await resolve_canvas_wiring(db, single)).specs)
+    rejected = {e.edge_id for e in validation.invalid_edges}
+    assert built_by_edge == {eid: eid not in rejected for eid in built_by_edge}
+
+    # The loose canvas PUT (the editor's draft write) reports it the same way.
+    rid = uuid.uuid4()
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
+    put = await client.put(
+        f"/internal/forks/{rid}/canvas", json={"canvas_data": canvas}, headers=_hdr()
+    )
+    assert put.status_code == 200, put.text
+    assert put.json()["valid"] is False
+    assert [(e["edge_id"], e["reason"]) for e in put.json()["invalid_edges"]] == [
+        ("e1", "no_port_path")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_save_fork_distinct_source_ports_share_common_final_hop(client):
     """Two edges with distinct source ports but the same target port share a hop.
 

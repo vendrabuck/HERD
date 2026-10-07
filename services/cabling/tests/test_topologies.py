@@ -860,6 +860,43 @@ async def test_validate_topology_reachable_edge(admin_client, user_client):
 
 
 @pytest.mark.asyncio
+async def test_validate_topology_reports_uncabled_chosen_ports(admin_client, user_client):
+    """Issue #1007: an edge whose chosen ports carry no cable is reported (the fork
+    save would build nothing for it), while the cabled sibling stays valid."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _seed_connection(admin_client, a, "eth1", b, "eth1")
+
+    create = await user_client.post("/topologies", json={"name": "Ported"})
+    topology_id = create.json()["id"]
+    canvas = _canvas_with_edge("nA", "nB", a, b)
+    cabled = canvas["edges"][0]
+    cabled["data"].update({"source_port_name": "eth1", "target_port_name": "eth1"})
+    canvas["edges"].append(
+        {
+            "id": "e2",
+            "source": "nA",
+            "target": "nB",
+            "data": {"layer": "L2", "source_port_name": "eth7", "target_port_name": "eth7"},
+        }
+    )
+    await user_client.put(f"/topologies/{topology_id}", json={"canvas_data": canvas})
+
+    resp = await user_client.post(f"/topologies/{topology_id}/validate")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is False
+    assert body["invalid_edges"] == [
+        {
+            "edge_id": "e2",
+            "source_device_id": str(a),
+            "target_device_id": str(b),
+            "layer": "L2",
+            "reason": "no_port_path",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_validate_topology_device_ids_field_lists_canvas_devices(admin_client, user_client):
     """The additive device_ids field (#701) lists every canvas device node,
     deduplicated and sorted, regardless of validity."""

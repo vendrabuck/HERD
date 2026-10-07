@@ -81,7 +81,12 @@ from app.models.fork import (
     ForkVersion,
     ReservationFork,
 )
-from app.services.canvas_nodes import classify_element_edge, node_to_device_map, node_to_element_map
+from app.services.canvas_nodes import (
+    classify_element_edge,
+    edge_port_constraints,
+    node_to_device_map,
+    node_to_element_map,
+)
 from app.services.l3_intent import L3NodeCandidate, RouteSpec
 from app.services.l3_validation import route_causes_invalid, validate_canvas_l3
 from app.services.pathfind_service import (
@@ -320,12 +325,9 @@ async def resolve_canvas_wiring(
         raw_edge_id = edge.get("id")
         edge_key = str(raw_edge_id) if raw_edge_id is not None else None
 
-        # Per-edge port constraints (issue #531). A blank string from the canvas is
-        # treated as absent, same as a missing key.
-        raw_source_port = edge_data.get("source_port_name")
-        raw_target_port = edge_data.get("target_port_name")
-        source_port = str(raw_source_port) if raw_source_port else None
-        target_port = str(raw_target_port) if raw_target_port else None
+        # Per-edge port constraints (issue #531), read through the helper the
+        # validator shares (issue #1007) so the two judges cannot drift.
+        source_port, target_port = edge_port_constraints(edge)
 
         edge_infos[idx] = (source_device, target_device, source_port, target_port, edge_key)
         if source_port is None and target_port is None:

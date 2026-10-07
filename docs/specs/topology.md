@@ -686,12 +686,15 @@ PUT and restore (TOPO-FORK-11, TOPO-FORK-12).
   `no_path`; one with a path is valid. \
   Enforced in: `services/cabling/app/services/topology_validation.py` (`validate_canvas_edges`) \
   Pinned by: `services/cabling/tests/test_topologies.py` (`test_validate_topology_reachable_edge`, `test_validate_topology_unreachable_edge`)
-- **TOPO-VAL-5.** The edge pass judges the device pair only: it does not read the edge's
-  `source_port_name` or `target_port_name`, so an edge whose named ports have no path is
-  reported valid when any path joins the two devices. Fork wiring does honor the ports
-  and builds nothing for such an edge (TOPO-FORK-18). Known gap, see #1007. \
-  Enforced in: `services/cabling/app/services/topology_validation.py` (`validate_canvas_edges`) \
-  Pinned by: none
+- **TOPO-VAL-5.** The edge pass judges a port-constrained edge by the fork save's rule
+  (TOPO-FORK-17, TOPO-FORK-18): when the edge names `source_port_name` or
+  `target_port_name`, the path must leave and arrive on those ports, with no fallback to
+  the device pair, and an edge no such path satisfies is `no_port_path`. Both judges read
+  the ports through one helper, so validation never calls valid an edge the save builds
+  nothing for (issue #1007). This applies wherever the edge pass runs: both validate
+  routes, reservation create, import, and the fork canvas PUT and restore. \
+  Enforced in: `services/cabling/app/services/topology_validation.py` (`validate_canvas_edges`); `services/cabling/app/services/canvas_nodes.py` (`edge_port_constraints`) \
+  Pinned by: `services/cabling/tests/test_forks.py` (`test_validator_and_save_judge_port_constrained_edges_alike`); `services/cabling/tests/test_topologies.py` (`test_validate_topology_reports_uncabled_chosen_ports`)
 - **TOPO-VAL-6.** `invalid_edges` lists problems in canvas edge order, each with
   `edge_id`, both device ids when known, the edge's `layer`, and `reason`. \
   Enforced in: `services/cabling/app/services/topology_validation.py` (`validate_canvas_edges`); `services/cabling/app/schemas/topology.py` (`InvalidEdge`) \
@@ -955,7 +958,9 @@ RES-FORK-17). Fork status, versions, and the restore marker are section 4.
   Pinned by: `services/cabling/tests/test_forks.py` (`test_save_fork_two_same_pair_edges_with_ports_resolve_to_two_wires`, `test_save_fork_two_same_pair_edges_without_ports_resolve_to_one_wire`, `test_save_fork_empty_string_port_names_treated_as_absent`, `test_save_fork_distinct_source_ports_share_common_final_hop`); `tests/integration/test_fork_save_port_resolution.py` (`test_activation_fork_resolves_two_port_distinct_edges_to_two_connections`)
 - **TOPO-FORK-18.** An edge with no path, or with port constraints no path satisfies,
   contributes no hop and never falls back to an unconstrained path; the save or create
-  still succeeds, and the answer does not name the skipped edge. Known gap, see #1007. \
+  still succeeds, and the answer does not name the skipped edge. Validation reports
+  such an edge before the save (`no_path` or `no_port_path`, TOPO-VAL-5); the save's own
+  answer naming it is still open, see #1007. \
   Enforced in: `services/cabling/app/services/fork_save_service.py` (`resolve_canvas_wiring`) \
   Pinned by: `services/cabling/tests/test_forks.py` (`test_save_fork_unresolvable_port_pair_does_not_fall_back`, `test_create_fork_skips_unreachable_edge`)
 - **TOPO-FORK-19.** A wire's identity is its two `(device, port)` endpoints in canonical
@@ -1663,9 +1668,8 @@ TOPO-BULK-4.
   two device nodes, as in the seeded "BROKEN - Half-Wired Chain" topology.
 - #985 (TOPO-UILIST-3): on the topologies page, a filter change made before the saved
   preferences load saves an empty search over the saved one.
-- #1007 (TOPO-VAL-5, TOPO-FORK-18): validation judges the device pair only, while the
-  fork save honors per-edge ports and skips an unresolvable constrained edge without
-  reporting it, so validation can call valid an edge the save builds nothing for.
+- #1007 (TOPO-FORK-18): validation now reports an unresolvable port-constrained edge,
+  but the fork save's own answer still does not name a skipped constrained edge.
 - #1008 (TOPO-CONN-9, TOPO-FORK-25): the single connection read has no visibility
   filter, and the fork read returns hops on devices outside a non-admin owner's
   visibility unredacted, while pathfind redacts the same hops (TOPO-PATH-9).
@@ -1713,7 +1717,6 @@ TOPO-BULK-4.
 ### Rules with no test
 
 - TOPO-CONN-11: deleting a connection that a live fork's wiring uses.
-- TOPO-VAL-5: the edge pass ignoring port names.
 - TOPO-VAL-14: `l3=0` on the internal validate skipping the routing pass (reservations
   pins that it sends `l3=0`; nothing in cabling pins the skip).
 - TOPO-STRIP-4: a PUT differing only in a non-allowlisted device key appending no
