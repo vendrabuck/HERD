@@ -308,3 +308,31 @@ a hover tooltip and a short dialog note stating the annotation-only
 behavior, and docs (TOPOLOGY_EDITOR.md, the manual, FEATURES.md,
 PLANNED_FEATURES.md) were corrected to stop describing it as a pending
 gap.
+
+## Amendment 2026-10-07: VLAN uniqueness is judged by current reachability (issue #1003)
+
+Decision 2 keeps `vlan_assignments` as the per-fabric allocation, arbitrated by the
+partial-unique index on ACTIVE (fabric, vlan). The stored `fabric_id` is a hash of the
+cabling component's member set, so it changes whenever a cable add or delete changes the
+component, and the old outage fallback substituted a per-switch `uuid5` id. Allocations
+made under different ids never saw each other's numbers, so two reservations could hold
+one number inside one connected component, and one reservation could hold two.
+
+As built: a VLAN number held by a live allocation anywhere in the connected cabling
+component of the switches being allocated for, transit switches included, is never
+given to another reservation, judged on the current graph at allocation time. Execution
+asks cabling's existing `GET /fabric/internal` for the current fabric id of the new
+switches and of every switch that anchors another live allocation (its definition scope,
+its defined switches, plus its stored fabric id as a conservative extra) and compares the
+answers: two switches are connected if and only if cabling answers the same id for both.
+A reservation's own reachable allocation is reused, and `_refresh_allocation_scopes` maps
+scope switches by the same current-id test. Because two rows in one component can carry
+different stored ids, the index can no longer arbitrate alone: allocation runs under one
+transaction-scoped advisory lock (`herd_common.advisory_lock.xact_lock`, fixed key
+`herd-execution-vlan-allocation`), with the index and the IntegrityError retry kept as a
+backstop. `fetch_fabric_id` fails closed: a non-200, a transport error, or an unparseable
+body raises `TransientUpstreamError`, the reconcile NAKs, and nothing is allocated; the
+`uuid5` stand-in is gone. Limit by decision: the check runs at allocation time only, so a
+cable added later that joins two components already holding one number is not
+re-checked, and the release supersession guard still compares stored fabric ids. No
+schema, route, or response shape changed.

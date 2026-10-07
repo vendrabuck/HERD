@@ -305,3 +305,29 @@ This section records where today's code differs from the decision text above (is
   or logs across a full create cycle. A unit run of a full create cycle shows the
   redaction marker and no plaintext in the run rows; the missing test is tracked in
   issue #1032.
+
+## As built (2026-10-07)
+
+Further differences from the decision text, recorded after the fixes for issues #1027,
+#1028, #1029, and #1032. The decisions themselves stand; the booking gate and the
+enforced enabled flag (issues #1053 and #1033) are noted under the hypervisor registry
+decision above.
+
+- Redaction test: the gap the previous section names is closed (issue #1032).
+  `test_full_recipe_cycle_never_stores_secret_plaintext` in
+  `services/execution/tests/test_nats_consumer_dynamic.py` runs a full create and
+  teardown cycle and asserts that no hypervisor secret value and no password-typed
+  template default appears in any column of any `ExecutionRun` row.
+- Recipe `login` results: the create, teardown, and compensation flows judge a recipe
+  `login` by its result through `recipe_session_succeeded` in `recipe_result.py` (a
+  present, falsy `success` fails, a missing key stays success), the same rule the
+  package validator applies to `login` and `logout`. A failed login on create is a
+  failed create; in teardown no `destroy_instance` runs and the row stays live
+  (issue #1027).
+- Teardown on a package download failure: only a broken package (`DriverPackageError`)
+  may end a teardown without a destroy. A download that fails while inventory or
+  package storage is briefly unreachable NAKs with the row unchanged, as the create
+  path already did (issue #1029).
+- Create after teardown: each request re-reads the reservation's status after its
+  `CREATING` row is committed and before any recipe call, so a request inserted after
+  another replica's teardown listed the rows creates nothing (issue #1028).
