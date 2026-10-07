@@ -50,8 +50,8 @@ MEDIUM, LOW) and a concrete target file path.
 
 ## Frontend: pages and components
 
-**38 page test files exist today**, covering every page under `frontend/src/pages/`
-except `ReservationCalendarPage`. The 2026-08-30 coverage batch (PRs #650 to #660)
+Every page under `frontend/src/pages/` has at least one test file today;
+`ReservationCalendarPage` was the last to get one (issue #1000). The 2026-08-30 coverage batch (PRs #650 to #660)
 added direct suites for the seven pages this register used to list as untested
 (`AddDevicePage`, `DeviceGroupsPage`, `GroupDetailPage`, `GroupsPage`, `UsersPage`,
 `TopologyPage`, `TopologyTemplatesPage`), plus three more `TopologyEditorPage`
@@ -63,9 +63,10 @@ ADR 0014 phase 2 (issue #34) added a fourth, `TopologyEditorPage.L3Routing`,
 covering the Routing panel's editor-level wiring (badge, validation toasts, the
 unsaved-routing-changes warning). `TopologyEditorPage.tsx` itself is now at 96.7% lines.
 
-- [HIGH] `frontend/src/pages/ReservationCalendarPage.tsx` (3.8% lines, no test
-  file). Calendar rendering, month navigation, and reservation-click handling are
-  all untested.
+- [HIGH] `frontend/src/pages/ReservationCalendarPage.tsx`: its suite
+  (`ReservationCalendarPage.test.tsx`, issue #1000) pins only the could-not-load
+  state on a 503 and the empty-range message. Calendar rendering, month navigation,
+  and reservation-click handling are still untested.
 
 Measured frontend coverage at the v0.6.0 release gate is 91.0% lines (89.65% statements, 82.09% branches, 89.14% functions; 1,636 tests, 148 test files).
 The per-file percentages below date from the 2026-09-09 refresh and were not re-measured for v0.6.0.
