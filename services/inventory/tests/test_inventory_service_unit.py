@@ -579,6 +579,36 @@ async def test_update_device_duplicate_name():
         with pytest.raises(HTTPException) as exc:
             await update_device(db, dev2.id, DeviceUpdate(name="Dev1"))
         assert exc.value.status_code == 409
+        assert exc.value.detail == "Device with name 'Dev1' already exists"
+
+
+@pytest.mark.asyncio
+async def test_update_device_non_unique_integrity_error_is_not_a_name_clash():
+    """issue #1016: every IntegrityError on update used to read as a name clash.
+    A NOT NULL (or any non-unique) violation now gets the generic 409."""
+    from unittest.mock import patch
+
+    from sqlalchemy.exc import IntegrityError
+
+    async with TestSessionLocal() as db:
+        template = await _create_template(db)
+        dev = await create_device(
+            db,
+            DeviceCreate(
+                name="Dev1",
+                template_id=template.id,
+                topology_type=TopologyType.PHYSICAL,
+                field_data={"model": "M1"},
+            ),
+        )
+        not_null = IntegrityError(
+            "UPDATE devices ...", {}, Exception("NOT NULL constraint failed: devices.status")
+        )
+        with patch.object(db, "commit", side_effect=not_null):
+            with pytest.raises(HTTPException) as exc:
+                await update_device(db, dev.id, DeviceUpdate(name="Dev1-renamed"))
+        assert exc.value.status_code == 409
+        assert exc.value.detail == "Device violates a database constraint"
 
 
 # --- delete_device ---

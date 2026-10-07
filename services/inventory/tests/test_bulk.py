@@ -665,3 +665,141 @@ async def test_non_utf8_import_file_is_422_naming_the_encoding(client, path):
     )
     devices = (await client.get("/devices")).json()["items"]
     assert devices == []
+
+
+# Partial-column device update (issue #1016) ---------------------------------
+
+
+async def _create_device_with_poll(client, template_id, name="FW-01") -> dict:
+    payload = {
+        "name": name,
+        "template_id": template_id,
+        "topology_type": "PHYSICAL",
+        "status": "AVAILABLE",
+        "field_data": {"model": "EX3300", "rack": "s3cret-rack"},
+        "poll_interval_seconds": 60,
+    }
+    resp = await client.post("/devices", json=payload)
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+async def _import(client, body: bytes, fmt: str) -> dict:
+    resp = await client.post(
+        "/devices/import",
+        params={"format": fmt},
+        files={"file": (f"d.{fmt}", io.BytesIO(body), "text/plain")},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def _device_by_name(client, name: str) -> dict:
+    devices = (await client.get("/devices")).json()["items"]
+    return next(d for d in devices if d["name"] == name)
+
+
+@pytest.mark.asyncio
+async def test_device_json_reimport_omitting_columns_keeps_stored_values(client):
+    """issue #1016: a JSON row without field_data or poll_interval_seconds
+    used to replace field_data with {} and clear the poll interval."""
+    template = await _create_template(client, name="Firewall")
+    await _create_device_with_poll(client, template["id"])
+    items = [{"name": "FW-01", "template_name": "Firewall", "status": "MAINTENANCE"}]
+    report = await _import(client, json.dumps(items).encode(), "json")
+    assert report["updated"] == 1, report
+    assert report["rejected"] == 0
+    fw = await _device_by_name(client, "FW-01")
+    assert fw["status"] == "MAINTENANCE"
+    assert fw["topology_type"] == "PHYSICAL"
+    assert fw["field_data"] == {"model": "EX3300", "rack": "s3cret-rack"}
+    assert fw["poll_interval_seconds"] == 60
+
+
+@pytest.mark.asyncio
+async def test_device_csv_export_drop_columns_reimport_keeps_omitted_values(client):
+    """Round trip: export CSV, delete the field_data and poll columns, edit
+    status, import. The omitted values survive and the edited one lands."""
+    template = await _create_template(client, name="Firewall")
+    await _create_device_with_poll(client, template["id"])
+    csv_body = (await client.get("/devices/export", params={"format": "csv"})).text
+
+    import csv as _csv
+
+    rows = list(_csv.DictReader(io.StringIO(csv_body)))
+    keep = ["name", "template_name", "topology_type", "status"]
+    out = io.StringIO()
+    writer = _csv.DictWriter(out, fieldnames=keep, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        row["status"] = "OFFLINE"
+        writer.writerow(row)
+
+    report = await _import(client, out.getvalue().encode(), "csv")
+    assert report["updated"] == 1, report
+    fw = await _device_by_name(client, "FW-01")
+    assert fw["status"] == "OFFLINE"
+    assert fw["field_data"] == {"model": "EX3300", "rack": "s3cret-rack"}
+    assert fw["poll_interval_seconds"] == 60
+
+
+@pytest.mark.asyncio
+async def test_device_csv_name_and_template_only_is_a_no_op_update(client):
+    """The issue's CSV repro: `name,template_name` for an existing device used
+    to be rejected as "Device with name ... already exists" (a NOT NULL failure
+    on the omitted status and topology_type). It is now an update that changes
+    nothing."""
+    template = await _create_template(client, name="Firewall")
+    before = await _create_device_with_poll(client, template["id"])
+    report = await _import(client, b"name,template_name\nFW-01,Firewall\n", "csv")
+    assert report["updated"] == 1, report
+    assert report["rejected"] == 0
+    after = await _device_by_name(client, "FW-01")
+    for key in ("status", "topology_type", "field_data", "poll_interval_seconds"):
+        assert after[key] == before[key]
+
+
+@pytest.mark.asyncio
+async def test_device_import_create_without_topology_type_names_the_field(client):
+    await _create_template(client, name="Firewall")
+    items = [{"name": "NEW-01", "template_name": "Firewall", "field_data": {"model": "X"}}]
+    report = await _import(client, json.dumps(items).encode(), "json")
+    assert report["rejected"] == 1
+    assert report["rows"][0]["reason"] == "missing required field: topology_type"
+    assert all(d["name"] != "NEW-01" for d in (await client.get("/devices")).json()["items"])
+
+
+@pytest.mark.asyncio
+async def test_device_import_schema_error_reason_names_field_and_omits_input(client):
+    """A schema error names the failing field and never echoes the row's
+    input (str(ValidationError) carried the whole field_data)."""
+    await _create_template(client, name="Firewall")
+    items = [
+        {
+            "name": "NEW-02",
+            "template_name": "Firewall",
+            "topology_type": "PHYSICAL",
+            "status": "BROKEN",
+            "field_data": {"model": "X", "rack": "s3cret-rack"},
+        }
+    ]
+    report = await _import(client, json.dumps(items).encode(), "json")
+    assert report["rejected"] == 1
+    reason = report["rows"][0]["reason"]
+    assert reason.startswith("status: Input should be")
+    assert "s3cret-rack" not in reason
+    assert "errors.pydantic.dev" not in reason
+
+
+@pytest.mark.asyncio
+async def test_put_device_explicit_null_status_is_422_naming_the_field(client):
+    """issue #1016: `PUT /devices/{id}` with `{"status": null}` answered 409
+    "Device with name ... already exists"."""
+    template = await _create_template(client, name="Firewall")
+    dev = await _create_device_with_poll(client, template["id"])
+    resp = await client.put(f"/devices/{dev['id']}", json={"status": None})
+    assert resp.status_code == 422
+    assert [e["msg"] for e in resp.json()["detail"]] == [
+        "Value error, status cannot be null; omit the field to leave it unchanged"
+    ]
+    assert (await _device_by_name(client, "FW-01"))["status"] == "AVAILABLE"

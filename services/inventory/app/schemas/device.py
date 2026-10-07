@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 from app.models.device import DeviceStatus, TopologyType
 
@@ -61,6 +61,19 @@ class DeviceUpdate(BaseModel):
     status: DeviceStatus | None = None
     field_data: dict[str, Any] | None = None
     poll_interval_seconds: int | None = None
+
+    @field_validator("name", "topology_type", "status", "field_data", mode="before")
+    @classmethod
+    def _refuse_explicit_null(cls, v: Any, info: ValidationInfo) -> Any:
+        # These four map to NOT NULL columns. An omitted field is left alone
+        # (update_device applies exclude_unset); an explicit null used to reach
+        # the commit and fail as a NOT NULL violation that was reported as a
+        # name clash (issue #1016). Refuse it here, by field name, as a 422.
+        if v is None:
+            raise ValueError(
+                f"{info.field_name} cannot be null; omit the field to leave it unchanged"
+            )
+        return v
 
     @field_validator("poll_interval_seconds")
     @classmethod

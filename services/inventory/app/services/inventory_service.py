@@ -10,6 +10,7 @@ from app.models.device import Device, DeviceStatus, TopologyType
 from app.models.driver_package import ConnectionType, DriverPackage
 from app.models.template import DeviceTemplate
 from app.schemas.device import DeviceCreate, DeviceUpdate
+from app.services.template_service import _integrity_kind
 
 
 def validate_field_data(
@@ -204,12 +205,20 @@ async def update_device(
         setattr(device, field, value)
     try:
         await db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         await db.rollback()
+        # Only a unique violation is a name clash (the name is the only unique
+        # column an update can change). Anything else keeps a generic 409 so it
+        # is never mislabeled as a duplicate name (issue #1016), the same split
+        # template_service._integrity_http_error makes.
+        if _integrity_kind(exc) == "unique":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Device with name '{device_name}' already exists",
+            ) from exc
         raise HTTPException(
-            status_code=409,
-            detail=f"Device with name '{device_name}' already exists",
-        )
+            status_code=409, detail="Device violates a database constraint"
+        ) from exc
     await db.refresh(device)
     return device
 

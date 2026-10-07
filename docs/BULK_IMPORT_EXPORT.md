@@ -126,6 +126,15 @@ field_data, poll_interval_seconds`. `field_data` is a JSON object encoded into a
 single cell. `topology_type` is `PHYSICAL` or `CLOUD`; `status` is one of
 `AVAILABLE`, `RESERVED`, `OFFLINE`, `MAINTENANCE`.
 
+A row whose `name` matches an existing device updates it in place, and only the
+columns the row carries with a value are written: an omitted or empty
+`topology_type`, `status`, `field_data`, or `poll_interval_seconds` keeps the
+stored value, so a file with only `name, template_name, status` changes the
+status and nothing else. A `field_data` cell that is present replaces the whole
+object. An import cannot clear a poll interval override; use the device update
+route for that. A row for a new device must carry `topology_type`, or it is
+rejected with `missing required field: topology_type`.
+
 ### Templates
 
 ```json

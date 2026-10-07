@@ -91,10 +91,29 @@ def test_device_create_name_over_cap_rejected():
 
 
 def test_device_update_name_empty_rejected():
-    # An explicit empty rename is invalid; omitting name (None) is allowed.
+    # An explicit empty rename is invalid; omitting name is allowed.
     with pytest.raises(ValidationError):
         DeviceUpdate(name="")
-    DeviceUpdate(name=None)
+    DeviceUpdate()
+
+
+@pytest.mark.parametrize("field", ["name", "topology_type", "status", "field_data"])
+def test_device_update_explicit_null_on_not_null_column_rejected_by_name(field):
+    """issue #1016: an explicit null on a NOT NULL column used to reach the
+    commit and come back as a name clash. It is refused here, naming the field."""
+    with pytest.raises(ValidationError) as exc:
+        DeviceUpdate(**{field: None})
+    errors = exc.value.errors(include_input=False, include_url=False)
+    assert [(e["loc"], e["msg"]) for e in errors] == [
+        ((field,), f"Value error, {field} cannot be null; omit the field to leave it unchanged")
+    ]
+
+
+def test_device_update_explicit_null_poll_interval_still_clears_the_override():
+    # poll_interval_seconds is nullable: null means "no per-device override".
+    assert DeviceUpdate(poll_interval_seconds=None).model_dump(exclude_unset=True) == {
+        "poll_interval_seconds": None
+    }
 
 
 def test_device_update_name_at_cap_accepted():
