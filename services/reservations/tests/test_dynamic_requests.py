@@ -905,7 +905,10 @@ async def test_restart_backstop_reverts_stranded_physical_reservation():
     is reverted to PENDING, not failed, so a later claim cycle re-activates it.
     No reservation.created was emitted yet (it commits with ACTIVE), so nothing
     was provisioned and there is nothing to tear down: the fix reclaims rather
-    than fails. No reservation.failed is staged and no device is released."""
+    than fails. No reservation.failed is staged. A PENDING row holds nothing
+    (issue #897), and a later cancel or elapsed-window failure writes no inventory
+    status for it, so the revert releases the devices the stranded attempt set
+    RESERVED (issue #993); a later claim re-flips them."""
     update_mock = AsyncMock()
     rid = await _insert_reservation(
         ReservationStatus.PENDING_PROVISION,
@@ -917,9 +920,10 @@ async def test_restart_backstop_reverts_stranded_physical_reservation():
     res = await _get_reservation(rid)
     assert res.status == ReservationStatus.PENDING
     assert await _outbox_rows("herd.reservations.failed") == []
-    # A revert flips no inventory status; the device release loop is for FAILED
-    # rows only. Re-activation on the next cycle re-flips exclusive devices.
-    update_mock.assert_not_called()
+    # The revert releases the row's exclusive device exactly once (issue #993).
+    update_mock.assert_awaited_once()
+    assert update_mock.await_args.args[1] == "AVAILABLE"
+    assert [str(d) for d in update_mock.await_args.args[0]] == [str(DEVICE_A)]
 
 
 async def test_restart_backstop_reclaims_and_reactivates_across_cycles():

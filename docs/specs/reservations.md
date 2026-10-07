@@ -81,7 +81,7 @@ numbered rules in section 8; section 5 names the caller condition for each route
 | `PENDING_PROVISION` | `ACTIVE` | `POST /internal/{id}/provision-result` | succeeded | `reservation.created` | RES-DYN-6, RES-DYN-7 |
 | `PENDING_PROVISION` | `FAILED` | `POST /internal/{id}/provision-result` | failed | `reservation.failed` | RES-DYN-6, RES-DYN-8 |
 | `PENDING_PROVISION` | `FAILED` | expiration sweep (dynamic timeout backstop) | dynamic requests; `updated_at` older than `PROVISION_TIMEOUT_SECONDS` | `reservation.failed` | RES-SWEEP-6, RES-SWEEP-8 |
-| `PENDING_PROVISION` | `PENDING` | expiration sweep (restart backstop) | no dynamic request; `updated_at` older than `PROVISION_TIMEOUT_SECONDS` | nothing | RES-SWEEP-7, RES-SWEEP-8 |
+| `PENDING_PROVISION` | `PENDING` | expiration sweep (restart backstop) | no dynamic request; `updated_at` older than `PROVISION_TIMEOUT_SECONDS` | nothing (the row's exclusive devices are released, holder-aware) | RES-SWEEP-7, RES-SWEEP-8 |
 | `ACTIVE` | `COMPLETED` | expiration sweep (auto-complete) | `end_time <= now` | `reservation.completed` | RES-SWEEP-4 |
 | `ACTIVE` | `COMPLETED` | `PUT /{id}/release` | owner only | `reservation.completed` | RES-RELEASE-3, RES-RELEASE-4 |
 | `PENDING`, `PENDING_PROVISION`, `ACTIVE` | `CANCELLED` | `DELETE /{id}` | owner or admin | `reservation.cancelled` | RES-CANCEL-3, RES-CANCEL-4, RES-CANCEL-5 |
@@ -182,10 +182,13 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_timeout_backstop_fails_stuck_dynamic_reservation`, `test_timeout_backstop_leaves_fresh_dynamic_reservation`); `services/reservations/tests/test_fork_archive_reconcile.py` (`test_timeout_backstop_failed_archives_fork`)
 - **RES-SWEEP-7.** A physical-only `PENDING_PROVISION` row stranded past the same
   deadline is moved back to `PENDING` by compare-and-swap, so a later tick re-activates
-  it; nothing is released or torn down. Devices the stranded attempt already set
-  `RESERVED` stay `RESERVED` while the row is `PENDING`. Known gap, see #993. \
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
-  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_restart_backstop_reverts_stranded_physical_reservation`, `test_restart_backstop_reclaims_and_reactivates_across_cycles`, `test_restart_backstop_skips_row_activated_concurrently`)
+  it; nothing is torn down. Only the writer whose compare-and-swap won then releases
+  the row's exclusive devices through the holder-aware filter (RES-HOLD-1: a `PENDING`
+  row holds nothing, and a later cancel or elapsed-window failure writes no inventory
+  status), after the commit and before the tick's claimed rows activate; a device
+  another live row holds is skipped. A later claim re-flips the devices. \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`); `services/reservations/app/services/reservation_service.py` (`_release_exclusive_devices_best_effort`, `release_devices_not_held_by_others`) \
+  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_restart_backstop_reverts_stranded_physical_reservation`, `test_restart_backstop_reclaims_and_reactivates_across_cycles`, `test_restart_backstop_skips_row_activated_concurrently`); `services/reservations/tests/test_restart_backstop_release.py` (`test_restart_backstop_revert_releases_the_rows_devices`, `test_restart_backstop_revert_then_elapsed_window_releases_exactly_once`, `test_restart_backstop_revert_then_cancel_leaves_nothing_reserved`, `test_restart_backstop_release_skips_a_device_another_live_row_holds`, `test_restart_backstop_lost_cas_releases_nothing`)
 - **RES-SWEEP-8.** `PROVISION_TIMEOUT_SECONDS=0` disables both provisioning backstops. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_timeout_backstop_disabled_when_zero`, `test_restart_backstop_disabled_when_timeout_zero`)
@@ -502,8 +505,8 @@ runs after the commit.
   reservation path. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_release_exclusive_devices_best_effort`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_non_exclusive_device_status_not_changed`, `test_cancel_non_exclusive_skips_status_update`)
-- **RES-HOLD-3.** Cancel, release, provision failure, the dynamic timeout, auto-complete,
-  and lost-activation reverts skip any device another `PENDING_PROVISION` or `ACTIVE`
+- **RES-HOLD-3.** Cancel, release, provision failure, the dynamic timeout, the restart
+  backstop's revert, auto-complete, and lost-activation reverts skip any device another `PENDING_PROVISION` or `ACTIVE`
   reservation holds, logging `release_skipped_device_held`. The create-path flip-failure
   revert (RES-CREATE-15) and PATCH removal (RES-PATCH-10) do not use this check. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`release_devices_not_held_by_others`) \
@@ -512,10 +515,11 @@ runs after the commit.
   device (fail open toward releasing). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`release_devices_not_held_by_others`) \
   Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_holder_lookup_failure_falls_back_to_releasing`)
-- **RES-HOLD-5.** Cancel, release, provision failure, and the dynamic timeout share one
-  release helper: a device whose exclusivity cannot be read is treated as exclusive, and
-  a device inventory answers 404 for is dropped from the release set. Auto-complete
-  reads exclusivity itself and follows RES-HOLD-9 instead. \
+- **RES-HOLD-5.** Cancel, release, provision failure, the dynamic timeout, and the
+  restart backstop's revert share one release helper: a device whose exclusivity cannot
+  be read is treated as exclusive, and a device inventory answers 404 for is dropped
+  from the release set. Auto-complete reads exclusivity itself and follows RES-HOLD-9
+  instead. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_release_exclusive_devices_best_effort`, `_DeviceGoneFromInventory`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_cancel_fetch_failure_falls_back_to_exclusive`); `services/reservations/tests/test_reservation_service_unit.py` (`test_release_exclusive_devices_drops_404_fetch_result`)
 - **RES-HOLD-6.** A 404 from inventory when setting a device `AVAILABLE` counts as
@@ -1236,10 +1240,6 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
 
 ### Open defects
 
-- #993 (RES-SWEEP-7): the physical-only restart backstop returns a row to `PENDING`
-  without releasing devices the stranded attempt already set `RESERVED`. If that row is
-  then cancelled while `PENDING` (RES-HOLD-1), or its window elapses (RES-SWEEP-3 makes
-  no inventory call), those devices stay `RESERVED` with no holder.
 - #994 (RES-PATCH-10, RES-HOLD-3): PATCH writes inventory before the edit commits, in
   one attempt whose failure is only logged, so an added exclusive device can stay
   `AVAILABLE` while held. The removal write skips the holder check every other release

@@ -1481,6 +1481,8 @@ async def _release_exclusive_devices_best_effort(
     excluded from the conflict status set, so devices left RESERVED would be
     orphaned (unbookable, nothing referencing them). Best-effort with bounded
     retry; the FAILED transition is already committed and is never reverted.
+    The expiration sweep's restart backstop also uses it for a row it reverted
+    to PENDING (issue #993), since a PENDING row holds nothing either.
 
     `context_label` names the caller's operation for the per-device fetch-
     failure warning and the retry-exhausted error message (e.g. "cancel" or

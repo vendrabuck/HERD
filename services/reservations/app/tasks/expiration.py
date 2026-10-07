@@ -406,6 +406,7 @@ async def _run_expiration_cycle() -> None:
         # reclaiming every in-flight provisioning. Physical-only rows take the
         # revert branch below, not this failing one.
         stuck: list[Reservation] = []
+        reverted: list[Reservation] = []
         if settings.provision_timeout_seconds > 0:
             deadline = now - timedelta(seconds=settings.provision_timeout_seconds)
             result = await db.execute(
@@ -459,9 +460,14 @@ async def _run_expiration_cycle() -> None:
             # ACTIVE transition), so no execution provisioning ran and there is
             # nothing to tear down; re-activation re-flips the exclusive devices
             # idempotently. PENDING is in the conflict set, so the window stays
-            # held across the revert. The NOT EXISTS mirrors the dynamic branch's
-            # EXISTS, so the two backstops partition PENDING_PROVISION and never
-            # both touch one row.
+            # held across the revert. A PENDING row holds nothing in inventory
+            # (issue #897), so every later path (cancel, the elapsed-window
+            # failure) assumes there is nothing to release; the devices the
+            # stranded attempt set RESERVED are therefore released below, after
+            # the commit and only for rows whose revert this call won (issue
+            # #993). The NOT EXISTS mirrors the dynamic branch's EXISTS, so the
+            # two backstops partition PENDING_PROVISION and never both touch one
+            # row.
             result = await db.execute(
                 select(Reservation).where(
                     and_(
@@ -480,6 +486,7 @@ async def _run_expiration_cycle() -> None:
                 # row, i.e. the genuine restart-strand case.
                 if not await _claim_provision_transition(db, res.id, ReservationStatus.PENDING):
                     continue
+                reverted.append(res)
                 logger.warning(
                     "Reclaiming stranded physical reservation %s; reverting to PENDING",
                     res.id,
@@ -520,6 +527,22 @@ async def _run_expiration_cycle() -> None:
         # Freeze the fork as the as-built record now the reservation is COMPLETED
         # (ADR 0006 Decision 5). Best-effort, mirroring the manual release path.
         await _archive_reservation_fork_best_effort(res.id)
+
+    # Release the devices of rows the restart backstop reverted to PENDING (issue
+    # #993). The revert committed above, so the row now holds nothing; leaving its
+    # devices RESERVED would orphan them if the row is then cancelled or its window
+    # elapses, since neither path writes inventory for a PENDING row. Holder-aware
+    # through the shared release helper: a row claimed above (PENDING_PROVISION) or
+    # any other live holder keeps its device. Like the completed release, this runs
+    # BEFORE the claimed rows activate. A later claim of the reverted row re-flips
+    # its devices.
+    for res in reverted:
+        await _release_exclusive_devices_best_effort(
+            res.id,
+            list(res.device_ids),
+            "provision_restart_release",
+            context_label="restart backstop",
+        )
 
     # Provision each claimed reservation now that the claim is committed and the
     # row lock is released: flip inventory, mark ACTIVE, fork, emit
