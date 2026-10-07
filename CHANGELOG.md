@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed: the fork save lists every line whose chosen ports no cable path joins in a new `constrained_edges_skipped` field (it still answers 200 and never wires other ports), and the editor's save toast names each such line by device and port and stays until dismissed (#1007).
+- Fixed: a directory-group mapping create the directory cannot validate answers 503 with the fixed detail `Directory unavailable, mapping not validated`; the directory error text goes to the log message only (#1009).
 - Fixed: a filter, page size, or sort changed on the Inventory, Reservations, or Topologies page before the saved preferences finished loading no longer saves an empty search over the saved one; the store holds such writes until the load settles, applies only what the user changed on top of the loaded values, and saves the result once (#985).
 - Fixed: the device page's Save sends only the fields the admin changed since clicking Edit, and Edit starts from the current device, so a rename no longer writes back a stale status over one provisioning set meanwhile (#1020).
 - Fixed: the topology editor opens a stored node that has no device (the seeded "BROKEN" topologies) instead of crashing into the error boundary; the node renders as "Unknown device" and a new connection to it is refused with a toast (#989).
