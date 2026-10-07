@@ -46,6 +46,9 @@ from app.tasks.ldap_sync_loop import effective_interval_seconds
 
 logger = logging.getLogger(__name__)
 
+# Fixed 503 detail for a mapping create the directory could not validate.
+MAPPING_DIRECTORY_UNAVAILABLE_DETAIL = "Directory unavailable, mapping not validated"
+
 router = APIRouter(prefix="/admin/ldap-sync", tags=["ldap-sync"])
 
 _admin_or_superadmin = Depends(require_role(Role.ADMIN, Role.SUPERADMIN))
@@ -125,10 +128,23 @@ async def create_mapping(
     try:
         entry = await ldap_service.fetch_group(body.group_dn)
     except ldap_service.LdapUnavailableError as exc:
-        # Nothing was proven; do not let an outage read as a bad DN.
+        # Nothing was proven; do not let an outage read as a bad DN. The
+        # directory client's text can carry the underlying exception (server
+        # address, bind result), so it goes to the log message only and the
+        # response detail is fixed (issue #1009, the class-name-only rule).
+        logger.warning(
+            "LDAP group mapping not validated, directory unavailable: %s",
+            exc,
+            extra={
+                "action": "ldap_mapping_directory_unavailable",
+                "group_dn": body.group_dn,
+                "herd_group_id": str(body.herd_group_id),
+                "exception_class": type(exc).__name__,
+            },
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Directory unavailable, mapping not validated: {exc}",
+            detail=MAPPING_DIRECTORY_UNAVAILABLE_DETAIL,
         )
     if entry is None:
         raise HTTPException(

@@ -962,11 +962,15 @@ RES-FORK-17). Fork status, versions, and the restore marker are section 4.
   Pinned by: `services/cabling/tests/test_forks.py` (`test_save_fork_two_same_pair_edges_with_ports_resolve_to_two_wires`, `test_save_fork_two_same_pair_edges_without_ports_resolve_to_one_wire`, `test_save_fork_empty_string_port_names_treated_as_absent`, `test_save_fork_distinct_source_ports_share_common_final_hop`); `tests/integration/test_fork_save_port_resolution.py` (`test_activation_fork_resolves_two_port_distinct_edges_to_two_connections`)
 - **TOPO-FORK-18.** An edge with no path, or with port constraints no path satisfies,
   contributes no hop and never falls back to an unconstrained path; the save or create
-  still succeeds, and the answer does not name the skipped edge. Validation reports
-  such an edge before the save (`no_path` or `no_port_path`, TOPO-VAL-5); the save's own
-  answer naming it is still open, see #1007. \
-  Enforced in: `services/cabling/app/services/fork_save_service.py` (`resolve_canvas_wiring`) \
-  Pinned by: `services/cabling/tests/test_forks.py` (`test_save_fork_unresolvable_port_pair_does_not_fall_back`, `test_create_fork_skips_unreachable_edge`)
+  still succeeds (200 by decision: the no-fallback rule of issue #531 stands and the
+  rest of the canvas is still reconciled). Validation reports such an edge before the
+  save (`no_path` or `no_port_path`, TOPO-VAL-5). The save's answer lists every
+  port-constrained edge it built nothing for in `constrained_edges_skipped`, in canvas
+  edge order, each with `edge_id`, both device ids, and both chosen port names (null for
+  an unconstrained side); an unconstrained edge with no path is not listed there
+  (issue #1007). \
+  Enforced in: `services/cabling/app/services/fork_save_service.py` (`resolve_canvas_wiring`, `SkippedConstrainedEdge`, `save_fork`); `services/cabling/app/schemas/fork.py` (`SkippedConstrainedEdgeResponse`, `ForkSaveResponse`) \
+  Pinned by: `services/cabling/tests/test_forks.py` (`test_save_fork_unresolvable_port_pair_does_not_fall_back`, `test_save_fork_constrained_edges_skipped_scope`, `test_resolve_canvas_wiring_lists_skipped_constrained_edges_in_edge_order`, `test_create_fork_skips_unreachable_edge`)
 - **TOPO-FORK-19.** A wire's identity is its two `(device, port)` endpoints in canonical
   order plus its layer; the edge id and connection id are not part of it. Save deletes
   the old wires missing from the new set, then inserts the new ones missing from the old
@@ -1526,9 +1530,13 @@ reservation's fork opens read-only.
   Enforced in: `frontend/src/lib/forkDiff.ts` (`edgeIdentityKey`, `diffForkCanvases`) \
   Pinned by: `frontend/src/test/lib/forkDiff.test.ts` (`does not report churn for the same wire re-drawn under a new edge id`, `uses multiset semantics for same-key edges, not set membership (coordinator review)`, `differs when the port names differ`, `reports a change when the destination text differs, even if it would canonicalize to the same network`)
 - **TOPO-UIFORK-9.** A successful commit shows the version and the released, built, and
-  unchanged counts, with the skipped attachment count only when above zero. \
-  Enforced in: `frontend/src/components/topology-editor/ForkSaveResultToast.tsx` (`ForkSaveResultToast`) \
-  Pinned by: `frontend/src/test/components/ForkSaveResultToast.test.tsx` (`shows the version and released/built/unchanged counts`, `omits the element attachments clause when the count is undefined or zero`, `shows the element attachments clause when the count is greater than zero`)
+  unchanged counts, with the skipped attachment count only when above zero. When the
+  save lists `constrained_edges_skipped` (TOPO-FORK-18), the toast names each such line
+  as device name and port to device name and port (short id when the canvas has no
+  name, "any port" for an unconstrained side) outside the expandable detail, and the
+  toast stays until dismissed (issue #1007). \
+  Enforced in: `frontend/src/components/topology-editor/ForkSaveResultToast.tsx` (`ForkSaveResultToast`); `frontend/src/lib/forkSaveResult.ts` (`skippedEdgeText`); `frontend/src/pages/TopologyEditorPage.tsx` (`handleCommitToReservation`) \
+  Pinned by: `frontend/src/test/components/ForkSaveResultToast.test.tsx` (`shows the version and released/built/unchanged counts`, `omits the element attachments clause when the count is undefined or zero`, `shows the element attachments clause when the count is greater than zero`, `names each line the save could not wire on its chosen ports (issue #1007)`, `omits the not-wired block when the list is absent or empty`); `tests/e2e/test_fork_save_skipped_edge_playwright.py` (`test_fork_save_toast_names_a_line_on_unjoined_ports`)
 
 **Out of scope.** Who may open the fork, and the Edit topology entry point, are
 `reservations.md` (RES-FORK-4, RES-FORK-19). The Wiring tab is
@@ -1678,8 +1686,7 @@ TOPO-BULK-4.
 
 ### Open defects
 
-- #1007 (TOPO-FORK-18): validation now reports an unresolvable port-constrained edge,
-  but the fork save's own answer still does not name a skipped constrained edge.
+None at present.
 
 ### Limits by decision
 

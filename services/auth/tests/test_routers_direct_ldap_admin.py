@@ -176,7 +176,7 @@ async def test_create_mapping_direct_directory_unavailable_503(monkeypatch):
         with pytest.raises(HTTPException) as exc:
             await create_mapping(body, db=db, current_user=admin)
         assert exc.value.status_code == 503
-        assert "not validated" in exc.value.detail
+        assert exc.value.detail == "Directory unavailable, mapping not validated"
 
 
 @pytest.mark.asyncio

@@ -1676,6 +1676,93 @@ async def test_save_fork_unresolvable_port_pair_does_not_fall_back(client):
     assert len(built) == 1
     assert built[0]["edge_key"] == "e0"
     assert _endpoint_set(built[0]) == frozenset({(str(a), "a0"), (str(b), "b0")})
+    # Issue #1007: the save names the edge it built nothing for, exactly.
+    assert resp.json()["constrained_edges_skipped"] == [
+        {
+            "edge_id": "e1",
+            "source_device_id": str(a),
+            "target_device_id": str(b),
+            "source_port_name": "a9",
+            "target_port_name": "b9",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_save_fork_constrained_edges_skipped_scope(client):
+    """Issue #1007: only port-constrained edges with no path are listed.
+
+    e0 is cabled and built; e1 is constrained on one side to an uncabled port
+    (listed, the unconstrained side reported as None); e2 has no chosen ports and
+    no path at all (not listed: validation reports it as no_path, and nothing
+    about the user's port choice was dropped); e3 has no chosen ports and a path
+    (built). A fully resolvable save answers an empty list.
+    """
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    rid = uuid.uuid4()
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
+    canvas = _canvas_with_edge_data(
+        [a, b, c],
+        [
+            (0, 1, {"source_port_name": "a0", "target_port_name": "b0"}),
+            (0, 1, {"source_port_name": "a7", "target_port_name": ""}),
+            (0, 2, {}),
+            (0, 1, {}),
+        ],
+    )
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": canvas, "member_device_ids": _members(canvas)},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["constrained_edges_skipped"] == [
+        {
+            "edge_id": "e1",
+            "source_device_id": str(a),
+            "target_device_id": str(b),
+            "source_port_name": "a7",
+            "target_port_name": None,
+        }
+    ]
+
+    ok_canvas = _canvas_with_edge_data(
+        [a, b], [(0, 1, {"source_port_name": "a0", "target_port_name": "b0"})]
+    )
+    resp = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": ok_canvas, "member_device_ids": _members(ok_canvas)},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["constrained_edges_skipped"] == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_canvas_wiring_lists_skipped_constrained_edges_in_edge_order(client):
+    """The resolver returns skipped constrained edges in canvas edge order (issue #1007)."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", b, "b0")
+    canvas = _canvas_with_edge_data(
+        [a, b],
+        [
+            (0, 1, {"source_port_name": "a9", "target_port_name": "b9"}),
+            (0, 1, {"source_port_name": "a0", "target_port_name": "b0"}),
+            (0, 1, {"source_port_name": "", "target_port_name": "b8"}),
+        ],
+    )
+    async with TestSessionLocal() as db:
+        resolution = await resolve_canvas_wiring(db, canvas)
+    assert len(resolution.specs) == 1
+    assert [
+        (s.edge_id, s.source_port_name, s.target_port_name)
+        for s in resolution.constrained_edges_skipped
+    ] == [("e0", "a9", "b9"), ("e2", None, "b8")]
 
 
 @pytest.mark.asyncio
