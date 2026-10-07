@@ -789,11 +789,12 @@ to one or more user groups; that grant is what lets a non-admin see a device.
   answers 503. \
   Enforced in: `services/inventory/app/routers/device_groups.py` (`get_device_groups_for_device_endpoint`, `_fetch_user_group_names`) \
   Pinned by: `services/inventory/tests/test_device_groups.py` (`test_device_groups_for_device_resolves_names`, `test_device_groups_for_device_returns_503_when_auth_service_down`, `test_fetch_user_group_names_success_maps_wanted_ids`)
-- **INV-GRP-12.** The name lookup sends no paging parameters, so it reads auth's first
-  page only (50 user groups, oldest first); a user group beyond it is listed with a
-  null name. Known gap, see #1021. \
-  Enforced in: `services/inventory/app/routers/device_groups.py` (`_fetch_user_group_names`) \
-  Pinned by: none
+- **INV-GRP-12.** The name lookup pages through auth's group list at auth's maximum
+  page size (500) until every wanted user group is named or the list ends, so a user
+  group on any page gets its name; only a user group auth no longer lists has a null
+  name. A failure on any page answers the 503 of INV-GRP-11. \
+  Enforced in: `services/inventory/app/routers/device_groups.py` (`_fetch_user_group_names`, `_AUTH_GROUP_PAGE_SIZE`) \
+  Pinned by: `services/inventory/tests/test_device_groups.py` (`test_fetch_user_group_names_pages_until_every_wanted_id_is_named`, `test_fetch_user_group_names_stops_once_every_wanted_id_is_named`, `test_fetch_user_group_names_unknown_id_stops_at_end_of_list_with_no_name`, `test_fetch_user_group_names_second_page_failure_is_503`)
 - **INV-GRP-13.** For a non-admin, a hidden device answers the same 404 as an unknown
   one (INV-VIS-6). \
   Enforced in: `services/inventory/app/routers/device_groups.py` (`get_device_groups_for_device_endpoint`) \
@@ -1337,7 +1338,7 @@ A rejected import row is not an HTTP error: it is a `reject` entry with a `reaso
 | Direction | Peer | Call | Purpose | On failure |
 |---|---|---|---|---|
 | inventory to auth | auth | `GET /groups/user/{id}` with the caller's JWT | a non-admin's user groups, for visibility | fail closed: 503 (INV-VIS-2) |
-| inventory to auth | auth | `GET /groups` with the caller's JWT | user group names for the by-device group lookup | fail closed: 503 (INV-GRP-11) |
+| inventory to auth | auth | `GET /groups?skip=&limit=500` with the caller's JWT, paged until every wanted id is named | user group names for the by-device group lookup | fail closed: 503 (INV-GRP-11) |
 | inventory to reservations | reservations | `GET /internal/by-device/{id}` (`X-Internal-Token`, 5 s) | delete guard: reservations booking the device | fail closed: 503, a non-JSON 200 included (INV-DEL-5, INV-DEL-6) |
 | inventory to cabling | cabling | `GET /internal/forks/by-device/{id}` (`X-Internal-Token`, 5 s) | delete guard: fork wiring and connections naming the device | fail closed: 503 (INV-DEL-5) |
 | inventory to secrets | secrets | `GET /internal/secrets/{id}/value` (`X-Internal-Token`, 10 s); only the status code is read | hypervisor secret exists | fail closed: 404 is 422, anything else 503 (INV-HYP-3, INV-HYP-4) |
@@ -1392,7 +1393,6 @@ INV-PORT-6, by a throwaway script against the service on SQLite with foreign key
   a status change made elsewhere in the meantime is overwritten. The admin status write
   itself ignoring reservation holds is intended (INV-STATUS-9, under Limits by
   decision).
-- #1021 (INV-GRP-12): user group names are resolved from auth's first page only.
 - #1023 (INV-PORT-8): a port delete has no cabling guard, and neither has a port
   rename (INV-PORT-7 changes the name with no cabling check), so a connection can name
   a port that no longer exists under that name.
@@ -1437,7 +1437,6 @@ exist); #1025 tracks the corrections.
 - INV-RED-4: redaction covers only the template's password keys.
 - INV-BATCH-4: the batch does not force `dut_only`.
 - INV-PORT-9: repeated port names on one device.
-- INV-GRP-12: user group names beyond auth's first page.
 - INV-GRP-15: a device left in no group is not returned to `No Pool`.
 - INV-GRP-16: renaming or deleting `No Pool`.
 - INV-GRP-17: the group name length.

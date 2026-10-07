@@ -429,6 +429,10 @@ async def _fetch_user_group_ids(user_id: uuid.UUID, authorization: str | None) -
     return [uuid.UUID(g["id"]) for g in groups]
 
 
+# Auth's GET /groups caps `limit` at 500 (services/auth/app/routers/groups.py).
+_AUTH_GROUP_PAGE_SIZE = 500
+
+
 async def _fetch_user_group_names(
     user_group_ids: list[uuid.UUID],
     authorization: str | None,
@@ -445,37 +449,53 @@ async def _fetch_user_group_names(
             status_code=500,
             detail="internal: missing Authorization header while resolving group names",
         )
-    try:
-        resp = await call_service(
-            _auth_base(),
-            "GET",
-            "/groups",
-            timeout=10.0,
-            auth=ForwardedAuth(authorization=authorization),
-        )
-    except httpx.HTTPError as exc:
-        logger.error("auth service unreachable while fetching group names: %s", exc)
-        raise HTTPException(
-            status_code=503, detail="auth service unreachable while fetching group names"
-        ) from exc
-
-    if resp.status_code != 200:
-        logger.error(
-            "auth service returned %s for group names: %s",
-            resp.status_code,
-            resp.text[:200],
-        )
-        raise HTTPException(
-            status_code=503,
-            detail=f"auth service returned {resp.status_code} when fetching group names",
-        )
-
-    data = resp.json()
-    groups = data.get("items", data) if isinstance(data, dict) else data
+    # Page through auth's group list until every wanted id is named or the list
+    # ends (issue #1021). Reading one default page (50, oldest first) left every
+    # later group with a null name. Auth has no by-ids lookup open to a non-admin
+    # caller, so paging at auth's maximum page size is the narrowest read.
     wanted = set(user_group_ids)
     name_map: dict[uuid.UUID, str] = {}
-    for g in groups:
-        gid = uuid.UUID(g["id"])
-        if gid in wanted:
-            name_map[gid] = g["name"]
-    return name_map
+    skip = 0
+    while True:
+        try:
+            resp = await call_service(
+                _auth_base(),
+                "GET",
+                "/groups",
+                timeout=10.0,
+                auth=ForwardedAuth(authorization=authorization),
+                params={"skip": skip, "limit": _AUTH_GROUP_PAGE_SIZE},
+            )
+        except httpx.HTTPError as exc:
+            logger.error("auth service unreachable while fetching group names: %s", exc)
+            raise HTTPException(
+                status_code=503, detail="auth service unreachable while fetching group names"
+            ) from exc
+
+        if resp.status_code != 200:
+            logger.error(
+                "auth service returned %s for group names: %s",
+                resp.status_code,
+                resp.text[:200],
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=f"auth service returned {resp.status_code} when fetching group names",
+            )
+
+        data = resp.json()
+        groups = data.get("items", data) if isinstance(data, dict) else data
+        for g in groups:
+            gid = uuid.UUID(g["id"])
+            if gid in wanted:
+                name_map[gid] = g["name"]
+
+        skip += len(groups)
+        total = data.get("total") if isinstance(data, dict) else None
+        if (
+            len(name_map) == len(wanted)
+            or not isinstance(data, dict)
+            or len(groups) < _AUTH_GROUP_PAGE_SIZE
+            or (isinstance(total, int) and skip >= total)
+        ):
+            return name_map
