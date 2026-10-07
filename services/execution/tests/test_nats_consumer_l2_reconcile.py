@@ -619,9 +619,13 @@ async def test_reconcile_template_not_found_parks_add_failed():
 
 
 async def test_reconcile_driver_load_raises_parks_add_failed_no_driver_call():
-    """A load_driver exception (corrupt cache, package missing) parks the add FAILED
-    with the pinned reason wrapping the load error, and fires no driver call."""
+    """A broken package (DriverPackageError) during the create_vlan define parks the
+    add FAILED with the pinned non-retryable reason and the sanitized class name, and
+    fires no driver call (issue #1002; the transient case is in
+    test_wiring_driver_load_classification)."""
     from contextlib import ExitStack
+
+    from app.services.driver_loader import DriverPackageError
 
     execute_fn, calls = _l2_recorder()
     patches = [
@@ -631,7 +635,7 @@ async def test_reconcile_driver_load_raises_parks_add_failed_no_driver_call():
         ),
         patch(
             "app.services.driver_loader.load_driver",
-            new=AsyncMock(side_effect=RuntimeError("package corrupt")),
+            new=AsyncMock(side_effect=DriverPackageError("package corrupt")),
         ),
         patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
         patch(
@@ -652,8 +656,10 @@ async def test_reconcile_driver_load_raises_parks_add_failed_no_driver_call():
     async with TestSessionLocal() as s:
         rows = (await s.execute(select(L2PortAssignment))).scalars().all()
     assert rows[0].status == "FAILED"
-    assert "driver load failed" in rows[0].last_error
-    assert "package corrupt" in rows[0].last_error
+    assert rows[0].last_error == (
+        f"{WIRING_UNRESOLVABLE_REASON}: driver load failed: DriverPackageError"
+    )
+    assert rows[0].attempts == 0
 
 
 async def test_reconcile_login_failure_parks_add_and_remove_failed_no_port_ops():

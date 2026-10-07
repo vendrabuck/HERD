@@ -13,6 +13,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
+from herd_common.l3_route_identity import route_identity_key
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +30,45 @@ logger = logging.getLogger(__name__)
 # intended RELEASED under this reason so the release-direction retry channels drive
 # the remove_route pass. Deliberately outside the non-retryable prefixes.
 FROZEN_PROVISION_PENDING_REMOVAL = "routes landed after wiring freeze; pending removal"
+
+# Reason a terminal teardown parks a FAILED intended-ACTIVE pin under (issue #1001):
+# a provision or intent-delta reconcile that failed may still have left routes on the
+# switch, so at teardown the row flips to intended RELEASED and the deprovision (and,
+# should it fail, the release-direction retry channels, which run while frozen) removes
+# its recorded routes. Deliberately outside the non-retryable prefixes.
+TEARDOWN_PENDING_REMOVAL = "reservation ended; pending route removal"
+
+
+def _route_key(route: dict) -> str:
+    return route_identity_key(
+        route.get("destination"),
+        route.get("interface"),
+        route.get("next_hop"),
+        route.get("virtual_router"),
+    )
+
+
+def union_routes(*route_lists: list[dict] | None) -> list[dict]:
+    """Ordered union of route lists by the shared route identity (issue #1001).
+
+    The first occurrence of each identity wins and keeps its position, so the
+    union of a pin with itself is the pin unchanged.
+    """
+    seen: set[str] = set()
+    out: list[dict] = []
+    for routes in route_lists:
+        for route in routes or []:
+            key = _route_key(route)
+            if key not in seen:
+                seen.add(key)
+                out.append(route)
+    return out
+
+
+def routes_not_in(routes: list[dict] | None, keep: list[dict] | None) -> list[dict]:
+    """The routes of `routes` whose identity is absent from `keep`, in order."""
+    keep_keys = {_route_key(r) for r in keep or []}
+    return [r for r in routes or [] if _route_key(r) not in keep_keys]
 
 
 async def get_route_assignments(
@@ -150,7 +190,12 @@ async def record_route_active(
             )
             db.add(row)
         else:
-            # Keep the row's existing pinned routes (the immutable set) on a flip.
+            # Keep the row's existing pinned routes on a flip, widened by the routes
+            # this provision just configured (issue #1001): the release channel must
+            # remove everything that may now be on the switch, and for an intent-driven
+            # switch `routes` can differ from the old pin. For a config-derived switch
+            # the two are the same set, so the union is the pin unchanged.
+            row.routes = union_routes(row.routes, routes)
             row.status = "FAILED"
             row.intended = "RELEASED"
             row.last_error = FROZEN_PROVISION_PENDING_REMOVAL
@@ -378,6 +423,8 @@ async def record_route_reconcile_failed(
     attempts: int,
     last_error: str | None,
     previous_routes: list[dict],
+    *,
+    possibly_installed: list[dict] | None = None,
 ) -> RouteAssignment | None:
     """Record a failed intent-delta reconcile against an already-ACTIVE L3 pin
     (ADR 0014 Decision 3, issue #34 phase 3).
@@ -389,11 +436,22 @@ async def record_route_reconcile_failed(
     that owns that row's history for this pass IF its delta is still current, so
     the #412 ambiguity there does not apply verbatim; it is instead covered by
     the compare-and-swap below. `intended` stays "ACTIVE" (a build-direction
-    failure, issue #369, so the build-direction retry channel picks it up),
-    `attempts` accumulate, and `routes` is left UNTOUCHED: Decision 3 requires
-    the previous pinned set survive a failed delta verbatim, so later teardown or
-    retry still targets exactly what is actually still installed, not the new
-    intent that never fully applied.
+    failure, issue #369, so the build-direction retry channel picks it up) and
+    `attempts` accumulate.
+
+    `routes` records what MAY be installed on the switch after the failed pass
+    (issue #1001). With `possibly_installed` None (nothing was driven: a gate
+    refusal, a driver load failure, a login failure) the previous pin is kept
+    verbatim, since nothing on the switch changed. After a partial drive the
+    caller passes `possibly_installed`: the previous routes whose removal did not
+    confirm plus every added route the pass drove (a superset, which is safe
+    because removing an absent route is idempotent by driver contract). The row
+    stays FAILED intended ACTIVE; a terminal teardown parks it intended RELEASED
+    and removes exactly these routes, and a later provision over it (a save or a
+    retry) removes the ones its new intent no longer names before configuring
+    the intent (removes before adds). Keeping only the previous pin, as before
+    #1001, left both the added routes and, after a successful rebuild, the
+    unremoved previous routes on the switch with no record of them.
 
     Compare-and-swap (review fix P2, issue #34 phase 3 review): `previous_routes`
     is the pinned set this delta was computed against; if the row's CURRENT
@@ -442,6 +500,8 @@ async def record_route_reconcile_failed(
     row.intended = "ACTIVE"
     row.attempts = (row.attempts or 0) + attempts
     row.last_error = last_error
+    if possibly_installed is not None:
+        row.routes = possibly_installed
     # The drive this failure records is over, so release the claim (issue #817).
     row.claimed_until = None
     await db.commit()
@@ -706,8 +766,12 @@ async def route_needs_remove(
 
     The idempotency gate for a deprovision (mirror of membership_needs_remove): true for an
     ACTIVE pin, and also for a FAILED row whose intended is RELEASED (a removal that never
-    confirmed, so routes may still be installed). A FAILED row whose intended is ACTIVE (a
-    provision that never applied) is excluded: there is nothing installed to remove.
+    confirmed, so routes may still be installed). A FAILED row whose intended is ACTIVE is
+    excluded here because it is still a build: its routes may well be partly installed
+    (issue #1001), but the way they come off is direction-explicit, never this gate. A
+    terminal teardown parks such a row intended RELEASED first (TEARDOWN_PENDING_REMOVAL),
+    the reconcile's stale-build settlement parks it the same way, and a provision over it
+    removes the routes its new intent drops (possibly_installed_routes).
     """
     res_uuid = _as_uuid(reservation_id)
     dev_uuid = _as_uuid(device_id)
@@ -723,6 +787,37 @@ async def route_needs_remove(
         return False
     status, intended = row
     return status == "ACTIVE" or (status == "FAILED" and intended == "RELEASED")
+
+
+async def possibly_installed_routes(
+    db: AsyncSession,
+    reservation_id: uuid.UUID | str,
+    device_id: uuid.UUID | str,
+) -> list[dict]:
+    """The routes a FAILED pin for this switch records as possibly installed (issue #1001).
+
+    A FAILED row of either direction keeps the routes an earlier provision, intent-delta
+    reconcile, or removal may have left on the switch. A provision drives remove_route for
+    the ones its own route set does not name before it configures that set, so a rebuild
+    never forgets them. Empty when there is no FAILED row (a fresh provision, or an
+    ACTIVE pin, which a provision never targets).
+    """
+    res_uuid = _as_uuid(reservation_id)
+    dev_uuid = _as_uuid(device_id)
+    row = (
+        (
+            await db.execute(
+                select(RouteAssignment).where(
+                    RouteAssignment.reservation_id == res_uuid,
+                    RouteAssignment.device_id == dev_uuid,
+                    RouteAssignment.status == "FAILED",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    return [] if row is None else list(row.routes or [])
 
 
 async def get_effective_pinned_routes(

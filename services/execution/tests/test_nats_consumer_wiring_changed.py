@@ -15,6 +15,7 @@ from app.database import Base
 from app.models.execution_run import ExecutionRun
 from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
+from app.services.driver_loader import DriverPackageError
 from app.services.nats_consumer import (
     WIRING_NOT_SIMPLE_CHAIN_REASON,
     WIRING_UNRESOLVABLE_REASON,
@@ -786,12 +787,42 @@ async def test_port_action_runs_carry_timestamps():
 # --- Verbatim-hop / unresolvable (Decision 5) -------------------------------
 
 
+def _download_failure() -> RuntimeError:
+    """The exact shape load_driver raises when the package download fails."""
+    import httpx
+
+    try:
+        raise httpx.ConnectError("inventory unreachable")
+    except httpx.ConnectError as cause:
+        exc = RuntimeError("Failed to download driver x: ConnectError")
+        exc.__cause__ = cause
+        return exc
+
+
 @pytest.mark.asyncio
-async def test_driver_load_raise_parks_pairs_failed_without_nak():
-    """A load_driver RAISE (broken package, cache miss gone wrong) parks every pair on
-    the switch FAILED with the pinned unresolvable driver-load reason, fires no driver
-    call, never NAKs, and still stamps the version. Re-expresses the retired legacy
-    test_handle_event_driver_load_failure pin on the fork-driven apply."""
+@pytest.mark.parametrize(
+    "load_exc, expected_error, expected_attempts, retryable",
+    [
+        (
+            DriverPackageError("Driver validation failed: missing Driver class"),
+            f"{WIRING_UNRESOLVABLE_REASON}: driver load failed: DriverPackageError",
+            0,
+            False,
+        ),
+        (_download_failure(), "driver load failed: ConnectError", 1, True),
+    ],
+    ids=["broken-package-permanent", "download-failure-transient"],
+)
+async def test_driver_load_raise_parks_pairs_failed_without_nak(
+    load_exc, expected_error, expected_attempts, retryable
+):
+    """A load_driver RAISE parks every pair on the switch FAILED, fires no driver call,
+    never NAKs, and still stamps the version. The reason depends on the failure kind
+    (issue #1002): a broken package carries the pinned non-retryable unresolvable
+    reason, while a transient download failure carries the plain sanitized text, which
+    both retry channels pick up. Neither stores the exception's own message."""
+    from app.services.wiring_retry_service import is_retryable_failure
+
     await _seed_state(last_applied=0)
     execute_fn, calls = _sandbox_recorder()
     device_fetch = _device_lookup()
@@ -803,7 +834,7 @@ async def test_driver_load_raise_parks_pairs_failed_without_nak():
         ),
         patch(
             "app.services.driver_loader.load_driver",
-            new=AsyncMock(side_effect=RuntimeError("cache download failed")),
+            new=AsyncMock(side_effect=load_exc),
         ),
         patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
         patch(
@@ -824,8 +855,9 @@ async def test_driver_load_raise_parks_pairs_failed_without_nak():
     failed = await _assignments("FAILED")
     assert len(failed) == 1
     assert failed[0].intended == "ACTIVE"
-    assert WIRING_UNRESOLVABLE_REASON in failed[0].last_error
-    assert "driver load failed" in failed[0].last_error
+    assert failed[0].last_error == expected_error
+    assert failed[0].attempts == expected_attempts
+    assert is_retryable_failure(failed[0].last_error) is retryable
     assert await _last_applied() == 1
 
 

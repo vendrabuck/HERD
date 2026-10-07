@@ -717,6 +717,11 @@ async def test_apply_l3_adjacency_template_not_found_parks_provision_failed():
 
 
 async def test_apply_l3_adjacency_driver_load_raises_parks_provision_failed():
+    """A broken package (DriverPackageError) parks the provision FAILED with the
+    pinned non-retryable reason and the sanitized class name, never the message
+    (issue #1002; the transient case is in test_wiring_driver_load_classification)."""
+    from app.services.driver_loader import DriverPackageError
+
     execute_fn, calls = _l3_recorder()
     ctx = _FetchContext(None)
     with (
@@ -726,7 +731,7 @@ async def test_apply_l3_adjacency_driver_load_raises_parks_provision_failed():
         ),
         patch(
             "app.services.driver_loader.load_driver",
-            new=AsyncMock(side_effect=RuntimeError("package corrupt")),
+            new=AsyncMock(side_effect=DriverPackageError("package corrupt")),
         ),
         patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
     ):
@@ -742,8 +747,10 @@ async def test_apply_l3_adjacency_driver_load_raises_parks_provision_failed():
     rows = await _rows()
     assert len(rows) == 1
     assert rows[0].status == "FAILED"
-    assert "driver load failed" in rows[0].last_error
-    assert "package corrupt" in rows[0].last_error
+    assert rows[0].last_error == (
+        "recorded hop unresolvable: driver load failed: DriverPackageError"
+    )
+    assert rows[0].attempts == 0
 
 
 async def test_apply_l3_adjacency_deprovision_switch_not_found_parks_failed():
@@ -937,7 +944,11 @@ async def test_delta_call_order_removes_before_adds_one_login_logout():
     )
 
 
-async def test_delta_partial_failure_keeps_previous_pin_lands_failed():
+async def test_delta_partial_failure_records_possibly_installed_routes_lands_failed():
+    """A delta whose remove confirmed but whose add failed lands FAILED intended ACTIVE,
+    and the row records what may now be on the switch: not the removed route, but the
+    route the pass tried to add (issue #1001; before it, the row kept the previous pin
+    and named a route that was gone while forgetting one that may be installed)."""
     intent_v1 = [_intent_route("10.20.0.0/24", "eth1")]
     await _reconcile(
         [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")], fork_version=1, l3_routes={SW_L3: intent_v1}
@@ -957,8 +968,8 @@ async def test_delta_partial_failure_keeps_previous_pin_lands_failed():
     assert len(rows) == 1
     assert rows[0].status == "FAILED"
     assert rows[0].intended == "ACTIVE"
-    assert {r["destination"] for r in rows[0].routes} == {"10.20.0.0/24"}, (
-        "the PREVIOUS pinned set survives a failed delta verbatim (Decision 3)"
+    assert {r["destination"] for r in rows[0].routes} == {"10.30.0.0/24"}, (
+        "the confirmed removal leaves the record and the attempted add joins it"
     )
     assert rows[0].attempts >= 1
     assert rows[0].last_error
@@ -1492,3 +1503,201 @@ def test_route_set_identity_uses_the_shared_herd_common_helper():
     }
     with_vrf = [dict(routes[0], virtual_router="red")]
     assert _route_set_identity_keys(with_vrf) != _route_set_identity_keys(routes)
+
+
+# --- Issue #1001: a failed route change leaves no untracked route behind -----
+# A FAILED intended-ACTIVE pin records what may be installed. Terminal teardown removes
+# it (parking the row release-direction first), and a later save or retry that rebuilds
+# the switch removes the routes its new intent drops before configuring the intent.
+
+ROUTE_A = "10.20.0.0/24"
+ROUTE_B = "10.30.0.0/24"
+L3_WIRES = [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")]
+
+
+async def _failed_delta_a_to_b():
+    """Pin {A}, then change intent to {B} with every remove_route failing: the add of B
+    runs anyway, so the switch may now hold both A and B."""
+    await _reconcile(L3_WIRES, fork_version=1, l3_routes={SW_L3: [_intent_route(ROUTE_A, "eth1")]})
+    execute_fn, calls = _l3_recorder(fail={"remove_route"})
+    await _reconcile(
+        L3_WIRES,
+        fork_version=2,
+        l3_routes={SW_L3: [_intent_route(ROUTE_B, "eth5")]},
+        execute_fn=execute_fn,
+        calls=calls,
+    )
+    assert ("remove_route", ROUTE_A) in calls
+    assert ("configure_route", ROUTE_B) in calls
+
+
+async def _freeze():
+    from app.models.reservation_wiring_state import ReservationWiringState
+
+    async with TestSessionLocal() as s:
+        state = await s.get(ReservationWiringState, uuid.UUID(RES_ID))
+        state.frozen = True
+        await s.commit()
+
+
+async def _teardown(execute_fn):
+    from app.services.nats_consumer import _teardown_from_ledgers
+
+    with ExitStack() as stack:
+        for p in _patches(execute_fn, L3_WIRES):
+            stack.enter_context(p)
+        await _teardown_from_ledgers(RES_ID, _FetchContext(None), _db_session_factory())
+
+
+async def _retry_tick(execute_fn, l3_routes=None):
+    from app.services.wiring_retry_service import run_wiring_retry_tick
+
+    kwargs = {"l3_routes": l3_routes} if l3_routes is not None else {}
+    with ExitStack() as stack:
+        for p in _patches(execute_fn, L3_WIRES, **kwargs):
+            stack.enter_context(p)
+        return await run_wiring_retry_tick(_db_session_factory())
+
+
+async def test_failed_delta_records_previous_and_added_routes_when_remove_fails():
+    await _failed_delta_a_to_b()
+    rows = await _rows()
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"
+    assert rows[0].intended == "ACTIVE"
+    assert [r["destination"] for r in rows[0].routes] == [ROUTE_A, ROUTE_B], (
+        "the unconfirmed removal and the attempted add are both possibly installed"
+    )
+
+
+async def test_teardown_removes_every_route_a_failed_delta_may_have_left():
+    """Issue #1001 sequence 1: the reservation ends before any retry succeeds. The
+    teardown issues remove_route for the old route AND the added one, and releases."""
+    await _failed_delta_a_to_b()
+    await _freeze()
+
+    execute_fn, calls = _l3_recorder()
+    await _teardown(execute_fn)
+
+    assert {d for a, d in calls if a == "remove_route"} == {ROUTE_A, ROUTE_B}
+    assert not any(a == "configure_route" for a, _d in calls)
+    rows = await _rows()
+    assert [r.status for r in rows] == ["RELEASED"]
+
+
+async def test_teardown_removal_failure_parks_release_direction_and_tick_finishes_it():
+    """The teardown's own removal fails too: the row is parked FAILED intended
+    RELEASED (never left build-direction, which a frozen reservation never retries),
+    and the next retry tick drives the removal while frozen and releases it."""
+    from app.services.route_service import TEARDOWN_PENDING_REMOVAL
+
+    await _failed_delta_a_to_b()
+    await _freeze()
+
+    execute_fn, calls = _l3_recorder(fail={"remove_route"})
+    await _teardown(execute_fn)
+    rows = await _rows()
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"
+    assert rows[0].intended == "RELEASED"
+    assert [r["destination"] for r in rows[0].routes] == [ROUTE_A, ROUTE_B]
+    assert {d for a, d in calls if a == "remove_route"} == {ROUTE_A, ROUTE_B}
+
+    execute_fn, calls = _l3_recorder()
+    stats = await _retry_tick(execute_fn)
+    assert stats["skipped_frozen"] == 0
+    assert stats["released"] == 1
+    assert {d for a, d in calls if a == "remove_route"} == {ROUTE_A, ROUTE_B}
+    assert [r.status for r in await _rows()] == ["RELEASED"]
+    assert TEARDOWN_PENDING_REMOVAL  # the parking reason is exported for the docs
+
+
+async def test_teardown_parks_failed_build_with_the_teardown_reason_before_driving():
+    """The park happens before any driver call: a teardown whose driver cannot even
+    log in still leaves the row release-direction with the teardown reason replaced by
+    the login failure, never as a build row."""
+    await _failed_delta_a_to_b()
+    await _freeze()
+
+    execute_fn, calls = _l3_recorder(fail={"login"})
+    await _teardown(execute_fn)
+    rows = await _rows()
+    assert rows[0].status == "FAILED"
+    assert rows[0].intended == "RELEASED"
+    assert rows[0].last_error.startswith("driver login failed")
+    assert not any(a == "remove_route" for a, _d in calls)
+
+
+async def test_teardown_releases_a_failed_build_with_no_routes_without_a_driver_call():
+    """A FAILED intended-ACTIVE pin that records no routes (a gate refusal on a fresh
+    provision) has nothing on the switch: teardown releases it with no driver session."""
+    async with TestSessionLocal() as s:
+        await record_route_failed(
+            s, RES_ID, SW_L3, None, 0, "l3_interface_unwired", intended="ACTIVE"
+        )
+    execute_fn, calls = _l3_recorder()
+    await _teardown(execute_fn)
+    assert calls == []
+    assert [r.status for r in await _rows()] == ["RELEASED"]
+
+
+async def test_save_after_failed_delta_removes_the_routes_its_intent_drops():
+    """Issue #1001 sequence 2: a later save rebuilds the switch. It removes the route the
+    failed delta could not remove before configuring the intent, pins only the intent,
+    and a teardown afterwards removes only that, leaving nothing behind."""
+    await _failed_delta_a_to_b()
+
+    execute_fn, calls = _l3_recorder()
+    await _reconcile(
+        L3_WIRES,
+        fork_version=3,
+        l3_routes={SW_L3: [_intent_route(ROUTE_B, "eth5")]},
+        execute_fn=execute_fn,
+        calls=calls,
+    )
+    route_calls = [(a, d) for a, d in calls if a in ("remove_route", "configure_route")]
+    assert route_calls == [("remove_route", ROUTE_A), ("configure_route", ROUTE_B)], (
+        "the residue is removed before the intent is configured"
+    )
+    active = await _rows("ACTIVE")
+    assert len(active) == 1
+    assert [r["destination"] for r in active[0].routes] == [ROUTE_B]
+
+    await _freeze()
+    execute_fn, calls = _l3_recorder()
+    await _teardown(execute_fn)
+    assert {d for a, d in calls if a == "remove_route"} == {ROUTE_B}
+
+
+async def test_retry_after_failed_delta_removes_the_routes_its_intent_drops():
+    """The build-direction retry channel rebuilds from the fork's current intent: it
+    computes its residue from the row's recorded routes, not from an empty set."""
+    await _failed_delta_a_to_b()
+
+    execute_fn, calls = _l3_recorder()
+    stats = await _retry_tick(execute_fn, l3_routes={SW_L3: [_intent_route(ROUTE_B, "eth5")]})
+    assert stats["reconnected"] == 1
+    route_calls = [(a, d) for a, d in calls if a in ("remove_route", "configure_route")]
+    assert route_calls == [("remove_route", ROUTE_A), ("configure_route", ROUTE_B)]
+    active = await _rows("ACTIVE")
+    assert [r["destination"] for r in active[0].routes] == [ROUTE_B]
+
+
+async def test_rebuild_whose_residue_removal_fails_keeps_the_residue_recorded():
+    """A rebuild whose residue removal fails again lands FAILED and still records the
+    unremoved route next to the intent, so nothing is forgotten on a second failure."""
+    await _failed_delta_a_to_b()
+
+    execute_fn, calls = _l3_recorder(fail={"remove_route"})
+    await _reconcile(
+        L3_WIRES,
+        fork_version=3,
+        l3_routes={SW_L3: [_intent_route(ROUTE_B, "eth5")]},
+        execute_fn=execute_fn,
+        calls=calls,
+    )
+    rows = await _rows()
+    assert len(rows) == 1
+    assert rows[0].status == "FAILED"
+    assert rows[0].intended == "ACTIVE"
+    assert {r["destination"] for r in rows[0].routes} == {ROUTE_A, ROUTE_B}

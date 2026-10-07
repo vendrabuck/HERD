@@ -42,6 +42,32 @@ class DriverPackageError(Exception):
     """
 
 
+def is_permanent_load_failure(exc: BaseException) -> bool:
+    """True when a ``load_driver`` failure can never succeed on a retry (issue #1002).
+
+    The one classifier for load failures. Only a ``DriverPackageError`` is
+    permanent: the package is broken for its SHA256 and reproduces identically.
+    Everything else ``load_driver`` can raise (the download ``RuntimeError`` when
+    inventory or package storage is unreachable, a cache-table read error) is
+    transient, and a caller must leave the work retryable.
+    """
+    return isinstance(exc, DriverPackageError)
+
+
+def driver_load_failure_text(exc: BaseException) -> str:
+    """The fixed, sanitized text stored for a ``load_driver`` failure (issues #840, #887).
+
+    ``driver load failed: <ClassName>``, the class being the wrapped cause's when
+    the exception chains one (the download's httpx error, the extract's
+    zipfile/OSError) and the exception's own otherwise. Never ``str(exc)``: a
+    row or an API response carries only this HERD-authored text, and the caller
+    logs the full text in a log message.
+    """
+    cause = exc.__cause__
+    cause_class = type(cause).__name__ if cause is not None else type(exc).__name__
+    return f"driver load failed: {cause_class}"
+
+
 # Required methods per connection type
 REQUIRED_METHODS = {
     "Layer 1 Switch": ["login", "logout", "connect_ports", "disconnect_ports", "status"],

@@ -77,6 +77,7 @@ Four small state machines live here. Only this section states their transitions.
 | `ACTIVE` | `FAILED`, intended `RELEASED` | `record_l2_membership_active` of another reservation | the row's own reservation is frozen | nothing | WIRE-LEDGER-12 |
 | `ACTIVE` | `FAILED`, intended `RELEASED` | `record_route_reconciled` | routes unchanged since the delta was computed; wiring frozen | nothing | WIRE-LEDGER-14 |
 | `ACTIVE` | `FAILED`, intended `ACTIVE` | `record_route_reconcile_failed` | routes unchanged since the delta was computed | nothing | WIRE-LEDGER-15 |
+| `FAILED`, intended `ACTIVE` | `FAILED`, intended `RELEASED` | `park_stale_route_build` at terminal teardown | the row is still `FAILED` | nothing | WIRE-TEARDOWN-6 |
 | `ACTIVE` | `ACTIVE` (new route list) | `record_route_reconciled` | routes unchanged since the delta was computed; wiring not frozen | nothing | WIRE-LEDGER-14 |
 | `ACTIVE` or `FAILED` | `RELEASED` | `release_l1_connection`, `release_l2_membership`, `release_route_membership` after a successful removal or a settlement | row is this reservation's, not RELEASED | nothing | WIRE-LEDGER-9 |
 | `ACTIVE` | `RELEASED` | `record_l1_connect` of another reservation | same switch and canonical pair | nothing | WIRE-LEDGER-11 |
@@ -129,7 +130,8 @@ build recorder re-checks it at record time (WIRE-LEDGER-4).
   ACTIVE in place by a compare-and-swap on status `FAILED` (a lost swap re-reads and
   returns the winner's row untouched); otherwise it inserts a new ACTIVE row. The key is
   (switch, canonical port pair) for L1, (switch, port) for L2, and (switch) for L3. An L3
-  flip replaces the stored routes with the routes just driven. \
+  flip replaces the stored routes with the routes just driven; the provision that drove
+  them first removed the stored routes they no longer name (WIRE-L3-19). \
   Enforced in: `services/execution/app/services/l1_assignment_service.py` (`record_l1_connect`, `_find_reusable_failed`); `services/execution/app/services/l2_membership_service.py` (`record_l2_membership_active`); `services/execution/app/services/route_service.py` (`record_route_active`) \
   Pinned by: `services/execution/tests/test_l1_assignment_service.py` (`test_record_connect_inserts_active_row`, `test_record_connect_reusable_failed_flip_sets_intended_active`); `services/execution/tests/test_l2_membership_service.py` (`test_record_active_reuses_prior_failed_row`); `services/execution/tests/test_wiring_claim.py` (`test_l1_success_flip_returns_the_winner_when_its_cas_loses`, `test_l2_success_flip_returns_the_winner_when_its_cas_loses`); `services/execution/tests/test_route_service.py` (`test_record_route_active_is_idempotent_for_redelivery`, `test_record_route_active_reusable_cas_loser_never_overwrites`)
 - **WIRE-LEDGER-3.** A partial-unique index allows at most one ACTIVE row per L1
@@ -141,9 +143,11 @@ build recorder re-checks it at record time (WIRE-LEDGER-4).
   not recorded ACTIVE: the row is inserted, or this reservation's FAILED row flipped, as
   `FAILED` intended `RELEASED` with a fixed reason (`FROZEN_BUILD_PENDING_RELEASE`,
   `FROZEN_JOIN_PENDING_REMOVAL`, `FROZEN_PROVISION_PENDING_REMOVAL`) and unchanged
-  attempts, so the release-direction retry channels remove what was built. An L1 pair
-  this reservation already holds ACTIVE is returned unchanged before the freeze check. \
-  Enforced in: `services/execution/app/services/l1_assignment_service.py` (`record_l1_connect`, `_park_frozen_build`); `services/execution/app/services/l2_membership_service.py` (`record_l2_membership_active`); `services/execution/app/services/route_service.py` (`record_route_active`) \
+  attempts, so the release-direction retry channels remove what was built. An L3 flip
+  keeps the stored routes and adds the routes just configured (`union_routes`), so the
+  removal covers both. An L1 pair this reservation already holds ACTIVE is returned
+  unchanged before the freeze check. \
+  Enforced in: `services/execution/app/services/l1_assignment_service.py` (`record_l1_connect`, `_park_frozen_build`); `services/execution/app/services/l2_membership_service.py` (`record_l2_membership_active`); `services/execution/app/services/route_service.py` (`record_route_active`, `union_routes`) \
   Pinned by: `services/execution/tests/test_l1_assignment_service.py` (`test_record_connect_frozen_parks_failed_intended_released`, `test_record_connect_frozen_reuses_failed_row_and_keeps_attempts`, `test_record_connect_frozen_short_circuits_own_active_row_unchanged`); `services/execution/tests/test_l2_membership_service.py` (`test_record_active_frozen_parks_failed_intended_released`); `services/execution/tests/test_route_service.py` (`test_record_route_active_frozen_parks_failed_intended_released`); `services/execution/tests/test_wiring_retry_service.py` (`test_tick_build_racing_terminal_freeze_does_not_strand_active_row`)
 - **WIRE-LEDGER-5.** Every failure write states the direction it attempted: intended
   `ACTIVE` for a failed build, `RELEASED` for a failed removal. \
@@ -200,14 +204,16 @@ build recorder re-checks it at record time (WIRE-LEDGER-4).
   Enforced in: `services/execution/app/services/route_service.py` (`record_route_reconciled`) \
   Pinned by: `services/execution/tests/test_route_service.py` (`test_record_route_reconciled_advances_the_pin_on_an_active_row`, `test_record_route_reconciled_stale_previous_routes_is_a_noop`, `test_record_route_reconciled_frozen_parks_failed_intended_released`, `test_record_route_reconciled_returns_none_when_no_active_row`)
 - **WIRE-LEDGER-15.** `record_route_reconcile_failed` flips an ACTIVE pin, under the same
-  locked routes comparison, to `FAILED` intended `ACTIVE`, adding the attempts and
-  keeping the stored routes; it has no build-direction guard. The row then has no
-  ACTIVE pin, so the next save provisions the switch as newly adjacent (WIRE-L3-2,
-  WIRE-L3-3) and a build retry drives it (WIRE-RETRY-9); either one configures the
-  current routes and replaces the stored list (WIRE-LEDGER-2) without removing the
-  stored routes that are not in it. Known gap, see #1001. \
-  Enforced in: `services/execution/app/services/route_service.py` (`record_route_reconcile_failed`) \
-  Pinned by: `services/execution/tests/test_route_service.py` (`test_record_route_reconcile_failed_keeps_previous_pin`, `test_record_route_reconcile_failed_is_not_guarded_by_412_unlike_record_route_failed`, `test_record_route_reconcile_failed_stale_previous_routes_is_a_noop`, `test_record_route_reconcile_failed_returns_none_when_not_active`)
+  locked routes comparison, to `FAILED` intended `ACTIVE`, adding the attempts; it has no
+  build-direction guard. The stored routes become what may still be installed: unchanged
+  when nothing was driven (a gate refusal, a load failure, a failed login), otherwise the
+  previous routes whose removal did not confirm plus every route the delta tried to add.
+  The row then has no ACTIVE pin, so the next save provisions the switch as newly
+  adjacent (WIRE-L3-2, WIRE-L3-3) and a build retry drives it (WIRE-RETRY-9); either one
+  removes the stored routes its route set drops before configuring it (WIRE-L3-19), and
+  a terminal teardown removes them all (WIRE-TEARDOWN-6). \
+  Enforced in: `services/execution/app/services/route_service.py` (`record_route_reconcile_failed`); `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`) \
+  Pinned by: `services/execution/tests/test_route_service.py` (`test_record_route_reconcile_failed_keeps_previous_pin`, `test_record_route_reconcile_failed_is_not_guarded_by_412_unlike_record_route_failed`, `test_record_route_reconcile_failed_stale_previous_routes_is_a_noop`, `test_record_route_reconcile_failed_returns_none_when_not_active`, `test_record_route_reconcile_failed_records_possibly_installed_routes`, `test_record_route_reconcile_failed_stale_writer_ignores_possibly_installed`); `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_delta_partial_failure_records_possibly_installed_routes_lands_failed`, `test_failed_delta_records_previous_and_added_routes_when_remove_fails`)
 - **WIRE-LEDGER-16.** A release-direction FAILED row is settled `RELEASED` with no driver
   call when another reservation holds an ACTIVE row on the same switch claiming either
   port of the pair (L1) or the same (switch, port) (L2). L3 has no such settlement:
@@ -791,14 +797,16 @@ removes exactly that when the switch is no longer needed.
 - **WIRE-L3-10.** A switch succeeds only when every route call succeeds. A clean provision
   pins ACTIVE (WIRE-LEDGER-2), a clean deprovision releases the pin (WIRE-LEDGER-9), and a
   clean delta stores the full new intent (WIRE-LEDGER-14). A failed provision records
-  FAILED intended `ACTIVE` with the attempted routes; a failed deprovision records FAILED
-  intended `RELEASED` keeping the pin; a failed delta goes through
-  `record_route_reconcile_failed` (WIRE-LEDGER-15). \
+  FAILED intended `ACTIVE` with the attempted routes plus any stored routes whose removal
+  did not confirm (WIRE-L3-19); a failed deprovision records FAILED intended `RELEASED`
+  keeping the pin; a failed delta goes through `record_route_reconcile_failed`
+  (WIRE-LEDGER-15). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_reconcile_failed_provision_lands_failed_intended_active`, `test_delta_partial_failure_keeps_previous_pin_lands_failed`, `test_delta_mixed_removes_and_adds_in_one_reconcile`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_l3_teardown_driver_failure_keeps_pin_and_lands_failed_released`)
+  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_reconcile_failed_provision_lands_failed_intended_active`, `test_delta_partial_failure_records_possibly_installed_routes_lands_failed`, `test_rebuild_whose_residue_removal_fails_keeps_the_residue_recorded`, `test_delta_mixed_removes_and_adds_in_one_reconcile`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_l3_teardown_driver_failure_keeps_pin_and_lands_failed_released`)
 - **WIRE-L3-11.** A switch inventory reports missing, a missing template, a driver load
-  that raises, or a failed `login` records the switch FAILED in its direction (through
-  `record_route_reconcile_failed` for a delta) with no route call. \
+  that raises (with the reason WIRE-DRIVER-7 gives it), or a failed `login` records the
+  switch FAILED in its direction (through `record_route_reconcile_failed` for a delta)
+  with no route call. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`) \
   Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_apply_l3_adjacency_switch_not_found_parks_provision_failed`, `test_apply_l3_adjacency_template_not_found_parks_provision_failed`, `test_apply_l3_adjacency_driver_load_raises_parks_provision_failed`, `test_apply_l3_adjacency_deprovision_switch_not_found_parks_failed`, `test_reconcile_login_failure_parks_provision_failed_no_configure_call`)
 - **WIRE-L3-12.** On a frozen reservation a delta drives only its removals and records
@@ -816,9 +824,10 @@ removes exactly that when the switch is no longer needed.
   Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_gate_missing_config_version_lands_unconfigured_failed_no_driver_call`, `test_gate_reconcile_failure_keeps_previous_pin_via_reconcile_failed_path`)
 - **WIRE-L3-14.** The gate refuses the whole switch with `l3_vrf_unsupported` when any
   route names a `virtual_router` and the switch's driver, loaded first, does not declare
-  `supports_vrf`; a missing switch, a missing driver, or a package that will not load
-  also refuses, while a failed package download raises `TransientUpstreamError`. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_gate_l3_drive_routes`, `_l3_driver_supports_vrf`) \
+  `supports_vrf`; a missing switch, a missing driver, or a broken package also refuses,
+  while any other load failure (a failed package download) raises
+  `TransientUpstreamError`, judged by `is_permanent_load_failure` (WIRE-DRIVER-7). \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_gate_l3_drive_routes`, `_l3_driver_supports_vrf`); `services/execution/app/services/driver_loader.py` (`is_permanent_load_failure`) \
   Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_vrf_route_fails_switch_with_no_driver_call`, `test_vrf_route_on_delta_fails_via_reconcile_failed_path`, `test_vrf_route_drives_when_the_driver_declares_supports_vrf`, `test_vrf_route_still_fails_when_the_driver_declares_only_dry_run`); `tests/integration/test_l3_intent_execution.py` (`test_vrf_route_on_a_non_declaring_driver_parks_l3_vrf_unsupported`)
 - **WIRE-L3-15.** The gate re-validates only when some route's
   `validated_config_version_id` is missing or differs from the id of the switch's current
@@ -841,6 +850,14 @@ removes exactly that when the switch is no longer needed.
   message; a 404 means the switch has no config. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_latest_config`) \
   Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_config_fetch_5xx_raises_transient_for_nak`, `test_config_fetch_404_returns_none`)
+- **WIRE-L3-19.** A provision of a switch that has a FAILED pin (a save rebuilding a
+  switch whose provision or delta failed, or a build or release retry) first drives
+  `remove_route` for the pin's stored routes that its own route set does not name, then
+  `configure_route` for its set, in the same login and logout, so a rebuild never
+  forgets a route an earlier failed pass may have left on the switch. A residue removal
+  that fails leaves the switch FAILED and keeps that route stored next to the route set. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`); `services/execution/app/services/route_service.py` (`possibly_installed_routes`, `routes_not_in`, `union_routes`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_save_after_failed_delta_removes_the_routes_its_intent_drops`, `test_retry_after_failed_delta_removes_the_routes_its_intent_drops`, `test_rebuild_whose_residue_removal_fails_keeps_the_residue_recorded`); `services/execution/tests/test_route_service.py` (`test_possibly_installed_routes_reads_a_failed_row_of_either_direction`, `test_possibly_installed_routes_ignores_an_active_pin`, `test_union_routes_dedups_by_route_identity_keeping_first_occurrence`, `test_routes_not_in_compares_by_identity_not_raw_dict_equality`)
 
 **Out of scope.** What makes routing intent valid at save time (`topology.md`); config
 versions (`device-configuration.md`).
@@ -886,12 +903,19 @@ it fails, and counted as done only when the driver's own answer says so.
   `HERD_`, plus the device id, name, connection type, reservation id, and user id. \
   Enforced in: `services/execution/app/services/execution_service.py` (`build_context`) \
   Pinned by: `services/execution/tests/test_execution_service.py` (`test_build_context`)
-- **WIRE-DRIVER-7.** A driver load that raises, including a failed package download,
-  parks the switch's rows under a reason starting `WIRING_UNRESOLVABLE_REASON` followed
-  by `driver load failed:` and the exception text, which neither retry channel retries
-  (WIRE-RETRY-4). Known gap, see #1002. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_apply_wiring_pairs`, `_apply_l2_memberships`, `_apply_l3_adjacency`); `services/execution/app/services/wiring_retry_service.py` (`is_retryable_failure`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_driver_load_raise_parks_pairs_failed_without_nak`); `services/execution/tests/test_wiring_retry_service.py` (`test_is_retryable_classifies_pinned_reasons_not_retryable`)
+- **WIRE-DRIVER-7.** A driver load that raises parks the switch's rows in their own
+  direction with no driver call, classified by the kind of failure. A broken package
+  (`DriverPackageError`) is permanent: the reason is `WIRING_UNRESOLVABLE_REASON` followed
+  by `driver load failed: DriverPackageError`, with no attempt counted, and neither retry
+  channel retries it (WIRE-RETRY-4). Any other load failure, a failed package download
+  in particular, is transient: the reason is `driver load failed: <ClassName>` (the
+  wrapped cause's class, for example `ConnectError`), with one attempt counted, and both
+  retry channels drive the row again in its direction, builds and releases (a teardown's
+  included) alike. A transient failure in the L2 `create_vlan` pre-pass parks the
+  dependent joins under `create_vlan failed: driver load failed: <ClassName>`. The stored
+  text never carries the exception's message, which goes only to the log. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_wiring_load_failure`, `_apply_wiring_pairs`, `_run_vlan_definition_op`, `_apply_l2_memberships`, `_apply_l3_adjacency`); `services/execution/app/services/driver_loader.py` (`is_permanent_load_failure`, `driver_load_failure_text`); `services/execution/app/services/wiring_retry_service.py` (`is_retryable_failure`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_driver_load_raise_parks_pairs_failed_without_nak`); `services/execution/tests/test_wiring_driver_load_classification.py` (`test_wiring_load_failure_reason_and_attempts_by_kind`, `test_l1_transient_download_failure_parks_build_and_release_retryable`, `test_l1_broken_package_parks_build_and_release_permanent`, `test_l2_transient_download_failure_parks_add_and_remove_retryable`, `test_l2_transient_failure_during_vlan_define_parks_the_add_retryable`, `test_l3_transient_download_failure_parks_provision_and_deprovision_retryable`, `test_l3_broken_package_parks_provision_and_deprovision_permanent`, `test_l1_transient_rows_converge_on_the_next_retry_tick`, `test_l2_transient_remove_converges_on_the_next_retry_tick`, `test_l3_transient_rows_converge_on_the_next_retry_tick`, `test_l1_broken_package_rows_are_not_retried_by_the_tick`, `test_teardown_l1_removal_with_transient_download_failure_stays_retryable`); `services/execution/tests/test_wiring_retry_service.py` (`test_is_retryable_classifies_pinned_reasons_not_retryable`)
 
 **Out of scope.** Driver package loading, caching, and validation (`inventory.md`,
 `device-configuration.md`); the driver method contract (`DRIVERS.md`).
@@ -961,12 +985,16 @@ WIRE-FREEZE-1.
   yet released stay ACTIVE, and the redelivery releases only what is left. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_from_ledgers`) \
   Pinned by: `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_upstream_error_naks_and_keeps_rows_active`, `test_redelivered_terminal_event_is_idempotent`); `tests/integration/test_failed_teardown.py` (`test_l3_failed_event_removes_pinned_routes_and_redelivery_is_idempotent`, `test_l1_failed_event_disconnects_only_applied_pairs`)
-- **WIRE-TEARDOWN-6.** Teardown reads no FAILED row. An L3 pin that a failed or refused
-  route delta left FAILED intended `ACTIVE` (WIRE-LEDGER-15) may still have its routes
-  installed; teardown does not remove them, and after the freeze no retry channel drives
-  a build-direction row (WIRE-RETRY-2, WIRE-RETRY-14). Known gap, see #1001. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_from_ledgers`); `services/execution/app/services/route_service.py` (`get_route_assignments`, `record_route_reconcile_failed`) \
-  Pinned by: none
+- **WIRE-TEARDOWN-6.** Teardown also removes what a FAILED intended-`ACTIVE` L3 pin
+  records (a failed provision or delta, WIRE-L3-10, WIRE-LEDGER-15), since those routes
+  may be installed. Before any driver call it parks each such pin `FAILED` intended
+  `RELEASED` under `TEARDOWN_PENDING_REMOVAL`, then deprovisions its stored routes with
+  the ACTIVE pins; a pin that stores no routes is released with no driver call. A failed
+  removal stays release-direction, which the retry channels drive while frozen
+  (WIRE-TEARDOWN-4). L1 and L2 FAILED intended-`ACTIVE` rows are not read: a failed L1
+  connect or L2 join has nothing confirmed to undo. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_from_ledgers`); `services/execution/app/services/route_service.py` (`park_stale_route_build`, `TEARDOWN_PENDING_REMOVAL`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_teardown_removes_every_route_a_failed_delta_may_have_left`, `test_teardown_removal_failure_parks_release_direction_and_tick_finishes_it`, `test_teardown_parks_failed_build_with_the_teardown_reason_before_driving`, `test_teardown_releases_a_failed_build_with_no_routes_without_a_driver_call`); `tests/integration/test_l3_intent_execution.py` (`test_cancel_after_a_failed_route_change_removes_every_route_ever_configured`)
 
 **Out of scope.** Dynamic-instance teardown, which runs after this (`dynamic-resources.md`);
 the fork archive (`reservations.md`, RES-FORK-11).
@@ -1029,11 +1057,11 @@ interface in section 8.15.
 - **WIRE-RETRY-9.** An L3 build row is driven with the fork's current routing intent for
   the switch when there is any, after the drive gate; a gate refusal re-records the row
   by row id with one more attempt and the reason, with no driver call; a gate transport
-  failure skips only that row. With no intent the row's stored routes are driven. A
-  success replaces the stored routes with those driven and removes none (WIRE-LEDGER-2).
-  Known gap, see #1001. \
-  Enforced in: `services/execution/app/services/wiring_retry_service.py` (`_reattempt_l3_rows`) \
-  Pinned by: `services/execution/tests/test_wiring_retry_l3.py` (`test_l3_build_retry_with_current_intent_drives_intent_not_stale_pin`, `test_l3_build_retry_without_intent_drives_row_routes_verbatim`, `test_l3_build_retry_with_intent_gate_failure_makes_no_driver_call`, `test_l3_build_retry_gate_transient_failure_isolated_per_row`, `test_l3_build_retry_trunk_skipped_switch_still_retried_when_intent_present`)
+  failure skips only that row. With no intent the row's stored routes are driven. The
+  stored routes the driven set drops are removed first (WIRE-L3-19), and a success
+  replaces the stored routes with those driven (WIRE-LEDGER-2). \
+  Enforced in: `services/execution/app/services/wiring_retry_service.py` (`_reattempt_l3_rows`); `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_retry_after_failed_delta_removes_the_routes_its_intent_drops`); `services/execution/tests/test_wiring_retry_l3.py` (`test_l3_build_retry_with_current_intent_drives_intent_not_stale_pin`, `test_l3_build_retry_without_intent_drives_row_routes_verbatim`, `test_l3_build_retry_with_intent_gate_failure_makes_no_driver_call`, `test_l3_build_retry_gate_transient_failure_isolated_per_row`, `test_l3_build_retry_trunk_skipped_switch_still_retried_when_intent_present`)
 - **WIRE-RETRY-10.** An L2 release settled as superseded also frees its allocation when
   no ACTIVE membership remains, undefining the VLAN where it was defined. \
   Enforced in: `services/execution/app/services/wiring_retry_service.py` (`_reattempt_l2_rows`) \
@@ -1194,7 +1222,7 @@ Events are in section 6; the internal routes this area serves are in section 7.
 | Out | cabling | `GET /fabric/internal?device_id` (internal token, 10 s) | the fabric of an L2 switch | Fail open: a substitute fabric per switch (WIRE-VLAN-6) |
 | Out | inventory | `GET /devices/{id}/internal`, `GET /templates/{id}/internal` (internal token, 10 s) | classify hop endpoints, load switch drivers | 5xx or transport nacks the event (WIRE-ORDER-11); in a retry the tick logs it and the manual route answers 503; another non-200 reads as missing (WIRE-PAIR-4, WIRE-L1-3) |
 | Out | inventory | `GET /devices/{id}/config-versions/latest/internal` (internal token, 10 s) | L3 config routes and the drive gate | 5xx or transport nacks (WIRE-L3-18); 404 means no config (WIRE-L3-4, WIRE-L3-16) |
-| Out | inventory | `GET /drivers/{id}/internal-download` (through the driver loader) | fetch a driver package on a cache miss | The switch's rows are parked non-retryable (WIRE-DRIVER-7); in the VRF capability check it nacks instead (WIRE-L3-14) |
+| Out | inventory | `GET /drivers/{id}/internal-download` (through the driver loader) | fetch a driver package on a cache miss | The switch's rows are parked FAILED and retryable by both retry channels; a broken package is parked non-retryable (WIRE-DRIVER-7); in the VRF capability check a failed download nacks instead (WIRE-L3-14) |
 | Out | driver package | `login`, `connect_ports`, `disconnect_ports`, `create_vlan`, `delete_vlan`, `add_to_vlan`, `remove_from_vlan`, `configure_route`, `remove_route`, `logout` in the sandbox | change the switch | Three attempts in line, then a FAILED row; never nacks (WIRE-DRIVER-2, WIRE-DRIVER-4) |
 | Out | NATS | `herd.reservations.dlq.execution` publish | dead-letter a message | Logged; the message is still acked (WIRE-CONSUME-12) |
 
@@ -1239,19 +1267,6 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
 
 ### Open defects
 
-- #1001 (WIRE-TEARDOWN-6, WIRE-LEDGER-15, WIRE-RETRY-9): a route pin whose reconcile
-  failed is `FAILED` intended `ACTIVE` and keeps its recorded routes. Terminal teardown
-  reads ACTIVE pins only, and both retry channels skip build-direction rows while
-  frozen, so those routes are never removed. While the reservation is live, the next
-  save (the adjacency reconcile) or a build retry provisions the current intent and
-  replaces the pin without removing the routes that left it.
-- #1002 (WIRE-DRIVER-7): every driver load failure, a transient package download
-  failure included, is recorded with the non-retryable unresolvable-hop reason, so
-  neither retry channel retries it. For L2 and L3 the next wiring change of any kind
-  re-drives a build-direction row whose switch is still intended, because the full
-  reconcile compares against ACTIVE rows only; a release-direction row parked this way
-  (a teardown's included) is driven again by nothing. An L1 build pair on a contiguous
-  delta waits for a gap, a heal, or the edge being redrawn.
 - #1003 (WIRE-VLAN-6): VLAN uniqueness is checked only among allocations with the same
   fabric id. A failed fabric lookup substitutes the id of a one-switch fabric, exactly
   what cabling computes for an isolated switch, and re-resolves it on every call. The
@@ -1299,5 +1314,4 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
 - WIRE-DISPATCH-5: a failed health-tier update does not fail the message.
 - WIRE-DRIVER-2: the in-line retry makes three attempts with backoff (only the constant
   is asserted).
-- WIRE-TEARDOWN-6: a FAILED intended-ACTIVE L3 pin is not removed at teardown.
 - WIRE-STATUS-6: the internal routes answer 500 with no token configured.

@@ -53,6 +53,20 @@
 - Fixed: AI generation refuses a proposal whose resolved devices mix physical and cloud types, as a repairable mistake and then a structured 422 `topology_mixed_types`, and reports each device's resolved type (#1038).
 - Tests: tests for the AI rules that had none, and the specification's "Pinned by" entries updated (#1040).
 - Docs: the AI commit dialog's config label says admin or a device manage grant, and three stale lines in TROUBLESHOOTING.md and ADR 0009 match the code (#1041).
+- Fixed: a driver package download that fails while wiring is applied (inventory or
+  package storage briefly unreachable on a cold driver cache) no longer strands the
+  connection. L1, L2, and L3 rows used to be parked under the non-retryable
+  `recorded hop unresolvable` reason that only a fork re-save cleared, and on the release
+  side (a teardown included) nothing ever drove them again. A transient load failure now
+  records `driver load failed: <ClassName>` with one attempt, and both retry channels
+  drive the row again in its own direction; a broken package (`DriverPackageError`) stays
+  non-retryable. The stored text carries only the class name (#1002).
+- Fixed: a Layer 3 route change that partly fails no longer leaves routes on the switch.
+  The failed pin now records every route that may still be installed (the previous
+  routes whose removal did not confirm plus the routes the change tried to add); a
+  terminal teardown parks such a pin release-direction and removes those routes, and a
+  later save or retry that rebuilds the switch removes the ones its intent drops before
+  configuring the intent (#1001).
 - Docs: corrected documentation, docstrings, and comments that the code contradicts, found while writing the specifications; ADR 0004 and ADR 0015 gain dated as-built addenda instead of rewritten decisions (#1010, #1025, #1031, #1041).
 - Docs: specifications under `docs/specs/`, one per feature area, each rule tied to the code that enforces it and the test that pins it. The first is `docs/specs/reservations.md`; `tests/unit/test_spec_references.py` fails when a specification names a path, symbol, test, link, or section that no longer exists.
 - Fixed: editing a reservation's devices obeys the inventory hold rule. The edit commits under a status guard, so a PATCH that races a cancel, release, auto-complete, or activation keeps nothing and answers 409; inventory is written only after the commit and only on an `ACTIVE` reservation, with three attempts, and removed devices are released through the holder-aware filter (#994).

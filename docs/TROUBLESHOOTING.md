@@ -202,6 +202,23 @@ The driver method took longer than the configured timeout (`execution_timeout_se
 
 The driver package validation failed. Confirm `driver.py` exists in the package root and defines a class named `Driver` with the required methods for its connection type. See [DRIVERS.md](DRIVERS.md).
 
+### Wiring row `FAILED` with `driver load failed: <ClassName>`
+
+The switch's driver package could not be loaded when execution tried to apply the
+wiring, so no driver call ran. The reason tells the two cases apart (issue #1002):
+
+- `driver load failed: ConnectError` (or another transport class) with no prefix: the
+  package download failed, usually because inventory or package storage was briefly
+  unreachable on a cold driver cache. The row is retryable in its own direction: the
+  background retry tick picks it up, or press **Retry failed** while the reservation is
+  `ACTIVE`. Each failed load counts one attempt, so a lasting outage stops the auto
+  retries at `WIRING_RETRY_MAX_ATTEMPTS`; a manual retry still works after that.
+- `recorded hop unresolvable: driver load failed: DriverPackageError`: the package is
+  broken (a corrupt archive, a missing or unimportable `driver.py`, a missing required
+  method). It is reported not retryable. Fix and re-upload the driver, then re-save the
+  fork wiring. The execution log line `Wiring driver load failed for switch ...` carries
+  the validation detail.
+
 ### Log action `dynamic_instance_keyed_destroy_failed`
 
 Meaning: a reservation with a dynamic instance ended, and the instance's ledger row had

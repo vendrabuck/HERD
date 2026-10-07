@@ -195,8 +195,9 @@ async def test_record_route_active_frozen_parks_failed_intended_released(db):
 
 async def test_record_route_active_frozen_reuses_failed_row_keeps_pinned_routes(db):
     """The retry-tick interleaving shape: the FAILED provision row being retried is
-    parked in place, keeping its already-pinned routes (the immutable set) and its
-    accumulated attempts."""
+    parked in place, keeping its already-pinned routes and its accumulated attempts,
+    widened by the routes the late provision configured (issue #1001), so the release
+    channel removes everything that may now be on the switch."""
     from app.models.reservation_wiring_state import ReservationWiringState
     from app.services.route_service import FROZEN_PROVISION_PENDING_REMOVAL, record_route_failed
 
@@ -210,7 +211,9 @@ async def test_record_route_active_frozen_reuses_failed_row_keeps_pinned_routes(
     assert row.id == failed.id, "the same row is parked, not a parallel row"
     assert row.status == "FAILED"
     assert row.intended == "RELEASED"
-    assert row.routes == ROUTES, "the flip keeps the original pinned set, never the edit"
+    assert row.routes == ROUTES + EDITED_ROUTES, (
+        "the flip keeps the original pinned set first and adds the configured edit"
+    )
     assert row.attempts == 2
     assert row.last_error == FROZEN_PROVISION_PENDING_REMOVAL
 
@@ -457,3 +460,81 @@ async def test_record_route_active_reusable_cas_loser_never_overwrites(db):
         await db.execute(select(RouteAssignment).where(RouteAssignment.id == failed.id))
     ).scalar_one()
     assert final.routes == ROUTES, "the winner's content survives; the loser never overwrote it"
+
+
+# --- Issue #1001: a FAILED pin records what may still be installed -------------
+
+
+def test_union_routes_dedups_by_route_identity_keeping_first_occurrence():
+    from app.services.route_service import union_routes
+
+    same_as_first = {"destination": "10.0.0.0/24", "interface": "eth0", "next_hop": "192.168.1.1"}
+    merged = union_routes(ROUTES, [same_as_first], EDITED_ROUTES, None)
+    assert merged == ROUTES + EDITED_ROUTES
+    assert union_routes(ROUTES, ROUTES) == ROUTES
+
+
+def test_routes_not_in_compares_by_identity_not_raw_dict_equality():
+    from app.services.route_service import routes_not_in
+
+    # A key-order and absent-vs-null virtual_router difference is the same route.
+    reordered = [dict(reversed(list(ROUTES[0].items())), virtual_router=None)]
+    assert routes_not_in(ROUTES, reordered) == [ROUTES[1]]
+    assert routes_not_in(ROUTES, []) == ROUTES
+    assert routes_not_in(None, ROUTES) == []
+
+
+async def test_possibly_installed_routes_reads_a_failed_row_of_either_direction(db):
+    from app.services.route_service import possibly_installed_routes, record_route_failed
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    assert await possibly_installed_routes(db, rid, sid) == []
+
+    await record_route_failed(db, rid, sid, ROUTES, 1, "boom", intended="ACTIVE")
+    assert await possibly_installed_routes(db, rid, sid) == ROUTES
+
+    await record_route_failed(db, rid, sid, None, 1, "boom", intended="RELEASED")
+    assert await possibly_installed_routes(db, rid, sid) == ROUTES
+
+
+async def test_possibly_installed_routes_ignores_an_active_pin(db):
+    """A provision never targets an ACTIVE pin, so an ACTIVE row contributes no residue."""
+    from app.services.route_service import possibly_installed_routes
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_active(db, rid, sid, ROUTES)
+    assert await possibly_installed_routes(db, rid, sid) == []
+
+
+async def test_record_route_reconcile_failed_records_possibly_installed_routes(db):
+    """After a partial drive the row records what may be on the switch, not the previous
+    pin; the compare-and-swap still runs against the previous pin first."""
+    from app.services.route_service import record_route_reconcile_failed
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_active(db, rid, sid, ROUTES)
+    row = await record_route_reconcile_failed(
+        db, rid, sid, 1, "boom", ROUTES, possibly_installed=ROUTES + EDITED_ROUTES
+    )
+    assert row.status == "FAILED"
+    assert row.intended == "ACTIVE"
+    assert row.routes == ROUTES + EDITED_ROUTES
+
+
+async def test_record_route_reconcile_failed_stale_writer_ignores_possibly_installed(db):
+    from app.services.route_service import record_route_reconcile_failed
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_active(db, rid, sid, ROUTES)
+    assert (
+        await record_route_reconcile_failed(
+            db, rid, sid, 1, "boom", EDITED_ROUTES, possibly_installed=EDITED_ROUTES
+        )
+        is None
+    )
+    row = (await db.execute(select(RouteAssignment))).scalars().one()
+    assert (row.status, row.routes) == ("ACTIVE", ROUTES)

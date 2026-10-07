@@ -876,3 +876,25 @@ a second physical interface with no cable; a route on it is refused, the existin
 **Left open.** #763 (config-content oracle) is unchanged. An interface named in a
 route but absent from the resolved hops because the hop was port-constrained to a
 different port is exactly what this refuses; that is the intent.
+
+## Amendment: a failed route change keeps a possibly-installed pin (2026-10-07, issue #1001)
+
+**What changed.** Decision 3 said a failed delta keeps the previous pinned set verbatim,
+so a later teardown or retry targets what was installed before the change. In practice
+the drive continues after a failed call, so routes the delta added were installed but not
+recorded, teardown read only ACTIVE pins, and a later rebuild re-pinned the new intent
+without removing anything. The `routes` column of a FAILED pin now records what MAY be
+installed on the switch after the failed pass: the previous routes whose removal did not
+confirm plus every route the pass tried to add (`record_route_reconcile_failed(...,
+possibly_installed=)`; with nothing driven the previous pin is still kept verbatim). A
+terminal teardown parks a FAILED intended-ACTIVE pin as intended RELEASED
+(`TEARDOWN_PENDING_REMOVAL`) before any driver call and removes exactly that set; a
+provision over a FAILED pin (a save or a retry) first removes the recorded routes its new
+intent no longer names, then configures the intent. The superset is safe because
+`remove_route` must succeed when the route is already absent, now stated in
+`docs/DRIVERS.md`; `frr_l3` and `mock_l3` already behave that way.
+
+**Not changed.** Pins stay per-reservation and non-exclusive, so there is still no L3
+supersession. Route identity is still `route_identity_key`.
+`docs/specs/provisioning-and-wiring.md` (WIRE-L3-19, LEDGER-2, LEDGER-4, TEARDOWN-6) is
+the as-built rule set.

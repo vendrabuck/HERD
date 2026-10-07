@@ -1036,7 +1036,12 @@ intent-driven switch is the deliberate exception (ADR 0014 Decision 3): a fork s
 that changes the switch's routing intent drives a delta against what is currently
 pinned (`remove_route` for routes that left, `configure_route` for routes that
 arrived, both within one login/logout, removes before adds), and the pin advances to
-the new set on success; a failed delta leaves the previous pin untouched. Intent
+the new set on success. A failed delta records every route that may still be on the
+switch (the previous routes whose removal did not confirm plus every route it tried to
+add, issue #1001): the next provision of that switch removes the ones its route set no
+longer names before configuring the set, and a reservation ending removes them all, so
+`remove_route` may be called for a route that is not installed and must succeed then
+(already absent is the desired end state). Intent
 disappearing from a switch that stays wired does NOT tear down its routes (no
 surprise mid-reservation teardown); it keeps whatever was last successfully applied,
 recoverable only by another intent-bearing save or the reservation ending. A stale or

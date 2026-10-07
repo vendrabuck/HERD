@@ -21,6 +21,7 @@ from app.models.execution_command import ExecutionCommand
 from app.models.execution_run import ExecutionRun
 from app.services.driver_loader import (
     DriverPackageError,
+    driver_load_failure_text,
     get_driver_config_schema,
     get_driver_metadata,
     load_driver,
@@ -480,9 +481,9 @@ async def run_driver_action(
         # underlying cause's class when e wraps one via __cause__, else e's
         # own class. The full text goes in the log MESSAGE, where an operator
         # reads it, and nowhere that a caller can.
+        sanitized_error = driver_load_failure_text(e)
         cause = e.__cause__
         cause_class = type(cause).__name__ if cause is not None else type(e).__name__
-        sanitized_error = f"driver load failed: {cause_class}"
         logger.error(
             "Driver load failed on run %s (%s): %s",
             run.id,
