@@ -763,13 +763,18 @@ removes exactly that when the switch is no longer needed.
   Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_reconcile_provisions_pinned_routes_on_first_adjacency`, `test_reconcile_deprovisions_on_last_adjacency_lost`, `test_reconcile_multi_hop_shared_adjacency_keeps_routes_until_last_hop`); `tests/integration/test_l3_reconcile.py` (`test_l3_routes_provision_on_gained_adjacency_and_release_on_lost`, `test_l3_shared_adjacency_keeps_routes_until_last_hop_leaves`)
 - **WIRE-L3-3.** A provision installs the fork's routing intent for the switch when there
   is any; otherwise the routes of this reservation's existing non-RELEASED pin (ACTIVE
-  before FAILED); otherwise the `routes` of the switch's latest config version. \
+  before FAILED) when that row records any; otherwise the `routes` of the switch's latest
+  config version. A row that records no routes is a drive-gate refusal recorded before
+  anything was applied, not an applied empty set, so it falls back to the config (ADR
+  0014 amendment for issue #1004). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_reconcile_l3_adjacency`); `services/execution/app/services/route_service.py` (`get_effective_pinned_routes`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_precedence_intent_beats_config_on_first_adjacency`, `test_precedence_no_intent_still_falls_back_to_config`, `test_precedence_decided_per_switch_in_one_reconcile`, `test_reconcile_reuses_pinned_set_not_edited_config_on_reprovision`); `tests/integration/test_l3_intent_execution.py` (`test_reservation_with_intent_provisions_exactly_the_intent`)
+  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_precedence_intent_beats_config_on_first_adjacency`, `test_precedence_no_intent_still_falls_back_to_config`, `test_precedence_decided_per_switch_in_one_reconcile`, `test_reconcile_reuses_pinned_set_not_edited_config_on_reprovision`, `test_refused_intent_then_removed_save_drives_the_configured_routes`, `test_refused_intent_then_fixed_save_drives_the_intent`, `test_failed_intent_provision_then_intent_removed_keeps_that_set_not_config`); `services/execution/tests/test_route_service.py` (`test_get_effective_pinned_routes_is_none_for_a_failed_row_with_no_routes`, `test_get_effective_pinned_routes_still_returns_a_failed_rows_routes`); `tests/integration/test_l3_intent_execution.py` (`test_reservation_with_intent_provisions_exactly_the_intent`)
 - **WIRE-L3-4.** A switch for which that rule yields no routes is not provisioned and no
-  pin is written. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_reconcile_l3_adjacency`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_provision_skips_switch_whose_config_has_no_routes`); `tests/integration/test_l3_route_provisioning.py` (`test_no_route_ops_when_l3_device_has_no_config`)
+  pin is written; a FAILED row for it that records no routes is released with no driver
+  call, unless a retry channel holds its drive claim. `_apply_l3_adjacency` drives and
+  records nothing for a provision that carries no routes. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_reconcile_l3_adjacency`, `_apply_l3_adjacency`); `services/execution/app/services/route_service.py` (`release_unapplied_route_pin`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_provision_skips_switch_whose_config_has_no_routes`, `test_refused_intent_removed_with_no_configured_routes_save_releases_the_row`, `test_apply_l3_adjacency_provision_with_no_routes_drives_and_records_nothing`); `services/execution/tests/test_route_service.py` (`test_release_unapplied_route_pin_releases_a_failed_row_with_no_routes`, `test_release_unapplied_route_pin_leaves_a_row_that_records_routes`, `test_release_unapplied_route_pin_leaves_an_active_row`, `test_release_unapplied_route_pin_leaves_a_claimed_row`, `test_release_unapplied_route_pin_matches_only_the_given_row_id`); `tests/integration/test_l3_route_provisioning.py` (`test_no_route_ops_when_l3_device_has_no_config`)
 - **WIRE-L3-5.** A deprovision removes the pin's stored routes, never routes re-read from
   the config, and is skipped when the pin is not believed installed (ACTIVE, or FAILED
   intended `RELEASED`). \
@@ -817,11 +822,11 @@ removes exactly that when the switch is no longer needed.
 - **WIRE-L3-13.** Routing intent passes the drive gate before it is provisioned or used
   for a delta. A refused newly adjacent switch is recorded FAILED intended `ACTIVE` with
   the gate's reason, keeping the routes of an existing non-RELEASED row or, when there is
-  none, storing an empty route list; a refused staying switch goes through
-  `record_route_reconcile_failed` keeping its pin; neither makes a driver call. Known
-  gap, see #1004. \
+  none, storing an empty route list, which records that nothing is installed (WIRE-L3-3,
+  WIRE-L3-4); a refused staying switch goes through `record_route_reconcile_failed`
+  keeping its pin; neither makes a driver call. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_reconcile_l3_adjacency`, `_gate_l3_drive_routes`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_gate_missing_config_version_lands_unconfigured_failed_no_driver_call`, `test_gate_reconcile_failure_keeps_previous_pin_via_reconcile_failed_path`)
+  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_gate_missing_config_version_lands_unconfigured_failed_no_driver_call`, `test_gate_reconcile_failure_keeps_previous_pin_via_reconcile_failed_path`, `test_vrf_route_fails_switch_with_no_driver_call`)
 - **WIRE-L3-14.** The gate refuses the whole switch with `l3_vrf_unsupported` when any
   route names a `virtual_router` and the switch's driver, loaded first, does not declare
   `supports_vrf`; a missing switch, a missing driver, or a broken package also refuses,
@@ -1057,11 +1062,14 @@ interface in section 8.15.
 - **WIRE-RETRY-9.** An L3 build row is driven with the fork's current routing intent for
   the switch when there is any, after the drive gate; a gate refusal re-records the row
   by row id with one more attempt and the reason, with no driver call; a gate transport
-  failure skips only that row. With no intent the row's stored routes are driven. The
+  failure skips only that row. With no intent the row's stored routes are driven; a row
+  that stores none is driven with the switch's configured routes, or released with no
+  driver call when those are empty too (WIRE-L3-4), and a transport failure reading the
+  configuration skips only that row. The
   stored routes the driven set drops are removed first (WIRE-L3-19), and a success
   replaces the stored routes with those driven (WIRE-LEDGER-2). \
   Enforced in: `services/execution/app/services/wiring_retry_service.py` (`_reattempt_l3_rows`); `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_retry_after_failed_delta_removes_the_routes_its_intent_drops`); `services/execution/tests/test_wiring_retry_l3.py` (`test_l3_build_retry_with_current_intent_drives_intent_not_stale_pin`, `test_l3_build_retry_without_intent_drives_row_routes_verbatim`, `test_l3_build_retry_with_intent_gate_failure_makes_no_driver_call`, `test_l3_build_retry_gate_transient_failure_isolated_per_row`, `test_l3_build_retry_trunk_skipped_switch_still_retried_when_intent_present`)
+  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_retry_after_failed_delta_removes_the_routes_its_intent_drops`, `test_refused_intent_then_removed_retry_drives_the_configured_routes`, `test_refused_intent_then_fixed_retry_drives_the_intent`, `test_failed_intent_provision_then_intent_removed_retry_keeps_that_set`, `test_refused_intent_removed_with_no_configured_routes_retry_releases_the_row`); `services/execution/tests/test_wiring_retry_l3.py` (`test_l3_build_retry_with_current_intent_drives_intent_not_stale_pin`, `test_l3_build_retry_without_intent_drives_row_routes_verbatim`, `test_l3_build_retry_with_intent_gate_failure_makes_no_driver_call`, `test_l3_build_retry_gate_transient_failure_isolated_per_row`, `test_l3_build_retry_trunk_skipped_switch_still_retried_when_intent_present`)
 - **WIRE-RETRY-10.** An L2 release settled as superseded also frees its allocation when
   no ACTIVE membership remains, undefining the VLAN where it was defined. \
   Enforced in: `services/execution/app/services/wiring_retry_service.py` (`_reattempt_l2_rows`) \
@@ -1272,11 +1280,6 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
   what cabling computes for an isolated switch, and re-resolves it on every call. The
   fabric id itself is computed by cabling from the membership of the connected
   component (`topology.md`).
-- #1004 (WIRE-L3-13, WIRE-L3-3): a drive-gate refusal on a newly adjacent switch with no
-  earlier row records a `FAILED` row with an empty route list. The effective pinned
-  routes are then an empty list rather than absent, so removing the intent does not
-  fall back to the configured routes, and the retry tick, driving the row's stored
-  routes, pins the empty set ACTIVE.
 
 ### Limits by decision
 

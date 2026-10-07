@@ -898,3 +898,37 @@ intent no longer names, then configures the intent. The superset is safe because
 supersession. Route identity is still `route_identity_key`.
 `docs/specs/provisioning-and-wiring.md` (WIRE-L3-19, LEDGER-2, LEDGER-4, TEARDOWN-6) is
 the as-built rule set.
+
+## Amendment: a refused intent leaves no applied set (2026-10-07, issue #1004)
+
+Decided by Lane on 2026-10-07 (option A on the issue).
+
+**What changed.** Decision 2 and addendum X4 met on one case. When the drive gate
+refuses a newly adjacent switch (`l3_vrf_unsupported`, or any re-validation reason)
+before anything was applied, the reconcile records a FAILED row with no routes. That
+empty list read as a pin, so removing the intent skipped the fallback to the switch's
+configured routes, and the retry tick drove the empty list: one login and one logout,
+no route call, the row ACTIVE with no routes, reported `reconnected`. Decision 2 now
+governs that case. X4's "keeps its applied set" applies only to a switch that had one.
+
+- A FAILED row with no routes records that nothing is installed, never an applied empty
+  set. A provision never pins an empty set (a switch whose route source yields nothing
+  is not provisioned), so the empty list is only ever an unapplied refusal.
+  `get_effective_pinned_routes` answers None for it, and the reconcile falls back to the
+  latest config version exactly as for a fresh provision.
+- The build-direction retry channel does the same: with no current intent, a row with
+  routes is driven with them (X4, unchanged), and a row with none is driven with the
+  configured routes.
+- When the configured routes are empty too, nothing is installed and nothing is due, so
+  the row is released with no driver call (`release_unapplied_route_pin`: a locked,
+  unclaimed FAILED row whose routes are still empty) instead of staying FAILED with a
+  stale reason that the retry tick would select forever.
+- `_apply_l3_adjacency` refuses to drive a provision that carries no routes, so a
+  session with zero route calls can no longer be recorded ACTIVE or reported
+  `reconnected`.
+
+**Not changed.** A switch that had an applied intent and loses it keeps that set (X4),
+whether its row is ACTIVE or FAILED with recorded routes. A refusal on a switch whose
+FAILED row already records routes keeps them (issue #1001). No schema changed.
+`docs/specs/provisioning-and-wiring.md` (WIRE-L3-3, WIRE-L3-4, WIRE-L3-13,
+WIRE-RETRY-9) is the as-built rule set.

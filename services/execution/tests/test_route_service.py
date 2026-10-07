@@ -538,3 +538,90 @@ async def test_record_route_reconcile_failed_stale_writer_ignores_possibly_insta
     )
     row = (await db.execute(select(RouteAssignment))).scalars().one()
     assert (row.status, row.routes) == ("ACTIVE", ROUTES)
+
+
+# --- Issue #1004: a FAILED row with no routes records nothing applied -------------
+
+
+async def test_get_effective_pinned_routes_is_none_for_a_failed_row_with_no_routes(db):
+    """A gate refusal recorded before anything was applied stores no routes; that is
+    not an applied empty set, so the caller falls back to the configured routes."""
+    from app.services.route_service import get_effective_pinned_routes, record_route_failed
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_failed(db, rid, sid, None, 0, "l3_vrf_unsupported", intended="ACTIVE")
+    assert await get_effective_pinned_routes(db, rid, sid) is None
+
+
+async def test_get_effective_pinned_routes_still_returns_a_failed_rows_routes(db):
+    from app.services.route_service import get_effective_pinned_routes, record_route_failed
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_failed(db, rid, sid, ROUTES, 1, "boom", intended="ACTIVE")
+    assert await get_effective_pinned_routes(db, rid, sid) == ROUTES
+
+
+async def test_release_unapplied_route_pin_releases_a_failed_row_with_no_routes(db):
+    from app.services.route_service import record_route_failed, release_unapplied_route_pin
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    failed = await record_route_failed(
+        db, rid, sid, None, 0, "l3_vrf_unsupported", intended="ACTIVE"
+    )
+    row = await release_unapplied_route_pin(db, rid, sid, row_id=failed.id)
+    assert row is not None
+    assert (row.status, row.intended, row.last_error) == ("RELEASED", "RELEASED", None)
+    assert row.released_at is not None
+
+
+async def test_release_unapplied_route_pin_leaves_a_row_that_records_routes(db):
+    """Recorded routes may be installed (issue #1001): such a row is never settled here."""
+    from app.services.route_service import record_route_failed, release_unapplied_route_pin
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_failed(db, rid, sid, ROUTES, 1, "boom", intended="ACTIVE")
+    assert await release_unapplied_route_pin(db, rid, sid) is None
+    row = (await db.execute(select(RouteAssignment))).scalar_one()
+    assert (row.status, row.routes) == ("FAILED", ROUTES)
+
+
+async def test_release_unapplied_route_pin_leaves_an_active_row(db):
+    from app.services.route_service import release_unapplied_route_pin
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_active(db, rid, sid, ROUTES)
+    assert await release_unapplied_route_pin(db, rid, sid) is None
+    row = (await db.execute(select(RouteAssignment))).scalar_one()
+    assert row.status == "ACTIVE"
+
+
+async def test_release_unapplied_route_pin_leaves_a_claimed_row(db):
+    """A row a retry channel is driving (issue #817) is not settled under it."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.services.route_service import record_route_failed, release_unapplied_route_pin
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    failed = await record_route_failed(
+        db, rid, sid, None, 0, "l3_vrf_unsupported", intended="ACTIVE"
+    )
+    failed.claimed_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+    await db.commit()
+    assert await release_unapplied_route_pin(db, rid, sid, row_id=failed.id) is None
+    assert (await db.execute(select(RouteAssignment))).scalar_one().status == "FAILED"
+
+
+async def test_release_unapplied_route_pin_matches_only_the_given_row_id(db):
+    from app.services.route_service import record_route_failed, release_unapplied_route_pin
+
+    rid = uuid.uuid4()
+    sid = uuid.uuid4()
+    await record_route_failed(db, rid, sid, None, 0, "l3_vrf_unsupported", intended="ACTIVE")
+    assert await release_unapplied_route_pin(db, rid, sid, row_id=uuid.uuid4()) is None
+    assert (await db.execute(select(RouteAssignment))).scalar_one().status == "FAILED"

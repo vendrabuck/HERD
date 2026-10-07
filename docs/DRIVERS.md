@@ -1044,7 +1044,10 @@ longer names before configuring the set, and a reservation ending removes them a
 (already absent is the desired end state). Intent
 disappearing from a switch that stays wired does NOT tear down its routes (no
 surprise mid-reservation teardown); it keeps whatever was last successfully applied,
-recoverable only by another intent-bearing save or the reservation ending. A stale or
+recoverable only by another intent-bearing save or the reservation ending. A switch
+whose intent was refused before anything was applied has no applied set to keep, so
+once its intent is removed it falls back to its config version's routes like any
+switch without intent (issue #1004). A stale or
 missing per-route validation stamp is re-validated against the switch's CURRENT
 config before any driver call (ADR 0014 addendum X-A); a route naming a
 `virtual_router` is refused for drivers that do not declare `supports_vrf`
