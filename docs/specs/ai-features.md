@@ -309,10 +309,16 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   request's attempts reported (AI-QUOTA-5). \
   Enforced in: `services/ai-orchestrator/app/services/generator.py` (`generate_topology`, `GeneratorError`); `services/ai-orchestrator/app/routes/generate.py` (`generate`) \
   Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_records_usage_when_quota_enabled`, `test_generate_failed_after_repairs_meters_every_attempt`)
-- **AI-GEN-15.** Generation does not check that the proposed `topology_type` values agree
-  with each other or with the resolved devices. Known gap, see #1038. \
-  Enforced in: `services/ai-orchestrator/app/services/generator.py` (`_validate_against_inventory`) \
-  Pinned by: none (issue #1038)
+- **AI-GEN-15.** After resolution, the resolved devices' `topology_type` values must agree
+  (a device record without one is not judged). A proposal that mixes types is a repairable
+  mistake: the model is re-prompted with one line per type naming its templates, from the
+  same `AI_GENERATE_MAX_REPAIRS` budget; after it, the route answers 422
+  `{"error": "topology_mixed_types", "groups": [{topology_type, roles, templates}], "message"}`.
+  A uniform proposal answers each device's `topology_type` as its resolved device's type.
+  The committer still writes `topologyType: "PHYSICAL"` on every device node
+  (AI-COMMIT-4). \
+  Enforced in: `services/ai-orchestrator/app/services/generator.py` (`_check_uniform_topology_type`, `TopologyMixedTypesError`, `_propose_until_valid`) \
+  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_mixed_types_repairs_then_returns_structured_422`, `test_generate_mixed_types_is_repaired_on_retry`, `test_generate_topology_type_follows_the_resolved_devices`)
 - **AI-GEN-16.** The response's `file_summaries` lists each extracted file's `filename`,
   character count, and `truncated` flag. \
   Enforced in: `services/ai-orchestrator/app/services/generator.py` (`generate_topology`) \
@@ -1317,6 +1323,11 @@ named in each rule.
   new conversation on the server. \
   Enforced in: `frontend/src/components/reservations/AIAssistantTabLegacy.tsx` (`AIAssistantTabLegacy`) \
   Pinned by: none
+- **AI-UI-19.** On a `topology_mixed_types` 422 the generate dialog shows the server's
+  message and one `TYPE: template, template` line per type; `topologyMixedTypesDetail`
+  narrows only a 422 whose detail has `error: topology_mixed_types` and an array `groups`. \
+  Enforced in: `frontend/src/components/topology-editor/AIDialog.tsx` (`AIDialog`); `frontend/src/lib/errors.ts` (`topologyMixedTypesDetail`, `formatMixedTypesDetail`) \
+  Pinned by: `frontend/src/test/components/AIDialog.test.tsx` (`names the templates per type on the mixed-types 422 (#1038)`); `frontend/src/test/lib/errors.test.ts` (`narrows the structured 422 body`, `returns null for the unconnectable 422 and a plain string`, `renders the message then one line per type`)
 
 **Out of scope.** The Purpose Review page and the Classify now button are reservations
 callers (`reservations.md`, RES-PURPOSE-9 to RES-PURPOSE-14).
@@ -1394,6 +1405,7 @@ stream opens are `error` frames, listed at the end.
 | 422 | validation list | a body or form outside its schema (prompt, commit body, question, purpose bounds) | AI-GEN-1, AI-COMMIT-2, AI-CONV-11, AI-PURPOSE-4 |
 | 422 | the config validator's message, prefixed with the role | a commit device config that fails validation | AI-COMMIT-3 |
 | 422 | `{"error": "topology_unconnectable", "pairs": [...], "message": "..."}` | no wireable device choice after repairs | AI-RESOLVE-14 |
+| 422 | `{"error": "topology_mixed_types", "groups": [...], "message": "..."}` | resolved devices of more than one topology type after repairs | AI-GEN-15 |
 | 422 | `{"error": "topology_unwireable", "invalid_edges": [...], "message": "..."}` | cabling's validate answered `valid: false` at commit | AI-COMMIT-10 |
 | 429 | `{"limit", "used", "remaining": 0, "reset_at"}` | daily quota reached | AI-QUOTA-2, AI-CONV-12, AI-RECIPE-4, AI-PURPOSE-3 |
 | 502 | `AI returned no usable response`, `AI call failed`, `AI returned a response that did not match the expected schema` | generation model failure | AI-GEN-7, AI-GEN-8, AI-GEN-9 |
@@ -1514,9 +1526,6 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
 
 ### Open defects
 
-- #1038 (AI-GEN-15): nothing in generation checks that a proposal's devices share one
-  topology type; the commit writes PHYSICAL on every device node, and the reservation
-  create's 422 is the only check.
 - #1039 (AI-CONV-9, AI-PURPOSE-6): the idle-conversation sweeper deletes by last use only,
   so a reservation's transcript can be gone before purpose classification reads it. The
   issue asks the owner to choose between exempting such conversations and documenting the
@@ -1559,7 +1568,6 @@ Issue #1040 tracks the tests for every rule below that no open defect names. A r
 under Open defects gets its test with that defect's fix.
 
 - AI-PROV-20: the anthropic provider's `EMPTY` placeholder.
-- AI-GEN-15: no agreement check on proposed `topology_type`.
 - AI-UPLOAD-3: empty or nameless parts skipped.
 - AI-RESOLVE-7: pathfind chunk size and timeout.
 - AI-CONV-5: later turns do not re-read the reservation.

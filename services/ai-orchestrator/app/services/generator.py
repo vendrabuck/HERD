@@ -105,6 +105,28 @@ class TopologyUnconnectableError(GeneratorError):
         self.repair_feedback = repair_feedback
 
 
+class TopologyMixedTypesError(GeneratorError):
+    """A proposal whose resolved devices mix topology types (422, issue #1038).
+
+    Physical and cloud devices never mix in one topology or reservation:
+    reservations refuses a mixed device set at creation, so a mixed proposal
+    could only fail later, at commit, after the topology was created and
+    deleted again. Treated like the unconnectable case: repairable (the model
+    can choose templates of one type), then a structured 422 once repairs run
+    out. `groups` lists each type with the roles and templates that resolved
+    to it; `repair_feedback` is the corrective note.
+    """
+
+    def __init__(self, groups: list[dict[str, Any]], message: str, repair_feedback: str) -> None:
+        super().__init__(
+            422,
+            message,
+            detail={"error": "topology_mixed_types", "groups": groups, "message": message},
+        )
+        self.groups = groups
+        self.repair_feedback = repair_feedback
+
+
 # How many times to re-prompt the model after a repairable validation failure
 # is settings.ai_generate_max_repairs (env AI_GENERATE_MAX_REPAIRS, default 2).
 # A hardcoded constant used to live here; it is now an operator-tunable
@@ -257,6 +279,21 @@ async def _propose_until_valid(
             logger.info(
                 "ai_proposal_unconnectable_retry",
                 extra={"attempt": attempt, "pairs": len(e.pairs)},
+            )
+            repair_feedback = e.repair_feedback
+            continue
+
+        # Issue #1038: the resolved devices must share one topology type.
+        # Repairable for the same reason as the unconnectable case above: the
+        # model can pick templates whose devices are all of one type.
+        try:
+            _check_uniform_topology_type(candidate)
+        except TopologyMixedTypesError as e:
+            if attempt >= max_repairs:
+                raise
+            logger.info(
+                "ai_proposal_mixed_types_retry",
+                extra={"attempt": attempt, "types": len(e.groups)},
             )
             repair_feedback = e.repair_feedback
             continue
@@ -461,6 +498,57 @@ async def _resolve_devices(
     )
     for proposed in response.devices:
         proposed.device = device_by_id[plan.assignment[proposed.role]]
+
+
+def _check_uniform_topology_type(response: GenerateResponse) -> None:
+    """Refuse a proposal whose resolved devices mix topology types (issue
+    #1038), and otherwise set each proposed device's `topology_type` to its
+    resolved device's real type, so the proposal states what was resolved
+    rather than the schema default.
+
+    The type is read from the inventory device record the resolver chose
+    (`device["topology_type"]`); a record without one is not judged.
+    """
+    roles_by_type: dict[str, list[str]] = defaultdict(list)
+    templates_by_type: dict[str, list[str]] = defaultdict(list)
+    for proposed in response.devices:
+        device_type = (proposed.device or {}).get("topology_type")
+        if not isinstance(device_type, str) or not device_type:
+            continue
+        roles_by_type[device_type].append(proposed.role)
+        if proposed.template_name not in templates_by_type[device_type]:
+            templates_by_type[device_type].append(proposed.template_name)
+
+    if len(roles_by_type) > 1:
+        groups = [
+            {
+                "topology_type": device_type,
+                "roles": roles_by_type[device_type],
+                "templates": templates_by_type[device_type],
+            }
+            for device_type in sorted(roles_by_type)
+        ]
+        types = " and ".join(g["topology_type"] for g in groups)
+        message = (
+            f"The proposal mixes {types} devices; physical and cloud devices cannot "
+            "share one topology or reservation."
+        )
+        lines = [
+            f"- templates {', '.join(g['templates'])} resolved to {g['topology_type']} devices"
+            for g in groups
+        ]
+        repair_feedback = (
+            "The proposal mixes device topology types:\n"
+            + "\n".join(lines)
+            + "\nPhysical and cloud devices never share one topology. Propose a topology "
+            "whose devices are all of one type."
+        )
+        raise TopologyMixedTypesError(groups, message, repair_feedback)
+
+    for proposed in response.devices:
+        device_type = (proposed.device or {}).get("topology_type")
+        if isinstance(device_type, str) and device_type:
+            proposed.topology_type = device_type
 
 
 def _unconnectable_error(

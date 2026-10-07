@@ -32,7 +32,7 @@ The orchestrator constrains the LLM's output via a tool schema built per request
 
 - `role` (unique within the proposal; e.g. `fw-a`, `fw-b`, `core-sw-1`)
 - `template_name` (must match a real template in your inventory exactly; no invented names)
-- `topology_type` (`PHYSICAL` or `CLOUD`; generation does not check that a proposal's devices share one type, see issue #1038)
+- `topology_type` (`PHYSICAL` or `CLOUD`; uniform across a single proposal, and after resolution it states the resolved devices' real type, see [One topology type per proposal](#one-topology-type-per-proposal))
 - `config` (optional; see [Device configs](#device-configs-the-allowlist))
 
 Edges reference roles by name and carry a `layer` (`L1`, `L2`, or `L3`).
@@ -71,6 +71,25 @@ When no assignment exists, the orchestrator does not return a flagged proposal a
 ```
 
 The AI dialog renders each pair as a "source role to target role" line so you can see which connection the lab cannot carry.
+
+## One topology type per proposal
+
+Physical and cloud devices never mix in one topology or reservation, so after resolution the orchestrator checks the `topology_type` of every device it chose (issue #1038). A proposal whose devices resolve to more than one type is a repairable mistake: the model is re-prompted with a note naming which templates resolved to which type, from the same `AI_GENERATE_MAX_REPAIRS` budget. Once that budget is exhausted the request fails with HTTP 422 before anything is committed:
+
+```json
+{
+  "detail": {
+    "error": "topology_mixed_types",
+    "groups": [
+      {"topology_type": "CLOUD", "roles": ["vm"], "templates": ["CloudVM"]},
+      {"topology_type": "PHYSICAL", "roles": ["fw"], "templates": ["EX3400"]}
+    ],
+    "message": "The proposal mixes CLOUD and PHYSICAL devices; physical and cloud devices cannot share one topology or reservation."
+  }
+}
+```
+
+The AI dialog shows the message with one line per type listing its templates. A uniform proposal comes back with each device's `topology_type` set to its resolved device's type. The commit still writes `topologyType: "PHYSICAL"` on every canvas node it builds; the reservation create's own check remains the second line of defense.
 
 ## File uploads
 

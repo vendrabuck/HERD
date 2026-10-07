@@ -169,6 +169,36 @@ describe("AIDialog", () => {
     expect(message).not.toBe("Failed to generate topology");
   });
 
+  it("names the templates per type on the mixed-types 422 (#1038)", async () => {
+    server.use(
+      http.post("/api/ai/generate", () =>
+        HttpResponse.json(
+          {
+            detail: {
+              error: "topology_mixed_types",
+              groups: [
+                { topology_type: "CLOUD", roles: ["vm"], templates: ["CloudVM"] },
+                { topology_type: "PHYSICAL", roles: ["fw"], templates: ["EX3400"] },
+              ],
+              message: "The proposal mixes CLOUD and PHYSICAL devices.",
+            },
+          },
+          { status: 422 },
+        ),
+      ),
+    );
+    renderDialog();
+    fireEvent.change(screen.getByLabelText("Prompt"), {
+      target: { value: "go" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Generate" }));
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    const message = toastError.mock.calls[0][0] as string;
+    expect(message).toBe(
+      "The proposal mixes CLOUD and PHYSICAL devices.\nCLOUD: CloudVM\nPHYSICAL: EX3400",
+    );
+  });
+
   it("keeps the plain-string fallback for a 422 that is not structured", async () => {
     server.use(
       http.post("/api/ai/generate", () =>

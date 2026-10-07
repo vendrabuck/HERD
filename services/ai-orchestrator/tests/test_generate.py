@@ -1435,3 +1435,110 @@ async def test_generate_unreachable_provider_meters_nothing(async_client, monkey
     assert resp.status_code == 503
     async with _TestSessionLocal() as db:
         assert await usage_repo.get_today_total(db, uuid.UUID(_USER_ID)) == 0
+
+
+# --- One topology type per proposal (issue #1038) --------------------------
+
+
+def _override_typed_resolver(monkeypatch, types: dict[str, str]) -> None:
+    """Like _override_resolver, but each template's devices carry the
+    topology_type given in `types` (default PHYSICAL)."""
+
+    async def _fake(token: str, template_id: str, count: int):
+        template_name = template_id.removeprefix("tpl-")
+        return [
+            {
+                "id": f"dev-{template_name}-{i}",
+                "name": f"{template_name}-{i}",
+                "template_id": template_id,
+                "template_name": template_name,
+                "topology_type": types.get(template_name, "PHYSICAL"),
+                "status": "AVAILABLE",
+            }
+            for i in range(count)
+        ]
+
+    monkeypatch.setattr(generator_module, "fetch_available_devices", _fake)
+    _override_pathfind(monkeypatch)
+
+
+_MIXED_PROPOSAL = {
+    "purpose": "mixed",
+    "devices": [
+        {"role": "fw", "template_name": "EX3400"},
+        {"role": "vm", "template_name": "CloudVM"},
+    ],
+    "edges": [],
+}
+
+
+async def test_generate_mixed_types_repairs_then_returns_structured_422(async_client, monkeypatch):
+    _override_inventory({"EX3400": 4, "CloudVM": 4})
+    _override_typed_resolver(monkeypatch, {"CloudVM": "CLOUD"})
+    sink: list[str] = []
+    _override_ai_recording(_MIXED_PROPOSAL, sink)
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "topology_mixed_types"
+    assert detail["groups"] == [
+        {"topology_type": "CLOUD", "roles": ["vm"], "templates": ["CloudVM"]},
+        {"topology_type": "PHYSICAL", "roles": ["fw"], "templates": ["EX3400"]},
+    ]
+    assert detail["message"] == (
+        "The proposal mixes CLOUD and PHYSICAL devices; physical and cloud devices "
+        "cannot share one topology or reservation."
+    )
+    # Default two repairs: three calls, the last two carrying the corrective note.
+    assert len(sink) == 3
+    assert sink[0] == ""
+    assert "templates CloudVM resolved to CLOUD devices" in sink[1]
+    assert "templates EX3400 resolved to PHYSICAL devices" in sink[1]
+
+
+async def test_generate_mixed_types_is_repaired_on_retry(async_client, monkeypatch):
+    _override_inventory({"EX3400": 4, "CloudVM": 4})
+    _override_typed_resolver(monkeypatch, {"CloudVM": "CLOUD"})
+    _override_ai_sequence(
+        [
+            _MIXED_PROPOSAL,
+            {
+                "purpose": "physical only",
+                "devices": [
+                    {"role": "fw", "template_name": "EX3400"},
+                    {"role": "fw2", "template_name": "EX3400"},
+                ],
+                "edges": [],
+            },
+        ]
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert {d["topology_type"] for d in resp.json()["devices"]} == {"PHYSICAL"}
+
+
+async def test_generate_topology_type_follows_the_resolved_devices(async_client, monkeypatch):
+    """A uniform proposal states the resolved devices' real type, not the
+    schema's PHYSICAL default the model left in place."""
+    _override_inventory({"CloudVM": 4})
+    _override_typed_resolver(monkeypatch, {"CloudVM": "CLOUD"})
+    _override_ai(
+        {
+            "purpose": "cloud pair",
+            "devices": [
+                {"role": "a", "template_name": "CloudVM", "topology_type": "PHYSICAL"},
+                {"role": "b", "template_name": "CloudVM"},
+            ],
+            "edges": [],
+        }
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert [d["topology_type"] for d in resp.json()["devices"]] == ["CLOUD", "CLOUD"]

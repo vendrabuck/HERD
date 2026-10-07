@@ -1,9 +1,12 @@
 import {
+  formatMixedTypesDetail,
   formatTopologyInUse,
   formatUnconnectableDetail,
+  topologyMixedTypesDetail,
   topologyDeleteErrorText,
   topologyInUseDetail,
   topologyUnconnectableDetail,
+  type TopologyMixedTypesDetail,
   type TopologyUnconnectableDetail,
 } from "@/lib/errors";
 
@@ -77,6 +80,33 @@ describe("formatUnconnectableDetail", () => {
 
   it("returns the message alone when there are no pairs", () => {
     expect(formatUnconnectableDetail({ ...DETAIL, pairs: [] })).toBe(DETAIL.message);
+  });
+});
+
+describe("topologyMixedTypesDetail (#1038)", () => {
+  const MIXED: TopologyMixedTypesDetail = {
+    error: "topology_mixed_types",
+    groups: [
+      { topology_type: "CLOUD", roles: ["vm"], templates: ["CloudVM"] },
+      { topology_type: "PHYSICAL", roles: ["fw", "sw"], templates: ["EX3400", "QFX"] },
+    ],
+    message: "The proposal mixes CLOUD and PHYSICAL devices.",
+  };
+
+  it("narrows the structured 422 body", () => {
+    expect(topologyMixedTypesDetail(axiosLike(422, MIXED))).toEqual(MIXED);
+  });
+
+  it("returns null for the unconnectable 422 and a plain string", () => {
+    expect(topologyMixedTypesDetail(axiosLike(422, DETAIL))).toBeNull();
+    expect(topologyMixedTypesDetail(axiosLike(422, "Unprocessable"))).toBeNull();
+    expect(topologyMixedTypesDetail(axiosLike(409, MIXED))).toBeNull();
+  });
+
+  it("renders the message then one line per type", () => {
+    expect(formatMixedTypesDetail(MIXED)).toBe(
+      "The proposal mixes CLOUD and PHYSICAL devices.\nCLOUD: CloudVM\nPHYSICAL: EX3400, QFX",
+    );
   });
 });
 
