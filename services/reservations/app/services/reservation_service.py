@@ -37,7 +37,7 @@ from app.models.reservation import (
     ReservationStatus,
     TopologyType,
 )
-from app.schemas.reservation import ReservationCreate, ReservationUpdate
+from app.schemas.reservation import ReservationCreate, ReservationUpdate, check_max_duration
 from app.services.purpose_service import (
     stamp_purpose_classify_requested,
     validate_purpose_category,
@@ -2382,6 +2382,12 @@ async def update_reservation(
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         if new_end <= now:
             raise ValueError("end_time must be in the future")
+
+        # The duration cap applies to the EFFECTIVE window after the edit, with
+        # create's own check and wording (issue #995). Only a PATCH that sets the
+        # end time is judged, so a row already longer than the cap stays editable
+        # in its other fields.
+        check_max_duration(reservation.start_time, data.end_time)
 
         # If extending, check for conflicts in the extended window
         if new_end > old_end:

@@ -118,3 +118,21 @@ async def test_patch_nonexistent_reservation_returns_404(admin_client):
         json={"purpose": "ghost"},
     )
     assert resp.status_code == 404
+
+
+async def test_patch_end_time_past_the_maximum_duration_is_refused(admin_client, fresh_devices):
+    """Issue #995: PATCH applies RESERVATION_MAX_DURATION_SECONDS (default 30 days)."""
+    duts = await fresh_devices(1)
+    res = await _create_reservation(admin_client, [duts[0]["id"]])
+    try:
+        start = datetime.fromisoformat(res["start_time"])
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        resp = await admin_client.patch(
+            f"/reservations/{res['id']}",
+            json={"end_time": (start + timedelta(days=400)).isoformat()},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"].startswith("reservation duration exceeds the maximum of ")
+    finally:
+        await _cancel(admin_client, res["id"])

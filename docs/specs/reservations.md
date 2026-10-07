@@ -339,8 +339,9 @@ The status a new booking starts in is RES-CREATE-12 to RES-CREATE-16 (section 4)
   Enforced in: `services/reservations/app/schemas/reservation.py` (`validate_window`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_rejects_past_start`)
 - **RES-CREATE-5.** A window longer than `RESERVATION_MAX_DURATION_SECONDS` (default 30
-  days) is refused; 0 disables the cap. \
-  Enforced in: `services/reservations/app/schemas/reservation.py` (`validate_window`) \
+  days) is refused; 0 disables the cap. A window of exactly the cap passes. PATCH applies
+  the same check (RES-PATCH-5). \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`validate_window`, `check_max_duration`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_rejects_overlong_duration`)
 - **RES-CREATE-6.** `purpose` is at most 2000 characters. \
   Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationCreate`) \
@@ -663,11 +664,15 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   devices are exclusive, all are checked. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_conflict_on_extension`); `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_extend_fetch_failure_falls_back_to_exclusive`)
-- **RES-PATCH-5.** Extending the end time does not apply
-  `RESERVATION_MAX_DURATION_SECONDS`; only create applies the cap (RES-CREATE-5). Known
-  gap, see #995. \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
-  Pinned by: none (issue #998)
+- **RES-PATCH-5.** A new `end_time` is judged against `RESERVATION_MAX_DURATION_SECONDS`
+  over the effective window (the stored `start_time` to the new end) by the same check
+  create uses (RES-CREATE-5), with the same wording; exactly the cap passes, one second
+  more is refused, 0 disables the cap. The refusal is 400, the PATCH convention for its
+  service-level refusals (section 13). Only a PATCH that sets `end_time` is judged, so a
+  row already longer than the cap stays editable in its purpose and devices; setting a
+  new end that is still over the cap is refused. PATCH cannot change `start_time`. \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`check_max_duration`); `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
+  Pinned by: `services/reservations/tests/test_reservation_patch_hold.py` (`test_patch_end_time_is_judged_against_the_cap`, `test_patch_cap_uses_the_stored_start_on_an_active_row`, `test_over_cap_legacy_row_stays_editable_outside_its_window`, `test_over_cap_legacy_row_cannot_set_a_window_still_over_the_cap`, `test_cap_zero_disables_the_patch_check`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_over_max_duration_returns_400`)
 - **RES-PATCH-6.** A new `device_ids` must be non-empty (at most 200, deduped), every
   device must exist, and all must share one topology type. \
   Enforced in: `services/reservations/app/schemas/reservation.py` (`device_ids_not_empty`); `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
@@ -1293,4 +1298,4 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
 
 ### Rules with no test
 
-- RES-PATCH-5: an extension past the duration cap (it currently succeeds; see #995).
+None: every rule names a test.

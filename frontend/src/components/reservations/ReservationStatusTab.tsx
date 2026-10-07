@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useUpdateReservation } from "@/api/reservations";
 import { useAuthStore } from "@/stores/authStore";
 import toast from "react-hot-toast";
+import { errorDetail } from "@/lib/errors";
 import type { Reservation } from "@/types/reservation.types";
 
 interface Props {
@@ -45,8 +46,8 @@ export function ReservationStatusTab({ reservation, onUpdated }: Props) {
       setEditing(false);
       onUpdated();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Update failed";
-      toast.error(msg);
+      // The server's own refusal text, e.g. the duration cap (issue #995).
+      toast.error(errorDetail(err, "Update failed"));
     }
   };
 

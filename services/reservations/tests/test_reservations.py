@@ -3694,3 +3694,29 @@ async def test_fetch_visible_device_ids_forwards_jwt_not_internal_token():
     assert headers["Authorization"] == "Bearer jwt-token-123"
     assert "X-Internal-Token" not in headers
     assert result == {DEVICE_A}
+
+
+# --- PATCH applies the maximum duration (issue #995) ---
+
+
+@pytest.mark.asyncio
+async def test_update_reservation_over_max_duration_returns_400(client):
+    resp = await _create_test_reservation(client, device_ids=[DEVICE_A])
+    assert resp.status_code == 201
+    body = resp.json()
+    start = datetime.fromisoformat(body["start_time"])
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    cap = 7200
+    with patch("app.config.settings.reservation_max_duration_seconds", cap):
+        over = await client.patch(
+            f"/{body['id']}",
+            json={"end_time": (start + timedelta(seconds=cap + 1)).isoformat()},
+        )
+        at = await client.patch(
+            f"/{body['id']}",
+            json={"end_time": (start + timedelta(seconds=cap)).isoformat()},
+        )
+    assert over.status_code == 400
+    assert over.json() == {"detail": f"reservation duration exceeds the maximum of {cap}s"}
+    assert at.status_code == 200
