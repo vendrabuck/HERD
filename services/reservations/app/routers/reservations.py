@@ -17,6 +17,7 @@ from app.database import get_db
 from app.dependencies.auth import get_current_user_payload, require_admin
 from app.models.reservation import Reservation, ReservationDevice, ReservationStatus
 from app.schemas.reservation import (
+    HeldDevicesResponse,
     OwnsActiveResponse,
     PaginatedReservationResponse,
     ProvisionResultRequest,
@@ -446,6 +447,38 @@ async def owns_active_reservation_for_device(
         if start <= now <= end:
             return OwnsActiveResponse(owns_active=True)
     return OwnsActiveResponse(owns_active=False)
+
+
+@router.get("/internal/held-devices", response_model=HeldDevicesResponse)
+async def list_devices_held_by_user(
+    user_id: uuid.UUID = Query(...),
+    x_internal_token: str = Header(...),
+    db: AsyncSession = Depends(get_db),
+) -> HeldDevicesResponse:
+    """Return every device the user's live reservations hold (issue #1030).
+
+    Internal-token-guarded service-to-service endpoint. Live means
+    PENDING_PROVISION or ACTIVE, the statuses that hold devices under the hold
+    rule; a PENDING row holds nothing and a terminal row has let go. Inventory
+    reads this to grant a non-admin owner visibility of the instance device that
+    represents their dynamic instance, which joins the "No Pool" group and is
+    otherwise outside their device-group visibility. Inventory intersects the
+    answer with instance devices, so listing physical devices here grants
+    nothing. Declared before /internal/{reservation_id} so the literal segment
+    is not parsed as a reservation id.
+    """
+    if not internal_token_matches(x_internal_token, settings.internal_api_token):
+        raise HTTPException(status_code=403, detail="Invalid internal token")
+    result = await db.execute(
+        select(ReservationDevice.device_id)
+        .join(Reservation, Reservation.id == ReservationDevice.reservation_id)
+        .where(
+            Reservation.user_id == user_id,
+            Reservation.status.in_((ReservationStatus.PENDING_PROVISION, ReservationStatus.ACTIVE)),
+        )
+        .distinct()
+    )
+    return HeldDevicesResponse(device_ids=sorted({row[0] for row in result.all()}, key=str))
 
 
 @router.get("/internal/active-users", response_model=list[uuid.UUID])

@@ -2459,6 +2459,27 @@ async def _hold_added_devices_after_edit(
     await _revert_flipped_devices_best_effort(reservation_id, sorted(flipped), db=db)
 
 
+def _held_instance_device_ids(
+    reservation: Reservation, devices: list[dict], held_ids: set[str]
+) -> set[str]:
+    """The instance devices among `devices` that this reservation already holds.
+
+    An instance device is the device a dynamic instance is materialized as; a
+    dynamic template materializes nothing else, so a device the reservation
+    already holds whose template is one of its dynamic requests' templates is
+    one of its instances (issue #1030). A device not yet held is never counted,
+    so a PATCH cannot pass a foreign device through this exemption.
+    """
+    dynamic_template_ids = {str(r.template_id) for r in reservation.dynamic_requests}
+    if not dynamic_template_ids:
+        return set()
+    return {
+        str(d["id"])
+        for d in devices
+        if str(d["id"]) in held_ids and str(d.get("template_id")) in dynamic_template_ids
+    }
+
+
 async def update_reservation(
     db: AsyncSession,
     reservation_id: uuid.UUID,
@@ -2557,8 +2578,16 @@ async def update_reservation(
             except Exception as exc:
                 raise RuntimeError(f"Failed to contact inventory service: {exc}") from exc
 
-            # Validate topology_type uniformity
-            topology_types = {d["topology_type"] for d in new_devices}
+            # Validate topology_type uniformity over the booked set only (issue
+            # #1030, decision A(a)): an instance device this reservation already
+            # holds is CLOUD by construction, and a booking of physical devices
+            # plus instances is intended, so instance devices are left out of
+            # the check exactly as create derives the type from the booked
+            # devices alone.
+            instance_ids = _held_instance_device_ids(reservation, new_devices, old_set)
+            topology_types = {
+                d["topology_type"] for d in new_devices if str(d["id"]) not in instance_ids
+            }
             if len(topology_types) > 1:
                 raise ValueError(
                     f"All devices must share the same topology type. "

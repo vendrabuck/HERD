@@ -34,11 +34,13 @@ from app.services.device_group_service import (
     delete_device_group,
     get_device_group,
     get_device_groups_for_device,
-    get_visible_device_ids,
     list_device_groups,
     update_device_group,
 )
-from app.services.device_visibility import check_device_read_visibility
+from app.services.device_visibility import (
+    _resolve_visible_device_ids,
+    check_device_read_visibility,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -169,10 +171,14 @@ async def get_visible_devices_endpoint(
     db: AsyncSession = Depends(get_db),
     payload: dict = Depends(get_current_user_payload),
 ):
-    """Get visible device IDs for a user by resolving their group memberships."""
+    """Get visible device IDs for a user by resolving their group memberships.
+
+    Goes through `_resolve_visible_device_ids`, the one non-admin device
+    visibility path, so the answer includes the instance devices the user's own
+    live reservations hold (issue #1030) exactly as every device read does.
+    """
     _authorize_subject(payload, user_id)
-    user_group_ids = await _fetch_user_group_ids(user_id, authorization)
-    visible = await get_visible_device_ids(db, user_group_ids)
+    visible = await _resolve_visible_device_ids(db, user_id, authorization)
     return {"device_ids": [str(d) for d in visible]}
 
 
