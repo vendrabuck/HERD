@@ -174,16 +174,22 @@ export interface CalendarQueryParams {
 export type ForkStatus = "ACTIVE" | "ARCHIVED";
 
 // One row of a fork's reconciled wiring, from GET /reservations/{id}/fork.
+// Issue #1008: for a non-admin, an end on a device outside the caller's
+// visibility comes back with its device id and port null, the cable id null,
+// and `hidden` true (pathfind's transit-hop redaction). No component reads
+// these rows today; a future reader must render a hidden end as hidden.
 export interface ForkConnection {
   id: string;
-  device_a_id: string;
-  port_a: string;
-  device_b_id: string;
-  port_b: string;
+  device_a_id: string | null;
+  port_a: string | null;
+  device_b_id: string | null;
+  port_b: string | null;
   layer: string;
   physical_connection_id: string | null;
+  edge_key?: string | null;
   created_by: string;
   created_at: string;
+  hidden: boolean;
 }
 
 // A fork_versions row without its canvas payload; the History list in live-edit

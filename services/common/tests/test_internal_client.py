@@ -215,3 +215,32 @@ async def test_params_become_query_string():
 
     assert resp.status_code == 200
     assert seen["params"] == {"user_id": "abc-123"}
+
+
+@pytest.mark.asyncio
+async def test_internal_token_auth_on_behalf_of_adds_authorization_header():
+    """Issue #1008: the acting user's bearer rides beside the internal token."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(200, json={"ok": True})
+
+    transport = httpx.MockTransport(handler)
+    import herd_common.internal_client as mod
+
+    orig = mod.httpx.AsyncClient
+    mod.httpx.AsyncClient = lambda *a, **kw: orig(*a, **{**kw, "transport": transport})
+    try:
+        await call_service(
+            "http://svc",
+            "GET",
+            "/internal/thing",
+            timeout=5.0,
+            auth=InternalTokenAuth(token="tok", on_behalf_of="Bearer user-jwt"),
+        )
+    finally:
+        mod.httpx.AsyncClient = orig
+
+    assert seen["headers"]["x-internal-token"] == "tok"
+    assert seen["headers"]["authorization"] == "Bearer user-jwt"

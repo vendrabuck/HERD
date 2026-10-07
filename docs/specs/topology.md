@@ -284,10 +284,14 @@ run on.
   the list is ordered newest first. \
   Enforced in: `services/cabling/app/services/connection_service.py` (`list_connections`) \
   Pinned by: `services/cabling/tests/test_connections.py` (`test_filter_connections_by_device_id`, `test_list_connections_pagination`)
-- **TOPO-CONN-9.** `GET /connections/{id}` answers any signed-in user with the full row,
-  with no visibility filter. Known gap, see #1008. \
-  Enforced in: `services/cabling/app/routes/connections.py` (`get_connection_endpoint`) \
-  Pinned by: `services/cabling/tests/test_connections.py` (`test_user_can_get_connection`, `test_get_connection_not_found`)
+- **TOPO-CONN-9.** `GET /connections/{id}` follows the list's visibility rule
+  (TOPO-CONN-7): an admin reads any row; a non-admin reads the full row when at least one
+  end is visible, and a row with no visible end answers the same 404 `Connection not
+  found` an unknown id gets (issue #1008). Visibility is resolved first, so an
+  unanswerable lookup is 503 `Could not verify device visibility; the connection was
+  not returned. Retry the request.` for every id. \
+  Enforced in: `services/cabling/app/routes/connections.py` (`get_connection_endpoint`); `services/cabling/app/services/visible_devices.py` (`resolve_caller_visibility`) \
+  Pinned by: `services/cabling/tests/test_connections.py` (`test_user_can_get_connection`, `test_get_connection_not_found`, `test_user_get_connection_with_no_visible_end_is_404`, `test_user_get_connection_visibility_unavailable_is_503`, `test_admin_get_connection_never_calls_inventory`)
 - **TOPO-CONN-10.** Deleting a connection is admin only; an unknown id is 404. \
   Enforced in: `services/cabling/app/routes/connections.py` (`delete_connection_endpoint`) \
   Pinned by: `services/cabling/tests/test_connections.py` (`test_delete_connection`, `test_user_cannot_delete`, `test_delete_connection_not_found`)
@@ -993,13 +997,18 @@ RES-FORK-17). Fork status, versions, and the restore marker are section 4.
   inventory call. \
   Enforced in: `services/cabling/app/routes/forks.py` (`save_fork_internal`); `services/cabling/app/services/fork_save_service.py` (`save_fork`) \
   Pinned by: `services/cabling/tests/test_fork_l3_routes.py` (`test_save_route_resolves_canvas_wiring_exactly_once`, `test_save_fork_l3_reconcile_reapplies_on_version_race_retry`); `services/cabling/tests/test_forks.py` (`test_save_fork_retries_on_version_conflict`)
-- **TOPO-FORK-25.** The fork read applies no device visibility filter: every connection
-  carries its device ids and port names as stored, transit hops on devices the
-  reservation's owner cannot see included, and reservations relays that body unchanged
-  to the owner. Pathfind redacts the same hops for a non-admin (TOPO-PATH-9). Known gap,
-  see #1008. \
-  Enforced in: `services/cabling/app/routes/forks.py` (`get_fork_internal`); `services/reservations/app/routers/reservations.py` (`get_reservation_fork`, `_relay_cabling_fork_response`) \
-  Pinned by: none
+- **TOPO-FORK-25.** The user-facing fork read is redacted to the caller's device
+  visibility (issue #1008). Reservations forwards the caller's bearer beside the internal
+  token (`on_behalf_of`); for a non-admin, cabling resolves visibility through
+  `resolve_caller_visibility` and every connection end on a hidden device comes back with
+  its device id and port null, the row's `physical_connection_id` null, and `hidden`
+  true, the redaction pathfind applies to a hidden transit hop (TOPO-PATH-9). An admin is
+  unfiltered; an unanswerable lookup is 503 `Could not verify device visibility; the fork
+  was not returned. Retry the request.`, relayed by reservations; a forwarded bearer that
+  does not verify is 401. A service caller that forwards no bearer (execution,
+  ai-orchestrator) gets every row as stored. \
+  Enforced in: `services/cabling/app/routes/forks.py` (`get_fork_internal`, `_redact_fork_connection`, `_decode_on_behalf_of`); `services/reservations/app/routers/reservations.py` (`get_reservation_fork`); `services/reservations/app/services/reservation_service.py` (`_cabling_fork_call`) \
+  Pinned by: `services/cabling/tests/test_forks.py` (`test_get_fork_on_behalf_of_non_admin_redacts_hidden_transit`, `test_get_fork_on_behalf_of_admin_and_service_callers_unredacted`, `test_get_fork_on_behalf_of_visibility_unavailable_is_503`, `test_get_fork_on_behalf_of_bad_bearer_is_401`); `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_owner_forwards_200`, `test_get_fork_lazy_create_rereads_on_behalf_of_caller`, `test_get_fork_relays_cabling_visibility_503`, `test_cabling_fork_call_sends_on_behalf_of_beside_internal_token`)
 - **TOPO-CLAIM-1.** A wire to build whose `(device, port)` endpoint is already in a wire
   of another `ACTIVE` fork refuses the save or create with 409
   `{message, conflicts: [{reservation_id, device_id, port}]}`, conflicts sorted;
@@ -1575,7 +1584,7 @@ other error carries `detail` as a string or the object shown.
 | 403 | `Not authorized to validate this topology` | user validate by a non-creator non-admin | TOPO-VAL-9 |
 | 403 | `Not authorized to modify this topology` | version restore by a non-creator non-admin | TOPO-VER-4 |
 | 403 | `Not authorized to modify this template` or `Not authorized to delete this template` | template update or delete by a non-creator non-admin | TOPO-TMPL-4 |
-| 404 | `Connection not found` | read or delete an unknown connection | TOPO-CONN-9, TOPO-CONN-10 |
+| 404 | `Connection not found` | read or delete an unknown connection; a non-admin's read of a connection with no visible end | TOPO-CONN-9, TOPO-CONN-10 |
 | 404 | `Device not found` | a non-admin's pathfind naming a hidden or unknown device | TOPO-PATH-8 |
 | 404 | `Topology not found` | any topology, version, validate, clone, or from-topology route on an unknown topology | TOPO-CRUD-2, TOPO-EDIT-1, TOPO-DEL-1, TOPO-VER-1, TOPO-VAL-9, TOPO-CLONE-1, TOPO-TMPL-5 |
 | 404 | `Version not found` | a topology version of another topology, or a fork version of another fork | TOPO-VER-2, TOPO-FORK-10 |
@@ -1597,7 +1606,7 @@ other error carries `detail` as a string or the object shown.
 | 422 | `{"error": "l3_intent_malformed", "node_id", "message"}` | fork save with malformed routing intent | TOPO-FORK-14 |
 | 422 | validation list | a schema bound: name lengths, bulk item count, pair count, unknown sort or owner value, missing `member_device_ids`, missing internal token header, devices batch size | TOPO-CONN-2, TOPO-CONN-12, TOPO-PATH-7, TOPO-LIST-4, TOPO-CRUD-1, TOPO-FORK-3, TOPO-FORK-13, TOPO-DEVB-1 |
 | 500 | `internal: missing Authorization header while resolving device visibility` | a non-admin request reaching a visibility-filtered route with no header (only a test harness does this) | TOPO-VIS-1 |
-| 503 | the route's own visibility wording, for example `Could not verify device visibility; connections were not returned. Retry the request.` | a non-admin's visibility lookup failed | TOPO-CONN-7, TOPO-PATH-11, TOPO-VAL-11, TOPO-BULK-11 |
+| 503 | the route's own visibility wording, for example `Could not verify device visibility; connections were not returned. Retry the request.` | a non-admin's visibility lookup failed | TOPO-CONN-7, TOPO-CONN-9, TOPO-FORK-25, TOPO-PATH-11, TOPO-VAL-11, TOPO-BULK-11 |
 | 503 | `Could not verify device-group membership for one or more devices in this batch; no connections were created. Retry the request.` | bulk create with an unverifiable device | TOPO-BOUND-4 |
 | 503 | `Could not verify topology is not in use` | delete guard could not read reservations | TOPO-DEL-3 |
 | 503 | `{"error": "l3_config_unavailable"}` | the routing pass could not read inventory in time | TOPO-L3-11, TOPO-BULK-13 |
@@ -1670,9 +1679,6 @@ TOPO-BULK-4.
   preferences load saves an empty search over the saved one.
 - #1007 (TOPO-FORK-18): validation now reports an unresolvable port-constrained edge,
   but the fork save's own answer still does not name a skipped constrained edge.
-- #1008 (TOPO-CONN-9, TOPO-FORK-25): the single connection read has no visibility
-  filter, and the fork read returns hops on devices outside a non-admin owner's
-  visibility unredacted, while pathfind redacts the same hops (TOPO-PATH-9).
 
 ### Limits by decision
 
@@ -1721,7 +1727,6 @@ TOPO-BULK-4.
   pins that it sends `l3=0`; nothing in cabling pins the skip).
 - TOPO-STRIP-4: a PUT differing only in a non-allowlisted device key appending no
   version.
-- TOPO-FORK-25: the fork read returning hidden transit hops unredacted.
 - TOPO-TMPL-9: instantiate not checking assigned device ids.
 - TOPO-UILIST-3: the empty search saved over the stored one (issue #985).
 - TOPO-UI-2: the device-less node crash (issue #989 asks for the test).

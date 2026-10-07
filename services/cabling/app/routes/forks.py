@@ -11,12 +11,14 @@ See docs/design/0001-editable-reservation-topologies.md (Decision 2).
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
+from fastapi.security import HTTPAuthorizationCredentials
 from herd_common.internal_auth import internal_token_matches
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
+from app.dependencies import get_current_user_payload
 from app.models.connection import Connection
 from app.models.fork import (
     ForkConnection,
@@ -64,6 +66,7 @@ from app.services.fork_save_service import (
 from app.services.fork_service import create_fork
 from app.services.l3_intent import merge_candidates_by_device, walk_l3_nodes
 from app.services.topology_validation import validate_canvas_edges
+from app.services.visible_devices import resolve_caller_visibility
 
 router = APIRouter(prefix="/internal/forks", tags=["forks"])
 
@@ -360,18 +363,80 @@ async def get_fork_devices_batch_internal(
     )
 
 
+FORK_VISIBILITY_UNAVAILABLE = (
+    "Could not verify device visibility; the fork was not returned. Retry the request."
+)
+
+
+def _decode_on_behalf_of(authorization: str) -> dict:
+    """Verify a forwarded user bearer with the same verifier every user route uses.
+
+    A value that is not ``Bearer <token>``, or a token that does not verify, is the
+    standard 401: an on-behalf-of read never degrades to the unredacted service view.
+    """
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(
+            status_code=401,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return get_current_user_payload(
+        HTTPAuthorizationCredentials(scheme="Bearer", credentials=token.strip())
+    )
+
+
+def _redact_fork_connection(
+    row: ForkConnection, visible_device_ids: set[uuid.UUID]
+) -> ForkConnectionResponse:
+    """One fork wiring row as a user with ``visible_device_ids`` may see it (#1008).
+
+    An end on a hidden device loses its device id and port, the row loses its
+    physical cable id, and ``hidden`` is set: pathfind's transit-hop redaction
+    (issue #763) applied to a stored hop.
+    """
+    out = ForkConnectionResponse.model_validate(row)
+    a_hidden = row.device_a_id not in visible_device_ids
+    b_hidden = row.device_b_id not in visible_device_ids
+    if not (a_hidden or b_hidden):
+        return out
+    update: dict = {"hidden": True, "physical_connection_id": None}
+    if a_hidden:
+        update.update(device_a_id=None, port_a=None)
+    if b_hidden:
+        update.update(device_b_id=None, port_b=None)
+    return out.model_copy(update=update)
+
+
 @router.get("/{reservation_id}", response_model=ForkDetailResponse)
 async def get_fork_internal(
     reservation_id: uuid.UUID,
     x_internal_token: str = Header(..., alias="X-Internal-Token"),
+    authorization: str | None = Header(None),
     db: AsyncSession = Depends(get_db),
 ):
     """Return a reservation's fork: metadata, current canvas, wiring, and versions.
 
     404 when no fork exists yet (reservations lazy-creates on first edit through the
     idempotent POST above). Read-only; issue #25 P3a, ADR 0006 Decision 2.
+
+    Issue #1008: a caller that also forwards a user's bearer as ``Authorization``
+    (reservations' owner read, ``InternalTokenAuth.on_behalf_of``) gets the wiring
+    as that user may see it: for a non-admin, every hop end on a device outside the
+    user's visibility is redacted (``_redact_fork_connection``), resolved through
+    ``resolve_caller_visibility``; an unanswerable lookup is a 503 and nothing is
+    returned. An admin, and a service caller with no ``Authorization`` (execution's
+    ``_fetch_fork_intended_wires``, which must see every hop), get every row as
+    stored.
     """
     _check_internal_token(x_internal_token)
+    visible_device_ids: set[uuid.UUID] | None = None
+    if authorization is not None:
+        visible_device_ids = await resolve_caller_visibility(
+            _decode_on_behalf_of(authorization),
+            authorization,
+            unavailable_detail=FORK_VISIBILITY_UNAVAILABLE,
+        )
     fork = await _load_fork(db, reservation_id)
 
     connections = (
@@ -424,7 +489,12 @@ async def get_fork_internal(
         draft_restored_from_id=fork.draft_restored_from_id,
         created_at=fork.created_at,
         updated_at=fork.updated_at,
-        connections=[ForkConnectionResponse.model_validate(c) for c in connections],
+        connections=[
+            ForkConnectionResponse.model_validate(c)
+            if visible_device_ids is None
+            else _redact_fork_connection(c, visible_device_ids)
+            for c in connections
+        ],
         versions=[ForkVersionSummary.model_validate(v) for v in versions],
         l3_routes=[ForkL3RouteResponse.model_validate(r) for r in l3_routes],
     )

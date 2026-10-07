@@ -1618,11 +1618,21 @@ async def test_connections_get_handler_found_and_404():
         from sqlalchemy import select
 
         existing = (await db.execute(select(Connection))).scalars().one()
-        got = await get_connection_endpoint(connection_id=existing.id, _=_payload(), db=db)
+        got = await get_connection_endpoint(
+            connection_id=existing.id,
+            payload=_payload(role="admin"),
+            authorization=None,
+            db=db,
+        )
         assert got.id == existing.id
 
         with pytest.raises(HTTPException) as exc:
-            await get_connection_endpoint(connection_id=uuid.uuid4(), _=_payload(), db=db)
+            await get_connection_endpoint(
+                connection_id=uuid.uuid4(),
+                payload=_payload(role="admin"),
+                authorization=None,
+                db=db,
+            )
     assert exc.value.status_code == 404
     assert exc.value.detail == "Connection not found"
 
@@ -2302,7 +2312,9 @@ async def test_get_fork_handler_returns_full_detail():
 
     async with TestSession() as db:
         with patch.object(settings, "internal_api_token", "tok"):
-            resp = await get_fork_internal(reservation_id=rid, x_internal_token="tok", db=db)
+            resp = await get_fork_internal(
+                reservation_id=rid, x_internal_token="tok", authorization=None, db=db
+            )
 
     assert resp.reservation_id == rid
     assert resp.status == "ACTIVE"
@@ -2321,7 +2333,9 @@ async def test_get_fork_handler_404_when_absent():
     async with TestSession() as db:
         with patch.object(settings, "internal_api_token", "tok"):
             with pytest.raises(HTTPException) as exc:
-                await get_fork_internal(reservation_id=uuid.uuid4(), x_internal_token="tok", db=db)
+                await get_fork_internal(
+                    reservation_id=uuid.uuid4(), x_internal_token="tok", authorization=None, db=db
+                )
     assert exc.value.status_code == 404
     assert exc.value.detail == "Fork not found"
 

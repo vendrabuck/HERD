@@ -1,7 +1,7 @@
 """Unit tests for the fork-on-activation models and POST /internal/forks (issue #25)."""
 
 import uuid
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.config import settings
@@ -3391,3 +3391,127 @@ async def test_save_fork_element_node_ignored_by_membership_check(client):
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["element_attachments_skipped"] == 1
+
+
+# --- GET /internal/forks/{reservation_id} on behalf of a user (issue #1008) ---
+
+
+def _bearer(role: str, sub: uuid.UUID | None = None) -> str:
+    from jose import jwt
+
+    token = jwt.encode(
+        {"sub": str(sub or uuid.uuid4()), "username": "owner", "role": role},
+        settings.secret_key,
+        algorithm=settings.algorithm,
+    )
+    return f"Bearer {token}"
+
+
+async def _fork_through_hidden_transit(client) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
+    """A fork whose one canvas edge A to B resolves through an off-canvas transit
+    device T (two cables, two fork hops). Returns (reservation_id, a, t, b)."""
+    a, t, b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _make_physical(a, "a0", t, "t-in")
+    await _make_physical(t, "t-out", b, "b0")
+    rid = uuid.uuid4()
+    canvas = _canvas([a, b], [(0, 1)])
+    await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": []},
+        headers=_hdr(),
+    )
+    saved = await client.post(
+        f"/internal/forks/{rid}/save",
+        json={"canvas_data": canvas, "member_device_ids": _members(canvas)},
+        headers=_hdr(),
+    )
+    assert saved.status_code == 200, saved.text
+    assert len(saved.json()["built"]) == 2
+    return rid, a, t, b
+
+
+def _ends(row: dict) -> set[tuple]:
+    return {(row["device_a_id"], row["port_a"]), (row["device_b_id"], row["port_b"])}
+
+
+@pytest.mark.asyncio
+async def test_get_fork_on_behalf_of_non_admin_redacts_hidden_transit(client):
+    rid, a, t, b = await _fork_through_hidden_transit(client)
+    fetch = AsyncMock(return_value={a, b})
+    with patch("app.services.visible_devices.fetch_visible_device_ids", fetch):
+        resp = await client.get(
+            f"/internal/forks/{rid}",
+            headers={**_hdr(), "Authorization": _bearer("user")},
+        )
+    assert resp.status_code == 200, resp.text
+    rows = resp.json()["connections"]
+    assert len(rows) == 2
+    assert all(r["hidden"] is True for r in rows)
+    assert all(r["physical_connection_id"] is None for r in rows)
+    assert {frozenset(_ends(r)) for r in rows} == {
+        frozenset({(str(a), "a0"), (None, None)}),
+        frozenset({(None, None), (str(b), "b0")}),
+    }
+    assert str(t) not in resp.text
+    assert "t-in" not in resp.text and "t-out" not in resp.text
+    fetch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_fork_on_behalf_of_admin_and_service_callers_unredacted(client):
+    rid, a, t, b = await _fork_through_hidden_transit(client)
+    fetch = AsyncMock(return_value=set())
+    with patch("app.services.visible_devices.fetch_visible_device_ids", fetch):
+        admin = await client.get(
+            f"/internal/forks/{rid}",
+            headers={**_hdr(), "Authorization": _bearer("admin")},
+        )
+        service = await client.get(f"/internal/forks/{rid}", headers=_hdr())
+    fetch.assert_not_awaited()
+    for resp in (admin, service):
+        assert resp.status_code == 200, resp.text
+        rows = resp.json()["connections"]
+        assert all(r["hidden"] is False for r in rows)
+        assert all(r["physical_connection_id"] is not None for r in rows)
+        ends = set().union(*(_ends(r) for r in rows))
+        assert ends == {(str(a), "a0"), (str(t), "t-in"), (str(t), "t-out"), (str(b), "b0")}
+
+
+@pytest.mark.asyncio
+async def test_get_fork_on_behalf_of_visibility_unavailable_is_503(client):
+    from app.services.visible_devices import VisibleDevicesUnavailableError
+
+    rid, *_ = await _fork_through_hidden_transit(client)
+    fetch = AsyncMock(side_effect=VisibleDevicesUnavailableError("boom"))
+    with patch("app.services.visible_devices.fetch_visible_device_ids", fetch):
+        resp = await client.get(
+            f"/internal/forks/{rid}",
+            headers={**_hdr(), "Authorization": _bearer("user")},
+        )
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "detail": "Could not verify device visibility; the fork was not returned. "
+        "Retry the request."
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorization", ["Bearer not-a-jwt", "Basic abc", "Bearer "])
+async def test_get_fork_on_behalf_of_bad_bearer_is_401(client, authorization):
+    """A forwarded identity that does not verify never degrades to the service view."""
+    rid, *_ = await _fork_through_hidden_transit(client)
+    resp = await client.get(
+        f"/internal/forks/{rid}", headers={**_hdr(), "Authorization": authorization}
+    )
+    assert resp.status_code == 401
+    assert resp.json() == {"detail": "Could not validate credentials"}
+
+
+@pytest.mark.asyncio
+async def test_get_fork_on_behalf_of_still_requires_internal_token(client):
+    rid, *_ = await _fork_through_hidden_transit(client)
+    resp = await client.get(
+        f"/internal/forks/{rid}",
+        headers={"X-Internal-Token": "wrong", "Authorization": _bearer("admin")},
+    )
+    assert resp.status_code == 403

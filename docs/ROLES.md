@@ -116,6 +116,13 @@ Backend connections represent physical cables or virtual links between devices.
 These are created by admins after a topology has been agreed and are not something
 end-users configure themselves.
 
+"View backend connections" is filtered by device visibility for a non-admin: the
+list returns only connections with at least one end on a device the user can see
+(issue #719), and the single read `GET /api/cabling/connections/{id}` follows the
+same rule, answering a connection with no visible end with the same `404
+Connection not found` an unknown id gets (issue #1008). Admins are unfiltered. If
+the visibility lookup cannot be answered, both reads fail closed with a 503.
+
 ### Superadmin
 
 There is exactly one superadmin account per deployment. It is created automatically
@@ -1112,6 +1119,13 @@ lazy-creates one):
 GET /api/reservations/{reservation_id}/fork
 Authorization: Bearer <token>   # owner or admin
 ```
+
+The fork's `connections` (its resolved wiring) are redacted to the caller's device
+visibility (issue #1008), the same way pathfind redacts a hidden transit hop: for a
+non-admin owner, each end on a device they cannot see comes back with its device id
+and port `null`, the row's `physical_connection_id` `null`, and `hidden: true`.
+Admins see every value. If visibility cannot be verified the read is a 503 and
+nothing is returned.
 
 Loosely edit the fork canvas (stored as a draft with no reconcile) and commit a
 reconcile that appends a fork version. Both mutations require the reservation to

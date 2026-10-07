@@ -30,13 +30,21 @@ class ForkCreateResponse(BaseModel):
 
 
 class ForkConnectionResponse(BaseModel):
-    """One row of the fork's wiring (issue #25 P3a, fork GET)."""
+    """One row of the fork's wiring (issue #25 P3a, fork GET).
+
+    The device ids and ports are nullable and ``hidden`` exists because of issue
+    #1008: when the read is made on behalf of a non-admin user (reservations' owner
+    read), an end on a device outside that user's visibility comes back with its
+    device id and port null, ``physical_connection_id`` is null, and ``hidden`` is
+    true, the same redaction pathfind applies to a hidden transit hop (issue #763).
+    A service caller (execution) and an admin always get every value.
+    """
 
     id: UUIDStr
-    device_a_id: UUIDStr
-    port_a: str
-    device_b_id: UUIDStr
-    port_b: str
+    device_a_id: OptionalUUIDStr = None
+    port_a: str | None = None
+    device_b_id: OptionalUUIDStr = None
+    port_b: str | None = None
     layer: str
     physical_connection_id: OptionalUUIDStr = None
     # The canvas edge id this hop was resolved from (issue #345 P3b); NULL when unknown
@@ -44,6 +52,7 @@ class ForkConnectionResponse(BaseModel):
     edge_key: str | None = None
     created_by: str
     created_at: datetime
+    hidden: bool = False
 
     model_config = {"from_attributes": True}
 
