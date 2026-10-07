@@ -3962,10 +3962,18 @@ async def _apply_l3_adjacency(
     removal releases the pin (release_route_membership); a clean reconcile advances
     the pin to the new set (record_route_reconciled). A per-switch failure (any
     route failed, a login failure, or an undrivable switch) lands a FAILED row
-    tagged with its direction (issue #369; a reconcile failure keeps the PREVIOUS
-    pinned set untouched via record_route_reconcile_failed) and the pass continues
-    (Decision 6, never NAKs). This one apply is shared by the reconcile and both
-    retry channels, the _apply_l2_memberships analogue.
+    tagged with its direction (issue #369) and the pass continues (Decision 6,
+    never NAKs). This one apply is shared by the reconcile and both retry
+    channels, the _apply_l2_memberships analogue.
+
+    A FAILED row's `routes` is what may still be installed (issue #1001): a failed
+    reconcile records the previous pin minus the removals that confirmed plus every
+    route it tried to add (the previous pin verbatim when nothing was driven), and a
+    failed provision records its own routes plus any residue it could not remove. A
+    provision over an existing FAILED pin (a reconcile-time rebuild or a retry) first
+    drives remove_route for that pin's routes its own route set drops (the residue),
+    then configure_route for its set, in the one login/logout, so a rebuild never
+    forgets a route an earlier failed pass left on the switch.
 
     Review fix P2 (issue #34 phase 3 review, the #412 extension): both
     record_route_reconciled and record_route_reconcile_failed are called with
@@ -4017,12 +4025,15 @@ async def _apply_l3_adjacency(
     )
     from app.services.l1_assignment_service import get_wiring_state
     from app.services.route_service import (
+        possibly_installed_routes,
         record_route_active,
         record_route_failed,
         record_route_reconcile_failed,
         record_route_reconciled,
         release_route_membership,
         route_needs_remove,
+        routes_not_in,
+        union_routes,
     )
 
     res_uuid = uuid.UUID(reservation_id)
@@ -4041,6 +4052,9 @@ async def _apply_l3_adjacency(
         remove_routes: list[dict] = []
         add_routes: list[dict] = []
         previous_routes: list[dict] = []
+        # Issue #1001: routes a FAILED pin for this switch records as possibly installed
+        # that this provision's own route set drops. Removed before the configures.
+        residue: list[dict] = []
         method = ""
         intended = "ACTIVE"
         frozen_now = False
@@ -4076,6 +4090,15 @@ async def _apply_l3_adjacency(
                 async with get_db_session() as db:
                     if not await route_needs_remove(db, res_uuid, switch_id):
                         continue
+            else:
+                # A provision over a FAILED pin (a reconcile-time rebuild or a retry)
+                # must first remove what that pin may have left installed and the new
+                # route set no longer names (issue #1001); recording ACTIVE with the new
+                # set would otherwise forget those routes for good.
+                async with get_db_session() as db:
+                    residue = routes_not_in(
+                        await possibly_installed_routes(db, res_uuid, switch_id), routes
+                    )
 
         switch_data = await ctx.get_device(switch_id)
         template_data = (
@@ -4134,7 +4157,7 @@ async def _apply_l3_adjacency(
                         db,
                         res_uuid,
                         switch_id,
-                        routes,
+                        union_routes(routes, residue),
                         load_attempts,
                         load_error,
                         intended=intended,
@@ -4194,7 +4217,7 @@ async def _apply_l3_adjacency(
                         db,
                         res_uuid,
                         switch_id,
-                        routes,
+                        union_routes(routes, residue),
                         login_attempts,
                         f"driver login failed: {login_err}",
                         intended=intended,
@@ -4211,8 +4234,13 @@ async def _apply_l3_adjacency(
                     ("configure_route", r) for r in add_routes
                 ]
             else:
-                drive_sequence = [(method, r) for r in routes]
+                drive_sequence = [("remove_route", r) for r in residue] + [
+                    (method, r) for r in routes
+                ]
 
+            # Removals that did not confirm (issue #1001): with the routes this pass
+            # configured, they are what may still be installed if the switch fails.
+            unremoved: list[dict] = []
             for op_method, route in drive_sequence:
                 ok, attempts, err = await _drive_l3_route(
                     db,
@@ -4232,6 +4260,8 @@ async def _apply_l3_adjacency(
                     switch_ok = False
                     switch_attempts += attempts
                     switch_last_error = err
+                    if op_method == "remove_route":
+                        unremoved.append(route)
 
             logout_run = await create_execution_run(
                 db,
@@ -4275,6 +4305,10 @@ async def _apply_l3_adjacency(
                     new_pin = item.get("intent") or []
                     await record_route_reconciled(db, res_uuid, switch_id, new_pin, previous_routes)
                 else:
+                    # Issue #1001: what may now be on the switch is the previous pin
+                    # minus the removals that confirmed, plus every route this pass
+                    # tried to add.
+                    removed = routes_not_in(remove_routes, unremoved)
                     await record_route_reconcile_failed(
                         db,
                         res_uuid,
@@ -4282,6 +4316,9 @@ async def _apply_l3_adjacency(
                         switch_attempts or 1,
                         switch_last_error,
                         previous_routes,
+                        possibly_installed=union_routes(
+                            routes_not_in(previous_routes, removed), add_routes
+                        ),
                     )
             elif switch_ok:
                 if direction == "provision":
@@ -4289,11 +4326,14 @@ async def _apply_l3_adjacency(
                 else:
                     await release_route_membership(db, res_uuid, switch_id)
             else:
+                # A failed provision keeps its own routes plus any residue whose removal
+                # did not confirm (issue #1001); a failed deprovision drives no residue,
+                # so this is its `routes` unchanged.
                 await record_route_failed(
                     db,
                     res_uuid,
                     switch_id,
-                    routes,
+                    union_routes(routes, unremoved if direction == "provision" else []),
                     switch_attempts or 1,
                     switch_last_error,
                     intended=intended,
@@ -4736,8 +4776,12 @@ async def _teardown_from_ledgers(
     from app.services.l1_assignment_service import active_assignments_for_reservation
     from app.services.l2_membership_service import active_memberships_for_reservation
     from app.services.route_service import (
+        TEARDOWN_PENDING_REMOVAL,
+        failed_route_assignments_for_reservation,
         get_effective_pinned_routes,
         get_route_assignments,
+        park_stale_route_build,
+        release_route_membership,
     )
 
     res_str = str(reservation_id)
@@ -4783,6 +4827,7 @@ async def _teardown_from_ledgers(
     # time: the whole reservation ends, so every pinned switch is due for removal.
     async with get_db_session() as db:
         l3_rows = await get_route_assignments(db, res_str)
+        l3_failed = await failed_route_assignments_for_reservation(db, res_str)
     deprovisions: list[dict] = []
     for row in l3_rows:
         switch_id = str(row.device_id)
@@ -4791,6 +4836,25 @@ async def _teardown_from_ledgers(
         deprovisions.append(
             {"device_id": switch_id, "routes": pinned if pinned is not None else row.routes}
         )
+    # Issue #1001: a FAILED intended-ACTIVE pin is a provision or intent-delta reconcile
+    # that did not confirm, and its `routes` are what that pass may have left on the
+    # switch. It is parked intended RELEASED first, so the deprovision's
+    # route_needs_remove gate admits it and, should the removal fail or this pass die,
+    # the release-direction retry channels (which run while frozen) finish it. A pin
+    # that records no routes has nothing on the switch and is released without a
+    # driver session. FAILED intended-RELEASED rows are already release-direction work
+    # for those channels and are left to them, as before.
+    for row in l3_failed:
+        if row.intended != "ACTIVE":
+            continue
+        async with get_db_session() as db:
+            parked = await park_stale_route_build(db, row.id, TEARDOWN_PENDING_REMOVAL)
+            if parked is None or parked.status != "FAILED":
+                continue
+            if not parked.routes:
+                await release_route_membership(db, res_str, str(row.device_id))
+                continue
+        deprovisions.append({"device_id": str(row.device_id), "routes": parked.routes})
     if deprovisions:
         await _apply_l3_adjacency(res_str, deprovisions, [], ctx, get_db_session)
 

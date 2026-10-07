@@ -457,6 +457,93 @@ async def test_cancel_removes_exactly_the_applied_intent_derived_set(
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
 
 
+# --- issue #1001: a failed route change leaves no route behind at cancel ---
+
+
+async def _poll_route_run_status(
+    client, reservation_id, action, destination, status, *, timeout=30.0
+):
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        for r in await _runs(client, reservation_id, action, status=status):
+            if r.get("port_a") == destination:
+                return r
+        await asyncio.sleep(0.5)
+    return None
+
+
+async def test_cancel_after_a_failed_route_change_removes_every_route_ever_configured(
+    admin_client, l3_switch, fresh_device
+):
+    """Change the intent from ROUTE_A to ROUTE_B while mock_l3 fails every remove_route:
+    the delta's removal of ROUTE_A fails, its configure of ROUTE_B succeeds, and the pin
+    lands FAILED intended ACTIVE. Clear the knob and cancel: execution must remove BOTH
+    routes, since both may be on the switch (issue #1001; before it, teardown skipped the
+    FAILED pin and left both installed). A retry tick landing before the cancel removes
+    ROUTE_A itself and the cancel removes ROUTE_B, so either order ends with a successful
+    remove_route for each route the switch was ever given."""
+    nats_err = await probe_nats()
+    if nats_err:
+        pytest.skip(nats_err)
+    connection = None
+    topology_id = None
+    reservation_id = None
+    try:
+        connection = await _create_connection(
+            admin_client, fresh_device["id"], l3_switch["id"], "ge-0/0/1"
+        )
+        topology_id = await _create_topology(
+            admin_client, _canvas_with_l3(fresh_device["id"], l3_switch["id"], [ROUTE_A])
+        )
+        reservation = await _reserve(
+            admin_client, [fresh_device["id"], l3_switch["id"]], topology_id
+        )
+        reservation_id = reservation["id"]
+        assert await _poll_active(admin_client, reservation_id), "reservation never activated"
+        assert await _poll_route_run(
+            admin_client, reservation_id, "configure_route", "10.20.0.0/24"
+        ), "the initial intent route was never configured"
+
+        armed = await admin_client.put(
+            f"/inventory/devices/{l3_switch['id']}",
+            json={"field_data": {"model": "test", "mock_fail_actions": "remove_route"}},
+        )
+        assert armed.status_code == 200, armed.text
+        saved = await _save_fork(
+            admin_client,
+            reservation_id,
+            _canvas_with_l3(fresh_device["id"], l3_switch["id"], [ROUTE_B]),
+        )
+        assert saved.status_code == 200, saved.text
+        assert await _poll_route_run_status(
+            admin_client, reservation_id, "remove_route", "10.20.0.0/24", "FAILED"
+        ), "the armed knob never failed the departing route's removal"
+        assert await _poll_route_run(
+            admin_client, reservation_id, "configure_route", "10.21.0.0/24"
+        ), "the arriving route was never configured"
+
+        cleared = await admin_client.put(
+            f"/inventory/devices/{l3_switch['id']}",
+            json={"field_data": {"model": "test", "mock_fail_actions": ""}},
+        )
+        assert cleared.status_code == 200, cleared.text
+        resp = await admin_client.delete(f"/reservations/{reservation_id}")
+        assert resp.status_code == 204, resp.text
+
+        for destination in ("10.20.0.0/24", "10.21.0.0/24"):
+            assert await _poll_route_run(
+                admin_client, reservation_id, "remove_route", destination
+            ), f"route {destination} was left on the switch after the cancel"
+    finally:
+        if reservation_id:
+            # A no-op when the cancel above already ran (terminal rows are left as is).
+            await admin_client.delete(f"/reservations/{reservation_id}")
+        if topology_id:
+            await delete_topology_checked(admin_client, topology_id)
+        if connection:
+            await admin_client.delete(f"/cabling/connections/{connection['id']}")
+
+
 # --- addendum X-B: explicit intent overrides the inter-switch trunk inference ---
 
 
