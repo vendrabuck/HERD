@@ -122,7 +122,15 @@ Check the device's current status in inventory. If `OFFLINE` or `MAINTENANCE` an
 
 ### `422 All devices must share the same topology type`
 
-You mixed `PHYSICAL` and `CLOUD` devices in one reservation. Split into two reservations, one per topology type.
+You mixed `PHYSICAL` and `CLOUD` devices in one reservation. Split into two reservations, one per topology type. The `CLOUD` instance devices a reservation with dynamic instances already holds do not count on an edit (issue #1030), so keeping them in the device list next to physical devices is fine.
+
+### `422 Template <id> not found in inventory` for a dynamic template you can see as admin
+
+A non-admin sees and books a dynamic template only when its hypervisor names a device group one of their user groups has a permission on (issue #1053); otherwise the template is hidden and the booking answers exactly like an unknown id. Open the hypervisor under **Admin > Hypervisors** and set **Bookable by device group**. Hypervisors registered before this setting existed are admin-only until an admin sets it.
+
+### `422 Hypervisor '<name>' is disabled; ...`
+
+The dynamic template's hypervisor has **Enabled** unticked (issue #1033). Re-enable it under **Admin > Hypervisors**, or book a template on another hypervisor. A booking taken before the hypervisor was disabled stays `PENDING_PROVISION` and fails at the provision timeout; execution logs `dynamic_instance_hypervisor_disabled` for it and creates nothing.
 
 ### Reservation stuck in `PENDING`
 

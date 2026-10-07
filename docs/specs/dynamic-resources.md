@@ -41,7 +41,7 @@ section 8.
 
 | Actor | May | May not |
 |---|---|---|
-| User | Book any dynamic template on a new reservation, alone or with devices (DYN-REQ-6); see the booked requests on their reservation; plan instances as canvas placeholders | Change a reservation's dynamic requests after booking (DYN-REQ-3); create a template or register a hypervisor; see the instance's device unless a user group they belong to has permission on the "No Pool" device group (DYN-DEVICE-10) |
+| User | Book a dynamic template visible to them (DYN-REQ-9) on a new reservation, alone or with devices (DYN-REQ-6); see the booked requests on their reservation; see and keep the instance device their own live reservation holds (DYN-DEVICE-10); plan instances as canvas placeholders | Change a reservation's dynamic requests after booking (DYN-REQ-3); see or book a dynamic template whose hypervisor names no device group they hold a permission on; book a template whose hypervisor is disabled (DYN-REQ-10); create a template or register a hypervisor |
 | Admin | Everything a user may; author dynamic templates and register hypervisors (`inventory.md`) | Create a dynamic instance device through the admin device routes (`inventory.md`, INV-DYN-8) |
 | Superadmin | Same as admin | Same as admin |
 | Another service (internal token) | Execution: create and delete instance devices in inventory (section 7), read templates, hypervisors, and secret values, post the provision result | Delete a non-dynamic device through the internal delete route (`inventory.md`, INV-DYN-7) |
@@ -143,7 +143,7 @@ taken, and none of these writes is retried blindly.
 
 None of its own. Dynamic requests ride the reservations routes: `POST /` accepts
 `dynamic_requests` and `GET /`, `GET /{id}` return them (`reservations.md`, section 5);
-this document adds the request-level rules DYN-REQ-1 to DYN-REQ-8. Hypervisor and
+this document adds the request-level rules DYN-REQ-1 to DYN-REQ-10. Hypervisor and
 template administration is in `inventory.md`.
 
 ## 6. Events
@@ -211,18 +211,40 @@ until the instances exist before it goes live.
 - **DYN-REQ-6.** A booking with devices and dynamic requests takes its topology type from
   the devices, and the instances attached on success are `CLOUD` devices (`inventory.md`,
   INV-STATUS-3), so a booking of physical devices plus instances holds devices of both
-  types. Known gap, see #1030. \
+  types; that mix is intended, and the device-set edit judges type uniformity over the
+  booked devices only, leaving out the instances the reservation holds
+  (`reservations.md`, RES-PATCH-6; issue #1030). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `apply_provision_result`); `services/inventory/app/services/inventory_service.py` (`_insert_dynamic_device`) \
-  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_dynamic_booking_stages_provision_requested_payload_exactly`); `services/inventory/tests/test_devices_internal.py` (`test_internal_create_generates_name`)
+  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_dynamic_booking_stages_provision_requested_payload_exactly`); `services/inventory/tests/test_devices_internal.py` (`test_internal_create_generates_name`); `services/reservations/tests/test_dynamic_gating.py` (`test_mixed_reservation_adds_a_device_and_keeps_its_instance`)
 - **DYN-REQ-7.** The template check at booking (RES-DYN-1) reads each distinct template
-  with the caller's JWT and checks only that it exists and is `dynamic`; no device-group
-  visibility or ACL check applies to a dynamic request. \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`); `services/reservations/app/routers/reservations.py` (`create_new_reservation`) \
-  Pinned by: none
+  with the caller's JWT, so inventory applies the visibility rule of DYN-REQ-9: a
+  template hidden from a non-admin answers 404 and the booking is refused with the same
+  `Template <id> not found in inventory` as an unknown id (issue #1053). No ACL check
+  applies beyond that visibility. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`, `_fetch_dynamic_templates`); `services/inventory/app/routers/templates.py` (`get_template_by_id`) \
+  Pinned by: `services/reservations/tests/test_dynamic_gating.py` (`test_hidden_dynamic_template_refused_exactly_like_an_unknown_id`); `tests/integration/test_dynamic_resources.py` (`test_dynamic_template_is_bookable_only_through_its_hypervisors_device_group`)
 - **DYN-REQ-8.** A booking with dynamic requests and no exclusive device writes no
   inventory status at booking or when it fails. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `apply_provision_result`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_dynamic_only_booking_flips_no_devices`, `test_dynamic_only_callback_failure_no_device_release`, `test_dynamic_only_timeout_backstop_no_device_release`)
+
+- **DYN-REQ-9.** A dynamic template is visible to a non-admin through its hypervisor:
+  the hypervisor names one device group (`device_group_id`), and every user group with a
+  permission on that device group may see and book the templates that point at the
+  hypervisor, the same permission rows that grant physical devices. A hypervisor with no
+  device group makes its templates admin-only, which is the state of every hypervisor
+  registered before the column existed. Admins see every template. Chosen over group
+  membership on each template (decision of issue #1053, 2026-10-07): one setting per
+  hypervisor covers all its templates, and template authoring stays unchanged. \
+  Enforced in: `services/inventory/app/services/device_visibility.py` (`resolve_visible_dynamic_hypervisor_ids`, `dynamic_template_visible`); `services/inventory/app/models/hypervisor.py` (`Hypervisor`) \
+  Pinned by: `services/inventory/tests/test_dynamic_visibility.py` (`test_dynamic_template_visible_through_its_hypervisors_device_group`, `test_hidden_dynamic_template_answers_like_an_unknown_id`, `test_template_list_hides_invisible_dynamic_templates_and_counts_what_it_shows`)
+- **DYN-REQ-10.** A booking naming a dynamic template whose hypervisor is disabled is
+  refused with 422 naming the hypervisor and its templates; the hypervisor is read once
+  per distinct hypervisor through inventory's internal route, after the template checks,
+  and a check that cannot be answered fails closed with 503 (`reservations.md`,
+  RES-DYN-10; issue #1033). \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`, `_fetch_hypervisor_internal`) \
+  Pinned by: `services/reservations/tests/test_dynamic_gating.py` (`test_disabled_hypervisor_refused_with_422_naming_it`, `test_unanswerable_hypervisor_check_fails_closed_with_503`); `tests/integration/test_dynamic_resources.py` (`test_disabled_hypervisor_refuses_the_booking`)
 
 **Out of scope.** The template check's error responses, the 50-request cap, the
 `PENDING_PROVISION` gate, and the callback are reservations' (`reservations.md`).
@@ -395,11 +417,16 @@ goes live.
 - **DYN-CREATE-28.** An abandoned event processes none of its remaining requests. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_handle_provision_requested`) \
   Pinned by: none
-- **DYN-CREATE-29.** The hypervisor's `enabled` flag is read by neither the booking nor
-  the create: a template whose hypervisor is disabled is booked and its instances are
-  created like any other. Known gap, see #1033. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_recipe_deps`); `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`) \
-  Pinned by: none
+- **DYN-CREATE-29.** The create refuses a hypervisor whose `enabled` flag is false, the
+  second line behind the booking's check (DYN-REQ-10) for a booking taken before an admin
+  disabled it: after the `CREATING` row is committed (and after the `ACTIVE` and
+  `DESTROYED` short-circuits, so a finished instance is still reported), nothing is
+  created, the row stays `CREATING`, the event is acknowledged and abandoned with the
+  fixed log action `dynamic_instance_hypervisor_disabled` (then
+  `dynamic_provision_abandoned`), and the reservation fails by the provision timeout.
+  Only an explicit `false` refuses (issue #1033). \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`, `_refuse_disabled_hypervisor`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_disabled_hypervisor_is_refused_and_the_row_stays_creating`, `test_disabled_hypervisor_does_not_undo_an_instance_already_active`)
 - **DYN-CREATE-30.** The create path reads and inserts ledger rows scoped to the event's
   reservation: a row another reservation holds under the same request id is never
   returned, so the insert trips the unique request id and the error is raised (issue
@@ -508,11 +535,12 @@ reservation, which is why its numbering starts at DYN-DEVICE-9.
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_delete_dynamic_device`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_delete_dynamic_device_maps_status_codes`, `test_delete_dynamic_device_raises_on_transport_error`)
 - **DYN-DEVICE-10.** The instance device joins the "No Pool" device group like every
-  new device (`inventory.md`, INV-DYN-6), so a non-admin owner sees it, and may name it
-  in a reservation edit (RES-PATCH-7), only when one of their user groups has permission
-  on that group. Known gap, see #1030. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`); `services/inventory/app/services/device_group_service.py` (`add_device_to_no_pool`, `get_visible_device_ids`); `services/reservations/app/routers/reservations.py` (`update_reservation_by_id`) \
-  Pinned by: none
+  new device (`inventory.md`, INV-DYN-6), and its visibility is also granted through the
+  reservation that holds it: a non-admin sees it, and may name it in a reservation edit
+  (RES-PATCH-7), while one of their own `PENDING_PROVISION` or `ACTIVE` reservations holds
+  it, whatever their permission on "No Pool" (`inventory.md`, INV-VIS-9; issue #1030). \
+  Enforced in: `services/inventory/app/services/device_visibility.py` (`_resolve_visible_device_ids`, `_instance_devices_held_by`); `services/reservations/app/routers/reservations.py` (`list_devices_held_by_user`, `update_reservation_by_id`) \
+  Pinned by: `services/inventory/tests/test_dynamic_visibility.py` (`test_owner_sees_the_instance_device_their_live_reservation_holds`, `test_instance_device_not_held_by_the_caller_stays_hidden`); `tests/integration/test_dynamic_resources.py` (`test_non_admin_owner_sees_and_keeps_their_instance_in_a_mixed_edit`)
 - **DYN-DEVICE-11.** Reservations treats an instance device like any exclusive device
   when the reservation ends or the device is removed: it is set `AVAILABLE`
   (RES-HOLD-5, RES-PATCH-10) independently of execution's delete, so it is `AVAILABLE`
@@ -981,14 +1009,19 @@ internal delete checks no reservation by decision (`inventory.md`, INV-DEL-9).
 
 ### Open defects
 
-- #1030 (DYN-REQ-6, DYN-DEVICE-10): mixed bookings are intended, and the `ACTIVE`
-  device-set edit applies the type uniformity check to the whole set, so a mixed
-  reservation cannot change its device set; the instance device joins No Pool, so a
-  non-admin owner whose groups have no permission on No Pool cannot see it or keep it
-  in a device-list edit.
-- #1033 (DYN-CREATE-29): the hypervisor `enabled` flag is written but never read.
+None at present.
 
 ### Limits by decision
+
+- A hypervisor names at most one device group (DYN-REQ-9); several audiences share one
+  device group by granting several user groups on it. Recorded in issue #1053 and
+  migration `0022_hypervisor_device_group.py`.
+- A create refused for a disabled hypervisor reports no failure: the reservation waits
+  in `PENDING_PROVISION` until the provision timeout fails it (DYN-CREATE-29). Recorded
+  in issue #1033 and the comment above the refusal in `_provision_one_instance`.
+- The instance-device grant fails to plain group visibility when reservations cannot
+  answer, so during such an outage a non-admin owner cannot open or keep their instance
+  device (DYN-DEVICE-10). Recorded in the docstring of `_fetch_held_device_ids`.
 
 - A row teardown left live is retried only by a redelivered or re-published terminal
   event; there is no sweep (DYN-DESTROY-15). Recorded in `docs/TROUBLESHOOTING.md`
@@ -1025,15 +1058,12 @@ internal delete checks no reservation by decision (`inventory.md`, INV-DEL-9).
 ### Rules with no test
 
 - DYN-REQ-3: dynamic requests cannot change after booking.
-- DYN-REQ-7: the booking-time template check has no visibility or ACL component.
 - DYN-CREATE-4: a `provision_requested` without `reservation_id`.
 - DYN-CREATE-9: a missing hypervisor or secret on create.
 - DYN-CREATE-15: the recipe timeout applied to recipe calls.
 - DYN-CREATE-23: inventory refusing the device create.
 - DYN-CREATE-27: earlier instances of an event kept when a later one fails.
 - DYN-CREATE-28: an abandoned event skips its remaining requests.
-- DYN-CREATE-29: the hypervisor's `enabled` flag is not read.
-- DYN-DEVICE-10: the instance device's visibility to its owner.
 - DYN-DEVICE-11: the instance device `AVAILABLE` between release and delete.
 - DYN-DESTROY-16: teardown's run user and run device id.
 - DYN-DESTROY-17: a transient error reading the recipe's configuration in teardown.

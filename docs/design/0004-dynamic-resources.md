@@ -97,6 +97,15 @@ columns. Admin CRUD at `/hypervisors`, plus
 `GET /hypervisors/{id}/internal` (X-Internal-Token) for execution.
 Credentials never appear inline in hypervisor rows or template fields.
 
+As built (issues #1033 and #1053): the enabled flag is enforced, a booking of
+a template whose hypervisor is disabled is refused at reservation create and
+execution refuses the create as a second line; and a later `device_group_id`
+column names the device group whose user groups may see and book the
+hypervisor's dynamic templates (null means admins only), the dynamic-template
+analogue of device-group visibility for physical devices. See
+`docs/specs/dynamic-resources.md` (DYN-REQ-7, DYN-REQ-9, DYN-REQ-10,
+DYN-CREATE-29).
+
 ### A dynamic template names a recipe and a hypervisor
 
 `template_type` gains `"dynamic"`. A dynamic template requires `driver_id`

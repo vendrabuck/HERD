@@ -82,13 +82,14 @@ The device's template decides which category it falls in. If a reservation is re
 
 Some resources do not exist until you book them: virtual machines or containers that a hypervisor creates for your reservation and destroys when it ends. Admins publish these as **dynamic templates**, and you book them from the same Create Reservation modal:
 
-1. In the **Dynamic instances** block, click **Add dynamic instance**, pick a dynamic template, and set a count. A reservation can mix devices and dynamic instances, or be dynamic-only (no devices at all). If the block says "No dynamic templates available", none have been published yet.
+1. In the **Dynamic instances** block, click **Add dynamic instance**, pick a dynamic template, and set a count. A reservation can mix devices and dynamic instances, or be dynamic-only (no devices at all). You see, and can book, only the dynamic templates an admin has opened to one of your groups (through the hypervisor's device group, the same permissions that make devices visible); a template you cannot see is refused as not found. If the block says "No dynamic templates available", none is published or none is open to you. A template whose hypervisor an admin has disabled is refused at booking with a message naming the hypervisor.
 2. Submit. The reservation stays in `PENDING_PROVISION` while the hypervisor creates the instances and only turns `ACTIVE` once they all exist. If creation fails after retries, the reservation lands in `FAILED` and any instances that were created are torn down.
 3. The detail modal's **Details** tab lists the booked dynamic instances by template and count.
+4. Once `ACTIVE`, each instance appears in the reservation as a `CLOUD` device. You can open it like any device while your reservation holds it, and you can change the reservation's devices (add or remove physical devices) as long as you keep the instance device in the list; leaving it out removes the instance, which is then destroyed.
 
 You can also plan canvas-first: drag a dynamic template from the topology editor's palette onto the canvas as a placeholder node, set its instance count on the node, and **Reserve Topology** prefills the dynamic instances block from your placeholders (see [TOPOLOGY_EDITOR.md](TOPOLOGY_EDITOR.md#dynamic-placeholders)). Placeholders are planning aids only: they cannot be cabled and are not saved with the topology.
 
-**For admins**, authoring has two parts: register the hypervisor (endpoint, type, credential secret) under **Admin > Hypervisors**, then create a template with type `dynamic` in the template editor and point it at both a `Hypervisor`-connection-type recipe driver and the registered hypervisor. See [ADMIN_HANDBOOK.md](ADMIN_HANDBOOK.md#templates) and [DRIVERS.md](DRIVERS.md) for the recipe package format.
+**For admins**, authoring has two parts: register the hypervisor (endpoint, type, credential secret, and the device group whose users may book its templates; none means admins only) under **Admin > Hypervisors**, then create a template with type `dynamic` in the template editor and point it at both a `Hypervisor`-connection-type recipe driver and the registered hypervisor. See [ADMIN_HANDBOOK.md](ADMIN_HANDBOOK.md#templates) and [DRIVERS.md](DRIVERS.md) for the recipe package format.
 
 ### Reservation detail
 
