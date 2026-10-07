@@ -380,24 +380,21 @@
       "properties": {
         "created_at": "string",
         "created_by": "string",
-        "device_a_id": "string",
-        "device_b_id": "string",
+        "device_a_id": "anyOf",
+        "device_b_id": "anyOf",
         "edge_key": "anyOf",
+        "hidden": "boolean",
         "id": "string",
         "layer": "string",
         "physical_connection_id": "anyOf",
-        "port_a": "string",
-        "port_b": "string"
+        "port_a": "anyOf",
+        "port_b": "anyOf"
       },
       "required": [
         "created_at",
         "created_by",
-        "device_a_id",
-        "device_b_id",
         "id",
-        "layer",
-        "port_a",
-        "port_b"
+        "layer"
       ],
       "type": "object"
     },
