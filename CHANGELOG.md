@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- Fixed: a filter, page size, or sort changed on the Inventory, Reservations, or Topologies page before the saved preferences finished loading no longer saves an empty search over the saved one; the store holds such writes until the load settles, applies only what the user changed on top of the loaded values, and saves the result once (#985).
+- Fixed: the device page's Save sends only the fields the admin changed since clicking Edit, and Edit starts from the current device, so a rename no longer writes back a stale status over one provisioning set meanwhile (#1020).
+- Fixed: the topology editor opens a stored node that has no device (the seeded "BROKEN" topologies) instead of crashing into the error boundary; the node renders as "Unknown device" and a new connection to it is refused with a toast (#989).
+- Fixed: `/config` and `/templates/new` carry bottom padding so their last controls can scroll clear of a stack of toasts (#988).
+- Fixed: a bulk group member add naming a user id with no account answers 404 `Users not found: <ids>` and adds nobody, instead of an unhandled 500 (#1009).
+- Docs: the dead-letter inspection, replay, and purge commands in `docs/OPERATIONS.md` run the `nats` CLI from a `natsio/nats-box` container, since the `nats` service image has no CLI, and say when a replay is meaningful (#991).
 - Fixed: inventory answers 422 or 503 where a 500 escaped: a bulk port create whose last generated name exceeds 255 characters, a device or template import file that is not UTF-8, and a non-JSON 200 from reservations during a device delete or config restore (#1022).
 - Fixed: a device-group bulk add naming a device that does not exist answers 422 `Devices not found: <ids>` and adds nothing, instead of a 500 (#1019).
 - Fixed: a device import that updates an existing device writes only the columns the row carries, so omitted `field_data`, poll interval, status, and topology type keep their stored values; an explicit null on a NOT NULL device field is a 422 naming the field, and only a real name clash reads as one (#1016).
