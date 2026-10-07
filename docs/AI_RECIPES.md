@@ -20,7 +20,9 @@ Dark by default. Three conditions must all hold:
 `GET /api/ai/status` reports the flag as `recipe_authoring`; the frontend
 renders the "Draft with AI" button on the drivers page only when both
 `enabled` and `recipe_authoring` are true. The ai-orchestrator also needs
-`INTERNAL_API_TOKEN` (its only internal-token use) to reach the validator.
+`INTERNAL_API_TOKEN` to reach the validator (the service also uses it for the purpose
+classification signal reads and the transcript-retention lookup; see
+[ENV_VARS.md](ENV_VARS.md)).
 
 ## The flow
 

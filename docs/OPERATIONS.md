@@ -73,6 +73,14 @@ Alembic migrations are per-service (one migration chain per database schema). On
 
 If a migration fails mid-flight, the service stays down. Fix the cause, re-run `make migrate-<service>` for just that one.
 
+`make migrate-inventory` revision 0022 (issue #1053) adds `hypervisors.device_group_id`
+and leaves it null on every existing hypervisor, which means admins only: after the
+upgrade, non-admins cannot see or book any dynamic template until an admin sets
+**Bookable by device group** on each hypervisor (Administration, then Hypervisors).
+`make migrate-reservations` revision 0017 (issue #997) adds
+`reservations.provision_started_at`; rows that predate it have no stamp, and the
+provisioning backstops measure those from `updated_at` as before.
+
 `make migrate-cabling` (part of a plain `make migrate`) includes a one-time data
 scrub (revision 0013, hardening): every stored canvas across `topologies`,
 `topology_versions`, `reservation_fork`, `fork_versions`, and

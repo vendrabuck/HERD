@@ -577,3 +577,22 @@ retry path for one exhausted row without an operator reaching for the
 global `POST /admin/purpose/backfill`. The integration test now calls it
 directly instead of waiting on the sweep, and no longer needs to run first
 in its suite.
+
+## Amendment 2026-10-07: transcripts are kept until the classifier reads them (issue #1039)
+
+Decision 11 has the end-of-reservation classifier read the reservation's assistant
+transcripts, but the assistant's idle sweeper deleted conversations by last use only
+(`ASSISTANT_CONVERSATION_TTL_HOURS`), so a transcript could be gone before the
+classifier ran. Decided (option E(a)): while `AI_PURPOSE_CLASSIFICATION_ENABLED` and
+`AI_PURPOSE_INCLUDE_TRANSCRIPTS` are both on, `expire_idle` keeps an idle conversation
+whose reservation is not terminal, or is terminal with classification still pending.
+Pending comes from reservations' internal `GET /internal/{id}`, which gained the additive
+boolean `purpose_classification_pending` (`purpose_classify_requested_at` set and no
+suggestion). The lookup runs once per reservation per cycle, at most 8 at a time, after
+the read transaction ends, and fails closed: a transport error, a missing token, a
+non-200 other than 404, a malformed body, or an unknown status keeps the conversation,
+while a 404 releases it. The delete re-applies the idle cutoff, so a conversation used
+during the lookups survives. With either flag off nothing reads transcripts, so the plain
+TTL applies and no lookup runs. Limit by decision: a terminal reservation whose
+classification never produces a suggestion stays pending, and its idle conversations are
+kept for as long as that lasts.

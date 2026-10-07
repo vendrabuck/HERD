@@ -44,7 +44,10 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   inventory is unreachable, no force flag). See
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Device group visibility** (Shipped): non-admin users only see devices in their
-  assigned groups.
+  assigned groups, plus the instance devices of their own `PENDING_PROVISION` or
+  `ACTIVE` reservations (issue #1030). A dynamic template is visible and bookable
+  only through its hypervisor's device group, admins only when none is set (issue
+  #1053).
 
 ## Inventory
 
@@ -63,6 +66,10 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   `reservation_ids` and `transit_reservation_ids`), or while any cable still names it
   (409 `device_cabled`, with `connection_count` and `connection_ids`). An unreachable
   upstream refuses with 503, and there is no force flag.
+- **Port delete and rename guard** (Shipped, issue #1023): a cable records its ports by
+  name, so deleting or renaming a port that any cable names is refused with 409
+  `port_cabled` (with `connection_count` and `connection_ids`); an unreachable cabling
+  service refuses with 503. Editing only a port's field data is never refused.
 - **Exclusive vs non-exclusive flag** (Shipped): exclusive devices get conflict
   detection; shared infrastructure (such as switches) can take concurrent
   reservations.
@@ -72,8 +79,9 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   spreadsheet formulas (a text cell starting with `=`, `+`, `-`, `@`, a tab, or a
   carriage return gets a leading quote) and the importers undo exactly that, so an
   exported value round-trips (issue #910). Targets migration between HERD
-  instances and bulk onboarding of existing inventory. Reservations, ACL grants,
-  and users are out of scope.
+  instances and bulk onboarding of existing inventory. A device or template dry run
+  is a full rehearsal through the same checks as the committing import, rolled back
+  at the end (issue #1017). Reservations, ACL grants, and users are out of scope.
 
 ## Topology
 
@@ -204,17 +212,23 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   reconcile that later commits use): Layer 1 port cross-connects, Layer 2 VLAN
   definition and membership (fabric-aware, conflict-free VLAN ids, defined on
   the switches on first use and deleted when the last membership releases), and Layer 3
-  static routes, pinned at provision time so teardown removes exactly what was
-  applied: the reservation's fork routing intent when the topology expresses it
+  static routes, pinned at provision time so teardown removes what was applied,
+  including the routes a partly failed route change may have left installed (issue
+  #1001): the reservation's fork routing intent when the topology expresses it
   (ADR 0014, issue #34) takes precedence, falling back to the switch's latest config
   version only when it does not. Deprovisioning on cancel or completion releases from
   the per-layer wiring ledgers (ADR 0009).
 - **Live editing** (Shipped): modify device lists, extend end times, and update
-  purpose on an active reservation. A device added to the device list wires
+  purpose on an active reservation. An edit commits only if the reservation's status
+  did not change while it ran (409 otherwise, issue #994), a new end time is held to
+  the same maximum duration as a new booking (issue #995), and a device added to a
+  pending reservation only has to be free in that reservation's window (issue #999). A device added to the device list wires
   nothing by itself: its connections are built when a topology commit draws them
   (ADR 0009 Decision 6); removing a device releases its wiring via the fork prune.
 - **Calendar view** (Shipped): Gantt-style timeline with day, week, and month views,
-  status filters, and click-to-view details.
+  status filters, and click-to-view details. A non-admin sees only reservations on
+  devices they can see, and the calendar refuses with 503 rather than show unfiltered
+  rows when that visibility cannot be checked (issue #1000).
 - **Lab purpose classification** (Shipped, all three phases): an optional purpose
   category alongside the existing free-text purpose field, drawn from a
   configurable taxonomy (`PURPOSE_CATEGORIES`, default qa_regression,
@@ -259,7 +273,10 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   rather than referencing a pre-existing device row. Admins register hypervisors
   from an admin Hypervisors page (list, register, edit, delete) with an endpoint, a
   free-string hypervisor type, and a secrets-service credential reference validated
-  at registration, and pair a dynamic template with both a hypervisor and a recipe
+  at registration, plus the device group whose user groups may see and book the
+  hypervisor's templates (none means admins only, issue #1053) and an Enabled flag
+  that, while off, refuses new bookings of its templates and creates no new instances
+  on it (issue #1033), and pair a dynamic template with both a hypervisor and a recipe
   driver package from the template editor, which offers a Dynamic type option
   alongside Device and Port and enforces the Hypervisor-driver requirement
   client-side (issue #398). Booking is both reservation-first (the Create
@@ -314,7 +331,8 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   provider. It is in no gate and no CI job.
 - **Reservation assistant** (Shipped): a multi-turn tool-use loop lets the
   reservation owner ask read-only questions about a running reservation
-  (device state, config history, paths, recent executions) and, when
+  (device state, config history, paths, recent executions), with every device
+  argument held to the reservation's own devices (issue #1054), and, when
   `AI_WRITE_TOOLS_ENABLED=true`, propose and schedule config changes through
   the existing apply pipeline. Every AI-initiated apply defaults to a
   dry-run that captures the commands the driver would emit; the frontend

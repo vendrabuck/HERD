@@ -604,3 +604,33 @@ the generalized-409 proof at both `_create_reservation_fork` (raises with an
 empty `device_ids` and the raw conflict detail) and
 `_create_reservation_fork_best_effort` (same definitive, not-retried, marked-
 and-True-returned treatment as the membership shape).
+
+## Amendment: hidden transit on the fork read, and skipped constrained lines on save (2026-10-07, issues #1008 and #1007)
+
+**Fork read (issue #1008).** Decision 2 says user JWTs never reach cabling's fork
+routes. That still holds for authority: the internal token authorizes the call and
+reservations still enforces ownership first. On the fork GET only, reservations now
+also forwards the caller's own bearer beside the internal token
+(`InternalTokenAuth.on_behalf_of` in `herd_common.internal_client`). When that header is
+present, `get_fork_internal` verifies it with the same JWT verifier the user routes use,
+resolves visibility through `resolve_caller_visibility`, and returns each connection end
+on a device the caller cannot see with `device_*_id` and `port_*` null,
+`physical_connection_id` null, and `hidden: true`, the redaction pathfind already applies
+to a hidden transit hop (issue #763). Admins are unfiltered, an unanswerable visibility
+lookup is a 503 that reservations relays, and a forwarded bearer that does not verify is
+a 401. A caller that forwards no bearer (execution's `_fetch_fork_intended_wires`,
+ai-orchestrator) gets the internal payload unchanged, so the wiring reconcile never sees
+a redacted row. Only `connections` is redacted; the canvas and `l3_routes` name the
+reservation's own booked devices.
+
+**Save (issue #1007).** Decision 3 resolves each committed edge to wiring. Since issue
+#531 an edge that names its ports is resolved only on those ports, with no fallback, and
+an unsatisfiable one builds nothing. The save still answers 200 in that case, by
+decision, but it no longer does so silently: `ForkSaveResponse` carries the additive
+`constrained_edges_skipped` (edge id, both device ids, both chosen port names, null for an
+unconstrained side, in canvas edge order), and the editor's save toast lists each such
+line. An unconstrained edge with no path is not listed there; validation reports it as
+`no_path`. The validator and the save share one port reader, `edge_port_constraints`, so
+`validate_canvas_edges` refuses an unsatisfiable port-constrained edge with the reason
+`no_port_path` everywhere the edge pass runs (both validate routes, reservation create,
+import, and the fork canvas PUT and restore), before the save is attempted.

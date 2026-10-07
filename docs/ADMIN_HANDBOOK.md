@@ -52,7 +52,7 @@ A driver is a Python package that teaches HERD how to log into and configure a r
    - **File** (the `.zip` or `.tar.gz`).
 4. Upload. The driver is stored locally under `/data/drivers/` by default (or in MinIO if configured) and validated on first use.
 
-Drivers are reference-counted by templates: you can't delete a driver that a template points at. Remove the template first or update it to a different driver.
+Drivers are reference-counted by templates: you can't delete a driver that a template points at. Remove the template first or update it to a different driver. For the same reason, changing a driver's connection type is refused with 409 when a template using it could not take the new type (a device template cannot use a `Hypervisor` driver, and a dynamic template needs one; issue #1018).
 
 ## Creating templates and devices
 
@@ -75,7 +75,7 @@ Typical workflow:
 5. Add field sections with typed fields (`string`, `number`, `boolean`, `password`, `dropdown`). Add per-field defaults where useful. Password fields are masked in the UI and excluded from search.
 6. Save.
 
-Changing a template mid-life is fine, but: new required fields without defaults will break existing devices' validation. Prefer adding optional fields.
+Changing a template mid-life is fine, but: new required fields without defaults will break existing devices' validation. Prefer adding optional fields. An update that names a driver or a hypervisor is checked against the same rules as a new template (a device template cannot lose its driver, and the driver's connection type must fit the template type), and is refused with 422 in the create path's words (issue #1018).
 
 ### Hypervisors
 
@@ -103,10 +103,10 @@ From an existing device's page, **Add ports**. Pick a port template, fill in fie
 Device groups control which devices non-admin users can see.
 
 - A device group is a named collection of devices.
-- A device group can have user-group permissions attached. If user group `networking` has access to device group `lab-a`, then every user in `networking` can see and reserve every device in `lab-a`.
+- A device group can have user-group permissions attached. If user group `networking` has access to device group `lab-a`, then every user in `networking` can see and reserve every device in `lab-a`, and can see and book the dynamic templates of every hypervisor whose **Bookable by device group** is `lab-a` (issue #1053).
 - A device can be in multiple device groups.
 - Admins always see all devices regardless of group memberships.
-- The `No Pool` group is seeded on startup; new devices auto-join. When you bulk-add a device to any other group, it's auto-removed from `No Pool`.
+- The `No Pool` group is seeded on startup; new devices auto-join. When you bulk-add a device to any other group, it's auto-removed from `No Pool`. A bulk add that names any unknown device id adds nothing and answers 422 `Devices not found: <ids>` (issue #1019).
 
 ### Setup
 
@@ -123,7 +123,7 @@ User groups do the opposite: they collect users so you can grant many of them ac
 
 - A user can be in multiple user groups.
 - The `Not Grouped` group is seeded; new registrations auto-join. When a user is added to any other group, they're auto-removed from `Not Grouped`.
-- Admins and superadmins can CRUD groups and bulk-manage members.
+- Admins and superadmins can CRUD groups and bulk-manage members. A bulk add that names any user id with no account adds nobody and answers 404 `Users not found: <ids>` (issue #1009).
 
 Setup is symmetrical to device groups: **User Groups > New group**, add members, save.
 
