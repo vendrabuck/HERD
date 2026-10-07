@@ -24,8 +24,10 @@ Issue #988 adds two pages whose last controls sit at the bottom centre:
 `/templates/new` ("+ Add Section") and `/config` (Save, Save and Restart, Back
 to login). Each is measured scrolled to its end with one toast and a stack of
 three. The template toasts are the page's own client-side "Name is required"
-refusal (no request is sent); the config toasts come from the page's own
-save-failure path with the settings PUT answered 500, so no setting changes.
+refusal, raised with Vendor and Model filled (a device template keeps Save
+disabled until both are set) and the name empty, so no request is sent; the
+config toasts come from the page's own save-failure path with the settings PUT
+answered 500, so no setting changes.
 
 Needs: the editor test creates and deletes its own empty topology and needs no
 seed. The config test logs in to the config UI and skips when the config
@@ -286,19 +288,42 @@ def test_template_editor_toasts_cover_no_control_at_the_page_end(pw_page):
     pw_login(pw_page)
     save = pw_page.get_by_role("button", name="Save", exact=True)
     add_section = pw_page.get_by_role("button", name="+ Add Section", exact=True)
-    for width, height in VIEWPORTS:
-        where = f"/templates/new {width}x{height}"
-        pw_page.set_viewport_size({"width": width, "height": height})
-        pw_page.goto(f"{HOST_BASE_URL}/templates/new")
-        expect(add_section).to_be_visible(timeout=WAIT_MS)
-        # The name is empty, so Save raises the page's own "Name is required"
-        # toast and sends nothing.
-        _measure_page_end(
-            pw_page,
-            lambda: save.click(timeout=5_000),
-            last_control=add_section,
-            where=where,
-        )
+
+    # The page sends nothing on this path; any template POST is recorded, and
+    # answered 500 so it cannot create a template even if the client-side
+    # check ever regresses.
+    posts: list[str] = []
+
+    def refuse_create(route):
+        if route.request.method == "POST":
+            posts.append(route.request.url)
+            route.fulfill(status=500, json={"detail": "injected by the #988 e2e test"})
+        else:
+            route.continue_()
+
+    pw_page.route("**/api/inventory/templates", refuse_create)
+    try:
+        for width, height in VIEWPORTS:
+            where = f"/templates/new {width}x{height}"
+            pw_page.set_viewport_size({"width": width, "height": height})
+            pw_page.goto(f"{HOST_BASE_URL}/templates/new")
+            expect(add_section).to_be_visible(timeout=WAIT_MS)
+            # A device template keeps Save disabled until Vendor and Model are
+            # filled. With both filled and the name left empty, Save is enabled
+            # and raises the page's own "Name is required" toast, the first
+            # check in its save handler, before any request.
+            pw_page.fill("#tmpl-vendor", "E2E Toast Vendor")
+            pw_page.fill("#tmpl-model", "E2E Toast Model")
+            expect(save).to_be_enabled(timeout=WAIT_MS)
+            _measure_page_end(
+                pw_page,
+                lambda: save.click(timeout=5_000),
+                last_control=add_section,
+                where=where,
+            )
+    finally:
+        pw_page.unroute("**/api/inventory/templates", refuse_create)
+    assert posts == [], f"the template editor sent a create request: {posts}"
 
 
 CONFIG_PASSWORD = os.environ.get("CONFIG_ADMIN_PASSWORD") or "admin123!"
