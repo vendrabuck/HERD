@@ -339,8 +339,9 @@ The status a new booking starts in is RES-CREATE-12 to RES-CREATE-16 (section 4)
   Enforced in: `services/reservations/app/schemas/reservation.py` (`validate_window`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_rejects_past_start`)
 - **RES-CREATE-5.** A window longer than `RESERVATION_MAX_DURATION_SECONDS` (default 30
-  days) is refused; 0 disables the cap. \
-  Enforced in: `services/reservations/app/schemas/reservation.py` (`validate_window`) \
+  days) is refused; 0 disables the cap. A window of exactly the cap passes. PATCH applies
+  the same check (RES-PATCH-5). \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`validate_window`, `check_max_duration`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_rejects_overlong_duration`)
 - **RES-CREATE-6.** `purpose` is at most 2000 characters. \
   Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationCreate`) \
@@ -349,14 +350,14 @@ The status a new booking starts in is RES-CREATE-12 to RES-CREATE-16 (section 4)
   any other device refuses the whole booking with 403. Admins skip the check. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`create_new_reservation`, `_fetch_visible_device_ids`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_non_admin_invisible_device_rejected`, `test_create_reservation_admin_skips_visibility`)
-- **RES-CREATE-8.** When inventory's visible-devices lookup errors or answers non-200,
-  the router skips the RES-CREATE-7 check (by decision, docstring of
-  `_fetch_visible_device_ids`), but the booking still cannot include an invisible
+- **RES-CREATE-8.** When inventory's visible-devices lookup errors, answers non-200, or
+  answers a misshapen body, the router skips the RES-CREATE-7 pre-check (by decision,
+  docstring of `_fetch_visible_device_ids`), but the booking still cannot include an invisible
   device: the device fetch of RES-CREATE-9 goes through inventory's
   `POST /devices/batch`, which omits every device outside a non-admin's visibility and
   fails closed, so such a device is refused as not found (422). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`_fetch_visible_device_ids`); `services/reservations/app/services/reservation_service.py` (`_fetch_devices`); `services/inventory/app/routers/devices.py` (`get_devices_batch`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_visibility_fetch_failure_allows`); `services/reservations/tests/test_coverage_gaps.py` (`test_visible_devices_non_200_logs_and_fails_open`); `services/reservations/tests/test_reservation_service_unit.py` (`test_fetch_devices_missing_from_batch_raises_value_error`); `services/inventory/tests/test_devices.py` (`test_batch_non_admin_gets_only_visible_with_passwords_redacted`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_visibility_fetch_failure_allows`, `test_create_visibility_precheck_still_skips_on_a_misshapen_answer`); `services/reservations/tests/test_coverage_gaps.py` (`test_visible_devices_non_200_logs_and_fails_open`); `services/reservations/tests/test_reservation_service_unit.py` (`test_fetch_devices_missing_from_batch_raises_value_error`); `services/inventory/tests/test_devices.py` (`test_batch_non_admin_gets_only_visible_with_passwords_redacted`)
 - **RES-CREATE-9.** Every requested device must exist in inventory, read in one batch
   call with the caller's JWT; a missing device refuses the booking with 422, and an
   unreachable inventory fails closed with 503. \
@@ -508,7 +509,7 @@ runs after the commit.
   `ACTIVE`; a `PENDING` reservation holds nothing, so cancelling it or editing its
   devices writes no inventory status. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_DEVICE_HOLDING_STATUSES`, `cancel_reservation`, `update_reservation`) \
-  Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_cancel_writes_inventory_only_when_row_held_devices`, `test_patch_add_writes_inventory_only_when_row_holds_devices`, `test_patch_remove_writes_inventory_only_when_row_holds_devices`)
+  Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_cancel_writes_inventory_only_when_row_held_devices`, `test_patch_add_writes_inventory_only_when_row_holds_devices`, `test_patch_remove_writes_inventory_only_when_row_holds_devices`); `services/reservations/tests/test_reservation_patch_hold.py` (`test_pending_add_accepts_a_device_reserved_now_but_free_in_the_window`)
 - **RES-HOLD-2.** Non-exclusive devices are never written to inventory by any
   reservation path. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`create_reservation`, `_release_exclusive_devices_best_effort`) \
@@ -519,7 +520,7 @@ runs after the commit.
   flip-failure revert (RES-CREATE-15). PATCH removal (RES-PATCH-10) does not use this
   check. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`release_devices_not_held_by_others`) \
-  Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_cancel_skips_a_device_another_live_row_holds`, `test_release_skips_a_device_another_live_row_holds`); `services/reservations/tests/test_expiration_hold_invariant.py` (`test_release_skips_device_a_pending_provision_row_holds`)
+  Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_cancel_skips_a_device_another_live_row_holds`, `test_release_skips_a_device_another_live_row_holds`); `services/reservations/tests/test_expiration_hold_invariant.py` (`test_release_skips_device_a_pending_provision_row_holds`); `services/reservations/tests/test_reservation_patch_hold.py` (`test_active_remove_skips_a_device_another_live_row_holds`)
 - **RES-HOLD-4.** If the holder lookup itself fails, the release proceeds for every
   device (fail open toward releasing). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`release_devices_not_held_by_others`) \
@@ -538,7 +539,7 @@ runs after the commit.
 - **RES-HOLD-7.** Releases after a terminal transition run after the commit, with three
   attempts on cancel, release, provision failure, and the timeout path, and a single
   attempt on auto-complete; a release that still fails is logged and the terminal
-  status stands. \
+  status stands. PATCH writes follow the same pattern (RES-PATCH-10). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_release_exclusive_devices_best_effort`); `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_cancel_reservation_retries_and_logs_when_release_fails`, `test_release_reservation_retries_and_logs_when_inventory_fails`)
 - **RES-HOLD-8.** Without `INTERNAL_API_TOKEN` configured, no inventory status write is
@@ -663,19 +664,24 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   devices are exclusive, all are checked. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_conflict_on_extension`); `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_extend_fetch_failure_falls_back_to_exclusive`)
-- **RES-PATCH-5.** Extending the end time does not apply
-  `RESERVATION_MAX_DURATION_SECONDS`; only create applies the cap (RES-CREATE-5). Known
-  gap, see #995. \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
-  Pinned by: none (issue #998)
+- **RES-PATCH-5.** A new `end_time` is judged against `RESERVATION_MAX_DURATION_SECONDS`
+  over the effective window (the stored `start_time` to the new end) by the same check
+  create uses (RES-CREATE-5), with the same wording; exactly the cap passes, one second
+  more is refused, 0 disables the cap. The refusal is 400, the PATCH convention for its
+  service-level refusals (section 13). Only a PATCH that sets `end_time` is judged, so a
+  row already longer than the cap stays editable in its purpose and devices; setting a
+  new end that is still over the cap is refused. PATCH cannot change `start_time`. \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`check_max_duration`); `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
+  Pinned by: `services/reservations/tests/test_reservation_patch_hold.py` (`test_patch_end_time_is_judged_against_the_cap`, `test_patch_cap_uses_the_stored_start_on_an_active_row`, `test_over_cap_legacy_row_stays_editable_outside_its_window`, `test_over_cap_legacy_row_cannot_set_a_window_still_over_the_cap`, `test_cap_zero_disables_the_patch_check`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_over_max_duration_returns_400`)
 - **RES-PATCH-6.** A new `device_ids` must be non-empty (at most 200, deduped), every
   device must exist, and all must share one topology type. \
   Enforced in: `services/reservations/app/schemas/reservation.py` (`device_ids_not_empty`); `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_empty_device_ids_rejected`, `test_update_reservation_topology_mismatch_rejected`); `services/reservations/tests/test_schema_bounds.py` (`test_update_device_ids_over_cap_rejected`)
 - **RES-PATCH-7.** A non-admin's new `device_ids` must all be visible to them (403
-  otherwise). When the visibility lookup fails the router skips this check, as on
-  create (RES-CREATE-8), and the device fetch of RES-PATCH-6 still refuses an invisible
-  device as not found (400). \
+  otherwise). When the visibility lookup cannot be answered the router skips this
+  pre-check, as on create (RES-CREATE-8), and the device fetch of RES-PATCH-6 still
+  refuses an invisible device as not found (400). The calendar, which returns rows,
+  fails closed instead (RES-CAL-3). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`update_reservation_by_id`, `_fetch_visible_device_ids`); `services/reservations/app/services/reservation_service.py` (`_fetch_devices`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_non_admin_invisible_device_rejected`)
 - **RES-PATCH-8.** On a topology-backed reservation, a device-set change re-runs
@@ -683,19 +689,32 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   (`l3=0`). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_validate_topology_connectivity`) \
   Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_device_change_revalidates_topology`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_device_change_breaks_topology_rejected`)
-- **RES-PATCH-9.** An added exclusive device must currently be `AVAILABLE`, also on a
-  `PENDING` reservation, and must not conflict over `[max(now, start), end)`. A create
-  for a future window skips the current-status check (RES-CREATE-12). Known gap, see
-  #999. \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
-  Pinned by: `services/reservations/tests/test_reservation_hold_invariant.py` (`test_patch_add_still_refuses_a_device_that_is_not_available_on_pending`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_conflict_on_added_device`)
-- **RES-PATCH-10.** On an `ACTIVE` row, added exclusive devices are set `RESERVED` and
-  removed exclusive devices `AVAILABLE` before the edit commits, each in one attempt
-  whose failure is logged and does not stop the edit. Neither write uses the holder
-  check, and the commit does not re-check the status the edit read. Known gap, see
-  #994. \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_update_device_statuses`) \
-  Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_add_exclusive_device_marks_reserved`, `test_update_reservation_remove_exclusive_device_marks_available`)
+- **RES-PATCH-9.** An added exclusive device must not conflict over
+  `[max(now, start), end)`, checked by the same refusal create uses, with create's
+  wording (`... already reserved in the requested window`). On an `ACTIVE` reservation it
+  must also be `AVAILABLE` now, because the row is about to hold it. On a `PENDING`
+  reservation the current status is not consulted, exactly like a create for a future
+  window (RES-CREATE-12): the row holds nothing until activation, which sets the device
+  `RESERVED` as usual. By decision (issue #999, 2026-10-05). \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_assert_no_window_conflicts`) \
+  Pinned by: `services/reservations/tests/test_reservation_patch_hold.py` (`test_pending_add_accepts_a_device_reserved_now_but_free_in_the_window`, `test_pending_add_refuses_a_device_booked_over_the_window_with_creates_wording`, `test_active_add_still_refuses_a_device_that_is_not_available_now`, `test_device_added_to_a_pending_row_is_reserved_at_activation`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_conflict_on_added_device`)
+- **RES-PATCH-10.** The edit commits under a status guard: a self-transition
+  compare-and-swap on the status the PATCH read. If a cancel, release, auto-complete, or
+  the sweep's activation claim moved the row during the PATCH, nothing of the edit is
+  kept (no device-set change, no event, no inventory write) and the PATCH answers 409
+  `Reservation changed status during the update (<read> to <now>); nothing was changed`
+  (log action `reservation_update_lost_race`). Inventory is written only after the
+  commit and only on an `ACTIVE` row: added exclusive devices are set `RESERVED` with
+  three attempts, then the status is read again and, if the row has left `ACTIVE`
+  meanwhile, the devices this call set are put back to `AVAILABLE` holder-aware
+  (`reservation_update_hold_reverted`); removed devices go through the shared release
+  helper (RES-HOLD-3, RES-HOLD-5) with three attempts. A write that still fails is logged
+  (`reservation_update_hold_failed`, `reservation_update_release_failed`) and the
+  committed edit stands, by decision: no double booking follows, because the conflict
+  check reads reservations' own rows, and the row's next transition writes the device
+  again. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `ReservationStatusChanged`, `_hold_added_devices_after_edit`, `_release_exclusive_devices_best_effort`) \
+  Pinned by: `services/reservations/tests/test_reservation_patch_hold.py` (`test_active_add_reserves_only_after_the_edit_committed`, `test_active_add_inventory_failure_is_retried_logged_and_the_edit_stands`, `test_active_remove_inventory_failure_is_retried_logged_and_the_edit_stands`, `test_commit_failure_writes_nothing_to_inventory`, `test_patch_losing_its_status_guard_keeps_nothing`, `test_cancel_committing_after_the_edit_reverts_the_added_hold`, `test_patch_route_answers_409_when_the_status_guard_loses`); `services/reservations/tests/test_reservation_patch_race_live_pg.py` (`test_cancel_during_the_patch_checks_keeps_nothing_of_the_patch`, `test_cancel_during_the_post_commit_flip_leaves_the_added_device_released`, `test_patch_versus_cancel_jittered_around_the_patch_commit`); `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_add_exclusive_device_marks_reserved`, `test_update_reservation_remove_exclusive_device_marks_available`)
 - **RES-PATCH-11.** Removing devices from an `ACTIVE` reservation records them in
   `pending_fork_prune_device_ids` in the edit's transaction, unioned with any ids still
   pending, then asks cabling to prune them from the fork (RES-FORK-16). \
@@ -806,10 +825,15 @@ and `frontend/src/pages/ReservationCalendarPage.tsx`; routes `GET /{id}` and
   Enforced in: `services/reservations/app/services/reservation_service.py` (`list_calendar_reservations`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_span_over_max_rejected`); `services/reservations/tests/test_reservation_service_unit.py` (`test_list_calendar_span_guard_disabled_when_zero`)
 - **RES-CAL-3.** For a non-admin the calendar keeps only reservations all of whose
-  devices are visible to them; when the visibility lookup fails, the calendar is
-  unfiltered and shows every user's reservations. Known gap, see #1000. \
-  Enforced in: `services/reservations/app/routers/reservations.py` (`get_calendar_reservations`, `_fetch_visible_device_ids`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_non_admin_visibility_filtering`); `services/reservations/tests/test_reservation_service_unit.py` (`test_calendar_visibility_subset_and_empty_set`)
+  devices are visible to them. When the visibility lookup cannot be answered (transport
+  error, non-200, or a body that is not `{"device_ids": [<str>, ...]}`) the calendar
+  fails closed: 503 `Could not verify device visibility; reservations were not returned.
+  Retry the request.` and no rows. Admins are unfiltered and never trigger the lookup.
+  By decision (issue #1000, 2026-10-05, superseding the fail-open accepted in #131). The
+  calendar page shows a could-not-load state on the refusal, not the empty-range
+  message. \
+  Enforced in: `services/reservations/app/routers/reservations.py` (`get_calendar_reservations`, `_fetch_visible_device_ids_strict`); `frontend/src/pages/ReservationCalendarPage.tsx` (`ReservationCalendarPage`) \
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_non_admin_visibility_filtering`, `test_calendar_non_admin_fails_closed_when_visibility_is_unanswerable`, `test_calendar_admin_is_unfiltered_and_never_asks_for_visibility`, `test_calendar_non_admin_with_a_real_answer_is_filtered`); `services/reservations/tests/test_reservation_service_unit.py` (`test_calendar_visibility_subset_and_empty_set`); `frontend/src/test/pages/ReservationCalendarPage.test.tsx` (`ReservationCalendarPage`)
 
 **Out of scope.** Utilization reports (`GET /reports/utilization` and its CSV) live in
 this service but belong to `operations-and-observability.md`.
@@ -1143,7 +1167,8 @@ sweep, and event delivery never return an error to a caller.
 | 404 | `Fork not found` | reading the fork of a non-`ACTIVE` reservation that has none | RES-FORK-5 |
 | 409 | `Time conflict: devices [<ids>] already reserved in the requested window` | create overlaps another live booking of an exclusive device | RES-CONFLICT-1 |
 | 409 | `Time conflict: devices [<ids>] already reserved in the extended window` | PATCH extension overlaps another live booking | RES-PATCH-4 |
-| 409 | `Time conflict: devices [<ids>] already reserved` | PATCH-add overlaps another live booking | RES-PATCH-9 |
+| 409 | `Time conflict: devices [<ids>] already reserved in the requested window` | PATCH-add overlaps another live booking (create's wording) | RES-PATCH-9 |
+| 409 | `Reservation changed status during the update (<read> to <now>); nothing was changed` | PATCH lost its status guard to a concurrent transition | RES-PATCH-10 |
 | 409 | `Reservation has no suggestion to accept` | accept or dismiss with no suggestion (same text on dismiss) | RES-PURPOSE-10, RES-PURPOSE-11 |
 | 409 | `{"error": "not_eligible"}` | Classify now on a row not yet stamped | RES-PURPOSE-13 |
 | 409 | `{"error": "already_suggested"}` | Classify now on a row with a suggestion | RES-PURPOSE-13 |
@@ -1168,6 +1193,7 @@ sweep, and event delivery never return an error to a caller.
 | 422 | `The following templates are not dynamic templates: <ids>` | a dynamic request names a non-dynamic template | RES-DYN-1 |
 | 422 | `Calendar window cannot exceed <N> days (requested ...)` | calendar window too wide | RES-CAL-2 |
 | 503 | `Failed to contact inventory service: ...` | inventory unreachable on create, PATCH, or the dynamic template check | RES-CREATE-9, RES-PATCH-6, RES-DYN-1 |
+| 503 | `Could not verify device visibility; reservations were not returned. Retry the request.` | non-admin calendar while the visibility lookup cannot be answered | RES-CAL-3 |
 | 503 | `Failed to reserve devices in inventory after retries: ...` | the create-path inventory flip exhausted its attempts | RES-CREATE-15 |
 | 503 | `Cabling validation returned <status>: ...` or `Failed to contact cabling service: ...` | topology validation failed on create or PATCH | RES-TOPO-6, RES-PATCH-8 |
 | 503 | `{"error": "purpose_classification_disabled"}` | Classify now with the feature off | RES-PURPOSE-13 |
@@ -1186,11 +1212,11 @@ Calls into this area are in section 7; events are in section 6.
 
 | Direction | Peer | Call | Purpose | On failure |
 |---|---|---|---|---|
-| Out | inventory | `GET /device-groups/visible-devices` (caller's JWT) | non-admin visibility on create, PATCH, calendar | Fail open: the filter is skipped. Create and PATCH still refuse an invisible device through the batch fetch below (RES-CREATE-8, RES-PATCH-7); the calendar shows every reservation (RES-CAL-3) |
+| Out | inventory | `GET /device-groups/visible-devices` (caller's JWT) | non-admin visibility on create, PATCH, calendar | Create and PATCH: the pre-check is skipped, and an invisible device is still refused through the batch fetch below (RES-CREATE-8, RES-PATCH-7). Calendar: fail closed, 503 and no rows (RES-CAL-3) |
 | Out | inventory | `POST /devices/batch` (caller's JWT) | device existence, visibility, type, exclusivity, status on create and PATCH | Fail closed: 503 on create and on PATCH device changes; on a PATCH end-time extension every device is treated as exclusive |
 | Out | inventory | `GET /templates/{id}` (caller's JWT) | dynamic template check | Fail closed: 503 |
 | Out | inventory | `GET /devices/{id}/internal` (internal token) | exclusivity on release and scheduled activation | Fail toward exclusive: an unreadable device is treated as exclusive; a 404 drops it from a release, except on auto-complete (RES-HOLD-5, RES-HOLD-9) |
-| Out | inventory | `POST /devices/{id}/status` (internal token) | set `RESERVED` or `AVAILABLE` | Create path: three attempts then `FAILED` and 503. Scheduled activation: three attempts then back to `PENDING`. Releases: logged, terminal status stands. PATCH: one attempt, logged, edit stands |
+| Out | inventory | `POST /devices/{id}/status` (internal token) | set `RESERVED` or `AVAILABLE` | Create path: three attempts then `FAILED` and 503. Scheduled activation: three attempts then back to `PENDING`. Releases: logged, terminal status stands. PATCH: after the commit, three attempts, logged, edit stands (RES-PATCH-10) |
 | Out | cabling | `POST /topologies/{id}/validate/internal` (internal token) | topology connectivity, membership, routing intent | 404: treated as nothing to validate (RES-TOPO-5). Other error or transport: fail closed, 503 |
 | Out | cabling | `POST /internal/forks` (internal token) | fork create at activation, by the sweep, or lazily on read | Activation and sweep: three attempts, logged, reservation stays `ACTIVE`; 409 or 422 final. Lazy read: 503 to the caller |
 | Out | cabling | `GET`, `PUT`, `POST` on `/internal/forks/{id}/...` (internal token) | the forwarded fork routes | 4xx relayed; 5xx and transport 503 |
@@ -1249,20 +1275,8 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
 
 ### Open defects
 
-- #994 (RES-PATCH-10, RES-HOLD-3): PATCH writes inventory before the edit commits, in
-  one attempt whose failure is only logged, so an added exclusive device can stay
-  `AVAILABLE` while held. The removal write skips the holder check every other release
-  path uses, and the commit does not re-check the status the edit read, so a cancel or
-  auto-complete racing a PATCH can leave an added device `RESERVED` with no holder.
-- #995 (RES-PATCH-5): a PATCH can extend a reservation past
-  `RESERVATION_MAX_DURATION_SECONDS`; only create applies the cap.
-- #999 (RES-PATCH-9): PATCH-add on a `PENDING` reservation requires the added device to
-  be `AVAILABLE` now, while a create for the same future window skips that check
-  (RES-CREATE-12) and relies on the window conflict check.
-- #1000 (RES-CAL-3): when the visibility lookup fails, a non-admin's calendar is
-  unfiltered and shows every user's reservations (purpose, owner name, device ids).
-  Booking stays closed in the same outage (RES-CREATE-8, RES-PATCH-7). Issue #131
-  recorded the fail-open calendar as acceptable; #1000 supersedes that decision.
+None at present.
+
 
 ### Limits by decision
 
@@ -1293,4 +1307,4 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
 
 ### Rules with no test
 
-- RES-PATCH-5: an extension past the duration cap (it currently succeeds; see #995).
+None: every rule names a test.

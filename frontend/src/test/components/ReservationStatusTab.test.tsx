@@ -176,8 +176,45 @@ describe("ReservationStatusTab", () => {
     });
     fireEvent.click(screen.getByText("Save"));
 
-    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("boom"));
     expect(onUpdated).not.toHaveBeenCalled();
     expect(screen.getByPlaceholderText("Purpose")).toBeInTheDocument();
+  });
+
+  it("shows the server's duration-cap refusal verbatim (issue #995)", async () => {
+    server.use(
+      http.patch("/api/reservations/:id", () =>
+        HttpResponse.json(
+          { detail: "reservation duration exceeds the maximum of 2592000s" },
+          { status: 400 },
+        ),
+      ),
+    );
+    renderWithProviders(<ReservationStatusTab reservation={BASE} onUpdated={vi.fn()} />);
+
+    fireEvent.click(screen.getByText("Edit Schedule"));
+    fireEvent.change(screen.getByPlaceholderText("Purpose"), {
+      target: { value: "changed" },
+    });
+    fireEvent.click(screen.getByText("Save"));
+
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "reservation duration exceeds the maximum of 2592000s",
+      ),
+    );
+  });
+
+  it("falls back to a generic message when the error carries no detail", async () => {
+    server.use(http.patch("/api/reservations/:id", () => HttpResponse.error()));
+    renderWithProviders(<ReservationStatusTab reservation={BASE} onUpdated={vi.fn()} />);
+
+    fireEvent.click(screen.getByText("Edit Schedule"));
+    fireEvent.change(screen.getByPlaceholderText("Purpose"), {
+      target: { value: "changed" },
+    });
+    fireEvent.click(screen.getByText("Save"));
+
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Update failed"));
   });
 });

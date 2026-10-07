@@ -1928,8 +1928,22 @@ async def test_non_exclusive_device_status_not_changed(client):
 # --- Calendar endpoint tests ---
 
 
+@pytest.fixture
+def calendar_visibility():
+    """The non-admin calendar's visibility lookup answers with every test device.
+
+    The calendar fails closed when the lookup cannot be answered (issue #1000), so
+    a calendar test that is not about visibility must stub a real answer.
+    """
+    with patch(
+        "app.routers.reservations._fetch_visible_device_ids_strict",
+        new=AsyncMock(return_value={DEVICE_A, DEVICE_B, DEVICE_CLOUD}),
+    ) as mock:
+        yield mock
+
+
 @pytest.mark.asyncio
-async def test_calendar_returns_cross_user_reservations(client, other_client):
+async def test_calendar_returns_cross_user_reservations(client, other_client, calendar_visibility):
     """Calendar shows reservations from multiple users."""
     resp1 = await _create_test_reservation(client, [DEVICE_A])
     assert resp1.status_code == 201
@@ -1953,7 +1967,7 @@ async def test_calendar_returns_cross_user_reservations(client, other_client):
 
 
 @pytest.mark.asyncio
-async def test_calendar_date_range_filter(client):
+async def test_calendar_date_range_filter(client, calendar_visibility):
     """Only overlapping reservations returned."""
     # Reservation from hour 1 to 3
     resp = await _create_test_reservation(client, [DEVICE_A])
@@ -1970,7 +1984,7 @@ async def test_calendar_date_range_filter(client):
 
 
 @pytest.mark.asyncio
-async def test_calendar_status_filter(client):
+async def test_calendar_status_filter(client, calendar_visibility):
     """Filter by specific status."""
     resp = await _create_test_reservation(client, [DEVICE_A])
     assert resp.status_code == 201
@@ -1994,7 +2008,7 @@ async def test_calendar_status_filter(client):
 
 
 @pytest.mark.asyncio
-async def test_calendar_device_filter(client):
+async def test_calendar_device_filter(client, calendar_visibility):
     """Filter by specific device_id."""
     resp_a = await _create_test_reservation(client, [DEVICE_A])
     assert resp_a.status_code == 201
@@ -2044,7 +2058,7 @@ async def test_calendar_requires_range_params(client):
 
 
 @pytest.mark.asyncio
-async def test_calendar_span_over_max_rejected(client):
+async def test_calendar_span_over_max_rejected(client, calendar_visibility):
     """A window wider than calendar_max_span_days is rejected with 422
     (issue #315), instead of silently loading an unbounded result set."""
     from app.config import settings
@@ -2059,7 +2073,7 @@ async def test_calendar_span_over_max_rejected(client):
 
 
 @pytest.mark.asyncio
-async def test_calendar_span_at_max_succeeds(client):
+async def test_calendar_span_at_max_succeeds(client, calendar_visibility):
     """A window just under (and at) calendar_max_span_days still succeeds."""
     from app.config import settings
 
@@ -2074,7 +2088,7 @@ async def test_calendar_span_at_max_succeeds(client):
 
 
 @pytest.mark.asyncio
-async def test_calendar_empty_range(client):
+async def test_calendar_empty_range(client, calendar_visibility):
     """No reservations in range returns []."""
     range_start = (NOW + timedelta(days=30)).isoformat()
     range_end = (NOW + timedelta(days=31)).isoformat()
@@ -2086,7 +2100,7 @@ async def test_calendar_empty_range(client):
 
 
 @pytest.mark.asyncio
-async def test_calendar_boundary_exclusion(client):
+async def test_calendar_boundary_exclusion(client, calendar_visibility):
     """Reservation ending exactly at range_start is excluded (half-open)."""
     # Reservation: hour 1 to hour 3
     resp = await _create_test_reservation(client, [DEVICE_A])
@@ -2304,7 +2318,7 @@ async def test_release_fetch_failure_falls_back_to_exclusive(client):
 
 
 @pytest.mark.asyncio
-async def test_calendar_multiple_status_filter(client):
+async def test_calendar_multiple_status_filter(client, calendar_visibility):
     """Calendar with multiple status params returns matching reservations."""
     from app.models.reservation import Reservation, ReservationStatus
 
@@ -2961,7 +2975,7 @@ async def test_calendar_non_admin_visibility_filtering(non_admin_client):
 
     # Visible devices include DEVICE_A, so reservation is visible
     with patch(
-        "app.routers.reservations._fetch_visible_device_ids",
+        "app.routers.reservations._fetch_visible_device_ids_strict",
         new=AsyncMock(return_value={DEVICE_A}),
     ):
         resp = await non_admin_client.get(
@@ -2972,7 +2986,7 @@ async def test_calendar_non_admin_visibility_filtering(non_admin_client):
 
     # Visible devices do NOT include DEVICE_A, so reservation is filtered out
     with patch(
-        "app.routers.reservations._fetch_visible_device_ids",
+        "app.routers.reservations._fetch_visible_device_ids_strict",
         new=AsyncMock(return_value={str(uuid.uuid4())}),
     ):
         resp = await non_admin_client.get(
@@ -3694,3 +3708,131 @@ async def test_fetch_visible_device_ids_forwards_jwt_not_internal_token():
     assert headers["Authorization"] == "Bearer jwt-token-123"
     assert "X-Internal-Token" not in headers
     assert result == {DEVICE_A}
+
+
+# --- calendar fails closed when visibility cannot be answered (issue #1000) ---
+
+CALENDAR_UNAVAILABLE_DETAIL = (
+    "Could not verify device visibility; reservations were not returned. Retry the request."
+)
+
+
+def _visible_devices_client(*, response=None, exc=None):
+    """A stand-in httpx.AsyncClient for the router's visible-devices call."""
+    mock_client = AsyncMock()
+    if exc is not None:
+        mock_client.get.side_effect = exc
+    else:
+        mock_client.get.return_value = response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    return mock_client
+
+
+def _resp(status_code, body=None, json_exc=None):
+    r = MagicMock()
+    r.status_code = status_code
+    if json_exc is not None:
+        r.json.side_effect = json_exc
+    else:
+        r.json.return_value = body
+    return r
+
+
+_CALENDAR_LOOKUP_FAILURES = {
+    "transport_error": dict(exc=httpx.ConnectError("inventory down")),
+    "non_200": dict(response=_resp(500, {"detail": "boom"})),
+    "forbidden": dict(response=_resp(401, {"detail": "nope"})),
+    "non_json_body": dict(response=_resp(200, json_exc=ValueError("not json"))),
+    "body_not_an_object": dict(response=_resp(200, ["a"])),
+    "device_ids_missing": dict(response=_resp(200, {})),
+    "device_ids_not_a_list": dict(response=_resp(200, {"device_ids": "x"})),
+    "device_ids_not_strings": dict(response=_resp(200, {"device_ids": [1, 2]})),
+}
+
+
+def _calendar_params():
+    return {
+        "range_start": (NOW - timedelta(hours=1)).isoformat(),
+        "range_end": (NOW + timedelta(hours=10)).isoformat(),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", sorted(_CALENDAR_LOOKUP_FAILURES))
+async def test_calendar_non_admin_fails_closed_when_visibility_is_unanswerable(
+    admin_client, failure
+):
+    resp = await _create_test_reservation(admin_client, device_ids=[DEVICE_A])
+    assert resp.status_code == 201
+
+    non_admin_payload = {"sub": USER_ID, "username": "testuser", "role": "user"}
+    app.dependency_overrides[get_current_user_payload] = lambda: non_admin_payload
+    mock_client = _visible_devices_client(**_CALENDAR_LOOKUP_FAILURES[failure])
+    with patch("app.routers.reservations.httpx.AsyncClient", return_value=mock_client):
+        cal = await admin_client.get("/calendar", params=_calendar_params())
+    assert cal.status_code == 503
+    assert cal.json() == {"detail": CALENDAR_UNAVAILABLE_DETAIL}
+    mock_client.get.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", sorted(_CALENDAR_LOOKUP_FAILURES))
+async def test_calendar_admin_is_unfiltered_and_never_asks_for_visibility(admin_client, failure):
+    resp = await _create_test_reservation(admin_client, device_ids=[DEVICE_A])
+    assert resp.status_code == 201
+    mock_client = _visible_devices_client(**_CALENDAR_LOOKUP_FAILURES[failure])
+    with patch("app.routers.reservations.httpx.AsyncClient", return_value=mock_client):
+        cal = await admin_client.get("/calendar", params=_calendar_params())
+    assert cal.status_code == 200
+    assert [r["id"] for r in cal.json()] == [resp.json()["id"]]
+    mock_client.get.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_calendar_non_admin_with_a_real_answer_is_filtered(admin_client):
+    resp = await _create_test_reservation(admin_client, device_ids=[DEVICE_A])
+    assert resp.status_code == 201
+    non_admin_payload = {"sub": USER_ID, "username": "testuser", "role": "user"}
+    app.dependency_overrides[get_current_user_payload] = lambda: non_admin_payload
+    for visible, expected in (([DEVICE_A], 1), ([], 0)):
+        mock_client = _visible_devices_client(response=_resp(200, {"device_ids": visible}))
+        with patch("app.routers.reservations.httpx.AsyncClient", return_value=mock_client):
+            cal = await admin_client.get("/calendar", params=_calendar_params())
+        assert cal.status_code == 200
+        assert len(cal.json()) == expected
+
+
+@pytest.mark.asyncio
+async def test_create_visibility_precheck_still_skips_on_a_misshapen_answer(non_admin_client):
+    """Create keeps the lenient pre-check: the batch device fetch fails closed instead."""
+    mock_client = _visible_devices_client(response=_resp(200, {"device_ids": "x"}))
+    with patch("app.routers.reservations.httpx.AsyncClient", return_value=mock_client):
+        resp = await _create_test_reservation(non_admin_client, device_ids=[DEVICE_A])
+    assert resp.status_code == 201
+
+
+# --- PATCH applies the maximum duration (issue #995) ---
+
+
+@pytest.mark.asyncio
+async def test_update_reservation_over_max_duration_returns_400(client):
+    resp = await _create_test_reservation(client, device_ids=[DEVICE_A])
+    assert resp.status_code == 201
+    body = resp.json()
+    start = datetime.fromisoformat(body["start_time"])
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    cap = 7200
+    with patch("app.config.settings.reservation_max_duration_seconds", cap):
+        over = await client.patch(
+            f"/{body['id']}",
+            json={"end_time": (start + timedelta(seconds=cap + 1)).isoformat()},
+        )
+        at = await client.patch(
+            f"/{body['id']}",
+            json={"end_time": (start + timedelta(seconds=cap)).isoformat()},
+        )
+    assert over.status_code == 400
+    assert over.json() == {"detail": f"reservation duration exceeds the maximum of {cap}s"}
+    assert at.status_code == 200

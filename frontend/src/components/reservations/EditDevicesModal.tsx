@@ -3,6 +3,7 @@ import { Modal } from "@/components/ui/Modal";
 import { useUpdateReservation } from "@/api/reservations";
 import { usePaginatedDevices, useAllDeviceNames } from "@/api/inventory";
 import toast from "react-hot-toast";
+import { errorDetail } from "@/lib/errors";
 import type { Reservation } from "@/types/reservation.types";
 
 interface Props {
@@ -20,11 +21,15 @@ export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Prop
   const update = useUpdateReservation();
   const { data: deviceNames } = useAllDeviceNames();
 
-  // Fetch available devices matching the reservation's topology type
+  // Candidates match the reservation's topology type. Only an ACTIVE row holds its
+  // devices, so only there must an added device be AVAILABLE now. A PENDING row
+  // holds nothing until its window starts, so, like a new booking for a future
+  // window, the server's window conflict check decides and the list is not
+  // filtered by current status (issue #999).
   const { data: availableData, isLoading } = usePaginatedDevices(
     {
       topology_type: reservation.topology_type,
-      status: "AVAILABLE",
+      status: reservation.status === "PENDING" ? undefined : "AVAILABLE",
       dut_only: true,
       search: search || undefined,
     },
@@ -69,8 +74,7 @@ export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Prop
       onUpdated();
       onClose();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Failed to update devices";
-      toast.error(msg);
+      toast.error(errorDetail(err, "Failed to update devices"));
     }
   };
 

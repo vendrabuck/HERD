@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useCalendarReservations } from "@/api/reservations";
 import { useAllDevices } from "@/api/inventory";
+import { errorDetail } from "@/lib/errors";
 import { ReservationDetailModal } from "@/components/reservations/ReservationDetailModal";
 import { getDayRange, getWeekRange, getMonthRange } from "@/utils/dateUtils";
 import type { Reservation, ReservationStatus } from "@/types/reservation.types";
@@ -87,7 +88,12 @@ export function ReservationCalendarPage() {
   const rangeStartIso = start.toISOString();
   const rangeEndIso = end.toISOString();
 
-  const { data: reservations, isLoading } = useCalendarReservations({
+  const {
+    data: reservations,
+    isLoading,
+    isError,
+    error,
+  } = useCalendarReservations({
     range_start: rangeStartIso,
     range_end: rangeEndIso,
     status: statusFilter.length < ALL_STATUSES.length ? statusFilter : undefined,
@@ -213,6 +219,12 @@ export function ReservationCalendarPage() {
         <div className="bg-white rounded-lg border border-gray-200 overflow-x-auto">
           {isLoading && (
             <p className="text-sm text-gray-400 text-center py-8">Loading calendar...</p>
+          )}
+          {isError && (
+            <p role="alert" className="text-sm text-red-600 text-center py-8">
+              Could not load the calendar.{" "}
+              {errorDetail(error, "The reservations service did not answer.")}
+            </p>
           )}
           {reservations && reservations.length === 0 && !isLoading && (
             <p className="text-sm text-gray-400 text-center py-8">No reservations in this range</p>

@@ -48,6 +48,10 @@
 - Tests: new tests pin the 50-request dynamic cap (backend and frontend), owner-only `GET /{id}`, `PATCH /{id}`, and release for non-owner admins and users, and the sweep's `PENDING` claim against a concurrent cancel on a real Postgres (`test_sweep_claim_cancel_race_live_pg.py`, added to the live-Postgres gate phase) (#998).
 - Docs: corrected documentation, docstrings, and comments that the code contradicts, found while writing the specifications; ADR 0004 and ADR 0015 gain dated as-built addenda instead of rewritten decisions (#1010, #1025, #1031, #1041).
 - Docs: specifications under `docs/specs/`, one per feature area, each rule tied to the code that enforces it and the test that pins it. The first is `docs/specs/reservations.md`; `tests/unit/test_spec_references.py` fails when a specification names a path, symbol, test, link, or section that no longer exists.
+- Fixed: editing a reservation's devices obeys the inventory hold rule. The edit commits under a status guard, so a PATCH that races a cancel, release, auto-complete, or activation keeps nothing and answers 409; inventory is written only after the commit and only on an `ACTIVE` reservation, with three attempts, and removed devices are released through the holder-aware filter (#994).
+- Fixed: a PATCH can no longer stretch a reservation past `RESERVATION_MAX_DURATION_SECONDS`; the new end time is judged from the stored start by create's own check and wording (400) (#995).
+- Fixed: adding a device to a `PENDING` reservation follows create's rule for a future window: the window conflict check decides, not whether the device is `AVAILABLE` right now (#999).
+- Fixed: the reservations calendar answers 503 for a non-admin when device visibility cannot be verified, instead of showing every user's reservations; admins are unaffected (#1000).
 - Fixed: ending a reservation no longer leaks a dynamic instance whose create failed,
   timed out, or lost its process after touching the hypervisor. Teardown used to treat a
   ledger row with no `instance_ref` as "nothing was created" and mark it `DESTROYED`

@@ -1204,7 +1204,11 @@ Authorization: Bearer <any-authenticated-token>
 
 Supports query params: `range_start` (required), `range_end` (required),
 `status` (list, optional), `device_id` (optional). Non-admin users see only
-reservations for devices visible through their device group permissions.
+reservations whose devices are all visible through their device group permissions.
+When that visibility cannot be verified (inventory unreachable, a non-200, or a
+malformed answer), a non-admin's calendar fails closed: 503 with the detail
+`Could not verify device visibility; reservations were not returned. Retry the request.`
+and no rows (issue #1000). Admins are unfiltered and are never refused for this.
 
 ---
 

@@ -262,13 +262,26 @@ async def get_calendar_reservations(
     payload: dict = Depends(get_current_user_payload),
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
+    """Every user's reservations overlapping the window, filtered for a non-admin.
+
+    A non-admin sees only reservations all of whose devices are visible to them.
+    When that visibility cannot be answered (inventory unreachable, non-200, or a
+    misshapen body) the calendar FAILS CLOSED with 503 and returns nothing (issue
+    #1000, decided 2026-10-05, superseding the fail-open accepted in #131): the
+    rows carry purpose, owner name, and device ids, so an unverifiable filter must
+    never degrade into an unfiltered one. Admins are unfiltered and never trigger
+    the lookup.
+    """
     role = payload.get("role", "user")
     visible_device_ids = None
     if role not in ("admin", "superadmin"):
         user_id = uuid.UUID(payload["sub"])
-        visible = await _fetch_visible_device_ids(user_id, credentials.credentials)
-        if visible is not None:
-            visible_device_ids = visible
+        try:
+            visible_device_ids = await _fetch_visible_device_ids_strict(
+                user_id, credentials.credentials
+            )
+        except VisibleDevicesUnavailable:
+            raise HTTPException(status_code=503, detail=CALENDAR_VISIBILITY_UNAVAILABLE) from None
 
     try:
         return await list_calendar_reservations(
@@ -1194,23 +1207,24 @@ async def retry_reservation_wiring(
     return _relay_execution_response(resp)
 
 
-async def _fetch_visible_device_ids(user_id: uuid.UUID, token: str) -> set[str] | None:
-    """Fetch visible device IDs for a user from the inventory service.
+class VisibleDevicesUnavailable(Exception):
+    """Inventory's visible-devices lookup could not be answered (issue #1000)."""
+
+
+CALENDAR_VISIBILITY_UNAVAILABLE = (
+    "Could not verify device visibility; reservations were not returned. Retry the request."
+)
+
+
+async def _fetch_visible_device_ids_strict(user_id: uuid.UUID, token: str) -> set[str]:
+    """Fetch a user's visible device ids from inventory, or raise VisibleDevicesUnavailable.
 
     Forwards the caller's JWT: the inventory /device-groups/visible-devices
     endpoint is JWT-guarded (not internal-token), so the bearer token is what
     authenticates this call and lets inventory resolve the user's groups as the
-    real user. Returns None on a genuine transport error (fail-open, do not
-    restrict); a None from here means the visibility filter is skipped.
-
-    This fail-open is deliberate and intentionally differs from the 503 raised
-    when the create-reservation device-info fetch fails (see create_reservation,
-    which surfaces a hard RuntimeError -> 503). Visibility is an additive filter:
-    losing it on a transient inventory outage degrades to "show/allow more,"
-    never to a privilege escalation across a tenancy boundary, so blocking the
-    request would be a worse outcome than briefly skipping the filter. The
-    device-info fetch, by contrast, is load-bearing for correctness, so it fails
-    closed. Keep the two behaviors distinct on purpose.
+    real user. A transport error, a non-200, and a body that is not
+    `{"device_ids": [<str>, ...]}` all raise: none of them is an answer. The
+    calendar route uses this directly and fails closed (issue #1000).
     """
     try:
         async with httpx.AsyncClient() as client:
@@ -1220,10 +1234,37 @@ async def _fetch_visible_device_ids(user_id: uuid.UUID, token: str) -> set[str] 
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=10.0,
             )
-            if resp.status_code == 200:
-                data = resp.json()
-                return set(data.get("device_ids", []))
-            logger.warning("visible-devices returned %s for user %s", resp.status_code, user_id)
-    except Exception:
+    except Exception as exc:
         logger.warning("Failed to fetch visible devices for user %s", user_id)
-    return None
+        raise VisibleDevicesUnavailable("transport error") from exc
+    if resp.status_code != 200:
+        logger.warning("visible-devices returned %s for user %s", resp.status_code, user_id)
+        raise VisibleDevicesUnavailable(f"status {resp.status_code}")
+    try:
+        data = resp.json()
+    except Exception as exc:
+        logger.warning("visible-devices returned a non-JSON body for user %s", user_id)
+        raise VisibleDevicesUnavailable("unparseable body") from exc
+    ids = data.get("device_ids") if isinstance(data, dict) else None
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+        logger.warning("visible-devices returned a misshapen body for user %s", user_id)
+        raise VisibleDevicesUnavailable("misshapen body")
+    return set(ids)
+
+
+async def _fetch_visible_device_ids(user_id: uuid.UUID, token: str) -> set[str] | None:
+    """The create and PATCH visibility pre-check: like the strict fetch, None on failure.
+
+    Returns None when the lookup cannot be answered, and the router then skips
+    the 403 pre-check. That is safe on create and PATCH only because the device
+    fetch that follows goes through inventory's POST /devices/batch with the
+    caller's token, which omits every device outside a non-admin's visibility and
+    fails closed, so an invisible device is still refused as not found
+    (RES-CREATE-8, RES-PATCH-7). Nothing that RETURNS reservations may use this
+    lenient form: the calendar uses `_fetch_visible_device_ids_strict` and fails
+    closed (issue #1000).
+    """
+    try:
+        return await _fetch_visible_device_ids_strict(user_id, token)
+    except VisibleDevicesUnavailable:
+        return None

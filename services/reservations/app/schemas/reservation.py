@@ -20,6 +20,19 @@ def _as_utc(dt: datetime) -> datetime:
     return dt
 
 
+def check_max_duration(start: datetime, end: datetime) -> None:
+    """Refuse a window longer than RESERVATION_MAX_DURATION_SECONDS (0 disables the cap).
+
+    The ONE implementation of the duration cap (issue #995): create's schema
+    validator and the PATCH path in update_reservation both call it, so the two
+    cannot drift. A window of exactly the cap passes; one second more fails.
+    Naive datetimes are treated as UTC (SQLite drops tzinfo on read).
+    """
+    max_duration = settings.reservation_max_duration_seconds
+    if max_duration and (_as_utc(end) - _as_utc(start)).total_seconds() > max_duration:
+        raise ValueError(f"reservation duration exceeds the maximum of {max_duration}s")
+
+
 def _dedupe_preserve_order(values: list[uuid.UUID]) -> list[uuid.UUID]:
     """Drop duplicate device ids, keeping first-seen order.
 
@@ -105,15 +118,12 @@ class ReservationCreate(BaseModel):
         """
         now = datetime.now(timezone.utc)
         start = _as_utc(self.start_time)
-        end = _as_utc(self.end_time)
 
         grace = settings.reservation_start_grace_seconds
         if (now - start).total_seconds() > grace:
             raise ValueError(f"start_time is too far in the past (more than {grace}s before now)")
 
-        max_duration = settings.reservation_max_duration_seconds
-        if max_duration and (end - start).total_seconds() > max_duration:
-            raise ValueError(f"reservation duration exceeds the maximum of {max_duration}s")
+        check_max_duration(start, self.end_time)
         return self
 
 

@@ -149,22 +149,12 @@ async def test_patch_on_pending_provision_is_refused_with_zero_inventory_calls(s
     assert _calls(spy) == []
 
 
-async def test_patch_add_still_refuses_a_device_that_is_not_available_on_pending(spy):
-    """The AVAILABLE-only add refusal is unchanged for a PENDING row."""
-
-    async def busy(ids, token):
-        return [_device(d, status="RESERVED") for d in ids]
-
-    async with TestSessionLocal() as db:
-        res = await _insert(db, PENDING, [HELD])
-        with (
-            patch(f"{SVC}._fetch_devices", new=busy),
-            pytest.raises(ValueError, match="not available"),
-        ):
-            await update_reservation(
-                db, res.id, USER_ID, ReservationUpdate(device_ids=[HELD, OTHER]), token="t"
-            )
-    assert _calls(spy) == []
+# The old "PATCH-add on a PENDING row refuses a device not AVAILABLE now" pin is
+# gone by decision (issue #999, 2026-10-05): a PENDING row holds nothing, so the
+# add applies create's future-window rule. Its replacements live in
+# test_reservation_patch_hold.py:
+# test_pending_add_accepts_a_device_reserved_now_but_free_in_the_window and
+# test_active_add_still_refuses_a_device_that_is_not_available_now.
 
 
 # --- holder-aware release (issue #898): cancel and release share one helper ---
