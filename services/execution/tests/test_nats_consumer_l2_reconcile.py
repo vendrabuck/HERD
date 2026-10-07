@@ -325,7 +325,7 @@ async def test_reconcile_bare_data_output_stays_success():
 # --- test_assign_vlans_uses_fallback_when_fabric_lookup_fails) ---
 
 
-async def _reconcile_with_fabric(fork_wires, fabric_fetch):
+async def _reconcile_with_fabric(fork_wires, fabric_fetch, res_id=RES_ID, fork_version=1):
     from contextlib import ExitStack
 
     execute_fn, calls = _l2_recorder()
@@ -336,7 +336,7 @@ async def _reconcile_with_fabric(fork_wires, fabric_fetch):
         for p in patches:
             stack.enter_context(p)
         await handle_wiring_changed(
-            {"reservation_id": RES_ID, "fork_version": 1},
+            {"reservation_id": res_id, "fork_version": fork_version},
             _db_session_factory(),
         )
     return calls
@@ -383,21 +383,114 @@ async def test_allocation_shares_one_vlan_within_a_fabric():
     assert set(memberships.values()) == {allocations[0].id}
 
 
-async def test_allocation_falls_back_when_fabric_lookup_fails():
-    """A switch whose fabric cannot be determined still allocates, under a deterministic
-    per-switch fallback fabric id (uuid5 of the switch id), so provisioning never blocks
-    on the fabric endpoint."""
+async def test_allocation_fails_closed_when_fabric_lookup_fails():
+    """A switch whose fabric cannot be determined allocates NOTHING (issue #1003,
+    decision d). The real fetch_fabric_id runs against a cabling that answers 503:
+    the failure propagates as TransientUpstreamError so the consumer NAKs and
+    retries, no stand-in fabric is invented, no membership is recorded, and no
+    add_to_vlan or create_vlan reaches the driver."""
+    from contextlib import ExitStack
+    from unittest.mock import MagicMock
 
-    async def fabric_fetch(switch_id):
-        return None
+    from app.services.nats_consumer import TransientUpstreamError
 
-    await _reconcile_with_fabric([_wire(DUT1, "eth0", SW_L2, "0/0/1")], fabric_fetch)
+    class _Cabling503:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, params=None, headers=None, timeout=None):
+            resp = MagicMock()
+            resp.status_code = 503
+            return resp
+
+    execute_fn, calls = _l2_recorder()
+    patches = _patches(execute_fn, [_wire(DUT1, "eth0", SW_L2, "0/0/1")])[:-1] + [
+        patch("app.services.vlan_service.httpx.AsyncClient", new=lambda *a, **kw: _Cabling503())
+    ]
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        with pytest.raises(TransientUpstreamError, match="upstream 503"):
+            await handle_wiring_changed(
+                {"reservation_id": RES_ID, "fork_version": 1}, _db_session_factory()
+            )
+
+    assert [c for c in calls if c[0] in ("add_to_vlan", "create_vlan")] == []
+    async with TestSessionLocal() as s:
+        assert (await s.execute(select(VlanAssignment))).scalars().all() == []
+        assert (await s.execute(select(L2PortAssignment))).scalars().all() == []
+
+
+def _colliding_res_id(target_vlan: int, exclude: str) -> str:
+    from app.services.vlan_service import _derive_vlan_id
+
+    for i in range(1, 200000):
+        candidate = str(uuid.UUID(int=i))
+        if candidate != exclude and _derive_vlan_id(candidate) == target_vlan:
+            return candidate
+    raise AssertionError("no colliding reservation id found")
+
+
+async def test_cable_change_between_two_reservations_joins_keeps_numbers_distinct():
+    """Issue #1003 sequence 2 through the consumer: reservation 1 joins SW_L2 while
+    cabling answers fabric F1; an admin cable change then re-keys the component to F2
+    and puts SW_L2_B in it; reservation 2, whose preferred number equals
+    reservation 1's, joins SW_L2_B. The two live allocations sit in one component, so
+    their numbers must differ even though their stored fabric ids do not match."""
+    from app.services.vlan_service import _derive_vlan_id
+
+    f1, f2 = uuid.uuid4(), uuid.uuid4()
+    res2 = _colliding_res_id(_derive_vlan_id(RES_ID), RES_ID)
+
+    async def before(switch_id):
+        return f1
+
+    async def after(switch_id):
+        return f2
+
+    await _reconcile_with_fabric([_wire(DUT1, "eth0", SW_L2, "0/0/1")], before)
+    await _reconcile_with_fabric([_wire(DUT2, "eth0", SW_L2_B, "0/0/2")], after, res_id=res2)
+
+    async with TestSessionLocal() as s:
+        allocations = (await s.execute(select(VlanAssignment))).scalars().all()
+    by_res = {str(a.reservation_id): a for a in allocations}
+    assert set(by_res) == {RES_ID, res2}
+    assert by_res[RES_ID].fabric_id == f1 and by_res[res2].fabric_id == f2
+    assert by_res[RES_ID].vlan_id == _derive_vlan_id(RES_ID)
+    assert by_res[res2].vlan_id != by_res[RES_ID].vlan_id
+
+
+async def test_cable_change_keeps_one_allocation_and_scope_for_one_reservation():
+    """Issue #1003 for one reservation: after a cable change re-keys its component,
+    a later join on a newly reachable switch reuses the reservation's existing
+    allocation (one number per component), and the scope refresh maps both switches
+    onto it instead of emptying the scope against the stale stored fabric id."""
+    f1, f2 = uuid.uuid4(), uuid.uuid4()
+
+    async def before(switch_id):
+        return f1
+
+    async def after(switch_id):
+        return f2
+
+    await _reconcile_with_fabric([_wire(DUT1, "eth0", SW_L2, "0/0/1")], before)
+    await _reconcile_with_fabric(
+        [_wire(DUT1, "eth0", SW_L2, "0/0/1"), _wire(DUT2, "eth0", SW_L2_B, "0/0/2")],
+        after,
+        fork_version=2,
+    )
 
     async with TestSessionLocal() as s:
         allocations = (await s.execute(select(VlanAssignment))).scalars().all()
     assert len(allocations) == 1
-    assert allocations[0].fabric_id == uuid.uuid5(uuid.NAMESPACE_DNS, SW_L2)
-    assert (SW_L2, "0/0/1") in await _active_memberships()
+    assert allocations[0].fabric_id == f1
+    assert set(allocations[0].switch_device_ids) == {SW_L2, SW_L2_B}
+    memberships = await _active_memberships()
+    assert memberships[(SW_L2, "0/0/1")] == allocations[0].id
+    assert memberships[(SW_L2_B, "0/0/2")] == allocations[0].id
 
 
 # --- Stale-intent settlement in the full reconcile (issue #491) ---

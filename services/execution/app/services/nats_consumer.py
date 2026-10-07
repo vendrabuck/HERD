@@ -2724,19 +2724,27 @@ async def _refresh_allocation_scopes(
     reservation_id: str,
     scope: set[str],
     get_db_session,
+    resolver=None,
 ) -> list[uuid.UUID]:
     """Stamp the current transit-inclusive definition scope onto the reservation's
-    ACTIVE allocations, grouped by fabric (issue #442). Returns their ids.
+    ACTIVE allocations, grouped by connected component (issues #442, #1003). Returns
+    their ids.
 
-    switch_device_ids is REPLACED with the derived scope (per fabric), so it always
-    mirrors the latest recorded-hop walk; a switch that left the scope keeps its
+    switch_device_ids is REPLACED with the scope switches that sit in the allocation's
+    component on the CURRENT cabling graph: a scope switch belongs to an allocation
+    when its current fabric id equals the current fabric id of any of the allocation's
+    anchor switches (switch_device_ids plus defined_switch_ids) or the allocation's
+    stored fabric id. The stored id alone is never the test (issue #1003): a cable
+    change re-keys a component, and comparing against the stale id would empty the
+    scope and lose the allocation's position. A switch that left the scope keeps its
     definition (defined_switch_ids is untouched here) and is undefined at last-free,
-    the accepted bounded lingering. Uses the same uuid5 fabric fallback as
-    _resolve_add_allocations so a scope switch maps to the identical fabric id.
+    the accepted bounded lingering. A fabric lookup that cannot be answered raises
+    TransientUpstreamError (fail closed, no stand-in fabric).
     """
     from app.models.vlan_assignment import VlanAssignment
-    from app.services.vlan_service import fetch_fabric_id
+    from app.services.vlan_service import FabricResolver, allocation_anchor_switches
 
+    resolver = resolver if resolver is not None else FabricResolver()
     async with get_db_session() as db:
         rows = (
             (
@@ -2755,13 +2763,13 @@ async def _refresh_allocation_scopes(
 
         fabric_of: dict[str, uuid.UUID] = {}
         for sid in scope:
-            fid = await fetch_fabric_id(sid)
-            if fid is None:
-                fid = uuid.uuid5(uuid.NAMESPACE_DNS, sid)
-            fabric_of[sid] = fid
+            fabric_of[sid] = await resolver.fabric_of(sid)
 
         for row in rows:
-            new_scope = sorted(s for s, f in fabric_of.items() if f == row.fabric_id)
+            keys = {row.fabric_id}
+            for anchor in allocation_anchor_switches(row):
+                keys.add(await resolver.fabric_of(anchor))
+            new_scope = sorted(s for s, f in fabric_of.items() if f in keys)
             if set(new_scope) != {str(s) for s in (row.switch_device_ids or [])}:
                 row.switch_device_ids = new_scope
         await db.commit()
@@ -2772,32 +2780,34 @@ async def _resolve_add_allocations(
     reservation_id: str,
     add_switch_ports: set[tuple[str, str]],
     get_db_session,
+    resolver=None,
 ) -> dict[str, tuple[uuid.UUID, int]]:
-    """Resolve (vlan_assignment_id, vlan_id) per switch for the fabrics gaining a member.
+    """Resolve (vlan_assignment_id, vlan_id) per switch for the components gaining a member.
 
-    Groups the switches that have at least one ADD by fabric, allocates a conflict-free
-    VLAN number per fabric via the unchanged find_or_assign_vlan (idempotent: an existing
-    ACTIVE allocation for the (reservation, fabric) is returned, so a fabric with a live
-    membership keeps its number), and reads back the vlan_assignments row id. Allocation
-    happens on a fabric's FIRST built membership (ADR 0009 Decision 4): only switches with
-    an add are grouped, so a fabric with no add allocates nothing here. A NEW allocation
-    is seeded with the add switches as its switch_device_ids; the reconcile then stamps
-    the transit-inclusive definition scope over it via _refresh_allocation_scopes before
-    the define pre-pass reads it (issue #442). The retry channel resolves through here
-    with no wires in hand, so its allocations keep the add-switch seed until the next
-    fork-driven reconcile widens them.
+    Groups the switches that have at least one ADD by their CURRENT fabric id (the
+    connected-component key cabling computes on the current graph) and resolves one
+    allocation per group through find_or_assign_allocation, which reuses this
+    reservation's allocation that reaches the component and otherwise allocates a
+    number no other live allocation in reach holds (issue #1003). Allocation happens
+    on a component's FIRST built membership (ADR 0009 Decision 4): only switches with
+    an add are grouped, so a component with no add allocates nothing here. A NEW
+    allocation is seeded with the add switches as its switch_device_ids; the reconcile
+    then stamps the transit-inclusive definition scope over it via
+    _refresh_allocation_scopes before the define pre-pass reads it (issue #442). The
+    retry channel resolves through here with no wires in hand, so its allocations keep
+    the add-switch seed until the next fork-driven reconcile widens them.
+
+    Fail closed (issue #1003): a fabric lookup that cannot be answered raises
+    TransientUpstreamError, which NAKs the reconcile, leaves the retry tick's rows
+    FAILED, and answers 503 on the manual retry. Nothing is allocated.
     """
-    from app.models.vlan_assignment import VlanAssignment
-    from app.services.vlan_service import fetch_fabric_id, find_or_assign_vlan
+    from app.services.vlan_service import FabricResolver, find_or_assign_allocation
 
-    switch_ids = {sid for sid, _port in add_switch_ports}
+    resolver = resolver if resolver is not None else FabricResolver()
+    switch_ids = sorted({sid for sid, _port in add_switch_ports})
     switch_fabric: dict[str, uuid.UUID] = {}
     for sid in switch_ids:
-        fid = await fetch_fabric_id(sid)
-        if fid is None:
-            fid = uuid.uuid5(uuid.NAMESPACE_DNS, sid)
-            logger.warning("Could not determine fabric for L2 switch %s, using fallback", sid)
-        switch_fabric[sid] = fid
+        switch_fabric[sid] = await resolver.fabric_of(sid)
 
     fabric_switches: dict[uuid.UUID, list[str]] = {}
     for sid, fid in switch_fabric.items():
@@ -2806,29 +2816,11 @@ async def _resolve_add_allocations(
     fabric_alloc: dict[uuid.UUID, tuple[uuid.UUID, int]] = {}
     async with get_db_session() as db:
         for fid, sids in fabric_switches.items():
-            vlan_id = await find_or_assign_vlan(db, reservation_id, fid, sids)
-            row = (
-                await db.execute(
-                    select(VlanAssignment).where(
-                        VlanAssignment.reservation_id == uuid.UUID(reservation_id),
-                        VlanAssignment.fabric_id == fid,
-                        VlanAssignment.status == "ACTIVE",
-                    )
-                )
-            ).scalar_one_or_none()
-            if row is None:
-                # Should not happen (find_or_assign just committed an ACTIVE row), but be
-                # defensive: without the row id we cannot key a membership, so skip.
-                logger.error(
-                    "No ACTIVE vlan_assignment after find_or_assign for fabric %s "
-                    "reservation %s; skipping its adds",
-                    fid,
-                    reservation_id,
-                )
-                continue
-            fabric_alloc[fid] = (row.id, vlan_id)
+            fabric_alloc[fid] = await find_or_assign_allocation(
+                db, reservation_id, fid, sids, resolver
+            )
 
-    return {sid: fabric_alloc[fid] for sid, fid in switch_fabric.items() if fid in fabric_alloc}
+    return {sid: fabric_alloc[fid] for sid, fid in switch_fabric.items()}
 
 
 async def _vlan_ids_for(
@@ -3400,6 +3392,7 @@ async def _reconcile_l2_memberships(
         park_stale_l2_build,
         release_l2_membership,
     )
+    from app.services.vlan_service import FabricResolver
 
     intended = await _derive_l2_memberships(intended_wires, ctx)
     definition_scope = await _derive_l2_definition_scope(intended_wires, ctx)
@@ -3450,19 +3443,24 @@ async def _reconcile_l2_memberships(
             await _define_pending_for_allocations(set(alloc_ids), ctx, get_db_session)
         return
 
-    alloc_by_switch = await _resolve_add_allocations(reservation_id, add_keys, get_db_session)
+    # One memoized fabric resolver for the whole pass (issue #1003): each switch's
+    # current fabric is looked up at most once across allocation and scope refresh.
+    resolver = FabricResolver()
+    alloc_by_switch = await _resolve_add_allocations(
+        reservation_id, add_keys, get_db_session, resolver
+    )
     # Refresh AFTER resolving so allocations created for first-membership fabrics get
     # the transit-inclusive scope stamped before the define pre-pass reads it (#442).
     define_allocation_ids = set(
-        await _refresh_allocation_scopes(reservation_id, definition_scope, get_db_session)
+        await _refresh_allocation_scopes(reservation_id, definition_scope, get_db_session, resolver)
     )
 
     adds: list[dict] = []
     for switch_id, port in add_keys:
         alloc = alloc_by_switch.get(switch_id)
         if alloc is None:
-            # No allocation resolved for this switch's fabric (upstream fabric lookup or
-            # allocation failed); park the join FAILED so the retry channel revisits it.
+            # Defensive: no allocation resolved for this switch (a lookup failure raises
+            # before this point, issue #1003); park the join FAILED for the retry channel.
             async with get_db_session() as db:
                 from app.services.l2_membership_service import record_l2_failed
 

@@ -1257,7 +1257,10 @@ is the user guide.
 ### 8.15 Fabric lookup
 
 **What it does.** Execution asks which physical fabric a device is in, so a VLAN number
-can be reused in fabrics that share no cable.
+can be reused in fabrics that share no cable. Two devices are reachable from each other
+through cabling exactly when this route answers the same `fabric_id` for both on the
+same graph; execution's VLAN allocation compares current answers this way and never
+trusts a stored id alone (`provisioning-and-wiring.md`, WIRE-VLAN-2).
 
 **Surfaces.** Route `GET /fabric/internal` (section 7).
 
