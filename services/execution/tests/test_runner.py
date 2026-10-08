@@ -86,8 +86,9 @@ def test_runner_connect_ports_with_args():
     with tmpdir:
         ctx_file = Path(tmpdir.name) / "context.json"
         ctx_file.write_text(json.dumps({}))
-        kwargs_json = json.dumps({"port_a": "1/0/1", "port_b": "1/0/2"})
-        result = _run_runner([tmpdir.name, "connect_ports", str(ctx_file), kwargs_json])
+        kwargs_file = Path(tmpdir.name) / "kwargs.json"
+        kwargs_file.write_text(json.dumps({"port_a": "1/0/1", "port_b": "1/0/2"}))
+        result = _run_runner([tmpdir.name, "connect_ports", str(ctx_file), str(kwargs_file)])
     assert result.returncode == 0
     output = json.loads(result.stdout)
     assert output["connected"] == ["1/0/1", "1/0/2"]
@@ -98,8 +99,9 @@ def test_runner_disconnect_ports_with_args():
     with tmpdir:
         ctx_file = Path(tmpdir.name) / "context.json"
         ctx_file.write_text(json.dumps({}))
-        kwargs_json = json.dumps({"port_a": "a", "port_b": "b"})
-        result = _run_runner([tmpdir.name, "disconnect_ports", str(ctx_file), kwargs_json])
+        kwargs_file = Path(tmpdir.name) / "kwargs.json"
+        kwargs_file.write_text(json.dumps({"port_a": "a", "port_b": "b"}))
+        result = _run_runner([tmpdir.name, "disconnect_ports", str(ctx_file), str(kwargs_file)])
     assert result.returncode == 0
     output = json.loads(result.stdout)
     assert output["disconnected"] == ["a", "b"]
@@ -117,8 +119,9 @@ class Driver:
     with tmpdir:
         ctx_file = Path(tmpdir.name) / "context.json"
         ctx_file.write_text(json.dumps({}))
-        kwargs_json = json.dumps({"port": "eth6", "vlan_id": 200, "tag": "tagged"})
-        result = _run_runner([tmpdir.name, "add_to_vlan", str(ctx_file), kwargs_json])
+        kwargs_file = Path(tmpdir.name) / "kwargs.json"
+        kwargs_file.write_text(json.dumps({"port": "eth6", "vlan_id": 200, "tag": "tagged"}))
+        result = _run_runner([tmpdir.name, "add_to_vlan", str(ctx_file), str(kwargs_file)])
     assert result.returncode == 0
     output = json.loads(result.stdout)
     assert output["port"] == "eth6"
@@ -198,13 +201,14 @@ def test_runner_main_connect_ports():
     with tmpdir:
         ctx_file = Path(tmpdir.name) / "context.json"
         ctx_file.write_text(json.dumps({}))
-        kwargs_json = json.dumps({"port_a": "0/1/1", "port_b": "0/1/2"})
+        kwargs_file = Path(tmpdir.name) / "kwargs.json"
+        kwargs_file.write_text(json.dumps({"port_a": "0/1/1", "port_b": "0/1/2"}))
         sys.argv = [
             "_runner.py",
             tmpdir.name,
             "connect_ports",
             str(ctx_file),
-            kwargs_json,
+            str(kwargs_file),
         ]
         import io
 
@@ -256,8 +260,9 @@ class Driver:
     with tmpdir:
         ctx_file = Path(tmpdir.name) / "context.json"
         ctx_file.write_text(json.dumps({}))
-        kwargs_json = json.dumps({"port": "eth1", "vlan_id": 100, "tag": "tagged"})
-        sys.argv = ["_runner.py", tmpdir.name, "add_to_vlan", str(ctx_file), kwargs_json]
+        kwargs_file = Path(tmpdir.name) / "kwargs.json"
+        kwargs_file.write_text(json.dumps({"port": "eth1", "vlan_id": 100, "tag": "tagged"}))
+        sys.argv = ["_runner.py", tmpdir.name, "add_to_vlan", str(ctx_file), str(kwargs_file)]
         import io
 
         captured = io.StringIO()

@@ -8,6 +8,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from herd_common.acl import user_has_grant
 from herd_common.auth import make_auth_dependencies
+from herd_common.config_redaction import redact_config
 from herd_common.internal_auth import internal_token_matches
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -358,6 +359,7 @@ async def manual_execute(
         port_b=body.port_b,
         method_kwargs=body.method_kwargs,
         dry_run=body.dry_run,
+        config_version_id=body.config_version_id,
     )
     return run
 
@@ -401,7 +403,74 @@ async def internal_execute(
         port_b=body.port_b,
         method_kwargs=body.method_kwargs,
         dry_run=body.dry_run,
+        config_version_id=body.config_version_id,
     )
+
+
+# Pinned: tests match on these exact strings (CFG-RUN-7).
+RETRY_NO_CONFIG_SOURCE_DETAIL = (
+    "This run stores its configuration masked and names no config version to read it "
+    "back from, so it cannot be retried; start a new run instead"
+)
+RETRY_CONFIG_NOT_RECOVERED_DETAIL = (
+    "The configuration this run pushed could not be read back from its config version, "
+    "so it cannot be retried; start a new run instead"
+)
+RETRY_CONFIG_UNAVAILABLE_DETAIL = (
+    "Could not read the run's config version; nothing was retried. Retry the request."
+)
+
+
+async def _recover_masked_kwargs(run: ExecutionRun, authorization: str | None) -> dict:
+    """Read back the full arguments of a run whose stored copy is masked.
+
+    The run's `config_version_id` names where the configuration lives; it is read
+    from inventory's config-version detail route with the retrying admin's own
+    token, under the run's device, so a version of another device is not found.
+    The version's configuration is accepted only when masking it gives exactly the
+    stored copy, so a version that does not match what the run pushed is never
+    retried in its place. No reference, an unknown version, or a mismatch is 409;
+    an answer that cannot be read (transport error, a non-200 other than 404, a
+    body without a JSON object `config`) is 503.
+    """
+    raw_version_id = (run.input_params or {}).get("config_version_id")
+    try:
+        version_id = uuid.UUID(str(raw_version_id)) if raw_version_id else None
+    except ValueError:
+        version_id = None
+    if version_id is None:
+        raise HTTPException(status_code=409, detail=RETRY_NO_CONFIG_SOURCE_DETAIL)
+    if not authorization:
+        raise HTTPException(status_code=503, detail=RETRY_CONFIG_UNAVAILABLE_DETAIL)
+    url = (
+        f"{settings.inventory_service_url.rstrip('/')}/devices/{run.device_id}"
+        f"/config-versions/{version_id}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, headers={"Authorization": authorization})
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "Config version read for retry of run %s failed (%s)", run.id, type(exc).__name__
+        )
+        raise HTTPException(status_code=503, detail=RETRY_CONFIG_UNAVAILABLE_DETAIL) from None
+    if resp.status_code == 404:
+        raise HTTPException(status_code=409, detail=RETRY_CONFIG_NOT_RECOVERED_DETAIL)
+    if resp.status_code != 200:
+        logger.warning(
+            "Config version read for retry of run %s answered %s", run.id, resp.status_code
+        )
+        raise HTTPException(status_code=503, detail=RETRY_CONFIG_UNAVAILABLE_DETAIL)
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    config = body.get("config") if isinstance(body, dict) else None
+    if not isinstance(config, dict):
+        raise HTTPException(status_code=503, detail=RETRY_CONFIG_UNAVAILABLE_DETAIL)
+    if redact_config(config)[0] != (run.input_params or {}).get("method_kwargs"):
+        raise HTTPException(status_code=409, detail=RETRY_CONFIG_NOT_RECOVERED_DETAIL)
+    return config
 
 
 @router.post("/runs/{run_id}/retry", response_model=ExecutionRunResponse)
@@ -409,18 +478,20 @@ async def retry_run(
     run_id: uuid.UUID,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(None),
 ):
     """Retry a failed execution run. Admin only."""
     original = await get_execution_run(db, run_id)
     if not original:
-        raise HTTPException(status_code=404, detail="Execution run not found")
+        raise HTTPException(status_code=404, detail=RUN_NOT_FOUND_DETAIL)
     if original.status not in ("FAILED", "TIMEOUT"):
         raise HTTPException(status_code=400, detail="Only failed or timed-out runs can be retried")
+    input_params = original.input_params or {}
     # A retry repeats what the original run was, dry run included (issue #1091):
     # retrying a failed dry run for real would push a configuration nobody asked
     # to apply. A row without the record predates it, so its mode is unknown and
     # the retry is refused rather than guessed (fail closed).
-    recorded_dry_run = (original.input_params or {}).get("dry_run")
+    recorded_dry_run = input_params.get("dry_run")
     if not isinstance(recorded_dry_run, bool):
         raise HTTPException(
             status_code=409,
@@ -430,11 +501,21 @@ async def retry_run(
             ),
         )
 
+    # Recover method_kwargs. A row whose stored copy is masked is read back from
+    # its config version (CFG-RUN-7); any other row stored its arguments as sent
+    # (nothing needed masking, or the row predates masking).
+    if input_params.get("method_kwargs_redacted") is True:
+        original_kwargs = await _recover_masked_kwargs(original, authorization)
+    else:
+        original_kwargs = input_params.get("method_kwargs")
+    raw_version_id = input_params.get("config_version_id")
+    try:
+        config_version_id = uuid.UUID(str(raw_version_id)) if raw_version_id else None
+    except ValueError:
+        config_version_id = None
+
     device_data = await fetch_device(original.device_id)
     template_data = await fetch_template(device_data["template_id"])
-
-    # Recover method_kwargs from the original run's input_params
-    original_kwargs = (original.input_params or {}).get("method_kwargs")
 
     run = await run_driver_action(
         db,
@@ -447,6 +528,7 @@ async def retry_run(
         port_b=original.port_b,
         method_kwargs=original_kwargs,
         dry_run=recorded_dry_run,
+        config_version_id=config_version_id,
     )
     return run
 

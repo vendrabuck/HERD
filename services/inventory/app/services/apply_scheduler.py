@@ -159,6 +159,9 @@ async def _post_internal_execute(
         # reservation owner can read its transcript and find it in the
         # reservation's run list; null for a job tied to no reservation.
         "reservation_id": str(job.reservation_id) if job.reservation_id else None,
+        # The version the configuration came from: execution stores the run's
+        # arguments masked and reads them back from this version on a retry.
+        "config_version_id": str(job.version_id),
     }
     try:
         resp = await client.post(url, json=body, headers=headers, timeout=30.0)

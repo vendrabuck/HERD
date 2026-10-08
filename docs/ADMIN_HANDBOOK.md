@@ -223,7 +223,7 @@ The execution service runs driver code on infrastructure at reservation lifecycl
 
 - **View execution runs** at `/api/execution/runs` (paginated). Each run records the driver, action, status (`SUCCESS`, `FAILED`, `TIMEOUT`), output, error, duration, and input params.
 - **Manually execute** a driver method: `POST /api/execution/execute` with device id, action, user id, reservation id, and method_kwargs.
-- **Retry a failed run**: `POST /api/execution/runs/{id}/retry`. Only runs with status `FAILED` or `TIMEOUT` can be retried; successful runs are immutable. A retried dry run stays a dry run (the run records `dry_run` in its `input_params`); a run created before that record existed cannot be retried (409).
+- **Retry a failed run**: `POST /api/execution/runs/{id}/retry`. Only runs with status `FAILED` or `TIMEOUT` can be retried; successful runs are immutable. A retried dry run stays a dry run (the run records `dry_run` in its `input_params`); a run created before that record existed cannot be retried (409). A run stores its arguments masked; when masking changed them, the retry reads the configuration back from the config version the run names (inventory's apply paths always name one) and refuses with 409 when there is none or it no longer matches.
 
 Execution is mostly event-driven via NATS: reservation lifecycle events trigger L1 port connect/disconnect and L2 VLAN provision/deprovision automatically. Manual `/execute` is for AI commits with configs and for ad-hoc admin actions.
 

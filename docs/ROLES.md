@@ -1406,7 +1406,7 @@ POST /api/execution/runs/{run_id}/retry
 Authorization: Bearer <admin-token>
 ```
 
-Only runs with status FAILED or TIMEOUT can be retried. A retry repeats the original run's mode: a dry run is retried as a dry run. A run that does not record whether it was a dry run (one created before that record existed) is refused with 409.
+Only runs with status FAILED or TIMEOUT can be retried. A retry repeats the original run's mode: a dry run is retried as a dry run. A run that does not record whether it was a dry run (one created before that record existed) is refused with 409. A run stores its keyword arguments masked; when masking changed them, the retry reads the configuration back from the run's config version with the admin's token and refuses with 409 when the run names none or the version no longer matches (503 when inventory cannot answer).
 
 ### Trigger device status check (internal)
 
