@@ -1,6 +1,7 @@
 import toast from "react-hot-toast";
 import { useApplyJobs, useCancelApplyJob } from "@/api/deviceConfigJobs";
 import type { ApplyJob } from "@/api/deviceConfigJobs";
+import { errorDetail } from "@/lib/errors";
 
 const STATUS_COLORS: Record<string, string> = {
   pending: "text-yellow-700",
@@ -25,8 +26,7 @@ export function ApplyJobsPanel({ deviceId }: { deviceId: string }) {
       await cancelJob.mutateAsync(job.id);
       toast.success("Cancelled");
     } catch (err: unknown) {
-      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      toast.error(detail ?? "Cancel failed");
+      toast.error(errorDetail(err, "Cancel failed"));
     }
   };
 

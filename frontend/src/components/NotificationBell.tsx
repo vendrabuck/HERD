@@ -29,7 +29,7 @@ export function NotificationBell() {
   const [open, setOpen] = useState(false);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const { data: unreadCount = 0 } = useUnreadCount(isAuthenticated);
-  const { data: list, refetch: refetchList } = useNotifications({ limit: 20 });
+  const { data: list, refetch: refetchList } = useNotifications({ limit: 20 }, isAuthenticated);
   const markRead = useMarkNotificationRead();
   const markAll = useMarkAllNotificationsRead();
   const del = useDeleteNotification();
@@ -55,8 +55,7 @@ export function NotificationBell() {
     }
   };
 
-  const handleDelete = (e: React.MouseEvent, id: string) => {
-    e.stopPropagation();
+  const handleDelete = (id: string) => {
     del.mutate(id);
   };
 
@@ -113,34 +112,40 @@ export function NotificationBell() {
                 No notifications yet.
               </div>
             ) : (
-              list.items.map((n) => (
-                <button
-                  type="button"
-                  key={n.id}
-                  onClick={() => handleItemClick(n)}
-                  className={`w-full text-left px-4 py-3 border-b border-gray-100 hover:bg-gray-50 transition-colors ${
-                    n.read_at ? "bg-white" : "bg-blue-50"
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium text-gray-900">{n.title}</div>
-                      <div className="text-xs text-gray-600 mt-0.5">{n.body}</div>
-                      <div className="text-[11px] text-gray-400 mt-1">
+              // Each row holds two sibling buttons, never one inside the other
+              // (issue #1076): the notification itself (marks it read) and its
+              // Delete, so both are separate keyboard stops with their own names.
+              <ul>
+                {list.items.map((n) => (
+                  <li
+                    key={n.id}
+                    className={`flex items-start gap-3 px-4 py-3 border-b border-gray-100 hover:bg-gray-50 transition-colors ${
+                      n.read_at ? "bg-white" : "bg-blue-50"
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => handleItemClick(n)}
+                      className="flex-1 min-w-0 text-left"
+                    >
+                      {/* Spans, not divs: a button holds phrasing content only. */}
+                      <span className="block text-sm font-medium text-gray-900">{n.title}</span>
+                      <span className="block text-xs text-gray-600 mt-0.5">{n.body}</span>
+                      <span className="block text-[11px] text-gray-400 mt-1">
                         {formatRelative(n.created_at)}
-                      </div>
-                    </div>
+                      </span>
+                    </button>
                     <button
                       type="button"
                       aria-label="Delete notification"
-                      onClick={(e) => handleDelete(e, n.id)}
+                      onClick={() => handleDelete(n.id)}
                       className="text-gray-400 hover:text-red-500 text-sm"
                     >
                       x
                     </button>
-                  </div>
-                </button>
-              ))
+                  </li>
+                ))}
+              </ul>
             )}
           </div>
         </div>

@@ -11,6 +11,7 @@ import {
   useApplyDeviceConfigVersion,
 } from "@/api/deviceConfig";
 import { useScheduleApplyJob } from "@/api/deviceConfigJobs";
+import { configApplyErrorText, configRestoreErrorText, errorDetail } from "@/lib/errors";
 import type { DeviceConfigVersion } from "@/api/deviceConfig";
 import { ApplyJobsPanel } from "./ApplyJobsPanel";
 
@@ -69,8 +70,7 @@ export function DeviceConfigSection({ deviceId }: Props) {
       setCreateDescription("");
       toast.success("Config version created");
     } catch (err: unknown) {
-      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setCreateError(detail ?? (err instanceof Error ? err.message : "Failed"));
+      setCreateError(errorDetail(err, err instanceof Error ? err.message : "Failed"));
     }
   };
 
@@ -210,8 +210,8 @@ export function DeviceConfigSection({ deviceId }: Props) {
           try {
             await restoreVersion.mutateAsync({ versionId: restoreVersionId, body: {} });
             toast.success("Restored as a new version");
-          } catch {
-            toast.error("Restore failed");
+          } catch (err: unknown) {
+            toast.error(configRestoreErrorText(err));
           } finally {
             setRestoreVersionId(null);
           }
@@ -276,9 +276,7 @@ export function DeviceConfigSection({ deviceId }: Props) {
                   });
                   toast.success("Scheduled");
                 } catch (err: unknown) {
-                  const detail = (err as { response?: { data?: { detail?: string } } })?.response
-                    ?.data?.detail;
-                  toast.error(detail ?? "Schedule failed");
+                  toast.error(configApplyErrorText(err, "Schedule failed"));
                   return;
                 }
               } else {
@@ -289,8 +287,8 @@ export function DeviceConfigSection({ deviceId }: Props) {
                   } else {
                     toast.success(`Applied (run ${result.run_id?.slice(0, 8) ?? "n/a"})`);
                   }
-                } catch {
-                  toast.error("Apply request failed");
+                } catch (err: unknown) {
+                  toast.error(configApplyErrorText(err, "Apply request failed"));
                   return;
                 }
               }

@@ -1,5 +1,10 @@
 import {
+  configApplyErrorText,
+  configRestoreErrorText,
   deletePortErrorText,
+  driverCannotConfigureDetail,
+  formatRestoreBlocked,
+  restoreBlockedDetail,
   formatMixedTypesDetail,
   formatTopologyInUse,
   formatUnconnectableDetail,
@@ -210,5 +215,121 @@ describe("deletePortErrorText (issue #1023)", () => {
       "Failed to delete port",
     );
     expect(deletePortErrorText(new Error("network"))).toBe("Failed to delete port");
+  });
+});
+
+const GATE_MESSAGE =
+  "This device's driver implements the Layer 3 Switch contract, which has no configure " +
+  "method, so a config apply cannot run. Config versions on this device store intent only.";
+
+describe("configApplyErrorText (issue #1098)", () => {
+  it("shows the driver gate's sentence and the driver's name for the structured 409", () => {
+    const err = axiosLike(409, {
+      error: "driver_cannot_configure",
+      connection_type: "Layer 3 Switch",
+      driver: "frr_l3",
+      message: GATE_MESSAGE,
+    });
+    expect(driverCannotConfigureDetail(err)).not.toBeNull();
+    expect(configApplyErrorText(err, "Apply request failed")).toBe(
+      GATE_MESSAGE + " (driver: frr_l3)",
+    );
+  });
+
+  it("builds a sentence from the connection type when the message is missing", () => {
+    expect(
+      configApplyErrorText(
+        axiosLike(409, { error: "driver_cannot_configure", connection_type: "Layer 2 Switch" }),
+        "Apply request failed",
+      ),
+    ).toBe(
+      "This device's driver implements the Layer 2 Switch contract, which has no configure " +
+        "method, so a config apply cannot run.",
+    );
+    expect(
+      configApplyErrorText(axiosLike(409, { error: "driver_cannot_configure" }), "x"),
+    ).toBe("This device's driver has no configure method, so a config apply cannot run.");
+  });
+
+  it("passes a plain-string detail through (403, 422, the fail-closed 503)", () => {
+    const forbidden =
+      "manage grant required on this device for an immediate apply " +
+      "(a reservation owner can schedule the apply instead)";
+    expect(configApplyErrorText(axiosLike(403, forbidden), "Apply request failed")).toBe(
+      forbidden,
+    );
+    expect(
+      configApplyErrorText(axiosLike(503, "reservations service unreachable"), "Schedule failed"),
+    ).toBe("reservations service unreachable");
+  });
+
+  it("falls back for any other shape, never returning an object", () => {
+    expect(configApplyErrorText(axiosLike(409, { error: "other" }), "Schedule failed")).toBe(
+      "Schedule failed",
+    );
+    expect(
+      configApplyErrorText(axiosLike(500, { error: "driver_cannot_configure" }), "Apply failed"),
+    ).toBe("Apply failed");
+    expect(configApplyErrorText(axiosLike(422, [{ msg: "bad" }]), "Schedule failed")).toBe(
+      "Schedule failed",
+    );
+    expect(configApplyErrorText(new Error("network"), "Apply request failed")).toBe(
+      "Apply request failed",
+    );
+  });
+});
+
+describe("configRestoreErrorText (issue #1098)", () => {
+  const RES = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      id: `${i}${i}${i}${i}aaaa-0000-0000-0000-000000000000`,
+      status: "ACTIVE",
+      end_time: "2026-10-09T00:00:00Z",
+    }));
+
+  it("lists the blocking reservations by short id and status", () => {
+    const err = axiosLike(409, {
+      message: "Device has active reservations; restore blocked",
+      reservations: RES(2),
+    });
+    expect(restoreBlockedDetail(err)).not.toBeNull();
+    expect(configRestoreErrorText(err)).toBe(
+      "Device has active reservations; restore blocked: 0000aaaa (ACTIVE), 1111aaaa (ACTIVE)",
+    );
+  });
+
+  it("shows at most three ids, then the count of the rest", () => {
+    expect(
+      formatRestoreBlocked({
+        message: "Device has active reservations; restore blocked",
+        reservations: RES(5),
+      }),
+    ).toBe(
+      "Device has active reservations; restore blocked: 0000aaaa (ACTIVE), 1111aaaa (ACTIVE), " +
+        "2222aaaa (ACTIVE) and 2 more",
+    );
+  });
+
+  it("keeps the sentence when the message or the ids are missing", () => {
+    expect(formatRestoreBlocked({ reservations: [] })).toBe(
+      "Device has active reservations; restore blocked",
+    );
+    expect(formatRestoreBlocked({ reservations: [{ id: "abcdef0123", status: null }] })).toBe(
+      "Device has active reservations; restore blocked: abcdef01",
+    );
+  });
+
+  it("passes a plain-string detail through (403, 422, the fail-closed 503)", () => {
+    const unreachable = "reservations service unreachable while checking active reservations";
+    expect(configRestoreErrorText(axiosLike(503, unreachable))).toBe(unreachable);
+    expect(configRestoreErrorText(axiosLike(403, "manage permission required"))).toBe(
+      "manage permission required",
+    );
+  });
+
+  it("falls back for any other shape, never returning an object", () => {
+    expect(configRestoreErrorText(axiosLike(409, { message: "x" }))).toBe("Restore failed");
+    expect(configRestoreErrorText(axiosLike(503, { reservations: [] }))).toBe("Restore failed");
+    expect(configRestoreErrorText(new Error("network"))).toBe("Restore failed");
   });
 });

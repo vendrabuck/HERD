@@ -180,4 +180,248 @@ describe("DeviceConfigSection", () => {
     await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Config version created"));
     expect(receivedBody).toEqual({ config: { vlan: 100 }, description: "first cut" });
   });
+
+  it("shows a create refusal's string detail and never renders a validation list", async () => {
+    let calls = 0;
+    server.use(
+      http.get(VERSIONS_URL, () => HttpResponse.json({ items: [], total: 0, skip: 0, limit: 50 })),
+      http.post(VERSIONS_URL, () => {
+        calls += 1;
+        return calls === 1
+          ? HttpResponse.json({ detail: "config does not match the schema" }, { status: 422 })
+          : HttpResponse.json(
+              { detail: [{ loc: ["body", "config"], msg: "bad", type: "dict_type" }] },
+              { status: 422 },
+            );
+      }),
+    );
+
+    const user = userEvent.setup();
+    renderWithProviders(<DeviceConfigSection deviceId={DEVICE_ID} />);
+    await screen.findByText("No config versions yet.");
+    await user.click(screen.getByRole("button", { name: "New version" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByText("config does not match the schema")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    expect(
+      await screen.findByText("Request failed with status code 422"),
+    ).toBeInTheDocument();
+  });
+
+  describe("Apply dialog and Restore refusals (issue #1098)", () => {
+    const VERSION_URL = `${VERSIONS_URL}/ver-1`;
+    const GATE_MESSAGE =
+      "This device's driver implements the Layer 3 Switch contract, which has no configure " +
+      "method, so a config apply cannot run. Config versions on this device store intent only.";
+    const GATE_DETAIL = {
+      error: "driver_cannot_configure",
+      connection_type: "Layer 3 Switch",
+      driver: "frr_l3",
+      message: GATE_MESSAGE,
+    };
+    const FORBIDDEN =
+      "manage grant required on this device for an immediate apply " +
+      "(a reservation owner can schedule the apply instead)";
+
+    function oneVersion() {
+      server.use(
+        http.get(VERSIONS_URL, () =>
+          HttpResponse.json({ items: [makeVersion()], total: 1, skip: 0, limit: 50 }),
+        ),
+      );
+    }
+
+    async function openApplyDialog() {
+      const user = userEvent.setup();
+      renderWithProviders(<DeviceConfigSection deviceId={DEVICE_ID} />);
+      await screen.findByText("v1");
+      await user.click(screen.getByRole("button", { name: "Apply" }));
+      // Every Modal titles itself through id="modal-title", so the section's
+      // several modals share one id; find the dialog through its heading.
+      const heading = await screen.findByRole("heading", { name: "Apply config to device" });
+      const dialog = heading.closest("dialog") as HTMLElement;
+      return { user, dialog };
+    }
+
+    async function confirmRestore() {
+      const user = userEvent.setup();
+      renderWithProviders(<DeviceConfigSection deviceId={DEVICE_ID} />);
+      await screen.findByText("v1");
+      const row = screen.getByText("v1").closest("tr") as HTMLElement;
+      await user.click(within(row).getByRole("button", { name: "Restore" }));
+      const heading = await screen.findByRole("heading", { name: "Restore this version?" });
+      const dialog = heading.closest("dialog") as HTMLElement;
+      await user.click(within(dialog).getByRole("button", { name: "Restore" }));
+    }
+
+    it("applies now and shows the run id on success", async () => {
+      oneVersion();
+      let applied = false;
+      server.use(
+        http.post(`${VERSION_URL}/apply`, () => {
+          applied = true;
+          return HttpResponse.json({
+            version_id: "ver-1",
+            run_id: "run-12345678-abcd",
+            status: "success",
+            error: null,
+          });
+        }),
+      );
+      const { user, dialog } = await openApplyDialog();
+      await user.click(within(dialog).getByRole("button", { name: "Apply now" }));
+      await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Applied (run run-1234)"));
+      expect(applied).toBe(true);
+      expect(toastError).not.toHaveBeenCalled();
+    });
+
+    it("shows the stored error for a failed apply answer", async () => {
+      oneVersion();
+      server.use(
+        http.post(`${VERSION_URL}/apply`, () =>
+          HttpResponse.json({
+            version_id: "ver-1",
+            run_id: null,
+            status: "failed",
+            error: "execution service unreachable (ConnectError)",
+          }),
+        ),
+      );
+      const { user, dialog } = await openApplyDialog();
+      await user.click(within(dialog).getByRole("button", { name: "Apply now" }));
+      await waitFor(() =>
+        expect(toastError).toHaveBeenCalledWith(
+          "Apply failed: execution service unreachable (ConnectError)",
+        ),
+      );
+    });
+
+    it("shows the driver gate's sentence when Apply now is refused with 409", async () => {
+      oneVersion();
+      server.use(
+        http.post(`${VERSION_URL}/apply`, () =>
+          HttpResponse.json({ detail: GATE_DETAIL }, { status: 409 }),
+        ),
+      );
+      const { user, dialog } = await openApplyDialog();
+      await user.click(within(dialog).getByRole("button", { name: "Apply now" }));
+      await waitFor(() =>
+        expect(toastError).toHaveBeenCalledWith(GATE_MESSAGE + " (driver: frr_l3)"),
+      );
+      // A refusal keeps the dialog open so the user can schedule or cancel.
+      const heading = screen.getByRole("heading", { name: "Apply config to device" });
+      expect((heading.closest("dialog") as HTMLDialogElement).open).toBe(true);
+    });
+
+    it("shows the server's sentence when Apply now is refused with 403", async () => {
+      oneVersion();
+      server.use(
+        http.post(`${VERSION_URL}/apply`, () =>
+          HttpResponse.json({ detail: FORBIDDEN }, { status: 403 }),
+        ),
+      );
+      const { user, dialog } = await openApplyDialog();
+      await user.click(within(dialog).getByRole("button", { name: "Apply now" }));
+      await waitFor(() => expect(toastError).toHaveBeenCalledWith(FORBIDDEN));
+    });
+
+    it("schedules at the chosen time and sends it as ISO", async () => {
+      oneVersion();
+      let body: { scheduled_for?: string } | undefined;
+      server.use(
+        http.post(`${VERSION_URL}/schedule`, async ({ request }) => {
+          body = (await request.json()) as typeof body;
+          return HttpResponse.json({ id: "job-1" });
+        }),
+      );
+      const { user, dialog } = await openApplyDialog();
+      await user.type(within(dialog).getByLabelText("Schedule for (optional)"), "2030-01-02T03:04");
+      await user.click(within(dialog).getByRole("button", { name: "Schedule" }));
+      await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Scheduled"));
+      expect(body?.scheduled_for).toBe(new Date("2030-01-02T03:04").toISOString());
+    });
+
+    it("shows the driver gate's sentence, not an object, when a schedule is refused", async () => {
+      oneVersion();
+      server.use(
+        http.post(`${VERSION_URL}/schedule`, () =>
+          HttpResponse.json({ detail: GATE_DETAIL }, { status: 409 }),
+        ),
+      );
+      const { user, dialog } = await openApplyDialog();
+      await user.type(within(dialog).getByLabelText("Schedule for (optional)"), "2030-01-02T03:04");
+      await user.click(within(dialog).getByRole("button", { name: "Schedule" }));
+      await waitFor(() =>
+        expect(toastError).toHaveBeenCalledWith(GATE_MESSAGE + " (driver: frr_l3)"),
+      );
+      for (const call of toastError.mock.calls) {
+        expect(typeof call[0]).toBe("string");
+      }
+    });
+
+    it("shows a plain-string schedule refusal as given", async () => {
+      oneVersion();
+      server.use(
+        http.post(`${VERSION_URL}/schedule`, () =>
+          HttpResponse.json({ detail: "reservations service unreachable" }, { status: 503 }),
+        ),
+      );
+      const { user, dialog } = await openApplyDialog();
+      await user.type(within(dialog).getByLabelText("Schedule for (optional)"), "2030-01-02T03:04");
+      await user.click(within(dialog).getByRole("button", { name: "Schedule" }));
+      await waitFor(() =>
+        expect(toastError).toHaveBeenCalledWith("reservations service unreachable"),
+      );
+    });
+
+    it("lists the blocking reservations when a restore is refused with 409", async () => {
+      oneVersion();
+      server.use(
+        http.post(`${VERSION_URL}/restore`, () =>
+          HttpResponse.json(
+            {
+              detail: {
+                message: "Device has active reservations; restore blocked",
+                reservations: [
+                  { id: "aaaa1111-0000-0000-0000-000000000000", status: "ACTIVE", end_time: null },
+                  { id: "bbbb2222-0000-0000-0000-000000000000", status: "ACTIVE", end_time: null },
+                ],
+              },
+            },
+            { status: 409 },
+          ),
+        ),
+      );
+      await confirmRestore();
+      await waitFor(() =>
+        expect(toastError).toHaveBeenCalledWith(
+          "Device has active reservations; restore blocked: aaaa1111 (ACTIVE), bbbb2222 (ACTIVE)",
+        ),
+      );
+    });
+
+    it("shows the guard's sentence when a restore fails closed with 503", async () => {
+      oneVersion();
+      const unreachable = "reservations service unreachable while checking active reservations";
+      server.use(
+        http.post(`${VERSION_URL}/restore`, () =>
+          HttpResponse.json({ detail: unreachable }, { status: 503 }),
+        ),
+      );
+      await confirmRestore();
+      await waitFor(() => expect(toastError).toHaveBeenCalledWith(unreachable));
+    });
+
+    it("restores and shows a success toast", async () => {
+      oneVersion();
+      server.use(
+        http.post(`${VERSION_URL}/restore`, () =>
+          HttpResponse.json({ ...makeVersion({ id: "ver-2", version_number: 2 }), config: {} }),
+        ),
+      );
+      await confirmRestore();
+      await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Restored as a new version"));
+    });
+  });
 });

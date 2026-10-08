@@ -80,11 +80,12 @@ what a test would still need to cover:
   and pins the `Toaster` placement; router wiring and the `ErrorBoundary` are still
   exercised only indirectly through page tests that render individual routed
   components.
-- [MEDIUM] Device-config panels: `frontend/src/components/device-config/ApplyJobsPanel.tsx`
-  (6.7%, exercised only indirectly through `DeviceConfigSection.test.tsx`) and
-  `frontend/src/components/device-config/DeviceConfigSection.tsx` (49.4%, has its
-  own suite). The schedule-apply submit and job-status-polling branches are the
-  deferred piece, the same UI-journey gap the E2E section below already tracks.
+- [LOW] Device-config panels: `frontend/src/components/device-config/DeviceConfigSection.tsx`
+  (82.4% of lines since issue #1098, which added the Apply dialog and Restore refusal
+  tests) and `frontend/src/components/device-config/ApplyJobsPanel.tsx` (100%, its own
+  suite `ApplyJobsPanel.test.tsx` since #1098). The view and diff modals' loading
+  states are the untested remainder; the browser journey stays with the E2E section
+  below.
 - [MEDIUM] AI assistant tabs: `frontend/src/components/reservations/AIAssistantTab.tsx`
   (77.8%, has a suite) and `frontend/src/components/reservations/AIAssistantTabLegacy.tsx`
   (68.4%, no suite of its own, the default render path since
@@ -103,9 +104,11 @@ what a test would still need to cover:
 - [MEDIUM] `frontend/src/components/admin/UserManagementTable.tsx` (0%):
   `UsersPage.test.tsx` mocks it out entirely rather than rendering it, so its
   fetch, sort, and promote/demote actions have no test at all.
-- [LOW] `frontend/src/components/NotificationBell.tsx` (60.5%) and
+- [LOW] `frontend/src/components/NotificationBell.tsx` (76.2% since issue #1076,
+  which added mark read, delete, and keyboard tests) and
   `frontend/src/components/ui/BulkImportExport.tsx` (83.3%): both have a
-  targeted suite; dropdown and export-format branches are the remainder.
+  targeted suite; the outside-click close, the Settings link, and the
+  export-format branches are the remainder.
 
 A file with no test importing it (`App.tsx`, and effectively
 `UserManagementTable.tsx`) now shows 0% rather than being omitted from the report:
