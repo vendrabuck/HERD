@@ -673,11 +673,12 @@ apply-job routes of sections 5 and 7.
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_cancel_pending_job`, `test_cancel_other_users_job_forbidden`, `test_cancel_already_cancelled_job`); `services/inventory/tests/test_device_configs_rbac.py` (`test_admin_can_cancel_other_users_pending_job`); `services/inventory/tests/test_router_edge_cases.py` (`test_cancel_unknown_job_404`)
 - **CFG-JOB-11.** A confirm needs a source job that is a dry run (409
   `Source job is not a dry-run; nothing to promote`) and `success` (409
-  `Source dry-run is '<status>'; only successful dry-runs can be promoted`); these are
-  checked before the caller's authority (CFG-AUTH-3) on the job's device, and an unknown
-  job is 404 `Apply job not found`. \
+  `Source dry-run is '<status>'; only successful dry-runs can be promoted`). The order
+  is 404 `Apply job not found` for an unknown job (no authority lookup runs), then the
+  caller's authority (CFG-AUTH-3) on the job's device, then the two 409s, so a caller
+  without authority gets the 403 in every state and learns only that the job exists. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`confirm_dry_run_apply`) \
-  Pinned by: `services/inventory/tests/test_confirm_dry_run.py` (`test_confirm_404_when_job_missing`, `test_confirm_409_when_source_is_not_dry_run`, `test_confirm_409_when_dry_run_pending`, `test_confirm_409_when_dry_run_failed`)
+  Pinned by: `services/inventory/tests/test_confirm_dry_run.py` (`test_confirm_404_when_job_missing`, `test_confirm_409_when_source_is_not_dry_run`, `test_confirm_409_when_dry_run_pending`, `test_confirm_409_when_dry_run_failed`, `test_confirm_non_owner_gets_403_not_409_in_every_refusing_state`, `test_confirm_authorized_non_admin_still_gets_409`, `test_confirm_unknown_job_is_404_before_authority`)
 - **CFG-JOB-12.** A confirm writes a new `pending` real job (not a dry run) for the same
   device and version, due 10 seconds from now, carrying the source's `reservation_id`
   and the confirming user as `created_by`, answers 201 with it, leaves the source

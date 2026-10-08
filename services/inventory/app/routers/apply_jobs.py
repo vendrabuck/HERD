@@ -362,14 +362,27 @@ async def confirm_dry_run_apply(
     dry_run on the source row, so the promotion is auditable as a separate
     row by the confirming user at a fresh timestamp.
 
-    Rejects 409 if the source job is not a successful dry-run. Reuses the
-    same ACL gate as schedule_apply_job (manage grant or active-reservation
-    owner), so a user cannot promote a dry-run for a device they could no
-    longer schedule against.
+    Reuses the same ACL gate as schedule_apply_job (manage grant or
+    active-reservation owner), so a user cannot promote a dry-run for a device
+    they could no longer schedule against. Order: 404 for an unknown job, then
+    the authority check (403), then the 409s when the source is not a
+    successful dry-run, so a caller without authority learns only that the job
+    exists, never its kind or status (issue #1113).
     """
     source = await db.get(DeviceConfigApplyJob, job_id)
     if not source:
         raise HTTPException(status_code=404, detail="Apply job not found")
+
+    if not _is_admin(payload):
+        allowed = await _user_can_manage_device(payload["sub"], source.device_id, authorization)
+        if not allowed:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "manage permission required on this device (or active reservation ownership)"
+                ),
+            )
+
     if not source.dry_run:
         raise HTTPException(
             status_code=409,
@@ -382,16 +395,6 @@ async def confirm_dry_run_apply(
                 f"Source dry-run is {source.status!r}; only successful dry-runs can be promoted"
             ),
         )
-
-    if not _is_admin(payload):
-        allowed = await _user_can_manage_device(payload["sub"], source.device_id, authorization)
-        if not allowed:
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "manage permission required on this device (or active reservation ownership)"
-                ),
-            )
 
     # Create a new job, NOT a flip on the source. Audit attribution is the
     # confirming user; the source job remains the historical record of the

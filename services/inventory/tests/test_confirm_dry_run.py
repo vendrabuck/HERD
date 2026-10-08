@@ -22,6 +22,7 @@ from app.dependencies.auth import get_current_user_payload
 from app.main import app
 from app.models.device_config_apply_job import DeviceConfigApplyJob
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -275,3 +276,81 @@ async def test_confirm_non_admin_owner_allowed(admin_client):
     assert resp.status_code == 201, resp.text
     # Audit attribution is the confirming user, not the original creator.
     assert resp.json()["created_by"] == USER_PAYLOAD["sub"]
+
+
+# --- Check order: 404, then authority (403), then the 409s (issue #1113) ---
+
+_MANAGE_REQUIRED = "manage permission required on this device (or active reservation ownership)"
+
+
+async def _apply_job_count() -> int:
+    async with TestSessionLocal() as session:
+        return (await session.execute(select(func.count(DeviceConfigApplyJob.id)))).scalar_one()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dry_run", "status"),
+    [(False, "success"), (True, "pending"), (True, "failed")],
+    ids=["real-job", "dry-run-pending", "dry-run-failed"],
+)
+async def test_confirm_non_owner_gets_403_not_409_in_every_refusing_state(
+    admin_client, dry_run, status
+):
+    """A caller without authority over the job's device learns only that the
+    job exists: the pinned 403, never a 409 that tells the job's kind or
+    status, and no row is written."""
+    job_id, device_id, _ = await _seed_dry_run_job(admin_client, dry_run=dry_run, status=status)
+    rows_before = await _apply_job_count()
+
+    app.dependency_overrides[get_current_user_payload] = lambda: USER_PAYLOAD
+    guard = AsyncMock(return_value=False)
+    with patch("app.routers.apply_jobs._user_can_manage_device", new=guard):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.post(f"/apply-jobs/{job_id}/confirm")
+    assert resp.status_code == 403, resp.text
+    assert resp.json() == {"detail": _MANAGE_REQUIRED}
+    guard.assert_awaited_once()
+    assert str(guard.await_args.args[1]) == device_id
+    assert await _apply_job_count() == rows_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dry_run", "status", "detail"),
+    [
+        (False, "success", "Source job is not a dry-run; nothing to promote"),
+        (
+            True,
+            "failed",
+            "Source dry-run is 'failed'; only successful dry-runs can be promoted",
+        ),
+    ],
+    ids=["real-job", "dry-run-failed"],
+)
+async def test_confirm_authorized_non_admin_still_gets_409(admin_client, dry_run, status, detail):
+    """Authority passes first, then the source job's state decides."""
+    job_id, _, _ = await _seed_dry_run_job(admin_client, dry_run=dry_run, status=status)
+
+    app.dependency_overrides[get_current_user_payload] = lambda: USER_PAYLOAD
+    with patch(
+        "app.routers.apply_jobs._user_can_manage_device",
+        new=AsyncMock(return_value=True),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.post(f"/apply-jobs/{job_id}/confirm")
+    assert resp.status_code == 409, resp.text
+    assert resp.json() == {"detail": detail}
+
+
+@pytest.mark.asyncio
+async def test_confirm_unknown_job_is_404_before_authority(admin_client):
+    """An unknown id is 404 for a non-admin, and no authority lookup runs."""
+    app.dependency_overrides[get_current_user_payload] = lambda: USER_PAYLOAD
+    guard = AsyncMock(return_value=False)
+    with patch("app.routers.apply_jobs._user_can_manage_device", new=guard):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.post(f"/apply-jobs/{uuid.uuid4()}/confirm")
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Apply job not found"}
+    guard.assert_not_awaited()
