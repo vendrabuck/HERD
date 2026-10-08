@@ -277,6 +277,57 @@ def extract_password_keys(template_data: dict) -> set[str]:
     return keys
 
 
+class _MalformedInventoryBody(Exception):
+    """A 200 from inventory whose body is not a JSON object."""
+
+
+def _inventory_failure_text(exc: Exception) -> str:
+    """HERD-authored text for a failed inventory read (issue #1093).
+
+    Never `str(exc)`: an httpx exception carries the internal inventory URL, and
+    an upstream body is foreign text. Only the upstream status or the exception
+    class is kept, the forms the AI tool errors use.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"upstream service answered HTTP {exc.response.status_code}"
+    if isinstance(exc, httpx.TransportError):
+        return f"upstream service unreachable ({type(exc).__name__})"
+    if isinstance(exc, _MalformedInventoryBody | json.JSONDecodeError):
+        return "upstream service answered with a malformed body"
+    return type(exc).__name__
+
+
+async def _fetch_inventory_internal(path: str, what: str, not_found_detail: str) -> dict:
+    """GET an inventory internal route with the internal token and 10 seconds.
+
+    404 is relayed as 404 `not_found_detail`; any other failure, a 200 whose body is
+    not a JSON object included, is 503 `Failed to fetch <what>: <HERD-authored text>`
+    (fail closed). The full exception text goes to the log message only.
+    """
+    url = f"{settings.inventory_service_url}{path}"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                url,
+                headers={"X-Internal-Token": settings.internal_api_token},
+                timeout=10.0,
+            )
+            if resp.status_code == 404:
+                raise HTTPException(status_code=404, detail=not_found_detail)
+            resp.raise_for_status()
+            body = resp.json()
+            if not isinstance(body, dict):
+                raise _MalformedInventoryBody(type(body).__name__)
+            return body
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Failed to fetch %s from inventory (%s): %s", what, type(exc).__name__, exc)
+        raise HTTPException(
+            status_code=503, detail=f"Failed to fetch {what}: {_inventory_failure_text(exc)}"
+        )
+
+
 async def fetch_device(device_id: uuid.UUID) -> dict:
     """Fetch device details from inventory service.
 
@@ -285,22 +336,9 @@ async def fetch_device(device_id: uuid.UUID) -> dict:
     downstream with X-Internal-Token), so it must not hit the Bearer-only
     /devices/{id} route, which returns 401 for a token-only caller.
     """
-    url = f"{settings.inventory_service_url}/devices/{device_id}/internal"
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                url,
-                headers={"X-Internal-Token": settings.internal_api_token},
-                timeout=10.0,
-            )
-            if resp.status_code == 404:
-                raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
-            resp.raise_for_status()
-            return resp.json()
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Failed to fetch device: {exc}")
+    return await _fetch_inventory_internal(
+        f"/devices/{device_id}/internal", "device", f"Device {device_id} not found"
+    )
 
 
 async def fetch_template(template_id: str) -> dict:
@@ -309,22 +347,9 @@ async def fetch_template(template_id: str) -> dict:
     Uses the token-guarded /internal route for the same reason as fetch_device:
     a token-only caller gets 401 from the Bearer-only /templates/{id} route.
     """
-    url = f"{settings.inventory_service_url}/templates/{template_id}/internal"
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                url,
-                headers={"X-Internal-Token": settings.internal_api_token},
-                timeout=10.0,
-            )
-            if resp.status_code == 404:
-                raise HTTPException(status_code=404, detail=f"Template {template_id} not found")
-            resp.raise_for_status()
-            return resp.json()
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Failed to fetch template: {exc}")
+    return await _fetch_inventory_internal(
+        f"/templates/{template_id}/internal", "template", f"Template {template_id} not found"
+    )
 
 
 def driver_result_failed(result: dict) -> tuple[bool, str | None]:
