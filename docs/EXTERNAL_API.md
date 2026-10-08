@@ -5,8 +5,8 @@ the internal endpoints the web UI calls. It has two halves:
 
 - An inbound HTTP API under `/api/v1` for reserving and releasing devices from
   CI/CD pipelines and test-automation systems.
-- Outbound webhooks that POST reservation lifecycle events to endpoints you
-  register, so external systems react to HERD instead of polling it.
+- Outbound webhooks that POST reservation lifecycle and device health events to
+  endpoints you register, so external systems react to HERD instead of polling it.
 
 The `/api/v1` surface is a thin facade owned by the `integration` service. It
 forwards the caller's identity to the internal services, so RBAC, device-group
@@ -220,7 +220,7 @@ curl -sS -X PUT "$BASE/reservations/$RID/release" -H "$AUTH" | jq .status
 ## Webhooks
 
 Register an HTTP endpoint and HERD will POST a signed JSON payload to it whenever
-a subscribed reservation event occurs. Subscription management is admin-only and
+a subscribed event occurs. Subscription management is admin-only and
 lives under `/api/v1/webhooks`.
 
 ### Registering an endpoint

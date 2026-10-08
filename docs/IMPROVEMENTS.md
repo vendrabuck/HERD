@@ -24,10 +24,10 @@ doc's own rule. Remaining security-adjacent work is tracked in the issue queue r
 here (at the time of this refresh: the assistant message-retention decision in
 [#338](https://github.com/vendrabuck/HERD/issues/338)).
 
-One lower-severity observation was examined and deliberately not filed as a bug, but is
-worth noting for a hardening pass: outbound webhook targets are admin-registered with no
-SSRF allowlist (within admin authority today, but worth an allowlist when multi-tenancy
-lands).
+Outbound webhook targets, once noted here for a hardening pass, now follow a destination
+rule: a target must resolve to public addresses only, checked at registration and before
+every delivery, and the operator admits internal receivers through
+`WEBHOOK_ALLOWED_HOSTS` (see [EXTERNAL_API.md](EXTERNAL_API.md#destination-rule)).
 
 ## Performance and scalability
 

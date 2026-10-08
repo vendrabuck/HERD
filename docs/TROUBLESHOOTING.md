@@ -9,9 +9,31 @@ Common failure modes and how to diagnose them. Organized by what the user sees.
 `config.json` has not been written to the `herd-config` volume, so the login page is gating behind the setup flow. Two fixes:
 
 - Put every required value in `.env` (see `.env.example`) and `make restart`. The config service's first-start auto-bootstrap will write `config.json` from the env on boot, and the login form will enable. Check `docker compose logs config` for a message like `Config bootstrapped from environment` or a warning naming the missing var.
-- Or click the wrench icon on the login page, log in with the config-page password (set `CONFIG_ADMIN_PASSWORD`, or read the one-time password from `docker compose logs config`), fill in required settings, and click **Save and Restart**.
+- Or click the wrench icon on the login page, log in with the config-page password (set `CONFIG_ADMIN_PASSWORD`, or read the generated password from `docker compose logs config`; it stays valid until you change it), fill in required settings, and click **Save and Restart**.
 
 See [OPERATIONS.md](OPERATIONS.md#config-service-first-run).
+
+### The config page keeps saying `Invalid config password` even with the right password
+
+The config login limits failed attempts, and the page shows the same toast for a refused
+password and for a login that has to wait. A waiting login is answered HTTP 429 `Too many
+failed login attempts; try again later` with a `Retry-After` header, before the password
+is checked (the browser's network panel shows it). From a source address's third
+consecutive failure, that source waits 1 second, doubling to 60 seconds; once
+`CONFIG_LOGIN_MAX_ATTEMPTS` failures (default 20) from any sources fall within
+`CONFIG_LOGIN_LOCKOUT_SECONDS` (default 300), every login waits that long. `docker compose
+logs config` shows one WARNING line starting `config_login_locked` per wait, with the scope
+and source address. Wait it out and log in once, or restart the config service (`docker
+compose restart config`), which clears the counts. See
+[OPERATIONS.md](OPERATIONS.md#option-b-use-the-config-ui).
+
+### A config save answers `422 Unknown settings: <keys>`
+
+The config page saves only the settings its schema lists, and a save that names any other
+key is refused whole, with nothing written. The editor never sends such a key itself (it
+shows only schema keys), so this comes from a script or a hand-built request. Settings
+outside the schema, such as `SECRETS_KEK` or a `*_SERVICE_URL`, belong in `.env` or the
+compose environment. See [ENV_VARS.md](ENV_VARS.md#config-service).
 
 ### Services crash-loop on startup
 
@@ -216,6 +238,60 @@ The driver method took longer than the configured timeout (`execution_timeout_se
 ### Execution run status `FAILED` with `Driver class not found`
 
 The driver package validation failed. Confirm `driver.py` exists in the package root and defines a class named `Driver` with the required methods for its connection type. See [DRIVERS.md](DRIVERS.md).
+
+### A reservation owner's run list is missing runs, or answers `503 Could not verify device visibility`
+
+A non-admin's `GET /api/execution/runs?reservation_id=` lists only the runs on devices
+inside their device-group visibility. A wiring run on a transit switch the owner cannot
+see is left out, and its transcript (`GET /api/execution/runs/{id}/commands`) answers 404
+`Execution run not found`, exactly like an unknown run. Runs a dynamic-resource recipe
+makes are filed under the hypervisor, which is not a device, so only admins see them. An
+admin sees every run. `503 Could not verify device visibility; nothing was returned.
+Retry the request.` means execution could not get the caller's visible devices from
+inventory (inventory down, a non-200, or a malformed answer); it returns no rows rather
+than an unfiltered list. The same lookup backs `GET /api/execution/device-health/{id}`,
+which answers a device outside the caller's visibility as an unpolled device
+(`UNKNOWN`). Check inventory's health and logs, then retry.
+
+### Retrying a run answers 409 `... cannot be retried; start a new run instead`
+
+A run stores its keyword arguments masked, so a retry of a run whose configuration was
+masked reads the configuration back from the config version the run names. Inventory's
+apply paths (Apply now and scheduled applies) always name one. Three answers:
+
+- 409 `This run stores its configuration masked and names no config version to read it
+  back from, so it cannot be retried; start a new run instead`: the run was started
+  directly through `POST /api/execution/execute` (the AI commit path does this) without a
+  `config_version_id`.
+- 409 `The configuration this run pushed could not be read back from its config version,
+  so it cannot be retried; start a new run instead`: the version is gone, or masking it
+  does not give the stored copy.
+- 503 `Could not read the run's config version; nothing was retried. Retry the request.`:
+  inventory could not answer.
+
+For the first two, start a new run or re-apply the config version from the device page. A
+run that does not record whether it was a dry run is refused with its own 409 (see
+[ROLES.md](ROLES.md#retry-a-failed-run)).
+
+### `POST /api/execution/execute` answers `422 reservation_id must reference a reservation ...`
+
+A `reservation_id` in the body must name a reservation that holds the device and, for a
+non-admin, one the caller owns (`reservation_id must reference a reservation you own that
+includes this device`; an admin sees `... a reservation that includes this device`).
+Drop the field or send the right reservation. `503 Could not verify the reservation;
+nothing was run. Retry the request.` means the reservations service could not answer.
+
+### Log action `vlan_delete_unjudged`
+
+When a reservation's last membership in a VLAN is released, execution deletes the VLAN
+definition from each switch it was defined on, unless another live allocation holding
+the same number reaches the current cabling component of one of those switches. This line
+means cabling could not answer that question (its fabric lookup failed), so no
+`delete_vlan` ran for that allocation: the empty definition stays on the listed
+switches, the allocation is already released, and nothing retries the delete. Once
+cabling is healthy, remove the definition by hand on each switch the line names, after
+confirming no live reservation uses that VLAN number there. See
+[DRIVERS.md](DRIVERS.md#when-methods-are-called-1).
 
 ### Wiring row `FAILED` with `driver load failed: <ClassName>`
 

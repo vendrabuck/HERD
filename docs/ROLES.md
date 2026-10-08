@@ -1401,6 +1401,8 @@ Admins may execute any action. A non-admin may call this endpoint only when the 
 
 A `reservation_id`, when given, must name a reservation that holds the device and, for a non-admin, one the caller owns (admins are exempt from ownership, not from the device check); otherwise the call is refused with 422 before any run row or driver call, and with 503 when the reservations service cannot answer. The run row's reservation is therefore always one that held the device.
 
+The body also takes `method_kwargs`, `dry_run` (default false), and an optional `config_version_id`: the config version the arguments came from. Inventory's two apply paths send it, the run records it, and a retry of a run whose stored arguments were masked reads the configuration back from it (see Retry below). It is recorded, not checked, at execute time.
+
 ### Retry a failed run
 
 ```
@@ -1442,7 +1444,7 @@ exactly as an unpolled one (below), so the answer does not reveal whether a hidd
 device exists. A visibility lookup inventory cannot answer is 503.
 
 On miss (device has not been polled yet), returns a synthesized 200 with
-`last_status=UNKNOWN` and all other fields null. This is deliberate: the frontend
+`last_status=UNKNOWN`, `consecutive_failures` 0, and the other fields null. This is deliberate: the frontend
 renders a health badge on every device-detail page and per-device 404 handling
 would be noisy.
 
@@ -1882,6 +1884,8 @@ Authorization: Bearer <admin-token>
 | `/api/execution/execute` | POST | yes (`configure` only, with device `manage` grant) | yes | yes |
 | `/api/execution/runs/{id}/retry` | POST | | yes | yes |
 | `/api/execution/device-check` | POST | internal | internal | internal |
+| `/api/execution/device-health/{device_id}` | GET | yes (device visible; any other device answers as unpolled) | yes | yes |
+| `/api/execution/device-health` | GET | | yes | yes |
 | `/api/v1/reservations` | POST | yes (as the caller) | yes | yes |
 | `/api/v1/reservations` | GET | yes (as the caller) | yes | yes |
 | `/api/v1/reservations/{id}` | GET | yes (as the caller) | yes | yes |

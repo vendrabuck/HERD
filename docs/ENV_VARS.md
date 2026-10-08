@@ -146,7 +146,7 @@ If you run a service on a different host or port, update the URL in `.env` or th
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CORS_ORIGINS` | `""` in code; `https://localhost` at the docker-compose level | Comma-separated origins allowed by every backend's CORS middleware. Each service's `app/config.py` defaults to an empty string; `docker-compose.yml` supplies `${CORS_ORIGINS:-https://localhost}` for every service, so a fresh `.env` (which also sets `CORS_ORIGINS=https://localhost`) gets `https://localhost` in practice. Add your real hostname or IP to enable cross-host access. The config service does not read it: it allows any origin and never allows credentials. |
+| `CORS_ORIGINS` | `""` in code; `https://localhost` at the docker-compose level | Comma-separated origins allowed by every backend's CORS middleware. Each service's `app/config.py` defaults to an empty string; `docker-compose.yml` supplies `${CORS_ORIGINS:-https://localhost}` for every service, so a fresh `.env` (which also sets `CORS_ORIGINS=https://localhost`) gets `https://localhost` in practice. Add your real hostname or IP to enable cross-host access. The config service keeps the value only as a setting it stores for the other services; its own CORS policy allows any origin and never allows credentials. |
 
 TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env var for cert paths. See [OPERATIONS.md](OPERATIONS.md#tls-certificate-rotation).
 
@@ -397,8 +397,9 @@ The execution service runs the same outbox relay for the `device.health_transiti
 ## Integration service
 
 The integration service (issue #33) exposes the versioned `/api/v1` external reservation
-facade and fans reservation lifecycle events out to admin-registered outbound webhooks,
-consumed via its own NATS durable consumer.
+facade and fans reservation lifecycle and device health events out to admin-registered
+outbound webhooks, consumed via its own two NATS durable consumers (one on
+`HERD_RESERVATIONS`, one on `HERD_HEALTH`).
 
 | Variable | Default | Purpose |
 |---|---|---|
