@@ -664,13 +664,16 @@ everyone with a live reservation on it is told.
   nothing, logged `health_event_no_device_id` or `health_event_invalid_device_id`. \
   Enforced in: `services/notifications/app/services/event_router.py` (`_build_health_messages`) \
   Pinned by: `services/notifications/tests/test_event_router_health.py` (`test_event_missing_device_id_is_skipped`, `test_event_invalid_device_id_is_skipped`)
-- **INTEG-HEALTH-4.** The empty list a failed admin-list fetch answers is cached for
-  `HEALTH_NOTIFY_ADMIN_CACHE_TTL_SECONDS` exactly like a real answer, so admins miss
-  every health notification for that window. Known gap, see #1075. \
-  Enforced in: `services/notifications/app/services/health_recipients.py` (`AdminListClient`); `services/common/herd_common/ttl_cache.py` (`SingletonTTLCache`) \
-  Pinned by: none (issue #1075)
+- **INTEG-HEALTH-4.** Only an answer from auth is cached, for
+  `HEALTH_NOTIFY_ADMIN_CACHE_TTL_SECONDS`: a 200 with a list, an empty one included.
+  The empty list a failed fetch answers (INTEG-HEALTH-5) covers only the event that hit
+  the failure; it is returned as `Uncached`, nothing is stored, and the next event asks
+  auth again. \
+  Enforced in: `services/notifications/app/services/health_recipients.py` (`AdminListClient`); `services/common/herd_common/ttl_cache.py` (`SingletonTTLCache`, `Uncached`) \
+  Pinned by: `services/notifications/tests/test_health_recipients.py` (`test_admin_list_failure_is_not_cached`, `test_admin_list_missing_token_is_not_cached`, `test_admin_list_empty_answer_is_cached`); `services/common/tests/test_ttl_cache.py` (`test_singleton_uncached_fallback_is_returned_but_not_stored`)
 - **INTEG-HEALTH-5.** The admin-list fetch answers an empty list, fail open, on a missing
-  internal token, a transport error, a non-200, or a body that is not JSON; entries that
+  internal token, a transport error, a non-200, a body that is not JSON, or a JSON body
+  that is not a list; entries that
   are not UUIDs are skipped. \
   Enforced in: `services/notifications/app/services/health_recipients.py` (`AdminListClient`) \
   Pinned by: `services/notifications/tests/test_health_recipients.py` (`test_admin_list_returns_empty_when_token_missing`, `test_admin_list_returns_empty_on_http_error`, `test_admin_list_returns_empty_on_non_200`, `test_admin_list_returns_empty_on_malformed_json`, `test_admin_list_skips_unparseable_ids`)
@@ -684,9 +687,10 @@ everyone with a live reservation on it is told.
   Enforced in: `services/notifications/app/services/event_router.py` (`_build_health_messages`) \
   Pinned by: `services/notifications/tests/test_event_router_health.py` (`test_empty_recipient_list_produces_no_messages`); `services/notifications/tests/test_health_recipients.py` (`test_resolver_returns_empty_when_both_sides_fail`); `tests/integration/test_health_alerting_flow.py` (`test_event_with_no_recipients_drops_silently`)
 - **INTEG-HEALTH-8.** The admin list is cached for the TTL, and concurrent misses make
-  one fetch. \
+  one fetch when that fetch answers; after a failed fetch nothing is stored, so each
+  waiting caller asks again (INTEG-HEALTH-4). \
   Enforced in: `services/notifications/app/services/health_recipients.py` (`AdminListClient`); `services/common/herd_common/ttl_cache.py` (`SingletonTTLCache`) \
-  Pinned by: `services/notifications/tests/test_health_recipients.py` (`test_admin_list_caches_within_ttl`, `test_admin_list_concurrent_callers_fetch_once`, `test_admin_list_refetches_after_invalidate`)
+  Pinned by: `services/notifications/tests/test_health_recipients.py` (`test_admin_list_caches_within_ttl`, `test_admin_list_concurrent_callers_fetch_once`, `test_admin_list_refetches_after_invalidate`); `services/common/tests/test_ttl_cache.py` (`test_concurrent_callers_during_a_failure_each_ask_again`)
 
 **Out of scope.** When execution publishes a transition (`operations-and-observability.md`).
 
@@ -781,11 +785,13 @@ they hear about; everything is on in the app by default and off everywhere else.
   a whole object, so a channel the body omits is reset to its default rather than kept. \
   Enforced in: `services/notifications/app/routers/notifications.py` (`put_preferences`); `services/notifications/app/schemas/preferences.py` (`NotificationPreferencesUpdate`) \
   Pinned by: none (issue #1081)
-- **INTEG-PREFS-6.** The defaults a failed consumer-side preference fetch answers are
-  cached for `PREFERENCES_CACHE_TTL_SECONDS` exactly like a real answer, so a user who
-  opted out of an event can receive it for that window. Known gap, see #1075. \
-  Enforced in: `services/notifications/app/services/preferences_client.py` (`PreferencesClient`); `services/common/herd_common/ttl_cache.py` (`TTLCache`) \
-  Pinned by: none (issue #1075)
+- **INTEG-PREFS-6.** Only a 200 from user-profile is cached, for
+  `PREFERENCES_CACHE_TTL_SECONDS`. The defaults a failed consumer-side fetch answers
+  (INTEG-PREFS-7) cover only the event that hit the failure; they are returned as
+  `Uncached`, nothing is stored, and the next event reads the stored preferences again,
+  so an opt-out applies from the next event on. \
+  Enforced in: `services/notifications/app/services/preferences_client.py` (`PreferencesClient`); `services/common/herd_common/ttl_cache.py` (`TTLCache`, `Uncached`) \
+  Pinned by: `services/notifications/tests/test_preferences_client.py` (`test_failed_fetch_is_not_cached_so_an_opt_out_applies_next_call`); `services/common/tests/test_ttl_cache.py` (`test_uncached_fallback_is_returned_but_not_stored`)
 - **INTEG-PREFS-7.** The consumer reads preferences through user-profile's internal route
   with the internal token and answers the defaults, fail open, on a transport error or a
   non-200. \
@@ -836,10 +842,13 @@ others or the bell.
   retried only by a redelivery. \
   Enforced in: `services/notifications/app/services/dispatchers/outbound.py` (`run_outbound`) \
   Pinned by: `services/notifications/tests/test_multichannel_dispatch.py` (`test_one_channel_failure_does_not_block_others`)
-- **INTEG-OUT-5.** The `None` a failed contact lookup answers is cached for
-  `PREFERENCES_CACHE_TTL_SECONDS` exactly like a real answer. Known gap, see #1075. \
-  Enforced in: `services/notifications/app/services/contact_client.py` (`ContactClient`); `services/common/herd_common/ttl_cache.py` (`TTLCache`) \
-  Pinned by: none (issue #1075)
+- **INTEG-OUT-5.** Only an answer from auth is cached, for
+  `PREFERENCES_CACHE_TTL_SECONDS`: a contact, or `None` for a 404 (unknown or
+  deactivated user). The `None` a missing token, a transport error, another non-200, or
+  a malformed body answers (INTEG-OUT-6) is returned as `Uncached` and not stored, so the
+  next event asks auth again. \
+  Enforced in: `services/notifications/app/services/contact_client.py` (`ContactClient`); `services/common/herd_common/ttl_cache.py` (`TTLCache`, `Uncached`) \
+  Pinned by: `services/notifications/tests/test_contact_client.py` (`test_failed_lookup_is_not_cached`, `test_not_found_is_an_answer_and_is_cached`, `test_missing_token_is_not_cached`)
 - **INTEG-OUT-6.** The contact lookup (auth, internal token) answers `None` on a missing
   token, a transport error, a non-200, or a malformed body; email is then skipped,
   logged `email_no_recipient`, and chat names the user by id. \
@@ -939,11 +948,11 @@ the log action.
 |---|---|---|---|---|
 | Out (integration) | reservations | `POST /`, `GET /`, `GET /{id}`, `DELETE /{id}`, `PUT /{id}/release`, `GET /{id}/wiring-status` (caller's JWT, 10 s) | every facade route | Fail closed: 503 (INTEG-FACADE-14); a refusal is relayed (INTEG-FACADE-12) |
 | Out (integration) | external receiver | `POST <target_url>` (`WEBHOOK_DELIVERY_TIMEOUT_SECONDS` per attempt) | deliver an event | Retried, then a `dead` row; never fails the message (INTEG-HOOK-14, INTEG-HOOK-19) |
-| Out (notifications) | auth | `GET /internal/admins` (internal token, 5 s), cached | health recipients | Fail open: no admin recipients, cached for the TTL (INTEG-HEALTH-4, INTEG-HEALTH-5) |
+| Out (notifications) | auth | `GET /internal/admins` (internal token, 5 s), cached | health recipients | Fail open: no admin recipients for that event, not cached (INTEG-HEALTH-4, INTEG-HEALTH-5) |
 | Out (notifications) | reservations | `GET /internal/active-users?device_id` (internal token, 5 s) | health recipients | Fail open: no holder recipients (INTEG-HEALTH-6) |
-| Out (notifications) | user-profile | `GET /preferences/internal?user_id` (internal token, 5 s), cached | a recipient's preferences | Fail open: defaults, cached for the TTL (INTEG-PREFS-6, INTEG-PREFS-7) |
+| Out (notifications) | user-profile | `GET /preferences/internal?user_id` (internal token, 5 s), cached | a recipient's preferences | Fail open: defaults for that event, not cached (INTEG-PREFS-6, INTEG-PREFS-7) |
 | Out (notifications) | user-profile | `GET /preferences`, `PATCH /preferences` (caller's JWT, 10 s) | the preferences proxy | Fail closed: 503 (INTEG-PREFS-3) |
-| Out (notifications) | auth | `GET /internal/users/{id}/contact` (internal token, 5 s), cached | email address, chat username | Fail open: email skipped, chat by id (INTEG-OUT-5, INTEG-OUT-6) |
+| Out (notifications) | auth | `GET /internal/users/{id}/contact` (internal token, 5 s), cached | email address, chat username | Fail open: email skipped, chat by id, not cached (INTEG-OUT-5, INTEG-OUT-6) |
 | Out (notifications) | SMTP server, chat URL, outbound webhook URL | SMTP send, `POST` (the channel's timeout) | outbound channels | Logged and swallowed; claim released (INTEG-OUT-3, INTEG-OUT-4) |
 | Out (both) | NATS | DLQ publish | dead letters | Logged; the message is still acked (INTEG-CONSUME-9, INTEG-NCONSUME-9) |
 
@@ -994,8 +1003,6 @@ Two documents are incomplete against the code this specification describes, trac
 
 ### Open defects
 
-- #1075 (INTEG-HEALTH-4, INTEG-PREFS-6, INTEG-OUT-5): a failed admin-list, preference,
-  or contact lookup is cached for the full TTL as if it were an answer.
 - #1076 (INTEG-UI-3): the bell nests the delete button inside the item button, and its
   list query runs while signed out.
 - #1077 (INTEG-ROUTE-2): a failed reservation produces no notification and has no
@@ -1043,10 +1050,7 @@ Two documents are incomplete against the code this specification describes, trac
 - INTEG-HOOK-15: a `dead` row retried and overwritten on redelivery.
 - INTEG-HOOK-16: the concurrent ledger insert race.
 - INTEG-HOOK-22: the ledger key with neither an event id nor metadata.
-- INTEG-HEALTH-4: the empty admin list cached after a failure.
 - INTEG-INAPP-7: marking a read notification read again.
 - INTEG-PREFS-5: `channels` replaced whole on a write.
-- INTEG-PREFS-6: default preferences cached after a failure.
-- INTEG-OUT-5: a missing contact cached after a failure.
 - INTEG-UI-3: the nested delete button.
 - INTEG-UI-4: click to mark read and the disabled Mark all read.

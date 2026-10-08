@@ -15,7 +15,7 @@ import uuid
 
 import httpx
 from herd_common.internal_client import InternalTokenAuth, call_service
-from herd_common.ttl_cache import SingletonTTLCache
+from herd_common.ttl_cache import SingletonTTLCache, Uncached
 
 from app.config import settings
 
@@ -51,13 +51,19 @@ class AdminListClient:
     async def list_admins(self) -> list[uuid.UUID]:
         return list(await self._cache.get())
 
-    async def _fetch(self) -> list[uuid.UUID]:
+    async def _fetch(self) -> list[uuid.UUID] | Uncached[list[uuid.UUID]]:
+        """Fetch the admin ids; a failure returns `Uncached([])` (issue #1075).
+
+        The empty fallback covers the event that hit the failure; marking it
+        Uncached keeps it out of the cache so the next event asks auth again.
+        A 200 with an empty list is an answer and is cached.
+        """
         if not self._token:
             logger.warning(
                 "health_recipients: INTERNAL_API_TOKEN unset; cannot fetch admin list",
                 extra={"action": "admin_fetch_no_token"},
             )
-            return []
+            return Uncached([])
         try:
             resp = await call_service(
                 self._base_url,
@@ -72,18 +78,27 @@ class AdminListClient:
                 extra={"action": "admin_fetch_failed"},
                 exc_info=True,
             )
-            return []
+            return Uncached([])
         if resp.status_code != 200:
             logger.warning(
                 "Non-200 from auth /internal/admins; returning empty",
                 extra={"action": "admin_fetch_non_200", "status": resp.status_code},
             )
-            return []
+            return Uncached([])
         try:
             data = resp.json()
         except ValueError:
-            logger.warning("auth /internal/admins returned malformed JSON")
-            return []
+            logger.warning(
+                "auth /internal/admins returned malformed JSON",
+                extra={"action": "admin_fetch_malformed"},
+            )
+            return Uncached([])
+        if not isinstance(data, list):
+            logger.warning(
+                "auth /internal/admins returned a body that is not a list",
+                extra={"action": "admin_fetch_malformed"},
+            )
+            return Uncached([])
         out: list[uuid.UUID] = []
         for item in data:
             try:

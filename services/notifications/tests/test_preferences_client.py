@@ -107,6 +107,39 @@ async def test_fetch_falls_back_on_http_error():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["transport", "non_200"])
+async def test_failed_fetch_is_not_cached_so_an_opt_out_applies_next_call(failure):
+    """Issue #1075: the defaults cover only the call that hit the failure.
+    The next call asks user-profile again and honors the stored opt-out."""
+    import httpx
+
+    user_id = uuid.uuid4()
+    client = PreferencesClient(ttl_seconds=60)
+    stored = {"events": {"reservation.created": False}}
+    ok = AsyncMock()
+    ok.status_code = 200
+    ok.json = lambda: _make_upstream(stored)
+    if failure == "transport":
+        first = httpx.ConnectError("boom")
+    else:
+        first = AsyncMock()
+        first.status_code = 503
+        first.json = lambda: {}
+
+    with patch("herd_common.internal_client.httpx.AsyncClient") as MockClient:
+        inst = MockClient.return_value.__aenter__.return_value
+        inst.request = AsyncMock(side_effect=[first, ok, AssertionError("cached")])
+        during = await client.get(user_id)
+        after = await client.get(user_id)
+        again = await client.get(user_id)
+
+    assert during.event_enabled("reservation.created") is True
+    assert after.event_enabled("reservation.created") is False
+    assert again.event_enabled("reservation.created") is False
+    assert inst.request.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_fetch_falls_back_on_non_200():
     client = PreferencesClient(ttl_seconds=60)
     resp = AsyncMock()

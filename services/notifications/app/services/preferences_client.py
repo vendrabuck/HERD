@@ -3,7 +3,7 @@ import uuid
 
 import httpx
 from herd_common.internal_client import InternalTokenAuth, call_service
-from herd_common.ttl_cache import TTLCache
+from herd_common.ttl_cache import TTLCache, Uncached
 
 from app.config import settings
 from app.schemas.preferences import NotificationPreferences
@@ -36,7 +36,16 @@ class PreferencesClient:
     async def get(self, user_id: uuid.UUID) -> NotificationPreferences:
         return await self._cache.get(user_id)
 
-    async def _fetch(self, user_id: uuid.UUID) -> NotificationPreferences:
+    async def _fetch(
+        self, user_id: uuid.UUID
+    ) -> NotificationPreferences | Uncached[NotificationPreferences]:
+        """Fetch one user's preferences.
+
+        A transport error or non-200 returns the defaults wrapped in
+        `Uncached` (issue #1075): the event that hit the failure is delivered
+        under the defaults, and the next event asks user-profile again rather
+        than ignoring an opt-out for the whole TTL.
+        """
         try:
             resp = await call_service(
                 self._base_url,
@@ -52,7 +61,7 @@ class PreferencesClient:
                 extra={"action": "prefs_fetch_failed", "user_id": str(user_id)},
                 exc_info=True,
             )
-            return NotificationPreferences.with_defaults(None)
+            return Uncached(NotificationPreferences.with_defaults(None))
 
         if resp.status_code != 200:
             logger.warning(
@@ -63,7 +72,7 @@ class PreferencesClient:
                     "status": resp.status_code,
                 },
             )
-            return NotificationPreferences.with_defaults(None)
+            return Uncached(NotificationPreferences.with_defaults(None))
 
         payload = resp.json()
         stored = (payload.get("extras") or {}).get("notifications")

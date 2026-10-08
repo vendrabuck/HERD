@@ -8,6 +8,9 @@ of `PreferencesClient`.
 
 A lookup failure (auth unreachable, non-200, missing user) returns None; the
 calling dispatcher logs and skips its channel without blocking the others.
+Only a 404 (unknown or deactivated user) is an answer and is cached; every
+other failure returns `Uncached(None)`, so the next event asks auth again
+instead of skipping that user's email for the whole TTL (issue #1075).
 """
 
 import logging
@@ -16,7 +19,7 @@ from dataclasses import dataclass
 
 import httpx
 from herd_common.internal_client import InternalTokenAuth, call_service
-from herd_common.ttl_cache import TTLCache
+from herd_common.ttl_cache import TTLCache, Uncached
 
 from app.config import settings
 
@@ -49,13 +52,13 @@ class ContactClient:
     async def get(self, user_id: uuid.UUID) -> UserContact | None:
         return await self._cache.get(user_id)
 
-    async def _fetch(self, user_id: uuid.UUID) -> UserContact | None:
+    async def _fetch(self, user_id: uuid.UUID) -> UserContact | None | Uncached[None]:
         if not self._token:
             logger.warning(
                 "contact_client: INTERNAL_API_TOKEN unset; cannot resolve user contact",
                 extra={"action": "contact_fetch_no_token", "user_id": str(user_id)},
             )
-            return None
+            return Uncached(None)
         try:
             resp = await call_service(
                 self._base_url,
@@ -70,6 +73,12 @@ class ContactClient:
                 extra={"action": "contact_fetch_failed", "user_id": str(user_id)},
                 exc_info=True,
             )
+            return Uncached(None)
+        if resp.status_code == 404:
+            logger.warning(
+                "auth has no active user for this id; skipping outbound channel",
+                extra={"action": "contact_fetch_not_found", "user_id": str(user_id)},
+            )
             return None
         if resp.status_code != 200:
             logger.warning(
@@ -80,7 +89,7 @@ class ContactClient:
                     "status": resp.status_code,
                 },
             )
-            return None
+            return Uncached(None)
         try:
             data = resp.json()
             return UserContact(
@@ -93,7 +102,7 @@ class ContactClient:
                 "auth /internal/users/{id}/contact returned malformed JSON",
                 extra={"action": "contact_fetch_malformed", "user_id": str(user_id)},
             )
-            return None
+            return Uncached(None)
 
     def invalidate(self, user_id: uuid.UUID) -> None:
         self._cache.invalidate(user_id)

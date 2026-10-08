@@ -41,6 +41,21 @@ Usage (singleton):
     )
     admins = await cache.get()
     cache.invalidate()
+
+A failure is not an answer (issue #1075). When `fetch` could not ask the
+upstream (transport error, unexpected status, unreadable body, no token) it
+returns its fallback wrapped in `Uncached(value)`: `get` hands the caller
+the bare value and stores nothing, so the next call asks again instead of
+replaying the outage for the whole TTL. Only the caller can tell a failure
+from an answer (an empty admin list or default preferences can be either),
+which is why the marking happens in `fetch` and the not-storing happens here.
+
+    async def _fetch(self, key):
+        try:
+            resp = await call_service(...)
+        except httpx.HTTPError:
+            return Uncached(FALLBACK)
+        return parse(resp)
 """
 
 from __future__ import annotations
@@ -48,12 +63,24 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Generic, TypeVar
 
 K = TypeVar("K")
 V = TypeVar("V")
 
 Clock = Callable[[], float]
+
+
+@dataclass(frozen=True)
+class Uncached(Generic[V]):
+    """A fallback `fetch` returns when it could not get an answer.
+
+    The cache returns `value` to this caller and stores nothing, so the
+    failure does not outlive the call that hit it.
+    """
+
+    value: V
 
 
 class TTLCache(Generic[K, V]):
@@ -69,7 +96,7 @@ class TTLCache(Generic[K, V]):
     def __init__(
         self,
         *,
-        fetch: Callable[[K], Awaitable[V]],
+        fetch: Callable[[K], Awaitable[V | Uncached[V]]],
         ttl_seconds: float,
         clock: Clock = time.monotonic,
     ):
@@ -97,9 +124,11 @@ class TTLCache(Generic[K, V]):
             hit, value = self._cache_hit(key)
             if hit:
                 return value  # type: ignore[return-value]
-            value = await self._fetch(key)
-            self._cache[key] = (self._clock() + self._ttl, value)
-            return value
+            fetched = await self._fetch(key)
+            if isinstance(fetched, Uncached):
+                return fetched.value
+            self._cache[key] = (self._clock() + self._ttl, fetched)
+            return fetched
 
     def invalidate(self, key: K) -> None:
         self._cache.pop(key, None)
@@ -116,7 +145,7 @@ class SingletonTTLCache(Generic[V]):
     def __init__(
         self,
         *,
-        fetch: Callable[[], Awaitable[V]],
+        fetch: Callable[[], Awaitable[V | Uncached[V]]],
         ttl_seconds: float,
         clock: Clock = time.monotonic,
     ):
@@ -140,14 +169,16 @@ class SingletonTTLCache(Generic[V]):
             hit, value = self._cache_hit()
             if hit:
                 return value  # type: ignore[return-value]
-            value = await self._fetch()
-            self._cached = value
+            fetched = await self._fetch()
+            if isinstance(fetched, Uncached):
+                return fetched.value
+            self._cached = fetched
             self._cached_until = self._clock() + self._ttl
-            return value
+            return fetched
 
     def invalidate(self) -> None:
         self._cached_until = 0.0
         self._cached = None
 
 
-__all__ = ["TTLCache", "SingletonTTLCache"]
+__all__ = ["TTLCache", "SingletonTTLCache", "Uncached"]
