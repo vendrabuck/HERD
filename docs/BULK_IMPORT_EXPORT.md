@@ -41,6 +41,14 @@ cabling service. There is no cross-schema bulk path.
 Import endpoints accept a single multipart file field named `file`. `format`
 defaults to `json`. `dry_run` defaults to `false`.
 
+The device export leaves out dynamic-instance devices, the devices that
+execution creates for a booking's dynamic request (they carry a `request_id`).
+Such a device lives only as long as the reservation that created it, and its
+dynamic template cannot hold a device on import, so another instance would
+reject its row with `Template is not a device template` (issue #1068). Every
+other device is exported. The dynamic templates themselves are still exported
+and imported (see `hypervisor_name` above).
+
 Topology import enforces the same creator-or-admin gate as
 `PUT /api/cabling/topologies/{id}`, per row on the update path: a row whose
 name matches a topology created by another user is rejected with a

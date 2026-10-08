@@ -173,7 +173,7 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 | POST | `/device-groups/{id}/permissions/bulk-remove` | admin | 200 | INV-AUTH-2, INV-GRP-9 |
 | GET | `/device-groups/visible-devices?user_id` | the user themself, or any admin | 200 | INV-VIS-8, INV-VIS-9 |
 | GET | `/device-groups/device/{id}` | any signed-in user (non-admins: visible devices only) | 200 | INV-GRP-10 to INV-GRP-13, INV-VIS-6 |
-| GET | `/devices/export`, `/templates/export` | admin | 200 | INV-BULK-1 to INV-BULK-3, INV-BULK-19, INV-CSV-1, INV-CSV-2 |
+| GET | `/devices/export`, `/templates/export` | admin | 200 | INV-BULK-1 to INV-BULK-3, INV-BULK-19, INV-BULK-21, INV-CSV-1, INV-CSV-2 |
 | POST | `/devices/import`, `/templates/import` (multipart) | admin | 200 | INV-BULK-4 to INV-BULK-16, INV-BULK-18 to INV-BULK-20, INV-CSV-3 |
 | `/devices/{id}/config-versions...`, `/devices/{id}/apply-jobs`, `/apply-jobs/...` | | see `device-configuration.md` | | none here |
 
@@ -1171,6 +1171,13 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   encoded; re-save it as UTF-8 and retry` for the whole file, and nothing is written. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`parse_import`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_non_utf8_import_file_is_422_naming_the_encoding`)
+- **INV-BULK-21.** A device export, CSV or JSON, leaves out every dynamic-instance device
+  (a device carrying a `request_id`); every other device is exported. An instance device
+  lives only as long as its reservation, and its dynamic template cannot hold a device,
+  so its row would be rejected on another instance (`Template is not a device
+  template`) and would update the live instance device on its own. \
+  Enforced in: `services/inventory/app/routers/bulk.py` (`export_devices`) \
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_device_export_leaves_out_instance_devices`, `test_device_export_with_instance_device_imports_clean_on_a_fresh_stack`, `test_device_export_reimported_on_its_own_stack_leaves_instance_device_alone`)
 
 **Out of scope.** Topology import and export (`topology.md`). Ports and device groups
 are not exported or imported.
@@ -1472,6 +1479,9 @@ None at present.
   docstring) (INV-BATCH-4).
 - The internal dynamic-instance delete skips the delete guard (the
   `delete_dynamic_device_internal` docstring) (INV-DEL-9).
+- The device export leaves out dynamic-instance devices rather than exporting them
+  marked for the importer to skip (the `export_devices` docstring, issue #1068)
+  (INV-BULK-21).
 - The delete guard has no force flag (the `device_delete_guard.py` module docstring)
   (INV-DEL-7), and neither has the port delete and rename guard (the
   `port_cabling_guard.py` module docstring) (INV-PORT-8).
