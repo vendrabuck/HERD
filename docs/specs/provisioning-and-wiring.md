@@ -482,8 +482,12 @@ wiring, and only the three terminal events remove it.
   unknown and acked. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`handle_reservation_event`) \
   Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_handle_unknown_event`)
-- **WIRE-DISPATCH-5.** A failure of the health-tier update is logged and never fails the
-  message. \
+- **WIRE-DISPATCH-5.** A failure of the health-tier update never fails the message: the
+  handler does not raise and the rest of the event's work still runs. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`handle_reservation_event`) \
+  Pinned by: `services/execution/tests/test_health_scheduler_scale.py` (`test_handle_reservation_event_survives_tier_failure`)
+- **WIRE-DISPATCH-6.** That failure is logged as a warning,
+  `health tier transition failed for reservation <id>`, with the exception attached. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`handle_reservation_event`) \
   Pinned by: none
 
@@ -1333,7 +1337,7 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
 ### Rules with no test
 
 - WIRE-GATE-5: payload device ids are not cross-checked.
-- WIRE-DISPATCH-5: a failed health-tier update does not fail the message.
+- WIRE-DISPATCH-6: the warning logged when the health-tier update fails.
 - WIRE-DRIVER-2: the in-line retry makes three attempts with backoff (only the constant
   is asserted).
 - WIRE-STATUS-6: the internal routes answer 500 with no token configured.
