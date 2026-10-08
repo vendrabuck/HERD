@@ -245,11 +245,12 @@ the web interface's API does.
   answers 503 `Reservations service unavailable`, fail closed. \
   Enforced in: `services/integration/app/routers/reservations.py` (`_forward`, `UPSTREAM_TIMEOUT`) \
   Pinned by: `services/integration/tests/test_facade.py` (`test_upstream_unreachable_is_503`)
-- **INTEG-FACADE-15.** The `{reservation_id}` path segment is a string, not validated as
-  a UUID by the facade, and is placed into the upstream path as given; reservations
-  validates it. \
+- **INTEG-FACADE-15.** The `{reservation_id}` path segment must be a UUID: anything else
+  is FastAPI's 422 (`uuid_parsing` at `["path", "reservation_id"]`) and no upstream call
+  is made, so a percent-encoded `?` or a dot segment can never change the upstream route.
+  A valid id is forwarded in its canonical lower-case hyphenated form (#1105). \
   Enforced in: `services/integration/app/routers/reservations.py` (`get_reservation`, `cancel_reservation`, `release_reservation`, `get_reservation_wiring_status`) \
-  Pinned by: none
+  Pinned by: `services/integration/tests/test_facade.py` (`test_reservation_id_must_be_a_uuid`, `test_reservation_id_is_forwarded_in_canonical_form`)
 
 **Out of scope.** Token minting and exchange (`identity-and-access.md`); every rule about
 which reservation a caller may act on (`reservations.md`).
@@ -925,7 +926,7 @@ kinds on the Settings page.
 | 403 | `Admin or superadmin role required` | a webhook route without an admin role | INTEG-HOOK-1 |
 | 404 | `Webhook not found` | unknown subscription on read, delete, or deliveries | INTEG-HOOK-6, INTEG-HOOK-7, INTEG-HOOK-10 |
 | 404 | `Notification not found` | unknown or foreign notification on mark read or delete | INTEG-INAPP-6, INTEG-INAPP-9 |
-| 422 | FastAPI validation envelope | a facade body that fails `V1ReservationRequest`; a webhook body with a bad URL, unknown or empty event types, or an over-long field; a facade list or notification list parameter out of range | INTEG-FACADE-4, INTEG-FACADE-6, INTEG-HOOK-2, INTEG-HOOK-3, INTEG-INAPP-3 |
+| 422 | FastAPI validation envelope | a facade body that fails `V1ReservationRequest`; a facade reservation id that is not a UUID; a webhook body with a bad URL, unknown or empty event types, or an over-long field; a facade list or notification list parameter out of range | INTEG-FACADE-4, INTEG-FACADE-6, INTEG-FACADE-15, INTEG-HOOK-2, INTEG-HOOK-3, INTEG-INAPP-3 |
 | upstream status | upstream `detail`, body, or text | reservations refused a facade call | INTEG-FACADE-12, INTEG-FACADE-13 |
 | 503 | `Reservations service unavailable` | reservations unreachable or slower than 10 seconds | INTEG-FACADE-14 |
 | 503 | `user-profile unreachable` | user-profile unreachable on a preferences read or write | INTEG-PREFS-3 |
@@ -1042,7 +1043,6 @@ Two documents are incomplete against the code this specification describes, trac
 ### Rules with no test
 
 - INTEG-FACADE-13: the error detail fallbacks for a body without `detail` or not JSON.
-- INTEG-FACADE-15: the reservation id forwarded unvalidated.
 - INTEG-VERSION-4: the published contract compared with the running service.
 - INTEG-HOOK-4: repeated event names stored once.
 - INTEG-HOOK-8: subscription delete cascades to its ledger rows.

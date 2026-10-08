@@ -111,7 +111,9 @@ token. The facade forwards your JWT to the reservations service, so RBAC,
 device-group visibility, and ACL grants are enforced downstream exactly as for an
 interactive user. Upstream status codes are propagated unchanged (for example a
 `403`, `404`, `409`, or `422` from reservations reaches you as the same status),
-and an unreachable reservations service surfaces as `503`.
+and an unreachable reservations service surfaces as `503`. The `{id}` in every
+`/api/v1/reservations/{id}` path must be a UUID; any other value is answered `422`
+by the facade itself (FastAPI's validation envelope) and never reaches reservations.
 
 ### POST /api/v1/reservations
 

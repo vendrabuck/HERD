@@ -10,6 +10,7 @@ routes carry no extra prefix and the app sees /reservations.
 """
 
 import logging
+import uuid
 from typing import Any
 
 import httpx
@@ -146,7 +147,7 @@ async def list_reservations(
 
 @router.get("/reservations/{reservation_id}", response_model=V1ReservationResponse)
 async def get_reservation(
-    reservation_id: str,
+    reservation_id: uuid.UUID,
     _payload: dict = Depends(get_current_user_payload),
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
@@ -158,7 +159,7 @@ async def get_reservation(
 
 @router.delete("/reservations/{reservation_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def cancel_reservation(
-    reservation_id: str,
+    reservation_id: uuid.UUID,
     _payload: dict = Depends(get_current_user_payload),
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
@@ -170,7 +171,7 @@ async def cancel_reservation(
 
 @router.put("/reservations/{reservation_id}/release", response_model=V1ReservationResponse)
 async def release_reservation(
-    reservation_id: str,
+    reservation_id: uuid.UUID,
     _payload: dict = Depends(get_current_user_payload),
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
@@ -182,7 +183,7 @@ async def release_reservation(
 
 @router.get("/reservations/{reservation_id}/wiring-status")
 async def get_reservation_wiring_status(
-    reservation_id: str,
+    reservation_id: uuid.UUID,
     _payload: dict = Depends(get_current_user_payload),
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
