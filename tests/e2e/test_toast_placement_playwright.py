@@ -231,6 +231,16 @@ def test_inventory_list_toasts_cover_no_control_at_the_bottom(pw_page):
             where = f"inventory {width}x{height}"
             pw_page.set_viewport_size({"width": width, "height": height})
             pw_page.goto(f"{HOST_BASE_URL}/inventory")
+            # A saved filter that matches nothing (one leaked by another test,
+            # issue #1070) would hide every row. Clear it locally through the
+            # Filters region's control; the preference write it causes is
+            # refused by the route above, so the saved value is untouched.
+            pw_page.wait_for_load_state("networkidle")
+            panel_clear = pw_page.get_by_role("region", name="Filters").get_by_role(
+                "button", name="Clear filters"
+            )
+            if panel_clear.count():
+                panel_clear.click()
             duplicate = pw_page.get_by_role("button", name="Duplicate device")
             expect(duplicate.first).to_be_visible(timeout=WAIT_MS)
             expect(pw_page.get_by_label("Rows per page")).to_be_visible()

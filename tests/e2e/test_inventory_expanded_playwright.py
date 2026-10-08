@@ -18,7 +18,11 @@ The test provisions its own uuid-suffixed device (never touches seeded data) and
 deletes it in a finally block. It also reads and restores the "inventory" key of
 its saved search filter, a per-user server-side preference (user-profile service)
 shared with any other concurrent session logged in as the same admin account; a
-leftover filter value would poison the inventory page for another agent's run.
+leftover filter value would poison the inventory page for every later test.
+Every search fill therefore waits for the debounced preference PATCH whose parsed
+body carries that exact search (issue #1070), so no write is still in flight when
+the finally block restores the baseline, and the finally block reads the
+preference back and fails the test that leaked it.
 """
 
 import uuid
@@ -27,7 +31,7 @@ import httpx
 import pytest
 from playwright.sync_api import expect
 
-from .conftest import HOST_BASE_URL, pw_login
+from .conftest import HOST_BASE_URL, pw_login, pw_prefs_patch_carries
 
 
 def _token(page) -> str | None:
@@ -78,6 +82,39 @@ def _required_field_data(template: dict) -> dict:
     return data
 
 
+def _search_saved(term: str):
+    """Predicate for the preference PATCH that saves exactly `term` as the inventory search."""
+    return lambda response: pw_prefs_patch_carries(response, "inventory", term, key="search")
+
+
+def _fill_search_and_wait_for_save(page, search_box, term: str) -> None:
+    """Type a search and wait for the debounced PATCH that saves exactly that term."""
+    with page.expect_response(_search_saved(term)):
+        search_box.fill(term)
+
+
+def _restore_inventory_filter(page, baseline: dict | None) -> None:
+    """Write the baseline back last, then fail the test if the read-back differs.
+
+    `baseline` is None when it was never read (the test skipped first), in which
+    case nothing was changed and nothing is written.
+    """
+    if baseline is None:
+        return
+    _api(
+        page,
+        "PATCH",
+        "/user-profile/preferences",
+        json={"saved_filters": {"inventory": baseline}},
+        allow_errors=True,
+    )
+    after = _api(page, "GET", "/user-profile/preferences", allow_errors=True)
+    if after.status_code == 200:
+        restored = after.json().get("saved_filters", {}).get("inventory") or {}
+        if restored != baseline:
+            pytest.fail(f"inventory preference not restored: {restored!r} != {baseline!r}")
+
+
 def test_inventory_expanded_shows_device_info_panel(pw_page):
     """Expanding a device row renders DeviceInfoPanel with content pinned to the API.
 
@@ -125,16 +162,19 @@ def test_inventory_expanded_shows_device_info_panel(pw_page):
         pytest.skip("could not provision a test device against any available device template")
     device_id = device["id"]
 
-    baseline_inventory_filter: dict = {}
+    baseline_inventory_filter: dict | None = None
     try:
         prefs_before = _api(pw_page, "GET", "/user-profile/preferences", allow_errors=True)
+        baseline_inventory_filter = {}
         if prefs_before.status_code == 200:
             baseline_inventory_filter = (
                 prefs_before.json().get("saved_filters", {}).get("inventory") or {}
             )
 
         pw_page.goto(f"{HOST_BASE_URL}/inventory")
-        pw_page.get_by_placeholder("Search devices by name...").fill(name)
+        _fill_search_and_wait_for_save(
+            pw_page, pw_page.get_by_placeholder("Search devices by name..."), name
+        )
 
         row = pw_page.locator("tbody tr", has_text=name)
         expect(row).to_have_count(1)
@@ -164,13 +204,7 @@ def test_inventory_expanded_shows_device_info_panel(pw_page):
         expect(modified_by_dd).to_have_text(fetched.get("modified_by_name") or "Unknown")
     finally:
         _api(pw_page, "DELETE", f"/inventory/devices/{device_id}", allow_errors=True)
-        _api(
-            pw_page,
-            "PATCH",
-            "/user-profile/preferences",
-            json={"saved_filters": {"inventory": baseline_inventory_filter}},
-            allow_errors=True,
-        )
+        _restore_inventory_filter(pw_page, baseline_inventory_filter)
 
 
 def test_inventory_expansion_survives_delayed_search_refetch(pw_page):
@@ -202,7 +236,7 @@ def test_inventory_expansion_survives_delayed_search_refetch(pw_page):
     name_a = f"e2e-pw-inv-race-{token}-a"
     name_b = f"e2e-pw-inv-race-{token}-b"
     created_ids: list[str] = []
-    baseline_inventory_filter: dict = {}
+    baseline_inventory_filter: dict | None = None
     try:
         for name in (name_a, name_b):
             for template in templates:
@@ -226,6 +260,7 @@ def test_inventory_expansion_survives_delayed_search_refetch(pw_page):
                 pytest.skip("could not provision a test device against any device template")
 
         prefs_before = _api(pw_page, "GET", "/user-profile/preferences", allow_errors=True)
+        baseline_inventory_filter = {}
         if prefs_before.status_code == 200:
             baseline_inventory_filter = (
                 prefs_before.json().get("saved_filters", {}).get("inventory") or {}
@@ -234,8 +269,11 @@ def test_inventory_expansion_survives_delayed_search_refetch(pw_page):
         pw_page.goto(f"{HOST_BASE_URL}/inventory")
         search_box = pw_page.get_by_placeholder("Search devices by name...")
 
-        # Step 1: settle on a list holding only device A.
-        search_box.fill(name_a)
+        # Step 1: settle on a list holding only device A. The PATCH saving name_a
+        # must be observed here: name_a starts with the shared token, and a
+        # name_a PATCH still in flight during step 2 is what used to satisfy
+        # step 2's wait early and leak the shared token (issue #1070).
+        _fill_search_and_wait_for_save(pw_page, search_box, name_a)
         row_a = pw_page.locator("tbody tr", has_text=name_a)
         expect(row_a).to_have_count(1)
         expect(pw_page.locator("tbody tr", has_text=name_b)).to_have_count(0)
@@ -253,21 +291,13 @@ def test_inventory_expansion_survives_delayed_search_refetch(pw_page):
                 route.continue_()
 
         # The page saves the search as a debounced preference PATCH. Wait for the
-        # one carrying the shared token before the cleanup below restores the
-        # baseline, or that late PATCH lands after the restore and poisons the
-        # saved filter for the next run (the search box would start prefilled).
-        def is_shared_prefs_patch(response):
-            request = response.request
-            return (
-                request.method == "PATCH"
-                and "/user-profile/preferences" in response.url
-                and shared in (request.post_data or "")
-            )
-
+        # one whose parsed body saves exactly the shared token before the cleanup
+        # below restores the baseline, or that late PATCH lands after the restore
+        # and poisons the saved filter for every later test (issue #1070).
         pw_page.route("**/api/inventory/devices?*", hold_shared_search)
         try:
             with (
-                pw_page.expect_response(is_shared_prefs_patch),
+                pw_page.expect_response(_search_saved(shared)),
                 pw_page.expect_request(lambda r: f"search={shared}" in r.url),
             ):
                 search_box.fill(shared)
@@ -292,10 +322,4 @@ def test_inventory_expansion_survives_delayed_search_refetch(pw_page):
     finally:
         for device_id in created_ids:
             _api(pw_page, "DELETE", f"/inventory/devices/{device_id}", allow_errors=True)
-        _api(
-            pw_page,
-            "PATCH",
-            "/user-profile/preferences",
-            json={"saved_filters": {"inventory": baseline_inventory_filter}},
-            allow_errors=True,
-        )
+        _restore_inventory_filter(pw_page, baseline_inventory_filter)

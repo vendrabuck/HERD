@@ -6,6 +6,7 @@ Tests connect to the remote WebDriver at http://localhost:4444.
 """
 
 import io
+import json
 import os
 import re
 import tarfile
@@ -713,6 +714,32 @@ def pw_api(page, method, path, **kwargs):
     if not allow_errors:
         resp.raise_for_status()
     return resp
+
+
+_WHOLE_FILTER = object()
+
+
+def pw_prefs_patch_carries(response, page_key: str, expected, key=_WHOLE_FILTER) -> bool:
+    """True for a preferences PATCH whose parsed body saves exactly `expected` (issue #1070).
+
+    Compares `saved_filters[page_key]` (or, with `key`, that one key of it) by
+    equality on the parsed JSON body, never by a substring of the raw body: a
+    substring test matched an earlier PATCH whose search merely started with the
+    awaited value, so the real PATCH landed after the test's restore and leaked
+    the search into every later test. A test that changes a saved filter through
+    the UI waits on this for its final value before it restores the baseline.
+    """
+    request = response.request
+    if request.method != "PATCH" or "/user-profile/preferences" not in response.url:
+        return False
+    try:
+        body = json.loads(request.post_data or "{}")
+    except ValueError:
+        return False
+    saved = (body.get("saved_filters") or {}).get(page_key)
+    if key is _WHOLE_FILTER:
+        return saved == expected
+    return isinstance(saved, dict) and saved.get(key) == expected
 
 
 def pw_two_devices_with_ports(page, min_ports: int = 1):

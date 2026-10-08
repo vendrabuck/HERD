@@ -23,7 +23,6 @@ after the restore would poison the next run), and restores both in a finally wit
 read-back. Cleanup cancels every booked reservation, even on failure.
 """
 
-import json
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -32,7 +31,13 @@ from urllib.parse import parse_qsl, urlparse
 import pytest
 from playwright.sync_api import expect
 
-from .conftest import HOST_BASE_URL, log_cleanup_failure, pw_api, pw_login
+from .conftest import (
+    HOST_BASE_URL,
+    log_cleanup_failure,
+    pw_api,
+    pw_login,
+    pw_prefs_patch_carries,
+)
 
 WAIT_MS = 15000
 SORT_PREF_KEY = "sort:reservations"
@@ -57,17 +62,6 @@ def _is_list_request(response, expected: dict[str, str]) -> bool:
         return False
     plain = {k: v for k, v in params.items() if k not in bounds}
     return plain == {k: v for k, v in expected.items() if k not in want_bounds}
-
-
-def _prefs_patch_carries(response, key: str, expected) -> bool:
-    request = response.request
-    if request.method != "PATCH" or "/user-profile/preferences" not in response.url:
-        return False
-    try:
-        body = json.loads(request.post_data or "{}")
-    except ValueError:
-        return False
-    return (body.get("saved_filters") or {}).get(key) == expected
 
 
 def _read_prefs(page) -> dict:
@@ -203,7 +197,7 @@ def test_search_and_status_filters_and_bulk_on_a_filtered_list(pw_page, filter_t
 
         # Search narrows to this run's three rows (newest created first).
         with page.expect_response(
-            lambda r: _prefs_patch_carries(r, FILTER_PREF_KEY, {"search": token}),
+            lambda r: pw_prefs_patch_carries(r, FILTER_PREF_KEY, {"search": token}),
             timeout=WAIT_MS,
         ):
             with page.expect_response(
@@ -255,7 +249,7 @@ def test_search_and_status_filters_and_bulk_on_a_filtered_list(pw_page, filter_t
         ):
             search.fill(token)
         with page.expect_response(
-            lambda r: _prefs_patch_carries(
+            lambda r: pw_prefs_patch_carries(
                 r, FILTER_PREF_KEY, {"search": token, "status": "CANCELLED"}
             ),
             timeout=WAIT_MS,
@@ -270,7 +264,7 @@ def test_search_and_status_filters_and_bulk_on_a_filtered_list(pw_page, filter_t
         assert all(i["status"] == "CANCELLED" for i in readback["items"])
 
         with page.expect_response(
-            lambda r: _prefs_patch_carries(
+            lambda r: pw_prefs_patch_carries(
                 r, FILTER_PREF_KEY, {"search": token, "status": "PENDING"}
             ),
             timeout=WAIT_MS,
@@ -297,7 +291,7 @@ def test_search_and_status_filters_and_bulk_on_a_filtered_list(pw_page, filter_t
         _assert_matches_api(page, listed.value)
         empty = page.get_by_text("No reservations match the current filters.")
         with page.expect_response(
-            lambda r: _prefs_patch_carries(r, FILTER_PREF_KEY, {"search": ""}),
+            lambda r: pw_prefs_patch_carries(r, FILTER_PREF_KEY, {"search": ""}),
             timeout=WAIT_MS,
         ):
             empty.get_by_role("button", name="Clear filters", exact=True).click()

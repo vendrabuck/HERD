@@ -18,14 +18,20 @@ PATCH landing after the restore would poison the next run), and restores the
 baseline in a finally block with a read-back.
 """
 
-import json
 import uuid
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from playwright.sync_api import expect
 
-from .conftest import HOST_BASE_URL, driver_tarball, log_cleanup_failure, pw_api, pw_login
+from .conftest import (
+    HOST_BASE_URL,
+    driver_tarball,
+    log_cleanup_failure,
+    pw_api,
+    pw_login,
+    pw_prefs_patch_carries,
+)
 
 
 def _is_list_request(response, expected: dict[str, str]) -> bool:
@@ -39,17 +45,6 @@ def _is_list_request(response, expected: dict[str, str]) -> bool:
     if params.pop("limit", None) != "50" or params.pop("skip", None) != "0":
         return False
     return params == expected
-
-
-def _prefs_patch_carries(response, expected: dict) -> bool:
-    request = response.request
-    if request.method != "PATCH" or "/user-profile/preferences" not in response.url:
-        return False
-    try:
-        body = json.loads(request.post_data or "{}")
-    except ValueError:
-        return False
-    return (body.get("saved_filters") or {}).get("inventory") == expected
 
 
 def _read_inventory_pref(page) -> dict:
@@ -143,10 +138,15 @@ def test_inventory_status_and_template_filters(pw_page):
         template_select = pw_page.get_by_label("Template", exact=True)
 
         # A baseline preference left by another session must not leak in: start
-        # from the cleared state (the finally block restores the baseline).
+        # from the cleared state (the finally block restores the baseline). Use
+        # the Filters region's control: a saved filter that matches nothing also
+        # renders a second "Clear filters" in the table's empty state (issue #1070).
         pw_page.wait_for_load_state("networkidle")
-        if pw_page.get_by_role("button", name="Clear filters").count():
-            pw_page.get_by_role("button", name="Clear filters").click()
+        panel_clear = pw_page.get_by_role("region", name="Filters").get_by_role(
+            "button", name="Clear filters"
+        )
+        if panel_clear.count():
+            panel_clear.click()
 
         with pw_page.expect_response(lambda r: _is_list_request(r, {"search": token})):
             search.fill(token)
@@ -235,7 +235,7 @@ def test_inventory_status_and_template_filters(pw_page):
         # Final choice: persist a filter, wait for the PATCH carrying it, then
         # prove the saved object reads back and survives a reload.
         final_pref = {"search": "", "status": "AVAILABLE"}
-        with pw_page.expect_response(lambda r: _prefs_patch_carries(r, final_pref)):
+        with pw_page.expect_response(lambda r: pw_prefs_patch_carries(r, "inventory", final_pref)):
             status_select.select_option("AVAILABLE")
         assert _read_inventory_pref(pw_page) == final_pref
 
