@@ -1,12 +1,13 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
+from app import login_limits
 from app.auth import create_session_token, require_config_session
-from app.config_schema import CONFIG_SCHEMA
+from app.config_schema import CONFIG_SCHEMA, SCHEMA_KEYS
 from app.config_store import (
     bootstrap_from_env,
     change_password,
@@ -35,10 +36,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# The wildcard origin is deliberate (this is the one service that does not use
+# herd_common's CORS helper). Credentials are never allowed: the config session
+# is a bearer token the page sends in the Authorization header, so no request
+# needs credentials mode, and a wildcard with credentials would echo any Origin
+# back with Access-Control-Allow-Credentials (issue #1111).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -87,10 +93,29 @@ async def get_status():
     }
 
 
+LOGIN_LOCKED_DETAIL = "Too many failed login attempts; try again later"
+
+
 @app.post("/login")
-async def login(req: LoginRequest):
+async def login(req: LoginRequest, request: Request):
+    # Attempt limits (app/login_limits.py): a waiting source, or every source
+    # during a cross-source lockout, is refused before the password is checked.
+    limiter = login_limits.LIMITER
+    source = login_limits.client_source(
+        request.headers.get("x-forwarded-for"),
+        request.client.host if request.client else None,
+    )
+    wait = limiter.retry_after(source)
+    if wait is not None:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            LOGIN_LOCKED_DETAIL,
+            headers={"Retry-After": str(wait)},
+        )
     if not verify_password(req.password):
+        limiter.record_failure(source)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid password")
+    limiter.record_success(source)
     token = create_session_token()
     return {
         "token": token,
@@ -135,7 +160,13 @@ async def get_settings(_session: dict = Depends(require_config_session)):
     # in the editor when config.json is missing the key; file wins on conflict.
     # This mirrors the runtime source order for a UI-saved file in
     # herd_common.config_loader.herd_settings_sources; keep the two in sync.
-    merged = {**load_env_values(), **load_config()}
+    # Only schema keys are shown, so the editor never sends back a key the save
+    # refuses (issue #1109); a key placed in the file by hand stays there.
+    merged = {
+        key: value
+        for key, value in {**load_env_values(), **load_config()}.items()
+        if key in SCHEMA_KEYS
+    }
     secret_keys = {f["key"] for f in CONFIG_SCHEMA if f.get("secret")}
     redacted = {}
     for key, value in merged.items():
@@ -156,6 +187,15 @@ async def update_settings(
     # write the placeholder itself: once saved, config.json outranks the
     # environment at runtime (herd_common.config_loader.herd_settings_sources),
     # so a literal "********" would become the live credential.
+    #
+    # Only CONFIG_SCHEMA keys may be written (issue #1109): a body naming any
+    # other key is refused whole, before anything is resolved or written.
+    unknown = sorted(set(req.values) - SCHEMA_KEYS)
+    if unknown:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            {"errors": [f"Unknown settings: {', '.join(unknown)}"]},
+        )
     existing = load_config()
     env_values = load_env_values()
     secret_keys = {f["key"] for f in CONFIG_SCHEMA if f.get("secret")}
@@ -168,6 +208,11 @@ async def update_settings(
                 merged[key] = env_values[key]
             else:
                 merged.pop(key, None)
+    # A key already in the file outside the schema (placed there by hand) is
+    # carried over unchanged: the save can neither set nor change it.
+    for key, value in existing.items():
+        if key not in SCHEMA_KEYS:
+            merged[key] = value
 
     errors = save_config(merged)
     if errors:

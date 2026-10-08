@@ -132,10 +132,16 @@ def load_config() -> dict:
         return {}
     try:
         with open(CONFIG_FILE) as f:
-            return json.load(f)
+            loaded = json.load(f)
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Ignoring corrupt config file %s: %s", CONFIG_FILE, exc)
         return {}
+    if not isinstance(loaded, dict):
+        # Valid JSON that is not an object holds no settings; treat it like a
+        # corrupt file rather than handing callers a list or a scalar.
+        logger.warning("Ignoring config file %s: not a JSON object", CONFIG_FILE)
+        return {}
+    return loaded
 
 
 def save_config(values: dict) -> list[str]:

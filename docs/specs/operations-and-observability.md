@@ -121,7 +121,7 @@ while it is still due, so concurrent schedulers and replicas poll disjoint rows
 | GET | `/device-health/{device_id}` (execution) | any signed-in user | 200 | OPS-HEALTH-1, OPS-HEALTH-2 |
 | GET | `/device-health` (execution) | admin | 200 | OPS-HEALTH-3, OPS-HEALTH-4 |
 | GET | `/status` (config) | anyone | 200 | OPS-CONFIG-4 |
-| POST | `/login` (config) | anyone with the config password | 200 | OPS-CONFIG-6, OPS-CONFIG-7 |
+| POST | `/login` (config) | anyone with the config password, within the attempt limits | 200 | OPS-CONFIG-6, OPS-CONFIG-7, OPS-CONFIG-22 |
 | POST | `/change-password` (config) | config session | 200 | OPS-CONFIG-8 |
 | GET | `/schema` (config) | anyone | 200 | OPS-CONFIG-10 |
 | GET | `/settings` (config) | config session | 200 | OPS-CONFIG-10 |
@@ -494,19 +494,23 @@ presses Save and Restart. Login to HERD stays disabled until the file exists.
   Pinned by: `services/config/tests/test_config.py` (`test_put_settings_locked_until_rotated`, `test_apply_locked_until_rotated`, `test_write_allowed_with_operator_password`)
 - **OPS-CONFIG-10.** `GET /schema` lists the editable fields to anyone; `GET /settings`
   needs a session and answers the environment values overlaid by the file's values,
-  with every non-empty secret field shown as `********`. \
-  Enforced in: `services/config/app/main.py` (`get_schema`, `get_settings`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_schema`, `test_get_settings_includes_env_values_when_no_file`, `test_get_settings_file_overrides_env`, `test_get_settings_redacts_env_secrets`, `test_settings_unauthenticated`)
+  limited to the schema's keys, with every non-empty secret field shown as `********`. \
+  Enforced in: `services/config/app/main.py` (`get_schema`, `get_settings`, `SCHEMA_KEYS`) \
+  Pinned by: `services/config/tests/test_config.py` (`test_schema`, `test_get_settings_includes_env_values_when_no_file`, `test_get_settings_file_overrides_env`, `test_get_settings_redacts_env_secrets`, `test_settings_unauthenticated`, `test_get_settings_answers_schema_keys_only`)
 - **OPS-CONFIG-11.** A secret field sent back as `********` keeps the file's value, else
   the environment's; with neither it is dropped, and the placeholder itself is never
   written. \
   Enforced in: `services/config/app/main.py` (`update_settings`) \
   Pinned by: `services/config/tests/test_config.py` (`test_save_settings_preserves_redacted_secrets`, `test_save_settings_resolves_masked_secret_from_env`, `test_save_settings_drops_masked_optional_secret_without_source`, `test_save_settings_masked_required_secret_without_source_is_422`)
-- **OPS-CONFIG-12.** A save missing a required field, or carrying it blank, is 422
-  `{"errors": ["<KEY> is required", ...]}` and writes nothing; otherwise the body's
-  values are written as given. \
-  Enforced in: `services/config/app/config_store.py` (`save_config`); `services/config/app/main.py` (`update_settings`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_save_settings_missing_required`, `test_save_config_blank_required`, `test_save_and_get_settings`)
+- **OPS-CONFIG-12.** A save may write only keys `CONFIG_SCHEMA` declares: a body naming
+  any other key is 422 `{"errors": ["Unknown settings: <KEY>, ..."]}` (the unknown keys
+  sorted, checked first) and writes nothing. A save missing a required field, or carrying
+  it blank, is 422 `{"errors": ["<KEY> is required", ...]}` and writes nothing. Otherwise
+  the body's values are written, and a key already in the file outside the schema (placed
+  there by hand) is carried over unchanged. A file that is not a JSON object reads as
+  empty. \
+  Enforced in: `services/config/app/main.py` (`update_settings`, `SCHEMA_KEYS`); `services/config/app/config_schema.py` (`SCHEMA_KEYS`); `services/config/app/config_store.py` (`save_config`, `load_config`) \
+  Pinned by: `services/config/tests/test_config.py` (`test_save_settings_refuses_keys_outside_the_schema`, `test_save_settings_with_unknown_key_leaves_existing_file_unchanged`, `test_unknown_key_is_refused_before_the_required_check`, `test_save_settings_with_schema_keys_only_saves`, `test_save_settings_keeps_keys_already_in_the_file_outside_the_schema`, `test_load_config_non_object_returns_empty`, `test_save_settings_missing_required`, `test_save_config_blank_required`, `test_save_and_get_settings`)
 - **OPS-CONFIG-13.** `POST /apply` restarts only containers of the config service's own
   compose project, read from its own container's label; when that label cannot be read
   it restarts nothing and reports an error. \
@@ -544,6 +548,30 @@ presses Save and Restart. Login to HERD stays disabled until the file exists.
   through `GET /settings`. \
   Enforced in: `frontend/src/pages/ConfigPage.tsx` (`ConfigPage`) \
   Pinned by: `tests/e2e/test_config_playwright.py` (`test_config_save_persists_value_via_api_readback`, `test_config_full_cycle_edit_and_restore_via_ui`)
+- **OPS-CONFIG-21.** The config service answers cross-origin requests from any origin
+  (`allow_origins=["*"]`, deliberately not `herd_common`'s CORS helper) and never allows
+  credentials: a preflight or a request carrying a cookie gets
+  `Access-Control-Allow-Origin: *` and no `Access-Control-Allow-Credentials`. The page
+  sends its session in the `Authorization` header, which needs no credentials mode. \
+  Enforced in: `services/config/app/main.py` (`CORSMiddleware`, `allow_credentials=False`) \
+  Pinned by: `services/config/tests/test_cors.py` (`test_cors_middleware_options_are_wildcard_without_credentials`, `test_preflight_from_any_origin_allows_no_credentials`, `test_simple_request_with_cookie_does_not_echo_the_origin`)
+- **OPS-CONFIG-22.** `POST /login` limits failed attempts in process, per source address
+  and across all sources. From a source's third consecutive failure on, it waits before
+  its next attempt: 1 second, doubling with each further failure, capped at 60 seconds;
+  a source with no failure for 15 minutes starts over. When `CONFIG_LOGIN_MAX_ATTEMPTS`
+  failures (default 20) from any sources fall within `CONFIG_LOGIN_LOCKOUT_SECONDS`
+  (default 300), every source waits that long. While a wait applies the login is 429
+  `Too many failed login attempts; try again later` with `Retry-After` in whole seconds,
+  answered before the password is checked. A successful login clears its source's
+  failures and the cross-source count. Each wait that begins logs one WARNING line
+  starting `config_login_locked` with the scope (`source` or `global`), the source
+  address, the failure count, and the wait, and never the password. The source is the
+  first `X-Forwarded-For` entry when it is an IP address, else the peer, which relies on
+  Traefik replacing any client-supplied value; state is per process on the monotonic
+  clock, with idle sources dropped and at most 10,000 kept. A knob that is not a positive
+  integer falls back to its default with a warning. \
+  Enforced in: `services/config/app/login_limits.py` (`LoginLimiter`, `source_delay_seconds`, `client_source`, `LIMITER`); `services/config/app/main.py` (`login`, `LOGIN_LOCKED_DETAIL`) \
+  Pinned by: `services/config/tests/test_login_limits.py` (`test_source_delay_schedule_starts_after_the_third_failure_and_caps_at_60`, `test_each_failure_sets_the_scheduled_wait`, `test_wait_counts_down_and_expires`, `test_success_resets_the_source`, `test_sources_are_isolated`, `test_a_quiet_source_starts_over`, `test_global_lockout_after_max_attempts_across_sources`, `test_global_window_slides`, `test_success_clears_the_cross_source_count`, `test_tracked_sources_are_bounded`, `test_idle_sources_are_dropped`, `test_knobs_are_read_from_the_environment`, `test_knob_defaults`, `test_a_knob_that_is_not_a_positive_integer_falls_back_to_its_default`, `test_source_is_the_first_forwarded_address`, `test_source_falls_back_to_the_peer`, `test_lock_log_line_names_source_scope_and_wait`, `test_login_waits_after_the_third_failure`, `test_login_success_resets_the_count`, `test_login_sources_are_keyed_on_the_forwarded_address`, `test_login_global_lockout_refuses_every_source`, `test_login_lock_log_never_carries_the_password`, `test_login_limits_imports_only_the_standard_library`)
 
 **Out of scope.** The superadmin seed that reads `SUPERADMIN_*` (`identity-and-access.md`,
 IAM-BOOT-1 to IAM-BOOT-5); the meaning of each field (each area's Configuration section).
@@ -1300,10 +1328,12 @@ CLI documentation guard (OPS-NATS-14).
 | Status | Error key or detail | When | Rule |
 |---|---|---|---|
 | 401 | `Invalid password` | config login with a wrong password, or with an unreadable auth file | OPS-CONFIG-6, OPS-CONFIG-7 |
+| 429 | `Too many failed login attempts; try again later`, with `Retry-After` | config login while its source, or every source, is waiting after failed attempts | OPS-CONFIG-22 |
 | 401 | `Session expired`, `Invalid session token` | a config route with an expired or bad session token | OPS-CONFIG-17 |
 | 403 | `Change the config password before modifying or applying configuration` | config save or apply before the password is rotated | OPS-CONFIG-9 |
 | 422 | validation list | a new config password outside 8 to 32 characters | OPS-CONFIG-8 |
 | 422 | `{"errors": ["<KEY> is required", ...]}` | a config save missing a required field, including a masked secret with no source | OPS-CONFIG-11, OPS-CONFIG-12 |
+| 422 | `{"errors": ["Unknown settings: <KEY>, ..."]}` | a config save naming a key outside `CONFIG_SCHEMA` | OPS-CONFIG-12 |
 | 400 | `No configuration to apply` | config apply with no `config.json` | OPS-CONFIG-15 |
 | 200 | `{"restarted": [...], "errors": [...]}` | config apply; failures are entries in `errors` | OPS-CONFIG-13, OPS-CONFIG-16 |
 | 403 | `Admin or superadmin role required` | a non-admin lists health snapshots, reads a report, or writes a secret | OPS-HEALTH-3, OPS-REPORT-1, OPS-SECRET-1 |
@@ -1371,6 +1401,8 @@ Startup refusals (no HTTP answer; the container exits or waits):
 | `HERD_CONFIG_DATA_DIR` (config) | `/data/herd-config` | Where the config service keeps `config.json`, the marker, and the auth file |
 | `CONFIG_ADMIN_PASSWORD` (config) | empty | The config-page password; empty means a generated one (OPS-CONFIG-5) |
 | `CONFIG_SESSION_SECRET` (config) | empty | Session signing key; empty means a random per-process key (OPS-CONFIG-17) |
+| `CONFIG_LOGIN_MAX_ATTEMPTS` (config) | `20` | Failed config logins across all sources, within the lockout window, that make every source wait (OPS-CONFIG-22) |
+| `CONFIG_LOGIN_LOCKOUT_SECONDS` (config) | `300` | The cross-source window and wait (OPS-CONFIG-22) |
 | `OUTBOX_RELAY_TICK_SECONDS` (reservations, execution) | `5.0` | Relay base cadence (OPS-OUTBOX-7) |
 | `OUTBOX_BATCH_SIZE` | `100` | Rows per relay pass (OPS-OUTBOX-4) |
 | `OUTBOX_RETENTION_SECONDS` | `604800` | Age after which published rows are pruned (OPS-OUTBOX-8) |
@@ -1396,7 +1428,9 @@ Startup refusals (no HTTP answer; the container exits or waits):
 
 Fixed in code, not configurable: the 10 s outbox publish timeout and the hourly prune;
 the five-minute poll claim window; the 5 s and 60 s schema-gate poll and warning
-periods; the 30-minute config session; the 500-reservation transit chunk and the
+periods; the 30-minute config session; the per-source config login schedule (two free
+failures, then 1 s doubling to 60 s, a source forgotten after 15 quiet minutes, at most
+10,000 sources kept); the 500-reservation transit chunk and the
 100,000-device fleet stop; the preference caps of 200 keys, 64 KB, and page sizes of 1
 to 500.
 
@@ -1446,6 +1480,10 @@ None at present.
   Recorded in the docstring of `_build_fleet_section`.
 - A user in several groups counts in each group's line (OPS-REPORT-5). Recorded in the
   comment in `rollup_by_group`.
+- Config login attempt counts live in one config process: a restart clears them,
+  replicas count separately, and a cross-source wait applies to the operator too
+  (OPS-CONFIG-22). Recorded in the module docstring of
+  `services/config/app/login_limits.py`.
 - The config session ends on every config-service restart unless
   `CONFIG_SESSION_SECRET` is set (OPS-CONFIG-17). Recorded in issue #246 and the
   docstring of `_load_session_secret`.

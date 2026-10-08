@@ -52,6 +52,8 @@ If any required var is missing, the config service logs a warning listing them a
 
 Config-page values take precedence over `.env` for every key that has been saved through the config UI; a `config.json` that exists only from the first-run auto-bootstrap stays subordinate to `.env`, so pure-`.env` operation is unchanged until the first UI save (see the precedence section in `ENV_VARS.md` for the marker mechanics and the escape hatches). The config UI's own password is independent of the app config: set `CONFIG_ADMIN_PASSWORD` to pin it, otherwise the wrench icon accepts the random password logged on first boot, which stays valid until it is changed.
 
+The config login limits failed attempts. From a source address's third consecutive failure, that source waits before its next try (1 second, doubling to 60 seconds), and once `CONFIG_LOGIN_MAX_ATTEMPTS` failures (default 20) from any sources fall within `CONFIG_LOGIN_LOCKOUT_SECONDS` (default 300), every login waits that long, including yours. A waiting login gets HTTP 429 with a `Retry-After` header, and each wait that begins logs one WARNING line starting `config_login_locked` with the scope and source address (`docker compose logs config`). A successful login clears the counts, and restarting the config service (`docker compose restart config`) clears them too. The source address is the client address Traefik forwards, so if you put another proxy in front of Traefik, configure Traefik's `forwardedHeaders.trustedIPs` for it or every client shares that proxy's address.
+
 ## Upgrade path
 
 For new schema additions between HERD versions:

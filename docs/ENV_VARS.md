@@ -146,7 +146,7 @@ If you run a service on a different host or port, update the URL in `.env` or th
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CORS_ORIGINS` | `""` in code; `https://localhost` at the docker-compose level | Comma-separated origins allowed by every backend's CORS middleware. Each service's `app/config.py` defaults to an empty string; `docker-compose.yml` supplies `${CORS_ORIGINS:-https://localhost}` for every service, so a fresh `.env` (which also sets `CORS_ORIGINS=https://localhost`) gets `https://localhost` in practice. Add your real hostname or IP to enable cross-host access. |
+| `CORS_ORIGINS` | `""` in code; `https://localhost` at the docker-compose level | Comma-separated origins allowed by every backend's CORS middleware. Each service's `app/config.py` defaults to an empty string; `docker-compose.yml` supplies `${CORS_ORIGINS:-https://localhost}` for every service, so a fresh `.env` (which also sets `CORS_ORIGINS=https://localhost`) gets `https://localhost` in practice. Add your real hostname or IP to enable cross-host access. The config service does not read it: it allows any origin and never allows credentials. |
 
 TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env var for cert paths. See [OPERATIONS.md](OPERATIONS.md#tls-certificate-rotation).
 
@@ -170,10 +170,17 @@ TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env 
 The config page login password is set by `CONFIG_ADMIN_PASSWORD`; there is no longer a
 hardcoded default. Config service auth is separate from HERD JWT.
 
+The config page saves only the settings its schema lists (`GET /api/config/schema`): a save
+naming any other key is refused with 422 and writes nothing. A key you place in
+`config.json` by hand outside the schema is not shown in the editor and is carried over
+unchanged by the next save; edit or remove it by hand.
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CONFIG_ADMIN_PASSWORD` | random per deploy | The config-page login password (`services/config/app/config_store.py`). When set, that value is the password and the config write/apply surface is unlocked. When unset, a random password is generated on first boot and logged once at WARNING (read it from the config container logs); the write and apply endpoints return 403 until you log in and change the password. The logged password stays a valid config login until it is changed, so set this variable or change the password promptly, and treat the config container's log as sensitive until then. Never a source-visible constant. |
 | `CONFIG_SESSION_SECRET` | random per process | HMAC key that signs and verifies the short-lived config-session token issued after config login (`services/config/app/auth.py`). If unset, a random secret is generated at process start, so sessions do not survive a config-service restart. Set it to a strong shared value only when you run multiple config replicas and need a session to verify across them. It is never a source-visible constant. |
+| `CONFIG_LOGIN_MAX_ATTEMPTS` | `20` | Failed config-page logins, from any mix of source addresses within `CONFIG_LOGIN_LOCKOUT_SECONDS`, after which every login is refused with 429 and `Retry-After` for `CONFIG_LOGIN_LOCKOUT_SECONDS` (`services/config/app/login_limits.py`). Separately, each source address waits after its third consecutive failure: 1 second, doubling to a cap of 60 seconds (fixed in code). A successful login clears both counts. Counts live in the config process only, so a restart clears them. A value that is not a positive integer falls back to the default with a warning. |
+| `CONFIG_LOGIN_LOCKOUT_SECONDS` | `300` | The window over which `CONFIG_LOGIN_MAX_ATTEMPTS` counts failures, and how long every login waits once it is reached. |
 
 ## AI orchestrator
 
