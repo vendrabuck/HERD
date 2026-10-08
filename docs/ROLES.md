@@ -1931,9 +1931,10 @@ device's groups with the same 404 an unknown id gets (`Device not found`, or `Ap
 not found` for a job, judged by the job's own device). The write routes answer 404 for
 an unknown device before they check authorization, so a 403 means the device exists;
 apply and schedule also check the version first (`Config version not found`), while
-restore checks it after authorization. Confirm checks the job exists, then that it is a
-successful dry run (409 otherwise), then authorization. An admin passes every
-authorization check. Apply and schedule then refuse a driver whose connection type has
+restore checks it after authorization. Confirm checks the job exists (404, with no
+authority lookup), then authorization, then that the job is a successful dry run (409
+otherwise), so a caller without authority learns only that the job exists (issue #1113).
+An admin passes every authorization check. Apply and schedule then refuse a driver whose connection type has
 no `configure` with 409 `driver_cannot_configure`. Cancelling a job (`DELETE
 /apply-jobs/{id}`) is open to its creator and to admins, and only while it is `pending`:
 anything else, including a cancel that loses to the scheduler claiming the job, is 409
