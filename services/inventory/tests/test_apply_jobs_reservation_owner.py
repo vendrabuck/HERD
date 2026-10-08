@@ -415,3 +415,81 @@ async def test_scheduled_for_just_within_horizon_returns_201(admin_client):
         json={"scheduled_for": just_within},
     )
     assert resp.status_code == 201, resp.text
+
+
+# --- Immediate apply: no reservation widening (issue #1092) -----------------
+
+
+@pytest.mark.asyncio
+async def test_reservation_owner_without_grant_is_refused_immediate_apply(admin_client):
+    """Execution admits a non-admin `configure` only with an explicit manage
+    grant, so inventory refuses the reservation owner's immediate apply up front
+    with a pinned 403 instead of forwarding a call execution always refuses.
+    The same owner still passes the schedule route (widening kept there)."""
+    device_id, version_id = await _seed_device(admin_client)
+
+    app.dependency_overrides[get_current_user_payload] = lambda: USER_PAYLOAD
+    execution_client = AsyncMock()
+    with (
+        patch("herd_common.acl._owns_active_reservation", new=AsyncMock(return_value=True)),
+        patch(
+            "app.services.manage_guard.user_has_grant", new=AsyncMock(return_value=False)
+        ) as grant,
+        patch("herd_common.acl.user_has_grant", new=AsyncMock(return_value=False)),
+        patch("app.routers.device_configs.httpx.AsyncClient", execution_client),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.post(
+                f"/devices/{device_id}/config-versions/{version_id}/apply",
+                headers={"Authorization": "Bearer t"},
+            )
+            scheduled = await ac.post(
+                f"/devices/{device_id}/config-versions/{version_id}/schedule",
+                json={"scheduled_for": _future_iso()},
+                headers={"Authorization": "Bearer t"},
+            )
+    assert resp.status_code == 403, resp.text
+    assert resp.json() == {
+        "detail": (
+            "manage grant required on this device for an immediate apply "
+            "(a reservation owner can schedule the apply instead)"
+        )
+    }
+    execution_client.assert_not_called()
+    grant.assert_awaited_once()
+    assert grant.await_args.kwargs["permission"] == "manage"
+    assert grant.await_args.kwargs["resource_type"] == "device"
+    assert grant.await_args.kwargs["resource_id"] == device_id
+    assert grant.await_args.kwargs["authorization"] == "Bearer t"
+    assert scheduled.status_code == 201, scheduled.text
+
+
+@pytest.mark.asyncio
+async def test_explicit_manage_check_without_token_is_false_and_asks_nobody():
+    from app.services import manage_guard
+
+    grant = AsyncMock(return_value=True)
+    with patch("app.services.manage_guard.user_has_grant", new=grant):
+        assert await manage_guard._user_has_explicit_manage("u", uuid.uuid4(), None) is False
+        assert await manage_guard._user_has_explicit_manage("u", uuid.uuid4(), "") is False
+    grant.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", [True, False])
+async def test_explicit_manage_check_relays_the_acl_answer(answer):
+    from app.services import manage_guard
+
+    device_id = uuid.uuid4()
+    grant = AsyncMock(return_value=answer)
+    with patch("app.services.manage_guard.user_has_grant", new=grant):
+        got = await manage_guard._user_has_explicit_manage("u1", device_id, "Bearer x")
+    assert got is answer
+    grant.assert_awaited_once_with(
+        user_id="u1",
+        resource_type="device",
+        resource_id=str(device_id),
+        permission="manage",
+        authorization="Bearer x",
+        acl_service_url=settings.acl_service_url,
+    )

@@ -270,14 +270,14 @@ and `user_has_manage_or_owns_active_reservation` in
   this area without asking acl or reservations. \
   Enforced in: `services/inventory/app/services/manage_guard.py` (`_is_admin`) \
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_create_config_version_happy_path`, `test_schedule_apply_job`); `services/inventory/tests/test_confirm_dry_run.py` (`test_confirm_promotes_dry_run_to_real_apply`)
-- **CFG-AUTH-3.** Any other caller passes create, restore, apply, schedule, and confirm
-  only when it holds an explicit `manage` grant on the device (acl `POST /check` with
+- **CFG-AUTH-3.** Any other caller passes create, restore, schedule, and confirm
+  (the immediate apply is narrower, CFG-APPLY-5) only when it holds an explicit `manage` grant on the device (acl `POST /check` with
   the caller's own token) or owns an `ACTIVE` reservation that holds the device
   (reservations `GET /internal/active?user_id&device_id` with the internal token);
   otherwise 403
   `manage permission required on this device (or active reservation ownership)`. \
   Enforced in: `services/inventory/app/services/manage_guard.py` (`_user_can_manage_device`); `services/common/herd_common/acl.py` (`user_has_manage_or_owns_active_reservation`, `_explicit_acl_manage`, `_owns_active_reservation`) \
-  Pinned by: `services/inventory/tests/test_device_configs_rbac.py` (`test_non_admin_create_version_denied_without_acl_grant`, `test_non_admin_create_version_succeeds_with_acl_grant`, `test_non_admin_restore_denied_without_acl_grant`, `test_non_admin_apply_denied_without_acl_grant`, `test_non_admin_schedule_denied_without_acl_grant`, `test_non_admin_schedule_succeeds_with_acl_grant`); `services/inventory/tests/test_apply_jobs_reservation_owner.py` (`test_reservation_owner_can_schedule_without_explicit_grant`, `test_reservation_owner_can_create_config_version`, `test_non_owner_without_grant_still_rejected`); `services/inventory/tests/test_confirm_dry_run.py` (`test_confirm_non_admin_without_grant_rejected`, `test_confirm_non_admin_owner_allowed`); `services/common/tests/test_acl.py` (`test_explicit_grant_returns_true`, `test_no_explicit_grant_falls_through_to_reservation_check`, `test_no_grant_no_reservation_returns_false`)
+  Pinned by: `services/inventory/tests/test_device_configs_rbac.py` (`test_non_admin_create_version_denied_without_acl_grant`, `test_non_admin_create_version_succeeds_with_acl_grant`, `test_non_admin_restore_denied_without_acl_grant`, `test_non_admin_schedule_denied_without_acl_grant`, `test_non_admin_schedule_succeeds_with_acl_grant`); `services/inventory/tests/test_apply_jobs_reservation_owner.py` (`test_reservation_owner_can_schedule_without_explicit_grant`, `test_reservation_owner_can_create_config_version`, `test_non_owner_without_grant_still_rejected`); `services/inventory/tests/test_confirm_dry_run.py` (`test_confirm_non_admin_without_grant_rejected`, `test_confirm_non_admin_owner_allowed`); `services/common/tests/test_acl.py` (`test_explicit_grant_returns_true`, `test_no_explicit_grant_falls_through_to_reservation_check`, `test_no_grant_no_reservation_returns_false`)
 - **CFG-AUTH-4.** The check fails closed. With no bearer token, or when acl is
   unreachable, answers non-200, or answers non-JSON, the grant counts as absent and the
   reservation check still runs; that check answers no when no internal token is
@@ -536,12 +536,16 @@ versions to the device immediately and sees whether the push worked.
   current config pointer moves to the version; both are committed before the answer. \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_apply_success_flips_current_pointer`, `test_apply_failure_does_not_flip_current_pointer`); `services/inventory/tests/test_device_configs_rbac.py` (`test_apply_with_malformed_run_id_returns_200_and_persists_pointer`)
-- **CFG-APPLY-5.** Execution admits a non-admin's `configure` only with an explicit
-  `manage` grant (CFG-EXEC-1), so the owner of an active reservation who passes
-  inventory's check without a grant always gets 200 `failed` with
-  `403 Admin access or device manage grant required`. Known gap, see #1092. \
-  Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`, `_user_has_acl_manage`); `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
-  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_execute_non_admin_configure_without_grant_forbidden`); `services/inventory/tests/test_device_configs.py` (`test_apply_surfaces_403_verbatim`)
+- **CFG-APPLY-5.** The immediate apply forwards the caller's token to execution, which
+  admits a non-admin's `configure` only with an explicit `manage` grant (CFG-EXEC-1), so
+  inventory asks the same question up front with no reservation widening: a non-admin
+  passes only with an explicit acl `manage` grant on the device (no bearer token, or any
+  acl failure, counts as no grant), otherwise 403
+  `manage grant required on this device for an immediate apply (a reservation owner can schedule the apply instead)`
+  before any execution call. A reservation owner without a grant schedules the apply
+  instead (CFG-AUTH-3), which runs through execution's internal route. \
+  Enforced in: `services/inventory/app/services/manage_guard.py` (`_user_has_explicit_manage`, `IMMEDIATE_APPLY_FORBIDDEN_DETAIL`); `services/inventory/app/routers/device_configs.py` (`apply_config_version`); `services/execution/app/routers/executions.py` (`manual_execute`, `_user_has_acl_manage`) \
+  Pinned by: `services/inventory/tests/test_apply_jobs_reservation_owner.py` (`test_reservation_owner_without_grant_is_refused_immediate_apply`, `test_explicit_manage_check_without_token_is_false_and_asks_nobody`, `test_explicit_manage_check_relays_the_acl_answer`); `services/inventory/tests/test_device_configs_rbac.py` (`test_non_admin_apply_denied_without_acl_grant`); `services/execution/tests/test_router_endpoints.py` (`test_execute_non_admin_configure_without_grant_forbidden`)
 - **CFG-APPLY-6.** The device's current config pointer is written through one helper by
   both paths: an immediate apply that succeeded and a scheduled job that succeeded and
   was not a dry run (CFG-SCHED-10). No route returns it; the latest-version internal
@@ -1206,9 +1210,10 @@ status.
 |---|---|---|---|
 | 401 | `Not authenticated` or `Could not validate credentials` | no bearer token, or one that does not verify | CFG-AUTH-1 |
 | 403 | `manage permission required on this device (or active reservation ownership)` | an inventory write by a caller without `manage` or an active reservation | CFG-AUTH-3 |
+| 403 | `manage grant required on this device for an immediate apply (a reservation owner can schedule the apply instead)` | a non-admin immediate apply without an explicit `manage` grant | CFG-APPLY-5 |
 | 403 | `Not authorized to cancel this job` | a cancel by someone other than the creator or an admin | CFG-JOB-10 |
 | 403 | `Admin access required` | a non-admin `POST /execute` of another action; a non-admin `GET /runs` without `reservation_id`; a transcript of a run with no reservation | CFG-EXEC-1, CFG-RUN-1, CFG-TX-5 |
-| 403 | `Admin access or device manage grant required` | a non-admin `configure` without a `manage` grant | CFG-EXEC-1, CFG-APPLY-5 |
+| 403 | `Admin access or device manage grant required` | a non-admin `configure` without a `manage` grant | CFG-EXEC-1 |
 | 403 | `Reservation not owned by caller` | a run list or transcript for a reservation the caller does not own | CFG-RUN-1, CFG-TX-5 |
 | 403 | `Admin or superadmin role required` | a non-admin run detail or retry | CFG-RUN-4, CFG-RUN-5 |
 | 403 | `Invalid internal token` | an internal route with a wrong token | CFG-VER-14, CFG-EXEC-6, CFG-VAL-1 |
@@ -1302,8 +1307,6 @@ confirmed by reading only.
 ### Open defects
 
 - #1091 (CFG-RUN-6): retrying a failed dry run pushes the configuration for real.
-- #1092 (CFG-APPLY-5): immediate apply admits reservation owners whom execution then
-  refuses, and [ROLES.md](../ROLES.md) says they pass.
 - #1093 (CFG-APPLY-2, CFG-SCHED-9, CFG-EXEC-4): exception and upstream text reach job
   rows and API answers.
 - #1096 (CFG-AUTH-4, CFG-SCHEMA-7): a 200 whose JSON body is not an object raises instead

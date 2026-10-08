@@ -477,7 +477,7 @@ async def test_apply_surfaces_403_verbatim(user_client):
     with (
         patch("app.routers.device_configs.httpx.AsyncClient", lambda **kw: FakeClient()),
         patch(
-            "app.routers.device_configs._user_can_manage_device",
+            "app.routers.device_configs._user_has_explicit_manage",
             new=AsyncMock(return_value=True),
         ),
     ):
@@ -533,7 +533,7 @@ async def test_apply_succeeds_for_non_admin_with_acl_grant(user_client):
     with (
         patch("app.routers.device_configs.httpx.AsyncClient", lambda **kw: FakeClient()),
         patch(
-            "app.routers.device_configs._user_can_manage_device",
+            "app.routers.device_configs._user_has_explicit_manage",
             new=AsyncMock(return_value=True),
         ),
     ):

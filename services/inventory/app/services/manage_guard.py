@@ -13,7 +13,7 @@ need it and this is their shared home.
 import uuid
 
 from fastapi import HTTPException
-from herd_common.acl import user_has_manage_or_owns_active_reservation
+from herd_common.acl import user_has_grant, user_has_manage_or_owns_active_reservation
 from herd_common.device_config import connection_type_supports_configure
 
 from app.config import settings
@@ -43,6 +43,39 @@ async def _user_can_manage_device(
         acl_service_url=settings.acl_service_url,
         reservations_service_url=settings.reservations_service_url,
         internal_api_token=settings.internal_api_token,
+    )
+
+
+# Pinned (issue #1092): tests match on this exact string.
+IMMEDIATE_APPLY_FORBIDDEN_DETAIL = (
+    "manage grant required on this device for an immediate apply "
+    "(a reservation owner can schedule the apply instead)"
+)
+
+
+async def _user_has_explicit_manage(
+    user_id: str,
+    device_id: uuid.UUID,
+    authorization: str | None,
+) -> bool:
+    """True iff the caller holds an explicit acl `manage` grant on the device.
+
+    The immediate apply's gate (issue #1092). It forwards the caller's token to
+    execution `POST /execute`, which admits a non-admin `configure` only with an
+    explicit grant and no reservation widening, so inventory asks the same
+    question up front instead of admitting a reservation owner whom execution
+    then always refuses. Closed by default: no token, or any acl failure, is
+    False.
+    """
+    if not authorization:
+        return False
+    return await user_has_grant(
+        user_id=str(user_id),
+        resource_type="device",
+        resource_id=str(device_id),
+        permission="manage",
+        authorization=authorization,
+        acl_service_url=settings.acl_service_url,
     )
 
 

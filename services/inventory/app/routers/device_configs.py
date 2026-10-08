@@ -32,9 +32,11 @@ from app.services.apply_outcome import judge_success_answer, move_current_config
 from app.services.config_diff import render_unified_diff
 from app.services.device_visibility import check_device_read_visibility
 from app.services.manage_guard import (
+    IMMEDIATE_APPLY_FORBIDDEN_DETAIL,
     _assert_driver_can_configure,
     _is_admin,
     _user_can_manage_device,
+    _user_has_explicit_manage,
 )
 from app.services.published_schema import published_schema_for_device
 from app.services.reservation_guard import find_blocking_reservations_for_device
@@ -436,15 +438,16 @@ async def apply_config_version(
     device = await _load_device(db, device_id)
     version = await _load_version(db, device_id, version_id)
 
+    # The immediate apply forwards the caller's token to execution `POST
+    # /execute`, which admits a non-admin `configure` only with an explicit
+    # manage grant. Ask that same question here (issue #1092) instead of the
+    # manage-or-reservation-owner widening the other config writes use, so a
+    # reservation owner without a grant is refused up front rather than always
+    # getting a failed apply back; such an owner can schedule the apply.
     if not _is_admin(payload):
-        allowed = await _user_can_manage_device(payload["sub"], device_id, authorization)
+        allowed = await _user_has_explicit_manage(payload["sub"], device_id, authorization)
         if not allowed:
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "manage permission required on this device (or active reservation ownership)"
-                ),
-            )
+            raise HTTPException(status_code=403, detail=IMMEDIATE_APPLY_FORBIDDEN_DETAIL)
 
     # Driver-capability gate (issue #839): after authorization so an
     # unauthorized caller learns nothing new about the device's driver, and
