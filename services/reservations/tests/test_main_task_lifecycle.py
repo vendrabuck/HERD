@@ -89,3 +89,41 @@ async def test_lifespan_purpose_classify_task_uses_its_own_interval_setting():
 
     await asyncio.wait_for(_run(), timeout=10)
     assert seen_intervals == [12345]
+
+
+@pytest.mark.asyncio
+async def test_lifespan_starts_without_nats_using_the_real_client(monkeypatch, caplog):
+    """Issue #1083: with the REAL nats client and a broker that refuses
+    connections, startup finishes (the bounded first connect raises) and the
+    documented logged-and-continue branch runs, rather than the lifespan
+    waiting forever inside nats.connect. No mock of nats.connect here: a mock
+    that raises proved a path the real client never took."""
+    import herd_common.jetstream as jetstream
+    from app.main import lifespan
+
+    monkeypatch.setattr(jetstream, "NATS_INITIAL_CONNECT_ATTEMPTS", 2)
+    monkeypatch.setattr(jetstream, "NATS_RECONNECT_TIME_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(settings, "nats_url", "nats://127.0.0.1:1")
+
+    async def fake_loop(interval_seconds=60):
+        await asyncio.Event().wait()
+
+    entered = asyncio.Event()
+
+    async def _run():
+        with (
+            patch("app.main.create_all_and_stamp", new=AsyncMock()),
+            patch("app.main.run_outbox_relay", new=AsyncMock()),
+            patch("app.tasks.expiration.expiration_loop", new=fake_loop),
+            patch("app.tasks.expiration.purpose_classify_loop", new=fake_loop),
+        ):
+            mock_app = MagicMock()
+            async with lifespan(mock_app):
+                entered.set()
+                assert mock_app.state.nats is None
+
+    with caplog.at_level("WARNING", logger="app.main"):
+        await asyncio.wait_for(_run(), timeout=10)
+
+    assert entered.is_set()
+    assert "NATS unavailable at nats://127.0.0.1:1, events will be skipped" in caplog.text

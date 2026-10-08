@@ -94,9 +94,11 @@ async def _wait_for_peer_redelivery(event_id: str, window_seconds: float) -> lis
                 break
             for msg in msgs:
                 try:
-                    ours = json.loads(msg.data).get("event_id") == event_id
+                    body = json.loads(msg.data)
                 except ValueError:
-                    ours = False
+                    body = None
+                # A non-object body (issue #1074's poison test) is never ours.
+                ours = isinstance(body, dict) and body.get("event_id") == event_id
                 if ours and msg.metadata.num_delivered > 1:
                     redeliveries.append(msg.metadata.num_delivered)
                     await msg.ack()

@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import httpx
 from herd_common.jetstream import (
+    connect_nats,
+    decode_event_object,
     ensure_consumer,
     ensure_stream_exists,
     heartbeat_interval,
@@ -5073,9 +5075,10 @@ async def process_reservation_message(
     ack/nak/dlq actions are explicit; the loop does not rely on ack_wait
     timeout to drive failure handling.
     """
-    try:
-        event_data = json.loads(msg.data.decode())
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    # A body that is not UTF-8 JSON, or is JSON but not an object, is poison
+    # (issue #1074: a non-object body used to escape unsettled).
+    event_data = decode_event_object(msg.data)
+    if event_data is None:
         logger.error(
             "Poison message on reservations stream; routing to DLQ",
             extra={"action": "nats_poison_message", "size": len(msg.data)},
@@ -5233,14 +5236,11 @@ async def start_nats_consumer(app) -> None:
     from nats.js.api import ConsumerConfig
 
     try:
-        # Retry reconnect forever so the durable consumer and the health-event
-        # outbox relay resume after a broker restart instead of giving up at the
-        # default 60-attempt cap.
-        nc = await nats.connect(
-            settings.nats_url,
-            max_reconnect_attempts=-1,
-            reconnect_time_wait=2,
-        )
+        # Bounded first connect, unlimited reconnects once connected (issue
+        # #1083): a broker that is down at boot raises after a few tries, so the
+        # warning below is reachable and the service runs without the consumer;
+        # an established connection still retries forever.
+        nc = await connect_nats(settings.nats_url)
         app.state.nats = nc
         js = nc.jetstream()
 

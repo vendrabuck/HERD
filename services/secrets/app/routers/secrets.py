@@ -34,7 +34,15 @@ from app.schemas.secret import (
 )
 from app.services import crypto
 from app.services.inventory_guard import find_hypervisors_referencing_secret
-from app.services.keyring import deserialize_data, rotate_dek, serialize_data
+from app.services.keyring import (
+    ROTATION_CONFLICT_DETAIL,
+    KeyVersionUnavailableError,
+    RotationConflictError,
+    deserialize_data,
+    key_unavailable_http,
+    rotate_dek,
+    serialize_data,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,21 +105,34 @@ async def _has_grant(
     )
 
 
-def _encrypt_into(secret: Secret, data: dict, request: Request) -> None:
+async def _encrypt_into(secret: Secret, data: dict, request: Request, db: AsyncSession) -> None:
+    # The key version is read from the key table on every write, not from this
+    # process's memory, so a rotation in another replica binds here at once
+    # (issue #1085).
     keyring = request.app.state.keyring
-    secret.key_version = keyring.active_version
+    try:
+        version, dek = await keyring.current(db)
+    except KeyVersionUnavailableError as exc:
+        raise key_unavailable_http(exc) from None
+    secret.key_version = version
     secret.nonce, secret.ciphertext = crypto.encrypt_value(
-        keyring.active_dek,
+        dek,
         serialize_data(data),
         secret_id=secret.id,
         key_version=secret.key_version,
     )
 
 
-def _decrypt(secret: Secret, request: Request) -> dict:
+async def _decrypt(secret: Secret, request: Request, db: AsyncSession) -> dict:
     keyring = request.app.state.keyring
+    try:
+        # A version another replica's rotation created is loaded on first use
+        # (issue #1085); it used to be a KeyError and an unhandled 500.
+        dek = await keyring.load_dek(db, secret.key_version)
+    except KeyVersionUnavailableError as exc:
+        raise key_unavailable_http(exc) from None
     plaintext = crypto.decrypt_value(
-        keyring.dek(secret.key_version),
+        dek,
         secret.nonce,
         secret.ciphertext,
         secret_id=secret.id,
@@ -135,7 +156,7 @@ async def create_secret(
         created_by=_principal_id(payload),
         updated_by=_principal_id(payload),
     )
-    _encrypt_into(secret, body.data, request)
+    await _encrypt_into(secret, body.data, request, db)
     db.add(secret)
     try:
         await db.commit()
@@ -198,7 +219,9 @@ async def reveal_secret(
             if await _has_grant(payload, secret_id, "view", authorization):
                 raise HTTPException(status_code=403, detail="manage permission required")
             raise HTTPException(status_code=404, detail="Secret not found")
-    return SecretValueResponse(id=secret.id, name=secret.name, data=_decrypt(secret, request))
+    return SecretValueResponse(
+        id=secret.id, name=secret.name, data=await _decrypt(secret, request, db)
+    )
 
 
 @router.put("/{secret_id}", response_model=SecretResponse)
@@ -217,7 +240,7 @@ async def update_secret(
     if body.description is not None:
         secret.description = body.description
     if body.data is not None:
-        _encrypt_into(secret, body.data, request)
+        await _encrypt_into(secret, body.data, request, db)
     secret.updated_by = _principal_id(payload)
     await db.commit()
     await db.refresh(secret)
@@ -263,5 +286,12 @@ async def rotate_keys(
     db: AsyncSession = Depends(get_db),
 ):
     """Introduce a new DEK version and re-encrypt every secret to it."""
-    result = await rotate_dek(db, request.app.state.keyring)
+    try:
+        result = await rotate_dek(db, request.app.state.keyring)
+    except RotationConflictError:
+        # Issue #1085: the backstop when two rotations pick the same version
+        # (the advisory lock serializes them on Postgres); nothing changed.
+        raise HTTPException(status_code=409, detail=ROTATION_CONFLICT_DETAIL) from None
+    except KeyVersionUnavailableError as exc:
+        raise key_unavailable_http(exc) from None
     return RotateResponse(**result)

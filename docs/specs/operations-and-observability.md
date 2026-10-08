@@ -522,8 +522,9 @@ presses Save and Restart. Login to HERD stays disabled until the file exists.
   Pinned by: `services/config/tests/test_config.py` (`test_apply_not_configured`)
 - **OPS-CONFIG-16.** `POST /apply` answers 200 `{restarted, errors}`; each per-service
   failure, a missing Docker SDK, an unreachable Docker daemon, and a failed listing are
-  entries in `errors`, and those entries carry the exception text. Known gap, see
-  #1086. \
+  entries in `errors`. An entry names what failed and the exception class only
+  (`Failed to restart <service>: <ClassName>`, `Cannot connect to Docker: <ClassName>`,
+  `Cannot list containers: <ClassName>`); the exception text goes to the log message. \
   Enforced in: `services/config/app/docker_ctl.py` (`restart_services`) \
   Pinned by: `services/config/tests/test_docker_ctl.py` (`test_restart_services_collects_errors`, `test_restart_services_returns_error_when_docker_sdk_missing`, `test_restart_services_returns_error_when_from_env_fails`, `test_restart_services_returns_error_when_list_fails`)
 - **OPS-CONFIG-17.** Session tokens are signed with `CONFIG_SESSION_SECRET` when set,
@@ -703,13 +704,15 @@ reaches a stack that keeps its broker state and no consumer drifts from the othe
 
 **Rules.**
 
-- **OPS-NATS-1.** Each service that uses NATS connects with unlimited reconnect attempts
-  and a 2 second wait. With no broker reachable that call keeps retrying and never
-  raises, so the service does not finish starting, and serves no route, until the broker
-  answers; the logged-and-continue branch after it is reached only by other errors.
-  Known gap, see #1083. \
-  Enforced in: `services/reservations/app/main.py` (`lifespan`); `services/execution/app/services/nats_consumer.py` (`start_nats_consumer`) \
-  Pinned by: none
+- **OPS-NATS-1.** Each service that uses NATS connects through `connect_nats`: the first
+  connection is tried at most `NATS_INITIAL_CONNECT_ATTEMPTS` (5) more times, 2 seconds
+  apart, and then raises, so a service whose broker is down at boot logs the failure and
+  finishes starting without NATS (about 10 seconds for a refused connection). Once a
+  connection is established the reconnect cap is unlimited, so a broker restart never
+  closes it. A service that started without NATS does not connect later: it stays
+  without the broker until it is restarted. \
+  Enforced in: `services/common/herd_common/jetstream.py` (`connect_nats`, `NATS_INITIAL_CONNECT_ATTEMPTS`); `services/reservations/app/main.py` (`lifespan`); `services/execution/app/services/nats_consumer.py` (`start_nats_consumer`); `services/notifications/app/services/nats_consumer.py` (`start_nats_consumer`); `services/integration/app/services/nats_consumer.py` (`start_nats_consumer`) \
+  Pinned by: `services/common/tests/test_nats_connect.py` (`test_initial_connect_to_a_down_broker_raises_instead_of_hanging`, `test_established_connection_reconnects_past_the_initial_bound`); `services/reservations/tests/test_main_task_lifecycle.py` (`test_lifespan_starts_without_nats_using_the_real_client`); `services/execution/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`)
 - **OPS-NATS-2.** The owner of a stream declares it with `ensure_stream`: add, and on the
   server's stream-name-in-use error (code 10058) update to the same config; any other
   error propagates. \
@@ -1043,11 +1046,11 @@ hypervisor page's secret selector (`inventory.md`); key rotation in
   references the secret; there is no force flag. By decision; issue #456. \
   Enforced in: `services/secrets/app/routers/secrets.py` (`delete_secret`); `services/secrets/app/services/inventory_guard.py` (`find_hypervisors_referencing_secret`) \
   Pinned by: `services/secrets/tests/test_api.py` (`test_delete_refused_while_hypervisor_references_secret`); `services/secrets/tests/test_routers_direct.py` (`test_delete_secret_direct_refused_while_referenced`)
-- **OPS-SECRET-14.** An unreachable inventory or a non-200 answer refuses the delete with
-  503; a 200 whose body is not a JSON list of objects ends in an unhandled 500. Known
-  gap, see #1084. \
-  Enforced in: `services/secrets/app/services/inventory_guard.py` (`find_hypervisors_referencing_secret`) \
-  Pinned by: `services/secrets/tests/test_inventory_guard.py` (`test_transport_error_fails_closed_503`, `test_upstream_error_fails_closed_503`); `services/secrets/tests/test_api.py` (`test_delete_fails_closed_when_inventory_unreachable`)
+- **OPS-SECRET-14.** An unreachable inventory, a non-200 answer, or a 200 whose body is
+  not a JSON list of objects refuses the delete with 503 and deletes nothing; the
+  unreadable 200 uses the non-200 wording. \
+  Enforced in: `services/secrets/app/services/inventory_guard.py` (`find_hypervisors_referencing_secret`, `UPSTREAM_ERROR_DETAIL`) \
+  Pinned by: `services/secrets/tests/test_inventory_guard.py` (`test_transport_error_fails_closed_503`, `test_upstream_error_fails_closed_503`, `test_malformed_200_fails_closed_503`); `services/secrets/tests/test_api.py` (`test_delete_fails_closed_when_inventory_unreachable`, `test_delete_fails_closed_on_malformed_inventory_200`)
 - **OPS-SECRET-15.** The service refuses to start unless `SECRETS_KEK` is base64 for
   exactly 32 bytes, naming the variable; on an empty key table it creates key version 1. \
   Enforced in: `services/secrets/app/services/crypto.py` (`load_kek`); `services/secrets/app/services/keyring.py` (`bootstrap_keyring`); `services/secrets/app/main.py` (`lifespan`) \
@@ -1059,15 +1062,23 @@ hypervisor page's secret selector (`inventory.md`); key rotation in
   Pinned by: `services/secrets/tests/test_keyring.py` (`test_wrong_kek_refuses_to_boot`, `test_kek_rotation_rewraps_and_sticks`); `services/secrets/tests/test_crypto.py` (`test_dek_unwrap_wrong_kek_fails`)
 - **OPS-SECRET-17.** `POST /keys/rotate` is admin only: in one transaction it adds key
   version `max + 1`, re-encrypts every secret to it, and retires every earlier version
-  without deleting it, then answers `{new_version, reencrypted}`. Only the process that
-  served the call learns the new key; another replica cannot decrypt a rotated secret
-  until it restarts. Known gap, see #1085. \
-  Enforced in: `services/secrets/app/routers/secrets.py` (`rotate_keys`); `services/secrets/app/services/keyring.py` (`rotate_dek`) \
-  Pinned by: `services/secrets/tests/test_keyring.py` (`test_dek_rotation_reencrypts_and_retires`, `test_dek_rotation_survives_reboot`); `services/secrets/tests/test_api.py` (`test_rotate_endpoint`, `test_rotate_requires_admin`); `tests/integration/test_secrets_flow.py` (`test_rotation_preserves_plaintext`)
-- **OPS-SECRET-18.** Two rotations at once both choose the same new version; the second
-  commit fails on the version key with an unhandled 500. Known gap, see #1085. \
-  Enforced in: `services/secrets/app/services/keyring.py` (`rotate_dek`) \
-  Pinned by: none
+  without deleting it, then answers `{new_version, reencrypted}`. The key table is the
+  source of truth and each process's keyring is a cache of it: a key version a process
+  has not seen (another replica's rotation) is read and unwrapped on first use, and every
+  write encrypts under the newest unretired version in the table, so a rotation binds
+  every replica with no restart. A version that is missing or does not unwrap under this
+  process's `SECRETS_KEK` answers 503 `Secret key material is unavailable to this service`
+  on reveal, internal reveal, create, update, and rotate, logged with action
+  `key_version_unavailable`. \
+  Enforced in: `services/secrets/app/routers/secrets.py` (`rotate_keys`, `_encrypt_into`, `_decrypt`); `services/secrets/app/routers/internal.py` (`_reveal`); `services/secrets/app/services/keyring.py` (`rotate_dek`, `load_dek`, `current`, `key_unavailable_http`) \
+  Pinned by: `services/secrets/tests/test_keyring.py` (`test_dek_rotation_reencrypts_and_retires`, `test_dek_rotation_survives_reboot`, `test_peer_replica_loads_a_rotated_version_on_first_use`, `test_peer_replica_encrypts_new_data_under_the_rotated_version`, `test_load_dek_unknown_version_is_unavailable`, `test_load_dek_under_a_different_kek_is_unavailable`, `test_stale_replica_rotation_picks_the_next_version`); `services/secrets/tests/test_api.py` (`test_rotate_endpoint`, `test_rotate_requires_admin`, `test_reveal_on_a_replica_that_missed_the_rotation`, `test_write_on_a_replica_that_missed_the_rotation_uses_the_new_version`, `test_unloadable_key_version_is_503_with_a_fixed_detail`); `tests/integration/test_secrets_flow.py` (`test_rotation_preserves_plaintext`)
+- **OPS-SECRET-18.** Every rotation takes one transaction-scoped Postgres advisory lock
+  (`herd-secrets-dek-rotation`) before it reads the key table, so two rotations, in one
+  process or two replicas, run one after the other and the second moves to the next
+  version. If the new version is taken anyway, the rotation rolls back and answers 409
+  `Another key rotation committed first; nothing was changed. Retry.`; it never answers 500. \
+  Enforced in: `services/secrets/app/services/keyring.py` (`rotate_dek`, `DEK_ROTATION_LOCK_KEY`); `services/secrets/app/routers/secrets.py` (`rotate_keys`) \
+  Pinned by: `services/secrets/tests/test_keyring.py` (`test_rotation_takes_the_lock_before_reading_the_key_table`, `test_concurrent_rotation_conflict_is_refused_and_changes_nothing`); `services/secrets/tests/test_api.py` (`test_rotation_conflict_is_409_not_500`)
 
 **Out of scope.** Granting `view` and `manage` (`identity-and-access.md`); hypervisor
 registration and its secret check (`inventory.md`); how execution uses a hypervisor
@@ -1304,8 +1315,9 @@ CLI documentation guard (OPS-NATS-14).
 | 403 | `manage permission required` | reveal by a holder of `view` only | OPS-SECRET-8 |
 | 403 | `Invalid internal token` | a secrets internal route without the right token | OPS-SECRET-10 |
 | 409 | `{"error": "secret_in_use", "hypervisor_ids", "hypervisor_names"}` | deleting a secret a hypervisor references | OPS-SECRET-13 |
-| 503 | `inventory service unreachable while checking secret references`, `inventory service returned an error while checking secret references` | the delete guard cannot ask inventory | OPS-SECRET-14 |
-| 500 | none | a malformed 200 from the delete guard's lookup; two rotations at once; a reveal on a replica that missed a rotation | OPS-SECRET-14, OPS-SECRET-17, OPS-SECRET-18 |
+| 503 | `inventory service unreachable while checking secret references`, `inventory service returned an error while checking secret references` | the delete guard cannot ask inventory, or cannot read its 200 | OPS-SECRET-14 |
+| 409 | `Another key rotation committed first; nothing was changed. Retry.` | two rotations at once that the lock did not serialize | OPS-SECRET-18 |
+| 503 | `Secret key material is unavailable to this service` | a key version that is missing or does not unwrap under this process's key | OPS-SECRET-17 |
 | 401 | `Invalid subject in token` | a preferences route with a missing or non-UUID subject | OPS-PREF-1 |
 | 422 | validation list, or `merged <reason>` | a preferences body or merged result over a cap | OPS-PREF-4, OPS-PREF-5 |
 | 401 | `Invalid internal token` | the internal preferences read without the right token | OPS-PREF-7 |
@@ -1319,7 +1331,7 @@ Startup refusals (no HTTP answer; the container exits or waits):
 |---|---|---|
 | secrets exits with `SECRETS_KEK is not set`, `... is not valid base64`, or `... must decode to exactly 32 bytes` | missing or malformed key material | OPS-SECRET-15 |
 | secrets exits naming the key version | a stored key that unwraps under neither key | OPS-SECRET-16 |
-| a service waits in startup | the NATS broker is unreachable | OPS-NATS-1 |
+| a service logs that NATS is unavailable and starts without it | the NATS broker is unreachable at boot | OPS-NATS-1 |
 | a service refuses to load its settings, naming the value | a bad `NATS_NAK_BACKOFF_SECONDS` entry or `NATS_ACK_WAIT_SECONDS` below 2 | OPS-NATS-9, OPS-NATS-10 |
 
 ## 10. Interactions with other services
@@ -1328,14 +1340,14 @@ Startup refusals (no HTTP answer; the container exits or waits):
 |---|---|---|---|---|
 | Out (every producer) | NATS | outbox relay publish, 10 s per message | deliver staged events | Fail safe: the row stays unpublished and is retried (OPS-OUTBOX-6, OPS-OUTBOX-7) |
 | Out (reservations, execution) | Postgres | `LISTEN herd_outbox_<schema>` on a dedicated connection | wake the relay | Logged and retried each tick; the tick still drains (OPS-OUTBOX-11) |
-| Out (every NATS user) | NATS | connect at startup | streams, consumers, relay | Startup waits until the broker answers (OPS-NATS-1) |
+| Out (every NATS user) | NATS | connect at startup | streams, consumers, relay | Startup finishes without NATS after a bounded first connect; no later connect until a restart (OPS-NATS-1) |
 | Out (execution) | inventory | `GET /devices/health-config` (internal token, 10 s) | poll registry | Fail safe: the previous registry is kept (OPS-POLL-2) |
 | Out (execution) | inventory | device and template reads per poll | what to poll and with which driver | The poll records `UNREACHABLE` (OPS-POLL-7) |
 | Out (execution) | the device's driver | `login`, `status`, `logout` in the sandbox | health check | Recorded as the poll's status (OPS-POLL-7) |
 | Out (execution, device check) | inventory | device and template reads (internal token, 10 s) | the device check | Fail closed: 404 or 503 (OPS-HEALTH-7) |
 | Out (execution, device check) | the device's driver | `login`, then `status` and `logout` in the sandbox | the device check | Answered 200 with the failed run's status and error (OPS-HEALTH-8, OPS-HEALTH-9) |
 | Out (secrets) | acl | `GET /resources` with the caller's token (5 s); the shared grant check | which secrets a user may see or reveal | Fail closed: nothing listed, 404 or 403 (OPS-SECRET-5) |
-| Out (secrets) | inventory | `GET /hypervisors/by-secret/{id}/internal` (internal token, 5 s) | delete guard | Fail closed: 503; a malformed 200 is a 500 (OPS-SECRET-14) |
+| Out (secrets) | inventory | `GET /hypervisors/by-secret/{id}/internal` (internal token, 5 s) | delete guard | Fail closed: 503, a malformed 200 included (OPS-SECRET-14) |
 | Out (reservations, report) | cabling | `POST /internal/forks/devices/batch` (internal token, 10 s, chunks of 500) | transit devices | Fail closed: 503 (OPS-REPORT-8) |
 | Out (reservations, report) | inventory | `GET /devices` with the caller's token (10 s, paged by 500) | fleet section | Fail open: `fleet` null, or 503 for the fleet CSV (OPS-REPORT-11, OPS-REPORT-14) |
 | Out (reservations, report) | auth | `POST /groups/users/groups` with the caller's token (5 s) | group section | Fail open: every user `Ungrouped` (OPS-REPORT-5) |
@@ -1409,14 +1421,6 @@ failing when a dependency is down (OPS-LIVE-1), services are said to crash-loop 
 
 ### Open defects
 
-- #1083, OPS-NATS-1: a service waits in startup until NATS answers, while the code's
-  own fallback, `reservations.md` (RES-EVENT-4), and `provisioning-and-wiring.md`
-  (WIRE-CONSUME-4) describe a service that starts without it.
-- #1084, OPS-SECRET-14: a malformed 200 from inventory's secret reference lookup is an
-  unhandled 500 instead of the fail-closed 503.
-- #1085, OPS-SECRET-17 and OPS-SECRET-18: a DEK rotation is invisible to other replicas
-  until they restart, and two rotations at once end in a 500.
-- #1086, OPS-CONFIG-16: the config apply response carries raw exception text.
 - #1087, OPS-LOG-9, OPS-LIVE-1, OPS-SET-7, OPS-NATS-13: the operator documents and
   FEATURES.md describe behavior the code does not have.
 - #1093, OPS-HEALTH-7: the device check's 503 carries raw exception text from the
@@ -1458,9 +1462,7 @@ failing when a dependency is down (OPS-LIVE-1), services are said to crash-loop 
 - OPS-SET-9: settings read once at import.
 - OPS-SCHEMA-9: schemas created only on an empty volume.
 - OPS-OUTBOX-14: the relay does not republish an acknowledged event.
-- OPS-NATS-1: startup with an unreachable broker.
 - OPS-NATS-13: JetStream store durability under `make prod`.
 - OPS-HEALTH-10: the device check writes no health status row and stages no event.
 - OPS-NATS-15: reservations' declaration of `HERD_RESERVATIONS`.
-- OPS-SECRET-18: two rotations at once.
 - OPS-REPORT-9: the routes' mapping of a transit failure to 503.

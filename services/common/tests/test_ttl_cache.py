@@ -10,7 +10,7 @@ other.
 import asyncio
 
 import pytest
-from herd_common.ttl_cache import SingletonTTLCache, TTLCache
+from herd_common.ttl_cache import SingletonTTLCache, TTLCache, Uncached
 
 
 class _FakeClock:
@@ -276,3 +276,111 @@ def test_singleton_cache_has_no_key_parameter_on_get():
 def test_singleton_and_per_key_are_distinct_classes():
     assert not issubclass(SingletonTTLCache, TTLCache)
     assert not issubclass(TTLCache, SingletonTTLCache)
+
+
+# --- Uncached: a failure is not an answer (issue #1075) ---
+
+
+@pytest.mark.asyncio
+async def test_uncached_fallback_is_returned_but_not_stored():
+    """A fetch that could not ask returns Uncached(fallback): this caller gets
+    the bare fallback and the next call asks again, then caches the answer."""
+    calls = []
+
+    async def fetch(key: str):
+        calls.append(key)
+        if len(calls) == 1:
+            return Uncached("fallback")
+        return f"answer-{key}"
+
+    cache: TTLCache[str, str] = TTLCache(fetch=fetch, ttl_seconds=60)
+
+    first = await cache.get("a")
+    second = await cache.get("a")
+    third = await cache.get("a")
+
+    assert first == "fallback"
+    assert not isinstance(first, Uncached)
+    assert (second, third) == ("answer-a", "answer-a")
+    assert calls == ["a", "a"]
+
+
+@pytest.mark.asyncio
+async def test_uncached_failure_leaves_an_existing_entry_for_other_keys():
+    async def fetch(key: str):
+        return Uncached(None) if key == "down" else f"answer-{key}"
+
+    calls = []
+
+    async def counting_fetch(key: str):
+        calls.append(key)
+        return await fetch(key)
+
+    cache: TTLCache[str, str | None] = TTLCache(fetch=counting_fetch, ttl_seconds=60)
+    assert await cache.get("up") == "answer-up"
+    assert await cache.get("down") is None
+    assert await cache.get("down") is None
+    assert await cache.get("up") == "answer-up"
+    assert calls == ["up", "down", "down"]
+
+
+@pytest.mark.asyncio
+async def test_singleton_uncached_fallback_is_returned_but_not_stored():
+    calls = {"n": 0}
+
+    async def fetch():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return Uncached([])
+        return ["admin"]
+
+    cache: SingletonTTLCache[list[str]] = SingletonTTLCache(fetch=fetch, ttl_seconds=60)
+
+    first = await cache.get()
+    second = await cache.get()
+    third = await cache.get()
+
+    assert first == []
+    assert (second, third) == (["admin"], ["admin"])
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_uncached_falsy_answer_is_still_cached_when_not_wrapped():
+    """An empty answer the upstream GAVE is cached; only the wrapper skips."""
+    calls = {"n": 0}
+
+    async def fetch():
+        calls["n"] += 1
+        return []
+
+    cache: SingletonTTLCache[list[str]] = SingletonTTLCache(fetch=fetch, ttl_seconds=60)
+    await cache.get()
+    await cache.get()
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_callers_during_a_failure_each_ask_again():
+    """With nothing stored, a waiter that gets the lock after a failed fetch
+    finds no entry and fetches itself: failures are not shared. Pinned so a
+    later change to that tradeoff is deliberate."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def fetch(key: str):
+        calls["n"] += 1
+        started.set()
+        await release.wait()
+        return Uncached("fallback")
+
+    cache: TTLCache[str, str] = TTLCache(fetch=fetch, ttl_seconds=60)
+    first = asyncio.create_task(cache.get("k"))
+    await started.wait()
+    second = asyncio.create_task(cache.get("k"))
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await asyncio.gather(first, second) == ["fallback", "fallback"]
+    assert calls["n"] == 2

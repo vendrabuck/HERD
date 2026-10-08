@@ -296,7 +296,7 @@ This area publishes only dead-letter copies.
 
 | Subject | Producer | Staged when | Consumers | Payload keys | Rules |
 |---|---|---|---|---|---|
-| `herd.reservations.dlq.execution` | execution consumer | a message is undecodable, raises `PermanentEventError`, or fails at its fifth delivery (published directly, not through an outbox) | none; retained in the `HERD_DLQ` stream for inspection and replay | the original message bytes, unchanged | WIRE-CONSUME-8, WIRE-CONSUME-9, WIRE-CONSUME-11, WIRE-CONSUME-13 |
+| `herd.reservations.dlq.execution` | execution consumer | a message is undecodable or not a JSON object, raises `PermanentEventError`, or fails at its fifth delivery (published directly, not through an outbox) | none; retained in the `HERD_DLQ` stream for inspection and replay | the original message bytes, unchanged | WIRE-CONSUME-8, WIRE-CONSUME-9, WIRE-CONSUME-11, WIRE-CONSUME-13 |
 
 Events consumed from `HERD_RESERVATIONS` (all produced by reservations, section 6 of
 `reservations.md`):
@@ -352,11 +352,11 @@ for an operator.
   Enforced in: `services/execution/app/services/nats_consumer.py` (`start_nats_consumer`); `services/common/herd_common/jetstream.py` (`ensure_stream_exists`) \
   Pinned by: `services/execution/tests/test_nats_consumer_full.py` (`test_start_nats_consumer_stream_create_failure`); `services/common/tests/test_jetstream.py` (`test_ensure_stream_exists_existing_stream_never_calls_add_stream`, `test_ensure_stream_exists_not_found_triggers_one_add_stream_with_no_max_age`)
 - **WIRE-CONSUME-4.** When NATS is unreachable at startup the failure is logged and the
-  service runs without the consumer; once connected, the client reconnects without limit.
-  Known gap, see #1083: with no broker reachable the connect call retries and never
-  raises, so startup waits for NATS (`operations-and-observability.md`, OPS-NATS-1). \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`start_nats_consumer`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_full.py` (`test_start_nats_consumer_connection_failure`)
+  service runs without the consumer until it is restarted; once connected, the client
+  reconnects without limit. The first connect is bounded (`operations-and-observability.md`,
+  OPS-NATS-1). \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`start_nats_consumer`); `services/common/herd_common/jetstream.py` (`connect_nats`) \
+  Pinned by: `services/execution/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`); `services/execution/tests/test_nats_consumer_full.py` (`test_start_nats_consumer_connection_failure`)
 - **WIRE-CONSUME-5.** On a migration-managed schema that lacks a model table, the
   consumer start is deferred until the table appears, so events wait on the stream
   instead of failing. \
@@ -371,10 +371,11 @@ for an operator.
   thread, so the event loop keeps sending heartbeats while a switch answers. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_run_sandbox`) \
   Pinned by: `services/execution/tests/test_nats_consumer_heartbeat.py` (`test_run_sandbox_runs_off_the_event_loop`)
-- **WIRE-CONSUME-8.** A message whose body is not JSON is published to
-  `herd.reservations.dlq.execution` and acked, logged `nats_poison_message`. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`process_reservation_message`) \
-  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_process_message_poison_json_routes_to_dlq_and_acks`); `tests/integration/test_dlq_and_idempotency.py` (`test_poison_reservation_event_is_retained_in_dlq`)
+- **WIRE-CONSUME-8.** A message whose body is not JSON, or is JSON but not an object, is
+  published to `herd.reservations.dlq.execution` and acked, logged `nats_poison_message`,
+  before the corroboration gate or any handler reads it. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`process_reservation_message`); `services/common/herd_common/jetstream.py` (`decode_event_object`) \
+  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_process_message_poison_json_routes_to_dlq_and_acks`, `test_process_message_non_object_json_routes_to_dlq_and_acks`); `tests/integration/test_dlq_and_idempotency.py` (`test_poison_reservation_event_is_retained_in_dlq`, `test_non_object_json_event_is_dead_lettered_by_each_consumer`)
 - **WIRE-CONSUME-9.** A `PermanentEventError` from the handler dead-letters the message on
   its first delivery and acks it, logged `nats_dlq_permanent`. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`process_reservation_message`, `PermanentEventError`) \
@@ -1300,8 +1301,7 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
 
 ### Open defects
 
-- #1083, WIRE-CONSUME-4: with NATS unreachable at boot the service waits in startup
-  instead of starting without the consumer.
+None at present.
 
 ### Limits by decision
 

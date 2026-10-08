@@ -95,6 +95,62 @@ async def test_admin_list_returns_empty_on_http_error():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "transport",
+        "non_200",
+        "malformed_json",
+        "not_a_list",
+    ],
+)
+async def test_admin_list_failure_is_not_cached(failure):
+    """Issue #1075: a failed lookup answers [] for THAT call only; the next
+    call asks auth again and its answer is the one cached."""
+    a = uuid.uuid4()
+    client = AdminListClient(base_url="http://auth-test:8000", internal_token="t", ttl_seconds=60)
+    if failure == "transport":
+        first = httpx.ConnectError("nope")
+    elif failure == "non_200":
+        first = _mock_resp(status_code=503)
+    elif failure == "malformed_json":
+        first = _mock_resp(raise_value_error=True)
+    else:
+        first = _mock_resp(json_data={"admins": [str(a)]})
+    with patch("httpx.AsyncClient") as MockClient:
+        instance = MockClient.return_value.__aenter__.return_value
+        instance.request = AsyncMock(
+            side_effect=[first, _mock_resp(json_data=[str(a)]), AssertionError("cached")]
+        )
+        during = await client.list_admins()
+        after = await client.list_admins()
+        again = await client.list_admins()
+    assert during == []
+    assert after == [a]
+    assert again == [a]
+    assert instance.request.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_admin_list_missing_token_is_not_cached():
+    client = AdminListClient(base_url="http://auth-test:8000", internal_token="", ttl_seconds=60)
+    assert await client.list_admins() == []
+    assert client._cache._cached_until == 0.0
+
+
+@pytest.mark.asyncio
+async def test_admin_list_empty_answer_is_cached():
+    """A 200 with [] is an answer (no admins), not a failure: cached."""
+    client = AdminListClient(base_url="http://auth-test:8000", internal_token="t", ttl_seconds=60)
+    with patch("httpx.AsyncClient") as MockClient:
+        instance = MockClient.return_value.__aenter__.return_value
+        instance.request = AsyncMock(return_value=_mock_resp(json_data=[]))
+        assert await client.list_admins() == []
+        assert await client.list_admins() == []
+    assert instance.request.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_admin_list_returns_empty_on_non_200():
     client = AdminListClient(base_url="http://auth-test:8000", internal_token="t", ttl_seconds=60)
     with patch("httpx.AsyncClient") as MockClient:

@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock
 import pytest
 from herd_common.jetstream import (
     JS_STREAM_NAME_IN_USE,
+    decode_event_object,
     ensure_consumer,
     ensure_stream,
     ensure_stream_exists,
@@ -462,3 +463,22 @@ def test_validate_ack_wait_refuses_below_the_minimum_with_pinned_wording(bad):
         validate_ack_wait_seconds(bad)
 
     assert str(exc.value) == f"NATS_ACK_WAIT_SECONDS must be at least 2 seconds, got {bad}"
+
+
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        (b'{"event": "x"}', {"event": "x"}),
+        (b"{}", {}),
+        (b"null", None),
+        (b"5", None),
+        (b"[1]", None),
+        (b'"text"', None),
+        (b"true", None),
+        (b"not json", None),
+        (b"\xff\xfe", None),
+    ],
+)
+def test_decode_event_object_accepts_only_json_objects(body, expected):
+    """Issue #1074: anything but a JSON object is poison (None)."""
+    assert decode_event_object(body) == expected

@@ -50,9 +50,12 @@ async def _publish_raw(payload: bytes, subject: str = _RESERVATIONS_SUBJECT) -> 
         await nc.close()
 
 
-async def _find_in_execution_dlq(marker: bytes, *, timeout: float = 15.0) -> bytes | None:
-    """Poll the HERD_DLQ stream for a message on the execution DLQ subject whose
-    body contains `marker`. Returns the message bytes, or None on timeout.
+async def _find_in_execution_dlq(
+    marker: bytes, *, timeout: float = 15.0, subject: str = _EXECUTION_DLQ_SUBJECT
+) -> bytes | None:
+    """Poll the HERD_DLQ stream for a message on `subject` (default: the
+    execution DLQ subject) whose body contains `marker`. Returns the message
+    bytes, or None on timeout.
 
     Reading is non-destructive: an ephemeral pull consumer over a limits-retention
     stream leaves the messages in place.
@@ -62,7 +65,7 @@ async def _find_in_execution_dlq(marker: bytes, *, timeout: float = 15.0) -> byt
         js = nc.jetstream()
         # Confirm the stream exists rather than re-declaring it (see _publish_raw).
         await js.stream_info("HERD_DLQ")
-        sub = await js.pull_subscribe(_EXECUTION_DLQ_SUBJECT, stream="HERD_DLQ")
+        sub = await js.pull_subscribe(subject, stream="HERD_DLQ")
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
             try:
@@ -107,6 +110,9 @@ async def _fetch_reservation_event(
                     body = json.loads(m.data)
                 except Exception:  # noqa: BLE001 - skip non-JSON
                     continue
+                if not isinstance(body, dict):
+                    # A non-object body (issue #1074's poison test) is not an event.
+                    continue
                 if body.get("event") == event and body.get("reservation_id") == reservation_id:
                     return m.data
             await asyncio.sleep(0.3)
@@ -133,6 +139,32 @@ async def test_poison_reservation_event_is_retained_in_dlq():
     )
     # The DLQ preserves the original payload verbatim for inspection/replay.
     assert retained == poison
+
+
+@pytest.mark.parametrize(
+    "dlq_subject",
+    [
+        _EXECUTION_DLQ_SUBJECT,
+        "herd.reservations.dlq.notifications",
+        "herd.reservations.dlq.integration",
+    ],
+)
+async def test_non_object_json_event_is_dead_lettered_by_each_consumer(dlq_subject):
+    """Issue #1074: a body that is valid JSON but not an object is poison for
+    every reservations-stream consumer. Before the fix the integration and
+    notifications consumers left it unsettled and dropped it after max_deliver
+    with no DLQ copy. One message per consumer is published so each case is
+    independent of the others."""
+    marker = uuid.uuid4().hex
+    poison = json.dumps(["NON-OBJECT-POISON", marker]).encode()
+
+    try:
+        await _publish_raw(poison)
+    except Exception as exc:  # noqa: BLE001 - host may not reach NATS in some envs
+        pytest.skip(f"NATS unreachable from test host: {exc}")
+
+    retained = await _find_in_execution_dlq(marker.encode(), subject=dlq_subject)
+    assert retained == poison, f"non-object body was not dead-lettered on {dlq_subject}"
 
 
 # --- Redelivery idempotency -------------------------------------------------

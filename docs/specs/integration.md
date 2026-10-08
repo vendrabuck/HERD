@@ -452,10 +452,11 @@ the stream nor causes a duplicate.
   Enforced in: `services/integration/app/services/nats_consumer.py` (`start_nats_consumer`, `NATS_FETCH_TIMEOUT_SECONDS`) \
   Pinned by: `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_consumer_loop_fetches_one_message_at_a_time_on_both_subscriptions`, `test_consumer_loop_continues_after_idle_timeout`, `test_consumer_loop_survives_fetch_exception_and_retries`)
 - **INTEG-CONSUME-3.** When NATS cannot be reached at startup the failure is logged and
-  the service serves its API with no webhook delivery; a failure to ensure a stream is
-  logged and both consumers still start. \
-  Enforced in: `services/integration/app/services/nats_consumer.py` (`start_nats_consumer`) \
-  Pinned by: `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_start_nats_consumer_connection_failure_is_swallowed`, `test_start_nats_consumer_stream_ensure_failure_still_starts_both_consumers`)
+  the service serves its API with no webhook delivery until it is restarted (the first
+  connect is bounded, `operations-and-observability.md` OPS-NATS-1); a failure to ensure
+  a stream is logged and both consumers still start. \
+  Enforced in: `services/integration/app/services/nats_consumer.py` (`start_nats_consumer`); `services/common/herd_common/jetstream.py` (`connect_nats`) \
+  Pinned by: `services/integration/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`); `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_start_nats_consumer_connection_failure_is_swallowed`, `test_start_nats_consumer_stream_ensure_failure_still_starts_both_consumers`)
 - **INTEG-CONSUME-4.** On a migration-managed schema missing a model table, the consumers
   start only once the tables exist, so events wait on the stream. \
   Enforced in: `services/integration/app/main.py` (`lifespan`); `services/common/herd_common/consumer_schema_gate.py` (`start_consumer_when_schema_ready`) \
@@ -465,12 +466,12 @@ the stream nor causes a duplicate.
   peer consumer while it runs. \
   Enforced in: `services/integration/app/services/nats_consumer.py` (`process_batch`, `NATS_HEARTBEAT_SECONDS`); `services/common/herd_common/jetstream.py` (`process_batch_with_heartbeat`) \
   Pinned by: `services/integration/tests/test_nats_consumer_heartbeat.py` (`test_running_handler_is_heartbeated_then_stops_after_ack`, `test_heartbeat_interval_is_below_ack_wait`); `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_started_consumer_loop_heartbeats_a_slow_handler`); `tests/integration/test_webhook_slow_receiver_live.py` (`test_slow_receiver_gets_the_event_exactly_once`)
-- **INTEG-CONSUME-6.** A body that is valid JSON but not an object is not treated as
-  poison: the handler's error escapes `process_message` unsettled, and the broker
-  redelivers it until `max_deliver`, after which it is dropped with no dead-letter copy.
-  Known gap, see #1074. \
-  Enforced in: `services/integration/app/services/nats_consumer.py` (`process_message`) \
-  Pinned by: none (issue #1074)
+- **INTEG-CONSUME-6.** A body that is valid JSON but not an object (`null`, a number, a
+  string, a boolean, a list) is poison, handled as INTEG-CONSUME-7 handles a body that is
+  not JSON: published to the subscription's dead-letter subject and acked, logged
+  `nats_poison_message`, before any handler runs. \
+  Enforced in: `services/integration/app/services/nats_consumer.py` (`process_message`); `services/common/herd_common/jetstream.py` (`decode_event_object`) \
+  Pinned by: `services/integration/tests/test_nats_consumer.py` (`test_process_message_non_object_json_goes_to_dlq`); `services/common/tests/test_jetstream.py` (`test_decode_event_object_accepts_only_json_objects`); `tests/integration/test_dlq_and_idempotency.py` (`test_non_object_json_event_is_dead_lettered_by_each_consumer`)
 - **INTEG-CONSUME-7.** A body that is not JSON is published to the subscription's
   dead-letter subject (`herd.reservations.dlq.integration` or
   `herd.health.dlq.integration`) and acked, logged `nats_poison_message`. \
@@ -553,10 +554,11 @@ event is delivered twice.
   Enforced in: `services/notifications/app/services/nats_consumer.py` (`start_nats_consumer`, `NATS_FETCH_TIMEOUT_SECONDS`) \
   Pinned by: `services/notifications/tests/test_nats_consumer.py` (`test_start_nats_consumer_loop_fetches_one_message_at_a_time`, `test_start_nats_consumer_loop_swallows_unexpected_errors`)
 - **INTEG-NCONSUME-3.** When NATS cannot be reached at startup the failure is logged and
-  the service serves its API with no event-driven notifications; a stream failure is
-  tolerated. \
-  Enforced in: `services/notifications/app/services/nats_consumer.py` (`start_nats_consumer`) \
-  Pinned by: `services/notifications/tests/test_nats_consumer.py` (`test_start_nats_consumer_swallows_connect_failure`, `test_start_nats_consumer_tolerates_add_stream_failure`)
+  the service serves its API with no event-driven notifications until it is restarted
+  (the first connect is bounded, `operations-and-observability.md` OPS-NATS-1); a stream
+  failure is tolerated. \
+  Enforced in: `services/notifications/app/services/nats_consumer.py` (`start_nats_consumer`); `services/common/herd_common/jetstream.py` (`connect_nats`) \
+  Pinned by: `services/notifications/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`); `services/notifications/tests/test_nats_consumer.py` (`test_start_nats_consumer_swallows_connect_failure`, `test_start_nats_consumer_tolerates_add_stream_failure`)
 - **INTEG-NCONSUME-4.** On a migration-managed schema missing a model table, the
   consumers start only once the tables exist. \
   Enforced in: `services/notifications/app/main.py` (`lifespan`); `services/common/herd_common/consumer_schema_gate.py` (`start_consumer_when_schema_ready`) \
@@ -565,11 +567,11 @@ event is delivered twice.
   every half of `ack_wait`, so a slow outbound channel does not cause a redelivery. \
   Enforced in: `services/notifications/app/services/nats_consumer.py` (`process_batch`, `NATS_HEARTBEAT_SECONDS`); `services/common/herd_common/jetstream.py` (`process_batch_with_heartbeat`) \
   Pinned by: `services/notifications/tests/test_nats_consumer_heartbeat.py` (`test_running_handler_is_heartbeated_then_stops_after_ack`, `test_heartbeat_interval_is_below_ack_wait`); `services/notifications/tests/test_nats_consumer.py` (`test_started_consumer_loop_heartbeats_a_slow_handler`)
-- **INTEG-NCONSUME-6.** A body that is valid JSON but not an object is not treated as
-  poison: the error escapes `process_message` unsettled and the message is dropped after
-  `max_deliver` with no dead-letter copy. Known gap, see #1074. \
-  Enforced in: `services/notifications/app/services/nats_consumer.py` (`process_message`) \
-  Pinned by: none (issue #1074)
+- **INTEG-NCONSUME-6.** A body that is valid JSON but not an object is poison, handled as
+  INTEG-NCONSUME-7 handles a body that is not JSON: dead-lettered and acked, logged
+  `nats_poison_message`, before any handler runs. \
+  Enforced in: `services/notifications/app/services/nats_consumer.py` (`process_message`); `services/common/herd_common/jetstream.py` (`decode_event_object`) \
+  Pinned by: `services/notifications/tests/test_nats_consumer.py` (`test_process_message_non_object_json_goes_to_dlq`); `tests/integration/test_dlq_and_idempotency.py` (`test_non_object_json_event_is_dead_lettered_by_each_consumer`)
 - **INTEG-NCONSUME-7.** A body that is not JSON is published to
   `herd.reservations.dlq.notifications` or `herd.health.dlq.notifications` and acked,
   logged `nats_poison_message`. \
@@ -662,13 +664,16 @@ everyone with a live reservation on it is told.
   nothing, logged `health_event_no_device_id` or `health_event_invalid_device_id`. \
   Enforced in: `services/notifications/app/services/event_router.py` (`_build_health_messages`) \
   Pinned by: `services/notifications/tests/test_event_router_health.py` (`test_event_missing_device_id_is_skipped`, `test_event_invalid_device_id_is_skipped`)
-- **INTEG-HEALTH-4.** The empty list a failed admin-list fetch answers is cached for
-  `HEALTH_NOTIFY_ADMIN_CACHE_TTL_SECONDS` exactly like a real answer, so admins miss
-  every health notification for that window. Known gap, see #1075. \
-  Enforced in: `services/notifications/app/services/health_recipients.py` (`AdminListClient`); `services/common/herd_common/ttl_cache.py` (`SingletonTTLCache`) \
-  Pinned by: none (issue #1075)
+- **INTEG-HEALTH-4.** Only an answer from auth is cached, for
+  `HEALTH_NOTIFY_ADMIN_CACHE_TTL_SECONDS`: a 200 with a list, an empty one included.
+  The empty list a failed fetch answers (INTEG-HEALTH-5) covers only the event that hit
+  the failure; it is returned as `Uncached`, nothing is stored, and the next event asks
+  auth again. \
+  Enforced in: `services/notifications/app/services/health_recipients.py` (`AdminListClient`); `services/common/herd_common/ttl_cache.py` (`SingletonTTLCache`, `Uncached`) \
+  Pinned by: `services/notifications/tests/test_health_recipients.py` (`test_admin_list_failure_is_not_cached`, `test_admin_list_missing_token_is_not_cached`, `test_admin_list_empty_answer_is_cached`); `services/common/tests/test_ttl_cache.py` (`test_singleton_uncached_fallback_is_returned_but_not_stored`)
 - **INTEG-HEALTH-5.** The admin-list fetch answers an empty list, fail open, on a missing
-  internal token, a transport error, a non-200, or a body that is not JSON; entries that
+  internal token, a transport error, a non-200, a body that is not JSON, or a JSON body
+  that is not a list; entries that
   are not UUIDs are skipped. \
   Enforced in: `services/notifications/app/services/health_recipients.py` (`AdminListClient`) \
   Pinned by: `services/notifications/tests/test_health_recipients.py` (`test_admin_list_returns_empty_when_token_missing`, `test_admin_list_returns_empty_on_http_error`, `test_admin_list_returns_empty_on_non_200`, `test_admin_list_returns_empty_on_malformed_json`, `test_admin_list_skips_unparseable_ids`)
@@ -682,9 +687,10 @@ everyone with a live reservation on it is told.
   Enforced in: `services/notifications/app/services/event_router.py` (`_build_health_messages`) \
   Pinned by: `services/notifications/tests/test_event_router_health.py` (`test_empty_recipient_list_produces_no_messages`); `services/notifications/tests/test_health_recipients.py` (`test_resolver_returns_empty_when_both_sides_fail`); `tests/integration/test_health_alerting_flow.py` (`test_event_with_no_recipients_drops_silently`)
 - **INTEG-HEALTH-8.** The admin list is cached for the TTL, and concurrent misses make
-  one fetch. \
+  one fetch when that fetch answers; after a failed fetch nothing is stored, so each
+  waiting caller asks again (INTEG-HEALTH-4). \
   Enforced in: `services/notifications/app/services/health_recipients.py` (`AdminListClient`); `services/common/herd_common/ttl_cache.py` (`SingletonTTLCache`) \
-  Pinned by: `services/notifications/tests/test_health_recipients.py` (`test_admin_list_caches_within_ttl`, `test_admin_list_concurrent_callers_fetch_once`, `test_admin_list_refetches_after_invalidate`)
+  Pinned by: `services/notifications/tests/test_health_recipients.py` (`test_admin_list_caches_within_ttl`, `test_admin_list_concurrent_callers_fetch_once`, `test_admin_list_refetches_after_invalidate`); `services/common/tests/test_ttl_cache.py` (`test_concurrent_callers_during_a_failure_each_ask_again`)
 
 **Out of scope.** When execution publishes a transition (`operations-and-observability.md`).
 
@@ -779,11 +785,13 @@ they hear about; everything is on in the app by default and off everywhere else.
   a whole object, so a channel the body omits is reset to its default rather than kept. \
   Enforced in: `services/notifications/app/routers/notifications.py` (`put_preferences`); `services/notifications/app/schemas/preferences.py` (`NotificationPreferencesUpdate`) \
   Pinned by: none (issue #1081)
-- **INTEG-PREFS-6.** The defaults a failed consumer-side preference fetch answers are
-  cached for `PREFERENCES_CACHE_TTL_SECONDS` exactly like a real answer, so a user who
-  opted out of an event can receive it for that window. Known gap, see #1075. \
-  Enforced in: `services/notifications/app/services/preferences_client.py` (`PreferencesClient`); `services/common/herd_common/ttl_cache.py` (`TTLCache`) \
-  Pinned by: none (issue #1075)
+- **INTEG-PREFS-6.** Only a 200 from user-profile is cached, for
+  `PREFERENCES_CACHE_TTL_SECONDS`. The defaults a failed consumer-side fetch answers
+  (INTEG-PREFS-7) cover only the event that hit the failure; they are returned as
+  `Uncached`, nothing is stored, and the next event reads the stored preferences again,
+  so an opt-out applies from the next event on. \
+  Enforced in: `services/notifications/app/services/preferences_client.py` (`PreferencesClient`); `services/common/herd_common/ttl_cache.py` (`TTLCache`, `Uncached`) \
+  Pinned by: `services/notifications/tests/test_preferences_client.py` (`test_failed_fetch_is_not_cached_so_an_opt_out_applies_next_call`); `services/common/tests/test_ttl_cache.py` (`test_uncached_fallback_is_returned_but_not_stored`)
 - **INTEG-PREFS-7.** The consumer reads preferences through user-profile's internal route
   with the internal token and answers the defaults, fail open, on a transport error or a
   non-200. \
@@ -834,10 +842,13 @@ others or the bell.
   retried only by a redelivery. \
   Enforced in: `services/notifications/app/services/dispatchers/outbound.py` (`run_outbound`) \
   Pinned by: `services/notifications/tests/test_multichannel_dispatch.py` (`test_one_channel_failure_does_not_block_others`)
-- **INTEG-OUT-5.** The `None` a failed contact lookup answers is cached for
-  `PREFERENCES_CACHE_TTL_SECONDS` exactly like a real answer. Known gap, see #1075. \
-  Enforced in: `services/notifications/app/services/contact_client.py` (`ContactClient`); `services/common/herd_common/ttl_cache.py` (`TTLCache`) \
-  Pinned by: none (issue #1075)
+- **INTEG-OUT-5.** Only an answer from auth is cached, for
+  `PREFERENCES_CACHE_TTL_SECONDS`: a contact, or `None` for a 404 (unknown or
+  deactivated user). The `None` a missing token, a transport error, another non-200, or
+  a malformed body answers (INTEG-OUT-6) is returned as `Uncached` and not stored, so the
+  next event asks auth again. \
+  Enforced in: `services/notifications/app/services/contact_client.py` (`ContactClient`); `services/common/herd_common/ttl_cache.py` (`TTLCache`, `Uncached`) \
+  Pinned by: `services/notifications/tests/test_contact_client.py` (`test_failed_lookup_is_not_cached`, `test_not_found_is_an_answer_and_is_cached`, `test_missing_token_is_not_cached`)
 - **INTEG-OUT-6.** The contact lookup (auth, internal token) answers `None` on a missing
   token, a transport error, a non-200, or a malformed body; email is then skipped,
   logged `email_no_recipient`, and chat names the user by id. \
@@ -924,10 +935,9 @@ the log action.
 
 | Outcome | Log action | When | Rule |
 |---|---|---|---|
-| acked, dead-lettered | `nats_poison_message` | the body is not JSON | INTEG-CONSUME-7, INTEG-NCONSUME-7 |
+| acked, dead-lettered | `nats_poison_message` | the body is not JSON, or is JSON but not an object | INTEG-CONSUME-6, INTEG-CONSUME-7, INTEG-NCONSUME-6, INTEG-NCONSUME-7 |
 | nacked with delay | `nats_message_nak` | a handler error before the fifth delivery | INTEG-CONSUME-8, INTEG-NCONSUME-8 |
 | acked, dead-lettered | `nats_dlq_exhausted` | a handler error at the fifth delivery | INTEG-CONSUME-8, INTEG-NCONSUME-8 |
-| left unsettled | `Unexpected error processing NATS message` | the body is JSON but not an object | INTEG-CONSUME-6, INTEG-NCONSUME-6 |
 | acked, ledger row `dead` | none | every POST attempt to a receiver failed | INTEG-HOOK-14 |
 | acked, nothing sent | `notification_deduped` | the user or channel already has this event | INTEG-INAPP-1, INTEG-OUT-3 |
 | acked, channel skipped | `outbound_dispatch_failed` | an email, chat, or webhook-channel send failed | INTEG-OUT-4 |
@@ -938,11 +948,11 @@ the log action.
 |---|---|---|---|---|
 | Out (integration) | reservations | `POST /`, `GET /`, `GET /{id}`, `DELETE /{id}`, `PUT /{id}/release`, `GET /{id}/wiring-status` (caller's JWT, 10 s) | every facade route | Fail closed: 503 (INTEG-FACADE-14); a refusal is relayed (INTEG-FACADE-12) |
 | Out (integration) | external receiver | `POST <target_url>` (`WEBHOOK_DELIVERY_TIMEOUT_SECONDS` per attempt) | deliver an event | Retried, then a `dead` row; never fails the message (INTEG-HOOK-14, INTEG-HOOK-19) |
-| Out (notifications) | auth | `GET /internal/admins` (internal token, 5 s), cached | health recipients | Fail open: no admin recipients, cached for the TTL (INTEG-HEALTH-4, INTEG-HEALTH-5) |
+| Out (notifications) | auth | `GET /internal/admins` (internal token, 5 s), cached | health recipients | Fail open: no admin recipients for that event, not cached (INTEG-HEALTH-4, INTEG-HEALTH-5) |
 | Out (notifications) | reservations | `GET /internal/active-users?device_id` (internal token, 5 s) | health recipients | Fail open: no holder recipients (INTEG-HEALTH-6) |
-| Out (notifications) | user-profile | `GET /preferences/internal?user_id` (internal token, 5 s), cached | a recipient's preferences | Fail open: defaults, cached for the TTL (INTEG-PREFS-6, INTEG-PREFS-7) |
+| Out (notifications) | user-profile | `GET /preferences/internal?user_id` (internal token, 5 s), cached | a recipient's preferences | Fail open: defaults for that event, not cached (INTEG-PREFS-6, INTEG-PREFS-7) |
 | Out (notifications) | user-profile | `GET /preferences`, `PATCH /preferences` (caller's JWT, 10 s) | the preferences proxy | Fail closed: 503 (INTEG-PREFS-3) |
-| Out (notifications) | auth | `GET /internal/users/{id}/contact` (internal token, 5 s), cached | email address, chat username | Fail open: email skipped, chat by id (INTEG-OUT-5, INTEG-OUT-6) |
+| Out (notifications) | auth | `GET /internal/users/{id}/contact` (internal token, 5 s), cached | email address, chat username | Fail open: email skipped, chat by id, not cached (INTEG-OUT-5, INTEG-OUT-6) |
 | Out (notifications) | SMTP server, chat URL, outbound webhook URL | SMTP send, `POST` (the channel's timeout) | outbound channels | Logged and swallowed; claim released (INTEG-OUT-3, INTEG-OUT-4) |
 | Out (both) | NATS | DLQ publish | dead letters | Logged; the message is still acked (INTEG-CONSUME-9, INTEG-NCONSUME-9) |
 
@@ -993,11 +1003,6 @@ Two documents are incomplete against the code this specification describes, trac
 
 ### Open defects
 
-- #1074 (INTEG-CONSUME-6, INTEG-NCONSUME-6): a JSON message body that is not an object
-  escapes both consumers unsettled and is dropped after `max_deliver` with no
-  dead-letter copy.
-- #1075 (INTEG-HEALTH-4, INTEG-PREFS-6, INTEG-OUT-5): a failed admin-list, preference,
-  or contact lookup is cached for the full TTL as if it were an answer.
 - #1076 (INTEG-UI-3): the bell nests the delete button inside the item button, and its
   list query runs while signed out.
 - #1077 (INTEG-ROUTE-2): a failed reservation produces no notification and has no
@@ -1045,12 +1050,7 @@ Two documents are incomplete against the code this specification describes, trac
 - INTEG-HOOK-15: a `dead` row retried and overwritten on redelivery.
 - INTEG-HOOK-16: the concurrent ledger insert race.
 - INTEG-HOOK-22: the ledger key with neither an event id nor metadata.
-- INTEG-CONSUME-6: a JSON body that is not an object (integration).
-- INTEG-NCONSUME-6: a JSON body that is not an object (notifications).
-- INTEG-HEALTH-4: the empty admin list cached after a failure.
 - INTEG-INAPP-7: marking a read notification read again.
 - INTEG-PREFS-5: `channels` replaced whole on a write.
-- INTEG-PREFS-6: default preferences cached after a failure.
-- INTEG-OUT-5: a missing contact cached after a failure.
 - INTEG-UI-3: the nested delete button.
 - INTEG-UI-4: click to mark read and the disabled Mark all read.

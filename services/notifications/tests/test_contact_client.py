@@ -183,3 +183,67 @@ def test_get_contact_client_is_lazy_singleton():
         assert first is second
     finally:
         set_contact_client(None)
+
+
+_OK = {"email": "a@b.com", "username": "alice"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first",
+    [
+        "transport",
+        httpx.Response(503, json={"detail": "down"}),
+        httpx.Response(200, json={"unexpected": "shape"}),
+        httpx.Response(200, content=b"not json"),
+    ],
+    ids=["transport", "non_200", "missing_keys", "not_json"],
+)
+async def test_failed_lookup_is_not_cached(first):
+    """Issue #1075: a failure skips email for THAT call only; the next call
+    asks auth again and caches the answer."""
+    uid = uuid.uuid4()
+    responses = [first, httpx.Response(200, json=_OK)]
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        r = responses.pop(0) if responses else httpx.Response(500)
+        if r == "transport":
+            raise httpx.ConnectError("auth down")
+        return r
+
+    c = _client(handler)
+    during = await c.get(uid)
+    after = await c.get(uid)
+    again = await c.get(uid)
+    c._restore()
+    assert during is None
+    assert after is not None and after.email == "a@b.com"
+    assert again == after
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_not_found_is_an_answer_and_is_cached():
+    """A 404 (unknown or deactivated user) is what auth answered: cached."""
+    uid = uuid.uuid4()
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(404, json={"detail": "User not found"})
+
+    c = _client(handler)
+    assert await c.get(uid) is None
+    assert await c.get(uid) is None
+    c._restore()
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_missing_token_is_not_cached():
+    c = ContactClient(base_url="http://auth", internal_token="", ttl_seconds=60)
+    uid = uuid.uuid4()
+    assert await c.get(uid) is None
+    assert uid not in c._cache._cache

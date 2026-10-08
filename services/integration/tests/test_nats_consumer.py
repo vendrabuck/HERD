@@ -18,6 +18,7 @@ import json
 import uuid
 from unittest.mock import AsyncMock
 
+import pytest
 from app.services import nats_consumer
 from app.services.delivery import Target
 
@@ -418,3 +419,22 @@ async def test_handle_event_health_transition_not_delivered_to_reservation_only_
     targets = await load_matching_targets(_session_factory, "device.health_transition")
 
     assert [t.id for t in targets] == [health_sub.id]
+
+
+@pytest.mark.parametrize("body", [b"null", b"5", b"[1]", b'"text"', b"true"])
+async def test_process_message_non_object_json_goes_to_dlq(body):
+    """Issue #1074: valid JSON that is not an object is poison. Before the fix
+    the handler's `.get` raised, the except branch's own `event_data.get`
+    raised again, and the message escaped with no ack, nak, or DLQ copy."""
+    msg = _FakeMsg(body)
+    js = AsyncMock()
+
+    async def _handler(event_data, raw_body, session_factory, dedupe_key):
+        raise AssertionError("handler should not be called on a poison message")
+
+    result = await nats_consumer.process_message(msg, js, _handler, session_factory=object())
+
+    assert result == "dlq"
+    js.publish.assert_awaited_once_with(nats_consumer.NATS_DLQ_SUBJECT, body)
+    msg.ack.assert_awaited_once()
+    msg.nak.assert_not_awaited()

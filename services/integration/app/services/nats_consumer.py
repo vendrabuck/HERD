@@ -24,11 +24,12 @@ unexpected consumer-loop error.
 """
 
 import asyncio
-import json
 import logging
 from collections.abc import Awaitable, Callable
 
 from herd_common.jetstream import (
+    connect_nats,
+    decode_event_object,
     ensure_consumer,
     ensure_stream_exists,
     heartbeat_interval,
@@ -157,9 +158,10 @@ async def process_message(
     NAK), so the redelivery actually waits
     NATS_NAK_BACKOFF_SECONDS[min(num_delivered - 1, ...)] seconds.
     """
-    try:
-        event_data = json.loads(msg.data.decode())
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    # A body that is not UTF-8 JSON, or is JSON but not an object, is poison
+    # (issue #1074: a non-object body used to escape unsettled).
+    event_data = decode_event_object(msg.data)
+    if event_data is None:
         logger.error(
             "Poison message on stream; routing to DLQ",
             extra={"action": "nats_poison_message", "dlq_subject": dlq_subject},
@@ -244,11 +246,11 @@ async def start_nats_consumer(app) -> None:
     from nats.js.api import ConsumerConfig
 
     try:
-        nc = await nats.connect(
-            settings.nats_url,
-            max_reconnect_attempts=-1,
-            reconnect_time_wait=2,
-        )
+        # Bounded first connect, unlimited reconnects once connected (issue
+        # #1083): a broker that is down at boot raises after a few tries, so the
+        # warning below is reachable and the service runs without the consumer;
+        # an established connection still retries forever.
+        nc = await connect_nats(settings.nats_url)
         app.state.nats = nc
         js = nc.jetstream()
 

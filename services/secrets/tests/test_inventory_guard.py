@@ -51,3 +51,26 @@ async def test_upstream_error_fails_closed_503():
     assert exc_info.value.detail == (
         "inventory service returned an error while checking secret references"
     )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, content=b"<html>proxy error</html>"),
+        httpx.Response(200, json={"error": "gateway"}),
+        httpx.Response(200, json=["hv-1", "hv-2"]),
+        httpx.Response(200, json=None),
+        httpx.Response(200, json=[{"id": "a", "name": "ok"}, 5]),
+    ],
+    ids=["non-json", "json-object", "list-of-strings", "json-null", "mixed-list"],
+)
+async def test_malformed_200_fails_closed_503(response):
+    """Issue #1084: a 200 the guard cannot read is the same fail-closed 503 as
+    a 5xx, never an unhandled 500 (JSONDecodeError or AttributeError)."""
+    with patch(_INVENTORY_GET, new=AsyncMock(return_value=response)):
+        with pytest.raises(HTTPException) as exc_info:
+            await find_hypervisors_referencing_secret(uuid.uuid4())
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == (
+        "inventory service returned an error while checking secret references"
+    )

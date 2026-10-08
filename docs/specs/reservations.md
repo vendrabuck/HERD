@@ -1116,12 +1116,13 @@ caller.
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_wiring_changed_payload`) \
   Pinned by: `services/reservations/tests/test_wiring_changed_staging.py` (`test_heal_staging_carries_null_delta`)
 - **RES-EVENT-4.** NATS being unreachable at startup is logged and does not stop the
-  service or its background tasks; events wait in the outbox and the relay picks up a
-  later connection. Known gap, see #1083: with no broker reachable the connect call
-  retries and never raises, so startup waits for NATS (`operations-and-observability.md`,
-  OPS-NATS-1). \
-  Enforced in: `services/reservations/app/main.py` (`lifespan`) \
-  Pinned by: `services/reservations/tests/test_main_task_lifecycle.py` (`test_lifespan_creates_and_cancels_expiration_and_purpose_classify_tasks`)
+  service or its background tasks: the first connect is bounded
+  (`operations-and-observability.md`, OPS-NATS-1) and its failure leaves the service
+  running with no NATS connection. Events wait in the outbox, unpublished, until the
+  service is restarted with the broker reachable; a connection that was established and
+  then lost is recovered by the client's unlimited reconnect. \
+  Enforced in: `services/reservations/app/main.py` (`lifespan`); `services/common/herd_common/jetstream.py` (`connect_nats`) \
+  Pinned by: `services/reservations/tests/test_main_task_lifecycle.py` (`test_lifespan_starts_without_nats_using_the_real_client`, `test_lifespan_creates_and_cancels_expiration_and_purpose_classify_tasks`)
 
 **Out of scope.** The relay, deduplication headers, and consumer behavior are shared
 infrastructure (`operations-and-observability.md`); what consumers do is in their own
@@ -1260,7 +1261,7 @@ Calls into this area are in section 7; events are in section 6.
 | Out | cabling | `GET /internal/forks` (internal token, paged by 200) | sweep's active-fork listing | The tick's archive, heal, and missing-fork steps are skipped |
 | Out | execution | `GET /internal/reservations/{id}/wiring-status`, `POST .../wiring/retry` (internal token, 30 s) | wiring proxies | 4xx relayed; 5xx and transport 503 |
 | Out | ai-orchestrator | `POST /internal/classify-purpose` (internal token, `PURPOSE_CLASSIFY_TIMEOUT_SECONDS`) | purpose suggestion | Never raises; outcome classes in RES-PURPOSE-6 and RES-PURPOSE-7 |
-| Out | NATS | `HERD_RESERVATIONS` via the outbox relay | lifecycle events (section 6) | Events wait in the outbox until NATS is reachable (at-least-once, RES-EVENT-4) |
+| Out | NATS | `HERD_RESERVATIONS` via the outbox relay | lifecycle events (section 6) | Events wait in the outbox until a NATS connection exists (at-least-once, RES-EVENT-4) |
 
 Utilization reporting additionally calls inventory, auth, execution, and cabling; it
 belongs to `operations-and-observability.md`.
@@ -1310,9 +1311,7 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
 
 ### Open defects
 
-- #1083, RES-EVENT-4: with NATS unreachable at boot the service waits in startup instead
-  of starting without it.
-
+None at present.
 
 ### Limits by decision
 

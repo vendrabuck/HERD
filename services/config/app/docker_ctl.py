@@ -31,6 +31,9 @@ def restart_services() -> dict:
     """Restart the HERD application services of this compose project via Docker API.
 
     Returns a dict with 'restarted' (list of names) and 'errors' (list of strings).
+    An error names what failed and the exception CLASS only; the exception text
+    (a socket path, a daemon URL, an API error body) goes to the log, never to
+    the response (issue #1086).
     """
     try:
         import docker
@@ -42,7 +45,8 @@ def restart_services() -> dict:
     try:
         client = docker.from_env()
     except Exception as exc:
-        result["errors"].append(f"Cannot connect to Docker: {exc}")
+        result["errors"].append(f"Cannot connect to Docker: {type(exc).__name__}")
+        logger.error("Cannot connect to Docker: %s", exc)
         return result
 
     project = _own_compose_project(client)
@@ -58,7 +62,8 @@ def restart_services() -> dict:
             filters={"label": [f"{PROJECT_LABEL}={project}", SERVICE_LABEL]}
         )
     except Exception as exc:
-        result["errors"].append(f"Cannot list containers: {exc}")
+        result["errors"].append(f"Cannot list containers: {type(exc).__name__}")
+        logger.error("Cannot list containers: %s", exc)
         return result
 
     for container in containers:
@@ -70,8 +75,7 @@ def restart_services() -> dict:
             result["restarted"].append(service_name)
             logger.info("Restarted service: %s", service_name)
         except Exception as exc:
-            msg = f"Failed to restart {service_name}: {exc}"
-            result["errors"].append(msg)
-            logger.error(msg)
+            result["errors"].append(f"Failed to restart {service_name}: {type(exc).__name__}")
+            logger.error("Failed to restart %s: %s", service_name, exc)
 
     return result

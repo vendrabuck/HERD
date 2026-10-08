@@ -105,7 +105,7 @@ Five durable consumers feed off two source streams (`HERD_RESERVATIONS` for `her
 - `integration` webhooks consumer (`integration-webhooks-consumer`), DLQ `herd.reservations.dlq.integration`
 - `integration` webhooks health consumer (`integration-webhooks-health-consumer`, issue #831), DLQ `herd.health.dlq.integration`
 
-Messages that poisoned any consumer (bad JSON or exhausted `max_deliver=5`) land on the consumer's DLQ subject and are retained in `HERD_DLQ` within the stream's `max_age` (see JetStream durability below); on the dev/test path they are retained only until the next container recreate.
+Messages that poisoned any consumer (bad JSON, JSON that is not an object, or exhausted `max_deliver=5`) land on the consumer's DLQ subject and are retained in `HERD_DLQ` within the stream's `max_age` (see JetStream durability below); on the dev/test path they are retained only until the next container recreate.
 
 The compose `nats` service runs `nats:2.10-alpine`, which ships only `nats-server`: there is no `nats` CLI inside it, so running `nats` in that container fails with "executable file not found". Run the CLI from a one-off `natsio/nats-box` container on the stack's network instead, the same form `docs/TROUBLESHOOTING.md` uses. The network is `<compose project>_herd-net` (for example `herd-public_herd-net` for a checkout in `herd-public/`; `docker network ls | grep herd-net` lists it). Every command below goes through this one shell variable; `nats-box:0.14.5` carries natscli 0.1.5, whose flags these commands use:
 
@@ -222,7 +222,15 @@ POST /api/secrets/keys/rotate      (admin JWT)
 
 introduces a new key version, re-encrypts every secret to it, and retires (but
 retains) prior versions so nothing becomes undecryptable. Verify with a reveal
-afterwards.
+afterwards. With several secrets replicas, the others need no restart: each
+reads a key version it has not seen from the key table on first use, and every
+write encrypts under the newest unretired version in the table. Rotations are
+serialized by a Postgres advisory lock, so a second rotation waits and then
+moves to the next version; if one is refused anyway it answers 409 and changed
+nothing, so retry it. A 503 `Secret key material is unavailable to this service`
+means a replica cannot unwrap a stored key version (a missing row or a
+different `SECRETS_KEK` from the other replicas); the log names the version
+under action `key_version_unavailable`.
 
 Losing `SECRETS_KEK` with no `SECRETS_KEK_PREVIOUS` window makes stored
 secrets unrecoverable; there is no backdoor. Keep the KEK in whatever secret
@@ -311,6 +319,7 @@ There is no built-in Prometheus/Grafana stack; roll your own based on the JSON l
 - Reservations service still accepts writes. Lifecycle events are written to the transactional outbox in the same transaction as the state change (issue #21), so nothing is lost while NATS is unreachable; the relay just cannot publish them yet.
 - Execution service can't consume events during the outage, so L1/L2 driver operations are NOT triggered yet; a reservation goes `ACTIVE` but its devices are not configured on real hardware until events flow again. Health-transition events are likewise buffered in the execution outbox.
 - Recover: bring NATS up. The per-service outbox relays reconnect and drain their unpublished rows on the next tick after NATS is reachable again (at most `OUTBOX_RELAY_TICK_SECONDS` later; the issue #682 wake path is deliberately ignored while the relay is waiting out an outage), so reservation and health events are delivered once (not lost), just delayed. No manual catch-up event is needed for these streams.
+- A service that STARTED while NATS was down is different: its first connect gives up after a few tries (about 10 seconds; issue #1083), it logs `NATS unavailable at ...` (reservations) or `Failed to connect to NATS; ...` (execution, notifications, integration), finishes starting, and stays without NATS until it is restarted. After NATS is back, restart every service that logged one of those lines (`docker compose restart <svc>`); its outbox rows and the durable consumers' unacknowledged messages are kept, so nothing is lost. A connection that was established before the outage reconnects by itself, without limit.
 
 ### Config volume is wiped
 
