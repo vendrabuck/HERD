@@ -549,6 +549,113 @@ async def test_dry_run_update_writes_nothing(admin_client):
     assert await _count_versions() == 1
 
 
+# Dry run is a full rehearsal (issue #1064) ----------------------------------
+
+
+def _without_flag(report: dict) -> dict:
+    return {k: v for k, v in report.items() if k != "dry_run"}
+
+
+async def _topology_state() -> list[tuple]:
+    """Every stored topology and version, for a writes-nothing comparison."""
+    async with TestSessionLocal() as session:
+        topologies = (await session.execute(select(Topology))).scalars().all()
+        versions = (await session.execute(select(TopologyVersion))).scalars().all()
+        return sorted(
+            [
+                ("t", str(t.id), t.name, json.dumps(t.canvas_data, sort_keys=True))
+                for t in topologies
+            ]
+            + [
+                ("v", str(v.topology_id), str(v.version_number), v.description or "")
+                for v in versions
+            ]
+        )
+
+
+@pytest.mark.asyncio
+async def test_dry_run_duplicate_new_name_matches_commit_row_for_row(admin_client):
+    """The issue's repro: a file naming one NEW topology twice. The commit
+    creates it on the first row and updates it on the second, so the dry run
+    must report `create, update` too, not `create, create`. The file also
+    carries an update of an existing topology and an unresolvable row, and the
+    dry run writes nothing at all."""
+    await _seed_connection()
+    ghost = _canvas_with_names()
+    ghost["nodes"].append({"id": "n3", "data": {"device": {"name": "ghost"}, "label": "ghost"}})
+    items = [
+        {"name": "Twice", "canvas": _canvas_with_names()},
+        {"name": "Twice", "canvas": _isolated_nodes_canvas()},
+        {"name": "Existing", "canvas": _isolated_nodes_canvas()},
+        {"name": "Ghost", "canvas": ghost},
+    ]
+    with _resolver({"switch-a": DEV_A, "switch-b": DEV_B}):
+        await _import_json(admin_client, [{"name": "Existing", "canvas": _canvas_with_names()}])
+        before = await _topology_state()
+        dry = (await _import_json(admin_client, items, dry_run="true")).json()
+        assert await _topology_state() == before
+        real = (await _import_json(admin_client, items)).json()
+
+    assert dry["dry_run"] is True
+    assert real["dry_run"] is False
+    assert [r["action"] for r in dry["rows"]] == ["create", "update", "update", "reject"]
+    assert dry["rows"][3]["reason"] == "unresolved device names: ghost"
+    assert _without_flag(dry) == _without_flag(real)
+    # The commit really did create then update: one "Twice", two versions.
+    async with TestSessionLocal() as session:
+        twice = (
+            (await session.execute(select(Topology).where(Topology.name == "Twice")))
+            .scalars()
+            .all()
+        )
+        assert len(twice) == 1
+        assert twice[0].canvas_data["edges"] == []
+        versions = (
+            (
+                await session.execute(
+                    select(TopologyVersion).where(TopologyVersion.topology_id == twice[0].id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sorted(v.version_number for v in versions) == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_dry_run_csv_matches_commit_row_for_row(admin_client):
+    """CSV groups rows by topology name, so a name cannot repeat as two
+    records; the report for a mixed CSV file (a create, an update of an
+    existing topology, an unresolvable device) still matches the commit row
+    for row, and the dry run writes nothing."""
+    await _seed_connection()
+    csv_body = (
+        "topology_name,source_device,source_port,target_device,target_port,layer\n"
+        "Fresh CSV,switch-a,eth0,switch-b,eth0,L1\n"
+        "Existing,switch-b,eth0,switch-a,eth0,L1\n"
+        "Ghost CSV,switch-a,eth0,ghost,eth0,L1\n"
+    )
+
+    async def _post(dry_run: str) -> dict:
+        resp = await admin_client.post(
+            "/topologies/import",
+            params={"format": "csv", "dry_run": dry_run},
+            files={"file": ("t.csv", io.BytesIO(csv_body.encode()), "text/csv")},
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    with _resolver({"switch-a": DEV_A, "switch-b": DEV_B}):
+        await _import_json(admin_client, [{"name": "Existing", "canvas": _canvas_with_names()}])
+        before = await _topology_state()
+        dry = await _post("true")
+        assert await _topology_state() == before
+        real = await _post("false")
+
+    assert [r["action"] for r in dry["rows"]] == ["create", "update", "reject"]
+    assert _without_flag(dry) == _without_flag(real)
+
+
 @pytest.mark.asyncio
 async def test_mixed_create_and_update_batch(admin_client):
     await _seed_connection()
