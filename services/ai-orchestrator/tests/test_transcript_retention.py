@@ -1,4 +1,4 @@
-"""Idle-conversation retention for purpose classification (issue #1039).
+"""Idle-conversation retention for purpose classification (issues #1039, #1067).
 
 The sweeper keeps an idle conversation while its reservation is not terminal,
 or is terminal with the end-of-reservation classification still pending, and
@@ -196,6 +196,33 @@ async def test_the_sweep_keeps_only_what_the_classifier_still_owes():
     assert drop_classified not in await _remaining()
     assert drop_gone not in await _remaining()
     assert await _remaining() == {keep_live, keep_pending, keep_down, fresh}
+
+
+async def test_the_sweep_releases_a_transcript_whose_classification_hit_the_attempt_cap():
+    """Issue #1067: once the purpose sweep has used up a terminal reservation's
+    attempts without a suggestion, reservations reports it not pending (only the
+    manual Classify now, or a backfill reset, can try it again), so its idle
+    conversation is released instead of being kept forever. The body is the full
+    internal status reservations answers for such a row."""
+    rid = uuid.uuid4()
+    conv_id = await _idle_conversation(rid)
+    capped = {
+        "id": str(rid),
+        "status": "COMPLETED",
+        "is_active": False,
+        "start_time": "2026-10-01T10:00:00+00:00",
+        "end_time": "2026-10-01T12:00:00+00:00",
+        "purpose_classification_pending": False,
+    }
+
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.get(f"{BASE}/internal/{rid}").mock(
+            return_value=httpx.Response(200, json=capped)
+        )
+        assert await _sweep() == 1
+
+    assert route.call_count == 1
+    assert conv_id not in await _remaining()
 
 
 async def test_the_sweep_asks_once_per_reservation():

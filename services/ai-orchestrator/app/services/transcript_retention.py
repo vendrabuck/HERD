@@ -5,8 +5,10 @@ reservation's assistant conversations (purpose_signals._gather_transcripts_block
 so a conversation idle past ASSISTANT_CONVERSATION_TTL_HOURS must not be
 deleted while that read is still owed. The sweeper keeps a conversation when
 its reservation is not terminal yet, or is terminal with the classification
-still pending (purpose_classify_requested_at set and no suggestion, reported
-by reservations as `purpose_classification_pending`).
+still pending (purpose_classify_requested_at set, no suggestion, and the
+purpose sweep's attempts not yet at purpose_classify_max_attempts, reported by
+reservations as `purpose_classification_pending`; issue #1067 added the cap, so
+a row the sweep has given up on releases its transcript).
 
 The exemption applies only while this service would actually send transcripts
 to the classifier (AI_PURPOSE_CLASSIFICATION_ENABLED and

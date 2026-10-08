@@ -593,6 +593,8 @@ the read transaction ends, and fails closed: a transport error, a missing token,
 non-200 other than 404, a malformed body, or an unknown status keeps the conversation,
 while a 404 releases it. The delete re-applies the idle cutoff, so a conversation used
 during the lookups survives. With either flag off nothing reads transcripts, so the plain
-TTL applies and no lookup runs. Limit by decision: a terminal reservation whose
-classification never produces a suggestion stays pending, and its idle conversations are
-kept for as long as that lasts.
+TTL applies and no lookup runs. Follow-up (issue #1067): pending also requires the
+sweep's attempts to be below `PURPOSE_CLASSIFY_MAX_ATTEMPTS`, so a reservation whose
+classification hits the cap without a suggestion is no longer pending and its idle
+conversations are released after the TTL; the admin backfill resets the attempts and
+makes it pending again.

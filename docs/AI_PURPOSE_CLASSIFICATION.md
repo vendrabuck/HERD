@@ -313,8 +313,9 @@ conversation when its reservation:
 
 - is not terminal yet (`PENDING`, `PENDING_PROVISION`, or `ACTIVE`), or
 - is terminal (`COMPLETED`, `CANCELLED`, or `FAILED`) and its end-of-reservation
-  classification is still pending: `purpose_classify_requested_at` is set and
-  there is no suggestion yet.
+  classification is still pending: `purpose_classify_requested_at` is set, there
+  is no suggestion yet, and the sweep has not used up the row's attempts
+  (`purpose_classify_attempts` below `PURPOSE_CLASSIFY_MAX_ATTEMPTS`).
 
 So the transcript the end pass is meant to read is still there when it reads
 it. Once the suggestion is stored, the next sweep after the TTL deletes the
@@ -327,10 +328,12 @@ A 404 means the reservation does not exist, and its conversations are deleted.
 With either flag off nothing reads transcripts, so the plain idle TTL applies
 and the sweeper makes no lookups.
 
-A terminal reservation whose classification never produces a suggestion (the
-sweep's attempt cap was reached and nobody pressed Classify now) stays
-pending, so its idle conversations are kept until it is classified or one of
-the two flags is turned off.
+A terminal reservation whose classification never produces a suggestion stops
+being pending when the sweep's attempt cap is reached (issue #1067), because the
+sweep never selects it again; its idle conversations are then deleted by the
+next sweep after the TTL. Classify now still works on such a row, without the
+transcript once it is gone, and the admin backfill resets its attempts, which
+makes it pending again.
 
 The prompt assembled for either pass never includes credentials, secret
 values, or device configuration contents: `field_data` is never forwarded,
