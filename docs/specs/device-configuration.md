@@ -97,7 +97,7 @@ write their own runs, `provisioning-and-wiring.md` and `dynamic-resources.md`):
 |---|---|---|---|---|---|
 | (none) | job `pending` | `POST /devices/{id}/config-versions/{vid}/schedule`; `POST /apply-jobs/{id}/confirm` (a new row) | CFG-JOB-1 to CFG-JOB-7; CFG-JOB-11 | nothing | CFG-STATE-1 |
 | job `pending` | job `running` | the apply scheduler (`fire_job`) | conditional update on `pending` | nothing | CFG-STATE-2 |
-| job `pending` | job `cancelled` | `DELETE /apply-jobs/{id}` | creator or admin; read as `pending` | nothing | CFG-STATE-3, CFG-STATE-4 |
+| job `pending` | job `cancelled` | `DELETE /apply-jobs/{id}` | creator or admin; conditional update on `pending` | nothing | CFG-STATE-3, CFG-STATE-4 |
 | job `running` | job `pending` | the stale sweep | `fired_at` null and `scheduled_for` over 300 seconds ago | nothing | CFG-STATE-5 |
 | job `running` | job `skipped` | the apply scheduler | reservation not active, or creator not authorized | nothing | CFG-STATE-6 |
 | job `running` | job `success` or `failed` | the apply scheduler | the execute outcome | nothing | CFG-STATE-7 |
@@ -108,10 +108,11 @@ write their own runs, `provisioning-and-wiring.md` and `dynamic-resources.md`):
 | run `RUNNING` | run `FAILED` | `run_driver_action` | dry run refused | nothing | CFG-RUNSTATE-3 |
 | run `RUNNING` | run `SUCCESS`, `FAILED`, or `TIMEOUT` | `run_driver_action` | the sandbox result | nothing | CFG-RUNSTATE-4 |
 
-**Concurrency.** Only the scheduler's claim is a compare-and-swap. `_due_jobs` also
-selects with `FOR UPDATE SKIP LOCKED` on Postgres, but the lock is released at the first
-commit inside `fire_job`, so the claim is what keeps two schedulers off one job. Every
-other job write and every run write reads the row and overwrites it.
+**Concurrency.** The scheduler's claim and the cancel are compare-and-swap updates on
+`pending`, so exactly one of them wins a pending job. `_due_jobs` also selects with
+`FOR UPDATE SKIP LOCKED` on Postgres, but the lock is released at the first commit
+inside `fire_job`, so the claim is what keeps two schedulers off one job. Every other
+job write and every run write reads the row and overwrites it.
 
 **Rules.**
 
@@ -128,11 +129,13 @@ other job write and every run write reads the row and overwrites it.
   is refused (CFG-JOB-10). \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`cancel_apply_job`) \
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_cancel_pending_job`, `test_cancel_already_cancelled_job`)
-- **CFG-STATE-4.** The cancel write carries no status guard, so a cancel that commits
-  after the scheduler's claim answers 204 while the job still fires, and the job ends
-  with whichever of the two writes committed last. Known gap, see #1088. \
-  Enforced in: `services/inventory/app/routers/apply_jobs.py` (`cancel_apply_job`) \
-  Pinned by: none (#1088)
+- **CFG-STATE-4.** The cancel is a compare-and-swap on `status = 'pending'`, the same
+  guard as the claim (CFG-STATE-2), so exactly one of the two wins. A cancel that loses
+  (the claim committed after the cancel read the row) changes nothing and answers 409
+  `Job is '<status>', not cancellable` with the status it finds; a claim that loses
+  fires nothing. A 204 therefore means the job never fires. \
+  Enforced in: `services/inventory/app/routers/apply_jobs.py` (`cancel_apply_job`); `services/inventory/app/services/apply_scheduler.py` (`fire_job`) \
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_cancel_loses_to_a_claim_that_committed_after_its_read`, `test_cancelled_job_is_never_fired_by_a_later_claim`); `services/inventory/tests/test_config_apply_races_live_pg.py` (`test_cancel_holds_the_row_first_claim_fires_nothing`, `test_claim_holds_the_row_first_cancel_answers_409`)
 - **CFG-STATE-5.** Each scheduler tick first returns to `pending` every `running` job
   whose `fired_at` is null and whose `scheduled_for` is more than
   `STALE_RUNNING_AFTER_SECONDS` (300) in the past. The age is measured from
@@ -352,7 +355,7 @@ internal route of section 7.
   `Could not allocate a config version number under concurrent writes; retry the request`.
   Only a unique violation is retried. \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`_commit_new_version`, `_next_version_number`, `VERSION_ALLOCATION_CONFLICT_DETAIL`); `services/inventory/app/models/device_config_version.py` (`DeviceConfigVersion`); `services/inventory/migrations/versions/0023_config_version_unique_index.py` (`upgrade`) \
-  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_model_declares_unique_device_version_index`, `test_create_all_schema_refuses_duplicate_version_number`, `test_create_retries_after_version_number_collision`, `test_restore_retries_after_version_number_collision`, `test_create_answers_409_when_version_allocation_keeps_colliding`)
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_model_declares_unique_device_version_index`, `test_create_all_schema_refuses_duplicate_version_number`, `test_create_retries_after_version_number_collision`, `test_restore_retries_after_version_number_collision`, `test_create_answers_409_when_version_allocation_keeps_colliding`); `services/inventory/tests/test_config_apply_races_live_pg.py` (`test_concurrent_creates_get_distinct_numbers`)
 - **CFG-VER-6.** The list answers the device's versions newest number first, without
   their `config`, as `{items, total, skip, limit}`. \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`list_config_versions`) \
@@ -1211,7 +1214,7 @@ status.
 | 409 | `{"error": "driver_cannot_configure", "connection_type", "driver", "message"}` | a push to a device whose driver cannot configure | CFG-GATE-2, CFG-GATE-4 |
 | 409 | `{"error": "device_has_no_driver", "message"}` | any execution action on a device with no driver | CFG-GATE-4 |
 | 409 | `{"message": "Device has active reservations; restore blocked", "reservations": [...]}` | a restore while another user's reservation holds the device | CFG-VER-12 |
-| 409 | `Job is '<status>', not cancellable` | a cancel of a job that is not `pending` | CFG-JOB-10 |
+| 409 | `Job is '<status>', not cancellable` | a cancel of a job that is not `pending`, or one the scheduler claimed first | CFG-JOB-10, CFG-STATE-4 |
 | 409 | `Could not allocate a config version number under concurrent writes; retry the request` | a create or restore that collided five times | CFG-VER-5 |
 | 409 | `Source job is not a dry-run; nothing to promote`, `Source dry-run is '<status>'; only successful dry-runs can be promoted` | a confirm of the wrong kind of job | CFG-JOB-11 |
 | 422 | `Device has no driver-defined connection_type; cannot validate config` | a version for a device without a driver connection type | CFG-VER-2 |
@@ -1289,8 +1292,6 @@ confirmed by reading only.
 
 ### Open defects
 
-- #1088 (CFG-STATE-4): a cancel racing the scheduler's claim answers 204 while the job
-  fires.
 - #1089 (CFG-STATE-5): the stale sweep measures from `scheduled_for`, so a late-claimed
   job can be fired twice by two schedulers.
 - #1090 (CFG-SCHED-8): scheduled runs carry no reservation, so a reservation owner cannot
@@ -1331,7 +1332,6 @@ that should have a test are tracked in #1100.
 
 ### Rules with no test
 
-- CFG-STATE-4: a cancel racing the claim.
 - CFG-RUNSTATE-5: a run left `PENDING` or `RUNNING` by an unexpected exception.
 - CFG-AUTH-6: the write routes skip visibility.
 - CFG-VER-10: the default restore description.

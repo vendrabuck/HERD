@@ -1274,3 +1274,80 @@ async def test_create_answers_409_when_version_allocation_keeps_colliding(client
     assert calls["n"] == 5
     listing = await client.get(f"/devices/{device_id}/config-versions")
     assert listing.json()["total"] == 1
+
+
+# ---- cancel versus the scheduler's claim (issue #1088) ----
+
+
+async def _schedule_job(client) -> tuple[str, str]:
+    device_id = await _create_device(client)
+    create = await client.post(
+        f"/devices/{device_id}/config-versions", json={"config": {"vlan": 7}}
+    )
+    sched = await client.post(
+        f"/devices/{device_id}/config-versions/{create.json()['id']}/schedule",
+        json={"scheduled_for": _future()},
+    )
+    assert sched.status_code == 201
+    return device_id, sched.json()["id"]
+
+
+async def _job_status(job_id: str) -> str:
+    from app.models.device_config_apply_job import DeviceConfigApplyJob  # noqa: PLC0415
+
+    async with TestSessionLocal() as session:
+        job = await session.get(DeviceConfigApplyJob, uuid.UUID(job_id))
+        return job.status
+
+
+@pytest.mark.asyncio
+async def test_cancel_loses_to_a_claim_that_committed_after_its_read(client):
+    """The claim lands between the cancel's read (pending) and its write: the cancel
+    must change nothing and answer 409, never 204 over a job that is firing."""
+    from app.models.device_config_apply_job import DeviceConfigApplyJob  # noqa: PLC0415
+    from app.routers.apply_jobs import cancel_apply_job  # noqa: PLC0415
+    from fastapi import HTTPException  # noqa: PLC0415
+    from sqlalchemy import update  # noqa: PLC0415
+
+    _, job_id = await _schedule_job(client)
+    async with TestSessionLocal() as cancel_session:
+        # The cancel's read: the row is pending in this session's identity map.
+        stale = await cancel_session.get(DeviceConfigApplyJob, uuid.UUID(job_id))
+        assert stale.status == "pending"
+        # The scheduler's claim commits from another session.
+        async with TestSessionLocal() as claim_session:
+            claim = await claim_session.execute(
+                update(DeviceConfigApplyJob)
+                .where(
+                    DeviceConfigApplyJob.id == uuid.UUID(job_id),
+                    DeviceConfigApplyJob.status == "pending",
+                )
+                .values(status="running")
+            )
+            await claim_session.commit()
+            assert claim.rowcount == 1
+        with pytest.raises(HTTPException) as exc:
+            await cancel_apply_job(uuid.UUID(job_id), payload=override_admin(), db=cancel_session)
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Job is 'running', not cancellable"
+    assert await _job_status(job_id) == "running"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_job_is_never_fired_by_a_later_claim(client):
+    """The other order: the cancel commits first, so the claim changes no row and
+    nothing reaches execution."""
+    from app.models.device_config_apply_job import DeviceConfigApplyJob  # noqa: PLC0415
+    from app.services.apply_scheduler import fire_job  # noqa: PLC0415
+
+    _, job_id = await _schedule_job(client)
+    async with TestSessionLocal() as sched_session:
+        # The scheduler read the row while it was still pending.
+        job = await sched_session.get(DeviceConfigApplyJob, uuid.UUID(job_id))
+        resp = await client.delete(f"/apply-jobs/{job_id}")
+        assert resp.status_code == 204
+        post = AsyncMock(return_value=("success", None, None))
+        with patch("app.services.apply_scheduler._post_internal_execute", new=post):
+            await fire_job(sched_session, job, client=None)
+    post.assert_not_awaited()
+    assert await _job_status(job_id) == "cancelled"
