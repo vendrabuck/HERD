@@ -235,6 +235,9 @@ None. Inventory has no NATS connection, and the driver-action routes publish not
 | POST | `/execute/internal` (execution) | `X-Internal-Token` | inventory's apply scheduler | the run | CFG-EXEC-6, CFG-GATE-4 |
 | POST | `/internal/validate-package` (execution) | `X-Internal-Token` | ai-orchestrator (recipe drafting) | the validation report | CFG-VAL-1 to CFG-VAL-9 |
 
+Execution's `POST /device-check` (an on-demand login, status, and logout of one device)
+is specified in `operations-and-observability.md`, rules OPS-HEALTH-6 to OPS-HEALTH-10.
+
 The inventory routes require the `X-Internal-Token` header: a missing header is a 422
 and a wrong one 403 `Invalid internal token`. The execution routes answer 500
 `Internal API token not configured` when execution has no token and 403
@@ -615,8 +618,7 @@ apply-job routes of sections 5 and 7.
   Pinned by: `services/inventory/tests/test_apply_jobs_reservation_owner.py` (`test_foreign_reservation_id_returns_422_and_writes_no_row`, `test_reservation_id_inactive_returns_422_and_writes_no_row`, `test_reservation_id_active_but_not_owned_by_caller_returns_422`, `test_reservation_id_valid_and_owned_schedules_successfully`, `test_reservation_id_validation_fails_closed_when_unreachable`)
 - **CFG-JOB-5.** The two lookups do not prove that the named reservation itself holds
   the device or belongs to the caller: a caller with one qualifying reservation can
-  name another active one. By decision; see the `_validate_reservation_for_job`
-  docstring. \
+  name another active one. Known gap, see #1104. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`_validate_reservation_for_job`) \
   Pinned by: none
 - **CFG-JOB-6.** A dry-run job needs the device's driver to declare `supports_dry_run`;
@@ -1303,15 +1305,15 @@ confirmed by reading only.
 - #1097 (CFG-LOAD-6, CFG-RUNSTATE-5): concurrent first loads of a driver fail, and a run
   whose action raises unexpectedly stays `PENDING` or `RUNNING`.
 - #1098 (CFG-UI-4): the device page shows structured refusals as generic text.
+- #1104 (CFG-JOB-5): a schedule's reservation check proves the caller owns some active
+  reservation holding the device, not that the named reservation holds it or belongs to
+  the caller.
 
 Documentation that disagrees with the code is tracked in #1099; the unpinned rules below
 that should have a test are tracked in #1100.
 
 ### Limits by decision
 
-- A schedule's reservation check proves ownership of some active reservation holding
-  the device, not of the one named (the `_validate_reservation_for_job` docstring)
-  (CFG-JOB-5).
 - A driver's dry-run declaration is trusted ([DRIVERS.md](../DRIVERS.md), "Dry-run
   support") (CFG-DRY-4).
 - Driver packages are trusted code and the sandbox limits resources only
