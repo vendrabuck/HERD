@@ -1792,6 +1792,19 @@ Authorization: Bearer <admin-token>
 | `/api/inventory/device-groups/{id}/permissions/bulk` | POST | | yes | yes |
 | `/api/inventory/device-groups/{id}/permissions/bulk-remove` | POST | | yes | yes |
 | `/api/inventory/device-groups/visible-devices` | GET | yes (own `user_id` only) | yes | yes |
+| `/api/inventory/devices/{id}/config-versions` | GET | yes (device visible) | yes | yes |
+| `/api/inventory/devices/{id}/config-versions/diff` | GET | yes (device visible) | yes | yes |
+| `/api/inventory/devices/{id}/config-versions/{vid}` | GET | yes (device visible) | yes | yes |
+| `/api/inventory/devices/{id}/config-versions/latest/internal` | GET | internal | internal | internal |
+| `/api/inventory/devices/{id}/config-versions` | POST | yes (`manage` or active-reservation owner) | yes | yes |
+| `/api/inventory/devices/{id}/config-versions/{vid}/restore` | POST | yes (`manage` or active-reservation owner) | yes | yes |
+| `/api/inventory/devices/{id}/config-versions/{vid}/apply` | POST | yes (explicit `manage` grant only) | yes | yes |
+| `/api/inventory/devices/{id}/config-versions/{vid}/schedule` | POST | yes (`manage` or active-reservation owner) | yes | yes |
+| `/api/inventory/devices/{id}/apply-jobs` | GET | yes (device visible) | yes | yes |
+| `/api/inventory/devices/{id}/apply-jobs/internal` | GET | internal | internal | internal |
+| `/api/inventory/apply-jobs/{id}` | GET | yes (job's device visible) | yes | yes |
+| `/api/inventory/apply-jobs/{id}/confirm` | POST | yes (`manage` or active-reservation owner) | yes | yes |
+| `/api/inventory/apply-jobs/{id}` | DELETE | yes (job creator only) | yes | yes |
 | `/api/reservations/` | POST | yes | yes | yes |
 | `/api/reservations/` | GET | yes (own only) | own, or all with `all=true` | own, or all with `all=true` |
 | `/api/reservations/calendar` | GET | yes | yes | yes |
@@ -1911,6 +1924,20 @@ any valid JWT and act only on the caller's own notifications: another user's
 notification id answers 404 `Notification not found`, and there is no admin view of
 other users' rows. The two preference routes forward the caller's JWT to user-profile,
 which reads and writes the caller's own preferences.
+
+The inventory config-version and apply-job rows follow the rules in "Reservation-owner
+widening for device-config writes" above. The read routes answer a non-admin outside the
+device's groups with the same 404 an unknown id gets (`Device not found`, or `Apply job
+not found` for a job, judged by the job's own device). The write routes answer 404 for
+an unknown device before they check authorization, so a 403 means the device exists;
+apply and schedule also check the version first (`Config version not found`), while
+restore checks it after authorization. Confirm checks the job exists, then that it is a
+successful dry run (409 otherwise), then authorization. An admin passes every
+authorization check. Apply and schedule then refuse a driver whose connection type has
+no `configure` with 409 `driver_cannot_configure`. Cancelling a job (`DELETE
+/apply-jobs/{id}`) is open to its creator and to admins, and only while it is `pending`:
+anything else, including a cancel that loses to the scheduler claiming the job, is 409
+`Job is '<status>', not cancellable`.
 
 The integration service also registers a test-only webhook sink, `POST /webhooks/echo`
 (accepts a `delay_ms` query parameter, clamped to 10 seconds) and

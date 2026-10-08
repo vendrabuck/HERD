@@ -742,11 +742,11 @@ async def _drive_run(
             # no further than this log record: never into the run row or an
             # API response, since it can carry hosts, paths, or
             # credential-adjacent text.
-            # The text goes in the MESSAGE, not only in `extra`: herd_common's
-            # JsonFormatter emits a fixed allowlist of extra keys, and run_id,
-            # exception_class, and exception_message are not on it, so a
-            # record carrying them only as extras would reach the container
-            # log with the diagnosis stripped.
+            # The text also goes in the MESSAGE, so the diagnosis reads in one
+            # line under any formatter. herd_common's JSONFormatter emits
+            # every extra key as well (issue #872), redacting only by key
+            # NAME, so it cannot see a secret inside this raw text; this
+            # record is the one place the raw text is deliberately kept.
             logger.error(
                 "Driver call raised %s on run %s: %s",
                 exception_class,

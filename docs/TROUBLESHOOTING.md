@@ -419,7 +419,7 @@ The notifications service consumes the same `herd.reservations.*` events on its 
 
 ### DLQ has messages
 
-Inspect them, figure out why they failed, decide whether to replay or discard. Each DLQ message is a snapshot of the original event payload; replaying means publishing it back on `herd.reservations.<event-type>`. Check both `herd.reservations.dlq.execution` (execution) and `herd.reservations.dlq.notifications` so you don't miss the half of the system you weren't looking for. See [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq).
+Inspect them, figure out why they failed, decide whether to replay or discard. Each DLQ message is a snapshot of the original event payload; replaying means publishing it back on its original subject (`herd.reservations.<event-type>`, or `herd.health.status_changed` for a health event). Check all five DLQ subjects, `herd.reservations.dlq.execution`, `herd.reservations.dlq.notifications`, `herd.reservations.dlq.integration`, `herd.health.dlq.notifications`, and `herd.health.dlq.integration`, so you don't miss the part of the system you weren't looking for. See [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq).
 
 ### DLQ messages disappeared after a rebuild
 

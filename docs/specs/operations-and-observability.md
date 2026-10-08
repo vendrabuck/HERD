@@ -948,11 +948,15 @@ check one device now, through the same login, status, and logout sequence a poll
 - **OPS-HEALTH-7.** The device check reads the device and its template through
   inventory's internal routes, the same reads as `device-configuration.md` (CFG-EXEC-4):
   a 404 answers 404 `Device <id> not found` or `Template <id> not found`, and any other
-  failure answers 503 `Failed to fetch device: <exception text>` (or template). A
-  device with no driver answers 409 `{"error": "device_has_no_driver", "message"}` before
-  any run is written (`device-configuration.md`, CFG-GATE-4). Known gap, see #1093. \
-  Enforced in: `services/execution/app/services/execution_service.py` (`fetch_device`, `fetch_template`, `_assert_action_permitted`) \
-  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_fetch_device_404_raises_404`, `test_fetch_device_other_error_raises_503`, `test_fetch_template_404_raises_404`, `test_fetch_template_other_error_raises_503`); `services/execution/tests/test_configure_capability_gate.py` (`test_assert_action_permitted_raises_409_for_no_driver_regardless_of_action`); `tests/integration/test_device_check_internal_fetch.py` (`test_device_check_uses_internal_inventory_routes`)
+  failure, a 200 whose body is not a JSON object included, answers 503 `Failed to fetch
+  device: <reason>` (or template) with a HERD-authored reason (`upstream service answered
+  HTTP <status>`, `upstream service unreachable (<ClassName>)`, `upstream service answered
+  with a malformed body`, or the exception's class name), never the exception text, which
+  goes to the log message only. A device with no driver answers 409
+  `{"error": "device_has_no_driver", "message"}` before any run is written
+  (`device-configuration.md`, CFG-GATE-4). \
+  Enforced in: `services/execution/app/services/execution_service.py` (`fetch_device`, `fetch_template`, `_fetch_inventory_internal`, `_inventory_failure_text`, `_assert_action_permitted`) \
+  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_fetch_device_404_raises_404`, `test_fetch_device_other_error_raises_503`, `test_fetch_template_404_raises_404`, `test_fetch_template_other_error_raises_503`, `test_fetch_failure_detail_never_carries_foreign_text`); `services/execution/tests/test_configure_capability_gate.py` (`test_assert_action_permitted_raises_409_for_no_driver_regardless_of_action`); `tests/integration/test_device_check_internal_fetch.py` (`test_device_check_uses_internal_inventory_routes`)
 - **OPS-HEALTH-8.** The check runs `login` first; when the login run is not `SUCCESS` it
   answers 200 with `status` `FAILED`, the login run's id, and the login run's `error`,
   and runs neither `status` nor `logout`. \
@@ -1307,7 +1311,7 @@ CLI documentation guard (OPS-NATS-14).
 | 500 | `Internal API token not configured` | a device check while execution has no internal token | OPS-HEALTH-6 |
 | 403 | `Invalid internal token` | a device check without the right token | OPS-HEALTH-6 |
 | 404 | `Device <id> not found`, `Template <id> not found` | a device check on a device or template inventory does not know | OPS-HEALTH-7 |
-| 503 | `Failed to fetch device: <exception text>`, `Failed to fetch template: <exception text>` | a device check when inventory cannot answer | OPS-HEALTH-7 |
+| 503 | `Failed to fetch device: <reason>`, `Failed to fetch template: <reason>` (HERD-authored reason: an upstream status, `unreachable (<ClassName>)`, a malformed body, or a class name) | a device check when inventory cannot answer, or answers a body that is not a JSON object | OPS-HEALTH-7 |
 | 409 | `{"error": "device_has_no_driver", "message"}` | a device check on a device with no driver | OPS-HEALTH-7 |
 | 422 | validation list | a secret body outside the schema, an empty `data` | OPS-SECRET-1 |
 | 409 | `A secret with this name already exists` | a taken secret name | OPS-SECRET-2 |
@@ -1415,8 +1419,7 @@ the host with the installed NATS client against a closed local port.
 
 ### Open defects
 
-- #1093, OPS-HEALTH-7: the device check's 503 carries raw exception text from the
-  inventory read (the same defect as CFG-EXEC-4 in `device-configuration.md`).
+None at present.
 
 ### Limits by decision
 
