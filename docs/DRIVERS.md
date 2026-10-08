@@ -522,7 +522,9 @@ Driver code runs in a separate subprocess with these limits enforced:
 - Device credentials are passed to the driver via a temporary file only; password-typed
   template fields are not copied into the child's environment variables.
 
-A driver that exceeds the wall-clock timeout is recorded as failed with a timeout error.
+A driver that exceeds the wall-clock timeout is recorded with status `TIMEOUT` (not
+`FAILED`) and the error `Execution timed out after <N>s`; a `TIMEOUT` run can be retried
+like a `FAILED` one.
 A driver killed by a resource limit (for example out-of-memory or CPU exhaustion) is
 recorded as failed with the terminating signal.
 

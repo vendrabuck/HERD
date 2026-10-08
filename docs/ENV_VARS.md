@@ -26,7 +26,7 @@ Upgrading from a version without the marker: an existing `config.json` with no `
 
 On the very first `make up`, the config service writes `/data/herd-config/config.json` automatically from the process environment when every required variable below is present and non-empty. That file is what gates the login page, so a complete `.env` now unlocks login without visiting the config UI. If any required var is missing the config service logs a warning listing them, skips the bootstrap, and the login page keeps directing you to the wrench icon.
 
-The config page's own login password is set by `CONFIG_ADMIN_PASSWORD`. When you set it (in `.env` or the environment), that is the config-UI password and the config write surface is unlocked immediately. When it is unset, the config service generates a random one-time password on first boot and logs it once at WARNING (read it from `make logs config` or the container logs); the write and apply endpoints stay locked with HTTP 403 until you log in and change the password. There is no longer a hardcoded default password. The related `CONFIG_SESSION_SECRET` pins the config session-token signing key across replicas; when unset, a random per-process key is used.
+The config page's own login password is set by `CONFIG_ADMIN_PASSWORD`. When you set it (in `.env` or the environment), that is the config-UI password and the config write surface is unlocked immediately. When it is unset, the config service generates a random password on first boot and logs it once at WARNING (read it from `make logs config` or the container logs); the write and apply endpoints stay locked with HTTP 403 until you log in and change the password. The logged password stays a valid config login until it is changed, so anyone who can read the config container's log (or a log shipper that collects it) can sign in to the config page with it: set `CONFIG_ADMIN_PASSWORD`, or change the generated password promptly, and treat that log as sensitive until you do. There is no longer a hardcoded default password. The related `CONFIG_SESSION_SECRET` pins the config session-token signing key across replicas; when unset, a random per-process key is used.
 
 ## Config editor populates from env
 
@@ -163,7 +163,7 @@ TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env 
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LOG_LEVEL` | `INFO` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Per-service. |
+| `LOG_LEVEL` | `INFO` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Per-service. The config service does not read it: it logs plain text, WARNING and higher only. |
 
 ## Config service
 
@@ -172,7 +172,7 @@ hardcoded default. Config service auth is separate from HERD JWT.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CONFIG_ADMIN_PASSWORD` | random per deploy | The config-page login password (`services/config/app/config_store.py`). When set, that value is the password and the config write/apply surface is unlocked. When unset, a random one-time password is generated on first boot and logged once at WARNING (read it from the config container logs); the write and apply endpoints return 403 until you log in and change the password. Never a source-visible constant. |
+| `CONFIG_ADMIN_PASSWORD` | random per deploy | The config-page login password (`services/config/app/config_store.py`). When set, that value is the password and the config write/apply surface is unlocked. When unset, a random password is generated on first boot and logged once at WARNING (read it from the config container logs); the write and apply endpoints return 403 until you log in and change the password. The logged password stays a valid config login until it is changed, so set this variable or change the password promptly, and treat the config container's log as sensitive until then. Never a source-visible constant. |
 | `CONFIG_SESSION_SECRET` | random per process | HMAC key that signs and verifies the short-lived config-session token issued after config login (`services/config/app/auth.py`). If unset, a random secret is generated at process start, so sessions do not survive a config-service restart. Set it to a strong shared value only when you run multiple config replicas and need a session to verify across them. It is never a source-visible constant. |
 
 ## AI orchestrator

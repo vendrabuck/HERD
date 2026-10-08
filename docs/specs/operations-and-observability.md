@@ -368,7 +368,7 @@ name looks like a credential.
   Pinned by: `services/common/tests/test_logging.py` (`test_setup_logging_configures_root_logger`)
 - **OPS-LOG-9.** The config service does not use this formatter: it logs through the
   standard library with no handler of its own, so its lines are plain text and its INFO
-  lines are not emitted. Known gap, see #1087. \
+  lines are not emitted. `FEATURES.md` and `docs/ENV_VARS.md` (`LOG_LEVEL`) say so. \
   Enforced in: `services/config/app/main.py` (`logger`) \
   Pinned by: none
 - **OPS-LOG-10.** Key-name redaction cannot see inside a string value, so a driver run's
@@ -421,7 +421,7 @@ subclasses `HerdBaseSettings`. The full ladder for operators is in
   Pinned by: `services/common/tests/test_config_loader.py` (`test_source_database_url_yields_to_env_database_url`); `services/common/tests/test_base_settings.py` (`test_env_database_url_beats_file_derived_database_url`)
 - **OPS-SET-7.** Every service but config reads the file at `HERD_CONFIG_FILE`, default
   `/etc/herd/config.json`, mounted read-only from the `herd-config` volume; a missing
-  file is not an error (OPS-SET-3). Known gap in the documentation, see #1087. \
+  file is not an error (OPS-SET-3). \
   Enforced in: `services/common/herd_common/config_loader.py` (`CONFIG_FILE`); `docker-compose.yml` (`herd-config`) \
   Pinned by: `services/common/tests/test_config_loader.py` (`test_source_returns_nothing_when_file_missing`)
 - **OPS-SET-8.** Every service's `Settings` subclasses `HerdBaseSettings`, which supplies
@@ -1413,16 +1413,8 @@ the host with the installed NATS client against a closed local port.
 
 ## 13. Known limits and gaps
 
-[OPERATIONS.md](../OPERATIONS.md) and [FEATURES.md](../../FEATURES.md) disagree with the
-code in five places, tracked as documentation in #1087: `/health` is described as
-failing when a dependency is down (OPS-LIVE-1), services are said to crash-loop when
-`config.json` is gone (OPS-SET-3, OPS-SET-7), the NATS volume is named `nats`
-(OPS-NATS-13), and every service is said to log JSON (OPS-LOG-9).
-
 ### Open defects
 
-- #1087, OPS-LOG-9, OPS-LIVE-1, OPS-SET-7, OPS-NATS-13: the operator documents and
-  FEATURES.md describe behavior the code does not have.
 - #1093, OPS-HEALTH-7: the device check's 503 carries raw exception text from the
   inventory read (the same defect as CFG-EXEC-4 in `device-configuration.md`).
 

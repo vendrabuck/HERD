@@ -1340,7 +1340,9 @@ GET /api/execution/runs
 Authorization: Bearer <token>
 ```
 
-Supports query params: `device_id`, `reservation_id`, `status`, `skip`, `limit`.
+Supports query params: `device_id`, `reservation_id`, `status`, `created_after`,
+`created_before` (ISO 8601 timestamps bounding the run's creation time), `skip`, and
+`limit` (default 50, at most 500).
 
 Auth: admin or superadmin can list with any combination of filters (including
 the unscoped form with no `reservation_id`). Non-admin callers must supply a
@@ -1842,6 +1844,24 @@ Authorization: Bearer <admin-token>
 | `/api/execution/execute` | POST | yes (`configure` only, with device `manage` grant) | yes | yes |
 | `/api/execution/runs/{id}/retry` | POST | | yes | yes |
 | `/api/execution/device-check` | POST | internal | internal | internal |
+| `/api/v1/reservations` | POST | yes (as the caller) | yes | yes |
+| `/api/v1/reservations` | GET | yes (as the caller) | yes | yes |
+| `/api/v1/reservations/{id}` | GET | yes (as the caller) | yes | yes |
+| `/api/v1/reservations/{id}` | DELETE | yes (as the caller) | yes | yes |
+| `/api/v1/reservations/{id}/release` | PUT | yes (as the caller) | yes | yes |
+| `/api/v1/reservations/{id}/wiring-status` | GET | yes (as the caller) | yes | yes |
+| `/api/v1/webhooks` | POST | | yes | yes |
+| `/api/v1/webhooks` | GET | | yes | yes |
+| `/api/v1/webhooks/{id}` | GET | | yes | yes |
+| `/api/v1/webhooks/{id}` | DELETE | | yes | yes |
+| `/api/v1/webhooks/{id}/deliveries` | GET | | yes | yes |
+| `/api/notifications/notifications` | GET | yes (own rows) | yes (own rows) | yes (own rows) |
+| `/api/notifications/notifications/unread-count` | GET | yes (own rows) | yes (own rows) | yes (own rows) |
+| `/api/notifications/notifications/{id}/read` | PATCH | yes (own rows) | yes (own rows) | yes (own rows) |
+| `/api/notifications/notifications/read-all` | POST | yes (own rows) | yes (own rows) | yes (own rows) |
+| `/api/notifications/notifications/{id}` | DELETE | yes (own rows) | yes (own rows) | yes (own rows) |
+| `/api/notifications/notifications/preferences` | GET | yes (own) | yes (own) | yes (own) |
+| `/api/notifications/notifications/preferences` | PUT | yes (own) | yes (own) | yes (own) |
 | `/api/auth/health` | GET | open | open | open |
 | `/api/inventory/health` | GET | open | open | open |
 | `/api/reservations/health` | GET | open | open | open |
@@ -1881,6 +1901,16 @@ same `reservation.cancelled` event as an owner self-cancel.
 `PUT /api/reservations/{id}/release` is owner-only for every role: it passes only the
 caller's id, so an admin who does not own the reservation gets 404 (issue #843 mirrors
 this in the UI through `canReleaseAs`).
+
+The `/api/v1/reservations` routes (the integration service's versioned facade) take any
+valid JWT and forward it to the reservations service, so every ownership, visibility,
+and admin rule above is applied there as the real caller: "as the caller" means the
+facade adds no rule of its own. The `/api/v1/webhooks` routes are admin or superadmin
+(`403 Admin or superadmin role required` otherwise). The `/api/notifications` routes take
+any valid JWT and act only on the caller's own notifications: another user's
+notification id answers 404 `Notification not found`, and there is no admin view of
+other users' rows. The two preference routes forward the caller's JWT to user-profile,
+which reads and writes the caller's own preferences.
 
 The integration service also registers a test-only webhook sink, `POST /webhooks/echo`
 (accepts a `delay_ms` query parameter, clamped to 10 seconds) and

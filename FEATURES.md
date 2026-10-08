@@ -437,8 +437,11 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   under a production deployment (a mounted volume with a configurable retention cap)
   and deliberately ephemeral under local dev, for clean-start test isolation.
   (Issue #620.)
-- **Structured JSON logging** (Shipped): every service emits JSON logs with request
-  middleware and business-event logging; per-service log level configurable.
+- **Structured JSON logging** (Shipped): every backend service except config emits
+  JSON logs with request middleware and business-event logging; per-service log level
+  configurable. The config service logs plain text through the Python standard library
+  with no handler of its own, so only its WARNING and higher lines reach the container
+  log.
 - **Version and build visibility** (Shipped): the login page and the app header show
   the running version, and an admin-only About page lists the version, build, and
   build date of the frontend and of every backend service, read live from each
