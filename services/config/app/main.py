@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
 from app.auth import create_session_token, require_config_session
-from app.config_schema import CONFIG_SCHEMA
+from app.config_schema import CONFIG_SCHEMA, SCHEMA_KEYS
 from app.config_store import (
     bootstrap_from_env,
     change_password,
@@ -140,7 +140,13 @@ async def get_settings(_session: dict = Depends(require_config_session)):
     # in the editor when config.json is missing the key; file wins on conflict.
     # This mirrors the runtime source order for a UI-saved file in
     # herd_common.config_loader.herd_settings_sources; keep the two in sync.
-    merged = {**load_env_values(), **load_config()}
+    # Only schema keys are shown, so the editor never sends back a key the save
+    # refuses (issue #1109); a key placed in the file by hand stays there.
+    merged = {
+        key: value
+        for key, value in {**load_env_values(), **load_config()}.items()
+        if key in SCHEMA_KEYS
+    }
     secret_keys = {f["key"] for f in CONFIG_SCHEMA if f.get("secret")}
     redacted = {}
     for key, value in merged.items():
@@ -161,6 +167,15 @@ async def update_settings(
     # write the placeholder itself: once saved, config.json outranks the
     # environment at runtime (herd_common.config_loader.herd_settings_sources),
     # so a literal "********" would become the live credential.
+    #
+    # Only CONFIG_SCHEMA keys may be written (issue #1109): a body naming any
+    # other key is refused whole, before anything is resolved or written.
+    unknown = sorted(set(req.values) - SCHEMA_KEYS)
+    if unknown:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            {"errors": [f"Unknown settings: {', '.join(unknown)}"]},
+        )
     existing = load_config()
     env_values = load_env_values()
     secret_keys = {f["key"] for f in CONFIG_SCHEMA if f.get("secret")}
@@ -173,6 +188,11 @@ async def update_settings(
                 merged[key] = env_values[key]
             else:
                 merged.pop(key, None)
+    # A key already in the file outside the schema (placed there by hand) is
+    # carried over unchanged: the save can neither set nor change it.
+    for key, value in existing.items():
+        if key not in SCHEMA_KEYS:
+            merged[key] = value
 
     errors = save_config(merged)
     if errors:

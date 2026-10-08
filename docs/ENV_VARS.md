@@ -170,6 +170,11 @@ TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env 
 The config page login password is set by `CONFIG_ADMIN_PASSWORD`; there is no longer a
 hardcoded default. Config service auth is separate from HERD JWT.
 
+The config page saves only the settings its schema lists (`GET /api/config/schema`): a save
+naming any other key is refused with 422 and writes nothing. A key you place in
+`config.json` by hand outside the schema is not shown in the editor and is carried over
+unchanged by the next save; edit or remove it by hand.
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CONFIG_ADMIN_PASSWORD` | random per deploy | The config-page login password (`services/config/app/config_store.py`). When set, that value is the password and the config write/apply surface is unlocked. When unset, a random password is generated on first boot and logged once at WARNING (read it from the config container logs); the write and apply endpoints return 403 until you log in and change the password. The logged password stays a valid config login until it is changed, so set this variable or change the password promptly, and treat the config container's log as sensitive until then. Never a source-visible constant. |

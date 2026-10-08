@@ -92,6 +92,13 @@ class TestConfigStore:
         # Must not raise; falls back to {} like the missing-file path.
         assert load_config() == {}
 
+    def test_load_config_non_object_returns_empty(self, tmp_config_dir):
+        # Valid JSON that is not an object holds no settings; the save path
+        # reads the file's keys, so it must get a dict back.
+        with open(os.path.join(tmp_config_dir, "config.json"), "w") as f:
+            f.write("[1, 2]")
+        assert load_config() == {}
+
     def test_save_config_blank_required(self):
         values = {
             "POSTGRES_USER": "",
@@ -568,3 +575,97 @@ class TestWriteSurfaceLockout:
             "/settings", json={"values": _REQUIRED_VALUES}, headers=headers
         )
         assert resp.status_code == 200
+
+
+# -- issue #1109: the save writes only keys CONFIG_SCHEMA declares --
+
+
+async def _session_headers(client):
+    resp = await client.post("/login", json={"password": CFG_PASSWORD})
+    return {"Authorization": f"Bearer {resp.json()['token']}"}
+
+
+class TestSettingsKeysLimitedToSchema:
+    @pytest.mark.asyncio
+    async def test_save_settings_refuses_keys_outside_the_schema(
+        self, async_client, tmp_config_dir
+    ):
+        headers = await _session_headers(async_client)
+        body = {**_REQUIRED_VALUES, "ZZ_SERVICE_URL": "http://x", "SECRETS_KEK": "k"}
+        resp = await async_client.put("/settings", json={"values": body}, headers=headers)
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == {
+            "errors": ["Unknown settings: SECRETS_KEK, ZZ_SERVICE_URL"]
+        }
+        # Nothing written.
+        assert not os.path.exists(os.path.join(tmp_config_dir, "config.json"))
+
+    @pytest.mark.asyncio
+    async def test_save_settings_with_unknown_key_leaves_existing_file_unchanged(
+        self, async_client, tmp_config_dir
+    ):
+        headers = await _session_headers(async_client)
+        ok = await async_client.put("/settings", json={"values": _REQUIRED_VALUES}, headers=headers)
+        assert ok.status_code == 200
+        config_path = os.path.join(tmp_config_dir, "config.json")
+        with open(config_path) as f:
+            before = f.read()
+
+        body = {**_REQUIRED_VALUES, "POSTGRES_USER": "changed", "INVENTORY_SERVICE_URL": "x"}
+        resp = await async_client.put("/settings", json={"values": body}, headers=headers)
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == {"errors": ["Unknown settings: INVENTORY_SERVICE_URL"]}
+        with open(config_path) as f:
+            assert f.read() == before
+
+    @pytest.mark.asyncio
+    async def test_unknown_key_is_refused_before_the_required_check(self, async_client):
+        # An unknown key is reported even when a required key is also missing,
+        # so the caller learns about both problems in the order they are fixed.
+        headers = await _session_headers(async_client)
+        resp = await async_client.put(
+            "/settings", json={"values": {"NOT_A_SETTING": "x"}}, headers=headers
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == {"errors": ["Unknown settings: NOT_A_SETTING"]}
+
+    @pytest.mark.asyncio
+    async def test_save_settings_with_schema_keys_only_saves(self, async_client):
+        headers = await _session_headers(async_client)
+        body = {**_REQUIRED_VALUES, "LOG_LEVEL": "DEBUG", "AI_API_KEY": "key"}
+        resp = await async_client.put("/settings", json={"values": body}, headers=headers)
+        assert resp.status_code == 200
+        assert load_config() == body
+
+    @pytest.mark.asyncio
+    async def test_get_settings_answers_schema_keys_only(self, async_client, tmp_config_dir):
+        # A key placed in config.json by hand is not shown, so the editor never
+        # sends back a key the save would refuse.
+        with open(os.path.join(tmp_config_dir, "config.json"), "w") as f:
+            json.dump({**_REQUIRED_VALUES, "HAND_PLACED_KEY": "v"}, f)
+        headers = await _session_headers(async_client)
+        resp = await async_client.get("/settings", headers=headers)
+        assert resp.status_code == 200
+        values = resp.json()["values"]
+        assert "HAND_PLACED_KEY" not in values
+        assert values["POSTGRES_USER"] == "herd"
+
+    @pytest.mark.asyncio
+    async def test_save_settings_keeps_keys_already_in_the_file_outside_the_schema(
+        self, async_client, tmp_config_dir
+    ):
+        # The editor's round trip (read, then save what it read) succeeds, and a
+        # key that was already in the file outside the schema is kept as it was:
+        # the save can neither set nor change it.
+        with open(os.path.join(tmp_config_dir, "config.json"), "w") as f:
+            json.dump({**_REQUIRED_VALUES, "HAND_PLACED_KEY": "v"}, f)
+        headers = await _session_headers(async_client)
+        shown = (await async_client.get("/settings", headers=headers)).json()["values"]
+        shown["POSTGRES_DB"] = "otherdb"
+        resp = await async_client.put("/settings", json={"values": shown}, headers=headers)
+        assert resp.status_code == 200
+        saved = load_config()
+        assert saved["POSTGRES_DB"] == "otherdb"
+        assert saved["HAND_PLACED_KEY"] == "v"
+        # The masked secrets resolved back to the file's values.
+        assert saved["POSTGRES_PASSWORD"] == "secret"

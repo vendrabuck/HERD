@@ -494,19 +494,23 @@ presses Save and Restart. Login to HERD stays disabled until the file exists.
   Pinned by: `services/config/tests/test_config.py` (`test_put_settings_locked_until_rotated`, `test_apply_locked_until_rotated`, `test_write_allowed_with_operator_password`)
 - **OPS-CONFIG-10.** `GET /schema` lists the editable fields to anyone; `GET /settings`
   needs a session and answers the environment values overlaid by the file's values,
-  with every non-empty secret field shown as `********`. \
-  Enforced in: `services/config/app/main.py` (`get_schema`, `get_settings`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_schema`, `test_get_settings_includes_env_values_when_no_file`, `test_get_settings_file_overrides_env`, `test_get_settings_redacts_env_secrets`, `test_settings_unauthenticated`)
+  limited to the schema's keys, with every non-empty secret field shown as `********`. \
+  Enforced in: `services/config/app/main.py` (`get_schema`, `get_settings`, `SCHEMA_KEYS`) \
+  Pinned by: `services/config/tests/test_config.py` (`test_schema`, `test_get_settings_includes_env_values_when_no_file`, `test_get_settings_file_overrides_env`, `test_get_settings_redacts_env_secrets`, `test_settings_unauthenticated`, `test_get_settings_answers_schema_keys_only`)
 - **OPS-CONFIG-11.** A secret field sent back as `********` keeps the file's value, else
   the environment's; with neither it is dropped, and the placeholder itself is never
   written. \
   Enforced in: `services/config/app/main.py` (`update_settings`) \
   Pinned by: `services/config/tests/test_config.py` (`test_save_settings_preserves_redacted_secrets`, `test_save_settings_resolves_masked_secret_from_env`, `test_save_settings_drops_masked_optional_secret_without_source`, `test_save_settings_masked_required_secret_without_source_is_422`)
-- **OPS-CONFIG-12.** A save missing a required field, or carrying it blank, is 422
-  `{"errors": ["<KEY> is required", ...]}` and writes nothing; otherwise the body's
-  values are written as given. \
-  Enforced in: `services/config/app/config_store.py` (`save_config`); `services/config/app/main.py` (`update_settings`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_save_settings_missing_required`, `test_save_config_blank_required`, `test_save_and_get_settings`)
+- **OPS-CONFIG-12.** A save may write only keys `CONFIG_SCHEMA` declares: a body naming
+  any other key is 422 `{"errors": ["Unknown settings: <KEY>, ..."]}` (the unknown keys
+  sorted, checked first) and writes nothing. A save missing a required field, or carrying
+  it blank, is 422 `{"errors": ["<KEY> is required", ...]}` and writes nothing. Otherwise
+  the body's values are written, and a key already in the file outside the schema (placed
+  there by hand) is carried over unchanged. A file that is not a JSON object reads as
+  empty. \
+  Enforced in: `services/config/app/main.py` (`update_settings`, `SCHEMA_KEYS`); `services/config/app/config_schema.py` (`SCHEMA_KEYS`); `services/config/app/config_store.py` (`save_config`, `load_config`) \
+  Pinned by: `services/config/tests/test_config.py` (`test_save_settings_refuses_keys_outside_the_schema`, `test_save_settings_with_unknown_key_leaves_existing_file_unchanged`, `test_unknown_key_is_refused_before_the_required_check`, `test_save_settings_with_schema_keys_only_saves`, `test_save_settings_keeps_keys_already_in_the_file_outside_the_schema`, `test_load_config_non_object_returns_empty`, `test_save_settings_missing_required`, `test_save_config_blank_required`, `test_save_and_get_settings`)
 - **OPS-CONFIG-13.** `POST /apply` restarts only containers of the config service's own
   compose project, read from its own container's label; when that label cannot be read
   it restarts nothing and reports an error. \
@@ -1311,6 +1315,7 @@ CLI documentation guard (OPS-NATS-14).
 | 403 | `Change the config password before modifying or applying configuration` | config save or apply before the password is rotated | OPS-CONFIG-9 |
 | 422 | validation list | a new config password outside 8 to 32 characters | OPS-CONFIG-8 |
 | 422 | `{"errors": ["<KEY> is required", ...]}` | a config save missing a required field, including a masked secret with no source | OPS-CONFIG-11, OPS-CONFIG-12 |
+| 422 | `{"errors": ["Unknown settings: <KEY>, ..."]}` | a config save naming a key outside `CONFIG_SCHEMA` | OPS-CONFIG-12 |
 | 400 | `No configuration to apply` | config apply with no `config.json` | OPS-CONFIG-15 |
 | 200 | `{"restarted": [...], "errors": [...]}` | config apply; failures are entries in `errors` | OPS-CONFIG-13, OPS-CONFIG-16 |
 | 403 | `Admin or superadmin role required` | a non-admin lists health snapshots, reads a report, or writes a secret | OPS-HEALTH-3, OPS-REPORT-1, OPS-SECRET-1 |

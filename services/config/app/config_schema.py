@@ -540,3 +540,8 @@ CONFIG_SCHEMA = [
 ]
 
 REQUIRED_KEYS = [f["key"] for f in CONFIG_SCHEMA if f["required"]]
+
+# The only keys the config page may write (issue #1109): config.json outranks the
+# environment in every service after the first save, so a key outside this set
+# would let a save set a setting the page never offers.
+SCHEMA_KEYS = frozenset(f["key"] for f in CONFIG_SCHEMA)
