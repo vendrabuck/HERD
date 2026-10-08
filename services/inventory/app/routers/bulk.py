@@ -1,6 +1,7 @@
 """Bulk import and export endpoints for devices and templates.
 
-Export endpoints stream a CSV or JSON file of every device or template. Import
+Export endpoints stream a CSV or JSON file of every device (dynamic-instance
+devices excepted) or template. Import
 endpoints accept an uploaded file, run per-row validation through the existing
 create/update service functions, and return a per-row report. A `dry_run` import
 writes nothing and returns the same report shape so an operator can preview the
@@ -63,8 +64,15 @@ async def export_devices(
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_admin),
 ):
-    """Export every device to CSV or JSON. Admin or superadmin only."""
-    devices = (await db.execute(select(Device).order_by(Device.name))).unique().scalars().all()
+    """Export every device to CSV or JSON. Admin or superadmin only.
+
+    Dynamic-instance devices (those carrying a `request_id`, created by
+    execution for one booking) are left out: they have no life outside the
+    reservation that made them, and their dynamic template cannot hold a
+    device on import (issue #1068).
+    """
+    stmt = select(Device).where(Device.request_id.is_(None)).order_by(Device.name)
+    devices = (await db.execute(stmt)).unique().scalars().all()
     records = [device_to_record(d) for d in devices]
     return _export_response(records, DEVICE_CSV_COLUMNS, "devices", format, DEVICE_CSV_TEXT_COLUMNS)
 

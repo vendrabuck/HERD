@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Fixed: a non-admin `configure` on execution's `POST /execute` whose acl check answers 200 with a JSON body that is not an object (a list, a string, a number, or null) gets the pinned 403 `Admin access or device manage grant required` instead of a 500; execution now asks acl through `herd_common.acl.user_has_grant`, the one closed-by-default reader (execution half of #1096).
+- Fixed: confirming a dry-run config apply (`POST /apply-jobs/{id}/confirm`) checks the caller's authority on the job's device before the two 409s, so a caller without authority gets 403 whatever the job's kind or status and learns only that the job exists; an unknown job is still 404 first (#1113).
+- Fixed: the device export, CSV and JSON, leaves out dynamic-instance devices (devices carrying a `request_id`), which another instance rejected with `Template is not a device template` and a re-import on the same instance wrote back over the live instance device; every other device still exports and round-trips (#1068).
 - Fixed: reservations, execution, notifications, and integration start without a NATS broker. The first connect is bounded (`herd_common.jetstream.connect_nats`, five retries two seconds apart) and then raises into each service's logged-and-continue branch; an established connection still reconnects without limit (#1083).
 - Fixed: a NATS event whose body is JSON but not an object (a list, a string, a number) is dead-lettered and acknowledged by the execution, integration, and notifications consumers, as undecodable JSON already was, instead of escaping unsettled and being dropped after the delivery cap with no DLQ copy (#1074).
 - Fixed: a secret delete whose inventory reference lookup answers 200 with a body that is not a JSON list of objects answers the fail-closed 503 and keeps the secret, instead of a 500 (#1084).

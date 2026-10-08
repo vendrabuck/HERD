@@ -5,6 +5,7 @@ run_driver_action) and the /device-check, /execute, /runs/{id}/retry paths
 that aren't covered by the existing CRUD tests.
 """
 
+import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
@@ -27,6 +28,7 @@ from app.services.execution_service import (
 )
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 ADMIN_ID = str(uuid.uuid4())
@@ -724,6 +726,54 @@ async def test_execute_non_admin_configure_without_grant_forbidden(user_client, 
     )
     assert resp.status_code == 403
     assert "manage grant" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [[{"allowed": True}], "allowed", 1, None])
+async def test_execute_non_admin_configure_acl_answer_not_an_object_forbidden(
+    user_client, monkeypatch, body
+):
+    """acl answering 200 with JSON that is not an object is no grant: the
+    pinned 403, never an unhandled 500, and no run row (issue #1096)."""
+    acl_calls: list[str] = []
+
+    class _AclClient:
+        """Stands in for every outbound client the check opens (the ASGI test
+        client already exists, so it is unaffected)."""
+
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def request(self, method, url, **kw):
+            acl_calls.append(url)
+            # Explicit content: json=None would mean "no body", not a null body.
+            return httpx.Response(
+                200,
+                content=json.dumps(body).encode(),
+                headers={"content-type": "application/json"},
+            )
+
+        async def post(self, url, **kw):
+            return await self.request("POST", url, **kw)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AclClient)
+    resp = await user_client.post(
+        "/execute",
+        json={"device_id": DEVICE_ID, "action": "configure", "user_id": USER_ID},
+        headers={"Authorization": "Bearer t"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json() == {"detail": "Admin access or device manage grant required"}
+    assert len(acl_calls) == 1 and acl_calls[0].endswith("/check")
+    async with TestSessionLocal() as session:
+        rows = (await session.execute(select(ExecutionRun))).scalars().all()
+    assert rows == []
 
 
 @pytest.mark.asyncio

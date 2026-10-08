@@ -100,6 +100,12 @@ class _FakeClient:
             raise self._exc
         return self._resp
 
+    async def request(self, method, url, headers=None, params=None, json=None, timeout=None):
+        # herd_common.internal_client.call_service goes through request().
+        if self._exc is not None:
+            raise self._exc
+        return self._resp
+
 
 def _resp(status_code: int, payload=None, raise_json=False):
     r = MagicMock()
@@ -162,6 +168,22 @@ async def test_acl_manage_false_when_not_allowed(monkeypatch):
         ex_router.httpx,
         "AsyncClient",
         lambda *a, **kw: _FakeClient(resp=_resp(200, {"allowed": False})),
+    )
+    assert await ex_router._user_has_acl_manage(str(USER_ID), DEVICE_ID, "Bearer t") is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [[{"allowed": True}], "allowed", 1, None])
+async def test_acl_manage_false_when_answer_not_an_object(monkeypatch, body):
+    """A 200 whose JSON is not an object (list, string, number, null) is an
+    unusable answer: no grant, never an AttributeError (issue #1096)."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = body
+    monkeypatch.setattr(
+        ex_router.httpx,
+        "AsyncClient",
+        lambda *a, **kw: _FakeClient(resp=resp),
     )
     assert await ex_router._user_has_acl_manage(str(USER_ID), DEVICE_ID, "Bearer t") is False
 

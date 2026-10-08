@@ -1081,3 +1081,115 @@ async def test_template_reimport_moves_dynamic_template_to_named_hypervisor(clie
     report = await _post_import(client, "templates", items, dry_run=False)
     assert report["updated"] == 1, report
     assert (await client.get(f"/templates/{tpl['id']}")).json()["hypervisor_id"] == west
+
+
+# Instance devices are left out of the device export (issue #1068) -----------
+
+
+async def _create_instance_device(client) -> dict:
+    """A dynamic-instance device as execution makes one: a dynamic template,
+    a booking's reservation id, and a request_id."""
+    import uuid
+
+    tpl = await _create_dynamic_template(client, "Dyn", "pve-east")
+    resp = await client.post(
+        "/devices/internal",
+        headers={"X-Internal-Token": "test-token"},
+        json={
+            "template_id": tpl["id"],
+            "reservation_id": str(uuid.uuid4()),
+            "request_id": str(uuid.uuid4()),
+            "field_data": {"k": "v"},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def _exported_device_names(body: bytes, fmt: str) -> list[str]:
+    if fmt == "json":
+        return [i["name"] for i in json.loads(body)["items"]]
+    import csv
+
+    return [row["name"] for row in csv.DictReader(io.StringIO(body.decode()))]
+
+
+@pytest.mark.parametrize("fmt", ["json", "csv"])
+@pytest.mark.asyncio
+async def test_device_export_leaves_out_instance_devices(client, fmt):
+    template = await _create_template(client, name="Firewall")
+    await _create_device(client, template["id"], name="FW-01")
+    instance = await _create_instance_device(client)
+    listed = [d["name"] for d in (await client.get("/devices")).json()["items"]]
+    assert instance["name"] in listed
+
+    resp = await client.get("/devices/export", params={"format": fmt})
+    assert resp.status_code == 200
+    assert _exported_device_names(resp.content, fmt) == ["FW-01"]
+
+
+@pytest.mark.parametrize("fmt", ["json", "csv"])
+@pytest.mark.asyncio
+async def test_device_export_reimported_on_its_own_stack_leaves_instance_device_alone(client, fmt):
+    """Re-importing the export on the same stack recreates the physical device
+    and writes no row over the live instance device (before #1068 its row was
+    re-imported as an update)."""
+    template = await _create_template(client, name="Firewall")
+    fw = await _create_device(client, template["id"], name="FW-01")
+    await _create_instance_device(client)
+    exported = (await client.get("/devices/export", params={"format": fmt})).content
+    assert (await client.delete(f"/devices/{fw['id']}")).status_code == 204
+
+    resp = await client.post(
+        "/devices/import",
+        params={"format": fmt},
+        files={"file": (f"d.{fmt}", io.BytesIO(exported), "text/plain")},
+    )
+    assert resp.status_code == 200, resp.text
+    report = resp.json()
+    assert report["rows"] == [{"row": 0, "action": "create", "identity": "FW-01", "reason": None}]
+    devices = (await client.get("/devices")).json()["items"]
+    assert any(d["name"] == "FW-01" and d["field_data"].get("rack") == "A1" for d in devices)
+
+
+@pytest.mark.parametrize("fmt", ["json", "csv"])
+@pytest.mark.asyncio
+async def test_device_export_with_instance_device_imports_clean_on_a_fresh_stack(client, fmt):
+    """Templates then devices into a fresh stack: every device row is created
+    and none is rejected. Before #1068 the instance device's row was rejected
+    with `Template is not a device template`, since the dynamic template it
+    names cannot hold a device."""
+    template = await _create_template(client, name="Firewall")
+    await _create_device(client, template["id"], name="FW-01")
+    await _create_instance_device(client)
+    drivers = [
+        (d["name"], d["connection_type"]) for d in (await client.get("/drivers")).json()["items"]
+    ]
+    tmpl_export = (await client.get("/templates/export", params={"format": fmt})).content
+    dev_export = (await client.get("/devices/export", params={"format": fmt})).content
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+    for name, connection_type in drivers:
+        await _create_named_driver(client, name, connection_type)
+    await _create_hypervisor(client, "pve-east")
+
+    tmpl_report = (
+        await client.post(
+            "/templates/import",
+            params={"format": fmt},
+            files={"file": (f"t.{fmt}", io.BytesIO(tmpl_export), "text/plain")},
+        )
+    ).json()
+    assert tmpl_report["created"] == 2 and tmpl_report["rejected"] == 0, tmpl_report
+
+    resp = await client.post(
+        "/devices/import",
+        params={"format": fmt},
+        files={"file": (f"d.{fmt}", io.BytesIO(dev_export), "text/plain")},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rows"] == [
+        {"row": 0, "action": "create", "identity": "FW-01", "reason": None}
+    ]

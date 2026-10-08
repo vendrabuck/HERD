@@ -673,11 +673,12 @@ apply-job routes of sections 5 and 7.
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_cancel_pending_job`, `test_cancel_other_users_job_forbidden`, `test_cancel_already_cancelled_job`); `services/inventory/tests/test_device_configs_rbac.py` (`test_admin_can_cancel_other_users_pending_job`); `services/inventory/tests/test_router_edge_cases.py` (`test_cancel_unknown_job_404`)
 - **CFG-JOB-11.** A confirm needs a source job that is a dry run (409
   `Source job is not a dry-run; nothing to promote`) and `success` (409
-  `Source dry-run is '<status>'; only successful dry-runs can be promoted`); these are
-  checked before the caller's authority (CFG-AUTH-3) on the job's device, and an unknown
-  job is 404 `Apply job not found`. \
+  `Source dry-run is '<status>'; only successful dry-runs can be promoted`). The order
+  is 404 `Apply job not found` for an unknown job (no authority lookup runs), then the
+  caller's authority (CFG-AUTH-3) on the job's device, then the two 409s, so a caller
+  without authority gets the 403 in every state and learns only that the job exists. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`confirm_dry_run_apply`) \
-  Pinned by: `services/inventory/tests/test_confirm_dry_run.py` (`test_confirm_404_when_job_missing`, `test_confirm_409_when_source_is_not_dry_run`, `test_confirm_409_when_dry_run_pending`, `test_confirm_409_when_dry_run_failed`)
+  Pinned by: `services/inventory/tests/test_confirm_dry_run.py` (`test_confirm_404_when_job_missing`, `test_confirm_409_when_source_is_not_dry_run`, `test_confirm_409_when_dry_run_pending`, `test_confirm_409_when_dry_run_failed`, `test_confirm_non_owner_gets_403_not_409_in_every_refusing_state`, `test_confirm_authorized_non_admin_still_gets_409`, `test_confirm_unknown_job_is_404_before_authority`)
 - **CFG-JOB-12.** A confirm writes a new `pending` real job (not a dry run) for the same
   device and version, due 10 seconds from now, carrying the source's `reservation_id`
   and the confirming user as `created_by`, answers 201 with it, leaves the source
@@ -786,10 +787,12 @@ is WIRE-DRIVER-6 in `provisioning-and-wiring.md`.
 - **CFG-EXEC-1.** `POST /execute` lets an admin run any action. Any other caller may run
   only `configure` (403 `Admin access required` otherwise) and only with an explicit
   `manage` grant on the device, asked of acl `POST /check` with the caller's own token
-  and 5 seconds; no token, a transport error, a non-200, non-JSON, or no grant is 403
+  and 5 seconds through the shared closed-by-default reader (CFG-AUTH-4); no token, a
+  transport error, a non-200, non-JSON, a JSON body that is not an object (a list,
+  string, number, or null), or no grant is 403
   `Admin access or device manage grant required`. Owning a reservation does not count. \
-  Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`, `_user_has_acl_manage`) \
-  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_execute_non_admin_status_action_forbidden`, `test_execute_non_admin_configure_without_grant_forbidden`, `test_execute_non_admin_configure_with_grant_succeeds`); `services/execution/tests/test_router_direct.py` (`test_acl_manage_false_without_authorization`, `test_acl_manage_false_on_httpx_error`, `test_acl_manage_false_on_non_200`, `test_acl_manage_false_on_malformed_json`, `test_acl_manage_true_when_allowed`, `test_acl_manage_false_when_not_allowed`)
+  Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`, `_user_has_acl_manage`); `services/common/herd_common/acl.py` (`user_has_grant`) \
+  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_execute_non_admin_status_action_forbidden`, `test_execute_non_admin_configure_without_grant_forbidden`, `test_execute_non_admin_configure_with_grant_succeeds`, `test_execute_non_admin_configure_acl_answer_not_an_object_forbidden`); `services/execution/tests/test_router_direct.py` (`test_acl_manage_false_without_authorization`, `test_acl_manage_false_on_httpx_error`, `test_acl_manage_false_on_non_200`, `test_acl_manage_false_on_malformed_json`, `test_acl_manage_true_when_allowed`, `test_acl_manage_false_when_not_allowed`, `test_acl_manage_false_when_answer_not_an_object`)
 - **CFG-EXEC-2.** On `POST /execute` the run is attributed to the token's `sub`; the
   body's required `user_id` is ignored. \
   Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`) \
@@ -1335,8 +1338,6 @@ confirmed by reading only.
 
 ### Open defects
 
-- #1096 (CFG-EXEC-1): execution's `_user_has_acl_manage` still raises on a 200 whose
-  JSON body is not an object; the inventory and `herd_common` sites are fixed.
 - #1104 (CFG-JOB-5): a schedule's reservation check proves the caller owns some active
   reservation holding the device, not that the named reservation holds it or belongs to
   the caller.
