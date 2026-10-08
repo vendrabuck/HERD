@@ -544,6 +544,13 @@ presses Save and Restart. Login to HERD stays disabled until the file exists.
   through `GET /settings`. \
   Enforced in: `frontend/src/pages/ConfigPage.tsx` (`ConfigPage`) \
   Pinned by: `tests/e2e/test_config_playwright.py` (`test_config_save_persists_value_via_api_readback`, `test_config_full_cycle_edit_and_restore_via_ui`)
+- **OPS-CONFIG-21.** The config service answers cross-origin requests from any origin
+  (`allow_origins=["*"]`, deliberately not `herd_common`'s CORS helper) and never allows
+  credentials: a preflight or a request carrying a cookie gets
+  `Access-Control-Allow-Origin: *` and no `Access-Control-Allow-Credentials`. The page
+  sends its session in the `Authorization` header, which needs no credentials mode. \
+  Enforced in: `services/config/app/main.py` (`CORSMiddleware`, `allow_credentials=False`) \
+  Pinned by: `services/config/tests/test_cors.py` (`test_cors_middleware_options_are_wildcard_without_credentials`, `test_preflight_from_any_origin_allows_no_credentials`, `test_simple_request_with_cookie_does_not_echo_the_origin`)
 
 **Out of scope.** The superadmin seed that reads `SUPERADMIN_*` (`identity-and-access.md`,
 IAM-BOOT-1 to IAM-BOOT-5); the meaning of each field (each area's Configuration section).

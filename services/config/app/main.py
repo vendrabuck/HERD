@@ -35,10 +35,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# The wildcard origin is deliberate (this is the one service that does not use
+# herd_common's CORS helper). Credentials are never allowed: the config session
+# is a bearer token the page sends in the Authorization header, so no request
+# needs credentials mode, and a wildcard with credentials would echo any Origin
+# back with Access-Control-Allow-Credentials (issue #1111).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
