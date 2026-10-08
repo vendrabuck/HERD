@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import httpx
 from fastapi import HTTPException
+from herd_common.config_redaction import redact_config
 from herd_common.device_config import (
     ConfigValidationError,
     PublishedSchemaError,
@@ -45,11 +46,25 @@ async def create_execution_run(
     method_kwargs: dict | None = None,
     dedupe_key: str | None = None,
     dry_run: bool = False,
+    config_version_id: uuid.UUID | None = None,
 ) -> ExecutionRun:
-    # Store method_kwargs in input_params for queryability
     input_params = dict(input_params)
+    # The keyword arguments are kept for queryability in a MASKED form only
+    # (herd_common.config_redaction): a `configure` call's arguments are the
+    # device configuration, and the run reads return input_params. Whether
+    # anything was masked is recorded beside it, so a retry knows the stored
+    # copy is not the configuration and must read it back from its config
+    # version (retry_run). A row without `method_kwargs_redacted` predates the
+    # rule and holds its arguments as sent.
     if method_kwargs:
-        input_params["method_kwargs"] = method_kwargs
+        stored_kwargs, masked = redact_config(method_kwargs)
+        input_params["method_kwargs"] = stored_kwargs
+        input_params["method_kwargs_redacted"] = masked
+    # The config version a pushed configuration came from, when the caller
+    # names one (inventory's two apply paths do): the reference a retry reads
+    # the full configuration back from.
+    if config_version_id is not None:
+        input_params["config_version_id"] = str(config_version_id)
     # Record whether the run is a dry run (issue #1091), so a retry repeats
     # what the original run was: the sandbox receives dry_run only in its own
     # copy of the context, which is never stored. Always written, False
@@ -205,8 +220,16 @@ async def list_execution_runs(
     created_before: datetime | None = None,
     skip: int = 0,
     limit: int = 50,
+    visible_device_ids: set[uuid.UUID] | None = None,
 ) -> tuple[list[ExecutionRun], int]:
+    """Filter, count, and page execution runs, newest first.
+
+    `visible_device_ids` None means no device filter (an admin); a set keeps only
+    runs on those devices, an empty set none, so the count and the page agree.
+    """
     query = select(ExecutionRun)
+    if visible_device_ids is not None:
+        query = query.where(ExecutionRun.device_id.in_(visible_device_ids))
     if device_id is not None:
         query = query.where(ExecutionRun.device_id == device_id)
     if reservation_id is not None:
@@ -443,6 +466,7 @@ async def run_driver_action(
     port_b: str | None = None,
     method_kwargs: dict | None = None,
     dry_run: bool = False,
+    config_version_id: uuid.UUID | None = None,
 ) -> ExecutionRun:
     """Core execution logic: build context, load driver, run in sandbox, record result."""
     _assert_action_permitted(device_data, action)
@@ -478,8 +502,8 @@ async def run_driver_action(
             # secret material lives inside a VALUE, not under a
             # credential-shaped key (issue #872 follow-up). Only the key
             # names are queryable context; the values are not logged here at
-            # all (they still land in the ExecutionRun row via
-            # create_execution_run, which is unrelated to this log line).
+            # all (the ExecutionRun row stores them masked, see
+            # create_execution_run).
             "method_kwarg_keys": sorted(method_kwargs) if method_kwargs else None,
         },
     )
@@ -498,6 +522,7 @@ async def run_driver_action(
         port_b=port_b,
         method_kwargs=method_kwargs,
         dry_run=dry_run,
+        config_version_id=config_version_id,
     )
     run_id = run.id
 

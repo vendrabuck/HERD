@@ -166,6 +166,7 @@ def execute_driver_method(
 
     # Write context to a temp file (not CLI args, to avoid exposing passwords in process list)
     context_file = None
+    kwargs_file = None
     transcript_file = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -188,7 +189,18 @@ def execute_driver_method(
         if port_b is not None and "port_b" not in effective_kwargs:
             effective_kwargs["port_b"] = port_b
         if effective_kwargs:
-            cmd.append(json.dumps(effective_kwargs))
+            # The keyword arguments travel in their own temp file, like the
+            # context and for the same reason: a `configure` call's arguments
+            # are the device configuration, and the child's command line is
+            # readable by any process in the container (/proc/<pid>/cmdline,
+            # ps). Only the file's path is on argv. Same lifecycle and
+            # permissions as the context file (mode 0600, deleted below).
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False, prefix="herd_kw_"
+            ) as f:
+                json.dump(effective_kwargs, f)
+                kwargs_file = f.name
+            cmd.append(kwargs_file)
 
         env = {
             "PYTHONPATH": driver_path,
@@ -328,6 +340,8 @@ def execute_driver_method(
     finally:
         if context_file and os.path.exists(context_file):
             os.unlink(context_file)
+        if kwargs_file and os.path.exists(kwargs_file):
+            os.unlink(kwargs_file)
         if transcript_file and os.path.exists(transcript_file):
             os.unlink(transcript_file)
 

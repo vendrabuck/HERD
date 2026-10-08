@@ -1255,4 +1255,5 @@ async def test_post_internal_execute_sends_the_job_reservation_id(monkeypatch, t
         "method_kwargs": {"vlan": 7},
         "dry_run": dry_run,
         "reservation_id": str(reservation_id) if tied else None,
+        "config_version_id": str(job.version_id),
     }

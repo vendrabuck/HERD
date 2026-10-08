@@ -48,7 +48,7 @@ reservation ownership) are numbered rules in section 8.
 | Actor | May | May not |
 |---|---|---|
 | Unauthenticated caller | Nothing (401) | Anything |
-| User | Read the config versions, diffs, and apply jobs of a device visible to them; read any driver's config schema; with a `manage` grant on the device or an active reservation of it, create and restore versions, apply now, schedule, and confirm a dry run; cancel their own pending jobs; with a `manage` grant, run `configure` through `POST /execute`; list the runs of a reservation they own and read those runs' command transcripts | See a hidden device's history; run any driver action other than `configure`; read a single run's detail; retry a run |
+| User | Read the config versions, diffs, and apply jobs of a device visible to them; read any driver's config schema; with a `manage` grant on the device or an active reservation of it, create and restore versions, apply now, schedule, and confirm a dry run; cancel their own pending jobs; with a `manage` grant, run `configure` through `POST /execute`; list the runs of a reservation they own that ran on devices visible to them and read those runs' command transcripts | See a hidden device's history or runs; run any driver action other than `configure`; read a single run's detail; retry a run |
 | Admin | Everything on every device; run any driver action; list, read, and retry any run | Apply to a device whose driver contract has no `configure` (CFG-GATE-2, CFG-GATE-4) |
 | Superadmin | Same as admin | Same as admin |
 | Another service (internal token) | Read a device's latest config version and its apply-job summary; read a driver's published schema; run `configure` through `POST /execute/internal`; validate a package | Anything through the user-facing routes |
@@ -216,10 +216,10 @@ Execution routes:
 | Method | Path | Who may call | Success | Rules |
 |---|---|---|---|---|
 | POST | `/execute` | admin (any action); a user with a `manage` grant (`configure` only) | 201 | CFG-EXEC-1 to CFG-EXEC-5, CFG-EXEC-7 to CFG-EXEC-13, CFG-GATE-4 |
-| GET | `/runs` | admin; a user, with the `reservation_id` of a reservation they own | 200 | CFG-RUN-1 to CFG-RUN-3 |
+| GET | `/runs` | admin; a user, with the `reservation_id` of a reservation they own (runs on devices they may see) | 200 | CFG-RUN-1 to CFG-RUN-3 |
 | GET | `/runs/{id}` | admin | 200 | CFG-RUN-4 |
-| GET | `/runs/{id}/commands` | admin; a user who owns the run's reservation | 200 | CFG-TX-5 |
-| POST | `/runs/{id}/retry` | admin | 200 | CFG-RUN-5, CFG-RUN-6 |
+| GET | `/runs/{id}/commands` | admin; a user who owns the run's reservation and may see the run's device | 200 | CFG-TX-5 |
+| POST | `/runs/{id}/retry` | admin | 200 | CFG-RUN-5 to CFG-RUN-7 |
 
 `GET /runs` takes `device_id`, `reservation_id`, `status`, `created_after`,
 `created_before`, `skip` (default 0), and `limit` (1 to 500, default 50) and answers
@@ -518,8 +518,10 @@ versions to the device immediately and sees whether the push worked.
 
 - **CFG-APPLY-1.** After the checks of CFG-AUTH-3 and CFG-GATE-2, inventory calls
   execution `POST /execute` with the caller's own `Authorization` header and a 30 second
-  timeout, sending `device_id`, `action` `configure`, `user_id` (the caller), and the
-  version's config as `method_kwargs`; it sends no `dry_run` and no `reservation_id`. \
+  timeout, sending `device_id`, `action` `configure`, `user_id` (the caller), the
+  version's config as `method_kwargs`, and the version's id as `config_version_id` (the
+  reference a retry reads the configuration back from, CFG-RUN-7); it sends no
+  `dry_run` and no `reservation_id`. \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_apply_calls_execution_with_method_kwargs`)
 - **CFG-APPLY-2.** Every execution outcome answers 200
@@ -747,10 +749,10 @@ re-checking at fire time that the job may still run.
   Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_fire_job_fails_when_version_was_deleted`)
 - **CFG-SCHED-8.** A job is fired with execution `POST /execute/internal`, the internal
   token, and 30 seconds, sending `device_id`, `action` `configure`, `user_id` (the job's
-  creator), the version's config as `method_kwargs`, `dry_run`, and the job's
+  creator), the version's config as `method_kwargs`, `dry_run`, the job's
   `reservation_id` (null for a job tied to none), so the run carries the reservation and
   its owner can read the transcript (CFG-TX-5) and find the run in the reservation's run
-  list. \
+  list, and the job's version id as `config_version_id` (CFG-RUN-7). \
   Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_post_internal_execute`) \
   Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_post_internal_execute_sends_the_job_reservation_id`)
 - **CFG-SCHED-9.** The job is `success` only for a 2xx JSON answer whose `status` is
@@ -797,11 +799,25 @@ is WIRE-DRIVER-6 in `provisioning-and-wiring.md`.
   body's required `user_id` is ignored. \
   Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`) \
   Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_manual_execute_overrides_user_id_with_jwt_subject`)
-- **CFG-EXEC-3.** The body's `reservation_id`, `port_a`, `port_b`, `method_kwargs`, and
-  `dry_run` are used as sent; the `reservation_id` is not checked against the device or
-  the caller. \
-  Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`) \
-  Pinned by: none (#1100)
+- **CFG-EXEC-3.** On `POST /execute`, after the checks of CFG-EXEC-1 and before any
+  device read, run row, or driver call, a `reservation_id` must name a reservation whose
+  device set holds the device (any status) and, for a non-admin, one the caller owns;
+  admins are exempt from ownership only. It is read from reservations
+  `GET /internal/by-device/{device_id}` with the internal token and 5 seconds, which lists
+  every holder of the device with its owner (the caller-token `GET /{id}` answers only
+  the caller's own reservations, admins included, so it cannot confirm an admin's id).
+  A reservation that is not listed, or a non-admin's reservation owned by someone else,
+  is 422 `reservation_id must reference a reservation you own that includes this device`
+  (an admin's: `reservation_id must reference a reservation that includes this device`);
+  no internal token, a transport error, a non-200, a body that is not JSON, or a body that
+  is not a list of objects with string `id` and `user_id` is 503
+  `Could not verify the reservation; nothing was run. Retry the request.` An omitted
+  `reservation_id` asks nothing. `POST /execute/internal` does not check it (its caller is
+  trusted through the internal token). `port_a`, `port_b`, `method_kwargs`, `dry_run`, and
+  `config_version_id` are used as sent; the `config_version_id` is only recorded (a retry
+  checks it, CFG-RUN-7). \
+  Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`, `_assert_execute_reservation`) \
+  Pinned by: `services/execution/tests/test_manual_execute_reservation_scope.py` (`test_owner_runs_configure_under_their_own_reservation`, `test_non_admin_cannot_tag_a_run_with_another_users_reservation`, `test_non_admin_cannot_tag_a_run_with_a_reservation_without_the_device`, `test_admin_may_tag_a_run_with_another_users_reservation_holding_the_device`, `test_admin_cannot_tag_a_run_with_a_reservation_without_the_device`, `test_execute_without_a_reservation_asks_nothing`, `test_reservation_check_fails_closed`, `test_reservation_check_without_an_internal_token_fails_closed`, `test_non_admin_without_a_grant_is_refused_before_the_reservation_check`, `test_internal_execute_reservation_is_not_checked`); `tests/integration/test_execution_device_scope.py` (`test_execute_refuses_a_reservation_that_does_not_hold_the_device`, `test_execute_accepts_the_callers_reservation_holding_the_device`)
 - **CFG-EXEC-4.** The device and its template are read through inventory's internal
   routes with the internal token and 10 seconds; a 404 is 404 `Device <id> not found` or
   `Template <id> not found`, and any other failure is 503 `Failed to fetch device: <reason>`
@@ -829,9 +845,15 @@ is WIRE-DRIVER-6 in `provisioning-and-wiring.md`.
   Enforced in: `services/execution/app/services/execution_service.py` (`run_driver_action`, `redact_context_for_logging`, `extract_password_keys`) \
   Pinned by: `services/execution/tests/test_api_endpoints.py` (`test_execute_success`); `services/execution/tests/test_execution_service.py` (`test_redact_context`, `test_extract_password_keys`)
 - **CFG-EXEC-8.** A non-empty `method_kwargs` is stored in `input_params` under
-  `method_kwargs` as sent, a pushed configuration included. \
-  Enforced in: `services/execution/app/services/execution_service.py` (`create_execution_run`) \
-  Pinned by: none (#1100)
+  `method_kwargs` only as a masked copy, for every action: a value under a key whose name
+  matches the log formatter's credential key pattern is `[redacted]`, and inside a string
+  everything after a credential keyword token (`password`, `passwd`, `passphrase`,
+  `secret`, `community`, `key`, `key-string`, `md5`, or a hyphenated or underscored
+  name ending in one) on the same line is `[redacted]`. `method_kwargs_redacted` records
+  whether anything was masked, and a `config_version_id` the caller sent is stored
+  beside it. The driver receives the arguments as sent. \
+  Enforced in: `services/execution/app/services/execution_service.py` (`create_execution_run`); `services/common/herd_common/config_redaction.py` (`redact_config`, `redact_command_text`) \
+  Pinned by: `services/execution/tests/test_run_arguments_storage.py` (`test_configure_run_stores_no_credential_value_from_an_frr_config`, `test_run_without_credentials_stores_its_arguments_as_sent`, `test_internal_execute_records_the_config_version`, `test_create_execution_run_masks_any_action_arguments`); `services/common/tests/test_config_redaction.py` (`test_frr_config_keeps_no_credential_value`, `test_value_under_a_credential_named_key_is_masked_whole`, `test_configuration_without_credentials_is_unchanged`, `test_words_that_only_contain_a_keyword_are_not_keywords`)
 - **CFG-EXEC-9.** A driver load failure ends the run `FAILED` with
   `driver load failed: <ClassName>` (the wrapped cause's class when there is one); the
   exception text goes to the log message only. \
@@ -882,18 +904,26 @@ reservation can list the runs tagged with it.
   and pages with `skip` and `limit`. \
   Enforced in: `services/execution/app/services/execution_service.py` (`list_execution_runs`) \
   Pinned by: `services/execution/tests/test_execution_crud.py` (`test_list_filter_by_device_id`, `test_list_filter_by_reservation_id`, `test_list_filter_by_status`, `test_list_pagination`, `test_list_combined_filters`); `services/execution/tests/test_execution_service_edges.py` (`test_list_execution_runs_created_after_and_before`)
-- **CFG-RUN-3.** A reservation owner's list holds every run tagged with that
-  reservation, whatever device it ran on, the wiring consumer's switch runs
-  (WIRE-DRIVER-5) included, each with its `input_params`. \
-  Enforced in: `services/execution/app/routers/executions.py` (`list_runs`); `services/execution/app/services/execution_service.py` (`list_execution_runs`) \
-  Pinned by: none (#1100)
+- **CFG-RUN-3.** A non-admin's list holds only the runs whose device the caller may see
+  under device-group visibility, asked once per request of inventory
+  `GET /device-groups/visible-devices` with the caller's own token and 10 seconds,
+  after the ownership check of CFG-RUN-1. The filter is part of the query, so `total`
+  and paging count only those runs; a wiring consumer's run on a switch outside the
+  caller's visibility (WIRE-DRIVER-5), or a recipe run filed under a hypervisor id,
+  is not listed. No token, a transport error, a non-200, a body that is not JSON, or a
+  body that is not `{"device_ids": [<str>, ...]}` is 503
+  `Could not verify device visibility; nothing was returned. Retry the request.` with
+  no rows. An admin's list is not filtered and asks nothing. \
+  Enforced in: `services/execution/app/routers/executions.py` (`_authorize_runs_list`, `list_runs`); `services/execution/app/services/device_visibility.py` (`fetch_visible_device_ids`, `resolve_caller_visibility`); `services/execution/app/services/execution_service.py` (`list_execution_runs`) \
+  Pinned by: `services/execution/tests/test_run_reads_device_visibility.py` (`test_owner_run_list_holds_only_visible_devices`, `test_owner_run_list_empty_when_no_device_is_visible`, `test_owner_run_list_device_filter_on_hidden_device_is_empty`, `test_owner_run_list_fails_closed_when_visibility_unanswerable`, `test_owner_run_list_ownership_is_still_the_first_gate`, `test_admin_run_list_is_unfiltered_and_asks_nothing`, `test_fetch_visible_device_ids_without_a_token_is_unanswerable`, `test_resolve_caller_visibility_is_none_for_admins`)
 - **CFG-RUN-4.** `GET /runs/{id}` is for admins (403
   `Admin or superadmin role required`); an unknown run is 404 `Execution run not found`. \
   Enforced in: `services/execution/app/routers/executions.py` (`get_run`) \
   Pinned by: `services/execution/tests/test_router_direct.py` (`test_get_run_404_when_missing`, `test_get_run_returns_persisted`); `services/execution/tests/test_api_endpoints.py` (`test_get_run_detail`)
 - **CFG-RUN-5.** An admin's retry of a `FAILED` or `TIMEOUT` run runs the same action
   again as a new run, with the original run's user, reservation, ports, and
-  `method_kwargs`, and answers 200 with the new run; any other status is 400
+  `method_kwargs` (read back as CFG-RUN-7 says when the stored copy is masked), and
+  answers 200 with the new run; any other status is 400
   `Only failed or timed-out runs can be retried`, an unknown run 404. \
   Enforced in: `services/execution/app/routers/executions.py` (`retry_run`) \
   Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_retry_rejects_successful_run`, `test_retry_failed_run_rebuilds_and_runs`); `services/execution/tests/test_api_endpoints.py` (`test_retry_failed_run`, `test_retry_success_run_rejected`); `services/execution/tests/test_router_direct.py` (`test_retry_run_404_when_missing`)
@@ -906,6 +936,22 @@ reservation can list the runs tagged with it.
   before any device read or driver call. \
   Enforced in: `services/execution/app/routers/executions.py` (`retry_run`); `services/execution/app/services/execution_service.py` (`create_execution_run`, `run_driver_action`) \
   Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_retry_failed_dry_run_stays_a_dry_run`, `test_retry_failed_real_run_stays_real`, `test_retry_refuses_run_without_dry_run_record`, `test_execute_records_dry_run_on_the_run`)
+- **CFG-RUN-7.** A retry of a run whose `method_kwargs_redacted` is true reads the
+  configuration back from the run's `config_version_id` through inventory
+  `GET /devices/{device_id}/config-versions/{version_id}` (the run's device) with the
+  retrying admin's own token and 10 seconds, and uses it only when masking it (CFG-EXEC-8)
+  gives exactly the stored copy; the new run records the same `config_version_id`. A run
+  with no `config_version_id` is 409
+  `This run stores its configuration masked and names no config version to read it back from, so it cannot be retried; start a new run instead`;
+  a 404 or a configuration that does not match is 409
+  `The configuration this run pushed could not be read back from its config version, so it cannot be retried; start a new run instead`;
+  no token, a transport error, another non-200, or a body without a JSON object `config`
+  is 503 `Could not read the run's config version; nothing was retried. Retry the request.`
+  Each refusal comes after the check of CFG-RUN-6 and before any device read or driver
+  call. A run whose arguments needed no masking, or one written before masking (no
+  `method_kwargs_redacted`), is retried with its stored arguments. \
+  Enforced in: `services/execution/app/routers/executions.py` (`retry_run`, `_recover_masked_kwargs`) \
+  Pinned by: `services/execution/tests/test_run_arguments_storage.py` (`test_retry_reads_a_masked_configuration_back_from_its_config_version`, `test_retry_of_a_masked_run_without_a_config_version_is_refused`, `test_retry_refuses_a_version_that_does_not_match_the_run`, `test_retry_fails_closed_when_the_config_version_cannot_be_read`, `test_retry_of_an_unmasked_run_reuses_its_stored_arguments`)
 
 **Out of scope.** The wiring status and wiring retry routes, which are not run history
 (`provisioning-and-wiring.md`).
@@ -940,10 +986,13 @@ which drivers import; `GET /runs/{id}/commands`.
 - **CFG-TX-5.** `GET /runs/{id}/commands` answers the rows in order, an empty list when
   the driver recorded none, and 404 `Execution run not found` for an unknown run. An
   admin may read any run; anyone else only a run whose `reservation_id` passes the
-  ownership check of CFG-RUN-1 (403 `Reservation not owned by caller`), and a run with
-  no reservation is 403 `Admin access required`. \
-  Enforced in: `services/execution/app/routers/executions.py` (`list_run_commands`, `_authorize_run_read`); `services/execution/app/services/execution_service.py` (`list_command_log`) \
-  Pinned by: `services/execution/tests/test_command_log_acl.py` (`test_admin_can_read_any_run`, `test_non_admin_owner_can_read`, `test_non_admin_non_owner_rejected`, `test_non_admin_run_without_reservation_rejected`, `test_reservations_service_error_is_closed_by_default`); `services/execution/tests/test_router_direct.py` (`test_list_run_commands_404_when_run_missing`, `test_list_run_commands_admin_returns_empty`); `services/execution/tests/test_command_log.py` (`test_get_run_commands_admin`, `test_get_run_commands_not_found`)
+  ownership check of CFG-RUN-1 (403 `Reservation not owned by caller`) and whose device
+  the caller may see under the visibility answer of CFG-RUN-3; a run on a device
+  outside it answers byte for byte as an unknown run (404 `Execution run not found`),
+  and an unanswerable lookup is the 503 of CFG-RUN-3. A run with no reservation is 403
+  `Admin access required`. \
+  Enforced in: `services/execution/app/routers/executions.py` (`list_run_commands`, `_authorize_run_read`); `services/execution/app/services/device_visibility.py` (`resolve_caller_visibility`); `services/execution/app/services/execution_service.py` (`list_command_log`) \
+  Pinned by: `services/execution/tests/test_command_log_acl.py` (`test_admin_can_read_any_run`, `test_non_admin_owner_can_read`, `test_non_admin_non_owner_rejected`, `test_non_admin_run_without_reservation_rejected`, `test_reservations_service_error_is_closed_by_default`); `services/execution/tests/test_router_direct.py` (`test_list_run_commands_404_when_run_missing`, `test_list_run_commands_admin_returns_empty`); `services/execution/tests/test_command_log.py` (`test_get_run_commands_admin`, `test_get_run_commands_not_found`); `services/execution/tests/test_run_reads_device_visibility.py` (`test_owner_reads_transcript_of_visible_run`, `test_hidden_run_transcript_answers_exactly_like_an_unknown_run`, `test_transcript_read_fails_closed_when_visibility_unanswerable`, `test_admin_reads_any_transcript_without_a_lookup`)
 
 **Out of scope.** The golden-transcript regression tests of the checked-in drivers
 (`services/execution/tests/test_golden_transcripts.py`), which pin driver output rather
@@ -1105,10 +1154,11 @@ the child entry point `services/execution/app/services/_runner.py`;
 **Rules.**
 
 - **CFG-SBX-1.** Each call starts `python _runner.py <driver dir> <action> <context file>`
-  plus, when there are keyword arguments, their JSON as one more argument; the context
-  is written to a temporary JSON file that is deleted when the call ends. \
+  plus, when there are keyword arguments, the path of a second temporary JSON file that
+  holds them; no argument text is on the child's command line. Both files are written
+  with owner-only permissions and deleted when the call ends. \
   Enforced in: `services/execution/app/services/driver_sandbox.py` (`execute_driver_method`); `services/execution/app/services/_runner.py` (`main`) \
-  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_execute_login`, `test_execute_context_passed`, `test_execute_connect_ports_via_method_kwargs`); `services/execution/tests/test_runner.py` (`test_runner_login_action`, `test_runner_connect_ports_with_args`, `test_runner_invalid_context_file`)
+  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_execute_login`, `test_execute_context_passed`, `test_execute_connect_ports_via_method_kwargs`); `services/execution/tests/test_runner.py` (`test_runner_login_action`, `test_runner_connect_ports_with_args`, `test_runner_invalid_context_file`); `services/execution/tests/test_run_arguments_storage.py` (`test_driver_arguments_never_on_the_child_command_line`, `test_driver_call_without_arguments_passes_no_arguments_file`)
 - **CFG-SBX-2.** The keyword arguments are `method_kwargs` plus `port_a` and `port_b`
   when given and not already present. \
   Enforced in: `services/execution/app/services/driver_sandbox.py` (`execute_driver_method`) \
@@ -1255,7 +1305,7 @@ status.
 | 404 | `Apply job not found` | an unknown job, or a job of a hidden device on the read | CFG-AUTH-5, CFG-JOB-9, CFG-JOB-10, CFG-JOB-11 |
 | 404 | `Driver package not found` | the schema proxy for an unknown driver | CFG-SCHEMA-9 |
 | 404 | `Device <id> not found`, `Template <id> not found` | execution cannot find the device or its template | CFG-EXEC-4 |
-| 404 | `Execution run not found` | an unknown run | CFG-RUN-4, CFG-RUN-5, CFG-TX-5 |
+| 404 | `Execution run not found` | an unknown run, or, on a non-admin transcript read, a run on a device the caller may not see | CFG-RUN-4, CFG-RUN-5, CFG-TX-5 |
 | 400 | `Only failed or timed-out runs can be retried` | a retry of a run that is not `FAILED` or `TIMEOUT` | CFG-RUN-5 |
 | 409 | `{"error": "driver_cannot_configure", "connection_type", "driver", "message"}` | a push to a device whose driver cannot configure | CFG-GATE-2, CFG-GATE-4 |
 | 409 | `{"error": "device_has_no_driver", "message"}` | any execution action on a device with no driver | CFG-GATE-4 |
@@ -1264,10 +1314,13 @@ status.
 | 409 | `Could not allocate a config version number under concurrent writes; retry the request` | a create or restore that collided five times | CFG-VER-5 |
 | 409 | `Source job is not a dry-run; nothing to promote`, `Source dry-run is '<status>'; only successful dry-runs can be promoted` | a confirm of the wrong kind of job | CFG-JOB-11 |
 | 409 | `This run does not record whether it was a dry run, so it cannot be retried; start a new run instead` | a retry of a run written before runs recorded `dry_run` | CFG-RUN-6 |
+| 409 | `This run stores its configuration masked and names no config version to read it back from, so it cannot be retried; start a new run instead` | a retry of a masked run with no `config_version_id` | CFG-RUN-7 |
+| 409 | `The configuration this run pushed could not be read back from its config version, so it cannot be retried; start a new run instead` | a retry whose config version is unknown or no longer matches | CFG-RUN-7 |
 | 422 | `Device has no driver-defined connection_type; cannot validate config` | a version for a device without a driver connection type | CFG-VER-2 |
 | 422 | `device '<name>': config failed schema validation: <message>` and the other validator messages | a config the schema refuses | CFG-VER-3, CFG-SCHEMA-3, CFG-SCHEMA-4, CFG-EXEC-10 |
 | 422 | `scheduled_for must be in the future`, `scheduled_for must be within <N> days from now` | a bad schedule time | CFG-JOB-1, CFG-JOB-2 |
 | 422 | `reservation_id must reference an active reservation you own that includes this device` | a schedule naming a reservation that fails CFG-JOB-4 | CFG-JOB-4 |
+| 422 | `reservation_id must reference a reservation you own that includes this device`, `reservation_id must reference a reservation that includes this device` (an admin) | a `POST /execute` naming a reservation that fails CFG-EXEC-3 | CFG-EXEC-3 |
 | 422 | `this driver does not advertise dry-run support; refuse to fire a dry-run that would hit the wire` | a dry-run schedule for a driver without dry-run support | CFG-JOB-6 |
 | 422 | `internal execute is restricted to action='configure'; got '<action>'` | `POST /execute/internal` of another action | CFG-EXEC-6 |
 | 422 | `Only the Hypervisor connection type is supported for package validation`; `package_b64 is not valid base64`; `package exceeds the <N> byte validation limit`; `package is empty` | a validation request the route refuses | CFG-VAL-1, CFG-VAL-2 |
@@ -1276,6 +1329,9 @@ status.
 | 503 | `reservations service unreachable while checking active reservations` and the two sibling details | a restore whose guard cannot be answered | CFG-VER-13 |
 | 503 | `Failed to fetch device: <reason>`, `Failed to fetch template: <reason>` (an upstream status, a class name, or a malformed-body note; never upstream text) | execution cannot read the device or template | CFG-EXEC-4 |
 | 503 | the visibility lookup's own detail (`inventory.md`) | a non-admin read whose visibility lookup fails | CFG-AUTH-5 |
+| 503 | `Could not verify the reservation; nothing was run. Retry the request.` | a `POST /execute` whose reservation cannot be checked | CFG-EXEC-3 |
+| 503 | `Could not read the run's config version; nothing was retried. Retry the request.` | a retry whose config version cannot be read | CFG-RUN-7 |
+| 503 | `Could not verify device visibility; nothing was returned. Retry the request.` | a non-admin run list or transcript read whose visibility lookup cannot be answered | CFG-RUN-3, CFG-TX-5 |
 
 ## 10. Interactions with other services
 
@@ -1291,6 +1347,9 @@ status.
 | inventory to execution | execution | `POST /execute/internal` (`X-Internal-Token`, 30 s) | a scheduled job | the job is `failed` (CFG-SCHED-9) |
 | execution to acl | acl | `POST /check` with the caller's token, 5 s | a non-admin `configure` | fail closed: 403 (CFG-EXEC-1) |
 | execution to reservations | reservations | `GET /{id}` with the caller's token, 5 s | run list and transcript ownership | fail closed: 403 (CFG-RUN-1, CFG-TX-5) |
+| execution to reservations | reservations | `GET /internal/by-device/{id}` (`X-Internal-Token`, 5 s) | a `POST /execute` that names a reservation | fail closed: 503 (CFG-EXEC-3) |
+| execution to inventory | inventory | `GET /devices/{id}/config-versions/{vid}` with the admin's token, 10 s | a retry of a masked run | 404 is 409, anything else unreadable is 503 (CFG-RUN-7) |
+| execution to inventory | inventory | `GET /device-groups/visible-devices?user_id` with the caller's token, 10 s | a non-admin's run list and transcript read | fail closed: 503 (CFG-RUN-3, CFG-TX-5) |
 | execution to inventory | inventory | `GET /devices/{id}/internal`, `GET /templates/{id}/internal` (`X-Internal-Token`, 10 s) | the device and template of an action | 404 is relayed; anything else, a body that is not a JSON object included, 503 (CFG-EXEC-4) |
 | execution to inventory | inventory | `GET /drivers/{id}/internal-download` (`X-Internal-Token`, 30 s) | the driver archive on a cache miss | the run is `FAILED` with `driver load failed: <ClassName>` (CFG-LOAD-2, CFG-EXEC-9) |
 | execution to a driver | the driver package | a sandboxed subprocess | every driver method | the run records the failure (CFG-SBX-5, CFG-SBX-7, CFG-RUNSTATE-4) |
@@ -1359,6 +1418,12 @@ that should have a test are tracked in #1100.
 - Only `Management` drivers can be pushed a configuration; versions on other types
   store intent ([DRIVERS.md](../DRIVERS.md), "Apply versus config versions") (CFG-GATE-1,
   CFG-GATE-3).
+- A retry accepts a config version whose masked copy equals the run's stored copy, so
+  two configurations that differ only inside masked text compare equal; config versions
+  are never edited in place, so a version id names one configuration (the
+  `_recover_masked_kwargs` docstring) (CFG-RUN-7). A run that a direct `POST /execute`
+  started with masked arguments and no `config_version_id` cannot be retried; a new run
+  is the way (CFG-RUN-7).
 
 ### Rules with no test
 
@@ -1369,8 +1434,5 @@ that should have a test are tracked in #1100.
 - CFG-JOB-5: the named reservation is not itself proven.
 - CFG-JOB-6: the schedule-time dry-run support check.
 - CFG-JOB-13: confirm repeats no schedule-time check.
-- CFG-EXEC-3: the body's reservation and options are taken as sent.
-- CFG-EXEC-8: `method_kwargs` stored on the run.
-- CFG-RUN-3: an owner's list holds every run of the reservation.
 - CFG-DRY-4: the dry-run declaration is not verified.
 - CFG-SBX-9: no isolation beyond resource limits.

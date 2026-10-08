@@ -2,15 +2,17 @@
 """Standalone subprocess entry point for driver execution.
 
 Usage:
-    python _runner.py <driver_path> <action> <context_json_file> [method_kwargs_json]
+    python _runner.py <driver_path> <action> <context_json_file> [method_kwargs_json_file]
 
 Loads driver.py from driver_path, instantiates Driver(context), calls the
 requested method, and prints the JSON result to stdout. Exits 0 on success,
 1 on failure.
 
-method_kwargs_json is an optional JSON string of keyword arguments to pass
-to the driver method (e.g. '{"port_a": "0/0/1", "port_b": "0/0/2"}' for L1
-or '{"port": "eth1", "vlan_id": 100, "tag": "tagged"}' for L2).
+method_kwargs_json_file is the optional path of a JSON file holding the keyword
+arguments to pass to the driver method (e.g. {"port_a": "0/0/1", "port_b":
+"0/0/2"} for L1 or {"port": "eth1", "vlan_id": 100, "tag": "tagged"} for L2).
+The arguments are read from a file, never taken from the command line, for the
+same reason the context is: argv is readable by every process in the container.
 """
 
 import importlib.util
@@ -30,7 +32,7 @@ if _RUNNER_DIR not in sys.path:
 def main():
     if len(sys.argv) < 4:
         print(
-            "Usage: _runner.py <driver_path> <action> <context_file> [method_kwargs_json]",
+            "Usage: _runner.py <driver_path> <action> <context_file> [method_kwargs_file]",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -52,7 +54,10 @@ def main():
     driver_path = sys.argv[1]
     action = sys.argv[2]
     context_file = sys.argv[3]
-    method_kwargs = json.loads(sys.argv[4]) if len(sys.argv) > 4 else {}
+    method_kwargs = {}
+    if len(sys.argv) > 4:
+        with open(sys.argv[4]) as f:
+            method_kwargs = json.load(f)
 
     # Load context from temp file
     with open(context_file) as f:

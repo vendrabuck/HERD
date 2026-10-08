@@ -189,6 +189,7 @@
     "ManualExecuteRequest": {
       "properties": {
         "action": "string",
+        "config_version_id": "anyOf",
         "device_id": "string",
         "dry_run": "boolean",
         "method_kwargs": "anyOf",

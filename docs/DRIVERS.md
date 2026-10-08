@@ -502,6 +502,13 @@ driver in cleartext so the driver can authenticate with the device. These values
 - Redacted as `***REDACTED***` in all execution logs and stored execution run records
 - Never exposed in API responses beyond the execution service
 
+A method's keyword arguments (for `configure`, the configuration itself) reach the child
+the same way, through a second temporary file whose path is the only thing on the
+command line. The execution run stores them masked: a value under a credential-named key
+and the rest of a command line after a keyword such as `password`, `secret`,
+`community`, `key`, or `md5` read `[redacted]`. A retry of such a run reads the full
+configuration back from the config version it came from.
+
 ### Execution sandbox
 
 Driver code runs in a separate subprocess with these limits enforced:

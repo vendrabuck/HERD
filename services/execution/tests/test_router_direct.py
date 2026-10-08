@@ -258,6 +258,11 @@ async def test_list_run_commands_non_admin_owner_allowed(db, monkeypatch):
     db.add(run)
     await db.commit()
     monkeypatch.setattr(ex_router, "_user_owns_reservation", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        ex_router.device_visibility,
+        "fetch_visible_device_ids",
+        AsyncMock(return_value={run.device_id}),
+    )
     rows = await ex_router.list_run_commands(run.id, {"role": "user"}, "Bearer t", db)
     assert rows == []
 
@@ -353,7 +358,7 @@ async def test_list_runs_returns_paginated(db):
         created_before=None,
         skip=0,
         limit=50,
-        _={"role": "admin"},
+        visible_device_ids=None,
         db=db,
     )
     assert resp.total == 1
@@ -404,9 +409,14 @@ async def test_user_owns_reservation_true_on_200(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_device_health_synthetic_unknown(db):
+async def test_get_device_health_synthetic_unknown(db, monkeypatch):
     device_id = uuid.uuid4()
-    resp = await health_router.get_device_health(device_id, db, {"role": "user"})
+    monkeypatch.setattr(
+        health_router.device_visibility,
+        "fetch_visible_device_ids",
+        AsyncMock(return_value={device_id}),
+    )
+    resp = await health_router.get_device_health(device_id, db, {"role": "user"}, "Bearer t")
     assert resp.last_status == "UNKNOWN"
     assert resp.device_id == device_id
     assert resp.last_polled_at is None
@@ -414,11 +424,16 @@ async def test_get_device_health_synthetic_unknown(db):
 
 
 @pytest.mark.asyncio
-async def test_get_device_health_returns_persisted(db):
+async def test_get_device_health_returns_persisted(db, monkeypatch):
     device_id = uuid.uuid4()
     db.add(DeviceHealthStatus(device_id=device_id, last_status="DEGRADED", consecutive_failures=2))
     await db.commit()
-    resp = await health_router.get_device_health(device_id, db, {"role": "user"})
+    monkeypatch.setattr(
+        health_router.device_visibility,
+        "fetch_visible_device_ids",
+        AsyncMock(return_value={device_id}),
+    )
+    resp = await health_router.get_device_health(device_id, db, {"role": "user"}, "Bearer t")
     assert resp.last_status == "DEGRADED"
     assert resp.consecutive_failures == 2
 

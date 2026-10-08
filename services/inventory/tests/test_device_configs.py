@@ -435,6 +435,7 @@ async def test_apply_calls_execution_with_method_kwargs(client):
     assert body["run_id"] == "11111111-1111-1111-1111-111111111111"
     assert captured["body"]["action"] == "configure"
     assert captured["body"]["method_kwargs"] == {"vlan": 555, "ip": "10.0.0.5"}
+    assert captured["body"]["config_version_id"] == vid
     assert captured["body"]["device_id"] == device_id
 
 

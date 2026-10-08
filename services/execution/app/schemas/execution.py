@@ -67,3 +67,7 @@ class ManualExecuteRequest(BaseModel):
     port_b: str | None = None
     method_kwargs: dict | None = None
     dry_run: bool = False
+    # The config version `method_kwargs` came from, when there is one (inventory's
+    # apply paths send it). The run stores its arguments masked, so a retry reads
+    # the configuration back from this version (retry_run, CFG-RUN-7).
+    config_version_id: uuid.UUID | None = None

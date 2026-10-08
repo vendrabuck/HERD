@@ -48,7 +48,7 @@ beyond role (secret grants, own-row preferences) are numbered in section 8.
 |---|---|---|
 | Unauthenticated caller | Read `/health` and `/version` on every service; read the config service's status and field schema; log in to the config service with its password | Anything else |
 | Config operator (config-page password, not a HERD account) | Read the merged settings (secret values masked), change the config password, save settings and restart this compose project's services once the password is rotated (OPS-CONFIG-9) | Save or restart before rotating a generated password; restart services of another compose project (OPS-CONFIG-13) |
-| User | Read any device's health snapshot (OPS-HEALTH-1); read, replace, merge, and reset their own preferences; list and read the secrets they hold a `view` or `manage` grant on, and reveal those they hold `manage` on | List all health snapshots; read reports; create, edit, delete, or rotate secrets; read another user's preferences |
+| User | Read the health snapshot of a device they can see (OPS-HEALTH-1); read, replace, merge, and reset their own preferences; list and read the secrets they hold a `view` or `manage` grant on, and reveal those they hold `manage` on | List all health snapshots; read reports; create, edit, delete, or rotate secrets; read another user's preferences |
 | Admin | Everything a user may; list health snapshots; read the utilization report and its CSV; create, list, read, reveal, edit, and delete every secret; rotate the data-encryption key; open the About page | Delete a secret a hypervisor references (OPS-SECRET-13) |
 | Superadmin | Same as admin | Same as admin |
 | Another service (internal token) | Read a secret's plaintext by id or name; read a user's preferences; run an on-demand device check (section 7) | Anything through the user-facing routes |
@@ -118,7 +118,7 @@ while it is still due, so concurrent schedulers and replicas poll disjoint rows
 |---|---|---|---|---|
 | GET | `/health` (every service) | anyone | 200 | OPS-LIVE-1, OPS-LIVE-2 |
 | GET | `/version` (every service) | anyone | 200 | OPS-VER-1 to OPS-VER-6 |
-| GET | `/device-health/{device_id}` (execution) | any signed-in user | 200 | OPS-HEALTH-1, OPS-HEALTH-2 |
+| GET | `/device-health/{device_id}` (execution) | any signed-in user (non-admins: devices they can see) | 200 | OPS-HEALTH-1, OPS-HEALTH-2 |
 | GET | `/device-health` (execution) | admin | 200 | OPS-HEALTH-3, OPS-HEALTH-4 |
 | GET | `/status` (config) | anyone | 200 | OPS-CONFIG-4 |
 | POST | `/login` (config) | anyone with the config password, within the attempt limits | 200 | OPS-CONFIG-6, OPS-CONFIG-7, OPS-CONFIG-22 |
@@ -945,10 +945,17 @@ check one device now, through the same login, status, and logout sequence a poll
 
 **Rules.**
 
-- **OPS-HEALTH-1.** `GET /device-health/{device_id}` answers any signed-in user with the
-  stored snapshot for the device id given. \
-  Enforced in: `services/execution/app/routers/health.py` (`get_device_health`) \
-  Pinned by: `services/execution/tests/test_health_endpoints.py` (`test_get_health_returns_persisted_row`, `test_get_health_available_to_non_admin`)
+- **OPS-HEALTH-1.** `GET /device-health/{device_id}` answers an admin with the stored
+  snapshot for any device id. A non-admin gets the stored snapshot only for a device
+  inside their device-group visibility, asked once of inventory
+  `GET /device-groups/visible-devices` with the caller's own token and 10 seconds through
+  execution's one visibility helper; any other device answers byte for byte as an id
+  with no snapshot (OPS-HEALTH-2), so the answer does not tell a hidden polled device
+  from an unknown id. No token, a transport error, a non-200, a body that is not JSON,
+  or a body that is not `{"device_ids": [<str>, ...]}` is 503
+  `Could not verify device visibility; nothing was returned. Retry the request.` \
+  Enforced in: `services/execution/app/routers/health.py` (`get_device_health`); `services/execution/app/services/device_visibility.py` (`resolve_caller_visibility`, `fetch_visible_device_ids`) \
+  Pinned by: `services/execution/tests/test_health_endpoints.py` (`test_get_health_returns_persisted_row`, `test_get_health_available_to_non_admin`, `test_hidden_polled_device_health_answers_exactly_like_an_unknown_device`, `test_get_health_visible_set_empty_hides_every_snapshot`, `test_get_health_fails_closed_when_visibility_unanswerable`, `test_get_health_non_admin_without_token_fails_closed`, `test_get_health_admin_sees_every_row_without_a_lookup`); `tests/integration/test_execution_device_scope.py` (`test_health_read_of_a_visible_device_answers_under_its_id`, `test_health_read_of_a_hidden_device_answers_like_an_unknown_id`)
 - **OPS-HEALTH-2.** A device with no snapshot answers 200 with a synthesized `UNKNOWN`
   record (no poll time, zero failures), never 404. \
   Enforced in: `services/execution/app/routers/health.py` (`get_device_health`) \
@@ -1341,6 +1348,7 @@ CLI documentation guard (OPS-NATS-14).
 | 500 | `Internal API token not configured` | a device check while execution has no internal token | OPS-HEALTH-6 |
 | 403 | `Invalid internal token` | a device check without the right token | OPS-HEALTH-6 |
 | 404 | `Device <id> not found`, `Template <id> not found` | a device check on a device or template inventory does not know | OPS-HEALTH-7 |
+| 503 | `Could not verify device visibility; nothing was returned. Retry the request.` | a non-admin health read whose visibility lookup cannot be answered | OPS-HEALTH-1 |
 | 503 | `Failed to fetch device: <reason>`, `Failed to fetch template: <reason>` (HERD-authored reason: an upstream status, `unreachable (<ClassName>)`, a malformed body, or a class name) | a device check when inventory cannot answer, or answers a body that is not a JSON object | OPS-HEALTH-7 |
 | 409 | `{"error": "device_has_no_driver", "message"}` | a device check on a device with no driver | OPS-HEALTH-7 |
 | 422 | validation list | a secret body outside the schema, an empty `data` | OPS-SECRET-1 |
@@ -1379,6 +1387,7 @@ Startup refusals (no HTTP answer; the container exits or waits):
 | Out (execution) | inventory | device and template reads per poll | what to poll and with which driver | The poll records `UNREACHABLE` (OPS-POLL-7) |
 | Out (execution) | the device's driver | `login`, `status`, `logout` in the sandbox | health check | Recorded as the poll's status (OPS-POLL-7) |
 | Out (execution, device check) | inventory | device and template reads (internal token, 10 s) | the device check | Fail closed: 404 or 503 (OPS-HEALTH-7) |
+| Out (execution, health read) | inventory | `GET /device-groups/visible-devices` with the caller's token (10 s) | a non-admin's single-device health read | Fail closed: 503 (OPS-HEALTH-1) |
 | Out (execution, device check) | the device's driver | `login`, then `status` and `logout` in the sandbox | the device check | Answered 200 with the failed run's status and error (OPS-HEALTH-8, OPS-HEALTH-9) |
 | Out (secrets) | acl | `GET /resources` with the caller's token (5 s); the shared grant check | which secrets a user may see or reveal | Fail closed: nothing listed, 404 or 403 (OPS-SECRET-5) |
 | Out (secrets) | inventory | `GET /hypervisors/by-secret/{id}/internal` (internal token, 5 s) | delete guard | Fail closed: 503, a malformed 200 included (OPS-SECRET-14) |

@@ -8,6 +8,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from herd_common.acl import user_has_grant
 from herd_common.auth import make_auth_dependencies
+from herd_common.config_redaction import redact_config
 from herd_common.internal_auth import internal_token_matches
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -25,6 +26,7 @@ from app.schemas.execution import (
     ManualExecuteRequest,
     PaginatedExecutionRunResponse,
 )
+from app.services import device_visibility
 from app.services.driver_loader import (
     DriverPackageError,
     get_driver_config_schema,
@@ -53,6 +55,10 @@ from app.services.wiring_retry_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Pinned: the by-id run reads answer an unknown run and a run on a device the
+# caller may not see with this same detail.
+RUN_NOT_FOUND_DETAIL = "Execution run not found"
 
 get_current_user_payload, require_admin = make_auth_dependencies(
     secret_key=settings.secret_key,
@@ -93,11 +99,12 @@ async def _user_has_acl_manage(
 
 
 async def _user_owns_reservation(reservation_id: uuid.UUID, authorization: str | None) -> bool:
-    """Ask the reservations service whether the caller can read this reservation.
+    """Ask the reservations service whether the caller owns this reservation.
 
-    The reservations service returns 200 to owners and admins, 404 to everyone
-    else (non-owners and non-existent IDs share the 404 to avoid leaking
-    existence). Returns False on any failure, mirroring `_user_has_acl_manage`.
+    The reservations service's `GET /{id}` answers 200 only for the caller's own
+    reservation (admins included) and 404 for everything else, so non-owners and
+    non-existent IDs share the 404. Returns False on any failure, mirroring
+    `_user_has_acl_manage`.
     """
     if not authorization:
         return False
@@ -110,23 +117,112 @@ async def _user_owns_reservation(reservation_id: uuid.UUID, authorization: str |
     return resp.status_code == 200
 
 
+# Pinned: tests match on these exact strings (CFG-EXEC-3, issue #1112). The style
+# follows inventory's RESERVATION_MISMATCH_ERROR.
+EXECUTE_RESERVATION_MISMATCH_DETAIL = (
+    "reservation_id must reference a reservation you own that includes this device"
+)
+EXECUTE_RESERVATION_MISMATCH_ADMIN_DETAIL = (
+    "reservation_id must reference a reservation that includes this device"
+)
+EXECUTE_RESERVATION_UNAVAILABLE_DETAIL = (
+    "Could not verify the reservation; nothing was run. Retry the request."
+)
+
+
+async def _assert_execute_reservation(
+    reservation_id: uuid.UUID, device_id: uuid.UUID, payload: dict
+) -> None:
+    """Check a manual execute's `reservation_id` before anything runs (issue #1112).
+
+    The run row is tagged with this id, so it must name a reservation that exists
+    and holds the device, and, for a non-admin, one the caller owns (admins are
+    exempt from ownership, not from existence or the device). One read answers
+    all three: reservations' `GET /internal/by-device/{device_id}` (internal
+    token) lists every reservation, of any status and any owner, whose device set
+    holds the device, with its owner. The caller-token `GET /{id}` route cannot
+    serve here because it answers only the caller's own reservations, admins
+    included, so it cannot confirm an admin's id for another user's reservation.
+    The answer is only compared, never returned.
+
+    A reservation that is not listed, or a non-admin's reservation owned by
+    someone else, is 422 with one detail per caller kind (a non-admin cannot tell
+    the two apart). The check fails closed: no internal token, a transport error,
+    a non-200, a body that is not JSON, or a body that is not a list of objects
+    with string `id` and `user_id` is 503.
+    """
+    is_admin = payload.get("role") in ("admin", "superadmin")
+    mismatch = (
+        EXECUTE_RESERVATION_MISMATCH_ADMIN_DETAIL
+        if is_admin
+        else EXECUTE_RESERVATION_MISMATCH_DETAIL
+    )
+    if not settings.internal_api_token:
+        raise HTTPException(status_code=503, detail=EXECUTE_RESERVATION_UNAVAILABLE_DETAIL)
+    url = f"{settings.reservations_service_url.rstrip('/')}/internal/by-device/{device_id}"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url, headers={"X-Internal-Token": settings.internal_api_token})
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "Reservation check for execute on device %s failed (%s)",
+            device_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503, detail=EXECUTE_RESERVATION_UNAVAILABLE_DETAIL
+        ) from None
+    if resp.status_code != 200:
+        logger.warning(
+            "Reservation check for execute on device %s answered %s", device_id, resp.status_code
+        )
+        raise HTTPException(status_code=503, detail=EXECUTE_RESERVATION_UNAVAILABLE_DETAIL)
+    try:
+        rows = resp.json()
+    except ValueError:
+        rows = None
+    if not isinstance(rows, list) or not all(
+        isinstance(row, dict)
+        and isinstance(row.get("id"), str)
+        and isinstance(row.get("user_id"), str)
+        for row in rows
+    ):
+        logger.warning("Reservation check for execute on device %s: misshapen body", device_id)
+        raise HTTPException(status_code=503, detail=EXECUTE_RESERVATION_UNAVAILABLE_DETAIL)
+    for row in rows:
+        try:
+            if uuid.UUID(row["id"]) != reservation_id:
+                continue
+        except ValueError:
+            continue
+        if is_admin or row["user_id"] == str(payload.get("sub")):
+            return
+        break
+    raise HTTPException(status_code=422, detail=mismatch)
+
+
 async def _authorize_runs_list(
     reservation_id: uuid.UUID | None = Query(None),
     payload: dict = Depends(get_current_user_payload),
     authorization: str | None = Header(None),
-) -> dict:
-    """Authorize GET /runs. Admins always pass; non-admins must supply a
-    reservation_id they own. Without a reservation_id, non-admins are rejected
-    (the unscoped listing remains admin-only).
+) -> set[uuid.UUID] | None:
+    """Authorize GET /runs and resolve the caller's device visibility.
+
+    Admins always pass and get None (no device filter). A non-admin must supply
+    a reservation_id they own (the unscoped listing remains admin-only); that
+    ownership check is the first gate. The caller's device-group visibility is
+    then resolved once (`resolve_caller_visibility`, 503 when it cannot be
+    answered), and the returned set limits the list to runs on devices the
+    caller may see.
     """
     role = payload.get("role")
     if role in ("admin", "superadmin"):
-        return payload
+        return None
     if reservation_id is None:
         raise HTTPException(status_code=403, detail="Admin access required")
     if not await _user_owns_reservation(reservation_id, authorization):
         raise HTTPException(status_code=403, detail="Reservation not owned by caller")
-    return payload
+    return await device_visibility.resolve_caller_visibility(payload, authorization)
 
 
 async def _authorize_run_read(
@@ -134,11 +230,14 @@ async def _authorize_run_read(
     payload: dict,
     authorization: str | None,
 ) -> None:
-    """Admin always passes; non-admins pass iff the run is tied to a reservation they own.
+    """Admin always passes; a non-admin passes iff they own the run's reservation
+    and may see the run's device.
 
-    Same shape as the iter-2 carve-out on GET /runs: reservation-owner reads
-    are allowed when scoped to a reservation they hold. Runs with no
-    reservation_id (e.g. ad-hoc device checks) remain admin-only.
+    Same shape as GET /runs: reservation-owner reads are allowed when scoped to a
+    reservation they hold. Runs with no reservation_id (e.g. ad-hoc device
+    checks) remain admin-only. A run on a device outside the caller's
+    device-group visibility answers exactly as an unknown run id does (404
+    `RUN_NOT_FOUND_DETAIL`), and an unanswerable visibility lookup is 503.
     """
     role = payload.get("role")
     if role in ("admin", "superadmin"):
@@ -147,6 +246,9 @@ async def _authorize_run_read(
         raise HTTPException(status_code=403, detail="Admin access required")
     if not await _user_owns_reservation(run.reservation_id, authorization):
         raise HTTPException(status_code=403, detail="Reservation not owned by caller")
+    visible = await device_visibility.resolve_caller_visibility(payload, authorization)
+    if visible is not None and run.device_id not in visible:
+        raise HTTPException(status_code=404, detail=RUN_NOT_FOUND_DETAIL)
 
 
 # --- API Endpoints ---
@@ -161,10 +263,14 @@ async def list_runs(
     created_before: datetime | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
-    _: dict = Depends(_authorize_runs_list),
+    visible_device_ids: set[uuid.UUID] | None = Depends(_authorize_runs_list),
     db: AsyncSession = Depends(get_db),
 ):
-    """List execution runs. Admin (any filter) or reservation owner (with reservation_id)."""
+    """List execution runs. Admin (any filter) or reservation owner (with reservation_id).
+
+    A non-admin's list holds only runs on devices they may see; the filter is in
+    the query, so `total` and paging count only those runs.
+    """
     items, total = await list_execution_runs(
         db,
         device_id=device_id,
@@ -174,6 +280,7 @@ async def list_runs(
         created_before=created_before,
         skip=skip,
         limit=limit,
+        visible_device_ids=visible_device_ids,
     )
     return PaginatedExecutionRunResponse(items=items, total=total, skip=skip, limit=limit)
 
@@ -201,13 +308,14 @@ async def list_run_commands(
     """List the per-command transcript for an execution run.
 
     Admin always. Non-admin reservation owners may read transcripts for runs
-    tied to a reservation they hold (matches the iter-2 carve-out on GET /runs).
+    tied to a reservation they hold, on a device they may see (the same rule as
+    GET /runs; a hidden run answers as an unknown one, see _authorize_run_read).
     Returns an empty list for runs whose driver did not opt into command
     logging; the absence of rows is a property of the driver, not an error.
     """
     run = await get_execution_run(db, run_id)
     if not run:
-        raise HTTPException(status_code=404, detail="Execution run not found")
+        raise HTTPException(status_code=404, detail=RUN_NOT_FOUND_DETAIL)
     await _authorize_run_read(run, payload, authorization)
     return await list_command_log(db, run_id)
 
@@ -303,7 +411,10 @@ async def manual_execute(
       - action == "configure", AND
       - the caller has an ACL `manage` grant on this device.
 
-    All other non-admin calls are rejected 403.
+    All other non-admin calls are rejected 403. A `reservation_id`, when given,
+    must name a reservation that holds the device and, for a non-admin, that the
+    caller owns (`_assert_execute_reservation`); it is checked before any device
+    read, run row, or driver call.
     """
     role = payload.get("role", "user")
     if role not in ("admin", "superadmin"):
@@ -315,6 +426,9 @@ async def manual_execute(
                 status_code=403,
                 detail="Admin access or device manage grant required",
             )
+
+    if body.reservation_id is not None:
+        await _assert_execute_reservation(body.reservation_id, body.device_id, payload)
 
     device_data = await fetch_device(body.device_id)
     template_data = await fetch_template(device_data["template_id"])
@@ -336,6 +450,7 @@ async def manual_execute(
         port_b=body.port_b,
         method_kwargs=body.method_kwargs,
         dry_run=body.dry_run,
+        config_version_id=body.config_version_id,
     )
     return run
 
@@ -379,7 +494,74 @@ async def internal_execute(
         port_b=body.port_b,
         method_kwargs=body.method_kwargs,
         dry_run=body.dry_run,
+        config_version_id=body.config_version_id,
     )
+
+
+# Pinned: tests match on these exact strings (CFG-RUN-7).
+RETRY_NO_CONFIG_SOURCE_DETAIL = (
+    "This run stores its configuration masked and names no config version to read it "
+    "back from, so it cannot be retried; start a new run instead"
+)
+RETRY_CONFIG_NOT_RECOVERED_DETAIL = (
+    "The configuration this run pushed could not be read back from its config version, "
+    "so it cannot be retried; start a new run instead"
+)
+RETRY_CONFIG_UNAVAILABLE_DETAIL = (
+    "Could not read the run's config version; nothing was retried. Retry the request."
+)
+
+
+async def _recover_masked_kwargs(run: ExecutionRun, authorization: str | None) -> dict:
+    """Read back the full arguments of a run whose stored copy is masked.
+
+    The run's `config_version_id` names where the configuration lives; it is read
+    from inventory's config-version detail route with the retrying admin's own
+    token, under the run's device, so a version of another device is not found.
+    The version's configuration is accepted only when masking it gives exactly the
+    stored copy, so a version that does not match what the run pushed is never
+    retried in its place. No reference, an unknown version, or a mismatch is 409;
+    an answer that cannot be read (transport error, a non-200 other than 404, a
+    body without a JSON object `config`) is 503.
+    """
+    raw_version_id = (run.input_params or {}).get("config_version_id")
+    try:
+        version_id = uuid.UUID(str(raw_version_id)) if raw_version_id else None
+    except ValueError:
+        version_id = None
+    if version_id is None:
+        raise HTTPException(status_code=409, detail=RETRY_NO_CONFIG_SOURCE_DETAIL)
+    if not authorization:
+        raise HTTPException(status_code=503, detail=RETRY_CONFIG_UNAVAILABLE_DETAIL)
+    url = (
+        f"{settings.inventory_service_url.rstrip('/')}/devices/{run.device_id}"
+        f"/config-versions/{version_id}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, headers={"Authorization": authorization})
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "Config version read for retry of run %s failed (%s)", run.id, type(exc).__name__
+        )
+        raise HTTPException(status_code=503, detail=RETRY_CONFIG_UNAVAILABLE_DETAIL) from None
+    if resp.status_code == 404:
+        raise HTTPException(status_code=409, detail=RETRY_CONFIG_NOT_RECOVERED_DETAIL)
+    if resp.status_code != 200:
+        logger.warning(
+            "Config version read for retry of run %s answered %s", run.id, resp.status_code
+        )
+        raise HTTPException(status_code=503, detail=RETRY_CONFIG_UNAVAILABLE_DETAIL)
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    config = body.get("config") if isinstance(body, dict) else None
+    if not isinstance(config, dict):
+        raise HTTPException(status_code=503, detail=RETRY_CONFIG_UNAVAILABLE_DETAIL)
+    if redact_config(config)[0] != (run.input_params or {}).get("method_kwargs"):
+        raise HTTPException(status_code=409, detail=RETRY_CONFIG_NOT_RECOVERED_DETAIL)
+    return config
 
 
 @router.post("/runs/{run_id}/retry", response_model=ExecutionRunResponse)
@@ -387,18 +569,20 @@ async def retry_run(
     run_id: uuid.UUID,
     _: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(None),
 ):
     """Retry a failed execution run. Admin only."""
     original = await get_execution_run(db, run_id)
     if not original:
-        raise HTTPException(status_code=404, detail="Execution run not found")
+        raise HTTPException(status_code=404, detail=RUN_NOT_FOUND_DETAIL)
     if original.status not in ("FAILED", "TIMEOUT"):
         raise HTTPException(status_code=400, detail="Only failed or timed-out runs can be retried")
+    input_params = original.input_params or {}
     # A retry repeats what the original run was, dry run included (issue #1091):
     # retrying a failed dry run for real would push a configuration nobody asked
     # to apply. A row without the record predates it, so its mode is unknown and
     # the retry is refused rather than guessed (fail closed).
-    recorded_dry_run = (original.input_params or {}).get("dry_run")
+    recorded_dry_run = input_params.get("dry_run")
     if not isinstance(recorded_dry_run, bool):
         raise HTTPException(
             status_code=409,
@@ -408,11 +592,21 @@ async def retry_run(
             ),
         )
 
+    # Recover method_kwargs. A row whose stored copy is masked is read back from
+    # its config version (CFG-RUN-7); any other row stored its arguments as sent
+    # (nothing needed masking, or the row predates masking).
+    if input_params.get("method_kwargs_redacted") is True:
+        original_kwargs = await _recover_masked_kwargs(original, authorization)
+    else:
+        original_kwargs = input_params.get("method_kwargs")
+    raw_version_id = input_params.get("config_version_id")
+    try:
+        config_version_id = uuid.UUID(str(raw_version_id)) if raw_version_id else None
+    except ValueError:
+        config_version_id = None
+
     device_data = await fetch_device(original.device_id)
     template_data = await fetch_template(device_data["template_id"])
-
-    # Recover method_kwargs from the original run's input_params
-    original_kwargs = (original.input_params or {}).get("method_kwargs")
 
     run = await run_driver_action(
         db,
@@ -425,6 +619,7 @@ async def retry_run(
         port_b=original.port_b,
         method_kwargs=original_kwargs,
         dry_run=recorded_dry_run,
+        config_version_id=config_version_id,
     )
     return run
 

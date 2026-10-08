@@ -467,6 +467,9 @@ async def apply_config_version(
         "action": "configure",
         "user_id": payload["sub"],
         "method_kwargs": version.config,
+        # The version the configuration came from: execution stores the run's
+        # arguments masked and reads them back from this version on a retry.
+        "config_version_id": str(version.id),
     }
     headers = {"Authorization": authorization} if authorization else {}
 
