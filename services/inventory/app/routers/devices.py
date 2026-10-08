@@ -22,6 +22,11 @@ from app.schemas.device import (
 )
 from app.services.device_delete_guard import assert_device_deletable
 from app.services.device_visibility import _resolve_visible_device_ids
+from app.services.field_redaction import (
+    REDACTED_VALUE,
+    password_field_keys,
+    redact_field_data,
+)
 from app.services.inventory_service import (
     create_device,
     create_dynamic_instance_device,
@@ -40,44 +45,11 @@ router = APIRouter(tags=["devices"])
 
 _FAULT_STATUS_SENTINEL = "__herd_fault_status__"
 
-# Sentinel written over password-typed field values on non-admin reads. Matches
-# the config service's secret masking so the frontend renders a stable, obviously
-# redacted value. The key is retained (only its value is replaced) so the response
-# shape is unchanged for the UI.
-_REDACTED_VALUE = "********"
-
-
-def _password_field_keys(template: DeviceTemplate | None) -> set[str]:
-    """Bare field_data keys whose template field is type "password".
-
-    Mirrors the execution service's extract_password_keys, but over the bare keys
-    used in a device's field_data (execution prefixes them with HERD_ for the run
-    context env; inventory stores them unprefixed). Defensive against malformed
-    sections so a bad template never breaks a read.
-    """
-    if template is None or not template.sections:
-        return set()
-    keys: set[str] = set()
-    for section in template.sections:
-        if not isinstance(section, dict):
-            continue
-        for field in section.get("fields", []):
-            if isinstance(field, dict) and field.get("type") == "password":
-                key = field.get("key")
-                if key:
-                    keys.add(key)
-    return keys
-
-
-def _redact_field_data(field_data: dict, password_keys: set[str]) -> dict:
-    """Replace truthy password-typed values with the redaction sentinel.
-
-    Empty/None values are left untouched so a redacted response never implies a
-    secret exists where none was set.
-    """
-    if not password_keys:
-        return field_data
-    return {k: (_REDACTED_VALUE if k in password_keys and v else v) for k, v in field_data.items()}
+# The masking rule lives once in app.services.field_redaction; these names are
+# kept so the call sites in this module and any older importer stay valid.
+_REDACTED_VALUE = REDACTED_VALUE
+_password_field_keys = password_field_keys
+_redact_field_data = redact_field_data
 
 
 def _fault_injection_enabled() -> bool:

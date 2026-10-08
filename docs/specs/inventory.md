@@ -144,8 +144,8 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 | GET | `/ports/{id}` | any signed-in user (non-admins: ports of visible devices only) | 200 | INV-AUTH-1, INV-PORT-2, INV-RED-1 |
 | PUT | `/ports/{id}` | admin | 200 | INV-AUTH-2, INV-PORT-7, INV-PORT-10 |
 | DELETE | `/ports/{id}` | admin | 204 | INV-AUTH-2, INV-PORT-8 |
-| GET | `/templates` | any signed-in user | 200 | INV-AUTH-1, INV-TPL-1, INV-TPL-25 |
-| GET | `/templates/{id}` | any signed-in user | 200 | INV-AUTH-1, INV-TPL-1, INV-TPL-20, INV-TPL-25 |
+| GET | `/templates` | any signed-in user | 200 | INV-AUTH-1, INV-TPL-1, INV-TPL-20, INV-TPL-25, INV-RED-5 |
+| GET | `/templates/{id}` | any signed-in user | 200 | INV-AUTH-1, INV-TPL-1, INV-TPL-20, INV-TPL-25, INV-RED-5 |
 | POST | `/templates` | admin | 201 | INV-AUTH-2, INV-TPL-2 to INV-TPL-14, INV-POLL-1 |
 | PUT | `/templates/{id}` | admin | 200 | INV-AUTH-2, INV-TPL-15 to INV-TPL-18, INV-TPL-24, INV-POLL-1 |
 | DELETE | `/templates/{id}` | admin | 204 | INV-AUTH-2, INV-TPL-19 |
@@ -205,7 +205,7 @@ Every route here requires `X-Internal-Token` (INV-INT-1).
 | GET | `/devices/health-config` | `X-Internal-Token` | execution (health scheduler) | list of `{device_id, resolved_interval_seconds}` | INV-INT-1, INV-POLL-3 |
 | POST | `/devices/internal` | `X-Internal-Token` | execution (dynamic provisioning) | the created or existing device | INV-INT-1, INV-DYN-1 to INV-DYN-6, INV-DYN-9, INV-STATUS-3 |
 | DELETE | `/devices/{id}/internal` | `X-Internal-Token` | execution (dynamic teardown) | 204 | INV-INT-1, INV-DYN-7, INV-DYN-8 |
-| GET | `/templates/{id}/internal` | `X-Internal-Token` | execution, ai-orchestrator | the template | INV-INT-1, INV-TPL-20 |
+| GET | `/templates/{id}/internal` | `X-Internal-Token` | execution, ai-orchestrator | the template, password-field defaults in clear | INV-INT-1, INV-TPL-20, INV-RED-5 |
 | GET | `/drivers/{id}/internal-download` | `X-Internal-Token` | execution (driver loader) | the archive bytes | INV-INT-1, INV-DRV-2 |
 | GET | `/hypervisors/{id}/internal` | `X-Internal-Token` | execution (dynamic provisioning) | `{id, name, endpoint, hypervisor_type, secret_id, enabled}` | INV-INT-1, INV-HYP-8 |
 | GET | `/hypervisors/by-secret/{secret_id}/internal` | `X-Internal-Token` | secrets (delete guard) | list of `{id, name}` | INV-INT-1, INV-HYP-9 |
@@ -335,10 +335,12 @@ Copy, delete) and `frontend/src/pages/TemplateEditorPage.tsx` (view and edit); r
   `Cannot delete template: ports still reference it`. \
   Enforced in: `services/inventory/app/services/template_service.py` (`delete_template`) \
   Pinned by: `services/inventory/tests/test_devices.py` (`test_delete_template_blocked_by_devices`); `services/inventory/tests/test_ports.py` (`test_delete_port_template_blocked_by_ports`)
-- **INV-TPL-20.** A template read returns its sections as stored, plus the driver's
-  name, SHA256, filename, and connection type (null for a template without a driver). \
+- **INV-TPL-20.** A template read returns the driver's name, SHA256, filename, and
+  connection type (null for a template without a driver), and returns its sections as
+  stored for admin and internal callers; a non-admin read masks password-field defaults
+  (INV-RED-5). \
   Enforced in: `services/inventory/app/routers/templates.py` (`_template_to_response`) \
-  Pinned by: `services/inventory/tests/test_templates_internal.py` (`test_internal_template_exposes_driver_sha256_and_filename`, `test_internal_template_null_driver_fields_for_port_template`)
+  Pinned by: `services/inventory/tests/test_templates_internal.py` (`test_internal_template_exposes_driver_sha256_and_filename`, `test_internal_template_null_driver_fields_for_port_template`); `services/inventory/tests/test_template_default_redaction.py` (`test_admin_template_reads_return_password_defaults_in_clear`, `test_internal_template_read_returns_password_defaults_in_clear`)
 - **INV-TPL-21.** The templates page's Copy creates `Copy of <name>` carrying the
   type, driver, hypervisor, exclusive flag, icon, description, identity, poll interval,
   and sections, and shows the server's detail when the create is refused. \
@@ -500,11 +502,12 @@ dynamic-instance create.
 ### 8.5 Device visibility and password redaction
 
 **What it does.** A non-admin user sees only the devices in device groups granted to one
-of their user groups, and never sees the value of a password field. Admins see
-everything.
+of their user groups, and never sees the value of a password field, neither on a device
+or port nor as a template field's default. Admins see everything.
 
 **Surfaces.** `GET /devices`, `POST /devices/batch`, `GET /devices/{id}`, the port
-reads, `GET /device-groups/device/{id}`, `GET /device-groups/visible-devices`. Other
+reads, `GET /device-groups/device/{id}`, `GET /device-groups/visible-devices`,
+`GET /templates`, `GET /templates/{id}`. Other
 areas call `check_device_read_visibility` for their own device-scoped reads
 (`device-configuration.md`).
 
@@ -563,11 +566,11 @@ areas call `check_device_read_visibility` for their own device-scoped reads
 - **INV-RED-1.** Every non-admin device and port read (list, batch, single device, port
   list, single port) replaces the value of each field the template declares as a
   `password` field with `********`, keeping the key. \
-  Enforced in: `services/inventory/app/routers/devices.py` (`_password_field_keys`, `_redact_field_data`); `services/inventory/app/routers/ports.py` (`_port_to_response`) \
+  Enforced in: `services/inventory/app/services/field_redaction.py` (`password_field_keys`, `redact_field_data`); `services/inventory/app/routers/devices.py` (`_device_to_response`); `services/inventory/app/routers/ports.py` (`_port_to_response`) \
   Pinned by: `services/inventory/tests/test_devices.py` (`test_non_admin_get_device_masks_password_fields`, `test_non_admin_list_devices_masks_password_fields`, `test_batch_non_admin_gets_only_visible_with_passwords_redacted`); `services/inventory/tests/test_ports.py` (`test_port_password_field_redacted_for_non_admin`)
 - **INV-RED-2.** An empty or null password value is left as it is, so a masked value
   always means a secret is set. \
-  Enforced in: `services/inventory/app/routers/devices.py` (`_redact_field_data`) \
+  Enforced in: `services/inventory/app/services/field_redaction.py` (`redact_field_data`) \
   Pinned by: `services/inventory/tests/test_devices.py` (`test_non_admin_empty_password_value_not_falsely_masked`)
 - **INV-RED-3.** Admin reads and the internal device read return password values in
   clear. \
@@ -575,8 +578,18 @@ areas call `check_device_read_visibility` for their own device-scoped reads
   Pinned by: `services/inventory/tests/test_devices.py` (`test_admin_get_device_returns_password_fields_unmasked`, `test_internal_get_device_returns_password_fields_unmasked`, `test_batch_admin_passwords_not_redacted`)
 - **INV-RED-4.** Redaction reads the device's current template: a value stored under a
   key the template does not declare as `password` is returned as stored. \
-  Enforced in: `services/inventory/app/routers/devices.py` (`_password_field_keys`) \
+  Enforced in: `services/inventory/app/services/field_redaction.py` (`password_field_keys`) \
   Pinned by: none
+- **INV-RED-5.** A non-admin template read (`GET /templates`, `GET /templates/{id}`)
+  replaces the `default` of every `password` field with `********` when it is a
+  non-empty string, because a device created without a value for the field stores that
+  default (INV-FIELD-2). An empty or null default and every non-password field are
+  returned as stored, the sections are a copy (the stored template is never changed),
+  and a payload with no role counts as a user. Admin, superadmin, create, update, and
+  internal template reads return the default in clear; the template export is
+  admin-only. \
+  Enforced in: `services/inventory/app/services/field_redaction.py` (`redact_template_sections`); `services/inventory/app/routers/templates.py` (`_template_to_response`, `get_templates`, `get_template_by_id`) \
+  Pinned by: `services/inventory/tests/test_template_default_redaction.py` (`test_non_admin_get_template_masks_password_defaults`, `test_non_admin_list_templates_masks_password_defaults`, `test_template_read_without_a_role_claim_is_masked`, `test_admin_template_reads_return_password_defaults_in_clear`, `test_internal_template_read_returns_password_defaults_in_clear`, `test_non_admin_read_does_not_rewrite_the_stored_default`, `test_redact_template_sections_never_mutates_its_input`, `test_redact_template_sections_masks_only_non_empty_password_defaults`)
 
 **Out of scope.** Cabling's and reservations' use of visibility (`topology.md`,
 `reservations.md`); granting user groups to device groups is section 8.9.

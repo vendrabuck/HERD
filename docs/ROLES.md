@@ -694,8 +694,11 @@ dynamic template is left out of the list (and its `total`) and answers
 `GET /templates/{id}` with the same 404 `Template not found` as an unknown id, so a
 reservation naming it is refused as not found too. A hypervisor with no device group
 makes its templates admin-only. When auth cannot answer the group lookup the read fails
-closed with 503. Creating, updating, and deleting templates requires admin or
-superadmin role.
+closed with 503. A non-admin read of `GET /templates` or `GET /templates/{id}` returns
+`********` in place of a `password` field's non-empty `default`, the same masking a
+non-admin device or port read applies to password values; admin, superadmin, and the
+internal `GET /templates/{id}/internal` read return the default in clear. Creating,
+updating, and deleting templates requires admin or superadmin role.
 
 ### List templates
 
