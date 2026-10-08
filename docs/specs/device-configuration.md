@@ -58,7 +58,7 @@ reservation ownership) are numbered rules in section 8.
 | Concept | Meaning | Owner | Stored in |
 |---|---|---|---|
 | Config version | One numbered snapshot of a device's configuration: the config object, the connection type it was validated against, a free-text description, the author, an optional `restored_from_id`, and the id of the last run that applied it | inventory | `device_config_versions` (`DeviceConfigVersion` in `services/inventory/app/models/device_config_version.py`); `last_apply_run_id` is a bare execution id, no foreign key |
-| Current config pointer | `devices.current_config_version_id`, the version an immediate apply last applied with success | inventory | `devices` |
+| Current config pointer | `devices.current_config_version_id`, the version a successful apply last pushed for real, immediate or scheduled (a dry run never moves it); no route returns it | inventory | `devices` |
 | Config schema registry | HERD's own JSON Schema for the `configure` input of three connection types | common | `CONFIG_SCHEMAS` in `services/common/herd_common/device_config.py` |
 | Published config schema | A schema a driver returns from its `config_schema()` classmethod, preferred over the registry | execution (captured), inventory (proxied) | `driver_cache.config_schema_json` (`DriverCache` in `services/execution/app/models/driver_cache.py`) |
 | Apply job | A scheduled push of one version to its device, optionally a dry run and optionally tied to a reservation | inventory | `device_config_apply_jobs` (`DeviceConfigApplyJob` in `services/inventory/app/models/device_config_apply_job.py`); `reservation_id` and `run_id` are bare ids of other services |
@@ -343,7 +343,7 @@ internal route of section 7.
   Enforced in: `services/inventory/app/routers/device_configs.py` (`_validate_config_for_device`, `create_config_version`) \
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_create_config_version_validates`, `test_create_config_version_unsupported_connection_type`, `test_layer2_switch_vlan_assignments_validated`)
 - **CFG-VER-4.** Creating or restoring a version never moves the device's current
-  config pointer; only an immediate apply does (CFG-APPLY-4). \
+  config pointer; only a successful apply does (CFG-APPLY-4, CFG-SCHED-10). \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`create_config_version`, `restore_config_version`) \
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_create_version_does_not_flip_current_pointer`, `test_restore_does_not_flip_current_pointer`)
 - **CFG-VER-5.** The next number is the device's current maximum plus one, and the
@@ -522,12 +522,15 @@ versions to the device immediately and sees whether the push worked.
   raw text. Known gap, see #1093. \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
   Pinned by: `services/inventory/tests/test_router_edge_cases.py` (`test_apply_handles_execution_transport_error`, `test_apply_handles_non_json_error_body`); `services/inventory/tests/test_device_configs.py` (`test_apply_surfaces_403_verbatim`)
-- **CFG-APPLY-3.** For a 2xx answer, `status` is the run's status in lower case, and
-  `success` when the body has no status or is not JSON; `error` is the run's. A
-  scheduled job counts the same answers as `failed` (CFG-SCHED-9). Known gap, see
-  #1094. \
-  Enforced in: `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
-  Pinned by: `services/inventory/tests/test_router_edge_cases.py` (`test_apply_handles_non_json_success_body`); `services/inventory/tests/test_device_configs.py` (`test_apply_success_flips_current_pointer`)
+- **CFG-APPLY-3.** Both apply paths judge a 2xx answer by one rule: only a JSON object
+  whose run `status` is `SUCCESS` (any case) is a success. A missing or null status is
+  `failed` with `execution returned non-success status`, and a body that is not JSON, or
+  JSON that is not an object, is `failed` with `execution returned malformed JSON`. For
+  the immediate apply `status` is otherwise the run's status in lower case and `error`
+  the run's (`execution returned non-success status` when it has none); a scheduled job
+  records the same verdict as `success` or `failed` (CFG-SCHED-9). \
+  Enforced in: `services/inventory/app/services/apply_outcome.py` (`judge_success_answer`, `ApplyOutcome`, `MALFORMED_ANSWER_ERROR`, `NON_SUCCESS_ERROR`); `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
+  Pinned by: `services/inventory/tests/test_router_edge_cases.py` (`test_apply_handles_non_json_success_body`); `services/inventory/tests/test_device_configs.py` (`test_apply_success_flips_current_pointer`, `test_immediate_apply_without_a_success_status_is_failed`, `test_immediate_apply_relays_a_timeout_run_status`)
 - **CFG-APPLY-4.** When the answer names a run, the version's `last_apply_run_id` is set
   (null when the id is not a UUID) and, only when the status is `success`, the device's
   current config pointer moves to the version; both are committed before the answer. \
@@ -539,10 +542,12 @@ versions to the device immediately and sees whether the push worked.
   `403 Admin access or device manage grant required`. Known gap, see #1092. \
   Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`, `_user_has_acl_manage`); `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
   Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_execute_non_admin_configure_without_grant_forbidden`); `services/inventory/tests/test_device_configs.py` (`test_apply_surfaces_403_verbatim`)
-- **CFG-APPLY-6.** The device's current config pointer is written by an immediate apply
-  only and is returned by no route. Known gap, see #1094. \
-  Enforced in: `services/inventory/app/routers/device_configs.py` (`apply_config_version`); `services/inventory/app/services/apply_scheduler.py` (`fire_job`) \
-  Pinned by: none (#1094)
+- **CFG-APPLY-6.** The device's current config pointer is written through one helper by
+  both paths: an immediate apply that succeeded and a scheduled job that succeeded and
+  was not a dry run (CFG-SCHED-10). No route returns it; the latest-version internal
+  read deliberately uses the highest number instead (CFG-VER-7). \
+  Enforced in: `services/inventory/app/services/apply_outcome.py` (`move_current_config_pointer`); `services/inventory/app/routers/device_configs.py` (`apply_config_version`); `services/inventory/app/services/apply_scheduler.py` (`fire_job`) \
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_apply_success_flips_current_pointer`, `test_apply_failure_does_not_flip_current_pointer`); `services/inventory/tests/test_apply_scheduler.py` (`test_scheduled_apply_moves_pointer_only_on_a_real_success`)
 
 **Out of scope.** What execution does with the call (8.8); the AI commit's own push to
 `POST /execute` (`ai-features.md`, AI-COMMIT-15).
@@ -739,10 +744,12 @@ re-checking at fire time that the job may still run.
   that is not a UUID is stored as null. Known gap, see #1093. \
   Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_post_internal_execute`) \
   Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_post_internal_execute_http_error`, `test_post_internal_execute_error_body_not_json`, `test_post_internal_execute_success_body_not_json`, `test_post_internal_execute_malformed_run_id_degrades_to_none`, `test_post_internal_execute_non_success_status`, `test_post_internal_execute_missing_status_records_failed`, `test_post_internal_execute_null_status_records_failed`)
-- **CFG-SCHED-10.** A successful job sets its version's `last_apply_run_id` but does not
-  move the device's current config pointer. Known gap, see #1094. \
-  Enforced in: `services/inventory/app/services/apply_scheduler.py` (`fire_job`) \
-  Pinned by: none (#1094)
+- **CFG-SCHED-10.** A successful job sets its version's `last_apply_run_id` when the
+  answer named a run, and, unless it was a dry run, moves the device's current config
+  pointer to the version, the same record an immediate apply writes (CFG-APPLY-6). A
+  failed job, and a successful dry run, leave the pointer where it was. \
+  Enforced in: `services/inventory/app/services/apply_scheduler.py` (`fire_job`); `services/inventory/app/services/apply_outcome.py` (`move_current_config_pointer`) \
+  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_scheduled_apply_moves_pointer_only_on_a_real_success`)
 
 **Out of scope.** Catching up missed fire times: a job fires once, at the first tick at
 or after its time.
@@ -1300,8 +1307,6 @@ confirmed by reading only.
   refuses, and [ROLES.md](../ROLES.md) says they pass.
 - #1093 (CFG-APPLY-2, CFG-SCHED-9, CFG-EXEC-4): exception and upstream text reach job
   rows and API answers.
-- #1094 (CFG-APPLY-3, CFG-APPLY-6, CFG-SCHED-10): immediate and scheduled applies judge
-  a run and move the current config pointer differently.
 - #1096 (CFG-AUTH-4, CFG-SCHEMA-7): a 200 whose JSON body is not an object raises instead
   of failing closed or open.
 - #1097 (CFG-LOAD-6, CFG-RUNSTATE-5): concurrent first loads of a driver fail, and a run
@@ -1335,13 +1340,11 @@ that should have a test are tracked in #1100.
 - CFG-AUTH-6: the write routes skip visibility.
 - CFG-VER-10: the default restore description.
 - CFG-VER-15: no version delete; the cascade from the device.
-- CFG-APPLY-6: the current config pointer's writers and readers.
 - CFG-JOB-3: the time checks run before the lookups.
 - CFG-JOB-5: the named reservation is not itself proven.
 - CFG-JOB-6: the schedule-time dry-run support check.
 - CFG-JOB-13: confirm repeats no schedule-time check.
 - CFG-SCHED-8: the fire request's body.
-- CFG-SCHED-10: a scheduled success leaves the pointer.
 - CFG-EXEC-3: the body's reservation and options are taken as sent.
 - CFG-EXEC-8: `method_kwargs` stored on the run.
 - CFG-RUN-3: an owner's list holds every run of the reservation.

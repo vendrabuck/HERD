@@ -37,6 +37,7 @@ from app.config import settings
 from app.models.device import Device
 from app.models.device_config_apply_job import DeviceConfigApplyJob
 from app.models.device_config_version import DeviceConfigVersion
+from app.services.apply_outcome import judge_success_answer, move_current_config_pointer
 from app.services.published_schema import driver_for_device
 
 logger = logging.getLogger(__name__)
@@ -157,24 +158,11 @@ async def _post_internal_execute(
         except ValueError:
             detail = resp.text
         return "failed", None, f"{resp.status_code} {detail}"
-    try:
-        data = resp.json()
-    except ValueError:
-        return "failed", None, "execution returned malformed JSON"
-    run_id_str = data.get("id")
-    run_id = None
-    if run_id_str:
-        try:
-            run_id = uuid.UUID(run_id_str)
-        except (ValueError, TypeError):
-            run_id = None
-    # Safe default (issue #720): a response with no status is never a success.
-    # Unreachable today (ExecutionRunResponse.status is required over a NOT NULL
-    # column), so this only matters if the contract ever loosens.
-    run_status = str(data.get("status", "FAILED")).upper()
-    if run_status == "SUCCESS":
-        return "success", run_id, None
-    return "failed", run_id, str(data.get("error") or "execution returned non-success status")
+    # One success rule for both apply paths (issue #1094, apply_outcome): a 2xx
+    # is a success only with a JSON object whose run status is SUCCESS; a missing
+    # status is never a success (issue #720).
+    outcome = judge_success_answer(resp)
+    return outcome.job_status, outcome.run_id, outcome.error
 
 
 STALE_RUNNING_AFTER_SECONDS = 300
@@ -324,8 +312,14 @@ async def fire_job(
     job.run_id = run_id
     job.error = error
     job.fired_at = datetime.now(timezone.utc)
-    if new_status == "success" and run_id is not None:
-        version.last_apply_run_id = run_id
+    if new_status == "success":
+        if run_id is not None:
+            version.last_apply_run_id = run_id
+        # The device now has this version applied (issue #1094), the same record
+        # an immediate apply writes. A dry run pushed nothing, so it leaves the
+        # pointer where it was.
+        if not job.dry_run:
+            await move_current_config_pointer(db, job.device_id, version.id)
     await db.commit()
 
 

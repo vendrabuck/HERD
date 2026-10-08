@@ -270,7 +270,8 @@ async def test_apply_handles_non_json_error_body(client):
 
 @pytest.mark.asyncio
 async def test_apply_handles_non_json_success_body(client):
-    """A 2xx response whose body is not JSON degrades to an empty payload."""
+    """A 2xx response whose body is not JSON is a failed apply (issue #1094), the
+    same answer the scheduled path records for it."""
     device_id, version_id = await _seed_device(client)
 
     class TextOnlyResponse:
@@ -299,8 +300,9 @@ async def test_apply_handles_non_json_success_body(client):
             headers={"Authorization": "Bearer t"},
         )
     assert resp.status_code == 200
-    # No run id in body -> status defaults to "success", pointer not moved.
-    assert resp.json()["status"] == "success"
+    assert resp.json()["status"] == "failed"
+    assert resp.json()["error"] == "execution returned malformed JSON"
+    assert resp.json()["run_id"] is None
 
 
 # --- devices: malformed-subject visibility denials + resolve short-circuit ---

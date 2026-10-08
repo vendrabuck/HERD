@@ -1351,3 +1351,81 @@ async def test_cancelled_job_is_never_fired_by_a_later_claim(client):
             await fire_job(sched_session, job, client=None)
     post.assert_not_awaited()
     assert await _job_status(job_id) == "cancelled"
+
+
+# ---- one success rule for both apply paths (issue #1094) ----
+
+
+def _apply_client_answering(status_code: int, body):
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = status_code
+            self.text = ""
+
+        def json(self):
+            return body
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json, headers=None):
+            return FakeResponse()
+
+    return lambda **kw: FakeClient()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "run_id", "error"),
+    [
+        (
+            {"id": "55555555-5555-5555-5555-555555555555"},
+            "55555555-5555-5555-5555-555555555555",
+            "execution returned non-success status",
+        ),
+        (
+            {"id": "55555555-5555-5555-5555-555555555555", "status": None},
+            "55555555-5555-5555-5555-555555555555",
+            "execution returned non-success status",
+        ),
+        (["SUCCESS"], None, "execution returned malformed JSON"),
+        ("SUCCESS", None, "execution returned malformed JSON"),
+    ],
+)
+async def test_immediate_apply_without_a_success_status_is_failed(client, body, run_id, error):
+    """A 2xx with no run status, or JSON that is not an object, is never a success,
+    and the pointer stays put (it used to default to success)."""
+    device_id = await _create_device(client)
+    v = await client.post(f"/devices/{device_id}/config-versions", json={"config": {"vlan": 3}})
+    with patch("app.routers.device_configs.httpx.AsyncClient", _apply_client_answering(200, body)):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions/{v.json()['id']}/apply",
+            headers={"Authorization": "Bearer t"},
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "version_id": v.json()["id"],
+        "run_id": run_id,
+        "status": "failed",
+        "error": error,
+    }
+    assert await _read_device_current_pointer(device_id) is None
+
+
+@pytest.mark.asyncio
+async def test_immediate_apply_relays_a_timeout_run_status(client):
+    device_id = await _create_device(client)
+    v = await client.post(f"/devices/{device_id}/config-versions", json={"config": {"vlan": 3}})
+    body = {"id": str(uuid.uuid4()), "status": "TIMEOUT", "error": "driver timed out"}
+    with patch("app.routers.device_configs.httpx.AsyncClient", _apply_client_answering(200, body)):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions/{v.json()['id']}/apply",
+            headers={"Authorization": "Bearer t"},
+        )
+    assert resp.json()["status"] == "timeout"
+    assert resp.json()["error"] == "driver timed out"
+    assert await _read_device_current_pointer(device_id) is None

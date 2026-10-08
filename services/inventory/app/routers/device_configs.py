@@ -28,6 +28,7 @@ from app.schemas.device_config import (
     DeviceConfigVersionResponse,
     PaginatedDeviceConfigVersions,
 )
+from app.services.apply_outcome import judge_success_answer, move_current_config_pointer
 from app.services.config_diff import render_unified_diff
 from app.services.device_visibility import check_device_read_visibility
 from app.services.manage_guard import (
@@ -484,35 +485,23 @@ async def apply_config_version(
             error=f"{resp.status_code} {detail}",
         )
 
-    try:
-        data = resp.json()
-    except ValueError:
-        data = {}
-    run_id = data.get("id")
-    run_status = str(data.get("status", "SUCCESS")).lower()
+    # One success rule for both apply paths (issue #1094, apply_outcome): a 2xx
+    # is a success only with a JSON object whose run status is SUCCESS, so a
+    # missing status or a body that is not JSON is a failure here too.
+    outcome = judge_success_answer(resp)
 
-    # Parse the run_id BEFORE any DB mutation so a malformed value can never
-    # prevent the commit that persists `device.current_config_version_id`. A
-    # bad run_id simply degrades to a NULL pointer on the persisted version.
-    parsed_run_id: uuid.UUID | None = None
-    if run_id:
-        try:
-            parsed_run_id = uuid.UUID(run_id)
-        except (ValueError, TypeError):
-            parsed_run_id = None
-
-    if run_id:
-        version.last_apply_run_id = parsed_run_id
-        # Only move the device's current-config pointer when this apply
-        # actually succeeded. A failed apply leaves the pointer on whatever
-        # version was applied last (or NULL if none).
-        if run_status == "success":
-            device.current_config_version_id = version.id
+    if outcome.succeeded or outcome.run_id is not None:
+        version.last_apply_run_id = outcome.run_id
+        # Only a successful apply moves the device's current-config pointer; a
+        # failed one leaves it on whatever was applied last (or NULL if none).
+        # The scheduled path moves it by the same helper.
+        if outcome.succeeded:
+            await move_current_config_pointer(db, device.id, version.id)
         await db.commit()
 
     return DeviceConfigApplyResponse(
         version_id=version.id,
-        run_id=parsed_run_id,
-        status=run_status,
-        error=data.get("error"),
+        run_id=outcome.run_id,
+        status=outcome.run_status,
+        error=outcome.error,
     )

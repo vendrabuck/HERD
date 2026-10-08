@@ -1117,3 +1117,55 @@ async def test_sweep_leaves_a_recent_claim_alone_whatever_its_scheduled_time():
         assert await _resweep_stale_running(db, now) == 0
         await db.refresh(job)
         assert job.status == "running"
+
+
+# ---- a scheduled success moves the current config pointer (issue #1094) ----
+
+
+async def _pointer(device_id):
+    async with TestSessionLocal() as s:
+        device = await s.get(Device, device_id)
+        return device.current_config_version_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dry_run", "answer", "moves"),
+    [
+        (False, FakeResponse(201, {"id": str(uuid.uuid4()), "status": "SUCCESS"}), True),
+        (True, FakeResponse(201, {"id": str(uuid.uuid4()), "status": "SUCCESS"}), False),
+        (False, FakeResponse(201, {"id": str(uuid.uuid4()), "status": "FAILED"}), False),
+        (False, FakeResponse(201, {"id": str(uuid.uuid4())}), False),
+    ],
+)
+async def test_scheduled_apply_moves_pointer_only_on_a_real_success(
+    monkeypatch, dry_run, answer, moves
+):
+    async with TestSessionLocal() as db:
+        device, version, job = await _seed_device_version_and_job(
+            db, connection_type="Management", scheduled_for=datetime.now(timezone.utc)
+        )
+        device_id, version_id = device.id, version.id
+        job.dry_run = dry_run
+        await db.commit()
+        db.expire(device)
+        _patch_creator_authorized(monkeypatch)
+        await fire_job(db, job, FakeClient(post_responses={"/execute/internal": answer}))
+        await db.refresh(job)
+        status = job.status
+    assert status == ("success" if answer._body.get("status") == "SUCCESS" else "failed")
+    assert await _pointer(device_id) == (version_id if moves else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [["SUCCESS"], "SUCCESS", 7])
+async def test_post_internal_execute_non_object_json_records_failed(monkeypatch, body):
+    async with TestSessionLocal() as db:
+        _, job = await _seed_version_and_job(db, scheduled_for=datetime.now(timezone.utc))
+    client = FakeClient(post_responses={"/execute/internal": FakeResponse(201, None)})
+    client._post["/execute/internal"]._body = body
+    assert await _post_internal_execute(client, job, {}) == (
+        "failed",
+        None,
+        "execution returned malformed JSON",
+    )
