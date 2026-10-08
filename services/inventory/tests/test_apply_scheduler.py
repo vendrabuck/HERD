@@ -1169,3 +1169,37 @@ async def test_post_internal_execute_non_object_json_records_failed(monkeypatch,
         None,
         "execution returned malformed JSON",
     )
+
+
+# ---- the fire request carries the job's reservation (issue #1090) ----
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize("tied", [True, False])
+async def test_post_internal_execute_sends_the_job_reservation_id(monkeypatch, tied, dry_run):
+    monkeypatch.setattr(
+        "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+    )
+    job = _make_job()
+    job.dry_run = dry_run
+    reservation_id = uuid.uuid4()
+    job.reservation_id = reservation_id if tied else None
+    run_id = uuid.uuid4()
+    client = FakeClient(
+        post_responses={
+            "/execute/internal": FakeResponse(201, {"id": str(run_id), "status": "SUCCESS"})
+        }
+    )
+    await _post_internal_execute(client, job, {"vlan": 7})
+    [(url, body, headers)] = client.posts
+    assert url.endswith("/execute/internal")
+    assert headers == {"X-Internal-Token": "token"}
+    assert body == {
+        "device_id": str(job.device_id),
+        "action": "configure",
+        "user_id": str(job.created_by),
+        "method_kwargs": {"vlan": 7},
+        "dry_run": dry_run,
+        "reservation_id": str(reservation_id) if tied else None,
+    }

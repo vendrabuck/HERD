@@ -731,11 +731,12 @@ re-checking at fire time that the job may still run.
   Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_fire_job_fails_when_version_was_deleted`)
 - **CFG-SCHED-8.** A job is fired with execution `POST /execute/internal`, the internal
   token, and 30 seconds, sending `device_id`, `action` `configure`, `user_id` (the job's
-  creator), the version's config as `method_kwargs`, and `dry_run`; it sends no
-  `reservation_id`, so the run carries none, and a non-admin reservation owner cannot
-  read its transcript (CFG-TX-5). Known gap, see #1090. \
+  creator), the version's config as `method_kwargs`, `dry_run`, and the job's
+  `reservation_id` (null for a job tied to none), so the run carries the reservation and
+  its owner can read the transcript (CFG-TX-5) and find the run in the reservation's run
+  list. \
   Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_post_internal_execute`) \
-  Pinned by: none (#1090)
+  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_post_internal_execute_sends_the_job_reservation_id`)
 - **CFG-SCHED-9.** The job is `success` only for a 2xx JSON answer whose `status` is
   `SUCCESS` in any case. Otherwise it is `failed` with `execution unreachable: <text>` (a
   transport error), `<status> <detail>` (400 or more),
@@ -1300,8 +1301,6 @@ confirmed by reading only.
 
 ### Open defects
 
-- #1090 (CFG-SCHED-8): scheduled runs carry no reservation, so a reservation owner cannot
-  read the dry-run transcript the review dialog asks for.
 - #1091 (CFG-RUN-6): retrying a failed dry run pushes the configuration for real.
 - #1092 (CFG-APPLY-5): immediate apply admits reservation owners whom execution then
   refuses, and [ROLES.md](../ROLES.md) says they pass.
@@ -1344,7 +1343,6 @@ that should have a test are tracked in #1100.
 - CFG-JOB-5: the named reservation is not itself proven.
 - CFG-JOB-6: the schedule-time dry-run support check.
 - CFG-JOB-13: confirm repeats no schedule-time check.
-- CFG-SCHED-8: the fire request's body.
 - CFG-EXEC-3: the body's reservation and options are taken as sent.
 - CFG-EXEC-8: `method_kwargs` stored on the run.
 - CFG-RUN-3: an owner's list holds every run of the reservation.

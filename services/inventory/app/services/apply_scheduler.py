@@ -147,6 +147,10 @@ async def _post_internal_execute(
         "user_id": str(job.created_by),
         "method_kwargs": config,
         "dry_run": bool(job.dry_run),
+        # The run is tagged with the job's reservation (issue #1090), so the
+        # reservation owner can read its transcript and find it in the
+        # reservation's run list; null for a job tied to no reservation.
+        "reservation_id": str(job.reservation_id) if job.reservation_id else None,
     }
     try:
         resp = await client.post(url, json=body, headers=headers, timeout=30.0)
