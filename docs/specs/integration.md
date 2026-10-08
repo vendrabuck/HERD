@@ -896,15 +896,16 @@ kinds on the Settings page.
   or shows `No notifications yet.`; its Settings button goes to `/settings`. \
   Enforced in: `frontend/src/components/NotificationBell.tsx` (`NotificationBell`) \
   Pinned by: `frontend/src/test/components/NotificationBell.test.tsx` (`opens the panel and lists notifications`, `shows empty state when there are no notifications`); `tests/e2e/test_notifications_bell.py` (`test_notifications_bell_opens_panel`, `test_notifications_panel_empty_state`, `test_notifications_settings_link_navigates`)
-- **INTEG-UI-3.** Each listed notification is a button, and its delete control is a
-  second button nested inside it; the list query also runs while the bell renders
-  nothing. Known gap, see #1076. \
+- **INTEG-UI-3.** Each listed notification is a list item holding two sibling buttons,
+  never one inside the other: the notification itself and its `Delete notification`
+  control, each a separate keyboard stop with its own accessible name; the list query
+  runs only while signed in, the same gate as the unread count. \
   Enforced in: `frontend/src/components/NotificationBell.tsx` (`NotificationBell`, `handleDelete`); `frontend/src/api/notifications.ts` (`useNotifications`) \
-  Pinned by: none (issue #1076)
+  Pinned by: `frontend/src/test/components/NotificationBell.test.tsx` (`makes no list request while signed out`, `Delete removes that notification through the API and does not mark it read`, `the item and its Delete are separate keyboard stops with their own names`, `never nests a button inside a button`)
 - **INTEG-UI-4.** Clicking an unread notification marks it read; Mark all read is
   disabled while nothing is unread. \
   Enforced in: `frontend/src/components/NotificationBell.tsx` (`handleItemClick`) \
-  Pinned by: none
+  Pinned by: `frontend/src/test/components/NotificationBell.test.tsx` (`clicking an unread notification marks it read through the API`, `clicking a read notification sends nothing`, `Mark all read is disabled while nothing is unread`, `Mark all read is enabled while something is unread`); `tests/e2e/test_flows_effects_playwright.py` (`test_notification_round_trip`)
 - **INTEG-UI-5.** The Settings page shows the in-app toggle, the three outbound toggles
   (off unless stored on), and one toggle per event kind for the six kinds notifications
   renders; Save sends all channels and events and toasts `Preferences saved` or
@@ -988,7 +989,7 @@ calls in notifications; the 20-item bell list and its 30 second unread poll.
 | Functional (through the service API) | the httpx-against-the-app tests in `test_facade.py`, `test_webhooks.py`, and `services/notifications/tests/test_router.py`; `services/notifications/tests/test_functional_dispatch_path.py` | The facade's upstream is a stubbed transport |
 | Integration (running stack) | `tests/integration/test_v1_facade.py`, `test_webhooks_flow.py`, `test_webhook_slow_receiver_live.py`, `test_notifications_flow.py`, `test_notification_channels_flow.py`, `test_health_alerting_flow.py`, `test_nats_consumer_configs_live.py`; `tests/contract/test_openapi_schema.py` | The health tests publish the event straight to `HERD_HEALTH` with a fresh `event_id` rather than driving the poller. The slow-receiver test binds a peer consumer and flakes on a stack other sessions use |
 | Stress and load | `tests/load/locustfile.py` (`NotificationUser`: unread count, list, preference reads and writes) | Nothing loads the facade, webhook fan-out, or the consumers |
-| Browser end-to-end | `tests/e2e/test_notifications_bell.py`, `tests/e2e/test_settings_page.py` | Nothing clicks mark read or delete in a browser (INTEG-UI-4); the facade and webhooks have no interface |
+| Browser end-to-end | `tests/e2e/test_notifications_bell.py`, `tests/e2e/test_settings_page.py` | `tests/e2e/test_flows_effects_playwright.py` (`test_notification_round_trip`) clicks mark read; nothing clicks delete in a browser; the facade and webhooks have no interface |
 
 Not run for this document: nothing here was checked against a running stack. The unit,
 functional, integration, contract, load, and browser suites were read, not run; only
@@ -1003,8 +1004,6 @@ Two documents are incomplete against the code this specification describes, trac
 
 ### Open defects
 
-- #1076 (INTEG-UI-3): the bell nests the delete button inside the item button, and its
-  list query runs while signed out.
 - #1077 (INTEG-ROUTE-2): a failed reservation produces no notification and has no
   preference toggle; nothing records this as a decision.
 - #1078 (INTEG-HOOK-9): a webhook subscription cannot be paused; `is_active` has no
@@ -1052,5 +1051,3 @@ Two documents are incomplete against the code this specification describes, trac
 - INTEG-HOOK-22: the ledger key with neither an event id nor metadata.
 - INTEG-INAPP-7: marking a read notification read again.
 - INTEG-PREFS-5: `channels` replaced whole on a write.
-- INTEG-UI-3: the nested delete button.
-- INTEG-UI-4: click to mark read and the disabled Mark all read.

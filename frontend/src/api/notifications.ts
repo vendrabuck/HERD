@@ -96,10 +96,14 @@ export function useUnreadCount(enabled: boolean = true, intervalMs: number = 30_
   });
 }
 
-export function useNotifications(params?: { limit?: number; unread_only?: boolean }) {
+export function useNotifications(
+  params?: { limit?: number; unread_only?: boolean },
+  enabled: boolean = true,
+) {
   return useQuery({
     queryKey: ["notifications", "list", params ?? {}],
     queryFn: () => fetchNotifications(params),
+    enabled,
   });
 }
 

@@ -716,11 +716,12 @@ def test_notification_round_trip(pw_page):
         current = _my_notifications(pw_page, reservation_id)
         target_idx, target = next((i, n) for i, n in current if n["read_at"] is None)
 
-        item_buttons = pw_page.locator("button").filter(
+        # Each row is a list item holding two sibling buttons (issue #1076):
+        # the notification itself (first, marks it read) and its Delete.
+        items = pw_page.get_by_role("listitem").filter(
             has=pw_page.get_by_role("button", name="Delete notification")
         )
-        # Click the title area (top-left) to avoid the row's Delete "x".
-        item_buttons.nth(target_idx).click(position={"x": 16, "y": 16})
+        items.nth(target_idx).get_by_role("button").first.click()
 
         # --- Effect assertion via the notifications API: that exact
         # notification flipped to read (its contribution to the unread count

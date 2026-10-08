@@ -104,9 +104,11 @@ what a test would still need to cover:
 - [MEDIUM] `frontend/src/components/admin/UserManagementTable.tsx` (0%):
   `UsersPage.test.tsx` mocks it out entirely rather than rendering it, so its
   fetch, sort, and promote/demote actions have no test at all.
-- [LOW] `frontend/src/components/NotificationBell.tsx` (60.5%) and
+- [LOW] `frontend/src/components/NotificationBell.tsx` (76.2% since issue #1076,
+  which added mark read, delete, and keyboard tests) and
   `frontend/src/components/ui/BulkImportExport.tsx` (83.3%): both have a
-  targeted suite; dropdown and export-format branches are the remainder.
+  targeted suite; the outside-click close, the Settings link, and the
+  export-format branches are the remainder.
 
 A file with no test importing it (`App.tsx`, and effectively
 `UserManagementTable.tsx`) now shows 0% rather than being omitted from the report:
