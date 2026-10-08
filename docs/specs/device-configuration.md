@@ -799,12 +799,25 @@ is WIRE-DRIVER-6 in `provisioning-and-wiring.md`.
   body's required `user_id` is ignored. \
   Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`) \
   Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_manual_execute_overrides_user_id_with_jwt_subject`)
-- **CFG-EXEC-3.** The body's `reservation_id`, `port_a`, `port_b`, `method_kwargs`,
-  `dry_run`, and `config_version_id` are used as sent; the `reservation_id` is not
-  checked against the device or the caller, and the `config_version_id` is only recorded
-  (a retry checks it, CFG-RUN-7). \
-  Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`) \
-  Pinned by: none (#1100)
+- **CFG-EXEC-3.** On `POST /execute`, after the checks of CFG-EXEC-1 and before any
+  device read, run row, or driver call, a `reservation_id` must name a reservation whose
+  device set holds the device (any status) and, for a non-admin, one the caller owns;
+  admins are exempt from ownership only. It is read from reservations
+  `GET /internal/by-device/{device_id}` with the internal token and 5 seconds, which lists
+  every holder of the device with its owner (the caller-token `GET /{id}` answers only
+  the caller's own reservations, admins included, so it cannot confirm an admin's id).
+  A reservation that is not listed, or a non-admin's reservation owned by someone else,
+  is 422 `reservation_id must reference a reservation you own that includes this device`
+  (an admin's: `reservation_id must reference a reservation that includes this device`);
+  no internal token, a transport error, a non-200, a body that is not JSON, or a body that
+  is not a list of objects with string `id` and `user_id` is 503
+  `Could not verify the reservation; nothing was run. Retry the request.` An omitted
+  `reservation_id` asks nothing. `POST /execute/internal` does not check it (its caller is
+  trusted through the internal token). `port_a`, `port_b`, `method_kwargs`, `dry_run`, and
+  `config_version_id` are used as sent; the `config_version_id` is only recorded (a retry
+  checks it, CFG-RUN-7). \
+  Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`, `_assert_execute_reservation`) \
+  Pinned by: `services/execution/tests/test_manual_execute_reservation_scope.py` (`test_owner_runs_configure_under_their_own_reservation`, `test_non_admin_cannot_tag_a_run_with_another_users_reservation`, `test_non_admin_cannot_tag_a_run_with_a_reservation_without_the_device`, `test_admin_may_tag_a_run_with_another_users_reservation_holding_the_device`, `test_admin_cannot_tag_a_run_with_a_reservation_without_the_device`, `test_execute_without_a_reservation_asks_nothing`, `test_reservation_check_fails_closed`, `test_reservation_check_without_an_internal_token_fails_closed`, `test_non_admin_without_a_grant_is_refused_before_the_reservation_check`, `test_internal_execute_reservation_is_not_checked`)
 - **CFG-EXEC-4.** The device and its template are read through inventory's internal
   routes with the internal token and 10 seconds; a 404 is 404 `Device <id> not found` or
   `Template <id> not found`, and any other failure is 503 `Failed to fetch device: <reason>`
@@ -1307,6 +1320,7 @@ status.
 | 422 | `device '<name>': config failed schema validation: <message>` and the other validator messages | a config the schema refuses | CFG-VER-3, CFG-SCHEMA-3, CFG-SCHEMA-4, CFG-EXEC-10 |
 | 422 | `scheduled_for must be in the future`, `scheduled_for must be within <N> days from now` | a bad schedule time | CFG-JOB-1, CFG-JOB-2 |
 | 422 | `reservation_id must reference an active reservation you own that includes this device` | a schedule naming a reservation that fails CFG-JOB-4 | CFG-JOB-4 |
+| 422 | `reservation_id must reference a reservation you own that includes this device`, `reservation_id must reference a reservation that includes this device` (an admin) | a `POST /execute` naming a reservation that fails CFG-EXEC-3 | CFG-EXEC-3 |
 | 422 | `this driver does not advertise dry-run support; refuse to fire a dry-run that would hit the wire` | a dry-run schedule for a driver without dry-run support | CFG-JOB-6 |
 | 422 | `internal execute is restricted to action='configure'; got '<action>'` | `POST /execute/internal` of another action | CFG-EXEC-6 |
 | 422 | `Only the Hypervisor connection type is supported for package validation`; `package_b64 is not valid base64`; `package exceeds the <N> byte validation limit`; `package is empty` | a validation request the route refuses | CFG-VAL-1, CFG-VAL-2 |
@@ -1315,6 +1329,7 @@ status.
 | 503 | `reservations service unreachable while checking active reservations` and the two sibling details | a restore whose guard cannot be answered | CFG-VER-13 |
 | 503 | `Failed to fetch device: <reason>`, `Failed to fetch template: <reason>` (an upstream status, a class name, or a malformed-body note; never upstream text) | execution cannot read the device or template | CFG-EXEC-4 |
 | 503 | the visibility lookup's own detail (`inventory.md`) | a non-admin read whose visibility lookup fails | CFG-AUTH-5 |
+| 503 | `Could not verify the reservation; nothing was run. Retry the request.` | a `POST /execute` whose reservation cannot be checked | CFG-EXEC-3 |
 | 503 | `Could not read the run's config version; nothing was retried. Retry the request.` | a retry whose config version cannot be read | CFG-RUN-7 |
 | 503 | `Could not verify device visibility; nothing was returned. Retry the request.` | a non-admin run list or transcript read whose visibility lookup cannot be answered | CFG-RUN-3, CFG-TX-5 |
 
@@ -1332,6 +1347,7 @@ status.
 | inventory to execution | execution | `POST /execute/internal` (`X-Internal-Token`, 30 s) | a scheduled job | the job is `failed` (CFG-SCHED-9) |
 | execution to acl | acl | `POST /check` with the caller's token, 5 s | a non-admin `configure` | fail closed: 403 (CFG-EXEC-1) |
 | execution to reservations | reservations | `GET /{id}` with the caller's token, 5 s | run list and transcript ownership | fail closed: 403 (CFG-RUN-1, CFG-TX-5) |
+| execution to reservations | reservations | `GET /internal/by-device/{id}` (`X-Internal-Token`, 5 s) | a `POST /execute` that names a reservation | fail closed: 503 (CFG-EXEC-3) |
 | execution to inventory | inventory | `GET /devices/{id}/config-versions/{vid}` with the admin's token, 10 s | a retry of a masked run | 404 is 409, anything else unreadable is 503 (CFG-RUN-7) |
 | execution to inventory | inventory | `GET /device-groups/visible-devices?user_id` with the caller's token, 10 s | a non-admin's run list and transcript read | fail closed: 503 (CFG-RUN-3, CFG-TX-5) |
 | execution to inventory | inventory | `GET /devices/{id}/internal`, `GET /templates/{id}/internal` (`X-Internal-Token`, 10 s) | the device and template of an action | 404 is relayed; anything else, a body that is not a JSON object included, 503 (CFG-EXEC-4) |
@@ -1418,6 +1434,5 @@ that should have a test are tracked in #1100.
 - CFG-JOB-5: the named reservation is not itself proven.
 - CFG-JOB-6: the schedule-time dry-run support check.
 - CFG-JOB-13: confirm repeats no schedule-time check.
-- CFG-EXEC-3: the body's reservation and options are taken as sent.
 - CFG-DRY-4: the dry-run declaration is not verified.
 - CFG-SBX-9: no isolation beyond resource limits.

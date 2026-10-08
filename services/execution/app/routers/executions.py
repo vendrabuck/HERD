@@ -99,11 +99,12 @@ async def _user_has_acl_manage(
 
 
 async def _user_owns_reservation(reservation_id: uuid.UUID, authorization: str | None) -> bool:
-    """Ask the reservations service whether the caller can read this reservation.
+    """Ask the reservations service whether the caller owns this reservation.
 
-    The reservations service returns 200 to owners and admins, 404 to everyone
-    else (non-owners and non-existent IDs share the 404 to avoid leaking
-    existence). Returns False on any failure, mirroring `_user_has_acl_manage`.
+    The reservations service's `GET /{id}` answers 200 only for the caller's own
+    reservation (admins included) and 404 for everything else, so non-owners and
+    non-existent IDs share the 404. Returns False on any failure, mirroring
+    `_user_has_acl_manage`.
     """
     if not authorization:
         return False
@@ -114,6 +115,90 @@ async def _user_owns_reservation(reservation_id: uuid.UUID, authorization: str |
     except httpx.HTTPError:
         return False
     return resp.status_code == 200
+
+
+# Pinned: tests match on these exact strings (CFG-EXEC-3, issue #1112). The style
+# follows inventory's RESERVATION_MISMATCH_ERROR.
+EXECUTE_RESERVATION_MISMATCH_DETAIL = (
+    "reservation_id must reference a reservation you own that includes this device"
+)
+EXECUTE_RESERVATION_MISMATCH_ADMIN_DETAIL = (
+    "reservation_id must reference a reservation that includes this device"
+)
+EXECUTE_RESERVATION_UNAVAILABLE_DETAIL = (
+    "Could not verify the reservation; nothing was run. Retry the request."
+)
+
+
+async def _assert_execute_reservation(
+    reservation_id: uuid.UUID, device_id: uuid.UUID, payload: dict
+) -> None:
+    """Check a manual execute's `reservation_id` before anything runs (issue #1112).
+
+    The run row is tagged with this id, so it must name a reservation that exists
+    and holds the device, and, for a non-admin, one the caller owns (admins are
+    exempt from ownership, not from existence or the device). One read answers
+    all three: reservations' `GET /internal/by-device/{device_id}` (internal
+    token) lists every reservation, of any status and any owner, whose device set
+    holds the device, with its owner. The caller-token `GET /{id}` route cannot
+    serve here because it answers only the caller's own reservations, admins
+    included, so it cannot confirm an admin's id for another user's reservation.
+    The answer is only compared, never returned.
+
+    A reservation that is not listed, or a non-admin's reservation owned by
+    someone else, is 422 with one detail per caller kind (a non-admin cannot tell
+    the two apart). The check fails closed: no internal token, a transport error,
+    a non-200, a body that is not JSON, or a body that is not a list of objects
+    with string `id` and `user_id` is 503.
+    """
+    is_admin = payload.get("role") in ("admin", "superadmin")
+    mismatch = (
+        EXECUTE_RESERVATION_MISMATCH_ADMIN_DETAIL
+        if is_admin
+        else EXECUTE_RESERVATION_MISMATCH_DETAIL
+    )
+    if not settings.internal_api_token:
+        raise HTTPException(status_code=503, detail=EXECUTE_RESERVATION_UNAVAILABLE_DETAIL)
+    url = f"{settings.reservations_service_url.rstrip('/')}/internal/by-device/{device_id}"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url, headers={"X-Internal-Token": settings.internal_api_token})
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "Reservation check for execute on device %s failed (%s)",
+            device_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503, detail=EXECUTE_RESERVATION_UNAVAILABLE_DETAIL
+        ) from None
+    if resp.status_code != 200:
+        logger.warning(
+            "Reservation check for execute on device %s answered %s", device_id, resp.status_code
+        )
+        raise HTTPException(status_code=503, detail=EXECUTE_RESERVATION_UNAVAILABLE_DETAIL)
+    try:
+        rows = resp.json()
+    except ValueError:
+        rows = None
+    if not isinstance(rows, list) or not all(
+        isinstance(row, dict)
+        and isinstance(row.get("id"), str)
+        and isinstance(row.get("user_id"), str)
+        for row in rows
+    ):
+        logger.warning("Reservation check for execute on device %s: misshapen body", device_id)
+        raise HTTPException(status_code=503, detail=EXECUTE_RESERVATION_UNAVAILABLE_DETAIL)
+    for row in rows:
+        try:
+            if uuid.UUID(row["id"]) != reservation_id:
+                continue
+        except ValueError:
+            continue
+        if is_admin or row["user_id"] == str(payload.get("sub")):
+            return
+        break
+    raise HTTPException(status_code=422, detail=mismatch)
 
 
 async def _authorize_runs_list(
@@ -326,7 +411,10 @@ async def manual_execute(
       - action == "configure", AND
       - the caller has an ACL `manage` grant on this device.
 
-    All other non-admin calls are rejected 403.
+    All other non-admin calls are rejected 403. A `reservation_id`, when given,
+    must name a reservation that holds the device and, for a non-admin, that the
+    caller owns (`_assert_execute_reservation`); it is checked before any device
+    read, run row, or driver call.
     """
     role = payload.get("role", "user")
     if role not in ("admin", "superadmin"):
@@ -338,6 +426,9 @@ async def manual_execute(
                 status_code=403,
                 detail="Admin access or device manage grant required",
             )
+
+    if body.reservation_id is not None:
+        await _assert_execute_reservation(body.reservation_id, body.device_id, payload)
 
     device_data = await fetch_device(body.device_id)
     template_data = await fetch_template(device_data["template_id"])

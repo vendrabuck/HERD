@@ -1399,6 +1399,8 @@ Returns HTTP 201 with the execution run result.
 
 Admins may execute any action. A non-admin may call this endpoint only when the action is `configure` and the caller holds an ACL `manage` grant on the target device; any other non-admin call is rejected 403 (`Admin access required`, or `Admin access or device manage grant required` when the grant is missing).
 
+A `reservation_id`, when given, must name a reservation that holds the device and, for a non-admin, one the caller owns (admins are exempt from ownership, not from the device check); otherwise the call is refused with 422 before any run row or driver call, and with 503 when the reservations service cannot answer. The run row's reservation is therefore always one that held the device.
+
 ### Retry a failed run
 
 ```
