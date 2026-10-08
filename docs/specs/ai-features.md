@@ -863,7 +863,7 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
 which admits a device `manage` grant or an active reservation of the device through
 `user_has_manage_or_owns_active_reservation` in `services/common/herd_common/acl.py`
 (`identity-and-access.md`, `device-configuration.md`). Who may list execution runs
-(`provisioning-and-wiring.md`).
+(`device-configuration.md`, CFG-RUN-1).
 
 ### 8.6 Assistant documentation lookup
 
