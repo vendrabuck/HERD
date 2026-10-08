@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed: non-admin template reads mask password-field defaults the way device reads mask password values, and the template editor's Default input for a password field no longer shows the value on screen.
 - Docs: README.md, FEATURES.md, PLANNED_FEATURES.md, ARCHITECTURE.md, the user, admin, topology editor, and operations guides, and GAPS.md describe the 2026-10-07 fixes as built (instance-device and dynamic-template visibility, the enforced hypervisor flag, the port cabling guard, reservation edit and calendar rules, reachability-scoped VLAN allocation, the assistant's device scope and transcript retention), and ADRs 0004, 0006, 0009, and 0013 gain dated as-built amendments.
 - Fixed: the fork save lists every line whose chosen ports no cable path joins in a new `constrained_edges_skipped` field (it still answers 200 and never wires other ports), and the editor's save toast names each such line by device and port and stays until dismissed (#1007).
 - Fixed: a directory-group mapping create the directory cannot validate answers 503 with the fixed detail `Directory unavailable, mapping not validated`; the directory error text goes to the log message only (#1009).
