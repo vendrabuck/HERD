@@ -56,6 +56,11 @@ services:
       # random per-process key.
       CONFIG_ADMIN_PASSWORD: ${CONFIG_ADMIN_PASSWORD:-}
       CONFIG_SESSION_SECRET: ${CONFIG_SESSION_SECRET:-}
+      # Config login attempt limits: this many failures from any sources within
+      # the lockout window make every source wait that long (per-source waits are
+      # fixed in services/config/app/login_limits.py).
+      CONFIG_LOGIN_MAX_ATTEMPTS: ${CONFIG_LOGIN_MAX_ATTEMPTS:-20}
+      CONFIG_LOGIN_LOCKOUT_SECONDS: ${CONFIG_LOGIN_LOCKOUT_SECONDS:-300}
     volumes:
       - herd-config:/data/herd-config
       - /var/run/docker.sock:/var/run/docker.sock:ro

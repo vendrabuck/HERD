@@ -1,10 +1,11 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
+from app import login_limits
 from app.auth import create_session_token, require_config_session
 from app.config_schema import CONFIG_SCHEMA, SCHEMA_KEYS
 from app.config_store import (
@@ -92,10 +93,29 @@ async def get_status():
     }
 
 
+LOGIN_LOCKED_DETAIL = "Too many failed login attempts; try again later"
+
+
 @app.post("/login")
-async def login(req: LoginRequest):
+async def login(req: LoginRequest, request: Request):
+    # Attempt limits (app/login_limits.py): a waiting source, or every source
+    # during a cross-source lockout, is refused before the password is checked.
+    limiter = login_limits.LIMITER
+    source = login_limits.client_source(
+        request.headers.get("x-forwarded-for"),
+        request.client.host if request.client else None,
+    )
+    wait = limiter.retry_after(source)
+    if wait is not None:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            LOGIN_LOCKED_DETAIL,
+            headers={"Retry-After": str(wait)},
+        )
     if not verify_password(req.password):
+        limiter.record_failure(source)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid password")
+    limiter.record_success(source)
     token = create_session_token()
     return {
         "token": token,

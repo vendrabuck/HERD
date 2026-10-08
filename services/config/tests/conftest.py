@@ -19,6 +19,12 @@ def tmp_config_dir(monkeypatch):
     # the random-seed / locked branch clear this var themselves.
     monkeypatch.setenv("CONFIG_ADMIN_PASSWORD", "test-config-pass")
 
+    # A fresh login limiter per test, so failed logins in one test never make
+    # another wait. Tests that need a clock or knobs of their own replace it.
+    import app.login_limits as login_limits
+
+    monkeypatch.setattr(login_limits, "LIMITER", login_limits.LoginLimiter())
+
     with tempfile.TemporaryDirectory() as tmpdir:
         monkeypatch.setenv("HERD_CONFIG_DATA_DIR", tmpdir)
         # Patch the module-level variables in config_store
