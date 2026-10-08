@@ -98,7 +98,7 @@ write their own runs, `provisioning-and-wiring.md` and `dynamic-resources.md`):
 | (none) | job `pending` | `POST /devices/{id}/config-versions/{vid}/schedule`; `POST /apply-jobs/{id}/confirm` (a new row) | CFG-JOB-1 to CFG-JOB-7; CFG-JOB-11 | nothing | CFG-STATE-1 |
 | job `pending` | job `running` | the apply scheduler (`fire_job`) | conditional update on `pending` | nothing | CFG-STATE-2 |
 | job `pending` | job `cancelled` | `DELETE /apply-jobs/{id}` | creator or admin; conditional update on `pending` | nothing | CFG-STATE-3, CFG-STATE-4 |
-| job `running` | job `pending` | the stale sweep | `fired_at` null and `scheduled_for` over 300 seconds ago | nothing | CFG-STATE-5 |
+| job `running` | job `pending` | the stale sweep | `fired_at` null and claimed (`claimed_at`) over 300 seconds ago | nothing | CFG-STATE-5 |
 | job `running` | job `skipped` | the apply scheduler | reservation not active, or creator not authorized | nothing | CFG-STATE-6 |
 | job `running` | job `success` or `failed` | the apply scheduler | the execute outcome | nothing | CFG-STATE-7 |
 | any job status | job `failed` | the scheduler loop after `fire_job` raised | none (by id) | nothing | CFG-STATE-8 |
@@ -136,13 +136,14 @@ job write and every run write reads the row and overwrites it.
   fires nothing. A 204 therefore means the job never fires. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`cancel_apply_job`); `services/inventory/app/services/apply_scheduler.py` (`fire_job`) \
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_cancel_loses_to_a_claim_that_committed_after_its_read`, `test_cancelled_job_is_never_fired_by_a_later_claim`); `services/inventory/tests/test_config_apply_races_live_pg.py` (`test_cancel_holds_the_row_first_claim_fires_nothing`, `test_claim_holds_the_row_first_cancel_answers_409`)
-- **CFG-STATE-5.** Each scheduler tick first returns to `pending` every `running` job
-  whose `fired_at` is null and whose `scheduled_for` is more than
-  `STALE_RUNNING_AFTER_SECONDS` (300) in the past. The age is measured from
-  `scheduled_for`, not from the claim, so a job claimed late (a backlog or an outage) can
-  be re-queued while another scheduler is still firing it. Known gap, see #1089. \
-  Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_resweep_stale_running`, `STALE_RUNNING_AFTER_SECONDS`) \
-  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_resweep_stale_running_requeues`, `test_resweep_leaves_fresh_running_alone`, `test_resweep_leaves_terminal_jobs_alone`)
+- **CFG-STATE-5.** The claim writes `claimed_at`. Each scheduler tick first returns to
+  `pending`, with `claimed_at` cleared, every `running` job whose `fired_at` is null and
+  whose `claimed_at` is more than `STALE_RUNNING_AFTER_SECONDS` (300) in the past. The
+  age is measured from the claim, so a job claimed late (a backlog or an outage) is not
+  re-queued while its claimer is still firing it; a job claimed before the column
+  existed (inventory migration 0024) has it null and is measured from `scheduled_for`. \
+  Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_resweep_stale_running`, `STALE_RUNNING_AFTER_SECONDS`, `fire_job`); `services/inventory/app/models/device_config_apply_job.py` (`DeviceConfigApplyJob`); `services/inventory/migrations/versions/0024_apply_job_claimed_at.py` (`upgrade`) \
+  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_resweep_stale_running_requeues`, `test_resweep_leaves_fresh_running_alone`, `test_resweep_leaves_terminal_jobs_alone`, `test_claim_records_claimed_at`, `test_sweep_does_not_requeue_a_late_claimed_job_still_firing`, `test_sweep_requeues_a_job_claimed_past_the_threshold_and_clears_the_claim`, `test_sweep_leaves_a_recent_claim_alone_whatever_its_scheduled_time`)
 - **CFG-STATE-6.** A claimed job becomes `skipped`, with its reason in `error` and
   `fired_at` set, when its reservation is not active (CFG-SCHED-5) or its creator fails
   the fire-time authority check (CFG-SCHED-6). \
@@ -1292,8 +1293,6 @@ confirmed by reading only.
 
 ### Open defects
 
-- #1089 (CFG-STATE-5): the stale sweep measures from `scheduled_for`, so a late-claimed
-  job can be fired twice by two schedulers.
 - #1090 (CFG-SCHED-8): scheduled runs carry no reservation, so a reservation owner cannot
   read the dry-run transcript the review dialog asks for.
 - #1091 (CFG-RUN-6): retrying a failed dry run pushes the configuration for real.

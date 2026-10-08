@@ -1039,3 +1039,81 @@ async def test_fire_job_unresolvable_device_is_left_to_existing_behavior(monkeyp
         assert job.status == "success"
         assert str(job.run_id) == run_id
         assert len(client.posts) == 1
+
+
+# ---- stale sweep measured from the claim (issue #1089) ----
+
+
+@pytest.mark.asyncio
+async def test_claim_records_claimed_at(monkeypatch):
+    async with TestSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        _, job = await _seed_version_and_job(db, scheduled_for=now - timedelta(hours=1))
+        assert job.claimed_at is None
+        _patch_creator_authorized(monkeypatch, allowed=False)
+        await fire_job(db, job, FakeClient())
+        await db.refresh(job)
+        assert job.status == "skipped"
+        claimed = job.claimed_at.replace(tzinfo=timezone.utc)
+        assert now - timedelta(seconds=5) <= claimed <= datetime.now(timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_requeue_a_late_claimed_job_still_firing(monkeypatch):
+    """A job scheduled an hour ago is claimed now (a backlog or an outage). While
+    its execute call is in flight another scheduler's tick runs the sweep and then
+    looks for due jobs: the job must stay running and be fired exactly once."""
+    async with TestSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        _, job = await _seed_version_and_job(db, scheduled_for=now - timedelta(hours=1))
+        _patch_creator_authorized(monkeypatch)
+        seen: dict = {}
+        posts: list = []
+
+        async def execute_while_peer_ticks(client, fired_job, config):
+            posts.append(fired_job.id)
+            async with TestSessionLocal() as peer:
+                seen["requeued"] = await _resweep_stale_running(peer, datetime.now(timezone.utc))
+                seen["due"] = await _due_jobs(peer, datetime.now(timezone.utc))
+                row = await peer.get(DeviceConfigApplyJob, fired_job.id)
+                await peer.refresh(row)
+                seen["status"] = row.status
+            return "success", None, None
+
+        monkeypatch.setattr(apply_scheduler, "_post_internal_execute", execute_while_peer_ticks)
+        await fire_job(db, job, FakeClient())
+        await db.refresh(job)
+
+    assert seen == {"requeued": 0, "due": [], "status": "running"}
+    assert posts == [job.id]
+    assert job.status == "success"
+
+
+@pytest.mark.asyncio
+async def test_sweep_requeues_a_job_claimed_past_the_threshold_and_clears_the_claim():
+    async with TestSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        _, job = await _seed_version_and_job(db, scheduled_for=now - timedelta(minutes=1))
+        job.status = "running"
+        job.claimed_at = now - timedelta(minutes=6)
+        await db.commit()
+
+        affected = await _resweep_stale_running(db, now)
+        assert affected == 1
+        await db.refresh(job)
+        assert job.status == "pending"
+        assert job.claimed_at is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_leaves_a_recent_claim_alone_whatever_its_scheduled_time():
+    async with TestSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        _, job = await _seed_version_and_job(db, scheduled_for=now - timedelta(days=2))
+        job.status = "running"
+        job.claimed_at = now - timedelta(minutes=4)
+        await db.commit()
+
+        assert await _resweep_stale_running(db, now) == 0
+        await db.refresh(job)
+        assert job.status == "running"

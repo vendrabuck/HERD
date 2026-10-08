@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from herd_common.acl import user_has_manage_or_owns_active_reservation_internal
 from herd_common.device_config import connection_type_supports_configure
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
@@ -188,11 +188,16 @@ async def _resweep_stale_running(
     """Re-queue jobs left in `running` past the stale threshold.
 
     A stuck-running job has status='running', fired_at=NULL (terminal flip never
-    happened), and scheduled_for older than the threshold. The WHERE clause is
-    selective enough that we will not race a job that is legitimately still
-    being worked: a healthy claim flips status='running' within ms of
-    scheduled_for, so anything more than five minutes past schedule with
-    fired_at still NULL has crashed.
+    happened), and was CLAIMED more than the threshold ago (issue #1089). The age
+    is measured from `claimed_at`, which the claim in `fire_job` writes, never
+    from `scheduled_for`: a job claimed late (after a scheduler outage, behind a
+    backlog, or created with a time already in the past) is legitimately being
+    fired long after its scheduled time, and re-queuing it would let a second
+    scheduler fire it again. A healthy fire takes at most the reservation, ACL,
+    and execute timeouts (well under a minute) from its claim, so a job still
+    running five minutes after its claim has crashed. A row claimed before
+    `claimed_at` existed has it null and falls back to `scheduled_for`, the old
+    rule. The re-queue clears `claimed_at` so the next claim restarts the clock.
 
     Returns the row count that was re-queued (useful for tests + logs).
     """
@@ -202,9 +207,11 @@ async def _resweep_stale_running(
         .where(
             DeviceConfigApplyJob.status == "running",
             DeviceConfigApplyJob.fired_at.is_(None),
-            DeviceConfigApplyJob.scheduled_for < threshold,
+            func.coalesce(DeviceConfigApplyJob.claimed_at, DeviceConfigApplyJob.scheduled_for)
+            < threshold,
         )
-        .values(status="pending")
+        .values(status="pending", claimed_at=None)
+        .execution_options(synchronize_session=False)
     )
     await db.commit()
     if result.rowcount:
@@ -258,7 +265,7 @@ async def fire_job(
             DeviceConfigApplyJob.id == job.id,
             DeviceConfigApplyJob.status == "pending",
         )
-        .values(status="running")
+        .values(status="running", claimed_at=datetime.now(timezone.utc))
     )
     await db.commit()
     if claim.rowcount == 0:
