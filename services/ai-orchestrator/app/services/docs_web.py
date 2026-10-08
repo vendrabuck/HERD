@@ -21,18 +21,19 @@ at most AI_DOCS_WEB_MAX_BYTES before being cut. The per-hop timeout is the
 dispatcher's existing HTTP client timeout.
 
 The resolver is injected so the unit tests cover every refused address class
-without touching DNS or the network.
+without touching DNS or the network. The address predicate, the resolver type,
+and the default resolver live once in herd_common.public_address (shared with
+integration's webhook destination check) and are re-exported here under their
+old names.
 """
 
 from __future__ import annotations
 
-import ipaddress
 import logging
-import socket
-from collections.abc import Callable
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
+from herd_common.public_address import Resolver, default_resolver, is_public_address
 
 from app.config import settings
 from app.services.docs_sources import DocsLookupError, html_to_text, normalize_plain_text
@@ -43,20 +44,6 @@ MAX_REDIRECTS = 3
 USER_AGENT = "HERD-ai-orchestrator docs-lookup"
 ALLOWED_CONTENT_TYPES = frozenset({"text/html", "text/plain", "text/markdown", "text/x-markdown"})
 REDIRECT_STATUS = frozenset({301, 302, 303, 307, 308})
-
-Resolver = Callable[[str], list[str]]
-
-# RFC 6598 shared address space (carrier-grade NAT; also Tailscale and some
-# cloud and Kubernetes networks). ipaddress does not count it as private, so it
-# is refused explicitly (issue #1055).
-SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
-
-
-def default_resolver(host: str) -> list[str]:
-    """Resolve a hostname to every address it answers with. Sorted so the
-    refusal a caller sees for a multi-address host is deterministic."""
-    infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
-    return sorted({info[4][0] for info in infos})
 
 
 def _dot_segment(segment: str) -> str | None:
@@ -161,36 +148,6 @@ def match_prefix(url: str, prefixes: list[str]) -> str | None:
         if normalized.startswith(prefix):
             return normalized
     return None
-
-
-def is_public_address(raw_address: str) -> bool:
-    """True only for an address the container may legitimately talk to.
-
-    Refuses loopback, private, shared address space (100.64.0.0/10),
-    link-local (which is where cloud metadata services live), multicast,
-    unspecified, and reserved ranges, plus the
-    IPv4-mapped IPv6 forms of all of them, which is the usual way a private
-    address sneaks past a naive IPv4-only check.
-    """
-    try:
-        address = ipaddress.ip_address(raw_address)
-    except ValueError:
-        return False
-    if isinstance(address, ipaddress.IPv6Address):
-        if address.ipv4_mapped is not None:
-            return False
-        if address.sixtofour is not None or address.teredo is not None:
-            return False
-    elif address in SHARED_ADDRESS_SPACE:
-        return False
-    return not (
-        address.is_loopback
-        or address.is_private
-        or address.is_link_local
-        or address.is_multicast
-        or address.is_unspecified
-        or address.is_reserved
-    )
 
 
 def assert_public_host(url: str, resolver: Resolver) -> None:

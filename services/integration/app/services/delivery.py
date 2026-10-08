@@ -6,6 +6,13 @@ never double-sends to an already-delivered subscription. A delivery that
 exhausts its retries writes a `dead` ledger row, which is the dead-letter record
 the acceptance criteria require. Each delivery runs in its own DB session so the
 fan-out can run concurrently (a SQLAlchemy async session is not concurrency-safe).
+
+Before any POST the destination rule is checked again (app/services/destination.py):
+a host that no longer resolves to allowed addresses gets a `failed` row with the
+fixed text `destination not allowed` and is not retried. Redirects are not
+followed: a 3xx answer is a failed attempt like any other non-2xx. The ledger's
+`last_error` carries only `upstream answered HTTP <status>` or
+`delivery failed (<ClassName>)`; the full error text goes to the log message.
 """
 
 import logging
@@ -18,7 +25,9 @@ from herd_common.webhooks import WEBHOOK_SIGNATURE_HEADER, sign_body
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from app.config import settings
 from app.models.webhook import WebhookDelivery, WebhookSubscription
+from app.services.destination import DESTINATION_NOT_ALLOWED, destination_allowed, target_host
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +101,26 @@ async def deliver_one(
         if existing is not None and existing.status == "delivered":
             return "skipped"
 
+        if not await destination_allowed(target.target_url, settings.webhook_allowed_hosts):
+            logger.warning(
+                "Webhook delivery to subscription %s refused: host %r does not resolve to "
+                "an allowed address",
+                target.id,
+                target_host(target.target_url),
+                extra={"action": "webhook_destination_refused"},
+            )
+            return await _record(
+                session,
+                existing,
+                target,
+                event_id,
+                event_type,
+                status="failed",
+                attempts=0,
+                response_status=None,
+                last_error=DESTINATION_NOT_ALLOWED,
+            )
+
         signature = sign_body(body, target.secret)
         headers = {
             "Content-Type": "application/json",
@@ -101,7 +130,7 @@ async def deliver_one(
 
         async def _post() -> httpx.Response:
             state["attempts"] += 1
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
                 resp = await client.post(target.target_url, content=body, headers=headers)
             state["status"] = resp.status_code
             resp.raise_for_status()
@@ -115,6 +144,13 @@ async def deliver_one(
                 max_delay=RETRY_MAX_DELAY,
             )
         except Exception as exc:
+            logger.warning(
+                "Webhook delivery to subscription %s dead after %d attempts: %s",
+                target.id,
+                state["attempts"],
+                exc,
+                extra={"action": "webhook_delivery_dead"},
+            )
             return await _record(
                 session,
                 existing,
@@ -124,7 +160,7 @@ async def deliver_one(
                 status="dead",
                 attempts=state["attempts"],
                 response_status=state["status"],
-                last_error=str(exc)[:1024],
+                last_error=delivery_error_text(exc),
             )
 
         return await _record(
@@ -139,6 +175,15 @@ async def deliver_one(
             last_error=None,
             delivered_at=datetime.now(timezone.utc),
         )
+
+
+def delivery_error_text(exc: BaseException) -> str:
+    """The ledger text for a failed delivery: the answer's status when the
+    receiver answered, else the exception's class name. Never the exception's
+    own text, which can carry the URL and transport detail."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"upstream answered HTTP {exc.response.status_code}"
+    return f"delivery failed ({type(exc).__name__})"
 
 
 async def _record(

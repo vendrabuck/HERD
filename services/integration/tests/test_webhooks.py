@@ -202,7 +202,7 @@ async def test_delivery_persistent_failure_retries_then_dead(session_factory, mo
     assert rows[0].status == "dead"
     assert rows[0].attempts == 2
     assert rows[0].response_status == 500
-    assert rows[0].last_error
+    assert rows[0].last_error == "upstream answered HTTP 500"
 
 
 async def test_delivery_connection_error_is_retried_then_dead(session_factory, monkeypatch):
@@ -217,6 +217,7 @@ async def test_delivery_connection_error_is_retried_then_dead(session_factory, m
     assert len(record["calls"]) == 2
     rows = await _deliveries(session_factory, target.id)
     assert rows[0].status == "dead"
+    assert rows[0].last_error == "delivery failed (ConnectError)"
 
 
 async def test_redelivered_event_with_delivered_row_is_skipped(session_factory, monkeypatch):

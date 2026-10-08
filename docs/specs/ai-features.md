@@ -936,9 +936,11 @@ documentation sites, instead of answering such questions from memory.
   Pinned by: `services/ai-orchestrator/tests/test_docs_web.py` (`test_normalize_url_canonicalizes`, `test_normalize_url_refuses_non_https_and_userinfo`, `test_prefix_match_refuses_lookalikes`, `test_a_bare_host_prefix_gets_a_trailing_slash`, `test_fetch_refuses_a_url_outside_the_allowlist`, `test_fetch_refuses_with_an_empty_allowlist`, `test_fetch_refuses_a_dot_segment_path_that_leaves_the_prefix`, `test_fetch_requests_the_normalized_path_that_was_matched`)
 - **AI-DOCS-11.** Every address the host resolves to must be public: loopback, private,
   shared address space (100.64.0.0/10, issue #1055), link-local, multicast, unspecified, and reserved addresses, their IPv4-mapped forms, and
-  6to4 and Teredo addresses are refused, as is a host that does not resolve. \
-  Enforced in: `services/ai-orchestrator/app/services/docs_web.py` (`assert_public_host`, `is_public_address`) \
-  Pinned by: `services/ai-orchestrator/tests/test_docs_web.py` (`test_refused_address_classes`, `test_public_addresses_are_allowed`, `test_fetch_refuses_when_any_resolved_address_is_private`, `test_fetch_refuses_when_the_host_does_not_resolve`)
+  6to4 and Teredo addresses are refused, as is a host that does not resolve. The predicate
+  lives once in `herd_common` and integration's webhook destination rule (INTEG-HOOK-2)
+  uses the same copy. \
+  Enforced in: `services/ai-orchestrator/app/services/docs_web.py` (`assert_public_host`); `services/common/herd_common/public_address.py` (`is_public_address`) \
+  Pinned by: `services/ai-orchestrator/tests/test_docs_web.py` (`test_refused_address_classes`, `test_public_addresses_are_allowed`, `test_fetch_refuses_when_any_resolved_address_is_private`, `test_fetch_refuses_when_the_host_does_not_resolve`); `services/common/tests/test_public_address.py` (`test_refused_address_classes`, `test_public_addresses_are_allowed`)
 - **AI-DOCS-12.** Redirects are followed by hand, at most 3, each target normalized as in
   AI-DOCS-10, re-matched against the prefixes, and re-resolved. \
   Enforced in: `services/ai-orchestrator/app/services/docs_web.py` (`fetch_web_document`, `MAX_REDIRECTS`) \

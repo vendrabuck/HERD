@@ -229,7 +229,8 @@ lives under `/api/v1/webhooks`.
 
 Request fields:
 
-- `target_url` (string, required): an `http://` or `https://` URL.
+- `target_url` (string, required): an `http://` or `https://` URL whose host
+  resolves to public addresses only (see Destination rule below).
 - `event_types` (list of string, required, at least one): the events to deliver.
 - `secret` (string, optional): the shared HMAC secret. If omitted, HERD generates
   one and returns it in the creation response.
@@ -249,6 +250,25 @@ curl -sS -X POST https://herd.example.com/api/v1/webhooks \
       }'
 # 201 Created; response includes the generated "secret" once.
 ```
+
+### Destination rule
+
+Every address the `target_url` host resolves to must be a public address.
+Loopback, link-local, private (RFC 1918 and IPv6 unique-local), shared address
+space (`100.64.0.0/10`), multicast, and unspecified addresses are refused, as is
+a host that does not resolve. An IP literal host is judged as written.
+Registration answers `422` with `{"detail": "target_url must resolve to a public
+address"}` and stores nothing when the rule is not met.
+
+The rule is checked again before every delivery, so a destination that later
+resolves somewhere else is not sent to: that delivery is recorded with status
+`failed` and `last_error` `destination not allowed`, and is not retried.
+
+An operator admits internal destinations on purpose with the integration
+service's `WEBHOOK_ALLOWED_HOSTS` setting: a comma-separated list of hostnames
+(matched exactly against the URL host, case-insensitively) and CIDRs (an address
+inside one is allowed). It is empty by default. See
+[ENV_VARS.md](ENV_VARS.md#integration-service).
 
 Other subscription endpoints (all admin):
 
@@ -390,7 +410,8 @@ def receive():
   once an event is `delivered` to a subscription, a redelivery of that event is
   skipped. Use the payload `event_id` as your own idempotency key too.
 - Retried with backoff. A timeout, connection error, or non-2xx response is
-  retried a bounded number of times with exponential backoff.
+  retried a bounded number of times with exponential backoff. Redirects are not
+  followed: a `3xx` answer counts as a failed attempt, so register the final URL.
 - Dead-lettered on exhaustion. When the retries are exhausted, HERD records a
   ledger row with status `dead`. A failing endpoint never blocks delivery to
   other subscriptions and never stalls the event stream.
@@ -399,9 +420,12 @@ def receive():
   as a failed attempt.
 
 Inspect what happened with `GET /api/v1/webhooks/{id}/deliveries` (admin), newest
-first. Each ledger row carries `event_id`, `event_type`, `status` (`delivered`
-or `dead`), `attempts`, `response_status`, `last_error`, `created_at`, and
-`delivered_at`.
+first. Each ledger row carries `event_id`, `event_type`, `status` (`delivered`,
+`dead`, or `failed` when the destination was not allowed), `attempts`,
+`response_status`, `last_error`, `created_at`, and `delivered_at`. `last_error`
+is one of `upstream answered HTTP <status>` (the receiver answered with a
+non-2xx status), `delivery failed (<ErrorClass>)` (no answer, for example
+`ConnectError` or `ReadTimeout`), or `destination not allowed`.
 
 ## Versioning and deprecation policy
 

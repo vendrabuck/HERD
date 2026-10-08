@@ -406,6 +406,7 @@ consumed via its own NATS durable consumer.
 | `WEBHOOK_DELIVERY_TIMEOUT_SECONDS` | `10.0` | HTTP timeout for a single outbound webhook delivery attempt. |
 | `WEBHOOK_DELIVERY_ATTEMPTS` | `4` | Maximum delivery attempts (including the first) before a webhook delivery is recorded as dead-lettered. |
 | `WEBHOOK_TEST_SINK_ENABLED` | `false` | When true, exposes a test-only sink endpoint used to assert webhook deliveries in integration tests. Leave off outside test environments. |
+| `WEBHOOK_ALLOWED_HOSTS` | empty | Comma-separated hostnames or CIDRs that a webhook `target_url` may use even though they resolve to non-public addresses. A hostname matches the URL host exactly (case-insensitive) and is admitted without resolving it; a CIDR (or a single address) admits any resolved address inside it. With it empty, every destination host must resolve to public addresses only, checked at registration (422 `target_url must resolve to a public address`) and again before each delivery (a `failed` ledger row with `destination not allowed`). A malformed CIDR refuses to start the service. `docker-compose.override.yml` sets `integration,reservations` for the live tests; `make prod` leaves it empty. |
 
 ## Build identifier (issue #846)
 
