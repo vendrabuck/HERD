@@ -522,8 +522,9 @@ presses Save and Restart. Login to HERD stays disabled until the file exists.
   Pinned by: `services/config/tests/test_config.py` (`test_apply_not_configured`)
 - **OPS-CONFIG-16.** `POST /apply` answers 200 `{restarted, errors}`; each per-service
   failure, a missing Docker SDK, an unreachable Docker daemon, and a failed listing are
-  entries in `errors`, and those entries carry the exception text. Known gap, see
-  #1086. \
+  entries in `errors`. An entry names what failed and the exception class only
+  (`Failed to restart <service>: <ClassName>`, `Cannot connect to Docker: <ClassName>`,
+  `Cannot list containers: <ClassName>`); the exception text goes to the log message. \
   Enforced in: `services/config/app/docker_ctl.py` (`restart_services`) \
   Pinned by: `services/config/tests/test_docker_ctl.py` (`test_restart_services_collects_errors`, `test_restart_services_returns_error_when_docker_sdk_missing`, `test_restart_services_returns_error_when_from_env_fails`, `test_restart_services_returns_error_when_list_fails`)
 - **OPS-CONFIG-17.** Session tokens are signed with `CONFIG_SESSION_SECRET` when set,
@@ -1420,7 +1421,6 @@ failing when a dependency is down (OPS-LIVE-1), services are said to crash-loop 
 
 ### Open defects
 
-- #1086, OPS-CONFIG-16: the config apply response carries raw exception text.
 - #1087, OPS-LOG-9, OPS-LIVE-1, OPS-SET-7, OPS-NATS-13: the operator documents and
   FEATURES.md describe behavior the code does not have.
 - #1093, OPS-HEALTH-7: the device check's 503 carries raw exception text from the

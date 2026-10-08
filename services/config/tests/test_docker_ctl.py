@@ -1,5 +1,6 @@
 """Tests for app.docker_ctl.restart_services using a fake Docker client."""
 
+import logging
 import sys
 import types
 
@@ -19,7 +20,7 @@ class _FakeContainer:
     def restart(self, timeout: int = 30) -> None:
         self.restart_called = True
         if self.fail:
-            raise RuntimeError("kaboom")
+            raise RuntimeError("kaboom: 500 Server Error for http+docker://localhost/v1.45")
 
 
 class _FakeContainersAPI:
@@ -168,16 +169,19 @@ def test_restart_services_fails_closed_when_own_project_label_missing(monkeypatc
     assert auth.restart_called is False
 
 
-def test_restart_services_collects_errors(monkeypatch):
+def test_restart_services_collects_errors(monkeypatch, caplog):
     working = _FakeContainer("auth")
     broken = _FakeContainer("inventory", fail=True)
     _install_fake_docker(monkeypatch, [working, broken])
 
+    caplog.set_level(logging.ERROR, logger="app.docker_ctl")
     result = restart_services()
     assert result["restarted"] == ["auth"]
-    assert len(result["errors"]) == 1
-    assert "inventory" in result["errors"][0]
-    assert "kaboom" in result["errors"][0]
+    # Issue #1086: the response names the service and the exception class
+    # only; the exception text goes to the log.
+    assert result["errors"] == ["Failed to restart inventory: RuntimeError"]
+    assert "kaboom" in caplog.text
+    assert "http+docker://localhost" in caplog.text
 
 
 def test_restart_services_returns_error_when_docker_sdk_missing(monkeypatch):
@@ -191,20 +195,30 @@ def test_restart_services_returns_error_when_docker_sdk_missing(monkeypatch):
     assert "Docker SDK not installed" in result["errors"][0]
 
 
-def test_restart_services_returns_error_when_from_env_fails(monkeypatch):
-    _install_fake_docker(monkeypatch, [], from_env_exc=RuntimeError("no socket"))
+def test_restart_services_returns_error_when_from_env_fails(monkeypatch, caplog):
+    _install_fake_docker(
+        monkeypatch,
+        [],
+        from_env_exc=FileNotFoundError("no socket at /var/run/docker.sock"),
+    )
 
+    caplog.set_level(logging.ERROR, logger="app.docker_ctl")
     result = restart_services()
     assert result["restarted"] == []
-    assert any("Cannot connect to Docker" in err for err in result["errors"])
+    assert result["errors"] == ["Cannot connect to Docker: FileNotFoundError"]
+    assert "/var/run/docker.sock" in caplog.text
 
 
-def test_restart_services_returns_error_when_list_fails(monkeypatch):
-    _install_fake_docker(monkeypatch, [], list_exc=RuntimeError("daemon busy"))
+def test_restart_services_returns_error_when_list_fails(monkeypatch, caplog):
+    _install_fake_docker(
+        monkeypatch, [], list_exc=RuntimeError("daemon busy at tcp://10.0.0.5:2376")
+    )
 
+    caplog.set_level(logging.ERROR, logger="app.docker_ctl")
     result = restart_services()
     assert result["restarted"] == []
-    assert any("Cannot list containers" in err for err in result["errors"])
+    assert result["errors"] == ["Cannot list containers: RuntimeError"]
+    assert "tcp://10.0.0.5:2376" in caplog.text
 
 
 @pytest.mark.parametrize("name", sorted(SKIP_SERVICES))
