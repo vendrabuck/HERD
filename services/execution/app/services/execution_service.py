@@ -13,7 +13,7 @@ from herd_common.device_config import (
     validate_device_config,
     validate_device_config_with_schema,
 )
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -474,7 +474,99 @@ async def run_driver_action(
         method_kwargs=method_kwargs,
         dry_run=dry_run,
     )
+    run_id = run.id
 
+    # Everything after the row is written runs under one guard (issue #1097): an
+    # exception nothing below anticipates (a database error on the driver cache,
+    # a bug) must not leave the run PENDING or RUNNING for good, since nothing
+    # sweeps such rows. The 422 for a refused configure input is an HTTPException
+    # that has already finished the run FAILED, so it passes through.
+    try:
+        return await _drive_run(
+            db,
+            run,
+            device_data=device_data,
+            action=action,
+            driver_id=driver_id,
+            driver_sha256=driver_sha256,
+            driver_filename=driver_filename,
+            connection_type=connection_type,
+            context=context,
+            password_keys=password_keys,
+            port_a=port_a,
+            port_b=port_b,
+            method_kwargs=method_kwargs,
+            dry_run=dry_run,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return await _fail_run_unexpected(db, run_id, exc)
+
+
+UNEXPECTED_FAILURE_PREFIX = "execution failed"
+
+
+async def _fail_run_unexpected(db: AsyncSession, run_id: uuid.UUID, exc: Exception) -> ExecutionRun:
+    """Finish a run that an unexpected exception interrupted as FAILED.
+
+    The stored error is the fixed `execution failed: <ClassName>` (issue #840's
+    class-name-only rule); the exception text goes to the log MESSAGE only. The
+    write is a compare-and-swap on PENDING or RUNNING, so a run that already
+    reached a final status keeps it. The session is rolled back first, since the
+    exception may have left its transaction unusable (an IntegrityError does).
+    If the write itself fails, the ORIGINAL exception is re-raised.
+    """
+    logger.error(
+        "Run %s interrupted by %s: %s",
+        run_id,
+        type(exc).__name__,
+        exc,
+        extra={"run_id": str(run_id)},
+    )
+    try:
+        await db.rollback()
+        await db.execute(
+            update(ExecutionRun)
+            .where(
+                ExecutionRun.id == run_id,
+                ExecutionRun.status.in_(("PENDING", "RUNNING")),
+            )
+            .values(
+                status="FAILED",
+                error=f"{UNEXPECTED_FAILURE_PREFIX}: {type(exc).__name__}",
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+        await db.commit()
+        run = await db.get(ExecutionRun, run_id, populate_existing=True)
+    except Exception:
+        logger.exception("Could not record run %s as FAILED", run_id)
+        raise exc
+    if run is None:
+        raise exc
+    return run
+
+
+async def _drive_run(
+    db: AsyncSession,
+    run: ExecutionRun,
+    *,
+    device_data: dict,
+    action: str,
+    driver_id: uuid.UUID,
+    driver_sha256: str,
+    driver_filename: str,
+    connection_type: str,
+    context: dict,
+    password_keys: set[str],
+    port_a: str | None,
+    port_b: str | None,
+    method_kwargs: dict | None,
+    dry_run: bool,
+) -> ExecutionRun:
+    """Load the driver, run the action in the sandbox, and record the result on an
+    already-written run row (the body of run_driver_action after the row exists)."""
     # Load driver
     try:
         driver_path = await load_driver(

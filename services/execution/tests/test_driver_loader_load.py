@@ -685,4 +685,186 @@ async def test_load_driver_updates_existing_row_under_concurrent_insert(db):
     # Exactly one row, updated in place (not a duplicate insert).
     assert len(rows) == 1
     assert rows[0].sha256 == "fresh_sha"
-    assert rows[0].local_path.endswith(str(driver_id))
+    # The attempt's own directory, a sibling of the legacy <cache>/<driver id> path.
+    assert Path(rows[0].local_path).name.startswith(f"{driver_id}-")
+
+
+# --- Concurrent first loads (issue #1097) ---
+
+
+def _patch_loader_settings(mock_settings, cache_root: str) -> None:
+    mock_settings.driver_cache_path = cache_root
+    mock_settings.inventory_service_url = "http://test"
+    mock_settings.internal_api_token = "token"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_loads_of_one_driver_both_succeed(tmp_path):
+    """Two first loads of one driver, both past the cache miss before either writes
+    the cache row: both succeed, one cache row exists, both callers get the SAME
+    directory, and the loser's extraction is removed. Before the fix the second
+    insert broke the unique driver_id and raised IntegrityError."""
+    import asyncio
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'cache.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+
+    driver_id = uuid.uuid4()
+    zip_bytes = _make_zip(VALID_L1_DRIVER)
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+
+    # Both loads must be past get_cached_driver (a miss) before either proceeds.
+    arrived = 0
+    both_missed = asyncio.Event()
+
+    async def _download(_driver_id):
+        nonlocal arrived
+        arrived += 1
+        if arrived == 2:
+            both_missed.set()
+        await both_missed.wait()
+        return zip_bytes
+
+    async def _load():
+        async with sessions() as session:
+            return await load_driver(session, driver_id, "sha-1", "driver.zip", "Layer 1 Switch")
+
+    try:
+        with (
+            patch(
+                "app.services.driver_loader.download_driver_package",
+                new=AsyncMock(side_effect=_download),
+            ),
+            patch("app.services.driver_loader.extract_config_schema_json", return_value=None),
+            patch("app.services.driver_loader.settings") as mock_settings,
+        ):
+            _patch_loader_settings(mock_settings, str(cache_root))
+            first, second = await asyncio.wait_for(asyncio.gather(_load(), _load()), 30)
+
+        assert first == second
+        assert Path(first).is_dir()
+        assert (Path(first) / "driver.py").is_file()
+        # Only the winner's extraction remains on disk.
+        assert [p.name for p in cache_root.iterdir()] == [Path(first).name]
+        async with sessions() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(DriverCache).where(DriverCache.driver_id == driver_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert len(rows) == 1
+        assert rows[0].local_path == first
+        assert rows[0].sha256 == "sha-1"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_load_driver_adopts_row_written_after_its_own_read(db, tmp_path):
+    """The insert is insert-or-nothing: when a concurrent load commits the row
+    between this load's read and its insert, the insert does nothing, the
+    re-read finds the winner (same sha256, directory present), and this load
+    returns the winner's directory and removes its own extraction."""
+    from app.services import driver_loader
+
+    driver_id = uuid.uuid4()
+    winner_dir = tmp_path / f"{driver_id}-winner"
+    winner_dir.mkdir()
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+
+    real_read = driver_loader._read_cache_row
+    calls = 0
+
+    async def _read(session, did):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # The concurrent winner commits right after our first read saw nothing.
+            session.add(
+                DriverCache(
+                    driver_id=driver_id,
+                    sha256="sha-1",
+                    local_path=str(winner_dir),
+                    metadata_json=None,
+                    config_schema_json=None,
+                )
+            )
+            await session.commit()
+            return None
+        return await real_read(session, did)
+
+    with (
+        patch.object(driver_loader, "_read_cache_row", new=_read),
+        patch.object(
+            driver_loader,
+            "download_driver_package",
+            new=AsyncMock(return_value=_make_zip(VALID_L1_DRIVER)),
+        ),
+        patch.object(driver_loader, "extract_config_schema_json", return_value=None),
+        patch("app.services.driver_loader.settings") as mock_settings,
+    ):
+        _patch_loader_settings(mock_settings, str(cache_root))
+        path = await load_driver(db, driver_id, "sha-1", "driver.zip", "Layer 1 Switch")
+
+    assert path == str(winner_dir)
+    assert list(cache_root.iterdir()) == []
+    rows = (
+        (await db.execute(select(DriverCache).where(DriverCache.driver_id == driver_id)))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].local_path == str(winner_dir)
+
+
+@pytest.mark.asyncio
+async def test_load_driver_replaces_row_of_another_package_and_removes_its_directory(db, tmp_path):
+    """A row for a different sha256 (or a missing directory) is updated in place to
+    this load's directory, and the replaced directory is removed."""
+    from app.services import driver_loader
+
+    driver_id = uuid.uuid4()
+    old_dir = tmp_path / f"{driver_id}-old"
+    old_dir.mkdir()
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+    db.add(
+        DriverCache(
+            driver_id=driver_id,
+            sha256="old-sha",
+            local_path=str(old_dir),
+            metadata_json=None,
+            config_schema_json=None,
+        )
+    )
+    await db.commit()
+
+    with (
+        patch.object(driver_loader, "get_cached_driver", new=AsyncMock(return_value=None)),
+        patch.object(
+            driver_loader,
+            "download_driver_package",
+            new=AsyncMock(return_value=_make_zip(VALID_L1_DRIVER)),
+        ),
+        patch.object(driver_loader, "extract_config_schema_json", return_value=None),
+        patch("app.services.driver_loader.settings") as mock_settings,
+    ):
+        _patch_loader_settings(mock_settings, str(cache_root))
+        path = await load_driver(db, driver_id, "new-sha", "driver.zip", "Layer 1 Switch")
+
+    assert Path(path).parent == cache_root
+    assert Path(path).is_dir()
+    assert not old_dir.exists()
+    row = (
+        await db.execute(select(DriverCache).where(DriverCache.driver_id == driver_id))
+    ).scalar_one()
+    assert row.sha256 == "new-sha"
+    assert row.local_path == path

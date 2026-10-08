@@ -814,3 +814,29 @@ async def test_user_owns_reservation_returns_false_on_httpx_error(monkeypatch):
     monkeypatch.setattr(ex_router.httpx, "AsyncClient", lambda *a, **kw: _FailingClient())
     result = await ex_router._user_owns_reservation(uuid.uuid4(), "Bearer t")
     assert result is False
+
+
+@pytest.mark.asyncio
+async def test_execute_unexpected_load_error_answers_201_with_failed_run(admin_client, monkeypatch):
+    """Issue #1097: an unexpected load error used to escape as a 500 with the run
+    left PENDING. The call now answers 201 with the run FAILED (CFG-EXEC-5)."""
+    from sqlalchemy.exc import IntegrityError
+
+    monkeypatch.setattr(ex_router, "fetch_device", AsyncMock(return_value=_fake_device_data()))
+    monkeypatch.setattr(ex_router, "fetch_template", AsyncMock(return_value=_fake_template_data()))
+    monkeypatch.setattr(
+        ex_service,
+        "load_driver",
+        AsyncMock(side_effect=IntegrityError("INSERT", {}, Exception("UNIQUE failed"))),
+    )
+
+    resp = await admin_client.post(
+        "/execute",
+        json={"device_id": DEVICE_ID, "action": "status", "user_id": USER_ID},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["status"] == "FAILED"
+    assert resp.json()["error"] == "execution failed: IntegrityError"
+    async with TestSessionLocal() as session:
+        stored = await session.get(ExecutionRun, uuid.UUID(resp.json()["id"]))
+    assert stored.status == "FAILED"

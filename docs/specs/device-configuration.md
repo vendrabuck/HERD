@@ -107,12 +107,15 @@ write their own runs, `provisioning-and-wiring.md` and `dynamic-resources.md`):
 | run `PENDING` | run `RUNNING` | `run_driver_action` | none | nothing | CFG-RUNSTATE-3 |
 | run `RUNNING` | run `FAILED` | `run_driver_action` | dry run refused | nothing | CFG-RUNSTATE-3 |
 | run `RUNNING` | run `SUCCESS`, `FAILED`, or `TIMEOUT` | `run_driver_action` | the sandbox result | nothing | CFG-RUNSTATE-4 |
+| run `PENDING` or `RUNNING` | run `FAILED` | `run_driver_action` (`_fail_run_unexpected`) | an unexpected exception; conditional update on `PENDING` or `RUNNING` | nothing | CFG-RUNSTATE-5 |
 
 **Concurrency.** The scheduler's claim and the cancel are compare-and-swap updates on
 `pending`, so exactly one of them wins a pending job. `_due_jobs` also selects with
 `FOR UPDATE SKIP LOCKED` on Postgres, but the lock is released at the first commit
 inside `fire_job`, so the claim is what keeps two schedulers off one job. Every other
-job write and every run write reads the row and overwrites it.
+job write and every run write reads the row and overwrites it, except the final
+`FAILED` write after an unexpected exception (CFG-RUNSTATE-5), which is conditional on
+`PENDING` or `RUNNING`.
 
 **Rules.**
 
@@ -178,12 +181,16 @@ job write and every run write reads the row and overwrites it.
   not, the run is `TIMEOUT` if the sandbox error contains `timed out`, else `FAILED`. \
   Enforced in: `services/execution/app/services/execution_service.py` (`run_driver_action`, `driver_result_failed`) \
   Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_run_driver_action_success`, `test_run_driver_action_execution_timeout`, `test_run_driver_action_execution_failure`); `services/execution/tests/test_execution_service_edges.py` (`test_run_driver_action_driver_result_failure_records_failed`, `test_run_driver_action_bare_data_output_stays_success`, `test_run_driver_action_falsy_success_value_records_failed`)
-- **CFG-RUNSTATE-5.** An exception that escapes `run_driver_action` after the row is
-  written (any load error other than `DriverPackageError`, `ValueError`, or
-  `RuntimeError`, for example a database error) leaves the run `PENDING` or `RUNNING`
-  for good; nothing sweeps such rows. Known gap, see #1097. \
-  Enforced in: `services/execution/app/services/execution_service.py` (`run_driver_action`) \
-  Pinned by: none (#1097)
+- **CFG-RUNSTATE-5.** An exception nothing else handles that escapes the work after
+  the row is written (a database error, a sandbox call that raises) ends the run
+  `FAILED` with `execution failed: <ClassName>` and `completed_at`, through a
+  compare-and-swap on `PENDING` or `RUNNING` after a session rollback, so a run already
+  in a final status keeps it; the exception text goes to the log message only, and the
+  call answers as any other finished run (CFG-EXEC-5). If that write fails, the
+  original exception is raised. The 422 of a refused `configure` input (CFG-EXEC-10)
+  passes through unchanged. \
+  Enforced in: `services/execution/app/services/execution_service.py` (`run_driver_action`, `_fail_run_unexpected`) \
+  Pinned by: `services/execution/tests/test_execution_service_edges.py` (`test_run_driver_action_unexpected_load_error_records_failed`, `test_run_driver_action_unexpected_sandbox_error_records_failed`, `test_fail_run_unexpected_keeps_a_final_status`, `test_fail_run_unexpected_reraises_original_when_the_write_fails`); `services/execution/tests/test_router_endpoints.py` (`test_execute_unexpected_load_error_answers_201_with_failed_run`)
 
 ## 5. API surface
 
@@ -1044,7 +1051,8 @@ is WIRE-DRIVER-7 in `provisioning-and-wiring.md`.
   the cause's class, which callers treat as transient. \
   Enforced in: `services/execution/app/services/driver_loader.py` (`download_driver_package`, `load_driver`) \
   Pinned by: `services/execution/tests/test_driver_loader_load.py` (`test_download_driver_package_success`, `test_download_driver_package_failure`, `test_load_driver_download_failure`, `test_load_driver_download_failure_sanitizes_foreign_text`)
-- **CFG-LOAD-3.** The archive is extracted under `DRIVER_CACHE_PATH/<driver id>`: a
+- **CFG-LOAD-3.** The archive is extracted into a directory of the load's own,
+  `DRIVER_CACHE_PATH/<driver id>-<random hex>`, never shared with another load: a
   `.zip`, or a `.tar.gz` or `.tgz` through the tar `data` filter; entries cannot land
   outside the directory. Any other name, or a corrupt archive, raises
   `DriverPackageError` naming only the cause's class, and the directory is removed. \
@@ -1058,15 +1066,18 @@ is WIRE-DRIVER-7 in `provisioning-and-wiring.md`.
   Enforced in: `services/execution/app/services/driver_loader.py` (`validate_driver`, `REQUIRED_METHODS`, `load_driver`) \
   Pinned by: `services/execution/tests/test_driver_loader.py` (`test_validate_valid_l1_driver`, `test_validate_missing_driver_py`, `test_validate_missing_driver_class`, `test_validate_missing_methods`, `test_validate_unknown_connection_type`, `test_validate_syntax_error_driver`); `services/execution/tests/test_driver_loader_advanced.py` (`test_validate_management_driver`, `test_validate_l1_driver_against_l2_type`, `test_required_methods_dict_completeness`); `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_validation_failure`, `test_load_driver_validate_import_failure_sanitizes_foreign_text`)
 - **CFG-LOAD-5.** A good package's SHA256, directory, metadata, and published schema
-  are written to the driver's cache row, updating it in place when a row exists. \
-  Enforced in: `services/execution/app/services/driver_loader.py` (`load_driver`) \
-  Pinned by: `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_download_and_cache`, `test_load_driver_updates_existing_cache`, `test_load_driver_updates_existing_row_under_concurrent_insert`)
-- **CFG-LOAD-6.** When two first loads of one driver run at once, both find no row,
-  extract into the same directory, and insert; the second insert breaks the unique
-  driver id and its caller fails with an unhandled error (CFG-RUNSTATE-5). Known gap,
-  see #1097. \
-  Enforced in: `services/execution/app/services/driver_loader.py` (`load_driver`); `services/execution/app/models/driver_cache.py` (`DriverCache`) \
-  Pinned by: none (#1097)
+  are written to the driver's cache row. With no row, the row is inserted with
+  `ON CONFLICT (driver_id) DO NOTHING` and read back. A row for another SHA256, or whose
+  directory is gone, is updated in place to this load's directory and the replaced
+  directory is removed. \
+  Enforced in: `services/execution/app/services/driver_loader.py` (`load_driver`, `_record_cache_row`) \
+  Pinned by: `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_download_and_cache`, `test_load_driver_updates_existing_cache`, `test_load_driver_updates_existing_row_under_concurrent_insert`, `test_load_driver_replaces_row_of_another_package_and_removes_its_directory`)
+- **CFG-LOAD-6.** Concurrent first loads of one driver both succeed: each extracts into
+  its own directory (CFG-LOAD-3), the insert that loses the unique driver id does
+  nothing, and the loser, finding the winner's row for the same SHA256 with its
+  directory present, returns the winner's directory and removes its own. \
+  Enforced in: `services/execution/app/services/driver_loader.py` (`load_driver`, `_record_cache_row`); `services/execution/app/models/driver_cache.py` (`DriverCache`) \
+  Pinned by: `services/execution/tests/test_driver_loader_load.py` (`test_concurrent_first_loads_of_one_driver_both_succeed`, `test_load_driver_adopts_row_written_after_its_own_read`)
 
 **Out of scope.** Driver upload, replacement, and storage (`inventory.md`, INV-DRV-1 to
 INV-DRV-18); the method contract of each connection type ([DRIVERS.md](../DRIVERS.md)).
@@ -1250,7 +1261,6 @@ status.
 | 422 | `internal execute is restricted to action='configure'; got '<action>'` | `POST /execute/internal` of another action | CFG-EXEC-6 |
 | 422 | `Only the Hypervisor connection type is supported for package validation`; `package_b64 is not valid base64`; `package exceeds the <N> byte validation limit`; `package is empty` | a validation request the route refuses | CFG-VAL-1, CFG-VAL-2 |
 | 500 | `Internal API token not configured` | an execution internal route when execution has no token | CFG-EXEC-6, CFG-VAL-1 |
-| 500 | (unhandled) | concurrent first loads of one driver | CFG-LOAD-6 |
 | 503 | `reservations service unreachable` | a schedule whose reservation cannot be checked | CFG-JOB-4 |
 | 503 | `reservations service unreachable while checking active reservations` and the two sibling details | a restore whose guard cannot be answered | CFG-VER-13 |
 | 503 | `Failed to fetch device: <text>`, `Failed to fetch template: <text>` | execution cannot read the device or template | CFG-EXEC-4 |
@@ -1321,8 +1331,6 @@ confirmed by reading only.
   inventory side, CFG-APPLY-2 and CFG-SCHED-9, is fixed).
 - #1096 (CFG-EXEC-1): execution's `_user_has_acl_manage` still raises on a 200 whose
   JSON body is not an object; the inventory and `herd_common` sites are fixed.
-- #1097 (CFG-LOAD-6, CFG-RUNSTATE-5): concurrent first loads of a driver fail, and a run
-  whose action raises unexpectedly stays `PENDING` or `RUNNING`.
 - #1098 (CFG-UI-4): the device page shows structured refusals as generic text.
 - #1104 (CFG-JOB-5): a schedule's reservation check proves the caller owns some active
   reservation holding the device, not that the named reservation holds it or belongs to
@@ -1348,7 +1356,6 @@ that should have a test are tracked in #1100.
 
 ### Rules with no test
 
-- CFG-RUNSTATE-5: a run left `PENDING` or `RUNNING` by an unexpected exception.
 - CFG-AUTH-6: the write routes skip visibility.
 - CFG-VER-10: the default restore description.
 - CFG-VER-15: no version delete; the cascade from the device.
@@ -1360,7 +1367,6 @@ that should have a test are tracked in #1100.
 - CFG-EXEC-8: `method_kwargs` stored on the run.
 - CFG-RUN-3: an owner's list holds every run of the reservation.
 - CFG-DRY-4: the dry-run declaration is not verified.
-- CFG-LOAD-6: concurrent first loads.
 - CFG-SBX-9: no isolation beyond resource limits.
 - CFG-UI-4: the Apply dialog's outcomes.
 - CFG-UI-5: the scheduled-applies panel.
