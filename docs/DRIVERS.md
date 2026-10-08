@@ -48,7 +48,7 @@ loaded. This matters because the AI commit path (`committer.py` in the ai-orches
 applying proposal configs after a topology commit) posts `configure` straight to
 `/execute` rather than going through inventory's apply endpoints, so execution's own
 gate is what stops it; inventory's gate alone did not cover that path. The assistant's
-`schedule_config_apply` tool goes through inventory's apply endpoint and meets
+`schedule_config_apply` tool goes through inventory's schedule endpoint and meets
 inventory's gate first. Execution's gate also refuses ANY action, not only `configure`,
 against a device with no resolvable driver (`driver_id` missing or null), with a
 structured 409 `device_has_no_driver`, since there is nothing to load.
@@ -1603,7 +1603,7 @@ You should get back a run record with `status: SUCCESS` and your `{reachable: tr
 
 ### 8. Iterate
 
-Update `driver.py`, rebuild the archive, upload via **Drivers > Edit > Replace file** (or `PUT /api/inventory/drivers/{id}/file`). The execution service detects the new SHA256, invalidates its cache, and re-extracts on next call.
+Update `driver.py`, rebuild the archive, upload via **Drivers > Edit > Replace file** (or `PUT /api/inventory/drivers/{id}/file`). The execution service detects the new SHA256, invalidates its cache, and re-extracts on next call. Each load extracts into its own directory under the cache path, `<driver id>-<random hex>` (issue #1097), so two first loads of one driver at once never share or remove each other's files.
 
 ## Debugging tips
 

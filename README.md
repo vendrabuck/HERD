@@ -474,11 +474,12 @@ own health consumer consumes. See
 An encrypted-at-rest credential store (ADR [docs/design/0003](docs/design/0003-encrypted-credential-store.md),
 issue #39), gated by ACL `secret`-resource grants rather than device-group visibility.
 Plaintext values are protected by envelope encryption: each secret is encrypted under a
-per-secret data key, which is itself wrapped by a key-encryption key (KEK) supplied via
-the required `SECRETS_KEK` environment variable; the service refuses to boot without a
+data-encryption key (one per key version, not per secret), which is itself wrapped by a
+key-encryption key (KEK) supplied via the required `SECRETS_KEK` environment variable; the service refuses to boot without a
 valid KEK, so there is never a source-visible default to leak. `POST /keys/rotate`
-introduces a new KEK version and re-encrypts every stored secret; `SECRETS_KEK_PREVIOUS`
-supports a rotation window where old and new keys are both present. Reveal
+introduces a new data-key version and re-encrypts every stored secret, and every secrets
+replica picks the new version up without a restart; `SECRETS_KEK_PREVIOUS` supports a KEK
+rotation window where old and new keys are both present. Reveal
 (`GET /secrets/{id}/value`) requires a `manage` grant on the secret; a `view` grant sees
 metadata only. Hypervisors (dynamic-resources, ADR 0004) reference a secret by id rather
 than accepting credentials inline, and the execution service resolves the plaintext only
@@ -557,7 +558,7 @@ Four jobs run on push/PR to main, plus a scheduled nightly workflow:
 
 - [docs/DRIVERS.md](docs/DRIVERS.md): Driver developer guide, interface contracts, packaging quickstart, AI-config allowlist.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Public architecture overview: services, inter-service auth contract, event-driven flows, reservation state machine, frontend patterns.
-- [docs/specs/](docs/specs/README.md): Feature and functional specifications, one per area: what each feature does and the exact rules it follows, with the code that enforces each rule and the test that pins it. Reservations is the first.
+- [docs/specs/](docs/specs/README.md): Feature and functional specifications, one per area: what each feature does and the exact rules it follows, with the code that enforces each rule and the test that pins it. All ten areas are written.
 - [docs/MANUAL_TESTING.md](docs/MANUAL_TESTING.md): Manual test plan for cases deliberately excluded from automation, with the reason, preconditions, steps, and expected results per case.
 
 ### First install
