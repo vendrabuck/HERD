@@ -801,10 +801,13 @@ is WIRE-DRIVER-6 in `provisioning-and-wiring.md`.
   Pinned by: none (#1100)
 - **CFG-EXEC-4.** The device and its template are read through inventory's internal
   routes with the internal token and 10 seconds; a 404 is 404 `Device <id> not found` or
-  `Template <id> not found`, and any other failure is 503
-  `Failed to fetch device: <exception text>` (or template). Known gap, see #1093. \
-  Enforced in: `services/execution/app/services/execution_service.py` (`fetch_device`, `fetch_template`) \
-  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_fetch_device_returns_payload`, `test_fetch_device_404_raises_404`, `test_fetch_device_other_error_raises_503`, `test_fetch_template_404_raises_404`, `test_fetch_template_other_error_raises_503`)
+  `Template <id> not found`, and any other failure is 503 `Failed to fetch device: <reason>`
+  (or template), where the reason is HERD-authored: `upstream service answered HTTP <status>`,
+  `upstream service unreachable (<ClassName>)`, `upstream service answered with a malformed body`
+  (a body that is not JSON or not a JSON object), or the exception's class name. The
+  exception text goes to the log message only. \
+  Enforced in: `services/execution/app/services/execution_service.py` (`fetch_device`, `fetch_template`, `_fetch_inventory_internal`, `_inventory_failure_text`) \
+  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_fetch_device_returns_payload`, `test_fetch_device_404_raises_404`, `test_fetch_device_other_error_raises_503`, `test_fetch_template_404_raises_404`, `test_fetch_template_other_error_raises_503`, `test_fetch_failure_detail_never_carries_foreign_text`)
 - **CFG-EXEC-5.** Once the gate (CFG-GATE-4) passes, a call answers 201 with the run
   whatever its outcome; only a refused `configure` input (CFG-EXEC-10) changes the HTTP
   status. \
@@ -1263,7 +1266,7 @@ status.
 | 500 | `Internal API token not configured` | an execution internal route when execution has no token | CFG-EXEC-6, CFG-VAL-1 |
 | 503 | `reservations service unreachable` | a schedule whose reservation cannot be checked | CFG-JOB-4 |
 | 503 | `reservations service unreachable while checking active reservations` and the two sibling details | a restore whose guard cannot be answered | CFG-VER-13 |
-| 503 | `Failed to fetch device: <text>`, `Failed to fetch template: <text>` | execution cannot read the device or template | CFG-EXEC-4 |
+| 503 | `Failed to fetch device: <reason>`, `Failed to fetch template: <reason>` (an upstream status, a class name, or a malformed-body note; never upstream text) | execution cannot read the device or template | CFG-EXEC-4 |
 | 503 | the visibility lookup's own detail (`inventory.md`) | a non-admin read whose visibility lookup fails | CFG-AUTH-5 |
 
 ## 10. Interactions with other services
@@ -1280,7 +1283,7 @@ status.
 | inventory to execution | execution | `POST /execute/internal` (`X-Internal-Token`, 30 s) | a scheduled job | the job is `failed` (CFG-SCHED-9) |
 | execution to acl | acl | `POST /check` with the caller's token, 5 s | a non-admin `configure` | fail closed: 403 (CFG-EXEC-1) |
 | execution to reservations | reservations | `GET /{id}` with the caller's token, 5 s | run list and transcript ownership | fail closed: 403 (CFG-RUN-1, CFG-TX-5) |
-| execution to inventory | inventory | `GET /devices/{id}/internal`, `GET /templates/{id}/internal` (`X-Internal-Token`, 10 s) | the device and template of an action | 404 is relayed; anything else 503 (CFG-EXEC-4) |
+| execution to inventory | inventory | `GET /devices/{id}/internal`, `GET /templates/{id}/internal` (`X-Internal-Token`, 10 s) | the device and template of an action | 404 is relayed; anything else, a body that is not a JSON object included, 503 (CFG-EXEC-4) |
 | execution to inventory | inventory | `GET /drivers/{id}/internal-download` (`X-Internal-Token`, 30 s) | the driver archive on a cache miss | the run is `FAILED` with `driver load failed: <ClassName>` (CFG-LOAD-2, CFG-EXEC-9) |
 | execution to a driver | the driver package | a sandboxed subprocess | every driver method | the run records the failure (CFG-SBX-5, CFG-SBX-7, CFG-RUNSTATE-4) |
 
@@ -1327,8 +1330,6 @@ confirmed by reading only.
 
 ### Open defects
 
-- #1093 (CFG-EXEC-4): exception and upstream text reach execution's fetch answers (the
-  inventory side, CFG-APPLY-2 and CFG-SCHED-9, is fixed).
 - #1096 (CFG-EXEC-1): execution's `_user_has_acl_manage` still raises on a 200 whose
   JSON body is not an object; the inventory and `herd_common` sites are fixed.
 - #1098 (CFG-UI-4): the device page shows structured refusals as generic text.

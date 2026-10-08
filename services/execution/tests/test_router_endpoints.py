@@ -170,6 +170,7 @@ async def test_fetch_device_other_error_raises_503(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         await fetch_device(uuid.UUID(DEVICE_ID))
     assert exc.value.status_code == 503
+    assert exc.value.detail == "Failed to fetch device: RuntimeError"
 
 
 @pytest.mark.asyncio
@@ -203,6 +204,68 @@ async def test_fetch_template_other_error_raises_503(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         await fetch_template(TEMPLATE_ID)
     assert exc.value.status_code == 503
+    assert exc.value.detail == "Failed to fetch template: RuntimeError"
+
+
+# --- fetch_device / fetch_template never relay foreign text (issue #1093) ---
+
+_INTERNAL_URL = "http://inventory:8000/devices/secret-internal-path/internal"
+
+
+def _status_response(code: int, body_text: str) -> httpx.Response:
+    request = httpx.Request("GET", _INTERNAL_URL)
+    response = httpx.Response(code, text=body_text, request=request)
+    return response
+
+
+@pytest.mark.parametrize("fetch", ["device", "template"])
+@pytest.mark.parametrize(
+    "client_kwargs, expected",
+    [
+        (
+            {"exc": httpx.ConnectError(f"All connection attempts failed to {_INTERNAL_URL}")},
+            "upstream service unreachable (ConnectError)",
+        ),
+        (
+            {"exc": httpx.ReadTimeout(f"timed out reading {_INTERNAL_URL}")},
+            "upstream service unreachable (ReadTimeout)",
+        ),
+        (
+            {"response": _status_response(502, "secret-internal-path stack trace")},
+            "upstream service answered HTTP 502",
+        ),
+        (
+            {"response": _status_response(200, "<html>secret-internal-path</html>")},
+            "upstream service answered with a malformed body",
+        ),
+        (
+            {"response": _status_response(200, '["secret-internal-path"]')},
+            "upstream service answered with a malformed body",
+        ),
+        (
+            {"exc": RuntimeError(f"boom at {_INTERNAL_URL}")},
+            "RuntimeError",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_fetch_failure_detail_never_carries_foreign_text(
+    monkeypatch, caplog, fetch, client_kwargs, expected
+):
+    """The 503 detail is HERD-authored text plus a status or class name; the
+    internal URL and any upstream body reach the log message only."""
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: _FakeHttpxClient(**client_kwargs))
+    with caplog.at_level("ERROR"), pytest.raises(HTTPException) as exc:
+        if fetch == "device":
+            await fetch_device(uuid.UUID(DEVICE_ID))
+        else:
+            await fetch_template(TEMPLATE_ID)
+    assert exc.value.status_code == 503
+    assert exc.value.detail == f"Failed to fetch {fetch}: {expected}"
+    assert "secret-internal-path" not in exc.value.detail
+    assert any(
+        r.getMessage().startswith(f"Failed to fetch {fetch} from inventory") for r in caplog.records
+    )
 
 
 # --- run_driver_action: success and failure paths ---
