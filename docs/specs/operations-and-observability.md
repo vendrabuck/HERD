@@ -955,7 +955,7 @@ check one device now, through the same login, status, and logout sequence a poll
   or a body that is not `{"device_ids": [<str>, ...]}` is 503
   `Could not verify device visibility; nothing was returned. Retry the request.` \
   Enforced in: `services/execution/app/routers/health.py` (`get_device_health`); `services/execution/app/services/device_visibility.py` (`resolve_caller_visibility`, `fetch_visible_device_ids`) \
-  Pinned by: `services/execution/tests/test_health_endpoints.py` (`test_get_health_returns_persisted_row`, `test_get_health_available_to_non_admin`, `test_hidden_polled_device_health_answers_exactly_like_an_unknown_device`, `test_get_health_visible_set_empty_hides_every_snapshot`, `test_get_health_fails_closed_when_visibility_unanswerable`, `test_get_health_non_admin_without_token_fails_closed`, `test_get_health_admin_sees_every_row_without_a_lookup`)
+  Pinned by: `services/execution/tests/test_health_endpoints.py` (`test_get_health_returns_persisted_row`, `test_get_health_available_to_non_admin`, `test_hidden_polled_device_health_answers_exactly_like_an_unknown_device`, `test_get_health_visible_set_empty_hides_every_snapshot`, `test_get_health_fails_closed_when_visibility_unanswerable`, `test_get_health_non_admin_without_token_fails_closed`, `test_get_health_admin_sees_every_row_without_a_lookup`); `tests/integration/test_execution_device_scope.py` (`test_health_read_of_a_visible_device_answers_under_its_id`, `test_health_read_of_a_hidden_device_answers_like_an_unknown_id`)
 - **OPS-HEALTH-2.** A device with no snapshot answers 200 with a synthesized `UNKNOWN`
   record (no poll time, zero failures), never 404. \
   Enforced in: `services/execution/app/routers/health.py` (`get_device_health`) \
