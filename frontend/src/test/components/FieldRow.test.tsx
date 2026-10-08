@@ -137,6 +137,27 @@ describe("FieldRow default-value editor per type", () => {
     expect(onChange).toHaveBeenCalledWith(0, { ...field, default: undefined });
   });
 
+  it("password type: default input is masked, uses the password placeholder, and edits the default", () => {
+    const field: FieldDefinition = { ...STRING_FIELD, type: "password", default: "lab-shared-pw" };
+    const { onChange } = renderRow(field);
+    const defaultInput = screen.getByPlaceholderText("password");
+    expect(defaultInput).toHaveAttribute("type", "password");
+    expect(defaultInput).toHaveAccessibleName("Default password");
+    expect(defaultInput).toHaveValue("lab-shared-pw");
+    // No plain-text default input renders for a password field.
+    expect(screen.queryByPlaceholderText("No default")).not.toBeInTheDocument();
+    fireEvent.change(defaultInput, { target: { value: "rotated" } });
+    expect(onChange).toHaveBeenLastCalledWith(0, { ...field, default: "rotated" });
+    fireEvent.change(defaultInput, { target: { value: "" } });
+    expect(onChange).toHaveBeenLastCalledWith(0, { ...field, default: undefined });
+  });
+
+  it("string type: default input stays a plain text input", () => {
+    renderRow({ ...STRING_FIELD, default: "eth0" });
+    expect(screen.getByPlaceholderText("No default")).toHaveAttribute("type", "text");
+    expect(screen.queryByPlaceholderText("password")).not.toBeInTheDocument();
+  });
+
   it("number type: parses a numeric default and clears to undefined on invalid input", () => {
     const field: FieldDefinition = { ...STRING_FIELD, type: "number", default: 30 };
     const { onChange } = renderRow(field);

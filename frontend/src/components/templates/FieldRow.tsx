@@ -144,6 +144,22 @@ export function FieldRow({ field, index, onChange, onRemove }: FieldRowProps) {
               }}
               className="flex-1 text-sm border border-gray-300 rounded px-2 py-1 focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
+          ) : field.type === "password" ? (
+            // A password default is the shared credential devices inherit, so
+            // the editor does not echo it on screen.
+            <input
+              type="password"
+              placeholder="password"
+              aria-label="Default password"
+              autoComplete="new-password"
+              value={(field.default as string) ?? ""}
+              onChange={(e) =>
+                update({
+                  default: e.target.value || undefined,
+                })
+              }
+              className="flex-1 text-sm border border-gray-300 rounded px-2 py-1 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
           ) : (
             <input
               type="text"

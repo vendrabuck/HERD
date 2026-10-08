@@ -20,6 +20,7 @@ from app.services.device_visibility import (
     dynamic_templates_exist,
     resolve_visible_dynamic_hypervisor_ids,
 )
+from app.services.field_redaction import redact_template_sections
 from app.services.template_service import (
     create_template,
     delete_template,
@@ -33,7 +34,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["templates"])
 
 
-def _template_to_response(template: DeviceTemplate) -> TemplateResponse:
+def _template_to_response(template: DeviceTemplate, *, redact: bool) -> TemplateResponse:
+    """Build a template response.
+
+    ``redact`` is required at every call site: a non-admin read passes True so
+    each password field's default is masked (INV-RED-5); admin-only and
+    internal reads pass False and return the sections as stored.
+    """
+    sections = redact_template_sections(template.sections) if redact else template.sections
     return TemplateResponse(
         id=template.id,
         name=template.name,
@@ -50,7 +58,7 @@ def _template_to_response(template: DeviceTemplate) -> TemplateResponse:
         vendor=template.vendor,
         model=template.model,
         part_number=template.part_number,
-        sections=template.sections,
+        sections=sections,
         created_at=template.created_at,
         updated_at=template.updated_at,
         modified_by=template.modified_by,
@@ -69,12 +77,16 @@ async def get_templates(
 ):
     """List templates. Available to all authenticated users.
 
+    A non-admin read masks each password field's non-empty default (INV-RED-5).
+
     A non-admin sees a dynamic template only when it is visible to them through
     its hypervisor's device group (issue #1053); every other template is listed
     for everyone. The visibility lookup runs only when the listing can contain a
     dynamic template (the type filter allows one and at least one exists), and
     it fails closed (503) when auth cannot answer.
     """
+    # The same admin test the device reads use for INV-RED-1.
+    redact = payload.get("role", "user") not in ("admin", "superadmin")
     visible_hv = None
     if template_type in (None, "dynamic") and await dynamic_templates_exist(db):
         visible_hv = await resolve_visible_dynamic_hypervisor_ids(db, payload, authorization)
@@ -86,7 +98,7 @@ async def get_templates(
         visible_dynamic_hypervisor_ids=visible_hv,
     )
     return PaginatedTemplateResponse(
-        items=[_template_to_response(t) for t in templates],
+        items=[_template_to_response(t, redact=redact) for t in templates],
         total=total,
         skip=skip,
         limit=limit,
@@ -102,6 +114,8 @@ async def get_template_by_id(
 ):
     """Get a single template. Available to all authenticated users.
 
+    A non-admin read masks each password field's non-empty default (INV-RED-5).
+
     A dynamic template hidden from a non-admin (issue #1053) answers the same
     404 and detail as an unknown id, so this read cannot tell the two apart; a
     reservation naming it is refused as not found for the same reason.
@@ -113,7 +127,8 @@ async def get_template_by_id(
         visible_hv = await resolve_visible_dynamic_hypervisor_ids(db, payload, authorization)
         if not dynamic_template_visible(template, visible_hv):
             raise HTTPException(status_code=404, detail="Template not found")
-    return _template_to_response(template)
+    redact = payload.get("role", "user") not in ("admin", "superadmin")
+    return _template_to_response(template, redact=redact)
 
 
 @router.get("/templates/{template_id}/internal", response_model=TemplateResponse)
@@ -128,7 +143,7 @@ async def get_template_by_id_internal(
     template = await get_template(db, template_id)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
-    return _template_to_response(template)
+    return _template_to_response(template, redact=False)
 
 
 @router.post(
@@ -148,7 +163,7 @@ async def create_new_template(
         template.name,
         extra={"action": "template_create", "template_id": str(template.id)},
     )
-    return _template_to_response(template)
+    return _template_to_response(template, redact=False)
 
 
 @router.put("/templates/{template_id}", response_model=TemplateResponse)
@@ -167,7 +182,7 @@ async def update_template_by_id(
         template_id,
         extra={"action": "template_update", "template_id": str(template_id)},
     )
-    return _template_to_response(template)
+    return _template_to_response(template, redact=False)
 
 
 @router.delete("/templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT)

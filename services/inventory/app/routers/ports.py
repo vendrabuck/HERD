@@ -7,9 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.dependencies.auth import get_current_user_payload, require_admin
 from app.models.port import Port
-from app.routers.devices import _password_field_keys, _redact_field_data
 from app.schemas.port import BulkPortCreate, PortCreate, PortResponse, PortUpdate
 from app.services.device_visibility import _resolve_visible_device_ids
+from app.services.field_redaction import password_field_keys, redact_field_data
 from app.services.port_service import (
     create_port,
     create_ports_bulk,
@@ -26,11 +26,11 @@ router = APIRouter(tags=["ports"])
 
 def _port_to_response(port: Port, *, redact_passwords: bool = False) -> PortResponse:
     # A port's field_data can hold password-typed fields (its template is a
-    # DeviceTemplate), so non-admin reads mask those values, reusing the device
-    # router's redaction so ports and devices stay consistent (issue #310).
+    # DeviceTemplate), so non-admin reads mask those values, reusing the shared
+    # field_redaction module so ports and devices stay consistent (issue #310).
     field_data = port.field_data
     if redact_passwords:
-        field_data = _redact_field_data(field_data or {}, _password_field_keys(port.template))
+        field_data = redact_field_data(field_data or {}, password_field_keys(port.template))
     return PortResponse(
         id=port.id,
         name=port.name,
