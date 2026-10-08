@@ -106,6 +106,10 @@ async def _validate_reservation_for_job(
             raise HTTPException(
                 status_code=503, detail="reservations service unreachable"
             ) from None
+        # A 200 whose JSON is not an object is unusable, the same fail-closed
+        # 503 as a non-JSON body (issue #1096).
+        if not isinstance(status_data, dict):
+            raise HTTPException(status_code=503, detail="reservations service unreachable")
         if not status_data.get("is_active"):
             raise HTTPException(status_code=422, detail=RESERVATION_MISMATCH_ERROR)
 
@@ -128,6 +132,10 @@ async def _validate_reservation_for_job(
             raise HTTPException(
                 status_code=503, detail="reservations service unreachable"
             ) from None
+        # A 200 whose JSON is not an object is unusable, the same fail-closed
+        # 503 as a non-JSON body (issue #1096).
+        if not isinstance(active_data, dict):
+            raise HTTPException(status_code=503, detail="reservations service unreachable")
         if not active_data.get("owns_active"):
             raise HTTPException(status_code=422, detail=RESERVATION_MISMATCH_ERROR)
 

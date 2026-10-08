@@ -282,9 +282,10 @@ and `user_has_manage_or_owns_active_reservation` in
   unreachable, answers non-200, or answers non-JSON, the grant counts as absent and the
   reservation check still runs; that check answers no when no internal token is
   configured or reservations is unreachable, non-200, or non-JSON. A 200 whose JSON body
-  is not an object raises instead of answering no. Known gap, see #1096. \
-  Enforced in: `services/common/herd_common/acl.py` (`user_has_grant`, `_owns_active_reservation`) \
-  Pinned by: `services/common/tests/test_acl.py` (`test_no_bearer_token_skips_acl_check_and_tries_reservations`, `test_acl_service_unreachable_still_tries_reservations`, `test_acl_5xx_falls_through_to_reservations`, `test_malformed_acl_response_falls_through_to_reservations`, `test_reservations_service_unreachable_returns_false`, `test_reservations_non_200_returns_false`, `test_malformed_reservation_response_returns_false`, `test_no_internal_token_skips_reservation_lookup`)
+  is not an object (a list, string, number, or null) is an unusable answer and counts as
+  no on every leg, the internal-token grant check included. \
+  Enforced in: `services/common/herd_common/acl.py` (`user_has_grant`, `_owns_active_reservation`, `_explicit_acl_manage_internal`, `_json_flag`) \
+  Pinned by: `services/common/tests/test_acl.py` (`test_no_bearer_token_skips_acl_check_and_tries_reservations`, `test_acl_service_unreachable_still_tries_reservations`, `test_acl_5xx_falls_through_to_reservations`, `test_malformed_acl_response_falls_through_to_reservations`, `test_reservations_service_unreachable_returns_false`, `test_reservations_non_200_returns_false`, `test_malformed_reservation_response_returns_false`, `test_no_internal_token_skips_reservation_lookup`, `test_acl_answer_not_an_object_is_no_grant`, `test_reservations_answer_not_an_object_is_not_owner`, `test_manage_internal_answer_not_an_object_is_false`)
 - **CFG-AUTH-5.** The version list, detail, and diff, the device's apply-job list, and the
   apply-job read are gated by device visibility, not by `manage`: a non-admin outside the
   device's groups gets the same 404 as an unknown id (`Device not found`, or
@@ -460,11 +461,10 @@ both services.
 - **CFG-SCHEMA-7.** Inventory reads a driver's published schema from execution's
   internal config-schema route (CFG-SCHEMA-10) with the driver's SHA256, file name, and
   connection type and a 10 second timeout, and fails open: a transport error, a non-200,
-  a non-JSON body, `has_schema` false, or a non-object `schema` all mean no published
-  schema, and the registry applies. A 200 whose JSON body is not an object raises
-  instead. Known gap, see #1096. \
+  a non-JSON body, a JSON body that is not an object, `has_schema` false, or a
+  non-object `schema` all mean no published schema, and the registry applies. \
   Enforced in: `services/inventory/app/services/published_schema.py` (`_fetch_published_schema`, `published_schema_for_device`) \
-  Pinned by: `services/inventory/tests/test_published_schema.py` (`test_valid_200_parses_and_returns_schema`, `test_200_malformed_body_falls_back_to_none`, `test_200_has_schema_false_falls_back_to_none`, `test_non_200_falls_back_to_none_with_warning`, `test_transport_error_falls_back_to_none`, `test_published_schema_for_device_returns_none_when_no_driver`); `services/inventory/tests/test_device_configs.py` (`test_create_falls_back_to_registry_when_no_published_schema`, `test_create_fails_open_to_registry_when_execution_unreachable`)
+  Pinned by: `services/inventory/tests/test_published_schema.py` (`test_valid_200_parses_and_returns_schema`, `test_200_malformed_body_falls_back_to_none`, `test_200_has_schema_false_falls_back_to_none`, `test_non_200_falls_back_to_none_with_warning`, `test_transport_error_falls_back_to_none`, `test_published_schema_for_device_returns_none_when_no_driver`, `test_200_body_not_an_object_falls_back_to_none`); `services/inventory/tests/test_device_configs.py` (`test_create_falls_back_to_registry_when_no_published_schema`, `test_create_fails_open_to_registry_when_execution_unreachable`)
 - **CFG-SCHEMA-8.** Inventory keeps each answer in process for 30 seconds, keyed by
   driver id and SHA256, so replacing a driver's file never serves the old schema. \
   Enforced in: `services/inventory/app/services/published_schema.py` (`_fetch_published_schema`, `_MEMO_TTL_SECONDS`) \
@@ -629,9 +629,10 @@ apply-job routes of sections 5 and 7.
   reservation holding the device (`GET /internal/active`), both with the internal token
   and 5 seconds; a 404, an inactive reservation, or no ownership is 422
   `RESERVATION_MISMATCH_ERROR`, and anything else (no token, transport error, another
-  status, non-JSON) is 503 `reservations service unreachable`. Admins are checked too. \
+  status, non-JSON, JSON that is not an object) is 503 `reservations service unreachable`.
+  Admins are checked too. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`_validate_reservation_for_job`, `RESERVATION_MISMATCH_ERROR`) \
-  Pinned by: `services/inventory/tests/test_apply_jobs_reservation_owner.py` (`test_foreign_reservation_id_returns_422_and_writes_no_row`, `test_reservation_id_inactive_returns_422_and_writes_no_row`, `test_reservation_id_active_but_not_owned_by_caller_returns_422`, `test_reservation_id_valid_and_owned_schedules_successfully`, `test_reservation_id_validation_fails_closed_when_unreachable`)
+  Pinned by: `services/inventory/tests/test_apply_jobs_reservation_owner.py` (`test_foreign_reservation_id_returns_422_and_writes_no_row`, `test_reservation_id_inactive_returns_422_and_writes_no_row`, `test_reservation_id_active_but_not_owned_by_caller_returns_422`, `test_reservation_id_valid_and_owned_schedules_successfully`, `test_reservation_id_validation_fails_closed_when_unreachable`, `test_reservation_id_answer_not_an_object_fails_closed_503`)
 - **CFG-JOB-5.** The two lookups do not prove that the named reservation itself holds
   the device or belongs to the caller: a caller with one qualifying reservation can
   name another active one. Known gap, see #1104. \
@@ -721,10 +722,10 @@ re-checking at fire time that the job may still run.
   Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_fire_job_proceeds_when_reservation_active`, `test_fire_job_skips_when_reservation_active_but_creator_unauthorized`)
 - **CFG-SCHED-5.** The reservation check reads reservations `GET /internal/{id}` with the
   internal token and 5 seconds and fires only on 200 with `is_active` true; no token, a
-  transport error, another status, or non-JSON skips the job with
+  transport error, another status, non-JSON, or JSON that is not an object skips the job with
   `reservation not currently active`. \
   Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_reservation_active`, `fire_job`) \
-  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_fire_job_skipped_when_reservation_not_active`, `test_reservation_gate_hits_internal_url`, `test_reservation_gate_closed_default_when_token_missing`, `test_reservation_gate_closed_default_on_403`, `test_reservation_active_http_error_returns_false`, `test_reservation_active_malformed_json_returns_false`)
+  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_fire_job_skipped_when_reservation_not_active`, `test_reservation_gate_hits_internal_url`, `test_reservation_gate_closed_default_when_token_missing`, `test_reservation_gate_closed_default_on_403`, `test_reservation_active_http_error_returns_false`, `test_reservation_active_malformed_json_returns_false`, `test_reservation_active_answer_not_an_object_returns_false`)
 - **CFG-SCHED-6.** The creator check (CFG-AUTH-7) runs for every job, with or without a
   reservation, and a no skips the job with `CREATOR_UNAUTHORIZED_ERROR`. \
   Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_creator_still_authorized`, `fire_job`, `CREATOR_UNAUTHORIZED_ERROR`) \
@@ -1239,7 +1240,7 @@ status.
 | 422 | `internal execute is restricted to action='configure'; got '<action>'` | `POST /execute/internal` of another action | CFG-EXEC-6 |
 | 422 | `Only the Hypervisor connection type is supported for package validation`; `package_b64 is not valid base64`; `package exceeds the <N> byte validation limit`; `package is empty` | a validation request the route refuses | CFG-VAL-1, CFG-VAL-2 |
 | 500 | `Internal API token not configured` | an execution internal route when execution has no token | CFG-EXEC-6, CFG-VAL-1 |
-| 500 | (unhandled) | concurrent first loads of one driver; a non-object JSON body from an upstream check | CFG-LOAD-6, CFG-AUTH-4 |
+| 500 | (unhandled) | concurrent first loads of one driver | CFG-LOAD-6 |
 | 503 | `reservations service unreachable` | a schedule whose reservation cannot be checked | CFG-JOB-4 |
 | 503 | `reservations service unreachable while checking active reservations` and the two sibling details | a restore whose guard cannot be answered | CFG-VER-13 |
 | 503 | `Failed to fetch device: <text>`, `Failed to fetch template: <text>` | execution cannot read the device or template | CFG-EXEC-4 |
@@ -1309,8 +1310,8 @@ confirmed by reading only.
 - #1091 (CFG-RUN-6): retrying a failed dry run pushes the configuration for real.
 - #1093 (CFG-APPLY-2, CFG-SCHED-9, CFG-EXEC-4): exception and upstream text reach job
   rows and API answers.
-- #1096 (CFG-AUTH-4, CFG-SCHEMA-7): a 200 whose JSON body is not an object raises instead
-  of failing closed or open.
+- #1096 (CFG-EXEC-1): execution's `_user_has_acl_manage` still raises on a 200 whose
+  JSON body is not an object; the inventory and `herd_common` sites are fixed.
 - #1097 (CFG-LOAD-6, CFG-RUNSTATE-5): concurrent first loads of a driver fail, and a run
   whose action raises unexpectedly stays `PENDING` or `RUNNING`.
 - #1098 (CFG-UI-4): the device page shows structured refusals as generic text.

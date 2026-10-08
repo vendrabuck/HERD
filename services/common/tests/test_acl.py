@@ -418,3 +418,80 @@ async def test_manage_or_reservation_internal_closed_when_both_unreachable(monke
         internal_api_token=INTERNAL_TOKEN,
     )
     assert result is False
+
+
+# --- A 200 whose JSON is not an object (issue #1096) -------------------------
+
+
+class _RawJsonResp:
+    """A 200 whose json() returns the given value verbatim (list, str, number)."""
+
+    status_code = 200
+
+    def __init__(self, body):
+        self._body = body
+
+    def json(self):
+        return self._body
+
+    @property
+    def text(self):
+        return json.dumps(self._body)
+
+
+_NON_OBJECT_BODIES = [[{"allowed": True, "owns_active": True}], "allowed", 1, None]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+async def test_acl_answer_not_an_object_is_no_grant(monkeypatch, body):
+    """user_has_grant: a non-object 200 counts as no grant (never raises), so
+    the reservation free pass still decides."""
+    _patch_http(
+        monkeypatch,
+        acl_response=_RawJsonResp(body),
+        res_response=_Resp(200, {"owns_active": False}),
+    )
+    result = await user_has_manage_or_owns_active_reservation(
+        user_id=USER_ID,
+        device_id=DEVICE_ID,
+        authorization=BEARER,
+        acl_service_url=ACL_URL,
+        reservations_service_url=RES_URL,
+        internal_api_token=INTERNAL_TOKEN,
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+async def test_reservations_answer_not_an_object_is_not_owner(monkeypatch, body):
+    """_owns_active_reservation: a non-object 200 counts as not an owner."""
+    _patch_http(
+        monkeypatch,
+        acl_response=_Resp(200, {"allowed": False}),
+        res_response=_RawJsonResp(body),
+    )
+    result = await user_has_manage_or_owns_active_reservation(
+        user_id=USER_ID,
+        device_id=DEVICE_ID,
+        authorization=BEARER,
+        acl_service_url=ACL_URL,
+        reservations_service_url=RES_URL,
+        internal_api_token=INTERNAL_TOKEN,
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+async def test_manage_internal_answer_not_an_object_is_false(monkeypatch, body):
+    """_explicit_acl_manage_internal: a non-object 200 counts as no grant."""
+    _patch_http(monkeypatch, acl_response=_RawJsonResp(body))
+    result = await user_has_manage_internal(
+        user_id=USER_ID,
+        device_id=DEVICE_ID,
+        acl_service_url=ACL_URL,
+        internal_api_token=INTERNAL_TOKEN,
+    )
+    assert result is False

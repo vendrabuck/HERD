@@ -493,3 +493,52 @@ async def test_explicit_manage_check_relays_the_acl_answer(answer):
         authorization="Bearer x",
         acl_service_url=settings.acl_service_url,
     )
+
+
+# --- A 200 whose JSON is not an object (issue #1096) -------------------------
+
+
+class _RawJsonResp:
+    """A response whose json() returns the given value verbatim."""
+
+    def __init__(self, status_code: int, body):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("which", ["status", "active"])
+@pytest.mark.parametrize("body", [[{"is_active": True, "owns_active": True}], "yes", 1, None])
+async def test_reservation_id_answer_not_an_object_fails_closed_503(
+    admin_client, monkeypatch, which, body
+):
+    """Either reservations read answering 200 with JSON that is not an object
+    is the same fail-closed 503 as a non-JSON body, never an unhandled 500,
+    and no job row is written."""
+    device_id, version_id = await _seed_device(admin_client)
+    reservation_id = uuid.uuid4()
+
+    monkeypatch.setattr(
+        "app.routers.apply_jobs.settings.internal_api_token", "token", raising=False
+    )
+    status_resp = _FakeResp(200, {"id": str(reservation_id), "is_active": True})
+    active_resp = _FakeResp(200, {"owns_active": True})
+    if which == "status":
+        status_resp = _RawJsonResp(200, body)
+    else:
+        active_resp = _RawJsonResp(200, body)
+    fake_client = _FakeReservationsAsyncClient(
+        get_responses={str(reservation_id): status_resp, "/internal/active": active_resp}
+    )
+    monkeypatch.setattr("app.routers.apply_jobs.httpx.AsyncClient", lambda *a, **kw: fake_client)
+
+    resp = await admin_client.post(
+        f"/devices/{device_id}/config-versions/{version_id}/schedule",
+        json={"scheduled_for": _future_iso(), "reservation_id": str(reservation_id)},
+    )
+    assert resp.status_code == 503, resp.text
+    assert resp.json() == {"detail": "reservations service unreachable"}
+    assert await _apply_job_row_count() == 0

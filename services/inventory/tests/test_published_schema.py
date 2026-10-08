@@ -249,3 +249,19 @@ async def test_published_schema_for_device_delegates_to_driver_fetch(monkeypatch
 
     result = await mod.published_schema_for_device(device)
     assert result == published
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [[{"has_schema": True, "schema": {}}], "schema", 1, None])
+async def test_200_body_not_an_object_falls_back_to_none(monkeypatch, body):
+    """A 200 whose JSON is not an object is malformed: the registry is used
+    (fail open), never an AttributeError (issue #1096)."""
+    driver = _make_driver()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    _patch_transport(monkeypatch, handler)
+
+    result = await mod.published_schema_for_driver(driver)
+    assert result is None

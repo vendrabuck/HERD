@@ -100,6 +100,9 @@ async def _reservation_active(client: httpx.AsyncClient, reservation_id: uuid.UU
         data = resp.json()
     except ValueError:
         return False
+    if not isinstance(data, dict):
+        # Not an object: unusable, so "do not fire" like any failure (issue #1096).
+        return False
     return bool(data.get("is_active"))
 
 

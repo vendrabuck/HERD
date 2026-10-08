@@ -671,6 +671,28 @@ async def test_reservation_active_malformed_json_returns_false(monkeypatch):
     assert await _reservation_active(_Client(), uuid.uuid4()) is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [[{"is_active": True}], "true", 1, None])
+async def test_reservation_active_answer_not_an_object_returns_false(monkeypatch, body):
+    """A 200 whose JSON is not an object means "do not fire", like any other
+    unusable answer, and never raises (issue #1096)."""
+    monkeypatch.setattr(
+        "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+    )
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return body
+
+    class _Client:
+        async def get(self, url, headers=None, timeout=None):
+            return _Resp()
+
+    assert await _reservation_active(_Client(), uuid.uuid4()) is False
+
+
 # --- _post_internal_execute direct branches ---------------------------------
 
 
