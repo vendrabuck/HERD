@@ -29,6 +29,9 @@ a consumer's `stream_info` finds it and never reaches `add_stream` at all;
 the no-`max_age` fallback config exists only for the case where a consumer
 starts before its stream's producer.
 
+`connect_nats` (issue #1083) is the one NATS connect every service uses: a
+bounded first connect that raises, then unlimited reconnects once connected.
+
 `ensure_consumer`, `nak_delay`, and `parse_nak_backoff_schedule` are issue
 #895's helpers: the durable-config upgrade path, and the NAK-delay schedule
 every consumer's transient-error branch consults so a bare `msg.nak()` no
@@ -61,6 +64,56 @@ DEFAULT_NAK_BACKOFF_SECONDS = (1, 5, 15, 60, 120)
 # nats-server source, not guessed: HTTP status 400 (surfaced by nats-py as
 # `BadRequestError`), err_code 10058.
 JS_STREAM_NAME_IN_USE = 10058
+
+# Bounded INITIAL connect (issue #1083). nats-py treats a negative
+# `max_reconnect_attempts` as "retry forever" for the first connection too
+# (the `while True` loop in `Client.connect` continues on NoServersError), so
+# `nats.connect(url, max_reconnect_attempts=-1)` against a broker that is down
+# at boot never returns and never raises, and a lifespan awaiting it never
+# finishes starting. `connect_nats` makes at most this many attempts, spaced
+# by NATS_RECONNECT_TIME_WAIT_SECONDS, before raising, so each caller's
+# logged-and-continue branch is reachable. Note nats-py reads 0 as unlimited
+# too (its pool only discards a server when the cap is > 0), so the bound
+# must be at least 1.
+NATS_INITIAL_CONNECT_ATTEMPTS = 5
+NATS_RECONNECT_TIME_WAIT_SECONDS = 2
+
+
+async def connect_nats(
+    url: str,
+    *,
+    initial_attempts: int | None = None,
+    reconnect_time_wait: float | None = None,
+):
+    """Connect to NATS with a bounded first connect and unlimited reconnects.
+
+    The first connection is tried at most `initial_attempts` times (plus the
+    first try) and then raises the client's own error (`NoServersError`), so
+    the caller can log and continue without the broker. Once a connection is
+    ESTABLISHED, the client's reconnect cap is switched to -1 (never give up):
+    the durable consumers and the outbox relays depend on that connection
+    recovering after a broker restart, which the default 60-attempt cap would
+    eventually abandon. nats-py reads `options["max_reconnect_attempts"]` on
+    every reconnect pass, so the change applies to every later reconnect.
+
+    Omitted arguments read the module constants at CALL time, so a test can
+    shorten the bound by patching them.
+    """
+    if initial_attempts is None:
+        initial_attempts = NATS_INITIAL_CONNECT_ATTEMPTS
+    if reconnect_time_wait is None:
+        reconnect_time_wait = NATS_RECONNECT_TIME_WAIT_SECONDS
+    if initial_attempts < 1:
+        raise ValueError("initial_attempts must be at least 1 (nats-py reads 0 as unlimited)")
+    import nats
+
+    nc = await nats.connect(
+        url,
+        max_reconnect_attempts=initial_attempts,
+        reconnect_time_wait=reconnect_time_wait,
+    )
+    nc.options["max_reconnect_attempts"] = -1
+    return nc
 
 
 async def ensure_stream(

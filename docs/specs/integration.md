@@ -452,10 +452,11 @@ the stream nor causes a duplicate.
   Enforced in: `services/integration/app/services/nats_consumer.py` (`start_nats_consumer`, `NATS_FETCH_TIMEOUT_SECONDS`) \
   Pinned by: `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_consumer_loop_fetches_one_message_at_a_time_on_both_subscriptions`, `test_consumer_loop_continues_after_idle_timeout`, `test_consumer_loop_survives_fetch_exception_and_retries`)
 - **INTEG-CONSUME-3.** When NATS cannot be reached at startup the failure is logged and
-  the service serves its API with no webhook delivery; a failure to ensure a stream is
-  logged and both consumers still start. \
-  Enforced in: `services/integration/app/services/nats_consumer.py` (`start_nats_consumer`) \
-  Pinned by: `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_start_nats_consumer_connection_failure_is_swallowed`, `test_start_nats_consumer_stream_ensure_failure_still_starts_both_consumers`)
+  the service serves its API with no webhook delivery until it is restarted (the first
+  connect is bounded, `operations-and-observability.md` OPS-NATS-1); a failure to ensure
+  a stream is logged and both consumers still start. \
+  Enforced in: `services/integration/app/services/nats_consumer.py` (`start_nats_consumer`); `services/common/herd_common/jetstream.py` (`connect_nats`) \
+  Pinned by: `services/integration/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`); `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_start_nats_consumer_connection_failure_is_swallowed`, `test_start_nats_consumer_stream_ensure_failure_still_starts_both_consumers`)
 - **INTEG-CONSUME-4.** On a migration-managed schema missing a model table, the consumers
   start only once the tables exist, so events wait on the stream. \
   Enforced in: `services/integration/app/main.py` (`lifespan`); `services/common/herd_common/consumer_schema_gate.py` (`start_consumer_when_schema_ready`) \
@@ -553,10 +554,11 @@ event is delivered twice.
   Enforced in: `services/notifications/app/services/nats_consumer.py` (`start_nats_consumer`, `NATS_FETCH_TIMEOUT_SECONDS`) \
   Pinned by: `services/notifications/tests/test_nats_consumer.py` (`test_start_nats_consumer_loop_fetches_one_message_at_a_time`, `test_start_nats_consumer_loop_swallows_unexpected_errors`)
 - **INTEG-NCONSUME-3.** When NATS cannot be reached at startup the failure is logged and
-  the service serves its API with no event-driven notifications; a stream failure is
-  tolerated. \
-  Enforced in: `services/notifications/app/services/nats_consumer.py` (`start_nats_consumer`) \
-  Pinned by: `services/notifications/tests/test_nats_consumer.py` (`test_start_nats_consumer_swallows_connect_failure`, `test_start_nats_consumer_tolerates_add_stream_failure`)
+  the service serves its API with no event-driven notifications until it is restarted
+  (the first connect is bounded, `operations-and-observability.md` OPS-NATS-1); a stream
+  failure is tolerated. \
+  Enforced in: `services/notifications/app/services/nats_consumer.py` (`start_nats_consumer`); `services/common/herd_common/jetstream.py` (`connect_nats`) \
+  Pinned by: `services/notifications/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`); `services/notifications/tests/test_nats_consumer.py` (`test_start_nats_consumer_swallows_connect_failure`, `test_start_nats_consumer_tolerates_add_stream_failure`)
 - **INTEG-NCONSUME-4.** On a migration-managed schema missing a model table, the
   consumers start only once the tables exist. \
   Enforced in: `services/notifications/app/main.py` (`lifespan`); `services/common/herd_common/consumer_schema_gate.py` (`start_consumer_when_schema_ready`) \

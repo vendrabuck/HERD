@@ -703,13 +703,15 @@ reaches a stack that keeps its broker state and no consumer drifts from the othe
 
 **Rules.**
 
-- **OPS-NATS-1.** Each service that uses NATS connects with unlimited reconnect attempts
-  and a 2 second wait. With no broker reachable that call keeps retrying and never
-  raises, so the service does not finish starting, and serves no route, until the broker
-  answers; the logged-and-continue branch after it is reached only by other errors.
-  Known gap, see #1083. \
-  Enforced in: `services/reservations/app/main.py` (`lifespan`); `services/execution/app/services/nats_consumer.py` (`start_nats_consumer`) \
-  Pinned by: none
+- **OPS-NATS-1.** Each service that uses NATS connects through `connect_nats`: the first
+  connection is tried at most `NATS_INITIAL_CONNECT_ATTEMPTS` (5) more times, 2 seconds
+  apart, and then raises, so a service whose broker is down at boot logs the failure and
+  finishes starting without NATS (about 10 seconds for a refused connection). Once a
+  connection is established the reconnect cap is unlimited, so a broker restart never
+  closes it. A service that started without NATS does not connect later: it stays
+  without the broker until it is restarted. \
+  Enforced in: `services/common/herd_common/jetstream.py` (`connect_nats`, `NATS_INITIAL_CONNECT_ATTEMPTS`); `services/reservations/app/main.py` (`lifespan`); `services/execution/app/services/nats_consumer.py` (`start_nats_consumer`); `services/notifications/app/services/nats_consumer.py` (`start_nats_consumer`); `services/integration/app/services/nats_consumer.py` (`start_nats_consumer`) \
+  Pinned by: `services/common/tests/test_nats_connect.py` (`test_initial_connect_to_a_down_broker_raises_instead_of_hanging`, `test_established_connection_reconnects_past_the_initial_bound`); `services/reservations/tests/test_main_task_lifecycle.py` (`test_lifespan_starts_without_nats_using_the_real_client`); `services/execution/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`)
 - **OPS-NATS-2.** The owner of a stream declares it with `ensure_stream`: add, and on the
   server's stream-name-in-use error (code 10058) update to the same config; any other
   error propagates. \
@@ -1319,7 +1321,7 @@ Startup refusals (no HTTP answer; the container exits or waits):
 |---|---|---|
 | secrets exits with `SECRETS_KEK is not set`, `... is not valid base64`, or `... must decode to exactly 32 bytes` | missing or malformed key material | OPS-SECRET-15 |
 | secrets exits naming the key version | a stored key that unwraps under neither key | OPS-SECRET-16 |
-| a service waits in startup | the NATS broker is unreachable | OPS-NATS-1 |
+| a service logs that NATS is unavailable and starts without it | the NATS broker is unreachable at boot | OPS-NATS-1 |
 | a service refuses to load its settings, naming the value | a bad `NATS_NAK_BACKOFF_SECONDS` entry or `NATS_ACK_WAIT_SECONDS` below 2 | OPS-NATS-9, OPS-NATS-10 |
 
 ## 10. Interactions with other services
@@ -1328,7 +1330,7 @@ Startup refusals (no HTTP answer; the container exits or waits):
 |---|---|---|---|---|
 | Out (every producer) | NATS | outbox relay publish, 10 s per message | deliver staged events | Fail safe: the row stays unpublished and is retried (OPS-OUTBOX-6, OPS-OUTBOX-7) |
 | Out (reservations, execution) | Postgres | `LISTEN herd_outbox_<schema>` on a dedicated connection | wake the relay | Logged and retried each tick; the tick still drains (OPS-OUTBOX-11) |
-| Out (every NATS user) | NATS | connect at startup | streams, consumers, relay | Startup waits until the broker answers (OPS-NATS-1) |
+| Out (every NATS user) | NATS | connect at startup | streams, consumers, relay | Startup finishes without NATS after a bounded first connect; no later connect until a restart (OPS-NATS-1) |
 | Out (execution) | inventory | `GET /devices/health-config` (internal token, 10 s) | poll registry | Fail safe: the previous registry is kept (OPS-POLL-2) |
 | Out (execution) | inventory | device and template reads per poll | what to poll and with which driver | The poll records `UNREACHABLE` (OPS-POLL-7) |
 | Out (execution) | the device's driver | `login`, `status`, `logout` in the sandbox | health check | Recorded as the poll's status (OPS-POLL-7) |
@@ -1409,9 +1411,6 @@ failing when a dependency is down (OPS-LIVE-1), services are said to crash-loop 
 
 ### Open defects
 
-- #1083, OPS-NATS-1: a service waits in startup until NATS answers, while the code's
-  own fallback, `reservations.md` (RES-EVENT-4), and `provisioning-and-wiring.md`
-  (WIRE-CONSUME-4) describe a service that starts without it.
 - #1084, OPS-SECRET-14: a malformed 200 from inventory's secret reference lookup is an
   unhandled 500 instead of the fail-closed 503.
 - #1085, OPS-SECRET-17 and OPS-SECRET-18: a DEK rotation is invisible to other replicas
@@ -1458,7 +1457,6 @@ failing when a dependency is down (OPS-LIVE-1), services are said to crash-loop 
 - OPS-SET-9: settings read once at import.
 - OPS-SCHEMA-9: schemas created only on an empty volume.
 - OPS-OUTBOX-14: the relay does not republish an acknowledged event.
-- OPS-NATS-1: startup with an unreachable broker.
 - OPS-NATS-13: JetStream store durability under `make prod`.
 - OPS-HEALTH-10: the device check writes no health status row and stages no event.
 - OPS-NATS-15: reservations' declaration of `HERD_RESERVATIONS`.

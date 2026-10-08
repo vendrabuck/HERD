@@ -29,6 +29,7 @@ import logging
 from collections.abc import Awaitable, Callable
 
 from herd_common.jetstream import (
+    connect_nats,
     ensure_consumer,
     ensure_stream_exists,
     heartbeat_interval,
@@ -244,11 +245,11 @@ async def start_nats_consumer(app) -> None:
     from nats.js.api import ConsumerConfig
 
     try:
-        nc = await nats.connect(
-            settings.nats_url,
-            max_reconnect_attempts=-1,
-            reconnect_time_wait=2,
-        )
+        # Bounded first connect, unlimited reconnects once connected (issue
+        # #1083): a broker that is down at boot raises after a few tries, so the
+        # warning below is reachable and the service runs without the consumer;
+        # an established connection still retries forever.
+        nc = await connect_nats(settings.nats_url)
         app.state.nats = nc
         js = nc.jetstream()
 

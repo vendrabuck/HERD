@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from herd_common.cors import add_cors_middleware
-from herd_common.jetstream import ensure_stream
+from herd_common.jetstream import connect_nats, ensure_stream
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.outbox import run_outbox_relay
 from herd_common.schema_init import create_all_and_stamp
@@ -34,17 +34,13 @@ async def lifespan(app: FastAPI):
     # Connect to NATS (non-fatal if unavailable)
     app.state.nats = None
     try:
-        import nats
-
-        # Retry reconnect forever (max_reconnect_attempts=-1): the outbox relay
-        # depends on this connection recovering after a broker restart, otherwise
-        # buffered events would be stranded once the default 60-attempt cap gave
-        # up and closed the connection.
-        nc = await nats.connect(
-            settings.nats_url,
-            max_reconnect_attempts=-1,
-            reconnect_time_wait=2,
-        )
+        # Bounded first connect, unlimited reconnects once connected (issue
+        # #1083, herd_common.jetstream.connect_nats): a broker that is down at
+        # boot raises after a few tries, so this lifespan reaches the warning
+        # below instead of waiting forever; an established connection still
+        # retries forever, since the outbox relay depends on it recovering after
+        # a broker restart.
+        nc = await connect_nats(settings.nats_url)
         app.state.nats = nc
         logger.info("Connected to NATS at %s", settings.nats_url)
         js = nc.jetstream()

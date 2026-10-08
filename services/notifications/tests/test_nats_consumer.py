@@ -586,6 +586,8 @@ class _FakeNatsConn:
     def __init__(self, js):
         self._js = js
         self.closed = False
+        # herd_common.jetstream.connect_nats sets the reconnect cap here.
+        self.options = {}
 
     def jetstream(self):
         return self._js
