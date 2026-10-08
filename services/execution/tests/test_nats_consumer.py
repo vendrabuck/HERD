@@ -864,3 +864,22 @@ async def test_process_message_falls_back_to_stream_sequence_without_event_id():
     assert result == "ack"
     _args, _kwargs = handler.call_args
     assert _args[2] == "HERD_RESERVATIONS:55"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [b"null", b"5", b"[1]", b'"text"', b"true"])
+async def test_process_message_non_object_json_routes_to_dlq_and_acks(body):
+    """Issue #1074 (checked in execution too): valid JSON that is not an
+    object is poison, routed to the DLQ before the corroboration gate or any
+    handler reads it with `.get`."""
+    js = _make_js()
+    msg = _make_msg(body)
+    handler = AsyncMock()
+
+    result = await process_reservation_message(msg, js, handler, session_factory=lambda: None)
+
+    assert result == "dlq"
+    handler.assert_not_awaited()
+    js.publish.assert_awaited_once_with(NATS_DLQ_SUBJECT, body)
+    msg.ack.assert_awaited_once()
+    msg.nak.assert_not_awaited()

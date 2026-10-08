@@ -296,7 +296,7 @@ This area publishes only dead-letter copies.
 
 | Subject | Producer | Staged when | Consumers | Payload keys | Rules |
 |---|---|---|---|---|---|
-| `herd.reservations.dlq.execution` | execution consumer | a message is undecodable, raises `PermanentEventError`, or fails at its fifth delivery (published directly, not through an outbox) | none; retained in the `HERD_DLQ` stream for inspection and replay | the original message bytes, unchanged | WIRE-CONSUME-8, WIRE-CONSUME-9, WIRE-CONSUME-11, WIRE-CONSUME-13 |
+| `herd.reservations.dlq.execution` | execution consumer | a message is undecodable or not a JSON object, raises `PermanentEventError`, or fails at its fifth delivery (published directly, not through an outbox) | none; retained in the `HERD_DLQ` stream for inspection and replay | the original message bytes, unchanged | WIRE-CONSUME-8, WIRE-CONSUME-9, WIRE-CONSUME-11, WIRE-CONSUME-13 |
 
 Events consumed from `HERD_RESERVATIONS` (all produced by reservations, section 6 of
 `reservations.md`):
@@ -371,10 +371,11 @@ for an operator.
   thread, so the event loop keeps sending heartbeats while a switch answers. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_run_sandbox`) \
   Pinned by: `services/execution/tests/test_nats_consumer_heartbeat.py` (`test_run_sandbox_runs_off_the_event_loop`)
-- **WIRE-CONSUME-8.** A message whose body is not JSON is published to
-  `herd.reservations.dlq.execution` and acked, logged `nats_poison_message`. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`process_reservation_message`) \
-  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_process_message_poison_json_routes_to_dlq_and_acks`); `tests/integration/test_dlq_and_idempotency.py` (`test_poison_reservation_event_is_retained_in_dlq`)
+- **WIRE-CONSUME-8.** A message whose body is not JSON, or is JSON but not an object, is
+  published to `herd.reservations.dlq.execution` and acked, logged `nats_poison_message`,
+  before the corroboration gate or any handler reads it. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`process_reservation_message`); `services/common/herd_common/jetstream.py` (`decode_event_object`) \
+  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_process_message_poison_json_routes_to_dlq_and_acks`, `test_process_message_non_object_json_routes_to_dlq_and_acks`); `tests/integration/test_dlq_and_idempotency.py` (`test_poison_reservation_event_is_retained_in_dlq`, `test_non_object_json_event_is_dead_lettered_by_each_consumer`)
 - **WIRE-CONSUME-9.** A `PermanentEventError` from the handler dead-letters the message on
   its first delivery and acks it, logged `nats_dlq_permanent`. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`process_reservation_message`, `PermanentEventError`) \

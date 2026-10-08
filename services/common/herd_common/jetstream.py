@@ -41,6 +41,7 @@ longer redelivers immediately (see each function's docstring).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 
@@ -64,6 +65,24 @@ DEFAULT_NAK_BACKOFF_SECONDS = (1, 5, 15, 60, 120)
 # nats-server source, not guessed: HTTP status 400 (surfaced by nats-py as
 # `BadRequestError`), err_code 10058.
 JS_STREAM_NAME_IN_USE = 10058
+
+
+def decode_event_object(data: bytes) -> dict | None:
+    """Decode a consumed message body into an event dict, or None for poison.
+
+    Every consumer treats an undecodable body as poison (DLQ plus ack). A body
+    that decodes to valid JSON that is NOT an object (`null`, `5`, `[1]`) is
+    poison too (issue #1074): every handler, `event_dedupe_key`, and each
+    consumer's own error branch read it with `.get`, so before this check the
+    AttributeError escaped the consumer with the message never settled and,
+    after max_deliver, dropped with no DLQ copy.
+    """
+    try:
+        event = json.loads(data.decode())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return event if isinstance(event, dict) else None
+
 
 # Bounded INITIAL connect (issue #1083). nats-py treats a negative
 # `max_reconnect_attempts` as "retry forever" for the first connection too

@@ -910,3 +910,23 @@ async def test_started_consumer_loop_heartbeats_a_slow_handler(monkeypatch):
         assert msg.in_progress.await_count >= 3
     finally:
         await nats_consumer.stop_nats_consumer(app)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [b"null", b"5", b"[1]", b'"text"', b"true"])
+async def test_process_message_non_object_json_goes_to_dlq(body):
+    """Issue #1074: valid JSON that is not an object is poison. Before the fix
+    the handler's `.get` raised, the except branch's own `event_data.get`
+    raised again, and the message escaped with no ack, nak, or DLQ copy."""
+    msg = _FakeMsg(body)
+    js = AsyncMock()
+
+    async def _handler(event, sf, dedupe_key=None):
+        raise AssertionError("handler should not be called on poison msg")
+
+    result = await nats_consumer.process_message(msg, js, _handler, _session_factory)
+
+    assert result == "dlq"
+    js.publish.assert_awaited_once_with(nats_consumer.NATS_DLQ_SUBJECT, body)
+    msg.ack.assert_awaited_once()
+    msg.nak.assert_not_awaited()

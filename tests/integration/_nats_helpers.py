@@ -78,6 +78,9 @@ async def fetch_reservation_event(
                     body = json.loads(m.data)
                 except Exception:  # noqa: BLE001 - skip non-JSON
                     continue
+                if not isinstance(body, dict):
+                    # A non-object body (issue #1074's poison test) is not an event.
+                    continue
                 if body.get("event") == event and body.get("reservation_id") == reservation_id:
                     return m.data
             await asyncio.sleep(0.3)
@@ -135,6 +138,9 @@ async def fetch_events_for_reservation(
                 try:
                     body = json.loads(m.data)
                 except Exception:  # noqa: BLE001 - skip non-JSON
+                    continue
+                if not isinstance(body, dict):
+                    # A non-object body (issue #1074's poison test) is not an event.
                     continue
                 if body.get("reservation_id") == reservation_id:
                     events.append(body)

@@ -466,12 +466,12 @@ the stream nor causes a duplicate.
   peer consumer while it runs. \
   Enforced in: `services/integration/app/services/nats_consumer.py` (`process_batch`, `NATS_HEARTBEAT_SECONDS`); `services/common/herd_common/jetstream.py` (`process_batch_with_heartbeat`) \
   Pinned by: `services/integration/tests/test_nats_consumer_heartbeat.py` (`test_running_handler_is_heartbeated_then_stops_after_ack`, `test_heartbeat_interval_is_below_ack_wait`); `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_started_consumer_loop_heartbeats_a_slow_handler`); `tests/integration/test_webhook_slow_receiver_live.py` (`test_slow_receiver_gets_the_event_exactly_once`)
-- **INTEG-CONSUME-6.** A body that is valid JSON but not an object is not treated as
-  poison: the handler's error escapes `process_message` unsettled, and the broker
-  redelivers it until `max_deliver`, after which it is dropped with no dead-letter copy.
-  Known gap, see #1074. \
-  Enforced in: `services/integration/app/services/nats_consumer.py` (`process_message`) \
-  Pinned by: none (issue #1074)
+- **INTEG-CONSUME-6.** A body that is valid JSON but not an object (`null`, a number, a
+  string, a boolean, a list) is poison, handled as INTEG-CONSUME-7 handles a body that is
+  not JSON: published to the subscription's dead-letter subject and acked, logged
+  `nats_poison_message`, before any handler runs. \
+  Enforced in: `services/integration/app/services/nats_consumer.py` (`process_message`); `services/common/herd_common/jetstream.py` (`decode_event_object`) \
+  Pinned by: `services/integration/tests/test_nats_consumer.py` (`test_process_message_non_object_json_goes_to_dlq`); `services/common/tests/test_jetstream.py` (`test_decode_event_object_accepts_only_json_objects`); `tests/integration/test_dlq_and_idempotency.py` (`test_non_object_json_event_is_dead_lettered_by_each_consumer`)
 - **INTEG-CONSUME-7.** A body that is not JSON is published to the subscription's
   dead-letter subject (`herd.reservations.dlq.integration` or
   `herd.health.dlq.integration`) and acked, logged `nats_poison_message`. \
@@ -567,11 +567,11 @@ event is delivered twice.
   every half of `ack_wait`, so a slow outbound channel does not cause a redelivery. \
   Enforced in: `services/notifications/app/services/nats_consumer.py` (`process_batch`, `NATS_HEARTBEAT_SECONDS`); `services/common/herd_common/jetstream.py` (`process_batch_with_heartbeat`) \
   Pinned by: `services/notifications/tests/test_nats_consumer_heartbeat.py` (`test_running_handler_is_heartbeated_then_stops_after_ack`, `test_heartbeat_interval_is_below_ack_wait`); `services/notifications/tests/test_nats_consumer.py` (`test_started_consumer_loop_heartbeats_a_slow_handler`)
-- **INTEG-NCONSUME-6.** A body that is valid JSON but not an object is not treated as
-  poison: the error escapes `process_message` unsettled and the message is dropped after
-  `max_deliver` with no dead-letter copy. Known gap, see #1074. \
-  Enforced in: `services/notifications/app/services/nats_consumer.py` (`process_message`) \
-  Pinned by: none (issue #1074)
+- **INTEG-NCONSUME-6.** A body that is valid JSON but not an object is poison, handled as
+  INTEG-NCONSUME-7 handles a body that is not JSON: dead-lettered and acked, logged
+  `nats_poison_message`, before any handler runs. \
+  Enforced in: `services/notifications/app/services/nats_consumer.py` (`process_message`); `services/common/herd_common/jetstream.py` (`decode_event_object`) \
+  Pinned by: `services/notifications/tests/test_nats_consumer.py` (`test_process_message_non_object_json_goes_to_dlq`); `tests/integration/test_dlq_and_idempotency.py` (`test_non_object_json_event_is_dead_lettered_by_each_consumer`)
 - **INTEG-NCONSUME-7.** A body that is not JSON is published to
   `herd.reservations.dlq.notifications` or `herd.health.dlq.notifications` and acked,
   logged `nats_poison_message`. \
@@ -926,10 +926,9 @@ the log action.
 
 | Outcome | Log action | When | Rule |
 |---|---|---|---|
-| acked, dead-lettered | `nats_poison_message` | the body is not JSON | INTEG-CONSUME-7, INTEG-NCONSUME-7 |
+| acked, dead-lettered | `nats_poison_message` | the body is not JSON, or is JSON but not an object | INTEG-CONSUME-6, INTEG-CONSUME-7, INTEG-NCONSUME-6, INTEG-NCONSUME-7 |
 | nacked with delay | `nats_message_nak` | a handler error before the fifth delivery | INTEG-CONSUME-8, INTEG-NCONSUME-8 |
 | acked, dead-lettered | `nats_dlq_exhausted` | a handler error at the fifth delivery | INTEG-CONSUME-8, INTEG-NCONSUME-8 |
-| left unsettled | `Unexpected error processing NATS message` | the body is JSON but not an object | INTEG-CONSUME-6, INTEG-NCONSUME-6 |
 | acked, ledger row `dead` | none | every POST attempt to a receiver failed | INTEG-HOOK-14 |
 | acked, nothing sent | `notification_deduped` | the user or channel already has this event | INTEG-INAPP-1, INTEG-OUT-3 |
 | acked, channel skipped | `outbound_dispatch_failed` | an email, chat, or webhook-channel send failed | INTEG-OUT-4 |
@@ -995,9 +994,6 @@ Two documents are incomplete against the code this specification describes, trac
 
 ### Open defects
 
-- #1074 (INTEG-CONSUME-6, INTEG-NCONSUME-6): a JSON message body that is not an object
-  escapes both consumers unsettled and is dropped after `max_deliver` with no
-  dead-letter copy.
 - #1075 (INTEG-HEALTH-4, INTEG-PREFS-6, INTEG-OUT-5): a failed admin-list, preference,
   or contact lookup is cached for the full TTL as if it were an answer.
 - #1076 (INTEG-UI-3): the bell nests the delete button inside the item button, and its
@@ -1047,8 +1043,6 @@ Two documents are incomplete against the code this specification describes, trac
 - INTEG-HOOK-15: a `dead` row retried and overwritten on redelivery.
 - INTEG-HOOK-16: the concurrent ledger insert race.
 - INTEG-HOOK-22: the ledger key with neither an event id nor metadata.
-- INTEG-CONSUME-6: a JSON body that is not an object (integration).
-- INTEG-NCONSUME-6: a JSON body that is not an object (notifications).
 - INTEG-HEALTH-4: the empty admin list cached after a failure.
 - INTEG-INAPP-7: marking a read notification read again.
 - INTEG-PREFS-5: `channels` replaced whole on a write.

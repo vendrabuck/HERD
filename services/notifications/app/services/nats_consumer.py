@@ -1,12 +1,12 @@
 """NATS consumer: subscribe to reservation lifecycle events and dispatch notifications."""
 
 import asyncio
-import json
 import logging
 from collections.abc import Awaitable, Callable
 
 from herd_common.jetstream import (
     connect_nats,
+    decode_event_object,
     ensure_consumer,
     ensure_stream_exists,
     heartbeat_interval,
@@ -130,9 +130,10 @@ async def process_message(
     NAK), so the redelivery actually waits
     NATS_NAK_BACKOFF_SECONDS[min(num_delivered - 1, ...)] seconds.
     """
-    try:
-        event_data = json.loads(msg.data.decode())
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    # A body that is not UTF-8 JSON, or is JSON but not an object, is poison
+    # (issue #1074: a non-object body used to escape unsettled).
+    event_data = decode_event_object(msg.data)
+    if event_data is None:
         logger.error(
             "Poison message on stream; routing to DLQ",
             extra={

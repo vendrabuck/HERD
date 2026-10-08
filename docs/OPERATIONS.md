@@ -105,7 +105,7 @@ Five durable consumers feed off two source streams (`HERD_RESERVATIONS` for `her
 - `integration` webhooks consumer (`integration-webhooks-consumer`), DLQ `herd.reservations.dlq.integration`
 - `integration` webhooks health consumer (`integration-webhooks-health-consumer`, issue #831), DLQ `herd.health.dlq.integration`
 
-Messages that poisoned any consumer (bad JSON or exhausted `max_deliver=5`) land on the consumer's DLQ subject and are retained in `HERD_DLQ` within the stream's `max_age` (see JetStream durability below); on the dev/test path they are retained only until the next container recreate.
+Messages that poisoned any consumer (bad JSON, JSON that is not an object, or exhausted `max_deliver=5`) land on the consumer's DLQ subject and are retained in `HERD_DLQ` within the stream's `max_age` (see JetStream durability below); on the dev/test path they are retained only until the next container recreate.
 
 The compose `nats` service runs `nats:2.10-alpine`, which ships only `nats-server`: there is no `nats` CLI inside it, so running `nats` in that container fails with "executable file not found". Run the CLI from a one-off `natsio/nats-box` container on the stack's network instead, the same form `docs/TROUBLESHOOTING.md` uses. The network is `<compose project>_herd-net` (for example `herd-public_herd-net` for a checkout in `herd-public/`; `docker network ls | grep herd-net` lists it). Every command below goes through this one shell variable; `nats-box:0.14.5` carries natscli 0.1.5, whose flags these commands use:
 
