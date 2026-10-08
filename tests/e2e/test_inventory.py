@@ -6,6 +6,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+from .conftest import api_request
+
 WAIT = 15
 
 
@@ -71,7 +73,20 @@ def test_inventory_search_filters_results(logged_in_browser, base_url):
 
     search_input.send_keys(Keys.END)
     search_input.send_keys(Keys.BACKSPACE * len(typed))
-    time.sleep(0.6)
+    # The empty search reaches the server about 500 ms after the last keystroke
+    # (300 ms search debounce plus the store's 200 ms PATCH debounce). A fixed
+    # 0.6 s sleep left about 100 ms before the next navigation or driver.quit
+    # could drop that PATCH, leaving the typed search saved (issue #1070), so
+    # poll the saved preference until it reads back empty.
+    deadline = time.monotonic() + WAIT
+    saved = None
+    while time.monotonic() < deadline:
+        prefs = api_request(logged_in_browser, "GET", "/user-profile/preferences").json()
+        saved = ((prefs.get("saved_filters") or {}).get("inventory") or {}).get("search") or ""
+        if saved == "":
+            break
+        time.sleep(0.25)
+    assert saved == "", f"inventory search still saved as {saved!r} after erasing it"
 
 
 def test_inventory_device_expand_shows_ports(logged_in_browser, base_url):

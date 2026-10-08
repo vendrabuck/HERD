@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from playwright.sync_api import expect
 
-from .conftest import HOST_BASE_URL, pw_api, pw_login
+from .conftest import HOST_BASE_URL, pw_api, pw_login, pw_prefs_patch_carries
 
 PREFS_GLOB = "**/api/user-profile/preferences"
 
@@ -45,18 +45,6 @@ def _is_page_list_request(request) -> bool:
 
 def _search_of(request) -> str | None:
     return (parse_qs(urlparse(request.url).query).get("search") or [None])[0]
-
-
-def _inventory_patch_with_status(response, status: str) -> bool:
-    request = response.request
-    if request.method != "PATCH" or "/user-profile/preferences" not in response.url:
-        return False
-    try:
-        body = json.loads(request.post_data or "{}")
-    except ValueError:
-        return False
-    inventory = (body.get("saved_filters") or {}).get("inventory")
-    return isinstance(inventory, dict) and inventory.get("status") == status
 
 
 def test_late_loading_saved_search_survives_an_immediate_filter_change(pw_page):
@@ -110,7 +98,7 @@ def test_late_loading_saved_search_survives_an_immediate_filter_change(pw_page):
                 polling="raf",
             )
             with pw_page.expect_response(
-                lambda r: _inventory_patch_with_status(r, "MAINTENANCE")
+                lambda r: pw_prefs_patch_carries(r, "inventory", "MAINTENANCE", key="status")
             ) as patch_info:
                 status_select.select_option("MAINTENANCE")
         finally:
@@ -192,7 +180,7 @@ def test_filter_change_while_preferences_load_is_held_keeps_saved_search(pw_page
             assert patches == [], "a preference PATCH left while the GET was held"
 
             with pw_page.expect_response(
-                lambda r: _inventory_patch_with_status(r, "MAINTENANCE")
+                lambda r: pw_prefs_patch_carries(r, "inventory", "MAINTENANCE", key="status")
             ) as patch_info:
                 for route in held:
                     route.continue_()
