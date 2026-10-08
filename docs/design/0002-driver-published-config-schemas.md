@@ -341,7 +341,7 @@ Slices 1-3 are non-behavioral and safe to merge ahead of 4.
 
 ## As built (2026-10-08)
 
-Two points where the shipped code differs from the text above; the decisions stand.
+Three points where the shipped code differs from the text above; the decisions stand.
 
 - The proxy route `GET /api/inventory/drivers/{id}/config-schema` admits any signed-in
   user, not only admins (section 2.3 and slice 3 said admin-readable): it drives the
@@ -354,3 +354,9 @@ Two points where the shipped code differs from the text above; the decisions sta
   loser adopts the winner's directory. A changed SHA256 still removes the old directory
   and re-extracts. The current rules are CFG-LOAD-1 onward in
   `docs/specs/device-configuration.md`.
+- Section 1.2's sandbox invocation predates PR #1127: the child no longer receives the
+  method's keyword arguments as a JSON argument. They travel in a second owner-only
+  temporary file with the context file's lifecycle, only its path is on the command
+  line, and `_runner.py` reads it from there; the run row stores the arguments masked
+  through `herd_common.config_redaction.redact_config`. The current rules are CFG-SBX-1
+  and CFG-EXEC-8 in `docs/specs/device-configuration.md`.
