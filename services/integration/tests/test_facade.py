@@ -423,3 +423,69 @@ async def test_upstream_unreachable_is_503(monkeypatch):
         resp = await c.get(f"/reservations/{uuid.uuid4()}", headers=_auth(_token()))
 
     assert resp.status_code == 503
+
+
+# --- reservation id path segment (issue #1105) --------------------------------
+
+_ID_ROUTES = [
+    ("GET", "/reservations/{rid}"),
+    ("DELETE", "/reservations/{rid}"),
+    ("PUT", "/reservations/{rid}/release"),
+    ("GET", "/reservations/{rid}/wiring-status"),
+]
+
+# Each spelling reaches the route as one path segment: a plain non-UUID, a
+# percent-encoded "?" (decoded to "?x", which would move the rest of the
+# upstream path into the query string), and percent-encoded dot segments
+# (decoded to "..", which httpx would collapse upstream).
+_BAD_IDS = ["not-a-uuid", "%3Fx", "%2E%2E", "12345"]
+
+
+@pytest.mark.parametrize("method,template", _ID_ROUTES)
+@pytest.mark.parametrize("bad_id", _BAD_IDS)
+async def test_reservation_id_must_be_a_uuid(monkeypatch, method, template, bad_id):
+    """Every facade route that puts the reservation id into the upstream path
+    answers FastAPI's 422 for a non-UUID id and makes no upstream call, so the
+    forwarded request always targets /<uuid>... (INTEG-FACADE-15)."""
+    calls = []
+
+    def handler(method_, url, headers, json, params):
+        calls.append(url)
+        return httpx.Response(200, json=[])
+
+    _install_handler(monkeypatch, handler)
+    async with _client() as c:
+        resp = await c.request(method, template.format(rid=bad_id), headers=_auth(_token()))
+
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert isinstance(detail, list)
+    assert detail[0]["loc"] == ["path", "reservation_id"]
+    assert detail[0]["type"] == "uuid_parsing"
+    assert calls == []
+
+
+@pytest.mark.parametrize("method,template", _ID_ROUTES)
+async def test_reservation_id_is_forwarded_in_canonical_form(monkeypatch, method, template):
+    """A valid id in any accepted spelling (here upper case) is forwarded as the
+    canonical lower-case hyphenated UUID."""
+    rid = uuid.uuid4()
+    internal = _sample_internal(str(rid))
+    seen = []
+
+    def handler(method_, url, headers, json, params):
+        seen.append(url)
+        if method_ == "DELETE":
+            return httpx.Response(204)
+        return httpx.Response(200, json=internal)
+
+    _install_handler(monkeypatch, handler)
+    async with _client() as c:
+        resp = await c.request(
+            method, template.format(rid=str(rid).upper()), headers=_auth(_token())
+        )
+
+    assert resp.status_code in (200, 204), resp.text
+    assert len(seen) == 1
+    suffix = template.format(rid=str(rid)).removeprefix("/reservations")
+    assert seen[0] == f"{facade.settings.reservations_service_url}{suffix}"

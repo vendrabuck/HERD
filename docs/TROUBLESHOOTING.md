@@ -425,6 +425,25 @@ Inspect them, figure out why they failed, decide whether to replay or discard. E
 
 Expected under `make up` and the gate stack: JetStream state is ephemeral there by design and is lost on a container recreate. See [OPERATIONS.md](OPERATIONS.md#jetstream-durability) for what is and isn't durable, and what `make prod` does instead.
 
+### Webhook registration answers `422 target_url must resolve to a public address`
+
+The destination's host resolves to a non-public address (loopback, link-local,
+private, shared address space, multicast, or unspecified), or does not resolve at
+all. A receiver on the public internet needs a hostname that resolves publicly. An
+internal receiver is admitted only when the operator names its hostname or a CIDR
+containing its address in the integration service's `WEBHOOK_ALLOWED_HOSTS` (see
+[ENV_VARS.md](ENV_VARS.md#integration-service)), then recreates the container.
+
+### Webhook deliveries recorded `failed` with `destination not allowed`
+
+The same rule runs before every delivery, so a subscription registered before the
+rule existed, or whose host now resolves to a non-public address, is not sent to.
+Nothing was POSTed and the delivery is not retried. Fix the destination (or the
+allowlist) and the next event, or a republished one, is delivered normally. Other
+`last_error` values are `upstream answered HTTP <status>` (the receiver answered
+non-2xx) and `delivery failed (<ErrorClass>)` (no answer); the integration
+service's log line for the delivery carries the full error text.
+
 ## Secrets service
 
 ### Secrets container restarts in a loop or exits at boot

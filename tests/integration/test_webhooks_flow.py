@@ -15,6 +15,11 @@ The success receiver is the integration service's own unauthenticated echo sink
 (http://integration:8000/webhooks/echo), reachable on the docker network. The
 service /health endpoints are GET-only and would 405 a webhook POST, so they are
 not usable as a 2xx target.
+
+Both in-network targets resolve to compose-network (private) addresses, so they
+are registrable only because docker-compose.override.yml names `integration` and
+`reservations` in WEBHOOK_ALLOWED_HOSTS; any other internal host is refused with
+422 (test_webhook_target_must_be_public).
 """
 
 import asyncio
@@ -232,11 +237,33 @@ async def test_webhook_failure_dead_letters(admin_client, fresh_device):
         assert terminal, f"no dead-letter row appeared; ledger={rows}"
         assert terminal[0]["status"] == "dead"
         assert terminal[0]["attempts"] >= 1
-        assert terminal[0]["last_error"]
+        # The ledger carries the answer's status only, never httpx's text.
+        # The dead target answers a POST with a 4xx (405 today, since the route only
+        # serves GET); the ledger text names whatever status the receiver answered.
+        assert terminal[0]["response_status"] is not None
+        assert terminal[0]["last_error"] == (
+            f"upstream answered HTTP {terminal[0]['response_status']}"
+        )
     finally:
         if reservation_id:
             await admin_client.delete(f"/v1/reservations/{reservation_id}")
         await admin_client.delete(f"/v1/webhooks/{webhook_id}")
+
+
+async def test_webhook_target_must_be_public(admin_client):
+    """A destination whose host resolves to a non-public address (here the
+    stack's own Postgres, on the compose network) and is not named in
+    WEBHOOK_ALLOWED_HOSTS is refused at registration, and nothing is stored."""
+    target = "http://postgres:5432/hook"
+    resp = await admin_client.post(
+        "/v1/webhooks",
+        json={"target_url": target, "event_types": ["reservation.created"]},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {"detail": "target_url must resolve to a public address"}
+    listed = await admin_client.get("/v1/webhooks")
+    assert listed.status_code == 200, listed.text
+    assert target not in [w["target_url"] for w in listed.json()]
 
 
 async def test_unknown_event_type_rejected(admin_client):
@@ -259,11 +286,13 @@ async def test_webhooks_require_admin(user_client):
 
 async def test_device_health_transition_event_type_accepted(admin_client):
     """Issue #831: the registration validator now accepts
-    device.health_transition alongside the six reservation lifecycle events."""
+    device.health_transition alongside the six reservation lifecycle events.
+    The target is the allowlisted echo sink: a registered destination must
+    resolve, so a placeholder such as example.invalid is refused."""
     resp = await admin_client.post(
         "/v1/webhooks",
         json={
-            "target_url": "https://example.invalid/hook",
+            "target_url": ECHO_TARGET,
             "event_types": ["device.health_transition"],
         },
     )

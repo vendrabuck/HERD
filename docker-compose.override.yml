@@ -63,6 +63,12 @@ services:
       # Test-only webhook delivery sink, dev/test stack only (never in make prod,
       # which excludes this override). Mirrors the HERD_FAULT_INJECTION seam.
       WEBHOOK_TEST_SINK_ENABLED: "true"
+      # Dev/test-only webhook destination allowlist (never in make prod, which
+      # leaves it empty so every destination must resolve to public addresses).
+      # Admits the in-network targets tests/integration/test_webhooks_flow.py and
+      # test_webhook_slow_receiver_live.py register: the echo sink on
+      # integration and the 404 route on reservations.
+      WEBHOOK_ALLOWED_HOSTS: "integration,reservations"
       # Dev/test-only short NAK-delay schedule (issue #895; production default
       # is 1,5,15,60,120). Keeps tests/integration/test_dynamic_resources.py's
       # transient-failure exhaustion fast while still exercising a real

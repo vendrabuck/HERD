@@ -71,14 +71,15 @@ Two small state machines live in this area. The rules the tables cite are in sec
 
 - `delivered`: a POST for this (subscription, event) answered 2xx. Never written again.
 - `dead`: every attempt of the last delivery failed.
-
-The model's comment also names a `failed` status; no code path writes it.
+- `failed`: the destination was not allowed when the delivery was due (INTEG-HOOK-23);
+  nothing was POSTed.
 
 | From | To | Performed by | Guard | Stages | Rule |
 |---|---|---|---|---|---|
 | (none) | `delivered` | webhook consumer (`deliver_one`) | an attempt answered 2xx | nothing | INTEG-HOOK-13 |
 | (none) | `dead` | webhook consumer (`deliver_one`) | every attempt failed | nothing | INTEG-HOOK-14 |
-| `dead` | `delivered` or `dead` | a redelivered or republished event (`deliver_one`) | none | nothing | INTEG-HOOK-15 |
+| (none) | `failed` | webhook consumer (`deliver_one`) | the destination is not allowed | nothing | INTEG-HOOK-23 |
+| `dead` or `failed` | `delivered`, `dead`, or `failed` | a redelivered or republished event (`deliver_one`) | none | nothing | INTEG-HOOK-15, INTEG-HOOK-23 |
 | `delivered` | anything | nothing | none | nothing | INTEG-HOOK-17 |
 
 **Statuses of a notification.** Unread (`read_at` null) and read (`read_at` set).
@@ -245,11 +246,12 @@ the web interface's API does.
   answers 503 `Reservations service unavailable`, fail closed. \
   Enforced in: `services/integration/app/routers/reservations.py` (`_forward`, `UPSTREAM_TIMEOUT`) \
   Pinned by: `services/integration/tests/test_facade.py` (`test_upstream_unreachable_is_503`)
-- **INTEG-FACADE-15.** The `{reservation_id}` path segment is a string, not validated as
-  a UUID by the facade, and is placed into the upstream path as given; reservations
-  validates it. \
+- **INTEG-FACADE-15.** The `{reservation_id}` path segment must be a UUID: anything else
+  is FastAPI's 422 (`uuid_parsing` at `["path", "reservation_id"]`) and no upstream call
+  is made, so a percent-encoded `?` or a dot segment can never change the upstream route.
+  A valid id is forwarded in its canonical lower-case hyphenated form (#1105). \
   Enforced in: `services/integration/app/routers/reservations.py` (`get_reservation`, `cancel_reservation`, `release_reservation`, `get_reservation_wiring_status`) \
-  Pinned by: none
+  Pinned by: `services/integration/tests/test_facade.py` (`test_reservation_id_must_be_a_uuid`, `test_reservation_id_is_forwarded_in_canonical_form`)
 
 **Out of scope.** Token minting and exchange (`identity-and-access.md`); every rule about
 which reservation a caller may act on (`reservations.md`).
@@ -307,9 +309,19 @@ one's delivery history.
   Enforced in: `services/integration/app/routers/webhooks.py` (`require_admin`) \
   Pinned by: `services/integration/tests/test_webhooks.py` (`test_create_requires_admin`); `tests/integration/test_webhooks_flow.py` (`test_webhooks_require_admin`)
 - **INTEG-HOOK-2.** `target_url` is 1 to 2048 characters and must start with `http://`
-  or `https://`, else 422; no other property of the destination is checked. \
-  Enforced in: `services/integration/app/schemas/webhook.py` (`WebhookCreate`, `_validate_url`) \
-  Pinned by: `services/integration/tests/test_webhooks.py` (`test_create_rejects_non_http_url`)
+  or `https://`, else 422 (validation envelope). Its host must then resolve to public
+  addresses only: every A and AAAA answer must pass `is_public_address` (loopback,
+  link-local, RFC 1918, shared address space 100.64.0.0/10, IPv6 unique-local,
+  multicast, unspecified, reserved, and IPv4-mapped, 6to4, and Teredo forms are
+  refused), an IP literal host is judged as written, and a host that does not resolve
+  or answers nothing is refused (fail closed). `WEBHOOK_ALLOWED_HOSTS` admits named
+  internal destinations: a hostname entry matching the URL host exactly
+  (case-insensitive, trailing dot ignored) is admitted without resolving, and an address
+  inside a CIDR entry counts as allowed. A refusal is 422 `target_url must resolve to a
+  public address` and nothing is stored. The check and the later connection resolve DNS
+  separately (the limit AI-DOCS-11 shares). \
+  Enforced in: `services/integration/app/schemas/webhook.py` (`WebhookCreate`, `_validate_url`); `services/integration/app/routers/webhooks.py` (`create_webhook`); `services/integration/app/services/destination.py` (`destination_allowed`, `destination_allowed_sync`, `parse_allowed_hosts`, `TARGET_NOT_PUBLIC_DETAIL`); `services/common/herd_common/public_address.py` (`is_public_address`, `default_resolver`) \
+  Pinned by: `services/integration/tests/test_webhooks.py` (`test_create_rejects_non_http_url`); `services/integration/tests/test_webhook_destinations.py` (`test_webhook_target_must_be_public`, `test_webhook_target_public_address_is_accepted`, `test_webhook_target_refused_when_any_answer_is_not_public`, `test_webhook_target_refused_when_host_does_not_resolve`, `test_webhook_target_ip_literal_is_judged_without_resolving`, `test_allowed_hosts_admits_a_named_host_without_resolving`, `test_allowed_hosts_name_match_is_exact`, `test_allowed_hosts_admits_addresses_inside_a_cidr`, `test_allowed_hosts_cidr_does_not_admit_other_private_addresses`, `test_malformed_cidr_refuses_to_boot`); `services/common/tests/test_public_address.py` (`test_refused_address_classes`); `tests/integration/test_webhooks_flow.py` (`test_webhook_target_must_be_public`)
 - **INTEG-HOOK-3.** `event_types` is a non-empty list whose every entry is one of the
   seven names in `KNOWN_EVENT_TYPES` (the six reservation names `created`, `updated`,
   `cancelled`, `completed`, `failed`, `expiring_soon` under `reservation.`, and
@@ -375,15 +387,18 @@ and then recorded as dead without holding up anyone else.
 - **INTEG-HOOK-13.** Each attempt is bounded by `WEBHOOK_DELIVERY_TIMEOUT_SECONDS`; a
   timeout, transport error, or non-2xx answer is retried up to
   `WEBHOOK_DELIVERY_ATTEMPTS` attempts in all, 0.5 seconds apart at first and doubling to
-  a 5 second cap. A 2xx writes a `delivered` row with the attempt count, the status
-  code, and `delivered_at`. \
+  a 5 second cap. Redirects are not followed: a 3xx answer is a failed attempt. A 2xx
+  writes a `delivered` row with the attempt count, the status code, and `delivered_at`. \
   Enforced in: `services/integration/app/services/delivery.py` (`deliver_one`, `RETRY_INITIAL_DELAY`, `RETRY_MAX_DELAY`) \
-  Pinned by: `services/integration/tests/test_webhooks.py` (`test_delivery_2xx_writes_delivered_row`, `test_delivery_persistent_failure_retries_then_dead`, `test_delivery_connection_error_is_retried_then_dead`); `tests/integration/test_webhooks_flow.py` (`test_webhook_delivered_exactly_once`)
+  Pinned by: `services/integration/tests/test_webhooks.py` (`test_delivery_2xx_writes_delivered_row`, `test_delivery_persistent_failure_retries_then_dead`, `test_delivery_connection_error_is_retried_then_dead`); `services/integration/tests/test_webhook_destinations.py` (`test_delivery_does_not_follow_redirects`); `tests/integration/test_webhooks_flow.py` (`test_webhook_delivered_exactly_once`)
 - **INTEG-HOOK-14.** When every attempt fails the row is written `dead`, with the attempt
-  count, the status of the last answer received (null when none came), and `last_error`, the
-  text of the last failure cut to 1024 characters. \
-  Enforced in: `services/integration/app/services/delivery.py` (`deliver_one`, `_record`) \
-  Pinned by: `services/integration/tests/test_webhooks.py` (`test_delivery_persistent_failure_retries_then_dead`); `tests/integration/test_webhooks_flow.py` (`test_webhook_failure_dead_letters`)
+  count, the status of the last answer received (null when none came), and `last_error`,
+  which is only `upstream answered HTTP <status>` when the last attempt got an answer or
+  `delivery failed (<ClassName>)` otherwise; the exception's own text (which can carry the
+  URL and transport detail) goes to the log message (`webhook_delivery_dead`), never to
+  the row or the deliveries read. \
+  Enforced in: `services/integration/app/services/delivery.py` (`deliver_one`, `delivery_error_text`, `_record`) \
+  Pinned by: `services/integration/tests/test_webhooks.py` (`test_delivery_persistent_failure_retries_then_dead`, `test_delivery_connection_error_is_retried_then_dead`); `services/integration/tests/test_webhook_destinations.py` (`test_delivery_ledger_records_the_answer_status_only`, `test_delivery_ledger_records_the_exception_class_only`); `tests/integration/test_webhooks_flow.py` (`test_webhook_failure_dead_letters`)
 - **INTEG-HOOK-15.** A redelivered or republished event whose row is `dead` is POSTed
   again, and the same row is overwritten with the new outcome and a fresh attempt
   count. \
@@ -421,6 +436,15 @@ and then recorded as dead without holding up anyone else.
   ledger key is the text `None`, shared by every such message. \
   Enforced in: `services/integration/app/services/nats_consumer.py` (`handle_event`) \
   Pinned by: none
+- **INTEG-HOOK-23.** Before any POST the destination rule of INTEG-HOOK-2 is checked
+  again against the stored `target_url`, so a subscription stored before the rule or a
+  host whose answers changed is caught. A destination that is not allowed, or whose host
+  does not resolve, gets a `failed` row with `attempts` 0, `response_status` null, and
+  `last_error` `destination not allowed`; nothing is sent, no retry runs, the message is
+  acked, and the log action is `webhook_destination_refused`. A `failed` row is not
+  `delivered`, so a redelivered event checks again. \
+  Enforced in: `services/integration/app/services/delivery.py` (`deliver_one`); `services/integration/app/services/destination.py` (`destination_allowed`, `DESTINATION_NOT_ALLOWED`) \
+  Pinned by: `services/integration/tests/test_webhook_destinations.py` (`test_delivery_to_a_destination_not_allowed_is_failed_and_not_sent`, `test_delivery_to_an_internal_literal_is_failed`, `test_delivery_to_an_allowed_host_is_sent`, `test_failed_destination_row_is_retried_on_redelivery`)
 
 **Out of scope.** The JetStream transport and its redelivery timing
 (`operations-and-observability.md`); a receiver's own deduplication, which
@@ -924,8 +948,9 @@ kinds on the Settings page.
 | 401 | `Invalid subject in token` | a notification route with a `sub` that is not a UUID | INTEG-INAPP-2 |
 | 403 | `Admin or superadmin role required` | a webhook route without an admin role | INTEG-HOOK-1 |
 | 404 | `Webhook not found` | unknown subscription on read, delete, or deliveries | INTEG-HOOK-6, INTEG-HOOK-7, INTEG-HOOK-10 |
+| 422 | `target_url must resolve to a public address` | a webhook destination whose host is not public, not allowlisted, or does not resolve | INTEG-HOOK-2 |
 | 404 | `Notification not found` | unknown or foreign notification on mark read or delete | INTEG-INAPP-6, INTEG-INAPP-9 |
-| 422 | FastAPI validation envelope | a facade body that fails `V1ReservationRequest`; a webhook body with a bad URL, unknown or empty event types, or an over-long field; a facade list or notification list parameter out of range | INTEG-FACADE-4, INTEG-FACADE-6, INTEG-HOOK-2, INTEG-HOOK-3, INTEG-INAPP-3 |
+| 422 | FastAPI validation envelope | a facade body that fails `V1ReservationRequest`; a facade reservation id that is not a UUID; a webhook body with a bad URL, unknown or empty event types, or an over-long field; a facade list or notification list parameter out of range | INTEG-FACADE-4, INTEG-FACADE-6, INTEG-FACADE-15, INTEG-HOOK-2, INTEG-HOOK-3, INTEG-INAPP-3 |
 | upstream status | upstream `detail`, body, or text | reservations refused a facade call | INTEG-FACADE-12, INTEG-FACADE-13 |
 | 503 | `Reservations service unavailable` | reservations unreachable or slower than 10 seconds | INTEG-FACADE-14 |
 | 503 | `user-profile unreachable` | user-profile unreachable on a preferences read or write | INTEG-PREFS-3 |
@@ -939,7 +964,8 @@ the log action.
 | acked, dead-lettered | `nats_poison_message` | the body is not JSON, or is JSON but not an object | INTEG-CONSUME-6, INTEG-CONSUME-7, INTEG-NCONSUME-6, INTEG-NCONSUME-7 |
 | nacked with delay | `nats_message_nak` | a handler error before the fifth delivery | INTEG-CONSUME-8, INTEG-NCONSUME-8 |
 | acked, dead-lettered | `nats_dlq_exhausted` | a handler error at the fifth delivery | INTEG-CONSUME-8, INTEG-NCONSUME-8 |
-| acked, ledger row `dead` | none | every POST attempt to a receiver failed | INTEG-HOOK-14 |
+| acked, ledger row `dead` | `webhook_delivery_dead` | every POST attempt to a receiver failed | INTEG-HOOK-14 |
+| acked, ledger row `failed` | `webhook_destination_refused` | the destination was not allowed when the delivery was due | INTEG-HOOK-23 |
 | acked, nothing sent | `notification_deduped` | the user or channel already has this event | INTEG-INAPP-1, INTEG-OUT-3 |
 | acked, channel skipped | `outbound_dispatch_failed` | an email, chat, or webhook-channel send failed | INTEG-OUT-4 |
 
@@ -948,7 +974,8 @@ the log action.
 | Direction | Peer | Call | Purpose | On failure |
 |---|---|---|---|---|
 | Out (integration) | reservations | `POST /`, `GET /`, `GET /{id}`, `DELETE /{id}`, `PUT /{id}/release`, `GET /{id}/wiring-status` (caller's JWT, 10 s) | every facade route | Fail closed: 503 (INTEG-FACADE-14); a refusal is relayed (INTEG-FACADE-12) |
-| Out (integration) | external receiver | `POST <target_url>` (`WEBHOOK_DELIVERY_TIMEOUT_SECONDS` per attempt) | deliver an event | Retried, then a `dead` row; never fails the message (INTEG-HOOK-14, INTEG-HOOK-19) |
+| Out (integration) | external receiver | `POST <target_url>` (`WEBHOOK_DELIVERY_TIMEOUT_SECONDS` per attempt, redirects not followed) | deliver an event | Retried, then a `dead` row; never fails the message (INTEG-HOOK-14, INTEG-HOOK-19); a destination not allowed is a `failed` row with no POST (INTEG-HOOK-23) |
+| Out (integration) | DNS | resolve the `target_url` host at registration and before each delivery | the destination rule | Fail closed: 422 at registration, a `failed` row at delivery (INTEG-HOOK-2, INTEG-HOOK-23) |
 | Out (notifications) | auth | `GET /internal/admins` (internal token, 5 s), cached | health recipients | Fail open: no admin recipients for that event, not cached (INTEG-HEALTH-4, INTEG-HEALTH-5) |
 | Out (notifications) | reservations | `GET /internal/active-users?device_id` (internal token, 5 s) | health recipients | Fail open: no holder recipients (INTEG-HEALTH-6) |
 | Out (notifications) | user-profile | `GET /preferences/internal?user_id` (internal token, 5 s), cached | a recipient's preferences | Fail open: defaults for that event, not cached (INTEG-PREFS-6, INTEG-PREFS-7) |
@@ -966,6 +993,7 @@ the log action.
 | `WEBHOOK_DELIVERY_TIMEOUT_SECONDS` (integration) | `10.0` | Limit for each POST attempt to a receiver |
 | `WEBHOOK_DELIVERY_ATTEMPTS` (integration) | `4` | Attempts in all before a `dead` row |
 | `WEBHOOK_TEST_SINK_ENABLED` (integration) | `false` | Registers the echo sink; only the development and test override sets it |
+| `WEBHOOK_ALLOWED_HOSTS` (integration) | empty | Hostnames or CIDRs admitted as webhook destinations although not public (INTEG-HOOK-2); the development and test override sets `integration,reservations`; a malformed CIDR refuses to start |
 | `NATS_ACK_WAIT_SECONDS` (both) | `30` | In-flight window of every durable here; the override pins integration's to `4` (INTEG-SINK-4); below 2 refuses to start |
 | `NATS_NAK_BACKOFF_SECONDS` (both) | `1,5,15,60,120` | Delay before each redelivery of a nacked message |
 | `RESERVATIONS_SERVICE_URL` (both) | `http://reservations:8000` | The facade's upstream; notifications' holder lookup |
@@ -985,7 +1013,7 @@ calls in notifications; the 20-item bell list and its 30 second unread poll.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/integration/tests/` (`test_facade.py`, `test_webhooks.py`, `test_webhooks_router_direct.py`, `test_nats_consumer.py`, `test_nats_consumer_lifecycle.py`, `test_nats_consumer_heartbeat.py`, `test_version.py`, `test_config_ack_wait.py`); `services/notifications/tests/` (every file); `tests/unit/test_consumer_heartbeat_wiring.py`; the frontend tests named in section 8.13 | In-memory SQLite, upstreams and NATS stubbed; SQLite does not enforce the cascade of INTEG-HOOK-8 |
+| Unit | `services/integration/tests/` (`test_facade.py`, `test_webhooks.py`, `test_webhook_destinations.py`, `test_webhooks_router_direct.py`, `test_nats_consumer.py`, `test_nats_consumer_lifecycle.py`, `test_nats_consumer_heartbeat.py`, `test_version.py`, `test_config_ack_wait.py`); `services/notifications/tests/` (every file); `tests/unit/test_consumer_heartbeat_wiring.py`; the frontend tests named in section 8.13 | In-memory SQLite, upstreams and NATS stubbed; SQLite does not enforce the cascade of INTEG-HOOK-8 |
 | Functional (through the service API) | the httpx-against-the-app tests in `test_facade.py`, `test_webhooks.py`, and `services/notifications/tests/test_router.py`; `services/notifications/tests/test_functional_dispatch_path.py` | The facade's upstream is a stubbed transport |
 | Integration (running stack) | `tests/integration/test_v1_facade.py`, `test_webhooks_flow.py`, `test_webhook_slow_receiver_live.py`, `test_notifications_flow.py`, `test_notification_channels_flow.py`, `test_health_alerting_flow.py`, `test_nats_consumer_configs_live.py`; `tests/contract/test_openapi_schema.py` | The health tests publish the event straight to `HERD_HEALTH` with a fresh `event_id` rather than driving the poller. The slow-receiver test binds a peer consumer and flakes on a stack other sessions use |
 | Stress and load | `tests/load/locustfile.py` (`NotificationUser`: unread count, list, preference reads and writes) | Nothing loads the facade, webhook fan-out, or the consumers |
@@ -1042,7 +1070,6 @@ Two documents are incomplete against the code this specification describes, trac
 ### Rules with no test
 
 - INTEG-FACADE-13: the error detail fallbacks for a body without `detail` or not JSON.
-- INTEG-FACADE-15: the reservation id forwarded unvalidated.
 - INTEG-VERSION-4: the published contract compared with the running service.
 - INTEG-HOOK-4: repeated event names stored once.
 - INTEG-HOOK-8: subscription delete cascades to its ledger rows.

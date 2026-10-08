@@ -7,6 +7,7 @@ are app-relative /webhooks. Only admins manage subscriptions; the NATS consumer
 
 import asyncio
 import json
+import logging
 import secrets
 import uuid
 from collections import OrderedDict
@@ -25,6 +26,9 @@ from app.schemas.webhook import (
     WebhookDeliveryResponse,
     WebhookResponse,
 )
+from app.services.destination import TARGET_NOT_PUBLIC_DETAIL, destination_allowed, target_host
+
+logger = logging.getLogger(__name__)
 
 _get_current_user_payload, require_admin = make_auth_dependencies(
     secret_key=settings.secret_key,
@@ -49,7 +53,18 @@ async def create_webhook(
     db: AsyncSession = Depends(get_db),
 ):
     """Register an outbound webhook. Returns the secret once so the registrant
-    can verify signatures; it is never echoed again on list or get."""
+    can verify signatures; it is never echoed again on list or get.
+
+    The target's host must resolve to public addresses only, or be admitted by
+    WEBHOOK_ALLOWED_HOSTS (app/services/destination.py); otherwise 422 and
+    nothing is stored."""
+    if not await destination_allowed(body.target_url, settings.webhook_allowed_hosts):
+        logger.warning(
+            "Webhook registration refused: host %r does not resolve to an allowed address",
+            target_host(body.target_url),
+            extra={"action": "webhook_destination_refused"},
+        )
+        raise HTTPException(status_code=422, detail=TARGET_NOT_PUBLIC_DETAIL)
     secret = body.secret or secrets.token_urlsafe(32)
     sub = WebhookSubscription(
         target_url=body.target_url,

@@ -2,6 +2,8 @@ from herd_common.base_settings import HerdBaseSettings
 from herd_common.jetstream import parse_nak_backoff_schedule, validate_ack_wait_seconds
 from pydantic import field_validator
 
+from app.services.destination import parse_allowed_hosts
+
 
 class Settings(HerdBaseSettings):
     database_url: str  # db login, password, and url go here via DATABASE_URL env var
@@ -44,6 +46,17 @@ class Settings(HerdBaseSettings):
     # default and enabled only in docker-compose.override.yml (never in prod),
     # mirroring the HERD_FAULT_INJECTION seam convention.
     webhook_test_sink_enabled: bool = False
+    # Internal webhook destinations admitted on purpose (app/services/destination.py):
+    # comma-separated hostnames or CIDRs. Empty by default, so every destination
+    # must resolve to public addresses; docker-compose.override.yml names the
+    # in-network echo sink for the live tests. A malformed CIDR refuses to boot.
+    webhook_allowed_hosts: str = ""
+
+    @field_validator("webhook_allowed_hosts")
+    @classmethod
+    def _validate_allowed_hosts(cls, v: str) -> str:
+        parse_allowed_hosts(v)
+        return v
 
     log_level: str = "INFO"
 
