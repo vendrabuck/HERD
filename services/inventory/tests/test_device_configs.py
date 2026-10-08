@@ -1168,3 +1168,109 @@ async def test_config_version_reads_404_detail_matches_device_read():
         assert config_resp.json()["detail"] == device_resp.json()["detail"]
     finally:
         app.dependency_overrides.clear()
+
+
+# ---- version numbering under concurrent writes (issue #1095) ----
+
+
+def test_model_declares_unique_device_version_index():
+    """A schema built by create_all must carry the unique index migration 0013 made,
+    or concurrent creates on a fresh install store the same number twice."""
+    from app.models.device_config_version import DeviceConfigVersion  # noqa: PLC0415
+
+    indexes = {ix.name: ix for ix in DeviceConfigVersion.__table__.indexes}
+    ix = indexes["ix_device_config_versions_device_version"]
+    assert ix.unique is True
+    assert [c.name for c in ix.columns] == ["device_id", "version_number"]
+
+
+@pytest.mark.asyncio
+async def test_create_all_schema_refuses_duplicate_version_number(client):
+    """The create_all schema (the one these tests run on) enforces uniqueness."""
+    from app.models.device_config_version import DeviceConfigVersion  # noqa: PLC0415
+    from sqlalchemy.exc import IntegrityError  # noqa: PLC0415
+
+    device_id = uuid.UUID(await _create_device(client))
+    async with TestSessionLocal() as session:
+        for _ in range(2):
+            session.add(
+                DeviceConfigVersion(
+                    device_id=device_id,
+                    version_number=1,
+                    connection_type="Management",
+                    config={},
+                    created_by=uuid.uuid4(),
+                )
+            )
+        with pytest.raises(IntegrityError):
+            await session.commit()
+
+
+def _colliding_numbers(collisions: int):
+    """A stand-in for _next_version_number that answers 1 (already taken) for the
+    first `collisions` calls, as a concurrent writer that won the race would make
+    the read look, then answers the real max+1."""
+    from app.routers import device_configs  # noqa: PLC0415
+
+    real = device_configs._next_version_number
+    calls = {"n": 0}
+
+    async def fake(db, device_id):
+        calls["n"] += 1
+        if calls["n"] <= collisions:
+            return 1
+        return await real(db, device_id)
+
+    return fake, calls
+
+
+@pytest.mark.asyncio
+async def test_create_retries_after_version_number_collision(client):
+    device_id = await _create_device(client)
+    first = await client.post(f"/devices/{device_id}/config-versions", json={"config": {"vlan": 1}})
+    assert first.json()["version_number"] == 1
+
+    fake, calls = _colliding_numbers(2)
+    with patch("app.routers.device_configs._next_version_number", new=fake):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions", json={"config": {"vlan": 2}}
+        )
+    assert resp.status_code == 201
+    assert resp.json()["version_number"] == 2
+    assert resp.json()["config"] == {"vlan": 2}
+    assert calls["n"] == 3
+    listing = await client.get(f"/devices/{device_id}/config-versions")
+    assert [i["version_number"] for i in listing.json()["items"]] == [2, 1]
+
+
+@pytest.mark.asyncio
+async def test_restore_retries_after_version_number_collision(client):
+    device_id = await _create_device(client)
+    first = await client.post(f"/devices/{device_id}/config-versions", json={"config": {"vlan": 1}})
+    fake, _ = _colliding_numbers(1)
+    with patch("app.routers.device_configs._next_version_number", new=fake):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions/{first.json()['id']}/restore", json={}
+        )
+    assert resp.status_code == 201
+    assert resp.json()["version_number"] == 2
+    assert resp.json()["restored_from_id"] == first.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_create_answers_409_when_version_allocation_keeps_colliding(client):
+    device_id = await _create_device(client)
+    await client.post(f"/devices/{device_id}/config-versions", json={"config": {"vlan": 1}})
+
+    fake, calls = _colliding_numbers(10_000)
+    with patch("app.routers.device_configs._next_version_number", new=fake):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions", json={"config": {"vlan": 2}}
+        )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == (
+        "Could not allocate a config version number under concurrent writes; retry the request"
+    )
+    assert calls["n"] == 5
+    listing = await client.get(f"/devices/{device_id}/config-versions")
+    assert listing.json()["total"] == 1

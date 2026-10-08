@@ -342,14 +342,17 @@ internal route of section 7.
   config pointer; only an immediate apply does (CFG-APPLY-4). \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`create_config_version`, `restore_config_version`) \
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_create_version_does_not_flip_current_pointer`, `test_restore_does_not_flip_current_pointer`)
-- **CFG-VER-5.** The next number is read as the current maximum plus one with no lock.
-  The unique index on device and version number exists only on a schema built by
-  inventory migration 0013; the model does not declare it, so a schema built fresh by
-  `create_all` has none. Two concurrent writes for one device therefore either store
-  the same number (fresh schema) or one fails with an unhandled 500 (migrated schema).
-  Known gap, see #1095. \
-  Enforced in: `services/inventory/app/routers/device_configs.py` (`_next_version_number`); `services/inventory/app/models/device_config_version.py` (`DeviceConfigVersion`); `services/inventory/migrations/versions/0013_device_config_versions.py` (`ix_device_config_versions_device_version`) \
-  Pinned by: none (#1095)
+- **CFG-VER-5.** The next number is the device's current maximum plus one, and the
+  unique index `ix_device_config_versions_device_version` on device and version number
+  is the arbiter: the model declares it, so a schema built by `create_all` has it, and
+  inventory migration 0023 adds it (renumbering any duplicates above the device's
+  maximum, earliest row kept) to a schema built before the declaration. A create or
+  restore whose number collides rolls back, recomputes, and tries again, at most five
+  times; then it answers 409
+  `Could not allocate a config version number under concurrent writes; retry the request`.
+  Only a unique violation is retried. \
+  Enforced in: `services/inventory/app/routers/device_configs.py` (`_commit_new_version`, `_next_version_number`, `VERSION_ALLOCATION_CONFLICT_DETAIL`); `services/inventory/app/models/device_config_version.py` (`DeviceConfigVersion`); `services/inventory/migrations/versions/0023_config_version_unique_index.py` (`upgrade`) \
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_model_declares_unique_device_version_index`, `test_create_all_schema_refuses_duplicate_version_number`, `test_create_retries_after_version_number_collision`, `test_restore_retries_after_version_number_collision`, `test_create_answers_409_when_version_allocation_keeps_colliding`)
 - **CFG-VER-6.** The list answers the device's versions newest number first, without
   their `config`, as `{items, total, skip, limit}`. \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`list_config_versions`) \
@@ -1209,6 +1212,7 @@ status.
 | 409 | `{"error": "device_has_no_driver", "message"}` | any execution action on a device with no driver | CFG-GATE-4 |
 | 409 | `{"message": "Device has active reservations; restore blocked", "reservations": [...]}` | a restore while another user's reservation holds the device | CFG-VER-12 |
 | 409 | `Job is '<status>', not cancellable` | a cancel of a job that is not `pending` | CFG-JOB-10 |
+| 409 | `Could not allocate a config version number under concurrent writes; retry the request` | a create or restore that collided five times | CFG-VER-5 |
 | 409 | `Source job is not a dry-run; nothing to promote`, `Source dry-run is '<status>'; only successful dry-runs can be promoted` | a confirm of the wrong kind of job | CFG-JOB-11 |
 | 422 | `Device has no driver-defined connection_type; cannot validate config` | a version for a device without a driver connection type | CFG-VER-2 |
 | 422 | `device '<name>': config failed schema validation: <message>` and the other validator messages | a config the schema refuses | CFG-VER-3, CFG-SCHEMA-3, CFG-SCHEMA-4, CFG-EXEC-10 |
@@ -1218,7 +1222,7 @@ status.
 | 422 | `internal execute is restricted to action='configure'; got '<action>'` | `POST /execute/internal` of another action | CFG-EXEC-6 |
 | 422 | `Only the Hypervisor connection type is supported for package validation`; `package_b64 is not valid base64`; `package exceeds the <N> byte validation limit`; `package is empty` | a validation request the route refuses | CFG-VAL-1, CFG-VAL-2 |
 | 500 | `Internal API token not configured` | an execution internal route when execution has no token | CFG-EXEC-6, CFG-VAL-1 |
-| 500 | (unhandled) | concurrent version creates on a migrated schema; concurrent first loads of one driver; a non-object JSON body from an upstream check | CFG-VER-5, CFG-LOAD-6, CFG-AUTH-4 |
+| 500 | (unhandled) | concurrent first loads of one driver; a non-object JSON body from an upstream check | CFG-LOAD-6, CFG-AUTH-4 |
 | 503 | `reservations service unreachable` | a schedule whose reservation cannot be checked | CFG-JOB-4 |
 | 503 | `reservations service unreachable while checking active reservations` and the two sibling details | a restore whose guard cannot be answered | CFG-VER-13 |
 | 503 | `Failed to fetch device: <text>`, `Failed to fetch template: <text>` | execution cannot read the device or template | CFG-EXEC-4 |
@@ -1289,8 +1293,6 @@ confirmed by reading only.
   fires.
 - #1089 (CFG-STATE-5): the stale sweep measures from `scheduled_for`, so a late-claimed
   job can be fired twice by two schedulers.
-- #1095 (CFG-VER-5): version numbers are not safe under concurrent writes, and fresh
-  schemas lack the unique index.
 - #1090 (CFG-SCHED-8): scheduled runs carry no reservation, so a reservation owner cannot
   read the dry-run transcript the review dialog asks for.
 - #1091 (CFG-RUN-6): retrying a failed dry run pushes the configuration for real.
@@ -1332,7 +1334,6 @@ that should have a test are tracked in #1100.
 - CFG-STATE-4: a cancel racing the claim.
 - CFG-RUNSTATE-5: a run left `PENDING` or `RUNNING` by an unexpected exception.
 - CFG-AUTH-6: the write routes skip visibility.
-- CFG-VER-5: concurrent version numbering.
 - CFG-VER-10: the default restore description.
 - CFG-VER-15: no version delete; the cascade from the device.
 - CFG-APPLY-6: the current config pointer's writers and readers.

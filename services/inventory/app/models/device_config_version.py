@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, Uuid, func
+from sqlalchemy import JSON, DateTime, ForeignKey, Index, Integer, String, Text, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.config import settings
@@ -14,7 +14,21 @@ _self_fk = f"{_schema}.device_config_versions.id" if _schema else "device_config
 
 class DeviceConfigVersion(Base):
     __tablename__ = "device_config_versions"
-    __table_args__ = {"schema": _schema} if _schema else {}
+    # Version numbers are unique per device on every schema (issue #1095). Migration
+    # 0013 created this index, but a schema built fresh by create_all only gets what
+    # the model declares, so the model must declare it too; migration 0023 adds it to
+    # any schema built before this declaration existed. The write path allocates
+    # max+1 and retries on a collision with this index
+    # (device_configs._commit_new_version).
+    __table_args__ = (
+        Index(
+            "ix_device_config_versions_device_version",
+            "device_id",
+            "version_number",
+            unique=True,
+        ),
+        {"schema": _schema} if _schema else {},
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     device_id: Mapped[uuid.UUID] = mapped_column(

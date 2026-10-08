@@ -11,6 +11,7 @@ from herd_common.device_config import (
 )
 from herd_common.internal_auth import internal_token_matches
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -36,6 +37,7 @@ from app.services.manage_guard import (
 )
 from app.services.published_schema import published_schema_for_device
 from app.services.reservation_guard import find_blocking_reservations_for_device
+from app.services.template_service import _integrity_kind
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +237,57 @@ async def _next_version_number(db: AsyncSession, device_id: uuid.UUID) -> int:
     return (current or 0) + 1
 
 
+# Each retry recomputes max+1 against the committed rows, so a small cap absorbs
+# realistic contention on one device; exhaustion means something else is wrong.
+# Same shape as cabling's version_service._commit_with_new_version.
+_MAX_VERSION_ALLOCATE_ATTEMPTS = 5
+
+# Pinned (issue #1095): tests match on this exact string.
+VERSION_ALLOCATION_CONFLICT_DETAIL = (
+    "Could not allocate a config version number under concurrent writes; retry the request"
+)
+
+
+async def _commit_new_version(
+    db: AsyncSession, device_id: uuid.UUID, version: DeviceConfigVersion
+) -> None:
+    """Number `version` max+1 for its device and commit, retrying on a collision.
+
+    Issue #1095. The read of max+1 and the insert are not atomic, so two concurrent
+    writers for one device can pick the same number. The unique index
+    ix_device_config_versions_device_version (declared on the model, ensured by
+    migration 0023) is the arbiter: the loser's commit raises a unique violation,
+    rolls back, recomputes max+1 against the winner's committed row, and tries
+    again. Only a unique violation is retried; any other integrity error
+    propagates. Past the cap the caller gets 409
+    VERSION_ALLOCATION_CONFLICT_DETAIL rather than a 500 or a duplicate number.
+    """
+    for attempt in range(_MAX_VERSION_ALLOCATE_ATTEMPTS):
+        version.version_number = await _next_version_number(db, device_id)
+        db.add(version)
+        try:
+            await db.commit()
+            return
+        except IntegrityError as exc:
+            await db.rollback()
+            if _integrity_kind(exc) != "unique":
+                raise
+            logger.info(
+                "config version number %s for device %s collided (attempt %d)",
+                version.version_number,
+                device_id,
+                attempt + 1,
+                extra={"action": "config_version_number_collision"},
+            )
+    logger.warning(
+        "config version allocation for device %s exhausted %d attempts",
+        device_id,
+        _MAX_VERSION_ALLOCATE_ATTEMPTS,
+        extra={"action": "config_version_allocation_exhausted"},
+    )
+    raise HTTPException(status_code=409, detail=VERSION_ALLOCATION_CONFLICT_DETAIL)
+
+
 @router.post(
     "/devices/{device_id}/config-versions",
     response_model=DeviceConfigVersionDetail,
@@ -269,22 +322,19 @@ async def create_config_version(
     except ConfigValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    version_number = await _next_version_number(db, device_id)
     version = DeviceConfigVersion(
         device_id=device_id,
-        version_number=version_number,
         connection_type=connection_type,
         config=body.config,
         description=body.description,
         created_by=uuid.UUID(payload["sub"]),
         author_name=payload.get("username", ""),
     )
-    db.add(version)
     # `device.current_config_version_id` is intentionally NOT flipped here.
     # The pointer means "what is actually applied", and a draft creation does
     # not apply anything. `apply_config_version` flips it after a successful
     # run.
-    await db.commit()
+    await _commit_new_version(db, device_id, version)
     await db.refresh(version)
     return DeviceConfigVersionDetail.model_validate(version)
 
@@ -355,10 +405,8 @@ async def restore_config_version(
     if description is None:
         description = f"Restored from v{source.version_number}"
 
-    version_number = await _next_version_number(db, device_id)
     new_version = DeviceConfigVersion(
         device_id=device_id,
-        version_number=version_number,
         connection_type=source.connection_type,
         config=source.config,
         description=description,
@@ -366,10 +414,9 @@ async def restore_config_version(
         author_name=payload.get("username", ""),
         restored_from_id=source.id,
     )
-    db.add(new_version)
     # See note in create_config_version: restore writes a draft, it does not
     # apply, so the current-config pointer stays where it was.
-    await db.commit()
+    await _commit_new_version(db, device_id, new_version)
     await db.refresh(new_version)
     return DeviceConfigVersionDetail.model_validate(new_version)
 
