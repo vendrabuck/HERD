@@ -352,7 +352,9 @@ for an operator.
   Enforced in: `services/execution/app/services/nats_consumer.py` (`start_nats_consumer`); `services/common/herd_common/jetstream.py` (`ensure_stream_exists`) \
   Pinned by: `services/execution/tests/test_nats_consumer_full.py` (`test_start_nats_consumer_stream_create_failure`); `services/common/tests/test_jetstream.py` (`test_ensure_stream_exists_existing_stream_never_calls_add_stream`, `test_ensure_stream_exists_not_found_triggers_one_add_stream_with_no_max_age`)
 - **WIRE-CONSUME-4.** When NATS is unreachable at startup the failure is logged and the
-  service runs without the consumer; once connected, the client reconnects without limit. \
+  service runs without the consumer; once connected, the client reconnects without limit.
+  Known gap, see #1083: with no broker reachable the connect call retries and never
+  raises, so startup waits for NATS (`operations-and-observability.md`, OPS-NATS-1). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`start_nats_consumer`) \
   Pinned by: `services/execution/tests/test_nats_consumer_full.py` (`test_start_nats_consumer_connection_failure`)
 - **WIRE-CONSUME-5.** On a migration-managed schema that lacks a model table, the
@@ -1294,6 +1296,8 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
 
 ### Open defects
 
+- #1083, WIRE-CONSUME-4: with NATS unreachable at boot the service waits in startup
+  instead of starting without the consumer.
 
 ### Limits by decision
 
