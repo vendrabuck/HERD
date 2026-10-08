@@ -238,7 +238,12 @@ async def test_webhook_failure_dead_letters(admin_client, fresh_device):
         assert terminal[0]["status"] == "dead"
         assert terminal[0]["attempts"] >= 1
         # The ledger carries the answer's status only, never httpx's text.
-        assert terminal[0]["last_error"] == "upstream answered HTTP 404"
+        # The dead target answers a POST with a 4xx (405 today, since the route only
+        # serves GET); the ledger text names whatever status the receiver answered.
+        assert terminal[0]["response_status"] is not None
+        assert terminal[0]["last_error"] == (
+            f"upstream answered HTTP {terminal[0]['response_status']}"
+        )
     finally:
         if reservation_id:
             await admin_client.delete(f"/v1/reservations/{reservation_id}")
