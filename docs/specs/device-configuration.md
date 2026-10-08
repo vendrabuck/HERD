@@ -786,10 +786,12 @@ is WIRE-DRIVER-6 in `provisioning-and-wiring.md`.
 - **CFG-EXEC-1.** `POST /execute` lets an admin run any action. Any other caller may run
   only `configure` (403 `Admin access required` otherwise) and only with an explicit
   `manage` grant on the device, asked of acl `POST /check` with the caller's own token
-  and 5 seconds; no token, a transport error, a non-200, non-JSON, or no grant is 403
+  and 5 seconds through the shared closed-by-default reader (CFG-AUTH-4); no token, a
+  transport error, a non-200, non-JSON, a JSON body that is not an object (a list,
+  string, number, or null), or no grant is 403
   `Admin access or device manage grant required`. Owning a reservation does not count. \
-  Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`, `_user_has_acl_manage`) \
-  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_execute_non_admin_status_action_forbidden`, `test_execute_non_admin_configure_without_grant_forbidden`, `test_execute_non_admin_configure_with_grant_succeeds`); `services/execution/tests/test_router_direct.py` (`test_acl_manage_false_without_authorization`, `test_acl_manage_false_on_httpx_error`, `test_acl_manage_false_on_non_200`, `test_acl_manage_false_on_malformed_json`, `test_acl_manage_true_when_allowed`, `test_acl_manage_false_when_not_allowed`)
+  Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`, `_user_has_acl_manage`); `services/common/herd_common/acl.py` (`user_has_grant`) \
+  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_execute_non_admin_status_action_forbidden`, `test_execute_non_admin_configure_without_grant_forbidden`, `test_execute_non_admin_configure_with_grant_succeeds`, `test_execute_non_admin_configure_acl_answer_not_an_object_forbidden`); `services/execution/tests/test_router_direct.py` (`test_acl_manage_false_without_authorization`, `test_acl_manage_false_on_httpx_error`, `test_acl_manage_false_on_non_200`, `test_acl_manage_false_on_malformed_json`, `test_acl_manage_true_when_allowed`, `test_acl_manage_false_when_not_allowed`, `test_acl_manage_false_when_answer_not_an_object`)
 - **CFG-EXEC-2.** On `POST /execute` the run is attributed to the token's `sub`; the
   body's required `user_id` is ignored. \
   Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`) \
@@ -1335,8 +1337,6 @@ confirmed by reading only.
 
 ### Open defects
 
-- #1096 (CFG-EXEC-1): execution's `_user_has_acl_manage` still raises on a 200 whose
-  JSON body is not an object; the inventory and `herd_common` sites are fixed.
 - #1104 (CFG-JOB-5): a schedule's reservation check proves the caller owns some active
   reservation holding the device, not that the named reservation holds it or belongs to
   the caller.

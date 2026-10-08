@@ -6,6 +6,7 @@ from datetime import datetime
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from herd_common.acl import user_has_grant
 from herd_common.auth import make_auth_dependencies
 from herd_common.internal_auth import internal_token_matches
 from pydantic import BaseModel
@@ -74,30 +75,21 @@ async def _user_has_acl_manage(
     """Ask the ACL service whether the caller has manage on this device.
 
     Returns False on any failure (network error, non-2xx response, malformed
-    payload). The /execute admin path is the safety net so a closed-by-default
-    failure here is the right policy.
+    payload, or a JSON body that is not an object). The /execute admin path is
+    the safety net so a closed-by-default failure here is the right policy.
+    The check itself is herd_common.acl.user_has_grant, the one closed-by-default
+    ACL reader (issue #1096: this copy used to raise on a non-object body).
     """
     if not authorization:
         return False
-    url = f"{settings.acl_service_url.rstrip('/')}/check"
-    body = {
-        "user_id": str(user_id),
-        "resource_type": "device",
-        "resource_id": str(device_id),
-        "permission": "manage",
-    }
-    headers = {"Authorization": authorization}
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(url, json=body, headers=headers)
-    except httpx.HTTPError:
-        return False
-    if resp.status_code != 200:
-        return False
-    try:
-        return bool(resp.json().get("allowed", False))
-    except ValueError:
-        return False
+    return await user_has_grant(
+        user_id=str(user_id),
+        resource_type="device",
+        resource_id=str(device_id),
+        permission="manage",
+        authorization=authorization,
+        acl_service_url=settings.acl_service_url,
+    )
 
 
 async def _user_owns_reservation(reservation_id: uuid.UUID, authorization: str | None) -> bool:
