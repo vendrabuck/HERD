@@ -11,11 +11,11 @@ This is the first inbound reference INTO secrets from another service's
 schema, so it mirrors the shape of inventory's issue #337 reservation guard
 (services/inventory/app/services/reservation_guard.py): an internal-token
 reverse lookup against the owning service, failing CLOSED with 503 on a
-transport error or non-200. A secret delete is destructive and rare, so an
-unverifiable reference check must block, not silently let the delete
-through. No force flag, per the issue #391 reasoning: the escape hatch is
-re-pointing or deleting the referencing hypervisor first, which is the
-correct order anyway.
+transport error, a non-200, or a 200 it cannot read (issue #1084). A
+secret delete is destructive and rare, so an unverifiable reference check
+must block, not silently let the delete through. No force flag, per the
+issue #391 reasoning: the escape hatch is re-pointing or deleting the
+referencing hypervisor first, which is the correct order anyway.
 
 Known and accepted TOCTOU window, the same class #337 accepted: a
 hypervisor registering (which validates the secret exists) concurrently
@@ -38,13 +38,16 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+UPSTREAM_ERROR_DETAIL = "inventory service returned an error while checking secret references"
+
 
 async def find_hypervisors_referencing_secret(secret_id: uuid.UUID) -> list[dict]:
     """Return [{id, name}, ...] for hypervisors referencing this secret.
 
     Calls inventory's by-secret internal endpoint with X-Internal-Token.
-    Raises HTTPException(503) on a transport error or a non-200 response
-    instead of failing open; see the module docstring for why.
+    Raises HTTPException(503) on a transport error, a non-200 response, or a
+    200 whose body is not a JSON list of objects, instead of failing open;
+    see the module docstring for why.
     """
     url = f"{settings.inventory_service_url.rstrip('/')}/hypervisors/by-secret/{secret_id}/internal"
     headers = {"X-Internal-Token": settings.internal_api_token}
@@ -66,9 +69,20 @@ async def find_hypervisors_referencing_secret(secret_id: uuid.UUID) -> list[dict
             "inventory service returned %s while checking secret references",
             resp.status_code,
         )
-        raise HTTPException(
-            status_code=503,
-            detail="inventory service returned an error while checking secret references",
-        )
+        raise HTTPException(status_code=503, detail=UPSTREAM_ERROR_DETAIL)
 
-    return resp.json()
+    # Issue #1084: a 200 whose body is not a JSON list of objects is as
+    # unverifiable as a 5xx (the rule inventory follows for reservations'
+    # answers, issue #1019), so it fails closed with the same 503 instead of
+    # raising an unhandled JSONDecodeError or AttributeError (500) later.
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, list) or not all(isinstance(item, dict) for item in body):
+        logger.error(
+            "inventory service answered 200 with an unreadable body while checking "
+            "secret references",
+        )
+        raise HTTPException(status_code=503, detail=UPSTREAM_ERROR_DETAIL)
+    return body

@@ -8,8 +8,10 @@ responses or logs.
 """
 
 import logging
+import types
 import uuid
 
+import httpx
 import pytest
 from app import routers
 from app.config import settings
@@ -263,6 +265,54 @@ async def test_delete_fails_closed_when_inventory_unreachable(client, monkeypatc
         "inventory service unreachable while checking secret references"
     )
     # Fail-closed means blocked, not deleted.
+    resp = await client.get(f"/secrets/{body['id']}", headers=_auth(_token("admin")))
+    assert resp.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, content=b"<html>proxy error</html>"),
+        httpx.Response(200, json={"error": "gateway"}),
+        httpx.Response(200, json=["hv-1"]),
+    ],
+    ids=["non-json", "json-object", "list-of-strings"],
+)
+async def test_delete_fails_closed_on_malformed_inventory_200(client, monkeypatch, response):
+    """Issue #1084: through the REAL guard, a 200 from inventory whose body is
+    not a JSON list of objects is a 503 (was an unhandled 500), and the secret
+    is not deleted."""
+    from app.services import inventory_guard
+
+    body = await _create(client, name=f"hv-cred-malformed-{uuid.uuid4().hex[:6]}")
+    monkeypatch.setattr(
+        routers.secrets,
+        "find_hypervisors_referencing_secret",
+        inventory_guard.find_hypervisors_referencing_secret,
+    )
+
+    class _InventoryClient:
+        # Stands in for httpx.AsyncClient inside the guard module only; the
+        # test client itself is a real httpx.AsyncClient and stays unpatched.
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, headers=None):
+            return response
+
+    fake_httpx = types.SimpleNamespace(AsyncClient=_InventoryClient, HTTPError=httpx.HTTPError)
+    monkeypatch.setattr(inventory_guard, "httpx", fake_httpx)
+    resp = await client.delete(f"/secrets/{body['id']}", headers=_auth(_token("admin")))
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == (
+        "inventory service returned an error while checking secret references"
+    )
     resp = await client.get(f"/secrets/{body['id']}", headers=_auth(_token("admin")))
     assert resp.status_code == 200
 

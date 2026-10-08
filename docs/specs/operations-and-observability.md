@@ -1045,11 +1045,11 @@ hypervisor page's secret selector (`inventory.md`); key rotation in
   references the secret; there is no force flag. By decision; issue #456. \
   Enforced in: `services/secrets/app/routers/secrets.py` (`delete_secret`); `services/secrets/app/services/inventory_guard.py` (`find_hypervisors_referencing_secret`) \
   Pinned by: `services/secrets/tests/test_api.py` (`test_delete_refused_while_hypervisor_references_secret`); `services/secrets/tests/test_routers_direct.py` (`test_delete_secret_direct_refused_while_referenced`)
-- **OPS-SECRET-14.** An unreachable inventory or a non-200 answer refuses the delete with
-  503; a 200 whose body is not a JSON list of objects ends in an unhandled 500. Known
-  gap, see #1084. \
-  Enforced in: `services/secrets/app/services/inventory_guard.py` (`find_hypervisors_referencing_secret`) \
-  Pinned by: `services/secrets/tests/test_inventory_guard.py` (`test_transport_error_fails_closed_503`, `test_upstream_error_fails_closed_503`); `services/secrets/tests/test_api.py` (`test_delete_fails_closed_when_inventory_unreachable`)
+- **OPS-SECRET-14.** An unreachable inventory, a non-200 answer, or a 200 whose body is
+  not a JSON list of objects refuses the delete with 503 and deletes nothing; the
+  unreadable 200 uses the non-200 wording. \
+  Enforced in: `services/secrets/app/services/inventory_guard.py` (`find_hypervisors_referencing_secret`, `UPSTREAM_ERROR_DETAIL`) \
+  Pinned by: `services/secrets/tests/test_inventory_guard.py` (`test_transport_error_fails_closed_503`, `test_upstream_error_fails_closed_503`, `test_malformed_200_fails_closed_503`); `services/secrets/tests/test_api.py` (`test_delete_fails_closed_when_inventory_unreachable`, `test_delete_fails_closed_on_malformed_inventory_200`)
 - **OPS-SECRET-15.** The service refuses to start unless `SECRETS_KEK` is base64 for
   exactly 32 bytes, naming the variable; on an empty key table it creates key version 1. \
   Enforced in: `services/secrets/app/services/crypto.py` (`load_kek`); `services/secrets/app/services/keyring.py` (`bootstrap_keyring`); `services/secrets/app/main.py` (`lifespan`) \
@@ -1306,8 +1306,8 @@ CLI documentation guard (OPS-NATS-14).
 | 403 | `manage permission required` | reveal by a holder of `view` only | OPS-SECRET-8 |
 | 403 | `Invalid internal token` | a secrets internal route without the right token | OPS-SECRET-10 |
 | 409 | `{"error": "secret_in_use", "hypervisor_ids", "hypervisor_names"}` | deleting a secret a hypervisor references | OPS-SECRET-13 |
-| 503 | `inventory service unreachable while checking secret references`, `inventory service returned an error while checking secret references` | the delete guard cannot ask inventory | OPS-SECRET-14 |
-| 500 | none | a malformed 200 from the delete guard's lookup; two rotations at once; a reveal on a replica that missed a rotation | OPS-SECRET-14, OPS-SECRET-17, OPS-SECRET-18 |
+| 503 | `inventory service unreachable while checking secret references`, `inventory service returned an error while checking secret references` | the delete guard cannot ask inventory, or cannot read its 200 | OPS-SECRET-14 |
+| 500 | none | two rotations at once; a reveal on a replica that missed a rotation | OPS-SECRET-17, OPS-SECRET-18 |
 | 401 | `Invalid subject in token` | a preferences route with a missing or non-UUID subject | OPS-PREF-1 |
 | 422 | validation list, or `merged <reason>` | a preferences body or merged result over a cap | OPS-PREF-4, OPS-PREF-5 |
 | 401 | `Invalid internal token` | the internal preferences read without the right token | OPS-PREF-7 |
@@ -1337,7 +1337,7 @@ Startup refusals (no HTTP answer; the container exits or waits):
 | Out (execution, device check) | inventory | device and template reads (internal token, 10 s) | the device check | Fail closed: 404 or 503 (OPS-HEALTH-7) |
 | Out (execution, device check) | the device's driver | `login`, then `status` and `logout` in the sandbox | the device check | Answered 200 with the failed run's status and error (OPS-HEALTH-8, OPS-HEALTH-9) |
 | Out (secrets) | acl | `GET /resources` with the caller's token (5 s); the shared grant check | which secrets a user may see or reveal | Fail closed: nothing listed, 404 or 403 (OPS-SECRET-5) |
-| Out (secrets) | inventory | `GET /hypervisors/by-secret/{id}/internal` (internal token, 5 s) | delete guard | Fail closed: 503; a malformed 200 is a 500 (OPS-SECRET-14) |
+| Out (secrets) | inventory | `GET /hypervisors/by-secret/{id}/internal` (internal token, 5 s) | delete guard | Fail closed: 503, a malformed 200 included (OPS-SECRET-14) |
 | Out (reservations, report) | cabling | `POST /internal/forks/devices/batch` (internal token, 10 s, chunks of 500) | transit devices | Fail closed: 503 (OPS-REPORT-8) |
 | Out (reservations, report) | inventory | `GET /devices` with the caller's token (10 s, paged by 500) | fleet section | Fail open: `fleet` null, or 503 for the fleet CSV (OPS-REPORT-11, OPS-REPORT-14) |
 | Out (reservations, report) | auth | `POST /groups/users/groups` with the caller's token (5 s) | group section | Fail open: every user `Ungrouped` (OPS-REPORT-5) |
@@ -1411,8 +1411,6 @@ failing when a dependency is down (OPS-LIVE-1), services are said to crash-loop 
 
 ### Open defects
 
-- #1084, OPS-SECRET-14: a malformed 200 from inventory's secret reference lookup is an
-  unhandled 500 instead of the fail-closed 503.
 - #1085, OPS-SECRET-17 and OPS-SECRET-18: a DEK rotation is invisible to other replicas
   until they restart, and two rotations at once end in a 500.
 - #1086, OPS-CONFIG-16: the config apply response carries raw exception text.
