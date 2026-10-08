@@ -222,7 +222,15 @@ POST /api/secrets/keys/rotate      (admin JWT)
 
 introduces a new key version, re-encrypts every secret to it, and retires (but
 retains) prior versions so nothing becomes undecryptable. Verify with a reveal
-afterwards.
+afterwards. With several secrets replicas, the others need no restart: each
+reads a key version it has not seen from the key table on first use, and every
+write encrypts under the newest unretired version in the table. Rotations are
+serialized by a Postgres advisory lock, so a second rotation waits and then
+moves to the next version; if one is refused anyway it answers 409 and changed
+nothing, so retry it. A 503 `Secret key material is unavailable to this service`
+means a replica cannot unwrap a stored key version (a missing row or a
+different `SECRETS_KEK` from the other replicas); the log names the version
+under action `key_version_unavailable`.
 
 Losing `SECRETS_KEK` with no `SECRETS_KEK_PREVIOUS` window makes stored
 secrets unrecoverable; there is no backdoor. Keep the KEK in whatever secret

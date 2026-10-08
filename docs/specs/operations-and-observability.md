@@ -1061,15 +1061,23 @@ hypervisor page's secret selector (`inventory.md`); key rotation in
   Pinned by: `services/secrets/tests/test_keyring.py` (`test_wrong_kek_refuses_to_boot`, `test_kek_rotation_rewraps_and_sticks`); `services/secrets/tests/test_crypto.py` (`test_dek_unwrap_wrong_kek_fails`)
 - **OPS-SECRET-17.** `POST /keys/rotate` is admin only: in one transaction it adds key
   version `max + 1`, re-encrypts every secret to it, and retires every earlier version
-  without deleting it, then answers `{new_version, reencrypted}`. Only the process that
-  served the call learns the new key; another replica cannot decrypt a rotated secret
-  until it restarts. Known gap, see #1085. \
-  Enforced in: `services/secrets/app/routers/secrets.py` (`rotate_keys`); `services/secrets/app/services/keyring.py` (`rotate_dek`) \
-  Pinned by: `services/secrets/tests/test_keyring.py` (`test_dek_rotation_reencrypts_and_retires`, `test_dek_rotation_survives_reboot`); `services/secrets/tests/test_api.py` (`test_rotate_endpoint`, `test_rotate_requires_admin`); `tests/integration/test_secrets_flow.py` (`test_rotation_preserves_plaintext`)
-- **OPS-SECRET-18.** Two rotations at once both choose the same new version; the second
-  commit fails on the version key with an unhandled 500. Known gap, see #1085. \
-  Enforced in: `services/secrets/app/services/keyring.py` (`rotate_dek`) \
-  Pinned by: none
+  without deleting it, then answers `{new_version, reencrypted}`. The key table is the
+  source of truth and each process's keyring is a cache of it: a key version a process
+  has not seen (another replica's rotation) is read and unwrapped on first use, and every
+  write encrypts under the newest unretired version in the table, so a rotation binds
+  every replica with no restart. A version that is missing or does not unwrap under this
+  process's `SECRETS_KEK` answers 503 `Secret key material is unavailable to this service`
+  on reveal, internal reveal, create, update, and rotate, logged with action
+  `key_version_unavailable`. \
+  Enforced in: `services/secrets/app/routers/secrets.py` (`rotate_keys`, `_encrypt_into`, `_decrypt`); `services/secrets/app/routers/internal.py` (`_reveal`); `services/secrets/app/services/keyring.py` (`rotate_dek`, `load_dek`, `current`, `key_unavailable_http`) \
+  Pinned by: `services/secrets/tests/test_keyring.py` (`test_dek_rotation_reencrypts_and_retires`, `test_dek_rotation_survives_reboot`, `test_peer_replica_loads_a_rotated_version_on_first_use`, `test_peer_replica_encrypts_new_data_under_the_rotated_version`, `test_load_dek_unknown_version_is_unavailable`, `test_load_dek_under_a_different_kek_is_unavailable`, `test_stale_replica_rotation_picks_the_next_version`); `services/secrets/tests/test_api.py` (`test_rotate_endpoint`, `test_rotate_requires_admin`, `test_reveal_on_a_replica_that_missed_the_rotation`, `test_write_on_a_replica_that_missed_the_rotation_uses_the_new_version`, `test_unloadable_key_version_is_503_with_a_fixed_detail`); `tests/integration/test_secrets_flow.py` (`test_rotation_preserves_plaintext`)
+- **OPS-SECRET-18.** Every rotation takes one transaction-scoped Postgres advisory lock
+  (`herd-secrets-dek-rotation`) before it reads the key table, so two rotations, in one
+  process or two replicas, run one after the other and the second moves to the next
+  version. If the new version is taken anyway, the rotation rolls back and answers 409
+  `Another key rotation committed first; nothing was changed. Retry.`; it never answers 500. \
+  Enforced in: `services/secrets/app/services/keyring.py` (`rotate_dek`, `DEK_ROTATION_LOCK_KEY`); `services/secrets/app/routers/secrets.py` (`rotate_keys`) \
+  Pinned by: `services/secrets/tests/test_keyring.py` (`test_rotation_takes_the_lock_before_reading_the_key_table`, `test_concurrent_rotation_conflict_is_refused_and_changes_nothing`); `services/secrets/tests/test_api.py` (`test_rotation_conflict_is_409_not_500`)
 
 **Out of scope.** Granting `view` and `manage` (`identity-and-access.md`); hypervisor
 registration and its secret check (`inventory.md`); how execution uses a hypervisor
@@ -1307,7 +1315,8 @@ CLI documentation guard (OPS-NATS-14).
 | 403 | `Invalid internal token` | a secrets internal route without the right token | OPS-SECRET-10 |
 | 409 | `{"error": "secret_in_use", "hypervisor_ids", "hypervisor_names"}` | deleting a secret a hypervisor references | OPS-SECRET-13 |
 | 503 | `inventory service unreachable while checking secret references`, `inventory service returned an error while checking secret references` | the delete guard cannot ask inventory, or cannot read its 200 | OPS-SECRET-14 |
-| 500 | none | two rotations at once; a reveal on a replica that missed a rotation | OPS-SECRET-17, OPS-SECRET-18 |
+| 409 | `Another key rotation committed first; nothing was changed. Retry.` | two rotations at once that the lock did not serialize | OPS-SECRET-18 |
+| 503 | `Secret key material is unavailable to this service` | a key version that is missing or does not unwrap under this process's key | OPS-SECRET-17 |
 | 401 | `Invalid subject in token` | a preferences route with a missing or non-UUID subject | OPS-PREF-1 |
 | 422 | validation list, or `merged <reason>` | a preferences body or merged result over a cap | OPS-PREF-4, OPS-PREF-5 |
 | 401 | `Invalid internal token` | the internal preferences read without the right token | OPS-PREF-7 |
@@ -1411,8 +1420,6 @@ failing when a dependency is down (OPS-LIVE-1), services are said to crash-loop 
 
 ### Open defects
 
-- #1085, OPS-SECRET-17 and OPS-SECRET-18: a DEK rotation is invisible to other replicas
-  until they restart, and two rotations at once end in a 500.
 - #1086, OPS-CONFIG-16: the config apply response carries raw exception text.
 - #1087, OPS-LOG-9, OPS-LIVE-1, OPS-SET-7, OPS-NATS-13: the operator documents and
   FEATURES.md describe behavior the code does not have.
@@ -1458,5 +1465,4 @@ failing when a dependency is down (OPS-LIVE-1), services are said to crash-loop 
 - OPS-NATS-13: JetStream store durability under `make prod`.
 - OPS-HEALTH-10: the device check writes no health status row and stages no event.
 - OPS-NATS-15: reservations' declaration of `HERD_RESERVATIONS`.
-- OPS-SECRET-18: two rotations at once.
 - OPS-REPORT-9: the routes' mapping of a transit failure to 503.

@@ -18,7 +18,7 @@ from app.config import settings
 from app.database import Base, get_db
 from app.main import app
 from app.models import Secret
-from app.services.keyring import bootstrap_keyring
+from app.services.keyring import Keyring, RotationConflictError, bootstrap_keyring
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from jose import jwt
@@ -324,6 +324,80 @@ async def test_rotate_endpoint(client):
     assert resp.json() == {"new_version": 2, "reencrypted": 1}
     resp = await client.get(f"/secrets/{body['id']}/value", headers=_auth(_token("admin")))
     assert resp.json()["data"] == PLAINTEXT
+
+
+def _swap_to_stale_replica(kek: bytes | None = None) -> Keyring:
+    """Replace the app's keyring with a second process's: booted before the
+    rotation, so it holds version 1 only (issue #1085)."""
+    current = app.state.keyring
+    stale = Keyring(kek or current._kek, {1: current.dek(1)}, active_version=1)
+    app.state.keyring = stale
+    return stale
+
+
+async def test_reveal_on_a_replica_that_missed_the_rotation(client):
+    body = await _create(client)
+    resp = await client.post("/keys/rotate", headers=_auth(_token("admin")))
+    assert resp.status_code == 200
+    _swap_to_stale_replica()
+
+    resp = await client.get(f"/secrets/{body['id']}/value", headers=_auth(_token("admin")))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"] == PLAINTEXT
+    resp = await client.get(
+        f"/internal/secrets/{body['id']}/value", headers={"X-Internal-Token": "test-token"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"] == PLAINTEXT
+
+
+async def test_write_on_a_replica_that_missed_the_rotation_uses_the_new_version(client):
+    rotator = app.state.keyring
+    resp = await client.post("/keys/rotate", headers=_auth(_token("admin")))
+    assert resp.json()["new_version"] == 2
+    stale = _swap_to_stale_replica()
+
+    body = await _create(client, "written-after-rotation")
+    assert stale.active_version == 2
+    # The rotating process (version 2 cached at rotation) reads it back, so the
+    # row was written under version 2, not the retired version 1.
+    app.state.keyring = rotator
+    resp = await client.get(f"/secrets/{body['id']}/value", headers=_auth(_token("admin")))
+    assert resp.status_code == 200
+    assert resp.json()["data"] == PLAINTEXT
+
+
+async def test_unloadable_key_version_is_503_with_a_fixed_detail(client, caplog):
+    body = await _create(client)
+    await client.post("/keys/rotate", headers=_auth(_token("admin")))
+    _swap_to_stale_replica(kek=b"z" * 32)
+
+    caplog.set_level(logging.ERROR, logger="app.services.keyring")
+    resp = await client.get(f"/secrets/{body['id']}/value", headers=_auth(_token("admin")))
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "Secret key material is unavailable to this service"}
+    resp = await client.get(
+        f"/internal/secrets/{body['id']}/value", headers={"X-Internal-Token": "test-token"}
+    )
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "Secret key material is unavailable to this service"}
+    resp = await client.put(
+        f"/secrets/{body['id']}", json={"data": PLAINTEXT}, headers=_auth(_token("admin"))
+    )
+    assert resp.status_code == 503
+    assert any(getattr(r, "action", None) == "key_version_unavailable" for r in caplog.records)
+
+
+async def test_rotation_conflict_is_409_not_500(client, monkeypatch):
+    async def conflicting(session, keyring):
+        raise RotationConflictError()
+
+    monkeypatch.setattr(routers.secrets, "rotate_dek", conflicting)
+    resp = await client.post("/keys/rotate", headers=_auth(_token("admin")))
+    assert resp.status_code == 409
+    assert resp.json() == {
+        "detail": "Another key rotation committed first; nothing was changed. Retry."
+    }
 
 
 async def test_rotate_requires_admin(client):
