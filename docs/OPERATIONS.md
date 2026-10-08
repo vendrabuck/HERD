@@ -46,7 +46,7 @@ If any required var is missing, the config service logs a warning listing them a
 2. Click the wrench icon on the login page.
 3. Log in with the config-page password: set `CONFIG_ADMIN_PASSWORD` to choose it, or read the random password the config service generates and logs once, at WARNING, on first boot (`docker compose logs config`).
 4. If you used the generated password, you must change it (min 8, max 32 chars) before the config write and apply actions unlock. Until you change it, the generated password stays a working config login for anyone who can read the config container's log, including any log shipper that collects it: that session can read the merged settings (secret values masked) and change the password, which unlocks save and restart. Either set `CONFIG_ADMIN_PASSWORD` or change the generated password promptly, and treat the config container's log as sensitive until you do.
-5. Fill in the required database, auth, and API-token fields (same required list as above). The superadmin fields are optional; if you skip them, create the first admin account through the UI afterward.
+5. Fill in the required database, auth, and API-token fields (same required list as above). The superadmin fields are optional; if you skip them, create the first admin account through the UI afterward. The page saves only the settings its schema lists: a save that names any other key is refused with 422 `Unknown settings: <keys>` and writes nothing, and a key placed in `config.json` by hand outside the schema is not shown in the editor and is carried over unchanged by the next save.
 6. Click **Save and Restart**. The config service writes `config.json` to the shared Docker volume and restarts this compose project's app services via the Docker socket (config, traefik, postgres, nats, and the frontend are skipped; other compose projects on the host are never touched). If a restart fails, the response's `errors` list names what failed and the exception class only (for example `Cannot connect to Docker: DockerException`); the full text is in the config service log (issue #1086).
 7. Once containers come back healthy (`docker compose ps`), the login form re-enables and you can sign in as the superadmin.
 
@@ -66,6 +66,8 @@ make migrate                     # alembic upgrade head for every service
 ```
 
 The order matters. `make migrate` execs into the running containers, and `make restart` (`docker compose restart`) never swaps a container onto a rebuilt image, so migrating or restarting before the `docker compose up -d` recreate would run the OLD image's migration files. Recreate first, then migrate: the exec then sees the new release's migrations.
+
+Check outbound webhook subscriptions when upgrading past the webhook destination rule: a subscription whose `target_url` host resolves to a loopback, private, or other non-public address now records `failed` deliveries with `destination not allowed` and is not sent to. Under `make prod`, `WEBHOOK_ALLOWED_HOSTS` is empty; name each internal receiver there (a hostname or a CIDR) before upgrading, or re-register it at a public address. See [EXTERNAL_API.md](EXTERNAL_API.md#destination-rule).
 
 After the recreate, the admin-only About page (Administration, then About) is the fastest way to confirm every service actually landed on the new build: a row marked "differs" or "unreachable" names the service that still needs a rebuild. See `docs/ADMIN_HANDBOOK.md`.
 
