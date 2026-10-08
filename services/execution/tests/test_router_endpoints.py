@@ -501,7 +501,7 @@ async def test_retry_failed_run_rebuilds_and_runs(admin_client, monkeypatch):
             action="status",
             user_id=uuid.UUID(USER_ID),
             status="FAILED",
-            input_params={"method_kwargs": {"foo": "bar"}},
+            input_params={"method_kwargs": {"foo": "bar"}, "dry_run": False},
         )
         session.add(run)
         await session.commit()
@@ -519,6 +519,109 @@ async def test_retry_failed_run_rebuilds_and_runs(admin_client, monkeypatch):
     resp = await admin_client.post(f"/runs/{run_id}/retry")
     assert resp.status_code == 200
     assert resp.json()["status"] == "SUCCESS"
+
+
+async def _seed_failed_run(input_params: dict, action: str = "configure") -> uuid.UUID:
+    async with TestSessionLocal() as session:
+        run = ExecutionRun(
+            device_id=uuid.UUID(DEVICE_ID),
+            driver_id=uuid.UUID(DRIVER_ID),
+            driver_sha256="sha",
+            action=action,
+            user_id=uuid.UUID(USER_ID),
+            status="FAILED",
+            input_params=input_params,
+        )
+        session.add(run)
+        await session.commit()
+        return run.id
+
+
+def _mock_retry_pipeline(monkeypatch, *, connection_type: str = "Management") -> MagicMock:
+    device = _fake_device_data()
+    device["connection_type"] = connection_type
+    monkeypatch.setattr(ex_router, "fetch_device", AsyncMock(return_value=device))
+    monkeypatch.setattr(ex_router, "fetch_template", AsyncMock(return_value=_fake_template_data()))
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_config_schema", AsyncMock(return_value=None))
+    monkeypatch.setattr(ex_service, "validate_device_config", lambda *a, **k: None)
+    sandbox = MagicMock(return_value={"success": True, "output": None, "duration_ms": 1})
+    monkeypatch.setattr(ex_service, "execute_driver_method", sandbox)
+    return sandbox
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_dry_run_stays_a_dry_run(admin_client, monkeypatch):
+    """Issue #1091: retrying a failed dry run must not push the configuration for
+    real. The sandbox is called with dry_run=True and the new run records it."""
+    run_id = await _seed_failed_run(
+        {"method_kwargs": {"hostname": "r1"}, "dry_run": True}, action="configure"
+    )
+    sandbox = _mock_retry_pipeline(monkeypatch)
+
+    resp = await admin_client.post(f"/runs/{run_id}/retry")
+    assert resp.status_code == 200
+    assert sandbox.call_count == 1
+    assert sandbox.call_args.kwargs["dry_run"] is True
+    assert sandbox.call_args.kwargs["action"] == "configure"
+    assert resp.json()["input_params"]["dry_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_real_run_stays_real(admin_client, monkeypatch):
+    run_id = await _seed_failed_run(
+        {"method_kwargs": {"hostname": "r1"}, "dry_run": False}, action="configure"
+    )
+    sandbox = _mock_retry_pipeline(monkeypatch)
+
+    resp = await admin_client.post(f"/runs/{run_id}/retry")
+    assert resp.status_code == 200
+    assert sandbox.call_args.kwargs["dry_run"] is False
+    assert resp.json()["input_params"]["dry_run"] is False
+
+
+@pytest.mark.parametrize(
+    "input_params",
+    [
+        {"method_kwargs": {"hostname": "r1"}},
+        {"method_kwargs": {"hostname": "r1"}, "dry_run": "true"},
+        {"method_kwargs": {"hostname": "r1"}, "dry_run": None},
+    ],
+)
+@pytest.mark.asyncio
+async def test_retry_refuses_run_without_dry_run_record(admin_client, monkeypatch, input_params):
+    """A run that predates the record (or carries a non-boolean one) is refused with
+    a pinned 409 and nothing reaches the sandbox: its mode cannot be known."""
+    run_id = await _seed_failed_run(input_params)
+    sandbox = _mock_retry_pipeline(monkeypatch)
+
+    resp = await admin_client.post(f"/runs/{run_id}/retry")
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == (
+        "This run does not record whether it was a dry run, so it cannot be "
+        "retried; start a new run instead"
+    )
+    sandbox.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_records_dry_run_on_the_run(admin_client, monkeypatch):
+    """Every run records whether it was a dry run in input_params (issue #1091)."""
+    sandbox = _mock_retry_pipeline(monkeypatch)
+    for dry_run in (True, False):
+        resp = await admin_client.post(
+            "/execute",
+            json={
+                "device_id": DEVICE_ID,
+                "action": "configure",
+                "user_id": USER_ID,
+                "method_kwargs": {"hostname": "r1"},
+                "dry_run": dry_run,
+            },
+        )
+        assert resp.status_code == 201
+        assert resp.json()["input_params"]["dry_run"] is dry_run
+        assert sandbox.call_args.kwargs["dry_run"] is dry_run
 
 
 # ---- ACL carve-out for /execute (roadmap #9 iter 2 piece A) ---------------

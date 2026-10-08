@@ -44,11 +44,19 @@ async def create_execution_run(
     port_b: str | None = None,
     method_kwargs: dict | None = None,
     dedupe_key: str | None = None,
+    dry_run: bool = False,
 ) -> ExecutionRun:
     # Store method_kwargs in input_params for queryability
+    input_params = dict(input_params)
     if method_kwargs:
-        input_params = dict(input_params)
         input_params["method_kwargs"] = method_kwargs
+    # Record whether the run is a dry run (issue #1091), so a retry repeats
+    # what the original run was: the sandbox receives dry_run only in its own
+    # copy of the context, which is never stored. Always written, False
+    # included, so a row WITHOUT the key is one that predates the record and
+    # its mode is unknown (retry_run refuses those). Callers that never dry-run
+    # (the NATS consumer) record False truthfully by default.
+    input_params["dry_run"] = bool(dry_run)
     run = ExecutionRun(
         device_id=device_id,
         driver_id=driver_id,
@@ -464,6 +472,7 @@ async def run_driver_action(
         port_a=port_a,
         port_b=port_b,
         method_kwargs=method_kwargs,
+        dry_run=dry_run,
     )
 
     # Load driver

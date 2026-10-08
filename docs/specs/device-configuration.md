@@ -811,7 +811,8 @@ is WIRE-DRIVER-6 in `provisioning-and-wiring.md`.
   Enforced in: `services/execution/app/routers/executions.py` (`internal_execute`, `_require_internal_token`) \
   Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_internal_execute_uses_internal_token`, `test_internal_execute_rejects_non_configure_action`, `test_require_internal_token_rejects_missing`, `test_require_internal_token_errors_when_not_configured`)
 - **CFG-EXEC-7.** The run's `input_params` is the driver context with every key of a
-  `password`-typed template field replaced by `***REDACTED***`. \
+  `password`-typed template field replaced by `***REDACTED***`, plus the keys CFG-EXEC-8
+  and CFG-RUN-6 add. \
   Enforced in: `services/execution/app/services/execution_service.py` (`run_driver_action`, `redact_context_for_logging`, `extract_password_keys`) \
   Pinned by: `services/execution/tests/test_api_endpoints.py` (`test_execute_success`); `services/execution/tests/test_execution_service.py` (`test_redact_context`, `test_extract_password_keys`)
 - **CFG-EXEC-8.** A non-empty `method_kwargs` is stored in `input_params` under
@@ -883,11 +884,15 @@ reservation can list the runs tagged with it.
   `Only failed or timed-out runs can be retried`, an unknown run 404. \
   Enforced in: `services/execution/app/routers/executions.py` (`retry_run`) \
   Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_retry_rejects_successful_run`, `test_retry_failed_run_rebuilds_and_runs`); `services/execution/tests/test_api_endpoints.py` (`test_retry_failed_run`, `test_retry_success_run_rejected`); `services/execution/tests/test_router_direct.py` (`test_retry_run_404_when_missing`)
-- **CFG-RUN-6.** A run does not record whether it was a dry run and a retry passes no
-  `dry_run`, so retrying a failed or timed-out dry run pushes the configuration for
-  real. Known gap, see #1091. \
-  Enforced in: `services/execution/app/routers/executions.py` (`retry_run`) \
-  Pinned by: none (#1091)
+- **CFG-RUN-6.** Every run records whether it was a dry run as a boolean `dry_run` in
+  its `input_params` (False on runs that never dry-run, such as the wiring consumer's),
+  and a retry passes the recorded value on, so a retried dry run stays a dry run. A run
+  whose `input_params` carries no boolean `dry_run` (one written before the record
+  existed) is refused with 409
+  `This run does not record whether it was a dry run, so it cannot be retried; start a new run instead`
+  before any device read or driver call. \
+  Enforced in: `services/execution/app/routers/executions.py` (`retry_run`); `services/execution/app/services/execution_service.py` (`create_execution_run`, `run_driver_action`) \
+  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_retry_failed_dry_run_stays_a_dry_run`, `test_retry_failed_real_run_stays_real`, `test_retry_refuses_run_without_dry_run_record`, `test_execute_records_dry_run_on_the_run`)
 
 **Out of scope.** The wiring status and wiring retry routes, which are not run history
 (`provisioning-and-wiring.md`).
@@ -1236,6 +1241,7 @@ status.
 | 409 | `Job is '<status>', not cancellable` | a cancel of a job that is not `pending`, or one the scheduler claimed first | CFG-JOB-10, CFG-STATE-4 |
 | 409 | `Could not allocate a config version number under concurrent writes; retry the request` | a create or restore that collided five times | CFG-VER-5 |
 | 409 | `Source job is not a dry-run; nothing to promote`, `Source dry-run is '<status>'; only successful dry-runs can be promoted` | a confirm of the wrong kind of job | CFG-JOB-11 |
+| 409 | `This run does not record whether it was a dry run, so it cannot be retried; start a new run instead` | a retry of a run written before runs recorded `dry_run` | CFG-RUN-6 |
 | 422 | `Device has no driver-defined connection_type; cannot validate config` | a version for a device without a driver connection type | CFG-VER-2 |
 | 422 | `device '<name>': config failed schema validation: <message>` and the other validator messages | a config the schema refuses | CFG-VER-3, CFG-SCHEMA-3, CFG-SCHEMA-4, CFG-EXEC-10 |
 | 422 | `scheduled_for must be in the future`, `scheduled_for must be within <N> days from now` | a bad schedule time | CFG-JOB-1, CFG-JOB-2 |
@@ -1311,7 +1317,6 @@ confirmed by reading only.
 
 ### Open defects
 
-- #1091 (CFG-RUN-6): retrying a failed dry run pushes the configuration for real.
 - #1093 (CFG-EXEC-4): exception and upstream text reach execution's fetch answers (the
   inventory side, CFG-APPLY-2 and CFG-SCHED-9, is fixed).
 - #1096 (CFG-EXEC-1): execution's `_user_has_acl_manage` still raises on a 200 whose
@@ -1354,7 +1359,6 @@ that should have a test are tracked in #1100.
 - CFG-EXEC-3: the body's reservation and options are taken as sent.
 - CFG-EXEC-8: `method_kwargs` stored on the run.
 - CFG-RUN-3: an owner's list holds every run of the reservation.
-- CFG-RUN-6: a retried dry run.
 - CFG-DRY-4: the dry-run declaration is not verified.
 - CFG-LOAD-6: concurrent first loads.
 - CFG-SBX-9: no isolation beyond resource limits.
