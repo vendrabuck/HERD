@@ -439,7 +439,7 @@ async def test_apply_calls_execution_with_method_kwargs(client):
 
 
 @pytest.mark.asyncio
-async def test_apply_surfaces_403_verbatim(user_client):
+async def test_apply_reports_execution_403_by_status_only(user_client):
     """Non-admin /execute returns 403; apply should mark the result failed."""
     # Create device + config under admin first by switching overrides.
     app.dependency_overrides[get_current_user_payload] = override_admin
@@ -477,7 +477,7 @@ async def test_apply_surfaces_403_verbatim(user_client):
     with (
         patch("app.routers.device_configs.httpx.AsyncClient", lambda **kw: FakeClient()),
         patch(
-            "app.routers.device_configs._user_can_manage_device",
+            "app.routers.device_configs._user_has_explicit_manage",
             new=AsyncMock(return_value=True),
         ),
     ):
@@ -488,8 +488,8 @@ async def test_apply_surfaces_403_verbatim(user_client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "failed"
-    assert "403" in body["error"]
-    assert "Admin access required" in body["error"]
+    # The status only (issue #1093): execution's plain string detail is not relayed.
+    assert body["error"] == "execution answered HTTP 403"
 
 
 @pytest.mark.asyncio
@@ -533,7 +533,7 @@ async def test_apply_succeeds_for_non_admin_with_acl_grant(user_client):
     with (
         patch("app.routers.device_configs.httpx.AsyncClient", lambda **kw: FakeClient()),
         patch(
-            "app.routers.device_configs._user_can_manage_device",
+            "app.routers.device_configs._user_has_explicit_manage",
             new=AsyncMock(return_value=True),
         ),
     ):
@@ -1168,3 +1168,264 @@ async def test_config_version_reads_404_detail_matches_device_read():
         assert config_resp.json()["detail"] == device_resp.json()["detail"]
     finally:
         app.dependency_overrides.clear()
+
+
+# ---- version numbering under concurrent writes (issue #1095) ----
+
+
+def test_model_declares_unique_device_version_index():
+    """A schema built by create_all must carry the unique index migration 0013 made,
+    or concurrent creates on a fresh install store the same number twice."""
+    from app.models.device_config_version import DeviceConfigVersion  # noqa: PLC0415
+
+    indexes = {ix.name: ix for ix in DeviceConfigVersion.__table__.indexes}
+    ix = indexes["ix_device_config_versions_device_version"]
+    assert ix.unique is True
+    assert [c.name for c in ix.columns] == ["device_id", "version_number"]
+
+
+@pytest.mark.asyncio
+async def test_create_all_schema_refuses_duplicate_version_number(client):
+    """The create_all schema (the one these tests run on) enforces uniqueness."""
+    from app.models.device_config_version import DeviceConfigVersion  # noqa: PLC0415
+    from sqlalchemy.exc import IntegrityError  # noqa: PLC0415
+
+    device_id = uuid.UUID(await _create_device(client))
+    async with TestSessionLocal() as session:
+        for _ in range(2):
+            session.add(
+                DeviceConfigVersion(
+                    device_id=device_id,
+                    version_number=1,
+                    connection_type="Management",
+                    config={},
+                    created_by=uuid.uuid4(),
+                )
+            )
+        with pytest.raises(IntegrityError):
+            await session.commit()
+
+
+def _colliding_numbers(collisions: int):
+    """A stand-in for _next_version_number that answers 1 (already taken) for the
+    first `collisions` calls, as a concurrent writer that won the race would make
+    the read look, then answers the real max+1."""
+    from app.routers import device_configs  # noqa: PLC0415
+
+    real = device_configs._next_version_number
+    calls = {"n": 0}
+
+    async def fake(db, device_id):
+        calls["n"] += 1
+        if calls["n"] <= collisions:
+            return 1
+        return await real(db, device_id)
+
+    return fake, calls
+
+
+@pytest.mark.asyncio
+async def test_create_retries_after_version_number_collision(client):
+    device_id = await _create_device(client)
+    first = await client.post(f"/devices/{device_id}/config-versions", json={"config": {"vlan": 1}})
+    assert first.json()["version_number"] == 1
+
+    fake, calls = _colliding_numbers(2)
+    with patch("app.routers.device_configs._next_version_number", new=fake):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions", json={"config": {"vlan": 2}}
+        )
+    assert resp.status_code == 201
+    assert resp.json()["version_number"] == 2
+    assert resp.json()["config"] == {"vlan": 2}
+    assert calls["n"] == 3
+    listing = await client.get(f"/devices/{device_id}/config-versions")
+    assert [i["version_number"] for i in listing.json()["items"]] == [2, 1]
+
+
+@pytest.mark.asyncio
+async def test_restore_retries_after_version_number_collision(client):
+    device_id = await _create_device(client)
+    first = await client.post(f"/devices/{device_id}/config-versions", json={"config": {"vlan": 1}})
+    fake, _ = _colliding_numbers(1)
+    with patch("app.routers.device_configs._next_version_number", new=fake):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions/{first.json()['id']}/restore", json={}
+        )
+    assert resp.status_code == 201
+    assert resp.json()["version_number"] == 2
+    assert resp.json()["restored_from_id"] == first.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_create_answers_409_when_version_allocation_keeps_colliding(client):
+    device_id = await _create_device(client)
+    await client.post(f"/devices/{device_id}/config-versions", json={"config": {"vlan": 1}})
+
+    fake, calls = _colliding_numbers(10_000)
+    with patch("app.routers.device_configs._next_version_number", new=fake):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions", json={"config": {"vlan": 2}}
+        )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == (
+        "Could not allocate a config version number under concurrent writes; retry the request"
+    )
+    assert calls["n"] == 5
+    listing = await client.get(f"/devices/{device_id}/config-versions")
+    assert listing.json()["total"] == 1
+
+
+# ---- cancel versus the scheduler's claim (issue #1088) ----
+
+
+async def _schedule_job(client) -> tuple[str, str]:
+    device_id = await _create_device(client)
+    create = await client.post(
+        f"/devices/{device_id}/config-versions", json={"config": {"vlan": 7}}
+    )
+    sched = await client.post(
+        f"/devices/{device_id}/config-versions/{create.json()['id']}/schedule",
+        json={"scheduled_for": _future()},
+    )
+    assert sched.status_code == 201
+    return device_id, sched.json()["id"]
+
+
+async def _job_status(job_id: str) -> str:
+    from app.models.device_config_apply_job import DeviceConfigApplyJob  # noqa: PLC0415
+
+    async with TestSessionLocal() as session:
+        job = await session.get(DeviceConfigApplyJob, uuid.UUID(job_id))
+        return job.status
+
+
+@pytest.mark.asyncio
+async def test_cancel_loses_to_a_claim_that_committed_after_its_read(client):
+    """The claim lands between the cancel's read (pending) and its write: the cancel
+    must change nothing and answer 409, never 204 over a job that is firing."""
+    from app.models.device_config_apply_job import DeviceConfigApplyJob  # noqa: PLC0415
+    from app.routers.apply_jobs import cancel_apply_job  # noqa: PLC0415
+    from fastapi import HTTPException  # noqa: PLC0415
+    from sqlalchemy import update  # noqa: PLC0415
+
+    _, job_id = await _schedule_job(client)
+    async with TestSessionLocal() as cancel_session:
+        # The cancel's read: the row is pending in this session's identity map.
+        stale = await cancel_session.get(DeviceConfigApplyJob, uuid.UUID(job_id))
+        assert stale.status == "pending"
+        # The scheduler's claim commits from another session.
+        async with TestSessionLocal() as claim_session:
+            claim = await claim_session.execute(
+                update(DeviceConfigApplyJob)
+                .where(
+                    DeviceConfigApplyJob.id == uuid.UUID(job_id),
+                    DeviceConfigApplyJob.status == "pending",
+                )
+                .values(status="running")
+            )
+            await claim_session.commit()
+            assert claim.rowcount == 1
+        with pytest.raises(HTTPException) as exc:
+            await cancel_apply_job(uuid.UUID(job_id), payload=override_admin(), db=cancel_session)
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Job is 'running', not cancellable"
+    assert await _job_status(job_id) == "running"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_job_is_never_fired_by_a_later_claim(client):
+    """The other order: the cancel commits first, so the claim changes no row and
+    nothing reaches execution."""
+    from app.models.device_config_apply_job import DeviceConfigApplyJob  # noqa: PLC0415
+    from app.services.apply_scheduler import fire_job  # noqa: PLC0415
+
+    _, job_id = await _schedule_job(client)
+    async with TestSessionLocal() as sched_session:
+        # The scheduler read the row while it was still pending.
+        job = await sched_session.get(DeviceConfigApplyJob, uuid.UUID(job_id))
+        resp = await client.delete(f"/apply-jobs/{job_id}")
+        assert resp.status_code == 204
+        post = AsyncMock(return_value=("success", None, None))
+        with patch("app.services.apply_scheduler._post_internal_execute", new=post):
+            await fire_job(sched_session, job, client=None)
+    post.assert_not_awaited()
+    assert await _job_status(job_id) == "cancelled"
+
+
+# ---- one success rule for both apply paths (issue #1094) ----
+
+
+def _apply_client_answering(status_code: int, body):
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = status_code
+            self.text = ""
+
+        def json(self):
+            return body
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json, headers=None):
+            return FakeResponse()
+
+    return lambda **kw: FakeClient()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "run_id", "error"),
+    [
+        (
+            {"id": "55555555-5555-5555-5555-555555555555"},
+            "55555555-5555-5555-5555-555555555555",
+            "execution returned non-success status",
+        ),
+        (
+            {"id": "55555555-5555-5555-5555-555555555555", "status": None},
+            "55555555-5555-5555-5555-555555555555",
+            "execution returned non-success status",
+        ),
+        (["SUCCESS"], None, "execution returned malformed JSON"),
+        ("SUCCESS", None, "execution returned malformed JSON"),
+    ],
+)
+async def test_immediate_apply_without_a_success_status_is_failed(client, body, run_id, error):
+    """A 2xx with no run status, or JSON that is not an object, is never a success,
+    and the pointer stays put (it used to default to success)."""
+    device_id = await _create_device(client)
+    v = await client.post(f"/devices/{device_id}/config-versions", json={"config": {"vlan": 3}})
+    with patch("app.routers.device_configs.httpx.AsyncClient", _apply_client_answering(200, body)):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions/{v.json()['id']}/apply",
+            headers={"Authorization": "Bearer t"},
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "version_id": v.json()["id"],
+        "run_id": run_id,
+        "status": "failed",
+        "error": error,
+    }
+    assert await _read_device_current_pointer(device_id) is None
+
+
+@pytest.mark.asyncio
+async def test_immediate_apply_relays_a_timeout_run_status(client):
+    device_id = await _create_device(client)
+    v = await client.post(f"/devices/{device_id}/config-versions", json={"config": {"vlan": 3}})
+    body = {"id": str(uuid.uuid4()), "status": "TIMEOUT", "error": "driver timed out"}
+    with patch("app.routers.device_configs.httpx.AsyncClient", _apply_client_answering(200, body)):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions/{v.json()['id']}/apply",
+            headers={"Authorization": "Bearer t"},
+        )
+    assert resp.json()["status"] == "timeout"
+    assert resp.json()["error"] == "driver timed out"
+    assert await _read_device_current_pointer(device_id) is None

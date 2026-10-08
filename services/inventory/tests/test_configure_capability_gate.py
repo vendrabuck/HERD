@@ -290,7 +290,7 @@ async def test_apply_non_manager_gets_403_not_409():
 
         app.dependency_overrides[get_current_user_payload] = override_user
         with patch(
-            "app.routers.device_configs._user_can_manage_device",
+            "app.routers.device_configs._user_has_explicit_manage",
             new=AsyncMock(return_value=False),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:

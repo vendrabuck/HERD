@@ -671,6 +671,28 @@ async def test_reservation_active_malformed_json_returns_false(monkeypatch):
     assert await _reservation_active(_Client(), uuid.uuid4()) is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [[{"is_active": True}], "true", 1, None])
+async def test_reservation_active_answer_not_an_object_returns_false(monkeypatch, body):
+    """A 200 whose JSON is not an object means "do not fire", like any other
+    unusable answer, and never raises (issue #1096)."""
+    monkeypatch.setattr(
+        "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+    )
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return body
+
+    class _Client:
+        async def get(self, url, headers=None, timeout=None):
+            return _Resp()
+
+    assert await _reservation_active(_Client(), uuid.uuid4()) is False
+
+
 # --- _post_internal_execute direct branches ---------------------------------
 
 
@@ -697,7 +719,8 @@ async def test_post_internal_execute_http_error(monkeypatch):
     status, run_id, error = await _post_internal_execute(client, _make_job(), {"vlan": 1})
     assert status == "failed"
     assert run_id is None
-    assert "unreachable" in error
+    # Class name only (issue #1093): the exception text never reaches the row.
+    assert error == "execution service unreachable (ConnectError)"
 
 
 @pytest.mark.asyncio
@@ -712,7 +735,37 @@ async def test_post_internal_execute_error_body_not_json(monkeypatch):
 
     status, run_id, error = await _post_internal_execute(_Client(), _make_job(), {})
     assert status == "failed"
-    assert error.startswith("503")
+    assert error == "execution answered HTTP 503"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        (
+            {"detail": {"error": "driver_cannot_configure", "message": "No configure method."}},
+            "execution answered HTTP 409: No configure method.",
+        ),
+        ({"detail": "Failed to fetch device: http://inventory:8000 refused"}, None),
+    ],
+)
+async def test_post_internal_execute_refusal_stores_herd_text_only(monkeypatch, body, expected):
+    """The job row's error is the status plus a structured detail's message,
+    never a plain upstream string (issue #1093)."""
+    import httpx
+
+    monkeypatch.setattr(
+        "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+    )
+
+    class _Client:
+        async def post(self, url, json=None, headers=None, timeout=None):
+            return httpx.Response(409, json=body)
+
+    status, run_id, error = await _post_internal_execute(_Client(), _make_job(), {})
+    assert status == "failed"
+    assert run_id is None
+    assert error == (expected or "execution answered HTTP 409")
 
 
 @pytest.mark.asyncio
@@ -1039,3 +1092,167 @@ async def test_fire_job_unresolvable_device_is_left_to_existing_behavior(monkeyp
         assert job.status == "success"
         assert str(job.run_id) == run_id
         assert len(client.posts) == 1
+
+
+# ---- stale sweep measured from the claim (issue #1089) ----
+
+
+@pytest.mark.asyncio
+async def test_claim_records_claimed_at(monkeypatch):
+    async with TestSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        _, job = await _seed_version_and_job(db, scheduled_for=now - timedelta(hours=1))
+        assert job.claimed_at is None
+        _patch_creator_authorized(monkeypatch, allowed=False)
+        await fire_job(db, job, FakeClient())
+        await db.refresh(job)
+        assert job.status == "skipped"
+        claimed = job.claimed_at.replace(tzinfo=timezone.utc)
+        assert now - timedelta(seconds=5) <= claimed <= datetime.now(timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_requeue_a_late_claimed_job_still_firing(monkeypatch):
+    """A job scheduled an hour ago is claimed now (a backlog or an outage). While
+    its execute call is in flight another scheduler's tick runs the sweep and then
+    looks for due jobs: the job must stay running and be fired exactly once."""
+    async with TestSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        _, job = await _seed_version_and_job(db, scheduled_for=now - timedelta(hours=1))
+        _patch_creator_authorized(monkeypatch)
+        seen: dict = {}
+        posts: list = []
+
+        async def execute_while_peer_ticks(client, fired_job, config):
+            posts.append(fired_job.id)
+            async with TestSessionLocal() as peer:
+                seen["requeued"] = await _resweep_stale_running(peer, datetime.now(timezone.utc))
+                seen["due"] = await _due_jobs(peer, datetime.now(timezone.utc))
+                row = await peer.get(DeviceConfigApplyJob, fired_job.id)
+                await peer.refresh(row)
+                seen["status"] = row.status
+            return "success", None, None
+
+        monkeypatch.setattr(apply_scheduler, "_post_internal_execute", execute_while_peer_ticks)
+        await fire_job(db, job, FakeClient())
+        await db.refresh(job)
+
+    assert seen == {"requeued": 0, "due": [], "status": "running"}
+    assert posts == [job.id]
+    assert job.status == "success"
+
+
+@pytest.mark.asyncio
+async def test_sweep_requeues_a_job_claimed_past_the_threshold_and_clears_the_claim():
+    async with TestSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        _, job = await _seed_version_and_job(db, scheduled_for=now - timedelta(minutes=1))
+        job.status = "running"
+        job.claimed_at = now - timedelta(minutes=6)
+        await db.commit()
+
+        affected = await _resweep_stale_running(db, now)
+        assert affected == 1
+        await db.refresh(job)
+        assert job.status == "pending"
+        assert job.claimed_at is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_leaves_a_recent_claim_alone_whatever_its_scheduled_time():
+    async with TestSessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        _, job = await _seed_version_and_job(db, scheduled_for=now - timedelta(days=2))
+        job.status = "running"
+        job.claimed_at = now - timedelta(minutes=4)
+        await db.commit()
+
+        assert await _resweep_stale_running(db, now) == 0
+        await db.refresh(job)
+        assert job.status == "running"
+
+
+# ---- a scheduled success moves the current config pointer (issue #1094) ----
+
+
+async def _pointer(device_id):
+    async with TestSessionLocal() as s:
+        device = await s.get(Device, device_id)
+        return device.current_config_version_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dry_run", "answer", "moves"),
+    [
+        (False, FakeResponse(201, {"id": str(uuid.uuid4()), "status": "SUCCESS"}), True),
+        (True, FakeResponse(201, {"id": str(uuid.uuid4()), "status": "SUCCESS"}), False),
+        (False, FakeResponse(201, {"id": str(uuid.uuid4()), "status": "FAILED"}), False),
+        (False, FakeResponse(201, {"id": str(uuid.uuid4())}), False),
+    ],
+)
+async def test_scheduled_apply_moves_pointer_only_on_a_real_success(
+    monkeypatch, dry_run, answer, moves
+):
+    async with TestSessionLocal() as db:
+        device, version, job = await _seed_device_version_and_job(
+            db, connection_type="Management", scheduled_for=datetime.now(timezone.utc)
+        )
+        device_id, version_id = device.id, version.id
+        job.dry_run = dry_run
+        await db.commit()
+        db.expire(device)
+        _patch_creator_authorized(monkeypatch)
+        await fire_job(db, job, FakeClient(post_responses={"/execute/internal": answer}))
+        await db.refresh(job)
+        status = job.status
+    assert status == ("success" if answer._body.get("status") == "SUCCESS" else "failed")
+    assert await _pointer(device_id) == (version_id if moves else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [["SUCCESS"], "SUCCESS", 7])
+async def test_post_internal_execute_non_object_json_records_failed(monkeypatch, body):
+    async with TestSessionLocal() as db:
+        _, job = await _seed_version_and_job(db, scheduled_for=datetime.now(timezone.utc))
+    client = FakeClient(post_responses={"/execute/internal": FakeResponse(201, None)})
+    client._post["/execute/internal"]._body = body
+    assert await _post_internal_execute(client, job, {}) == (
+        "failed",
+        None,
+        "execution returned malformed JSON",
+    )
+
+
+# ---- the fire request carries the job's reservation (issue #1090) ----
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize("tied", [True, False])
+async def test_post_internal_execute_sends_the_job_reservation_id(monkeypatch, tied, dry_run):
+    monkeypatch.setattr(
+        "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+    )
+    job = _make_job()
+    job.dry_run = dry_run
+    reservation_id = uuid.uuid4()
+    job.reservation_id = reservation_id if tied else None
+    run_id = uuid.uuid4()
+    client = FakeClient(
+        post_responses={
+            "/execute/internal": FakeResponse(201, {"id": str(run_id), "status": "SUCCESS"})
+        }
+    )
+    await _post_internal_execute(client, job, {"vlan": 7})
+    [(url, body, headers)] = client.posts
+    assert url.endswith("/execute/internal")
+    assert headers == {"X-Internal-Token": "token"}
+    assert body == {
+        "device_id": str(job.device_id),
+        "action": "configure",
+        "user_id": str(job.created_by),
+        "method_kwargs": {"vlan": 7},
+        "dry_run": dry_run,
+        "reservation_id": str(reservation_id) if tied else None,
+    }

@@ -25,6 +25,23 @@ logger = logging.getLogger(__name__)
 _ACL_HTTP_TIMEOUT_SECONDS = 5.0
 
 
+def _json_flag(resp: httpx.Response, key: str) -> bool:
+    """Read a boolean flag from a 200 answer's JSON object, closed by default.
+
+    A body that is not JSON, or JSON that is not an object (a list, string,
+    or number), is an unusable answer and counts as no, like any other
+    failure path (issue #1096); it never raises.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    if not isinstance(body, dict):
+        logger.info("acl_answer_not_an_object", extra={"flag": key})
+        return False
+    return bool(body.get(key, False))
+
+
 async def user_has_grant(
     *,
     user_id: str,
@@ -60,10 +77,7 @@ async def user_has_grant(
         return False
     if resp.status_code != 200:
         return False
-    try:
-        return bool(resp.json().get("allowed", False))
-    except ValueError:
-        return False
+    return _json_flag(resp, "allowed")
 
 
 async def _explicit_acl_manage(
@@ -113,10 +127,7 @@ async def _owns_active_reservation(
         return False
     if resp.status_code != 200:
         return False
-    try:
-        return bool(resp.json().get("owns_active", False))
-    except ValueError:
-        return False
+    return _json_flag(resp, "owns_active")
 
 
 async def _explicit_acl_manage_internal(
@@ -151,10 +162,7 @@ async def _explicit_acl_manage_internal(
         return False
     if resp.status_code != 200:
         return False
-    try:
-        return bool(resp.json().get("allowed", False))
-    except ValueError:
-        return False
+    return _json_flag(resp, "allowed")
 
 
 async def user_has_manage_internal(

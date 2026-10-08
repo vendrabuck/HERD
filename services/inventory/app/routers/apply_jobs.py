@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from herd_common.internal_auth import internal_token_matches
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -106,6 +106,10 @@ async def _validate_reservation_for_job(
             raise HTTPException(
                 status_code=503, detail="reservations service unreachable"
             ) from None
+        # A 200 whose JSON is not an object is unusable, the same fail-closed
+        # 503 as a non-JSON body (issue #1096).
+        if not isinstance(status_data, dict):
+            raise HTTPException(status_code=503, detail="reservations service unreachable")
         if not status_data.get("is_active"):
             raise HTTPException(status_code=422, detail=RESERVATION_MISMATCH_ERROR)
 
@@ -128,6 +132,10 @@ async def _validate_reservation_for_job(
             raise HTTPException(
                 status_code=503, detail="reservations service unreachable"
             ) from None
+        # A 200 whose JSON is not an object is unusable, the same fail-closed
+        # 503 as a non-JSON body (issue #1096).
+        if not isinstance(active_data, dict):
+            raise HTTPException(status_code=503, detail="reservations service unreachable")
         if not active_data.get("owns_active"):
             raise HTTPException(status_code=422, detail=RESERVATION_MISMATCH_ERROR)
 
@@ -434,8 +442,40 @@ async def cancel_apply_job(
             status_code=409,
             detail=f"Job is {job.status!r}, not cancellable",
         )
-    job.status = "cancelled"
+    # Compare-and-swap (issue #1088): the scheduler's claim in
+    # apply_scheduler.fire_job is a conditional update on status='pending' too,
+    # so exactly one of the two writes wins the row. A cancel that loses (the
+    # claim committed after the read above) changes nothing and answers the same
+    # 409 a cancel of a running job gets, so a 204 always means the job will
+    # never fire, and a job that fired never reads as cancelled.
+    result = await db.execute(
+        update(DeviceConfigApplyJob)
+        .where(
+            DeviceConfigApplyJob.id == job_id,
+            DeviceConfigApplyJob.status == "pending",
+        )
+        .values(status="cancelled")
+        .execution_options(synchronize_session=False)
+    )
     await db.commit()
+    if result.rowcount == 0:
+        current = (
+            await db.execute(
+                select(DeviceConfigApplyJob.status).where(DeviceConfigApplyJob.id == job_id)
+            )
+        ).scalar_one_or_none()
+        if current is None:
+            raise HTTPException(status_code=404, detail="Apply job not found")
+        logger.info(
+            "apply job %s cancel lost to a concurrent writer (now %s)",
+            job_id,
+            current,
+            extra={"action": "apply_job_cancel_lost_race"},
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is {current!r}, not cancellable",
+        )
 
 
 @router.get(

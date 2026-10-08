@@ -58,7 +58,7 @@ reservation ownership) are numbered rules in section 8.
 | Concept | Meaning | Owner | Stored in |
 |---|---|---|---|
 | Config version | One numbered snapshot of a device's configuration: the config object, the connection type it was validated against, a free-text description, the author, an optional `restored_from_id`, and the id of the last run that applied it | inventory | `device_config_versions` (`DeviceConfigVersion` in `services/inventory/app/models/device_config_version.py`); `last_apply_run_id` is a bare execution id, no foreign key |
-| Current config pointer | `devices.current_config_version_id`, the version an immediate apply last applied with success | inventory | `devices` |
+| Current config pointer | `devices.current_config_version_id`, the version a successful apply last pushed for real, immediate or scheduled (a dry run never moves it); no route returns it | inventory | `devices` |
 | Config schema registry | HERD's own JSON Schema for the `configure` input of three connection types | common | `CONFIG_SCHEMAS` in `services/common/herd_common/device_config.py` |
 | Published config schema | A schema a driver returns from its `config_schema()` classmethod, preferred over the registry | execution (captured), inventory (proxied) | `driver_cache.config_schema_json` (`DriverCache` in `services/execution/app/models/driver_cache.py`) |
 | Apply job | A scheduled push of one version to its device, optionally a dry run and optionally tied to a reservation | inventory | `device_config_apply_jobs` (`DeviceConfigApplyJob` in `services/inventory/app/models/device_config_apply_job.py`); `reservation_id` and `run_id` are bare ids of other services |
@@ -97,8 +97,8 @@ write their own runs, `provisioning-and-wiring.md` and `dynamic-resources.md`):
 |---|---|---|---|---|---|
 | (none) | job `pending` | `POST /devices/{id}/config-versions/{vid}/schedule`; `POST /apply-jobs/{id}/confirm` (a new row) | CFG-JOB-1 to CFG-JOB-7; CFG-JOB-11 | nothing | CFG-STATE-1 |
 | job `pending` | job `running` | the apply scheduler (`fire_job`) | conditional update on `pending` | nothing | CFG-STATE-2 |
-| job `pending` | job `cancelled` | `DELETE /apply-jobs/{id}` | creator or admin; read as `pending` | nothing | CFG-STATE-3, CFG-STATE-4 |
-| job `running` | job `pending` | the stale sweep | `fired_at` null and `scheduled_for` over 300 seconds ago | nothing | CFG-STATE-5 |
+| job `pending` | job `cancelled` | `DELETE /apply-jobs/{id}` | creator or admin; conditional update on `pending` | nothing | CFG-STATE-3, CFG-STATE-4 |
+| job `running` | job `pending` | the stale sweep | `fired_at` null and claimed (`claimed_at`) over 300 seconds ago | nothing | CFG-STATE-5 |
 | job `running` | job `skipped` | the apply scheduler | reservation not active, or creator not authorized | nothing | CFG-STATE-6 |
 | job `running` | job `success` or `failed` | the apply scheduler | the execute outcome | nothing | CFG-STATE-7 |
 | any job status | job `failed` | the scheduler loop after `fire_job` raised | none (by id) | nothing | CFG-STATE-8 |
@@ -108,10 +108,11 @@ write their own runs, `provisioning-and-wiring.md` and `dynamic-resources.md`):
 | run `RUNNING` | run `FAILED` | `run_driver_action` | dry run refused | nothing | CFG-RUNSTATE-3 |
 | run `RUNNING` | run `SUCCESS`, `FAILED`, or `TIMEOUT` | `run_driver_action` | the sandbox result | nothing | CFG-RUNSTATE-4 |
 
-**Concurrency.** Only the scheduler's claim is a compare-and-swap. `_due_jobs` also
-selects with `FOR UPDATE SKIP LOCKED` on Postgres, but the lock is released at the first
-commit inside `fire_job`, so the claim is what keeps two schedulers off one job. Every
-other job write and every run write reads the row and overwrites it.
+**Concurrency.** The scheduler's claim and the cancel are compare-and-swap updates on
+`pending`, so exactly one of them wins a pending job. `_due_jobs` also selects with
+`FOR UPDATE SKIP LOCKED` on Postgres, but the lock is released at the first commit
+inside `fire_job`, so the claim is what keeps two schedulers off one job. Every other
+job write and every run write reads the row and overwrites it.
 
 **Rules.**
 
@@ -128,18 +129,21 @@ other job write and every run write reads the row and overwrites it.
   is refused (CFG-JOB-10). \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`cancel_apply_job`) \
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_cancel_pending_job`, `test_cancel_already_cancelled_job`)
-- **CFG-STATE-4.** The cancel write carries no status guard, so a cancel that commits
-  after the scheduler's claim answers 204 while the job still fires, and the job ends
-  with whichever of the two writes committed last. Known gap, see #1088. \
-  Enforced in: `services/inventory/app/routers/apply_jobs.py` (`cancel_apply_job`) \
-  Pinned by: none (#1088)
-- **CFG-STATE-5.** Each scheduler tick first returns to `pending` every `running` job
-  whose `fired_at` is null and whose `scheduled_for` is more than
-  `STALE_RUNNING_AFTER_SECONDS` (300) in the past. The age is measured from
-  `scheduled_for`, not from the claim, so a job claimed late (a backlog or an outage) can
-  be re-queued while another scheduler is still firing it. Known gap, see #1089. \
-  Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_resweep_stale_running`, `STALE_RUNNING_AFTER_SECONDS`) \
-  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_resweep_stale_running_requeues`, `test_resweep_leaves_fresh_running_alone`, `test_resweep_leaves_terminal_jobs_alone`)
+- **CFG-STATE-4.** The cancel is a compare-and-swap on `status = 'pending'`, the same
+  guard as the claim (CFG-STATE-2), so exactly one of the two wins. A cancel that loses
+  (the claim committed after the cancel read the row) changes nothing and answers 409
+  `Job is '<status>', not cancellable` with the status it finds; a claim that loses
+  fires nothing. A 204 therefore means the job never fires. \
+  Enforced in: `services/inventory/app/routers/apply_jobs.py` (`cancel_apply_job`); `services/inventory/app/services/apply_scheduler.py` (`fire_job`) \
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_cancel_loses_to_a_claim_that_committed_after_its_read`, `test_cancelled_job_is_never_fired_by_a_later_claim`); `services/inventory/tests/test_config_apply_races_live_pg.py` (`test_cancel_holds_the_row_first_claim_fires_nothing`, `test_claim_holds_the_row_first_cancel_answers_409`)
+- **CFG-STATE-5.** The claim writes `claimed_at`. Each scheduler tick first returns to
+  `pending`, with `claimed_at` cleared, every `running` job whose `fired_at` is null and
+  whose `claimed_at` is more than `STALE_RUNNING_AFTER_SECONDS` (300) in the past. The
+  age is measured from the claim, so a job claimed late (a backlog or an outage) is not
+  re-queued while its claimer is still firing it; a job claimed before the column
+  existed (inventory migration 0024) has it null and is measured from `scheduled_for`. \
+  Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_resweep_stale_running`, `STALE_RUNNING_AFTER_SECONDS`, `fire_job`); `services/inventory/app/models/device_config_apply_job.py` (`DeviceConfigApplyJob`); `services/inventory/migrations/versions/0024_apply_job_claimed_at.py` (`upgrade`) \
+  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_resweep_stale_running_requeues`, `test_resweep_leaves_fresh_running_alone`, `test_resweep_leaves_terminal_jobs_alone`, `test_claim_records_claimed_at`, `test_sweep_does_not_requeue_a_late_claimed_job_still_firing`, `test_sweep_requeues_a_job_claimed_past_the_threshold_and_clears_the_claim`, `test_sweep_leaves_a_recent_claim_alone_whatever_its_scheduled_time`)
 - **CFG-STATE-6.** A claimed job becomes `skipped`, with its reason in `error` and
   `fired_at` set, when its reservation is not active (CFG-SCHED-5) or its creator fails
   the fire-time authority check (CFG-SCHED-6). \
@@ -266,21 +270,22 @@ and `user_has_manage_or_owns_active_reservation` in
   this area without asking acl or reservations. \
   Enforced in: `services/inventory/app/services/manage_guard.py` (`_is_admin`) \
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_create_config_version_happy_path`, `test_schedule_apply_job`); `services/inventory/tests/test_confirm_dry_run.py` (`test_confirm_promotes_dry_run_to_real_apply`)
-- **CFG-AUTH-3.** Any other caller passes create, restore, apply, schedule, and confirm
-  only when it holds an explicit `manage` grant on the device (acl `POST /check` with
+- **CFG-AUTH-3.** Any other caller passes create, restore, schedule, and confirm
+  (the immediate apply is narrower, CFG-APPLY-5) only when it holds an explicit `manage` grant on the device (acl `POST /check` with
   the caller's own token) or owns an `ACTIVE` reservation that holds the device
   (reservations `GET /internal/active?user_id&device_id` with the internal token);
   otherwise 403
   `manage permission required on this device (or active reservation ownership)`. \
   Enforced in: `services/inventory/app/services/manage_guard.py` (`_user_can_manage_device`); `services/common/herd_common/acl.py` (`user_has_manage_or_owns_active_reservation`, `_explicit_acl_manage`, `_owns_active_reservation`) \
-  Pinned by: `services/inventory/tests/test_device_configs_rbac.py` (`test_non_admin_create_version_denied_without_acl_grant`, `test_non_admin_create_version_succeeds_with_acl_grant`, `test_non_admin_restore_denied_without_acl_grant`, `test_non_admin_apply_denied_without_acl_grant`, `test_non_admin_schedule_denied_without_acl_grant`, `test_non_admin_schedule_succeeds_with_acl_grant`); `services/inventory/tests/test_apply_jobs_reservation_owner.py` (`test_reservation_owner_can_schedule_without_explicit_grant`, `test_reservation_owner_can_create_config_version`, `test_non_owner_without_grant_still_rejected`); `services/inventory/tests/test_confirm_dry_run.py` (`test_confirm_non_admin_without_grant_rejected`, `test_confirm_non_admin_owner_allowed`); `services/common/tests/test_acl.py` (`test_explicit_grant_returns_true`, `test_no_explicit_grant_falls_through_to_reservation_check`, `test_no_grant_no_reservation_returns_false`)
+  Pinned by: `services/inventory/tests/test_device_configs_rbac.py` (`test_non_admin_create_version_denied_without_acl_grant`, `test_non_admin_create_version_succeeds_with_acl_grant`, `test_non_admin_restore_denied_without_acl_grant`, `test_non_admin_schedule_denied_without_acl_grant`, `test_non_admin_schedule_succeeds_with_acl_grant`); `services/inventory/tests/test_apply_jobs_reservation_owner.py` (`test_reservation_owner_can_schedule_without_explicit_grant`, `test_reservation_owner_can_create_config_version`, `test_non_owner_without_grant_still_rejected`); `services/inventory/tests/test_confirm_dry_run.py` (`test_confirm_non_admin_without_grant_rejected`, `test_confirm_non_admin_owner_allowed`); `services/common/tests/test_acl.py` (`test_explicit_grant_returns_true`, `test_no_explicit_grant_falls_through_to_reservation_check`, `test_no_grant_no_reservation_returns_false`)
 - **CFG-AUTH-4.** The check fails closed. With no bearer token, or when acl is
   unreachable, answers non-200, or answers non-JSON, the grant counts as absent and the
   reservation check still runs; that check answers no when no internal token is
   configured or reservations is unreachable, non-200, or non-JSON. A 200 whose JSON body
-  is not an object raises instead of answering no. Known gap, see #1096. \
-  Enforced in: `services/common/herd_common/acl.py` (`user_has_grant`, `_owns_active_reservation`) \
-  Pinned by: `services/common/tests/test_acl.py` (`test_no_bearer_token_skips_acl_check_and_tries_reservations`, `test_acl_service_unreachable_still_tries_reservations`, `test_acl_5xx_falls_through_to_reservations`, `test_malformed_acl_response_falls_through_to_reservations`, `test_reservations_service_unreachable_returns_false`, `test_reservations_non_200_returns_false`, `test_malformed_reservation_response_returns_false`, `test_no_internal_token_skips_reservation_lookup`)
+  is not an object (a list, string, number, or null) is an unusable answer and counts as
+  no on every leg, the internal-token grant check included. \
+  Enforced in: `services/common/herd_common/acl.py` (`user_has_grant`, `_owns_active_reservation`, `_explicit_acl_manage_internal`, `_json_flag`) \
+  Pinned by: `services/common/tests/test_acl.py` (`test_no_bearer_token_skips_acl_check_and_tries_reservations`, `test_acl_service_unreachable_still_tries_reservations`, `test_acl_5xx_falls_through_to_reservations`, `test_malformed_acl_response_falls_through_to_reservations`, `test_reservations_service_unreachable_returns_false`, `test_reservations_non_200_returns_false`, `test_malformed_reservation_response_returns_false`, `test_no_internal_token_skips_reservation_lookup`, `test_acl_answer_not_an_object_is_no_grant`, `test_reservations_answer_not_an_object_is_not_owner`, `test_manage_internal_answer_not_an_object_is_false`)
 - **CFG-AUTH-5.** The version list, detail, and diff, the device's apply-job list, and the
   apply-job read are gated by device visibility, not by `manage`: a non-admin outside the
   device's groups gets the same 404 as an unknown id (`Device not found`, or
@@ -339,17 +344,20 @@ internal route of section 7.
   Enforced in: `services/inventory/app/routers/device_configs.py` (`_validate_config_for_device`, `create_config_version`) \
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_create_config_version_validates`, `test_create_config_version_unsupported_connection_type`, `test_layer2_switch_vlan_assignments_validated`)
 - **CFG-VER-4.** Creating or restoring a version never moves the device's current
-  config pointer; only an immediate apply does (CFG-APPLY-4). \
+  config pointer; only a successful apply does (CFG-APPLY-4, CFG-SCHED-10). \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`create_config_version`, `restore_config_version`) \
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_create_version_does_not_flip_current_pointer`, `test_restore_does_not_flip_current_pointer`)
-- **CFG-VER-5.** The next number is read as the current maximum plus one with no lock.
-  The unique index on device and version number exists only on a schema built by
-  inventory migration 0013; the model does not declare it, so a schema built fresh by
-  `create_all` has none. Two concurrent writes for one device therefore either store
-  the same number (fresh schema) or one fails with an unhandled 500 (migrated schema).
-  Known gap, see #1095. \
-  Enforced in: `services/inventory/app/routers/device_configs.py` (`_next_version_number`); `services/inventory/app/models/device_config_version.py` (`DeviceConfigVersion`); `services/inventory/migrations/versions/0013_device_config_versions.py` (`ix_device_config_versions_device_version`) \
-  Pinned by: none (#1095)
+- **CFG-VER-5.** The next number is the device's current maximum plus one, and the
+  unique index `ix_device_config_versions_device_version` on device and version number
+  is the arbiter: the model declares it, so a schema built by `create_all` has it, and
+  inventory migration 0023 adds it (renumbering any duplicates above the device's
+  maximum, earliest row kept) to a schema built before the declaration. A create or
+  restore whose number collides rolls back, recomputes, and tries again, at most five
+  times; then it answers 409
+  `Could not allocate a config version number under concurrent writes; retry the request`.
+  Only a unique violation is retried. \
+  Enforced in: `services/inventory/app/routers/device_configs.py` (`_commit_new_version`, `_next_version_number`, `VERSION_ALLOCATION_CONFLICT_DETAIL`); `services/inventory/app/models/device_config_version.py` (`DeviceConfigVersion`); `services/inventory/migrations/versions/0023_config_version_unique_index.py` (`upgrade`) \
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_model_declares_unique_device_version_index`, `test_create_all_schema_refuses_duplicate_version_number`, `test_create_retries_after_version_number_collision`, `test_restore_retries_after_version_number_collision`, `test_create_answers_409_when_version_allocation_keeps_colliding`); `services/inventory/tests/test_config_apply_races_live_pg.py` (`test_concurrent_creates_get_distinct_numbers`)
 - **CFG-VER-6.** The list answers the device's versions newest number first, without
   their `config`, as `{items, total, skip, limit}`. \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`list_config_versions`) \
@@ -453,11 +461,10 @@ both services.
 - **CFG-SCHEMA-7.** Inventory reads a driver's published schema from execution's
   internal config-schema route (CFG-SCHEMA-10) with the driver's SHA256, file name, and
   connection type and a 10 second timeout, and fails open: a transport error, a non-200,
-  a non-JSON body, `has_schema` false, or a non-object `schema` all mean no published
-  schema, and the registry applies. A 200 whose JSON body is not an object raises
-  instead. Known gap, see #1096. \
+  a non-JSON body, a JSON body that is not an object, `has_schema` false, or a
+  non-object `schema` all mean no published schema, and the registry applies. \
   Enforced in: `services/inventory/app/services/published_schema.py` (`_fetch_published_schema`, `published_schema_for_device`) \
-  Pinned by: `services/inventory/tests/test_published_schema.py` (`test_valid_200_parses_and_returns_schema`, `test_200_malformed_body_falls_back_to_none`, `test_200_has_schema_false_falls_back_to_none`, `test_non_200_falls_back_to_none_with_warning`, `test_transport_error_falls_back_to_none`, `test_published_schema_for_device_returns_none_when_no_driver`); `services/inventory/tests/test_device_configs.py` (`test_create_falls_back_to_registry_when_no_published_schema`, `test_create_fails_open_to_registry_when_execution_unreachable`)
+  Pinned by: `services/inventory/tests/test_published_schema.py` (`test_valid_200_parses_and_returns_schema`, `test_200_malformed_body_falls_back_to_none`, `test_200_has_schema_false_falls_back_to_none`, `test_non_200_falls_back_to_none_with_warning`, `test_transport_error_falls_back_to_none`, `test_published_schema_for_device_returns_none_when_no_driver`, `test_200_body_not_an_object_falls_back_to_none`); `services/inventory/tests/test_device_configs.py` (`test_create_falls_back_to_registry_when_no_published_schema`, `test_create_fails_open_to_registry_when_execution_unreachable`)
 - **CFG-SCHEMA-8.** Inventory keeps each answer in process for 30 seconds, keyed by
   driver id and SHA256, so replacing a driver's file never serves the old schema. \
   Enforced in: `services/inventory/app/services/published_schema.py` (`_fetch_published_schema`, `_MEMO_TTL_SECONDS`) \
@@ -510,32 +517,44 @@ versions to the device immediately and sees whether the push worked.
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_apply_calls_execution_with_method_kwargs`)
 - **CFG-APPLY-2.** Every execution outcome answers 200
   `{version_id, run_id, status, error}`: a transport error is `failed` with
-  `execution service unreachable: <exception text>`, and an execution status of 400 or
-  more is `failed` with `<status> <detail>`, the detail taken from the JSON body or the
-  raw text. Known gap, see #1093. \
-  Enforced in: `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
-  Pinned by: `services/inventory/tests/test_router_edge_cases.py` (`test_apply_handles_execution_transport_error`, `test_apply_handles_non_json_error_body`); `services/inventory/tests/test_device_configs.py` (`test_apply_surfaces_403_verbatim`)
-- **CFG-APPLY-3.** For a 2xx answer, `status` is the run's status in lower case, and
-  `success` when the body has no status or is not JSON; `error` is the run's. A
-  scheduled job counts the same answers as `failed` (CFG-SCHED-9). Known gap, see
-  #1094. \
-  Enforced in: `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
-  Pinned by: `services/inventory/tests/test_router_edge_cases.py` (`test_apply_handles_non_json_success_body`); `services/inventory/tests/test_device_configs.py` (`test_apply_success_flips_current_pointer`)
+  `execution service unreachable (<ClassName>)`, and an execution status of 400 or more
+  is `failed` with `execution answered HTTP <status>`, followed by `: <message>` only
+  when the detail is an object carrying a non-empty string `message` (the structured
+  `driver_cannot_configure` and `device_has_no_driver` refusals). A plain string detail,
+  a validation list, and a body that is not JSON are never relayed; the exception text
+  and the raw body go to the log message only. \
+  Enforced in: `services/inventory/app/routers/device_configs.py` (`apply_config_version`); `services/inventory/app/services/apply_outcome.py` (`unreachable_error`, `refusal_error`) \
+  Pinned by: `services/inventory/tests/test_router_edge_cases.py` (`test_apply_handles_execution_transport_error`, `test_apply_handles_non_json_error_body`); `services/inventory/tests/test_device_configs.py` (`test_apply_reports_execution_403_by_status_only`); `services/inventory/tests/test_apply_outcome_errors.py` (`test_unreachable_error_is_the_class_name_only`, `test_unreachable_error_names_each_transport_class`, `test_refusal_error_carries_status_and_structured_message_only`, `test_refusal_error_non_json_body_is_status_only_and_logged`)
+- **CFG-APPLY-3.** Both apply paths judge a 2xx answer by one rule: only a JSON object
+  whose run `status` is `SUCCESS` (any case) is a success. A missing or null status is
+  `failed` with `execution returned non-success status`, and a body that is not JSON, or
+  JSON that is not an object, is `failed` with `execution returned malformed JSON`. For
+  the immediate apply `status` is otherwise the run's status in lower case and `error`
+  the run's (`execution returned non-success status` when it has none); a scheduled job
+  records the same verdict as `success` or `failed` (CFG-SCHED-9). \
+  Enforced in: `services/inventory/app/services/apply_outcome.py` (`judge_success_answer`, `ApplyOutcome`, `MALFORMED_ANSWER_ERROR`, `NON_SUCCESS_ERROR`); `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
+  Pinned by: `services/inventory/tests/test_router_edge_cases.py` (`test_apply_handles_non_json_success_body`); `services/inventory/tests/test_device_configs.py` (`test_apply_success_flips_current_pointer`, `test_immediate_apply_without_a_success_status_is_failed`, `test_immediate_apply_relays_a_timeout_run_status`)
 - **CFG-APPLY-4.** When the answer names a run, the version's `last_apply_run_id` is set
   (null when the id is not a UUID) and, only when the status is `success`, the device's
   current config pointer moves to the version; both are committed before the answer. \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_apply_success_flips_current_pointer`, `test_apply_failure_does_not_flip_current_pointer`); `services/inventory/tests/test_device_configs_rbac.py` (`test_apply_with_malformed_run_id_returns_200_and_persists_pointer`)
-- **CFG-APPLY-5.** Execution admits a non-admin's `configure` only with an explicit
-  `manage` grant (CFG-EXEC-1), so the owner of an active reservation who passes
-  inventory's check without a grant always gets 200 `failed` with
-  `403 Admin access or device manage grant required`. Known gap, see #1092. \
-  Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`, `_user_has_acl_manage`); `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
-  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_execute_non_admin_configure_without_grant_forbidden`); `services/inventory/tests/test_device_configs.py` (`test_apply_surfaces_403_verbatim`)
-- **CFG-APPLY-6.** The device's current config pointer is written by an immediate apply
-  only and is returned by no route. Known gap, see #1094. \
-  Enforced in: `services/inventory/app/routers/device_configs.py` (`apply_config_version`); `services/inventory/app/services/apply_scheduler.py` (`fire_job`) \
-  Pinned by: none (#1094)
+- **CFG-APPLY-5.** The immediate apply forwards the caller's token to execution, which
+  admits a non-admin's `configure` only with an explicit `manage` grant (CFG-EXEC-1), so
+  inventory asks the same question up front with no reservation widening: a non-admin
+  passes only with an explicit acl `manage` grant on the device (no bearer token, or any
+  acl failure, counts as no grant), otherwise 403
+  `manage grant required on this device for an immediate apply (a reservation owner can schedule the apply instead)`
+  before any execution call. A reservation owner without a grant schedules the apply
+  instead (CFG-AUTH-3), which runs through execution's internal route. \
+  Enforced in: `services/inventory/app/services/manage_guard.py` (`_user_has_explicit_manage`, `IMMEDIATE_APPLY_FORBIDDEN_DETAIL`); `services/inventory/app/routers/device_configs.py` (`apply_config_version`); `services/execution/app/routers/executions.py` (`manual_execute`, `_user_has_acl_manage`) \
+  Pinned by: `services/inventory/tests/test_apply_jobs_reservation_owner.py` (`test_reservation_owner_without_grant_is_refused_immediate_apply`, `test_explicit_manage_check_without_token_is_false_and_asks_nobody`, `test_explicit_manage_check_relays_the_acl_answer`); `services/inventory/tests/test_device_configs_rbac.py` (`test_non_admin_apply_denied_without_acl_grant`); `services/execution/tests/test_router_endpoints.py` (`test_execute_non_admin_configure_without_grant_forbidden`)
+- **CFG-APPLY-6.** The device's current config pointer is written through one helper by
+  both paths: an immediate apply that succeeded and a scheduled job that succeeded and
+  was not a dry run (CFG-SCHED-10). No route returns it; the latest-version internal
+  read deliberately uses the highest number instead (CFG-VER-7). \
+  Enforced in: `services/inventory/app/services/apply_outcome.py` (`move_current_config_pointer`); `services/inventory/app/routers/device_configs.py` (`apply_config_version`); `services/inventory/app/services/apply_scheduler.py` (`fire_job`) \
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_apply_success_flips_current_pointer`, `test_apply_failure_does_not_flip_current_pointer`); `services/inventory/tests/test_apply_scheduler.py` (`test_scheduled_apply_moves_pointer_only_on_a_real_success`)
 
 **Out of scope.** What execution does with the call (8.8); the AI commit's own push to
 `POST /execute` (`ai-features.md`, AI-COMMIT-15).
@@ -613,9 +632,10 @@ apply-job routes of sections 5 and 7.
   reservation holding the device (`GET /internal/active`), both with the internal token
   and 5 seconds; a 404, an inactive reservation, or no ownership is 422
   `RESERVATION_MISMATCH_ERROR`, and anything else (no token, transport error, another
-  status, non-JSON) is 503 `reservations service unreachable`. Admins are checked too. \
+  status, non-JSON, JSON that is not an object) is 503 `reservations service unreachable`.
+  Admins are checked too. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`_validate_reservation_for_job`, `RESERVATION_MISMATCH_ERROR`) \
-  Pinned by: `services/inventory/tests/test_apply_jobs_reservation_owner.py` (`test_foreign_reservation_id_returns_422_and_writes_no_row`, `test_reservation_id_inactive_returns_422_and_writes_no_row`, `test_reservation_id_active_but_not_owned_by_caller_returns_422`, `test_reservation_id_valid_and_owned_schedules_successfully`, `test_reservation_id_validation_fails_closed_when_unreachable`)
+  Pinned by: `services/inventory/tests/test_apply_jobs_reservation_owner.py` (`test_foreign_reservation_id_returns_422_and_writes_no_row`, `test_reservation_id_inactive_returns_422_and_writes_no_row`, `test_reservation_id_active_but_not_owned_by_caller_returns_422`, `test_reservation_id_valid_and_owned_schedules_successfully`, `test_reservation_id_validation_fails_closed_when_unreachable`, `test_reservation_id_answer_not_an_object_fails_closed_503`)
 - **CFG-JOB-5.** The two lookups do not prove that the named reservation itself holds
   the device or belongs to the caller: a caller with one qualifying reservation can
   name another active one. Known gap, see #1104. \
@@ -705,10 +725,10 @@ re-checking at fire time that the job may still run.
   Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_fire_job_proceeds_when_reservation_active`, `test_fire_job_skips_when_reservation_active_but_creator_unauthorized`)
 - **CFG-SCHED-5.** The reservation check reads reservations `GET /internal/{id}` with the
   internal token and 5 seconds and fires only on 200 with `is_active` true; no token, a
-  transport error, another status, or non-JSON skips the job with
+  transport error, another status, non-JSON, or JSON that is not an object skips the job with
   `reservation not currently active`. \
   Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_reservation_active`, `fire_job`) \
-  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_fire_job_skipped_when_reservation_not_active`, `test_reservation_gate_hits_internal_url`, `test_reservation_gate_closed_default_when_token_missing`, `test_reservation_gate_closed_default_on_403`, `test_reservation_active_http_error_returns_false`, `test_reservation_active_malformed_json_returns_false`)
+  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_fire_job_skipped_when_reservation_not_active`, `test_reservation_gate_hits_internal_url`, `test_reservation_gate_closed_default_when_token_missing`, `test_reservation_gate_closed_default_on_403`, `test_reservation_active_http_error_returns_false`, `test_reservation_active_malformed_json_returns_false`, `test_reservation_active_answer_not_an_object_returns_false`)
 - **CFG-SCHED-6.** The creator check (CFG-AUTH-7) runs for every job, with or without a
   reservation, and a no skips the job with `CREATOR_UNAUTHORIZED_ERROR`. \
   Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_creator_still_authorized`, `fire_job`, `CREATOR_UNAUTHORIZED_ERROR`) \
@@ -719,23 +739,27 @@ re-checking at fire time that the job may still run.
   Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_fire_job_fails_when_version_was_deleted`)
 - **CFG-SCHED-8.** A job is fired with execution `POST /execute/internal`, the internal
   token, and 30 seconds, sending `device_id`, `action` `configure`, `user_id` (the job's
-  creator), the version's config as `method_kwargs`, and `dry_run`; it sends no
-  `reservation_id`, so the run carries none, and a non-admin reservation owner cannot
-  read its transcript (CFG-TX-5). Known gap, see #1090. \
+  creator), the version's config as `method_kwargs`, `dry_run`, and the job's
+  `reservation_id` (null for a job tied to none), so the run carries the reservation and
+  its owner can read the transcript (CFG-TX-5) and find the run in the reservation's run
+  list. \
   Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_post_internal_execute`) \
-  Pinned by: none (#1090)
+  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_post_internal_execute_sends_the_job_reservation_id`)
 - **CFG-SCHED-9.** The job is `success` only for a 2xx JSON answer whose `status` is
-  `SUCCESS` in any case. Otherwise it is `failed` with `execution unreachable: <text>` (a
-  transport error), `<status> <detail>` (400 or more),
+  `SUCCESS` in any case. Otherwise it is `failed` with
+  `execution service unreachable (<ClassName>)` (a transport error), the immediate
+  apply's refusal text (400 or more, CFG-APPLY-2),
   `execution returned malformed JSON`, or the run's `error`, else
   `execution returned non-success status` (a missing or null status included). A run id
-  that is not a UUID is stored as null. Known gap, see #1093. \
-  Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_post_internal_execute`) \
-  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_post_internal_execute_http_error`, `test_post_internal_execute_error_body_not_json`, `test_post_internal_execute_success_body_not_json`, `test_post_internal_execute_malformed_run_id_degrades_to_none`, `test_post_internal_execute_non_success_status`, `test_post_internal_execute_missing_status_records_failed`, `test_post_internal_execute_null_status_records_failed`)
-- **CFG-SCHED-10.** A successful job sets its version's `last_apply_run_id` but does not
-  move the device's current config pointer. Known gap, see #1094. \
-  Enforced in: `services/inventory/app/services/apply_scheduler.py` (`fire_job`) \
-  Pinned by: none (#1094)
+  that is not a UUID is stored as null. \
+  Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_post_internal_execute`); `services/inventory/app/services/apply_outcome.py` (`unreachable_error`, `refusal_error`) \
+  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_post_internal_execute_http_error`, `test_post_internal_execute_error_body_not_json`, `test_post_internal_execute_refusal_stores_herd_text_only`, `test_post_internal_execute_success_body_not_json`, `test_post_internal_execute_malformed_run_id_degrades_to_none`, `test_post_internal_execute_non_success_status`, `test_post_internal_execute_missing_status_records_failed`, `test_post_internal_execute_null_status_records_failed`)
+- **CFG-SCHED-10.** A successful job sets its version's `last_apply_run_id` when the
+  answer named a run, and, unless it was a dry run, moves the device's current config
+  pointer to the version, the same record an immediate apply writes (CFG-APPLY-6). A
+  failed job, and a successful dry run, leave the pointer where it was. \
+  Enforced in: `services/inventory/app/services/apply_scheduler.py` (`fire_job`); `services/inventory/app/services/apply_outcome.py` (`move_current_config_pointer`) \
+  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_scheduled_apply_moves_pointer_only_on_a_real_success`)
 
 **Out of scope.** Catching up missed fire times: a job fires once, at the first tick at
 or after its time.
@@ -1191,9 +1215,10 @@ status.
 |---|---|---|---|
 | 401 | `Not authenticated` or `Could not validate credentials` | no bearer token, or one that does not verify | CFG-AUTH-1 |
 | 403 | `manage permission required on this device (or active reservation ownership)` | an inventory write by a caller without `manage` or an active reservation | CFG-AUTH-3 |
+| 403 | `manage grant required on this device for an immediate apply (a reservation owner can schedule the apply instead)` | a non-admin immediate apply without an explicit `manage` grant | CFG-APPLY-5 |
 | 403 | `Not authorized to cancel this job` | a cancel by someone other than the creator or an admin | CFG-JOB-10 |
 | 403 | `Admin access required` | a non-admin `POST /execute` of another action; a non-admin `GET /runs` without `reservation_id`; a transcript of a run with no reservation | CFG-EXEC-1, CFG-RUN-1, CFG-TX-5 |
-| 403 | `Admin access or device manage grant required` | a non-admin `configure` without a `manage` grant | CFG-EXEC-1, CFG-APPLY-5 |
+| 403 | `Admin access or device manage grant required` | a non-admin `configure` without a `manage` grant | CFG-EXEC-1 |
 | 403 | `Reservation not owned by caller` | a run list or transcript for a reservation the caller does not own | CFG-RUN-1, CFG-TX-5 |
 | 403 | `Admin or superadmin role required` | a non-admin run detail or retry | CFG-RUN-4, CFG-RUN-5 |
 | 403 | `Invalid internal token` | an internal route with a wrong token | CFG-VER-14, CFG-EXEC-6, CFG-VAL-1 |
@@ -1208,7 +1233,8 @@ status.
 | 409 | `{"error": "driver_cannot_configure", "connection_type", "driver", "message"}` | a push to a device whose driver cannot configure | CFG-GATE-2, CFG-GATE-4 |
 | 409 | `{"error": "device_has_no_driver", "message"}` | any execution action on a device with no driver | CFG-GATE-4 |
 | 409 | `{"message": "Device has active reservations; restore blocked", "reservations": [...]}` | a restore while another user's reservation holds the device | CFG-VER-12 |
-| 409 | `Job is '<status>', not cancellable` | a cancel of a job that is not `pending` | CFG-JOB-10 |
+| 409 | `Job is '<status>', not cancellable` | a cancel of a job that is not `pending`, or one the scheduler claimed first | CFG-JOB-10, CFG-STATE-4 |
+| 409 | `Could not allocate a config version number under concurrent writes; retry the request` | a create or restore that collided five times | CFG-VER-5 |
 | 409 | `Source job is not a dry-run; nothing to promote`, `Source dry-run is '<status>'; only successful dry-runs can be promoted` | a confirm of the wrong kind of job | CFG-JOB-11 |
 | 422 | `Device has no driver-defined connection_type; cannot validate config` | a version for a device without a driver connection type | CFG-VER-2 |
 | 422 | `device '<name>': config failed schema validation: <message>` and the other validator messages | a config the schema refuses | CFG-VER-3, CFG-SCHEMA-3, CFG-SCHEMA-4, CFG-EXEC-10 |
@@ -1218,7 +1244,7 @@ status.
 | 422 | `internal execute is restricted to action='configure'; got '<action>'` | `POST /execute/internal` of another action | CFG-EXEC-6 |
 | 422 | `Only the Hypervisor connection type is supported for package validation`; `package_b64 is not valid base64`; `package exceeds the <N> byte validation limit`; `package is empty` | a validation request the route refuses | CFG-VAL-1, CFG-VAL-2 |
 | 500 | `Internal API token not configured` | an execution internal route when execution has no token | CFG-EXEC-6, CFG-VAL-1 |
-| 500 | (unhandled) | concurrent version creates on a migrated schema; concurrent first loads of one driver; a non-object JSON body from an upstream check | CFG-VER-5, CFG-LOAD-6, CFG-AUTH-4 |
+| 500 | (unhandled) | concurrent first loads of one driver | CFG-LOAD-6 |
 | 503 | `reservations service unreachable` | a schedule whose reservation cannot be checked | CFG-JOB-4 |
 | 503 | `reservations service unreachable while checking active reservations` and the two sibling details | a restore whose guard cannot be answered | CFG-VER-13 |
 | 503 | `Failed to fetch device: <text>`, `Failed to fetch template: <text>` | execution cannot read the device or template | CFG-EXEC-4 |
@@ -1285,23 +1311,11 @@ confirmed by reading only.
 
 ### Open defects
 
-- #1088 (CFG-STATE-4): a cancel racing the scheduler's claim answers 204 while the job
-  fires.
-- #1089 (CFG-STATE-5): the stale sweep measures from `scheduled_for`, so a late-claimed
-  job can be fired twice by two schedulers.
-- #1095 (CFG-VER-5): version numbers are not safe under concurrent writes, and fresh
-  schemas lack the unique index.
-- #1090 (CFG-SCHED-8): scheduled runs carry no reservation, so a reservation owner cannot
-  read the dry-run transcript the review dialog asks for.
 - #1091 (CFG-RUN-6): retrying a failed dry run pushes the configuration for real.
-- #1092 (CFG-APPLY-5): immediate apply admits reservation owners whom execution then
-  refuses, and [ROLES.md](../ROLES.md) says they pass.
-- #1093 (CFG-APPLY-2, CFG-SCHED-9, CFG-EXEC-4): exception and upstream text reach job
-  rows and API answers.
-- #1094 (CFG-APPLY-3, CFG-APPLY-6, CFG-SCHED-10): immediate and scheduled applies judge
-  a run and move the current config pointer differently.
-- #1096 (CFG-AUTH-4, CFG-SCHEMA-7): a 200 whose JSON body is not an object raises instead
-  of failing closed or open.
+- #1093 (CFG-EXEC-4): exception and upstream text reach execution's fetch answers (the
+  inventory side, CFG-APPLY-2 and CFG-SCHED-9, is fixed).
+- #1096 (CFG-EXEC-1): execution's `_user_has_acl_manage` still raises on a 200 whose
+  JSON body is not an object; the inventory and `herd_common` sites are fixed.
 - #1097 (CFG-LOAD-6, CFG-RUNSTATE-5): concurrent first loads of a driver fail, and a run
   whose action raises unexpectedly stays `PENDING` or `RUNNING`.
 - #1098 (CFG-UI-4): the device page shows structured refusals as generic text.
@@ -1329,19 +1343,14 @@ that should have a test are tracked in #1100.
 
 ### Rules with no test
 
-- CFG-STATE-4: a cancel racing the claim.
 - CFG-RUNSTATE-5: a run left `PENDING` or `RUNNING` by an unexpected exception.
 - CFG-AUTH-6: the write routes skip visibility.
-- CFG-VER-5: concurrent version numbering.
 - CFG-VER-10: the default restore description.
 - CFG-VER-15: no version delete; the cascade from the device.
-- CFG-APPLY-6: the current config pointer's writers and readers.
 - CFG-JOB-3: the time checks run before the lookups.
 - CFG-JOB-5: the named reservation is not itself proven.
 - CFG-JOB-6: the schedule-time dry-run support check.
 - CFG-JOB-13: confirm repeats no schedule-time check.
-- CFG-SCHED-8: the fire request's body.
-- CFG-SCHED-10: a scheduled success leaves the pointer.
 - CFG-EXEC-3: the body's reservation and options are taken as sent.
 - CFG-EXEC-8: `method_kwargs` stored on the run.
 - CFG-RUN-3: an owner's list holds every run of the reservation.

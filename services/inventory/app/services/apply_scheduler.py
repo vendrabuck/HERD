@@ -30,13 +30,19 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from herd_common.acl import user_has_manage_or_owns_active_reservation_internal
 from herd_common.device_config import connection_type_supports_configure
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
 from app.models.device import Device
 from app.models.device_config_apply_job import DeviceConfigApplyJob
 from app.models.device_config_version import DeviceConfigVersion
+from app.services.apply_outcome import (
+    judge_success_answer,
+    move_current_config_pointer,
+    refusal_error,
+    unreachable_error,
+)
 from app.services.published_schema import driver_for_device
 
 logger = logging.getLogger(__name__)
@@ -99,6 +105,9 @@ async def _reservation_active(client: httpx.AsyncClient, reservation_id: uuid.UU
         data = resp.json()
     except ValueError:
         return False
+    if not isinstance(data, dict):
+        # Not an object: unusable, so "do not fire" like any failure (issue #1096).
+        return False
     return bool(data.get("is_active"))
 
 
@@ -146,35 +155,24 @@ async def _post_internal_execute(
         "user_id": str(job.created_by),
         "method_kwargs": config,
         "dry_run": bool(job.dry_run),
+        # The run is tagged with the job's reservation (issue #1090), so the
+        # reservation owner can read its transcript and find it in the
+        # reservation's run list; null for a job tied to no reservation.
+        "reservation_id": str(job.reservation_id) if job.reservation_id else None,
     }
     try:
         resp = await client.post(url, json=body, headers=headers, timeout=30.0)
     except httpx.HTTPError as exc:
-        return "failed", None, f"execution unreachable: {exc}"
+        return "failed", None, unreachable_error(exc)
     if resp.status_code >= 400:
-        try:
-            detail = resp.json().get("detail", resp.text)
-        except ValueError:
-            detail = resp.text
-        return "failed", None, f"{resp.status_code} {detail}"
-    try:
-        data = resp.json()
-    except ValueError:
-        return "failed", None, "execution returned malformed JSON"
-    run_id_str = data.get("id")
-    run_id = None
-    if run_id_str:
-        try:
-            run_id = uuid.UUID(run_id_str)
-        except (ValueError, TypeError):
-            run_id = None
-    # Safe default (issue #720): a response with no status is never a success.
-    # Unreachable today (ExecutionRunResponse.status is required over a NOT NULL
-    # column), so this only matters if the contract ever loosens.
-    run_status = str(data.get("status", "FAILED")).upper()
-    if run_status == "SUCCESS":
-        return "success", run_id, None
-    return "failed", run_id, str(data.get("error") or "execution returned non-success status")
+        # The job row's error is HERD-authored text only (issue #1093), the
+        # same text the immediate apply returns.
+        return "failed", None, refusal_error(resp)
+    # One success rule for both apply paths (issue #1094, apply_outcome): a 2xx
+    # is a success only with a JSON object whose run status is SUCCESS; a missing
+    # status is never a success (issue #720).
+    outcome = judge_success_answer(resp)
+    return outcome.job_status, outcome.run_id, outcome.error
 
 
 STALE_RUNNING_AFTER_SECONDS = 300
@@ -188,11 +186,16 @@ async def _resweep_stale_running(
     """Re-queue jobs left in `running` past the stale threshold.
 
     A stuck-running job has status='running', fired_at=NULL (terminal flip never
-    happened), and scheduled_for older than the threshold. The WHERE clause is
-    selective enough that we will not race a job that is legitimately still
-    being worked: a healthy claim flips status='running' within ms of
-    scheduled_for, so anything more than five minutes past schedule with
-    fired_at still NULL has crashed.
+    happened), and was CLAIMED more than the threshold ago (issue #1089). The age
+    is measured from `claimed_at`, which the claim in `fire_job` writes, never
+    from `scheduled_for`: a job claimed late (after a scheduler outage, behind a
+    backlog, or created with a time already in the past) is legitimately being
+    fired long after its scheduled time, and re-queuing it would let a second
+    scheduler fire it again. A healthy fire takes at most the reservation, ACL,
+    and execute timeouts (well under a minute) from its claim, so a job still
+    running five minutes after its claim has crashed. A row claimed before
+    `claimed_at` existed has it null and falls back to `scheduled_for`, the old
+    rule. The re-queue clears `claimed_at` so the next claim restarts the clock.
 
     Returns the row count that was re-queued (useful for tests + logs).
     """
@@ -202,9 +205,11 @@ async def _resweep_stale_running(
         .where(
             DeviceConfigApplyJob.status == "running",
             DeviceConfigApplyJob.fired_at.is_(None),
-            DeviceConfigApplyJob.scheduled_for < threshold,
+            func.coalesce(DeviceConfigApplyJob.claimed_at, DeviceConfigApplyJob.scheduled_for)
+            < threshold,
         )
-        .values(status="pending")
+        .values(status="pending", claimed_at=None)
+        .execution_options(synchronize_session=False)
     )
     await db.commit()
     if result.rowcount:
@@ -258,7 +263,7 @@ async def fire_job(
             DeviceConfigApplyJob.id == job.id,
             DeviceConfigApplyJob.status == "pending",
         )
-        .values(status="running")
+        .values(status="running", claimed_at=datetime.now(timezone.utc))
     )
     await db.commit()
     if claim.rowcount == 0:
@@ -317,8 +322,14 @@ async def fire_job(
     job.run_id = run_id
     job.error = error
     job.fired_at = datetime.now(timezone.utc)
-    if new_status == "success" and run_id is not None:
-        version.last_apply_run_id = run_id
+    if new_status == "success":
+        if run_id is not None:
+            version.last_apply_run_id = run_id
+        # The device now has this version applied (issue #1094), the same record
+        # an immediate apply writes. A dry run pushed nothing, so it leaves the
+        # pointer where it was.
+        if not job.dry_run:
+            await move_current_config_pointer(db, job.device_id, version.id)
     await db.commit()
 
 

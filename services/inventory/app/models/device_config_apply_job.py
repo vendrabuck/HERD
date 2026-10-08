@@ -43,3 +43,8 @@ class DeviceConfigApplyJob(Base):
     author_name: Mapped[str] = mapped_column(String(150), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # When a scheduler claimed the job (issue #1089). The stale-running sweep
+    # measures a job's age from here, not from scheduled_for, so a job claimed
+    # late is not re-queued while its claimer is still firing it. Null for a job
+    # never claimed, and for one claimed before this column existed.
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

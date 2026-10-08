@@ -228,12 +228,14 @@ async def test_apply_handles_execution_transport_error(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "failed"
-    assert "unreachable" in body["error"]
+    # Class name only (issue #1093): the exception text never reaches the answer.
+    assert body["error"] == "execution service unreachable (ConnectError)"
 
 
 @pytest.mark.asyncio
 async def test_apply_handles_non_json_error_body(client):
-    """A >=400 response whose body is not JSON falls back to .text for the error."""
+    """A >=400 response whose body is not JSON reports the status only; the raw
+    text is logged, never returned (issue #1093)."""
     device_id, version_id = await _seed_device(client)
 
     class TextOnlyResponse:
@@ -264,13 +266,13 @@ async def test_apply_handles_non_json_error_body(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "failed"
-    assert "502" in body["error"]
-    assert "bad gateway" in body["error"]
+    assert body["error"] == "execution answered HTTP 502"
 
 
 @pytest.mark.asyncio
 async def test_apply_handles_non_json_success_body(client):
-    """A 2xx response whose body is not JSON degrades to an empty payload."""
+    """A 2xx response whose body is not JSON is a failed apply (issue #1094), the
+    same answer the scheduled path records for it."""
     device_id, version_id = await _seed_device(client)
 
     class TextOnlyResponse:
@@ -299,8 +301,9 @@ async def test_apply_handles_non_json_success_body(client):
             headers={"Authorization": "Bearer t"},
         )
     assert resp.status_code == 200
-    # No run id in body -> status defaults to "success", pointer not moved.
-    assert resp.json()["status"] == "success"
+    assert resp.json()["status"] == "failed"
+    assert resp.json()["error"] == "execution returned malformed JSON"
+    assert resp.json()["run_id"] is None
 
 
 # --- devices: malformed-subject visibility denials + resolve short-circuit ---

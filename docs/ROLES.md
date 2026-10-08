@@ -467,7 +467,6 @@ non-200 from auth yields `allowed: false`. Internal-token only.
 
 Inventory's config-version and apply-job write endpoints (`POST /devices/{id}/config-versions`,
 `POST /devices/{id}/config-versions/{vid}/restore`,
-`POST /devices/{id}/config-versions/{vid}/apply`,
 `POST /devices/{id}/config-versions/{vid}/schedule`, `POST /apply-jobs/{id}/confirm`)
 require `manage` on the target device. As of iter 3, this check is widened: a caller
 who owns a currently-active reservation that includes the device also passes. The
@@ -482,9 +481,17 @@ administering their reserved devices. Admins who want to keep AI-driven writes
 off-limits for specific devices can revoke device visibility from the topology so
 the device cannot be reserved in the first place.
 
+The immediate apply (`POST /devices/{id}/config-versions/{vid}/apply`) is NOT widened
+(issue #1092): it forwards the caller's token to execution `POST /execute`, which admits a
+non-admin `configure` only with an explicit `manage` grant, so inventory asks for that same
+grant up front and refuses everyone else with `403 manage grant required on this device for
+an immediate apply (a reservation owner can schedule the apply instead)` before calling
+execution. A reservation owner without a grant schedules the apply instead; the scheduler
+fires it through execution's internal route under inventory's own authorization.
+
 The two apply endpoints (`.../apply` and `.../schedule`) carry a second, narrower gate
 after this authorization check (issue #839): a caller who passes manage-or-reservation
-still gets a `409 {"error": "driver_cannot_configure", ...}` if the device's driver
+(manage alone for `.../apply`) still gets a `409 {"error": "driver_cannot_configure", ...}` if the device's driver
 connection type has no `configure` in its contract (today, every type except
 Management). The 409 always runs after the 403 check, never before, so an unauthorized
 caller learns nothing about the device's driver. Config-version create/list/read/restore
@@ -498,7 +505,7 @@ shape, and refuse ANY action against a device with no resolvable driver with a 4
 `device_has_no_driver`, both before any run row is created. This is the gate that
 stops the AI commit path (`committer.py`), which posts `configure` straight to `/execute`
 rather than going through either of inventory's apply endpoints above; the assistant's
-`schedule_config_apply` tool uses inventory's apply endpoint and meets inventory's gate.
+`schedule_config_apply` tool uses inventory's schedule endpoint and meets inventory's gate.
 
 Read paths (list config versions, get version detail, diff) are not gated by this
 manage-or-reservation-ownership widening. As of issue #718, they instead carry the

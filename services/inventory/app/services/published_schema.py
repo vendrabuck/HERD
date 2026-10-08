@@ -73,7 +73,13 @@ async def _fetch_published_schema(driver: DriverPackage) -> dict | None:
             resp = await client.get(url, params=params, headers=headers)
         if resp.status_code == 200:
             body = resp.json()
-            if body.get("has_schema") and isinstance(body.get("schema"), dict):
+            # A body that is not an object is malformed: use the registry
+            # (fail open, issue #1096) instead of raising AttributeError.
+            if (
+                isinstance(body, dict)
+                and body.get("has_schema")
+                and isinstance(body.get("schema"), dict)
+            ):
                 schema = body["schema"]
         else:
             logger.warning(
