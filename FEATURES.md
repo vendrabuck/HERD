@@ -83,9 +83,12 @@ one per area; all ten areas are written.
   spreadsheet formulas (a text cell starting with `=`, `+`, `-`, `@`, a tab, or a
   carriage return gets a leading quote) and the importers undo exactly that, so an
   exported value round-trips (issue #910). Targets migration between HERD
-  instances and bulk onboarding of existing inventory. A device or template dry run
-  is a full rehearsal through the same checks as the committing import, rolled back
-  at the end (issue #1017). Reservations, ACL grants, and users are out of scope.
+  instances and bulk onboarding of existing inventory. A dry run, for devices,
+  templates, and topologies alike, is a full rehearsal through the same checks as the
+  committing import, rolled back at the end, so its report matches the commit row for
+  row (issues #1017, #1064). The device export leaves out dynamic-instance devices,
+  which belong to one booking (issue #1068). Reservations, ACL grants, and users are
+  out of scope.
 
 ## Topology
 

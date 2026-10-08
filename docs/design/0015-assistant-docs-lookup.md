@@ -127,3 +127,13 @@ userinfo dropped. As built, `normalize_url` in
 (a user name or password) instead of normalizing it: such a configured prefix is skipped
 with the `docs_web_prefix_invalid` log line, and such a requested URL matches no prefix
 and is not fetched (issue #1041).
+
+## As built (2026-10-08)
+
+The web source section above places the address check in one helper inside the
+orchestrator. As built, the predicate `is_public_address` and the default resolver live
+in `services/common/herd_common/public_address.py`, shared with the integration
+service's webhook destination rule, and `docs_web.py` imports them under the same names
+(PR #1125). The predicate also refuses the shared address space `100.64.0.0/10`
+(issue #1055) and reserved ranges. The rebinding limitation recorded above applies to
+the webhook check as well. The current rule is AI-DOCS-11 in `docs/specs/ai-features.md`.
