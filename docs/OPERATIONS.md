@@ -44,13 +44,13 @@ If any required var is missing, the config service logs a warning listing them a
 
 1. Open `https://<host>`.
 2. Click the wrench icon on the login page.
-3. Log in with the config-page password: set `CONFIG_ADMIN_PASSWORD` to choose it, or read the random one-time password the config service logs on first boot (`docker compose logs config`).
-4. If you used the random one-time password, you must change it (min 8, max 32 chars) before the config write and apply actions unlock.
+3. Log in with the config-page password: set `CONFIG_ADMIN_PASSWORD` to choose it, or read the random password the config service generates and logs once, at WARNING, on first boot (`docker compose logs config`).
+4. If you used the generated password, you must change it (min 8, max 32 chars) before the config write and apply actions unlock. Until you change it, the generated password stays a working config login for anyone who can read the config container's log, including any log shipper that collects it: that session can read the merged settings (secret values masked) and change the password, which unlocks save and restart. Either set `CONFIG_ADMIN_PASSWORD` or change the generated password promptly, and treat the config container's log as sensitive until you do.
 5. Fill in the required database, auth, and API-token fields (same required list as above). The superadmin fields are optional; if you skip them, create the first admin account through the UI afterward.
-6. Click **Save and Restart**. The config service writes `config.json` to the shared Docker volume and restarts this compose project's app services via the Docker socket (config, traefik, postgres, nats, and the frontend are skipped; other compose projects on the host are never touched).
+6. Click **Save and Restart**. The config service writes `config.json` to the shared Docker volume and restarts this compose project's app services via the Docker socket (config, traefik, postgres, nats, and the frontend are skipped; other compose projects on the host are never touched). If a restart fails, the response's `errors` list names what failed and the exception class only (for example `Cannot connect to Docker: DockerException`); the full text is in the config service log (issue #1086).
 7. Once containers come back healthy (`docker compose ps`), the login form re-enables and you can sign in as the superadmin.
 
-Config-page values take precedence over `.env` for every key that has been saved through the config UI; a `config.json` that exists only from the first-run auto-bootstrap stays subordinate to `.env`, so pure-`.env` operation is unchanged until the first UI save (see the precedence section in `ENV_VARS.md` for the marker mechanics and the escape hatches). The config UI's own password is independent of the app config: set `CONFIG_ADMIN_PASSWORD` to pin it, otherwise the wrench icon accepts the random one-time password logged on first boot.
+Config-page values take precedence over `.env` for every key that has been saved through the config UI; a `config.json` that exists only from the first-run auto-bootstrap stays subordinate to `.env`, so pure-`.env` operation is unchanged until the first UI save (see the precedence section in `ENV_VARS.md` for the marker mechanics and the escape hatches). The config UI's own password is independent of the app config: set `CONFIG_ADMIN_PASSWORD` to pin it, otherwise the wrench icon accepts the random password logged on first boot, which stays valid until it is changed.
 
 ## Upgrade path
 
@@ -293,7 +293,8 @@ Configure verbosity per service via `LOG_LEVEL` (default `INFO`; use `DEBUG` for
 ## Healthchecks and monitoring
 
 - `docker compose ps` shows per-container health. Unhealthy containers need a logs inspection.
-- Every backend service exposes `GET /health` (200 when healthy), reachable through the gateway at `https://<host>/api/<svc>/health` (e.g. `curl -k https://localhost/api/auth/health`). From inside a container use `docker compose exec <svc> python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/health').status)"`; the service images do not ship curl.
+- Every backend service exposes `GET /health`, reachable through the gateway at `https://<host>/api/<svc>/health` (e.g. `curl -k https://localhost/api/auth/health`). From inside a container use `docker compose exec <svc> python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/health').status)"`; the service images do not ship curl.
+- `/health` is a liveness answer only: it returns a constant 200 `{"status": "ok", "service": "<name>"}` and checks no database, broker, or peer service, so it stays 200 while Postgres or NATS is down. The compose healthchecks call it, so a container marked healthy in `docker compose ps` is serving HTTP, nothing more; read the service logs for dependency failures. There is no readiness route.
 - Live OpenAPI docs: `https://<host>/api/<service>/docs` (auth required for most endpoints).
 
 There is no built-in Prometheus/Grafana stack; roll your own based on the JSON logs and `/health` endpoints.
@@ -303,14 +304,15 @@ There is no built-in Prometheus/Grafana stack; roll your own based on the JSON l
 - Postgres: single node by default. Horizontal scaling would require adding a pooler (PgBouncer) and replication; not in the default compose.
 - Services are stateless; scale by bumping `replicas` in compose and putting Traefik or another load balancer in front. Today they run 1x each.
 - Health polling scales horizontally (issue #24): run extra execution replicas with `EXECUTION_POLLER_ONLY=true` (background machinery only, no API routers) and set `HEALTH_POLL_SCHEDULER_ENABLED=false` on the API replicas for a clean split. Concurrent pollers against one schema are safe: due rows are claimed via `SELECT ... FOR UPDATE SKIP LOCKED` plus a conditional update, so two replicas never poll the same device. Bound each replica with `HEALTH_POLL_BATCH_SIZE` and `HEALTH_POLL_MAX_CONCURRENCY`, and watch the per-tick `health_tick` log (`rows_due` versus `polls_fired`) to decide when to add a replica.
-- NATS JetStream is a single node; message persistence is in the `nats` volume. For HA, cluster three NATS nodes.
-- Execution service's driver cache (`/data/driver-cache`) grows with driver churn; size the volume accordingly.
+- NATS JetStream is a single node. Under `make prod` message persistence is in the `nats-data` volume; the dev and gate stacks keep JetStream state in an unmounted directory, so it does not survive a recreate (see JetStream durability above). For HA, cluster three NATS nodes.
+- Execution service's driver cache (`/data/driver-cache`) grows with driver churn; size the volume accordingly. Each driver is extracted into its own directory, `<driver id>-<random hex>` (issue #1097); a new package version replaces the old directory on its next load.
 
 ## Disaster scenarios
 
 ### Postgres is down
 
-- Services that depend on it (auth, inventory, reservations, cabling, acl, execution) will fail their `/health` and crash-loop.
+- Every service with a database (all but config) keeps running and keeps answering `GET /health` with 200, since that route checks nothing; every request that needs the database fails until Postgres is back.
+- A service that starts or restarts while Postgres is down fails during startup (its schema check cannot connect) and exits; its `restart: unless-stopped` policy restarts it until Postgres answers.
 - Config service keeps running (no DB).
 - Recover: bring Postgres back up, let the services auto-recover. No manual intervention needed for the app; replay any lost transactions from backups if data was corrupted.
 
@@ -323,7 +325,11 @@ There is no built-in Prometheus/Grafana stack; roll your own based on the JSON l
 
 ### Config volume is wiped
 
-Services that can't find `config.json` will crash-loop. Rebuild by going through the config-service first-run again (same flow as initial setup).
+A missing `config.json` is not an error for the app services: every setting falls back to the environment, so a stack whose `.env` carries the required values keeps running, and a running service keeps the values it read at startup. What is lost:
+
+- Values saved only through the config UI. Each service picks up the environment value for those keys at its next restart; restore the volume from a backup (see Backup and restore) to get them back.
+- The login page's configured state. It shows the setup banner until `config.json` exists again. The config service writes it from the environment at its next start when every required variable is set (`docker compose restart config`); otherwise go through the wrench-icon flow (same flow as initial setup).
+- The config-page password file. The config service generates and logs a new password on its next use unless `CONFIG_ADMIN_PASSWORD` is set.
 
 ### Main commit accidentally force-pushed
 

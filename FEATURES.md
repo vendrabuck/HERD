@@ -2,7 +2,10 @@
 
 This document tracks what HERD currently supports and what is on the roadmap.
 For the big-picture story of why HERD exists, see [README.md](README.md). For
-architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). For the
+exact rules each feature follows, with the code that enforces each rule and the test
+that pins it, see the as-built specifications in [docs/specs/](docs/specs/README.md),
+one per area; all ten areas are written.
 
 **Status legend:**
 
@@ -39,7 +42,8 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   holding named secrets whose payloads are AES-GCM envelope-encrypted (an
   environment-supplied key-encryption key wraps per-version data-encryption
   keys), with ACL-gated reveal, an internal-token retrieval surface for
-  automated provisioning, and online key rotation. Deleting a secret is
+  automated provisioning, and online key rotation that binds every secrets replica
+  without a restart. Deleting a secret is
   refused with 409 while any hypervisor still references it (fail-closed when
   inventory is unreachable, no force flag). See
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -338,7 +342,9 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   dry-run that captures the commands the driver would emit; the frontend
   shows the transcript in a confirmation modal so the user reviews and
   confirms before any real apply runs. ACL widening lets reservation owners
-  manage their own reserved devices for the duration of the window. Drivers
+  write config versions and schedule and confirm applies on their own reserved
+  devices for the duration of the window; an immediate apply still needs an explicit
+  `manage` grant (issue #1092). Drivers
   must opt into dry-run via a `driver_metadata.json` declaring
   `supports_dry_run: true`; the inventory schedule endpoint and the execution
   sandbox refuse dry-runs against drivers that did not opt in, and the AI
@@ -377,7 +383,9 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   reservation goes active. Owner or admin can cancel while pending. Optional
   dry-run mode runs the driver in simulation, captures the commands it would
   have emitted, and returns them via `GET /api/execution/runs/{id}/commands`
-  for review before promotion to a real apply.
+  for review before promotion to a real apply. A scheduled apply's run carries the
+  job's reservation, so the reservation owner can read that transcript. A failed or
+  timed-out run retried later repeats its mode, so a retried dry run stays a dry run.
 - **Per-command execution transcripts** (Shipped): drivers can opt into a
   per-command transcript via the in-process `record_command` helper. Rows
   persist to `execution_command_log` with sequence, command bytes, response,
@@ -437,8 +445,11 @@ architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   under a production deployment (a mounted volume with a configurable retention cap)
   and deliberately ephemeral under local dev, for clean-start test isolation.
   (Issue #620.)
-- **Structured JSON logging** (Shipped): every service emits JSON logs with request
-  middleware and business-event logging; per-service log level configurable.
+- **Structured JSON logging** (Shipped): every backend service except config emits
+  JSON logs with request middleware and business-event logging; per-service log level
+  configurable. The config service logs plain text through the Python standard library
+  with no handler of its own, so only its WARNING and higher lines reach the container
+  log.
 - **Version and build visibility** (Shipped): the login page and the app header show
   the running version, and an admin-only About page lists the version, build, and
   build date of the frontend and of every backend service, read live from each

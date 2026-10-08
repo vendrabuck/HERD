@@ -338,3 +338,19 @@ Slices 1-3 are non-behavioral and safe to merge ahead of 4.
   the AI tool. The AI COMMIT validation in `committer.py:229` should also honor it
   eventually; confirm whether slice 4 must cover the commit path or whether that
   can trail.
+
+## As built (2026-10-08)
+
+Two points where the shipped code differs from the text above; the decisions stand.
+
+- The proxy route `GET /api/inventory/drivers/{id}/config-schema` admits any signed-in
+  user, not only admins (section 2.3 and slice 3 said admin-readable): it drives the
+  config-editor UI (`get_driver_config_schema_proxy` in `services/inventory/app/routers/drivers.py`).
+  Issue #1099.
+- Section 1.2's cache description predates issue #1097. Each first load of a driver now
+  extracts into a directory of its own, `<cache>/<driver id>-<random hex>`, and the
+  `DriverCache` row (one per driver, carrying the SHA256 and the directory) is written
+  insert-or-nothing and read back, so two concurrent first loads both succeed and the
+  loser adopts the winner's directory. A changed SHA256 still removes the old directory
+  and re-extracts. The current rules are CFG-LOAD-1 onward in
+  `docs/specs/device-configuration.md`.

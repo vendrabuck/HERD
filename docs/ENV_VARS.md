@@ -26,7 +26,7 @@ Upgrading from a version without the marker: an existing `config.json` with no `
 
 On the very first `make up`, the config service writes `/data/herd-config/config.json` automatically from the process environment when every required variable below is present and non-empty. That file is what gates the login page, so a complete `.env` now unlocks login without visiting the config UI. If any required var is missing the config service logs a warning listing them, skips the bootstrap, and the login page keeps directing you to the wrench icon.
 
-The config page's own login password is set by `CONFIG_ADMIN_PASSWORD`. When you set it (in `.env` or the environment), that is the config-UI password and the config write surface is unlocked immediately. When it is unset, the config service generates a random one-time password on first boot and logs it once at WARNING (read it from `make logs config` or the container logs); the write and apply endpoints stay locked with HTTP 403 until you log in and change the password. There is no longer a hardcoded default password. The related `CONFIG_SESSION_SECRET` pins the config session-token signing key across replicas; when unset, a random per-process key is used.
+The config page's own login password is set by `CONFIG_ADMIN_PASSWORD`. When you set it (in `.env` or the environment), that is the config-UI password and the config write surface is unlocked immediately. When it is unset, the config service generates a random password on first boot and logs it once at WARNING (read it from `make logs config` or the container logs); the write and apply endpoints stay locked with HTTP 403 until you log in and change the password. The logged password stays a valid config login until it is changed, so anyone who can read the config container's log (or a log shipper that collects it) can sign in to the config page with it: set `CONFIG_ADMIN_PASSWORD`, or change the generated password promptly, and treat that log as sensitive until you do. There is no longer a hardcoded default password. The related `CONFIG_SESSION_SECRET` pins the config session-token signing key across replicas; when unset, a random per-process key is used.
 
 ## Config editor populates from env
 
@@ -154,7 +154,7 @@ TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env 
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `NATS_URL` | `nats://nats:4222` | Connection string. Absence is non-fatal at startup; services log a warning and run without event-driven features. |
+| `NATS_URL` | `nats://nats:4222` | Connection string. Absence is non-fatal at startup: the first connect gives up after five retries two seconds apart (`herd_common.jetstream.connect_nats`, issue #1083, a module constant rather than a knob), the service logs a warning and runs without event-driven features, and it stays without NATS until it is restarted. A connection established at startup reconnects without limit after a broker restart. |
 | `NATS_STREAM_MAX_AGE_SECONDS` | `604800` (7 days) | JetStream retention cap (issue #620), applied via `herd_common.jetstream.ensure_stream` to `HERD_RESERVATIONS`, `HERD_HEALTH`, and `HERD_DLQ`. Read by the reservations and execution services (each applies it to the streams it owns). 0 disables the cap. Only matters where JetStream state is durable (`make prod`, the `nats-data` volume); under `make up` and the gate stack every stream starts empty on each recreate regardless of this setting. See [OPERATIONS.md](OPERATIONS.md#jetstream-durability). |
 | `NATS_NAK_BACKOFF_SECONDS` | `1,5,15,60,120` | Comma-separated seconds; the NAK-delay schedule a transient-error redelivery passes to `msg.nak(delay=...)` (issue #895). Read identically by execution, notifications, and integration (their durable consumers' shared knob); delivery *n* failing gets `schedule[n-1]`, clamped to the last entry past the schedule's length. Replaces the pre-#895 `ConsumerConfig.backoff` list, which JetStream silently used to replace the server-side `ack_wait` with `backoff[0]` (measured 1s against nats-server 2.10.29) and which only ever timed ack-timeout redeliveries, never a NAK, so a bare `msg.nak()` redelivered immediately regardless of it. `docker-compose.override.yml` (dev/test only) pins a short schedule (`0,1,1,1,1`) so the affected integration test finishes quickly; `make prod` uses the production default above. Each service validates every entry as a non-negative integer at Settings load and refuses to boot on a malformed value. |
 | `NATS_ACK_WAIT_SECONDS` | `30` | Integer seconds; the `ack_wait` of every durable pull consumer (issue #944): execution's `execution-consumer`, notifications' two durables, and integration's two webhook durables, read identically by the three services. The in-progress heartbeat (`herd_common.jetstream.keep_messages_alive`) runs at HALF of it, derived in one place (`heartbeat_interval`), so a handler that outlasts `ack_wait` is never redelivered while it runs; a crashed consumer stops heartbeating and the message correctly redelivers after `ack_wait`. `ensure_consumer` applies a changed value to an existing durable on restart. `docker-compose.override.yml` (dev/test only) pins `4` for integration ONLY, so `tests/integration/test_webhook_slow_receiver_live.py` can hold a webhook fan-out open past it inside the 30 s test cap; `make prod` and the other two services keep 30. Each service refuses to boot below 2 seconds at Settings load. |
@@ -163,7 +163,7 @@ TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env 
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LOG_LEVEL` | `INFO` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Per-service. |
+| `LOG_LEVEL` | `INFO` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Per-service. The config service does not read it: it logs plain text, WARNING and higher only. |
 
 ## Config service
 
@@ -172,7 +172,7 @@ hardcoded default. Config service auth is separate from HERD JWT.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CONFIG_ADMIN_PASSWORD` | random per deploy | The config-page login password (`services/config/app/config_store.py`). When set, that value is the password and the config write/apply surface is unlocked. When unset, a random one-time password is generated on first boot and logged once at WARNING (read it from the config container logs); the write and apply endpoints return 403 until you log in and change the password. Never a source-visible constant. |
+| `CONFIG_ADMIN_PASSWORD` | random per deploy | The config-page login password (`services/config/app/config_store.py`). When set, that value is the password and the config write/apply surface is unlocked. When unset, a random password is generated on first boot and logged once at WARNING (read it from the config container logs); the write and apply endpoints return 403 until you log in and change the password. The logged password stays a valid config login until it is changed, so set this variable or change the password promptly, and treat the config container's log as sensitive until then. Never a source-visible constant. |
 | `CONFIG_SESSION_SECRET` | random per process | HMAC key that signs and verifies the short-lived config-session token issued after config login (`services/config/app/auth.py`). If unset, a random secret is generated at process start, so sessions do not survive a config-service restart. Set it to a strong shared value only when you run multiple config replicas and need a session to verify across them. It is never a source-visible constant. |
 
 ## AI orchestrator
@@ -335,10 +335,10 @@ Test-only fault-injection seam (issue #214):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PREFERENCES_CACHE_TTL_SECONDS` | `30` | In-process TTL for cached per-user notification preferences fetched from user-profile. |
+| `PREFERENCES_CACHE_TTL_SECONDS` | `30` | In-process TTL for cached per-user notification preferences fetched from user-profile. Only an answer is cached: a failed read uses the defaults for that event alone and the next event asks again (issue #1075). |
 | `AUTH_SERVICE_URL` | `http://auth:8000` | Base URL for auth's `/internal/admins` endpoint, used by the health-transition recipient resolver. |
 | `RESERVATIONS_SERVICE_URL` | `http://reservations:8000` | Base URL for reservations' `/internal/active-users` endpoint, used to find users with an active reservation on a device that's transitioning. |
-| `HEALTH_NOTIFY_ADMIN_CACHE_TTL_SECONDS` | `60` | In-process TTL for the cached list of admin user-ids used to fan out `device.health_transition` events. Admin list rarely changes so a longer TTL is fine. |
+| `HEALTH_NOTIFY_ADMIN_CACHE_TTL_SECONDS` | `60` | In-process TTL for the cached list of admin user-ids used to fan out `device.health_transition` events. Admin list rarely changes so a longer TTL is fine. Only an answer is cached (an empty list from auth included): a failed lookup covers that event alone and the next event asks again (issue #1075). |
 
 ### Outbound channels (ROADMAP #40)
 
@@ -361,7 +361,7 @@ Transport config for the email, chat, and webhook dispatchers. All are instance-
 
 `AUTH_SERVICE_URL` (above) also backs the email and chat dispatchers' recipient lookup via auth's `/internal/users/{id}/contact` endpoint, so `INTERNAL_API_TOKEN` must match on auth and notifications for outbound email and chat to resolve an address.
 
-The notifications service runs two durable NATS consumers: one on `herd.reservations.*` (DLQ `herd.reservations.dlq.notifications`) and one on `herd.health.*` (DLQ `herd.health.dlq.notifications`). Distinct durables so a stuck health-event subscriber cannot block reservation events and vice versa. Absence of NATS is non-fatal at startup; the REST API still works and the consumers reconnect when NATS returns.
+The notifications service runs two durable NATS consumers: one on `herd.reservations.*` (DLQ `herd.reservations.dlq.notifications`) and one on `herd.health.*` (DLQ `herd.health.dlq.notifications`). Distinct durables so a stuck health-event subscriber cannot block reservation events and vice versa. Absence of NATS is non-fatal at startup: the REST API still works, but a service that could not connect at startup runs without its consumers until it is restarted. Consumers that connected at startup reconnect on their own when NATS returns.
 
 ## Reservations service
 

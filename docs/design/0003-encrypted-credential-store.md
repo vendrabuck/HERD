@@ -159,3 +159,27 @@ captured logs for the plaintext across a full request cycle.
 - Vault-style dynamic or leased credentials.
 - The dynamic-resources feature itself (#32); this store is its
   prerequisite, not its implementation.
+
+## As built (2026-10-08): DEK rotation across replicas
+
+The decision stands; this records how rotation behaves with more than one secrets
+replica, which the text above does not address (issue #1085).
+
+- The `key_versions` table is the source of truth and each process's keyring is a cache
+  of it. A replica that meets a key version it has not seen (written by another
+  replica's rotation) loads and unwraps it from the table on first use, so a DEK
+  rotation binds every replica with no restart.
+- Every write encrypts under the newest unretired version in the table, read at write
+  time, not the version the process held at boot.
+- A rotation takes a transaction-scoped Postgres advisory lock
+  (`herd_common.advisory_lock.xact_lock`, key `herd-secrets-dek-rotation`) before it
+  reads the table, so two rotations run one after the other. A collision that still
+  reaches the unique key (a database without advisory locks) rolls back and answers 409
+  `Another key rotation committed first; nothing was changed. Retry.`
+- A key version that is missing or does not unwrap under this replica's KEK answers a
+  fixed 503 `Secret key material is unavailable to this service`; the version is
+  logged under action `key_version_unavailable`.
+
+Enforced in `services/secrets/app/services/keyring.py` (`Keyring.load_dek`,
+`Keyring.current`, `rotate_dek`); the current rules are OPS-SECRET-17 and OPS-SECRET-18
+in `docs/specs/operations-and-observability.md`.

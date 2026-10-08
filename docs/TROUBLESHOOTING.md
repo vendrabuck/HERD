@@ -414,11 +414,12 @@ The notifications service consumes the same `herd.reservations.*` events on its 
 - Make sure you're logged in as the reservation **owner**; iteration 1 only notifies the owner (co-owners and ACL grantees are deferred).
 - Check `Settings` and confirm the relevant event (`Reservation confirmed`, `updated`, `cancelled`, `completed`) is still checked and the in-app channel is on.
 - The notifications consumer has its own DLQ subject at `herd.reservations.dlq.notifications` (independent from execution's DLQ). Poison messages or exhausted retries land there; see [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq).
-- If user-profile is down or misconfigured (missing `INTERNAL_API_TOKEN` match), the consumer fails open and still delivers notifications with defaults; verify user-profile's health endpoint returns 200 if prefs aren't being respected.
+- If user-profile is down or misconfigured (missing `INTERNAL_API_TOKEN` match), the consumer fails open and still delivers notifications with defaults; verify user-profile's health endpoint returns 200 if prefs aren't being respected. A failed preferences, admin-list, or contact lookup is never cached, so the next event asks again once the upstream recovers (issue #1075).
+- If the notifications service started while NATS was down, it logged `Failed to connect to NATS; ...` and runs without its consumers until it is restarted: restart it once NATS is up (see [OPERATIONS.md](OPERATIONS.md#nats-is-down)).
 
 ### DLQ has messages
 
-Inspect them, figure out why they failed, decide whether to replay or discard. Each DLQ message is a snapshot of the original event payload; replaying means publishing it back on `herd.reservations.<event-type>`. Check both `herd.reservations.dlq.execution` (execution) and `herd.reservations.dlq.notifications` so you don't miss the half of the system you weren't looking for. See [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq).
+Inspect them, figure out why they failed, decide whether to replay or discard. Each DLQ message is a snapshot of the original event payload; replaying means publishing it back on its original subject (`herd.reservations.<event-type>`, or `herd.health.status_changed` for a health event). Check all five DLQ subjects, `herd.reservations.dlq.execution`, `herd.reservations.dlq.notifications`, `herd.reservations.dlq.integration`, `herd.health.dlq.notifications`, and `herd.health.dlq.integration`, so you don't miss the part of the system you weren't looking for. See [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq).
 
 ### DLQ messages disappeared after a rebuild
 
@@ -443,6 +444,20 @@ decrypt. `docker compose logs secrets` shows the exact `KekError`:
   `SECRETS_KEK_PREVIOUS` and the new one as `SECRETS_KEK` to rotate (see
   OPERATIONS.md). If the original key is lost, stored secrets are
   unrecoverable by design; delete and recreate them.
+
+### A secrets call answers 503 `Secret key material is unavailable to this service`
+
+This replica cannot load or unwrap a stored key version: the version's row is missing
+from the key table, or this replica's `SECRETS_KEK` differs from the one that wrapped it
+(issue #1085). The log names the version under action `key_version_unavailable`. Give
+every secrets replica the same `SECRETS_KEK` (and `SECRETS_KEK_PREVIOUS` during a KEK
+rotation) and restart the one that differs. A replica needs no restart to see a data-key
+rotation another replica ran: it loads the new version from the key table on first use.
+
+### Key rotation answers 409 `Another key rotation committed first; nothing was changed. Retry.`
+
+Two rotations collided on the next key version. Rotations are serialized by a Postgres
+advisory lock, so this is rare; the refused one changed nothing, so run it again.
 
 ### Reveal returns 403 or 404 for a non-admin
 

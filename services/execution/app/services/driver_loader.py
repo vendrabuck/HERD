@@ -226,10 +226,12 @@ def extract_config_schema_json(driver_dir: Path) -> str | None:
     by design: a broken config_schema() must never block a driver load; the
     validation path falls back to the registry. See issue #23.
 
-    The sandbox is used to safely extract the schema without trusting arbitrary
-    driver code at import time. The extraction runs in a subprocess with resource
-    limits, so a malicious or runaway driver.config_schema() cannot hang the
-    execution service.
+    The subprocess does not keep driver code out of this process: on the load
+    path `validate_driver` has already imported driver.py in-process by the
+    time this runs (the package validator keeps an unapproved package out with
+    AST checks instead). What the subprocess bounds is the config_schema() call
+    itself: it runs with resource limits and a timeout, so a runaway
+    config_schema() cannot hang the execution service.
     """
     # Imported lazily so unit tests that exercise extract/validate without the
     # sandbox do not pull in the subprocess machinery at import time.
