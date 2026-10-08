@@ -11,6 +11,8 @@ from pathlib import Path
 
 import httpx
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -338,8 +340,14 @@ async def load_driver(
         logger.error("Failed to download driver %s: %s", driver_id, e)
         raise RuntimeError(f"Failed to download driver {driver_id}: {type(e).__name__}") from e
 
-    # Extract
-    dest_dir = Path(settings.driver_cache_path) / str(driver_id)
+    # Extract into a directory of this attempt's own (issue #1097). Two first
+    # loads of one driver used to extract into the same <cache>/<driver id>
+    # directory at once, so one could read a half-written tree or remove the
+    # other's files on a validation failure. A per-attempt directory is never
+    # shared, and only the cache row (written below, after validation) makes it
+    # visible to a later load. A sibling of the legacy <cache>/<driver id> path,
+    # never a child, so removing a stale legacy directory cannot remove it.
+    dest_dir = Path(settings.driver_cache_path) / f"{driver_id}-{uuid.uuid4().hex}"
     try:
         extract_driver_package(package_bytes, driver_filename, dest_dir)
     except Exception as e:
@@ -365,32 +373,104 @@ async def load_driver(
     # yields None and we degrade to the registry at validation time.
     config_schema_json = extract_config_schema_json(dest_dir)
 
-    # Update cache: upsert to handle concurrent load_driver calls. If two
-    # executions race on the same driver_id, both will download + extract + validate
-    # but only one will win the database write (UPSERT semantics). The loser's disk
-    # extraction is wasted but the cache row reflects the same sha256, so a later
-    # load will use whichever path the DB has (stale extraction paths are pruned
-    # on next load if the sha256 mismatches).
-    result = await db.execute(select(DriverCache).where(DriverCache.driver_id == driver_id))
-    existing = result.scalar_one_or_none()
-    if existing:
-        existing.sha256 = driver_sha256
-        existing.local_path = str(dest_dir)
-        existing.metadata_json = metadata_json
-        existing.config_schema_json = config_schema_json
-    else:
-        cache_entry = DriverCache(
-            driver_id=driver_id,
-            sha256=driver_sha256,
-            local_path=str(dest_dir),
-            metadata_json=metadata_json,
-            config_schema_json=config_schema_json,
-        )
-        db.add(cache_entry)
-    await db.commit()
+    # Record the cache row (issue #1097): a real insert-or-nothing on the unique
+    # driver_id, then a re-read, so a concurrent first load of the same driver
+    # never fails on the unique constraint. The loser adopts the winner's row
+    # when it holds the same package, and discards its own extraction.
+    local_path = await _record_cache_row(
+        db,
+        driver_id=driver_id,
+        driver_sha256=driver_sha256,
+        dest_dir=dest_dir,
+        metadata_json=metadata_json,
+        config_schema_json=config_schema_json,
+    )
 
     logger.info(
         "Driver loaded and cached",
-        extra={"driver_id": str(driver_id), "path": str(dest_dir)},
+        extra={"driver_id": str(driver_id), "path": local_path},
     )
-    return str(dest_dir)
+    return local_path
+
+
+def _insert_cache_row_if_absent(dialect_name: str, values: dict):
+    """INSERT ... ON CONFLICT (driver_id) DO NOTHING for the session's dialect."""
+    insert = pg_insert if dialect_name == "postgresql" else sqlite_insert
+    return insert(DriverCache).values(**values).on_conflict_do_nothing(index_elements=["driver_id"])
+
+
+async def _read_cache_row(db: AsyncSession, driver_id: uuid.UUID) -> DriverCache | None:
+    # populate_existing: a row this session already holds in its identity map
+    # would otherwise come back with the attributes it had before a concurrent
+    # writer's commit.
+    result = await db.execute(
+        select(DriverCache)
+        .where(DriverCache.driver_id == driver_id)
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _record_cache_row(
+    db: AsyncSession,
+    *,
+    driver_id: uuid.UUID,
+    driver_sha256: str,
+    dest_dir: Path,
+    metadata_json: str,
+    config_schema_json: str | None,
+) -> str:
+    """Write the driver's cache row for a freshly extracted package; return the
+    directory the caller should load from.
+
+    - No row: insert ours with ON CONFLICT DO NOTHING, commit, and re-read. When
+      the re-read row is ours, we won.
+    - A row for the SAME sha256 whose directory exists (a concurrent first load
+      won the insert): adopt it and remove our own extraction, so one directory
+      serves the package.
+    - Any other row (a different sha256, or a directory that is gone): update it
+      in place to ours, the behavior load_driver always had for a stale row.
+    """
+    ours = str(dest_dir)
+    existing = await _read_cache_row(db, driver_id)
+    if existing is None:
+        await db.execute(
+            _insert_cache_row_if_absent(
+                db.get_bind().dialect.name,
+                {
+                    "id": uuid.uuid4(),
+                    "driver_id": driver_id,
+                    "sha256": driver_sha256,
+                    "local_path": ours,
+                    "metadata_json": metadata_json,
+                    "config_schema_json": config_schema_json,
+                },
+            )
+        )
+        await db.commit()
+        existing = await _read_cache_row(db, driver_id)
+        if existing is None or existing.local_path == ours:
+            # existing is None only if a concurrent stale-row eviction removed the
+            # winner's row between our insert and the re-read; our extraction is
+            # valid, so serve it (the next load re-caches).
+            return ours
+
+    if existing.sha256 == driver_sha256 and Path(existing.local_path).exists():
+        logger.info(
+            "Driver cache row written by a concurrent load; adopting it",
+            extra={"driver_id": str(driver_id), "path": existing.local_path},
+        )
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        return existing.local_path
+
+    replaced_path = existing.local_path
+    existing.sha256 = driver_sha256
+    existing.local_path = ours
+    existing.metadata_json = metadata_json
+    existing.config_schema_json = config_schema_json
+    await db.commit()
+    if replaced_path != ours:
+        # The replaced directory held another package (or is already gone);
+        # get_cached_driver removes a stale directory the same way.
+        shutil.rmtree(replaced_path, ignore_errors=True)
+    return ours

@@ -685,3 +685,86 @@ async def test_run_driver_action_start_log_emits_context_keys_not_values(db, mon
     assert keys == sorted(keys)
     assert "HERD_notes" in keys
     assert "HERD_tacacs_key" in keys
+
+
+# --- An unexpected exception after the row is written (issue #1097) ---
+
+
+async def _reread(run_id):
+    async with TestSessionLocal() as session:
+        return await session.get(ExecutionRun, run_id)
+
+
+@pytest.mark.asyncio
+async def test_run_driver_action_unexpected_load_error_records_failed(db, monkeypatch, caplog):
+    """A load error outside DriverPackageError, ValueError, and RuntimeError (an
+    IntegrityError from the cache write, before #1097's upsert) used to escape with
+    the run left PENDING for good. It now ends FAILED with a class-name-only error,
+    and the exception text reaches the log message only."""
+    from sqlalchemy.exc import IntegrityError
+
+    monkeypatch.setattr(
+        ex_service,
+        "load_driver",
+        AsyncMock(
+            side_effect=IntegrityError(
+                "INSERT INTO driver_cache /secret/path", {}, Exception("UNIQUE failed")
+            )
+        ),
+    )
+    with caplog.at_level("ERROR"):
+        run = await run_driver_action(db, _device_data(), _template_data(), "status", USER_ID)
+
+    assert run.status == "FAILED"
+    assert run.error == "execution failed: IntegrityError"
+    assert run.completed_at is not None
+    stored = await _reread(run.id)
+    assert stored.status == "FAILED"
+    assert "/secret/path" not in stored.error
+    assert any("/secret/path" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_run_driver_action_unexpected_sandbox_error_records_failed(db, monkeypatch):
+    """An exception raised while the run is RUNNING ends it FAILED, not RUNNING."""
+    monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
+    monkeypatch.setattr(ex_service, "get_driver_config_schema", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        ex_service, "execute_driver_method", MagicMock(side_effect=OSError("fork failed"))
+    )
+
+    run = await run_driver_action(db, _device_data(), _template_data(), "status", USER_ID)
+
+    assert run.status == "FAILED"
+    assert run.error == "execution failed: OSError"
+    assert (await _reread(run.id)).status == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_fail_run_unexpected_keeps_a_final_status(db):
+    """The FAILED write is a compare-and-swap on PENDING or RUNNING: a run that
+    already reached a final status keeps it."""
+    run = ExecutionRun(
+        device_id=DEVICE_ID,
+        driver_id=DRIVER_ID,
+        driver_sha256="sha",
+        action="status",
+        user_id=USER_ID,
+        status="SUCCESS",
+        input_params={},
+    )
+    db.add(run)
+    await db.commit()
+
+    result = await ex_service._fail_run_unexpected(db, run.id, RuntimeError("late"))
+    assert result.status == "SUCCESS"
+    assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_fail_run_unexpected_reraises_original_when_the_write_fails(db, monkeypatch):
+    original = KeyError("boom")
+    monkeypatch.setattr(db, "commit", AsyncMock(side_effect=RuntimeError("db down")))
+    with pytest.raises(KeyError) as exc:
+        await ex_service._fail_run_unexpected(db, uuid.uuid4(), original)
+    assert exc.value is original

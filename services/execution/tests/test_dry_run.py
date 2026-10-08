@@ -281,17 +281,15 @@ async def test_load_driver_populates_cached_metadata(db, monkeypatch, tmp_path):
     # metadata file we wrote ourselves.
     driver_id = uuid.uuid4()
     sha = "abc"
-    dest = tmp_path / str(driver_id)
-    dest.mkdir(parents=True)
-    (dest / "driver.py").write_text(DRY_RUN_AWARE_DRIVER)
-    (dest / "driver_metadata.json").write_text('{"supports_dry_run": true}')
 
     async def fake_download(_driver_id):
         return b""
 
     def fake_extract(_pkg, _filename, dest_dir):
-        # No-op: we pre-populated dest above.
-        return
+        # Write the package files straight into the attempt's directory.
+        dest_dir.mkdir(parents=True)
+        (dest_dir / "driver.py").write_text(DRY_RUN_AWARE_DRIVER)
+        (dest_dir / "driver_metadata.json").write_text('{"supports_dry_run": true}')
 
     monkeypatch.setattr(driver_loader, "download_driver_package", fake_download)
     monkeypatch.setattr(driver_loader, "extract_driver_package", fake_extract)
