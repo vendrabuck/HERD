@@ -2895,9 +2895,18 @@ async def _release_orphaned_allocations(
     provably defined, never the raw scope). Guards, per the decision:
 
       - Reuse race: skipped entirely when another ACTIVE allocation now holds the same
-        (fabric, vlan_id): the number was re-allocated by the time the delete would run,
-        so deleting would strip the newer reservation's definition (the #424 supersession
-        rule, applied to definitions). The winner's own define pass is idempotent.
+        vlan_id in the CURRENT connected component of any switch in defined_switch_ids:
+        the number was re-allocated by the time the delete would run, so deleting would
+        strip the newer reservation's definition (the #424 supersession rule, applied to
+        definitions). The winner's own define pass is idempotent. Reachability is judged
+        on the current cabling graph through vlan_service.find_superseding_allocation,
+        the rule allocation uses (issue #1065), never by comparing stored fabric ids.
+      - Unjudgeable: when cabling cannot answer a fabric lookup (TransientUpstreamError)
+        supersession cannot be ruled out, so no delete runs for that allocation, its
+        switches stay in defined_switch_ids, and the pass continues with the next
+        allocation. The error is not re-raised: the row is already RELEASED, so a NAK
+        would not re-drive this delete, and raising would leave every later orphaned
+        allocation in the set unreleased.
       - Delete-failure: log-and-continue with a loud line. The allocation row is already
         RELEASED (allocation lifecycle is a database decision, never coupled to hardware
         cleanup) and bounded lingering of an empty VLAN definition is accepted; there is
@@ -2907,7 +2916,9 @@ async def _release_orphaned_allocations(
 
     from app.models.vlan_assignment import VlanAssignment
     from app.services.l2_membership_service import count_active_memberships_for_vlan
+    from app.services.vlan_service import FabricResolver, find_superseding_allocation
 
+    resolver = FabricResolver()
     for va_id in vlan_assignment_ids:
         async with get_db_session() as db:
             if await count_active_memberships_for_vlan(db, va_id) > 0:
@@ -2931,26 +2942,31 @@ async def _release_orphaned_allocations(
         if not defined:
             continue
 
-        async with get_db_session() as db:
-            winner = (
-                await db.execute(
-                    select(VlanAssignment.id).where(
-                        VlanAssignment.fabric_id == row.fabric_id,
-                        VlanAssignment.vlan_id == row.vlan_id,
-                        VlanAssignment.status == "ACTIVE",
-                        VlanAssignment.id != row.id,
-                    )
-                )
-            ).first()
+        try:
+            async with get_db_session() as db:
+                winner = await find_superseding_allocation(db, row, defined, resolver)
+        except TransientUpstreamError as exc:
+            logger.error(
+                "Skipping delete_vlan for VLAN %d (allocation %s, reservation %s): "
+                "supersession could not be judged (%s); the definition lingers on "
+                "switches %s",
+                row.vlan_id,
+                row.id,
+                row.reservation_id,
+                exc,
+                defined,
+                extra={"action": "vlan_delete_unjudged"},
+            )
+            continue
         if winner is not None:
             logger.warning(
-                "Skipping delete_vlan for VLAN %d on fabric %s: the number was "
-                "re-allocated (allocation %s superseded by %s) by the time the delete "
-                "would run",
+                "Skipping delete_vlan for VLAN %d: the number was re-allocated in the "
+                "current component of switches %s (allocation %s superseded by %s) by "
+                "the time the delete would run",
                 row.vlan_id,
-                row.fabric_id,
+                defined,
                 row.id,
-                winner[0],
+                winner,
             )
             continue
 

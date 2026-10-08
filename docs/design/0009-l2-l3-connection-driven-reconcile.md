@@ -334,5 +334,9 @@ backstop. `fetch_fabric_id` fails closed: a non-200, a transport error, or an un
 body raises `TransientUpstreamError`, the reconcile NAKs, and nothing is allocated; the
 `uuid5` stand-in is gone. Limit by decision: the check runs at allocation time only, so a
 cable added later that joins two components already holding one number is not
-re-checked, and the release supersession guard still compares stored fabric ids. No
-schema, route, or response shape changed.
+re-checked. No schema, route, or response shape changed. Follow-up (issue #1065): the
+release supersession guard judges by the same current-graph rule
+(`vlan_service.find_superseding_allocation`): a freed number's `delete_vlan` is skipped
+when another live allocation holding it reaches the current component of a switch the
+number is defined on, and skipped too, with the definition left in place, when cabling
+cannot answer.

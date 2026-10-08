@@ -783,7 +783,7 @@ VLAN definition lifecycle is coupled to the per-fabric allocation (issue #442, d
 |---|---|
 | VLAN definition (a fabric allocation's first built membership, or a scope growth) | login(), create_vlan(vlan_id), logout(), once per switch in the definition scope, before the first add_to_vlan on that switch |
 | Membership reconcile (activation, fork save, heal, retry) | login(), remove_from_vlan(port, vlan_id) for each departed port, add_to_vlan(port, vlan_id, tag) for each joined port, logout() |
-| Reservation ended (cancelled, completed, failed) | membership removes as above, driven strictly from the stored ledger; then login(), delete_vlan(vlan_id), logout() per switch the VLAN was defined on (skipped when the number was re-allocated on the fabric) |
+| Reservation ended (cancelled, completed, failed) | membership removes as above, driven strictly from the stored ledger; then login(), delete_vlan(vlan_id), logout() per switch the VLAN was defined on (skipped when the number was re-allocated in the switch's current cabling component) |
 | Device added to HERD or admin health check | login(), status(), logout() |
 
 The definition scope is transit-inclusive: it covers every L2 switch the reservation's

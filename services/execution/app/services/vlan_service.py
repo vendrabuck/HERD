@@ -20,6 +20,11 @@ is allocated against a guessed fabric.
 
 Limit by decision: the check runs when an allocation is made. A cable added later
 that joins two components already holding the same number is not re-checked.
+
+The release-side supersession guard (find_superseding_allocation, issue #1065) uses
+the same reachability rule: a freed number's delete_vlan is skipped when another live
+allocation holding it reaches the current component of a switch the number is
+defined on.
 """
 
 import logging
@@ -129,6 +134,51 @@ async def allocation_reaches(
         if await resolver.fabric_of(sid) == fabric_id:
             return True
     return False
+
+
+async def find_superseding_allocation(
+    db: AsyncSession,
+    row: VlanAssignment,
+    switch_ids: list[str],
+    resolver: FabricResolver,
+) -> uuid.UUID | None:
+    """The id of another ACTIVE allocation holding row's VLAN number in the CURRENT
+    connected component of any of switch_ids, or None (issue #1065).
+
+    The release-side supersession guard (WIRE-VLAN-11) judges by the same reachability
+    rule as allocation: an allocation sits in a switch's component when allocation_reaches
+    says so for that switch's current fabric id. row's own stored fabric id is never
+    compared, because a cable change since row was allocated re-keys its component.
+    With no other ACTIVE allocation holding the number nothing is looked up. A fabric
+    lookup that cannot be answered raises TransientUpstreamError (fail closed).
+    """
+    rivals = (
+        (
+            await db.execute(
+                select(VlanAssignment)
+                .where(
+                    VlanAssignment.vlan_id == row.vlan_id,
+                    VlanAssignment.status == "ACTIVE",
+                    VlanAssignment.id != row.id,
+                )
+                .order_by(VlanAssignment.created_at, VlanAssignment.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rivals:
+        return None
+    fabrics: list[uuid.UUID] = []
+    for sid in switch_ids:
+        fid = await resolver.fabric_of(sid)
+        if fid not in fabrics:
+            fabrics.append(fid)
+    for rival in rivals:
+        for fid in fabrics:
+            if await allocation_reaches(rival, fid, resolver):
+                return rival.id
+    return None
 
 
 async def _reachable_active(
