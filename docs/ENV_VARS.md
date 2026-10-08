@@ -154,7 +154,7 @@ TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env 
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `NATS_URL` | `nats://nats:4222` | Connection string. Absence is non-fatal at startup; services log a warning and run without event-driven features. |
+| `NATS_URL` | `nats://nats:4222` | Connection string. Absence is non-fatal at startup: the first connect gives up after five retries two seconds apart (`herd_common.jetstream.connect_nats`, issue #1083, a module constant rather than a knob), the service logs a warning and runs without event-driven features, and it stays without NATS until it is restarted. A connection established at startup reconnects without limit after a broker restart. |
 | `NATS_STREAM_MAX_AGE_SECONDS` | `604800` (7 days) | JetStream retention cap (issue #620), applied via `herd_common.jetstream.ensure_stream` to `HERD_RESERVATIONS`, `HERD_HEALTH`, and `HERD_DLQ`. Read by the reservations and execution services (each applies it to the streams it owns). 0 disables the cap. Only matters where JetStream state is durable (`make prod`, the `nats-data` volume); under `make up` and the gate stack every stream starts empty on each recreate regardless of this setting. See [OPERATIONS.md](OPERATIONS.md#jetstream-durability). |
 | `NATS_NAK_BACKOFF_SECONDS` | `1,5,15,60,120` | Comma-separated seconds; the NAK-delay schedule a transient-error redelivery passes to `msg.nak(delay=...)` (issue #895). Read identically by execution, notifications, and integration (their durable consumers' shared knob); delivery *n* failing gets `schedule[n-1]`, clamped to the last entry past the schedule's length. Replaces the pre-#895 `ConsumerConfig.backoff` list, which JetStream silently used to replace the server-side `ack_wait` with `backoff[0]` (measured 1s against nats-server 2.10.29) and which only ever timed ack-timeout redeliveries, never a NAK, so a bare `msg.nak()` redelivered immediately regardless of it. `docker-compose.override.yml` (dev/test only) pins a short schedule (`0,1,1,1,1`) so the affected integration test finishes quickly; `make prod` uses the production default above. Each service validates every entry as a non-negative integer at Settings load and refuses to boot on a malformed value. |
 | `NATS_ACK_WAIT_SECONDS` | `30` | Integer seconds; the `ack_wait` of every durable pull consumer (issue #944): execution's `execution-consumer`, notifications' two durables, and integration's two webhook durables, read identically by the three services. The in-progress heartbeat (`herd_common.jetstream.keep_messages_alive`) runs at HALF of it, derived in one place (`heartbeat_interval`), so a handler that outlasts `ack_wait` is never redelivered while it runs; a crashed consumer stops heartbeating and the message correctly redelivers after `ack_wait`. `ensure_consumer` applies a changed value to an existing durable on restart. `docker-compose.override.yml` (dev/test only) pins `4` for integration ONLY, so `tests/integration/test_webhook_slow_receiver_live.py` can hold a webhook fan-out open past it inside the 30 s test cap; `make prod` and the other two services keep 30. Each service refuses to boot below 2 seconds at Settings load. |
@@ -335,10 +335,10 @@ Test-only fault-injection seam (issue #214):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PREFERENCES_CACHE_TTL_SECONDS` | `30` | In-process TTL for cached per-user notification preferences fetched from user-profile. |
+| `PREFERENCES_CACHE_TTL_SECONDS` | `30` | In-process TTL for cached per-user notification preferences fetched from user-profile. Only an answer is cached: a failed read uses the defaults for that event alone and the next event asks again (issue #1075). |
 | `AUTH_SERVICE_URL` | `http://auth:8000` | Base URL for auth's `/internal/admins` endpoint, used by the health-transition recipient resolver. |
 | `RESERVATIONS_SERVICE_URL` | `http://reservations:8000` | Base URL for reservations' `/internal/active-users` endpoint, used to find users with an active reservation on a device that's transitioning. |
-| `HEALTH_NOTIFY_ADMIN_CACHE_TTL_SECONDS` | `60` | In-process TTL for the cached list of admin user-ids used to fan out `device.health_transition` events. Admin list rarely changes so a longer TTL is fine. |
+| `HEALTH_NOTIFY_ADMIN_CACHE_TTL_SECONDS` | `60` | In-process TTL for the cached list of admin user-ids used to fan out `device.health_transition` events. Admin list rarely changes so a longer TTL is fine. Only an answer is cached (an empty list from auth included): a failed lookup covers that event alone and the next event asks again (issue #1075). |
 
 ### Outbound channels (ROADMAP #40)
 
@@ -361,7 +361,7 @@ Transport config for the email, chat, and webhook dispatchers. All are instance-
 
 `AUTH_SERVICE_URL` (above) also backs the email and chat dispatchers' recipient lookup via auth's `/internal/users/{id}/contact` endpoint, so `INTERNAL_API_TOKEN` must match on auth and notifications for outbound email and chat to resolve an address.
 
-The notifications service runs two durable NATS consumers: one on `herd.reservations.*` (DLQ `herd.reservations.dlq.notifications`) and one on `herd.health.*` (DLQ `herd.health.dlq.notifications`). Distinct durables so a stuck health-event subscriber cannot block reservation events and vice versa. Absence of NATS is non-fatal at startup; the REST API still works and the consumers reconnect when NATS returns.
+The notifications service runs two durable NATS consumers: one on `herd.reservations.*` (DLQ `herd.reservations.dlq.notifications`) and one on `herd.health.*` (DLQ `herd.health.dlq.notifications`). Distinct durables so a stuck health-event subscriber cannot block reservation events and vice versa. Absence of NATS is non-fatal at startup: the REST API still works, but a service that could not connect at startup runs without its consumers until it is restarted. Consumers that connected at startup reconnect on their own when NATS returns.
 
 ## Reservations service
 
