@@ -65,7 +65,7 @@ async def test_create_execution_run(db):
     assert run.action == "login"
     assert run.status == "PENDING"
     assert run.user_id == USER_ID
-    assert run.input_params == {"HERD_ip_address": "10.0.1.50"}
+    assert run.input_params == {"HERD_ip_address": "10.0.1.50", "dry_run": False}
     assert run.port_a is None
     assert run.port_b is None
 

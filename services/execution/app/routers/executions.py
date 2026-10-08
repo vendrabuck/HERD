@@ -402,6 +402,19 @@ async def retry_run(
         raise HTTPException(status_code=404, detail="Execution run not found")
     if original.status not in ("FAILED", "TIMEOUT"):
         raise HTTPException(status_code=400, detail="Only failed or timed-out runs can be retried")
+    # A retry repeats what the original run was, dry run included (issue #1091):
+    # retrying a failed dry run for real would push a configuration nobody asked
+    # to apply. A row without the record predates it, so its mode is unknown and
+    # the retry is refused rather than guessed (fail closed).
+    recorded_dry_run = (original.input_params or {}).get("dry_run")
+    if not isinstance(recorded_dry_run, bool):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This run does not record whether it was a dry run, so it cannot be "
+                "retried; start a new run instead"
+            ),
+        )
 
     device_data = await fetch_device(original.device_id)
     template_data = await fetch_template(device_data["template_id"])
@@ -419,6 +432,7 @@ async def retry_run(
         port_a=original.port_a,
         port_b=original.port_b,
         method_kwargs=original_kwargs,
+        dry_run=recorded_dry_run,
     )
     return run
 

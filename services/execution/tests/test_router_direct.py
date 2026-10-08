@@ -298,7 +298,7 @@ async def test_retry_run_rejects_non_failed(db):
 @pytest.mark.asyncio
 async def test_retry_run_failed_rebuilds(db, monkeypatch):
     original = _make_run(status="FAILED")
-    original.input_params = {"method_kwargs": {"foo": "bar"}}
+    original.input_params = {"method_kwargs": {"foo": "bar"}, "dry_run": False}
     db.add(original)
     await db.commit()
 
@@ -312,6 +312,7 @@ async def test_retry_run_failed_rebuilds(db, monkeypatch):
     # method_kwargs recovered from the original run's input_params.
     _, kwargs = ex_router.run_driver_action.call_args
     assert kwargs["method_kwargs"] == {"foo": "bar"}
+    assert kwargs["dry_run"] is False
 
 
 # --- list_runs return path (line 164) ---
