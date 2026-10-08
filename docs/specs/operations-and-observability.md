@@ -51,7 +51,7 @@ beyond role (secret grants, own-row preferences) are numbered in section 8.
 | User | Read any device's health snapshot (OPS-HEALTH-1); read, replace, merge, and reset their own preferences; list and read the secrets they hold a `view` or `manage` grant on, and reveal those they hold `manage` on | List all health snapshots; read reports; create, edit, delete, or rotate secrets; read another user's preferences |
 | Admin | Everything a user may; list health snapshots; read the utilization report and its CSV; create, list, read, reveal, edit, and delete every secret; rotate the data-encryption key; open the About page | Delete a secret a hypervisor references (OPS-SECRET-13) |
 | Superadmin | Same as admin | Same as admin |
-| Another service (internal token) | Read a secret's plaintext by id or name; read a user's preferences (section 7) | Anything through the user-facing routes |
+| Another service (internal token) | Read a secret's plaintext by id or name; read a user's preferences; run an on-demand device check (section 7) | Anything through the user-facing routes |
 
 ## 3. Concepts and data
 
@@ -168,6 +168,7 @@ never fails the message (`provisioning-and-wiring.md`, WIRE-GATE-1, WIRE-DISPATC
 | GET | `/internal/secrets/{secret_id}/value` (secrets) | `X-Internal-Token` | execution (hypervisor credentials, `dynamic-resources.md`), inventory (hypervisor registration, `inventory.md`) | `{id, name, data}` | OPS-SECRET-9, OPS-SECRET-10 |
 | GET | `/internal/secrets/by-name/{name}/value` (secrets) | `X-Internal-Token` | none in the services today | `{id, name, data}` | OPS-SECRET-9, OPS-SECRET-10 |
 | GET | `/preferences/internal?user_id` (user-profile) | `X-Internal-Token` | notifications (channel and event opt-outs) | the user's preferences, created empty if missing | OPS-PREF-7 |
+| POST | `/device-check` (execution) | `X-Internal-Token` | none in the services today | `{run_id, device_id, status, output, error}` | OPS-HEALTH-6 to OPS-HEALTH-10 |
 
 This area calls inventory's `GET /devices/health-config` (`inventory.md`, INV-POLL-3) and
 `GET /hypervisors/by-secret/{id}/internal` (`inventory.md`); their answers are specified
@@ -897,15 +898,17 @@ INV-POLL-3); the event in section 6.
   Pinned by: `services/execution/tests/test_health_scheduler_scale.py` (`test_fleet_scale_defaults_match_pre_24_behavior`)
 
 **Out of scope.** The poll interval and its floor (`inventory.md`, INV-POLL-1 to
-INV-POLL-4); the on-demand device check and the driver runs each poll records
+INV-POLL-4); the on-demand device check (8.11); the driver runs each poll records
 (`device-configuration.md`); who is notified of a health event (`integration.md`).
 
 ### 8.11 Device health snapshot
 
 **What it does.** The device page shows a colored health badge with the last poll time,
-and an admin can list every device's health.
+and an admin can list every device's health. Another service can also ask execution to
+check one device now, through the same login, status, and logout sequence a poll runs.
 
 **Surfaces.** `services/execution/app/routers/health.py`;
+`services/execution/app/routers/executions.py` (`device_check`);
 `frontend/src/components/inventory/DeviceHealthBadge.tsx` and
 `frontend/src/api/health.ts`.
 
@@ -932,6 +935,36 @@ and an admin can list every device's health.
   last poll time (or Never polled) as its tooltip, and a placeholder while loading. \
   Enforced in: `frontend/src/components/inventory/DeviceHealthBadge.tsx` (`DeviceHealthBadge`); `frontend/src/api/health.ts` (`useDeviceHealth`) \
   Pinned by: `frontend/src/test/components/DeviceHealthBadge.test.tsx` (`renders Healthy in green when status is HEALTHY`, `renders Unknown in gray when device hasn't been polled`, `renders a placeholder while loading`, `renders 'Never polled' tooltip when last_polled_at is null`); `frontend/src/test/api/health.test.tsx` (`useDeviceHealth fetches a snapshot for a device`)
+- **OPS-HEALTH-6.** `POST /device-check` takes a body of `device_id` and `user_id` and
+  is guarded by the internal token only: 500 `Internal API token not configured` when
+  execution has no token, 403 `Invalid internal token` when the header is missing or
+  wrong. It reads no user JWT and applies no visibility or grant check; it acts on the
+  device id given and records the body's `user_id` on every run it writes. \
+  Enforced in: `services/execution/app/routers/executions.py` (`device_check`, `_require_internal_token`) \
+  Pinned by: `services/execution/tests/test_api_endpoints.py` (`test_device_check_requires_internal_token`); `services/execution/tests/test_router_endpoints.py` (`test_require_internal_token_rejects_missing`, `test_require_internal_token_errors_when_not_configured`)
+- **OPS-HEALTH-7.** The device check reads the device and its template through
+  inventory's internal routes, the same reads as `device-configuration.md` (CFG-EXEC-4):
+  a 404 answers 404 `Device <id> not found` or `Template <id> not found`, and any other
+  failure answers 503 `Failed to fetch device: <exception text>` (or template). A
+  device with no driver answers 409 `{"error": "device_has_no_driver", "message"}` before
+  any run is written (`device-configuration.md`, CFG-GATE-4). Known gap, see #1093. \
+  Enforced in: `services/execution/app/services/execution_service.py` (`fetch_device`, `fetch_template`, `_assert_action_permitted`) \
+  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_fetch_device_404_raises_404`, `test_fetch_device_other_error_raises_503`, `test_fetch_template_404_raises_404`, `test_fetch_template_other_error_raises_503`); `services/execution/tests/test_configure_capability_gate.py` (`test_assert_action_permitted_raises_409_for_no_driver_regardless_of_action`); `tests/integration/test_device_check_internal_fetch.py` (`test_device_check_uses_internal_inventory_routes`)
+- **OPS-HEALTH-8.** The check runs `login` first; when the login run is not `SUCCESS` it
+  answers 200 with `status` `FAILED`, the login run's id, and the login run's `error`,
+  and runs neither `status` nor `logout`. \
+  Enforced in: `services/execution/app/routers/executions.py` (`device_check`) \
+  Pinned by: `services/execution/tests/test_api_endpoints.py` (`test_device_check_login_failure`); `services/execution/tests/test_router_direct.py` (`test_device_check_login_failure_short_circuits`); `services/execution/tests/test_router_endpoints.py` (`test_device_check_login_failure_short_circuits`)
+- **OPS-HEALTH-9.** After a successful login the check runs `status` and then `logout`
+  and answers 200 with the status run's id, `status`, `output`, and `error`; the logout
+  run's outcome is not reported. \
+  Enforced in: `services/execution/app/routers/executions.py` (`device_check`) \
+  Pinned by: `services/execution/tests/test_router_direct.py` (`test_device_check_status_success_path`); `services/execution/tests/test_api_endpoints.py` (`test_device_check_success`); `services/execution/tests/test_router_endpoints.py` (`test_device_check_success`)
+- **OPS-HEALTH-10.** The check writes only execution run rows, one per action it ran,
+  with no reservation; it neither reads nor writes the device's health status row, so
+  the badge and the poll schedule do not change, and it stages no event. \
+  Enforced in: `services/execution/app/routers/executions.py` (`device_check`) \
+  Pinned by: none
 
 **Out of scope.** Health history: each poll's driver runs are the history
 (`device-configuration.md`).
@@ -1260,6 +1293,11 @@ CLI documentation guard (OPS-NATS-14).
 | 200 | `{"restarted": [...], "errors": [...]}` | config apply; failures are entries in `errors` | OPS-CONFIG-13, OPS-CONFIG-16 |
 | 403 | `Admin or superadmin role required` | a non-admin lists health snapshots, reads a report, or writes a secret | OPS-HEALTH-3, OPS-REPORT-1, OPS-SECRET-1 |
 | 422 | `Invalid last_status: <value>` | an unknown health filter that matches nothing | OPS-HEALTH-4 |
+| 500 | `Internal API token not configured` | a device check while execution has no internal token | OPS-HEALTH-6 |
+| 403 | `Invalid internal token` | a device check without the right token | OPS-HEALTH-6 |
+| 404 | `Device <id> not found`, `Template <id> not found` | a device check on a device or template inventory does not know | OPS-HEALTH-7 |
+| 503 | `Failed to fetch device: <exception text>`, `Failed to fetch template: <exception text>` | a device check when inventory cannot answer | OPS-HEALTH-7 |
+| 409 | `{"error": "device_has_no_driver", "message"}` | a device check on a device with no driver | OPS-HEALTH-7 |
 | 422 | validation list | a secret body outside the schema, an empty `data` | OPS-SECRET-1 |
 | 409 | `A secret with this name already exists` | a taken secret name | OPS-SECRET-2 |
 | 404 | `Secret not found` | an unknown secret id or name, or a non-admin with no grant | OPS-SECRET-6, OPS-SECRET-8, OPS-SECRET-9, OPS-SECRET-12 |
@@ -1294,6 +1332,8 @@ Startup refusals (no HTTP answer; the container exits or waits):
 | Out (execution) | inventory | `GET /devices/health-config` (internal token, 10 s) | poll registry | Fail safe: the previous registry is kept (OPS-POLL-2) |
 | Out (execution) | inventory | device and template reads per poll | what to poll and with which driver | The poll records `UNREACHABLE` (OPS-POLL-7) |
 | Out (execution) | the device's driver | `login`, `status`, `logout` in the sandbox | health check | Recorded as the poll's status (OPS-POLL-7) |
+| Out (execution, device check) | inventory | device and template reads (internal token, 10 s) | the device check | Fail closed: 404 or 503 (OPS-HEALTH-7) |
+| Out (execution, device check) | the device's driver | `login`, then `status` and `logout` in the sandbox | the device check | Answered 200 with the failed run's status and error (OPS-HEALTH-8, OPS-HEALTH-9) |
 | Out (secrets) | acl | `GET /resources` with the caller's token (5 s); the shared grant check | which secrets a user may see or reveal | Fail closed: nothing listed, 404 or 403 (OPS-SECRET-5) |
 | Out (secrets) | inventory | `GET /hypervisors/by-secret/{id}/internal` (internal token, 5 s) | delete guard | Fail closed: 503; a malformed 200 is a 500 (OPS-SECRET-14) |
 | Out (reservations, report) | cabling | `POST /internal/forks/devices/batch` (internal token, 10 s, chunks of 500) | transit devices | Fail closed: 503 (OPS-REPORT-8) |
@@ -1349,8 +1389,8 @@ to 500.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/common/tests/` (`test_logging.py`, `test_config_loader.py`, `test_base_settings.py`, `test_schema_init.py`, `test_consumer_schema_gate.py`, `test_outbox.py`, `test_jetstream.py`, `test_version.py`); `services/execution/tests/test_health_scheduler*.py`; `services/config/tests/`; `services/secrets/tests/test_crypto.py`, `test_keyring.py`; `services/reservations/tests/test_reporting_*.py`, `test_fleet_report.py`, `test_transit_gear_rollup.py`; the `tests/unit/` guards (`test_compose_settings_wiring.py`, `test_compose_ports.py`, `test_build_args_wiring.py`, `test_consumer_heartbeat_wiring.py`, `test_docs_nats_cli_form.py`, `test_check_image_matches_lock.py`); the frontend tests named in sections 8.3, 8.6, 8.11, and 8.14 | SQLite in memory; the scheduler's concurrency is driven within one process |
-| Functional (through the service API) | each service's `test_version.py`; `services/execution/tests/test_health_endpoints.py`; `services/config/tests/test_config.py`; `services/secrets/tests/test_api.py`; `services/user-profile/tests/test_preferences*.py`; the report route tests in `test_fleet_report.py` | httpx against the app |
-| Integration (running stack) | `tests/integration/test_outbox_durability.py`, `test_nats_consumer_configs_live.py`, `test_health_alerting_flow.py`, `test_secrets_flow.py`, `test_reporting.py`, `test_dlq_and_idempotency.py`; the live-Postgres suite `services/common/tests/test_outbox_wake_live_pg.py` | No running-stack test covers the config service, a scheduler poll end to end (the alerting test publishes its own events), or a JetStream store surviving a recreate |
+| Functional (through the service API) | each service's `test_version.py`; `services/execution/tests/test_health_endpoints.py`; the device check tests in `services/execution/tests/test_api_endpoints.py`, `test_router_endpoints.py`, and `test_router_direct.py`; `services/config/tests/test_config.py`; `services/secrets/tests/test_api.py`; `services/user-profile/tests/test_preferences*.py`; the report route tests in `test_fleet_report.py` | httpx against the app |
+| Integration (running stack) | `tests/integration/test_device_check_internal_fetch.py`, `test_outbox_durability.py`, `test_nats_consumer_configs_live.py`, `test_health_alerting_flow.py`, `test_secrets_flow.py`, `test_reporting.py`, `test_dlq_and_idempotency.py`; the live-Postgres suite `services/common/tests/test_outbox_wake_live_pg.py` | No running-stack test covers the config service, a scheduler poll end to end (the alerting test publishes its own events), or a JetStream store surviving a recreate |
 | Stress and load | `tests/load/locustfile.py` ([LOAD_TESTING.md](../LOAD_TESTING.md)) | The load test drives reservations, inventory, ACL, export, validation, notifications, and bulk cabling; none of its users polls health, reads reports, or touches secrets or the config service. Scheduler fleet scale is covered only by the unit bounds in section 8.10 |
 | Browser end-to-end | `tests/e2e/test_about_page_playwright.py`, `tests/e2e/test_config_playwright.py` (Save and Restart runs only with `HERD_E2E_RESTART=1`), `tests/e2e/test_config.py`, `tests/e2e/test_reporting_page.py` | No browser test covers the health badge or the help link |
 
@@ -1379,6 +1419,8 @@ failing when a dependency is down (OPS-LIVE-1), services are said to crash-loop 
 - #1086, OPS-CONFIG-16: the config apply response carries raw exception text.
 - #1087, OPS-LOG-9, OPS-LIVE-1, OPS-SET-7, OPS-NATS-13: the operator documents and
   FEATURES.md describe behavior the code does not have.
+- #1093, OPS-HEALTH-7: the device check's 503 carries raw exception text from the
+  inventory read (the same defect as CFG-EXEC-4 in `device-configuration.md`).
 
 ### Limits by decision
 
@@ -1418,6 +1460,7 @@ failing when a dependency is down (OPS-LIVE-1), services are said to crash-loop 
 - OPS-OUTBOX-14: the relay does not republish an acknowledged event.
 - OPS-NATS-1: startup with an unreachable broker.
 - OPS-NATS-13: JetStream store durability under `make prod`.
+- OPS-HEALTH-10: the device check writes no health status row and stages no event.
 - OPS-NATS-15: reservations' declaration of `HERD_RESERVATIONS`.
 - OPS-SECRET-18: two rotations at once.
 - OPS-REPORT-9: the routes' mapping of a transit failure to 503.

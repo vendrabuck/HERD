@@ -235,6 +235,9 @@ None. Inventory has no NATS connection, and the driver-action routes publish not
 | POST | `/execute/internal` (execution) | `X-Internal-Token` | inventory's apply scheduler | the run | CFG-EXEC-6, CFG-GATE-4 |
 | POST | `/internal/validate-package` (execution) | `X-Internal-Token` | ai-orchestrator (recipe drafting) | the validation report | CFG-VAL-1 to CFG-VAL-9 |
 
+Execution's `POST /device-check` (an on-demand login, status, and logout of one device)
+is specified in `operations-and-observability.md`, rules OPS-HEALTH-6 to OPS-HEALTH-10.
+
 The inventory routes require the `X-Internal-Token` header: a missing header is a 422
 and a wrong one 403 `Invalid internal token`. The execution routes answer 500
 `Internal API token not configured` when execution has no token and 403
