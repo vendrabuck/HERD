@@ -25,6 +25,7 @@ from app.schemas.execution import (
     ManualExecuteRequest,
     PaginatedExecutionRunResponse,
 )
+from app.services import device_visibility
 from app.services.driver_loader import (
     DriverPackageError,
     get_driver_config_schema,
@@ -53,6 +54,10 @@ from app.services.wiring_retry_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Pinned: the by-id run reads answer an unknown run and a run on a device the
+# caller may not see with this same detail.
+RUN_NOT_FOUND_DETAIL = "Execution run not found"
 
 get_current_user_payload, require_admin = make_auth_dependencies(
     secret_key=settings.secret_key,
@@ -114,19 +119,24 @@ async def _authorize_runs_list(
     reservation_id: uuid.UUID | None = Query(None),
     payload: dict = Depends(get_current_user_payload),
     authorization: str | None = Header(None),
-) -> dict:
-    """Authorize GET /runs. Admins always pass; non-admins must supply a
-    reservation_id they own. Without a reservation_id, non-admins are rejected
-    (the unscoped listing remains admin-only).
+) -> set[uuid.UUID] | None:
+    """Authorize GET /runs and resolve the caller's device visibility.
+
+    Admins always pass and get None (no device filter). A non-admin must supply
+    a reservation_id they own (the unscoped listing remains admin-only); that
+    ownership check is the first gate. The caller's device-group visibility is
+    then resolved once (`resolve_caller_visibility`, 503 when it cannot be
+    answered), and the returned set limits the list to runs on devices the
+    caller may see.
     """
     role = payload.get("role")
     if role in ("admin", "superadmin"):
-        return payload
+        return None
     if reservation_id is None:
         raise HTTPException(status_code=403, detail="Admin access required")
     if not await _user_owns_reservation(reservation_id, authorization):
         raise HTTPException(status_code=403, detail="Reservation not owned by caller")
-    return payload
+    return await device_visibility.resolve_caller_visibility(payload, authorization)
 
 
 async def _authorize_run_read(
@@ -134,11 +144,14 @@ async def _authorize_run_read(
     payload: dict,
     authorization: str | None,
 ) -> None:
-    """Admin always passes; non-admins pass iff the run is tied to a reservation they own.
+    """Admin always passes; a non-admin passes iff they own the run's reservation
+    and may see the run's device.
 
-    Same shape as the iter-2 carve-out on GET /runs: reservation-owner reads
-    are allowed when scoped to a reservation they hold. Runs with no
-    reservation_id (e.g. ad-hoc device checks) remain admin-only.
+    Same shape as GET /runs: reservation-owner reads are allowed when scoped to a
+    reservation they hold. Runs with no reservation_id (e.g. ad-hoc device
+    checks) remain admin-only. A run on a device outside the caller's
+    device-group visibility answers exactly as an unknown run id does (404
+    `RUN_NOT_FOUND_DETAIL`), and an unanswerable visibility lookup is 503.
     """
     role = payload.get("role")
     if role in ("admin", "superadmin"):
@@ -147,6 +160,9 @@ async def _authorize_run_read(
         raise HTTPException(status_code=403, detail="Admin access required")
     if not await _user_owns_reservation(run.reservation_id, authorization):
         raise HTTPException(status_code=403, detail="Reservation not owned by caller")
+    visible = await device_visibility.resolve_caller_visibility(payload, authorization)
+    if visible is not None and run.device_id not in visible:
+        raise HTTPException(status_code=404, detail=RUN_NOT_FOUND_DETAIL)
 
 
 # --- API Endpoints ---
@@ -161,10 +177,14 @@ async def list_runs(
     created_before: datetime | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
-    _: dict = Depends(_authorize_runs_list),
+    visible_device_ids: set[uuid.UUID] | None = Depends(_authorize_runs_list),
     db: AsyncSession = Depends(get_db),
 ):
-    """List execution runs. Admin (any filter) or reservation owner (with reservation_id)."""
+    """List execution runs. Admin (any filter) or reservation owner (with reservation_id).
+
+    A non-admin's list holds only runs on devices they may see; the filter is in
+    the query, so `total` and paging count only those runs.
+    """
     items, total = await list_execution_runs(
         db,
         device_id=device_id,
@@ -174,6 +194,7 @@ async def list_runs(
         created_before=created_before,
         skip=skip,
         limit=limit,
+        visible_device_ids=visible_device_ids,
     )
     return PaginatedExecutionRunResponse(items=items, total=total, skip=skip, limit=limit)
 
@@ -201,13 +222,14 @@ async def list_run_commands(
     """List the per-command transcript for an execution run.
 
     Admin always. Non-admin reservation owners may read transcripts for runs
-    tied to a reservation they hold (matches the iter-2 carve-out on GET /runs).
+    tied to a reservation they hold, on a device they may see (the same rule as
+    GET /runs; a hidden run answers as an unknown one, see _authorize_run_read).
     Returns an empty list for runs whose driver did not opt into command
     logging; the absence of rows is a property of the driver, not an error.
     """
     run = await get_execution_run(db, run_id)
     if not run:
-        raise HTTPException(status_code=404, detail="Execution run not found")
+        raise HTTPException(status_code=404, detail=RUN_NOT_FOUND_DETAIL)
     await _authorize_run_read(run, payload, authorization)
     return await list_command_log(db, run_id)
 

@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 ADMIN_ID = str(uuid.uuid4())
 USER_ID = str(uuid.uuid4())
 RESERVATION_ID = uuid.uuid4()
+DEVICE_ID = uuid.uuid4()
 
 ADMIN_PAYLOAD = {"sub": ADMIN_ID, "username": "admin", "role": "admin"}
 USER_PAYLOAD = {"sub": USER_ID, "username": "alice", "role": "user"}
@@ -47,7 +48,7 @@ async def _seed_run_with_commands(reservation_id: uuid.UUID | None) -> uuid.UUID
     async with TestSessionLocal() as session:
         run = await create_execution_run(
             session,
-            device_id=uuid.uuid4(),
+            device_id=DEVICE_ID,
             driver_id=uuid.uuid4(),
             driver_sha256="sha",
             action="configure",
@@ -104,6 +105,9 @@ async def test_non_admin_owner_can_read(_override_db, monkeypatch):
     app.dependency_overrides[get_current_user_payload] = lambda: USER_PAYLOAD
     monkeypatch.setattr(
         ex_router.httpx, "AsyncClient", lambda *a, **kw: _mock_reservations_response(200)
+    )
+    monkeypatch.setattr(
+        ex_router.device_visibility, "fetch_visible_device_ids", AsyncMock(return_value={DEVICE_ID})
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         resp = await ac.get(

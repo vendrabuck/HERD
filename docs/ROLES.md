@@ -55,7 +55,7 @@ is issued with the lower role.
 | Create, update, delete device groups | | yes | yes |
 | Manage device group devices and permissions | | yes | yes |
 | View execution runs (unscoped) | | yes | yes |
-| View execution runs for an owned reservation | yes | yes | yes |
+| View execution runs for an owned reservation (runs on devices the user can see) | yes | yes | yes |
 | Execute drivers and retry failed runs | | yes | yes |
 | View device health snapshot (single device) | yes | yes | yes |
 | List device health snapshots (all devices) | | yes | yes |
@@ -1349,9 +1349,27 @@ the unscoped form with no `reservation_id`). Non-admin callers must supply a
 `reservation_id` they own; the execution service verifies ownership via a
 cross-service `GET` to the reservations service with the caller's JWT. A
 non-admin request without `reservation_id`, or with a `reservation_id` the
-caller does not own, returns 403. This is used by the AI reservation
-assistant's `list_executions_for_reservation` tool so reservation owners can
-inspect their own apply history without being granted admin.
+caller does not own, returns 403. A non-admin's list then holds only the runs
+on devices the caller can see under device-group visibility, which execution
+asks inventory once per request with the caller's JWT; a run on any other device
+(a transit switch the wiring touched, for example) is not listed, and a lookup
+inventory cannot answer is 503 with no rows. Admins are not filtered. This is
+used by the AI reservation assistant's `list_executions_for_reservation` tool so
+reservation owners can inspect their own apply history without being granted
+admin.
+
+### Read a run's command transcript
+
+```
+GET /api/execution/runs/{run_id}/commands
+Authorization: Bearer <token>
+```
+
+Admins may read any run's transcript. A non-admin may read the transcript of a
+run tied to a reservation they own (403 otherwise; a run with no reservation is
+admin only) on a device they can see; a run on a device outside their visibility
+answers exactly as an unknown run id (404 `Execution run not found`), and a
+visibility lookup inventory cannot answer is 503.
 
 ### Get execution run detail
 
@@ -1854,6 +1872,7 @@ Authorization: Bearer <admin-token>
 | `/api/acl/resources` | GET | yes | yes | yes |
 | `/api/execution/runs` | GET | yes (owner, with `reservation_id`) | yes | yes |
 | `/api/execution/runs/{id}` | GET | | yes | yes |
+| `/api/execution/runs/{id}/commands` | GET | yes (owner of the run's reservation, device visible) | yes | yes |
 | `/api/execution/execute` | POST | yes (`configure` only, with device `manage` grant) | yes | yes |
 | `/api/execution/runs/{id}/retry` | POST | | yes | yes |
 | `/api/execution/device-check` | POST | internal | internal | internal |

@@ -895,6 +895,9 @@ async def test_list_runs_non_owner_with_reservation_id_403(user_client, monkeypa
 async def test_list_runs_owner_with_reservation_id_allowed(user_client, monkeypatch):
     """Owner of the reservation can list /runs filtered to that reservation."""
     monkeypatch.setattr(ex_router, "_user_owns_reservation", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        ex_router.device_visibility, "fetch_visible_device_ids", AsyncMock(return_value=set())
+    )
     resp = await user_client.get(
         f"/runs?reservation_id={uuid.uuid4()}",
         headers={"Authorization": "Bearer t"},

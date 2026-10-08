@@ -205,8 +205,16 @@ async def list_execution_runs(
     created_before: datetime | None = None,
     skip: int = 0,
     limit: int = 50,
+    visible_device_ids: set[uuid.UUID] | None = None,
 ) -> tuple[list[ExecutionRun], int]:
+    """Filter, count, and page execution runs, newest first.
+
+    `visible_device_ids` None means no device filter (an admin); a set keeps only
+    runs on those devices, an empty set none, so the count and the page agree.
+    """
     query = select(ExecutionRun)
+    if visible_device_ids is not None:
+        query = query.where(ExecutionRun.device_id.in_(visible_device_ids))
     if device_id is not None:
         query = query.where(ExecutionRun.device_id == device_id)
     if reservation_id is not None:

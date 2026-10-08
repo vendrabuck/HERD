@@ -216,9 +216,9 @@ Execution routes:
 | Method | Path | Who may call | Success | Rules |
 |---|---|---|---|---|
 | POST | `/execute` | admin (any action); a user with a `manage` grant (`configure` only) | 201 | CFG-EXEC-1 to CFG-EXEC-5, CFG-EXEC-7 to CFG-EXEC-13, CFG-GATE-4 |
-| GET | `/runs` | admin; a user, with the `reservation_id` of a reservation they own | 200 | CFG-RUN-1 to CFG-RUN-3 |
+| GET | `/runs` | admin; a user, with the `reservation_id` of a reservation they own (runs on devices they may see) | 200 | CFG-RUN-1 to CFG-RUN-3 |
 | GET | `/runs/{id}` | admin | 200 | CFG-RUN-4 |
-| GET | `/runs/{id}/commands` | admin; a user who owns the run's reservation | 200 | CFG-TX-5 |
+| GET | `/runs/{id}/commands` | admin; a user who owns the run's reservation and may see the run's device | 200 | CFG-TX-5 |
 | POST | `/runs/{id}/retry` | admin | 200 | CFG-RUN-5, CFG-RUN-6 |
 
 `GET /runs` takes `device_id`, `reservation_id`, `status`, `created_after`,
@@ -882,11 +882,18 @@ reservation can list the runs tagged with it.
   and pages with `skip` and `limit`. \
   Enforced in: `services/execution/app/services/execution_service.py` (`list_execution_runs`) \
   Pinned by: `services/execution/tests/test_execution_crud.py` (`test_list_filter_by_device_id`, `test_list_filter_by_reservation_id`, `test_list_filter_by_status`, `test_list_pagination`, `test_list_combined_filters`); `services/execution/tests/test_execution_service_edges.py` (`test_list_execution_runs_created_after_and_before`)
-- **CFG-RUN-3.** A reservation owner's list holds every run tagged with that
-  reservation, whatever device it ran on, the wiring consumer's switch runs
-  (WIRE-DRIVER-5) included, each with its `input_params`. \
-  Enforced in: `services/execution/app/routers/executions.py` (`list_runs`); `services/execution/app/services/execution_service.py` (`list_execution_runs`) \
-  Pinned by: none (#1100)
+- **CFG-RUN-3.** A non-admin's list holds only the runs whose device the caller may see
+  under device-group visibility, asked once per request of inventory
+  `GET /device-groups/visible-devices` with the caller's own token and 10 seconds,
+  after the ownership check of CFG-RUN-1. The filter is part of the query, so `total`
+  and paging count only those runs; a wiring consumer's run on a switch outside the
+  caller's visibility (WIRE-DRIVER-5), or a recipe run filed under a hypervisor id,
+  is not listed. No token, a transport error, a non-200, a body that is not JSON, or a
+  body that is not `{"device_ids": [<str>, ...]}` is 503
+  `Could not verify device visibility; nothing was returned. Retry the request.` with
+  no rows. An admin's list is not filtered and asks nothing. \
+  Enforced in: `services/execution/app/routers/executions.py` (`_authorize_runs_list`, `list_runs`); `services/execution/app/services/device_visibility.py` (`fetch_visible_device_ids`, `resolve_caller_visibility`); `services/execution/app/services/execution_service.py` (`list_execution_runs`) \
+  Pinned by: `services/execution/tests/test_run_reads_device_visibility.py` (`test_owner_run_list_holds_only_visible_devices`, `test_owner_run_list_empty_when_no_device_is_visible`, `test_owner_run_list_device_filter_on_hidden_device_is_empty`, `test_owner_run_list_fails_closed_when_visibility_unanswerable`, `test_owner_run_list_ownership_is_still_the_first_gate`, `test_admin_run_list_is_unfiltered_and_asks_nothing`, `test_fetch_visible_device_ids_without_a_token_is_unanswerable`, `test_resolve_caller_visibility_is_none_for_admins`)
 - **CFG-RUN-4.** `GET /runs/{id}` is for admins (403
   `Admin or superadmin role required`); an unknown run is 404 `Execution run not found`. \
   Enforced in: `services/execution/app/routers/executions.py` (`get_run`) \
@@ -940,10 +947,13 @@ which drivers import; `GET /runs/{id}/commands`.
 - **CFG-TX-5.** `GET /runs/{id}/commands` answers the rows in order, an empty list when
   the driver recorded none, and 404 `Execution run not found` for an unknown run. An
   admin may read any run; anyone else only a run whose `reservation_id` passes the
-  ownership check of CFG-RUN-1 (403 `Reservation not owned by caller`), and a run with
-  no reservation is 403 `Admin access required`. \
-  Enforced in: `services/execution/app/routers/executions.py` (`list_run_commands`, `_authorize_run_read`); `services/execution/app/services/execution_service.py` (`list_command_log`) \
-  Pinned by: `services/execution/tests/test_command_log_acl.py` (`test_admin_can_read_any_run`, `test_non_admin_owner_can_read`, `test_non_admin_non_owner_rejected`, `test_non_admin_run_without_reservation_rejected`, `test_reservations_service_error_is_closed_by_default`); `services/execution/tests/test_router_direct.py` (`test_list_run_commands_404_when_run_missing`, `test_list_run_commands_admin_returns_empty`); `services/execution/tests/test_command_log.py` (`test_get_run_commands_admin`, `test_get_run_commands_not_found`)
+  ownership check of CFG-RUN-1 (403 `Reservation not owned by caller`) and whose device
+  the caller may see under the visibility answer of CFG-RUN-3; a run on a device
+  outside it answers byte for byte as an unknown run (404 `Execution run not found`),
+  and an unanswerable lookup is the 503 of CFG-RUN-3. A run with no reservation is 403
+  `Admin access required`. \
+  Enforced in: `services/execution/app/routers/executions.py` (`list_run_commands`, `_authorize_run_read`); `services/execution/app/services/device_visibility.py` (`resolve_caller_visibility`); `services/execution/app/services/execution_service.py` (`list_command_log`) \
+  Pinned by: `services/execution/tests/test_command_log_acl.py` (`test_admin_can_read_any_run`, `test_non_admin_owner_can_read`, `test_non_admin_non_owner_rejected`, `test_non_admin_run_without_reservation_rejected`, `test_reservations_service_error_is_closed_by_default`); `services/execution/tests/test_router_direct.py` (`test_list_run_commands_404_when_run_missing`, `test_list_run_commands_admin_returns_empty`); `services/execution/tests/test_command_log.py` (`test_get_run_commands_admin`, `test_get_run_commands_not_found`); `services/execution/tests/test_run_reads_device_visibility.py` (`test_owner_reads_transcript_of_visible_run`, `test_hidden_run_transcript_answers_exactly_like_an_unknown_run`, `test_transcript_read_fails_closed_when_visibility_unanswerable`, `test_admin_reads_any_transcript_without_a_lookup`)
 
 **Out of scope.** The golden-transcript regression tests of the checked-in drivers
 (`services/execution/tests/test_golden_transcripts.py`), which pin driver output rather
@@ -1255,7 +1265,7 @@ status.
 | 404 | `Apply job not found` | an unknown job, or a job of a hidden device on the read | CFG-AUTH-5, CFG-JOB-9, CFG-JOB-10, CFG-JOB-11 |
 | 404 | `Driver package not found` | the schema proxy for an unknown driver | CFG-SCHEMA-9 |
 | 404 | `Device <id> not found`, `Template <id> not found` | execution cannot find the device or its template | CFG-EXEC-4 |
-| 404 | `Execution run not found` | an unknown run | CFG-RUN-4, CFG-RUN-5, CFG-TX-5 |
+| 404 | `Execution run not found` | an unknown run, or, on a non-admin transcript read, a run on a device the caller may not see | CFG-RUN-4, CFG-RUN-5, CFG-TX-5 |
 | 400 | `Only failed or timed-out runs can be retried` | a retry of a run that is not `FAILED` or `TIMEOUT` | CFG-RUN-5 |
 | 409 | `{"error": "driver_cannot_configure", "connection_type", "driver", "message"}` | a push to a device whose driver cannot configure | CFG-GATE-2, CFG-GATE-4 |
 | 409 | `{"error": "device_has_no_driver", "message"}` | any execution action on a device with no driver | CFG-GATE-4 |
@@ -1276,6 +1286,7 @@ status.
 | 503 | `reservations service unreachable while checking active reservations` and the two sibling details | a restore whose guard cannot be answered | CFG-VER-13 |
 | 503 | `Failed to fetch device: <reason>`, `Failed to fetch template: <reason>` (an upstream status, a class name, or a malformed-body note; never upstream text) | execution cannot read the device or template | CFG-EXEC-4 |
 | 503 | the visibility lookup's own detail (`inventory.md`) | a non-admin read whose visibility lookup fails | CFG-AUTH-5 |
+| 503 | `Could not verify device visibility; nothing was returned. Retry the request.` | a non-admin run list or transcript read whose visibility lookup cannot be answered | CFG-RUN-3, CFG-TX-5 |
 
 ## 10. Interactions with other services
 
@@ -1291,6 +1302,7 @@ status.
 | inventory to execution | execution | `POST /execute/internal` (`X-Internal-Token`, 30 s) | a scheduled job | the job is `failed` (CFG-SCHED-9) |
 | execution to acl | acl | `POST /check` with the caller's token, 5 s | a non-admin `configure` | fail closed: 403 (CFG-EXEC-1) |
 | execution to reservations | reservations | `GET /{id}` with the caller's token, 5 s | run list and transcript ownership | fail closed: 403 (CFG-RUN-1, CFG-TX-5) |
+| execution to inventory | inventory | `GET /device-groups/visible-devices?user_id` with the caller's token, 10 s | a non-admin's run list and transcript read | fail closed: 503 (CFG-RUN-3, CFG-TX-5) |
 | execution to inventory | inventory | `GET /devices/{id}/internal`, `GET /templates/{id}/internal` (`X-Internal-Token`, 10 s) | the device and template of an action | 404 is relayed; anything else, a body that is not a JSON object included, 503 (CFG-EXEC-4) |
 | execution to inventory | inventory | `GET /drivers/{id}/internal-download` (`X-Internal-Token`, 30 s) | the driver archive on a cache miss | the run is `FAILED` with `driver load failed: <ClassName>` (CFG-LOAD-2, CFG-EXEC-9) |
 | execution to a driver | the driver package | a sandboxed subprocess | every driver method | the run records the failure (CFG-SBX-5, CFG-SBX-7, CFG-RUNSTATE-4) |
@@ -1371,6 +1383,5 @@ that should have a test are tracked in #1100.
 - CFG-JOB-13: confirm repeats no schedule-time check.
 - CFG-EXEC-3: the body's reservation and options are taken as sent.
 - CFG-EXEC-8: `method_kwargs` stored on the run.
-- CFG-RUN-3: an owner's list holds every run of the reservation.
 - CFG-DRY-4: the dry-run declaration is not verified.
 - CFG-SBX-9: no isolation beyond resource limits.
