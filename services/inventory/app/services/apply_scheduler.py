@@ -37,7 +37,12 @@ from app.config import settings
 from app.models.device import Device
 from app.models.device_config_apply_job import DeviceConfigApplyJob
 from app.models.device_config_version import DeviceConfigVersion
-from app.services.apply_outcome import judge_success_answer, move_current_config_pointer
+from app.services.apply_outcome import (
+    judge_success_answer,
+    move_current_config_pointer,
+    refusal_error,
+    unreachable_error,
+)
 from app.services.published_schema import driver_for_device
 
 logger = logging.getLogger(__name__)
@@ -158,13 +163,11 @@ async def _post_internal_execute(
     try:
         resp = await client.post(url, json=body, headers=headers, timeout=30.0)
     except httpx.HTTPError as exc:
-        return "failed", None, f"execution unreachable: {exc}"
+        return "failed", None, unreachable_error(exc)
     if resp.status_code >= 400:
-        try:
-            detail = resp.json().get("detail", resp.text)
-        except ValueError:
-            detail = resp.text
-        return "failed", None, f"{resp.status_code} {detail}"
+        # The job row's error is HERD-authored text only (issue #1093), the
+        # same text the immediate apply returns.
+        return "failed", None, refusal_error(resp)
     # One success rule for both apply paths (issue #1094, apply_outcome): a 2xx
     # is a success only with a JSON object whose run status is SUCCESS; a missing
     # status is never a success (issue #720).

@@ -439,7 +439,7 @@ async def test_apply_calls_execution_with_method_kwargs(client):
 
 
 @pytest.mark.asyncio
-async def test_apply_surfaces_403_verbatim(user_client):
+async def test_apply_reports_execution_403_by_status_only(user_client):
     """Non-admin /execute returns 403; apply should mark the result failed."""
     # Create device + config under admin first by switching overrides.
     app.dependency_overrides[get_current_user_payload] = override_admin
@@ -488,8 +488,8 @@ async def test_apply_surfaces_403_verbatim(user_client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "failed"
-    assert "403" in body["error"]
-    assert "Admin access required" in body["error"]
+    # The status only (issue #1093): execution's plain string detail is not relayed.
+    assert body["error"] == "execution answered HTTP 403"
 
 
 @pytest.mark.asyncio

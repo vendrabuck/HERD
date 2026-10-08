@@ -719,7 +719,8 @@ async def test_post_internal_execute_http_error(monkeypatch):
     status, run_id, error = await _post_internal_execute(client, _make_job(), {"vlan": 1})
     assert status == "failed"
     assert run_id is None
-    assert "unreachable" in error
+    # Class name only (issue #1093): the exception text never reaches the row.
+    assert error == "execution service unreachable (ConnectError)"
 
 
 @pytest.mark.asyncio
@@ -734,7 +735,37 @@ async def test_post_internal_execute_error_body_not_json(monkeypatch):
 
     status, run_id, error = await _post_internal_execute(_Client(), _make_job(), {})
     assert status == "failed"
-    assert error.startswith("503")
+    assert error == "execution answered HTTP 503"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        (
+            {"detail": {"error": "driver_cannot_configure", "message": "No configure method."}},
+            "execution answered HTTP 409: No configure method.",
+        ),
+        ({"detail": "Failed to fetch device: http://inventory:8000 refused"}, None),
+    ],
+)
+async def test_post_internal_execute_refusal_stores_herd_text_only(monkeypatch, body, expected):
+    """The job row's error is the status plus a structured detail's message,
+    never a plain upstream string (issue #1093)."""
+    import httpx
+
+    monkeypatch.setattr(
+        "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
+    )
+
+    class _Client:
+        async def post(self, url, json=None, headers=None, timeout=None):
+            return httpx.Response(409, json=body)
+
+    status, run_id, error = await _post_internal_execute(_Client(), _make_job(), {})
+    assert status == "failed"
+    assert run_id is None
+    assert error == (expected or "execution answered HTTP 409")
 
 
 @pytest.mark.asyncio

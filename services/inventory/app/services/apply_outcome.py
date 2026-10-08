@@ -16,6 +16,7 @@ execution endpoint family, so they must agree on two questions:
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 
@@ -24,9 +25,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.device import Device
 
+logger = logging.getLogger(__name__)
+
 # Pinned (issues #720, #1094): tests match on these exact strings.
 MALFORMED_ANSWER_ERROR = "execution returned malformed JSON"
 NON_SUCCESS_ERROR = "execution returned non-success status"
+
+# Logged upstream text is capped so a large error page cannot flood the log.
+_LOGGED_BODY_LIMIT = 2000
 
 
 @dataclass(frozen=True)
@@ -90,3 +96,42 @@ async def move_current_config_pointer(
         .values(current_config_version_id=version_id)
         .execution_options(synchronize_session=False)
     )
+
+
+def unreachable_error(exc: BaseException) -> str:
+    """The stored and returned text for a transport error reaching execution.
+
+    Issue #1093: an httpx exception's text carries the internal execution URL,
+    so rows and answers get the class name only; the full text goes to the log
+    message.
+    """
+    logger.warning("config apply: execution service unreachable: %r", exc)
+    return f"execution service unreachable ({type(exc).__name__})"
+
+
+def refusal_error(resp) -> str:
+    """The stored and returned text for an execution answer of 400 or more.
+
+    Issue #1093: never the upstream body. The text is the status, plus the
+    `message` of a structured detail object (such as `driver_cannot_configure`
+    or `device_has_no_driver`), which execution authors for the operator. A
+    plain string detail, a validation list, or a non-JSON body adds nothing;
+    the raw body goes to the log message.
+    """
+    text = f"execution answered HTTP {resp.status_code}"
+    raw = getattr(resp, "text", "")
+    logger.warning(
+        "config apply: execution answered HTTP %s: %s",
+        resp.status_code,
+        str(raw)[:_LOGGED_BODY_LIMIT],
+    )
+    try:
+        data = resp.json()
+    except ValueError:
+        return text
+    detail = data.get("detail") if isinstance(data, dict) else None
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        if isinstance(message, str) and message:
+            return f"{text}: {message}"
+    return text

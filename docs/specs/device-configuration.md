@@ -517,11 +517,14 @@ versions to the device immediately and sees whether the push worked.
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_apply_calls_execution_with_method_kwargs`)
 - **CFG-APPLY-2.** Every execution outcome answers 200
   `{version_id, run_id, status, error}`: a transport error is `failed` with
-  `execution service unreachable: <exception text>`, and an execution status of 400 or
-  more is `failed` with `<status> <detail>`, the detail taken from the JSON body or the
-  raw text. Known gap, see #1093. \
-  Enforced in: `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
-  Pinned by: `services/inventory/tests/test_router_edge_cases.py` (`test_apply_handles_execution_transport_error`, `test_apply_handles_non_json_error_body`); `services/inventory/tests/test_device_configs.py` (`test_apply_surfaces_403_verbatim`)
+  `execution service unreachable (<ClassName>)`, and an execution status of 400 or more
+  is `failed` with `execution answered HTTP <status>`, followed by `: <message>` only
+  when the detail is an object carrying a non-empty string `message` (the structured
+  `driver_cannot_configure` and `device_has_no_driver` refusals). A plain string detail,
+  a validation list, and a body that is not JSON are never relayed; the exception text
+  and the raw body go to the log message only. \
+  Enforced in: `services/inventory/app/routers/device_configs.py` (`apply_config_version`); `services/inventory/app/services/apply_outcome.py` (`unreachable_error`, `refusal_error`) \
+  Pinned by: `services/inventory/tests/test_router_edge_cases.py` (`test_apply_handles_execution_transport_error`, `test_apply_handles_non_json_error_body`); `services/inventory/tests/test_device_configs.py` (`test_apply_reports_execution_403_by_status_only`); `services/inventory/tests/test_apply_outcome_errors.py` (`test_unreachable_error_is_the_class_name_only`, `test_unreachable_error_names_each_transport_class`, `test_refusal_error_carries_status_and_structured_message_only`, `test_refusal_error_non_json_body_is_status_only_and_logged`)
 - **CFG-APPLY-3.** Both apply paths judge a 2xx answer by one rule: only a JSON object
   whose run `status` is `SUCCESS` (any case) is a success. A missing or null status is
   `failed` with `execution returned non-success status`, and a body that is not JSON, or
@@ -743,13 +746,14 @@ re-checking at fire time that the job may still run.
   Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_post_internal_execute`) \
   Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_post_internal_execute_sends_the_job_reservation_id`)
 - **CFG-SCHED-9.** The job is `success` only for a 2xx JSON answer whose `status` is
-  `SUCCESS` in any case. Otherwise it is `failed` with `execution unreachable: <text>` (a
-  transport error), `<status> <detail>` (400 or more),
+  `SUCCESS` in any case. Otherwise it is `failed` with
+  `execution service unreachable (<ClassName>)` (a transport error), the immediate
+  apply's refusal text (400 or more, CFG-APPLY-2),
   `execution returned malformed JSON`, or the run's `error`, else
   `execution returned non-success status` (a missing or null status included). A run id
-  that is not a UUID is stored as null. Known gap, see #1093. \
-  Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_post_internal_execute`) \
-  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_post_internal_execute_http_error`, `test_post_internal_execute_error_body_not_json`, `test_post_internal_execute_success_body_not_json`, `test_post_internal_execute_malformed_run_id_degrades_to_none`, `test_post_internal_execute_non_success_status`, `test_post_internal_execute_missing_status_records_failed`, `test_post_internal_execute_null_status_records_failed`)
+  that is not a UUID is stored as null. \
+  Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_post_internal_execute`); `services/inventory/app/services/apply_outcome.py` (`unreachable_error`, `refusal_error`) \
+  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_post_internal_execute_http_error`, `test_post_internal_execute_error_body_not_json`, `test_post_internal_execute_refusal_stores_herd_text_only`, `test_post_internal_execute_success_body_not_json`, `test_post_internal_execute_malformed_run_id_degrades_to_none`, `test_post_internal_execute_non_success_status`, `test_post_internal_execute_missing_status_records_failed`, `test_post_internal_execute_null_status_records_failed`)
 - **CFG-SCHED-10.** A successful job sets its version's `last_apply_run_id` when the
   answer named a run, and, unless it was a dry run, moves the device's current config
   pointer to the version, the same record an immediate apply writes (CFG-APPLY-6). A
@@ -1308,8 +1312,8 @@ confirmed by reading only.
 ### Open defects
 
 - #1091 (CFG-RUN-6): retrying a failed dry run pushes the configuration for real.
-- #1093 (CFG-APPLY-2, CFG-SCHED-9, CFG-EXEC-4): exception and upstream text reach job
-  rows and API answers.
+- #1093 (CFG-EXEC-4): exception and upstream text reach execution's fetch answers (the
+  inventory side, CFG-APPLY-2 and CFG-SCHED-9, is fixed).
 - #1096 (CFG-EXEC-1): execution's `_user_has_acl_manage` still raises on a 200 whose
   JSON body is not an object; the inventory and `herd_common` sites are fixed.
 - #1097 (CFG-LOAD-6, CFG-RUNSTATE-5): concurrent first loads of a driver fail, and a run

@@ -28,7 +28,12 @@ from app.schemas.device_config import (
     DeviceConfigVersionResponse,
     PaginatedDeviceConfigVersions,
 )
-from app.services.apply_outcome import judge_success_answer, move_current_config_pointer
+from app.services.apply_outcome import (
+    judge_success_answer,
+    move_current_config_pointer,
+    refusal_error,
+    unreachable_error,
+)
 from app.services.config_diff import render_unified_diff
 from app.services.device_visibility import check_device_read_visibility
 from app.services.manage_guard import (
@@ -473,19 +478,17 @@ async def apply_config_version(
             version_id=version.id,
             run_id=None,
             status="failed",
-            error=f"execution service unreachable: {exc}",
+            error=unreachable_error(exc),
         )
 
     if resp.status_code >= 400:
-        try:
-            detail = resp.json().get("detail", resp.text)
-        except ValueError:
-            detail = resp.text
+        # HERD-authored text only (issue #1093): the status, plus a structured
+        # detail's message; the raw body is logged, never returned.
         return DeviceConfigApplyResponse(
             version_id=version.id,
             run_id=None,
             status="failed",
-            error=f"{resp.status_code} {detail}",
+            error=refusal_error(resp),
         )
 
     # One success rule for both apply paths (issue #1094, apply_outcome): a 2xx
