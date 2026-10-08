@@ -39,7 +39,7 @@ restates the full permission matrix, an ADR's argument, or a how-to.
 | Provisioning and wiring | [`provisioning-and-wiring.md`](provisioning-and-wiring.md) | Written |
 | Dynamic resources | [`dynamic-resources.md`](dynamic-resources.md) | Written |
 | AI features | [`ai-features.md`](ai-features.md) | Written |
-| Device configuration | `device-configuration.md` | Not written |
+| Device configuration | [`device-configuration.md`](device-configuration.md) | Written |
 | Operations and observability | [`operations-and-observability.md`](operations-and-observability.md) | Written |
 | Integration | [`integration.md`](integration.md) | Written |
 
