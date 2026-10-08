@@ -1117,7 +1117,9 @@ caller.
   Pinned by: `services/reservations/tests/test_wiring_changed_staging.py` (`test_heal_staging_carries_null_delta`)
 - **RES-EVENT-4.** NATS being unreachable at startup is logged and does not stop the
   service or its background tasks; events wait in the outbox and the relay picks up a
-  later connection. \
+  later connection. Known gap, see #1083: with no broker reachable the connect call
+  retries and never raises, so startup waits for NATS (`operations-and-observability.md`,
+  OPS-NATS-1). \
   Enforced in: `services/reservations/app/main.py` (`lifespan`) \
   Pinned by: `services/reservations/tests/test_main_task_lifecycle.py` (`test_lifespan_creates_and_cancels_expiration_and_purpose_classify_tasks`)
 
@@ -1308,7 +1310,8 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
 
 ### Open defects
 
-None at present.
+- #1083, RES-EVENT-4: with NATS unreachable at boot the service waits in startup instead
+  of starting without it.
 
 
 ### Limits by decision
