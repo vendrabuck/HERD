@@ -9,7 +9,7 @@ the liveness probe.
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from herd_common.auth import make_auth_dependencies
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +18,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.device_health_status import DeviceHealthStatus
 from app.schemas.health import DeviceHealthStatusResponse, PaginatedDeviceHealthResponse
+from app.services import device_visibility
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,8 @@ router = APIRouter(tags=["health"])
 async def get_device_health(
     device_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: dict = Depends(get_current_user_payload),
+    payload: dict = Depends(get_current_user_payload),
+    authorization: str | None = Header(None),
 ):
     """Return the current health snapshot for a device.
 
@@ -41,8 +43,17 @@ async def get_device_health(
     frontend health badge does not need per-device error handling on
     devices that have not been polled yet (poll_interval_seconds=NULL,
     or scheduler hasn't ticked since the device was added).
+
+    A non-admin may read only a device inside their device-group visibility
+    (issue #1108), resolved through the one execution visibility helper; any
+    other device answers with the same synthesized record an unknown id gets,
+    so the answer says nothing about whether the device exists or was polled.
+    An unanswerable visibility lookup is 503. Admins are unfiltered.
     """
-    row = await db.get(DeviceHealthStatus, device_id)
+    visible = await device_visibility.resolve_caller_visibility(payload, authorization)
+    row = None
+    if visible is None or device_id in visible:
+        row = await db.get(DeviceHealthStatus, device_id)
     if row is None:
         return DeviceHealthStatusResponse(
             device_id=device_id,

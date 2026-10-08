@@ -57,7 +57,7 @@ is issued with the lower role.
 | View execution runs (unscoped) | | yes | yes |
 | View execution runs for an owned reservation (runs on devices the user can see) | yes | yes | yes |
 | Execute drivers and retry failed runs | | yes | yes |
-| View device health snapshot (single device) | yes | yes | yes |
+| View device health snapshot (single device; users: devices they can see) | yes | yes | yes |
 | List device health snapshots (all devices) | | yes | yes |
 | Set `poll_interval_seconds` on a device or template | | yes | yes |
 | Set a reservation's purpose category | creator | yes | yes |
@@ -1433,7 +1433,11 @@ Authorization: Bearer <token>
 
 Returns the periodic-poll snapshot for a device: `last_polled_at`, `last_status`
 (UNKNOWN, HEALTHY, DEGRADED, UNREACHABLE), `last_run_id`, `consecutive_failures`,
-`next_poll_at`. Available to any authenticated user.
+`next_poll_at`. Available to any authenticated user; a non-admin gets a device's
+real snapshot only when the device is inside their device-group visibility (which
+execution asks inventory with the caller's JWT), and any other device answers
+exactly as an unpolled one (below), so the answer does not reveal whether a hidden
+device exists. A visibility lookup inventory cannot answer is 503.
 
 On miss (device has not been polled yet), returns a synthesized 200 with
 `last_status=UNKNOWN` and all other fields null. This is deliberate: the frontend

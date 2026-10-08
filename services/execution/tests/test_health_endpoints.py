@@ -9,12 +9,16 @@ Exercises:
 
 import uuid
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from app.database import Base, get_db
 from app.main import app
 from app.models.device_health_status import DeviceHealthStatus
 from app.routers.health import get_current_user_payload, require_admin
+from app.services import device_visibility
+from app.services.device_visibility import VISIBILITY_UNAVAILABLE_DETAIL
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -113,12 +117,112 @@ async def test_get_health_returns_persisted_row(admin_client):
 
 
 @pytest.mark.asyncio
-async def test_get_health_available_to_non_admin(user_client):
-    """Any authenticated user can read individual health snapshots."""
+async def test_get_health_available_to_non_admin(user_client, monkeypatch):
+    """A non-admin reads the snapshot of a device inside their visibility."""
+    device_id = uuid.uuid4()
+    await _seed_row(device_id, last_status="DEGRADED", consecutive_failures=3)
+    lookup = AsyncMock(return_value={device_id})
+    monkeypatch.setattr(device_visibility, "fetch_visible_device_ids", lookup)
+    resp = await user_client.get(
+        f"/device-health/{device_id}", headers={"Authorization": "Bearer user-token"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["last_status"] == "DEGRADED"
+    assert resp.json()["consecutive_failures"] == 3
+    # One lookup, with the caller's own bearer.
+    lookup.assert_awaited_once()
+    assert lookup.await_args.args[1] == "Bearer user-token"
+
+
+@pytest.mark.asyncio
+async def test_hidden_polled_device_health_answers_exactly_like_an_unknown_device(
+    user_client, monkeypatch
+):
+    """Issue #1108: a polled device outside the caller's visibility answers byte for
+    byte as the same id answers once it has no snapshot at all."""
+    device_id = uuid.uuid4()
+    await _seed_row(device_id, last_status="UNREACHABLE", consecutive_failures=7)
+    monkeypatch.setattr(
+        device_visibility, "fetch_visible_device_ids", AsyncMock(return_value={uuid.uuid4()})
+    )
+    hidden = await user_client.get(f"/device-health/{device_id}")
+
+    async with TestSessionLocal() as db:
+        await db.delete(await db.get(DeviceHealthStatus, device_id))
+        await db.commit()
+    unknown = await user_client.get(f"/device-health/{device_id}")
+
+    assert hidden.status_code == unknown.status_code == 200
+    assert hidden.content == unknown.content
+    assert hidden.json()["last_status"] == "UNKNOWN"
+    assert hidden.json()["consecutive_failures"] == 0
+
+
+@pytest.mark.asyncio
+async def test_get_health_visible_set_empty_hides_every_snapshot(user_client, monkeypatch):
+    device_id = uuid.uuid4()
+    await _seed_row(device_id, last_status="DEGRADED")
+    monkeypatch.setattr(
+        device_visibility, "fetch_visible_device_ids", AsyncMock(return_value=set())
+    )
+    resp = await user_client.get(f"/device-health/{device_id}")
+    assert resp.status_code == 200
+    assert resp.json()["last_status"] == "UNKNOWN"
+
+
+_RealAsyncClient = httpx.AsyncClient
+
+
+def _transport_failure(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("inventory down")
+
+
+def _non_200(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(502, json={"detail": "bad gateway"})
+
+
+def _wrong_shape(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json={"device_ids": "all"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler", [_transport_failure, _non_200, _wrong_shape])
+async def test_get_health_fails_closed_when_visibility_unanswerable(
+    user_client, monkeypatch, handler
+):
+    device_id = uuid.uuid4()
+    await _seed_row(device_id)
+
+    def factory(*args, **kwargs):
+        return _RealAsyncClient(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(device_visibility.httpx, "AsyncClient", factory)
+    resp = await user_client.get(
+        f"/device-health/{device_id}", headers={"Authorization": "Bearer user-token"}
+    )
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": VISIBILITY_UNAVAILABLE_DETAIL}
+
+
+@pytest.mark.asyncio
+async def test_get_health_non_admin_without_token_fails_closed(user_client):
     device_id = uuid.uuid4()
     await _seed_row(device_id)
     resp = await user_client.get(f"/device-health/{device_id}")
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": VISIBILITY_UNAVAILABLE_DETAIL}
+
+
+@pytest.mark.asyncio
+async def test_get_health_admin_sees_every_row_without_a_lookup(admin_client, monkeypatch):
+    device_id = uuid.uuid4()
+    await _seed_row(device_id, last_status="DEGRADED")
+    lookup = AsyncMock(side_effect=AssertionError("admins are never filtered"))
+    monkeypatch.setattr(device_visibility, "fetch_visible_device_ids", lookup)
+    resp = await admin_client.get(f"/device-health/{device_id}")
     assert resp.status_code == 200
+    assert resp.json()["last_status"] == "DEGRADED"
+    lookup.assert_not_awaited()
 
 
 # --- GET /device-health (list) ---
