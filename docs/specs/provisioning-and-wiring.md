@@ -754,11 +754,18 @@ WIRE-VLAN-4.
   Pinned by: `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_scope_grows_with_no_membership_delta_defines_new_transit_switch`, `test_heal_after_converged_apply_is_a_no_op`)
 - **WIRE-VLAN-11.** When an allocation is released, `delete_vlan` runs on each switch in
   its `defined_switch_ids`, unless another ACTIVE allocation now holds the same number in
-  the same fabric, in which case none runs; a failed delete is logged, the allocation
-  stays released, and only the switches whose delete succeeded leave
-  `defined_switch_ids`. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_release_orphaned_allocations`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_delete_on_last_free_per_switch`, `test_delete_skipped_when_vlan_reallocated_on_fabric`, `test_delete_failure_logs_and_continues`); `tests/integration/test_vlan_assignment.py` (`test_vlan_released_on_reservation_cancel`)
+  the current connected component of any of those switches, in which case none runs.
+  Supersession is judged on the current cabling graph by the rule allocation uses
+  (WIRE-VLAN-2): the other allocation reaches a switch's current fabric id through its
+  stored id or the current fabric of any switch it is anchored at; the released row's own
+  stored fabric id is never compared. With no other ACTIVE allocation holding the number,
+  cabling is not asked. When a fabric lookup cannot be answered, no delete runs for that
+  allocation, its switches stay in `defined_switch_ids`, the log action is
+  `vlan_delete_unjudged`, and the pass continues with the next allocation. A failed
+  delete is logged, the allocation stays released, and only the switches whose delete
+  succeeded leave `defined_switch_ids`. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_release_orphaned_allocations`); `services/execution/app/services/vlan_service.py` (`find_superseding_allocation`, `allocation_reaches`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_delete_on_last_free_per_switch`, `test_delete_skipped_when_vlan_reallocated_on_fabric`, `test_delete_failure_logs_and_continues`, `test_delete_skipped_when_a_cable_joined_the_switch_to_the_winners_component`, `test_delete_runs_when_the_components_split_after_the_winner_was_allocated`, `test_supersession_lookup_failure_skips_the_delete_and_continues`, `test_no_same_number_allocation_asks_cabling_nothing`); `tests/integration/test_vlan_assignment.py` (`test_vlan_released_on_reservation_cancel`)
 
 **Out of scope.** How cabling computes a fabric (`topology.md`).
 
@@ -1330,9 +1337,12 @@ None at present.
   (WIRE-LEDGER-16). Recorded in the docstring of `_reattempt_l3_rows`.
 - VLAN uniqueness is checked when an allocation is made (WIRE-VLAN-2). A cable added
   later that joins two components already holding the same number, or removed under a
-  live allocation, is not re-checked; there is no reconcile. The release supersession
-  guard (WIRE-VLAN-11) still compares stored fabric ids. Recorded in issue #1003 and the
-  module docstring of `vlan_service.py`.
+  live allocation, is not re-checked; there is no reconcile. Recorded in issue #1003 and
+  the module docstring of `vlan_service.py`.
+- A release whose supersession cannot be judged (cabling unreachable while another
+  allocation holds the number) leaves the VLAN defined on its switches (WIRE-VLAN-11);
+  nothing re-drives that delete. Recorded in issue #1065 and the docstring of
+  `_release_orphaned_allocations`.
 
 ### Rules with no test
 

@@ -642,7 +642,8 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
 - **AI-CONV-13.** While `AI_PURPOSE_CLASSIFICATION_ENABLED` and
   `AI_PURPOSE_INCLUDE_TRANSCRIPTS` are both on, the sweeper keeps an idle conversation
   whose reservation is not terminal, or is terminal with `purpose_classification_pending`
-  true (requested and no suggestion yet), so the end pass can read the transcript
+  true (requested, no suggestion yet, and the sweep's attempts below the cap, RES-INTERNAL-7
+  in `reservations.md`), so the end pass can read the transcript
   (AI-PURPOSE-6). It asks reservations `GET /internal/{id}` with the internal token once
   per reservation per cycle, 8 at a time, after its read transaction ends, and fails
   closed: a transport error, a missing token, a non-200 other than 404, a malformed body,
@@ -650,7 +651,7 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   `conversation_retention_lookup_failed`; a 404 releases it. With either flag off no
   lookup is made and AI-CONV-9 applies unchanged (issue #1039). \
   Enforced in: `services/ai-orchestrator/app/services/conversation_repo.py` (`expire_idle`); `services/ai-orchestrator/app/services/transcript_retention.py` (`reservation_keeps_transcript`, `transcripts_owed_to_classifier`) \
-  Pinned by: `services/ai-orchestrator/tests/test_transcript_retention.py` (`test_a_live_reservation_keeps_its_transcript`, `test_a_terminal_reservation_awaiting_classification_keeps_its_transcript`, `test_a_terminal_reservation_already_classified_releases_its_transcript`, `test_an_unknown_reservation_releases_its_transcript`, `test_an_unclear_answer_keeps_the_transcript`, `test_an_unreachable_reservations_service_keeps_the_transcript`, `test_a_missing_internal_token_keeps_the_transcript`, `test_the_sweep_keeps_only_what_the_classifier_still_owes`, `test_the_sweep_asks_once_per_reservation`, `test_without_a_transcript_reader_the_plain_ttl_applies_with_no_lookup`, `test_a_failed_lookup_is_logged_by_reason_and_status`)
+  Pinned by: `services/ai-orchestrator/tests/test_transcript_retention.py` (`test_a_live_reservation_keeps_its_transcript`, `test_a_terminal_reservation_awaiting_classification_keeps_its_transcript`, `test_a_terminal_reservation_already_classified_releases_its_transcript`, `test_an_unknown_reservation_releases_its_transcript`, `test_an_unclear_answer_keeps_the_transcript`, `test_an_unreachable_reservations_service_keeps_the_transcript`, `test_a_missing_internal_token_keeps_the_transcript`, `test_the_sweep_keeps_only_what_the_classifier_still_owes`, `test_the_sweep_asks_once_per_reservation`, `test_without_a_transcript_reader_the_plain_ttl_applies_with_no_lookup`, `test_a_failed_lookup_is_logged_by_reason_and_status`, `test_the_sweep_releases_a_transcript_whose_classification_hit_the_attempt_cap`)
 - **AI-CONV-10.** `ASSISTANT_CONVERSATION_TTL_HOURS` of 0 or less is refused at startup. \
   Enforced in: `services/ai-orchestrator/app/config.py` (`_validate_assistant_conversation_ttl_hours`) \
   Pinned by: `services/ai-orchestrator/tests/test_config.py` (`test_zero_or_negative_ttl_hours_rejected`)
@@ -1575,10 +1576,10 @@ None at this commit: #1039 is resolved by AI-CONV-13.
   DNS rebinding window (AI-DOCS-11). Recorded as a known limitation in ADR 0015 (decision
   3) and [AI_ASSISTANT.md](../AI_ASSISTANT.md); the web source ships disabled and behind an
   operator allowlist.
-- A terminal reservation whose classification never yields a suggestion (attempt cap
-  reached, no Classify now) stays pending, so its idle conversations are kept until it is
-  classified or either transcript flag is turned off (AI-CONV-13): Lane's decision on
-  #1039 (E(a)), recorded in [AI_PURPOSE_CLASSIFICATION.md](../AI_PURPOSE_CLASSIFICATION.md).
+- A terminal reservation whose classification hit the attempt cap is no longer pending,
+  so its idle conversations are deleted after the TTL (AI-CONV-13, issue #1067); a later
+  Classify now on that row runs without the transcript. Recorded in
+  [AI_PURPOSE_CLASSIFICATION.md](../AI_PURPOSE_CLASSIFICATION.md).
 - `GET /status` is unauthenticated and its construction probe is cached for 30 seconds
   (AI-PROV-5, AI-PROV-7): issue #606 and the docstring of `_ProviderConstructionCache`.
 - Usage rows are written only when a quota is configured (AI-QUOTA-1): the comment on

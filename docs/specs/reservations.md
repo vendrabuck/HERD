@@ -1162,12 +1162,15 @@ user in the flow. The routes, callers, and answers are in section 7.
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_internal_status`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_active_no_collision_with_int_status_path`, `test_internal_status_no_collision_with_user_get`)
 - **RES-INTERNAL-7.** `purpose_classification_pending` is true only when
-  `purpose_classify_requested_at` is set and `purpose_suggestion` is null, the same
-  predicate the purpose sweep selects on (without its attempt cap). The AI orchestrator's
+  `purpose_classify_requested_at` is set, `purpose_suggestion` is null, and
+  `purpose_classify_attempts` is below `PURPOSE_CLASSIFY_MAX_ATTEMPTS`: the same
+  predicate the purpose sweep selects on, cap included (issue #1067). A capped row is
+  therefore not pending; the admin backfill resets its attempts and makes it pending
+  again, and the manual Classify now ignores the cap either way. The AI orchestrator's
   idle-conversation sweeper reads it to keep a transcript the classifier has yet to read
   (issue #1039, `ai-features.md` AI-CONV-13). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_internal_status`); `services/reservations/app/schemas/reservation.py` (`ReservationInternalStatus`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_status_reports_purpose_classification_pending`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_status_reports_purpose_classification_pending`, `test_internal_status_pending_is_false_once_the_attempt_cap_is_reached`, `test_internal_status_pending_again_after_backfill_resets_a_capped_row`)
 
 - **RES-INTERNAL-8.** `held-devices` lists, once each and sorted, every device of the
   user's `PENDING_PROVISION` and `ACTIVE` reservations (the statuses that hold devices),

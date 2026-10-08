@@ -309,10 +309,11 @@ class ReservationInternalStatus(BaseModel):
     No PII; no device list.
 
     `purpose_classification_pending` is true while the end-of-reservation
-    purpose classification is owed and has not produced a suggestion
-    (purpose_classify_requested_at set, purpose_suggestion null). The AI
-    orchestrator's idle-conversation sweeper reads it so it keeps a transcript
-    the classifier has yet to read (issue #1039).
+    purpose classification is owed and the purpose sweep will still try it
+    (purpose_classify_requested_at set, purpose_suggestion null, and
+    purpose_classify_attempts below purpose_classify_max_attempts, issue #1067).
+    The AI orchestrator's idle-conversation sweeper reads it so it keeps a
+    transcript the classifier has yet to read (issue #1039).
     """
 
     id: uuid.UUID

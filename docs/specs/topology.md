@@ -1190,9 +1190,14 @@ is the user guide.
   Enforced in: `services/cabling/app/services/bulk_service.py` (`topology_to_csv_rows`, `parse_csv_topologies`); `services/common/herd_common/csv_safety.py` (`csv_safe_cell`, `csv_unsafe_cell`) \
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_export_csv_neutralizes_formula_trigger_cells`, `test_export_then_import_csv_roundtrips_formula_name`)
 - **TOPO-BULK-6.** Import is open to any signed-in user; `dry_run=true` runs every check
-  and returns the full report but writes nothing. \
-  Enforced in: `services/cabling/app/routes/bulk.py` (`import_topologies_endpoint`); `services/cabling/app/services/bulk_service.py` (`import_topologies`) \
-  Pinned by: `services/cabling/tests/test_bulk.py` (`test_import_json_creates_topology`, `test_dry_run_writes_nothing`, `test_dry_run_update_writes_nothing`)
+  and returns the full report but writes nothing. The dry run is a rehearsal: every row
+  runs through the same create and update path as a committing import on a session whose
+  commits are savepoint releases inside one outer transaction that is always rolled back,
+  so a later row sees an earlier row's write (a new name repeated in one file reports
+  `create` then `update`) and the dry-run report equals the committing report row for row
+  on the same starting data. \
+  Enforced in: `services/cabling/app/routes/bulk.py` (`import_topologies_endpoint`); `services/cabling/app/services/bulk_service.py` (`import_topologies`, `_import_topology_rows`); `services/common/herd_common/rehearsal.py` (`rehearsal_session`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_import_json_creates_topology`, `test_dry_run_writes_nothing`, `test_dry_run_update_writes_nothing`, `test_dry_run_duplicate_new_name_matches_commit_row_for_row`, `test_dry_run_csv_matches_commit_row_for_row`); `services/common/tests/test_rehearsal.py` (`test_commits_are_visible_inside_and_discarded_after`, `test_rollback_returns_to_the_last_commit_only`, `test_an_exception_inside_still_rolls_everything_back`)
 - **TOPO-BULK-7.** JSON import takes an object with an `items` list or a bare list;
   invalid JSON, another shape, or a non-list `items` is 422 for the whole request. \
   Enforced in: `services/cabling/app/services/bulk_service.py` (`parse_json_topologies`) \
@@ -1223,8 +1228,9 @@ is the user guide.
   Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`) \
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_unreachable_edge_rejected_by_validator`); `services/cabling/tests/test_route_handlers_direct.py` (`test_import_validation_failure_rejects_row`, `test_import_route_reasons_included_in_reject_message`)
 - **TOPO-BULK-13.** A 503 raised while judging a row (`l3_config_unavailable`) stops the
-  whole request with that 503; rows already processed keep their committed writes. \
-  Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`) \
+  whole request with that 503; on a committing import rows already processed keep their
+  committed writes, and on a dry run the rehearsal is rolled back as always. \
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`, `_import_topology_rows`) \
   Pinned by: `services/cabling/tests/test_route_handlers_direct.py` (`test_import_l3_config_unavailable_aborts_whole_request`)
 - **TOPO-BULK-14.** A row matches existing topologies by exact name, preferring the
   caller's own, else the earliest created; with no match it creates a topology owned by

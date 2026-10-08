@@ -766,6 +766,62 @@ async def test_internal_status_reports_purpose_classification_pending(
     assert resp.json()["purpose_classification_pending"] is pending
 
 
+async def _set_purpose_attempts(rid: str, attempts: int) -> None:
+    async with TestSessionLocal() as session:
+        row = await session.get(Reservation, uuid.UUID(rid))
+        row.purpose_classify_attempts = attempts
+        await session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("attempts_below_cap", "pending"), [(1, True), (0, False), (-1, False)])
+async def test_internal_status_pending_is_false_once_the_attempt_cap_is_reached(
+    internal_client, monkeypatch, attempts_below_cap, pending
+):
+    """Issue #1067: a requested row with no suggestion is pending only while the
+    sweep can still classify it (attempts below purpose_classify_max_attempts, the
+    sweep's own filter). At or over the cap the sweep never selects it again, so it
+    is reported not pending and the idle transcript sweeper may release it."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "purpose_classify_max_attempts", 3)
+    rid = await _insert_reservation_row(status=ReservationStatus.COMPLETED)
+    await _set_purpose_state(rid, requested=True, suggested=False)
+    await _set_purpose_attempts(rid, 3 - attempts_below_cap)
+    resp = await internal_client.get(
+        f"/internal/{rid}", headers={"X-Internal-Token": INTERNAL_TOKEN}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["purpose_classification_pending"] is pending
+
+
+@pytest.mark.asyncio
+async def test_internal_status_pending_again_after_backfill_resets_a_capped_row(
+    internal_client, monkeypatch
+):
+    """Issue #1067: the admin backfill resets a capped row's attempts, which makes
+    the sweep select it again, so the row reads pending again."""
+    from app.config import settings
+    from app.services.purpose_service import backfill_purpose_classification
+
+    monkeypatch.setattr(settings, "purpose_classify_max_attempts", 3)
+    rid = await _insert_reservation_row(status=ReservationStatus.COMPLETED)
+    await _set_purpose_state(rid, requested=True, suggested=False)
+    await _set_purpose_attempts(rid, 3)
+
+    async def _pending() -> bool:
+        resp = await internal_client.get(
+            f"/internal/{rid}", headers={"X-Internal-Token": INTERNAL_TOKEN}
+        )
+        assert resp.status_code == 200
+        return resp.json()["purpose_classification_pending"]
+
+    assert await _pending() is False
+    async with TestSessionLocal() as session:
+        assert await backfill_purpose_classification(session) == 1
+    assert await _pending() is True
+
+
 @pytest.mark.asyncio
 async def test_internal_status_bad_token_rejected(internal_client):
     rid = await _insert_reservation_row()

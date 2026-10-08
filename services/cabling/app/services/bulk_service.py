@@ -19,8 +19,11 @@ actor's own is matched before any other user's, so importing your own export
 never targets a same-named topology someone else created.
 
 Per-row error handling means one bad topology is rejected with a reason without
-aborting the batch. A dry_run import runs full parsing, name resolution, and
-validation and returns the per-row report without committing.
+aborting the batch. A dry_run import is a full rehearsal (issue #1064): every
+row runs through the same checks and writes as a committing import, on a
+`herd_common.rehearsal.rehearsal_session` whose outer transaction is always
+rolled back, so a later row sees an earlier row's write (a name repeated in one
+file reports `create` then `update`, as the commit does) and nothing is kept.
 
 Visibility (issue #908): the internal resolve-by-name call to inventory stays
 unfiltered (it still answers "does this name exist anywhere", the contract
@@ -47,6 +50,7 @@ from typing import Any
 
 from fastapi import HTTPException
 from herd_common.csv_safety import csv_safe_cell, csv_unsafe_cell
+from herd_common.rehearsal import rehearsal_session
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -369,8 +373,6 @@ async def import_topologies(
     else:
         raise HTTPException(status_code=422, detail="format must be 'csv' or 'json'")
 
-    report = _empty_report(dry_run)
-
     # Issue #908: resolve the caller's device visibility ONCE per request,
     # before any name is resolved or any row is judged, mirroring the #763
     # pattern on POST /topologies/{id}/validate. None for an admin (no
@@ -401,11 +403,36 @@ async def import_topologies(
             status_code=503, detail=f"could not resolve device names via inventory: {exc}"
         ) from exc
 
+    is_admin = actor_role in ("admin", "superadmin")
+    rows_args = (records, name_to_id, visible_ids, actor_id, actor_name, is_admin)
+    if dry_run:
+        # Issue #1064: the dry run is a rehearsal of the commit, not a
+        # separate code path, so its report equals the committing report row
+        # for row on the same starting data.
+        async with rehearsal_session(db) as rehearsal:
+            report = await _import_topology_rows(rehearsal, *rows_args)
+    else:
+        report = await _import_topology_rows(db, *rows_args)
+    report.dry_run = dry_run
+    return report
+
+
+async def _import_topology_rows(
+    db: AsyncSession,
+    records: list[dict[str, Any]],
+    name_to_id: dict[str, str],
+    visible_ids: set[uuid.UUID] | None,
+    actor_id: uuid.UUID,
+    actor_name: str,
+    is_admin: bool,
+) -> BulkImportReport:
+    """Run every topology row through the real create and update path on `db`
+    (the request session, or a rehearsal session for a dry run)."""
     # Local import of the validator to avoid a circular import at module load
     # (routes/topologies imports nothing from here, but keep the dependency one-way).
     from app.services.topology_validation import run_full_topology_validation
 
-    is_admin = actor_role in ("admin", "superadmin")
+    report = _empty_report(False)
 
     for index, rec in enumerate(records):
         name = (rec.get("name") or "").strip()
@@ -499,26 +526,25 @@ async def import_topologies(
             )
 
             if existing is None:
-                if not dry_run:
-                    topology = Topology(
-                        name=name,
-                        created_by=actor_id,
-                        owner_name=actor_name,
-                        canvas_data=rewritten,
-                    )
-                    db.add(topology)
-                    await db.flush()
-                    snapshot = TopologyVersion(
-                        topology_id=topology.id,
-                        version_number=1,
-                        canvas_data=rewritten,
-                        name=name,
-                        description="Imported via bulk import",
-                        created_by=actor_id,
-                        author_name=actor_name,
-                    )
-                    db.add(snapshot)
-                    await db.commit()
+                topology = Topology(
+                    name=name,
+                    created_by=actor_id,
+                    owner_name=actor_name,
+                    canvas_data=rewritten,
+                )
+                db.add(topology)
+                await db.flush()
+                snapshot = TopologyVersion(
+                    topology_id=topology.id,
+                    version_number=1,
+                    canvas_data=rewritten,
+                    name=name,
+                    description="Imported via bulk import",
+                    created_by=actor_id,
+                    author_name=actor_name,
+                )
+                db.add(snapshot)
+                await db.commit()
                 report.rows.append(RowResult(row=index, action="create", identity=name))
                 continue
 
@@ -563,7 +589,7 @@ async def import_topologies(
                     )
                     continue
 
-            if not dry_run and canvas_changed:
+            if canvas_changed:
                 existing.canvas_data = rewritten
                 existing.modified_by = actor_id
                 snapshot = TopologyVersion(
@@ -580,8 +606,7 @@ async def import_topologies(
                 await commit_with_new_version(db, existing, snapshot)
             report.rows.append(RowResult(row=index, action="update", identity=name))
         except HTTPException as exc:
-            if not dry_run:
-                await db.rollback()
+            await db.rollback()
             # S9 review fix, round 2: a 503 (l3_config_unavailable: inventory
             # could not be asked to judge this row's routing intent at all)
             # STOPS the import request from processing any further row, the
@@ -594,15 +619,15 @@ async def import_topologies(
             # (see the per-row `await db.commit()` above), so any row before
             # this one that created or updated a topology keeps that write;
             # only this row's own uncommitted change is rolled back and no
-            # further row is attempted.
+            # further row is attempted. On a dry run those commits were
+            # savepoint releases, and the rehearsal discards them on exit.
             if exc.status_code == 503:
                 raise
             report.rows.append(
                 RowResult(row=index, action="reject", identity=name or None, reason=str(exc.detail))
             )
         except Exception as exc:
-            if not dry_run:
-                await db.rollback()
+            await db.rollback()
             report.rows.append(
                 RowResult(row=index, action="reject", identity=name or None, reason=str(exc))
             )

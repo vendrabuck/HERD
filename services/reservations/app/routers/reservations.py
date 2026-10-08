@@ -609,7 +609,8 @@ async def get_reservation_internal_status(
     Guarded by X-Internal-Token. Returns status + is_active boolean (status ACTIVE
     AND within window) so callers do not need to replicate active-window logic.
     Also reports whether purpose classification is still owed
-    (purpose_classification_pending, issue #1039).
+    (purpose_classification_pending, issue #1039): the purpose sweep will still
+    select the row, so false once its attempts reach the cap (issue #1067).
     """
     if not internal_token_matches(x_internal_token, settings.internal_api_token):
         raise HTTPException(status_code=403, detail="Invalid internal token")
@@ -631,9 +632,15 @@ async def get_reservation_internal_status(
         is_active=is_active,
         start_time=start,
         end_time=end,
+        # The sweep's own selection (_run_purpose_classify_reconcile): requested, no
+        # suggestion, and attempts below the cap. A capped row is never selected
+        # again, so it is not pending (issue #1067); the admin backfill resets its
+        # attempts and makes it pending again.
         purpose_classification_pending=(
             reservation.purpose_classify_requested_at is not None
             and reservation.purpose_suggestion is None
+            and (reservation.purpose_classify_attempts or 0)
+            < settings.purpose_classify_max_attempts
         ),
     )
 

@@ -415,6 +415,170 @@ async def test_delete_skipped_when_vlan_reallocated_on_fabric(caplog):
     assert any("re-allocated" in rec.message for rec in caplog.records)
 
 
+# --- supersession judged by CURRENT reachability (issue #1065) ---
+
+
+def _fabric_map(mapping):
+    """A fetch_fabric_id stand-in answering each switch's CURRENT fabric id."""
+
+    async def _fetch(device_id):
+        return mapping[str(device_id)]
+
+    return AsyncMock(side_effect=_fetch)
+
+
+async def _seed_allocation(reservation_id, fabric_id, vlan_id, switches, defined):
+    async with TestSessionLocal() as s:
+        row = VlanAssignment(
+            reservation_id=uuid.UUID(reservation_id),
+            fabric_id=fabric_id,
+            vlan_id=vlan_id,
+            switch_device_ids=list(switches),
+            defined_switch_ids=list(defined),
+            status="ACTIVE",
+        )
+        s.add(row)
+        await s.commit()
+        await s.refresh(row)
+        return row.id
+
+
+async def _release(va_ids, fetch, factory=None):
+    """Run _release_orphaned_allocations with the CURRENT-fabric lookup `fetch`."""
+    execute_fn, calls = _recorder()
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        for p in _patches(execute_fn, [])[:-1]:
+            stack.enter_context(p)
+        stack.enter_context(patch("app.services.vlan_service.fetch_fabric_id", new=fetch))
+        await _release_orphaned_allocations(
+            set(va_ids), factory or _db_session_factory(), _FetchContext(None)
+        )
+    return calls
+
+
+async def test_delete_skipped_when_a_cable_joined_the_switch_to_the_winners_component(caplog):
+    """Our allocation was made while SW_L2 stood alone (stored fabric F_OLD); a cable
+    then joined SW_L2 to SW_MID, re-keying the component to F_NEW, and another
+    reservation holds the same number there. The stored ids differ, but SW_L2 now
+    reaches the winner, so deleting the VLAN on SW_L2 would strip the winner's
+    definition: the delete is superseded."""
+    f_old, f_new = uuid.uuid4(), uuid.uuid4()
+    mine = await _seed_allocation(RES_ID, f_old, 100, [SW_L2], [SW_L2])
+    # The winner sits on SW_MID only; the partial-unique index allows it because the
+    # stored fabric ids differ (the limit WIRE-VLAN-2 records).
+    await _seed_allocation(OTHER_RES, f_new, 100, [SW_MID], [SW_MID])
+    fetch = _fabric_map({SW_L2: f_new, SW_MID: f_new})
+
+    with caplog.at_level(logging.WARNING, logger="app.services.nats_consumer"):
+        calls = await _release([mine], fetch)
+
+    assert calls == [], "no delete_vlan: the number is live in SW_L2's current component"
+    released = await _allocation("RELEASED")
+    assert [r.id for r in released] == [mine]
+    assert released[0].defined_switch_ids == [SW_L2], "the skipped switch stays listed"
+    assert any("re-allocated" in rec.message for rec in caplog.records)
+
+
+async def test_delete_runs_when_the_components_split_after_the_winner_was_allocated():
+    """Our allocation and the winner were both made while SW_L2 and SW_L2_B were one
+    component (stored fabric F12, ours released before the winner took the number).
+    A cable was then removed: SW_L2 is now in F_A, the winner's SW_L2_B in F_B. The
+    stored ids still match, but the winner no longer reaches SW_L2, so the delete on
+    SW_L2 runs."""
+    f12, f_a, f_b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    mine = await _seed_allocation(RES_ID, f12, 100, [SW_L2], [SW_L2])
+
+    # The winner allocates the same (fabric, number) after our row flips RELEASED and
+    # before the supersession check, the only order the partial-unique index allows.
+    real_factory = _db_session_factory()
+    opened = {"n": 0}
+
+    class _HookedCtx:
+        def __init__(self):
+            self._inner = real_factory()
+
+        async def __aenter__(self):
+            opened["n"] += 1
+            if opened["n"] == 2:
+                await _seed_allocation(OTHER_RES, f12, 100, [SW_L2_B], [SW_L2_B])
+            return await self._inner.__aenter__()
+
+        async def __aexit__(self, *args):
+            return await self._inner.__aexit__(*args)
+
+    fetch = _fabric_map({SW_L2: f_a, SW_L2_B: f_b})
+    calls = await _release([mine], fetch, factory=lambda: _HookedCtx())
+
+    assert [(c[0], c[1], c[3]) for c in calls if c[0] == "delete_vlan"] == [
+        ("delete_vlan", SW_L2, 100)
+    ]
+    async with TestSessionLocal() as s:
+        after = (
+            await s.execute(select(VlanAssignment).where(VlanAssignment.id == mine))
+        ).scalar_one()
+    assert after.status == "RELEASED"
+    assert after.defined_switch_ids == []
+
+
+async def test_supersession_lookup_failure_skips_the_delete_and_continues(caplog):
+    """Fail closed: when a same-number allocation exists and cabling cannot answer the
+    current fabric, supersession cannot be ruled out, so no delete runs for that
+    allocation (its switch stays listed as defined) and the error is logged. The pass
+    continues: the next orphaned allocation, with no same-number rival, is released
+    and undefined without asking cabling."""
+    from app.services.nats_consumer import TransientUpstreamError
+
+    f_old, f_other, f_lone = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    first = await _seed_allocation(RES_ID, f_old, 100, [SW_L2], [SW_L2])
+    await _seed_allocation(OTHER_RES, f_other, 100, [SW_MID], [SW_MID])
+    second = await _seed_allocation(RES_ID, f_lone, 200, [SW_L2_B], [SW_L2_B])
+    fetch = AsyncMock(
+        side_effect=TransientUpstreamError("cabling fabric lookup for device x: upstream 503")
+    )
+
+    with caplog.at_level(logging.ERROR, logger="app.services.nats_consumer"):
+        calls = await _release([first, second], fetch)
+
+    assert [(c[0], c[1], c[3]) for c in calls if c[0] == "delete_vlan"] == [
+        ("delete_vlan", SW_L2_B, 200)
+    ]
+    async with TestSessionLocal() as s:
+        rows = {
+            r.id: r
+            for r in (
+                await s.execute(
+                    select(VlanAssignment).where(VlanAssignment.id.in_([first, second]))
+                )
+            )
+            .scalars()
+            .all()
+        }
+    assert rows[first].status == "RELEASED"
+    assert rows[first].defined_switch_ids == [SW_L2], "the unjudged switch stays listed"
+    assert rows[second].status == "RELEASED"
+    assert rows[second].defined_switch_ids == []
+    skipped = [r for r in caplog.records if getattr(r, "action", None) == "vlan_delete_unjudged"]
+    assert len(skipped) == 1
+    assert str(first) in skipped[0].getMessage()
+
+
+async def test_no_same_number_allocation_asks_cabling_nothing():
+    """With no other ACTIVE allocation holding the number nothing can supersede the
+    delete, so the release never consults cabling (an outage there cannot block it)."""
+    mine = await _seed_allocation(RES_ID, uuid.uuid4(), 300, [SW_L2], [SW_L2])
+    await _seed_allocation(OTHER_RES, uuid.uuid4(), 301, [SW_L2], [SW_L2])
+    fetch = AsyncMock(side_effect=AssertionError("cabling must not be asked"))
+
+    calls = await _release([mine], fetch)
+
+    assert [(c[0], c[1], c[3]) for c in calls if c[0] == "delete_vlan"] == [
+        ("delete_vlan", SW_L2, 300)
+    ]
+    fetch.assert_not_awaited()
+
+
 # --- idempotency ---
 
 
