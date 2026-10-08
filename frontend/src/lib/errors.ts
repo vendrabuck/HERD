@@ -245,3 +245,106 @@ export function deletePortErrorText(err: unknown): string {
   }
   return errorDetail(err, "Failed to delete port");
 }
+
+/**
+ * Inventory's config-apply driver gate (issues #839, #1098): 409
+ * {error: "driver_cannot_configure", connection_type, driver, message} when
+ * the device's driver implements a contract with no configure method. Both
+ * the immediate apply and the schedule answer it.
+ */
+export interface DriverCannotConfigureDetail {
+  error: "driver_cannot_configure";
+  connection_type?: unknown;
+  driver?: unknown;
+  message?: unknown;
+}
+
+/** Narrows a config apply error to the structured 409; null for any other shape. */
+export function driverCannotConfigureDetail(err: unknown): DriverCannotConfigureDetail | null {
+  return structuredDetail<DriverCannotConfigureDetail>(
+    err,
+    409,
+    (d) => d.error === "driver_cannot_configure",
+  );
+}
+
+/**
+ * The text for a refused config apply or schedule (issue #1098): the driver
+ * gate's own sentence plus the driver's name for the structured 409, else the
+ * server's plain-string detail (a 403, a 404, a 422, the fail-closed 503),
+ * else the caller's fallback.
+ */
+export function configApplyErrorText(err: unknown, fallback: string): string {
+  const gate = driverCannotConfigureDetail(err);
+  if (gate) {
+    const driver = typeof gate.driver === "string" && gate.driver ? gate.driver : null;
+    const type =
+      typeof gate.connection_type === "string" && gate.connection_type
+        ? gate.connection_type
+        : null;
+    const message =
+      typeof gate.message === "string" && gate.message
+        ? gate.message
+        : "This device's driver" +
+          (type ? " implements the " + type + " contract, which" : "") +
+          " has no configure method, so a config apply cannot run.";
+    return driver ? message + " (driver: " + driver + ")" : message;
+  }
+  return errorDetail(err, fallback);
+}
+
+/** The most reservation ids a restore refusal lists before "and N more". */
+export const RESTORE_BLOCKED_LIST_LIMIT = 3;
+
+/**
+ * Inventory's restore guard (issue #337): 409 {message, reservations: [{id,
+ * status, end_time}]} while another user's active reservation holds the
+ * device. The body carries no `error` key, so the narrower keys on the list.
+ */
+export interface RestoreBlockedDetail {
+  message?: unknown;
+  reservations: { id?: unknown; status?: unknown; end_time?: unknown }[];
+}
+
+/** Narrows a config restore error to the structured 409; null for any other shape. */
+export function restoreBlockedDetail(err: unknown): RestoreBlockedDetail | null {
+  return structuredDetail<RestoreBlockedDetail>(
+    err,
+    409,
+    (d) =>
+      Array.isArray(d.reservations) &&
+      d.reservations.every((r) => r !== null && typeof r === "object"),
+  );
+}
+
+/**
+ * "Device has active reservations; restore blocked: 1a2b3c4d (ACTIVE),
+ * 5e6f7a8b (ACTIVE), 9c0d1e2f (PENDING_PROVISION) and 2 more". Each id is cut
+ * to its first 8 characters, the way the rest of the UI shows reservation ids.
+ */
+export function formatRestoreBlocked(detail: RestoreBlockedDetail): string {
+  const message =
+    typeof detail.message === "string" && detail.message
+      ? detail.message
+      : "Device has active reservations; restore blocked";
+  const entries = detail.reservations
+    .filter((r) => typeof r.id === "string" && r.id)
+    .map((r) => {
+      const id = (r.id as string).slice(0, 8);
+      return typeof r.status === "string" && r.status ? id + " (" + r.status + ")" : id;
+    });
+  if (entries.length === 0) return message;
+  const shown = entries.slice(0, RESTORE_BLOCKED_LIST_LIMIT).join(", ");
+  const rest = entries.length - RESTORE_BLOCKED_LIST_LIMIT;
+  return message + ": " + shown + (rest > 0 ? " and " + rest + " more" : "");
+}
+
+/**
+ * The text for a refused config restore (issue #1098): the reservation list
+ * for the structured 409, else the server's plain-string detail (a 403, a
+ * 404, a 422 schema refusal, the fail-closed 503), else `Restore failed`.
+ */
+export function configRestoreErrorText(err: unknown): string {
+  const blocked = restoreBlockedDetail(err);
+  return blocked ? formatRestoreBlocked(blocked) : errorDetail(err, "Restore failed");
+}

@@ -80,11 +80,12 @@ what a test would still need to cover:
   and pins the `Toaster` placement; router wiring and the `ErrorBoundary` are still
   exercised only indirectly through page tests that render individual routed
   components.
-- [MEDIUM] Device-config panels: `frontend/src/components/device-config/ApplyJobsPanel.tsx`
-  (6.7%, exercised only indirectly through `DeviceConfigSection.test.tsx`) and
-  `frontend/src/components/device-config/DeviceConfigSection.tsx` (49.4%, has its
-  own suite). The schedule-apply submit and job-status-polling branches are the
-  deferred piece, the same UI-journey gap the E2E section below already tracks.
+- [LOW] Device-config panels: `frontend/src/components/device-config/DeviceConfigSection.tsx`
+  (82.4% of lines since issue #1098, which added the Apply dialog and Restore refusal
+  tests) and `frontend/src/components/device-config/ApplyJobsPanel.tsx` (100%, its own
+  suite `ApplyJobsPanel.test.tsx` since #1098). The view and diff modals' loading
+  states are the untested remainder; the browser journey stays with the E2E section
+  below.
 - [MEDIUM] AI assistant tabs: `frontend/src/components/reservations/AIAssistantTab.tsx`
   (77.8%, has a suite) and `frontend/src/components/reservations/AIAssistantTabLegacy.tsx`
   (68.4%, no suite of its own, the default render path since

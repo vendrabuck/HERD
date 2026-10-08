@@ -1010,17 +1010,22 @@ opened from the reservation assistant; clients `frontend/src/api/deviceConfig.ts
   Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`keeps Compare disabled until exactly two versions are selected`)
 - **CFG-UI-4.** The Apply dialog applies now when its time is blank, showing
   `Apply failed: <error>` for a `failed` answer and `Applied (run <first 8 characters>)`
-  otherwise, and schedules at the chosen local time when one is set. A refused request
-  shows the generic `Apply request failed` or `Restore failed`, or the server's `detail`
-  as given on a schedule, so a structured 409 detail is not shown as text. Known gap,
-  see #1098. \
-  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`) \
-  Pinned by: none (#1098)
+  otherwise, and schedules at the chosen local time when one is set. A refusal the server
+  explains reaches the user in words, through the helpers in `frontend/src/lib/errors.ts`:
+  the 409 `driver_cannot_configure` on Apply now or Schedule shows its `message` and the
+  driver's name, a restore 409 shows its sentence and up to three blocking reservations
+  (first 8 characters of the id and the status, then `and N more`), and any plain-string
+  `detail` (a 403, a 422, the fail-closed 503) shows as given; anything else shows
+  `Apply request failed`, `Schedule failed`, or `Restore failed`. A New version refusal
+  shows a string `detail` and never renders a validation list. \
+  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`); `frontend/src/lib/errors.ts` (`configApplyErrorText`, `configRestoreErrorText`, `formatRestoreBlocked`) \
+  Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`applies now and shows the run id on success`, `shows the stored error for a failed apply answer`, `shows the driver gate's sentence when Apply now is refused with 409`, `shows the server's sentence when Apply now is refused with 403`, `schedules at the chosen time and sends it as ISO`, `shows the driver gate's sentence, not an object, when a schedule is refused`, `lists the blocking reservations when a restore is refused with 409`, `shows the guard's sentence when a restore fails closed with 503`, `shows a create refusal's string detail and never renders a validation list`); `frontend/src/test/lib/errors.test.ts` (`shows at most three ids, then the count of the rest`, `falls back for any other shape, never returning an object`)
 - **CFG-UI-5.** The scheduled-applies panel is hidden when the device has no jobs,
   refreshes every 10 seconds, shows each job's status and error, and offers Cancel only
-  on a `pending` job. \
+  on a `pending` job; a refused cancel shows the server's string `detail`, else
+  `Cancel failed`. \
   Enforced in: `frontend/src/components/device-config/ApplyJobsPanel.tsx` (`ApplyJobsPanel`); `frontend/src/api/deviceConfigJobs.ts` (`useApplyJobs`) \
-  Pinned by: none (#1100)
+  Pinned by: `frontend/src/test/components/ApplyJobsPanel.test.tsx` (`renders nothing when the device has no scheduled applies`, `shows each job's status, error, author, and run, with Cancel only on pending`, `cancels a pending job through the API and confirms with a toast`, `shows the server's sentence when a cancel loses the race (409)`, `never toasts an object detail; a non-string refusal falls back`, `refreshes the job list every 10 seconds`)
 - **CFG-UI-6.** The dry-run review polls the job every 2 seconds until it is `success`,
   `failed`, `skipped`, or `cancelled`, then shows the run's transcript with simulated
   rows marked; Confirm is enabled only on `success`, Cancel dry-run only before it, and a
@@ -1313,7 +1318,7 @@ See [ENV_VARS.md](../ENV_VARS.md) for the rest.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/common/tests/test_device_config.py`, `services/common/tests/test_acl.py`; `services/inventory/tests/test_published_schema.py`, `test_apply_scheduler.py`; `services/execution/tests/test_driver_loader*.py`, `test_driver_sandbox*.py`, `test_runner.py`, `test_sandbox_isolation.py`, `test_dry_run.py`, `test_driver_transcript.py`, `test_config_schema_extraction.py`, `test_configure_capability_parity.py`, `test_package_validator.py`; frontend `frontend/src/test/components/DeviceConfigSection.test.tsx`, `AIApplyConfirmModal.test.tsx`, `frontend/src/test/api/deviceConfig.test.tsx`, `deviceConfigJobs.test.tsx` | SQLite in memory; the sandbox suites start real child processes |
+| Unit | `services/common/tests/test_device_config.py`, `services/common/tests/test_acl.py`; `services/inventory/tests/test_published_schema.py`, `test_apply_scheduler.py`; `services/execution/tests/test_driver_loader*.py`, `test_driver_sandbox*.py`, `test_runner.py`, `test_sandbox_isolation.py`, `test_dry_run.py`, `test_driver_transcript.py`, `test_config_schema_extraction.py`, `test_configure_capability_parity.py`, `test_package_validator.py`; frontend `frontend/src/test/components/DeviceConfigSection.test.tsx`, `ApplyJobsPanel.test.tsx`, `AIApplyConfirmModal.test.tsx`, `frontend/src/test/lib/errors.test.ts`, `frontend/src/test/api/deviceConfig.test.tsx`, `deviceConfigJobs.test.tsx` | SQLite in memory; the sandbox suites start real child processes |
 | Functional (through the service API) | `services/inventory/tests/test_device_configs.py`, `test_device_configs_rbac.py`, `test_apply_jobs_reservation_owner.py`, `test_confirm_dry_run.py`, `test_configure_capability_gate.py`, `test_device_config_restore_reservation_guard.py`, `test_device_read_visibility_gate.py`, `test_apply_jobs_internal_summary.py`, `test_router_edge_cases.py`; `services/execution/tests/test_router_endpoints.py`, `test_router_direct.py`, `test_api_endpoints.py`, `test_command_log*.py`, `test_config_schema_endpoint.py`, `test_configure_capability_gate.py`, `test_execution_service_edges.py` | acl, reservations, and execution are patched |
 | Integration (running stack) | `tests/integration/test_execution_configure_gate.py`, `test_execution_result_gating.py`, `test_package_validation.py`; the NOS lab tiers under `tests/nos_lab/` (`test_frr_mgmt_driver_live.py` drives the Management driver's `configure`) | None for config versions, scheduled applies, the scheduler, dry runs, or the schema proxy |
 | Stress and load | None | `tests/load/locustfile.py` has no configuration task |
@@ -1332,7 +1337,6 @@ confirmed by reading only.
 
 - #1096 (CFG-EXEC-1): execution's `_user_has_acl_manage` still raises on a 200 whose
   JSON body is not an object; the inventory and `herd_common` sites are fixed.
-- #1098 (CFG-UI-4): the device page shows structured refusals as generic text.
 - #1104 (CFG-JOB-5): a schedule's reservation check proves the caller owns some active
   reservation holding the device, not that the named reservation holds it or belongs to
   the caller.
@@ -1369,5 +1373,3 @@ that should have a test are tracked in #1100.
 - CFG-RUN-3: an owner's list holds every run of the reservation.
 - CFG-DRY-4: the dry-run declaration is not verified.
 - CFG-SBX-9: no isolation beyond resource limits.
-- CFG-UI-4: the Apply dialog's outcomes.
-- CFG-UI-5: the scheduled-applies panel.
