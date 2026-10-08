@@ -6,9 +6,10 @@ name), validates each row against the existing Pydantic schemas, and calls the
 existing create/update service functions row by row. Per-row error handling
 means one bad row is rejected with a reason while the rest of the batch
 proceeds. A `dry_run` import is a full rehearsal (issue #1017): it runs the
-same create/update service functions inside a transaction that is rolled back
-at the end, so the dry-run report matches the committing run row for row and
-nothing is written.
+same create/update service functions on a
+`herd_common.rehearsal.rehearsal_session`, inside a transaction that is rolled
+back at the end, so the dry-run report matches the committing run row for row
+and nothing is written.
 
 There is no cross-schema bulk path: this lives in the inventory service and only
 touches the inventory schema, matching the service-boundary rule.
@@ -18,12 +19,11 @@ import csv
 import io
 import json
 import uuid
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import HTTPException
 from herd_common.csv_safety import csv_safe_cell, csv_unsafe_cell
+from herd_common.rehearsal import rehearsal_session
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -291,37 +291,6 @@ def _validation_reason(exc: ValidationError) -> str:
     return "; ".join(parts)
 
 
-@asynccontextmanager
-async def _rehearsal_session(db: AsyncSession) -> AsyncIterator[AsyncSession]:
-    """A session whose commits are savepoint releases inside one outer
-    transaction that is always rolled back (issue #1017).
-
-    The create/update service functions commit per row. Run on this session,
-    each `commit()` only releases a savepoint and each `rollback()` only rolls
-    back to it (SQLAlchemy's `join_transaction_mode="create_savepoint"`), so a
-    dry run executes exactly the checks and writes a committing run executes,
-    later rows see earlier rows' writes as they would on commit, and the outer
-    transaction on the caller's connection is rolled back on exit, writing
-    nothing. Dialect gate: pysqlite and aiosqlite emit no BEGIN until the first
-    DML, so a SAVEPOINT would open (and its RELEASE commit) the outermost
-    SQLite transaction; on SQLite an explicit BEGIN opens the outer transaction
-    first. Postgres needs no gate.
-    """
-    conn = await db.connection()
-    if conn.dialect.name == "sqlite":
-        raw = await conn.get_raw_connection()
-        if not raw.driver_connection.in_transaction:
-            await conn.exec_driver_sql("BEGIN")
-    rehearsal = AsyncSession(
-        bind=conn, join_transaction_mode="create_savepoint", expire_on_commit=False
-    )
-    try:
-        yield rehearsal
-    finally:
-        await rehearsal.close()
-        await db.rollback()
-
-
 # Import: devices ------------------------------------------------------------
 
 
@@ -335,7 +304,7 @@ async def import_devices(
 ) -> BulkImportReport:
     rows = parse_import(raw, fmt, DEVICE_CSV_COLUMNS, DEVICE_CSV_TEXT_COLUMNS)
     if dry_run:
-        async with _rehearsal_session(db) as rehearsal:
+        async with rehearsal_session(db) as rehearsal:
             report = await _import_device_rows(rehearsal, rows, actor_id, actor_name)
     else:
         report = await _import_device_rows(db, rows, actor_id, actor_name)
@@ -482,7 +451,7 @@ async def import_templates(
 ) -> BulkImportReport:
     rows = parse_import(raw, fmt, TEMPLATE_CSV_COLUMNS, TEMPLATE_CSV_TEXT_COLUMNS)
     if dry_run:
-        async with _rehearsal_session(db) as rehearsal:
+        async with rehearsal_session(db) as rehearsal:
             report = await _import_template_rows(rehearsal, rows, actor_id)
     else:
         report = await _import_template_rows(db, rows, actor_id)

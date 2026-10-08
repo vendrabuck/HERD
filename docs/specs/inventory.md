@@ -1105,7 +1105,7 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   `dry_run: true`: it runs on a session joined to the request's connection whose
   commits are savepoint releases inside one outer transaction, and that transaction is
   rolled back when the import ends. \
-  Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`, `import_templates`, `_rehearsal_session`) \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`, `import_templates`); `services/common/herd_common/rehearsal.py` (`rehearsal_session`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_dry_run_writes_nothing`, `test_device_dry_run_report_matches_commit_row_for_row_and_writes_nothing`); `tests/integration/test_bulk_import_export.py` (`test_device_import_dry_run_writes_nothing`)
 - **INV-BULK-12.** A device update row leaves out every column it does not carry or
   leaves empty, so an omitted `field_data`, poll interval, status, or topology type
@@ -1161,7 +1161,7 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   sees an earlier row's create (a name repeated in one file reports `create` then
   `update`), and a rejected row is rolled back to its savepoint, so the dry-run report
   equals the committed report row for row on the same starting data. \
-  Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`, `import_templates`, `_import_device_rows`, `_import_template_rows`, `_rehearsal_session`) \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`, `import_templates`, `_import_device_rows`, `_import_template_rows`); `services/common/herd_common/rehearsal.py` (`rehearsal_session`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_dry_run_rejects_unknown_field_data_key_like_the_commit`, `test_dry_run_rejects_hypervisor_driver_on_device_template_like_the_commit`, `test_device_dry_run_report_matches_commit_row_for_row_and_writes_nothing`, `test_template_dry_run_duplicate_name_in_file_matches_commit`)
 - **INV-BULK-19.** `format` is `csv` or `json` (default `json`); any other value answers
   422. \

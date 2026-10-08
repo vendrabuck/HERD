@@ -15,9 +15,9 @@ transaction; on SQLite an explicit BEGIN opens the outer transaction first.
 Postgres needs no gate. This is the same dialect-gate idiom as
 `herd_common.advisory_lock`.
 
-Inventory's device and template importers carry the original copy
-(`_rehearsal_session` in inventory's `bulk_service.py`, issue #1017); cabling's
-topology importer uses this one (issue #1064).
+Users: inventory's device and template importers (issue #1017, where the
+pattern was introduced) and cabling's topology importer (issue #1064). A new
+importer with a dry run should use this helper rather than its own copy.
 """
 
 from collections.abc import AsyncIterator
