@@ -409,26 +409,17 @@ async def test_record_route_active_reusable_cas_loser_never_overwrites(db, caplo
     reach record_route_active for the same row as independent asyncio tasks).
 
     Both writers are real record_route_active calls. Writer B is held at its
-    CAS UPDATE (after its own FAILED-row SELECT) while writer A runs to
-    completion; then B is released. B's UPDATE must match zero rows and never
-    overwrite A's routes.
-
-    CURRENT BEHAVIOR, pinned as is: the loser branch rolls back and then reads
-    `reusable.id` to re-select the winner, but the rollback has expired
-    `reusable`, so that attribute read needs a lazy load the async session
-    cannot run and B raises MissingGreenlet before it logs "stale reattempt
-    writer skipped" or returns the winner's row. The comment in
-    record_route_active describes the intended return; reading the id before
-    the UPDATE would deliver it, and this test then needs its `pytest.raises`
-    replaced by the return and log assertions. A loser that overwrites (no
-    status clause in the CAS) or that commits a no-op and returns normally
-    (no rowcount check) completes without raising, so either fails here.
+    CAS UPDATE (after its own FAILED-row SELECT, so the row is attached to B's
+    session) while writer A runs to completion; then B is released. B's UPDATE
+    matches zero rows, and B rolls back, logs "stale reattempt writer
+    skipped", and returns the winner's row as-is (issue #1152: the re-read
+    used to read the expired row's id after the rollback and raised
+    MissingGreenlet).
     """
     import asyncio
     import logging
 
     from app.services.route_service import record_route_failed
-    from sqlalchemy.exc import MissingGreenlet
     from sqlalchemy.sql.dml import Update
 
     winner_routes = [{"destination": "10.9.0.0/24", "next_hop": None, "interface": "eth9"}]
@@ -459,13 +450,16 @@ async def test_record_route_active_reusable_cas_loser_never_overwrites(db, caplo
         assert row_a.routes == winner_routes
 
         release_b.set()
-        with pytest.raises(MissingGreenlet) as excinfo:
-            await asyncio.wait_for(writer_b, timeout=5)
-        assert any(entry.name == "record_route_active" for entry in excinfo.traceback)
+        row_b = await asyncio.wait_for(writer_b, timeout=5)
 
+    assert row_b is not None
+    assert row_b.id == failed.id
+    assert row_b.status == "ACTIVE"
+    assert row_b.routes == winner_routes, "the loser returns the winner's row as-is"
     messages = [r.getMessage() for r in caplog.records]
+    assert sum(m.startswith("stale reattempt writer skipped") for m in messages) == 1
     assert sum(m.startswith("Reattempt pinned L3 switch") for m in messages) == 1, (
-        "only the winner reports a flip; the loser's UPDATE matched zero rows"
+        "only the winner reports a flip"
     )
 
     final = (

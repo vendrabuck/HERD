@@ -220,10 +220,11 @@ async def record_l2_membership_active(
 
     reusable = await _find_reusable_failed(db, res_uuid, switch_uuid, port)
     if reusable is not None:
+        reusable_id = reusable.id
         result = await db.execute(
             update(L2PortAssignment)
             .where(
-                L2PortAssignment.id == reusable.id,
+                L2PortAssignment.id == reusable_id,
                 L2PortAssignment.status == "FAILED",
             )
             .values(
@@ -244,7 +245,7 @@ async def record_l2_membership_active(
             # here by issue #817 so all three layers share one flip discipline.
             await db.rollback()
             winner = (
-                await db.execute(select(L2PortAssignment).where(L2PortAssignment.id == reusable.id))
+                await db.execute(select(L2PortAssignment).where(L2PortAssignment.id == reusable_id))
             ).scalar_one_or_none()
             logger.info(
                 "stale reattempt writer skipped for switch %s port %s, reservation %s: "

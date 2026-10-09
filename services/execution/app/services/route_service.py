@@ -225,10 +225,11 @@ async def record_route_active(
         .first()
     )
     if reusable is not None:
+        reusable_id = reusable.id
         result = await db.execute(
             update(RouteAssignment)
             .where(
-                RouteAssignment.id == reusable.id,
+                RouteAssignment.id == reusable_id,
                 RouteAssignment.status == "FAILED",
             )
             .values(
@@ -248,7 +249,7 @@ async def record_route_active(
             # the winner, re-read and return its row as-is.
             await db.rollback()
             winner = (
-                await db.execute(select(RouteAssignment).where(RouteAssignment.id == reusable.id))
+                await db.execute(select(RouteAssignment).where(RouteAssignment.id == reusable_id))
             ).scalar_one_or_none()
             logger.info(
                 "stale reattempt writer skipped for L3 switch %s, reservation %s: "

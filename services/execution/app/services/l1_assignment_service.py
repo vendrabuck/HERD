@@ -130,10 +130,11 @@ async def record_l1_connect(
         }
         if physical_connection_id and reusable.physical_connection_id is None:
             values["physical_connection_id"] = _as_uuid(physical_connection_id)
+        reusable_id = reusable.id
         result = await db.execute(
             update(L1ConnectionAssignment)
             .where(
-                L1ConnectionAssignment.id == reusable.id,
+                L1ConnectionAssignment.id == reusable_id,
                 L1ConnectionAssignment.status == "FAILED",
             )
             .values(**values)
@@ -147,7 +148,7 @@ async def record_l1_connect(
             await db.rollback()
             winner = (
                 await db.execute(
-                    select(L1ConnectionAssignment).where(L1ConnectionAssignment.id == reusable.id)
+                    select(L1ConnectionAssignment).where(L1ConnectionAssignment.id == reusable_id)
                 )
             ).scalar_one_or_none()
             logger.info(
