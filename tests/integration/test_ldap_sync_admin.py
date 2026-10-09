@@ -40,7 +40,7 @@ way to obtain an admin-role JWT through the public API. This file instead:
 
 Concurrency note: this stack runs a single auth replica (services/auth's
 Dockerfile has no --workers flag), so the two sync-now requests in
-test_concurrent_sync_now_one_wins race the IN-PROCESS asyncio.Lock in
+test_concurrent_sync_now_runs_never_overlap race the IN-PROCESS asyncio.Lock in
 ldap_sync_service._SyncSlot, never the cross-replica Postgres advisory-lock
 branch (SyncBusyError("replica")). That branch needs two separate auth
 processes contending for the same advisory lock and is covered directly
@@ -63,6 +63,7 @@ import os
 import socket
 import time
 import uuid
+from datetime import datetime
 
 import httpx
 import pytest
@@ -245,11 +246,22 @@ async def test_sync_run_reconciles_group_membership_from_directory(superadmin_to
         assert members == HERD_IT_ENG_MEMBERS, members
 
 
-async def test_concurrent_sync_now_one_wins(superadmin_token):
-    """Two sync-now requests fired concurrently: exactly one is accepted
-    (202) and the other 409s with the in-process busy detail (see module
-    docstring for why this is always the in_process reason, never replica,
-    on this single-auth-replica stack).
+async def test_concurrent_sync_now_runs_never_overlap(superadmin_token):
+    """Two sync-now requests fired concurrently never produce overlapping runs
+    (issue #1134). Nothing here holds the first run open, and a run over the
+    one small herd-it-eng group finishes in milliseconds, so the second request
+    can legitimately arrive after the first run released the slot and be
+    accepted too. Both outcomes are correct; the invariant is the slot's:
+      - [202, 409]: the late request is refused with the in-process busy detail
+        (see the module docstring for why it is always in_process, never
+        replica, on this single-auth-replica stack);
+      - [202, 202]: both runs complete, and the earlier run's finished_at is at
+        or before the later run's started_at (started_at is the run row's
+        insert, made inside the slot; finished_at is stamped before the slot is
+        released).
+    The busy refusal itself is pinned deterministically by
+    services/auth/tests/test_ldap_sync.py
+    (test_sync_run_409_while_in_progress_and_lock_released_after).
     """
     headers = {"Authorization": f"Bearer {superadmin_token}"}
     async with httpx.AsyncClient(
@@ -264,14 +276,27 @@ async def test_concurrent_sync_now_one_wins(superadmin_token):
             assert not isinstance(resp, Exception), resp
 
         codes = sorted([first.status_code, second.status_code])
-        assert codes == [202, 409], (
+        assert codes in ([202, 409], [202, 202]), (
             first.status_code,
             second.status_code,
             first.text,
             second.text,
         )
-        winner, loser = (first, second) if first.status_code == 202 else (second, first)
-        assert loser.json()["detail"] == _RUN_IN_PROGRESS_DETAIL, loser.text
 
-        run = await _poll_run(client, winner.json()["run_id"])
-        assert run["status"] in ("success", "partial"), run
+        if codes == [202, 409]:
+            winner, loser = (first, second) if first.status_code == 202 else (second, first)
+            assert loser.json()["detail"] == _RUN_IN_PROGRESS_DETAIL, loser.text
+            run = await _poll_run(client, winner.json()["run_id"])
+            assert run["status"] in ("success", "partial"), run
+            return
+
+        run_ids = {first.json()["run_id"], second.json()["run_id"]}
+        assert len(run_ids) == 2, (first.text, second.text)
+        runs = [await _poll_run(client, run_id) for run_id in run_ids]
+        for run in runs:
+            assert run["status"] in ("success", "partial"), run
+            assert run["finished_at"] is not None, run
+        earlier, later = sorted(runs, key=lambda r: datetime.fromisoformat(r["started_at"]))
+        assert datetime.fromisoformat(earlier["finished_at"]) <= datetime.fromisoformat(
+            later["started_at"]
+        ), (earlier, later)
