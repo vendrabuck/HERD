@@ -1,7 +1,5 @@
 """E2E tests for the connections admin page."""
 
-import time
-
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -124,9 +122,17 @@ def test_connections_create_requires_device(admin_browser, base_url):
     admin_browser.find_element(
         By.XPATH, "//button[normalize-space()='Create']"
     ).click()
-    time.sleep(1.0)
-    body = admin_browser.find_element(By.TAG_NAME, "body").text.lower()
-    assert "required" in body or "device a" in body
+    # The validation toast by exact text (issue #1148: "device a" matched the
+    # modal's own "Device A" label before Create was clicked).
+    wait.until(
+        EC.presence_of_element_located(
+            (
+                By.XPATH,
+                "//*[@data-rht-toaster]//*[@role='status'"
+                " and normalize-space()='Device A is required']",
+            )
+        )
+    )
 
     admin_browser.find_element(
         By.XPATH, "//button[normalize-space()='Cancel']"

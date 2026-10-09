@@ -50,8 +50,19 @@ def test_config_wrong_password_shows_toast(browser, base_url):
         By.XPATH, "//button[normalize-space()='Sign in']"
     ).click()
 
-    import time
-
-    time.sleep(1.5)
-    body = browser.find_element(By.TAG_NAME, "body").text.lower()
-    assert "invalid" in body or "incorrect" in body or "password" in body
+    # The refusal toast itself, by exact text (issue #1148: "password" anywhere in
+    # the body matched the login form's own label). The login limiter (#1109) can
+    # answer a repeat run's attempt with its wait message instead; both are
+    # refusals, and the form must still be on screen either way.
+    WebDriverWait(browser, WAIT).until(
+        EC.presence_of_element_located(
+            (
+                By.XPATH,
+                "//*[@data-rht-toaster]//*[@role='status' and ("
+                "normalize-space()='Invalid config password'"
+                " or starts-with(normalize-space(), 'Too many failed login attempts')"
+                ")]",
+            )
+        )
+    )
+    assert browser.find_element(By.ID, "config-password").is_displayed()

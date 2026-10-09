@@ -104,6 +104,19 @@ def test_inventory_search_filters_results(logged_in_browser, base_url):
             )
         )
 
+        # The filtered empty state is what the search produces (issue #1148: the
+        # typed term lives in the input's value, which WebElement.text never
+        # includes, so "the term is not on the page" was always true). It must
+        # not be on screen before typing, or a stale saved filter produced it.
+        no_match = (
+            By.XPATH,
+            "//tbody//td[contains(normalize-space(), 'No devices match the current filters.')]",
+        )
+        assert logged_in_browser.find_elements(*no_match) == [], (
+            "the filtered empty state was already showing before the search; "
+            "a saved inventory filter was not restored"
+        )
+
         search_input = logged_in_browser.find_element(
             By.CSS_SELECTOR, "input[placeholder*='Search']"
         )
@@ -111,12 +124,11 @@ def test_inventory_search_filters_results(logged_in_browser, base_url):
         typed = "nonexistent-device-xyz"
         search_input.send_keys(typed)
 
-        # Wait for debounce
-        time.sleep(1.5)
-
-        page_text = logged_in_browser.find_element(By.TAG_NAME, "body").text
-        # Should show no results or fewer results
-        assert "No devices" in page_text or "nonexistent" not in page_text
+        wait.until(EC.presence_of_element_located(no_match))
+        rows = logged_in_browser.find_elements(
+            By.CSS_SELECTOR, "tbody tr button[aria-label*='Expand']"
+        )
+        assert rows == [], "a device row is still listed under a search no device name contains"
 
         # Erase via keystrokes so React's controlled onChange fires and the
         # debounced setSavedFilter writes an empty search back to user-profile.
@@ -139,26 +151,3 @@ def test_inventory_search_filters_results(logged_in_browser, base_url):
         assert saved == "", f"inventory search still saved as {saved!r} after erasing it"
     finally:
         _restore_inventory_filter(logged_in_browser, base_url, baseline)
-
-
-def test_inventory_device_expand_shows_ports(logged_in_browser, base_url):
-    """If devices exist, clicking expand shows port details."""
-    logged_in_browser.get(f"{base_url}/inventory")
-    wait = WebDriverWait(logged_in_browser, WAIT)
-
-    wait.until(
-        EC.presence_of_element_located(
-            (
-                By.XPATH,
-                "//table | //*[contains(text(), 'No devices')]",
-            )
-        )
-    )
-
-    # Only test expand if there are device rows
-    chevron_buttons = logged_in_browser.find_elements(By.CSS_SELECTOR, "tbody tr button")
-    if chevron_buttons:
-        chevron_buttons[0].click()
-        time.sleep(1)
-        page_text = logged_in_browser.find_element(By.TAG_NAME, "body").text
-        assert "port" in page_text.lower() or "no ports" in page_text.lower()

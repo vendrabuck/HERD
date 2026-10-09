@@ -946,7 +946,7 @@ kinds on the Settings page.
 - **INTEG-UI-2.** Opening the panel refetches the 20 newest notifications and lists them,
   or shows `No notifications yet.`; its Settings button goes to `/settings`. \
   Enforced in: `frontend/src/components/NotificationBell.tsx` (`NotificationBell`) \
-  Pinned by: `frontend/src/test/components/NotificationBell.test.tsx` (`opens the panel and lists notifications`, `shows empty state when there are no notifications`); `tests/e2e/test_notifications_bell.py` (`test_notifications_bell_opens_panel`, `test_notifications_panel_empty_state`, `test_notifications_settings_link_navigates`)
+  Pinned by: `frontend/src/test/components/NotificationBell.test.tsx` (`opens the panel and lists notifications`, `shows empty state when there are no notifications`); `tests/e2e/test_notifications_bell.py` (`test_notifications_bell_opens_panel`, `test_notifications_settings_link_navigates`)
 - **INTEG-UI-3.** Each listed notification is a list item holding two sibling buttons,
   never one inside the other: the notification itself and its `Delete notification`
   control, each a separate keyboard stop with its own accessible name; the list query

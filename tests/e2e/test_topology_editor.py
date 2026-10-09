@@ -88,17 +88,42 @@ def test_topology_editor_equipment_panel_collapses(
 def test_topology_editor_search_filters_palette(
     logged_in_browser, base_url, transient_topology
 ):
-    """Typing in the palette search filters the device list."""
+    """Typing in the palette search filters the device list.
+
+    Issue #1148: the old check ("no devices found" or the typed term absent from
+    the body) could not fail, since an input's value is never part of `.text`.
+    Now two palette devices are picked through the API; typing the second one's
+    full name must remove the first one's card and keep the second's.
+    """
+    duts = api_request(
+        logged_in_browser,
+        "GET",
+        "/inventory/devices",
+        params={"dut_only": "true", "limit": 50},
+    ).json()["items"]
+    keep = next(
+        (d for d in duts if any(d["name"].lower() not in o["name"].lower() for o in duts)),
+        None,
+    )
+    if keep is None:
+        pytest.skip("needs two DUT devices with distinct names; none seeded yet")
+    gone = next(o for o in duts if keep["name"].lower() not in o["name"].lower())
+
+    def _card(name):
+        return (By.XPATH, f"//*[@draggable]//p[normalize-space()='{name}']")
+
     _open_editor(logged_in_browser, base_url, transient_topology["id"])
     wait = WebDriverWait(logged_in_browser, WAIT)
     search = wait.until(EC.presence_of_element_located((By.ID, "eq-search")))
+    wait.until(EC.presence_of_element_located(_card(gone["name"])))
     search.clear()
-    typed = "nonexistent-device-xyz"
+    typed = keep["name"]
     search.send_keys(typed)
 
-    time.sleep(1.0)  # debounce via useDeferredValue
-    body = logged_in_browser.find_element(By.TAG_NAME, "body").text.lower()
-    assert "no devices found" in body or "nonexistent" not in body
+    # Absent from the DOM, not merely hidden: a long palette scrolls, and a card
+    # scrolled out of view must not count as filtered.
+    wait.until(lambda d: d.find_elements(*_card(gone["name"])) == [])
+    wait.until(EC.presence_of_element_located(_card(keep["name"])))
 
     # Remove the text via keystrokes so React's onChange fires (element.clear()
     # alone does not). Then wait out the user-profile debounce (200ms) so the
