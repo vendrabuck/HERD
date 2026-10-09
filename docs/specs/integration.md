@@ -43,7 +43,7 @@ routes (#1080). Rules beyond role are numbered in section 8.
 | Actor | May | May not |
 |---|---|---|
 | User | Call every `/api/v1/reservations` route with their own access token or an exchanged API token (INTEG-FACADE-1); read, mark read, and delete their own notifications (INTEG-INAPP-2); read and change their own notification preferences (INTEG-PREFS-1) | Register, read, or delete a webhook (INTEG-HOOK-1); see another user's notifications; reach any reservation route the facade does not expose (INTEG-FACADE-11) |
-| Admin | Everything a user may; register, list, read, and delete webhook subscriptions and read their delivery ledgers (INTEG-HOOK-1); receive every device health notification (INTEG-HEALTH-1) | Pause a webhook without deleting it (INTEG-HOOK-9) |
+| Admin | Everything a user may; register, list, read, pause, resume, and delete webhook subscriptions and read their delivery ledgers (INTEG-HOOK-1, INTEG-HOOK-9); receive every device health notification (INTEG-HEALTH-1) | Change a subscription's URL, event names, or secret (INTEG-HOOK-9) |
 | Superadmin | Same as admin | Same as admin |
 | Another service (internal token) | Nothing: neither service serves an internal route | |
 | External receiver | Receive signed POSTs for the event names a subscription lists (INTEG-HOOK-11, INTEG-HOOK-12) | Call anything back; the delivery is one-way |
@@ -114,12 +114,13 @@ them.
 | POST | `/api/v1/webhooks` | admin or superadmin | 201 | INTEG-HOOK-1 to INTEG-HOOK-5 |
 | GET | `/api/v1/webhooks` | admin or superadmin | 200 | INTEG-HOOK-1, INTEG-HOOK-6 |
 | GET | `/api/v1/webhooks/{webhook_id}` | admin or superadmin | 200 | INTEG-HOOK-1, INTEG-HOOK-6 |
+| PATCH | `/api/v1/webhooks/{webhook_id}` | admin or superadmin | 200 | INTEG-HOOK-1, INTEG-HOOK-9 |
 | DELETE | `/api/v1/webhooks/{webhook_id}` | admin or superadmin | 204 | INTEG-HOOK-1, INTEG-HOOK-7, INTEG-HOOK-8 |
 | GET | `/api/v1/webhooks/{webhook_id}/deliveries` | admin or superadmin | 200 | INTEG-HOOK-1, INTEG-HOOK-10 |
 | GET | `/api/v1/version` | anyone | 200 | INTEG-VERSION-2 |
 | GET | `/api/v1/health` | anyone | 200 | INTEG-VERSION-3 |
-| POST | `/api/v1/webhooks/echo` | anyone, only when the test sink is enabled | 200 | INTEG-SINK-1, INTEG-SINK-2 |
-| GET | `/api/v1/webhooks/echo/hits?event_id` | anyone, only when the test sink is enabled | 200 | INTEG-SINK-1, INTEG-SINK-3 |
+| POST | `/webhooks/echo` (in-network, `http://integration:8000`) | a caller inside the stack network, only when the test sink is enabled; through the gateway it is 403 | 200 | INTEG-SINK-1, INTEG-SINK-2 |
+| GET | `/api/v1/webhooks/echo/hits?event_id` | admin or superadmin, only when the test sink is enabled | 200 | INTEG-SINK-1, INTEG-SINK-3 |
 | GET | `/api/notifications/notifications?limit&offset&unread_only` | any valid access token, own rows | 200 | INTEG-INAPP-2 to INTEG-INAPP-4 |
 | GET | `/api/notifications/notifications/unread-count` | any valid access token, own rows | 200 | INTEG-INAPP-2, INTEG-INAPP-5 |
 | PATCH | `/api/notifications/notifications/{notification_id}/read` | the row's owner | 200 | INTEG-INAPP-2, INTEG-INAPP-6, INTEG-INAPP-7 |
@@ -147,8 +148,8 @@ event (section 8.3). Dead-letter copies go to the four subjects below, retained 
 |---|---|---|---|---|
 | `herd.reservations.*` (every reservation event) | reservations | integration (`integration-webhooks-consumer`) | POSTs the message to every active subscription listing its `event` name | INTEG-CONSUME-1, INTEG-HOOK-11 to INTEG-HOOK-22 |
 | `herd.health.status_changed` (`device.health_transition`) | execution | integration (`integration-webhooks-health-consumer`) | the same | INTEG-CONSUME-1, INTEG-HOOK-11 |
-| `herd.reservations.created`, `updated`, `cancelled`, `completed`, `expiring_soon` | reservations | notifications (`notifications-consumer`) | one notification to the reservation's owner, on each channel they enabled | INTEG-ROUTE-1, INTEG-ROUTE-3 to INTEG-ROUTE-5, INTEG-PREFS-9 |
-| `herd.reservations.failed`, `provision_requested`, `wiring_changed` | reservations | notifications | nothing; acked | INTEG-ROUTE-2 |
+| `herd.reservations.created`, `updated`, `cancelled`, `completed`, `failed`, `expiring_soon` | reservations | notifications (`notifications-consumer`) | one notification to the reservation's owner, on each channel they enabled | INTEG-ROUTE-1, INTEG-ROUTE-3 to INTEG-ROUTE-6, INTEG-PREFS-9 |
+| `herd.reservations.provision_requested`, `wiring_changed` | reservations | notifications | nothing; acked | INTEG-ROUTE-2 |
 | `herd.health.status_changed` (`device.health_transition`) | execution | notifications (`notifications-health-consumer`) | one notification to every admin and every active holder of the device | INTEG-HEALTH-1 to INTEG-HEALTH-7 |
 
 Only the seven event names in `KNOWN_EVENT_TYPES` can be subscribed (INTEG-HOOK-3), so a
@@ -295,10 +296,10 @@ enforces it.
 ### 8.3 Webhook subscriptions
 
 **What it does.** An admin registers an HTTP endpoint and the event names it wants, gets
-back a signing secret once, and can list, read, and delete subscriptions and read each
-one's delivery history.
+back a signing secret once, and can list, read, pause, resume, and delete subscriptions
+and read each one's delivery history.
 
-**Surfaces.** The five `/api/v1/webhooks` routes (section 5),
+**Surfaces.** The six `/api/v1/webhooks` routes (section 5),
 `services/integration/app/routers/webhooks.py`; validation in
 `services/integration/app/schemas/webhook.py`.
 
@@ -347,20 +348,29 @@ one's delivery history.
 - **INTEG-HOOK-8.** Deleting a subscription deletes its delivery ledger rows through the
   `ON DELETE CASCADE` foreign key. \
   Enforced in: `services/integration/migrations/versions/0002_webhooks.py` (`CASCADE`); `services/integration/app/models/webhook.py` (`WebhookDelivery`) \
-  Pinned by: none (issue #1081)
-- **INTEG-HOOK-9.** A subscription is created with `is_active` true and no route or task
-  ever changes it, so the only way to stop deliveries is to delete the subscription and
-  its history. Known gap, see #1078. \
-  Enforced in: `services/integration/app/models/webhook.py` (`WebhookSubscription`); `services/integration/app/routers/webhooks.py` (`create_webhook`) \
-  Pinned by: `services/integration/tests/test_webhooks_router_direct.py` (`test_create_webhook_direct_sets_created_by_from_sub`)
+  Pinned by: `services/integration/tests/test_webhooks.py` (`test_subscription_delete_cascades_to_ledger_rows_when_fks_are_enforced`); `tests/integration/test_webhooks_flow.py` (`test_deleting_a_subscription_deletes_its_ledger_rows`)
+- **INTEG-HOOK-9.** A subscription is created with `is_active` true. `PATCH
+  /webhooks/{webhook_id}` with the body `{"is_active": <boolean>}` pauses (false) or
+  resumes (true) it and answers the subscription without its secret (#1078). Any other
+  key, a missing or null `is_active`, or a value that is not a JSON boolean is 422 (the
+  validation envelope) and changes nothing; an unknown id is 404 `Webhook not found`. The
+  delivery ledger is kept. A paused subscription is left out of every event whose
+  targets are loaded after the commit (INTEG-HOOK-11) and gains no ledger row for it;
+  nothing is queued, so resuming does not replay the events it missed, and a later
+  redelivery of an event that has no row for the subscription delivers it normally. A
+  delivery whose targets were loaded before the pause is not interrupted: it makes its
+  remaining attempts and records its row. The change is logged with action
+  `webhook_active_changed`. \
+  Enforced in: `services/integration/app/routers/webhooks.py` (`update_webhook`); `services/integration/app/schemas/webhook.py` (`WebhookUpdate`); `services/integration/app/services/delivery.py` (`load_matching_targets`) \
+  Pinned by: `services/integration/tests/test_webhooks.py` (`test_patch_pauses_and_resumes_a_subscription`, `test_patch_requires_admin`, `test_patch_unknown_webhook_is_404`, `test_patch_refuses_anything_but_a_boolean_is_active`, `test_patch_keeps_the_delivery_ledger`, `test_paused_subscription_gets_no_new_event_and_nothing_queued`, `test_delivery_loaded_before_a_pause_finishes_its_attempts`); `services/integration/tests/test_webhooks_router_direct.py` (`test_create_webhook_direct_sets_created_by_from_sub`, `test_update_webhook_direct_toggles_is_active`, `test_update_webhook_direct_404_raises_http_exception`); `tests/integration/test_webhooks_flow.py` (`test_paused_webhook_receives_nothing_until_resumed`)
 - **INTEG-HOOK-10.** The delivery history of a subscription is returned newest first;
   `limit` defaults to 100 and is clamped into 1 to 500 rather than refused; an unknown
   subscription is 404 `Webhook not found`. \
   Enforced in: `services/integration/app/routers/webhooks.py` (`list_deliveries`) \
   Pinned by: `services/integration/tests/test_webhooks.py` (`test_deliveries_endpoint_lists_ledger`, `test_deliveries_endpoint_404_for_missing_webhook`, `test_deliveries_endpoint_clamps_limit`); `services/integration/tests/test_webhooks_router_direct.py` (`test_list_deliveries_direct_orders_newest_first_and_returns_rows`)
 
-**Out of scope.** Editing a subscription (there is no update route); rotating a secret
-other than by deleting and re-registering.
+**Out of scope.** Changing a subscription's URL, event names, or description (the only
+update is `is_active`); rotating a secret other than by deleting and re-registering.
 
 ### 8.4 Webhook delivery
 
@@ -401,14 +411,14 @@ and then recorded as dead without holding up anyone else.
   Pinned by: `services/integration/tests/test_webhooks.py` (`test_delivery_persistent_failure_retries_then_dead`, `test_delivery_connection_error_is_retried_then_dead`); `services/integration/tests/test_webhook_destinations.py` (`test_delivery_ledger_records_the_answer_status_only`, `test_delivery_ledger_records_the_exception_class_only`); `tests/integration/test_webhooks_flow.py` (`test_webhook_failure_dead_letters`)
 - **INTEG-HOOK-15.** A redelivered or republished event whose row is `dead` is POSTed
   again, and the same row is overwritten with the new outcome and a fresh attempt
-  count. \
+  count; `response_status` and `last_error` are those of the new pass. \
   Enforced in: `services/integration/app/services/delivery.py` (`deliver_one`, `_record`) \
-  Pinned by: none (issue #1081)
+  Pinned by: `services/integration/tests/test_webhooks.py` (`test_redelivered_event_with_dead_row_is_retried_and_overwrites_it`, `test_redelivered_event_with_dead_row_that_fails_again_resets_attempts`)
 - **INTEG-HOOK-16.** When a concurrent delivery of the same (subscription, event) wrote
   its row first, the losing insert is rolled back and logged, and the delivery returns
-  its own outcome without raising. \
+  its own outcome without raising; the ledger keeps the first writer's row. \
   Enforced in: `services/integration/app/services/delivery.py` (`_record`) \
-  Pinned by: none (issue #1081)
+  Pinned by: `services/integration/tests/test_webhooks.py` (`test_concurrent_delivery_that_wrote_first_wins_the_ledger_row`)
 - **INTEG-HOOK-17.** A redelivered or republished event whose row for a subscription is
   `delivered` is not POSTed again and gains no second row. \
   Enforced in: `services/integration/app/services/delivery.py` (`deliver_one`); `services/integration/app/models/webhook.py` (`uq_webhook_delivery_subscription_event`) \
@@ -523,8 +533,8 @@ the stream nor causes a duplicate.
 ### 8.6 Test delivery sink
 
 **What it does.** On the development and test stack only, the integration service hosts
-a receiver that always accepts a delivery, can answer slowly, and counts arrivals, so the
-live tests can prove a delivery arrives exactly once.
+a receiver that accepts a delivery made inside the stack network, can answer slowly, and
+counts arrivals for an admin, so the live tests can prove a delivery arrives exactly once.
 
 **Surfaces.** `test_sink_router` in `services/integration/app/routers/webhooks.py`,
 registered by `services/integration/app/main.py`; `docker-compose.override.yml`.
@@ -536,16 +546,23 @@ registered by `services/integration/app/main.py`; `docker-compose.override.yml`.
   OpenAPI document. \
   Enforced in: `services/integration/app/main.py` (`webhook_test_sink_enabled`); `docker-compose.override.yml` (`WEBHOOK_TEST_SINK_ENABLED`) \
   Pinned by: `services/integration/tests/test_webhooks_router_direct.py` (`test_sink_routes_stay_out_of_the_published_schema`)
-- **INTEG-SINK-2.** `POST /webhooks/echo` needs no authentication and answers 200
-  `{"ok": true, "received_bytes": N}`, after sleeping `delay_ms` clamped into 0 to
-  10000. \
-  Enforced in: `services/integration/app/routers/webhooks.py` (`echo_receiver`, `SINK_MAX_DELAY_MS`) \
-  Pinned by: `services/integration/tests/test_webhooks_router_direct.py` (`test_echo_receiver_reports_received_byte_count`, `test_echo_receiver_delay_ms_sleeps_and_is_clamped`)
+- **INTEG-SINK-2.** `POST /webhooks/echo` takes no token (its sender is integration's
+  own delivery worker, which sends only the signing headers) but accepts only a request
+  made inside the stack network: a request carrying `X-Forwarded-For` or `X-Real-Ip`,
+  which Traefik adds to every request it forwards, arrived through the gateway and is
+  refused with 403 `The test sink accepts deliveries from inside the stack network only`
+  before its body is read or counted, logged with action `webhook_sink_gateway_refused`
+  (#1107). An accepted POST answers 200 `{"ok": true, "received_bytes": N}`, after
+  sleeping `delay_ms` clamped into 0 to 10000. \
+  Enforced in: `services/integration/app/routers/webhooks.py` (`echo_receiver`, `_arrived_through_gateway`, `SINK_GATEWAY_REFUSED_DETAIL`, `SINK_MAX_DELAY_MS`) \
+  Pinned by: `services/integration/tests/test_webhooks_router_direct.py` (`test_echo_receiver_reports_received_byte_count`, `test_echo_receiver_delay_ms_sleeps_and_is_clamped`, `test_echo_receiver_refuses_a_request_that_came_through_the_gateway`, `test_echo_receiver_accepts_a_direct_in_network_delivery`); `tests/integration/test_webhooks_flow.py` (`test_echo_sink_is_closed_through_the_gateway`, `test_webhook_delivered_exactly_once`)
 - **INTEG-SINK-3.** The sink counts each arrival by the body's string `event_id` before
   any delay, keeps at most 1000 ids (oldest dropped), ignores bodies without one, and
-  `GET /webhooks/echo/hits?event_id` answers `{event_id, count}`. \
-  Enforced in: `services/integration/app/routers/webhooks.py` (`_record_sink_hit`, `echo_hits`, `_SINK_HITS_MAX_KEYS`) \
-  Pinned by: `services/integration/tests/test_webhooks_router_direct.py` (`test_echo_receiver_counts_arrivals_per_event_id`, `test_echo_receiver_ignores_bodies_without_a_string_event_id`, `test_echo_receiver_hit_table_is_bounded`)
+  `GET /webhooks/echo/hits?event_id` answers `{event_id, count}` to an admin or
+  superadmin only (INTEG-HOOK-1's gate; any other role is 403, no token is refused)
+  (#1107). \
+  Enforced in: `services/integration/app/routers/webhooks.py` (`_record_sink_hit`, `echo_hits`, `require_admin`, `_SINK_HITS_MAX_KEYS`) \
+  Pinned by: `services/integration/tests/test_webhooks_router_direct.py` (`test_echo_receiver_counts_arrivals_per_event_id`, `test_echo_receiver_ignores_bodies_without_a_string_event_id`, `test_echo_receiver_hit_table_is_bounded`, `test_echo_hits_requires_an_admin_token`); `tests/integration/test_webhooks_flow.py` (`test_echo_sink_is_closed_through_the_gateway`); `tests/integration/test_webhook_slow_receiver_live.py` (`test_slow_receiver_gets_the_event_exactly_once`)
 - **INTEG-SINK-4.** The development and test stack pins integration's
   `NATS_ACK_WAIT_SECONDS` to 4, and only integration's, so a live test's slow receiver
   outlasts `ack_wait` inside the test time limit. \
@@ -628,7 +645,7 @@ event is delivered twice.
 ### 8.8 Event routing
 
 **What it does.** A reservation's owner is told when it goes live, changes in a way that
-matters, is cancelled, completes, or is about to end.
+matters, is cancelled, completes, fails, or is about to end.
 
 **Surfaces.** `build_messages` in `services/notifications/app/services/event_router.py`.
 
@@ -642,10 +659,9 @@ matters, is cancelled, completes, or is about to end.
   Enforced in: `services/notifications/app/services/event_router.py` (`build_messages`, `_RENDERERS`, `_device_summary`) \
   Pinned by: `services/notifications/tests/test_event_router.py` (`test_created_event_produces_single_message`, `test_expiring_soon_event_produces_single_message`, `test_cancelled_and_completed_events_emit`, `test_created_event_zero_devices`); `tests/integration/test_notifications_flow.py` (`test_reservation_created_produces_in_app_notification`); `tests/integration/test_notification_channels_flow.py` (`test_expiring_soon_reminder_produces_single_notification`)
 - **INTEG-ROUTE-2.** Every other event name produces nothing and the message is acked:
-  `reservation.failed`, `provision_requested`, and `wiring_changed` included, so the
-  owner of a failed reservation is not notified. Known gap, see #1077. \
+  `reservation.provision_requested` and `reservation.wiring_changed` included. \
   Enforced in: `services/notifications/app/services/event_router.py` (`build_messages`, `_RENDERERS`) \
-  Pinned by: `services/notifications/tests/test_event_router.py` (`test_unknown_event_is_skipped`)
+  Pinned by: `services/notifications/tests/test_event_router.py` (`test_unknown_event_is_skipped`, `test_other_unrendered_reservation_events_are_still_skipped`)
 - **INTEG-ROUTE-3.** `reservation.updated` produces a message only when devices were
   added or removed or the end time changed (the `end_time_changed` flag, or for an older
   payload without it, a non-empty `end_time`). \
@@ -659,6 +675,16 @@ matters, is cancelled, completes, or is about to end.
   stored with the notification and returned by the list. \
   Enforced in: `services/notifications/app/services/event_router.py` (`build_messages`) \
   Pinned by: `services/notifications/tests/test_event_router.py` (`test_created_event_produces_single_message`)
+
+- **INTEG-ROUTE-6.** `reservation.failed` produces one message for the payload's
+  `user_id`, titled `Reservation failed`, with the body `Reservation <first eight
+  characters of the id> for <device count> failed.` (`Reservation for <device count>
+  failed.` when the payload has no `reservation_id`). The text is built from the id and
+  the device count only, so no upstream error text reaches any channel (#1077). The event
+  key is in `DEFAULT_EVENT_TYPES`, so it is on unless the user stored it off, including
+  for a user whose stored preferences predate the key (INTEG-PREFS-1). \
+  Enforced in: `services/notifications/app/services/event_router.py` (`_render_failed`, `_reservation_label`, `_RENDERERS`); `services/notifications/app/schemas/preferences.py` (`DEFAULT_EVENT_TYPES`, `with_defaults`) \
+  Pinned by: `services/notifications/tests/test_event_router.py` (`test_failed_event_notifies_the_owner`, `test_failed_event_text_carries_no_upstream_error_text`, `test_failed_event_without_reservation_id_still_notifies`, `test_failed_event_without_user_id_is_skipped`); `services/notifications/tests/test_preferences.py` (`test_stored_preferences_predating_the_key_receive_it_on`, `test_explicit_opt_out_of_failed_is_kept`); `services/notifications/tests/test_preferences_client.py` (`test_preferences_predating_reservation_failed_read_it_as_on`); `services/notifications/tests/test_nats_consumer.py` (`test_handle_event_delivers_failed_under_preferences_predating_the_key`, `test_handle_event_failed_respects_opt_out`); `services/notifications/tests/test_router.py` (`test_put_preferences_predating_failed_writes_it_on`, `test_get_preferences_predating_failed_reads_it_on`); `tests/integration/test_reservation_failed_notification.py` (`test_failed_reservation_notifies_owner_in_app`)
 
 **Out of scope.** When reservations stages each event (`reservations.md`, section 6).
 
@@ -808,7 +834,7 @@ they hear about; everything is on in the app by default and off everywhere else.
 - **INTEG-PREFS-5.** A write's `channels`, when present, replaces the stored channels as
   a whole object, so a channel the body omits is reset to its default rather than kept. \
   Enforced in: `services/notifications/app/routers/notifications.py` (`put_preferences`); `services/notifications/app/schemas/preferences.py` (`NotificationPreferencesUpdate`) \
-  Pinned by: none (issue #1081)
+  Pinned by: `services/notifications/tests/test_router.py` (`test_put_preferences_channels_replace_the_stored_object_whole`, `test_put_preferences_without_channels_keeps_stored_channels`)
 - **INTEG-PREFS-6.** Only a 200 from user-profile is cached, for
   `PREFERENCES_CACHE_TTL_SECONDS`. The defaults a failed consumer-side fetch answers
   (INTEG-PREFS-7) cover only the event that hit the failure; they are returned as
@@ -885,10 +911,11 @@ others or the bell.
   Pinned by: `services/notifications/tests/test_email_dispatcher.py` (`test_send_smtp_builds_message_and_sends_plain`, `test_send_smtp_starttls_and_login_when_configured`, `test_send_smtp_tls_without_credentials_skips_login`, `test_send_runs_send_smtp_in_thread_when_configured`)
 - **INTEG-OUT-8.** The webhook channel POSTs compact JSON `{user_id, event_type, title,
   body, data, dedupe_key}` signed `X-HERD-Signature: sha256=<hex>` over the exact bytes
-  with `WEBHOOK_SIGNING_SECRET`, using its own copy of the signing function rather than
-  the shared one. Known gap, see #1079. \
-  Enforced in: `services/notifications/app/services/dispatchers/webhook.py` (`WebhookDispatcher`, `sign_body`) \
-  Pinned by: `services/notifications/tests/test_outbound_dispatchers.py` (`test_webhook_posts_signed_when_configured`, `test_sign_body_is_hmac_sha256_hex`)
+  with `WEBHOOK_SIGNING_SECRET`, through the shared `sign_body` and
+  `WEBHOOK_SIGNATURE_HEADER` that integration's registered webhooks also use (#1079), so
+  the two outbound paths sign identically. \
+  Enforced in: `services/notifications/app/services/dispatchers/webhook.py` (`WebhookDispatcher`); `services/common/herd_common/webhooks.py` (`sign_body`, `WEBHOOK_SIGNATURE_HEADER`) \
+  Pinned by: `services/notifications/tests/test_outbound_dispatchers.py` (`test_webhook_posts_signed_when_configured`, `test_sign_body_is_hmac_sha256_hex`, `test_webhook_channel_signs_through_the_shared_helper`, `test_webhook_channel_bytes_and_headers_unchanged_by_shared_signer`)
 - **INTEG-OUT-9.** The chat channel POSTs `{"text": "[<username>] <title>: <body>"}` to
   the one configured chat URL. \
   Enforced in: `services/notifications/app/services/dispatchers/chat.py` (`ChatDispatcher`) \
@@ -931,11 +958,11 @@ kinds on the Settings page.
   Enforced in: `frontend/src/components/NotificationBell.tsx` (`handleItemClick`) \
   Pinned by: `frontend/src/test/components/NotificationBell.test.tsx` (`clicking an unread notification marks it read through the API`, `clicking a read notification sends nothing`, `Mark all read is disabled while nothing is unread`, `Mark all read is enabled while something is unread`); `tests/e2e/test_flows_effects_playwright.py` (`test_notification_round_trip`)
 - **INTEG-UI-5.** The Settings page shows the in-app toggle, the three outbound toggles
-  (off unless stored on), and one toggle per event kind for the six kinds notifications
-  renders; Save sends all channels and events and toasts `Preferences saved` or
+  (off unless stored on), and one toggle per event kind for the seven kinds notifications
+  renders (`Reservation failed` since #1077), each on unless stored off; Save sends all channels and events and toasts `Preferences saved` or
   `Failed to save preferences`. \
   Enforced in: `frontend/src/pages/SettingsPage.tsx` (`SettingsPage`, `EVENT_LABELS`, `OUTBOUND_CHANNELS`, `handleSave`) \
-  Pinned by: `frontend/src/test/pages/SettingsPage.test.tsx` (`shows a loading state then renders all event toggles`, `renders outbound channel toggles defaulting off`, `toggling and saving sends the new payload to the API`, `toasts an error when the save call fails`); `tests/e2e/test_settings_page.py` (`test_settings_event_toggle_round_trip`, `test_settings_email_channel_round_trip`)
+  Pinned by: `frontend/src/test/pages/SettingsPage.test.tsx` (`shows a loading state then renders all event toggles`, `shows the failed event on by default and sends an opt-out explicitly`, `renders outbound channel toggles defaulting off`, `toggling and saving sends the new payload to the API`, `toasts an error when the save call fails`); `tests/e2e/test_settings_page.py` (`test_settings_event_toggle_round_trip`, `test_settings_email_channel_round_trip`, `test_settings_shows_failed_event_toggle_checked_by_default`)
 
 **Out of scope.** The header layout around the bell (`frontend/src/components/layout/AppLayout.tsx`).
 
@@ -947,10 +974,10 @@ kinds on the Settings page.
 | 401 | `Could not validate credentials` | bad, expired, or subject-less token | INTEG-FACADE-1 |
 | 401 | `Invalid subject in token` | a notification route with a `sub` that is not a UUID | INTEG-INAPP-2 |
 | 403 | `Admin or superadmin role required` | a webhook route without an admin role | INTEG-HOOK-1 |
-| 404 | `Webhook not found` | unknown subscription on read, delete, or deliveries | INTEG-HOOK-6, INTEG-HOOK-7, INTEG-HOOK-10 |
+| 404 | `Webhook not found` | unknown subscription on read, pause or resume, delete, or deliveries | INTEG-HOOK-6, INTEG-HOOK-7, INTEG-HOOK-9, INTEG-HOOK-10 |
 | 422 | `target_url must resolve to a public address` | a webhook destination whose host is not public, not allowlisted, or does not resolve | INTEG-HOOK-2 |
 | 404 | `Notification not found` | unknown or foreign notification on mark read or delete | INTEG-INAPP-6, INTEG-INAPP-9 |
-| 422 | FastAPI validation envelope | a facade body that fails `V1ReservationRequest`; a facade reservation id that is not a UUID; a webhook body with a bad URL, unknown or empty event types, or an over-long field; a facade list or notification list parameter out of range | INTEG-FACADE-4, INTEG-FACADE-6, INTEG-FACADE-15, INTEG-HOOK-2, INTEG-HOOK-3, INTEG-INAPP-3 |
+| 422 | FastAPI validation envelope | a facade body that fails `V1ReservationRequest`; a facade reservation id that is not a UUID; a webhook body with a bad URL, unknown or empty event types, or an over-long field; a webhook PATCH body that is not exactly a boolean `is_active`; a facade list or notification list parameter out of range | INTEG-FACADE-4, INTEG-FACADE-6, INTEG-FACADE-15, INTEG-HOOK-2, INTEG-HOOK-3, INTEG-HOOK-9, INTEG-INAPP-3 |
 | upstream status | upstream `detail`, body, or text | reservations refused a facade call | INTEG-FACADE-12, INTEG-FACADE-13 |
 | 503 | `Reservations service unavailable` | reservations unreachable or slower than 10 seconds | INTEG-FACADE-14 |
 | 503 | `user-profile unreachable` | user-profile unreachable on a preferences read or write | INTEG-PREFS-3 |
@@ -1013,9 +1040,9 @@ calls in notifications; the 20-item bell list and its 30 second unread poll.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/integration/tests/` (`test_facade.py`, `test_webhooks.py`, `test_webhook_destinations.py`, `test_webhooks_router_direct.py`, `test_nats_consumer.py`, `test_nats_consumer_lifecycle.py`, `test_nats_consumer_heartbeat.py`, `test_version.py`, `test_config_ack_wait.py`); `services/notifications/tests/` (every file); `tests/unit/test_consumer_heartbeat_wiring.py`; the frontend tests named in section 8.13 | In-memory SQLite, upstreams and NATS stubbed; SQLite does not enforce the cascade of INTEG-HOOK-8 |
+| Unit | `services/integration/tests/` (`test_facade.py`, `test_webhooks.py`, `test_webhook_destinations.py`, `test_webhooks_router_direct.py`, `test_nats_consumer.py`, `test_nats_consumer_lifecycle.py`, `test_nats_consumer_heartbeat.py`, `test_version.py`, `test_config_ack_wait.py`); `services/notifications/tests/` (every file); `tests/unit/test_consumer_heartbeat_wiring.py`; the frontend tests named in section 8.13 | In-memory SQLite, upstreams and NATS stubbed; SQLite enforces the cascade of INTEG-HOOK-8 only in the one test that turns on `PRAGMA foreign_keys` |
 | Functional (through the service API) | the httpx-against-the-app tests in `test_facade.py`, `test_webhooks.py`, and `services/notifications/tests/test_router.py`; `services/notifications/tests/test_functional_dispatch_path.py` | The facade's upstream is a stubbed transport |
-| Integration (running stack) | `tests/integration/test_v1_facade.py`, `test_webhooks_flow.py`, `test_webhook_slow_receiver_live.py`, `test_notifications_flow.py`, `test_notification_channels_flow.py`, `test_health_alerting_flow.py`, `test_nats_consumer_configs_live.py`; `tests/contract/test_openapi_schema.py` | The health tests publish the event straight to `HERD_HEALTH` with a fresh `event_id` rather than driving the poller. The slow-receiver test binds a peer consumer and flakes on a stack other sessions use |
+| Integration (running stack) | `tests/integration/test_v1_facade.py`, `test_webhooks_flow.py`, `test_webhook_slow_receiver_live.py`, `test_notifications_flow.py`, `test_notification_channels_flow.py`, `test_reservation_failed_notification.py`, `test_health_alerting_flow.py`, `test_nats_consumer_configs_live.py`; `tests/contract/test_openapi_schema.py` | The health tests publish the event straight to `HERD_HEALTH` with a fresh `event_id` rather than driving the poller. The slow-receiver test binds a peer consumer and flakes on a stack other sessions use |
 | Stress and load | `tests/load/locustfile.py` (`NotificationUser`: unread count, list, preference reads and writes) | Nothing loads the facade, webhook fan-out, or the consumers |
 | Browser end-to-end | `tests/e2e/test_notifications_bell.py`, `tests/e2e/test_settings_page.py` | `tests/e2e/test_flows_effects_playwright.py` (`test_notification_round_trip`) clicks mark read; nothing clicks delete in a browser; the facade and webhooks have no interface |
 
@@ -1032,12 +1059,7 @@ Two documents are incomplete against the code this specification describes, trac
 
 ### Open defects
 
-- #1077 (INTEG-ROUTE-2): a failed reservation produces no notification and has no
-  preference toggle; nothing records this as a decision.
-- #1078 (INTEG-HOOK-9): a webhook subscription cannot be paused; `is_active` has no
-  write path.
-- #1079 (INTEG-OUT-8): the notifications webhook channel signs with a local copy of
-  `sign_body`.
+None at present.
 
 ### Limits by decision
 
@@ -1072,9 +1094,5 @@ Two documents are incomplete against the code this specification describes, trac
 - INTEG-FACADE-13: the error detail fallbacks for a body without `detail` or not JSON.
 - INTEG-VERSION-4: the published contract compared with the running service.
 - INTEG-HOOK-4: repeated event names stored once.
-- INTEG-HOOK-8: subscription delete cascades to its ledger rows.
-- INTEG-HOOK-15: a `dead` row retried and overwritten on redelivery.
-- INTEG-HOOK-16: the concurrent ledger insert race.
 - INTEG-HOOK-22: the ledger key with neither an event id nor metadata.
 - INTEG-INAPP-7: marking a read notification read again.
-- INTEG-PREFS-5: `channels` replaced whole on a write.

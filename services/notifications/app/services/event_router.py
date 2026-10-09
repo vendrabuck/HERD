@@ -76,6 +76,31 @@ def _render_completed(event: dict) -> tuple[str, str]:
     )
 
 
+def _reservation_label(event: dict) -> str:
+    """Name a reservation by the first eight characters of its id.
+
+    The frontend shows reservation ids in the same short form, so the owner can
+    match the notification to the row in the Reservations list.
+    """
+    raw = event.get("reservation_id")
+    if not raw:
+        return "Reservation"
+    return f"Reservation {str(raw)[:8]}"
+
+
+def _render_failed(event: dict) -> tuple[str, str]:
+    """Issue #1077: tell the owner a reservation failed.
+
+    The payload carries no failure reason by design, and the text is built only
+    from the reservation id and the device count, so no upstream error text can
+    reach any channel.
+    """
+    return (
+        "Reservation failed",
+        f"{_reservation_label(event)} for {_device_summary(event.get('device_ids'))} failed.",
+    )
+
+
 def _render_expiring_soon(event: dict) -> tuple[str, str]:
     return (
         "Reservation expiring soon",
@@ -106,6 +131,7 @@ _RENDERERS = {
     "reservation.updated": _render_updated,
     "reservation.cancelled": _render_cancelled,
     "reservation.completed": _render_completed,
+    "reservation.failed": _render_failed,
     "reservation.expiring_soon": _render_expiring_soon,
     "device.health_transition": _render_health_transition,
 }

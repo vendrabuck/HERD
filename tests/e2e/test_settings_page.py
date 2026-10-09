@@ -125,6 +125,17 @@ def test_settings_shows_expiring_soon_event_toggle(admin_browser, base_url):
     assert matches, "missing toggle for 'Reservation expiring soon'"
 
 
+def test_settings_shows_failed_event_toggle_checked_by_default(admin_browser, base_url):
+    """Settings page shows the reservation-failed toggle, on unless saved off (#1077)."""
+    _open_settings(admin_browser, base_url)
+    matches = admin_browser.find_elements(
+        By.XPATH, "//label[contains(., 'Reservation failed')]//input[@type='checkbox']"
+    )
+    assert matches, "missing toggle for 'Reservation failed'"
+    stored = api_request(admin_browser, "GET", PREFS_PATH).json()["events"]
+    assert matches[0].is_selected() is stored.get("reservation.failed", True)
+
+
 def test_settings_email_channel_round_trip(admin_browser, base_url, restore_prefs):
     """Enabling the email channel and saving persists channels.email (ROADMAP #40).
 

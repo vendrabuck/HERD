@@ -19,11 +19,14 @@ import pytest
 from app.database import Base
 from app.models.outbound_delivery import OutboundDelivery
 from app.services.contact_client import ContactClient, UserContact, set_contact_client
+from app.services.dispatchers import webhook as webhook_module
 from app.services.dispatchers.base import DispatchMessage
 from app.services.dispatchers.chat import ChatDispatcher
 from app.services.dispatchers.email import EmailDispatcher
 from app.services.dispatchers.outbound import _release, run_outbound
-from app.services.dispatchers.webhook import WebhookDispatcher, sign_body
+from app.services.dispatchers.webhook import WebhookDispatcher
+from herd_common import webhooks as shared_webhooks
+from herd_common.webhooks import sign_body
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -189,6 +192,55 @@ def test_sign_body_is_hmac_sha256_hex():
     secret = "topsecret"
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     assert sign_body(body, secret) == f"sha256={expected}"
+
+
+def test_webhook_channel_signs_through_the_shared_helper():
+    """Issue #1079: the channel uses herd_common.webhooks, not a local copy.
+
+    The dispatcher module's names are the shared objects themselves, so a change
+    to the shared signing scheme reaches both outbound paths together.
+    """
+    assert webhook_module.sign_body is shared_webhooks.sign_body
+    assert webhook_module.WEBHOOK_SIGNATURE_HEADER == "X-HERD-Signature"
+    assert webhook_module.WEBHOOK_SIGNATURE_HEADER is shared_webhooks.WEBHOOK_SIGNATURE_HEADER
+
+
+# The bytes, headers, and signature the channel sent for this fixed message
+# before issue #1079 moved signing to herd_common, captured from the old local
+# sign_body. A receiver must see no difference.
+_FIXED_USER_ID = uuid.UUID("11111111-2222-3333-4444-555555555555")
+_FIXED_SECRET = "fixed-secret"
+_FIXED_BODY = (
+    b'{"user_id":"11111111-2222-3333-4444-555555555555",'
+    b'"event_type":"reservation.created","title":"Reservation confirmed",'
+    b'"body":"body text","data":{"reservation_id":"r1"},'
+    b'"dedupe_key":"HERD_RESERVATIONS:7"}'
+)
+_FIXED_SIGNATURE = "sha256=f53d4875eb6dec383803543eb5469ce8835a55ef620c799e369ffcc6509529a6"
+
+
+@pytest.mark.asyncio
+async def test_webhook_channel_bytes_and_headers_unchanged_by_shared_signer():
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    client = AsyncMock()
+    client.post.return_value = resp
+    client.__aenter__.return_value = client
+    cfg = {"outbound_webhook_url": "http://hook", "webhook_signing_secret": _FIXED_SECRET}
+    with patch.multiple("app.services.dispatchers.webhook.settings", **cfg):
+        with patch("app.services.dispatchers.webhook.httpx.AsyncClient", return_value=client):
+            await WebhookDispatcher().send(
+                _session_factory,
+                _msg(user_id=_FIXED_USER_ID, dedupe_key="HERD_RESERVATIONS:7"),
+            )
+    client.post.assert_awaited_once()
+    args, kwargs = client.post.call_args
+    assert args == ("http://hook",)
+    assert kwargs["content"] == _FIXED_BODY
+    assert kwargs["headers"] == {
+        "Content-Type": "application/json",
+        "X-HERD-Signature": _FIXED_SIGNATURE,
+    }
 
 
 @pytest.mark.asyncio

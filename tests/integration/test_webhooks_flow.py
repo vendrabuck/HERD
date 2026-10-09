@@ -11,8 +11,10 @@ signed POST to the registered target. We assert the delivery ledger:
   - an unreachable / non-2xx receiver exhausts retries into a `dead` row,
     proving a failing target does not block delivery to others or the stream.
 
-The success receiver is the integration service's own unauthenticated echo sink
-(http://integration:8000/webhooks/echo), reachable on the docker network. The
+The success receiver is the integration service's own echo sink
+(http://integration:8000/webhooks/echo), reachable on the docker network; it
+refuses a POST that came through the gateway, and its hit count is admin-only
+(issue #1107, test_echo_sink_is_closed_through_the_gateway). The
 service /health endpoints are GET-only and would 405 a webhook POST, so they are
 not usable as a 2xx target.
 
@@ -29,9 +31,11 @@ import socket
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import nats
 import pytest
 from _nats_helpers import fetch_reservation_event
+from conftest import _psql
 
 pytestmark = pytest.mark.asyncio
 
@@ -336,3 +340,129 @@ async def test_webhook_delivered_for_health_transition(admin_client, fresh_devic
         assert delivered[0]["response_status"] == 200
     finally:
         await admin_client.delete(f"/v1/webhooks/{webhook_id}")
+
+
+async def test_paused_webhook_receives_nothing_until_resumed(admin_client, fresh_device):
+    """Issue #1078: PATCH {"is_active": false} pauses a subscription without deleting
+    it or its ledger; an event handled while it is paused gives it no row (a still
+    active control subscription proves the event was handled), and nothing is
+    replayed on resume, while the next event reaches it again."""
+    paused = await _register_webhook(
+        admin_client, ECHO_TARGET, event_types=["device.health_transition"]
+    )
+    control = await _register_webhook(
+        admin_client, ECHO_TARGET, event_types=["device.health_transition"]
+    )
+    try:
+        resp = await admin_client.patch(f"/v1/webhooks/{paused['id']}", json={"is_active": False})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["is_active"] is False
+        assert "secret" not in resp.json()
+
+        refused = await admin_client.patch(
+            f"/v1/webhooks/{paused['id']}",
+            json={"is_active": True, "target_url": ECHO_TARGET},
+        )
+        assert refused.status_code == 422, refused.text
+
+        missed = _health_transition_payload(fresh_device["id"])
+        await _publish_health_event(missed)
+        control_rows = await _poll_for_status(
+            admin_client, control["id"], {"delivered"}, event_id=missed["event_id"]
+        )
+        assert control_rows, "the control subscription never received the event"
+        ledger = await admin_client.get(f"/v1/webhooks/{paused['id']}/deliveries")
+        assert ledger.status_code == 200, ledger.text
+        assert [r for r in ledger.json() if r["event_id"] == missed["event_id"]] == []
+
+        resumed = await admin_client.patch(f"/v1/webhooks/{paused['id']}", json={"is_active": True})
+        assert resumed.status_code == 200, resumed.text
+        assert resumed.json()["is_active"] is True
+
+        after = _health_transition_payload(fresh_device["id"])
+        await _publish_health_event(after)
+        rows = await _poll_for_status(
+            admin_client, paused["id"], {"delivered"}, event_id=after["event_id"]
+        )
+        assert [r["status"] for r in rows] == ["delivered"], rows
+        ledger = await admin_client.get(f"/v1/webhooks/{paused['id']}/deliveries")
+        assert [r for r in ledger.json() if r["event_id"] == missed["event_id"]] == []
+    finally:
+        await admin_client.delete(f"/v1/webhooks/{paused['id']}")
+        await admin_client.delete(f"/v1/webhooks/{control['id']}")
+
+
+async def test_echo_sink_is_closed_through_the_gateway(admin_client, user_client, base_url):
+    """Issue #1107: the test sink adds no unauthenticated route to the gateway.
+
+    A POST through Traefik is refused even with an admin token (the gateway's
+    forwarding headers mark it), and the hit count needs an admin token. The
+    in-network POST from integration's delivery worker is covered by the
+    delivered-row tests above, which use the same sink as their target.
+    """
+    event_id = f"gw-probe-{uuid.uuid4()}"
+    body = json.dumps({"event_id": event_id})
+    posted = await admin_client.post(
+        "/v1/webhooks/echo", content=body, headers={"Content-Type": "application/json"}
+    )
+    assert posted.status_code == 403, posted.text
+    assert posted.json() == {
+        "detail": "The test sink accepts deliveries from inside the stack network only"
+    }
+
+    async with httpx.AsyncClient(base_url=base_url, verify=False, timeout=30.0) as anonymous:
+        unauthenticated = await anonymous.get(
+            "/v1/webhooks/echo/hits", params={"event_id": event_id}
+        )
+        assert unauthenticated.status_code in (401, 403), unauthenticated.text
+        refused_post = await anonymous.post(
+            "/v1/webhooks/echo", content=body, headers={"Content-Type": "application/json"}
+        )
+        assert refused_post.status_code == 403, refused_post.text
+
+    as_user = await user_client.get("/v1/webhooks/echo/hits", params={"event_id": event_id})
+    assert as_user.status_code == 403, as_user.text
+
+    as_admin = await admin_client.get("/v1/webhooks/echo/hits", params={"event_id": event_id})
+    assert as_admin.status_code == 200, as_admin.text
+    # The refused POSTs were never counted.
+    assert as_admin.json() == {"event_id": event_id, "count": 0}
+
+
+async def test_deleting_a_subscription_deletes_its_ledger_rows(admin_client):
+    """INTEG-HOOK-8 (issue #1081): the ledger's foreign key is ON DELETE CASCADE.
+
+    The SQLite unit backend does not enforce foreign keys by default, so this is
+    the check against the real Postgres schema. A ledger row is written straight
+    into integration.webhook_deliveries (no event needs to be delivered), then the
+    subscription is deleted through the API and the row must be gone.
+    """
+    webhook = await _register_webhook(admin_client, ECHO_TARGET)
+    webhook_id = webhook["id"]
+    probe_event = f"cascade-probe-{uuid.uuid4()}"
+    deleted = False
+    try:
+        inserted = _psql(
+            "INSERT INTO integration.webhook_deliveries "
+            "(id, subscription_id, event_id, event_type, status, attempts) VALUES "
+            f"(gen_random_uuid(), '{webhook_id}', '{probe_event}', 'reservation.created', "
+            "'dead', 1)"
+        )
+        assert inserted.returncode == 0, inserted.stderr
+        ledger = await admin_client.get(f"/v1/webhooks/{webhook_id}/deliveries")
+        assert [r["event_id"] for r in ledger.json()] == [probe_event]
+
+        resp = await admin_client.delete(f"/v1/webhooks/{webhook_id}")
+        assert resp.status_code == 204, resp.text
+        deleted = True
+
+        remaining = _psql(
+            "SELECT count(*) FROM integration.webhook_deliveries "
+            f"WHERE subscription_id = '{webhook_id}'",
+            tuples_only=True,
+        )
+        assert remaining.returncode == 0, remaining.stderr
+        assert remaining.stdout.strip() == "0"
+    finally:
+        if not deleted:
+            await admin_client.delete(f"/v1/webhooks/{webhook_id}")

@@ -216,3 +216,35 @@ async def test_concurrent_callers_fetch_once():
         await asyncio.gather(first, second)
 
     assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_preferences_predating_reservation_failed_read_it_as_on():
+    """Issue #1077: the consumer's read path fills the new key in as on.
+
+    The stored blob names every pre-#1077 event (some off) and not
+    reservation.failed; the consumer must still deliver a failure notice.
+    """
+    stored = {
+        "channels": {"in_app": True, "email": False, "chat": False, "webhook": False},
+        "events": {
+            "reservation.created": True,
+            "reservation.updated": False,
+            "reservation.cancelled": True,
+            "reservation.completed": False,
+            "device.health_transition": False,
+            "reservation.expiring_soon": True,
+        },
+    }
+    client = PreferencesClient(ttl_seconds=60)
+    resp = AsyncMock()
+    resp.status_code = 200
+    resp.json = lambda: _make_upstream(stored)
+
+    with patch("herd_common.internal_client.httpx.AsyncClient") as MockClient:
+        inst = MockClient.return_value.__aenter__.return_value
+        inst.request = AsyncMock(return_value=resp)
+        prefs = await client.get(uuid.uuid4())
+
+    assert prefs.event_enabled("reservation.failed") is True
+    assert prefs.event_enabled("reservation.updated") is False

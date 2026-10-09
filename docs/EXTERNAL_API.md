@@ -274,7 +274,16 @@ Other subscription endpoints (all admin):
 
 - `GET /api/v1/webhooks`: list subscriptions (secret omitted).
 - `GET /api/v1/webhooks/{id}`: one subscription (secret omitted).
-- `DELETE /api/v1/webhooks/{id}`: delete a subscription.
+- `PATCH /api/v1/webhooks/{id}`: pause or resume a subscription. The body is
+  exactly `{"is_active": false}` or `{"is_active": true}`; any other field, or a
+  value that is not a JSON boolean, is 422, and an unknown id is 404
+  `Webhook not found`. The answer is the subscription (secret omitted). The
+  delivery ledger is kept. A paused subscription receives no event handled after
+  the change and nothing is queued for it, so resuming does not replay the events
+  it missed. A delivery already under way when you pause (including its remaining
+  retries) finishes and is recorded.
+- `DELETE /api/v1/webhooks/{id}`: delete a subscription and its delivery ledger.
+  To stop deliveries but keep the record of what failed, pause it instead.
 - `GET /api/v1/webhooks/{id}/deliveries`: the delivery ledger for a subscription
   (see Delivery semantics).
 

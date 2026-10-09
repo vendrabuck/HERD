@@ -16,6 +16,10 @@ DEFAULT_EVENT_TYPES = (
     # ROADMAP #40: upcoming-expiry reminder, emitted by the reservations
     # expiration task within a configurable lead window of end_time.
     "reservation.expiring_soon",
+    # Issue #1077: the owner hears when a reservation fails. Default on, and a
+    # user whose stored preferences predate this key gets it on through
+    # with_defaults (an absent key is filled in as True).
+    "reservation.failed",
 )
 
 

@@ -435,7 +435,8 @@ one per area; all ten areas are written.
   channels as peer dispatchers, with the webhook HMAC-signed. Outbound sends are
   deduped on NATS redelivery and a failure on one channel does not block the others
   or in-app. An upcoming-expiry reminder fires once within a configurable lead window
-  of a reservation's end time. Per-channel and per-event opt-outs live in user
+  of a reservation's end time, and the owner of a reservation that fails is told
+  (issue #1077). Per-channel and per-event opt-outs live in user
   preferences; outbound channels default off. Bidirectional chat (slash commands,
   replies) and per-user channel credentials remain out of scope.
 - **Durable event delivery** (Shipped): reservation lifecycle and device-health

@@ -9,14 +9,17 @@ the standard incoming-webhook verification scheme.
 The channel is "configured" only when both the URL and the signing secret are
 set; an unsigned outbound webhook is never sent. Per-user opt-in is enforced
 upstream; the destination is instance-level.
+
+Signing goes through `herd_common.webhooks` (issue #1079), the same function and
+header name the integration service's registered webhooks use, so the two
+outbound paths cannot drift apart.
 """
 
-import hashlib
-import hmac
 import json
 import logging
 
 import httpx
+from herd_common.webhooks import WEBHOOK_SIGNATURE_HEADER, sign_body
 
 from app.config import settings
 from app.services.dispatchers.base import DispatchMessage
@@ -27,16 +30,6 @@ logger = logging.getLogger(__name__)
 
 def _is_configured() -> bool:
     return bool(settings.outbound_webhook_url and settings.webhook_signing_secret)
-
-
-def sign_body(body: bytes, secret: str) -> str:
-    """Return the X-HERD-Signature value for a raw request body.
-
-    Exposed for receivers and tests: signature = "sha256=" + hex HMAC-SHA256 of
-    the exact bytes that go over the wire, keyed by the shared secret.
-    """
-    digest = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return f"sha256={digest}"
 
 
 class WebhookDispatcher:
@@ -73,7 +66,7 @@ class WebhookDispatcher:
                     content=body,
                     headers={
                         "Content-Type": "application/json",
-                        "X-HERD-Signature": signature,
+                        WEBHOOK_SIGNATURE_HEADER: signature,
                     },
                     timeout=settings.webhook_timeout_seconds,
                 )

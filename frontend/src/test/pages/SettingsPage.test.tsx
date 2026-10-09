@@ -55,7 +55,42 @@ describe("SettingsPage", () => {
     expect(screen.getByText("Reservation cancelled")).toBeInTheDocument();
     expect(screen.getByText("Reservation completed")).toBeInTheDocument();
     expect(screen.getByText("Reservation expiring soon")).toBeInTheDocument();
+    expect(screen.getByText("Reservation failed")).toBeInTheDocument();
     expect(screen.getByText("Device health changes")).toBeInTheDocument();
+  });
+
+  it("shows the failed event on by default and sends an opt-out explicitly", async () => {
+    // Issue #1077: DEFAULT_PREFS predates reservation.failed, so the toggle
+    // starts checked; unchecking it must send the key as false.
+    let captured: unknown = null;
+    server.use(
+      http.get("/api/notifications/notifications/preferences", () =>
+        HttpResponse.json(DEFAULT_PREFS),
+      ),
+      http.put(
+        "/api/notifications/notifications/preferences",
+        async ({ request }) => {
+          const body = await request.json();
+          captured = body;
+          return HttpResponse.json(body);
+        },
+      ),
+    );
+    renderWithProviders(<SettingsPage />);
+    await waitFor(() =>
+      expect(screen.getByText("Notifications")).toBeInTheDocument(),
+    );
+    const failed = screen.getByLabelText("Reservation failed") as HTMLInputElement;
+    expect(failed.checked).toBe(true);
+    fireEvent.click(failed);
+    expect(failed.checked).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(toastSuccess).toHaveBeenCalledWith("Preferences saved"),
+    );
+    const body = captured as { events: Record<string, boolean> };
+    expect(body.events["reservation.failed"]).toBe(false);
   });
 
   it("toggling the device health event sends device.health_transition in the payload", async () => {

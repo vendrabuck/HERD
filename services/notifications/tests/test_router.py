@@ -283,6 +283,118 @@ async def test_put_preferences_writes_merged_payload(user_client):
     assert notif["events"]["reservation.completed"] is False
 
 
+def _prefs_upstream(stored: dict) -> dict:
+    return {
+        "user_id": str(_user_id),
+        "saved_filters": {},
+        "page_sizes": {},
+        "extras": {"notifications": stored},
+        "updated_at": "2026-04-20T00:00:00+00:00",
+    }
+
+
+async def _put_prefs_against(user_client, stored: dict, body: dict):
+    """PUT body against a user-profile stub holding `stored`; return (resp, written)."""
+    get_resp = AsyncMock()
+    get_resp.status_code = 200
+    get_resp.json = lambda: _prefs_upstream(stored)
+    patch_resp = AsyncMock()
+    patch_resp.status_code = 200
+    patch_resp.json = lambda: {}
+    captured = {}
+
+    async def _get(*args, **kwargs):
+        return get_resp
+
+    async def _patch(url, **kwargs):
+        captured["json"] = kwargs.get("json")
+        return patch_resp
+
+    with patch("app.routers.notifications.httpx.AsyncClient") as MockClient:
+        inst = MockClient.return_value.__aenter__.return_value
+        inst.get = _get
+        inst.patch = _patch
+        resp = await user_client.put("/notifications/preferences", json=body)
+    return resp, captured["json"]["extras"]["notifications"]
+
+
+@pytest.mark.asyncio
+async def test_put_preferences_channels_replace_the_stored_object_whole(user_client):
+    """INTEG-PREFS-5 (issue #1081): a body naming only some channels resets the rest.
+
+    `events` merges key by key, but `channels` is replaced as a whole object, so a
+    channel the body omits goes back to its default (in_app on, outbound off)
+    rather than keeping the stored value.
+    """
+    stored = {
+        "channels": {"in_app": False, "email": True, "chat": True, "webhook": True},
+        "events": {"reservation.completed": False},
+    }
+    resp, written = await _put_prefs_against(user_client, stored, {"channels": {"email": True}})
+    assert resp.status_code == 200
+    expected_channels = {"in_app": True, "email": True, "chat": False, "webhook": False}
+    assert resp.json()["channels"] == expected_channels
+    assert written["channels"] == expected_channels
+    # events untouched by a channels-only body: the stored opt-out survives.
+    assert written["events"]["reservation.completed"] is False
+
+
+@pytest.mark.asyncio
+async def test_put_preferences_without_channels_keeps_stored_channels(user_client):
+    stored = {
+        "channels": {"in_app": False, "email": True, "chat": True, "webhook": False},
+        "events": {},
+    }
+    resp, written = await _put_prefs_against(
+        user_client, stored, {"events": {"reservation.created": False}}
+    )
+    assert resp.status_code == 200
+    assert written["channels"] == stored["channels"]
+    assert written["events"]["reservation.created"] is False
+
+
+@pytest.mark.asyncio
+async def test_put_preferences_predating_failed_writes_it_on(user_client):
+    """Issue #1077: a save over preferences that predate reservation.failed stores it on."""
+    stored = {
+        "channels": {"in_app": True},
+        "events": {
+            "reservation.created": True,
+            "reservation.updated": False,
+            "reservation.cancelled": True,
+            "reservation.completed": False,
+            "device.health_transition": False,
+            "reservation.expiring_soon": True,
+        },
+    }
+    resp, written = await _put_prefs_against(
+        user_client, stored, {"events": {"reservation.updated": True}}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["events"]["reservation.failed"] is True
+    assert written["events"]["reservation.failed"] is True
+    assert written["events"]["reservation.updated"] is True
+    assert written["events"]["reservation.completed"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_preferences_predating_failed_reads_it_on(user_client):
+    stored = {"channels": {"in_app": True}, "events": {"reservation.created": False}}
+    get_resp = AsyncMock()
+    get_resp.status_code = 200
+    get_resp.json = lambda: _prefs_upstream(stored)
+
+    async def _get(*args, **kwargs):
+        return get_resp
+
+    with patch("app.routers.notifications.httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value.get = _get
+        resp = await user_client.get("/notifications/preferences")
+    assert resp.status_code == 200
+    assert resp.json()["events"]["reservation.failed"] is True
+    assert resp.json()["events"]["reservation.created"] is False
+
+
 # --- Health ---
 
 

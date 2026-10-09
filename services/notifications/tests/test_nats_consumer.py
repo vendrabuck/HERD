@@ -137,6 +137,52 @@ async def test_handle_event_respects_channel_opt_out():
 
 
 @pytest.mark.asyncio
+async def test_handle_event_delivers_failed_under_preferences_predating_the_key():
+    """Issue #1077: a user whose stored preferences predate reservation.failed hears it."""
+    stored = {
+        "channels": {"in_app": True},
+        "events": {
+            "reservation.created": True,
+            "reservation.updated": False,
+            "reservation.cancelled": True,
+            "reservation.completed": False,
+            "device.health_transition": False,
+            "reservation.expiring_soon": True,
+        },
+    }
+    set_preferences_client(_StubPrefsClient(NotificationPreferences.with_defaults(stored)))
+    dispatcher = _StubDispatcher()
+    event = {
+        "event": "reservation.failed",
+        "reservation_id": str(uuid.uuid4()),
+        "user_id": str(uuid.uuid4()),
+        "device_ids": [str(uuid.uuid4())],
+    }
+    await nats_consumer.handle_event(event, _session_factory, dispatchers=[dispatcher])
+    assert len(dispatcher.sent) == 1
+    assert dispatcher.sent[0].event_type == "reservation.failed"
+    assert dispatcher.sent[0].title == "Reservation failed"
+
+
+@pytest.mark.asyncio
+async def test_handle_event_failed_respects_opt_out():
+    set_preferences_client(
+        _StubPrefsClient(
+            NotificationPreferences.with_defaults({"events": {"reservation.failed": False}})
+        )
+    )
+    dispatcher = _StubDispatcher()
+    event = {
+        "event": "reservation.failed",
+        "reservation_id": str(uuid.uuid4()),
+        "user_id": str(uuid.uuid4()),
+        "device_ids": [],
+    }
+    await nats_consumer.handle_event(event, _session_factory, dispatchers=[dispatcher])
+    assert dispatcher.sent == []
+
+
+@pytest.mark.asyncio
 async def test_process_message_ack_on_success():
     payload = json.dumps(
         {
