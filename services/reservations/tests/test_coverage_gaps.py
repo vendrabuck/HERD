@@ -606,22 +606,32 @@ async def test_update_reservation_end_time_in_past_rejected():
 @pytest.mark.asyncio
 async def test_update_reservation_extend_fetch_failure_falls_back_to_exclusive():
     """If the device fetch during an extend fails, every device is treated as
-    exclusive and the conflict check still runs (here: no conflict, so the
-    extend succeeds)."""
+    exclusive and the conflict check still runs: a second reservation holding
+    DEVICE_A over hours 4 to 6 refuses the extension into that span (issue #1136).
+    Skipping the check on a failed fetch would let the extension through."""
     async with TestSessionLocal() as db:
-        res = await _insert_reservation(db, device_ids=[DEVICE_A], end_offset_h=3)
-        new_end = NOW + timedelta(hours=5)
+        res = await _insert_reservation(db, device_ids=[DEVICE_A], start_offset_h=1, end_offset_h=3)
+        await _insert_reservation(db, device_ids=[DEVICE_A], start_offset_h=4, end_offset_h=6)
+        old_end = res.end_time
+        res_id = res.id
         with (
             patch(
                 "app.services.reservation_service._fetch_devices",
                 new=AsyncMock(side_effect=RuntimeError("inventory down")),
             ),
         ):
-            result = await update_reservation(
-                db, res.id, USER_ID, ReservationUpdate(end_time=new_end), token="t"
-            )
-        assert result is not None
-        assert result.end_time.replace(tzinfo=None) == new_end.replace(tzinfo=None)
+            with pytest.raises(LookupError, match="already reserved in the extended window"):
+                await update_reservation(
+                    db,
+                    res_id,
+                    USER_ID,
+                    ReservationUpdate(end_time=NOW + timedelta(hours=5)),
+                    token="t",
+                )
+
+    async with TestSessionLocal() as db:
+        stored = await db.get(Reservation, res_id)
+        assert stored.end_time == old_end
 
 
 @pytest.mark.asyncio
