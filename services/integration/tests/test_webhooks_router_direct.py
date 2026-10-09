@@ -381,9 +381,10 @@ async def test_echo_receiver_counts_arrivals_per_event_id():
     await webhooks_mod.echo_receiver(_sink_request(body))
     await webhooks_mod.echo_receiver(_sink_request(b'{"event_id": "evt-2"}'))
 
-    assert (await webhooks_mod.echo_hits("evt-1")) == {"event_id": "evt-1", "count": 2}
-    assert (await webhooks_mod.echo_hits("evt-2"))["count"] == 1
-    assert (await webhooks_mod.echo_hits("never-sent"))["count"] == 0
+    admin = _payload()
+    assert (await webhooks_mod.echo_hits("evt-1", admin)) == {"event_id": "evt-1", "count": 2}
+    assert (await webhooks_mod.echo_hits("evt-2", admin))["count"] == 1
+    assert (await webhooks_mod.echo_hits("never-sent", admin))["count"] == 0
 
 
 async def test_echo_receiver_ignores_bodies_without_a_string_event_id():
@@ -429,3 +430,89 @@ def test_sink_routes_stay_out_of_the_published_schema():
     assert "/webhooks/echo" in {r.path for r in app.routes}
     assert "/webhooks/echo/hits" in {r.path for r in app.routes}
     assert not [p for p in app.openapi()["paths"] if p.startswith("/webhooks/echo")]
+
+
+# --- test sink gate (issue #1107) ---------------------------------------------
+
+
+def _sink_app():
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(webhooks_mod.test_sink_router)
+    return app
+
+
+def _sink_token(role: str) -> str:
+    from app.config import settings
+    from jose import jwt
+
+    return jwt.encode(
+        {"sub": str(uuid.uuid4()), "role": role}, settings.secret_key, algorithm="HS256"
+    )
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        {"X-Forwarded-For": "192.168.1.27"},
+        {"X-Real-Ip": "192.168.1.27"},
+        {"X-Forwarded-For": "192.168.1.27", "X-Real-Ip": "192.168.1.27"},
+    ],
+)
+async def test_echo_receiver_refuses_a_request_that_came_through_the_gateway(header):
+    from httpx import ASGITransport, AsyncClient
+
+    webhooks_mod._sink_hits.clear()
+    async with AsyncClient(transport=ASGITransport(app=_sink_app()), base_url="http://t") as c:
+        resp = await c.post(
+            "/webhooks/echo", content=json.dumps({"event_id": "evt-gw"}), headers=header
+        )
+    assert resp.status_code == 403
+    assert resp.json() == {
+        "detail": "The test sink accepts deliveries from inside the stack network only"
+    }
+    # Refused before the body is read: nothing is counted.
+    assert "evt-gw" not in webhooks_mod._sink_hits
+
+
+async def test_echo_receiver_accepts_a_direct_in_network_delivery():
+    """The delivery worker's own POST carries only the signing headers."""
+    from httpx import ASGITransport, AsyncClient
+
+    webhooks_mod._sink_hits.clear()
+    body = json.dumps({"event_id": "evt-direct"}).encode()
+    async with AsyncClient(transport=ASGITransport(app=_sink_app()), base_url="http://t") as c:
+        resp = await c.post(
+            "/webhooks/echo",
+            content=body,
+            headers={"Content-Type": "application/json", "X-HERD-Signature": "sha256=00"},
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "received_bytes": len(body)}
+    assert webhooks_mod._sink_hits["evt-direct"] == 1
+
+
+async def test_echo_hits_requires_an_admin_token():
+    from httpx import ASGITransport, AsyncClient
+
+    webhooks_mod._sink_hits.clear()
+    webhooks_mod._sink_hits["evt-h"] = 3
+    async with AsyncClient(transport=ASGITransport(app=_sink_app()), base_url="http://t") as c:
+        anonymous = await c.get("/webhooks/echo/hits", params={"event_id": "evt-h"})
+        user = await c.get(
+            "/webhooks/echo/hits",
+            params={"event_id": "evt-h"},
+            headers={"Authorization": f"Bearer {_sink_token('user')}"},
+        )
+        admin = await c.get(
+            "/webhooks/echo/hits",
+            params={"event_id": "evt-h"},
+            headers={"Authorization": f"Bearer {_sink_token('admin')}"},
+        )
+    assert anonymous.status_code in (401, 403)
+    assert "count" not in anonymous.text
+    assert user.status_code == 403
+    assert user.json() == {"detail": "Admin or superadmin role required"}
+    assert admin.status_code == 200
+    assert admin.json() == {"event_id": "evt-h", "count": 3}

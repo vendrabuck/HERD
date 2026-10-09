@@ -1973,9 +1973,14 @@ anything else, including a cancel that loses to the scheduler claiming the job, 
 The integration service also registers a test-only webhook sink, `POST /webhooks/echo`
 (accepts a `delay_ms` query parameter, clamped to 10 seconds) and
 `GET /webhooks/echo/hits?event_id=...` (how many POSTs carried that payload `event_id`).
-Both are unauthenticated and excluded from the OpenAPI document, and they exist only
-when `WEBHOOK_TEST_SINK_ENABLED=true`, which only `docker-compose.override.yml` sets;
-`make prod` never registers them (`services/integration/app/routers/webhooks.py`).
+Both are excluded from the OpenAPI document, and they exist only when
+`WEBHOOK_TEST_SINK_ENABLED=true`, which only `docker-compose.override.yml` sets;
+`make prod` never registers them (`services/integration/app/routers/webhooks.py`). Neither
+is open through the gateway (issue #1107): the POST takes no token, because its sender is
+integration's own delivery worker posting to `http://integration:8000/webhooks/echo`, but
+it refuses with 403 any request carrying `X-Forwarded-For` or `X-Real-Ip`, the headers
+Traefik adds to every request it forwards, so it answers only callers inside the stack
+network; the hit count is admin or superadmin only, like the subscription routes.
 
 ---
 

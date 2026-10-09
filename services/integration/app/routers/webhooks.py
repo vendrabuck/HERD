@@ -170,11 +170,28 @@ async def delete_webhook(
 
 # Test-only delivery sink. Registered by main.py ONLY when
 # settings.webhook_test_sink_enabled is true (set in docker-compose.override.yml,
-# never in prod), so this unauthenticated endpoint never exists in production. It
-# mirrors the repo's HERD_FAULT_INJECTION seam: a test affordance gated to the
-# dev/test stack. The services' /health routes are GET-only (405 on POST), so the
-# live webhook delivery test needs an in-network endpoint that returns 2xx to POST.
+# never in prod), so it never exists in production. It mirrors the repo's
+# HERD_FAULT_INJECTION seam: a test affordance gated to the dev/test stack. The
+# services' /health routes are GET-only (405 on POST), so the live webhook
+# delivery test needs an in-network endpoint that returns 2xx to POST.
+#
+# Issue #1107: neither route is open through the gateway. The POST is sent by
+# integration's own delivery worker straight to http://integration:8000, which
+# carries only the signing headers, so it cannot take a token; it refuses any
+# request that arrived through Traefik instead, judged by the forwarding headers
+# the gateway adds to every request it proxies. The hit count is admin-only.
 test_sink_router = APIRouter(prefix="/webhooks", tags=["v1-webhooks-test-sink"])
+
+# Headers Traefik adds to every request it forwards: Go's reverse proxy sets
+# X-Forwarded-For to the client address, and Traefik sets X-Real-Ip. A direct
+# in-network POST (the delivery worker's httpx client) carries neither, and a
+# client outside the network cannot strip what the gateway adds.
+_GATEWAY_FORWARDING_HEADERS = ("x-forwarded-for", "x-real-ip")
+SINK_GATEWAY_REFUSED_DETAIL = "The test sink accepts deliveries from inside the stack network only"
+
+
+def _arrived_through_gateway(request: Request) -> bool:
+    return any(name in request.headers for name in _GATEWAY_FORWARDING_HEADERS)
 
 
 # Longest the sink will sleep before answering (issue #944), so a stray
@@ -202,12 +219,20 @@ def _record_sink_hit(body: bytes) -> None:
 
 @test_sink_router.post("/echo", include_in_schema=False)
 async def echo_receiver(request: Request, delay_ms: int = 0):
-    """Unauthenticated 200 sink for end-to-end delivery verification (test stack only).
+    """In-network 200 sink for end-to-end delivery verification (test stack only).
 
-    `delay_ms` (query parameter on the registered target URL, clamped to
-    0..SINK_MAX_DELAY_MS) makes the sink answer slowly, so a live test can hold
-    a webhook fan-out open past the consumer's ack_wait (issue #944).
+    A request that arrived through the gateway is refused with 403 before its
+    body is read or counted (issue #1107). `delay_ms` (query parameter on the
+    registered target URL, clamped to 0..SINK_MAX_DELAY_MS) makes the sink answer
+    slowly, so a live test can hold a webhook fan-out open past the consumer's
+    ack_wait (issue #944).
     """
+    if _arrived_through_gateway(request):
+        logger.warning(
+            "Test sink POST refused: it arrived through the gateway",
+            extra={"action": "webhook_sink_gateway_refused"},
+        )
+        raise HTTPException(status_code=403, detail=SINK_GATEWAY_REFUSED_DETAIL)
     body = await request.body()
     _record_sink_hit(body)
     delay = max(0, min(delay_ms, SINK_MAX_DELAY_MS))
@@ -217,8 +242,10 @@ async def echo_receiver(request: Request, delay_ms: int = 0):
 
 
 @test_sink_router.get("/echo/hits", include_in_schema=False)
-async def echo_hits(event_id: str):
-    """How many POSTs the sink has received whose JSON body carried `event_id`."""
+async def echo_hits(event_id: str, _payload: dict = Depends(require_admin)):
+    """How many POSTs the sink has received whose JSON body carried `event_id`.
+
+    Admin only (issue #1107), the same gate as every subscription route."""
     return {"event_id": event_id, "count": _sink_hits.get(event_id, 0)}
 
 

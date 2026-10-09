@@ -11,8 +11,10 @@ signed POST to the registered target. We assert the delivery ledger:
   - an unreachable / non-2xx receiver exhausts retries into a `dead` row,
     proving a failing target does not block delivery to others or the stream.
 
-The success receiver is the integration service's own unauthenticated echo sink
-(http://integration:8000/webhooks/echo), reachable on the docker network. The
+The success receiver is the integration service's own echo sink
+(http://integration:8000/webhooks/echo), reachable on the docker network; it
+refuses a POST that came through the gateway, and its hit count is admin-only
+(issue #1107, test_echo_sink_is_closed_through_the_gateway). The
 service /health endpoints are GET-only and would 405 a webhook POST, so they are
 not usable as a 2xx target.
 
@@ -29,6 +31,7 @@ import socket
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import nats
 import pytest
 from _nats_helpers import fetch_reservation_event
@@ -386,3 +389,40 @@ async def test_paused_webhook_receives_nothing_until_resumed(admin_client, fresh
     finally:
         await admin_client.delete(f"/v1/webhooks/{paused['id']}")
         await admin_client.delete(f"/v1/webhooks/{control['id']}")
+
+
+async def test_echo_sink_is_closed_through_the_gateway(admin_client, user_client, base_url):
+    """Issue #1107: the test sink adds no unauthenticated route to the gateway.
+
+    A POST through Traefik is refused even with an admin token (the gateway's
+    forwarding headers mark it), and the hit count needs an admin token. The
+    in-network POST from integration's delivery worker is covered by the
+    delivered-row tests above, which use the same sink as their target.
+    """
+    event_id = f"gw-probe-{uuid.uuid4()}"
+    body = json.dumps({"event_id": event_id})
+    posted = await admin_client.post(
+        "/v1/webhooks/echo", content=body, headers={"Content-Type": "application/json"}
+    )
+    assert posted.status_code == 403, posted.text
+    assert posted.json() == {
+        "detail": "The test sink accepts deliveries from inside the stack network only"
+    }
+
+    async with httpx.AsyncClient(base_url=base_url, verify=False, timeout=30.0) as anonymous:
+        unauthenticated = await anonymous.get(
+            "/v1/webhooks/echo/hits", params={"event_id": event_id}
+        )
+        assert unauthenticated.status_code in (401, 403), unauthenticated.text
+        refused_post = await anonymous.post(
+            "/v1/webhooks/echo", content=body, headers={"Content-Type": "application/json"}
+        )
+        assert refused_post.status_code == 403, refused_post.text
+
+    as_user = await user_client.get("/v1/webhooks/echo/hits", params={"event_id": event_id})
+    assert as_user.status_code == 403, as_user.text
+
+    as_admin = await admin_client.get("/v1/webhooks/echo/hits", params={"event_id": event_id})
+    assert as_admin.status_code == 200, as_admin.text
+    # The refused POSTs were never counted.
+    assert as_admin.json() == {"event_id": event_id, "count": 0}

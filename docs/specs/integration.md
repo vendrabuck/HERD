@@ -119,8 +119,8 @@ them.
 | GET | `/api/v1/webhooks/{webhook_id}/deliveries` | admin or superadmin | 200 | INTEG-HOOK-1, INTEG-HOOK-10 |
 | GET | `/api/v1/version` | anyone | 200 | INTEG-VERSION-2 |
 | GET | `/api/v1/health` | anyone | 200 | INTEG-VERSION-3 |
-| POST | `/api/v1/webhooks/echo` | anyone, only when the test sink is enabled | 200 | INTEG-SINK-1, INTEG-SINK-2 |
-| GET | `/api/v1/webhooks/echo/hits?event_id` | anyone, only when the test sink is enabled | 200 | INTEG-SINK-1, INTEG-SINK-3 |
+| POST | `/webhooks/echo` (in-network, `http://integration:8000`) | a caller inside the stack network, only when the test sink is enabled; through the gateway it is 403 | 200 | INTEG-SINK-1, INTEG-SINK-2 |
+| GET | `/api/v1/webhooks/echo/hits?event_id` | admin or superadmin, only when the test sink is enabled | 200 | INTEG-SINK-1, INTEG-SINK-3 |
 | GET | `/api/notifications/notifications?limit&offset&unread_only` | any valid access token, own rows | 200 | INTEG-INAPP-2 to INTEG-INAPP-4 |
 | GET | `/api/notifications/notifications/unread-count` | any valid access token, own rows | 200 | INTEG-INAPP-2, INTEG-INAPP-5 |
 | PATCH | `/api/notifications/notifications/{notification_id}/read` | the row's owner | 200 | INTEG-INAPP-2, INTEG-INAPP-6, INTEG-INAPP-7 |
@@ -533,8 +533,8 @@ the stream nor causes a duplicate.
 ### 8.6 Test delivery sink
 
 **What it does.** On the development and test stack only, the integration service hosts
-a receiver that always accepts a delivery, can answer slowly, and counts arrivals, so the
-live tests can prove a delivery arrives exactly once.
+a receiver that accepts a delivery made inside the stack network, can answer slowly, and
+counts arrivals for an admin, so the live tests can prove a delivery arrives exactly once.
 
 **Surfaces.** `test_sink_router` in `services/integration/app/routers/webhooks.py`,
 registered by `services/integration/app/main.py`; `docker-compose.override.yml`.
@@ -546,16 +546,23 @@ registered by `services/integration/app/main.py`; `docker-compose.override.yml`.
   OpenAPI document. \
   Enforced in: `services/integration/app/main.py` (`webhook_test_sink_enabled`); `docker-compose.override.yml` (`WEBHOOK_TEST_SINK_ENABLED`) \
   Pinned by: `services/integration/tests/test_webhooks_router_direct.py` (`test_sink_routes_stay_out_of_the_published_schema`)
-- **INTEG-SINK-2.** `POST /webhooks/echo` needs no authentication and answers 200
-  `{"ok": true, "received_bytes": N}`, after sleeping `delay_ms` clamped into 0 to
-  10000. \
-  Enforced in: `services/integration/app/routers/webhooks.py` (`echo_receiver`, `SINK_MAX_DELAY_MS`) \
-  Pinned by: `services/integration/tests/test_webhooks_router_direct.py` (`test_echo_receiver_reports_received_byte_count`, `test_echo_receiver_delay_ms_sleeps_and_is_clamped`)
+- **INTEG-SINK-2.** `POST /webhooks/echo` takes no token (its sender is integration's
+  own delivery worker, which sends only the signing headers) but accepts only a request
+  made inside the stack network: a request carrying `X-Forwarded-For` or `X-Real-Ip`,
+  which Traefik adds to every request it forwards, arrived through the gateway and is
+  refused with 403 `The test sink accepts deliveries from inside the stack network only`
+  before its body is read or counted, logged with action `webhook_sink_gateway_refused`
+  (#1107). An accepted POST answers 200 `{"ok": true, "received_bytes": N}`, after
+  sleeping `delay_ms` clamped into 0 to 10000. \
+  Enforced in: `services/integration/app/routers/webhooks.py` (`echo_receiver`, `_arrived_through_gateway`, `SINK_GATEWAY_REFUSED_DETAIL`, `SINK_MAX_DELAY_MS`) \
+  Pinned by: `services/integration/tests/test_webhooks_router_direct.py` (`test_echo_receiver_reports_received_byte_count`, `test_echo_receiver_delay_ms_sleeps_and_is_clamped`, `test_echo_receiver_refuses_a_request_that_came_through_the_gateway`, `test_echo_receiver_accepts_a_direct_in_network_delivery`); `tests/integration/test_webhooks_flow.py` (`test_echo_sink_is_closed_through_the_gateway`, `test_webhook_delivered_exactly_once`)
 - **INTEG-SINK-3.** The sink counts each arrival by the body's string `event_id` before
   any delay, keeps at most 1000 ids (oldest dropped), ignores bodies without one, and
-  `GET /webhooks/echo/hits?event_id` answers `{event_id, count}`. \
-  Enforced in: `services/integration/app/routers/webhooks.py` (`_record_sink_hit`, `echo_hits`, `_SINK_HITS_MAX_KEYS`) \
-  Pinned by: `services/integration/tests/test_webhooks_router_direct.py` (`test_echo_receiver_counts_arrivals_per_event_id`, `test_echo_receiver_ignores_bodies_without_a_string_event_id`, `test_echo_receiver_hit_table_is_bounded`)
+  `GET /webhooks/echo/hits?event_id` answers `{event_id, count}` to an admin or
+  superadmin only (INTEG-HOOK-1's gate; any other role is 403, no token is refused)
+  (#1107). \
+  Enforced in: `services/integration/app/routers/webhooks.py` (`_record_sink_hit`, `echo_hits`, `require_admin`, `_SINK_HITS_MAX_KEYS`) \
+  Pinned by: `services/integration/tests/test_webhooks_router_direct.py` (`test_echo_receiver_counts_arrivals_per_event_id`, `test_echo_receiver_ignores_bodies_without_a_string_event_id`, `test_echo_receiver_hit_table_is_bounded`, `test_echo_hits_requires_an_admin_token`); `tests/integration/test_webhooks_flow.py` (`test_echo_sink_is_closed_through_the_gateway`); `tests/integration/test_webhook_slow_receiver_live.py` (`test_slow_receiver_gets_the_event_exactly_once`)
 - **INTEG-SINK-4.** The development and test stack pins integration's
   `NATS_ACK_WAIT_SECONDS` to 4, and only integration's, so a live test's slow receiver
   outlasts `ack_wait` inside the test time limit. \
