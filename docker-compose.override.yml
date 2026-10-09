@@ -27,6 +27,12 @@ services:
     # by `make prod` (docker compose -f docker-compose.yml), so prod never sees it.
     environment:
       - HERD_FAULT_INJECTION=1
+      # Dev/test-only fast apply scheduler (production default is 30s): lets the
+      # scheduled dry-run integration test (tests/integration/test_config_apply_flow.py,
+      # issue #1100) see its job fire inside the suite's --timeout=30 cap. Same
+      # pattern as reservations' EXPIRATION_INTERVAL_SECONDS below; make prod
+      # excludes this override.
+      - APPLY_SCHEDULER_INTERVAL_SECONDS=2
     volumes:
       - ./services/inventory/app:/app/app
       - ./services/inventory/migrations:/app/migrations

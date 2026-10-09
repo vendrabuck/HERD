@@ -180,6 +180,12 @@ async def test_uploaded_driver_with_supports_dry_run_false_stays_false(client):
 
 # --- schedule endpoint gate ---
 
+# Pinned (CFG-JOB-6): the schedule route's refusal, word for word.
+_NO_DRY_RUN_DETAIL = (
+    "this driver does not advertise dry-run support; "
+    "refuse to fire a dry-run that would hit the wire"
+)
+
 
 @pytest.mark.asyncio
 async def test_schedule_dry_run_succeeds_against_supporting_driver(client):
@@ -213,7 +219,9 @@ async def test_schedule_dry_run_rejected_against_non_supporting_driver(client):
         json={"scheduled_for": _future(), "dry_run": True},
     )
     assert resp.status_code == 422
-    assert "dry-run" in resp.json()["detail"]
+    assert resp.json() == {"detail": _NO_DRY_RUN_DETAIL}
+    jobs = await client.get(f"/devices/{device_id}/apply-jobs")
+    assert jobs.json()["total"] == 0
 
 
 @pytest.mark.asyncio
@@ -229,6 +237,7 @@ async def test_schedule_dry_run_rejected_when_metadata_absent(client):
         json={"scheduled_for": _future(), "dry_run": True},
     )
     assert resp.status_code == 422
+    assert resp.json() == {"detail": _NO_DRY_RUN_DETAIL}
 
 
 @pytest.mark.asyncio

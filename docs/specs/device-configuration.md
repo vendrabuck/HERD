@@ -304,7 +304,7 @@ and `user_has_manage_or_owns_active_reservation` in
 - **CFG-AUTH-6.** The write routes do not check visibility: a `manage` grant or an active
   reservation is enough, whatever the caller's device groups. \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`create_config_version`, `restore_config_version`, `apply_config_version`); `services/inventory/app/routers/apply_jobs.py` (`schedule_apply_job`, `confirm_dry_run_apply`) \
-  Pinned by: none (#1100)
+  Pinned by: `services/inventory/tests/test_device_config_write_rules.py` (`test_write_routes_do_not_check_device_visibility`)
 - **CFG-AUTH-7.** The fire-time check of a scheduled job asks the same two questions
   with no user token: acl `POST /internal/check` and reservations `GET /internal/active`,
   both with the internal token and a 5 second timeout; any failure on either answers no. \
@@ -384,9 +384,9 @@ internal route of section 7.
   Enforced in: `services/inventory/app/routers/device_configs.py` (`restore_config_version`) \
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_restore_creates_new_version`); `tests/e2e/test_flows_effects_playwright.py` (`test_device_config_version_cycle`)
 - **CFG-VER-10.** A restore without a `description` gets `Restored from v<N>`, N being
-  the source's number. \
+  the source's number; a given `description` is kept as sent. \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`restore_config_version`) \
-  Pinned by: none (#1100)
+  Pinned by: `services/inventory/tests/test_device_config_write_rules.py` (`test_restore_without_description_is_labelled_with_the_source_number`)
 - **CFG-VER-11.** A restore validates the stored config again before writing: against
   the device's current published schema when there is one, else the registry entry for
   the source version's connection type. \
@@ -415,7 +415,7 @@ internal route of section 7.
 - **CFG-VER-15.** No route deletes or edits a version; deleting the device deletes its
   versions and its apply jobs through the foreign keys. \
   Enforced in: `services/inventory/app/models/device_config_version.py` (`DeviceConfigVersion`); `services/inventory/app/models/device_config_apply_job.py` (`DeviceConfigApplyJob`) \
-  Pinned by: none (#1100)
+  Pinned by: `services/inventory/tests/test_device_config_write_rules.py` (`test_no_route_deletes_or_edits_a_config_version`, `test_version_cannot_be_deleted_or_edited_over_http`, `test_deleting_a_device_deletes_its_versions_and_apply_jobs`)
 
 **Out of scope.** What a Layer 3 switch's latest version means for routing (ADR 0014;
 `provisioning-and-wiring.md` WIRE-L3-4, `topology.md` TOPO-L3-7). The device delete
@@ -633,9 +633,10 @@ apply-job routes of sections 5 and 7.
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`schedule_apply_job`) \
   Pinned by: `services/inventory/tests/test_apply_jobs_reservation_owner.py` (`test_scheduled_for_beyond_horizon_returns_422`, `test_scheduled_for_just_within_horizon_returns_201`)
 - **CFG-JOB-3.** The two time checks run before the device and version lookups, so a
-  bad time on an unknown device is a 422. \
+  bad time on an unknown device is a 422, and before the authorization and reservation
+  checks, which then ask nobody. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`schedule_apply_job`) \
-  Pinned by: none (#1100)
+  Pinned by: `services/inventory/tests/test_device_config_write_rules.py` (`test_schedule_time_checks_run_before_the_device_and_version_lookups`); `services/inventory/tests/test_apply_jobs_reservation_scope.py` (`test_reservation_check_runs_after_the_time_checks_404s_and_403`)
 - **CFG-JOB-4.** A `reservation_id`, when given, is checked after the authorization
   check and the driver gate and before the dry-run gate, with two reads of reservations,
   both with the internal token and 5 seconds: `GET /internal/{id}` must answer 200 with
@@ -653,7 +654,7 @@ apply-job routes of sections 5 and 7.
   (`Could not verify the reservation; nothing was scheduled. Retry the request.`); the
   reason goes to the log only. Nothing is written on any refusal. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`_validate_reservation_for_job`, `_reservation_unavailable`, `RESERVATION_MISMATCH_ERROR`, `RESERVATION_MISMATCH_ADMIN_ERROR`, `RESERVATION_UNAVAILABLE_ERROR`) \
-  Pinned by: `services/inventory/tests/test_apply_jobs_reservation_scope.py` (`test_reservation_id_valid_and_owned_schedules_successfully`, `test_foreign_reservation_id_returns_422_and_writes_no_row`, `test_reservation_id_inactive_returns_422_and_writes_no_row`, `test_reservation_id_validation_fails_closed_when_unreachable`, `test_reservation_id_answer_not_an_object_fails_closed_503`, `test_reservation_check_without_an_internal_token_fails_closed`, `test_schedule_without_a_reservation_asks_nothing`)
+  Pinned by: `services/inventory/tests/test_apply_jobs_reservation_scope.py` (`test_reservation_id_valid_and_owned_schedules_successfully`, `test_foreign_reservation_id_returns_422_and_writes_no_row`, `test_reservation_id_inactive_returns_422_and_writes_no_row`, `test_reservation_id_validation_fails_closed_when_unreachable`, `test_reservation_id_answer_not_an_object_fails_closed_503`, `test_reservation_check_without_an_internal_token_fails_closed`, `test_schedule_without_a_reservation_asks_nothing`); `tests/integration/test_config_apply_flow.py` (`test_scheduled_dry_run_fires_and_its_confirm_queues_a_real_apply`, `test_schedule_refuses_a_reservation_that_does_not_hold_the_device`)
 - **CFG-JOB-5.** The named reservation itself must hold the device and, for a non-admin,
   belong to the caller (its `user_id` in the by-device list); an admin is exempt from
   ownership only, not from activeness or the device. A non-admin who owns one active
@@ -668,7 +669,7 @@ apply-job routes of sections 5 and 7.
   otherwise 422
   `this driver does not advertise dry-run support; refuse to fire a dry-run that would hit the wire`. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`schedule_apply_job`) \
-  Pinned by: none (#1100)
+  Pinned by: `services/inventory/tests/test_dry_run_gate.py` (`test_schedule_dry_run_rejected_against_non_supporting_driver`, `test_schedule_dry_run_rejected_when_metadata_absent`, `test_schedule_dry_run_succeeds_against_supporting_driver`)
 - **CFG-JOB-7.** A schedule stores the device, the version, `scheduled_for` as sent,
   the `reservation_id`, `dry_run`, status `pending`, the caller as `created_by`, and the
   token's `username` as `author_name`, and answers 201 with the job. \
@@ -705,7 +706,7 @@ apply-job routes of sections 5 and 7.
   reservation, driver gate, dry-run support) and does not check device visibility; the
   scheduler's fire-time checks still apply to the new job. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`confirm_dry_run_apply`) \
-  Pinned by: none (#1100)
+  Pinned by: `services/inventory/tests/test_device_config_write_rules.py` (`test_confirm_repeats_no_schedule_time_check`)
 - **CFG-JOB-14.** The internal summary answers `count`, every job ever scheduled for
   the device, and `names`, the distinct non-empty `description` values of their
   versions, at most `APPLY_JOBS_SUMMARY_NAME_CAP` (20), never a config; an unknown
@@ -831,7 +832,7 @@ is WIRE-DRIVER-6 in `provisioning-and-wiring.md`.
   `config_version_id` are used as sent; the `config_version_id` is only recorded (a retry
   checks it, CFG-RUN-7). \
   Enforced in: `services/execution/app/routers/executions.py` (`manual_execute`, `_assert_execute_reservation`) \
-  Pinned by: `services/execution/tests/test_manual_execute_reservation_scope.py` (`test_owner_runs_configure_under_their_own_reservation`, `test_non_admin_cannot_tag_a_run_with_another_users_reservation`, `test_non_admin_cannot_tag_a_run_with_a_reservation_without_the_device`, `test_admin_may_tag_a_run_with_another_users_reservation_holding_the_device`, `test_admin_cannot_tag_a_run_with_a_reservation_without_the_device`, `test_execute_without_a_reservation_asks_nothing`, `test_reservation_check_fails_closed`, `test_reservation_check_without_an_internal_token_fails_closed`, `test_non_admin_without_a_grant_is_refused_before_the_reservation_check`, `test_internal_execute_reservation_is_not_checked`); `tests/integration/test_execution_device_scope.py` (`test_execute_refuses_a_reservation_that_does_not_hold_the_device`, `test_execute_accepts_the_callers_reservation_holding_the_device`)
+  Pinned by: `services/execution/tests/test_manual_execute_reservation_scope.py` (`test_owner_runs_configure_under_their_own_reservation`, `test_non_admin_cannot_tag_a_run_with_another_users_reservation`, `test_non_admin_cannot_tag_a_run_with_a_reservation_without_the_device`, `test_admin_may_tag_a_run_with_another_users_reservation_holding_the_device`, `test_admin_cannot_tag_a_run_with_a_reservation_without_the_device`, `test_execute_without_a_reservation_asks_nothing`, `test_reservation_check_fails_closed`, `test_reservation_check_without_an_internal_token_fails_closed`, `test_non_admin_without_a_grant_is_refused_before_the_reservation_check`, `test_internal_execute_reservation_is_not_checked`, `test_execute_uses_ports_arguments_and_dry_run_as_sent`); `tests/integration/test_execution_device_scope.py` (`test_execute_refuses_a_reservation_that_does_not_hold_the_device`, `test_execute_accepts_the_callers_reservation_holding_the_device`)
 - **CFG-EXEC-4.** The device and its template are read through inventory's internal
   routes with the internal token and 10 seconds; a 404 is 404 `Device <id> not found` or
   `Template <id> not found`, and any other failure is 503 `Failed to fetch device: <reason>`
@@ -1395,8 +1396,8 @@ See [ENV_VARS.md](../ENV_VARS.md) for the rest.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/common/tests/test_device_config.py`, `services/common/tests/test_acl.py`; `services/inventory/tests/test_published_schema.py`, `test_apply_scheduler.py`; `services/execution/tests/test_driver_loader*.py`, `test_driver_sandbox*.py`, `test_runner.py`, `test_sandbox_isolation.py`, `test_dry_run.py`, `test_driver_transcript.py`, `test_config_schema_extraction.py`, `test_configure_capability_parity.py`, `test_package_validator.py`; frontend `frontend/src/test/components/DeviceConfigSection.test.tsx`, `ApplyJobsPanel.test.tsx`, `AIApplyConfirmModal.test.tsx`, `frontend/src/test/lib/errors.test.ts`, `frontend/src/test/api/deviceConfig.test.tsx`, `deviceConfigJobs.test.tsx` | SQLite in memory; the sandbox suites start real child processes |
-| Functional (through the service API) | `services/inventory/tests/test_device_configs.py`, `test_device_configs_rbac.py`, `test_apply_jobs_reservation_owner.py`, `test_apply_jobs_reservation_scope.py`, `test_confirm_dry_run.py`, `test_configure_capability_gate.py`, `test_device_config_restore_reservation_guard.py`, `test_device_read_visibility_gate.py`, `test_apply_jobs_internal_summary.py`, `test_router_edge_cases.py`; `services/execution/tests/test_router_endpoints.py`, `test_router_direct.py`, `test_api_endpoints.py`, `test_command_log*.py`, `test_config_schema_endpoint.py`, `test_configure_capability_gate.py`, `test_execution_service_edges.py` | acl, reservations, and execution are patched |
-| Integration (running stack) | `tests/integration/test_execution_configure_gate.py`, `test_execution_result_gating.py`, `test_package_validation.py`; the NOS lab tiers under `tests/nos_lab/` (`test_frr_mgmt_driver_live.py` drives the Management driver's `configure`) | None for config versions, scheduled applies, the scheduler, dry runs, or the schema proxy |
+| Functional (through the service API) | `services/inventory/tests/test_device_configs.py`, `test_device_configs_rbac.py`, `test_apply_jobs_reservation_owner.py`, `test_apply_jobs_reservation_scope.py`, `test_device_config_write_rules.py`, `test_dry_run_gate.py`, `test_confirm_dry_run.py`, `test_configure_capability_gate.py`, `test_device_config_restore_reservation_guard.py`, `test_device_read_visibility_gate.py`, `test_apply_jobs_internal_summary.py`, `test_router_edge_cases.py`; `services/execution/tests/test_router_endpoints.py`, `test_router_direct.py`, `test_api_endpoints.py`, `test_command_log*.py`, `test_config_schema_endpoint.py`, `test_configure_capability_gate.py`, `test_execution_service_edges.py`, `test_manual_execute_reservation_scope.py` | acl, reservations, and execution are patched |
+| Integration (running stack) | `tests/integration/test_config_apply_flow.py` (a config version validated through the schema proxy, a scheduled dry run fired by the scheduler on `drivers/frr_mgmt`, its transcript, the confirm, and the schedule's reservation check), `test_execution_configure_gate.py`, `test_execution_result_gating.py`, `test_execution_device_scope.py`, `test_package_validation.py`; the NOS lab tiers under `tests/nos_lab/` (`test_frr_mgmt_driver_live.py` drives the Management driver's `configure`) | The immediate apply and a real (not dry-run) scheduled push are not driven against a stack; the dev and gate stacks run the scheduler every 2 seconds (`docker-compose.override.yml`) |
 | Stress and load | None | `tests/load/locustfile.py` has no configuration task |
 | Browser end-to-end | `tests/e2e/test_flows_effects_playwright.py` (`test_device_config_version_cycle`: create, view, diff, restore), `tests/e2e/test_device_config_apply.py` (the section and panel render) | Apply, schedule, cancel, and the dry-run review are not driven in a browser; nightly and the gates only |
 
@@ -1412,9 +1413,6 @@ confirmed by reading only.
 ### Open defects
 
 None recorded.
-
-Documentation that disagrees with the code is tracked in #1099; the unpinned rules below
-that should have a test are tracked in #1100.
 
 ### Limits by decision
 
@@ -1439,11 +1437,5 @@ that should have a test are tracked in #1100.
 
 ### Rules with no test
 
-- CFG-AUTH-6: the write routes skip visibility.
-- CFG-VER-10: the default restore description.
-- CFG-VER-15: no version delete; the cascade from the device.
-- CFG-JOB-3: the time checks run before the lookups.
-- CFG-JOB-6: the schedule-time dry-run support check.
-- CFG-JOB-13: confirm repeats no schedule-time check.
 - CFG-DRY-4: the dry-run declaration is not verified.
 - CFG-SBX-9: no isolation beyond resource limits.
