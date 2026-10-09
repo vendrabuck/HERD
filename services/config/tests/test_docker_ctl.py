@@ -10,6 +10,12 @@ from app.docker_ctl import PROJECT_LABEL, SERVICE_LABEL, SKIP_SERVICES, restart_
 # The compose project the fake "own container" belongs to by default.
 OWN_PROJECT = "herd"
 
+# The containers Save and Restart must never bounce, written out here rather
+# than read from SKIP_SERVICES, so removing a name from the product set fails a
+# test instead of silently removing that name's test case (issue #1140). Adding
+# a name to the set needs a deliberate edit here too.
+EXPECTED_SKIP_SERVICES = ("config", "traefik", "postgres", "nats", "frontend")
+
 
 class _FakeContainer:
     def __init__(self, service_name: str, fail: bool = False, project: str = OWN_PROJECT):
@@ -111,14 +117,32 @@ def test_restart_services_restarts_non_skipped(monkeypatch):
     assert skipped.restart_called is False
 
 
-def test_restart_services_skips_known_services(monkeypatch):
-    # Every container belongs to SKIP_SERVICES, nothing should be restarted.
-    containers = [_FakeContainer(name) for name in SKIP_SERVICES]
+@pytest.mark.parametrize("name", EXPECTED_SKIP_SERVICES)
+def test_restart_services_never_restarts_a_skipped_service(monkeypatch, name):
+    # One container per literal name beside one ordinary service: only the
+    # ordinary one is restarted, so the skip is pinned through the behavior of
+    # restart_services, not only through the constant.
+    skipped = _FakeContainer(name)
+    auth = _FakeContainer("auth")
+    _install_fake_docker(monkeypatch, [skipped, auth])
+
+    result = restart_services()
+
+    assert result["restarted"] == ["auth"]
+    assert result["errors"] == []
+    assert skipped.restart_called is False
+    assert auth.restart_called is True
+
+
+def test_restart_services_skips_every_known_service(monkeypatch):
+    containers = [_FakeContainer(name) for name in EXPECTED_SKIP_SERVICES]
     _install_fake_docker(monkeypatch, containers)
 
     result = restart_services()
+
     assert result["restarted"] == []
     assert result["errors"] == []
+    assert not any(c.restart_called for c in containers)
 
 
 def test_restart_services_scopes_to_own_project(monkeypatch):
@@ -221,6 +245,5 @@ def test_restart_services_returns_error_when_list_fails(monkeypatch, caplog):
     assert "tcp://10.0.0.5:2376" in caplog.text
 
 
-@pytest.mark.parametrize("name", sorted(SKIP_SERVICES))
-def test_skip_services_contains_expected_names(name):
-    assert name in SKIP_SERVICES
+def test_skip_services_is_exactly_the_expected_names():
+    assert SKIP_SERVICES == set(EXPECTED_SKIP_SERVICES)
