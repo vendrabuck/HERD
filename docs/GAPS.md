@@ -169,6 +169,33 @@ Missing coverage:
 - [MEDIUM] Drivers: list, upload, download.
 - [LOW] Reporting, pathfinding, AI, config.
 
+## Suites that never run in GitHub CI
+
+Each suite below skips unless an environment variable or a reachable server says
+otherwise, and no GitHub workflow supplies it, so a green PR check and a green
+nightly say nothing about them.
+
+- **[MEDIUM] Live-LDAP auth suite.** `services/auth/tests/test_ldap_service_live.py`
+  (33 test functions, 41 collected items) skips through its module `pytestmark`
+  unless `HERD_TEST_LDAP_REQUIRED` is set or a directory answers at
+  `HERD_TEST_LDAP_HOST`/`HERD_TEST_LDAP_PORT`. It runs only through `make
+  test-auth-ldap`, which `make master` and `make everything` call through
+  `_gate-ldap-tests`. ci.yml's backend job has no directory, so it skips there, and
+  nightly.yml boots the directory (`make ldap-up`) but never runs this suite. Target:
+  a `make test-auth-ldap` step in `.github/workflows/nightly.yml` after the
+  existing `make ldap-up` step.
+- **[LOW] Config Save and Restart e2e.** `tests/e2e/test_config_playwright.py`
+  `test_config_save_and_restart_gated` skips unless `HERD_E2E_RESTART=1` (and carries
+  `seeded_skip_ok`); no workflow, Makefile target, or compose file sets the variable.
+  `docs/MANUAL_TESTING.md` (M4) covers the production-like restart by hand. Target: an
+  opt-in nightly step with `HERD_E2E_RESTART=1`, run last because it bounces the stack.
+- **[LOW] Live OpenAI-compatible provider smoke.**
+  `services/ai-orchestrator/tests/integration/test_vllm_live.py` (2 tests) skips
+  through its module `pytestmark` unless `HERD_VLLM_BASE_URL` is set; no workflow,
+  Makefile target, or compose file sets it, so it runs only by hand against a bench
+  server. Target: a manual or scheduled job with a reachable OpenAI-compatible
+  server, or a line in `docs/MANUAL_TESTING.md` naming when to run it.
+
 ## Notes
 
 - All items are actionable; each has a target file or clearly-identified
