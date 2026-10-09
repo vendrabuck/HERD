@@ -179,6 +179,15 @@ No physical cabling path between the two DUTs through known L1 switches. Either:
 
 One or both chosen ports have no recorded physical cabling. Pick a different port or ask an admin to record the cable.
 
+### A live-edit line shows red "no cable path on the chosen ports"
+
+In a live reservation edit, the draft autosave asks cabling to check the canvas, and this
+line's two ports are each cabled but no cable path joins them (issue #1066). The device pair
+can still be reachable through other ports, so the editor's own check passes; the fork save
+will not wire the line on other ports instead. The mark does not block **Commit to
+reservation**: the commit wires every other line and its toast names the skipped ones.
+Re-draw the line on ports a cable path joins, or ask an admin to record the missing cable.
+
 ### L3 validation or fork save fails with `503 l3_config_unavailable`
 
 The L3 validation pass (ADR 0014) fetches each L3-carrying switch's latest
@@ -501,7 +510,7 @@ Verify with `curl -k https://localhost/api/notifications/health` returning `{"st
 The notifications service consumes the same `herd.reservations.*` events on its own durable consumer. If the bell stays at zero:
 
 - Make sure you're logged in as the reservation **owner**; iteration 1 only notifies the owner (co-owners and ACL grantees are deferred).
-- Check `Settings` and confirm the relevant event (`Reservation confirmed`, `updated`, `cancelled`, `completed`) is still checked and the in-app channel is on.
+- Check `Settings` and confirm the relevant event (`Reservation confirmed`, `updated`, `cancelled`, `completed`, `expiring soon`, `failed`) is still checked and the in-app channel is on.
 - The notifications consumer has its own DLQ subject at `herd.reservations.dlq.notifications` (independent from execution's DLQ). Poison messages or exhausted retries land there; see [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq).
 - If user-profile is down or misconfigured (missing `INTERNAL_API_TOKEN` match), the consumer fails open and still delivers notifications with defaults; verify user-profile's health endpoint returns 200 if prefs aren't being respected. A failed preferences, admin-list, or contact lookup is never cached, so the next event asks again once the upstream recovers (issue #1075).
 - If the notifications service started while NATS was down, it logged `Failed to connect to NATS; ...` and runs without its consumers until it is restarted: restart it once NATS is up (see [OPERATIONS.md](OPERATIONS.md#nats-is-down)).
