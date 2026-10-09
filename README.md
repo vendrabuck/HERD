@@ -438,13 +438,15 @@ for 60s) and active reservation holders from reservations' internal endpoint (un
 per-event). The pluggable `Dispatcher` protocol ships four peer dispatchers: `InAppDispatcher`
 (the `notifications` table) plus `EmailDispatcher` (SMTP), `ChatDispatcher` (Slack-style
 incoming webhook), and `WebhookDispatcher` (HMAC-signed POST). Outbound channels are deduped
-on the source NATS stream+sequence via an `outbound_deliveries` ledger, and a send failure on
+on the payload `event_id` (the source NATS stream+sequence only for an event that carries none)
+via an `outbound_deliveries` ledger, and a send failure on
 one channel is isolated so it never blocks the others or in-app. Channel transport is
 instance-level config; outbound channels default off per user. A `reservation.expiring_soon`
 reminder is published by the reservations expiration task within a configurable lead window of
 `end_time`, deduped per reservation, and consumed through the existing reservations consumer.
 Per-user preferences live in `user_preferences.extras.notifications` (per-channel toggles +
-per-event opt-outs, including `device.health_transition` and `reservation.expiring_soon`) and
+per-event opt-outs, including `device.health_transition`, `reservation.expiring_soon`, and
+`reservation.failed`, every one on by default) and
 are read via user-profile's internal endpoint with a short in-process cache. REST API at
 `/api/notifications/notifications`
 for list/mark-read/mark-all/delete plus a GET/PUT `/preferences` proxy. Frontend surfaces

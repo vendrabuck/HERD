@@ -382,8 +382,11 @@ one per area; all ten areas are written.
 
 - **Per-device config versioning** (Shipped): list, detail, unified diff, and
   restore of device configuration snapshots.
-- **Scheduled config apply** (Shipped): schedule a config push to fire when a linked
-  reservation goes active. Owner or admin can cancel while pending. Optional
+- **Scheduled config apply** (Shipped): schedule a config push to fire at a set
+  time. A job may name a reservation; that reservation must already be active, hold
+  the device, and, for a non-admin, be the caller's (issue #1104), and the job is
+  skipped if the reservation is no longer active when it fires. The job's creator
+  or an admin can cancel it while pending. Optional
   dry-run mode runs the driver in simulation, captures the commands it would
   have emitted, and returns them via `GET /api/execution/runs/{id}/commands`
   for review before promotion to a real apply. A scheduled apply's run carries the
@@ -482,7 +485,9 @@ one per area; all ten areas are written.
   `device.health_transition`; each delivery is
   HMAC-SHA256 signed via `X-HERD-Signature`, at-least-once with retry and backoff,
   idempotent on the payload `event_id`, dead-lettered on exhaustion, and recorded
-  in an inspectable delivery ledger. See
+  in an inspectable delivery ledger. An admin can pause and resume a subscription
+  without losing its ledger; a paused subscription receives no event handled after
+  the pause, and a resume replays nothing (issue #1078). See
   [docs/EXTERNAL_API.md](docs/EXTERNAL_API.md) and
   [docs/api/v1-openapi.json](docs/api/v1-openapi.json). (Issue #33.)
 
