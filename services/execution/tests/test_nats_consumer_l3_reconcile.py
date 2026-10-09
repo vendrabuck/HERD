@@ -1142,14 +1142,24 @@ async def test_gate_missing_validation_stamp_revalidates_and_drives_clean_route(
 
 async def test_gate_stale_validation_stamp_revalidates_against_current_config():
     """A route stamped against a DIFFERENT (stale) config version id is also
-    re-validated, not merely a missing stamp."""
-    intent = [_intent_route("10.20.0.0/24", "eth1", validated_config_version_id="an-old-version")]
+    re-validated, not merely a missing stamp. The route names an interface the
+    CURRENT config does not declare, so only re-validation can refuse it: a
+    stale stamp trusted verbatim would drive login, configure_route, logout."""
+    intent = [
+        _intent_route(
+            "10.20.0.0/24", "eth-does-not-exist", validated_config_version_id="an-old-version"
+        )
+    ]
     calls = await _reconcile(
         [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
         l3_routes={SW_L3: intent},
         config_fetch=_config_with_interfaces,
     )
-    assert {d for a, d in calls if a == "configure_route"} == {"10.20.0.0/24"}
+    assert calls == [], "re-validation refused the route before any driver call"
+    rows = await _rows("FAILED")
+    assert len(rows) == 1
+    assert rows[0].last_error == "l3_unknown_interface"
+    assert rows[0].intended == "ACTIVE"
 
 
 async def test_gate_current_validation_stamp_trusts_verbatim_no_content_check():

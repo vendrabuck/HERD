@@ -223,41 +223,93 @@ def _preassign(fabric_id, vlan_id, reservation_id) -> VlanAssignment:
     )
 
 
+async def _assign_with_competitor_at_first_commit(engine, rid, competitor_rid, vlan_id):
+    """Run find_or_assign_vlan for rid with a competitor committed INSIDE the race.
+
+    The caller's session commit is wrapped: on its FIRST call, a second session
+    commits an ACTIVE row (competitor_rid, vlan_id) in FABRIC_A, and only then does
+    the caller's own commit run. The caller has already read the in-use set and
+    chosen its number, so its insert is the one that trips the partial-unique
+    index. Returns (assigned vlan, commit calls, rollback calls).
+    """
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    calls = {"commit": 0, "rollback": 0}
+    async with maker() as session:
+        real_commit = session.commit
+        real_rollback = session.rollback
+
+        async def _commit():
+            calls["commit"] += 1
+            if calls["commit"] == 1:
+                async with maker() as competitor:
+                    competitor.add(_preassign(FABRIC_A, vlan_id, competitor_rid))
+                    await competitor.commit()
+            await real_commit()
+
+        async def _rollback():
+            calls["rollback"] += 1
+            await real_rollback()
+
+        session.commit = _commit
+        session.rollback = _rollback
+        assigned = await find_or_assign_vlan(session, rid, FABRIC_A, [SWITCH_1], _resolver())
+    return assigned, calls["commit"], calls["rollback"]
+
+
 @pytest.mark.asyncio
 async def test_assign_vlan_loses_race_retries_onto_free_vlan(shared_engine):
     """A racing caller grabs our preferred VLAN first; we must retry onto a free one.
 
-    Drives the partial-unique index -> IntegrityError -> rollback -> retry branch:
-    we seed the in-use set as empty (so the caller computes its preferred VLAN), then
-    a competing session commits that exact VLAN to a different reservation before the
-    caller's commit. The caller's commit trips the index and retries onto a free VLAN.
+    Drives the partial-unique index, IntegrityError, rollback, retry branch:
+    the caller reads an empty in-use set and chooses its preferred VLAN, then a
+    competing session commits that exact VLAN to a different reservation just
+    before the caller's commit. The caller's commit trips the index, rolls back,
+    and the retry re-reads the in-use set and lands on the lowest free VLAN.
     """
-    maker = async_sessionmaker(shared_engine, expire_on_commit=False)
     rid = str(uuid.uuid4())
     preferred = _derive_vlan_id(rid)
     competitor_rid = _colliding_reservation_id(preferred, exclude=rid)
 
-    # Competitor takes the preferred VLAN first, in its own committed transaction.
-    async with maker() as competitor:
-        competitor.add(_preassign(FABRIC_A, preferred, competitor_rid))
-        await competitor.commit()
+    assigned, commits, rollbacks = await _assign_with_competitor_at_first_commit(
+        shared_engine, rid, competitor_rid, preferred
+    )
 
-    async with maker() as session:
-        assigned = await find_or_assign_vlan(session, rid, FABRIC_A, [SWITCH_1], _resolver())
-
+    assert commits == 2, "the first commit collided and the retry committed"
+    assert rollbacks == 1, "exactly one IntegrityError rollback"
     assert assigned != preferred, "caller should not reuse the VLAN the competitor took"
+    assert assigned == (VLAN_MIN if preferred != VLAN_MIN else VLAN_MIN + 1)
     active = await _active_vlans(shared_engine, FABRIC_A)
     assert sorted(active) == sorted([preferred, assigned])  # no duplicate, no orphan
     assert len(active) == 2
 
 
 @pytest.mark.asyncio
+async def test_assign_vlan_race_with_own_redelivery_retry_finds_own_row(shared_engine):
+    """The competitor that wins the race IS this reservation (a duplicate delivery
+    committing between our read and our commit). Our commit trips the index, rolls
+    back, and the retry's in-lock idempotency check finds the committed row and
+    returns its VLAN without a second insert."""
+    rid = str(uuid.uuid4())
+    preferred = _derive_vlan_id(rid)
+
+    assigned, commits, rollbacks = await _assign_with_competitor_at_first_commit(
+        shared_engine, rid, rid, preferred
+    )
+
+    assert assigned == preferred
+    assert commits == 1, "the retry found our row and wrote nothing"
+    assert rollbacks == 2, "one IntegrityError rollback, one lock-release rollback"
+    assert await _active_vlans(shared_engine, FABRIC_A) == [preferred]
+
+
+@pytest.mark.asyncio
 async def test_assign_vlan_concurrent_same_reservation_idempotent(shared_engine):
     """A redelivered assign for the SAME reservation+fabric returns the existing VLAN.
 
-    The competitor here IS this reservation (duplicate NATS delivery). The second
-    attempt's commit trips the index, rolls back, and the retry's idempotency check
-    finds the already-committed row and returns its VLAN, leaving exactly one row.
+    The second delivery runs after the first committed, so the leading idempotency
+    check (outside the lock) already sees the row and returns its VLAN; no commit
+    trips the index here. The index-and-retry path for this case is
+    test_assign_vlan_race_with_own_redelivery_retry_finds_own_row.
     """
     maker = async_sessionmaker(shared_engine, expire_on_commit=False)
     rid = str(uuid.uuid4())

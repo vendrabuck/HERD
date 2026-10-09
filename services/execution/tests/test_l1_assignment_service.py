@@ -499,7 +499,15 @@ async def test_record_connect_loses_race_returns_winner(shared_engine, monkeypat
 async def test_all_assignments_returns_every_status_oldest_first(db):
     """Unlike active_assignments_for_reservation, no status filter is applied: an
     ACTIVE row, a RELEASED row, and a FAILED row for the same reservation all come
-    back, ordered oldest-created first."""
+    back, ordered oldest-created first.
+
+    The rows are inserted in one order and given explicit, distinct created_at
+    values in another (SQLite stores created_at to the second, so rows written in
+    one test tie and an unordered read would return insertion order anyway)."""
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import update
+
     rid = uuid.uuid4()
     switch = uuid.uuid4()
     active = await record_l1_connect(db, rid, switch, "0/0/1", "0/0/2")
@@ -508,9 +516,17 @@ async def test_all_assignments_returns_every_status_oldest_first(db):
     failed = await record_l1_failed(
         db, rid, switch, "0/0/5", "0/0/6", attempts=1, last_error="boom", intended="ACTIVE"
     )
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for row_id, offset in ((released.id, 2), (failed.id, 0), (active.id, 1)):
+        await db.execute(
+            update(L1ConnectionAssignment)
+            .where(L1ConnectionAssignment.id == row_id)
+            .values(created_at=base + timedelta(minutes=offset))
+        )
+    await db.commit()
 
     rows = await all_assignments_for_reservation(db, rid)
-    assert [r.id for r in rows] == [active.id, released.id, failed.id]
+    assert [r.id for r in rows] == [failed.id, active.id, released.id]
     assert {r.status for r in rows} == {"ACTIVE", "RELEASED", "FAILED"}
 
 
@@ -597,8 +613,9 @@ def test_backfill_reconnect_after_disconnect_is_live():
         _run(rid, switch, "connect_ports", "SUCCESS", "A", "B", 3),
     ]
     out = compute_backfill_assignments(runs)
-    assert len(out) == 1
-    assert out[0]["port_a"], out[0]["port_b"] == ("A", "B")
+    assert out == [
+        {"reservation_id": rid, "switch_device_id": switch, "port_a": "A", "port_b": "B"}
+    ]
 
 
 def test_backfill_dedupes_to_one_row_per_pair():

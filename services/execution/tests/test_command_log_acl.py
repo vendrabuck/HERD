@@ -144,26 +144,42 @@ async def test_non_admin_run_without_reservation_rejected(_override_db):
     assert resp.status_code == 403
 
 
+class _ErrorClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def get(self, *args, **kwargs):
+        raise httpx.ConnectError("reservations service down")
+
+
 @pytest.mark.asyncio
-async def test_reservations_service_error_is_closed_by_default(_override_db, monkeypatch):
-    """Reservations service returning 5xx is treated as 'not owned'."""
+@pytest.mark.parametrize(
+    "client_factory",
+    [
+        pytest.param(lambda: _ErrorClient(), id="transport-error"),
+        pytest.param(lambda: _mock_reservations_response(503), id="http-503"),
+        pytest.param(lambda: _mock_reservations_response(500), id="http-500"),
+    ],
+)
+async def test_reservations_service_error_is_closed_by_default(
+    _override_db, monkeypatch, client_factory
+):
+    """Reservations service unreachable or answering 5xx is treated as 'not
+    owned': the ownership refusal, not a pass on to the visibility check."""
     run_id = await _seed_run_with_commands(reservation_id=RESERVATION_ID)
     app.dependency_overrides[get_current_user_payload] = lambda: USER_PAYLOAD
-
-    class _ErrorClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def get(self, *args, **kwargs):
-            raise httpx.ConnectError("reservations service down")
-
-    monkeypatch.setattr(ex_router.httpx, "AsyncClient", lambda *a, **kw: _ErrorClient())
+    monkeypatch.setattr(ex_router.httpx, "AsyncClient", lambda *a, **kw: client_factory())
+    # Visibility would admit the device, so only the ownership check can refuse.
+    monkeypatch.setattr(
+        ex_router.device_visibility, "fetch_visible_device_ids", AsyncMock(return_value={DEVICE_ID})
+    )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         resp = await ac.get(
             f"/runs/{run_id}/commands",
             headers={"Authorization": "Bearer fake-token"},
         )
     assert resp.status_code == 403
+    assert resp.json() == {"detail": "Reservation not owned by caller"}

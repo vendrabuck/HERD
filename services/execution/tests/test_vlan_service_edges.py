@@ -3,7 +3,10 @@
 Covers fetch_fabric_id (network helper, all outcomes, fail closed per issue
 #1003), the FabricResolver memo, the no-free-VLAN
 exhaustion in find_or_assign_vlan, and the retry-exhaustion guard. The happy
-paths and the IntegrityError-retry race are covered in test_vlan_service.py.
+paths are covered in test_vlan_service.py, and so is the IntegrityError-retry
+race: test_assign_vlan_loses_race_retries_onto_free_vlan and
+test_assign_vlan_race_with_own_redelivery_retry_finds_own_row commit a competitor
+row between the caller's read and its commit.
 """
 
 import uuid
