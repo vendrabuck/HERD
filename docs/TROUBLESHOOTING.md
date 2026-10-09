@@ -274,6 +274,18 @@ For the first two, start a new run or re-apply the config version from the devic
 run that does not record whether it was a dry run is refused with its own 409 (see
 [ROLES.md](ROLES.md#retry-a-failed-run)).
 
+### Scheduling a config apply answers `422 reservation_id must reference an active reservation ...`
+
+A `reservation_id` on `POST /api/inventory/devices/{id}/config-versions/{vid}/schedule`
+must name a reservation that is `ACTIVE` now and holds the device and, for a non-admin,
+one the caller owns (`reservation_id must reference an active reservation you own that
+includes this device`; an admin sees `... an active reservation that includes this
+device`). A reservation that has not started, has ended, or books other devices is
+refused, even when the caller owns another reservation that holds the device. Drop the
+field or send the right reservation. `503 Could not verify the reservation; nothing was
+scheduled. Retry the request.` means the reservations service could not answer; the
+inventory log line `Reservation check for schedule on device ... failed` says why.
+
 ### `POST /api/execution/execute` answers `422 reservation_id must reference a reservation ...`
 
 A `reservation_id` in the body must name a reservation that holds the device and, for a

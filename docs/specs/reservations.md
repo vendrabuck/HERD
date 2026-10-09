@@ -307,7 +307,7 @@ area.
 | GET | `/internal/active-users?device_id` | `X-Internal-Token` | notifications (health fan-out) | list of user ids | RES-INTERNAL-1, RES-INTERNAL-4 |
 | GET | `/internal/held-devices?user_id` | `X-Internal-Token` | inventory (instance-device visibility grant) | `{device_ids}` | RES-INTERNAL-1, RES-INTERNAL-8 |
 | GET | `/internal/by-topology/{topology_id}` | `X-Internal-Token` | cabling (topology edit lock and delete guard) | list of `{id, user_id, topology_id, status, end_time}` | RES-INTERNAL-1, RES-INTERNAL-5 |
-| GET | `/internal/by-device/{device_id}` | `X-Internal-Token` | inventory (device delete guard, config restore) | list of `{id, user_id, device_id, status, end_time}` | RES-INTERNAL-1, RES-INTERNAL-5 |
+| GET | `/internal/by-device/{device_id}` | `X-Internal-Token` | inventory (device delete guard, config restore, a schedule's `reservation_id`), execution (`POST /execute`'s `reservation_id`) | list of `{id, user_id, device_id, status, end_time}` | RES-INTERNAL-1, RES-INTERNAL-5 |
 | POST | `/internal/{id}/provision-result` | `X-Internal-Token` | execution | `{reservation_id, status, applied}` | RES-INTERNAL-1, RES-DYN-6, RES-DYN-7, RES-DYN-8 |
 
 ## 8. Features

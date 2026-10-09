@@ -307,3 +307,42 @@ async def test_internal_execute_reservation_is_not_checked(pipeline, monkeypatch
     assert resp.status_code == 201
     assert resp.json()["reservation_id"] == OTHER_RESERVATION
     lookup.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_uses_ports_arguments_and_dry_run_as_sent(pipeline, monkeypatch):
+    """CFG-EXEC-3: after the checks, `port_a`, `port_b`, `method_kwargs`, and
+    `dry_run` reach the driver call as sent, and `config_version_id` is only
+    recorded on the run (issue #1100)."""
+    seen: list = []
+    monkeypatch.setattr(ex_router.httpx, "AsyncClient", _reservations(_holders(HOLDERS), seen))
+    version_id = str(uuid.uuid4())
+    kwargs = {"hostname": "r1", "vlans": [10, 20], "nested": {"mtu": 9000}}
+    body = {
+        **_body(OWN_RESERVATION),
+        "action": "configure",
+        "port_a": "ge-0/0/1",
+        "port_b": "ge-0/0/2",
+        "method_kwargs": kwargs,
+        "dry_run": True,
+        "config_version_id": version_id,
+    }
+    async with _client_as(USER_PAYLOAD) as ac:
+        resp = await ac.post("/execute", json=body)
+
+    assert resp.status_code == 201, resp.text
+    assert pipeline.call_count == 1
+    call = pipeline.call_args.kwargs
+    assert call["action"] == "configure"
+    assert call["port_a"] == "ge-0/0/1"
+    assert call["port_b"] == "ge-0/0/2"
+    assert call["method_kwargs"] == kwargs
+    assert call["dry_run"] is True
+    run = resp.json()
+    assert run["port_a"] == "ge-0/0/1"
+    assert run["port_b"] == "ge-0/0/2"
+    assert run["reservation_id"] == OWN_RESERVATION
+    assert run["input_params"]["dry_run"] is True
+    assert run["input_params"]["config_version_id"] == version_id
+    assert run["input_params"]["method_kwargs"] == kwargs
+    assert len(seen) == 1

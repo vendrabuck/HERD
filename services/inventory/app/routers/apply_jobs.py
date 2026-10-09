@@ -40,9 +40,18 @@ from app.services.manage_guard import (
 
 APPLY_JOBS_SUMMARY_NAME_CAP = 20
 
-# Pinned (issue #704): tests match on this exact string.
+# Pinned: tests match on these exact strings (issues #704 and #1104). The admin
+# variant drops "you own": an admin is exempt from ownership, not from the
+# activeness or the device check. The style follows execution's
+# EXECUTE_RESERVATION_* details (CFG-EXEC-3).
 RESERVATION_MISMATCH_ERROR = (
     "reservation_id must reference an active reservation you own that includes this device"
+)
+RESERVATION_MISMATCH_ADMIN_ERROR = (
+    "reservation_id must reference an active reservation that includes this device"
+)
+RESERVATION_UNAVAILABLE_ERROR = (
+    "Could not verify the reservation; nothing was scheduled. Retry the request."
 )
 _RESERVATIONS_HTTP_TIMEOUT_SECONDS = 5.0
 
@@ -51,38 +60,52 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["apply-jobs"])
 
 
-async def _validate_reservation_for_job(
-    *, reservation_id: uuid.UUID, user_id: uuid.UUID, device_id: uuid.UUID
-) -> None:
-    """Validate a caller-supplied reservation_id at schedule time (issue #704).
+def _reservation_unavailable(device_id: uuid.UUID, why: str) -> HTTPException:
+    """Log why the reservation check could not be answered and build the fixed 503.
 
-    Must be an ACTIVE reservation owned by the caller that contains the
-    device. reservations' GET /internal/{id} (ReservationInternalStatus) is
-    deliberately minimal ("No PII; no device list", per its own docstring):
-    it has no owner or device_ids field, so it alone cannot answer ownership
-    or containment. This combines two internal calls instead:
-
-    1. GET /internal/{reservation_id}: the id exists and is currently
-       ACTIVE. A 404 or an inactive reservation is a 422.
-    2. GET /internal/active?user_id=&device_id=: the caller owns AT LEAST
-       ONE active reservation containing this device. This is the same
-       check herd_common.acl's reservation-owner free pass already uses
-       elsewhere; it is not itself scoped to reservation_id (that endpoint
-       returns no id to match against).
-
-    Together these are the closest available proxy for "reservation_id IS
-    an active reservation owned by the caller containing the device", but
-    not a airtight one: a caller holding two concurrent active
-    reservations, one containing the device and one not, could in
-    principle pass the id of the wrong one and still clear both checks.
-    Closing that gap would mean widening ReservationInternalStatus with an
-    owner/device_ids field, which is reservations' service boundary and out
-    of scope for this change (another lane owns that service). Fails
-    closed (503) if reservations is unreachable or answers with anything
-    other than a clean 200/404.
+    The reason is HERD-authored (a status code or an exception class), never
+    upstream text, and it goes to the log only; the caller sees the fixed detail.
     """
+    logger.warning("Reservation check for schedule on device %s failed (%s)", device_id, why)
+    return HTTPException(status_code=503, detail=RESERVATION_UNAVAILABLE_ERROR)
+
+
+async def _validate_reservation_for_job(
+    *, reservation_id: uuid.UUID, payload: dict, device_id: uuid.UUID
+) -> None:
+    """Check a caller-supplied reservation_id at schedule time (issues #704, #1104).
+
+    The job carries this id, and the scheduler's fire-time check keys on it
+    (CFG-SCHED-5), so it must name a reservation that is ACTIVE now, holds the
+    device, and, for a non-admin, belongs to the caller. An admin is exempt
+    from ownership only. Two internal-token reads answer that:
+
+    1. GET /internal/{reservation_id}: `is_active` (status ACTIVE and inside
+       its window), the same judgement the scheduler makes at fire time. A 404
+       or an inactive reservation is a 422.
+    2. GET /internal/by-device/{device_id}: every reservation, of any status
+       and any owner, whose device set holds the device, with its owner. The
+       named id must be listed and, for a non-admin, its `user_id` must be the
+       caller; otherwise 422.
+
+    Together these imply what reservations' GET /internal/active answers
+    (the caller owns an ACTIVE, in-window reservation holding the device),
+    so that third read is no longer made here. The reservation-owner widening
+    for a non-admin without a manage grant is the separate authorization
+    check in the route (`_user_can_manage_device`) and is unchanged.
+
+    One 422 detail per caller kind, so a non-admin cannot tell an unknown id,
+    an inactive one, another user's, and one without the device apart. The
+    check fails closed: no internal token, a transport error, a non-200 other
+    than the status read's 404, a body that is not JSON, a status body that is
+    not an object, or a by-device body that is not a list of objects with
+    string `id` and `user_id` is 503 RESERVATION_UNAVAILABLE_ERROR, and
+    nothing is scheduled.
+    """
+    is_admin = _is_admin(payload)
+    mismatch = RESERVATION_MISMATCH_ADMIN_ERROR if is_admin else RESERVATION_MISMATCH_ERROR
     if not settings.internal_api_token:
-        raise HTTPException(status_code=503, detail="reservations service unreachable")
+        raise _reservation_unavailable(device_id, "no internal token configured")
     base = settings.reservations_service_url.rstrip("/")
     headers = {"X-Internal-Token": settings.internal_api_token}
     async with httpx.AsyncClient() as client:
@@ -92,52 +115,56 @@ async def _validate_reservation_for_job(
                 headers=headers,
                 timeout=_RESERVATIONS_HTTP_TIMEOUT_SECONDS,
             )
-        except httpx.HTTPError:
-            raise HTTPException(
-                status_code=503, detail="reservations service unreachable"
-            ) from None
+        except httpx.HTTPError as exc:
+            raise _reservation_unavailable(device_id, type(exc).__name__) from None
         if resp.status_code == 404:
-            raise HTTPException(status_code=422, detail=RESERVATION_MISMATCH_ERROR)
+            raise HTTPException(status_code=422, detail=mismatch)
         if resp.status_code != 200:
-            raise HTTPException(status_code=503, detail="reservations service unreachable")
+            raise _reservation_unavailable(device_id, f"status read answered {resp.status_code}")
         try:
             status_data = resp.json()
         except ValueError:
-            raise HTTPException(
-                status_code=503, detail="reservations service unreachable"
-            ) from None
+            status_data = None
         # A 200 whose JSON is not an object is unusable, the same fail-closed
         # 503 as a non-JSON body (issue #1096).
         if not isinstance(status_data, dict):
-            raise HTTPException(status_code=503, detail="reservations service unreachable")
+            raise _reservation_unavailable(device_id, "status read answered a misshapen body")
         if not status_data.get("is_active"):
-            raise HTTPException(status_code=422, detail=RESERVATION_MISMATCH_ERROR)
+            raise HTTPException(status_code=422, detail=mismatch)
 
         try:
-            active_resp = await client.get(
-                f"{base}/internal/active",
-                params={"user_id": str(user_id), "device_id": str(device_id)},
+            holders_resp = await client.get(
+                f"{base}/internal/by-device/{device_id}",
                 headers=headers,
                 timeout=_RESERVATIONS_HTTP_TIMEOUT_SECONDS,
             )
-        except httpx.HTTPError:
-            raise HTTPException(
-                status_code=503, detail="reservations service unreachable"
-            ) from None
-        if active_resp.status_code != 200:
-            raise HTTPException(status_code=503, detail="reservations service unreachable")
+        except httpx.HTTPError as exc:
+            raise _reservation_unavailable(device_id, type(exc).__name__) from None
+        if holders_resp.status_code != 200:
+            raise _reservation_unavailable(
+                device_id, f"by-device read answered {holders_resp.status_code}"
+            )
         try:
-            active_data = active_resp.json()
+            rows = holders_resp.json()
         except ValueError:
-            raise HTTPException(
-                status_code=503, detail="reservations service unreachable"
-            ) from None
-        # A 200 whose JSON is not an object is unusable, the same fail-closed
-        # 503 as a non-JSON body (issue #1096).
-        if not isinstance(active_data, dict):
-            raise HTTPException(status_code=503, detail="reservations service unreachable")
-        if not active_data.get("owns_active"):
-            raise HTTPException(status_code=422, detail=RESERVATION_MISMATCH_ERROR)
+            rows = None
+        if not isinstance(rows, list) or not all(
+            isinstance(row, dict)
+            and isinstance(row.get("id"), str)
+            and isinstance(row.get("user_id"), str)
+            for row in rows
+        ):
+            raise _reservation_unavailable(device_id, "by-device read answered a misshapen body")
+    for row in rows:
+        try:
+            if uuid.UUID(row["id"]) != reservation_id:
+                continue
+        except ValueError:
+            continue
+        if is_admin or row["user_id"] == str(payload.get("sub")):
+            return
+        break
+    raise HTTPException(status_code=422, detail=mismatch)
 
 
 @router.post(
@@ -215,16 +242,16 @@ async def schedule_apply_job(
     # the runner. Raises 409 with a structured detail on refusal.
     _assert_driver_can_configure(device)
 
-    # Reservation-id validation (issue #704): an optional reservation_id must
-    # actually be an active reservation the caller owns that contains this
-    # device. Without this, any caller could attach an arbitrary or foreign
-    # reservation_id (or one that never covered this device) to a job,
-    # which the fire-time reservation-active check would then treat as
-    # legitimate cover.
+    # Reservation-id validation (issues #704, #1104): an optional reservation_id
+    # must name an ACTIVE reservation that holds this device and, for a
+    # non-admin, belongs to the caller. Without this, a caller could attach an
+    # arbitrary, foreign, or unrelated reservation_id to a job, and the
+    # fire-time reservation-active check would then follow that reservation
+    # instead of the one that authorized the job.
     if body.reservation_id is not None:
         await _validate_reservation_for_job(
             reservation_id=body.reservation_id,
-            user_id=uuid.UUID(payload["sub"]),
+            payload=payload,
             device_id=device_id,
         )
 

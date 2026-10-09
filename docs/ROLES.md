@@ -542,8 +542,17 @@ time (grant revoked, reservation ended), the job resolves `skipped` with the err
 where a job scheduled far in advance could still fire once its creator no longer
 qualifies. `scheduled_for` is also bounded (`apply_job_max_horizon_days`, default 30
 days) so a job cannot sit queued indefinitely before this re-check ever runs, and a
-caller-supplied `reservation_id` on the schedule request is validated up front (must
-be an active reservation the caller owns that contains the device; 422 otherwise).
+caller-supplied `reservation_id` on the schedule request is validated up front (issue
+#1104): it must name a reservation that is `ACTIVE` now and holds the device, and for a
+non-admin one the caller owns. An admin is exempt from ownership only. Anything else is
+422 (`reservation_id must reference an active reservation you own that includes this
+device`; an admin sees `... an active reservation that includes this device`), and 503
+`Could not verify the reservation; nothing was scheduled. Retry the request.` when the
+reservations service cannot answer. Naming the reservation does not replace the
+authorization check above: a non-admin still needs a `manage` grant or an active
+reservation of the device, and the fire-time re-check still applies to an admin, who
+has no standing of their own there, so an admin's job fires only while the admin holds
+a grant or owns an active reservation of the device.
 
 ---
 
