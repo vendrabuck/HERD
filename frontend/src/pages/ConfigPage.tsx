@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from "react";
 import { Link } from "react-router-dom";
 import toast from "react-hot-toast";
 import { TOAST_CLEARANCE_CLASS } from "@/lib/toastClearance";
+import { loginRetryAfterSeconds, loginRetryAfterText } from "@/lib/errors";
 import { ArrowLeft, Eye, EyeOff, ChevronDown, ChevronRight } from "lucide-react";
 import { useConfigStore } from "@/stores/configStore";
 import {
@@ -16,6 +17,9 @@ import {
 
 // -- Config Login --
 
+// setTimeout takes a signed 32-bit delay; a longer one fires at once.
+const MAX_TIMER_MS = 2_147_483_647;
+
 function ConfigLogin({
   onLoginSuccess,
 }: {
@@ -23,14 +27,36 @@ function ConfigLogin({
 }) {
   const [password, setPassword] = useState("");
   const login = useConfigLogin();
+  // Issue #1126: a 429 from the attempt limit (OPS-CONFIG-22) holds Sign in
+  // for the Retry-After wait, since an attempt inside it is refused before
+  // the password is even checked. A fresh object per refusal re-arms the
+  // timer below.
+  const [lockout, setLockout] = useState<{ seconds: number } | null>(null);
+
+  useEffect(() => {
+    if (!lockout) return;
+    const handle = setTimeout(
+      () => setLockout(null),
+      Math.min(lockout.seconds * 1000, MAX_TIMER_MS),
+    );
+    return () => clearTimeout(handle);
+  }, [lockout]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (lockout) return;
     try {
       const result = await login.mutateAsync(password);
       onLoginSuccess(result.password_changed);
-    } catch {
-      toast.error("Invalid config password");
+    } catch (err) {
+      const lockedText = loginRetryAfterText(err);
+      if (lockedText === null) {
+        toast.error("Invalid config password");
+        return;
+      }
+      toast.error(lockedText);
+      const seconds = loginRetryAfterSeconds(err);
+      if (seconds !== null) setLockout({ seconds });
     }
   };
 
@@ -62,7 +88,7 @@ function ConfigLogin({
         </div>
         <button
           type="submit"
-          disabled={login.isPending}
+          disabled={login.isPending || lockout !== null}
           className="w-full bg-blue-600 text-white py-2 rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
         >
           {login.isPending ? "Authenticating..." : "Sign in"}

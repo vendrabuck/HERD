@@ -3,7 +3,7 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const { toastError, toastSuccess } = vi.hoisted(() => ({
   toastError: vi.fn(),
@@ -81,6 +81,108 @@ describe("ConfigPage (unauthenticated)", () => {
       expect(toastError).toHaveBeenCalledWith("Invalid config password"),
     );
     expect(useConfigStore.getState().configToken).toBeNull();
+  });
+});
+
+// Issue #1126: the config login's attempt limit (OPS-CONFIG-22) answers 429
+// with Retry-After; the form says so and holds Sign in for the wait, while a
+// 401 keeps the wrong-password wording.
+describe("ConfigPage login attempt limit (issue #1126)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function submitWrongPassword() {
+    fireEvent.change(screen.getByLabelText("Config Password"), {
+      target: { value: "wrong" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+  }
+
+  function lockedLogin(headers: Record<string, string>) {
+    let calls = 0;
+    server.use(
+      http.post("/api/config/login", () => {
+        calls += 1;
+        return HttpResponse.json(
+          { detail: "Too many failed login attempts; try again later" },
+          { status: 429, headers },
+        );
+      }),
+    );
+    return () => calls;
+  }
+
+  it("keeps the wrong-password wording for a 401 and leaves Sign in enabled", async () => {
+    server.use(
+      http.post("/api/config/login", () =>
+        HttpResponse.json({ detail: "Invalid password" }, { status: 401 }),
+      ),
+    );
+    renderWithProviders(<ConfigPage />);
+    submitWrongPassword();
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Invalid config password"));
+    expect(toastError).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeEnabled();
+  });
+
+  it("shows the wait from Retry-After and disables Sign in until it passes", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const calls = lockedLogin({ "Retry-After": "30" });
+    renderWithProviders(<ConfigPage />);
+    submitWrongPassword();
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "Too many failed login attempts; try again in 30 seconds",
+      ),
+    );
+    expect(toastError).not.toHaveBeenCalledWith("Invalid config password");
+    const button = screen.getByRole("button", { name: "Sign in" });
+    await waitFor(() => expect(button).toBeDisabled());
+
+    // A submit inside the wait (Enter in the field) sends nothing.
+    fireEvent.submit(button.closest("form") as HTMLFormElement);
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(button).toBeDisabled();
+    expect(calls()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await waitFor(() => expect(button).toBeEnabled());
+  });
+
+  it("uses the singular for a one-second wait", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    lockedLogin({ "Retry-After": "1" });
+    renderWithProviders(<ConfigPage />);
+    submitWrongPassword();
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "Too many failed login attempts; try again in 1 second",
+      ),
+    );
+    await vi.advanceTimersByTimeAsync(1_000);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Sign in" })).toBeEnabled());
+  });
+
+  it("shows the server's sentence and keeps Sign in enabled when Retry-After is absent", async () => {
+    lockedLogin({});
+    renderWithProviders(<ConfigPage />);
+    submitWrongPassword();
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith("Too many failed login attempts; try again later"),
+    );
+    expect(toastError).not.toHaveBeenCalledWith("Invalid config password");
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeEnabled();
+  });
+
+  it("treats a Retry-After that is not a whole number of seconds as no stated wait", async () => {
+    lockedLogin({ "Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT" });
+    renderWithProviders(<ConfigPage />);
+    submitWrongPassword();
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith("Too many failed login attempts; try again later"),
+    );
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeEnabled();
   });
 });
 

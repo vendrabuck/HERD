@@ -8,6 +8,9 @@ import {
   formatMixedTypesDetail,
   formatTopologyInUse,
   formatUnconnectableDetail,
+  LOGIN_LOCKED_FALLBACK,
+  loginRetryAfterSeconds,
+  loginRetryAfterText,
   topologyMixedTypesDetail,
   topologyDeleteErrorText,
   topologyInUseDetail,
@@ -331,5 +334,66 @@ describe("configRestoreErrorText (issue #1098)", () => {
     expect(configRestoreErrorText(axiosLike(409, { message: "x" }))).toBe("Restore failed");
     expect(configRestoreErrorText(axiosLike(503, { reservations: [] }))).toBe("Restore failed");
     expect(configRestoreErrorText(new Error("network"))).toBe("Restore failed");
+  });
+});
+
+// Issue #1126: the config login's 429 from the attempt limit (OPS-CONFIG-22).
+describe("loginRetryAfterSeconds and loginRetryAfterText", () => {
+  function locked(headers: unknown, detail: unknown = LOGIN_LOCKED_FALLBACK, status = 429) {
+    return { response: { status, headers, data: { detail } } };
+  }
+
+  it("reads a whole-second Retry-After from a plain header object, in any case", () => {
+    expect(loginRetryAfterSeconds(locked({ "retry-after": "12" }))).toBe(12);
+    expect(loginRetryAfterSeconds(locked({ "Retry-After": " 7 " }))).toBe(7);
+    expect(loginRetryAfterText(locked({ "retry-after": "12" }))).toBe(
+      "Too many failed login attempts; try again in 12 seconds",
+    );
+    expect(loginRetryAfterText(locked({ "retry-after": "1" }))).toBe(
+      "Too many failed login attempts; try again in 1 second",
+    );
+  });
+
+  it("reads Retry-After through an AxiosHeaders-style get()", () => {
+    const headers = {
+      get(name: string) {
+        return name.toLowerCase() === "retry-after" ? "45" : undefined;
+      },
+    };
+    expect(loginRetryAfterSeconds(locked(headers))).toBe(45);
+  });
+
+  it("falls back to the server's sentence when Retry-After is missing or unusable", () => {
+    for (const headers of [
+      {},
+      undefined,
+      { "retry-after": "" },
+      { "retry-after": "0" },
+      { "retry-after": "-3" },
+      { "retry-after": "2.5" },
+      { "retry-after": "Wed, 21 Oct 2026 07:28:00 GMT" },
+    ]) {
+      expect(loginRetryAfterSeconds(locked(headers))).toBeNull();
+      expect(loginRetryAfterText(locked(headers))).toBe(LOGIN_LOCKED_FALLBACK);
+    }
+    expect(loginRetryAfterText(locked({}, "Slow down"))).toBe("Slow down");
+  });
+
+  it("writes the sentence itself when the 429 detail is not a string", () => {
+    expect(loginRetryAfterText(locked({}, [{ msg: "x" }]))).toBe(
+      "Too many failed login attempts; try again later",
+    );
+  });
+
+  it("answers null for anything that is not a 429", () => {
+    for (const err of [
+      locked({ "retry-after": "10" }, "Invalid password", 401),
+      locked({ "retry-after": "10" }, "boom", 503),
+      new Error("Network Error"),
+      undefined,
+    ]) {
+      expect(loginRetryAfterSeconds(err)).toBeNull();
+      expect(loginRetryAfterText(err)).toBeNull();
+    }
   });
 });

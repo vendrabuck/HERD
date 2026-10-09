@@ -13,12 +13,13 @@ Common failure modes and how to diagnose them. Organized by what the user sees.
 
 See [OPERATIONS.md](OPERATIONS.md#config-service-first-run).
 
-### The config page keeps saying `Invalid config password` even with the right password
+### The config page says `Too many failed login attempts`
 
-The config login limits failed attempts, and the page shows the same toast for a refused
-password and for a login that has to wait. A waiting login is answered HTTP 429 `Too many
+The config login limits failed attempts. A waiting login is answered HTTP 429 `Too many
 failed login attempts; try again later` with a `Retry-After` header, before the password
-is checked (the browser's network panel shows it). From a source address's third
+is checked. The page shows it as `Too many failed login attempts; try again in N seconds`
+and keeps **Sign in** disabled for those N seconds; a wrong password still shows `Invalid
+config password`. From a source address's third
 consecutive failure, that source waits 1 second, doubling to 60 seconds; once
 `CONFIG_LOGIN_MAX_ATTEMPTS` failures (default 20) from any sources fall within
 `CONFIG_LOGIN_LOCKOUT_SECONDS` (default 300), every login waits that long. `docker compose

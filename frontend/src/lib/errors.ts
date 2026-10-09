@@ -348,3 +348,67 @@ export function configRestoreErrorText(err: unknown): string {
   const blocked = restoreBlockedDetail(err);
   return blocked ? formatRestoreBlocked(blocked) : errorDetail(err, "Restore failed");
 }
+
+/**
+ * The config login's attempt limit (issue #1126, rule OPS-CONFIG-22): after
+ * repeated failures `POST /api/config/login` answers 429 `Too many failed
+ * login attempts; try again later` with `Retry-After` in whole seconds,
+ * before the password is checked. That refusal is not a wrong password, so
+ * the login form must not say it is one.
+ */
+export const LOGIN_LOCKED_FALLBACK = "Too many failed login attempts; try again later";
+
+function responseHeader(headers: unknown, name: string): unknown {
+  if (!headers || typeof headers !== "object") return undefined;
+  // axios hands back an AxiosHeaders instance whose get() ignores case; a
+  // plain object (a test double, an older adapter) is searched by hand.
+  const getter = (headers as { get?: unknown }).get;
+  if (typeof getter === "function") {
+    return (getter as (this: unknown, n: string) => unknown).call(headers, name);
+  }
+  const wanted = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+    if (key.toLowerCase() === wanted) return value;
+  }
+  return undefined;
+}
+
+function isLoginLocked(err: unknown): boolean {
+  return (err as { response?: { status?: number } })?.response?.status === 429;
+}
+
+/**
+ * The wait a config login 429 asks for, in seconds: the `Retry-After` header
+ * when it is a positive whole number, else null (no header, an HTTP date, a
+ * malformed value, zero). Null for any answer that is not a 429.
+ */
+export function loginRetryAfterSeconds(err: unknown): number | null {
+  if (!isLoginLocked(err)) return null;
+  const raw = responseHeader(
+    (err as { response?: { headers?: unknown } }).response?.headers,
+    "Retry-After",
+  );
+  const text = typeof raw === "number" ? String(raw) : raw;
+  if (typeof text !== "string" || !/^\s*\d+\s*$/.test(text)) return null;
+  const seconds = Number(text.trim());
+  return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : null;
+}
+
+/**
+ * The text for a config login 429 (issue #1126): "Too many failed login
+ * attempts; try again in N seconds" when the wait is known, else the server's
+ * own sentence, else the same sentence written here. Null for any answer that
+ * is not a 429, so the caller keeps its wrong-password wording for a 401.
+ */
+export function loginRetryAfterText(err: unknown): string | null {
+  if (!isLoginLocked(err)) return null;
+  const seconds = loginRetryAfterSeconds(err);
+  if (seconds !== null) {
+    return (
+      "Too many failed login attempts; try again in " +
+      seconds +
+      (seconds === 1 ? " second" : " seconds")
+    );
+  }
+  return errorDetail(err, LOGIN_LOCKED_FALLBACK);
+}
