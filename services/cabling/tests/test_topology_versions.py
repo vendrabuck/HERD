@@ -295,18 +295,45 @@ async def test_admin_can_restore(user_client):
     assert resp.status_code == 200
 
 
+async def _count_versions(topology_id: str) -> int:
+    from app.models.topology import TopologyVersion
+    from sqlalchemy import func, select
+
+    async with TestSessionLocal() as session:
+        return (
+            await session.execute(
+                select(func.count())
+                .select_from(TopologyVersion)
+                .where(TopologyVersion.topology_id == uuid.UUID(topology_id))
+            )
+        ).scalar_one()
+
+
 @pytest.mark.asyncio
 async def test_delete_topology_cascades_versions(user_client, _no_live_reservations_for_delete):
-    topology_id = await _make_topology(user_client)
-    await _save_canvas(user_client, topology_id, {"nodes": [{"id": "n1"}], "edges": []})
-    await _save_canvas(user_client, topology_id, {"nodes": [{"id": "n2"}], "edges": []})
+    """The cascade is the database's (ondelete="CASCADE" on topology_versions),
+    and SQLite enforces foreign keys only with PRAGMA foreign_keys=ON, so this
+    test turns it on for its own duration and counts the version rows; the
+    versions route's 404 alone comes from the parent lookup (issue #1139). The
+    in-memory engine keeps one connection for the whole module, so the pragma
+    is turned off again in the finally."""
+    async with test_engine.connect() as conn:
+        await conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+    try:
+        topology_id = await _make_topology(user_client)
+        await _save_canvas(user_client, topology_id, {"nodes": [{"id": "n1"}], "edges": []})
+        await _save_canvas(user_client, topology_id, {"nodes": [{"id": "n2"}], "edges": []})
+        assert await _count_versions(topology_id) == 2
 
-    resp = await user_client.delete(f"/topologies/{topology_id}")
-    assert resp.status_code == 204
+        resp = await user_client.delete(f"/topologies/{topology_id}")
+        assert resp.status_code == 204
 
-    # Versions endpoint 404s because topology is gone
-    resp = await user_client.get(f"/topologies/{topology_id}/versions")
-    assert resp.status_code == 404
+        assert await _count_versions(topology_id) == 0
+        resp = await user_client.get(f"/topologies/{topology_id}/versions")
+        assert resp.status_code == 404
+    finally:
+        async with test_engine.connect() as conn:
+            await conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
 
 
 @pytest.mark.asyncio
@@ -397,96 +424,134 @@ async def _insert_competing_version(topology_id: str, version_number: int) -> No
         await session.commit()
 
 
+def _lose_first_commit_to_a_racer(target: str, topology_id: str, state: dict):
+    """Patch the route's commit_with_new_version so its FIRST commit loses a race.
+
+    The real allocation reads max+1 first; only then, at the first commit, a
+    concurrent writer commits that very number through an independent session and
+    the database aborts our transaction with a unique-constraint IntegrityError
+    (the pattern the fork retry tests use). A competitor inserted BEFORE the max
+    read would never conflict at all (issue #1139). The rollback expires the
+    topology's pending field changes, so the retry only keeps them through
+    commit_with_new_version's reapply.
+    """
+    from app.services import version_service
+    from sqlalchemy.exc import IntegrityError
+
+    real_commit_with_new_version = version_service.commit_with_new_version
+
+    async def racing_commit_with_new_version(db, topology, snapshot):
+        real_commit = db.commit
+
+        async def commit():
+            state["commits"] += 1
+            if state["commits"] == 1:
+                state["first_number"] = snapshot.version_number
+                await db.rollback()
+                await _insert_competing_version(topology_id, snapshot.version_number)
+                raise IntegrityError(
+                    "INSERT", {}, Exception("uq_topology_versions_topology_version")
+                )
+            return await real_commit()
+
+        with patch.object(db, "commit", side_effect=commit):
+            return await real_commit_with_new_version(db, topology, snapshot)
+
+    return patch(target, side_effect=racing_commit_with_new_version)
+
+
+async def _stored_topology(topology_id: str):
+    from app.models.topology import Topology
+
+    async with TestSessionLocal() as session:
+        return await session.get(Topology, uuid.UUID(topology_id))
+
+
 @pytest.mark.asyncio
 async def test_update_topology_retries_on_version_number_conflict(user_client):
     """A concurrent writer claims version_number=2 between our max-read and commit.
 
-    The unique constraint makes our commit raise IntegrityError; the handler must
-    roll back, recompute max+1 (now 3), and retry rather than surfacing a 500. The
-    final state is a contiguous, duplicate-free version sequence.
+    The commit raises IntegrityError; the handler must roll back, re-apply the
+    pending name, canvas_data, and modified_by (the rollback expired them),
+    recompute max+1 (now 3), and retry rather than surfacing a 500.
     """
     topology_id = await _make_topology(user_client)
-    # First save makes version 1.
+    # First save (by the creator) makes version 1.
     await _save_canvas(user_client, topology_id, {"nodes": [{"id": "n1"}], "edges": []})
 
-    from app.services import version_service
-
-    real_commit_with_new_version = version_service.commit_with_new_version
-    state = {"raced": False}
-
-    async def racing_commit(db, topology, snapshot):
-        # On the first call, a concurrent writer grabs version 2 (the number this
-        # call is about to allocate) before our commit lands.
-        if not state["raced"]:
-            state["raced"] = True
-            await _insert_competing_version(topology_id, 2)
-        return await real_commit_with_new_version(db, topology, snapshot)
-
-    with patch(
-        "app.routes.topologies.commit_with_new_version",
-        side_effect=racing_commit,
+    # The racing PUT comes from an admin, so modified_by changes too.
+    app.dependency_overrides[get_current_user_payload] = _override_admin
+    new_canvas = {"nodes": [{"id": "n2"}], "edges": []}
+    state = {"commits": 0}
+    with _lose_first_commit_to_a_racer(
+        "app.routes.topologies.commit_with_new_version", topology_id, state
     ):
         resp = await user_client.put(
             f"/topologies/{topology_id}",
-            json={"canvas_data": {"nodes": [{"id": "n2"}], "edges": []}},
+            json={"name": "Renamed Lab", "canvas_data": new_canvas},
         )
 
     assert resp.status_code == 200, resp.text
+    # The first attempt read max=1 and lost number 2; the retry committed.
+    assert state == {"commits": 2, "first_number": 2}
 
     items = (await user_client.get(f"/topologies/{topology_id}/versions")).json()["items"]
     numbers = _version_numbers(items)
-    # 1 (first save), 2 (the racing writer), 3 (our retried insert): no duplicates,
-    # no gaps, and definitely no 500.
+    # 1 (first save), 2 (the racing writer), 3 (our retried insert).
     assert numbers == [1, 2, 3]
-    assert len(numbers) == len(set(numbers))
+    ours = next(v for v in items if v["version_number"] == 3)
+    assert ours["name"] == "Renamed Lab"
+
+    # The stored row carries every pending change across the rollback.
+    stored = await _stored_topology(topology_id)
+    assert stored.name == "Renamed Lab"
+    assert stored.canvas_data == new_canvas
+    assert stored.modified_by == uuid.UUID(ADMIN_ID)
 
 
 @pytest.mark.asyncio
 async def test_restore_retries_on_version_number_conflict(user_client):
     """Same race on the restore path: a concurrent writer takes the next number
-    first, and restore must retry to the following number instead of 500ing."""
+    after our max read, and restore must retry to the following number with the
+    restored canvas, name, and restored_from marker intact."""
     topology_id = await _make_topology(user_client)
     canvas_a = {"nodes": [{"id": "n1"}], "edges": []}
-    await _save_canvas(user_client, topology_id, canvas_a)  # version 1
+    canvas_b = {"nodes": [{"id": "n2"}], "edges": []}
+    await _save_canvas(user_client, topology_id, canvas_a)  # version 1, "My Lab"
+    await _save_canvas(user_client, topology_id, canvas_b, name="Renamed Lab")  # version 2
 
-    v_one_id = (await user_client.get(f"/topologies/{topology_id}/versions")).json()["items"][0][
-        "id"
-    ]
+    items = (await user_client.get(f"/topologies/{topology_id}/versions")).json()["items"]
+    v_one_id = next(v["id"] for v in items if v["version_number"] == 1)
 
-    from app.services import version_service
-
-    real_commit_with_new_version = version_service.commit_with_new_version
-    state = {"raced": False}
-
-    async def racing_commit(db, topology, snapshot):
-        if not state["raced"]:
-            state["raced"] = True
-            await _insert_competing_version(topology_id, 2)
-        return await real_commit_with_new_version(db, topology, snapshot)
-
-    with patch(
-        "app.routes.versions.commit_with_new_version",
-        side_effect=racing_commit,
+    app.dependency_overrides[get_current_user_payload] = _override_admin
+    state = {"commits": 0}
+    with _lose_first_commit_to_a_racer(
+        "app.routes.versions.commit_with_new_version", topology_id, state
     ):
         resp = await user_client.post(
-            f"/topologies/{topology_id}/versions/{v_one_id}/restore", json={}
+            f"/topologies/{topology_id}/versions/{v_one_id}/restore",
+            json={"restore_name": True},
         )
 
     assert resp.status_code == 200, resp.text
+    assert state == {"commits": 2, "first_number": 3}
 
     items = (await user_client.get(f"/topologies/{topology_id}/versions")).json()["items"]
-    numbers = _version_numbers(items)
-    assert numbers == [1, 2, 3]
-    assert len(numbers) == len(set(numbers))
-    # The restore snapshot (the one we retried) carries the restored_from marker and
-    # restored canvas, proving the retry preserved the snapshot's other fields.
+    assert _version_numbers(items) == [1, 2, 3, 4]
+    # The retried snapshot carries the restored_from marker and restored canvas.
     restored = [v for v in items if v["restored_from_id"] == v_one_id]
     assert len(restored) == 1
-    assert restored[0]["version_number"] == 3
+    assert restored[0]["version_number"] == 4
     detail = (
         await user_client.get(f"/topologies/{topology_id}/versions/{restored[0]['id']}")
     ).json()
     assert detail["canvas_data"] == canvas_a
+
+    # The live topology row took the restore despite the rollback in between.
+    stored = await _stored_topology(topology_id)
+    assert stored.canvas_data == canvas_a
+    assert stored.name == "My Lab"
+    assert stored.modified_by == uuid.UUID(ADMIN_ID)
 
 
 @pytest.mark.asyncio

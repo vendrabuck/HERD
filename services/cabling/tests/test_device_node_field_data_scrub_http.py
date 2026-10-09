@@ -8,6 +8,12 @@ is stored; this file drives each boundary with a canvas carrying field_data
 (with a password key) and asserts it is gone, and no "password" substring
 survives anywhere in the serialized response, on read-back through every
 relevant GET/export path.
+
+Every canvas READ route strips again, so a read-back through a GET cannot see
+whether the WRITE stripped. Each write-boundary test therefore also selects the
+stored row itself through TestSessionLocal (`_assert_stored_clean`), which is
+the only observation that fails when one write site stops stripping (issue
+#1139).
 """
 
 import io
@@ -79,6 +85,15 @@ def _assert_clean(body_text: str) -> None:
     assert "field_data" not in body_text
     assert _PASSWORD_MARKER not in body_text
     assert "password" not in body_text
+
+
+async def _assert_stored_clean(model, *where) -> None:
+    """Read the stored rows themselves, bypassing every read-side strip."""
+    async with TestSessionLocal() as db:
+        rows = (await db.execute(select(model).where(*where))).scalars().all()
+    assert rows, f"no stored {model.__name__} row matched"
+    for row in rows:
+        _assert_clean(json.dumps(row.canvas_data))
 
 
 @pytest.fixture(autouse=True)
@@ -158,22 +173,42 @@ async def test_topology_version_get_scrubs_field_data(client):
 
 @pytest.mark.asyncio
 async def test_topology_clone_scrubs_field_data(client):
+    """The source row is seeded dirty directly (a pre-migration row): a source
+    written through the PUT is already clean, so cloning it could never show
+    whether the clone itself strips."""
+    tid = uuid.uuid4()
     dev = str(uuid.uuid4())
-    create = await client.post("/topologies", json={"name": "Lab"})
-    tid = create.json()["id"]
-    await client.put(f"/topologies/{tid}", json={"canvas_data": _dirty_canvas(dev)})
+    async with TestSessionLocal() as db:
+        db.add(
+            Topology(id=tid, name="Lab", created_by=uuid.uuid4(), canvas_data=_dirty_canvas(dev))
+        )
+        await db.commit()
 
     clone_resp = await client.post(f"/topologies/{tid}/clone", json={"name": "Lab Clone"})
     assert clone_resp.status_code == 201, clone_resp.text
     _assert_clean(clone_resp.text)
 
+    clone_id = uuid.UUID(clone_resp.json()["id"])
+    await _assert_stored_clean(Topology, Topology.id == clone_id)
+    await _assert_stored_clean(TopologyVersion, TopologyVersion.topology_id == clone_id)
+
 
 @pytest.mark.asyncio
 async def test_topology_export_json_and_csv_scrub_field_data(client):
+    """The row is seeded dirty directly (a pre-migration row): one written
+    through the PUT is already clean, so its export could never show whether
+    the export strips on its own."""
     dev_a, dev_b = str(uuid.uuid4()), str(uuid.uuid4())
-    create = await client.post("/topologies", json={"name": "Lab"})
-    tid = create.json()["id"]
-    await client.put(f"/topologies/{tid}", json={"canvas_data": _dirty_canvas(dev_a, dev_b)})
+    async with TestSessionLocal() as db:
+        db.add(
+            Topology(
+                id=uuid.uuid4(),
+                name="Lab",
+                created_by=uuid.uuid4(),
+                canvas_data=_dirty_canvas(dev_a, dev_b),
+            )
+        )
+        await db.commit()
 
     json_resp = await client.get("/topologies/export", params={"format": "json"})
     assert json_resp.status_code == 200
@@ -219,6 +254,10 @@ async def test_topology_import_json_scrubs_field_data(client):
     tid = next(t["id"] for t in listing if t["name"] == "Imported Dirty Lab")
     detail = await client.get(f"/topologies/{tid}")
     _assert_clean(detail.text)
+
+    # The GET above strips on read; the import stores into both rows directly.
+    await _assert_stored_clean(Topology, Topology.name == "Imported Dirty Lab")
+    await _assert_stored_clean(TopologyVersion, TopologyVersion.topology_id == uuid.UUID(tid))
 
 
 @pytest.mark.asyncio
@@ -278,6 +317,10 @@ async def test_fork_canvas_put_scrubs_field_data(client):
     get_resp = await client.get(f"/internal/forks/{rid}", headers=_hdr())
     assert get_resp.status_code == 200
     _assert_clean(get_resp.text)
+
+    # The PUT response never carries a canvas and the GET strips on read, so
+    # only the stored fork row shows whether the PUT stripped.
+    await _assert_stored_clean(ReservationFork, ReservationFork.reservation_id == rid)
 
 
 @pytest.mark.asyncio
@@ -347,6 +390,8 @@ async def test_fork_create_scrubs_a_dirty_parent_topology_canvas(client):
     assert get_resp.status_code == 200
     _assert_clean(get_resp.text)
 
+    await _assert_stored_clean(ReservationFork, ReservationFork.reservation_id == rid)
+
 
 # --- Templates ----------------------------------------------------------------
 
@@ -366,6 +411,45 @@ async def test_template_create_and_instantiate_scrub_field_data(client):
 
     get_resp = await client.get(f"/templates/{create_resp.json()['id']}")
     _assert_clean(get_resp.text)
+    await _assert_stored_clean(
+        TopologyTemplate, TopologyTemplate.id == uuid.UUID(create_resp.json()["id"])
+    )
+
+    # Instantiate is its own write boundary. A template written through the
+    # create route is already clean, so seed a dirty one directly (the shape a
+    # pre-migration row would have) and instantiate that.
+    legacy_id = uuid.uuid4()
+    async with TestSessionLocal() as db:
+        db.add(
+            TopologyTemplate(
+                id=legacy_id,
+                name="Legacy Dirty Template",
+                created_by=uuid.uuid4(),
+                canvas_data={
+                    "nodes": [
+                        {
+                            "id": "n1",
+                            "type": "deviceNode",
+                            "data": {"device": {**_dirty_device(dev), "role": "r1"}},
+                        }
+                    ],
+                    "edges": [],
+                },
+            )
+        )
+        await db.commit()
+
+    assigned = str(uuid.uuid4())
+    inst_resp = await client.post(
+        f"/templates/{legacy_id}/instantiate",
+        json={"name": "From Legacy Template", "role_assignments": {"r1": assigned}},
+    )
+    assert inst_resp.status_code == 201, inst_resp.text
+    _assert_clean(inst_resp.text)
+    new_tid = uuid.UUID(inst_resp.json()["id"])
+    assert inst_resp.json()["canvas_data"]["nodes"][0]["data"]["device"]["id"] == assigned
+    await _assert_stored_clean(Topology, Topology.id == new_tid)
+    await _assert_stored_clean(TopologyVersion, TopologyVersion.topology_id == new_tid)
 
 
 # --- Read-side strip: a dirty row seeded directly, bypassing every write ----

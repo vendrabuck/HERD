@@ -2,6 +2,7 @@ import uuid
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from app.config import settings
 from app.database import Base, get_db
 from app.dependencies import get_current_user_payload, require_admin
 from app.main import app
@@ -38,6 +39,20 @@ async def setup_db():
 async def _override_get_db() -> AsyncSession:
     async with TestSessionLocal() as session:
         yield session
+
+
+@pytest.fixture(autouse=True)
+def _no_device_group_guard(monkeypatch):
+    """The creates in this file test connection rules, not the device-group guard.
+
+    With the guard at its default (enabled), every create asked inventory at
+    http://inventory:8000, the name failed to resolve on the host, and the
+    guard FAILED OPEN, so each 201 came from the outage branch; on a host where
+    inventory resolves, the random device ids would 404 and every create would
+    answer 422 (issue #1139). The guard is disabled explicitly here and pinned
+    on its own in test_service_unit.py and test_connections_bulk.py.
+    """
+    monkeypatch.setattr(settings, "enforce_device_group_boundaries", False)
 
 
 @pytest.fixture
@@ -79,6 +94,17 @@ def _connection_body():
         "connection_type": "ethernet",
         "notes": "test link",
     }
+
+
+@pytest.mark.asyncio
+async def test_create_in_this_file_makes_no_inventory_call(admin_client):
+    """Pins the fixture above: a create here never consults the device-group
+    guard, so no seed depends on inventory being unreachable."""
+    fetch = AsyncMock(return_value=set())
+    with patch("app.services.connection_service.fetch_device_group_ids", fetch):
+        resp = await admin_client.post("/connections", json=_connection_body())
+    assert resp.status_code == 201, resp.text
+    assert fetch.await_count == 0
 
 
 @pytest.mark.asyncio
