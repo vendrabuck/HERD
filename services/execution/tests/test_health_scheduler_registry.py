@@ -355,25 +355,44 @@ async def test_loop_pushes_forward_device_dropped_from_registry(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_loop_swallows_fire_poll_crash(monkeypatch):
-    """A fire_poll that raises is logged and does not break the tick."""
-    device_id = uuid.uuid4()
-    await _seed_due_row(device_id, datetime.now(timezone.utc))
-    health_scheduler._registry[device_id] = 60
+    """A fire_poll that raises is logged and does not break the tick: the other
+    due device still fires, and the loop sleeps the BASE tick, not the backoff a
+    failed tick earns (the tick-level catch would also swallow the error, so only
+    the sleep length tells the per-poll catch from the tick-level one)."""
+    now = datetime.now(timezone.utc)
+    crashing = uuid.uuid4()
+    healthy = uuid.uuid4()
+    await _seed_due_row(crashing, now)
+    await _seed_due_row(healthy, now)
+    health_scheduler._registry[crashing] = 60
+    health_scheduler._registry[healthy] = 60
     monkeypatch.setattr(health_scheduler, "_refresh_registry_if_due", AsyncMock())
 
-    async def _boom(*a, **kw):
-        raise RuntimeError("driver exploded")
+    fired = []
 
-    monkeypatch.setattr(health_scheduler, "fire_poll", _boom)
+    async def _fire(session_factory, dev_id, interval, nc=None):
+        fired.append(dev_id)
+        if dev_id == crashing:
+            raise RuntimeError("driver exploded")
 
-    async def _sleep_then_cancel(_seconds):
+    monkeypatch.setattr(health_scheduler, "fire_poll", _fire)
+
+    sleeps = []
+
+    async def _record_then_cancel(seconds):
+        sleeps.append(seconds)
         raise asyncio.CancelledError()
 
-    monkeypatch.setattr(health_scheduler.asyncio, "sleep", _sleep_then_cancel)
+    monkeypatch.setattr(health_scheduler.asyncio, "sleep", _record_then_cancel)
 
     # Must not raise RuntimeError; the CancelledError from sleep ends the loop.
     with pytest.raises(asyncio.CancelledError):
         await run_health_scheduler_loop(TestSessionLocal)
+
+    assert sorted(fired) == sorted([crashing, healthy]), "each due device fired once"
+    assert sleeps == [health_scheduler.settings.health_poll_scheduler_tick_seconds], (
+        "a crashing poll is not a failed tick: no backoff"
+    )
 
 
 @pytest.mark.asyncio
@@ -440,8 +459,9 @@ async def test_loop_tick_failure_backs_off(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await run_health_scheduler_loop(TestSessionLocal)
 
-    # On a failed tick the backoff is base*2 (base tick = 30 by default).
-    assert sleeps and sleeps[0] >= health_scheduler.settings.health_poll_scheduler_tick_seconds
+    # On a failed tick the backoff is base*2 (base tick = 30 by default, so well
+    # under the max(10 * base, 300) cap); a healthy tick would sleep exactly base.
+    assert sleeps == [2 * health_scheduler.settings.health_poll_scheduler_tick_seconds]
 
 
 # --- start_health_scheduler / stop_health_scheduler ---

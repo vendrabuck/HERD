@@ -540,3 +540,100 @@ async def test_l2_success_flip_returns_the_winner_when_its_cas_loses(db):
     async with TestSessionLocal() as s:
         fresh = await s.get(L2PortAssignment, row_id)
         assert fresh.status == "RELEASED"
+
+
+async def _race_held_loser(winner_call, loser_call):
+    """Run two real ledger writes against one FAILED row, the loser held at its CAS.
+
+    The loser runs on its own session and is held at its first UPDATE (the CAS),
+    after its own FAILED-row SELECT, so the row it flips is attached to that
+    session (as in production, unlike the patched siblings above, whose stale row
+    comes from a closed session the loser's rollback cannot expire). The winner
+    runs to completion on another session, then the loser is released. Returns
+    (winner's row, loser's row).
+    """
+    import asyncio
+
+    from sqlalchemy.sql.dml import Update
+
+    async with TestSessionLocal() as db_win, TestSessionLocal() as db_lose:
+        at_update = asyncio.Event()
+        release = asyncio.Event()
+        real_execute = db_lose.execute
+
+        async def _held_execute(statement, *args, **kwargs):
+            if isinstance(statement, Update) and not at_update.is_set():
+                at_update.set()
+                await release.wait()
+            return await real_execute(statement, *args, **kwargs)
+
+        db_lose.execute = _held_execute
+        loser = asyncio.create_task(loser_call(db_lose))
+        await asyncio.wait_for(at_update.wait(), timeout=5)
+        won = await winner_call(db_win)
+        release.set()
+        lost = await asyncio.wait_for(loser, timeout=5)
+    return won, lost
+
+
+def _stale_writer_skips(caplog) -> int:
+    return sum(r.getMessage().startswith("stale reattempt writer skipped") for r in caplog.records)
+
+
+async def test_l1_success_flip_cas_loser_with_attached_row_returns_the_winner(caplog):
+    """Issue #1152: two real record_l1_connect calls race on one FAILED pair. The
+    loser's CAS matches zero rows; it returns the winner's row (carrying the
+    physical connection id only the winner set) and logs the stale-writer skip,
+    instead of raising MissingGreenlet on the expired row after its rollback."""
+    import logging
+
+    row_id = await _seed_l1_failed()
+    phys = uuid.uuid4()
+    caplog.set_level(logging.INFO, logger="app.services.l1_assignment_service")
+
+    won, lost = await _race_held_loser(
+        lambda s: record_l1_connect(
+            s, RES_ID, SWITCH_ID, "0/0/1", "0/0/2", physical_connection_id=str(phys)
+        ),
+        lambda s: record_l1_connect(s, RES_ID, SWITCH_ID, "0/0/1", "0/0/2"),
+    )
+
+    assert won.id == row_id
+    assert won.status == "ACTIVE"
+    assert lost is not None
+    assert lost.id == row_id
+    assert lost.status == "ACTIVE"
+    assert lost.physical_connection_id == phys, "the loser returns the winner's row"
+    assert _stale_writer_skips(caplog) == 1
+    async with TestSessionLocal() as s:
+        fresh = await s.get(L1ConnectionAssignment, row_id)
+        assert (fresh.status, fresh.physical_connection_id) == ("ACTIVE", phys)
+
+
+async def test_l2_success_flip_cas_loser_with_attached_row_returns_the_winner(caplog):
+    """Issue #1152, the record_l2_membership_active mirror: the loser returns the
+    winner's row (pointing at the winner's VLAN allocation) and logs the
+    stale-writer skip; the loser's allocation is never written."""
+    import logging
+
+    seeded_va = await _seed_alloc()
+    winner_va = await _seed_alloc()
+    loser_va = await _seed_alloc()
+    row_id = await _seed_l2_failed(seeded_va)
+    caplog.set_level(logging.INFO, logger="app.services.l2_membership_service")
+
+    won, lost = await _race_held_loser(
+        lambda s: record_l2_membership_active(s, RES_ID, winner_va, SWITCH_ID, "0/0/1"),
+        lambda s: record_l2_membership_active(s, RES_ID, loser_va, SWITCH_ID, "0/0/1"),
+    )
+
+    assert won.id == row_id
+    assert won.status == "ACTIVE"
+    assert lost is not None
+    assert lost.id == row_id
+    assert lost.status == "ACTIVE"
+    assert lost.vlan_assignment_id == winner_va, "the loser returns the winner's row"
+    assert _stale_writer_skips(caplog) == 1
+    async with TestSessionLocal() as s:
+        fresh = await s.get(L2PortAssignment, row_id)
+        assert (fresh.status, fresh.vlan_assignment_id) == ("ACTIVE", winner_va)

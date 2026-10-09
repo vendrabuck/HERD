@@ -307,10 +307,15 @@ async def test_contiguous_delta_apply_builds_pair():
 
 @pytest.mark.asyncio
 async def test_stale_version_is_noop():
-    """version <= last_applied is a stale/duplicate delivery: no driver call, no change."""
+    """version <= last_applied is a stale/duplicate delivery: no driver call, no change.
+
+    Cabling's intended set holds PAIR_12, so the full reconcile a non-contiguous
+    version would otherwise take (3 != 5 + 1) would connect it; only the stale
+    guard keeps the driver silent. The last_applied check alone proves nothing
+    (stamp_last_applied never lowers the marker)."""
     await _seed_state(last_applied=5)
     execute_fn, calls = _sandbox_recorder()
-    await _run(_event(3, released=[], built=PAIR_12), execute_fn)
+    await _run(_event(3, released=[], built=PAIR_12), execute_fn, fork_wires=PAIR_12)
 
     assert calls == []
     assert await _assignments() == []

@@ -256,7 +256,11 @@ async def test_concurrent_ticks_claim_each_row_exactly_once(monkeypatch):
 
     Scope note: SQLite ignores FOR UPDATE SKIP LOCKED, so this pins the
     conditional-UPDATE guard (the correctness guarantee) only; the SKIP
-    LOCKED fast path is exercised on the live Postgres stack."""
+    LOCKED fast path is exercised on the live Postgres stack.
+
+    A two-party barrier on _due_rows holds each tick until BOTH have read the
+    full due list, so both ticks try to claim all three rows and only the
+    claim's `next_poll_at <= now` guard can keep a row from firing twice."""
     now = datetime.now(timezone.utc)
     ids = {await _seed_row(next_poll_at=now - timedelta(seconds=10)) for _ in range(3)}
 
@@ -267,13 +271,25 @@ async def test_concurrent_ticks_claim_each_row_exactly_once(monkeypatch):
         await asyncio.sleep(0)
 
     monkeypatch.setattr(health_scheduler, "fire_poll", stub)
+
+    both_read = asyncio.Barrier(2)
+    real_due_rows = health_scheduler._due_rows
+
+    async def _due_rows_then_wait(db, now, limit=None):
+        rows = await real_due_rows(db, now, limit)
+        await asyncio.wait_for(both_read.wait(), timeout=5)
+        return rows
+
+    monkeypatch.setattr(health_scheduler, "_due_rows", _due_rows_then_wait)
     stats_a, stats_b = await asyncio.gather(
         run_tick(TestSessionLocal, client=None),
         run_tick(TestSessionLocal, client=None),
     )
 
+    assert stats_a["rows_due"] == 3 and stats_b["rows_due"] == 3, "both ticks saw every row"
     assert sorted(str(d) for d in fired) == sorted(str(d) for d in ids)
     assert stats_a["polls_fired"] + stats_b["polls_fired"] == 3
+    assert stats_a["rows_claimed"] + stats_b["rows_claimed"] == 3
 
 
 @pytest.mark.asyncio

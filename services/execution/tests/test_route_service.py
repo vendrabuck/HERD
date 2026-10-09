@@ -400,7 +400,7 @@ async def test_record_route_active_reusable_flip_succeeds_when_cas_matches(db):
     assert row.routes == EDITED_ROUTES
 
 
-async def test_record_route_active_reusable_cas_loser_never_overwrites(db):
+async def test_record_route_active_reusable_cas_loser_never_overwrites(db, caplog):
     """P3 review fix: the FAILED-to-ACTIVE flip's CAS
     (`UPDATE ... WHERE status = 'FAILED'`) must reject a writer whose UPDATE
     runs after another writer's commit already flipped the row, even though
@@ -408,58 +408,66 @@ async def test_record_route_active_reusable_cas_loser_never_overwrites(db):
     fix closes: the ordinary consumer path and the wiring-retry sweep can both
     reach record_route_active for the same row as independent asyncio tasks).
 
-    A live two-session interleaving that forces both writers past their SELECT
-    before either commits cannot be driven by two SEQUENTIAL calls to
-    record_route_active itself: the second caller's own `existing == ACTIVE`
-    check would already short-circuit once the first has committed (a
-    different, pre-existing safety net that predates phase 3). So this test
-    drives the exact CAS UPDATE statement record_route_active issues directly,
-    with the interleaving forced explicitly, to prove the CAS clause itself
-    (not the unrelated `existing` short-circuit) is what rejects the loser.
+    Both writers are real record_route_active calls. Writer B is held at its
+    CAS UPDATE (after its own FAILED-row SELECT, so the row is attached to B's
+    session) while writer A runs to completion; then B is released. B's UPDATE
+    matches zero rows, and B rolls back, logs "stale reattempt writer
+    skipped", and returns the winner's row as-is (issue #1152: the re-read
+    used to read the expired row's id after the rollback and raised
+    MissingGreenlet).
     """
-    from app.services.route_service import record_route_failed
-    from sqlalchemy import update
+    import asyncio
+    import logging
 
+    from app.services.route_service import record_route_failed
+    from sqlalchemy.sql.dml import Update
+
+    winner_routes = [{"destination": "10.9.0.0/24", "next_hop": None, "interface": "eth9"}]
     rid = uuid.uuid4()
     sid = uuid.uuid4()
     failed = await record_route_failed(db, rid, sid, ROUTES, 2, "boom", intended="ACTIVE")
 
+    caplog.set_level(logging.INFO, logger="app.services.route_service")
     async with TestSessionLocal() as db_a, TestSessionLocal() as db_b:
-        # Both writers' SELECTs land before either writer's UPDATE (the race).
-        row_a = (
-            await db_a.execute(select(RouteAssignment).where(RouteAssignment.id == failed.id))
-        ).scalar_one()
-        row_b = (
-            await db_b.execute(select(RouteAssignment).where(RouteAssignment.id == failed.id))
-        ).scalar_one()
-        assert row_a.status == "FAILED"
-        assert row_b.status == "FAILED"
+        b_at_update = asyncio.Event()
+        release_b = asyncio.Event()
+        real_execute = db_b.execute
 
-        # Writer A wins: its CAS UPDATE matches (status is still FAILED) and commits.
-        result_a = await db_a.execute(
-            update(RouteAssignment)
-            .where(RouteAssignment.id == failed.id, RouteAssignment.status == "FAILED")
-            .values(status="ACTIVE", intended="ACTIVE", routes=ROUTES, last_error=None)
-        )
-        assert result_a.rowcount == 1
-        await db_a.commit()
+        async def _held_execute(statement, *args, **kwargs):
+            if isinstance(statement, Update) and not b_at_update.is_set():
+                b_at_update.set()
+                await release_b.wait()
+            return await real_execute(statement, *args, **kwargs)
 
-        # Writer B (the loser) issues the SAME CAS UPDATE against the row it read
-        # BEFORE A's commit; its WHERE clause no longer matches (status is now
-        # ACTIVE), so it must affect zero rows and must NEVER overwrite A's
-        # content.
-        result_b = await db_b.execute(
-            update(RouteAssignment)
-            .where(RouteAssignment.id == failed.id, RouteAssignment.status == "FAILED")
-            .values(status="ACTIVE", intended="ACTIVE", routes=EDITED_ROUTES, last_error=None)
-        )
-        assert result_b.rowcount == 0, "the loser's CAS must match zero rows"
-        await db_b.rollback()
+        db_b.execute = _held_execute
+        writer_b = asyncio.create_task(record_route_active(db_b, rid, sid, EDITED_ROUTES))
+        await asyncio.wait_for(b_at_update.wait(), timeout=5)
+
+        # Writer A wins: its SELECT still sees FAILED and its CAS matches.
+        row_a = await record_route_active(db_a, rid, sid, winner_routes)
+        assert row_a.id == failed.id
+        assert row_a.status == "ACTIVE"
+        assert row_a.routes == winner_routes
+
+        release_b.set()
+        row_b = await asyncio.wait_for(writer_b, timeout=5)
+
+    assert row_b is not None
+    assert row_b.id == failed.id
+    assert row_b.status == "ACTIVE"
+    assert row_b.routes == winner_routes, "the loser returns the winner's row as-is"
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum(m.startswith("stale reattempt writer skipped") for m in messages) == 1
+    assert sum(m.startswith("Reattempt pinned L3 switch") for m in messages) == 1, (
+        "only the winner reports a flip"
+    )
 
     final = (
         await db.execute(select(RouteAssignment).where(RouteAssignment.id == failed.id))
     ).scalar_one()
-    assert final.routes == ROUTES, "the winner's content survives; the loser never overwrote it"
+    await db.refresh(final)
+    assert final.routes == winner_routes, "the loser never overwrote the winner's content"
+    assert final.status == "ACTIVE"
 
 
 # --- Issue #1001: a FAILED pin records what may still be installed -------------

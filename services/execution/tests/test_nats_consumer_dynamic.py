@@ -797,13 +797,30 @@ async def test_recipe_download_failure_still_naks():
 
 
 async def test_create_instance_driver_failure_naks_row_stays_creating():
+    """A create_instance the driver reports failed is a transient failure: driven
+    through process_reservation_message on its FIRST delivery it NAKs (a
+    PermanentEventError would dead-letter instead), and the row stays CREATING."""
     calls, execute = _recipe_execute({"create_instance": CREATE_DRIVER_FAIL})
+    js = MagicMock()
+    js.publish = AsyncMock()
+    msg = MagicMock()
+    msg.data = json.dumps(_event()).encode()
+    msg.metadata = SimpleNamespace(num_delivered=1)
+    msg.ack = AsyncMock()
+    msg.nak = AsyncMock()
     patches = _create_patches(execute)
     with ExitStack() as stack:
         for p in patches:
             stack.enter_context(p)
-        with pytest.raises(RuntimeError):
-            await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
+        result = await process_reservation_message(
+            msg, js, handle_reservation_event, _db_session_factory()
+        )
+
+    assert result == "nak"
+    msg.nak.assert_awaited_once()
+    msg.ack.assert_not_awaited()
+    js.publish.assert_not_awaited()
+    assert [c[0] for c in calls] == ["login", "create_instance", "logout"]
 
     rows = await _rows()
     assert len(rows) == 1
@@ -2685,6 +2702,9 @@ async def test_create_login_payload_failure_is_a_failed_create():
             await _handle_provision_requested(_event(), _db_session_factory(), dedupe_key="s:1")
 
     assert str(excinfo.value) == f"recipe login failed for request {REQUEST_ID}"
+    # A RuntimeError that is not a PermanentEventError NAKs; a PermanentEventError
+    # (also a RuntimeError) would dead-letter on the first delivery.
+    assert not isinstance(excinfo.value, PermanentEventError)
     assert [c[0] for c in calls] == ["login"]
     rows = await _rows()
     assert [(r.status, r.instance_ref) for r in rows] == [("CREATING", None)]
