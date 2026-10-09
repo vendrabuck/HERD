@@ -40,3 +40,45 @@ class TestWithDefaults:
 
     def test_malformed_events_falls_back(self):
         _assert_safe_defaults(NotificationPreferences.with_defaults({"events": "not-a-dict"}))
+
+
+# Every event key that existed before issue #1077 added reservation.failed. A
+# user who saved preferences then has exactly these keys stored, because the
+# PUT proxy writes the merged defaults back (INTEG-PREFS-4).
+_PRE_1077_STORED = {
+    "channels": {"in_app": True, "email": False, "chat": False, "webhook": False},
+    "events": {
+        "reservation.created": True,
+        "reservation.updated": False,
+        "reservation.cancelled": True,
+        "reservation.completed": False,
+        "device.health_transition": False,
+        "reservation.expiring_soon": True,
+    },
+}
+
+
+class TestReservationFailedDefault:
+    """Issue #1077: reservation.failed is a default-on event key."""
+
+    def test_failed_is_a_default_event_type(self):
+        assert "reservation.failed" in DEFAULT_EVENT_TYPES
+
+    def test_stored_preferences_predating_the_key_receive_it_on(self):
+        prefs = NotificationPreferences.with_defaults(_PRE_1077_STORED)
+        assert prefs.events["reservation.failed"] is True
+        assert prefs.event_enabled("reservation.failed") is True
+        # Every stored choice is kept exactly as it was.
+        for key, value in _PRE_1077_STORED["events"].items():
+            assert prefs.events[key] is value
+
+    def test_explicit_opt_out_of_failed_is_kept(self):
+        stored = {"events": {**_PRE_1077_STORED["events"], "reservation.failed": False}}
+        prefs = NotificationPreferences.with_defaults(stored)
+        assert prefs.events["reservation.failed"] is False
+        assert prefs.event_enabled("reservation.failed") is False
+
+    def test_with_defaults_does_not_mutate_the_stored_dict(self):
+        stored = {"events": dict(_PRE_1077_STORED["events"])}
+        NotificationPreferences.with_defaults(stored)
+        assert "reservation.failed" not in stored["events"]

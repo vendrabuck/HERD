@@ -147,8 +147,8 @@ event (section 8.3). Dead-letter copies go to the four subjects below, retained 
 |---|---|---|---|---|
 | `herd.reservations.*` (every reservation event) | reservations | integration (`integration-webhooks-consumer`) | POSTs the message to every active subscription listing its `event` name | INTEG-CONSUME-1, INTEG-HOOK-11 to INTEG-HOOK-22 |
 | `herd.health.status_changed` (`device.health_transition`) | execution | integration (`integration-webhooks-health-consumer`) | the same | INTEG-CONSUME-1, INTEG-HOOK-11 |
-| `herd.reservations.created`, `updated`, `cancelled`, `completed`, `expiring_soon` | reservations | notifications (`notifications-consumer`) | one notification to the reservation's owner, on each channel they enabled | INTEG-ROUTE-1, INTEG-ROUTE-3 to INTEG-ROUTE-5, INTEG-PREFS-9 |
-| `herd.reservations.failed`, `provision_requested`, `wiring_changed` | reservations | notifications | nothing; acked | INTEG-ROUTE-2 |
+| `herd.reservations.created`, `updated`, `cancelled`, `completed`, `failed`, `expiring_soon` | reservations | notifications (`notifications-consumer`) | one notification to the reservation's owner, on each channel they enabled | INTEG-ROUTE-1, INTEG-ROUTE-3 to INTEG-ROUTE-6, INTEG-PREFS-9 |
+| `herd.reservations.provision_requested`, `wiring_changed` | reservations | notifications | nothing; acked | INTEG-ROUTE-2 |
 | `herd.health.status_changed` (`device.health_transition`) | execution | notifications (`notifications-health-consumer`) | one notification to every admin and every active holder of the device | INTEG-HEALTH-1 to INTEG-HEALTH-7 |
 
 Only the seven event names in `KNOWN_EVENT_TYPES` can be subscribed (INTEG-HOOK-3), so a
@@ -628,7 +628,7 @@ event is delivered twice.
 ### 8.8 Event routing
 
 **What it does.** A reservation's owner is told when it goes live, changes in a way that
-matters, is cancelled, completes, or is about to end.
+matters, is cancelled, completes, fails, or is about to end.
 
 **Surfaces.** `build_messages` in `services/notifications/app/services/event_router.py`.
 
@@ -642,10 +642,9 @@ matters, is cancelled, completes, or is about to end.
   Enforced in: `services/notifications/app/services/event_router.py` (`build_messages`, `_RENDERERS`, `_device_summary`) \
   Pinned by: `services/notifications/tests/test_event_router.py` (`test_created_event_produces_single_message`, `test_expiring_soon_event_produces_single_message`, `test_cancelled_and_completed_events_emit`, `test_created_event_zero_devices`); `tests/integration/test_notifications_flow.py` (`test_reservation_created_produces_in_app_notification`); `tests/integration/test_notification_channels_flow.py` (`test_expiring_soon_reminder_produces_single_notification`)
 - **INTEG-ROUTE-2.** Every other event name produces nothing and the message is acked:
-  `reservation.failed`, `provision_requested`, and `wiring_changed` included, so the
-  owner of a failed reservation is not notified. Known gap, see #1077. \
+  `reservation.provision_requested` and `reservation.wiring_changed` included. \
   Enforced in: `services/notifications/app/services/event_router.py` (`build_messages`, `_RENDERERS`) \
-  Pinned by: `services/notifications/tests/test_event_router.py` (`test_unknown_event_is_skipped`)
+  Pinned by: `services/notifications/tests/test_event_router.py` (`test_unknown_event_is_skipped`, `test_other_unrendered_reservation_events_are_still_skipped`)
 - **INTEG-ROUTE-3.** `reservation.updated` produces a message only when devices were
   added or removed or the end time changed (the `end_time_changed` flag, or for an older
   payload without it, a non-empty `end_time`). \
@@ -659,6 +658,16 @@ matters, is cancelled, completes, or is about to end.
   stored with the notification and returned by the list. \
   Enforced in: `services/notifications/app/services/event_router.py` (`build_messages`) \
   Pinned by: `services/notifications/tests/test_event_router.py` (`test_created_event_produces_single_message`)
+
+- **INTEG-ROUTE-6.** `reservation.failed` produces one message for the payload's
+  `user_id`, titled `Reservation failed`, with the body `Reservation <first eight
+  characters of the id> for <device count> failed.` (`Reservation for <device count>
+  failed.` when the payload has no `reservation_id`). The text is built from the id and
+  the device count only, so no upstream error text reaches any channel (#1077). The event
+  key is in `DEFAULT_EVENT_TYPES`, so it is on unless the user stored it off, including
+  for a user whose stored preferences predate the key (INTEG-PREFS-1). \
+  Enforced in: `services/notifications/app/services/event_router.py` (`_render_failed`, `_reservation_label`, `_RENDERERS`); `services/notifications/app/schemas/preferences.py` (`DEFAULT_EVENT_TYPES`, `with_defaults`) \
+  Pinned by: `services/notifications/tests/test_event_router.py` (`test_failed_event_notifies_the_owner`, `test_failed_event_text_carries_no_upstream_error_text`, `test_failed_event_without_reservation_id_still_notifies`, `test_failed_event_without_user_id_is_skipped`); `services/notifications/tests/test_preferences.py` (`test_stored_preferences_predating_the_key_receive_it_on`, `test_explicit_opt_out_of_failed_is_kept`); `services/notifications/tests/test_preferences_client.py` (`test_preferences_predating_reservation_failed_read_it_as_on`); `services/notifications/tests/test_nats_consumer.py` (`test_handle_event_delivers_failed_under_preferences_predating_the_key`, `test_handle_event_failed_respects_opt_out`); `services/notifications/tests/test_router.py` (`test_put_preferences_predating_failed_writes_it_on`, `test_get_preferences_predating_failed_reads_it_on`); `tests/integration/test_reservation_failed_notification.py` (`test_failed_reservation_notifies_owner_in_app`)
 
 **Out of scope.** When reservations stages each event (`reservations.md`, section 6).
 
@@ -932,11 +941,11 @@ kinds on the Settings page.
   Enforced in: `frontend/src/components/NotificationBell.tsx` (`handleItemClick`) \
   Pinned by: `frontend/src/test/components/NotificationBell.test.tsx` (`clicking an unread notification marks it read through the API`, `clicking a read notification sends nothing`, `Mark all read is disabled while nothing is unread`, `Mark all read is enabled while something is unread`); `tests/e2e/test_flows_effects_playwright.py` (`test_notification_round_trip`)
 - **INTEG-UI-5.** The Settings page shows the in-app toggle, the three outbound toggles
-  (off unless stored on), and one toggle per event kind for the six kinds notifications
-  renders; Save sends all channels and events and toasts `Preferences saved` or
+  (off unless stored on), and one toggle per event kind for the seven kinds notifications
+  renders (`Reservation failed` since #1077), each on unless stored off; Save sends all channels and events and toasts `Preferences saved` or
   `Failed to save preferences`. \
   Enforced in: `frontend/src/pages/SettingsPage.tsx` (`SettingsPage`, `EVENT_LABELS`, `OUTBOUND_CHANNELS`, `handleSave`) \
-  Pinned by: `frontend/src/test/pages/SettingsPage.test.tsx` (`shows a loading state then renders all event toggles`, `renders outbound channel toggles defaulting off`, `toggling and saving sends the new payload to the API`, `toasts an error when the save call fails`); `tests/e2e/test_settings_page.py` (`test_settings_event_toggle_round_trip`, `test_settings_email_channel_round_trip`)
+  Pinned by: `frontend/src/test/pages/SettingsPage.test.tsx` (`shows a loading state then renders all event toggles`, `shows the failed event on by default and sends an opt-out explicitly`, `renders outbound channel toggles defaulting off`, `toggling and saving sends the new payload to the API`, `toasts an error when the save call fails`); `tests/e2e/test_settings_page.py` (`test_settings_event_toggle_round_trip`, `test_settings_email_channel_round_trip`, `test_settings_shows_failed_event_toggle_checked_by_default`)
 
 **Out of scope.** The header layout around the bell (`frontend/src/components/layout/AppLayout.tsx`).
 
@@ -1016,7 +1025,7 @@ calls in notifications; the 20-item bell list and its 30 second unread poll.
 |---|---|---|
 | Unit | `services/integration/tests/` (`test_facade.py`, `test_webhooks.py`, `test_webhook_destinations.py`, `test_webhooks_router_direct.py`, `test_nats_consumer.py`, `test_nats_consumer_lifecycle.py`, `test_nats_consumer_heartbeat.py`, `test_version.py`, `test_config_ack_wait.py`); `services/notifications/tests/` (every file); `tests/unit/test_consumer_heartbeat_wiring.py`; the frontend tests named in section 8.13 | In-memory SQLite, upstreams and NATS stubbed; SQLite does not enforce the cascade of INTEG-HOOK-8 |
 | Functional (through the service API) | the httpx-against-the-app tests in `test_facade.py`, `test_webhooks.py`, and `services/notifications/tests/test_router.py`; `services/notifications/tests/test_functional_dispatch_path.py` | The facade's upstream is a stubbed transport |
-| Integration (running stack) | `tests/integration/test_v1_facade.py`, `test_webhooks_flow.py`, `test_webhook_slow_receiver_live.py`, `test_notifications_flow.py`, `test_notification_channels_flow.py`, `test_health_alerting_flow.py`, `test_nats_consumer_configs_live.py`; `tests/contract/test_openapi_schema.py` | The health tests publish the event straight to `HERD_HEALTH` with a fresh `event_id` rather than driving the poller. The slow-receiver test binds a peer consumer and flakes on a stack other sessions use |
+| Integration (running stack) | `tests/integration/test_v1_facade.py`, `test_webhooks_flow.py`, `test_webhook_slow_receiver_live.py`, `test_notifications_flow.py`, `test_notification_channels_flow.py`, `test_reservation_failed_notification.py`, `test_health_alerting_flow.py`, `test_nats_consumer_configs_live.py`; `tests/contract/test_openapi_schema.py` | The health tests publish the event straight to `HERD_HEALTH` with a fresh `event_id` rather than driving the poller. The slow-receiver test binds a peer consumer and flakes on a stack other sessions use |
 | Stress and load | `tests/load/locustfile.py` (`NotificationUser`: unread count, list, preference reads and writes) | Nothing loads the facade, webhook fan-out, or the consumers |
 | Browser end-to-end | `tests/e2e/test_notifications_bell.py`, `tests/e2e/test_settings_page.py` | `tests/e2e/test_flows_effects_playwright.py` (`test_notification_round_trip`) clicks mark read; nothing clicks delete in a browser; the facade and webhooks have no interface |
 
@@ -1033,8 +1042,6 @@ Two documents are incomplete against the code this specification describes, trac
 
 ### Open defects
 
-- #1077 (INTEG-ROUTE-2): a failed reservation produces no notification and has no
-  preference toggle; nothing records this as a decision.
 - #1078 (INTEG-HOOK-9): a webhook subscription cannot be paused; `is_active` has no
   write path.
 

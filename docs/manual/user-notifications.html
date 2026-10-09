@@ -105,7 +105,7 @@
     <p class="sectitle">What sets it off</p>
     <p>Three families of event reach the bell:</p>
     <div class="cardgrid c3" style="margin-top:16px;">
-      <div class="gcard" style="cursor:default;"><span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg></span><h3>Reservation lifecycle</h3><p>Confirmed, activated, updated, completed, cancelled &mdash; for reservations you own.</p></div>
+      <div class="gcard" style="cursor:default;"><span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg></span><h3>Reservation lifecycle</h3><p>Confirmed, activated, updated, completed, cancelled, failed &mdash; for reservations you own.</p></div>
       <div class="gcard" style="cursor:default;"><span class="ix user"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span><h3>Expiring soon</h3><p>A single reminder a configurable window before a reservation's end time, so a deadline doesn't sneak up.</p></div>
       <div class="gcard" style="cursor:default;"><span class="ix shared"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span><h3>Device health</h3><p>When a device crosses into unhealthy (or recovers). Goes to admins and to anyone with an active reservation on it. See <a href="admin-health-config.html#alerts">health monitoring</a>.</p></div>
     </div>
@@ -164,6 +164,7 @@
                     <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation cancelled</div>
                     <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation completed</div>
                     <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation expiring soon</div>
+                    <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation failed</div>
                     <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--gray-300);border-radius:4px"></span> Device health changed</div>
                   </div>
                   <div style="margin-top:14px;"><span class="hd-btn primary sm" data-anno="3" data-anno-pin="t" data-anno-arrow>Save</span></div>
@@ -173,12 +174,12 @@
           </div>
         </div>
       </div>
-      <p class="shotcap"><b>The Notifications settings.</b> Channel toggles on top, six per-event checkboxes below.</p>
+      <p class="shotcap"><b>The Notifications settings.</b> Channel toggles on top, seven per-event checkboxes below.</p>
     </figure>
 
     <ol class="legend">
       <li><b>Channels.</b> Four independent toggles: in-app, email, chat, webhook. There's no separate master switch; turning off "Show in-app notifications" silences just the bell (without deleting history), the same way turning off email only stops email. In-app and email are on here; chat and webhook are off, and outbound channels start off until you enable them.</li>
-      <li><b>Per-event toggles.</b> Six individual checkboxes: the five reservation lifecycle events (confirmed, updated, cancelled, completed, expiring soon) plus device health changed. Here, device-health is unchecked. Anything unchecked stops arriving; missing entries default to on.</li>
+      <li><b>Per-event toggles.</b> Seven individual checkboxes: the six reservation lifecycle events (confirmed, updated, cancelled, completed, expiring soon, failed) plus device health changed. Here, device-health is unchecked. Anything unchecked stops arriving; missing entries default to on.</li>
       <li><b>Save.</b> Applies to new events immediately &mdash; no restart, no reload.</li>
     </ol>
 
