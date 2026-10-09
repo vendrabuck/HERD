@@ -96,10 +96,18 @@ async def test_event_invalid_device_id_is_skipped():
 
 
 @pytest.mark.asyncio
-async def test_event_missing_device_name_falls_back():
-    """`device_name` is best-effort; falls back to 'device' if missing."""
+@pytest.mark.parametrize("name_shape", ["absent", "null"])
+async def test_event_missing_device_name_falls_back(name_shape):
+    """`device_name` is best-effort; falls back to 'device' if missing.
+
+    Exact strings (issue #1135): the template's fixed "Device" prefix would satisfy
+    a substring check even with no fallback ("Device None unhealthy").
+    """
     event = _health_event()
-    del event["device_name"]
+    if name_shape == "absent":
+        del event["device_name"]
+    else:
+        event["device_name"] = None
     recipients = [uuid.uuid4()]
     with patch(
         "app.services.event_router.resolve_health_recipients",
@@ -107,7 +115,10 @@ async def test_event_missing_device_name_falls_back():
     ):
         messages = await event_router.build_messages(event)
     assert len(messages) == 1
-    assert "device" in messages[0].title.lower()
+    assert messages[0].title == "Device device unhealthy"
+    assert messages[0].body == (
+        "device is now UNREACHABLE after 3 consecutive failed health checks."
+    )
 
 
 @pytest.mark.asyncio
