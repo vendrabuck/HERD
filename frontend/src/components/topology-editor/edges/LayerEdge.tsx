@@ -32,13 +32,18 @@ export function LayerEdge({
   // label), shared with BundledEdge; passing `data` straight through also
   // covers a data-less edge (review item 3) the same way resolveEdgeStroke's
   // own default does, with no separate null-check needed here.
-  const { stroke: pathStroke, statusLabel: pathStatusLabel } = resolveEdgeStroke(data);
+  const {
+    stroke: pathStroke,
+    statusLabel: pathStatusLabel,
+    statusTitle: pathStatusTitle,
+  } = resolveEdgeStroke(data);
   // A fork version diff overlay (issue #622) takes over both the stroke and
   // the status label: path validity is not meaningful for a historical
   // snapshot, and green/red communicates "changed" more directly here than
   // the layer's usual color would.
   const stroke = diffStatus === "added" ? DIFF_ADDED_STROKE : diffStatus === "removed" ? DIFF_REMOVED_STROKE : pathStroke;
   const statusLabel = diffStatus === "added" ? "added" : diffStatus === "removed" ? "removed" : pathStatusLabel;
+  const statusTitle = diffStatus ? undefined : pathStatusTitle;
   // Proposals always render dashed in the proposal-edge color so they are
   // visually distinct from committed edges even when the same L1/L2/L3 style
   // would otherwise apply; a removed-in-diff edge dashes too, since it no
@@ -107,6 +112,7 @@ export function LayerEdge({
             <span
               className="text-xs px-1 py-0.5 rounded whitespace-nowrap"
               style={{ color: stroke, backgroundColor: "white", border: `1px solid ${stroke}` }}
+              title={statusTitle}
             >
               {statusLabel}
             </span>

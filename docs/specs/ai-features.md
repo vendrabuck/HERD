@@ -1304,7 +1304,7 @@ named in each rule.
   `error: topology_unwireable` and an array `invalid_edges`; the dialog then lists each
   edge as `<role> to <role>: <reason in plain words>`, and otherwise shows
   `Commit failed: <detail>`. \
-  Enforced in: `frontend/src/lib/errors.ts` (`aiCommitTopologyUnwireableDetail`); `frontend/src/components/topology-editor/AICommitDialog.tsx` (`invalidEdgeReasonText`, `INVALID_EDGE_REASON_TEXT`) \
+  Enforced in: `frontend/src/lib/errors.ts` (`aiCommitTopologyUnwireableDetail`); `frontend/src/components/topology-editor/AICommitDialog.tsx` (`invalidEdgeReasonText`); `frontend/src/lib/edgeProblems.ts` (`invalidEdgeReasonText`, `INVALID_EDGE_REASON_TEXT`) \
   Pinned by: `frontend/src/test/components/AICommitDialog.test.tsx` (`toasts a plain-words per-edge list for a structured topology_unwireable 422`, `falls back to the generic detail toast for a non-topology_unwireable 422`, `toasts the backend detail when commit fails`)
 - **AI-UI-8.** The reservation detail modal shows the AI Assistant tab only when the status
   reports `enabled`. \

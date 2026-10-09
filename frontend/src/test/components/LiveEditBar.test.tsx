@@ -76,4 +76,33 @@ describe("LiveEditBar", () => {
     makeBar({ forkLoaded: false, isCommitting: true });
     expect(screen.getByRole("button", { name: "Committing..." })).toBeDisabled();
   });
+
+  // Issue #1066: lines only the server's draft check flags are stated, never a
+  // commit block (the save answers 200 for them and wires the rest).
+  it("states server-reported lines without blocking commit", () => {
+    const { onCommit } = makeBar({ serverInvalidEdgeCount: 2 });
+    expect(
+      screen.getByText(
+        "2 lines failed the last draft check; committing does not wire them. Hover their labels for the reason.",
+      ),
+    ).toBeInTheDocument();
+    const commit = screen.getByRole("button", { name: "Commit to reservation" });
+    expect(commit).toBeEnabled();
+    fireEvent.click(commit);
+    expect(onCommit).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the singular for one server-reported line and says nothing for none", () => {
+    makeBar({ serverInvalidEdgeCount: 1 });
+    expect(
+      screen.getByText(
+        "1 line failed the last draft check; committing does not wire it. Hover its label for the reason.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows no server note when the count is zero or omitted", () => {
+    makeBar();
+    expect(screen.queryByText(/last draft check/)).not.toBeInTheDocument();
+  });
 });

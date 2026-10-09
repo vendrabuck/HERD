@@ -1,4 +1,4 @@
-import { renderHook } from "@testing-library/react";
+import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { CanvasData } from "@/types/topology.types";
@@ -151,6 +151,128 @@ describe("useForkAutosave", () => {
       );
       result.current.flush();
       expect(putForkCanvasMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // Issue #1066: a draft PUT's answer (its invalid_edges) reaches the editor
+  // only when it is the newest PUT's and the canvas on screen is still the
+  // one it judged; never after unmount.
+  describe("onDraftValidated", () => {
+    type Props = { canvas: CanvasData; onDraftValidated: (r: unknown) => void };
+
+    function renderWithCallback(onDraftValidated: (r: unknown) => void) {
+      return renderHook(
+        (props: Props) =>
+          useForkAutosave({
+            reservationId: RES_ID,
+            canvas: props.canvas,
+            enabled: true,
+            delay: 2000,
+            onDraftValidated: props.onDraftValidated,
+          }),
+        { initialProps: { canvas: canvasWith("a"), onDraftValidated } },
+      );
+    }
+
+    function deferred<T>() {
+      let resolve: (value: T) => void = () => {};
+      const promise = new Promise<T>((r) => {
+        resolve = r;
+      });
+      return { promise, resolve };
+    }
+
+    it("hands the debounced PUT's answer to the callback", async () => {
+      const answer = {
+        id: "f-1",
+        valid: false,
+        invalid_edges: [{ edge_id: "e1", reason: "no_port_path" }],
+      };
+      putForkCanvasMock.mockResolvedValue(answer);
+      const onDraftValidated = vi.fn();
+      const { rerender } = renderWithCallback(onDraftValidated);
+
+      rerender({ canvas: canvasWith("edited"), onDraftValidated });
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(onDraftValidated).toHaveBeenCalledTimes(1);
+      expect(onDraftValidated).toHaveBeenCalledWith(answer);
+    });
+
+    it("hands a flush's answer to the callback too", async () => {
+      const onDraftValidated = vi.fn();
+      const { result, rerender } = renderWithCallback(onDraftValidated);
+      rerender({ canvas: canvasWith("edited"), onDraftValidated });
+      await act(async () => {
+        result.current.flush();
+      });
+      expect(onDraftValidated).toHaveBeenCalledWith({ id: "f-1", valid: true, invalid_edges: [] });
+    });
+
+    it("drops an older PUT's answer that settles after a newer PUT was sent", async () => {
+      const first = deferred<unknown>();
+      const second = deferred<unknown>();
+      putForkCanvasMock.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+      const onDraftValidated = vi.fn();
+      const { rerender } = renderWithCallback(onDraftValidated);
+
+      rerender({ canvas: canvasWith("b"), onDraftValidated });
+      await vi.advanceTimersByTimeAsync(2000);
+      rerender({ canvas: canvasWith("c"), onDraftValidated });
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(putForkCanvasMock).toHaveBeenCalledTimes(2);
+
+      const newer = { id: "f-1", valid: true, invalid_edges: [] };
+      await act(async () => {
+        second.resolve(newer);
+      });
+      await act(async () => {
+        first.resolve({ id: "f-1", valid: false, invalid_edges: [{ edge_id: "old", reason: "no_path" }] });
+      });
+      expect(onDraftValidated).toHaveBeenCalledTimes(1);
+      expect(onDraftValidated).toHaveBeenCalledWith(newer);
+    });
+
+    it("drops an answer for a canvas that changed while the PUT was in flight", async () => {
+      const pending = deferred<unknown>();
+      putForkCanvasMock.mockReturnValueOnce(pending.promise);
+      const onDraftValidated = vi.fn();
+      const { rerender } = renderWithCallback(onDraftValidated);
+
+      rerender({ canvas: canvasWith("b"), onDraftValidated });
+      await vi.advanceTimersByTimeAsync(2000);
+      // The canvas is replaced (or edited) before the answer arrives.
+      rerender({ canvas: canvasWith("replaced"), onDraftValidated });
+      await act(async () => {
+        pending.resolve({ id: "f-1", valid: false, invalid_edges: [{ edge_id: "e1", reason: "no_path" }] });
+      });
+      expect(onDraftValidated).not.toHaveBeenCalled();
+    });
+
+    it("never calls back after unmount", async () => {
+      const pending = deferred<unknown>();
+      putForkCanvasMock.mockReturnValueOnce(pending.promise);
+      const onDraftValidated = vi.fn();
+      const { rerender, unmount } = renderWithCallback(onDraftValidated);
+
+      rerender({ canvas: canvasWith("b"), onDraftValidated });
+      await vi.advanceTimersByTimeAsync(2000);
+      unmount();
+      await act(async () => {
+        pending.resolve({ id: "f-1", valid: true, invalid_edges: [] });
+      });
+      expect(onDraftValidated).not.toHaveBeenCalled();
+    });
+
+    it("does not call back when the PUT fails", async () => {
+      putForkCanvasMock.mockRejectedValueOnce(new Error("boom"));
+      const onDraftValidated = vi.fn();
+      const { result, rerender } = renderWithCallback(onDraftValidated);
+      rerender({ canvas: canvasWith("b"), onDraftValidated });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      expect(result.current.status).toBe("error");
+      expect(onDraftValidated).not.toHaveBeenCalled();
     });
   });
 });

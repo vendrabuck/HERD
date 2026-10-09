@@ -1,5 +1,6 @@
 import type { EdgeLayerType, LayerEdgeData } from "@/types/topology.types";
 import { LAYER_STYLES } from "./layerStyles";
+import { invalidEdgeReasonText } from "@/lib/edgeProblems";
 
 export const INVALID_STROKE = "#ef4444";
 const VALID_PATH_STROKE = "#22c55e";
@@ -12,6 +13,9 @@ export interface EdgeStrokeInfo {
   // Matches the inline label LayerEdge renders under the layer badge: null
   // when there is nothing to say yet (pathValid unresolved).
   statusLabel: string | null;
+  // Hover text for the status label (issue #1066), set only when the reason
+  // came from the server's check of the draft rather than the client's own.
+  statusTitle?: string;
 }
 
 /**
@@ -34,6 +38,19 @@ export function resolveEdgeStroke(data: LayerEdgeData | undefined): EdgeStrokeIn
 
   if (data?.portsCabled === false) {
     return { stroke: INVALID_STROKE, isInvalid: true, statusLabel: "uncabled port" };
+  }
+  // Issue #1066: the fork canvas PUT's own verdict on this line. It ranks
+  // above pathValid because a reachable device pair says nothing about the
+  // chosen ports: a line on two cabled but unjoined ports passes pathfind
+  // and is still one the save will not wire.
+  if (data?.serverInvalidReason) {
+    const text = invalidEdgeReasonText(data.serverInvalidReason);
+    return {
+      stroke: INVALID_STROKE,
+      isInvalid: true,
+      statusLabel: text,
+      statusTitle: `The last draft check reported this line: ${text}. Committing does not wire it.`,
+    };
   }
   if (data?.pathValid === true) {
     return {

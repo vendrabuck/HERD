@@ -1515,7 +1515,8 @@ reservation's fork opens read-only.
   stays disabled, reading `Loading fork...`, until it has loaded. \
   Enforced in: `frontend/src/pages/TopologyEditorPage.tsx` (`handleCommitToReservation`); `frontend/src/components/topology-editor/LiveEditBar.tsx` (`LiveEditBar`) \
   Pinned by: `frontend/src/test/pages/TopologyEditorForkMode.test.tsx` (`loads the reservation fork canvas, not the parent topology canvas`, `disables Commit and reads 'Loading fork...' until the fork hydrates; a click during that window issues no fork save or device PATCH`)
-- **TOPO-UIFORK-2.** Commit is blocked while any line is invalid; it adds newly drawn
+- **TOPO-UIFORK-2.** Commit is blocked while any line fails the editor's own checks
+  (TOPO-UIFORK-10's server marks do not block); it adds newly drawn
   devices to the reservation before saving the fork (a failure there blocks the save),
   removes dropped devices only after the save succeeds, and never writes the parent
   topology. \
@@ -1557,6 +1558,20 @@ reservation's fork opens read-only.
   toast stays until dismissed (issue #1007). \
   Enforced in: `frontend/src/components/topology-editor/ForkSaveResultToast.tsx` (`ForkSaveResultToast`); `frontend/src/lib/forkSaveResult.ts` (`skippedEdgeText`); `frontend/src/pages/TopologyEditorPage.tsx` (`handleCommitToReservation`) \
   Pinned by: `frontend/src/test/components/ForkSaveResultToast.test.tsx` (`shows the version and released/built/unchanged counts`, `omits the element attachments clause when the count is undefined or zero`, `shows the element attachments clause when the count is greater than zero`, `names each line the save could not wire on its chosen ports (issue #1007)`, `omits the not-wired block when the list is absent or empty`); `tests/e2e/test_fork_save_skipped_edge_playwright.py` (`test_fork_save_toast_names_a_line_on_unjoined_ports`)
+
+- **TOPO-UIFORK-10.** The `invalid_edges` of the newest draft PUT, when the canvas on
+  screen is still the one that PUT carried, mark each named line red with its reason in
+  words (`no_port_path` reads `no cable path on the chosen ports`) and the reason on
+  hover; a bundle with such a member goes red. The mark ranks above a reachable device
+  pair, so a line on two cabled ports no cable joins is shown red before the save. It
+  stays until a later PUT answers otherwise, a successful commit replaces the
+  `no_port_path` marks with the save's `constrained_edges_skipped` (other reasons stay),
+  and every canvas replacement (load, preview, diff, restore) clears it. The mark lives
+  only on the copies React Flow renders, never in the store or the persisted canvas,
+  and it does not block Commit: the live-edit bar states the count instead, since the
+  save wires the other lines (issue #1066). \
+  Enforced in: `frontend/src/lib/edgeProblems.ts` (`serverEdgeProblemsFrom`, `applySkippedConstrainedEdges`, `withServerEdgeProblems`, `stripServerEdgeProblem`); `frontend/src/hooks/useForkAutosave.ts` (`onDraftValidated`); `frontend/src/pages/TopologyEditorPage.tsx` (`loadCanvasAndClearRouteProblems`, `handleDraftValidated`, `serverOnlyInvalidEdgeCount`); `frontend/src/components/topology-editor/edges/edgeStatus.ts` (`resolveEdgeStroke`); `frontend/src/components/topology-editor/LiveEditBar.tsx` (`serverInvalidEdgeCount`) \
+  Pinned by: `frontend/src/test/lib/edgeProblems.test.ts` (`maps each reported edge id to its reason`, `replaces every no_port_path verdict with the save's skipped list and keeps other reasons`, `overlays the reason on copies of the matched edges only, never mutating the input`); `frontend/src/test/hooks/useForkAutosave.test.tsx` (`drops an older PUT's answer that settles after a newer PUT was sent`, `drops an answer for a canvas that changed while the PUT was in flight`, `never calls back after unmount`); `frontend/src/test/pages/TopologyEditorForkServerEdges.test.tsx` (`paints a line the draft PUT reported, inside its bundle, without touching the store`, `stays red until the next PUT answer says otherwise`, `clears the verdicts when a fork-history preview replaces the canvas, and they do not return on exit`, `a fork save refreshes the no_port_path verdicts from its skipped list and keeps the others`); `frontend/src/test/components/LayerEdge.test.tsx` (`renders red with the server's reason, above a reachable device pair`); `frontend/src/test/components/LiveEditBar.test.tsx` (`states server-reported lines without blocking commit`); `tests/e2e/test_fork_save_skipped_edge_playwright.py` (`test_fork_save_toast_names_a_line_on_unjoined_ports`)
 
 **Out of scope.** Who may open the fork, and the Edit topology entry point, are
 `reservations.md` (RES-FORK-4, RES-FORK-19). The Wiring tab is
@@ -1745,6 +1760,10 @@ None at present.
 - Deleting a cable that live fork wiring references is not refused (TOPO-CONN-11).
   Recorded in ADR 0007 (Decision 5): a graph change under a live reservation is an
   accepted failure mode, and the recovery is a re-save.
+- A line the fork draft already holds when the editor opens is marked by the server only
+  after the first draft PUT, which needs an edit; opening the editor sends no PUT
+  (TOPO-UIFORK-4, TOPO-UIFORK-10). Recorded in the comment on `serverEdgeProblems` in
+  `TopologyEditorPage.tsx` (issue #1066).
 - CSV import and export do not carry nodes with no edge or network elements; JSON is the
   lossless format (TOPO-BULK-3). Recorded in [BULK_IMPORT_EXPORT.md](../BULK_IMPORT_EXPORT.md).
 
