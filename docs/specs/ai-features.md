@@ -401,7 +401,7 @@ the pure search in `services/ai-orchestrator/app/services/resolver.py`, and cabl
   `Could not verify cabling paths; no topology was generated. Retry the request.`;
   reachability is never assumed. \
   Enforced in: `services/ai-orchestrator/app/services/cabling_client.py` (`fetch_pathfind_batch`, `CablingUnavailableError`); `services/ai-orchestrator/app/services/generator.py` (`CABLING_UNAVAILABLE_DETAIL`) \
-  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_503_when_pathfind_is_unavailable`)
+  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_503_when_pathfind_is_unavailable`, `test_pathfind_batch_fails_closed_when_cabling_cannot_answer`)
 - **AI-RESOLVE-7.** Pairs are sent in chunks of 200 per request with the caller's JWT and a
   20 second timeout. \
   Enforced in: `services/ai-orchestrator/app/services/cabling_client.py` (`PATHFIND_BATCH_CHUNK`, `PATHFIND_TIMEOUT_SECONDS`) \

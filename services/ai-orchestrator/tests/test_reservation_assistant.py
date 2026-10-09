@@ -379,6 +379,11 @@ async def test_ai_error_returns_502(async_client):
 
 
 async def test_overall_timeout_returns_504(async_client, monkeypatch):
+    """A buffered turn that hits the overall deadline with no landed write
+    answers 504 AND rolls the turn back: the flushed user message and the new
+    conversation are never committed, so no orphan trailing user message can
+    wedge the next turn's role alternation (the no-side-effect half of the
+    issue #871 matrix)."""
     monkeypatch.setattr(config_module.settings, "assistant_overall_deadline_s", 0.05)
     _override_seed()
 
@@ -398,6 +403,20 @@ async def test_overall_timeout_returns_504(async_client, monkeypatch):
     async with async_client as client:
         resp = await client.post(_url(), json={"question": "hi"}, headers=headers)
     assert resp.status_code == 504
+    assert resp.json()["detail"] == "Assistant did not respond within 0s"
+
+    from app.models.conversation import AssistantConversation, AssistantMessage
+    from sqlalchemy import func, select
+
+    async with _TestSessionLocal() as db:
+        conv_count = (
+            await db.execute(select(func.count()).select_from(AssistantConversation))
+        ).scalar_one()
+        msg_count = (
+            await db.execute(select(func.count()).select_from(AssistantMessage))
+        ).scalar_one()
+    assert conv_count == 0
+    assert msg_count == 0
 
 
 async def test_iteration_cap_exceeded_still_returns_200(async_client):

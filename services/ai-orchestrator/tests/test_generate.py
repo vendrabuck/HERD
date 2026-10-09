@@ -1161,25 +1161,46 @@ async def test_generate_unconnectable_repairs_then_returns_structured_422(
 
 
 async def test_generate_503_when_pathfind_is_unavailable(async_client, monkeypatch):
-    """A cabling outage fails CLOSED: no proposal, and reachability is never assumed."""
+    """AI-RESOLVE-6, end to end through the REAL cabling client: a cabling 5xx
+    fails CLOSED with the pinned 503, never a repairable
+    `topology_unconnectable` 422 (which is what reading the outage as "no pair
+    is reachable" would produce), so the model is asked exactly once. The
+    client's classification of each unanswerable input is pinned directly by
+    test_pathfind_batch_fails_closed_when_cabling_cannot_answer."""
+    from app.services import cabling_client
+
     _override_inventory({"EX3400": 8, "Client": 8})
     _override_resolver(monkeypatch)
-    _override_pathfind(monkeypatch, raises=CablingUnavailableError("boom"))
-    _override_ai(
-        {
-            "purpose": "one link",
-            "devices": [
-                {"role": "fw", "template_name": "EX3400"},
-                {"role": "client", "template_name": "Client"},
-            ],
-            "edges": [{"source_role": "fw", "target_role": "client", "layer": "L2"}],
-        }
+    # _override_resolver installs a pathfind stub; put the real client back.
+    monkeypatch.setattr(
+        generator_module, "fetch_pathfind_batch", cabling_client.fetch_pathfind_batch
     )
+    _patch_cabling_transport(monkeypatch, _pathfind_503)
+
+    calls = {"n": 0}
+
+    class CountingAI:
+        async def propose_topology(self, **kwargs):
+            calls["n"] += 1
+            return (
+                {
+                    "purpose": "one link",
+                    "devices": [
+                        {"role": "fw", "template_name": "EX3400"},
+                        {"role": "client", "template_name": "Client"},
+                    ],
+                    "edges": [{"source_role": "fw", "target_role": "client", "layer": "L2"}],
+                },
+                Usage(input_tokens=10, output_tokens=20),
+            )
+
+    app.dependency_overrides[get_ai_client] = lambda: CountingAI()
     headers = {"Authorization": f"Bearer {_user_token()}"}
     async with async_client as client:
         resp = await client.post("/generate", data={"prompt": "x"}, headers=headers)
     assert resp.status_code == 503
     assert resp.json()["detail"] == CABLING_UNAVAILABLE_DETAIL
+    assert calls["n"] == 1
 
 
 async def test_generate_fetches_the_configured_candidate_count(async_client, monkeypatch):
@@ -1598,3 +1619,67 @@ async def test_pathfind_batch_chunks_at_200_with_the_callers_jwt(monkeypatch):
     assert auth == ["Bearer caller-jwt"] * 3
     assert timeouts == [20.0]
     assert len(results) == 450
+
+
+def _patch_cabling_transport(monkeypatch, handler) -> None:
+    """Route the cabling client's httpx traffic through a MockTransport."""
+    import httpx
+    from app.services import cabling_client
+
+    real_client = httpx.AsyncClient
+
+    class _Patched(real_client):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(cabling_client.httpx, "AsyncClient", _Patched)
+
+
+def _pathfind_connect_error(request):
+    import httpx
+
+    raise httpx.ConnectError("connection refused", request=request)
+
+
+def _pathfind_503(request):
+    import httpx
+
+    return httpx.Response(503, json={"results": []})
+
+
+def _pathfind_non_json(request):
+    import httpx
+
+    return httpx.Response(200, content=b"<html>proxy error</html>")
+
+
+def _pathfind_no_results(request):
+    import httpx
+
+    return httpx.Response(200, json={})
+
+
+@pytest.mark.parametrize(
+    "handler, message",
+    [
+        (_pathfind_connect_error, "pathfind request failed"),
+        (_pathfind_503, "pathfind returned HTTP 503"),
+        (_pathfind_non_json, "pathfind returned a non-JSON body"),
+        (_pathfind_no_results, "pathfind returned no results list"),
+    ],
+    ids=["transport-error", "non-200", "non-json-body", "missing-results-list"],
+)
+async def test_pathfind_batch_fails_closed_when_cabling_cannot_answer(
+    monkeypatch, handler, message
+):
+    """AI-RESOLVE-6: the pathfind client fails CLOSED. A transport error, a
+    non-200, a non-JSON body, and a 200 without a `results` list each raise
+    CablingUnavailableError; none of them may come back as an empty or partial
+    answer, which the resolver would read as "not reachable"."""
+    from app.services import cabling_client
+
+    _patch_cabling_transport(monkeypatch, handler)
+    with pytest.raises(CablingUnavailableError) as excinfo:
+        await cabling_client.fetch_pathfind_batch("caller-jwt", [("s0", "t0")])
+    assert str(excinfo.value) == message

@@ -144,14 +144,19 @@ def test_tgz_skips_oversized_member(monkeypatch):
     assert "x" * 50 not in out
 
 
-def test_tgz_stops_at_budget(monkeypatch):
-    """When the remaining char budget is exhausted, the member loop breaks (82)."""
+def test_tgz_stops_at_budget():
+    """When the remaining char budget is exhausted, the member loop breaks (82).
+
+    Calls _extract_tgz directly: extract_files cuts every file to the remaining
+    budget afterwards, so through it the output is the same whether or not the
+    loop broke. Read directly, the second member's header proves it was read.
+    """
     # Budget of 5 chars: the first text member fills it, the second is never read.
-    monkeypatch.setattr(config_module.settings, "upload_max_extracted_chars", 5)
     data = _make_tgz([("a.txt", b"first member text"), ("b.txt", b"second member text")])
-    result = extract_files([("bundle.tgz", data)])
+    out = _extract_tgz(data, remaining_budget=5)
     # Only the first member contributed; the loop broke before the second.
-    assert "second member text" not in result[0].text
+    assert out == "--- a.txt ---\nfirst member text"
+    assert "--- b.txt ---" not in out
 
 
 def test_tgz_skips_member_when_extractfile_returns_none(monkeypatch):
