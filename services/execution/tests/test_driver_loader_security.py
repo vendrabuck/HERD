@@ -1,7 +1,7 @@
 """Security-edge coverage for driver package extraction.
 
 Path traversal, absolute-path entries, symlink escapes in tar, corrupted
-archives, and validation failures when driver.py crashes at import time.
+archives, and validation that never runs driver.py's own code (issue #1114).
 """
 
 import io
@@ -137,25 +137,28 @@ def test_tar_gz_traversal_blocked_by_data_filter():
             extract_driver_package(payload, "pkg.tar.gz", dest)
 
 
-def test_validate_reports_driver_import_error():
-    """A driver.py that crashes on import yields a load-failure validation error."""
-    payload = _zip_with_entries({"driver.py": "raise RuntimeError('boom at import')"})
-    with tempfile.TemporaryDirectory() as tmp:
-        dest = Path(tmp) / "driver"
-        extract_driver_package(payload, "pkg.zip", dest)
-        errors = validate_driver(dest, "Layer 1 Switch")
-        assert len(errors) == 1
-        assert "Failed to load driver.py" in errors[0]
+def test_validate_never_runs_driver_top_level_code(tmp_path):
+    """validate_driver parses driver.py and never imports it (issue #1114): a
+    top-level side effect does not run, and a top-level raise is not an error,
+    because only the sandbox ever executes package code."""
+    flag = tmp_path / "ran.flag"
+    driver = f'open(r"{flag}", "w").write("ran")\nraise RuntimeError("boom at import")\n'
+    payload = _zip_with_entries({"driver.py": driver + VALID_L1_DRIVER})
+    dest = tmp_path / "driver"
+    extract_driver_package(payload, "pkg.zip", dest)
+    assert validate_driver(dest, "Layer 1 Switch") == []
+    assert not flag.exists()
 
 
 def test_validate_reports_syntax_error_in_driver():
-    """A driver.py with a syntax error yields a load-failure validation error."""
+    """A driver.py with a syntax error yields a load-failure validation error
+    naming the parser's exception class only."""
     payload = _zip_with_entries({"driver.py": "def broken(:\n    pass"})
     with tempfile.TemporaryDirectory() as tmp:
         dest = Path(tmp) / "driver"
         extract_driver_package(payload, "pkg.zip", dest)
         errors = validate_driver(dest, "Layer 1 Switch")
-        assert any("Failed to load driver.py" in e for e in errors)
+        assert errors == ["Failed to load driver.py: SyntaxError"]
 
 
 def test_validate_rejects_driver_without_class():

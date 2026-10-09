@@ -81,8 +81,27 @@ requirements.txt      # OPTIONAL: pip dependencies installed before execution
 lib/                  # OPTIONAL: supporting Python modules, imported as lib.<module>
 ```
 
-The execution service extracts the archive, optionally installs dependencies from
-`requirements.txt`, then loads `driver.py` and instantiates the `Driver` class. The
+The execution service extracts the archive and checks `driver.py` by parsing it, never
+by importing it (issue #1114): package code runs only inside the driver sandbox. The
+check, shared with the generated-recipe validator, requires:
+
+- a plain top-level `class Driver` statement. A `Driver` bound any other way (an
+  assignment such as `Driver = make_driver()`, an import such as `from impl import
+  Driver`, or a class statement nested in an `if`, `try`, or function) is refused with
+  `driver.py must define Driver with a plain top-level class statement`;
+- every method the connection type requires, provided by the class body (`def`,
+  `async def`, an assignment, or an import), by an assignment onto `Driver` at module
+  level, or by a base class that is itself a top-level class statement in `driver.py`
+  (followed through its own bases);
+- when a method could come from code the parser cannot read (a base class imported
+  from another module, a class decorator, a metaclass, `setattr(Driver, ...)`), the
+  check does not refuse the package, and a missing method fails the first sandboxed
+  call that needs it.
+
+Because the load no longer imports `driver.py`, top-level code that raises (a missing
+dependency, for example) fails the first sandboxed call rather than the load. The
+service then optionally installs dependencies from `requirements.txt`, and each call
+loads `driver.py` in the sandbox and instantiates the `Driver` class. The
 package root is put on `PYTHONPATH` for the driver subprocess (a vendored `_deps/`
 directory, when present, is added as a second `PYTHONPATH` entry); `lib/` itself is never
 added as its own path entry, so its contents are importable only as the subpackage
@@ -1509,9 +1528,10 @@ draft is ever shown for review:
 
 Structural validation of an unapproved draft is AST-based and never imports
 the package in the service process; everything that must execute the code
-runs in the rlimit sandbox. Hand-written packages are unaffected: the load
-path (`validate_driver`) and the upload endpoint behave exactly as before,
-and `_deps/` vendoring remains available to human authors.
+runs in the rlimit sandbox. The structural check is the same one the load
+path (`validate_driver`) runs on every package (see Package structure); the
+policy rules above apply to generated recipes only, and `_deps/` vendoring
+remains available to human authors.
 
 ## Packaging quickstart
 
@@ -1526,7 +1546,7 @@ my-driver/
   requirements.txt   # optional; not installed by HERD, purely informational
 ```
 
-Only `driver.py` at the package root is required; the Driver class must be defined there.
+Only `driver.py` at the package root is required; the Driver class must be defined there, as a plain top-level `class Driver` statement.
 
 ### 2. Minimal `driver.py`
 
@@ -1618,7 +1638,7 @@ Update `driver.py`, rebuild the archive, upload via **Drivers > Edit > Replace f
 - **`TIMEOUT`**: your method took longer than `EXECUTION_TIMEOUT_SECONDS` (default 30). Raise it if the device is legitimately slow, or speed up the driver.
 - **`FAILED` with `Driver class not found`**: the package root doesn't contain a `driver.py` with a `Driver` class, or the class is missing one of the required methods for its connection type.
 - **`FAILED` with `error` reading `driver raised <ExceptionClassName>`**: the driver method raised (issue #840). The run row and any API response only ever carry the class name; the raw exception text is logged server-side on the execution service (`docker compose logs execution`, or `make logs`), keyed by the run id, and never stored or returned since it can carry hosts, paths, or credential-adjacent text. Check that log line for the actual message; most common cause is a credentials or network issue inside `login()`.
-- **`FAILED` with `error` reading `driver load failed: <ExceptionClassName>`**: loading the driver package itself failed (bad archive, missing `Driver` class, an import error inside the package), not a method call. The class name is the wrapped cause's class when the load error chains one via `__cause__`, else the load error's own class. Same sanitizing rule as above: the full text is in the execution service log, keyed by the run id, never on the row or in an API response.
+- **`FAILED` with `error` reading `driver load failed: <ExceptionClassName>`**: loading the driver package itself failed (bad archive, a `driver.py` that does not parse, a missing `Driver` class or required method), not a method call. An import error inside the package is not a load failure: the load only parses `driver.py`, so it surfaces as `driver raised <ExceptionClassName>` on the first call. The class name is the wrapped cause's class when the load error chains one via `__cause__`, else the load error's own class. Same sanitizing rule as above: the full text is in the execution service log, keyed by the run id, never on the row or in an API response.
 - **`FAILED` with `error` reading `execution failed: <ExceptionClassName>`**: something outside the driver failed while the run was in progress (for example a database error while recording the driver cache), so the run was closed as `FAILED` rather than left `PENDING` or `RUNNING`. The full text is in the execution service log line `Run <id> interrupted by <ExceptionClassName>`; retrying the run is safe.
 - **`FAILED` with `error` reading `driver process exited with status N`**: the driver's child process failed without reporting a structured exception (for example it called `sys.exit`, or died before the runner's handler ran). The child's raw output is never stored either; it is in the same execution service log line, keyed by the run id.
 - **Debugging locally**: run `python -c "from driver import Driver; d = Driver({...}); print(d.status())"` from the package dir. The execution service uses the same import path; if it works locally it will work in the sandbox.

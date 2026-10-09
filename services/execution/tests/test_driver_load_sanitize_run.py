@@ -126,9 +126,10 @@ async def test_run_driver_action_extraction_failure_stores_class_name_only(db, c
 
 
 @pytest.mark.asyncio
-async def test_run_driver_action_validate_import_failure_stores_class_name_only(db, caplog):
-    driver_code = f"raise RuntimeError({SENTINEL!r})\n"
-    zip_bytes = _make_zip(driver_code)
+async def test_run_driver_action_validate_parse_failure_stores_class_name_only(db, caplog):
+    # driver.py is parsed, never imported (issue #1114); the parser is patched
+    # to carry the sentinel the way its real message could carry a path.
+    zip_bytes = _make_zip("class Driver:\n    pass\n")
 
     with tempfile.TemporaryDirectory() as cache_root:
         with (
@@ -137,6 +138,10 @@ async def test_run_driver_action_validate_import_failure_stores_class_name_only(
                 new=AsyncMock(return_value=zip_bytes),
             ),
             patch("app.services.driver_loader.settings") as mock_settings,
+            patch(
+                "app.services.driver_structure.ast.parse",
+                side_effect=SyntaxError(SENTINEL),
+            ),
             caplog.at_level("ERROR"),
         ):
             mock_settings.driver_cache_path = cache_root

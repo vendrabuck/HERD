@@ -247,7 +247,7 @@ The driver method took longer than the configured timeout (`execution_timeout_se
 
 ### Execution run status `FAILED` with `Driver class not found`
 
-The driver package validation failed. Confirm `driver.py` exists in the package root and defines a class named `Driver` with the required methods for its connection type. See [DRIVERS.md](DRIVERS.md).
+The driver package validation failed. Confirm `driver.py` exists in the package root and defines `Driver` with a plain top-level `class Driver` statement that provides the required methods for its connection type (the check parses `driver.py`; it does not import it). See [DRIVERS.md](DRIVERS.md), "Package structure".
 
 ### A reservation owner's run list is missing runs, or answers `503 Could not verify device visibility`
 
@@ -327,8 +327,9 @@ wiring, so no driver call ran. The reason tells the two cases apart (issue #1002
   `ACTIVE`. Each failed load counts one attempt, so a lasting outage stops the auto
   retries at `WIRING_RETRY_MAX_ATTEMPTS`; a manual retry still works after that.
 - `recorded hop unresolvable: driver load failed: DriverPackageError`: the package is
-  broken (a corrupt archive, a missing or unimportable `driver.py`, a missing required
-  method). It is reported not retryable. Fix and re-upload the driver, then re-save the
+  broken (a corrupt archive, a missing or unparseable `driver.py`, a missing required
+  method). The load parses `driver.py` and never imports it, so a `driver.py` whose
+  imports fail fails the driver call instead (`driver raised <ClassName>`). It is reported not retryable. Fix and re-upload the driver, then re-save the
   fork wiring. The execution log line `Wiring driver load failed for switch ...` carries
   the validation detail.
 

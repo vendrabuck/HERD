@@ -1,6 +1,5 @@
 """Driver package loader: download, extract, validate, and cache driver packages."""
 
-import importlib.util
 import json
 import logging
 import shutil
@@ -17,6 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.driver_cache import DriverCache
+from app.services.driver_structure import REQUIRED_METHODS as REQUIRED_METHODS
+from app.services.driver_structure import DriverSourceError, driver_structure_errors
 
 # Capability declarations are opt-in and closed by default: a package whose
 # driver_metadata.json is missing, unreadable, or silent on a flag declares
@@ -35,8 +36,8 @@ class DriverPackageError(Exception):
     Raised for structural defects that are fixed for a given SHA256 and so
     reproduce identically on every redelivery: a structurally invalid archive
     (unsupported format, corrupt zip/tar), a missing driver.py, a driver.py
-    that fails to import (unparseable), a missing Driver class, an unknown
-    connection type, or a Driver missing a method the connection type requires.
+    that does not parse, a missing Driver class, an unknown connection type, or
+    a Driver missing a method the connection type requires.
     Distinct from a download failure (inventory unreachable), which stays a
     transient RuntimeError. The dynamic-provisioning consumer maps this to a
     PermanentEventError so a broken recipe dead-letters on first delivery
@@ -68,27 +69,6 @@ def driver_load_failure_text(exc: BaseException) -> str:
     cause = exc.__cause__
     cause_class = type(cause).__name__ if cause is not None else type(exc).__name__
     return f"driver load failed: {cause_class}"
-
-
-# Required methods per connection type
-REQUIRED_METHODS = {
-    "Layer 1 Switch": ["login", "logout", "connect_ports", "disconnect_ports", "status"],
-    "Layer 2 Switch": [
-        "login",
-        "logout",
-        "create_vlan",
-        "add_to_vlan",
-        "remove_from_vlan",
-        "delete_vlan",
-        "status",
-    ],
-    "Layer 3 Switch": ["login", "logout", "configure_route", "remove_route", "status"],
-    "Management": ["login", "logout", "configure", "backup", "status"],
-    # A dynamic-resource recipe (ADR 0004, issue #32): an ordinary driver
-    # package whose connection_type is Hypervisor. create_instance materializes
-    # an instance and destroy_instance idempotently removes it.
-    "Hypervisor": ["login", "logout", "create_instance", "destroy_instance", "status"],
-}
 
 
 async def get_cached_driver(
@@ -151,46 +131,22 @@ def extract_driver_package(package_bytes: bytes, filename: str, dest_dir: Path) 
 def validate_driver(driver_dir: Path, connection_type: str) -> list[str]:
     """Validate that the driver has driver.py with the required Driver class and methods.
 
-    Returns a list of validation errors (empty if valid).
+    Checked by parsing driver.py, never by importing it, through the one structural
+    check the package validator also uses (``driver_structure_errors``, issue #1114):
+    driver package code runs only inside the driver sandbox. Returns a list of
+    validation errors (empty if valid).
     """
-    errors = []
-    driver_py = driver_dir / "driver.py"
-    if not driver_py.exists():
-        errors.append("Missing driver.py at package root")
-        return errors
-
-    # Load the module to inspect it
     try:
-        spec = importlib.util.spec_from_file_location("driver_check", driver_py)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-    except Exception as e:
-        # e is whatever driver.py's own import raised (SyntaxError, ImportError,
-        # ...); its text can carry the extraction path inside the container
-        # (e.g. a SyntaxError's filename), so only the class name is kept in the
-        # errors list, which load_driver folds into a DriverPackageError that
-        # is stored on the run row (issue #840/#870). The full text goes in the
-        # log MESSAGE, not `extra`: the text is foreign and may carry a secret or
-        # path inside a value, which JSONFormatter's key-name redaction cannot see.
-        logger.error("Failed to load driver.py at %s: %s", driver_py, e)
-        errors.append(f"Failed to load driver.py: {type(e).__name__}")
-        return errors
-
-    if not hasattr(module, "Driver"):
-        errors.append("driver.py must define a class named Driver")
-        return errors
-
-    driver_cls = module.Driver
-    required = REQUIRED_METHODS.get(connection_type)
-    if required is None:
-        errors.append(f"Unknown connection type: {connection_type}")
-        return errors
-
-    for method_name in required:
-        if not callable(getattr(driver_cls, method_name, None)):
-            errors.append(f"Driver class is missing required method: {method_name}")
-
-    return errors
+        return driver_structure_errors(driver_dir, connection_type)
+    except DriverSourceError as exc:
+        cause = exc.__cause__
+        # The parser's text can carry a path or a fragment of the source, so only
+        # the class name is kept in the errors list, which load_driver folds into
+        # a DriverPackageError that is stored on the run row (issues #840, #870).
+        # The full text goes in the log MESSAGE, not `extra`: JSONFormatter's
+        # key-name redaction cannot see inside a value.
+        logger.error("Failed to parse driver.py at %s: %s", driver_dir / "driver.py", cause)
+        return [f"Failed to load driver.py: {type(cause).__name__}"]
 
 
 def read_driver_metadata(driver_dir: Path) -> dict:
@@ -226,12 +182,12 @@ def extract_config_schema_json(driver_dir: Path) -> str | None:
     by design: a broken config_schema() must never block a driver load; the
     validation path falls back to the registry. See issue #23.
 
-    The subprocess does not keep driver code out of this process: on the load
-    path `validate_driver` has already imported driver.py in-process by the
-    time this runs (the package validator keeps an unapproved package out with
-    AST checks instead). What the subprocess bounds is the config_schema() call
-    itself: it runs with resource limits and a timeout, so a runaway
-    config_schema() cannot hang the execution service.
+    The subprocess keeps driver code out of this process: `validate_driver`
+    checks the package by parsing driver.py, never importing it (issue #1114),
+    so this sandboxed call is the first time any of the package's code runs on
+    the load path. It also bounds the config_schema() call itself: it runs with
+    resource limits and a timeout, so a runaway config_schema() cannot hang the
+    execution service.
     """
     # Imported lazily so unit tests that exercise extract/validate without the
     # sandbox do not pull in the subprocess machinery at import time.

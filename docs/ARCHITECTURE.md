@@ -284,7 +284,7 @@ The execution service runs admin-uploaded driver code in a separate subprocess w
 wall-clock timeout and POSIX resource limits, but without OS-level isolation (see the
 security note below):
 
-- Package format: `.zip` or `.tar.gz` (<=10 MB) containing a `driver.py` with a `Driver` class.
+- Package format: `.zip` or `.tar.gz` (<=10 MB) containing a `driver.py` with a plain top-level `class Driver` statement. The load checks the class and its required methods by parsing `driver.py` (`driver_structure.py`, shared with the recipe validator), never by importing it; package code runs only in the sandbox.
 - Required methods per connection type (from `driver_loader.REQUIRED_METHODS`):
   - `Management`: login, logout, configure, backup, status
   - `Layer 1 Switch`: login, logout, connect_ports, disconnect_ports, status
