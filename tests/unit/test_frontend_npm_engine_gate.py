@@ -29,10 +29,14 @@ and this repo chose the cheaper one (see the Dockerfile's own comment).
 
 from __future__ import annotations
 
+import fnmatch
 import json
+import posixpath
 import re
+import shlex
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -162,33 +166,124 @@ def test_ci_gates_on_a_stable_package_lock():
     )
 
 
+def _dockerfile_instructions(text: str) -> list[tuple[str, str]]:
+    """(INSTRUCTION, arguments) per logical line, joining backslash continuations
+    and dropping comments and blank lines."""
+    instructions: list[tuple[str, str]] = []
+    pending = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not pending and (not line or line.startswith("#")):
+            continue
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        logical = (pending + line).strip()
+        pending = ""
+        keyword, _, args = logical.partition(" ")
+        instructions.append((keyword.upper(), args.strip()))
+    return instructions
+
+
+def _copy_sources(args: str) -> list[str] | None:
+    """The context sources of a COPY/ADD, or None when it copies from a stage."""
+    if args.startswith("["):
+        operands = json.loads(args)
+        flags: list[str] = []
+    else:
+        tokens = shlex.split(args)
+        flags = [t for t in tokens if t.startswith("--")]
+        operands = [t for t in tokens if not t.startswith("--")]
+    if any(f.startswith("--from") for f in flags):
+        return None
+    return [src for src in operands[:-1] if "://" not in src]
+
+
+def pre_install_npmrc_leaks(text: str, context: Path) -> list[str]:
+    """COPY/ADD sources ahead of the npm ci/install RUN that can bring `.npmrc`
+    into the build stage: the context root under any spelling (`.`, `./`, `/`),
+    any directory, or a name or glob that matches `.npmrc`. Flags such as
+    `--chown` are skipped and a `--from` stage copy is not the build context
+    (issue #1145)."""
+    instructions = _dockerfile_instructions(text)
+    install_index = next(
+        (
+            i
+            for i, (keyword, args) in enumerate(instructions)
+            if keyword == "RUN" and re.search(r"npm ci|npm install", args)
+        ),
+        None,
+    )
+    assert install_index is not None, "expected an npm ci/install RUN line in the Dockerfile"
+    copies = [
+        (keyword, args)
+        for keyword, args in instructions[:install_index]
+        if keyword in {"COPY", "ADD"}
+    ]
+    assert copies, "expected at least one COPY before the install RUN line"
+    leaks = []
+    for keyword, args in copies:
+        for src in _copy_sources(args) or []:
+            normalized = posixpath.normpath(src.lstrip("/") or ".")
+            if (
+                normalized == "."
+                or src.endswith("/")
+                or fnmatch.fnmatchcase(".npmrc", normalized)
+                or (context / normalized).is_dir()
+            ):
+                leaks.append(f"{keyword} {args} (source {src!r})")
+    return leaks
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "COPY . .",
+        "COPY . ./",
+        "COPY ./ /app/",
+        "COPY --chown=node . .",
+        "COPY --chown=node:node --chmod=644 . .",
+        "ADD . .",
+        "add . .",
+        "COPY . /app",
+        "COPY / /app",
+        "COPY .npmrc ./",
+        "COPY package.json .npmrc ./",
+        "COPY .npm* ./",
+        "COPY * ./",
+        'COPY [".", "./"]',
+        "COPY src ./src",
+        "COPY package.json \\\n     . ./",
+    ],
+)
+def test_pre_install_scan_flags_every_spelling_that_brings_npmrc(line):
+    text = f"FROM node:22-alpine AS build\nWORKDIR /app\n{line}\nRUN npm ci\nCOPY . .\n"
+    assert pre_install_npmrc_leaks(text, FRONTEND_DIR), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "COPY package.json package-lock.json* ./",
+        "COPY --chown=node package.json ./",
+        "ADD package.json ./",
+        "COPY --from=deps /app/node_modules ./node_modules",
+    ],
+)
+def test_pre_install_scan_allows_named_files_and_stage_copies(line):
+    text = f"FROM node:22-alpine AS build\nWORKDIR /app\n{line}\nRUN npm ci\nCOPY . .\n"
+    assert pre_install_npmrc_leaks(text, FRONTEND_DIR) == []
+
+
 def test_dockerfile_keeps_npmrc_out_of_the_install_layer():
     """The image build is exempt from engine-strict only because .npmrc is not
     copied into the build stage before npm ci/install runs. If that ever
     changes, the image needs its own npm pin (see the Dockerfile's comment)."""
-    text = DOCKERFILE_PATH.read_text()
-    lines = text.splitlines()
-
-    install_line_index = next(
-        (
-            i
-            for i, line in enumerate(lines)
-            if line.strip().startswith("RUN") and re.search(r"npm ci|npm install", line)
-        ),
-        None,
+    leaks = pre_install_npmrc_leaks(DOCKERFILE_PATH.read_text(), FRONTEND_DIR)
+    assert not leaks, (
+        f"a COPY or ADD before the install step now brings .npmrc into the build stage "
+        f"({leaks}); engine-strict would then apply to node:22-alpine's bundled "
+        "npm, which is not guaranteed to satisfy package.json's engines.npm floor. "
+        "Either keep .npmrc out of the pre-install COPY set, or add an explicit "
+        "`RUN npm install -g npm@<compliant version>` before the install step"
     )
-    assert install_line_index is not None, "expected an npm ci/install RUN line in the Dockerfile"
-
-    copy_lines_before_install = [
-        line for line in lines[:install_line_index] if line.strip().startswith("COPY")
-    ]
-    assert copy_lines_before_install, "expected at least one COPY before the install RUN line"
-
-    for line in copy_lines_before_install:
-        assert ".npmrc" not in line and line.strip() != "COPY . .", (
-            f"a COPY before the install step now brings .npmrc into the build stage "
-            f"({line!r}); engine-strict would then apply to node:22-alpine's bundled "
-            "npm, which is not guaranteed to satisfy package.json's engines.npm floor. "
-            "Either keep .npmrc out of the pre-install COPY set, or add an explicit "
-            "`RUN npm install -g npm@<compliant version>` before the install step"
-        )
