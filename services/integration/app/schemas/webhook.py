@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 # The event names a subscription may subscribe to. These mirror the `event`
 # field on HERD_RESERVATIONS payloads (subjects
@@ -42,6 +42,16 @@ class WebhookCreate(BaseModel):
             raise ValueError(f"unknown event_types {unknown}; allowed: {sorted(KNOWN_EVENT_TYPES)}")
         # De-duplicate while preserving order.
         return list(dict.fromkeys(v))
+
+
+class WebhookUpdate(BaseModel):
+    """Pause (false) or resume (true) a subscription; no other field may be sent."""
+
+    # Issue #1078: extra="forbid" refuses any other key with 422, and StrictBool
+    # refuses "false" or 0 rather than casting them.
+    model_config = ConfigDict(extra="forbid")
+
+    is_active: StrictBool
 
 
 class WebhookResponse(BaseModel):

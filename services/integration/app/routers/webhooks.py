@@ -25,6 +25,7 @@ from app.schemas.webhook import (
     WebhookCreated,
     WebhookDeliveryResponse,
     WebhookResponse,
+    WebhookUpdate,
 )
 from app.services.destination import TARGET_NOT_PUBLIC_DETAIL, destination_allowed, target_host
 
@@ -115,6 +116,41 @@ async def get_webhook(
     sub = await db.get(WebhookSubscription, webhook_id)
     if sub is None:
         raise HTTPException(status_code=404, detail="Webhook not found")
+    return WebhookResponse.model_validate(sub)
+
+
+@router.patch("/{webhook_id}", response_model=WebhookResponse)
+async def update_webhook(
+    webhook_id: uuid.UUID,
+    body: WebhookUpdate,
+    payload: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Pause or resume a subscription. The body is `{"is_active": <boolean>}` and
+    nothing else; the delivery history is kept. A paused subscription receives no
+    event handled after the change, and nothing is queued for it: resuming does
+    not replay the events it missed. A delivery already under way when the
+    subscription is paused finishes its attempts and is recorded."""
+    # Issue #1078. The pause binds at load_matching_targets (active rows only);
+    # deliver_one does not re-read is_active, so an in-flight fan-out finishes.
+    sub = await db.get(WebhookSubscription, webhook_id)
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    sub.is_active = body.is_active
+    await db.commit()
+    await db.refresh(sub)
+    changed_by = _principal_id(payload)
+    logger.info(
+        "Webhook subscription %s %s",
+        sub.id,
+        "resumed" if sub.is_active else "paused",
+        extra={
+            "action": "webhook_active_changed",
+            "webhook_id": str(sub.id),
+            "is_active": sub.is_active,
+            "changed_by": str(changed_by) if changed_by else None,
+        },
+    )
     return WebhookResponse.model_validate(sub)
 
 

@@ -43,7 +43,7 @@ routes (#1080). Rules beyond role are numbered in section 8.
 | Actor | May | May not |
 |---|---|---|
 | User | Call every `/api/v1/reservations` route with their own access token or an exchanged API token (INTEG-FACADE-1); read, mark read, and delete their own notifications (INTEG-INAPP-2); read and change their own notification preferences (INTEG-PREFS-1) | Register, read, or delete a webhook (INTEG-HOOK-1); see another user's notifications; reach any reservation route the facade does not expose (INTEG-FACADE-11) |
-| Admin | Everything a user may; register, list, read, and delete webhook subscriptions and read their delivery ledgers (INTEG-HOOK-1); receive every device health notification (INTEG-HEALTH-1) | Pause a webhook without deleting it (INTEG-HOOK-9) |
+| Admin | Everything a user may; register, list, read, pause, resume, and delete webhook subscriptions and read their delivery ledgers (INTEG-HOOK-1, INTEG-HOOK-9); receive every device health notification (INTEG-HEALTH-1) | Change a subscription's URL, event names, or secret (INTEG-HOOK-9) |
 | Superadmin | Same as admin | Same as admin |
 | Another service (internal token) | Nothing: neither service serves an internal route | |
 | External receiver | Receive signed POSTs for the event names a subscription lists (INTEG-HOOK-11, INTEG-HOOK-12) | Call anything back; the delivery is one-way |
@@ -114,6 +114,7 @@ them.
 | POST | `/api/v1/webhooks` | admin or superadmin | 201 | INTEG-HOOK-1 to INTEG-HOOK-5 |
 | GET | `/api/v1/webhooks` | admin or superadmin | 200 | INTEG-HOOK-1, INTEG-HOOK-6 |
 | GET | `/api/v1/webhooks/{webhook_id}` | admin or superadmin | 200 | INTEG-HOOK-1, INTEG-HOOK-6 |
+| PATCH | `/api/v1/webhooks/{webhook_id}` | admin or superadmin | 200 | INTEG-HOOK-1, INTEG-HOOK-9 |
 | DELETE | `/api/v1/webhooks/{webhook_id}` | admin or superadmin | 204 | INTEG-HOOK-1, INTEG-HOOK-7, INTEG-HOOK-8 |
 | GET | `/api/v1/webhooks/{webhook_id}/deliveries` | admin or superadmin | 200 | INTEG-HOOK-1, INTEG-HOOK-10 |
 | GET | `/api/v1/version` | anyone | 200 | INTEG-VERSION-2 |
@@ -295,10 +296,10 @@ enforces it.
 ### 8.3 Webhook subscriptions
 
 **What it does.** An admin registers an HTTP endpoint and the event names it wants, gets
-back a signing secret once, and can list, read, and delete subscriptions and read each
-one's delivery history.
+back a signing secret once, and can list, read, pause, resume, and delete subscriptions
+and read each one's delivery history.
 
-**Surfaces.** The five `/api/v1/webhooks` routes (section 5),
+**Surfaces.** The six `/api/v1/webhooks` routes (section 5),
 `services/integration/app/routers/webhooks.py`; validation in
 `services/integration/app/schemas/webhook.py`.
 
@@ -348,19 +349,28 @@ one's delivery history.
   `ON DELETE CASCADE` foreign key. \
   Enforced in: `services/integration/migrations/versions/0002_webhooks.py` (`CASCADE`); `services/integration/app/models/webhook.py` (`WebhookDelivery`) \
   Pinned by: none (issue #1081)
-- **INTEG-HOOK-9.** A subscription is created with `is_active` true and no route or task
-  ever changes it, so the only way to stop deliveries is to delete the subscription and
-  its history. Known gap, see #1078. \
-  Enforced in: `services/integration/app/models/webhook.py` (`WebhookSubscription`); `services/integration/app/routers/webhooks.py` (`create_webhook`) \
-  Pinned by: `services/integration/tests/test_webhooks_router_direct.py` (`test_create_webhook_direct_sets_created_by_from_sub`)
+- **INTEG-HOOK-9.** A subscription is created with `is_active` true. `PATCH
+  /webhooks/{webhook_id}` with the body `{"is_active": <boolean>}` pauses (false) or
+  resumes (true) it and answers the subscription without its secret (#1078). Any other
+  key, a missing or null `is_active`, or a value that is not a JSON boolean is 422 (the
+  validation envelope) and changes nothing; an unknown id is 404 `Webhook not found`. The
+  delivery ledger is kept. A paused subscription is left out of every event whose
+  targets are loaded after the commit (INTEG-HOOK-11) and gains no ledger row for it;
+  nothing is queued, so resuming does not replay the events it missed, and a later
+  redelivery of an event that has no row for the subscription delivers it normally. A
+  delivery whose targets were loaded before the pause is not interrupted: it makes its
+  remaining attempts and records its row. The change is logged with action
+  `webhook_active_changed`. \
+  Enforced in: `services/integration/app/routers/webhooks.py` (`update_webhook`); `services/integration/app/schemas/webhook.py` (`WebhookUpdate`); `services/integration/app/services/delivery.py` (`load_matching_targets`) \
+  Pinned by: `services/integration/tests/test_webhooks.py` (`test_patch_pauses_and_resumes_a_subscription`, `test_patch_requires_admin`, `test_patch_unknown_webhook_is_404`, `test_patch_refuses_anything_but_a_boolean_is_active`, `test_patch_keeps_the_delivery_ledger`, `test_paused_subscription_gets_no_new_event_and_nothing_queued`, `test_delivery_loaded_before_a_pause_finishes_its_attempts`); `services/integration/tests/test_webhooks_router_direct.py` (`test_create_webhook_direct_sets_created_by_from_sub`, `test_update_webhook_direct_toggles_is_active`, `test_update_webhook_direct_404_raises_http_exception`); `tests/integration/test_webhooks_flow.py` (`test_paused_webhook_receives_nothing_until_resumed`)
 - **INTEG-HOOK-10.** The delivery history of a subscription is returned newest first;
   `limit` defaults to 100 and is clamped into 1 to 500 rather than refused; an unknown
   subscription is 404 `Webhook not found`. \
   Enforced in: `services/integration/app/routers/webhooks.py` (`list_deliveries`) \
   Pinned by: `services/integration/tests/test_webhooks.py` (`test_deliveries_endpoint_lists_ledger`, `test_deliveries_endpoint_404_for_missing_webhook`, `test_deliveries_endpoint_clamps_limit`); `services/integration/tests/test_webhooks_router_direct.py` (`test_list_deliveries_direct_orders_newest_first_and_returns_rows`)
 
-**Out of scope.** Editing a subscription (there is no update route); rotating a secret
-other than by deleting and re-registering.
+**Out of scope.** Changing a subscription's URL, event names, or description (the only
+update is `is_active`); rotating a secret other than by deleting and re-registering.
 
 ### 8.4 Webhook delivery
 
@@ -957,10 +967,10 @@ kinds on the Settings page.
 | 401 | `Could not validate credentials` | bad, expired, or subject-less token | INTEG-FACADE-1 |
 | 401 | `Invalid subject in token` | a notification route with a `sub` that is not a UUID | INTEG-INAPP-2 |
 | 403 | `Admin or superadmin role required` | a webhook route without an admin role | INTEG-HOOK-1 |
-| 404 | `Webhook not found` | unknown subscription on read, delete, or deliveries | INTEG-HOOK-6, INTEG-HOOK-7, INTEG-HOOK-10 |
+| 404 | `Webhook not found` | unknown subscription on read, pause or resume, delete, or deliveries | INTEG-HOOK-6, INTEG-HOOK-7, INTEG-HOOK-9, INTEG-HOOK-10 |
 | 422 | `target_url must resolve to a public address` | a webhook destination whose host is not public, not allowlisted, or does not resolve | INTEG-HOOK-2 |
 | 404 | `Notification not found` | unknown or foreign notification on mark read or delete | INTEG-INAPP-6, INTEG-INAPP-9 |
-| 422 | FastAPI validation envelope | a facade body that fails `V1ReservationRequest`; a facade reservation id that is not a UUID; a webhook body with a bad URL, unknown or empty event types, or an over-long field; a facade list or notification list parameter out of range | INTEG-FACADE-4, INTEG-FACADE-6, INTEG-FACADE-15, INTEG-HOOK-2, INTEG-HOOK-3, INTEG-INAPP-3 |
+| 422 | FastAPI validation envelope | a facade body that fails `V1ReservationRequest`; a facade reservation id that is not a UUID; a webhook body with a bad URL, unknown or empty event types, or an over-long field; a webhook PATCH body that is not exactly a boolean `is_active`; a facade list or notification list parameter out of range | INTEG-FACADE-4, INTEG-FACADE-6, INTEG-FACADE-15, INTEG-HOOK-2, INTEG-HOOK-3, INTEG-HOOK-9, INTEG-INAPP-3 |
 | upstream status | upstream `detail`, body, or text | reservations refused a facade call | INTEG-FACADE-12, INTEG-FACADE-13 |
 | 503 | `Reservations service unavailable` | reservations unreachable or slower than 10 seconds | INTEG-FACADE-14 |
 | 503 | `user-profile unreachable` | user-profile unreachable on a preferences read or write | INTEG-PREFS-3 |
@@ -1042,8 +1052,6 @@ Two documents are incomplete against the code this specification describes, trac
 
 ### Open defects
 
-- #1078 (INTEG-HOOK-9): a webhook subscription cannot be paused; `is_active` has no
-  write path.
 
 ### Limits by decision
 

@@ -458,3 +458,171 @@ def test_event_payload_round_trips_for_signing():
     body = json.dumps(payload).encode()
     sig = sign_body(body, "k")
     assert hmac.compare_digest(sig, sign_body(body, "k"))
+
+
+# --- pause and resume (issue #1078) ---------------------------------------
+
+
+async def _register(c, **extra) -> dict:
+    resp = await c.post(
+        "/webhooks",
+        json={
+            "target_url": "https://x.example/h",
+            "event_types": ["reservation.created"],
+            **extra,
+        },
+        headers=_auth(_token()),
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+async def test_patch_pauses_and_resumes_a_subscription(session_factory):
+    async with _client(session_factory) as c:
+        created = await _register(c)
+        assert created["is_active"] is True
+
+        paused = await c.patch(
+            f"/webhooks/{created['id']}", json={"is_active": False}, headers=_auth(_token())
+        )
+        assert paused.status_code == 200, paused.text
+        body = paused.json()
+        assert body["is_active"] is False
+        assert body["id"] == created["id"]
+        assert body["target_url"] == created["target_url"]
+        assert body["event_types"] == created["event_types"]
+        assert "secret" not in body
+        read = await c.get(f"/webhooks/{created['id']}", headers=_auth(_token()))
+        assert read.json()["is_active"] is False
+
+        resumed = await c.patch(
+            f"/webhooks/{created['id']}", json={"is_active": True}, headers=_auth(_token())
+        )
+        assert resumed.status_code == 200
+        assert resumed.json()["is_active"] is True
+
+
+async def test_patch_requires_admin(session_factory):
+    async with _client(session_factory) as c:
+        created = await _register(c)
+        resp = await c.patch(
+            f"/webhooks/{created['id']}",
+            json={"is_active": False},
+            headers=_auth(_token(role="user")),
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "Admin or superadmin role required"
+        unauth = await c.patch(f"/webhooks/{created['id']}", json={"is_active": False})
+        assert unauth.status_code in (401, 403)
+        still = await c.get(f"/webhooks/{created['id']}", headers=_auth(_token()))
+        assert still.json()["is_active"] is True
+
+
+async def test_patch_unknown_webhook_is_404(session_factory):
+    async with _client(session_factory) as c:
+        resp = await c.patch(
+            f"/webhooks/{uuid.uuid4()}", json={"is_active": False}, headers=_auth(_token())
+        )
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Webhook not found"}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"is_active": None},
+        {"is_active": "false"},
+        {"is_active": 0},
+        {"is_active": False, "target_url": "https://other.example/h"},
+        {"is_active": False, "event_types": ["reservation.failed"]},
+        {"is_active": False, "secret": "new"},
+    ],
+)
+async def test_patch_refuses_anything_but_a_boolean_is_active(session_factory, body):
+    async with _client(session_factory) as c:
+        created = await _register(c)
+        resp = await c.patch(f"/webhooks/{created['id']}", json=body, headers=_auth(_token()))
+        assert resp.status_code == 422, resp.text
+        after = await c.get(f"/webhooks/{created['id']}", headers=_auth(_token()))
+        assert after.json()["is_active"] is True
+        assert after.json()["target_url"] == "https://x.example/h"
+
+
+async def test_patch_keeps_the_delivery_ledger(session_factory):
+    async with _client(session_factory) as c:
+        created = await _register(c)
+        async with session_factory() as s:
+            s.add(
+                WebhookDelivery(
+                    subscription_id=uuid.UUID(created["id"]),
+                    event_id="evt-kept",
+                    event_type="reservation.created",
+                    status="dead",
+                    attempts=3,
+                    response_status=500,
+                    last_error="upstream answered HTTP 500",
+                )
+            )
+            await s.commit()
+        await c.patch(
+            f"/webhooks/{created['id']}", json={"is_active": False}, headers=_auth(_token())
+        )
+        ledger = await c.get(f"/webhooks/{created['id']}/deliveries", headers=_auth(_token()))
+    assert ledger.status_code == 200
+    assert [d["event_id"] for d in ledger.json()] == ["evt-kept"]
+
+
+async def test_paused_subscription_gets_no_new_event_and_nothing_queued(
+    session_factory, monkeypatch
+):
+    """A paused subscription is left out of every later event, with no ledger row,
+    and resuming does not replay what it missed; the next event reaches it."""
+    from app.services.nats_consumer import handle_event
+
+    record = _install_fake_httpx(monkeypatch, status_code=200)
+    async with _client(session_factory) as c:
+        created = await _register(c)
+        await c.patch(
+            f"/webhooks/{created['id']}", json={"is_active": False}, headers=_auth(_token())
+        )
+        missed = {"event": "reservation.created", "event_id": "evt-missed"}
+        await handle_event(missed, json.dumps(missed).encode(), session_factory, "evt-missed")
+        assert record["calls"] == []
+        assert await _deliveries(session_factory, uuid.UUID(created["id"])) == []
+
+        await c.patch(
+            f"/webhooks/{created['id']}", json={"is_active": True}, headers=_auth(_token())
+        )
+        after = {"event": "reservation.created", "event_id": "evt-after"}
+        await handle_event(after, json.dumps(after).encode(), session_factory, "evt-after")
+
+    assert len(record["calls"]) == 1
+    rows = await _deliveries(session_factory, uuid.UUID(created["id"]))
+    assert [(r.event_id, r.status) for r in rows] == [("evt-after", "delivered")]
+
+
+async def test_delivery_loaded_before_a_pause_finishes_its_attempts(session_factory, monkeypatch):
+    """A delivery whose target was loaded before the pause is not interrupted: it
+    makes its remaining attempts and records its row (the pause binds from the
+    next event's target load)."""
+    record = _install_fake_httpx(monkeypatch, status_code=500)
+    target = await _make_target(session_factory, ["reservation.created"])
+    async with session_factory() as s:
+        sub = await s.get(WebhookSubscription, target.id)
+        sub.is_active = False
+        await s.commit()
+
+    result = await deliver_one(
+        session_factory,
+        target,
+        b'{"event_id":"evt-inflight"}',
+        "evt-inflight",
+        "reservation.created",
+        timeout=1.0,
+        attempts=2,
+    )
+    assert result == "dead"
+    assert len(record["calls"]) == 2
+    rows = await _deliveries(session_factory, target.id)
+    assert [(r.event_id, r.status, r.attempts) for r in rows] == [("evt-inflight", "dead", 2)]

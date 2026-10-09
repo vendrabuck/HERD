@@ -1895,6 +1895,7 @@ Authorization: Bearer <admin-token>
 | `/api/v1/webhooks` | POST | | yes | yes |
 | `/api/v1/webhooks` | GET | | yes | yes |
 | `/api/v1/webhooks/{id}` | GET | | yes | yes |
+| `/api/v1/webhooks/{id}` | PATCH | | yes | yes |
 | `/api/v1/webhooks/{id}` | DELETE | | yes | yes |
 | `/api/v1/webhooks/{id}/deliveries` | GET | | yes | yes |
 | `/api/notifications/notifications` | GET | yes (own rows) | yes (own rows) | yes (own rows) |

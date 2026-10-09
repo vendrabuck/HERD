@@ -45,6 +45,10 @@
       "/webhooks/{webhook_id}"
     ],
     [
+      "PATCH",
+      "/webhooks/{webhook_id}"
+    ],
+    [
       "GET",
       "/webhooks/{webhook_id}/deliveries"
     ]
@@ -176,6 +180,15 @@
         "id",
         "is_active",
         "target_url"
+      ],
+      "type": "object"
+    },
+    "WebhookUpdate": {
+      "properties": {
+        "is_active": "boolean"
+      },
+      "required": [
+        "is_active"
       ],
       "type": "object"
     }

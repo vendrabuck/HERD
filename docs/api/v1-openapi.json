@@ -479,6 +479,21 @@
         ],
         "title": "WebhookResponse",
         "type": "object"
+      },
+      "WebhookUpdate": {
+        "additionalProperties": false,
+        "description": "Pause (false) or resume (true) a subscription; no other field may be sent.",
+        "properties": {
+          "is_active": {
+            "title": "Is Active",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "is_active"
+        ],
+        "title": "WebhookUpdate",
+        "type": "object"
       }
     },
     "securitySchemes": {
@@ -961,6 +976,63 @@
           }
         ],
         "summary": "Get Webhook",
+        "tags": [
+          "v1-webhooks"
+        ]
+      },
+      "patch": {
+        "description": "Pause or resume a subscription. The body is `{\"is_active\": <boolean>}` and\nnothing else; the delivery history is kept. A paused subscription receives no\nevent handled after the change, and nothing is queued for it: resuming does\nnot replay the events it missed. A delivery already under way when the\nsubscription is paused finishes its attempts and is recorded.",
+        "operationId": "update_webhook_webhooks__webhook_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "webhook_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Webhook Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebhookUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Update Webhook",
         "tags": [
           "v1-webhooks"
         ]

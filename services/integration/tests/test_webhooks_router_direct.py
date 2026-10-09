@@ -144,6 +144,46 @@ async def test_get_webhook_direct_404_raises_http_exception(session_factory):
     assert exc_info.value.detail == "Webhook not found"
 
 
+# --- update_webhook (issue #1078) ---------------------------------------------
+
+
+async def test_update_webhook_direct_toggles_is_active(session_factory):
+    from app.schemas.webhook import WebhookUpdate
+
+    async with session_factory() as db:
+        sub = WebhookSubscription(
+            target_url="https://x.example/h", event_types=["reservation.created"], secret="s1"
+        )
+        db.add(sub)
+        await db.commit()
+        await db.refresh(sub)
+
+        paused = await webhooks_mod.update_webhook(
+            sub.id, WebhookUpdate(is_active=False), _payload(), db
+        )
+        assert paused.is_active is False
+        resumed = await webhooks_mod.update_webhook(
+            sub.id, WebhookUpdate(is_active=True), _payload(sub="not-a-uuid"), db
+        )
+        assert resumed.is_active is True
+
+    async with session_factory() as db2:
+        assert (await db2.get(WebhookSubscription, sub.id)).is_active is True
+
+
+async def test_update_webhook_direct_404_raises_http_exception(session_factory):
+    from app.schemas.webhook import WebhookUpdate
+
+    async with session_factory() as db:
+        with pytest.raises(HTTPException) as exc_info:
+            await webhooks_mod.update_webhook(
+                uuid.uuid4(), WebhookUpdate(is_active=False), _payload(), db
+            )
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "Webhook not found"
+
+
 # --- delete_webhook --------------------------------------------------------------
 
 

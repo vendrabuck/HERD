@@ -336,3 +336,53 @@ async def test_webhook_delivered_for_health_transition(admin_client, fresh_devic
         assert delivered[0]["response_status"] == 200
     finally:
         await admin_client.delete(f"/v1/webhooks/{webhook_id}")
+
+
+async def test_paused_webhook_receives_nothing_until_resumed(admin_client, fresh_device):
+    """Issue #1078: PATCH {"is_active": false} pauses a subscription without deleting
+    it or its ledger; an event handled while it is paused gives it no row (a still
+    active control subscription proves the event was handled), and nothing is
+    replayed on resume, while the next event reaches it again."""
+    paused = await _register_webhook(
+        admin_client, ECHO_TARGET, event_types=["device.health_transition"]
+    )
+    control = await _register_webhook(
+        admin_client, ECHO_TARGET, event_types=["device.health_transition"]
+    )
+    try:
+        resp = await admin_client.patch(f"/v1/webhooks/{paused['id']}", json={"is_active": False})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["is_active"] is False
+        assert "secret" not in resp.json()
+
+        refused = await admin_client.patch(
+            f"/v1/webhooks/{paused['id']}",
+            json={"is_active": True, "target_url": ECHO_TARGET},
+        )
+        assert refused.status_code == 422, refused.text
+
+        missed = _health_transition_payload(fresh_device["id"])
+        await _publish_health_event(missed)
+        control_rows = await _poll_for_status(
+            admin_client, control["id"], {"delivered"}, event_id=missed["event_id"]
+        )
+        assert control_rows, "the control subscription never received the event"
+        ledger = await admin_client.get(f"/v1/webhooks/{paused['id']}/deliveries")
+        assert ledger.status_code == 200, ledger.text
+        assert [r for r in ledger.json() if r["event_id"] == missed["event_id"]] == []
+
+        resumed = await admin_client.patch(f"/v1/webhooks/{paused['id']}", json={"is_active": True})
+        assert resumed.status_code == 200, resumed.text
+        assert resumed.json()["is_active"] is True
+
+        after = _health_transition_payload(fresh_device["id"])
+        await _publish_health_event(after)
+        rows = await _poll_for_status(
+            admin_client, paused["id"], {"delivered"}, event_id=after["event_id"]
+        )
+        assert [r["status"] for r in rows] == ["delivered"], rows
+        ledger = await admin_client.get(f"/v1/webhooks/{paused['id']}/deliveries")
+        assert [r for r in ledger.json() if r["event_id"] == missed["event_id"]] == []
+    finally:
+        await admin_client.delete(f"/v1/webhooks/{paused['id']}")
+        await admin_client.delete(f"/v1/webhooks/{control['id']}")
