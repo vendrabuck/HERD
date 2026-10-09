@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Tests: inventory tests whose input an earlier check refused now reach the rule they name: the template-validation HTTP tests send a port template valid except for the field under test and assert the exact 422 message, the non-admin device list test grants both devices so only the forced `dut_only` hides the infrastructure one, and the two apply-scheduler gate tests stub the creator re-check and assert `reservation not currently active` (#1138).
 - Fixed: a reservation that lands `FAILED` notifies its owner on every channel they enabled: the message is titled `Reservation failed` and names the reservation by its short id and device count, never a failure reason. The event is on by default, including for users whose saved preferences predate it, and the Settings page gains a `Reservation failed` toggle (#1077).
 - Added: an admin can pause and resume a webhook subscription with `PATCH /api/v1/webhooks/{id}` and the body `{"is_active": false}` or `{"is_active": true}`, keeping its delivery ledger; any other field is 422. A paused subscription receives no later event and nothing is replayed on resume (#1078).
 - Fixed: the notifications webhook channel signs through `herd_common.webhooks`, the helper integration's registered webhooks use, instead of a local copy; the bytes, headers, and signature a receiver sees are unchanged (#1079).

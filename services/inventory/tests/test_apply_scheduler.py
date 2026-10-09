@@ -463,8 +463,12 @@ async def test_reservation_gate_closed_default_when_token_missing(monkeypatch):
     """When internal_api_token is unset, gate returns False (do not fire).
 
     Closed-default behavior is intentional: an unreachable gate must not let a
-    job through.
+    job through. The creator re-check is stubbed to allow, so the reservation
+    gate is the only thing that can skip the job; the pinned error text proves
+    it was this gate and not the creator re-check (which also fails closed
+    without a token).
     """
+    _patch_creator_authorized(monkeypatch, allowed=True)
     async with TestSessionLocal() as db:
         now = datetime.now(timezone.utc)
         reservation_id = uuid.uuid4()
@@ -477,13 +481,23 @@ async def test_reservation_gate_closed_default_when_token_missing(monkeypatch):
         await fire_job(db, job, client)
         await db.refresh(job)
         assert job.status == "skipped"
+        assert job.error == "reservation not currently active"
         # No GET should even be attempted when token is unset.
         assert client.gets == []
+        # Nothing was sent to execution.
+        assert client.posts == []
 
 
 @pytest.mark.asyncio
 async def test_reservation_gate_closed_default_on_403(monkeypatch):
-    """A 403 from the reservations service must close the gate, not let through."""
+    """A 403 from the reservations service must close the gate, not let through.
+
+    The 403 body carries `is_active: True`, so only the status check can
+    refuse it: a gate that read the body of a non-200 answer would fire. The
+    creator re-check is stubbed to allow, so the pinned error text proves the
+    reservation gate is what skipped the job.
+    """
+    _patch_creator_authorized(monkeypatch, allowed=True)
     async with TestSessionLocal() as db:
         now = datetime.now(timezone.utc)
         reservation_id = uuid.uuid4()
@@ -493,13 +507,15 @@ async def test_reservation_gate_closed_default_on_403(monkeypatch):
             "app.services.apply_scheduler.settings.internal_api_token", "token", raising=False
         )
         client = FakeClient(
-            get_responses={
-                str(reservation_id): FakeResponse(403, {"detail": "Invalid internal token"})
-            },
+            get_responses={str(reservation_id): FakeResponse(403, {"is_active": True})},
         )
         await fire_job(db, job, client)
         await db.refresh(job)
         assert job.status == "skipped"
+        assert job.error == "reservation not currently active"
+        assert len(client.gets) == 1
+        # Nothing was sent to execution.
+        assert client.posts == []
 
 
 @pytest.mark.asyncio
