@@ -290,4 +290,31 @@ describe("BundledEdge", () => {
     expect(screen.queryByLabelText("Remove eth2 to 0/0/2")).not.toBeInTheDocument();
     expect(mockRemoveEdge).not.toHaveBeenCalled();
   });
+
+  // Issue #1066: a member the fork's draft check reported turns the whole
+  // bundle red (the any-member rule), and its row carries the reason on hover.
+  it("goes red when one member carries a server-reported reason, and lists it", () => {
+    renderBundled([
+      {
+        id: "e1",
+        data: { layer: "L1", source_port_name: "p1", target_port_name: "q1", pathValid: true, pathHopCount: 1 },
+      },
+      {
+        id: "e2",
+        data: {
+          layer: "L1",
+          source_port_name: "p2",
+          target_port_name: "q2",
+          pathValid: true,
+          pathHopCount: 1,
+          serverInvalidReason: "no_port_path",
+        },
+      },
+    ]);
+    expect(screen.getByTestId("edge").getAttribute("data-stroke")).toBe("#ef4444");
+    fireEvent.click(screen.getByRole("button", { name: /connections/ }));
+    const reason = screen.getByText("no cable path on the chosen ports");
+    expect(reason.getAttribute("title")).toMatch(/^The last draft check reported this line/);
+    expect(screen.getByText("1 hops")).toBeInTheDocument();
+  });
 });

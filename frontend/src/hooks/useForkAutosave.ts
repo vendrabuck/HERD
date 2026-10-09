@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { putForkCanvas } from "@/api/reservations";
+import type { ForkCanvasDraftResult } from "@/types/reservation.types";
 import type { CanvasData } from "@/types/topology.types";
 
 // The debounced fork-draft autosave interval. A draft PUT is cheap by design
@@ -61,9 +62,32 @@ export function useForkAutosave(params: {
   canvas: CanvasData;
   enabled: boolean;
   delay?: number;
+  // Issue #1066: called with a draft PUT's answer (its `invalid_edges` is the
+  // server's edge validation of the canvas it stored), but only for the
+  // newest PUT this hook sent, only while the canvas on screen is still the
+  // one that PUT carried, and never after unmount. An older answer arriving
+  // late, or an answer for a canvas since replaced or edited, is dropped:
+  // the next PUT will answer for what is on screen.
+  onDraftValidated?: (result: ForkCanvasDraftResult) => void;
 }): ForkAutosaveController {
-  const { reservationId, canvas, enabled, delay = FORK_AUTOSAVE_DELAY_MS } = params;
+  const { reservationId, canvas, enabled, delay = FORK_AUTOSAVE_DELAY_MS, onDraftValidated } =
+    params;
   const [status, setStatus] = useState<ForkAutosaveStatus>("idle");
+
+  // The newest PUT's sequence number and the latest callback, both read when
+  // a PUT settles (an async moment, outside any render).
+  const putSeqRef = useRef(0);
+  const mountedRef = useRef(true);
+  const onDraftValidatedRef = useRef(onDraftValidated);
+  useEffect(() => {
+    onDraftValidatedRef.current = onDraftValidated;
+  }, [onDraftValidated]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const signature = useMemo(() => canvasSignature(canvas), [canvas]);
 
@@ -81,6 +105,27 @@ export function useForkAutosave(params: {
   useEffect(() => {
     latestRef.current = { id: reservationId, signature, canvas };
   }, [reservationId, signature, canvas]);
+
+  // Sends one draft PUT and settles it: the baseline and status on success,
+  // the validation callback under the rules above. Shared by the debounce and
+  // flush(); the unmount flush stays fire-and-forget.
+  const putDraft = useCallback((target: { id: string; signature: string; canvas: CanvasData }) => {
+    const seq = ++putSeqRef.current;
+    setStatus("saving");
+    putForkCanvas(target.id, target.canvas)
+      .then((result) => {
+        lastSavedRef.current = target.signature;
+        setStatus("saved");
+        if (
+          mountedRef.current &&
+          seq === putSeqRef.current &&
+          target.signature === latestRef.current.signature
+        ) {
+          onDraftValidatedRef.current?.(result);
+        }
+      })
+      .catch(() => setStatus("error"));
+  }, []);
 
   // Seed the baseline when autosave becomes enabled, and clear it when disabled
   // (read-only, or leaving live-edit) so a later re-enable re-seeds cleanly.
@@ -111,13 +156,7 @@ export function useForkAutosave(params: {
       timeoutRef.current = null;
       const target = latestRef.current;
       if (!target.id) return;
-      setStatus("saving");
-      putForkCanvas(target.id, target.canvas)
-        .then(() => {
-          lastSavedRef.current = target.signature;
-          setStatus("saved");
-        })
-        .catch(() => setStatus("error"));
+      putDraft({ id: target.id, signature: target.signature, canvas: target.canvas });
     }, delay);
     timeoutRef.current = handle;
 
@@ -125,7 +164,7 @@ export function useForkAutosave(params: {
       clearTimeout(handle);
       if (timeoutRef.current === handle) timeoutRef.current = null;
     };
-  }, [signature, enabled, reservationId, delay]);
+  }, [signature, enabled, reservationId, delay, putDraft]);
 
   // Flush an unsaved draft on unmount (navigate-away). Fire-and-forget: cleanup
   // cannot await, but the loose PUT is idempotent and never appends a version.
@@ -155,14 +194,8 @@ export function useForkAutosave(params: {
     if (lastSavedRef.current === null) return; // baseline not seeded; nothing to flush
     if (target.signature === lastSavedRef.current) return; // no unsaved change
 
-    setStatus("saving");
-    putForkCanvas(target.id, target.canvas)
-      .then(() => {
-        lastSavedRef.current = target.signature;
-        setStatus("saved");
-      })
-      .catch(() => setStatus("error"));
-  }, []);
+    putDraft({ id: target.id, signature: target.signature, canvas: target.canvas });
+  }, [putDraft]);
 
   return { status, markClean, flush };
 }

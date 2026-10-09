@@ -50,6 +50,14 @@ import {
   type ResolvedRouteProblem,
 } from "@/lib/l3";
 import { diffForkCanvases } from "@/lib/forkDiff";
+import {
+  EMPTY_SERVER_EDGE_PROBLEMS,
+  applySkippedConstrainedEdges,
+  serverEdgeProblemsFrom,
+  stripServerEdgeProblem,
+  withServerEdgeProblems,
+  type ServerEdgeProblems,
+} from "@/lib/edgeProblems";
 import { useTopologyStore } from "@/stores/topologyStore";
 import { useForkAutosave } from "@/hooks/useForkAutosave";
 import { EquipmentBrowser } from "@/components/equipment-browser/EquipmentBrowser";
@@ -89,7 +97,11 @@ import { resolveEdgeStroke } from "@/components/topology-editor/edges/edgeStatus
 import { genId } from "@/lib/id";
 import type { Device, TopologyType } from "@/types/device.types";
 import type { AIGenerateResponse } from "@/types/ai.types";
-import type { ForkConflictDetail, ForkSaveResult } from "@/types/reservation.types";
+import type {
+  ForkCanvasDraftResult,
+  ForkConflictDetail,
+  ForkSaveResult,
+} from "@/types/reservation.types";
 import type {
   CanvasData,
   DeviceNodeData,
@@ -154,9 +166,12 @@ const DEVICE_LESS_NODE_MESSAGE =
 // ask for it to be cleared again (see groupEdgesForRender's doc comment), so
 // without this strip a save could bake a stale `selected: true` into
 // canvas_data and a later reload would render that edge pre-selected.
+// Issue #1066: `data.serverInvalidReason` is render-only too (the editor
+// overlays it on React Flow's copies, never the store); stripping it here as
+// well means no path can carry it into canvas_data.
 function stripTransientEdgeFields(edge: Edge<LayerEdgeData>): Edge<LayerEdgeData> {
   const { selected: _selected, animated: _animated, style: _style, zIndex: _zIndex, ...rest } = edge;
-  return rest;
+  return stripServerEdgeProblem(rest);
 }
 
 const LAYER_DESCRIPTIONS: Record<EdgeLayerType, string> = {
@@ -213,6 +228,24 @@ function TopologyEditorInner() {
   // the same node id), never left stale for an unrelated canvas.
   const [routeProblems, setRouteProblems] = useState<ResolvedRouteProblem[]>([]);
 
+  // Issue #1066: the fork's last draft check, canvas edge id to cabling's
+  // InvalidEdge reason, from the newest loose canvas PUT's `invalid_edges`
+  // (the autosave's onDraftValidated) and refreshed for `no_port_path` by a
+  // fork save's `constrained_edges_skipped`. It catches what the client
+  // checks cannot: a line on two cabled ports no cable joins to each other.
+  // Overlaid onto the render-only edge view (renderEdges), so such a line
+  // paints red with the reason until a later PUT says otherwise. Cleared at
+  // every wholesale canvas swap alongside routeProblems, for the same reason:
+  // an edge id from one canvas must never paint red on another. Not part of
+  // the commit gate (invalidEdges reads the store): the save itself still
+  // answers 200 for such a line and wires the rest (issue #1007). Known
+  // limit: opening the editor sends no PUT (the loaded canvas is the
+  // autosave baseline), so a line the draft already held is marked only
+  // after the first edit's PUT.
+  const [serverEdgeProblems, setServerEdgeProblems] = useState<ServerEdgeProblems>(
+    EMPTY_SERVER_EDGE_PROBLEMS,
+  );
+
   // An ARCHIVED fork is the frozen as-built record of an ended reservation: the
   // canvas renders read-only. This is the authoritative signal (the fork is
   // archived by the teardown paths), so mutations key off it directly. Kept
@@ -256,6 +289,8 @@ function TopologyEditorInner() {
   const loadCanvasAndClearRouteProblems = useCallback(
     (canvas: CanvasData) => {
       setRouteProblems([]);
+      // Issue #1066: the server's edge verdicts belong to the replaced canvas.
+      setServerEdgeProblems(EMPTY_SERVER_EDGE_PROBLEMS);
       loadCanvas(canvas);
     },
     [loadCanvas],
@@ -366,9 +401,12 @@ function TopologyEditorInner() {
   // ids, so selection/Delete on a bundle can be expanded before it reaches
   // the store (review item 3: an unexpanded change against a bundle id is a
   // no-op on the store, an undeletable, unselectable bundle).
+  // Issue #1066: the fork's server-reported invalid lines are overlaid first,
+  // on copies, so a bundle containing one goes red through BundledEdge's
+  // any-member rule and the store's edges never carry the reason.
   const { renderEdges, bundleMembers } = useMemo(
-    () => groupEdgesForRender(edges, isReadOnly),
-    [edges, isReadOnly],
+    () => groupEdgesForRender(withServerEdgeProblems(edges, serverEdgeProblems), isReadOnly),
+    [edges, serverEdgeProblems, isReadOnly],
   );
 
   // A select or remove EdgeChange targeting a bundle id is expanded into the
@@ -387,12 +425,17 @@ function TopologyEditorInner() {
   // no-ops harmlessly.
   const handleEdgesChange = useCallback(
     (changes: EdgeChange[]) => {
-      const expanded = changes.flatMap((change) => {
+      const expanded = changes.flatMap((change): EdgeChange[] => {
         if ("id" in change && bundleMembers.has(change.id)) {
           if (change.type === "select" || change.type === "remove") {
             return bundleMembers.get(change.id)!.map((id) => ({ ...change, id }));
           }
           return [change];
+        }
+        // Issue #1066: a replace carries a render copy, which may hold the
+        // render-only server reason; it must not reach the store.
+        if (change.type === "replace") {
+          return [{ ...change, item: stripServerEdgeProblem(change.item as Edge<LayerEdgeData>) }];
         }
         return [change];
       });
@@ -462,6 +505,21 @@ function TopologyEditorInner() {
     [edges],
   );
   const hasInvalidEdges = invalidEdges.length > 0;
+  // Issue #1066: lines only the server's draft check flags (a line the client
+  // already paints red is counted above). Shown in the live-edit bar; not a
+  // commit block.
+  const serverOnlyInvalidEdgeCount = useMemo(
+    () =>
+      serverEdgeProblems.size === 0
+        ? 0
+        : edges.filter(
+            (e) =>
+              serverEdgeProblems.has(e.id) &&
+              !isAnnotationEdge(e.data) &&
+              !resolveEdgeStroke(e.data).isInvalid,
+          ).length,
+    [edges, serverEdgeProblems],
+  );
 
   // ADR 0014 phase 2 (issue #34), E3: the Routing panel's gating rule (see
   // selectRoutingPanelNode's own doc comment). isReadOnly already covers both
@@ -628,6 +686,7 @@ function TopologyEditorInner() {
         // rendering, BEFORE loading (or clearing to empty) the new source's
         // canvas, on both branches below alike.
         setRouteProblems([]);
+        setServerEdgeProblems(EMPTY_SERVER_EDGE_PROBLEMS);
         const persisted = fork.canvas_data;
         const applyLoad =
           persisted && persisted.nodes
@@ -642,6 +701,7 @@ function TopologyEditorInner() {
     if (topology && !initializedRef.current) {
       initializedRef.current = true;
       setRouteProblems([]);
+      setServerEdgeProblems(EMPTY_SERVER_EDGE_PROBLEMS);
       if (topology.canvas_data) {
         void hydrateAndLoadCanvas(topology.canvas_data, loadCanvas);
       } else {
@@ -653,10 +713,14 @@ function TopologyEditorInner() {
   // Debounced fork-draft autosave: PUTs the loose canvas a couple of seconds
   // after edits pause and flushes on unmount. Enabled only for an editable
   // (non-archived) fork that has finished loading.
+  const handleDraftValidated = useCallback((result: ForkCanvasDraftResult) => {
+    setServerEdgeProblems(serverEdgeProblemsFrom(result.invalid_edges));
+  }, []);
   const autosave = useForkAutosave({
     reservationId: isLiveEdit ? reservationId : null,
     canvas: persistableCanvas,
     enabled: isLiveEdit && !isReadOnly && forkLoaded,
+    onDraftValidated: handleDraftValidated,
   });
   useEffect(() => {
     flushAutosaveRef.current = autosave.flush;
@@ -1287,6 +1351,12 @@ function TopologyEditorInner() {
       // applies to what is now on the fork (issue #34): clear rather than
       // leave a stale red badge/reason line from before this commit.
       setRouteProblems([]);
+      // Issue #1066: the save re-judged every port-constrained line on the
+      // canvas it just stored; its skipped list replaces the no_port_path
+      // verdicts (an edit since the last PUT may have fixed or broken one).
+      setServerEdgeProblems((current) =>
+        applySkippedConstrainedEdges(current, result.constrained_edges_skipped),
+      );
       // Issue #1007: a line the save could not wire on its chosen ports is
       // named in the toast by device name, and such a toast stays until
       // dismissed so the warning is not lost to the auto-hide timer.
@@ -1627,6 +1697,7 @@ function TopologyEditorInner() {
             <LiveEditBar
               deviceCount={allDeviceIds.length}
               invalidEdgeCount={invalidEdges.length}
+              serverInvalidEdgeCount={serverOnlyInvalidEdgeCount}
               isCommitting={isCommitting}
               forkLoaded={forkLoaded}
               autosaveStatus={autosave.status}

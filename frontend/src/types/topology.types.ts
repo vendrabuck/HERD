@@ -91,6 +91,11 @@ export interface LayerEdgeData extends Record<string, unknown> {
   // synthesized back in from the base side. Never persisted; the overlay
   // canvas is never autosaved (the editor locks while it is loaded).
   diffStatus?: "added" | "removed";
+  // Set only on the render copies the topology editor hands React Flow
+  // (issue #1066, lib/edgeProblems.ts withServerEdgeProblems): the reason the
+  // fork's last canvas PUT gave for this line in `invalid_edges`. Never in the
+  // store and never persisted (the editor's persist path strips it too).
+  serverInvalidReason?: string;
 }
 
 export type DeviceNode = Node<DeviceNodeData, "deviceNode">;

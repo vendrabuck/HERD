@@ -17,8 +17,13 @@ user. This test drives exactly that case through the live editor:
   holding both devices and the cabled line, and a reservation booked on it
   (polled to ACTIVE). The draft fork canvas is then written with a second line
   on port 2 of each device, which no cable joins.
-- UI-driven: open the live editor, click "Commit to reservation", and assert
-  the toast names the dropped line by device name and port.
+- UI-driven (issue #1066): open the live editor and move a node, which sends a
+  draft autosave PUT; its `invalid_edges` names the unjoined line, so the line
+  turns red before any save: the bundle's member list shows "no cable path on
+  the chosen ports" with the reason on hover, and the live-edit bar counts the
+  line without blocking Commit.
+- UI-driven: click "Commit to reservation", and assert the toast names the
+  dropped line by device name and port, and the line is still marked.
 - API read-back: the fork's saved connections hold only the cabled pair, and
   the user-facing validate route reports the second line as `no_port_path`
   (the pre-check that agrees with the save, issue #1047).
@@ -41,12 +46,30 @@ from .conftest import HOST_BASE_URL, driver_tarball, log_cleanup_failure, pw_api
 ACTIVE_POLL_SECONDS = 30
 WAIT_MS = 15_000
 NOT_WIRED_HEADING = "1 line not wired: no cable path on the chosen ports"
+NO_PORT_PATH_TEXT = "no cable path on the chosen ports"
+DRAFT_CHECK_NOTE = (
+    "1 line failed the last draft check; committing does not wire it. "
+    "Hover its label for the reason."
+)
 
 
 def _park_pointer(page) -> None:
     # react-hot-toast pauses a toast while the pointer is over the toaster
     # (bottom centre since issue #942); the left edge is clear of it.
     page.mouse.move(5, 400)
+
+
+def _move_node(page, node_id: str) -> None:
+    # Dragging a node changes its position, which the fork autosave treats as
+    # an edit: a draft PUT follows after the debounce.
+    box = page.locator(f'[data-id="{node_id}"]').bounding_box()
+    assert box is not None, f"node {node_id} has no bounding box"
+    x = box["x"] + box["width"] / 2
+    y = box["y"] + box["height"] / 2
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x + 40, y + 60, steps=8)
+    page.mouse.up()
 
 
 def _poll_active(page, reservation_id: str) -> str:
@@ -226,6 +249,37 @@ def test_fork_save_toast_names_a_line_on_unjoined_ports(pw_page):
         expect(pw_page.locator('[data-id="n-a"]')).to_be_visible(timeout=WAIT_MS)
         commit = pw_page.get_by_role("button", name="Commit to reservation")
         expect(commit).to_be_enabled(timeout=WAIT_MS)
+
+        # --- UI-driven (issue #1066): an edit sends a draft PUT whose answer
+        # marks the unjoined line red before the save.
+        with pw_page.expect_response(
+            lambda r: (
+                r.url.endswith(f"/reservations/{reservation_id}/fork/canvas")
+                and r.request.method == "PUT"
+            ),
+            timeout=WAIT_MS,
+        ) as put_info:
+            _move_node(pw_page, "n-b")
+        put_body = put_info.value.json()
+        assert [(e["edge_id"], e["reason"]) for e in put_body["invalid_edges"]] == [
+            ("e-unjoined", "no_port_path")
+        ], put_body
+        # Both lines share the device pair, so they render as one bundle.
+        bundle = pw_page.get_by_role("button", name="2 connections")
+        expect(bundle).to_be_visible(timeout=WAIT_MS)
+        expect(bundle).to_have_css("color", "rgb(239, 68, 68)", timeout=WAIT_MS)
+        bundle.click()
+        reason = pw_page.get_by_text(NO_PORT_PATH_TEXT, exact=True)
+        expect(reason).to_be_visible(timeout=WAIT_MS)
+        expect(reason).to_have_attribute(
+            "title",
+            f"The last draft check reported this line: {NO_PORT_PATH_TEXT}. "
+            "Committing does not wire it.",
+        )
+        expect(pw_page.get_by_text(DRAFT_CHECK_NOTE, exact=True)).to_be_visible()
+        # Not a commit block: the save still wires the cabled line.
+        expect(commit).to_be_enabled()
+
         with pw_page.expect_response(
             lambda r: (
                 r.url.endswith(f"/reservations/{reservation_id}/fork/save")
@@ -270,6 +324,10 @@ def test_fork_save_toast_names_a_line_on_unjoined_ports(pw_page):
         # The toast stays until dismissed when it carries a not-wired line.
         pw_page.get_by_role("button", name="Dismiss").first.click()
         expect(pw_page.get_by_text(NOT_WIRED_HEADING, exact=True)).to_have_count(0)
+
+        # The save skipped the line, so it stays marked after the commit.
+        expect(pw_page.get_by_text(NO_PORT_PATH_TEXT, exact=True)).to_be_visible()
+        expect(pw_page.get_by_text(DRAFT_CHECK_NOTE, exact=True)).to_be_visible()
     finally:
         if reservation_id:
             # DELETE cancels; the row stays in the list as CANCELLED.

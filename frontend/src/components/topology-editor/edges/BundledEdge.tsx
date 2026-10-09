@@ -18,7 +18,9 @@ const NEUTRAL_STROKE = "#4b5563";
  * (an uncabled port or an unreachable path, the same precedence LayerEdge
  * uses via resolveEdgeStroke), the whole bundle renders red; the expanded
  * list also shows each member's own status label so the signal survives
- * being folded into one visual line.
+ * being folded into one visual line. A member the server's draft check
+ * reported (issue #1066, `serverInvalidReason`) counts as invalid the same
+ * way, through resolveEdgeStroke.
  */
 export function BundledEdge({
   sourceX,
@@ -112,7 +114,11 @@ export function BundledEdge({
                       )}
                     </div>
                     {status.statusLabel && (
-                      <span className="text-[10px]" style={{ color: status.stroke }}>
+                      <span
+                        className="text-[10px]"
+                        style={{ color: status.stroke }}
+                        title={status.statusTitle}
+                      >
                         {status.statusLabel}
                       </span>
                     )}

@@ -71,4 +71,29 @@ describe("LayerEdge", () => {
     expect(screen.getByTestId("edge").getAttribute("data-stroke")).toBe("#3b82f6");
     expect(screen.getByText("L2")).toBeInTheDocument();
   });
+
+  // Issue #1066: the fork's draft check reported this line (render-only
+  // serverInvalidReason). It paints red with the reason, and the reason is on
+  // hover, even when the device pair itself is reachable.
+  it("renders red with the server's reason, above a reachable device pair", () => {
+    renderEdge({ layer: "L1", pathValid: true, pathHopCount: 1, serverInvalidReason: "no_port_path" });
+    expect(screen.getByTestId("edge").getAttribute("data-stroke")).toBe("#ef4444");
+    const label = screen.getByText("no cable path on the chosen ports");
+    expect(label.getAttribute("title")).toBe(
+      "The last draft check reported this line: no cable path on the chosen ports. Committing does not wire it.",
+    );
+    expect(screen.queryByText("1 hops")).not.toBeInTheDocument();
+  });
+
+  it("keeps the uncabled-port label first when a server reason is also present", () => {
+    renderEdge({ layer: "L1", portsCabled: false, serverInvalidReason: "no_port_path" });
+    expect(screen.getByText("uncabled port")).toBeInTheDocument();
+    expect(screen.getByText("uncabled port").getAttribute("title")).toBeNull();
+  });
+
+  it("shows an unknown server reason as its raw text rather than hiding it", () => {
+    renderEdge({ layer: "L2", serverInvalidReason: "some_new_reason" });
+    expect(screen.getByTestId("edge").getAttribute("data-stroke")).toBe("#ef4444");
+    expect(screen.getByText("some_new_reason")).toBeInTheDocument();
+  });
 });

@@ -5,25 +5,14 @@ import { isAxiosError } from "axios";
 import { Modal } from "@/components/ui/Modal";
 import { useAICommit } from "@/api/ai";
 import { aiCommitTopologyUnwireableDetail } from "@/lib/errors";
+// Plain-words rendering of cabling's InvalidEdge.reason vocabulary, shared
+// with the topology editor's edge labels (issue #1066).
+import { invalidEdgeReasonText } from "@/lib/edgeProblems";
 import type {
   AICommitRequest,
   AICommitResponse,
   AIGenerateResponse,
 } from "@/types/ai.types";
-
-// Plain-words rendering of cabling's InvalidEdge.reason vocabulary (see
-// AICommitTopologyUnwireableDetail); a reason this dialog has not seen
-// before falls back to the raw string rather than hiding it.
-const INVALID_EDGE_REASON_TEXT: Record<string, string> = {
-  no_path: "no cable path",
-  missing_device: "device not found",
-  element_to_element: "cannot connect two elements directly",
-  element_edge_no_port: "element has no available port",
-};
-
-function invalidEdgeReasonText(reason: string): string {
-  return INVALID_EDGE_REASON_TEXT[reason] ?? reason;
-}
 
 interface AICommitDialogProps {
   open: boolean;

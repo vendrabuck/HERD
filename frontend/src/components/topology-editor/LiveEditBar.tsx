@@ -3,6 +3,10 @@ import type { ForkAutosaveStatus } from "@/hooks/useForkAutosave";
 interface LiveEditBarProps {
   deviceCount: number;
   invalidEdgeCount: number;
+  // Issue #1066: lines the client checks pass but the fork's last draft check
+  // (the loose canvas PUT's invalid_edges) reported. Stated, never a commit
+  // block: the save answers 200 for them and wires everything else.
+  serverInvalidEdgeCount?: number;
   isCommitting: boolean;
   // False until the reservation's fork has been fetched and hydrated onto the
   // canvas (TopologyEditorPage's forkLoaded state). Committing before then
@@ -33,6 +37,7 @@ const AUTOSAVE_LABEL: Record<ForkAutosaveStatus, string> = {
 export function LiveEditBar({
   deviceCount,
   invalidEdgeCount,
+  serverInvalidEdgeCount = 0,
   isCommitting,
   forkLoaded,
   autosaveStatus,
@@ -76,6 +81,13 @@ export function LiveEditBar({
             <p className="text-xs text-red-600 mt-1">
               {invalidEdgeCount} edge{invalidEdgeCount !== 1 ? "s" : ""} have no
               physical path; fix or remove them before committing.
+            </p>
+          )}
+          {serverInvalidEdgeCount > 0 && (
+            <p className="text-xs text-red-600 mt-1">
+              {serverInvalidEdgeCount === 1
+                ? "1 line failed the last draft check; committing does not wire it. Hover its label for the reason."
+                : `${serverInvalidEdgeCount} lines failed the last draft check; committing does not wire them. Hover their labels for the reason.`}
             </p>
           )}
         </div>
