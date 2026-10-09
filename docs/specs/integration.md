@@ -885,10 +885,11 @@ others or the bell.
   Pinned by: `services/notifications/tests/test_email_dispatcher.py` (`test_send_smtp_builds_message_and_sends_plain`, `test_send_smtp_starttls_and_login_when_configured`, `test_send_smtp_tls_without_credentials_skips_login`, `test_send_runs_send_smtp_in_thread_when_configured`)
 - **INTEG-OUT-8.** The webhook channel POSTs compact JSON `{user_id, event_type, title,
   body, data, dedupe_key}` signed `X-HERD-Signature: sha256=<hex>` over the exact bytes
-  with `WEBHOOK_SIGNING_SECRET`, using its own copy of the signing function rather than
-  the shared one. Known gap, see #1079. \
-  Enforced in: `services/notifications/app/services/dispatchers/webhook.py` (`WebhookDispatcher`, `sign_body`) \
-  Pinned by: `services/notifications/tests/test_outbound_dispatchers.py` (`test_webhook_posts_signed_when_configured`, `test_sign_body_is_hmac_sha256_hex`)
+  with `WEBHOOK_SIGNING_SECRET`, through the shared `sign_body` and
+  `WEBHOOK_SIGNATURE_HEADER` that integration's registered webhooks also use (#1079), so
+  the two outbound paths sign identically. \
+  Enforced in: `services/notifications/app/services/dispatchers/webhook.py` (`WebhookDispatcher`); `services/common/herd_common/webhooks.py` (`sign_body`, `WEBHOOK_SIGNATURE_HEADER`) \
+  Pinned by: `services/notifications/tests/test_outbound_dispatchers.py` (`test_webhook_posts_signed_when_configured`, `test_sign_body_is_hmac_sha256_hex`, `test_webhook_channel_signs_through_the_shared_helper`, `test_webhook_channel_bytes_and_headers_unchanged_by_shared_signer`)
 - **INTEG-OUT-9.** The chat channel POSTs `{"text": "[<username>] <title>: <body>"}` to
   the one configured chat URL. \
   Enforced in: `services/notifications/app/services/dispatchers/chat.py` (`ChatDispatcher`) \
@@ -1036,8 +1037,6 @@ Two documents are incomplete against the code this specification describes, trac
   preference toggle; nothing records this as a decision.
 - #1078 (INTEG-HOOK-9): a webhook subscription cannot be paused; `is_active` has no
   write path.
-- #1079 (INTEG-OUT-8): the notifications webhook channel signs with a local copy of
-  `sign_body`.
 
 ### Limits by decision
 
