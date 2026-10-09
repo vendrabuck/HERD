@@ -52,9 +52,13 @@ def test_registers_cors_middleware():
         (",,", []),
     ],
 )
-def test_origin_parsing_matches_split_strip_filter_comprehension(cors_origins, expected):
-    # Same comprehension every service hand-wrote before extraction.
-    assert [o.strip() for o in cors_origins.split(",") if o.strip()] == expected
+def test_add_cors_middleware_parses_origins(cors_origins, expected):
+    # Drive the real helper and read the origin list it registered, so the
+    # split, strip, and empty-entry filter are the helper's, not this test's
+    # (issue #1141).
+    app = _build_app(cors_origins)
+    cors = next(m for m in app.user_middleware if m.cls is CORSMiddleware)
+    assert cors.kwargs["allow_origins"] == expected
 
 
 async def test_allowed_origin_receives_cors_headers():

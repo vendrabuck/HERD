@@ -1,7 +1,8 @@
 import uuid
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from app.config import settings
 from app.database import Base, get_db
 from app.dependencies import get_current_user_payload, require_admin
 from app.main import app
@@ -59,18 +60,33 @@ async def internal_client():
 
 
 async def _seed_connection(client, da_id, port_a, db_id, port_b):
-    resp = await client.post(
-        "/connections",
-        json={
-            "device_a_id": str(da_id),
-            "port_a": port_a,
-            "device_b_id": str(db_id),
-            "port_b": port_b,
-            "connection_type": "ethernet",
-        },
-    )
+    # A seed, not a guard test: disable the device-group guard explicitly. Left
+    # enabled, each seed asked inventory at http://inventory:8000 and got its 201
+    # only because the guard fails open when that name does not resolve (issue
+    # #1139); test_seed_connection_makes_no_inventory_call pins this.
+    with patch.object(settings, "enforce_device_group_boundaries", False):
+        resp = await client.post(
+            "/connections",
+            json={
+                "device_a_id": str(da_id),
+                "port_a": port_a,
+                "device_b_id": str(db_id),
+                "port_b": port_b,
+                "connection_type": "ethernet",
+            },
+        )
     assert resp.status_code == 201
     return resp.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_seed_connection_makes_no_inventory_call(admin_client):
+    """The seed helper never consults the device-group guard, so no seed
+    depends on inventory being unreachable (issue #1139)."""
+    fetch = AsyncMock(return_value=set())
+    with patch("app.services.connection_service.fetch_device_group_ids", fetch):
+        await _seed_connection(admin_client, uuid.uuid4(), "eth0", uuid.uuid4(), "eth1")
+    assert fetch.await_count == 0
 
 
 # ---- Unit tests for fabric_service functions ----

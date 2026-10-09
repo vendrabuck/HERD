@@ -519,7 +519,7 @@ presses Save and Restart. Login to HERD stays disabled until the file exists.
 - **OPS-CONFIG-14.** The restart skips `config`, `traefik`, `postgres`, `nats`, and
   `frontend`, and restarts each other service with a 30 second timeout. \
   Enforced in: `services/config/app/docker_ctl.py` (`SKIP_SERVICES`, `restart_services`) \
-  Pinned by: `services/config/tests/test_docker_ctl.py` (`test_restart_services_restarts_non_skipped`, `test_restart_services_skips_known_services`, `test_skip_services_contains_expected_names`)
+  Pinned by: `services/config/tests/test_docker_ctl.py` (`test_restart_services_restarts_non_skipped`, `test_restart_services_never_restarts_a_skipped_service`, `test_restart_services_skips_every_known_service`, `test_skip_services_is_exactly_the_expected_names`)
 - **OPS-CONFIG-15.** `POST /apply` with no `config.json` is 400 `No configuration to
   apply`. \
   Enforced in: `services/config/app/main.py` (`apply_config`) \

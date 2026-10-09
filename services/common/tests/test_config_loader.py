@@ -279,7 +279,19 @@ def test_source_database_url_yields_to_env_database_url(tmp_path, monkeypatch):
         json.dumps({"POSTGRES_USER": "herd", "POSTGRES_PASSWORD": "pw", "POSTGRES_DB": "herd"})
     )
     loader = _reload_loader(monkeypatch, str(config_file))
-    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@db.example.com:6432/herd")
 
-    values = loader.HerdJsonConfigSource(BaseSettings)()
+    # The settings class must declare database_url: the source emits only
+    # declared fields, so over a field-less class the result is empty whether
+    # or not the env guard exists (issue #1141).
+    class S(BaseSettings):
+        database_url: str = ""
+
+    # Control: with DATABASE_URL unset, the same class and file DO get the
+    # derived URL, so its absence below is the guard's doing.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    derived = loader.HerdJsonConfigSource(S)()
+    assert derived["database_url"] == "postgresql+asyncpg://herd:pw@postgres:5432/herd"
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@db.example.com:6432/herd")
+    values = loader.HerdJsonConfigSource(S)()
     assert "database_url" not in values

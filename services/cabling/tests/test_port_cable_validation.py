@@ -9,8 +9,10 @@ These tests exercise the backend data that drives that UI decision.
 """
 
 import uuid
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from app.config import settings
 from app.database import Base
 from app.schemas.connection import ConnectionCreate
 from app.services.connection_service import create_connection, list_connections
@@ -27,6 +29,35 @@ async def setup_db():
     yield
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
+
+
+@pytest.fixture(autouse=True)
+def _no_device_group_guard(monkeypatch):
+    """These creates seed cables for the cabled-port rule, not for the
+    device-group guard. With the guard at its default, each create asked
+    inventory and got through only because the guard fails open when inventory
+    cannot be reached (issue #1139); it is disabled explicitly here and pinned on
+    its own in test_service_unit.py."""
+    monkeypatch.setattr(settings, "enforce_device_group_boundaries", False)
+
+
+@pytest.mark.asyncio
+async def test_seed_create_makes_no_inventory_call():
+    fetch = AsyncMock(return_value=set())
+    with patch("app.services.connection_service.fetch_device_group_ids", fetch):
+        async with TestSession() as db:
+            await create_connection(
+                db,
+                ConnectionCreate(
+                    device_a_id=uuid.uuid4(),
+                    port_a="eth1",
+                    device_b_id=uuid.uuid4(),
+                    port_b="eth2",
+                    connection_type="L1",
+                ),
+                created_by="admin",
+            )
+    assert fetch.await_count == 0
 
 
 def _cabled_ports_for(device_id: uuid.UUID, connections) -> set[str]:
