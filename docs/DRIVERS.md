@@ -71,8 +71,11 @@ router.
 
 ## Package structure
 
-Driver packages are uploaded as `.zip` or `.tar.gz` archives (max 10 MB). The archive
-must contain the following at its root:
+Driver packages are uploaded as `.zip` or `.tar.gz` archives (max 10 MB). Extracted,
+an archive may hold at most 10,000 entries and declare at most 100 MiB uncompressed in
+total; the execution service checks both before it writes anything and refuses a package
+past either as a permanent load failure (`driver load failed: PackageLimitError`;
+issue #1115). The archive must contain the following at its root:
 
 ```
 driver.py             # REQUIRED: must contain a class named Driver
@@ -1638,7 +1641,7 @@ Update `driver.py`, rebuild the archive, upload via **Drivers > Edit > Replace f
 - **`TIMEOUT`**: your method took longer than `EXECUTION_TIMEOUT_SECONDS` (default 30). Raise it if the device is legitimately slow, or speed up the driver.
 - **`FAILED` with `Driver class not found`**: the package root doesn't contain a `driver.py` with a `Driver` class, or the class is missing one of the required methods for its connection type.
 - **`FAILED` with `error` reading `driver raised <ExceptionClassName>`**: the driver method raised (issue #840). The run row and any API response only ever carry the class name; the raw exception text is logged server-side on the execution service (`docker compose logs execution`, or `make logs`), keyed by the run id, and never stored or returned since it can carry hosts, paths, or credential-adjacent text. Check that log line for the actual message; most common cause is a credentials or network issue inside `login()`.
-- **`FAILED` with `error` reading `driver load failed: <ExceptionClassName>`**: loading the driver package itself failed (bad archive, a `driver.py` that does not parse, a missing `Driver` class or required method), not a method call. An import error inside the package is not a load failure: the load only parses `driver.py`, so it surfaces as `driver raised <ExceptionClassName>` on the first call. The class name is the wrapped cause's class when the load error chains one via `__cause__`, else the load error's own class. Same sanitizing rule as above: the full text is in the execution service log, keyed by the run id, never on the row or in an API response.
+- **`FAILED` with `error` reading `driver load failed: <ExceptionClassName>`**: loading the driver package itself failed (bad archive, an archive past the extraction ceilings (`PackageLimitError`), a `driver.py` that does not parse, a missing `Driver` class or required method), not a method call. An import error inside the package is not a load failure: the load only parses `driver.py`, so it surfaces as `driver raised <ExceptionClassName>` on the first call. The class name is the wrapped cause's class when the load error chains one via `__cause__`, else the load error's own class. Same sanitizing rule as above: the full text is in the execution service log, keyed by the run id, never on the row or in an API response.
 - **`FAILED` with `error` reading `execution failed: <ExceptionClassName>`**: something outside the driver failed while the run was in progress (for example a database error while recording the driver cache), so the run was closed as `FAILED` rather than left `PENDING` or `RUNNING`. The full text is in the execution service log line `Run <id> interrupted by <ExceptionClassName>`; retrying the run is safe.
 - **`FAILED` with `error` reading `driver process exited with status N`**: the driver's child process failed without reporting a structured exception (for example it called `sys.exit`, or died before the runner's handler ran). The child's raw output is never stored either; it is in the same execution service log line, keyed by the run id.
 - **Debugging locally**: run `python -c "from driver import Driver; d = Driver({...}); print(d.status())"` from the package dir. The execution service uses the same import path; if it works locally it will work in the sandbox.

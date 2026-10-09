@@ -1129,10 +1129,19 @@ is WIRE-DRIVER-7 in `provisioning-and-wiring.md`.
 - **CFG-LOAD-3.** The archive is extracted into a directory of the load's own,
   `DRIVER_CACHE_PATH/<driver id>-<random hex>`, never shared with another load: a
   `.zip`, or a `.tar.gz` or `.tgz` through the tar `data` filter; entries cannot land
-  outside the directory. Any other name, or a corrupt archive, raises
-  `DriverPackageError` naming only the cause's class, and the directory is removed. \
-  Enforced in: `services/execution/app/services/driver_loader.py` (`extract_driver_package`, `load_driver`) \
-  Pinned by: `services/execution/tests/test_driver_loader.py` (`test_extract_zip`, `test_extract_unsupported_format`); `services/execution/tests/test_driver_loader_advanced.py` (`test_extract_tar_gz`, `test_extract_tgz`); `services/execution/tests/test_driver_loader_security.py` (`test_zip_traversal_does_not_escape_destination`, `test_zip_absolute_path_entry_is_contained`, `test_zip_corrupt_archive_raises`, `test_tar_gz_corrupt_archive_raises`, `test_tar_gz_symlink_escape_is_blocked_by_data_filter`, `test_tar_gz_traversal_blocked_by_data_filter`); `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_extraction_failure`, `test_load_driver_extraction_failure_sanitizes_foreign_text`)
+  outside the directory. Before anything is written, the directory included, the
+  archive's entry count must be at most `MAX_ARCHIVE_ENTRIES` (10,000) and its declared
+  uncompressed total (the sum of the zip entries' `file_size`, or of the tar members'
+  `size`) at most `MAX_EXTRACTED_BYTES` (100 MiB); fixed constants, no setting. Past
+  either, extraction raises `PackageLimitError`
+  (`Driver package has more than 10000 entries; nothing was extracted` or
+  `Driver package declares more than 104857600 bytes uncompressed; nothing was extracted`),
+  and tar headers are read one at a time so a member past a ceiling is never
+  decompressed. The package validator extracts through the same function. Any other
+  name, a corrupt archive, or an archive past a ceiling raises `DriverPackageError`
+  naming only the cause's class, and the directory is removed. \
+  Enforced in: `services/execution/app/services/driver_loader.py` (`extract_driver_package`, `_check_archive_limits`, `MAX_ARCHIVE_ENTRIES`, `MAX_EXTRACTED_BYTES`, `PackageLimitError`, `load_driver`) \
+  Pinned by: `services/execution/tests/test_driver_loader.py` (`test_extract_zip`, `test_extract_unsupported_format`); `services/execution/tests/test_driver_loader_advanced.py` (`test_extract_tar_gz`, `test_extract_tgz`); `services/execution/tests/test_driver_loader_security.py` (`test_zip_traversal_does_not_escape_destination`, `test_zip_absolute_path_entry_is_contained`, `test_zip_corrupt_archive_raises`, `test_tar_gz_corrupt_archive_raises`, `test_tar_gz_symlink_escape_is_blocked_by_data_filter`, `test_tar_gz_traversal_blocked_by_data_filter`, `test_extraction_ceilings_are_the_documented_constants`, `test_zip_declaring_more_than_the_byte_ceiling_is_refused_before_writing`, `test_tar_gz_declaring_more_than_the_byte_ceiling_is_refused_before_writing`, `test_zip_with_more_than_the_entry_ceiling_is_refused_before_writing`, `test_tar_gz_with_more_than_the_entry_ceiling_is_refused_before_writing`, `test_archive_exactly_at_both_ceilings_extracts`, `test_archive_one_byte_over_the_ceiling_is_refused`, `test_archive_one_entry_over_the_ceiling_is_refused`); `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_extraction_failure`, `test_load_driver_extraction_failure_sanitizes_foreign_text`, `test_load_driver_refuses_archive_over_the_entry_ceiling`)
 - **CFG-LOAD-4.** The extracted package must hold `driver.py` with a plain top-level
   `class Driver` statement that provides every method `REQUIRED_METHODS` lists for the
   template's connection type (an unknown connection type fails). `load_driver` checks
@@ -1442,6 +1451,7 @@ None recorded.
   module, a class decorator, a metaclass, or `setattr(Driver, ...)`, so a method that
   could come from one of them is not refused at load; a missing method fails the
   sandboxed call instead (CFG-LOAD-4).
+- The extraction ceilings are constants, not settings (CFG-LOAD-3).
 - The validator reports a raised step's message, which a driver run never stores (the
   `_validation_error_text` docstring) (CFG-VAL-8).
 - The published-schema lookup fails open to the registry (ADR 0002 and the

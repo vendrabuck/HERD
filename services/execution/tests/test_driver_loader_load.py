@@ -391,6 +391,36 @@ async def test_load_driver_never_runs_driver_code_in_process(db, tmp_path):
     assert not flag.exists()
 
 
+@pytest.mark.asyncio
+async def test_load_driver_refuses_archive_over_the_entry_ceiling(db, tmp_path):
+    """An archive over an extraction ceiling is a permanent package error
+    naming the limit's class only, and nothing is left in the cache (issue #1115)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("driver.py", VALID_L1_DRIVER)
+        zf.writestr("extra.txt", "x")
+    driver_id = uuid.uuid4()
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+
+    with (
+        patch(
+            "app.services.driver_loader.download_driver_package",
+            new=AsyncMock(return_value=buf.getvalue()),
+        ),
+        patch("app.services.driver_loader.settings") as mock_settings,
+        patch("app.services.driver_loader.MAX_ARCHIVE_ENTRIES", 1),
+    ):
+        mock_settings.driver_cache_path = str(cache_root)
+        mock_settings.inventory_service_url = "http://test"
+        mock_settings.internal_api_token = "token"
+        with pytest.raises(DriverPackageError) as exc:
+            await load_driver(db, driver_id, "sha", "driver.zip", "Layer 1 Switch")
+
+    assert str(exc.value) == f"Failed to extract driver {driver_id}: PackageLimitError"
+    assert list(cache_root.iterdir()) == []
+
+
 # --- config_schema_json capture (issue #23) ---
 
 

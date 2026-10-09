@@ -327,7 +327,8 @@ wiring, so no driver call ran. The reason tells the two cases apart (issue #1002
   `ACTIVE`. Each failed load counts one attempt, so a lasting outage stops the auto
   retries at `WIRING_RETRY_MAX_ATTEMPTS`; a manual retry still works after that.
 - `recorded hop unresolvable: driver load failed: DriverPackageError`: the package is
-  broken (a corrupt archive, a missing or unparseable `driver.py`, a missing required
+  broken (a corrupt archive, an archive past the extraction ceilings of 10,000 entries
+  or 100 MiB uncompressed, a missing or unparseable `driver.py`, a missing required
   method). The load parses `driver.py` and never imports it, so a `driver.py` whose
   imports fail fails the driver call instead (`driver raised <ClassName>`). It is reported not retryable. Fix and re-upload the driver, then re-save the
   fork wiring. The execution log line `Wiring driver load failed for switch ...` carries

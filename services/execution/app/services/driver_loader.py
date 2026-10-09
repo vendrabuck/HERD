@@ -1,5 +1,6 @@
 """Driver package loader: download, extract, validate, and cache driver packages."""
 
+import io
 import json
 import logging
 import shutil
@@ -35,9 +36,10 @@ class DriverPackageError(Exception):
 
     Raised for structural defects that are fixed for a given SHA256 and so
     reproduce identically on every redelivery: a structurally invalid archive
-    (unsupported format, corrupt zip/tar), a missing driver.py, a driver.py
-    that does not parse, a missing Driver class, an unknown connection type, or
-    a Driver missing a method the connection type requires.
+    (unsupported format, corrupt zip/tar, over the extraction ceilings), a
+    missing driver.py, a driver.py that does not parse, a missing Driver class,
+    an unknown connection type, or a Driver missing a method the connection type
+    requires.
     Distinct from a download failure (inventory unreachable), which stays a
     transient RuntimeError. The dynamic-provisioning consumer maps this to a
     PermanentEventError so a broken recipe dead-letters on first delivery
@@ -110,19 +112,62 @@ async def download_driver_package(driver_id: uuid.UUID) -> bytes:
         return resp.content
 
 
+# Fixed ceilings on what extracting one driver package may write (issue #1115). The
+# upload is capped compressed (inventory's DRIVER_MAX_SIZE_BYTES), but a highly
+# compressible archive under that cap could still expand to fill the driver cache
+# volume every load shares. Real packages are a few files and kilobytes. Constants by
+# decision, not settings.
+MAX_EXTRACTED_BYTES = 100 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 10_000
+
+
+class PackageLimitError(ValueError):
+    """A driver archive declares more entries or more uncompressed bytes than the ceilings.
+
+    The message is HERD-authored and names the ceiling that was exceeded. load_driver
+    turns it into a DriverPackageError like any other extraction failure, so the row
+    text is ``driver load failed: PackageLimitError``.
+    """
+
+
+def _check_archive_limits(entries: int, total_bytes: int) -> None:
+    if entries > MAX_ARCHIVE_ENTRIES:
+        raise PackageLimitError(
+            f"Driver package has more than {MAX_ARCHIVE_ENTRIES} entries; nothing was extracted"
+        )
+    if total_bytes > MAX_EXTRACTED_BYTES:
+        raise PackageLimitError(
+            f"Driver package declares more than {MAX_EXTRACTED_BYTES} bytes uncompressed; "
+            "nothing was extracted"
+        )
+
+
 def extract_driver_package(package_bytes: bytes, filename: str, dest_dir: Path) -> None:
-    """Extract a .zip or .tar.gz driver package into dest_dir."""
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    """Extract a .zip or .tar.gz driver package into dest_dir.
 
+    The archive's entry count and declared uncompressed total are checked against
+    MAX_ARCHIVE_ENTRIES and MAX_EXTRACTED_BYTES before anything is written, dest_dir
+    included (issue #1115). A declared size also bounds what extraction writes: zipfile
+    reads no more than an entry's ``file_size`` and tarfile writes exactly a member's
+    ``size``.
+    """
     if filename.endswith(".zip"):
-        import io
-
         with zipfile.ZipFile(io.BytesIO(package_bytes)) as zf:
+            infos = zf.infolist()
+            _check_archive_limits(len(infos), sum(info.file_size for info in infos))
+            dest_dir.mkdir(parents=True, exist_ok=True)
             zf.extractall(dest_dir)
     elif filename.endswith(".tar.gz") or filename.endswith(".tgz"):
-        import io
-
         with tarfile.open(fileobj=io.BytesIO(package_bytes), mode="r:gz") as tf:
+            # Read member headers one at a time and stop at the first one past a
+            # ceiling, so a member declaring a huge size is never decompressed.
+            entries = 0
+            total_bytes = 0
+            for member in tf:
+                entries += 1
+                total_bytes += member.size
+                _check_archive_limits(entries, total_bytes)
+            dest_dir.mkdir(parents=True, exist_ok=True)
             tf.extractall(dest_dir, filter="data")
     else:
         raise ValueError(f"Unsupported package format: {filename}")
