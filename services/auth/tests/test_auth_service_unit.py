@@ -393,32 +393,50 @@ async def test_concurrent_logout_during_refresh_does_not_resurrect_session(monke
 
 
 @pytest.mark.asyncio
-async def test_concurrent_refresh_single_winner():
+async def test_concurrent_refresh_single_winner(monkeypatch):
     """Two refreshes racing the same token: exactly one succeeds, the other is
     refused, so a leaked/replayed token cannot mint two live sessions.
 
-    The first rotate consumes the token via the guarded UPDATE; the second sees
-    revoked == True and returns None.
+    Both refreshes must pass the fast-path read before either consumes the
+    token, or the second is refused by that read and the guarded UPDATE never
+    decides. So refresh A is paused at get_user_by_id (after its read, before
+    its consume) and refresh B runs to completion there in its own session. A's
+    guarded `revoked == False` UPDATE then matches zero rows and A returns None.
     """
+    import app.services.auth_service as auth_service
     from app.models.user import RefreshToken
     from sqlalchemy import func
     from sqlalchemy import select as sa_select
 
     async with TestSessionLocal() as db:
         user = await _create_test_user(db, "dup@test.com", "dupuser")
+        user_id = user.id
         _, raw_refresh = await create_tokens_for_user(db, user)
 
-        first = await rotate_refresh_token(db, raw_refresh)
-        second = await rotate_refresh_token(db, raw_refresh)
+        real_get_user_by_id = auth_service.get_user_by_id
+        results: dict[str, object] = {}
 
-        assert first is not None
-        assert second is None, "the same refresh token rotated twice"
+        async def interposing_get_user_by_id(session, requested_id):
+            # Run refresh B exactly once, inside refresh A's read-to-consume
+            # window; B's own lookup passes straight through.
+            if "b" not in results:
+                results["b"] = None
+                async with TestSessionLocal() as other:
+                    results["b"] = await rotate_refresh_token(other, raw_refresh)
+            return await real_get_user_by_id(session, requested_id)
 
-        # Exactly one live token exists (the rotation replacement), not two.
+        monkeypatch.setattr(auth_service, "get_user_by_id", interposing_get_user_by_id)
+
+        results["a"] = await rotate_refresh_token(db, raw_refresh)
+
+        assert results["b"] is not None, "the refresh inside the window should have won"
+        assert results["a"] is None, "the same refresh token rotated twice"
+
+        # Exactly one live token exists (the winner's replacement), not two.
         live = await db.execute(
             sa_select(func.count())
             .select_from(RefreshToken)
-            .where(RefreshToken.user_id == user.id, RefreshToken.revoked == False)  # noqa: E712
+            .where(RefreshToken.user_id == user_id, RefreshToken.revoked == False)  # noqa: E712
         )
         assert live.scalar() == 1
 

@@ -555,18 +555,23 @@ async def test_username_drift_collision_skips_repair_not_membership(db, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_missing_email_skip_suppresses_group_removals(db, monkeypatch):
+@pytest.mark.parametrize(
+    "reason",
+    [ldap_service.MEMBER_SKIP_MISSING_EMAIL, ldap_service.MEMBER_SKIP_MISSING_USERNAME],
+)
+async def test_unidentifiable_member_skip_suppresses_group_removals(db, monkeypatch, reason):
     group_id = await _mk_group(db)
     await _mk_mapping(db, group_id)
     existing = await _mk_user(db, 1)
     await _put_in_group(db, group_id, existing)
     # The directory still lists this exact member, but an attribute-level
-    # gap (e.g. an ACL change hiding mail) makes them unresolvable this
-    # pass; without suppression this existing member would be stripped.
+    # gap (e.g. an ACL change hiding mail or uid) makes them unresolvable
+    # this pass; without suppression this existing member would be stripped.
+    # Each reason is driven alone so that it, and nothing else, decides.
     _install_directory(
         monkeypatch,
         {_GROUP_DN: _entry([_dn(1)])},
-        {_dn(1): _skipped(ldap_service.MEMBER_SKIP_MISSING_EMAIL)},
+        {_dn(1): _skipped(reason)},
     )
 
     run = await ldap_sync_service.run_sync(db)
@@ -1105,12 +1110,6 @@ def test_tally_apply_to_writes_deactivation_counters_and_stays_non_degrading():
     tally.apply_to(run)
     assert run.users_deactivated == 1
     assert run.users_reactivated == 1
-
-
-def test_run_status_vocabulary_includes_aborted():
-    # A small, explicit pin: "aborted" is a real member of the status
-    # vocabulary the breaker can produce, not just a string typo'd once.
-    assert "aborted" in {"success", "partial", "aborted", "failed"}
 
 
 @pytest.mark.asyncio

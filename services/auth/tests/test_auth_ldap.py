@@ -115,13 +115,14 @@ async def test_ldap_login_bad_password(client, ldap_mode, fake_bind):
 @pytest.mark.asyncio
 async def test_local_mode_blocks_ldap_user(monkeypatch):
     # Default auth_method is local; an LDAP-sourced User must not authenticate
-    # against the local path even if someone happens to know a bcrypt-hash
-    # collision.
+    # against the local path even if the row carries a hash the password
+    # matches. The hash is real so that the auth_source check is the only thing
+    # that can refuse (with no hash, the missing-hash check refuses on its own).
     async with TestSessionLocal() as db:
         user = User(
             email="ldapuser@example.com",
             username="ldapuser",
-            hashed_password=None,
+            hashed_password=auth_service.get_password_hash("anything"),
             auth_source="ldap",
         )
         db.add(user)
