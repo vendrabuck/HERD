@@ -636,20 +636,34 @@ apply-job routes of sections 5 and 7.
   bad time on an unknown device is a 422. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`schedule_apply_job`) \
   Pinned by: none (#1100)
-- **CFG-JOB-4.** A `reservation_id`, when given, must answer reservations
-  `GET /internal/{id}` with 200 and `is_active` true, and the caller must own an active
-  reservation holding the device (`GET /internal/active`), both with the internal token
-  and 5 seconds; a 404, an inactive reservation, or no ownership is 422
-  `RESERVATION_MISMATCH_ERROR`, and anything else (no token, transport error, another
-  status, non-JSON, JSON that is not an object) is 503 `reservations service unreachable`.
-  Admins are checked too. \
-  Enforced in: `services/inventory/app/routers/apply_jobs.py` (`_validate_reservation_for_job`, `RESERVATION_MISMATCH_ERROR`) \
-  Pinned by: `services/inventory/tests/test_apply_jobs_reservation_owner.py` (`test_foreign_reservation_id_returns_422_and_writes_no_row`, `test_reservation_id_inactive_returns_422_and_writes_no_row`, `test_reservation_id_active_but_not_owned_by_caller_returns_422`, `test_reservation_id_valid_and_owned_schedules_successfully`, `test_reservation_id_validation_fails_closed_when_unreachable`, `test_reservation_id_answer_not_an_object_fails_closed_503`)
-- **CFG-JOB-5.** The two lookups do not prove that the named reservation itself holds
-  the device or belongs to the caller: a caller with one qualifying reservation can
-  name another active one. Known gap, see #1104. \
+- **CFG-JOB-4.** A `reservation_id`, when given, is checked after the authorization
+  check and the driver gate and before the dry-run gate, with two reads of reservations,
+  both with the internal token and 5 seconds: `GET /internal/{id}` must answer 200 with
+  `is_active` true (status `ACTIVE` inside its window, the judgement the scheduler
+  repeats at fire time, CFG-SCHED-5), and `GET /internal/by-device/{device_id}`, which
+  lists every reservation of any status and any owner that holds the device, must list
+  the id. A 404 or an inactive reservation is 422 without the second read; an id the
+  by-device list does not hold is 422. The 422 detail is `RESERVATION_MISMATCH_ERROR`
+  (`reservation_id must reference an active reservation you own that includes this device`)
+  for a non-admin and `RESERVATION_MISMATCH_ADMIN_ERROR`
+  (`reservation_id must reference an active reservation that includes this device`) for an
+  admin. No internal token, a transport error, any other status, a body that is not JSON,
+  a status body that is not an object, or a by-device body that is not a list of objects
+  with string `id` and `user_id` is 503 `RESERVATION_UNAVAILABLE_ERROR`
+  (`Could not verify the reservation; nothing was scheduled. Retry the request.`); the
+  reason goes to the log only. Nothing is written on any refusal. \
+  Enforced in: `services/inventory/app/routers/apply_jobs.py` (`_validate_reservation_for_job`, `_reservation_unavailable`, `RESERVATION_MISMATCH_ERROR`, `RESERVATION_MISMATCH_ADMIN_ERROR`, `RESERVATION_UNAVAILABLE_ERROR`) \
+  Pinned by: `services/inventory/tests/test_apply_jobs_reservation_scope.py` (`test_reservation_id_valid_and_owned_schedules_successfully`, `test_foreign_reservation_id_returns_422_and_writes_no_row`, `test_reservation_id_inactive_returns_422_and_writes_no_row`, `test_reservation_id_validation_fails_closed_when_unreachable`, `test_reservation_id_answer_not_an_object_fails_closed_503`, `test_reservation_check_without_an_internal_token_fails_closed`, `test_schedule_without_a_reservation_asks_nothing`)
+- **CFG-JOB-5.** The named reservation itself must hold the device and, for a non-admin,
+  belong to the caller (its `user_id` in the by-device list); an admin is exempt from
+  ownership only, not from activeness or the device. A non-admin who owns one active
+  reservation holding the device cannot name another of theirs that does not hold it, or
+  another user's that does (issue #1104). The check does not ask reservations
+  `GET /internal/active`: the named reservation being active, holding the device, and the
+  caller's implies that answer. The reservation-owner widening of CFG-AUTH-3 is a separate
+  check and is unchanged. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`_validate_reservation_for_job`) \
-  Pinned by: none
+  Pinned by: `services/inventory/tests/test_apply_jobs_reservation_scope.py` (`test_non_admin_cannot_name_their_own_reservation_without_the_device`, `test_reservation_id_active_but_not_owned_by_caller_returns_422`, `test_admin_may_name_another_users_active_reservation_holding_the_device`, `test_admin_cannot_name_an_active_reservation_without_the_device`)
 - **CFG-JOB-6.** A dry-run job needs the device's driver to declare `supports_dry_run`;
   otherwise 422
   `this driver does not advertise dry-run support; refuse to fire a dry-run that would hit the wire`. \
@@ -1319,13 +1333,13 @@ status.
 | 422 | `Device has no driver-defined connection_type; cannot validate config` | a version for a device without a driver connection type | CFG-VER-2 |
 | 422 | `device '<name>': config failed schema validation: <message>` and the other validator messages | a config the schema refuses | CFG-VER-3, CFG-SCHEMA-3, CFG-SCHEMA-4, CFG-EXEC-10 |
 | 422 | `scheduled_for must be in the future`, `scheduled_for must be within <N> days from now` | a bad schedule time | CFG-JOB-1, CFG-JOB-2 |
-| 422 | `reservation_id must reference an active reservation you own that includes this device` | a schedule naming a reservation that fails CFG-JOB-4 | CFG-JOB-4 |
+| 422 | `reservation_id must reference an active reservation you own that includes this device`, `reservation_id must reference an active reservation that includes this device` (an admin) | a schedule naming a reservation that fails CFG-JOB-4 or CFG-JOB-5 | CFG-JOB-4, CFG-JOB-5 |
 | 422 | `reservation_id must reference a reservation you own that includes this device`, `reservation_id must reference a reservation that includes this device` (an admin) | a `POST /execute` naming a reservation that fails CFG-EXEC-3 | CFG-EXEC-3 |
 | 422 | `this driver does not advertise dry-run support; refuse to fire a dry-run that would hit the wire` | a dry-run schedule for a driver without dry-run support | CFG-JOB-6 |
 | 422 | `internal execute is restricted to action='configure'; got '<action>'` | `POST /execute/internal` of another action | CFG-EXEC-6 |
 | 422 | `Only the Hypervisor connection type is supported for package validation`; `package_b64 is not valid base64`; `package exceeds the <N> byte validation limit`; `package is empty` | a validation request the route refuses | CFG-VAL-1, CFG-VAL-2 |
 | 500 | `Internal API token not configured` | an execution internal route when execution has no token | CFG-EXEC-6, CFG-VAL-1 |
-| 503 | `reservations service unreachable` | a schedule whose reservation cannot be checked | CFG-JOB-4 |
+| 503 | `Could not verify the reservation; nothing was scheduled. Retry the request.` | a schedule whose reservation cannot be checked | CFG-JOB-4 |
 | 503 | `reservations service unreachable while checking active reservations` and the two sibling details | a restore whose guard cannot be answered | CFG-VER-13 |
 | 503 | `Failed to fetch device: <reason>`, `Failed to fetch template: <reason>` (an upstream status, a class name, or a malformed-body note; never upstream text) | execution cannot read the device or template | CFG-EXEC-4 |
 | 503 | the visibility lookup's own detail (`inventory.md`) | a non-admin read whose visibility lookup fails | CFG-AUTH-5 |
@@ -1339,9 +1353,9 @@ status.
 |---|---|---|---|---|
 | inventory to acl | acl | `POST /check` with the caller's token, 5 s | explicit `manage` for a write | fail closed: counts as no grant, the reservation check still runs (CFG-AUTH-4) |
 | inventory to acl | acl | `POST /internal/check` (`X-Internal-Token`, 5 s) | fire-time `manage` | fail closed: counts as no grant (CFG-AUTH-7) |
-| inventory to reservations | reservations | `GET /internal/active?user_id&device_id` (`X-Internal-Token`, 5 s) | active-reservation ownership, at request and fire time | fail closed: counts as not owner (CFG-AUTH-4, CFG-AUTH-7); at schedule time a non-200 is 503 (CFG-JOB-4) |
+| inventory to reservations | reservations | `GET /internal/active?user_id&device_id` (`X-Internal-Token`, 5 s) | active-reservation ownership, at request and fire time | fail closed: counts as not owner (CFG-AUTH-4, CFG-AUTH-7) |
 | inventory to reservations | reservations | `GET /internal/{id}` (`X-Internal-Token`, 5 s) | a schedule's and a fire's reservation status | schedule: 503 (CFG-JOB-4); fire: the job is skipped (CFG-SCHED-5) |
-| inventory to reservations | reservations | `GET /internal/by-device/{id}` (`X-Internal-Token`, 5 s) | the restore guard | fail closed: 503 (CFG-VER-13) |
+| inventory to reservations | reservations | `GET /internal/by-device/{id}` (`X-Internal-Token`, 5 s) | the restore guard; a schedule's `reservation_id` | fail closed: 503 (CFG-VER-13, CFG-JOB-4) |
 | inventory to execution | execution | `GET /drivers/{id}/config-schema` (`X-Internal-Token`, 10 s) | the published schema | fail open: the registry applies (CFG-SCHEMA-7) |
 | inventory to execution | execution | `POST /execute` with the caller's token, 30 s | immediate apply | 200 with `status` `failed` and the error (CFG-APPLY-2) |
 | inventory to execution | execution | `POST /execute/internal` (`X-Internal-Token`, 30 s) | a scheduled job | the job is `failed` (CFG-SCHED-9) |
@@ -1381,7 +1395,7 @@ See [ENV_VARS.md](../ENV_VARS.md) for the rest.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/common/tests/test_device_config.py`, `services/common/tests/test_acl.py`; `services/inventory/tests/test_published_schema.py`, `test_apply_scheduler.py`; `services/execution/tests/test_driver_loader*.py`, `test_driver_sandbox*.py`, `test_runner.py`, `test_sandbox_isolation.py`, `test_dry_run.py`, `test_driver_transcript.py`, `test_config_schema_extraction.py`, `test_configure_capability_parity.py`, `test_package_validator.py`; frontend `frontend/src/test/components/DeviceConfigSection.test.tsx`, `ApplyJobsPanel.test.tsx`, `AIApplyConfirmModal.test.tsx`, `frontend/src/test/lib/errors.test.ts`, `frontend/src/test/api/deviceConfig.test.tsx`, `deviceConfigJobs.test.tsx` | SQLite in memory; the sandbox suites start real child processes |
-| Functional (through the service API) | `services/inventory/tests/test_device_configs.py`, `test_device_configs_rbac.py`, `test_apply_jobs_reservation_owner.py`, `test_confirm_dry_run.py`, `test_configure_capability_gate.py`, `test_device_config_restore_reservation_guard.py`, `test_device_read_visibility_gate.py`, `test_apply_jobs_internal_summary.py`, `test_router_edge_cases.py`; `services/execution/tests/test_router_endpoints.py`, `test_router_direct.py`, `test_api_endpoints.py`, `test_command_log*.py`, `test_config_schema_endpoint.py`, `test_configure_capability_gate.py`, `test_execution_service_edges.py` | acl, reservations, and execution are patched |
+| Functional (through the service API) | `services/inventory/tests/test_device_configs.py`, `test_device_configs_rbac.py`, `test_apply_jobs_reservation_owner.py`, `test_apply_jobs_reservation_scope.py`, `test_confirm_dry_run.py`, `test_configure_capability_gate.py`, `test_device_config_restore_reservation_guard.py`, `test_device_read_visibility_gate.py`, `test_apply_jobs_internal_summary.py`, `test_router_edge_cases.py`; `services/execution/tests/test_router_endpoints.py`, `test_router_direct.py`, `test_api_endpoints.py`, `test_command_log*.py`, `test_config_schema_endpoint.py`, `test_configure_capability_gate.py`, `test_execution_service_edges.py` | acl, reservations, and execution are patched |
 | Integration (running stack) | `tests/integration/test_execution_configure_gate.py`, `test_execution_result_gating.py`, `test_package_validation.py`; the NOS lab tiers under `tests/nos_lab/` (`test_frr_mgmt_driver_live.py` drives the Management driver's `configure`) | None for config versions, scheduled applies, the scheduler, dry runs, or the schema proxy |
 | Stress and load | None | `tests/load/locustfile.py` has no configuration task |
 | Browser end-to-end | `tests/e2e/test_flows_effects_playwright.py` (`test_device_config_version_cycle`: create, view, diff, restore), `tests/e2e/test_device_config_apply.py` (the section and panel render) | Apply, schedule, cancel, and the dry-run review are not driven in a browser; nightly and the gates only |
@@ -1397,9 +1411,7 @@ confirmed by reading only.
 
 ### Open defects
 
-- #1104 (CFG-JOB-5): a schedule's reservation check proves the caller owns some active
-  reservation holding the device, not that the named reservation holds it or belongs to
-  the caller.
+None recorded.
 
 Documentation that disagrees with the code is tracked in #1099; the unpinned rules below
 that should have a test are tracked in #1100.
@@ -1431,7 +1443,6 @@ that should have a test are tracked in #1100.
 - CFG-VER-10: the default restore description.
 - CFG-VER-15: no version delete; the cascade from the device.
 - CFG-JOB-3: the time checks run before the lookups.
-- CFG-JOB-5: the named reservation is not itself proven.
 - CFG-JOB-6: the schedule-time dry-run support check.
 - CFG-JOB-13: confirm repeats no schedule-time check.
 - CFG-DRY-4: the dry-run declaration is not verified.
