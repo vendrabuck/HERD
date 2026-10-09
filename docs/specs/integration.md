@@ -348,7 +348,7 @@ and read each one's delivery history.
 - **INTEG-HOOK-8.** Deleting a subscription deletes its delivery ledger rows through the
   `ON DELETE CASCADE` foreign key. \
   Enforced in: `services/integration/migrations/versions/0002_webhooks.py` (`CASCADE`); `services/integration/app/models/webhook.py` (`WebhookDelivery`) \
-  Pinned by: none (issue #1081)
+  Pinned by: `services/integration/tests/test_webhooks.py` (`test_subscription_delete_cascades_to_ledger_rows_when_fks_are_enforced`); `tests/integration/test_webhooks_flow.py` (`test_deleting_a_subscription_deletes_its_ledger_rows`)
 - **INTEG-HOOK-9.** A subscription is created with `is_active` true. `PATCH
   /webhooks/{webhook_id}` with the body `{"is_active": <boolean>}` pauses (false) or
   resumes (true) it and answers the subscription without its secret (#1078). Any other
@@ -411,14 +411,14 @@ and then recorded as dead without holding up anyone else.
   Pinned by: `services/integration/tests/test_webhooks.py` (`test_delivery_persistent_failure_retries_then_dead`, `test_delivery_connection_error_is_retried_then_dead`); `services/integration/tests/test_webhook_destinations.py` (`test_delivery_ledger_records_the_answer_status_only`, `test_delivery_ledger_records_the_exception_class_only`); `tests/integration/test_webhooks_flow.py` (`test_webhook_failure_dead_letters`)
 - **INTEG-HOOK-15.** A redelivered or republished event whose row is `dead` is POSTed
   again, and the same row is overwritten with the new outcome and a fresh attempt
-  count. \
+  count; `response_status` and `last_error` are those of the new pass. \
   Enforced in: `services/integration/app/services/delivery.py` (`deliver_one`, `_record`) \
-  Pinned by: none (issue #1081)
+  Pinned by: `services/integration/tests/test_webhooks.py` (`test_redelivered_event_with_dead_row_is_retried_and_overwrites_it`, `test_redelivered_event_with_dead_row_that_fails_again_resets_attempts`)
 - **INTEG-HOOK-16.** When a concurrent delivery of the same (subscription, event) wrote
   its row first, the losing insert is rolled back and logged, and the delivery returns
-  its own outcome without raising. \
+  its own outcome without raising; the ledger keeps the first writer's row. \
   Enforced in: `services/integration/app/services/delivery.py` (`_record`) \
-  Pinned by: none (issue #1081)
+  Pinned by: `services/integration/tests/test_webhooks.py` (`test_concurrent_delivery_that_wrote_first_wins_the_ledger_row`)
 - **INTEG-HOOK-17.** A redelivered or republished event whose row for a subscription is
   `delivered` is not POSTed again and gains no second row. \
   Enforced in: `services/integration/app/services/delivery.py` (`deliver_one`); `services/integration/app/models/webhook.py` (`uq_webhook_delivery_subscription_event`) \
@@ -834,7 +834,7 @@ they hear about; everything is on in the app by default and off everywhere else.
 - **INTEG-PREFS-5.** A write's `channels`, when present, replaces the stored channels as
   a whole object, so a channel the body omits is reset to its default rather than kept. \
   Enforced in: `services/notifications/app/routers/notifications.py` (`put_preferences`); `services/notifications/app/schemas/preferences.py` (`NotificationPreferencesUpdate`) \
-  Pinned by: none (issue #1081)
+  Pinned by: `services/notifications/tests/test_router.py` (`test_put_preferences_channels_replace_the_stored_object_whole`, `test_put_preferences_without_channels_keeps_stored_channels`)
 - **INTEG-PREFS-6.** Only a 200 from user-profile is cached, for
   `PREFERENCES_CACHE_TTL_SECONDS`. The defaults a failed consumer-side fetch answers
   (INTEG-PREFS-7) cover only the event that hit the failure; they are returned as
@@ -1040,7 +1040,7 @@ calls in notifications; the 20-item bell list and its 30 second unread poll.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/integration/tests/` (`test_facade.py`, `test_webhooks.py`, `test_webhook_destinations.py`, `test_webhooks_router_direct.py`, `test_nats_consumer.py`, `test_nats_consumer_lifecycle.py`, `test_nats_consumer_heartbeat.py`, `test_version.py`, `test_config_ack_wait.py`); `services/notifications/tests/` (every file); `tests/unit/test_consumer_heartbeat_wiring.py`; the frontend tests named in section 8.13 | In-memory SQLite, upstreams and NATS stubbed; SQLite does not enforce the cascade of INTEG-HOOK-8 |
+| Unit | `services/integration/tests/` (`test_facade.py`, `test_webhooks.py`, `test_webhook_destinations.py`, `test_webhooks_router_direct.py`, `test_nats_consumer.py`, `test_nats_consumer_lifecycle.py`, `test_nats_consumer_heartbeat.py`, `test_version.py`, `test_config_ack_wait.py`); `services/notifications/tests/` (every file); `tests/unit/test_consumer_heartbeat_wiring.py`; the frontend tests named in section 8.13 | In-memory SQLite, upstreams and NATS stubbed; SQLite enforces the cascade of INTEG-HOOK-8 only in the one test that turns on `PRAGMA foreign_keys` |
 | Functional (through the service API) | the httpx-against-the-app tests in `test_facade.py`, `test_webhooks.py`, and `services/notifications/tests/test_router.py`; `services/notifications/tests/test_functional_dispatch_path.py` | The facade's upstream is a stubbed transport |
 | Integration (running stack) | `tests/integration/test_v1_facade.py`, `test_webhooks_flow.py`, `test_webhook_slow_receiver_live.py`, `test_notifications_flow.py`, `test_notification_channels_flow.py`, `test_reservation_failed_notification.py`, `test_health_alerting_flow.py`, `test_nats_consumer_configs_live.py`; `tests/contract/test_openapi_schema.py` | The health tests publish the event straight to `HERD_HEALTH` with a fresh `event_id` rather than driving the poller. The slow-receiver test binds a peer consumer and flakes on a stack other sessions use |
 | Stress and load | `tests/load/locustfile.py` (`NotificationUser`: unread count, list, preference reads and writes) | Nothing loads the facade, webhook fan-out, or the consumers |
@@ -1059,6 +1059,7 @@ Two documents are incomplete against the code this specification describes, trac
 
 ### Open defects
 
+None at present.
 
 ### Limits by decision
 
@@ -1093,9 +1094,5 @@ Two documents are incomplete against the code this specification describes, trac
 - INTEG-FACADE-13: the error detail fallbacks for a body without `detail` or not JSON.
 - INTEG-VERSION-4: the published contract compared with the running service.
 - INTEG-HOOK-4: repeated event names stored once.
-- INTEG-HOOK-8: subscription delete cascades to its ledger rows.
-- INTEG-HOOK-15: a `dead` row retried and overwritten on redelivery.
-- INTEG-HOOK-16: the concurrent ledger insert race.
 - INTEG-HOOK-22: the ledger key with neither an event id nor metadata.
 - INTEG-INAPP-7: marking a read notification read again.
-- INTEG-PREFS-5: `channels` replaced whole on a write.

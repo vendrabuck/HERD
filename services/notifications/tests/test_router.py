@@ -319,6 +319,41 @@ async def _put_prefs_against(user_client, stored: dict, body: dict):
 
 
 @pytest.mark.asyncio
+async def test_put_preferences_channels_replace_the_stored_object_whole(user_client):
+    """INTEG-PREFS-5 (issue #1081): a body naming only some channels resets the rest.
+
+    `events` merges key by key, but `channels` is replaced as a whole object, so a
+    channel the body omits goes back to its default (in_app on, outbound off)
+    rather than keeping the stored value.
+    """
+    stored = {
+        "channels": {"in_app": False, "email": True, "chat": True, "webhook": True},
+        "events": {"reservation.completed": False},
+    }
+    resp, written = await _put_prefs_against(user_client, stored, {"channels": {"email": True}})
+    assert resp.status_code == 200
+    expected_channels = {"in_app": True, "email": True, "chat": False, "webhook": False}
+    assert resp.json()["channels"] == expected_channels
+    assert written["channels"] == expected_channels
+    # events untouched by a channels-only body: the stored opt-out survives.
+    assert written["events"]["reservation.completed"] is False
+
+
+@pytest.mark.asyncio
+async def test_put_preferences_without_channels_keeps_stored_channels(user_client):
+    stored = {
+        "channels": {"in_app": False, "email": True, "chat": True, "webhook": False},
+        "events": {},
+    }
+    resp, written = await _put_prefs_against(
+        user_client, stored, {"events": {"reservation.created": False}}
+    )
+    assert resp.status_code == 200
+    assert written["channels"] == stored["channels"]
+    assert written["events"]["reservation.created"] is False
+
+
+@pytest.mark.asyncio
 async def test_put_preferences_predating_failed_writes_it_on(user_client):
     """Issue #1077: a save over preferences that predate reservation.failed stores it on."""
     stored = {

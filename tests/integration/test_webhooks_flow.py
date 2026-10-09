@@ -35,6 +35,7 @@ import httpx
 import nats
 import pytest
 from _nats_helpers import fetch_reservation_event
+from conftest import _psql
 
 pytestmark = pytest.mark.asyncio
 
@@ -426,3 +427,42 @@ async def test_echo_sink_is_closed_through_the_gateway(admin_client, user_client
     assert as_admin.status_code == 200, as_admin.text
     # The refused POSTs were never counted.
     assert as_admin.json() == {"event_id": event_id, "count": 0}
+
+
+async def test_deleting_a_subscription_deletes_its_ledger_rows(admin_client):
+    """INTEG-HOOK-8 (issue #1081): the ledger's foreign key is ON DELETE CASCADE.
+
+    The SQLite unit backend does not enforce foreign keys by default, so this is
+    the check against the real Postgres schema. A ledger row is written straight
+    into integration.webhook_deliveries (no event needs to be delivered), then the
+    subscription is deleted through the API and the row must be gone.
+    """
+    webhook = await _register_webhook(admin_client, ECHO_TARGET)
+    webhook_id = webhook["id"]
+    probe_event = f"cascade-probe-{uuid.uuid4()}"
+    deleted = False
+    try:
+        inserted = _psql(
+            "INSERT INTO integration.webhook_deliveries "
+            "(id, subscription_id, event_id, event_type, status, attempts) VALUES "
+            f"(gen_random_uuid(), '{webhook_id}', '{probe_event}', 'reservation.created', "
+            "'dead', 1)"
+        )
+        assert inserted.returncode == 0, inserted.stderr
+        ledger = await admin_client.get(f"/v1/webhooks/{webhook_id}/deliveries")
+        assert [r["event_id"] for r in ledger.json()] == [probe_event]
+
+        resp = await admin_client.delete(f"/v1/webhooks/{webhook_id}")
+        assert resp.status_code == 204, resp.text
+        deleted = True
+
+        remaining = _psql(
+            "SELECT count(*) FROM integration.webhook_deliveries "
+            f"WHERE subscription_id = '{webhook_id}'",
+            tuples_only=True,
+        )
+        assert remaining.returncode == 0, remaining.stderr
+        assert remaining.stdout.strip() == "0"
+    finally:
+        if not deleted:
+            await admin_client.delete(f"/v1/webhooks/{webhook_id}")

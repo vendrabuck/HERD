@@ -626,3 +626,171 @@ async def test_delivery_loaded_before_a_pause_finishes_its_attempts(session_fact
     assert len(record["calls"]) == 2
     rows = await _deliveries(session_factory, target.id)
     assert [(r.event_id, r.status, r.attempts) for r in rows] == [("evt-inflight", "dead", 2)]
+
+
+# --- ledger paths without a test before issue #1081 ------------------------
+
+
+async def _seed_row(session_factory, subscription_id, event_id, *, status, attempts=3):
+    async with session_factory() as s:
+        row = WebhookDelivery(
+            subscription_id=subscription_id,
+            event_id=event_id,
+            event_type="reservation.created",
+            status=status,
+            attempts=attempts,
+            response_status=500,
+            last_error="upstream answered HTTP 500",
+        )
+        s.add(row)
+        await s.commit()
+        return row.id
+
+
+async def test_redelivered_event_with_dead_row_is_retried_and_overwrites_it(
+    session_factory, monkeypatch
+):
+    """INTEG-HOOK-15: a `dead` row does not block a redelivery; the event is POSTed
+    again and the SAME row takes the new outcome and a fresh attempt count."""
+    record = _install_fake_httpx(monkeypatch, status_code=200)
+    target = await _make_target(session_factory, ["reservation.created"])
+    row_id = await _seed_row(session_factory, target.id, "evt-dead", status="dead", attempts=3)
+
+    result = await deliver_one(
+        session_factory, target, b"{}", "evt-dead", "reservation.created", timeout=1.0, attempts=3
+    )
+    assert result == "delivered"
+    assert len(record["calls"]) == 1
+    rows = await _deliveries(session_factory, target.id)
+    assert len(rows) == 1
+    assert rows[0].id == row_id
+    assert rows[0].status == "delivered"
+    assert rows[0].attempts == 1
+    assert rows[0].response_status == 200
+    assert rows[0].last_error is None
+    assert rows[0].delivered_at is not None
+
+
+async def test_redelivered_event_with_dead_row_that_fails_again_resets_attempts(
+    session_factory, monkeypatch
+):
+    record = _install_fake_httpx(monkeypatch, raise_exc=httpx.ConnectError("refused"))
+    target = await _make_target(session_factory, ["reservation.created"])
+    row_id = await _seed_row(session_factory, target.id, "evt-dead2", status="dead", attempts=3)
+
+    result = await deliver_one(
+        session_factory,
+        target,
+        b"{}",
+        "evt-dead2",
+        "reservation.created",
+        timeout=1.0,
+        attempts=2,
+    )
+    assert result == "dead"
+    assert len(record["calls"]) == 2
+    rows = await _deliveries(session_factory, target.id)
+    assert [(r.id, r.status, r.attempts) for r in rows] == [(row_id, "dead", 2)]
+    # The previous answer's status is not carried over: this pass got no answer.
+    assert rows[0].response_status is None
+    assert rows[0].last_error == "delivery failed (ConnectError)"
+
+
+async def test_concurrent_delivery_that_wrote_first_wins_the_ledger_row(
+    session_factory, monkeypatch, caplog
+):
+    """INTEG-HOOK-16: when another delivery of the same (subscription, event) writes
+    its row while this one is POSTing, this insert loses on the unique index, is
+    rolled back and logged, and the delivery returns its own outcome without
+    raising. The ledger keeps the winner's row only."""
+    target = await _make_target(session_factory, ["reservation.created"])
+    record = {"calls": 0}
+
+    class _RacingClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, content=None, headers=None):
+            record["calls"] += 1
+            # The concurrent delivery records its row while this POST is in flight.
+            async with session_factory() as other:
+                other.add(
+                    WebhookDelivery(
+                        subscription_id=target.id,
+                        event_id="evt-race",
+                        event_type="reservation.created",
+                        status="dead",
+                        attempts=3,
+                        response_status=503,
+                        last_error="upstream answered HTTP 503",
+                    )
+                )
+                await other.commit()
+            return _FakeResponse(200)
+
+    monkeypatch.setattr(delivery_mod.httpx, "AsyncClient", _RacingClient)
+    caplog.set_level("INFO", logger=delivery_mod.logger.name)
+
+    result = await deliver_one(
+        session_factory, target, b"{}", "evt-race", "reservation.created", timeout=1.0, attempts=3
+    )
+
+    assert result == "delivered"
+    assert record["calls"] == 1
+    rows = await _deliveries(session_factory, target.id)
+    assert [(r.status, r.attempts, r.response_status) for r in rows] == [("dead", 3, 503)]
+    races = [r for r in caplog.records if "row race" in r.getMessage()]
+    assert len(races) == 1
+    assert races[0].levelname == "INFO"
+
+
+async def test_subscription_delete_cascades_to_ledger_rows_when_fks_are_enforced():
+    """INTEG-HOOK-8: the model declares ON DELETE CASCADE on the ledger's foreign
+    key. SQLite enforces it only with PRAGMA foreign_keys=ON, so this test turns
+    it on; the Postgres schema is checked by the live integration test
+    `test_deleting_a_subscription_deletes_its_ledger_rows`."""
+    from sqlalchemy import event, func, select
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _fk_on(dbapi_conn, _record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        target = await _make_target(factory, ["reservation.created"])
+        await _seed_row(factory, target.id, "evt-c1", status="delivered")
+        await _seed_row(factory, target.id, "evt-c2", status="dead")
+        other = await _make_target(factory, ["reservation.created"])
+        await _seed_row(factory, other.id, "evt-c1", status="delivered")
+
+        async with factory() as s:
+            await s.execute(
+                WebhookSubscription.__table__.delete().where(WebhookSubscription.id == target.id)
+            )
+            await s.commit()
+            remaining = (
+                await s.execute(
+                    select(WebhookDelivery.subscription_id, func.count()).group_by(
+                        WebhookDelivery.subscription_id
+                    )
+                )
+            ).all()
+        assert remaining == [(other.id, 1)]
+    finally:
+        await engine.dispose()
