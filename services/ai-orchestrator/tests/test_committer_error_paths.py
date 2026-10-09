@@ -565,18 +565,30 @@ async def test_commit_validate_non_json_200_body_fails_closed_with_503():
     assert rollback.called
 
 
-async def test_commit_validate_body_missing_valid_key_fails_closed_with_503():
-    """A 200 with valid JSON but no boolean `valid` key (e.g. an empty object)
-    is likewise an unanswerable question, not an implicit pass."""
-    with respx.mock(assert_all_called=True) as mock:
+@pytest.mark.parametrize(
+    "body",
+    [{}, {"valid": "true"}, {"valid": 1}, []],
+    ids=["empty-object", "string-true", "integer-one", "json-array"],
+)
+async def test_commit_validate_body_missing_valid_key_fails_closed_with_503(body):
+    """A 200 with valid JSON but no BOOLEAN `valid` key is likewise an
+    unanswerable question, not an implicit pass. The truthy non-booleans
+    ("true", 1) are the cases a presence or truthiness check would wave
+    through, and the array is not an object at all; each must stop before
+    the reservation is created and roll the topology back."""
+    with respx.mock(assert_all_called=False) as mock:
         mock.post(f"{CABLING_URL}/topologies").respond(201, json={"id": TOPOLOGY_ID})
         mock.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(200, json={})
-        mock.post(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}/validate").respond(200, json={})
+        mock.post(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}/validate").respond(200, json=body)
+        reserve = mock.post(f"{RESERVATIONS_URL}/").respond(201, json={"id": "res-1"})
         rollback = mock.delete(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").respond(204)
 
         with pytest.raises(CommitError) as exc:
             await committer.commit_proposal(_req(), "user-bearer", "user-1")
 
     assert exc.value.status_code == 503
-    assert "Failed to validate topology wireability" in exc.value.message
+    assert exc.value.message == (
+        "Failed to validate topology wireability: response had no boolean 'valid' field"
+    )
+    assert not reserve.called
     assert rollback.called

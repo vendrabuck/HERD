@@ -401,7 +401,7 @@ the pure search in `services/ai-orchestrator/app/services/resolver.py`, and cabl
   `Could not verify cabling paths; no topology was generated. Retry the request.`;
   reachability is never assumed. \
   Enforced in: `services/ai-orchestrator/app/services/cabling_client.py` (`fetch_pathfind_batch`, `CablingUnavailableError`); `services/ai-orchestrator/app/services/generator.py` (`CABLING_UNAVAILABLE_DETAIL`) \
-  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_503_when_pathfind_is_unavailable`)
+  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_503_when_pathfind_is_unavailable`, `test_pathfind_batch_fails_closed_when_cabling_cannot_answer`)
 - **AI-RESOLVE-7.** Pairs are sent in chunks of 200 per request with the caller's JWT and a
   20 second timeout. \
   Enforced in: `services/ai-orchestrator/app/services/cabling_client.py` (`PATHFIND_BATCH_CHUNK`, `PATHFIND_TIMEOUT_SECONDS`) \
@@ -763,7 +763,11 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
 - **AI-STREAM-5.** The deadline is one absolute instant that bounds only the wait for the
   next event; no frame is yielded inside a timeout scope, time spent handing a frame to a
   slow client counts against the deadline, and the inner generator is closed on every
-  exit. \
+  exit. The repository guard is an AST scan that sees a scope only when the `with` or
+  `async with` names `asyncio.timeout`, `asyncio.timeout_at`, or `asyncio.TaskGroup`
+  through the module name `asyncio`, or a bare `timeout`, `timeout_at`, or `TaskGroup`;
+  a module alias (`import asyncio as aio`) or a scope object bound to a variable before
+  the `with` passes it (#1145). \
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant_stream`, `_STREAM_END`) \
   Pinned by: `services/ai-orchestrator/tests/test_reservation_assistant_stream_deadline.py` (`test_stalled_client_with_landed_tool_still_gets_one_done`, `test_consumer_leaving_at_a_yield_closes_inner_generator_without_leaks`); `tests/unit/test_no_yield_inside_cancel_scope.py` (`test_no_service_app_yields_inside_a_cancel_scope`)
 - **AI-STREAM-6.** Any other exception, raised by the loop, by saving a finished turn (a

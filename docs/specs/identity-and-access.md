@@ -1169,8 +1169,10 @@ settings when the auth service starts.
   Pinned by: none
 
 **Out of scope.** The config service's own sign-in and the first-run settings page are
-in `operations-and-observability.md`; login stays disabled until the config service
-reports configured (IAM-UI-9).
+in `operations-and-observability.md`. The login form is disabled while the config
+service reports the system unconfigured (IAM-UI-9); while that status is still loading,
+or when the config service cannot be reached, the form stays enabled and a sign-in goes
+to auth as usual.
 
 ### 8.17 Sign-in in the browser
 

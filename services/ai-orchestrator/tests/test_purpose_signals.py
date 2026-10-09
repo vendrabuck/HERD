@@ -245,15 +245,25 @@ async def test_internal_signals_include_all_structured_signals(monkeypatch):
 @pytest.mark.asyncio
 async def test_internal_config_apply_jobs_never_include_config_contents(monkeypatch):
     """The job summary carries only names/counts (see the inventory-side
-    endpoint); this test pins that a raw config-shaped value never leaks
-    through the rendered block even if a caller-supplied name looked like one."""
+    endpoint); this test pins that the renderer reads only those two keys, so a
+    config-shaped value in the upstream body never leaks into the rendered
+    block. The stub answers with config-shaped extras on purpose: without them
+    there is nothing that could leak and the assertions below would be vacuous.
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if path.endswith(f"/devices/{DEVICE_A}/internal"):
             return httpx.Response(200, json=_device_payload(DEVICE_A, "sw-a"))
         if path.endswith(f"/devices/{DEVICE_A}/apply-jobs/internal"):
-            return httpx.Response(200, json={"count": 1, "names": ["apply-x"]})
+            return httpx.Response(
+                200,
+                json={
+                    "count": 1,
+                    "names": ["apply-x"],
+                    "jobs": [{"config": {"vlan": 10, "password": "secret-xyz"}}],
+                },
+            )
         if path.endswith(f"/internal/forks/{RESERVATION_ID}"):
             return httpx.Response(404, json={"detail": "no fork"})
         return httpx.Response(404, json={"detail": "unmocked"})
@@ -272,9 +282,10 @@ async def test_internal_config_apply_jobs_never_include_config_contents(monkeypa
         status="FAILED",
     )
     assert sig_module.SIGNAL_FORK not in used  # 404 -> no fork -> signal absent
-    assert "apply-x" in block
-    assert "secret" not in block.lower()
+    assert "secret-xyz" not in block
     assert "vlan" not in block.lower()
+    assert "DO-NOT-LEAK" not in block
+    assert f"  - device {DEVICE_A}: 1 jobs; names: apply-x" in block
 
 
 @pytest.mark.asyncio
@@ -429,6 +440,9 @@ async def test_transcripts_skip_tool_role_and_truncate_keeping_most_recent(monke
     assert sig_module.SIGNAL_TRANSCRIPTS in used
     assert "tool_result_should_never_appear" not in block
     assert "newest turn kept" in block
+    # The two kept lines total more than the 60-char budget, so the oldest
+    # turn must be the one dropped.
+    assert "oldest turn should be dropped" not in block
 
 
 # --- dedupe and bounded fan-out (issue #709) ---

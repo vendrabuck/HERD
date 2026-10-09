@@ -240,15 +240,16 @@ async def test_evict_to_budget_drops_oldest_pair_when_over_turn_cap():
             )
         await db.commit()
 
-        await conversation_repo.evict_to_budget(
+        dropped = await conversation_repo.evict_to_budget(
             db, conversation=conv, max_turns=5, token_budget=10_000_000
         )
         await db.commit()
 
         messages = await conversation_repo.load_messages(db, conversation_id=conv.id)
-    assert len(messages) <= 5
-    # Seed is pinned at position 0; the dropped pair was the earliest user/assistant.
-    assert messages[0].content[0].text == "seed"
+    # Seed is pinned at position 0; the four OLDEST pairs went, oldest first,
+    # and eviction stopped as soon as the cap was met (13 rows to 5).
+    assert [m.content[0].text for m in messages] == ["seed", "q4", "a4", "q5", "a5"]
+    assert dropped == 8
 
 
 @pytest.mark.asyncio

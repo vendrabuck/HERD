@@ -27,9 +27,9 @@ def test_extract_markdown():
 
 def test_extract_json_reformats_valid_json():
     result = extract_files([("data.json", b'{"b":2,"a":1}')])
-    # Should be pretty-printed and key-sorted
-    assert '"a": 1' in result[0].text
-    assert '"b": 2' in result[0].text
+    # Pretty-printed with a two-space indent and key-sorted: the exact text
+    # pins both, which a substring check on each key cannot.
+    assert result[0].text == '{\n  "a": 1,\n  "b": 2\n}'
 
 
 def test_extract_json_falls_back_to_raw_on_invalid():

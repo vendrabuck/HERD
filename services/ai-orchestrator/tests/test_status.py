@@ -200,16 +200,49 @@ async def test_status_construction_failure_reason_is_real_exception_class(
 async def test_status_construction_success_after_previous_failure_reports_ok(
     async_client, monkeypatch
 ):
+    """A cached construction failure is reported for its TTL window and no
+    longer: once the provider builds again and the window has passed, status
+    reports enabled, not degraded, with no stale reason."""
     monkeypatch.setattr(config_module.settings, "ai_provider", "anthropic")
     monkeypatch.setattr(config_module.settings, "ai_api_key", "sk-ant-real")
     monkeypatch.setattr(config_module.settings, "ai_base_url", "")
 
+    clock = {"now": 0.0}
+    cache = ai_client_module._ProviderConstructionCache(
+        ttl_seconds=30.0, clock=lambda: clock["now"]
+    )
+    monkeypatch.setattr(ai_client_module, "_provider_construction_cache", cache)
+
+    broken = {"on": True}
+    real_build = ai_client_module._build_provider
+
+    def _build():
+        if broken["on"]:
+            raise _MarkerError("construction failed")
+        return real_build()
+
+    monkeypatch.setattr(ai_client_module, "_build_provider", _build)
+
     async with async_client as client:
-        resp = await client.get("/status")
-    body = resp.json()
-    assert body["enabled"] is True
-    assert body["degraded"] is False
-    assert body["reason"] is None
+        failed = (await client.get("/status")).json()
+        assert failed["enabled"] is False
+        assert failed["degraded"] is True
+        assert failed["reason"] == "_MarkerError"
+
+        # The provider recovers, but inside the TTL window the cached failure
+        # still answers (the rate limit, issue #606).
+        broken["on"] = False
+        clock["now"] = 29.0
+        cached = (await client.get("/status")).json()
+        assert cached["degraded"] is True
+        assert cached["reason"] == "_MarkerError"
+
+        # Past the TTL the probe runs again and the recovery is reported.
+        clock["now"] = 31.0
+        recovered = (await client.get("/status")).json()
+    assert recovered["enabled"] is True
+    assert recovered["degraded"] is False
+    assert recovered["reason"] is None
 
 
 # --- construction cache (issue #606's rate-limit requirement) ---

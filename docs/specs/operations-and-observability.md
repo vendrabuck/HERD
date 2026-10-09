@@ -443,7 +443,10 @@ subclasses `HerdBaseSettings`. The full ladder for operators is in
 **What it does.** On a new stack the config service writes `config.json` from `.env`
 when every required value is there; otherwise an operator opens the config page from
 the login screen, signs in with the config password, fills in the required values, and
-presses Save and Restart. Login to HERD stays disabled until the file exists.
+presses Save and Restart. While the config service answers that the file does not
+exist, the HERD login form is disabled; while that answer is still loading, or when the
+config service cannot be reached, the form stays enabled and a sign-in goes to auth as
+usual (IAM-UI-9 in `identity-and-access.md`).
 
 **Surfaces.** `services/config/app/` (`main.py`, `config_store.py`, `auth.py`,
 `docker_ctl.py`, `config_schema.py`); `frontend/src/pages/ConfigPage.tsx` and
@@ -800,7 +803,11 @@ reaches a stack that keeps its broker state and no consumer drifts from the othe
   Pinned by: `services/common/tests/test_jetstream.py` (`test_keep_messages_alive_heartbeats_until_settled_or_cancelled`, `test_keep_messages_alive_swallows_in_progress_errors`, `test_process_batch_settles_in_order_and_survives_a_raising_message`, `test_process_batch_cancelled_mid_message_leaks_no_task`, `test_process_batch_cancel_while_stopping_heartbeat_still_propagates`)
 - **OPS-NATS-12.** Every module that calls `pull_subscribe(` runs its batches through
   `process_batch_with_heartbeat`, keeps no heartbeat of its own, and takes its ack wait
-  from settings and its heartbeat from `heartbeat_interval`. \
+  from settings and its heartbeat from `heartbeat_interval`. The repository guard is a
+  text scan: it requires the name `process_batch_with_heartbeat` and the two exact
+  assignment lines, and it refuses only a direct `keep_messages_alive(` call or
+  `create_task(_keep_messages_alive`, so a heartbeat started under an import alias or a
+  hand-rolled `in_progress` loop passes it (#1145). \
   Enforced in: `services/common/herd_common/jetstream.py` (`process_batch_with_heartbeat`, `heartbeat_interval`) \
   Pinned by: `tests/unit/test_consumer_heartbeat_wiring.py` (`test_consumer_modules_are_discovered`, `test_no_pull_consumer_module_keeps_an_inline_heartbeat`, `test_every_pull_consumer_module_uses_the_shared_heartbeat`, `test_every_pull_consumer_module_takes_ack_wait_and_heartbeat_from_one_source`)
 - **OPS-NATS-13.** Under `make prod` the broker stores JetStream state in the `nats-data`
