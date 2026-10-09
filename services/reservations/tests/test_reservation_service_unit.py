@@ -1657,11 +1657,23 @@ async def test_update_reservation_pending_provision_rejected():
 
 @pytest.mark.asyncio
 async def test_update_reservation_extend_non_exclusive_skips_conflict():
-    """Non-exclusive devices are not checked for conflicts during extension."""
+    """Non-exclusive devices are not checked for conflicts during extension.
+
+    A second reservation holds DEVICE_A over hours 4 to 6, inside the extended
+    window, so only the non-exclusive skip lets the extension through: were the
+    device conflict-checked, the PATCH would raise LookupError (issue #1136).
+    """
     from app.services.reservation_service import update_reservation
 
     async with TestSessionLocal() as db:
-        res = await _insert_reservation(db, device_ids=[DEVICE_A])
+        res = await _insert_reservation(db, device_ids=[DEVICE_A], start_offset_h=1, end_offset_h=3)
+        await _insert_reservation(
+            db,
+            device_ids=[DEVICE_A],
+            status=ReservationStatus.PENDING,
+            start_offset_h=4,
+            end_offset_h=6,
+        )
 
         new_end = NOW + timedelta(hours=5)
         non_excl_device = _make_device(DEVICE_A, exclusive=False)
@@ -1680,6 +1692,7 @@ async def test_update_reservation_extend_non_exclusive_skips_conflict():
                 token="fake",
             )
         assert result is not None
+        assert result.end_time.replace(tzinfo=None) == new_end.replace(tzinfo=None)
 
 
 @pytest.mark.asyncio

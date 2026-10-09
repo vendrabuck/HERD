@@ -378,10 +378,13 @@ async def test_reconcile_ignores_rows_already_suggested():
 @pytest.mark.asyncio
 async def test_reconcile_respects_batch_size(monkeypatch):
     monkeypatch.setattr(settings, "purpose_classify_batch_size", 2)
-    rids = [
-        await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=10 - i))
-        for i in range(3)
-    ]
+    # Inserted NEWEST first (issue #1136): an unordered SELECT returns insertion
+    # order, so only the ORDER BY on purpose_classify_requested_at can pick the
+    # two oldest rows. rids[i] was requested (10 - i) minutes ago.
+    by_index = {}
+    for i in reversed(range(3)):
+        by_index[i] = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=10 - i))
+    rids = [by_index[i] for i in range(3)]
     call = AsyncMock(return_value=_suggestion_response())
     with patch("app.services.purpose_service.call_service", call):
         await _run_purpose_classify_reconcile()
@@ -397,8 +400,10 @@ async def test_reconcile_respects_batch_size(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_reconcile_oldest_requested_first():
-    older = await _insert(purpose_classify_requested_at=NOW - timedelta(hours=2))
+    # Inserted newer first (issue #1136): an unordered SELECT returns insertion
+    # order, so only the ORDER BY can put the older request first.
     newer = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=1))
+    older = await _insert(purpose_classify_requested_at=NOW - timedelta(hours=2))
     seen_order: list[uuid.UUID] = []
 
     async def _fake_call(*args, **kwargs):

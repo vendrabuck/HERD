@@ -676,7 +676,7 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   `[old end, new end)` for the booked exclusive devices; when inventory cannot say which
   devices are exclusive, all are checked. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_conflict_on_extension`); `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_extend_fetch_failure_falls_back_to_exclusive`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_conflict_on_extension`, `test_update_reservation_inventory_unreachable_on_extension`); `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_extend_fetch_failure_falls_back_to_exclusive`); `services/reservations/tests/test_reservation_service_unit.py` (`test_update_reservation_extend_non_exclusive_skips_conflict`)
 - **RES-PATCH-5.** A new `end_time` is judged against `RESERVATION_MAX_DURATION_SECONDS`
   over the effective window (the stored `start_time` to the new end) by the same check
   create uses (RES-CREATE-5), with the same wording; exactly the cap passes, one second

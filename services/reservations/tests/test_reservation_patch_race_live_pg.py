@@ -197,7 +197,14 @@ def _device(device_id):
 
 
 class Inventory:
-    """Fake inventory status write; `flipping` is set once a RESERVED write began."""
+    """Fake inventory status write; `flipping` is set once a RESERVED write began.
+
+    A call is recorded when its simulated write LANDS, after the RESERVED sleep,
+    not when it starts (issue #1136). A cancel that releases the row's devices
+    while the flip sleeps is therefore recorded BEFORE the RESERVED write, so the
+    added device's last write is AVAILABLE only when the PATCH's own re-read and
+    revert put it back.
+    """
 
     def __init__(self, flip_seconds=0.0):
         self.calls: list[tuple[list[str], str]] = []
@@ -205,10 +212,10 @@ class Inventory:
         self.flip_seconds = flip_seconds
 
     async def __call__(self, ids, status, *, raise_on_failure=False, succeeded=None):
-        self.calls.append(([str(i) for i in ids], status))
         if status == "RESERVED":
             self.flipping.set()
             await asyncio.sleep(self.flip_seconds)
+        self.calls.append(([str(i) for i in ids], status))
         if succeeded is not None:
             succeeded.update(ids)
         return list(ids)
@@ -338,16 +345,27 @@ async def test_cancel_during_the_post_commit_flip_leaves_the_added_device_releas
     assert await _status_of(session_factory, rid) == CANCELLED
     assert len(await _events_for(sc, rid, "herd.reservations.updated")) == 1
     assert len(await _events_for(sc, rid, "herd.reservations.cancelled")) == 1
+    # The flip landed, after the cancel's release, and only the revert follows it.
+    assert ([str(added)], "RESERVED") in inv.calls
     assert inv.last_write_for(added) == "AVAILABLE"
     assert inv.last_write_for(held) == "AVAILABLE"
     assert await sc.foreign_snapshot() == foreign_before
 
 
 async def test_patch_versus_cancel_jittered_around_the_patch_commit(session_factory, scope):
-    """Fire the cancel at offsets straddling the PATCH's commit so the row lock is contended."""
+    """Fire the cancel at offsets straddling the PATCH's commit so the row lock is contended.
+
+    The first offset makes the PATCH lose and the last fires well after the PATCH
+    returned, so both branches run on every pass (issue #1136); the jittered ones
+    between them contend for the row lock and land inside the post-commit flip.
+    """
     sc, foreign_before = scope
     rng = random.Random(994)
-    offsets = [0.0] + [rng.uniform(SLOW_SECONDS - 0.05, SLOW_SECONDS + 0.05) for _ in range(7)]
+    offsets = (
+        [0.0]
+        + [rng.uniform(SLOW_SECONDS - 0.05, SLOW_SECONDS + 0.05) for _ in range(7)]
+        + [SLOW_SECONDS + 0.5]
+    )
     outcomes = set()
     for offset in offsets:
         rid, held, added, patched, cancelled, inv = await _patch_versus_cancel(
@@ -370,5 +388,5 @@ async def test_patch_versus_cancel_jittered_around_the_patch_commit(session_fact
             assert len(updated) == 1
             assert inv.last_write_for(added) == "AVAILABLE", f"offset {offset}"
         assert inv.last_write_for(held) == "AVAILABLE"
-    assert "patch_lost" in outcomes
+    assert outcomes == {"patch_lost", "patch_won"}
     assert await sc.foreign_snapshot() == foreign_before

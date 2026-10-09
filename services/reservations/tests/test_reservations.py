@@ -2938,11 +2938,22 @@ async def test_update_reservation_non_admin_invisible_device_rejected(non_admin_
 
 @pytest.mark.asyncio
 async def test_update_reservation_inventory_unreachable_on_extension(client):
-    """When inventory is unreachable during extension conflict check,
-    falls back to all exclusive."""
+    """When inventory is unreachable during the extension conflict check, every
+    device is treated as exclusive: a later booking of DEVICE_A inside the
+    extended window refuses the PATCH with 409 and the end time is unchanged
+    (issue #1136). Skipping the check on a failed fetch would answer 200."""
     resp = await _create_test_reservation(client, device_ids=[DEVICE_A])
     assert resp.status_code == 201
     res_id = resp.json()["id"]
+    old_end = resp.json()["end_time"]
+
+    later = await _create_test_reservation(
+        client,
+        device_ids=[DEVICE_A],
+        start_time=(NOW + timedelta(hours=4)).isoformat(),
+        end_time=(NOW + timedelta(hours=6)).isoformat(),
+    )
+    assert later.status_code == 201
 
     new_end = (NOW + timedelta(hours=5)).isoformat()
     with (
@@ -2951,9 +2962,15 @@ async def test_update_reservation_inventory_unreachable_on_extension(client):
             new=AsyncMock(side_effect=Exception("Connection refused")),
         ),
     ):
-        # Should still succeed (no conflict, falls back to treating all as exclusive)
         patch_resp = await client.patch(f"/{res_id}", json={"end_time": new_end})
-    assert patch_resp.status_code == 200
+    assert patch_resp.status_code == 409
+    detail = patch_resp.json()["detail"]
+    assert DEVICE_A in detail
+    assert detail.endswith("already reserved in the extended window")
+
+    get_resp = await client.get(f"/{res_id}")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["end_time"] == old_end
 
 
 @pytest.mark.asyncio
