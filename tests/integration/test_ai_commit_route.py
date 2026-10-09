@@ -146,7 +146,15 @@ async def test_commit_does_not_gate_on_ai_provider(
         reservation_id = result["reservation_id"]
         assert result["config_results"] == [], result
 
-        booked = await admin_client.get(f"/reservations/{reservation_id}")
+        # Read back with the committing user's own token: reservations' caller-token
+        # GET /{id} answers only the caller's own reservation, admins included.
+        async with httpx.AsyncClient(
+            base_url=base_url,
+            verify=False,
+            headers={"Authorization": f"Bearer {user_token}"},
+            timeout=30.0,
+        ) as uclient:
+            booked = await uclient.get(f"/reservations/{reservation_id}")
         assert booked.status_code == 200, booked.text
         assert booked.json()["device_ids"] == [visible_fresh_device["id"]], booked.json()
     finally:
