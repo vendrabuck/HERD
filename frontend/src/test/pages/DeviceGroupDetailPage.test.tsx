@@ -73,6 +73,7 @@ vi.mock("@/components/ui/Modal", () => ({
 }));
 
 import { server } from "../mocks/server";
+import { flushPending } from "../flushPending";
 import { DeviceGroupDetailPage } from "@/pages/admin/DeviceGroupDetailPage";
 import { useAuthStore } from "@/stores/authStore";
 
@@ -390,8 +391,12 @@ describe("DeviceGroupDetailPage", () => {
     const dialog = screen.getByRole("dialog", { name: "Delete Device Group" });
     fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
 
+    // Issue #1142: a delete the click started reaches the handler only after
+    // a few async hops, so let them run before asserting it never happened.
+    await flushPending();
     expect(deleteCalled).toBe(false);
     expect(navigateSpy).not.toHaveBeenCalled();
+    expect(dialog).not.toHaveAttribute("open");
   });
 
   it("surfaces the server detail message when delete fails", async () => {

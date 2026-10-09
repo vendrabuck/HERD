@@ -115,7 +115,10 @@ const PARENT_TOPOLOGY = {
 
 // Round-2 review G2 (issue #34): a second topology, distinct id, to prove
 // routeProblems does not survive an in-place id navigation (this page does
-// NOT remount on a param-only route change).
+// NOT remount on a param-only route change). Its L3 switch node deliberately
+// REUSES the node id "n1" that the stale problem names (issue #1142): the
+// badge overlay keys on node id, so only a reused id can show a stale problem
+// leaking across the navigation.
 const OTHER_TOPO_ID = "topo-l3-2";
 const OTHER_TOPOLOGY = {
   id: OTHER_TOPO_ID,
@@ -124,7 +127,11 @@ const OTHER_TOPOLOGY = {
   owner_name: "u",
   created_at: "2026-05-01T00:00:00Z",
   updated_at: "2026-05-01T00:00:00Z",
-  canvas_data: { nodes: [deviceNode("other-node", "d-other")], edges: [], selectedEdgeLayer: "L2" },
+  canvas_data: {
+    nodes: [l3Node("n1", "d-other", [route()])],
+    edges: [],
+    selectedEdgeLayer: "L2",
+  },
 };
 
 function baseHandlers() {
@@ -450,13 +457,18 @@ describe("TopologyEditorPage plain save: L3 routing intent (ADR 0014 phase 2, is
 
     fireEvent.click(screen.getByRole("button", { name: "go to other topology" }));
     await screen.findByText("Other topology");
-    await waitFor(() =>
-      expect(useTopologyStore.getState().nodes.map((n) => n.id)).toContain("other-node"),
-    );
+    // The store now holds the OTHER topology's "n1" (device d-other), not the
+    // parent's (device d-1).
+    await waitFor(() => {
+      const n1 = useTopologyStore.getState().nodes.find((n) => n.id === "n1");
+      expect((n1?.data as DeviceNodeData | undefined)?.device?.id).toBe("d-other");
+    });
 
-    const nodesAfterNav = rfProps.current?.nodes as Array<{ id: string; data: DeviceNodeData }>;
-    expect(nodesAfterNav.find((n) => n.id === "other-node")?.data.l3ValidationInvalid).not.toBe(
-      true,
-    );
+    await waitFor(() => {
+      const nodesAfterNav = rfProps.current?.nodes as Array<{ id: string; data: DeviceNodeData }>;
+      const n1 = nodesAfterNav.find((n) => n.id === "n1");
+      expect(n1?.data.device?.id).toBe("d-other");
+      expect(n1?.data.l3ValidationInvalid).not.toBe(true);
+    });
   });
 });

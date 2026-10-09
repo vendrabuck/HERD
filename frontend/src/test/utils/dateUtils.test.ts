@@ -13,16 +13,46 @@ describe("getDayRange", () => {
   });
 });
 
+// Issue #1142: these assert LOCAL calendar fields, never elapsed
+// milliseconds, so they hold in every time zone. A week that contains a DST
+// change is 167 or 169 hours long, so "end minus start equals 7 * 24 hours"
+// failed on any US-time-zone machine for the week below, while CI (UTC)
+// stayed green.
+function localFields(d: Date): [number, number, number, number, number, number] {
+  return [
+    d.getFullYear(),
+    d.getMonth(),
+    d.getDate(),
+    d.getHours(),
+    d.getMinutes(),
+    d.getSeconds(),
+  ];
+}
+
 describe("getWeekRange", () => {
-  it("starts on Sunday and spans 7 days", () => {
-    // March 14, 2026 is a Saturday
-    const date = new Date(2026, 2, 14);
+  it("starts at local midnight on the Sunday of the same week and ends 7 calendar days later", () => {
+    // March 14, 2026 is a Saturday. Its week (March 8 to 15) also contains the
+    // United States DST start (Sunday March 8).
+    const date = new Date(2026, 2, 14, 15, 30, 45);
     const { start, end } = getWeekRange(date);
     expect(start.getDay()).toBe(0); // Sunday
-    expect(start.getHours()).toBe(0);
-    const diffMs = end.getTime() - start.getTime();
-    const diffDays = diffMs / (1000 * 60 * 60 * 24);
-    expect(diffDays).toBe(7);
+    expect(localFields(start)).toEqual([2026, 2, 8, 0, 0, 0]);
+    expect(localFields(end)).toEqual([2026, 2, 15, 0, 0, 0]);
+    expect(end.getDay()).toBe(0);
+  });
+
+  it("a Sunday is the start of its own week", () => {
+    const date = new Date(2026, 2, 15, 23, 59, 59); // Sunday March 15, 2026
+    const { start, end } = getWeekRange(date);
+    expect(localFields(start)).toEqual([2026, 2, 15, 0, 0, 0]);
+    expect(localFields(end)).toEqual([2026, 2, 22, 0, 0, 0]);
+  });
+
+  it("crosses a month and year boundary", () => {
+    const date = new Date(2026, 0, 2); // Friday January 2, 2026
+    const { start, end } = getWeekRange(date);
+    expect(localFields(start)).toEqual([2025, 11, 28, 0, 0, 0]);
+    expect(localFields(end)).toEqual([2026, 0, 4, 0, 0, 0]);
   });
 });
 

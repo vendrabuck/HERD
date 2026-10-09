@@ -233,6 +233,19 @@ describe("RoutingPanel", () => {
       versionsQueryMock.mockReturnValue({ data: { items: [{ id: "cv-1" }] }, isFetching: false });
       seedStoreAndRender([]);
       expect(refetch).not.toHaveBeenCalled();
+      // Issue #1142: the mock ignores its arguments, so a canned refetch says
+      // nothing about laziness. The laziness IS the third argument: every
+      // render must hand the detail hook the latest version id with
+      // `enabled: false` (the hook's own honoring of that flag is pinned in
+      // src/test/api/deviceConfig.test.tsx).
+      expect(versionQueryMock).toHaveBeenCalledWith(
+        DEVICE_ID,
+        "cv-1",
+        expect.objectContaining({ enabled: false }),
+      );
+      for (const call of versionQueryMock.mock.calls) {
+        expect(call[2]).toEqual(expect.objectContaining({ enabled: false }));
+      }
     });
 
     it("replaces an empty table directly, with no confirm", async () => {

@@ -24,6 +24,7 @@ vi.mock("@/api/userProfile", () => ({
 }));
 
 import { server } from "../mocks/server";
+import { flushPending } from "../flushPending";
 import { InventoryPage } from "@/pages/InventoryPage";
 import { useAuthStore } from "@/stores/authStore";
 import { usePreferencesStore, _flushPendingPatchForTest } from "@/stores/preferencesStore";
@@ -698,9 +699,14 @@ describe("InventoryPage", () => {
       const dialog = findDialogByHeading("Delete devices");
       fireEvent.click(within(dialog).getByRole("button", { name: "Cancel", hidden: true }));
 
+      // Issue #1142: a delete the click started reaches the handler only after
+      // a few async hops, so let them run before asserting it never happened.
+      await flushPending();
       expect(deleteCalled).toBe(false);
       // Selection is preserved on cancel; only the dialog closes. Both rows
-      // were selected via the select-all checkbox at index 0.
+      // were selected via the select-all checkbox at index 0. Read after the
+      // flush, so a bulk delete that ran (and cleared the selection once its
+      // fan-out settled) would show here too.
       expect(screen.getByText("2 selected")).toBeInTheDocument();
     });
   });

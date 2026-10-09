@@ -37,6 +37,7 @@ vi.mock("@/stores/authStore", () => {
 });
 
 import { server } from "../mocks/server";
+import { flushPending } from "../flushPending";
 import { GrantsPage } from "@/pages/admin/GrantsPage";
 
 function renderWithProviders(node: ReactNode) {
@@ -332,10 +333,14 @@ describe("GrantsPage", () => {
     await within(table).findByText("Network Team");
 
     fireEvent.click(clickRowDelete());
-    const confirm = within(screen.getByRole("dialog", { name: /Delete Grant/i }));
-    fireEvent.click(confirm.getByRole("button", { name: "Cancel" }));
+    const confirmEl = screen.getByRole("dialog", { name: /Delete Grant/i });
+    fireEvent.click(within(confirmEl).getByRole("button", { name: "Cancel" }));
 
+    // Issue #1142: a delete the click started reaches the handler only after
+    // a few async hops, so let them run before asserting it never happened.
+    await flushPending();
     expect(deleteCalled).toBe(false);
+    expect(confirmEl).not.toHaveAttribute("open");
   });
 
   describe("filters", () => {
@@ -398,7 +403,12 @@ describe("GrantsPage", () => {
       ) as HTMLInputElement;
 
       fireEvent.change(filterResourceId, { target: { value: "not-a-full-uuid" } });
-      await waitFor(() => expect(requests[requests.length - 1]).toBeNull());
+      // Issue #1142: a waitFor on "last request is null" is already true from
+      // the initial load, so it proves nothing. Let any request the keystroke
+      // started arrive, then assert the partial id was never sent.
+      await flushPending();
+      expect(requests).not.toContain("not-a-full-uuid");
+      expect(requests[requests.length - 1]).toBeNull();
 
       fireEvent.change(filterResourceId, {
         target: { value: "11111111-1111-1111-1111-111111111111" },
@@ -406,6 +416,7 @@ describe("GrantsPage", () => {
       await waitFor(() =>
         expect(requests[requests.length - 1]).toBe("11111111-1111-1111-1111-111111111111"),
       );
+      expect(requests).not.toContain("not-a-full-uuid");
     });
 
     it("shows Clear filters only once a filter is active, and clearing resets every field", async () => {

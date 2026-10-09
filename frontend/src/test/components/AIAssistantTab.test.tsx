@@ -1,5 +1,5 @@
 import { http, HttpResponse } from "msw";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
 import type { ReactNode } from "react";
@@ -494,25 +494,52 @@ describe("AIAssistantChat (Branch 3, streaming)", () => {
   });
 
   it("shows a tool status while tools run and discards interim tokens", async () => {
+    // Issue #1142: the frames before `done` are served from a stream that
+    // pauses, so the LIVE streaming bubble can be read while the turn is still
+    // open. Read only after `done`, the bubble is gone and the final text is
+    // the server's answer, which says nothing about the interim reset.
+    const encoder = new TextEncoder();
+    const frame = (f: { event: string; data: unknown }) =>
+      encoder.encode(`event: ${f.event}\ndata: ${JSON.stringify(f.data)}\n\n`);
+    let releaseDone!: () => void;
+    const doneReleased = new Promise<void>((resolve) => {
+      releaseDone = resolve;
+    });
     server.use(
-      http.post(STREAM_URL, () =>
-        sseStream([
-          // Pre-tool narration that must be discarded when the tool status fires.
-          { event: "token", data: { text: "let me check" } },
-          {
-            event: "status",
-            data: { message: "running tools", tools: ["get_device"], interim: true },
+      http.post(STREAM_URL, () => {
+        const body = new ReadableStream<Uint8Array>({
+          async start(controller) {
+            // Pre-tool narration that must be discarded when the tool status fires.
+            controller.enqueue(frame({ event: "token", data: { text: "let me check" } }));
+            controller.enqueue(
+              frame({
+                event: "status",
+                data: { message: "running tools", tools: ["get_device"], interim: true },
+              }),
+            );
+            controller.enqueue(frame({ event: "token", data: { text: "with tools" } }));
+            await doneReleased;
+            controller.enqueue(
+              frame(
+                doneFrame({
+                  answer: "with tools",
+                  tool_calls: [
+                    {
+                      name: "get_device",
+                      arguments_summary: "device_id=abc",
+                      duration_ms: 23,
+                      error: null,
+                    },
+                  ],
+                  tool_iterations: 2,
+                }),
+              ),
+            );
+            controller.close();
           },
-          { event: "token", data: { text: "with tools" } },
-          doneFrame({
-            answer: "with tools",
-            tool_calls: [
-              { name: "get_device", arguments_summary: "device_id=abc", duration_ms: 23, error: null },
-            ],
-            tool_iterations: 2,
-          }),
-        ]),
-      ),
+        });
+        return new HttpResponse(body, { headers: { "Content-Type": "text/event-stream" } });
+      }),
     );
 
     renderWithProviders(<ChatHarness />);
@@ -521,7 +548,19 @@ describe("AIAssistantChat (Branch 3, streaming)", () => {
     });
     fireEvent.click(screen.getByTestId("assistant-send"));
 
-    await waitFor(() => expect(screen.getByText("with tools")).toBeInTheDocument());
+    // Mid-stream: the tool status shows, and the streaming text holds only the
+    // post-tool token; the interim narration was dropped, not prepended.
+    await waitFor(() =>
+      expect(screen.getByTestId("assistant-status")).toHaveTextContent("Running get_device..."),
+    );
+    const streaming = screen.getByTestId("assistant-streaming");
+    await waitFor(() => expect(within(streaming).getByText("with tools")).toBeInTheDocument());
+    expect(within(streaming).queryByText(/let me check/)).not.toBeInTheDocument();
+
+    releaseDone();
+
+    await waitFor(() => expect(screen.queryByTestId("assistant-streaming")).not.toBeInTheDocument());
+    expect(screen.getByText("with tools")).toBeInTheDocument();
     // The interim narration must not survive into the final bubble.
     expect(screen.queryByText("let me check")).not.toBeInTheDocument();
     expect(screen.getByText(/Tool calls \(1\)/)).toBeInTheDocument();

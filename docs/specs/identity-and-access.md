@@ -1189,7 +1189,7 @@ sends signed-out visitors to the login page, and keeps admin pages away from non
 - **IAM-UI-1.** The access and refresh tokens live in `localStorage`; the app counts as
   signed in whenever an access token is stored. \
   Enforced in: `frontend/src/stores/authStore.ts` (`useAuthStore`) \
-  Pinned by: `frontend/src/test/stores/authStore.test.ts` (`setTokens persists to localStorage and updates state`, `reads tokens from localStorage on initialization`, `clearAuth removes tokens and resets state`)
+  Pinned by: `frontend/src/test/stores/authStore.test.ts` (`setTokens persists to localStorage and updates state`, `reads tokens from localStorage on initialization`, `initializes with null tokens when localStorage is empty`, `is not authenticated from a stored refresh token alone`, `clearAuth removes tokens and resets state`)
 - **IAM-UI-2.** A 401 on any call other than login and refresh triggers one refresh;
   concurrent 401s wait for that single refresh and are retried with the new token, and
   each request is retried at most once. \

@@ -15,6 +15,7 @@ vi.mock("react-router-dom", async () => {
 });
 
 import { server } from "../mocks/server";
+import { flushPending } from "../flushPending";
 import { GroupsPage } from "@/pages/admin/GroupsPage";
 
 function renderWithProviders(node: ReactNode) {
@@ -145,6 +146,9 @@ describe("GroupsPage", () => {
     const dialog = within(screen.getByRole("dialog", { name: "Delete Group" }));
     fireEvent.click(dialog.getByRole("button", { name: "Cancel" }));
 
+    // Issue #1142: a delete the click started reaches the handler only after
+    // a few async hops, so let them run before asserting it never happened.
+    await flushPending();
     expect(deleteCalled).toBe(false);
     expect(screen.queryByRole("dialog", { name: "Delete Group" })).not.toBeInTheDocument();
   });
