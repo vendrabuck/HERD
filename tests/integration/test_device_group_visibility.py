@@ -274,12 +274,19 @@ async def test_non_admin_sees_only_dut_devices_in_granted_group(
             await admin_client.delete(f"/auth/users/{user_id}")
 
 
-async def test_admin_sees_all_devices_regardless_of_groups(admin_client):
-    """Admins bypass device-group visibility entirely."""
-    resp = await admin_client.get("/inventory/devices", params={"limit": 1})
+async def test_admin_sees_all_devices_regardless_of_groups(admin_client, user_client, fresh_device):
+    """Admins bypass device-group visibility entirely: a device in no device
+    group is listed for an admin and hidden from a non-admin (the control that
+    proves the device really is outside group visibility)."""
+    params = {"search": fresh_device["name"]}
+    resp = await admin_client.get("/inventory/devices", params=params)
     resp.raise_for_status()
-    # Admin should always see devices if any exist in the seeded environment.
-    assert resp.json()["total"] >= 0  # tolerate empty envs, but call must succeed
+    assert [d["id"] for d in resp.json()["items"]] == [fresh_device["id"]], resp.json()
+    assert resp.json()["total"] == 1, resp.json()
+
+    hidden = await user_client.get("/inventory/devices", params=params)
+    hidden.raise_for_status()
+    assert fresh_device["id"] not in [d["id"] for d in hidden.json()["items"]], hidden.json()
 
 
 async def _make_l3_switch(admin_client, suffix: str) -> tuple[str, str, str]:

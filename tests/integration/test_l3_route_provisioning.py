@@ -188,6 +188,21 @@ async def _poll_reservation_status(
     return False
 
 
+async def _poll_wiring_applied(
+    client, reservation_id: str, *, timeout: float = 30.0, interval: float = 0.5
+) -> dict | None:
+    """Poll wiring-status until execution has stamped last_applied_fork_version
+    (it does so at the end of handle_wiring_changed, after the L3 reconcile).
+    Returns the status, or None on timeout."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        resp = await client.get(f"/reservations/{reservation_id}/wiring-status")
+        if resp.status_code == 200 and resp.json().get("last_applied_fork_version") is not None:
+            return resp.json()
+        await asyncio.sleep(interval)
+    return None
+
+
 async def test_routes_configured_on_reservation_create_with_l3_switch(
     admin_client, l3_template, fresh_device
 ):
@@ -347,9 +362,19 @@ async def test_no_route_ops_when_l3_device_has_no_config(admin_client, l3_templa
             admin_client, [fresh_device["id"], switch["id"]], topology_id
         )
 
-        # Deterministic anchor: the reservation still activates.
+        # The reservation still activates.
         assert await _poll_reservation_status(admin_client, reservation["id"], "ACTIVE"), (
             "reservation never became ACTIVE"
+        )
+        # Execution-side anchor (issue #1147): ACTIVE is written by the create
+        # POST itself, before execution has seen the activation's wiring_changed.
+        # handle_wiring_changed stamps last_applied_fork_version only AFTER the L3
+        # reconcile ran, so a stamped version proves the reconcile is done and the
+        # runs read below is not vacuous.
+        wiring = await _poll_wiring_applied(admin_client, reservation["id"])
+        assert wiring is not None, "execution never applied the activation's wiring_changed"
+        assert [c for c in wiring["connections"] if c["layer"] == "l3"] == [], (
+            f"an unconfigured switch must record no route pin: {wiring}"
         )
 
         resp = await admin_client.get(

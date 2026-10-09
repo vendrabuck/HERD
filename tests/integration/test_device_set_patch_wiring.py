@@ -201,6 +201,7 @@ async def _poll_runs(
     return matched
 
 
+@pytest.mark.timeout(90)
 async def test_patch_add_wires_nothing_until_fork_save_and_remove_releases(
     admin_client, patch_l1_template, fresh_devices
 ):
@@ -237,6 +238,28 @@ async def test_patch_add_wires_nothing_until_fork_save_and_remove_releases(
         )
         assert resp.status_code == 200, resp.text
         assert sorted(resp.json()["device_ids"]) == sorted([dut_a["id"], dut_b["id"]])
+
+        # Ordering anchor BEFORE the save (issue #1147): a PATCH that wrongly wired
+        # the pair would leave it ACTIVE, the save would then skip it as already
+        # built, and the one-connect count below would still hold. So book a later
+        # wired reservation on the same switch, wait for its connect (the consumer
+        # handles the stream in order, so the PATCH's reservation.updated has been
+        # consumed), and read that this reservation has wired nothing yet.
+        dut_d, dut_e = await fresh_devices(2)
+        connections.append(await _connect(admin_client, dut_d["id"], switch["id"], "p4"))
+        connections.append(await _connect(admin_client, dut_e["id"], switch["id"], "p5"))
+        topo_anchor = await _create_topology(
+            admin_client, _canvas([dut_d["id"], dut_e["id"]], [(dut_d["id"], dut_e["id"])])
+        )
+        topology_ids.append(topo_anchor)
+        anchor = await _reserve(admin_client, [dut_d["id"], dut_e["id"]], topo_anchor)
+        reservations.append(anchor)
+        assert await _poll_runs(admin_client, anchor["id"], "connect_ports"), (
+            "the ordering anchor never connected; cannot prove the PATCH was consumed"
+        )
+        assert await _runs(admin_client, res_id, "connect_ports") == [], (
+            "the device-set PATCH must not wire an added device (ADR 0009 Decision 6)"
+        )
 
         # Draw the added device's edge on the fork and save: THIS is what wires it.
         save = await admin_client.post(

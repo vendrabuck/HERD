@@ -202,6 +202,7 @@ async def _publish_forged_cancelled(reservation_id: str, device_ids: list[str]) 
         await nc.close()
 
 
+@pytest.mark.timeout(90)
 async def test_forged_cancelled_event_for_an_active_reservation_is_ignored(
     admin_client, gate_switch_template, fresh_devices
 ):
@@ -214,6 +215,8 @@ async def test_forged_cancelled_event_for_an_active_reservation_is_ignored(
     connections = []
     topology_id = None
     reservation = None
+    anchor = None
+    anchor_topology_id = None
     try:
         connections.append(
             await _connect(admin_client, dut_a["id"], "eth0", switch["id"], "ge-0/0/1")
@@ -250,12 +253,34 @@ async def test_forged_cancelled_event_for_an_active_reservation_is_ignored(
         # published directly onto the stream, no reservations service involved.
         await _publish_forged_cancelled(res_id, [dut_a["id"], dut_b["id"], switch["id"]])
 
-        # No ordering anchor is possible here: a correctly-behaving consumer
-        # produces no observable effect from this event at all, so there is
-        # nothing to poll on. Give it a fixed window to have processed the
-        # forged event (well past one corroboration HTTP round trip) before
-        # asserting on the absence of any effect.
-        await asyncio.sleep(3.0)
+        # Ordering anchor (issue #1147), not a sleep: a correctly-behaving
+        # consumer produces no effect from the forged event, so book a LATER
+        # wired reservation on the same switch and wait for its wiring. The
+        # execution consumer handles the reservations stream one message at a
+        # time, in order, so once the anchor is wired the forged event has been
+        # consumed and the absence below is a fact.
+        dut_c, dut_d = await fresh_devices(2)
+        connections.append(
+            await _connect(admin_client, dut_c["id"], "eth0", switch["id"], "ge-0/0/3")
+        )
+        connections.append(
+            await _connect(admin_client, dut_d["id"], "eth0", switch["id"], "ge-0/0/4")
+        )
+        anchor_topology_id = await _create_topology(admin_client, _canvas(dut_c["id"], dut_d["id"]))
+        anchor = await _reserve(admin_client, [dut_c["id"], dut_d["id"]], anchor_topology_id)
+
+        async def _get_anchor_wiring():
+            resp = await admin_client.get(f"/reservations/{anchor['id']}/wiring-status")
+            resp.raise_for_status()
+            return resp.json()
+
+        anchor_wiring = await _poll(
+            _get_anchor_wiring,
+            lambda w: any(c["status"] == "ACTIVE" for c in w["connections"]),
+        )
+        assert any(c["status"] == "ACTIVE" for c in anchor_wiring["connections"]), (
+            "the ordering anchor was never wired; cannot prove the forged event was consumed"
+        )
 
         res_after_forgery = await _get_res()
         assert res_after_forgery["status"] == "ACTIVE", (
@@ -293,6 +318,10 @@ async def test_forged_cancelled_event_for_an_active_reservation_is_ignored(
             "a real cancel did not release the applied L1 connection"
         )
     finally:
+        if anchor:
+            await admin_client.delete(f"/reservations/{anchor['id']}")
+        if anchor_topology_id:
+            await delete_topology_checked(admin_client, anchor_topology_id)
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:

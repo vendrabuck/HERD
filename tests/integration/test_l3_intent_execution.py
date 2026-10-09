@@ -230,14 +230,25 @@ async def _poll_route_run(client, reservation_id, action, destination, *, timeou
     return None
 
 
-async def _no_route_run(client, reservation_id, action, *, window=6.0) -> bool:
-    """True if NO SUCCESS run of `action` appears within `window` seconds."""
-    deadline = asyncio.get_event_loop().time() + window
+async def _no_route_run_once_applied(
+    client, reservation_id, action, version, *, timeout=25.0
+) -> bool:
+    """True if NO SUCCESS run of `action` exists once execution applied fork `version`.
+
+    The anchor is execution-side (issue #1147): handle_wiring_changed stamps
+    last_applied_fork_version only after the L3 pass ran, so once the stamp reaches
+    `version` the reconcile that could have driven `action` is done and the absence
+    read below is a fact, not the end of a fixed window."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    applied = None
     while asyncio.get_event_loop().time() < deadline:
-        if await _runs(client, reservation_id, action):
-            return False
+        resp = await client.get(f"/reservations/{reservation_id}/wiring-status")
+        if resp.status_code == 200:
+            applied = resp.json().get("last_applied_fork_version")
+            if applied is not None and applied >= version:
+                return not await _runs(client, reservation_id, action)
         await asyncio.sleep(0.5)
-    return True
+    pytest.fail(f"execution never applied fork version {version} (last applied {applied})")
 
 
 async def _get_fork(client, reservation_id):
@@ -392,9 +403,9 @@ async def test_save_removing_all_intent_leaves_the_applied_set(
         )
         assert saved.status_code == 200, saved.text
 
-        assert await _no_route_run(admin_client, reservation_id, "remove_route"), (
-            "intent disappearing while the switch stays wired must not tear down its routes"
-        )
+        assert await _no_route_run_once_applied(
+            admin_client, reservation_id, "remove_route", saved.json()["version_number"]
+        ), "intent disappearing while the switch stays wired must not tear down its routes"
 
         fork = await _get_fork(admin_client, reservation_id)
         assert fork["l3_routes"] == [], "cabling's resolved intent for the device is gone"
@@ -925,9 +936,11 @@ async def test_vrf_route_on_a_non_declaring_driver_parks_l3_vrf_unsupported(
         assert await _poll_active(admin_client, reservation_id), "reservation never activated"
 
         # Nothing is ever driven for this switch.
-        assert await _no_route_run(admin_client, reservation_id, "configure_route"), (
-            "a VRF route was driven against a driver that never declared supports_vrf"
-        )
+        fork = await _get_fork(admin_client, reservation_id)
+        activation_version = max(v["version_number"] for v in fork["versions"])
+        assert await _no_route_run_once_applied(
+            admin_client, reservation_id, "configure_route", activation_version
+        ), "a VRF route was driven against a driver that never declared supports_vrf"
 
         deadline = asyncio.get_event_loop().time() + 25.0
         failed = []

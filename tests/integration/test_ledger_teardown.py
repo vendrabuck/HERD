@@ -247,25 +247,23 @@ async def _poll_wiring_conn(client, reservation_id, predicate, *, timeout=25.0):
 
 async def _poll_retry_l2(client, reservation_id, port, outcome, *, timeout=25.0):
     deadline = asyncio.get_event_loop().time() + timeout
-    last = None
     while asyncio.get_event_loop().time() < deadline:
         resp = await client.post(f"/reservations/{reservation_id}/wiring/retry")
         if resp.status_code == 200:
             for row in resp.json().get("results", []):
                 if row.get("layer") == "l2" and row.get("port") == port:
-                    last = row
                     if row.get("outcome") == outcome:
                         return row
         await asyncio.sleep(0.5)
-    return last
+    return None
 
 
 async def test_cancel_releases_all_three_ledgers(
     base_url, admin_token, admin_client, fresh_devices, teardown_drivers
 ):
     """A reservation wired through L1+L2+L3 switches via a fork save releases every ledger on
-    cancel: disconnect_ports, remove_from_vlan, and remove_route all fire, and the L1
-    wiring-status ends RELEASED with no FAILED residue."""
+    cancel: disconnect_ports, remove_from_vlan, and remove_route all fire, and every
+    wiring-status row (L1, L2, L3) ends RELEASED with no FAILED residue."""
     nats_err = await probe_nats()
     if nats_err:
         pytest.skip(nats_err)
@@ -318,17 +316,23 @@ async def test_cancel_releases_all_three_ledgers(
         assert await _poll_runs(admin_client, rid, "remove_from_vlan", 1), "L2 never left the VLAN"
         assert await _poll_runs(admin_client, rid, "remove_route", 1), "L3 routes never removed"
 
-        # The L1 wiring-status ends RELEASED with no FAILED residue.
-        released = await _poll_wiring_conn(
-            admin_client, rid, lambda c: c["status"] == "RELEASED", timeout=25.0
+        # Every ledger row, on all three layers, ends RELEASED with no FAILED residue.
+        # Polled to the END state (issue #1147): reading FAILED rows the instant the
+        # first L1 row is RELEASED raced the L2 and L3 passes of the same teardown.
+        def _all_released(status: dict) -> bool:
+            rows = status.get("connections", [])
+            return {c["layer"] for c in rows} == {"l1", "l2", "l3"} and all(
+                c["status"] == "RELEASED" for c in rows
+            )
+
+        deadline = asyncio.get_event_loop().time() + 25.0
+        status = await _wiring_status(admin_client, rid)
+        while not _all_released(status) and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.5)
+            status = await _wiring_status(admin_client, rid)
+        assert _all_released(status), (
+            f"every ledger row must end RELEASED after a clean teardown: {status}"
         )
-        assert released is not None, "the L1 cross-connect never reached RELEASED"
-        remaining = [
-            c
-            for c in (await _wiring_status(admin_client, rid))["connections"]
-            if c["status"] == "FAILED"
-        ]
-        assert remaining == [], "no FAILED wiring row should remain after a clean teardown"
     finally:
         if rid:
             await admin_client.delete(f"/reservations/{rid}")
@@ -382,7 +386,9 @@ async def test_cancel_teardown_failure_converges_on_terminal_retry(
         assert cancelled.status_code == 204, cancelled.text
 
         failed = await _poll_retry_l2(admin_client, rid, "1", "still_failed")
-        assert failed is not None and failed["layer"] == "l2", "no FAILED L2 release row surfaced"
+        assert failed is not None and failed["outcome"] == "still_failed", (
+            "no FAILED L2 release row surfaced as still_failed while the knob was armed"
+        )
 
         # Clear the knob and retry on the CANCELLED reservation: the release converges.
         cleared = await admin_client.put(

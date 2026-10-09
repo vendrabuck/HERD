@@ -271,12 +271,19 @@ async def test_webhook_target_must_be_public(admin_client):
 
 
 async def test_unknown_event_type_rejected(admin_client):
-    """The registration validator rejects an event type outside the known set."""
+    """The registration validator rejects an event type outside the known set.
+
+    The target is the allowlisted echo sink, so the event type is the ONLY thing
+    wrong with the request (issue #1147: example.invalid is itself refused with 422
+    since #1105, so a bare status check could not tell the two refusals apart)."""
     resp = await admin_client.post(
         "/v1/webhooks",
-        json={"target_url": "https://example.invalid/hook", "event_types": ["reservation.boom"]},
+        json={"target_url": ECHO_TARGET, "event_types": ["reservation.boom"]},
     )
     assert resp.status_code == 422, resp.text
+    errors = resp.json()["detail"]
+    assert [e["loc"][-1] for e in errors] == ["event_types"], errors
+    assert "unknown event_types ['reservation.boom']" in errors[0]["msg"], errors
 
 
 async def test_webhooks_require_admin(user_client):

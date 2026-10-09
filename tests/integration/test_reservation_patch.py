@@ -89,12 +89,19 @@ async def test_patch_removes_device_and_releases_it(admin_client, fresh_devices)
     duts = await fresh_devices(2)
 
     res = await _create_reservation(admin_client, [duts[0]["id"]], hours=1)
-    # Extend first to add the second device.
-    await admin_client.patch(
-        f"/reservations/{res['id']}",
-        json={"device_ids": [duts[0]["id"], duts[1]["id"]]},
-    )
     try:
+        # Extend first to add the second device, and prove it is RESERVED before the
+        # removal (issue #1147: an unchecked add left "AVAILABLE after removal" true
+        # even if the device had never been held).
+        added = await admin_client.patch(
+            f"/reservations/{res['id']}",
+            json={"device_ids": [duts[0]["id"], duts[1]["id"]]},
+        )
+        assert added.status_code == 200, added.text
+        held = await admin_client.get(f"/inventory/devices/{duts[1]['id']}")
+        held.raise_for_status()
+        assert held.json()["status"] == "RESERVED", held.json()
+
         resp = await admin_client.patch(
             f"/reservations/{res['id']}",
             json={"device_ids": [duts[0]["id"]]},

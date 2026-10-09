@@ -9,6 +9,8 @@ AI_API_KEY is the credential for the hosted Anthropic API; anthropic against a
 local Anthropic-compatible endpoint is configured on AI_BASE_URL alone.
 """
 
+import re
+
 import httpx
 import pytest
 from _ai_helpers import ai_provider_configured
@@ -93,7 +95,9 @@ async def test_ai_generate_succeeds_when_provider_configured(base_url, admin_tok
 
     assert resp.status_code != 503, f"503 despite enabled=true: {resp.text}"
 
-    if resp.status_code in (409, 502) and "available" in resp.text:
+    # The word "available" on its own (issue #1147): a bare substring check also
+    # matched "unavailable", so a provider outage answering 502 passed as success.
+    if resp.status_code in (409, 502) and re.search(r"(?<![A-Za-z])available", resp.text):
         return
 
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"

@@ -10,10 +10,12 @@ End-to-end over a running HERD stack with the checked-in mock L1 driver:
   disconnect_ports on the switch. Asserted through GET /execution/runs, the
   observable proxy for the l1_connection_assignments flip (the per-connection
   wiring-status endpoint is phase 4).
-- The frozen guard (Decision 7): after the reservation completes (teardown freezes
-  the wiring state), a directly-injected stale wiring_changed must not reconnect.
+- Ended reservations (Decision 7): after the reservation completes, a
+  directly-injected wiring_changed must not reconnect (the corroboration gate drops
+  it first; the frozen guard behind it is unit-pinned).
 - Replay idempotency (Decision 4): a stale wiring_changed (fork_version at or below
-  last-applied) injected after a save is a no-op, driving no additional switch op.
+  last-applied), delivered while the ledger disagrees with the intended set, is a
+  no-op, driving no switch op. Both read their absence after an ordering anchor.
 - The phase-4 per-connection surface (Decision 6): a fork-save build forced to fail via
   HERD_mock_fail_actions lands a FAILED row observable through the NEW user-facing
   GET /reservations/{id}/wiring-status; clearing the knob and hitting
@@ -50,6 +52,7 @@ import pytest
 
 from ._nats_helpers import fetch_events_for_reservation, probe_nats, publish_raw
 from ._topology_teardown import delete_topology_checked
+from .conftest import _psql
 
 pytestmark = pytest.mark.asyncio
 
@@ -715,6 +718,37 @@ async def _poll_wiring_version(client, reservation_id: str, version: int, timeou
     return False
 
 
+async def _book_ordering_anchor(
+    client, switch_id: str, fresh_devices, ports: tuple[str, str], cleanup: dict
+) -> None:
+    """Book a later wired reservation on the same switch and wait for its
+    activation connect_ports (issue #1147). The execution consumer handles the
+    reservations stream one message at a time, in order, so once this later
+    activation has been applied, every event published before it has been
+    consumed: an absence read after this is a fact, not a hope. Everything it
+    creates is appended to `cleanup` for the caller's finally block."""
+    dut_c, dut_d = await fresh_devices(2)
+    cleanup["connections"].append(await _connect(client, dut_c["id"], switch_id, ports[0]))
+    cleanup["connections"].append(await _connect(client, dut_d["id"], switch_id, ports[1]))
+    topology_id = await _create_topology(client, _canvas_edge(dut_c["id"], dut_d["id"]))
+    cleanup["topologies"].append(topology_id)
+    anchor = await _reserve(client, [dut_c["id"], dut_d["id"]], topology_id)
+    cleanup["reservations"].append(anchor["id"])
+    assert await _poll_run_count_at_least(client, anchor["id"], "connect_ports", 1), (
+        "the ordering anchor reservation never connected; cannot prove the injected "
+        "event was consumed"
+    )
+
+
+async def _release_anchor(client, cleanup: dict) -> None:
+    for reservation_id in cleanup["reservations"]:
+        await client.delete(f"/reservations/{reservation_id}")
+    for topology_id in cleanup["topologies"]:
+        await delete_topology_checked(client, topology_id)
+    for conn in cleanup["connections"]:
+        await client.delete(f"/cabling/connections/{conn['id']}")
+
+
 async def test_fork_save_release_drives_disconnect(admin_client, l1_template, fresh_devices):
     """Emptying and saving the fork releases the ACTIVE cross-connect: the consumer
     reconciles the now-empty intended set and drives disconnect_ports on the switch."""
@@ -758,15 +792,24 @@ async def test_fork_save_release_drives_disconnect(admin_client, l1_template, fr
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
 
 
-async def test_wiring_changed_frozen_after_complete_no_reconnect(
+@pytest.mark.timeout(90)
+async def test_wiring_changed_for_completed_reservation_does_not_reconnect(
     admin_client, l1_template, fresh_devices
 ):
-    """After the reservation completes (teardown freezes the wiring state), an injected
-    stale wiring_changed does not reconnect: the frozen guard is a no-op before any
-    driver call (ADR 0007 Decision 7).
+    """After the reservation completes, an injected wiring_changed asking to rebuild
+    the pair does not reconnect it.
 
-    A WIRED parent topology makes activation stage the initial wiring_changed reconcile
-    (ADR 0009 phase 7), which connects the pair; completion then tears it down and freezes.
+    What this proves live (issue #1147): a wiring_changed for an ended reservation is
+    dropped before any driver call. Two guards stand in the way, in this order: the
+    corroboration gate (_verify_reservation_event requires ACTIVE for wiring_changed,
+    so a COMPLETED row is acked as nats_event_unverified without running the handler)
+    and, behind it, the frozen guard in handle_wiring_changed (ADR 0007 Decision 7).
+    Live, the gate always answers first, so the frozen guard alone is pinned at unit
+    level by test_nats_consumer_wiring_changed.py
+    (test_frozen_reservation_is_noop_zero_driver_calls).
+
+    The absence is read after an ordering anchor (a later wired reservation on the same
+    switch), never after a sleep.
     """
     nats_err = await probe_nats()
     if nats_err:
@@ -777,6 +820,7 @@ async def test_wiring_changed_frozen_after_complete_no_reconnect(
     connections = []
     reservation_id = None
     topology_id = None
+    anchor = {"reservations": [], "topologies": [], "connections": []}
     try:
         connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "p1"))
         connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "p2"))
@@ -789,11 +833,12 @@ async def test_wiring_changed_frozen_after_complete_no_reconnect(
         # Complete the reservation: teardown disconnects and freezes the wiring state.
         released = await admin_client.put(f"/reservations/{reservation_id}/release")
         assert released.status_code == 200, released.text
-        await _poll_run_count_at_least(admin_client, reservation_id, "disconnect_ports", 1)
+        assert released.json()["status"] == "COMPLETED", released.json()
+        assert await _poll_run_count_at_least(admin_client, reservation_id, "disconnect_ports", 1)
 
         connect_before = await _count_success_runs(admin_client, reservation_id, "connect_ports")
 
-        # Inject a stale wiring_changed asking to rebuild the pair. Frozen => no-op.
+        # Inject a wiring_changed asking to rebuild the pair.
         payload = {
             "event": "reservation.wiring_changed",
             "reservation_id": reservation_id,
@@ -821,11 +866,14 @@ async def test_wiring_changed_frozen_after_complete_no_reconnect(
         }
         await publish_raw(_WIRING_CHANGED_SUBJECT, json.dumps(payload).encode())
 
-        # Give the consumer time to (not) act, then assert no new connect fired.
-        await asyncio.sleep(6)
+        await _book_ordering_anchor(admin_client, switch["id"], fresh_devices, ("p3", "p4"), anchor)
+
         connect_after = await _count_success_runs(admin_client, reservation_id, "connect_ports")
-        assert connect_after == connect_before, "frozen reservation must not reconnect"
+        assert connect_after == connect_before, "an ended reservation must not reconnect"
+        status = await _wiring_status(admin_client, reservation_id)
+        assert [c for c in status["connections"] if c["status"] == "ACTIVE"] == [], status
     finally:
+        await _release_anchor(admin_client, anchor)
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
         if topology_id:
@@ -835,11 +883,25 @@ async def test_wiring_changed_frozen_after_complete_no_reconnect(
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
 
 
+@pytest.mark.timeout(90)
 async def test_wiring_changed_stale_replay_no_double_apply(
     admin_client, l1_template, fresh_devices
 ):
-    """A stale wiring_changed (fork_version at or below last-applied) injected after a
-    save reconcile is a no-op: no additional switch op fires (ADR 0007 Decision 4)."""
+    """A stale wiring_changed (fork_version at or below last-applied) is a no-op: the
+    last-applied guard skips it before any reconcile (ADR 0007 Decision 4).
+
+    On a converged reservation the guard is unobservable, because a full reconcile of
+    an intended set that already matches the ledger drives nothing either (and
+    last_applied_fork_version never lowers, so reading it proves nothing). So the
+    replay is delivered while the ledger and the intended set DISAGREE (issue #1147):
+    after activation is applied, this reservation's L1 ledger rows are deleted
+    directly in Postgres, leaving cabling's intended pair with no ledger row. A
+    delta-less replay at the applied version must still be skipped; without the guard
+    it would full-reconcile and drive a second connect_ports to rebuild the pair. No
+    FAILED row is involved, so the background wiring retry tick has nothing to drive.
+    The absence is read after an ordering anchor, never after a sleep. Unit pin:
+    test_nats_consumer_wiring_changed.py (test_replay_after_success_is_noop).
+    """
     nats_err = await probe_nats()
     if nats_err:
         pytest.skip(f"NATS not reachable from host: {nats_err}")
@@ -849,6 +911,7 @@ async def test_wiring_changed_stale_replay_no_double_apply(
     connections = []
     reservation_id = None
     topology_id = None
+    anchor = {"reservations": [], "topologies": [], "connections": []}
     try:
         connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "p1"))
         connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "p2"))
@@ -857,40 +920,46 @@ async def test_wiring_changed_stale_replay_no_double_apply(
         reservation_id = reservation["id"]
 
         assert await _poll_run_count_at_least(admin_client, reservation_id, "connect_ports", 1)
-
-        # Save an emptied canvas to release the pair and advance last-applied.
-        saved = await admin_client.post(
-            f"/reservations/{reservation_id}/fork/save",
-            json={"canvas_data": {"nodes": [], "edges": []}},
+        applied_version = await _fork_version(admin_client, reservation_id)
+        assert await _poll_wiring_version(admin_client, reservation_id, applied_version), (
+            "execution never stamped the activation's fork version"
         )
-        assert saved.status_code == 200, saved.text
-        await _poll_run_count_at_least(admin_client, reservation_id, "disconnect_ports", 1)
+        assert await _count_success_runs(admin_client, reservation_id, "connect_ports") == 1
 
-        disconnect_before = await _count_success_runs(
-            admin_client, reservation_id, "disconnect_ports"
+        # Make the ledger disagree with the intended set: the pair stays intended in
+        # cabling's fork, but execution's ledger no longer records it.
+        deleted = _psql(
+            "DELETE FROM execution.l1_connection_assignments "
+            f"WHERE reservation_id = '{reservation_id}'"
+        )
+        assert deleted.returncode == 0 and "DELETE 1" in deleted.stdout, (
+            deleted.stdout,
+            deleted.stderr,
         )
 
-        # Inject a stale wiring_changed (version 1, below the applied version). The
-        # last-applied guard skips it: no re-disconnect and no reconnect.
+        # Replay at the applied version, delta-less so that, past the guard, the
+        # handler would take the full-reconcile path against the intended set.
         payload = {
             "event": "reservation.wiring_changed",
             "reservation_id": reservation_id,
-            "fork_version": 1,
-            "released": [],
-            "built": [],
+            "fork_version": applied_version,
+            "released": None,
+            "built": None,
             "event_id": str(uuid.uuid4()),
         }
         await publish_raw(_WIRING_CHANGED_SUBJECT, json.dumps(payload).encode())
 
-        await asyncio.sleep(6)
-        disconnect_after = await _count_success_runs(
-            admin_client, reservation_id, "disconnect_ports"
-        )
+        await _book_ordering_anchor(admin_client, switch["id"], fresh_devices, ("p3", "p4"), anchor)
+
         connect_after = await _count_success_runs(admin_client, reservation_id, "connect_ports")
-        assert disconnect_after == disconnect_before, "stale replay must not re-disconnect"
-        # Exactly the one activation connect; the stale event drives no rebuild.
-        assert connect_after == 1, "stale replay must not reconnect"
+        assert connect_after == 1, "the stale replay must not rebuild the pair"
+        status = await _wiring_status(admin_client, reservation_id)
+        assert [c for c in status["connections"] if c["layer"] == "l1"] == [], (
+            f"the stale replay must leave the ledger untouched: {status}"
+        )
+        assert status["last_applied_fork_version"] == applied_version, status
     finally:
+        await _release_anchor(admin_client, anchor)
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
         if topology_id:
@@ -1051,6 +1120,10 @@ async def test_heal_seam_purpose_sentinel_does_not_affect_unrelated_reservation(
     reservations unit suite (test_reservation_service_unit.py), which
     monkeypatches the env var directly; this stack has the var set stack-wide.
     """
+    nats_err = await probe_nats()
+    if nats_err:
+        pytest.skip(f"NATS not reachable from host: {nats_err}")
+
     switch = await _create_switch(admin_client, l1_template["id"])
     dut_a, dut_b = await fresh_devices(2)
     connections = []
@@ -1076,6 +1149,17 @@ async def test_heal_seam_purpose_sentinel_does_not_affect_unrelated_reservation(
         assert active is not None, (
             "a reservation with no fault sentinel must wire on normal activation, "
             "without waiting for the sweep heal"
+        )
+
+        # ACTIVE alone cannot tell activation staging from the 5 s sweep heal, which
+        # would also converge a blocked staging inside the window (issue #1147). The
+        # stream can: the activation staging carries the built wires, a heal carries
+        # released and built both None.
+        wiring_events = await fetch_events_for_reservation(reservation_id, _WIRING_CHANGED_SUBJECT)
+        assert wiring_events, "no reservation.wiring_changed event recorded for this reservation"
+        assert wiring_events[0].get("built") is not None, (
+            "the first wiring_changed for an unrelated reservation was a delta-less heal: "
+            f"the fault seam misfired and blocked its activation staging: {wiring_events}"
         )
     finally:
         if reservation_id:

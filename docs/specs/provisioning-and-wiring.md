@@ -437,7 +437,7 @@ support.
   500 that is not 200 acks the message without running the handler, logged
   `nats_event_unverified` with the reported status and a reason. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_verify_reservation_event`, `process_reservation_message`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_event_verification.py` (`test_unverified_terminal_event_acks_without_running_the_handler`, `test_gate_404_acks_without_running_the_handler`, `test_created_for_a_cancelled_reservation_is_unverified`); `tests/integration/test_event_verification_gate.py` (`test_forged_cancelled_event_for_an_active_reservation_is_ignored`)
+  Pinned by: `services/execution/tests/test_nats_consumer_event_verification.py` (`test_unverified_terminal_event_acks_without_running_the_handler`, `test_gate_404_acks_without_running_the_handler`, `test_created_for_a_cancelled_reservation_is_unverified`); `tests/integration/test_event_verification_gate.py` (`test_forged_cancelled_event_for_an_active_reservation_is_ignored`); `tests/integration/test_wiring_changed_reconcile.py` (`test_wiring_changed_for_completed_reservation_does_not_reconnect`)
 - **WIRE-GATE-3.** A 5xx or transport error from that check raises
   `TransientUpstreamError`, so the message is nacked and retried (fail closed). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_get_internal`, `_verify_reservation_event`) \
@@ -516,7 +516,7 @@ state transitions are WIRE-ORDER-1 and WIRE-FREEZE-1.
 - **WIRE-ORDER-3.** On a frozen reservation the event is a no-op before any driver call
   and the version is not stamped; a version at or below the last applied one is a no-op. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`handle_wiring_changed`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_frozen_reservation_is_noop_zero_driver_calls`, `test_stale_version_is_noop`, `test_replay_after_success_is_noop`); `tests/integration/test_wiring_changed_reconcile.py` (`test_wiring_changed_frozen_after_complete_no_reconnect`, `test_wiring_changed_stale_replay_no_double_apply`)
+  Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_frozen_reservation_is_noop_zero_driver_calls`, `test_stale_version_is_noop`, `test_replay_after_success_is_noop`); `tests/integration/test_wiring_changed_reconcile.py` (`test_wiring_changed_stale_replay_no_double_apply`)
 - **WIRE-ORDER-4.** The L1 pass is a full reconcile when the event carries no delta
   (`released` or `built` is null), when no wiring state row exists, or when the version is
   not exactly one above the last applied; otherwise it applies the carried `released`
@@ -840,7 +840,7 @@ removes exactly that when the switch is no longer needed.
   keeping the pin; a failed delta goes through `record_route_reconcile_failed`
   (WIRE-LEDGER-15). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_reconcile_failed_provision_lands_failed_intended_active`, `test_delta_partial_failure_records_possibly_installed_routes_lands_failed`, `test_rebuild_whose_residue_removal_fails_keeps_the_residue_recorded`, `test_delta_mixed_removes_and_adds_in_one_reconcile`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_l3_teardown_driver_failure_keeps_pin_and_lands_failed_released`)
+  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_reconcile_failed_provision_lands_failed_intended_active`, `test_delta_partial_failure_records_possibly_installed_routes_lands_failed`, `test_rebuild_whose_residue_removal_fails_keeps_the_residue_recorded`, `test_delta_mixed_removes_and_adds_in_one_reconcile`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_l3_teardown_driver_failure_keeps_pin_and_lands_failed_released`); `tests/integration/test_l2_l3_result_gating.py` (`test_l3_remove_route_result_failure_records_failed_and_keeps_pin`)
 - **WIRE-L3-11.** A switch inventory reports missing, a missing template, a driver load
   that raises (with the reason WIRE-DRIVER-7 gives it), or a failed `login` records the
   switch FAILED in its direction (through `record_route_reconcile_failed` for a delta)
@@ -926,11 +926,11 @@ it fails, and counted as done only when the driver's own answer says so.
   is a dict with a `success` key whose value is falsy; output with no `success` key
   succeeds. \
   Enforced in: `services/execution/app/services/execution_service.py` (`driver_result_failed`); `services/execution/app/services/nats_consumer.py` (`_run_driver_with_retry`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_reconcile_present_key_falsy_result_is_failure`, `test_reconcile_bare_data_output_stays_success`); `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_reconcile_present_key_falsy_result_is_failure`, `test_reconcile_bare_data_output_stays_success`); `tests/integration/test_l2_l3_result_gating.py` (`test_l2_add_to_vlan_result_failure_records_failed`, `test_l3_configure_route_result_failure_records_failed`)
+  Pinned by: `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_reconcile_present_key_falsy_result_is_failure`, `test_reconcile_bare_data_output_stays_success`); `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_reconcile_present_key_falsy_result_is_failure`, `test_reconcile_bare_data_output_stays_success`); `tests/integration/test_l2_l3_result_gating.py` (`test_l2_add_to_vlan_result_failure_records_failed`, `test_l3_configure_route_result_failure_records_failed`, `test_l3_remove_route_result_failure_records_failed_and_keeps_pin`)
 - **WIRE-DRIVER-4.** A driver failure never nacks the message: it lands a FAILED row and
   the message is acked. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_apply_one_port_action`, `_apply_one_vlan_action`, `_apply_l3_adjacency`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_driver_failure_acks_and_does_not_raise`); `tests/integration/test_l2_l3_result_gating.py` (`test_l3_remove_route_result_failure_keeps_pin_and_acks`)
+  Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_driver_failure_acks_and_does_not_raise`)
 - **WIRE-DRIVER-5.** Every login, logout, and change writes an execution run with the
   action, its ports or route identity, its keyword arguments, the reservation id, the
   context with password fields redacted, start and end times, and SUCCESS or FAILED; the

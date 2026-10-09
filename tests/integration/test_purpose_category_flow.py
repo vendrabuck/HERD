@@ -109,6 +109,14 @@ async def test_utilization_report_by_purpose_includes_classified_reservation(
         by_purpose = {b["purpose_category"]: b for b in resp.json()["by_purpose"]}
         assert "training" in by_purpose
         assert by_purpose["training"]["reservations"] >= 1
+        # Fleet-wide ">= 1" could be any other training reservation on the stack
+        # (issue #1147); the per-device breakdown names THIS reservation's device.
+        device_rows = [
+            b for b in resp.json()["by_device_purpose"] if b["device_id"] == fresh_device["id"]
+        ]
+        assert [(b["purpose_category"], b["reservations"]) for b in device_rows] == [
+            ("training", 1)
+        ], device_rows
     finally:
         await admin_client.delete(f"/reservations/{reservation_id}")
 

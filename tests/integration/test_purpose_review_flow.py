@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from _ai_helpers import ai_provider_configured
+from conftest import _psql
 
 pytestmark = pytest.mark.asyncio
 
@@ -163,13 +164,30 @@ async def test_backfill_marks_and_is_idempotent(admin_client, fresh_device):
         assert cancel.status_code == 204, cancel.text
 
         # The DELETE above already stamped purpose_classify_requested_at (it is
-        # one of the five terminal-transition sites), so backfill's own count
-        # is not asserted exactly (other terminal reservations on a shared
-        # stack may also be freshly eligible); the idempotency property is
-        # what this test pins.
+        # one of the terminal-transition sites), so a backfill would have nothing
+        # of this row's to mark and "the second call marks 0" would hold for a
+        # backfill that marks nothing at all (issue #1147). Clear the stamp, so
+        # this row is one the first call must mark, then read the mark back.
+        # Backfill's own count is not asserted exactly (other terminal
+        # reservations on a shared stack may also be freshly eligible).
+        cleared = _psql(
+            "UPDATE reservations.reservations SET purpose_classify_requested_at = NULL "
+            f"WHERE id = '{reservation_id}'"
+        )
+        assert cleared.returncode == 0 and "UPDATE 1" in cleared.stdout, (
+            cleared.stdout,
+            cleared.stderr,
+        )
+
         first = await admin_client.post("/reservations/admin/purpose/backfill")
         assert first.status_code == 200, first.text
-        assert isinstance(first.json()["marked"], int)
+        assert first.json()["marked"] >= 1, first.json()
+        stamped = _psql(
+            "SELECT purpose_classify_requested_at IS NOT NULL FROM reservations.reservations "
+            f"WHERE id = '{reservation_id}'",
+            tuples_only=True,
+        )
+        assert stamped.stdout.strip() == "t", (stamped.stdout, stamped.stderr)
 
         second = await admin_client.post("/reservations/admin/purpose/backfill")
         assert second.status_code == 200, second.text

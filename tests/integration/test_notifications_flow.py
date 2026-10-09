@@ -108,10 +108,6 @@ async def test_disabled_event_suppresses_notification(user_client, visible_fresh
     passes the reservations create-route visibility check.
     """
     fresh_device = visible_fresh_device
-    # Snapshot current count so we measure a delta.
-    baseline = await user_client.get("/notifications/notifications", params={"limit": 1})
-    baseline_total = baseline.json().get("total", 0) if baseline.status_code == 200 else 0
-
     await user_client.put(
         "/notifications/notifications/preferences",
         json={"events": {"reservation.created": False}},
@@ -119,29 +115,33 @@ async def test_disabled_event_suppresses_notification(user_client, visible_fresh
     try:
         reservation = await _create_reservation(user_client, fresh_device["id"])
         try:
-            # Give the consumer a window to process the event.
-            await asyncio.sleep(3.0)
+            # Ordering anchor (issue #1147), not a sleep: the reservation is one
+            # hour long and expiry_reminder_lead_seconds defaults to 3600, so the
+            # expiration sweep (every 5 s on the test stack) stages a
+            # reservation.expiring_soon for it right after the create. That event
+            # sits behind reservation.created on the stream and the notifications
+            # consumer handles one message at a time, in order, so once the
+            # reminder's row exists the created event has been consumed.
+            reminder = await _poll_for_notification(
+                user_client, "reservation.expiring_soon", reservation["id"], timeout=20.0
+            )
+            assert reminder is not None, (
+                "the expiring_soon anchor never arrived; cannot prove the created event "
+                "was consumed"
+            )
             after = await user_client.get(
                 "/notifications/notifications",
                 params={"limit": 50, "offset": 0},
             )
-            items = after.json().get("items", [])
-            # Only reservation.created is opted out above. The reservation is
-            # one hour long and expiry_reminder_lead_seconds defaults to 3600,
-            # so the expiration sweep (every 5 s on the test stack) stages a
-            # legitimate reservation.expiring_soon reminder for it almost at
-            # once, and since issue #682 the outbox delivers that reminder in
-            # milliseconds, inside this 3 s window. Match on the event type,
-            # not merely the reservation id, or the reminder trips the check.
-            for item in items:
-                data = item.get("data") or {}
-                if data.get("event") != "reservation.created":
-                    continue
-                assert data.get("reservation_id") != reservation["id"], (
-                    "reservation.created notification was created despite event opt-out"
-                )
-            assert after.json().get("total", 0) <= baseline_total + 1, (
-                "unexpected notification count increase while event was disabled"
+            assert after.status_code == 200, after.text
+            created_rows = [
+                item
+                for item in after.json().get("items", [])
+                if item.get("event_type") == "reservation.created"
+                and (item.get("data") or {}).get("reservation_id") == reservation["id"]
+            ]
+            assert created_rows == [], (
+                "reservation.created notification was created despite event opt-out"
             )
         finally:
             await user_client.delete(f"/reservations/{reservation['id']}")

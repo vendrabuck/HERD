@@ -404,6 +404,7 @@ async def test_l3_failed_event_removes_pinned_routes_and_redelivery_is_idempoten
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
 
 
+@pytest.mark.timeout(90)
 async def test_l1_failed_event_disconnects_only_applied_pairs(
     admin_client, teardown_templates, fresh_devices
 ):
@@ -422,6 +423,8 @@ async def test_l1_failed_event_disconnects_only_applied_pairs(
     connections = []
     topology_id = None
     reservation = None
+    anchor = None
+    anchor_topology_id = None
     device_ids = [d["id"] for d in duts]
     try:
         # One DUT pair cabled through each switch, and one canvas edge per pair, so
@@ -464,6 +467,21 @@ async def test_l1_failed_event_disconnects_only_applied_pairs(
         torn_down = {(k["port_a"], k["port_b"]) for k in (_method_kwargs(r) for r in disconnects)}
         assert torn_down == applied
 
+        # Ordering anchor (issue #1147): the first disconnect can land while the
+        # same teardown has yet to reach the broken switch, so book a later wired
+        # reservation on the healthy switch and wait for its connect. The consumer
+        # handles the stream in order, so the cancel's teardown is then complete.
+        dut_c, dut_d = await fresh_devices(2)
+        connections.append(await _connect(admin_client, dut_c["id"], "eth0", sw_ok["id"], "ok-p3"))
+        connections.append(await _connect(admin_client, dut_d["id"], "eth0", sw_ok["id"], "ok-p4"))
+        anchor_topology_id = await _create_topology(
+            admin_client, _canvas([(dut_c["id"], dut_d["id"])])
+        )
+        anchor = await _reserve(admin_client, [dut_c["id"], dut_d["id"]], anchor_topology_id)
+        assert await _poll_runs(admin_client, anchor["id"], "connect_ports"), (
+            "anchor reservation was never provisioned"
+        )
+
         # The broken switch got no disconnect attempt in ANY status: an ACTIVE
         # ledger row is the teardown's only trigger, and its connect never landed
         # one (the applied-state-only guarantee, now intrinsic to the ledger).
@@ -471,6 +489,10 @@ async def test_l1_failed_event_disconnects_only_applied_pairs(
         broken_actions = {r["action"] for r in all_runs if str(r["device_id"]) == sw_broken["id"]}
         assert "disconnect_ports" not in broken_actions
     finally:
+        if anchor:
+            await admin_client.delete(f"/reservations/{anchor['id']}")
+        if anchor_topology_id:
+            await delete_topology_checked(admin_client, anchor_topology_id)
         if reservation:
             await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:
