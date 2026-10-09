@@ -321,11 +321,13 @@ class _FakePagedConnection:
         self.entries: list = []
         self.result: dict = {}
         self.search_filters: list[str] = []
+        self.paged_cookies: list[bytes | None] = []
 
     def search(
         self, *, search_base, search_filter, search_scope, attributes, paged_cookie=None, **_kw
     ):
         self.search_filters.append(search_filter)
+        self.paged_cookies.append(paged_cookie)
         entries, result_code, cookie = self._pages.pop(0)
         self.entries = entries
         if result_code != RESULT_SUCCESS:
@@ -367,8 +369,10 @@ def test_present_emails_collects_across_multiple_pages_lowercased(monkeypatch):
     emails = ldap_service._present_emails_sync()
 
     assert emails == frozenset({"a@example.com", "b@example.com"})
-    # Two pages consumed; the second call carried the first page's cookie.
-    assert len(fake_conn.search_filters) == 2
+    # Two pages consumed: the first call sent no cookie and the second carried
+    # the first page's cookie (a loop that restarted from page one would
+    # never reach the second page on a real server).
+    assert fake_conn.paged_cookies == [None, b"cookie-1"]
 
 
 def test_present_emails_collects_multivalued_attribute(monkeypatch):

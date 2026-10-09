@@ -32,8 +32,11 @@ async def setup_db():
 @pytest.mark.asyncio
 async def test_seed_superadmin_skips_when_env_vars_empty():
     """When superadmin env vars are blank, _seed_superadmin returns early."""
+    # The seed's session factory points at this test's database, so a seed
+    # that did run would leave a superadmin row the read below finds.
     with (
         patch("app.main.settings") as mock_settings,
+        patch("app.main.AsyncSessionLocal", TestSessionLocal),
     ):
         mock_settings.superadmin_email = ""
         mock_settings.superadmin_username = ""
@@ -122,8 +125,11 @@ async def test_seed_superadmin_creates_new_superadmin():
 @pytest.mark.asyncio
 async def test_seed_superadmin_skips_partial_env_vars():
     """When only some env vars are set (password missing), skip seeding."""
+    # The seed's session factory points at this test's database, so a seed
+    # that did run would leave a superadmin row the read below finds.
     with (
         patch("app.main.settings") as mock_settings,
+        patch("app.main.AsyncSessionLocal", TestSessionLocal),
     ):
         mock_settings.superadmin_email = "sa@test.com"
         mock_settings.superadmin_username = "superadmin"

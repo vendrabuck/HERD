@@ -166,7 +166,7 @@ plain ORM writes; only one sync run can execute at a time (IAM-SERIAL-1).
 - **IAM-RUN-3.** A tripped circuit breaker (IAM-SWEEP-7) makes the run `aborted` with
   the breaker message as `error`, overriding `success` and `partial`. \
   Enforced in: `services/auth/app/services/ldap_sync_service.py` (`execute_run`) \
-  Pinned by: `services/auth/tests/test_ldap_sync_service.py` (`test_sweep_breaker_both_terms_exceeded_aborts_but_still_reactivates`, `test_run_status_vocabulary_includes_aborted`)
+  Pinned by: `services/auth/tests/test_ldap_sync_service.py` (`test_sweep_breaker_both_terms_exceeded_aborts_but_still_reactivates`)
 - **IAM-RUN-4.** An exception in the run machinery rolls back the uncommitted work and
   ends the run `failed` with the exception text as `error`; the exception is not
   re-raised. \
@@ -787,7 +787,7 @@ removes anyone when the directory could not be read completely.
   `suppressed_removals` when removals were due); a `not_found` skip never suppresses.
   By decision; see ADR 0011, phase 3 amendment 1. \
   Enforced in: `services/auth/app/services/ldap_sync_service.py` (`_reconcile_mapping`, `_REMOVAL_SUPPRESSING_REASONS`) \
-  Pinned by: `services/auth/tests/test_ldap_sync_service.py` (`test_missing_email_skip_suppresses_group_removals`, `test_not_found_skip_does_not_suppress_removal`)
+  Pinned by: `services/auth/tests/test_ldap_sync_service.py` (`test_unidentifiable_member_skip_suppresses_group_removals`, `test_not_found_skip_does_not_suppress_removal`)
 - **IAM-SYNC-6.** A member is matched to a HERD account by email. A member with no
   account is provisioned (LDAP, no password, role user) and then added. \
   Enforced in: `services/auth/app/services/ldap_sync_service.py` (`_ensure_ldap_user`, `_provision_or_recover`) \
