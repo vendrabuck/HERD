@@ -129,7 +129,11 @@ async def test_dynamic_template_missing_driver_422(client):
         },
     )
     assert resp.status_code == 422
-    assert "driver" in str(resp.json()).lower()
+    # Exact message list: Pydantic echoes the request (whose name contains
+    # "Driver") under `input`, so a substring on the body proves nothing.
+    assert [e["msg"] for e in resp.json()["detail"]] == [
+        "Value error, Dynamic templates must have a driver"
+    ]
 
 
 @pytest.mark.asyncio
@@ -145,7 +149,9 @@ async def test_dynamic_template_missing_hypervisor_422(client):
         },
     )
     assert resp.status_code == 422
-    assert "hypervisor" in str(resp.json()).lower()
+    assert [e["msg"] for e in resp.json()["detail"]] == [
+        "Value error, Dynamic templates must have a hypervisor"
+    ]
 
 
 @pytest.mark.asyncio

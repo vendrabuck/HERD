@@ -68,6 +68,11 @@ def test_dropdown_requires_options():
         _field(type="dropdown")
 
 
+def test_dropdown_rejects_empty_options_list():
+    with pytest.raises(ValidationError, match="options list"):
+        _field(type="dropdown", options=[])
+
+
 def test_non_dropdown_may_not_have_options():
     with pytest.raises(ValidationError, match="Only dropdown"):
         _field(type="string", options=["a"])

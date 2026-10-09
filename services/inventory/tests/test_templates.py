@@ -66,6 +66,26 @@ def mock_delete_object(key: str) -> None:
     _mock_storage.pop(key, None)
 
 
+def _port_template(name: str, fields: list[dict], section_name: str = "Section") -> dict:
+    """A one-section port template, valid except for what the caller passes.
+
+    A port template needs no driver and no vendor or model, so a field or
+    section rule under test is the only thing that can refuse it (a device
+    template without a driver would 422 on the driver rule whatever the
+    fields say).
+    """
+    return {
+        "name": name,
+        "template_type": "port",
+        "sections": [{"name": section_name, "fields": fields}],
+    }
+
+
+def _error_messages(resp) -> list[str]:
+    """The Pydantic messages of a 422 body, without the echoed input."""
+    return [e["msg"] for e in resp.json()["detail"]]
+
+
 TEMPLATE_PAYLOAD = {
     "name": "Firewall",
     "template_type": "port",
@@ -202,41 +222,23 @@ async def test_create_template_empty_sections(client):
 
 @pytest.mark.asyncio
 async def test_dropdown_without_options(client):
-    payload = {
-        "name": "Bad Template",
-        "sections": [
-            {
-                "name": "Section",
-                "fields": [
-                    {"key": "choice", "label": "Choice", "type": "dropdown"},
-                ],
-            }
-        ],
-    }
+    payload = _port_template(
+        "Bad Template", [{"key": "choice", "label": "Choice", "type": "dropdown"}]
+    )
     resp = await client.post("/templates", json=payload)
     assert resp.status_code == 422
+    assert _error_messages(resp) == ["Value error, Dropdown fields must have an options list"]
 
 
 @pytest.mark.asyncio
 async def test_non_dropdown_with_options(client):
-    payload = {
-        "name": "Bad Template",
-        "sections": [
-            {
-                "name": "Section",
-                "fields": [
-                    {
-                        "key": "name",
-                        "label": "Name",
-                        "type": "string",
-                        "options": ["a", "b"],
-                    },
-                ],
-            }
-        ],
-    }
+    payload = _port_template(
+        "Bad Template",
+        [{"key": "name", "label": "Name", "type": "string", "options": ["a", "b"]}],
+    )
     resp = await client.post("/templates", json=payload)
     assert resp.status_code == 422
+    assert _error_messages(resp) == ["Value error, Only dropdown fields may have options"]
 
 
 # --- Permission tests ---
@@ -335,46 +337,24 @@ async def test_create_template_with_multiword_options(client):
 
 @pytest.mark.asyncio
 async def test_create_template_dropdown_empty_option_string(client):
-    payload = {
-        "name": "Bad Options",
-        "sections": [
-            {
-                "name": "Section",
-                "fields": [
-                    {
-                        "key": "choice",
-                        "label": "Choice",
-                        "type": "dropdown",
-                        "options": ["valid", ""],
-                    },
-                ],
-            }
-        ],
-    }
+    payload = _port_template(
+        "Bad Options",
+        [{"key": "choice", "label": "Choice", "type": "dropdown", "options": ["valid", ""]}],
+    )
     resp = await client.post("/templates", json=payload)
     assert resp.status_code == 422
+    assert _error_messages(resp) == ["Value error, Dropdown options must not contain empty strings"]
 
 
 @pytest.mark.asyncio
 async def test_create_template_dropdown_empty_options_list(client):
-    payload = {
-        "name": "Empty Options",
-        "sections": [
-            {
-                "name": "Section",
-                "fields": [
-                    {
-                        "key": "choice",
-                        "label": "Choice",
-                        "type": "dropdown",
-                        "options": [],
-                    },
-                ],
-            }
-        ],
-    }
+    payload = _port_template(
+        "Empty Options",
+        [{"key": "choice", "label": "Choice", "type": "dropdown", "options": []}],
+    )
     resp = await client.post("/templates", json=payload)
     assert resp.status_code == 422
+    assert _error_messages(resp) == ["Value error, Dropdown fields must have an options list"]
 
 
 @pytest.mark.asyncio
@@ -426,54 +406,55 @@ async def test_create_template_duplicate_name(client):
 
 @pytest.mark.asyncio
 async def test_create_template_invalid_field_key(client):
-    payload = {
-        "name": "Bad Key",
-        "sections": [
-            {
-                "name": "Section",
-                "fields": [
-                    {"key": "invalid key!", "label": "Label", "type": "string"},
-                ],
-            }
-        ],
-    }
+    payload = _port_template(
+        "Bad Key", [{"key": "invalid key!", "label": "Label", "type": "string"}]
+    )
     resp = await client.post("/templates", json=payload)
     assert resp.status_code == 422
+    assert _error_messages(resp) == [
+        "Value error, Field key must contain only alphanumeric characters and underscores"
+    ]
 
 
 @pytest.mark.asyncio
 async def test_create_template_empty_section_name(client):
-    payload = {
-        "name": "Empty Section",
-        "sections": [
-            {
-                "name": "",
-                "fields": [
-                    {"key": "field1", "label": "Field", "type": "string"},
-                ],
-            }
-        ],
-    }
+    payload = _port_template(
+        "Empty Section",
+        [{"key": "field1", "label": "Field", "type": "string"}],
+        section_name="",
+    )
     resp = await client.post("/templates", json=payload)
     assert resp.status_code == 422
+    assert _error_messages(resp) == ["Value error, Section name must not be empty"]
 
 
 @pytest.mark.asyncio
 async def test_create_template_duplicate_field_keys(client):
-    payload = {
-        "name": "Dupe Keys",
-        "sections": [
-            {
-                "name": "Section",
-                "fields": [
-                    {"key": "name", "label": "Name", "type": "string"},
-                    {"key": "name", "label": "Name 2", "type": "string"},
-                ],
-            }
+    payload = _port_template(
+        "Dupe Keys",
+        [
+            {"key": "name", "label": "Name", "type": "string"},
+            {"key": "name", "label": "Name 2", "type": "string"},
         ],
-    }
+    )
     resp = await client.post("/templates", json=payload)
     assert resp.status_code == 422
+    assert _error_messages(resp) == ["Value error, Duplicate field keys in section: name"]
+
+
+@pytest.mark.asyncio
+async def test_port_template_helper_payload_is_accepted(client):
+    """Control for the 422 tests above: the shared payload with valid fields is
+    accepted, so each of them is refused by the one rule it names."""
+    payload = _port_template(
+        "Valid Port Tmpl",
+        [
+            {"key": "name", "label": "Name", "type": "string"},
+            {"key": "choice", "label": "Choice", "type": "dropdown", "options": ["a", "b"]},
+        ],
+    )
+    resp = await client.post("/templates", json=payload)
+    assert resp.status_code == 201, resp.text
 
 
 # --- Template type tests ---
@@ -618,10 +599,17 @@ async def test_update_template_exclusive(client):
 
 @pytest.mark.asyncio
 async def test_device_template_without_driver_returns_422(client):
-    """Creating a device template without driver_id returns 422."""
+    """Creating a device template without driver_id returns 422.
+
+    Vendor and model are present, so the driver rule is the only one that can
+    refuse the payload. The message list is compared exactly because Pydantic
+    echoes the request (whose name contains "Driver") under `input`.
+    """
     payload = {
         "name": "No Driver Device Tmpl",
         "template_type": "device",
+        "vendor": "Acme",
+        "model": "X1",
         "sections": [
             {
                 "name": "Config",
@@ -633,7 +621,7 @@ async def test_device_template_without_driver_returns_422(client):
     }
     resp = await client.post("/templates", json=payload)
     assert resp.status_code == 422
-    assert "driver" in str(resp.json()).lower()
+    assert _error_messages(resp) == ["Value error, Device templates must have a driver"]
 
 
 # --- Internal template endpoint ---

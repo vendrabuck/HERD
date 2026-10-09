@@ -558,39 +558,61 @@ async def test_dut_only_filters_infrastructure_devices(mock_up, client):
 @pytest.mark.asyncio
 @patch("app.services.driver_service.upload_object", side_effect=mock_upload_object)
 async def test_non_admin_forced_dut_only(mock_up, client):
-    # Create an infrastructure driver + template + device as admin
+    """A non-admin device list is always dut_only, whatever the query says.
+
+    Both devices are in the caller's visible set, so group visibility hides
+    nothing here: the forced dut_only is the only thing that can hide the
+    infrastructure device while the DUT stays listed.
+    """
+    # As admin: one DUT (Management) and one infrastructure device.
+    dut_resp = await create_driver_package(client, "DUT Only", connection_type="Management")
     infra_resp = await create_driver_package(client, "Infra Only", connection_type="Layer 2 Switch")
-    infra_driver_id = infra_resp.json()["id"]
-    tmpl = await client.post(
+    dut_tmpl = await client.post(
         "/templates",
+        json={**TEMPLATE_PAYLOAD, "name": "DUT Tmpl", "driver_id": dut_resp.json()["id"]},
+    )
+    infra_tmpl = await client.post(
+        "/templates",
+        json={**TEMPLATE_PAYLOAD, "name": "Infra Tmpl", "driver_id": infra_resp.json()["id"]},
+    )
+    dut_dev = await client.post(
+        "/devices",
         json={
-            **TEMPLATE_PAYLOAD,
-            "name": "Infra Tmpl",
-            "driver_id": infra_driver_id,
+            "name": "Visible DUT",
+            "template_id": dut_tmpl.json()["id"],
+            "topology_type": "PHYSICAL",
+            "field_data": {"model": "D"},
         },
     )
-    await client.post(
+    infra_dev = await client.post(
         "/devices",
         json={
             "name": "Hidden Device",
-            "template_id": tmpl.json()["id"],
+            "template_id": infra_tmpl.json()["id"],
             "topology_type": "PHYSICAL",
             "field_data": {"model": "X"},
         },
     )
+    assert dut_dev.status_code == 201
+    assert infra_dev.status_code == 201
+    visible = {uuid.UUID(dut_dev.json()["id"]), uuid.UUID(infra_dev.json()["id"])}
 
-    # Switch to user auth: should not see infrastructure devices. Mock
-    # group-visibility resolution so the list does not reach the (absent) auth
-    # service; dut_only is what hides the infra device here, not the visible set.
+    # Switch to user auth. Group visibility is mocked to grant BOTH devices,
+    # so the list does not reach the (absent) auth service and the visible set
+    # does not hide the infrastructure device.
     app.dependency_overrides[get_current_user_payload] = override_auth_user
     with patch(
         "app.routers.devices._resolve_visible_device_ids",
-        new=AsyncMock(return_value=set()),
+        new=AsyncMock(return_value=visible),
     ):
         resp = await client.get("/devices")
-    assert resp.status_code == 200
-    names = [d["name"] for d in resp.json()["items"]]
-    assert "Hidden Device" not in names
+        # An explicit dut_only=false from a non-admin is overridden too.
+        resp_explicit = await client.get("/devices", params={"dut_only": "false"})
+    for r in (resp, resp_explicit):
+        assert r.status_code == 200
+        names = [d["name"] for d in r.json()["items"]]
+        assert names == ["Visible DUT"]
+        assert r.json()["total"] == 1
 
 
 # --- config-schema proxy route (issue #23, slice 3) ---

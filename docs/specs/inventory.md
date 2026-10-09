@@ -278,7 +278,7 @@ Copy, delete) and `frontend/src/pages/TemplateEditorPage.tsx` (view and edit); r
 - **INV-TPL-7.** A `dropdown` field needs a non-empty options list with no blank option;
   any other type may not carry options. \
   Enforced in: `services/inventory/app/schemas/template.py` (`validate_options_and_default`) \
-  Pinned by: `services/inventory/tests/test_templates.py` (`test_dropdown_without_options`, `test_non_dropdown_with_options`, `test_create_template_dropdown_empty_option_string`)
+  Pinned by: `services/inventory/tests/test_templates.py` (`test_dropdown_without_options`, `test_create_template_dropdown_empty_options_list`, `test_non_dropdown_with_options`, `test_create_template_dropdown_empty_option_string`); `services/inventory/tests/test_template_schema_validators.py` (`test_dropdown_rejects_empty_options_list`)
 - **INV-TPL-8.** A field default must match the field type (a string for `string` and
   `password`, a number for `number`, a boolean for `boolean`), and a dropdown default
   must be one of its options. \
