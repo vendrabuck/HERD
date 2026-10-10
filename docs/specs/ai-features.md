@@ -763,11 +763,13 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
 - **AI-STREAM-5.** The deadline is one absolute instant that bounds only the wait for the
   next event; no frame is yielded inside a timeout scope, time spent handing a frame to a
   slow client counts against the deadline, and the inner generator is closed on every
-  exit. The repository guard is an AST scan that sees a scope only when the `with` or
-  `async with` names `asyncio.timeout`, `asyncio.timeout_at`, or `asyncio.TaskGroup`
-  through the module name `asyncio`, or a bare `timeout`, `timeout_at`, or `TaskGroup`;
-  a module alias (`import asyncio as aio`) or a scope object bound to a variable before
-  the `with` passes it (#1145). \
+  exit. The repository guard is an AST scan that recognizes `asyncio.timeout`,
+  `asyncio.timeout_at`, and `asyncio.TaskGroup` under every spelling that names them:
+  the module under its own name or an alias (`import asyncio as aio`), the function
+  imported bare or under an alias (`from asyncio import timeout as t`), a walrus inside
+  the `with`, and a name assigned from a scope call in the same function
+  (`scope = asyncio.timeout_at(d)` then `async with scope:`); a yield inside a nested
+  function is not counted against the enclosing scope (#1145). \
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant_stream`, `_STREAM_END`) \
   Pinned by: `services/ai-orchestrator/tests/test_reservation_assistant_stream_deadline.py` (`test_stalled_client_with_landed_tool_still_gets_one_done`, `test_consumer_leaving_at_a_yield_closes_inner_generator_without_leaks`); `tests/unit/test_no_yield_inside_cancel_scope.py` (`test_no_service_app_yields_inside_a_cancel_scope`)
 - **AI-STREAM-6.** Any other exception, raised by the loop, by saving a finished turn (a
