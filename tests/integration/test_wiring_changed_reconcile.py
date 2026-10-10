@@ -1120,10 +1120,6 @@ async def test_heal_seam_purpose_sentinel_does_not_affect_unrelated_reservation(
     reservations unit suite (test_reservation_service_unit.py), which
     monkeypatches the env var directly; this stack has the var set stack-wide.
     """
-    nats_err = await probe_nats()
-    if nats_err:
-        pytest.skip(f"NATS not reachable from host: {nats_err}")
-
     switch = await _create_switch(admin_client, l1_template["id"])
     dut_a, dut_b = await fresh_devices(2)
     connections = []
@@ -1141,6 +1137,10 @@ async def test_heal_seam_purpose_sentinel_does_not_affect_unrelated_reservation(
             f"int-heal-control-{uuid.uuid4().hex[:8]}",
         )
         reservation_id = reservation["id"]
+        # The container clock right after the create returned (the time anchor below).
+        clock = _psql("SELECT now()", tuples_only=True)
+        assert clock.returncode == 0 and clock.stdout.strip(), clock.stderr
+        created_by = clock.stdout.strip()
         assert await _poll_active(admin_client, reservation_id), "reservation never activated"
 
         active = await _poll_wiring_conn(
@@ -1152,14 +1152,24 @@ async def test_heal_seam_purpose_sentinel_does_not_affect_unrelated_reservation(
         )
 
         # ACTIVE alone cannot tell activation staging from the 5 s sweep heal, which
-        # would also converge a blocked staging inside the window (issue #1147). The
-        # stream can: the activation staging carries the built wires, a heal carries
-        # released and built both None.
-        wiring_events = await fetch_events_for_reservation(reservation_id, _WIRING_CHANGED_SUBJECT)
-        assert wiring_events, "no reservation.wiring_changed event recorded for this reservation"
-        assert wiring_events[0].get("built") is not None, (
-            "the first wiring_changed for an unrelated reservation was a delta-less heal: "
-            f"the fault seam misfired and blocked its activation staging: {wiring_events}"
+        # would also converge a blocked staging inside the window (issue #1147), and
+        # the stream cannot either: activation stages its wiring_changed delta-less,
+        # exactly as a heal does. Time can: the initial staging runs inside the
+        # create request, so its outbox row was written no later than the container
+        # clock read right after the POST returned, while a heal only stages on a
+        # later sweep tick (EXPIRATION_INTERVAL_SECONDS=5 on this stack).
+        first_staged = _psql(
+            "SELECT min(created_at) <= "
+            f"'{created_by}'::timestamptz FROM reservations.outbox "
+            f"WHERE subject = '{_WIRING_CHANGED_SUBJECT}' "
+            f"AND payload->>'reservation_id' = '{reservation_id}'",
+            tuples_only=True,
+        )
+        assert first_staged.returncode == 0, first_staged.stderr
+        assert first_staged.stdout.strip() == "t", (
+            "the first wiring_changed outbox row for an unrelated reservation was written "
+            f"after its create returned (at {created_by}): the fault seam misfired and a "
+            f"sweep heal staged it ({first_staged.stdout.strip()!r})"
         )
     finally:
         if reservation_id:
