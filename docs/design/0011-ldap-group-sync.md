@@ -482,6 +482,17 @@ authority for role, per the issue.
   local-mode refused state, since the e2e phase runs before the stack
   switches to LDAP mode.
 
+**Amendment (as built, 2026-10-10, issue #1134):** the concurrent sync-now
+test above no longer requires the second request to lose. A run over the one
+small `cn=herd-it-eng` group can finish before the second request arrives,
+and a correct server then accepts it. The test is now
+`test_concurrent_sync_now_runs_never_overlap`: it accepts `[202, 409]`, with
+the exact in-process busy detail on the 409, or `[202, 202]`, and in the second
+case asserts that the earlier run's `finished_at` is at or before the later
+run's `started_at`. The serialization decision is unchanged; the busy 409
+itself is pinned deterministically by the auth unit test
+`test_sync_run_409_while_in_progress_and_lock_released_after`.
+
 ## Out of scope
 
 Per issue #38: role mapping, push/event-driven sync, SCIM, nested-group
