@@ -803,11 +803,13 @@ reaches a stack that keeps its broker state and no consumer drifts from the othe
   Pinned by: `services/common/tests/test_jetstream.py` (`test_keep_messages_alive_heartbeats_until_settled_or_cancelled`, `test_keep_messages_alive_swallows_in_progress_errors`, `test_process_batch_settles_in_order_and_survives_a_raising_message`, `test_process_batch_cancelled_mid_message_leaks_no_task`, `test_process_batch_cancel_while_stopping_heartbeat_still_propagates`)
 - **OPS-NATS-12.** Every module that calls `pull_subscribe(` runs its batches through
   `process_batch_with_heartbeat`, keeps no heartbeat of its own, and takes its ack wait
-  from settings and its heartbeat from `heartbeat_interval`. The repository guard is a
-  text scan: it requires the name `process_batch_with_heartbeat` and the two exact
-  assignment lines, and it refuses only a direct `keep_messages_alive(` call or
-  `create_task(_keep_messages_alive`, so a heartbeat started under an import alias or a
-  hand-rolled `in_progress` loop passes it (#1145). \
+  from settings and its heartbeat from `heartbeat_interval`. The repository guard
+  refuses an own heartbeat by an AST scan: any call to `keep_messages_alive` under its
+  own name, `_keep_messages_alive`, an import alias, or a module attribute, and any
+  `.in_progress(` call (what a hand-rolled heartbeat loop must make); a mention in a
+  comment or docstring is not a call and does not count. It also requires the name
+  `process_batch_with_heartbeat` in the module text and the two exact assignment lines
+  (#1145). \
   Enforced in: `services/common/herd_common/jetstream.py` (`process_batch_with_heartbeat`, `heartbeat_interval`) \
   Pinned by: `tests/unit/test_consumer_heartbeat_wiring.py` (`test_consumer_modules_are_discovered`, `test_no_pull_consumer_module_keeps_an_inline_heartbeat`, `test_every_pull_consumer_module_uses_the_shared_heartbeat`, `test_every_pull_consumer_module_takes_ack_wait_and_heartbeat_from_one_source`)
 - **OPS-NATS-13.** Under `make prod` the broker stores JetStream state in the `nats-data`
