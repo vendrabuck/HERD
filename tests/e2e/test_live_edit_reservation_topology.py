@@ -137,19 +137,23 @@ def _open_reservations(driver, base_url):
 def _open_detail_modal_for(driver, base_url, reservation):
     """Open the reservations list and click the row for the given reservation.
 
-    Falls back to the first row when no row carries the reservation id, which
-    keeps the test resilient to the row markup not exposing the id; the
-    reserved_topology fixture only creates a single fresh reservation, so the
-    first row is overwhelmingly the right one after a refresh.
+    The row is found by its short-id cell (the first 8 characters of the id, as
+    the list renders it), never the first row (issue #1148: the old lookup used a
+    data-reservation-id attribute no row carries, so it always fell back to the
+    first row). The modal wait is scoped to the open dialog's tab bar, not any
+    text containing "Reservation", which the page heading already satisfied.
     """
     _open_reservations(driver, base_url)
     wait = WebDriverWait(driver, WAIT)
-    rows = driver.find_elements(
-        By.XPATH, f"//tbody/tr[contains(@data-reservation-id, '{reservation['id']}')]"
+    short_id = reservation["id"][:8]
+    wait.until(
+        EC.element_to_be_clickable((By.XPATH, f"//tbody/tr/td[normalize-space()='{short_id}']"))
+    ).click()
+    wait.until(
+        EC.visibility_of_element_located(
+            (By.XPATH, "//dialog[@open]//button[normalize-space()='Details']")
+        )
     )
-    (rows[0] if rows else driver.find_element(By.CSS_SELECTOR, "tbody tr")).click()
-    # Wait for the modal titled "Reservation".
-    wait.until(EC.visibility_of_element_located((By.XPATH, "//*[contains(text(), 'Reservation')]")))
 
 
 def test_edit_topology_button_present_for_reserved_topology(
@@ -183,8 +187,9 @@ def test_edit_topology_lands_on_live_edit_editor(admin_browser, base_url, reserv
     wait.until(EC.url_contains("/topology/"))
     wait.until(EC.url_contains("reservationId="))
     current = admin_browser.current_url
-    assert "/topology/" in current
-    assert "reservationId=" in current
+    # This reservation's own topology and id, not just the URL shape.
+    assert f"/topology/{reserved_topology['topology']['id']}" in current, current
+    assert f"reservationId={reserved_topology['reservation']['id']}" in current, current
 
     # The blue LiveEditBar renders its label. CSS text-transform is not applied
     # to this label (it is literally uppercase in the markup), so match the

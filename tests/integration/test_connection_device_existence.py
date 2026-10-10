@@ -29,16 +29,22 @@ def _connect_body(device_a_id: str, device_b_id: str) -> dict:
 
 @pytest.mark.asyncio
 async def test_connection_rejected_when_both_devices_nonexistent(admin_client):
-    body = _connect_body(str(uuid.uuid4()), str(uuid.uuid4()))
+    missing_a = str(uuid.uuid4())
+    body = _connect_body(missing_a, str(uuid.uuid4()))
     resp = await admin_client.post("/cabling/connections", json=body)
-    assert resp.status_code >= 400 and resp.status_code < 500, resp.text
+    # The guard looks device A up first, so A is the one named (issue #1147: any
+    # 4xx used to pass, including an unrelated validation refusal).
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"] == f"Device {missing_a} does not exist", resp.text
 
 
 @pytest.mark.asyncio
 async def test_connection_rejected_when_one_device_nonexistent(admin_client, fresh_device):
-    body = _connect_body(fresh_device["id"], str(uuid.uuid4()))
+    missing_b = str(uuid.uuid4())
+    body = _connect_body(fresh_device["id"], missing_b)
     resp = await admin_client.post("/cabling/connections", json=body)
-    assert resp.status_code >= 400 and resp.status_code < 500, resp.text
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"] == f"Device {missing_b} does not exist", resp.text
 
 
 @pytest.mark.asyncio

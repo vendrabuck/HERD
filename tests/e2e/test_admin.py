@@ -36,9 +36,12 @@ def test_users_page_shows_roles(admin_browser, base_url):
     admin_browser.get(f"{base_url}/admin/users")
     wait = WebDriverWait(admin_browser, WAIT)
 
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "tbody tr")))
-    page_text = admin_browser.find_element(By.TAG_NAME, "body").text
-    assert "admin" in page_text.lower() or "user" in page_text.lower()
+    # The role badge of the seeded superadmin, as an exact cell text (issue #1148:
+    # "admin" or "user" anywhere in the body matched the header's Administration
+    # menu and the User Management heading with no role rendered at all).
+    wait.until(
+        EC.presence_of_element_located((By.XPATH, "//tbody//td[normalize-space()='superadmin']"))
+    )
 
 
 def test_groups_page_loads(admin_browser, base_url):

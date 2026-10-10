@@ -207,17 +207,15 @@ async def _poll_active(client, reservation_id: str, *, timeout: float = 15.0) ->
 async def _poll_retry_l2(client, reservation_id, port, outcome, *, timeout=25.0):
     """Poll POST wiring/retry until a layer-l2 outcome for `port` matches `outcome`."""
     deadline = asyncio.get_event_loop().time() + timeout
-    last = None
     while asyncio.get_event_loop().time() < deadline:
         resp = await client.post(f"/reservations/{reservation_id}/wiring/retry")
         if resp.status_code == 200:
             for row in resp.json().get("results", []):
                 if row.get("layer") == "l2" and row.get("port") == port:
-                    last = row
                     if row.get("outcome") == outcome:
                         return row
         await asyncio.sleep(0.5)
-    return last
+    return None
 
 
 async def _save_fork(client, reservation_id, canvas):
@@ -342,7 +340,9 @@ async def test_l2_failed_add_surfaces_and_manual_retry_recovers(
         # The failed join surfaces as a layer-l2 FAILED outcome (still_failed on retry
         # while the knob is armed).
         failed = await _poll_retry_l2(admin_client, rid, "1", "still_failed")
-        assert failed is not None and failed["layer"] == "l2", "no FAILED L2 membership surfaced"
+        assert failed is not None and failed["outcome"] == "still_failed", (
+            "no FAILED L2 membership surfaced as still_failed while the knob was armed"
+        )
 
         # Clear the knob and retry: the join converges ACTIVE.
         cleared = await admin_client.put(
@@ -395,7 +395,9 @@ async def test_l2_release_failure_retry_converges_released(
         assert emptied.status_code == 200, emptied.text
 
         failed = await _poll_retry_l2(admin_client, rid, "1", "still_failed")
-        assert failed is not None and failed["layer"] == "l2", "no FAILED release membership"
+        assert failed is not None and failed["outcome"] == "still_failed", (
+            "no FAILED release membership surfaced as still_failed while the knob was armed"
+        )
 
         # Clear the knob and retry: the leave converges RELEASED.
         await admin_client.put(

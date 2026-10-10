@@ -12,11 +12,9 @@ driven wiring path: after the fix these run at FAILED with the driver's error.
 For L3 specifically, a driver-result failure on remove_route must also leave
 the reservation's route pin ACTIVE (pinned directly against the ledger at the
 unit level in test_nats_consumer_l3_reconcile.py and
-test_nats_consumer_ledger_teardown.py). There is no REST endpoint for
-route_assignments rows, so this suite proves the pin-kept invariant the same
-way test_l3_route_provisioning.py proves everything else: through the
-execution_runs the driver actually ran, plus the reservation reaching
-CANCELLED normally (a driver-result failure ACKs, it never NAKs the message).
+test_nats_consumer_ledger_teardown.py). This suite reads the pin live through
+reservations' GET /{id}/wiring-status, which relays every route_assignments
+row with its status, intended direction, and route count.
 
 As of ADR 0009 phase 7 initial provisioning is fork-driven: each test books a
 WIRED parent topology (a committed DUT-to-switch canvas edge), so activation
@@ -269,16 +267,21 @@ async def _poll_runs(
     return []
 
 
-async def _poll_reservation_status(
-    client, reservation_id: str, wanted: str, *, timeout: float = 30.0, interval: float = 0.5
-) -> bool:
+async def _poll_wiring_status(
+    client, reservation_id: str, predicate, *, timeout: float = 30.0, interval: float = 0.5
+) -> dict | None:
+    """Poll the layered wiring-status surface until `predicate(status)` holds;
+    return that status, or the last one seen on timeout."""
     deadline = asyncio.get_event_loop().time() + timeout
+    status: dict | None = None
     while asyncio.get_event_loop().time() < deadline:
-        resp = await client.get(f"/reservations/{reservation_id}")
-        if resp.status_code == 200 and resp.json().get("status") == wanted:
-            return True
+        resp = await client.get(f"/reservations/{reservation_id}/wiring-status")
+        if resp.status_code == 200:
+            status = resp.json()
+            if predicate(status):
+                return status
         await asyncio.sleep(interval)
-    return False
+    return status
 
 
 # --- L2: add_to_vlan driver-result failure -----------------------------------
@@ -375,17 +378,24 @@ async def test_l3_configure_route_result_failure_records_failed(
 # --- L3: remove_route driver-result failure keeps the pin (deprovision) -----
 
 
-async def test_l3_remove_route_result_failure_keeps_pin_and_acks(
+async def test_l3_remove_route_result_failure_records_failed_and_keeps_pin(
     admin_client, gating_l3_template, fresh_device
 ):
     """remove_route returning a driver-reported failure on cancel: the FAILED
-    run is recorded with the driver's error, and (Decision 6/7's driver-
-    failures-ACK posture) the reservation still reaches CANCELLED rather than
-    getting stuck retrying the whole message. The route pin itself staying
-    ACTIVE is pinned directly against the ledger at the unit level (see
-    test_nats_consumer_ledger_teardown.py's
-    test_l3_teardown_driver_failure_keeps_pin_and_lands_failed_released); there
-    is no REST surface for route_assignments to reassert it live."""
+    run is recorded with the driver's error, and the route pin is KEPT, read
+    live through the layered wiring-status surface: the l3 row lands FAILED,
+    intended RELEASED, still holding its one route (a release-on-failure would
+    land it RELEASED and never satisfy the poll).
+
+    Not asserted here (issue #1147): the ACK posture. CANCELLED is written by
+    reservations' own DELETE before execution sees the event, so it says
+    nothing about the consumer, and counting remove_route runs cannot tell a
+    NAK redelivery from the background wiring retry tick, which re-drives a
+    FAILED release-direction pin on a terminal reservation every 60 s. The ACK
+    is pinned at unit level by test_nats_consumer_wiring_changed.py
+    (test_driver_failure_acks_and_does_not_raise) and
+    test_nats_consumer_ledger_teardown.py
+    (test_l3_teardown_driver_failure_keeps_pin_and_lands_failed_released)."""
     suffix = uuid.uuid4().hex[:8]
     # Only remove_route is knobbed: configure_route must succeed so there is a
     # pin to attempt removing.
@@ -420,11 +430,18 @@ async def test_l3_remove_route_result_failure_keeps_pin_and_acks(
         assert failed_remove, "remove_route driver-result failure must record a FAILED run"
         assert failed_remove[0]["error"] == "mock injected failure on remove_route"
 
-        # A driver-result failure ACKs (Decision 7): the reservation still
-        # reaches CANCELLED, it does not hang PENDING_PROVISION-adjacent retrying
-        # the whole NATS message.
-        assert await _poll_reservation_status(admin_client, reservation["id"], "CANCELLED"), (
-            "reservation must still reach CANCELLED after a driver-result failure"
+        def _kept_pin(status: dict) -> bool:
+            l3 = [c for c in status.get("connections", []) if c["layer"] == "l3"]
+            return (
+                len(l3) == 1
+                and l3[0]["status"] == "FAILED"
+                and l3[0]["intended"] == "RELEASED"
+                and l3[0]["route_count"] == len(routes)
+            )
+
+        status = await _poll_wiring_status(admin_client, reservation["id"], _kept_pin)
+        assert status is not None and _kept_pin(status), (
+            f"the failed removal must keep the pin FAILED intended RELEASED: {status}"
         )
     finally:
         if topology_id:

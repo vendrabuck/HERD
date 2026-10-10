@@ -87,11 +87,18 @@ async def test_execute_accepts_the_callers_reservation_holding_the_device(
                 "reservation_id": reservation["id"],
             },
         )
-        # The reservation check passed: whatever follows (a run, or the
-        # driverless device's 409), it is not the reservation refusal.
-        assert resp.status_code != 422, resp.text
-        assert resp.status_code != 503, resp.text
-        if resp.status_code == 201:
-            assert resp.json()["reservation_id"] == reservation["id"]
+        # The reservation check passed, so a run row is written and tagged with the
+        # reservation (issue #1147: "not 422 and not 503" also passed a crash or any
+        # other refusal). fresh_device's template carries the session's Management
+        # driver, so the driverless 409 cannot apply; whatever the stub driver does,
+        # a run that starts answers 201 with the run (a failed one included).
+        assert resp.status_code == 201, resp.text
+        run = resp.json()
+        assert run["reservation_id"] == reservation["id"], run
+        runs = await admin_client.get(
+            "/execution/runs", params={"reservation_id": reservation["id"]}
+        )
+        assert runs.status_code == 200, runs.text
+        assert [r["id"] for r in runs.json()["items"]] == [run["id"]], runs.json()
     finally:
         await admin_client.delete(f"/reservations/{reservation['id']}")

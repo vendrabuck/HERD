@@ -73,9 +73,7 @@ async def test_commit_end_before_start_rejected(base_url, user_token):
         "topology_name": "bad-window",
         "start_time": now.isoformat(),
         "end_time": (now - timedelta(hours=1)).isoformat(),
-        "devices": [
-            {"role": "dut", "device_id": "00000000-0000-0000-0000-000000000000"}
-        ],
+        "devices": [{"role": "dut", "device_id": "00000000-0000-0000-0000-000000000000"}],
         "edges": [],
     }
     async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
@@ -96,9 +94,7 @@ async def test_commit_missing_topology_name_rejected(base_url, user_token):
         # topology_name omitted
         "start_time": now.isoformat(),
         "end_time": (now + timedelta(hours=1)).isoformat(),
-        "devices": [
-            {"role": "dut", "device_id": "00000000-0000-0000-0000-000000000000"}
-        ],
+        "devices": [{"role": "dut", "device_id": "00000000-0000-0000-0000-000000000000"}],
         "edges": [],
     }
     async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
@@ -112,35 +108,60 @@ async def test_commit_missing_topology_name_rejected(base_url, user_token):
     )
 
 
-async def test_commit_does_not_gate_on_ai_provider(base_url, user_token, fresh_device):
-    """The commit endpoint is data-only; even without the AI provider
-    configured, an authenticated caller reaches the business logic (rather
-    than a 503 feature-gate). We send a payload that will pass the schema
-    and probe whether the response is anything other than 503. The exact
-    outcome (200 or a business error) depends on user_token's permissions
-    on the seeded device, which we do not assert here.
+async def test_commit_does_not_gate_on_ai_provider(
+    admin_client, base_url, user_token, visible_fresh_device
+):
+    """The commit endpoint is data-only; whether or not the AI provider is
+    configured (the CI and gate stacks have no AI_* settings), an authenticated
+    caller's valid proposal commits: 200 with the topology and reservation ids.
+
+    Issue #1147: this used to assert only "not 503", which a commit refused for
+    any other reason (or a crash answering 500) also satisfied. The device is
+    visible to the caller, so the expected answer is the success itself.
     """
     now = datetime.now(timezone.utc)
     body = {
-        "topology_name": f"int-commit-probe-{now.timestamp():.0f}",
+        "topology_name": f"int-commit-probe-{uuid.uuid4().hex[:8]}",
         "purpose": "commit-gate integration probe",
         "start_time": now.isoformat(),
         "end_time": (now + timedelta(hours=1)).isoformat(),
         "devices": [
-            {"role": "dut", "device_id": fresh_device["id"]},
+            {"role": "dut", "device_id": visible_fresh_device["id"]},
         ],
         "edges": [],
         "apply_configs": False,
     }
-    async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
-        resp = await client.post(
-            f"{base_url}/ai/commit",
-            json=body,
+    topology_id: str | None = None
+    reservation_id: str | None = None
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
+            resp = await client.post(
+                f"{base_url}/ai/commit",
+                json=body,
+                headers={"Authorization": f"Bearer {user_token}"},
+            )
+        assert resp.status_code == 200, f"commit failed: {resp.status_code}: {resp.text}"
+        result = resp.json()
+        topology_id = result["topology_id"]
+        reservation_id = result["reservation_id"]
+        assert result["config_results"] == [], result
+
+        # Read back with the committing user's own token: reservations' caller-token
+        # GET /{id} answers only the caller's own reservation, admins included.
+        async with httpx.AsyncClient(
+            base_url=base_url,
+            verify=False,
             headers={"Authorization": f"Bearer {user_token}"},
-        )
-    assert resp.status_code != 503, (
-        f"commit should not gate on ai_is_configured(); got 503: {resp.text}"
-    )
+            timeout=30.0,
+        ) as uclient:
+            booked = await uclient.get(f"/reservations/{reservation_id}")
+        assert booked.status_code == 200, booked.text
+        assert booked.json()["device_ids"] == [visible_fresh_device["id"]], booked.json()
+    finally:
+        if reservation_id:
+            await admin_client.delete(f"/reservations/{reservation_id}")
+        if topology_id:
+            await delete_topology_checked(admin_client, topology_id)
 
 
 async def test_commit_with_element_attachment_produces_valid_topology(

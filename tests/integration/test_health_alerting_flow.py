@@ -198,22 +198,39 @@ async def test_active_reservation_holder_also_receives(user_client, visible_fres
         await user_client.delete(f"/reservations/{reservation['id']}")
 
 
-async def test_event_with_no_recipients_drops_silently(user_client):
+async def test_event_with_no_recipients_drops_silently(admin_client, user_client):
     """A device with no holders and a non-admin caller results in no notification.
 
     The caller is a regular user (not admin), and the random device_id has no
     active reservation. Recipient resolver returns admins (which the caller is
     not in) and an empty holder list, so the user_client sees nothing.
+
+    The absence is read after the event is proven consumed (issue #1147), never
+    after a window: the admin receives this same event (the positive control that
+    the fan-out ran), and a SECOND event published after it reaches the admin too.
+    The notifications consumer handles the health stream one message at a time,
+    in order, so once the second event's row exists the first is fully handled.
     """
     device_id = str(uuid.uuid4())
+    anchor_device_id = str(uuid.uuid4())
     try:
         await _publish_health_event(_bad_news_event(device_id, device_name="int-no-recipients"))
+        await _publish_health_event(
+            _bad_news_event(anchor_device_id, device_name="int-no-recipients-anchor")
+        )
     except Exception as exc:
         pytest.skip(f"NATS unreachable from test host: {exc}")
 
-    # Short timeout: if a notification was going to arrive for this user
-    # it would have done so by now.
+    admin_row = await _poll_for_notification(admin_client, "device.health_transition", device_id)
+    assert admin_row is not None, "the admin never received the event; the fan-out did not run"
+    anchor_row = await _poll_for_notification(
+        admin_client, "device.health_transition", anchor_device_id
+    )
+    assert anchor_row is not None, (
+        "the anchor event never reached the admin; cannot prove the first was fully handled"
+    )
+
     matched = await _poll_for_notification(
-        user_client, "device.health_transition", device_id, timeout=4.0
+        user_client, "device.health_transition", device_id, timeout=0.5
     )
     assert matched is None

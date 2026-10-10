@@ -141,8 +141,13 @@ async def test_fork_lifecycle_read_edit_save_archive(admin_client, fresh_devices
         )
         assert saved.status_code == 200, saved.text
         result = saved.json()
-        assert "released" in result and "built" in result
         assert result["built"] == []
+        # The seeded wire itself is what the save released (issue #1147: the key's
+        # presence alone held for a save that released nothing).
+        assert len(result["released"]) == 1, result
+        wire = result["released"][0]
+        assert {wire["device_a_id"], wire["device_b_id"]} == {a_id, b_id}, wire
+        assert (wire["port_a"], wire["port_b"]) == ("eth1", "eth1"), wire
         assert result["version_number"] >= 2
 
         # Complete the reservation: teardown archives the fork as the as-built record.

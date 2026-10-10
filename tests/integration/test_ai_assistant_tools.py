@@ -241,19 +241,31 @@ async def test_assistant_write_flow_discovers_schema_first(
         )
 
 
-async def test_assistant_reservation_404_for_non_owner(base_url, user_token):
-    """Iter-1 contract preserved: non-owner gets 404 (not 403) from the assistant."""
+async def test_assistant_reservation_404_for_non_owner(base_url, user_token, admin_reservation):
+    """Iter-1 contract preserved: non-owner gets 404 (not 403) from the assistant.
+
+    The reservation is a REAL one owned by the admin (issue #1147: an unknown id
+    alone proved only the unknown-id branch), and the non-owner's answer must be
+    byte-identical to an unknown id's, so ownership is not revealed."""
     if not ai_provider_configured():
         pytest.skip("AI provider not configured; assistant endpoint returns 503 anyway")
 
+    reservation, _device = admin_reservation
     bogus = str(uuid.uuid4())
     async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
         resp = await client.post(
+            f"{base_url}/ai/reservations/{reservation['id']}/assistant",
+            json={"question": "any?"},
+            headers={"Authorization": f"Bearer {user_token}"},
+        )
+        unknown = await client.post(
             f"{base_url}/ai/reservations/{bogus}/assistant",
             json={"question": "any?"},
             headers={"Authorization": f"Bearer {user_token}"},
         )
-    assert resp.status_code == 404
+    assert resp.status_code == 404, resp.text
+    assert unknown.status_code == 404, unknown.text
+    assert resp.json() == unknown.json(), (resp.text, unknown.text)
 
 
 # Live model call with a documentation lookup: the httpx client below allows

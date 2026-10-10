@@ -38,6 +38,9 @@ async def test_v1_reserve_status_list_release(admin_client, fresh_device):
         status_resp = await admin_client.get(f"/v1/reservations/{reservation_id}")
         assert status_resp.status_code == 200
         assert status_resp.json()["id"] == reservation_id
+        # start_time is now, so the create activated the row in the request:
+        # the release below must move it OFF this status.
+        assert status_resp.json()["status"] == "ACTIVE", status_resp.json()
 
         listed = await admin_client.get("/v1/reservations")
         assert listed.status_code == 200
@@ -45,7 +48,11 @@ async def test_v1_reserve_status_list_release(admin_client, fresh_device):
 
         release = await admin_client.put(f"/v1/reservations/{reservation_id}/release")
         assert release.status_code == 200
-        assert release.json()["status"] in ("COMPLETED", "ACTIVE")
+        assert release.json()["status"] == "COMPLETED", release.json()
+        # Read back through the facade: the release reached the stored row.
+        after = await admin_client.get(f"/v1/reservations/{reservation_id}")
+        assert after.status_code == 200
+        assert after.json()["status"] == "COMPLETED", after.json()
     finally:
         await admin_client.delete(f"/v1/reservations/{reservation_id}")
 

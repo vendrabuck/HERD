@@ -932,12 +932,12 @@ copy of the auth service.
   process is refused as busy `in_process` and one on another replica as busy `replica`,
   each mapped by sync-now to its own 409. \
   Enforced in: `services/auth/app/services/ldap_sync_service.py` (`_SyncSlot`, `SyncBusyError`, `_ADVISORY_LOCK_KEY`); `services/auth/app/routers/ldap_sync.py` (`start_sync_run`) \
-  Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_sync_run_409_while_in_progress_and_lock_released_after`); `services/auth/tests/test_routers_direct_ldap_admin.py` (`test_start_sync_run_direct_in_process_busy_409`, `test_start_sync_run_direct_replica_busy_409`); `services/auth/tests/test_ldap_sync_service_live_pg.py` (`test_sync_slot_replica_busy_when_another_connection_holds_the_lock`, `test_sync_slot_acquires_cleanly_once_the_other_replica_releases`)
+  Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_sync_run_409_while_in_progress_and_lock_released_after`); `services/auth/tests/test_routers_direct_ldap_admin.py` (`test_start_sync_run_direct_in_process_busy_409`, `test_start_sync_run_direct_replica_busy_409`); `services/auth/tests/test_ldap_sync_service_live_pg.py` (`test_sync_slot_replica_busy_when_another_connection_holds_the_lock`, `test_sync_slot_acquires_cleanly_once_the_other_replica_releases`); `tests/integration/test_ldap_sync_admin.py` (`test_concurrent_sync_now_runs_never_overlap`)
 - **IAM-SERIAL-2.** Sync-now is refused 409 outside LDAP mode without taking the slot;
   otherwise it creates the run row, hands the slot to a background task, and answers 202
   with `run_id` at once. \
   Enforced in: `services/auth/app/routers/ldap_sync.py` (`start_sync_run`); `services/auth/app/services/ldap_sync_service.py` (`start_background_run`, `_run_in_background`) \
-  Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_sync_run_202_then_run_visible_and_finalized`, `test_sync_run_refused_outside_ldap_mode_without_leaking_lock`); `tests/integration/test_ldap_sync_admin.py` (`test_concurrent_sync_now_one_wins`)
+  Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_sync_run_202_then_run_visible_and_finalized`, `test_sync_run_refused_outside_ldap_mode_without_leaking_lock`); `tests/integration/test_ldap_sync_admin.py` (`test_concurrent_sync_now_runs_never_overlap`)
 - **IAM-SERIAL-3.** A failed advisory unlock invalidates the lock's connection so the
   session lock cannot outlive the run on a pooled connection. \
   Enforced in: `services/auth/app/services/ldap_sync_service.py` (`_release_sync_locks`) \

@@ -42,6 +42,7 @@ import pytest
 
 from ._device_teardown import delete_device_checked
 from ._topology_teardown import delete_topology_checked
+from .conftest import _psql
 
 pytestmark = pytest.mark.asyncio
 
@@ -181,8 +182,12 @@ async def _create_topology(client, canvas: dict) -> str:
     return topology_id
 
 
-async def _create_reservation(client, device_ids: list[str], topology_id: str) -> dict:
-    now = datetime.now(timezone.utc)
+async def _create_reservation(
+    client, device_ids: list[str], topology_id: str, *, start_offset_s: float = 0.0
+) -> dict:
+    """Book now (activates in the request) or, with start_offset_s, a PENDING
+    row the expiration sweep activates once its start time passes."""
+    now = datetime.now(timezone.utc) + timedelta(seconds=start_offset_s)
     resp = await client.post(
         "/reservations/",
         json={
@@ -346,9 +351,25 @@ async def test_vlan_released_on_reservation_cancel(admin_client, l2_template, fr
         await admin_client.delete(f"/inventory/devices/{switch['id']}")
 
 
+@pytest.mark.timeout(90)
 async def test_vlan_ids_are_unique_within_same_fabric(admin_client, l2_template, fresh_devices):
     """Two overlapping reservations whose DUTs share one L2 switch (one fabric)
-    receive different VLAN ids (the per-fabric uniqueness invariant)."""
+    receive different VLAN ids (the per-fabric uniqueness invariant).
+
+    The collision is FORCED (issue #1147): each reservation's preferred number is
+    derived from its server-chosen id (vlan_service._derive_vlan_id), so two
+    random ids collide about once in 4093 runs and a plain "the two differ" check
+    passes with the uniqueness rule removed. So B is booked PENDING, its id is
+    known, A's stored ACTIVE allocation is moved onto B's preferred number, and
+    only then is B activated. B must be given another number. Unit pin:
+    test_vlan_service.py test_assign_vlan_forced_conflict.
+
+    B is booked beyond RESERVATION_START_GRACE_SECONDS (300 by default), because a
+    start inside the grace is treated as "start now" and activates in the create
+    request. Its start_time is then moved to now in Postgres so the expiration
+    sweep (EXPIRATION_INTERVAL_SECONDS=5 on this stack) claims it on its next
+    tick, the same activation path a scheduled booking takes.
+    """
     suffix = uuid.uuid4().hex[:8]
     switch = await _create_device(admin_client, l2_template["id"], f"mock-l2-sw-{suffix}")
     dut_a, dut_b = await fresh_devices(2)
@@ -372,20 +393,42 @@ async def test_vlan_ids_are_unique_within_same_fabric(admin_client, l2_template,
 
         res_a = await _create_reservation(admin_client, [dut_a["id"], switch["id"]], topo_a)
         reservations.append(res_a)
-        res_b = await _create_reservation(admin_client, [dut_b["id"], switch["id"]], topo_b)
-        reservations.append(res_b)
         assert await _poll_active(admin_client, res_a["id"]), "reservation A never activated"
-        assert await _poll_active(admin_client, res_b["id"]), "reservation B never activated"
-
         runs_a = await _poll_success_runs(admin_client, res_a["id"], "add_to_vlan")
-        runs_b = await _poll_success_runs(admin_client, res_b["id"], "add_to_vlan")
-        assert runs_a and runs_b, "both reservations must provision a VLAN on the shared switch"
+        assert runs_a, "reservation A never joined its VLAN on the shared switch"
 
-        vlan_a = _vlan_of(runs_a[0])
+        res_b = await _create_reservation(
+            admin_client, [dut_b["id"], switch["id"]], topo_b, start_offset_s=900.0
+        )
+        reservations.append(res_b)
+        assert res_b["status"] == "PENDING", res_b
+        preferred_b = (uuid.UUID(res_b["id"]).int % 4093) + 2
+        moved = _psql(
+            f"UPDATE execution.vlan_assignments SET vlan_id = {preferred_b} "
+            f"WHERE reservation_id = '{res_a['id']}' AND status = 'ACTIVE'"
+        )
+        assert moved.returncode == 0 and "UPDATE 1" in moved.stdout, (
+            moved.stdout,
+            moved.stderr,
+        )
+        # Make B due now; the sweep's claim (_due_pending_stmt) activates it.
+        due = _psql(
+            "UPDATE reservations.reservations SET start_time = now() "
+            f"WHERE id = '{res_b['id']}' AND status = 'PENDING'"
+        )
+        assert due.returncode == 0 and "UPDATE 1" in due.stdout, (due.stdout, due.stderr)
+
+        assert await _poll_active(admin_client, res_b["id"], timeout=15.0), (
+            "reservation B never activated"
+        )
+        runs_b = await _poll_success_runs(admin_client, res_b["id"], "add_to_vlan")
+        assert runs_b, "reservation B never joined a VLAN on the shared switch"
+
         vlan_b = _vlan_of(runs_b[0])
-        assert 2 <= vlan_a <= 4094 and 2 <= vlan_b <= 4094
-        assert vlan_a != vlan_b, (
-            f"two reservations in the same fabric got the same vlan_id {vlan_a}"
+        assert 2 <= vlan_b <= 4094
+        assert vlan_b != preferred_b, (
+            f"reservation B took its preferred vlan_id {preferred_b}, which A holds "
+            "in the same fabric"
         )
     finally:
         for res in reservations:

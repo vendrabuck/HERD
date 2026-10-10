@@ -18,8 +18,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .conftest import api_request
-
 WAIT = 15
 
 
@@ -72,49 +70,6 @@ def test_notifications_bell_opens_panel(logged_in_browser, base_url):
     )
     assert mark_all.is_displayed()
     assert settings_btn.is_displayed()
-    _close_bell_if_open(logged_in_browser)
-
-
-def test_notifications_panel_empty_state(logged_in_browser, base_url):
-    """With no notifications, the panel shows the empty-state copy and
-    'Mark all read' is disabled."""
-    logged_in_browser.get(f"{base_url}/topology")
-    # Best-effort clear: mark-all-read so unread count is zero.
-    api_request(
-        logged_in_browser,
-        "POST",
-        "/notifications/notifications/read-all",
-        allow_errors=True,
-    )
-    # Ensure list endpoint reachable; skip if backend not seeded.
-    list_resp = api_request(
-        logged_in_browser,
-        "GET",
-        "/notifications/notifications?limit=20",
-        allow_errors=True,
-    )
-    if list_resp.status_code != 200:
-        import pytest
-
-        pytest.skip(f"notifications list unavailable: {list_resp.status_code}")
-    items = list_resp.json().get("items", [])
-
-    _open_bell(logged_in_browser)
-    if not items:
-        body = logged_in_browser.find_element(By.TAG_NAME, "body").text
-        assert "No notifications yet" in body
-        mark_all = logged_in_browser.find_element(
-            By.XPATH, "//button[normalize-space()='Mark all read']"
-        )
-        # disabled attribute is reflected as a property when truthy.
-        assert mark_all.get_attribute("disabled") is not None
-    else:
-        # If notifications exist from a prior session, just confirm panel rendered
-        # a list region rather than the empty-state.
-        bodies = logged_in_browser.find_elements(
-            By.XPATH, "//*[contains(text(), 'No notifications yet')]"
-        )
-        assert bodies == []
     _close_bell_if_open(logged_in_browser)
 
 

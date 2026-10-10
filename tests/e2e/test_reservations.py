@@ -68,23 +68,30 @@ def test_calendar_has_view_mode_toggles(logged_in_browser, base_url):
 
 
 def test_calendar_day_view_toggles(logged_in_browser, base_url):
-    """Clicking 'day' switches the header label to a single-day format."""
+    """Clicking 'day' switches the header label to a single-day format.
+
+    Issue #1148: the old check (the Today button is displayed) held in every view
+    mode. The header label is read before and after: the default week label is a
+    range ("Oct 5 - Oct 11, 2026"), and the day label is one date with no range.
+    """
     logged_in_browser.get(f"{base_url}/reservations/calendar")
     wait = WebDriverWait(logged_in_browser, WAIT)
     wait.until(EC.presence_of_element_located((By.XPATH, "//button[contains(text(), 'Today')]")))
+
+    header = (By.XPATH, "//button[normalize-space()='Next']/following-sibling::span[1]")
+    week_label = wait.until(EC.presence_of_element_located(header)).text
+    assert " - " in week_label, f"the default week view label is not a range: {week_label!r}"
 
     day_btn = logged_in_browser.find_element(
         By.XPATH, "//button[normalize-space()='day']"
     )
     day_btn.click()
 
-    import time
-
-    time.sleep(0.5)
-    # Day view still shows the Today button and renders without error.
-    assert logged_in_browser.find_element(
-        By.XPATH, "//button[contains(text(), 'Today')]"
-    ).is_displayed()
+    wait.until(lambda d: d.find_element(*header).text != week_label)
+    day_label = logged_in_browser.find_element(*header).text
+    assert day_label and " - " not in day_label, (
+        f"the day view label is not a single date: {day_label!r}"
+    )
 
 
 def test_calendar_today_button_clickable(logged_in_browser, base_url):

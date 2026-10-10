@@ -76,9 +76,19 @@ async def test_jwt_endpoint_rejects_malformed_bearer(base_url):
 
 
 async def test_jwt_endpoint_rejects_expired_token(base_url):
-    """A JWT signed with the right key but with `exp` in the past is 401."""
+    """A JWT signed with the right key but with `exp` in the past is 401.
+
+    Positive control first (issue #1147): the same minting with a future `exp`
+    must get PAST auth (404 for the unknown device; GET /devices/{id} checks
+    existence before visibility), or the host's AUTH_SECRET_KEY is not the stack's
+    verifying key and the 401 below would prove nothing about expiry."""
     expired = _mint_jwt({"exp": int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp())})
     async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+        control = await client.get(
+            f"{base_url}/inventory/devices/{_FAKE_DEVICE}",
+            headers={"Authorization": f"Bearer {_mint_jwt()}"},
+        )
+        assert control.status_code == 404, control.text
         resp = await client.get(
             f"{base_url}/inventory/devices/{_FAKE_DEVICE}",
             headers={"Authorization": f"Bearer {expired}"},

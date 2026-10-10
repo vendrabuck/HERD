@@ -432,6 +432,34 @@ def _dynamic_device_id(reservation: dict, physical_id: str) -> str:
     return extra.pop()
 
 
+async def _book_dynamic_anchor(client, template_id: str) -> tuple[str, str | None]:
+    """Ordering anchor (issue #1147): book a LATER dynamic-only reservation and wait
+    for it to go ACTIVE. ACTIVE needs execution's provision-result callback, so the
+    later provision_requested has been consumed; the execution consumer handles the
+    reservations stream one message at a time, in order, so every event published
+    before it has been consumed too. Returns (reservation id, materialized device id)
+    for _cancel_and_drain."""
+    now = datetime.now(timezone.utc)
+    resp = await client.post(
+        "/reservations/",
+        json={
+            "device_ids": [],
+            "purpose": "dynamic resources ordering anchor",
+            "start_time": now.isoformat(),
+            "end_time": (now + timedelta(hours=1)).isoformat(),
+            "dynamic_requests": [{"template_id": template_id}],
+        },
+    )
+    resp.raise_for_status()
+    anchor_id = resp.json()["id"]
+    active = await _poll_reservation_status(client, anchor_id, "ACTIVE")
+    assert active is not None, (
+        "the ordering anchor never activated; cannot prove the earlier events were consumed"
+    )
+    device_ids = active.get("device_ids") or []
+    return anchor_id, (device_ids[0] if device_ids else None)
+
+
 async def _cancel_and_drain(client, reservation_id: str, device_id: str | None = None) -> None:
     """Best-effort cleanup: cancel, then wait for the async instance teardown.
 
@@ -657,25 +685,32 @@ async def test_failed_keyed_destroy_leaves_ledger_row_creating(
 
 @pytest.mark.timeout(300)
 async def test_failed_recipe_login_never_creates_and_lands_failed(
-    admin_client, failing_login_dynamic_template, fresh_device
+    admin_client, failing_login_dynamic_template, dynamic_template, fresh_device
 ):
     """Issue #1027, live: the recipe login returns {"success": false}. No
     create_instance may run on any delivery (it used to run right after the
     failed login), every login run row is FAILED, the event exhausts its
     deliveries and the reservation lands in FAILED. Teardown's own login fails
     the same way, so no destroy_instance runs either and the ledger row stays
-    CREATING with no instance_ref as a may-still-exist record."""
+    CREATING with no instance_ref as a may-still-exist record.
+
+    "No destroy" is also the state BEFORE teardown runs, so the runs are read after
+    an ordering anchor booked once FAILED is seen (issue #1147): the reservation.failed
+    event that drives teardown is then known to be consumed."""
     reservation = await _reserve_dynamic(
         admin_client, fresh_device["id"], failing_login_dynamic_template["id"]
     )
     request_id = reservation["dynamic_requests"][0]["id"]
+    anchor_id = None
+    anchor_device_id = None
     try:
         failed = await _poll_reservation_status(
             admin_client, reservation["id"], "FAILED", timeout=240.0, interval=2.0
         )
         assert failed is not None, "reservation never landed in FAILED after login failures"
-        # Let teardown's login run land before reading the runs.
-        await asyncio.sleep(3.0)
+        anchor_id, anchor_device_id = await _book_dynamic_anchor(
+            admin_client, dynamic_template["id"]
+        )
 
         assert await _runs(admin_client, reservation["id"], "create_instance") == []
         assert await _runs(admin_client, reservation["id"], "destroy_instance") == []
@@ -689,6 +724,8 @@ async def test_failed_recipe_login_never_creates_and_lands_failed(
         status = await _poll_device_status(admin_client, fresh_device["id"], "AVAILABLE")
         assert status == "AVAILABLE", f"physical device stuck in {status} after FAILED"
     finally:
+        if anchor_id:
+            await _cancel_and_drain(admin_client, anchor_id, anchor_device_id)
         # Test garbage on a shared stack: no create ever ran, so the
         # may-still-exist row is known to be empty here and can go.
         _psql(f"DELETE FROM execution.dynamic_instances WHERE request_id = '{request_id}'")
@@ -786,6 +823,8 @@ async def test_provision_requested_redelivery_is_idempotent(
 
     reservation = await _reserve_dynamic(admin_client, fresh_device["id"], dynamic_template["id"])
     device_id = None
+    anchor_id = None
+    anchor_device_id = None
     try:
         active = await _poll_reservation_status(admin_client, reservation["id"], "ACTIVE")
         assert active is not None, "reservation never became ACTIVE"
@@ -804,10 +843,11 @@ async def test_provision_requested_redelivery_is_idempotent(
         mutated["event_id"] = str(uuid.uuid4())
         await publish_raw(_PROVISION_SUBJECT, json.dumps(mutated).encode())
 
-        # Settle: a redelivered create short-circuits on the ledger row, so
-        # there is no positive signal to poll for; give the consumer time to
-        # process both replays, then assert nothing was duplicated.
-        await asyncio.sleep(6.0)
+        # A refused replay leaves no positive signal, so read the absence after an
+        # ordering anchor booked behind both replays (issue #1147), not a sleep.
+        anchor_id, anchor_device_id = await _book_dynamic_anchor(
+            admin_client, dynamic_template["id"]
+        )
 
         creates = await _runs(admin_client, reservation["id"], "create_instance", "SUCCESS")
         assert len(creates) == 1, (
@@ -824,6 +864,8 @@ async def test_provision_requested_redelivery_is_idempotent(
         assert body["status"] == "ACTIVE"
         assert sorted(body["device_ids"]) == sorted(active["device_ids"])
     finally:
+        if anchor_id:
+            await _cancel_and_drain(admin_client, anchor_id, anchor_device_id)
         await _cancel_and_drain(admin_client, reservation["id"], device_id)
 
 

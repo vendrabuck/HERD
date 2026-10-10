@@ -1,10 +1,10 @@
 """E2E tests for the drivers admin page."""
 
-import time
-
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+
+from .conftest import api_request
 
 WAIT = 15
 
@@ -67,8 +67,11 @@ def test_drivers_connection_type_dropdown_has_all_options(admin_browser, base_ur
 
 
 def test_drivers_upload_requires_name(admin_browser, base_url):
-    """Clicking Upload without a name surfaces a validation error toast."""
+    """Clicking Upload without a name surfaces a validation error toast, and no
+    driver is created (read back through the API)."""
     _open_drivers(admin_browser, base_url)
+    before = api_request(admin_browser, "GET", "/inventory/drivers", params={"limit": 1})
+    total_before = before.json()["total"]
     admin_browser.find_element(
         By.XPATH, "//button[contains(., 'Upload Driver')]"
     ).click()
@@ -79,9 +82,19 @@ def test_drivers_upload_requires_name(admin_browser, base_url):
     admin_browser.find_element(
         By.XPATH, "//button[normalize-space()='Upload']"
     ).click()
-    time.sleep(1.0)
-    body = admin_browser.find_element(By.TAG_NAME, "body").text.lower()
-    assert "required" in body or "name" in body
+    # The validation toast by exact text (issue #1148: "name" matched the
+    # modal's own Name label and the table header).
+    wait.until(
+        EC.presence_of_element_located(
+            (
+                By.XPATH,
+                "//*[@data-rht-toaster]//*[@role='status'"
+                " and normalize-space()='Name is required']",
+            )
+        )
+    )
+    after = api_request(admin_browser, "GET", "/inventory/drivers", params={"limit": 1})
+    assert after.json()["total"] == total_before, "a refused upload must create no driver"
 
     admin_browser.find_element(
         By.XPATH, "//button[normalize-space()='Cancel']"

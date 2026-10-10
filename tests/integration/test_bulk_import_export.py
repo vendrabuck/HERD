@@ -142,7 +142,9 @@ async def test_topology_import_rejects_unreachable_edge(admin_client, fresh_devi
     assert resp.status_code == 200, resp.text
     report = resp.json()
     assert report["rejected"] == 1
-    assert "validation failed" in report["rows"][0]["reason"]
+    # The exact reason (issue #1147): "validation failed" alone matched every
+    # validator refusal, not the unreachable edge this test builds.
+    assert report["rows"][0]["reason"] == "topology validation failed: no_path(e1)", report
 
 
 @pytest.mark.asyncio

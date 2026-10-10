@@ -137,6 +137,34 @@ describe("EquipmentBrowser", () => {
     expect(screen.queryByText(/No devices in inventory/)).not.toBeInTheDocument();
   });
 
+  it("sends the typed search to the devices request and lists only what it returns", async () => {
+    // Issue #1148: every other case answers each devices request the same way,
+    // so a palette that never sent `search` passed them all. This handler
+    // filters on the query parameter like the real list route does.
+    stubTemplates();
+    const alpha = makeDevice({ id: "dev-alpha", name: "alpha-switch" });
+    const beta = makeDevice({ id: "dev-beta", name: "beta-router" });
+    const searches: (string | null)[] = [];
+    server.use(
+      http.get("/api/inventory/devices", ({ request }) => {
+        const search = new URL(request.url).searchParams.get("search");
+        searches.push(search);
+        const items = [alpha, beta].filter((d) => !search || d.name.includes(search));
+        return HttpResponse.json(paginate(items));
+      }),
+    );
+
+    renderWithProviders(<EquipmentBrowser />);
+    expect(await screen.findByText("alpha-switch")).toBeInTheDocument();
+    expect(screen.getByText("beta-router")).toBeInTheDocument();
+
+    await userEvent.type(screen.getByPlaceholderText("Search devices..."), "beta");
+
+    await waitFor(() => expect(screen.queryByText("alpha-switch")).not.toBeInTheDocument());
+    expect(screen.getByText("beta-router")).toBeInTheDocument();
+    expect(searches).toContain("beta");
+  });
+
   it("shows an error message when the devices request fails", async () => {
     stubTemplates();
     server.use(

@@ -10,9 +10,15 @@ This test is gated three ways and auto-skips when any gate fails:
    and looking for the LDAP method hint. If absent we skip.
 2. The local OpenLDAP container described in the project local LDAP setup notes
    must be reachable. We probe for it via the auth service's login endpoint.
-3. The test user `user1` (password `Password1` per the local-ldap context file)
-   must bind successfully. If the login attempt returns 401, the LDAP
-   directory or its env wiring is wrong, and we skip rather than fail.
+3. The test user defaults to `ldapit-eng1` (password `Password1`), the
+   dedicated integration identity from infra/ldap-test/ldif/70-seed-integration.ldif.
+   The seed script's LOCAL user1..user1000 would collide with `user1` (JIT
+   provisioning refuses a username collision).
+
+Once the module gates pass, a login that does not redirect FAILS (issue #1148):
+it used to be turned into a skip, and this module's seeded_skip_ok marker then
+exempted that skip from the no-skip gate, so the test could not fail for the
+defect it names.
 
 When the stack is configured for local auth (the default for this branch),
 all tests in this file skip cleanly.
@@ -26,10 +32,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .conftest import HOST_BASE_URL
+from .conftest import HOST_BASE_URL, api_request
 
 WAIT = 15
-LDAP_USERNAME = os.environ.get("E2E_LDAP_USERNAME", "user1")
+LDAP_USERNAME = os.environ.get("E2E_LDAP_USERNAME", "ldapit-eng1")
 LDAP_PASSWORD = os.environ.get("E2E_LDAP_PASSWORD", "Password1")
 
 
@@ -79,15 +85,7 @@ def test_ldap_user_can_login(browser, base_url):
 
     browser.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
 
-    try:
-        wait.until(EC.url_contains("/topology"))
-    except Exception:
-        # If the directory bind failed (wrong env), surface as a skip rather
-        # than a false-negative test failure.
-        pytest.skip(
-            f"LDAP bind for {LDAP_USERNAME!r} did not redirect to /topology; "
-            "check stack LDAP env wiring."
-        )
+    wait.until(EC.url_contains("/topology"))
     assert "/topology" in browser.current_url
 
 
@@ -105,12 +103,10 @@ def test_ldap_login_jit_provisions_user(browser, base_url):
         browser.find_element(By.ID, "login-email").send_keys(LDAP_USERNAME)
         browser.find_element(By.ID, "login-password").send_keys(LDAP_PASSWORD)
         browser.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
-        try:
-            wait.until(EC.url_contains("/topology"))
-        except Exception:
-            pytest.skip("LDAP bind redirect did not happen")
+        wait.until(EC.url_contains("/topology"))
 
-    # Non-admin LDAP users cannot view the admin page; just confirm the header
-    # username (set from the auth /me response) matches our LDAP uid.
-    body = browser.find_element(By.TAG_NAME, "body").text
-    assert LDAP_USERNAME in body or LDAP_USERNAME.lower() in body.lower()
+    # Non-admin LDAP users cannot view the admin page, so read the account the
+    # browser's own session belongs to through the API (issue #1148: a page
+    # substring "user1" also matched user10 to user19).
+    me = api_request(browser, "GET", "/auth/me")
+    assert me.json()["username"] == LDAP_USERNAME, me.json()

@@ -209,14 +209,25 @@ async def _poll_route_run(client, reservation_id, action, destination, *, timeou
     return None
 
 
-async def _no_route_run(client, reservation_id, action, *, window=6.0) -> bool:
-    """Return True if NO run of `action` appears within `window` seconds (absence check)."""
-    deadline = asyncio.get_event_loop().time() + window
+async def _no_route_run_once_applied(
+    client, reservation_id, action, version, *, timeout=25.0
+) -> bool:
+    """True if NO SUCCESS run of `action` exists once execution applied fork `version`.
+
+    The anchor is execution-side (issue #1147): handle_wiring_changed stamps
+    last_applied_fork_version only after the L3 pass ran, so once the stamp reaches
+    `version` the reconcile that could have driven `action` is done and the absence
+    read below is a fact, not the end of a fixed window."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    applied = None
     while asyncio.get_event_loop().time() < deadline:
-        if await _runs(client, reservation_id, action):
-            return False
+        resp = await client.get(f"/reservations/{reservation_id}/wiring-status")
+        if resp.status_code == 200:
+            applied = resp.json().get("last_applied_fork_version")
+            if applied is not None and applied >= version:
+                return not await _runs(client, reservation_id, action)
         await asyncio.sleep(0.5)
-    return True
+    pytest.fail(f"execution never applied fork version {version} (last applied {applied})")
 
 
 async def _poll_active(client, reservation_id: str, *, timeout: float = 15.0) -> bool:
@@ -232,17 +243,15 @@ async def _poll_active(client, reservation_id: str, *, timeout: float = 15.0) ->
 async def _poll_retry_l3(client, reservation_id, outcome, *, timeout=25.0):
     """Poll POST wiring/retry until a layer-l3 outcome matches `outcome`."""
     deadline = asyncio.get_event_loop().time() + timeout
-    last = None
     while asyncio.get_event_loop().time() < deadline:
         resp = await client.post(f"/reservations/{reservation_id}/wiring/retry")
         if resp.status_code == 200:
             for row in resp.json().get("results", []):
                 if row.get("layer") == "l3":
-                    last = row
                     if row.get("outcome") == outcome:
                         return row
         await asyncio.sleep(0.5)
-    return last
+    return None
 
 
 async def _save_fork(client, reservation_id, canvas):
@@ -349,9 +358,9 @@ async def test_l3_shared_adjacency_keeps_routes_until_last_hop_leaves(
         }
         resaved = await _save_fork(admin_client, rid, only_a)
         assert resaved.status_code == 200, resaved.text
-        assert await _no_route_run(admin_client, rid, "remove_route"), (
-            "a still-adjacent L3 switch must NOT be deprovisioned"
-        )
+        assert await _no_route_run_once_applied(
+            admin_client, rid, "remove_route", resaved.json()["version_number"]
+        ), "a still-adjacent L3 switch must NOT be deprovisioned"
     finally:
         if rid:
             await admin_client.delete(f"/reservations/{rid}")
@@ -393,7 +402,9 @@ async def test_l3_failed_provision_surfaces_and_manual_retry_recovers(
         # The failed provision surfaces as a layer-l3 FAILED outcome (still_failed while
         # the knob is armed).
         failed = await _poll_retry_l3(admin_client, rid, "still_failed")
-        assert failed is not None and failed["layer"] == "l3", "no FAILED L3 pin surfaced"
+        assert failed is not None and failed["outcome"] == "still_failed", (
+            "no FAILED L3 pin surfaced as still_failed while the knob was armed"
+        )
         assert failed["route_count"] == len(ROUTES)
 
         # Clear the knob and retry: the provision converges ACTIVE.
