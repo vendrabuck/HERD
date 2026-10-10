@@ -11,14 +11,6 @@ describe("authStore", () => {
     });
   });
 
-  it("initializes with null tokens when localStorage is empty", () => {
-    const state = useAuthStore.getState();
-    expect(state.accessToken).toBeNull();
-    expect(state.refreshToken).toBeNull();
-    expect(state.user).toBeNull();
-    expect(state.isAuthenticated).toBe(false);
-  });
-
   it("setTokens persists to localStorage and updates state", () => {
     useAuthStore.getState().setTokens("access-123", "refresh-456");
     const state = useAuthStore.getState();
@@ -53,24 +45,51 @@ describe("authStore", () => {
     useAuthStore.getState().setUser(user);
     expect(useAuthStore.getState().user).toEqual(user);
   });
+});
 
-  it("reads tokens from localStorage on initialization", () => {
+// Issue #1142: the store's initializer runs once, when the module is first
+// imported, so the tests above (which reset state with setState) never
+// exercise it. Each test here seeds localStorage, drops the module cache, and
+// imports a FRESH store so the real initializer reads what was seeded.
+describe("authStore initializer", () => {
+  async function freshStore() {
+    vi.resetModules();
+    const mod = await import("@/stores/authStore");
+    return mod.useAuthStore;
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    localStorage.clear();
+    vi.resetModules();
+  });
+
+  it("reads tokens from localStorage on initialization", async () => {
     localStorage.setItem("access_token", "stored-access");
     localStorage.setItem("refresh_token", "stored-refresh");
-    // Re-create store state by calling the creator
-    // Zustand stores read localStorage in the initializer, so we need to
-    // simulate re-initialization by checking what the store creator would produce
-    const store = useAuthStore;
-    // The store was already created, but we can verify the pattern works
-    // by setting state as the initializer would
-    store.setState({
-      accessToken: localStorage.getItem("access_token"),
-      refreshToken: localStorage.getItem("refresh_token"),
-      isAuthenticated: !!localStorage.getItem("access_token"),
-    });
-    const state = store.getState();
+    const state = (await freshStore()).getState();
     expect(state.accessToken).toBe("stored-access");
     expect(state.refreshToken).toBe("stored-refresh");
+    expect(state.user).toBeNull();
     expect(state.isAuthenticated).toBe(true);
+  });
+
+  it("initializes with null tokens when localStorage is empty", async () => {
+    const state = (await freshStore()).getState();
+    expect(state.accessToken).toBeNull();
+    expect(state.refreshToken).toBeNull();
+    expect(state.user).toBeNull();
+    expect(state.isAuthenticated).toBe(false);
+  });
+
+  it("is not authenticated from a stored refresh token alone", async () => {
+    localStorage.setItem("refresh_token", "stored-refresh");
+    const state = (await freshStore()).getState();
+    expect(state.accessToken).toBeNull();
+    expect(state.refreshToken).toBe("stored-refresh");
+    expect(state.isAuthenticated).toBe(false);
   });
 });

@@ -15,6 +15,7 @@ vi.mock("react-router-dom", async () => {
 });
 
 import { server } from "../mocks/server";
+import { flushPending } from "../flushPending";
 import { DeviceGroupsPage } from "@/pages/admin/DeviceGroupsPage";
 
 function renderWithProviders(node: ReactNode) {
@@ -146,10 +147,14 @@ describe("DeviceGroupsPage", () => {
     await screen.findByText("Edge Firewalls");
 
     fireEvent.click(screen.getAllByRole("button", { name: "Delete" })[0]);
-    const dialog = within(screen.getByRole("dialog", { name: "Delete Device Group" }));
-    fireEvent.click(dialog.getByRole("button", { name: "Cancel" }));
+    const dialogEl = screen.getByRole("dialog", { name: "Delete Device Group" });
+    fireEvent.click(within(dialogEl).getByRole("button", { name: "Cancel" }));
 
+    // Issue #1142: a delete the click started reaches the handler only after
+    // a few async hops, so let them run before asserting it never happened.
+    await flushPending();
     expect(deleteCalled).toBe(false);
+    expect(dialogEl).not.toHaveAttribute("open");
   });
 
   it("surfaces the server detail message when delete fails", async () => {

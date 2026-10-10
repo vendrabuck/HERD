@@ -290,11 +290,23 @@ describe("useForkVersionPreview", () => {
       { wrapper },
     );
 
+    // Issue #1142: restore from INSIDE a preview, the only state in which a
+    // live draft is preserved. Restoring from idle preserves nothing, so a
+    // restore that wrongly routed through exit() (which reloads the preserved
+    // draft) would look identical there.
+    result.current.startPreview(V1);
+    await waitFor(() => expect(result.current.mode).toBe("preview"));
+    await waitFor(() => expect(result.current.previewLoading).toBe(false));
+    // A null canvas_data previews nothing onto the store; clear any call so
+    // the assertions below see only what the restore loaded.
+    loadCanvas.mockClear();
+
     await result.current.restoreVersion(V1);
 
     // loadCanvas's LAST call must be the empty restored canvas, not the
     // preserved live draft: a null canvas_data must still replace the stale
-    // draft rather than leaving it on screen.
+    // draft rather than leaving it on screen, and no call in between may
+    // flash the live draft back either.
     const lastCall = loadCanvas.mock.calls[loadCanvas.mock.calls.length - 1][0] as CanvasData;
     expect(lastCall).toEqual({ nodes: [], edges: [] });
     expect(loadCanvas.mock.calls.every((call) => call[0] !== live)).toBe(true);

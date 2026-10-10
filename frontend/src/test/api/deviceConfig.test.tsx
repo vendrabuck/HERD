@@ -5,8 +5,10 @@ import type { ReactNode } from "react";
 import { describe, it, expect } from "vitest";
 
 import { server } from "../mocks/server";
+import { flushPending } from "../flushPending";
 import {
   useDeviceConfigVersions,
+  useDeviceConfigVersion,
   useCreateDeviceConfigVersion,
   useDeviceConfigDiff,
   useApplyDeviceConfigVersion,
@@ -24,6 +26,41 @@ const VA = "22222222-2222-2222-2222-222222222222";
 const VB = "33333333-3333-3333-3333-333333333333";
 
 describe("device config api hooks", () => {
+  // Issue #1142: the Routing panel's lazy Import relies on this option. A
+  // disabled detail query must issue no request until refetch() is called.
+  it("useDeviceConfigVersion with enabled false fetches nothing until refetch", async () => {
+    let detailGets = 0;
+    server.use(
+      http.get(`/api/inventory/devices/${DEVICE}/config-versions/${VA}`, () => {
+        detailGets += 1;
+        return HttpResponse.json({ id: VA, device_id: DEVICE, config: { routes: [] } });
+      }),
+    );
+    const { result } = renderHook(
+      () => useDeviceConfigVersion(DEVICE, VA, { enabled: false }),
+      { wrapper },
+    );
+    await flushPending();
+    expect(detailGets).toBe(0);
+    expect(result.current.data).toBeUndefined();
+
+    await result.current.refetch();
+    expect(detailGets).toBe(1);
+  });
+
+  it("useDeviceConfigVersion without options fetches at once", async () => {
+    let detailGets = 0;
+    server.use(
+      http.get(`/api/inventory/devices/${DEVICE}/config-versions/${VA}`, () => {
+        detailGets += 1;
+        return HttpResponse.json({ id: VA, device_id: DEVICE, config: { routes: [] } });
+      }),
+    );
+    const { result } = renderHook(() => useDeviceConfigVersion(DEVICE, VA), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(detailGets).toBe(1);
+  });
+
   it("lists config versions", async () => {
     server.use(
       http.get(`/api/inventory/devices/${DEVICE}/config-versions`, () =>

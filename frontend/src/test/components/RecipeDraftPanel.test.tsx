@@ -295,12 +295,35 @@ describe("RecipeDraftPanel", () => {
   it("closing the panel resets prompt, draft, and upload fields", async () => {
     const onClose = vi.fn();
     mockCreateDriver.mutateAsync.mockResolvedValue({});
+    // onClose is a spy, so the panel stays mounted and open after the close:
+    // every field the close must reset can be read back (issue #1142).
     render(<RecipeDraftPanel open onClose={onClose} />);
+    fireEvent.change(screen.getByLabelText("Hypervisor type (optional)"), {
+      target: { value: "proxmox" },
+    });
     await draftInPanel(draftResponse());
+    expect(await screen.findByText("Validation passed (1 attempt)")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Driver name"), { target: { value: "my-recipe" } });
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "my notes" } });
 
     fireEvent.click(await screen.findByRole("button", { name: "Approve and upload", hidden: true }));
     await waitFor(() => expect(mockToastSuccess).toHaveBeenCalledWith("Recipe uploaded as a driver"));
     expect(onClose).toHaveBeenCalled();
+
+    // Prompt, hypervisor type, and the draft are cleared.
+    expect(screen.getByLabelText("What should the recipe do?")).toHaveValue("");
+    expect(screen.getByLabelText("Hypervisor type (optional)")).toHaveValue("");
+    expect(screen.queryByText(/Validation passed/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Driver name")).not.toBeInTheDocument();
+
+    // The upload fields are hidden with the draft, so a fresh draft shows
+    // whether they were reset: the name prefills from the NEW metadata only
+    // when the old value was cleared (applyDraft keeps a non-empty name).
+    await draftInPanel(
+      draftResponse({ driver_metadata: { name: "second-recipe", version: "0.1.0" } }),
+    );
+    expect(await screen.findByLabelText("Driver name")).toHaveValue("second-recipe");
+    expect(screen.getByLabelText("Description")).toHaveValue("");
   });
 
   it("renders FAILED for a failed dry-run method, with its error and transcript", async () => {

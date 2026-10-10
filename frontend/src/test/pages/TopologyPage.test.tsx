@@ -46,6 +46,7 @@ vi.mock("@/api/topologies", () => ({
   useBulkDeleteTopologies: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
 
+import { flushPending } from "../flushPending";
 import { TopologyPage } from "@/pages/TopologyPage";
 import type { Topology } from "@/types/topology.types";
 
@@ -262,8 +263,12 @@ describe("TopologyPage delete flow", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
 
     await waitFor(() => expect(mockDeleteTopology.mutateAsync).toHaveBeenCalledTimes(1));
-    // The dialog is still open for a retry, unlike a successful delete which closes it.
-    expect(screen.getByText("Delete topology?")).toBeInTheDocument();
+    // Issue #1142: the dialog stays MOUNTED (and keeps its title) when closed,
+    // so the title text proves nothing. Let the rejection settle, then read
+    // the dialog's own open state: still open for a retry, unlike a
+    // successful delete which closes it.
+    await flushPending();
+    expect(dialog).toHaveAttribute("open");
   });
 });
 
