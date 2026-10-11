@@ -444,7 +444,8 @@ async def test_failed_build_surfaces_and_manual_retry_recovers(
             admin_client, reservation_id, lambda c: c["status"] == "ACTIVE"
         )
         assert active is not None, (
-            f"the retried connection never read back ACTIVE (last retry row: {reconnected})"
+            "the retried connection never read back ACTIVE "
+            f"(the retry poll returned {reconnected!r}; None means it saw no convergence)"
         )
         remaining = [
             c
@@ -541,7 +542,8 @@ async def test_cancelled_disconnect_failure_direction_aware_retry(
             admin_client, reservation_id, lambda c: c["status"] == "RELEASED"
         )
         assert released is not None, (
-            f"the retried connection never read back RELEASED (last retry row: {row_released})"
+            "the retried connection never read back RELEASED "
+            f"(the retry poll returned {row_released!r}; None means it saw no convergence)"
         )
         # RELEASED does not say the driver ran: the supersession guard settles a release
         # with no driver call. The shared apply records the run SUCCESS before it flips
