@@ -247,14 +247,16 @@ string and the commit date, so a partly rebuilt stack can be told apart from a f
   `VITE_HERD_BUILD_DATE`. \
   Enforced in: `docker-compose.yml` (`HERD_BUILD`, `VITE_HERD_BUILD`) \
   Pinned by: `tests/unit/test_build_args_wiring.py` (`test_every_build_service_is_covered_by_this_test`, `test_every_compose_build_stanza_carries_the_build_args`)
-- **OPS-BUILD-3.** Every service Dockerfile declares the two args after its last
-  dependency install and exports them as environment variables, so a new build string
+- **OPS-BUILD-3.** Every service Dockerfile declares the two args in the stage that
+  ships, after its last dependency install and every other `RUN`, `COPY`, or `ADD`, and
+  exports them as environment variables after both declarations, so a new build string
   rebuilds only that layer. \
   Enforced in: `services/auth/Dockerfile` (`HERD_BUILD`) \
   Pinned by: `tests/unit/test_build_args_wiring.py` (`test_every_service_dockerfile_declares_the_build_args_and_env`)
-- **OPS-BUILD-4.** The frontend Dockerfile declares its two args before `npm run build`,
-  and Vite injects the package version, the build, and the build date as compile-time
-  constants (`dev` and empty when unset). \
+- **OPS-BUILD-4.** The frontend Dockerfile declares its two args, and exports them
+  after both, in the stage that runs `npm run build`, after that stage's install and
+  before the build, and Vite injects the package version, the build, and the build date
+  as compile-time constants (`dev` and empty when unset). \
   Enforced in: `frontend/Dockerfile` (`VITE_HERD_BUILD`); `frontend/vite.config.ts` (`__APP_VERSION__`, `__APP_BUILD__`, `__APP_BUILD_DATE__`) \
   Pinned by: `tests/unit/test_build_args_wiring.py` (`test_frontend_dockerfile_declares_vite_build_args_before_npm_run_build`)
 
@@ -281,7 +283,7 @@ guard in `identity-and-access.md`), `frontend/src/components/layout/AppLayout.ts
 - **OPS-ABOUT-2.** `appVersion.ts` is the one reader of the injected constants; the build
   falls back to `dev` and the build date to null. \
   Enforced in: `frontend/src/lib/appVersion.ts` (`APP_VERSION`, `APP_BUILD`, `APP_BUILD_DATE`) \
-  Pinned by: `frontend/src/test/lib/appVersion.test.ts` (`APP_VERSION is read from package.json`, `APP_BUILD falls back to 'dev' when VITE_HERD_BUILD is unset (default vitest env)`, `APP_BUILD_DATE is null when VITE_HERD_BUILD_DATE is unset (default vitest env)`)
+  Pinned by: `frontend/src/test/lib/appVersion.test.ts` (`APP_VERSION is read from package.json's version field, not a hardcoded literal`, `APP_BUILD falls back to 'dev' when VITE_HERD_BUILD is unset (default vitest env)`, `APP_BUILD_DATE is null when VITE_HERD_BUILD_DATE is unset (default vitest env)`)
 - **OPS-ABOUT-3.** Two versions are the same release when their release numbers match
   and their pre-release states match, accepting the PEP 440 and semver spellings of one
   dev or rc pre-release; any unparseable string matches nothing. \
@@ -807,9 +809,13 @@ reaches a stack that keeps its broker state and no consumer drifts from the othe
   refuses an own heartbeat by an AST scan: any call to `keep_messages_alive` under its
   own name, `_keep_messages_alive`, an import alias, or a module attribute, and any
   `.in_progress(` call (what a hand-rolled heartbeat loop must make); a mention in a
-  comment or docstring is not a call and does not count. It also requires the name
-  `process_batch_with_heartbeat` in the module text and the two exact assignment lines
-  (#1145). \
+  comment or docstring is not a call and does not count (#1145). The same scan requires
+  a call to the shared `process_batch_with_heartbeat` (own name, import alias, or module
+  attribute; an import, a comment, or a local function of that name is not one), an
+  interval that is `heartbeat_interval` of `settings.nats_ack_wait_seconds`, directly or
+  through names assigned exactly once, and that same configured value as the `ack_wait`
+  of every `ConsumerConfig`; an own fraction, a literal, or a reassigned name fails
+  (#1158). \
   Enforced in: `services/common/herd_common/jetstream.py` (`process_batch_with_heartbeat`, `heartbeat_interval`) \
   Pinned by: `tests/unit/test_consumer_heartbeat_wiring.py` (`test_consumer_modules_are_discovered`, `test_no_pull_consumer_module_keeps_an_inline_heartbeat`, `test_every_pull_consumer_module_uses_the_shared_heartbeat`, `test_every_pull_consumer_module_takes_ack_wait_and_heartbeat_from_one_source`)
 - **OPS-NATS-13.** Under `make prod` the broker stores JetStream state in the `nats-data`
@@ -1318,8 +1324,12 @@ Dockerfiles, and the unit tests under `tests/unit/` named below; the CI backend 
 **Rules.**
 
 - **OPS-GUARD-1.** Every `Settings` field of every service is passed by the base compose
-  file as `${VAR:-default}` with the same default as the code, or is listed as an
-  exemption with a reason; a stale exemption fails, and no field declares an alias. \
+  file as `${VAR:-default}` with the same default as the code, where `VAR` is the
+  field's own name or, for the five fields the guard records (`DATABASE_URL`,
+  `SECRET_KEY`, `ALGORITHM`, and auth's two token lifetimes), the renamed variable; or
+  it is listed as an exemption with a reason. A value that interpolates another
+  variable, or an escaped `$${VAR}`, is not passed; a stale exemption fails, and no
+  field declares an alias. \
   Enforced in: `docker-compose.yml` (`environment`) \
   Pinned by: `tests/unit/test_compose_settings_wiring.py` (`test_service_names_matches_discovered_services`, `test_no_settings_field_declares_an_alias`, `test_every_settings_field_is_wired_or_exempt`, `test_no_stale_exemptions`, `test_no_stale_default_mismatch_exemptions`, `test_wired_compose_defaults_match_settings_defaults`, `test_every_active_ai_env_example_key_is_wired_to_ai_orchestrator`)
 - **OPS-GUARD-2.** The base compose file publishes Traefik's 80 and 443 to every

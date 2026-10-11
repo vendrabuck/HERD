@@ -125,8 +125,12 @@ not finished.
   citation. It fails when a specification:
   - names a repository path that does not exist, or a relative link that does not
     resolve;
-  - names an "Enforced in" or "Pinned by" symbol or test name that no longer appears
-    in the file it names, or writes a reference line in any other shape;
+  - names an "Enforced in" symbol that no longer appears in the file it names (for
+    Python, TypeScript, and JavaScript, a symbol left only in a comment does not
+    count), names a "Pinned by" test that is not a test there (a Python function or
+    class pytest collects; for a frontend test the complete title of an `it`, `test`,
+    or `describe` call that is not commented out, `.skip`, or `.todo`), or writes a
+    reference line in any other shape;
   - repeats a rule identifier, writes one that does not match `<AREA>-<TOPIC>-<N>`,
     or has a rule without exactly one of each reference line;
   - cites a rule identifier in the State model, API surface, Events, Internal API, or
