@@ -20,12 +20,21 @@ field, not just ai-orchestrator's AI_/ASSISTANT_/UPLOAD_ knobs:
 
     For every Settings field of every HERD service, either
     (a) docker-compose.yml's base environment block for that service passes
-        it through via an explicit ${VAR...} reference (anywhere on the
-        right-hand side; the container-side key is always the field name
-        upper-cased, HerdBaseSettings/pydantic-settings default env-var
-        naming; test_no_settings_field_declares_an_alias below verifies no
-        field overrides that with an alias), or
+        it through: the value under the container-side key interpolates the
+        field's OWN operator-facing variable, `${FIELD_NAME...}`, or, for
+        the five fields _RENAMED_WIRING lists, the differently named
+        variable(s) recorded there (anywhere on the right-hand side; the
+        container-side key is always the field name upper-cased,
+        HerdBaseSettings/pydantic-settings default env-var naming;
+        test_no_settings_field_declares_an_alias below verifies no field
+        overrides that with an alias), or
     (b) it is listed in _EXEMPTIONS below with a one-line reason.
+
+A value that interpolates some OTHER variable is not wired (issue #1158):
+`AI_GENERATE_MAX_REPAIRS: ${AI_RESOLVER_MAX_SEARCH_STEPS:-5000}` passes a
+value through, but not the one an operator sets under the documented name.
+Neither is an escaped `$${VAR}` (compose hands the container the literal
+text) or a `${VAR:+text}` (compose inserts the text, never the value).
 
 Compose passes an env var to a service only through an explicit ${VAR} line
 in its `environment:` block; no service uses `env_file`. docker-compose.yml
@@ -47,6 +56,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -201,31 +211,74 @@ def _service_environment(service: str) -> dict:
     return environment
 
 
-def _is_wired(environment: dict, field_name: str) -> bool:
-    """True when the compose key for this field (the field name
-    upper-cased) is present and its value contains at least one explicit
-    ${VAR...} interpolation.
+# Fields that reach the container through a differently named operator-facing
+# variable, by design (docs/ENV_VARS.md: the AUTH_SECRET_KEY, AUTH_ALGORITHM and
+# AUTH_*_EXPIRE_* rows, and "Database URLs (auto-computed)"). Every other field
+# must be wired through its own name upper-cased. A field listed here must
+# interpolate EVERY variable named for it; test_no_stale_renamed_wiring fails on
+# an entry no service uses any more.
+_RENAMED_WIRING: dict[str, frozenset[str]] = {
+    "database_url": frozenset({"POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"}),
+    "secret_key": frozenset({"AUTH_SECRET_KEY"}),
+    "algorithm": frozenset({"AUTH_ALGORITHM"}),
+    "access_token_expire_minutes": frozenset({"AUTH_ACCESS_TOKEN_EXPIRE_MINUTES"}),
+    "refresh_token_expire_days": frozenset({"AUTH_REFRESH_TOKEN_EXPIRE_DAYS"}),
+}
 
-    Deliberately loose about WHICH var is referenced, not just the field's
-    own name: several fields are wired through a differently-named
-    operator-facing var by design (SECRET_KEY's value is `${AUTH_SECRET_KEY}`,
-    not `${SECRET_KEY}`; DATABASE_URL's value interpolates
-    `${POSTGRES_USER}`/`${POSTGRES_PASSWORD}`/`${POSTGRES_DB}`, not
-    `${DATABASE_URL}`, see docs/ENV_VARS.md "Database URLs (auto-computed)"
-    and the AUTH_SECRET_KEY row in the Required table). What matters for the
-    invariant is only whether SOME .env value can reach this field at
-    container-creation time; a pure literal (e.g. "http://inventory:8000" or
-    "auth") can never do that regardless of which var it might have been
-    named after.
+# `${NAME`, then what follows the name; or a bare `$NAME`.
+_BRACED_INTERPOLATION = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:?[-?+])?")
+_BARE_INTERPOLATION = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def interpolated_variables(value: object) -> set[str]:
+    """The host variables whose VALUE compose substitutes into a compose value.
+
+    Counts `${VAR}`, `${VAR:-default}`, `${VAR-default}`, `${VAR:?error}`,
+    `${VAR?error}`, and a bare `$VAR`, anywhere in the string, including inside
+    another substitution's default. Does not count `$${VAR}` (compose's escape:
+    the container receives the literal text) or `${VAR:+text}` and `${VAR+text}`
+    (compose inserts `text` when VAR is set, never VAR's value). A value that is
+    not a string interpolates nothing."""
+    if not isinstance(value, str):
+        return set()
+    text = value.replace("$$", "\0")
+    names = {
+        match.group(1)
+        for match in _BRACED_INTERPOLATION.finditer(text)
+        if not (match.group(2) or "").endswith("+")
+    }
+    return names | set(_BARE_INTERPOLATION.findall(text))
+
+
+def operator_variables(field_name: str) -> frozenset[str]:
+    """The .env variable(s) an operator sets to reach this Settings field."""
+    return _RENAMED_WIRING.get(field_name, frozenset({field_name.upper()}))
+
+
+def _is_wired(environment: dict, field_name: str) -> bool:
+    """True when the compose key for this field (the field name upper-cased)
+    is present and its value interpolates the field's operator-facing
+    variable(s): its own name, or every variable _RENAMED_WIRING records for
+    it (SECRET_KEY's value is `${AUTH_SECRET_KEY}`; DATABASE_URL's interpolates
+    `${POSTGRES_USER}`, `${POSTGRES_PASSWORD}`, and `${POSTGRES_DB}`).
+
+    WHICH variable matters (issue #1158): a value that interpolates some other
+    variable, a pure literal (e.g. "http://inventory:8000" or "auth"), an
+    escaped `$${VAR}`, or a `${VAR:+text}` cannot carry what the operator set
+    under the documented name into the container.
     """
     value = environment.get(field_name.upper())
-    return isinstance(value, str) and "${" in value
+    return isinstance(value, str) and operator_variables(field_name) <= interpolated_variables(
+        value
+    )
 
 
 def _wired_default(environment: dict, field_name: str) -> str | None:
-    """The literal default from a ${FIELD_NAME:-default} pattern, or None if
-    the field isn't wired through its OWN name with a fallback (wired
-    through a renamed var, or wired with no fallback, e.g. `${VAR}`).
+    """The literal default from a ${VAR:-default} pattern, where VAR is the
+    field's one operator-facing variable (its own name, or the single renamed
+    variable _RENAMED_WIRING records), or None if the field isn't wired with a
+    fallback (wired with no fallback, e.g. `${VAR}`, or through several
+    variables, as DATABASE_URL is).
 
     Scans by brace-depth rather than a single non-greedy regex
     (`[^}]*` stopping at the first `}`), because at least one default
@@ -235,10 +288,11 @@ def _wired_default(environment: dict, field_name: str) -> str | None:
     braces before the one that actually ends the substitution.
     """
     value = environment.get(field_name.upper())
-    if not isinstance(value, str):
+    variables = operator_variables(field_name)
+    if not isinstance(value, str) or len(variables) != 1:
         return None
-    prefix = f"${{{field_name.upper()}:-"
-    start = value.find(prefix)
+    prefix = f"${{{next(iter(variables))}:-"
+    start = value.replace("$$", "\0\0").find(prefix)
     if start == -1:
         return None
     i = start + len(prefix)
@@ -454,10 +508,11 @@ def test_every_settings_field_is_wired_or_exempt():
             if _is_wired(environment, field_name):
                 continue
             failures.append(
-                f"{service}.{field_name} (env var {field_name.upper()}): missing "
-                "from docker-compose.yml's environment block and not in "
-                "_EXEMPTIONS, so setting it in .env has no effect in the "
-                "container"
+                f"{service}.{field_name}: docker-compose.yml's environment block "
+                f"has no {field_name.upper()} value that interpolates "
+                f"{', '.join(sorted(operator_variables(field_name)))}, and the field "
+                "is not in _EXEMPTIONS, so setting it in .env has no effect in "
+                "the container"
             )
     assert not failures, "unwired, unexempted Settings fields:\n" + "\n".join(sorted(failures))
 
@@ -483,6 +538,15 @@ def test_no_stale_exemptions():
                     "docker-compose.yml; remove the stale exemption"
                 )
     assert not failures, "stale exemptions:\n" + "\n".join(sorted(failures))
+
+
+def test_no_stale_renamed_wiring():
+    """A _RENAMED_WIRING entry is an allowance to be wired through another
+    variable name; one that no service's Settings model uses any more must be
+    deleted rather than left to excuse a future field of the same name."""
+    in_use = {field for service in SERVICE_NAMES for field in _load_settings_fields(service)}
+    stale = sorted(set(_RENAMED_WIRING) - in_use)
+    assert not stale, f"renamed-wiring entries no Settings model declares: {stale}"
 
 
 def test_no_stale_default_mismatch_exemptions():
@@ -513,10 +577,10 @@ def test_no_stale_default_mismatch_exemptions():
 
 
 def test_wired_compose_defaults_match_settings_defaults():
-    """Where docker-compose.yml carries a ${FIELD_NAME:-default} fallback
-    (the field is wired through its OWN name with a literal default, not a
-    renamed var like SECRET_KEY<-AUTH_SECRET_KEY and not a no-fallback
-    passthrough like INTERNAL_API_TOKEN<-${INTERNAL_API_TOKEN}), that default
+    """Where docker-compose.yml carries a ${VAR:-default} fallback for the
+    field's one operator-facing variable (its own name, or the renamed one,
+    as ALGORITHM carries ${AUTH_ALGORITHM:-HS256}; not a no-fallback
+    passthrough like INTERNAL_API_TOKEN's ${INTERNAL_API_TOKEN}), that default
     must equal the Settings field's own default, or a fresh clone (no .env
     value set) silently diverges from what the Settings model documents."""
     failures = []
@@ -558,13 +622,111 @@ def _active_env_example_keys(prefix: str) -> set[str]:
     return keys
 
 
+def keys_not_passed_through(keys: set[str], environment: dict) -> list[str]:
+    """The keys an operator can set in .env that no value of this environment
+    block interpolates. A container-side key of the same name with a literal
+    value does not pass the .env value through."""
+    reaching = set().union(*(interpolated_variables(value) for value in environment.values()))
+    return sorted(keys - reaching)
+
+
 def test_every_active_ai_env_example_key_is_wired_to_ai_orchestrator():
     active_keys = _active_env_example_keys("AI_")
-    wired_keys = set(_service_environment("ai-orchestrator"))
-
-    missing = sorted(active_keys - wired_keys)
+    missing = keys_not_passed_through(active_keys, _service_environment("ai-orchestrator"))
     assert not missing, (
-        "these AI_* keys are active in .env.example but missing from the "
-        "ai-orchestrator environment block in docker-compose.yml, so setting "
-        "them in .env has no effect in the container: " + ", ".join(missing)
+        "these AI_* keys are active in .env.example but no value in the "
+        "ai-orchestrator environment block in docker-compose.yml interpolates "
+        "them, so setting them in .env has no effect in the container: " + ", ".join(missing)
     )
+
+
+# --- the wiring predicate itself (issue #1158): every way a compose line can
+# look wired without carrying the operator's value into the container.
+
+_FIELD = "ai_generate_max_repairs"
+_KEY = "AI_GENERATE_MAX_REPAIRS"
+
+
+def _environment(yaml_lines: str) -> dict:
+    return yaml.safe_load("environment:\n" + yaml_lines)["environment"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "${AI_GENERATE_MAX_REPAIRS:-2}",
+        "${AI_GENERATE_MAX_REPAIRS}",
+        "${AI_GENERATE_MAX_REPAIRS-2}",
+        "${AI_GENERATE_MAX_REPAIRS:?set it}",
+        "$AI_GENERATE_MAX_REPAIRS",
+        "prefix-${AI_GENERATE_MAX_REPAIRS:-2}-suffix",
+        "${OTHER:-${AI_GENERATE_MAX_REPAIRS}}",
+        "$${literal}-${AI_GENERATE_MAX_REPAIRS}",
+    ],
+)
+def test_wiring_predicate_accepts_the_fields_own_variable(value: str):
+    assert _is_wired({_KEY: value}, _FIELD)
+
+
+def test_wiring_predicate_accepts_the_recorded_renames():
+    environment = _environment(
+        "  SECRET_KEY: ${AUTH_SECRET_KEY}\n"
+        "  ALGORITHM: ${AUTH_ALGORITHM:-HS256}\n"
+        "  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}"
+        "@postgres:5432/${POSTGRES_DB}\n"
+    )
+    assert _is_wired(environment, "secret_key")
+    assert _is_wired(environment, "algorithm")
+    assert _is_wired(environment, "database_url")
+    assert _wired_default(environment, "algorithm") == "HS256"
+    assert _wired_default(environment, "secret_key") is None
+
+
+NOT_WIRED = {
+    "another variable": "  AI_GENERATE_MAX_REPAIRS: ${AI_RESOLVER_MAX_SEARCH_STEPS:-5000}\n",
+    "a longer variable name ending in the field's": (
+        "  AI_GENERATE_MAX_REPAIRS: ${OLD_AI_GENERATE_MAX_REPAIRS:-2}\n"
+    ),
+    "a longer variable name starting with the field's": (
+        "  AI_GENERATE_MAX_REPAIRS: ${AI_GENERATE_MAX_REPAIRS_V2:-2}\n"
+    ),
+    "an escaped dollar": "  AI_GENERATE_MAX_REPAIRS: $${AI_GENERATE_MAX_REPAIRS:-2}\n",
+    "the alternate-value form": "  AI_GENERATE_MAX_REPAIRS: ${AI_GENERATE_MAX_REPAIRS:+2}\n",
+    "a literal": "  AI_GENERATE_MAX_REPAIRS: 2\n",
+    "a literal string": '  AI_GENERATE_MAX_REPAIRS: "2"\n',
+    "the variable only in a YAML comment": (
+        "  AI_GENERATE_MAX_REPAIRS: 2  # ${AI_GENERATE_MAX_REPAIRS:-2}\n"
+    ),
+    "the variable under another key": ("  AI_GENERATE_MAX_REPAIR: ${AI_GENERATE_MAX_REPAIRS:-2}\n"),
+    "the name without a dollar": "  AI_GENERATE_MAX_REPAIRS: AI_GENERATE_MAX_REPAIRS\n",
+    "an empty value": "  AI_GENERATE_MAX_REPAIRS:\n",
+}
+
+
+@pytest.mark.parametrize("spelling", sorted(NOT_WIRED))
+def test_wiring_predicate_refuses_a_line_that_only_looks_wired(spelling: str):
+    assert not _is_wired(_environment(NOT_WIRED[spelling]), _FIELD), spelling
+
+
+def test_wiring_predicate_refuses_a_renamed_field_missing_one_of_its_variables():
+    environment = _environment(
+        "  SECRET_KEY: ${SOME_OTHER_SECRET}\n"
+        "  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:herd@postgres:5432/${POSTGRES_DB}\n"
+    )
+    assert not _is_wired(environment, "secret_key")
+    assert not _is_wired(environment, "database_url")
+
+
+def test_wired_default_ignores_an_escaped_substitution():
+    assert _wired_default({_KEY: "$${AI_GENERATE_MAX_REPAIRS:-2}"}, _FIELD) is None
+    assert _wired_default({_KEY: "${AI_GENERATE_MAX_REPAIRS:-2}"}, _FIELD) == "2"
+
+
+def test_env_example_scan_needs_an_interpolation_not_a_key():
+    keys = {"AI_MODEL", "AI_PROVIDER"}
+    wired = _environment("  AI_MODEL: ${AI_MODEL:-m}\n  AI_PROVIDER: ${AI_PROVIDER:-p}\n")
+    assert keys_not_passed_through(keys, wired) == []
+    literal = _environment("  AI_MODEL: some-model\n  AI_PROVIDER: ${AI_PROVIDER:-p}\n")
+    assert keys_not_passed_through(keys, literal) == ["AI_MODEL"]
+    crossed = _environment("  AI_MODEL: ${AI_PROVIDER:-p}\n  AI_PROVIDER: ${AI_PROVIDER:-p}\n")
+    assert keys_not_passed_through(keys, crossed) == ["AI_MODEL"]
