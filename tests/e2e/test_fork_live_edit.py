@@ -415,6 +415,10 @@ def _pw_commit_fork(page, reservation_id, expected_version):
     therefore asserted by its exact version, which only this save's toast can
     carry; the heading is the same line whether or not the save skipped a
     line (ForkSaveResultToast.tsx).
+
+    Returns the save response's parsed body (released, built, and the skipped
+    lists) for a caller that wants to assert on the delta; the callers today
+    read the fork back instead and ignore it.
     """
     response = pw_click_for_response(
         page,
@@ -433,9 +437,9 @@ def _pw_commit_fork(page, reservation_id, expected_version):
 def test_preview_shows_history_banner_and_disables_save_pw(pw_page):
     """Previewing a fork version locks Save/commit and shows the banner (issue #622).
 
-    Committing before preview creates fork version 2 (identical to version 1,
-    since no edges were ever drawn; see the module docstring), giving the
-    history panel a second, genuinely-previewable row.
+    Nothing is committed first: the fork has only version 1, written at
+    activation, and the history panel's one row is the version previewed
+    (`.first` on its Preview button).
     """
     pw_login(pw_page)
     setup = _pw_create_reserved_topology(pw_page)

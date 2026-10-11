@@ -760,11 +760,24 @@ def pw_click_for_response(page, target, method, url_end, *, status=200, timeout=
 
     The click sits INSIDE expect_response, so the listener is registered before
     the request can leave; a response that arrives before the caller's next
-    line is still caught. `target` is waited on until enabled first, so the
-    response timeout measures the request alone and not a control that is
-    still loading. Matches on the request method and on the URL without its
-    query string ending in `url_end`. Fails with the response body when the
-    status is not `status`.
+    line is still caught. `target` is waited on until enabled first, so a
+    control that is still loading does not spend the response timeout. That
+    timeout still covers more than the request: the click's own actionability
+    wait, and anything the page does between the click and the request (in the
+    fork editor, a Commit made before the reservation has loaded sends a
+    device-set PATCH ahead of the save POST, TopologyEditorPage.tsx
+    handleCommitToReservation). Matches on the request method and on the URL
+    without its query string ending in `url_end`. Fails with the response body
+    when the status is not `status`.
+
+    It returns the FIRST response the predicate matches. The main axios client
+    replays a request once after a 401 and a token refresh
+    (frontend/src/api/client.ts), so a test that outlives its access token
+    (30 minutes; every pw_page test logs in fresh) would capture the 401 and
+    fail the status assertion here although the replay succeeds. Such a test
+    should not use this helper as is: it writes its own expect_response whose
+    predicate also requires `r.status != 401`, so the replay's response is the
+    one captured.
     """
     from playwright.sync_api import expect
 
