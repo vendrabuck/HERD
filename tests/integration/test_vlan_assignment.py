@@ -40,7 +40,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from ._device_teardown import delete_device_checked
+from ._device_teardown import delete_device_checked, delete_devices_checked
 from ._topology_teardown import delete_topology_checked
 from .conftest import _psql
 
@@ -456,6 +456,25 @@ async def _create_trunk(client, switch_a_id: str, switch_b_id: str, port: str) -
     return resp.json()
 
 
+def _stored_fabric_id(reservation_id: str) -> str:
+    """The fabric id stored on the reservation's one ACTIVE VLAN allocation.
+
+    There is no REST endpoint for vlan_assignments rows, so this reads Postgres
+    through the conftest `_psql` helper, as the forced collisions here do.
+    """
+    uuid.UUID(reservation_id)  # only ever interpolate a well-formed uuid
+    result = _psql(
+        "SELECT fabric_id FROM execution.vlan_assignments "
+        f"WHERE reservation_id = '{reservation_id}' AND status = 'ACTIVE'",
+        tuples_only=True,
+    )
+    assert result.returncode == 0, result.stderr
+    rows = result.stdout.split()
+    assert len(rows) == 1, f"expected one ACTIVE allocation for {reservation_id}: {rows}"
+    return rows[0]
+
+
+@pytest.mark.timeout(90)
 async def test_vlan_ids_stay_distinct_across_a_cable_change_between_joins(
     admin_client, l2_template, fresh_devices
 ):
@@ -467,13 +486,20 @@ async def test_vlan_ids_stay_distinct_across_a_cable_change_between_joins(
     A's VLAN is defined, so B must get a different number even though A's allocation
     was stored under the old fabric id.
 
-    Limit, stated plainly: each reservation's preferred number is derived from its
-    server-chosen id, so on the pre-fix code this assertion fails only when the two
-    preferred numbers collide. The deterministic pins for the same sequence are the
-    unit tests that force colliding ids (test_vlan_service.py,
-    test_cable_change_between_joins_keeps_numbers_distinct, and
-    test_nats_consumer_l2_reconcile.py,
-    test_cable_change_between_two_reservations_joins_keeps_numbers_distinct).
+    The collision is FORCED (issue #1158), the arrangement
+    test_vlan_ids_are_unique_within_same_fabric uses: each reservation's preferred
+    number is derived from its server-chosen id, so two random ids collide about
+    once in 4093 runs and "the two differ" passes on the pre-fix code. So B is
+    booked PENDING (beyond RESERVATION_START_GRACE_SECONDS), its id and so its
+    preferred number are known, A's stored ACTIVE allocation is moved onto that
+    number, the cable is added, and only then is B made due for the sweep. A rule
+    that compares STORED fabric ids finds nothing in B's component, hands B its
+    preferred number, and fails the last assertion; the two stored ids are read
+    back to show they really differ, so the same-fabric rule the sibling pins
+    cannot be what kept B off the number. Unit pins for the same sequence:
+    test_vlan_service.py (test_cable_change_between_joins_keeps_numbers_distinct)
+    and test_nats_consumer_l2_reconcile.py
+    (test_cable_change_between_two_reservations_joins_keeps_numbers_distinct).
     """
     suffix = uuid.uuid4().hex[:8]
     s1 = await _create_device(admin_client, l2_template["id"], f"mock-l2-s1-{suffix}")
@@ -493,24 +519,59 @@ async def test_vlan_ids_stay_distinct_across_a_cable_change_between_joins(
         assert await _poll_active(admin_client, res_a["id"]), "reservation A never activated"
         runs_a = await _poll_success_runs(admin_client, res_a["id"], "add_to_vlan")
         assert runs_a, "reservation A never joined its VLAN on S1"
-        vlan_a = _vlan_of(runs_a[0])
+        assert str(runs_a[0]["device_id"]) == s1["id"]
+        fabric_a = _stored_fabric_id(res_a["id"])
+
+        # B is booked PENDING while S1 and S2 are still separate, so its id (and its
+        # preferred number) is known before it joins anything.
+        topo_b = await _create_topology(admin_client, _canvas_edge(dut_b["id"], s2["id"]))
+        topology_ids.append(topo_b)
+        res_b = await _create_reservation(
+            admin_client, [dut_b["id"], s2["id"]], topo_b, start_offset_s=900.0
+        )
+        reservations.append(res_b)
+        assert res_b["status"] == "PENDING", res_b
+        preferred_b = (uuid.UUID(res_b["id"]).int % 4093) + 2
+        moved = _psql(
+            f"UPDATE execution.vlan_assignments SET vlan_id = {preferred_b} "
+            f"WHERE reservation_id = '{res_a['id']}' AND status = 'ACTIVE'"
+        )
+        assert moved.returncode == 0 and "UPDATE 1" in moved.stdout, (
+            moved.stdout,
+            moved.stderr,
+        )
 
         # The admin cable change between the two joins: S1 and S2 become one component.
         connections.append(await _create_trunk(admin_client, s1["id"], s2["id"], "eth9"))
 
-        topo_b = await _create_topology(admin_client, _canvas_edge(dut_b["id"], s2["id"]))
-        topology_ids.append(topo_b)
-        res_b = await _create_reservation(admin_client, [dut_b["id"], s2["id"]], topo_b)
-        reservations.append(res_b)
-        assert await _poll_active(admin_client, res_b["id"]), "reservation B never activated"
+        # Make B due now; the sweep's claim (_due_pending_stmt) activates it.
+        due = _psql(
+            "UPDATE reservations.reservations SET start_time = now() "
+            f"WHERE id = '{res_b['id']}' AND status = 'PENDING'"
+        )
+        assert due.returncode == 0 and "UPDATE 1" in due.stdout, (due.stdout, due.stderr)
+
+        assert await _poll_active(admin_client, res_b["id"], timeout=15.0), (
+            "reservation B never activated"
+        )
         runs_b = await _poll_success_runs(admin_client, res_b["id"], "add_to_vlan")
         assert runs_b, "reservation B never joined its VLAN on S2"
-        vlan_b = _vlan_of(runs_b[0])
-
         assert str(runs_b[0]["device_id"]) == s2["id"]
-        assert 2 <= vlan_a <= 4094 and 2 <= vlan_b <= 4094
-        assert vlan_b != vlan_a, (
-            f"reservation B reused VLAN {vlan_a}, which A holds on S1, reachable from S2"
+
+        # The arrangement held: A's allocation still sits under the fabric id it was
+        # stored with before the cable, and B's was stored under another one, so only
+        # reachability on the current graph could connect the two.
+        assert _stored_fabric_id(res_a["id"]) == fabric_a
+        assert _stored_fabric_id(res_b["id"]) != fabric_a, (
+            "the cable change did not re-key the component; the stored-id rule and the "
+            "reachability rule cannot be told apart here"
+        )
+
+        vlan_b = _vlan_of(runs_b[0])
+        assert 2 <= vlan_b <= 4094
+        assert vlan_b != preferred_b, (
+            f"reservation B took its preferred vlan_id {preferred_b}, which A holds on S1, "
+            "reachable from S2 since the cable change"
         )
     finally:
         for res in reservations:
@@ -519,5 +580,4 @@ async def test_vlan_ids_stay_distinct_across_a_cable_change_between_joins(
             await delete_topology_checked(admin_client, tid)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        for switch in (s1, s2):
-            await delete_device_checked(admin_client, switch["id"])
+        await delete_devices_checked(admin_client, [s1["id"], s2["id"]])
