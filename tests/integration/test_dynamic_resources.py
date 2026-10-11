@@ -648,17 +648,28 @@ async def test_failed_create_is_destroyed_by_keyed_teardown(
 
 @pytest.mark.timeout(300)
 async def test_failed_keyed_destroy_leaves_ledger_row_creating(
-    admin_client, failing_destroy_dynamic_template, fresh_device
+    admin_client, failing_destroy_dynamic_template, dynamic_template, fresh_device
 ):
     """Issue #937 failure policy, live: the keyed destroy itself fails (the
     stand-in for a recipe written before the contract), so the row must NOT be
     retired: it stays CREATING with no instance_ref as a may-still-exist
-    record, and the reservation still ends FAILED (the event was ACKed, not
-    looped)."""
+    record, and the terminal event is settled after ONE keyed destroy (ACKed,
+    not looped).
+
+    The keyed run is recorded BEFORE the ledger decision (the recipe's logout
+    step, a second sandbox call, runs between the two), so "still CREATING"
+    read when the run turns terminal is also the state before a wrongful
+    retirement lands. The row is therefore read after an ordering anchor booked
+    once that run is seen (issue #1158, the #1147 shape): a later dynamic-only
+    reservation reaching ACTIVE means execution consumed its provision_requested,
+    which sits behind this reservation's reservation.failed on the one
+    sequential consumer, so the teardown handler has returned."""
     reservation = await _reserve_dynamic(
         admin_client, fresh_device["id"], failing_destroy_dynamic_template["id"]
     )
     request_id = reservation["dynamic_requests"][0]["id"]
+    anchor_id = None
+    anchor_device_id = None
     try:
         failed = await _poll_reservation_status(
             admin_client, reservation["id"], "FAILED", timeout=240.0, interval=2.0
@@ -670,14 +681,22 @@ async def test_failed_keyed_destroy_leaves_ledger_row_creating(
         output = json.loads(keyed[0]["output"])
         assert output["success"] is False
 
-        # Teardown has finished with this row (the keyed run is recorded before
-        # the ledger decision); give it a moment, then the row must still be live.
-        await asyncio.sleep(3.0)
+        anchor_id, anchor_device_id = await _book_dynamic_anchor(
+            admin_client, dynamic_template["id"]
+        )
+
+        # Teardown is over: the row is still live and nothing drove a second destroy.
         assert _ledger_row(request_id) == ("CREATING", "")
+        destroys = await _runs(admin_client, reservation["id"], "destroy_instance")
+        assert [r["id"] for r in destroys] == [keyed[0]["id"]], (
+            f"the failed keyed destroy must not be re-driven: {destroys}"
+        )
         # The physical device is released regardless.
         status = await _poll_device_status(admin_client, fresh_device["id"], "AVAILABLE")
         assert status == "AVAILABLE", f"physical device stuck in {status} after FAILED"
     finally:
+        if anchor_id:
+            await _cancel_and_drain(admin_client, anchor_id, anchor_device_id)
         # Test garbage on a shared stack: the mock created nothing, so the
         # may-still-exist row is known to be empty here and can go.
         _psql(f"DELETE FROM execution.dynamic_instances WHERE request_id = '{request_id}'")
