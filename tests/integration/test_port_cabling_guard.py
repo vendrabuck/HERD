@@ -13,6 +13,8 @@ import uuid
 
 import pytest
 
+from ._device_teardown import delete_port_checked
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -111,5 +113,5 @@ async def test_cabled_port_refuses_delete_and_rename_until_the_cable_is_removed(
         if connection_id is not None:
             await admin_client.delete(f"/cabling/connections/{connection_id}")
         for port_id in port_ids:
-            await admin_client.delete(f"/inventory/ports/{port_id}")
+            await delete_port_checked(admin_client, port_id)
         await admin_client.delete(f"/inventory/templates/{template_id}")

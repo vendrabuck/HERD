@@ -36,7 +36,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-from ._device_teardown import delete_device_checked
+from ._device_teardown import delete_device_checked, delete_devices_checked
 from ._l3_helpers import create_connection as _create_connection
 from ._l3_helpers import create_device as _create_device
 from ._l3_helpers import create_l3_driver, create_l3_template
@@ -609,8 +609,7 @@ async def test_trunk_hop_with_intent_on_both_ends_drives_both_switches(admin_cli
             await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch_a['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch_b['id']}")
+        await delete_devices_checked(admin_client, [switch_a["id"], switch_b["id"]])
 
 
 # --- addendum X-K: interface-level attachment (issue #756) ------------------

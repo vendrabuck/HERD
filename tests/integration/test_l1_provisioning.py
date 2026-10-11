@@ -28,6 +28,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked
 from ._topology_teardown import delete_topology_checked
 
 pytestmark = pytest.mark.asyncio
@@ -255,7 +256,7 @@ async def test_l1_ports_connected_on_reservation_create(admin_client, l1_templat
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 def _canvas_two_port_distinct_edges(a_id: str, b_id: str) -> dict:
@@ -471,7 +472,7 @@ async def test_l1_two_port_distinct_edges_drive_two_distinct_connect_calls(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_l1_ports_disconnected_on_reservation_cancel(
@@ -485,6 +486,7 @@ async def test_l1_ports_disconnected_on_reservation_cancel(
     dut_a, dut_b = await fresh_devices(2)
     connections = []
     topology_id = None
+    reservation = None
     try:
         connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "p1"))
         connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "p2"))
@@ -503,8 +505,12 @@ async def test_l1_ports_disconnected_on_reservation_cancel(
         assert str(runs[0]["device_id"]) == switch["id"]
         assert _ports_of(runs[0]) == {"p1", "p2"}
     finally:
+        if reservation:
+            # A no-op once the body cancelled; on a failure before that, the
+            # reservation must end before its topology and devices can go.
+            await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])

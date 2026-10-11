@@ -32,6 +32,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked, delete_devices_checked
 from ._nats_helpers import probe_nats
 from ._topology_teardown import delete_topology_checked
 
@@ -340,8 +341,7 @@ async def test_cancel_releases_all_three_ledgers(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        for sw in switches:
-            await admin_client.delete(f"/inventory/devices/{sw['id']}")
+        await delete_devices_checked(admin_client, [sw["id"] for sw in switches])
 
 
 async def test_cancel_teardown_failure_converges_on_terminal_retry(
@@ -406,4 +406,4 @@ async def test_cancel_teardown_failure_converges_on_terminal_retry(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{l2_sw['id']}")
+        await delete_device_checked(admin_client, l2_sw["id"])

@@ -48,6 +48,7 @@ import httpx
 import nats
 import pytest
 
+from ._device_teardown import delete_device_checked, delete_devices_checked
 from ._topology_teardown import delete_topology_checked
 
 pytestmark = pytest.mark.asyncio
@@ -401,7 +402,7 @@ async def test_l3_failed_event_removes_pinned_routes_and_redelivery_is_idempoten
             await delete_topology_checked(admin_client, topology_id)
         for connection in connections:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 @pytest.mark.timeout(90)
@@ -499,8 +500,7 @@ async def test_l1_failed_event_disconnects_only_applied_pairs(
             await delete_topology_checked(admin_client, topology_id)
         for connection in connections:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{sw_ok['id']}")
-        await admin_client.delete(f"/inventory/devices/{sw_broken['id']}")
+        await delete_devices_checked(admin_client, [sw_ok["id"], sw_broken["id"]])
 
 
 async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_teardown_works(
@@ -576,4 +576,4 @@ async def test_failed_event_without_provisioning_tears_down_nothing_then_l2_tear
             await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])

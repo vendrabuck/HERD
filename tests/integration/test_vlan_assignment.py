@@ -293,7 +293,7 @@ async def test_vlan_assigned_on_reservation_create_with_l2_switch(
             await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_vlan_released_on_reservation_cancel(admin_client, l2_template, fresh_device):
@@ -348,7 +348,7 @@ async def test_vlan_released_on_reservation_cancel(admin_client, l2_template, fr
             await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 @pytest.mark.timeout(90)
@@ -437,7 +437,7 @@ async def test_vlan_ids_are_unique_within_same_fabric(admin_client, l2_template,
             await delete_topology_checked(admin_client, tid)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def _create_trunk(client, switch_a_id: str, switch_b_id: str, port: str) -> dict:

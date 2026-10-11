@@ -35,6 +35,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked
 from ._nats_helpers import probe_nats
 from ._topology_teardown import delete_topology_checked
 
@@ -261,7 +262,7 @@ async def test_l2_membership_provisions_then_releases_on_fork_save(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_l2_membership_moves_to_new_port_same_vlan(
@@ -308,7 +309,7 @@ async def test_l2_membership_moves_to_new_port_same_vlan(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_l2_failed_add_surfaces_and_manual_retry_recovers(
@@ -360,7 +361,7 @@ async def test_l2_failed_add_surfaces_and_manual_retry_recovers(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_l2_release_failure_retry_converges_released(
@@ -414,4 +415,4 @@ async def test_l2_release_failure_retry_converges_released(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])

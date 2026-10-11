@@ -32,6 +32,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked
 from ._nats_helpers import probe_nats
 from ._topology_teardown import delete_topology_checked
 
@@ -307,7 +308,7 @@ async def test_l3_routes_provision_on_gained_adjacency_and_release_on_lost(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_l3_shared_adjacency_keeps_routes_until_last_hop_leaves(
@@ -368,7 +369,7 @@ async def test_l3_shared_adjacency_keeps_routes_until_last_hop_leaves(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_l3_failed_provision_surfaces_and_manual_retry_recovers(
@@ -423,4 +424,4 @@ async def test_l3_failed_provision_surfaces_and_manual_retry_recovers(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])

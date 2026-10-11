@@ -28,6 +28,7 @@ from pathlib import Path
 import nats
 import pytest
 
+from ._device_teardown import delete_device_checked
 from ._topology_teardown import delete_topology_checked
 
 pytestmark = pytest.mark.asyncio
@@ -328,4 +329,4 @@ async def test_forged_cancelled_event_for_an_active_reservation_is_ignored(
             await delete_topology_checked(admin_client, topology_id)
         for connection in connections:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])

@@ -50,6 +50,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked
 from ._nats_helpers import fetch_events_for_reservation, probe_nats, publish_raw
 from ._topology_teardown import delete_topology_checked
 from .conftest import _psql
@@ -446,7 +447,7 @@ async def test_failed_build_surfaces_and_manual_retry_recovers(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_cancelled_disconnect_failure_direction_aware_retry(
@@ -542,7 +543,7 @@ async def test_cancelled_disconnect_failure_direction_aware_retry(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
@@ -705,7 +706,7 @@ async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def _poll_wiring_version(client, reservation_id: str, version: int, timeout: float = 30.0):
@@ -789,7 +790,7 @@ async def test_fork_save_release_drives_disconnect(admin_client, l1_template, fr
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 @pytest.mark.timeout(90)
@@ -880,7 +881,7 @@ async def test_wiring_changed_for_completed_reservation_does_not_reconnect(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 @pytest.mark.timeout(90)
@@ -966,7 +967,7 @@ async def test_wiring_changed_stale_replay_no_double_apply(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_delta_less_heal_converges_after_initial_staging_failure(
@@ -1106,7 +1107,7 @@ async def test_delta_less_heal_converges_after_initial_staging_failure(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_heal_seam_purpose_sentinel_does_not_affect_unrelated_reservation(
@@ -1178,4 +1179,4 @@ async def test_heal_seam_purpose_sentinel_does_not_affect_unrelated_reservation(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])

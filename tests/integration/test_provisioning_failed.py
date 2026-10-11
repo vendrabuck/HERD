@@ -19,6 +19,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from ._device_teardown import delete_devices_checked
+
 pytestmark = pytest.mark.asyncio
 
 # Mirrors services/inventory/app/routers/devices.py:_FAULT_STATUS_SENTINEL.
@@ -104,5 +106,4 @@ async def test_provisioning_failure_lands_failed_and_reverts_devices(admin_clien
         # returns it to AVAILABLE.
         assert y_resp.json()["status"] == "AVAILABLE"
     finally:
-        await admin_client.delete(f"/inventory/devices/{device_x['id']}")
-        await admin_client.delete(f"/inventory/devices/{device_y['id']}")
+        await delete_devices_checked(admin_client, [device_x["id"], device_y["id"]])

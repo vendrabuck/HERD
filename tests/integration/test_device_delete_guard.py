@@ -29,6 +29,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked
 from ._topology_teardown import delete_topology_checked
 
 pytestmark = pytest.mark.asyncio
@@ -294,7 +295,9 @@ async def test_transit_switch_on_live_fork_blocks_delete_until_cancel(
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
         if not switch_deleted:
-            await _delete_when_released(admin_client, switch["id"])
+            # A failure path: the body never got to its own asserted delete. The
+            # checked helper fails the test on a refusal instead of leaking the switch.
+            await delete_device_checked(admin_client, switch["id"])
 
 
 # --- Issue #940: cabled, unreserved device ---------------------------------------

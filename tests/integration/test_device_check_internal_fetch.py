@@ -23,6 +23,8 @@ import zipfile
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked
+
 pytestmark = pytest.mark.asyncio
 
 # A complete Management driver: all five methods the connection type requires
@@ -153,7 +155,7 @@ async def test_device_check_uses_internal_inventory_routes(admin_client, base_ur
         )
     finally:
         if device_id:
-            await admin_client.delete(f"/inventory/devices/{device_id}")
+            await delete_device_checked(admin_client, device_id)
         if template_id:
             await admin_client.delete(f"/inventory/templates/{template_id}")
         await admin_client.delete(f"/inventory/drivers/{driver['id']}")

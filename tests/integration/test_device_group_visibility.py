@@ -12,6 +12,7 @@ import uuid
 
 import pytest
 
+from ._device_teardown import delete_device_checked
 from ._topology_teardown import delete_topology_checked
 
 pytestmark = pytest.mark.asyncio
@@ -263,7 +264,7 @@ async def test_non_admin_sees_only_dut_devices_in_granted_group(
         if device_group_id:
             await admin_client.delete(f"/inventory/device-groups/{device_group_id}")
         if switch_id:
-            await admin_client.delete(f"/inventory/devices/{switch_id}")
+            await delete_device_checked(admin_client, switch_id)
         if template_id:
             await admin_client.delete(f"/inventory/templates/{template_id}")
         if driver_id:
@@ -543,7 +544,7 @@ async def test_hidden_device_is_not_a_validate_or_pathfind_oracle(
         for connection_id in connection_ids:
             await admin_client.delete(f"/cabling/connections/{connection_id}")
         if switch_id:
-            await admin_client.delete(f"/inventory/devices/{switch_id}")
+            await delete_device_checked(admin_client, switch_id)
         if template_id:
             await admin_client.delete(f"/inventory/templates/{template_id}")
         if driver_id:
