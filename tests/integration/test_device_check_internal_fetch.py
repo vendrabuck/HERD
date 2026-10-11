@@ -154,8 +154,11 @@ async def test_device_check_uses_internal_inventory_routes(admin_client, base_ur
             f"expected SUCCESS, got {body['status']} (error={body.get('error')})"
         )
     finally:
-        if device_id:
-            await delete_device_checked(admin_client, device_id)
-        if template_id:
-            await admin_client.delete(f"/inventory/templates/{template_id}")
-        await admin_client.delete(f"/inventory/drivers/{driver['id']}")
+        # The rest of the cleanup runs even when the checked delete raises.
+        try:
+            if device_id:
+                await delete_device_checked(admin_client, device_id)
+        finally:
+            if template_id:
+                await admin_client.delete(f"/inventory/templates/{template_id}")
+            await admin_client.delete(f"/inventory/drivers/{driver['id']}")

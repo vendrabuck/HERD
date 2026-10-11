@@ -112,6 +112,14 @@ async def test_cabled_port_refuses_delete_and_rename_until_the_cable_is_removed(
     finally:
         if connection_id is not None:
             await admin_client.delete(f"/cabling/connections/{connection_id}")
+        # Every port gets its delete attempt, and the template delete still runs,
+        # before the first refusal is raised.
+        refusals: list[Exception] = []
         for port_id in port_ids:
-            await delete_port_checked(admin_client, port_id)
+            try:
+                await delete_port_checked(admin_client, port_id)
+            except Exception as exc:
+                refusals.append(exc)
         await admin_client.delete(f"/inventory/templates/{template_id}")
+        if refusals:
+            raise refusals[0]

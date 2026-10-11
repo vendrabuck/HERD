@@ -263,16 +263,19 @@ async def test_non_admin_sees_only_dut_devices_in_granted_group(
     finally:
         if device_group_id:
             await admin_client.delete(f"/inventory/device-groups/{device_group_id}")
-        if switch_id:
-            await delete_device_checked(admin_client, switch_id)
-        if template_id:
-            await admin_client.delete(f"/inventory/templates/{template_id}")
-        if driver_id:
-            await admin_client.delete(f"/inventory/drivers/{driver_id}")
-        if user_group_id:
-            await admin_client.delete(f"/auth/groups/{user_group_id}")
-        if user_id:
-            await admin_client.delete(f"/auth/users/{user_id}")
+        # The rest of the cleanup runs even when the checked delete raises.
+        try:
+            if switch_id:
+                await delete_device_checked(admin_client, switch_id)
+        finally:
+            if template_id:
+                await admin_client.delete(f"/inventory/templates/{template_id}")
+            if driver_id:
+                await admin_client.delete(f"/inventory/drivers/{driver_id}")
+            if user_group_id:
+                await admin_client.delete(f"/auth/groups/{user_group_id}")
+            if user_id:
+                await admin_client.delete(f"/auth/users/{user_id}")
 
 
 async def test_admin_sees_all_devices_regardless_of_groups(admin_client, user_client, fresh_device):
@@ -543,13 +546,16 @@ async def test_hidden_device_is_not_a_validate_or_pathfind_oracle(
             await delete_topology_checked(admin_client, topology_id)
         for connection_id in connection_ids:
             await admin_client.delete(f"/cabling/connections/{connection_id}")
-        if switch_id:
-            await delete_device_checked(admin_client, switch_id)
-        if template_id:
-            await admin_client.delete(f"/inventory/templates/{template_id}")
-        if driver_id:
-            await admin_client.delete(f"/inventory/drivers/{driver_id}")
-        if device_group_id:
-            await admin_client.delete(f"/inventory/device-groups/{device_group_id}")
-        if user_group_id:
-            await admin_client.delete(f"/auth/groups/{user_group_id}")
+        # The rest of the cleanup runs even when the checked delete raises.
+        try:
+            if switch_id:
+                await delete_device_checked(admin_client, switch_id)
+        finally:
+            if template_id:
+                await admin_client.delete(f"/inventory/templates/{template_id}")
+            if driver_id:
+                await admin_client.delete(f"/inventory/drivers/{driver_id}")
+            if device_group_id:
+                await admin_client.delete(f"/inventory/device-groups/{device_group_id}")
+            if user_group_id:
+                await admin_client.delete(f"/auth/groups/{user_group_id}")
