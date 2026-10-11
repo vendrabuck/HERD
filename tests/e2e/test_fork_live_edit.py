@@ -50,7 +50,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .conftest import HOST_BASE_URL, api_request, pw_api, pw_login
+from .conftest import HOST_BASE_URL, api_request, pw_api, pw_click_for_response, pw_login
 
 WAIT = 15
 # A freshly created reservation whose start_time is now transitions
@@ -398,7 +398,36 @@ def _pw_cleanup_reserved_topology(page, setup):
 
 
 PREVIEW_BANNER_RE = re.compile(r"Previewing version \d+")
-FORK_SAVED_TOAST_RE = re.compile(r"Fork saved as v\d+")
+
+
+def _pw_commit_fork(page, reservation_id, expected_version):
+    """Click Commit and return once THIS save has answered and shown its own toast.
+
+    The ordering anchor is the save POST's own response (pw_click_for_response),
+    not a toast: cabling commits the appended fork version before it answers,
+    so a read-back that starts after the 200 arrives always sees that version.
+    The save toast is a react-hot-toast custom toast and stays up for 4 s, so a
+    second commit made inside that time finds the FIRST commit's toast still on
+    screen: a wait on the bare "Fork saved as v<n>" pattern returns at once on
+    the stale toast and the read-back then races the save still in flight
+    (issue #1169, the nightly failure of 2026-10-11, `assert 2 == 3`), or it
+    matches two toasts and dies on a strict mode violation. The toast is
+    therefore asserted by its exact version, which only this save's toast can
+    carry; the heading is the same line whether or not the save skipped a
+    line (ForkSaveResultToast.tsx).
+    """
+    response = pw_click_for_response(
+        page,
+        page.get_by_role("button", name="Commit to reservation"),
+        "POST",
+        f"/reservations/{reservation_id}/fork/save",
+    )
+    body = response.json()
+    assert body["version_number"] == expected_version, body
+    expect(page.get_by_text(f"Fork saved as v{expected_version}", exact=True)).to_be_visible(
+        timeout=15_000
+    )
+    return body
 
 
 def test_preview_shows_history_banner_and_disables_save_pw(pw_page):
@@ -468,8 +497,7 @@ def test_restore_then_save_via_fork_readback_pw(pw_page):
         expect(pw_page.locator(".react-flow__node").first).to_be_visible(timeout=15_000)
 
         # Commit once with no edits to create version 2 (identical canvas).
-        pw_page.get_by_role("button", name="Commit to reservation").click()
-        expect(pw_page.get_by_text(FORK_SAVED_TOAST_RE)).to_be_visible(timeout=15_000)
+        _pw_commit_fork(pw_page, reservation["id"], 2)
         assert len(fork_now()["versions"]) == 2
 
         # Restore version 1 through the history panel. The panel lists
@@ -498,8 +526,9 @@ def test_restore_then_save_via_fork_readback_pw(pw_page):
         assert len(fork_after_restore["versions"]) == 2, "restore alone must not append a version"
 
         # Save the restored draft: a new version lands, carrying restored_from_id.
-        pw_page.get_by_role("button", name="Commit to reservation").click()
-        expect(pw_page.get_by_text(FORK_SAVED_TOAST_RE)).to_be_visible(timeout=15_000)
+        # Version 2's toast is still on screen here, so the wait is on this
+        # save's own response and its own "v3" toast (see _pw_commit_fork).
+        _pw_commit_fork(pw_page, reservation["id"], 3)
 
         fork_after_save = fork_now()
         assert len(fork_after_save["versions"]) == 3
