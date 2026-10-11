@@ -23,6 +23,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked
+
 _MOCK_L2_DIR = Path(__file__).resolve().parents[2] / "drivers" / "mock_l2"
 
 
@@ -109,7 +111,7 @@ async def gating_device(base_url, admin_token, gating_template):
         resp.raise_for_status()
         device = resp.json()
         yield device
-        await client.delete(f"/inventory/devices/{device['id']}")
+        await delete_device_checked(client, device["id"])
 
 
 async def _execute(client, device_id, action):

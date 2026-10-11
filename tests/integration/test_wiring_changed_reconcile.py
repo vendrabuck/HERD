@@ -50,8 +50,10 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked
 from ._nats_helpers import fetch_events_for_reservation, probe_nats, publish_raw
 from ._topology_teardown import delete_topology_checked
+from ._wiring_retry import poll_wiring_retry
 from .conftest import _psql
 
 pytestmark = pytest.mark.asyncio
@@ -269,26 +271,35 @@ async def _poll_wiring_conn(client, reservation_id: str, predicate, *, timeout: 
     return None
 
 
-async def _poll_retry_l1(client, reservation_id: str, outcome: str, *, timeout: float = 25.0):
+async def _poll_retry_l1(
+    client,
+    reservation_id: str,
+    outcome: str,
+    *,
+    failed_row_id: str | None = None,
+    timeout: float = 25.0,
+):
     """Poll POST wiring/retry until a layer-l1 outcome matches `outcome`.
 
     Mirrors _poll_retry_l2 in test_l2_reconcile.py / test_ledger_teardown.py. Since
     issue #817, `in_progress` is a legitimate outcome: the background retry tick
     (WIRING_RETRY_INTERVAL_SECONDS) can hold the row's claim at the instant of a manual
     call, so a single POST answering in_progress is not a failure, it means try again.
-    The product contract is convergence, not "the first manual call does the work"."""
-    deadline = asyncio.get_event_loop().time() + timeout
-    last = None
-    while asyncio.get_event_loop().time() < deadline:
-        resp = await client.post(f"/reservations/{reservation_id}/wiring/retry")
-        if resp.status_code == 200:
-            for row in resp.json().get("results", []):
-                if row.get("layer") == "l1":
-                    last = row
-                    if row.get("outcome") == outcome:
-                        return row
-        await asyncio.sleep(0.5)
-    return last
+    The product contract is convergence, not "the first manual call does the work".
+
+    None unless the wanted outcome was seen. With `failed_row_id` (the id of the row
+    already seen FAILED on wiring-status) a row the tick converged first, which the
+    retry answer no longer names (a 409 on a frozen reservation), is accepted from
+    wiring-status by that id instead of polling out the whole timeout; see
+    _wiring_retry.poll_wiring_retry (issue #1158)."""
+    return await poll_wiring_retry(
+        client,
+        reservation_id,
+        lambda row: row.get("layer") == "l1",
+        outcome,
+        failed_row_id=failed_row_id,
+        timeout=timeout,
+    )
 
 
 async def _poll_active(client, reservation_id: str, *, timeout: float = 12.0) -> bool:
@@ -421,7 +432,9 @@ async def test_failed_build_surfaces_and_manual_retry_recovers(
 
         # Issue #817: a single retry call may answer in_progress if the background tick
         # holds the row's claim at that instant, so poll instead of asserting on one call.
-        reconnected = await _poll_retry_l1(admin_client, reservation_id, "reconnected")
+        reconnected = await _poll_retry_l1(
+            admin_client, reservation_id, "reconnected", failed_row_id=failed["id"]
+        )
 
         # wiring-status must show the pair ACTIVE, whichever channel (manual retry or the
         # background tick) did the flip. The read-back is mandatory: a reported
@@ -431,7 +444,8 @@ async def test_failed_build_surfaces_and_manual_retry_recovers(
             admin_client, reservation_id, lambda c: c["status"] == "ACTIVE"
         )
         assert active is not None, (
-            f"the retried connection never read back ACTIVE (last retry row: {reconnected})"
+            "the retried connection never read back ACTIVE "
+            f"(the retry poll returned {reconnected!r}; None means it saw no convergence)"
         )
         remaining = [
             c
@@ -446,7 +460,7 @@ async def test_failed_build_surfaces_and_manual_retry_recovers(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_cancelled_disconnect_failure_direction_aware_retry(
@@ -517,7 +531,9 @@ async def test_cancelled_disconnect_failure_direction_aware_retry(
 
         # Issue #817: a single retry call may answer in_progress if the background tick
         # holds the row's claim at that instant, so poll instead of asserting on one call.
-        row_released = await _poll_retry_l1(admin_client, reservation_id, "released")
+        row_released = await _poll_retry_l1(
+            admin_client, reservation_id, "released", failed_row_id=failed["id"]
+        )
 
         # The read-back is mandatory, whichever channel (manual retry or the background
         # tick) did the flip: a reported "released" means the compare-and-swap already
@@ -526,8 +542,17 @@ async def test_cancelled_disconnect_failure_direction_aware_retry(
             admin_client, reservation_id, lambda c: c["status"] == "RELEASED"
         )
         assert released is not None, (
-            f"the retried connection never read back RELEASED (last retry row: {row_released})"
+            "the retried connection never read back RELEASED "
+            f"(the retry poll returned {row_released!r}; None means it saw no convergence)"
         )
+        # RELEASED does not say the driver ran: the supersession guard settles a release
+        # with no driver call. The shared apply records the run SUCCESS before it flips
+        # the row, on either channel, and no disconnect could succeed while the knob was
+        # armed (it was armed from the switch's creation), so this run is the cleared
+        # retry's own.
+        assert await _poll_run_count_at_least(
+            admin_client, reservation_id, "disconnect_ports", 1
+        ), "the connection read RELEASED but no disconnect_ports succeeded"
         remaining = [
             c
             for c in (await _wiring_status(admin_client, reservation_id))["connections"]
@@ -542,7 +567,7 @@ async def test_cancelled_disconnect_failure_direction_aware_retry(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
@@ -705,7 +730,7 @@ async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def _poll_wiring_version(client, reservation_id: str, version: int, timeout: float = 30.0):
@@ -789,7 +814,7 @@ async def test_fork_save_release_drives_disconnect(admin_client, l1_template, fr
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 @pytest.mark.timeout(90)
@@ -880,7 +905,7 @@ async def test_wiring_changed_for_completed_reservation_does_not_reconnect(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 @pytest.mark.timeout(90)
@@ -966,7 +991,7 @@ async def test_wiring_changed_stale_replay_no_double_apply(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_delta_less_heal_converges_after_initial_staging_failure(
@@ -1106,7 +1131,7 @@ async def test_delta_less_heal_converges_after_initial_staging_failure(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_heal_seam_purpose_sentinel_does_not_affect_unrelated_reservation(
@@ -1178,4 +1203,4 @@ async def test_heal_seam_purpose_sentinel_does_not_affect_unrelated_reservation(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])

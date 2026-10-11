@@ -19,6 +19,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from ._device_teardown import delete_devices_checked
+
 pytestmark = pytest.mark.asyncio
 
 # Mirrors services/inventory/app/routers/devices.py:_FAULT_STATUS_SENTINEL.
@@ -104,5 +106,15 @@ async def test_provisioning_failure_lands_failed_and_reverts_devices(admin_clien
         # returns it to AVAILABLE.
         assert y_resp.json()["status"] == "AVAILABLE"
     finally:
-        await admin_client.delete(f"/inventory/devices/{device_x['id']}")
-        await admin_client.delete(f"/inventory/devices/{device_y['id']}")
+        # Cancel whatever this booking left live before the devices go. If the path
+        # under test regresses (the row ends ACTIVE, not FAILED), the assertion above
+        # is the failure to read, not a device_in_use refusal from the teardown. A
+        # cancel on the FAILED row a correct stack leaves is a no-op.
+        leftovers = await admin_client.get(
+            "/reservations/", params={"search": purpose, "limit": 50}
+        )
+        if leftovers.status_code == 200:
+            for row in leftovers.json()["items"]:
+                if row.get("purpose") == purpose:
+                    await admin_client.delete(f"/reservations/{row['id']}")
+        await delete_devices_checked(admin_client, [device_x["id"], device_y["id"]])

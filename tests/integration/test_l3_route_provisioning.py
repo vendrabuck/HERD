@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked
 from ._l3_helpers import create_connection as _create_connection
 from ._l3_helpers import create_device as _create_device
 from ._l3_helpers import create_l3_driver, create_l3_template
@@ -244,7 +245,7 @@ async def test_routes_configured_on_reservation_create_with_l3_switch(
             await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_routes_removed_on_reservation_cancel(admin_client, l3_template, fresh_device):
@@ -253,6 +254,7 @@ async def test_routes_removed_on_reservation_cancel(admin_client, l3_template, f
     switch = await _create_device(admin_client, l3_template["id"], f"mock-l3-sw-{suffix}")
     connection = None
     topology_id = None
+    reservation = None
     try:
         await _create_config_version(admin_client, switch["id"], ROUTES)
         connection = await _create_connection(
@@ -282,11 +284,15 @@ async def test_routes_removed_on_reservation_cancel(admin_client, l3_template, f
             remove_runs = await _poll_success_runs(admin_client, reservation["id"], "remove_route")
         assert _as_kwarg_set(remove_runs) == _expected_set(ROUTES)
     finally:
+        if reservation:
+            # A no-op once the body cancelled; on a failure before that, the
+            # reservation must end before its topology and devices can go.
+            await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:
             await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_route_removal_matches_provisioned_set_after_config_edit(
@@ -299,6 +305,7 @@ async def test_route_removal_matches_provisioned_set_after_config_edit(
     switch = await _create_device(admin_client, l3_template["id"], f"mock-l3-sw-{suffix}")
     connection = None
     topology_id = None
+    reservation = None
     try:
         await _create_config_version(admin_client, switch["id"], ROUTES)
         connection = await _create_connection(
@@ -336,11 +343,15 @@ async def test_route_removal_matches_provisioned_set_after_config_edit(
             "deprovision must never touch routes from the edited config"
         )
     finally:
+        if reservation:
+            # A no-op once the body cancelled; on a failure before that, the
+            # reservation must end before its topology and devices can go.
+            await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:
             await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 async def test_no_route_ops_when_l3_device_has_no_config(admin_client, l3_template, fresh_device):
@@ -393,4 +404,4 @@ async def test_no_route_ops_when_l3_device_has_no_config(admin_client, l3_templa
             await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])

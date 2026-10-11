@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
+from ._device_teardown import delete_port_checked
 from ._topology_teardown import delete_topology_checked
 
 pytestmark = pytest.mark.asyncio
@@ -276,5 +277,7 @@ async def test_commit_with_element_attachment_produces_valid_topology(
         # template delete 409s ("ports still reference it"); the device
         # itself (and this port, cascading) is cleaned up separately by the
         # fresh_device fixture behind visible_fresh_device.
-        await admin_client.delete(f"/inventory/ports/{port_id}")
-        await admin_client.delete(f"/inventory/templates/{port_template_id}")
+        try:
+            await delete_port_checked(admin_client, port_id)
+        finally:
+            await admin_client.delete(f"/inventory/templates/{port_template_id}")

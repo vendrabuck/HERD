@@ -32,8 +32,10 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked, delete_devices_checked
 from ._nats_helpers import probe_nats
 from ._topology_teardown import delete_topology_checked
+from ._wiring_retry import poll_wiring_retry
 
 pytestmark = pytest.mark.asyncio
 
@@ -219,6 +221,22 @@ async def _poll_runs(client, reservation_id, action, target=1, *, timeout=30.0) 
     return count
 
 
+async def _poll_success_run_on_port(client, reservation_id, action, port, *, timeout=25.0):
+    """Poll for a SUCCESS run of `action` on switch `port` (port_a); the run or None."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        resp = await client.get(
+            "/execution/runs",
+            params={"reservation_id": reservation_id, "status": "SUCCESS", "limit": 400},
+        )
+        if resp.status_code == 200:
+            for run in resp.json().get("items", []):
+                if run["action"] == action and run.get("port_a") == port:
+                    return run
+        await asyncio.sleep(0.5)
+    return None
+
+
 async def _poll_active(client, reservation_id, *, timeout=15.0) -> bool:
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
@@ -245,17 +263,25 @@ async def _poll_wiring_conn(client, reservation_id, predicate, *, timeout=25.0):
     return None
 
 
-async def _poll_retry_l2(client, reservation_id, port, outcome, *, timeout=25.0):
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
-        resp = await client.post(f"/reservations/{reservation_id}/wiring/retry")
-        if resp.status_code == 200:
-            for row in resp.json().get("results", []):
-                if row.get("layer") == "l2" and row.get("port") == port:
-                    if row.get("outcome") == outcome:
-                        return row
-        await asyncio.sleep(0.5)
-    return None
+async def _poll_retry_l2(
+    client, reservation_id, port, outcome, *, failed_row_id=None, timeout=25.0
+):
+    """Poll POST wiring/retry until a layer-l2 outcome for `port` matches `outcome`.
+
+    None unless the wanted outcome was seen. With `failed_row_id` (the id of the row
+    already seen FAILED) a row the background retry tick converged first is accepted
+    from wiring-status by that id. On this file's CANCELLED reservation the retry
+    answers 409 (wiring frozen) once no release-direction FAILED row is left, so
+    without the fallback a tick that got there first could never be seen; see
+    _wiring_retry.poll_wiring_retry (issue #1158)."""
+    return await poll_wiring_retry(
+        client,
+        reservation_id,
+        lambda row: row.get("layer") == "l2" and row.get("port") == port,
+        outcome,
+        failed_row_id=failed_row_id,
+        timeout=timeout,
+    )
 
 
 async def test_cancel_releases_all_three_ledgers(
@@ -340,8 +366,7 @@ async def test_cancel_releases_all_three_ledgers(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        for sw in switches:
-            await admin_client.delete(f"/inventory/devices/{sw['id']}")
+        await delete_devices_checked(admin_client, [sw["id"] for sw in switches])
 
 
 async def test_cancel_teardown_failure_converges_on_terminal_retry(
@@ -396,9 +421,18 @@ async def test_cancel_teardown_failure_converges_on_terminal_retry(
             json={"field_data": {"model": "t", "mock_fail_actions": ""}},
         )
         assert cleared.status_code == 200, cleared.text
-        released = await _poll_retry_l2(admin_client, rid, "1", "released")
+        released = await _poll_retry_l2(
+            admin_client, rid, "1", "released", failed_row_id=failed["id"]
+        )
         assert released is not None, "the L2 release never converged after clearing the knob"
-        assert released["outcome"] == "released"
+        assert released["status"] == "RELEASED", released
+        # RELEASED by id does not say the driver ran: the supersession guard settles a
+        # release with no driver call. The shared apply records the run SUCCESS before
+        # it flips the row, on either channel, and no remove on this port could succeed
+        # while the knob was armed, so this run is the cleared retry's own.
+        assert await _poll_success_run_on_port(admin_client, rid, "remove_from_vlan", "1"), (
+            "the membership read RELEASED but no remove_from_vlan succeeded on port 1"
+        )
     finally:
         if rid:
             await admin_client.delete(f"/reservations/{rid}")
@@ -406,4 +440,4 @@ async def test_cancel_teardown_failure_converges_on_terminal_retry(
             await delete_topology_checked(admin_client, topology_id)
         for conn in connections:
             await admin_client.delete(f"/cabling/connections/{conn['id']}")
-        await admin_client.delete(f"/inventory/devices/{l2_sw['id']}")
+        await delete_device_checked(admin_client, l2_sw["id"])

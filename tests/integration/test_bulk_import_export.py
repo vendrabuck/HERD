@@ -17,6 +17,7 @@ import uuid
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked
 from ._topology_teardown import delete_topology_checked
 
 
@@ -104,7 +105,7 @@ async def test_device_import_commit_and_per_row_report(admin_client, dut_templat
         created_id = match[0]["id"]
     finally:
         if created_id:
-            await admin_client.delete(f"/inventory/devices/{created_id}")
+            await delete_device_checked(admin_client, created_id)
 
 
 @pytest.mark.asyncio

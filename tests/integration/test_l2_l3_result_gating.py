@@ -35,6 +35,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ._device_teardown import delete_device_checked
 from ._topology_teardown import delete_topology_checked
 
 pytestmark = pytest.mark.asyncio
@@ -329,7 +330,7 @@ async def test_l2_add_to_vlan_result_failure_records_failed(
             await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 # --- L3: configure_route driver-result failure (provision) ------------------
@@ -372,7 +373,7 @@ async def test_l3_configure_route_result_failure_records_failed(
             await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
 
 
 # --- L3: remove_route driver-result failure keeps the pin (deprovision) -----
@@ -404,6 +405,7 @@ async def test_l3_remove_route_result_failure_records_failed_and_keeps_pin(
     )
     connection = None
     topology_id = None
+    reservation = None
     routes = [{"destination": "10.91.0.0/24", "next_hop": "192.168.91.1", "interface": "eth0"}]
     try:
         await _create_config_version(admin_client, switch["id"], routes)
@@ -444,8 +446,12 @@ async def test_l3_remove_route_result_failure_records_failed_and_keeps_pin(
             f"the failed removal must keep the pin FAILED intended RELEASED: {status}"
         )
     finally:
+        if reservation:
+            # A no-op once the body cancelled; on a failure before that, the
+            # reservation must end before its topology and devices can go.
+            await admin_client.delete(f"/reservations/{reservation['id']}")
         if topology_id:
             await delete_topology_checked(admin_client, topology_id)
         if connection:
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
-        await admin_client.delete(f"/inventory/devices/{switch['id']}")
+        await delete_device_checked(admin_client, switch["id"])
