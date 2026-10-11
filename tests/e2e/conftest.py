@@ -742,6 +742,76 @@ def pw_prefs_patch_carries(response, page_key: str, expected, key=_WHOLE_FILTER)
     return isinstance(saved, dict) and saved.get(key) == expected
 
 
+# A point clear of the bottom-centre toast stack (issue #942): a toast is at
+# most 350 px wide and centred, so the left edge is never over one.
+PW_OFF_TOASTER = (5, 400)
+
+
+def pw_click_for_response(page, target, method, url_end, *, status=200, timeout=15_000):
+    """Click `target` and return the response THIS click caused (issue #1169).
+
+    The ordering anchor for an API read-back after a UI mutation. A wait that
+    orders a read-back must be something only the action under test can
+    produce. A toast is not that when an earlier action already put the same
+    text on screen (a custom toast stays 4 s, a success toast 2 s): the wait
+    returns at once on the stale toast and the read-back races the request
+    still in flight. The request's own response is: the server commits before
+    it answers, so a read-back that starts after this returns sees the write.
+
+    The click sits INSIDE expect_response, so the listener is registered before
+    the request can leave; a response that arrives before the caller's next
+    line is still caught. `target` is waited on until enabled first, so a
+    control that is still loading does not spend the response timeout. That
+    timeout still covers more than the request: the click's own actionability
+    wait, and anything the page does between the click and the request (in the
+    fork editor, a Commit made before the reservation has loaded sends a
+    device-set PATCH ahead of the save POST, TopologyEditorPage.tsx
+    handleCommitToReservation). Matches on the request method and on the URL
+    without its query string ending in `url_end`. Fails with the response body
+    when the status is not `status`.
+
+    It returns the FIRST response the predicate matches. The main axios client
+    replays a request once after a 401 and a token refresh
+    (frontend/src/api/client.ts), so a test that outlives its access token
+    (30 minutes; every pw_page test logs in fresh) would capture the 401 and
+    fail the status assertion here although the replay succeeds. Such a test
+    should not use this helper as is: it writes its own expect_response whose
+    predicate also requires `r.status != 401`, so the replay's response is the
+    one captured.
+    """
+    from playwright.sync_api import expect
+
+    expect(target).to_be_enabled(timeout=timeout)
+    with page.expect_response(
+        lambda r: r.request.method == method and r.url.split("?", 1)[0].endswith(url_end),
+        timeout=timeout,
+    ) as info:
+        target.click()
+    response = info.value
+    assert response.status == status, (
+        f"{method} {url_end} answered {response.status}, expected {status}: {response.text()}"
+    )
+    return response
+
+
+def pw_toast_gone(page, text, *, timeout=10_000):
+    """Wait until no toast with exactly `text` is left in the page (issue #1169).
+
+    Call this before repeating an action whose toast text is the same as the
+    earlier one's, so the next toast assertion can only be satisfied by the
+    new toast and never matches two elements (a strict mode violation). The
+    pointer is parked off the toaster first, because react-hot-toast pauses a
+    toast's timer while the pointer is over it. Count zero, not hidden: a
+    dismissed toast stays in the DOM for its exit animation. The match is the
+    whole page on purpose: if anything else carries the same exact text this
+    times out loudly instead of passing without having waited for the toast.
+    """
+    from playwright.sync_api import expect
+
+    page.mouse.move(*PW_OFF_TOASTER)
+    expect(page.get_by_text(text, exact=True)).to_have_count(0, timeout=timeout)
+
+
 def pw_two_devices_with_ports(page, min_ports: int = 1):
     """Find two distinct seeded devices, of the SAME topology_type, that each
     have at least min_ports ports.

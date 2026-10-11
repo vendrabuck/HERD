@@ -38,12 +38,18 @@ import httpx
 import pytest
 from playwright.sync_api import expect
 
+from .conftest import pw_click_for_response, pw_toast_gone
+
 HOST_BASE_URL = os.environ.get("E2E_HOST_BASE_URL", "https://localhost")
 CONFIG_PASSWORD = os.environ.get("CONFIG_ADMIN_PASSWORD") or "admin123!"
 
 # Schema label for LDAP_USER_FILTER (services/config/app/config_schema.py).
 FILTER_LABEL = "User Search Filter"
 SENTINEL_FILTER = "(uid={username})(e2e-playwright-sentinel)"
+
+# The Save toast (ConfigPage.tsx handleSave). Matched exactly: Save and Restart
+# raises "Configuration saved, restarting services...", which is another toast.
+SAVED_TOAST = "Configuration saved"
 
 # Container path of the precedence marker (services/config/app/config_store.py).
 BOOTSTRAP_MARKER = "/data/herd-config/config.bootstrapped"
@@ -103,6 +109,26 @@ def _ui_login(page):
     page.get_by_role("button", name="Sign in").click()
 
 
+def _ui_save(page):
+    """Click Save and return once THIS save's PUT has answered 200 and its toast is up.
+
+    The read-back that follows is ordered by the PUT's own response (issue
+    #1169): the config service writes config.json before it answers, so a GET
+    that starts after this returns reads the saved value. The toast is a UI
+    assertion only. It can be satisfied by nothing but this save's toast as
+    long as no earlier "Configuration saved" toast is still in the page: true
+    for the first save after a page load, and a test that saves a second time
+    calls pw_toast_gone(page, SAVED_TOAST) first (a success toast stays 2 s).
+    """
+    pw_click_for_response(
+        page,
+        page.get_by_role("button", name="Save", exact=True),
+        "PUT",
+        "/api/config/settings",
+    )
+    expect(page.get_by_text(SAVED_TOAST, exact=True)).to_be_visible()
+
+
 def test_config_login_success_shows_editor(pw_page, config_api):
     """The config login SUCCESS path renders the editor (previously untested).
 
@@ -132,8 +158,7 @@ def test_config_save_persists_value_via_api_readback(
             "xpath=following-sibling::input"
         )
         field.fill(SENTINEL_FILTER)
-        pw_page.get_by_role("button", name="Save", exact=True).click()
-        expect(pw_page.get_by_text("Configuration saved")).to_be_visible()
+        _ui_save(pw_page)
 
         saved = config_api.get("/api/config/settings").json()["values"]
         assert saved["LDAP_USER_FILTER"] == SENTINEL_FILTER
@@ -165,15 +190,17 @@ def test_config_full_cycle_edit_and_restore_via_ui(pw_page, config_api, preserve
         _ui_login(pw_page)
 
         _filter_field(pw_page).fill(SENTINEL_FILTER)
-        pw_page.get_by_role("button", name="Save", exact=True).click()
-        expect(pw_page.get_by_text("Configuration saved")).to_be_visible()
+        _ui_save(pw_page)
         saved = config_api.get("/api/config/settings").json()["values"]
         assert saved["LDAP_USER_FILTER"] == SENTINEL_FILTER
 
-        # Restore the original value THROUGH THE UI, not the API.
+        # Restore the original value THROUGH THE UI, not the API. The first
+        # save's toast carries the same text as the one this save will raise,
+        # so it must be gone first: otherwise the toast check in _ui_save is
+        # met by the stale toast, or by two toasts at once.
+        pw_toast_gone(pw_page, SAVED_TOAST)
         _filter_field(pw_page).fill(original_filter)
-        pw_page.get_by_role("button", name="Save", exact=True).click()
-        expect(pw_page.get_by_text("Configuration saved")).to_be_visible()
+        _ui_save(pw_page)
         restored = config_api.get("/api/config/settings").json()["values"]
         # Empty string is stored as unset (PR #374), so an originally-empty
         # value reads back as either "" or absent; both satisfy the baseline.
