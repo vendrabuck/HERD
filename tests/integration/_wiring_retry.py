@@ -19,11 +19,21 @@ follow for a test that clears a mock fail knob and then polls for convergence
 
 So when the retry answer names no row for the wanted identity, the poll reads
 wiring-status and accepts the row the caller saw FAILED, matched BY ID, in the
-status the wanted outcome stands for. That is the same read-back-by-id the retry
-itself reports from, taken through the other endpoint, so it accepts nothing the
-retry would not have reported had it loaded the row a moment earlier. A row that
-is still FAILED is named by the retry answer (or, on wiring-status, is not in the
-settled status) and is never accepted; a row that never existed has no id to match.
+status the wanted outcome stands for. A row that is still FAILED is named by the
+retry answer (or, on wiring-status, is not in the settled status) and is never
+accepted; a row that never existed has no id to match.
+
+What the fallback does NOT know is how the row got there. For "reconnected" that
+loses nothing: the only writers that flip a FAILED row ACTIVE run after a driver
+success (record_l1_connect, record_l2_membership_active, record_route_active), and
+the retry's own "reconnected" is the same status read-back. For "released" it is
+weaker than the retry's word: a release-direction row can also end RELEASED through
+the supersession guard, with no driver call, which the retry reports as "superseded"
+and wiring-status shows as plain RELEASED. Two things cover that. A retry answer
+that reports "superseded" for the caller's own row ends the poll with None, and
+callers that poll for "released" also assert a SUCCESS run of the release action
+for the port, which the shared apply writes before it flips the row and which
+cannot exist before the knob is cleared.
 """
 
 import asyncio
@@ -87,6 +97,11 @@ async def poll_wiring_retry(
     wiring-status row, which has `status` but no `outcome`, so callers assert on
     `status`: a retry row reported "reconnected" has status ACTIVE and one reported
     "released" has status RELEASED, by the retry's own read-back.
+
+    A retry answer that reports "superseded" for the row with `failed_row_id` ends
+    the poll with None at once when another outcome was wanted: that row settled
+    with no driver call, and from then on wiring-status would show it RELEASED like
+    a driven release.
     """
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
@@ -99,6 +114,11 @@ async def poll_wiring_retry(
         for row in rows:
             if row.get("outcome") == outcome:
                 return row
+        if failed_row_id is not None and any(
+            row.get("outcome") == "superseded" and str(row.get("id")) == str(failed_row_id)
+            for row in rows
+        ):
+            return None
         if (
             failed_row_id is not None
             and not rows

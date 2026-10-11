@@ -423,6 +423,13 @@ async def test_l2_release_failure_retry_converges_released(
         )
         assert released is not None, "the membership never converged RELEASED after retry"
         assert released["status"] == "RELEASED", released
+        # RELEASED by id does not say the driver ran: the supersession guard settles a
+        # release with no driver call. The shared apply records the run SUCCESS before
+        # it flips the row, on either channel, and no remove on this port could succeed
+        # while the knob was armed, so this run is the cleared retry's own.
+        assert await _poll_run(admin_client, rid, "remove_from_vlan", "1"), (
+            "the membership read RELEASED but no remove_from_vlan succeeded on port 1"
+        )
     finally:
         if rid:
             await admin_client.delete(f"/reservations/{rid}")

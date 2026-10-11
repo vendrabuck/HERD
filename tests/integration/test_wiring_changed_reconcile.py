@@ -543,6 +543,14 @@ async def test_cancelled_disconnect_failure_direction_aware_retry(
         assert released is not None, (
             f"the retried connection never read back RELEASED (last retry row: {row_released})"
         )
+        # RELEASED does not say the driver ran: the supersession guard settles a release
+        # with no driver call. The shared apply records the run SUCCESS before it flips
+        # the row, on either channel, and no disconnect could succeed while the knob was
+        # armed (it was armed from the switch's creation), so this run is the cleared
+        # retry's own.
+        assert await _poll_run_count_at_least(
+            admin_client, reservation_id, "disconnect_ports", 1
+        ), "the connection read RELEASED but no disconnect_ports succeeded"
         remaining = [
             c
             for c in (await _wiring_status(admin_client, reservation_id))["connections"]

@@ -221,6 +221,22 @@ async def _poll_runs(client, reservation_id, action, target=1, *, timeout=30.0) 
     return count
 
 
+async def _poll_success_run_on_port(client, reservation_id, action, port, *, timeout=25.0):
+    """Poll for a SUCCESS run of `action` on switch `port` (port_a); the run or None."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        resp = await client.get(
+            "/execution/runs",
+            params={"reservation_id": reservation_id, "status": "SUCCESS", "limit": 400},
+        )
+        if resp.status_code == 200:
+            for run in resp.json().get("items", []):
+                if run["action"] == action and run.get("port_a") == port:
+                    return run
+        await asyncio.sleep(0.5)
+    return None
+
+
 async def _poll_active(client, reservation_id, *, timeout=15.0) -> bool:
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
@@ -410,6 +426,13 @@ async def test_cancel_teardown_failure_converges_on_terminal_retry(
         )
         assert released is not None, "the L2 release never converged after clearing the knob"
         assert released["status"] == "RELEASED", released
+        # RELEASED by id does not say the driver ran: the supersession guard settles a
+        # release with no driver call. The shared apply records the run SUCCESS before
+        # it flips the row, on either channel, and no remove on this port could succeed
+        # while the knob was armed, so this run is the cleared retry's own.
+        assert await _poll_success_run_on_port(admin_client, rid, "remove_from_vlan", "1"), (
+            "the membership read RELEASED but no remove_from_vlan succeeded on port 1"
+        )
     finally:
         if rid:
             await admin_client.delete(f"/reservations/{rid}")
