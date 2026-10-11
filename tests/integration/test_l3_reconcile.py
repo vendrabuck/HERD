@@ -35,6 +35,7 @@ import pytest
 from ._device_teardown import delete_device_checked
 from ._nats_helpers import probe_nats
 from ._topology_teardown import delete_topology_checked
+from ._wiring_retry import poll_wiring_retry
 
 pytestmark = pytest.mark.asyncio
 
@@ -241,18 +242,21 @@ async def _poll_active(client, reservation_id: str, *, timeout: float = 15.0) ->
     return False
 
 
-async def _poll_retry_l3(client, reservation_id, outcome, *, timeout=25.0):
-    """Poll POST wiring/retry until a layer-l3 outcome matches `outcome`."""
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
-        resp = await client.post(f"/reservations/{reservation_id}/wiring/retry")
-        if resp.status_code == 200:
-            for row in resp.json().get("results", []):
-                if row.get("layer") == "l3":
-                    if row.get("outcome") == outcome:
-                        return row
-        await asyncio.sleep(0.5)
-    return None
+async def _poll_retry_l3(client, reservation_id, outcome, *, failed_row_id=None, timeout=25.0):
+    """Poll POST wiring/retry until a layer-l3 outcome matches `outcome`.
+
+    None unless the wanted outcome was seen. With `failed_row_id` (the id of the pin
+    already seen FAILED) a pin the background retry tick converged first, which the
+    retry answer no longer names, is accepted from wiring-status by that id; see
+    _wiring_retry.poll_wiring_retry (issue #1158)."""
+    return await poll_wiring_retry(
+        client,
+        reservation_id,
+        lambda row: row.get("layer") == "l3",
+        outcome,
+        failed_row_id=failed_row_id,
+        timeout=timeout,
+    )
 
 
 async def _save_fork(client, reservation_id, canvas):
@@ -414,9 +418,13 @@ async def test_l3_failed_provision_surfaces_and_manual_retry_recovers(
             json={"field_data": {"model": "test", "mock_fail_actions": ""}},
         )
         assert cleared.status_code == 200, cleared.text
-        recovered = await _poll_retry_l3(admin_client, rid, "reconnected")
+        # Either the manual retry reports "reconnected", or the background retry tick
+        # converged the pin first and it reads back ACTIVE by id (issue #1158).
+        recovered = await _poll_retry_l3(
+            admin_client, rid, "reconnected", failed_row_id=failed["id"]
+        )
         assert recovered is not None, "the route pin never converged ACTIVE after retry"
-        assert recovered["outcome"] == "reconnected"
+        assert recovered["status"] == "ACTIVE", recovered
     finally:
         if rid:
             await admin_client.delete(f"/reservations/{rid}")

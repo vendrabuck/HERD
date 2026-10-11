@@ -35,6 +35,7 @@ import pytest
 from ._device_teardown import delete_device_checked, delete_devices_checked
 from ._nats_helpers import probe_nats
 from ._topology_teardown import delete_topology_checked
+from ._wiring_retry import poll_wiring_retry
 
 pytestmark = pytest.mark.asyncio
 
@@ -246,17 +247,25 @@ async def _poll_wiring_conn(client, reservation_id, predicate, *, timeout=25.0):
     return None
 
 
-async def _poll_retry_l2(client, reservation_id, port, outcome, *, timeout=25.0):
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
-        resp = await client.post(f"/reservations/{reservation_id}/wiring/retry")
-        if resp.status_code == 200:
-            for row in resp.json().get("results", []):
-                if row.get("layer") == "l2" and row.get("port") == port:
-                    if row.get("outcome") == outcome:
-                        return row
-        await asyncio.sleep(0.5)
-    return None
+async def _poll_retry_l2(
+    client, reservation_id, port, outcome, *, failed_row_id=None, timeout=25.0
+):
+    """Poll POST wiring/retry until a layer-l2 outcome for `port` matches `outcome`.
+
+    None unless the wanted outcome was seen. With `failed_row_id` (the id of the row
+    already seen FAILED) a row the background retry tick converged first is accepted
+    from wiring-status by that id. On this file's CANCELLED reservation the retry
+    answers 409 (wiring frozen) once no release-direction FAILED row is left, so
+    without the fallback a tick that got there first could never be seen; see
+    _wiring_retry.poll_wiring_retry (issue #1158)."""
+    return await poll_wiring_retry(
+        client,
+        reservation_id,
+        lambda row: row.get("layer") == "l2" and row.get("port") == port,
+        outcome,
+        failed_row_id=failed_row_id,
+        timeout=timeout,
+    )
 
 
 async def test_cancel_releases_all_three_ledgers(
@@ -396,9 +405,11 @@ async def test_cancel_teardown_failure_converges_on_terminal_retry(
             json={"field_data": {"model": "t", "mock_fail_actions": ""}},
         )
         assert cleared.status_code == 200, cleared.text
-        released = await _poll_retry_l2(admin_client, rid, "1", "released")
+        released = await _poll_retry_l2(
+            admin_client, rid, "1", "released", failed_row_id=failed["id"]
+        )
         assert released is not None, "the L2 release never converged after clearing the knob"
-        assert released["outcome"] == "released"
+        assert released["status"] == "RELEASED", released
     finally:
         if rid:
             await admin_client.delete(f"/reservations/{rid}")

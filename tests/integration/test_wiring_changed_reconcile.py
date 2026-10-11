@@ -53,6 +53,7 @@ import pytest
 from ._device_teardown import delete_device_checked
 from ._nats_helpers import fetch_events_for_reservation, probe_nats, publish_raw
 from ._topology_teardown import delete_topology_checked
+from ._wiring_retry import poll_wiring_retry
 from .conftest import _psql
 
 pytestmark = pytest.mark.asyncio
@@ -270,26 +271,35 @@ async def _poll_wiring_conn(client, reservation_id: str, predicate, *, timeout: 
     return None
 
 
-async def _poll_retry_l1(client, reservation_id: str, outcome: str, *, timeout: float = 25.0):
+async def _poll_retry_l1(
+    client,
+    reservation_id: str,
+    outcome: str,
+    *,
+    failed_row_id: str | None = None,
+    timeout: float = 25.0,
+):
     """Poll POST wiring/retry until a layer-l1 outcome matches `outcome`.
 
     Mirrors _poll_retry_l2 in test_l2_reconcile.py / test_ledger_teardown.py. Since
     issue #817, `in_progress` is a legitimate outcome: the background retry tick
     (WIRING_RETRY_INTERVAL_SECONDS) can hold the row's claim at the instant of a manual
     call, so a single POST answering in_progress is not a failure, it means try again.
-    The product contract is convergence, not "the first manual call does the work"."""
-    deadline = asyncio.get_event_loop().time() + timeout
-    last = None
-    while asyncio.get_event_loop().time() < deadline:
-        resp = await client.post(f"/reservations/{reservation_id}/wiring/retry")
-        if resp.status_code == 200:
-            for row in resp.json().get("results", []):
-                if row.get("layer") == "l1":
-                    last = row
-                    if row.get("outcome") == outcome:
-                        return row
-        await asyncio.sleep(0.5)
-    return last
+    The product contract is convergence, not "the first manual call does the work".
+
+    None unless the wanted outcome was seen. With `failed_row_id` (the id of the row
+    already seen FAILED on wiring-status) a row the tick converged first, which the
+    retry answer no longer names (a 409 on a frozen reservation), is accepted from
+    wiring-status by that id instead of polling out the whole timeout; see
+    _wiring_retry.poll_wiring_retry (issue #1158)."""
+    return await poll_wiring_retry(
+        client,
+        reservation_id,
+        lambda row: row.get("layer") == "l1",
+        outcome,
+        failed_row_id=failed_row_id,
+        timeout=timeout,
+    )
 
 
 async def _poll_active(client, reservation_id: str, *, timeout: float = 12.0) -> bool:
@@ -422,7 +432,9 @@ async def test_failed_build_surfaces_and_manual_retry_recovers(
 
         # Issue #817: a single retry call may answer in_progress if the background tick
         # holds the row's claim at that instant, so poll instead of asserting on one call.
-        reconnected = await _poll_retry_l1(admin_client, reservation_id, "reconnected")
+        reconnected = await _poll_retry_l1(
+            admin_client, reservation_id, "reconnected", failed_row_id=failed["id"]
+        )
 
         # wiring-status must show the pair ACTIVE, whichever channel (manual retry or the
         # background tick) did the flip. The read-back is mandatory: a reported
@@ -518,7 +530,9 @@ async def test_cancelled_disconnect_failure_direction_aware_retry(
 
         # Issue #817: a single retry call may answer in_progress if the background tick
         # holds the row's claim at that instant, so poll instead of asserting on one call.
-        row_released = await _poll_retry_l1(admin_client, reservation_id, "released")
+        row_released = await _poll_retry_l1(
+            admin_client, reservation_id, "released", failed_row_id=failed["id"]
+        )
 
         # The read-back is mandatory, whichever channel (manual retry or the background
         # tick) did the flip: a reported "released" means the compare-and-swap already
