@@ -201,6 +201,13 @@ async def test_start_nats_consumer_success():
     assert mock_js.add_consumer.await_args.args[0] == "HERD_RESERVATIONS"
     # Verify subscription was created
     mock_js.pull_subscribe.assert_called_once()
+    # The order itself, read from the ONE call log both mocks share through their
+    # parent: two separate "was called once" checks hold whichever came first,
+    # and pull_subscribe ahead of add_consumer binds to the durable's stale config.
+    durable_calls = [
+        name for name, _, _ in mock_js.mock_calls if name in ("add_consumer", "pull_subscribe")
+    ]
+    assert durable_calls == ["add_consumer", "pull_subscribe"], mock_js.mock_calls
     # Verify consumer task was stored
     assert hasattr(mock_app.state, "nats_consumer_task")
 

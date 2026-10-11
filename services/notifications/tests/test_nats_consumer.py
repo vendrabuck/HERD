@@ -605,6 +605,9 @@ class _FakeJetStream:
         self.added_streams = []
         self.subscribe_calls = []
         self.add_consumer_calls = []
+        # Every add_consumer and pull_subscribe as (operation, durable), in the
+        # order they happened. The two lists above cannot say which came first.
+        self.durable_calls = []
         self.published = []
         self._add_stream_error = add_stream_error
 
@@ -617,11 +620,13 @@ class _FakeJetStream:
         # issue #895: herd_common.jetstream.ensure_consumer calls this to
         # create-or-update the durable BEFORE pull_subscribe binds to it.
         self.add_consumer_calls.append({"stream": stream, "config": config})
+        self.durable_calls.append(("add_consumer", config.durable_name))
 
     async def pull_subscribe(self, subject_pattern, durable, config):
         self.subscribe_calls.append(
             {"subject": subject_pattern, "durable": durable, "config": config}
         )
+        self.durable_calls.append(("pull_subscribe", durable))
         return self._subs.get(subject_pattern, _FakeSubscription([]))
 
     async def publish(self, subject, payload):
@@ -688,10 +693,20 @@ async def test_start_nats_consumer_wires_both_subscriptions(monkeypatch):
         )
         durables = {c["durable"] for c in js.subscribe_calls}
         assert durables == {nats_consumer.NATS_DURABLE, nats_consumer.HEALTH_DURABLE}
-        # issue #895: both durables are created-or-updated via add_consumer
-        # BEFORE pull_subscribe binds to them, and neither config carries a
-        # `backoff` (a real object attribute here, not just a kwargs entry, so
-        # accessing it directly proves ensure_consumer built it that way).
+        # issue #895: each durable is created-or-updated (add_consumer, through
+        # ensure_consumer) exactly once and BEFORE the one pull_subscribe that
+        # binds to it. pull_subscribe binds to whatever config an existing
+        # durable already has, so the reverse order would leave a stale config
+        # in force. Read from ONE ordered log: separate per-call lists hold
+        # the same entries whichever call came first.
+        for durable in (nats_consumer.NATS_DURABLE, nats_consumer.HEALTH_DURABLE):
+            assert [op for op, name in js.durable_calls if name == durable] == [
+                "add_consumer",
+                "pull_subscribe",
+            ], js.durable_calls
+        # Neither config carries a `backoff` (a real object attribute here, not
+        # just a kwargs entry, so accessing it directly proves ensure_consumer
+        # built it that way).
         assert len(js.add_consumer_calls) == 2
         add_consumer_durables = {c["config"].durable_name for c in js.add_consumer_calls}
         assert add_consumer_durables == {nats_consumer.NATS_DURABLE, nats_consumer.HEALTH_DURABLE}
