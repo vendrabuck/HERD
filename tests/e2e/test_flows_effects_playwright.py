@@ -42,7 +42,7 @@ from pathlib import Path
 import httpx
 from playwright.sync_api import expect
 
-from .conftest import HOST_BASE_URL, pw_login
+from .conftest import HOST_BASE_URL, pw_click_for_response, pw_login, pw_toast_gone
 
 _MOCK_HV_DIR = Path(__file__).resolve().parents[2] / "drivers" / "mock_hypervisor"
 
@@ -344,6 +344,33 @@ def test_bulk_topology_import_dialog_dry_run_then_commit(pw_page):
 # ---------------------------------------------------------------------------
 
 
+# The create toast (DeviceConfigSection.tsx handleCreate), the same text for
+# every version created.
+CONFIG_VERSION_CREATED = "Config version created"
+
+
+def _save_config_version(page, device_id: str, expected_version: int) -> None:
+    """Click Save in the New version form; return once THIS create has answered 201.
+
+    The create POST's own response orders everything after it (issue #1169):
+    it carries the version number inventory allocated, so a toast left over
+    from an earlier create cannot stand in for it. The toast is a UI assertion
+    only; a caller creating a second version calls
+    pw_toast_gone(page, CONFIG_VERSION_CREATED) first, so this check is met by
+    the new toast alone and never by two at once.
+    """
+    response = pw_click_for_response(
+        page,
+        page.get_by_role("button", name="Save", exact=True),
+        "POST",
+        f"/inventory/devices/{device_id}/config-versions",
+        status=201,
+    )
+    body = response.json()
+    assert body["version_number"] == expected_version, body
+    expect(page.get_by_text(CONFIG_VERSION_CREATED, exact=True)).to_be_visible()
+
+
 def test_device_config_version_cycle(pw_page):
     pw_login(pw_page)
     suffix = uuid.uuid4().hex[:8]
@@ -379,8 +406,7 @@ def test_device_config_version_cycle(pw_page):
         pw_page.get_by_role("button", name="New version", exact=True).click()
         pw_page.fill("#config-json", json.dumps(config_a))
         pw_page.fill("#config-description", "version A")
-        pw_page.get_by_role("button", name="Save", exact=True).click()
-        expect(pw_page.get_by_text("Config version created")).to_be_visible()
+        _save_config_version(pw_page, device_id, 1)
         expect(pw_page.locator("tr", has_text="v1")).to_be_visible()
 
         # --- View version 1 and confirm its config renders ---
@@ -390,11 +416,13 @@ def test_device_config_version_cycle(pw_page):
         pw_page.get_by_role("button", name="Close", exact=True).click()
 
         # --- Create version 2 ---
+        # Version 1's toast carries the same text as the one this create will
+        # raise; with both on screen the toast check would match two elements.
+        pw_toast_gone(pw_page, CONFIG_VERSION_CREATED)
         pw_page.get_by_role("button", name="New version", exact=True).click()
         pw_page.fill("#config-json", json.dumps(config_b))
         pw_page.fill("#config-description", "version B")
-        pw_page.get_by_role("button", name="Save", exact=True).click()
-        expect(pw_page.get_by_text("Config version created")).to_be_visible()
+        _save_config_version(pw_page, device_id, 2)
         expect(pw_page.locator("tr", has_text="v2")).to_be_visible()
 
         # --- Diff v1 and v2: check both compare boxes, open the diff ---
