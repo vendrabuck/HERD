@@ -9,12 +9,29 @@ Dockerfile as text, in the same style as tests/unit/test_compose_settings_wiring
 and tests/unit/test_nos_lab_ci_wiring.py.
 
 The Dockerfile checks pin POSITION, not presence (issue #1158). Each file is read as
-instructions grouped by build stage: the ARG and ENV lines must sit in the stage that
-ships (services) or that runs the Vite build (frontend), the ENV line after both ARG
-lines, and, for a service, no RUN, COPY, or ADD after them, which covers an install
-under any spelling. The detector tests at the end feed the same two scans a clean
-Dockerfile and every arrangement that keeps all the expected lines while breaking
-what they are for.
+instructions grouped by build stage (keyword and arguments split on any whitespace,
+continuations joined, comments dropped). For a service, in the stage that ships: each
+of the two variables is declared by exactly one ARG instruction, with the pinned
+text; exactly one ENV instruction sets them, with the pinned text, after both ARG
+lines; and no RUN, COPY, or ADD follows the first ARG line, which covers an install
+under any spelling. A RUN that needs the value after the ARG is refused by design:
+the ENV line already puts the value in the image. For the frontend, in the stage
+that runs `npm run build`: the same ARG and ENV rules, all three lines ahead of the
+build, and after that stage's `npm ci` or `npm install` when it has one. The detector
+tests at the end feed the same two scans a clean Dockerfile and every arrangement
+that keeps all the expected lines while breaking what they are for.
+
+Limits. The file is read as text, not built:
+
+- not seen: an ARG block inside a heredoc body, a shell-form CMD or ENTRYPOINT that
+  overrides or unsets the variable, `RUN VITE_HERD_BUILD=dev npm run build`, a
+  build run through a wrapper script, a served frontend stage that copies `dist`
+  from another stage, a parser `escape` directive, and anything compose sets at
+  run time;
+- read conservatively (refused though it may be sound), exact text kept from the
+  original guard: a quoted default (`ARG HERD_BUILD="dev"`), both variables on one
+  ARG instruction, an ENV line that carries a third variable or is split in two, an
+  `${VAR:-default}` expansion in the ENV line, and any COPY or RUN after the ARG.
 """
 
 from __future__ import annotations
@@ -93,10 +110,12 @@ def dockerfile_stages(text: str) -> list[list[tuple[int, str, str]]]:
     """The build stages of a Dockerfile, each a list of (line, INSTRUCTION, arguments).
 
     Backslash continuations are joined, comments and blank lines dropped (also
-    inside a continued instruction, as Docker does), keywords upper-cased. A new
-    stage starts at every FROM; instructions ahead of the first FROM (global ARGs)
-    form no stage."""
+    inside a continued instruction, as Docker does), the keyword split from its
+    arguments at the first run of whitespace (a space or a tab) and upper-cased, and
+    runs of whitespace in the arguments collapsed. A new stage starts at every FROM;
+    instructions ahead of the first FROM (global ARGs) form no stage."""
     stages: list[list[tuple[int, str, str]]] = []
+    logical: list[tuple[int, str]] = []
     pending, first_line = "", 0
     for number, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
@@ -107,12 +126,18 @@ def dockerfile_stages(text: str) -> list[list[tuple[int, str, str]]]:
         if line.endswith("\\"):
             pending += line[:-1] + " "
             continue
-        keyword, _, arguments = (pending + line).strip().partition(" ")
+        logical.append((first_line, pending + line))
         pending = ""
+    if pending.strip():
+        # A continuation that runs off the end of the file is still an instruction.
+        logical.append((first_line, pending))
+    for first_line, text in logical:
+        keyword, *rest = text.split(None, 1)
+        arguments = " ".join(rest[0].split()) if rest else ""
         if keyword.upper() == "FROM":
             stages.append([])
         if stages:
-            stages[-1].append((first_line, keyword.upper(), " ".join(arguments.split())))
+            stages[-1].append((first_line, keyword.upper(), arguments))
     return stages
 
 
@@ -128,12 +153,17 @@ def _ordering_problems(
     problems: list[str] = []
     arg_positions: list[int] = []
     for arg in args:
-        positions = [
-            i for i, (_, keyword, value) in enumerate(stage) if (keyword, value) == ("ARG", arg)
+        name = arg.split("=")[0]
+        declared = [
+            i
+            for i, (_, keyword, value) in enumerate(stage)
+            if keyword == "ARG" and name in (word.split("=")[0] for word in value.split())
         ]
-        if len(positions) != 1:
+        positions = [i for i in declared if stage[i][2] == arg]
+        if len(positions) != 1 or len(declared) != 1:
             problems.append(
-                f"expected exactly one 'ARG {arg}' in the stage, found {len(positions)}"
+                f"expected exactly one ARG instruction declaring {name}, reading 'ARG {arg}'; "
+                f"found {[f'line {stage[i][0]}: ARG {stage[i][2]}' for i in declared]}"
             )
         arg_positions += positions
     names = [arg.split("=")[0] for arg in args]
@@ -162,6 +192,8 @@ _FRONTEND_ARG_LINES = ("VITE_HERD_BUILD=dev", "VITE_HERD_BUILD_DATE=")
 _FRONTEND_ENV_LINE = (
     "VITE_HERD_BUILD=${VITE_HERD_BUILD} VITE_HERD_BUILD_DATE=${VITE_HERD_BUILD_DATE}"
 )
+# `npm run build`, not `npm run build:docs` or `npm run build-storybook`.
+_NPM_RUN_BUILD = re.compile(r"\bnpm run build(?![\w:.-])")
 # Instructions that build a filesystem layer. One of these after the build ARGs is
 # rebuilt on every commit, because the ARG value (and the ENV that follows) is part
 # of its cache key.
@@ -173,10 +205,12 @@ def service_build_arg_problems(text: str) -> list[str]:
     it ships, as late as possible; empty when it does (issue #846).
 
     Judged on the FINAL stage, the one that becomes the image: an ARG or ENV in an
-    earlier stage does not reach it. The stage must declare both ARGs once, carry
-    them into ENV after both, set neither variable anywhere else, install its
-    dependencies before the ARGs, and build no layer (RUN, COPY, ADD, under any
-    spelling of the command) after the first ARG."""
+    earlier stage does not reach it. The stage must declare each ARG once, carry
+    them into ENV after both, set neither variable anywhere else, and build no layer
+    (RUN, COPY, ADD, under any spelling of the command) after the first ARG. Where
+    the dependencies are installed is not asked: with no layer allowed after the
+    ARG lines, every install is ahead of them, whatever it is called and whichever
+    stage it runs in."""
     stages = dockerfile_stages(text)
     if not stages:
         return ["no FROM instruction"]
@@ -185,8 +219,6 @@ def service_build_arg_problems(text: str) -> list[str]:
     if not arg_positions:
         return problems
     first_arg = min(arg_positions)
-    if not any(k == "RUN" and "pip install" in v for _, k, v in stage[:first_arg]):
-        problems.append("no 'pip install' RUN ahead of the ARG lines to anchor against")
     for line, keyword, value in stage[first_arg + 1 :]:
         if keyword in _LAYER_INSTRUCTIONS:
             problems.append(
@@ -201,14 +233,15 @@ def frontend_build_arg_problems(text: str) -> list[str]:
     """Why the frontend Dockerfile does not bake the build identifier into the Vite
     build while keeping the dependency install cached; empty when it does.
 
-    Judged on the stage that runs `npm run build`: both ARGs once, the ENV line
+    Judged on the stage that runs `npm run build`: each ARG once, the ENV line
     after both, all three ahead of the build (Vite reads the environment then) and
-    after that stage's `npm ci`/`npm install` RUN."""
+    after that stage's `npm ci`/`npm install` RUN when it has one (a stage that
+    copies `node_modules` from a deps stage has none)."""
     builds = [
         (stage, index)
         for stage in dockerfile_stages(text)
         for index, (_, keyword, value) in enumerate(stage)
-        if keyword == "RUN" and re.search(r"\bnpm run build\b", value)
+        if keyword == "RUN" and _NPM_RUN_BUILD.search(value)
     ]
     if len(builds) != 1:
         return [f"expected exactly one 'RUN npm run build', found {len(builds)}"]
@@ -227,9 +260,7 @@ def frontend_build_arg_problems(text: str) -> list[str]:
         for i, (_, k, v) in enumerate(stage)
         if k == "RUN" and re.search(r"\bnpm (ci|install)\b", v)
     ]
-    if not installs:
-        problems.append("no npm ci/install RUN in the build stage to anchor against")
-    elif max(installs) > min(arg_positions):
+    if installs and max(installs) > min(arg_positions):
         problems.append(
             "the VITE_HERD_BUILD ARG lines must come after the npm ci/install layer, or a "
             "build-string change reinstalls the dependencies"
@@ -312,6 +343,23 @@ def test_service_scan_accepts_a_clean_dockerfile():
     assert service_build_arg_problems(lowercase) == []
     builder = "FROM python:3.12-slim AS builder\nRUN make wheels\n" + GOOD_SERVICE
     assert service_build_arg_problems(builder) == []
+    tabs = _swap(GOOD_SERVICE, _ARGS + _ENV, (_ARGS + _ENV).replace("ARG ", "ARG\t"))
+    assert service_build_arg_problems(tabs.replace("ENV ", "ENV \t")) == []
+    metadata = _swap(GOOD_SERVICE, "USER appuser\n", "LABEL a=b\nWORKDIR /app\nUSER appuser\n")
+    assert service_build_arg_problems(metadata) == []
+
+
+def test_service_scan_does_not_ask_where_the_install_runs():
+    """With no layer allowed after the ARG lines, a slim final stage whose
+    dependencies were installed in a builder, or with `uv sync`, is as late as any."""
+    slim = (
+        "FROM python:3.12-slim AS builder\nRUN uv pip install --system -r requirements.txt\n"
+        "FROM python:3.12-slim\nCOPY --from=builder /usr/local /usr/local\n" + _ARGS + _ENV
+    )
+    assert service_build_arg_problems(slim) == []
+    synced = _swap(GOOD_SERVICE, _INSTALL, "RUN uv sync --frozen\n")
+    synced = _swap(synced, "RUN uv pip install --system --no-deps -e .\n", "")
+    assert service_build_arg_problems(synced) == []
 
 
 SERVICE_FALSE_PASSES = {
@@ -361,6 +409,23 @@ SERVICE_FALSE_PASSES = {
     "ENV carries only the build string": _swap(
         GOOD_SERVICE, _ENV, "ENV HERD_BUILD=${HERD_BUILD}\n"
     ),
+    "install after the ARG lines, a tab after RUN": _swap(
+        GOOD_SERVICE, _ENV, _ENV + "RUN\tuv pip install --system extra\n"
+    ),
+    "install after the ARG lines, lowercase keyword": _swap(
+        GOOD_SERVICE, _ENV, _ENV + "run uv pip install --system extra\n"
+    ),
+    "install as the last line, ending in a backslash": _swap(
+        GOOD_SERVICE,
+        'CMD ["uvicorn", "app.main:app"]\n',
+        'CMD ["uvicorn", "app.main:app"]\nRUN uv pip install --system extra \\\n',
+    ),
+    "the ARG declared again with another default before the ENV": _swap(
+        GOOD_SERVICE, _ENV, "ARG HERD_BUILD=release\n" + _ENV
+    ),
+    "the ARG declared only ahead of the first FROM": _swap(
+        _swap(GOOD_SERVICE, _ARGS, ""), "FROM python:3.12-slim\n", _ARGS + "FROM python:3.12-slim\n"
+    ),
 }
 
 
@@ -388,6 +453,20 @@ GOOD_FRONTEND = (
 
 def test_frontend_scan_accepts_a_clean_dockerfile():
     assert frontend_build_arg_problems(GOOD_FRONTEND) == []
+    docs = _swap(
+        GOOD_FRONTEND, "RUN npm run build\n", "RUN npm run build\nRUN npm run build:docs\n"
+    )
+    assert frontend_build_arg_problems(docs) == []
+    split = (
+        "FROM node:22-alpine AS deps\n"
+        + _FE_INSTALL
+        + "FROM node:22-alpine AS build\nCOPY --from=deps /app/node_modules ./node_modules\n"
+        + "COPY . .\n"
+        + _FE_ARGS
+        + _FE_ENV
+        + "RUN npm run build -- --mode production\n"
+    )
+    assert frontend_build_arg_problems(split) == []
 
 
 FRONTEND_FALSE_PASSES = {
@@ -415,6 +494,14 @@ FRONTEND_FALSE_PASSES = {
     ),
     "the build is commented out": _swap(
         GOOD_FRONTEND, "RUN npm run build\n", "# RUN npm run build\nRUN npx vite build\n"
+    ),
+    "only a build:docs script is run": _swap(
+        GOOD_FRONTEND, "RUN npm run build\n", "RUN npm run build:docs\n"
+    ),
+    "the build moved above the ARG lines, a tab after RUN": _swap(
+        _swap(GOOD_FRONTEND, "RUN npm run build\n", ""),
+        "COPY . .\n",
+        "COPY . .\nRUN\tnpm run build\n",
     ),
 }
 
