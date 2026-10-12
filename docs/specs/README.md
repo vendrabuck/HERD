@@ -130,13 +130,16 @@ not finished.
     count; one in a string or docstring does), names a "Pinned by" test that is not
     defined as a test there, or writes a reference line in any other shape. A Python
     test is a function named `test*` in a file named `test_*.py` or `*_test.py`,
-    at module level or as a method of a module-level `Test*` class with no
-    `__init__`. A frontend test is the complete title of an `it`, `test`, or
-    `describe` call in a `*.test.*` or `*.spec.*` file that starts its line and is
-    not commented out, `.skip`, or `.todo`. The guard checks that the test is
-    defined, not that it runs: its module docstring lists what it cannot see (a
-    `@pytest.mark.skip`, an `it` inside a `describe.skip` block) and the shapes it
-    cannot cite (a node id, a nested class, a title holding a backtick);
+    not decorated as a pytest fixture, at module level or as a method of a
+    module-level `Test*` class with no `__init__`. A frontend test is the complete
+    title of an `it`, `test`, or `describe` call in a `*.test.*` or `*.spec.*` file
+    that starts its line, does not start inside a string or template literal, and
+    is not commented out, `.skip`, `.todo`, or `.fails`. The guard checks that the
+    test is defined, not that it runs: its module docstring lists what it cannot see
+    (a `@pytest.mark.skip`, an `it` inside a `describe.skip` block) and the shapes it
+    cannot cite (a node id, a nested class, a title holding a backtick, and,
+    refused conservatively, a test method of a `unittest.TestCase` subclass not
+    named `Test*` or one a `Test` class inherits);
   - repeats a rule identifier, writes one that does not match `<AREA>-<TOPIC>-<N>`,
     or has a rule without exactly one of each reference line;
   - cites a rule identifier in the State model, API surface, Events, Internal API, or
