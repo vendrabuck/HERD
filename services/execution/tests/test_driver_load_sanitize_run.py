@@ -127,8 +127,9 @@ async def test_run_driver_action_extraction_failure_stores_class_name_only(db, c
 
 @pytest.mark.asyncio
 async def test_run_driver_action_validate_parse_failure_stores_class_name_only(db, caplog):
-    # driver.py is parsed, never imported (issue #1114); the parser is patched
-    # to carry the sentinel the way its real message could carry a path.
+    # driver.py is parsed, never imported (issue #1114); the module's own parse
+    # seam (_parse_source, never the stdlib ast module) is patched to carry the
+    # sentinel the way the parser's real message could carry a path.
     zip_bytes = _make_zip("class Driver:\n    pass\n")
 
     with tempfile.TemporaryDirectory() as cache_root:
@@ -139,7 +140,7 @@ async def test_run_driver_action_validate_parse_failure_stores_class_name_only(d
             ),
             patch("app.services.driver_loader.settings") as mock_settings,
             patch(
-                "app.services.driver_structure.ast.parse",
+                "app.services.driver_structure._parse_source",
                 side_effect=SyntaxError(SENTINEL),
             ),
             caplog.at_level("ERROR"),
@@ -157,3 +158,33 @@ async def test_run_driver_action_validate_parse_failure_stores_class_name_only(d
 
     formatted = [JSONFormatter("execution").format(r) for r in caplog.records]
     assert any(SENTINEL in line for line in formatted)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source",
+    [
+        "x = " + "+".join(["1"] * 500_000) + "\nclass Driver:\n    pass\n",
+        "x = " + "-" * 200_000 + "1\nclass Driver:\n    pass\n",
+    ],
+    ids=["plus-chain", "unary-chain"],
+)
+async def test_run_driver_action_parser_crash_stores_the_permanent_load_text(db, source):
+    """A driver.py the parser cannot get through (a RecursionError or MemoryError
+    inside ast.parse) is a broken package (issue #1178): the row reads like any
+    other unparseable driver.py. Before #1178 the first stored `driver load
+    failed: RecursionError` and the second escaped the load branch as
+    `execution failed: MemoryError`."""
+    with tempfile.TemporaryDirectory() as cache_root:
+        with (
+            patch(
+                "app.services.driver_loader.download_driver_package",
+                new=AsyncMock(return_value=_make_zip(source)),
+            ),
+            patch("app.services.driver_loader.settings") as mock_settings,
+        ):
+            mock_settings.driver_cache_path = cache_root
+            run = await run_driver_action(db, _device_data(), _template_data(), "status", USER_ID)
+
+    assert run.status == "FAILED"
+    assert run.error == "driver load failed: DriverPackageError"

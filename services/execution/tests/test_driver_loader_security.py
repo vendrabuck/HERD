@@ -11,6 +11,7 @@ import io
 import struct
 import tarfile
 import tempfile
+import tracemalloc
 import zipfile
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from app.services import driver_loader
 from app.services.driver_loader import (
     MAX_ARCHIVE_ENTRIES,
     MAX_EXTRACTED_BYTES,
+    MAX_TAR_READ_BYTES,
     PackageLimitError,
     extract_driver_package,
     validate_driver,
@@ -296,3 +298,116 @@ def test_archive_one_entry_over_the_ceiling_is_refused(tmp_path, monkeypatch, fi
     with pytest.raises(PackageLimitError, match="more than 1 entries"):
         extract_driver_package(payload, filename, dest)
     assert not dest.exists()
+
+
+# --- A tar header record is never read past MAX_TAR_READ_BYTES (issue #1179) ---
+#
+# tarfile reads a pax extended header (x, g) or a GNU long name or long link (L, K)
+# whole, in one read, before the member it describes exists to be checked. Before
+# #1179 a 389 KB upload declaring a 400 MB pax header raised the process's peak RSS
+# by about 500 MiB, and then extracted.
+
+TAR_READ_REFUSAL = (
+    f"Driver package has a tar header record over {MAX_TAR_READ_BYTES} bytes "
+    "(a pax extended header or GNU long name); nothing was extracted"
+)
+
+_HEADER_TYPES = {
+    "pax-x": tarfile.XHDTYPE,
+    "pax-g": tarfile.XGLTYPE,
+    "gnu-L": tarfile.GNUTYPE_LONGNAME,
+    "gnu-K": tarfile.GNUTYPE_LONGLINK,
+}
+
+
+def _tar_gz_with_oversized_header(header_type: bytes, declared: int) -> bytes:
+    """A gzip'd tar whose first header is `header_type` declaring `declared` bytes,
+    followed by that many real (zero) bytes and a driver.py member, so a reader
+    that honors the header does allocate it."""
+    header = tarfile.TarInfo("././@header")
+    header.type = header_type
+    header.size = declared
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+        gz.write(header.tobuf(format=tarfile.GNU_FORMAT))
+        gz.write(b"\0" * declared)
+        gz.write(b"\0" * ((512 - declared % 512) % 512))
+        driver = tarfile.TarInfo("driver.py")
+        data = VALID_L1_DRIVER.encode()
+        driver.size = len(data)
+        gz.write(driver.tobuf(format=tarfile.GNU_FORMAT))
+        gz.write(data + b"\0" * ((512 - len(data) % 512) % 512))
+        gz.write(b"\0" * 1024)
+    return buf.getvalue()
+
+
+def test_tar_read_bound_is_the_documented_constant():
+    assert MAX_TAR_READ_BYTES == 1024 * 1024
+
+
+@pytest.mark.parametrize("header_type", _HEADER_TYPES.values(), ids=_HEADER_TYPES)
+def test_an_oversized_tar_header_record_is_refused_before_it_is_read(tmp_path, header_type):
+    declared = 8 * MAX_TAR_READ_BYTES
+    payload = _tar_gz_with_oversized_header(header_type, declared)
+    dest = tmp_path / "driver"
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(PackageLimitError) as exc:
+            extract_driver_package(payload, "pkg.tar.gz", dest)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert str(exc.value) == TAR_READ_REFUSAL
+    assert not dest.exists()
+    # The 8 MiB record was never read into memory.
+    assert peak < 2 * MAX_TAR_READ_BYTES
+
+
+def _pax_tar_gz_with_comment(comment_len: int) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.PAX_FORMAT) as tf:
+        data = VALID_L1_DRIVER.encode()
+        info = tarfile.TarInfo("driver.py")
+        info.size = len(data)
+        info.pax_headers = {"comment": "c" * comment_len}
+        tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def test_a_pax_header_just_under_the_read_bound_extracts(tmp_path):
+    dest = tmp_path / "driver"
+    extract_driver_package(_pax_tar_gz_with_comment(MAX_TAR_READ_BYTES - 4096), "p.tgz", dest)
+    assert (dest / "driver.py").read_text() == VALID_L1_DRIVER
+
+
+def test_a_well_formed_pax_header_just_over_the_read_bound_is_refused(tmp_path):
+    dest = tmp_path / "driver"
+    with pytest.raises(PackageLimitError) as exc:
+        extract_driver_package(_pax_tar_gz_with_comment(MAX_TAR_READ_BYTES + 1), "p.tgz", dest)
+    assert str(exc.value) == TAR_READ_REFUSAL
+    assert not dest.exists()
+
+
+@pytest.mark.parametrize("tar_format", [tarfile.PAX_FORMAT, tarfile.GNU_FORMAT], ids=["pax", "gnu"])
+def test_long_member_names_still_extract(tmp_path, tar_format):
+    name = "d" * 120 + "/" + "n" * 150 + ".py"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz", format=tar_format) as tf:
+        for member_name, data in (("driver.py", VALID_L1_DRIVER.encode()), (name, b"x = 1\n")):
+            info = tarfile.TarInfo(member_name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    dest = tmp_path / "driver"
+    extract_driver_package(buf.getvalue(), "pkg.tar.gz", dest)
+    assert (dest / name).read_bytes() == b"x = 1\n"
+
+
+def test_member_data_larger_than_the_read_bound_extracts(tmp_path):
+    """Member data is copied in small chunks, so the bound never refuses a big file."""
+    data = bytes(range(256)) * (5 * MAX_TAR_READ_BYTES // 256)
+    payload = _tar_gz_with_entries({"driver.py": VALID_L1_DRIVER.encode(), "blob.bin": data})
+    dest = tmp_path / "driver"
+    extract_driver_package(payload, "pkg.tar.gz", dest)
+    assert (dest / "blob.bin").read_bytes() == data
