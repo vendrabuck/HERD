@@ -1,11 +1,11 @@
 """Validator for unapproved recipe packages (ADR 0005, issue #28, phase 1).
 
-Validates a driver package WITHOUT executing it in this process. The load
-path's validate_driver imports the module in-process, which is fine for a
-package an admin already approved and uploaded, but this validator exists
-for AI-drafted packages that nobody has approved yet, so:
+Validates a driver package WITHOUT executing it in this process. This
+validator exists for AI-drafted packages that nobody has approved yet, so:
 
-- structural checks are AST-based (never imported, never executed here);
+- structural checks are AST-based (never imported, never executed here),
+  through driver_structure_errors, the one check the load path's
+  validate_driver also uses (issue #1114);
 - everything that must run the code (config-schema extraction, the dry-run
   lifecycle) runs in the rlimit sandbox subprocess, and only after the
   static sections passed.
@@ -27,12 +27,9 @@ import uuid
 from pathlib import Path
 
 from app.config import settings
-from app.services.driver_loader import (
-    REQUIRED_METHODS,
-    extract_driver_package,
-    read_driver_metadata,
-)
+from app.services.driver_loader import extract_driver_package, read_driver_metadata
 from app.services.driver_sandbox import execute_driver_method, extract_config_schema
+from app.services.driver_structure import DriverSourceError, driver_structure_errors
 from app.services.recipe_result import (
     created_instance_ref,
     recipe_reported_success,
@@ -118,40 +115,15 @@ def _parse_python_files(package_dir: Path) -> tuple[dict[Path, ast.AST], list[st
 def _structural_errors(package_dir: Path, connection_type: str) -> list[str]:
     """AST-only structural validation: driver.py, class Driver, required methods.
 
-    Deliberately does not import the module; import-time failures surface
-    from the sandboxed steps instead, where arbitrary top-level code cannot
-    touch this process.
+    The shared check (driver_structure_errors) never imports the module;
+    import-time failures surface from the sandboxed steps instead, where
+    arbitrary top-level code cannot touch this process. A parse failure keeps
+    the parser's message: it is the repair signal for the drafting loop.
     """
-    errors: list[str] = []
-    required = REQUIRED_METHODS.get(connection_type)
-    if required is None:
-        return [f"Unknown connection type: {connection_type}"]
-
-    driver_py = package_dir / "driver.py"
-    if not driver_py.exists():
-        return ["Missing driver.py at package root"]
-
     try:
-        tree = ast.parse(driver_py.read_text(encoding="utf-8"), filename="driver.py")
-    except (SyntaxError, UnicodeDecodeError, OSError) as exc:
-        return [f"driver.py failed to parse: {exc}"]
-
-    driver_cls = next(
-        (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Driver"),
-        None,
-    )
-    if driver_cls is None:
-        return ["driver.py must define a top-level class named Driver"]
-
-    defined = {
-        node.name
-        for node in driver_cls.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    for method_name in required:
-        if method_name not in defined:
-            errors.append(f"Driver class is missing required method: {method_name}")
-    return errors
+        return driver_structure_errors(package_dir, connection_type)
+    except DriverSourceError as exc:
+        return [f"driver.py failed to parse: {exc.__cause__}"]
 
 
 def _import_roots(tree: ast.AST) -> set[str]:

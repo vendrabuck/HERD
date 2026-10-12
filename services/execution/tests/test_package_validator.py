@@ -180,9 +180,28 @@ def test_unparseable_driver_py_fails_structural():
 
 def test_missing_driver_class_fails_structural():
     report = run(good_package_b64(**{"driver.py": "class NotADriver:\n    pass"}))
+    assert report["structural"]["errors"] == ["driver.py must define a class named Driver"]
+
+
+def test_driver_not_bound_by_a_top_level_class_fails_structural():
+    """The load path's rule, through the one shared check (issue #1114)."""
+    driver = GOOD_DRIVER.replace("class Driver:", "class _Impl:") + "\nDriver = _Impl\n"
+    report = run(good_package_b64(**{"driver.py": driver}))
     assert report["structural"]["errors"] == [
-        "driver.py must define a top-level class named Driver"
+        "driver.py must define Driver with a plain top-level class statement"
     ]
+
+
+def test_methods_inherited_from_a_base_in_driver_py_pass_structural():
+    """A Driver inheriting the required methods from a top-level base class in
+    driver.py passes the shared check (the import-based load check always
+    accepted it; the validator's own copy used to refuse it) and runs green."""
+    driver = GOOD_DRIVER.replace("class Driver:", "class _Base:") + (
+        "\n\nclass Driver(_Base):\n    pass\n"
+    )
+    report = run(good_package_b64(**{"driver.py": driver}))
+    assert report["structural"] == {"passed": True, "errors": []}
+    assert report["valid"] is True
 
 
 def test_structural_failure_never_executes_the_package(tmp_path):

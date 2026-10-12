@@ -322,14 +322,12 @@ async def test_load_driver_extraction_failure_sanitizes_foreign_text(db, caplog)
 
 
 @pytest.mark.asyncio
-async def test_load_driver_validate_import_failure_sanitizes_foreign_text(db, caplog):
-    """driver.py itself raising at import time (SyntaxError, ImportError, or
-    anything else the package author's code does) must not leak into the
-    DriverPackageError message; validate_driver keeps only the class name."""
-    # A driver.py that raises at module-exec time, embedding the sentinel the
-    # way a real import failure could embed a container filesystem path.
-    driver_code = f"raise RuntimeError({_SENTINEL!r})\n"
-    zip_bytes = _make_zip(driver_code)
+async def test_load_driver_validate_parse_failure_sanitizes_foreign_text(db, caplog):
+    """driver.py failing to parse must not leak the parser's text into the
+    DriverPackageError message; validate_driver keeps only the class name.
+    The parser is patched to carry the sentinel the way a real message could
+    carry a container filesystem path or a fragment of the source."""
+    zip_bytes = _make_zip(VALID_L1_DRIVER)
 
     with tempfile.TemporaryDirectory() as cache_root:
         with (
@@ -338,6 +336,10 @@ async def test_load_driver_validate_import_failure_sanitizes_foreign_text(db, ca
                 new=AsyncMock(return_value=zip_bytes),
             ),
             patch("app.services.driver_loader.settings") as mock_settings,
+            patch(
+                "app.services.driver_structure.ast.parse",
+                side_effect=SyntaxError(_SENTINEL),
+            ),
             caplog.at_level("ERROR"),
         ):
             mock_settings.driver_cache_path = cache_root
@@ -345,15 +347,78 @@ async def test_load_driver_validate_import_failure_sanitizes_foreign_text(db, ca
             mock_settings.internal_api_token = "token"
             with pytest.raises(DriverPackageError) as exc:
                 await load_driver(db, uuid.uuid4(), "sha", "driver.zip", "Layer 1 Switch")
+            # The failed load's own directory is removed.
+            assert list(Path(cache_root).iterdir()) == []
 
     message = str(exc.value)
-    assert message == "Driver validation failed: Failed to load driver.py: RuntimeError"
+    assert message == "Driver validation failed: Failed to load driver.py: SyntaxError"
     assert _SENTINEL not in message
 
     from herd_common.logging import JSONFormatter
 
     formatted = [JSONFormatter("execution").format(r) for r in caplog.records]
     assert any(_SENTINEL in line for line in formatted)
+
+
+@pytest.mark.asyncio
+async def test_load_driver_never_runs_driver_code_in_process(db, tmp_path):
+    """load_driver validates by parsing driver.py, never by importing it
+    (issue #1114): a top-level side effect does not run in the execution
+    process, and a top-level raise does not fail the load. The sandboxed
+    config-schema step is patched out so any execution would be in-process."""
+    flag = tmp_path / "ran.flag"
+    driver_code = (
+        f'open(r"{flag}", "w").write("ran")\n'
+        'raise RuntimeError("top-level code ran")\n' + VALID_L1_DRIVER
+    )
+    zip_bytes = _make_zip(driver_code)
+    cache_root = tmp_path / "cache"
+
+    with (
+        patch(
+            "app.services.driver_loader.download_driver_package",
+            new=AsyncMock(return_value=zip_bytes),
+        ),
+        patch("app.services.driver_loader.settings") as mock_settings,
+        patch("app.services.driver_loader.extract_config_schema_json", return_value=None),
+    ):
+        mock_settings.driver_cache_path = str(cache_root)
+        mock_settings.inventory_service_url = "http://test"
+        mock_settings.internal_api_token = "token"
+        result = await load_driver(db, uuid.uuid4(), "sha", "driver.zip", "Layer 1 Switch")
+
+    assert (Path(result) / "driver.py").exists()
+    assert not flag.exists()
+
+
+@pytest.mark.asyncio
+async def test_load_driver_refuses_archive_over_the_entry_ceiling(db, tmp_path):
+    """An archive over an extraction ceiling is a permanent package error
+    naming the limit's class only, and nothing is left in the cache (issue #1115)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("driver.py", VALID_L1_DRIVER)
+        zf.writestr("extra.txt", "x")
+    driver_id = uuid.uuid4()
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+
+    with (
+        patch(
+            "app.services.driver_loader.download_driver_package",
+            new=AsyncMock(return_value=buf.getvalue()),
+        ),
+        patch("app.services.driver_loader.settings") as mock_settings,
+        patch("app.services.driver_loader.MAX_ARCHIVE_ENTRIES", 1),
+    ):
+        mock_settings.driver_cache_path = str(cache_root)
+        mock_settings.inventory_service_url = "http://test"
+        mock_settings.internal_api_token = "token"
+        with pytest.raises(DriverPackageError) as exc:
+            await load_driver(db, driver_id, "sha", "driver.zip", "Layer 1 Switch")
+
+    assert str(exc.value) == f"Failed to extract driver {driver_id}: PackageLimitError"
+    assert list(cache_root.iterdir()) == []
 
 
 # --- config_schema_json capture (issue #23) ---
