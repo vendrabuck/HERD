@@ -27,13 +27,17 @@ What counts as what (the rules docs/specs/README.md promises):
   shape the runner collects, not a name that survives in a comment, a string, a
   helper, or a longer title.
   In a Python file, the file is named `test_*.py` or `*_test.py`, and the name is a
-  function whose name starts with `test`, defined at module level or as a method of
-  a module-level class whose name starts with `Test` and that defines no `__init__`
-  (pytest's default collection rules, which this repository does not override).
+  function whose name starts with `test` and that is not decorated as a fixture
+  (`@pytest.fixture`, `@pytest_asyncio.fixture`, a bare `@fixture`, called or not),
+  defined at module level or as a method of a module-level class whose name starts
+  with `Test` and that defines no `__init__` (pytest's default collection rules,
+  which this repository does not override).
   In a TypeScript or JavaScript file, the file is named `*.test.*` or `*.spec.*`,
   and the name is the complete title (the first string argument) of an `it(...)`,
-  `test(...)`, or `describe(...)` call that starts its line, is not commented out,
-  and carries no `.skip` or `.todo` modifier.
+  `test(...)`, or `describe(...)` call that starts its line, does not start inside a
+  string or template literal, is not commented out, and carries no `.skip`, `.todo`,
+  or `.fails` modifier (a `.fails` test passes only while its body fails, so citing
+  one would pin the opposite of the rule).
   In any other file type it is a literal match, as for Enforced in.
 - Rule: a list item that starts `- **<ID>.**` where <ID> is hyphen-separated words.
   The identifier must match `<AREA>-<TOPIC>-<N>` (RULE_ID), be unique within the
@@ -57,7 +61,10 @@ asserts:
   `__test__ = False`, `pytest.importorskip`, or a body that only skips; a test name
   rebound later in the module. Not found, so not citable: a method of a nested
   `Test` class, a test defined under a module-level `if` or `try`, a test assigned
-  from a factory, and a node id (`TestSvc::test_x`, `test_x[case]`).
+  from a factory, and a node id (`TestSvc::test_x`, `test_x[case]`); and, refused
+  conservatively though pytest collects them, a test method of a
+  `unittest.TestCase` subclass whose name does not start with `Test`, and a test
+  method a `Test` class inherits from a base class.
 - Frontend, still counted: an `it` inside a `describe.skip(...)` block,
   `it.skipIf(true)`, `it.runIf(false)`, and a test under `if (false) {`. The comment
   remover is a scanner, not a parser: a regex literal holding `/*` or an unbalanced
@@ -78,6 +85,7 @@ them to that.
 from __future__ import annotations
 
 import ast
+import bisect
 import io
 import re
 import time
@@ -152,7 +160,9 @@ _JS_TEST_CALL = re.compile(
     re.MULTILINE,
 )
 _JS_SUFFIXES = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
-_JS_NOT_RUN = {"skip", "todo"}
+# Modifiers whose test is not citable: not run (`skip`, `todo`), or run with its
+# outcome inverted (`fails`).
+_JS_NOT_CITABLE = {"skip", "todo", "fails"}
 
 PATTERNS = (
     _FENCE,
@@ -216,18 +226,35 @@ def python_collected_tests(source: str) -> set[str]:
     """The test functions pytest collects from a test module under its default
     rules: a function whose name starts with `test`, at module level or as a method
     of a module-level class whose name starts with `Test` and that has no
-    `__init__`. A helper, a fixture, a method of any other class, a function nested
-    in another, and a name in a comment or a string are not tests."""
+    `__init__`. A helper, a fixture (even one named `test_*`), a method of any other
+    class, a function nested in another, and a name in a comment or a string are
+    not tests."""
     functions = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+    def is_test(node: ast.AST) -> bool:
+        return (
+            isinstance(node, functions)
+            and node.name.startswith("test")
+            and not any(_is_fixture_decorator(d) for d in node.decorator_list)
+        )
+
     names: set[str] = set()
     for node in ast.parse(source).body:
-        if isinstance(node, functions) and node.name.startswith("test"):
+        if is_test(node):
             names.add(node.name)
         elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
             members = [member for member in node.body if isinstance(member, functions)]
             if not any(member.name == "__init__" for member in members):
-                names |= {m.name for m in members if m.name.startswith("test")}
+                names |= {m.name for m in members if is_test(m)}
     return names
+
+
+def _is_fixture_decorator(decorator: ast.expr) -> bool:
+    """`@pytest.fixture`, `@pytest_asyncio.fixture`, or `@fixture`, called or not."""
+    target = decorator.func if isinstance(decorator, ast.Call) else decorator
+    return (isinstance(target, ast.Name) and target.id == "fixture") or (
+        isinstance(target, ast.Attribute) and target.attr == "fixture"
+    )
 
 
 def _js_string_end(source: str, start: int) -> int:
@@ -264,13 +291,36 @@ def js_without_comments(source: str) -> str:
     return "".join(out)
 
 
+def _js_literal_spans(code: str) -> list[tuple[int, int]]:
+    """(start, end) of every string and template literal in comment-free code: the
+    opening quote's index and the index just past the closing one."""
+    spans: list[tuple[int, int]] = []
+    i = 0
+    while i < len(code):
+        if code[i] in "\"'`":
+            end = _js_string_end(code, i)
+            spans.append((i, end))
+            i = end
+        else:
+            i += 1
+    return spans
+
+
 def js_test_titles(source: str) -> set[str]:
     """Complete titles of the `it`, `test`, and `describe` calls a vitest file runs:
-    not commented out, and not `.skip` or `.todo`."""
+    not commented out, not starting inside a string or template literal (a sample
+    of test code held in a backtick string is not a test), and not `.skip`,
+    `.todo`, or `.fails`."""
     code = js_without_comments(source)
+    spans = _js_literal_spans(code)
+    starts = [start for start, _ in spans]
     titles: set[str] = set()
     for match in _JS_TEST_CALL.finditer(code):
-        if _JS_NOT_RUN & set(match.group(1).split(".")):
+        if _JS_NOT_CITABLE & set(match.group(1).split(".")):
+            continue
+        call = match.start() + len(match.group()) - len(match.group().lstrip(" \t"))
+        index = bisect.bisect_right(starts, call) - 1
+        if index >= 0 and spans[index][0] < call < spans[index][1]:
             continue
         end = _js_string_end(code, match.end())
         titles.add(re.sub(r"\\(.)", r"\1", code[match.end() + 1 : end - 1]))
@@ -800,6 +850,19 @@ NOT_A_PYTHON_TEST = {
         "class TestOuter:\n    class TestInner:\n        def test_real(self):\n            pass\n"
     ),
     "defined under if False": "if False:\n    def test_real():\n        pass\n",
+    "a fixture named like a test": (
+        "import pytest\n\n\n@pytest.fixture\ndef test_real():\n    return 1\n"
+    ),
+    "a fixture named like a test, with arguments": (
+        "import pytest\n\n\n@pytest.fixture(scope='module')\ndef test_real():\n    return 1\n"
+    ),
+    "an async fixture named like a test": (
+        "import pytest_asyncio\n\n\n@pytest_asyncio.fixture\nasync def test_real():\n    return 1\n"
+    ),
+    "a fixture method of a Test class": (
+        "from pytest import fixture\n\n\nclass TestSvc:\n    @fixture\n"
+        "    def test_real(self):\n        return 1\n"
+    ),
 }
 
 
@@ -821,6 +884,9 @@ def test_checker_flags_a_python_test_name_that_is_not_a_test(fake_repo: Path, sp
         "class TestSvc:\n    async def test_real(self):\n        pass\n",
         "\ufeffdef test_real():\n    pass\n",
         "def test_real():\n    return f'{{literal}} {1}'  # a comment\n",
+        "import pytest\n\n\n@pytest.fixture\ndef device():\n    pass\n\n\n"
+        "def test_real(device):\n    pass\n",
+        "import pytest\n\n\n@pytest.mark.usefixtures('db')\ndef test_real():\n    pass\n",
     ],
 )
 def test_checker_accepts_every_collectable_python_test(fake_repo: Path, source: str):
@@ -930,6 +996,8 @@ def _check_ts(repo: Path, source: str) -> list[str]:
         'it.only("shows the row", fn);\n',
         'const glob = "src/**/*.ts"; // a glob, not a comment\nit("shows the row", fn);\n',
         'const url = "https://example.com/*";\nit("shows the row", fn);\n/* tail */\n',
+        'const sample = `\nit("other", fn)\n`;\nit("shows the row", fn);\n',
+        'const a = "x";\nit(`shows the row`, function () {\n  expect(`${a}`).toBe("x");\n});\n',
     ],
 )
 def test_checker_accepts_a_frontend_test_title_under_any_call_shape(fake_repo: Path, source: str):
@@ -961,6 +1029,15 @@ NOT_A_FRONTEND_TEST = {
     "an expectation, not a title": (
         'it("other", function () {\n  expect(t).toBe("shows the row");\n});\n'
     ),
+    "inside a template literal": (
+        'const sample = `\nit("shows the row", fn)\n`;\nit("other", fn);\n'
+    ),
+    "inside a template literal, indented": (
+        "const sample = `\n  test('shows the row', fn);\n`;\nit(\"other\", fn);\n"
+    ),
+    "expected to fail": 'it.fails("shows the row", fn);\n',
+    "expected to fail, test": 'test.fails("shows the row", fn);\n',
+    "expected to fail, after another modifier": 'it.concurrent.fails("shows the row", fn);\n',
 }
 
 
