@@ -247,8 +247,10 @@ def l3_switch_setup(pw_page):
 
 
 # A point at the left edge, horizontally clear of the bottom-centre toaster
-# (react-hot-toast, `App.tsx`, issue #942): a toast is at most 350 px wide and
-# centred, so x = 5 is outside every toast at any e2e viewport.
+# (react-hot-toast, `App.tsx`, issue #942): a toast is centred and far narrower
+# than the viewport (a success toast at most 350 px, a custom toast such as the
+# fork save toast about 450 px), so x = 5 is outside every toast at any e2e
+# viewport.
 _OFF_TOASTER = (5, 400)
 
 
