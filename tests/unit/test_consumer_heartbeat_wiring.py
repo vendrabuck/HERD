@@ -15,7 +15,11 @@ name in a comment, a docstring, or an unused import is not a call, and two
 correct-looking assignment lines do not help a module that then hands the helper
 `NATS_HEARTBEAT_SECONDS * 2` or gives its durable `ack_wait=NATS_ACK_WAIT_SECONDS
 / 4`. A name is followed to its value only when the scope that binds it (the
-function, else the module) binds it exactly once, by a plain assignment.
+function, else the module) binds it exactly once, by a plain assignment, counting
+every binding of the name in that scope (an assignment, an augmented assignment, a
+`for`, `with`, or `except` target, a walrus, an import, a def, a parameter, a
+`match` capture) and every rebinding a nested function makes through `nonlocal`
+(of a function's name) or `global` (of a module name).
 
 Limits. The scan follows names inside one module; it does not execute anything:
 
@@ -26,6 +30,10 @@ Limits. The scan follows names inside one module; it does not execute anything:
   the module sets `ack_wait` somewhere else; `setattr(config, "ack_wait", ...)`,
   `config.__dict__[...] = ...`, `globals()[...] = ...`; a helper monkeypatched on
   the shared module; a consumer reached with `getattr(js, "pull_subscribe")`;
+  `config.ack_wait` set as a tuple-unpack target (`config.ack_wait, x = 5, 1`), a
+  `for` target, or a `with ... as` target; an `ack_wait` in a `**{...}` dict literal
+  that is not the call's last `**` argument; and a config built from a dict by a
+  class method such as `ConsumerConfig.from_response({"ack_wait": 5})`;
 - read conservatively (refused though it may be sound): a constant imported from a
   sibling module, a `ConsumerConfig` factory that takes `ack_wait` as a parameter,
   and a cast such as `ack_wait=float(NATS_ACK_WAIT_SECONDS)`. The value must be the
@@ -171,6 +179,9 @@ class _Module:
         self._scopes: dict[ast.AST, dict[str, list[ast.AST]]] = {}
         # Names a function declares `global` and binds: these rebind the module's name.
         self._global_rebinds: dict[str, list[ast.AST]] = {}
+        # Names a nested function declares `nonlocal` and binds, keyed by the
+        # enclosing function scope whose name they rebind.
+        self._nonlocal_rebinds: dict[tuple[ast.AST, str], list[ast.AST]] = {}
         for node in ast.walk(self.tree):
             if isinstance(node, _FUNCTION_SCOPES):
                 self._bindings(node)
@@ -182,11 +193,13 @@ class _Module:
     def _bindings(self, scope: ast.AST) -> dict[str, list[ast.AST]]:
         """Every binding of a plain name made directly in a scope (module, function,
         or class body), not in a function or class nested inside it: assignments,
-        imports, defs, parameters, `except ... as`."""
+        imports, defs, parameters, `except ... as`, `match` captures. A name the
+        scope declares `global` or `nonlocal` is moved to the scope it rebinds."""
         if scope in self._scopes:
             return self._scopes[scope]
         found: dict[str, list[ast.AST]] = {}
         declared_global: set[str] = set()
+        declared_nonlocal: set[str] = set()
         pending = list(ast.iter_child_nodes(scope))
         while pending:
             node = pending.pop()
@@ -197,6 +210,8 @@ class _Module:
                 continue
             if isinstance(node, ast.Global):
                 declared_global.update(node.names)
+            elif isinstance(node, ast.Nonlocal):
+                declared_nonlocal.update(node.names)
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 for alias in node.names:
                     local = alias.asname or alias.name.split(".")[0]
@@ -205,22 +220,42 @@ class _Module:
                 found.setdefault(node.arg, []).append(node)
             elif isinstance(node, ast.ExceptHandler) and node.name:
                 found.setdefault(node.name, []).append(node)
+            elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+                found.setdefault(node.name, []).append(node)
+            elif isinstance(node, ast.MatchMapping) and node.rest:
+                found.setdefault(node.rest, []).append(node)
             elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
                 found.setdefault(node.id, []).append(node)
             pending.extend(ast.iter_child_nodes(node))
         for name in declared_global:
             self._global_rebinds.setdefault(name, []).extend(found.pop(name, []))
+        rebinds = {name: found.pop(name, []) for name in declared_nonlocal}
         self._scopes[scope] = found
+        for name, nodes in rebinds.items():
+            owner = self._enclosing_binder(scope, name)
+            if owner is not None:
+                self._nonlocal_rebinds.setdefault((owner, name), []).extend(nodes)
         return found
+
+    def _enclosing_binder(self, scope: ast.AST, name: str) -> ast.AST | None:
+        """The nearest function enclosing `scope` that binds `name` itself (the
+        scope a `nonlocal name` in `scope` rebinds)."""
+        outer = self.parent.get(scope)
+        while outer is not None:
+            if isinstance(outer, _FUNCTION_SCOPES) and name in self._bindings(outer):
+                return outer
+            outer = self.parent.get(outer)
+        return None
 
     def _lookup(self, name: str, at: ast.AST) -> list[ast.AST]:
         """The bindings of `name` in the scope a use at `at` reads it from: the
-        nearest enclosing function that binds it, else the module (whose count
-        includes every `global` rebinding made inside a function)."""
+        nearest enclosing function that binds it (whose count includes every
+        `nonlocal` rebinding made in a function nested inside it), else the module
+        (whose count includes every `global` rebinding made inside a function)."""
         scope = self.parent.get(at)
         while scope is not None:
             if isinstance(scope, _FUNCTION_SCOPES) and name in self._bindings(scope):
-                return self._bindings(scope)[name]
+                return self._bindings(scope)[name] + self._nonlocal_rebinds.get((scope, name), [])
             scope = self.parent.get(scope)
         return self._bindings(self.tree).get(name, []) + self._global_rebinds.get(name, [])
 
@@ -314,12 +349,15 @@ def heartbeat_wiring_problems(source: str) -> list[str]:
       function of the same name is not that call.
     - The interval of every such call (third positional argument or `interval=`)
       must be `heartbeat_interval(...)` of `settings.nats_ack_wait_seconds`,
-      directly or through names their scope assigns once. `X * 2`, `ACK_WAIT / 3`,
-      a literal, a reassigned name, or a local `heartbeat_interval` all fail.
+      directly or through names their scope assigns exactly once (rebindings
+      through `global` and `nonlocal` included). `X * 2`, `ACK_WAIT / 3`, a
+      literal, a reassigned name, or a local `heartbeat_interval` all fail.
     - The module must set `ack_wait` at least once. Every `ConsumerConfig(...)`
-      must pass `ack_wait=`, and every `ack_wait` the module SETS (a call keyword,
-      a `**{...}` literal, or an attribute assignment) must be
-      `settings.nats_ack_wait_seconds`, directly or through a name assigned once.
+      must pass `ack_wait=`, and every `ack_wait` setting the scan reads (a call
+      keyword, a key of the call's last `**{...}` dict literal, or a plain,
+      augmented, annotated, or chained assignment to an `.ack_wait` attribute) must
+      be `settings.nats_ack_wait_seconds`, directly or through a name assigned once.
+      The other ways to set it are listed under Limits in the module docstring.
       Reading it (`config.ack_wait` in a log line or a comparison) is not setting it.
     """
     module = _Module(source)
@@ -423,6 +461,14 @@ SOUND_SHAPES = {
     "an unrelated function with a local named like a constant": GOOD_CONSUMER + "def describe():\n"
     "    NATS_HEARTBEAT_SECONDS = 'label'\n"
     "    return NATS_HEARTBEAT_SECONDS\n",
+    "a nested function that only reads the local interval name": GOOD_CONSUMER.replace(
+        "    await process_batch_with_heartbeat(msgs, handle, NATS_HEARTBEAT_SECONDS)\n",
+        "    cadence = NATS_HEARTBEAT_SECONDS\n"
+        "    def show():\n"
+        "        nonlocal cadence\n"
+        "        return cadence\n"
+        "    await process_batch_with_heartbeat(msgs, handle, cadence)\n",
+    ),
     "the interval bound once to a local name": GOOD_CONSUMER.replace(
         "    await process_batch_with_heartbeat(msgs, handle, NATS_HEARTBEAT_SECONDS)\n",
         "    cadence = NATS_HEARTBEAT_SECONDS\n"
@@ -523,6 +569,30 @@ FALSE_PASSES = {
     "ack_wait name rebound by an except clause": GOOD_CONSUMER.replace(
         _CONSTANTS,
         _CONSTANTS + "try:\n    pass\nexcept Exception as NATS_ACK_WAIT_SECONDS:\n    pass\n",
+    ),
+    "interval name rebound through nonlocal in a nested function": GOOD_CONSUMER.replace(
+        f"    await {_CALL}\n",
+        "    cadence = NATS_HEARTBEAT_SECONDS\n"
+        "    def bump():\n"
+        "        nonlocal cadence\n"
+        "        cadence = 99\n"
+        "    bump()\n"
+        "    await process_batch_with_heartbeat(msgs, handle, cadence)\n",
+    ),
+    "interval name rebound through nonlocal two functions down": GOOD_CONSUMER.replace(
+        f"    await {_CALL}\n",
+        "    cadence = NATS_HEARTBEAT_SECONDS\n"
+        "    def outer():\n"
+        "        def inner():\n"
+        "            nonlocal cadence\n"
+        "            cadence = 99\n"
+        "        inner()\n"
+        "    outer()\n"
+        "    await process_batch_with_heartbeat(msgs, handle, cadence)\n",
+    ),
+    "heartbeat name rebound by a match capture": GOOD_CONSUMER.replace(
+        _CONSTANTS,
+        _CONSTANTS + "match 99:\n    case NATS_HEARTBEAT_SECONDS:\n        pass\n",
     ),
     "the interval is a parameter of the calling function": GOOD_CONSUMER.replace(
         _BATCH,
