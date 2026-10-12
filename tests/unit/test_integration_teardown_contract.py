@@ -10,29 +10,52 @@ so `tests/integration/` routes those deletes through `delete_device_checked`,
 fail the test on a refusal.
 
 This scan keeps it that way. It detects the BEHAVIOR, not one spelling (the issue
-#1145 rule): an HTTP DELETE whose URL resolves to one device, port, or topology,
-whether the call is `client.delete(...)`, a bound `delete` under another name,
-`getattr(client, "delete")(...)`, or any call that names the method "DELETE"
-(`client.request`, `build_request`, `httpx.Request`), and whether the URL is an
-f-string, a concatenation, `str.format`, `%` formatting, a `"".join`, a name assigned
-one of those (in the function or at module level), or a parameter of a local wrapper
+#1145 rule): an HTTP DELETE whose URL resolves to one device, port, or topology.
+The call is `client.delete(...)`, a name bound to `client.delete` or to
+`getattr(client, "delete")`, `getattr(client, "delete")(...)` itself, or any call
+that names the method "DELETE" (`client.request`, `client.stream`, `build_request`,
+`httpx.Request`). The URL is an f-string, a concatenation, `str.format`, `%`
+formatting, or a `"".join` over a list or tuple literal, with or without a query
+string or fragment after the id; or a name bound to one of those, in the function
+or at module level, by a plain, annotated, or augmented (`url += ...`) assignment, a
+walrus, a tuple unpack (`url, n = ..., 1`), or as the target of a `for` loop or a
+comprehension over a list, tuple, or set literal, a comprehension, or a name bound
+to one; or a parameter of a local wrapper, a `def` or a lambda assigned to a name,
 that forwards it to a delete. The spellings are fixture cases below that must be
 flagged.
 
 The exemptions are explicit, per function and per kind, with a count and a reason:
 the helpers themselves, and the tests whose SUBJECT is the delete's answer. A new
-delete in an exempt function changes its count and fails; an exemption nothing
-matches any more fails as stale.
+delete in an exempt function, or one fewer, changes its count and fails; an
+exemption nothing matches any more fails as stale.
 
-Known limits, stated plainly: a URL that reaches the call only through a function
-parameter is followed one level (a local wrapper called by name), not through
-several; a URL built at run time from data the scan cannot see (a dict lookup, an
-attribute, a value returned by a call) is not resolved.
+Limits. The scan reads the source; it does not run it:
+
+- order is not read: every value a scope ever binds to a name is unioned over the
+  whole function (or module), so a URL variable that once held a device URL and is
+  later rebound to another URL is reported for a delete of the later one (a false
+  red whose message, use the checked teardown helper, is the wrong fix), and a
+  reused variable can change an exempt function's count;
+- a URL is followed through ONE local wrapper called by its name: not through a
+  wrapper that calls another wrapper, a wrapper reached as an attribute (a module
+  helper `helpers.rm(...)`, a method `H().rm(...)`), `functools.partial`, or a
+  wrapper's default parameter value;
+- not resolved, so not seen: a URL built from data the scan cannot see (a dict
+  lookup, an attribute, a value returned by a call such as `httpx.URL(...)`,
+  `os.path.join`, or `posixpath.join`), `str.join` over a generator, a loop or
+  comprehension over anything else (`zip`, `enumerate`, a dict), a path with a
+  doubled slash (`/inventory//devices/<id>`), and a method name computed by a call
+  (`"delete".upper()`); and a wrapper that forwards its pieces as `*args`;
+- the answer-returning check below sees only a call to the helper, by its own name,
+  that is a bare expression statement: an answer assigned and never read
+  (`resp = await ...`), assigned to `_`, handed to `asyncio.gather`, or a call
+  through an alias of the helper is not seen.
 """
 
 import ast
 import itertools
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -52,9 +75,13 @@ _HOLE = "\x00"
 _PARAM = "\x01{}\x01"
 _PARAM_RE = re.compile("\x01([A-Za-z_][A-Za-z0-9_]*)\x01")
 _MAX_TEMPLATES = 32
-_MAX_DEPTH = 6
+_MAX_DEPTH = 12
 
-_MEMBER_RE = re.compile("(" + "|".join(re.escape(p) for p in GUARDED_PATHS) + r")/[^/?#]+/?$")
+# One member of a guarded collection, optionally followed by a slash and by a query
+# string or a fragment.
+_MEMBER_RE = re.compile(
+    "(" + "|".join(re.escape(p) for p in GUARDED_PATHS) + r")/[^/?#]+/?(?:[?#].*)?$"
+)
 
 
 def _kind_of(template: str) -> str | None:
@@ -63,13 +90,36 @@ def _kind_of(template: str) -> str | None:
     return GUARDED_PATHS[match.group(1)] if match else None
 
 
+@dataclass(frozen=True, eq=False)
+class _ElementOf:
+    """A name bound as the target of a `for` loop or a comprehension: one element of
+    `iterable`."""
+
+    iterable: object
+
+
+@dataclass(frozen=True, eq=False)
+class _ItemOf:
+    """One position of a tuple or list unpack: item `index` of `value`."""
+
+    value: object
+    index: int
+
+
+@dataclass(frozen=True)
+class _ParamRef:
+    """A function parameter: a named hole a wrapper's call sites fill in."""
+
+    name: str
+
+
 class _Scope:
-    """Assignments and parameters of one function body (or of the module)."""
+    """Name bindings and parameters of one function body (or of the module)."""
 
     def __init__(self, node: ast.AST):
         self.node = node
         self.params: set[str] = set()
-        self.assigns: dict[str, list[ast.expr]] = {}
+        self.assigns: dict[str, list[object]] = {}
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
             args = node.args
             for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs):
@@ -77,14 +127,33 @@ class _Scope:
         for child in self._own_nodes(node):
             if isinstance(child, ast.Assign):
                 for target in child.targets:
-                    if isinstance(target, ast.Name):
-                        self.assigns.setdefault(target.id, []).append(child.value)
-            elif (
-                isinstance(child, ast.AnnAssign | ast.NamedExpr)
-                and child.value is not None
-                and isinstance(child.target, ast.Name)
-            ):
-                self.assigns.setdefault(child.target.id, []).append(child.value)
+                    self._bind(target, child.value)
+            elif isinstance(child, ast.AnnAssign | ast.NamedExpr) and child.value is not None:
+                self._bind(child.target, child.value)
+            elif isinstance(child, ast.AugAssign) and isinstance(child.target, ast.Name):
+                # `url += x` binds url to (every earlier value of url) + x.
+                name = child.target.id
+                self._bind(
+                    child.target,
+                    ast.BinOp(
+                        left=ast.Name(id=name, ctx=ast.Load()), op=child.op, right=child.value
+                    ),
+                )
+            elif isinstance(child, ast.For | ast.AsyncFor | ast.comprehension):
+                self._bind(child.target, _ElementOf(child.iter))
+
+    def _bind(self, target: ast.expr, value: object) -> None:
+        if isinstance(target, ast.Name):
+            self.assigns.setdefault(target.id, []).append(value)
+        elif isinstance(target, ast.Tuple | ast.List):
+            starred = False
+            for index, element in enumerate(target.elts):
+                if isinstance(element, ast.Starred):
+                    starred = True
+                    self._bind(element.value, None)
+                else:
+                    # After a starred element the position is not known.
+                    self._bind(element, None if starred else _ItemOf(value, index))
 
     @staticmethod
     def _own_nodes(node: ast.AST):
@@ -105,14 +174,78 @@ def _concat(parts: list[set[str]]) -> set[str]:
     return _cap("".join(combo) for combo in itertools.product(*parts))
 
 
-def _render(expr: ast.expr | None, scopes: list[_Scope], depth: int = 0) -> set[str]:
+def _one_step(expr: object, scopes: list[_Scope], depth: int) -> list[object]:
+    """What a name, a loop or comprehension element, or an unpacked item stands for,
+    one step back: the expressions it was bound to (None where that is not known
+    statically, a `_ParamRef` for a parameter)."""
+    if isinstance(expr, ast.Name):
+        for scope in scopes:
+            if expr.id in scope.assigns:
+                return list(scope.assigns[expr.id])
+            if expr.id in scope.params:
+                return [_ParamRef(expr.id)]
+        return [None]
+    if isinstance(expr, _ElementOf):
+        return _elements(expr.iterable, scopes, depth)
+    if isinstance(expr, _ItemOf):
+        return _items(expr, scopes, depth)
+    return [expr]
+
+
+def _concrete(expr: object, scopes: list[_Scope], depth: int) -> list[object]:
+    """`expr` followed through names, elements, and items to the expressions it
+    can be (None where that is not known statically)."""
+    if depth > _MAX_DEPTH:
+        return [None]
+    if isinstance(expr, ast.Name | _ElementOf | _ItemOf):
+        found: list[object] = []
+        for value in _one_step(expr, scopes, depth + 1):
+            found.extend(_concrete(value, scopes, depth + 1))
+        return found[:_MAX_TEMPLATES]
+    return [expr]
+
+
+def _elements(iterable: object, scopes: list[_Scope], depth: int) -> list[object]:
+    """The expressions one element of `iterable` can be: the items of a list, tuple,
+    or set literal, the element expression of a comprehension, else None."""
+    found: list[object] = []
+    for value in _concrete(iterable, scopes, depth + 1):
+        if isinstance(value, ast.List | ast.Tuple | ast.Set):
+            found.extend(None if isinstance(e, ast.Starred) else e for e in value.elts)
+        elif isinstance(value, ast.ListComp | ast.GeneratorExp | ast.SetComp):
+            found.append(value.elt)
+        else:
+            found.append(None)
+    return found[:_MAX_TEMPLATES] or [None]
+
+
+def _items(item: _ItemOf, scopes: list[_Scope], depth: int) -> list[object]:
+    """The expressions position `item.index` of an unpacked value can be."""
+    found: list[object] = []
+    for value in _concrete(item.value, scopes, depth + 1):
+        if (
+            isinstance(value, ast.Tuple | ast.List)
+            and item.index < len(value.elts)
+            and not any(isinstance(e, ast.Starred) for e in value.elts[: item.index + 1])
+        ):
+            found.append(value.elts[item.index])
+        else:
+            found.append(None)
+    return found[:_MAX_TEMPLATES] or [None]
+
+
+def _render(expr: object, scopes: list[_Scope], depth: int = 0) -> set[str]:
     """Every string `expr` can statically be, with holes where it cannot be known.
 
     `scopes` is innermost first, the module last. A name resolves to what it was
-    assigned in the nearest scope that assigns it; a parameter stays a named hole.
+    bound to in the nearest scope that binds it, a loop or comprehension target to
+    the elements of what it iterates, an unpacked name to its position; a parameter
+    stays a named hole.
     """
     if expr is None or depth > _MAX_DEPTH:
         return {_HOLE}
+    if isinstance(expr, _ParamRef):
+        return {_PARAM.format(expr.name)}
     if isinstance(expr, ast.Constant):
         return {expr.value if isinstance(expr.value, str) else str(expr.value)}
     if isinstance(expr, ast.JoinedStr):
@@ -155,30 +288,38 @@ def _render(expr: ast.expr | None, scopes: list[_Scope], depth: int = 0) -> set[
         if isinstance(func, ast.Name) and func.id == "str" and len(expr.args) == 1:
             return _render(expr.args[0], scopes, depth + 1)
         return {_HOLE}
-    if isinstance(expr, ast.Name):
-        for scope in scopes:
-            if expr.id in scope.assigns:
-                rendered: set[str] = set()
-                for value in scope.assigns[expr.id]:
-                    rendered |= _render(value, scopes, depth + 1)
-                return _cap(rendered)
-            if expr.id in scope.params:
-                return {_PARAM.format(expr.id)}
-        return {_HOLE}
+    if isinstance(expr, ast.Name | _ElementOf | _ItemOf):
+        rendered: set[str] = set()
+        for value in _one_step(expr, scopes, depth + 1):
+            rendered |= _render(value, scopes, depth + 1)
+        return _cap(rendered)
     return {_HOLE}
 
 
-def _is_delete_attr(expr: ast.expr) -> bool:
+def _is_delete_attr(expr: object) -> bool:
     return isinstance(expr, ast.Attribute) and expr.attr == "delete"
 
 
+def _is_getattr_delete(expr: object, scopes: list[_Scope]) -> bool:
+    """`getattr(client, "delete")`, the method name given by any spelling `_render`
+    resolves."""
+    return (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id == "getattr"
+        and len(expr.args) >= 2
+        and "delete" in _render(expr.args[1], scopes)
+    )
+
+
 def _names_bound_to_delete(scopes: list[_Scope]) -> set[str]:
-    """Names assigned a bound `.delete` method (`rm = client.delete`)."""
+    """Names bound to a bound `.delete` method (`rm = client.delete`) or to
+    `getattr(client, "delete")`."""
     return {
         name
         for scope in scopes
         for name, values in scope.assigns.items()
-        if any(_is_delete_attr(value) for value in values)
+        if any(_is_delete_attr(v) or _is_getattr_delete(v, scopes) for v in values)
     }
 
 
@@ -199,13 +340,7 @@ def _delete_url(call: ast.Call, scopes: list[_Scope]) -> ast.expr | None:
     is_delete_call = (
         _is_delete_attr(func)
         or (isinstance(func, ast.Name) and func.id in _names_bound_to_delete(scopes))
-        or (
-            isinstance(func, ast.Call)
-            and isinstance(func.func, ast.Name)
-            and func.func.id == "getattr"
-            and len(func.args) >= 2
-            and "delete" in _render(func.args[1], scopes)
-        )
+        or _is_getattr_delete(func, scopes)
     )
     if is_delete_call:
         return first if first is not None else url_kw
@@ -236,6 +371,8 @@ class _Finder(ast.NodeVisitor):
         self.wrappers: dict[str, list[tuple[list[str], set[str]]]] = {}
         # (enclosing function, callee name, call node, scopes at the call)
         self.calls: list[tuple[str, str, ast.Call, list[_Scope]]] = []
+        # A lambda assigned to a name is a wrapper under that name.
+        self.lambda_names: dict[ast.Lambda, str] = {}
         self.visit(tree)
 
     def _scopes(self) -> list[_Scope]:
@@ -254,6 +391,13 @@ class _Finder(ast.NodeVisitor):
     visit_AsyncFunctionDef = _visit_function
     visit_Lambda = _visit_function
 
+    def visit_Assign(self, node: ast.Assign) -> None:
+        if isinstance(node.value, ast.Lambda):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    self.lambda_names[node.value] = target.id
+        self.generic_visit(node)
+
     def visit_Call(self, node: ast.Call) -> None:
         scopes = self._scopes()
         url = _delete_url(node, scopes)
@@ -265,8 +409,12 @@ class _Finder(ast.NodeVisitor):
             if not kinds and self.stack and any(_PARAM_RE.search(t) for t in templates):
                 func_node = self.stack[-1][1].node
                 if isinstance(func_node, ast.FunctionDef | ast.AsyncFunctionDef):
+                    wrapper = func_node.name
+                else:
+                    wrapper = self.lambda_names.get(func_node)
+                if wrapper is not None:
                     params = [a.arg for a in (*func_node.args.posonlyargs, *func_node.args.args)]
-                    self.wrappers.setdefault(func_node.name, []).append((params, templates))
+                    self.wrappers.setdefault(wrapper, []).append((params, templates))
         if isinstance(node.func, ast.Name):
             self.calls.append((self._where(), node.func.id, node, scopes))
         self.generic_visit(node)
@@ -454,6 +602,74 @@ _MUST_FLAG = {
         '    await client.delete(f"/inventory/devices/{device_id}/")\n',
         [("t", "device", 2)],
     ),
+    "query string after the id": (
+        "async def t(client, device_id):\n"
+        '    await client.delete(f"/inventory/devices/{device_id}?force=1")\n',
+        [("t", "device", 2)],
+    ),
+    "fragment after the id": (
+        "async def t(client, port_id):\n"
+        '    await client.delete("/inventory/ports/" + port_id + "#x")\n',
+        [("t", "port", 2)],
+    ),
+    "augmented assignment": (
+        "async def t(client, device_id):\n"
+        '    url = "/inventory/devices/"\n'
+        "    url += device_id\n"
+        "    await client.delete(url)\n",
+        [("t", "device", 4)],
+    ),
+    "for loop target over a list literal": (
+        "async def t(client, a, b):\n"
+        '    for url in [f"/inventory/devices/{a}", f"/inventory/devices/{b}"]:\n'
+        "        await client.delete(url)\n",
+        [("t", "device", 3)],
+    ),
+    "for loop target over a name bound to a tuple": (
+        "async def t(client, a):\n"
+        '    urls = (f"/cabling/topologies/{a}",)\n'
+        "    for url in urls:\n"
+        "        await client.delete(url)\n",
+        [("t", "topology", 4)],
+    ),
+    "for loop that unpacks the path pieces": (
+        "async def t(client, a):\n"
+        '    for kind, ident in [("devices", a)]:\n'
+        '        await client.delete(f"/inventory/{kind}/{ident}")\n',
+        [("t", "device", 3)],
+    ),
+    "comprehension target": (
+        "import asyncio\n"
+        "async def t(client, ids):\n"
+        "    await asyncio.gather(\n"
+        '        *[client.delete(u) for u in [f"/inventory/devices/{i}" for i in ids]]\n'
+        "    )\n",
+        [("t", "device", 4)],
+    ),
+    "tuple unpack": (
+        "async def t(client, device_id):\n"
+        '    url, n = f"/inventory/devices/{device_id}", 1\n'
+        "    await client.delete(url)\n",
+        [("t", "device", 3)],
+    ),
+    "getattr bound to a name": (
+        "async def t(client, device_id):\n"
+        '    rm = getattr(client, "delete")\n'
+        '    await rm(f"/inventory/devices/{device_id}")\n',
+        [("t", "device", 3)],
+    ),
+    "lambda wrapper": (
+        "async def t(client, port_id):\n"
+        "    rm = lambda u: client.delete(u)\n"
+        '    await rm(f"/inventory/ports/{port_id}")\n',
+        [("t", "port", 3)],
+    ),
+    "stream with the method named": (
+        "async def t(client, device_id):\n"
+        '    async with client.stream("DELETE", f"/inventory/devices/{device_id}"):\n'
+        "        pass\n",
+        [("t", "device", 2)],
+    ),
 }
 
 _MUST_PASS = {
@@ -503,6 +719,21 @@ _MUST_PASS = {
     ),
     "not a delete: a set method that happens to share the name is given no url": (
         "def t(cache):\n    cache.delete()\n"
+    ),
+    "a query string on a route the contract does not cover": (
+        "async def t(client, x):\n"
+        '    await client.delete(f"/cabling/connections/{x}?force=1")\n'
+        '    await client.delete(f"/inventory/devices/{x}/apply-jobs/{x}?y=1")\n'
+    ),
+    "a loop over urls the contract does not cover": (
+        "async def t(client, a, b):\n"
+        '    for url in [f"/cabling/connections/{a}", f"/reservations/{b}"]:\n'
+        "        await client.delete(url)\n"
+    ),
+    "a lambda wrapper used for something else": (
+        "async def t(client, x):\n"
+        "    rm = lambda u: client.delete(u)\n"
+        '    await rm(f"/cabling/connections/{x}")\n'
     ),
 }
 
@@ -641,7 +872,7 @@ def test_every_exemption_names_an_existing_file_and_carries_a_reason():
         assert count >= 1 and reason.strip()
 
 
-def test_judge_fails_on_a_new_site_a_grown_count_and_a_stale_exemption(tmp_path):
+def test_judge_fails_on_a_new_site_a_changed_count_and_a_stale_exemption(tmp_path):
     """The judge on a made-up directory: every departure from the allowlist is named."""
     (tmp_path / "test_subject.py").write_text(
         "async def test_refusal(client, d):\n"
@@ -661,6 +892,19 @@ def test_judge_fails_on_a_new_site_a_grown_count_and_a_stale_exemption(tmp_path)
     assert judge(_scan(tmp_path), allowed) == [
         "2 bare deletes where 1 are exempt, convert the new one or correct the count: "
         "test_subject.py::test_refusal (device, line 2, 4)"
+    ]
+
+    # One of the exempt function's asserted deletes removed: the count shrank, and
+    # a count that only has to be "at most" would let a later bare delete in.
+    shrunk = {("test_subject.py", "test_refusal", "device"): (2, "subject")}
+    (tmp_path / "test_subject.py").write_text(
+        "async def test_refusal(client, d):\n"
+        '    resp = await client.delete(f"/inventory/devices/{d}")\n'
+        "    assert resp.status_code == 409\n"
+    )
+    assert judge(_scan(tmp_path), shrunk) == [
+        "1 bare deletes where 2 are exempt, convert the new one or correct the count: "
+        "test_subject.py::test_refusal (device, line 2)"
     ]
 
     # A bare delete in another function of the same file, and in a new file.
@@ -693,13 +937,17 @@ def test_judge_fails_on_a_new_site_a_grown_count_and_a_stale_exemption(tmp_path)
 # --- an exempt helper that hands the answer back -------------------------------------
 
 # Exempt helpers that RETURN the delete's answer instead of asserting it themselves.
-# Their exemption holds only while every caller reads that answer, so a call whose
-# result is dropped is the bare ignored delete again, one call removed.
+# Their exemption holds only while callers read that answer, so a call whose result
+# is dropped is the bare ignored delete again, one call removed. The check sees a
+# dropped answer only as a bare expression statement (module docstring, Limits).
 ANSWER_RETURNING_HELPERS = {"test_device_delete_guard.py": {"_delete_when_released"}}
 
 
 def find_discarded_answers(source: str, helpers: set[str]) -> list[int]:
-    """Lines where a call to one of `helpers` is a statement whose value is dropped."""
+    """Lines where a call to one of `helpers`, by its own name, is a bare expression
+    statement (awaited or not), so its value is dropped. An answer assigned and never
+    read, assigned to `_`, handed to `asyncio.gather`, or a call through an alias is
+    not seen (module docstring, Limits)."""
     lines = []
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Expr):

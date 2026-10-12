@@ -816,12 +816,16 @@ reaches a stack that keeps its broker state and no consumer drifts from the othe
   a call to the shared `process_batch_with_heartbeat` (own name, import alias, or module
   attribute; an import, a comment, or a local function of that name is not one), an
   interval that is `heartbeat_interval` of `settings.nats_ack_wait_seconds`, directly or
-  through names their scope assigns exactly once, at least one place in the module
-  that sets `ack_wait`, and that same configured value everywhere the module sets it,
-  with `ack_wait` present on every `ConsumerConfig` call; an own fraction, a literal, a
-  cast, or a reassigned name fails. The scan follows names within one module and does
-  not judge whether the code is reached; the guard's module docstring lists those
-  limits (#1158). \
+  through names their scope binds exactly once (a rebinding from a nested function
+  through `global` or `nonlocal` counts as a second binding), at least one place in the
+  module that sets `ack_wait`, and that same configured value at every `ack_wait`
+  setting the scan reads (a call keyword, a key of a call's last `**{...}` dict literal,
+  or an assignment to an `.ack_wait` attribute), with `ack_wait` present on every
+  `ConsumerConfig` call; an own fraction, a literal, a cast, or a reassigned name fails.
+  The scan follows names within one module and does not judge whether the code is
+  reached; the guard's module docstring lists those limits and the settings of
+  `ack_wait` it does not read (a tuple, `for`, or `with` target, a `**` dict that is not
+  a call's last, a config built from a dict by `ConsumerConfig.from_response`) (#1158). \
   Enforced in: `services/common/herd_common/jetstream.py` (`process_batch_with_heartbeat`, `heartbeat_interval`) \
   Pinned by: `tests/unit/test_consumer_heartbeat_wiring.py` (`test_consumer_modules_are_discovered`, `test_no_pull_consumer_module_keeps_an_inline_heartbeat`, `test_every_pull_consumer_module_uses_the_shared_heartbeat`, `test_every_pull_consumer_module_takes_ack_wait_and_heartbeat_from_one_source`)
 - **OPS-NATS-13.** Under `make prod` the broker stores JetStream state in the `nats-data`

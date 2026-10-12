@@ -742,8 +742,9 @@ def pw_prefs_patch_carries(response, page_key: str, expected, key=_WHOLE_FILTER)
     return isinstance(saved, dict) and saved.get(key) == expected
 
 
-# A point clear of the bottom-centre toast stack (issue #942): a toast is at
-# most 350 px wide and centred, so the left edge is never over one.
+# A point clear of the bottom-centre toast stack (issue #942): a toast is
+# centred and far narrower than any e2e viewport (a success toast at most 350 px,
+# the fork save custom toast about 450 px), so the left edge is never over one.
 PW_OFF_TOASTER = (5, 400)
 
 
@@ -773,7 +774,8 @@ def pw_click_for_response(page, target, method, url_end, *, status=200, timeout=
     It returns the FIRST response the predicate matches. The main axios client
     replays a request once after a 401 and a token refresh
     (frontend/src/api/client.ts), so a test that outlives its access token
-    (30 minutes; every pw_page test logs in fresh) would capture the 401 and
+    (30 minutes; pw_page gives each test a fresh browser context and every
+    current caller signs in at its start, so none does) would capture the 401 and
     fail the status assertion here although the replay succeeds. Such a test
     should not use this helper as is: it writes its own expect_response whose
     predicate also requires `r.status != 401`, so the replay's response is the

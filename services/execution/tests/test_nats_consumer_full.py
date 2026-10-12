@@ -172,7 +172,21 @@ async def test_start_nats_consumer_success():
     mock_msg.ack = AsyncMock()
 
     # Pull subscription: fetch returns the message once, then times out.
-    mock_js.pull_subscribe = AsyncMock(return_value=_StubPullSub([mock_msg]))
+    # Every add_consumer and pull_subscribe as (operation, durable), in the order
+    # they happened. The durable add_consumer creates is read from the config AT
+    # the call: ensure_consumer sets it there, and the config object is a mock any
+    # later write would change.
+    durable_calls = []
+
+    async def add_consumer(stream, config):
+        durable_calls.append(("add_consumer", config.durable_name, stream))
+
+    async def pull_subscribe(subject, durable, config):
+        durable_calls.append(("pull_subscribe", durable, None))
+        return _StubPullSub([mock_msg])
+
+    mock_js.add_consumer = AsyncMock(side_effect=add_consumer)
+    mock_js.pull_subscribe = AsyncMock(side_effect=pull_subscribe)
 
     mock_nats_module = MagicMock()
     mock_nats_module.connect = AsyncMock(return_value=mock_nc)
@@ -198,16 +212,22 @@ async def test_start_nats_consumer_success():
     assert "backoff" not in consumer_config_kwargs
     assert consumer_config_kwargs["ack_wait"] == 30
     mock_js.add_consumer.assert_awaited_once()
-    assert mock_js.add_consumer.await_args.args[0] == "HERD_RESERVATIONS"
     # Verify subscription was created
     mock_js.pull_subscribe.assert_called_once()
-    # The order itself, read from the ONE call log both mocks share through their
-    # parent: two separate "was called once" checks hold whichever came first,
-    # and pull_subscribe ahead of add_consumer binds to the durable's stale config.
-    durable_calls = [
-        name for name, _, _ in mock_js.mock_calls if name in ("add_consumer", "pull_subscribe")
-    ]
-    assert durable_calls == ["add_consumer", "pull_subscribe"], mock_js.mock_calls
+    # The pairing, read from ONE ordered log BY DURABLE NAME, as the notifications
+    # and integration start tests read theirs: the durable pull_subscribe binds must
+    # be the one add_consumer created or updated, and created first. Two separate
+    # "was called once" checks hold whichever came first, a call-order check alone
+    # holds when ensure_consumer created some other durable, and pull_subscribe
+    # ahead of add_consumer binds to the durable's stale config.
+    assert [op for op, durable, _ in durable_calls if durable == "execution-consumer"] == [
+        "add_consumer",
+        "pull_subscribe",
+    ], durable_calls
+    # The durable is created on its own stream, asserted as the whole map.
+    assert {d: s for op, d, s in durable_calls if op == "add_consumer"} == {
+        "execution-consumer": "HERD_RESERVATIONS"
+    }
     # Verify consumer task was stored
     assert hasattr(mock_app.state, "nats_consumer_task")
 
