@@ -262,3 +262,27 @@ Three PRs, each independently green; the feature is inert until the last:
 - Editing or refining an already-uploaded driver package in place; v1
   drafts new packages only.
 - A declarative recipe DSL.
+
+## As built (2026-10-12)
+
+Where the validator's structural step differs from the decision text above (step 2
+under "Validation lives in execution behind a new internal endpoint" and the upload-path
+context bullet). The decisions themselves stand.
+
+- Step 2 never imports the package. The structural check is one function,
+  `driver_structure_errors` in `services/execution/app/services/driver_structure.py`,
+  shared by the load path's `validate_driver` and the validator (issue #1114): it parses
+  `driver.py` and requires a plain top-level `class Driver` statement that provides every
+  `REQUIRED_METHODS` entry through a binding that could be callable (issue #1179). Code
+  in the package first runs in the sandbox, at config-schema extraction or the dry run,
+  so an import that fails surfaces there and not as a structural error.
+- The validator reads and parses each `.py` file in the package once, as bytes (a PEP 263
+  coding cookie is honored), and the structural and policy sections judge `driver.py`
+  from that one parse (issue #1179). A parse failure keeps the parser's message, the
+  repair signal for the drafting loop.
+- Step 1 extracts through the load path's `extract_driver_package`, so the extraction
+  ceilings and the tar read bound apply (issues #1115, #1179), and an extraction failure
+  is reported as `Failed to extract package: <ClassName>`, the class name only (issue
+  #1180).
+- The current rules are CFG-VAL-3 and CFG-VAL-4 (and CFG-LOAD-3, CFG-LOAD-4 for the
+  shared pieces) in `docs/specs/device-configuration.md`.
