@@ -41,6 +41,12 @@ A value that only LOOKS wired is not (issue #1158): another variable
 longer value (`x-${VAR:-2}`, `${OTHER:-${VAR}}`, a doubled substitution), or
 a default the comparison would not read (`${VAR-99}`).
 
+The #849 check, kept below, starts from `.env.example` instead: every active `AI_*`
+key there must be set, on ai-orchestrator's container-side key of the SAME name, to
+exactly `${KEY}` or `${KEY:-default}`, the whole-value rule above. The key
+interpolated under another container key, inside a longer value, or in another
+variable's default does not count.
+
 Limits. Only the base file's `environment:` mapping is read:
 
 - not seen: `docker-compose.override.yml`, an `env_file`, a value changed by the
@@ -640,20 +646,22 @@ def _active_env_example_keys(prefix: str) -> set[str]:
 
 
 def keys_not_passed_through(keys: set[str], environment: dict) -> list[str]:
-    """The keys an operator can set in .env that no value of this environment
-    block interpolates. A container-side key of the same name with a literal
-    value does not pass the .env value through."""
-    reaching = set().union(*(interpolated_variables(value) for value in environment.values()))
-    return sorted(keys - reaching)
+    """The keys an operator can set in .env whose container-side key of the same
+    name does not carry the value unchanged: its whole value must be the key's own
+    `${KEY}` or `${KEY:-default}`, the shape `_is_wired` requires of a Settings
+    field. A literal value, another variable, the key interpolated under another
+    container key or inside a longer value or a default, and `${KEY-x}` do not."""
+    return sorted(k for k in keys if not whole_value_substitution(environment.get(k), k)[0])
 
 
 def test_every_active_ai_env_example_key_is_wired_to_ai_orchestrator():
     active_keys = _active_env_example_keys("AI_")
     missing = keys_not_passed_through(active_keys, _service_environment("ai-orchestrator"))
     assert not missing, (
-        "these AI_* keys are active in .env.example but no value in the "
-        "ai-orchestrator environment block in docker-compose.yml interpolates "
-        "them, so setting them in .env has no effect in the container: " + ", ".join(missing)
+        "these AI_* keys are active in .env.example but the ai-orchestrator "
+        "environment block in docker-compose.yml does not set the same key to "
+        "exactly ${KEY} or ${KEY:-default}, so setting them in .env does not reach "
+        "the container unchanged: " + ", ".join(missing)
     )
 
 
@@ -799,3 +807,23 @@ def test_env_example_scan_needs_an_interpolation_not_a_key():
     assert keys_not_passed_through(keys, literal) == ["AI_MODEL"]
     crossed = _environment("  AI_MODEL: ${AI_PROVIDER:-p}\n  AI_PROVIDER: ${AI_PROVIDER:-p}\n")
     assert keys_not_passed_through(keys, crossed) == ["AI_MODEL"]
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        "  AI_OTHER: ${AI_MODEL}\n",
+        "  AI_MODEL: ${OTHER:-${AI_MODEL}}\n",
+        "  AI_MODEL: x-${AI_MODEL}\n",
+        "  AI_MODEL: ${AI_MODEL}-x\n",
+        "  AI_MODEL: ${AI_MODEL-x}\n",
+        "  AI_MODEL: ${AI_MODEL:?required}\n",
+        "  AI_MODEL: $${AI_MODEL}\n",
+        "  AI_MODEL: $AI_MODEL\n",
+    ],
+)
+def test_env_example_scan_needs_the_keys_own_whole_value_interpolation(lines: str):
+    """Interpolated somewhere is not enough: under another container key, inside a
+    longer value or another variable's default, or in a form compose does not read
+    as `${KEY:-default}`, the documented key does not reach the container as set."""
+    assert keys_not_passed_through({"AI_MODEL"}, _environment(lines)) == ["AI_MODEL"]
