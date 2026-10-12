@@ -75,7 +75,9 @@ Driver packages are uploaded as `.zip` or `.tar.gz` archives (max 10 MB). Extrac
 an archive may hold at most 10,000 entries and declare at most 100 MiB uncompressed in
 total; the execution service checks both before it writes anything and refuses a package
 past either as a permanent load failure (`driver load failed: PackageLimitError`;
-issue #1115). The archive must contain the following at its root:
+issue #1115). A `.tar.gz` whose pax extended header or GNU long name is over 1 MiB is
+refused the same way before the header is read into memory (issue #1179). The archive
+must contain the following at its root:
 
 ```
 driver.py             # REQUIRED: must contain a class named Driver
@@ -88,21 +90,44 @@ The execution service extracts the archive and checks `driver.py` by parsing it,
 by importing it (issue #1114): package code runs only inside the driver sandbox. The
 check, shared with the generated-recipe validator, requires:
 
+- a `driver.py` that parses. Any parse failure, including the parser running out of
+  stack or memory on a very long or deeply nested expression, is a permanent load
+  failure (`driver load failed: DriverPackageError`; issue #1178);
 - a plain top-level `class Driver` statement. A `Driver` bound any other way (an
   assignment such as `Driver = make_driver()`, an import such as `from impl import
   Driver`, or a class statement nested in an `if`, `try`, or function) is refused with
   `driver.py must define Driver with a plain top-level class statement`;
-- every method the connection type requires, provided by the class body (`def`,
-  `async def`, an assignment, or an import), by an assignment onto `Driver` at module
-  level, or by a base class that is itself a top-level class statement in `driver.py`
-  (followed through its own bases);
+- every method the connection type requires, provided by a binding that could be
+  callable (issue #1179): in the class body a `def`, an `async def`, a nested class, an
+  import, or an assignment whose value is not a literal (a lambda, a name, an
+  attribute, a call); an assignment of such a value onto `Driver` at module level
+  (`Driver.status = _status`); or a base class that is itself a top-level class
+  statement in `driver.py` and provides it the same way (followed through its own
+  bases). An annotation with no value (`status: object`) and an assignment of a literal
+  (`status = None`, a string, a number, a container) do not provide a method. The class
+  body and the module-level statements after the class run in order, so a later `del`
+  or literal assignment there removes a method bound earlier;
 - when a method could come from code the parser cannot read (a base class imported
-  from another module, a class decorator, a metaclass, `setattr(Driver, ...)`), the
-  check does not refuse the package, and a missing method fails the first sandboxed
-  call that needs it.
+  from another module, a class decorator, a metaclass, `setattr(Driver, ...)` anywhere
+  in the file), the check does not refuse the package, and a missing method fails the
+  first sandboxed call that needs it. A binding inside an `if`, `try`, `while`, `with`,
+  or `match` block, a `for` or `with` target, and a `Driver.<name>` assignment inside a
+  function count whether or not that code ever runs.
+
+This differs from the import-based check it replaced in both directions. It refuses a
+required method that exists only because it was assigned onto a base class
+(`_Base.status = f`) or added by rebinding the class (`Driver = add(Driver)`). It
+accepts a method assigned only inside a function that is never called or bound only
+under a false condition, a class with a decorator, a class keyword, or a `setattr` call
+whose methods are really missing, and a `driver.py` that parses but does not compile
+(an assignment expression in a comprehension in a class body); each of those then
+fails its first sandboxed call.
 
 Because the load no longer imports `driver.py`, top-level code that raises (a missing
-dependency, for example) fails the first sandboxed call rather than the load. The
+dependency, for example) fails the first sandboxed call rather than the load. For a
+dynamic-resource recipe that call is `login`, so its `provision_requested` event is
+retried like any failed login and dead-lettered at the fifth delivery, not on the first
+as a package that fails the load is (issue #279). The
 service then optionally installs dependencies from `requirements.txt`, and each call
 loads `driver.py` in the sandbox and instantiates the `Driver` class. The
 package root is put on `PYTHONPATH` for the driver subprocess (a vendored `_deps/`

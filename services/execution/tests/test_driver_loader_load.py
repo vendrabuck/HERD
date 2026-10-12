@@ -13,10 +13,12 @@ from app.models.driver_cache import DriverCache
 from app.services.driver_loader import (
     DriverPackageError,
     download_driver_package,
+    driver_load_failure_text,
     extract_config_schema_json,
     extract_driver_package,
     get_driver_config_schema,
     get_driver_metadata,
+    is_permanent_load_failure,
     load_driver,
 )
 from sqlalchemy import select
@@ -325,8 +327,9 @@ async def test_load_driver_extraction_failure_sanitizes_foreign_text(db, caplog)
 async def test_load_driver_validate_parse_failure_sanitizes_foreign_text(db, caplog):
     """driver.py failing to parse must not leak the parser's text into the
     DriverPackageError message; validate_driver keeps only the class name.
-    The parser is patched to carry the sentinel the way a real message could
-    carry a container filesystem path or a fragment of the source."""
+    The module's own parse seam (driver_structure._parse_source, never the
+    stdlib ast module) is patched to carry the sentinel the way a real parser
+    message could carry a container filesystem path or a fragment of the source."""
     zip_bytes = _make_zip(VALID_L1_DRIVER)
 
     with tempfile.TemporaryDirectory() as cache_root:
@@ -337,7 +340,7 @@ async def test_load_driver_validate_parse_failure_sanitizes_foreign_text(db, cap
             ),
             patch("app.services.driver_loader.settings") as mock_settings,
             patch(
-                "app.services.driver_structure.ast.parse",
+                "app.services.driver_structure._parse_source",
                 side_effect=SyntaxError(_SENTINEL),
             ),
             caplog.at_level("ERROR"),
@@ -933,3 +936,88 @@ async def test_load_driver_replaces_row_of_another_package_and_removes_its_direc
     ).scalar_one()
     assert row.sha256 == "new-sha"
     assert row.local_path == path
+
+
+# --- A parser crash is a permanent load failure and leaks no directory (issue #1178) ---
+
+# driver.py sources the parser itself cannot get through: a RecursionError and a
+# MemoryError on CPython 3.12. Before #1178 both escaped load_driver bare, classed
+# transient, and left the attempt's extraction directory behind on every retry.
+_PARSER_CRASH_SOURCES = {
+    "plus-chain": "x = " + "+".join(["1"] * 500_000) + "\nclass Driver:\n    pass\n",
+    "unary-chain": "x = " + "-" * 200_000 + "1\nclass Driver:\n    pass\n",
+}
+
+
+def _patched_load(cache_root: str, package: bytes):
+    """Patches for a cold-cache load of `package` into cache_root."""
+    download = patch(
+        "app.services.driver_loader.download_driver_package",
+        new=AsyncMock(return_value=package),
+    )
+    settings_patch = patch("app.services.driver_loader.settings")
+    return download, settings_patch
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", _PARSER_CRASH_SOURCES.values(), ids=_PARSER_CRASH_SOURCES)
+async def test_load_driver_parser_crash_is_permanent_and_leaves_nothing(db, source):
+    driver_id = uuid.uuid4()
+    with tempfile.TemporaryDirectory() as cache_root:
+        download, settings_patch = _patched_load(cache_root, _make_zip(source))
+        with download, settings_patch as mock_settings:
+            mock_settings.driver_cache_path = cache_root
+            with pytest.raises(DriverPackageError) as exc:
+                await load_driver(db, driver_id, "sha", "driver.zip", "Layer 1 Switch")
+            assert list(Path(cache_root).iterdir()) == []
+
+    assert is_permanent_load_failure(exc.value)
+    assert driver_load_failure_text(exc.value) == "driver load failed: DriverPackageError"
+    assert str(exc.value) in (
+        "Driver validation failed: Failed to load driver.py: RecursionError",
+        "Driver validation failed: Failed to load driver.py: MemoryError",
+    )
+    rows = (await db.execute(select(DriverCache))).scalars().all()
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_load_driver_three_parser_crash_loads_leave_no_directory(db):
+    """Every retry of a package that can never load extracts afresh, so each one
+    must clean up after itself."""
+    driver_id = uuid.uuid4()
+    with tempfile.TemporaryDirectory() as cache_root:
+        package = _make_zip(_PARSER_CRASH_SOURCES["plus-chain"])
+        download, settings_patch = _patched_load(cache_root, package)
+        with download, settings_patch as mock_settings:
+            mock_settings.driver_cache_path = cache_root
+            for _ in range(3):
+                with pytest.raises(DriverPackageError):
+                    await load_driver(db, driver_id, "sha", "driver.zip", "Layer 1 Switch")
+            assert list(Path(cache_root).iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target",
+    [
+        "app.services.driver_loader.validate_driver",
+        "app.services.driver_loader.read_driver_metadata",
+        "app.services.driver_loader.extract_config_schema_json",
+    ],
+    ids=["validate", "metadata", "config-schema"],
+)
+async def test_load_driver_removes_the_directory_when_a_package_check_raises(db, target):
+    """A check that raises (rather than returning errors) still removes the
+    attempt's directory, and the exception reaches the caller unchanged, so a
+    transient failure stays transient."""
+    boom = RuntimeError("check crashed")
+    with tempfile.TemporaryDirectory() as cache_root:
+        download, settings_patch = _patched_load(cache_root, _make_zip(VALID_L1_DRIVER))
+        with download, settings_patch as mock_settings, patch(target, side_effect=boom):
+            mock_settings.driver_cache_path = cache_root
+            with pytest.raises(RuntimeError) as exc:
+                await load_driver(db, uuid.uuid4(), "sha", "driver.zip", "Layer 1 Switch")
+            assert list(Path(cache_root).iterdir()) == []
+    assert exc.value is boom
+    assert not is_permanent_load_failure(exc.value)

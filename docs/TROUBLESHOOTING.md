@@ -449,6 +449,20 @@ default 900) fails it. No ledger row and
 no instance exist, so there is nothing to tear down. Rebook after reservations recovers,
 or replay the dead-lettered event before the timeout fires (`DLQ has messages` below).
 
+### A dynamic reservation with a broken recipe retries five times before it fails
+
+A recipe package that fails the load's checks (a corrupt archive, an unparseable
+`driver.py`, no `Driver` class, a missing required method) dead-letters the
+`provision_requested` event on its first delivery and fails the reservation at once
+(issue #279). The load parses `driver.py` and never runs it (issue #1114), so a recipe
+whose top-level code raises, most often an import of a module the sandbox does not
+have, passes the load and fails its first sandboxed `login` instead: the `login`
+ExecutionRun row is `FAILED` with `driver raised ModuleNotFoundError` (or the class that
+was raised), the event is NAK'd like any failed login, and the reservation fails only
+when the fifth delivery is dead-lettered (`nats_dlq_exhausted`, about 81 seconds at the
+default `NATS_NAK_BACKOFF_SECONDS`), with five `login` runs recorded. Fix the recipe's
+imports and re-upload it.
+
 ### Log action `dynamic_instance_device_delete_failed`
 
 Meaning: teardown destroyed a dynamic instance on the hypervisor, but inventory refused

@@ -7,7 +7,8 @@ package validator). That check requires a plain top-level `class Driver` stateme
 the methods `REQUIRED_METHODS` lists for the package's connection type. This test runs
 it over every package under drivers/ with the connection type the package's own
 driver_metadata.json declares, so a refactor that moves a method out of sight of the
-parser fails here, stack-free, instead of at upload time.
+parser fails here, stack-free, instead of when execution first loads the package (the
+check runs at load; inventory's upload never runs it).
 
 The module is loaded by path, not imported as `app...`: every service names its
 package `app`, and driver_structure.py is pure standard library for exactly this use.

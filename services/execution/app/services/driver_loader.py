@@ -1,5 +1,6 @@
 """Driver package loader: download, extract, validate, and cache driver packages."""
 
+import gzip
 import io
 import json
 import logging
@@ -37,13 +38,19 @@ class DriverPackageError(Exception):
     Raised for structural defects that are fixed for a given SHA256 and so
     reproduce identically on every redelivery: a structurally invalid archive
     (unsupported format, corrupt zip/tar, over the extraction ceilings), a
-    missing driver.py, a driver.py that does not parse, a missing Driver class,
-    an unknown connection type, or a Driver missing a method the connection type
-    requires.
+    missing driver.py, a driver.py that does not parse (any failure in
+    driver_structure.PARSE_FAILURES, the parser's RecursionError and MemoryError
+    included, issue #1178), a missing Driver class, an unknown connection type,
+    or a Driver missing a method the connection type requires.
     Distinct from a download failure (inventory unreachable), which stays a
     transient RuntimeError. The dynamic-provisioning consumer maps this to a
     PermanentEventError so a broken recipe dead-letters on first delivery
-    instead of NAK'ing through the full retry ladder (issue #279).
+    instead of NAK'ing through the full retry ladder (issue #279). Only what the
+    load checks counts: the load parses driver.py and never imports it (issue
+    #1114), so a recipe whose top-level code raises (an import of a missing
+    module) loads, fails its first sandboxed call (login), and that event is
+    NAK'd like any failed login and dead-lettered only when NATS_MAX_DELIVER
+    deliveries are spent (``nats_dlq_exhausted``), not on its first delivery.
     """
 
 
@@ -119,6 +126,13 @@ async def download_driver_package(driver_id: uuid.UUID) -> bytes:
 # decision, not settings.
 MAX_EXTRACTED_BYTES = 100 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 10_000
+# The largest single read the tar reader may make from the decompressed stream (issue
+# #1179). tarfile reads member headers in 512-byte blocks and copies member data in
+# 16 KiB chunks, but reads a pax extended header (types x and g) or a GNU long name
+# or long link (types L and K) whole, in one call, before the member it describes
+# exists to be checked against the ceilings above. Bounding the read bounds that
+# allocation. A real pax header or long name is well under a kilobyte.
+MAX_TAR_READ_BYTES = 1024 * 1024
 
 
 class PackageLimitError(ValueError):
@@ -142,6 +156,33 @@ def _check_archive_limits(entries: int, total_bytes: int) -> None:
         )
 
 
+class _BoundedTarStream:
+    """The decompressed tar stream, refusing any single read over MAX_TAR_READ_BYTES.
+
+    tarfile reads a pax or GNU long-name header's whole declared size in one call;
+    this refuses that call before anything is decompressed into memory for it.
+    Every other read tarfile makes is a 512-byte header block or a data chunk of at
+    most its 16 KiB copy buffer, so a well-formed package never reaches the bound.
+    """
+
+    def __init__(self, raw: gzip.GzipFile) -> None:
+        self._raw = raw
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0 or size > MAX_TAR_READ_BYTES:
+            raise PackageLimitError(
+                f"Driver package has a tar header record over {MAX_TAR_READ_BYTES} bytes "
+                "(a pax extended header or GNU long name); nothing was extracted"
+            )
+        return self._raw.read(size)
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        return self._raw.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._raw.tell()
+
+
 def extract_driver_package(package_bytes: bytes, filename: str, dest_dir: Path) -> None:
     """Extract a .zip or .tar.gz driver package into dest_dir.
 
@@ -150,6 +191,15 @@ def extract_driver_package(package_bytes: bytes, filename: str, dest_dir: Path) 
     included (issue #1115). A declared size also bounds what extraction writes: zipfile
     reads no more than an entry's ``file_size`` and tarfile writes exactly a member's
     ``size``.
+
+    A tar is read through ``_BoundedTarStream``, so no single read from the
+    decompressed stream exceeds MAX_TAR_READ_BYTES: a pax or GNU long-name header
+    declaring more is refused before it is read into memory (issue #1179). Member
+    headers are read one at a time and the scan stops at the first one past a
+    ceiling; skipping over member data still decompresses it in small chunks, and
+    extraction then decompresses the stream a second time from the start. The work
+    is synchronous, and load_driver calls it on the event loop (a limit: up to about
+    twice MAX_EXTRACTED_BYTES of gunzip per cache miss blocks the loop).
     """
     if filename.endswith(".zip"):
         with zipfile.ZipFile(io.BytesIO(package_bytes)) as zf:
@@ -158,17 +208,21 @@ def extract_driver_package(package_bytes: bytes, filename: str, dest_dir: Path) 
             dest_dir.mkdir(parents=True, exist_ok=True)
             zf.extractall(dest_dir)
     elif filename.endswith(".tar.gz") or filename.endswith(".tgz"):
-        with tarfile.open(fileobj=io.BytesIO(package_bytes), mode="r:gz") as tf:
-            # Read member headers one at a time and stop at the first one past a
-            # ceiling, so a member declaring a huge size is never decompressed.
-            entries = 0
-            total_bytes = 0
-            for member in tf:
-                entries += 1
-                total_bytes += member.size
-                _check_archive_limits(entries, total_bytes)
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            tf.extractall(dest_dir, filter="data")
+        with gzip.GzipFile(fileobj=io.BytesIO(package_bytes), mode="rb") as raw:
+            try:
+                tf = tarfile.open(fileobj=_BoundedTarStream(raw), mode="r:")
+            except OSError as exc:
+                # What tarfile.open(mode="r:gz") raises for a stream that is not gzip.
+                raise tarfile.ReadError("not a gzip file") from exc
+            with tf:
+                entries = 0
+                total_bytes = 0
+                for member in tf:
+                    entries += 1
+                    total_bytes += member.size
+                    _check_archive_limits(entries, total_bytes)
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                tf.extractall(dest_dir, filter="data")
     else:
         raise ValueError(f"Unsupported package format: {filename}")
 
@@ -360,21 +414,28 @@ async def load_driver(
         shutil.rmtree(dest_dir, ignore_errors=True)
         raise DriverPackageError(f"Failed to extract driver {driver_id}: {type(e).__name__}") from e
 
-    # Validate
-    errors = validate_driver(dest_dir, connection_type)
-    if errors:
+    # Until the cache row names it, nothing else will ever remove this attempt's
+    # directory, so any failure while the package is checked removes it here: a
+    # check that returns errors, and one that raises (issue #1178). A raise is
+    # re-raised unchanged, so its transient or permanent class is kept.
+    try:
+        # Validate
+        errors = validate_driver(dest_dir, connection_type)
+        if errors:
+            raise DriverPackageError(f"Driver validation failed: {'; '.join(errors)}")
+
+        # Capture driver_metadata.json (opt-in capability declaration). Default-shape
+        # if missing so the cache always reflects "we looked and this is what we saw".
+        metadata = read_driver_metadata(dest_dir)
+        metadata_json = json.dumps(metadata)
+
+        # Capture the driver-published config schema (issue #23). Fail-open: a
+        # driver that omits config_schema(), ships a broken one, or times out
+        # yields None and we degrade to the registry at validation time.
+        config_schema_json = extract_config_schema_json(dest_dir)
+    except BaseException:
         shutil.rmtree(dest_dir, ignore_errors=True)
-        raise DriverPackageError(f"Driver validation failed: {'; '.join(errors)}")
-
-    # Capture driver_metadata.json (opt-in capability declaration). Default-shape
-    # if missing so the cache always reflects "we looked and this is what we saw".
-    metadata = read_driver_metadata(dest_dir)
-    metadata_json = json.dumps(metadata)
-
-    # Capture the driver-published config schema (issue #23). Fail-open: a
-    # driver that omits config_schema(), ships a broken one, or times out
-    # yields None and we degrade to the registry at validation time.
-    config_schema_json = extract_config_schema_json(dest_dir)
+        raise
 
     # Record the cache row (issue #1097): a real insert-or-nothing on the unique
     # driver_id, then a re-read, so a concurrent first load of the same driver

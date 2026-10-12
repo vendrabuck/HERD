@@ -29,7 +29,11 @@ from pathlib import Path
 from app.config import settings
 from app.services.driver_loader import extract_driver_package, read_driver_metadata
 from app.services.driver_sandbox import execute_driver_method, extract_config_schema
-from app.services.driver_structure import DriverSourceError, driver_structure_errors
+from app.services.driver_structure import (
+    DriverSourceError,
+    driver_structure_errors,
+    parse_python_file,
+)
 from app.services.recipe_result import (
     created_instance_ref,
     recipe_reported_success,
@@ -99,20 +103,32 @@ def _decode_package(package_b64: str) -> bytes:
     return package_bytes
 
 
-def _parse_python_files(package_dir: Path) -> tuple[dict[Path, ast.AST], list[str]]:
-    """Parse every .py file in the package. Returns (trees, parse_errors)."""
-    trees: dict[Path, ast.AST] = {}
-    errors: list[str] = []
+DRIVER_PY = Path("driver.py")
+
+
+def _parse_python_files(package_dir: Path) -> dict[Path, ast.Module | DriverSourceError]:
+    """Parse every .py file in the package once, keyed by its package-relative path.
+
+    Each file goes through ``parse_python_file``, the load path's own reader, so
+    it is read as bytes (a PEP 263 coding cookie is honored) and every parse
+    failure is the same ``DriverSourceError``. The structural and policy sections
+    both judge driver.py from this one result (issue #1179).
+    """
+    parsed: dict[Path, ast.Module | DriverSourceError] = {}
     for py_file in sorted(package_dir.rglob("*.py")):
         rel = py_file.relative_to(package_dir)
         try:
-            trees[rel] = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(rel))
-        except (SyntaxError, UnicodeDecodeError, OSError) as exc:
-            errors.append(f"{rel}: failed to parse: {exc}")
-    return trees, errors
+            parsed[rel] = parse_python_file(py_file, str(rel))
+        except DriverSourceError as exc:
+            parsed[rel] = exc
+    return parsed
 
 
-def _structural_errors(package_dir: Path, connection_type: str) -> list[str]:
+def _structural_errors(
+    package_dir: Path,
+    connection_type: str,
+    parsed: dict[Path, ast.Module | DriverSourceError],
+) -> list[str]:
     """AST-only structural validation: driver.py, class Driver, required methods.
 
     The shared check (driver_structure_errors) never imports the module;
@@ -121,7 +137,7 @@ def _structural_errors(package_dir: Path, connection_type: str) -> list[str]:
     the parser's message: it is the repair signal for the drafting loop.
     """
     try:
-        return driver_structure_errors(package_dir, connection_type)
+        return driver_structure_errors(package_dir, connection_type, parsed=parsed.get(DRIVER_PY))
     except DriverSourceError as exc:
         return [f"driver.py failed to parse: {exc.__cause__}"]
 
@@ -206,7 +222,9 @@ def _credential_literal_errors(rel: Path, tree: ast.AST) -> list[str]:
     return errors
 
 
-def _policy_errors(package_dir: Path) -> list[str]:
+def _policy_errors(
+    package_dir: Path, parsed: dict[Path, ast.Module | DriverSourceError]
+) -> list[str]:
     """The stricter generated-recipe contract (ADR 0005).
 
     - driver_metadata.json must exist, parse, and declare supports_dry_run
@@ -242,8 +260,12 @@ def _policy_errors(package_dir: Path) -> list[str]:
     if (package_dir / "requirements.txt").exists():
         errors.append("requirements.txt is not allowed in generated recipes (stdlib only in v1)")
 
-    trees, parse_errors = _parse_python_files(package_dir)
-    errors.extend(parse_errors)
+    trees: dict[Path, ast.Module] = {}
+    for rel, result in parsed.items():
+        if isinstance(result, DriverSourceError):
+            errors.append(f"{rel}: failed to parse: {result.__cause__}")
+        else:
+            trees[rel] = result
 
     local_modules = _local_module_names(package_dir)
     allowed = set(sys.stdlib_module_names) | _SANDBOX_PROVIDED_MODULES
@@ -424,16 +446,25 @@ def validate_package(package_b64: str, filename: str, connection_type: str) -> d
         try:
             extract_driver_package(package_bytes, filename, tmp_dir)
         except Exception as exc:
+            # A tar filter error's text carries the temporary directory's path, so
+            # the report keeps only the class name, the rule every other foreign
+            # exception text in this service follows (issues #840, #1180). The full
+            # text goes in the log MESSAGE, not `extra`.
+            logger.warning("Failed to extract package under validation: %s", exc)
             return {
                 "valid": False,
-                "structural": {"passed": False, "errors": [f"Failed to extract package: {exc}"]},
+                "structural": {
+                    "passed": False,
+                    "errors": [f"Failed to extract package: {type(exc).__name__}"],
+                },
                 "policy": {"passed": False, "errors": []},
                 "schema": {"present": False, "schema": None, "error": None},
                 "dry_run": {"passed": False, "methods": [], "error": "not run"},
             }
 
-        structural = _structural_errors(tmp_dir, connection_type)
-        policy = _policy_errors(tmp_dir)
+        parsed = _parse_python_files(tmp_dir)
+        structural = _structural_errors(tmp_dir, connection_type, parsed)
+        policy = _policy_errors(tmp_dir, parsed)
 
         # Only a statically clean package gets executed, even in the sandbox.
         if structural or policy:

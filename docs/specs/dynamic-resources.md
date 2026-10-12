@@ -327,9 +327,13 @@ goes live.
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_broken_package_leaves_row_creating_for_teardown`)
 - **DYN-CREATE-12.** A recipe package that cannot load (`DriverPackageError`) raises
   `PermanentEventError`, dead-lettering the whole event on its first delivery with no
-  recipe call. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_broken_package_raises_permanent_with_diagnosable_message`, `test_broken_package_dlqs_on_first_delivery_with_failure_callback`); `tests/integration/test_dynamic_resources.py` (`test_broken_recipe_package_dead_letters_on_first_delivery`)
+  recipe call. Only what the load checks counts (CFG-LOAD-4 in
+  [device-configuration.md](device-configuration.md)): `driver.py` is parsed and never
+  run there, so a recipe whose top-level code raises (an import of a missing module)
+  loads, fails its first sandboxed `login` (DYN-CREATE-17), and is nacked like a failed
+  create, dead-lettered only at the fifth delivery. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`); `services/execution/app/services/driver_loader.py` (`load_driver`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_broken_package_raises_permanent_with_diagnosable_message`, `test_broken_package_dlqs_on_first_delivery_with_failure_callback`, `test_create_login_payload_failure_is_a_failed_create`); `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_never_runs_driver_code_in_process`); `tests/integration/test_dynamic_resources.py` (`test_broken_recipe_package_dead_letters_on_first_delivery`)
 - **DYN-CREATE-13.** A recipe package download failure is transient: the event is
   nacked and retried. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`); `services/execution/app/services/driver_loader.py` (`load_driver`) \
@@ -930,8 +934,8 @@ acknowledgement and the log action.
 | Outcome | Log action | When | Rule |
 |---|---|---|---|
 | acked, nothing run | `nats_event_unverified` | `provision_requested` for a reservation not `PENDING_PROVISION` | DYN-CREATE-1 |
-| dead-lettered on first delivery, failure callback | `nats_dlq_permanent` | template, hypervisor, or secret missing; recipe package cannot load; inventory refused the device; create succeeded without a ref | DYN-CREATE-8, DYN-CREATE-9, DYN-CREATE-12, DYN-CREATE-19, DYN-CREATE-23, DYN-DLQ-1 |
-| nacked with delay | `nats_message_nak` | 5xx or transport error; package download failure; failed login or create; reservations unreachable | DYN-CREATE-2, DYN-CREATE-10, DYN-CREATE-13, DYN-CREATE-16, DYN-CREATE-18 |
+| dead-lettered on first delivery, failure callback | `nats_dlq_permanent` | template, hypervisor, or secret missing; recipe package fails the load's checks (archive, `driver.py` parse, `Driver` class, required methods); inventory refused the device; create succeeded without a ref | DYN-CREATE-8, DYN-CREATE-9, DYN-CREATE-12, DYN-CREATE-19, DYN-CREATE-23, DYN-DLQ-1 |
+| nacked with delay | `nats_message_nak` | 5xx or transport error; package download failure; failed login or create, including a recipe whose top-level code raises (the load parses `driver.py` and never runs it, so the first sandboxed `login` fails); reservations unreachable | DYN-CREATE-2, DYN-CREATE-10, DYN-CREATE-13, DYN-CREATE-16, DYN-CREATE-18 |
 | dead-lettered at the fifth delivery, failure callback | `nats_dlq_exhausted` | any nacked failure that persists | DYN-CREATE-2, DYN-CREATE-18, DYN-DLQ-1 |
 | acked, event abandoned, no callback | `dynamic_provision_abandoned` | a request refused or undone | DYN-CREATE-6, DYN-CREATE-26 |
 | acked, ledger row left live | `dynamic_instance_keyed_destroy_failed`, `dynamic_instance_teardown_contended`, or a plain error | teardown could not prove the instance gone | DYN-DESTROY-7, DYN-DESTROY-9, DYN-DESTROY-10, DYN-DESTROY-14 |

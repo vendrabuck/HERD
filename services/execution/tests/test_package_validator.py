@@ -13,13 +13,16 @@ the internal route (auth wording, unsupported connection type, report shape).
 import base64
 import io
 import json
+import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from app.config import settings
 from app.main import app
+from app.services import driver_structure
 from app.services.package_validator import (
     KEYED_DESTROY_STEP,
     PackageDecodeError,
@@ -509,7 +512,32 @@ def test_corrupt_archive_reports_extraction_failure():
     garbage = base64.b64encode(b"this is not a zip archive").decode()
     report = run(garbage)
     assert report["valid"] is False
-    assert report["structural"]["errors"][0].startswith("Failed to extract package")
+    assert report["structural"]["errors"] == ["Failed to extract package: BadZipFile"]
+
+
+def test_extraction_failure_reports_the_class_name_only(caplog):
+    """A tar filter error's text carries a path on the execution host; the
+    report keeps only the class name and the text goes to the log (issue #1180).
+    Before, the report read `Failed to extract package: '../escape.py' would be
+    extracted to '/tmp/escape.py', which is outside the destination`."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        data = b"x = 1\n"
+        info = tarfile.TarInfo("../escape.py")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    package_b64 = base64.b64encode(buf.getvalue()).decode()
+
+    with caplog.at_level("WARNING"):
+        report = validate_package(package_b64, "package.tar.gz", "Hypervisor")
+
+    assert report["valid"] is False
+    assert report["structural"]["errors"] == ["Failed to extract package: OutsideDestinationError"]
+    serialized = json.dumps(report)
+    assert tempfile.gettempdir() not in serialized
+    assert "escape.py" not in serialized
+    leaked = [r.getMessage() for r in caplog.records if "escape.py" in r.getMessage()]
+    assert leaked and tempfile.gettempdir() in leaked[0]
 
 
 def test_no_temp_dirs_left_behind():
@@ -620,3 +648,48 @@ async def test_route_returns_red_report_not_error_for_broken_package(client):
     assert (
         "Driver class is missing required method: create_instance" in (data["structural"]["errors"])
     )
+
+
+# --- driver.py is read once, as bytes, and both sections judge that one parse (#1179) ---
+
+LATIN1_DRIVER = ("# -*- coding: latin-1 -*-\nLABEL = '\xe9'\n" + GOOD_DRIVER).encode("latin-1")
+
+
+def _package_with_driver_bytes(driver_bytes: bytes) -> str:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("driver.py", driver_bytes)
+        zf.writestr("driver_metadata.json", json.dumps(GOOD_METADATA))
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def test_a_coding_cookie_is_honored_by_both_sections():
+    """Before #1179 the structural section read bytes (cookie honored) while the
+    policy section read UTF-8 text, so this package passed structural and failed
+    policy with `driver.py: failed to parse: 'utf-8' codec can't decode`."""
+    report = run(_package_with_driver_bytes(LATIN1_DRIVER))
+    assert report["structural"] == {"passed": True, "errors": []}
+    assert report["policy"] == {"passed": True, "errors": []}
+
+
+def test_a_non_utf8_byte_without_a_cookie_fails_both_sections():
+    report = run(_package_with_driver_bytes(LATIN1_DRIVER.replace(b"latin-1", b"utf-8")))
+    assert report["valid"] is False
+    assert len(report["structural"]["errors"]) == 1
+    assert report["structural"]["errors"][0].startswith("driver.py failed to parse:")
+    assert len(report["policy"]["errors"]) == 1
+    assert report["policy"]["errors"][0].startswith("driver.py: failed to parse:")
+
+
+def test_driver_py_is_parsed_once_per_validation():
+    parsed_names: list[str] = []
+    real_parse = driver_structure._parse_source
+
+    def counting_parse(source, filename):
+        parsed_names.append(filename)
+        return real_parse(source, filename)
+
+    with patch.object(driver_structure, "_parse_source", side_effect=counting_parse):
+        report = run(good_package_b64(**{"helper.py": "VALUE = 1\n"}))
+    assert report["valid"] is True
+    assert sorted(parsed_names) == ["driver.py", "helper.py"]
