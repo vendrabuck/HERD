@@ -504,6 +504,7 @@ The execution service consumes `herd.reservations.*` events from NATS JetStream.
 
 - Check execution service logs for consumer errors.
 - A poison message (invalid JSON, or JSON that is not an object) lands on the DLQ subject `herd.reservations.dlq.execution`; inspect with the `nats` CLI (see [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq)).
+- A failure no retry can change (for example a dynamic recipe whose template, hypervisor, or secret is missing, or whose package fails the load's checks) goes to the same DLQ on its first delivery, logged as `nats_dlq_permanent`.
 - A transient handler failure gets NAK'd with an explicit delay from the `NATS_NAK_BACKOFF_SECONDS` schedule (issue #895; `1,5,15,60,120` seconds by default) and retried up to `max_deliver=5`. After that it also goes to DLQ.
 - A log line with `"action": "nats_event_unverified"` means the event was acked WITHOUT running the handler: execution's consumer corroborates `reservation.created`/`.updated`/`.cancelled`/`.completed`/`.failed`/`.wiring_changed` against reservations' own status for the row before acting on it (see ARCHITECTURE.md's Event-driven flows section), and this event's claim did not match. This is the expected, correct outcome for an event whose reservation moved on (or never existed) before the message was processed, not a bug; the log line's `reported_status` names what reservations actually had on file.
 
@@ -681,7 +682,7 @@ Actions page, not just the local `<tempdir>/herd-e2e-artifacts` default.
 - **Per service shell**: `make shell-<service>` (auth, inventory, reservations, cabling, acl, execution, user-profile, notifications, ai-orchestrator).
 - **Structured fields to grep for**:
   - `action=reservation_create` / `reservation_provision_failed` (reservations)
-  - `action=nats_poison_message` / `nats_dlq_exhausted` / `nats_message_nak` (execution, notifications)
+  - `action=nats_poison_message` / `nats_dlq_exhausted` / `nats_message_nak` (execution, notifications); `nats_dlq_permanent` (execution)
   - `action=notification_delivered` / `notification_opted_out` / `prefs_fetch_failed` (notifications)
   - `action=device_group_create` / `device_group_add_devices` (inventory)
   - `method=POST path=/api/...` / `status_code=5xx` (middleware access log)
