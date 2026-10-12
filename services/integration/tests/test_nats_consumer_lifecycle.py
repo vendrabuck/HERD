@@ -63,6 +63,9 @@ class _FakeJetStream:
         self.added_streams = []
         self.subscribe_calls = []
         self.add_consumer_calls = []
+        # Every add_consumer and pull_subscribe as (operation, durable), in the
+        # order they happened. The two lists above cannot say which came first.
+        self.durable_calls = []
         self.published = []
         self._add_stream_error = add_stream_error
 
@@ -74,12 +77,17 @@ class _FakeJetStream:
     async def add_consumer(self, stream, config):
         # issue #895: herd_common.jetstream.ensure_consumer calls this to
         # create-or-update the durable BEFORE pull_subscribe binds to it.
-        self.add_consumer_calls.append({"stream": stream, "config": config})
+        # The durable is read NOW: the config object may be shared between durables.
+        self.add_consumer_calls.append(
+            {"stream": stream, "config": config, "durable": config.durable_name}
+        )
+        self.durable_calls.append(("add_consumer", config.durable_name))
 
     async def pull_subscribe(self, subject_pattern, durable, config):
         self.subscribe_calls.append(
             {"subject": subject_pattern, "durable": durable, "config": config}
         )
+        self.durable_calls.append(("pull_subscribe", durable))
         return self._subs.setdefault(subject_pattern, _StubPullSub([]))
 
     async def publish(self, subject, payload):
@@ -215,11 +223,25 @@ async def test_start_nats_consumer_wires_both_subscriptions():
             nats_consumer.HEALTH_SUBJECT_PATTERN,
         }
 
-        # issue #895: both durables are created-or-updated via add_consumer
-        # BEFORE pull_subscribe binds to them, with no `backoff` kwarg.
+        # issue #895: each durable is created-or-updated (add_consumer, through
+        # ensure_consumer) exactly once and BEFORE the one pull_subscribe that
+        # binds to it. pull_subscribe binds to whatever config an existing
+        # durable already has, so the reverse order would leave a stale config
+        # in force. Read from ONE ordered log: separate per-call lists hold
+        # the same entries whichever call came first.
+        for durable in (nats_consumer.NATS_DURABLE, nats_consumer.HEALTH_DURABLE):
+            assert [op for op, name in mock_js.durable_calls if name == durable] == [
+                "add_consumer",
+                "pull_subscribe",
+            ], mock_js.durable_calls
+        # Both durables are created-or-updated with no `backoff` kwarg.
         assert len(mock_js.add_consumer_calls) == 2
-        for call in mock_js.add_consumer_calls:
-            assert call["stream"] in {nats_consumer.NATS_STREAM, nats_consumer.HEALTH_STREAM}
+        # Each durable is created on ITS stream. A membership check over the two
+        # streams holds with them exchanged, so the pairing is asserted whole.
+        assert {c["durable"]: c["stream"] for c in mock_js.add_consumer_calls} == {
+            nats_consumer.NATS_DURABLE: nats_consumer.NATS_STREAM,
+            nats_consumer.HEALTH_DURABLE: nats_consumer.HEALTH_STREAM,
+        }
         consumer_config_calls = patched_modules["nats.js.api"].ConsumerConfig.call_args_list
         for call in consumer_config_calls:
             assert "backoff" not in call.kwargs

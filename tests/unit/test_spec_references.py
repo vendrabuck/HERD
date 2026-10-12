@@ -16,10 +16,25 @@ What counts as what (the rules docs/specs/README.md promises):
   bare names such as `inventory.md` (a specification not written yet) are not either.
 - Reference line: a line indented exactly two spaces, with no bullet, reading
   `Enforced in: ...` or `Pinned by: ...`. Its value is one or more
-  `` `path` (`symbol`, `symbol`) `` groups separated by `; `, all on that one line. Each
-  symbol must appear literally in that file, not as part of a longer identifier.
+  `` `path` (`symbol`, `symbol`) `` groups separated by `; `, all on that one line.
   `Pinned by` may instead start with `none`. A reference written as a nested bullet
   (`  - Enforced in:`) is the retired format and is flagged.
+- Enforced in symbol: it must appear literally in that file, not as part of a longer
+  identifier, and for a Python, TypeScript, or JavaScript file not only inside a
+  comment (a symbol may legitimately be a string such as an error detail, so string
+  and docstring contents count).
+- Pinned by test (issue #1158): the name must be a test DEFINED in that file in a
+  shape the runner collects, not a name that survives in a comment, a string, a
+  helper, or a longer title.
+  In a Python file, the file is named `test_*.py` or `*_test.py`, and the name is a
+  function whose name starts with `test`, defined at module level or as a method of
+  a module-level class whose name starts with `Test` and that defines no `__init__`
+  (pytest's default collection rules, which this repository does not override).
+  In a TypeScript or JavaScript file, the file is named `*.test.*` or `*.spec.*`,
+  and the name is the complete title (the first string argument) of an `it(...)`,
+  `test(...)`, or `describe(...)` call that starts its line, is not commented out,
+  and carries no `.skip` or `.todo` modifier.
+  In any other file type it is a literal match, as for Enforced in.
 - Rule: a list item that starts `- **<ID>.**` where <ID> is hyphen-separated words.
   The identifier must match `<AREA>-<TOPIC>-<N>` (RULE_ID), be unique within the
   document, and the item must carry exactly one Enforced in line and one Pinned by line,
@@ -35,6 +50,26 @@ What counts as what (the rules docs/specs/README.md promises):
   anchor. Its target, without any `#anchor`, must exist relative to the document.
 - Section: every `## ` heading of TEMPLATE.md appears verbatim in the specification.
 
+Limits. A cited test is checked for being defined, not for running or for what it
+asserts:
+
+- Python, still counted: a test under `@pytest.mark.skip`, a module `pytestmark`,
+  `__test__ = False`, `pytest.importorskip`, or a body that only skips; a test name
+  rebound later in the module. Not found, so not citable: a method of a nested
+  `Test` class, a test defined under a module-level `if` or `try`, a test assigned
+  from a factory, and a node id (`TestSvc::test_x`, `test_x[case]`).
+- Frontend, still counted: an `it` inside a `describe.skip(...)` block,
+  `it.skipIf(true)`, `it.runIf(false)`, and a test under `if (false) {`. The comment
+  remover is a scanner, not a parser: a regex literal holding `/*` or an unbalanced
+  quote, or an apostrophe in JSX text, can hide or reveal the text after it. Not
+  found, so not citable: `it.each` written as a tagged template or with more than
+  one level of nested parentheses, `it<Ctx>(`, an aliased import of `it`, a call
+  that does not start its line, a title built by concatenation, and a title written
+  with an escape other than an escaped quote or backslash. A title holding a
+  backtick cannot be written in a specification's code span at all.
+- Enforced in: a symbol only in a docstring or another string counts, and in a file
+  that is not Python, TypeScript, or JavaScript a symbol only in a comment counts.
+
 Every regular expression here is linear: no quantified group whose body can match the
 same text in more than one way. test_patterns_are_linear_on_adversarial_input holds
 them to that.
@@ -42,8 +77,12 @@ them to that.
 
 from __future__ import annotations
 
+import ast
+import io
 import re
 import time
+import tokenize
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -104,6 +143,16 @@ _ISSUE_NUMBER = re.compile(r"^[1-9][0-9]*$")
 # Link text excludes "[" so a run of "[" cannot make every start scan to the end.
 _LINK = re.compile(r"\[[^\[\]]*\]\(([^)\s]+)\)")
 _HEADING2 = re.compile(r"^## .+$", re.MULTILINE)
+# The opening of a vitest call up to its title: `it(`, `test.each([...])(`,
+# `describe.skip(`. Anchored at the start of a line so a commented-out call does not
+# match; group 1 holds the modifiers. The optional middle group is the argument list
+# of a modifier such as `.each(...)`, with one level of nested parentheses.
+_JS_TEST_CALL = re.compile(
+    r"^[ \t]*(?:it|test|describe)((?:\.\w+)*)(?:\((?:[^()]|\([^()]*\))*\))?\(\s*(?=[\"'`])",
+    re.MULTILINE,
+)
+_JS_SUFFIXES = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+_JS_NOT_RUN = {"skip", "todo"}
 
 PATTERNS = (
     _FENCE,
@@ -119,6 +168,7 @@ PATTERNS = (
     _ISSUE_NUMBER,
     _LINK,
     _HEADING2,
+    _JS_TEST_CALL,
 )
 
 
@@ -135,6 +185,142 @@ def _symbol_pattern(symbol: str) -> re.Pattern[str]:
     left = r"(?<!\w)" if re.match(r"\w", symbol[0]) else ""
     right = r"(?!\w)" if re.match(r"\w", symbol[-1]) else ""
     return re.compile(left + re.escape(symbol) + right)
+
+
+def is_python_test_file(name: str) -> bool:
+    """pytest's default `python_files`: `test_*.py` or `*_test.py`."""
+    return name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
+
+
+def is_js_test_file(name: str) -> bool:
+    """vitest's default include: `*.test.*` or `*.spec.*`."""
+    parts = name.split(".")
+    return len(parts) >= 3 and parts[-2] in ("test", "spec")
+
+
+def python_without_comments(source: str) -> str:
+    """Python source with every comment cut out of the ORIGINAL text, every other
+    character where it was. The comments are located with `tokenize` and removed by
+    position; the tokens are never re-emitted, because `tokenize.untokenize` does
+    not reproduce its input (it rewrites `{{` inside an f-string, for one)."""
+    lines = source.split("\n")
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type == tokenize.COMMENT:
+            row, column = token.start
+            line = lines[row - 1]
+            lines[row - 1] = line[:column] + line[token.end[1] :]
+    return "\n".join(lines)
+
+
+def python_collected_tests(source: str) -> set[str]:
+    """The test functions pytest collects from a test module under its default
+    rules: a function whose name starts with `test`, at module level or as a method
+    of a module-level class whose name starts with `Test` and that has no
+    `__init__`. A helper, a fixture, a method of any other class, a function nested
+    in another, and a name in a comment or a string are not tests."""
+    functions = (ast.FunctionDef, ast.AsyncFunctionDef)
+    names: set[str] = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, functions) and node.name.startswith("test"):
+            names.add(node.name)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            members = [member for member in node.body if isinstance(member, functions)]
+            if not any(member.name == "__init__" for member in members):
+                names |= {m.name for m in members if m.name.startswith("test")}
+    return names
+
+
+def _js_string_end(source: str, start: int) -> int:
+    """Index just past the string literal that opens at `start`."""
+    quote, i = source[start], start + 1
+    while i < len(source) and source[i] != quote:
+        i += 2 if source[i] == "\\" else 1
+    return min(i + 1, len(source))
+
+
+def js_without_comments(source: str) -> str:
+    """TypeScript or JavaScript source with `//` and `/* */` comments blanked out,
+    line structure kept. String and template literals are skipped whole, so a `//`
+    in a URL or a `/*` in a glob is not a comment."""
+    out: list[str] = []
+    i = 0
+    while i < len(source):
+        ch, pair = source[i], source[i : i + 2]
+        if ch in "\"'`":
+            end = _js_string_end(source, i)
+            out.append(source[i:end])
+            i = end
+        elif pair == "//":
+            end = source.find("\n", i)
+            i = len(source) if end == -1 else end
+        elif pair == "/*":
+            end = source.find("*/", i + 2)
+            end = len(source) if end == -1 else end + 2
+            out.append("".join(c if c == "\n" else " " for c in source[i:end]))
+            i = end
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def js_test_titles(source: str) -> set[str]:
+    """Complete titles of the `it`, `test`, and `describe` calls a vitest file runs:
+    not commented out, and not `.skip` or `.todo`."""
+    code = js_without_comments(source)
+    titles: set[str] = set()
+    for match in _JS_TEST_CALL.finditer(code):
+        if _JS_NOT_RUN & set(match.group(1).split(".")):
+            continue
+        end = _js_string_end(code, match.end())
+        titles.add(re.sub(r"\\(.)", r"\1", code[match.end() + 1 : end - 1]))
+    return titles
+
+
+class _Source:
+    """One referenced file: the text an Enforced in symbol is searched in, and the
+    tests it holds (None for a file type with no notion of a test)."""
+
+    def __init__(self, path: Path):
+        # utf-8-sig drops a leading byte order mark, which Python source may carry.
+        content = path.read_text(encoding="utf-8-sig")
+        self.tests: set[str] | None = None
+        self.searchable = content
+        self.unreadable = False
+        if path.suffix == ".py":
+            try:
+                self.searchable = python_without_comments(content)
+                self.tests = python_collected_tests(content)
+            except (SyntaxError, tokenize.TokenError):
+                self.unreadable = True
+                self.tests = set()
+            if not is_python_test_file(path.name):
+                self.tests = set()
+        elif path.suffix in _JS_SUFFIXES:
+            self.searchable = js_without_comments(content)
+            self.tests = js_test_titles(content) if is_js_test_file(path.name) else set()
+
+    def problem(self, kind: str, symbol: str, path_token: str) -> str | None:
+        if self.unreadable:
+            return f"{kind}: {path_token} is not parseable Python"
+        if kind == "Pinned by" and self.tests is not None:
+            if symbol in self.tests:
+                return None
+            return f"Pinned by: `{symbol}` is not a test in {path_token}"
+        if _symbol_pattern(symbol).search(self.searchable):
+            return None
+        return f"{kind}: `{symbol}` does not appear in {path_token}"
+
+
+@lru_cache(maxsize=None)
+def _read_source(path: Path, modified: int, size: int) -> _Source:
+    """One parse per file per run; the stat values make a rewritten file a new key."""
+    return _Source(path)
+
+
+def _source(path: Path) -> _Source:
+    stat = path.stat()
+    return _read_source(path, stat.st_mtime_ns, stat.st_size)
 
 
 def _sections(text: str, level: str) -> dict[str, str]:
@@ -210,10 +396,10 @@ def check_references(text: str, repo_root: Path) -> list[str]:
             if not is_repo_path(path_token) or not source.is_file():
                 problems.append(f"{kind} names a file that does not exist: {path_token}")
                 continue
-            content = source.read_text(encoding="utf-8")
             for symbol in symbols:
-                if not _symbol_pattern(symbol).search(content):
-                    problems.append(f"{kind}: `{symbol}` does not appear in {path_token}")
+                problem = _source(source).problem(kind, symbol, path_token)
+                if problem:
+                    problems.append(problem)
     return problems
 
 
@@ -428,7 +614,7 @@ def test_checker_flags_a_symbol_missing_from_its_file(fake_repo: Path):
 def test_checker_flags_a_test_name_that_is_only_a_prefix(fake_repo: Path):
     (fake_repo / "tests" / "test_svc.py").write_text("def test_real_but_longer():\n    pass\n")
     assert _check(fake_repo, _spec()) == [
-        "Pinned by: `test_real` does not appear in tests/test_svc.py"
+        "Pinned by: `test_real` is not a test in tests/test_svc.py"
     ]
 
 
@@ -589,6 +775,219 @@ def test_checker_ignores_code_inside_fences(fake_repo: Path):
     assert _check(fake_repo, _spec(extra=extra)) == []
 
 
+# A cited test must exist as a test, and an enforcing symbol must be code (issue
+# #1158): one way of leaving the name in the file without the thing it names per case.
+
+NOT_A_PYTHON_TEST = {
+    "only in a comment": "# test_real was removed\ndef test_other():\n    pass\n",
+    "commented out": "# def test_real():\n#     pass\ndef test_other():\n    pass\n",
+    "only in a string": 'REMOVED = "test_real"\n\n\ndef test_other():\n    pass\n',
+    "only in a docstring": 'def test_other():\n    """Replaces test_real."""\n',
+    "only called": "def test_other():\n    test_real()\n",
+    "only imported": "from elsewhere import test_real\n\n\ndef test_other():\n    pass\n",
+    "nested in another function": "def helper():\n    def test_real():\n        pass\n",
+    "a longer name": "def test_real_but_longer():\n    pass\n",
+    "a private twin": "def _test_real():\n    pass\n",
+    "a method of a class pytest does not collect": (
+        "class SvcCases:\n    def test_real(self):\n        pass\n"
+    ),
+    "a method of a Test class with __init__": (
+        "class TestSvc:\n    def __init__(self):\n        pass\n\n"
+        "    def test_real(self):\n        pass\n"
+    ),
+    "a class of that name": "class test_real:\n    def test_x(self):\n        pass\n",
+    "a method of a nested class": (
+        "class TestOuter:\n    class TestInner:\n        def test_real(self):\n            pass\n"
+    ),
+    "defined under if False": "if False:\n    def test_real():\n        pass\n",
+}
+
+
+@pytest.mark.parametrize("spelling", sorted(NOT_A_PYTHON_TEST))
+def test_checker_flags_a_python_test_name_that_is_not_a_test(fake_repo: Path, spelling: str):
+    (fake_repo / "tests" / "test_svc.py").write_text(NOT_A_PYTHON_TEST[spelling])
+    assert _check(fake_repo, _spec()) == [
+        "Pinned by: `test_real` is not a test in tests/test_svc.py"
+    ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def test_real():\n    pass\n",
+        "async def test_real():\n    pass\n",
+        "class TestSvc:\n    def test_real(self):\n        pass\n",
+        "import pytest\n\n\n@pytest.mark.parametrize('x', [1])\ndef test_real(x):\n    pass\n",
+        "class TestSvc:\n    async def test_real(self):\n        pass\n",
+        "\ufeffdef test_real():\n    pass\n",
+        "def test_real():\n    return f'{{literal}} {1}'  # a comment\n",
+    ],
+)
+def test_checker_accepts_every_collectable_python_test(fake_repo: Path, source: str):
+    (fake_repo / "tests" / "test_svc.py").write_text(source)
+    assert _check(fake_repo, _spec()) == []
+
+
+@pytest.mark.parametrize(
+    ("path", "symbol"),
+    [
+        ("tests/helpers.py", "test_real"),
+        ("tests/conftest.py", "test_real"),
+        ("tests/test_svc.py", "make_device"),
+        ("tests/test_svc.py", "device"),
+    ],
+)
+def test_checker_flags_a_python_citation_pytest_does_not_collect(
+    fake_repo: Path, path: str, symbol: str
+):
+    """A function in a file pytest never collects, and a helper or a fixture in a
+    test file, exist and are not tests."""
+    source = (
+        "import pytest\n\n\ndef make_device():\n    pass\n\n\n"
+        "@pytest.fixture\ndef device():\n    pass\n\n\ndef test_real():\n    pass\n"
+    )
+    (fake_repo / path).write_text(source)
+    rule = GOOD_RULE.replace("`tests/test_svc.py` (`test_real`)", f"`{path}` (`{symbol}`)")
+    assert _check(fake_repo, _spec(rules=rule)) == [
+        f"Pinned by: `{symbol}` is not a test in {path}"
+    ]
+
+
+def test_checker_reports_a_python_file_it_cannot_parse(fake_repo: Path):
+    (fake_repo / "tests" / "test_svc.py").write_text("def test_real(:\n    pass\n")
+    assert _check(fake_repo, _spec()) == ["Pinned by: tests/test_svc.py is not parseable Python"]
+
+
+def test_comment_removal_leaves_every_other_character_in_place():
+    source = (
+        "x = f'{{a}} {b}'  # one\n"
+        "y = '# not a comment'\t# two\r\n"
+        "\x0cz = 1 \\\n    + 2  # three\n"
+        "# four"
+    )
+    assert python_without_comments(source) == (
+        "x = f'{{a}} {b}'  \ny = '# not a comment'\t\r\n\x0cz = 1 \\\n    + 2  \n"
+    )
+
+
+def test_comment_removal_keeps_every_token_of_a_real_module():
+    """The module whose f-string `{{` a token round trip rewrote: the stripped text
+    holds no comment and exactly the source's other tokens."""
+    path = REPO_ROOT / "services" / "ai-orchestrator" / "app" / "services" / "recipe_author.py"
+    source = path.read_text(encoding="utf-8")
+
+    def tokens(text: str) -> list[tuple[int, str]]:
+        skipped = (tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE)
+        return [
+            (token.type, token.string)
+            for token in tokenize.generate_tokens(io.StringIO(text).readline)
+            if token.type not in skipped
+        ]
+
+    stripped = python_without_comments(source)
+    assert "#" in source and tokens(stripped) == tokens(source)
+    assert not [
+        token
+        for token in tokenize.generate_tokens(io.StringIO(stripped).readline)
+        if token.type == tokenize.COMMENT
+    ]
+
+
+def test_checker_flags_an_enforcing_symbol_that_is_only_in_a_comment(fake_repo: Path):
+    (fake_repo / "services" / "svc" / "app.py").write_text(
+        "# real_symbol used to live here\ndef other():\n    pass  # real_symbol\n"
+    )
+    assert _check(fake_repo, _spec()) == [
+        "Enforced in: `real_symbol` does not appear in services/svc/app.py"
+    ]
+
+
+def test_checker_accepts_an_enforcing_symbol_that_is_a_string(fake_repo: Path):
+    (fake_repo / "services" / "svc" / "app.py").write_text('DETAIL = "real_symbol"  # the detail\n')
+    assert _check(fake_repo, _spec()) == []
+
+
+_TS_RULE = GOOD_RULE.replace(
+    "`tests/test_svc.py` (`test_real`)", "`frontend/src/x.test.tsx` (`shows the row`)"
+)
+
+
+def _check_ts(repo: Path, source: str) -> list[str]:
+    (repo / "frontend" / "src").mkdir(parents=True, exist_ok=True)
+    (repo / "frontend" / "src" / "x.test.tsx").write_text(source)
+    return _check(repo, _spec(rules=_TS_RULE))
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'it("shows the row", fn);\n',
+        "  it('shows the row', fn);\n",
+        "test(`shows the row`, fn);\n",
+        'describe("shows the row", fn);\n',
+        'it(\n  "shows the row",\n  fn,\n);\n',
+        'it.each([[1, (2)], [3, 4]])("shows the row", fn);\n',
+        'it.only("shows the row", fn);\n',
+        'const glob = "src/**/*.ts"; // a glob, not a comment\nit("shows the row", fn);\n',
+        'const url = "https://example.com/*";\nit("shows the row", fn);\n/* tail */\n',
+    ],
+)
+def test_checker_accepts_a_frontend_test_title_under_any_call_shape(fake_repo: Path, source: str):
+    assert _check_ts(fake_repo, source) == []
+
+
+def test_checker_matches_a_frontend_title_through_its_escapes(fake_repo: Path):
+    rule = _TS_RULE.replace("shows the row", "shows the row's name")
+    (fake_repo / "frontend" / "src").mkdir(parents=True)
+    (fake_repo / "frontend" / "src" / "x.test.tsx").write_text(
+        "it('shows the row\\'s name', fn);\n"
+    )
+    assert _check(fake_repo, _spec(rules=rule)) == []
+
+
+NOT_A_FRONTEND_TEST = {
+    "only in a line comment": '// shows the row\nit("other", fn);\n',
+    "commented out": '// it("shows the row", fn);\nit("other", fn);\n',
+    "commented out, indented": '  // it("shows the row", fn);\n',
+    "inside a block comment": '/*\nit("shows the row", fn);\n*/\nit("other", fn);\n',
+    "inside a one-line block comment": '/* it("shows the row", fn); */\n',
+    "skipped": 'it.skip("shows the row", fn);\n',
+    "a todo": 'it.todo("shows the row");\n',
+    "a skipped block": 'describe.skip("shows the row", fn);\n',
+    "a longer title": 'it("shows the row and its actions", fn);\n',
+    "a longer title, the cited text at the end": 'it("never shows the row", fn);\n',
+    "only a string": 'const title = "shows the row";\nit("other", fn);\n',
+    "xit": 'xit("shows the row", fn);\n',
+    "an expectation, not a title": (
+        'it("other", function () {\n  expect(t).toBe("shows the row");\n});\n'
+    ),
+}
+
+
+@pytest.mark.parametrize("spelling", sorted(NOT_A_FRONTEND_TEST))
+def test_checker_flags_a_frontend_title_that_is_not_a_running_test(fake_repo: Path, spelling: str):
+    assert _check_ts(fake_repo, NOT_A_FRONTEND_TEST[spelling]) == [
+        "Pinned by: `shows the row` is not a test in frontend/src/x.test.tsx"
+    ]
+
+
+def test_checker_flags_a_frontend_title_in_a_file_the_runner_does_not_collect(fake_repo: Path):
+    (fake_repo / "frontend" / "src").mkdir(parents=True)
+    (fake_repo / "frontend" / "src" / "helpers.tsx").write_text('it("shows the row", fn);\n')
+    rule = _TS_RULE.replace("x.test.tsx", "helpers.tsx")
+    assert _check(fake_repo, _spec(rules=rule)) == [
+        "Pinned by: `shows the row` is not a test in frontend/src/helpers.tsx"
+    ]
+
+
+def test_checker_keeps_the_literal_match_for_other_file_types(fake_repo: Path):
+    (fake_repo / "tests" / "cases.md").write_text("Case: shows the row\n")
+    rule = GOOD_RULE.replace(
+        "`tests/test_svc.py` (`test_real`)", "`tests/cases.md` (`shows the row`)"
+    )
+    assert _check(fake_repo, _spec(rules=rule)) == []
+
+
 # Every pattern stays linear. Each input is built to make a backtracking pattern
 # explode (long runs that almost match, then fail at the end); a linear pattern
 # finishes each in milliseconds.
@@ -610,6 +1009,10 @@ ADVERSARIAL = (
     "  Enforced in: " + "`p` (`s`); " * _N + "?",
     "services/" + "a/" * _N + " ",
     "## " + " " * _N,
+    "it(" * _N,
+    "it.each(" + "(a)" * _N,
+    "it(x\n" * _N,
+    "it" + ".a" * _N + "(",
 )
 
 
