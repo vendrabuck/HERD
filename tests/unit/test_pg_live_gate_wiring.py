@@ -11,13 +11,47 @@ place these suites execute with HERD_TEST_PG_REQUIRED=1, so membership in that
 recipe is the thing worth pinning.
 
 Membership means the BEHAVIOR, not the file name appearing somewhere near the
-target (issue #1158). A suite counts only when the recipe holds a pytest command
-that names the file, runs from the suite's own service directory, carries
-HERD_TEST_PG_REQUIRED=1 on that command, selects nothing narrower than the whole
-file, and sits where its failure fails the recipe. A name in a comment (after the
-recipe, between its lines, or on a commented-out line), in an `echo`, or on a
-command whose status is dropped does not count; the detector tests below feed each
-of those spellings to the same scan the real-tree tests use.
+target (issue #1158). A suite counts only when the recipe holds a command for which
+ALL of this is true:
+
+- it is a pytest invocation: `pytest`, `uv run pytest`, `python -m pytest`, or
+  `uv run python -m pytest`, optionally behind `env [-u NAME] [NAME=value]` or
+  `timeout <duration>`;
+- it names the suite's file, and runs in the suite's own service directory
+  (`services/<svc>`, reached by `cd` in the same shell or subshell);
+- HERD_TEST_PG_REQUIRED=1 is assigned on that command (or by its `env` wrapper).
+  An `export` earlier in the line is NOT read: such a recipe is refused;
+- every other argument is on a short allowlist of options that cannot narrow or
+  skip a run (`-v -q -x -s -l` in any cluster, `-r<chars>`, `--tb`, `--durations`,
+  `--durations-min`, `--maxfail`, `--color`, `-W`, `-p no:<plugin>`,
+  `--strict-markers`, `--strict-config`). Anything else is refused, which covers
+  `-k`, `-m`, `--collect-only`, `--deselect`, `-o`, a node id, and every clustered
+  or abbreviated spelling of them without listing them;
+- PYTEST_ADDOPTS appears nowhere in the recipe;
+- its failure fails the recipe: no `;`, `||`, `|`, or `&` after it at any nesting
+  level, it is not the right-hand side of `||` or `|`, and the line has no `-`
+  prefix;
+- no `exit` runs ahead of it in its shell or subshell (an `exit` directly after
+  `||` is taken as an error exit and allowed).
+
+A name in a comment (after the recipe, between its lines, or on a commented-out
+line) or in an `echo` is not a command and does not count. The same reading is
+applied to `master` and `everything`: each must hold a `$(MAKE)`, `$(SUBMAKE)`, or
+`make` command for the phase with no option that stops it running or hides its
+failure. The detector tests below feed every one of these spellings to the scans
+the real-tree tests use.
+
+Limits. The shell is read by a small scanner, not a shell:
+
+- not seen: `trap 'exit 0' EXIT`, a later second definition of the target, `.IGNORE`,
+  `.ONESHELL`, a changed `.RECIPEPREFIX`, a shell function that is defined and never
+  called, a negated group such as `! (false && (...))`, a command behind `false &&`,
+  and anything inside an `if` or loop whose condition is false;
+- read conservatively (refused though it may be sound): an `export` of the required
+  variable, an `exit` inside a `{ ...; }` group, a backtick substitution holding a
+  pipe, `uv run` with options ahead of `pytest`, a redirect, any pytest option
+  outside the allowlist, and, for the gates, the phase listed as a prerequisite of
+  `master` or `everything` instead of called in its recipe.
 """
 
 from __future__ import annotations
@@ -46,17 +80,19 @@ _TWO_CHAR_OPERATORS = ("&&", "||", ";;", ">>", "<<", ">&", "<&", "&>", "|&")
 # do not end the list the compound sits in.
 _COMPOUND_OPEN = {"if", "for", "while", "until", "case"}
 _COMPOUND_CLOSE = {"fi", "done", "esac"}
-# pytest options that select less than the whole file, or run nothing.
-_NOT_A_FULL_RUN = (
-    "--collect-only",
-    "--co",
-    "--setup-only",
-    "--setup-plan",
-    "--deselect",
-    "--ignore",
-    "-k",
-    "-m",
+# pytest arguments that cannot narrow or skip a run. Everything else is refused, so a
+# narrowing option needs no entry here under any spelling.
+_HARMLESS_FLAG_CLUSTER = re.compile(r"-[vqxsl]+")
+_HARMLESS_ATTACHED = re.compile(
+    r"-r[A-Za-z]+|-W.+|-pno:.+|--(?:tb|durations|durations-min|maxfail|color)=.+"
 )
+_HARMLESS_LONG = {"--strict-markers", "--strict-config"}
+# Options whose value is the next word.
+_HARMLESS_WITH_VALUE = {"--tb", "--durations", "--durations-min", "--maxfail", "--color", "-W"}
+_DURATION = re.compile(r"\d+(?:\.\d+)?[smhd]?")
+# make options that do not stop a sub-make running its target or hide its failure.
+_HARMLESS_MAKE_OPTION = re.compile(r"--no-print-directory|-s|--silent|-k|--keep-going|-j\d*")
+_MAKE_TARGET_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
 
 
 def recipe_lines(makefile_text: str, target: str) -> list[str]:
@@ -187,24 +223,26 @@ def _failure_fails_the_line(tokens: list[tuple[str, bool]], start: int, end: int
 
 @dataclass(frozen=True)
 class ShellCommand:
-    """One simple command of a recipe line."""
+    """One simple command of a recipe line. `words` is empty for a bare assignment."""
 
     words: tuple[str, ...]
     env: tuple[tuple[str, str], ...]
     cwd: str
     failure_fails_the_recipe: bool
+    after_an_exit: bool
 
 
 def recipe_commands(makefile_text: str, target: str) -> list[ShellCommand]:
-    """Every simple command a target's recipe runs, with the directory its
-    subshell changed into, the variables assigned on the command itself, and
-    whether its failure fails the recipe. Each logical line is its own shell."""
+    """Every simple command a target's recipe holds, with the directory its
+    subshell changed into, the variables assigned on the command itself, whether
+    its failure fails the recipe, and whether an `exit` runs ahead of it in its
+    shell or subshell. Each logical line is its own shell."""
     commands: list[ShellCommand] = []
     for logical in recipe_lines(makefile_text, target):
         prefix = re.match(r"[@+\-\s]*", logical).group()
         text = _MAKE_VARIABLE.sub(r"${\1}", logical[len(prefix) :]).replace("$$", "$")
         tokens = _shell_tokens(text)
-        cwd = [""]
+        cwd, exited = [""], [False]
         start = 0
         for index in range(len(tokens) + 1):
             if index < len(tokens) and not tokens[index][1]:
@@ -215,7 +253,7 @@ def recipe_commands(makefile_text: str, target: str) -> list[ShellCommand]:
                 env.append(_ASSIGNMENT.match(words.pop(0)).groups())
             if words[:1] == ["cd"] and len(words) > 1:
                 cwd[-1] = posixpath.normpath(posixpath.join(cwd[-1], words[1]))
-            if words:
+            if words or env:
                 commands.append(
                     ShellCommand(
                         words=tuple(words),
@@ -223,27 +261,87 @@ def recipe_commands(makefile_text: str, target: str) -> list[ShellCommand]:
                         cwd=cwd[-1],
                         failure_fails_the_recipe="-" not in prefix
                         and _failure_fails_the_line(tokens, start, index),
+                        after_an_exit=exited[-1],
                     )
                 )
+            if words[:1] == ["exit"] and not (start > 0 and tokens[start - 1][0] == "||"):
+                exited[-1] = True
             if index < len(tokens):
                 if tokens[index][0] == "(":
                     cwd.append(cwd[-1])
+                    exited.append(exited[-1])
                 elif tokens[index][0] == ")" and len(cwd) > 1:
                     cwd.pop()
+                    exited.pop()
             start = index + 1
     return commands
 
 
-def _pytest_arguments(words: tuple[str, ...]) -> tuple[str, ...] | None:
-    """The arguments of a pytest invocation, or None when the command is not one
-    (an `echo` that mentions pytest is not)."""
-    if words[:1] == ("pytest",):
-        return words[1:]
-    if words[:2] == ("uv", "run") and "pytest" in words[2:]:
-        return words[words.index("pytest", 2) + 1 :]
-    if words[:1] in (("python",), ("python3",)) and words[1:3] == ("-m", "pytest"):
-        return words[3:]
+def _pytest_invocation(command: ShellCommand) -> tuple[dict[str, str], tuple[str, ...]] | None:
+    """(the variables pytest is started with, pytest's arguments) for a command that
+    runs pytest, or None when it does not (an `echo` that mentions pytest does not).
+
+    A leading `env` or `timeout <duration>` wrapper is read through: `env -u NAME`
+    and `env -i` remove variables, `env NAME=value` adds one. Any other wrapper, and
+    `uv run` with anything between `run` and `pytest`, is not recognized."""
+    env = dict(command.env)
+    words = list(command.words)
+    while words[:1] in (["env"], ["timeout"]):
+        if words.pop(0) == "timeout":
+            if not words or not _DURATION.fullmatch(words.pop(0)):
+                return None
+            continue
+        while words:
+            if words[0] in ("-i", "-", "--ignore-environment"):
+                env.clear()
+                words.pop(0)
+            elif words[0] == "-u" and len(words) > 1:
+                env.pop(words[1], None)
+                del words[:2]
+            elif _ASSIGNMENT.match(words[0]):
+                name, value = _ASSIGNMENT.match(words.pop(0)).groups()
+                env[name] = value
+            else:
+                break
+    for runner in (
+        ["pytest"],
+        ["uv", "run", "pytest"],
+        ["python", "-m", "pytest"],
+        ["python3", "-m", "pytest"],
+        ["uv", "run", "python", "-m", "pytest"],
+    ):
+        if words[: len(runner)] == runner:
+            return env, tuple(words[len(runner) :])
     return None
+
+
+def _split_pytest_arguments(arguments: tuple[str, ...]) -> tuple[list[str], list[str]]:
+    """(the test files named, every argument that is neither a plain file nor on the
+    allowlist of options that cannot narrow or skip a run)."""
+    files: list[str] = []
+    refused: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if not argument.startswith("-"):
+            if argument.split("::")[0].endswith(".py"):
+                files.append(argument.split("::")[0])
+            if not argument.endswith(".py"):
+                refused.append(argument)
+        elif argument in _HARMLESS_WITH_VALUE and index + 1 < len(arguments):
+            index += 1
+        elif argument == "-p" and arguments[index + 1 : index + 2][:1]:
+            index += 1
+            if not arguments[index].startswith("no:"):
+                refused.append(f"-p {arguments[index]}")
+        elif not (
+            argument in _HARMLESS_LONG
+            or _HARMLESS_FLAG_CLUSTER.fullmatch(argument)
+            or _HARMLESS_ATTACHED.fullmatch(argument)
+        ):
+            refused.append(argument)
+        index += 1
+    return files, refused
 
 
 @dataclass(frozen=True)
@@ -257,34 +355,41 @@ class GateRun:
 def gate_runs(makefile_text: str) -> list[GateRun]:
     """Every pytest command in the gate recipe that names a `.py` file, with the
     repo-relative path of each file (resolved against the directory the command
-    runs in) and the reasons, if any, it is not a hard-required full run whose
-    failure fails the gate."""
+    runs in) and the reasons, if any, it is not a hard-required run of the whole
+    file, from the suite's service directory, whose failure fails the gate."""
+    commands = recipe_commands(makefile_text, GATE_TARGET)
+    addopts = any(
+        word.split("=")[0] == "PYTEST_ADDOPTS"
+        for command in commands
+        for word in (*command.words, *(name for name, _ in command.env))
+    )
     runs: list[GateRun] = []
-    for command in recipe_commands(makefile_text, GATE_TARGET):
-        arguments = _pytest_arguments(command.words)
-        if arguments is None:
+    for command in commands:
+        invocation = _pytest_invocation(command)
+        if invocation is None:
             continue
-        files = [a for a in arguments if not a.startswith("-") and a.split("::")[0].endswith(".py")]
+        env, arguments = invocation
+        files, refused = _split_pytest_arguments(arguments)
         if not files:
             continue
+        suites = tuple(posixpath.normpath(posixpath.join(command.cwd, f)) for f in files)
         problems = []
-        if dict(command.env).get("HERD_TEST_PG_REQUIRED") != "1":
+        if env.get("HERD_TEST_PG_REQUIRED") != "1":
             problems.append("HERD_TEST_PG_REQUIRED=1 is not set on the command")
         if not command.failure_fails_the_recipe:
             problems.append("its failure does not fail the recipe")
-        narrowing = [
-            a for a in arguments if a.split("=")[0] in _NOT_A_FULL_RUN or ("::" in a and a in files)
-        ]
-        if narrowing:
-            problems.append(f"it does not run the whole file ({' '.join(narrowing)})")
-        runs.append(
-            GateRun(
-                suites=tuple(
-                    posixpath.normpath(posixpath.join(command.cwd, f.split("::")[0])) for f in files
-                ),
-                problems=tuple(problems),
+        if command.after_an_exit:
+            problems.append("an exit runs ahead of it")
+        if refused:
+            problems.append(
+                f"an argument that may narrow or skip the run ({' '.join(refused)}); only "
+                "the file and options that cannot do that are accepted"
             )
-        )
+        if addopts:
+            problems.append("PYTEST_ADDOPTS is set in the recipe")
+        if any(posixpath.dirname(posixpath.dirname(suite)) != command.cwd for suite in suites):
+            problems.append("it does not run in the suite's service directory")
+        runs.append(GateRun(suites=suites, problems=tuple(problems)))
     return runs
 
 
@@ -293,18 +398,36 @@ def soundly_run_suites(makefile_text: str) -> set[str]:
     return {suite for run in gate_runs(makefile_text) if not run.problems for suite in run.suites}
 
 
+def _runs_the_phase(command: ShellCommand) -> bool:
+    """Whether a command is a sub-make of the gate phase that really runs it and
+    whose failure fails the gate: `$(MAKE)`, `$(SUBMAKE)` (the Makefile's alias for
+    it), or `make`, then only targets, `NAME=value`, `-C <dir>`, and options that
+    neither stop the run nor hide its failure. `-n`, `-q`, `-t`, `-i`, `-o` and their
+    long forms are therefore refused without being listed."""
+    words = list(command.words)
+    if words[:1] not in (["${MAKE}"], ["${SUBMAKE}"], ["make"]) or GATE_TARGET not in words:
+        return False
+    rest = words[1:]
+    while rest:
+        word = rest.pop(0)
+        if word == "-C" and rest:
+            rest.pop(0)
+        elif not (
+            _HARMLESS_MAKE_OPTION.fullmatch(word)
+            or _ASSIGNMENT.match(word)
+            or _MAKE_TARGET_WORD.fullmatch(word)
+        ):
+            return False
+    return command.failure_fails_the_recipe and not command.after_an_exit
+
+
 def gates_that_skip_the_phase(makefile_text: str) -> list[str]:
-    """The gate targets whose recipe holds no `$(MAKE) _gate-pg-live-tests` command
-    whose failure fails the gate."""
+    """The gate targets whose recipe holds no sub-make of `_gate-pg-live-tests` that
+    runs it and whose failure fails the gate."""
     return [
         gate
         for gate in GATES
-        if not any(
-            command.words[0] in ("${MAKE}", "make")
-            and GATE_TARGET in command.words[1:]
-            and command.failure_fails_the_recipe
-            for command in recipe_commands(makefile_text, gate)
-        )
+        if not any(_runs_the_phase(command) for command in recipe_commands(makefile_text, gate))
     ]
 
 
@@ -382,11 +505,27 @@ def test_scan_reads_a_sound_recipe():
     assert [run.problems for run in gate_runs(text)] == [(), ()]
 
 
-def test_scan_follows_cd_out_of_a_subshell_and_a_repo_root_path():
-    text = _makefile(
-        "\tHERD_TEST_PG_REQUIRED=1 uv run pytest services/a/tests/test_one_live_pg.py && \\\n"
-        "\t(cd services && cd b && HERD_TEST_PG_REQUIRED=1 pytest tests/test_two_live_pg.py)"
-    )
+SOUND_SPELLINGS = {
+    "two cd steps and a bare pytest": "(cd services && cd b && HERD_TEST_PG_REQUIRED=1 pytest "
+    "tests/test_two_live_pg.py)",
+    "env -u wrapper": "(cd services/b && HERD_TEST_PG_REQUIRED=1 env -u VIRTUAL_ENV uv run "
+    "pytest tests/test_two_live_pg.py -v)",
+    "the variable given by the env wrapper": "(cd services/b && env HERD_TEST_PG_REQUIRED=1 "
+    "uv run pytest tests/test_two_live_pg.py -v)",
+    "timeout wrapper": "(cd services/b && HERD_TEST_PG_REQUIRED=1 timeout 900 uv run pytest "
+    "tests/test_two_live_pg.py -v)",
+    "python -m pytest": "(cd services/b && HERD_TEST_PG_REQUIRED=1 uv run python -m pytest "
+    "tests/test_two_live_pg.py)",
+    "options that cannot narrow the run": "(cd services/b && HERD_TEST_PG_REQUIRED=1 uv run "
+    "pytest tests/test_two_live_pg.py -vv -x -rA --tb=short -p no:cacheprovider "
+    "--durations=5 -W error --maxfail 1 --strict-markers)",
+}
+
+
+@pytest.mark.parametrize("spelling", sorted(SOUND_SPELLINGS))
+def test_scan_accepts_every_sound_spelling_of_a_run(spelling: str):
+    text = _makefile(_SETUP + _RUN_ONE + " && \\\n\t" + SOUND_SPELLINGS[spelling])
+    assert [run.problems for run in gate_runs(text)] == [(), ()], spelling
     assert soundly_run_suites(text) == {ONE, TWO}
 
 
@@ -468,7 +607,62 @@ FALSE_PASSES = {
     "a longer file name that contains the suite's": _makefile(
         _ONLY_ONE + " && \\\n" + _RUN_TWO.replace("tests/test_two", "tests/not_test_two")
     ),
+    "named by a repo-root path, not run in its service directory": _makefile(
+        _ONLY_ONE + " && \\\n"
+        "\tHERD_TEST_PG_REQUIRED=1 uv run pytest services/b/tests/test_two_live_pg.py -v"
+    ),
+    "an exit ahead of it in its subshell": _makefile(
+        _ONLY_ONE + " && \\\n" + _RUN_TWO.replace("cd services/b &&", "cd services/b && exit 0 &&")
+    ),
+    "the variable cleared by env -i": _makefile(
+        _ONLY_ONE + " && \\\n" + _RUN_TWO.replace("uv run pytest", "env -i uv run pytest")
+    ),
+    "the variable unset by env -u": _makefile(
+        _ONLY_ONE
+        + " && \\\n"
+        + _RUN_TWO.replace("uv run pytest", "env -u HERD_TEST_PG_REQUIRED uv run pytest")
+    ),
+    "uv run of an echo": _makefile(
+        _ONLY_ONE + " && \\\n" + _RUN_TWO.replace("uv run pytest", "uv run echo pytest")
+    ),
+    "PYTEST_ADDOPTS on the command": _makefile(
+        _RUN_ONE.replace("\t(", "\t@(", 1)
+        + "\n"
+        + _RUN_TWO.replace(
+            "HERD_TEST_PG_REQUIRED=1", 'PYTEST_ADDOPTS="--co" HERD_TEST_PG_REQUIRED=1'
+        )
+    ),
 }
+# Every argument real pytest accepts that selects less than the file or runs nothing
+# (measured against pytest itself for issue #1158), in place of the trailing `-v`.
+for _arguments in (
+    "-vk test_x",
+    "-ktest_x",
+    "-qk test_x",
+    "-mslow",
+    "-vm slow",
+    "-m slow",
+    "--collectonly",
+    "--fixtures",
+    "--markers",
+    "--help",
+    "--version",
+    "--setup-only",
+    "--setup-plan",
+    "--deselect tests/test_two_live_pg.py::test_x",
+    "--ignore=tests/test_two_live_pg.py",
+    "--ignore-glob=*_live_pg.py",
+    "-o addopts=--co",
+    "-o python_functions=test_x",
+    "-p pytest_randomly",
+    "--lf",
+    "--sw",
+    "-c other.ini",
+    "tests/",
+):
+    FALSE_PASSES[f"pytest argument: {_arguments}"] = _makefile(
+        _ONLY_ONE + " && \\\n" + _RUN_TWO.replace(" -v)", f" {_arguments})")
+    )
 
 
 @pytest.mark.parametrize("spelling", sorted(FALSE_PASSES))
@@ -476,7 +670,39 @@ def test_scan_does_not_count_a_suite_that_is_named_but_not_run(spelling: str):
     text = FALSE_PASSES[spelling]
     assert "test_two_live_pg.py" in text, "the case must still name the suite"
     assert TWO not in soundly_run_suites(text), spelling
-    assert ONE in soundly_run_suites(text), "the case must break only the second suite"
+    if spelling != "PYTEST_ADDOPTS on the command":
+        assert ONE in soundly_run_suites(text), "the case must break only the second suite"
+
+
+def test_scan_accepts_an_error_exit_ahead_of_the_chain():
+    text = _makefile("\ttest -f .env || exit 1; \\\n" + _RUN_ONE + " && \\\n" + _RUN_TWO)
+    assert soundly_run_suites(text) == {ONE, TWO}
+
+
+@pytest.mark.parametrize(
+    "ahead",
+    [
+        "\texit 0; \\\n",
+        "\texport PYTEST_ADDOPTS=--co; \\\n",
+        '\tPYTEST_ADDOPTS="-k nothing"; export PYTEST_ADDOPTS; \\\n',
+    ],
+)
+def test_scan_counts_no_suite_behind_an_exit_or_a_recipe_wide_addopts(ahead: str):
+    text = _makefile(ahead + _RUN_ONE + " && \\\n" + _RUN_TWO)
+    assert soundly_run_suites(text) == set(), ahead
+    assert len(gate_runs(text)) == 2
+
+
+def test_scan_reads_the_required_variable_on_the_command_only():
+    """By decision: an `export` once for the line is a sound recipe the scan does not
+    read, so it is refused and the recipe must keep the variable on each command."""
+    text = _makefile(
+        "\texport HERD_TEST_PG_REQUIRED=1; \\\n"
+        + _RUN_ONE
+        + " && \\\n"
+        + _RUN_TWO.replace("HERD_TEST_PG_REQUIRED=1 ", "")
+    )
+    assert soundly_run_suites(text) == {ONE}
 
 
 def _gates(master_tail: str, everything_tail: str) -> str:
@@ -501,6 +727,21 @@ def test_gate_scan_accepts_the_call_as_the_last_link_and_before_an_if_block():
 
 
 @pytest.mark.parametrize(
+    "call",
+    [
+        "\t\t$(SUBMAKE) _gate-pg-live-tests",
+        "\t\t${MAKE} _gate-pg-live-tests",
+        "\t\tmake _gate-pg-live-tests",
+        "\t\t$(MAKE) -C . _gate-pg-live-tests",
+        "\t\t$(MAKE) _gate-pg-live-tests COMPOSE_PROJECT_NAME=$(GATE_PROJECT)",
+        "\t\t$(MAKE) --no-print-directory -k _gate-pg-live-tests",
+    ],
+)
+def test_gate_scan_accepts_every_spelling_of_a_real_call(call: str):
+    assert gates_that_skip_the_phase(_gates(call, call + _LOAD_TAIL)) == []
+
+
+@pytest.mark.parametrize(
     "broken",
     [
         "\t\t# $(MAKE) _gate-pg-live-tests",
@@ -508,6 +749,16 @@ def test_gate_scan_accepts_the_call_as_the_last_link_and_before_an_if_block():
         "\t\t$(MAKE) _gate-pg-live-tests || true",
         "\t\t$(MAKE) _gate-pg-live-tests; \\\n\t\ttrue",
         "\t\ttrue\n\n# $(MAKE) _gate-pg-live-tests runs after the stack is up",
+        "\t\ttrue\n\t-$(MAKE) _gate-pg-live-tests",
+        "\t\t-$(MAKE) _gate-pg-live-tests",
+        "\t\t$(MAKE) -n _gate-pg-live-tests",
+        "\t\t$(MAKE) --dry-run _gate-pg-live-tests",
+        "\t\t$(MAKE) -q _gate-pg-live-tests",
+        "\t\t$(MAKE) -t _gate-pg-live-tests",
+        "\t\t$(MAKE) -i _gate-pg-live-tests",
+        "\t\t$(MAKE) -o _gate-pg-live-tests _gate-pg-live-tests",
+        "\t\texit 0 && $(MAKE) _gate-pg-live-tests",
+        "\t\t$(OTHER) _gate-pg-live-tests",
     ],
 )
 def test_gate_scan_flags_a_gate_that_names_the_phase_without_running_it(broken: str):
