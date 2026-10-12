@@ -780,7 +780,7 @@ reaches a stack that keeps its broker state and no consumer drifts from the othe
   bound, so a changed consumer config reaches a durable that already exists on a kept
   store; the helper names the durable and fills the filter subject only when none is set. \
   Enforced in: `services/common/herd_common/jetstream.py` (`ensure_consumer`) \
-  Pinned by: `services/common/tests/test_jetstream.py` (`test_ensure_consumer_sets_name_durable_name_filter_subject_and_calls_add_consumer`, `test_ensure_consumer_does_not_overwrite_an_already_set_filter_subject`, `test_ensure_consumer_tolerates_a_config_double_missing_filter_subject_attrs`)
+  Pinned by: `services/common/tests/test_jetstream.py` (`test_ensure_consumer_sets_name_durable_name_filter_subject_and_calls_add_consumer`, `test_ensure_consumer_does_not_overwrite_an_already_set_filter_subject`, `test_ensure_consumer_tolerates_a_config_double_missing_filter_subject_attrs`); `services/execution/tests/test_nats_consumer_full.py` (`test_start_nats_consumer_success`); `services/notifications/tests/test_nats_consumer.py` (`test_start_nats_consumer_wires_both_subscriptions`); `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_start_nats_consumer_wires_both_subscriptions`)
 - **OPS-NATS-7.** No durable carries `backoff`; against a running stack all five durables
   report the configured `ack_wait` and no `backoff`. By decision; issue #895. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`start_nats_consumer`) \
