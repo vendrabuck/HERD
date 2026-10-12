@@ -1137,11 +1137,17 @@ is WIRE-DRIVER-7 in `provisioning-and-wiring.md`.
   (`Driver package has more than 10000 entries; nothing was extracted` or
   `Driver package declares more than 104857600 bytes uncompressed; nothing was extracted`),
   and tar headers are read one at a time so a member past a ceiling is never
-  decompressed. The package validator extracts through the same function. Any other
-  name, a corrupt archive, or an archive past a ceiling raises `DriverPackageError`
-  naming only the cause's class, and the directory is removed. \
-  Enforced in: `services/execution/app/services/driver_loader.py` (`extract_driver_package`, `_check_archive_limits`, `MAX_ARCHIVE_ENTRIES`, `MAX_EXTRACTED_BYTES`, `PackageLimitError`, `load_driver`) \
-  Pinned by: `services/execution/tests/test_driver_loader.py` (`test_extract_zip`, `test_extract_unsupported_format`); `services/execution/tests/test_driver_loader_advanced.py` (`test_extract_tar_gz`, `test_extract_tgz`); `services/execution/tests/test_driver_loader_security.py` (`test_zip_traversal_does_not_escape_destination`, `test_zip_absolute_path_entry_is_contained`, `test_zip_corrupt_archive_raises`, `test_tar_gz_corrupt_archive_raises`, `test_tar_gz_symlink_escape_is_blocked_by_data_filter`, `test_tar_gz_traversal_blocked_by_data_filter`, `test_extraction_ceilings_are_the_documented_constants`, `test_zip_declaring_more_than_the_byte_ceiling_is_refused_before_writing`, `test_tar_gz_declaring_more_than_the_byte_ceiling_is_refused_before_writing`, `test_zip_with_more_than_the_entry_ceiling_is_refused_before_writing`, `test_tar_gz_with_more_than_the_entry_ceiling_is_refused_before_writing`, `test_archive_exactly_at_both_ceilings_extracts`, `test_archive_one_byte_over_the_ceiling_is_refused`, `test_archive_one_entry_over_the_ceiling_is_refused`); `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_extraction_failure`, `test_load_driver_extraction_failure_sanitizes_foreign_text`, `test_load_driver_refuses_archive_over_the_entry_ceiling`)
+  decompressed. A tar is read through a stream that refuses any single read over
+  `MAX_TAR_READ_BYTES` (1 MiB), so a pax extended header or GNU long name or long link
+  declaring more, which tarfile would read whole before the member it describes can be
+  checked, raises `PackageLimitError`
+  (`Driver package has a tar header record over 1048576 bytes (a pax extended header or GNU long name); nothing was extracted`)
+  before it is read into memory (issue #1179). The package validator extracts through
+  the same function. Any other name, a corrupt archive, or an archive past a ceiling
+  raises `DriverPackageError` naming only the cause's class, and the directory is
+  removed. \
+  Enforced in: `services/execution/app/services/driver_loader.py` (`extract_driver_package`, `_check_archive_limits`, `_BoundedTarStream`, `MAX_ARCHIVE_ENTRIES`, `MAX_EXTRACTED_BYTES`, `MAX_TAR_READ_BYTES`, `PackageLimitError`, `load_driver`) \
+  Pinned by: `services/execution/tests/test_driver_loader.py` (`test_extract_zip`, `test_extract_unsupported_format`); `services/execution/tests/test_driver_loader_advanced.py` (`test_extract_tar_gz`, `test_extract_tgz`); `services/execution/tests/test_driver_loader_security.py` (`test_zip_traversal_does_not_escape_destination`, `test_zip_absolute_path_entry_is_contained`, `test_zip_corrupt_archive_raises`, `test_tar_gz_corrupt_archive_raises`, `test_tar_gz_symlink_escape_is_blocked_by_data_filter`, `test_tar_gz_traversal_blocked_by_data_filter`, `test_extraction_ceilings_are_the_documented_constants`, `test_zip_declaring_more_than_the_byte_ceiling_is_refused_before_writing`, `test_tar_gz_declaring_more_than_the_byte_ceiling_is_refused_before_writing`, `test_zip_with_more_than_the_entry_ceiling_is_refused_before_writing`, `test_tar_gz_with_more_than_the_entry_ceiling_is_refused_before_writing`, `test_archive_exactly_at_both_ceilings_extracts`, `test_archive_one_byte_over_the_ceiling_is_refused`, `test_archive_one_entry_over_the_ceiling_is_refused`, `test_tar_read_bound_is_the_documented_constant`, `test_an_oversized_tar_header_record_is_refused_before_it_is_read`, `test_a_pax_header_just_under_the_read_bound_extracts`, `test_a_well_formed_pax_header_just_over_the_read_bound_is_refused`, `test_long_member_names_still_extract`, `test_member_data_larger_than_the_read_bound_extracts`); `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_extraction_failure`, `test_load_driver_extraction_failure_sanitizes_foreign_text`, `test_load_driver_refuses_archive_over_the_entry_ceiling`)
 - **CFG-LOAD-4.** The extracted package must hold `driver.py` with a plain top-level
   `class Driver` statement that provides every method `REQUIRED_METHODS` lists for the
   template's connection type (an unknown connection type fails). `load_driver` checks
@@ -1150,21 +1156,31 @@ is WIRE-DRIVER-7 in `provisioning-and-wiring.md`.
   bound any other way (an assignment, an import, a class statement nested in an `if`,
   `try`, or function) fails with
   `driver.py must define Driver with a plain top-level class statement`; no `Driver` at
-  all fails with `driver.py must define a class named Driver`. A method counts when the
-  class body binds it (`def`, `async def`, an assignment, or an import), when it is
-  assigned onto `Driver` at module level, or when a base class that is itself a
-  top-level class statement in `driver.py` provides it (followed recursively). When a
-  method could come from code the parser cannot read (a base imported from another
-  module or written as an expression, a class decorator, a metaclass or other class
-  keyword, `setattr(Driver, ...)`), the method check passes and a missing method fails
-  the sandboxed call that needs it. Top-level code in `driver.py` first runs, in the
-  sandbox, at config-schema extraction (CFG-LOAD-5) or the first driver call, so an
-  import that raises fails that call rather than the load. A failure raises
-  `DriverPackageError` `Driver validation failed: <reasons>`, a parse error named by
-  class only (`Failed to load driver.py: SyntaxError`), and the directory is
-  removed. \
-  Enforced in: `services/execution/app/services/driver_structure.py` (`driver_structure_errors`, `REQUIRED_METHODS`, `DriverSourceError`); `services/execution/app/services/driver_loader.py` (`validate_driver`, `load_driver`) \
-  Pinned by: `services/execution/tests/test_driver_loader.py` (`test_validate_valid_l1_driver`, `test_validate_missing_driver_py`, `test_validate_missing_driver_class`, `test_validate_missing_methods`, `test_validate_unknown_connection_type`, `test_validate_syntax_error_driver`); `services/execution/tests/test_driver_loader_advanced.py` (`test_validate_management_driver`, `test_validate_l1_driver_against_l2_type`, `test_required_methods_dict_completeness`); `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_validation_failure`, `test_load_driver_validate_parse_failure_sanitizes_foreign_text`, `test_load_driver_never_runs_driver_code_in_process`); `services/execution/tests/test_driver_loader_security.py` (`test_validate_never_runs_driver_top_level_code`, `test_validate_reports_syntax_error_in_driver`); `services/execution/tests/test_driver_structure.py` (`test_driver_not_bound_by_a_top_level_class_statement_is_refused`, `test_methods_inherited_from_a_top_level_base_count`, `test_a_followed_base_that_lacks_a_method_still_reports_it`, `test_class_body_bindings_other_than_def_count`, `test_module_level_attribute_assignment_counts`, `test_methods_from_code_a_parser_cannot_read_are_not_refused`, `test_driver_never_runs_top_level_code`); `tests/unit/test_checked_in_drivers_structure.py` (`test_checked_in_driver_passes_the_shared_structural_check`)
+  all fails with `driver.py must define a class named Driver`. A method counts only
+  when a binding that could be callable provides it: in the class body a `def`, an
+  `async def`, a nested class, an import, or an assignment whose value is not a literal;
+  an assignment of such a value onto `Driver` at module level; or a base class that is
+  itself a top-level class statement in `driver.py` and provides it the same way
+  (followed recursively). An annotation with no value and an assignment of a literal
+  (`None`, a string, a number, a container, an f-string, a comprehension) provide
+  nothing, and a literal hides an inherited method; in the class body and the
+  module-level statements after the class, which run in order, a later `del` or literal
+  assignment removes an earlier binding (issue #1179). When a method could come from
+  code the parser cannot read (a base imported from another module or written as an
+  expression, a class decorator, a metaclass or other class keyword,
+  `setattr(Driver, ...)` anywhere in the file), the method check passes and a missing
+  method fails the sandboxed call that needs it. Top-level code in `driver.py` first
+  runs, in the sandbox, at config-schema extraction (CFG-LOAD-5) or the first driver
+  call, so an import that raises fails that call rather than the load. Every parse
+  failure (`PARSE_FAILURES`: a syntax error, a null byte or decode error, an unreadable
+  file, and the parser's own `RecursionError` or `MemoryError`) is the same permanent
+  failure (issue #1178). A failure raises `DriverPackageError`
+  `Driver validation failed: <reasons>`, a parse error named by class only
+  (`Failed to load driver.py: SyntaxError`), and the directory is removed; it is also
+  removed when a package check raises instead of returning errors, and that exception
+  reaches the caller unchanged. \
+  Enforced in: `services/execution/app/services/driver_structure.py` (`driver_structure_errors`, `parse_python_file`, `PARSE_FAILURES`, `REQUIRED_METHODS`, `DriverSourceError`); `services/execution/app/services/driver_loader.py` (`validate_driver`, `load_driver`) \
+  Pinned by: `services/execution/tests/test_driver_loader.py` (`test_validate_valid_l1_driver`, `test_validate_missing_driver_py`, `test_validate_missing_driver_class`, `test_validate_missing_methods`, `test_validate_unknown_connection_type`, `test_validate_syntax_error_driver`); `services/execution/tests/test_driver_loader_advanced.py` (`test_validate_management_driver`, `test_validate_l1_driver_against_l2_type`, `test_required_methods_dict_completeness`); `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_validation_failure`, `test_load_driver_validate_parse_failure_sanitizes_foreign_text`, `test_load_driver_never_runs_driver_code_in_process`, `test_load_driver_parser_crash_is_permanent_and_leaves_nothing`, `test_load_driver_three_parser_crash_loads_leave_no_directory`, `test_load_driver_removes_the_directory_when_a_package_check_raises`); `services/execution/tests/test_driver_load_sanitize_run.py` (`test_run_driver_action_parser_crash_stores_the_permanent_load_text`); `services/execution/tests/test_driver_loader_security.py` (`test_validate_never_runs_driver_top_level_code`, `test_validate_reports_syntax_error_in_driver`); `services/execution/tests/test_driver_structure.py` (`test_driver_not_bound_by_a_top_level_class_statement_is_refused`, `test_methods_inherited_from_a_top_level_base_count`, `test_a_followed_base_that_lacks_a_method_still_reports_it`, `test_class_body_bindings_other_than_def_count`, `test_module_level_attribute_assignment_counts`, `test_methods_from_code_a_parser_cannot_read_are_not_refused`, `test_driver_never_runs_top_level_code`, `test_a_parser_crash_is_a_parse_failure`, `test_parse_failures_name_every_class_the_parser_can_raise`, `test_each_parse_failure_class_becomes_a_driver_source_error`, `test_an_unrelated_error_is_not_relabelled_as_a_parse_failure`, `test_a_class_body_binding_that_is_never_callable_does_not_count`, `test_a_class_body_binding_that_could_be_callable_counts`, `test_a_literal_in_the_class_body_hides_an_inherited_method`, `test_a_del_in_the_class_body_exposes_the_inherited_method`, `test_a_module_level_statement_after_the_class_can_remove_a_method`, `test_a_module_level_literal_then_callable_counts`, `test_bindings_in_code_that_may_not_run_pass_by_decision`, `test_a_method_assigned_onto_a_followed_base_is_reported_missing`, `test_a_method_added_by_rebinding_the_class_is_reported_missing`, `test_a_method_assigned_only_inside_an_uncalled_function_counts`, `test_a_driver_py_that_parses_but_does_not_compile_passes`); `tests/unit/test_checked_in_drivers_structure.py` (`test_checked_in_driver_passes_the_shared_structural_check`)
 - **CFG-LOAD-5.** A good package's SHA256, directory, metadata, and published schema
   are written to the driver's cache row. With no row, the row is inserted with
   `ON CONFLICT (driver_id) DO NOTHING` and read back. A row for another SHA256, or whose
@@ -1275,16 +1291,22 @@ drafting loop (`ai-features.md`, AI-RECIPE-8).
   Pinned by: `services/execution/tests/test_package_validator.py` (`test_invalid_base64_raises_decode_error`, `test_size_cap_raises_decode_error`, `test_route_rejects_invalid_base64`)
 - **CFG-VAL-3.** The package is extracted into a temporary directory that is always
   removed and never cached; an extraction failure answers a failing report with
-  `Failed to extract package: <text>`. \
+  `Failed to extract package: <ClassName>`, the class name only, because a tar filter
+  error's text carries a path on the execution host; the text goes to the log message
+  (issue #1180). \
   Enforced in: `services/execution/app/services/package_validator.py` (`validate_package`) \
-  Pinned by: `services/execution/tests/test_package_validator.py` (`test_corrupt_archive_reports_extraction_failure`, `test_no_temp_dirs_left_behind`)
+  Pinned by: `services/execution/tests/test_package_validator.py` (`test_corrupt_archive_reports_extraction_failure`, `test_extraction_failure_reports_the_class_name_only`, `test_no_temp_dirs_left_behind`)
 - **CFG-VAL-4.** The structural section is checked by parsing, never importing, through
   the load path's own check (CFG-LOAD-4): `driver.py` exists, parses, and holds a plain
   top-level `class Driver` that provides every required Hypervisor method under that
   rule's terms, inherited methods included. A parse failure reports
-  `driver.py failed to parse: <parser message>`. \
-  Enforced in: `services/execution/app/services/package_validator.py` (`_structural_errors`); `services/execution/app/services/driver_structure.py` (`driver_structure_errors`) \
-  Pinned by: `services/execution/tests/test_package_validator.py` (`test_missing_driver_py_fails_structural`, `test_missing_required_method_fails_structural`, `test_unparseable_driver_py_fails_structural`, `test_missing_driver_class_fails_structural`, `test_driver_not_bound_by_a_top_level_class_fails_structural`, `test_methods_inherited_from_a_base_in_driver_py_pass_structural`)
+  `driver.py failed to parse: <parser message>`. Every `.py` file in the package is
+  read once, as bytes (a PEP 263 coding cookie is honored), and parsed once through
+  the load path's own reader (`parse_python_file`), and the structural and policy
+  sections both judge driver.py from that one parse, so they cannot disagree about
+  whether it parses (issue #1179). \
+  Enforced in: `services/execution/app/services/package_validator.py` (`_parse_python_files`, `_structural_errors`); `services/execution/app/services/driver_structure.py` (`driver_structure_errors`, `parse_python_file`) \
+  Pinned by: `services/execution/tests/test_package_validator.py` (`test_missing_driver_py_fails_structural`, `test_missing_required_method_fails_structural`, `test_unparseable_driver_py_fails_structural`, `test_missing_driver_class_fails_structural`, `test_driver_not_bound_by_a_top_level_class_fails_structural`, `test_methods_inherited_from_a_base_in_driver_py_pass_structural`, `test_a_coding_cookie_is_honored_by_both_sections`, `test_a_non_utf8_byte_without_a_cookie_fails_both_sections`, `test_driver_py_is_parsed_once_per_validation`)
 - **CFG-VAL-5.** The policy section requires `driver_metadata.json` to exist, parse to
   an object, and declare `supports_dry_run` true; forbids `_deps/` and
   `requirements.txt`; allows only absolute imports of the standard library, of modules
@@ -1450,8 +1472,26 @@ None recorded.
 - The load-time structural check cannot read a base class imported from another
   module, a class decorator, a metaclass, or `setattr(Driver, ...)`, so a method that
   could come from one of them is not refused at load; a missing method fails the
-  sandboxed call instead (CFG-LOAD-4).
-- The extraction ceilings are constants, not settings (CFG-LOAD-3).
+  sandboxed call instead (CFG-LOAD-4). A `setattr(Driver, ...)` call anywhere, even in
+  dead code, or any class decorator or class keyword turns the whole method check off,
+  in the package validator too, whose dry run still calls the five Hypervisor methods
+  (CFG-VAL-4).
+- A binding inside a conditional block, a `for` or `with` target, and a
+  `Driver.<name>` assignment inside a function count as provided whether or not that
+  code runs, and a `del` or literal assignment there removes nothing; a class with
+  more than one followed base gets a method when any base provides it, with no method
+  resolution order computed (the `driver_structure.py` module docstring) (CFG-LOAD-4).
+- The parse-based check refuses a method assigned onto a base class or added by
+  rebinding the class, which the import-based check it replaced accepted, and accepts
+  a method bound only in code that never runs, a decorated or `setattr` class whose
+  methods are missing, and a `driver.py` that parses but does not compile, which that
+  check refused ([DRIVERS.md](../DRIVERS.md), "Package structure") (CFG-LOAD-4).
+- The extraction ceilings and the tar read bound are constants, not settings
+  (CFG-LOAD-3).
+- A tar package is decompressed twice on a cache miss, once by the ceiling scan and
+  again by extraction, synchronously inside the async `load_driver`, so up to about
+  twice the 100 MiB ceiling of gunzip work blocks the event loop (the
+  `extract_driver_package` docstring) (CFG-LOAD-3).
 - The validator reports a raised step's message, which a driver run never stores (the
   `_validation_error_text` docstring) (CFG-VAL-8).
 - The published-schema lookup fails open to the registry (ADR 0002 and the
