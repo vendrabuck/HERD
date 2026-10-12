@@ -14,8 +14,22 @@ Every check is an AST scan of what the module DOES (issue #1158): the helper's
 name in a comment, a docstring, or an unused import is not a call, and two
 correct-looking assignment lines do not help a module that then hands the helper
 `NATS_HEARTBEAT_SECONDS * 2` or gives its durable `ack_wait=NATS_ACK_WAIT_SECONDS
-/ 4`. What stays out of reach of a static scan is whether the function that calls
-the helper is itself reached by the consumer loop; the service suites drive that.
+/ 4`. A name is followed to its value only when the scope that binds it (the
+function, else the module) binds it exactly once, by a plain assignment.
+
+Limits. The scan follows names inside one module; it does not execute anything:
+
+- not seen: whether the code is reached (a call under `if False`, in a function
+  nothing calls, or after a `return`); `settings` rebound to a local object, or its
+  attribute overwritten; a `ConsumerConfig` built with no `ack_wait` under an
+  assigned alias (`CC = ConsumerConfig`) or by a function in another module, when
+  the module sets `ack_wait` somewhere else; `setattr(config, "ack_wait", ...)`,
+  `config.__dict__[...] = ...`, `globals()[...] = ...`; a helper monkeypatched on
+  the shared module; a consumer reached with `getattr(js, "pull_subscribe")`;
+- read conservatively (refused though it may be sound): a constant imported from a
+  sibling module, a `ConsumerConfig` factory that takes `ack_wait` as a parameter,
+  and a cast such as `ack_wait=float(NATS_ACK_WAIT_SECONDS)`. The value must be the
+  setting itself, by decision: it is already validated where it is declared.
 """
 
 import ast
@@ -141,74 +155,122 @@ def test_no_pull_consumer_module_keeps_an_inline_heartbeat():
     assert not inline, f"pull consumer with its own heartbeat task: {inline}"
 
 
+_FUNCTION_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
 class _Module:
-    """Name resolution for one module, enough to follow a value back to the shared
-    helpers and to `settings.nats_ack_wait_seconds`."""
+    """Scope-aware name resolution for one module, enough to follow a value back to
+    the shared helpers and to `settings.nats_ack_wait_seconds`."""
 
     def __init__(self, source: str):
         self.tree = ast.parse(source)
-        # local name to the herd_common.jetstream name it was imported as
-        self.jetstream_names: dict[str, str] = {}
-        # local names bound to the herd_common.jetstream module itself
-        self.jetstream_modules: set[str] = set()
+        self.parent = {
+            child: node for node in ast.walk(self.tree) for child in ast.iter_child_nodes(node)
+        }
         self.consumer_config_names = {"ConsumerConfig"}
-        # every place a plain name is bound: assignments, defs, parameters, imports
-        self.bindings: dict[str, list[ast.AST]] = {}
+        self._scopes: dict[ast.AST, dict[str, list[ast.AST]]] = {}
+        # Names a function declares `global` and binds: these rebind the module's name.
+        self._global_rebinds: dict[str, list[ast.AST]] = {}
         for node in ast.walk(self.tree):
-            if isinstance(node, ast.ImportFrom):
+            if isinstance(node, _FUNCTION_SCOPES):
+                self._bindings(node)
+            elif isinstance(node, ast.ImportFrom):
                 for alias in node.names:
-                    local = alias.asname or alias.name
-                    self._bind(local, node)
-                    if node.module == JETSTREAM_MODULE:
-                        self.jetstream_names[local] = alias.name
-                    elif node.module == "herd_common" and alias.name == "jetstream":
-                        self.jetstream_modules.add(local)
                     if alias.name == "ConsumerConfig":
-                        self.consumer_config_names.add(local)
-            elif isinstance(node, ast.Import):
-                for alias in node.names:
-                    self._bind(alias.asname or alias.name.split(".")[0], node)
-                    if alias.name == JETSTREAM_MODULE and alias.asname:
-                        self.jetstream_modules.add(alias.asname)
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                self._bind(node.name, node)
-            elif isinstance(node, ast.arg):
-                self._bind(node.arg, node)
-            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                self._bind(node.id, node)
+                        self.consumer_config_names.add(alias.asname or alias.name)
 
-    def _bind(self, name: str, node: ast.AST) -> None:
-        self.bindings.setdefault(name, []).append(node)
+    def _bindings(self, scope: ast.AST) -> dict[str, list[ast.AST]]:
+        """Every binding of a plain name made directly in a scope (module, function,
+        or class body), not in a function or class nested inside it: assignments,
+        imports, defs, parameters, `except ... as`."""
+        if scope in self._scopes:
+            return self._scopes[scope]
+        found: dict[str, list[ast.AST]] = {}
+        declared_global: set[str] = set()
+        pending = list(ast.iter_child_nodes(scope))
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                found.setdefault(node.name, []).append(node)
+                continue
+            if isinstance(node, ast.Lambda):
+                continue
+            if isinstance(node, ast.Global):
+                declared_global.update(node.names)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    local = alias.asname or alias.name.split(".")[0]
+                    found.setdefault(local, []).append(node)
+            elif isinstance(node, ast.arg):
+                found.setdefault(node.arg, []).append(node)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                found.setdefault(node.name, []).append(node)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                found.setdefault(node.id, []).append(node)
+            pending.extend(ast.iter_child_nodes(node))
+        for name in declared_global:
+            self._global_rebinds.setdefault(name, []).extend(found.pop(name, []))
+        self._scopes[scope] = found
+        return found
+
+    def _lookup(self, name: str, at: ast.AST) -> list[ast.AST]:
+        """The bindings of `name` in the scope a use at `at` reads it from: the
+        nearest enclosing function that binds it, else the module (whose count
+        includes every `global` rebinding made inside a function)."""
+        scope = self.parent.get(at)
+        while scope is not None:
+            if isinstance(scope, _FUNCTION_SCOPES) and name in self._bindings(scope):
+                return self._bindings(scope)[name]
+            scope = self.parent.get(scope)
+        return self._bindings(self.tree).get(name, []) + self._global_rebinds.get(name, [])
+
+    def _single_assigned_value(self, name: ast.Name) -> ast.expr | None:
+        """The value of a name whose scope binds it exactly once, by a plain
+        single-target assignment; None for anything else (rebound, augmented,
+        unpacked, a parameter, an import)."""
+        bindings = self._lookup(name.id, name)
+        if len(bindings) != 1:
+            return None
+        statement = self.parent.get(bindings[0])
+        if isinstance(statement, ast.Assign) and statement.targets == [bindings[0]]:
+            return statement.value
+        if isinstance(statement, ast.AnnAssign) and statement.target is bindings[0]:
+            return statement.value
+        return None
 
     def shared_helper(self, func: ast.expr) -> str | None:
         """The herd_common.jetstream helper a call target is, or None. A local
-        name counts only while its import is its ONE binding: a module that also
-        defines or reassigns the name is calling its own code."""
-        if isinstance(func, ast.Name) and func.id in self.jetstream_names:
-            if len(self.bindings[func.id]) == 1:
-                return self.jetstream_names[func.id]
+        name counts only while its import is its ONE binding in the scope that
+        binds it: a module that also defines or reassigns the name is calling its
+        own code."""
+        if isinstance(func, ast.Name):
+            bindings = self._lookup(func.id, func)
+            if len(bindings) == 1 and isinstance(bindings[0], ast.ImportFrom):
+                if bindings[0].module == JETSTREAM_MODULE:
+                    return next(
+                        a.name for a in bindings[0].names if (a.asname or a.name) == func.id
+                    )
+            return None
         if isinstance(func, ast.Attribute):
             value = func.value
-            if isinstance(value, ast.Name) and value.id in self.jetstream_modules:
-                return func.attr
             if ast.unparse(value) == JETSTREAM_MODULE:
                 return func.attr
-        return None
-
-    def _single_assigned_value(self, name: str) -> ast.expr | None:
-        """The value of a name bound exactly once in the whole module, by a plain
-        single-target assignment; None for anything else (rebound, augmented,
-        unpacked, a parameter)."""
-        if len(self.bindings.get(name, [])) != 1:
-            return None
-        for node in ast.walk(self.tree):
-            if isinstance(node, ast.Assign) and len(node.targets) == 1:
-                target = node.targets[0]
-                if isinstance(target, ast.Name) and target.id == name:
-                    return node.value
-            elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                if isinstance(node.target, ast.Name) and node.target.id == name:
-                    return node.value
+            if isinstance(value, ast.Name):
+                bindings = self._lookup(value.id, value)
+                if len(bindings) != 1:
+                    return None
+                origin = bindings[0]
+                if isinstance(origin, ast.ImportFrom) and origin.module == "herd_common":
+                    if any(
+                        a.name == "jetstream" and (a.asname or a.name) == value.id
+                        for a in origin.names
+                    ):
+                        return func.attr
+                if isinstance(origin, ast.Import):
+                    if any(
+                        a.name == JETSTREAM_MODULE and a.asname == value.id for a in origin.names
+                    ):
+                        return func.attr
         return None
 
     def is_settings_ack_wait(self, expr: ast.expr, depth: int = 0) -> bool:
@@ -216,7 +278,7 @@ class _Module:
         if isinstance(expr, ast.Attribute):
             return ast.unparse(expr) == "settings.nats_ack_wait_seconds"
         if isinstance(expr, ast.Name) and depth < 4:
-            value = self._single_assigned_value(expr.id)
+            value = self._single_assigned_value(expr)
             return value is not None and self.is_settings_ack_wait(value, depth + 1)
         return False
 
@@ -231,12 +293,16 @@ class _Module:
                 and self.is_settings_ack_wait(expr.args[0])
             )
         if isinstance(expr, ast.Name) and depth < 4:
-            value = self._single_assigned_value(expr.id)
+            value = self._single_assigned_value(expr)
             return value is not None and self.is_shared_cadence(value, depth + 1)
         return False
 
 
 NO_SHARED_HEARTBEAT = "never calls herd_common.jetstream.process_batch_with_heartbeat"
+NO_ACK_WAIT = (
+    "sets no ack_wait anywhere, so nothing here gives the durable the configured "
+    "ack_wait the heartbeat is derived from"
+)
 
 
 def heartbeat_wiring_problems(source: str) -> list[str]:
@@ -248,11 +314,13 @@ def heartbeat_wiring_problems(source: str) -> list[str]:
       function of the same name is not that call.
     - The interval of every such call (third positional argument or `interval=`)
       must be `heartbeat_interval(...)` of `settings.nats_ack_wait_seconds`,
-      directly or through names assigned once. `X * 2`, `ACK_WAIT / 3`, a literal,
-      a reassigned name, or a local `heartbeat_interval` all fail.
-    - Every `ConsumerConfig(...)` must pass `ack_wait=`, and every `ack_wait`
-      the module sets (keyword, attribute, or dict key) must be
+      directly or through names their scope assigns once. `X * 2`, `ACK_WAIT / 3`,
+      a literal, a reassigned name, or a local `heartbeat_interval` all fail.
+    - The module must set `ack_wait` at least once. Every `ConsumerConfig(...)`
+      must pass `ack_wait=`, and every `ack_wait` the module SETS (a call keyword,
+      a `**{...}` literal, or an attribute assignment) must be
       `settings.nats_ack_wait_seconds`, directly or through a name assigned once.
+      Reading it (`config.ack_wait` in a log line or a comparison) is not setting it.
     """
     module = _Module(source)
     problems: list[str] = []
@@ -275,10 +343,16 @@ def heartbeat_wiring_problems(source: str) -> list[str]:
                 f"line {call.lineno}: the heartbeat interval is {shown}, not "
                 "heartbeat_interval(settings.nats_ack_wait_seconds)"
             )
+    sites = 0
     for node in ast.walk(module.tree):
         ack_wait_values: list[ast.expr | None] = []
         if isinstance(node, ast.Call):
             keywords = {k.arg: k.value for k in node.keywords}
+            splat = keywords.get(None)
+            if isinstance(splat, ast.Dict):
+                for key, value in zip(splat.keys, splat.values):
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        keywords[key.value] = value
             is_config = (
                 isinstance(node.func, ast.Name) and node.func.id in module.consumer_config_names
             ) or (isinstance(node.func, ast.Attribute) and node.func.attr == "ConsumerConfig")
@@ -290,16 +364,15 @@ def heartbeat_wiring_problems(source: str) -> list[str]:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if any(isinstance(t, ast.Attribute) and t.attr == "ack_wait" for t in targets):
                 ack_wait_values.append(None if isinstance(node, ast.AugAssign) else node.value)
-        elif isinstance(node, ast.Dict):
-            for key, value in zip(node.keys, node.values):
-                if isinstance(key, ast.Constant) and key.value == "ack_wait":
-                    ack_wait_values.append(value)
+        sites += len(ack_wait_values)
         for value in ack_wait_values:
             if value is None or not module.is_settings_ack_wait(value):
                 shown = "not set from settings" if value is None else ast.unparse(value)
                 problems.append(
                     f"line {node.lineno}: ack_wait is {shown}, not settings.nats_ack_wait_seconds"
                 )
+    if not sites:
+        problems.append(NO_ACK_WAIT)
     return problems
 
 
@@ -343,6 +416,23 @@ SOUND_SHAPES = {
         "async def start(js, api):\n"
         "    config = api.ConsumerConfig(ack_wait=settings.nats_ack_wait_seconds)\n"
         "    return await js.pull_subscribe('s', durable='d', config=config)\n"
+    ),
+    "an unrelated function with a parameter named like a constant": GOOD_CONSUMER
+    + "def describe(NATS_ACK_WAIT_SECONDS, NATS_HEARTBEAT_SECONDS):\n"
+    "    return NATS_ACK_WAIT_SECONDS\n",
+    "an unrelated function with a local named like a constant": GOOD_CONSUMER + "def describe():\n"
+    "    NATS_HEARTBEAT_SECONDS = 'label'\n"
+    "    return NATS_HEARTBEAT_SECONDS\n",
+    "the interval bound once to a local name": GOOD_CONSUMER.replace(
+        "    await process_batch_with_heartbeat(msgs, handle, NATS_HEARTBEAT_SECONDS)\n",
+        "    cadence = NATS_HEARTBEAT_SECONDS\n"
+        "    await process_batch_with_heartbeat(msgs, handle, cadence)\n",
+    ),
+    "a log line and a comparison that read the durable's ack_wait": GOOD_CONSUMER.replace(
+        "    return await",
+        "    logger.info('durable', extra={'ack_wait': config.ack_wait})\n"
+        "    assert info.config.ack_wait == config.ack_wait\n"
+        "    return await",
     ),
 }
 
@@ -421,7 +511,48 @@ FALSE_PASSES = {
     "durable ack_wait passed through a dict": GOOD_CONSUMER.replace(
         f"ConsumerConfig(max_deliver=5, {_ACK})", "ConsumerConfig(**{'ack_wait': 30})"
     ),
+    "durable ack_wait hidden in a splatted name": GOOD_CONSUMER.replace(
+        f"ConsumerConfig(max_deliver=5, {_ACK})", "ConsumerConfig(**options)"
+    ),
+    "no ack_wait anywhere: the config is built elsewhere": GOOD_CONSUMER.replace(
+        f"ConsumerConfig(max_deliver=5, {_ACK})", "build_config('d')"
+    ),
+    "heartbeat name rebound through global in another function": GOOD_CONSUMER + "def tune():\n"
+    "    global NATS_HEARTBEAT_SECONDS\n"
+    "    NATS_HEARTBEAT_SECONDS = 20\n",
+    "ack_wait name rebound by an except clause": GOOD_CONSUMER.replace(
+        _CONSTANTS,
+        _CONSTANTS + "try:\n    pass\nexcept Exception as NATS_ACK_WAIT_SECONDS:\n    pass\n",
+    ),
+    "the interval is a parameter of the calling function": GOOD_CONSUMER.replace(
+        _BATCH,
+        "async def process_batch(msgs, NATS_HEARTBEAT_SECONDS=60):\n"
+        "    await process_batch_with_heartbeat(msgs, handle, NATS_HEARTBEAT_SECONDS)\n",
+    ),
 }
+
+# Sound in fact, refused by the scan because it cannot follow the value (see Limits).
+REFUSED_CONSERVATIVELY = {
+    "a float() cast on the durable's ack_wait": GOOD_CONSUMER.replace(
+        _ACK, "ack_wait=float(NATS_ACK_WAIT_SECONDS)"
+    ),
+    "constants imported from a sibling module": GOOD_CONSUMER.replace(
+        _CONSTANTS, "from app.consumer_constants import NATS_ACK_WAIT_SECONDS\n"
+    ).replace("NATS_HEARTBEAT_SECONDS", "heartbeat_interval(NATS_ACK_WAIT_SECONDS)"),
+    "a config factory that takes ack_wait as a parameter": GOOD_CONSUMER.replace(
+        _START,
+        "def build(ack_wait):\n"
+        "    return ConsumerConfig(ack_wait=ack_wait)\n"
+        "async def start(js):\n"
+        "    config = build(NATS_ACK_WAIT_SECONDS)\n"
+        "    return await js.pull_subscribe('s', durable='d', config=config)\n",
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(REFUSED_CONSERVATIVELY))
+def test_wiring_scan_refuses_a_value_it_cannot_follow(shape: str):
+    assert heartbeat_wiring_problems(REFUSED_CONSERVATIVELY[shape]), shape
 
 
 @pytest.mark.parametrize("spelling", sorted(FALSE_PASSES))
