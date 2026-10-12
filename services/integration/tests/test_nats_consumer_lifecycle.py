@@ -77,7 +77,10 @@ class _FakeJetStream:
     async def add_consumer(self, stream, config):
         # issue #895: herd_common.jetstream.ensure_consumer calls this to
         # create-or-update the durable BEFORE pull_subscribe binds to it.
-        self.add_consumer_calls.append({"stream": stream, "config": config})
+        # The durable is read NOW: the config object may be shared between durables.
+        self.add_consumer_calls.append(
+            {"stream": stream, "config": config, "durable": config.durable_name}
+        )
         self.durable_calls.append(("add_consumer", config.durable_name))
 
     async def pull_subscribe(self, subject_pattern, durable, config):
@@ -233,8 +236,12 @@ async def test_start_nats_consumer_wires_both_subscriptions():
             ], mock_js.durable_calls
         # Both durables are created-or-updated with no `backoff` kwarg.
         assert len(mock_js.add_consumer_calls) == 2
-        for call in mock_js.add_consumer_calls:
-            assert call["stream"] in {nats_consumer.NATS_STREAM, nats_consumer.HEALTH_STREAM}
+        # Each durable is created on ITS stream. A membership check over the two
+        # streams holds with them exchanged, so the pairing is asserted whole.
+        assert {c["durable"]: c["stream"] for c in mock_js.add_consumer_calls} == {
+            nats_consumer.NATS_DURABLE: nats_consumer.NATS_STREAM,
+            nats_consumer.HEALTH_DURABLE: nats_consumer.HEALTH_STREAM,
+        }
         consumer_config_calls = patched_modules["nats.js.api"].ConsumerConfig.call_args_list
         for call in consumer_config_calls:
             assert "backoff" not in call.kwargs

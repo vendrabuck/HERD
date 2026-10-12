@@ -619,7 +619,10 @@ class _FakeJetStream:
     async def add_consumer(self, stream, config):
         # issue #895: herd_common.jetstream.ensure_consumer calls this to
         # create-or-update the durable BEFORE pull_subscribe binds to it.
-        self.add_consumer_calls.append({"stream": stream, "config": config})
+        # The durable is read NOW: the config object may be shared between durables.
+        self.add_consumer_calls.append(
+            {"stream": stream, "config": config, "durable": config.durable_name}
+        )
         self.durable_calls.append(("add_consumer", config.durable_name))
 
     async def pull_subscribe(self, subject_pattern, durable, config):
@@ -708,6 +711,12 @@ async def test_start_nats_consumer_wires_both_subscriptions(monkeypatch):
         # just a kwargs entry, so accessing it directly proves ensure_consumer
         # built it that way).
         assert len(js.add_consumer_calls) == 2
+        # Each durable is created on ITS stream. A membership check over the two
+        # streams holds with them exchanged, so the pairing is asserted whole.
+        assert {c["durable"]: c["stream"] for c in js.add_consumer_calls} == {
+            nats_consumer.NATS_DURABLE: nats_consumer.NATS_STREAM,
+            nats_consumer.HEALTH_DURABLE: nats_consumer.HEALTH_STREAM,
+        }
         add_consumer_durables = {c["config"].durable_name for c in js.add_consumer_calls}
         assert add_consumer_durables == {nats_consumer.NATS_DURABLE, nats_consumer.HEALTH_DURABLE}
         for call in js.add_consumer_calls:
