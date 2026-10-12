@@ -247,16 +247,19 @@ string and the commit date, so a partly rebuilt stack can be told apart from a f
   `VITE_HERD_BUILD_DATE`. \
   Enforced in: `docker-compose.yml` (`HERD_BUILD`, `VITE_HERD_BUILD`) \
   Pinned by: `tests/unit/test_build_args_wiring.py` (`test_every_build_service_is_covered_by_this_test`, `test_every_compose_build_stanza_carries_the_build_args`)
-- **OPS-BUILD-3.** Every service Dockerfile declares the two args in the stage that
-  ships, after its last dependency install and every other `RUN`, `COPY`, or `ADD`, and
-  exports them as environment variables after both declarations, so a new build string
-  rebuilds only that layer. \
+- **OPS-BUILD-3.** Every service Dockerfile declares each of the two args once, in the
+  stage that ships, with no `RUN`, `COPY`, or `ADD` after them (so every dependency
+  install is ahead of them, whatever it is called), and exports them in one `ENV`
+  instruction after both declarations, so a new build string rebuilds only that layer.
+  A `RUN` that would need the value after the `ARG` is refused by the guard: the `ENV`
+  line already puts the value in the image. \
   Enforced in: `services/auth/Dockerfile` (`HERD_BUILD`) \
   Pinned by: `tests/unit/test_build_args_wiring.py` (`test_every_service_dockerfile_declares_the_build_args_and_env`)
 - **OPS-BUILD-4.** The frontend Dockerfile declares its two args, and exports them
-  after both, in the stage that runs `npm run build`, after that stage's install and
-  before the build, and Vite injects the package version, the build, and the build date
-  as compile-time constants (`dev` and empty when unset). \
+  after both, in the stage that runs `npm run build`, before the build and after that
+  stage's `npm ci` or `npm install` when it has one, and Vite injects the package
+  version, the build, and the build date as compile-time constants (`dev` and empty
+  when unset). \
   Enforced in: `frontend/Dockerfile` (`VITE_HERD_BUILD`); `frontend/vite.config.ts` (`__APP_VERSION__`, `__APP_BUILD__`, `__APP_BUILD_DATE__`) \
   Pinned by: `tests/unit/test_build_args_wiring.py` (`test_frontend_dockerfile_declares_vite_build_args_before_npm_run_build`)
 
@@ -813,9 +816,12 @@ reaches a stack that keeps its broker state and no consumer drifts from the othe
   a call to the shared `process_batch_with_heartbeat` (own name, import alias, or module
   attribute; an import, a comment, or a local function of that name is not one), an
   interval that is `heartbeat_interval` of `settings.nats_ack_wait_seconds`, directly or
-  through names assigned exactly once, and that same configured value as the `ack_wait`
-  of every `ConsumerConfig`; an own fraction, a literal, or a reassigned name fails
-  (#1158). \
+  through names their scope assigns exactly once, at least one place in the module
+  that sets `ack_wait`, and that same configured value everywhere the module sets it,
+  with `ack_wait` present on every `ConsumerConfig` call; an own fraction, a literal, a
+  cast, or a reassigned name fails. The scan follows names within one module and does
+  not judge whether the code is reached; the guard's module docstring lists those
+  limits (#1158). \
   Enforced in: `services/common/herd_common/jetstream.py` (`process_batch_with_heartbeat`, `heartbeat_interval`) \
   Pinned by: `tests/unit/test_consumer_heartbeat_wiring.py` (`test_consumer_modules_are_discovered`, `test_no_pull_consumer_module_keeps_an_inline_heartbeat`, `test_every_pull_consumer_module_uses_the_shared_heartbeat`, `test_every_pull_consumer_module_takes_ack_wait_and_heartbeat_from_one_source`)
 - **OPS-NATS-13.** Under `make prod` the broker stores JetStream state in the `nats-data`
@@ -1324,14 +1330,18 @@ Dockerfiles, and the unit tests under `tests/unit/` named below; the CI backend 
 **Rules.**
 
 - **OPS-GUARD-1.** Every `Settings` field of every service is passed by the base compose
-  file as `${VAR:-default}` with the same default as the code, where `VAR` is the
-  field's own name or, for the five fields the guard records (`DATABASE_URL`,
-  `SECRET_KEY`, `ALGORITHM`, and auth's two token lifetimes), the renamed variable; or
-  it is listed as an exemption with a reason. A value that interpolates another
-  variable, or an escaped `$${VAR}`, is not passed; a stale exemption fails, and no
-  field declares an alias. \
+  file or is listed as an exemption with a reason. Passed means the whole value under
+  the field's key is exactly `${VAR}` or `${VAR:-default}`, the default (when there is
+  one) equal to the code's except for `CORS_ORIGINS`, whose compose default differs by
+  decision, where `VAR` is the field's own name or, for `SECRET_KEY`,
+  `ALGORITHM`, and auth's two token lifetimes, the renamed variable the guard records;
+  `DATABASE_URL` is the one field built from several variables and must interpolate
+  all three `POSTGRES_*` variables. Another variable, an escaped `$${VAR}`, text
+  around the substitution, or any other substitution form (`${VAR-x}`, `${VAR:?x}`,
+  `${VAR:+x}`, a bare `$VAR`) is not passed. A stale exemption or renamed-variable
+  entry fails, and no field declares an alias. \
   Enforced in: `docker-compose.yml` (`environment`) \
-  Pinned by: `tests/unit/test_compose_settings_wiring.py` (`test_service_names_matches_discovered_services`, `test_no_settings_field_declares_an_alias`, `test_every_settings_field_is_wired_or_exempt`, `test_no_stale_exemptions`, `test_no_stale_default_mismatch_exemptions`, `test_wired_compose_defaults_match_settings_defaults`, `test_every_active_ai_env_example_key_is_wired_to_ai_orchestrator`)
+  Pinned by: `tests/unit/test_compose_settings_wiring.py` (`test_service_names_matches_discovered_services`, `test_no_settings_field_declares_an_alias`, `test_every_settings_field_is_wired_or_exempt`, `test_no_stale_exemptions`, `test_no_stale_default_mismatch_exemptions`, `test_wired_compose_defaults_match_settings_defaults`, `test_every_active_ai_env_example_key_is_wired_to_ai_orchestrator`, `test_no_stale_renamed_wiring`)
 - **OPS-GUARD-2.** The base compose file publishes Traefik's 80 and 443 to every
   interface and every other port, the Traefik dashboard included, on loopback only; the
   dev override adds no second dashboard binding and publishes its own ports on loopback

@@ -127,10 +127,16 @@ not finished.
     resolve;
   - names an "Enforced in" symbol that no longer appears in the file it names (for
     Python, TypeScript, and JavaScript, a symbol left only in a comment does not
-    count), names a "Pinned by" test that is not a test there (a Python function or
-    class pytest collects; for a frontend test the complete title of an `it`, `test`,
-    or `describe` call that is not commented out, `.skip`, or `.todo`), or writes a
-    reference line in any other shape;
+    count; one in a string or docstring does), names a "Pinned by" test that is not
+    defined as a test there, or writes a reference line in any other shape. A Python
+    test is a function named `test*` in a file named `test_*.py` or `*_test.py`,
+    at module level or as a method of a module-level `Test*` class with no
+    `__init__`. A frontend test is the complete title of an `it`, `test`, or
+    `describe` call in a `*.test.*` or `*.spec.*` file that starts its line and is
+    not commented out, `.skip`, or `.todo`. The guard checks that the test is
+    defined, not that it runs: its module docstring lists what it cannot see (a
+    `@pytest.mark.skip`, an `it` inside a `describe.skip` block) and the shapes it
+    cannot cite (a node id, a nested class, a title holding a backtick);
   - repeats a rule identifier, writes one that does not match `<AREA>-<TOPIC>-<N>`,
     or has a rule without exactly one of each reference line;
   - cites a rule identifier in the State model, API surface, Events, Internal API, or
