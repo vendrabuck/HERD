@@ -1395,6 +1395,7 @@ CLI documentation guard (OPS-NATS-14).
 | 422 | validation list | a new config password outside 8 to 32 characters | OPS-CONFIG-8 |
 | 422 | `{"errors": ["<KEY> is required", ...]}` | a config save missing a required field, including a masked secret with no source | OPS-CONFIG-11, OPS-CONFIG-12 |
 | 422 | `{"errors": ["Unknown settings: <KEY>, ..."]}` | a config save naming a key outside `CONFIG_SCHEMA` | OPS-CONFIG-12 |
+| 422 | `{"errors": ["AUTH_SECRET_KEY is unset, blank, or still a placeholder; ...", "AUTH_ALGORITHM must be one of HS256, HS384, HS512"]}` (either or both) | a config save with a missing, blank, or placeholder `AUTH_SECRET_KEY`, or a set `AUTH_ALGORITHM` outside the three | OPS-CONFIG-23 |
 | 400 | `No configuration to apply` | config apply with no `config.json` | OPS-CONFIG-15 |
 | 200 | `{"restarted": [...], "errors": [...]}` | config apply; failures are entries in `errors` | OPS-CONFIG-13, OPS-CONFIG-16 |
 | 403 | `Admin or superadmin role required` | a non-admin lists health snapshots, reads a report, or writes a secret | OPS-HEALTH-3, OPS-REPORT-1, OPS-SECRET-1 |

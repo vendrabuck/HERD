@@ -161,7 +161,7 @@ cp .env.example .env
 #   SUPERADMIN_EMAIL, SUPERADMIN_USERNAME, SUPERADMIN_PASSWORD
 # Also set the compose-time values before first `make up`, as in Option A:
 #   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, AUTH_SECRET_KEY, INTERNAL_API_TOKEN
-# AUTH_SECRET_KEY is required; services fail without it
+# AUTH_SECRET_KEY is required; services refuse to start while it is unset, blank, or still the .env.example placeholder
 # LOG_LEVEL controls logging verbosity (DEBUG, INFO, WARNING, ERROR, CRITICAL; default: INFO)
 
 make up        # dev mode: hot-reload + volume mounts
@@ -533,7 +533,7 @@ make test-load-ui        # Locust with web UI
 
 Four jobs run on push/PR to main, plus a scheduled nightly workflow:
 - **backend**: lockfile drift check (uv lock --check), install deps (uv sync), lint (ruff check), format check (ruff format --check), test all 13 services (pytest), coverage report
-- **frontend**: install deps (npm ci), lint (eslint), test (vitest), build (vite)
+- **frontend**: install deps (npm ci), lint (eslint), test (vitest, run twice: under the runner's UTC clock and under `TZ=America/Los_Angeles`), build (vite)
 - **integration** (advisory): boots the full ephemeral stack and runs the contract and integration suites
 - **nos-dialect** (advisory): boots the checked-in emulated-gear lab (a real Nokia SR Linux node and a real FRRouting node, `infra/nos-test/`) and runs the four driver-dialect suites against them; no HERD stack involved
 - **nightly** (scheduled, not on every PR): the heavier suites PR CI skips, contract, integration, e2e, a seeded headless locust load run, and the NOS lab's two via-stack feature suites (a real device driven through HERD's own reservation path). On failure it uploads compose and stack diagnostics plus any e2e failure artifacts (screenshot, page HTML, console log, traceback) as the `nightly-failure-artifacts` GitHub Actions artifact, 7-day retention.

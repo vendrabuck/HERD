@@ -317,7 +317,7 @@ Driver packages are stored locally by default. To use MinIO (or any S3-compatibl
 | Variable | Default | Purpose |
 |---|---|---|
 | `DRIVER_STORAGE_PATH` | `/data/drivers` | Local filesystem path for driver packages. Ignored when MinIO is configured. |
-| `DRIVER_MAX_SIZE_BYTES` | `10485760` | Maximum accepted size (in bytes) of an uploaded driver package. Default is 10 MB. |
+| `DRIVER_MAX_SIZE_BYTES` | `10485760` | Maximum accepted size (in bytes) of an uploaded driver package. Default is 10 MB. Separately, and not configurable, the upload refuses with 422 a `driver_metadata.json` over 1 MiB or a `.tar.gz` holding a tar header record over 1 MiB (issue #1180; see [DRIVERS.md](DRIVERS.md)). |
 | `MINIO_ENDPOINT` | (empty) | Set to enable MinIO; endpoint like `minio:9000`. |
 | `MINIO_ACCESS_KEY` | (empty) | Required when MinIO is configured. |
 | `MINIO_SECRET_KEY` | (empty) | Required when MinIO is configured. |
