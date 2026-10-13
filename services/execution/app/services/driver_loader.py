@@ -11,6 +11,8 @@ import zipfile
 from pathlib import Path
 
 import httpx
+from herd_common.bounded_tar import MAX_TAR_READ_BYTES as MAX_TAR_READ_BYTES
+from herd_common.bounded_tar import TAR_READ_LIMIT_TEXT, BoundedTarStream, TarReadLimitError
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -126,13 +128,11 @@ async def download_driver_package(driver_id: uuid.UUID) -> bytes:
 # decision, not settings.
 MAX_EXTRACTED_BYTES = 100 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 10_000
-# The largest single read the tar reader may make from the decompressed stream (issue
-# #1179). tarfile reads member headers in 512-byte blocks and copies member data in
-# 16 KiB chunks, but reads a pax extended header (types x and g) or a GNU long name
-# or long link (types L and K) whole, in one call, before the member it describes
-# exists to be checked against the ceilings above. Bounding the read bounds that
-# allocation. A real pax header or long name is well under a kilobyte.
-MAX_TAR_READ_BYTES = 1024 * 1024
+# MAX_TAR_READ_BYTES, the largest single read the tar reader may make from the
+# decompressed stream (issue #1179), lives in herd_common.bounded_tar since #1180, which
+# shares it with inventory's driver upload; it is re-exported from this module above.
+# The refusal text for a tar header record over that bound:
+TAR_READ_REFUSAL = f"Driver package has a {TAR_READ_LIMIT_TEXT}; nothing was extracted"
 
 
 class PackageLimitError(ValueError):
@@ -156,31 +156,23 @@ def _check_archive_limits(entries: int, total_bytes: int) -> None:
         )
 
 
-class _BoundedTarStream:
-    """The decompressed tar stream, refusing any single read over MAX_TAR_READ_BYTES.
-
-    tarfile reads a pax or GNU long-name header's whole declared size in one call;
-    this refuses that call before anything is decompressed into memory for it.
-    Every other read tarfile makes is a 512-byte header block or a data chunk of at
-    most its 16 KiB copy buffer, so a well-formed package never reaches the bound.
-    """
-
-    def __init__(self, raw: gzip.GzipFile) -> None:
-        self._raw = raw
-
-    def read(self, size: int = -1) -> bytes:
-        if size is None or size < 0 or size > MAX_TAR_READ_BYTES:
-            raise PackageLimitError(
-                f"Driver package has a tar header record over {MAX_TAR_READ_BYTES} bytes "
-                "(a pax extended header or GNU long name); nothing was extracted"
-            )
-        return self._raw.read(size)
-
-    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        return self._raw.seek(offset, whence)
-
-    def tell(self) -> int:
-        return self._raw.tell()
+def _extract_tar_gz(package_bytes: bytes, dest_dir: Path) -> None:
+    """The tar branch of extract_driver_package; see its docstring for the rules."""
+    with gzip.GzipFile(fileobj=io.BytesIO(package_bytes), mode="rb") as raw:
+        try:
+            tf = tarfile.open(fileobj=BoundedTarStream(raw), mode="r:")
+        except OSError as exc:
+            # What tarfile.open(mode="r:gz") raises for a stream that is not gzip.
+            raise tarfile.ReadError("not a gzip file") from exc
+        with tf:
+            entries = 0
+            total_bytes = 0
+            for member in tf:
+                entries += 1
+                total_bytes += member.size
+                _check_archive_limits(entries, total_bytes)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            tf.extractall(dest_dir, filter="data")
 
 
 def extract_driver_package(package_bytes: bytes, filename: str, dest_dir: Path) -> None:
@@ -192,9 +184,10 @@ def extract_driver_package(package_bytes: bytes, filename: str, dest_dir: Path) 
     reads no more than an entry's ``file_size`` and tarfile writes exactly a member's
     ``size``.
 
-    A tar is read through ``_BoundedTarStream``, so no single read from the
-    decompressed stream exceeds MAX_TAR_READ_BYTES: a pax or GNU long-name header
-    declaring more is refused before it is read into memory (issue #1179). Member
+    A tar is read through ``herd_common.bounded_tar.BoundedTarStream``, so no single
+    read from the decompressed stream exceeds MAX_TAR_READ_BYTES: a pax or GNU
+    long-name header declaring more is refused before it is read into memory, raised
+    here as ``PackageLimitError`` with TAR_READ_REFUSAL (issue #1179). Member
     headers are read one at a time and the scan stops at the first one past a
     ceiling; skipping over member data still decompresses it in small chunks, and
     extraction then decompresses the stream a second time from the start. The work
@@ -208,21 +201,10 @@ def extract_driver_package(package_bytes: bytes, filename: str, dest_dir: Path) 
             dest_dir.mkdir(parents=True, exist_ok=True)
             zf.extractall(dest_dir)
     elif filename.endswith(".tar.gz") or filename.endswith(".tgz"):
-        with gzip.GzipFile(fileobj=io.BytesIO(package_bytes), mode="rb") as raw:
-            try:
-                tf = tarfile.open(fileobj=_BoundedTarStream(raw), mode="r:")
-            except OSError as exc:
-                # What tarfile.open(mode="r:gz") raises for a stream that is not gzip.
-                raise tarfile.ReadError("not a gzip file") from exc
-            with tf:
-                entries = 0
-                total_bytes = 0
-                for member in tf:
-                    entries += 1
-                    total_bytes += member.size
-                    _check_archive_limits(entries, total_bytes)
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                tf.extractall(dest_dir, filter="data")
+        try:
+            _extract_tar_gz(package_bytes, dest_dir)
+        except TarReadLimitError as exc:
+            raise PackageLimitError(TAR_READ_REFUSAL) from exc
     else:
         raise ValueError(f"Unsupported package format: {filename}")
 
@@ -255,6 +237,14 @@ def read_driver_metadata(driver_dir: Path) -> dict:
     The contract is opt-in: drivers must explicitly declare
     `supports_dry_run: true` to be eligible for AI-initiated dry-run apply
     scheduling. See docs/DRIVERS.md.
+
+    Malformed covers every way the file can fail to read as JSON (issue #1189):
+    an OSError, text that is not UTF-8 (UnicodeDecodeError) or not JSON
+    (JSONDecodeError), both ValueErrors, and nesting deep enough that json.load
+    raises RecursionError. None of these may escape: load_driver would re-raise
+    it, and is_permanent_load_failure classes anything but DriverPackageError as
+    transient, so a package that can never change would be retried forever. The
+    warning names the exception class only.
     """
     metadata_path = driver_dir / "driver_metadata.json"
     if not metadata_path.exists():
@@ -266,8 +256,10 @@ def read_driver_metadata(driver_dir: Path) -> dict:
             logger.warning("driver_metadata.json is not an object: %s", metadata_path)
             return dict(DEFAULT_DRIVER_METADATA)
         return data
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Failed to read driver_metadata.json at %s: %s", metadata_path, exc)
+    except (OSError, ValueError, RecursionError) as exc:
+        logger.warning(
+            "Failed to read driver_metadata.json at %s: %s", metadata_path, type(exc).__name__
+        )
         return dict(DEFAULT_DRIVER_METADATA)
 
 

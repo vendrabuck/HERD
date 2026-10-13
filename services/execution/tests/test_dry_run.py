@@ -6,6 +6,7 @@ service). This file exercises the execution-side safety nets.
 """
 
 import json
+import logging
 import os
 import tempfile
 import uuid
@@ -19,6 +20,7 @@ from app.services.driver_loader import (
     read_driver_metadata,
 )
 from app.services.driver_sandbox import DryRunRefused, execute_driver_method
+from herd_common.logging import JSONFormatter
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 test_engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
@@ -133,6 +135,46 @@ def test_read_metadata_handles_non_object(tmp_path):
     meta_file = tmp_path / "driver_metadata.json"
     meta_file.write_text('"a string, not an object"')
     assert read_driver_metadata(tmp_path) == DEFAULT_DRIVER_METADATA
+
+
+# A metadata file that cannot be read as JSON in any way yields the defaults and one
+# class-name-only warning (issue #1189): a raise would escape load_driver as a
+# transient failure and the package would be retried forever.
+
+_UNREADABLE_METADATA = {
+    "non-utf8": (b'{"supports_dry_run": true, "x": "\xff\xfe"}', "UnicodeDecodeError"),
+    "deeply-nested": (b"[" * 200_000 + b"]" * 200_000, "RecursionError"),
+}
+
+
+@pytest.mark.parametrize("raw, exc_class", _UNREADABLE_METADATA.values(), ids=_UNREADABLE_METADATA)
+def test_read_metadata_unreadable_file_yields_defaults_and_one_class_only_warning(
+    tmp_path, caplog, raw, exc_class
+):
+    (tmp_path / "driver_metadata.json").write_bytes(raw)
+
+    with caplog.at_level(logging.WARNING, logger="app.services.driver_loader"):
+        assert read_driver_metadata(tmp_path) == DEFAULT_DRIVER_METADATA
+
+    records = [r for r in caplog.records if r.name == "app.services.driver_loader"]
+    assert len(records) == 1
+    message = json.loads(JSONFormatter("execution").format(records[0]))["message"]
+    assert message.endswith(f": {exc_class}")
+    # The exception's own text never reaches the log line.
+    assert "decode byte" not in message
+    assert "recursion" not in message
+
+
+def test_read_metadata_good_file_still_parses_and_logs_nothing(tmp_path, caplog):
+    (tmp_path / "driver_metadata.json").write_bytes(
+        b'{"supports_dry_run": true, "supports_vrf": true}'
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.services.driver_loader"):
+        parsed = read_driver_metadata(tmp_path)
+
+    assert parsed == {"supports_dry_run": True, "supports_vrf": True}
+    assert [r for r in caplog.records if r.name == "app.services.driver_loader"] == []
 
 
 # --- get_driver_metadata: cache row read ---

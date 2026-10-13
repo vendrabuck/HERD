@@ -1,3 +1,4 @@
+import gzip
 import hashlib
 import io
 import json
@@ -5,8 +6,10 @@ import logging
 import tarfile
 import uuid
 import zipfile
+from typing import IO
 
 from fastapi import HTTPException
+from herd_common.bounded_tar import TAR_READ_LIMIT_TEXT, BoundedTarStream, TarReadLimitError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +23,43 @@ logger = logging.getLogger(__name__)
 ALLOWED_EXTENSIONS = {".zip", ".tar.gz"}
 
 
+# The largest driver_metadata.json the upload will read (issue #1180). The archive is
+# capped compressed (DRIVER_MAX_SIZE_BYTES), but a small, highly compressible entry
+# could otherwise expand in memory in this process. A real metadata file is a few
+# hundred bytes. It must not exceed MAX_TAR_READ_BYTES: a tar member is read in one
+# call of at most its declared size through BoundedTarStream.
+MAX_DRIVER_METADATA_BYTES = 1024 * 1024
+
+METADATA_TOO_LARGE_DETAIL = (
+    f"driver_metadata.json is larger than {MAX_DRIVER_METADATA_BYTES} bytes; nothing was stored"
+)
+TAR_READ_LIMIT_DETAIL = f"Driver package has a {TAR_READ_LIMIT_TEXT}; nothing was stored"
+
+
+class _MetadataTooLargeError(ValueError):
+    """driver_metadata.json declares, or holds, more than MAX_DRIVER_METADATA_BYTES."""
+
+
+def _read_metadata_bytes(stream: IO[bytes], declared_size: int) -> bytes:
+    """Read one metadata entry, never more than MAX_DRIVER_METADATA_BYTES plus one byte.
+
+    The declared size (zip ``file_size``, tar ``size``) is checked first, so an entry
+    declaring too much is refused before anything is decompressed for it; then the
+    read itself is capped, so an entry whose header understates what it holds is
+    refused rather than read whole. The cap also bounds the work behind the read:
+    zipfile returns at most the central directory's ``file_size``, but it inflates up
+    to the size it is asked for before truncating, so an unbounded read of an entry
+    that understates its size would inflate the whole stream. tarfile reads exactly
+    a member's ``size``.
+    """
+    if declared_size > MAX_DRIVER_METADATA_BYTES:
+        raise _MetadataTooLargeError
+    raw = stream.read(MAX_DRIVER_METADATA_BYTES + 1)
+    if len(raw) > MAX_DRIVER_METADATA_BYTES:
+        raise _MetadataTooLargeError
+    return raw
+
+
 def _parse_driver_metadata(filename: str, file_data: bytes) -> dict:
     """Peek inside a driver package for `driver_metadata.json` and return it.
 
@@ -27,28 +67,42 @@ def _parse_driver_metadata(filename: str, file_data: bytes) -> dict:
     missing metadata file, a top-level value that is not an object, or anything
     else surprising. Every capability flag read from the result is therefore
     opt-in and closed by default.
+
+    Two failures are refused instead, with a 422 that names the bound and nothing
+    stored (issue #1180), because they are about the package's size, not its
+    content: a metadata entry over MAX_DRIVER_METADATA_BYTES (declared or read),
+    and a tar header record over MAX_TAR_READ_BYTES, which the tar is read through
+    ``herd_common.bounded_tar.BoundedTarStream`` to catch before it is read into
+    memory.
     """
     lower = filename.lower()
     try:
         if lower.endswith(".zip"):
             with zipfile.ZipFile(io.BytesIO(file_data)) as zf:
                 try:
-                    raw = zf.read("driver_metadata.json")
+                    info = zf.getinfo("driver_metadata.json")
                 except KeyError:
                     return {}
+                with zf.open(info) as entry:
+                    raw = _read_metadata_bytes(entry, info.file_size)
         elif lower.endswith(".tar.gz") or lower.endswith(".tgz"):
-            with tarfile.open(fileobj=io.BytesIO(file_data), mode="r:gz") as tf:
-                try:
-                    member = tf.getmember("driver_metadata.json")
-                except KeyError:
-                    return {}
-                extracted = tf.extractfile(member)
-                if extracted is None:
-                    return {}
-                raw = extracted.read()
+            with gzip.GzipFile(fileobj=io.BytesIO(file_data), mode="rb") as gz:
+                with tarfile.open(fileobj=BoundedTarStream(gz), mode="r:") as tf:
+                    try:
+                        member = tf.getmember("driver_metadata.json")
+                    except KeyError:
+                        return {}
+                    extracted = tf.extractfile(member)
+                    if extracted is None:
+                        return {}
+                    raw = _read_metadata_bytes(extracted, member.size)
         else:
             return {}
         meta = json.loads(raw.decode("utf-8"))
+    except _MetadataTooLargeError:
+        raise HTTPException(status_code=422, detail=METADATA_TOO_LARGE_DETAIL)
+    except TarReadLimitError:
+        raise HTTPException(status_code=422, detail=TAR_READ_LIMIT_DETAIL)
     except Exception as exc:
         logger.info("driver upload: could not parse driver_metadata.json (%s)", exc)
         return {}
@@ -275,6 +329,9 @@ async def replace_driver_file(
     sha256 = hashlib.sha256(file_data).hexdigest()
     storage_key = f"{driver_id}/{filename}"
     old_storage_key = package.storage_key
+    # Read before anything is stored: a package refused for its size (issue #1180)
+    # must leave the stored file and the row as they were.
+    replacement_metadata = _parse_driver_metadata(filename, file_data)
 
     # Upload new file first, then delete old one (create-then-delete)
     upload_object(storage_key, file_data)
@@ -290,7 +347,6 @@ async def replace_driver_file(
     package.size_bytes = len(file_data)
     package.sha256 = sha256
     package.uploaded_by = username
-    replacement_metadata = _parse_driver_metadata(filename, file_data)
     package.supports_dry_run = bool(replacement_metadata.get("supports_dry_run", False))
     package.supports_vrf = bool(replacement_metadata.get("supports_vrf", False))
     await db.commit()

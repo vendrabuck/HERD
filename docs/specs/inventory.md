@@ -921,9 +921,19 @@ download, delete); routes under `/drivers`. The package format is in
 - **INV-DRV-7.** `supports_dry_run` and `supports_vrf` are read from a top-level
   `driver_metadata.json` in the archive and are false unless the file declares them;
   an unreadable archive, a missing or malformed file, or a non-object value reads as
-  false. Known gap, see #1180. \
-  Enforced in: `services/inventory/app/services/driver_service.py` (`_parse_driver_metadata`, `create_driver`) \
-  Pinned by: `services/inventory/tests/test_driver_service_unit.py` (`test_create_driver_persists_the_declared_capability_flags`, `test_parse_supports_dry_run_malformed_json_returns_false`, `test_parse_supports_dry_run_corrupt_zip_returns_false`, `test_parse_supports_dry_run_non_dict_metadata_returns_false`, `test_the_two_capability_flags_are_read_independently`)
+  false. The read is bounded (issue #1180): a `driver_metadata.json` larger than
+  `MAX_DRIVER_METADATA_BYTES` (1 MiB), by its declared size (zip `file_size`, tar
+  `size`) or by what a capped read of at most that many bytes plus one returns, is
+  refused with 422 `driver_metadata.json is larger than 1048576 bytes; nothing was
+  stored`, and a `.tar.gz` is read through `herd_common.bounded_tar.BoundedTarStream`,
+  so a pax extended header or GNU long name over `MAX_TAR_READ_BYTES` (1 MiB) is
+  refused before it is read into memory with 422 `Driver package has a tar header
+  record over 1048576 bytes (a pax extended header or GNU long name); nothing was
+  stored` (the execution-side rule is CFG-LOAD-3). Both refusals happen before the file
+  is stored, on create and on file replace, so a refused replace leaves the stored file
+  and the row unchanged. \
+  Enforced in: `services/inventory/app/services/driver_service.py` (`_parse_driver_metadata`, `_read_metadata_bytes`, `MAX_DRIVER_METADATA_BYTES`, `create_driver`, `replace_driver_file`) \
+  Pinned by: `services/inventory/tests/test_driver_service_unit.py` (`test_create_driver_persists_the_declared_capability_flags`, `test_parse_supports_dry_run_malformed_json_returns_false`, `test_parse_supports_dry_run_corrupt_zip_returns_false`, `test_parse_supports_dry_run_non_dict_metadata_returns_false`, `test_the_two_capability_flags_are_read_independently`); `services/inventory/tests/test_driver_metadata_bounds.py` (`test_metadata_bound_is_the_documented_constant_and_fits_the_tar_read_bound`, `test_oversized_metadata_is_refused_and_nothing_is_stored`, `test_metadata_exactly_at_the_bound_still_uploads`, `test_oversized_metadata_on_file_replace_leaves_the_stored_file`, `test_a_large_declared_size_is_refused_before_it_is_decompressed`, `test_an_entry_holding_more_than_it_declares_is_refused_by_the_read_cap`, `test_a_real_zip_understating_its_entry_decompresses_only_up_to_the_read_cap`, `test_a_tar_header_record_over_the_read_bound_is_refused_at_upload`, `test_a_tar_header_record_over_the_read_bound_is_never_read_into_memory`, `test_a_pax_header_under_the_read_bound_still_uploads`, `test_malformed_metadata_still_uploads_with_flags_closed`)
 - **INV-DRV-8.** A package name is unique; a duplicate answers 409
   `Driver with name '<name>' already exists`. \
   Enforced in: `services/inventory/app/services/driver_service.py` (`create_driver`) \
@@ -1469,9 +1479,7 @@ INV-PORT-6, by a throwaway script against the service on SQLite with foreign key
 
 ### Open defects
 
-- #1180 (INV-DRV-7): the upload reads `driver_metadata.json` whole, with no size bound,
-  in the inventory process; none of execution's extraction ceilings or its tar read
-  bound (`device-configuration.md`, CFG-LOAD-3) apply at upload.
+None at present.
 
 ### Limits by decision
 
