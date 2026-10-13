@@ -116,8 +116,10 @@ def _park_on_toast(page) -> None:
 
 
 def _park_off_toaster(page) -> None:
-    # Left edge: a toast is at most 350 px wide and centred, so x = 5 is
-    # outside every toast at any e2e viewport.
+    # Left edge: every toast this file raises is a plain success or error bar,
+    # which react-hot-toast caps at 350 px wide and centres, so x = 5 is outside
+    # all of them at any e2e viewport. The width is not measured here, and a
+    # wider custom toast (the fork save toast, about 450 px) is never raised.
     page.mouse.move(5, 400)
 
 

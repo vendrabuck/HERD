@@ -1229,7 +1229,7 @@ the child entry point `services/execution/app/services/_runner.py`;
 - **CFG-SBX-4.** The child applies `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_NOFILE`, and
   `RLIMIT_NPROC` from the `DRIVER_RLIMIT_*` settings as both soft and hard limits before
   it imports the driver; 0 leaves a limit off, and a limit that cannot be set is
-  skipped. \
+  skipped. Known gap, see #1180. \
   Enforced in: `services/execution/app/services/driver_sandbox.py` (`_rlimit_pairs`); `services/execution/app/services/_rlimits.py` (`apply_rlimits`); `services/execution/app/services/_runner.py` (`main`) \
   Pinned by: `services/execution/tests/test_driver_sandbox_edges.py` (`test_rlimit_pairs_reads_settings_live`, `test_apply_rlimits_applies_each_positive_limit`, `test_apply_rlimits_skips_unknown_limit_name`, `test_apply_rlimits_swallows_setrlimit_error`, `test_execute_passes_rlimit_policy_to_child_env`); `services/execution/tests/test_sandbox_isolation.py` (`test_memory_limit_kills_driver`, `test_cpu_limit_kills_driver`)
 - **CFG-SBX-5.** Unless the caller passes a timeout, `status` gets
@@ -1444,7 +1444,7 @@ See [ENV_VARS.md](../ENV_VARS.md) for the rest.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/common/tests/test_device_config.py`, `services/common/tests/test_acl.py`; `services/inventory/tests/test_published_schema.py`, `test_apply_scheduler.py`; `services/execution/tests/test_driver_loader*.py`, `test_driver_sandbox*.py`, `test_runner.py`, `test_sandbox_isolation.py`, `test_dry_run.py`, `test_driver_transcript.py`, `test_config_schema_extraction.py`, `test_configure_capability_parity.py`, `test_package_validator.py`; frontend `frontend/src/test/components/DeviceConfigSection.test.tsx`, `ApplyJobsPanel.test.tsx`, `AIApplyConfirmModal.test.tsx`, `frontend/src/test/lib/errors.test.ts`, `frontend/src/test/api/deviceConfig.test.tsx`, `deviceConfigJobs.test.tsx` | SQLite in memory; the sandbox suites start real child processes |
+| Unit | `services/common/tests/test_device_config.py`, `services/common/tests/test_acl.py`; `services/inventory/tests/test_published_schema.py`, `test_apply_scheduler.py`; `services/execution/tests/test_driver_loader*.py`, `test_driver_sandbox*.py`, `test_driver_structure.py`, `test_driver_load_sanitize_run.py`, `test_runner.py`, `test_sandbox_isolation.py`, `test_dry_run.py`, `test_driver_transcript.py`, `test_config_schema_extraction.py`, `test_configure_capability_parity.py`, `test_package_validator.py`; `tests/unit/test_checked_in_drivers_structure.py`; frontend `frontend/src/test/components/DeviceConfigSection.test.tsx`, `ApplyJobsPanel.test.tsx`, `AIApplyConfirmModal.test.tsx`, `frontend/src/test/lib/errors.test.ts`, `frontend/src/test/api/deviceConfig.test.tsx`, `deviceConfigJobs.test.tsx` | SQLite in memory; the sandbox suites start real child processes |
 | Functional (through the service API) | `services/inventory/tests/test_device_configs.py`, `test_device_configs_rbac.py`, `test_apply_jobs_reservation_owner.py`, `test_apply_jobs_reservation_scope.py`, `test_device_config_write_rules.py`, `test_dry_run_gate.py`, `test_confirm_dry_run.py`, `test_configure_capability_gate.py`, `test_device_config_restore_reservation_guard.py`, `test_device_read_visibility_gate.py`, `test_apply_jobs_internal_summary.py`, `test_router_edge_cases.py`; `services/execution/tests/test_router_endpoints.py`, `test_router_direct.py`, `test_api_endpoints.py`, `test_command_log*.py`, `test_config_schema_endpoint.py`, `test_configure_capability_gate.py`, `test_execution_service_edges.py`, `test_manual_execute_reservation_scope.py` | acl, reservations, and execution are patched |
 | Integration (running stack) | `tests/integration/test_config_apply_flow.py` (a config version validated through the schema proxy, a scheduled dry run fired by the scheduler on `drivers/frr_mgmt`, its transcript, the confirm, and the schedule's reservation check), `test_execution_configure_gate.py`, `test_execution_result_gating.py`, `test_execution_device_scope.py`, `test_package_validation.py`; the NOS lab tiers under `tests/nos_lab/` (`test_frr_mgmt_driver_live.py` drives the Management driver's `configure`) | The immediate apply and a real (not dry-run) scheduled push are not driven against a stack; the dev and gate stacks run the scheduler every 2 seconds (`docker-compose.override.yml`) |
 | Stress and load | None | `tests/load/locustfile.py` has no configuration task |
@@ -1461,7 +1461,11 @@ confirmed by reading only.
 
 ### Open defects
 
-None recorded.
+- #1180 (CFG-SBX-4): the limits bind `driver.py` only. Other package code runs in the
+  child before they apply: a package `sitecustomize.py` runs at interpreter start, and
+  a package module that shadows a standard library module the runner imports before
+  the limits (`json`) runs in its place, both with no limit. It still runs in the
+  child, never in the execution process; open by owner decision.
 
 ### Limits by decision
 
