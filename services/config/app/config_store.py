@@ -5,6 +5,7 @@ import secrets
 
 import bcrypt
 
+from app.auth_rules import auth_setting_errors
 from app.config_schema import CONFIG_SCHEMA, REQUIRED_KEYS
 
 logger = logging.getLogger(__name__)
@@ -145,12 +146,21 @@ def load_config() -> dict:
 
 
 def save_config(values: dict) -> list[str]:
-    """Save config values. Returns list of validation errors (empty on success)."""
+    """Save config values. Returns list of validation errors (empty on success).
+
+    Nothing is written when any error is returned. AUTH_SECRET_KEY and
+    AUTH_ALGORITHM are judged by app.auth_rules (the services' startup rules), so
+    a blank or placeholder secret reports that rule's message rather than the
+    generic "is required".
+    """
     errors = []
     for key in REQUIRED_KEYS:
+        if key == "AUTH_SECRET_KEY":
+            continue
         val = values.get(key)
         if val is None or (isinstance(val, str) and val.strip() == ""):
             errors.append(f"{key} is required")
+    errors += auth_setting_errors(values)
     if errors:
         return errors
 
@@ -182,8 +192,10 @@ def bootstrap_from_env() -> bool:
 
     Idempotent: returns False if config.json already exists. Reads every
     CONFIG_SCHEMA key from os.environ and writes a config file when every
-    REQUIRED_KEYS entry is present and non-empty. When required values are
-    missing the user still reaches the config UI as before.
+    REQUIRED_KEYS entry is present and non-empty and the access-token settings
+    pass app.auth_rules (so a placeholder secret is never copied into a file
+    that outranks a later .env fix once the UI saves). When required values are
+    missing or refused the user still reaches the config UI as before.
 
     The admin password file is left untouched so the config page keeps its
     default-password gate on first visit.
@@ -199,6 +211,11 @@ def bootstrap_from_env() -> bool:
             "Config auto-bootstrap skipped; missing required env vars: %s",
             ", ".join(missing),
         )
+        return False
+
+    refused = auth_setting_errors(values)
+    if refused:
+        logger.warning("Config auto-bootstrap skipped; %s", " ".join(refused))
         return False
 
     _ensure_data_dir()

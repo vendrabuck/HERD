@@ -1,11 +1,12 @@
+from herd_common.auth_settings import AuthSecretKey, JwtAlgorithm
 from herd_common.base_settings import HerdBaseSettings
 
 
 class Settings(HerdBaseSettings):
     database_url: str  # db login, password, and url go here via DATABASE_URL env var
     db_schema: str = "secrets"
-    secret_key: str
-    algorithm: str = "HS256"
+    secret_key: AuthSecretKey
+    algorithm: JwtAlgorithm = "HS256"
     cors_origins: str = ""
     acl_service_url: str = "http://acl:8000"
     # Issue #456: the delete-time reference guard's reverse lookup.

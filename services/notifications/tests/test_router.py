@@ -1,3 +1,5 @@
+import base64
+import json
 import uuid
 from unittest.mock import AsyncMock, patch
 
@@ -498,6 +500,103 @@ def test_get_bearer_credentials_rejects_token_without_sub():
     with pytest.raises(HTTPException) as exc:
         get_bearer_credentials(credentials=_make_creds(token))
     assert exc.value.status_code == 401
+
+
+# jose cannot build an HMAC key from this (it is shaped like a public key) and
+# raises JWKError, a JOSEError that is not a JWTError.
+_ASYMMETRIC_SHAPED_KEY = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQc=\n"
+
+
+def _unsigned_token(payload: dict) -> str:
+    def _segment(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    return f"{_segment({'alg': 'none', 'typ': 'JWT'})}.{_segment(payload)}."
+
+
+def test_get_bearer_credentials_service_algorithm_is_hs256_in_this_suite():
+    assert settings.algorithm == "HS256"
+
+
+def test_get_bearer_credentials_rejects_alg_none():
+    token = _unsigned_token({"sub": str(uuid.uuid4())})
+    with pytest.raises(HTTPException) as exc:
+        get_bearer_credentials(credentials=_make_creds(token))
+    assert exc.value.status_code == 401
+    assert exc.value.detail == "Could not validate credentials"
+
+
+def test_get_bearer_credentials_rejects_another_hmac_algorithm():
+    token = jwt.encode({"sub": str(uuid.uuid4())}, settings.secret_key, algorithm="HS512")
+    with pytest.raises(HTTPException) as exc:
+        get_bearer_credentials(credentials=_make_creds(token))
+    assert exc.value.status_code == 401
+    assert exc.value.detail == "Could not validate credentials"
+
+
+def test_get_bearer_credentials_gives_decode_exactly_the_configured_algorithm(monkeypatch):
+    from app.routers import notifications as notifications_router
+
+    seen: list = []
+    real_decode = notifications_router.jwt.decode
+
+    def recording_decode(*args, **kwargs):
+        seen.append(kwargs.get("algorithms"))
+        return real_decode(*args, **kwargs)
+
+    monkeypatch.setattr(notifications_router.jwt, "decode", recording_decode)
+    good = jwt.encode({"sub": str(uuid.uuid4())}, settings.secret_key, algorithm=settings.algorithm)
+    get_bearer_credentials(credentials=_make_creds(good))
+    with pytest.raises(HTTPException):
+        get_bearer_credentials(credentials=_make_creds(_unsigned_token({"sub": "x"})))
+    assert seen == [[settings.algorithm], [settings.algorithm]]
+
+
+def test_get_bearer_credentials_logs_a_key_error_once_by_class_name(monkeypatch, caplog):
+    import json as _json
+    import logging
+
+    from herd_common.logging import JSONFormatter
+
+    caplog.set_level(logging.DEBUG, logger="app.routers.notifications")
+    token = jwt.encode(
+        {"sub": str(uuid.uuid4())}, settings.secret_key, algorithm=settings.algorithm
+    )
+    monkeypatch.setattr(settings, "secret_key", _ASYMMETRIC_SHAPED_KEY)
+    with pytest.raises(HTTPException):
+        get_bearer_credentials(credentials=_make_creds(token))
+    records = [r for r in caplog.records if r.name == "app.routers.notifications"]
+    assert len(records) == 1
+    formatted = JSONFormatter("notifications").format(records[0])
+    logged = _json.loads(formatted)
+    assert logged["level"] == "ERROR"
+    assert logged["message"] == (
+        "access token not checked: the configured key is unusable (JWKError)"
+    )
+    assert logged["action"] == "jwt_key_unusable"
+    assert logged["error_class"] == "JWKError"
+    assert "BEGIN PUBLIC KEY" not in formatted
+
+
+def test_get_bearer_credentials_does_not_log_a_token_without_sub(caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="app.routers.notifications")
+    token = jwt.encode({"role": "user"}, settings.secret_key, algorithm=settings.algorithm)
+    with pytest.raises(HTTPException):
+        get_bearer_credentials(credentials=_make_creds(token))
+    assert [r for r in caplog.records if r.name == "app.routers.notifications"] == []
+
+
+def test_get_bearer_credentials_answers_401_for_a_key_jose_cannot_use(monkeypatch):
+    token = jwt.encode(
+        {"sub": str(uuid.uuid4())}, settings.secret_key, algorithm=settings.algorithm
+    )
+    monkeypatch.setattr(settings, "secret_key", _ASYMMETRIC_SHAPED_KEY)
+    with pytest.raises(HTTPException) as exc:
+        get_bearer_credentials(credentials=_make_creds(token))
+    assert exc.value.status_code == 401
+    assert exc.value.detail == "Could not validate credentials"
 
 
 # --- _caller_id: invalid subject ---

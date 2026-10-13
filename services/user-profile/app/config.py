@@ -1,11 +1,12 @@
+from herd_common.auth_settings import AuthSecretKey, JwtAlgorithm
 from herd_common.base_settings import HerdBaseSettings
 
 
 class Settings(HerdBaseSettings):
     database_url: str
     db_schema: str = "user_profile"
-    secret_key: str
-    algorithm: str = "HS256"
+    secret_key: AuthSecretKey
+    algorithm: JwtAlgorithm = "HS256"
     cors_origins: str = ""
     internal_api_token: str = ""
 

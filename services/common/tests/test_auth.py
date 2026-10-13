@@ -1,10 +1,15 @@
+import base64
+import json
+import logging
 import time
 import uuid
 
 import pytest
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
+from herd_common import auth as auth_module
 from herd_common.auth import caller_id, make_auth_dependencies
+from herd_common.logging import JSONFormatter
 from jose import jwt
 
 SECRET = "test-secret"
@@ -71,6 +76,111 @@ def test_empty_sub_raises_401():
 def test_malformed_token_raises_401():
     with pytest.raises(HTTPException) as exc_info:
         get_current_user_payload(_creds("not.a.jwt"))
+    assert exc_info.value.status_code == 401
+
+
+# --- algorithm list and key errors ---
+
+# jose refuses this as an HMAC secret (it is shaped like a public key) and raises
+# JWKError, a JOSEError that is not a JWTError, while building the key.
+ASYMMETRIC_SHAPED_KEY = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQc=\n"
+
+
+def _unsigned_token(payload: dict) -> str:
+    def _segment(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    return f"{_segment({'alg': 'none', 'typ': 'JWT'})}.{_segment(payload)}."
+
+
+def test_token_with_alg_none_raises_401():
+    with pytest.raises(HTTPException) as exc_info:
+        get_current_user_payload(_creds(_unsigned_token({"sub": "user-1", "role": "admin"})))
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Could not validate credentials"
+
+
+def test_token_signed_with_another_hmac_algorithm_raises_401():
+    token = jwt.encode({"sub": "user-1"}, SECRET, algorithm="HS512")
+    with pytest.raises(HTTPException) as exc_info:
+        get_current_user_payload(_creds(token))
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Could not validate credentials"
+
+
+def test_key_that_jose_cannot_use_raises_401_not_a_key_error():
+    payload_dep, _ = make_auth_dependencies(ASYMMETRIC_SHAPED_KEY, ALG)
+    token = _make_token({"sub": "user-1"})
+    with pytest.raises(HTTPException) as exc_info:
+        payload_dep(_creds(token))
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Could not validate credentials"
+
+
+def _record_decode_algorithms(monkeypatch) -> list:
+    """Wrap jose's decode as herd_common.auth reaches it; record `algorithms`."""
+    seen: list = []
+    real_decode = auth_module.jwt.decode
+
+    def recording_decode(*args, **kwargs):
+        seen.append(kwargs.get("algorithms"))
+        return real_decode(*args, **kwargs)
+
+    monkeypatch.setattr(auth_module.jwt, "decode", recording_decode)
+    return seen
+
+
+@pytest.mark.parametrize("algorithm", ["HS256", "HS512"])
+def test_decode_is_given_exactly_the_configured_algorithm(monkeypatch, algorithm):
+    seen = _record_decode_algorithms(monkeypatch)
+    payload_dep, _ = make_auth_dependencies(SECRET, algorithm)
+    token = jwt.encode({"sub": "user-1"}, SECRET, algorithm=algorithm)
+    assert payload_dep(_creds(token))["sub"] == "user-1"
+    with pytest.raises(HTTPException):
+        payload_dep(_creds(_unsigned_token({"sub": "user-1"})))
+    assert seen == [[algorithm], [algorithm]]
+
+
+def test_key_error_is_logged_once_by_class_name(caplog):
+    caplog.set_level(logging.DEBUG, logger="herd_common.auth")
+    payload_dep, _ = make_auth_dependencies(ASYMMETRIC_SHAPED_KEY, ALG)
+    with pytest.raises(HTTPException):
+        payload_dep(_creds(_make_token({"sub": "user-1"})))
+    records = [r for r in caplog.records if r.name == "herd_common.auth"]
+    assert len(records) == 1
+    formatted = JSONFormatter("common").format(records[0])
+    logged = json.loads(formatted)
+    assert logged["level"] == "ERROR"
+    assert logged["message"] == (
+        "access token not checked: the configured key is unusable (JWKError)"
+    )
+    assert logged["action"] == "jwt_key_unusable"
+    assert logged["error_class"] == "JWKError"
+    assert "BEGIN PUBLIC KEY" not in formatted
+    assert "HMAC" not in formatted
+
+
+@pytest.mark.parametrize("shape", ["alg-none", "hs512", "wrong-key", "garbage"])
+def test_a_token_that_does_not_verify_is_not_logged(caplog, shape):
+    caplog.set_level(logging.DEBUG, logger="herd_common.auth")
+    token = {
+        "alg-none": _unsigned_token({"sub": "user-1"}),
+        "hs512": jwt.encode({"sub": "user-1"}, SECRET, algorithm="HS512"),
+        "wrong-key": _make_token({"sub": "user-1"}, secret="another-secret"),
+        "garbage": "not.a.token",
+    }[shape]
+    with pytest.raises(HTTPException) as exc_info:
+        get_current_user_payload(_creds(token))
+    assert exc_info.value.status_code == 401
+    assert [r for r in caplog.records if r.name == "herd_common.auth"] == []
+
+
+def test_hs512_service_accepts_its_own_tokens_only():
+    payload_dep, _ = make_auth_dependencies(SECRET, "HS512")
+    good = jwt.encode({"sub": "user-1"}, SECRET, algorithm="HS512")
+    assert payload_dep(_creds(good))["sub"] == "user-1"
+    with pytest.raises(HTTPException) as exc_info:
+        payload_dep(_creds(_make_token({"sub": "user-1"})))
     assert exc_info.value.status_code == 401
 
 

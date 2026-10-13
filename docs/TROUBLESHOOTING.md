@@ -38,7 +38,7 @@ compose environment. See [ENV_VARS.md](ENV_VARS.md#config-service).
 
 ### Services crash-loop on startup
 
-Most common cause: `AUTH_SECRET_KEY` is missing or empty. Either put it in `.env` or complete the config-service setup.
+Most common cause: `AUTH_SECRET_KEY` is missing, blank, or still the `.env.example` placeholder, and each service exits at startup with `AUTH_SECRET_KEY is unset, blank, or still a placeholder; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32`. Put a real value (`openssl rand -hex 32`) in `.env`, or complete the config-service setup. If a configuration was ever saved in the config UI (`config.json` with no `config.bootstrapped` marker beside it), that file outranks `.env`, so fixing `.env` alone does not help: enter the new value in the config UI and save, which refuses a blank or placeholder value. A value shaped like a public key, certificate, or JSON object stops the services with `AUTH_SECRET_KEY cannot be used as an HMAC secret; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32`; replace it the same way. A service process started outside compose with no `SECRET_KEY` at all reports `secret_key Field required` instead. An `AUTH_ALGORITHM` other than `HS256`, `HS384`, or `HS512` stops the services the same way, with `AUTH_ALGORITHM must be one of HS256, HS384, HS512`.
 
 Second most common: config service started but `config.json` was never written. Same fix as above.
 

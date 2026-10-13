@@ -125,7 +125,7 @@ while it is still due, so concurrent schedulers and replicas poll disjoint rows
 | POST | `/change-password` (config) | config session | 200 | OPS-CONFIG-8 |
 | GET | `/schema` (config) | anyone | 200 | OPS-CONFIG-10 |
 | GET | `/settings` (config) | config session | 200 | OPS-CONFIG-10 |
-| PUT | `/settings` (config) | config session, password rotated | 200 | OPS-CONFIG-9, OPS-CONFIG-11, OPS-CONFIG-12 |
+| PUT | `/settings` (config) | config session, password rotated | 200 | OPS-CONFIG-9, OPS-CONFIG-11, OPS-CONFIG-12, OPS-CONFIG-23 |
 | POST | `/apply` (config) | config session, password rotated | 200 | OPS-CONFIG-9, OPS-CONFIG-13 to OPS-CONFIG-16 |
 | POST | `/secrets` (secrets) | admin | 201 | OPS-SECRET-1, OPS-SECRET-2 |
 | GET | `/secrets` (secrets) | any signed-in user | 200 | OPS-SECRET-5 |
@@ -454,16 +454,17 @@ config service cannot be reached, the form stays enabled and a sign-in goes to a
 usual (IAM-UI-9 in `identity-and-access.md`).
 
 **Surfaces.** `services/config/app/` (`main.py`, `config_store.py`, `auth.py`,
-`docker_ctl.py`, `config_schema.py`); `frontend/src/pages/ConfigPage.tsx` and
+`docker_ctl.py`, `config_schema.py`, `auth_rules.py`); `frontend/src/pages/ConfigPage.tsx` and
 `frontend/src/stores/configStore.ts`. The login page's use of `GET /status` is
 `identity-and-access.md` (IAM-UI-9).
 
 **Rules.**
 
 - **OPS-CONFIG-1.** At startup, when `config.json` does not exist and every required
-  field has a non-blank environment value, the service writes the file from the
-  environment values of every schema field and writes the `config.bootstrapped` marker
-  beside it; otherwise it logs the missing names and writes nothing. \
+  field has a non-blank environment value and the access-token settings pass
+  OPS-CONFIG-23, the service writes the file from the environment values of every schema
+  field and writes the `config.bootstrapped` marker beside it; otherwise it logs the
+  missing names or the refusal and writes nothing. \
   Enforced in: `services/config/app/config_store.py` (`bootstrap_from_env`, `load_env_values`) \
   Pinned by: `services/config/tests/test_bootstrap.py` (`test_bootstrap_writes_config_when_required_env_set`, `test_bootstrap_writes_marker`, `test_bootstrap_skips_when_required_missing`, `test_bootstrap_skips_blank_required`, `test_lifespan_invokes_bootstrap`)
 - **OPS-CONFIG-2.** The bootstrap never overwrites an existing `config.json`. \
@@ -513,7 +514,8 @@ usual (IAM-UI-9 in `identity-and-access.md`).
 - **OPS-CONFIG-12.** A save may write only keys `CONFIG_SCHEMA` declares: a body naming
   any other key is 422 `{"errors": ["Unknown settings: <KEY>, ..."]}` (the unknown keys
   sorted, checked first) and writes nothing. A save missing a required field, or carrying
-  it blank, is 422 `{"errors": ["<KEY> is required", ...]}` and writes nothing. Otherwise
+  it blank, is 422 `{"errors": ["<KEY> is required", ...]}` and writes nothing, except
+  `AUTH_SECRET_KEY`, which reports OPS-CONFIG-23's message after those entries. Otherwise
   the body's values are written, and a key already in the file outside the schema (placed
   there by hand) is carried over unchanged. A file that is not a JSON object reads as
   empty. \
@@ -583,6 +585,22 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   wrong-password message a 401 gets; Sign in stays disabled for those N seconds. \
   Enforced in: `services/config/app/login_limits.py` (`LoginLimiter`, `source_delay_seconds`, `client_source`, `LIMITER`); `services/config/app/main.py` (`login`, `LOGIN_LOCKED_DETAIL`); `frontend/src/lib/errors.ts` (`loginRetryAfterText`, `loginRetryAfterSeconds`); `frontend/src/pages/ConfigPage.tsx` (`ConfigLogin`) \
   Pinned by: `frontend/src/test/lib/errors.test.ts` (`loginRetryAfterSeconds and loginRetryAfterText`); `frontend/src/test/pages/ConfigPage.test.tsx` (`shows the wait from Retry-After and disables Sign in until it passes`, `shows the server's sentence and keeps Sign in enabled when Retry-After is absent`, `treats a Retry-After that is not a whole number of seconds as no stated wait`, `keeps the wrong-password wording for a 401 and leaves Sign in enabled`); `services/config/tests/test_login_limits.py` (`test_source_delay_schedule_starts_after_the_third_failure_and_caps_at_60`, `test_each_failure_sets_the_scheduled_wait`, `test_wait_counts_down_and_expires`, `test_success_resets_the_source`, `test_sources_are_isolated`, `test_a_quiet_source_starts_over`, `test_global_lockout_after_max_attempts_across_sources`, `test_global_window_slides`, `test_success_clears_the_cross_source_count`, `test_tracked_sources_are_bounded`, `test_idle_sources_are_dropped`, `test_knobs_are_read_from_the_environment`, `test_knob_defaults`, `test_a_knob_that_is_not_a_positive_integer_falls_back_to_its_default`, `test_source_is_the_first_forwarded_address`, `test_source_falls_back_to_the_peer`, `test_lock_log_line_names_source_scope_and_wait`, `test_login_waits_after_the_third_failure`, `test_login_success_resets_the_count`, `test_login_sources_are_keyed_on_the_forwarded_address`, `test_login_global_lockout_refuses_every_source`, `test_login_lock_log_never_carries_the_password`, `test_login_limits_imports_only_the_standard_library`)
+
+- **OPS-CONFIG-23.** A save through `PUT /settings`, and the first-boot bootstrap, apply
+  the services' startup rules for the access-token settings (IAM-JWT-4) through a
+  standard-library copy, since the config service has no `herd_common`: an
+  `AUTH_SECRET_KEY` that is missing, not a string, has no printable character other than
+  white space, or, trimmed, starts with `<` and ends with `>` is refused with `AUTH_SECRET_KEY is unset, blank, or still a placeholder; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32`, a
+  masked `********` that resolves to such a value included (OPS-CONFIG-11); an
+  `AUTH_ALGORITHM` other than an empty string (which the services read as unset), HS256,
+  HS384, or HS512 is refused with `AUTH_ALGORITHM must be one of HS256, HS384, HS512`. A
+  save answers 422 `{"errors": [...]}` with these after any `<KEY> is required` entries
+  and writes nothing; the bootstrap logs them and writes nothing (OPS-CONFIG-1). The two
+  messages are the shared module's, spelled identically. The services' signing round trip
+  through jose is not copied, so a value only it refuses is refused at service startup
+  with `AUTH_SECRET_KEY cannot be used as an HMAC secret; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32`. \
+  Enforced in: `services/config/app/auth_rules.py` (`auth_setting_errors`, `secret_key_refused`, `algorithm_refused`, `SECRET_KEY_REFUSED_MESSAGE`, `ALGORITHM_REFUSED_MESSAGE`); `services/config/app/config_store.py` (`save_config`, `bootstrap_from_env`) \
+  Pinned by: `services/config/tests/test_auth_rules.py` (`test_messages_are_the_shared_modules_spelled_identically`, `test_the_copy_refuses_the_secrets_the_shared_rule_refuses`, `test_the_copy_refuses_other_algorithms`, `test_save_refuses_a_blank_or_placeholder_secret_and_writes_nothing`, `test_save_refuses_an_rs256_algorithm_and_writes_nothing`, `test_save_reports_every_refusal_together`, `test_save_refusal_leaves_an_existing_file_unchanged`, `test_put_refuses_with_the_shared_message_and_leaves_the_file`, `test_put_keeping_a_stored_placeholder_secret_is_refused`, `test_put_keeping_an_env_placeholder_secret_is_refused`, `test_bootstrap_with_a_placeholder_secret_writes_nothing`, `test_bootstrap_with_an_rs256_algorithm_writes_nothing`, `test_bootstrap_with_good_auth_settings_writes`)
 
 **Out of scope.** The superadmin seed that reads `SUPERADMIN_*` (`identity-and-access.md`,
 IAM-BOOT-1 to IAM-BOOT-5); the meaning of each field (each area's Configuration section).
