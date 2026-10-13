@@ -1,3 +1,5 @@
+import base64
+import json
 import time
 import uuid
 
@@ -71,6 +73,53 @@ def test_empty_sub_raises_401():
 def test_malformed_token_raises_401():
     with pytest.raises(HTTPException) as exc_info:
         get_current_user_payload(_creds("not.a.jwt"))
+    assert exc_info.value.status_code == 401
+
+
+# --- algorithm list and key errors ---
+
+# jose refuses this as an HMAC secret (it is shaped like a public key) and raises
+# JWKError, a JOSEError that is not a JWTError, while building the key.
+ASYMMETRIC_SHAPED_KEY = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQc=\n"
+
+
+def _unsigned_token(payload: dict) -> str:
+    def _segment(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    return f"{_segment({'alg': 'none', 'typ': 'JWT'})}.{_segment(payload)}."
+
+
+def test_token_with_alg_none_raises_401():
+    with pytest.raises(HTTPException) as exc_info:
+        get_current_user_payload(_creds(_unsigned_token({"sub": "user-1", "role": "admin"})))
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Could not validate credentials"
+
+
+def test_token_signed_with_another_hmac_algorithm_raises_401():
+    token = jwt.encode({"sub": "user-1"}, SECRET, algorithm="HS512")
+    with pytest.raises(HTTPException) as exc_info:
+        get_current_user_payload(_creds(token))
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Could not validate credentials"
+
+
+def test_key_that_jose_cannot_use_raises_401_not_a_key_error():
+    payload_dep, _ = make_auth_dependencies(ASYMMETRIC_SHAPED_KEY, ALG)
+    token = _make_token({"sub": "user-1"})
+    with pytest.raises(HTTPException) as exc_info:
+        payload_dep(_creds(token))
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Could not validate credentials"
+
+
+def test_hs512_service_accepts_its_own_tokens_only():
+    payload_dep, _ = make_auth_dependencies(SECRET, "HS512")
+    good = jwt.encode({"sub": "user-1"}, SECRET, algorithm="HS512")
+    assert payload_dep(_creds(good))["sub"] == "user-1"
+    with pytest.raises(HTTPException) as exc_info:
+        payload_dep(_creds(_make_token({"sub": "user-1"})))
     assert exc_info.value.status_code == 401
 
 

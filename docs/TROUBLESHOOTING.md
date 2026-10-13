@@ -38,7 +38,7 @@ compose environment. See [ENV_VARS.md](ENV_VARS.md#config-service).
 
 ### Services crash-loop on startup
 
-Most common cause: `AUTH_SECRET_KEY` is missing or empty. Either put it in `.env` or complete the config-service setup.
+Most common cause: `AUTH_SECRET_KEY` is missing, blank, or still the `.env.example` placeholder, and each service exits at startup with `AUTH_SECRET_KEY is unset, blank, or still a placeholder; set it in .env to a random value, for example the output of openssl rand -hex 32`. Either put a real value in `.env` or complete the config-service setup. An `AUTH_ALGORITHM` other than `HS256`, `HS384`, or `HS512` stops the services the same way, with `AUTH_ALGORITHM must be one of HS256, HS384, HS512`.
 
 Second most common: config service started but `config.json` was never written. Same fix as above.
 

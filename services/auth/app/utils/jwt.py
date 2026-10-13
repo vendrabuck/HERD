@@ -2,7 +2,7 @@ import hashlib
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from jose import jwt
+from jose import JOSEError, JWTError, jwt
 
 from app.config import settings
 
@@ -28,5 +28,16 @@ def hash_token(raw_token: str) -> str:
 
 
 def verify_access_token(token: str) -> dict:
-    """Raises JWTError if invalid. Returns payload dict."""
-    return jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+    """Return the payload of a token that verifies; raise JWTError otherwise.
+
+    jose raises JWTError for a token that does not verify and other JOSEError
+    subclasses (JWKError) when the configured key cannot be used for the
+    algorithm. Both are raised here as JWTError, so every caller's single
+    `except JWTError` answers 401 rather than letting a key error become a 500.
+    """
+    try:
+        return jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+    except JWTError:
+        raise
+    except JOSEError as exc:
+        raise JWTError("token could not be verified") from exc

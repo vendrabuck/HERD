@@ -1,6 +1,7 @@
 import logging
 from typing import Literal
 
+from herd_common.auth_settings import AuthSecretKey, JwtAlgorithm
 from herd_common.base_settings import HerdBaseSettings
 from pydantic import Field, field_validator
 
@@ -8,8 +9,8 @@ logger = logging.getLogger(__name__)
 
 
 class Settings(HerdBaseSettings):
-    secret_key: str = "ai-orchestrator-dev-secret"
-    algorithm: str = "HS256"
+    secret_key: AuthSecretKey
+    algorithm: JwtAlgorithm = "HS256"
     cors_origins: str = ""
 
     # First-time DB integration for ai-orchestrator (Branch 3: multi-turn chat).

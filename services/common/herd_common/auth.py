@@ -18,7 +18,7 @@ import uuid
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError, jwt
+from jose import JOSEError, jwt
 
 ADMIN_ROLES = {"admin", "superadmin"}
 
@@ -57,7 +57,10 @@ def make_auth_dependencies(secret_key: str, algorithm: str = "HS256"):
             if not payload.get("sub"):
                 raise credentials_exception
             return payload
-        except JWTError:
+        except JOSEError:
+            # JOSEError is the base of JWTError and of the key errors jose raises
+            # while building the verification key, so a token or a key that cannot
+            # be verified answers the same 401.
             raise credentials_exception
 
     def require_admin(
