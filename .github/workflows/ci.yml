@@ -136,6 +136,16 @@ jobs:
       - name: Test
         run: cd frontend && npm test
 
+      # The runner's clock is UTC, so the step above can never see a date bug
+      # that only shows up in a local zone or across a daylight saving change.
+      # Run the same suite once more in a zone that observes DST. TZ lives in
+      # the step env (not a shell prefix) so tests/unit/test_ci_frontend_tz_wiring.py
+      # can read it from this file.
+      - name: Test (non-UTC time zone, America/Los_Angeles)
+        env:
+          TZ: America/Los_Angeles
+        run: cd frontend && npm test
+
       - name: Build
         run: cd frontend && npm run build
 
