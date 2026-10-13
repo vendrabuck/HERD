@@ -26,7 +26,7 @@ There are two ways to get past the "login disabled" gate on a brand-new stack. P
 
 ### Option A: fill `.env` and skip the UI (recommended)
 
-If your `.env` already has every required value, the config service auto-bootstraps on first startup. On boot, the service checks `/data/herd-config/config.json`; if the file is missing and every required var is present and non-empty in the process environment, it writes the file from those vars and the login form enables immediately. No wrench-icon detour, no manual paste.
+If your `.env` already has every required value, the config service auto-bootstraps on first startup. On boot, the service checks `/data/herd-config/config.json`; if the file is missing, every required var is present and non-empty in the process environment, and `AUTH_SECRET_KEY` and `AUTH_ALGORITHM` pass the services' startup rules (the secret not a `<...>` placeholder; the algorithm, when set, `HS256`, `HS384`, or `HS512`), it writes the file from those vars and the login form enables immediately. No wrench-icon detour, no manual paste.
 
 Required values (also listed in `.env.example`):
 
@@ -38,7 +38,7 @@ Optional but recommended: `SUPERADMIN_EMAIL`, `SUPERADMIN_USERNAME`, `SUPERADMIN
 
 Optional: `AI_API_KEY` and `AI_MODEL` enable AI topology generation. Leaving them blank is supported; the Use AI button just stays hidden.
 
-If any required var is missing, the config service logs a warning listing them and falls back to Option B.
+If any required var is missing, the config service logs a warning listing them and falls back to Option B; a refused `AUTH_SECRET_KEY` or `AUTH_ALGORITHM` is logged the same way, with the refusal message, and nothing is written.
 
 ### Option B: use the config UI
 
@@ -46,7 +46,7 @@ If any required var is missing, the config service logs a warning listing them a
 2. Click the wrench icon on the login page.
 3. Log in with the config-page password: set `CONFIG_ADMIN_PASSWORD` to choose it, or read the random password the config service generates and logs once, at WARNING, on first boot (`docker compose logs config`).
 4. If you used the generated password, you must change it (min 8, max 32 chars) before the config write and apply actions unlock. Until you change it, the generated password stays a working config login for anyone who can read the config container's log, including any log shipper that collects it: that session can read the merged settings (secret values masked) and change the password, which unlocks save and restart. Either set `CONFIG_ADMIN_PASSWORD` or change the generated password promptly, and treat the config container's log as sensitive until you do.
-5. Fill in the required database, auth, and API-token fields (same required list as above). The superadmin fields are optional; if you skip them, create the first admin account through the UI afterward. The page saves only the settings its schema lists: a save that names any other key is refused with 422 `Unknown settings: <keys>` and writes nothing, and a key placed in `config.json` by hand outside the schema is not shown in the editor and is carried over unchanged by the next save.
+5. Fill in the required database, auth, and API-token fields (same required list as above). A blank or `<...>` placeholder `AUTH_SECRET_KEY`, or a set `AUTH_ALGORITHM` other than `HS256`, `HS384`, or `HS512`, is refused with 422 and nothing is written. The superadmin fields are optional; if you skip them, create the first admin account through the UI afterward. The page saves only the settings its schema lists: a save that names any other key is refused with 422 `Unknown settings: <keys>` and writes nothing, and a key placed in `config.json` by hand outside the schema is not shown in the editor and is carried over unchanged by the next save.
 6. Click **Save and Restart**. The config service writes `config.json` to the shared Docker volume and restarts this compose project's app services via the Docker socket (config, traefik, postgres, nats, and the frontend are skipped; other compose projects on the host are never touched). If a restart fails, the response's `errors` list names what failed and the exception class only (for example `Cannot connect to Docker: DockerException`); the full text is in the config service log (issue #1086).
 7. Once containers come back healthy (`docker compose ps`), the login form re-enables and you can sign in as the superadmin.
 
@@ -66,6 +66,8 @@ make migrate                     # alembic upgrade head for every service
 ```
 
 The order matters. `make migrate` execs into the running containers, and `make restart` (`docker compose restart`) never swaps a container onto a rebuilt image, so migrating or restarting before the `docker compose up -d` recreate would run the OLD image's migration files. Recreate first, then migrate: the exec then sees the new release's migrations.
+
+Check `AUTH_SECRET_KEY` and `AUTH_ALGORITHM` when upgrading past the access-token settings validation: every service except config refuses to start while `AUTH_SECRET_KEY` is unset, blank, still a `<...>` placeholder, or not usable as an HMAC key, or while `AUTH_ALGORITHM` is anything but `HS256`, `HS384`, or `HS512`, and the log line names the variable. Fix the value in `.env`, or in the config UI if a configuration was saved there. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#services-crash-loop-on-startup).
 
 Check outbound webhook subscriptions when upgrading past the webhook destination rule: a subscription whose `target_url` host resolves to a loopback, private, or other non-public address now records `failed` deliveries with `destination not allowed` and is not sent to. Under `make prod`, `WEBHOOK_ALLOWED_HOSTS` is empty; name each internal receiver there (a hostname or a CIDR) before upgrading, or re-register it at a public address. See [EXTERNAL_API.md](EXTERNAL_API.md#destination-rule).
 
@@ -332,7 +334,7 @@ There is no built-in Prometheus/Grafana stack; roll your own based on the JSON l
 A missing `config.json` is not an error for the app services: every setting falls back to the environment, so a stack whose `.env` carries the required values keeps running, and a running service keeps the values it read at startup. What is lost:
 
 - Values saved only through the config UI. Each service picks up the environment value for those keys at its next restart; restore the volume from a backup (see Backup and restore) to get them back.
-- The login page's configured state. It shows the setup banner until `config.json` exists again. The config service writes it from the environment at its next start when every required variable is set (`docker compose restart config`); otherwise go through the wrench-icon flow (same flow as initial setup).
+- The login page's configured state. It shows the setup banner until `config.json` exists again. The config service writes it from the environment at its next start when every required variable is set and the access-token settings pass its check (`docker compose restart config`); otherwise go through the wrench-icon flow (same flow as initial setup).
 - The config-page password file. The config service generates and logs a new password on its next use unless `CONFIG_ADMIN_PASSWORD` is set.
 
 ### Main commit accidentally force-pushed

@@ -8,7 +8,7 @@ Common failure modes and how to diagnose them. Organized by what the user sees.
 
 `config.json` has not been written to the `herd-config` volume, so the login page is gating behind the setup flow. Two fixes:
 
-- Put every required value in `.env` (see `.env.example`) and `make restart`. The config service's first-start auto-bootstrap will write `config.json` from the env on boot, and the login form will enable. Check `docker compose logs config` for a message like `Config bootstrapped from environment` or a warning naming the missing var.
+- Put every required value in `.env` (see `.env.example`) and `make restart`. The config service's first-start auto-bootstrap will write `config.json` from the env on boot, and the login form will enable. If it does not, `docker compose logs config` carries a warning beginning `Config auto-bootstrap skipped;` that names the missing var or quotes the refusal of `AUTH_SECRET_KEY` or `AUTH_ALGORITHM` (the success line is logged at INFO, which the config service does not emit).
 - Or click the wrench icon on the login page, log in with the config-page password (set `CONFIG_ADMIN_PASSWORD`, or read the generated password from `docker compose logs config`; it stays valid until you change it), fill in required settings, and click **Save and Restart**.
 
 See [OPERATIONS.md](OPERATIONS.md#config-service-first-run).
@@ -235,7 +235,7 @@ By design: when `AI_API_KEY` is blank, `GET /api/ai/status` returns `{"enabled":
 
 ### Driver upload fails with `422`
 
-File type or size issue. Allowed: `.zip` or `.tar.gz`, max 10 MB. Check filename and size.
+File type or size issue. Allowed: `.zip` or `.tar.gz`, max 10 MB. Check filename and size. A package under that cap is still refused when its `driver_metadata.json` is over 1 MiB (`driver_metadata.json is larger than 1048576 bytes; nothing was stored`) or a `.tar.gz` holds a pax extended header or GNU long name over 1 MiB (`Driver package has a tar header record over 1048576 bytes ...`); nothing is stored. See [DRIVERS.md](DRIVERS.md).
 
 ### Driver upload fails with `409`
 

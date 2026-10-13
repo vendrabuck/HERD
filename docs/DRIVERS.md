@@ -165,7 +165,8 @@ and the execution sandbox refuses to spawn the subprocess as a second-line defen
 
 The file carries every capability declaration a driver makes. All of them are
 opt-in and closed by default: a missing file, unreadable JSON, or a silent field
-means the driver declares nothing.
+means the driver declares nothing. A file over 1 MiB is not read as nothing: the upload
+refuses it with 422 (see the package limits above).
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|

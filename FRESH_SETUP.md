@@ -51,7 +51,7 @@ SECRETS_KEK=<generate with: python3 -c "import os,base64; print(base64.b64encode
 NATS_URL=nats://nats:4222
 ```
 
-The `AUTH_SECRET_KEY` and `INTERNAL_API_TOKEN` should be unique random strings. Every backend service refuses to start while `AUTH_SECRET_KEY` is blank, still a `<...>` placeholder, or not usable as an HMAC key (a public key or JSON shape), and `AUTH_ALGORITHM` must be `HS256`, `HS384`, or `HS512`.
+The `AUTH_SECRET_KEY` and `INTERNAL_API_TOKEN` should be unique random strings. Every backend service except config refuses to start while `AUTH_SECRET_KEY` is blank, still a `<...>` placeholder, or not usable as an HMAC key (a public key or JSON shape), and `AUTH_ALGORITHM` must be `HS256`, `HS384`, or `HS512`.
 The superadmin account is created on first startup only; these values are ignored on subsequent restarts.
 
 `SECRETS_KEK` is the encryption key for the secrets service (base64-encoded 32
