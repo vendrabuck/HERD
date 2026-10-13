@@ -5,7 +5,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from herd_common.auth import caller_id as _caller_id
-from herd_common.auth import make_auth_dependencies
+from herd_common.auth import log_unusable_key, make_auth_dependencies
 from jose import JOSEError, JWTError, jwt
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,7 +47,8 @@ def get_bearer_credentials(
             raise JWTError("missing sub")
     except JOSEError as exc:
         # JOSEError covers JWTError and the key errors jose raises while building
-        # the verification key, so both answer 401.
+        # the verification key, so both answer 401; a key error is also logged.
+        log_unusable_key(logger, exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not validate credentials",

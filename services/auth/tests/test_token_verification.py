@@ -10,15 +10,18 @@ as JWTError.
 
 import base64
 import json
+import logging
 import uuid
 
 import pytest
 from app.config import settings
 from app.dependencies.auth import _ClaimAvailability, _decode_role_claim, get_current_user
 from app.services.auth_service import create_user
+from app.utils import jwt as jwt_utils
 from app.utils.jwt import create_access_token, verify_access_token
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
+from herd_common.logging import JSONFormatter
 from jose import JWTError, jwt
 from starlette.requests import Request
 
@@ -75,6 +78,50 @@ def test_verify_raises_a_key_error_as_jwterror(monkeypatch):
         verify_access_token(token)
     assert type(exc_info.value) is JWTError
     assert type(exc_info.value.__cause__).__name__ == "JWKError"
+
+
+def test_verify_gives_decode_exactly_the_configured_algorithm(monkeypatch):
+    seen: list = []
+    real_decode = jwt_utils.jwt.decode
+
+    def recording_decode(*args, **kwargs):
+        seen.append(kwargs.get("algorithms"))
+        return real_decode(*args, **kwargs)
+
+    monkeypatch.setattr(jwt_utils.jwt, "decode", recording_decode)
+    verify_access_token(create_access_token({"sub": str(uuid.uuid4())}))
+    with pytest.raises(JWTError):
+        verify_access_token(_unsigned_token({"sub": str(uuid.uuid4())}))
+    assert seen == [[settings.algorithm], [settings.algorithm]]
+
+
+def test_verify_logs_a_key_error_once_by_class_name(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG, logger="app.utils.jwt")
+    token = create_access_token({"sub": str(uuid.uuid4())})
+    monkeypatch.setattr(settings, "secret_key", ASYMMETRIC_SHAPED_KEY)
+    with pytest.raises(JWTError):
+        verify_access_token(token)
+    records = [r for r in caplog.records if r.name == "app.utils.jwt"]
+    assert len(records) == 1
+    formatted = JSONFormatter("auth").format(records[0])
+    logged = json.loads(formatted)
+    assert logged["level"] == "ERROR"
+    assert logged["message"] == (
+        "access token not checked: the configured key is unusable (JWKError)"
+    )
+    assert logged["action"] == "jwt_key_unusable"
+    assert logged["error_class"] == "JWKError"
+    assert "BEGIN PUBLIC KEY" not in formatted
+
+
+@pytest.mark.parametrize("shape", ["alg-none", "hs512"])
+def test_verify_does_not_log_a_token_that_does_not_verify(caplog, shape):
+    caplog.set_level(logging.DEBUG, logger="app.utils.jwt")
+    payload = {"sub": str(uuid.uuid4())}
+    token = _unsigned_token(payload) if shape == "alg-none" else _hs512_token(payload)
+    with pytest.raises(JWTError):
+        verify_access_token(token)
+    assert [r for r in caplog.records if r.name == "app.utils.jwt"] == []
 
 
 # --- get_current_user ---

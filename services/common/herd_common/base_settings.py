@@ -25,9 +25,13 @@ class HerdBaseSettings(BaseSettings):
     herd_common.config_loader.herd_settings_sources for the file-vs-env
     ordering rules) and the shared .env model_config once. The config
     service has no Settings model and does not use this base class.
+
+    `hide_input_in_errors` keeps the refused value out of the text of a
+    ValidationError, which a service prints when its Settings fail to load; the
+    message still names the field and the rule.
     """
 
-    model_config = {"env_file": ".env", "case_sensitive": False}
+    model_config = {"env_file": ".env", "case_sensitive": False, "hide_input_in_errors": True}
 
     @classmethod
     def settings_customise_sources(

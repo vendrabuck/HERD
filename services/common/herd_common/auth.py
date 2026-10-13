@@ -12,15 +12,45 @@ Usage in a service:
 the payload's `sub` claim into a UUID:
     from herd_common.auth import caller_id
     user_id = caller_id(payload)
+
+`log_unusable_key` is shared by the three token decode sites (this module's
+dependency, auth's `verify_access_token`, notifications' `get_bearer_credentials`):
+each answers 401 for any `JOSEError`, and one that is not a `JWTError` is a key
+jose could not use, a server-side setting rather than a bad token, so it is
+logged once at ERROR with the exception class name only.
 """
 
+import logging
 import uuid
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JOSEError, jwt
+from jose import JOSEError, JWTError, jwt
+
+logger = logging.getLogger(__name__)
 
 ADMIN_ROLES = {"admin", "superadmin"}
+
+KEY_UNUSABLE_LOG_MESSAGE = "access token not checked: the configured key is unusable (%s)"
+
+
+def log_unusable_key(log: logging.Logger, exc: JOSEError) -> None:
+    """Log a key error raised while verifying a token, by class name only.
+
+    A `JWTError` is a token that did not verify and is not logged; any other
+    `JOSEError` (JWKError, JWSError raised while building the key) is logged at
+    ERROR with action `jwt_key_unusable` and the class name. The exception text
+    is never logged.
+    """
+    if isinstance(exc, JWTError):
+        return
+    error_class = type(exc).__name__
+    log.error(
+        KEY_UNUSABLE_LOG_MESSAGE,
+        error_class,
+        extra={"action": "jwt_key_unusable", "error_class": error_class},
+    )
+
 
 bearer_scheme = HTTPBearer()
 
@@ -57,10 +87,11 @@ def make_auth_dependencies(secret_key: str, algorithm: str = "HS256"):
             if not payload.get("sub"):
                 raise credentials_exception
             return payload
-        except JOSEError:
+        except JOSEError as exc:
             # JOSEError is the base of JWTError and of the key errors jose raises
             # while building the verification key, so a token or a key that cannot
-            # be verified answers the same 401.
+            # be verified answers the same 401; a key error is also logged.
+            log_unusable_key(logger, exc)
             raise credentials_exception
 
     def require_admin(

@@ -15,6 +15,7 @@ from herd_common.auth_settings import (
     ALGORITHM_REFUSED_MESSAGE,
     MIN_SECRET_KEY_BYTES,
     SECRET_KEY_REFUSED_MESSAGE,
+    SECRET_KEY_UNUSABLE_MESSAGE,
     AuthSecretKey,
     JwtAlgorithm,
     validate_auth_secret,
@@ -25,8 +26,14 @@ from pydantic import BaseModel, ValidationError
 LOGGER_NAME = "herd_common.auth_settings"
 
 EXPECTED_SECRET_MESSAGE = (
-    "AUTH_SECRET_KEY is unset, blank, or still a placeholder; set it in .env to a "
-    "random value, for example the output of openssl rand -hex 32"
+    "AUTH_SECRET_KEY is unset, blank, or still a placeholder; set it in .env, or in "
+    "the config UI if a configuration was saved there, to a random value, for "
+    "example the output of openssl rand -hex 32"
+)
+EXPECTED_UNUSABLE_MESSAGE = (
+    "AUTH_SECRET_KEY cannot be used as an HMAC secret; set it in .env, or in the "
+    "config UI if a configuration was saved there, to a random value, for example "
+    "the output of openssl rand -hex 32"
 )
 EXPECTED_ALGORITHM_MESSAGE = "AUTH_ALGORITHM must be one of HS256, HS384, HS512"
 
@@ -42,6 +49,7 @@ def _records(caplog) -> list[logging.LogRecord]:
 
 def test_messages_are_the_documented_wording():
     assert SECRET_KEY_REFUSED_MESSAGE == EXPECTED_SECRET_MESSAGE
+    assert SECRET_KEY_UNUSABLE_MESSAGE == EXPECTED_UNUSABLE_MESSAGE
     assert ALGORITHM_REFUSED_MESSAGE == EXPECTED_ALGORITHM_MESSAGE
     assert MIN_SECRET_KEY_BYTES == 32
 
@@ -59,6 +67,10 @@ def test_messages_are_the_documented_wording():
         "  <secret key goes here>  ",
         "<your secret>",
         "<>",
+        "\u200b",
+        "\ufeff",
+        " \u200b\ufeff\t",
+        "\u200b" * 40,
     ],
     ids=[
         "empty",
@@ -68,6 +80,10 @@ def test_messages_are_the_documented_wording():
         "padded-placeholder",
         "other-placeholder-wording",
         "bare-angle-brackets",
+        "zero-width-space",
+        "byte-order-mark",
+        "invisible-and-space",
+        "forty-zero-width-spaces",
     ],
 )
 def test_secret_refused_with_the_fixed_message(value, caplog):
@@ -133,6 +149,77 @@ def test_secret_is_returned_unchanged_including_surrounding_space():
     assert validate_auth_secret(value) == value
 
 
+# Shapes jose will not sign and verify with as an HMAC secret: a PEM public key,
+# an RSA public key, a certificate, and an ssh public key are refused while the
+# key is built; a JSON-shaped value signs but is read as a JSON Web Key on
+# verify, so no token it signs verifies.
+_UNUSABLE_SECRETS = {
+    "pem-public-key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQc=\n"
+    "-----END PUBLIC KEY-----",
+    "rsa-public-key": "-----BEGIN RSA PUBLIC KEY-----\nMIIBCgKCAQEAu1SU1LfVLPHCozMxH2Mo\n"
+    "-----END RSA PUBLIC KEY-----",
+    "certificate": "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUZ2Vu\n"
+    "-----END CERTIFICATE-----",
+    "ssh-public-key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7 user@host",
+    "json-web-key": '{"kty": "oct", "k": "c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0"}',
+    "json-object": '{"secret": "0123456789abcdef0123456789abcdef"}',
+}
+
+
+@pytest.mark.parametrize("name", sorted(_UNUSABLE_SECRETS))
+def test_secret_jose_cannot_sign_and_verify_with_is_refused(name, caplog):
+    caplog.set_level(logging.DEBUG)
+    value = _UNUSABLE_SECRETS[name]
+    with pytest.raises(ValidationError) as exc_info:
+        _Model(secret_key=value)
+    errors = exc_info.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["loc"] == ("secret_key",)
+    assert errors[0]["msg"] == f"Value error, {EXPECTED_UNUSABLE_MESSAGE}"
+    # The round trip neither logs nor echoes the value, or any line of it.
+    assert caplog.records == []
+    assert all(line not in errors[0]["msg"] for line in value.splitlines())
+
+
+def test_the_round_trip_signs_and_verifies_with_the_value_itself(monkeypatch):
+    seen: list = []
+    real_encode = auth_settings.jwt.encode
+    real_decode = auth_settings.jwt.decode
+
+    def recording_encode(claims, key, algorithm):
+        seen.append(("encode", key, algorithm))
+        return real_encode(claims, key, algorithm=algorithm)
+
+    def recording_decode(token, key, algorithms):
+        seen.append(("decode", key, algorithms))
+        return real_decode(token, key, algorithms=algorithms)
+
+    monkeypatch.setattr(auth_settings.jwt, "encode", recording_encode)
+    monkeypatch.setattr(auth_settings.jwt, "decode", recording_decode)
+    value = "k" * 40
+    assert validate_auth_secret(value) == value
+    assert seen == [("encode", value, "HS256"), ("decode", value, ["HS256"])]
+
+
+def test_a_blank_or_placeholder_secret_is_refused_before_the_round_trip(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("the round trip ran")
+
+    monkeypatch.setattr(auth_settings.jwt, "encode", fail)
+    for value in ("", "<secret key goes here>", "\u200b"):
+        with pytest.raises(ValueError) as exc_info:
+            validate_auth_secret(value)
+        assert str(exc_info.value) == EXPECTED_SECRET_MESSAGE
+
+
+def test_a_short_secret_that_jose_cannot_use_is_refused_without_the_warning(caplog):
+    caplog.set_level(logging.DEBUG, logger=LOGGER_NAME)
+    with pytest.raises(ValueError) as exc_info:
+        validate_auth_secret("ssh-rsa AAAA")
+    assert str(exc_info.value) == EXPECTED_UNUSABLE_MESSAGE
+    assert _records(caplog) == []
+
+
 # --- the algorithm ---
 
 
@@ -189,12 +276,57 @@ def test_settings_refuse_an_empty_secret_key_env(monkeypatch, tmp_path):
     ]
 
 
+def test_settings_refuse_the_placeholder_from_a_saved_config_file(monkeypatch, tmp_path):
+    # A file saved in the config UI (no bootstrap marker) outranks the
+    # environment, so a placeholder there is refused even when env is good.
+    config_file = tmp_path / "config.json"
+    config_file.write_text('{"AUTH_SECRET_KEY": "<secret key goes here>"}')
+    from herd_common import base_settings, config_loader
+
+    # Patched, not reloaded, so the path is restored after the test.
+    monkeypatch.setattr(config_loader, "CONFIG_FILE", str(config_file))
+
+    class Settings(base_settings.HerdBaseSettings):
+        model_config = {"env_file": None}
+        secret_key: auth_settings.AuthSecretKey
+
+    monkeypatch.setenv("SECRET_KEY", "k" * 40)
+    with pytest.raises(ValidationError) as exc_info:
+        Settings()
+    assert [(e["loc"], e["msg"]) for e in exc_info.value.errors()] == [
+        (("secret_key",), f"Value error, {EXPECTED_SECRET_MESSAGE}")
+    ]
+
+
 def test_settings_refuse_the_placeholder_from_env(monkeypatch, tmp_path):
     settings_cls = _settings_cls(monkeypatch, tmp_path)
     monkeypatch.setenv("SECRET_KEY", "<secret key goes here>")
     with pytest.raises(ValidationError) as exc_info:
         settings_cls()
     assert exc_info.value.errors()[0]["msg"] == f"Value error, {EXPECTED_SECRET_MESSAGE}"
+
+
+def test_settings_refuse_an_unusable_secret_from_env(monkeypatch, tmp_path):
+    settings_cls = _settings_cls(monkeypatch, tmp_path)
+    monkeypatch.setenv("SECRET_KEY", _UNUSABLE_SECRETS["ssh-public-key"])
+    with pytest.raises(ValidationError) as exc_info:
+        settings_cls()
+    assert [(e["loc"], e["msg"]) for e in exc_info.value.errors()] == [
+        (("secret_key",), f"Value error, {EXPECTED_UNUSABLE_MESSAGE}")
+    ]
+
+
+def test_settings_error_text_names_the_field_and_rule_but_not_the_value(monkeypatch, tmp_path):
+    settings_cls = _settings_cls(monkeypatch, tmp_path)
+    value = "<my-real-Secr3t-value-0123456789abcdef>"
+    monkeypatch.setenv("SECRET_KEY", value)
+    with pytest.raises(ValidationError) as exc_info:
+        settings_cls()
+    text = str(exc_info.value)
+    assert "secret_key" in text
+    assert EXPECTED_SECRET_MESSAGE in text
+    assert "Secr3t" not in text
+    assert "input_value" not in text
 
 
 def test_settings_require_the_secret_key(monkeypatch, tmp_path):

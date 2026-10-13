@@ -1,10 +1,14 @@
 import hashlib
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from herd_common.auth import log_unusable_key
 from jose import JOSEError, JWTError, jwt
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 def create_access_token(data: dict) -> str:
@@ -33,11 +37,13 @@ def verify_access_token(token: str) -> dict:
     jose raises JWTError for a token that does not verify and other JOSEError
     subclasses (JWKError) when the configured key cannot be used for the
     algorithm. Both are raised here as JWTError, so every caller's single
-    `except JWTError` answers 401 rather than letting a key error become a 500.
+    `except JWTError` answers 401 rather than letting a key error become a 500;
+    a key error is logged by class name first (`log_unusable_key`).
     """
     try:
         return jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
     except JWTError:
         raise
     except JOSEError as exc:
+        log_unusable_key(logger, exc)
         raise JWTError("token could not be verified") from exc

@@ -421,22 +421,39 @@ service checks on its own; the browser renews it silently with the refresh token
   Enforced in: `services/auth/app/dependencies/auth.py` (`get_current_user`) \
   Pinned by: `services/auth/tests/test_auth.py` (`test_me_without_token`, `test_me_with_invalid_token`, `test_me_with_non_uuid_subject_returns_401`, `test_me_with_empty_bearer`, `test_me_without_bearer_prefix`); `services/auth/tests/test_routers_direct.py` (`test_get_current_user_nonexistent_user`, `test_get_current_user_inactive_user`, `test_get_current_user_no_sub_in_token`)
 - **IAM-JWT-4.** Every service that checks access tokens validates its token settings
-  when its Settings model loads: `AUTH_SECRET_KEY` (read as `SECRET_KEY`) that is unset,
-  blank, or a placeholder (a value that, trimmed, starts with `<` and ends with `>`) is
-  refused with `AUTH_SECRET_KEY is unset, blank, or still a placeholder; set it in .env to
-  a random value, for example the output of openssl rand -hex 32`, so the service does not
-  start; a value under 32 bytes in UTF-8 loads and logs one warning giving only its byte
-  length; and `AUTH_ALGORITHM` (read as `ALGORITHM`) must be HS256, HS384, or HS512, else
-  `AUTH_ALGORITHM must be one of HS256, HS384, HS512`. Every service's Settings model
-  declares the two fields with the shared types and no secret default. \
-  Enforced in: `services/common/herd_common/auth_settings.py` (`validate_auth_secret`, `validate_jwt_algorithm`, `AuthSecretKey`, `JwtAlgorithm`, `SECRET_KEY_REFUSED_MESSAGE`, `ALGORITHM_REFUSED_MESSAGE`) \
-  Pinned by: `services/common/tests/test_auth_settings.py` (`test_secret_refused_with_the_fixed_message`, `test_secret_of_31_bytes_loads_and_logs_one_warning_with_only_the_length`, `test_secret_of_32_bytes_loads_and_logs_nothing`, `test_other_algorithms_are_refused_naming_the_three_allowed`, `test_settings_refuse_an_empty_secret_key_env`, `test_settings_require_the_secret_key`); `tests/unit/test_jwt_settings_wiring.py` (`test_every_settings_model_uses_the_shared_types`)
+  when its Settings model loads, so the service does not start on a refused value.
+  `AUTH_SECRET_KEY` (read as `SECRET_KEY`) is refused with `AUTH_SECRET_KEY is unset, blank, or still a placeholder; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32` when it has no printable
+  character other than white space (empty, white space only, or only invisible format
+  characters such as a zero-width space or a byte-order mark) or when, trimmed, it starts
+  with `<` and ends with `>` (a placeholder). Under compose an `AUTH_SECRET_KEY` missing
+  from `.env` reaches every service as an empty `SECRET_KEY` (compose passes an unset
+  variable as blank) and gets that message too; a process started with no `SECRET_KEY` at
+  all fails instead with pydantic's `secret_key Field required`. A value jose cannot sign
+  and then verify one HS256 token with (a PEM public key, certificate, or ssh public key
+  shape, or a JSON-shaped value, which jose reads as a JSON Web Key on verify) is refused
+  with `AUTH_SECRET_KEY cannot be used as an HMAC secret; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32`; the check neither logs nor returns the value. A value under 32 bytes in
+  UTF-8 loads and logs one warning giving only its byte length; it fires when the module's
+  `Settings()` runs at import, before the service sets up logging, so it is a plain-text
+  line. `AUTH_ALGORITHM` (read as `ALGORITHM`) must be HS256, HS384, or HS512, else
+  `AUTH_ALGORITHM must be one of HS256, HS384, HS512`. A configuration saved in the config
+  UI outranks the environment (OPS-SET-1), so a refused value in `config.json` stops the
+  services with the same messages, which name both places; the config UI's save and the
+  first-boot bootstrap refuse a blank or placeholder secret and another algorithm before
+  writing (OPS-CONFIG-23). Every service's Settings model declares the two fields with the
+  shared types and no secret default, and the text of a Settings load error names the
+  field and the rule but never the refused value. \
+  Enforced in: `services/common/herd_common/auth_settings.py` (`validate_auth_secret`, `validate_jwt_algorithm`, `AuthSecretKey`, `JwtAlgorithm`, `SECRET_KEY_REFUSED_MESSAGE`, `SECRET_KEY_UNUSABLE_MESSAGE`, `ALGORITHM_REFUSED_MESSAGE`); `services/common/herd_common/base_settings.py` (`HerdBaseSettings`) \
+  Pinned by: `services/common/tests/test_auth_settings.py` (`test_secret_refused_with_the_fixed_message`, `test_secret_jose_cannot_sign_and_verify_with_is_refused`, `test_the_round_trip_signs_and_verifies_with_the_value_itself`, `test_secret_of_31_bytes_loads_and_logs_one_warning_with_only_the_length`, `test_secret_of_32_bytes_loads_and_logs_nothing`, `test_other_algorithms_are_refused_naming_the_three_allowed`, `test_settings_refuse_an_empty_secret_key_env`, `test_settings_require_the_secret_key`, `test_settings_refuse_an_unusable_secret_from_env`, `test_settings_refuse_the_placeholder_from_a_saved_config_file`, `test_settings_error_text_names_the_field_and_rule_but_not_the_value`); `tests/unit/test_jwt_settings_wiring.py` (`test_every_settings_model_uses_the_shared_types`)
 - **IAM-JWT-5.** Every access-token decode passes exactly one algorithm, the configured
   one, and keeps signature verification on, so a token whose header names another
   algorithm (`none` or another HS size) is refused; any error jose raises, including one
-  raised while building the key, answers 401 `Could not validate credentials`. \
-  Enforced in: `services/common/herd_common/auth.py` (`make_auth_dependencies`, `JOSEError`); `services/auth/app/utils/jwt.py` (`verify_access_token`, `JOSEError`); `services/notifications/app/routers/notifications.py` (`get_bearer_credentials`, `JOSEError`) \
-  Pinned by: `services/common/tests/test_auth.py` (`test_token_with_alg_none_raises_401`, `test_token_signed_with_another_hmac_algorithm_raises_401`, `test_key_that_jose_cannot_use_raises_401_not_a_key_error`, `test_valid_token_returns_payload`); `services/auth/tests/test_token_verification.py` (`test_verify_refuses_alg_none`, `test_verify_refuses_another_hmac_algorithm`, `test_verify_raises_a_key_error_as_jwterror`, `test_me_refuses_with_401`, `test_me_answers_200_for_a_correct_token`, `test_me_answers_401_for_a_key_jose_cannot_use`); `services/notifications/tests/test_router.py` (`test_get_bearer_credentials_rejects_alg_none`, `test_get_bearer_credentials_rejects_another_hmac_algorithm`, `test_get_bearer_credentials_answers_401_for_a_key_jose_cannot_use`, `test_get_bearer_credentials_accepts_valid_token`); `tests/unit/test_jwt_settings_wiring.py` (`test_every_jose_decode_names_one_algorithm_and_keeps_verification`)
+  raised while building the key, answers 401 `Could not validate credentials`. An error
+  that is not a `JWTError` is a key jose could not use, so each decode site also logs one
+  ERROR line, `access token not checked: the configured key is unusable (<ClassName>)`,
+  with action `jwt_key_unusable` and the class name only; a token that does not verify is
+  not logged. \
+  Enforced in: `services/common/herd_common/auth.py` (`make_auth_dependencies`, `log_unusable_key`, `JOSEError`); `services/auth/app/utils/jwt.py` (`verify_access_token`, `JOSEError`); `services/notifications/app/routers/notifications.py` (`get_bearer_credentials`, `JOSEError`) \
+  Pinned by: `services/common/tests/test_auth.py` (`test_decode_is_given_exactly_the_configured_algorithm`, `test_token_with_alg_none_raises_401`, `test_token_signed_with_another_hmac_algorithm_raises_401`, `test_key_that_jose_cannot_use_raises_401_not_a_key_error`, `test_key_error_is_logged_once_by_class_name`, `test_a_token_that_does_not_verify_is_not_logged`, `test_valid_token_returns_payload`); `services/auth/tests/test_token_verification.py` (`test_verify_gives_decode_exactly_the_configured_algorithm`, `test_verify_refuses_alg_none`, `test_verify_refuses_another_hmac_algorithm`, `test_verify_raises_a_key_error_as_jwterror`, `test_verify_logs_a_key_error_once_by_class_name`, `test_me_refuses_with_401`, `test_me_answers_200_for_a_correct_token`, `test_me_answers_401_for_a_key_jose_cannot_use`); `services/notifications/tests/test_router.py` (`test_get_bearer_credentials_gives_decode_exactly_the_configured_algorithm`, `test_get_bearer_credentials_rejects_alg_none`, `test_get_bearer_credentials_rejects_another_hmac_algorithm`, `test_get_bearer_credentials_answers_401_for_a_key_jose_cannot_use`, `test_get_bearer_credentials_logs_a_key_error_once_by_class_name`, `test_get_bearer_credentials_accepts_valid_token`); `tests/unit/test_jwt_settings_wiring.py` (`test_every_jose_decode_names_one_algorithm_and_keeps_verification`)
 
 **Out of scope.** Token revocation lists do not exist; an access token is valid until
 `exp`.
@@ -1323,7 +1340,7 @@ Calls into this area are in section 7 and the forwarded-JWT group routes noted u
 
 | Setting | Default | Effect |
 |---|---|---|
-| `AUTH_SECRET_KEY` | none (required) | JWT signing key, shared by every JWT-checking service; unset, blank, or placeholder refuses startup (IAM-JWT-4) |
+| `AUTH_SECRET_KEY` | none (required) | JWT signing key, shared by every JWT-checking service; unset, blank, placeholder, or not usable as an HMAC key refuses startup (IAM-JWT-4) |
 | `AUTH_ALGORITHM` | `HS256` | JWT algorithm: HS256, HS384, or HS512 (IAM-JWT-4) |
 | `AUTH_ACCESS_TOKEN_EXPIRE_MINUTES` | `30` | Access token lifetime, also the exchange's `expires_in` |
 | `AUTH_REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Refresh token lifetime |
