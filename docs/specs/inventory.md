@@ -921,7 +921,7 @@ download, delete); routes under `/drivers`. The package format is in
 - **INV-DRV-7.** `supports_dry_run` and `supports_vrf` are read from a top-level
   `driver_metadata.json` in the archive and are false unless the file declares them;
   an unreadable archive, a missing or malformed file, or a non-object value reads as
-  false. \
+  false. Known gap, see #1180. \
   Enforced in: `services/inventory/app/services/driver_service.py` (`_parse_driver_metadata`, `create_driver`) \
   Pinned by: `services/inventory/tests/test_driver_service_unit.py` (`test_create_driver_persists_the_declared_capability_flags`, `test_parse_supports_dry_run_malformed_json_returns_false`, `test_parse_supports_dry_run_corrupt_zip_returns_false`, `test_parse_supports_dry_run_non_dict_metadata_returns_false`, `test_the_two_capability_flags_are_read_independently`)
 - **INV-DRV-8.** A package name is unique; a duplicate answers 409
@@ -1469,7 +1469,9 @@ INV-PORT-6, by a throwaway script against the service on SQLite with foreign key
 
 ### Open defects
 
-None at present.
+- #1180 (INV-DRV-7): the upload reads `driver_metadata.json` whole, with no size bound,
+  in the inventory process; none of execution's extraction ceilings or its tar read
+  bound (`device-configuration.md`, CFG-LOAD-3) apply at upload.
 
 ### Limits by decision
 
