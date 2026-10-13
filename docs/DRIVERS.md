@@ -76,8 +76,12 @@ an archive may hold at most 10,000 entries and declare at most 100 MiB uncompres
 total; the execution service checks both before it writes anything and refuses a package
 past either as a permanent load failure (`driver load failed: PackageLimitError`;
 issue #1115). A `.tar.gz` whose pax extended header or GNU long name is over 1 MiB is
-refused the same way before the header is read into memory (issue #1179). The archive
-must contain the following at its root:
+refused the same way before the header is read into memory (issue #1179). That read
+bound lives in `herd_common.bounded_tar` and applies at upload too: inventory refuses
+such a `.tar.gz` with 422, and refuses a `driver_metadata.json` larger than 1 MiB
+(declared or read) with 422 `driver_metadata.json is larger than 1048576 bytes; nothing
+was stored`, storing nothing (issue #1180). The archive must contain the following at
+its root:
 
 ```
 driver.py             # REQUIRED: must contain a class named Driver
