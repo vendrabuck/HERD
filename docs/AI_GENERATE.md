@@ -99,6 +99,7 @@ The AI dialog lets you attach reference files to give the LLM context without ha
 - Max 5 files per request.
 - Max 5 MB per file.
 - Aggregate text extracted across all files is capped at 80,000 characters (the per-file `truncated` flag appears in the response if a file hit its limit).
+- A `.tgz` or `.tar.gz` that cannot be read (not gzip, truncated, or corrupt) is refused with 400 `Failed to read tgz archive (ReadError)`, and one holding a pax extended header or GNU long name over 1 MiB is refused with 400 `The tgz archive has a tar header record over 1048576 bytes (a pax extended header or GNU long name); nothing was extracted` before the header is read into memory. A refused file fails the whole request.
 
 Files are parsed into text server-side (PDF via pdfplumber; tar/gz text members extracted; JSON pretty-printed; text passed through) and framed in the prompt as **untrusted context**: the LLM is told to use them only to inform device selection and config, not to treat them as instructions. You get a `file_summaries` block in the response listing each filename, extracted char count, and truncation flag.
 

@@ -5,8 +5,8 @@ chunks, but it reads a pax extended header (types x and g) or a GNU long name or
 long link (types L and K) whole, in one call, before the member it describes exists
 to be checked against any ceiling. A small, highly compressible archive can declare
 such a record of hundreds of megabytes, and the reader would allocate all of it.
-Bounding every single read bounds that allocation (issues #1179 and #1180). A real
-pax header or long name is well under a kilobyte.
+Bounding every single read bounds that allocation (issues #1179, #1180, and #1192). A
+real pax header or long name is well under a kilobyte.
 
 Every reader of an uploaded tar opens it as::
 
@@ -14,18 +14,31 @@ Every reader of an uploaded tar opens it as::
         tf = tarfile.open(fileobj=BoundedTarStream(raw), mode="r:")
 
 and maps ``TarReadLimitError`` to its own refusal: execution's driver loader to its
-``PackageLimitError``, inventory's driver upload to a 422. Opening with
+``PackageLimitError``, inventory's driver upload to a 422, ai-orchestrator's context
+file extractor to its ``ExtractionError`` (a 400). Opening with
 ``tarfile.open(mode="r:gz")`` instead reads through tarfile's own gzip stream, which
 this bound cannot see, so do not swap it back.
+
+That mode also turned a body that is not gzip into ``tarfile.ReadError`` at the open. A
+hand-opened ``GzipFile`` reads lazily and raises its own errors at whichever read first
+meets the fault: ``BadGzipFile`` (an ``OSError``) for a body that is not gzip or fails
+its checksum, ``EOFError`` for a stream that ends early, ``zlib.error`` for corrupt
+data. Each reader decides what those become: execution re-raises an ``OSError`` from
+the open as ``tarfile.ReadError`` and its load path treats any extraction failure as a
+broken package, inventory's metadata read takes any failure as no metadata, and
+ai-orchestrator's extractor raises all three as ``tarfile.ReadError``.
 
 The bound relies on tarfile's read sizes: a header block is 512 bytes and member data
 is copied in chunks of at most 16 KiB, so a well-formed package never reaches it. If a
 future tarfile read member data in one call, a member larger than the bound would be
 refused; execution's ``test_member_data_larger_than_the_read_bound_extracts`` and the
-long-name tests fail if that ever changes. A caller that reads one member whole
-(``extractfile(member).read()``) makes a single read of the member's size, so it must
-bound the member at or under MAX_TAR_READ_BYTES first, as inventory's metadata read
-does.
+long-name tests fail if that ever changes. A caller that reads a member itself passes
+its read size through to this stream: ``extractfile(member).read(n)`` reaches it as one
+read of up to ``n`` bytes, and ``read()`` as one read of the member's whole size. Such a
+caller must either bound the member at or under MAX_TAR_READ_BYTES first, as
+inventory's metadata read does, or read the member in chunks of at most
+MAX_TAR_READ_BYTES, as ai-orchestrator's extractor does for a text member that may be
+several megabytes.
 """
 
 import io
