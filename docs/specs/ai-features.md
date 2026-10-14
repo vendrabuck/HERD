@@ -69,7 +69,7 @@ to `reservations.md`.
 | Method | Path | Who may call | Success | Rules |
 |---|---|---|---|---|
 | GET | `/status` | anyone, no token | 200 | AI-PROV-5, AI-PROV-6, AI-PROV-7, AI-PROV-8 |
-| POST | `/generate` | any signed-in user | 200 | AI-PROV-2, AI-GEN-1 to AI-GEN-16, AI-UPLOAD-1 to AI-UPLOAD-14, AI-RESOLVE-1 to AI-RESOLVE-15, AI-QUOTA-2 |
+| POST | `/generate` | any signed-in user | 200 | AI-PROV-2, AI-GEN-1 to AI-GEN-16, AI-UPLOAD-1 to AI-UPLOAD-18, AI-RESOLVE-1 to AI-RESOLVE-15, AI-QUOTA-2 |
 | POST | `/commit` | any signed-in user; upstream services apply their own rules to the caller's JWT | 200 | AI-COMMIT-1 to AI-COMMIT-19 |
 | POST | `/reservations/{id}/assistant` | the reservation's owner (first turn); the conversation's creator on the same reservation (later turns) | 200 | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-TURN-1 to AI-TURN-8, AI-TOOL-1 to AI-TOOL-11, AI-WRITE-1 to AI-WRITE-3 |
 | POST | `/reservations/{id}/assistant/stream` | as above | 200 (`text/event-stream`) | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-STREAM-1 to AI-STREAM-7, AI-TOOL-1 to AI-TOOL-11, AI-WRITE-1 to AI-WRITE-3 |
@@ -358,10 +358,13 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   refuses any single read from the decompressed stream over `MAX_TAR_READ_BYTES` (1 MiB;
   the driver readers' rules are CFG-LOAD-3 in `device-configuration.md` and INV-DRV-7 in
   `inventory.md`). A pax extended header or a GNU long name or long link declaring more,
-  which tarfile would read whole before the member it describes can be checked, answers
+  which tarfile would read whole before the member it describes can be checked, is
+  refused before it is read into memory, and the request fails as a whole (issue #1192).
+  Since issue #1201 the header ceilings of AI-UPLOAD-15, both under this bound, refuse
+  such a header first with their own detail, so no upload reaches this bound's refusal,
   400 `The tgz archive has a tar header record over 1048576 bytes (a pax extended header
-  or GNU long name); nothing was extracted` before it is read into memory, and the
-  request fails as a whole (issue #1192). \
+  or GNU long name); nothing was extracted`; it stays as the second line, pinned with
+  those ceilings raised past it. \
   Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`_extract_tgz`, `TGZ_READ_LIMIT_DETAIL`); `services/common/herd_common/bounded_tar.py` (`BoundedTarStream`, `MAX_TAR_READ_BYTES`, `TarReadLimitError`) \
   Pinned by: `services/ai-orchestrator/tests/test_extractor_branches.py` (`test_tgz_header_record_over_the_read_bound_is_refused_before_it_is_read`, `test_tgz_well_formed_pax_header_just_over_the_read_bound_is_refused`, `test_tgz_pax_header_just_under_the_read_bound_extracts`, `test_tgz_long_member_names_still_extract`, `test_tgz_read_refusal_and_member_chunk_follow_the_shared_bound`); `services/ai-orchestrator/tests/test_generate.py` (`test_generate_tgz_with_an_oversized_tar_header_answers_400`)
 - **AI-UPLOAD-9.** A text member's data is read in chunks of `_MEMBER_READ_CHUNK_BYTES`
@@ -384,16 +387,25 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   the default limit) raises `RecursionError`, which is not a tar error; it is caught by
   name and answers the same 400 naming its own class, `Failed to read tgz archive
   (RecursionError)`, whether the run opens the archive or follows a member. A shorter run
-  extracts. \
+  extracts. Only those failures and the extractor's own refusals become a 400: any other
+  exception raised during the walk, a `MemoryError` or a programming error such as a
+  `KeyError`, propagates unchanged (issue #1201). A tgz whose gzip stream is whole but
+  whose tar has an invalid or cut header where a member's own header should be is not
+  refused: tarfile reads such a header as the end of the archive, so the members before it
+  extract and the request answers 200; the same header first is the 400 above. A bad or
+  cut header that FOLLOWS a pax extended, global, or GNU long-name header is instead the
+  400 `ReadError`, because tarfile is waiting for the described member's header and raises.
+  A non-integer or over-long `GNU.sparse.realsize` is refused by AI-UPLOAD-16, not a 500. \
   Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`_extract_tgz`, `_GZIP_FAILURES`) \
-  Pinned by: `services/ai-orchestrator/tests/test_extractor.py` (`test_extract_tgz_invalid_archive_raises`); `services/ai-orchestrator/tests/test_extractor_branches.py` (`test_tgz_gzip_layer_failure_is_an_extraction_error`, `test_tgz_honest_stored_block_stream_extracts`, `test_tgz_run_of_consecutive_headers_that_recurses_is_an_extraction_error`, `test_tgz_run_of_consecutive_headers_under_the_recursion_limit_extracts`); `services/ai-orchestrator/tests/test_generate.py` (`test_generate_tgz_of_consecutive_headers_that_recurse_answers_400`)
+  Pinned by: `services/ai-orchestrator/tests/test_extractor.py` (`test_extract_tgz_invalid_archive_raises`); `services/ai-orchestrator/tests/test_extractor_branches.py` (`test_tgz_gzip_layer_failure_is_an_extraction_error`, `test_tgz_honest_stored_block_stream_extracts`, `test_tgz_run_of_consecutive_headers_that_recurses_is_an_extraction_error`, `test_tgz_run_of_consecutive_headers_under_the_recursion_limit_extracts`, `test_tgz_walk_lets_an_error_it_does_not_name_propagate`, `test_tgz_bad_header_after_the_first_member_yields_the_members_before_it`, `test_tgz_bad_header_after_an_extended_header_is_an_unreadable_archive`); `services/ai-orchestrator/tests/test_generate.py` (`test_generate_tgz_of_consecutive_headers_that_recurse_answers_400`)
 - **AI-UPLOAD-11.** A tgz holds at most `MAX_TGZ_ENTRIES` (10,000) members, a fixed
   ceiling with no setting. Every member the walk meets counts, whatever its type or
   extension, read or passed over. The member after the ten thousandth answers 400 `The tgz
   archive has more than 10000 entries; nothing was extracted` and no header after that
-  member's is read, so what the reader keeps per member is bounded; the request fails as a
-  whole and no text is kept. An archive of exactly 10,000 members extracts. The character
-  budget (AI-UPLOAD-6) ends the walk only at the next text member with data, so the
+  member's is read, so the number of members the walk meets is bounded (what the reader
+  holds for each is AI-UPLOAD-17); the request fails as a whole and no text is kept. An
+  archive of exactly 10,000 members extracts. The character budget (AI-UPLOAD-6) ends the
+  walk only at the next text member with data no larger than the per-file cap, so the
   members before that one still count and the members after it are never reached
   (issue #1195). \
   Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`_extract_tgz`, `MAX_TGZ_ENTRIES`, `TGZ_ENTRY_LIMIT_DETAIL`) \
@@ -406,7 +418,9 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   sizes), padding, and a size a header declares with no data behind it. A read or a skip
   that would end past the ceiling answers 400 `The tgz archive extends past 104857600
   bytes uncompressed; nothing was extracted` before the stream moves, so the bytes past
-  the ceiling are never decompressed; the request fails as a whole and no text is kept.
+  the ceiling are never read by the tar reader (the gzip layer decompresses ahead of the
+  position into its own read buffer, 8 KiB measured); the request fails as a whole and no
+  text is kept.
   The bound is exact to the byte on the position and so to the 512-byte block on an
   archive: one whose first end-of-archive block ends at the ceiling extracts, one block
   more is refused (issue #1195). \
@@ -424,6 +438,68 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   name that is valid UTF-8, non-ASCII included, is unchanged (issue #1196). \
   Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`_safe_member_name`, `_extract_tgz`) \
   Pinned by: `services/ai-orchestrator/tests/test_extractor_branches.py` (`test_tgz_member_name_that_is_not_utf8_enters_the_text_with_replacement_characters`, `test_tgz_honest_non_ascii_member_name_is_unchanged`, `test_safe_member_name_replaces_every_lone_surrogate_and_nothing_else`); `services/ai-orchestrator/tests/test_generate.py` (`test_generate_tgz_member_name_that_is_not_utf8_reaches_the_provider`)
+- **AI-UPLOAD-15.** The extended headers in front of one tgz member (pax extended headers,
+  Solaris `X` headers, and GNU long names and long links) may take at most
+  `MAX_TGZ_MEMBER_HEADER_BYTES` (65,536) bytes together, counted from the header after the
+  last member, and the pax global headers of the whole archive at most
+  `MAX_TGZ_GLOBAL_HEADER_BYTES` (4,096) bytes together; both are fixed ceilings with no
+  setting. Each header counts `self._block(self.size)`, its declared size rounded up to
+  the 512-byte block, because tarfile reads the whole block and parses pax records until
+  the block ends or a NUL, so a header declaring one byte can carry 511 more bytes of
+  records. They are counted together because tarfile holds every header of a run until
+  the member is reached, and keeps the global headers' records for the rest of the walk,
+  copying them into every member. The header that passes a ceiling is refused once its
+  512-byte descriptor block is read and before its data block is: 400 `The tgz archive has
+  more than 65536 bytes of pax extended headers and GNU long names in front of one member;
+  nothing was extracted` or `The tgz archive has more than 4096 bytes of pax global
+  headers; nothing was extracted`; the request fails as a whole and no text is kept. An
+  archive at either ceiling exactly extracts, as do `git archive` output (one 52-byte
+  global comment), tarfile's PAX archives with long UTF-8 paths, and its GNU archives of
+  10,000 members with long names (issue #1201). \
+  Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`_BoundedTarInfo`, `MAX_TGZ_MEMBER_HEADER_BYTES`, `MAX_TGZ_GLOBAL_HEADER_BYTES`, `TGZ_MEMBER_HEADER_LIMIT_DETAIL`, `TGZ_GLOBAL_HEADER_LIMIT_DETAIL`, `_extract_tgz`) \
+  Pinned by: `services/ai-orchestrator/tests/test_extractor_branches.py` (`test_tgz_header_ceilings_and_their_refusals_are_the_pinned_values`, `test_tgz_extended_header_over_its_ceiling_is_refused_before_it_is_read`, `test_tgz_extended_header_at_its_ceiling_extracts`, `test_tgz_run_of_extended_headers_is_counted_together`, `test_tgz_extended_header_count_starts_again_at_each_member`, `test_tgz_global_header_over_its_ceiling_is_refused_before_it_is_read`, `test_tgz_global_headers_are_counted_across_the_archive`, `test_tgz_padded_global_headers_are_counted_by_their_block`, `test_tgz_padded_member_headers_are_counted_by_their_block`, `test_tgz_run_of_small_headers_reaches_the_ceiling_before_tarfile_recurses`, `test_tgz_from_git_archive_extracts_the_same_text_as_without_its_global_header`, `test_tgz_pax_archive_with_long_utf8_paths_extracts`, `test_tgz_gnu_archive_of_the_entry_ceiling_with_long_names_extracts`); `services/ai-orchestrator/tests/test_generate.py` (`test_generate_tgz_past_a_header_ceiling_answers_400`, `test_generate_tgz_from_git_archive_reaches_the_provider`, `test_generate_tgz_with_an_oversized_tar_header_answers_400`)
+- **AI-UPLOAD-16.** A tgz holding a sparse member in any GNU format (the type `S` member
+  with its extension blocks, or a pax header naming sparse format 0.0, 0.1, or 1.0)
+  answers 400 `The tgz archive has a sparse member, which is not supported; nothing was
+  extracted`, wherever the member is; the request fails as a whole and no text is kept.
+  A type `S` member is refused before its first extension block is read, and a pax
+  sparse member once its pax header and its own header are read, before any of its
+  data, where the 1.0 map is. Any other `GNU.sparse.` record in an extended or global
+  header, which GNU tar writes only for sparse members, is refused in `_apply_pax_info`
+  before tarfile converts it, so a non-integer or over-4,300-digit `GNU.sparse.realsize`
+  that tarfile would turn into memory with a bare `int()` is this 400, not a 500
+  (issue #1201). \
+  Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`_BoundedTarInfo`, `TGZ_SPARSE_DETAIL`) \
+  Pinned by: `services/ai-orchestrator/tests/test_extractor_branches.py` (`test_tgz_sparse_member_is_refused_before_its_map_is_read`, `test_tgz_sparse_member_is_refused_wherever_it_is`, `test_tarfile_still_has_the_methods_the_bounded_tarinfo_overrides`); `services/ai-orchestrator/tests/test_generate.py` (`test_generate_tgz_past_a_header_ceiling_answers_400`, `test_generate_tgz_with_a_bad_sparse_realsize_answers_400`)
+- **AI-UPLOAD-17.** The memory the tgz reader holds is bounded by constants independent of
+  the archive's content: with AI-UPLOAD-8, AI-UPLOAD-11, AI-UPLOAD-12, AI-UPLOAD-15, and
+  AI-UPLOAD-16 in place, the walk empties `TarFile.members` after each step, so it holds
+  one member at a time. The pax records it parses for that member come from at most
+  `MAX_TGZ_MEMBER_HEADER_BYTES` of extended header blocks in front of it and
+  `MAX_TGZ_GLOBAL_HEADER_BYTES` of global header blocks in the archive (AI-UPLOAD-15
+  counts the block-rounded bytes tarfile actually reads, so a header declaring one byte
+  cannot smuggle a block of records past the ceiling); besides them the walk keeps the
+  text extracted so far, which the character budget bounds. In a child process capped at
+  256 MiB of address space, a global header of just under 1 MiB in front of 1,000
+  members, a sparse 1.0 map of ten million numbers, and 4,096 global headers each
+  declaring one byte but carrying a full block (the issue's 1.7 GiB shape) are each
+  refused in under two seconds (milliseconds measured), and 150 members each behind a
+  full 64 KiB pax header extract, each raising the resident peak by under 16 MiB. The checks sit in overrides of private tarfile methods
+  (`_proc_member`, `_proc_gnusparse_00`, `_01`, `_10`), so a test fails if a Python upgrade
+  renames them or changes how tarfile calls them (issue #1201). \
+  Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`_extract_tgz`, `_BoundedTarInfo`) \
+  Pinned by: `services/ai-orchestrator/tests/test_extractor_branches.py` (`test_tgz_walk_holds_one_member_at_a_time`, `test_tarfile_still_has_the_methods_the_bounded_tarinfo_overrides`, `test_tgz_global_header_copied_into_a_thousand_members_is_refused_in_bounded_memory`, `test_tgz_sparse_map_of_ten_million_numbers_is_refused_in_bounded_memory`, `test_tgz_padded_global_header_flood_is_refused_in_bounded_memory`, `test_tgz_members_each_behind_a_full_extended_header_walk_in_bounded_memory`)
+- **AI-UPLOAD-18.** A text member read short of its end, because the character budget cut
+  it (AI-UPLOAD-9 reads bytes against a character budget), decodes as UTF-8 up to the last
+  whole character before the cut; only bytes that are not UTF-8 make it fall back to
+  Latin-1. A member read whole decodes as AI-UPLOAD-5 says, so one ending inside a
+  character is Latin-1 throughout. The held-back bytes at the cut are dropped only when
+  they can begin a UTF-8 character; a tail that can never (a lead byte whose next byte is
+  out of range, such as a CESU-8 surrogate the decoder buffers) makes the member fall
+  back to Latin-1 (issue #1201; before, a cut inside a character made the whole member
+  Latin-1). \
+  Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`_decode_member_text`, `_extract_tgz`) \
+  Pinned by: `services/ai-orchestrator/tests/test_extractor_branches.py` (`test_tgz_member_cut_inside_a_utf8_character_decodes_as_utf8`, `test_tgz_member_cut_at_every_byte_of_a_character_keeps_the_whole_characters`, `test_tgz_cut_member_that_is_not_utf8_still_falls_back_to_latin1`, `test_tgz_cut_ending_in_a_cesu8_surrogate_falls_back_to_latin1`, `test_tgz_whole_member_ending_inside_a_character_is_read_as_latin1`, `test_tgz_three_megabyte_utf8_text_member_extracts_whole`)
 
 **Out of scope.** Choosing ports: the proposal never names a port for a device-to-device
 edge (section 8.3). Saving the canvas as the user's own topology, which the topology editor
@@ -1504,6 +1580,9 @@ stream opens are `error` frames, listed at the end.
 | 400 | `The tgz archive has a tar header record over 1048576 bytes (a pax extended header or GNU long name); nothing was extracted` | a tgz upload holding a pax or GNU long-name header over the tar read bound | AI-UPLOAD-8 |
 | 400 | `The tgz archive has more than 10000 entries; nothing was extracted` | a tgz upload of more than 10,000 members | AI-UPLOAD-11 |
 | 400 | `The tgz archive extends past 104857600 bytes uncompressed; nothing was extracted` | a tgz upload the reader would have to read or skip past 100 MiB of, decompressed | AI-UPLOAD-12 |
+| 400 | `The tgz archive has more than 65536 bytes of pax extended headers and GNU long names in front of one member; nothing was extracted` | a tgz upload whose extended headers in front of one member declare more than 64 KiB together | AI-UPLOAD-15 |
+| 400 | `The tgz archive has more than 4096 bytes of pax global headers; nothing was extracted` | a tgz upload whose pax global headers declare more than 4 KiB together | AI-UPLOAD-15 |
+| 400 | `The tgz archive has a sparse member, which is not supported; nothing was extracted` | a tgz upload holding a GNU sparse member in any format | AI-UPLOAD-16 |
 | 400 | `start must not be after end` or `date range too large; max 366 days` | bad usage report range | AI-QUOTA-8 |
 | 401 | `Not authenticated` or `Could not validate credentials` | no token or a bad token on any route but status, health, and version | AI-GEN-1, AI-COMMIT-1, AI-STREAM-1, AI-QUOTA-6, AI-QUOTA-8 |
 | 403 | `Admin or superadmin role required` | identity, usage, or recipe routes as a user | AI-IDENT-1, AI-QUOTA-8, AI-RECIPE-2 |
@@ -1661,11 +1740,15 @@ None at this commit: #1039 is resolved by AI-CONV-13.
   so its idle conversations are deleted after the TTL (AI-CONV-13, issue #1067); a later
   Classify now on that row runs without the transcript. Recorded in
   [AI_PURPOSE_CLASSIFICATION.md](../AI_PURPOSE_CLASSIFICATION.md).
-- The two ceilings on an uploaded tgz are fixed constants, not settings, and passing one
+- The ceilings on an uploaded tgz are fixed constants, not settings, and passing one
   refuses the file instead of keeping the text extracted so far (AI-UPLOAD-11,
-  AI-UPLOAD-12): issue #1195 and the comment on `MAX_TGZ_ENTRIES` in
+  AI-UPLOAD-12, AI-UPLOAD-15): issues #1195 and #1201 and the comments on
+  `MAX_TGZ_ENTRIES` and `MAX_TGZ_MEMBER_HEADER_BYTES` in
   `services/ai-orchestrator/app/services/extractor.py`. A support bundle of more than
-  10,000 members, or one the reader must pass 100 MiB of, is refused.
+  10,000 members, one the reader must pass 100 MiB of, one with more than 64 KiB of
+  extended headers in front of a member or 4 KiB of pax global headers, or one holding a
+  sparse member (AI-UPLOAD-16, for example a `tar --sparse` archive of a file with holes)
+  is refused.
 - `GET /status` is unauthenticated and its construction probe is cached for 30 seconds
   (AI-PROV-5, AI-PROV-7): issue #606 and the docstring of `_ProviderConstructionCache`.
 - Usage rows are written only when a quota is configured (AI-QUOTA-1): the comment on

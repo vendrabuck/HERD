@@ -4,8 +4,18 @@ Supported types: .pdf, .txt, .md, .json, .xml, .tgz (tech support bundles).
 No persistent storage: files are read into memory, extracted, and discarded.
 Per-file and aggregate size caps defend against oversized uploads and
 runaway token costs.
+
+The tgz reader keeps one invariant (issues #1192, #1195, #1201): the memory it holds is
+bounded by constants independent of the archive's content, for every byte sequence a
+client can upload, while an honest archive (git archive output with its small pax
+global header, a PAX archive with long UTF-8 paths, a GNU archive of 10,000 members, a
+text member of several megabytes) extracts unchanged. The constants are the ceilings
+below, each refusing the whole file with a fixed 400 detail ending "nothing was
+extracted"; `_extract_tgz` says how they combine. The PDF reader has no such bound yet
+(issue #1202).
 """
 
+import codecs
 import gzip
 import io
 import json
@@ -48,6 +58,62 @@ TGZ_BYTES_LIMIT_DETAIL = (
     "nothing was extracted"
 )
 
+# Ceilings on what tarfile builds in memory from the headers of one uploaded tgz
+# (issue #1201). The two ceilings above bound how many members there are and how far
+# the stream moves, not what tarfile makes of the bytes it reads: it parses a header's
+# records into Python objects at several times their size, it copies the pax global
+# header's records into every member, and it reads a GNU sparse map into Python lists.
+# Fixed, not settings.
+#
+# Both ceilings count the bytes tarfile reads and parses for a header: its declared size
+# rounded up to the 512-byte block (TarInfo._block), because tarfile reads the whole
+# block and parses pax records until the block ends or a NUL byte, so a header declaring
+# 1 byte can carry up to 511 bytes of records.
+#
+# The extended headers in front of one member (pax extended headers and GNU long names
+# and long links) may take at most MAX_TGZ_MEMBER_HEADER_BYTES together. They are
+# counted together because tarfile reads a run of them by calling itself once per
+# header, so every header of the run is held in memory until the member is reached.
+# An honest run is a few kilobytes at most: measured runs were 3,011 bytes (GNU tar, a
+# 3,000-byte path), 3,142 bytes (GNU tar with xattrs and an ACL), and 3,167 bytes
+# (tarfile's PAX writer, non-ASCII path and owner names), each rounded to blocks.
+MAX_TGZ_MEMBER_HEADER_BYTES = 64 * 1024
+# The pax global headers of the whole archive may take at most this many bytes
+# together, counted the same way. tarfile keeps their records for the rest of the walk
+# and copies them into every later member. git archive writes one of 52 bytes (a commit
+# id comment), which takes one 512-byte block.
+MAX_TGZ_GLOBAL_HEADER_BYTES = 4 * 1024
+
+TGZ_MEMBER_HEADER_LIMIT_DETAIL = (
+    f"The tgz archive has more than {MAX_TGZ_MEMBER_HEADER_BYTES} bytes of pax extended "
+    "headers and GNU long names in front of one member; nothing was extracted"
+)
+TGZ_GLOBAL_HEADER_LIMIT_DETAIL = (
+    f"The tgz archive has more than {MAX_TGZ_GLOBAL_HEADER_BYTES} bytes of pax global "
+    "headers; nothing was extracted"
+)
+# A sparse member of any GNU format (the old type S member with its extension blocks,
+# and the pax formats 0.0, 0.1, and 1.0) is refused: its map is read into Python lists
+# whose size only the stream ceiling bounds, about 18 bytes of memory for every 2 bytes
+# of a 1.0 map. So is any pax record whose keyword starts with GNU.sparse., which GNU tar
+# writes only for a sparse member: tarfile converts GNU.sparse.size and .realsize with a
+# bare int(), and a value that is not a number answered a 500.
+TGZ_SPARSE_DETAIL = (
+    "The tgz archive has a sparse member, which is not supported; nothing was extracted"
+)
+
+# The extended header types counted against MAX_TGZ_MEMBER_HEADER_BYTES.
+_MEMBER_HEADER_TYPES = (
+    tarfile.XHDTYPE,
+    tarfile.SOLARIS_XHDTYPE,
+    tarfile.GNUTYPE_LONGNAME,
+    tarfile.GNUTYPE_LONGLINK,
+)
+# Where _BoundedTarInfo keeps its two running totals: attributes of the TarFile being
+# walked, so each walk has its own and concurrent walks share nothing.
+_MEMBER_HEADER_BYTES_ATTR = "_herd_member_header_bytes"
+_GLOBAL_HEADER_BYTES_ATTR = "_herd_global_header_bytes"
+
 # The largest single read of one tgz member's data. The tar is read through
 # BoundedTarStream, which refuses any single read over MAX_TAR_READ_BYTES, and one
 # read of a member reaches the stream as one read of up to that size; a text member
@@ -82,7 +148,9 @@ class _CeilingStream:
     and GNU long names (read inside tarfile and never yielded as members, so no sum of
     member sizes counts them), and padding. Bounding the position bounds all of them,
     whatever a header declares. A read or a seek that would end past the ceiling is
-    refused before the stream moves, so the bytes past it are never decompressed.
+    refused before the stream moves, so the bytes past it are never read through this
+    stream. The gzip layer below decompresses ahead of the position into its own read
+    buffer (8 KiB measured); that read-ahead is not counted.
 
     It sits inside ``BoundedTarStream``, which has already refused an unbounded read,
     so ``read`` is always given a real size.
@@ -111,6 +179,59 @@ class _CeilingStream:
         return self._raw.tell()
 
 
+class _BoundedTarInfo(tarfile.TarInfo):
+    """The TarInfo class the tgz walk opens its archive with (issue #1201).
+
+    tarfile builds every header through this class (``TarFile.open(tarinfo=...)``), so
+    these overrides see each header before tarfile acts on it. ``_proc_member`` is the
+    hook tarfile's source names for a subclass; it runs once a header's 512-byte block is
+    read and before any data of that header is, so the two header ceilings refuse
+    before the stream moves past the header that passes them, and an old GNU sparse
+    member is refused before its extension blocks are read. The ceilings count
+    ``self._block(self.size)``, the bytes tarfile reads and parses, not the size the
+    header declares. The pax sparse formats are named only inside a pax header's
+    records, so they are refused where tarfile hands them over, in
+    ``_proc_gnusparse_00``, ``_01``, and ``_10``: after the pax header and the member's
+    own header are read and before the 1.0 map in the member's data is.
+    ``_apply_pax_info`` refuses any other ``GNU.sparse.`` record, from an extended or a
+    global header, before tarfile converts its value. These five are private tarfile
+    methods; a test fails if a Python upgrade renames them or changes how tarfile calls
+    them.
+    """
+
+    def _proc_member(self, archive):
+        if self.type in _MEMBER_HEADER_TYPES:
+            total = getattr(archive, _MEMBER_HEADER_BYTES_ATTR, 0) + self._block(self.size)
+            if total > MAX_TGZ_MEMBER_HEADER_BYTES:
+                raise _TgzLimitError(TGZ_MEMBER_HEADER_LIMIT_DETAIL)
+            setattr(archive, _MEMBER_HEADER_BYTES_ATTR, total)
+        elif self.type == tarfile.XGLTYPE:
+            total = getattr(archive, _GLOBAL_HEADER_BYTES_ATTR, 0) + self._block(self.size)
+            if total > MAX_TGZ_GLOBAL_HEADER_BYTES:
+                raise _TgzLimitError(TGZ_GLOBAL_HEADER_LIMIT_DETAIL)
+            setattr(archive, _GLOBAL_HEADER_BYTES_ATTR, total)
+        elif self.type == tarfile.GNUTYPE_SPARSE:
+            raise _TgzLimitError(TGZ_SPARSE_DETAIL)
+        else:
+            # A member: the run of extended headers in front of the next one starts here.
+            setattr(archive, _MEMBER_HEADER_BYTES_ATTR, 0)
+        return super()._proc_member(archive)
+
+    def _apply_pax_info(self, pax_headers, encoding, errors):
+        if any(keyword.startswith("GNU.sparse.") for keyword in pax_headers):
+            raise _TgzLimitError(TGZ_SPARSE_DETAIL)
+        super()._apply_pax_info(pax_headers, encoding, errors)
+
+    def _proc_gnusparse_00(self, next_info, raw_headers):
+        raise _TgzLimitError(TGZ_SPARSE_DETAIL)
+
+    def _proc_gnusparse_01(self, next_info, pax_headers):
+        raise _TgzLimitError(TGZ_SPARSE_DETAIL)
+
+    def _proc_gnusparse_10(self, next_info, pax_headers, archive):
+        raise _TgzLimitError(TGZ_SPARSE_DETAIL)
+
+
 @dataclass
 class _Raw:
     filename: str
@@ -130,6 +251,49 @@ def _decode_text(data: bytes) -> str:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         return data.decode("latin-1", errors="replace")
+
+
+def _starts_a_character(tail: bytes) -> bool:
+    """Whether some continuation bytes complete `tail` into one valid UTF-8 character.
+
+    Only the byte after a lead byte has a range that depends on the lead (E0, ED, F0,
+    and F4 narrow it); every later continuation byte may be any of 0x80 to 0xBF.
+    """
+    seconds = range(0x80, 0xC0) if len(tail) == 1 else [None]
+    for second in seconds:
+        start = tail if second is None else tail + bytes([second])
+        for extra in range(0, 3):
+            try:
+                if len((start + b"\x80" * extra).decode("utf-8")) == 1:
+                    return True
+            except UnicodeDecodeError:
+                continue
+    return False
+
+
+def _decode_member_text(data: bytes, cut: bool) -> str:
+    """Decode a tgz member's text, `cut` when the read stopped before the member's end.
+
+    The read is cut by bytes against a character budget, so it can stop inside a UTF-8
+    character. A cut read is decoded with an incremental UTF-8 decoder that holds back
+    an incomplete character at the end instead of failing on it (issue #1201): before,
+    the strict decode failed and the whole member fell back to Latin-1. The held-back
+    bytes are dropped only when they can start a character; bytes that can never be
+    UTF-8 there (the decoder holds back a lead byte whose next byte is out of its range,
+    such as a CESU-8 surrogate) make the member fall back to Latin-1, as a member that
+    is not UTF-8 anywhere else does.
+    """
+    if not cut:
+        return _decode_text(data)
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    try:
+        text = decoder.decode(data, final=False)
+    except UnicodeDecodeError:
+        return data.decode("latin-1", errors="replace")
+    held, _ = decoder.getstate()
+    if held and not _starts_a_character(held):
+        return data.decode("latin-1", errors="replace")
+    return text
 
 
 def _safe_member_name(name: str) -> str:
@@ -181,18 +345,33 @@ def _extract_tgz(data: bytes, remaining_budget: int) -> str:
     The tar is read through ``herd_common.bounded_tar.BoundedTarStream``, so no single
     read from the decompressed stream exceeds MAX_TAR_READ_BYTES: a pax or GNU
     long-name header declaring more is refused with TGZ_READ_LIMIT_DETAIL before it
-    is read into memory (issue #1192). Opening with ``tarfile.open(mode="r:gz")``
+    is read into memory (issue #1192). Since issue #1201 the header ceilings below,
+    both under that bound, refuse such a header first, so that refusal is the second
+    line. Opening with ``tarfile.open(mode="r:gz")``
     instead reads through tarfile's own gzip stream, which that bound cannot see.
     Every failure of the gzip layer is raised as ``tarfile.ReadError``, the class
     tarfile's gzip mode gives a body that is not gzip, so it ends as an
     ExtractionError like any other unreadable archive.
 
-    The walk is bounded (issue #1195). Every member the iteration yields is counted,
+    The walk is bounded (issue #1195). Every member ``TarFile.next`` returns is counted,
     whatever its type or extension, and the member after MAX_TGZ_ENTRIES is refused
-    with TGZ_ENTRY_LIMIT_DETAIL before another header is read, which bounds what
-    tarfile keeps in ``TarFile.members``. ``_CeilingStream`` refuses, with
-    TGZ_BYTES_LIMIT_DETAIL, any read or seek that would move the decompressed stream
-    past MAX_TGZ_DECOMPRESSED_BYTES. Either refusal fails the file; no text is kept.
+    with TGZ_ENTRY_LIMIT_DETAIL before another header is read. ``_CeilingStream``
+    refuses, with TGZ_BYTES_LIMIT_DETAIL, any read or seek that would move the
+    decompressed stream past MAX_TGZ_DECOMPRESSED_BYTES. Either refusal fails the file;
+    no text is kept.
+
+    The memory the walk holds is bounded by constants, whatever the archive's bytes
+    are (issue #1201). The archive is opened with ``_BoundedTarInfo``, which refuses
+    more than MAX_TGZ_MEMBER_HEADER_BYTES of extended headers in front of one member,
+    more than MAX_TGZ_GLOBAL_HEADER_BYTES of pax global headers in the archive, and
+    every sparse member, each with its own detail and nothing extracted; both header
+    ceilings count each header's declared size rounded up to 512 bytes, which is what
+    tarfile reads and parses. tarfile appends every member it reads to
+    ``TarFile.members``; the walk never looks back, so it empties that list after each
+    step and holds one member at a time. The pax records it parses for that member come
+    from at most MAX_TGZ_MEMBER_HEADER_BYTES of extended header blocks in front of it
+    and MAX_TGZ_GLOBAL_HEADER_BYTES of global header blocks in the archive; besides
+    them the walk keeps the text extracted so far, which the character budget bounds.
 
     tarfile reads a pax extended header or a GNU long name by calling itself for the
     header that follows, so a run of a few hundred of them in a row, a kilobyte or two
@@ -206,8 +385,12 @@ def _extract_tgz(data: bytes, remaining_budget: int) -> str:
         with gzip.GzipFile(fileobj=io.BytesIO(data), mode="rb") as gz:
             try:
                 stream = BoundedTarStream(_CeilingStream(gz))
-                with tarfile.open(fileobj=stream, mode="r:") as tar:
-                    for entries, member in enumerate(tar, start=1):
+                with tarfile.open(fileobj=stream, mode="r:", tarinfo=_BoundedTarInfo) as tar:
+                    entries = 0
+                    while (member := tar.next()) is not None:
+                        # tarfile keeps every member it reads; this walk never looks back.
+                        tar.members.clear()
+                        entries += 1
                         if entries > MAX_TGZ_ENTRIES:
                             raise _TgzLimitError(TGZ_ENTRY_LIMIT_DETAIL)
                         if not member.isfile():
@@ -222,7 +405,7 @@ def _extract_tgz(data: bytes, remaining_budget: int) -> str:
                         if f is None:
                             continue
                         raw = _read_member(f, min(member.size, remaining_budget - used + 1024))
-                        text = _decode_text(raw)
+                        text = _decode_member_text(raw, cut=len(raw) < member.size)
                         header = f"--- {_safe_member_name(member.name)} ---\n"
                         chunk = header + text
                         parts.append(chunk)

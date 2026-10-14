@@ -16,6 +16,7 @@ from app.main import app
 from app.routes import generate as generate_module
 from app.routes.generate import _inventory_provider, _read_uploads
 from app.schemas.generate import ExtractedFile
+from app.services import extractor as extractor_module
 from app.services import generator as generator_module
 from app.services import usage_repo
 from app.services.ai_client import (
@@ -1368,7 +1369,8 @@ async def test_generate_rejected_upload_makes_no_inventory_call(async_client, mo
 async def test_generate_tgz_with_an_oversized_tar_header_answers_400(async_client, monkeypatch):
     """Issue #1192: a tgz whose pax extended header declares more than the tar read
     bound answers the upload path's 400 with the extractor's refusal, and neither
-    inventory nor the provider is called."""
+    inventory nor the provider is called. Since #1201 the refusal is the extended
+    header ceiling's (64 KiB), which such a header passes first."""
     header = tarfile.TarInfo("././@header")
     header.type = tarfile.XHDTYPE
     header.size = 8 * MAX_TAR_READ_BYTES
@@ -1389,8 +1391,8 @@ async def test_generate_tgz_with_an_oversized_tar_header_answers_400(async_clien
         resp = await client.post("/generate", data={"prompt": "x"}, files=files, headers=headers)
     assert resp.status_code == 400
     assert resp.json()["detail"] == (
-        "The tgz archive has a tar header record over 1048576 bytes "
-        "(a pax extended header or GNU long name); nothing was extracted"
+        "The tgz archive has more than 65536 bytes of pax extended headers and GNU long "
+        "names in front of one member; nothing was extracted"
     )
     assert calls["n"] == 0
 
@@ -1443,6 +1445,144 @@ async def test_generate_tgz_past_the_byte_ceiling_answers_400(async_client, monk
     assert calls["n"] == 0
 
 
+def _tar_record(name: str, type_: bytes, data: bytes) -> bytes:
+    info = tarfile.TarInfo(name)
+    info.type = type_
+    info.size = len(data)
+    return info.tobuf(format=tarfile.GNU_FORMAT) + data + b"\0" * ((512 - len(data) % 512) % 512)
+
+
+def _tar_member(name: str, data: bytes) -> bytes:
+    return _tar_record(name, tarfile.REGTYPE, data)
+
+
+# Issue #1201: one upload past each header ceiling, a few hundred bytes compressed.
+_TGZ_PAST_A_HEADER_CEILING = {
+    "global-header": (
+        _tar_record("pax_global_header", tarfile.XGLTYPE, b"5000 comment=" + b"c" * 4986 + b"\n")
+        + _tar_member("notes.txt", b"hello"),
+        "The tgz archive has more than 4096 bytes of pax global headers; nothing was extracted",
+    ),
+    "long-name": (
+        _tar_record("././@LongLink", tarfile.GNUTYPE_LONGNAME, b"n" * 70_000 + b".txt\0")
+        + _tar_member("notes.txt", b"hello"),
+        "The tgz archive has more than 65536 bytes of pax extended headers and GNU long "
+        "names in front of one member; nothing was extracted",
+    ),
+    "sparse-1.0": (
+        _tar_record(
+            "././@PaxHeader",
+            tarfile.XHDTYPE,
+            b"22 GNU.sparse.major=1\n22 GNU.sparse.minor=0\n",
+        )
+        + _tar_member("s.bin", b"1\n0\n10\n")
+        + _tar_member("notes.txt", b"hello"),
+        "The tgz archive has a sparse member, which is not supported; nothing was extracted",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("tar_bytes", "detail"), _TGZ_PAST_A_HEADER_CEILING.values(), ids=_TGZ_PAST_A_HEADER_CEILING
+)
+async def test_generate_tgz_past_a_header_ceiling_answers_400(
+    async_client, monkeypatch, tar_bytes, detail
+):
+    """Issue #1201: a tgz the reader would have to hold too much of in memory answers
+    the upload path's 400 with the extractor's refusal, through the worker thread, and
+    neither inventory nor the provider is called: nothing was extracted."""
+    data = _tgz_of_tar_bytes(tar_bytes)
+    assert len(data) < 8 * 1024
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    calls = _override_inventory({"EX3400": 4})
+
+    resp = await _post_one_tgz(async_client, data)
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == detail
+    assert calls["n"] == 0
+
+
+def _pax_record_bytes(keyword: bytes, value: bytes) -> bytes:
+    body = b" " + keyword + b"=" + value + b"\n"
+    length = len(body) + 1
+    while len(str(length)) + len(body) != length:
+        length = len(str(length)) + len(body)
+    return str(length).encode() + body
+
+
+_SPARSE_REALSIZE_BAD = {
+    "non-integer-in-x": (tarfile.XHDTYPE, b"abc"),
+    "non-integer-in-g": (tarfile.XGLTYPE, b"abc"),
+    "too-many-digits-in-x": (tarfile.XHDTYPE, b"1" * 5000),
+}
+
+
+@pytest.mark.parametrize(
+    ("header_type", "value"), _SPARSE_REALSIZE_BAD.values(), ids=_SPARSE_REALSIZE_BAD
+)
+async def test_generate_tgz_with_a_bad_sparse_realsize_answers_400(
+    async_client, monkeypatch, header_type, value
+):
+    """Issue #1201: a GNU.sparse.realsize that is not a number made tarfile's int()
+    raise ValueError, which escaped as a 500. The header is now refused as a sparse
+    member before the value is converted, through the worker thread, with no inventory
+    or provider call."""
+    record = _pax_record_bytes(b"GNU.sparse.realsize", value)
+    name = "pax_global_header" if header_type == tarfile.XGLTYPE else "././@PaxHeader"
+    header = tarfile.TarInfo(name)
+    header.type = header_type
+    header.size = len(record)
+    padded = record + b"\0" * ((512 - len(record) % 512) % 512)
+    tar_bytes = (
+        header.tobuf(format=tarfile.GNU_FORMAT) + padded + _tar_member("notes.txt", b"hello")
+    )
+    data = _tgz_of_tar_bytes(tar_bytes)
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    calls = _override_inventory({"EX3400": 4})
+
+    resp = await _post_one_tgz(async_client, data)
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "The tgz archive has a sparse member, which is not supported; nothing was extracted"
+    )
+    assert calls["n"] == 0
+
+
+async def test_generate_tgz_from_git_archive_reaches_the_provider(async_client, monkeypatch):
+    """Issue #1201: git archive writes a pax global header (a 52-byte commit comment)
+    in front of its members. It is within the global header ceiling, and the members'
+    text reaches the provider as it did before."""
+    captured: dict[str, str] = {}
+
+    class StubAI:
+        async def propose_topology(self, *, file_context: str = "", **_kwargs):
+            captured["file_context"] = file_context
+            return (
+                {
+                    "purpose": "from-git",
+                    "devices": [{"role": "a", "template_name": "EX3400"}],
+                    "edges": [],
+                },
+                Usage(input_tokens=10, output_tokens=20),
+            )
+
+    comment = b"52 comment=0123456789abcdef0123456789abcdef01234567\n"
+    data = _tgz_of_tar_bytes(
+        _tar_record("pax_global_header", tarfile.XGLTYPE, comment)
+        + _tar_member("repo/router.cfg", b"hostname r1\n")
+    )
+    app.dependency_overrides[get_ai_client] = lambda: StubAI()
+    _override_inventory({"EX3400": 4})
+    _override_resolver(monkeypatch)
+
+    resp = await _post_one_tgz(async_client, data)
+
+    assert resp.status_code == 200, resp.text
+    assert "--- repo/router.cfg ---\nhostname r1\n" in captured["file_context"]
+
+
 async def test_generate_tgz_of_consecutive_headers_that_recurse_answers_400(
     async_client, monkeypatch
 ):
@@ -1461,6 +1601,10 @@ async def test_generate_tgz_of_consecutive_headers_that_recurse_answers_400(
     member = notes.tobuf(format=tarfile.GNU_FORMAT) + b"hello".ljust(512, b"\0")
     data = _tgz_of_tar_bytes(record * sys.getrecursionlimit() + member)
     assert len(data) < 8 * 1024
+    # Each 512-byte header block counts against the 64 KiB member-header ceiling, so a
+    # run this long would hit it before tarfile recurses; raise it here so this test
+    # still reaches the RecursionError path the route must map to 400.
+    monkeypatch.setattr(extractor_module, "MAX_TGZ_MEMBER_HEADER_BYTES", 64 * MAX_TAR_READ_BYTES)
 
     # The real extraction, unchanged; this only notes which thread ran it.
     ran_in: list[threading.Thread] = []
