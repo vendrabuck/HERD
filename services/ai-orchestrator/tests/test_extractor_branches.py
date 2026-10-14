@@ -963,12 +963,14 @@ _BEFORE_THE_RUN = {"run-opens-the-archive": b"", "run-follows-a-member": _header
     "record", [record for record, _ in _CHAINED_HEADERS.values()], ids=_CHAINED_HEADERS
 )
 def test_tgz_run_of_consecutive_headers_that_recurses_is_an_extraction_error(
-    record, lead, stream_reached
+    record, lead, stream_reached, header_ceilings_raised
 ):
     """A run as long as the recursion limit itself: every header costs tarfile at least
     one frame, so the run passes the limit whatever the limit is. The error ends as
     the unreadable-archive ExtractionError naming its own class, with the gzip stream
-    closed, and not as a RecursionError out of the extractor."""
+    closed, and not as a RecursionError out of the extractor. The header ceilings are
+    raised past the run so recursion, not a ceiling, is what stops it; the ceilings
+    stopping such a run first is pinned below."""
     run = sys.getrecursionlimit()
     data = gzip.compress(lead + record * run + _NOTES_MEMBER_AND_END)
     assert len(data) < 8 * 1024
@@ -983,9 +985,12 @@ def test_tgz_run_of_consecutive_headers_that_recurses_is_an_extraction_error(
 
 @pytest.mark.parametrize("lead", _BEFORE_THE_RUN.values(), ids=_BEFORE_THE_RUN)
 @pytest.mark.parametrize(("record", "text"), _CHAINED_HEADERS.values(), ids=_CHAINED_HEADERS)
-def test_tgz_run_of_consecutive_headers_under_the_recursion_limit_extracts(record, text, lead):
+def test_tgz_run_of_consecutive_headers_under_the_recursion_limit_extracts(
+    record, text, lead, header_ceilings_raised
+):
     """A hundred of the same headers in a row, a third of what recursed, read as they
-    always did."""
+    always did. The header ceilings are raised so this proves the recursion floor
+    alone; a run of small headers reaching a ceiling first is pinned below."""
     data = gzip.compress(lead + record * 100 + _NOTES_MEMBER_AND_END)
 
     result = extract_files([("bundle.tgz", data)])
@@ -1191,12 +1196,19 @@ _HEADER_RUNS = {
 }
 
 
+def _block(n: int) -> int:
+    return -(-n // 512) * 512
+
+
 @pytest.mark.parametrize(("first", "second"), _HEADER_RUNS.values(), ids=_HEADER_RUNS)
 def test_tgz_run_of_extended_headers_is_counted_together(first, second, stream_reached):
     """tarfile holds every header of a run until the member is reached, so the run is
-    what the ceiling counts: 40,000 bytes and then 30,000 is refused at the second
-    header's block, and 40,000 and then 25,536, the ceiling exactly, extracts."""
-    lead = _extended_header(first, 40_000)
+    what the ceiling counts, in the block-rounded bytes tarfile reads: a 40,448-byte
+    header then a 30,208-byte one is refused at the second header's block, and the same
+    first header then one filling the ceiling exactly (25,088 bytes) extracts."""
+    first_total = 40_448
+    lead = _extended_header(first, first_total)
+    assert _block(first_total) == first_total
 
     over = gzip.compress(lead + _extended_header(second, 30_000) + _NOTES_MEMBER_AND_END)
     with pytest.raises(ExtractionError) as exc:
@@ -1204,11 +1216,12 @@ def test_tgz_run_of_extended_headers_is_counted_together(first, second, stream_r
     assert str(exc.value) == MEMBER_HEADER_REFUSAL
     assert stream_reached == [len(lead) + 512]
 
-    rest = _MEMBER_HEADER_CEILING - 40_000
+    rest = _MEMBER_HEADER_CEILING - first_total
+    assert _block(rest) == rest
     at = gzip.compress(lead + _extended_header(second, rest) + _NOTES_MEMBER_AND_END)
     result = extract_files([("bundle.tgz", at)])
     # The first long name of a run names the member; tarfile applies it last.
-    named_by = (first, 40_000) if first == tarfile.GNUTYPE_LONGNAME else (second, rest)
+    named_by = (first, first_total) if first == tarfile.GNUTYPE_LONGNAME else (second, rest)
     assert result[0].text == _text_after(*named_by)
 
 
@@ -1418,6 +1431,7 @@ def test_tarfile_still_has_the_methods_the_bounded_tarinfo_overrides():
     refusal it carries would be gone without any other test noticing first."""
     overridden = {
         "_proc_member": ["archive"],
+        "_apply_pax_info": ["pax_headers", "encoding", "errors"],
         "_proc_gnusparse_00": ["next_info", "raw_headers"],
         "_proc_gnusparse_01": ["next_info", "pax_headers"],
         "_proc_gnusparse_10": ["next_info", "pax_headers", "archive"],
@@ -1434,6 +1448,13 @@ def test_tarfile_still_has_the_methods_the_bounded_tarinfo_overrides():
     pax_source = inspect.getsource(tarfile.TarInfo._proc_pax)
     for name in ("_proc_gnusparse_00", "_proc_gnusparse_01", "_proc_gnusparse_10"):
         assert f"self.{name}(" in pax_source, name
+    # _proc_pax applies the records through _apply_pax_info, the ValueError seam #1201
+    # guards; both the extended and the global path reach it.
+    assert "_apply_pax_info(" in pax_source
+    # _proc_member and _proc_gnulong read self._block(self.size), the byte count the
+    # ceilings use; a rename there would uncount a padded header's records.
+    assert "self._block(self.size)" in inspect.getsource(tarfile.TarInfo._proc_pax)
+    assert "self._block(self.size)" in inspect.getsource(tarfile.TarInfo._proc_gnulong)
     # TarFile.next keeps what it reads in TarFile.members, which the walk empties.
     assert "self.members.append(tarinfo)" in inspect.getsource(tarfile.TarFile.next)
 
@@ -1518,6 +1539,115 @@ def test_tgz_bad_header_after_the_first_member_yields_the_members_before_it(tail
     assert str(exc.value) == UNREADABLE_TGZ
 
 
+# A bad header ends the archive only where a member's own header should be. After a pax
+# extended, global, or GNU long-name header, tarfile expects the described member's
+# header and raises SubsequentHeaderError, which TarFile.next turns into ReadError at
+# any offset, so the file is the 400 unreadable archive (issue #1201 review finding 2).
+_EXTENDED_BEFORE_A_BAD_HEADER = {
+    "pax-extended": _record("././@PaxHeader", tarfile.XHDTYPE, b"13 comment=x\n"),
+    "pax-global": _record("pax_global_header", tarfile.XGLTYPE, b"13 comment=x\n"),
+    "gnu-long-name": _record("././@LongLink", tarfile.GNUTYPE_LONGNAME, b"later.txt\0"),
+}
+
+
+@pytest.mark.parametrize(
+    "extended", _EXTENDED_BEFORE_A_BAD_HEADER.values(), ids=_EXTENDED_BEFORE_A_BAD_HEADER
+)
+def test_tgz_bad_header_after_an_extended_header_is_an_unreadable_archive(extended):
+    first = _member_bytes("a.txt", b"first")
+    bad = _member_with_a_bad_checksum("b.txt", b"second")
+    data = gzip.compress(first + extended + bad + _member_bytes("c.txt", b"third") + b"\0" * 1024)
+
+    with pytest.raises(ExtractionError) as exc:
+        _extract_tgz(data, remaining_budget=10_000)
+
+    assert str(exc.value) == UNREADABLE_TGZ
+
+
+# --- The ceilings count the block-rounded bytes tarfile reads, not the declared size ---
+#
+# tarfile's _proc_pax reads self._block(self.size) bytes and parses records until the
+# block ends or a NUL, so a header declaring 1 byte can carry up to 511 bytes of
+# records. Counting the declared size let a flood of such headers pass every ceiling and
+# drive the reader to gigabytes (issue #1201 review finding 1).
+
+
+def _padded_header(type_: bytes, name: str, records: bytes) -> bytes:
+    """A header declaring size 1 whose 512-byte block is filled with `records`."""
+    assert 0 < len(records) <= 511
+    return _header_block(name, 1, type_) + records.ljust(512, b"\0")
+
+
+def _distinct_records_for_a_block(prefix: bytes) -> bytes:
+    """As many distinct empty-valued pax records as fit in one 512-byte block."""
+    records: list[bytes] = []
+    size = 0
+    i = 0
+    while True:
+        record = _pax_record(prefix + b"%04d" % i, b"")
+        if size + len(record) > 511:
+            break
+        records.append(record)
+        size += len(record)
+        i += 1
+    return b"".join(records)
+
+
+def test_tgz_padded_global_headers_are_counted_by_their_block(stream_reached):
+    """Nine global headers, each declaring 1 byte but carrying a full block of distinct
+    records: 9 blocks is 4,608 bytes, past the 4 KiB ceiling, so the ninth is refused.
+    Declared-size counting would see 9 bytes and let them all through."""
+    headers = [
+        _padded_header(
+            tarfile.XGLTYPE, "pax_global_header", _distinct_records_for_a_block(b"g%d_" % i)
+        )
+        for i in range(9)
+    ]
+    data = gzip.compress(b"".join(headers) + _NOTES_MEMBER_AND_END)
+    assert len(data) < 64 * 1024
+
+    with pytest.raises(ExtractionError) as exc:
+        extract_files([("bundle.tgz", data)])
+
+    assert str(exc.value) == GLOBAL_HEADER_REFUSAL
+    # Eight headers' data blocks fit (4,096 counted bytes); the ninth is refused at its
+    # own 512-byte descriptor, before its data block. Each header spans a descriptor and
+    # a data block on the stream, so the position is eight headers plus the ninth's
+    # descriptor.
+    assert stream_reached == [8 * 1024 + 512]
+
+
+def test_tgz_padded_member_headers_are_counted_by_their_block(stream_reached):
+    """A run of 129 extended headers in front of one member, each declaring 1 byte but
+    carrying a full block: 129 blocks is 66,048 bytes, past the 64 KiB ceiling. 128
+    blocks is the ceiling exactly and extracts."""
+    one = _padded_header(tarfile.XHDTYPE, "././@PaxHeader", _distinct_records_for_a_block(b"m_"))
+    over = gzip.compress(one * 129 + _NOTES_MEMBER_AND_END)
+    with pytest.raises(ExtractionError) as exc:
+        extract_files([("bundle.tgz", over)])
+    assert str(exc.value) == MEMBER_HEADER_REFUSAL
+    assert stream_reached == [128 * 1024 + 512]
+
+    at = gzip.compress(one * 128 + _NOTES_MEMBER_AND_END)
+    assert extract_files([("bundle.tgz", at)])[0].text == _NOTES
+
+
+def test_tgz_run_of_small_headers_reaches_the_ceiling_before_tarfile_recurses(stream_reached):
+    """With block counting, a run of minimal headers hits the member ceiling at the
+    129th, well before the recursion limit, so the RecursionError catch is a genuine
+    second line. The same run with the ceiling raised recurses (pinned above)."""
+    record = _small_header_record("././@PaxHeader", tarfile.XHDTYPE, b"13 comment=x\n")
+    run = sys.getrecursionlimit()
+    assert run > 129
+    data = gzip.compress(record * run + _NOTES_MEMBER_AND_END)
+
+    with pytest.raises(ExtractionError) as exc:
+        extract_files([("bundle.tgz", data)])
+
+    assert str(exc.value) == MEMBER_HEADER_REFUSAL
+    assert stream_reached == [128 * 1024 + 512]
+
+
 # --- A text member cut inside a UTF-8 character ---
 
 
@@ -1556,6 +1686,23 @@ def test_tgz_cut_member_that_is_not_utf8_still_falls_back_to_latin1():
     content = b"\xe9" * 5000
     out = _extract_tgz(_make_tgz([("l.txt", content)]), remaining_budget=1000)
     assert out == "--- l.txt ---\n" + "é" * 2024
+
+
+def test_tgz_cut_ending_in_a_cesu8_surrogate_falls_back_to_latin1():
+    """A cut whose held-back tail can never start a UTF-8 character: the incremental
+    decoder BUFFERS a CESU-8 surrogate lead pair (ED A0) rather than raising, so the
+    whole-character path would drop it silently. The member falls back to Latin-1
+    instead, so those bytes are not lost (issue #1201 review finding 5)."""
+    budget = 1000
+    cut = budget + 1024
+    content = b"a" * (cut - 2) + b"\xed\xa0" + b"a" * 2000
+    assert content[:cut].endswith(b"\xed\xa0") and len(content) > cut
+
+    out = _extract_tgz(_make_tgz([("c.txt", content)]), remaining_budget=budget)
+
+    assert out == "--- c.txt ---\n" + content[:cut].decode("latin-1")
+    # Not the silent-drop path, which would lose the two surrogate bytes.
+    assert out != "--- c.txt ---\n" + "a" * (cut - 2)
 
 
 def test_tgz_whole_member_ending_inside_a_character_is_read_as_latin1():
@@ -1627,6 +1774,31 @@ def _walk_in_a_capped_child(data: bytes, tmp_path) -> dict:
 _needs_rlimit = pytest.mark.skipif(
     sys.platform != "linux", reason="RLIMIT_AS and /proc/self/status are Linux behavior"
 )
+
+
+@_needs_rlimit
+def test_tgz_padded_global_header_flood_is_refused_in_bounded_memory(tmp_path):
+    """The review's 1.7 GiB shape (finding 1): 4,096 global headers each DECLARING one
+    byte but carrying a full block of distinct records, then a run of 230 zero-size pax
+    extended headers in front of one member. Every header passes the declared-size
+    count; the block count refuses at the ninth global header. Before the fix this
+    reached 1.7 GiB at an 8 GiB cap and a MemoryError 500 at 256 MiB."""
+    globals_ = [
+        _padded_header(
+            tarfile.XGLTYPE, "pax_global_header", _distinct_records_for_a_block(b"g%d_" % (i % 97))
+        )
+        + _header_block("a.bin")
+        for i in range(4096)
+    ]
+    run = _header_block("././@PaxHeader", 0, tarfile.XHDTYPE) * 230
+    data = gzip.compress(b"".join(globals_) + run + _member_bytes("b.txt", b"hello") + b"\0" * 1024)
+    assert len(data) < 700 * 1024
+
+    report = _walk_in_a_capped_child(data, tmp_path)
+
+    assert report["outcome"] == GLOBAL_HEADER_REFUSAL
+    assert report["seconds"] < 2
+    assert report["peak_kib"] - report["before_kib"] < 16 * 1024
 
 
 @_needs_rlimit

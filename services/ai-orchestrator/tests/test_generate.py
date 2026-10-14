@@ -16,6 +16,7 @@ from app.main import app
 from app.routes import generate as generate_module
 from app.routes.generate import _inventory_provider, _read_uploads
 from app.schemas.generate import ExtractedFile
+from app.services import extractor as extractor_module
 from app.services import generator as generator_module
 from app.services import usage_repo
 from app.services.ai_client import (
@@ -1502,6 +1503,53 @@ async def test_generate_tgz_past_a_header_ceiling_answers_400(
     assert calls["n"] == 0
 
 
+def _pax_record_bytes(keyword: bytes, value: bytes) -> bytes:
+    body = b" " + keyword + b"=" + value + b"\n"
+    length = len(body) + 1
+    while len(str(length)) + len(body) != length:
+        length = len(str(length)) + len(body)
+    return str(length).encode() + body
+
+
+_SPARSE_REALSIZE_BAD = {
+    "non-integer-in-x": (tarfile.XHDTYPE, b"abc"),
+    "non-integer-in-g": (tarfile.XGLTYPE, b"abc"),
+    "too-many-digits-in-x": (tarfile.XHDTYPE, b"1" * 5000),
+}
+
+
+@pytest.mark.parametrize(
+    ("header_type", "value"), _SPARSE_REALSIZE_BAD.values(), ids=_SPARSE_REALSIZE_BAD
+)
+async def test_generate_tgz_with_a_bad_sparse_realsize_answers_400(
+    async_client, monkeypatch, header_type, value
+):
+    """Issue #1201: a GNU.sparse.realsize that is not a number made tarfile's int()
+    raise ValueError, which escaped as a 500. The header is now refused as a sparse
+    member before the value is converted, through the worker thread, with no inventory
+    or provider call."""
+    record = _pax_record_bytes(b"GNU.sparse.realsize", value)
+    name = "pax_global_header" if header_type == tarfile.XGLTYPE else "././@PaxHeader"
+    header = tarfile.TarInfo(name)
+    header.type = header_type
+    header.size = len(record)
+    padded = record + b"\0" * ((512 - len(record) % 512) % 512)
+    tar_bytes = (
+        header.tobuf(format=tarfile.GNU_FORMAT) + padded + _tar_member("notes.txt", b"hello")
+    )
+    data = _tgz_of_tar_bytes(tar_bytes)
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    calls = _override_inventory({"EX3400": 4})
+
+    resp = await _post_one_tgz(async_client, data)
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "The tgz archive has a sparse member, which is not supported; nothing was extracted"
+    )
+    assert calls["n"] == 0
+
+
 async def test_generate_tgz_from_git_archive_reaches_the_provider(async_client, monkeypatch):
     """Issue #1201: git archive writes a pax global header (a 52-byte commit comment)
     in front of its members. It is within the global header ceiling, and the members'
@@ -1553,6 +1601,10 @@ async def test_generate_tgz_of_consecutive_headers_that_recurse_answers_400(
     member = notes.tobuf(format=tarfile.GNU_FORMAT) + b"hello".ljust(512, b"\0")
     data = _tgz_of_tar_bytes(record * sys.getrecursionlimit() + member)
     assert len(data) < 8 * 1024
+    # Each 512-byte header block counts against the 64 KiB member-header ceiling, so a
+    # run this long would hit it before tarfile recurses; raise it here so this test
+    # still reaches the RecursionError path the route must map to 400.
+    monkeypatch.setattr(extractor_module, "MAX_TGZ_MEMBER_HEADER_BYTES", 64 * MAX_TAR_READ_BYTES)
 
     # The real extraction, unchanged; this only notes which thread ran it.
     ran_in: list[threading.Thread] = []
