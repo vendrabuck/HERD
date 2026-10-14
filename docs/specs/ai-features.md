@@ -378,9 +378,15 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   is not gzip, a stream that ends early, corrupt compressed data, a wrong checksum met
   when the reader reaches the gzip trailer), whether it comes at the open, at a header,
   inside a member's data, or while a member is skipped, is raised as `tarfile.ReadError`,
-  so the class named is `ReadError`. \
+  so the class named is `ReadError`. A run of consecutive pax extended or global headers,
+  or GNU long names or long links, long enough that tarfile's reading of them recurses
+  past the interpreter's limit (it calls itself once per such header; a few hundred with
+  the default limit) raises `RecursionError`, which is not a tar error; it is caught by
+  name and answers the same 400 naming its own class, `Failed to read tgz archive
+  (RecursionError)`, whether the run opens the archive or follows a member. A shorter run
+  extracts. \
   Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`_extract_tgz`, `_GZIP_FAILURES`) \
-  Pinned by: `services/ai-orchestrator/tests/test_extractor.py` (`test_extract_tgz_invalid_archive_raises`); `services/ai-orchestrator/tests/test_extractor_branches.py` (`test_tgz_gzip_layer_failure_is_an_extraction_error`, `test_tgz_honest_stored_block_stream_extracts`)
+  Pinned by: `services/ai-orchestrator/tests/test_extractor.py` (`test_extract_tgz_invalid_archive_raises`); `services/ai-orchestrator/tests/test_extractor_branches.py` (`test_tgz_gzip_layer_failure_is_an_extraction_error`, `test_tgz_honest_stored_block_stream_extracts`, `test_tgz_run_of_consecutive_headers_that_recurses_is_an_extraction_error`, `test_tgz_run_of_consecutive_headers_under_the_recursion_limit_extracts`); `services/ai-orchestrator/tests/test_generate.py` (`test_generate_tgz_of_consecutive_headers_that_recurse_answers_400`)
 - **AI-UPLOAD-11.** A tgz holds at most `MAX_TGZ_ENTRIES` (10,000) members, a fixed
   ceiling with no setting. Every member the walk meets counts, whatever its type or
   extension, read or passed over. The member after the ten thousandth answers 400 `The tgz
@@ -1494,7 +1500,7 @@ stream opens are `error` frames, listed at the end.
 |---|---|---|---|
 | 400 | `Too many files: limit is <N>, got <M>` | more file parts than `UPLOAD_MAX_FILES` | AI-UPLOAD-1 |
 | 400 | `File '<name>' exceeds limit of <N> bytes` or `Upload total exceeds limit of <N> bytes` | an upload past a size cap | AI-UPLOAD-2 |
-| 400 | `Unsupported file type '<ext>' for <name>. Accepted: ...`, `Failed to parse PDF (<ExceptionClass>)`, `Failed to read tgz archive (<ExceptionClass>)` | an upload that cannot be extracted | AI-UPLOAD-4, AI-UPLOAD-5, AI-UPLOAD-10 |
+| 400 | `Unsupported file type '<ext>' for <name>. Accepted: ...`, `Failed to parse PDF (<ExceptionClass>)`, `Failed to read tgz archive (<ExceptionClass>)` | an upload that cannot be extracted; for a tgz the class is `ReadError` or another tar error, or `RecursionError` for a run of consecutive pax or long-name headers too long for the reader | AI-UPLOAD-4, AI-UPLOAD-5, AI-UPLOAD-10 |
 | 400 | `The tgz archive has a tar header record over 1048576 bytes (a pax extended header or GNU long name); nothing was extracted` | a tgz upload holding a pax or GNU long-name header over the tar read bound | AI-UPLOAD-8 |
 | 400 | `The tgz archive has more than 10000 entries; nothing was extracted` | a tgz upload of more than 10,000 members | AI-UPLOAD-11 |
 | 400 | `The tgz archive extends past 104857600 bytes uncompressed; nothing was extracted` | a tgz upload the reader would have to read or skip past 100 MiB of, decompressed | AI-UPLOAD-12 |

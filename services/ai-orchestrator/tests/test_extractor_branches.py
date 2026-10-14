@@ -15,7 +15,8 @@ The sections after it pin the two ceilings on the walk (issue #1195): the member
 MAX_TGZ_ENTRIES is refused before another header is read, and no record of any type
 moves the decompressed stream past MAX_TGZ_DECOMPRESSED_BYTES; and the member name
 (issue #1196): a name that is not UTF-8 enters the text with U+FFFD in place of each
-undecodable byte.
+undecodable byte. Between them, a run of consecutive pax or long-name headers long
+enough to make tarfile recurse past the interpreter's limit is an ExtractionError.
 """
 
 import builtins
@@ -23,6 +24,7 @@ import gzip
 import io
 import json
 import struct
+import sys
 import tarfile
 import tracemalloc
 import zlib
@@ -872,6 +874,83 @@ def test_tgz_flood_of_pax_headers_is_refused_at_the_byte_ceiling(stream_reached)
     # Ninety-nine whole pairs fit; the hundredth pair's header data would end past it.
     assert stream_reached == [99 * len(pair) + 512]
     assert stream_reached[0] <= extractor.MAX_TGZ_DECOMPRESSED_BYTES
+
+
+# --- A run of consecutive headers that makes tarfile recurse ---
+#
+# tarfile reads a pax extended header or a GNU long name or long link by calling
+# itself for the header that follows it, three frames a header on CPython 3.12. With
+# the default limit of 1000 frames the smallest run that raised RecursionError was 328
+# from a script and 327 from a worker thread. RecursionError is not a tarfile.TarError:
+# before it was caught, a 1.8 KB upload of 400 such headers was an unhandled 500.
+
+UNREADABLE_BY_RECURSION = "Failed to read tgz archive (RecursionError)"
+
+
+def _small_header_record(name: str, type_: bytes, data: bytes) -> bytes:
+    return _header_block(name, len(data), type_) + data.ljust(512, b"\0")
+
+
+# Each kind of header tarfile reads that way, and the text an archive of such headers
+# then notes.txt yields: a GNU long name renames the member, the others leave its name.
+_CHAINED_HEADERS = {
+    "pax-extended": (
+        _small_header_record("././@PaxHeader", tarfile.XHDTYPE, b"13 comment=x\n"),
+        _NOTES,
+    ),
+    "pax-global": (
+        _small_header_record("././@PaxHeader", tarfile.XGLTYPE, b"13 comment=x\n"),
+        _NOTES,
+    ),
+    "gnu-long-name": (
+        _small_header_record("././@LongLink", tarfile.GNUTYPE_LONGNAME, b"long/name.txt\0"),
+        "--- long/name.txt ---\nhello",
+    ),
+    "gnu-long-link": (
+        _small_header_record("././@LongLink", tarfile.GNUTYPE_LONGLINK, b"long/link.txt\0"),
+        _NOTES,
+    ),
+}
+
+# Where the run starts decides where the error is raised: a run that opens the archive
+# is read inside tarfile.open, a run after a member inside the iteration.
+_BEFORE_THE_RUN = {"run-opens-the-archive": b"", "run-follows-a-member": _header_block("a.bin")}
+
+
+@pytest.mark.parametrize("lead", _BEFORE_THE_RUN.values(), ids=_BEFORE_THE_RUN)
+@pytest.mark.parametrize(
+    "record", [record for record, _ in _CHAINED_HEADERS.values()], ids=_CHAINED_HEADERS
+)
+def test_tgz_run_of_consecutive_headers_that_recurses_is_an_extraction_error(
+    record, lead, stream_reached
+):
+    """A run as long as the recursion limit itself: every header costs tarfile at least
+    one frame, so the run passes the limit whatever the limit is. The error ends as
+    the unreadable-archive ExtractionError naming its own class, with the gzip stream
+    closed, and not as a RecursionError out of the extractor."""
+    run = sys.getrecursionlimit()
+    data = gzip.compress(lead + record * run + _NOTES_MEMBER_AND_END)
+    assert len(data) < 8 * 1024
+
+    with pytest.raises(ExtractionError) as exc:
+        extract_files([("bundle.tgz", data)])
+
+    assert str(exc.value) == UNREADABLE_BY_RECURSION
+    assert type(exc.value.__cause__) is RecursionError
+    assert len(stream_reached) == 1
+
+
+@pytest.mark.parametrize("lead", _BEFORE_THE_RUN.values(), ids=_BEFORE_THE_RUN)
+@pytest.mark.parametrize(("record", "text"), _CHAINED_HEADERS.values(), ids=_CHAINED_HEADERS)
+def test_tgz_run_of_consecutive_headers_under_the_recursion_limit_extracts(record, text, lead):
+    """A hundred of the same headers in a row, a third of what recursed, read as they
+    always did."""
+    data = gzip.compress(lead + record * 100 + _NOTES_MEMBER_AND_END)
+
+    result = extract_files([("bundle.tgz", data)])
+
+    assert result[0].text == text
+    assert result[0].truncated is False
 
 
 # --- A member name that is not UTF-8 (issue #1196) ---

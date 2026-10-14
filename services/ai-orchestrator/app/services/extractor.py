@@ -193,6 +193,12 @@ def _extract_tgz(data: bytes, remaining_budget: int) -> str:
     tarfile keeps in ``TarFile.members``. ``_CeilingStream`` refuses, with
     TGZ_BYTES_LIMIT_DETAIL, any read or seek that would move the decompressed stream
     past MAX_TGZ_DECOMPRESSED_BYTES. Either refusal fails the file; no text is kept.
+
+    tarfile reads a pax extended header or a GNU long name by calling itself for the
+    header that follows, so a run of a few hundred of them in a row, a kilobyte or two
+    compressed, ends in ``RecursionError``. That is not a ``tarfile.TarError``; it is
+    caught here by name and ends as the same ExtractionError as any other archive
+    that cannot be read, naming its own class.
     """
     parts: list[str] = []
     used = 0
@@ -227,7 +233,7 @@ def _extract_tgz(data: bytes, remaining_budget: int) -> str:
         raise ExtractionError(TGZ_READ_LIMIT_DETAIL) from e
     except _TgzLimitError as e:
         raise ExtractionError(str(e)) from e
-    except tarfile.TarError as e:
+    except (tarfile.TarError, RecursionError) as e:
         raise ExtractionError(f"Failed to read tgz archive ({type(e).__name__})") from e
     return "\n\n".join(parts)
 

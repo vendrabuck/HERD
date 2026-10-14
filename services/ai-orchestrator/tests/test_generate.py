@@ -2,6 +2,7 @@ import asyncio
 import gzip
 import io
 import json
+import sys
 import tarfile
 import threading
 import uuid
@@ -1440,6 +1441,46 @@ async def test_generate_tgz_past_the_byte_ceiling_answers_400(async_client, monk
         "The tgz archive extends past 104857600 bytes uncompressed; nothing was extracted"
     )
     assert calls["n"] == 0
+
+
+async def test_generate_tgz_of_consecutive_headers_that_recurse_answers_400(
+    async_client, monkeypatch
+):
+    """A tgz of as many consecutive pax extended headers as the recursion limit makes
+    tarfile recurse past it. The RecursionError is raised in the worker thread the
+    extraction runs in, and the route answers the upload path's 400 with the
+    unreadable-archive detail naming that class; before it was caught there, a 1.8 KB
+    upload of 400 such headers was an unhandled 500. Neither inventory nor the provider
+    is called."""
+    pax = tarfile.TarInfo("././@PaxHeader")
+    pax.type = tarfile.XHDTYPE
+    pax.size = 13
+    record = pax.tobuf(format=tarfile.GNU_FORMAT) + b"13 comment=x\n".ljust(512, b"\0")
+    notes = tarfile.TarInfo("notes.txt")
+    notes.size = 5
+    member = notes.tobuf(format=tarfile.GNU_FORMAT) + b"hello".ljust(512, b"\0")
+    data = _tgz_of_tar_bytes(record * sys.getrecursionlimit() + member)
+    assert len(data) < 8 * 1024
+
+    # The real extraction, unchanged; this only notes which thread ran it.
+    ran_in: list[threading.Thread] = []
+    real_extract_files = generate_module.extract_files
+
+    def recording_extract_files(uploads):
+        ran_in.append(threading.current_thread())
+        return real_extract_files(uploads)
+
+    monkeypatch.setattr(generate_module, "extract_files", recording_extract_files)
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    calls = _override_inventory({"EX3400": 4})
+
+    resp = await _post_one_tgz(async_client, data)
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "Failed to read tgz archive (RecursionError)"
+    assert calls["n"] == 0
+    assert len(ran_in) == 1
+    assert ran_in[0] is not threading.current_thread()
 
 
 async def test_read_uploads_runs_the_extraction_off_the_event_loop(monkeypatch):
