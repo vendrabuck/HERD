@@ -148,7 +148,10 @@ WIRING_STALE_BUILD_REASON = "build intent gone; pending release"
 # The canonical non-retryable prefix set (ADR 0007 Decision 5). Single-sourced here
 # (issue #491 review): the three stale-build reconcile exclusions below and
 # wiring_retry_service._NON_RETRYABLE_PREFIXES must never drift apart, or the most
-# safety-critical exclusion in the reconcile misclassifies asymmetrically.
+# safety-critical exclusion in the reconcile misclassifies asymmetrically. The retry
+# tick's three due selects build their SQL reason test from this tuple too
+# (wiring_due.retryable_reason, issue #1190), so a prefix added here is excluded by the
+# selects with no second list to edit.
 NON_RETRYABLE_REASON_PREFIXES = (WIRING_UNRESOLVABLE_REASON, WIRING_NOT_SIMPLE_CHAIN_REASON)
 
 

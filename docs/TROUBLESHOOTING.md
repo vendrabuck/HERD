@@ -334,6 +334,38 @@ wiring, so no driver call ran. The reason tells the two cases apart (issue #1002
   fork wiring. The execution log line `Wiring driver load failed for switch ...` carries
   the validation detail.
 
+### The `wiring_retry_tick` log line shows `excluded_not_retryable` or `excluded_frozen` above zero
+
+Meaning: the wiring ledgers hold `FAILED` rows under the attempts cap that the background
+retry tick will never drive, and its selects leave them out (issue #1190). They repeat on
+every tick because the tick does not change them. They no longer take up the tick's batch of
+`WIRING_RETRY_BATCH_SIZE` rows per ledger, so they do not delay other rows. (Other selected rows
+still can: a build row whose intent cannot be read while cabling or inventory is unreachable
+is selected, left unchanged, and counts no attempt, so a batch of them delays newer rows in
+its ledger until that service answers again. It shows as `still_failed` with no driver run.)
+
+- `excluded_not_retryable`: rows whose reason starts with `recorded hop unresolvable` or
+  `hop set is not a simple chain`. The saved wiring cannot be applied as recorded, so a
+  driver retry would fail the same way. On an `ACTIVE` reservation, fix the cause (the
+  switch, its template, or its driver package) and re-save the fork wiring; the Wiring tab
+  reports these rows as not retryable. On an ended reservation no channel will retry them:
+  the tick leaves them out, a manual retry reports them `not_retryable`, and a fork re-save
+  needs an `ACTIVE` reservation. A row that was going to RELEASE (`intended` is `RELEASED`)
+  may mean the hardware was left connected: the disconnect never ran. Read the row with
+  `GET /api/reservations/{id}/wiring-status` (any status, owner or admin), which lists each
+  row's switch, and its ports for L1 and L2. For a reason such as a missing template or `driver load failed:
+  DriverPackageError` the switch is still in inventory: check on the switch whether the
+  row's ports are still cross-connected (L1), still in the VLAN (L2), or whether its routes
+  are still installed (L3), and remove them by hand. A reason ending in `switch <id> not
+  found` means the switch is gone from inventory, so HERD cannot reach it; if that hardware
+  still exists, check it the same way.
+- `excluded_frozen`: build-direction rows of reservations that have ended. A connection
+  is never built for an ended reservation, so these rows stay as a record of a build that
+  did not finish. No action is needed.
+
+`null` in place of a number means the count could not be read on that tick; the execution
+log carries a warning with the cause, and the tick still retried what it selected.
+
 ### Log action `dynamic_instance_keyed_destroy_failed`
 
 Meaning: a reservation with a dynamic instance ended, and the instance's ledger row had

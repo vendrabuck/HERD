@@ -22,6 +22,7 @@ from app.models.route_assignment import RouteAssignment
 from app.services._uuid_utils import as_uuid as _as_uuid
 from app.services.l1_assignment_service import get_wiring_state
 from app.services.wiring_claim import unclaimed
+from app.services.wiring_due import tick_would_drive
 
 logger = logging.getLogger(__name__)
 
@@ -956,13 +957,20 @@ async def due_failed_route_rows(
     """FAILED route pins still under the attempts cap, oldest first, batch-capped.
 
     The background auto-retry channel's per-tick L3 candidate set, the due_failed_rows
-    analogue. Retryability and the frozen guard are applied by the caller.
+    analogue. It carries the same drive rule, wiring_due.tick_would_drive (issue
+    #1190): a pin with a pinned non-retryable reason and a build-direction pin of a
+    frozen reservation are not candidates, so they cannot fill the batch; the caller
+    keeps both checks for a reservation frozen after this select. The rule reads only
+    the reason, the direction, and the freeze, never `routes`, so a FAILED pin that
+    records no routes (issue #1004) or possibly-installed routes (issue #1001) is a
+    candidate exactly when the tick drove it before.
 
     RETRY-ONLY, so it also filters on the issue #817 drive claim and takes FOR UPDATE
-    SKIP LOCKED, exactly like due_failed_rows: a row another channel is currently
-    driving is not a candidate. The per-row compare-and-swap in
+    SKIP LOCKED on the ledger table, exactly like due_failed_rows: a row another
+    channel is currently driving is not a candidate. The per-row compare-and-swap in
     wiring_claim.WiringRowClaims.claim is the real guard; the reconcile's stale-build
-    widening reader deliberately carries neither (see wiring_claim's module docstring).
+    widening reader deliberately carries none of these predicates (see wiring_claim's
+    and wiring_due's module docstrings).
     """
     now = now or datetime.now(timezone.utc)
     result = await db.execute(
@@ -971,9 +979,10 @@ async def due_failed_route_rows(
             RouteAssignment.status == "FAILED",
             RouteAssignment.attempts < max_attempts,
             unclaimed(RouteAssignment, now),
+            tick_would_drive(RouteAssignment),
         )
         .order_by(RouteAssignment.created_at.asc())
         .limit(limit)
-        .with_for_update(skip_locked=True)
+        .with_for_update(skip_locked=True, of=RouteAssignment.__table__)
     )
     return list(result.scalars().all())

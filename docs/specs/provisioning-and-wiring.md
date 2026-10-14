@@ -1046,6 +1046,8 @@ going; a build whose intent has gone is never retried.
 
 **Surfaces.** `reattempt_reservation`, `run_wiring_retry_tick`, and
 `run_wiring_retry_loop` in `services/execution/app/services/wiring_retry_service.py`;
+the tick's selection predicate `tick_would_drive` in
+`services/execution/app/services/wiring_due.py`;
 internal route `POST /internal/reservations/{reservation_id}/wiring/retry`; the user
 interface in section 8.15.
 
@@ -1117,22 +1119,36 @@ interface in section 8.15.
   Enforced in: `services/execution/app/routers/executions.py` (`internal_wiring_retry`) \
   Pinned by: `services/execution/tests/test_router_wiring_endpoints.py` (`test_wiring_retry_upstream_maps_to_503`, `test_wiring_retry_relays_outcomes`)
 - **WIRE-RETRY-13.** Each tick selects, per ledger, up to `WIRING_RETRY_BATCH_SIZE` (at
-  least 1) unclaimed FAILED rows with attempts below `WIRING_RETRY_MAX_ATTEMPTS`, oldest
-  first, skipping rows locked by another transaction. \
+  least 1) unclaimed FAILED rows with attempts below `WIRING_RETRY_MAX_ATTEMPTS` that
+  neither skip rule of WIRE-RETRY-14 sets aside, oldest first, skipping rows locked by
+  another transaction. The select locks rows of its own ledger only, none in
+  `reservation_wiring_state`. A selected row is not always driven: a build-direction row
+  whose intent cannot be read (cabling's fork read, or an inventory read in the
+  derivation, raising `TransientUpstreamError`) is left unchanged with no attempt
+  counted, so while that upstream fails, a batch of such rows older than the rest of a
+  ledger keeps newer rows from being selected; twenty of them older than one
+  release-direction row kept that row from being selected for five ticks running, with
+  no driver call, in each ledger. Known limit by decision: an outage counts no attempt,
+  so it never retires rows, and the batch is not reordered (Limits by decision). \
   Enforced in: `services/execution/app/services/wiring_retry_service.py` (`run_wiring_retry_tick`); `services/execution/app/services/l1_assignment_service.py` (`due_failed_rows`); `services/execution/app/services/l2_membership_service.py` (`due_failed_l2_rows`); `services/execution/app/services/route_service.py` (`due_failed_route_rows`) \
-  Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_tick_respects_batch_cap`, `test_tick_skips_rows_past_max_attempts`); `services/execution/tests/test_wiring_claim.py` (`test_l1_claimed_row_is_invisible_to_the_tick_select`, `test_l1_expired_claim_is_reclaimable`)
-- **WIRE-RETRY-14.** The tick skips rows with a pinned reason (counted
-  `skipped_not_retryable`) and build-direction rows of frozen reservations (counted
-  `skipped_frozen`); release-direction rows are retried on a frozen reservation. \
-  Enforced in: `services/execution/app/services/wiring_retry_service.py` (`run_wiring_retry_tick`) \
-  Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_tick_skips_frozen_reservation`, `test_tick_retries_frozen_release_and_skips_frozen_build`, `test_tick_skips_non_retryable_l2_and_l3_rows`, `test_tick_skips_frozen_l2_and_l3_build_rows`, `test_parked_post_freeze_build_converges_released_on_next_tick`)
+  Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_tick_respects_batch_cap`, `test_tick_skips_rows_past_max_attempts`); `services/execution/tests/test_wiring_claim.py` (`test_l1_claimed_row_is_invisible_to_the_tick_select`, `test_l1_expired_claim_is_reclaimable`); `services/execution/tests/test_wiring_due.py` (`test_due_statement_locks_the_ledger_table_only`, `test_unverifiable_build_rows_still_fill_the_batch_while_the_upstream_fails`); `services/execution/tests/test_wiring_retry_due_predicate_live_pg.py` (`test_due_select_locks_its_ledger_row_and_no_wiring_state_row`)
+- **WIRE-RETRY-14.** The three selects leave out rows with a pinned reason and
+  build-direction rows of frozen reservations, so neither kind counts toward a batch and a
+  ledger full of them cannot keep a newer retryable row from being selected;
+  release-direction rows are selected and retried on a frozen reservation. A row is
+  selected exactly when neither rule sets it aside: its reason is absent, empty, or starts
+  with none of `NON_RETRYABLE_REASON_PREFIXES` (compared case-sensitively), and it is
+  release-direction or its reservation has no frozen wiring state row. \
+  Enforced in: `services/execution/app/services/wiring_due.py` (`tick_would_drive`, `retryable_reason`, `frozen_build`); `services/execution/app/services/l1_assignment_service.py` (`due_failed_rows`); `services/execution/app/services/l2_membership_service.py` (`due_failed_l2_rows`); `services/execution/app/services/route_service.py` (`due_failed_route_rows`) \
+  Pinned by: `services/execution/tests/test_wiring_due.py` (`test_due_query_returns_exactly_the_rows_the_tick_would_drive`, `test_due_query_follows_the_prefix_tuple`, `test_a_full_batch_of_stale_rows_does_not_hide_a_newer_retryable_row`, `test_one_tick_drives_the_retryable_row_behind_a_batch_of_stale_rows`, `test_release_row_of_a_frozen_reservation_is_selected_and_driven`); `services/execution/tests/test_wiring_retry_due_predicate_live_pg.py` (`test_due_query_returns_exactly_the_rows_the_tick_would_drive`, `test_due_query_follows_the_prefix_tuple`, `test_stale_rows_cannot_fill_the_batch`); `services/execution/tests/test_wiring_retry_service.py` (`test_tick_skips_frozen_reservation`, `test_tick_retries_frozen_release_and_skips_frozen_build`, `test_tick_skips_non_retryable_l2_and_l3_rows`, `test_tick_skips_frozen_l2_and_l3_build_rows`, `test_parked_post_freeze_build_converges_released_on_next_tick`)
 - **WIRE-RETRY-15.** An exception from one layer's retry is logged, its rows stay FAILED,
   and the other layers still run. \
   Enforced in: `services/execution/app/services/wiring_retry_service.py` (`run_wiring_retry_tick`) \
   Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_tick_l1_reattempt_exception_leaves_row_failed_and_does_not_raise`, `test_tick_l2_reattempt_exception_leaves_row_failed_and_does_not_raise`, `test_tick_l3_reattempt_exception_leaves_row_failed_and_does_not_raise`)
 - **WIRE-RETRY-16.** The tick returns and logs (`wiring_retry_tick`, at its end) the
   totals `rows_due`, `rows_retried`, `reconnected`, `released`, `superseded`,
-  `still_failed`, `in_progress`, the two skip counts, and per-layer retried counts. \
+  `still_failed`, `in_progress`, the two skip counts (WIRE-RETRY-19), the two excluded
+  counts (WIRE-RETRY-20), and per-layer retried counts. \
   Enforced in: `services/execution/app/services/wiring_retry_service.py` (`run_wiring_retry_tick`) \
   Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_tick_reports_released_stat_for_release_direction_rows`, `test_tick_reports_superseded_stat`); `services/execution/tests/test_wiring_retry_l2.py` (`test_tick_labels_layers_and_counts_per_layer`); `services/execution/tests/test_wiring_retry_l3.py` (`test_tick_labels_layers_and_counts_l3`)
 - **WIRE-RETRY-17.** The loop ticks every `WIRING_RETRY_INTERVAL_SECONDS` (at least 1); a
@@ -1144,6 +1160,21 @@ interface in section 8.15.
   independent of `EXECUTION_POLLER_ONLY`, so it runs in every replica that enables it. \
   Enforced in: `services/execution/app/services/wiring_retry_service.py` (`start_wiring_retry_scheduler`); `services/execution/app/main.py` (`lifespan`) \
   Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_scheduler_start_respects_enable_flag`)
+- **WIRE-RETRY-19.** The tick applies the two rules of WIRE-RETRY-14 again to the rows
+  it loaded. A build-direction row whose reservation was frozen after the select is not
+  driven, is left unchanged, and is counted `skipped_frozen`; the next tick's select
+  leaves it out. A loaded row with a pinned reason is not driven and is counted
+  `skipped_not_retryable`. \
+  Enforced in: `services/execution/app/services/wiring_retry_service.py` (`run_wiring_retry_tick`, `is_retryable_failure`) \
+  Pinned by: `services/execution/tests/test_wiring_due.py` (`test_row_frozen_after_the_select_is_skipped_once_then_excluded`, `test_tick_still_refuses_rows_its_select_should_not_have_returned`)
+- **WIRE-RETRY-20.** `excluded_not_retryable` and `excluded_frozen` count, across the
+  three ledgers, the FAILED rows under the attempts cap that the selects leave out
+  (claimed rows included; a row with a pinned reason on a frozen reservation counts as
+  not retryable). A count that cannot be read is logged, reports both as null, and does
+  not fail the tick. The tick line is logged at INFO when `rows_due` or either excluded
+  count is above zero, and at DEBUG otherwise. \
+  Enforced in: `services/execution/app/services/wiring_retry_service.py` (`run_wiring_retry_tick`); `services/execution/app/services/wiring_due.py` (`count_tick_excluded`) \
+  Pinned by: `services/execution/tests/test_wiring_due.py` (`test_count_tick_excluded_counts_failed_under_cap_rows_by_reason`, `test_tick_excluded_stats_sum_the_three_ledgers`, `test_tick_excluded_stats_leave_out_rows_at_and_above_the_cap`, `test_tick_log_level_follows_each_excluded_count`, `test_a_failed_exclusion_count_does_not_fail_the_tick`, `test_tick_log_stays_at_info_while_only_excluded_rows_exist`); `services/execution/tests/test_wiring_retry_due_predicate_live_pg.py` (`test_count_tick_excluded_counts_the_case_product`)
 
 **Out of scope.** Reservations' status gate on the proxy (`reservations.md`,
 RES-FORK-18).
@@ -1295,13 +1326,17 @@ attempts; the claim budget (WIRE-CLAIM-3).
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/execution/tests/` (in-memory SQLite): `test_nats_consumer*.py`, `test_l1_assignment_service.py`, `test_l2_membership_service.py`, `test_route_service.py`, `test_vlan_service*.py`, `test_wiring_retry*.py`, `test_wiring_claim.py`; `services/common/tests/test_jetstream.py`; `tests/unit/test_consumer_heartbeat_wiring.py`; `frontend/src/test/components/ReservationWiringTab.test.tsx`, `frontend/src/test/api/reservationWiring.test.tsx` | Driver calls are recorded fakes; `FOR UPDATE SKIP LOCKED` and row locks are no-ops on SQLite |
-| Functional (through the service API) | `services/execution/tests/test_router_wiring_endpoints.py` (httpx against the app); `services/execution/tests/test_wiring_retry_claim_race_live_pg.py` against a real Postgres | The live suite runs in the `make master` and `make everything` gates |
+| Functional (through the service API) | `services/execution/tests/test_router_wiring_endpoints.py` (httpx against the app); `services/execution/tests/test_wiring_retry_claim_race_live_pg.py` and `services/execution/tests/test_wiring_retry_due_predicate_live_pg.py` against a real Postgres | The two live suites run in the `make master` and `make everything` gates |
 | Integration (running stack) | `tests/integration/test_wiring_changed_reconcile.py`, `test_l1_provisioning.py`, `test_l2_reconcile.py`, `test_vlan_assignment.py`, `test_l3_reconcile.py`, `test_l3_route_provisioning.py`, `test_l3_intent_execution.py`, `test_l2_l3_result_gating.py`, `test_ledger_teardown.py`, `test_failed_teardown.py`, `test_event_verification_gate.py`, `test_dlq_and_idempotency.py`, `test_device_set_patch_wiring.py`, `test_nats_consumer_configs_live.py` | Drive the checked-in mock drivers; the NOS lab tiers (`tests/nos_lab/`) drive real FRR and SR Linux and are covered in `device-configuration.md` |
 | Stress and load | None | No load test drives fork saves, wiring retries, or teardown; `tests/load/locustfile.py` covers reservations and topology validation only |
 | Browser end-to-end | `tests/e2e/test_reservation_wiring.py`, `test_wiring_failed_row_playwright.py`, `test_wiring_layered_playwright.py`, `test_l3_routing_playwright.py` | Run nightly and in the gates, not per pull request |
 
 Not run for this document: nothing was checked against a running stack. The
-live-Postgres suite, the integration suite, and the browser suite were read, not run.
+live-Postgres claim suite, the integration suite, and the browser suite were read, not
+run. The exception is WIRE-RETRY-13, WIRE-RETRY-14, WIRE-RETRY-19, and WIRE-RETRY-20
+(issue #1190), whose live-Postgres suite
+`test_wiring_retry_due_predicate_live_pg.py` was run against a used execution schema
+and against an empty one.
 The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
 
 ## 13. Known limits and gaps
@@ -1312,6 +1347,10 @@ None at present.
 
 ### Limits by decision
 
+- A build-direction row the retry tick selects but cannot verify against the current
+  intent (an upstream read failing) is left unchanged with no attempt counted, so during
+  that outage a batch of such rows delays newer rows of its ledger (WIRE-RETRY-13).
+  Recorded in issue #1190, PR #1198, and the module docstring of `wiring_due.py`.
 - An empty fork answer (cabling 404) converges a reservation's wiring to nothing
   (WIRE-ORDER-6), while every other unreadable answer defers. Recorded in the docstring
   of `_fetch_fork_intended_wires` and in issue #460.

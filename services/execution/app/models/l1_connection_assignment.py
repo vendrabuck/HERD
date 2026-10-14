@@ -29,15 +29,19 @@ _active_l1_unique = Index(
 )
 
 # Partial index for the wiring auto-retry sweep's per-tick candidate query
-# (due_failed_rows: WHERE status = 'FAILED' AND attempts < max_attempts ORDER BY
-# created_at). The table is append-only (ADR 0007 Decision 4: RELEASED/FAILED
-# rows are retained as the applied-wiring audit trail), so it grows without
-# bound while the sweep runs every tick. Partial-on-FAILED keeps the index
-# small and matches the hot predicate directly; attempts is left out of the
-# index since it is rarely selective enough on its own append-heavy table to
-# be worth the extra column, and the FAILED-only predicate already discards
-# the bulk of rows. Declared here (not only in the migration) so
-# Base.metadata.create_all builds it for the SQLite unit-test DB.
+# (due_failed_rows: WHERE status = 'FAILED' AND attempts < max_attempts AND the
+# row is unclaimed AND neither skip rule sets it aside, ORDER BY created_at). The table
+# is append-only (ADR 0007 Decision 4: RELEASED/FAILED rows are retained as the
+# applied-wiring audit trail), so it grows without bound while the sweep runs
+# every tick. Partial-on-FAILED keeps the index small and serves the status
+# test and the ordering; attempts is left out of the index since it is rarely
+# selective enough on its own append-heavy table to be worth the extra column,
+# and the FAILED-only predicate already discards the bulk of rows. The claim
+# test and the drive rule (wiring_due.tick_would_drive, issue #1190: the reason
+# prefixes and the frozen-reservation subquery) are filters applied to the
+# FAILED rows the index yields, not index conditions. Declared here (not only
+# in the migration) so Base.metadata.create_all builds it for the SQLite
+# unit-test DB.
 _failed_l1_created_at = Index(
     "ix_l1_connection_assignments_failed_created_at",
     "created_at",

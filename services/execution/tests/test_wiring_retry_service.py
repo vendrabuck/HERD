@@ -558,14 +558,18 @@ async def test_tick_skips_rows_past_max_attempts(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_tick_skips_frozen_reservation(monkeypatch):
-    """A FAILED row whose reservation is frozen is skipped, not reattempted."""
+    """A FAILED build row whose reservation is frozen is not reattempted. Since issue
+    #1190 the tick's select leaves it out (counted excluded_frozen) and it is never
+    loaded, where before it was loaded and counted skipped_frozen."""
     monkeypatch.setattr(settings, "wiring_retry_batch_size", 20)
     await _seed_state(frozen=True)
     await _seed_failed("0/0/1", "0/0/2", attempts=0)
     execute_fn, calls = _sandbox_recorder()
     stats = await _run_tick(execute_fn)
 
-    assert stats["skipped_frozen"] == 1
+    assert stats["excluded_frozen"] == 1
+    assert stats["rows_due"] == 0
+    assert stats["skipped_frozen"] == 0
     assert stats["rows_retried"] == 0
     assert calls == []
     assert len(await _rows("FAILED")) == 1
@@ -582,7 +586,9 @@ async def test_tick_retries_frozen_release_and_skips_frozen_build(monkeypatch):
     execute_fn, calls = _sandbox_recorder()
     stats = await _run_tick(execute_fn)
 
-    assert stats["skipped_frozen"] == 1, "the build-direction row is skipped"
+    assert stats["excluded_frozen"] == 1, "the build-direction row is left out"
+    assert stats["rows_due"] == 1, "only the release-direction row is selected"
+    assert stats["skipped_frozen"] == 0
     assert stats["rows_retried"] == 1
     assert stats["released"] == 1
     assert ("connect_ports", "0/0/1", "0/0/2") not in calls
@@ -923,9 +929,10 @@ async def test_reattempt_rows_skips_id_deleted_before_refresh():
 
 @pytest.mark.asyncio
 async def test_tick_skips_non_retryable_l2_and_l3_rows(monkeypatch):
-    """The tick's skipped_not_retryable counter applies to L1, L2, and L3 rows alike:
-    a pinned unresolvable reason on any layer is excluded from the batch and never
-    reaches the driver."""
+    """A pinned unresolvable reason on any layer is excluded from the batch and never
+    reaches the driver. Since issue #1190 the three selects leave such a row out, so it
+    is counted excluded_not_retryable across L1, L2, and L3 alike and is never loaded
+    (rows_due 0), where before it was loaded and counted skipped_not_retryable."""
     from app.models.l2_port_assignment import L2PortAssignment
     from app.models.route_assignment import RouteAssignment
 
@@ -960,7 +967,9 @@ async def test_tick_skips_non_retryable_l2_and_l3_rows(monkeypatch):
     execute_fn, calls = _sandbox_recorder()
     stats = await _run_tick(execute_fn)
 
-    assert stats["skipped_not_retryable"] == 3
+    assert stats["excluded_not_retryable"] == 3
+    assert stats["rows_due"] == 0
+    assert stats["skipped_not_retryable"] == 0
     assert stats["rows_retried"] == 0
     assert calls == []
 
@@ -968,7 +977,9 @@ async def test_tick_skips_non_retryable_l2_and_l3_rows(monkeypatch):
 @pytest.mark.asyncio
 async def test_tick_skips_frozen_l2_and_l3_build_rows(monkeypatch):
     """Direction-scoped freeze applies uniformly across layers: a frozen reservation's
-    build-direction L2 and L3 rows are counted skipped_frozen and never driven."""
+    build-direction L2 and L3 rows are never driven. Since issue #1190 the selects
+    leave them out (counted excluded_frozen, rows_due 0), where before they were loaded
+    and counted skipped_frozen."""
     from app.models.l2_port_assignment import L2PortAssignment
     from app.models.route_assignment import RouteAssignment
 
@@ -1003,7 +1014,9 @@ async def test_tick_skips_frozen_l2_and_l3_build_rows(monkeypatch):
     execute_fn, calls = _sandbox_recorder()
     stats = await _run_tick(execute_fn)
 
-    assert stats["skipped_frozen"] == 2
+    assert stats["excluded_frozen"] == 2
+    assert stats["rows_due"] == 0
+    assert stats["skipped_frozen"] == 0
     assert stats["rows_retried"] == 0
     assert calls == []
 
