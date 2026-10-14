@@ -45,8 +45,18 @@ MEDIUM, LOW) and a concrete target file path.
   canvas-save-fail and reservation-fail rollback paths. Not covered: rollback
   when the rollback DELETE itself fails (what does the user see?), and
   rollback when the /execute admin-required path is hit on a partial commit.
-- **[LOW] extractor.py malformed-output resilience.** `test_extractor.py` exists
-  but has no "LLM returned a tool_use with missing required keys" test.
+- **[LOW] Malformed model output: a proposal missing required keys.**
+  `services/ai-orchestrator/app/services/extractor.py` reads uploaded files and
+  never sees model output, so it is not where this gap lives. A forced
+  `propose_topology` tool_use block whose input lacks a required key (`purpose`,
+  `devices`, or `edges` of `GenerateResponse`) reaches `GenerateResponse.model_validate`
+  in `generator.py`, which answers 502 `AI returned a response that did not match
+  the expected schema`. The only test of that branch,
+  `test_generate_schema_violation_never_leaks_offending_input` in `test_generate.py`,
+  sends a wrongly typed `purpose` with every key present; no test omits a key. What
+  `test_ai_client.py` covers on the `ai_client.py` side is an empty content list and
+  a text block that is not JSON (`AI did not return a tool_use block`), both asserted
+  as a bare `AIError` without the message.
 
 ## Frontend: pages and components
 
@@ -147,7 +157,7 @@ clients have a suite but stay below 85% lines on error and edge-case branches:
   E2E gap until the LLM call can be stubbed at the network layer (the integration
   test `tests/integration/test_ai_status.py::test_ai_generate_succeeds_when_key_present`
   exercises the live LLM path).
-- [HIGH] Device-config edit -> schedule -> result UI flow. Backend (inventory +
+- [HIGH] Device-config edit, schedule, and result UI flow. Backend (inventory +
   execution + scheduler) is unit-tested; the user-visible journey of editing
   a config, scheduling an apply, and watching the job status update is not
   (`tests/e2e/test_device_config_apply.py` covers the device-detail page, the

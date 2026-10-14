@@ -1122,14 +1122,24 @@ interface in section 8.15.
   least 1) unclaimed FAILED rows with attempts below `WIRING_RETRY_MAX_ATTEMPTS` that
   neither skip rule of WIRE-RETRY-14 sets aside, oldest first, skipping rows locked by
   another transaction. The select locks rows of its own ledger only, none in
-  `reservation_wiring_state`. A selected row is not always driven: a build-direction row
-  whose intent cannot be read (cabling's fork read, or an inventory read in the
-  derivation, raising `TransientUpstreamError`) is left unchanged with no attempt
-  counted, so while that upstream fails, a batch of such rows older than the rest of a
-  ledger keeps newer rows from being selected; twenty of them older than one
-  release-direction row kept that row from being selected for five ticks running, with
-  no driver call, in each ledger. Known limit by decision: an outage counts no attempt,
-  so it never retires rows, and the batch is not reordered (Limits by decision). \
+  `reservation_wiring_state`. A selected row is not always driven: any upstream read that
+  fails during a layer's retry (the intent: cabling's fork read or an inventory read in
+  the derivation; the switch or its template from inventory; for L2 the fabric lookup),
+  in either direction, raises `TransientUpstreamError` and leaves the rows it covers
+  unchanged with no attempt counted. A build-direction row whose intent cannot be read
+  is passed over on its own. A failed switch, template, or fabric read escapes the
+  layer's apply (`_reattempt_rows` and its L2 and L3 twins have no per-reservation
+  catch), so the tick catches it and the layer's whole selection, release rows
+  included, stays unchanged, with the layer's `rows_retried` 0 while `rows_due` counts
+  it; one bad switch also stops the reservations the iteration reaches after it. So
+  while that upstream fails, a batch of such rows older than the rest of a ledger keeps
+  newer rows from being selected: twenty build rows with an unreadable intent older
+  than one release-direction row kept that row from being selected for five ticks
+  running, with no driver call, in each ledger, and twenty release rows on a switch
+  whose inventory read failed hid a newer row on a healthy switch, every tick reporting
+  `rows_due 20, rows_retried 0` (issue #1204). Known limit by decision: an outage counts
+  no attempt, so it never retires rows, and the batch is not reordered (Limits by
+  decision). \
   Enforced in: `services/execution/app/services/wiring_retry_service.py` (`run_wiring_retry_tick`); `services/execution/app/services/l1_assignment_service.py` (`due_failed_rows`); `services/execution/app/services/l2_membership_service.py` (`due_failed_l2_rows`); `services/execution/app/services/route_service.py` (`due_failed_route_rows`) \
   Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_tick_respects_batch_cap`, `test_tick_skips_rows_past_max_attempts`); `services/execution/tests/test_wiring_claim.py` (`test_l1_claimed_row_is_invisible_to_the_tick_select`, `test_l1_expired_claim_is_reclaimable`); `services/execution/tests/test_wiring_due.py` (`test_due_statement_locks_the_ledger_table_only`, `test_unverifiable_build_rows_still_fill_the_batch_while_the_upstream_fails`); `services/execution/tests/test_wiring_retry_due_predicate_live_pg.py` (`test_due_select_locks_its_ledger_row_and_no_wiring_state_row`)
 - **WIRE-RETRY-14.** The three selects leave out rows with a pinned reason and
@@ -1352,10 +1362,13 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
 
 ### Limits by decision
 
-- A build-direction row the retry tick selects but cannot verify against the current
-  intent (an upstream read failing) is left unchanged with no attempt counted, so during
-  that outage a batch of such rows delays newer rows of its ledger (WIRE-RETRY-13).
-  Recorded in issue #1190, PR #1198, and the module docstring of `wiring_due.py`.
+- A row the retry tick selects but cannot drive because an upstream read fails during
+  its layer's retry (intent, switch, template, or fabric; either direction) is left
+  unchanged with no attempt counted, so during that outage a batch of such rows delays
+  newer rows of its ledger, and a failed switch, template, or fabric read stops the
+  whole layer for the tick (WIRE-RETRY-13). Recorded in issue #1190, PR #1198, issue
+  #1204 (its code half, a per-reservation catch, is open), and the module docstring of
+  `wiring_due.py`.
 - An empty fork answer (cabling 404) converges a reservation's wiring to nothing
   (WIRE-ORDER-6), while every other unreadable answer defers. Recorded in the docstring
   of `_fetch_fork_intended_wires` and in issue #460.
