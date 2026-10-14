@@ -1343,7 +1343,12 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
 
 ### Open defects
 
-None at present.
+- #1199 (WIRE-RETRY-4, WIRE-RETRY-14): a release-direction row recorded FAILED with a
+  pinned reason while its switch still exists (the switch's template missing, or a
+  broken driver package at teardown) can never be driven once its reservation has ended:
+  the retry tick leaves it out, a manual retry reports it `not_retryable`, and a fork
+  re-save needs an ACTIVE reservation. The connection it describes may still be live on
+  the hardware.
 
 ### Limits by decision
 
@@ -1358,7 +1363,8 @@ None at present.
   failed rows are the retry channels' work. Recorded in ADR 0007 (Decision 6).
 - A pinned-reason row (unresolvable hop, not a simple chain) is never retried and never
   settled by the stale-intent pass (WIRE-RETRY-4, WIRE-STALE-1); recovery is a fork
-  re-save. Recorded in ADR 0007 (Decision 5) and the comment on
+  re-save, which needs an ACTIVE reservation (an ended reservation's release rows are the
+  open defect above, issue #1199). Recorded in ADR 0007 (Decision 5) and the comment on
   `NON_RETRYABLE_REASON_PREFIXES`.
 - Only an event's status is corroborated, not its device ids (WIRE-GATE-5), and NATS
   itself has no authentication. Recorded in the comment above

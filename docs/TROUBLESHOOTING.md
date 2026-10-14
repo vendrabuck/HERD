@@ -351,7 +351,8 @@ its ledger until that service answers again. It shows as `still_failed` with no 
   reports these rows as not retryable. On an ended reservation no channel will retry them:
   the tick leaves them out, a manual retry reports them `not_retryable`, and a fork re-save
   needs an `ACTIVE` reservation. A row that was going to RELEASE (`intended` is `RELEASED`)
-  may mean the hardware was left connected: the disconnect never ran. Read the row with
+  may mean the hardware was left connected: the disconnect never ran, and nothing in HERD
+  will run it later (an open defect, issue #1199). Read the row with
   `GET /api/reservations/{id}/wiring-status` (any status, owner or admin), which lists each
   row's switch, and its ports for L1 and L2. For a reason such as a missing template or `driver load failed:
   DriverPackageError` the switch is still in inventory: check on the switch whether the
