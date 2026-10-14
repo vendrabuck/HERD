@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -92,6 +93,11 @@ async def _read_uploads(files: list[UploadFile] | None) -> list[ExtractedFile]:
     data as defense in depth; this function's job is only to stop an
     oversized or excessive upload from being buffered in memory in the first
     place.
+
+    The extraction itself runs in a worker thread (issue #1195): walking a tgz
+    up to its ceilings, or parsing a PDF, is synchronous work of up to seconds,
+    and run on the event loop it would stall every other request to the
+    service, `/health` included.
     """
     if not files:
         return []
@@ -134,7 +140,7 @@ async def _read_uploads(files: list[UploadFile] | None) -> list[ExtractedFile]:
     if not uploads:
         return []
     try:
-        return extract_files(uploads)
+        return await asyncio.to_thread(extract_files, uploads)
     except ExtractionError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
 

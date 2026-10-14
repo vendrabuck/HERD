@@ -1,6 +1,10 @@
+import asyncio
 import gzip
 import io
+import json
+import sys
 import tarfile
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -9,12 +13,15 @@ import pytest
 from app import config as config_module
 from app.database import Base, engine
 from app.main import app
+from app.routes import generate as generate_module
 from app.routes.generate import _inventory_provider, _read_uploads
+from app.schemas.generate import ExtractedFile
 from app.services import generator as generator_module
 from app.services import usage_repo
 from app.services.ai_client import (
     AI_NOT_CONFIGURED_DETAIL,
     AI_PROVIDER_UNREACHABLE_DETAIL,
+    AIClient,
     AIError,
     AIProviderUnavailableError,
     get_ai_client,
@@ -23,6 +30,7 @@ from app.services.cabling_client import CablingUnavailableError
 from app.services.generator import CABLING_UNAVAILABLE_DETAIL, INVENTORY_UNAVAILABLE_DETAIL
 from app.services.inventory_client import InventorySummary, InventoryUnavailableError
 from app.services.llm_provider import Usage
+from app.services.providers.anthropic_provider import AnthropicProvider
 from fastapi import HTTPException
 from herd_common.bounded_tar import MAX_TAR_READ_BYTES
 from httpx import ASGITransport, AsyncClient
@@ -1385,6 +1393,214 @@ async def test_generate_tgz_with_an_oversized_tar_header_answers_400(async_clien
         "(a pax extended header or GNU long name); nothing was extracted"
     )
     assert calls["n"] == 0
+
+
+def _tgz_of_tar_bytes(tar_bytes: bytes) -> bytes:
+    return gzip.compress(tar_bytes + b"\0" * 1024)
+
+
+async def _post_one_tgz(async_client, data: bytes):
+    files = [("files", ("bundle.tgz", data, "application/gzip"))]
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        return await client.post("/generate", data={"prompt": "x"}, files=files, headers=headers)
+
+
+async def test_generate_tgz_over_the_entry_ceiling_answers_400(async_client, monkeypatch):
+    """Issue #1195: a tgz of more members than the entry ceiling answers the upload
+    path's 400 with the extractor's refusal, through the worker thread the extraction
+    runs in, and neither inventory nor the provider is called."""
+    empty = tarfile.TarInfo("a.bin").tobuf(format=tarfile.GNU_FORMAT)
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    calls = _override_inventory({"EX3400": 4})
+
+    resp = await _post_one_tgz(async_client, _tgz_of_tar_bytes(empty * 10_001))
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "The tgz archive has more than 10000 entries; nothing was extracted"
+    )
+    assert calls["n"] == 0
+
+
+async def test_generate_tgz_past_the_byte_ceiling_answers_400(async_client, monkeypatch):
+    """Issue #1195: a tgz holding a member whose data would take the decompressed
+    stream past the byte ceiling answers 400 with the extractor's refusal, and neither
+    inventory nor the provider is called."""
+    big = tarfile.TarInfo("big.bin")
+    big.size = 1024 * 1024 * 1024
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    calls = _override_inventory({"EX3400": 4})
+
+    resp = await _post_one_tgz(
+        async_client, _tgz_of_tar_bytes(big.tobuf(format=tarfile.GNU_FORMAT))
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "The tgz archive extends past 104857600 bytes uncompressed; nothing was extracted"
+    )
+    assert calls["n"] == 0
+
+
+async def test_generate_tgz_of_consecutive_headers_that_recurse_answers_400(
+    async_client, monkeypatch
+):
+    """A tgz of as many consecutive pax extended headers as the recursion limit makes
+    tarfile recurse past it. The RecursionError is raised in the worker thread the
+    extraction runs in, and the route answers the upload path's 400 with the
+    unreadable-archive detail naming that class; before it was caught there, a 1.8 KB
+    upload of 400 such headers was an unhandled 500. Neither inventory nor the provider
+    is called."""
+    pax = tarfile.TarInfo("././@PaxHeader")
+    pax.type = tarfile.XHDTYPE
+    pax.size = 13
+    record = pax.tobuf(format=tarfile.GNU_FORMAT) + b"13 comment=x\n".ljust(512, b"\0")
+    notes = tarfile.TarInfo("notes.txt")
+    notes.size = 5
+    member = notes.tobuf(format=tarfile.GNU_FORMAT) + b"hello".ljust(512, b"\0")
+    data = _tgz_of_tar_bytes(record * sys.getrecursionlimit() + member)
+    assert len(data) < 8 * 1024
+
+    # The real extraction, unchanged; this only notes which thread ran it.
+    ran_in: list[threading.Thread] = []
+    real_extract_files = generate_module.extract_files
+
+    def recording_extract_files(uploads):
+        ran_in.append(threading.current_thread())
+        return real_extract_files(uploads)
+
+    monkeypatch.setattr(generate_module, "extract_files", recording_extract_files)
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    calls = _override_inventory({"EX3400": 4})
+
+    resp = await _post_one_tgz(async_client, data)
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "Failed to read tgz archive (RecursionError)"
+    assert calls["n"] == 0
+    assert len(ran_in) == 1
+    assert ran_in[0] is not threading.current_thread()
+
+
+async def test_read_uploads_runs_the_extraction_off_the_event_loop(monkeypatch):
+    """Issue #1195: the extraction is synchronous work of up to seconds, so it must
+    not run on the event loop. The stand-in below blocks its caller until a coroutine
+    on the same loop releases it. Off the loop, that coroutine runs while the
+    extraction waits, and the wait ends released. On the loop, nothing else can run:
+    the wait times out unreleased, which fails the test instead of hanging it."""
+    started = threading.Event()
+    release = threading.Event()
+    seen: dict[str, object] = {}
+
+    def blocking_extract(uploads):
+        seen["uploads"] = uploads
+        seen["thread"] = threading.current_thread()
+        started.set()
+        seen["released"] = release.wait(timeout=5)
+        return [ExtractedFile(filename="notes.txt", text="extracted", truncated=False)]
+
+    monkeypatch.setattr(generate_module, "extract_files", blocking_extract)
+
+    async def release_once_the_extraction_is_waiting() -> None:
+        while not started.is_set():
+            await asyncio.sleep(0.005)
+        release.set()
+
+    loop_thread = threading.current_thread()
+    releaser = asyncio.create_task(release_once_the_extraction_is_waiting())
+    extracted = await _read_uploads([_CountingUploadFile("notes.txt", b"hello")])
+    await asyncio.wait_for(releaser, timeout=5)
+
+    assert seen["released"] is True
+    assert seen["thread"] is not loop_thread
+    assert seen["uploads"] == [("notes.txt", b"hello")]
+    assert [f.text for f in extracted] == ["extracted"]
+
+
+async def test_read_uploads_maps_an_extraction_error_from_the_worker_thread_to_400(monkeypatch):
+    """An ExtractionError raised in the worker thread is the same 400 it was when the
+    extraction ran inline, with the error's own text as the detail."""
+
+    def refusing_extract(uploads):
+        raise generate_module.ExtractionError("refused in the worker thread")
+
+    monkeypatch.setattr(generate_module, "extract_files", refusing_extract)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _read_uploads([_CountingUploadFile("notes.txt", b"hello")])
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "refused in the worker thread"
+
+
+async def test_generate_tgz_member_name_that_is_not_utf8_reaches_the_provider(
+    async_client, monkeypatch
+):
+    """Issue #1196: a tgz member whose name holds a byte that is not UTF-8. The real
+    Anthropic provider runs here over a recording transport, because the failure was
+    in the SDK encoding its request body: the name reached it as a lone surrogate, the
+    encode raised UnicodeEncodeError before anything was sent, and the route answered
+    502 `AI returned no usable response`. Now the request is sent, with U+FFFD in
+    place of the byte."""
+    import httpx2
+    from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
+
+    info = tarfile.TarInfo("bad\udcff name.txt")
+    info.size = 2
+    header = info.tobuf(format=tarfile.GNU_FORMAT, encoding="utf-8", errors="surrogateescape")
+    assert b"bad\xff name.txt" in header
+    data = _tgz_of_tar_bytes(header + b"hi" + b"\0" * 510)
+
+    sent: list[bytes] = []
+
+    def provider_endpoint(request: httpx2.Request) -> httpx2.Response:
+        sent.append(request.content)
+        return httpx2.Response(
+            200,
+            json={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "test-model",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "propose_topology",
+                        "input": {
+                            "purpose": "with a bundle",
+                            "devices": [{"role": "a", "template_name": "EX3400"}],
+                            "edges": [],
+                        },
+                    }
+                ],
+                "stop_reason": "tool_use",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 20},
+            },
+        )
+
+    provider = AnthropicProvider(api_key="sk-ant-fake", model="test-model")
+    http_client = DefaultAsyncHttpxClient(transport=httpx2.MockTransport(provider_endpoint))
+    provider._client = AsyncAnthropic(api_key="sk-ant-fake", http_client=http_client, max_retries=0)
+    app.dependency_overrides[get_ai_client] = lambda: AIClient(provider=provider, max_tokens=256)
+    _override_inventory({"EX3400": 4})
+    _override_resolver(monkeypatch)
+
+    try:
+        resp = await _post_one_tgz(async_client, data)
+    finally:
+        await http_client.aclose()
+
+    assert resp.status_code == 200, resp.text
+    shown = "--- bad\ufffd name.txt ---\nhi"
+    assert resp.json()["file_summaries"] == [
+        {"filename": "bundle.tgz", "chars": len(shown), "truncated": False}
+    ]
+    assert len(sent) == 1
+    user_text = json.loads(sent[0].decode("utf-8"))["messages"][0]["content"][0]["text"]
+    assert f"=== FILE: bundle.tgz ===\n{shown}\n\n=== USER PROMPT ===" in user_text
 
 
 async def test_generate_503_when_inventory_summary_fails(async_client, monkeypatch):
