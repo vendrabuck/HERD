@@ -10,11 +10,18 @@ The last section pins the bounded tar read (issue #1192): a tar header record ov
 herd_common's MAX_TAR_READ_BYTES is refused before it is read into memory, an honest
 archive extracts the same text as before, a member larger than the bound included,
 and every failure of the gzip layer is an ExtractionError.
+
+The sections after it pin the two ceilings on the walk (issue #1195): the member past
+MAX_TGZ_ENTRIES is refused before another header is read, and no record of any type
+moves the decompressed stream past MAX_TGZ_DECOMPRESSED_BYTES; and the member name
+(issue #1196): a name that is not UTF-8 enters the text with U+FFFD in place of each
+undecodable byte.
 """
 
 import builtins
 import gzip
 import io
+import json
 import struct
 import tarfile
 import tracemalloc
@@ -25,11 +32,15 @@ from app import config as config_module
 from app.services import extractor
 from app.services.extractor import (
     ExtractionError,
+    _CeilingStream,
     _decode_text,
     _extension,
     _extract_pdf,
     _extract_tgz,
+    _safe_member_name,
+    _TgzLimitError,
     extract_files,
+    render_file_context,
 )
 from herd_common.bounded_tar import MAX_TAR_READ_BYTES
 
@@ -465,3 +476,473 @@ def test_tgz_honest_stored_block_stream_extracts():
     out = _extract_tgz(data, remaining_budget=10_000_000)
 
     assert out == "--- a.txt ---\n" + content.decode("ascii")
+
+
+# --- The walk over a tgz is bounded (issue #1195) ---
+#
+# Before #1195 the walk stopped only at the character budget, which text members alone
+# advance, or at the end of the archive. An 894 KB upload of 400,000 empty members took
+# 7.7 s and raised the process's resident memory from 57 MiB to 226 MiB, and a 1 MiB
+# upload holding one skipped member of 1 GiB of zeros took 2.1 s, all of it on the
+# event loop.
+
+ENTRY_REFUSAL = "The tgz archive has more than 10000 entries; nothing was extracted"
+BYTES_REFUSAL = "The tgz archive extends past 104857600 bytes uncompressed; nothing was extracted"
+
+_MIB = 1024 * 1024
+_NOTES = "--- notes.txt ---\nhello"
+
+
+def _header_block(name: str, size: int = 0, type_: bytes = tarfile.REGTYPE) -> bytes:
+    """One 512-byte tar header declaring `size` bytes, with no data after it."""
+    info = tarfile.TarInfo(name)
+    info.size = size
+    info.type = type_
+    return info.tobuf(format=tarfile.GNU_FORMAT)
+
+
+def _gzip_members(*pieces: tuple[bytes, int]) -> bytes:
+    """A gzip file made of several gzip members, which a reader sees as one stream.
+    Each piece is compressed once and repeated `times` times, so a stream of a hundred
+    megabytes is built without compressing a hundred megabytes."""
+    return b"".join(gzip.compress(piece) * times for piece, times in pieces if piece)
+
+
+def _zeros(count: int) -> list[tuple[bytes, int]]:
+    """`count` zero bytes as pieces for _gzip_members."""
+    whole, rest = divmod(count, _MIB)
+    return [(b"\0" * _MIB, whole), (b"\0" * rest, 1)]
+
+
+_NOTES_MEMBER_AND_END = _member_bytes("notes.txt", b"hello") + b"\0" * 1024
+
+
+def _tgz_with_a_large_member(
+    name: str, size: int, *, type_: bytes = tarfile.REGTYPE, with_data: bool = True
+) -> bytes:
+    """A member declaring `size` bytes, its data (zeros) unless `with_data` is False,
+    then notes.txt and the end of the archive. `size` is a multiple of 512."""
+    assert size % 512 == 0
+    data = _zeros(size) if with_data else []
+    return _gzip_members((_header_block(name, size, type_), 1), *data, (_NOTES_MEMBER_AND_END, 1))
+
+
+@pytest.fixture
+def stream_reached(monkeypatch):
+    """How far the extractor moved each decompressed stream it opened: the stream's
+    position when it was closed. It only records; the stream reads as it always does."""
+    reached: list[int] = []
+
+    class _RecordingGzipFile(gzip.GzipFile):
+        def close(self):
+            if self.fileobj is not None:
+                reached.append(self.tell())
+            super().close()
+
+    monkeypatch.setattr(extractor.gzip, "GzipFile", _RecordingGzipFile)
+    return reached
+
+
+def test_tgz_ceilings_and_their_refusals_are_the_pinned_values():
+    assert extractor.MAX_TGZ_ENTRIES == 10_000
+    assert extractor.MAX_TGZ_DECOMPRESSED_BYTES == 100 * _MIB
+    assert extractor.TGZ_ENTRY_LIMIT_DETAIL == ENTRY_REFUSAL
+    assert extractor.TGZ_BYTES_LIMIT_DETAIL == BYTES_REFUSAL
+
+
+# Each kind of member the walk passes over without reading: none of them adds to the
+# character budget, so before #1195 nothing counted them.
+_UNREAD_MEMBERS = {
+    "empty-file": _header_block("a.bin"),
+    "empty-text-file": _header_block("a.txt"),
+    "directory": _header_block("d", type_=tarfile.DIRTYPE),
+    "symlink": _header_block("l", type_=tarfile.SYMTYPE),
+    "fifo": _header_block("f", type_=tarfile.FIFOTYPE),
+    "unknown-type": _header_block("u", type_=b"Z"),
+    "non-text-file-with-data": _member_bytes("a.bin", b"\x00\x01"),
+}
+
+
+def test_tgz_with_exactly_the_entry_ceiling_extracts(stream_reached):
+    """Ten thousand members, of every kind the walk passes over, and the last one text."""
+    kinds = list(_UNREAD_MEMBERS.values())
+    each, extra = divmod(extractor.MAX_TGZ_ENTRIES - 1, len(kinds))
+    filler = b"".join(kinds) * each + kinds[0] * extra
+    data = _gzip_members((filler, 1), (_NOTES_MEMBER_AND_END, 1))
+
+    result = extract_files([("bundle.tgz", data)])
+
+    assert result[0].text == _NOTES
+    assert result[0].truncated is False
+    # The whole archive was walked, to the end of its first end-of-archive block.
+    assert stream_reached == [len(filler) + 1024 + 512]
+
+
+@pytest.mark.parametrize("member", _UNREAD_MEMBERS.values(), ids=_UNREAD_MEMBERS)
+def test_tgz_one_entry_over_the_ceiling_is_refused_whatever_the_members_are(member, monkeypatch):
+    """Every member the iteration yields counts, whatever its type or extension, and
+    the member that passes the ceiling may be of any kind: here it is one the walk
+    would not read. The ceiling is lowered so each kind is tried on both sides of it
+    quickly; the tests around this one use the real ceiling."""
+    ceiling = 20
+    monkeypatch.setattr(extractor, "MAX_TGZ_ENTRIES", ceiling)
+
+    def tgz(count: int) -> bytes:
+        tar_bytes = _member_bytes("notes.txt", b"hello") + member * (count - 1)
+        return gzip.compress(tar_bytes + b"\0" * 1024)
+
+    assert _extract_tgz(tgz(ceiling), remaining_budget=10_000) == _NOTES
+    with pytest.raises(ExtractionError) as exc:
+        _extract_tgz(tgz(ceiling + 1), remaining_budget=10_000)
+    assert str(exc.value) == ENTRY_REFUSAL
+
+
+def test_tgz_one_entry_over_the_ceiling_is_refused():
+    """The text member is the 10,001st: nothing is extracted, the file is refused."""
+    data = _gzip_members(
+        (_header_block("a.bin") * extractor.MAX_TGZ_ENTRIES, 1), (_NOTES_MEMBER_AND_END, 1)
+    )
+    with pytest.raises(ExtractionError) as exc:
+        extract_files([("bundle.tgz", data)])
+    assert str(exc.value) == ENTRY_REFUSAL
+
+
+def test_tgz_entry_flood_is_refused_at_the_member_past_the_ceiling(stream_reached):
+    """Sixty thousand empty members in a 134 KB upload. The walk reads the header of
+    the member past the ceiling, which is what shows the archive is over it, and no
+    header after that one, so what tarfile keeps per member stays bounded."""
+    members = 60_000
+    data = gzip.compress(_header_block("a.bin") * members + b"\0" * 1024)
+    assert len(data) < 256 * 1024
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(ExtractionError) as exc:
+            extract_files([("bundle.tgz", data)])
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert str(exc.value) == ENTRY_REFUSAL
+    assert stream_reached == [(extractor.MAX_TGZ_ENTRIES + 1) * 512]
+    # About 4 MiB with the ceiling; walking all sixty thousand holds about 25 MiB.
+    assert peak < 12 * _MIB
+
+
+def test_tgz_walk_ends_at_a_text_member_after_the_budget_and_not_before(monkeypatch):
+    """The character budget ends the walk only at the next text member with data. The
+    members before that one are still walked and counted, so a spent budget does not
+    excuse an archive from the ceiling; members after it are never reached."""
+    monkeypatch.setattr(extractor, "MAX_TGZ_ENTRIES", 5)
+    first = _member_bytes("a.txt", b"first member text")
+    empties = _header_block("a.bin") * 10
+    end = b"\0" * 1024
+
+    stopped_by_the_budget = gzip.compress(first + _member_bytes("b.txt", b"x") + empties + end)
+    assert _extract_tgz(stopped_by_the_budget, remaining_budget=5) == (
+        "--- a.txt ---\nfirst member text"
+    )
+
+    no_text_member_follows = gzip.compress(first + empties + end)
+    with pytest.raises(ExtractionError) as exc:
+        _extract_tgz(no_text_member_follows, remaining_budget=5)
+    assert str(exc.value) == ENTRY_REFUSAL
+
+
+def test_ceiling_stream_refuses_a_read_or_seek_past_the_ceiling_before_moving(monkeypatch):
+    """The bound is on the position, to the byte: a read or seek ending at the ceiling
+    is served, one ending a byte past it is refused, and a refusal moves nothing."""
+    monkeypatch.setattr(extractor, "MAX_TGZ_DECOMPRESSED_BYTES", 1000)
+    payload = bytes(range(256)) * 8
+    with gzip.GzipFile(fileobj=io.BytesIO(gzip.compress(payload)), mode="rb") as gz:
+        stream = _CeilingStream(gz)
+
+        assert stream.read(600) == payload[:600]
+        with pytest.raises(_TgzLimitError) as exc:
+            stream.read(401)
+        assert str(exc.value) == BYTES_REFUSAL
+        assert stream.tell() == gz.tell() == 600
+        assert stream.read(400) == payload[600:1000]
+        with pytest.raises(_TgzLimitError):
+            stream.read(1)
+        assert gz.tell() == 1000
+
+        assert stream.seek(0) == 0
+        assert stream.seek(1000) == 1000
+        assert stream.seek(10) == 10
+        with pytest.raises(_TgzLimitError) as exc:
+            stream.seek(1001)
+        assert str(exc.value) == BYTES_REFUSAL
+        assert gz.tell() == 10
+        # tarfile seeks from the start only; no other seek goes through unchecked.
+        for whence in (io.SEEK_CUR, io.SEEK_END):
+            with pytest.raises(io.UnsupportedOperation):
+                stream.seek(0, whence)
+        assert gz.tell() == 10
+
+
+def _pax_record(keyword: bytes, value: bytes) -> bytes:
+    body = b" " + keyword + b"=" + value + b"\n"
+    length = len(body) + 1
+    while len(str(length)) + len(body) != length:
+        length = len(str(length)) + len(body)
+    return str(length).encode() + body
+
+
+def _pax_size_override(size: int) -> bytes:
+    """A pax extended header giving the next member a size its own header does not."""
+    record = _pax_record(b"size", str(size).encode())
+    return _header_block("././@PaxHeader", len(record), tarfile.XHDTYPE) + record.ljust(512, b"\0")
+
+
+# Every place the bytes of a decompressed tar can be, each crossing a 64 KiB ceiling
+# in a different record. A sum of member sizes sees some of them and misses the rest:
+# the header and padding blocks of many small members, and every pax header and GNU
+# long name.
+_SMALL_CEILING = 64 * 1024
+_RECORDS_PAST_A_SMALL_CEILING = {
+    "skipped-member-data": _header_block("a.bin", 70_144) + b"s" * 70_144,
+    "text-member-data": _header_block("a.txt", 70_144) + b"t" * 70_144,
+    "many-small-members": _member_bytes("a.bin", b"m" * 512) * 80,
+    "pax-extended-header": _header_block("././@PaxHeader", 70_144, tarfile.XHDTYPE)
+    + b"\0" * 70_144
+    + _header_block("a.bin"),
+    "pax-global-header": _header_block("././@PaxHeader", 70_144, tarfile.XGLTYPE)
+    + b"\0" * 70_144
+    + _header_block("a.bin"),
+    "gnu-long-name": _header_block("././@LongLink", 70_144, tarfile.GNUTYPE_LONGNAME)
+    + b"n" * 70_143
+    + b"\0"
+    + _header_block("a.bin"),
+    "gnu-long-link": _header_block("././@LongLink", 70_144, tarfile.GNUTYPE_LONGLINK)
+    + b"n" * 70_143
+    + b"\0"
+    + _header_block("a.bin"),
+    "pax-headers-of-empty-members": (
+        _header_block("././@PaxHeader", 8192, tarfile.XHDTYPE)
+        + b"\0" * 8192
+        + _header_block("a.bin")
+    )
+    * 10,
+    # tarfile reads a run of such headers inside one step of the iteration, so the
+    # walk sees no member between them at which it could check anything.
+    "consecutive-pax-headers-before-one-member": (
+        _header_block("././@PaxHeader", 8192, tarfile.XHDTYPE) + b"\0" * 8192
+    )
+    * 10
+    + _header_block("a.bin"),
+    "size-in-a-pax-record": _pax_size_override(10**11) + _header_block("a.bin"),
+    "size-the-data-does-not-back": _header_block("a.bin", 10**9),
+    "data-of-an-unknown-member-type": _header_block("u", 70_144, b"Z") + b"u" * 70_144,
+}
+
+
+@pytest.mark.parametrize(
+    "records", _RECORDS_PAST_A_SMALL_CEILING.values(), ids=_RECORDS_PAST_A_SMALL_CEILING
+)
+def test_tgz_no_record_type_moves_the_stream_past_the_byte_ceiling(
+    records, monkeypatch, stream_reached
+):
+    """Whatever kind of record the bytes are in, the walk is refused and the stream
+    stays at or under the ceiling. The ceiling is lowered to 64 KiB so every kind is
+    tried quickly; the wording is the constant's, so it still names the real one."""
+    monkeypatch.setattr(extractor, "MAX_TGZ_DECOMPRESSED_BYTES", _SMALL_CEILING)
+    monkeypatch.setattr(config_module.settings, "upload_max_extracted_chars", 10_000_000)
+    data = gzip.compress(records + _NOTES_MEMBER_AND_END)
+
+    with pytest.raises(ExtractionError) as exc:
+        extract_files([("bundle.tgz", data)])
+
+    assert str(exc.value) == BYTES_REFUSAL
+    assert len(stream_reached) == 1
+    assert stream_reached[0] <= _SMALL_CEILING
+
+
+def test_tgz_records_under_a_small_ceiling_still_extract(monkeypatch):
+    """The control for the cases above: the same kinds of record, sized to end under
+    the lowered ceiling, extract, so those refusals come from the ceiling alone."""
+    monkeypatch.setattr(extractor, "MAX_TGZ_DECOMPRESSED_BYTES", _SMALL_CEILING)
+    records = (
+        _header_block("a.bin", 8192)
+        + b"s" * 8192
+        + _header_block("././@PaxHeader", 8192, tarfile.XHDTYPE)
+        + b"\0" * 8192
+        + _header_block("a.bin")
+        + _header_block("././@LongLink", 8192, tarfile.GNUTYPE_LONGNAME)
+        + b"n" * 8191
+        + b"\0"
+        + _header_block("a.bin")
+        + _member_bytes("first.txt", b"t" * 8192)
+    )
+    assert len(records) + len(_NOTES_MEMBER_AND_END) < _SMALL_CEILING
+
+    out = _extract_tgz(gzip.compress(records + _NOTES_MEMBER_AND_END), remaining_budget=100_000)
+
+    assert out == "--- first.txt ---\n" + "t" * 8192 + "\n\n" + _NOTES
+
+
+# The stream positions of an archive holding one large member, then notes.txt: the
+# large member's header, its data, notes.txt's header and one data block, and the
+# first end-of-archive block, which is the last thing the reader reads.
+_BLOCKS_AROUND_THE_LARGE_MEMBER = 4 * 512
+
+
+def test_tgz_whose_first_end_block_ends_at_the_byte_ceiling_extracts(stream_reached):
+    """The bound is exact to the tar block. This archive's first end-of-archive block
+    ends at byte 104,857,600 and the reader passes over all of it."""
+    size = extractor.MAX_TGZ_DECOMPRESSED_BYTES - _BLOCKS_AROUND_THE_LARGE_MEMBER
+    data = _tgz_with_a_large_member("big.bin", size)
+    assert len(data) < 256 * 1024
+
+    result = extract_files([("bundle.tgz", data)])
+
+    assert result[0].text == _NOTES
+    assert stream_reached == [extractor.MAX_TGZ_DECOMPRESSED_BYTES]
+
+
+def test_tgz_one_block_past_the_byte_ceiling_is_refused(stream_reached):
+    """One 512-byte block more and the last read would end past the ceiling."""
+    size = extractor.MAX_TGZ_DECOMPRESSED_BYTES - _BLOCKS_AROUND_THE_LARGE_MEMBER + 512
+    data = _tgz_with_a_large_member("big.bin", size)
+
+    with pytest.raises(ExtractionError) as exc:
+        extract_files([("bundle.tgz", data)])
+
+    assert str(exc.value) == BYTES_REFUSAL
+    assert stream_reached == [extractor.MAX_TGZ_DECOMPRESSED_BYTES]
+
+
+_OVER_THE_BYTE_CEILING = 101 * _MIB
+_MEMBERS_PASSED_OVER = {
+    # Not a text extension, so the walk skips it.
+    "non-text-member": lambda: _tgz_with_a_large_member("big.bin", _OVER_THE_BYTE_CEILING),
+    # A text extension, but larger than the per-file cap, so the walk skips it.
+    "text-member-over-the-file-cap": lambda: _tgz_with_a_large_member(
+        "big.log", _OVER_THE_BYTE_CEILING
+    ),
+    "unknown-member-type": lambda: _tgz_with_a_large_member(
+        "big", _OVER_THE_BYTE_CEILING, type_=b"Z"
+    ),
+    # The issue's measured upload, with the size its header declares but no data.
+    "declared-size-with-no-data": lambda: _tgz_with_a_large_member(
+        "big.bin", 1024 * _MIB, with_data=False
+    ),
+}
+
+
+@pytest.mark.parametrize("build", _MEMBERS_PASSED_OVER.values(), ids=_MEMBERS_PASSED_OVER)
+def test_tgz_member_ending_past_the_byte_ceiling_is_refused_before_it_is_decompressed(
+    build, stream_reached
+):
+    """tarfile passes over a member's data by seeking forward in the gzip stream,
+    which decompresses and discards all of it. The member's end is past the ceiling,
+    so that seek is refused: the stream stays where the member's header ended."""
+    data = build()
+    assert len(data) < 256 * 1024
+
+    with pytest.raises(ExtractionError) as exc:
+        extract_files([("bundle.tgz", data)])
+
+    assert str(exc.value) == BYTES_REFUSAL
+    assert stream_reached == [512]
+
+
+def test_tgz_flood_of_pax_headers_is_refused_at_the_byte_ceiling(stream_reached):
+    """A hundred and twenty pax extended headers of just under 1 MiB each, every one
+    followed by an empty member: 126 MiB of stream in a 138 KB upload. Each header is
+    under the single-read bound, the members are far under the entry ceiling, and the
+    member sizes sum to zero, so only a bound on the stream position sees them. At the
+    5 MiB upload cap the same flood is 4.7 GiB and took 9.7 s with no such bound."""
+    header_bytes = MAX_TAR_READ_BYTES - 512
+    pair = (
+        _header_block("././@PaxHeader", header_bytes, tarfile.XHDTYPE)
+        + b"\0" * header_bytes
+        + _header_block("a.bin")
+    )
+    pairs = 120
+    assert pairs * len(pair) > extractor.MAX_TGZ_DECOMPRESSED_BYTES
+    assert pairs < extractor.MAX_TGZ_ENTRIES
+    data = _gzip_members((pair, pairs), (_NOTES_MEMBER_AND_END, 1))
+    assert len(data) < 256 * 1024
+
+    with pytest.raises(ExtractionError) as exc:
+        extract_files([("bundle.tgz", data)])
+
+    assert str(exc.value) == BYTES_REFUSAL
+    # Ninety-nine whole pairs fit; the hundredth pair's header data would end past it.
+    assert stream_reached == [99 * len(pair) + 512]
+    assert stream_reached[0] <= extractor.MAX_TGZ_DECOMPRESSED_BYTES
+
+
+# --- A member name that is not UTF-8 (issue #1196) ---
+#
+# tarfile decodes a name byte that is not valid UTF-8 to a lone surrogate. Before
+# #1196 the name went into the text as it was, and the provider call then failed to
+# encode its request body.
+
+
+def _member_named(raw_name: bytes, content: bytes, tar_format: int = tarfile.GNU_FORMAT) -> bytes:
+    """One tar member whose name is exactly `raw_name`, valid UTF-8 or not."""
+    info = tarfile.TarInfo(raw_name.decode("utf-8", "surrogateescape"))
+    info.size = len(content)
+    header = info.tobuf(format=tar_format, encoding="utf-8", errors="surrogateescape")
+    assert raw_name in header
+    return header + content + b"\0" * ((512 - len(content) % 512) % 512)
+
+
+_NAMES_THAT_ARE_NOT_UTF8 = {
+    "one-bad-byte": (b"bad\xff name.txt", "bad\ufffd name.txt"),
+    "two-bad-bytes": (b"\xfe\xff.txt", "\ufffd\ufffd.txt"),
+    "cut-multibyte-character": (b"caf\xc3.txt", "caf\ufffd.txt"),
+    "latin-1-name": (b"r\xe9sum\xe9.txt", "r\ufffdsum\ufffd.txt"),
+    "encoded-surrogate": (b"s\xed\xb3\xbf.txt", "s\ufffd\ufffd\ufffd.txt"),
+    "bad-byte-in-a-directory": (b"d\xff/ok.txt", "d\ufffd/ok.txt"),
+    "bad-byte-beside-honest-non-ascii": (
+        "caf\u00e9-".encode() + b"\xff.txt",
+        "caf\u00e9-\ufffd.txt",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "tar_format", [tarfile.GNU_FORMAT, tarfile.PAX_FORMAT], ids=["gnu", "pax-record"]
+)
+@pytest.mark.parametrize(
+    ("raw_name", "shown"), _NAMES_THAT_ARE_NOT_UTF8.values(), ids=_NAMES_THAT_ARE_NOT_UTF8
+)
+def test_tgz_member_name_that_is_not_utf8_enters_the_text_with_replacement_characters(
+    raw_name, shown, tar_format
+):
+    """Each undecodable byte of the name is shown as U+FFFD, whether the name is in
+    the member's header or in a pax path record, and the result can be encoded."""
+    data = gzip.compress(_member_named(raw_name, b"hi", tar_format) + b"\0" * 1024)
+
+    result = extract_files([("bundle.tgz", data)])
+
+    assert result[0].text == f"--- {shown} ---\nhi"
+    assert result[0].text.encode("utf-8") == b"--- " + shown.encode("utf-8") + b" ---\nhi"
+    assert json.loads(result[0].model_dump_json())["text"] == f"--- {shown} ---\nhi"
+    render_file_context(result).encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "tar_format", [tarfile.GNU_FORMAT, tarfile.PAX_FORMAT], ids=["gnu", "pax-record"]
+)
+def test_tgz_honest_non_ascii_member_name_is_unchanged(tar_format):
+    name = "caf\u00e9/\u65e5\u672c\u8a9e-\u00f1-\U00010400.txt"
+    data = gzip.compress(_member_named(name.encode(), b"hi", tar_format) + b"\0" * 1024)
+
+    result = extract_files([("bundle.tgz", data)])
+
+    assert result[0].text == f"--- {name} ---\nhi"
+    assert result[0].text.encode("utf-8") == b"--- " + name.encode("utf-8") + b" ---\nhi"
+
+
+def test_safe_member_name_replaces_every_lone_surrogate_and_nothing_else():
+    honest = "caf\u00e9/\u65e5\u672c\u8a9e \ufffd\U00010400.txt"
+    assert _safe_member_name(honest) == honest
+    # The escapes tarfile produces, and the surrogates it does not, at both ends of
+    # each range: none of them can be encoded, so none is left in.
+    lone = "\ud800\udbff\udc00\udc80\udcff\udfff"
+    assert _safe_member_name(f"a{lone}b") == "a" + "\ufffd" * 6 + "b"
+    _safe_member_name(f"a{lone}b").encode("utf-8")

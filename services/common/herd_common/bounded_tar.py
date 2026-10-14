@@ -19,6 +19,11 @@ file extractor to its ``ExtractionError`` (a 400). Opening with
 ``tarfile.open(mode="r:gz")`` instead reads through tarfile's own gzip stream, which
 this bound cannot see, so do not swap it back.
 
+This class bounds one read, not how far the stream goes: many reads under the bound
+can still pass over any amount of data. A reader that must bound that as well does it
+itself. ai-orchestrator's extractor puts its own position ceiling (``_CeilingStream``)
+around the gzip stream and gives that to this class as the raw stream (issue #1195).
+
 That mode also turned a body that is not gzip into ``tarfile.ReadError`` at the open. A
 hand-opened ``GzipFile`` reads lazily and raises its own errors at whichever read first
 meets the fault: ``BadGzipFile`` (an ``OSError``) for a body that is not gzip or fails
