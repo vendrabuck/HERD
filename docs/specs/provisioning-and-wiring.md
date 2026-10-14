@@ -1119,17 +1119,24 @@ interface in section 8.15.
   Enforced in: `services/execution/app/routers/executions.py` (`internal_wiring_retry`) \
   Pinned by: `services/execution/tests/test_router_wiring_endpoints.py` (`test_wiring_retry_upstream_maps_to_503`, `test_wiring_retry_relays_outcomes`)
 - **WIRE-RETRY-13.** Each tick selects, per ledger, up to `WIRING_RETRY_BATCH_SIZE` (at
-  least 1) unclaimed FAILED rows with attempts below `WIRING_RETRY_MAX_ATTEMPTS` that the
-  tick will drive (WIRE-RETRY-14), oldest first, skipping rows locked by another
-  transaction. The select locks rows of its own ledger only, none in
-  `reservation_wiring_state`. \
+  least 1) unclaimed FAILED rows with attempts below `WIRING_RETRY_MAX_ATTEMPTS` that
+  neither skip rule of WIRE-RETRY-14 sets aside, oldest first, skipping rows locked by
+  another transaction. The select locks rows of its own ledger only, none in
+  `reservation_wiring_state`. A selected row is not always driven: a build-direction row
+  whose intent cannot be read (cabling's fork read, or an inventory read in the
+  derivation, raising `TransientUpstreamError`) is left unchanged with no attempt
+  counted, so while that upstream fails, a batch of such rows older than the rest of a
+  ledger keeps newer rows from being selected; twenty of them older than one
+  release-direction row kept that row from being selected for five ticks running, with
+  no driver call, in each ledger. Known limit by decision: an outage counts no attempt,
+  so it never retires rows, and the batch is not reordered (Limits by decision). \
   Enforced in: `services/execution/app/services/wiring_retry_service.py` (`run_wiring_retry_tick`); `services/execution/app/services/l1_assignment_service.py` (`due_failed_rows`); `services/execution/app/services/l2_membership_service.py` (`due_failed_l2_rows`); `services/execution/app/services/route_service.py` (`due_failed_route_rows`) \
-  Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_tick_respects_batch_cap`, `test_tick_skips_rows_past_max_attempts`); `services/execution/tests/test_wiring_claim.py` (`test_l1_claimed_row_is_invisible_to_the_tick_select`, `test_l1_expired_claim_is_reclaimable`); `services/execution/tests/test_wiring_due.py` (`test_due_statement_locks_the_ledger_table_only`); `services/execution/tests/test_wiring_retry_due_predicate_live_pg.py` (`test_due_select_locks_its_ledger_row_and_no_wiring_state_row`)
+  Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_tick_respects_batch_cap`, `test_tick_skips_rows_past_max_attempts`); `services/execution/tests/test_wiring_claim.py` (`test_l1_claimed_row_is_invisible_to_the_tick_select`, `test_l1_expired_claim_is_reclaimable`); `services/execution/tests/test_wiring_due.py` (`test_due_statement_locks_the_ledger_table_only`, `test_unverifiable_build_rows_still_fill_the_batch_while_the_upstream_fails`); `services/execution/tests/test_wiring_retry_due_predicate_live_pg.py` (`test_due_select_locks_its_ledger_row_and_no_wiring_state_row`)
 - **WIRE-RETRY-14.** The three selects leave out rows with a pinned reason and
   build-direction rows of frozen reservations, so neither kind counts toward a batch and a
   ledger full of them cannot keep a newer retryable row from being selected;
   release-direction rows are selected and retried on a frozen reservation. A row is
-  selected exactly when the tick would drive it: its reason is absent, empty, or starts
+  selected exactly when neither rule sets it aside: its reason is absent, empty, or starts
   with none of `NON_RETRYABLE_REASON_PREFIXES` (compared case-sensitively), and it is
   release-direction or its reservation has no frozen wiring state row. \
   Enforced in: `services/execution/app/services/wiring_due.py` (`tick_would_drive`, `retryable_reason`, `frozen_build`); `services/execution/app/services/l1_assignment_service.py` (`due_failed_rows`); `services/execution/app/services/l2_membership_service.py` (`due_failed_l2_rows`); `services/execution/app/services/route_service.py` (`due_failed_route_rows`) \
@@ -1167,7 +1174,7 @@ interface in section 8.15.
   not fail the tick. The tick line is logged at INFO when `rows_due` or either excluded
   count is above zero, and at DEBUG otherwise. \
   Enforced in: `services/execution/app/services/wiring_retry_service.py` (`run_wiring_retry_tick`); `services/execution/app/services/wiring_due.py` (`count_tick_excluded`) \
-  Pinned by: `services/execution/tests/test_wiring_due.py` (`test_count_tick_excluded_counts_failed_under_cap_rows_by_reason`, `test_tick_excluded_stats_sum_the_three_ledgers`, `test_a_failed_exclusion_count_does_not_fail_the_tick`, `test_tick_log_stays_at_info_while_only_excluded_rows_exist`); `services/execution/tests/test_wiring_retry_due_predicate_live_pg.py` (`test_count_tick_excluded_counts_the_case_product`)
+  Pinned by: `services/execution/tests/test_wiring_due.py` (`test_count_tick_excluded_counts_failed_under_cap_rows_by_reason`, `test_tick_excluded_stats_sum_the_three_ledgers`, `test_tick_excluded_stats_leave_out_rows_at_and_above_the_cap`, `test_tick_log_level_follows_each_excluded_count`, `test_a_failed_exclusion_count_does_not_fail_the_tick`, `test_tick_log_stays_at_info_while_only_excluded_rows_exist`); `services/execution/tests/test_wiring_retry_due_predicate_live_pg.py` (`test_count_tick_excluded_counts_the_case_product`)
 
 **Out of scope.** Reservations' status gate on the proxy (`reservations.md`,
 RES-FORK-18).
@@ -1340,6 +1347,10 @@ None at present.
 
 ### Limits by decision
 
+- A build-direction row the retry tick selects but cannot verify against the current
+  intent (an upstream read failing) is left unchanged with no attempt counted, so during
+  that outage a batch of such rows delays newer rows of its ledger (WIRE-RETRY-13).
+  Recorded in issue #1190, PR #1198, and the module docstring of `wiring_due.py`.
 - An empty fork answer (cabling 404) converges a reservation's wiring to nothing
   (WIRE-ORDER-6), while every other unreadable answer defers. Recorded in the docstring
   of `_fetch_fork_intended_wires` and in issue #460.

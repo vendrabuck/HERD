@@ -40,6 +40,7 @@ from app.services.nats_consumer import (
     NON_RETRYABLE_REASON_PREFIXES,
     WIRING_NOT_SIMPLE_CHAIN_REASON,
     WIRING_UNRESOLVABLE_REASON,
+    TransientUpstreamError,
 )
 from app.services.wiring_retry_service import is_retryable_failure, run_wiring_retry_tick
 from sqlalchemy import select
@@ -388,6 +389,47 @@ async def test_one_tick_drives_the_retryable_row_behind_a_batch_of_stale_rows(le
     assert stats["excluded_frozen"] == batch
 
 
+@pytest.mark.parametrize("ledger", LEDGERS, ids=LEDGER_IDS)
+async def test_unverifiable_build_rows_still_fill_the_batch_while_the_upstream_fails(ledger):
+    """The known limit, by decision (WIRE-RETRY-13). A build row passes both skip rules,
+    so it is selected; while cabling cannot answer, its intent cannot be verified, it is
+    not driven, and it counts no attempt. A batch of such rows older than a retryable
+    release row keeps that row from being selected, tick after tick, until the upstream
+    answers. The stats show the rows as retried and still failed with no driver call.
+    Counting an attempt here would retire rows during an outage, so it is not done."""
+    batch = settings.wiring_retry_batch_size
+    release_id = await _seed_release_row(ledger, uuid.uuid4())
+    builds = [
+        ledger.make(
+            uuid.uuid4(),
+            i,
+            intended=BUILD,
+            attempts=1,
+            last_error="boom",
+            created_at=OLD + timedelta(seconds=i),
+        )
+        for i in range(batch)
+    ]
+    await _seed(reversed(builds))
+    before = await _snapshot(ledger)
+
+    execute_fn, calls = _recorder()
+    for _ in range(2):
+        with patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(side_effect=TransientUpstreamError("cabling down")),
+        ):
+            stats = await _tick(execute_fn)
+        assert stats["rows_due"] == batch
+        assert stats["rows_retried"] == batch
+        assert stats["still_failed"] == batch
+        assert (stats["skipped_not_retryable"], stats["skipped_frozen"]) == (0, 0)
+
+    assert _row_calls(calls) == [], "no row was driven, the release row included"
+    assert await _snapshot(ledger) == before, "no attempt is counted for an outage"
+    assert before[release_id][0] == "FAILED"
+
+
 # --- The direction-scoped freeze (issue #369) --------------------------------
 
 
@@ -564,6 +606,74 @@ async def test_a_failed_exclusion_count_does_not_fail_the_tick(ledger):
     assert stats["released"] == 1
     assert stats["excluded_not_retryable"] is None
     assert stats["excluded_frozen"] is None
+
+
+async def test_tick_excluded_stats_leave_out_rows_at_and_above_the_cap():
+    """The tick counts excluded rows under WIRING_RETRY_MAX_ATTEMPTS, not under the batch
+    size: with the cap (10) below the batch (20), stale rows at 10 and 15 attempts are not
+    counted, a row at 9 is."""
+    assert settings.wiring_retry_max_attempts < settings.wiring_retry_batch_size
+    frozen_reservation = uuid.uuid4()
+    await _freeze(frozen_reservation)
+    l1 = LEDGERS[0]
+    rows = []
+    for n, attempts in enumerate((CAP - 1, CAP, CAP + 5)):
+        rows.append(
+            l1.make(
+                uuid.uuid4(),
+                n,
+                intended=BUILD,
+                attempts=attempts,
+                last_error=WIRING_UNRESOLVABLE_REASON,
+            )
+        )
+        rows.append(
+            l1.make(
+                frozen_reservation, 100 + n, intended=BUILD, attempts=attempts, last_error="boom"
+            )
+        )
+    await _seed(rows)
+
+    execute_fn, calls = _recorder()
+    stats = await _tick(execute_fn)
+
+    assert (stats["excluded_not_retryable"], stats["excluded_frozen"]) == (1, 1)
+    assert stats["rows_due"] == 0
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "kind, level",
+    [
+        ("nothing", logging.DEBUG),
+        ("not_retryable_only", logging.INFO),
+        ("frozen_only", logging.INFO),
+    ],
+)
+async def test_tick_log_level_follows_each_excluded_count(caplog, kind, level):
+    """Each excluded count on its own keeps the tick line at INFO; with no row selected
+    and none excluded it is DEBUG."""
+    frozen_reservation = uuid.uuid4()
+    await _freeze(frozen_reservation)
+    stale = {
+        "nothing": [],
+        "not_retryable_only": _stale_rows(LEDGERS[0], "not_retryable", 2, frozen_reservation),
+        "frozen_only": _stale_rows(LEDGERS[1], "frozen_build", 3, frozen_reservation),
+    }[kind]
+    await _seed(stale)
+
+    execute_fn, _calls = _recorder()
+    with caplog.at_level(logging.DEBUG, logger="app.services.wiring_retry_service"):
+        await _tick(execute_fn)
+
+    (record,) = _tick_records(caplog)
+    assert record.rows_due == 0
+    assert (record.excluded_not_retryable, record.excluded_frozen) == {
+        "nothing": (0, 0),
+        "not_retryable_only": (2, 0),
+        "frozen_only": (0, 3),
+    }[kind]
+    assert record.levelno == level
 
 
 def _tick_records(caplog) -> list[logging.LogRecord]:

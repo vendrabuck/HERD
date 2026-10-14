@@ -19,6 +19,10 @@ The right-hand side is computed here in Python (`Case.expected`). Its reason par
 `assert_reason_expectations_match_python` checks the production
 `is_retryable_failure` against it, so a test fails when the SQL and the Python
 disagree and also when the Python rule itself moves.
+
+"Would drive" in this module means "passes the tick's two skip checks" (the pinned
+reason and the frozen build), the rule the selection must equal. It does not mean a
+driver call follows: a build row is still revalidated against cabling's intent.
 """
 
 from __future__ import annotations
@@ -117,7 +121,12 @@ LEDGER_IDS = [ledger.name for ledger in LEDGERS]
 # "RELEASED". The tick's rule reads only "is it RELEASED or not".
 BUILD = "ACTIVE"
 RELEASE = "RELEASED"
-INTENDED = (BUILD, RELEASE)
+# A third value the code never writes (the column has no CHECK constraint). The tick's
+# rule is `intended != "RELEASED"`, so anything but the exact text "RELEASED" is build
+# direction, a lower-case "released" included. Without it the product cannot tell
+# `!= "RELEASED"` from `== "ACTIVE"`.
+UNEXPECTED_INTENDED = "released"
+INTENDED = (BUILD, RELEASE, UNEXPECTED_INTENDED)
 
 # The reservation's wiring state: no row at all, a row that is not frozen, a frozen row.
 STATES = ("no_state_row", "not_frozen", "frozen")
@@ -199,7 +208,7 @@ class Case:
 
     @property
     def expected(self) -> bool:
-        """The drive rule plus the query's own cap and claim filters, in Python."""
+        """The two skip checks plus the query's own cap and claim filters, in Python."""
         eligible = not self.at_cap and self.claim != "claimed"
         would_drive = self.retryable and not (self.intended != RELEASE and self.frozen)
         return eligible and would_drive
@@ -291,9 +300,9 @@ def assert_parity(population: Population, returned_ids: set[uuid.UUID]) -> None:
     extra = [population.cases_by_id[i].describe() for i in returned - expected]
     assert not missing and not extra, (
         f"due query and drive rule disagree on {len(missing) + len(extra)} of {len(own)} rows.\n"
-        f"  the tick would drive these, the query did not return them ({len(missing)}):\n    "
+        f"  the skip checks pass these, the query did not return them ({len(missing)}):\n    "
         + "\n    ".join(sorted(missing)[:12])
-        + f"\n  the query returned these, the tick would not drive them ({len(extra)}):\n    "
+        + f"\n  the query returned these, the skip checks set them aside ({len(extra)}):\n    "
         + "\n    ".join(sorted(extra)[:12])
     )
 
@@ -302,7 +311,7 @@ FrozenLookup = Callable[[uuid.UUID], bool]
 
 
 def python_would_drive(row, is_frozen: FrozenLookup) -> bool:
-    """The tick's drive rule for a loaded ledger row, as run_wiring_retry_tick applies it."""
+    """The tick's two skip checks for a loaded row, as run_wiring_retry_tick applies them."""
     return is_retryable_failure(row.last_error) and not (
         row.intended != RELEASE and is_frozen(row.reservation_id)
     )

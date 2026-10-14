@@ -15,8 +15,8 @@ the LIMIT, such a row stayed FAILED, under the cap, and oldest. Once a ledger he
 batch of them, every batch was full of rows the tick would never drive and a newer
 retryable row was never selected: the background retry for that ledger was dead.
 
-This module is the same rule as a WHERE clause, so the LIMIT counts only rows the
-tick will drive. The invariant, for every FAILED, under-cap, unclaimed row r:
+This module is the same two rules as a WHERE clause, so the LIMIT counts no row they
+set aside. The invariant, for every FAILED, under-cap, unclaimed row r:
 
     r is returned by its due query (ignoring LIMIT)
         if and only if
@@ -42,7 +42,16 @@ Why each piece is written the way it is:
     drop its rows. A subquery also keeps the due selects' FOR UPDATE on the ledger
     table alone.
 
-Who may use this. The three due queries, and nothing else. The per-reservation
+What this does NOT promise (a known limit, by decision, issue #1190). A selected row
+can still end a tick unchanged for reasons these rules cannot see: a build row whose
+intent cannot be read (cabling's fork, or inventory during the derivation, raising
+TransientUpstreamError) is not driven and counts no attempt, so while that upstream is
+down a batch of such rows, older than everything else in a ledger, keeps newer rows of
+that ledger from being selected. It heals when the upstream answers. Counting an
+attempt for an outage would retire rows during the outage, so that is not done.
+
+Who may use this. The three due queries take `tick_would_drive`, and
+`count_tick_excluded` here reuses its two halves; nothing else. The per-reservation
 FAILED readers (`failed_assignments_for_reservation` and its L2 and L3 siblings) are
 shared with the manual retry, which REPORTS not-retryable and frozen rows, and with
 the reconcile's stale-build widening, which must see every FAILED row (see
@@ -50,7 +59,7 @@ wiring_claim's module docstring); they deliberately do not take this predicate.
 
 The tick keeps its two Python checks as a second line. A reservation can be frozen
 between the select and the check; the row the check then skips is excluded here on
-the next tick, so it can take a batch slot at most once.
+the next tick (a freeze is never undone), so it can take a batch slot at most once.
 """
 
 from __future__ import annotations
@@ -101,7 +110,12 @@ def frozen_build(model):
 
 
 def tick_would_drive(model):
-    """The retry tick's drive rule as one predicate, for the three due queries only."""
+    """The retry tick's two skip rules as one predicate, for the three due queries only.
+
+    True when neither rule sets the row aside. It does not mean the tick will make a
+    driver call for the row: a build row is still revalidated against cabling's
+    current intent first (see the module docstring's known limit).
+    """
     return and_(retryable_reason(model), not_(frozen_build(model)))
 
 

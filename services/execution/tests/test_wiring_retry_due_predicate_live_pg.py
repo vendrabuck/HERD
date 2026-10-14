@@ -39,7 +39,10 @@ reservations' FAILED rows and whose execution service is running its own retry t
     carries an attempts value far above any real cap, so no real tick selects it, and
     it is deleted in a finally.
   - Assertions are scoped, never the SQL: the real statement runs unmodified and the
-    test narrows the RESULT to its own ids. Where foreign rows are judged, only the
+    test narrows the RESULT to its own ids. The parity and starvation tests call the
+    due query with a large LIMIT, so for the few seconds their transaction is open they
+    hold FOR UPDATE locks on every foreign row it returns; a concurrent writer of such
+    a row (the stack's own tick skips them) waits that long. Where foreign rows are judged, only the
     direction a concurrent lock cannot break is asserted (a row the query returned
     must be one the tick would drive; SKIP LOCKED may hide a foreign row, never add
     one).
@@ -141,12 +144,20 @@ _OWN_TABLES = (*_LEDGER_MODELS, ReservationWiringState)
 # shared mapper state is touched. It also means the suite does not depend on the
 # database's own default search_path.
 EXECUTION_SCHEMA = "execution"
+# Every connection waits at most this long for a row lock. The due selects never wait
+# (SKIP LOCKED), and nothing else here touches a row another session holds, so a wait
+# means a regression: with SKIP LOCKED lost, the lock test fails in seconds instead of
+# hanging the gate. Set per connection, so a COMMIT inside a test does not clear it.
+LOCK_TIMEOUT = "5s"
 
 
 @pytest.fixture
 async def pg_engine():
     engine = create_async_engine(
-        PG_DSN, connect_args={"server_settings": {"search_path": EXECUTION_SCHEMA}}
+        PG_DSN,
+        connect_args={
+            "server_settings": {"search_path": EXECUTION_SCHEMA, "lock_timeout": LOCK_TIMEOUT}
+        },
     )
     yield engine
     await engine.dispose()
@@ -486,8 +497,8 @@ async def test_due_select_locks_its_ledger_row_and_no_wiring_state_row(ledger, s
                     "the own row is the oldest drivable row under this test's cap"
                 )
 
-                # The wiring-state row is free: an UPDATE of it returns at once.
-                await other.execute(text("SET LOCAL lock_timeout = '3s'"))
+                # The wiring-state row is free: an UPDATE of it returns at once (the
+                # connection's lock_timeout turns a wait into a failure).
                 updated = await other.execute(
                     update(ReservationWiringState)
                     .where(ReservationWiringState.reservation_id == reservation_id)

@@ -32,11 +32,11 @@ Two entry points share one core:
     refusal contract is unchanged).
   - run_wiring_retry_tick / run_wiring_retry_loop: the background auto-retry channel.
     Each tick sweeps at most wiring_retry_batch_size FAILED rows per ledger that are
-    still under wiring_retry_max_attempts AND that it will drive: a row with a pinned
-    non-retryable reason, and a build-direction row of a frozen reservation, are left
-    out by the selects themselves (wiring_due.tick_would_drive, issue #1190), so they
-    never fill a batch. The survivors are reattempted, batch capped exactly like the
-    issue #24 health scheduler.
+    still under wiring_retry_max_attempts: a row with a pinned non-retryable reason,
+    and a build-direction row of a frozen reservation, are left out by the selects
+    themselves (wiring_due.tick_would_drive, issue #1190), so they never fill a batch.
+    The selected rows are reattempted, batch capped exactly like the issue #24 health
+    scheduler.
 
 Both channels share one supersession guard (l1_assignment_service
 supersede_release_if_reclaimed) run before a release retry fires the driver: a
@@ -1042,28 +1042,34 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
     """One sweep of the background auto-retry channel; returns tick stats.
 
     Selects, per ledger, at most wiring_retry_batch_size FAILED rows still under
-    wiring_retry_max_attempts (rows past the cap are manual-retry only) that it will
-    drive, then reattempts them. The selects leave out the non-hardware-retryable rows
-    and any BUILD-direction row whose reservation is frozen (wiring_due.tick_would_drive,
-    issue #1190): dropping such a row here does not change it, so while they were
-    dropped after the LIMIT, one batch of them at the old end of a ledger hid every
-    newer retryable row from every later tick. The frozen exclusion is row-scoped and
-    direction-aware (ADR 0009 phase 3, issue #369): a RELEASE-direction row is retried
-    even on a frozen reservation, so a stuck disconnect can still finish after the
-    reservation ends. The batch cap bounds one tick exactly as the health scheduler's
-    batch cap does; a repeat failure accumulates attempts, so a row converges toward the
-    cap and eventually stops being swept.
+    wiring_retry_max_attempts (rows past the cap are manual-retry only) that neither
+    skip rule sets aside, then reattempts them. The selects leave out the
+    non-hardware-retryable rows and any BUILD-direction row whose reservation is frozen
+    (wiring_due.tick_would_drive, issue #1190): dropping such a row here does not
+    change it, so while they were dropped after the LIMIT, one batch of them at the old
+    end of a ledger hid every newer retryable row from every later tick. The frozen
+    exclusion is row-scoped and direction-aware (ADR 0009 phase 3, issue #369): a
+    RELEASE-direction row is retried even on a frozen reservation, so a stuck
+    disconnect can still finish after the reservation ends. The batch cap bounds one
+    tick exactly as the health scheduler's batch cap does; a repeat failure accumulates
+    attempts, so a row converges toward the cap and eventually stops being swept. A
+    selected row can still end the tick unchanged: a build row whose intent cannot be
+    read (an upstream outage) is not driven and counts no attempt, so a batch of them
+    delays newer rows until the upstream answers (a known limit by decision, see
+    wiring_due's module docstring).
 
     Stats. `skipped_not_retryable` and `skipped_frozen` keep their meaning, rows this
-    tick LOADED and then did not drive. The selects apply the same two rules, so
-    `skipped_frozen` now counts only a build row whose reservation was frozen between
-    the select and the check below, and `skipped_not_retryable` stays 0 unless the
-    select and the Python rule ever disagree; both are normally 0.
-    `excluded_not_retryable` and `excluded_frozen` count the FAILED, under-cap rows
-    the selects leave out, across the three ledgers: the standing population a
-    long-lived stack carries, reported on every tick. They come from one aggregate per
-    ledger on a session of their own and are None when that read fails, which never
-    fails the tick.
+    tick LOADED and then set aside by its two Python checks below; a row the layer
+    retry leaves unchanged for another reason (an upstream read failing, a claim the
+    manual channel holds) is counted in `rows_retried` and its outcome instead. The
+    selects apply the same two rules, so `skipped_frozen` now counts only a build row
+    whose reservation was frozen between the select and the check below, and
+    `skipped_not_retryable` stays 0 unless the select and the Python rule ever
+    disagree; both are normally 0. `excluded_not_retryable` and `excluded_frozen`
+    count the FAILED, under-cap rows the selects leave out, across the three ledgers:
+    the standing population a long-lived stack carries, reported on every tick. They
+    come from one aggregate per ledger on a session of their own and are None when
+    that read fails, which never fails the tick.
 
     Per-row drive claim (issue #817): the three selects skip rows another channel already
     holds, and each row is claimed again by a compare-and-swap immediately before its own
@@ -1140,9 +1146,10 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
     # The second line behind the selects (issue #1190). The selects already apply both
     # rules below, so the frozen check fires only for a reservation frozen after the
     # select ran, and the reason check only if the select and is_retryable_failure ever
-    # disagree. A row skipped here is not changed by the skip; the next tick's select
-    # excludes it, so it can take a batch slot at most once and can never starve the
-    # rows behind it.
+    # disagree. A row skipped here is not changed by the skip. A freeze is never
+    # undone, so the next tick's select excludes a frozen-check skip and it takes a
+    # batch slot at most once. A reason-check skip would mean the select is wrong, and
+    # the select would return that row again; the parity tests pin that it cannot.
     for row in due:
         if not is_retryable_failure(row.last_error):
             stats["skipped_not_retryable"] += 1

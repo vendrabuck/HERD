@@ -30,7 +30,7 @@ _active_l1_unique = Index(
 
 # Partial index for the wiring auto-retry sweep's per-tick candidate query
 # (due_failed_rows: WHERE status = 'FAILED' AND attempts < max_attempts AND the
-# row is unclaimed AND the tick would drive it, ORDER BY created_at). The table
+# row is unclaimed AND neither skip rule sets it aside, ORDER BY created_at). The table
 # is append-only (ADR 0007 Decision 4: RELEASED/FAILED rows are retained as the
 # applied-wiring audit trail), so it grows without bound while the sweep runs
 # every tick. Partial-on-FAILED keeps the index small and serves the status

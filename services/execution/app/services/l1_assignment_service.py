@@ -509,14 +509,16 @@ async def due_failed_rows(
     row parked past the cap is never re-swept (manual retry only). The LIMIT bounds
     one tick exactly as the health scheduler's batch cap does.
 
-    The select also carries the tick's own drive rule, wiring_due.tick_would_drive
+    The select also carries the tick's two skip rules, wiring_due.tick_would_drive
     (issue #1190): a row with a pinned non-retryable reason, and a build-direction
-    row of a frozen reservation, are not candidates, so the LIMIT counts only rows
-    the tick will drive. Before, both tests ran in the caller after the LIMIT, and a
-    batch of such rows (which the caller's skip leaves as they are) hid every newer
-    retryable row from every later tick. A release-direction row of a frozen reservation is still
-    a candidate (issue #369). The caller keeps both checks for a reservation frozen
-    between this select and its drive.
+    row of a frozen reservation, are not candidates, so the LIMIT counts none of them.
+    Before, both tests ran in the caller after the LIMIT, and a batch of such rows
+    (which the caller's skip leaves as they are) hid every newer retryable row from
+    every later tick. A release-direction row of a frozen reservation is still a
+    candidate (issue #369). The caller keeps both checks for a reservation frozen
+    between this select and its drive. A candidate is not always driven: a build row
+    whose intent cannot be read is left unchanged with no attempt counted, a known
+    limit described in wiring_due's module docstring.
 
     RETRY-ONLY, so it also filters on the issue #817 drive claim: a row another
     channel is currently driving is not a candidate, and the select takes FOR UPDATE

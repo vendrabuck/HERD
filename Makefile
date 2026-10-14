@@ -868,8 +868,9 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # The execution suite added for issue #1190 (the retry tick's selection
 # predicate) needs the migrated execution schema too. It never runs a tick: it
 # calls the three due queries on rows it inserts inside a rolled-back
-# transaction, and commits only one row per test, hidden from the stack's own
-# retry tick by an attempts value above any cap, for the lock check.
+# transaction. Only its three lock tests commit, two rows each (a ledger row
+# hidden from the stack's own retry tick by an attempts value above any cap,
+# and its reservation_wiring_state row), deleted in a finally.
 # tests/unit/test_pg_live_gate_wiring.py fails if a new *_live_pg.py file is
 # written and then wired into nothing.
 _gate-pg-live-tests:
