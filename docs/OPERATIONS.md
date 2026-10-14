@@ -292,7 +292,13 @@ docker compose logs execution --no-log-prefix | \
 # Slow requests (over 1s)
 docker compose logs --no-log-prefix --tail 5000 | \
   jq -R 'fromjson? | select((.duration_ms // 0) > 1000)'
+
+# The wiring retry tick's per-tick line from execution
+docker compose logs execution --no-log-prefix --tail 2000 | \
+  jq -R 'fromjson? | select(.action == "wiring_retry_tick")'
 ```
+
+The `wiring_retry_tick` line carries `rows_due` (rows the tick selected this time, at most `WIRING_RETRY_BATCH_SIZE` per ledger), `rows_retried`, the outcome counts (`reconnected`, `released`, `superseded`, `still_failed`, `in_progress`), per-layer retried counts, and two pairs of counters for rows it does not drive. `excluded_not_retryable` and `excluded_frozen` count the `FAILED` rows under the attempts cap that the tick's selects leave out, across the three wiring ledgers: rows with a pinned not-retryable reason, and build rows of ended (frozen) reservations. They are a standing population, repeated on every tick, and they do not hold back any other row (issue #1190); `null` means the count could not be read on that tick. `skipped_not_retryable` and `skipped_frozen` count rows the tick selected and then did not drive, which happens only when a reservation ends between the select and the drive, so they are normally 0. The line is logged at `INFO` while `rows_due` or an excluded count is above zero and at `DEBUG` otherwise. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for what to do about excluded rows.
 
 Configure verbosity per service via `LOG_LEVEL` (default `INFO`; use `DEBUG` for investigations and remember to turn it back down).
 

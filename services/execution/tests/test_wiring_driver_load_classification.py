@@ -331,7 +331,11 @@ async def test_l1_broken_package_rows_are_not_retried_by_the_tick():
     with ExitStack() as stack:
         _enter(stack, _patches(execute_fn, fork_wires=_l1_wires([("0/0/1", "0/0/2")])))
         stats = await run_wiring_retry_tick(_db_session_factory())
-    assert stats["skipped_not_retryable"] == 2
+    # Issue #1190: the tick's selects leave a pinned-reason row out, so it is counted
+    # as excluded and is never loaded, where before it was loaded and counted skipped.
+    assert stats["excluded_not_retryable"] == 2
+    assert stats["rows_due"] == 0
+    assert stats["skipped_not_retryable"] == 0
     assert calls == []
 
 

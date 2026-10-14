@@ -865,6 +865,11 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # added for issue #817 (the wiring retry drive claim) is in that same category:
 # it runs both retry channels as real concurrent tasks against the gate's
 # execution ledger tables, proving one row reaches the driver exactly once.
+# The execution suite added for issue #1190 (the retry tick's selection
+# predicate) needs the migrated execution schema too. It never runs a tick: it
+# calls the three due queries on rows it inserts inside a rolled-back
+# transaction, and commits only one row per test, hidden from the stack's own
+# retry tick by an attempts value above any cap, for the lock check.
 # tests/unit/test_pg_live_gate_wiring.py fails if a new *_live_pg.py file is
 # written and then wired into nothing.
 _gate-pg-live-tests:
@@ -891,6 +896,8 @@ _gate-pg-live-tests:
 		uv run pytest tests/test_topology_list_order_live_pg.py -v) && \
 	(cd services/execution && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_wiring_retry_claim_race_live_pg.py -v) && \
+	(cd services/execution && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_wiring_retry_due_predicate_live_pg.py -v) && \
 	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_reservation_status_cas_live_pg.py -v) && \
 	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \

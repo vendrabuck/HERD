@@ -20,6 +20,7 @@ from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
 from app.services._uuid_utils import as_uuid as _as_uuid
 from app.services.wiring_claim import unclaimed
+from app.services.wiring_due import tick_would_drive
 
 logger = logging.getLogger(__name__)
 
@@ -506,18 +507,31 @@ async def due_failed_rows(
     The background auto-retry channel's per-tick candidate set (ADR 0007 Decision 6
     item 2): FAILED rows whose accumulated `attempts` is below `max_attempts`, so a
     row parked past the cap is never re-swept (manual retry only). The LIMIT bounds
-    one tick exactly as the health scheduler's batch cap does. Retryability by reason
-    and the frozen-reservation guard are applied by the caller, since neither is a
-    clean SQL predicate here.
+    one tick exactly as the health scheduler's batch cap does.
+
+    The select also carries the tick's own drive rule, wiring_due.tick_would_drive
+    (issue #1190): a row with a pinned non-retryable reason, and a build-direction
+    row of a frozen reservation, are not candidates, so the LIMIT counts only rows
+    the tick will drive. Before, both tests ran in the caller after the LIMIT, and a
+    batch of such rows (which the caller's skip leaves as they are) hid every newer
+    retryable row from every later tick. A release-direction row of a frozen reservation is still
+    a candidate (issue #369). The caller keeps both checks for a reservation frozen
+    between this select and its drive.
 
     RETRY-ONLY, so it also filters on the issue #817 drive claim: a row another
     channel is currently driving is not a candidate, and the select takes FOR UPDATE
     SKIP LOCKED (the health scheduler's `_due_rows` idiom). The real race guard is
     the per-row compare-and-swap in wiring_claim.WiringRowClaims.claim, taken
     immediately before the driver call; this predicate only avoids loading rows that
-    would be skipped there anyway. The reconcile's stale-build widening reader
-    (failed_assignments_for_reservation) deliberately has neither, see
-    wiring_claim's module docstring.
+    would be skipped there anyway. FOR UPDATE names the ledger table (`of=`), so
+    the frozen test's subquery over reservation_wiring_state locks nothing there.
+    `of=` is given the Table, not the mapped class: the class resolves through the
+    mapper's memoized copy of the table, and where that copy and the live Table
+    differ (the live-Postgres suites flip `__table__.schema` in a process whose
+    SQLite tests already built it) the clause renders as an alias Postgres rejects.
+    The reconcile's stale-build widening reader
+    (failed_assignments_for_reservation) deliberately has none of these predicates,
+    see wiring_claim's and wiring_due's module docstrings.
     """
     now = now or datetime.now(timezone.utc)
     result = await db.execute(
@@ -526,10 +540,11 @@ async def due_failed_rows(
             L1ConnectionAssignment.status == "FAILED",
             L1ConnectionAssignment.attempts < max_attempts,
             unclaimed(L1ConnectionAssignment, now),
+            tick_would_drive(L1ConnectionAssignment),
         )
         .order_by(L1ConnectionAssignment.created_at.asc())
         .limit(limit)
-        .with_for_update(skip_locked=True)
+        .with_for_update(skip_locked=True, of=L1ConnectionAssignment.__table__)
     )
     return list(result.scalars().all())
 

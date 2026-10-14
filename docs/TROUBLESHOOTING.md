@@ -334,6 +334,25 @@ wiring, so no driver call ran. The reason tells the two cases apart (issue #1002
   fork wiring. The execution log line `Wiring driver load failed for switch ...` carries
   the validation detail.
 
+### The `wiring_retry_tick` log line shows `excluded_not_retryable` or `excluded_frozen` above zero
+
+Meaning: the wiring ledgers hold `FAILED` rows under the attempts cap that the background
+retry tick will never drive, and its selects leave them out (issue #1190). They repeat on
+every tick because the tick does not change them. They do not delay any other row: the tick's
+batch of `WIRING_RETRY_BATCH_SIZE` rows per ledger is filled only with rows it will drive.
+
+- `excluded_not_retryable`: rows whose reason starts with `recorded hop unresolvable` or
+  `hop set is not a simple chain`. The saved wiring cannot be applied as recorded, so a
+  driver retry would fail the same way. On an `ACTIVE` reservation, fix the cause (the
+  switch, its template, or its driver package) and re-save the fork wiring; the Wiring tab
+  reports these rows as not retryable. On an ended reservation there is nothing to do.
+- `excluded_frozen`: build-direction rows of reservations that have ended. A connection
+  is never built for an ended reservation, so these rows stay as a record of a build that
+  did not finish. No action is needed.
+
+`null` in place of a number means the count could not be read on that tick; the execution
+log carries a warning with the cause, and the tick still retried what it selected.
+
 ### Log action `dynamic_instance_keyed_destroy_failed`
 
 Meaning: a reservation with a dynamic instance ended, and the instance's ledger row had

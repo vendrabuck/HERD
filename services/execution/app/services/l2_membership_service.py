@@ -31,6 +31,7 @@ from app.models.l2_port_assignment import L2PortAssignment
 from app.services._uuid_utils import as_uuid as _as_uuid
 from app.services.l1_assignment_service import get_wiring_state
 from app.services.wiring_claim import unclaimed
+from app.services.wiring_due import tick_would_drive
 
 logger = logging.getLogger(__name__)
 
@@ -680,13 +681,17 @@ async def due_failed_l2_rows(
     """FAILED membership rows still under the attempts cap, oldest first, batch-capped.
 
     The background auto-retry channel's per-tick L2 candidate set, the due_failed_rows
-    analogue. Retryability and the frozen guard are applied by the caller.
+    analogue. It carries the same drive rule, wiring_due.tick_would_drive (issue
+    #1190): a row with a pinned non-retryable reason and a build-direction row of a
+    frozen reservation are not candidates, so they cannot fill the batch; the caller
+    keeps both checks for a reservation frozen after this select.
 
     RETRY-ONLY, so it also filters on the issue #817 drive claim and takes FOR UPDATE
-    SKIP LOCKED, exactly like due_failed_rows: a row another channel is currently
-    driving is not a candidate. The per-row compare-and-swap in
+    SKIP LOCKED on the ledger table, exactly like due_failed_rows: a row another
+    channel is currently driving is not a candidate. The per-row compare-and-swap in
     wiring_claim.WiringRowClaims.claim is the real guard; the reconcile's stale-build
-    widening reader deliberately carries neither (see wiring_claim's module docstring).
+    widening reader deliberately carries none of these predicates (see wiring_claim's
+    and wiring_due's module docstrings).
     """
     now = now or datetime.now(timezone.utc)
     result = await db.execute(
@@ -695,10 +700,11 @@ async def due_failed_l2_rows(
             L2PortAssignment.status == "FAILED",
             L2PortAssignment.attempts < max_attempts,
             unclaimed(L2PortAssignment, now),
+            tick_would_drive(L2PortAssignment),
         )
         .order_by(L2PortAssignment.created_at.asc())
         .limit(limit)
-        .with_for_update(skip_locked=True)
+        .with_for_update(skip_locked=True, of=L2PortAssignment.__table__)
     )
     return list(result.scalars().all())
 
