@@ -1,3 +1,6 @@
+import gzip
+import io
+import tarfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -21,6 +24,7 @@ from app.services.generator import CABLING_UNAVAILABLE_DETAIL, INVENTORY_UNAVAIL
 from app.services.inventory_client import InventorySummary, InventoryUnavailableError
 from app.services.llm_provider import Usage
 from fastapi import HTTPException
+from herd_common.bounded_tar import MAX_TAR_READ_BYTES
 from httpx import ASGITransport, AsyncClient
 from jose import jwt
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -1350,6 +1354,36 @@ async def test_generate_rejected_upload_makes_no_inventory_call(async_client, mo
     async with async_client as client:
         resp = await client.post("/generate", data={"prompt": "x"}, files=files, headers=headers)
     assert resp.status_code == 400
+    assert calls["n"] == 0
+
+
+async def test_generate_tgz_with_an_oversized_tar_header_answers_400(async_client, monkeypatch):
+    """Issue #1192: a tgz whose pax extended header declares more than the tar read
+    bound answers the upload path's 400 with the extractor's refusal, and neither
+    inventory nor the provider is called."""
+    header = tarfile.TarInfo("././@header")
+    header.type = tarfile.XHDTYPE
+    header.size = 8 * MAX_TAR_READ_BYTES
+    member = tarfile.TarInfo("notes.txt")
+    member.size = 5
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+        gz.write(header.tobuf(format=tarfile.GNU_FORMAT))
+        gz.write(b"\0" * header.size)
+        gz.write(member.tobuf(format=tarfile.GNU_FORMAT))
+        gz.write(b"hello" + b"\0" * 507)
+        gz.write(b"\0" * 1024)
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    calls = _override_inventory({"EX3400": 4})
+    files = [("files", ("bundle.tgz", buf.getvalue(), "application/gzip"))]
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, files=files, headers=headers)
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "The tgz archive has a tar header record over 1048576 bytes "
+        "(a pax extended header or GNU long name); nothing was extracted"
+    )
     assert calls["n"] == 0
 
 

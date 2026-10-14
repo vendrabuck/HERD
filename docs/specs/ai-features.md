@@ -69,7 +69,7 @@ to `reservations.md`.
 | Method | Path | Who may call | Success | Rules |
 |---|---|---|---|---|
 | GET | `/status` | anyone, no token | 200 | AI-PROV-5, AI-PROV-6, AI-PROV-7, AI-PROV-8 |
-| POST | `/generate` | any signed-in user | 200 | AI-PROV-2, AI-GEN-1 to AI-GEN-16, AI-UPLOAD-1 to AI-UPLOAD-7, AI-RESOLVE-1 to AI-RESOLVE-15, AI-QUOTA-2 |
+| POST | `/generate` | any signed-in user | 200 | AI-PROV-2, AI-GEN-1 to AI-GEN-16, AI-UPLOAD-1 to AI-UPLOAD-10, AI-RESOLVE-1 to AI-RESOLVE-15, AI-QUOTA-2 |
 | POST | `/commit` | any signed-in user; upstream services apply their own rules to the caller's JWT | 200 | AI-COMMIT-1 to AI-COMMIT-19 |
 | POST | `/reservations/{id}/assistant` | the reservation's owner (first turn); the conversation's creator on the same reservation (later turns) | 200 | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-TURN-1 to AI-TURN-8, AI-TOOL-1 to AI-TOOL-11, AI-WRITE-1 to AI-WRITE-3 |
 | POST | `/reservations/{id}/assistant/stream` | as above | 200 (`text/event-stream`) | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-STREAM-1 to AI-STREAM-7, AI-TOOL-1 to AI-TOOL-11, AI-WRITE-1 to AI-WRITE-3 |
@@ -354,6 +354,33 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   untrusted context; with no files the prompt is sent alone. \
   Enforced in: `services/ai-orchestrator/app/services/ai_client.py` (`propose_topology`) \
   Pinned by: `services/ai-orchestrator/tests/test_ai_client.py` (`test_propose_topology_prepends_file_context_when_present`, `test_propose_topology_omits_file_context_wrapper_when_absent`)
+- **AI-UPLOAD-8.** A tgz is read through `herd_common.bounded_tar.BoundedTarStream`, which
+  refuses any single read from the decompressed stream over `MAX_TAR_READ_BYTES` (1 MiB;
+  the driver readers' rules are CFG-LOAD-3 in `device-configuration.md` and INV-DRV-7 in
+  `inventory.md`). A pax extended header or a GNU long name or long link declaring more,
+  which tarfile would read whole before the member it describes can be checked, answers
+  400 `The tgz archive has a tar header record over 1048576 bytes (a pax extended header
+  or GNU long name); nothing was extracted` before it is read into memory, and the
+  request fails as a whole (issue #1192). \
+  Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`_extract_tgz`, `TGZ_READ_LIMIT_DETAIL`); `services/common/herd_common/bounded_tar.py` (`BoundedTarStream`, `MAX_TAR_READ_BYTES`, `TarReadLimitError`) \
+  Pinned by: `services/ai-orchestrator/tests/test_extractor_branches.py` (`test_tgz_header_record_over_the_read_bound_is_refused_before_it_is_read`, `test_tgz_well_formed_pax_header_just_over_the_read_bound_is_refused`, `test_tgz_pax_header_just_under_the_read_bound_extracts`, `test_tgz_long_member_names_still_extract`, `test_tgz_read_refusal_and_member_chunk_follow_the_shared_bound`); `services/ai-orchestrator/tests/test_generate.py` (`test_generate_tgz_with_an_oversized_tar_header_answers_400`)
+- **AI-UPLOAD-9.** A text member's data is read in chunks of `_MEMBER_READ_CHUNK_BYTES`
+  (64 KiB), never in one call, because one read of a member is one read of up to that
+  size from the bounded stream: a member larger than `MAX_TAR_READ_BYTES`, up to the per-file
+  cap, extracts whole, and a member larger than the remaining character budget is read to
+  that budget plus 1024 bytes and no further. With the default
+  `UPLOAD_MAX_EXTRACTED_CHARS` a member is read to at most 81,024 bytes; the chunks matter
+  once an operator raises that budget past the bound. \
+  Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`_read_member`, `_MEMBER_READ_CHUNK_BYTES`, `_extract_tgz`) \
+  Pinned by: `services/ai-orchestrator/tests/test_extractor_branches.py` (`test_tgz_member_larger_than_the_read_bound_extracts_whole`, `test_tgz_member_larger_than_the_budget_is_read_to_the_same_cut`, `test_tgz_second_member_is_cut_by_what_the_first_member_used`, `test_tgz_small_archive_extracts_the_same_text_as_before`, `test_tgz_stops_at_budget`, `test_tgz_read_refusal_and_member_chunk_follow_the_shared_bound`)
+- **AI-UPLOAD-10.** A tgz that cannot be read answers 400 `Failed to read tgz archive
+  (<ExceptionClass>)`, the class name only. Every failure of the gzip layer (a body that
+  is not gzip, a stream that ends early, corrupt compressed data, a wrong checksum met
+  when the reader reaches the gzip trailer), whether it comes at the open, at a header,
+  inside a member's data, or while a member is skipped, is raised as `tarfile.ReadError`,
+  so the class named is `ReadError`. \
+  Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`_extract_tgz`, `_GZIP_FAILURES`) \
+  Pinned by: `services/ai-orchestrator/tests/test_extractor.py` (`test_extract_tgz_invalid_archive_raises`); `services/ai-orchestrator/tests/test_extractor_branches.py` (`test_tgz_gzip_layer_failure_is_an_extraction_error`, `test_tgz_honest_stored_block_stream_extracts`)
 
 **Out of scope.** Choosing ports: the proposal never names a port for a device-to-device
 edge (section 8.3). Saving the canvas as the user's own topology, which the topology editor
@@ -1430,7 +1457,8 @@ stream opens are `error` frames, listed at the end.
 |---|---|---|---|
 | 400 | `Too many files: limit is <N>, got <M>` | more file parts than `UPLOAD_MAX_FILES` | AI-UPLOAD-1 |
 | 400 | `File '<name>' exceeds limit of <N> bytes` or `Upload total exceeds limit of <N> bytes` | an upload past a size cap | AI-UPLOAD-2 |
-| 400 | `Unsupported file type '<ext>' for <name>. Accepted: ...`, `Failed to parse PDF (<ExceptionClass>)`, `Failed to read tgz archive (<ExceptionClass>)` | an upload that cannot be extracted | AI-UPLOAD-4, AI-UPLOAD-5 |
+| 400 | `Unsupported file type '<ext>' for <name>. Accepted: ...`, `Failed to parse PDF (<ExceptionClass>)`, `Failed to read tgz archive (<ExceptionClass>)` | an upload that cannot be extracted | AI-UPLOAD-4, AI-UPLOAD-5, AI-UPLOAD-10 |
+| 400 | `The tgz archive has a tar header record over 1048576 bytes (a pax extended header or GNU long name); nothing was extracted` | a tgz upload holding a pax or GNU long-name header over the tar read bound | AI-UPLOAD-8 |
 | 400 | `start must not be after end` or `date range too large; max 366 days` | bad usage report range | AI-QUOTA-8 |
 | 401 | `Not authenticated` or `Could not validate credentials` | no token or a bad token on any route but status, health, and version | AI-GEN-1, AI-COMMIT-1, AI-STREAM-1, AI-QUOTA-6, AI-QUOTA-8 |
 | 403 | `Admin or superadmin role required` | identity, usage, or recipe routes as a user | AI-IDENT-1, AI-QUOTA-8, AI-RECIPE-2 |
