@@ -313,7 +313,7 @@
 
     <div class="callout warn">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3z"/><path d="M12 9v4M12 17h.01"/></svg></span>
-      <div><span class="ttl">When retrying won't help</span><p>A failed connection marked <em>not retryable</em> can't be reapplied as recorded &mdash; its cabling path changed under the reservation, so the row explains that retrying is pointless. The fix is to <strong>re-save the fork wiring</strong> (open live-edit mode and commit again), which re-resolves the path against current inventory. Then retry.</p></div>
+      <div><span class="ttl">When retrying won't help</span><p>A failed connection marked <em>not retryable</em> can't be reapplied as recorded: its cabling path changed under the reservation, or HERD could not load the switch it runs through (the switch or its template is gone, or its driver package is broken), so the row explains that retrying is pointless. The fix is to <strong>re-save the fork wiring</strong> (open live-edit mode and commit again), which re-resolves the path against current inventory; for a broken driver package, have an admin fix and re-upload it first. Then retry.</p></div>
     </div>
 
     <h2 class="sec" id="asbuilt">The paper trail</h2>

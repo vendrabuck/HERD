@@ -150,7 +150,7 @@
     <p class="sectitle">Setting things up</p>
 
     <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Driver upload fails with 422 or 409</span></summary>
-      <div class="acc-body"><p><b>422</b> = wrong file type or too big. Use a <code>.zip</code> or <code>.tar.gz</code> under 10 MB. <b>409</b> = the driver name is already taken; names are unique, pick another.</p></div></details>
+      <div class="acc-body"><p><b>422</b> = the package was refused and nothing was stored; the message says why. Usually it is the wrong file type or too big: use a <code>.zip</code> or <code>.tar.gz</code> under 10 MB. A package is also refused when its <code>driver_metadata.json</code> is larger than 1 MiB, or when a <code>.tar.gz</code> holds a tar header record (a pax extended header or GNU long name) over 1 MiB. <b>409</b> = the driver name is already taken; names are unique, pick another.</p></div></details>
 
     <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Can't delete a driver</span></summary>
       <div class="acc-body"><p>A template still points at it &mdash; drivers are reference-counted. Remove or repoint the template first, then delete the driver.</p></div></details>
