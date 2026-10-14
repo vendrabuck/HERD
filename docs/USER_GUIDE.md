@@ -67,9 +67,9 @@ The panel on the left of the Reservations list searches and filters it (issue #9
 
 Transitions the system runs automatically:
 
-- **Activate** (`PENDING -> ACTIVE`): at your reservation's start time.
-- **Provision** (`PENDING_PROVISION -> ACTIVE` or `FAILED`): during create, as soon as the inventory service confirms.
-- **Expire** (`ACTIVE -> COMPLETED`): at your reservation's end time.
+- **Activate** (`PENDING` to `ACTIVE`): at your reservation's start time.
+- **Provision** (`PENDING_PROVISION` to `ACTIVE` or `FAILED`): during create, as soon as the inventory service confirms.
+- **Expire** (`ACTIVE` to `COMPLETED`): at your reservation's end time.
 
 ### Exclusive vs shared devices
 

@@ -494,7 +494,7 @@ create a reservation, a fork, or any row at all.
   device out from under a topology-bound reservation cannot reopen the same
   gap phase 1 closed at the fork.
 - Fail-closed is unchanged: an unreachable cabling service still raises
-  `RuntimeError` -> `503`, exactly as the pre-existing connectivity check does;
+  `RuntimeError` mapped to `503`, exactly as the pre-existing connectivity check does;
   a 404 (topology deleted between selection and submit) is still treated as no
   validation, not a hard failure, since there is no canvas left to check
   membership against.

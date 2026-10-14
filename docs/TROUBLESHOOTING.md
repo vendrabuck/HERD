@@ -231,6 +231,56 @@ Fix: either uncheck **Apply device configs** in the commit dialog, or have an ad
 
 By design: when `AI_API_KEY` is blank, `GET /api/ai/status` returns `{"enabled": false}` and the frontend hides the **Use AI** button entirely. To re-enable the feature, set the key in `.env` or via the config UI and restart the ai-orchestrator container (`make restart`). You can check the current state by hitting `/api/ai/status` directly; it is unauthenticated.
 
+### `400` on `POST /generate` naming an uploaded file
+
+Symptom: the AI generate request answers 400 and no proposal is made. The detail names the
+file or the archive, and a tgz refusal ends in `nothing was extracted`. Any one refused
+file fails the whole request; no text from the other files is used. The route checks the
+files after the provider and quota gates and before it reads inventory, so a refused
+upload costs inventory nothing. A refusal writes no log line of its own (the 400 shows in
+the access log only); the response body is the record. Defaults first, then each message
+(`services/ai-orchestrator/app/routes/generate.py` and `app/services/extractor.py`; see
+[AI_GENERATE.md](AI_GENERATE.md#file-uploads) and rules AI-UPLOAD-1 to AI-UPLOAD-18 in
+`docs/specs/ai-features.md`):
+
+| Limit | Default | Setting |
+|---|---|---|
+| Files per request | 5 | `UPLOAD_MAX_FILES` |
+| Bytes per file | 5242880 (5 MB) | `UPLOAD_MAX_FILE_BYTES` |
+| Extracted text, all files together | 80000 characters | `UPLOAD_MAX_EXTRACTED_CHARS` |
+
+The text budget is not a refusal: a file cut at it is returned with `truncated` set. The
+tgz limits below are constants in the code, not settings.
+
+| 400 detail | Cause |
+|---|---|
+| `Too many files: limit is 5, got N` | More file parts than `UPLOAD_MAX_FILES`; checked before any part is read. |
+| `File '<name>' exceeds limit of 5242880 bytes` | One file is over `UPLOAD_MAX_FILE_BYTES`; the read stops at the chunk that crosses it. |
+| `Upload total exceeds limit of 26214400 bytes` | All files together are over the file count times the per-file limit. The count check and the per-file check run first, so no request can reach this one at any setting. |
+| `Unsupported file type '<ext>' for <name>. Accepted: .pdf, .txt, .md, .json, .xml, .tgz, .tar.gz` | Any other extension, or none (`<ext>` is then empty). |
+| `Failed to parse PDF (<ExceptionClass>)` | pdfplumber could not read the PDF; the class name is all that is returned. |
+| `PDF extraction not available: pdfplumber is not installed` | The ai-orchestrator image lacks pdfplumber; rebuild it. |
+| `Failed to read tgz archive (ReadError)` | Not gzip, a stream that ends early or is corrupt, a wrong checksum, or a bad first tar header. A bad header after at least one good member is read as the end of the archive and the earlier members are used; a bad header after a pax or GNU long-name header is this 400. |
+| `Failed to read tgz archive (RecursionError)` | Several hundred pax or GNU long-name headers in a row, more than the reader can follow. |
+| `The tgz archive has more than 10000 entries; nothing was extracted` | Over 10,000 members of any type (an archive of exactly 10,000 extracts). |
+| `The tgz archive extends past 104857600 bytes uncompressed; nothing was extracted` | The reader would have to read or skip past 100 MiB of decompressed stream. |
+| `The tgz archive has more than 65536 bytes of pax extended headers and GNU long names in front of one member; nothing was extracted` | Over 64 KiB of those headers together before one member, each counted rounded up to its 512-byte block. |
+| `The tgz archive has more than 4096 bytes of pax global headers; nothing was extracted` | Over 4 KiB of pax global headers in the archive, counted the same way (`git archive` writes 52 bytes). |
+| `The tgz archive has a sparse member, which is not supported; nothing was extracted` | A sparse member in any GNU format, or any pax record whose keyword starts with `GNU.sparse.`. |
+| `The tgz archive has a tar header record over 1048576 bytes (a pax extended header or GNU long name); nothing was extracted` | One read over 1 MiB from the decompressed tar stream. The 64 KiB header ceiling refuses such a header first, so this is the second line and no upload reaches it. |
+
+The extractor repeats the file count and per-file checks (`Too many files: ...` and `File
+'<name>' is N bytes, exceeds limit of M`) as defense in depth; the route's chunked read
+refuses first, so a request does not reach the second wording.
+
+Fix: have the user shrink or re-create the file (a smaller or fewer set of files, a
+plain-text export in place of a rejected type, an archive without sparse members or
+oversized binaries), or, for the three settings, raise them in `.env` or the config UI and
+restart the ai-orchestrator container (`make restart`; the settings are listed in
+[ENV_VARS.md](ENV_VARS.md)). A raised `UPLOAD_MAX_FILE_BYTES` does not lift the fixed tgz
+ceilings. The PDF reader has no
+memory bound of its own yet (issue #1202).
+
 ## Drivers and execution
 
 ### Driver upload fails with `422`
@@ -340,9 +390,19 @@ Meaning: the wiring ledgers hold `FAILED` rows under the attempts cap that the b
 retry tick will never drive, and its selects leave them out (issue #1190). They repeat on
 every tick because the tick does not change them. They no longer take up the tick's batch of
 `WIRING_RETRY_BATCH_SIZE` rows per ledger, so they do not delay other rows. (Other selected rows
-still can: a build row whose intent cannot be read while cabling or inventory is unreachable
-is selected, left unchanged, and counts no attempt, so a batch of them delays newer rows in
-its ledger until that service answers again. It shows as `still_failed` with no driver run.)
+still can: any upstream read that fails during a layer's retry (the intent from cabling, the
+switch or its template from inventory, and for L2 the fabric lookup), in either direction,
+leaves the rows it covers unchanged with no attempt counted, so a batch of them delays newer
+rows in its ledger until that service answers again. A build row whose intent cannot be read
+is passed over on its own and shows as `still_failed` with no driver run. A failed switch,
+template, or fabric read is wider: it makes that layer's whole retry raise, so every selected
+row of the layer, release rows included, stays unchanged, the tick logs `wiring retry tick:
+L<n> reattempt failed; rows stay FAILED`, and the layer's `rows_retried` is 0 while `rows_due`
+still counts the rows. One bad switch therefore also stops the other reservations the tick
+would reach after it in that layer. Measured: 20 release rows on a switch whose inventory read
+failed hid a newer row on a healthy switch, every tick reporting `rows_due 20, rows_retried 0`.
+A known limit by decision, WIRE-RETRY-13; the per-reservation isolation that would narrow it
+is the open code half of issue #1204.)
 
 - `excluded_not_retryable`: rows whose reason starts with `recorded hop unresolvable` or
   `hop set is not a simple chain`. The saved wiring cannot be applied as recorded, so a
@@ -351,15 +411,22 @@ its ledger until that service answers again. It shows as `still_failed` with no 
   reports these rows as not retryable. On an ended reservation no channel will retry them:
   the tick leaves them out, a manual retry reports them `not_retryable`, and a fork re-save
   needs an `ACTIVE` reservation. A row that was going to RELEASE (`intended` is `RELEASED`)
-  may mean the hardware was left connected: the disconnect never ran, and nothing in HERD
-  will run it later (an open defect, issue #1199). Read the row with
+  may mean the hardware was left connected: the disconnect never ran, and no retry channel
+  will run it later (an open defect, issue #1199). Re-publishing the reservation's terminal
+  event does not recover these rows either: the teardown pass reads only `ACTIVE` L1 and L2
+  rows and, for L3, `ACTIVE` pins and `FAILED` pins intended `ACTIVE`, never a `FAILED` row
+  intended `RELEASED` (`_teardown_from_ledgers`). Read the row with
   `GET /api/reservations/{id}/wiring-status` (any status, owner or admin), which lists each
   row's switch, and its ports for L1 and L2. For a reason such as a missing template or `driver load failed:
   DriverPackageError` the switch is still in inventory: check on the switch whether the
   row's ports are still cross-connected (L1), still in the VLAN (L2), or whether its routes
   are still installed (L3), and remove them by hand. A reason ending in `switch <id> not
-  found` means the switch is gone from inventory, so HERD cannot reach it; if that hardware
-  still exists, check it the same way.
+  found` means inventory did not return the switch. The switch may be gone from inventory,
+  but that is not the only cause: execution reads any answer below 500 other than 200 as
+  "not found", so a 401 or 403 from inventory during an `INTERNAL_API_TOKEN` rotation (both
+  sides must hold the new value, or service-to-service calls 403) pins an existing switch's
+  rows the same way (open, issue #1203). Look up the switch in inventory first; whichever
+  the cause, if that hardware still exists, check it the same way.
 - `excluded_frozen`: build-direction rows of reservations that have ended. A connection
   is never built for an ended reservation, so these rows stay as a record of a build that
   did not finish. No action is needed.

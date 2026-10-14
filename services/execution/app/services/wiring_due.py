@@ -42,13 +42,18 @@ Why each piece is written the way it is:
     drop its rows. A subquery also keeps the due selects' FOR UPDATE on the ledger
     table alone.
 
-What this does NOT promise (a known limit, by decision, issue #1190). A selected row
-can still end a tick unchanged for reasons these rules cannot see: a build row whose
-intent cannot be read (cabling's fork, or inventory during the derivation, raising
-TransientUpstreamError) is not driven and counts no attempt, so while that upstream is
-down a batch of such rows, older than everything else in a ledger, keeps newer rows of
-that ledger from being selected. It heals when the upstream answers. Counting an
-attempt for an outage would retire rows during the outage, so that is not done.
+What this does NOT promise (a known limit, by decision, issues #1190 and #1204). A
+selected row can still end a tick unchanged for reasons these rules cannot see: any
+upstream read that fails during a layer's retry (the intent from cabling's fork or from
+inventory during the derivation, the switch or its template from inventory, and for L2
+the fabric lookup), in either direction, raises TransientUpstreamError, and the rows it
+covers are not driven and count no attempt. A build row whose intent cannot be read is
+passed over on its own; a failed switch, template, or fabric read escapes the layer's
+apply, so the tick drops the whole layer's selection for that tick (the layer's
+rows_retried is 0 while rows_due counts it). While that upstream is down a batch of such
+rows, older than everything else in a ledger, keeps newer rows of that ledger from being
+selected. It heals when the upstream answers. Counting an attempt for an outage would
+retire rows during the outage, so that is not done.
 
 Who may use this. The three due queries take `tick_would_drive`, and
 `count_tick_excluded` here reuses its two halves; nothing else. The per-reservation
