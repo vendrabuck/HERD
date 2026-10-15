@@ -516,9 +516,11 @@ async def due_failed_rows(
     (which the caller's skip leaves as they are) hid every newer retryable row from
     every later tick. A release-direction row of a frozen reservation is still a
     candidate (issue #369). The caller keeps both checks for a reservation frozen
-    between this select and its drive. A candidate is not always driven: a build row
-    whose intent cannot be read is left unchanged with no attempt counted, a known
-    limit described in wiring_due's module docstring.
+    between this select and its drive. A candidate is not always driven: a row an
+    upstream read fails for (a build row's intent; a switch, template, or fabric read
+    inside its reservation's apply, which passes over only that reservation, issue
+    #1204) is left unchanged with no attempt counted, a known limit described in
+    wiring_due's module docstring.
 
     RETRY-ONLY, so it also filters on the issue #817 drive claim: a row another
     channel is currently driving is not a candidate, and the select takes FOR UPDATE

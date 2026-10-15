@@ -397,14 +397,12 @@ switch or its template from inventory, and for L2 the fabric lookup), in either 
 leaves the rows it covers unchanged with no attempt counted, so a batch of them delays newer
 rows in its ledger until that service answers again. A build row whose intent cannot be read
 is passed over on its own and shows as `still_failed` with no driver run. A failed switch,
-template, or fabric read is wider: it makes that layer's whole retry raise, so every selected
-row of the layer, release rows included, stays unchanged, the tick logs `wiring retry tick:
-L<n> reattempt failed; rows stay FAILED`, and the layer's `rows_retried` is 0 while `rows_due`
-still counts the rows. One bad switch therefore also stops the other reservations the tick
-would reach after it in that layer. Measured: 20 release rows on a switch whose inventory read
-failed hid a newer row on a healthy switch, every tick reporting `rows_due 20, rows_retried 0`.
-A known limit by decision, WIRE-RETRY-13; the per-reservation isolation that would narrow it
-is the open code half of issue #1204.)
+template, or fabric read stops only the reservation it belongs to (issue #1204): that
+reservation's rows of the layer, release rows included, stay unchanged and show as
+`still_failed` and in `skipped_upstream`, the tick logs one warning with action
+`wiring_retry_reservation_upstream_failed` naming the reservation, the layer, and the error's
+class (look up the failing read in inventory's or cabling's own log), and every other
+reservation in the batch is still driven. A known limit by decision, WIRE-RETRY-13.)
 
 - `excluded_not_retryable`: rows whose reason starts with `recorded hop unresolvable` or
   `hop set is not a simple chain`. The saved wiring cannot be applied as recorded, so a

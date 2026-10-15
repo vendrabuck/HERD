@@ -437,8 +437,9 @@ async def test_nil_allocation_build_retry_resolution_failure_makes_no_driver_cal
 async def test_nil_allocation_build_retry_fabric_outage_fails_closed():
     """Issue #1003, decision d, on the retry channel: when cabling cannot answer the
     fabric lookup during re-resolution, nothing is allocated and nothing is driven.
-    The error propagates (the manual route maps it to 503; the tick's per-channel
-    catch leaves the row FAILED), and the row stays FAILED with its attempts."""
+    On the manual channel the error propagates (the route maps it to 503). The tick
+    catches it for this reservation alone (issue #1204): the row reads back
+    still_failed, counted in skipped_upstream, and stays FAILED with its attempts."""
     from app.services.nats_consumer import TransientUpstreamError
 
     rid = await _seed_l2_failed("0/0/1", "ACTIVE", uuid.UUID(int=0), attempts=2)
@@ -458,7 +459,9 @@ async def test_nil_allocation_build_retry_fabric_outage_fails_closed():
 
     assert calls == [], "no driver call while the fabric is unknown"
     assert stats["rows_due"] == 1, "the tick did pick the row up"
-    assert stats["l2_rows_retried"] == 0
+    assert stats["l2_rows_retried"] == 1
+    assert stats["still_failed"] == 1
+    assert stats["skipped_upstream"] == 1
     row = await _l2_row(rid)
     assert row.status == "FAILED"
     assert row.attempts == 2
