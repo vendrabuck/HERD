@@ -391,12 +391,16 @@ async def test_one_tick_drives_the_retryable_row_behind_a_batch_of_stale_rows(le
 
 @pytest.mark.parametrize("ledger", LEDGERS, ids=LEDGER_IDS)
 async def test_unverifiable_build_rows_still_fill_the_batch_while_the_upstream_fails(ledger):
-    """The known limit, by decision (WIRE-RETRY-13). A build row passes both skip rules,
-    so it is selected; while cabling cannot answer, its intent cannot be verified, it is
-    not driven, and it counts no attempt. A batch of such rows older than a retryable
-    release row keeps that row from being selected, tick after tick, until the upstream
-    answers. The stats show the rows as retried and still failed with no driver call.
-    Counting an attempt here would retire rows during an outage, so it is not done."""
+    """The known limit, by decision (WIRE-RETRY-13), in its intent-read form. A build
+    row passes both skip rules, so it is selected; while cabling cannot answer, its
+    intent cannot be verified, it is not driven, and it counts no attempt. A batch of
+    such rows older than a retryable release row keeps that row from being selected,
+    tick after tick, until the upstream answers. The stats show the rows as retried and
+    still failed with no driver call. Counting an attempt here would retire rows during
+    an outage, so it is not done. A failed switch, template, or fabric read inside a
+    reservation's apply has the same posture but is caught per reservation (issue #1204,
+    test_wiring_retry_upstream_isolation.py): only that reservation's rows wait, and a
+    row of another reservation in the same batch is driven."""
     batch = settings.wiring_retry_batch_size
     release_id = await _seed_release_row(ledger, uuid.uuid4())
     builds = [

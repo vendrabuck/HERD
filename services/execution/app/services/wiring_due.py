@@ -48,12 +48,14 @@ upstream read that fails during a layer's retry (the intent from cabling's fork 
 inventory during the derivation, the switch or its template from inventory, and for L2
 the fabric lookup), in either direction, raises TransientUpstreamError, and the rows it
 covers are not driven and count no attempt. A build row whose intent cannot be read is
-passed over on its own; a failed switch, template, or fabric read escapes the layer's
-apply, so the tick drops the whole layer's selection for that tick (the layer's
-rows_retried is 0 while rows_due counts it). While that upstream is down a batch of such
-rows, older than everything else in a ledger, keeps newer rows of that ledger from being
-selected. It heals when the upstream answers. Counting an attempt for an outage would
-retire rows during the outage, so that is not done.
+passed over on its own. A failed switch, template, or fabric read inside one
+reservation's layer apply is caught for that reservation alone (issue #1204): its rows
+of that layer stay as they were, the tick counts them in `skipped_upstream` and logs
+`wiring_retry_reservation_upstream_failed`, and every other reservation in the batch is
+still driven. While that upstream is down a batch of such rows, older than everything
+else in a ledger, still keeps newer rows of that ledger from being selected. It heals
+when the upstream answers. Counting an attempt for an outage would retire rows during
+the outage, so that is not done.
 
 Who may use this. The three due queries take `tick_would_drive`, and
 `count_tick_excluded` here reuses its two halves; nothing else. The per-reservation

@@ -82,6 +82,26 @@ itself, so there is no reaper and no heartbeat. The three per-tick selects also 
 rows already claimed (FOR UPDATE SKIP LOCKED plus the claim predicate); the
 per-reservation FAILED readers deliberately do NOT, because the reconcile's
 stale-build widening shares them and must keep seeing every FAILED row.
+
+Per-reservation upstream isolation (issue #1204). The tick's batch spans reservations,
+and each layer retry calls its consumer apply once per reservation. The invariant: an
+upstream read that fails inside one reservation's layer apply (a TransientUpstreamError
+from the switch or template read, for L2 the fabric lookup, for L3 the route apply)
+leaves ONLY that reservation's rows of that layer unchanged for the tick, with no
+attempt counted (the outage posture of WIRE-RETRY-13), and every other reservation's
+rows in the same layer and tick are driven as if that reservation were absent. Each of
+the three `_reattempt_*` functions therefore catches TransientUpstreamError around each
+reservation's apply call (and, for L2, around its allocation re-resolution), logs one
+line with the fixed action `wiring_retry_reservation_upstream_failed` (reservation id,
+layer, exception class name only, never upstream text), and moves to the next
+reservation; the tick reports the rows left unchanged as `skipped_upstream`. Nothing
+wider than TransientUpstreamError is caught: any other exception still drops the layer
+for the tick (WIRE-RETRY-15). The catch never leaves a drive claim behind, because no
+upstream read sits between a row's claim and its record in any layer's apply. Only the
+tick isolates: the manual channel passes no collector, so the error still propagates
+and the endpoint answers 503 (WIRE-RETRY-12), one reservation being all it drives.
+Within one reservation the apply is not undone: rows it drove before the read failed
+keep their new state and are not counted as unchanged.
 """
 
 from __future__ import annotations
@@ -124,6 +144,62 @@ from app.services.wiring_claim import WiringRowClaims, claimable_row_ids
 from app.services.wiring_due import count_tick_excluded
 
 logger = logging.getLogger(__name__)
+
+# The fixed log action for a reservation a retry tick passes over because an upstream
+# read failed inside its layer apply (issue #1204).
+RESERVATION_UPSTREAM_FAILED_ACTION = "wiring_retry_reservation_upstream_failed"
+
+
+def _row_snapshot(rows) -> dict[uuid.UUID, tuple[str, int, str | None]]:
+    """(reservation, attempts, last_error) per loaded row, taken before anything is driven."""
+    return {row.id: (str(row.reservation_id), row.attempts, row.last_error) for row in rows}
+
+
+def _record_upstream_skips(
+    layer: str,
+    upstream_failed: dict[str, str],
+    snapshot: dict[uuid.UUID, tuple[str, int, str | None]],
+    by_id: dict,
+    claims: WiringRowClaims,
+    upstream_skips: set[uuid.UUID],
+) -> None:
+    """Log each reservation whose apply an upstream read stopped, and collect its rows.
+
+    A row counts as left unchanged when it is still FAILED with the attempts and reason
+    it was loaded with and no other channel took it: an apply that raised partway may
+    already have driven and recorded some of the reservation's rows, and those are not
+    counted. `upstream_failed` maps the reservation to the exception's CLASS NAME, the
+    only part of the error that reaches the log (issue #1204; upstream text never does).
+    """
+    for res_str, error_class in upstream_failed.items():
+        unchanged = {
+            rid
+            for rid, (row_res, attempts, last_error) in snapshot.items()
+            if row_res == res_str
+            and rid not in claims.lost
+            and (row := by_id.get(rid)) is not None
+            and row.status == "FAILED"
+            and row.attempts == attempts
+            and row.last_error == last_error
+        }
+        upstream_skips.update(unchanged)
+        logger.warning(
+            "wiring retry tick: an upstream read failed during the %s apply for "
+            "reservation %s (%s); %d of its row(s) left unchanged this tick, no attempt "
+            "counted",
+            layer,
+            res_str,
+            error_class,
+            len(unchanged),
+            extra={
+                "action": RESERVATION_UPSTREAM_FAILED_ACTION,
+                "reservation_id": res_str,
+                "layer": layer,
+                "error_class": error_class,
+                "rows_unchanged": len(unchanged),
+            },
+        )
+
 
 # The pinned non-retryable reason prefixes (ADR 0007 Decision 5). A FAILED row whose
 # last_error starts with either one records an intent that a verbatim apply cannot
@@ -248,6 +324,7 @@ async def _reattempt_rows(
     rows: list[L1ConnectionAssignment],
     get_db_session,
     claims: WiringRowClaims | None = None,
+    upstream_skips: set[uuid.UUID] | None = None,
 ) -> list[dict]:
     """Reattempt a list of retryable FAILED rows in their own direction; return outcomes.
 
@@ -285,9 +362,13 @@ async def _reattempt_rows(
     rows stay FAILED untouched and read back "still_failed"; release-direction rows are
     unaffected by all of this.
 
-    A TransientUpstreamError from resolving a switch during the apply (inventory 5xx)
-    still propagates to the caller: the manual endpoint maps it to 503; the background
-    tick logs it and moves on. The rows stay FAILED for the next sweep.
+    A TransientUpstreamError raised inside one reservation's apply (a switch or template
+    read on an inventory 5xx) depends on `upstream_skips` (issue #1204). The tick passes
+    a set: the error is caught for that reservation alone, its rows stay as they were
+    with no attempt counted, the ids of the rows left unchanged are added to the set, one
+    `wiring_retry_reservation_upstream_failed` line is logged, and the next reservation
+    is applied as if this one were absent. The manual channel passes None: the error
+    propagates and the endpoint maps it to 503.
 
     Per-row drive claim (issue #817): a `WiringRowClaims` ledger rides into the apply,
     which claims each row immediately before its own driver call. A row the OTHER
@@ -308,6 +389,9 @@ async def _reattempt_rows(
 
     claims = claims if claims is not None else WiringRowClaims()
     retry_ids: list[uuid.UUID] = [row.id for row in rows]
+    snapshot = _row_snapshot(rows)
+    # reservation -> class name of the TransientUpstreamError that stopped its apply.
+    upstream_failed: dict[str, str] = {}
 
     # Supersession guard (shared by both channels): a release whose port a newer build
     # on another reservation already reclaimed needs no driver call. Flip it RELEASED
@@ -382,19 +466,29 @@ async def _reattempt_rows(
                     str(row.switch_device_id), []
                 ).append((row.port_a, row.port_b, phys))
 
-        for res_str in {*by_res_build, *by_res_release}:
+        # In selection order (retry_ids_by_res is filled row by row), so the order the
+        # reservations are applied in is the batch's own, not a set's hash order.
+        for res_str in retry_ids_by_res:
+            if res_str not in by_res_build and res_str not in by_res_release:
+                continue
             build_by_switch = by_res_build.get(res_str, {})
             release_by_switch = by_res_release.get(res_str, {})
-            await _apply_wiring_pairs(
-                res_str,
-                release_by_switch,
-                build_by_switch,
-                [],
-                ctx,
-                get_db_session,
-                retry_row_ids=retry_ids_by_res.get(res_str),
-                claims=claims,
-            )
+            try:
+                await _apply_wiring_pairs(
+                    res_str,
+                    release_by_switch,
+                    build_by_switch,
+                    [],
+                    ctx,
+                    get_db_session,
+                    retry_row_ids=retry_ids_by_res.get(res_str),
+                    claims=claims,
+                )
+            except TransientUpstreamError as exc:
+                if upstream_skips is None:
+                    raise
+                # Issue #1204: this reservation only; the next one is still applied.
+                upstream_failed[res_str] = type(exc).__name__
 
     async with get_db_session() as db:
         refreshed = (
@@ -427,6 +521,8 @@ async def _reattempt_rows(
         else:
             outcome = "still_failed"
         outcomes.append(_outcome(row, outcome))
+    if upstream_skips is not None:
+        _record_upstream_skips("l1", upstream_failed, snapshot, by_id, claims, upstream_skips)
     return outcomes
 
 
@@ -434,6 +530,7 @@ async def _reattempt_l2_rows(
     rows: list[L2PortAssignment],
     get_db_session,
     claims: WiringRowClaims | None = None,
+    upstream_skips: set[uuid.UUID] | None = None,
 ) -> list[dict]:
     """Reattempt FAILED L2 membership rows in their own direction; return outcomes.
 
@@ -472,6 +569,14 @@ async def _reattempt_l2_rows(
 
     Per-row drive claim (issue #817), the _reattempt_rows shape: a row the other channel
     claimed first is never driven and reads back "in_progress".
+
+    Per-reservation upstream isolation (issue #1204), the _reattempt_rows shape: with
+    `upstream_skips` set (the tick), a TransientUpstreamError from one reservation's
+    allocation re-resolution (the fail-closed fabric lookup) or from its apply (a switch
+    or template read) stops only that reservation. A re-resolution failure skips the
+    reservation's apply altogether, so none of its rows is re-parked with the
+    no-allocation reason or driven this tick; the other reservations are applied. With
+    `upstream_skips` None (the manual channel) the error propagates (503).
     """
     from app.models.vlan_assignment import VlanAssignment
     from app.services.l2_membership_service import record_l2_failed, release_l2_membership
@@ -492,6 +597,9 @@ async def _reattempt_l2_rows(
     claims = claims if claims is not None else WiringRowClaims()
     _NIL = uuid.UUID(int=0)
     retry_ids: list[uuid.UUID] = [row.id for row in rows]
+    snapshot = _row_snapshot(rows)
+    # reservation -> class name of the TransientUpstreamError that stopped it (#1204).
+    upstream_failed: dict[str, str] = {}
 
     va_ids = {row.vlan_assignment_id for row in rows}
     async with get_db_session() as db:
@@ -588,7 +696,15 @@ async def _reattempt_l2_rows(
                 )
         resolved: dict[str, dict[str, tuple[uuid.UUID, int]]] = {}
         for res_str, targets in resolve_targets.items():
-            alloc = await _resolve_add_allocations(res_str, targets, get_db_session)
+            try:
+                alloc = await _resolve_add_allocations(res_str, targets, get_db_session)
+            except TransientUpstreamError as exc:
+                if upstream_skips is None:
+                    raise
+                # Issue #1204: this reservation is not applied this tick (below), so no
+                # row of it is re-parked with the no-allocation reason or driven.
+                upstream_failed[res_str] = type(exc).__name__
+                continue
             resolved[res_str] = alloc
             # Fold the freshly-resolved VLAN numbers into the read-back map so a healed
             # row's outcome reports its real VLAN, not None.
@@ -607,6 +723,8 @@ async def _reattempt_l2_rows(
             if row.id in superseded_ids or row.id in blocked_build_ids:
                 continue
             res_str = str(row.reservation_id)
+            if res_str in upstream_failed:
+                continue
             retry_ids_by_res.setdefault(res_str, {})[(str(row.switch_device_id), row.port)] = row.id
             if row.intended == "RELEASED":
                 entry = {
@@ -652,15 +770,21 @@ async def _reattempt_l2_rows(
             by_res.setdefault(res_str, {"removes": [], "adds": []})["adds"].append(entry)
 
         for res_str, sets in by_res.items():
-            await _apply_l2_memberships(
-                res_str,
-                sets["removes"],
-                sets["adds"],
-                ctx,
-                get_db_session,
-                retry_row_ids=retry_ids_by_res.get(res_str),
-                claims=claims,
-            )
+            try:
+                await _apply_l2_memberships(
+                    res_str,
+                    sets["removes"],
+                    sets["adds"],
+                    ctx,
+                    get_db_session,
+                    retry_row_ids=retry_ids_by_res.get(res_str),
+                    claims=claims,
+                )
+            except TransientUpstreamError as exc:
+                if upstream_skips is None:
+                    raise
+                # Issue #1204: this reservation only; the next one is still applied.
+                upstream_failed[res_str] = type(exc).__name__
         if superseded_va_ids:
             await _release_orphaned_allocations(superseded_va_ids, get_db_session, ctx)
 
@@ -689,6 +813,8 @@ async def _reattempt_l2_rows(
         else:
             outcome = "still_failed"
         outcomes.append(_l2_outcome(row, outcome, vlan_by_va.get(row.vlan_assignment_id)))
+    if upstream_skips is not None:
+        _record_upstream_skips("l2", upstream_failed, snapshot, by_id, claims, upstream_skips)
     return outcomes
 
 
@@ -696,6 +822,7 @@ async def _reattempt_l3_rows(
     rows: list[RouteAssignment],
     get_db_session,
     claims: WiringRowClaims | None = None,
+    upstream_skips: set[uuid.UUID] | None = None,
 ) -> list[dict]:
     """Reattempt FAILED L3 route pins in their own direction; return outcomes.
 
@@ -754,6 +881,12 @@ async def _reattempt_l3_rows(
 
     Per-row drive claim (issue #817), the _reattempt_rows shape: a pin the other channel
     claimed first is never driven and reads back "in_progress".
+
+    Per-reservation upstream isolation (issue #1204), the _reattempt_rows shape: with
+    `upstream_skips` set (the tick), a TransientUpstreamError out of one reservation's
+    `_apply_l3_adjacency` (a switch or template read) stops only that reservation, the
+    reservation-level counterpart of the per-row gate catch above. With `upstream_skips`
+    None (the manual channel) it propagates (503).
     """
     from app.services.nats_consumer import (
         WIRING_STALE_BUILD_REASON,
@@ -772,6 +905,9 @@ async def _reattempt_l3_rows(
 
     claims = claims if claims is not None else WiringRowClaims()
     retry_ids: list[uuid.UUID] = [row.id for row in rows]
+    snapshot = _row_snapshot(rows)
+    # reservation -> class name of the TransientUpstreamError that stopped it (#1204).
+    upstream_failed: dict[str, str] = {}
 
     # reservation -> {"deprovisions": [...], "provisions": [...]} of {device_id, routes}.
     # Deprovisions group up front; provisions are revalidated first (issue #491), so
@@ -893,15 +1029,21 @@ async def _reattempt_l3_rows(
                 ].append(entry)
 
         for res_str, sets in by_res.items():
-            await _apply_l3_adjacency(
-                res_str,
-                sets["deprovisions"],
-                sets["provisions"],
-                ctx,
-                get_db_session,
-                retry_row_ids=retry_ids_by_res.get(res_str),
-                claims=claims,
-            )
+            try:
+                await _apply_l3_adjacency(
+                    res_str,
+                    sets["deprovisions"],
+                    sets["provisions"],
+                    ctx,
+                    get_db_session,
+                    retry_row_ids=retry_ids_by_res.get(res_str),
+                    claims=claims,
+                )
+            except TransientUpstreamError as exc:
+                if upstream_skips is None:
+                    raise
+                # Issue #1204: this reservation only; the next one is still applied.
+                upstream_failed[res_str] = type(exc).__name__
 
     async with get_db_session() as db:
         refreshed = (
@@ -926,6 +1068,8 @@ async def _reattempt_l3_rows(
         else:
             outcome = "still_failed"
         outcomes.append(_l3_outcome(row, outcome))
+    if upstream_skips is not None:
+        _record_upstream_skips("l3", upstream_failed, snapshot, by_id, claims, upstream_skips)
     return outcomes
 
 
@@ -1053,15 +1197,22 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
     disconnect can still finish after the reservation ends. The batch cap bounds one
     tick exactly as the health scheduler's batch cap does; a repeat failure accumulates
     attempts, so a row converges toward the cap and eventually stops being swept. A
-    selected row can still end the tick unchanged: a build row whose intent cannot be
-    read (an upstream outage) is not driven and counts no attempt, so a batch of them
-    delays newer rows until the upstream answers (a known limit by decision, see
-    wiring_due's module docstring).
+    selected row can still end the tick unchanged: a row an upstream read cannot be
+    answered for is not driven and counts no attempt, so a batch of them delays newer
+    rows until the upstream answers (a known limit by decision, see wiring_due's module
+    docstring). A build row whose intent cannot be read is passed over on its own; a
+    failed switch, template, or fabric read inside one reservation's layer apply passes
+    over only that reservation's rows of that layer (issue #1204), and every other
+    reservation in the batch is still driven.
 
     Stats. `skipped_not_retryable` and `skipped_frozen` keep their meaning, rows this
     tick LOADED and then set aside by its two Python checks below; a row the layer
     retry leaves unchanged for another reason (an upstream read failing, a claim the
-    manual channel holds) is counted in `rows_retried` and its outcome instead. The
+    manual channel holds) is counted in `rows_retried` and its outcome instead.
+    `skipped_upstream` (issue #1204) counts the rows, across the three layers, that a
+    reservation's failed upstream read left unchanged (a subset of `still_failed`, so
+    also of `rows_retried`). A build row passed over because its intent read failed is
+    not counted there, unless its reservation's apply then failed too. The
     selects apply the same two rules, so `skipped_frozen` now counts only a build row
     whose reservation was frozen between the select and the check below, and
     `skipped_not_retryable` stays 0 unless the select and the Python rule ever
@@ -1082,6 +1233,9 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
     # skipped rows claimed before the tick started, and the per-row compare-and-swap
     # inside each apply catches a row the manual channel claimed since.
     claims = WiringRowClaims()
+    # Rows a reservation's failed upstream read left unchanged, across the three layers
+    # (issue #1204). Passing the set is what turns on the per-reservation catch.
+    upstream_skips: set[uuid.UUID] = set()
 
     async with get_db_session() as db:
         due = await due_failed_rows(db, batch, max_attempts)
@@ -1101,6 +1255,9 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
         # Rows the manual channel was already driving when this tick reached them
         # (issue #817): additive counter, the tick's view of a lost claim.
         "in_progress": 0,
+        # Rows left unchanged because an upstream read failed inside their
+        # reservation's layer apply (issue #1204); filled in after the three layers.
+        "skipped_upstream": 0,
         "skipped_frozen": 0,
         "skipped_not_retryable": 0,
         # FAILED, under-cap rows the three selects leave out (issue #1190); filled in
@@ -1192,10 +1349,12 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
 
     if to_retry:
         try:
-            outcomes = await _reattempt_rows(to_retry, get_db_session, claims)
+            outcomes = await _reattempt_rows(to_retry, get_db_session, claims, upstream_skips)
         except Exception:
-            # A TransientUpstreamError (or any resolve failure) must never wedge the
-            # loop: the rows stay FAILED and the next tick re-sweeps them.
+            # Anything the per-reservation catch does not take (it takes only a
+            # TransientUpstreamError raised inside one reservation's apply, issue #1204)
+            # must never wedge the loop: the rows stay FAILED and the next tick
+            # re-sweeps them.
             logger.warning(
                 "wiring retry tick: L1 reattempt failed; rows stay FAILED", exc_info=True
             )
@@ -1205,7 +1364,9 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
 
     if to_retry_l2:
         try:
-            outcomes_l2 = await _reattempt_l2_rows(to_retry_l2, get_db_session, claims)
+            outcomes_l2 = await _reattempt_l2_rows(
+                to_retry_l2, get_db_session, claims, upstream_skips
+            )
         except Exception:
             logger.warning(
                 "wiring retry tick: L2 reattempt failed; rows stay FAILED", exc_info=True
@@ -1216,7 +1377,9 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
 
     if to_retry_l3:
         try:
-            outcomes_l3 = await _reattempt_l3_rows(to_retry_l3, get_db_session, claims)
+            outcomes_l3 = await _reattempt_l3_rows(
+                to_retry_l3, get_db_session, claims, upstream_skips
+            )
         except Exception:
             logger.warning(
                 "wiring retry tick: L3 reattempt failed; rows stay FAILED", exc_info=True
@@ -1228,6 +1391,7 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
     stats["rows_retried"] = (
         stats["l1_rows_retried"] + stats["l2_rows_retried"] + stats["l3_rows_retried"]
     )
+    stats["skipped_upstream"] = len(upstream_skips)
 
     # INFO while there is anything to see: rows selected, or rows the selects exclude.
     # A stack whose ledgers hold only stale rows selects nothing, and must not go quiet.
