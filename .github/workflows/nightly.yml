@@ -19,11 +19,11 @@
 # Also runs the LDAP-mode stack coverage the master/everything gates run
 # (issue #572): infra/ldap-test boots alongside the stack, and after e2e the
 # stack's auth service is switched to LDAP mode, tests/integration/
-# test_ldap_auth.py and test_ldap_sync_admin.py run against it, and the
-# Postgres-live LDAP sync suites run against the stack's own Postgres, via
-# `make _gate-ldap-stack-tests` / `make _gate-pg-live-tests` (the same
-# internal targets master/everything use, see the Makefile's LDAP comment
-# block). Unlike those gates, this job never passes -p to `docker compose`
+# test_ldap_auth.py and test_ldap_sync_admin.py run against it, and every
+# Postgres-live suite (services/*/tests/*_live_pg.py) runs against the stack's
+# own Postgres, via `make _gate-ldap-stack-tests` / `make _gate-pg-live-tests`
+# (the same internal targets master/everything use, see the Makefile's LDAP
+# comment block). Unlike those gates, this job never passes -p to `docker compose`
 # (`docker compose build` / `up -d` above use the plain default project), so
 # COMPOSE_PROJECT_NAME is set explicitly to match: actions/checkout@v7 checks
 # this repository out into $GITHUB_WORKSPACE, which the runner sets to
@@ -116,7 +116,7 @@ jobs:
       - name: LDAP-mode stack tests
         run: make _gate-ldap-stack-tests COMPOSE_PROJECT_NAME=herd
 
-      - name: Postgres-live LDAP sync tests
+      - name: Postgres-live suites (every services/*/tests/*_live_pg.py)
         run: make _gate-pg-live-tests
 
       - name: Seed stack for load test

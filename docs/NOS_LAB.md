@@ -66,10 +66,11 @@ hand-repairing a stateful container.
 - `make nos-test-feature`, run the two via-stack suites against a running
   stack: attach, seed, run, always detach
 
-None of these run as part of `make test`, `make master`, or `make everything`;
-locally this phase is opt-in only, so a host that never runs it pays nothing
-for it. The two test targets DO run in GitHub Actions, on different
-schedules; see "Where these run" below.
+None of these run as part of `make test` or `make master`. `make everything`
+runs `make nos-test-dialect` as one of its phases (booting the lab if it is not
+already up); every other target here is opt-in locally. The two test targets
+also run in GitHub Actions, on different schedules; see "Where these run"
+below.
 
 ## Phase 3a: wiring the lab into a running HERD stack
 
@@ -164,10 +165,12 @@ leaked neighbouring prefix such as `192.0.2.40/30`. A syntactically malformed
   `l3_intent_malformed`) and never reaches execution or the driver.
 
 Needs BOTH the lab (`make nos-up`) and a running dev stack with the lab
-attached (`make up`, `make nos-attach`); it lives under `tests/nos_lab/`
-(never invoked by `make test`, `make master`, or `make everything`) rather
-than `tests/integration/` (which IS invoked by those, against an ephemeral
-gate stack the lab is never attached to). Same gating convention as the
+attached (`make up`, `make nos-attach`); it lives under `tests/nos_lab/` as a
+via-stack feature suite (no local gate runs it: `make everything` runs only
+that directory's dialect suites, and `make test` and `make master` run none of
+it) rather than under `tests/integration/` (which `make master` and `make
+everything` run against an ephemeral gate stack the lab is never attached to;
+`make test` does not run it). Same gating convention as the
 other lab-live tests: skips automatically when either precondition is
 missing, and `HERD_TEST_NOS_REQUIRED=1` turns a missing precondition into a
 hard failure. Run it with:

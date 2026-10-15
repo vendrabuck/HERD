@@ -8,7 +8,7 @@ Common failure modes and how to diagnose them. Organized by what the user sees.
 
 `config.json` has not been written to the `herd-config` volume, so the login page is gating behind the setup flow. Two fixes:
 
-- Put every required value in `.env` (see `.env.example`) and `make restart`. The config service's first-start auto-bootstrap will write `config.json` from the env on boot, and the login form will enable. If it does not, `docker compose logs config` carries a warning beginning `Config auto-bootstrap skipped;` that names the missing var or quotes the refusal of `AUTH_SECRET_KEY` or `AUTH_ALGORITHM` (the success line is logged at INFO, which the config service does not emit).
+- Put every required value in `.env` (see `.env.example`) and run `make up` (`make prod` on a production host), which recreates every container whose environment changed. `make restart` is not enough here: it runs `docker compose restart`, which restarts each container with the environment it was created with and never re-reads `.env`. The config service's first-start auto-bootstrap will write `config.json` from the env on boot, and the login form will enable. If it does not, `docker compose logs config` carries a warning beginning `Config auto-bootstrap skipped;` that names the missing var or quotes the refusal of `AUTH_SECRET_KEY` or `AUTH_ALGORITHM` (the success line is logged at INFO, which the config service does not emit).
 - Or click the wrench icon on the login page, log in with the config-page password (set `CONFIG_ADMIN_PASSWORD`, or read the generated password from `docker compose logs config`; it stays valid until you change it), fill in required settings, and click **Save and Restart**.
 
 See [OPERATIONS.md](OPERATIONS.md#config-service-first-run).
@@ -229,7 +229,7 @@ Fix: either uncheck **Apply device configs** in the commit dialog, or have an ad
 
 ### AI button is missing from the topology editor
 
-By design: when `AI_API_KEY` is blank, `GET /api/ai/status` returns `{"enabled": false}` and the frontend hides the **Use AI** button entirely. To re-enable the feature, set the key in `.env` or via the config UI and restart the ai-orchestrator container (`make restart`). You can check the current state by hitting `/api/ai/status` directly; it is unauthenticated.
+By design: when `AI_API_KEY` is blank, `GET /api/ai/status` returns `{"enabled": false}` and the frontend hides the **Use AI** button entirely. To re-enable the feature, set the key in `.env` and run `make up` (`make prod` on a production host), which recreates the ai-orchestrator container with the new environment (`make restart` only restarts containers with the environment they were created with, so it does not pick up a `.env` edit), or set it in the config UI and click **Save and Restart**. You can check the current state by hitting `/api/ai/status` directly; it is unauthenticated.
 
 ### `400` on `POST /generate` naming an uploaded file
 
@@ -275,9 +275,11 @@ refuses first, so a request does not reach the second wording.
 
 Fix: have the user shrink or re-create the file (a smaller or fewer set of files, a
 plain-text export in place of a rejected type, an archive without sparse members or
-oversized binaries), or, for the three settings, raise them in `.env` or the config UI and
-restart the ai-orchestrator container (`make restart`; the settings are listed in
-[ENV_VARS.md](ENV_VARS.md)). A raised `UPLOAD_MAX_FILE_BYTES` does not lift the fixed tgz
+oversized binaries), or, for the three settings, raise them in `.env` and run `make up`
+(`make prod` on a production host), which recreates the ai-orchestrator container with the
+new environment, or raise them in the config UI and click **Save and Restart** (the
+settings are listed in [ENV_VARS.md](ENV_VARS.md)). `make restart` does not pick up a `.env`
+edit: `docker compose restart` keeps each container's creation-time environment. A raised `UPLOAD_MAX_FILE_BYTES` does not lift the fixed tgz
 ceilings. The PDF reader has no
 memory bound of its own yet (issue #1202).
 

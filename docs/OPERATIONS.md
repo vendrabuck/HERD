@@ -18,7 +18,7 @@ make migrate       # run alembic upgrade head in every migratable service
 make migrate-<svc> # single-service migration
 ```
 
-`make clean` stops the stack and purges caches but KEEPS every Docker volume, so data survives. Every `down` variant (`down`, `clean`, `clean-data`, `gate-clean`) enables the `e2e` compose profile, so a Selenium container left by `make test-e2e` is stopped as well; a plain profile-less `down` would leave it running on host port 4444 and the next gate's e2e phase would fail at Selenium recreate before any test ran. The `make master` and `make everything` gates run in a separate `<dir>-gate` compose project and never touch the dev stack's volumes either. A successful `make everything` deliberately leaves that gate stack running and seeded (usable at `https://localhost` without re-seeding); `make gate-down` stops and purges it, after which `make up` restores the dev stack. A failed run tears the gate stack down itself. `make clean-data` is the destructive variant: it drops every dev-stack volume including Postgres data. Never run it on an environment you care about without a backup. `make master-clean` goes further still: it runs the internal `_clean-images` helper first, which deletes every HERD-tagged Docker image (dev and gate projects) and prunes dangling layers, then runs `master` with `--no-cache` so every image rebuilds from scratch; it does not touch unrelated images on the host.
+`make clean` stops the stack and purges caches but KEEPS every Docker volume, so data survives. Every `down` variant (`down`, `clean`, `clean-data`, `gate-clean`) enables the `e2e` compose profile, so a Selenium container left by `make test-e2e` is stopped as well; a plain profile-less `down` would leave it running on host port 4444 and the next gate's e2e phase would fail at Selenium recreate before any test ran. The `make master` and `make everything` gates run in a separate `<dir>-gate` compose project and never touch the dev stack's volumes either. A successful `make everything` deliberately leaves that gate stack running and seeded (usable at `https://localhost` without re-seeding); `make gate-down` stops and purges it, after which `make up` restores the dev stack. A failed run tears the gate stack down itself. Every gate run, pass or fail, leaves the dev stack stopped (its `gate-clean` step stops it before anything else runs), so after a failed gate `make up` alone restores the dev stack with its data. `make clean-data` is the destructive variant: it drops every dev-stack volume including Postgres data. Never run it on an environment you care about without a backup. `make master-clean` goes further still: it runs the internal `_clean-images` helper first, which deletes this checkout's compose images (those labelled with its dev project or its gate project) and prunes dangling layers, then runs `master` with both image builds forced to `--no-cache` (master-quick's dev-project build and the gate stack's own build), so every image rebuilds from scratch; it does not touch the test labs' images, other checkouts' images, or unrelated images on the host.
 
 ## Config-service first-run
 
@@ -58,14 +58,18 @@ The config login limits failed attempts. From a source address's third consecuti
 
 For new schema additions between HERD versions:
 
+On a production host (a stack started with `make prod`):
+
 ```bash
-git pull                         # get the new code
-make build                       # rebuild images with the new code
-docker compose up -d             # recreate containers onto the new images
-make migrate                     # alembic upgrade head for every service
+git pull                                   # get the new code
+make build                                 # rebuild images with the new code
+docker compose -f docker-compose.yml up -d # recreate containers onto the new images
+make migrate                               # alembic upgrade head for every service
 ```
 
-The order matters. `make migrate` execs into the running containers, and `make restart` (`docker compose restart`) never swaps a container onto a rebuilt image, so migrating or restarting before the `docker compose up -d` recreate would run the OLD image's migration files. Recreate first, then migrate: the exec then sees the new release's migrations.
+The recreate names `-f docker-compose.yml` because that is what `make prod` runs (`docker compose -f docker-compose.yml up --build -d`; `make prod` itself can replace the build and recreate lines). A bare `docker compose up -d` also merges `docker-compose.override.yml`, which would recreate a production stack in dev mode: code bind mounts and hot reload, `HERD_FAULT_INJECTION` on, and the dev `WEBHOOK_ALLOWED_HOSTS`. On a dev stack started with `make up`, use the bare `docker compose up -d` (or `make up`) for the recreate step instead.
+
+The order matters. `make migrate` execs into the running containers, and `make restart` (`docker compose restart`) never swaps a container onto a rebuilt image, so migrating or restarting before the recreate would run the OLD image's migration files. Recreate first, then migrate: the exec then sees the new release's migrations.
 
 Check `AUTH_SECRET_KEY` and `AUTH_ALGORITHM` when upgrading past the access-token settings validation: every service except config refuses to start while `AUTH_SECRET_KEY` is unset, blank, still a `<...>` placeholder, or not usable as an HMAC key, or while `AUTH_ALGORITHM` is anything but `HS256`, `HS384`, or `HS512`, and the log line names the variable. Fix the value in `.env`, or in the config UI if a configuration was saved there. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#services-crash-loop-on-startup).
 

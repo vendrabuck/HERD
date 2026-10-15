@@ -134,7 +134,10 @@ make test-reservations
 make test-cabling
 make test-acl
 make test-execution
+make test-secrets
+make test-integration-service  # the integration service's unit suite
 cd frontend && npm test  # frontend tests (vitest)
+make test-frontend-tz    # the same suite under TZ=America/Los_Angeles, as CI runs it a second time
 ```
 
 ### Coverage
@@ -155,7 +158,7 @@ make format             # ruff format + ruff check --fix
 ### Full validation
 
 ```bash
-make master             # full gate: deps, format, lint, unit, frontend, image build, live LDAP, ephemeral-stack contract + integration + e2e
+make master             # full gate: uv.lock check, deps, format, lint, unit, frontend, image build, live LDAP, ephemeral-stack contract + integration + e2e, LDAP-mode stack tests, Postgres-live suites
 ```
 
 ### Frontend dev server
@@ -191,7 +194,7 @@ On a fresh system, tables are auto-created by each service on startup; you do no
 For upgrading an existing database after schema changes:
 
 ```bash
-make migrate            # runs alembic upgrade head in all service containers
+make migrate            # runs alembic upgrade head in each of the eleven database services
 make migrate-auth       # single service
 make migrate-inventory
 make migrate-reservations
