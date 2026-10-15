@@ -539,10 +539,12 @@ Each phase is independently mergeable and independently useful.
    plus a reservation commit against that topology, proving the internal gate
    accepts it. Seeding trap (issue #629): these tests need an AVAILABLE
    inventory device, and both `make everything` and `nightly.yml` run e2e
-   BEFORE `make seed`, so a device-gated test skips silently in every automated
-   run. Until #629 lands, this phase's tests must be run explicitly against a
-   seeded stack and that run recorded as the phase's verification story; a
-   green gate is not evidence they executed.
+   BEFORE `make seed`, so a device-gated test skips silently in that first pass.
+   Issue #629 closed the trap: `make everything` and
+   `nightly.yml` now run a second e2e pass, `make test-e2e-seeded`, after the
+   seed, and it fails on any skip not marked `seeded_skip_ok`. Before that, this
+   phase's tests had to be run explicitly against a seeded stack and that run
+   recorded as the phase's verification story.
 
 ## Testing
 
@@ -589,7 +591,7 @@ All five QA levels, per the repo's conventions.
 - **E2E (Playwright, seeded stack)**: as phase 3 above, drop, attach two ports,
   save, reload, validate, and commit a reservation, each asserted by API
   read-back rather than UI acknowledgment, with any canvas mutation restored to
-  baseline. Run explicitly on a seeded stack (issue #629).
+  baseline. Needs a seeded stack, which `make test-e2e-seeded` provides (issue #629).
 
 ## Out of scope
 

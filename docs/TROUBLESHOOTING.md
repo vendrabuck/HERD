@@ -367,6 +367,16 @@ cabling is healthy, remove the definition by hand on each switch the line names,
 confirming no live reservation uses that VLAN number there. See
 [DRIVERS.md](DRIVERS.md#when-methods-are-called-1).
 
+An open defect (issue #1209) is the same leak without this line: when the switch read (inventory)
+or the driver session of a `delete_vlan` fails, the release pass stops at that allocation
+instead of continuing. The allocation in hand stays released with its `defined_switch_ids`
+untrimmed, so the VLAN definition may still be on the switch, and the allocations after it
+in the pass are not released and stay `ACTIVE` with no memberships. The background wiring
+retry logs this case, when it meets it, as `wiring_retry_superseded_release_upstream_failed`
+(see [OPERATIONS.md](OPERATIONS.md#log-inspection-recipes)), and nothing re-runs the release. After an
+inventory outage that overlapped a reservation ending, check by hand the switches of that
+reservation's VLAN allocations the same way.
+
 ### Wiring row `FAILED` with `driver load failed: <ClassName>`
 
 The switch's driver package could not be loaded when execution tried to apply the

@@ -1721,7 +1721,12 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
 
 ### Open defects
 
-None at this commit: #1039 is resolved by AI-CONV-13.
+- #1202 (AI-UPLOAD-5, AI-UPLOAD-13): the PDF text read (pdfplumber in `_extract_pdf`) has
+  no bound on what a PDF inflates to. A small upload whose content stream inflates to
+  hundreds of MiB is held in memory while the page walk runs; the per-file upload cap
+  bounds the compressed size only, and the tgz reader's ceilings do not apply to a PDF.
+
+(#1039 is resolved by AI-CONV-13.)
 
 ### Limits by decision
 
