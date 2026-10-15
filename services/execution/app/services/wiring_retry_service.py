@@ -94,9 +94,13 @@ the three `_reattempt_*` functions therefore catches TransientUpstreamError arou
 reservation's apply call (and, for L2, around its allocation re-resolution), logs one
 line with the fixed action `wiring_retry_reservation_upstream_failed` (reservation id,
 layer, exception class name only, never upstream text), and moves to the next
-reservation; the tick reports the rows left unchanged as `skipped_upstream`. Nothing
-wider than TransientUpstreamError is caught: any other exception still drops the layer
-for the tick (WIRE-RETRY-15). The catch never leaves a drive claim behind, because no
+reservation; the tick reports the rows left unchanged as `skipped_upstream`. One more
+call is caught the same way in tick mode: the L2 retry's release of the allocations its
+superseded rows left orphaned, which runs after the per-reservation loop and after the
+read-back and skip accounting (action `wiring_retry_superseded_release_upstream_failed`,
+class name only); the outcomes stand. Nothing wider than TransientUpstreamError is
+caught: any exception those catches do not take still drops the layer for the tick
+(WIRE-RETRY-15). The catch never leaves a drive claim behind, because no
 upstream read sits between a row's claim and its record in any layer's apply. Only the
 tick isolates: the manual channel passes no collector, so the error still propagates
 and the endpoint answers 503 (WIRE-RETRY-12), one reservation being all it drives.
@@ -148,6 +152,9 @@ logger = logging.getLogger(__name__)
 # The fixed log action for a reservation a retry tick passes over because an upstream
 # read failed inside its layer apply (issue #1204).
 RESERVATION_UPSTREAM_FAILED_ACTION = "wiring_retry_reservation_upstream_failed"
+# The fixed log action for an upstream read failing inside the L2 retry's release of
+# the allocations its superseded rows left orphaned (issue #1204 review).
+SUPERSEDED_RELEASE_UPSTREAM_FAILED_ACTION = "wiring_retry_superseded_release_upstream_failed"
 
 
 def _row_snapshot(rows) -> dict[uuid.UUID, tuple[str, int, str | None]]:
@@ -577,6 +584,12 @@ async def _reattempt_l2_rows(
     reservation's apply altogether, so none of its rows is re-parked with the
     no-allocation reason or driven this tick; the other reservations are applied. With
     `upstream_skips` None (the manual channel) the error propagates (503).
+
+    The superseded rows' allocation release runs last, after the read-back and the
+    skip accounting. In tick mode a TransientUpstreamError from it (a delete_vlan switch
+    read) is logged with the action `wiring_retry_superseded_release_upstream_failed`
+    and the class name only, and the outcomes are still returned; on the manual channel
+    it propagates (503).
     """
     from app.models.vlan_assignment import VlanAssignment
     from app.services.l2_membership_service import record_l2_failed, release_l2_membership
@@ -785,36 +798,64 @@ async def _reattempt_l2_rows(
                     raise
                 # Issue #1204: this reservation only; the next one is still applied.
                 upstream_failed[res_str] = type(exc).__name__
+
+        # The read-back and the per-reservation skips are settled BEFORE the superseded
+        # rows' allocation cleanup below, so nothing that cleanup does can discard them
+        # (issue #1204 review): every membership row already holds its recorded state,
+        # and the cleanup touches allocations only, never a membership row.
+        async with get_db_session() as db:
+            refreshed = (
+                (
+                    await db.execute(
+                        select(L2PortAssignment).where(L2PortAssignment.id.in_(retry_ids))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        by_id = {r.id: r for r in refreshed}
+
+        outcomes: list[dict] = []
+        for rid in retry_ids:
+            row = by_id.get(rid)
+            if row is None:
+                continue
+            if rid in superseded_ids:
+                outcome = "superseded"
+            elif row.status == "ACTIVE":
+                outcome = "reconnected"
+            elif row.status == "RELEASED":
+                outcome = "released"
+            elif rid in claims.lost:
+                # The other channel claimed this row before our driver call (issue #817).
+                outcome = "in_progress"
+            else:
+                outcome = "still_failed"
+            outcomes.append(_l2_outcome(row, outcome, vlan_by_va.get(row.vlan_assignment_id)))
+        if upstream_skips is not None:
+            _record_upstream_skips("l2", upstream_failed, snapshot, by_id, claims, upstream_skips)
+
         if superseded_va_ids:
-            await _release_orphaned_allocations(superseded_va_ids, get_db_session, ctx)
-
-    async with get_db_session() as db:
-        refreshed = (
-            (await db.execute(select(L2PortAssignment).where(L2PortAssignment.id.in_(retry_ids))))
-            .scalars()
-            .all()
-        )
-    by_id = {r.id: r for r in refreshed}
-
-    outcomes: list[dict] = []
-    for rid in retry_ids:
-        row = by_id.get(rid)
-        if row is None:
-            continue
-        if rid in superseded_ids:
-            outcome = "superseded"
-        elif row.status == "ACTIVE":
-            outcome = "reconnected"
-        elif row.status == "RELEASED":
-            outcome = "released"
-        elif rid in claims.lost:
-            # The other channel claimed this row before our driver call (issue #817).
-            outcome = "in_progress"
-        else:
-            outcome = "still_failed"
-        outcomes.append(_l2_outcome(row, outcome, vlan_by_va.get(row.vlan_assignment_id)))
-    if upstream_skips is not None:
-        _record_upstream_skips("l2", upstream_failed, snapshot, by_id, claims, upstream_skips)
+            try:
+                await _release_orphaned_allocations(superseded_va_ids, get_db_session, ctx)
+            except TransientUpstreamError as exc:
+                if upstream_skips is None:
+                    raise
+                # Tick mode: the rows' outcomes stand. An upstream read inside the
+                # cleanup (a delete_vlan switch read) stops the cleanup's remaining
+                # allocations for this tick; they are not re-driven by a later tick.
+                logger.warning(
+                    "wiring retry tick: an upstream read failed while releasing the "
+                    "allocations of superseded L2 rows (%s); the row outcomes stand, "
+                    "allocations the release had not reached stay as they are",
+                    type(exc).__name__,
+                    extra={
+                        "action": SUPERSEDED_RELEASE_UPSTREAM_FAILED_ACTION,
+                        "layer": "l2",
+                        "error_class": type(exc).__name__,
+                        "allocation_count": len(superseded_va_ids),
+                    },
+                )
     return outcomes
 
 
@@ -1211,8 +1252,10 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
     manual channel holds) is counted in `rows_retried` and its outcome instead.
     `skipped_upstream` (issue #1204) counts the rows, across the three layers, that a
     reservation's failed upstream read left unchanged (a subset of `still_failed`, so
-    also of `rows_retried`). A build row passed over because its intent read failed is
-    not counted there, unless its reservation's apply then failed too. The
+    also of `rows_retried`, unless an exception no catch takes then drops that layer's
+    outcomes, which leaves the rows already counted here). A build row passed over
+    because its intent read failed is not counted there, unless its reservation's apply
+    then failed too. The
     selects apply the same two rules, so `skipped_frozen` now counts only a build row
     whose reservation was frozen between the select and the check below, and
     `skipped_not_retryable` stays 0 unless the select and the Python rule ever
@@ -1351,10 +1394,10 @@ async def run_wiring_retry_tick(get_db_session) -> dict:
         try:
             outcomes = await _reattempt_rows(to_retry, get_db_session, claims, upstream_skips)
         except Exception:
-            # Anything the per-reservation catch does not take (it takes only a
-            # TransientUpstreamError raised inside one reservation's apply, issue #1204)
-            # must never wedge the loop: the rows stay FAILED and the next tick
-            # re-sweeps them.
+            # Anything the per-reservation catches do not take (they take only a
+            # TransientUpstreamError raised inside one reservation's apply, or in L2's
+            # superseded allocation release, issue #1204) must never wedge the loop: the
+            # rows stay FAILED and the next tick re-sweeps them.
             logger.warning(
                 "wiring retry tick: L1 reattempt failed; rows stay FAILED", exc_info=True
             )
