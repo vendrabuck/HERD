@@ -22,8 +22,8 @@ wording. A driver's dialect handling is invisible to the mocks and, until
 now, exercised only by hand against `drivers/frr_mgmt`'s one FRRouting
 target (`docs/MANUAL_TESTING.md` case M1) or against real hardware.
 
-This lab gives every developer and CI (once wired in; it is opt-in for now,
-see below) two real, differently-shaped network operating systems to drive:
+This lab gives every developer and CI (wired in: the dialect tier runs on every
+pull request and in `make everything`, the feature tier nightly; see below) two real, differently-shaped network operating systems to drive:
 one Cisco-dialect Layer 3 router and one Nokia-dialect Layer 2 switch. It
 exists apart from the external `network-simulator` project referenced in
 ADR 0010: that project needs its own Proxmox host and is not reboot-persistent,

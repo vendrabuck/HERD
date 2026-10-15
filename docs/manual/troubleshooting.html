@@ -53,7 +53,7 @@
     <p class="sectitle">Login problems</p>
 
     <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">The login fields are greyed out, with a "not configured" banner</span></summary>
-      <div class="acc-body"><p>This is an <strong>admin/install</strong> issue, not yours: the platform's first-run config hasn't been written. You can't log in until it is. Send the admin to <a href="admin-setup.html">first-day setup</a> &mdash; they either populate the required values and restart, or use the wrench icon on the login page to finish setup. Then reload.</p></div></details>
+      <div class="acc-body"><p>This is an <strong>admin/install</strong> issue, not yours: the platform's first-run config hasn't been written. You can't log in until it is. Send the admin to <a href="admin-setup.html">first-day setup</a> &mdash; they either populate the required values in the environment file and bring the stack up again with make up (a plain restart does not re-read it), or use the wrench icon on the login page to finish setup. Then reload.</p></div></details>
 
     <details class="accordion"><summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">The Register button is disabled</span></summary>
       <div class="acc-body"><p>Your company runs HERD against its corporate directory (LDAP/AD), so self-registration is off. You don't need it &mdash; just <strong>sign in with your directory username and password</strong>; your account is created automatically on first login.</p></div></details>

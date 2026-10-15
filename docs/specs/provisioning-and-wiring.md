@@ -1375,6 +1375,18 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
   the retry tick leaves it out, a manual retry reports it `not_retryable`, and a fork
   re-save needs an ACTIVE reservation. The connection it describes may still be live on
   the hardware.
+- #1203 (WIRE-ORDER-11): execution reads any inventory answer below 500 other than 200
+  as "not found" for a switch or its template, so a 401 or 403 (an `INTERNAL_API_TOKEN`
+  rotation window is one cause) pins an existing switch's rows with a
+  `recorded hop unresolvable: switch <id> not found` reason, which is not retryable, with
+  no attempt counted. The reason then reads as if the switch were gone from inventory.
+- #1209 (WIRE-VLAN-11): a `TransientUpstreamError` from the switch read or driver session
+  of a `delete_vlan` in the release pass is not caught per allocation. The exception
+  leaves the allocation in hand released with its `defined_switch_ids` untrimmed (the
+  definition may still be on the switch) and leaves every later orphaned allocation in
+  the set unreleased and ACTIVE with no memberships; the retry path does not select the
+  already-released superseded rows again, so nothing finishes the job. The fabric lookup
+  failure (`vlan_delete_unjudged`) is the part that is caught.
 
 ### Limits by decision
 
