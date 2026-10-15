@@ -1019,13 +1019,16 @@ _gate-pg-live-tests:
 # before this phase existed.
 # Deliberately calls neither `$(MAKE) ldap-up` nor `$(MAKE) ldap-down` (unlike
 # _gate-ldap-tests above): a recipe line containing a literal $(MAKE) reference
-# is executed for real even under `make -n` (GNU Make's documented escape
-# hatch for accurate recursive dry-run reporting), and this recipe already
-# mixes in real docker network/compose mutation, so keeping it $(MAKE)-free
-# keeps `make -n master` / `make -n everything` (and `make -n
-# _gate-ldap-stack-tests` on its own) genuine dry runs that print without
-# touching any container. It inlines the same $(LDAP_COMPOSE) commands
-# ldap-up/ldap-down wrap instead.
+# is executed even under `make -n` (GNU Make's documented escape hatch for
+# accurate recursive dry-run reporting: the sub-make inherits -n and only
+# prints, but every other command on that shell line runs for real), and this
+# recipe mixes in real docker network/compose mutation. It inlines the same
+# $(LDAP_COMPOSE) commands ldap-up/ldap-down wrap instead, which keeps `make -n
+# _gate-ldap-stack-tests` a genuine dry run that prints without touching any
+# container; `make -n _gate-pg-live-tests` is one for the same reason. The
+# gates are NOT dry-run safe: the master and everything recipes hold `$(MAKE)`
+# lines of their own (the line that starts and stops the gate stack among
+# them), so never `make -n master` or `make -n everything`.
 #
 # Also deliberately uses BARE `docker compose` throughout (never
 # $(GATE_COMPOSE)'s explicit -p), so this target works against whichever
