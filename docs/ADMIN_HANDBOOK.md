@@ -265,10 +265,10 @@ Admins manage named secrets in the secrets service; values are encrypted at rest
 
 The AI feature is opt-in and gated by `ai_is_configured()`:
 
-- For the default `AI_PROVIDER=anthropic`, either `AI_API_KEY` (hosted API) or `AI_BASE_URL` (a local Anthropic-compatible endpoint, e.g. vLLM) being set is enough. For `AI_PROVIDER=openai_compat`, `AI_BASE_URL` must be set. Set the relevant variable(s) in `.env` (or via the config UI's AI Integration section) and `make restart`. The frontend checks `GET /api/ai/status` on load, so the **Use AI** button appears on the topology editor only when the provider is configured.
+- For the default `AI_PROVIDER=anthropic`, either `AI_API_KEY` (hosted API) or `AI_BASE_URL` (a local Anthropic-compatible endpoint, e.g. vLLM) being set is enough. For `AI_PROVIDER=openai_compat`, `AI_BASE_URL` must be set. Set the relevant variable(s) in `.env` and run `make up` (`make prod` on a production host), which recreates the containers whose environment changed, or set them in the config UI's AI Integration section and click **Save and Restart**. `make restart` is not enough after a `.env` edit: `docker compose restart` keeps each container's creation-time environment. The frontend checks `GET /api/ai/status` on load, so the **Use AI** button appears on the topology editor only when the provider is configured.
 - Optional `AI_MODEL` (default `claude-sonnet-4-6`) lets you bias for quality (`claude-opus-4-7`) or cost (`claude-haiku-4-5`).
-- To turn the feature off cleanly, blank the relevant variable(s) and `make restart`; users will see the button disappear on reload.
-- `/api/ai/status` is unauthenticated by design (no secret content) so the frontend can decide whether to render the button before any user logs in. It returns `{enabled, provider, model, recipe_authoring, degraded, reason}`.
+- To turn the feature off cleanly, blank the relevant variable(s) the same way (`make up` or `make prod` after a `.env` edit, **Save and Restart** in the config UI); users will see the button disappear on reload.
+- `/api/ai/status` is unauthenticated by design (no secret content) so the frontend can decide whether to render the button before any user logs in. It returns `{enabled, provider, model, recipe_authoring, purpose_classification, degraded, reason}`.
 
 See [AI_GENERATE.md](AI_GENERATE.md) for the user-facing flow and [TROUBLESHOOTING.md](TROUBLESHOOTING.md#ai-topology-generation) for failure modes.
 

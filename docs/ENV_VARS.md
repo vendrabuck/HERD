@@ -26,7 +26,7 @@ Upgrading from a version without the marker: an existing `config.json` with no `
 
 On the very first `make up`, the config service writes `/data/herd-config/config.json` automatically from the process environment when every required variable below is present and non-empty. That file is what gates the login page, so a complete `.env` now unlocks login without visiting the config UI. If any required var is missing the config service logs a warning listing them, skips the bootstrap, and the login page keeps directing you to the wrench icon.
 
-The config page's own login password is set by `CONFIG_ADMIN_PASSWORD`. When you set it (in `.env` or the environment), that is the config-UI password and the config write surface is unlocked immediately. When it is unset, the config service generates a random password on first boot and logs it once at WARNING (read it from `make logs config` or the container logs); the write and apply endpoints stay locked with HTTP 403 until you log in and change the password. The logged password stays a valid config login until it is changed, so anyone who can read the config container's log (or a log shipper that collects it) can sign in to the config page with it: set `CONFIG_ADMIN_PASSWORD`, or change the generated password promptly, and treat that log as sensitive until you do. There is no longer a hardcoded default password. The related `CONFIG_SESSION_SECRET` pins the config session-token signing key across replicas; when unset, a random per-process key is used.
+The config page's own login password is set by `CONFIG_ADMIN_PASSWORD`. When you set it (in `.env` or the environment), that is the config-UI password and the config write surface is unlocked immediately. When it is unset, the config service generates a random password on first boot and logs it once at WARNING (read it with `docker compose logs config`); the write and apply endpoints stay locked with HTTP 403 until you log in and change the password. The logged password stays a valid config login until it is changed, so anyone who can read the config container's log (or a log shipper that collects it) can sign in to the config page with it: set `CONFIG_ADMIN_PASSWORD`, or change the generated password promptly, and treat that log as sensitive until you do. There is no longer a hardcoded default password. The related `CONFIG_SESSION_SECRET` pins the config session-token signing key across replicas; when unset, a random per-process key is used.
 
 ## Config editor populates from env
 
@@ -423,8 +423,8 @@ schema and never appear in `config.json` or the config editor.
 
 Both variables degrade without error when git is missing or the checkout is not a
 repository: `HERD_BUILD` falls back to the literal `dev` and `HERD_BUILD_DATE` to an
-empty string, and a build with no args given still succeeds. `make version` (alias
-`make build-info`) prints what the Makefile computed without building anything. A value
+empty string, and a build with no args given still succeeds. `make version` prints
+what the Makefile computed without building anything. A value
 already present in the environment (set by CI or a release script) is used as-is and
 skips the git calls; the Makefile guards the computation with `$(origin ...)`, not a
 plain `?=` default, specifically so an exported value always wins. A bare `docker compose build`

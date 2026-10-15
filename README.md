@@ -148,7 +148,7 @@ make up        # dev mode: hot-reload + volume mounts
 
 # Open https://localhost, click the wrench icon on the login page,
 # log in with the config password (set CONFIG_ADMIN_PASSWORD, or read the
-# one-time password from `make logs config`), change it, fill out all
+# one-time password from `docker compose logs config`), change it, fill out all
 # required fields, and click "Save and Restart".
 ```
 
@@ -200,13 +200,15 @@ make down            # Stop full stack
 make build           # Rebuild all images
 make test            # Run all backend tests (13 services)
 make test-frontend   # Run frontend tests (vitest)
+make test-frontend-tz # Run frontend tests under TZ=America/Los_Angeles (CI's second run)
 make test-e2e        # Run E2E browser tests (Selenium + Playwright, requires running stack)
 make coverage        # Run all backend tests with coverage report
 make lint            # ruff check + eslint
 make format          # ruff format + ruff check --fix
-make master          # Full validation: lint + unit + frontend + build + live LDAP + ephemeral stack + integration + e2e + LDAP-mode stack tests + the fifteen Postgres-live suites (no coverage)
-make master-clean    # Same as master, but wipes herd-* images first and forces a no-cache rebuild
-make everything      # Same surface as master plus: format-check (no mutate), backend + frontend coverage, the NOS lab dialect tests, seed, headless locust load; on success the seeded gate stack is left running (make gate-down to stop)
+make master          # Full validation: uv.lock check + format + lint + unit + frontend + build + live LDAP + ephemeral stack + contract + integration + e2e + LDAP-mode stack tests + the fifteen Postgres-live suites (no coverage)
+make master-clean    # Same as master, but removes this checkout's dev and gate images first and rebuilds both with no cache
+make everything      # Same surface as master plus: format-check (no mutate), backend + frontend coverage, the CI checks master skips (vitest under America/Los_Angeles, package-lock sync, image versus uv.lock), the NOS lab dialect tests, seed, a seeded e2e pass, headless locust load; on success the seeded gate stack is left running (make gate-down to stop)
+make check-image-lock # Check the built ai-orchestrator image installs exactly what uv.lock pins
 make migrate         # Run Alembic migrations
 make logs            # Tail logs
 make frontend-dev    # Run frontend dev server
@@ -507,9 +509,12 @@ make test-config
 make test-ai-orchestrator
 make test-user-profile
 make test-notifications
+make test-secrets
+make test-integration-service  # the integration service's unit suite (make test-integration is the cross-service suite)
 
 # Frontend tests (vitest + testing-library + MSW)
 cd frontend && npm test
+make test-frontend-tz    # the same suite under TZ=America/Los_Angeles, as CI runs it a second time
 
 # Coverage
 make coverage            # all backend services with terminal report

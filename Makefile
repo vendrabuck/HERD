@@ -10,9 +10,10 @@ DB_SERVICES := auth inventory reservations cabling acl execution user-profile no
 # workspace ruff config's default discovery and lint/format must target it
 # explicitly. Add new repo-root packages or scripts here so they are linted and
 # format-checked locally and in CI. Today this is the seedtools seeding package
-# (issue #791), the CI image-vs-lock guard script (issue #593), and the AI
-# generate evaluation harness (tests/ai_eval/; the rest of tests/ is not
-# covered by make lint or CI's ruff steps).
+# (issue #791), the CI image-vs-lock guard script (issue #593), the AI generate
+# evaluation harness (tests/ai_eval/), and the repo-root unit tests
+# (tests/unit/); the rest of tests/ is not covered by make lint or CI's ruff
+# steps.
 ROOT_PY := seedtools/ scripts/check_image_matches_lock.py tests/ai_eval/ tests/unit/
 
 # The ephemeral master/everything gate stack runs in its OWN compose project so
@@ -83,7 +84,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	$(addprefix coverage-,$(SERVICES)) \
 	$(addprefix migrate-,$(DB_SERVICES)) \
 	$(addprefix shell-,$(DB_SERVICES)) \
-	test-frontend test-integration test-integration-service test-contract test-load test-load-ui test-e2e test-e2e-seeded test-e2e-stop test-auth-ldap ai-eval \
+	test-frontend test-frontend-tz check-image-lock test-integration test-integration-service test-contract test-load test-load-ui test-e2e test-e2e-seeded test-e2e-stop test-auth-ldap ai-eval \
 	test-root coverage-parallel coverage-frontend \
 	install frontend-install frontend-dev lint format clean clean-data gate-clean gate-down seed seed-frr seed-nos \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset _gate-ldap-tests \
@@ -110,7 +111,7 @@ help:  ## Show this help (the default target)
 		/^[a-zA-Z0-9_-]+:.*## / {printf "  %-22s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@echo ""
 	@echo "Per-service targets (one per name in SERVICES / DB_SERVICES):"
-	@echo "  test-<svc>      run one service's unit suite"
+	@echo "  test-<svc>      run one service's unit suite (integration: test-integration-service)"
 	@echo "  coverage-<svc>  run one service's suite under coverage (html)"
 	@echo "  migrate-<svc>   alembic upgrade head in one DB service"
 	@echo "  shell-<svc>     open a bash shell in one DB service container"
@@ -150,8 +151,16 @@ audit:  ## Audit Python and frontend deps for known vulnerabilities
 # master-quick is the fast iteration target: lint + unit tests + frontend + build.
 # master is the full "one command validates everything" pipeline and brings up
 # an ephemeral stack for integration + e2e before tearing it back down.
+#
+# `uv lock --check` runs BEFORE `uv sync`, as in ci.yml's backend job: without
+# --locked, `uv sync` rewrites a stale uv.lock in place, so the drift CI fails
+# on would otherwise be repaired silently in the working tree and the gate would
+# go green. tests/unit/test_gate_ci_parity_wiring.py pins the order.
 
-master-quick:  ## Fast gate: format + lint + unit + frontend + build
+master-quick:  ## Fast gate: lock check + format + lint + unit + frontend + build
+	@echo ""
+	@echo "=== Checking uv.lock is in sync (fails instead of rewriting it) ==="
+	uv lock --check
 	@echo ""
 	@echo "=== Installing Python dependencies ==="
 	uv sync --all-extras
@@ -186,7 +195,7 @@ master-quick:  ## Fast gate: format + lint + unit + frontend + build
 	@echo ""
 	@echo "=== master-quick complete ==="
 
-master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + ephemeral stack contract/integration/e2e
+master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + gate stack contract/integration/e2e + LDAP-mode stack + Postgres-live suites
 	@echo ""
 	@echo "=== Live LDAP auth tests ==="
 	$(MAKE) _gate-ldap-tests
@@ -204,28 +213,40 @@ master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + epheme
 		$(MAKE) test-e2e COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== LDAP-mode stack tests (gate auth switched to LDAP) ===" && \
 		$(MAKE) _gate-ldap-stack-tests COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
-		echo "" && echo "=== Postgres-live LDAP sync tests ===" && \
+		echo "" && echo "=== Postgres-live suites (every services/*/tests/*_live_pg.py, real Postgres) ===" && \
 		$(MAKE) _gate-pg-live-tests
 	@echo ""
 	@echo "=== master complete ==="
 
 # -- Master (clean-image variant) ---------------------------------------------
 #
-# Same as `make master` but first removes every Docker image that belongs to
-# this compose project and forces `docker compose build --no-cache` so no
-# BuildKit layer cache is reused. Unrelated Docker images and unrelated build
-# cache on the machine are untouched.
+# Same as `make master` but first removes this checkout's dev and gate compose
+# images, then builds both image sets with `--no-cache` so no BuildKit layer
+# cache is reused: master-quick's dev-project `docker compose build` through
+# BUILD_NO_CACHE=1, and the gate stack's own images through GATE_NO_CACHE=1
+# (_master-stack-up runs `$(GATE_COMPOSE) build --no-cache` before its
+# `up -d --build`, which then finds every layer fresh). Unrelated Docker images
+# and unrelated build cache on the machine are untouched.
 
-# Removes every HERD-tagged Docker image (dev and gate compose projects) and
-# prunes dangling layers, so the next `make up` or `make build` rebuilds from
-# scratch. Internal helper for master-clean; unrelated images on the host are
-# left untouched.
+# Removes this checkout's compose images and prunes dangling layers, so the
+# next `make up` or `make build` rebuilds from scratch. Images are selected by
+# the `com.docker.compose.project` label compose stamps on every image it
+# builds, once for the dev project (COMPOSE_PROJECT_NAME, else DEV_PROJECT, the
+# same resolution the `down` above uses) and once for the gate project. A name
+# pattern was used before and was both too wide and too narrow: `herd-*` also
+# matched the NOS lab's built image (`herd-nos-test-frr`, project
+# herd-nos-test) and every other checkout's images, and missed a checkout whose
+# directory name does not start with "herd". Internal helper for
+# master-clean; the test labs, other checkouts' images, and unrelated images on
+# the host are left untouched.
 _clean-images:
 	@echo ""
 	@echo "=== Removing HERD compose images ==="
 	-docker compose --profile e2e down --remove-orphans
 	-$(GATE_COMPOSE) --profile e2e down -v --remove-orphans
-	@ids=$$(docker images --filter "reference=herd-*" --filter "reference=$(GATE_PROJECT)-*" -q | sort -u); \
+	@dev=$${COMPOSE_PROJECT_NAME:-$(DEV_PROJECT)}; \
+		ids=$$( (docker images -q --filter "label=com.docker.compose.project=$$dev"; \
+			docker images -q --filter "label=com.docker.compose.project=$(GATE_PROJECT)") | sort -u); \
 		if [ -n "$$ids" ]; then \
 			echo "$$ids" | xargs -r docker rmi -f; \
 		else \
@@ -235,14 +256,20 @@ _clean-images:
 	@echo "=== Pruning dangling images ==="
 	-docker image prune -f
 
-master-clean: _clean-images  ## master with all HERD compose images rebuilt --no-cache
-	@BUILD_NO_CACHE=1 $(MAKE) master
+master-clean: _clean-images  ## master with this checkout's dev and gate images rebuilt --no-cache
+	@BUILD_NO_CACHE=1 GATE_NO_CACHE=1 $(MAKE) master
 
 # -- Everything (full prod-grade gate: master + coverage + stress + fail-on-dirty) --
 #
 # Differences from `master`:
 #   - `ruff format --check` instead of `ruff format` (no source mutation).
 #   - Runs backend and frontend tests under coverage (master skips coverage).
+#   - Runs the ci.yml checks master does not (tests/unit/test_gate_ci_parity_wiring.py
+#     pins each one): `uv lock --check` before `uv sync` (master-quick has that
+#     one too), a second frontend run under TZ=America/Los_Angeles
+#     (test-frontend-tz), the package-lock.json sync check after the frontend
+#     build, and the image-versus-lock check on the freshly built
+#     ai-orchestrator image (check-image-lock).
 #   - After seeding the gate stack, re-runs e2e via test-e2e-seeded (issue #629):
 #     the first e2e pass above runs against an unseeded stack, so tests gated on
 #     an available device always skip there; this second pass runs the same
@@ -261,7 +288,10 @@ master-clean: _clean-images  ## master with all HERD compose images rebuilt --no
 # way); only the load-test tail is skipped.
 EVERYTHING_LOAD ?= 1
 
-everything: gate-clean  ## Closest-to-CI gate: master + coverage + format-check + load tests
+everything: gate-clean  ## Full gate: CI checks + coverage + live LDAP + NOS dialect + stack phases + seed + seeded e2e + load; leaves the seeded gate stack up
+	@echo ""
+	@echo "=== Checking uv.lock is in sync (fails instead of rewriting it) ==="
+	uv lock --check
 	@echo ""
 	@echo "=== Installing Python dependencies ==="
 	uv sync --all-extras
@@ -290,11 +320,20 @@ everything: gate-clean  ## Closest-to-CI gate: master + coverage + format-check 
 	@echo "=== Frontend tests with coverage ==="
 	$(MAKE) coverage-frontend
 	@echo ""
+	@echo "=== Frontend tests in a non-UTC time zone ==="
+	$(MAKE) test-frontend-tz
+	@echo ""
 	@echo "=== Building frontend ==="
 	cd frontend && npm run build
 	@echo ""
+	@echo "=== Checking package-lock.json is in sync ==="
+	cd frontend && npm install && git diff --exit-code -- package-lock.json
+	@echo ""
 	@echo "=== Building Docker images ==="
 	docker compose build
+	@echo ""
+	@echo "=== Checking the ai-orchestrator image matches uv.lock ==="
+	$(MAKE) check-image-lock
 	@echo ""
 	@echo "=== Starting ephemeral stack for integration + e2e + load ==="
 	@ok=0; trap 'if [ "$$ok" != 1 ]; then $(MAKE) _master-stack-down; fi' EXIT INT TERM; \
@@ -308,7 +347,7 @@ everything: gate-clean  ## Closest-to-CI gate: master + coverage + format-check 
 		$(MAKE) test-e2e COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== LDAP-mode stack tests (gate auth switched to LDAP) ===" && \
 		$(MAKE) _gate-ldap-stack-tests COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
-		echo "" && echo "=== Postgres-live LDAP sync tests ===" && \
+		echo "" && echo "=== Postgres-live suites (every services/*/tests/*_live_pg.py, real Postgres) ===" && \
 		$(MAKE) _gate-pg-live-tests && \
 		echo "" && echo "=== Seeding gate stack ===" && \
 		$(MAKE) _everything-seed && \
@@ -328,6 +367,38 @@ everything: gate-clean  ## Closest-to-CI gate: master + coverage + format-check 
 
 everything-noload:  ## everything minus the load-test tail (stack still seeded and left up)
 	$(MAKE) everything EVERYTHING_LOAD=0
+
+# Public name for stopping a gate stack that a successful `make everything`
+# left running (master always tears its stack down itself). After gate-down,
+# `make up` restores the dev stack with its data. Every gate run, pass or
+# fail, leaves the dev stack stopped (gate-clean stops it first), so `make up`
+# is the way back after a failed gate too.
+gate-down: _master-stack-down  ## Stop and purge the gate stack an `everything` run left up
+
+# Image-versus-lock check (issue #593), the same shape as ci.yml's backend
+# job steps "Build representative image (ai-orchestrator)" and "Assert image
+# matches uv.lock": diff the ai-orchestrator image's installed packages against
+# the lock export its Dockerfile installs from. It reads the image this
+# checkout's `docker compose build` tagged (the name comes from `docker compose
+# config --images`, so it follows COMPOSE_PROJECT_NAME the way the build did;
+# the grep drops the dependency images config also lists) and runs it once as
+# a throwaway container with no stack, network, or volume. ci.yml builds the
+# image with a plain `docker build`; the Dockerfile and build context are the
+# same.
+check-image-lock:  ## Check the built ai-orchestrator image installs exactly what uv.lock pins (run make build first)
+	@img=$$(docker compose config --images ai-orchestrator 2>/dev/null | grep -e '-ai-orchestrator$$' | head -1); \
+		echo "Image: $${img:-none found, run make build first}"; \
+		tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+		[ -n "$$img" ] && \
+		uv export --frozen --package herd-ai-orchestrator --no-hashes \
+			--no-emit-workspace --no-default-groups --no-header --no-annotate \
+			> "$$tmp/lock-export.txt" && \
+		docker run --rm "$$img" pip list --format=freeze > "$$tmp/image-installed.txt" && \
+		uv run python scripts/check_image_matches_lock.py \
+			"$$tmp/lock-export.txt" "$$tmp/image-installed.txt" \
+			--allow herd-ai-orchestrator --allow herd-common --allow pip
+
+## --- Seeding ---
 
 # Seeds the running stack via the seedtools package (issue #791): users, drivers,
 # templates, devices, ports, L1/L2 switches, cabling, device/user groups, 6
@@ -365,7 +436,12 @@ seed-frr:  ## Seed a running stack with the FRR live-config demo (the two slice1
 seed-nos:  ## Seed a running stack with the NOS test lab (real SR Linux + FRR lab nodes)
 	uv run python -m seedtools nos
 
+# -- Gate stack helpers (internal, used by master, everything, and gate-down) --
+
+# GATE_NO_CACHE=1 (set by master-clean) builds the gate project's images with
+# --no-cache first; `up --build` then reuses those fresh layers.
 _master-stack-up:
+	@if [ "$$GATE_NO_CACHE" = "1" ]; then $(GATE_COMPOSE) build --no-cache; fi
 	$(GATE_COMPOSE) up -d --build
 
 _master-wait-healthy:
@@ -385,11 +461,6 @@ _master-stack-down:
 	@echo "=== Tearing down ephemeral gate stack ==="
 	-$(MAKE) test-e2e-stop COMPOSE_PROJECT_NAME=$(GATE_PROJECT)
 	-$(GATE_COMPOSE) --profile e2e down -v --remove-orphans
-
-# Public name for stopping a gate stack that a successful `make everything`
-# left running (master always tears its stack down itself). After gate-down,
-# `make up` restores the dev stack with its data.
-gate-down: _master-stack-down  ## Stop and purge the gate stack an `everything` run left up
 
 ## --- Docker Compose ---
 
@@ -471,6 +542,14 @@ test-integration-service:  ## Run the integration service's unit suite (test-<sv
 test-frontend:  ## Run the frontend vitest suite
 	cd frontend && npm test
 
+# ci.yml's frontend job runs vitest twice: under the runner's UTC clock and
+# under America/Los_Angeles, a zone with daylight saving time (issue #1185,
+# pinned by tests/unit/test_ci_frontend_tz_wiring.py). This is the second run,
+# the same command with TZ set on it; `make everything` runs it beside
+# coverage-frontend, which runs under the host's own zone.
+test-frontend-tz:  ## Run the frontend vitest suite under TZ=America/Los_Angeles (as ci.yml does)
+	cd frontend && TZ=America/Los_Angeles npm test
+
 test-integration:  ## Run cross-service integration tests (needs a running stack)
 	uv run pytest tests/integration/ -v --timeout=30 -x
 
@@ -547,6 +626,8 @@ _collect-stack-diagnostics:
 		docker compose logs --no-color --timestamps "$$svc" > "$(DIAG_DIR)/logs-$$svc.txt" || true; \
 	done
 
+## --- Test labs (LDAP, NOS) ---
+
 # -- LDAP test server (infra/ldap-test) ---------------------------------------
 #
 # A checked-in osixia/openldap compose file under infra/ldap-test seeds the
@@ -582,12 +663,12 @@ _collect-stack-diagnostics:
 #   deliberately never calls $(MAKE) (see the target's own comment) so
 #   `make -n` stays a genuine dry run.
 #
-#   _gate-pg-live-tests runs right after it: the Postgres-live LDAP sync
-#   suites (services/auth/tests/test_ldap_sync_service_live_pg.py and
-#   services/common/tests/test_advisory_lock_live_pg.py, hard-required via
-#   HERD_TEST_PG_REQUIRED=1) against the gate stack's own Postgres. It needs
-#   no LDAP mode, so it is a separate step rather than nested inside
-#   _gate-ldap-stack-tests.
+#   _gate-pg-live-tests runs right after it: every
+#   services/*/tests/*_live_pg.py suite (the LDAP sync service is one of
+#   them; see the target's own comment below), hard-required via
+#   HERD_TEST_PG_REQUIRED=1, against the gate stack's own Postgres, most of
+#   them against its migrated schemas. It needs no LDAP mode, so it is a
+#   separate step rather than nested inside _gate-ldap-stack-tests.
 
 # Pinned with -p (not left to the compose file's own `name: herd-ldap-test`)
 # after an incident on 2026-08-26: COMPOSE_PROJECT_NAME is exported into
@@ -620,13 +701,13 @@ ldap-up:  ## Start the checked-in LDAP test server (infra/ldap-test), wait until
 ldap-down:  ## Stop and remove the LDAP test server
 	$(LDAP_COMPOSE) down -v --remove-orphans
 
-ldap-status:
+ldap-status:  ## Show the LDAP test server's container status
 	$(LDAP_COMPOSE) ps
 
-ldap-logs:
+ldap-logs:  ## Tail the LDAP test server's logs
 	$(LDAP_COMPOSE) logs -f
 
-ldap-reset:
+ldap-reset:  ## Recreate the LDAP test server and reseed it from the checked-in LDIF
 	$(LDAP_COMPOSE) down -v --remove-orphans
 	$(MAKE) ldap-up
 
@@ -654,9 +735,10 @@ _gate-ldap-tests:
 
 # Checked-in emulated-gear test lab (infra/nos-test, docs/NOS_LAB.md): phase 0
 # of the emulated-gear test tier (ADR 0010). License-free, needs no external
-# Proxmox host, unlike network-simulator. Deliberately opt-in: NOT wired into
-# `make test`, `make master`, or `make everything`, so it costs nothing on a
-# host that never runs it. Pinned with -p (own compose project
+# Proxmox host, unlike network-simulator. Not wired into `make test` or `make
+# master`; `make everything` runs the dialect tier (nos-test-dialect, below)
+# as one of its phases, and the via-stack tier runs only in nightly.yml.
+# Pinned with -p (own compose project
 # herd-nos-test, own network herd-nos-test-net) for the same reason
 # LDAP_COMPOSE is pinned: an exported COMPOSE_PROJECT_NAME must never be able
 # to redirect a `down` on this file onto another project's containers.
@@ -768,9 +850,10 @@ nos-detach:  ## Detach the NOS test lab containers from the dev stack's network
 #   the seed step.
 #
 # Both workflows call these targets rather than spelling out a pytest
-# invocation, so a workflow and a local run cannot drift apart. Neither
-# target is wired into `make master` or `make everything`: keeping the lab
-# opt-in there is a separate decision (docs/NOS_LAB.md).
+# invocation, so a workflow and a local run cannot drift apart. `make
+# everything` also runs nos-test-dialect as its own phase (decided
+# 2026-09-12); neither tier runs in `make test` or `make master`, and
+# nos-test-feature runs only in nightly.yml (docs/NOS_LAB.md).
 NOS_DIALECT_TESTS := \
 	tests/nos_lab/test_nos_lab_live.py \
 	tests/nos_lab/test_frr_l3_driver_live.py \
@@ -831,7 +914,7 @@ nos-test-dialect:  ## Run the NOS lab dialect suites (boots the lab if it is not
 #
 # Deliberately NOT wired into master or everything (nightly only, via
 # nightly.yml): it needs a running HERD stack plus the lab, and the two
-# needs together are a heavier local ask than the dialect tier below carries.
+# needs together are a heavier local ask than the dialect tier above carries.
 nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running stack and lab)
 	@net=$${COMPOSE_PROJECT_NAME:-$(DEV_PROJECT)}_herd-net; \
 	if ! docker network inspect "$$net" >/dev/null 2>&1; then \
@@ -843,11 +926,17 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 	$(SUBMAKE) seed-nos && \
 	HERD_TEST_NOS_REQUIRED=1 uv run pytest $(NOS_FEATURE_TESTS) -v
 
-# Postgres-live coverage for the ADR 0011 sync surface (issue #572): the
-# advisory-lock SQL and _SyncSlot's cross-replica branch never run on the
-# SQLite engine every other sync test uses. Any reachable Postgres works
-# (these tests create no application schema), so this target just needs a
-# DSN: it is built from .env's POSTGRES_USER/PASSWORD/DB plus the gate
+# Postgres-live suites: every services/*/tests/*_live_pg.py (fifteen today,
+# in auth, common, cabling, execution, reservations, and inventory), each run
+# from its own service directory. They prove what the SQLite engine every unit
+# suite uses cannot: advisory locks, row locks and SKIP LOCKED, native enum and
+# uuid columns, collation, VARCHAR width. It began (issue #572) as the ADR 0011
+# sync surface, where the advisory-lock SQL and _SyncSlot's cross-replica
+# branch never run on SQLite; those first suites create no application schema
+# and work against any reachable Postgres, while most of the later ones need
+# the gate's migrated schemas (the cabling and execution suites named below
+# are examples). This target needs only a DSN: it is built from .env's
+# POSTGRES_USER/PASSWORD/DB plus the gate
 # stack's published Postgres host port (POSTGRES_PORT, default 5433, the
 # same default docker-compose.yml's postgres service publishes on), NOT a
 # COMPOSE_PROJECT_NAME lookup, since the host port is fixed regardless of
@@ -880,7 +969,7 @@ _gate-pg-live-tests:
 	pgport=$$(grep -E '^POSTGRES_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2-); \
 	pgport=$${pgport:-5433}; \
 	dsn="postgresql+asyncpg://$${pguser:-herd}:$${pgpass:-herd}@127.0.0.1:$${pgport}/$${pgdb:-herd}"; \
-	echo "Postgres-live LDAP sync tests against 127.0.0.1:$${pgport}/$${pgdb:-herd}"; \
+	echo "Postgres-live suites against 127.0.0.1:$${pgport}/$${pgdb:-herd}"; \
 	(cd services/auth && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_ldap_sync_service_live_pg.py -v) && \
 	(cd services/common && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
@@ -930,13 +1019,16 @@ _gate-pg-live-tests:
 # before this phase existed.
 # Deliberately calls neither `$(MAKE) ldap-up` nor `$(MAKE) ldap-down` (unlike
 # _gate-ldap-tests above): a recipe line containing a literal $(MAKE) reference
-# is executed for real even under `make -n` (GNU Make's documented escape
-# hatch for accurate recursive dry-run reporting), and this recipe already
-# mixes in real docker network/compose mutation, so keeping it $(MAKE)-free
-# keeps `make -n master` / `make -n everything` (and `make -n
-# _gate-ldap-stack-tests` on its own) genuine dry runs that print without
-# touching any container. It inlines the same $(LDAP_COMPOSE) commands
-# ldap-up/ldap-down wrap instead.
+# is executed even under `make -n` (GNU Make's documented escape hatch for
+# accurate recursive dry-run reporting: the sub-make inherits -n and only
+# prints, but every other command on that shell line runs for real), and this
+# recipe mixes in real docker network/compose mutation. It inlines the same
+# $(LDAP_COMPOSE) commands ldap-up/ldap-down wrap instead, which keeps `make -n
+# _gate-ldap-stack-tests` a genuine dry run that prints without touching any
+# container; `make -n _gate-pg-live-tests` is one for the same reason. The
+# gates are NOT dry-run safe: the master and everything recipes hold `$(MAKE)`
+# lines of their own (the line that starts and stops the gate stack among
+# them), so never `make -n master` or `make -n everything`.
 #
 # Also deliberately uses BARE `docker compose` throughout (never
 # $(GATE_COMPOSE)'s explicit -p), so this target works against whichever
@@ -1026,6 +1118,8 @@ _gate-ldap-stack-tests:
 		uv run pytest tests/integration/test_ldap_auth.py tests/integration/test_ldap_sync_admin.py \
 			-v --timeout=60
 
+## --- Coverage ---
+
 # -- Coverage -----------------------------------------------------------------
 #
 # Per-service `coverage-<svc>` and the aggregator `coverage` are generated from
@@ -1101,14 +1195,18 @@ format:  ## Format and autofix backend Python (services/ + root scripts)
 
 # -- Cleanup ------------------------------------------------------------------
 
+# The cache purge prunes ./.claude, which can hold other checkouts (agent
+# worktrees under .claude/worktrees/) whose caches and coverage are not this
+# checkout's to delete. The files go through `-exec rm`, not `-delete`, because
+# -delete implies -depth, under which find ignores -prune.
 clean:  ## Stop the stack (KEEPING volumes/data) and remove caches/coverage artifacts
 	docker compose --profile e2e down --remove-orphans
-	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
-	find . -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
-	find . -type d -name htmlcov -exec rm -rf {} + 2>/dev/null || true
-	find . -type f -name coverage.xml -delete 2>/dev/null || true
-	find . -type f -name .coverage -delete 2>/dev/null || true
+	find . -path ./.claude -prune -o -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	find . -path ./.claude -prune -o -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
+	find . -path ./.claude -prune -o -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
+	find . -path ./.claude -prune -o -type d -name htmlcov -exec rm -rf {} + 2>/dev/null || true
+	find . -path ./.claude -prune -o -type f -name coverage.xml -exec rm -f {} + 2>/dev/null || true
+	find . -path ./.claude -prune -o -type f -name .coverage -exec rm -f {} + 2>/dev/null || true
 
 # Pre-gate cleanup for master/everything. Both compose projects publish the same
 # host ports, so the dev stack must be STOPPED before the gate stack can boot;
