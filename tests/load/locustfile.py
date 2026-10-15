@@ -24,6 +24,7 @@ path (polled by the bell on an interval, so the hottest read in the service) and
 the preferences read/write proxy that the /settings channel toggles drive.
 """
 
+import logging
 import os
 import random
 import uuid
@@ -34,6 +35,8 @@ import urllib3
 from locust import HttpUser, between, task
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+logger = logging.getLogger(__name__)
 
 
 def _load_repo_env() -> None:
@@ -542,18 +545,29 @@ class BulkConnectionAdmin(HerdUser):
 class DeviceConfigUser(HerdUser):
     """Exercises the device-configuration read and write paths (issue #1100).
 
-    on_start creates ONE device of its own from a seeded `Management` template
-    (the only connection type whose versions are pushed, CFG-GATE-1), filling the
-    template's required fields with inert placeholders (a documentation address,
-    192.0.2.10, for an `ip` field), and on_stop deletes it, which removes every
-    version this user wrote (CFG-VER-15). Seeded devices are never written to. The
-    tasks list and create config versions on that device (each create validates
-    the config against the driver's schema, CFG-VER-3), read one back, diff the two
-    newest, read the driver's config schema through inventory's proxy
-    (CFG-SCHEMA-9), and list the device's apply jobs. It never applies or
-    schedules: a push would reach execution and a driver, which is not what this
-    load measures. With no seeded `Management` template, or when the device cannot
-    be created, every task is a safe no-op. A run killed before on_stop leaves its
+    on_start picks a `Management` device template (the only connection type whose
+    versions are pushed, CFG-GATE-1) whose driver's config schema, read through
+    inventory's proxy, comes from the registry (`source` `registry`, CFG-SCHEMA-9):
+    the version bodies below use the registry's vocabulary, and a driver that
+    publishes its own schema replaces it (CFG-SCHEMA-6; frr_mgmt accepts only
+    `commands`), so such a template is skipped. Templates are tried in the order the
+    template list answers, newest first. It then creates ONE device of its own from
+    that template, filling the template's required fields with inert placeholders (a
+    documentation address, 192.0.2.10, for an `ip` field); on_stop deletes it, which
+    removes every version this user wrote (CFG-VER-15). Seeded devices are never
+    written to. The tasks list and create config versions on that device (each create
+    validates the config against the schema, CFG-VER-3), read one back, diff the two
+    newest, read the driver's config schema, and list the device's apply jobs. It
+    never applies or schedules: a push would reach execution and a driver, which is
+    not what this load measures.
+
+    With no such template, nothing is created and every task does nothing. A refused
+    device create is recorded as a locust failure on
+    `/api/inventory/devices [config load device]` (so the run exits 1), and every task
+    then does nothing. The device is AVAILABLE, so a `ReservationUser` can book it; a
+    delete refused with 409 `device_in_use` cancels the reservations the answer lists
+    and tries once more, and a delete that still fails is a locust failure and a
+    logged warning naming the device. A run killed before on_stop leaves its
     `load-cfg-` device behind; delete it by name.
     """
 
@@ -573,16 +587,21 @@ class DeviceConfigUser(HerdUser):
         )
         if resp.status_code != 200:
             return
-        template = next(
-            (
-                t
-                for t in resp.json().get("items", [])
-                if t.get("template_type") == "device"
-                and t.get("connection_type") == "Management"
-                and t.get("driver_id")
-            ),
-            None,
-        )
+        template = None
+        for candidate in resp.json().get("items", []):
+            if not (
+                candidate.get("template_type") == "device"
+                and candidate.get("connection_type") == "Management"
+                and candidate.get("driver_id")
+            ):
+                continue
+            schema = self._auth_get(
+                f"/api/inventory/drivers/{candidate['driver_id']}/config-schema",
+                name="/api/inventory/drivers/[id]/config-schema [config load template pick]",
+            )
+            if schema.status_code == 200 and schema.json().get("source") == "registry":
+                template = candidate
+                break
         if template is None:
             return
         create = self._auth_post(
@@ -623,11 +642,55 @@ class DeviceConfigUser(HerdUser):
         return values
 
     def on_stop(self):
-        if self._device_id:
+        if not self._device_id:
+            return
+        path = f"/api/inventory/devices/{self._device_id}"
+        name = "/api/inventory/devices/[id] [config load device]"
+        with self._auth_delete(path, name=name, catch_response=True) as resp:
+            blocking = self._blocking_reservation_ids(resp)
+            if resp.status_code == 204:
+                return
+            if blocking is None:
+                resp.failure(f"device delete answered {resp.status_code}: {resp.text[:200]}")
+                logger.warning(
+                    "DeviceConfigUser could not delete its device %s: HTTP %s",
+                    self._device_id,
+                    resp.status_code,
+                )
+                return
+            # A ReservationUser booked this AVAILABLE device; not a load failure.
+            resp.success()
+        for reservation_id in blocking:
             self._auth_delete(
-                f"/api/inventory/devices/{self._device_id}",
-                name="/api/inventory/devices/[id] [config load device]",
+                f"/api/reservations/{reservation_id}",
+                name="/api/reservations/[id] [config load device release]",
             )
+        with self._auth_delete(path, name=name, catch_response=True) as retry:
+            if retry.status_code != 204:
+                retry.failure(f"device delete answered {retry.status_code}: {retry.text[:200]}")
+                logger.warning(
+                    "DeviceConfigUser could not delete its device %s after cancelling "
+                    "reservations %s: HTTP %s; delete it by hand",
+                    self._device_id,
+                    blocking,
+                    retry.status_code,
+                )
+
+    @staticmethod
+    def _blocking_reservation_ids(resp) -> list | None:
+        """The reservation ids of a 409 `device_in_use` answer, else None."""
+        if resp.status_code != 409:
+            return None
+        try:
+            detail = resp.json().get("detail")
+        except ValueError:
+            return None
+        if not isinstance(detail, dict) or detail.get("error") != "device_in_use":
+            return None
+        ids = detail.get("reservation_ids")
+        if not isinstance(ids, list) or not ids:
+            return None
+        return [str(i) for i in ids]
 
     @task(4)
     def list_versions(self):

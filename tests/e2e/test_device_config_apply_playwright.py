@@ -3,11 +3,13 @@
 The four journeys the device page and the dry-run review offer, each driven through
 the UI and then proved by reading the backend back through the API:
 
-- Apply now from the Apply dialog (CFG-UI-4, CFG-APPLY-1 to CFG-APPLY-4).
+- Apply now from the Apply dialog (CFG-UI-4, CFG-APPLY-1, CFG-APPLY-3, CFG-APPLY-4).
 - Schedule from the same dialog, watched in the Scheduled applies panel until the
-  apply scheduler fires it (CFG-UI-4, CFG-UI-5, CFG-JOB-7, CFG-SCHED-8, CFG-SCHED-9).
-- Cancel a pending job from the panel (CFG-UI-5, CFG-JOB-10, CFG-STATE-3).
-- Review a fired dry run and confirm it (CFG-UI-6, CFG-JOB-11, CFG-JOB-12).
+  apply scheduler fires it (CFG-UI-4, CFG-UI-5, CFG-STATE-1, CFG-JOB-7, CFG-SCHED-8,
+  CFG-SCHED-9).
+- Cancel a pending job from the panel (CFG-UI-5, CFG-STATE-3).
+- Review a fired dry run and confirm it (CFG-UI-6, CFG-STATE-1, CFG-JOB-12,
+  CFG-SCHED-8).
 
 Every test seeds its own world through the API and removes it in a `finally`: the
 checked-in `drivers/frr_mgmt` package uploaded unchanged under a per-run name, a
@@ -22,10 +24,16 @@ so both are REAL applies. The device these tests create carries no `HERD_ip` and
 `ConnectHandler(host=None, ...)`; netmiko refuses that in its constructor with
 `ValueError: Either ip or host must be set` before it opens any socket. The run is
 therefore FAILED with `driver raised ValueError` and an empty transcript, which is
-what these tests pin. The dry-run review's job is a real dry run scheduled through the
-API (the device page cannot schedule one; the reservation assistant does), and a dry
-run of frr_mgmt opens no SSH session by the driver's own contract. The real job a
-confirm queues is cancelled at once and the 204 proves it never fired.
+what these tests pin. That exact text depends on two things outside the product:
+netmiko's constructor check (`BaseConnection.__init__`, netmiko 4.7.0 in uv.lock)
+and frr_mgmt's `configure` not checking the host itself the way its `login` does. A
+netmiko change of that check, or such a check added to `configure` (which would give
+`driver raised DriverError`), turns these tests red with no product regression.
+
+The dry-run review's job is a real dry run scheduled through the API (the device page
+cannot schedule one; the reservation assistant does), and a dry run of frr_mgmt opens
+no SSH session by the driver's own contract. The real job a confirm queues is
+cancelled at once and the 204 proves it never fired.
 
 The dry-run review opens only from the reservation assistant. Its two network calls
 are answered in the page (`page.route`): `/api/ai/status` reports the assistant
@@ -258,6 +266,8 @@ def _assert_hostless_failed_run(page, run_id: str, version: dict) -> None:
     assert run["input_params"]["dry_run"] is False
     assert run["input_params"]["config_version_id"] == version["id"]
     assert run["input_params"]["method_kwargs"] == {"commands": COMMANDS}
+    # Neither push names a reservation (CFG-APPLY-1, CFG-SCHED-8 for a job tied to none).
+    assert run["reservation_id"] is None
     # No command was recorded: the driver never reached a device.
     commands = pw_api(page, "GET", f"/execution/runs/{run_id}/commands").json()
     assert commands == []
@@ -388,8 +398,8 @@ def test_cancel_a_pending_scheduled_apply_from_the_panel(pw_page):
     """A pending job scheduled an hour out is cancelled from the panel, for good.
 
     CFG-UI-5: the panel offers Cancel on the pending row and drops it once the job is
-    cancelled. CFG-JOB-10 and CFG-STATE-3: the creator's cancel answers 204 and the
-    job reads back `cancelled`, never fired and with no run.
+    cancelled. CFG-STATE-3: the creator's cancel answers 204 and the job reads back
+    `cancelled`, never fired and with no run.
     """
     pw_login(pw_page)
     suffix = uuid.uuid4().hex[:8]
@@ -518,10 +528,12 @@ def test_dry_run_review_shows_the_transcript_and_confirm_queues_the_real_apply(p
 
     CFG-UI-6: the dialog polls the job, shows the waiting state with Confirm disabled,
     then the success line and the run's transcript rows marked simulated, and enables
-    Confirm. CFG-JOB-11 and CFG-JOB-12: Confirm promotes the successful dry run into
-    a new pending real job for the same device, version, and reservation, and the
-    source job is left as it was. The promoted job is cancelled at once; its 204 is
-    the proof it never fired.
+    Confirm; the rows are the fired run's own transcript, fetched by its run id.
+    CFG-SCHED-8: the scheduler ran the dry run as a dry run of the version, tagged
+    with the job's reservation. CFG-JOB-12: Confirm promotes the successful dry run
+    into a new real job for the same device, version, and reservation, and the source
+    job is left as it was. The promoted job is cancelled right after the confirm
+    answers; its 204 is the proof it never fired.
     """
     pw_login(pw_page)
     suffix = uuid.uuid4().hex[:8]
@@ -562,6 +574,17 @@ def test_dry_run_review_shows_the_transcript_and_confirm_queues_the_real_apply(p
                 "scheduled_for": source["scheduled_for"],
             },
         )
+        # Every transcript request the page sends, to prove the dialog reads the run
+        # the scheduler recorded and no other.
+        transcript_requests: list[str] = []
+        pw_page.on(
+            "request",
+            lambda req: (
+                transcript_requests.append(req.url.split("?", 1)[0])
+                if req.url.split("?", 1)[0].endswith("/commands")
+                else None
+            ),
+        )
         pw_page.goto(f"{HOST_BASE_URL}/reservations")
         row = pw_page.locator("table tbody tr", has_text=reservation["purpose"])
         expect(row).to_be_visible(timeout=WAIT_MS)
@@ -588,16 +611,31 @@ def test_dry_run_review_shows_the_transcript_and_confirm_queues_the_real_apply(p
         assert fired["status"] == "success", fired
         expect(review.get_by_text(DRY_RUN_SUCCEEDED, exact=True)).to_be_visible(timeout=WAIT_MS)
 
-        # The transcript the dialog shows is the run's own, row for row.
+        # The run the scheduler recorded: a dry run of the version, tagged with the
+        # job's reservation (CFG-SCHED-8).
+        run = pw_api(pw_page, "GET", f"/execution/runs/{fired['run_id']}").json()
+        assert run["status"] == "SUCCESS", run
+        assert run["action"] == "configure"
+        assert run["input_params"]["dry_run"] is True
+        assert run["input_params"]["config_version_id"] == version["id"]
+        assert run["reservation_id"] == reservation["id"]
+
+        # The transcript the dialog shows is that run's own, row for row: every
+        # transcript request names the fired run, and each row's cells equal the API's.
         transcript = pw_api(pw_page, "GET", f"/execution/runs/{fired['run_id']}/commands").json()
         assert [r["command"] for r in transcript] == COMMANDS
         assert {r["exit_status"] for r in transcript} == {"simulated"}
         rows = review.locator("tbody tr")
-        expect(rows).to_have_count(len(COMMANDS))
-        for index, command in enumerate(COMMANDS):
+        expect(rows).to_have_count(len(transcript))
+        for index, entry in enumerate(transcript):
             cells = rows.nth(index).locator("td")
-            expect(cells.nth(1)).to_have_text(command)
-            expect(cells.nth(3)).to_have_text("simulated")
+            expect(cells.nth(0)).to_have_text(str(entry["seq"]))
+            expect(cells.nth(1)).to_have_text(entry["command"])
+            expect(cells.nth(2)).to_have_text(entry["response"] or "")
+            expect(cells.nth(3)).to_have_text(entry["exit_status"])
+        expected_path = f"/api/execution/runs/{fired['run_id']}/commands"
+        assert transcript_requests, "the dialog never requested a transcript"
+        assert all(url.endswith(expected_path) for url in transcript_requests), transcript_requests
 
         pw_page.mouse.move(*PW_OFF_TOASTER)
         response = pw_click_for_response(
@@ -605,13 +643,27 @@ def test_dry_run_review_shows_the_transcript_and_confirm_queues_the_real_apply(p
         )
         promoted = response.json()
         promoted_id = promoted["id"]
+        assert promoted["status"] == "pending", promoted
+        # Cancel the real job at once, before any other wait: it is due 10 seconds
+        # after the confirm, and a 204 on the cancel's compare-and-swap means it was
+        # still pending and never fires (CFG-STATE-4).
+        cancelled = pw_api(
+            pw_page, "DELETE", f"/inventory/apply-jobs/{promoted_id}", allow_errors=True
+        )
+        assert cancelled.status_code == 204, cancelled.text
+        promoted_id_done = promoted_id
+        promoted_id = None
+
         expect(pw_page.get_by_text(CONFIRMED_TOAST, exact=True)).to_be_visible()
         expect(pw_page.get_by_role("heading", name=REVIEW_DIALOG, exact=True)).to_have_count(0)
 
-        # Read-back: a new pending real job for the same device, version, reservation.
-        stored = pw_api(pw_page, "GET", f"/inventory/apply-jobs/{promoted_id}").json()
+        # Read-back: a new real job for the same device, version, and reservation,
+        # now cancelled (the cancel touches only its status).
+        stored = pw_api(pw_page, "GET", f"/inventory/apply-jobs/{promoted_id_done}").json()
         assert stored["id"] != source["id"]
-        assert stored["status"] == "pending", stored
+        assert stored["status"] == "cancelled", stored
+        assert stored["fired_at"] is None
+        assert stored["run_id"] is None
         assert stored["dry_run"] is False
         assert stored["device_id"] == device_id
         assert stored["version_id"] == version["id"]
@@ -619,13 +671,6 @@ def test_dry_run_review_shows_the_transcript_and_confirm_queues_the_real_apply(p
         # The source dry run is unchanged.
         after = pw_api(pw_page, "GET", f"/inventory/apply-jobs/{source['id']}").json()
         assert after == fired
-
-        # Cancel the real job before it is due: a 204 means it never fires (CFG-STATE-4).
-        cancelled = pw_api(
-            pw_page, "DELETE", f"/inventory/apply-jobs/{promoted_id}", allow_errors=True
-        )
-        assert cancelled.status_code == 204, cancelled.text
-        promoted_id = None
     finally:
         if promoted_id is not None:
             resp = pw_api(

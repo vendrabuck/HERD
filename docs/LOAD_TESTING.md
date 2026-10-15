@@ -105,13 +105,22 @@ Exercises `POST /connections/bulk`, the admin-only bulk cable-create path.
 
 Exercises the device-configuration paths (issue #1100) on one device of its own.
 
-- `on_start`: logs in as admin, picks the first seeded device template whose
-  connection type is `Management`, and creates one `load-cfg-<hex>` device from
-  it, filling the template's required fields with inert placeholders (an `ip`
-  field gets the documentation address `192.0.2.10`). With no such template, or
-  when the create fails, every task is a no-op.
-- `on_stop`: deletes the device, which removes every config version it wrote. A
-  run killed before `on_stop` leaves the device behind; delete it by name.
+- `on_start`: logs in as admin and walks the device templates whose connection
+  type is `Management` in the order the template list answers (newest first). For
+  each it reads the driver's config schema through inventory's proxy and keeps the
+  first whose `source` is `registry`: the version bodies use the registry's
+  vocabulary, and a driver that publishes its own schema (frr_mgmt accepts only
+  `commands`) would refuse every create. It creates one `load-cfg-<hex>` device from
+  that template, filling the template's required fields with inert placeholders (an
+  `ip` field gets the documentation address `192.0.2.10`). With no such template,
+  nothing is created and every task does nothing. A refused device create is a
+  recorded locust failure (the run exits 1), and every task then does nothing.
+- `on_stop`: deletes the device, which removes every config version it wrote. The
+  device is `AVAILABLE`, so a `ReservationUser` can book it: a delete refused with
+  409 `device_in_use` cancels the reservations the answer lists and tries once
+  more; a delete that still fails is a recorded failure and a logged warning naming
+  the device. A run killed before `on_stop` leaves the device behind; delete it by
+  name.
 - Tasks:
   - `list_versions` (weight 4): `GET /api/inventory/devices/{id}/config-versions`
   - `create_version` (weight 2): `POST` a new version with the registry's

@@ -687,7 +687,7 @@ apply-job routes of sections 5 and 7.
   `Job is '<status>', not cancellable`); an unknown job is 404 `Apply job not found`. The
   cancel does not check device visibility. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`cancel_apply_job`) \
-  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_cancel_pending_job`, `test_cancel_other_users_job_forbidden`, `test_cancel_already_cancelled_job`); `services/inventory/tests/test_device_configs_rbac.py` (`test_admin_can_cancel_other_users_pending_job`); `services/inventory/tests/test_router_edge_cases.py` (`test_cancel_unknown_job_404`); `tests/e2e/test_device_config_apply_playwright.py` (`test_cancel_a_pending_scheduled_apply_from_the_panel`)
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_cancel_pending_job`, `test_cancel_other_users_job_forbidden`, `test_cancel_already_cancelled_job`); `services/inventory/tests/test_device_configs_rbac.py` (`test_admin_can_cancel_other_users_pending_job`); `services/inventory/tests/test_router_edge_cases.py` (`test_cancel_unknown_job_404`)
 - **CFG-JOB-11.** A confirm needs a source job that is a dry run (409
   `Source job is not a dry-run; nothing to promote`) and `success` (409
   `Source dry-run is '<status>'; only successful dry-runs can be promoted`). The order
@@ -769,7 +769,7 @@ re-checking at fire time that the job may still run.
   its owner can read the transcript (CFG-TX-5) and find the run in the reservation's run
   list, and the job's version id as `config_version_id` (CFG-RUN-7). \
   Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_post_internal_execute`) \
-  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_post_internal_execute_sends_the_job_reservation_id`); `tests/e2e/test_device_config_apply_playwright.py` (`test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`)
+  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_post_internal_execute_sends_the_job_reservation_id`); `tests/e2e/test_device_config_apply_playwright.py` (`test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`, `test_dry_run_review_shows_the_transcript_and_confirm_queues_the_real_apply`)
 - **CFG-SCHED-9.** The job is `success` only for a 2xx JSON answer whose `status` is
   `SUCCESS` in any case. Otherwise it is `failed` with
   `execution service unreachable (<ClassName>)` (a transport error), the immediate
