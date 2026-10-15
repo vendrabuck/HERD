@@ -1,6 +1,6 @@
 """Locust load test definitions for HERD.
 
-Seven user classes simulating different usage patterns:
+Eight user classes simulating different usage patterns:
 - ReservationUser: creates, lists, queries calendar, releases reservations
 - InventoryBrowser: browses devices, templates, and the topologies list
 - BulkExporter: exports devices, templates, and topologies; dry-runs a device import
@@ -11,6 +11,8 @@ Seven user classes simulating different usage patterns:
 - NotificationUser: polls notifications and updates channel/event preferences
 - BulkConnectionAdmin: posts small POST /connections/bulk batches, then deletes
   what it created
+- DeviceConfigUser: writes and reads config versions, the driver config schema,
+  and the apply-job list on one device of its own, deleted at the end
 
 Note on the outbound notification channels and expiry reminder (ROADMAP #40):
 the dispatch side is a NATS consumer with no synchronous request surface, so it
@@ -535,3 +537,160 @@ class BulkConnectionAdmin(HerdUser):
                 f"/api/cabling/connections/{connection_id}",
                 name="/api/cabling/connections/[id]",
             )
+
+
+class DeviceConfigUser(HerdUser):
+    """Exercises the device-configuration read and write paths (issue #1100).
+
+    on_start creates ONE device of its own from a seeded `Management` template
+    (the only connection type whose versions are pushed, CFG-GATE-1), filling the
+    template's required fields with inert placeholders (a documentation address,
+    192.0.2.10, for an `ip` field), and on_stop deletes it, which removes every
+    version this user wrote (CFG-VER-15). Seeded devices are never written to. The
+    tasks list and create config versions on that device (each create validates
+    the config against the driver's schema, CFG-VER-3), read one back, diff the two
+    newest, read the driver's config schema through inventory's proxy
+    (CFG-SCHEMA-9), and list the device's apply jobs. It never applies or
+    schedules: a push would reach execution and a driver, which is not what this
+    load measures. With no seeded `Management` template, or when the device cannot
+    be created, every task is a safe no-op. A run killed before on_stop leaves its
+    `load-cfg-` device behind; delete it by name.
+    """
+
+    weight = 1
+    wait_time = between(1, 3)
+
+    def on_start(self):
+        self._login(ADMIN_EMAIL, ADMIN_PASSWORD)
+        self._device_id = None
+        self._driver_id = None
+        self._version_ids = []
+
+        resp = self._auth_get(
+            "/api/inventory/templates",
+            params={"limit": 200},
+            name="/api/inventory/templates [config load template pick]",
+        )
+        if resp.status_code != 200:
+            return
+        template = next(
+            (
+                t
+                for t in resp.json().get("items", [])
+                if t.get("template_type") == "device"
+                and t.get("connection_type") == "Management"
+                and t.get("driver_id")
+            ),
+            None,
+        )
+        if template is None:
+            return
+        create = self._auth_post(
+            "/api/inventory/devices",
+            name="/api/inventory/devices [config load device]",
+            json={
+                "name": f"load-cfg-{uuid.uuid4().hex[:8]}",
+                "template_id": template["id"],
+                "topology_type": "PHYSICAL",
+                "status": "AVAILABLE",
+                "field_data": self._placeholder_fields(template),
+            },
+        )
+        if create.status_code != 201:
+            return
+        self._device_id = create.json()["id"]
+        self._driver_id = template["driver_id"]
+
+    @staticmethod
+    def _placeholder_fields(template: dict) -> dict:
+        """Inert values for the template's required fields; nothing ever connects."""
+        values = {}
+        for section in template.get("sections") or []:
+            for field in section.get("fields") or []:
+                if not field.get("required"):
+                    continue
+                kind = field.get("type")
+                if field.get("options"):
+                    values[field["key"]] = field["options"][0]
+                elif kind == "number":
+                    values[field["key"]] = 1
+                elif kind == "boolean":
+                    values[field["key"]] = False
+                elif field["key"] == "ip":
+                    values[field["key"]] = "192.0.2.10"
+                else:
+                    values[field["key"]] = "load"
+        return values
+
+    def on_stop(self):
+        if self._device_id:
+            self._auth_delete(
+                f"/api/inventory/devices/{self._device_id}",
+                name="/api/inventory/devices/[id] [config load device]",
+            )
+
+    @task(4)
+    def list_versions(self):
+        if not self._device_id:
+            return
+        self._auth_get(
+            f"/api/inventory/devices/{self._device_id}/config-versions",
+            name="/api/inventory/devices/[id]/config-versions",
+        )
+
+    @task(2)
+    def create_version(self):
+        if not self._device_id:
+            return
+        resp = self._auth_post(
+            f"/api/inventory/devices/{self._device_id}/config-versions",
+            name="/api/inventory/devices/[id]/config-versions [create]",
+            # The registry's Management vocabulary (CFG-SCHEMA-1).
+            json={
+                "config": {
+                    "hostname": f"load-{uuid.uuid4().hex[:8]}",
+                    "vlan": random.randint(1, 4094),
+                },
+                "description": "load test",
+            },
+        )
+        if resp.status_code == 201:
+            self._version_ids.append(resp.json()["id"])
+
+    @task(2)
+    def read_version(self):
+        if not self._device_id or not self._version_ids:
+            return
+        self._auth_get(
+            f"/api/inventory/devices/{self._device_id}/config-versions/"
+            f"{random.choice(self._version_ids)}",
+            name="/api/inventory/devices/[id]/config-versions/[vid]",
+        )
+
+    @task(1)
+    def diff_versions(self):
+        if not self._device_id or len(self._version_ids) < 2:
+            return
+        self._auth_get(
+            f"/api/inventory/devices/{self._device_id}/config-versions/diff",
+            name="/api/inventory/devices/[id]/config-versions/diff",
+            params={"from": self._version_ids[-2], "to": self._version_ids[-1]},
+        )
+
+    @task(2)
+    def read_config_schema(self):
+        if not self._driver_id:
+            return
+        self._auth_get(
+            f"/api/inventory/drivers/{self._driver_id}/config-schema",
+            name="/api/inventory/drivers/[id]/config-schema",
+        )
+
+    @task(2)
+    def list_apply_jobs(self):
+        if not self._device_id:
+            return
+        self._auth_get(
+            f"/api/inventory/devices/{self._device_id}/apply-jobs",
+            name="/api/inventory/devices/[id]/apply-jobs",
+        )

@@ -122,7 +122,7 @@ job write and every run write reads the row and overwrites it, except the final
 - **CFG-STATE-1.** A job is created `pending` by a schedule, and by a confirm, which
   writes a new row and leaves its source job unchanged. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`schedule_apply_job`, `confirm_dry_run_apply`) \
-  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_schedule_apply_job`); `services/inventory/tests/test_confirm_dry_run.py` (`test_confirm_promotes_dry_run_to_real_apply`, `test_confirm_leaves_source_dry_run_intact`)
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_schedule_apply_job`); `services/inventory/tests/test_confirm_dry_run.py` (`test_confirm_promotes_dry_run_to_real_apply`, `test_confirm_leaves_source_dry_run_intact`); `tests/e2e/test_device_config_apply_playwright.py` (`test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`, `test_dry_run_review_shows_the_transcript_and_confirm_queues_the_real_apply`)
 - **CFG-STATE-2.** The scheduler claims a due job with an update guarded on
   `status = 'pending'`; when it changes no row, another scheduler won and this one fires
   nothing. \
@@ -131,7 +131,7 @@ job write and every run write reads the row and overwrites it, except the final
 - **CFG-STATE-3.** A cancel sets a job read as `pending` to `cancelled`; any other status
   is refused (CFG-JOB-10). \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`cancel_apply_job`) \
-  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_cancel_pending_job`, `test_cancel_already_cancelled_job`)
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_cancel_pending_job`, `test_cancel_already_cancelled_job`); `tests/e2e/test_device_config_apply_playwright.py` (`test_cancel_a_pending_scheduled_apply_from_the_panel`)
 - **CFG-STATE-4.** The cancel is a compare-and-swap on `status = 'pending'`, the same
   guard as the claim (CFG-STATE-2), so exactly one of the two wins. A cancel that loses
   (the claim committed after the cancel read the row) changes nothing and answers 409
@@ -523,7 +523,7 @@ versions to the device immediately and sees whether the push worked.
   reference a retry reads the configuration back from, CFG-RUN-7); it sends no
   `dry_run` and no `reservation_id`. \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
-  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_apply_calls_execution_with_method_kwargs`)
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_apply_calls_execution_with_method_kwargs`); `tests/e2e/test_device_config_apply_playwright.py` (`test_apply_now_answers_the_failed_run_and_records_it_on_the_version`)
 - **CFG-APPLY-2.** Every execution outcome answers 200
   `{version_id, run_id, status, error}`: a transport error is `failed` with
   `execution service unreachable (<ClassName>)`, and an execution status of 400 or more
@@ -542,12 +542,12 @@ versions to the device immediately and sees whether the push worked.
   the run's (`execution returned non-success status` when it has none); a scheduled job
   records the same verdict as `success` or `failed` (CFG-SCHED-9). \
   Enforced in: `services/inventory/app/services/apply_outcome.py` (`judge_success_answer`, `ApplyOutcome`, `MALFORMED_ANSWER_ERROR`, `NON_SUCCESS_ERROR`); `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
-  Pinned by: `services/inventory/tests/test_router_edge_cases.py` (`test_apply_handles_non_json_success_body`); `services/inventory/tests/test_device_configs.py` (`test_apply_success_flips_current_pointer`, `test_immediate_apply_without_a_success_status_is_failed`, `test_immediate_apply_relays_a_timeout_run_status`)
+  Pinned by: `services/inventory/tests/test_router_edge_cases.py` (`test_apply_handles_non_json_success_body`); `services/inventory/tests/test_device_configs.py` (`test_apply_success_flips_current_pointer`, `test_immediate_apply_without_a_success_status_is_failed`, `test_immediate_apply_relays_a_timeout_run_status`); `tests/e2e/test_device_config_apply_playwright.py` (`test_apply_now_answers_the_failed_run_and_records_it_on_the_version`)
 - **CFG-APPLY-4.** When the answer names a run, the version's `last_apply_run_id` is set
   (null when the id is not a UUID) and, only when the status is `success`, the device's
   current config pointer moves to the version; both are committed before the answer. \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`apply_config_version`) \
-  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_apply_success_flips_current_pointer`, `test_apply_failure_does_not_flip_current_pointer`); `services/inventory/tests/test_device_configs_rbac.py` (`test_apply_with_malformed_run_id_returns_200_and_persists_pointer`)
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_apply_success_flips_current_pointer`, `test_apply_failure_does_not_flip_current_pointer`); `services/inventory/tests/test_device_configs_rbac.py` (`test_apply_with_malformed_run_id_returns_200_and_persists_pointer`); `tests/e2e/test_device_config_apply_playwright.py` (`test_apply_now_answers_the_failed_run_and_records_it_on_the_version`)
 - **CFG-APPLY-5.** The immediate apply forwards the caller's token to execution, which
   admits a non-admin's `configure` only with an explicit `manage` grant (CFG-EXEC-1), so
   inventory asks the same question up front with no reservation widening: a non-admin
@@ -674,7 +674,7 @@ apply-job routes of sections 5 and 7.
   the `reservation_id`, `dry_run`, status `pending`, the caller as `created_by`, and the
   token's `username` as `author_name`, and answers 201 with the job. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`schedule_apply_job`) \
-  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_schedule_apply_job`)
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_schedule_apply_job`); `tests/e2e/test_device_config_apply_playwright.py` (`test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`)
 - **CFG-JOB-8.** A device's job list is ordered by `scheduled_for`, latest first; an
   unknown device is 404 `Device not found`. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`list_apply_jobs`) \
@@ -687,7 +687,7 @@ apply-job routes of sections 5 and 7.
   `Job is '<status>', not cancellable`); an unknown job is 404 `Apply job not found`. The
   cancel does not check device visibility. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`cancel_apply_job`) \
-  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_cancel_pending_job`, `test_cancel_other_users_job_forbidden`, `test_cancel_already_cancelled_job`); `services/inventory/tests/test_device_configs_rbac.py` (`test_admin_can_cancel_other_users_pending_job`); `services/inventory/tests/test_router_edge_cases.py` (`test_cancel_unknown_job_404`)
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_cancel_pending_job`, `test_cancel_other_users_job_forbidden`, `test_cancel_already_cancelled_job`); `services/inventory/tests/test_device_configs_rbac.py` (`test_admin_can_cancel_other_users_pending_job`); `services/inventory/tests/test_router_edge_cases.py` (`test_cancel_unknown_job_404`); `tests/e2e/test_device_config_apply_playwright.py` (`test_cancel_a_pending_scheduled_apply_from_the_panel`)
 - **CFG-JOB-11.** A confirm needs a source job that is a dry run (409
   `Source job is not a dry-run; nothing to promote`) and `success` (409
   `Source dry-run is '<status>'; only successful dry-runs can be promoted`). The order
@@ -701,7 +701,7 @@ apply-job routes of sections 5 and 7.
   and the confirming user as `created_by`, answers 201 with it, leaves the source
   unchanged, and logs `apply_job_promoted_from_dry_run`. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`confirm_dry_run_apply`) \
-  Pinned by: `services/inventory/tests/test_confirm_dry_run.py` (`test_confirm_promotes_dry_run_to_real_apply`, `test_confirm_leaves_source_dry_run_intact`, `test_confirm_non_admin_owner_allowed`)
+  Pinned by: `services/inventory/tests/test_confirm_dry_run.py` (`test_confirm_promotes_dry_run_to_real_apply`, `test_confirm_leaves_source_dry_run_intact`, `test_confirm_non_admin_owner_allowed`); `tests/e2e/test_device_config_apply_playwright.py` (`test_dry_run_review_shows_the_transcript_and_confirm_queues_the_real_apply`)
 - **CFG-JOB-13.** A confirm repeats none of the schedule-time checks (horizon,
   reservation, driver gate, dry-run support) and does not check device visibility; the
   scheduler's fire-time checks still apply to the new job. \
@@ -769,7 +769,7 @@ re-checking at fire time that the job may still run.
   its owner can read the transcript (CFG-TX-5) and find the run in the reservation's run
   list, and the job's version id as `config_version_id` (CFG-RUN-7). \
   Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_post_internal_execute`) \
-  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_post_internal_execute_sends_the_job_reservation_id`)
+  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_post_internal_execute_sends_the_job_reservation_id`); `tests/e2e/test_device_config_apply_playwright.py` (`test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`)
 - **CFG-SCHED-9.** The job is `success` only for a 2xx JSON answer whose `status` is
   `SUCCESS` in any case. Otherwise it is `failed` with
   `execution service unreachable (<ClassName>)` (a transport error), the immediate
@@ -778,7 +778,7 @@ re-checking at fire time that the job may still run.
   `execution returned non-success status` (a missing or null status included). A run id
   that is not a UUID is stored as null. \
   Enforced in: `services/inventory/app/services/apply_scheduler.py` (`_post_internal_execute`); `services/inventory/app/services/apply_outcome.py` (`unreachable_error`, `refusal_error`) \
-  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_post_internal_execute_http_error`, `test_post_internal_execute_error_body_not_json`, `test_post_internal_execute_refusal_stores_herd_text_only`, `test_post_internal_execute_success_body_not_json`, `test_post_internal_execute_malformed_run_id_degrades_to_none`, `test_post_internal_execute_non_success_status`, `test_post_internal_execute_missing_status_records_failed`, `test_post_internal_execute_null_status_records_failed`)
+  Pinned by: `services/inventory/tests/test_apply_scheduler.py` (`test_post_internal_execute_http_error`, `test_post_internal_execute_error_body_not_json`, `test_post_internal_execute_refusal_stores_herd_text_only`, `test_post_internal_execute_success_body_not_json`, `test_post_internal_execute_malformed_run_id_degrades_to_none`, `test_post_internal_execute_non_success_status`, `test_post_internal_execute_missing_status_records_failed`, `test_post_internal_execute_null_status_records_failed`); `tests/e2e/test_device_config_apply_playwright.py` (`test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`)
 - **CFG-SCHED-10.** A successful job sets its version's `last_apply_run_id` when the
   answer named a run, and, unless it was a dry run, moves the device's current config
   pointer to the version, the same record an immediate apply writes (CFG-APPLY-6). A
@@ -1090,19 +1090,19 @@ opened from the reservation assistant; clients `frontend/src/api/deviceConfig.ts
   `Apply request failed`, `Schedule failed`, or `Restore failed`. A New version refusal
   shows a string `detail` and never renders a validation list. \
   Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`); `frontend/src/lib/errors.ts` (`configApplyErrorText`, `configRestoreErrorText`, `formatRestoreBlocked`) \
-  Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`applies now and shows the run id on success`, `shows the stored error for a failed apply answer`, `shows the driver gate's sentence when Apply now is refused with 409`, `shows the server's sentence when Apply now is refused with 403`, `schedules at the chosen time and sends it as ISO`, `shows the driver gate's sentence, not an object, when a schedule is refused`, `lists the blocking reservations when a restore is refused with 409`, `shows the guard's sentence when a restore fails closed with 503`, `shows a create refusal's string detail and never renders a validation list`); `frontend/src/test/lib/errors.test.ts` (`shows at most three ids, then the count of the rest`, `falls back for any other shape, never returning an object`)
+  Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`applies now and shows the run id on success`, `shows the stored error for a failed apply answer`, `shows the driver gate's sentence when Apply now is refused with 409`, `shows the server's sentence when Apply now is refused with 403`, `schedules at the chosen time and sends it as ISO`, `shows the driver gate's sentence, not an object, when a schedule is refused`, `lists the blocking reservations when a restore is refused with 409`, `shows the guard's sentence when a restore fails closed with 503`, `shows a create refusal's string detail and never renders a validation list`); `frontend/src/test/lib/errors.test.ts` (`shows at most three ids, then the count of the rest`, `falls back for any other shape, never returning an object`); `tests/e2e/test_device_config_apply_playwright.py` (`test_apply_now_answers_the_failed_run_and_records_it_on_the_version`, `test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`)
 - **CFG-UI-5.** The scheduled-applies panel is hidden when the device has no jobs,
   refreshes every 10 seconds, shows each job's status and error, and offers Cancel only
   on a `pending` job; a refused cancel shows the server's string `detail`, else
   `Cancel failed`. \
   Enforced in: `frontend/src/components/device-config/ApplyJobsPanel.tsx` (`ApplyJobsPanel`); `frontend/src/api/deviceConfigJobs.ts` (`useApplyJobs`) \
-  Pinned by: `frontend/src/test/components/ApplyJobsPanel.test.tsx` (`renders nothing when the device has no scheduled applies`, `shows each job's status, error, author, and run, with Cancel only on pending`, `cancels a pending job through the API and confirms with a toast`, `shows the server's sentence when a cancel loses the race (409)`, `never toasts an object detail; a non-string refusal falls back`, `refreshes the job list every 10 seconds`)
+  Pinned by: `frontend/src/test/components/ApplyJobsPanel.test.tsx` (`renders nothing when the device has no scheduled applies`, `shows each job's status, error, author, and run, with Cancel only on pending`, `cancels a pending job through the API and confirms with a toast`, `shows the server's sentence when a cancel loses the race (409)`, `never toasts an object detail; a non-string refusal falls back`, `refreshes the job list every 10 seconds`); `tests/e2e/test_device_config_apply_playwright.py` (`test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`, `test_cancel_a_pending_scheduled_apply_from_the_panel`)
 - **CFG-UI-6.** The dry-run review polls the job every 2 seconds until it is `success`,
   `failed`, `skipped`, or `cancelled`, then shows the run's transcript with simulated
   rows marked; Confirm is enabled only on `success`, Cancel dry-run only before it, and a
   refused confirm shows the server's `detail`. \
   Enforced in: `frontend/src/components/reservations/AIApplyConfirmModal.tsx` (`AIApplyConfirmModal`); `frontend/src/api/deviceConfigJobs.ts` (`useApplyJob`, `TERMINAL_STATUSES`) \
-  Pinned by: `frontend/src/test/components/AIApplyConfirmModal.test.tsx` (`renders the plan text`, `shows the transcript with simulated badges once the dry-run succeeds`, `disables Confirm until the dry-run succeeds`, `Confirm POSTs to the confirm endpoint and closes`, `Cancel button cancels the dry-run job and closes`, `Confirm endpoint 409 (failed dry-run) surfaces detail as toast`)
+  Pinned by: `frontend/src/test/components/AIApplyConfirmModal.test.tsx` (`renders the plan text`, `shows the transcript with simulated badges once the dry-run succeeds`, `disables Confirm until the dry-run succeeds`, `Confirm POSTs to the confirm endpoint and closes`, `Cancel button cancels the dry-run job and closes`, `Confirm endpoint 409 (failed dry-run) surfaces detail as toast`); `tests/e2e/test_device_config_apply_playwright.py` (`test_dry_run_review_shows_the_transcript_and_confirm_queues_the_real_apply`)
 
 **Out of scope.** When the assistant opens the review (`ai-features.md`); the rest of
 the device page (`inventory.md`).
@@ -1451,9 +1451,9 @@ See [ENV_VARS.md](../ENV_VARS.md) for the rest.
 |---|---|---|
 | Unit | `services/common/tests/test_device_config.py`, `services/common/tests/test_acl.py`, `services/common/tests/test_bounded_tar.py`; `services/inventory/tests/test_published_schema.py`, `test_apply_scheduler.py`; `services/execution/tests/test_driver_loader*.py`, `test_driver_sandbox*.py`, `test_driver_structure.py`, `test_driver_load_sanitize_run.py`, `test_runner.py`, `test_sandbox_isolation.py`, `test_dry_run.py`, `test_driver_transcript.py`, `test_config_schema_extraction.py`, `test_configure_capability_parity.py`, `test_package_validator.py`; `tests/unit/test_checked_in_drivers_structure.py`; frontend `frontend/src/test/components/DeviceConfigSection.test.tsx`, `ApplyJobsPanel.test.tsx`, `AIApplyConfirmModal.test.tsx`, `frontend/src/test/lib/errors.test.ts`, `frontend/src/test/api/deviceConfig.test.tsx`, `deviceConfigJobs.test.tsx` | SQLite in memory; the sandbox suites start real child processes |
 | Functional (through the service API) | `services/inventory/tests/test_device_configs.py`, `test_device_configs_rbac.py`, `test_apply_jobs_reservation_owner.py`, `test_apply_jobs_reservation_scope.py`, `test_device_config_write_rules.py`, `test_dry_run_gate.py`, `test_confirm_dry_run.py`, `test_configure_capability_gate.py`, `test_device_config_restore_reservation_guard.py`, `test_device_read_visibility_gate.py`, `test_apply_jobs_internal_summary.py`, `test_router_edge_cases.py`; `services/execution/tests/test_router_endpoints.py`, `test_router_direct.py`, `test_api_endpoints.py`, `test_command_log*.py`, `test_config_schema_endpoint.py`, `test_configure_capability_gate.py`, `test_execution_service_edges.py`, `test_manual_execute_reservation_scope.py` | acl, reservations, and execution are patched |
-| Integration (running stack) | `tests/integration/test_config_apply_flow.py` (a config version validated through the schema proxy, a scheduled dry run fired by the scheduler on `drivers/frr_mgmt`, its transcript, the confirm, and the schedule's reservation check), `test_execution_configure_gate.py`, `test_execution_result_gating.py`, `test_execution_device_scope.py`, `test_package_validation.py`; the NOS lab tiers under `tests/nos_lab/` (`test_frr_mgmt_driver_live.py` drives the Management driver's `configure`) | The immediate apply and a real (not dry-run) scheduled push are not driven against a stack; the dev and gate stacks run the scheduler every 2 seconds (`docker-compose.override.yml`) |
-| Stress and load | None | `tests/load/locustfile.py` has no configuration task |
-| Browser end-to-end | `tests/e2e/test_flows_effects_playwright.py` (`test_device_config_version_cycle`: create, view, diff, restore), `tests/e2e/test_device_config_apply.py` (the section and panel render) | Apply, schedule, cancel, and the dry-run review are not driven in a browser; nightly and the gates only |
+| Integration (running stack) | `tests/integration/test_config_apply_flow.py` (a config version validated through the schema proxy, a scheduled dry run fired by the scheduler on `drivers/frr_mgmt`, its transcript, the confirm, and the schedule's reservation check), `test_execution_configure_gate.py`, `test_execution_result_gating.py`, `test_execution_device_scope.py`, `test_package_validation.py`; the NOS lab tiers under `tests/nos_lab/` (`test_frr_mgmt_driver_live.py` drives the Management driver's `configure`) | The immediate apply and a real (not dry-run) scheduled push are not driven by this suite; the browser tests below drive both, to a device with no host; the dev and gate stacks run the scheduler every 2 seconds (`docker-compose.override.yml`) |
+| Stress and load | `tests/load/locustfile.py` (`DeviceConfigUser`: version list, create, detail, and diff, the driver config-schema proxy, and the apply-job list, on one device of its own) | No load task applies, schedules, cancels, or confirms: a push would reach execution and a driver |
+| Browser end-to-end | `tests/e2e/test_flows_effects_playwright.py` (`test_device_config_version_cycle`: create, view, diff, restore), `tests/e2e/test_device_config_apply.py` (the section and panel render), `tests/e2e/test_device_config_apply_playwright.py` (Apply now, Schedule watched until the scheduler fires it, Cancel from the panel, and the dry-run review's Confirm, each read back through the API) | Both pushes from the device page are real applies to a device with no `HERD_ip`, refused by netmiko before any socket opens; the dry-run review is reached through the reservation assistant with its two calls answered in the page; nightly and the gates only |
 
 Run while writing this document: the inventory suite (985 passed), the common suite
 (462 passed, 7 skipped), the execution suite (1284 passed, 5 skipped), the four cited

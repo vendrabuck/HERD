@@ -7,9 +7,9 @@ set up in a generic test environment.
 
 This file covers the user-visible navigation half: an admin can open a device
 detail page from the inventory list, see the device-config section, and the
-section renders its config-JSON textarea and apply-jobs panel. The actual
-schedule submit is left as a deferred E2E gap; it is exercised by the
-execution-service integration and inventory device_config unit tests.
+section renders its config-JSON textarea and apply-jobs panel. Apply now,
+schedule, cancel, and the dry-run review are driven, with API read-back, by
+tests/e2e/test_device_config_apply_playwright.py (issue #1100).
 """
 
 import pytest
