@@ -157,12 +157,14 @@ clients have a suite but stay below 85% lines on error and edge-case branches:
   E2E gap until the LLM call can be stubbed at the network layer (the integration
   test `tests/integration/test_ai_status.py::test_ai_generate_succeeds_when_key_present`
   exercises the live LLM path).
-- [HIGH] Device-config edit, schedule, and result UI flow. Backend (inventory +
-  execution + scheduler) is unit-tested; the user-visible journey of editing
-  a config, scheduling an apply, and watching the job status update is not
-  (`tests/e2e/test_device_config_apply.py` covers the device-detail page, the
-  config section, and the apply-jobs panel rendering, but the schedule submit is
-  a deferred E2E gap).
+- [LOW] Device-config apply UI flow, remainder. `tests/e2e/test_device_config_apply_playwright.py`
+  (issue #1100) drives Apply now, Schedule (watched in the Scheduled applies panel
+  until the scheduler fires it), Cancel from the panel, and the dry-run review's
+  Confirm, each read back through the API. Not driven in a browser: a push that
+  reaches a real device (the device page offers no dry run, so both its pushes go
+  to a device with no `HERD_ip`; the live push is `docs/MANUAL_TESTING.md` M1), the
+  review's Cancel dry-run button, and a refused confirm (both pinned by
+  `frontend/src/test/components/AIApplyConfirmModal.test.tsx`).
 - [MEDIUM] Pathfind UI: "Find Path" button, result rendering, dedup display.
 - [MEDIUM] Device detail modal edit workflows (not the passive view already tested).
 
@@ -171,13 +173,15 @@ clients have a suite but stay below 85% lines on error and edge-case branches:
 `tests/load/locustfile.py` covers auth login, reservations, inventory list/detail,
 templates list, ACL check, bulk export (devices/templates/topologies, JSON and CSV,
 plus a dry-run import), notifications (unread-count, list, preferences write), a
-routed-topology validation task, and bulk connection creation (`POST /connections/bulk`).
+routed-topology validation task, bulk connection creation (`POST /connections/bulk`),
+and device configuration (`DeviceConfigUser`: config versions, the config-schema
+proxy, and the apply-job list on a device of its own; no apply or schedule).
 Missing coverage:
 
 - [MEDIUM] Topology write endpoints (create, update, canvas save, versions) beyond
   the bulk export path.
 - [MEDIUM] Drivers: list, upload, download.
-- [LOW] Reporting, pathfinding, AI, config.
+- [LOW] Reporting, pathfinding, AI.
 
 ## Suites that never run in GitHub CI
 

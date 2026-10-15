@@ -1,6 +1,6 @@
 """Locust load test definitions for HERD.
 
-Seven user classes simulating different usage patterns:
+Eight user classes simulating different usage patterns:
 - ReservationUser: creates, lists, queries calendar, releases reservations
 - InventoryBrowser: browses devices, templates, and the topologies list
 - BulkExporter: exports devices, templates, and topologies; dry-runs a device import
@@ -11,6 +11,8 @@ Seven user classes simulating different usage patterns:
 - NotificationUser: polls notifications and updates channel/event preferences
 - BulkConnectionAdmin: posts small POST /connections/bulk batches, then deletes
   what it created
+- DeviceConfigUser: writes and reads config versions, the driver config schema,
+  and the apply-job list on one device of its own, deleted at the end
 
 Note on the outbound notification channels and expiry reminder (ROADMAP #40):
 the dispatch side is a NATS consumer with no synchronous request surface, so it
@@ -22,6 +24,7 @@ path (polled by the bell on an interval, so the hottest read in the service) and
 the preferences read/write proxy that the /settings channel toggles drive.
 """
 
+import logging
 import os
 import random
 import uuid
@@ -32,6 +35,8 @@ import urllib3
 from locust import HttpUser, between, task
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+logger = logging.getLogger(__name__)
 
 
 def _load_repo_env() -> None:
@@ -535,3 +540,220 @@ class BulkConnectionAdmin(HerdUser):
                 f"/api/cabling/connections/{connection_id}",
                 name="/api/cabling/connections/[id]",
             )
+
+
+class DeviceConfigUser(HerdUser):
+    """Exercises the device-configuration read and write paths (issue #1100).
+
+    on_start picks a `Management` device template (the only connection type whose
+    versions are pushed, CFG-GATE-1) whose driver's config schema, read through
+    inventory's proxy, comes from the registry (`source` `registry`, CFG-SCHEMA-9):
+    the version bodies below use the registry's vocabulary, and a driver that
+    publishes its own schema replaces it (CFG-SCHEMA-6; frr_mgmt accepts only
+    `commands`), so such a template is skipped. Templates are tried in the order the
+    template list answers, newest first. It then creates ONE device of its own from
+    that template, filling the template's required fields with inert placeholders (a
+    documentation address, 192.0.2.10, for an `ip` field); on_stop deletes it, which
+    removes every version this user wrote (CFG-VER-15). Seeded devices are never
+    written to. The tasks list and create config versions on that device (each create
+    validates the config against the schema, CFG-VER-3), read one back, diff the two
+    newest, read the driver's config schema, and list the device's apply jobs. It
+    never applies or schedules: a push would reach execution and a driver, which is
+    not what this load measures.
+
+    With no such template, nothing is created and every task does nothing. A refused
+    device create is recorded as a locust failure on
+    `/api/inventory/devices [config load device]` (so the run exits 1), and every task
+    then does nothing. The device is AVAILABLE, so a `ReservationUser` can book it; a
+    delete refused with 409 `device_in_use` cancels the reservations the answer lists
+    and tries once more, and a delete that still fails is a locust failure and a
+    logged warning naming the device. A run killed before on_stop leaves its
+    `load-cfg-` device behind; delete it by name.
+    """
+
+    weight = 1
+    wait_time = between(1, 3)
+
+    def on_start(self):
+        self._login(ADMIN_EMAIL, ADMIN_PASSWORD)
+        self._device_id = None
+        self._driver_id = None
+        self._version_ids = []
+
+        resp = self._auth_get(
+            "/api/inventory/templates",
+            params={"limit": 200},
+            name="/api/inventory/templates [config load template pick]",
+        )
+        if resp.status_code != 200:
+            return
+        template = None
+        for candidate in resp.json().get("items", []):
+            if not (
+                candidate.get("template_type") == "device"
+                and candidate.get("connection_type") == "Management"
+                and candidate.get("driver_id")
+            ):
+                continue
+            schema = self._auth_get(
+                f"/api/inventory/drivers/{candidate['driver_id']}/config-schema",
+                name="/api/inventory/drivers/[id]/config-schema [config load template pick]",
+            )
+            if schema.status_code == 200 and schema.json().get("source") == "registry":
+                template = candidate
+                break
+        if template is None:
+            return
+        create = self._auth_post(
+            "/api/inventory/devices",
+            name="/api/inventory/devices [config load device]",
+            json={
+                "name": f"load-cfg-{uuid.uuid4().hex[:8]}",
+                "template_id": template["id"],
+                "topology_type": "PHYSICAL",
+                "status": "AVAILABLE",
+                "field_data": self._placeholder_fields(template),
+            },
+        )
+        if create.status_code != 201:
+            return
+        self._device_id = create.json()["id"]
+        self._driver_id = template["driver_id"]
+
+    @staticmethod
+    def _placeholder_fields(template: dict) -> dict:
+        """Inert values for the template's required fields; nothing ever connects."""
+        values = {}
+        for section in template.get("sections") or []:
+            for field in section.get("fields") or []:
+                if not field.get("required"):
+                    continue
+                kind = field.get("type")
+                if field.get("options"):
+                    values[field["key"]] = field["options"][0]
+                elif kind == "number":
+                    values[field["key"]] = 1
+                elif kind == "boolean":
+                    values[field["key"]] = False
+                elif field["key"] == "ip":
+                    values[field["key"]] = "192.0.2.10"
+                else:
+                    values[field["key"]] = "load"
+        return values
+
+    def on_stop(self):
+        if not self._device_id:
+            return
+        path = f"/api/inventory/devices/{self._device_id}"
+        name = "/api/inventory/devices/[id] [config load device]"
+        with self._auth_delete(path, name=name, catch_response=True) as resp:
+            blocking = self._blocking_reservation_ids(resp)
+            if resp.status_code == 204:
+                return
+            if blocking is None:
+                resp.failure(f"device delete answered {resp.status_code}: {resp.text[:200]}")
+                logger.warning(
+                    "DeviceConfigUser could not delete its device %s: HTTP %s",
+                    self._device_id,
+                    resp.status_code,
+                )
+                return
+            # A ReservationUser booked this AVAILABLE device; not a load failure.
+            resp.success()
+        for reservation_id in blocking:
+            self._auth_delete(
+                f"/api/reservations/{reservation_id}",
+                name="/api/reservations/[id] [config load device release]",
+            )
+        with self._auth_delete(path, name=name, catch_response=True) as retry:
+            if retry.status_code != 204:
+                retry.failure(f"device delete answered {retry.status_code}: {retry.text[:200]}")
+                logger.warning(
+                    "DeviceConfigUser could not delete its device %s after cancelling "
+                    "reservations %s: HTTP %s; delete it by hand",
+                    self._device_id,
+                    blocking,
+                    retry.status_code,
+                )
+
+    @staticmethod
+    def _blocking_reservation_ids(resp) -> list | None:
+        """The reservation ids of a 409 `device_in_use` answer, else None."""
+        if resp.status_code != 409:
+            return None
+        try:
+            detail = resp.json().get("detail")
+        except ValueError:
+            return None
+        if not isinstance(detail, dict) or detail.get("error") != "device_in_use":
+            return None
+        ids = detail.get("reservation_ids")
+        if not isinstance(ids, list) or not ids:
+            return None
+        return [str(i) for i in ids]
+
+    @task(4)
+    def list_versions(self):
+        if not self._device_id:
+            return
+        self._auth_get(
+            f"/api/inventory/devices/{self._device_id}/config-versions",
+            name="/api/inventory/devices/[id]/config-versions",
+        )
+
+    @task(2)
+    def create_version(self):
+        if not self._device_id:
+            return
+        resp = self._auth_post(
+            f"/api/inventory/devices/{self._device_id}/config-versions",
+            name="/api/inventory/devices/[id]/config-versions [create]",
+            # The registry's Management vocabulary (CFG-SCHEMA-1).
+            json={
+                "config": {
+                    "hostname": f"load-{uuid.uuid4().hex[:8]}",
+                    "vlan": random.randint(1, 4094),
+                },
+                "description": "load test",
+            },
+        )
+        if resp.status_code == 201:
+            self._version_ids.append(resp.json()["id"])
+
+    @task(2)
+    def read_version(self):
+        if not self._device_id or not self._version_ids:
+            return
+        self._auth_get(
+            f"/api/inventory/devices/{self._device_id}/config-versions/"
+            f"{random.choice(self._version_ids)}",
+            name="/api/inventory/devices/[id]/config-versions/[vid]",
+        )
+
+    @task(1)
+    def diff_versions(self):
+        if not self._device_id or len(self._version_ids) < 2:
+            return
+        self._auth_get(
+            f"/api/inventory/devices/{self._device_id}/config-versions/diff",
+            name="/api/inventory/devices/[id]/config-versions/diff",
+            params={"from": self._version_ids[-2], "to": self._version_ids[-1]},
+        )
+
+    @task(2)
+    def read_config_schema(self):
+        if not self._driver_id:
+            return
+        self._auth_get(
+            f"/api/inventory/drivers/{self._driver_id}/config-schema",
+            name="/api/inventory/drivers/[id]/config-schema",
+        )
+
+    @task(2)
+    def list_apply_jobs(self):
+        if not self._device_id:
+            return
+        self._auth_get(
+            f"/api/inventory/devices/{self._device_id}/apply-jobs",
+            name="/api/inventory/devices/[id]/apply-jobs",
+        )

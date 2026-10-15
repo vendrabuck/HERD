@@ -4,7 +4,7 @@ HERD's load tests drive the HTTP API with [Locust](https://locust.io/), a Python
 
 ## What the tests do
 
-The locustfile lives at `tests/load/locustfile.py`. It defines one abstract base class and seven concrete user classes:
+The locustfile lives at `tests/load/locustfile.py`. It defines one abstract base class and eight concrete user classes:
 
 ### `HerdUser` (base)
 
@@ -101,9 +101,41 @@ Exercises `POST /connections/bulk`, the admin-only bulk cable-create path.
     legitimate outcome under concurrency, not a load-test failure.
 - Think time: 2 to 5 seconds.
 
+### `DeviceConfigUser` (weight 1)
+
+Exercises the device-configuration paths (issue #1100) on one device of its own.
+
+- `on_start`: logs in as admin and walks the device templates whose connection
+  type is `Management` in the order the template list answers (newest first). For
+  each it reads the driver's config schema through inventory's proxy and keeps the
+  first whose `source` is `registry`: the version bodies use the registry's
+  vocabulary, and a driver that publishes its own schema (frr_mgmt accepts only
+  `commands`) would refuse every create. It creates one `load-cfg-<hex>` device from
+  that template, filling the template's required fields with inert placeholders (an
+  `ip` field gets the documentation address `192.0.2.10`). With no such template,
+  nothing is created and every task does nothing. A refused device create is a
+  recorded locust failure (the run exits 1), and every task then does nothing.
+- `on_stop`: deletes the device, which removes every config version it wrote. The
+  device is `AVAILABLE`, so a `ReservationUser` can book it: a delete refused with
+  409 `device_in_use` cancels the reservations the answer lists and tries once
+  more; a delete that still fails is a recorded failure and a logged warning naming
+  the device. A run killed before `on_stop` leaves the device behind; delete it by
+  name.
+- Tasks:
+  - `list_versions` (weight 4): `GET /api/inventory/devices/{id}/config-versions`
+  - `create_version` (weight 2): `POST` a new version with the registry's
+    `Management` vocabulary (`hostname`, `vlan`), validated on every create
+  - `read_version` (weight 2): `GET` one version this user wrote
+  - `diff_versions` (weight 1): `GET .../config-versions/diff` of the two newest
+  - `read_config_schema` (weight 2): `GET /api/inventory/drivers/{id}/config-schema`
+  - `list_apply_jobs` (weight 2): `GET /api/inventory/devices/{id}/apply-jobs`
+- It never applies or schedules: a push would reach execution and a driver.
+  Seeded devices are never written to.
+- Think time: 1 to 3 seconds.
+
 ### Class weighting
 
-Locust picks which class to spawn using the `weight` attribute. With the defaults (`ReservationUser` 3, `InventoryBrowser` 5, `BulkExporter` 1, `RoutedTopologyValidator` 1, `NotificationUser` 2, `ACLChecker` 2, `BulkConnectionAdmin` 1; total 15), out of every 15 virtual users you get roughly 3 reservation users, 5 inventory browsers, 1 bulk exporter, 1 routed-topology validator, 2 notification users, 2 ACL checkers, and 1 bulk-connection admin. Increase `-u` to scale all seven proportionally.
+Locust picks which class to spawn using the `weight` attribute. With the defaults (`ReservationUser` 3, `InventoryBrowser` 5, `BulkExporter` 1, `RoutedTopologyValidator` 1, `NotificationUser` 2, `ACLChecker` 2, `BulkConnectionAdmin` 1, `DeviceConfigUser` 1; total 16), out of every 16 virtual users you get roughly 3 reservation users, 5 inventory browsers, 1 bulk exporter, 1 routed-topology validator, 2 notification users, 2 ACL checkers, 1 bulk-connection admin, and 1 device-config user. Increase `-u` to scale all eight proportionally.
 
 ## Prerequisites
 
