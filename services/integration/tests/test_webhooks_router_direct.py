@@ -444,8 +444,8 @@ def _sink_app():
 
 
 def _sink_token(role: str) -> str:
+    import jwt
     from app.config import settings
-    from jose import jwt
 
     return jwt.encode(
         {"sub": str(uuid.uuid4()), "role": role}, settings.secret_key, algorithm="HS256"

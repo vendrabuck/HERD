@@ -24,8 +24,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import jwt
 import pytest
-from jose import jwt
 
 pytestmark = pytest.mark.asyncio
 

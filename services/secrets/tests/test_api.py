@@ -12,6 +12,7 @@ import types
 import uuid
 
 import httpx
+import jwt
 import pytest
 from app import routers
 from app.config import settings
@@ -21,11 +22,10 @@ from app.models import Secret
 from app.services.keyring import Keyring, RotationConflictError, bootstrap_keyring
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
-from jose import jwt
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-SECRET_KEY = "test-secret"
+SECRET_KEY = "3fcbb4bf16b0e162be24d2eb59065316c1e84194669ebf9270203280b18e18f7"
 PLAINTEXT = {"username": "svc-account", "password": "hunter2-plaintext-canary"}
 
 

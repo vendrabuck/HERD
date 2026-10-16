@@ -8,7 +8,9 @@ carry: the value, or any leading part of it.
 
 import importlib
 import logging
+import warnings
 
+import jwt
 import pytest
 from herd_common import auth_settings
 from herd_common.auth_settings import (
@@ -21,6 +23,8 @@ from herd_common.auth_settings import (
     validate_auth_secret,
     validate_jwt_algorithm,
 )
+from herd_common.jwt_codec import decode_access_token
+from jwt.warnings import InsecureKeyLengthWarning
 from pydantic import BaseModel, ValidationError
 
 LOGGER_NAME = "herd_common.auth_settings"
@@ -149,10 +153,10 @@ def test_secret_is_returned_unchanged_including_surrounding_space():
     assert validate_auth_secret(value) == value
 
 
-# Shapes jose will not sign and verify with as an HMAC secret: a PEM public key,
-# an RSA public key, a certificate, and an ssh public key are refused while the
-# key is built; a JSON-shaped value signs but is read as a JSON Web Key on
-# verify, so no token it signs verifies.
+# Shapes PyJWT will not sign and verify with as an HMAC secret: a PEM public
+# key, an RSA public key, a certificate, an ssh public key, and a JSON value
+# carrying a `kty` member (a JSON Web Key) are refused with InvalidKeyError while
+# the key is prepared.
 _UNUSABLE_SECRETS = {
     "pem-public-key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQc=\n"
     "-----END PUBLIC KEY-----",
@@ -162,12 +166,11 @@ _UNUSABLE_SECRETS = {
     "-----END CERTIFICATE-----",
     "ssh-public-key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7 user@host",
     "json-web-key": '{"kty": "oct", "k": "c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0"}',
-    "json-object": '{"secret": "0123456789abcdef0123456789abcdef"}',
 }
 
 
 @pytest.mark.parametrize("name", sorted(_UNUSABLE_SECRETS))
-def test_secret_jose_cannot_sign_and_verify_with_is_refused(name, caplog):
+def test_secret_pyjwt_cannot_sign_and_verify_with_is_refused(name, caplog):
     caplog.set_level(logging.DEBUG)
     value = _UNUSABLE_SECRETS[name]
     with pytest.raises(ValidationError) as exc_info:
@@ -181,24 +184,56 @@ def test_secret_jose_cannot_sign_and_verify_with_is_refused(name, caplog):
     assert all(line not in errors[0]["msg"] for line in value.splitlines())
 
 
+def test_a_json_object_without_kty_is_an_ordinary_secret_and_loads(caplog):
+    # By decision (issue #1186): the library HERD used before PyJWT refused any
+    # JSON-shaped value; PyJWT refuses only one carrying a `kty` member, so this
+    # loads as an HMAC secret.
+    caplog.set_level(logging.DEBUG)
+    value = '{"secret": "0123456789abcdef0123456789abcdef"}'
+    assert _Model(secret_key=value).secret_key == value
+    assert caplog.records == []
+
+
 def test_the_round_trip_signs_and_verifies_with_the_value_itself(monkeypatch):
     seen: list = []
     real_encode = auth_settings.jwt.encode
-    real_decode = auth_settings.jwt.decode
 
     def recording_encode(claims, key, algorithm):
         seen.append(("encode", key, algorithm))
         return real_encode(claims, key, algorithm=algorithm)
 
-    def recording_decode(token, key, algorithms):
-        seen.append(("decode", key, algorithms))
-        return real_decode(token, key, algorithms=algorithms)
+    def recording_decode(token, key, algorithm):
+        seen.append(("decode", key, algorithm))
+        return decode_access_token(token, key, algorithm)
 
     monkeypatch.setattr(auth_settings.jwt, "encode", recording_encode)
-    monkeypatch.setattr(auth_settings.jwt, "decode", recording_decode)
+    monkeypatch.setattr(auth_settings, "decode_access_token", recording_decode)
     value = "k" * 40
     assert validate_auth_secret(value) == value
-    assert seen == [("encode", value, "HS256"), ("decode", value, ["HS256"])]
+    assert seen == [("encode", value, "HS256"), ("decode", value, "HS256")]
+
+
+def test_a_short_secret_raises_no_python_warning_at_load():
+    # PyJWT warns on both round-trip calls for a key under 32 bytes; the round
+    # trip ignores exactly that warning, so a short secret loads under the suites'
+    # filterwarnings = ["error"] and the rule's one log line is the only signal.
+    value = "q" * 20
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert validate_auth_secret(value) == value
+    assert caught == []
+
+
+def test_the_round_trip_does_not_silence_the_warning_outside_itself():
+    # The filter is set before the load and not reset after it, so an ignore the
+    # round trip left behind would hide the later warning. (pytest.warns would not
+    # see that: it installs its own "always" filter.)
+    value = "q" * 20
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", InsecureKeyLengthWarning)
+        assert validate_auth_secret(value) == value
+        jwt.encode({"sub": "x"}, value, algorithm="HS256")
+    assert [w.category for w in caught] == [InsecureKeyLengthWarning]
 
 
 def test_a_blank_or_placeholder_secret_is_refused_before_the_round_trip(monkeypatch):
@@ -212,7 +247,7 @@ def test_a_blank_or_placeholder_secret_is_refused_before_the_round_trip(monkeypa
         assert str(exc_info.value) == EXPECTED_SECRET_MESSAGE
 
 
-def test_a_short_secret_that_jose_cannot_use_is_refused_without_the_warning(caplog):
+def test_a_short_secret_that_pyjwt_cannot_use_is_refused_without_the_warning(caplog):
     caplog.set_level(logging.DEBUG, logger=LOGGER_NAME)
     with pytest.raises(ValueError) as exc_info:
         validate_auth_secret("ssh-rsa AAAA")

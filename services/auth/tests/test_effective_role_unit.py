@@ -19,6 +19,7 @@ ever changed to accept credentials some other way.
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import jwt
 import pytest
 from app.config import settings
 from app.dependencies.auth import (
@@ -29,7 +30,6 @@ from app.dependencies.auth import (
 )
 from app.models.user import Role, User
 from app.utils.jwt import create_access_token
-from jose import jwt as jose_jwt
 from starlette.requests import Request
 
 ROLES = [Role.USER, Role.ADMIN, Role.SUPERADMIN]
@@ -57,7 +57,7 @@ def _expired_token(role: str = "superadmin") -> str:
         "role": role,
         "exp": datetime.now(timezone.utc) - timedelta(minutes=5),
     }
-    return jose_jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
+    return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
 
 
 @pytest.mark.parametrize("db_role", ROLES)

@@ -3,6 +3,7 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import jwt
 import pytest
 from app import config as config_module
 from app.database import Base, engine
@@ -14,7 +15,6 @@ from app.routes.template_identity import (
 from app.services.ai_client import AIError, get_ai_client
 from app.services.llm_provider import Usage
 from httpx import ASGITransport, AsyncClient
-from jose import jwt
 
 _ADMIN_ID = str(uuid.uuid4())
 

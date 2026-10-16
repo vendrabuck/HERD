@@ -4,15 +4,16 @@ import logging
 import time
 import uuid
 
+import jwt
 import pytest
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from herd_common import auth as auth_module
 from herd_common.auth import caller_id, make_auth_dependencies
 from herd_common.logging import JSONFormatter
-from jose import jwt
 
-SECRET = "test-secret"
+SECRET = "3fcbb4bf16b0e162be24d2eb59065316c1e84194669ebf9270203280b18e18f7"
+OTHER_SECRET = "c1d8e0f2a4b6c8d0e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4c6d8"
 ALG = "HS256"
 
 get_current_user_payload, require_admin = make_auth_dependencies(SECRET, ALG)
@@ -46,14 +47,14 @@ def test_valid_token_returns_payload():
 
 
 def test_expired_token_raises_401():
-    token = _make_token({"sub": "user-1", "exp": int(time.time()) - 10})
+    token = _make_token({"sub": "user-1", "exp": int(time.time()) - 60})
     with pytest.raises(HTTPException) as exc_info:
         get_current_user_payload(_creds(token))
     assert exc_info.value.status_code == 401
 
 
 def test_invalid_signature_raises_401():
-    token = _make_token({"sub": "user-1"}, secret="wrong-secret")
+    token = _make_token({"sub": "user-1"}, secret=OTHER_SECRET)
     with pytest.raises(HTTPException) as exc_info:
         get_current_user_payload(_creds(token))
     assert exc_info.value.status_code == 401
@@ -81,9 +82,12 @@ def test_malformed_token_raises_401():
 
 # --- algorithm list and key errors ---
 
-# jose refuses this as an HMAC secret (it is shaped like a public key) and raises
-# JWKError, a JOSEError that is not a JWTError, while building the key.
-ASYMMETRIC_SHAPED_KEY = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQc=\n"
+# PyJWT refuses this as an HMAC secret (it is a PEM public key block) and raises
+# InvalidKeyError, a PyJWTError that is not an InvalidTokenError, while preparing
+# the key.
+ASYMMETRIC_SHAPED_KEY = (
+    "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQc=\n-----END PUBLIC KEY-----\n"
+)
 
 
 def _unsigned_token(payload: dict) -> str:
@@ -108,7 +112,7 @@ def test_token_signed_with_another_hmac_algorithm_raises_401():
     assert exc_info.value.detail == "Could not validate credentials"
 
 
-def test_key_that_jose_cannot_use_raises_401_not_a_key_error():
+def test_key_that_pyjwt_cannot_use_raises_401_not_a_key_error():
     payload_dep, _ = make_auth_dependencies(ASYMMETRIC_SHAPED_KEY, ALG)
     token = _make_token({"sub": "user-1"})
     with pytest.raises(HTTPException) as exc_info:
@@ -118,7 +122,8 @@ def test_key_that_jose_cannot_use_raises_401_not_a_key_error():
 
 
 def _record_decode_algorithms(monkeypatch) -> list:
-    """Wrap jose's decode as herd_common.auth reaches it; record `algorithms`."""
+    """Wrap PyJWT's decode as herd_common.auth reaches it through the shared
+    helper; record `algorithms`."""
     seen: list = []
     real_decode = auth_module.jwt.decode
 
@@ -152,10 +157,10 @@ def test_key_error_is_logged_once_by_class_name(caplog):
     logged = json.loads(formatted)
     assert logged["level"] == "ERROR"
     assert logged["message"] == (
-        "access token not checked: the configured key is unusable (JWKError)"
+        "access token not checked: the configured key is unusable (InvalidKeyError)"
     )
     assert logged["action"] == "jwt_key_unusable"
-    assert logged["error_class"] == "JWKError"
+    assert logged["error_class"] == "InvalidKeyError"
     assert "BEGIN PUBLIC KEY" not in formatted
     assert "HMAC" not in formatted
 
@@ -166,7 +171,7 @@ def test_a_token_that_does_not_verify_is_not_logged(caplog, shape):
     token = {
         "alg-none": _unsigned_token({"sub": "user-1"}),
         "hs512": jwt.encode({"sub": "user-1"}, SECRET, algorithm="HS512"),
-        "wrong-key": _make_token({"sub": "user-1"}, secret="another-secret"),
+        "wrong-key": _make_token({"sub": "user-1"}, secret=OTHER_SECRET),
         "garbage": "not.a.token",
     }[shape]
     with pytest.raises(HTTPException) as exc_info:
