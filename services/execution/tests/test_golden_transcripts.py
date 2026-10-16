@@ -45,8 +45,8 @@ def _load_fixtures() -> list[tuple[str, dict]]:
 def _materialize_driver(driver_name: str, tmp_path: Path) -> str:
     """Copy a fixture driver package to a fresh temp dir and return the path.
 
-    The sandbox sets PYTHONPATH to this dir; copying isolates each test from
-    bytecode caches in the source tree.
+    The sandbox runner puts this dir on the child's sys.path; copying isolates
+    each test from bytecode caches in the source tree.
     """
     src = DRIVER_ROOT / driver_name
     if not src.exists():
