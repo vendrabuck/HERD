@@ -15,12 +15,16 @@ printable character other than white space (empty, white space only, or only
 invisible format characters such as a zero-width space or a byte-order mark),
 and any value that, stripped, starts with `<` and ends with `>`: the shape of
 the placeholder `.env.example` ships (`<secret key goes here>`), in any wording.
-It then signs one HS256 token with the value and verifies it with the value
-through jose, and refuses with `SECRET_KEY_UNUSABLE_MESSAGE` when jose raises
-any `JOSEError` (a PEM, certificate, or ssh public key shape is not an HMAC key
-to jose, and a JSON-shaped value is read as a JSON Web Key on verify, so its
-signature never verifies). The round trip neither logs nor returns the value or
-any part of it. A value whose UTF-8 encoding is shorter than
+It then signs one HS256 token with the value through PyJWT and verifies it with
+the value through `herd_common.jwt_codec.decode_access_token`, and refuses with
+`SECRET_KEY_UNUSABLE_MESSAGE` when PyJWT raises any `jwt.PyJWTError`: PyJWT's
+HMAC key preparation refuses a PEM block (a public or private key, a
+certificate), an ssh public key, and a JSON value carrying a `kty` member (a JSON
+Web Key) with `InvalidKeyError`. Any other JSON-shaped value is an ordinary HMAC
+secret to PyJWT and loads. The round trip neither logs nor returns the value or
+any part of it, and it ignores PyJWT's `InsecureKeyLengthWarning` for its own two
+calls only: the short-key rule is the byte-length check below, which logs, and
+the test suites turn every warning into an error. A value whose UTF-8 encoding is shorter than
 `MIN_SECRET_KEY_BYTES` loads, and one warning is logged through the `logging`
 module (never `warnings`, which the test suites turn into errors) carrying only
 the byte length.
@@ -43,10 +47,14 @@ the copies equal to these.
 """
 
 import logging
+import warnings
 from typing import Annotated
 
-from jose import JOSEError, jwt
+import jwt
+from jwt.warnings import InsecureKeyLengthWarning
 from pydantic import AfterValidator
+
+from herd_common.jwt_codec import decode_access_token
 
 logger = logging.getLogger(__name__)
 
@@ -84,10 +92,21 @@ def _is_placeholder(value: str) -> bool:
 
 
 def _signs_and_verifies(value: str) -> bool:
+    """Whether PyJWT can sign and verify one HS256 token with `value` as the key.
+
+    PyJWT warns with `InsecureKeyLengthWarning` on both calls when the key is
+    shorter than 32 bytes. That warning, and only that one, is ignored inside
+    this round trip: `validate_auth_secret` enforces the short-key rule itself
+    with a byte-length check and one log line, and under the test suites'
+    `filterwarnings = ["error"]` the warning would otherwise refuse a short key
+    the rule says must load.
+    """
     try:
-        token = jwt.encode({"sub": "x"}, value, algorithm="HS256")
-        jwt.decode(token, value, algorithms=["HS256"])
-    except JOSEError:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", InsecureKeyLengthWarning)
+            token = jwt.encode({"sub": "x"}, value, algorithm="HS256")
+            decode_access_token(token, value, "HS256")
+    except jwt.PyJWTError:
         return False
     return True
 

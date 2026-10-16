@@ -17,8 +17,9 @@ write a value every service would then refuse at startup:
 The two message strings are the shared module's, spelled identically;
 tests/test_auth_rules.py pins them equal to herd_common.auth_settings on the
 host, where both are importable. The services' third rule, a signing round trip
-through jose (which this service does not ship), is not copied: a value that
-passes here and fails it is refused at service startup with
+through PyJWT and herd_common.jwt_codec, is not copied (this service ships PyJWT
+for its own session but not herd_common): a value that passes here and fails it
+is refused at service startup with
 herd_common.auth_settings.SECRET_KEY_UNUSABLE_MESSAGE, which names the config UI
 as well as .env.
 """
