@@ -1244,9 +1244,12 @@ the child entry point `services/execution/app/services/_runner.py`;
   module the runner imported first (`json`) is never imported, by the runner or the
   driver, because `sys.modules` keeps serving the standard library one; a package
   module that shadows one the runner has not imported still does, under the limits.
-  A package `driver_transcript.py` or `_rlimits.py` never replaces the runner's own. \
+  A package `driver_transcript.py` or `_rlimits.py` never replaces the runner's own.
+  The order is load-bearing: `_rlimits` imports `resource` lazily, inside
+  `apply_rlimits`, so a package `resource.py` on the path before the caps would make
+  that import fail and leave every limit off; it never runs. \
   Enforced in: `services/execution/app/services/driver_sandbox.py` (`_rlimit_pairs`, `execute_driver_method`); `services/execution/app/services/_rlimits.py` (`apply_rlimits`); `services/execution/app/services/_runner.py` (`main`, `_put_package_on_path`) \
-  Pinned by: `services/execution/tests/test_driver_sandbox_edges.py` (`test_rlimit_pairs_reads_settings_live`, `test_apply_rlimits_applies_each_positive_limit`, `test_apply_rlimits_skips_unknown_limit_name`, `test_apply_rlimits_swallows_setrlimit_error`, `test_execute_passes_rlimit_policy_to_child_env`); `services/execution/tests/test_sandbox_isolation.py` (`test_memory_limit_kills_driver`, `test_cpu_limit_kills_driver`, `test_package_sitecustomize_never_runs_in_the_child`, `test_package_json_module_never_replaces_the_standard_library`, `test_package_module_the_driver_imports_runs_under_the_caps`, `test_child_is_isolated_and_resolves_runner_then_package_then_deps`, `test_checked_in_mock_l1_driver_still_runs_in_the_isolated_child`); `services/execution/tests/test_runner.py` (`test_put_package_on_path_inserts_package_right_after_the_runner_dir`, `test_put_package_on_path_adds_deps_after_the_package`)
+  Pinned by: `services/execution/tests/test_driver_sandbox_edges.py` (`test_rlimit_pairs_reads_settings_live`, `test_apply_rlimits_applies_each_positive_limit`, `test_apply_rlimits_skips_unknown_limit_name`, `test_apply_rlimits_swallows_setrlimit_error`, `test_execute_passes_rlimit_policy_to_child_env`); `services/execution/tests/test_sandbox_isolation.py` (`test_memory_limit_kills_driver`, `test_cpu_limit_kills_driver`, `test_package_sitecustomize_never_runs_in_the_child`, `test_package_json_module_never_replaces_the_standard_library`, `test_package_module_the_driver_imports_runs_under_the_caps`, `test_child_is_isolated_and_resolves_runner_then_package_then_deps`, `test_checked_in_mock_l1_driver_still_runs_in_the_isolated_child`, `test_package_resource_module_cannot_switch_the_caps_off`); `services/execution/tests/test_runner.py` (`test_put_package_on_path_inserts_package_right_after_the_runner_dir`, `test_put_package_on_path_adds_deps_after_the_package`)
 - **CFG-SBX-5.** Unless the caller passes a timeout, `status` gets
   `STATUS_CHECK_TIMEOUT_SECONDS` (10) and every other action `EXECUTION_TIMEOUT_SECONDS`
   (30); a child still running then is killed and the call fails with
@@ -1268,7 +1271,7 @@ the child entry point `services/execution/app/services/_runner.py`;
   Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_execute_non_json_stdout`, `test_execute_failing_driver`); `services/execution/tests/test_driver_sandbox_edges.py` (`test_success_with_non_json_stdout_wraps_raw_output`, `test_success_with_stderr_carries_it_separately_and_leaves_error_none`, `test_negative_returncode_reports_signal`, `test_raise_behind_stderr_noise_is_still_sanitized`, `test_parser_reads_only_the_last_line`, `test_unstructured_failure_never_stores_raw_stderr_as_error`)
 - **CFG-SBX-8.** A package's `requirements.txt` is installed into `_deps` (60 seconds,
   no resource limits, errors only logged) only when `ALLOW_DRIVER_PIP_INSTALL` is true
-  and `_deps` does not exist yet, by `python -I -m pip install -r <requirements.txt>
+  and `_deps` does not exist yet, by `python -I -B -m pip install -r <requirements.txt>
   --target <_deps> -q`, so pip, too, imports nothing from the package directory or the
   current directory (issue #1180). \
   Enforced in: `services/execution/app/services/driver_sandbox.py` (`execute_driver_method`) \

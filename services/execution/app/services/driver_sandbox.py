@@ -236,10 +236,11 @@ def execute_driver_method(
         # off). When off, drivers must vendor their deps into _deps/. The
         # install subprocess deliberately does NOT apply the driver rlimits: it
         # does not run the _runner.py wrapper (which reads _RLIMITS_ENV_KEY), so
-        # the 256MB RLIMIT_AS never bites pip. It runs as `python -I -m pip`
-        # for the same reason the child does (issue #1180): pip must not import
-        # a `sitecustomize.py` or a stdlib-shadowing module from the package
-        # directory or the current directory.
+        # the 256MB RLIMIT_AS never bites pip. It runs as `python -I -B -m pip`
+        # for the same reasons the child runs with those flags (issue #1180):
+        # pip must not import a `sitecustomize.py` or a stdlib-shadowing module
+        # from the package directory or the current directory, and `-B` stands
+        # in for the PYTHONDONTWRITEBYTECODE that `-I` ignores.
         deps_dir = os.path.join(driver_path, "_deps")
         reqs_file = os.path.join(driver_path, "requirements.txt")
         if os.path.exists(reqs_file) and not os.path.exists(deps_dir):
@@ -249,6 +250,7 @@ def execute_driver_method(
                         [
                             "python",
                             "-I",
+                            "-B",
                             "-m",
                             "pip",
                             "install",

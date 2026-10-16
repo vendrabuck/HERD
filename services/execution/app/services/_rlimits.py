@@ -8,11 +8,13 @@ other service module:
 - the child wrapper (_runner.py, as _rlimits, since the services directory is
   on the child's sys.path) applies them before importing any driver code.
 
-The child runs in isolated mode (`python -I -B`, issue #1180) with only the
-runner's own directory on sys.path when this module is imported (the driver
-path and _deps are added after the limits apply), so it cannot import settings;
-keeping this module dependency-free is what lets both sides share the apply
-logic instead of duplicating it. The policy (which RLIMIT_* maps
+The child runs in isolated mode (`python -I -B`, issue #1180). When this module
+is imported there, the child's sys.path holds the runner's own directory ahead
+of the standard library and site-packages, but not the driver path or _deps,
+which are added only after the limits apply; and the child gets no service
+settings environment, so this module must not depend on settings. Keeping it
+dependency-free is what lets both sides share the apply logic instead of
+duplicating it. The policy (which RLIMIT_* maps
 to which setting, and the concrete values) lives once, in the parent.
 """
 

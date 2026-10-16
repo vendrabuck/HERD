@@ -151,7 +151,7 @@ def test_pip_install_exception_swallowed(monkeypatch):
     raised = []
 
     def fake_run(cmd, *args, **kwargs):
-        if cmd[:5] == ["python", "-I", "-m", "pip", "install"]:
+        if cmd[:6] == ["python", "-I", "-B", "-m", "pip", "install"]:
             raised.append(cmd)
             raise RuntimeError("pip exploded")
         return real_run(cmd, *args, **kwargs)

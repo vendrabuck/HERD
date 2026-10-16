@@ -82,7 +82,11 @@ def main():
         _rlimits.apply_rlimits(json.loads(_rlimits_json))
 
     driver_path = sys.argv[1]
-    # Only now, with the caps applied, does the package become importable.
+    # Only now, with the caps applied, does the package become importable. The
+    # order is load-bearing: `_rlimits` imports `resource` lazily, inside
+    # apply_rlimits, so `resource` must resolve before the package is on the
+    # path; a package `resource.py` found first would make that import fail and
+    # leave every limit off.
     _put_package_on_path(driver_path)
     action = sys.argv[2]
     context_file = sys.argv[3]

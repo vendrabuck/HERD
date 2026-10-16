@@ -216,6 +216,7 @@ import sys
 import driver_transcript
 import herd_probe_dep
 import herd_probe_local
+from lib import herd_probe_lib
 
 class Driver:
     def __init__(self, context):
@@ -229,6 +230,7 @@ class Driver:
             "driver_transcript_file": driver_transcript.__file__,
             "local": herd_probe_local.WHERE,
             "dep": herd_probe_dep.WHERE,
+            "lib": herd_probe_lib.WHERE,
         }
 """
 
@@ -282,9 +284,14 @@ def test_package_json_module_never_replaces_the_standard_library(monkeypatch, tm
 
     assert not marker.exists(), f"package json.py ran, RLIMIT_AS seen: {marker.read_text()}"
     assert result["success"] is True, result
-    # The test process and the child run the same interpreter, so the standard
-    # library json has the same file in both.
-    assert result["output"] == {"json_file": json.__file__, "dumped": "[1, 2]"}
+    output = result["output"]
+    assert set(output) == {"json_file", "dumped"}
+    assert output["dumped"] == "[1, 2]"
+    # The standard library package, never the package's own json.py. Judged by
+    # the path alone: the child runs `python` from PATH, which need not be the
+    # interpreter running this test.
+    assert not output["json_file"].startswith(driver_dir + os.sep), output["json_file"]
+    assert output["json_file"].endswith(os.path.join("json", "__init__.py")), output["json_file"]
 
 
 @_skip_no_rlimit
@@ -302,12 +309,71 @@ def test_package_module_the_driver_imports_runs_under_the_caps(monkeypatch):
     assert result["output"] == {"as_at_import": [_PROBE_AS_BYTES, _PROBE_AS_BYTES]}
 
 
+# A package `resource.py` that records that it ran and then fails to import.
+# `_rlimits.apply_rlimits` imports `resource` lazily and returns without
+# applying any limit when that import fails, so if the package were on sys.path
+# before the caps, this shadow would switch every limit off.
+_RESOURCE_SHADOW = """
+import os
+
+_marker = os.environ.get("HERD_PROBE_MARKER")
+if _marker:
+    with open(_marker, "w") as _f:
+        _f.write("package resource.py ran")
+raise ImportError("package resource.py shadow")
+"""
+
+# Reads the real address-space limit: drops its own package directory from
+# sys.path, forgets any cached `resource`, and imports the standard one.
+REAL_RESOURCE_DRIVER = """
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+class Driver:
+    def __init__(self, context):
+        self.context = context
+
+    def status(self):
+        sys.path[:] = [p for p in sys.path if os.path.abspath(p) != _HERE]
+        sys.modules.pop("resource", None)
+        import resource
+
+        return {"as": list(resource.getrlimit(resource.RLIMIT_AS))}
+"""
+
+
+@_skip_no_rlimit
+def test_package_resource_module_cannot_switch_the_caps_off(monkeypatch, tmp_path):
+    """The package goes on sys.path only AFTER the caps are applied. The order
+    matters: `_rlimits` imports `resource` lazily, inside `apply_rlimits`, and
+    `resource` is an extension module that sits after the package directory on
+    the path, so a package put on the path first would serve its own
+    `resource.py` there; the import would fail and no limit would apply. Here
+    the shadow never runs and the driver reads the configured cap."""
+    _limit_address_space_only(monkeypatch)
+    driver_dir = _make_driver_dir(REAL_RESOURCE_DRIVER)
+    with open(os.path.join(driver_dir, "resource.py"), "w") as f:
+        f.write(_RESOURCE_SHADOW)
+    marker = tmp_path / "resource_shadow.marker"
+
+    result = execute_driver_method(
+        driver_dir, "status", {"HERD_probe_marker": str(marker)}, timeout=10
+    )
+
+    assert not marker.exists(), marker.read_text()
+    assert result["success"] is True, result
+    assert result["output"] == {"as": [_PROBE_AS_BYTES, _PROBE_AS_BYTES]}
+
+
 def test_child_is_isolated_and_resolves_runner_then_package_then_deps(monkeypatch):
     """The child runs with `-I -B`, and the sys.path a driver sees starts with
     the runner directory, then the package directory, then _deps (the order
     PYTHONPATH used to give). So `driver_transcript` is the runner's sibling
     even when the package ships a file of that name, a sibling module and a
-    vendored module both import, and no bytecode is written into the package."""
+    vendored module both import, a `lib/` subpackage imports as `lib.<module>`,
+    and no bytecode is written into the package."""
     _limit_address_space_only(monkeypatch)
     driver_dir = _make_driver_dir(PATH_REPORT_DRIVER)
     deps_dir = os.path.join(driver_dir, "_deps")
@@ -318,6 +384,11 @@ def test_child_is_isolated_and_resolves_runner_then_package_then_deps(monkeypatc
         f.write('WHERE = "package"\n')
     with open(os.path.join(deps_dir, "herd_probe_dep.py"), "w") as f:
         f.write('WHERE = "_deps"\n')
+    os.makedirs(os.path.join(driver_dir, "lib"))
+    with open(os.path.join(driver_dir, "lib", "__init__.py"), "w") as f:
+        f.write("")
+    with open(os.path.join(driver_dir, "lib", "herd_probe_lib.py"), "w") as f:
+        f.write('WHERE = "lib subpackage"\n')
     runner_dir = os.path.dirname(driver_sandbox._RUNNER_PATH)
 
     result = execute_driver_method(driver_dir, "status", {}, timeout=10)
@@ -330,6 +401,7 @@ def test_child_is_isolated_and_resolves_runner_then_package_then_deps(monkeypatc
         "driver_transcript_file": os.path.join(runner_dir, "driver_transcript.py"),
         "local": "package",
         "dep": "_deps",
+        "lib": "lib subpackage",
     }
     assert not os.path.exists(os.path.join(driver_dir, "__pycache__"))
     assert not os.path.exists(os.path.join(deps_dir, "__pycache__"))

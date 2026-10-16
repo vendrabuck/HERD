@@ -588,8 +588,11 @@ Driver code runs in a separate subprocess with these limits enforced:
   ahead of the standard library. A package module named like a standard library module
   the runner has already imported (for example `json.py`) is never imported, by the
   runner or by the driver; one named like any other standard library module still
-  shadows it for the driver, under the limits. Do not ship a `sitecustomize.py`,
-  `driver_transcript.py`, or `_rlimits.py`: none of them is ever loaded from a package.
+  shadows it for the driver, under the limits. A package `sitecustomize.py` is never run
+  at interpreter start, and a `driver_transcript.py` or `_rlimits.py` in a package is
+  never loaded, because the runner's directory comes first. A Python subprocess the
+  driver starts itself gets no `PYTHONPATH`, so a driver must pass the package and
+  `_deps/` paths to it explicitly.
 
 A driver that exceeds the wall-clock timeout is recorded with status `TIMEOUT` (not
 `FAILED`) and the error `Execution timed out after <N>s`; a `TIMEOUT` run can be retried

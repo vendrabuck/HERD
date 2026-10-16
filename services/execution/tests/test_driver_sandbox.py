@@ -238,10 +238,11 @@ def test_requirements_txt_installed_when_pip_install_enabled(monkeypatch):
     assert len(pip_calls) == 1
     # pip runs in isolated mode too (issue #1180), so no `sitecustomize.py` or
     # stdlib-shadowing module in the package or the current directory can run
-    # inside it, and it gets no PYTHONPATH.
+    # inside it, and it gets no PYTHONPATH; `-B` as for the child.
     assert pip_calls[0] == [
         "python",
         "-I",
+        "-B",
         "-m",
         "pip",
         "install",
