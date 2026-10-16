@@ -428,10 +428,13 @@ service checks on its own; the browser renews it silently with the refresh token
   with `<` and ends with `>` (a placeholder). Under compose an `AUTH_SECRET_KEY` missing
   from `.env` reaches every service as an empty `SECRET_KEY` (compose passes an unset
   variable as blank) and gets that message too; a process started with no `SECRET_KEY` at
-  all fails instead with pydantic's `secret_key Field required`. A value jose cannot sign
-  and then verify one HS256 token with (a PEM public key, certificate, or ssh public key
-  shape, or a JSON-shaped value, which jose reads as a JSON Web Key on verify) is refused
-  with `AUTH_SECRET_KEY cannot be used as an HMAC secret; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32`; the check neither logs nor returns the value. A value under 32 bytes in
+  all fails instead with pydantic's `secret_key Field required`. A value PyJWT cannot sign
+  and then verify one HS256 token with (a PEM block such as a public key or certificate,
+  an ssh public key, or a JSON value carrying a `kty` member, a JSON Web Key) is refused
+  with `AUTH_SECRET_KEY cannot be used as an HMAC secret; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32`; the check neither logs nor returns the value. Any other JSON-shaped value is an
+  ordinary HMAC secret to PyJWT and loads (since #1186; the library HERD used before
+  refused it). The round trip ignores PyJWT's `InsecureKeyLengthWarning` for its own two
+  calls only, so a short value loads under `filterwarnings = ["error"]`. A value under 32 bytes in
   UTF-8 loads and logs one warning giving only its byte length; it fires when the module's
   `Settings()` runs at import, before the service sets up logging, so it is a plain-text
   line. `AUTH_ALGORITHM` (read as `ALGORITHM`) must be HS256, HS384, or HS512, else
@@ -442,18 +445,31 @@ service checks on its own; the browser renews it silently with the refresh token
   writing (OPS-CONFIG-23). Every service's Settings model declares the two fields with the
   shared types and no secret default, and the text of a Settings load error names the
   field and the rule but never the refused value. \
-  Enforced in: `services/common/herd_common/auth_settings.py` (`validate_auth_secret`, `validate_jwt_algorithm`, `AuthSecretKey`, `JwtAlgorithm`, `SECRET_KEY_REFUSED_MESSAGE`, `SECRET_KEY_UNUSABLE_MESSAGE`, `ALGORITHM_REFUSED_MESSAGE`); `services/common/herd_common/base_settings.py` (`HerdBaseSettings`) \
-  Pinned by: `services/common/tests/test_auth_settings.py` (`test_secret_refused_with_the_fixed_message`, `test_secret_jose_cannot_sign_and_verify_with_is_refused`, `test_the_round_trip_signs_and_verifies_with_the_value_itself`, `test_secret_of_31_bytes_loads_and_logs_one_warning_with_only_the_length`, `test_secret_of_32_bytes_loads_and_logs_nothing`, `test_other_algorithms_are_refused_naming_the_three_allowed`, `test_settings_refuse_an_empty_secret_key_env`, `test_settings_require_the_secret_key`, `test_settings_refuse_an_unusable_secret_from_env`, `test_settings_refuse_the_placeholder_from_a_saved_config_file`, `test_settings_error_text_names_the_field_and_rule_but_not_the_value`); `tests/unit/test_jwt_settings_wiring.py` (`test_every_settings_model_uses_the_shared_types`)
-- **IAM-JWT-5.** Every access-token decode passes exactly one algorithm, the configured
-  one, and keeps signature verification on, so a token whose header names another
-  algorithm (`none` or another HS size) is refused; any error jose raises, including one
-  raised while building the key, answers 401 `Could not validate credentials`. An error
-  that is not a `JWTError` is a key jose could not use, so each decode site also logs one
-  ERROR line, `access token not checked: the configured key is unusable (<ClassName>)`,
+  Enforced in: `services/common/herd_common/auth_settings.py` (`validate_auth_secret`, `_signs_and_verifies`, `InsecureKeyLengthWarning`, `validate_jwt_algorithm`, `AuthSecretKey`, `JwtAlgorithm`, `SECRET_KEY_REFUSED_MESSAGE`, `SECRET_KEY_UNUSABLE_MESSAGE`, `ALGORITHM_REFUSED_MESSAGE`); `services/common/herd_common/base_settings.py` (`HerdBaseSettings`) \
+  Pinned by: `services/common/tests/test_auth_settings.py` (`test_secret_refused_with_the_fixed_message`, `test_secret_pyjwt_cannot_sign_and_verify_with_is_refused`, `test_a_json_object_without_kty_is_an_ordinary_secret_and_loads`, `test_the_round_trip_signs_and_verifies_with_the_value_itself`, `test_a_short_secret_raises_no_python_warning_at_load`, `test_the_round_trip_does_not_silence_the_warning_outside_itself`, `test_secret_of_31_bytes_loads_and_logs_one_warning_with_only_the_length`, `test_secret_of_32_bytes_loads_and_logs_nothing`, `test_other_algorithms_are_refused_naming_the_three_allowed`, `test_settings_refuse_an_empty_secret_key_env`, `test_settings_require_the_secret_key`, `test_settings_refuse_an_unusable_secret_from_env`, `test_settings_refuse_the_placeholder_from_a_saved_config_file`, `test_settings_error_text_names_the_field_and_rule_but_not_the_value`); `tests/unit/test_jwt_settings_wiring.py` (`test_every_settings_model_uses_the_shared_types`)
+- **IAM-JWT-5.** Every access-token decode goes through one PyJWT call, the shared
+  `decode_access_token`, which passes exactly one algorithm, the configured one, and keeps
+  signature verification on, so a token whose header names another algorithm (`none` or
+  another HS size) is refused; any `jwt.PyJWTError`, including the `InvalidKeyError`
+  PyJWT raises while preparing the key, answers 401 `Could not validate credentials`. An
+  error that is not a `jwt.InvalidTokenError` is a key PyJWT could not use, so each decode
+  site also logs one ERROR line, `access token not checked: the configured key is unusable (<ClassName>)`,
   with action `jwt_key_unusable` and the class name only; a token that does not verify is
-  not logged. \
-  Enforced in: `services/common/herd_common/auth.py` (`make_auth_dependencies`, `log_unusable_key`, `JOSEError`); `services/auth/app/utils/jwt.py` (`verify_access_token`, `JOSEError`); `services/notifications/app/routers/notifications.py` (`get_bearer_credentials`, `JOSEError`) \
-  Pinned by: `services/common/tests/test_auth.py` (`test_decode_is_given_exactly_the_configured_algorithm`, `test_token_with_alg_none_raises_401`, `test_token_signed_with_another_hmac_algorithm_raises_401`, `test_key_that_jose_cannot_use_raises_401_not_a_key_error`, `test_key_error_is_logged_once_by_class_name`, `test_a_token_that_does_not_verify_is_not_logged`, `test_valid_token_returns_payload`); `services/auth/tests/test_token_verification.py` (`test_verify_gives_decode_exactly_the_configured_algorithm`, `test_verify_refuses_alg_none`, `test_verify_refuses_another_hmac_algorithm`, `test_verify_raises_a_key_error_as_jwterror`, `test_verify_logs_a_key_error_once_by_class_name`, `test_me_refuses_with_401`, `test_me_answers_200_for_a_correct_token`, `test_me_answers_401_for_a_key_jose_cannot_use`); `services/notifications/tests/test_router.py` (`test_get_bearer_credentials_gives_decode_exactly_the_configured_algorithm`, `test_get_bearer_credentials_rejects_alg_none`, `test_get_bearer_credentials_rejects_another_hmac_algorithm`, `test_get_bearer_credentials_answers_401_for_a_key_jose_cannot_use`, `test_get_bearer_credentials_logs_a_key_error_once_by_class_name`, `test_get_bearer_credentials_accepts_valid_token`); `tests/unit/test_jwt_settings_wiring.py` (`test_every_jose_decode_names_one_algorithm_and_keeps_verification`)
+  not logged. The config service's own session decode is the one other PyJWT decode (it
+  may not import `herd_common`); a repository guard fails on any other. \
+  Enforced in: `services/common/herd_common/jwt_codec.py` (`decode_access_token`); `services/common/herd_common/auth.py` (`make_auth_dependencies`, `log_unusable_key`, `PyJWTError`); `services/auth/app/utils/jwt.py` (`verify_access_token`, `PyJWTError`); `services/notifications/app/routers/notifications.py` (`get_bearer_credentials`, `PyJWTError`) \
+  Pinned by: `services/common/tests/test_auth.py` (`test_decode_is_given_exactly_the_configured_algorithm`, `test_token_with_alg_none_raises_401`, `test_token_signed_with_another_hmac_algorithm_raises_401`, `test_key_that_pyjwt_cannot_use_raises_401_not_a_key_error`, `test_key_error_is_logged_once_by_class_name`, `test_a_token_that_does_not_verify_is_not_logged`, `test_valid_token_returns_payload`); `services/auth/tests/test_token_verification.py` (`test_verify_gives_decode_exactly_the_configured_algorithm`, `test_verify_refuses_alg_none`, `test_verify_refuses_another_hmac_algorithm`, `test_verify_raises_a_key_error_as_invalid_token_error`, `test_verify_logs_a_key_error_once_by_class_name`, `test_me_refuses_with_401`, `test_me_answers_200_for_a_correct_token`, `test_me_answers_401_for_a_key_pyjwt_cannot_use`); `services/notifications/tests/test_router.py` (`test_get_bearer_credentials_gives_decode_exactly_the_configured_algorithm`, `test_get_bearer_credentials_rejects_alg_none`, `test_get_bearer_credentials_rejects_another_hmac_algorithm`, `test_get_bearer_credentials_answers_401_for_a_key_pyjwt_cannot_use`, `test_get_bearer_credentials_logs_a_key_error_once_by_class_name`, `test_get_bearer_credentials_accepts_valid_token`); `services/common/tests/test_jwt_codec.py` (`test_each_failure_raises_its_exact_class_and_message`, `test_each_failure_answers_401_over_http_and_is_not_logged`, `test_a_key_pyjwt_cannot_use_raises_invalid_key_error_not_a_token_error`, `test_a_key_pyjwt_cannot_use_answers_401_over_http_and_is_logged`); `tests/unit/test_jwt_settings_wiring.py` (`test_every_decode_goes_through_the_helper_with_one_algorithm`, `test_the_only_direct_decodes_are_the_helper_and_the_allowed_table`, `test_every_token_verifying_function_calls_the_shared_helper`)
+- **IAM-JWT-6.** The shared decode allows 10 s of clock skew between the auth service
+  that signs and a service that verifies (`ACCESS_TOKEN_LEEWAY_SECONDS`): a token still
+  verifies up to 10 s after its `exp`, and one whose `iat` (or `nbf`) is up to 10 s in the
+  future verifies; an `iat` further ahead is refused (`The token is not yet valid (iat)`)
+  and answers 401. A key shorter than 32 bytes is not refused at decode
+  (`enforce_minimum_key_length` stays off): the token verifies and PyJWT emits one
+  `InsecureKeyLengthWarning` through `warnings`, while startup reports the short key
+  (IAM-JWT-4). Token format and claims did not change with the move to PyJWT (#1186), so a
+  token signed by an earlier build verifies. \
+  Enforced in: `services/common/herd_common/jwt_codec.py` (`decode_access_token`, `ACCESS_TOKEN_LEEWAY_SECONDS`) \
+  Pinned by: `services/common/tests/test_jwt_codec.py` (`test_leeway_is_ten_seconds`, `test_decode_is_given_one_algorithm_and_the_leeway`, `test_an_iat_inside_the_leeway_verifies`, `test_an_exp_inside_the_leeway_still_verifies`, `test_each_failure_raises_its_exact_class_and_message`, `test_a_good_token_answers_200_over_http`, `test_a_short_key_verifies_with_one_insecure_key_length_warning`, `test_a_short_key_answers_200_over_http_with_the_warning`, `test_a_token_the_previous_library_signed_verifies`, `test_a_token_the_previous_library_signed_answers_200_over_http`)
 
 **Out of scope.** Token revocation lists do not exist; an access token is valid until
 `exp`.
