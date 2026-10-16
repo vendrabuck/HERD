@@ -5,7 +5,7 @@ description = "Shared utilities for HERD services"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.111.0",
-    "python-jose[cryptography]>=3.3.0",
+    "pyjwt>=2.15.0",
     "jsonschema>=4.21.0",
 ]
 
