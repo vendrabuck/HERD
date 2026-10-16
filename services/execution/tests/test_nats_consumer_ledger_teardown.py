@@ -10,11 +10,14 @@ ACTIVE rows across all three ledgers, drive the terminal path, and assert the re
 the freeze ordering, mirroring the test_nats_consumer_l2_reconcile.py fixtures.
 """
 
+import json
 import logging
 import uuid
 from contextlib import ExitStack
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from app.database import Base
 from app.models.l1_connection_assignment import L1ConnectionAssignment
@@ -620,3 +623,199 @@ async def test_teardown_not_blocked_by_preexisting_frozen():
 
     assert await _statuses(L1ConnectionAssignment) == ["RELEASED"]
     assert "disconnect_ports" in calls
+
+
+# --- issue #1203: a 401 or 403 from inventory never pins the teardown rows ---
+#
+# These drive the REAL _fetch_device and _fetch_template through process_reservation_
+# message (corroboration gate included) on an httpx MockTransport standing in for
+# reservations and inventory, so the whole chain from inventory's answer to the NAK is
+# exercised. During an INTERNAL_API_TOKEN rotation inventory answers 401 or 403 for a
+# switch that EXISTS; before #1203 the helpers read that as "not found" and the layers
+# pinned every row on the switch with WIRING_UNRESOLVABLE_REASON and 0 attempts, which
+# no channel drives on an ended reservation (#1199).
+
+_LAYER_SWITCH = {"L1": SW_L1, "L2": SW_L2, "L3": SW_L3}
+_LAYER_MODELS = {
+    "L1": (L1ConnectionAssignment,),
+    "L2": (L2PortAssignment, VlanAssignment),
+    "L3": (RouteAssignment,),
+}
+_LAYER_ORDER = ["L1", "L2", "L3"]
+
+
+def _layer_device(device_id, ctype, layer):
+    body = _dev(device_id, ctype, layer)
+    body["template_id"] = f"tmpl-{layer}"
+    return body
+
+
+_INVENTORY_DEVICES = {
+    SW_L1: _layer_device(SW_L1, "Layer 1 Switch", "L1"),
+    SW_L2: _layer_device(SW_L2, "Layer 2 Switch", "L2"),
+    SW_L3: _layer_device(SW_L3, "Layer 3 Switch", "L3"),
+}
+
+
+def _stack_transport(denied: dict, unexpected: list):
+    """MockTransport answering reservations' corroboration GET with CANCELLED and
+    inventory's device and template reads from the tables above; a path in `denied`
+    is answered with its status instead. Any other request is recorded in
+    `unexpected` (asserted empty) and answered 404."""
+    from app.config import settings
+
+    reservations_path = httpx.URL(f"{settings.reservations_service_url}/internal/{RES_ID}").path
+    inventory_host = httpx.URL(settings.inventory_service_url).host
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path in denied:
+            return httpx.Response(denied[path], json={"detail": "Invalid internal token"})
+        if path == reservations_path:
+            return httpx.Response(200, json={"id": RES_ID, "status": "CANCELLED"})
+        if request.url.host == inventory_host:
+            parts = path.strip("/").split("/")
+            if len(parts) == 3 and parts[0] == "devices" and parts[2] == "internal":
+                if parts[1] in _INVENTORY_DEVICES:
+                    return httpx.Response(200, json=_INVENTORY_DEVICES[parts[1]])
+            if len(parts) == 3 and parts[0] == "templates" and parts[2] == "internal":
+                return httpx.Response(200, json={"id": parts[1], "name": "T", "sections": []})
+        unexpected.append((request.method, str(request.url)))
+        return httpx.Response(404, json={"detail": "unexpected request"})
+
+    return httpx.MockTransport(handler)
+
+
+async def _ledger_snapshot(models):
+    """Every column of every row of `models` for this reservation, in id order."""
+    snap = {}
+    async with TestSessionLocal() as s:
+        for model in models:
+            rows = (
+                (
+                    await s.execute(
+                        select(model)
+                        .where(model.reservation_id == uuid.UUID(RES_ID))
+                        .order_by(model.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            snap[model.__name__] = [
+                {col.key: getattr(row, col.key) for col in model.__mapper__.column_attrs}
+                for row in rows
+            ]
+    return snap
+
+
+async def _deliver_cancelled(denied: dict, unexpected: list, execute_fn, num_delivered: int):
+    """Deliver one reservation.cancelled message through process_reservation_message
+    with the real handler and the real fetch helpers; return (result, msg)."""
+    from app.services.nats_consumer import process_reservation_message
+
+    real_client = httpx.AsyncClient
+    transport = _stack_transport(denied, unexpected)
+
+    def _client(*args, **kwargs):
+        return real_client(transport=transport)
+
+    msg = MagicMock()
+    msg.data = json.dumps(_make_event("reservation.cancelled")).encode()
+    msg.metadata = SimpleNamespace(num_delivered=num_delivered)
+    msg.ack = AsyncMock()
+    msg.nak = AsyncMock()
+    js = MagicMock()
+    js.publish = AsyncMock()
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("app.services.nats_consumer.httpx.AsyncClient", new=_client))
+        stack.enter_context(
+            patch(
+                "app.services.driver_loader.load_driver",
+                new=AsyncMock(return_value="/tmp/driver"),
+            )
+        )
+        stack.enter_context(
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn)
+        )
+        stack.enter_context(
+            patch("app.services.nats_consumer.apply_reservation_event_tiers", new=AsyncMock())
+        )
+        stack.enter_context(
+            patch("app.services.nats_consumer._execute_dynamic_teardown", new=AsyncMock())
+        )
+        result = await process_reservation_message(
+            msg, js, handle_reservation_event, _db_session_factory()
+        )
+    js.publish.assert_not_awaited()
+    return result, msg
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("resource", ["device", "template"])
+@pytest.mark.parametrize("layer", _LAYER_ORDER)
+async def test_teardown_inventory_auth_error_naks_and_never_pins(layer, resource, status, caplog):
+    """Issue #1203: inventory answering 401 or 403 for an existing switch (or its
+    template) during a terminal teardown NAKs the message with the backoff delay, leaves
+    that layer's rows and every later layer's rows exactly as they were (every column),
+    writes WIRING_UNRESOLVABLE_REASON nowhere, and a redelivery once inventory answers
+    200 releases every row. Layers ahead of the failing one release on the first
+    delivery (the pass runs L1, then L2, then L3)."""
+    from app.services.nats_consumer import (
+        NATS_NAK_BACKOFF_SECONDS,
+        WIRING_UNRESOLVABLE_REASON,
+        TransientUpstreamError,
+    )
+
+    await _seed_l1()
+    await _seed_l2()
+    await _seed_l3()
+    untouched_layers = _LAYER_ORDER[_LAYER_ORDER.index(layer) :]
+    untouched_models = [m for name in untouched_layers for m in _LAYER_MODELS[name]]
+    before = await _ledger_snapshot(untouched_models)
+
+    switch_id = _LAYER_SWITCH[layer]
+    denied_path = (
+        f"/devices/{switch_id}/internal"
+        if resource == "device"
+        else f"/templates/tmpl-{layer}/internal"
+    )
+    unexpected: list = []
+    execute_fn, calls = _recorder()
+
+    with caplog.at_level(logging.WARNING, logger="app.services.nats_consumer"):
+        result, msg = await _deliver_cancelled({denied_path: status}, unexpected, execute_fn, 1)
+
+    assert result == "nak"
+    nak_records = [r for r in caplog.records if getattr(r, "action", None) == "nats_message_nak"]
+    assert len(nak_records) == 1
+    cause = nak_records[0].exc_info[1]
+    assert isinstance(cause, TransientUpstreamError)
+    what = f"fetch device {switch_id}" if resource == "device" else f"fetch template tmpl-{layer}"
+    assert str(cause) == f"{what}: upstream {status}"
+    msg.nak.assert_awaited_once_with(delay=NATS_NAK_BACKOFF_SECONDS[0])
+    msg.ack.assert_not_awaited()
+    assert await _ledger_snapshot(untouched_models) == before
+    for model in (L1ConnectionAssignment, L2PortAssignment, RouteAssignment):
+        async with TestSessionLocal() as s:
+            errors = (await s.execute(select(model.last_error))).scalars().all()
+        assert not any(e and e.startswith(WIRING_UNRESOLVABLE_REASON) for e in errors), (
+            model.__name__,
+            errors,
+        )
+    release_actions = {"L1": "disconnect_ports", "L2": "remove_from_vlan", "L3": "remove_route"}
+    for name in untouched_layers:
+        assert release_actions[name] not in calls, f"{name} must not be driven on a denied read"
+
+    # Redelivery: inventory answers again, so the same event releases every row.
+    result, msg = await _deliver_cancelled({}, unexpected, execute_fn, 2)
+
+    assert result == "ack"
+    msg.ack.assert_awaited_once()
+    msg.nak.assert_not_awaited()
+    assert await _statuses(L1ConnectionAssignment) == ["RELEASED"]
+    assert await _statuses(L2PortAssignment) == ["RELEASED"]
+    assert await _statuses(VlanAssignment) == ["RELEASED"]
+    assert await _statuses(RouteAssignment) == ["RELEASED"]
+    assert unexpected == []

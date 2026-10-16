@@ -634,6 +634,82 @@ async def test_fetch_template_returns_none_on_404():
         assert await _fetch_template("tpl-1") is None
 
 
+# --- issue #1203: the device and template reads return None ONLY on a 404 ---
+#
+# A None from either read makes the wiring layers pin every pair on the switch as
+# `recorded hop unresolvable: switch <id> not found` with no attempt counted, so
+# only inventory's "no such row" answer may produce it. Every other non-200 (a 401
+# or 403 during an INTERNAL_API_TOKEN rotation, a 409, a 422, a 5xx) and a transport
+# error raise TransientUpstreamError so the event NAKs and the row is driven again.
+# The tests drive the REAL helpers through a real httpx.AsyncClient on a
+# MockTransport, so _get_internal and the response judgement both run.
+
+_FETCH_HELPERS = [
+    pytest.param(_fetch_device, "dev-1", "/devices/dev-1/internal", "fetch device", id="device"),
+    pytest.param(
+        _fetch_template, "tpl-1", "/templates/tpl-1/internal", "fetch template", id="template"
+    ),
+]
+
+
+def _inventory_client(status_code, body=None, seen=None):
+    """A real AsyncClient whose every request is answered with `status_code` (and the
+    JSON `body`), recording (path, X-Internal-Token) of each request into `seen`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if seen is not None:
+            seen.append((request.url.path, request.headers.get("X-Internal-Token")))
+        return httpx.Response(status_code, json=body if body is not None else {"detail": "x"})
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper,record_id,path,what", _FETCH_HELPERS)
+async def test_inventory_read_returns_the_body_on_200(helper, record_id, path, what):
+    from app.config import settings
+
+    body = {"id": record_id, "name": "switch-1", "template_id": "tpl-1"}
+    seen: list = []
+    async with _inventory_client(200, body, seen) as client:
+        assert await helper(record_id, client) == body
+    assert seen == [(path, settings.internal_api_token)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper,record_id,path,what", _FETCH_HELPERS)
+async def test_inventory_read_returns_none_only_on_404(helper, record_id, path, what):
+    async with _inventory_client(404, {"detail": "Device not found"}) as client:
+        assert await helper(record_id, client) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403, 409, 422, 500, 502, 503])
+@pytest.mark.parametrize("helper,record_id,path,what", _FETCH_HELPERS)
+async def test_inventory_read_raises_transient_on_every_other_status(
+    helper, record_id, path, what, status
+):
+    """A 401 or 403 (the INTERNAL_API_TOKEN rotation case) is an answer about an
+    EXISTING switch, never "not found": it raises with the status in the message,
+    exactly as a 5xx does, so the event NAKs instead of pinning the rows."""
+    async with _inventory_client(status) as client:
+        with pytest.raises(TransientUpstreamError) as exc_info:
+            await helper(record_id, client)
+    assert str(exc_info.value) == f"{what} {record_id}: upstream {status}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper,record_id,path,what", _FETCH_HELPERS)
+async def test_inventory_read_raises_transient_on_transport_error(helper, record_id, path, what):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(TransientUpstreamError) as exc_info:
+            await helper(record_id, client)
+    assert str(exc_info.value) == f"{what} {record_id}: transport error: connection refused"
+
+
 @pytest.mark.asyncio
 async def test_fetch_device_returns_json_on_200():
     """The success path: a real 200 is parsed and returned, not mocked away."""

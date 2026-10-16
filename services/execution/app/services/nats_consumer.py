@@ -209,6 +209,10 @@ class TransientUpstreamError(RuntimeError):
     NAK the message so JetStream retries with backoff, instead of the fetch
     helper swallowing the failure as "not found" and silently half-provisioning.
     A genuine 404 is NOT transient: helpers still return None/[] for that.
+    Since issue #1203 the switch device and template reads (_fetch_device and
+    _fetch_template, through _inventory_record_or_none) also raise it on every
+    OTHER non-200 (a 401 or 403 during an INTERNAL_API_TOKEN rotation, a 409,
+    a 422), because their None pins the switch's wiring rows as unresolvable.
     """
 
 
@@ -425,11 +429,32 @@ def _client_ctx(client):
     return _AsyncNullCtx(client)
 
 
+def _inventory_record_or_none(resp, *, what: str) -> dict | None:
+    """Judge inventory's answer to a device or template read (issue #1203).
+
+    200 returns the parsed body; 404 returns None, the ONLY answer that means
+    "not in inventory"; every other status raises TransientUpstreamError with
+    the same "<what>: upstream <status>" text _get_internal uses for a 5xx.
+    A None here makes the wiring layers pin the switch's rows as unresolvable
+    with no attempt counted, so a 401 or 403 (an INTERNAL_API_TOKEN rotation)
+    or any other answer about an existing switch must NAK and be driven again
+    once inventory answers, never pin. _fetch_device and _fetch_template both
+    judge through this one function so the two cannot drift.
+    """
+    if resp.status_code == 200:
+        return resp.json()
+    if resp.status_code == 404:
+        return None
+    raise TransientUpstreamError(f"{what}: upstream {resp.status_code}")
+
+
 async def _fetch_device(device_id: str, client=None) -> dict | None:
     """Fetch device details from inventory service.
 
-    Raises TransientUpstreamError on a 5xx or transport error so the message
-    NAKs and retries; a non-200 below 500 (e.g. a genuine 404) returns None.
+    Returns None only on a 404. Raises TransientUpstreamError on a transport
+    error and on every other non-200 (a 5xx, and since issue #1203 a 401, 403,
+    409, 422, and so on) so the message NAKs and retries; see
+    _inventory_record_or_none.
 
     When `client` is provided it is reused (per-event connection pooling, issue
     #137); when None a fresh client is opened for this one call as before.
@@ -443,16 +468,16 @@ async def _fetch_device(device_id: str, client=None) -> dict | None:
             headers={"X-Internal-Token": settings.internal_api_token},
             timeout=10.0,
         )
-        if resp.status_code != 200:
-            return None
-        return resp.json()
+        return _inventory_record_or_none(resp, what=f"fetch device {device_id}")
 
 
 async def _fetch_template(template_id: str, client=None) -> dict | None:
     """Fetch template details from inventory service.
 
-    Raises TransientUpstreamError on a 5xx or transport error so the message
-    NAKs and retries; a non-200 below 500 (e.g. a genuine 404) returns None.
+    Returns None only on a 404. Raises TransientUpstreamError on a transport
+    error and on every other non-200 (a 5xx, and since issue #1203 a 401, 403,
+    409, 422, and so on) so the message NAKs and retries; see
+    _inventory_record_or_none.
 
     When `client` is provided it is reused (per-event connection pooling, issue
     #137); when None a fresh client is opened for this one call as before.
@@ -466,9 +491,7 @@ async def _fetch_template(template_id: str, client=None) -> dict | None:
             headers={"X-Internal-Token": settings.internal_api_token},
             timeout=10.0,
         )
-        if resp.status_code != 200:
-            return None
-        return resp.json()
+        return _inventory_record_or_none(resp, what=f"fetch template {template_id}")
 
 
 async def _fetch_latest_config(device_id: str, client=None) -> dict | None:
@@ -500,10 +523,11 @@ async def _fetch_latest_config(device_id: str, client=None) -> dict | None:
 async def _fetch_hypervisor(hypervisor_id: str, client=None) -> dict | None:
     """Fetch a hypervisor's internal record from the inventory service (issue #32).
 
-    Mirrors _fetch_template exactly: raises TransientUpstreamError on a 5xx or
-    transport error so the message NAKs and retries; a non-200 below 500 (a
-    genuine 404) returns None, which the create flow treats as a permanent
-    config error.
+    Raises TransientUpstreamError on a 5xx or transport error so the message
+    NAKs and retries; a non-200 below 500 (a genuine 404) returns None, which
+    the create flow treats as a permanent config error. Unlike _fetch_template
+    since issue #1203, a 401 or 403 here still returns None (the
+    non-200-means-absent idiom the sibling helpers keep).
     """
     url = f"{settings.inventory_service_url}/hypervisors/{hypervisor_id}/internal"
     async with _client_ctx(client) as c:
@@ -981,10 +1005,12 @@ async def _fetch_recipe_deps(
 ) -> tuple[dict | None, dict | None, dict | None]:
     """Fetch (template, hypervisor, secret_data) for a recipe run.
 
-    Any of the three being None means a 404 (a missing config resource); the
-    caller decides whether that is a permanent create-flow error or a teardown
-    that should leave the row ACTIVE. A 5xx or transport error has already raised
-    TransientUpstreamError inside the fetch helpers.
+    Any of the three being None means a missing config resource (the template
+    read answers None only on a 404 since issue #1203; the hypervisor and secret
+    reads keep the non-200-below-500 idiom); the caller decides whether that is
+    a permanent create-flow error or a teardown that should leave the row
+    ACTIVE. A 5xx or transport error, and any non-404 non-200 on the template
+    read, has already raised TransientUpstreamError inside the fetch helpers.
     """
     template = await _fetch_template(template_id, client)
     if template is None:
