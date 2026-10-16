@@ -148,15 +148,19 @@ def test_pip_install_exception_swallowed(monkeypatch):
         f.write("# empty\n")
 
     real_run = driver_sandbox.subprocess.run
+    raised = []
 
     def fake_run(cmd, *args, **kwargs):
-        if cmd[:2] == ["pip", "install"]:
+        if cmd[:6] == ["python", "-I", "-B", "-m", "pip", "install"]:
+            raised.append(cmd)
             raise RuntimeError("pip exploded")
         return real_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(driver_sandbox.subprocess, "run", fake_run)
     result = execute_driver_method(driver_dir, "login", {"HERD_device_id": "x"}, timeout=15)
-    # The pip failure did not abort the driver run.
+    # The install was attempted (and raised), and the failure did not abort
+    # the driver run.
+    assert len(raised) == 1
     assert result["success"] is True
 
 
@@ -309,8 +313,8 @@ def test_dry_run_injects_context_flag(monkeypatch):
         stderr = ""
 
     def _capture_run(cmd, *a, **kw):
-        # cmd is [python, _runner.py, driver_path, action, context_file, ...].
-        ctx_path = cmd[4]
+        # cmd is [python, -I, -B, _runner.py, driver_path, action, context_file, ...].
+        ctx_path = cmd[6]
         with open(ctx_path) as f:
             seen["ctx"] = json.load(f)
         return _Done()

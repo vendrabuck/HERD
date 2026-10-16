@@ -134,9 +134,9 @@ retried like any failed login and dead-lettered at the fifth delivery, not on th
 as a package that fails the load is (issue #279). The
 service then optionally installs dependencies from `requirements.txt`, and each call
 loads `driver.py` in the sandbox and instantiates the `Driver` class. The
-package root is put on `PYTHONPATH` for the driver subprocess (a vendored `_deps/`
-directory, when present, is added as a second `PYTHONPATH` entry); `lib/` itself is never
-added as its own path entry, so its contents are importable only as the subpackage
+package root is put on the child's `sys.path` by the runner after the resource limits are
+applied (a vendored `_deps/` directory, when present, is added as the next entry); `lib/`
+itself is never added as its own path entry, so its contents are importable only as the subpackage
 `lib.<module>` (`import lib.foo` or `from lib import foo`), not as a top-level module.
 
 ---
@@ -580,6 +580,19 @@ Driver code runs in a separate subprocess with these limits enforced:
     paramiko) need the headroom; it still guards against a runaway fork bomb.
 - Device credentials are passed to the driver via a temporary file only; password-typed
   template fields are not copied into the child's environment variables.
+- No package file runs before the resource limits apply. The child is started in Python's
+  isolated mode (`python -I -B`), so the package directory is not on `sys.path` while
+  the interpreter starts: a `sitecustomize.py` in the package is never imported, and no
+  `PYTHON*` environment variable reaches the child. The runner applies the limits, then
+  puts the package directory and `_deps/` on `sys.path`, after its own directory and
+  ahead of the standard library. A package module named like a standard library module
+  the runner has already imported (for example `json.py`) is never imported, by the
+  runner or by the driver; one named like any other standard library module still
+  shadows it for the driver, under the limits. A package `sitecustomize.py` is never run
+  at interpreter start, and a `driver_transcript.py` or `_rlimits.py` in a package is
+  never loaded, because the runner's directory comes first. A Python subprocess the
+  driver starts itself gets no `PYTHONPATH`, so a driver must pass the package and
+  `_deps/` paths to it explicitly.
 
 A driver that exceeds the wall-clock timeout is recorded with status `TIMEOUT` (not
 `FAILED`) and the error `Execution timed out after <N>s`; a `TIMEOUT` run can be retried
@@ -603,7 +616,7 @@ device should use it rather than shipping its own SSH client.
 
 For anything else, vendor your driver's third-party dependencies into a `_deps/`
 directory inside the package; the execution service adds `_deps/` to the driver's
-`PYTHONPATH` at runtime.
+`sys.path` at runtime, after the resource limits are applied.
 
 Installing a package `requirements.txt` at execution time is off by default, because a
 runtime `pip install` pulls arbitrary code from the network as the service user. An

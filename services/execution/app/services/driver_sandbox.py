@@ -181,7 +181,17 @@ def execute_driver_method(
         ) as f:
             transcript_file = f.name
 
-        cmd = ["python", _RUNNER_PATH, driver_path, action, context_file]
+        # Isolated mode (issue #1180). `-I` keeps every package file out of the
+        # interpreter's startup: no PYTHONPATH (it implies `-E`, so every
+        # PYTHON* variable is ignored), no user site directory, and (since 3.11,
+        # it implies `-P`) no script directory on sys.path. Without it the
+        # package directory was on sys.path from the first instruction, so a
+        # package `sitecustomize.py` ran at startup and a package `json.py`
+        # replaced the standard library for the runner's own `import json`,
+        # both before _runner.py applied the resource limits. The runner puts
+        # the package directory (and `_deps`) on sys.path itself, after the
+        # limits. `-B` replaces PYTHONDONTWRITEBYTECODE, which `-I` ignores.
+        cmd = ["python", "-I", "-B", _RUNNER_PATH, driver_path, action, context_file]
         # Merge port_a/port_b into method_kwargs for backward compatibility
         effective_kwargs = dict(method_kwargs or {})
         if port_a is not None and "port_a" not in effective_kwargs:
@@ -202,9 +212,9 @@ def execute_driver_method(
                 kwargs_file = f.name
             cmd.append(kwargs_file)
 
+        # No PYTHONPATH or PYTHONDONTWRITEBYTECODE: the child runs with `-I`,
+        # which ignores both, so setting them would only mislead a reader.
         env = {
-            "PYTHONPATH": driver_path,
-            "PYTHONDONTWRITEBYTECODE": "1",
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
             "HERD_TRANSCRIPT_PATH": transcript_file,
         }
@@ -226,14 +236,30 @@ def execute_driver_method(
         # off). When off, drivers must vendor their deps into _deps/. The
         # install subprocess deliberately does NOT apply the driver rlimits: it
         # does not run the _runner.py wrapper (which reads _RLIMITS_ENV_KEY), so
-        # the 256MB RLIMIT_AS never bites pip.
+        # the 256MB RLIMIT_AS never bites pip. It runs as `python -I -B -m pip`
+        # for the same reasons the child runs with those flags (issue #1180):
+        # pip must not import a `sitecustomize.py` or a stdlib-shadowing module
+        # from the package directory or the current directory, and `-B` stands
+        # in for the PYTHONDONTWRITEBYTECODE that `-I` ignores.
         deps_dir = os.path.join(driver_path, "_deps")
         reqs_file = os.path.join(driver_path, "requirements.txt")
         if os.path.exists(reqs_file) and not os.path.exists(deps_dir):
             if settings.allow_driver_pip_install:
                 try:
                     subprocess.run(
-                        ["pip", "install", "-r", reqs_file, "--target", deps_dir, "-q"],
+                        [
+                            "python",
+                            "-I",
+                            "-B",
+                            "-m",
+                            "pip",
+                            "install",
+                            "-r",
+                            reqs_file,
+                            "--target",
+                            deps_dir,
+                            "-q",
+                        ],
                         timeout=60,
                         capture_output=True,
                         env=env,
@@ -246,8 +272,8 @@ def execute_driver_method(
                     "skipping install. Vendor deps into _deps/ or enable the flag."
                 )
 
-        if os.path.exists(deps_dir):
-            env["PYTHONPATH"] = f"{driver_path}:{deps_dir}"
+        # The child finds `_deps` itself (_runner._put_package_on_path, from
+        # driver_path and the same existence test), after the resource limits.
 
         start = time.monotonic()
         try:

@@ -219,10 +219,12 @@ def test_requirements_txt_installed_when_pip_install_enabled(monkeypatch):
 
     real_run = driver_sandbox.subprocess.run
     pip_calls = []
+    pip_envs = []
 
     def fake_run(cmd, *args, **kwargs):
-        if cmd[:2] == ["pip", "install"]:
+        if "pip" in cmd:
             pip_calls.append(cmd)
+            pip_envs.append(kwargs["env"])
 
             class _Done:
                 returncode = 0
@@ -234,16 +236,52 @@ def test_requirements_txt_installed_when_pip_install_enabled(monkeypatch):
     result = execute_driver_method(driver_dir, "login", {"HERD_device_id": "test"}, timeout=15)
     assert result["success"] is True
     assert len(pip_calls) == 1
-    assert pip_calls[0][:2] == ["pip", "install"]
+    # pip runs in isolated mode too (issue #1180), so no `sitecustomize.py` or
+    # stdlib-shadowing module in the package or the current directory can run
+    # inside it, and it gets no PYTHONPATH; `-B` as for the child.
+    assert pip_calls[0] == [
+        "python",
+        "-I",
+        "-B",
+        "-m",
+        "pip",
+        "install",
+        "-r",
+        os.path.join(driver_dir, "requirements.txt"),
+        "--target",
+        os.path.join(driver_dir, "_deps"),
+        "-q",
+    ]
+    assert "PYTHONPATH" not in pip_envs[0]
+
+
+DEPS_IMPORT_DRIVER = """
+import herd_vendored_dep
+
+class Driver:
+    def __init__(self, context):
+        self.context = context
+
+    def login(self):
+        return {"dep": herd_vendored_dep.VALUE, "dep_file": herd_vendored_dep.__file__}
+"""
 
 
 def test_execute_with_existing_deps_dir():
-    """When _deps directory already exists, PYTHONPATH includes it."""
-    driver_dir = _make_driver_dir(VALID_L1_DRIVER)
+    """A module vendored under _deps/ is importable by the driver: the runner
+    puts _deps on the child's sys.path itself (the child runs with `-I`, so no
+    PYTHONPATH reaches it, issue #1180)."""
+    driver_dir = _make_driver_dir(DEPS_IMPORT_DRIVER)
     deps_dir = os.path.join(driver_dir, "_deps")
     os.makedirs(deps_dir)
+    with open(os.path.join(deps_dir, "herd_vendored_dep.py"), "w") as f:
+        f.write('VALUE = "from _deps"\n')
     result = execute_driver_method(driver_dir, "login", {"HERD_device_id": "test"}, timeout=10)
-    assert result["success"] is True
+    assert result["success"] is True, result
+    assert result["output"] == {
+        "dep": "from _deps",
+        "dep_file": os.path.join(deps_dir, "herd_vendored_dep.py"),
+    }
 
 
 def test_execute_connect_ports_via_method_kwargs():

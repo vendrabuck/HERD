@@ -42,9 +42,20 @@ class Driver:
 """
 
 
+@pytest.fixture(autouse=True)
+def _restore_sys_path():
+    """main() puts the driver directory on sys.path (issue #1180); the
+    in-process tests below must not leave a temporary directory there."""
+    saved = list(sys.path)
+    yield
+    sys.path[:] = saved
+
+
 def _run_runner(args: list[str], timeout: int = 10) -> subprocess.CompletedProcess:
+    # Started the way the sandbox starts it (driver_sandbox.execute_driver_method):
+    # isolated mode, no bytecode written.
     return subprocess.run(
-        [sys.executable, RUNNER_PATH, *args],
+        [sys.executable, "-I", "-B", RUNNER_PATH, *args],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -151,6 +162,33 @@ def test_runner_driver_init_exception():
         result = _run_runner([tmpdir.name, "login", str(ctx_file)])
     assert result.returncode == 1
     assert "Init failed" in result.stderr
+
+
+# --- _put_package_on_path (issue #1180) ---
+
+
+def test_put_package_on_path_inserts_package_right_after_the_runner_dir(monkeypatch):
+    """The package directory goes directly after the runner directory, ahead of
+    the standard library, and no _deps entry is added when there is none."""
+    from app.services import _runner
+
+    with tempfile.TemporaryDirectory() as driver_dir:
+        monkeypatch.setattr(sys, "path", [_runner._RUNNER_DIR, "/stdlib", "/site"])
+        _runner._put_package_on_path(driver_dir)
+        assert sys.path == [_runner._RUNNER_DIR, driver_dir, "/stdlib", "/site"]
+
+
+def test_put_package_on_path_adds_deps_after_the_package(monkeypatch):
+    """With a _deps directory, it follows the package directory, the order
+    PYTHONPATH="<driver>:<driver>/_deps" used to give."""
+    from app.services import _runner
+
+    with tempfile.TemporaryDirectory() as driver_dir:
+        deps_dir = str(Path(driver_dir) / "_deps")
+        Path(deps_dir).mkdir()
+        monkeypatch.setattr(sys, "path", ["/first", _runner._RUNNER_DIR, "/stdlib"])
+        _runner._put_package_on_path(driver_dir)
+        assert sys.path == ["/first", _runner._RUNNER_DIR, driver_dir, deps_dir, "/stdlib"]
 
 
 # --- In-process tests for coverage of _runner.main() ---
