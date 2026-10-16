@@ -430,23 +430,42 @@ reservation in the batch is still driven. A known limit by decision, WIRE-RETRY-
   row's switch, and its ports for L1 and L2. For a reason such as a missing template or `driver load failed:
   DriverPackageError` the switch is still in inventory: check on the switch whether the
   row's ports are still cross-connected (L1), still in the VLAN (L2), or whether its routes
-  are still installed (L3), and remove them by hand. A reason ending in `switch <id> not
-  found` means inventory answered 404 for the switch: it is gone from inventory (a reason
-  starting `template for` means the switch's template answered 404, and the switch itself
-  is still there). If that hardware still exists, check it the same way. Since issue
-  #1203 no other answer pins a row this way. A 401 or 403 from inventory, most often an
+  are still installed (L3), and remove them by hand. A reason that ends in `switch <id>
+  not found` and does not contain `template for` means inventory answered 404 for the
+  switch: it is gone from inventory. A reason that contains `template for` (it ends in
+  `template for switch <id> not found`, or `template for L2 switch` or `L3 switch`)
+  means inventory answered 404 for the switch's template, and the switch itself is still
+  there. If that hardware still exists, check it the same way. Since issue #1203 no
+  other answer pins a row this way. A 401 or 403 from inventory, most often an
   `INTERNAL_API_TOKEN` rotation (every service must hold the new value, or
-  service-to-service calls answer 403 until they do), or any other answer that is not
-  200 or 404, is transient: the event is NAKed with backoff and the rows keep their
-  status, attempts, and reason; in a retry the tick leaves them unchanged and counts them
-  in `skipped_upstream`, and a manual retry answers 503. They are driven again once
-  inventory answers. A row recorded with this reason before that change may still name a switch
-  that exists, so look the switch up in inventory before you trust the reason. To confirm
-  a rotation is the cause, look in `docker compose logs execution` for the
+  service-to-service calls answer 403 until they do), or any other answer that is not a
+  200 carrying a JSON object or a 404, is transient: the event is NAKed with backoff and
+  the ACTIVE rows keep their status, attempts, and reason (a `FAILED` L3 pin intended
+  `ACTIVE` is the exception: teardown parks it intended `RELEASED` before it reads the
+  switch, issue #1001, and the retry tick finishes it). In a retry, the tick leaves the
+  rows of a reservation whose apply hit the error unchanged and counts them in
+  `skipped_upstream`; a build row whose endpoint read fails while the tick re-checks its
+  intent reads back `still_failed` only, and a manual retry answers 503. The rows are
+  driven again once inventory answers, with two limits. The NAK window is bounded:
+  after `NATS_MAX_DELIVER` (5) deliveries over the `NATS_NAK_BACKOFF_SECONDS` schedule
+  (about 81 seconds at the defaults) the event is dead-lettered (`nats_dlq_exhausted`),
+  and a teardown that ran out of deliveries leaves the switch's rows `ACTIVE` on the
+  ended reservation until the dead-lettered terminal event is replayed (`DLQ has
+  messages` below), which works because teardown reads `ACTIVE` rows. And when
+  execution holds the stale token while reservations already has the new one, the
+  corroboration gate reads reservations' 403 on `GET /internal/{id}` as not
+  corroborated, so the event is ACKed and dropped (`nats_event_unverified`) before any
+  inventory read: re-publish the terminal event once every service holds the new value.
+  A row recorded with a `not found` reason before issue #1203 may still name a switch
+  that exists, so look the switch up in inventory before you trust the reason. To
+  confirm a rotation is the cause, look in `docker compose logs execution` for the
   `nats_message_nak` warning whose exception reads `TransientUpstreamError: fetch device
-  <id>: upstream 403` (or `fetch template <id>: upstream 401`), then put the same value
-  in every service (`make up` recreates the containers whose environment changed; a plain
-  restart does not re-read `.env`).
+  <id>: upstream 403` (or `fetch template <id>: upstream 401`), or for
+  `nats_event_unverified` with reason `unexpected status 403`. Then put the same value in every
+  service: `make up` on a dev stack or `make prod` on a production host recreates the
+  containers whose environment changed (a plain restart keeps the old environment), and
+  on a stack whose configuration was saved in the config UI, `INTERNAL_API_TOKEN` is
+  read from that `config.json`, not from `.env`, so change it in the config UI.
 - `excluded_frozen`: build-direction rows of reservations that have ended. A connection
   is never built for an ended reservation, so these rows stay as a record of a build that
   did not finish. No action is needed.

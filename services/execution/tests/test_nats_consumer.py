@@ -699,6 +699,30 @@ async def test_inventory_read_raises_transient_on_every_other_status(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [b"null", b"[]", b'[{"id": "dev-1"}]', b"not json"],
+    ids=["null", "empty-list", "list", "unparseable"],
+)
+@pytest.mark.parametrize("helper,record_id,path,what", _FETCH_HELPERS)
+async def test_inventory_read_raises_transient_on_a_malformed_200_body(
+    helper, record_id, path, what, content
+):
+    """A 200 whose body is not a JSON object is not a record: `null` would otherwise be
+    a None that pins the switch as not found, and a list would escape later as an
+    AttributeError. It raises like any other unusable answer, so 404 stays the only
+    not-found answer."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=content, headers={"content-type": "application/json"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(TransientUpstreamError) as exc_info:
+            await helper(record_id, client)
+    assert str(exc_info.value) == f"{what} {record_id}: upstream answered with a malformed body"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("helper,record_id,path,what", _FETCH_HELPERS)
 async def test_inventory_read_raises_transient_on_transport_error(helper, record_id, path, what):
     def handler(request: httpx.Request) -> httpx.Response:

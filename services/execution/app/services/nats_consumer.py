@@ -432,20 +432,30 @@ def _client_ctx(client):
 def _inventory_record_or_none(resp, *, what: str) -> dict | None:
     """Judge inventory's answer to a device or template read (issue #1203).
 
-    200 returns the parsed body; 404 returns None, the ONLY answer that means
-    "not in inventory"; every other status raises TransientUpstreamError with
-    the same "<what>: upstream <status>" text _get_internal uses for a 5xx.
-    A None here makes the wiring layers pin the switch's rows as unresolvable
-    with no attempt counted, so a 401 or 403 (an INTERNAL_API_TOKEN rotation)
-    or any other answer about an existing switch must NAK and be driven again
-    once inventory answers, never pin. _fetch_device and _fetch_template both
-    judge through this one function so the two cannot drift.
+    A 200 whose body is a JSON object returns that object; a 404 returns None,
+    the ONLY answer that means "not in inventory". Every other status raises
+    TransientUpstreamError with the same "<what>: upstream <status>" text
+    _get_internal uses for a 5xx, and a 200 whose body is not a JSON object
+    (`null`, a list, unparseable text) raises it with "<what>: upstream answered
+    with a malformed body", the rule execution_service._fetch_inventory_internal
+    applies to the same routes. A None here makes the wiring layers pin the
+    switch's rows as unresolvable with no attempt counted, so a 401 or 403 (an
+    INTERNAL_API_TOKEN rotation) or any other answer about an existing switch
+    must NAK and be driven again once inventory answers, never pin.
+    _fetch_device and _fetch_template both judge through this one function so
+    the two cannot drift.
     """
-    if resp.status_code == 200:
-        return resp.json()
     if resp.status_code == 404:
         return None
-    raise TransientUpstreamError(f"{what}: upstream {resp.status_code}")
+    if resp.status_code != 200:
+        raise TransientUpstreamError(f"{what}: upstream {resp.status_code}")
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        raise TransientUpstreamError(f"{what}: upstream answered with a malformed body")
+    return body
 
 
 async def _fetch_device(device_id: str, client=None) -> dict | None:
@@ -607,9 +617,12 @@ async def _fetch_fork_intended_wires(reservation_id: str, client=None) -> ForkIn
     the L1/L2/L3 full reconciles converge live wiring toward, so misreading an auth
     or shape error as "empty" would tear down a live reservation's entire wiring and
     then stamp the version so nothing re-applies it. Unreadable intent must defer
-    convergence (ADR 0007), never destroy state. This deliberately diverges from the
-    sibling _fetch_* helpers above, whose non-200-means-absent reading only degrades
-    one connection; do not "symmetrize" this branch with theirs. Only L1 rows are
+    convergence (ADR 0007), never destroy state. The switch device and template reads
+    (_fetch_device, _fetch_template) follow the same 404-only rule since issue #1203,
+    because their None pins every pair on the switch; the other sibling _fetch_*
+    helpers above (_fetch_latest_config, _fetch_hypervisor, _fetch_secret_value)
+    keep the non-200-means-absent reading, which only degrades one connection; do
+    not "symmetrize" those with this branch. Only L1 rows are
     returned in the wires list; phase 1 wiring is L1 by construction, and a stray
     non-L1 row is ignored. The ``l3_routes`` field is additive on cabling's payload
     (ADR 0014 phase 1): a cabling image that predates it, or a response with no such
@@ -2013,9 +2026,10 @@ async def _wires_to_switch_pairs(
                        resolves is WIRING_UNRESOLVABLE_REASON (Decision 5); an ambiguous
                        (non-simple-chain) group is WIRING_NOT_SIMPLE_CHAIN_REASON.
 
-    Raises TransientUpstreamError (through ctx.get_device) on a 5xx or transport error
-    while classifying an endpoint, so an UPSTREAM outage NAKs the whole message rather
-    than mis-classifying a live switch as gone (Decision 7 error split).
+    Raises TransientUpstreamError (through ctx.get_device) on a transport error or any
+    non-200 other than a 404 (a 5xx, and since issue #1203 a 401 or 403 too) while
+    classifying an endpoint, so an UPSTREAM outage NAKs the whole message rather than
+    mis-classifying a live switch as gone (Decision 7 error split).
     """
     device_is_switch: dict[str, bool] = {}
     keyed_groups: dict[str, list[dict]] = {}
@@ -2545,9 +2559,11 @@ async def _derive_l2_memberships(
 
     Returns {(switch_device_id, switch_port)} for every hop endpoint that lands on a
     Layer 2 Switch whose opposite endpoint is not itself a Layer 2 Switch. Classifies
-    each endpoint device through ctx.get_device (memoized per event), so a 5xx while
-    classifying raises TransientUpstreamError and NAKs the whole message (Decision 7):
-    an upstream outage must never be mistaken for "this port is not an L2 member".
+    each endpoint device through ctx.get_device (memoized per event), so a transport
+    error or any non-200 other than a 404 while classifying (a 5xx, and since issue
+    #1203 a 401 or 403) raises TransientUpstreamError and NAKs the whole message
+    (Decision 7): an upstream outage must never be mistaken for "this port is not an
+    L2 member".
     """
     memberships: set[tuple[str, str]] = set()
     for wire in wires:
@@ -2585,9 +2601,9 @@ async def _derive_l2_definition_scope(
     trunk port is not an access member of the reservation's VLAN) and wrong for
     DEFINITIONS (an undefined VLAN on a trunk-transit switch forwards nothing on strict
     NOS), so the definition scope is the membership switches plus the trunk-transit
-    switches. Unresolvable endpoints are omitted exactly as in the membership walk; a
-    5xx while classifying raises TransientUpstreamError through ctx.get_device and NAKs
-    the whole message.
+    switches. Unresolvable endpoints (a 404) are omitted exactly as in the membership
+    walk; a transport error or any other non-200 while classifying raises
+    TransientUpstreamError through ctx.get_device and NAKs the whole message.
     """
     scope: set[str] = set()
     for wire in wires:
@@ -3652,9 +3668,10 @@ async def _derive_l3_adjacency(
 
     Returns {switch_device_id} for every hop endpoint that lands on a Layer 3 Switch whose
     opposite endpoint is not itself a Layer 3 Switch. Classifies each endpoint device
-    through ctx.get_device (memoized per event), so a 5xx while classifying raises
-    TransientUpstreamError and NAKs the whole message (Decision 7): an upstream outage must
-    never be mistaken for "this switch is no longer adjacent". The L2 derivation's exact
+    through ctx.get_device (memoized per event), so a transport error or any non-200
+    other than a 404 while classifying (a 5xx, and since issue #1203 a 401 or 403)
+    raises TransientUpstreamError and NAKs the whole message (Decision 7): an upstream
+    outage must never be mistaken for "this switch is no longer adjacent". The L2 derivation's exact
     shape, keyed on the switch device id (an L3 pin is per switch, not per port).
 
     ADR 0014 addendum X-B (issue #34 phase 3): when `l3_intent` (the fork's routing

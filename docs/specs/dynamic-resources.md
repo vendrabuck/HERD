@@ -312,7 +312,7 @@ goes live.
   #1203) raises `PermanentEventError`, so the event is dead-lettered on its first
   delivery (WIRE-CONSUME-9). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_recipe_deps`, `_fetch_template`, `_provision_one_instance`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_missing_template_is_permanent_dlq_with_failure_callback`, `test_missing_template_raises_permanent_directly`); `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_returns_none_only_on_404`)
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_missing_template_is_permanent_dlq_with_failure_callback`, `test_missing_template_raises_permanent_directly`, `test_create_template_read_auth_error_naks_and_never_dead_letters`, `test_teardown_template_read_auth_error_raises_and_leaves_row_unchanged`); `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_returns_none_only_on_404`)
 - **DYN-CREATE-9.** The template's current `hypervisor_id` and that hypervisor's
   `secret_id` are then read from inventory and the secrets service; a missing hypervisor
   or secret raises `PermanentEventError` the same way. \
@@ -321,10 +321,12 @@ goes live.
 - **DYN-CREATE-10.** A 5xx or transport error on any of those reads raises
   `TransientUpstreamError`, so the event is nacked and retried; on the template read
   every other non-404 non-200 (a 401 or 403 during an `INTERNAL_API_TOKEN` rotation, a
-  422) raises it too (#1203), while the hypervisor and secret reads still treat any
+  422) and a 200 whose body is not a JSON object raise it too (#1203), on create and on
+  teardown alike (a teardown no longer leaves the row live with `recipe_config_missing`
+  for such an answer), while the hypervisor and secret reads still treat any
   non-200 below 500 as missing (DYN-CREATE-9). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_template`, `_inventory_record_or_none`, `_fetch_hypervisor`, `_fetch_secret_value`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_transient_5xx_naks`, `test_fetch_hypervisor_5xx_raises_transient`, `test_fetch_secret_value_5xx_raises_transient`); `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_raises_transient_on_every_other_status`)
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_transient_5xx_naks`, `test_fetch_hypervisor_5xx_raises_transient`, `test_fetch_secret_value_5xx_raises_transient`, `test_create_template_read_auth_error_naks_and_never_dead_letters`, `test_teardown_template_read_auth_error_raises_and_leaves_row_unchanged`); `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_raises_transient_on_every_other_status`)
 - **DYN-CREATE-11.** The `CREATING` row is written before the recipe package is loaded
   and before any recipe call, so every later failure leaves a row for teardown. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`) \

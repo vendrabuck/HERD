@@ -758,10 +758,16 @@ async def _deliver_cancelled(denied: dict, unexpected: list, execute_fn, num_del
 async def test_teardown_inventory_auth_error_naks_and_never_pins(layer, resource, status, caplog):
     """Issue #1203: inventory answering 401 or 403 for an existing switch (or its
     template) during a terminal teardown NAKs the message with the backoff delay, leaves
-    that layer's rows and every later layer's rows exactly as they were (every column),
-    writes WIRING_UNRESOLVABLE_REASON nowhere, and a redelivery once inventory answers
-    200 releases every row. Layers ahead of the failing one release on the first
-    delivery (the pass runs L1, then L2, then L3)."""
+    the ACTIVE rows of that layer and of every later layer exactly as they were (every
+    column), writes WIRING_UNRESOLVABLE_REASON nowhere, keeps the wiring frozen, and a
+    redelivery once inventory answers 200 drives the release of those layers and
+    releases every row. Layers ahead of the failing one release on the first delivery
+    (the pass runs L1, then L2, then L3).
+
+    The rows seeded here are all ACTIVE. A FAILED intended-ACTIVE L3 pin is a different
+    case by design (#1001): teardown parks it intended RELEASED before the switch is
+    read, so the NAKed delivery changes it and the release-direction retry tick finishes
+    it; that is the same as a 5xx and is not what this test pins."""
     from app.services.nats_consumer import (
         NATS_NAK_BACKOFF_SECONDS,
         WIRING_UNRESOLVABLE_REASON,
@@ -807,8 +813,16 @@ async def test_teardown_inventory_auth_error_naks_and_never_pins(layer, resource
     release_actions = {"L1": "disconnect_ports", "L2": "remove_from_vlan", "L3": "remove_route"}
     for name in untouched_layers:
         assert release_actions[name] not in calls, f"{name} must not be driven on a denied read"
+    ahead_layers = _LAYER_ORDER[: _LAYER_ORDER.index(layer)]
+    for name in ahead_layers:
+        assert release_actions[name] in calls, f"{name} is ahead of the denied read"
+        for model in _LAYER_MODELS[name]:
+            assert await _statuses(model) == ["RELEASED"], model.__name__
+    state = await _wiring_state()
+    assert state is not None and state.frozen is True, "the freeze outlives the NAK"
 
     # Redelivery: inventory answers again, so the same event releases every row.
+    calls_before_redelivery = len(calls)
     result, msg = await _deliver_cancelled({}, unexpected, execute_fn, 2)
 
     assert result == "ack"
@@ -818,4 +832,8 @@ async def test_teardown_inventory_auth_error_naks_and_never_pins(layer, resource
     assert await _statuses(L2PortAssignment) == ["RELEASED"]
     assert await _statuses(VlanAssignment) == ["RELEASED"]
     assert await _statuses(RouteAssignment) == ["RELEASED"]
+    redelivery_calls = calls[calls_before_redelivery:]
+    assert {a for a in redelivery_calls if a in release_actions.values()} == {
+        release_actions[name] for name in untouched_layers
+    }, "RELEASED alone does not prove the driver ran"
     assert unexpected == []

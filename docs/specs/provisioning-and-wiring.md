@@ -303,7 +303,7 @@ Events consumed from `HERD_RESERVATIONS` (all produced by reservations, section 
 
 | Subject | What this area does | Rules |
 |---|---|---|
-| `herd.reservations.wiring_changed` | ordered apply of the fork's wiring | WIRE-ORDER-2 to WIRE-ORDER-13 |
+| `herd.reservations.wiring_changed` | ordered apply of the fork's wiring | WIRE-ORDER-2 to WIRE-ORDER-14 |
 | `herd.reservations.cancelled`, `completed`, `failed` | freeze, then tear down from the ledgers | WIRE-DISPATCH-3, WIRE-TEARDOWN-1 to WIRE-TEARDOWN-6 |
 | `herd.reservations.created` | no wiring (health tiers only) | WIRE-DISPATCH-1 |
 | `herd.reservations.updated` | no wiring (dynamic teardown of removed devices only) | WIRE-DISPATCH-2 |
@@ -554,13 +554,18 @@ state transitions are WIRE-ORDER-1 and WIRE-FREEZE-1.
   Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_driver_failure_acks_and_does_not_raise`, `test_upstream_error_raises_for_nak`)
 - **WIRE-ORDER-11.** A device or template lookup in inventory reads as not found only
   when inventory answers 404. Every other non-200 (a 401 or 403 during an
-  `INTERNAL_API_TOKEN` rotation, a 409, a 422, a 5xx) and a transport failure raise
-  `TransientUpstreamError` with the text `fetch device <id>: upstream <status>` (or
-  `fetch template <id>: ...`, or `...: transport error: <message>`), so the event is
-  nacked and nothing is recorded for the switch: no row is pinned with
-  `WIRING_UNRESOLVABLE_REASON` and the version is not stamped (#1203). \
+  `INTERNAL_API_TOKEN` rotation, a 409, a 422, a 5xx), a 200 whose body is not a JSON
+  object, and a transport failure raise `TransientUpstreamError` with the text
+  `fetch device <id>: upstream <status>` (or `fetch template <id>: ...`,
+  `...: upstream answered with a malformed body`, `...: transport error: <message>`),
+  so the event is nacked and no row is pinned with `WIRING_UNRESOLVABLE_REASON`: a
+  `wiring_changed` leaves the version unstamped and records nothing for the switch,
+  and a terminal teardown leaves the ACTIVE rows of the failing layer and of every
+  later layer unchanged (#1203). A FAILED intended-ACTIVE L3 pin is the exception
+  that a 5xx shares: teardown parks it intended RELEASED before the switch is read
+  (#1001), and the release-direction retry tick finishes it. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_device`, `_fetch_template`, `_inventory_record_or_none`) \
-  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_returns_the_body_on_200`, `test_inventory_read_returns_none_only_on_404`, `test_inventory_read_raises_transient_on_every_other_status`, `test_inventory_read_raises_transient_on_transport_error`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_inventory_auth_error_naks_and_never_pins`); `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_inventory_auth_error_on_switch_read_raises_and_pins_nothing`)
+  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_returns_the_body_on_200`, `test_inventory_read_returns_none_only_on_404`, `test_inventory_read_raises_transient_on_every_other_status`, `test_inventory_read_raises_transient_on_a_malformed_200_body`, `test_inventory_read_raises_transient_on_transport_error`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_inventory_auth_error_naks_and_never_pins`); `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_inventory_auth_error_on_switch_read_raises_and_pins_nothing`)
 - **WIRE-ORDER-12.** Within one event each device and each switch's latest config is
   fetched at most once. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_FetchContext`) \
