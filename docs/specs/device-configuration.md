@@ -1214,29 +1214,39 @@ the child entry point `services/execution/app/services/_runner.py`;
 
 **Rules.**
 
-- **CFG-SBX-1.** Each call starts `python _runner.py <driver dir> <action> <context file>`
+- **CFG-SBX-1.** Each call starts `python -I -B _runner.py <driver dir> <action> <context file>`
   plus, when there are keyword arguments, the path of a second temporary JSON file that
   holds them; no argument text is on the child's command line. Both files are written
   with owner-only permissions and deleted when the call ends. \
   Enforced in: `services/execution/app/services/driver_sandbox.py` (`execute_driver_method`); `services/execution/app/services/_runner.py` (`main`) \
-  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_execute_login`, `test_execute_context_passed`, `test_execute_connect_ports_via_method_kwargs`); `services/execution/tests/test_runner.py` (`test_runner_login_action`, `test_runner_connect_ports_with_args`, `test_runner_invalid_context_file`); `services/execution/tests/test_run_arguments_storage.py` (`test_driver_arguments_never_on_the_child_command_line`, `test_driver_call_without_arguments_passes_no_arguments_file`)
+  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_execute_login`, `test_execute_context_passed`, `test_execute_connect_ports_via_method_kwargs`); `services/execution/tests/test_runner.py` (`test_runner_login_action`, `test_runner_connect_ports_with_args`, `test_runner_invalid_context_file`); `services/execution/tests/test_run_arguments_storage.py` (`test_driver_arguments_never_on_the_child_command_line`, `test_driver_call_without_arguments_passes_no_arguments_file`); `services/execution/tests/test_sandbox_isolation.py` (`test_child_command_is_isolated_and_env_carries_no_pythonpath`)
 - **CFG-SBX-2.** The keyword arguments are `method_kwargs` plus `port_a` and `port_b`
   when given and not already present. \
   Enforced in: `services/execution/app/services/driver_sandbox.py` (`execute_driver_method`) \
   Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_execute_connect_ports_via_method_kwargs`, `test_execute_connect_ports`)
-- **CFG-SBX-3.** The child's environment holds `PYTHONPATH` (the driver directory, plus
-  `_deps` when present), `PYTHONDONTWRITEBYTECODE`, `PATH`, `HERD_TRANSCRIPT_PATH`, the
+- **CFG-SBX-3.** The child's environment holds `PATH`, `HERD_TRANSCRIPT_PATH`, the
   rlimit policy, and every context key upper-cased as a string (booleans in lower case,
   null as empty, lists and objects as JSON) except the keys of `password`-typed fields,
-  which reach the driver through the context file only. \
+  which reach the driver through the context file only. It holds no `PYTHONPATH` and no
+  `PYTHONDONTWRITEBYTECODE`: the child runs with `-I`, which ignores every `PYTHON*`
+  variable (issue #1180). \
   Enforced in: `services/execution/app/services/driver_sandbox.py` (`execute_driver_method`, `context_to_env_vars`) \
-  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_context_to_env_vars_string`, `test_context_to_env_vars_bool`, `test_context_to_env_vars_none`, `test_context_to_env_vars_dict`, `test_context_to_env_vars_keys_uppercased`, `test_context_to_env_vars_exclude_strips_secrets`, `test_env_vars_visible_in_subprocess`, `test_password_keys_stripped_from_env_but_kept_in_context`); `services/execution/tests/test_sandbox_isolation.py` (`test_no_secret_key_leaks_into_env`)
+  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_context_to_env_vars_string`, `test_context_to_env_vars_bool`, `test_context_to_env_vars_none`, `test_context_to_env_vars_dict`, `test_context_to_env_vars_keys_uppercased`, `test_context_to_env_vars_exclude_strips_secrets`, `test_env_vars_visible_in_subprocess`, `test_password_keys_stripped_from_env_but_kept_in_context`); `services/execution/tests/test_sandbox_isolation.py` (`test_no_secret_key_leaks_into_env`, `test_child_command_is_isolated_and_env_carries_no_pythonpath`)
 - **CFG-SBX-4.** The child applies `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_NOFILE`, and
   `RLIMIT_NPROC` from the `DRIVER_RLIMIT_*` settings as both soft and hard limits before
   it imports the driver; 0 leaves a limit off, and a limit that cannot be set is
-  skipped. Known gap, see #1180. \
-  Enforced in: `services/execution/app/services/driver_sandbox.py` (`_rlimit_pairs`); `services/execution/app/services/_rlimits.py` (`apply_rlimits`); `services/execution/app/services/_runner.py` (`main`) \
-  Pinned by: `services/execution/tests/test_driver_sandbox_edges.py` (`test_rlimit_pairs_reads_settings_live`, `test_apply_rlimits_applies_each_positive_limit`, `test_apply_rlimits_skips_unknown_limit_name`, `test_apply_rlimits_swallows_setrlimit_error`, `test_execute_passes_rlimit_policy_to_child_env`); `services/execution/tests/test_sandbox_isolation.py` (`test_memory_limit_kills_driver`, `test_cpu_limit_kills_driver`)
+  skipped. No package file runs before the limits (issue #1180): the child starts in
+  isolated mode (`-I -B`), so the package directory is not on `sys.path` at interpreter
+  start and a package `sitecustomize.py` is never imported, and `_runner.py` puts the
+  package directory and then `_deps` (when it exists) on `sys.path` only after
+  `apply_rlimits`, right after its own directory and ahead of the standard library (the
+  order `PYTHONPATH` used to give). A package module named like a standard library
+  module the runner imported first (`json`) is never imported, by the runner or the
+  driver, because `sys.modules` keeps serving the standard library one; a package
+  module that shadows one the runner has not imported still does, under the limits.
+  A package `driver_transcript.py` or `_rlimits.py` never replaces the runner's own. \
+  Enforced in: `services/execution/app/services/driver_sandbox.py` (`_rlimit_pairs`, `execute_driver_method`); `services/execution/app/services/_rlimits.py` (`apply_rlimits`); `services/execution/app/services/_runner.py` (`main`, `_put_package_on_path`) \
+  Pinned by: `services/execution/tests/test_driver_sandbox_edges.py` (`test_rlimit_pairs_reads_settings_live`, `test_apply_rlimits_applies_each_positive_limit`, `test_apply_rlimits_skips_unknown_limit_name`, `test_apply_rlimits_swallows_setrlimit_error`, `test_execute_passes_rlimit_policy_to_child_env`); `services/execution/tests/test_sandbox_isolation.py` (`test_memory_limit_kills_driver`, `test_cpu_limit_kills_driver`, `test_package_sitecustomize_never_runs_in_the_child`, `test_package_json_module_never_replaces_the_standard_library`, `test_package_module_the_driver_imports_runs_under_the_caps`, `test_child_is_isolated_and_resolves_runner_then_package_then_deps`, `test_checked_in_mock_l1_driver_still_runs_in_the_isolated_child`); `services/execution/tests/test_runner.py` (`test_put_package_on_path_inserts_package_right_after_the_runner_dir`, `test_put_package_on_path_adds_deps_after_the_package`)
 - **CFG-SBX-5.** Unless the caller passes a timeout, `status` gets
   `STATUS_CHECK_TIMEOUT_SECONDS` (10) and every other action `EXECUTION_TIMEOUT_SECONDS`
   (30); a child still running then is killed and the call fails with
@@ -1258,7 +1268,9 @@ the child entry point `services/execution/app/services/_runner.py`;
   Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_execute_non_json_stdout`, `test_execute_failing_driver`); `services/execution/tests/test_driver_sandbox_edges.py` (`test_success_with_non_json_stdout_wraps_raw_output`, `test_success_with_stderr_carries_it_separately_and_leaves_error_none`, `test_negative_returncode_reports_signal`, `test_raise_behind_stderr_noise_is_still_sanitized`, `test_parser_reads_only_the_last_line`, `test_unstructured_failure_never_stores_raw_stderr_as_error`)
 - **CFG-SBX-8.** A package's `requirements.txt` is installed into `_deps` (60 seconds,
   no resource limits, errors only logged) only when `ALLOW_DRIVER_PIP_INSTALL` is true
-  and `_deps` does not exist yet. \
+  and `_deps` does not exist yet, by `python -I -m pip install -r <requirements.txt>
+  --target <_deps> -q`, so pip, too, imports nothing from the package directory or the
+  current directory (issue #1180). \
   Enforced in: `services/execution/app/services/driver_sandbox.py` (`execute_driver_method`) \
   Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_requirements_txt_skipped_when_pip_install_disabled`, `test_requirements_txt_installed_when_pip_install_enabled`, `test_execute_with_existing_deps_dir`); `services/execution/tests/test_driver_sandbox_edges.py` (`test_pip_install_exception_swallowed`)
 - **CFG-SBX-9.** The child runs as execution's own user with no namespace, filesystem,
@@ -1466,11 +1478,7 @@ confirmed by reading only.
 
 ### Open defects
 
-- #1180 (CFG-SBX-4): the limits bind `driver.py` only. Other package code runs in the
-  child before they apply: a package `sitecustomize.py` runs at interpreter start, and
-  a package module that shadows a standard library module the runner imports before
-  the limits (`json`) runs in its place, both with no limit. It still runs in the
-  child, never in the execution process; open by owner decision.
+None at present.
 
 ### Limits by decision
 
