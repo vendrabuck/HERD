@@ -904,6 +904,105 @@ async def test_upstream_error_raises_for_nak():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("resource", ["device", "template"])
+async def test_inventory_auth_error_on_switch_read_raises_and_pins_nothing(resource, status):
+    """Issue #1203: a 401 or 403 from inventory on the switch's device or template read
+    (an INTERNAL_API_TOKEN rotation) raises TransientUpstreamError for a NAK, leaves
+    last_applied_fork_version unstamped, writes no ledger row (in particular no FAILED
+    row pinned with WIRING_UNRESOLVABLE_REASON), and drives no driver call; the
+    redelivery, with inventory answering again, builds the pair and stamps the version.
+    The REAL _fetch_device and _fetch_template run against an httpx MockTransport."""
+    import httpx
+
+    await _seed_state(last_applied=0)
+    devices = {
+        SWITCH_ID: SWITCH_DATA,
+        DUT1: {**DUT_DATA, "id": DUT1},
+        DUT2: {**DUT_DATA, "id": DUT2},
+    }
+    denied_path = (
+        f"/devices/{SWITCH_ID}/internal"
+        if resource == "device"
+        else f"/templates/{SWITCH_DATA['template_id']}/internal"
+    )
+    denied = {denied_path: status}
+    unexpected: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path in denied:
+            return httpx.Response(denied[path], json={"detail": "Invalid internal token"})
+        parts = path.strip("/").split("/")
+        if len(parts) == 3 and parts[2] == "internal":
+            if parts[0] == "devices" and parts[1] in devices:
+                return httpx.Response(200, json=devices[parts[1]])
+            if parts[0] == "templates" and parts[1] == SWITCH_DATA["template_id"]:
+                return httpx.Response(200, json=TEMPLATE_DATA)
+        unexpected.append((request.method, str(request.url)))
+        return httpx.Response(404, json={"detail": "unexpected request"})
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+
+    def run_patches(execute_fn):
+        return [
+            patch(
+                "app.services.nats_consumer.httpx.AsyncClient",
+                new=lambda *a, **kw: real_client(transport=transport),
+            ),
+            patch(
+                "app.services.driver_loader.load_driver",
+                new=AsyncMock(return_value="/tmp/driver"),
+            ),
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+            patch(
+                "app.services.nats_consumer._fetch_fork_intended_wires",
+                new=AsyncMock(return_value=PAIR_12),
+            ),
+        ]
+
+    execute_fn, calls = _sandbox_recorder()
+    ps = run_patches(execute_fn)
+    for p in ps:
+        p.start()
+    try:
+        with pytest.raises(TransientUpstreamError) as exc_info:
+            await handle_reservation_event(
+                _event(1, released=[], built=PAIR_12), _db_session_factory()
+            )
+    finally:
+        for p in ps:
+            p.stop()
+
+    what = (
+        f"fetch device {SWITCH_ID}"
+        if resource == "device"
+        else f"fetch template {SWITCH_DATA['template_id']}"
+    )
+    assert str(exc_info.value) == f"{what}: upstream {status}"
+    assert await _last_applied() == 0, "a NAK must not stamp the version"
+    assert await _assignments() == [], "no row, so nothing is pinned not-retryable"
+    assert calls == []
+
+    denied.clear()
+    ps = run_patches(execute_fn)
+    for p in ps:
+        p.start()
+    try:
+        await handle_reservation_event(_event(1, released=[], built=PAIR_12), _db_session_factory())
+    finally:
+        for p in ps:
+            p.stop()
+
+    active = await _assignments("ACTIVE")
+    assert [(r.port_a, r.port_b) for r in active] == [("0/0/1", "0/0/2")]
+    assert ("connect_ports", "0/0/1", "0/0/2") in calls
+    assert await _last_applied() == 1
+    assert unexpected == []
+
+
+@pytest.mark.asyncio
 async def test_upstream_error_on_fork_fetch_raises():
     """A 5xx from cabling's fork GET during a gap reconcile raises (NAK)."""
     await _seed_state(last_applied=0)

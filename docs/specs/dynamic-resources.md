@@ -308,19 +308,25 @@ goes live.
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_provision_over_every_ledger_state`)
 - **DYN-CREATE-8.** The template is read from inventory with the internal token; a
-  missing template raises `PermanentEventError`, so the event is dead-lettered on its
-  first delivery (WIRE-CONSUME-9). \
+  missing template (inventory answers 404, the only answer that means missing since
+  #1203) raises `PermanentEventError`, so the event is dead-lettered on its first
+  delivery (WIRE-CONSUME-9). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_recipe_deps`, `_fetch_template`, `_provision_one_instance`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_missing_template_is_permanent_dlq_with_failure_callback`, `test_missing_template_raises_permanent_directly`)
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_missing_template_is_permanent_dlq_with_failure_callback`, `test_missing_template_raises_permanent_directly`, `test_create_template_read_auth_error_naks_and_never_dead_letters`, `test_teardown_template_read_auth_error_raises_and_leaves_row_unchanged`); `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_returns_none_only_on_404`)
 - **DYN-CREATE-9.** The template's current `hypervisor_id` and that hypervisor's
   `secret_id` are then read from inventory and the secrets service; a missing hypervisor
   or secret raises `PermanentEventError` the same way. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_recipe_deps`, `_fetch_hypervisor`, `_fetch_secret_value`, `_provision_one_instance`) \
   Pinned by: none
 - **DYN-CREATE-10.** A 5xx or transport error on any of those reads raises
-  `TransientUpstreamError`, so the event is nacked and retried. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_template`, `_fetch_hypervisor`, `_fetch_secret_value`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_transient_5xx_naks`, `test_fetch_hypervisor_5xx_raises_transient`, `test_fetch_secret_value_5xx_raises_transient`)
+  `TransientUpstreamError`, so the event is nacked and retried; on the template read
+  every other non-404 non-200 (a 401 or 403 during an `INTERNAL_API_TOKEN` rotation, a
+  422) and a 200 whose body is not a JSON object raise it too (#1203), on create and on
+  teardown alike (a teardown no longer leaves the row live with `recipe_config_missing`
+  for such an answer), while the hypervisor and secret reads still treat any
+  non-200 below 500 as missing (DYN-CREATE-9). \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_template`, `_inventory_record_or_none`, `_fetch_hypervisor`, `_fetch_secret_value`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_transient_5xx_naks`, `test_fetch_hypervisor_5xx_raises_transient`, `test_fetch_secret_value_5xx_raises_transient`, `test_create_template_read_auth_error_naks_and_never_dead_letters`, `test_teardown_template_read_auth_error_raises_and_leaves_row_unchanged`); `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_raises_transient_on_every_other_status`)
 - **DYN-CREATE-11.** The `CREATING` row is written before the recipe package is loaded
   and before any recipe call, so every later failure leaves a row for teardown. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`) \
@@ -935,7 +941,7 @@ acknowledgement and the log action.
 |---|---|---|---|
 | acked, nothing run | `nats_event_unverified` | `provision_requested` for a reservation not `PENDING_PROVISION` | DYN-CREATE-1 |
 | dead-lettered on first delivery, failure callback | `nats_dlq_permanent` | template, hypervisor, or secret missing; recipe package fails the load's checks (archive, `driver.py` parse, `Driver` class, required methods); inventory refused the device; create succeeded without a ref | DYN-CREATE-8, DYN-CREATE-9, DYN-CREATE-12, DYN-CREATE-19, DYN-CREATE-23, DYN-DLQ-1 |
-| nacked with delay | `nats_message_nak` | 5xx or transport error; package download failure; failed login or create, including a recipe whose top-level code raises (the load parses `driver.py` and never runs it, so the first sandboxed `login` fails); reservations unreachable | DYN-CREATE-2, DYN-CREATE-10, DYN-CREATE-13, DYN-CREATE-16, DYN-CREATE-18 |
+| nacked with delay | `nats_message_nak` | 5xx or transport error, or any other non-404 answer to the template read; package download failure; failed login or create, including a recipe whose top-level code raises (the load parses `driver.py` and never runs it, so the first sandboxed `login` fails); reservations unreachable | DYN-CREATE-2, DYN-CREATE-10, DYN-CREATE-13, DYN-CREATE-16, DYN-CREATE-18 |
 | dead-lettered at the fifth delivery, failure callback | `nats_dlq_exhausted` | any nacked failure that persists | DYN-CREATE-2, DYN-CREATE-18, DYN-DLQ-1 |
 | acked, event abandoned, no callback | `dynamic_provision_abandoned` | a request refused or undone | DYN-CREATE-6, DYN-CREATE-26 |
 | acked, ledger row left live | `dynamic_instance_keyed_destroy_failed`, `dynamic_instance_teardown_contended`, or a plain error | teardown could not prove the instance gone | DYN-DESTROY-7, DYN-DESTROY-9, DYN-DESTROY-10, DYN-DESTROY-14 |

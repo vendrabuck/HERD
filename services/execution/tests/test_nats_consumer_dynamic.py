@@ -2858,3 +2858,147 @@ async def test_full_recipe_cycle_never_stores_secret_plaintext():
             for plaintext in plaintexts:
                 assert plaintext not in value, (run.action, column.name)
         assert "***REDACTED***" in json.dumps(run.input_params, default=str)
+
+
+# --- issue #1203: a non-404 answer to the template read is transient, never missing ---
+#
+# These run the REAL _fetch_template (and, on the redelivery, the real hypervisor and
+# secret reads) on an httpx MockTransport. A 401 or 403 from inventory (an
+# INTERNAL_API_TOKEN rotation) is an answer about an existing template: the create must
+# NAK, not dead-letter as a missing template and fail the reservation, and the teardown
+# must NAK, not leave the row live with `recipe_config_missing`.
+
+
+def _inventory_transport(denied: dict, unexpected: list):
+    """Answer the template, hypervisor, and secret reads from the tables above; a path in
+    `denied` gets its status instead; anything else is recorded in `unexpected`."""
+    from app.config import settings
+
+    template_path = f"/templates/{TEMPLATE_ID}/internal"
+    hypervisor_path = f"/hypervisors/{HYPERVISOR_ID}/internal"
+    secret_path = httpx.URL(
+        f"{settings.secrets_service_url}/internal/secrets/{SECRET_ID}/value"
+    ).path
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path in denied:
+            return httpx.Response(denied[path], json={"detail": "Invalid internal token"})
+        if path == template_path:
+            return httpx.Response(200, json=TEMPLATE_DATA)
+        if path == hypervisor_path:
+            return httpx.Response(200, json=HYPERVISOR_DATA)
+        if path == secret_path:
+            return httpx.Response(200, json={"data": SECRET_DATA})
+        unexpected.append((request.method, str(request.url)))
+        return httpx.Response(404, json={"detail": "unexpected request"})
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    return patch(
+        "app.services.nats_consumer.httpx.AsyncClient",
+        new=lambda *a, **kw: real_client(transport=transport),
+    )
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_create_template_read_auth_error_naks_and_never_dead_letters(status, caplog):
+    """A provision_requested whose template read answers 401 or 403 NAKs with the
+    backoff delay: no DLQ publish, no failure callback (which would FAIL the
+    reservation), no `nats_dlq_permanent`, no ledger row, no recipe call. Before #1203
+    the read returned None and the create raised PermanentEventError."""
+    from app.services.nats_consumer import NATS_NAK_BACKOFF_SECONDS
+
+    calls, execute = _recipe_execute({"create_instance": CREATE_OK})
+    posted = AsyncMock()
+    js = MagicMock()
+    js.publish = AsyncMock()
+    msg = _provision_msg(1)
+    unexpected: list = []
+    # Every create seam except the three config reads, which run for real on the transport.
+    real_reads = {"_fetch_template", "_fetch_hypervisor", "_fetch_secret_value"}
+    patches = [p for p in _create_patches(execute) if p.attribute not in real_reads]
+    patches.append(_inventory_transport({f"/templates/{TEMPLATE_ID}/internal": status}, unexpected))
+    patches.append(patch("app.services.nats_consumer._post_provision_result", new=posted))
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        result = await process_reservation_message(
+            msg, js, handle_reservation_event, _db_session_factory()
+        )
+
+    assert result == "nak"
+    msg.nak.assert_awaited_once_with(delay=NATS_NAK_BACKOFF_SECONDS[0])
+    msg.ack.assert_not_awaited()
+    js.publish.assert_not_awaited()
+    posted.assert_not_awaited()
+    actions = [getattr(r, "action", None) for r in caplog.records]
+    assert "nats_dlq_permanent" not in actions
+    [nak] = [r for r in caplog.records if getattr(r, "action", None) == "nats_message_nak"]
+    assert isinstance(nak.exc_info[1], TransientUpstreamError)
+    assert str(nak.exc_info[1]) == f"fetch template {TEMPLATE_ID}: upstream {status}"
+    assert await _rows() == []
+    assert calls == []
+    assert unexpected == []
+
+
+@pytest.mark.parametrize("seed", ["keyed_creating", "by_ref_active"])
+async def test_teardown_template_read_auth_error_raises_and_leaves_row_unchanged(seed, caplog):
+    """A terminal event whose dynamic teardown template read answers 403 raises
+    TransientUpstreamError (the consumer NAKs), leaves the ledger row exactly as it was,
+    and logs no `recipe_config_missing` (the left-live outcome a missing template takes);
+    the redelivery, with inventory answering, destroys the instance and retires the row.
+    Before #1203 the read returned None and the row was left live and ACKed."""
+    if seed == "keyed_creating":
+        await _seed_creating()
+    else:
+        await _seed_active()
+
+    async def snapshot():
+        return [
+            {c.key: getattr(r, c.key) for c in DynamicInstance.__mapper__.column_attrs}
+            for r in await _rows()
+        ]
+
+    before = await snapshot()
+    calls, execute = _recipe_execute({"destroy_instance": DESTROY_OK})
+    delete = AsyncMock(return_value=True)
+    unexpected: list = []
+    event = {
+        "event": "reservation.cancelled",
+        "reservation_id": RES_ID,
+        "user_id": USER_ID,
+        "device_ids": [],
+    }
+
+    def patches(denied):
+        return [
+            _inventory_transport(denied, unexpected),
+            patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/r")),
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute),
+            patch("app.services.nats_consumer._delete_dynamic_device", new=delete),
+            patch("app.services.nats_consumer.apply_reservation_event_tiers", new=AsyncMock()),
+        ]
+
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in patches({f"/templates/{TEMPLATE_ID}/internal": 403}):
+            stack.enter_context(p)
+        with pytest.raises(TransientUpstreamError) as exc_info:
+            await handle_reservation_event(event, _db_session_factory())
+
+    assert str(exc_info.value) == f"fetch template {TEMPLATE_ID}: upstream 403"
+    assert await snapshot() == before
+    assert calls == []
+    delete.assert_not_awaited()
+    assert not [r for r in caplog.records if getattr(r, "reason", None) == "recipe_config_missing"]
+    assert not [r for r in caplog.records if "Cannot load recipe deps" in r.getMessage()]
+
+    with ExitStack() as stack:
+        for p in patches({}):
+            stack.enter_context(p)
+        await handle_reservation_event(event, _db_session_factory())
+
+    assert [c[0] for c in calls] == ["login", "destroy_instance", "logout"]
+    rows = await _rows()
+    assert [r.status for r in rows] == ["DESTROYED"]
+    assert unexpected == []

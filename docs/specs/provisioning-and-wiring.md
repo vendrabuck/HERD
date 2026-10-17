@@ -303,7 +303,7 @@ Events consumed from `HERD_RESERVATIONS` (all produced by reservations, section 
 
 | Subject | What this area does | Rules |
 |---|---|---|
-| `herd.reservations.wiring_changed` | ordered apply of the fork's wiring | WIRE-ORDER-2 to WIRE-ORDER-13 |
+| `herd.reservations.wiring_changed` | ordered apply of the fork's wiring | WIRE-ORDER-2 to WIRE-ORDER-14 |
 | `herd.reservations.cancelled`, `completed`, `failed` | freeze, then tear down from the ledgers | WIRE-DISPATCH-3, WIRE-TEARDOWN-1 to WIRE-TEARDOWN-6 |
 | `herd.reservations.created` | no wiring (health tiers only) | WIRE-DISPATCH-1 |
 | `herd.reservations.updated` | no wiring (dynamic teardown of removed devices only) | WIRE-DISPATCH-2 |
@@ -552,11 +552,20 @@ state transitions are WIRE-ORDER-1 and WIRE-FREEZE-1.
   repeats the whole apply. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`handle_wiring_changed`) \
   Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_driver_failure_acks_and_does_not_raise`, `test_upstream_error_raises_for_nak`)
-- **WIRE-ORDER-11.** A device, template, or config lookup in inventory that answers 5xx
-  or fails in transport raises `TransientUpstreamError` (nack); any other non-200 reads as
-  not found. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_device`, `_fetch_template`, `_fetch_latest_config`) \
-  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_fetch_device_raises_on_5xx`, `test_fetch_device_returns_none_on_404`, `test_fetch_template_raises_on_5xx`, `test_fetch_device_raises_on_transport_error`)
+- **WIRE-ORDER-11.** A device or template lookup in inventory reads as not found only
+  when inventory answers 404. Every other non-200 (a 401 or 403 during an
+  `INTERNAL_API_TOKEN` rotation, a 409, a 422, a 5xx), a 200 whose body is not a JSON
+  object, and a transport failure raise `TransientUpstreamError` with the text
+  `fetch device <id>: upstream <status>` (or `fetch template <id>: ...`,
+  `...: upstream answered with a malformed body`, `...: transport error: <message>`),
+  so the event is nacked and no row is pinned with `WIRING_UNRESOLVABLE_REASON`: a
+  `wiring_changed` leaves the version unstamped and records nothing for the switch,
+  and a terminal teardown leaves the ACTIVE rows of the failing layer and of every
+  later layer unchanged (#1203). A FAILED intended-ACTIVE L3 pin is the exception
+  that a 5xx shares: teardown parks it intended RELEASED before the switch is read
+  (#1001), and the release-direction retry tick finishes it. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_device`, `_fetch_template`, `_inventory_record_or_none`) \
+  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_returns_the_body_on_200`, `test_inventory_read_returns_none_only_on_404`, `test_inventory_read_raises_transient_on_every_other_status`, `test_inventory_read_raises_transient_on_a_malformed_200_body`, `test_inventory_read_raises_transient_on_transport_error`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_inventory_auth_error_naks_and_never_pins`); `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_inventory_auth_error_on_switch_read_raises_and_pins_nothing`)
 - **WIRE-ORDER-12.** Within one event each device and each switch's latest config is
   fetched at most once. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_FetchContext`) \
@@ -567,6 +576,12 @@ state transitions are WIRE-ORDER-1 and WIRE-FREEZE-1.
   connections are released. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`handle_wiring_changed`) \
   Pinned by: `tests/integration/test_device_set_patch_wiring.py` (`test_patch_add_wires_nothing_until_fork_save_and_remove_releases`)
+- **WIRE-ORDER-14.** A switch's latest-config lookup in inventory that answers 5xx or
+  fails in transport raises `TransientUpstreamError` (nack); any other non-200 reads as
+  no config (split from WIRE-ORDER-11 by #1203, which changed only the device and
+  template lookups). \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_latest_config`) \
+  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_fetch_latest_config_returns_json_on_200`, `test_fetch_latest_config_returns_none_on_404`, `test_fetch_latest_config_raises_on_5xx`)
 
 **Out of scope.** When reservations stages the event and the ledger that guarantees it
 (`reservations.md`, RES-EVENT-2, RES-EVENT-3); what the fork contains (`topology.md`).
@@ -596,7 +611,8 @@ switch on it must connect, and refuses to guess when the chain is ambiguous.
   `WIRING_NOT_SIMPLE_CHAIN_REASON`; a hop from a device to itself fails the same way. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_chain_walk_group`, `_wires_to_switch_pairs`, `WIRING_NOT_SIMPLE_CHAIN_REASON`) \
   Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_branch_is_not_a_simple_chain_fails_safe`, `test_two_edges_one_switch_null_edge_key_fails_safe`)
-- **WIRE-PAIR-4.** A hop whose endpoint device inventory reports missing fails with
+- **WIRE-PAIR-4.** A hop whose endpoint device inventory reports missing (a 404,
+  WIRE-ORDER-11) fails with
   `WIRING_UNRESOLVABLE_REASON`; recorded hops are applied as recorded and never
   re-routed. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_wires_to_switch_pairs`, `WIRING_UNRESOLVABLE_REASON`) \
@@ -631,7 +647,8 @@ each confirmed change.
 - **WIRE-L1-2.** Port pairs are stored sorted, so (a, b) and (b, a) are one pair. \
   Enforced in: `services/execution/app/services/l1_assignment_service.py` (`canonical_port_pair`) \
   Pinned by: `services/execution/tests/test_l1_assignment_service.py` (`test_canonical_port_pair_both_orders_collide`, `test_record_connect_reversed_order_is_idempotent`, `test_release_matches_reversed_port_order`)
-- **WIRE-L1-3.** A switch inventory reports missing, a missing template, or a driver load
+- **WIRE-L1-3.** A switch inventory reports missing or a missing template (a 404,
+  WIRE-ORDER-11), or a driver load
   that raises parks every build pair on it FAILED intended `ACTIVE` and every release pair
   still believed live FAILED intended `RELEASED`, attempts 0, with a reason starting
   `WIRING_UNRESOLVABLE_REASON`, and makes no driver call. \
@@ -1318,7 +1335,7 @@ Events are in section 6; the internal routes this area serves are in section 7.
 | Out | reservations | `GET /internal/{id}` (internal token, 10 s) | corroborate an event's status | Fail closed: 5xx or transport nacks; 404 or another non-200 acks without acting (WIRE-GATE-2, WIRE-GATE-3) |
 | Out | cabling | `GET /internal/forks/{id}` (internal token, 10 s) | the intended hops and routing intent | Fail closed: 404 is an empty set; any other non-200 or transport nacks the event (WIRE-ORDER-6), and a retry drives no build row of that reservation (WIRE-RETRY-7) |
 | Out | cabling | `GET /fabric/internal?device_id` (internal token, 10 s) | the current fabric of an L2 switch, the reachability test for VLAN uniqueness | Fail closed: any non-200, transport error, or bad body nacks the event; in a retry the tick logs it and the manual route answers 503 (WIRE-VLAN-6) |
-| Out | inventory | `GET /devices/{id}/internal`, `GET /templates/{id}/internal` (internal token, 10 s) | classify hop endpoints, load switch drivers | 5xx or transport nacks the event (WIRE-ORDER-11); in a retry the tick logs it and the manual route answers 503; another non-200 reads as missing (WIRE-PAIR-4, WIRE-L1-3) |
+| Out | inventory | `GET /devices/{id}/internal`, `GET /templates/{id}/internal` (internal token, 10 s) | classify hop endpoints, load switch drivers | any non-200 other than 404, or a transport error, nacks the event (WIRE-ORDER-11); in a retry the tick logs it and the manual route answers 503; a 404 reads as missing (WIRE-PAIR-4, WIRE-L1-3) |
 | Out | inventory | `GET /devices/{id}/config-versions/latest/internal` (internal token, 10 s) | L3 config routes and the drive gate | 5xx or transport nacks (WIRE-L3-18); 404 means no config (WIRE-L3-4, WIRE-L3-16) |
 | Out | inventory | `GET /drivers/{id}/internal-download` (through the driver loader) | fetch a driver package on a cache miss | The switch's rows are parked FAILED and retryable by both retry channels; a broken package is parked non-retryable (WIRE-DRIVER-7); in the VRF capability check a failed download nacks instead (WIRE-L3-14) |
 | Out | driver package | `login`, `connect_ports`, `disconnect_ports`, `create_vlan`, `delete_vlan`, `add_to_vlan`, `remove_from_vlan`, `configure_route`, `remove_route`, `logout` in the sandbox | change the switch | Three attempts in line, then a FAILED row; never nacks (WIRE-DRIVER-2, WIRE-DRIVER-4) |
@@ -1375,11 +1392,6 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
   the retry tick leaves it out, a manual retry reports it `not_retryable`, and a fork
   re-save needs an ACTIVE reservation. The connection it describes may still be live on
   the hardware.
-- #1203 (WIRE-ORDER-11): execution reads any inventory answer below 500 other than 200
-  as "not found" for a switch or its template, so a 401 or 403 (an `INTERNAL_API_TOKEN`
-  rotation window is one cause) pins an existing switch's rows with a
-  `recorded hop unresolvable: switch <id> not found` reason, which is not retryable, with
-  no attempt counted. The reason then reads as if the switch were gone from inventory.
 - #1209 (WIRE-VLAN-11): a `TransientUpstreamError` from the switch read or driver session
   of a `delete_vlan` in the release pass is not caught per allocation. The exception
   leaves the allocation in hand released with its `defined_switch_ids` untrimmed (the
