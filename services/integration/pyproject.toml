@@ -9,7 +9,6 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.30",
     "asyncpg>=0.29.0",
     "alembic>=1.13.0",
-    "pyjwt>=2.15.0",
     "pydantic-settings>=2.3.0",
     "httpx>=0.27.0",
     "nats-py>=2.6.0",
@@ -22,6 +21,7 @@ herd-common = { workspace = true }
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2.0",
+    "pyjwt>=2.15.0",
     "pytest-asyncio>=0.23.0",
     "httpx>=0.27.0",
     "aiosqlite>=0.20.0",

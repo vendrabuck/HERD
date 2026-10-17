@@ -37,10 +37,14 @@ Every reference must be the function of a call (a bare reference handed on, as i
 `functools.partial(jwt.decode, ...)`, is refused), and every such call must:
 
 - sit in `decode_access_token` in `herd_common/jwt_codec.py` (`DECODE_HELPER`),
-  or in a function named in `DIRECT_DECODE_ALLOWED` with a reason; every other
-  site calls the helper. The table holds only the config service's session
-  decode, which may not import `herd_common`; an entry nothing matches fails as
-  stale;
+  or in a function named in `DIRECT_DECODE_ALLOWED` with a count and a reason;
+  every other site calls the helper. A site is the file plus the qualified path
+  of the innermost function or class around the call (`f`, `outer.inner`,
+  `Class.method`, `<module>`), so a nested function or a method that reuses an
+  allowed name is a different site and is refused, and each allowed site must
+  hold exactly its count of decode calls (the helper one). The table holds only
+  the config service's session decode, which may not import `herd_common`; an
+  entry nothing matches fails as stale;
 - pass the token and the key as the only positional arguments, with no `*args`
   and no `**kwargs`;
 - pass `algorithms=` as a list literal of exactly one element, not starred;
@@ -99,7 +103,8 @@ construction; the decode scan reads it, and its session decode is the one
 Limits. What the scans cannot see:
 
 - a decode reached by `importlib.import_module("jwt")`, `__import__`,
-  `sys.modules[...]`, a signature checked by hand (`jwt.algorithms`,
+  `sys.modules[...]`, source run by `exec(...)` or `eval(...)` (a string is not
+  parsed), a signature checked by hand (`jwt.algorithms`,
   `jwt.api_jws.PyJWS._verify_signature` is refused only as a private attribute),
   claims read without a decode (`jwt.utils.base64url_decode`, `json.loads` of a
   segment), or code outside the two scanned roots;
@@ -172,25 +177,27 @@ AUTH_SETTINGS_MODULE = "herd_common.auth_settings"
 SHARED_TYPES = ("AuthSecretKey", "JwtAlgorithm")
 ALLOWED_ALGORITHMS = ("HS256", "HS384", "HS512")
 
-# The one shared decode: (path relative to the repo, function name).
+# The one shared decode: (path relative to the repo, qualified function path). It
+# holds exactly one decode call.
 DECODE_HELPER = ("services/common/herd_common/jwt_codec.py", "decode_access_token")
 
-# (path relative to the repo, enclosing function name) to reason: the only other
-# functions that may call a PyJWT decode directly.
-DIRECT_DECODE_ALLOWED: dict[tuple[str, str], str] = {
+# (path relative to the repo, qualified function path) to (decode calls it holds,
+# reason): the only other functions that may call a PyJWT decode directly.
+DIRECT_DECODE_ALLOWED: dict[tuple[str, str], tuple[int, str]] = {
     ("services/config/app/auth.py", "_verify_token"): (
+        1,
         "the config service is standalone and may not import herd_common (its image "
         "does not ship it), so it verifies its own config session token, signed with "
-        "CONFIG_SESSION_SECRET, not an access token"
+        "CONFIG_SESSION_SECRET, not an access token",
     ),
 }
 
-# (path relative to the repo, enclosing function name) to reason. Empty by design.
+# (path relative to the repo, qualified function path) to reason. Empty by design.
 UNVERIFIED_READ_ALLOWED: dict[tuple[str, str], str] = {}
 
 # The four app functions that verify a token, each through the shared helper.
 HELPER_CALL_SITES = {
-    ("services/common/herd_common/auth.py", "get_current_user_payload"),
+    ("services/common/herd_common/auth.py", "make_auth_dependencies.get_current_user_payload"),
     ("services/common/herd_common/auth_settings.py", "_signs_and_verifies"),
     ("services/auth/app/utils/jwt.py", "verify_access_token"),
     ("services/notifications/app/routers/notifications.py", "get_bearer_credentials"),
@@ -463,18 +470,19 @@ def _decode_call_problems(call: ast.Call) -> list[str]:
 
 
 def _enclosing_functions(tree: ast.AST) -> dict[int, str]:
-    """Map id(node) to the name of the innermost function containing it."""
+    """Map id(node) to the qualified path of the innermost function or class that
+    contains it (`f`, `outer.inner`, `Class.method`), or `<module>`."""
     owners: dict[int, str] = {}
 
-    def visit(node: ast.AST, owner: str) -> None:
+    def visit(node: ast.AST, path: str) -> None:
         for child in ast.iter_child_nodes(node):
-            child_owner = (
-                child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else owner
-            )
-            owners[id(child)] = child_owner
-            visit(child, child_owner)
+            child_path = path
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                child_path = f"{path}.{child.name}" if path else child.name
+            owners[id(child)] = child_path or "<module>"
+            visit(child, child_path)
 
-    visit(tree, "<module>")
+    visit(tree, "")
     return owners
 
 
@@ -482,9 +490,10 @@ def _is_store(node: ast.AST) -> bool:
     return isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
 
 
-def direct_decode_allowed() -> set[tuple[str, str]]:
-    """The functions that may call a PyJWT decode: the helper and the table."""
-    return {DECODE_HELPER} | set(DIRECT_DECODE_ALLOWED)
+def direct_decode_allowed() -> dict[tuple[str, str], int]:
+    """The sites that may call a PyJWT decode, each with how many calls it holds:
+    the helper (one) and the table."""
+    return {DECODE_HELPER: 1} | {site: count for site, (count, _) in DIRECT_DECODE_ALLOWED.items()}
 
 
 def _module_findings(index: _Index, rel_path: str, direct_rule: bool) -> list[str]:
@@ -497,6 +506,7 @@ def _module_findings(index: _Index, rel_path: str, direct_rule: bool) -> list[st
         for n, name in names.private_imports
     ]
     allowed = direct_decode_allowed()
+    allowed_counts: dict[str, int] = {}
     called: set[int] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -507,7 +517,9 @@ def _module_findings(index: _Index, rel_path: str, direct_rule: bool) -> list[st
             for problem in _decode_call_problems(node):
                 findings.append(f"{rel_path}:{node.lineno} jwt decode {problem}")
             owner = owners.get(id(node), "<module>")
-            if direct_rule and (rel_path, owner) not in allowed:
+            if (rel_path, owner) in allowed:
+                allowed_counts[owner] = allowed_counts.get(owner, 0) + 1
+            elif direct_rule:
                 findings.append(
                     f"{rel_path}:{node.lineno} jwt decode called directly in {owner}; "
                     "call herd_common.jwt_codec.decode_access_token"
@@ -517,6 +529,13 @@ def _module_findings(index: _Index, rel_path: str, direct_rule: bool) -> list[st
             if node.args or node.keywords:
                 findings.append(
                     f"{rel_path}:{node.lineno} constructs PyJWT or PyJWS with arguments"
+                )
+    if direct_rule:
+        for owner, count in sorted(allowed_counts.items()):
+            if count != allowed[(rel_path, owner)]:
+                findings.append(
+                    f"{rel_path} jwt decode called {count} times in {owner}; "
+                    f"the allowlist admits {allowed[(rel_path, owner)]}"
                 )
     # A plain assignment to names is an alias the scan follows, except directly in
     # a class body, where the alias becomes an attribute the scan cannot follow.
@@ -620,8 +639,17 @@ def unverified_read_sites(index: "_Index") -> set[tuple[str, str]]:
     return _sites(index, "unverified")
 
 
-def direct_decode_sites(index: "_Index") -> set[tuple[str, str]]:
-    return _sites(index, "decode", calls_only=True)
+def direct_decode_counts(index: "_Index") -> dict[tuple[str, str], int]:
+    """How many PyJWT decode calls each (path, qualified owner) holds."""
+    counts: dict[tuple[str, str], int] = {}
+    for rel_path, tree in index.trees.items():
+        names = index.names[rel_path]
+        owners = _enclosing_functions(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and names.kind_of(node.func) == "decode":
+                site = (rel_path, owners.get(id(node), "<module>"))
+                counts[site] = counts.get(site, 0) + 1
+    return counts
 
 
 def helper_call_sites(index: "_Index") -> set[tuple[str, str]]:
@@ -916,8 +944,8 @@ def settings_modules() -> list[Path]:
 
 def test_the_only_direct_decodes_are_the_helper_and_the_allowed_table():
     # Also the stale check: every allowed entry, and the helper, is a real site.
-    assert direct_decode_sites(repository_index()) == direct_decode_allowed()
-    assert all(reason.strip() for reason in DIRECT_DECODE_ALLOWED.values())
+    assert direct_decode_counts(repository_index()) == direct_decode_allowed()
+    assert all(count >= 1 and reason.strip() for count, reason in DIRECT_DECODE_ALLOWED.values())
 
 
 def test_every_token_verifying_function_calls_the_shared_helper():
@@ -1274,6 +1302,28 @@ _BAD_DIRECT = {
         "services/svc/app/a.py",
         "import jwt\ndef f(t):\n    return jwt.PyJWT().decode(t, k, algorithms=[alg])\n",
     ),
+    # An allowed name reused by a nested function or a method is another site.
+    "config-nested-def": (
+        _CONFIG_PATH,
+        "import jwt\ndef other(t):\n    def _verify_token(t):\n"
+        f"        return {_HONEST_CALL}\n    return _verify_token(t)\n",
+    ),
+    "config-class-method": (
+        _CONFIG_PATH,
+        "import jwt\nclass Session:\n    def _verify_token(self, t):\n"
+        f"        return {_HONEST_CALL}\n",
+    ),
+    "helper-file-class-method": (
+        _HELPER_PATH,
+        "import jwt\nclass Codec:\n"
+        f"    def {_HELPER_FUNCTION}(self, t, k, alg):\n"
+        "        return jwt.decode(t, k, algorithms=[alg], options={'verify_exp': False})\n",
+    ),
+    "helper-nested-def": (
+        _HELPER_PATH,
+        f"import jwt\ndef {_HELPER_FUNCTION}(t, k, alg):\n    def inner(t):\n"
+        f"        return {_HONEST_CALL}\n    return inner(t)\n",
+    ),
 }
 
 _EXPECTED_DIRECT = {
@@ -1284,6 +1334,10 @@ _EXPECTED_DIRECT = {
     "config-other-function": "require_config_session",
     "helper-name-in-another-file": _HELPER_FUNCTION,
     "pyjwt-instance": "f",
+    "config-nested-def": "other._verify_token",
+    "config-class-method": "Session._verify_token",
+    "helper-file-class-method": f"Codec.{_HELPER_FUNCTION}",
+    "helper-nested-def": f"{_HELPER_FUNCTION}.inner",
 }
 
 
@@ -1302,11 +1356,26 @@ def test_fixture_direct_decodes_that_fail(name):
     ], findings
 
 
+@pytest.mark.parametrize(
+    "rel_path, function",
+    [(_HELPER_PATH, _HELPER_FUNCTION), (_CONFIG_PATH, "_verify_token")],
+    ids=["the-helper", "the-config-session"],
+)
+def test_an_allowed_site_holding_a_second_decode_is_refused(rel_path, function):
+    source = (
+        f"import jwt\ndef {function}(t, k, alg):\n"
+        f"    if t:\n        return {_HONEST_CALL}\n    return {_HONEST_CALL}\n"
+    )
+    assert decode_findings(source, rel_path, direct_rule=True) == [
+        f"{rel_path} jwt decode called 2 times in {function}; the allowlist admits 1"
+    ]
+
+
 def test_direct_decode_table_admits_only_its_function(monkeypatch):
     source = (
         f"import jwt\ndef a(t):\n    return {_HONEST_CALL}\ndef b(t):\n    return {_HONEST_CALL}\n"
     )
-    monkeypatch.setitem(DIRECT_DECODE_ALLOWED, ("services/svc/app/x.py", "a"), "fixture")
+    monkeypatch.setitem(DIRECT_DECODE_ALLOWED, ("services/svc/app/x.py", "a"), (1, "fixture"))
     findings = decode_findings(source, "services/svc/app/x.py", direct_rule=True)
     assert len(findings) == 1 and "called directly in b;" in findings[0]
 

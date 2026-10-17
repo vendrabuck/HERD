@@ -596,8 +596,8 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   HS384, or HS512 is refused with `AUTH_ALGORITHM must be one of HS256, HS384, HS512`. A
   save answers 422 `{"errors": [...]}` with these after any `<KEY> is required` entries
   and writes nothing; the bootstrap logs them and writes nothing (OPS-CONFIG-1). The two
-  messages are the shared module's, spelled identically. The services' signing round trip
-  through PyJWT is not copied, so a value only it refuses is refused at service startup
+  messages are the shared module's, spelled identically. The services' key-shape check and
+  signing round trip through PyJWT are not copied, so a value only they refuse is refused at service startup
   with `AUTH_SECRET_KEY cannot be used as an HMAC secret; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32`. \
   Enforced in: `services/config/app/auth_rules.py` (`auth_setting_errors`, `secret_key_refused`, `algorithm_refused`, `SECRET_KEY_REFUSED_MESSAGE`, `ALGORITHM_REFUSED_MESSAGE`); `services/config/app/config_store.py` (`save_config`, `bootstrap_from_env`) \
   Pinned by: `services/config/tests/test_auth_rules.py` (`test_messages_are_the_shared_modules_spelled_identically`, `test_the_copy_refuses_the_secrets_the_shared_rule_refuses`, `test_the_copy_refuses_other_algorithms`, `test_save_refuses_a_blank_or_placeholder_secret_and_writes_nothing`, `test_save_refuses_an_rs256_algorithm_and_writes_nothing`, `test_save_reports_every_refusal_together`, `test_save_refusal_leaves_an_existing_file_unchanged`, `test_put_refuses_with_the_shared_message_and_leaves_the_file`, `test_put_keeping_a_stored_placeholder_secret_is_refused`, `test_put_keeping_an_env_placeholder_secret_is_refused`, `test_bootstrap_with_a_placeholder_secret_writes_nothing`, `test_bootstrap_with_an_rs256_algorithm_writes_nothing`, `test_bootstrap_with_good_auth_settings_writes`)

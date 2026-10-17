@@ -123,6 +123,18 @@ _FAILURES = {
         jwt.exceptions.InvalidSubjectError,
         "Subject must be a string",
     ),
+    # 12 s, not 11: one second of margin against the clock tick, so a leeway of
+    # 11 to 29 s fails here and not only in the constant pins.
+    "exp-just-past-the-leeway": (
+        lambda: _token({"sub": "user-1", "exp": _now() - 12}),
+        jwt.ExpiredSignatureError,
+        "Signature has expired",
+    ),
+    "iat-just-past-the-leeway": (
+        lambda: _token({"sub": "user-1", "iat": _now() + 12}),
+        jwt.ImmatureSignatureError,
+        "The token is not yet valid (iat)",
+    ),
     "iat-past-the-leeway": (
         lambda: _token({"sub": "user-1", "iat": _now() + 30}),
         jwt.ImmatureSignatureError,

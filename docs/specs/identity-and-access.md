@@ -151,7 +151,7 @@ plain ORM writes; only one sync run can execute at a time (IAM-SERIAL-1).
   Pinned by: `services/auth/tests/test_auth_service_unit.py` (`test_concurrent_logout_during_refresh_does_not_resurrect_session`, `test_concurrent_refresh_single_winner`, `test_token_expiring_during_refresh_does_not_mint`, `test_user_deactivated_during_refresh_does_not_mint`); `services/auth/tests/test_auth.py` (`test_refresh_with_already_used_token`, `test_expired_refresh_token_rejected`)
 - **IAM-SESSION-3.** Logout revokes the presented refresh token if it exists and always
   answers 204, even for an unknown token; it does not touch the access token, which
-  stays valid until it expires. \
+  stays valid until it expires (its `exp` plus the 10 s leeway, IAM-JWT-6). \
   Enforced in: `services/auth/app/routers/auth.py` (`logout`); `services/auth/app/services/auth_service.py` (`revoke_refresh_token`) \
   Pinned by: `services/auth/tests/test_auth.py` (`test_logout_revokes_refresh_token`, `test_logout_with_invalid_token`, `test_full_auth_lifecycle`)
 - **IAM-RUN-1.** A sync run row is committed with status `running` before any directory
@@ -428,12 +428,16 @@ service checks on its own; the browser renews it silently with the refresh token
   with `<` and ends with `>` (a placeholder). Under compose an `AUTH_SECRET_KEY` missing
   from `.env` reaches every service as an empty `SECRET_KEY` (compose passes an unset
   variable as blank) and gets that message too; a process started with no `SECRET_KEY` at
-  all fails instead with pydantic's `secret_key Field required`. A value PyJWT cannot sign
-  and then verify one HS256 token with (a PEM block such as a public key or certificate,
-  an ssh public key, or a JSON value carrying a `kty` member, a JSON Web Key) is refused
-  with `AUTH_SECRET_KEY cannot be used as an HMAC secret; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32`; the check neither logs nor returns the value. Any other JSON-shaped value is an
-  ordinary HMAC secret to PyJWT and loads (since #1186; the library HERD used before
-  refused it). The round trip ignores PyJWT's `InsecureKeyLengthWarning` for its own two
+  all fails instead with pydantic's `secret_key Field required`. A value shaped like a
+  key, or one PyJWT cannot sign and then verify one HS256 token with, is refused with `AUTH_SECRET_KEY cannot be used as an HMAC secret; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32`; the check neither logs nor returns the value. PyJWT itself refuses a complete PEM block
+  (BEGIN and END lines both present), an ssh key at the very start of the value, and a JSON
+  value carrying a `kty` member (a JSON Web Key). HERD refuses the partial shapes PyJWT
+  would accept itself, before the round trip: any value containing `-----BEGIN ` (so a lone
+  BEGIN line or a truncated block) and any value whose stripped form starts with `ssh-` or
+  `ecdsa-sha2-` (so a key behind leading white space). A value that cannot be encoded as
+  UTF-8 (a lone surrogate) is refused with the same message. Any other JSON-shaped value (an
+  array, a string, an object without `kty`) is an ordinary HMAC secret and loads (since
+  #1186; the library HERD used before refused it). The round trip ignores PyJWT's `InsecureKeyLengthWarning` for its own two
   calls only, so a short value loads under `filterwarnings = ["error"]`. A value under 32 bytes in
   UTF-8 loads and logs one warning giving only its byte length; it fires when the module's
   `Settings()` runs at import, before the service sets up logging, so it is a plain-text
@@ -445,8 +449,8 @@ service checks on its own; the browser renews it silently with the refresh token
   writing (OPS-CONFIG-23). Every service's Settings model declares the two fields with the
   shared types and no secret default, and the text of a Settings load error names the
   field and the rule but never the refused value. \
-  Enforced in: `services/common/herd_common/auth_settings.py` (`validate_auth_secret`, `_signs_and_verifies`, `InsecureKeyLengthWarning`, `validate_jwt_algorithm`, `AuthSecretKey`, `JwtAlgorithm`, `SECRET_KEY_REFUSED_MESSAGE`, `SECRET_KEY_UNUSABLE_MESSAGE`, `ALGORITHM_REFUSED_MESSAGE`); `services/common/herd_common/base_settings.py` (`HerdBaseSettings`) \
-  Pinned by: `services/common/tests/test_auth_settings.py` (`test_secret_refused_with_the_fixed_message`, `test_secret_pyjwt_cannot_sign_and_verify_with_is_refused`, `test_a_json_object_without_kty_is_an_ordinary_secret_and_loads`, `test_the_round_trip_signs_and_verifies_with_the_value_itself`, `test_a_short_secret_raises_no_python_warning_at_load`, `test_the_round_trip_does_not_silence_the_warning_outside_itself`, `test_secret_of_31_bytes_loads_and_logs_one_warning_with_only_the_length`, `test_secret_of_32_bytes_loads_and_logs_nothing`, `test_other_algorithms_are_refused_naming_the_three_allowed`, `test_settings_refuse_an_empty_secret_key_env`, `test_settings_require_the_secret_key`, `test_settings_refuse_an_unusable_secret_from_env`, `test_settings_refuse_the_placeholder_from_a_saved_config_file`, `test_settings_error_text_names_the_field_and_rule_but_not_the_value`); `tests/unit/test_jwt_settings_wiring.py` (`test_every_settings_model_uses_the_shared_types`)
+  Enforced in: `services/common/herd_common/auth_settings.py` (`validate_auth_secret`, `_is_key_shaped`, `_signs_and_verifies`, `InsecureKeyLengthWarning`, `validate_jwt_algorithm`, `AuthSecretKey`, `JwtAlgorithm`, `SECRET_KEY_REFUSED_MESSAGE`, `SECRET_KEY_UNUSABLE_MESSAGE`, `ALGORITHM_REFUSED_MESSAGE`); `services/common/herd_common/base_settings.py` (`HerdBaseSettings`) \
+  Pinned by: `services/common/tests/test_auth_settings.py` (`test_secret_refused_with_the_fixed_message`, `test_secret_pyjwt_cannot_sign_and_verify_with_is_refused`, `test_a_json_object_without_kty_is_an_ordinary_secret_and_loads`, `test_a_json_array_or_string_is_an_ordinary_secret_and_loads`, `test_the_round_trip_signs_and_verifies_with_the_value_itself`, `test_a_short_secret_raises_no_python_warning_at_load`, `test_another_warning_raised_inside_the_round_trip_still_surfaces`, `test_the_round_trip_does_not_silence_the_warning_outside_itself`, `test_secret_of_31_bytes_loads_and_logs_one_warning_with_only_the_length`, `test_secret_of_32_bytes_loads_and_logs_nothing`, `test_other_algorithms_are_refused_naming_the_three_allowed`, `test_settings_refuse_an_empty_secret_key_env`, `test_settings_require_the_secret_key`, `test_settings_refuse_an_unusable_secret_from_env`, `test_settings_refuse_the_placeholder_from_a_saved_config_file`, `test_settings_error_text_names_the_field_and_rule_but_not_the_value`); `tests/unit/test_jwt_settings_wiring.py` (`test_every_settings_model_uses_the_shared_types`)
 - **IAM-JWT-5.** Every access-token decode goes through one PyJWT call, the shared
   `decode_access_token`, which passes exactly one algorithm, the configured one, and keeps
   signature verification on, so a token whose header names another algorithm (`none` or
@@ -472,7 +476,7 @@ service checks on its own; the browser renews it silently with the refresh token
   Pinned by: `services/common/tests/test_jwt_codec.py` (`test_leeway_is_ten_seconds`, `test_decode_is_given_one_algorithm_and_the_leeway`, `test_an_iat_inside_the_leeway_verifies`, `test_an_exp_inside_the_leeway_still_verifies`, `test_each_failure_raises_its_exact_class_and_message`, `test_a_good_token_answers_200_over_http`, `test_a_short_key_verifies_with_one_insecure_key_length_warning`, `test_a_short_key_answers_200_over_http_with_the_warning`, `test_a_token_the_previous_library_signed_verifies`, `test_a_token_the_previous_library_signed_answers_200_over_http`)
 
 **Out of scope.** Token revocation lists do not exist; an access token is valid until
-`exp`.
+its `exp` plus the 10 s leeway (IAM-JWT-6).
 
 ### 8.5 Roles and the effective role
 

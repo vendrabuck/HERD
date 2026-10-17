@@ -153,10 +153,13 @@ def test_secret_is_returned_unchanged_including_surrounding_space():
     assert validate_auth_secret(value) == value
 
 
-# Shapes PyJWT will not sign and verify with as an HMAC secret: a PEM public
-# key, an RSA public key, a certificate, an ssh public key, and a JSON value
-# carrying a `kty` member (a JSON Web Key) are refused with InvalidKeyError while
-# the key is prepared.
+# Shapes refused as an HMAC secret. PyJWT refuses a complete PEM block (a public
+# key, an RSA public key, a certificate), an ssh key at the start of the value,
+# and a JSON value carrying a `kty` member (a JSON Web Key) with InvalidKeyError
+# while it prepares the key. HERD refuses the partial shapes PyJWT would accept
+# itself, before the round trip (`_is_key_shaped`): a lone BEGIN line, a
+# truncated block, and a key type behind leading white space. A value that is not
+# valid UTF-8 (a lone surrogate) is refused because it cannot be encoded.
 _UNUSABLE_SECRETS = {
     "pem-public-key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQc=\n"
     "-----END PUBLIC KEY-----",
@@ -166,6 +169,11 @@ _UNUSABLE_SECRETS = {
     "-----END CERTIFICATE-----",
     "ssh-public-key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7 user@host",
     "json-web-key": '{"kty": "oct", "k": "c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0"}',
+    "pem-begin-line-only": "-----BEGIN PUBLIC KEY-----",
+    "pem-truncated": "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo",
+    "ssh-key-leading-space": "  ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7 user@host",
+    "ecdsa-key-leading-tab": "\tecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY user@host",
+    "non-utf8": "abc\udcffdef" + "k" * 40,
 }
 
 
@@ -190,6 +198,17 @@ def test_a_json_object_without_kty_is_an_ordinary_secret_and_loads(caplog):
     # loads as an HMAC secret.
     caplog.set_level(logging.DEBUG)
     value = '{"secret": "0123456789abcdef0123456789abcdef"}'
+    assert _Model(secret_key=value).secret_key == value
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    ['["0123456789abcdef", "0123456789abcdef"]', '"0123456789abcdef0123456789abcdef"'],
+    ids=["json-array", "json-string"],
+)
+def test_a_json_array_or_string_is_an_ordinary_secret_and_loads(value, caplog):
+    caplog.set_level(logging.DEBUG)
     assert _Model(secret_key=value).secret_key == value
     assert caplog.records == []
 
@@ -222,6 +241,26 @@ def test_a_short_secret_raises_no_python_warning_at_load():
         warnings.simplefilter("always")
         assert validate_auth_secret(value) == value
     assert caught == []
+
+
+def test_another_warning_raised_inside_the_round_trip_still_surfaces(monkeypatch):
+    # Only InsecureKeyLengthWarning is ignored inside the round trip: a different
+    # warning raised there (here by a stand-in for PyJWT's encode) still reaches
+    # the caller, while the short key's own warning does not.
+    real_encode = auth_settings.jwt.encode
+
+    def warning_encode(claims, key, algorithm):
+        warnings.warn(UserWarning("a warning the round trip must not hide"))
+        return real_encode(claims, key, algorithm=algorithm)
+
+    monkeypatch.setattr(auth_settings.jwt, "encode", warning_encode)
+    value = "q" * 20
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert validate_auth_secret(value) == value
+    assert [(w.category, str(w.message)) for w in caught] == [
+        (UserWarning, "a warning the round trip must not hide")
+    ]
 
 
 def test_the_round_trip_does_not_silence_the_warning_outside_itself():
