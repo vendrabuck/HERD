@@ -38,7 +38,7 @@ compose environment. See [ENV_VARS.md](ENV_VARS.md#config-service).
 
 ### Services crash-loop on startup
 
-Most common cause: `AUTH_SECRET_KEY` is missing, blank, or still the `.env.example` placeholder, and each service exits at startup with `AUTH_SECRET_KEY is unset, blank, or still a placeholder; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32`. Put a real value (`openssl rand -hex 32`) in `.env`, or complete the config-service setup. If a configuration was ever saved in the config UI (`config.json` with no `config.bootstrapped` marker beside it), that file outranks `.env`, so fixing `.env` alone does not help: enter the new value in the config UI and save, which refuses a blank or placeholder value. A value shaped like a public key, certificate, or JSON object stops the services with `AUTH_SECRET_KEY cannot be used as an HMAC secret; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32`; replace it the same way. A service process started outside compose with no `SECRET_KEY` at all reports `secret_key Field required` instead. An `AUTH_ALGORITHM` other than `HS256`, `HS384`, or `HS512` stops the services the same way, with `AUTH_ALGORITHM must be one of HS256, HS384, HS512`.
+Most common cause: `AUTH_SECRET_KEY` is missing, blank, or still the `.env.example` placeholder, and each service exits at startup with `AUTH_SECRET_KEY is unset, blank, or still a placeholder; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32`. Put a real value (`openssl rand -hex 32`) in `.env`, or complete the config-service setup. If a configuration was ever saved in the config UI (`config.json` with no `config.bootstrapped` marker beside it), that file outranks `.env`, so fixing `.env` alone does not help: enter the new value in the config UI and save, which refuses a blank or placeholder value. A value shaped like a key (anything containing `-----BEGIN `, so a public key, certificate, or even a lone BEGIN line from a multi-line paste; an `ssh-` or `ecdsa-sha2-` key; or a JSON Web Key, a JSON value with a `kty` member) stops the services with `AUTH_SECRET_KEY cannot be used as an HMAC secret; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32`; replace it the same way. A service process started outside compose with no `SECRET_KEY` at all reports `secret_key Field required` instead. An `AUTH_ALGORITHM` other than `HS256`, `HS384`, or `HS512` stops the services the same way, with `AUTH_ALGORITHM must be one of HS256, HS384, HS512`.
 
 Second most common: config service started but `config.json` was never written. Same fix as above.
 
@@ -48,7 +48,7 @@ Check with `make logs` or `docker compose logs <service>`; the startup error mes
 
 Either:
 - The `AUTH_SECRET_KEY` changed after tokens were issued. Access tokens signed with the old key are refused everywhere, but refresh tokens do not depend on the key, so the client's silent refresh normally recovers on its own; a user needs to log in again only when the refresh fails too. See [SECURITY.md](../SECURITY.md) for ending sessions after a rotation.
-- Clock skew between the client and the backend is larger than the token lifetime.
+- Clock skew between the auth service (which signs the token) and another backend service (which verifies it) is more than 10 seconds: every service accepts a token up to 10 seconds past its expiry and refuses one issued more than 10 seconds in its future.
 - The bearer token expired (30 min default). The auth client should refresh automatically; if it's stuck, clear local storage and log in fresh.
 
 ### LDAP login fails immediately
@@ -494,7 +494,7 @@ record instead of being retired, and the event is acknowledged. The log line car
   package that merely could not be DOWNLOADED (inventory or package storage briefly
   unreachable on a replica with no cached copy) is not logged here: teardown NAKs the
   terminal event so it is redelivered and the destroy runs then (issue #1029).
-- `recipe_config_missing`: the template, hypervisor, or secret is gone (404).
+- `recipe_config_missing`: the template, hypervisor, or secret is gone. The template read means gone only on a 404 (any other non-200 NAKs, issue #1203); the hypervisor and secret reads still mean gone on any non-200 below 500, so a 401 or 403 during an `INTERNAL_API_TOKEN` rotation lands here too (an open defect, issue #1216).
 
 Find the affected rows and log lines:
 
@@ -645,7 +645,7 @@ The execution service consumes `herd.reservations.*` events from NATS JetStream.
 - A poison message (invalid JSON, or JSON that is not an object) lands on the DLQ subject `herd.reservations.dlq.execution`; inspect with the `nats` CLI (see [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq)).
 - A failure no retry can change (for example a dynamic recipe whose template, hypervisor, or secret is missing, or whose package fails the load's checks) goes to the same DLQ on its first delivery, logged as `nats_dlq_permanent`.
 - A transient handler failure gets NAK'd with an explicit delay from the `NATS_NAK_BACKOFF_SECONDS` schedule (issue #895; `1,5,15,60,120` seconds by default) and retried up to `max_deliver=5`. After that it also goes to DLQ.
-- A log line with `"action": "nats_event_unverified"` means the event was acked WITHOUT running the handler: execution's consumer corroborates `reservation.created`/`.updated`/`.cancelled`/`.completed`/`.failed`/`.wiring_changed` against reservations' own status for the row before acting on it (see ARCHITECTURE.md's Event-driven flows section), and this event's claim did not match. This is the expected, correct outcome for an event whose reservation moved on (or never existed) before the message was processed, not a bug; the log line's `reported_status` names what reservations actually had on file.
+- A log line with `"action": "nats_event_unverified"` means the event was acked WITHOUT running the handler: execution's consumer corroborates `reservation.created`/`.updated`/`.cancelled`/`.completed`/`.failed`/`.wiring_changed` against reservations' own status for the row before acting on it (see ARCHITECTURE.md's Event-driven flows section), and this event's claim did not match. This is the expected, correct outcome for an event whose reservation moved on (or never existed) before the message was processed, not a bug; the log line's `reported_status` names what reservations actually had on file. The one exception is a `reason` of `unexpected status 403` (or another non-200 below 500), which means reservations refused execution's token during an `INTERNAL_API_TOKEN` rotation and the event was dropped unrun (an open defect, issue #1215); the `excluded_not_retryable` entry under the `wiring_retry_tick` heading above describes the recovery.
 
 ### Notifications container is stuck in a crash loop on a fresh stack
 
