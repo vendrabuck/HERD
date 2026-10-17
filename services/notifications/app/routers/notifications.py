@@ -2,11 +2,12 @@ import logging
 import uuid
 
 import httpx
+import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from herd_common.auth import caller_id as _caller_id
 from herd_common.auth import log_unusable_key, make_auth_dependencies
-from jose import JOSEError, JWTError, jwt
+from herd_common.jwt_codec import decode_access_token
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -40,14 +41,15 @@ def get_bearer_credentials(
     after verification, so we re-verify here with the raw string on hand.
     """
     try:
-        payload = jwt.decode(
-            credentials.credentials, settings.secret_key, algorithms=[settings.algorithm]
+        payload = decode_access_token(
+            credentials.credentials, settings.secret_key, settings.algorithm
         )
         if payload.get("sub") is None:
-            raise JWTError("missing sub")
-    except JOSEError as exc:
-        # JOSEError covers JWTError and the key errors jose raises while building
-        # the verification key, so both answer 401; a key error is also logged.
+            raise jwt.InvalidTokenError("missing sub")
+    except jwt.PyJWTError as exc:
+        # PyJWTError covers InvalidTokenError and InvalidKeyError, which PyJWT
+        # raises while preparing the verification key, so both answer 401; a key
+        # error is also logged.
         log_unusable_key(logger, exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

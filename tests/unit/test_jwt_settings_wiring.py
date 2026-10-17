@@ -1,21 +1,28 @@
-"""Every access-token decode names exactly one algorithm, and every service's
-access-token settings use the shared startup validation.
+"""Every access-token decode goes through the one shared helper and names exactly
+one algorithm, and every service's access-token settings use the shared startup
+validation.
 
 Two AST scans; nothing is imported or executed.
 
 DECODE CALLS. Every Python file under `services/*/app` and
-`services/common/herd_common` is read for references to python-jose's
-`jwt.decode`. A reference is any of these spellings:
+`services/common/herd_common` is read for references to PyJWT's decode
+functions. A reference is any of these spellings:
 
-- `jwt.decode` after `from jose import jwt` (or `from jose import jwt as j`, then
-  `j.decode`);
-- `jose.jwt.decode` after `import jose` or `import jose.jwt`, and `J.jwt.decode`
-  after `import jose as J`;
-- `JJ.decode` after `import jose.jwt as JJ`;
-- the bare name after `from jose.jwt import decode` (or `... import decode as d`);
-- `getattr(<module>, "decode")` on any of the module spellings above;
+- `jwt.decode` or `jwt.decode_complete` after `import jwt` (or `import jwt as j`,
+  then `j.decode`);
+- `jwt.api_jwt.decode`, `jwt.api_jws.decode`, and their `decode_complete`, after
+  `import jwt`, `import jwt.api_jwt`, `from jwt import api_jwt`, or `import
+  jwt.api_jws as S` (then `S.decode`);
+- the bare name after `from jwt import decode`, `from jwt.api_jwt import
+  decode`, or `from jwt.api_jws import decode_complete` (or `... as d`);
+- `decode` and `decode_complete` on a `PyJWT` or `PyJWS` instance: a call of the
+  class under any spelling above (`jwt.PyJWT()`, `from jwt import PyJWS` then
+  `PyJWS()`, `jwt.api_jwt.PyJWT()`), or a name bound to one;
+- `getattr(<object>, "decode")` on any of the module, class, or instance
+  spellings above;
 - any name bound by a plain assignment to one of the above, or to one of the
-  module spellings (`decode = jwt.decode`, `codec = jwt`), followed transitively;
+  module, class, or instance spellings (`decode = jwt.decode`, `codec = jwt`,
+  `codec = jwt.PyJWT()`), followed transitively;
 - any of the above reached from another scanned module: a name imported from a
   scanned module (`from herd_common.auth import jwt`, `from .codec import d`,
   `from app.codec import jwt`, `from herd_common.auth import *`) is what it is
@@ -23,28 +30,45 @@ DECODE CALLS. Every Python file under `services/*/app` and
   herd_common.auth` then `herd_common.auth.jwt.decode`, `from herd_common import
   auth` then `auth.jwt.decode`), across any number of modules. `herd_common.*` is
   the shared package; `app.*` is resolved inside the importing file's own
-  service, since every service has its own `app` package.
+  service, since every service has its own `app` package. Any other `import jwt`
+  is PyJWT.
 
 Every reference must be the function of a call (a bare reference handed on, as in
 `functools.partial(jwt.decode, ...)`, is refused), and every such call must:
 
+- sit in `decode_access_token` in `herd_common/jwt_codec.py` (`DECODE_HELPER`),
+  or in a function named in `DIRECT_DECODE_ALLOWED` with a count and a reason;
+  every other site calls the helper. A site is the file plus the qualified path
+  of the innermost function or class around the call (`f`, `outer.inner`,
+  `Class.method`, `<module>`), so a nested function or a method that reuses an
+  allowed name is a different site and is refused, and each allowed site must
+  hold exactly its count of decode calls (the helper one). The table holds only
+  the config service's session decode, which may not import `herd_common`; an
+  entry nothing matches fails as stale;
 - pass the token and the key as the only positional arguments, with no `*args`
   and no `**kwargs`;
 - pass `algorithms=` as a list literal of exactly one element, not starred;
 - pass no `options=`, or a dict literal with no `**` whose `verify_signature`
   key, when present, is the literal `True`.
 
-Also refused: a star import from `jose` or any `jose.*` module; a jose module
-object (`jose`, its `jwt` or `jws` module, under any spelling above) used in any
-way but an attribute read, a `getattr` with a literal name, or a plain alias
-assignment (`vars(jwt)`, `run(jwt)`, `(jwt,)`, `getattr(jwt, name)`); and a dunder
-attribute of one (`jwt.__dict__`, `getattr(jwt, "__dict__")`).
+Also refused: a star import from `jwt` or any `jwt.*` module; a name starting
+with `_` imported from `jwt`, `jwt.api_jwt`, or `jwt.api_jws`, or read as an
+attribute of a PyJWT module, class, or instance (`jwt.api_jwt._jwt_global_obj`,
+`jwt.__dict__`, `getattr(jwt, "__dict__")`); an attribute of one assigned or
+deleted (`jwt.decode = f`, `codec.options = {...}`); a `PyJWT` or `PyJWS` built
+with any argument (its `options` can turn verification off for every call); any
+reference to `register_algorithm` or `unregister_algorithm` on the package,
+`jwt.api_jws`, or a `PyJWS` class or instance; a PyJWT module, class, or instance
+used in any way but an attribute read, a `getattr` with a literal name, a plain
+alias assignment, or (a class) a call (`vars(jwt)`, `run(jwt)`, `(jwt,)`,
+`setattr(jwt, ...)`, `getattr(jwt, name)`).
 
-`get_unverified_claims`, `get_unverified_header`, and `get_unverified_headers`
-on jose's `jwt` or `jws` module, under the same spellings or imported by name
-from `jose.jwt` or `jose.jws`, may appear only inside a function named in
+`get_unverified_header` on the package, `jwt.api_jws`, or a `PyJWS` class or
+instance, under the same spellings or imported by name from `jwt` or
+`jwt.api_jws`, may appear only inside a function named in
 `UNVERIFIED_READ_ALLOWED` with a reason. The table is empty today; an entry
-nothing matches fails as stale.
+nothing matches fails as stale. (A decode with `verify_signature` off, the other
+unverified read, is refused by the call rule above.)
 
 SETTINGS. Every `services/*/app/config.py` with a class attribute named
 `secret_key` (compared case-insensitively, since the Settings models read the
@@ -72,32 +96,43 @@ default that is one of HS256, HS384, HS512 (pydantic does not validate a default
   module (an assignment, a `def` or `class`, an `except ... as`, a loop or `with`
   target, another import), at module level, in a class, or in a function.
 
-The config service has no `app/config.py` and is skipped by construction; it
-signs its own session with PyJWT, which this scan does not read.
+The config service has no `app/config.py` and is skipped by the settings scan by
+construction; the decode scan reads it, and its session decode is the one
+`DIRECT_DECODE_ALLOWED` entry.
 
 Limits. What the scans cannot see:
 
-- a decode reached by `importlib.import_module("jose.jwt")`, `__import__`,
-  `sys.modules[...]`, `jose.jws.verify` or `jose.jwe` (only `jwt.decode` is
-  checked), or code outside the two scanned roots;
+- a decode reached by `importlib.import_module("jwt")`, `__import__`,
+  `sys.modules[...]`, source run by `exec(...)` or `eval(...)` (a string is not
+  parsed), a signature checked by hand (`jwt.algorithms`,
+  `jwt.api_jws.PyJWS._verify_signature` is refused only as a private attribute),
+  claims read without a decode (`jwt.utils.base64url_decode`, `json.loads` of a
+  segment), or code outside the two scanned roots;
 - a name followed from another module only through an import statement naming a
   scanned module, or an attribute or literal `getattr` of a scanned module; a
   scanned module object handed on (`vars(herd_common.auth)["jwt"]`,
   `herd_common.auth.__dict__`), a non-literal `getattr` on one, a function's
-  return value, or an attribute of anything that is not a module (`obj.d(...)`)
-  is not followed;
+  return value (`make_codec().decode`), or an attribute of anything that is not a
+  module, class, or instance the scan tracks (`obj.d(...)`) is not followed;
+- a `PyJWT` or `PyJWS` instance is tracked only when it is built by a call the
+  scan reads; one built through a subclass (`class C(jwt.PyJWT)`), returned by a
+  function, or taken from a container is not;
 - refused although it can be honest (false reds, by decision, because the scan
   cannot follow them): a decode stored in a class body, on an instance
   (`class V: d = jwt.decode`, `self.d = jwt.decode`), or in a container is
-  reported as referenced, not called; a jose module handed to anything (`vars`,
-  a helper, a tuple) is refused; a rebinding of a shared type's name inside a
+  reported as referenced, not called; a PyJWT module, class, or instance handed
+  to anything (`vars`, a helper, a tuple) is refused; an unbound
+  `jwt.PyJWT.decode(instance, t, k, ...)` is refused as passing more than the
+  token and the key positionally; a rebinding of a shared type's name inside a
   function, where it cannot change a class annotation, is refused;
 - names are followed without regard to statement order or scope, so a rebinding
   to another value can make an unrelated call read as a decode (refused, a false
-  red), never the reverse;
+  red), never the reverse; a name bound both to PyJWT and to a scanned module
+  (`import jwt` and `from app.utils import jwt` in one file) is read as whichever
+  binding the scan meets last;
 - `algorithms=` whose single element is itself a list or a name bound to several
   algorithms at runtime (`algorithms=[ALGS]` with `ALGS` a list); the element is
-  not evaluated;
+  not evaluated; nor is `leeway`, which only `test_jwt_codec.py` pins;
 - a Settings field reading `SECRET_KEY` or `ALGORITHM` under another attribute
   name through `Field(alias=...)` or `validation_alias`, a field or a validator
   added by a base class other than the one in the file, or a `model_validator`;
@@ -114,16 +149,59 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 
-JOSE = "jose"
-JOSE_JWT = "jose.jwt"
-JOSE_JWS = "jose.jws"
-UNVERIFIED_READS = {"get_unverified_claims", "get_unverified_header", "get_unverified_headers"}
+PYJWT = "jwt"
+# The PyJWT modules the scan tracks, by dotted name, and the kind each binds.
+PYJWT_MODULES = {"jwt": "package", "jwt.api_jwt": "jwt_module", "jwt.api_jws": "jws_module"}
+_DECODES = {"decode": "decode", "decode_complete": "decode"}
+_REGISTRY = {"register_algorithm": "registry", "unregister_algorithm": "registry"}
+_JWS_READS = {**_DECODES, "get_unverified_header": "unverified", **_REGISTRY}
+# What an attribute (or a name imported from a module) of each tracked kind is.
+ATTRIBUTES: dict[str, dict[str, str]] = {
+    "package": {
+        "api_jwt": "jwt_module",
+        "api_jws": "jws_module",
+        "PyJWT": "jwt_class",
+        "PyJWS": "jws_class",
+        **_JWS_READS,
+    },
+    "jwt_module": {"PyJWT": "jwt_class", "PyJWS": "jws_class", **_DECODES},
+    "jws_module": {"PyJWS": "jws_class", **_JWS_READS},
+    "jwt_class": dict(_DECODES),
+    "jws_class": dict(_JWS_READS),
+    "jwt_instance": dict(_DECODES),
+    "jws_instance": dict(_JWS_READS),
+}
+INSTANCE_OF = {"jwt_class": "jwt_instance", "jws_class": "jws_instance"}
+OBJECT_KINDS = tuple(ATTRIBUTES)
 AUTH_SETTINGS_MODULE = "herd_common.auth_settings"
 SHARED_TYPES = ("AuthSecretKey", "JwtAlgorithm")
 ALLOWED_ALGORITHMS = ("HS256", "HS384", "HS512")
 
-# (path relative to the repo, enclosing function name) to reason. Empty by design.
+# The one shared decode: (path relative to the repo, qualified function path). It
+# holds exactly one decode call.
+DECODE_HELPER = ("services/common/herd_common/jwt_codec.py", "decode_access_token")
+
+# (path relative to the repo, qualified function path) to (decode calls it holds,
+# reason): the only other functions that may call a PyJWT decode directly.
+DIRECT_DECODE_ALLOWED: dict[tuple[str, str], tuple[int, str]] = {
+    ("services/config/app/auth.py", "_verify_token"): (
+        1,
+        "the config service is standalone and may not import herd_common (its image "
+        "does not ship it), so it verifies its own config session token, signed with "
+        "CONFIG_SESSION_SECRET, not an access token",
+    ),
+}
+
+# (path relative to the repo, qualified function path) to reason. Empty by design.
 UNVERIFIED_READ_ALLOWED: dict[tuple[str, str], str] = {}
+
+# The four app functions that verify a token, each through the shared helper.
+HELPER_CALL_SITES = {
+    ("services/common/herd_common/auth.py", "make_auth_dependencies.get_current_user_payload"),
+    ("services/common/herd_common/auth_settings.py", "_signs_and_verifies"),
+    ("services/auth/app/utils/jwt.py", "verify_access_token"),
+    ("services/notifications/app/routers/notifications.py", "get_bearer_credentials"),
+}
 
 
 def scanned_files() -> list[Path]:
@@ -229,11 +307,9 @@ class _Index:
 
 # --- decode references ---
 
-JOSE_MODULE_KINDS = ("package", "jwt_module", "jws_module")
 
-
-def _is_jose_module(dotted: str | None) -> bool:
-    return dotted is not None and (dotted == JOSE or dotted.startswith(JOSE + "."))
+def _is_pyjwt_module(dotted: str | None) -> bool:
+    return dotted is not None and (dotted == PYJWT or dotted.startswith(PYJWT + "."))
 
 
 def _attribute_target(node: ast.AST) -> tuple[ast.AST, str] | None:
@@ -253,15 +329,17 @@ def _attribute_target(node: ast.AST) -> tuple[ast.AST, str] | None:
 
 
 class _ModuleNames:
-    """What each name in one module is bound to: jose's package (`package`), its
-    `jwt` or `jws` module, `decode`, an unverified reader (`unverified`), or a
-    scanned module (`mod:<key>`). Names are read from every import and every
-    plain assignment in the file, without regard to statement order or scope."""
+    """What each name in one module is bound to: a PyJWT module, class, or instance
+    (a kind in `ATTRIBUTES`), `decode`, an unverified reader (`unverified`), the
+    algorithm registry (`registry`), or a scanned module (`mod:<key>`). Names are
+    read from every import and every plain assignment in the file, without regard
+    to statement order or scope."""
 
     def __init__(self, tree: ast.AST, index: "_Index", own_key: str | None):
         self.index = index
         self.bindings: dict[str, str] = {}
-        self.star_jose: list[ast.ImportFrom] = []
+        self.star_imports: list[ast.ImportFrom] = []
+        self.private_imports: list[tuple[ast.ImportFrom, str]] = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 self._import(node, own_key)
@@ -271,14 +349,13 @@ class _ModuleNames:
 
     def _import(self, node: ast.Import, own_key: str | None) -> None:
         for alias in node.names:
-            if alias.name == JOSE:
-                self.bindings[alias.asname or JOSE] = "package"
-            elif alias.name in (JOSE_JWT, JOSE_JWS):
+            if _is_pyjwt_module(alias.name):
                 if alias.asname:
-                    kind = "jwt_module" if alias.name == JOSE_JWT else "jws_module"
-                    self.bindings[alias.asname] = kind
+                    kind = PYJWT_MODULES.get(alias.name)
+                    if kind is not None:
+                        self.bindings[alias.asname] = kind
                 else:
-                    self.bindings[JOSE] = "package"
+                    self.bindings[PYJWT] = "package"
             elif alias.asname:
                 key = self.index.qualify(own_key, alias.name, 0)
                 if key is not None:
@@ -290,19 +367,20 @@ class _ModuleNames:
                     self.bindings[first] = f"mod:{key}"
 
     def _import_from(self, node: ast.ImportFrom, own_key: str | None) -> None:
-        if node.level == 0 and _is_jose_module(node.module):
+        if node.level == 0 and _is_pyjwt_module(node.module):
+            module_kind = PYJWT_MODULES.get(node.module)
             for alias in node.names:
-                bound = alias.asname or alias.name
                 if alias.name == "*":
-                    self.star_jose.append(node)
-                elif node.module == JOSE and alias.name == "jwt":
-                    self.bindings[bound] = "jwt_module"
-                elif node.module == JOSE and alias.name == "jws":
-                    self.bindings[bound] = "jws_module"
-                elif node.module == JOSE_JWT and alias.name == "decode":
-                    self.bindings[bound] = "decode"
-                elif node.module in (JOSE_JWT, JOSE_JWS) and alias.name in UNVERIFIED_READS:
-                    self.bindings[bound] = "unverified"
+                    self.star_imports.append(node)
+                    continue
+                if module_kind is None:
+                    continue
+                if alias.name.startswith("_"):
+                    self.private_imports.append((node, alias.name))
+                    continue
+                kind = ATTRIBUTES[module_kind].get(alias.name)
+                if kind is not None:
+                    self.bindings[alias.asname or alias.name] = kind
             return
         key = self.index.qualify(own_key, node.module or "", node.level)
         if key is None:
@@ -341,17 +419,13 @@ class _ModuleNames:
             return self.bindings.get(node.id)
         target = _attribute_target(node)
         if target is None:
+            if isinstance(node, ast.Call):
+                return INSTANCE_OF.get(self.kind_of(node.func))
             return None
         obj, name = target
         obj_kind = self.kind_of(obj)
-        if obj_kind == "package":
-            return {"jwt": "jwt_module", "jws": "jws_module"}.get(name)
-        if obj_kind == "jwt_module":
-            if name == "decode":
-                return "decode"
-            return "unverified" if name in UNVERIFIED_READS else None
-        if obj_kind == "jws_module":
-            return "unverified" if name in UNVERIFIED_READS else None
+        if obj_kind in ATTRIBUTES:
+            return ATTRIBUTES[obj_kind].get(name)
         if obj_kind is not None and obj_kind.startswith("mod:"):
             return self.index.lookup(obj_kind[len("mod:") :], name)
         return None
@@ -396,18 +470,19 @@ def _decode_call_problems(call: ast.Call) -> list[str]:
 
 
 def _enclosing_functions(tree: ast.AST) -> dict[int, str]:
-    """Map id(node) to the name of the innermost function containing it."""
+    """Map id(node) to the qualified path of the innermost function or class that
+    contains it (`f`, `outer.inner`, `Class.method`), or `<module>`."""
     owners: dict[int, str] = {}
 
-    def visit(node: ast.AST, owner: str) -> None:
+    def visit(node: ast.AST, path: str) -> None:
         for child in ast.iter_child_nodes(node):
-            child_owner = (
-                child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else owner
-            )
-            owners[id(child)] = child_owner
-            visit(child, child_owner)
+            child_path = path
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                child_path = f"{path}.{child.name}" if path else child.name
+            owners[id(child)] = child_path or "<module>"
+            visit(child, child_path)
 
-    visit(tree, "<module>")
+    visit(tree, "")
     return owners
 
 
@@ -415,17 +490,53 @@ def _is_store(node: ast.AST) -> bool:
     return isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
 
 
-def _module_findings(index: _Index, rel_path: str) -> list[str]:
+def direct_decode_allowed() -> dict[tuple[str, str], int]:
+    """The sites that may call a PyJWT decode, each with how many calls it holds:
+    the helper (one) and the table."""
+    return {DECODE_HELPER: 1} | {site: count for site, (count, _) in DIRECT_DECODE_ALLOWED.items()}
+
+
+def _module_findings(index: _Index, rel_path: str, direct_rule: bool) -> list[str]:
     tree = index.trees[rel_path]
     names = index.names[rel_path]
     owners = _enclosing_functions(tree)
-    findings = [f"{rel_path}:{n.lineno} star import from {n.module}" for n in names.star_jose]
+    findings = [f"{rel_path}:{n.lineno} star import from {n.module}" for n in names.star_imports]
+    findings += [
+        f"{rel_path}:{n.lineno} private name {name} imported from {n.module}"
+        for n, name in names.private_imports
+    ]
+    allowed = direct_decode_allowed()
+    allowed_counts: dict[str, int] = {}
     called: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and names.kind_of(node.func) == "decode":
+        if not isinstance(node, ast.Call):
+            continue
+        func_kind = names.kind_of(node.func)
+        if func_kind == "decode":
             called.add(id(node.func))
             for problem in _decode_call_problems(node):
-                findings.append(f"{rel_path}:{node.lineno} jose decode {problem}")
+                findings.append(f"{rel_path}:{node.lineno} jwt decode {problem}")
+            owner = owners.get(id(node), "<module>")
+            if (rel_path, owner) in allowed:
+                allowed_counts[owner] = allowed_counts.get(owner, 0) + 1
+            elif direct_rule:
+                findings.append(
+                    f"{rel_path}:{node.lineno} jwt decode called directly in {owner}; "
+                    "call herd_common.jwt_codec.decode_access_token"
+                )
+        elif func_kind in INSTANCE_OF:
+            called.add(id(node.func))
+            if node.args or node.keywords:
+                findings.append(
+                    f"{rel_path}:{node.lineno} constructs PyJWT or PyJWS with arguments"
+                )
+    if direct_rule:
+        for owner, count in sorted(allowed_counts.items()):
+            if count != allowed[(rel_path, owner)]:
+                findings.append(
+                    f"{rel_path} jwt decode called {count} times in {owner}; "
+                    f"the allowlist admits {allowed[(rel_path, owner)]}"
+                )
     # A plain assignment to names is an alias the scan follows, except directly in
     # a class body, where the alias becomes an attribute the scan cannot follow.
     class_body = {
@@ -442,8 +553,8 @@ def _module_findings(index: _Index, rel_path: str) -> list[str]:
             for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
         )
     }
-    # A jose module object may be read only by attribute (a literal getattr
-    # included); any other use hands it to code the scan does not follow.
+    # A PyJWT module, class, or instance may be read only by attribute (a literal
+    # getattr included); any other use hands it to code the scan does not follow.
     read_by_attribute: set[int] = set()
     for node in ast.walk(tree):
         target = _attribute_target(node)
@@ -451,56 +562,119 @@ def _module_findings(index: _Index, rel_path: str) -> list[str]:
             continue
         obj, attr = target
         read_by_attribute.add(id(obj))
-        if attr.startswith("__") and names.kind_of(obj) in JOSE_MODULE_KINDS:
-            findings.append(f"{rel_path}:{node.lineno} jose module dunder attribute {attr}")
+        if names.kind_of(obj) not in OBJECT_KINDS:
+            continue
+        if attr.startswith("_"):
+            findings.append(f"{rel_path}:{node.lineno} jwt private attribute {attr}")
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            findings.append(f"{rel_path}:{node.lineno} jwt attribute assigned {attr}")
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)) or _is_store(node):
             continue
         kind = names.kind_of(node)
+        owner = owners.get(id(node), "<module>")
         if kind == "decode":
             if id(node) not in called and id(node) not in alias_values:
-                findings.append(f"{rel_path}:{node.lineno} jose decode referenced, not called")
+                findings.append(f"{rel_path}:{node.lineno} jwt decode referenced, not called")
         elif kind == "unverified":
-            owner = owners.get(id(node), "<module>")
             if (rel_path, owner) not in UNVERIFIED_READ_ALLOWED:
-                findings.append(f"{rel_path}:{node.lineno} jose unverified read in {owner}")
-        elif kind in JOSE_MODULE_KINDS:
-            if id(node) not in read_by_attribute and id(node) not in alias_values:
+                findings.append(f"{rel_path}:{node.lineno} jwt unverified read in {owner}")
+        elif kind == "registry":
+            findings.append(f"{rel_path}:{node.lineno} jwt algorithm registry used in {owner}")
+        elif kind in OBJECT_KINDS:
+            if (
+                id(node) not in read_by_attribute
+                and id(node) not in alias_values
+                and id(node) not in called
+            ):
                 findings.append(
-                    f"{rel_path}:{node.lineno} jose module referenced other than by attribute"
+                    f"{rel_path}:{node.lineno} jwt object referenced other than by attribute"
                 )
     return sorted(set(findings))
 
 
-def _index_findings(index: _Index) -> list[str]:
+def _index_findings(index: _Index, direct_rule: bool = True) -> list[str]:
     findings: list[str] = []
     for rel_path in index.trees:
-        findings += _module_findings(index, rel_path)
+        findings += _module_findings(index, rel_path, direct_rule)
     return findings
 
 
-def scan_decodes(sources: dict[str, str]) -> list[str]:
-    """Every refused decode, unverified read, or jose module use across modules."""
-    return _index_findings(_Index(sources))
+def scan_decodes(sources: dict[str, str], *, direct_rule: bool = True) -> list[str]:
+    """Every refused decode, unverified read, or PyJWT object use across modules.
+
+    `direct_rule=False` leaves out only the rule that a decode sits in the helper
+    or an allowed function, so a fixture can pin the call shape on its own.
+    """
+    return _index_findings(_Index(sources), direct_rule)
 
 
-def decode_findings(source: str, rel_path: str = "<fixture>") -> list[str]:
+def decode_findings(
+    source: str, rel_path: str = "<fixture>", *, direct_rule: bool = False
+) -> list[str]:
     """`scan_decodes` for one module on its own."""
-    return scan_decodes({rel_path: source})
+    return scan_decodes({rel_path: source}, direct_rule=direct_rule)
 
 
-def unverified_read_sites(index: "_Index") -> set[tuple[str, str]]:
+def _sites(index: "_Index", wanted: str, *, calls_only: bool = False) -> set[tuple[str, str]]:
+    """(path, enclosing function) of every reference of kind `wanted`."""
     sites = set()
     for rel_path, tree in index.trees.items():
         names = index.names[rel_path]
         owners = _enclosing_functions(tree)
-        sites |= {
-            (rel_path, owners.get(id(node), "<module>"))
+        for node in ast.walk(tree):
+            if calls_only:
+                if isinstance(node, ast.Call) and names.kind_of(node.func) == wanted:
+                    sites.add((rel_path, owners.get(id(node), "<module>")))
+            elif (
+                not isinstance(node, (ast.Import, ast.ImportFrom))
+                and not _is_store(node)
+                and names.kind_of(node) == wanted
+            ):
+                sites.add((rel_path, owners.get(id(node), "<module>")))
+    return sites
+
+
+def unverified_read_sites(index: "_Index") -> set[tuple[str, str]]:
+    return _sites(index, "unverified")
+
+
+def direct_decode_counts(index: "_Index") -> dict[tuple[str, str], int]:
+    """How many PyJWT decode calls each (path, qualified owner) holds."""
+    counts: dict[tuple[str, str], int] = {}
+    for rel_path, tree in index.trees.items():
+        names = index.names[rel_path]
+        owners = _enclosing_functions(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and names.kind_of(node.func) == "decode":
+                site = (rel_path, owners.get(id(node), "<module>"))
+                counts[site] = counts.get(site, 0) + 1
+    return counts
+
+
+def helper_call_sites(index: "_Index") -> set[tuple[str, str]]:
+    """(path, function) of every call of the shared helper, imported by name from
+    `herd_common.jwt_codec` (under an alias too) or read as its attribute."""
+    sites = set()
+    for rel_path, tree in index.trees.items():
+        local = {
+            alias.asname or alias.name
             for node in ast.walk(tree)
-            if not isinstance(node, (ast.Import, ast.ImportFrom))
-            and not _is_store(node)
-            and names.kind_of(node) == "unverified"
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "herd_common.jwt_codec"
+            and node.level == 0
+            for alias in node.names
+            if alias.name == DECODE_HELPER[1]
         }
+        owners = _enclosing_functions(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (isinstance(func, ast.Name) and func.id in local) or (
+                isinstance(func, ast.Attribute) and func.attr == DECODE_HELPER[1]
+            ):
+                sites.add((rel_path, owners.get(id(node), "<module>")))
     return sites
 
 
@@ -768,22 +942,14 @@ def settings_modules() -> list[Path]:
 # --- the repository ---
 
 
-def test_scan_covers_the_three_decode_sites():
-    index = repository_index()
-    hits = {
-        rel
-        for rel, tree in index.trees.items()
-        if any(
-            isinstance(n, ast.Call) and index.names[rel].kind_of(n.func) == "decode"
-            for n in ast.walk(tree)
-        )
-    }
-    assert {
-        "services/common/herd_common/auth.py",
-        "services/common/herd_common/auth_settings.py",
-        "services/auth/app/utils/jwt.py",
-        "services/notifications/app/routers/notifications.py",
-    } <= hits
+def test_the_only_direct_decodes_are_the_helper_and_the_allowed_table():
+    # Also the stale check: every allowed entry, and the helper, is a real site.
+    assert direct_decode_counts(repository_index()) == direct_decode_allowed()
+    assert all(count >= 1 and reason.strip() for count, reason in DIRECT_DECODE_ALLOWED.values())
+
+
+def test_every_token_verifying_function_calls_the_shared_helper():
+    assert HELPER_CALL_SITES <= helper_call_sites(repository_index())
 
 
 def test_the_index_keys_every_scanned_file():
@@ -794,7 +960,7 @@ def test_the_index_keys_every_scanned_file():
     assert index.keys["services/auth/app/utils/jwt.py"] == "auth:app.utils.jwt"
 
 
-def test_every_jose_decode_names_one_algorithm_and_keeps_verification():
+def test_every_decode_goes_through_the_helper_with_one_algorithm():
     assert _index_findings(repository_index()) == []
 
 
@@ -847,22 +1013,28 @@ def test_allowed_algorithms_match_the_shared_module():
 # --- fixture cases: decode ---
 
 _GOOD_DECODES = [
-    "from jose import jwt\njwt.decode(t, k, algorithms=[alg])\n",
-    "from jose import jwt as j\nj.decode(t, k, algorithms=['HS256'])\n",
-    "import jose\njose.jwt.decode(t, k, algorithms=[alg])\n",
-    "import jose.jwt\njose.jwt.decode(t, k, algorithms=[alg])\n",
-    "from jose.jwt import decode\ndecode(t, k, algorithms=[alg])\n",
-    "from jose import jwt\njwt.decode(t, k, algorithms=[alg], options={'verify_exp': False})\n",
-    "from jose import jwt\njwt.decode(t, k, algorithms=[a], options={'verify_signature': True})\n",
-    "from jose import jwt\nd = jwt.decode\nd(t, k, algorithms=[alg])\n",
-    # PyJWT is not jose.
-    "import jwt\njwt.decode(t, k)\n",
-    "# from jose import jwt; jwt.decode(t, k)\nx = 1\n",
-    "from jose import jwt\njwt.encode(c, k, algorithm=alg)\n",
-    # Reading other attributes of a jose module is fine.
-    "from jose import jwt\ntry:\n    pass\nexcept jwt.JWTError:\n    pass\n",
-    "from jose import jwt\ngetattr(jwt, 'encode')(c, k, algorithm=alg)\n",
-    "from jose import jwt\ncodec = jwt\ncodec.decode(t, k, algorithms=[alg])\n",
+    "import jwt\njwt.decode(t, k, algorithms=[alg])\n",
+    "import jwt as j\nj.decode(t, k, algorithms=['HS256'])\n",
+    "import jwt\njwt.decode_complete(t, k, algorithms=[alg])\n",
+    "import jwt.api_jwt\njwt.api_jwt.decode(t, k, algorithms=[alg])\n",
+    "from jwt import api_jws\napi_jws.decode(t, k, algorithms=[alg])\n",
+    "from jwt import decode\ndecode(t, k, algorithms=[alg])\n",
+    "from jwt.api_jwt import decode_complete as dc\ndc(t, k, algorithms=[alg])\n",
+    "import jwt\njwt.decode(t, k, algorithms=[alg], leeway=10)\n",
+    "import jwt\njwt.decode(t, k, algorithms=[alg], options={'verify_exp': False})\n",
+    "import jwt\njwt.decode(t, k, algorithms=[a], options={'verify_signature': True})\n",
+    "import jwt\nd = jwt.decode\nd(t, k, algorithms=[alg])\n",
+    "import jwt\njwt.PyJWT().decode(t, k, algorithms=[alg])\n",
+    "from jwt import PyJWS\ncodec = PyJWS()\ncodec.decode(t, k, algorithms=[alg])\n",
+    "# import jwt; jwt.decode(t, k)\nx = 1\n",
+    "import jwt\njwt.encode(c, k, algorithm=alg)\n",
+    # Reading other attributes of PyJWT is fine.
+    "import jwt\ntry:\n    pass\nexcept jwt.PyJWTError:\n    pass\n",
+    "import jwt\ntry:\n    pass\nexcept jwt.exceptions.InvalidSubjectError:\n    pass\n",
+    "from jwt.exceptions import InvalidTokenError\nx = InvalidTokenError\n",
+    "from jwt.warnings import InsecureKeyLengthWarning\nx = InsecureKeyLengthWarning\n",
+    "import jwt\ngetattr(jwt, 'encode')(c, k, algorithm=alg)\n",
+    "import jwt\ncodec = jwt\ncodec.decode(t, k, algorithms=[alg])\n",
 ]
 
 
@@ -872,75 +1044,111 @@ def test_fixture_decodes_that_pass(source):
 
 
 _BAD_DECODES = {
-    "no-algorithms": "from jose import jwt\njwt.decode(t, k)\n",
-    "two-algorithms": "from jose import jwt\njwt.decode(t, k, algorithms=['HS256', 'none'])\n",
-    "empty-list": "from jose import jwt\njwt.decode(t, k, algorithms=[])\n",
-    "name-not-list": "from jose import jwt\njwt.decode(t, k, algorithms=ALGS)\n",
-    "tuple": "from jose import jwt\njwt.decode(t, k, algorithms=(alg,))\n",
-    "starred": "from jose import jwt\njwt.decode(t, k, algorithms=[*algs])\n",
-    "positional-algorithms": "from jose import jwt\njwt.decode(t, k, [alg])\n",
-    "star-args": "from jose import jwt\njwt.decode(*args, algorithms=[alg])\n",
-    "star-kwargs": "from jose import jwt\njwt.decode(t, k, **kw)\n",
+    "no-algorithms": "import jwt\njwt.decode(t, k)\n",
+    "two-algorithms": "import jwt\njwt.decode(t, k, algorithms=['HS256', 'none'])\n",
+    "empty-list": "import jwt\njwt.decode(t, k, algorithms=[])\n",
+    "name-not-list": "import jwt\njwt.decode(t, k, algorithms=ALGS)\n",
+    "tuple": "import jwt\njwt.decode(t, k, algorithms=(alg,))\n",
+    "starred": "import jwt\njwt.decode(t, k, algorithms=[*algs])\n",
+    "positional-algorithms": "import jwt\njwt.decode(t, k, [alg])\n",
+    "star-args": "import jwt\njwt.decode(*args, algorithms=[alg])\n",
+    "star-kwargs": "import jwt\njwt.decode(t, k, **kw)\n",
     "verify-off": (
-        "from jose import jwt\n"
-        "jwt.decode(t, k, algorithms=[alg], options={'verify_signature': False})\n"
+        "import jwt\njwt.decode(t, k, algorithms=[alg], options={'verify_signature': False})\n"
+    ),
+    "verify-off-api-jwt": (
+        "import jwt\n"
+        "jwt.api_jwt.decode(t, k, algorithms=[alg], options={'verify_signature': False})\n"
     ),
     "verify-name": (
-        "from jose import jwt\n"
-        "jwt.decode(t, k, algorithms=[alg], options={'verify_signature': v})\n"
+        "import jwt\njwt.decode(t, k, algorithms=[alg], options={'verify_signature': v})\n"
     ),
-    "options-name": "from jose import jwt\njwt.decode(t, k, algorithms=[alg], options=opts)\n",
-    "options-splat": ("from jose import jwt\njwt.decode(t, k, algorithms=[alg], options={**o})\n"),
-    "alias-module": "from jose import jwt as j\nj.decode(t, k)\n",
-    "package": "import jose\njose.jwt.decode(t, k)\n",
-    "package-alias": "import jose as J\nJ.jwt.decode(t, k)\n",
-    "submodule": "import jose.jwt\njose.jwt.decode(t, k)\n",
-    "submodule-alias": "import jose.jwt as JJ\nJJ.decode(t, k)\n",
-    "from-decode": "from jose.jwt import decode\ndecode(t, k)\n",
-    "from-decode-alias": "from jose.jwt import decode as d\nd(t, k)\n",
-    "assigned-function": "from jose import jwt\nd = jwt.decode\nd(t, k)\n",
-    "assigned-module": "from jose import jwt\ncodec = jwt\ncodec.decode(t, k)\n",
-    "assigned-twice": "from jose import jwt\na = jwt\nb = a.decode\nb(t, k)\n",
-    "getattr": "from jose import jwt\ngetattr(jwt, 'decode')(t, k)\n",
-    "partial": (
-        "import functools\nfrom jose import jwt\n"
-        "f = functools.partial(jwt.decode, algorithms=[alg])\n"
+    "options-name": "import jwt\njwt.decode(t, k, algorithms=[alg], options=opts)\n",
+    "options-splat": "import jwt\njwt.decode(t, k, algorithms=[alg], options={**o})\n",
+    # The spelling cases: the call is found under each spelling, so the missing
+    # algorithms= is reported.
+    "alias-package": "import jwt as j\nj.decode(t, k)\n",
+    "decode-complete": "import jwt\njwt.decode_complete(t, k)\n",
+    "api-jwt": "import jwt.api_jwt\njwt.api_jwt.decode(t, k)\n",
+    "api-jwt-alias": "import jwt.api_jwt as A\nA.decode(t, k)\n",
+    "api-jwt-from": "from jwt import api_jwt\napi_jwt.decode_complete(t, k)\n",
+    "api-jws": "import jwt\njwt.api_jws.decode(t, k)\n",
+    "api-jws-alias": "import jwt.api_jws as S\nS.decode_complete(t, k)\n",
+    "from-decode": "from jwt import decode\ndecode(t, k)\n",
+    "from-decode-alias": "from jwt import decode as d\nd(t, k)\n",
+    "from-api-jwt-decode": "from jwt.api_jwt import decode\ndecode(t, k)\n",
+    "from-api-jws-decode-complete": (
+        "from jwt.api_jws import decode_complete\ndecode_complete(t, k)\n"
     ),
-    "passed-on": "from jose import jwt\nrun(jwt.decode, t, k)\n",
-    "in-function": "from jose import jwt\ndef f(t):\n    return jwt.decode(t, k)\n",
-    "unverified-claims": (
-        "from jose import jwt\ndef f(t):\n    return jwt.get_unverified_claims(t)\n"
+    "pyjwt-instance": "import jwt\njwt.PyJWT().decode(t, k)\n",
+    "pyjwt-instance-bound": "from jwt import PyJWT\ncodec = PyJWT()\ncodec.decode_complete(t, k)\n",
+    "pyjwt-from-api-jwt": "from jwt.api_jwt import PyJWT\nPyJWT().decode(t, k)\n",
+    "pyjwt-of-api-jwt": "import jwt\njwt.api_jwt.PyJWT().decode(t, k)\n",
+    "pyjws-instance": "import jwt\njwt.PyJWS().decode(t, k)\n",
+    "pyjws-of-api-jws": "import jwt.api_jws as S\nS.PyJWS().decode_complete(t, k)\n",
+    "assigned-function": "import jwt\nd = jwt.decode\nd(t, k)\n",
+    "assigned-module": "import jwt\ncodec = jwt\ncodec.decode(t, k)\n",
+    "assigned-twice": "import jwt\na = jwt\nb = a.decode\nb(t, k)\n",
+    "assigned-class": "import jwt\nC = jwt.PyJWT\nC().decode(t, k)\n",
+    "getattr": "import jwt\ngetattr(jwt, 'decode')(t, k)\n",
+    "getattr-instance": "import jwt\ngetattr(jwt.PyJWT(), 'decode')(t, k)\n",
+    "in-function": "import jwt\ndef f(t):\n    return jwt.decode(t, k)\n",
+    "constructed-with-options": (
+        "import jwt\njwt.PyJWT(options={'verify_signature': False}).decode(t, k, algorithms=[a])\n"
     ),
-    "unverified-header": (
-        "from jose import jws\ndef f(t):\n    return jws.get_unverified_header(t)\n"
+    "pyjws-constructed-with-arguments": (
+        "from jwt import PyJWS\nPyJWS(['HS256']).decode(t, k, algorithms=[a])\n"
     ),
+    "partial": "import functools\nimport jwt\nf = functools.partial(jwt.decode, algorithms=[a])\n",
+    "passed-on": "import jwt\nrun(jwt.decode, t, k)\n",
+    "unverified-header": "import jwt\ndef f(t):\n    return jwt.get_unverified_header(t)\n",
+    "unverified-api-jws": (
+        "import jwt\ndef f(t):\n    return jwt.api_jws.get_unverified_header(t)\n"
+    ),
+    "unverified-pyjws": "import jwt\ndef f(t):\n    return jwt.PyJWS().get_unverified_header(t)\n",
     "unverified-by-name": (
-        "from jose.jwt import get_unverified_claims as g\ndef f(t):\n    return g(t)\n"
+        "from jwt import get_unverified_header as g\ndef f(t):\n    return g(t)\n"
     ),
-    "unverified-package": "import jose\nx = jose.jwt.get_unverified_header(t)\n",
-    "star-jose": "from jose import *\njwt.decode(t, k)\n",
-    "star-jose-jwt": "from jose.jwt import *\ndecode(t, k)\n",
-    "star-jose-jws": "from jose.jws import *\nget_unverified_header(t)\n",
-    "module-handed-on": "from jose import jwt\nrun(jwt)\n",
-    "module-in-vars": "from jose import jwt\nvars(jwt)['decode'](t, k)\n",
-    "module-in-tuple": "from jose import jwt\nfor m in (jwt,):\n    m.decode(t, k)\n",
-    "package-handed-on": "import jose\nrun(jose)\n",
-    "jwt-of-package-handed-on": "import jose\nrun(jose.jwt)\n",
-    "getattr-not-literal": "from jose import jwt\ngetattr(jwt, name)(t, k)\n",
-    "dunder-dict": "from jose import jwt\njwt.__dict__['decode'](t, k)\n",
-    "getattr-dunder": "from jose import jwt\ngetattr(jwt, '__dict__')['decode'](t, k)\n",
-    "class-attribute-alias": "from jose import jwt\nclass V:\n    d = jwt.decode\nV.d(t, k)\n",
+    "unverified-module-level": "import jwt\nx = jwt.get_unverified_header(t)\n",
+    "register-algorithm": "import jwt\njwt.register_algorithm('HS256', alg)\n",
+    "unregister-by-name": (
+        "from jwt.api_jws import unregister_algorithm\nunregister_algorithm('HS256')\n"
+    ),
+    "register-on-pyjws": "import jwt\ndef f():\n    jwt.PyJWS().register_algorithm('HS256', a)\n",
+    "star-jwt": "from jwt import *\ndecode(t, k)\n",
+    "star-api-jwt": "from jwt.api_jwt import *\ndecode(t, k)\n",
+    "star-api-jws": "from jwt.api_jws import *\nget_unverified_header(t)\n",
+    "star-exceptions": "from jwt.exceptions import *\n",
+    "private-attribute": "import jwt\njwt.api_jwt._jwt_global_obj.decode(t, k, algorithms=[a])\n",
+    "private-import": "from jwt.api_jwt import _jwt_global_obj\n_jwt_global_obj.decode(t, k)\n",
+    "private-method": "import jwt\njwt.PyJWS()._verify_signature(t, h, s, k, a)\n",
+    "dunder-dict": "import jwt\njwt.__dict__['decode'](t, k)\n",
+    "getattr-dunder": "import jwt\ngetattr(jwt, '__dict__')['decode'](t, k)\n",
+    "attribute-assigned": "import jwt\njwt.decode = fake\n",
+    "instance-options-assigned": "import jwt\ncodec = jwt.PyJWT()\ncodec.options = {}\n",
+    "attribute-deleted": "import jwt\ndel jwt.api_jwt.decode\n",
+    "module-handed-on": "import jwt\nrun(jwt)\n",
+    "module-in-vars": "import jwt\nvars(jwt)['decode'](t, k)\n",
+    "module-in-tuple": "import jwt\nfor m in (jwt,):\n    m.decode(t, k)\n",
+    "submodule-handed-on": "import jwt\nrun(jwt.api_jwt)\n",
+    "class-handed-on": "import jwt\nrun(jwt.PyJWT)\n",
+    "instance-handed-on": "import jwt\nrun(jwt.PyJWT())\n",
+    "setattr": "import jwt\nsetattr(jwt, 'decode', fake)\n",
+    "getattr-not-literal": "import jwt\ngetattr(jwt, name)(t, k)\n",
+    "class-attribute-alias": "import jwt\nclass V:\n    d = jwt.decode\nV.d(t, k)\n",
     "instance-attribute-alias": (
-        "from jose import jwt\nclass V:\n    def __init__(self):\n        self.d = jwt.decode\n"
+        "import jwt\nclass V:\n    def __init__(self):\n        self.d = jwt.decode\n"
     ),
-    "decode-in-dict": "from jose import jwt\ntable = {'d': jwt.decode}\n",
+    "decode-in-dict": "import jwt\ntable = {'d': jwt.decode}\n",
 }
 
 
 _NO_ALGORITHMS = "names no algorithms= keyword"
 _NOT_ONE = "algorithms= is not a one-element list literal"
-_NOT_CALLED = "jose decode referenced, not called"
-_MODULE_REFERENCED = "jose module referenced other than by attribute"
+_VERIFY_OFF = "options= turns verify_signature off"
+_NOT_CALLED = "jwt decode referenced, not called"
+_REFERENCED = "jwt object referenced other than by attribute"
+_REGISTRY = "jwt algorithm registry used in"
 _EXPECTED_DECODE_REASON = {
     "no-algorithms": _NO_ALGORITHMS,
     "two-algorithms": _NOT_ONE,
@@ -951,41 +1159,67 @@ _EXPECTED_DECODE_REASON = {
     "positional-algorithms": "passes more than the token and the key positionally",
     "star-args": "passes *args",
     "star-kwargs": "passes **kwargs",
-    "verify-off": "options= turns verify_signature off",
-    "verify-name": "options= turns verify_signature off",
+    "verify-off": _VERIFY_OFF,
+    "verify-off-api-jwt": _VERIFY_OFF,
+    "verify-name": _VERIFY_OFF,
     "options-name": "options= is not a dict literal without **",
     "options-splat": "options= is not a dict literal without **",
-    # The spelling cases: the call is found under each spelling, so the missing
-    # algorithms= is reported.
-    "alias-module": _NO_ALGORITHMS,
-    "package": _NO_ALGORITHMS,
-    "package-alias": _NO_ALGORITHMS,
-    "submodule": _NO_ALGORITHMS,
-    "submodule-alias": _NO_ALGORITHMS,
+    "alias-package": _NO_ALGORITHMS,
+    "decode-complete": _NO_ALGORITHMS,
+    "api-jwt": _NO_ALGORITHMS,
+    "api-jwt-alias": _NO_ALGORITHMS,
+    "api-jwt-from": _NO_ALGORITHMS,
+    "api-jws": _NO_ALGORITHMS,
+    "api-jws-alias": _NO_ALGORITHMS,
     "from-decode": _NO_ALGORITHMS,
     "from-decode-alias": _NO_ALGORITHMS,
+    "from-api-jwt-decode": _NO_ALGORITHMS,
+    "from-api-jws-decode-complete": _NO_ALGORITHMS,
+    "pyjwt-instance": _NO_ALGORITHMS,
+    "pyjwt-instance-bound": _NO_ALGORITHMS,
+    "pyjwt-from-api-jwt": _NO_ALGORITHMS,
+    "pyjwt-of-api-jwt": _NO_ALGORITHMS,
+    "pyjws-instance": _NO_ALGORITHMS,
+    "pyjws-of-api-jws": _NO_ALGORITHMS,
     "assigned-function": _NO_ALGORITHMS,
     "assigned-module": _NO_ALGORITHMS,
     "assigned-twice": _NO_ALGORITHMS,
+    "assigned-class": _NO_ALGORITHMS,
     "getattr": _NO_ALGORITHMS,
+    "getattr-instance": _NO_ALGORITHMS,
     "in-function": _NO_ALGORITHMS,
+    "constructed-with-options": "constructs PyJWT or PyJWS with arguments",
+    "pyjws-constructed-with-arguments": "constructs PyJWT or PyJWS with arguments",
     "partial": _NOT_CALLED,
     "passed-on": _NOT_CALLED,
-    "unverified-claims": "jose unverified read in f",
-    "unverified-header": "jose unverified read in f",
-    "unverified-by-name": "jose unverified read in f",
-    "unverified-package": "jose unverified read in <module>",
-    "star-jose": "star import from jose",
-    "star-jose-jwt": "star import from jose.jwt",
-    "star-jose-jws": "star import from jose.jws",
-    "module-handed-on": _MODULE_REFERENCED,
-    "module-in-vars": _MODULE_REFERENCED,
-    "module-in-tuple": _MODULE_REFERENCED,
-    "package-handed-on": _MODULE_REFERENCED,
-    "jwt-of-package-handed-on": _MODULE_REFERENCED,
-    "getattr-not-literal": _MODULE_REFERENCED,
-    "dunder-dict": "jose module dunder attribute __dict__",
-    "getattr-dunder": "jose module dunder attribute __dict__",
+    "unverified-header": "jwt unverified read in f",
+    "unverified-api-jws": "jwt unverified read in f",
+    "unverified-pyjws": "jwt unverified read in f",
+    "unverified-by-name": "jwt unverified read in f",
+    "unverified-module-level": "jwt unverified read in <module>",
+    "register-algorithm": f"{_REGISTRY} <module>",
+    "unregister-by-name": f"{_REGISTRY} <module>",
+    "register-on-pyjws": f"{_REGISTRY} f",
+    "star-jwt": "star import from jwt",
+    "star-api-jwt": "star import from jwt.api_jwt",
+    "star-api-jws": "star import from jwt.api_jws",
+    "star-exceptions": "star import from jwt.exceptions",
+    "private-attribute": "jwt private attribute _jwt_global_obj",
+    "private-import": "private name _jwt_global_obj imported from jwt.api_jwt",
+    "private-method": "jwt private attribute _verify_signature",
+    "dunder-dict": "jwt private attribute __dict__",
+    "getattr-dunder": "jwt private attribute __dict__",
+    "attribute-assigned": "jwt attribute assigned decode",
+    "instance-options-assigned": "jwt attribute assigned options",
+    "attribute-deleted": "jwt attribute assigned decode",
+    "module-handed-on": _REFERENCED,
+    "module-in-vars": _REFERENCED,
+    "module-in-tuple": _REFERENCED,
+    "submodule-handed-on": _REFERENCED,
+    "class-handed-on": _REFERENCED,
+    "instance-handed-on": _REFERENCED,
+    "setattr": _REFERENCED,
+    "getattr-not-literal": _REFERENCED,
     "class-attribute-alias": _NOT_CALLED,
     "instance-attribute-alias": _NOT_CALLED,
     "decode-in-dict": _NOT_CALLED,
@@ -1004,7 +1238,7 @@ def test_fixture_decodes_that_fail(name):
 
 def test_unverified_read_allowlist_admits_only_its_function(monkeypatch):
     source = (
-        "from jose import jwt\n"
+        "import jwt\n"
         "def peek(t):\n    return jwt.get_unverified_header(t)\n"
         "def other(t):\n    return jwt.get_unverified_header(t)\n"
     )
@@ -1013,12 +1247,165 @@ def test_unverified_read_allowlist_admits_only_its_function(monkeypatch):
     assert len(findings) == 1 and "in other" in findings[0]
 
 
+# --- fixture cases: the direct-decode rule ---
+
+_HELPER_PATH, _HELPER_FUNCTION = DECODE_HELPER
+_CONFIG_PATH = "services/config/app/auth.py"
+_HONEST_CALL = "jwt.decode(t, k, algorithms=[alg])"
+
+_GOOD_DIRECT = {
+    "the-helper": (
+        _HELPER_PATH,
+        f"import jwt\ndef {_HELPER_FUNCTION}(t, k, alg):\n    return {_HONEST_CALL}\n",
+    ),
+    "the-config-session": (
+        _CONFIG_PATH,
+        f"import jwt\ndef _verify_token(t):\n    return {_HONEST_CALL}\n",
+    ),
+    "a-helper-caller": (
+        "services/svc/app/a.py",
+        "from herd_common.jwt_codec import decode_access_token\n"
+        "def f(t):\n    return decode_access_token(t, k, alg)\n",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_GOOD_DIRECT))
+def test_fixture_direct_decodes_that_pass(name):
+    rel_path, source = _GOOD_DIRECT[name]
+    assert decode_findings(source, rel_path, direct_rule=True) == []
+
+
+_BAD_DIRECT = {
+    "app-function": (
+        "services/svc/app/a.py",
+        f"import jwt\ndef f(t):\n    return {_HONEST_CALL}\n",
+    ),
+    "module-level": ("services/svc/app/a.py", f"import jwt\nx = {_HONEST_CALL}\n"),
+    "herd-common-module": (
+        "services/common/herd_common/auth.py",
+        f"import jwt\ndef get_current_user_payload(t):\n    return {_HONEST_CALL}\n",
+    ),
+    "helper-file-other-function": (
+        _HELPER_PATH,
+        f"import jwt\ndef peek(t, k, alg):\n    return {_HONEST_CALL}\n",
+    ),
+    "config-other-function": (
+        _CONFIG_PATH,
+        f"import jwt\ndef require_config_session(t):\n    return {_HONEST_CALL}\n",
+    ),
+    "helper-name-in-another-file": (
+        "services/svc/app/a.py",
+        f"import jwt\ndef {_HELPER_FUNCTION}(t, k, alg):\n    return {_HONEST_CALL}\n",
+    ),
+    "pyjwt-instance": (
+        "services/svc/app/a.py",
+        "import jwt\ndef f(t):\n    return jwt.PyJWT().decode(t, k, algorithms=[alg])\n",
+    ),
+    # An allowed name reused by a nested function or a method is another site.
+    "config-nested-def": (
+        _CONFIG_PATH,
+        "import jwt\ndef other(t):\n    def _verify_token(t):\n"
+        f"        return {_HONEST_CALL}\n    return _verify_token(t)\n",
+    ),
+    "config-class-method": (
+        _CONFIG_PATH,
+        "import jwt\nclass Session:\n    def _verify_token(self, t):\n"
+        f"        return {_HONEST_CALL}\n",
+    ),
+    "helper-file-class-method": (
+        _HELPER_PATH,
+        "import jwt\nclass Codec:\n"
+        f"    def {_HELPER_FUNCTION}(self, t, k, alg):\n"
+        "        return jwt.decode(t, k, algorithms=[alg], options={'verify_exp': False})\n",
+    ),
+    "helper-nested-def": (
+        _HELPER_PATH,
+        f"import jwt\ndef {_HELPER_FUNCTION}(t, k, alg):\n    def inner(t):\n"
+        f"        return {_HONEST_CALL}\n    return inner(t)\n",
+    ),
+}
+
+_EXPECTED_DIRECT = {
+    "app-function": "f",
+    "module-level": "<module>",
+    "herd-common-module": "get_current_user_payload",
+    "helper-file-other-function": "peek",
+    "config-other-function": "require_config_session",
+    "helper-name-in-another-file": _HELPER_FUNCTION,
+    "pyjwt-instance": "f",
+    "config-nested-def": "other._verify_token",
+    "config-class-method": "Session._verify_token",
+    "helper-file-class-method": f"Codec.{_HELPER_FUNCTION}",
+    "helper-nested-def": f"{_HELPER_FUNCTION}.inner",
+}
+
+
+def test_every_bad_direct_fixture_names_its_function():
+    assert set(_EXPECTED_DIRECT) == set(_BAD_DIRECT)
+
+
+@pytest.mark.parametrize("name", sorted(_BAD_DIRECT))
+def test_fixture_direct_decodes_that_fail(name):
+    rel_path, source = _BAD_DIRECT[name]
+    findings = decode_findings(source, rel_path, direct_rule=True)
+    line = next(n for n, text in enumerate(source.splitlines(), 1) if ".decode(t" in text)
+    assert findings == [
+        f"{rel_path}:{line} jwt decode called directly in {_EXPECTED_DIRECT[name]}; "
+        "call herd_common.jwt_codec.decode_access_token"
+    ], findings
+
+
+@pytest.mark.parametrize(
+    "rel_path, function",
+    [(_HELPER_PATH, _HELPER_FUNCTION), (_CONFIG_PATH, "_verify_token")],
+    ids=["the-helper", "the-config-session"],
+)
+def test_an_allowed_site_holding_a_second_decode_is_refused(rel_path, function):
+    source = (
+        f"import jwt\ndef {function}(t, k, alg):\n"
+        f"    if t:\n        return {_HONEST_CALL}\n    return {_HONEST_CALL}\n"
+    )
+    assert decode_findings(source, rel_path, direct_rule=True) == [
+        f"{rel_path} jwt decode called 2 times in {function}; the allowlist admits 1"
+    ]
+
+
+def test_direct_decode_table_admits_only_its_function(monkeypatch):
+    source = (
+        f"import jwt\ndef a(t):\n    return {_HONEST_CALL}\ndef b(t):\n    return {_HONEST_CALL}\n"
+    )
+    monkeypatch.setitem(DIRECT_DECODE_ALLOWED, ("services/svc/app/x.py", "a"), (1, "fixture"))
+    findings = decode_findings(source, "services/svc/app/x.py", direct_rule=True)
+    assert len(findings) == 1 and "called directly in b;" in findings[0]
+
+
+def test_helper_call_sites_follow_an_import_alias():
+    index = _Index(
+        {
+            "services/svc/app/a.py": (
+                "from herd_common.jwt_codec import decode_access_token as dat\n"
+                "def f(t):\n    return dat(t, k, alg)\n"
+            ),
+            "services/svc/app/b.py": (
+                "from herd_common import jwt_codec\n"
+                "def g(t):\n    return jwt_codec.decode_access_token(t, k, alg)\n"
+            ),
+            "services/svc/app/c.py": "def decode_access_token(t):\n    return t\nx = 1\n",
+        }
+    )
+    assert helper_call_sites(index) == {
+        ("services/svc/app/a.py", "f"),
+        ("services/svc/app/b.py", "g"),
+    }
+
+
 # --- fixture cases: decodes across modules ---
 
 _COMMON = "services/common/herd_common"
 _APP = "services/svc/app"
 
-_REEXPORT = {f"{_COMMON}/auth.py": "from jose import jwt\n"}
+_REEXPORT = {f"{_COMMON}/auth.py": "import jwt\n"}
 
 _GOOD_ACROSS_MODULES = {
     "reexported-module-honest": {
@@ -1032,7 +1419,7 @@ _GOOD_ACROSS_MODULES = {
     # Each service has its own `app` package: another service's binding is not
     # this one's.
     "app-is-per-service": {
-        "services/other/app/codec.py": "from jose import jwt\n",
+        "services/other/app/codec.py": "import jwt\n",
         f"{_APP}/codec.py": "x = 1\n",
         f"{_APP}/b.py": "from app.codec import jwt\njwt.decode(t, k)\n",
     },
@@ -1041,7 +1428,7 @@ _GOOD_ACROSS_MODULES = {
 
 @pytest.mark.parametrize("name", sorted(_GOOD_ACROSS_MODULES))
 def test_fixture_decodes_across_modules_that_pass(name):
-    assert scan_decodes(_GOOD_ACROSS_MODULES[name]) == []
+    assert scan_decodes(_GOOD_ACROSS_MODULES[name], direct_rule=False) == []
 
 
 _BAD_ACROSS_MODULES = {
@@ -1070,41 +1457,52 @@ _BAD_ACROSS_MODULES = {
         f"{_APP}/a.py": "from herd_common import auth\ngetattr(auth, 'jwt').decode(t, k)\n",
     },
     "alias-defined-elsewhere": {
-        f"{_COMMON}/codec.py": "from jose import jwt\nd = jwt.decode\n",
+        f"{_COMMON}/codec.py": "import jwt\nd = jwt.decode\n",
         f"{_APP}/a.py": "from herd_common.codec import d\nd(t, k)\n",
+    },
+    "instance-defined-elsewhere": {
+        f"{_COMMON}/codec.py": "import jwt\ncodec = jwt.PyJWT()\n",
+        f"{_APP}/a.py": "from herd_common.codec import codec\ncodec.decode(t, k)\n",
     },
     "star-from-scanned": {
         **_REEXPORT,
         f"{_APP}/a.py": "from herd_common.auth import *\njwt.decode(t, k)\n",
     },
     "two-hops": {
-        f"{_COMMON}/a.py": "from jose import jwt\n",
+        f"{_COMMON}/a.py": "import jwt\n",
         f"{_COMMON}/b.py": "from herd_common.a import jwt\n",
         f"{_APP}/c.py": "from herd_common.b import jwt\njwt.decode(t, k)\n",
     },
     "app-absolute": {
-        f"{_APP}/codec.py": "from jose import jwt\n",
+        f"{_APP}/codec.py": "import jwt\n",
         f"{_APP}/b.py": "from app.codec import jwt\njwt.decode(t, k)\n",
     },
     "relative-import": {
-        f"{_APP}/codec.py": "from jose import jwt\n",
+        f"{_APP}/codec.py": "import jwt\n",
         f"{_APP}/sub/__init__.py": "",
         f"{_APP}/sub/b.py": "from ..codec import jwt\njwt.decode(t, k)\n",
     },
     "relative-from-package": {
         f"{_APP}/__init__.py": "",
-        f"{_APP}/codec.py": "from jose import jwt\n",
+        f"{_APP}/codec.py": "import jwt\n",
         f"{_APP}/b.py": "from . import codec\ncodec.jwt.decode(t, k)\n",
     },
     "reexported-unverified": {
         **_REEXPORT,
         f"{_APP}/a.py": (
-            "from herd_common.auth import jwt\ndef f(t):\n    return jwt.get_unverified_claims(t)\n"
+            "from herd_common.auth import jwt\ndef f(t):\n    return jwt.get_unverified_header(t)\n"
         ),
     },
     "reexported-module-handed-on": {
         **_REEXPORT,
         f"{_APP}/a.py": "from herd_common.auth import jwt\nvars(jwt)\n",
+    },
+    "reexported-direct-decode": {
+        **_REEXPORT,
+        f"{_APP}/a.py": (
+            "from herd_common.auth import jwt\ndef f(t):\n"
+            "    return jwt.decode(t, k, algorithms=[alg])\n"
+        ),
     },
 }
 
@@ -1116,13 +1514,15 @@ _EXPECTED_ACROSS_MODULES = {
     "package-attribute": (f"{_APP}/a.py", _NO_ALGORITHMS),
     "getattr-on-module": (f"{_APP}/a.py", _NO_ALGORITHMS),
     "alias-defined-elsewhere": (f"{_APP}/a.py", _NO_ALGORITHMS),
+    "instance-defined-elsewhere": (f"{_APP}/a.py", _NO_ALGORITHMS),
     "star-from-scanned": (f"{_APP}/a.py", _NO_ALGORITHMS),
     "two-hops": (f"{_APP}/c.py", _NO_ALGORITHMS),
     "app-absolute": (f"{_APP}/b.py", _NO_ALGORITHMS),
     "relative-import": (f"{_APP}/sub/b.py", _NO_ALGORITHMS),
     "relative-from-package": (f"{_APP}/b.py", _NO_ALGORITHMS),
-    "reexported-unverified": (f"{_APP}/a.py", "jose unverified read in f"),
-    "reexported-module-handed-on": (f"{_APP}/a.py", _MODULE_REFERENCED),
+    "reexported-unverified": (f"{_APP}/a.py", "jwt unverified read in f"),
+    "reexported-module-handed-on": (f"{_APP}/a.py", _REFERENCED),
+    "reexported-direct-decode": (f"{_APP}/a.py", "jwt decode called directly in f;"),
 }
 
 

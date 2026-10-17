@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import jwt
 import pytest
 from app import config as config_module
 from app.database import Base, engine
@@ -35,7 +36,6 @@ from app.services.providers.anthropic_provider import AnthropicProvider
 from fastapi import HTTPException
 from herd_common.bounded_tar import MAX_TAR_READ_BYTES
 from httpx import ASGITransport, AsyncClient
-from jose import jwt
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 _USER_ID = str(uuid.uuid4())

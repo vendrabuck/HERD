@@ -106,7 +106,7 @@ Shared data layer: PostgreSQL 16 (schema-per-service) and NATS JetStream (async 
 | Topology editor | React Flow (@xyflow/react) |
 | State management | Zustand, TanStack Query |
 | UI | Tailwind CSS 4, shadcn/ui |
-| Auth | Custom JWT service (bcrypt, python-jose) |
+| Auth | Custom JWT service (bcrypt, PyJWT) |
 
 ## Roles
 

@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import jwt
 import pytest
 from app import config as config_module
 from app.database import Base, engine
@@ -30,7 +31,6 @@ from app.services.reservation_context import (
 )
 from app.services.tools import ToolCallRecord
 from httpx import ASGITransport, AsyncClient
-from jose import jwt
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 _TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)

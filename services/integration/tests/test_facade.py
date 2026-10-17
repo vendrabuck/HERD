@@ -12,13 +12,13 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import jwt
 import pytest
 from app.main import app
 from app.routers import reservations as facade
 from httpx import ASGITransport, AsyncClient
-from jose import jwt
 
-SECRET = "test-secret"
+SECRET = "3fcbb4bf16b0e162be24d2eb59065316c1e84194669ebf9270203280b18e18f7"
 
 # Captured by the fake client for forwarding assertions.
 CAPTURED: dict = {}

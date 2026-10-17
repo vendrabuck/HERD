@@ -3,8 +3,9 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import jwt
 from herd_common.auth import log_unusable_key
-from jose import JOSEError, JWTError, jwt
+from herd_common.jwt_codec import decode_access_token
 
 from app.config import settings
 
@@ -32,18 +33,19 @@ def hash_token(raw_token: str) -> str:
 
 
 def verify_access_token(token: str) -> dict:
-    """Return the payload of a token that verifies; raise JWTError otherwise.
+    """Return the payload of a token that verifies; raise InvalidTokenError otherwise.
 
-    jose raises JWTError for a token that does not verify and other JOSEError
-    subclasses (JWKError) when the configured key cannot be used for the
-    algorithm. Both are raised here as JWTError, so every caller's single
-    `except JWTError` answers 401 rather than letting a key error become a 500;
-    a key error is logged by class name first (`log_unusable_key`).
+    The shared decode (`herd_common.jwt_codec.decode_access_token`) raises
+    `jwt.InvalidTokenError` for a token that does not verify and another
+    `jwt.PyJWTError` (`InvalidKeyError`) when the configured key cannot be used
+    for the algorithm. Both are raised here as `jwt.InvalidTokenError`, so every
+    caller answers 401 rather than letting a key error become a 500; a key error
+    is logged by class name first (`log_unusable_key`).
     """
     try:
-        return jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
-    except JWTError:
+        return decode_access_token(token, settings.secret_key, settings.algorithm)
+    except jwt.InvalidTokenError:
         raise
-    except JOSEError as exc:
+    except jwt.PyJWTError as exc:
         log_unusable_key(logger, exc)
-        raise JWTError("token could not be verified") from exc
+        raise jwt.InvalidTokenError("token could not be verified") from exc

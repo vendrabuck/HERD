@@ -8,12 +8,12 @@ rollback on canvas save failure, and rollback on reservation failure.
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import jwt
 import pytest
 import respx
 from app import config as config_module
 from app.main import app
 from httpx import ASGITransport, AsyncClient
-from jose import jwt
 
 CABLING_URL = config_module.settings.cabling_service_url.rstrip("/")
 RESERVATIONS_URL = config_module.settings.reservations_service_url.rstrip("/")

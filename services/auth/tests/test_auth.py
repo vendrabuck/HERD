@@ -306,7 +306,7 @@ async def test_me_with_invalid_token(client):
 async def test_me_with_non_uuid_subject_returns_401(client):
     """A validly-signed token whose sub is not a UUID must return 401, not 500.
 
-    uuid.UUID() on a non-UUID sub raises ValueError (not a JWTError); the
+    uuid.UUID() on a non-UUID sub raises ValueError (not a PyJWTError); the
     dependency must map that to the credentials 401 rather than letting it
     surface as an unhandled 500.
     """

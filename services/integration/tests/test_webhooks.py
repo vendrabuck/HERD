@@ -10,6 +10,7 @@ import json
 import uuid
 
 import httpx
+import jwt
 import pytest
 from app.database import Base, get_db
 from app.main import app
@@ -19,11 +20,10 @@ from app.services import delivery as delivery_mod
 from app.services.delivery import Target, deliver_one, load_matching_targets
 from herd_common.webhooks import WEBHOOK_SIGNATURE_HEADER, sign_body
 from httpx import ASGITransport, AsyncClient
-from jose import jwt
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-SECRET = "test-secret"
+SECRET = "3fcbb4bf16b0e162be24d2eb59065316c1e84194669ebf9270203280b18e18f7"
 
 
 @pytest.fixture

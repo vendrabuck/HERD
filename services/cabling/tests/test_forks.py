@@ -3484,7 +3484,7 @@ async def test_save_fork_element_node_ignored_by_membership_check(client):
 
 
 def _bearer(role: str, sub: uuid.UUID | None = None) -> str:
-    from jose import jwt
+    import jwt
 
     token = jwt.encode(
         {"sub": str(sub or uuid.uuid4()), "username": "owner", "role": role},

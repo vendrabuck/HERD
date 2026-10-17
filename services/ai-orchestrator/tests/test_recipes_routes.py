@@ -15,6 +15,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
+import jwt
 import pytest
 from app import config as config_module
 from app.database import Base, engine
@@ -24,7 +25,6 @@ from app.services.ai_client import AI_NOT_CONFIGURED_DETAIL, AIError, get_ai_cli
 from app.services.llm_provider import Usage
 from app.services.recipe_author import RECIPE_VALIDATOR_UNREACHABLE_DETAIL, RecipeAuthorError
 from httpx import ASGITransport, AsyncClient
-from jose import jwt
 
 _ADMIN_ID = str(uuid.uuid4())
 

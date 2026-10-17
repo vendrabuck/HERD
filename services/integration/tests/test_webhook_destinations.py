@@ -13,6 +13,7 @@ import socket
 import uuid
 
 import httpx
+import jwt
 import pytest
 from app.config import Settings, settings
 from app.database import Base, get_db
@@ -22,12 +23,11 @@ from app.services import delivery as delivery_mod
 from app.services import destination
 from app.services.delivery import Target, deliver_one
 from httpx import ASGITransport, AsyncClient
-from jose import jwt
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-SECRET = "test-secret"
+SECRET = "3fcbb4bf16b0e162be24d2eb59065316c1e84194669ebf9270203280b18e18f7"
 REFUSED = "target_url must resolve to a public address"
 
 

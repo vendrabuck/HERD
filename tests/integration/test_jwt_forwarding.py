@@ -24,8 +24,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import jwt
 import pytest
-from jose import jwt
 
 pytestmark = pytest.mark.asyncio
 
@@ -35,6 +35,15 @@ def _mint_jwt(payload_overrides: dict | None = None) -> str:
     secret = os.getenv("AUTH_SECRET_KEY")
     algorithm = os.getenv("AUTH_ALGORITHM", "HS256")
     assert secret, "AUTH_SECRET_KEY missing from environment; integration conftest should load .env"
+    # PyJWT warns (InsecureKeyLengthWarning) when it signs with an HMAC key under
+    # 32 bytes, and filterwarnings = ["error"] would turn that into an opaque
+    # failure here. The services start with such a key, so name it plainly.
+    secret_bytes = len(secret.encode("utf-8"))
+    assert secret_bytes >= 32, (
+        f"AUTH_SECRET_KEY is {secret_bytes} bytes; these tests sign with PyJWT, which warns "
+        "on an HMAC key under 32 bytes, and the suite turns warnings into errors. Set it to "
+        "the output of openssl rand -hex 32"
+    )
 
     now = datetime.now(timezone.utc)
     payload = {

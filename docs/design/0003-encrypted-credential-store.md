@@ -32,7 +32,11 @@ Relevant existing fabric, verified:
   (JWT 401, role 403); internal endpoints check `X-Internal-Token` and return
   403 on mismatch (convention across services).
 - Crypto: the `cryptography` package is already a transitive dependency of
-  every service via `python-jose[cryptography]`.
+  every service via `python-jose[cryptography]`. As built (2026-10-16, issue
+  #1186): python-jose was replaced by PyJWT, which does not pull in
+  `cryptography`, so it is no longer in every image; `herd-secrets` declares it
+  directly (below), and `paramiko` and `pdfminer-six` still bring it to the
+  services that use them.
 - Scaffold: the `integration` service (added 2026-06-29) is the reference for
   adding a service; its touchpoint list is reproduced below.
 - Lesson from #246: never ship a hardcoded or defaulted key; missing key
@@ -77,7 +81,9 @@ Two tables in the `secrets` schema:
 - A database dump alone never yields plaintext: it contains ciphertext,
   nonces, and wrapped DEKs, all useless without the KEK from the environment.
 - Dependency: declare `cryptography` directly in the new service's
-  pyproject; it is already in the image via python-jose.
+  pyproject; it is already in the image via python-jose. As built: it is
+  declared directly in `services/secrets/pyproject.toml`, which is what keeps it
+  in the secrets image since python-jose left the workspace (issue #1186).
 
 ### Authorization rides the existing ACL fabric
 

@@ -4,6 +4,7 @@ import uuid
 from unittest.mock import AsyncMock, patch
 
 import httpx
+import jwt
 import pytest
 from app.config import settings
 from app.database import Base, get_db
@@ -22,7 +23,6 @@ from app.services import notification_service
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from httpx import ASGITransport, AsyncClient
-from jose import jwt
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -500,11 +500,17 @@ def test_get_bearer_credentials_rejects_token_without_sub():
     with pytest.raises(HTTPException) as exc:
         get_bearer_credentials(credentials=_make_creds(token))
     assert exc.value.status_code == 401
+    assert exc.value.detail == "Could not validate credentials"
+    assert exc.value.headers == {"WWW-Authenticate": "Bearer"}
+    assert type(exc.value.__cause__) is jwt.InvalidTokenError
+    assert str(exc.value.__cause__) == "missing sub"
 
 
-# jose cannot build an HMAC key from this (it is shaped like a public key) and
-# raises JWKError, a JOSEError that is not a JWTError.
-_ASYMMETRIC_SHAPED_KEY = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQc=\n"
+# PyJWT cannot prepare an HMAC key from this (it is a PEM public key block) and
+# raises InvalidKeyError, a PyJWTError that is not an InvalidTokenError.
+_ASYMMETRIC_SHAPED_KEY = (
+    "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQc=\n-----END PUBLIC KEY-----\n"
+)
 
 
 def _unsigned_token(payload: dict) -> str:
@@ -535,16 +541,16 @@ def test_get_bearer_credentials_rejects_another_hmac_algorithm():
 
 
 def test_get_bearer_credentials_gives_decode_exactly_the_configured_algorithm(monkeypatch):
-    from app.routers import notifications as notifications_router
+    from herd_common import jwt_codec
 
     seen: list = []
-    real_decode = notifications_router.jwt.decode
+    real_decode = jwt_codec.jwt.decode
 
     def recording_decode(*args, **kwargs):
         seen.append(kwargs.get("algorithms"))
         return real_decode(*args, **kwargs)
 
-    monkeypatch.setattr(notifications_router.jwt, "decode", recording_decode)
+    monkeypatch.setattr(jwt_codec.jwt, "decode", recording_decode)
     good = jwt.encode({"sub": str(uuid.uuid4())}, settings.secret_key, algorithm=settings.algorithm)
     get_bearer_credentials(credentials=_make_creds(good))
     with pytest.raises(HTTPException):
@@ -571,10 +577,10 @@ def test_get_bearer_credentials_logs_a_key_error_once_by_class_name(monkeypatch,
     logged = _json.loads(formatted)
     assert logged["level"] == "ERROR"
     assert logged["message"] == (
-        "access token not checked: the configured key is unusable (JWKError)"
+        "access token not checked: the configured key is unusable (InvalidKeyError)"
     )
     assert logged["action"] == "jwt_key_unusable"
-    assert logged["error_class"] == "JWKError"
+    assert logged["error_class"] == "InvalidKeyError"
     assert "BEGIN PUBLIC KEY" not in formatted
 
 
@@ -588,7 +594,7 @@ def test_get_bearer_credentials_does_not_log_a_token_without_sub(caplog):
     assert [r for r in caplog.records if r.name == "app.routers.notifications"] == []
 
 
-def test_get_bearer_credentials_answers_401_for_a_key_jose_cannot_use(monkeypatch):
+def test_get_bearer_credentials_answers_401_for_a_key_pyjwt_cannot_use(monkeypatch):
     token = jwt.encode(
         {"sub": str(uuid.uuid4())}, settings.secret_key, algorithm=settings.algorithm
     )
