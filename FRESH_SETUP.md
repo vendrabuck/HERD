@@ -4,7 +4,7 @@ Complete guide for building HERD from scratch on a new machine.
 
 ## Prerequisites
 
-- Docker and Docker Compose (v2+)
+- Docker and Docker Compose 2.27.1 or later. The Traefik service interpolates `${COMPOSE_PROJECT_NAME}`, which Compose sets for interpolation (from `-p`, the environment, `.env`, or the directory name) only since 2.27.1 (compose-go #628). On an older Compose every command fails with `required variable COMPOSE_PROJECT_NAME is missing a value: the compose project name is empty (needs Docker Compose 2.27.1 or later); Traefik would route nothing`; upgrade Compose (`docker compose version` shows yours).
 - Git
 - Node.js 22.22.2+ and npm 11.11.0+ (for local frontend dev/testing; `frontend/package.json` declares `engines.node: ">=22"`, but `engine-strict` in `frontend/.npmrc` binds every dependency's own engines floor too, and jsdom 30 declares `^22.22.2 || ^24.15.0 || >=26`, so a Node 22.x host below 22.22.2 is refused by `npm ci`/`npm install`, issue #885)
 - Python 3.12+ and uv (for local backend dev/testing)
@@ -62,7 +62,7 @@ unrecoverable, and there is no default.
 
 ## 3. TLS certificates (HTTPS)
 
-The repository includes a pre-generated certificate chain for `localhost` / `127.0.0.1` in `infra/traefik/certs/`, but not its private key: `infra/traefik/certs/server.key` is not tracked. Without that file Traefik logs `Unable to parse certificate ... failed to find any PEM data in key input` and serves its own self-signed `TRAEFIK DEFAULT CERT`, so the browser warns even after you trust `root-ca.crt`; generate your own chain and key with the steps below, keeping `localhost` and `127.0.0.1` among the SANs (issue #1239 tracks a generated setup). Those steps are also what you need to reach the stack from another machine on your network (or with a different hostname):
+The repository includes a pre-generated certificate chain for `localhost` / `127.0.0.1` in `infra/traefik/certs/`, but not its private key: `infra/traefik/certs/server.key` is not tracked. Without that file Traefik logs `Unable to parse certificate ... failed to find any PEM data in key input` and serves its own self-signed `TRAEFIK DEFAULT CERT`, so the browser warns even after you trust `root-ca.crt`; generate your own chain and key with the steps below, keeping `localhost` and `127.0.0.1` among the SANs (issue #1239 tracks a generated setup). Those steps are also what you need to reach the stack from another machine on your network by a different host name. Access by IP address needs more than an IP SAN: a client connecting by IP sends no SNI, and `dynamic.yml` sets no default certificate, so Traefik answers with its own default certificate whatever the chain holds (issue #1239 tracks setting one). The steps:
 
 1. Generate a new PKI chain (Root CA, Intermediate CA, Server cert with your IP as SAN)
 2. Place files in `infra/traefik/certs/`

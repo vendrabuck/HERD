@@ -18,9 +18,12 @@ MEDIUM, LOW) and a concrete target file path.
 
 ## Security and cross-cutting
 
-- **[MEDIUM] TLS/Traefik cert chain verification.** Zero tests touch the
-  traefik config at `infra/traefik/` or verify that `https://localhost`
-  serves the expected cert chain. Target: a small integration check that
+- **[MEDIUM] TLS/Traefik cert chain verification.** No test verifies that
+  `https://localhost` serves the expected cert chain or that
+  `infra/traefik/dynamic.yml` loads it (the static configuration, the
+  `traefik` command in `docker-compose.yml`, is pinned by
+  `tests/unit/test_gateway_ports_guard.py`; the private key is not tracked,
+  issue #1239). Target: a small integration check that
   fetches `/api/auth/healthz` with `verify=True` against the committed CA.
 - **[MEDIUM] Alembic up/down tests.** Migrations run implicitly through the
   integration stack setup; no explicit test verifies `alembic upgrade head`
