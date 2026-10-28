@@ -21,7 +21,8 @@ ROOT_PY := seedtools/ scripts/check_image_matches_lock.py tests/ai_eval/ tests/u
 # (gate-clean purges only the gate project) and `make up` after a gate run
 # restores the dev stack WITH its data, no reseed needed. A SUCCESSFUL
 # `make everything` leaves its gate stack running and seeded (both projects
-# publish the same host ports, so run `make gate-down` before `make up`);
+# publish the same host ports, so run `make gate-down` before `make up`, which
+# refuses to start while another project holds them);
 # master always tears its gate stack down. Lowercased because
 # compose project names reject uppercase (leading non-alphanumerics are
 # stripped, also a compose rule); derived from the directory so worktree gates
@@ -92,6 +93,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	nos-test-dialect nos-test-feature \
 	_gate-ldap-stack-tests _gate-pg-live-tests \
 	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed _clean-images _test-e2e-run \
+	_assert-gateway-ports-free \
 	_collect-stack-diagnostics
 
 ## --- Meta ---
@@ -216,7 +218,7 @@ master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + gate s
 		echo "" && echo "=== Postgres-live suites (every services/*/tests/*_live_pg.py, real Postgres) ===" && \
 		$(MAKE) _gate-pg-live-tests
 	@echo ""
-	@echo "=== master complete ==="
+	@echo "=== master complete: gate stack torn down; dev stack stopped ('make up' restores it) ==="
 
 # -- Master (clean-image variant) ---------------------------------------------
 #
@@ -363,7 +365,8 @@ everything: gate-clean  ## Full gate: CI checks + coverage + live LDAP + NOS dia
 		ok=1
 	@echo ""
 	@echo "=== everything complete: gate stack left running and seeded at https://localhost ==="
-	@echo "    make gate-down   stop it (then 'make up' restores the dev stack)"
+	@echo "    It holds host ports 80 and 443, so 'make up' refuses to start the dev stack while it runs."
+	@echo "    make gate-down   stop it and purge its database (then 'make up' restores the dev stack)"
 
 everything-noload:  ## everything minus the load-test tail (stack still seeded and left up)
 	$(MAKE) everything EVERYTHING_LOAD=0
@@ -468,11 +471,22 @@ _master-stack-down:
 
 up: dev  ## Start the full stack in dev mode (hot reload), alias of dev
 
-dev:  ## Start the full stack in dev mode (build + detached)
+dev: _assert-gateway-ports-free  ## Start the full stack in dev mode (build + detached)
 	docker compose up --build -d
 
-prod:  ## Start the stack without dev overrides (no reload)
+prod: _assert-gateway-ports-free  ## Start the stack without dev overrides (no reload)
 	docker compose -f docker-compose.yml up --build -d
+
+# Refuses `make up`/`dev`/`prod` while ANOTHER compose project (typically the
+# seeded gate stack a successful `make everything` leaves serving
+# https://localhost) already publishes host port 80 or 443. Starting anyway
+# never worked: the new Traefik cannot bind and stays Created, and the new
+# stack's postgres and nats can come up with no network attached, so every
+# service dies on a name-resolution error. Our own project (COMPOSE_PROJECT_NAME,
+# else DEV_PROJECT, the resolution docker compose itself uses here) is allowed,
+# so re-running `make up` on a running dev stack still works.
+_assert-gateway-ports-free:
+	@sh scripts/check_gateway_ports_free.sh "$${COMPOSE_PROJECT_NAME:-$(DEV_PROJECT)}"
 
 # Every compose `down` below carries --profile e2e: a profile-gated service that is
 # not enabled is neither an active service nor an orphan, so a plain `down` (even
@@ -485,7 +499,17 @@ down:  ## Stop the stack (including the e2e Selenium container if it is up)
 build:  ## Build all service images
 	docker compose build
 
+# With no dev container at all but another project on host port 443 (the gate
+# stack a `make everything` left up), `docker compose logs` prints nothing and
+# waits; the hint says which stack is actually serving.
 logs:  ## Tail logs for all services
+	@dev=$${COMPOSE_PROJECT_NAME:-$(DEV_PROJECT)}; \
+		if [ -z "$$(docker compose ps -aq 2>/dev/null)" ]; then \
+			other=$$(docker ps --filter publish=443 --format '{{.Label "com.docker.compose.project"}}' | grep -vx "$$dev" | head -1); \
+			if [ -n "$$other" ]; then \
+				echo "Note: compose project $$dev has no containers; https://localhost is served by compose project $$other (docker compose -p $$other logs -f)."; \
+			fi; \
+		fi
 	docker compose logs -f
 
 restart:  ## Restart all running services

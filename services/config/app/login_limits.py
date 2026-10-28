@@ -23,7 +23,7 @@ Source address and its trust assumption: the source is the first entry of
 `X-Forwarded-For` when it parses as an IP address, else the TCP peer. This relies
 on Traefik being the only way in: the config container publishes no host port,
 and Traefik's entry points do not trust client-supplied forwarded headers (the
-shipped `infra/traefik/traefik.yml` sets no `forwardedHeaders` trust), so Traefik
+shipped Traefik command in `docker-compose.yml` sets no `forwardedHeaders` trust), so Traefik
 replaces any `X-Forwarded-For` a client sends with the client's own address. A
 deployment that puts another proxy in front of Traefik without configuring
 `forwardedHeaders.trustedIPs` makes every client share that proxy's address, so

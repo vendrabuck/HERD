@@ -62,7 +62,7 @@ unrecoverable, and there is no default.
 
 ## 3. TLS certificates (HTTPS)
 
-The repository includes pre-generated certs for `localhost` / `127.0.0.1` in `infra/traefik/certs/`. The included chain works out of the box for local-only development on `https://localhost`. If you need to reach the stack from another machine on your network (or with a different hostname):
+The repository includes a pre-generated certificate chain for `localhost` / `127.0.0.1` in `infra/traefik/certs/`, but not its private key: `infra/traefik/certs/server.key` is not tracked. Without that file Traefik logs `Unable to parse certificate ... failed to find any PEM data in key input` and serves its own self-signed `TRAEFIK DEFAULT CERT`, so the browser warns even after you trust `root-ca.crt`; generate your own chain and key with the steps below, keeping `localhost` and `127.0.0.1` among the SANs (issue #1239 tracks a generated setup). Those steps are also what you need to reach the stack from another machine on your network (or with a different hostname):
 
 1. Generate a new PKI chain (Root CA, Intermediate CA, Server cert with your IP as SAN)
 2. Place files in `infra/traefik/certs/`
