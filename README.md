@@ -125,7 +125,7 @@ and instructions for creating the superadmin account.
 
 ### Prerequisites
 
-- Docker + Docker Compose
+- Docker + Docker Compose 2.27.1 or later (see [FRESH_SETUP.md](FRESH_SETUP.md))
 - `uv` (Python package manager)
 - Node.js 22.22.2+ and npm 11.11.0+ (for local frontend development; `frontend/.npmrc` sets `engine-strict`, so an older host is refused by `npm ci`, see [FRESH_SETUP.md](FRESH_SETUP.md))
 
