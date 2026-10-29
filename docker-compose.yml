@@ -83,16 +83,45 @@ services:
       start_period: 5s
 
   # --- Traefik (API Gateway) ---
+  #
+  # The whole static configuration is these command-line flags, with no
+  # configuration file: Traefik's three static configuration sources (a file,
+  # the command line, environment variables) are mutually exclusive, and the
+  # first one present wins, so a flag next to --configFile is ignored. Flags are
+  # also the only source compose can interpolate.
+  #
+  # Project isolation: every Traefik on a host reads the same Docker socket, and
+  # the dev and gate stacks label their containers with the same router names,
+  # so without the constraint one stack's Traefik load-balances across the
+  # other stack's containers, half of them on a network it cannot reach (the
+  # page then hangs). The constraint admits only containers of THIS compose
+  # project, and the network flag picks this project's network address.
+  # Compose (2.27.1 and later) always sets COMPOSE_PROJECT_NAME for
+  # interpolation, from -p, the environment, or the directory name; the :?
+  # form refuses to render the file if it is ever empty, because an empty
+  # constraint would match no container and take every route down.
   traefik:
     image: traefik:latest
     command:
-      - "--configFile=/etc/traefik/traefik.yml"
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+      - "--entryPoints.web.address=:80"
+      - "--entryPoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entryPoints.web.http.redirections.entryPoint.scheme=https"
+      - "--entryPoints.websecure.address=:443"
+      - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+      - "--providers.docker.exposedByDefault=false"
+      - "--providers.docker.constraints=Label(`com.docker.compose.project`,`${COMPOSE_PROJECT_NAME:?the compose project name is empty (needs Docker Compose 2.27.1 or later); Traefik would route nothing}`)"
+      - "--providers.docker.network=${COMPOSE_PROJECT_NAME:?the compose project name is empty (needs Docker Compose 2.27.1 or later); Traefik would route nothing}_herd-net"
+      - "--providers.file.filename=/etc/traefik/dynamic.yml"
+      - "--providers.file.watch=true"
+      - "--log.level=INFO"
+      - "--accessLog=true"
     ports:
       - "80:80"
       - "443:443"
       - "127.0.0.1:8080:8080"  # Traefik dashboard, unauthenticated: loopback only (issue #708)
     volumes:
-      - ./infra/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./infra/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
       - ./infra/traefik/certs:/etc/traefik/certs:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro

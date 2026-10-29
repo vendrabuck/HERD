@@ -21,7 +21,8 @@ ROOT_PY := seedtools/ scripts/check_image_matches_lock.py tests/ai_eval/ tests/u
 # (gate-clean purges only the gate project) and `make up` after a gate run
 # restores the dev stack WITH its data, no reseed needed. A SUCCESSFUL
 # `make everything` leaves its gate stack running and seeded (both projects
-# publish the same host ports, so run `make gate-down` before `make up`);
+# publish the same host ports, so run `make gate-down` before `make up`, which
+# refuses to start while another project holds them);
 # master always tears its gate stack down. Lowercased because
 # compose project names reject uppercase (leading non-alphanumerics are
 # stripped, also a compose rule); derived from the directory so worktree gates
@@ -38,8 +39,11 @@ GATE_PROJECT := $(shell printf '%s' '$(notdir $(CURDIR))' | tr '[:upper:]' '[:lo
 GATE_COMPOSE := docker compose -p $(GATE_PROJECT)
 
 # The dev stack's own compose project name, same derivation as GATE_PROJECT
-# minus the "-gate" suffix (docker compose's own default when no `name:` /
-# `-p` is given). Used by nos-attach/nos-detach below to find the dev stack's
+# minus the "-gate" suffix. This equals docker compose's own default only when
+# the directory name has no `_`, `.`, or space (compose keeps `_` and drops `.`
+# and spaces; this maps all three to `-`) and `.env` sets no
+# COMPOSE_PROJECT_NAME (make never reads `.env`); the gateway ports guard asks
+# compose instead (COMPOSE_OWN_PROJECT_CMD). Used by nos-attach/nos-detach below to find the dev stack's
 # network from a worktree whose CURDIR-derived name would otherwise be wrong;
 # an explicit COMPOSE_PROJECT_NAME always wins, the same override
 # _gate-ldap-stack-tests supports.
@@ -92,6 +96,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	nos-test-dialect nos-test-feature \
 	_gate-ldap-stack-tests _gate-pg-live-tests \
 	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed _clean-images _test-e2e-run \
+	_assert-gateway-ports-free _assert-gate-ports-free \
 	_collect-stack-diagnostics
 
 ## --- Meta ---
@@ -216,7 +221,7 @@ master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + gate s
 		echo "" && echo "=== Postgres-live suites (every services/*/tests/*_live_pg.py, real Postgres) ===" && \
 		$(MAKE) _gate-pg-live-tests
 	@echo ""
-	@echo "=== master complete ==="
+	@echo "=== master complete: gate stack torn down; dev stack stopped ('make up' restores it) ==="
 
 # -- Master (clean-image variant) ---------------------------------------------
 #
@@ -231,8 +236,11 @@ master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + gate s
 # Removes this checkout's compose images and prunes dangling layers, so the
 # next `make up` or `make build` rebuilds from scratch. Images are selected by
 # the `com.docker.compose.project` label compose stamps on every image it
-# builds, once for the dev project (COMPOSE_PROJECT_NAME, else DEV_PROJECT, the
-# same resolution the `down` above uses) and once for the gate project. A name
+# builds, once for the dev project (COMPOSE_PROJECT_NAME from the environment,
+# else DEV_PROJECT; this equals compose's own name only for a directory name of
+# letters, digits, and dashes with no COMPOSE_PROJECT_NAME in `.env`, since
+# compose keeps `_` and drops `.` where DEV_PROJECT turns both into `-`) and
+# once for the gate project. A name
 # pattern was used before and was both too wide and too narrow: `herd-*` also
 # matched the NOS lab's built image (`herd-nos-test-frr`, project
 # herd-nos-test) and every other checkout's images, and missed a checkout whose
@@ -363,7 +371,8 @@ everything: gate-clean  ## Full gate: CI checks + coverage + live LDAP + NOS dia
 		ok=1
 	@echo ""
 	@echo "=== everything complete: gate stack left running and seeded at https://localhost ==="
-	@echo "    make gate-down   stop it (then 'make up' restores the dev stack)"
+	@echo "    It holds host ports 80 and 443, so 'make up' refuses to start the dev stack while it runs."
+	@echo "    make gate-down   stop it and purge its database (then 'make up' restores the dev stack)"
 
 everything-noload:  ## everything minus the load-test tail (stack still seeded and left up)
 	$(MAKE) everything EVERYTHING_LOAD=0
@@ -438,9 +447,19 @@ seed-nos:  ## Seed a running stack with the NOS test lab (real SR Linux + FRR la
 
 # -- Gate stack helpers (internal, used by master, everything, and gate-down) --
 
+_assert-gate-ports-free:
+	@HERD_GATE_PROJECT="$(GATE_PROJECT)" sh scripts/check_gateway_ports_free.sh "$(GATE_PROJECT)" "rerun the gate"
+
 # GATE_NO_CACHE=1 (set by master-clean) builds the gate project's images with
 # --no-cache first; `up --build` then reuses those fresh layers.
-_master-stack-up:
+#
+# The gateway ports guard runs first. By the time this target runs, `gate-clean`
+# has stopped this checkout's dev stack and purged this checkout's stale gate
+# project, so only a FOREIGN stack can trip it: another checkout's dev stack or
+# its seeded gate stack. Without the guard this gate's Traefik could not bind,
+# and the seed, integration, and e2e phases (all addressed to https://localhost)
+# would run against that other, serving stack and write into its database.
+_master-stack-up: _assert-gate-ports-free
 	@if [ "$$GATE_NO_CACHE" = "1" ]; then $(GATE_COMPOSE) build --no-cache; fi
 	$(GATE_COMPOSE) up -d --build
 
@@ -464,15 +483,38 @@ _master-stack-down:
 
 ## --- Docker Compose ---
 
+# The compose project name docker compose itself uses for this checkout: the
+# top-level `name:` of the rendered configuration (from -p, COMPOSE_PROJECT_NAME
+# in the environment or `.env`, a `name:` key, or the normalised directory
+# name). Prints nothing when compose cannot render the configuration. A shell
+# command for recipes, used as $$($(COMPOSE_OWN_PROJECT_CMD)).
+COMPOSE_OWN_PROJECT_CMD = docker compose config 2>/dev/null | sed -n 's/^name: //p' | head -n 1
+
 # -- Docker Compose -----------------------------------------------------------
 
 up: dev  ## Start the full stack in dev mode (hot reload), alias of dev
 
-dev:  ## Start the full stack in dev mode (build + detached)
+dev: _assert-gateway-ports-free  ## Start the full stack in dev mode (build + detached)
 	docker compose up --build -d
 
-prod:  ## Start the stack without dev overrides (no reload)
+prod: _assert-gateway-ports-free  ## Start the stack without dev overrides (no reload)
 	docker compose -f docker-compose.yml up --build -d
+
+# Refuses `make up`/`dev`/`prod` while ANOTHER compose project (typically the
+# seeded gate stack a successful `make everything` leaves serving
+# https://localhost) already publishes host port 80 or 443. Starting anyway
+# never worked: the new Traefik cannot bind and stays Created, and the new
+# stack's postgres and nats can come up with no network attached, so every
+# service dies on a name-resolution error. Our own project is allowed, so
+# re-running `make up` on a running dev stack still works. "Our own project" is
+# the name docker compose itself reports for this checkout
+# (COMPOSE_OWN_PROJECT_CMD), not DEV_PROJECT: compose keeps `_` and drops `.`
+# and spaces where DEV_PROJECT turns them into `-`, and compose also honours
+# COMPOSE_PROJECT_NAME from `.env`, which make never reads. When compose
+# cannot answer (the name comes back empty) the guard fails closed (exit 2).
+_assert-gateway-ports-free:
+	@own=$$($(COMPOSE_OWN_PROJECT_CMD)); \
+		HERD_GATE_PROJECT="$(GATE_PROJECT)" sh scripts/check_gateway_ports_free.sh "$$own"
 
 # Every compose `down` below carries --profile e2e: a profile-gated service that is
 # not enabled is neither an active service nor an orphan, so a plain `down` (even
@@ -485,10 +527,33 @@ down:  ## Stop the stack (including the e2e Selenium container if it is up)
 build:  ## Build all service images
 	docker compose build
 
+# With no dev container at all but another project on host port 80 or 443 (the
+# gate stack a `make everything` left up), `docker compose logs` prints nothing
+# and waits; the hint says which stack is actually serving. The holders come
+# from the guard script's --list mode, so both use one parser.
 logs:  ## Tail logs for all services
+	@own=$$($(COMPOSE_OWN_PROJECT_CMD)); \
+		if [ -n "$$own" ] && [ -z "$$(docker compose ps -aq 2>/dev/null)" ]; then \
+			other=$$(sh scripts/check_gateway_ports_free.sh --list "$$own" 2>/dev/null | sed -n 's/^project //p' | head -n 1); \
+			if [ -n "$$other" ]; then \
+				echo "Note: compose project $$own has no containers; https://localhost is served by compose project $$other (docker compose -p $$other logs -f)."; \
+			fi; \
+		fi
 	docker compose logs -f
 
+# A Traefik container created before PR #1240 bind-mounts
+# infra/traefik/traefik.yml, which no longer exists. RESTARTING it makes Docker
+# recreate the missing source as a root-owned directory and the start fails
+# ("not a directory"), taking the gateway down; RECREATING it from the current
+# definition is safe. So this target first recreates Traefik, alone, when the
+# running container still carries that mount, then restarts as before. It
+# starts nothing that is not already running.
 restart:  ## Restart all running services
+	@cid=$$(docker compose ps -q traefik 2>/dev/null); \
+		if [ -n "$$cid" ] && docker inspect "$$cid" --format '{{range .Mounts}}{{.Destination}} {{end}}' 2>/dev/null | grep -q '/etc/traefik/traefik.yml'; then \
+			echo "Traefik predates the removal of infra/traefik/traefik.yml; recreating it before the restart."; \
+			docker compose up -d --no-deps --force-recreate traefik; \
+		fi
 	docker compose restart
 
 ## --- Database migrations ---
@@ -781,7 +846,9 @@ nos-reset:  ## Recreate the NOS test lab from scratch (discards all node state)
 # network behind, so nos-detach must always be run to undo nos-attach.
 #
 # Scoped to the DEV stack only (never the gate stack): an explicit
-# COMPOSE_PROJECT_NAME always wins, else DEV_PROJECT (CURDIR-derived) is
+# COMPOSE_PROJECT_NAME in the environment always wins, else DEV_PROJECT
+# (CURDIR-derived; compose's own name differs for a directory name with `_` or
+# `.`, or when `.env` sets COMPOSE_PROJECT_NAME, which make never reads) is
 # used, the same override _gate-ldap-stack-tests supports, needed because a
 # worktree's own CURDIR-derived name does not match the dev stack's project
 # when the dev stack was booted from a different checkout directory.

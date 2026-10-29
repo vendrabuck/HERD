@@ -44,6 +44,23 @@ Second most common: config service started but `config.json` was never written. 
 
 Check with `make logs` or `docker compose logs <service>`; the startup error message names the missing setting.
 
+### `make up` refuses to start, or the page hangs after `make up` following `make everything`
+
+A successful `make everything` leaves its seeded gate stack (compose project `<dir>-gate`, for example `herd-public-gate`) serving `https://localhost` on host ports 80 and 443. The dev stack publishes the same ports, so the two cannot run together. `make up`, `make dev`, and `make prod` therefore refuse to start while another compose project publishes host port 80 or 443, with a message such as:
+
+```
+Refusing to start compose project herd-public: another stack already publishes host port 80 or 443.
+  Held by compose project herd-public-gate (started from /home/you/HERD-public).
+  That is this checkout's seeded gate stack: a successful 'make everything'
+  left it serving https://localhost, built from this checkout. Either
+    - use it as is at https://localhost, or
+    - run 'make gate-down' (this PURGES the gate stack's database), then run 'make up'.
+```
+
+Remedy: use the gate stack as it is, or run `make gate-down` and then `make up`. `make gate-down` deletes the gate stack's volumes, so its seeded data is gone; the dev stack's own data is untouched. When the holder is another checkout's gate stack, the message gives the exact `docker compose -p <project> --profile e2e down -v --remove-orphans` teardown instead, since this checkout's `make gate-down` would not touch it; any other project is named with a `docker compose -p <project> down` hint. The guard compares against the project name `docker compose config` reports for the checkout, so a running dev stack of your own never blocks `make up`; when compose cannot render the configuration the guard refuses with `Could not determine this checkout's compose project name`. `make everything` and `make master` run the same check before they start the gate stack (ending in `then rerun the gate here.`), so a gate run never sends its tests into another checkout's serving stack. `make logs` prints a one-line note when the dev project has no containers but another project serves `https://localhost`.
+
+Before this guard, starting anyway produced two failures. The dev Traefik could not bind the ports and stayed `Created`, and the dev `postgres` and `nats` could come up with no network attached, so every service died with `socket.gaierror: Temporary failure in name resolution` (`dependency ... is unhealthy` from compose). Worse, the gate stack's own Traefik read the dev stack's containers over the shared Docker socket, because both stacks carry the same `traefik.*` labels, and load-balanced each route across both stacks' containers; the dev ones sit on a network the gate Traefik cannot reach, so about half of the requests to `/` and `/api/config/status` hung and the page never finished loading. Each stack's Traefik now admits only containers of its own compose project (a `--providers.docker.constraints` rule on the `com.docker.compose.project` label in `docker-compose.yml`), so a second project on the host can no longer change what a running stack serves. If you still see a route with servers from two stacks (`curl -s http://127.0.0.1:8080/api/http/services` lists more than one server for `config@docker`), that Traefik predates the fix: recreate it with `docker compose -p <project> up -d --no-deps --force-recreate traefik`. Recreate, never restart, a Traefik from before the fix: restarting it fails with a `not a directory` mount error and leaves a root-owned `infra/traefik/traefik.yml` directory behind (see the upgrade note in `docs/OPERATIONS.md`; remove it with `sudo rmdir infra/traefik/traefik.yml`).
+
 ### Login succeeds but every API call returns 401
 
 Either:
