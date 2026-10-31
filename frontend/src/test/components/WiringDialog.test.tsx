@@ -260,7 +260,10 @@ describe("WiringDialog", () => {
 
     expect(screen.getByTestId(`line-layer-${lineId}-L3`)).toHaveAttribute("aria-pressed", "true");
     const sourceDot = screen.getByTestId("port-dot-sp1");
-    expect(sourceDot).toHaveStyle({ background: "rgb(34, 197, 94)" });
+    // Read the longhand the shorthand sets: since jsdom 30.1.3 a computed
+    // `background` serializes every layer default, so the shorthand never
+    // equals a bare colour.
+    expect(sourceDot).toHaveStyle({ backgroundColor: "rgb(34, 197, 94)" });
 
     connectViaClick("eth3", "0/0/2");
     const newPill = screen.getByTestId(
