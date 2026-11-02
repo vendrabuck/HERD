@@ -77,6 +77,23 @@ describe("SettingsPage", () => {
     expect(screen.getByText("Device health changes")).toBeInTheDocument();
   });
 
+  it("renders inside its own scroll container, Save included (#1260)", async () => {
+    // AppLayout clips the Outlet (flex-1 overflow-hidden), so the page's
+    // outermost element must scroll or the Notifications Save button below
+    // the fold cannot be reached.
+    server.use(
+      http.get("/api/notifications/notifications/preferences", () =>
+        HttpResponse.json(DEFAULT_PREFS),
+      ),
+    );
+    const { container } = renderWithProviders(<SettingsPage />);
+    const save = await screen.findByRole("button", { name: "Save" });
+    const outer = container.firstElementChild as HTMLElement;
+    expect(outer).toHaveClass("h-full", "overflow-y-auto");
+    expect(outer).toContainElement(save);
+    expect(outer).toContainElement(screen.getByRole("heading", { name: "Settings", level: 1 }));
+  });
+
   it("shows the failed event on by default and sends an opt-out explicitly", async () => {
     // Issue #1077: DEFAULT_PREFS predates reservation.failed, so the toggle
     // starts checked; unchecking it must send the key as false.
