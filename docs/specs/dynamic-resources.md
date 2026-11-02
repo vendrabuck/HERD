@@ -290,7 +290,7 @@ goes live.
   teardown ran can no longer create an instance after the reservation ended (issue
   #1028). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`, `_verify_reservation_event`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_create_for_a_request_teardown_never_listed_creates_nothing`, `test_create_recheck_5xx_naks_before_any_recipe_call`)
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_create_for_a_request_teardown_never_listed_creates_nothing`, `test_create_recheck_5xx_naks_before_any_recipe_call`, `test_create_recheck_token_refusal_naks_then_redelivery_creates`)
 - **DYN-CREATE-4.** An event with no `reservation_id` is logged and acked with no work. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_handle_provision_requested`) \
   Pinned by: none
@@ -723,7 +723,7 @@ guidance: [TROUBLESHOOTING.md](../TROUBLESHOOTING.md).
   and with the row unchanged, so the terminal event is nacked and the redelivery
   destroys the instance (#1203 for the template, #1216 for the hypervisor and secret). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_recipe_deps`, `_raise_if_token_refused`, `_teardown_attempt`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_teardown_template_read_auth_error_raises_and_leaves_row_unchanged`, `test_teardown_config_read_auth_error_raises_and_leaves_row_unchanged`)
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_teardown_template_read_auth_error_raises_and_leaves_row_unchanged`, `test_teardown_config_read_auth_error_raises_and_leaves_row_unchanged`, `test_teardown_config_read_5xx_or_transport_error_raises_and_leaves_row_unchanged`)
 
 **Out of scope.** The wiring freeze and wiring teardown that run first
 (`provisioning-and-wiring.md`); the device release reservations makes

@@ -1896,10 +1896,10 @@ async def _last_applied():
         return state.last_applied_fork_version if state is not None else None
 
 
-async def _reconcile_through_inventory(execute_fn, denied_status, config_body, l3_routes=None):
-    """One full reconcile of a DUT-to-L3 wire with the real latest-config read, answered
-    `denied_status` when set and otherwise 200 with `config_body`; returns the requests
-    the transport did not expect."""
+def _inventory_config_patches(execute_fn, denied_status, config_body, l3_routes=None):
+    """The `_patches` set with the REAL latest-config read on an httpx MockTransport
+    answering `denied_status` when set and otherwise 200 with `config_body`. Returns
+    (patches, unexpected), `unexpected` recording any other request."""
     config_path = f"/devices/{SW_L3}/config-versions/latest/internal"
     unexpected: list = []
 
@@ -1914,19 +1914,31 @@ async def _reconcile_through_inventory(execute_fn, denied_status, config_body, l
     real_client = httpx.AsyncClient
     transport = httpx.MockTransport(handler)
     kwargs = {"l3_routes": l3_routes} if l3_routes is not None else {}
-    with ExitStack() as stack:
-        stack.enter_context(
-            patch(
-                "app.services.nats_consumer.httpx.AsyncClient",
-                new=lambda *a, **kw: real_client(transport=transport),
-            )
-        )
-        for p in _patches(
+    patches = [
+        # nats_consumer.httpx is the httpx module itself, so this also covers the
+        # client the wiring retry service opens.
+        patch(
+            "app.services.nats_consumer.httpx.AsyncClient",
+            new=lambda *a, **kw: real_client(transport=transport),
+        ),
+        *_patches(
             execute_fn,
             [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
             config_fetch=_fetch_latest_config,
             **kwargs,
-        ):
+        ),
+    ]
+    return patches, unexpected
+
+
+async def _reconcile_through_inventory(execute_fn, denied_status, config_body, l3_routes=None):
+    """One full reconcile of a DUT-to-L3 wire with the real latest-config read; returns
+    the requests the transport did not expect."""
+    patches, unexpected = _inventory_config_patches(
+        execute_fn, denied_status, config_body, l3_routes
+    )
+    with ExitStack() as stack:
+        for p in patches:
             stack.enter_context(p)
         await handle_wiring_changed(
             {"reservation_id": RES_ID, "fork_version": 1}, _db_session_factory()
@@ -1977,4 +1989,83 @@ async def test_config_read_auth_error_on_intent_gate_naks_not_unconfigured(statu
     assert {d for a, d in calls if a == "configure_route"} == {"10.20.0.0/24"}
     assert await _active_switches() == {SW_L3}
     assert await _last_applied() == 1
+    assert unexpected == []
+
+
+# The retry channels' configured-routes read (issue #1004 fallback): a FAILED row that
+# records no routes and has no intent is driven with the switch's configured routes, and
+# released with no driver call when there are none. Before #1216 a 401 or 403 on that
+# read was "no routes", so the row was RELEASED (outcome "released") with its switch's
+# routes never installed. Now the read raises, the row is skipped for this pass with
+# every column unchanged (outcome "still_failed"), and a later pass drives it.
+
+
+def _row_columns(row):
+    return {c.key: getattr(row, c.key) for c in RouteAssignment.__mapper__.column_attrs}
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_retry_tick_config_read_token_refusal_skips_the_row_then_drives_it(status):
+    from app.services.wiring_retry_service import run_wiring_retry_tick
+
+    await _refuse_first_adjacency()
+    [before] = await _rows()
+
+    execute_fn, calls = _l3_recorder()
+    patches, unexpected = _inventory_config_patches(execute_fn, status, None, l3_routes={})
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        stats = await run_wiring_retry_tick(_db_session_factory())
+
+    assert calls == [], "no driver session on a refused read"
+    assert stats["released"] == 0
+    assert stats["reconnected"] == 0
+    [after] = await _rows()
+    assert _row_columns(after) == _row_columns(before), "skipped, not released"
+
+    patches, _ = _inventory_config_patches(execute_fn, None, CONFIG_BY_SWITCH[SW_L3], l3_routes={})
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        stats = await run_wiring_retry_tick(_db_session_factory())
+
+    assert stats["reconnected"] == 1
+    assert {d for a, d in calls if a == "configure_route"} == {r["destination"] for r in ROUTES}
+    rows = await _rows()
+    assert [(r.status, r.routes) for r in rows] == [("ACTIVE", ROUTES)]
+    assert unexpected == []
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_manual_retry_config_read_token_refusal_reports_still_failed(status):
+    """The manual channel takes the same per-row skip: the row is reported
+    "still_failed" with every column unchanged (not "released", and not a 503: the
+    read's failure is caught per row, as a transport failure already was), and the next
+    manual retry, with inventory answering, reconnects it."""
+    from app.services.wiring_retry_service import reattempt_reservation
+
+    await _refuse_first_adjacency()
+    [before] = await _rows()
+
+    execute_fn, calls = _l3_recorder()
+    patches, unexpected = _inventory_config_patches(execute_fn, status, None, l3_routes={})
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+
+    assert [r["outcome"] for r in result["results"]] == ["still_failed"]
+    assert calls == []
+    [after] = await _rows()
+    assert _row_columns(after) == _row_columns(before)
+
+    patches, _ = _inventory_config_patches(execute_fn, None, CONFIG_BY_SWITCH[SW_L3], l3_routes={})
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+
+    assert [r["outcome"] for r in result["results"]] == ["reconnected"]
+    assert {d for a, d in calls if a == "configure_route"} == {r["destination"] for r in ROUTES}
     assert unexpected == []
