@@ -226,6 +226,24 @@ baseline config at boot (`infra/nos-test/srl/baseline.cli`), which clears the
 tag. If you see this error, the lab's baseline did not apply; `make nos-reset`
 rebuilds it from a clean image and reapplies the baseline.
 
+**`nos-test-srl` stays `(health: starting)` and `make nos-up` never returns, or
+a dialect test fails with "could not open an SSH session to the SR Linux node
+after 3 attempts".** The SR Linux healthcheck reports healthy only after the
+baseline landed AND `infra/nos-test/srl/ssh_ready.sh` read an `SSH-` banner from
+port 22 (issue #1263), and every test-side session retries a boot-time reset
+three times, two seconds apart. Either message means sshd on the node is not
+answering. See which half of the healthcheck fails, then run the probe by hand:
+
+```bash
+docker inspect --format '{{json .State.Health}}' nos-test-srl
+docker exec nos-test-srl bash /etc/opt/srlinux/ssh_ready.sh 22
+```
+
+A probe that prints `no SSH banner on port 22` on a node whose SSH port answers
+from the host (`ssh -p 2223 admin@127.0.0.1`) means the probe is looking in the
+wrong place, not that sshd is down; its header lists the namespaces and
+addresses it tries. Otherwise `make nos-reset` rebuilds the node.
+
 **A VRF-tagged L3 route test skips with a message about the `vrf`/`dummy` kernel
 modules.** The FRR node's VRF fixture (VRF `blue`, member interface `dummy0`)
 needs the **Docker host's** `vrf` and `dummy` kernel modules; a container cannot

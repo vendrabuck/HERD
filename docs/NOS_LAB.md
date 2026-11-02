@@ -254,6 +254,17 @@ make nos-detach
   both services declare a healthcheck, that the published ports do not
   collide with the dev or gate compose files' ports, and the shape of the
   checked-in SR Linux baseline file.
+- `tests/unit/test_nos_lab_ssh_readiness.py`, static plus local, runs in CI
+  with no lab (issue #1263): pins that the SR Linux healthcheck runs the SSH
+  banner probe after the baseline check and the FRR one keeps its `nc -z`,
+  runs `ssh_ready.sh` against fake servers on 127.0.0.1 (a banner passes; a
+  reset, a close, a non-SSH line, silence, and a closed port fail), and pins
+  the retry helper below. Every test-side netmiko session under
+  `tests/nos_lab/` opens through `tests/nos_lab/_lab_ssh.py`'s
+  `open_lab_session`, which retries a transport failure (`OSError`, which
+  covers `ConnectionResetError`, `EOFError`, `NetmikoTimeoutException`) at
+  most three times two seconds apart and never retries an authentication
+  failure; a driver under test still opens its own session unwrapped.
 - `tests/unit/test_seed_nos_lab_driver.py`, static, runs in CI with no lab
   or stack: pins that `seedtools.nos_lab`'s `seed_nos_lab` zips the
   real `drivers/srl_l2` and `drivers/frr_l3` packages from disk (never
@@ -375,7 +386,16 @@ The healthcheck proves the baseline actually landed, not merely that
 `sr_cli` answers: it checks that `/etc/opt/srlinux/config.json` (the saved
 startup config) exists and that the LAST setting the baseline applies
 (`ethernet-1/2 vlan-tagging`) reads back `true`. A healthy container
-therefore implies the whole baseline ran to completion.
+therefore implies the whole baseline ran to completion. It then proves SSH
+works (issue #1263): `infra/nos-test/srl/ssh_ready.sh`, mounted read-only,
+must read an `SSH-` version banner from port 22, so `make nos-up` returns
+only once sshd answers a new connection. A banner read, not the FRR node's
+`nc -z` port check, because the failure it closes was a socket that listens
+and then resets the connection during the banner exchange, which made the
+first SR Linux dialect test fail with `ConnectionResetError` on a node
+reported healthy. The script tries the `srbase-mgmt` network namespace (where
+SR Linux runs its management ssh-server) and then its own, and relies only on
+bash's `/dev/tcp`, `read -t`, `ip`, and, when present, `timeout`.
 
 ## The FRR node's VRF fixture
 
