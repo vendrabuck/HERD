@@ -744,7 +744,7 @@ user can see (`inventory.md`) and which resources ACL grants open to them (secti
 - **IAM-GROUP-11.** "Not Grouped" is found by its exact name every time; renaming or
   deleting it turns the automatic assignment off until the next service start recreates
   a group of that name. \
-  Enforced in: `services/auth/app/services/group_service.py` (`get_group_by_name`); `services/auth/app/main.py` (`_seed_not_grouped`) \
+  Enforced in: `services/auth/app/services/group_service.py` (`get_group_by_name`, `group_name_exists`); `services/auth/app/main.py` (`_seed_not_grouped`) \
   Pinned by: none
 - **IAM-GROUP-12.** The group detail page does not fetch the user list for a non-admin
   viewer. \
@@ -1232,6 +1232,13 @@ settings when the auth service starts.
   note in [ADMIN_HANDBOOK.md](../ADMIN_HANDBOOK.md). \
   Enforced in: `services/auth/app/main.py` (`_seed_superadmin`) \
   Pinned by: none
+- **IAM-BOOT-6.** The startup seeds' existence checks (a superadmin exists, the
+  configured email is registered, "Not Grouped" exists) select the id column only, so on
+  a schema stamped at the previous release, before `make migrate` runs, a column a later
+  release added to `users` or `user_groups` is never named and auth still boots
+  (issue #1261). \
+  Enforced in: `services/auth/app/services/auth_service.py` (`superadmin_exists`, `email_registered`); `services/auth/app/services/group_service.py` (`group_name_exists`); `services/auth/app/main.py` (`_seed_superadmin`, `_seed_not_grouped`) \
+  Pinned by: `services/auth/tests/test_startup_seed_schema.py` (`test_superadmin_existence_check_selects_the_id_only`, `test_startup_seeds_on_an_existing_stack_select_ids_only`, `test_seed_email_check_selects_the_id_only`, `test_seed_completes_on_a_users_table_without_the_profile_columns`, `test_seed_email_check_completes_on_a_users_table_without_the_profile_columns`)
 
 **Out of scope.** The config service's own sign-in and the first-run settings page are
 in `operations-and-observability.md`. The login form is disabled while the config

@@ -119,7 +119,24 @@ async def get_all_users(db: AsyncSession, skip: int = 0, limit: int = 50) -> tup
 
 
 async def superadmin_exists(db: AsyncSession) -> bool:
-    result = await db.execute(select(User).where(User.role == Role.SUPERADMIN))
+    """Whether any superadmin account exists.
+
+    Selects the id only (issue #1261): this runs at every startup, before
+    `make migrate` can, so it must never name a column a stamped schema from
+    the previous release may still lack. Reading the whole User model here
+    once kept auth from booting after a release added columns to users.
+    """
+    result = await db.execute(select(User.id).where(User.role == Role.SUPERADMIN).limit(1))
+    return result.scalar_one_or_none() is not None
+
+
+async def email_registered(db: AsyncSession, email: str) -> bool:
+    """Whether an account with this login email exists, reading the id only.
+
+    The startup seed's existence check (issue #1261); see superadmin_exists.
+    Callers that need the account itself use get_user_by_email.
+    """
+    result = await db.execute(select(User.id).where(User.email == email))
     return result.scalar_one_or_none() is not None
 
 

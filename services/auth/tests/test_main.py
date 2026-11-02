@@ -191,22 +191,30 @@ async def test_seed_not_grouped_handles_integrity_error():
         db.add(UserGroup(name="Not Grouped", description="Default"))
         await db.commit()
 
-    # Patch get_group_by_name to return None so it attempts the insert
-    original_get = get_group_by_name
-
-    async def fake_get(db, name):
-        if name == "Not Grouped":
-            return None
-        return await original_get(db, name)
+    # Make the seed's existence check answer "absent" so it attempts the
+    # insert. The seed imports group_name_exists at call time, so patching the
+    # module attribute reaches it; the assertion below proves the patch did.
+    fake_exists = AsyncMock(return_value=False)
 
     with (
         patch("app.main.AsyncSessionLocal", TestSessionLocal),
-        patch("app.services.group_service.get_group_by_name", side_effect=fake_get),
+        patch("app.services.group_service.group_name_exists", fake_exists),
     ):
         from app.main import _seed_not_grouped
 
         # Should not raise; IntegrityError is caught
         await _seed_not_grouped()
+
+    fake_exists.assert_awaited_once()
+    async with TestSessionLocal() as db:
+        from sqlalchemy import func, select
+
+        count = (
+            await db.execute(
+                select(func.count()).select_from(UserGroup).where(UserGroup.name == "Not Grouped")
+            )
+        ).scalar()
+        assert count == 1
 
 
 # --- lifespan ---

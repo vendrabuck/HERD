@@ -284,3 +284,15 @@ async def bulk_remove_members(
 async def get_group_by_name(db: AsyncSession, name: str) -> UserGroup | None:
     result = await db.execute(select(UserGroup).where(UserGroup.name == name))
     return result.scalar_one_or_none()
+
+
+async def group_name_exists(db: AsyncSession, name: str) -> bool:
+    """Whether a group of this exact name exists, reading the id only.
+
+    The startup seed's existence check (issue #1261): it runs before
+    `make migrate` can, so it must never name a column a stamped schema from
+    the previous release may still lack. Callers that need the group itself
+    use get_group_by_name.
+    """
+    result = await db.execute(select(UserGroup.id).where(UserGroup.name == name))
+    return result.scalar_one_or_none() is not None
