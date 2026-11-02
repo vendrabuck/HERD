@@ -27,6 +27,8 @@ class UserContact(BaseModel):
 
     Returned by the notifications service to address email and chat
     messages. Only the fields an outbound dispatcher needs; no secrets.
+    `email` is the delivery address: contact_email when set, else the login
+    email (issue #1252).
     """
 
     user_id: uuid.UUID
@@ -81,12 +83,19 @@ async def get_user_contact(
     messages without holding a real JWT. Inactive users are still
     resolvable, the dispatch decision is made by the caller. 404 when the
     user does not exist so the caller can skip the channel cleanly.
+
+    `email` is the account's contact_email when one is set (issue #1252),
+    else the login email; the response shape is unchanged, so notifications
+    needs no change. A changed address reaches notifications within its
+    contact cache TTL.
     """
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
-    return UserContact(user_id=user.id, email=user.email, username=user.username)
+    return UserContact(
+        user_id=user.id, email=user.contact_email or user.email, username=user.username
+    )
 
 
 @router.get("/internal/users/{user_id}/groups", response_model=list[GroupResponse])
