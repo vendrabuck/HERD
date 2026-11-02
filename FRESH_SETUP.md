@@ -54,6 +54,8 @@ NATS_URL=nats://nats:4222
 The `AUTH_SECRET_KEY` and `INTERNAL_API_TOKEN` should be unique random strings. Every backend service except config refuses to start while `AUTH_SECRET_KEY` is blank, still a `<...>` placeholder, or not usable as an HMAC key (a PEM block or ssh key, a truncated or lone `-----BEGIN` line included, or a JSON Web Key), and `AUTH_ALGORITHM` must be `HS256`, `HS384`, or `HS512`.
 The superadmin account is created on first startup only; these values are ignored on subsequent restarts.
 
+By default Traefik publishes the gateway (ports 80 and 443) on every IPv4 interface, so the stack answers at `https://localhost` and at each address the host has. To serve it on one address only, for example the wired NIC of a host that also has wifi, add `HERD_GATEWAY_BIND=<that address>` to `.env` (issue #1256; `.env.example` carries a commented example). `localhost` and every other interface are then refused, and the Makefile's seed, test, and gate targets address the stack at `https://<that address>` instead of `https://localhost`; `make gateway-url` prints the URL it derived. A browser at an IP address still warns about the certificate (step 3 below, issue #1239).
+
 `SECRETS_KEK` is the encryption key for the secrets service (base64-encoded 32
 bytes, not hex). It is required for `make prod`; the dev stack (`make up`)
 supplies a dev-only key via `docker-compose.override.yml` so you can defer it
@@ -107,7 +109,7 @@ make logs
 
 ## 6. Access the application
 
-- Web UI: `https://<your-host-ip>` (or `https://localhost`)
+- Web UI: `https://<your-host-ip>` (or `https://localhost`); with `HERD_GATEWAY_BIND` set, only `https://<that address>`, the URL `make gateway-url` prints
 - HTTP auto-redirects to HTTPS
 - Traefik dashboard: bound to loopback only (`127.0.0.1:8080` on the Docker host, issue #708). The dashboard and its `/api` have no authentication, so it is never published on a routable interface under `make prod`. To view it from another machine, open an SSH tunnel and browse the local end: `ssh -L 8080:127.0.0.1:8080 <user>@<your-host-ip>`, then `http://localhost:8080`. This applies to `make up` as well; on the Docker host itself `http://localhost:8080` works directly.
 - API endpoints: `https://<your-host-ip>/api/auth`, `/api/inventory`, `/api/reservations`, `/api/cabling`, `/api/acl`, `/api/execution`, `/api/ai`, `/api/config`, `/api/notifications`, `/api/user-profile`, `/api/v1`, `/api/secrets`

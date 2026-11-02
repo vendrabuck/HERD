@@ -58,4 +58,4 @@ locust -f locustfile.py \
 
 - `SEED_EMAIL` / `SEED_PASSWORD`: admin credentials (default: seed script values)
 - `SEED_USER_EMAIL` / `SEED_USER_PASSWORD`: regular user credentials
-- `HERD_BASE_URL`: stack URL (default: https://localhost)
+- `HERD_BASE_URL`: stack URL; `make test-load` drops a trailing `/api` (default under make: the gateway URL `make gateway-url` prints, from `HERD_GATEWAY_BIND`; otherwise https://localhost)
