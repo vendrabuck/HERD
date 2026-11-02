@@ -214,10 +214,12 @@ async def create_user(
     username: str,
     password: str,
     role: Role = Role.USER,
+    full_name: str | None = None,
 ) -> User:
     user = User(
         email=email,
         username=username,
+        full_name=full_name or username,
         hashed_password=get_password_hash(password),
         auth_source="local",
         role=role,
@@ -261,6 +263,10 @@ async def create_ldap_user(
     user = User(
         email=email,
         username=username,
+        # Phase 1 reads no directory display-name attribute (issue #1252), so
+        # an LDAP account's name starts as its username and the user may edit
+        # it; sync never writes full_name.
+        full_name=username,
         hashed_password=None,
         auth_source="ldap",
         role=Role.USER,
@@ -300,6 +306,54 @@ async def set_user_role(
     await db.commit()
     await db.refresh(user)
     return user
+
+
+# The profile columns a profile write may change (issue #1252). The routes'
+# request schema accepts only these keys; this set is the second line, so a
+# caller handing update_user_profile any other column name gets a ValueError
+# instead of a silent write to role, email, or is_active.
+PROFILE_FIELDS = frozenset({"full_name", "contact_email", "phone"})
+
+
+async def update_user_profile(
+    db: AsyncSession,
+    target_user_id: uuid.UUID,
+    changes: dict[str, str | None],
+    *,
+    modified_by: uuid.UUID,
+) -> tuple[User, list[str]] | None:
+    """Apply a profile PATCH to one account (issue #1252).
+
+    `changes` holds only the keys the caller sent (an omitted key is
+    unchanged). Every accepted write sets modified_by to the caller, a self
+    edit included. Returns the refreshed user and the sorted NAMES of the
+    fields whose stored value actually changed, or None for an unknown id.
+    """
+    unknown = set(changes) - PROFILE_FIELDS
+    if unknown:
+        raise ValueError(f"Not profile fields: {sorted(unknown)}")
+    user = await get_user_by_id(db, target_user_id)
+    if not user:
+        return None
+    changed = sorted(name for name, value in changes.items() if getattr(user, name) != value)
+    for name, value in changes.items():
+        setattr(user, name, value)
+    user.modified_by = modified_by
+    await db.commit()
+    await db.refresh(user)
+    # Field NAMES only, never values: contact_email and phone are personal
+    # data, and key-name redaction cannot see inside a value.
+    logger.info(
+        "User profile updated: %s by %s",
+        target_user_id,
+        modified_by,
+        extra={
+            "action": "user_profile_updated",
+            "user_id": str(target_user_id),
+            "changed_fields": changed,
+        },
+    )
+    return user, changed
 
 
 async def set_user_active(

@@ -5,14 +5,20 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.dependencies.auth import require_role
+from app.dependencies.auth import get_current_user, get_effective_role, require_role
 from app.models.user import Role, User
-from app.schemas.auth import PaginatedUserResponse, SetRoleRequest, UserResponse
+from app.schemas.auth import (
+    PaginatedUserResponse,
+    ProfileUpdateRequest,
+    SetRoleRequest,
+    UserResponse,
+)
 from app.services.auth_service import (
     get_all_users,
     get_user_by_id,
     set_user_active,
     set_user_role,
+    update_user_profile,
 )
 
 logger = logging.getLogger(__name__)
@@ -21,6 +27,10 @@ router = APIRouter(prefix="/users", tags=["admin"])
 
 _superadmin_only = Depends(require_role(Role.SUPERADMIN))
 _admin_or_superadmin = Depends(require_role(Role.ADMIN, Role.SUPERADMIN))
+
+# Roles that may edit ANY account's profile (issue #1252). Judged against the
+# caller's EFFECTIVE role (get_effective_role), never the bare database role.
+PROFILE_EDIT_ANY_ROLES = frozenset({Role.ADMIN, Role.SUPERADMIN})
 
 
 @router.get("", response_model=PaginatedUserResponse)
@@ -158,3 +168,29 @@ async def deactivate_user(
         extra={"action": "user_deactivate", "user_id": str(user_id)},
     )
     return updated
+
+
+@router.patch("/{user_id}/profile", response_model=UserResponse)
+async def update_user_profile_by_id(
+    user_id: uuid.UUID,
+    body: ProfileUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    caller_role: Role = Depends(get_effective_role),
+):
+    """Edit one account's profile: full_name, contact_email, phone (issue #1252).
+
+    Self or admin, deliberately NOT require_role (which answers 403 to every
+    non-admin): an admin or superadmin may name any account, active or not,
+    the superadmin's included. A caller whose effective role is user may name
+    only their own id; any other id answers the same 404 "User not found" an
+    unknown id does, decided BEFORE any lookup, so the answer says nothing
+    about whether that account exists.
+    """
+    not_found = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if caller_role not in PROFILE_EDIT_ANY_ROLES and user_id != current_user.id:
+        raise not_found
+    result = await update_user_profile(db, user_id, body.changes(), modified_by=current_user.id)
+    if result is None:
+        raise not_found
+    return result[0]

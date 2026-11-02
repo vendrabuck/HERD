@@ -9,6 +9,7 @@ from app.models.user import User
 from app.schemas.auth import (
     LoginRequest,
     LogoutRequest,
+    ProfileUpdateRequest,
     RefreshRequest,
     RegisterRequest,
     TokenResponse,
@@ -22,6 +23,7 @@ from app.services.auth_service import (
     get_user_by_username,
     revoke_refresh_token,
     rotate_refresh_token,
+    update_user_profile,
 )
 
 router = APIRouter(tags=["auth"])
@@ -41,7 +43,9 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     if await get_user_by_email(db, body.email) or await get_user_by_username(db, body.username):
         raise HTTPException(status_code=409, detail="Email or username already exists")
     try:
-        user = await create_user(db, body.email, body.username, body.password)
+        user = await create_user(
+            db, body.email, body.username, body.password, full_name=body.full_name
+        )
     except IntegrityError:
         raise HTTPException(status_code=409, detail="Email or username already exists")
     return user
@@ -80,3 +84,22 @@ async def logout(body: LogoutRequest, db: AsyncSession = Depends(get_db)):
 @router.get("/me", response_model=UserResponse)
 async def me(current_user: User = Depends(get_current_user)):
     return current_user
+
+
+@router.patch("/me/profile", response_model=UserResponse)
+async def update_my_profile(
+    body: ProfileUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Edit the caller's own profile: full_name, contact_email, phone (issue #1252).
+
+    Any signed-in active account. Login email, username, and role are not
+    accepted here (the request schema forbids unknown keys).
+    """
+    result = await update_user_profile(
+        db, current_user.id, body.changes(), modified_by=current_user.id
+    )
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    return result[0]
