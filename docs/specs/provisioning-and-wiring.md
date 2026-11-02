@@ -433,15 +433,18 @@ support.
   `provision_requested` needs `PENDING_PROVISION`; `wiring_changed` needs `ACTIVE`. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_EVENT_CORROBORATION_RULES`, `_verify_reservation_event`) \
   Pinned by: `services/execution/tests/test_nats_consumer_event_verification.py` (`test_event_status_table`, `test_updated_for_a_pending_reservation_is_verified`)
-- **WIRE-GATE-2.** A status that does not corroborate, a 404, or any other answer below
-  500 that is not 200 acks the message without running the handler, logged
-  `nats_event_unverified` with the reported status and a reason. \
+- **WIRE-GATE-2.** A 200 whose status does not corroborate, or a 404, acks the message
+  without running the handler, logged `nats_event_unverified` with the reported status
+  and a reason; no other answer does (WIRE-GATE-3). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_verify_reservation_event`, `process_reservation_message`) \
   Pinned by: `services/execution/tests/test_nats_consumer_event_verification.py` (`test_unverified_terminal_event_acks_without_running_the_handler`, `test_gate_404_acks_without_running_the_handler`, `test_created_for_a_cancelled_reservation_is_unverified`); `tests/integration/test_event_verification_gate.py` (`test_forged_cancelled_event_for_an_active_reservation_is_ignored`); `tests/integration/test_wiring_changed_reconcile.py` (`test_wiring_changed_for_completed_reservation_does_not_reconnect`)
-- **WIRE-GATE-3.** A 5xx or transport error from that check raises
-  `TransientUpstreamError`, so the message is nacked and retried (fail closed). \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_get_internal`, `_verify_reservation_event`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_event_verification.py` (`test_5xx_raises_transient_upstream_error`, `test_transport_error_raises_transient_upstream_error`, `test_gate_transport_failure_naks_like_any_other_transient_error`)
+- **WIRE-GATE-3.** A transport error or any other answer from that check (a 5xx, and
+  since #1215 a 401 or 403 during an `INTERNAL_API_TOKEN` rotation, a 409, or a 422 for
+  a malformed id) raises `TransientUpstreamError`, so the message is nacked and retried,
+  and dead-lettered after the backoff schedule when the answer persists (fail closed:
+  the handler never runs on it, and the event is never acked unrun). \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_get_internal`, `_internal_record_found`, `_verify_reservation_event`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_event_verification.py` (`test_5xx_raises_transient_upstream_error`, `test_transport_error_raises_transient_upstream_error`, `test_gate_transport_failure_naks_like_any_other_transient_error`, `test_verifier_raises_transient_on_every_status_but_200_and_404`, `test_gate_auth_error_naks_and_never_runs_or_drops_the_event`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_cancelled_event_whose_check_is_refused_naks_then_tears_down`)
 - **WIRE-GATE-4.** An event with no table entry, or with no `reservation_id`, makes no
   call and goes straight to its handler. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_verify_reservation_event`) \
@@ -577,11 +580,13 @@ state transitions are WIRE-ORDER-1 and WIRE-FREEZE-1.
   Enforced in: `services/execution/app/services/nats_consumer.py` (`handle_wiring_changed`) \
   Pinned by: `tests/integration/test_device_set_patch_wiring.py` (`test_patch_add_wires_nothing_until_fork_save_and_remove_releases`)
 - **WIRE-ORDER-14.** A switch's latest-config lookup in inventory that answers 5xx or
-  fails in transport raises `TransientUpstreamError` (nack); any other non-200 reads as
-  no config (split from WIRE-ORDER-11 by #1203, which changed only the device and
-  template lookups). \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_latest_config`) \
-  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_fetch_latest_config_returns_json_on_200`, `test_fetch_latest_config_returns_none_on_404`, `test_fetch_latest_config_raises_on_5xx`)
+  fails in transport raises `TransientUpstreamError` (nack), and since #1216 so does a
+  401 or 403 (an `INTERNAL_API_TOKEN` rotation); any other non-200 reads as no config, by
+  decision, since a misread there degrades one switch's routes and not a whole desired
+  set (split from WIRE-ORDER-11 by #1203, which moved the device and template lookups
+  to 404-only). \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_latest_config`, `_raise_if_token_refused`) \
+  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_fetch_latest_config_returns_json_on_200`, `test_fetch_latest_config_returns_none_on_404`, `test_fetch_latest_config_raises_on_5xx`, `test_sibling_read_raises_transient_on_a_token_refusal`, `test_sibling_read_keeps_reading_other_4xx_as_absent`)
 
 **Out of scope.** When reservations stages the event and the ledger that guarantees it
 (`reservations.md`, RES-EVENT-2, RES-EVENT-3); what the fork contains (`topology.md`).
@@ -901,10 +906,13 @@ removes exactly that when the switch is no longer needed.
   keyword. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_drive_l3_route`, `_apply_l3_adjacency`) \
   Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_declaring_driver_receives_virtual_router_null_for_a_default_table_route`, `test_non_declaring_driver_is_never_handed_the_virtual_router_keyword`); `tests/integration/test_l3_intent_execution.py` (`test_vrf_route_reaches_a_declaring_driver_with_the_keyword`, `test_a_default_table_route_still_carries_no_vrf_to_a_non_declaring_driver`)
-- **WIRE-L3-18.** A latest-config read that answers 5xx or fails in transport nacks the
-  message; a 404 means the switch has no config. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_latest_config`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_config_fetch_5xx_raises_transient_for_nak`, `test_config_fetch_404_returns_none`)
+- **WIRE-L3-18.** A latest-config read that answers 5xx, fails in transport, or (since
+  #1216) answers 401 or 403 nacks the message before any driver call, with no route row
+  written and the fork version unstamped: the switch is neither skipped as having no
+  routes nor refused `l3_switch_unconfigured`, and the redelivery provisions it. A 404
+  (or any other non-200 below 500, WIRE-ORDER-14) means the switch has no config. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_latest_config`, `_raise_if_token_refused`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_config_fetch_5xx_raises_transient_for_nak`, `test_config_fetch_404_returns_none`, `test_config_read_auth_error_without_intent_naks_then_installs_routes`, `test_config_read_auth_error_on_intent_gate_naks_not_unconfigured`)
 - **WIRE-L3-19.** A provision of a switch that has a FAILED pin (a save rebuilding a
   switch whose provision or delta failed, or a build or release retry) first drives
   `remove_route` for the pin's stored routes that its own route set does not name, then
@@ -1332,11 +1340,11 @@ Events are in section 6; the internal routes this area serves are in section 7.
 
 | Direction | Peer | Call | Purpose | On failure |
 |---|---|---|---|---|
-| Out | reservations | `GET /internal/{id}` (internal token, 10 s) | corroborate an event's status | Fail closed: 5xx or transport nacks; 404 or another non-200 acks without acting (WIRE-GATE-2, WIRE-GATE-3) |
+| Out | reservations | `GET /internal/{id}` (internal token, 10 s) | corroborate an event's status | Fail closed: a 404 or a non-corroborating 200 acks without acting (WIRE-GATE-2); any other answer (401, 403, 409, 422, 5xx) or a transport error nacks (WIRE-GATE-3) |
 | Out | cabling | `GET /internal/forks/{id}` (internal token, 10 s) | the intended hops and routing intent | Fail closed: 404 is an empty set; any other non-200 or transport nacks the event (WIRE-ORDER-6), and a retry drives no build row of that reservation (WIRE-RETRY-7) |
 | Out | cabling | `GET /fabric/internal?device_id` (internal token, 10 s) | the current fabric of an L2 switch, the reachability test for VLAN uniqueness | Fail closed: any non-200, transport error, or bad body nacks the event; in a retry the tick logs it and the manual route answers 503 (WIRE-VLAN-6) |
 | Out | inventory | `GET /devices/{id}/internal`, `GET /templates/{id}/internal` (internal token, 10 s) | classify hop endpoints, load switch drivers | any non-200 other than 404, or a transport error, nacks the event (WIRE-ORDER-11); in a retry the tick logs it and the manual route answers 503; a 404 reads as missing (WIRE-PAIR-4, WIRE-L1-3) |
-| Out | inventory | `GET /devices/{id}/config-versions/latest/internal` (internal token, 10 s) | L3 config routes and the drive gate | 5xx or transport nacks (WIRE-L3-18); 404 means no config (WIRE-L3-4, WIRE-L3-16) |
+| Out | inventory | `GET /devices/{id}/config-versions/latest/internal` (internal token, 10 s) | L3 config routes and the drive gate | 5xx, 401, 403, or transport nacks (WIRE-ORDER-14, WIRE-L3-18); 404 or another non-200 below 500 means no config (WIRE-L3-4, WIRE-L3-16) |
 | Out | inventory | `GET /drivers/{id}/internal-download` (through the driver loader) | fetch a driver package on a cache miss | The switch's rows are parked FAILED and retryable by both retry channels; a broken package is parked non-retryable (WIRE-DRIVER-7); in the VRF capability check a failed download nacks instead (WIRE-L3-14) |
 | Out | driver package | `login`, `connect_ports`, `disconnect_ports`, `create_vlan`, `delete_vlan`, `add_to_vlan`, `remove_from_vlan`, `configure_route`, `remove_route`, `logout` in the sandbox | change the switch | Three attempts in line, then a FAILED row; never nacks (WIRE-DRIVER-2, WIRE-DRIVER-4) |
 | Out | NATS | `herd.reservations.dlq.execution` publish | dead-letter a message | Logged; the message is still acked (WIRE-CONSUME-12) |

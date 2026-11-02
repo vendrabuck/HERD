@@ -20,6 +20,7 @@ import uuid
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from app.database import Base
 from app.models.route_assignment import RouteAssignment
@@ -1875,3 +1876,105 @@ async def test_apply_l3_adjacency_provision_with_no_routes_drives_and_records_no
     assert calls == []
     rows = await _rows()
     assert [(r.status, r.last_error) for r in rows] == [("FAILED", "l3_vrf_unsupported")]
+
+
+# --- issue #1216: a 401 or 403 on the latest-config read NAKs, never "no config" ---
+#
+# Inventory answers a wrong X-Internal-Token with 403 "Invalid internal token". Before
+# #1216 _fetch_latest_config read every answer below 500 other than 200 as "no config":
+# with no intent the switch was skipped as having no routes (none installed) while the
+# fork version was stamped, so nothing drove it again; with intent awaiting
+# re-validation the switch landed FAILED with the misleading `l3_switch_unconfigured`.
+# These run the REAL _fetch_latest_config on an httpx MockTransport.
+
+
+async def _last_applied():
+    from app.services.l1_assignment_service import get_wiring_state
+
+    async with TestSessionLocal() as s:
+        state = await get_wiring_state(s, RES_ID)
+        return state.last_applied_fork_version if state is not None else None
+
+
+async def _reconcile_through_inventory(execute_fn, denied_status, config_body, l3_routes=None):
+    """One full reconcile of a DUT-to-L3 wire with the real latest-config read, answered
+    `denied_status` when set and otherwise 200 with `config_body`; returns the requests
+    the transport did not expect."""
+    config_path = f"/devices/{SW_L3}/config-versions/latest/internal"
+    unexpected: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == config_path:
+            if denied_status is not None:
+                return httpx.Response(denied_status, json={"detail": "Invalid internal token"})
+            return httpx.Response(200, json=config_body)
+        unexpected.append((request.method, str(request.url)))
+        return httpx.Response(404, json={"detail": "unexpected request"})
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    kwargs = {"l3_routes": l3_routes} if l3_routes is not None else {}
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                "app.services.nats_consumer.httpx.AsyncClient",
+                new=lambda *a, **kw: real_client(transport=transport),
+            )
+        )
+        for p in _patches(
+            execute_fn,
+            [_wire(DUT1, "eth0", SW_L3, "ge-0/0/1")],
+            config_fetch=_fetch_latest_config,
+            **kwargs,
+        ):
+            stack.enter_context(p)
+        await handle_wiring_changed(
+            {"reservation_id": RES_ID, "fork_version": 1}, _db_session_factory()
+        )
+    return unexpected
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_config_read_auth_error_without_intent_naks_then_installs_routes(status):
+    """No intent: the switch's configured routes are what is provisioned. A 401 or 403
+    on the latest-config read raises TransientUpstreamError (NAK), drives nothing,
+    writes no route row, and leaves the fork version unstamped; the redelivery
+    installs the configured routes and stamps the version."""
+    execute_fn, calls = _l3_recorder()
+    with pytest.raises(TransientUpstreamError) as exc_info:
+        await _reconcile_through_inventory(execute_fn, status, None)
+    assert str(exc_info.value) == f"fetch latest config for device {SW_L3}: upstream {status}"
+    assert calls == []
+    assert await _rows() == []
+    assert await _last_applied() is None, "a NAK must not stamp the fork version"
+
+    unexpected = await _reconcile_through_inventory(execute_fn, None, CONFIG_BY_SWITCH[SW_L3])
+    assert {d for a, d in calls if a == "configure_route"} == {"10.0.0.0/24", "10.1.0.0/24"}
+    assert await _active_switches() == {SW_L3}
+    assert (await _rows("ACTIVE"))[0].routes == ROUTES
+    assert await _last_applied() == 1
+    assert unexpected == []
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_config_read_auth_error_on_intent_gate_naks_not_unconfigured(status):
+    """Intent awaiting re-validation (no validation stamp): a 401 or 403 on the
+    latest-config read raises TransientUpstreamError (NAK) instead of landing the switch
+    FAILED `l3_switch_unconfigured`, and drives nothing; the redelivery re-validates
+    against the real config and drives the route."""
+    intent = {SW_L3: [_intent_route("10.20.0.0/24", "eth1", validated_config_version_id=None)]}
+    execute_fn, calls = _l3_recorder()
+    with pytest.raises(TransientUpstreamError) as exc_info:
+        await _reconcile_through_inventory(execute_fn, status, None, l3_routes=intent)
+    assert str(exc_info.value) == f"fetch latest config for device {SW_L3}: upstream {status}"
+    assert calls == []
+    assert await _rows() == [], "no FAILED row, in particular no l3_switch_unconfigured"
+    assert await _last_applied() is None
+
+    unexpected = await _reconcile_through_inventory(
+        execute_fn, None, await _config_with_interfaces(SW_L3), l3_routes=intent
+    )
+    assert {d for a, d in calls if a == "configure_route"} == {"10.20.0.0/24"}
+    assert await _active_switches() == {SW_L3}
+    assert await _last_applied() == 1
+    assert unexpected == []

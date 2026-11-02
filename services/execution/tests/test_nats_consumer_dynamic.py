@@ -3002,3 +3002,160 @@ async def test_teardown_template_read_auth_error_raises_and_leaves_row_unchanged
     rows = await _rows()
     assert [r.status for r in rows] == ["DESTROYED"]
     assert unexpected == []
+
+
+# --- issue #1216: a non-404 answer to the hypervisor or secret read is transient ---
+#
+# Inventory and secrets answer a wrong X-Internal-Token with 403 "Invalid internal
+# token". Before #1216 the hypervisor and secret reads read any answer below 500 other
+# than 200 as missing: a create raised PermanentEventError on its first delivery (DLQ,
+# failure callback, reservation FAILED instead of retried), and a teardown left the row
+# live with `recipe_config_missing` and never destroyed the VM. The REAL reads run on
+# the httpx MockTransport above.
+
+
+def _config_read_path(resource):
+    from app.config import settings
+
+    if resource == "hypervisor":
+        return f"/hypervisors/{HYPERVISOR_ID}/internal"
+    return httpx.URL(f"{settings.secrets_service_url}/internal/secrets/{SECRET_ID}/value").path
+
+
+def _config_read_what(resource):
+    if resource == "hypervisor":
+        return f"fetch hypervisor {HYPERVISOR_ID}"
+    return f"fetch secret {SECRET_ID}"
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("resource", ["hypervisor", "secret"])
+async def test_create_config_read_auth_error_naks_then_redelivery_creates(resource, status, caplog):
+    """A provision_requested whose hypervisor or secret read answers 401 or 403 NAKs
+    with the backoff delay: no DLQ publish, no failure callback, no
+    `nats_dlq_permanent`, no ledger row, no recipe call. The redelivery of the same
+    message, with the read answering 200, creates the instance and reports success."""
+    from app.services.nats_consumer import NATS_NAK_BACKOFF_SECONDS
+
+    calls, execute = _recipe_execute({"create_instance": CREATE_OK})
+    posted = AsyncMock()
+    js = MagicMock()
+    js.publish = AsyncMock()
+    msg = _provision_msg(1)
+    unexpected: list = []
+    denied = {_config_read_path(resource): status}
+    real_reads = {"_fetch_template", "_fetch_hypervisor", "_fetch_secret_value"}
+
+    def run_patches():
+        patches = [p for p in _create_patches(execute) if p.attribute not in real_reads]
+        patches.append(_inventory_transport(denied, unexpected))
+        patches.append(patch("app.services.nats_consumer._post_provision_result", new=posted))
+        return patches
+
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in run_patches():
+            stack.enter_context(p)
+        result = await process_reservation_message(
+            msg, js, handle_reservation_event, _db_session_factory()
+        )
+
+    assert result == "nak"
+    msg.nak.assert_awaited_once_with(delay=NATS_NAK_BACKOFF_SECONDS[0])
+    msg.ack.assert_not_awaited()
+    js.publish.assert_not_awaited()
+    posted.assert_not_awaited()
+    actions = [getattr(r, "action", None) for r in caplog.records]
+    assert "nats_dlq_permanent" not in actions
+    [nak] = [r for r in caplog.records if getattr(r, "action", None) == "nats_message_nak"]
+    assert isinstance(nak.exc_info[1], TransientUpstreamError)
+    assert str(nak.exc_info[1]) == f"{_config_read_what(resource)}: upstream {status}"
+    assert await _rows() == []
+    assert calls == []
+
+    denied.clear()
+    redelivery = MagicMock()
+    redelivery.data = msg.data
+    redelivery.metadata = SimpleNamespace(num_delivered=2)
+    redelivery.ack = AsyncMock()
+    redelivery.nak = AsyncMock()
+    with ExitStack() as stack:
+        for p in run_patches():
+            stack.enter_context(p)
+        result = await process_reservation_message(
+            redelivery, js, handle_reservation_event, _db_session_factory()
+        )
+
+    assert result == "ack"
+    redelivery.nak.assert_not_awaited()
+    js.publish.assert_not_awaited()
+    assert [c[0] for c in calls] == ["login", "create_instance", "logout"]
+    rows = await _rows()
+    assert [(r.status, r.instance_ref) for r in rows] == [("ACTIVE", "vm-100")]
+    posted.assert_awaited_once()
+    assert posted.await_args.kwargs["succeeded"] is True
+    assert unexpected == []
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("resource", ["hypervisor", "secret"])
+@pytest.mark.parametrize("seed", ["keyed_creating", "by_ref_active"])
+async def test_teardown_config_read_auth_error_raises_and_leaves_row_unchanged(
+    seed, resource, status, caplog
+):
+    """A terminal event whose dynamic teardown reads the hypervisor or secret and gets
+    401 or 403 raises TransientUpstreamError (the consumer NAKs), leaves the ledger row
+    exactly as it was, runs no recipe step, and logs no `recipe_config_missing`; the
+    redelivery, with the read answering, destroys the instance and retires the row."""
+    if seed == "keyed_creating":
+        await _seed_creating()
+    else:
+        await _seed_active()
+
+    async def snapshot():
+        return [
+            {c.key: getattr(r, c.key) for c in DynamicInstance.__mapper__.column_attrs}
+            for r in await _rows()
+        ]
+
+    before = await snapshot()
+    calls, execute = _recipe_execute({"destroy_instance": DESTROY_OK})
+    delete = AsyncMock(return_value=True)
+    unexpected: list = []
+    event = {
+        "event": "reservation.cancelled",
+        "reservation_id": RES_ID,
+        "user_id": USER_ID,
+        "device_ids": [],
+    }
+
+    def patches(denied):
+        return [
+            _inventory_transport(denied, unexpected),
+            patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/r")),
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute),
+            patch("app.services.nats_consumer._delete_dynamic_device", new=delete),
+            patch("app.services.nats_consumer.apply_reservation_event_tiers", new=AsyncMock()),
+        ]
+
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in patches({_config_read_path(resource): status}):
+            stack.enter_context(p)
+        with pytest.raises(TransientUpstreamError) as exc_info:
+            await handle_reservation_event(event, _db_session_factory())
+
+    assert str(exc_info.value) == f"{_config_read_what(resource)}: upstream {status}"
+    assert await snapshot() == before
+    assert calls == []
+    delete.assert_not_awaited()
+    assert not [r for r in caplog.records if getattr(r, "reason", None) == "recipe_config_missing"]
+    assert not [r for r in caplog.records if "Cannot load recipe deps" in r.getMessage()]
+
+    with ExitStack() as stack:
+        for p in patches({}):
+            stack.enter_context(p)
+        await handle_reservation_event(event, _db_session_factory())
+
+    assert [c[0] for c in calls] == ["login", "destroy_instance", "logout"]
+    rows = await _rows()
+    assert [r.status for r in rows] == ["DESTROYED"]
+    assert unexpected == []

@@ -212,7 +212,11 @@ class TransientUpstreamError(RuntimeError):
     Since issue #1203 the switch device and template reads (_fetch_device and
     _fetch_template, through _inventory_record_or_none) also raise it on every
     OTHER non-200 (a 401 or 403 during an INTERNAL_API_TOKEN rotation, a 409,
-    a 422), because their None pins the switch's wiring rows as unresolvable.
+    a 422), because their None pins the switch's wiring rows as unresolvable,
+    and since issue #1215 so does the event corroboration check. Since issue
+    #1216 the latest-config, hypervisor, and secret reads raise it on a 401 or
+    403 too (_raise_if_token_refused), and still read every other answer below
+    500 as absent.
     """
 
 
@@ -240,6 +244,51 @@ async def _get_internal(client, url, *, what, **kwargs):
     if resp.status_code >= 500:
         raise TransientUpstreamError(f"{what}: upstream {resp.status_code}")
     return resp
+
+
+def _internal_record_found(resp, *, what: str) -> bool:
+    """Judge an internal read's status: True on a 200, False on a 404, the ONLY
+    answer that means the record is absent; every other status raises
+    TransientUpstreamError with the "<what>: upstream <status>" text _get_internal
+    uses for a 5xx. The rule of the switch device and template reads (issue #1203,
+    through _inventory_record_or_none) and of the event corroboration check (issue
+    #1215), whose answer decides a whole switch's rows or a whole event.
+
+    The services answer a wrong X-Internal-Token with 403 "Invalid internal token",
+    so a 401 or 403 (an INTERNAL_API_TOKEN rotation), a 409, or a 422 says nothing
+    about whether the record exists. Raising NAKs the message so it is retried once
+    the peer answers, and a persistent answer is dead-lettered after the normal
+    backoff and can be replayed. Every caller passes the response _get_internal
+    returned, so a 5xx never reaches here.
+    """
+    if resp.status_code == 404:
+        return False
+    if resp.status_code != 200:
+        raise TransientUpstreamError(f"{what}: upstream {resp.status_code}")
+    return True
+
+
+# The statuses an internal endpoint answers when it refuses the caller's
+# X-Internal-Token (every service answers a wrong token with 403 "Invalid internal
+# token"); during an INTERNAL_API_TOKEN rotation they say nothing about the record.
+_TOKEN_REFUSED_STATUSES = (401, 403)
+
+
+def _raise_if_token_refused(resp, *, what: str) -> None:
+    """Raise TransientUpstreamError ("<what>: upstream <status>") on a 401 or 403
+    (issue #1216); return for any other answer, which the caller judges as before.
+
+    For the latest-config, hypervisor, and secret reads, which deliberately keep
+    reading every other answer below 500 that is not a 200 as absent: a misread
+    there degrades one connection, not a whole desired set, so they are not moved
+    to the 404-only rule of _internal_record_found. A token refusal is the one
+    answer that is common (every rotation) and stranding: read as absent it
+    leaves a dynamic instance running after teardown, dead-letters a create as a
+    missing config, or leaves an L3 switch's routes uninstalled while the fork
+    version is stamped.
+    """
+    if resp.status_code in _TOKEN_REFUSED_STATUSES:
+        raise TransientUpstreamError(f"{what}: upstream {resp.status_code}")
 
 
 # --- Reservation-event corroboration gate ------------------------------------
@@ -360,12 +409,16 @@ async def _verify_reservation_event(
     (not subject to this gate; proceed as before). Otherwise returns a
     ReservationEventVerification: `verified=True` means the reported status
     corroborates the event and the caller should proceed; `verified=False`
-    means it does not (including a 404, "reservation not found", and any other
-    non-200 the underlying GET did not already turn into a raised error) and
-    the caller must ack without running the handler. Raises
-    TransientUpstreamError (via `_get_internal`) on a 5xx or transport error,
-    so the message NAKs and retries instead of proceeding on an unanswerable
-    check: fail closed, never assume corroboration.
+    means it does not (a 200 whose status does not corroborate the event, or a
+    404, "reservation not found") and the caller must ack without running the
+    handler. Raises TransientUpstreamError on a 5xx or transport error (via
+    `_get_internal`) and, since issue #1215, on every other non-200 that is not
+    a 404 (via `_internal_record_found`): a 401 or 403 during an
+    INTERNAL_API_TOKEN rotation, or a 422 for a malformed id, is no answer
+    about the reservation, so the message NAKs and retries (and is
+    dead-lettered after the backoff schedule if the answer persists) instead
+    of being acked and dropped unrun. Fail closed either way: an unanswered
+    check never corroborates and never runs the handler.
     """
     event_type = event_data.get("event", "")
     rule = _EVENT_CORROBORATION_RULES.get(event_type)
@@ -385,10 +438,8 @@ async def _verify_reservation_event(
         headers={"X-Internal-Token": settings.internal_api_token},
         timeout=10.0,
     )
-    if resp.status_code == 404:
+    if not _internal_record_found(resp, what="verify reservation event"):
         return ReservationEventVerification(False, None, "reservation not found")
-    if resp.status_code != 200:
-        return ReservationEventVerification(False, None, f"unexpected status {resp.status_code}")
     reported_status = resp.json().get("status")
     if reported_status is not None and rule(reported_status, event_data):
         return ReservationEventVerification(True, reported_status, "")
@@ -435,7 +486,7 @@ def _inventory_record_or_none(resp, *, what: str) -> dict | None:
     A 200 whose body is a JSON object returns that object; a 404 returns None,
     the ONLY answer that means "not in inventory". Every other status raises
     TransientUpstreamError with the same "<what>: upstream <status>" text
-    _get_internal uses for a 5xx, and a 200 whose body is not a JSON object
+    _get_internal uses for a 5xx (_internal_record_found), and a 200 whose body is not a JSON object
     (`null`, a list, unparseable text) raises it with "<what>: upstream answered
     with a malformed body", the rule execution_service._fetch_inventory_internal
     applies to the same routes. A None here makes the wiring layers pin the
@@ -445,10 +496,8 @@ def _inventory_record_or_none(resp, *, what: str) -> dict | None:
     _fetch_device and _fetch_template both judge through this one function so
     the two cannot drift.
     """
-    if resp.status_code == 404:
+    if not _internal_record_found(resp, what=what):
         return None
-    if resp.status_code != 200:
-        raise TransientUpstreamError(f"{what}: upstream {resp.status_code}")
     try:
         body = resp.json()
     except ValueError:
@@ -509,9 +558,11 @@ async def _fetch_latest_config(device_id: str, client=None) -> dict | None:
 
     Feeds L3 route provisioning (issue #20): the consumer has no acting user,
     so it reads the X-Internal-Token endpoint added for this purpose. Raises
-    TransientUpstreamError on a 5xx or transport error so the message NAKs and
-    retries; a non-200 below 500 (no versions, unknown device) returns None,
-    which the caller treats as "no routes to provision".
+    TransientUpstreamError on a 5xx or transport error, and since issue #1216 on
+    a 401 or 403 (_raise_if_token_refused), so the message NAKs and retries; any
+    other non-200 below 500 (no versions, unknown device) returns None, which
+    the caller treats as "no routes to provision" (or `l3_switch_unconfigured`
+    on the intent gate).
 
     When `client` is provided it is reused (per-event connection pooling, issue
     #137); when None a fresh client is opened for this one call as before.
@@ -525,6 +576,7 @@ async def _fetch_latest_config(device_id: str, client=None) -> dict | None:
             headers={"X-Internal-Token": settings.internal_api_token},
             timeout=10.0,
         )
+        _raise_if_token_refused(resp, what=f"fetch latest config for device {device_id}")
         if resp.status_code != 200:
             return None
         return resp.json()
@@ -533,11 +585,11 @@ async def _fetch_latest_config(device_id: str, client=None) -> dict | None:
 async def _fetch_hypervisor(hypervisor_id: str, client=None) -> dict | None:
     """Fetch a hypervisor's internal record from the inventory service (issue #32).
 
-    Raises TransientUpstreamError on a 5xx or transport error so the message
-    NAKs and retries; a non-200 below 500 (a genuine 404) returns None, which
-    the create flow treats as a permanent config error. Unlike _fetch_template
-    since issue #1203, a 401 or 403 here still returns None (the
-    non-200-means-absent idiom the sibling helpers keep).
+    Raises TransientUpstreamError on a 5xx or transport error, and since issue
+    #1216 on a 401 or 403 (_raise_if_token_refused), so the message NAKs and
+    retries; any other non-200 below 500 (a genuine 404) returns None, which the
+    create flow treats as a permanent config error and teardown as
+    `recipe_config_missing`.
     """
     url = f"{settings.inventory_service_url}/hypervisors/{hypervisor_id}/internal"
     async with _client_ctx(client) as c:
@@ -548,6 +600,7 @@ async def _fetch_hypervisor(hypervisor_id: str, client=None) -> dict | None:
             headers={"X-Internal-Token": settings.internal_api_token},
             timeout=10.0,
         )
+        _raise_if_token_refused(resp, what=f"fetch hypervisor {hypervisor_id}")
         if resp.status_code != 200:
             return None
         return resp.json()
@@ -558,9 +611,11 @@ async def _fetch_secret_value(secret_id: str, client=None) -> dict | None:
 
     Reads GET /internal/secrets/{id}/value (X-Internal-Token) and returns the
     `data` mapping of secret key-values. Raises TransientUpstreamError on a 5xx
-    or transport error so the message NAKs and retries; a genuine 404 returns
-    None (a permanent config error to the create flow). Mirrors the _fetch_*
-    idiom exactly.
+    or transport error, and since issue #1216 on a 401 or 403, which the secrets
+    service answers for a wrong internal token (_raise_if_token_refused), so the
+    message NAKs and retries; any other non-200 below 500 (a genuine 404)
+    returns None (a permanent config error to the create flow,
+    `recipe_config_missing` to teardown).
     """
     url = f"{settings.secrets_service_url}/internal/secrets/{secret_id}/value"
     async with _client_ctx(client) as c:
@@ -571,6 +626,7 @@ async def _fetch_secret_value(secret_id: str, client=None) -> dict | None:
             headers={"X-Internal-Token": settings.internal_api_token},
             timeout=10.0,
         )
+        _raise_if_token_refused(resp, what=f"fetch secret {secret_id}")
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -621,7 +677,8 @@ async def _fetch_fork_intended_wires(reservation_id: str, client=None) -> ForkIn
     (_fetch_device, _fetch_template) follow the same 404-only rule since issue #1203,
     because their None pins every pair on the switch; the other sibling _fetch_*
     helpers above (_fetch_latest_config, _fetch_hypervisor, _fetch_secret_value)
-    keep the non-200-means-absent reading, which only degrades one connection; do
+    keep the non-200-means-absent reading, which only degrades one connection, except
+    that since issue #1216 a 401 or 403 (a token rotation) raises there too; do
     not "symmetrize" those with this branch. Only L1 rows are
     returned in the wires list; phase 1 wiring is L1 by construction, and a stray
     non-L1 row is ignored. The ``l3_routes`` field is additive on cabling's payload
@@ -1020,10 +1077,11 @@ async def _fetch_recipe_deps(
 
     Any of the three being None means a missing config resource (the template
     read answers None only on a 404 since issue #1203; the hypervisor and secret
-    reads keep the non-200-below-500 idiom); the caller decides whether that is
-    a permanent create-flow error or a teardown that should leave the row
-    ACTIVE. A 5xx or transport error, and any non-404 non-200 on the template
-    read, has already raised TransientUpstreamError inside the fetch helpers.
+    reads keep the non-200-below-500 idiom, minus a 401 or 403 since issue
+    #1216); the caller decides whether that is a permanent create-flow error or
+    a teardown that should leave the row ACTIVE. A 5xx or transport error, any
+    non-404 non-200 on the template read, and a 401 or 403 on any of the three
+    has already raised TransientUpstreamError inside the fetch helpers.
     """
     template = await _fetch_template(template_id, client)
     if template is None:
@@ -5153,9 +5211,11 @@ async def process_reservation_message(
     try:
         # Corroborate the event against reservations' own record BEFORE any
         # handler runs (see the gate's docstring above _verify_reservation_event).
-        # A TransientUpstreamError raised here (5xx or transport error) is caught
-        # by the generic except-Exception branch below, same as a handler-raised
-        # one, so an unanswerable check NAKs and retries rather than proceeding.
+        # A TransientUpstreamError raised here (a transport error, or any answer
+        # other than 200 or 404: a 5xx, and since issue #1215 a 401 or 403 during
+        # an INTERNAL_API_TOKEN rotation) is caught by the generic except-Exception
+        # branch below, same as a handler-raised one, so an unanswerable check NAKs
+        # and retries rather than proceeding or being acked and dropped unrun.
         async with httpx.AsyncClient() as verify_client:
             verification = await _verify_reservation_event(event_data, verify_client)
         if verification is not None and not verification.verified:

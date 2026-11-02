@@ -472,17 +472,19 @@ reservation in the batch is still driven. A known limit by decision, WIRE-RETRY-
   (about 81 seconds at the defaults) the event is dead-lettered (`nats_dlq_exhausted`),
   and a teardown that ran out of deliveries leaves the switch's rows `ACTIVE` on the
   ended reservation until the dead-lettered terminal event is replayed (`DLQ has
-  messages` below), which works because teardown reads `ACTIVE` rows. And when
-  execution holds the stale token while reservations already has the new one, the
-  corroboration gate reads reservations' 403 on `GET /internal/{id}` as not
-  corroborated, so the event is ACKed and dropped (`nats_event_unverified`) before any
-  inventory read: re-publish the terminal event once every service holds the new value.
-  A row recorded with a `not found` reason before issue #1203 may still name a switch
+  messages` below), which works because teardown reads `ACTIVE` rows. When execution
+  holds the stale token while reservations already has the new one, reservations
+  answers the corroboration check (`GET /internal/{id}`) with 403 before any inventory
+  read; since issue #1215 that is transient too, so the event is NAKed on the same
+  schedule (before, it was ACKed and dropped as `nats_event_unverified`, and the
+  terminal event had to be re-published by hand). A row recorded with a `not found` reason before issue #1203 may still name a switch
   that exists, so look the switch up in inventory before you trust the reason. To
   confirm a rotation is the cause, look in `docker compose logs execution` for the
   `nats_message_nak` warning whose exception reads `TransientUpstreamError: fetch device
-  <id>: upstream 403` (or `fetch template <id>: upstream 401`), or for
-  `nats_event_unverified` with reason `unexpected status 403`. Then put the same value in every
+  <id>: upstream 403` (or `fetch template <id>: upstream 401`, `verify reservation
+  event: upstream 403`, `fetch latest config for device <id>: upstream 403`). On a
+  version before issue #1215, look for `nats_event_unverified` with reason `unexpected
+  status 403` instead. Then put the same value in every
   service: `make up` on a dev stack or `make prod` on a production host recreates the
   containers whose environment changed (a plain restart keeps the old environment), and
   on a stack whose configuration was saved in the config UI, `INTERNAL_API_TOKEN` is
@@ -515,7 +517,7 @@ record instead of being retired, and the event is acknowledged. The log line car
   package that merely could not be DOWNLOADED (inventory or package storage briefly
   unreachable on a replica with no cached copy) is not logged here: teardown NAKs the
   terminal event so it is redelivered and the destroy runs then (issue #1029).
-- `recipe_config_missing`: the template, hypervisor, or secret is gone. The template read means gone only on a 404 (any other non-200 NAKs, issue #1203); the hypervisor and secret reads still mean gone on any non-200 below 500, so a 401 or 403 during an `INTERNAL_API_TOKEN` rotation lands here too (an open defect, issue #1216).
+- `recipe_config_missing`: the template, hypervisor, or secret is gone. The template read means gone only on a 404 (any other non-200 NAKs, issue #1203). The hypervisor and secret reads still mean gone on any non-200 below 500 except a 401 or 403: since issue #1216 a token refusal during an `INTERNAL_API_TOKEN` rotation NAKs the terminal event with the row unchanged, and the redelivery destroys the instance once the read is answered. On a version before issue #1216 a 401 or 403 on the hypervisor or secret read also landed here, so look the template's hypervisor and its secret up before you trust the reason on an older row.
 
 Find the affected rows and log lines:
 
@@ -666,7 +668,7 @@ The execution service consumes `herd.reservations.*` events from NATS JetStream.
 - A poison message (invalid JSON, or JSON that is not an object) lands on the DLQ subject `herd.reservations.dlq.execution`; inspect with the `nats` CLI (see [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq)).
 - A failure no retry can change (for example a dynamic recipe whose template, hypervisor, or secret is missing, or whose package fails the load's checks) goes to the same DLQ on its first delivery, logged as `nats_dlq_permanent`.
 - A transient handler failure gets NAK'd with an explicit delay from the `NATS_NAK_BACKOFF_SECONDS` schedule (issue #895; `1,5,15,60,120` seconds by default) and retried up to `max_deliver=5`. After that it also goes to DLQ.
-- A log line with `"action": "nats_event_unverified"` means the event was acked WITHOUT running the handler: execution's consumer corroborates `reservation.created`/`.updated`/`.cancelled`/`.completed`/`.failed`/`.wiring_changed` against reservations' own status for the row before acting on it (see ARCHITECTURE.md's Event-driven flows section), and this event's claim did not match. This is the expected, correct outcome for an event whose reservation moved on (or never existed) before the message was processed, not a bug; the log line's `reported_status` names what reservations actually had on file. The one exception is a `reason` of `unexpected status 403` (or another non-200 below 500), which means reservations refused execution's token during an `INTERNAL_API_TOKEN` rotation and the event was dropped unrun (an open defect, issue #1215); the `excluded_not_retryable` entry under the `wiring_retry_tick` heading above describes the recovery.
+- A log line with `"action": "nats_event_unverified"` means the event was acked WITHOUT running the handler: execution's consumer corroborates `reservation.created`/`.updated`/`.cancelled`/`.completed`/`.failed`/`.wiring_changed` against reservations' own status for the row before acting on it (see ARCHITECTURE.md's Event-driven flows section), and this event's claim did not match. This is the expected, correct outcome for an event whose reservation moved on (or never existed) before the message was processed, not a bug; the log line's `reported_status` names what reservations actually had on file, and its `reason` is `status does not corroborate event` or, for a 404, `reservation not found`. Only those two outcomes ack an event unrun. Any other answer to the check (a 401 or 403 while the services hold different `INTERNAL_API_TOKEN` values during a rotation, a 409, a 422 for a malformed id, a 5xx) or a transport error is transient since issue #1215: the event is NAKed with the backoff delay (`nats_message_nak`, exception `verify reservation event: upstream <status>`) and runs once reservations answers. During a rotation, put the same value in every service within the NAK window (five deliveries, about 81 seconds at the defaults); an event that outlasts it is dead-lettered (`nats_dlq_exhausted`) and can be replayed from the DLQ once every service holds the new value. On a version before issue #1215 a `reason` of `unexpected status 403` (or another non-200 below 500) meant the event was dropped unrun; re-publish a dropped terminal event to run its teardown.
 
 ### Notifications container is stuck in a crash loop on a fresh stack
 

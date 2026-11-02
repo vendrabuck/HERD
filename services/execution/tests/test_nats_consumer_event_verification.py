@@ -165,6 +165,99 @@ async def test_transport_error_raises_transient_upstream_error():
         await _verify_reservation_event(event_data, client)
 
 
+# --- issue #1215: only a 404 or a non-corroborating 200 is "unverified" -------
+#
+# Reservations answers a wrong X-Internal-Token with 403 "Invalid internal token".
+# Before #1215 a 401 or 403 (or any other answer below 500 that was not 200 or 404)
+# came back verified=False, so process_reservation_message acked the event and
+# skipped the handler: during an INTERNAL_API_TOKEN rotation a reservation.cancelled
+# was dropped unrun, leaving wiring ACTIVE and dynamic instances running on an ended
+# reservation. Every such answer now raises TransientUpstreamError (NAK, then the
+# DLQ after the backoff schedule); the corroboration rule itself is unchanged.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,verified",
+    [("CANCELLED", True), ("ACTIVE", False)],
+    ids=["corroborating", "not-corroborating"],
+)
+async def test_verifier_200_is_judged_by_the_status_rule(status, verified):
+    client = _FakeGetClient(response=_status_response(status))
+    event_data = {"event": "reservation.cancelled", "reservation_id": str(uuid.uuid4())}
+
+    result = await _verify_reservation_event(event_data, client)
+
+    assert result.verified is verified
+    assert result.reported_status == status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403, 409, 422, 500, 502, 503])
+@pytest.mark.parametrize("event", GATED_EVENTS)
+async def test_verifier_raises_transient_on_every_status_but_200_and_404(event, status):
+    """A 401 or 403 (the rotation case), a 409, a 422 (a malformed id), or a 5xx is
+    no answer about the reservation: it raises with the status in the text instead
+    of returning an unverified result the caller would ack and drop."""
+    client = _FakeGetClient(
+        response=httpx.Response(status, json={"detail": "Invalid internal token"})
+    )
+    event_data = {"event": event, "reservation_id": str(uuid.uuid4())}
+
+    with pytest.raises(TransientUpstreamError) as exc_info:
+        await _verify_reservation_event(event_data, client)
+    assert str(exc_info.value) == f"verify reservation event: upstream {status}"
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_verifier_transport_error_text_names_the_check():
+    client = _FakeGetClient(exc=httpx.ConnectError("connection refused"))
+    event_data = {"event": "reservation.cancelled", "reservation_id": str(uuid.uuid4())}
+
+    with pytest.raises(TransientUpstreamError) as exc_info:
+        await _verify_reservation_event(event_data, client)
+    assert str(exc_info.value) == "verify reservation event: transport error: connection refused"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403])
+async def test_gate_auth_error_naks_and_never_runs_or_drops_the_event(status, caplog):
+    """process_reservation_message with the REAL verifier: a 401 or 403 from
+    reservations NAKs with the backoff delay, runs no handler, logs no
+    `nats_event_unverified`, and publishes nothing to the DLQ."""
+    rid = str(uuid.uuid4())
+    js = _make_js()
+    payload = json.dumps({"event": "reservation.cancelled", "reservation_id": rid}).encode()
+    msg = _make_msg(payload)
+    handler = AsyncMock()
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(status, json={"detail": "Invalid internal token"})
+    )
+    real_client = httpx.AsyncClient
+
+    with (
+        patch(
+            "app.services.nats_consumer.httpx.AsyncClient",
+            new=lambda *a, **kw: real_client(transport=transport),
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        result = await process_reservation_message(
+            msg, js, handler, session_factory=lambda: None, max_deliver=5
+        )
+
+    assert result == "nak"
+    msg.nak.assert_awaited_once_with(delay=NATS_NAK_BACKOFF_SECONDS[0])
+    msg.ack.assert_not_awaited()
+    handler.assert_not_awaited()
+    js.publish.assert_not_awaited()
+    actions = [getattr(r, "action", None) for r in caplog.records]
+    assert "nats_event_unverified" not in actions
+    [nak] = [r for r in caplog.records if getattr(r, "action", None) == "nats_message_nak"]
+    assert str(nak.exc_info[1]) == f"verify reservation event: upstream {status}"
+
+
 @pytest.mark.asyncio
 async def test_missing_reservation_id_skips_the_gate():
     """Every handler already guards a missing reservation_id itself (issue
