@@ -39,6 +39,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.nos_lab._lab_ssh import open_lab_session
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DRIVER_PATH = _REPO_ROOT / "drivers" / "srl_l2" / "driver.py"
 _spec = importlib.util.spec_from_file_location("srl_l2_driver_live", _DRIVER_PATH)
@@ -339,9 +341,8 @@ def _stage_stale_candidate(line):
     Disconnects without committing and without discarding, which is what a
     driver process killed by the sandbox rlimit leaves behind.
     """
-    from netmiko import ConnectHandler
-
-    conn = ConnectHandler(
+    conn = open_lab_session(
+        "the SR Linux node",
         device_type="nokia_srl",
         host=SRL_HOST,
         username=SRL_USERNAME,
@@ -360,9 +361,8 @@ def _stage_stale_candidate(line):
 
 def _clear_admin_candidate():
     """Discard whatever is left in the admin user's private candidate."""
-    from netmiko import ConnectHandler
-
-    conn = ConnectHandler(
+    conn = open_lab_session(
+        "the SR Linux node",
         device_type="nokia_srl",
         host=SRL_HOST,
         username=SRL_USERNAME,
