@@ -15,6 +15,7 @@ role=user account picked through the API), because auth has no user-delete
 endpoint and a registered throwaway account would persist on the stack.
 """
 
+import re
 import uuid
 
 import pytest
@@ -52,7 +53,14 @@ def _pick_non_admin(page, self_id: str) -> dict:
 
 def _edit_button_for(page, username: str):
     """Page forward through Admin > Users until that account's Edit profile
-    control is visible (the list is oldest-first, 50 per page)."""
+    control is visible (the list is oldest-first, 50 per page).
+
+    Each Next is ordered by the list GET it causes, never a sleep: the table
+    keeps the previous page on screen while the next one loads
+    (usePaginatedUsers uses keepPreviousData), so a fixed wait can read the old
+    page. After the response, the indicator text changing proves the new page
+    rendered before the control is counted.
+    """
     name = f"Edit profile of {username}"
     for _ in range(MAX_PAGES):
         button = page.get_by_role("button", name=name, exact=True)
@@ -61,8 +69,18 @@ def _edit_button_for(page, username: str):
         next_btn = page.get_by_role("button", name="Next", exact=True)
         if next_btn.count() == 0 or not next_btn.is_enabled():
             break
-        next_btn.click()
-        page.wait_for_timeout(200)
+        indicator = page.get_by_text(re.compile(r"Page \d+ of \d+"))
+        before = indicator.inner_text()
+        with page.expect_response(
+            lambda r: (
+                r.request.method == "GET"
+                and r.url.split("?", 1)[0].endswith("/api/auth/users")
+                and r.status != 401
+            )
+        ) as info:
+            next_btn.click()
+        assert info.value.status == 200, info.value.text()
+        expect(indicator).not_to_have_text(before)
     pytest.fail(f"could not find the Edit profile control for {username} on Admin > Users")
 
 
