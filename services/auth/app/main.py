@@ -37,6 +37,12 @@ async def _seed_superadmin() -> None:
     Create the superadmin account on first startup if the three SUPERADMIN_*
     environment variables are all set and no superadmin already exists.
     This runs exactly once; subsequent startups are a no-op.
+
+    Its two existence checks read ids only (issue #1261): this runs before
+    `make migrate` can, so a release that adds a column to users must not
+    keep auth from booting on the previous release's stamped schema. The
+    create branch runs only when no superadmin exists, which on an upgraded
+    stack is never, and on a fresh stack create_all has built every column.
     """
     email = settings.superadmin_email.strip()
     username = settings.superadmin_username.strip()
@@ -47,7 +53,7 @@ async def _seed_superadmin() -> None:
 
     from app.services.auth_service import (
         create_user,
-        get_user_by_email,
+        email_registered,
         superadmin_exists,
     )
 
@@ -55,7 +61,7 @@ async def _seed_superadmin() -> None:
         if await superadmin_exists(db):
             return
 
-        if await get_user_by_email(db, email):
+        if await email_registered(db, email):
             logger.warning(
                 "SUPERADMIN_EMAIL '%s' is already registered as a regular user. "
                 "Superadmin was not created.",
@@ -70,14 +76,17 @@ async def _seed_superadmin() -> None:
 
 
 async def _seed_not_grouped() -> None:
-    """Create the 'Not Grouped' default user group on first startup."""
+    """Create the 'Not Grouped' default user group on first startup.
+
+    The existence check reads the id only, for the reason _seed_superadmin
+    gives (issue #1261).
+    """
     from sqlalchemy.exc import IntegrityError
 
-    from app.services.group_service import get_group_by_name
+    from app.services.group_service import group_name_exists
 
     async with AsyncSessionLocal() as db:
-        existing = await get_group_by_name(db, "Not Grouped")
-        if existing:
+        if await group_name_exists(db, "Not Grouped"):
             return
         try:
             db.add(UserGroup(name="Not Grouped", description="Default group for unassigned users"))
