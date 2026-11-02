@@ -204,3 +204,17 @@ async def test_ldap_jit_provision_auto_assigns_to_not_grouped(client, ldap_mode,
         ).scalar_one()
         groups = await get_user_groups(db, user.id)
         assert "Not Grouped" in {g.name for g in groups}
+
+
+@pytest.mark.asyncio
+async def test_ldap_login_jit_provision_sets_full_name_to_username(client, ldap_mode, fake_bind):
+    """Issue #1252: phase 1 reads no directory display-name attribute, so a
+    JIT-provisioned LDAP account's full_name starts as its username, and its
+    contact_email and phone start empty."""
+    resp = await client.post("/login", json={"email": "alice", "password": "good"})
+    assert resp.status_code == 200
+    async with TestSessionLocal() as db:
+        row = (await db.execute(select(User).where(User.email == "alice@example.com"))).scalar_one()
+        assert row.full_name == "alice"
+        assert row.contact_email is None
+        assert row.phone is None

@@ -55,6 +55,9 @@ def mock_user(
         id=user_id or uuid.uuid4(),
         email=email or f"{username}@test.com",
         username=username,
+        # Unsaved, so the insert-time full_name default never runs; set it
+        # here so a UserResponse built from this mock validates (#1252).
+        full_name=username,
         hashed_password="fake",
         is_active=True,
         role=role,
