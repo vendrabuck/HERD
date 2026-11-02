@@ -10,19 +10,22 @@ Rule ids are the specification's IAM-PROFILE-1 to IAM-PROFILE-8 in
 docs/specs/identity-and-access.md.
 """
 
+import contextlib
 import json
 import logging
+import re
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from app.models.user import Role, User
-from app.services.auth_service import create_ldap_user, create_user
+from app.services.auth_service import create_ldap_user, create_user, update_user_profile
 from app.utils.jwt import create_access_token
 from fastapi import HTTPException
 from herd_common.logging import JSONFormatter
+from sqlalchemy import event
 
-from tests._harness import TestSessionLocal
+from tests._harness import TestSessionLocal, engine
 
 _NOT_FOUND = {"detail": "User not found"}
 
@@ -392,30 +395,95 @@ async def test_id_route_refuses_a_non_profile_key_even_for_an_admin(client):
 # --- direct handler calls: no lookup before the refusal ---
 
 
+@contextlib.contextmanager
+def _users_table_statements():
+    """Record every SQL statement the test engine sends that names the users table.
+
+    Pinned at the database, not at a Python name: a lookup added anywhere in the
+    handler, through any import binding, still reaches the engine as a statement.
+    """
+    seen: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        if _USERS_TABLE.search(statement):
+            seen.append(statement)
+
+    sync_engine = engine.sync_engine
+    event.listen(sync_engine, "before_cursor_execute", _record)
+    try:
+        yield seen
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", _record)
+
+
+_USERS_TABLE = re.compile(r"\busers\b")
+
+
 @pytest.mark.asyncio
 async def test_user_refusal_on_another_id_makes_no_lookup():
     """The 404 for a user naming another id is decided before any read of the
-    users table, so its timing and answer cannot depend on the target."""
+    named account, so its timing and answer cannot depend on the target. The
+    caller is already resolved (passed in, as get_current_user would hand it
+    over), so the handler must send NO statement naming the users table."""
     from app.routers.admin import update_user_profile_by_id
     from app.schemas.auth import ProfileUpdateRequest
 
     caller = await _make_user(username="direct")
-    with (
-        patch("app.routers.admin.update_user_profile", new=AsyncMock()) as write,
-        patch("app.services.auth_service.get_user_by_id", new=AsyncMock()) as lookup,
-    ):
-        async with TestSessionLocal() as db:
-            with pytest.raises(HTTPException) as exc:
-                await update_user_profile_by_id(
-                    uuid.uuid4(),
-                    ProfileUpdateRequest(full_name="X"),
-                    db=db,
-                    current_user=caller,
-                    caller_role=Role.USER,
-                )
-    assert (exc.value.status_code, exc.value.detail) == (404, "User not found")
-    write.assert_not_awaited()
-    lookup.assert_not_awaited()
+    other = await _make_user(username="direct-other")
+    with patch("app.routers.admin.update_user_profile", wraps=update_user_profile) as write:
+        for target_id in (other.id, uuid.uuid4()):
+            async with TestSessionLocal() as db:
+                with _users_table_statements() as seen:
+                    with pytest.raises(HTTPException) as exc:
+                        await update_user_profile_by_id(
+                            target_id,
+                            ProfileUpdateRequest(full_name="X"),
+                            db=db,
+                            current_user=caller,
+                            caller_role=Role.USER,
+                        )
+            assert (exc.value.status_code, exc.value.detail) == (404, "User not found")
+            assert seen == []
+    write.assert_not_called()
+    assert (await _stored(other.id)).full_name == "direct-other"
+
+
+@pytest.mark.asyncio
+async def test_user_refusal_over_http_reads_no_users_row_after_the_caller(make_client):
+    """The same invariant through the real route and dependency chain. The caller
+    is supplied by the get_current_user override, so every statement naming the
+    users table during the request would be a read of the named account."""
+    caller = await _make_user(username="http-caller")
+    other = await _make_user(username="http-other")
+    async with make_client(caller) as ac:
+        with _users_table_statements() as seen:
+            resp = await ac.patch(f"/users/{other.id}/profile", json={"full_name": "Hacked"})
+    assert resp.status_code == 404
+    assert resp.json() == _NOT_FOUND
+    assert seen == []
+    # Control: the same harness DOES see the lookup an allowed self edit makes,
+    # so an empty list above is not a listener that records nothing.
+    async with make_client(caller) as ac:
+        with _users_table_statements() as seen_self:
+            ok = await ac.patch(f"/users/{caller.id}/profile", json={"full_name": "Self"})
+    assert ok.status_code == 200
+    assert seen_self != []
+
+
+@pytest.mark.asyncio
+async def test_update_user_profile_refuses_a_non_profile_column_and_writes_nothing():
+    """The second line behind extra="forbid": the service function itself
+    refuses any column outside PROFILE_FIELDS before reading or writing."""
+    target = await _make_user(username="svc-target")
+    admin = await _make_user(Role.ADMIN, username="svc-admin")
+    async with TestSessionLocal() as db:
+        with pytest.raises(ValueError) as exc:
+            await update_user_profile(
+                db, target.id, {"role": Role.ADMIN, "full_name": "X"}, modified_by=admin.id
+            )
+    assert str(exc.value) == "Not profile fields: ['role']"
+    row = await _stored(target.id)
+    assert (row.role, row.full_name, row.modified_by) == (Role.USER, "svc-target", None)
 
 
 @pytest.mark.asyncio

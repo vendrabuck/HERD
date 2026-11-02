@@ -184,8 +184,9 @@ async def update_user_profile_by_id(
     non-admin): an admin or superadmin may name any account, active or not,
     the superadmin's included. A caller whose effective role is user may name
     only their own id; any other id answers the same 404 "User not found" an
-    unknown id does, decided BEFORE any lookup, so the answer says nothing
-    about whether that account exists.
+    unknown id does, decided BEFORE any read of the named account (only the
+    caller's own row has been read, by get_current_user), so the answer says
+    nothing about whether that account exists.
     """
     not_found = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     if caller_role not in PROFILE_EDIT_ANY_ROLES and user_id != current_user.id:
