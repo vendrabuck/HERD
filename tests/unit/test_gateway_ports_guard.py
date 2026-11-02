@@ -24,7 +24,12 @@ These tests pin both fixes without a stack and without a Docker daemon:
 - `make restart` recreates a Traefik that still carries the removed
   `traefik.yml` mount before restarting (restarting it would fail to start);
 - the compose Traefik command constrains discovery to its own compose project
-  and is the only static configuration source.
+  and is the only static configuration source;
+- the gateway address follows HERD_GATEWAY_BIND (issue #1256): the Makefile
+  derives GATEWAY_HOST from the environment or `.env` the way compose does,
+  `make gateway-url` prints it, and the guard's remedies, the `make logs` note,
+  the `make everything` banner, the gate's health wait, and the load test's
+  host all name it, proven through real `make` with a scratch `.env`.
 """
 
 import os
@@ -49,6 +54,11 @@ SEP = "|"
 DEAD_DOCKER_HOST = "unix:///nonexistent/herd-test-no-daemon.sock"
 REAL_DOCKER = shutil.which("docker")
 HAS_MAKE = shutil.which("make") is not None
+
+# Every variable that steers the derived gateway address. A shell (or a parent
+# `make test-root`, which exports the last two) must not leak them into a test.
+GATEWAY_ENV = ("HERD_GATEWAY_BIND", "HERD_GATEWAY_HOST", "HERD_BASE_URL", "E2E_HOST_BASE_URL")
+BOUND = "192.0.2.10"  # TEST-NET-1, never a real host
 
 
 def _compose_available() -> bool:
@@ -146,7 +156,13 @@ def _stub_docker(
     )
     stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
     env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
-    for name in ("COMPOSE_PROJECT_NAME", "HERD_GATE_PROJECT", "MAKEFLAGS", "MFLAGS"):
+    for name in (
+        "COMPOSE_PROJECT_NAME",
+        "HERD_GATE_PROJECT",
+        "MAKEFLAGS",
+        "MFLAGS",
+        *GATEWAY_ENV,
+    ):
         env.pop(name, None)
     env["DOCKER_HOST"] = DEAD_DOCKER_HOST
     return env, calls
@@ -234,6 +250,29 @@ def test_retry_text_is_the_callers(tmp_path):
     assert result.returncode == 1
     assert "then rerun the gate." in result.stdout
     assert "'make up'" not in result.stdout
+
+
+def test_gateway_host_names_the_address_in_both_gate_remedies(tmp_path):
+    """HERD_GATEWAY_HOST (the Makefile's GATEWAY_HOST) replaces localhost in the
+    'serving' and 'use it as is' lines, for this checkout's gate and another's."""
+    for holder, own_gate in (("herd-public-gate", "herd-public-gate"), ("herd-x-gate", "")):
+        env, _ = _stub_docker(tmp_path / holder, {"443": [(holder, "t")]})
+        env["HERD_GATE_PROJECT"] = own_gate
+        env["HERD_GATEWAY_HOST"] = BOUND
+        result = _run_script(env, "herd-public")
+        assert result.returncode == 1
+        out = result.stdout
+        assert f"serving https://{BOUND}" in out, out
+        assert f"use it as is at https://{BOUND}, or" in out, out
+        assert "localhost" not in out, out
+
+
+def test_empty_gateway_host_falls_back_to_localhost(tmp_path):
+    env, _ = _stub_docker(tmp_path, {"443": [("herd-public-gate", "t")]})
+    env["HERD_GATE_PROJECT"] = "herd-public-gate"
+    env["HERD_GATEWAY_HOST"] = ""
+    result = _run_script(env, "herd-public")
+    assert "use it as is at https://localhost, or" in result.stdout
 
 
 def test_non_gate_project_refuses_without_gate_wording(tmp_path):
@@ -345,6 +384,7 @@ def test_dev_guard_asks_compose_for_the_project_name():
     text = "\n".join(recipe)
     assert "$$($(COMPOSE_OWN_PROJECT_CMD))" in text
     assert "scripts/check_gateway_ports_free.sh" in text
+    assert 'HERD_GATEWAY_HOST="$(GATEWAY_HOST)"' in text
     assert "DEV_PROJECT" not in text
     assert "$(MAKE)" not in text and "SUBMAKE" not in text
     assert not any(line.lstrip("\t").startswith("-") for line in recipe)
@@ -366,25 +406,31 @@ def test_gate_stack_up_depends_on_the_gate_guard():
     assert len(recipe) == 1, recipe
     line = recipe[0]
     assert 'sh scripts/check_gateway_ports_free.sh "$(GATE_PROJECT)"' in line
+    assert 'HERD_GATEWAY_HOST="$(GATEWAY_HOST)"' in line
     assert not line.lstrip("\t").startswith("-")
     for word in ("$(MAKE)", "exit", "exec"):
         assert word not in line
 
 
-def _checkout(tmp_path: Path, dirname: str, compose: bool = False) -> Path:
-    """A scratch copy of the checkout's Makefile and guard script."""
+def _checkout(
+    tmp_path: Path, dirname: str, compose: bool = False, dotenv: str | None = None
+) -> Path:
+    """A scratch copy of the checkout's Makefile and guard script, with a
+    scratch `.env` holding `dotenv` when given."""
     root = tmp_path / dirname
     (root / "scripts").mkdir(parents=True)
     shutil.copy2(MAKEFILE, root / "Makefile")
     shutil.copy2(SCRIPT, root / "scripts" / SCRIPT.name)
     if compose:
         (root / "docker-compose.yml").write_text("services:\n  a:\n    image: busybox\n")
+    if dotenv is not None:
+        (root / ".env").write_text(dotenv)
     return root
 
 
-def _make(root: Path, target: str, env) -> subprocess.CompletedProcess:
+def _make(root: Path, target: str, env, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["make", "-s", "-C", str(root), target],
+        ["make", "-s", "-C", str(root), *args, target],
         env={**env, "HERD_BUILD": "test", "HERD_BUILD_DATE": ""},
         capture_output=True,
         text=True,
@@ -541,9 +587,196 @@ def test_logs_hints_at_the_stack_that_is_serving(tmp_path, holders):
 def test_everything_banner_says_make_up_is_refused_while_the_gate_runs():
     _, recipe = _rule("everything")
     tail = "\n".join(recipe[-4:])
-    assert "gate stack left running and seeded at https://localhost" in tail
+    assert "gate stack left running and seeded at $(GATEWAY_URL)" in tail
     assert "'make up' refuses to start the dev stack while it runs" in tail
     assert "make gate-down" in tail and "purge its database" in tail
+
+
+# -- the gateway address (issue #1256) ----------------------------------------
+
+
+def _print_make(root: Path, env, *lines: str, args: tuple[str, ...] = ()) -> str:
+    """Run `lines` as the recipe of a scratch target in a second makefile read
+    after the checkout's own, so they expand against its real variables."""
+    extra = root / "print.mk"
+    extra.write_text("_test-print:\n" + "".join(f"\t{line}\n" for line in lines))
+    result = subprocess.run(
+        ["make", "-s", "-C", str(root), "-f", "Makefile", "-f", "print.mk", *args, "_test-print"],
+        env={**env, "HERD_BUILD": "test", "HERD_BUILD_DATE": ""},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout
+
+
+@pytest.mark.skipif(not HAS_MAKE, reason="make is not installed")
+@pytest.mark.parametrize(
+    ("dotenv", "expected"),
+    [
+        (None, "https://localhost"),
+        ("", "https://localhost"),
+        ("HERD_GATEWAY_BIND=\n", "https://localhost"),
+        ("HERD_GATEWAY_BIND=0.0.0.0\n", "https://localhost"),
+        (f"HERD_GATEWAY_BIND={BOUND}\n", f"https://{BOUND}"),
+        (f"POSTGRES_DB=herd\nHERD_GATEWAY_BIND={BOUND}\nCORS_ORIGINS=x\n", f"https://{BOUND}"),
+        (f'HERD_GATEWAY_BIND="{BOUND}"\n', f"https://{BOUND}"),
+        (f"export HERD_GATEWAY_BIND='{BOUND}'  # wired NIC\n", f"https://{BOUND}"),
+        (f"HERD_GATEWAY_BIND=198.51.100.1\nHERD_GATEWAY_BIND={BOUND}\n", f"https://{BOUND}"),
+        (f"# HERD_GATEWAY_BIND={BOUND}\n", "https://localhost"),
+        (f"OTHER_HERD_GATEWAY_BIND={BOUND}\n", "https://localhost"),
+    ],
+)
+def test_gateway_url_follows_the_dotenv_bind_through_real_make(tmp_path, dotenv, expected):
+    """`.env` is read as compose reads it: the last assignment wins, quotes, an
+    `export` prefix, and a trailing comment are dropped, a commented-out or
+    differently named line is not the knob, and 0.0.0.0 or empty means every
+    interface, addressed as localhost."""
+    root = _checkout(tmp_path, "herd-public", dotenv=dotenv)
+    env, calls = _stub_docker(tmp_path, {})
+    result = _make(root, "gateway-url", env)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected + "\n"
+    assert _calls(calls) == [] and not (tmp_path / "stub" / "ps.log").exists()
+
+
+@pytest.mark.skipif(not HAS_MAKE, reason="make is not installed")
+def test_environment_and_command_line_bind_beat_dotenv_as_in_compose(tmp_path):
+    """Compose interpolation prefers the shell environment over `.env`; so does
+    the Makefile, and a command-line value wins over both."""
+    root = _checkout(tmp_path, "herd-public", dotenv=f"HERD_GATEWAY_BIND={BOUND}\n")
+    env, _ = _stub_docker(tmp_path, {})
+    env["HERD_GATEWAY_BIND"] = "198.51.100.7"
+    assert _make(root, "gateway-url", env).stdout == "https://198.51.100.7\n"
+    env["HERD_GATEWAY_BIND"] = ""
+    assert _make(root, "gateway-url", env).stdout == "https://localhost\n"
+    del env["HERD_GATEWAY_BIND"]
+    cli = _make(root, "gateway-url", env, "HERD_GATEWAY_BIND=0.0.0.0")
+    assert cli.stdout == "https://localhost\n"
+
+
+@pytest.mark.skipif(not HAS_MAKE, reason="make is not installed")
+def test_gateway_url_dry_run_only_prints(tmp_path):
+    """`make -n gateway-url` is safe: the recipe is a lone echo with no $(MAKE)."""
+    root = _checkout(tmp_path, "herd-public", dotenv=f"HERD_GATEWAY_BIND={BOUND}\n")
+    env, calls = _stub_docker(tmp_path, {})
+    result = _make(root, "gateway-url", env, "-n")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f'echo "https://{BOUND}"\n'
+    _, recipe = _rule("gateway-url")
+    assert recipe == ['\t@echo "$(GATEWAY_URL)"']
+    assert _calls(calls) == []
+
+
+@pytest.mark.skipif(not HAS_MAKE, reason="make is not installed")
+def test_gateway_url_is_listed_by_the_bare_make_help(tmp_path):
+    root = _checkout(tmp_path, "herd-public")
+    env, _ = _stub_docker(tmp_path, {})
+    result = _make(root, "help", env)
+    assert result.returncode == 0, result.stderr
+    assert any(line.split()[:1] == ["gateway-url"] for line in result.stdout.splitlines())
+
+
+@pytest.mark.skipif(not HAS_MAKE, reason="make is not installed")
+@pytest.mark.parametrize(
+    ("dotenv", "environment", "base_url", "e2e_url"),
+    [
+        (None, {}, "https://localhost/api", "https://localhost"),
+        (f"HERD_GATEWAY_BIND={BOUND}\n", {}, f"https://{BOUND}/api", f"https://{BOUND}"),
+        (
+            f"HERD_GATEWAY_BIND={BOUND}\n",
+            {"HERD_BASE_URL": "https://elsewhere/api", "E2E_HOST_BASE_URL": "https://e2e"},
+            "https://elsewhere/api",
+            "https://e2e",
+        ),
+    ],
+)
+def test_harness_urls_are_exported_to_recipes(tmp_path, dotenv, environment, base_url, e2e_url):
+    """Seed, integration, contract, Playwright, and locust read HERD_BASE_URL or
+    E2E_HOST_BASE_URL from their environment; the recipe environment carries the
+    derived defaults, and a value the caller exported still wins."""
+    root = _checkout(tmp_path, "herd-public", dotenv=dotenv)
+    env, _ = _stub_docker(tmp_path, {})
+    env.update(environment)
+    out = _print_make(root, env, '@printf \'%s|%s\\n\' "$$HERD_BASE_URL" "$$E2E_HOST_BASE_URL"')
+    assert out == f"{base_url}|{e2e_url}\n"
+
+
+@pytest.mark.skipif(not HAS_MAKE, reason="make is not installed")
+@pytest.mark.parametrize(
+    ("base_url", "host"),
+    [
+        (None, f"https://{BOUND}"),
+        ("https://localhost", "https://localhost"),
+        ("https://localhost/api", "https://localhost"),
+        ("https://localhost/api/", "https://localhost"),
+        ("https://203.0.113.5", "https://203.0.113.5"),
+    ],
+)
+def test_load_host_is_the_gateway_root(tmp_path, base_url, host):
+    """The locustfile's paths start with /api, so test-load's --host drops a
+    trailing /api from HERD_BASE_URL (the exported default has one; nightly.yml
+    passes the bare https://localhost)."""
+    root = _checkout(tmp_path, "herd-public", dotenv=f"HERD_GATEWAY_BIND={BOUND}\n")
+    env, _ = _stub_docker(tmp_path, {})
+    if base_url is not None:
+        env["HERD_BASE_URL"] = base_url
+    assert _print_make(root, env, "@echo '$(LOAD_HOST)'") == host + "\n"
+    for target in ("test-load", "test-load-ui"):
+        _, recipe = _rule(target)
+        assert len(recipe) == 1 and "--host $(LOAD_HOST)" in recipe[0], recipe
+
+
+def test_no_recipe_line_hard_codes_localhost():
+    """Every stack-addressing recipe line goes through the derived address."""
+    lines = MAKEFILE.read_text().splitlines()
+    offenders = [line for line in lines if line.startswith("\t") and "https://localhost" in line]
+    assert offenders == []
+    _, recipe = _rule("_master-wait-healthy")
+    assert any("curl -skf $(GATEWAY_URL)/api/auth/health" in line for line in recipe), recipe
+
+
+@pytest.mark.skipif(not HAS_MAKE, reason="make is not installed")
+def test_bound_address_reaches_every_operator_message_through_real_make(tmp_path):
+    """A scratch `.env` with HERD_GATEWAY_BIND set: the dev guard's refusal, the
+    gate guard's refusal, the `make logs` note, and the everything banner all
+    name https://<that address> and none says localhost."""
+    dotenv = f"HERD_GATEWAY_BIND={BOUND}\n"
+    url = f"https://{BOUND}"
+
+    root = _checkout(tmp_path / "dev", "herd-public", dotenv=dotenv)
+    env, calls = _stub_docker(
+        tmp_path / "dev", {"443": [("herd-public-gate", "t")]}, compose_name="herd-public"
+    )
+    up = _make(root, "up", env)
+    assert up.returncode != 0
+    assert f"left it serving {url}, built from this checkout" in up.stdout
+    assert f"use it as is at {url}, or" in up.stdout
+    assert "localhost" not in up.stdout
+    assert not _ran_up(calls)
+
+    logs = _make(root, "logs", env)
+    assert logs.returncode == 0, logs.stderr
+    assert (
+        f"compose project herd-public has no containers; {url} is served by "
+        "compose project herd-public-gate" in logs.stdout
+    )
+
+    _, everything = _rule("everything")
+    banner = [line.lstrip("\t") for line in everything[-3:]]
+    assert all(line.startswith('@echo "') for line in banner), banner
+    printed = _print_make(root, env, *banner)
+    assert f"gate stack left running and seeded at {url} ===" in printed
+    assert "localhost" not in printed
+
+    wt = _checkout(tmp_path / "gate", "herd-wt", dotenv=dotenv)
+    env2, calls2 = _stub_docker(tmp_path / "gate", {"443": [("herd-public-gate", "t", "/w")]})
+    gate = _make(wt, "_master-stack-up", env2)
+    assert gate.returncode != 0
+    assert f"checkout left serving {url}. Either" in gate.stdout
+    assert "localhost" not in gate.stdout
+    assert not _ran_up(calls2)
 
 
 # -- the compose Traefik definition -------------------------------------------

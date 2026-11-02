@@ -14,8 +14,17 @@ Issue #964 extends the same rule to the dev override: every port
 `docker-compose.override.yml` publishes (today only the e2e Selenium Grid on
 4444 and its noVNC view on 7900, neither of which authenticates) must bind
 loopback too, unless it is listed in DEV_OVERRIDE_WIDE_BY_DESIGN with a reason.
+
+Issue #1256 publishes Traefik's 80 and 443 on `${HERD_GATEWAY_BIND:-0.0.0.0}`,
+so an operator can serve the gateway on one host address only. Those two
+entries must carry exactly that host, and no other port entry in either file may
+use the knob (it would let one setting widen a loopback-only port).
 """
 
+import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -26,6 +35,22 @@ BASE_COMPOSE = REPO_ROOT / "docker-compose.yml"
 DEV_OVERRIDE = REPO_ROOT / "docker-compose.override.yml"
 
 DASHBOARD_PORT = 8080
+
+# The host address of Traefik's HTTP and HTTPS entries (issue #1256), verbatim.
+GATEWAY_BIND_HOST = "${HERD_GATEWAY_BIND:-0.0.0.0}"
+GATEWAY_BIND_VAR = "HERD_GATEWAY_BIND"
+DEAD_DOCKER_HOST = "unix:///nonexistent/herd-test-no-daemon.sock"
+REAL_DOCKER = shutil.which("docker")
+
+
+def _compose_available() -> bool:
+    if REAL_DOCKER is None:
+        return False
+    probe = subprocess.run([REAL_DOCKER, "compose", "version"], capture_output=True, timeout=30)
+    return probe.returncode == 0
+
+
+HAS_COMPOSE = _compose_available()
 
 # Traefik's own plain HTTP/HTTPS listeners are the one deliberately wide
 # binding in the base file: the whole point of the gateway is to be reachable.
@@ -183,6 +208,86 @@ def test_base_compose_still_publishes_traefik_http_and_https():
     assert {"80", "443"} <= containers
 
 
+def test_traefik_http_and_https_publish_on_the_gateway_bind_knob():
+    """Issue #1256: both gateway entries carry exactly ${HERD_GATEWAY_BIND:-0.0.0.0}
+    as their host address, publish the same host port as the container port, and
+    are the only Traefik entries for 80 and 443."""
+    gateway = sorted(
+        binding
+        for binding in map(_host_binding, _traefik_ports(BASE_COMPOSE))
+        if binding[2] in {"80", "443"}
+    )
+    assert gateway == [
+        (GATEWAY_BIND_HOST, "443", "443"),
+        (GATEWAY_BIND_HOST, "80", "80"),
+    ]
+
+
+def test_no_other_port_entry_uses_the_gateway_bind_knob():
+    """The knob widens or narrows the gateway only. On any other entry (the
+    dashboard, Postgres, NATS, Selenium) it would let one .env line move a
+    loopback-only port onto a routable address."""
+    offenders = []
+    for path in (BASE_COMPOSE, DEV_OVERRIDE):
+        for service_name, ports in _all_service_ports(path).items():
+            for entry in ports:
+                if GATEWAY_BIND_VAR not in json.dumps(entry):
+                    continue
+                container_port = _host_binding(entry)[2]
+                if path == BASE_COMPOSE and (service_name, container_port) in WIDE_BY_DESIGN:
+                    continue
+                offenders.append((path.name, service_name, entry))
+    assert offenders == []
+
+
+@pytest.mark.skipif(not HAS_COMPOSE, reason="docker compose is not installed")
+@pytest.mark.parametrize(
+    ("bind", "expected_host_ip"),
+    [(None, "0.0.0.0"), ("", "0.0.0.0"), ("0.0.0.0", "0.0.0.0"), ("192.0.2.10", "192.0.2.10")],
+)
+def test_compose_renders_the_gateway_bind_into_traefik_ports(tmp_path, bind, expected_host_ip):
+    """Real `docker compose config` (rendering needs no daemon) with an empty
+    env file, so a .env in the checkout cannot leak in: unset or empty binds
+    every IPv4 interface, a value binds that address, the dashboard stays on
+    loopback."""
+    env_file = tmp_path / "empty.env"
+    env_file.write_text("")
+    env = {
+        k: v for k, v in os.environ.items() if k not in {"COMPOSE_PROJECT_NAME", GATEWAY_BIND_VAR}
+    }
+    env["DOCKER_HOST"] = DEAD_DOCKER_HOST
+    if bind is not None:
+        env[GATEWAY_BIND_VAR] = bind
+    result = subprocess.run(
+        [
+            REAL_DOCKER,
+            "compose",
+            "--env-file",
+            str(env_file),
+            "-f",
+            str(BASE_COMPOSE),
+            "-p",
+            "herd-bind-test",
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    ports = json.loads(result.stdout)["services"]["traefik"]["ports"]
+    rendered = sorted((p["target"], p.get("host_ip"), str(p["published"])) for p in ports)
+    assert rendered == [
+        (80, expected_host_ip, "80"),
+        (443, expected_host_ip, "443"),
+        (8080, "127.0.0.1", "8080"),
+    ]
+
+
 def test_dev_override_adds_no_second_dashboard_binding():
     """Port lists merge across compose files, so an 8080 entry here would not
     replace the loopback bind; it would stack a second host binding on the
@@ -271,6 +376,10 @@ def test_dev_override_allowlist_names_ports_the_override_actually_publishes():
         ("127.0.0.1:${POSTGRES_PORT:-5433}:5432", ("127.0.0.1", "${POSTGRES_PORT:-5433}", "5432")),
         ("${POSTGRES_PORT:-5433}:5432", (None, "${POSTGRES_PORT:-5433}", "5432")),
         ("${E2E_BIND:-127.0.0.1}:7900:7900", ("${E2E_BIND:-127.0.0.1}", "7900", "7900")),
+        (
+            "${HERD_GATEWAY_BIND:-0.0.0.0}:443:443",
+            ("${HERD_GATEWAY_BIND:-0.0.0.0}", "443", "443"),
+        ),
         ("0.0.0.0:4444:4444", ("0.0.0.0", "4444", "4444")),
         ("[::1]:4444:4444", ("[::1]", "4444", "4444")),
         ("127.0.0.1:4444:4444/tcp", ("127.0.0.1", "4444", "4444")),
@@ -299,6 +408,7 @@ def test_host_binding_rejects_an_unrecognised_entry():
         "0.0.0.0:4444:4444",
         "4444",
         "${E2E_BIND:-127.0.0.1}:4444:4444",
+        "${HERD_GATEWAY_BIND:-0.0.0.0}:4444:4444",
         "[::]:4444:4444",
         {"target": 4444, "published": 4444},
         {"target": 4444, "published": 4444, "host_ip": "0.0.0.0"},

@@ -118,8 +118,12 @@ services:
       - "--log.level=INFO"
       - "--accessLog=true"
     ports:
-      - "80:80"
-      - "443:443"
+      # The gateway's HTTP and HTTPS ports publish on HERD_GATEWAY_BIND (issue
+      # #1256): unset means every IPv4 interface; set it in .env to one host
+      # address to serve the stack there only. The Makefile reads the same
+      # value so its harnesses address that host.
+      - "${HERD_GATEWAY_BIND:-0.0.0.0}:80:80"
+      - "${HERD_GATEWAY_BIND:-0.0.0.0}:443:443"
       - "127.0.0.1:8080:8080"  # Traefik dashboard, unauthenticated: loopback only (issue #708)
     volumes:
       - ./infra/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro

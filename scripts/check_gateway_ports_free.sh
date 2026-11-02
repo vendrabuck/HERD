@@ -16,19 +16,24 @@
 # for which the message gives the exact compose command `make gate-down` runs
 # (the directory compose last started it from is shown as a hint only: a
 # container recreated from another checkout carries that checkout's path).
+# HERD_GATEWAY_HOST (default localhost) is the address the message says a gate
+# stack serves; the Makefile passes the GATEWAY_HOST it derives from
+# HERD_GATEWAY_BIND (issue #1256), so the remedy names https://<that address>.
 # With --list it prints one line per holder that is not
 # ours ("project <name>" or "container <name>"), nothing else, and exits 0.
 #
 # Why: the dev stack and the gate stack a `make everything` run leaves serving
-# https://localhost publish the same host ports. Starting one while the other
+# the gateway URL publish the same host ports. Starting one while the other
 # runs leaves the new Traefik unable to bind (it stays Created) and the new
 # stack's services unable to resolve each other, so `make up` fails in a way
 # that looks like broken code, and a gate run's tests would talk to the other
 # stack's gateway. Only host ports 80 and 443 are checked, by design: they are
-# the ones every stack publishes on all interfaces and the ones its clients
+# the ones every stack publishes beyond loopback and the ones its clients
 # use; a stack that holds only its loopback ports (Postgres, NATS, the
-# dashboard) is not seen. Only Docker containers are checked; a host process
-# listening on the ports is not seen either.
+# dashboard) is not seen. The check is by host port, whatever address the
+# holder publishes it on (HERD_GATEWAY_BIND), so two stacks bound to different
+# addresses are refused as well, conservatively. Only Docker containers are
+# checked; a host process listening on the ports is not seen either.
 set -u
 
 list=0
@@ -97,6 +102,9 @@ if [ -z "$blocking" ]; then
 fi
 
 own_gate=${HERD_GATE_PROJECT:-}
+gateway_host=${HERD_GATEWAY_HOST:-}
+[ -n "$gateway_host" ] || gateway_host=localhost
+url="https://$gateway_host"
 echo "Refusing to start compose project $own: another stack already publishes host port 80 or 443."
 while IFS='|' read -r holder workdir; do
     [ -n "$holder" ] || continue
@@ -115,13 +123,13 @@ while IFS='|' read -r holder workdir; do
         *-gate)
             if [ -n "$own_gate" ] && [ "$holder" = "$own_gate" ]; then
                 echo "  That is this checkout's seeded gate stack: a successful 'make everything'"
-                echo "  left it serving https://localhost, built from this checkout. Either"
-                echo "    - use it as is at https://localhost, or"
+                echo "  left it serving $url, built from this checkout. Either"
+                echo "    - use it as is at $url, or"
                 echo "    - run 'make gate-down' (this PURGES the gate stack's database), then $retry."
             else
                 echo "  That is the seeded gate stack a successful 'make everything' in another"
-                echo "  checkout left serving https://localhost. Either"
-                echo "    - use it as is at https://localhost, or"
+                echo "  checkout left serving $url. Either"
+                echo "    - use it as is at $url, or"
                 echo "    - stop it with 'docker compose -p $holder --profile e2e down -v --remove-orphans'"
                 echo "      (the teardown 'make gate-down' runs in that checkout; this PURGES the gate"
                 echo "      stack's database), then $retry here."

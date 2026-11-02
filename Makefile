@@ -75,13 +75,39 @@ HERD_BUILD_DATE := $(shell TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:
 endif
 export HERD_BUILD_DATE
 
+# Gateway address (issue #1256). docker compose publishes Traefik's host ports 80
+# and 443 on ${HERD_GATEWAY_BIND:-0.0.0.0}, taking the value from the shell
+# environment first and the repo-root `.env` second, as compose interpolation
+# does. Make never reads `.env`, so the value is read here the same way: an
+# environment or command-line HERD_GATEWAY_BIND wins, otherwise the last
+# `HERD_GATEWAY_BIND=` line of `.env` (an `export ` prefix, quotes, and a
+# trailing ` #` comment are dropped; no `.env` means unset). GATEWAY_HOST is the
+# address the host-side harnesses reach the stack at: `localhost` when the
+# knob is empty or 0.0.0.0 (every interface, the default), otherwise the value
+# as written. HERD_BASE_URL (seedtools, the integration, contract, and NOS lab
+# via-stack suites, and test-load) and E2E_HOST_BASE_URL (Playwright and the
+# Selenium fixtures' host-side API calls) are exported with that host as their
+# default, so every stack-addressing sub-process follows the bind address; a
+# value already in the environment still wins (`?=`). `make gateway-url`
+# prints the derived URL.
+ifeq ($(origin HERD_GATEWAY_BIND), undefined)
+GATEWAY_BIND := $(shell [ -f .env ] && sed -n -E 's/^(export[[:space:]]+)?HERD_GATEWAY_BIND=//p' .env | tail -n 1 | sed -E 's/[[:space:]]+\#.*$$//' | tr -d "\"' \t\r")
+else
+GATEWAY_BIND := $(strip $(HERD_GATEWAY_BIND))
+endif
+GATEWAY_HOST := $(if $(filter-out 0.0.0.0,$(GATEWAY_BIND)),$(GATEWAY_BIND),localhost)
+GATEWAY_URL := https://$(GATEWAY_HOST)
+HERD_BASE_URL ?= $(GATEWAY_URL)/api
+E2E_HOST_BASE_URL ?= $(GATEWAY_URL)
+export HERD_BASE_URL E2E_HOST_BASE_URL
+
 # Coverage package name per service. Most are app/; common ships herd_common/.
 cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 
 # Self-documenting help is the default goal: a bare `make` prints the target list.
 .DEFAULT_GOAL := help
 
-.PHONY: help version audit master master-quick master-clean everything everything-noload \
+.PHONY: help version gateway-url audit master master-quick master-clean everything everything-noload \
 	up dev prod down build logs restart \
 	migrate test coverage \
 	$(addprefix test-,$(SERVICES)) \
@@ -126,6 +152,12 @@ help:  ## Show this help (the default target)
 version:  ## Show the build string and date every image would be stamped with
 	@echo "HERD_BUILD=$(HERD_BUILD)"
 	@echo "HERD_BUILD_DATE=$(HERD_BUILD_DATE)"
+
+# Prints the gateway URL this checkout's stack serves (GATEWAY_URL above,
+# derived from HERD_GATEWAY_BIND). Deliberately $(MAKE)-free, so `make -n
+# gateway-url` stays a dry run.
+gateway-url:  ## Show the https URL the gateway serves (from HERD_GATEWAY_BIND)
+	@echo "$(GATEWAY_URL)"
 
 # -- Audit (dependency / security) --------------------------------------------
 #
@@ -286,7 +318,7 @@ master-clean: _clean-images  ## master with this checkout's dev and gate images 
 #   - Runs the NOS lab dialect tier (nos-test-dialect) after the live LDAP
 #     phase and before frontend coverage; `master` does not run it.
 #   - On SUCCESS the gate stack is left RUNNING and seeded (a live,
-#     freshly-validated stack at https://localhost); `make gate-down` stops
+#     freshly-validated stack at the gateway URL, `make gateway-url`); `make gate-down` stops
 #     it, and the next gate run's gate-clean purges it anyway, so every gate
 #     is still born fresh. On failure the stack is torn down as before.
 # Everything stops on first failure; failure teardown is trapped.
@@ -363,14 +395,14 @@ everything: gate-clean  ## Full gate: CI checks + coverage + live LDAP + NOS dia
 		$(MAKE) test-e2e-seeded COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		if [ "$(EVERYTHING_LOAD)" != "0" ]; then \
 			echo "" && echo "=== Load / stress tests ===" && \
-			HERD_BASE_URL=https://localhost $(MAKE) test-load; \
+			$(MAKE) test-load; \
 		else \
 			echo "" && echo "=== Skipping load tests (EVERYTHING_LOAD=0) ==="; \
 		fi && \
 		$(MAKE) test-e2e-stop COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		ok=1
 	@echo ""
-	@echo "=== everything complete: gate stack left running and seeded at https://localhost ==="
+	@echo "=== everything complete: gate stack left running and seeded at $(GATEWAY_URL) ==="
 	@echo "    It holds host ports 80 and 443, so 'make up' refuses to start the dev stack while it runs."
 	@echo "    make gate-down   stop it and purge its database (then 'make up' restores the dev stack)"
 
@@ -448,7 +480,7 @@ seed-nos:  ## Seed a running stack with the NOS test lab (real SR Linux + FRR la
 # -- Gate stack helpers (internal, used by master, everything, and gate-down) --
 
 _assert-gate-ports-free:
-	@HERD_GATE_PROJECT="$(GATE_PROJECT)" sh scripts/check_gateway_ports_free.sh "$(GATE_PROJECT)" "rerun the gate"
+	@HERD_GATE_PROJECT="$(GATE_PROJECT)" HERD_GATEWAY_HOST="$(GATEWAY_HOST)" sh scripts/check_gateway_ports_free.sh "$(GATE_PROJECT)" "rerun the gate"
 
 # GATE_NO_CACHE=1 (set by master-clean) builds the gate project's images with
 # --no-cache first; `up --build` then reuses those fresh layers.
@@ -457,7 +489,7 @@ _assert-gate-ports-free:
 # has stopped this checkout's dev stack and purged this checkout's stale gate
 # project, so only a FOREIGN stack can trip it: another checkout's dev stack or
 # its seeded gate stack. Without the guard this gate's Traefik could not bind,
-# and the seed, integration, and e2e phases (all addressed to https://localhost)
+# and the seed, integration, and e2e phases (all addressed to $(GATEWAY_URL))
 # would run against that other, serving stack and write into its database.
 _master-stack-up: _assert-gate-ports-free
 	@if [ "$$GATE_NO_CACHE" = "1" ]; then $(GATE_COMPOSE) build --no-cache; fi
@@ -466,7 +498,7 @@ _master-stack-up: _assert-gate-ports-free
 _master-wait-healthy:
 	@echo "Waiting for stack to report healthy..."
 	@TIMEOUT=180; START=$$(date +%s); ELAPSED=0; \
-		until curl -skf https://localhost/api/auth/health > /dev/null 2>&1; do \
+		until curl -skf $(GATEWAY_URL)/api/auth/health > /dev/null 2>&1; do \
 			NOW=$$(date +%s); ELAPSED=$$((NOW - START)); \
 			if [ $$ELAPSED -gt $$TIMEOUT ]; then \
 				echo "Timed out after $${TIMEOUT}s waiting for stack"; exit 1; \
@@ -502,7 +534,7 @@ prod: _assert-gateway-ports-free  ## Start the stack without dev overrides (no r
 
 # Refuses `make up`/`dev`/`prod` while ANOTHER compose project (typically the
 # seeded gate stack a successful `make everything` leaves serving
-# https://localhost) already publishes host port 80 or 443. Starting anyway
+# the gateway URL) already publishes host port 80 or 443. Starting anyway
 # never worked: the new Traefik cannot bind and stays Created, and the new
 # stack's postgres and nats can come up with no network attached, so every
 # service dies on a name-resolution error. Our own project is allowed, so
@@ -514,7 +546,7 @@ prod: _assert-gateway-ports-free  ## Start the stack without dev overrides (no r
 # cannot answer (the name comes back empty) the guard fails closed (exit 2).
 _assert-gateway-ports-free:
 	@own=$$($(COMPOSE_OWN_PROJECT_CMD)); \
-		HERD_GATE_PROJECT="$(GATE_PROJECT)" sh scripts/check_gateway_ports_free.sh "$$own"
+		HERD_GATE_PROJECT="$(GATE_PROJECT)" HERD_GATEWAY_HOST="$(GATEWAY_HOST)" sh scripts/check_gateway_ports_free.sh "$$own"
 
 # Every compose `down` below carries --profile e2e: a profile-gated service that is
 # not enabled is neither an active service nor an orphan, so a plain `down` (even
@@ -536,7 +568,7 @@ logs:  ## Tail logs for all services
 		if [ -n "$$own" ] && [ -z "$$(docker compose ps -aq 2>/dev/null)" ]; then \
 			other=$$(sh scripts/check_gateway_ports_free.sh --list "$$own" 2>/dev/null | sed -n 's/^project //p' | head -n 1); \
 			if [ -n "$$other" ]; then \
-				echo "Note: compose project $$own has no containers; https://localhost is served by compose project $$other (docker compose -p $$other logs -f)."; \
+				echo "Note: compose project $$own has no containers; $(GATEWAY_URL) is served by compose project $$other (docker compose -p $$other logs -f)."; \
 			fi; \
 		fi
 	docker compose logs -f
@@ -625,11 +657,16 @@ test-integration:  ## Run cross-service integration tests (needs a running stack
 test-contract:  ## Run OpenAPI contract snapshot tests (needs a running stack)
 	uv run pytest tests/contract/ -v
 
+# Locust's --host is the gateway root (the locustfile's paths start with /api),
+# so a trailing `/api` (or `/api/`) on HERD_BASE_URL is dropped: the exported
+# default carries one, while nightly.yml passes the bare `https://localhost`.
+LOAD_HOST = $(patsubst %/api,%,$(patsubst %/,%,$(HERD_BASE_URL)))
+
 test-load:  ## Run headless locust load test (needs a running stack)
-	cd tests/load && uv run locust -f locustfile.py --host $${HERD_BASE_URL:-https://localhost} --headless -u 20 -r 5 --run-time 1m
+	cd tests/load && uv run locust -f locustfile.py --host $(LOAD_HOST) --headless -u 20 -r 5 --run-time 1m
 
 test-load-ui:  ## Run locust with its web UI (needs a running stack)
-	cd tests/load && uv run locust -f locustfile.py --host $${HERD_BASE_URL:-https://localhost}
+	cd tests/load && uv run locust -f locustfile.py --host $(LOAD_HOST)
 
 # Opt-in, scored measurement of AI topology-generator proposal wireability
 # (see docs/AI_GENERATE.md, "Measuring proposal wireability"): how often a
