@@ -190,3 +190,65 @@ async def test_send_runs_send_smtp_in_thread_when_configured():
         send.assert_called_once_with("to@example.com", "Reservation confirmed", "body text")
     finally:
         set_contact_client(None)
+
+
+# --- issue #1252: the delivery address is whatever auth's contact route answers ---
+
+
+@pytest.mark.asyncio
+async def test_email_is_addressed_to_the_contact_email_auth_reports(monkeypatch):
+    """Functional path for issue #1252, with no notifications code change: auth's
+    GET /internal/users/{id}/contact answers a user's contact_email in its
+    `email` key when one is set, and the real ContactClient plus the real
+    _send_smtp address the SMTP message To that value, not the login email.
+
+    The auth route is stubbed at the HTTP layer (httpx.MockTransport behind
+    herd_common.internal_client.call_service) and smtplib.SMTP is stubbed, so
+    the whole chain from contact lookup to the built message runs for real.
+    """
+    import herd_common.internal_client as internal_client
+    import httpx
+
+    user_id = uuid.uuid4()
+    seen_paths: list[str] = []
+
+    def auth_contact_route(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        assert request.headers["X-Internal-Token"] == "tok"
+        return httpx.Response(
+            200,
+            json={
+                "user_id": str(user_id),
+                "email": "carol.alerts@mail.example.com",
+                "username": "carol",
+            },
+        )
+
+    real_async_client = internal_client.httpx.AsyncClient
+
+    def _client_factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(auth_contact_route)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(internal_client.httpx, "AsyncClient", _client_factory)
+
+    server = MagicMock()
+    smtp_cm = MagicMock()
+    smtp_cm.__enter__.return_value = server
+    smtp_cm.__exit__.return_value = False
+
+    set_contact_client(ContactClient(base_url="http://auth", internal_token="tok", ttl_seconds=0))
+    try:
+        with patch.multiple("app.services.dispatchers.email.settings", **_smtp_settings()):
+            with patch("app.services.dispatchers.email.smtplib.SMTP", return_value=smtp_cm):
+                await EmailDispatcher().send(
+                    _session_factory, _msg(user_id=user_id, dedupe_key=None)
+                )
+    finally:
+        set_contact_client(None)
+
+    assert seen_paths == [f"/internal/users/{user_id}/contact"]
+    server.send_message.assert_called_once()
+    sent = server.send_message.call_args[0][0]
+    assert sent["To"] == "carol.alerts@mail.example.com"
+    assert sent["Subject"] == "Reservation confirmed"

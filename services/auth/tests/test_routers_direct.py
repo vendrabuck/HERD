@@ -83,7 +83,7 @@ async def test_register_endpoint_integrity_error_fallback():
     async with TestSessionLocal() as db:
         body = RegisterRequest(email="race@test.com", username="raceuser", password="password123")
 
-        async def mock_create_user(db, email, username, password):
+        async def mock_create_user(db, email, username, password, full_name=None):
             raise IntegrityError("duplicate", params=None, orig=None)
 
         with patch("app.routers.auth.create_user", side_effect=mock_create_user):

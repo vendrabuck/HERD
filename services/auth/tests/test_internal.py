@@ -132,6 +132,41 @@ async def test_internal_user_contact_returns_email_and_username(internal_client)
 
 
 @pytest.mark.asyncio
+async def test_internal_user_contact_returns_contact_email_when_set(internal_client):
+    """Issue #1252: a set contact_email is the delivery address the contact
+    route reports; the response shape is unchanged."""
+    uid = await _seed_user(role=Role.USER, username="carol")
+    async with TestSessionLocal() as session:
+        user = await session.get(User, uid)
+        user.contact_email = "carol.alerts@mail.example.com"
+        await session.commit()
+    resp = await internal_client.get(
+        f"/internal/users/{uid}/contact", headers={"X-Internal-Token": INTERNAL_TOKEN}
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "user_id": str(uid),
+        "email": "carol.alerts@mail.example.com",
+        "username": "carol",
+    }
+
+
+@pytest.mark.asyncio
+async def test_internal_user_contact_returns_login_email_when_contact_email_is_null(
+    internal_client,
+):
+    uid = await _seed_user(role=Role.USER, username="dave")
+    async with TestSessionLocal() as session:
+        user = await session.get(User, uid)
+        assert user.contact_email is None
+    resp = await internal_client.get(
+        f"/internal/users/{uid}/contact", headers={"X-Internal-Token": INTERNAL_TOKEN}
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"user_id": str(uid), "email": f"{uid}@example.com", "username": "dave"}
+
+
+@pytest.mark.asyncio
 async def test_internal_user_contact_404_for_unknown_user(internal_client):
     resp = await internal_client.get(
         f"/internal/users/{uuid.uuid4()}/contact",
