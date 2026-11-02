@@ -412,3 +412,34 @@ export function loginRetryAfterText(err: unknown): string | null {
   }
   return errorDetail(err, LOGIN_LOCKED_FALLBACK);
 }
+
+// Field labels for the profile 422 list (issue #1252), matching the labels on
+// the Settings Profile section and the Users page Edit profile dialog.
+const PROFILE_FIELD_LABELS: Record<string, string> = {
+  full_name: "Name",
+  contact_email: "Contact email",
+  phone: "Phone",
+};
+
+/**
+ * Toast text for a failed profile save (issue #1252). A plain string detail
+ * (404 "User not found") is shown as is. A pydantic 422 list naming the
+ * profile fields becomes one "<Label>: <message>" per field, joined with
+ * "; ", so a bad phone and a bad address are both reported. Anything else,
+ * a 422 entry for another field included, falls back to `fallback`.
+ */
+export function profileSaveErrorText(err: unknown, fallback: string): string {
+  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
+  if (typeof detail === "string") return detail;
+  if (!Array.isArray(detail) || detail.length === 0) return fallback;
+  const parts: string[] = [];
+  for (const entry of detail) {
+    const loc = (entry as { loc?: unknown })?.loc;
+    const msg = (entry as { msg?: unknown })?.msg;
+    const field = Array.isArray(loc) ? loc[loc.length - 1] : undefined;
+    const label = typeof field === "string" ? PROFILE_FIELD_LABELS[field] : undefined;
+    if (!label || typeof msg !== "string") return fallback;
+    parts.push(`${label}: ${msg}`);
+  }
+  return parts.join("; ");
+}

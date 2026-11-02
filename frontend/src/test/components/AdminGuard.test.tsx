@@ -35,7 +35,7 @@ beforeEach(() => {
 describe("AdminGuard", () => {
   it("redirects a non-admin user to /topology and renders nothing", async () => {
     useAuthStore.setState({
-      user: { id: "1", username: "bob", email: "b@b.c", role: "user", is_active: true, created_at: "" },
+      user: { id: "1", username: "bob", email: "b@b.c", full_name: "bob", contact_email: null, phone: null, role: "user", is_active: true, created_at: "" },
     });
 
     renderGuard();
@@ -46,7 +46,7 @@ describe("AdminGuard", () => {
 
   it("renders children for an admin user", () => {
     useAuthStore.setState({
-      user: { id: "1", username: "admin", email: "a@b.c", role: "admin", is_active: true, created_at: "" },
+      user: { id: "1", username: "admin", email: "a@b.c", full_name: "admin", contact_email: null, phone: null, role: "admin", is_active: true, created_at: "" },
     });
 
     renderGuard();
@@ -60,6 +60,9 @@ describe("AdminGuard", () => {
       user: {
         id: "1",
         username: "super",
+        full_name: "super",
+        contact_email: null,
+        phone: null,
         email: "s@b.c",
         role: "superadmin",
         is_active: true,
@@ -110,7 +113,7 @@ describe("AdminGuard", () => {
 
   it("guards the /reporting route and redirects a non-admin to /topology", async () => {
     useAuthStore.setState({
-      user: { id: "1", username: "bob", email: "b@b.c", role: "user", is_active: true, created_at: "" },
+      user: { id: "1", username: "bob", email: "b@b.c", full_name: "bob", contact_email: null, phone: null, role: "user", is_active: true, created_at: "" },
     });
 
     renderReportingRoute();
@@ -121,7 +124,7 @@ describe("AdminGuard", () => {
 
   it("renders the /reporting route for an admin", () => {
     useAuthStore.setState({
-      user: { id: "1", username: "admin", email: "a@b.c", role: "admin", is_active: true, created_at: "" },
+      user: { id: "1", username: "admin", email: "a@b.c", full_name: "admin", contact_email: null, phone: null, role: "admin", is_active: true, created_at: "" },
     });
 
     renderReportingRoute();

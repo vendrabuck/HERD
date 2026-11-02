@@ -1,5 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { LoginRequest, RegisterRequest, TokenResponse, User } from "@/types/auth.types";
+import type {
+  LoginRequest,
+  ProfileUpdate,
+  RegisterRequest,
+  TokenResponse,
+  User,
+} from "@/types/auth.types";
 import apiClient from "./client";
 import { useAuthStore } from "@/stores/authStore";
 
@@ -15,6 +21,11 @@ async function register(data: RegisterRequest): Promise<User> {
 
 async function getCurrentUser(): Promise<User> {
   const resp = await apiClient.get<User>("/auth/me");
+  return resp.data;
+}
+
+async function updateMyProfile(profile: ProfileUpdate): Promise<User> {
+  const resp = await apiClient.patch<User>("/auth/me/profile", profile);
   return resp.data;
 }
 
@@ -57,6 +68,22 @@ export function useLogout() {
     onSettled: () => {
       useAuthStore.getState().clearAuth();
       queryClient.clear();
+    },
+  });
+}
+
+/**
+ * Save the caller's own profile (issue #1252). On success the cached current
+ * user is replaced with the server's answer, so the header and every reader of
+ * useCurrentUser show the new name at once; the admin user list is refetched.
+ */
+export function useUpdateMyProfile() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: updateMyProfile,
+    onSuccess: (user) => {
+      queryClient.setQueryData(["currentUser"], user);
+      queryClient.invalidateQueries({ queryKey: ["adminUsers"] });
     },
   });
 }

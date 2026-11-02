@@ -15,13 +15,30 @@ vi.mock("react-hot-toast", () => ({
 
 import { server } from "../mocks/server";
 import { SettingsPage } from "@/pages/SettingsPage";
+import { useAuthStore } from "@/stores/authStore";
+import type { User } from "@/types/auth.types";
 
-function renderWithProviders(node: ReactNode) {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
-  return render(<QueryClientProvider client={client}>{node}</QueryClientProvider>);
+function renderWithProviders(node: ReactNode, client?: QueryClient) {
+  const qc =
+    client ??
+    new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+  return render(<QueryClientProvider client={qc}>{node}</QueryClientProvider>);
 }
+
+const ME: User = {
+  id: "me-1",
+  email: "ada@login.example.com",
+  username: "ada",
+  full_name: "Ada Lovelace",
+  contact_email: null,
+  phone: "555 0100",
+  is_active: true,
+  role: "user",
+  created_at: "2026-01-01T00:00:00Z",
+  updated_at: "2026-01-01T00:00:00Z",
+};
 
 const DEFAULT_PREFS = {
   channels: { in_app: true },
@@ -36,6 +53,7 @@ const DEFAULT_PREFS = {
 beforeEach(() => {
   toastError.mockClear();
   toastSuccess.mockClear();
+  useAuthStore.setState({ isAuthenticated: false, user: null });
 });
 
 describe("SettingsPage", () => {
@@ -238,5 +256,128 @@ describe("SettingsPage", () => {
     await waitFor(() =>
       expect(toastError).toHaveBeenCalledWith("Failed to save preferences"),
     );
+  });
+});
+
+
+// Issue #1252: the Profile section above Notifications.
+describe("SettingsPage profile section", () => {
+  function profileHandlers(onPatch?: (body: unknown) => Response | Promise<Response>) {
+    useAuthStore.setState({ isAuthenticated: true, accessToken: "t" });
+    server.use(
+      http.get("/api/notifications/notifications/preferences", () =>
+        HttpResponse.json(DEFAULT_PREFS),
+      ),
+      http.get("/api/auth/me", () => HttpResponse.json(ME)),
+      http.patch("/api/auth/me/profile", async ({ request }) => {
+        const body = await request.json();
+        return onPatch
+          ? onPatch(body)
+          : HttpResponse.json({ ...ME, ...(body as object), updated_at: "2026-02-02T00:00:00Z" });
+      }),
+    );
+  }
+
+  it("prefills the editable fields and shows the login identity read-only", async () => {
+    profileHandlers();
+    renderWithProviders(<SettingsPage />);
+    const name = (await screen.findByLabelText("Name")) as HTMLInputElement;
+    expect(name.value).toBe("Ada Lovelace");
+    expect((screen.getByLabelText("Contact email") as HTMLInputElement).value).toBe("");
+    expect((screen.getByLabelText("Phone") as HTMLInputElement).value).toBe("555 0100");
+    expect(screen.getByText("ada@login.example.com")).toBeInTheDocument();
+    expect(screen.getByText("ada")).toBeInTheDocument();
+    // Login email and username are not inputs.
+    expect(screen.queryByDisplayValue("ada@login.example.com")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Where email notifications go. Leave blank to use the sign-in email."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Stored and shown only. HERD does not call or text this number."),
+    ).toBeInTheDocument();
+  });
+
+  it("disables Save profile until a field changes and while the name is blank", async () => {
+    profileHandlers();
+    renderWithProviders(<SettingsPage />);
+    const name = await screen.findByLabelText("Name");
+    const save = screen.getByRole("button", { name: "Save profile" });
+    expect(save).toBeDisabled();
+    fireEvent.change(name, { target: { value: "   " } });
+    expect(save).toBeDisabled();
+    expect(screen.getByText("Name is required.")).toBeInTheDocument();
+    fireEvent.change(name, { target: { value: "Countess Ada" } });
+    expect(save).toBeEnabled();
+  });
+
+  it("PATCHes only the changed fields and refreshes the cached current user", async () => {
+    let captured: unknown = null;
+    profileHandlers((body) => {
+      captured = body;
+      return HttpResponse.json({
+        ...ME,
+        full_name: "Countess Ada",
+        contact_email: "ada@mail.example.com",
+        updated_at: "2026-02-02T00:00:00Z",
+      });
+    });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    renderWithProviders(<SettingsPage />, client);
+    fireEvent.change(await screen.findByLabelText("Name"), {
+      target: { value: " Countess Ada " },
+    });
+    fireEvent.change(screen.getByLabelText("Contact email"), {
+      target: { value: "ada@mail.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save profile" }));
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Profile saved"));
+    expect(captured).toEqual({ full_name: "Countess Ada", contact_email: "ada@mail.example.com" });
+    expect(client.getQueryData<User>(["currentUser"])?.full_name).toBe("Countess Ada");
+    // The form remounts with the saved values as its new baseline.
+    await waitFor(() =>
+      expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Countess Ada"),
+    );
+    expect(screen.getByRole("button", { name: "Save profile" })).toBeDisabled();
+  });
+
+  it("sends a cleared phone as null", async () => {
+    let captured: unknown = null;
+    profileHandlers((body) => {
+      captured = body;
+      return HttpResponse.json({ ...ME, phone: null });
+    });
+    renderWithProviders(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText("Phone"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save profile" }));
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Profile saved"));
+    expect(captured).toEqual({ phone: null });
+  });
+
+  it("toasts a 422 per field through profileSaveErrorText", async () => {
+    profileHandlers(() =>
+      HttpResponse.json(
+        {
+          detail: [
+            {
+              type: "string_pattern_mismatch",
+              loc: ["body", "phone"],
+              msg: "String should match pattern '^[0-9 +()-]*[0-9][0-9 +()-]*$'",
+            },
+          ],
+        },
+        { status: 422 },
+      ),
+    );
+    renderWithProviders(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText("Phone"), { target: { value: "call me" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save profile" }));
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "Phone: String should match pattern '^[0-9 +()-]*[0-9][0-9 +()-]*$'",
+      ),
+    );
+    expect(toastSuccess).not.toHaveBeenCalled();
   });
 });

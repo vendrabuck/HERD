@@ -16,6 +16,9 @@ function user(overrides: Partial<User> = {}): User {
     id: "u-1",
     email: "a@b.com",
     username: "alice",
+    full_name: "alice",
+    contact_email: null,
+    phone: null,
     is_active: true,
     role: "user",
     created_at: "2026-01-01T00:00:00Z",
@@ -113,6 +116,22 @@ describe("AppLayout", () => {
       expect(screen.getByRole("link", { name: label })).toBeInTheDocument();
     }
     expect(screen.getByText("page content")).toBeInTheDocument();
+  });
+
+  it("shows the full name in the header (issue #1252)", async () => {
+    server.use(
+      http.get("/api/auth/me", () => HttpResponse.json(user({ full_name: "Alice Smith" }))),
+    );
+    renderLayout("/inventory");
+    const name = await screen.findByText("Alice Smith");
+    expect(name).toHaveAttribute("title", "alice");
+    expect(screen.queryByText("alice")).not.toBeInTheDocument();
+  });
+
+  it("falls back to the username when the full name is empty (issue #1252)", async () => {
+    server.use(http.get("/api/auth/me", () => HttpResponse.json(user({ full_name: "" }))));
+    renderLayout("/inventory");
+    expect(await screen.findByText("alice")).toBeInTheDocument();
   });
 
   it("shows the injected app version beside the HERD wordmark (issue #846)", () => {

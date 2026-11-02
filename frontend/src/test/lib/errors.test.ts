@@ -11,6 +11,7 @@ import {
   LOGIN_LOCKED_FALLBACK,
   loginRetryAfterSeconds,
   loginRetryAfterText,
+  profileSaveErrorText,
   topologyMixedTypesDetail,
   topologyDeleteErrorText,
   topologyInUseDetail,
@@ -395,5 +396,48 @@ describe("loginRetryAfterSeconds and loginRetryAfterText", () => {
       expect(loginRetryAfterSeconds(err)).toBeNull();
       expect(loginRetryAfterText(err)).toBeNull();
     }
+  });
+});
+
+
+describe("profileSaveErrorText (issue #1252)", () => {
+  it("shows a string detail as is", () => {
+    expect(profileSaveErrorText(axiosLike(404, "User not found"), "Failed")).toBe(
+      "User not found",
+    );
+  });
+
+  it("labels each profile field of a 422 list and joins them", () => {
+    const err = axiosLike(422, [
+      { loc: ["body", "contact_email"], msg: "value is not a valid email address: bad" },
+      { loc: ["body", "phone"], msg: "String should have at most 32 characters" },
+    ]);
+    expect(profileSaveErrorText(err, "Failed")).toBe(
+      "Contact email: value is not a valid email address: bad; " +
+        "Phone: String should have at most 32 characters",
+    );
+  });
+
+  it("labels the name field", () => {
+    const err = axiosLike(422, [
+      { loc: ["body", "full_name"], msg: "String should have at least 1 character" },
+    ]);
+    expect(profileSaveErrorText(err, "Failed")).toBe(
+      "Name: String should have at least 1 character",
+    );
+  });
+
+  it("falls back when a 422 entry names another field", () => {
+    const err = axiosLike(422, [
+      { loc: ["body", "phone"], msg: "bad" },
+      { loc: ["body", "role"], msg: "Extra inputs are not permitted" },
+    ]);
+    expect(profileSaveErrorText(err, "Failed to save profile")).toBe("Failed to save profile");
+  });
+
+  it("falls back for an empty list, a missing detail, and a non-axios error", () => {
+    expect(profileSaveErrorText(axiosLike(422, []), "F")).toBe("F");
+    expect(profileSaveErrorText(axiosLike(500, undefined), "F")).toBe("F");
+    expect(profileSaveErrorText(new Error("network"), "F")).toBe("F");
   });
 });

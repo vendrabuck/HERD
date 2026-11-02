@@ -1,11 +1,11 @@
 import { http, HttpResponse } from "msw";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { describe, it, expect, beforeEach } from "vitest";
 
 import { server } from "../mocks/server";
-import { useLogin, useLogout, useCurrentUser } from "@/api/auth";
+import { useLogin, useLogout, useCurrentUser, useUpdateMyProfile } from "@/api/auth";
 import { useAuthStore } from "@/stores/authStore";
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -89,5 +89,29 @@ describe("auth api hooks", () => {
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(useAuthStore.getState().accessToken).toBeNull();
     expect(useAuthStore.getState().isAuthenticated).toBe(false);
+  });
+
+  it("useUpdateMyProfile PATCHes /auth/me/profile and replaces the cached current user", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    client.setQueryData(["currentUser"], { id: "me", full_name: "Old" });
+    let captured: unknown = null;
+    server.use(
+      http.patch("/api/auth/me/profile", async ({ request }) => {
+        captured = await request.json();
+        return HttpResponse.json({ id: "me", full_name: "New Name" });
+      }),
+    );
+    const { result } = renderHook(() => useUpdateMyProfile(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    });
+    await act(async () => {
+      await result.current.mutateAsync({ full_name: "New Name" });
+    });
+    expect(captured).toEqual({ full_name: "New Name" });
+    expect(client.getQueryData(["currentUser"])).toEqual({ id: "me", full_name: "New Name" });
   });
 });
