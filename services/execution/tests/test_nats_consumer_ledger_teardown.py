@@ -709,9 +709,12 @@ async def _ledger_snapshot(models):
     return snap
 
 
-async def _deliver_cancelled(denied: dict, unexpected: list, execute_fn, num_delivered: int):
+async def _deliver_cancelled(
+    denied: dict, unexpected: list, execute_fn, num_delivered: int, dynamic_teardown=None
+):
     """Deliver one reservation.cancelled message through process_reservation_message
-    with the real handler and the real fetch helpers; return (result, msg)."""
+    with the real handler and the real fetch helpers; return (result, msg). The dynamic
+    teardown is stubbed (`dynamic_teardown`, a fresh AsyncMock when not given)."""
     from app.services.nats_consumer import process_reservation_message
 
     real_client = httpx.AsyncClient
@@ -743,7 +746,10 @@ async def _deliver_cancelled(denied: dict, unexpected: list, execute_fn, num_del
             patch("app.services.nats_consumer.apply_reservation_event_tiers", new=AsyncMock())
         )
         stack.enter_context(
-            patch("app.services.nats_consumer._execute_dynamic_teardown", new=AsyncMock())
+            patch(
+                "app.services.nats_consumer._execute_dynamic_teardown",
+                new=dynamic_teardown if dynamic_teardown is not None else AsyncMock(),
+            )
         )
         result = await process_reservation_message(
             msg, js, handle_reservation_event, _db_session_factory()
@@ -836,4 +842,64 @@ async def test_teardown_inventory_auth_error_naks_and_never_pins(layer, resource
     assert {a for a in redelivery_calls if a in release_actions.values()} == {
         release_actions[name] for name in untouched_layers
     }, "RELEASED alone does not prove the driver ran"
+    assert unexpected == []
+
+
+# --- issue #1215: a 401 or 403 from the corroboration check NAKs, never drops ---
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_cancelled_event_whose_check_is_refused_naks_then_tears_down(status, caplog):
+    """Issue #1215: reservations answering the corroboration GET with 401 or 403 (an
+    INTERNAL_API_TOKEN rotation) NAKs the reservation.cancelled with the backoff delay:
+    no handler runs, so no freeze, no ledger change, no driver call, no dynamic
+    teardown, and no `nats_event_unverified` ack. Before #1215 the check returned
+    unverified and the event was ACKed and dropped, leaving the rows ACTIVE and the
+    dynamic instances running on an ended reservation. The redelivery, once
+    reservations answers 200 CANCELLED, runs the full teardown: every ledger row
+    released through the driver and the dynamic teardown run."""
+    from app.config import settings
+    from app.services.nats_consumer import NATS_NAK_BACKOFF_SECONDS, TransientUpstreamError
+
+    await _seed_l1()
+    await _seed_l2()
+    await _seed_l3()
+    all_models = [m for name in _LAYER_ORDER for m in _LAYER_MODELS[name]]
+    before = await _ledger_snapshot(all_models)
+    reservations_path = httpx.URL(f"{settings.reservations_service_url}/internal/{RES_ID}").path
+    unexpected: list = []
+    execute_fn, calls = _recorder()
+    dynamic_teardown = AsyncMock()
+
+    with caplog.at_level(logging.WARNING, logger="app.services.nats_consumer"):
+        result, msg = await _deliver_cancelled(
+            {reservations_path: status}, unexpected, execute_fn, 1, dynamic_teardown
+        )
+
+    assert result == "nak"
+    msg.nak.assert_awaited_once_with(delay=NATS_NAK_BACKOFF_SECONDS[0])
+    msg.ack.assert_not_awaited()
+    actions = [getattr(r, "action", None) for r in caplog.records]
+    assert "nats_event_unverified" not in actions
+    [nak] = [r for r in caplog.records if getattr(r, "action", None) == "nats_message_nak"]
+    assert isinstance(nak.exc_info[1], TransientUpstreamError)
+    assert str(nak.exc_info[1]) == f"verify reservation event: upstream {status}"
+    assert await _ledger_snapshot(all_models) == before
+    assert await _wiring_state() is None, "the handler never ran, so nothing froze"
+    assert calls == []
+    dynamic_teardown.assert_not_awaited()
+
+    result, msg = await _deliver_cancelled({}, unexpected, execute_fn, 2, dynamic_teardown)
+
+    assert result == "ack"
+    msg.ack.assert_awaited_once()
+    msg.nak.assert_not_awaited()
+    assert await _statuses(L1ConnectionAssignment) == ["RELEASED"]
+    assert await _statuses(L2PortAssignment) == ["RELEASED"]
+    assert await _statuses(VlanAssignment) == ["RELEASED"]
+    assert await _statuses(RouteAssignment) == ["RELEASED"]
+    assert {"disconnect_ports", "remove_from_vlan", "remove_route"} <= set(calls)
+    state = await _wiring_state()
+    assert state is not None and state.frozen is True
+    dynamic_teardown.assert_awaited_once()
     assert unexpected == []

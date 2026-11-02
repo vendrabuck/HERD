@@ -734,6 +734,121 @@ async def test_inventory_read_raises_transient_on_transport_error(helper, record
     assert str(exc_info.value) == f"{what} {record_id}: transport error: connection refused"
 
 
+# --- issue #1216: a 401 or 403 on the latest-config, hypervisor, or secret read ---
+#
+# Inventory and the secrets service answer a wrong X-Internal-Token with 403 "Invalid
+# internal token". These three reads deliberately keep reading every other answer
+# below 500 that is not a 200 as absent (a misread degrades one connection, not a
+# whole desired set), but a token refusal is the INTERNAL_API_TOKEN rotation case:
+# read as absent it left an L3 switch's routes uninstalled while the fork version was
+# stamped, dead-lettered a dynamic create as a missing config, and left a teardown's
+# VM running. A 401 or 403 now raises TransientUpstreamError; every other status keeps
+# its old reading, which the table pins too.
+
+
+def _secret_path(secret_id):
+    from app.config import settings
+
+    return httpx.URL(f"{settings.secrets_service_url}/internal/secrets/{secret_id}/value").path
+
+
+_SIBLING_READS = [
+    pytest.param(
+        _fetch_latest_config,
+        "dev-1",
+        "/devices/dev-1/config-versions/latest/internal",
+        "fetch latest config for device dev-1",
+        id="latest-config",
+    ),
+    pytest.param(
+        _fetch_hypervisor,
+        "hv-1",
+        "/hypervisors/hv-1/internal",
+        "fetch hypervisor hv-1",
+        id="hypervisor",
+    ),
+    pytest.param(
+        _fetch_secret_value,
+        "sec-1",
+        None,
+        "fetch secret sec-1",
+        id="secret",
+    ),
+]
+
+
+def _sibling_client(status_code, body=None, seen=None):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if seen is not None:
+            seen.append((request.url.path, request.headers.get("X-Internal-Token")))
+        return httpx.Response(status_code, json=body if body is not None else {"detail": "x"})
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper,record_id,path,what", _SIBLING_READS)
+async def test_sibling_read_reads_a_200_as_before(helper, record_id, path, what):
+    """A 200 is read exactly as before #1216: the body, or a secret's `data` mapping."""
+    from app.config import settings
+
+    body = {"id": record_id, "name": "x", "data": {"username": "root"}}
+    seen: list = []
+    async with _sibling_client(200, body, seen) as client:
+        result = await helper(record_id, client)
+    assert result == (body["data"] if helper is _fetch_secret_value else body)
+    expected_path = path if path is not None else _secret_path(record_id)
+    assert seen == [(expected_path, settings.internal_api_token)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("helper,record_id,path,what", _SIBLING_READS)
+async def test_sibling_read_raises_transient_on_a_token_refusal(
+    helper, record_id, path, what, status
+):
+    """A 401 or 403 (the rotation case) raises with the status in the text, exactly
+    as a 5xx does, so the event NAKs instead of reading the record as absent."""
+    async with _sibling_client(status, {"detail": "Invalid internal token"}) as client:
+        with pytest.raises(TransientUpstreamError) as exc_info:
+            await helper(record_id, client)
+    assert str(exc_info.value) == f"{what}: upstream {status}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [404, 409, 422])
+@pytest.mark.parametrize("helper,record_id,path,what", _SIBLING_READS)
+async def test_sibling_read_keeps_reading_other_4xx_as_absent(
+    helper, record_id, path, what, status
+):
+    """Every other answer below 500 still reads as absent (None): #1216 changes only the
+    token-refusal statuses, by decision (the non-200-means-absent idiom stays)."""
+    async with _sibling_client(status) as client:
+        assert await helper(record_id, client) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [500, 502, 503])
+@pytest.mark.parametrize("helper,record_id,path,what", _SIBLING_READS)
+async def test_sibling_read_raises_transient_on_5xx(helper, record_id, path, what, status):
+    async with _sibling_client(status) as client:
+        with pytest.raises(TransientUpstreamError) as exc_info:
+            await helper(record_id, client)
+    assert str(exc_info.value) == f"{what}: upstream {status}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper,record_id,path,what", _SIBLING_READS)
+async def test_sibling_read_raises_transient_on_transport_error(helper, record_id, path, what):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(TransientUpstreamError) as exc_info:
+            await helper(record_id, client)
+    assert str(exc_info.value) == f"{what}: transport error: connection refused"
+
+
 @pytest.mark.asyncio
 async def test_fetch_device_returns_json_on_200():
     """The success path: a real 200 is parsed and returned, not mocked away."""

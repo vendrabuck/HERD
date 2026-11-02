@@ -269,8 +269,8 @@ goes live.
   with no recipe call and no ledger change, logged `nats_event_unverified`. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_requested_event_corroborated`, `_EVENT_CORROBORATION_RULES`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_provision_redelivery_after_reservation_left_pending_provision_creates_nothing`, `test_provision_requested_under_pending_provision_still_runs`); `services/execution/tests/test_nats_consumer_event_verification.py` (`test_event_status_table`)
-- **DYN-CREATE-2.** When reservations answers that check with a 5xx or not at all, the
-  event is nacked with no create attempted (WIRE-GATE-3); once that lasts through the
+- **DYN-CREATE-2.** When reservations answers that check with anything but a 200 or a
+  404 (a 5xx, and since #1215 a 401, 403, 409, or 422) or not at all, the event is nacked with no create attempted (WIRE-GATE-3); once that lasts through the
   fifth delivery the event is dead-lettered and the failure callback (DYN-DLQ-1) is
   attempted, which is lost while reservations is down, so the reservation fails by the
   timeout backstop (RES-SWEEP-6). By decision (CHANGELOG, issue #937; the
@@ -283,7 +283,8 @@ goes live.
   `PENDING_PROVISION` the request creates nothing, its row stays `CREATING` with no ref,
   `dynamic_instance_create_skipped_reservation_ended` is logged with the request id,
   reservation id, and `reported_status`, and the event is abandoned (DYN-CREATE-26). A
-  5xx or transport error on that read raises `TransientUpstreamError`. Because teardown
+  transport error or any answer other than a 200 or a 404 on that read (a 5xx, and since
+  #1215 a 401 or 403) raises `TransientUpstreamError`. Because teardown
   runs only after the terminal status is committed, a teardown that listed the rows
   before this row existed is always seen by the re-read, so a request with no row when
   teardown ran can no longer create an instance after the reservation ended (issue
@@ -315,18 +316,21 @@ goes live.
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_missing_template_is_permanent_dlq_with_failure_callback`, `test_missing_template_raises_permanent_directly`, `test_create_template_read_auth_error_naks_and_never_dead_letters`, `test_teardown_template_read_auth_error_raises_and_leaves_row_unchanged`); `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_returns_none_only_on_404`)
 - **DYN-CREATE-9.** The template's current `hypervisor_id` and that hypervisor's
   `secret_id` are then read from inventory and the secrets service; a missing hypervisor
-  or secret raises `PermanentEventError` the same way. \
+  or secret (any non-200 below 500 other than a 401 or 403, which DYN-CREATE-10 covers)
+  raises `PermanentEventError` the same way. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_recipe_deps`, `_fetch_hypervisor`, `_fetch_secret_value`, `_provision_one_instance`) \
   Pinned by: none
 - **DYN-CREATE-10.** A 5xx or transport error on any of those reads raises
-  `TransientUpstreamError`, so the event is nacked and retried; on the template read
-  every other non-404 non-200 (a 401 or 403 during an `INTERNAL_API_TOKEN` rotation, a
-  422) and a 200 whose body is not a JSON object raise it too (#1203), on create and on
-  teardown alike (a teardown no longer leaves the row live with `recipe_config_missing`
-  for such an answer), while the hypervisor and secret reads still treat any
-  non-200 below 500 as missing (DYN-CREATE-9). \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_template`, `_inventory_record_or_none`, `_fetch_hypervisor`, `_fetch_secret_value`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_transient_5xx_naks`, `test_fetch_hypervisor_5xx_raises_transient`, `test_fetch_secret_value_5xx_raises_transient`, `test_create_template_read_auth_error_naks_and_never_dead_letters`, `test_teardown_template_read_auth_error_raises_and_leaves_row_unchanged`); `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_raises_transient_on_every_other_status`)
+  `TransientUpstreamError`, so the event is nacked and retried; so does a 401 or 403 on
+  any of them (an `INTERNAL_API_TOKEN` rotation; the template read since #1203, the
+  hypervisor and secret reads since #1216), on create and on teardown alike: a create
+  is not dead-lettered as a missing config and a teardown does not leave the row live
+  with `recipe_config_missing` for a token refusal. On the template read every other
+  non-404 non-200 (a 409, a 422) and a 200 whose body is not a JSON object raise it too
+  (#1203), while the hypervisor and secret reads still treat any other non-200 below
+  500 as missing (DYN-CREATE-9). \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_template`, `_inventory_record_or_none`, `_fetch_hypervisor`, `_fetch_secret_value`, `_raise_if_token_refused`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_transient_5xx_naks`, `test_fetch_hypervisor_5xx_raises_transient`, `test_fetch_secret_value_5xx_raises_transient`, `test_create_template_read_auth_error_naks_and_never_dead_letters`, `test_teardown_template_read_auth_error_raises_and_leaves_row_unchanged`, `test_create_config_read_auth_error_naks_then_redelivery_creates`, `test_teardown_config_read_auth_error_raises_and_leaves_row_unchanged`); `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_raises_transient_on_every_other_status`, `test_sibling_read_raises_transient_on_a_token_refusal`)
 - **DYN-CREATE-11.** The `CREATING` row is written before the recipe package is loaded
   and before any recipe call, so every later failure leaves a row for teardown. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_provision_one_instance`) \
@@ -656,7 +660,8 @@ guidance: [TROUBLESHOOTING.md](../TROUBLESHOOTING.md).
   against the snapshot teardown read (DYN-LEDGER-5). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_attempt`) \
   Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_teardown_happy_path_destroys_and_marks_destroyed`, `test_keyed_destroy_on_active_row_without_ref_destroys_and_deletes_device`); `tests/integration/test_dynamic_resources.py` (`test_cancel_tears_down_the_dynamic_instance`)
-- **DYN-DESTROY-7.** A missing template, hypervisor, or secret, a broken recipe package
+- **DYN-DESTROY-7.** A missing template, hypervisor, or secret (DYN-CREATE-9; a token
+  refusal is DYN-DESTROY-17's), a broken recipe package
   (`DriverPackageError`), a failed `login` (DYN-CREATE-17), a failed or raising
   `destroy_instance`, or a device delete that answers neither 204 nor 404 leaves the row
   in its status and the event is acked; nothing is raised. \
@@ -712,10 +717,13 @@ guidance: [TROUBLESHOOTING.md](../TROUBLESHOOTING.md).
   the row's `hypervisor_id` as device id. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_attempt`) \
   Pinned by: none
-- **DYN-DESTROY-17.** A 5xx or transport error reading the row's template, hypervisor,
-  or secret during teardown raises `TransientUpstreamError` the same way. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_recipe_deps`, `_teardown_attempt`) \
-  Pinned by: none
+- **DYN-DESTROY-17.** A 5xx or transport error, or a 401 or 403 (an
+  `INTERNAL_API_TOKEN` rotation), reading the row's template, hypervisor, or secret
+  during teardown raises `TransientUpstreamError` the same way, before any recipe call
+  and with the row unchanged, so the terminal event is nacked and the redelivery
+  destroys the instance (#1203 for the template, #1216 for the hypervisor and secret). \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_recipe_deps`, `_raise_if_token_refused`, `_teardown_attempt`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_dynamic.py` (`test_teardown_template_read_auth_error_raises_and_leaves_row_unchanged`, `test_teardown_config_read_auth_error_raises_and_leaves_row_unchanged`)
 
 **Out of scope.** The wiring freeze and wiring teardown that run first
 (`provisioning-and-wiring.md`); the device release reservations makes
@@ -941,11 +949,11 @@ acknowledgement and the log action.
 |---|---|---|---|
 | acked, nothing run | `nats_event_unverified` | `provision_requested` for a reservation not `PENDING_PROVISION` | DYN-CREATE-1 |
 | dead-lettered on first delivery, failure callback | `nats_dlq_permanent` | template, hypervisor, or secret missing; recipe package fails the load's checks (archive, `driver.py` parse, `Driver` class, required methods); inventory refused the device; create succeeded without a ref | DYN-CREATE-8, DYN-CREATE-9, DYN-CREATE-12, DYN-CREATE-19, DYN-CREATE-23, DYN-DLQ-1 |
-| nacked with delay | `nats_message_nak` | 5xx or transport error, or any other non-404 answer to the template read; package download failure; failed login or create, including a recipe whose top-level code raises (the load parses `driver.py` and never runs it, so the first sandboxed `login` fails); reservations unreachable | DYN-CREATE-2, DYN-CREATE-10, DYN-CREATE-13, DYN-CREATE-16, DYN-CREATE-18 |
+| nacked with delay | `nats_message_nak` | 5xx or transport error, a 401 or 403 to the hypervisor or secret read, or any other non-404 answer to the template read; package download failure; failed login or create, including a recipe whose top-level code raises (the load parses `driver.py` and never runs it, so the first sandboxed `login` fails); reservations unreachable | DYN-CREATE-2, DYN-CREATE-10, DYN-CREATE-13, DYN-CREATE-16, DYN-CREATE-18 |
 | dead-lettered at the fifth delivery, failure callback | `nats_dlq_exhausted` | any nacked failure that persists | DYN-CREATE-2, DYN-CREATE-18, DYN-DLQ-1 |
 | acked, event abandoned, no callback | `dynamic_provision_abandoned` | a request refused or undone | DYN-CREATE-6, DYN-CREATE-26 |
 | acked, ledger row left live | `dynamic_instance_keyed_destroy_failed`, `dynamic_instance_teardown_contended`, or a plain error | teardown could not prove the instance gone | DYN-DESTROY-7, DYN-DESTROY-9, DYN-DESTROY-10, DYN-DESTROY-14 |
-| nacked with delay | `nats_message_nak` | teardown hit a 5xx or transport error | DYN-DESTROY-12, DYN-DESTROY-17 |
+| nacked with delay | `nats_message_nak` | teardown hit a 5xx or transport error, a 401 or 403 to a recipe config read, or any other non-404 answer to the template read | DYN-DESTROY-12, DYN-DESTROY-17 |
 
 Browser refusals (toasts and inline alerts, no request sent):
 
@@ -962,9 +970,9 @@ Browser refusals (toasts and inline alerts, no request sent):
 |---|---|---|---|---|
 | In (from reservations, at booking) | inventory | `GET /templates/{id}` (caller's JWT) | template check (RES-DYN-1) | Fail closed: 503 to the user (`reservations.md`) |
 | Out | reservations | `GET /internal/{id}` (internal token, 10 s) | corroborate `provision_requested` | Fail closed: nack, then dead-letter at the fifth delivery with no create (DYN-CREATE-2) |
-| Out | inventory | `GET /templates/{id}/internal` (internal token, 10 s) | template, recipe driver and checksum, hypervisor id, fields | Create: 404 dead-letters, 5xx and transport nack. Teardown: 404 leaves the row live, 5xx and transport nack |
-| Out | inventory | `GET /hypervisors/{id}/internal` (internal token, 10 s) | endpoint, type, `secret_id` | As the template read |
-| Out | secrets | `GET /internal/secrets/{id}/value` (internal token, 10 s) | the credential for the recipe | As the template read; a 200 whose body is not an object reads as no keys |
+| Out | inventory | `GET /templates/{id}/internal` (internal token, 10 s) | template, recipe driver and checksum, hypervisor id, fields | Create: 404 dead-letters; any other non-200 (401, 403, 409, 422, 5xx) and transport nack. Teardown: 404 leaves the row live; any other non-200 and transport nack (DYN-CREATE-10, DYN-DESTROY-17) |
+| Out | inventory | `GET /hypervisors/{id}/internal` (internal token, 10 s) | endpoint, type, `secret_id` | Create: 401 or 403 nacks (#1216), any other non-200 below 500 dead-letters, 5xx and transport nack. Teardown: 401 or 403 nacks, any other non-200 below 500 leaves the row live, 5xx and transport nack |
+| Out | secrets | `GET /internal/secrets/{id}/value` (internal token, 10 s) | the credential for the recipe | As the hypervisor read; a 200 whose body is not an object reads as no keys |
 | Out | inventory | recipe package download (`load_driver`) | the recipe | Create: a broken package dead-letters, a download failure nacks. Teardown: any failure leaves the row live and acks (DYN-DESTROY-8) |
 | Out | recipe driver | `login`, `create_instance`, `destroy_instance`, `logout` in the sandbox (`RECIPE_TIMEOUT_SECONDS`) | create and destroy the instance | Create: a failure nacks. Teardown: a failure leaves the row live and acks. Compensation: logged |
 | Out | inventory | `POST /devices/internal` (internal token, 30 s) | materialize the instance | 5xx and transport nack; any other refusal dead-letters (DYN-CREATE-22, DYN-CREATE-23) |
@@ -1076,7 +1084,6 @@ None at present.
 - DYN-CREATE-28: an abandoned event skips its remaining requests.
 - DYN-DEVICE-11: the instance device `AVAILABLE` between release and delete.
 - DYN-DESTROY-16: teardown's run user and run device id.
-- DYN-DESTROY-17: a transient error reading the recipe's configuration in teardown.
 - DYN-CONTRACT-2: `status` never called, `create_instance` called without arguments.
 - DYN-UI-10: a drop on a live reservation's canvas.
 - DYN-UI-14: placeholders left out of the fork save and autosave.
