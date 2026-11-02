@@ -33,6 +33,12 @@ one per area; all ten areas are written.
   sync-now button, and run history.
 - **Three-role RBAC** (Shipped): user, admin, superadmin. See
   [docs/ROLES.md](docs/ROLES.md).
+- **User profile** (Shipped): every account has a display name, plus an optional
+  contact email (where email notifications go instead of the sign-in email) and an
+  optional phone number (stored and shown only). Each user edits their own on
+  Settings; admins and the superadmin edit any account's from Admin > Users
+  (issue #1252; IAM-PROFILE rules in
+  [docs/specs/identity-and-access.md](docs/specs/identity-and-access.md)).
 - **User groups** (Shipped): organize users into teams with bulk member management.
 - **Resource-level ACL grants** (Shipped): group-based view and manage grants on
   devices, topologies, reservations, and secrets, via the acl service's API and

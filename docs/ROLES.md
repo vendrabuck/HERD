@@ -89,7 +89,8 @@ A user cannot:
 - Create, update, or delete user groups
 - Add or remove group members
 - Create, view, or delete ACL grants
-- View or manage other users' accounts
+- View or manage other users' accounts, except that every user edits their own profile
+  (name, contact email, phone) on Settings
 
 ### Admin
 
@@ -1760,6 +1761,7 @@ Authorization: Bearer <admin-token>
 | `/api/auth/refresh` | POST | open | open | open |
 | `/api/auth/logout` | POST | open | open | open |
 | `/api/auth/me` | GET | yes | yes | yes |
+| `/api/auth/me/profile` | PATCH | yes (own) | yes (own) | yes (own) |
 | `/api/auth/groups` | GET | yes | yes | yes |
 | `/api/auth/groups/{id}` | GET | | yes | yes |
 | `/api/auth/groups` | POST | | yes | yes |
@@ -1775,6 +1777,7 @@ Authorization: Bearer <admin-token>
 | `/api/auth/users/{id}/role` | PUT | | | yes |
 | `/api/auth/users/{id}/activate` | POST | | yes | yes |
 | `/api/auth/users/{id}/deactivate` | POST | | yes | yes |
+| `/api/auth/users/{id}/profile` | PATCH | yes (own id only) | yes | yes |
 | `/api/auth/admin/ldap-sync/status` | GET | | yes | yes |
 | `/api/auth/admin/ldap-sync/mappings` | POST | | yes | yes |
 | `/api/auth/admin/ldap-sync/mappings` | GET | | yes | yes |
@@ -1963,6 +1966,16 @@ any valid JWT and act only on the caller's own notifications: another user's
 notification id answers 404 `Notification not found`, and there is no admin view of
 other users' rows. The two preference routes forward the caller's JWT to user-profile,
 which reads and writes the caller's own preferences.
+
+The two profile routes (issue #1252) write only `full_name`, `contact_email`, and
+`phone`. `PATCH /api/auth/me/profile` edits the caller's own account.
+`PATCH /api/auth/users/{id}/profile` is one route for self or admin, judged by the
+effective role and deliberately not role-gated: an admin or the superadmin may name any
+account, active or not, the superadmin's included; a user may name only their own id,
+and any other id answers 404 `User not found`, byte-identical to an unknown id and
+decided before any lookup, the same own-rows convention as `/api/notifications`. An
+unknown key (`role`, `email`, `username`, `is_active`, and so on) is a 422; role and
+activation keep their own routes.
 
 The inventory config-version and apply-job rows follow the rules in "Reservation-owner
 widening for device-config writes" above. The read routes answer a non-admin outside the
