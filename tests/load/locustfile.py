@@ -8,7 +8,8 @@ Eight user classes simulating different usage patterns:
 - RoutedTopologyValidator: repeatedly validates one topology carrying Layer 3
   routing intent (ADR 0014, issue #34 phase 3), a safe no-op when the seeded
   pool has no Layer 3 Switch device
-- NotificationUser: polls notifications and updates channel/event preferences
+- NotificationUser: polls notifications, updates channel/event preferences,
+  and edits its own profile name (issue #1252), restoring it at the end
 - BulkConnectionAdmin: posts small POST /connections/bulk batches, then deletes
   what it created
 - DeviceConfigUser: writes and reads config versions, the driver config schema,
@@ -102,6 +103,9 @@ class HerdUser(HttpUser):
 
     def _auth_delete(self, path: str, **kwargs):
         return self.client.delete(path, headers=self.headers, verify=False, **kwargs)
+
+    def _auth_patch(self, path: str, **kwargs):
+        return self.client.patch(path, headers=self.headers, verify=False, **kwargs)
 
 
 class ReservationUser(HerdUser):
@@ -374,9 +378,28 @@ class NotificationUser(HerdUser):
     weight = 2
     wait_time = between(1, 3)
 
+    # The profile task (issue #1252) alternates the shared load account's
+    # full_name between its original value and this marker. Several instances
+    # share one account, so an instance that starts while another holds the
+    # marker takes the username (the default name) as the original instead.
+    LOAD_PROFILE_NAME = "HERD load test profile"
+
     def on_start(self):
         self._login(USER_EMAIL, USER_PASSWORD)
         self._toggle = False
+        self._profile_flip = False
+        self._original_full_name = None
+        resp = self._auth_get("/api/auth/me")
+        if resp.status_code == 200:
+            me = resp.json()
+            name = me.get("full_name")
+            self._original_full_name = (
+                me.get("username") if not name or name == self.LOAD_PROFILE_NAME else name
+            )
+
+    def on_stop(self):
+        if self._original_full_name:
+            self._auth_patch("/api/auth/me/profile", json={"full_name": self._original_full_name})
 
     @task(5)
     def unread_count(self):
@@ -405,6 +428,18 @@ class NotificationUser(HerdUser):
                 "events": {"reservation.expiring_soon": True},
             },
         )
+
+    @task(1)
+    def update_profile(self):
+        # The Settings page's profile write: read /me, then PATCH the caller's
+        # own profile, alternating between two names so each call is a real
+        # write. A single-row update, so this smokes the path, not capacity.
+        if not self._original_full_name:
+            return
+        self._auth_get("/api/auth/me")
+        self._profile_flip = not self._profile_flip
+        name = self.LOAD_PROFILE_NAME if self._profile_flip else self._original_full_name
+        self._auth_patch("/api/auth/me/profile", json={"full_name": name})
 
 
 class ACLChecker(HerdUser):
