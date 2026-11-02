@@ -29,6 +29,8 @@ import subprocess
 import pytest
 from netmiko import ConnectHandler
 
+from tests.nos_lab._lab_ssh import open_lab_session
+
 SRL_HOST = os.getenv("HERD_TEST_SRL_HOST", "127.0.0.1")
 SRL_PORT = int(os.getenv("HERD_TEST_SRL_PORT", "2223"))
 SRL_USERNAME = "admin"
@@ -96,7 +98,8 @@ def _docker_exec(container: str, *args: str) -> str:
 
 
 def _srl_connection() -> ConnectHandler:
-    return ConnectHandler(
+    return open_lab_session(
+        "the SR Linux node",
         device_type="nokia_srl",
         host=SRL_HOST,
         port=SRL_PORT,
@@ -107,7 +110,8 @@ def _srl_connection() -> ConnectHandler:
 
 
 def _frr_connection() -> ConnectHandler:
-    return ConnectHandler(
+    return open_lab_session(
+        "the FRR node",
         device_type="cisco_ios",
         host=FRR_HOST,
         port=FRR_PORT,
