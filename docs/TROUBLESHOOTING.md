@@ -466,7 +466,10 @@ reservation in the batch is still driven. A known limit by decision, WIRE-RETRY-
   switch, issue #1001, and the retry tick finishes it). In a retry, the tick leaves the
   rows of a reservation whose apply hit the error unchanged and counts them in
   `skipped_upstream`; a build row whose endpoint read fails while the tick re-checks its
-  intent reads back `still_failed` only, and a manual retry answers 503. The rows are
+  intent reads back `still_failed` only, and a manual retry answers 503. An L3 row that
+  stores no routes and whose switch's configured-routes read is refused also reads back
+  `still_failed`, in the tick and in a manual retry, with every column unchanged (before
+  issue #1216 it was released as having no routes). The rows are
   driven again once inventory answers, with two limits. The NAK window is bounded:
   after `NATS_MAX_DELIVER` (5) deliveries over the `NATS_NAK_BACKOFF_SECONDS` schedule
   (about 81 seconds at the defaults) the event is dead-lettered (`nats_dlq_exhausted`),

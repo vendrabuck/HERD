@@ -907,10 +907,16 @@ removes exactly that when the switch is no longer needed.
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_drive_l3_route`, `_apply_l3_adjacency`) \
   Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_declaring_driver_receives_virtual_router_null_for_a_default_table_route`, `test_non_declaring_driver_is_never_handed_the_virtual_router_keyword`); `tests/integration/test_l3_intent_execution.py` (`test_vrf_route_reaches_a_declaring_driver_with_the_keyword`, `test_a_default_table_route_still_carries_no_vrf_to_a_non_declaring_driver`)
 - **WIRE-L3-18.** A latest-config read that answers 5xx, fails in transport, or (since
-  #1216) answers 401 or 403 nacks the message before any driver call, with no route row
-  written and the fork version unstamped: the switch is neither skipped as having no
-  routes nor refused `l3_switch_unconfigured`, and the redelivery provisions it. A 404
-  (or any other non-200 below 500, WIRE-ORDER-14) means the switch has no config. \
+  #1216) answers 401 or 403 raises `TransientUpstreamError`, so the message is nacked
+  before any L3 driver call of that pass and the fork version is left unstamped. The
+  switch whose read failed gets no route row written or changed: it is neither skipped
+  as having no routes nor refused `l3_switch_unconfigured`, and the redelivery
+  provisions it. What the same pass did before the read stays as it was left, as for any
+  nack: the L1 and L2 layers, which run first; another switch the L3 pass already
+  settled (recorded FAILED by the drive gate, or released by WIRE-L3-4); and a stale
+  build row already parked FAILED intended `RELEASED`, which the retry channels then
+  remove. A 404 (or any other non-200 below 500, WIRE-ORDER-14) means the switch has no
+  config. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_latest_config`, `_raise_if_token_refused`) \
   Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_config_fetch_5xx_raises_transient_for_nak`, `test_config_fetch_404_returns_none`, `test_config_read_auth_error_without_intent_naks_then_installs_routes`, `test_config_read_auth_error_on_intent_gate_naks_not_unconfigured`)
 - **WIRE-L3-19.** A provision of a switch that has a FAILED pin (a save rebuilding a
@@ -1124,12 +1130,15 @@ interface in section 8.15.
   by row id with one more attempt and the reason, with no driver call; a gate transport
   failure skips only that row. With no intent the row's stored routes are driven; a row
   that stores none is driven with the switch's configured routes, or released with no
-  driver call when those are empty too (WIRE-L3-4), and a transport failure reading the
-  configuration skips only that row. The
+  driver call when those are empty too (WIRE-L3-4). A failed read of the configuration
+  (a 5xx, a transport error, or since #1216 a 401 or 403) skips only that row, every
+  column unchanged, and it reads back `still_failed` in the tick and in a manual retry;
+  before #1216 a 401 or 403 read as no configured routes and released the row, a manual
+  retry reporting `released`. The
   stored routes the driven set drops are removed first (WIRE-L3-19), and a success
   replaces the stored routes with those driven (WIRE-LEDGER-2). \
   Enforced in: `services/execution/app/services/wiring_retry_service.py` (`_reattempt_l3_rows`); `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_retry_after_failed_delta_removes_the_routes_its_intent_drops`, `test_refused_intent_then_removed_retry_drives_the_configured_routes`, `test_refused_intent_then_fixed_retry_drives_the_intent`, `test_failed_intent_provision_then_intent_removed_retry_keeps_that_set`, `test_refused_intent_removed_with_no_configured_routes_retry_releases_the_row`); `services/execution/tests/test_wiring_retry_l3.py` (`test_l3_build_retry_with_current_intent_drives_intent_not_stale_pin`, `test_l3_build_retry_without_intent_drives_row_routes_verbatim`, `test_l3_build_retry_with_intent_gate_failure_makes_no_driver_call`, `test_l3_build_retry_gate_transient_failure_isolated_per_row`, `test_l3_build_retry_trunk_skipped_switch_still_retried_when_intent_present`)
+  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_retry_after_failed_delta_removes_the_routes_its_intent_drops`, `test_refused_intent_then_removed_retry_drives_the_configured_routes`, `test_refused_intent_then_fixed_retry_drives_the_intent`, `test_failed_intent_provision_then_intent_removed_retry_keeps_that_set`, `test_refused_intent_removed_with_no_configured_routes_retry_releases_the_row`, `test_retry_tick_config_read_token_refusal_skips_the_row_then_drives_it`, `test_manual_retry_config_read_token_refusal_reports_still_failed`); `services/execution/tests/test_wiring_retry_l3.py` (`test_l3_build_retry_with_current_intent_drives_intent_not_stale_pin`, `test_l3_build_retry_without_intent_drives_row_routes_verbatim`, `test_l3_build_retry_with_intent_gate_failure_makes_no_driver_call`, `test_l3_build_retry_gate_transient_failure_isolated_per_row`, `test_l3_build_retry_trunk_skipped_switch_still_retried_when_intent_present`)
 - **WIRE-RETRY-10.** An L2 release settled as superseded also frees its allocation when
   no ACTIVE membership remains, undefining the VLAN where it was defined. \
   Enforced in: `services/execution/app/services/wiring_retry_service.py` (`_reattempt_l2_rows`) \

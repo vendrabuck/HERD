@@ -112,6 +112,9 @@ def reservation_status():
     async def _verify(event_data, client):
         return await real_verify(event_data, _ReservationsStatusClient(state))
 
+    # A test that scripts reservations' answers itself reaches the real verifier here.
+    _verify.__wrapped_real__ = real_verify
+
     with patch("app.services.nats_consumer._verify_reservation_event", new=_verify):
         yield state
 
@@ -2581,6 +2584,96 @@ async def test_create_recheck_5xx_naks_before_any_recipe_call(reservation_status
     assert [r.status for r in rows] == ["CREATING"]
 
 
+class _ScriptedStatusClient:
+    """Answers reservations' GET /internal/{id} from a list of status codes, one per
+    call in order: 200 answers PENDING_PROVISION, anything else the token refusal."""
+
+    def __init__(self, codes):
+        self._codes = list(codes)
+
+    async def get(self, url, **kwargs):
+        code = self._codes.pop(0)
+        if code == 200:
+            return httpx.Response(200, json={"status": "PENDING_PROVISION"})
+        return httpx.Response(code, json={"detail": "Invalid internal token"})
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_create_recheck_token_refusal_naks_then_redelivery_creates(status, caplog):
+    """Issue #1215: the per-request re-check after the CREATING row is committed goes
+    through the same verifier as the event gate, so a 401 or 403 there (reservations
+    refusing execution's token mid-rotation) NAKs with no recipe call and is never
+    read as "the reservation ended": no `dynamic_instance_create_skipped_reservation_ended`,
+    no abandon, no DLQ, no failure callback. The redelivery reuses the CREATING row and
+    creates the instance. Delivery 1 answers the gate 200 and the re-check `status`;
+    delivery 2 answers both 200."""
+    from app.services.nats_consumer import NATS_NAK_BACKOFF_SECONDS
+
+    calls, execute = _recipe_execute({"create_instance": CREATE_OK})
+    posted = AsyncMock()
+    js = MagicMock()
+    js.publish = AsyncMock()
+    msg = _provision_msg(1)
+    real_verify = nats_consumer._verify_reservation_event.__wrapped_real__
+
+    def run_patches(codes):
+        client = _ScriptedStatusClient(codes)
+
+        async def _verify(event_data, _client):
+            return await real_verify(event_data, client)
+
+        patches = _create_patches(execute)
+        patches.append(patch("app.services.nats_consumer._verify_reservation_event", new=_verify))
+        patches.append(patch("app.services.nats_consumer._post_provision_result", new=posted))
+        return patches, client
+
+    patches, client = run_patches([200, status])
+    with caplog.at_level("INFO"), ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        result = await process_reservation_message(
+            msg, js, handle_reservation_event, _db_session_factory()
+        )
+
+    assert client._codes == [], "the gate and the re-check both asked"
+    assert result == "nak"
+    msg.nak.assert_awaited_once_with(delay=NATS_NAK_BACKOFF_SECONDS[0])
+    msg.ack.assert_not_awaited()
+    js.publish.assert_not_awaited()
+    posted.assert_not_awaited()
+    actions = _actions(caplog)
+    assert "dynamic_instance_create_skipped_reservation_ended" not in actions
+    assert "dynamic_provision_abandoned" not in actions
+    [nak] = [r for r in caplog.records if getattr(r, "action", None) == "nats_message_nak"]
+    assert str(nak.exc_info[1]) == f"verify reservation event: upstream {status}"
+    assert calls == []
+    [creating] = await _rows()
+    assert creating.status == "CREATING"
+    assert creating.instance_ref is None
+
+    redelivery = MagicMock()
+    redelivery.data = msg.data
+    redelivery.metadata = SimpleNamespace(num_delivered=2)
+    redelivery.ack = AsyncMock()
+    redelivery.nak = AsyncMock()
+    patches, client = run_patches([200, 200])
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        result = await process_reservation_message(
+            redelivery, js, handle_reservation_event, _db_session_factory()
+        )
+
+    assert result == "ack"
+    redelivery.nak.assert_not_awaited()
+    assert [c[0] for c in calls] == ["login", "create_instance", "logout"]
+    [row] = await _rows()
+    assert row.id == creating.id, "the redelivery reuses the CREATING row"
+    assert (row.status, row.instance_ref) == ("ACTIVE", "vm-100")
+    posted.assert_awaited_once()
+    assert posted.await_args.kwargs["succeeded"] is True
+
+
 @pytest.mark.parametrize(
     "delete_effect",
     [
@@ -2871,7 +2964,8 @@ async def test_full_recipe_cycle_never_stores_secret_plaintext():
 
 def _inventory_transport(denied: dict, unexpected: list):
     """Answer the template, hypervisor, and secret reads from the tables above; a path in
-    `denied` gets its status instead; anything else is recorded in `unexpected`."""
+    `denied` gets its status instead (or, for an exception value, raises it as a transport
+    error); anything else is recorded in `unexpected`."""
     from app.config import settings
 
     template_path = f"/templates/{TEMPLATE_ID}/internal"
@@ -2883,6 +2977,8 @@ def _inventory_transport(denied: dict, unexpected: list):
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if path in denied:
+            if isinstance(denied[path], Exception):
+                raise denied[path]
             return httpx.Response(denied[path], json={"detail": "Invalid internal token"})
         if path == template_path:
             return httpx.Response(200, json=TEMPLATE_DATA)
@@ -3004,7 +3100,7 @@ async def test_teardown_template_read_auth_error_raises_and_leaves_row_unchanged
     assert unexpected == []
 
 
-# --- issue #1216: a non-404 answer to the hypervisor or secret read is transient ---
+# --- issue #1216: a 401 or 403 on the hypervisor or secret read is transient ---
 #
 # Inventory and secrets answer a wrong X-Internal-Token with 403 "Invalid internal
 # token". Before #1216 the hypervisor and secret reads read any answer below 500 other
@@ -3017,12 +3113,16 @@ async def test_teardown_template_read_auth_error_raises_and_leaves_row_unchanged
 def _config_read_path(resource):
     from app.config import settings
 
+    if resource == "template":
+        return f"/templates/{TEMPLATE_ID}/internal"
     if resource == "hypervisor":
         return f"/hypervisors/{HYPERVISOR_ID}/internal"
     return httpx.URL(f"{settings.secrets_service_url}/internal/secrets/{SECRET_ID}/value").path
 
 
 def _config_read_what(resource):
+    if resource == "template":
+        return f"fetch template {TEMPLATE_ID}"
     if resource == "hypervisor":
         return f"fetch hypervisor {HYPERVISOR_ID}"
     return f"fetch secret {SECRET_ID}"
@@ -3096,16 +3196,12 @@ async def test_create_config_read_auth_error_naks_then_redelivery_creates(resour
     assert unexpected == []
 
 
-@pytest.mark.parametrize("status", [401, 403])
-@pytest.mark.parametrize("resource", ["hypervisor", "secret"])
-@pytest.mark.parametrize("seed", ["keyed_creating", "by_ref_active"])
-async def test_teardown_config_read_auth_error_raises_and_leaves_row_unchanged(
-    seed, resource, status, caplog
-):
-    """A terminal event whose dynamic teardown reads the hypervisor or secret and gets
-    401 or 403 raises TransientUpstreamError (the consumer NAKs), leaves the ledger row
-    exactly as it was, runs no recipe step, and logs no `recipe_config_missing`; the
-    redelivery, with the read answering, destroys the instance and retires the row."""
+async def _teardown_config_read_fails_then_redelivery_destroys(seed, resource, failure, caplog):
+    """Seed a live row, run a terminal event whose `resource` read fails with `failure`
+    (a status, or an exception raised as a transport error), and check the teardown
+    raised TransientUpstreamError with the row unchanged, no recipe step, no device
+    delete, and no `recipe_config_missing`; then redeliver with every read answering and
+    check the instance is destroyed and the row retired. Returns the raised text."""
     if seed == "keyed_creating":
         await _seed_creating()
     else:
@@ -3138,12 +3234,11 @@ async def test_teardown_config_read_auth_error_raises_and_leaves_row_unchanged(
         ]
 
     with caplog.at_level("INFO"), ExitStack() as stack:
-        for p in patches({_config_read_path(resource): status}):
+        for p in patches({_config_read_path(resource): failure}):
             stack.enter_context(p)
         with pytest.raises(TransientUpstreamError) as exc_info:
             await handle_reservation_event(event, _db_session_factory())
 
-    assert str(exc_info.value) == f"{_config_read_what(resource)}: upstream {status}"
     assert await snapshot() == before
     assert calls == []
     delete.assert_not_awaited()
@@ -3159,3 +3254,39 @@ async def test_teardown_config_read_auth_error_raises_and_leaves_row_unchanged(
     rows = await _rows()
     assert [r.status for r in rows] == ["DESTROYED"]
     assert unexpected == []
+    return str(exc_info.value)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("resource", ["hypervisor", "secret"])
+@pytest.mark.parametrize("seed", ["keyed_creating", "by_ref_active"])
+async def test_teardown_config_read_auth_error_raises_and_leaves_row_unchanged(
+    seed, resource, status, caplog
+):
+    """A terminal event whose dynamic teardown reads the hypervisor or secret and gets
+    401 or 403 raises TransientUpstreamError (the consumer NAKs), leaves the ledger row
+    exactly as it was, runs no recipe step, and logs no `recipe_config_missing`; the
+    redelivery, with the read answering, destroys the instance and retires the row."""
+    text = await _teardown_config_read_fails_then_redelivery_destroys(
+        seed, resource, status, caplog
+    )
+    assert text == f"{_config_read_what(resource)}: upstream {status}"
+
+
+@pytest.mark.parametrize("failure", [503, "transport"])
+@pytest.mark.parametrize("resource", ["template", "hypervisor", "secret"])
+async def test_teardown_config_read_5xx_or_transport_error_raises_and_leaves_row_unchanged(
+    resource, failure, caplog
+):
+    """DYN-DESTROY-17's other half: a 5xx or a transport error on the template,
+    hypervisor, or secret read during teardown raises TransientUpstreamError the same
+    way, before any recipe call and with the row unchanged, and the redelivery destroys
+    the instance."""
+    denial = httpx.ConnectError("connection refused") if failure == "transport" else failure
+    text = await _teardown_config_read_fails_then_redelivery_destroys(
+        "keyed_creating", resource, denial, caplog
+    )
+    if failure == "transport":
+        assert text == f"{_config_read_what(resource)}: transport error: connection refused"
+    else:
+        assert text == f"{_config_read_what(resource)}: upstream {failure}"
