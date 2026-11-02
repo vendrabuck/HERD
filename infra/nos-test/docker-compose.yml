@@ -56,6 +56,7 @@ services:
     volumes:
       - ./srl/start.sh:/etc/opt/srlinux/start.sh:ro
       - ./srl/baseline.cli:/etc/opt/srlinux/baseline.cli:ro
+      - ./srl/ssh_ready.sh:/etc/opt/srlinux/ssh_ready.sh:ro
     ports:
       - "${HERD_TEST_SRL_PORT:-2223}:22"
     healthcheck:
@@ -73,10 +74,21 @@ services:
       # argument is the correct non-interactive, single-shot form. "-c"
       # made this exit 1 on a "Parsing error: Unknown token 'commit'" even
       # when the info output itself was correct (verified live).
+      #
+      # Then, issue #1263, it proves SSH WORKS: ssh_ready.sh (mounted above)
+      # must read an "SSH-" version banner from port 22. The baseline check
+      # alone never opened an SSH connection, so `make nos-up` (`--wait`)
+      # could return while sshd still reset new connections during the banner
+      # exchange, and the first SR Linux dialect test failed with
+      # ConnectionResetError on a node reported healthy. A banner read rather
+      # than the FRR node's `nc -z`, because a socket that listens and then
+      # resets on connect is exactly that failure, and a port check passes it.
+      # The script's header says which namespaces and addresses it tries and
+      # which binaries it relies on.
       test:
         [
           "CMD-SHELL",
-          "test -f /etc/opt/srlinux/config.json && sr_cli 'info /interface ethernet-1/2 vlan-tagging' | grep -q true",
+          "test -f /etc/opt/srlinux/config.json && sr_cli 'info /interface ethernet-1/2 vlan-tagging' | grep -q true && bash /etc/opt/srlinux/ssh_ready.sh 22",
         ]
       # The budget below is deliberately generous because SR Linux's own boot
       # time (loading its many internal manager processes before sr_cli
