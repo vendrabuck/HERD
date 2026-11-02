@@ -375,7 +375,7 @@ describe("SettingsPage profile section", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save profile" }));
     await waitFor(() =>
       expect(toastError).toHaveBeenCalledWith(
-        "Phone: String should match pattern '^[0-9 +()-]*[0-9][0-9 +()-]*$'",
+        "Phone may contain only digits, spaces, +, -, (, and ), with at least one digit",
       ),
     );
     expect(toastSuccess).not.toHaveBeenCalled();

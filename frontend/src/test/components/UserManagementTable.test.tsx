@@ -66,6 +66,19 @@ describe("UserManagementTable profile column (issue #1252)", () => {
     expect(screen.getByRole("button", { name: "Edit profile of root" })).toBeInTheDocument();
   });
 
+  it("shows the username in the Name column when the payload has no full name", async () => {
+    // An older API answer without full_name, or an empty one, reads as the
+    // username, as the header does (displayName).
+    const legacy = { ...user({ id: "old-1", username: "olduser" }) } as Partial<User>;
+    delete legacy.full_name;
+    server.use(listHandler([legacy as User, user({ id: "e-1", username: "blank", full_name: "" })]));
+    renderTable();
+    const rows = await screen.findAllByRole("row");
+    const cellsOf = (i: number) => within(rows[i]).getAllByRole("cell").map((c) => c.textContent);
+    expect(cellsOf(1).slice(0, 2)).toEqual(["olduser", "olduser"]);
+    expect(cellsOf(2).slice(0, 2)).toEqual(["blank", "blank"]);
+  });
+
   it("PATCHes only the changed fields of the chosen account and refetches the list", async () => {
     let captured: { url: string; body: unknown } | null = null;
     let listCalls = 0;

@@ -421,11 +421,17 @@ const PROFILE_FIELD_LABELS: Record<string, string> = {
   phone: "Phone",
 };
 
+// Pydantic reports the phone character rule as the raw regular expression;
+// the profile forms show the rule in words instead (issue #1252).
+export const PHONE_PATTERN_TEXT =
+  "Phone may contain only digits, spaces, +, -, (, and ), with at least one digit";
+
 /**
  * Toast text for a failed profile save (issue #1252). A plain string detail
  * (404 "User not found") is shown as is. A pydantic 422 list naming the
  * profile fields becomes one "<Label>: <message>" per field, joined with
- * "; ", so a bad phone and a bad address are both reported. Anything else,
+ * "; ", so a bad phone and a bad address are both reported; a phone that
+ * breaks the character rule reads PHONE_PATTERN_TEXT, not the regex. Anything else,
  * a 422 entry for another field included, falls back to `fallback`.
  */
 export function profileSaveErrorText(err: unknown, fallback: string): string {
@@ -439,7 +445,12 @@ export function profileSaveErrorText(err: unknown, fallback: string): string {
     const field = Array.isArray(loc) ? loc[loc.length - 1] : undefined;
     const label = typeof field === "string" ? PROFILE_FIELD_LABELS[field] : undefined;
     if (!label || typeof msg !== "string") return fallback;
-    parts.push(`${label}: ${msg}`);
+    const type = (entry as { type?: unknown })?.type;
+    if (field === "phone" && type === "string_pattern_mismatch") {
+      parts.push(PHONE_PATTERN_TEXT);
+    } else {
+      parts.push(`${label}: ${msg}`);
+    }
   }
   return parts.join("; ");
 }

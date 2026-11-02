@@ -2,6 +2,7 @@ import { useState } from "react";
 import { usePaginatedUsers, useSetUserRole } from "@/api/admin";
 import { Pagination } from "@/components/ui/Pagination";
 import { EditProfileDialog } from "@/components/admin/EditProfileDialog";
+import { displayName } from "@/lib/profileEdit";
 import type { User } from "@/types/auth.types";
 
 interface UserManagementTableProps {
@@ -50,7 +51,7 @@ export function UserManagementTable({ currentUserId, showRoleControls = true }: 
 
             return (
               <tr key={user.id} className="hover:bg-gray-50">
-                <td className="px-4 py-3 font-medium text-gray-900">{user.full_name}</td>
+                <td className="px-4 py-3 font-medium text-gray-900">{displayName(user)}</td>
                 <td className="px-4 py-3 text-gray-700">{user.username}</td>
                 <td className="px-4 py-3 text-gray-600">{user.email}</td>
                 <td className="px-4 py-3">
