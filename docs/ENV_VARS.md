@@ -148,6 +148,8 @@ If you run a service on a different host or port, update the URL in `.env` or th
 |---|---|---|
 | `CORS_ORIGINS` | `""` in code; `https://localhost` at the docker-compose level | Comma-separated origins allowed by every backend's CORS middleware. Each service's `app/config.py` defaults to an empty string; `docker-compose.yml` supplies `${CORS_ORIGINS:-https://localhost}` for every service, so a fresh `.env` (which also sets `CORS_ORIGINS=https://localhost`) gets `https://localhost` in practice. Add your real hostname or IP to enable cross-host access. The config service keeps the value only as a setting it stores for the other services; its own CORS policy allows any origin and never allows credentials. |
 
+| `HERD_GATEWAY_BIND` | unset (every IPv4 interface, `0.0.0.0`) | Host address Traefik publishes ports 80 and 443 on (issue #1256). A compose-level knob, not a Settings field: `docker-compose.yml` interpolates `${HERD_GATEWAY_BIND:-0.0.0.0}` into the two gateway port entries, read from the shell environment or `.env`, and no service reads it. Set it to one IPv4 address (for example the wired NIC of a host that also has wifi) to serve the stack at that address only: `localhost` and every other interface are then refused. The Traefik dashboard stays on `127.0.0.1:8080` whatever the value. The Makefile reads the same value (the environment or command line first, else the last `HERD_GATEWAY_BIND=` line of `.env`) and derives the address its host-side harnesses use: `localhost` for unset, empty, or `0.0.0.0`, otherwise the value as written; `make gateway-url` prints the result, and it becomes the default of the exported `HERD_BASE_URL` and `E2E_HOST_BASE_URL`. A browser at the bound address warns about the certificate until #1239 lands (see TROUBLESHOOTING.md). |
+
 TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env var for cert paths. See [OPERATIONS.md](OPERATIONS.md#tls-certificate-rotation).
 
 ## NATS
@@ -452,7 +454,8 @@ Knobs read by `tests/e2e/conftest.py` and `pytest tests/e2e/`, not by the runnin
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `E2E_HOST_BASE_URL` | `https://localhost` | HERD URL as seen by the pytest process on the host, used by Playwright tests and by host-side API calls made from Selenium test fixtures. |
+| `E2E_HOST_BASE_URL` | `https://localhost` (under make, `https://<gateway host>`) | HERD URL as seen by the pytest process on the host, used by Playwright tests and by host-side API calls made from Selenium test fixtures. The Makefile exports `$(GATEWAY_URL)` (see `HERD_GATEWAY_BIND`) as its default, so `make test-e2e` follows the bind address; a value already in the environment wins. |
+| `HERD_BASE_URL` | `https://localhost/api` (under make, `https://<gateway host>/api`) | Gateway API root for the host-side harnesses that address a running stack: `seedtools` (after `SEED_BASE_URL`), the integration, contract, and NOS lab via-stack suites, and `make test-load`, whose locust `--host` drops a trailing `/api`. The Makefile exports it the same way as `E2E_HOST_BASE_URL`. |
 | `HERD_E2E_REQUIRE_NO_SKIP` | (unset) | Set to `1` (via `make test-e2e-seeded`) to fail the run if any non-exempt test skips; see the seeded-stack skip gate in `tests/e2e/conftest.py`. |
 | `HERD_E2E_ARTIFACT_DIR` | `<tempdir>/herd-e2e-artifacts` | Root directory failure artifacts (screenshot, page HTML, console log, traceback, metadata) are written under when an e2e test fails during its call phase. One subdirectory per failing test, named from its sanitized nodeid; overwritten on rerun. Nothing is written for a passing test. See `docs/TROUBLESHOOTING.md`. |
 

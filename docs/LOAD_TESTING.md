@@ -157,9 +157,11 @@ Equivalent to:
 
 ```bash
 cd tests/load && uv run locust -f locustfile.py \
-  --host ${HERD_BASE_URL:-https://localhost} \
+  --host https://localhost \
   --headless -u 20 -r 5 --run-time 1m
 ```
+
+where the host is the Makefile's `LOAD_HOST`: `HERD_BASE_URL` with a trailing `/api` dropped (the locustfile's paths start with `/api`), and `HERD_BASE_URL` defaults to `https://<gateway host>/api`, the address `HERD_GATEWAY_BIND` gives (`make gateway-url`; `localhost` when unset).
 
 - `-u 20`: total virtual users
 - `-r 5`: spawn rate (users per second)
@@ -187,7 +189,7 @@ uv run locust -f locustfile.py \
 
 ### Targeting a non-default host
 
-Set `HERD_BASE_URL` to point the Makefile targets at a different stack:
+Set `HERD_BASE_URL` to point the Makefile targets at a different stack (with or without the `/api` suffix):
 
 ```bash
 HERD_BASE_URL=https://localhost make test-load
@@ -215,7 +217,7 @@ An "Error report" at the bottom lists exception messages for any failed requests
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `HERD_BASE_URL` | Target stack URL | `https://localhost` |
+| `HERD_BASE_URL` | Target stack URL (a trailing `/api` is dropped for locust's `--host`) | `https://<gateway host>/api` under make (see `HERD_GATEWAY_BIND`), `https://localhost` otherwise |
 | `SEED_EMAIL` | Admin login for `ReservationUser` and `InventoryBrowser` | `admin@example.com` |
 | `SEED_PASSWORD` | Admin password | `admin123!` |
 | `SEED_USER_EMAIL` | Regular user login for `ACLChecker` | `user1@herd.dev` |
