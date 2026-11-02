@@ -32,8 +32,8 @@ numbered in section 8.
 | Actor | May | May not |
 |---|---|---|
 | Unauthenticated caller | Register (local mode only), log in, refresh, log out, exchange an API token, read `/health` and `/version` | Anything else; every other route answers 401 |
-| User | Read their own account, list groups by name, read any user's group memberships, ask the acl service about their own access | Read a group's members, change any group, list users, change roles or activation, create API tokens, manage grants, ask about another user's access |
-| Admin | Everything a user may; list users; activate any account; deactivate any account other than their own and the superadmin's; manage groups and members; manage directory mappings and run directory sync; create API tokens for any principal of their rank or lower; list and revoke every API token; manage grants; ask about any user's access | Change any role; assign the superadmin role; deactivate the superadmin or themselves; mint a token above their own rank |
+| User | Read their own account, edit their own profile (name, contact email, phone), list groups by name, read any user's group memberships, ask the acl service about their own access | Read a group's members, change any group, list users, change roles or activation, create API tokens, manage grants, ask about another user's access |
+| Admin | Everything a user may; list users; edit any account's profile, the superadmin's included; activate any account; deactivate any account other than their own and the superadmin's; manage groups and members; manage directory mappings and run directory sync; create API tokens for any principal of their rank or lower; list and revoke every API token; manage grants; ask about any user's access | Change any role; assign the superadmin role; deactivate the superadmin or themselves; mint a token above their own rank |
 | Superadmin | Everything an admin may; set any other non-superadmin account's role to user or admin; mint superadmin tokens | Change their own role or another superadmin's; assign the superadmin role; deactivate themselves |
 | Another service (internal token) | List active admin ids, read a user's contact details, read an active user's groups (auth); run a permission check for a user id (acl) | Anything through the user-facing routes |
 
@@ -41,7 +41,7 @@ numbered in section 8.
 
 | Concept | Meaning | Owner | Stored in |
 |---|---|---|---|
-| User account | Email, username, role, `auth_source` (`local` or `ldap`), `is_active`, `deactivated_by_sync`, a bcrypt hash for local accounts only | auth | `users` (`User` in `services/auth/app/models/user.py`) |
+| User account | Email, username, role, `auth_source` (`local` or `ldap`), `is_active`, `deactivated_by_sync`, a bcrypt hash for local accounts only, and the profile: `full_name` (required), `contact_email` and `phone` (optional) | auth | `users` (`User` in `services/auth/app/models/user.py`) |
 | Role | `user`, `admin`, or `superadmin`, ranked in that order | auth | `users.role` |
 | Access token | A signed JWT carrying `sub`, `username`, `email`, `role`, `exp`, `iat` (and `auth_source` when minted from an API token). Never stored | auth (issues); every service verifies | the client |
 | Refresh token | An opaque random value; only its SHA-256 hash is stored, with an expiry and a revoked flag | auth | `refresh_tokens` (`RefreshToken`) |
@@ -190,12 +190,14 @@ Auth service:
 
 | Method | Path | Who may call | Success | Rules |
 |---|---|---|---|---|
-| POST | `/register` | anyone, unauthenticated; local mode only | 201 | IAM-REG-1 to IAM-REG-6 |
+| POST | `/register` | anyone, unauthenticated; local mode only | 201 | IAM-REG-1 to IAM-REG-6, IAM-PROFILE-9 |
 | POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-4, IAM-LDAP-1 to IAM-LDAP-11 |
 | POST | `/refresh` | anyone holding a refresh token | 200 | IAM-SESSION-1, IAM-SESSION-2, IAM-JWT-2 |
 | POST | `/logout` | anyone, unauthenticated | 204 | IAM-SESSION-3 |
-| GET | `/me` | any signed-in active account | 200 | IAM-JWT-3, IAM-ROLE-8 |
-| GET | `/users` | admin, superadmin | 200 | IAM-USER-1 |
+| GET | `/me` | any signed-in active account | 200 | IAM-JWT-3, IAM-ROLE-8, IAM-PROFILE-10 |
+| PATCH | `/me/profile` | any signed-in active account, for itself | 200 | IAM-PROFILE-3 to IAM-PROFILE-8 |
+| GET | `/users` | admin, superadmin | 200 | IAM-USER-1, IAM-PROFILE-10 |
+| PATCH | `/users/{id}/profile` | any signed-in active account; a user only for their own id, admin and superadmin for any | 200 | IAM-PROFILE-1 to IAM-PROFILE-8 |
 | PUT | `/users/{id}/role` | superadmin | 200 | IAM-USER-2 to IAM-USER-7 |
 | POST | `/users/{id}/activate` | admin, superadmin | 200 | IAM-ACCT-2 |
 | POST | `/users/{id}/deactivate` | admin, superadmin | 200 | IAM-ACCT-1 |
@@ -251,7 +253,7 @@ None. Neither service publishes or consumes a NATS event.
 | Method | Path | Auth | Caller | Answers | Rules |
 |---|---|---|---|---|---|
 | GET | `/internal/admins` (auth) | `X-Internal-Token` | notifications (health fan-out) | list of user ids | IAM-INTERNAL-2, IAM-INTERNAL-3 |
-| GET | `/internal/users/{user_id}/contact` (auth) | `X-Internal-Token` | notifications (outbound channels) | `{user_id, email, username}` | IAM-INTERNAL-2, IAM-INTERNAL-4 |
+| GET | `/internal/users/{user_id}/contact` (auth) | `X-Internal-Token` | notifications (outbound channels) | `{user_id, email, username}`; `email` is the contact email when set, else the login email | IAM-INTERNAL-2, IAM-INTERNAL-4 |
 | GET | `/internal/users/{user_id}/groups` (auth) | `X-Internal-Token` | acl (`POST /internal/check`) | list of groups, same shape as `GET /groups/user/{user_id}` | IAM-INTERNAL-2, IAM-INTERNAL-5 |
 | POST | `/internal/check` (acl) | `X-Internal-Token` | inventory (scheduled apply re-check, through `herd_common`) | `{allowed, grants}` | IAM-INTERNAL-2, IAM-ACL-12 |
 
@@ -672,7 +674,8 @@ demotes them back. Activation is in the State model (IAM-ACCT-1, IAM-ACCT-2).
   Pinned by: none
 
 **Out of scope.** The user interface has no activate or deactivate control and no API
-token page; those exist only through the API. Nothing deletes an account.
+token page; those exist only through the API. Nothing deletes an account. Profile
+editing from the same page is section 8.18.
 
 ### 8.9 User groups
 
@@ -1155,9 +1158,14 @@ check.
   Enforced in: `services/auth/app/routers/internal.py` (`list_admin_user_ids`) \
   Pinned by: `services/auth/tests/test_internal.py` (`test_internal_admins_returns_admin_and_superadmin`, `test_internal_admins_excludes_inactive_users`)
 - **IAM-INTERNAL-4.** The contact route answers any existing account, active or not, and
-  404 for an unknown id; the caller decides whether to send. \
-  Enforced in: `services/auth/app/routers/internal.py` (`get_user_contact`) \
-  Pinned by: `services/auth/tests/test_internal.py` (`test_internal_user_contact_returns_email_and_username`, `test_internal_user_contact_404_for_unknown_user`)
+  404 for an unknown id; the caller decides whether to send. Its `email` is the
+  account's `contact_email` when one is set and the login email otherwise (issue
+  #1252), with the response shape unchanged, so notifications addresses email there
+  with no change of its own. A changed address reaches notifications within its contact
+  cache TTL (`PREFERENCES_CACHE_TTL_SECONDS`, 30 s by default); nothing invalidates the
+  cache on a profile write. \
+  Enforced in: `services/auth/app/routers/internal.py` (`get_user_contact`); `services/notifications/app/services/contact_client.py` (`ContactClient`) \
+  Pinned by: `services/auth/tests/test_internal.py` (`test_internal_user_contact_returns_email_and_username`, `test_internal_user_contact_404_for_unknown_user`, `test_internal_user_contact_returns_contact_email_when_set`, `test_internal_user_contact_returns_login_email_when_contact_email_is_null`); `services/notifications/tests/test_email_dispatcher.py` (`test_email_is_addressed_to_the_contact_email_auth_reports`); `tests/integration/test_user_profile_flow.py` (`test_contact_route_answers_contact_email_then_the_login_email`)
 - **IAM-INTERNAL-5.** The internal groups route answers the same shape as
   `GET /groups/user/{user_id}`, and 404 for an unknown or inactive account. \
   Enforced in: `services/auth/app/routers/internal.py` (`get_user_groups_internal`) \
@@ -1286,6 +1294,105 @@ sends signed-out visitors to the login page, and keeps admin pages away from non
 
 **Out of scope.** Theming and preferences (`operations-and-observability.md`).
 
+### 8.18 User profile
+
+**What it does.** Every account carries a display name, and may carry a contact email
+(where email notifications go instead of the sign-in email) and a phone number (stored
+and shown only; nothing calls or texts it). The account edits its own profile on
+Settings; an admin or the superadmin edits any account's profile from the Users page.
+The sign-in email and the username are not part of the profile and no route here
+changes them.
+
+**Surfaces.** User interface `frontend/src/pages/SettingsPage.tsx` (Profile section),
+`frontend/src/components/admin/UserManagementTable.tsx` with
+`frontend/src/components/admin/EditProfileDialog.tsx` (Users page), both built on
+`frontend/src/components/profile/ProfileForm.tsx`, and the Name field of
+`frontend/src/pages/RegisterPage.tsx`; routes `PATCH /me/profile` and
+`PATCH /users/{id}/profile` (body `ProfileUpdateRequest` in
+`services/auth/app/schemas/auth.py`), with the fields on `UserResponse`; migration
+`services/auth/migrations/versions/0009_user_profile.py`.
+
+**Rules.**
+
+- **IAM-PROFILE-1.** On `PATCH /users/{id}/profile` a caller whose effective role is
+  `user` may name only their own id; any other id, existing or not, active or not,
+  answers 404 `User not found` byte-identical to an unknown id. The refusal is decided
+  before any read of the users table, so neither the answer nor the work done depends
+  on whether the account exists. The route does not use `require_role`, which would
+  answer 403. \
+  Enforced in: `services/auth/app/routers/admin.py` (`update_user_profile_by_id`, `PROFILE_EDIT_ANY_ROLES`) \
+  Pinned by: `services/auth/tests/test_user_profile_routes.py` (`test_user_naming_another_id_gets_404_byte_identical_to_an_unknown_id`, `test_user_naming_another_inactive_id_gets_the_same_404`, `test_user_naming_own_id_on_the_id_route_edits_own_profile`, `test_user_refusal_on_another_id_makes_no_lookup`); `tests/integration/test_user_profile_flow.py` (`test_user_naming_another_id_gets_the_unknown_id_404`)
+- **IAM-PROFILE-2.** A caller whose effective role is `admin` or `superadmin` may edit
+  any account's profile, active or inactive, the superadmin's included; an unknown id
+  answers 404 `User not found`. The decision uses the effective role (IAM-ROLE-2), so
+  an admin account holding a token whose claim is `user` is judged as a user, and so is
+  a demoted account holding an older admin token. \
+  Enforced in: `services/auth/app/routers/admin.py` (`update_user_profile_by_id`); `services/auth/app/dependencies/auth.py` (`get_effective_role`) \
+  Pinned by: `services/auth/tests/test_user_profile_routes.py` (`test_admin_edits_another_users_profile_and_is_recorded_as_modifier`, `test_admin_edits_an_inactive_users_profile`, `test_superadmin_edits_an_admins_profile`, `test_admin_edits_the_superadmins_profile`, `test_admin_naming_an_unknown_id_gets_404`, `test_admin_account_holding_a_user_claim_token_is_judged_as_user`, `test_demoted_account_holding_an_admin_claim_token_is_judged_as_user`); `tests/integration/test_user_profile_flow.py` (`test_admin_edits_a_users_profile_and_reads_it_back_from_the_user_list`); `tests/e2e/test_user_profile_playwright.py` (`test_admin_edits_another_users_profile_on_the_users_page`)
+- **IAM-PROFILE-3.** Both profile routes accept only `full_name`, `contact_email`, and
+  `phone`. Any other key (`role`, `email`, `username`, `is_active`,
+  `deactivated_by_sync`, `auth_source`, `hashed_password`) is a 422 of type
+  `extra_forbidden` and nothing is written; role and activation keep their own routes.
+  The service function refuses any other column name as a second line. \
+  Enforced in: `services/auth/app/schemas/auth.py` (`ProfileUpdateRequest`); `services/auth/app/services/auth_service.py` (`update_user_profile`, `PROFILE_FIELDS`) \
+  Pinned by: `services/auth/tests/test_profile_schema.py` (`test_non_profile_key_refused_as_extra`); `services/auth/tests/test_user_profile_routes.py` (`test_non_profile_key_is_a_422_and_the_account_is_unchanged`, `test_id_route_refuses_a_non_profile_key_even_for_an_admin`)
+- **IAM-PROFILE-4.** PATCH semantics: an omitted key is unchanged; `null` on
+  `contact_email` or `phone` clears it, and an empty or all-white-space string is read
+  as `null`; `null` on `full_name` is a 422 `Value error, full_name may not be null`
+  and an empty one a 422 `String should have at least 1 character`, each located at
+  `["body", "full_name"]`. \
+  Enforced in: `services/auth/app/schemas/auth.py` (`ProfileUpdateRequest`, `FULL_NAME_NULL_MESSAGE`, `_blank_to_none`) \
+  Pinned by: `services/auth/tests/test_profile_schema.py` (`test_full_name_null_refused_naming_the_field`, `test_contact_email_blank_reads_as_null`, `test_contact_email_null_clears`, `test_phone_blank_reads_as_null`, `test_omitted_keys_are_not_in_changes`); `services/auth/tests/test_user_profile_routes.py` (`test_omitted_keys_are_left_unchanged`, `test_empty_string_and_null_clear_contact_email_and_phone`, `test_null_full_name_is_a_422_naming_the_field_and_writes_nothing`, `test_empty_full_name_is_a_422_naming_the_field`)
+- **IAM-PROFILE-5.** `full_name` is stripped of leading and trailing white space and
+  must then be 1 to 200 characters; it is not unique. `contact_email` is a valid email
+  address (pydantic `EmailStr`), not unique, and never a login identity. `phone` holds
+  only digits, spaces, `+`, `-`, `(`, and `)`, at least one digit, at most 32
+  characters; there is no E.164 check. \
+  Enforced in: `services/auth/app/schemas/auth.py` (`FullName`, `Phone`, `PHONE_PATTERN`, `ProfileUpdateRequest`) \
+  Pinned by: `services/auth/tests/test_profile_schema.py` (`test_full_name_at_200_characters_accepted`, `test_full_name_at_201_characters_refused_with_exact_message`, `test_full_name_empty_after_strip_refused_with_exact_message`, `test_full_name_is_stripped`, `test_contact_email_invalid_address_refused_with_exact_message`, `test_phone_with_every_allowed_character_accepted`, `test_phone_at_32_characters_accepted`, `test_phone_at_33_characters_refused_with_exact_message`, `test_phone_with_a_disallowed_character_refused_with_exact_message`, `test_phone_without_a_digit_refused_with_exact_message`)
+- **IAM-PROFILE-6.** Every accepted profile write sets `modified_by` to the caller, a
+  self edit included. (Activation still does not record it; IAM-USER-7 covers roles.) \
+  Enforced in: `services/auth/app/services/auth_service.py` (`update_user_profile`) \
+  Pinned by: `services/auth/tests/test_user_profile_routes.py` (`test_self_edit_writes_all_three_fields_and_sets_modified_by`, `test_admin_edits_another_users_profile_and_is_recorded_as_modifier`, `test_admin_direct_call_writes_with_the_caller_as_modifier`); `tests/integration/test_user_profile_flow.py` (`test_self_profile_edit_reads_back_through_me`)
+- **IAM-PROFILE-7.** An LDAP account edits its profile by the same rules. Phase 1 reads
+  no directory display-name or telephone attribute: provisioning (login or sync) sets
+  `full_name` to the username and leaves the other two empty, and sync never writes a
+  profile field. The directory still owns `username` and the login email. \
+  Enforced in: `services/auth/app/services/auth_service.py` (`create_ldap_user`) \
+  Pinned by: `services/auth/tests/test_user_profile_routes.py` (`test_ldap_account_may_edit_its_profile`); `services/auth/tests/test_auth_ldap.py` (`test_ldap_login_jit_provision_sets_full_name_to_username`)
+- **IAM-PROFILE-8.** Each write logs one INFO line with action `user_profile_updated`,
+  `user_id`, and `changed_fields`, the sorted names of the fields whose stored value
+  changed; never a value, since the contact email and phone are personal data. \
+  Enforced in: `services/auth/app/services/auth_service.py` (`update_user_profile`) \
+  Pinned by: `services/auth/tests/test_user_profile_routes.py` (`test_profile_write_logs_one_line_with_changed_field_names_and_no_values`)
+- **IAM-PROFILE-9.** Every account has a `full_name`. `RegisterRequest.full_name` is
+  optional with IAM-PROFILE-5's bounds, and omitted or `null` stores the username; the
+  startup seed and LDAP provisioning store the username; the column is NOT NULL with an
+  insert-time default copying the row's username; migration 0009 adds the three
+  columns, backfills `full_name` from `username` on existing rows, then makes it NOT
+  NULL. \
+  Enforced in: `services/auth/app/schemas/auth.py` (`RegisterRequest`); `services/auth/app/services/auth_service.py` (`create_user`, `create_ldap_user`); `services/auth/app/models/user.py` (`_default_full_name`); `services/auth/migrations/versions/0009_user_profile.py` (`upgrade`, `downgrade`) \
+  Pinned by: `services/auth/tests/test_user_profile_routes.py` (`test_register_without_full_name_stores_the_username`, `test_register_with_full_name_stores_it_stripped`, `test_create_user_without_a_name_defaults_to_the_username`); `services/auth/tests/test_profile_schema.py` (`test_register_full_name_is_optional`, `test_register_full_name_at_201_characters_refused`, `test_register_full_name_blank_refused`); `services/auth/tests/test_user_profile_migration.py` (`test_upgrade_backfills_full_name_from_username_on_existing_rows`, `test_upgrade_leaves_full_name_not_null_and_the_other_two_nullable`, `test_downgrade_drops_the_three_columns_and_keeps_the_rows`, `test_fresh_schema_declares_the_same_columns_as_the_migration`)
+- **IAM-PROFILE-10.** `UserResponse` carries `full_name`, `contact_email`, and `phone`,
+  so `GET /me`, `GET /users`, register, and both profile routes report them with no
+  second fetch. \
+  Enforced in: `services/auth/app/schemas/auth.py` (`UserResponse`) \
+  Pinned by: `services/auth/tests/test_user_profile_routes.py` (`test_me_reports_the_profile_fields_after_a_self_edit`); `tests/e2e/test_user_profile_playwright.py` (`test_self_profile_edit_on_settings_reads_back_through_me`)
+- **IAM-PROFILE-11.** The Settings Profile section and the Users page Edit profile
+  dialog show the sign-in email and username read-only, require a name, send only the
+  fields that changed (a blank optional field as `null`), and report a 422 per field as
+  `<Label>: <message>`. A successful self edit, or an admin's edit of their own row,
+  replaces the cached current user, so the header shows the new name at once. The
+  header shows `full_name`, falling back to the username. Register prefills Name from
+  the username until the name is edited, and omits it when blank. \
+  Enforced in: `frontend/src/components/profile/ProfileForm.tsx` (`ProfileForm`); `frontend/src/lib/profileEdit.ts` (`profileEditPayload`, `displayName`); `frontend/src/lib/errors.ts` (`profileSaveErrorText`); `frontend/src/api/auth.ts` (`useUpdateMyProfile`); `frontend/src/api/admin.ts` (`useUpdateUserProfile`); `frontend/src/pages/RegisterPage.tsx` (`RegisterPage`) \
+  Pinned by: `frontend/src/test/pages/SettingsPage.test.tsx` (`prefills the editable fields and shows the login identity read-only`, `disables Save profile until a field changes and while the name is blank`, `PATCHes only the changed fields and refreshes the cached current user`, `toasts a 422 per field through profileSaveErrorText`); `frontend/src/test/components/UserManagementTable.test.tsx` (`shows a Name column and an Edit profile control on every row, superadmin included`, `PATCHes only the changed fields of the chosen account and refetches the list`, `an admin editing their own row also refreshes the cached current user`); `frontend/src/test/components/AppLayout.test.tsx` (`shows the full name in the header (issue #1252)`, `falls back to the username when the full name is empty (issue #1252)`); `frontend/src/test/pages/RegisterPage.test.tsx` (`prefills Name from the username until the name is edited`, `omits full_name when the name is cleared, so the API stores the username`); `frontend/src/test/lib/profileEdit.test.ts` (`sends only the changed name, trimmed`, `sends a cleared contact email and phone as null`)
+
+**Out of scope.** SMS or any call to the phone number; a `department` field (the
+obvious next column, same rules); avatars; mapping a directory attribute onto a profile
+field; changing the login email or username; notification cache invalidation on a
+profile write.
+
 ## 9. Errors
 
 FastAPI validation errors (422) carry `detail` as a list of `{loc, msg, type}`; every
@@ -1310,7 +1417,7 @@ other error carries `detail` as a string. A 401 from a bearer check also sends
 | 403 | `Admin or superadmin role required` | an acl grant route as a non-admin claim | IAM-ACL-4, IAM-CLAIM-2 |
 | 403 | `Cannot query permissions for another user` | acl check, batch, or resources about someone else | IAM-ACL-8 |
 | 403 | `Invalid internal token` | an internal route with a wrong token | IAM-INTERNAL-2 |
-| 404 | `User not found` | role change, activate, deactivate, add member, or an internal lookup on an unknown account; internal groups on an inactive one | IAM-USER-5, IAM-ACCT-1, IAM-ACCT-2, IAM-GROUP-6, IAM-INTERNAL-4, IAM-INTERNAL-5 |
+| 404 | `User not found` | role change, activate, deactivate, add member, profile edit, or an internal lookup on an unknown account; internal groups on an inactive one; a user's profile edit naming any account but their own | IAM-USER-5, IAM-ACCT-1, IAM-ACCT-2, IAM-GROUP-6, IAM-INTERNAL-4, IAM-INTERNAL-5, IAM-PROFILE-1 |
 | 404 | `Principal user not found` | token create for an unknown principal | IAM-APITOK-1 |
 | 404 | `Group not found` | any group route on an unknown group (admin caller) | IAM-GROUP-6, IAM-GROUP-7, IAM-GROUP-8, IAM-GROUP-9 |
 | 404 | `Member not found` | remove a non-member | IAM-GROUP-7 |
@@ -1329,7 +1436,7 @@ other error carries `detail` as a string. A 401 from a bearer check also sends
 | 409 | `Directory sync requires auth_method=ldap` | sync-now outside LDAP mode | IAM-SERIAL-2 |
 | 409 | `A sync run is already in progress`, `A sync run is already in progress on another replica` | sync-now while a run holds the slot | IAM-SERIAL-1 |
 | 409 | `This grant already exists` | duplicate grant | IAM-ACL-2 |
-| 422 | validation list | registration, login, group, bulk, mapping, token, grant, or check body out of bounds; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-LOGIN-3, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2 |
+| 422 | validation list | registration, login, profile, group, bulk, mapping, token, grant, or check body out of bounds; a profile body with a key other than the three profile fields, or a null or empty `full_name`; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-PROFILE-3, IAM-PROFILE-4, IAM-PROFILE-5, IAM-LOGIN-3, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2 |
 | 422 | `group_dn does not resolve in the directory` | mapping DN proven absent | IAM-MAP-3 |
 | 503 | `Directory unavailable, mapping not validated` | mapping create while the directory cannot be asked | IAM-MAP-3 |
 | 503 | `Internal API token not configured` | an internal route with no token configured | IAM-INTERNAL-2 |
@@ -1388,11 +1495,11 @@ cap 20 per category; prune cadence 24 hours; bulk and batch caps 500.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/auth/tests/` (in-memory SQLite, `test_effective_role_unit.py`, `test_api_tokens.py`, `test_ldap_service.py`, `test_ldap_sync_service.py`, `test_ldap_sync_service_scaling.py`, `test_ldap_sync_stale_run_reaper.py`, `test_ldap_sync_loop.py`); `services/acl/tests/test_grant_service_unit.py`, `test_auth_client.py`, `test_schema_validators.py`; `services/common/tests/test_auth.py`, `test_auth_settings.py`, `test_internal_auth.py`, `test_acl.py`; `services/notifications/tests/test_router.py` (its token decode); `tests/unit/test_jwt_settings_wiring.py`; `frontend/src/test/` (`api/client.test.ts`, `stores/authStore.test.ts`, `lib/roles.test.ts`, `components/guards.test.tsx`, `components/AdminGuard.test.tsx`, `routes.test.tsx`, the admin page tests) | SQLite has no advisory locks, so only the in-process half of the run slot is exercised here |
-| Functional (through the service API) | `services/auth/tests/test_auth.py`, `test_groups.py`, `test_internal.py`, `test_ldap_sync.py`, `test_effective_role_http.py`, `test_auth_ldap.py`; `services/acl/tests/test_grants.py`, `test_internal.py`; the live suites `services/auth/tests/test_ldap_service_live.py` (real directory) and `services/auth/tests/test_ldap_sync_service_live_pg.py` (real Postgres) | The live-LDAP suite runs in the gates' live-LDAP phase; the Postgres suite in `_gate-pg-live-tests` |
-| Integration (running stack) | `tests/integration/test_auth_flow.py`, `test_acl_flow.py`, `test_ldap_auth.py`, `test_ldap_sync_admin.py` | The LDAP ones run only in the gates' LDAP-mode phase |
-| Stress and load | `tests/load/locustfile.py` (every user logs in; `ACLChecker` exercises the check route) | No load test covers refresh, the token exchange, or a sync run |
-| Browser end-to-end | `tests/e2e/test_login.py`, `test_register_and_roles.py`, `test_roles_playwright.py`, `test_admin_guard_redirect_playwright.py`, `test_user_groups_playwright.py`, `test_acl_grants_playwright.py`, `test_ldap_sync_admin_playwright.py`, `test_ldap_login.py` | Runs nightly and in the gates; the LDAP login tests are exempt skips on the local-mode gate stack |
+| Unit | `services/auth/tests/` (in-memory SQLite, `test_profile_schema.py`, `test_user_profile_migration.py`, `test_effective_role_unit.py`, `test_api_tokens.py`, `test_ldap_service.py`, `test_ldap_sync_service.py`, `test_ldap_sync_service_scaling.py`, `test_ldap_sync_stale_run_reaper.py`, `test_ldap_sync_loop.py`); `services/acl/tests/test_grant_service_unit.py`, `test_auth_client.py`, `test_schema_validators.py`; `services/common/tests/test_auth.py`, `test_auth_settings.py`, `test_internal_auth.py`, `test_acl.py`; `services/notifications/tests/test_router.py` (its token decode); `tests/unit/test_jwt_settings_wiring.py`; `frontend/src/test/` (`api/client.test.ts`, `stores/authStore.test.ts`, `lib/roles.test.ts`, `components/guards.test.tsx`, `components/AdminGuard.test.tsx`, `routes.test.tsx`, the admin page tests) | SQLite has no advisory locks, so only the in-process half of the run slot is exercised here |
+| Functional (through the service API) | `services/auth/tests/test_auth.py`, `test_user_profile_routes.py`, `test_groups.py`, `test_internal.py`, `test_ldap_sync.py`, `test_effective_role_http.py`, `test_auth_ldap.py`; `services/acl/tests/test_grants.py`, `test_internal.py`; the live suites `services/auth/tests/test_ldap_service_live.py` (real directory) and `services/auth/tests/test_ldap_sync_service_live_pg.py` (real Postgres) | The live-LDAP suite runs in the gates' live-LDAP phase; the Postgres suite in `_gate-pg-live-tests` |
+| Integration (running stack) | `tests/integration/test_auth_flow.py`, `test_user_profile_flow.py`, `test_acl_flow.py`, `test_ldap_auth.py`, `test_ldap_sync_admin.py` | The LDAP ones run only in the gates' LDAP-mode phase |
+| Stress and load | `tests/load/locustfile.py` (every user logs in; `ACLChecker` exercises the check route; `NotificationUser` edits its own profile name) | No load test covers refresh, the token exchange, or a sync run |
+| Browser end-to-end | `tests/e2e/test_login.py`, `test_register_and_roles.py`, `test_roles_playwright.py`, `test_user_profile_playwright.py`, `test_admin_guard_redirect_playwright.py`, `test_user_groups_playwright.py`, `test_acl_grants_playwright.py`, `test_ldap_sync_admin_playwright.py`, `test_ldap_login.py` | Runs nightly and in the gates; the LDAP login tests are exempt skips on the local-mode gate stack |
 
 Not run for this document: only the drift guard and the repository-root unit suite were
 run. The auth, acl, and common service suites, the live-LDAP and live-Postgres suites,
@@ -1429,6 +1536,10 @@ None at present.
   `ldap_sync_loop.py` and ADR 0011 (Audit).
 - The superadmin can be activated by any admin, with no carve-out (IAM-ACCT-2).
   Recorded in the docstring of `deactivate_user` and [ROLES.md](../ROLES.md).
+- A profile edit reaches notifications' email address within the contact cache TTL,
+  not at once, and a user's profile edit naming another id answers the unknown-id
+  404 rather than 403 (IAM-INTERNAL-4, IAM-PROFILE-1). Recorded in issue #1252 (owner
+  decisions, 2026-11-02).
 - The deactivation breaker's denominator is every LDAP account, inactive ones included
   (IAM-SWEEP-7). Recorded in ADR 0011 (as amended 2026-08-12: one pass over all LDAP
   users).

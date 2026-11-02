@@ -224,13 +224,21 @@ LDAP-authenticated and local accounts share the same notification prefs; they li
 
 ## Settings
 
-The **Settings** page (reachable from the user menu or the bell's Settings link) currently holds the Notifications section above. Additional sections (theme, default landing page) are planned; your saved filters and page-size choices on the Inventory page are already persisted automatically and don't need a setting here.
+The **Settings** page (reachable from the user menu or the bell's Settings link) holds two sections: **Profile** (below) and the Notifications section above. Additional sections (theme, default landing page) are planned; your saved filters and page-size choices on the Inventory page are already persisted automatically and don't need a setting here.
 
 ## Profile and password
 
-Your profile has basic account info (email, username, role, group memberships). To change your password, use the auth service's change-password endpoint or the profile page if your UI version exposes it. LDAP-authenticated users change their password in the directory; HERD doesn't store one for them.
+The **Profile** section of Settings shows your sign-in email and username (read-only: they are your login identity) and three fields you can edit:
 
-Forgotten passwords: contact an admin. There is no self-serve reset flow today.
+- **Name** (required): the name shown in the header and on the admin Users page. It starts as your username, or as the name you typed when you registered.
+- **Contact email** (optional): where email notifications go. Leave it blank and they go to your sign-in email. A change reaches the notifications service within about 30 seconds.
+- **Phone** (optional): digits, spaces, `+`, `-`, `(`, and `)`, up to 32 characters. It is stored and shown only; HERD never calls or texts it.
+
+Change a field and choose **Save profile**; only the fields you changed are sent. LDAP accounts edit these three fields the same way; the directory still owns the username and sign-in email. Admins and the superadmin can edit any account's profile from **Admin > Users** with the row's **Edit profile** control.
+
+There is no password change in HERD today: no route sets a local account's password after registration. LDAP-authenticated users change their password in the directory; HERD doesn't store one for them.
+
+Forgotten passwords: there is no self-serve or admin reset flow today; ask your administrator.
 
 ## Glossary
 
