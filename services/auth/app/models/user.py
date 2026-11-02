@@ -18,6 +18,19 @@ class Role(str, enum.Enum):
     SUPERADMIN = "superadmin"
 
 
+def _default_full_name(context) -> str | None:
+    """Insert-time default for users.full_name: the row's own username.
+
+    Issue #1252: full_name is NOT NULL, and every creation site that is not
+    handed a name (register without one, the superadmin seed, LDAP
+    provisioning) stores the username instead. The creation functions in
+    auth_service pass full_name explicitly; this default is the backstop for
+    any other insert (tests that build User(...) directly included), so a row
+    can never reach the NOT NULL constraint without a name.
+    """
+    return context.get_current_parameters().get("username")
+
+
 class User(Base):
     __tablename__ = "users"
     __table_args__ = {"schema": _schema} if _schema else {}
@@ -25,6 +38,12 @@ class User(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     username: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    # Profile fields (issue #1252). full_name is the display name, required and
+    # not unique; contact_email is a delivery address only (never a login
+    # identity, so not unique); phone is stored and displayed only.
+    full_name: Mapped[str] = mapped_column(String(200), nullable=False, default=_default_full_name)
+    contact_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
     hashed_password: Mapped[str | None] = mapped_column(Text, nullable=True)
     auth_source: Mapped[str] = mapped_column(
         String(16), nullable=False, default="local", server_default="local"
