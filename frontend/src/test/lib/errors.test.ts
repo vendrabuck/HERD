@@ -418,6 +418,30 @@ describe("profileSaveErrorText (issue #1252)", () => {
     );
   });
 
+  it("words the phone character rule instead of showing the regex", () => {
+    const err = axiosLike(422, [
+      {
+        type: "string_pattern_mismatch",
+        loc: ["body", "phone"],
+        msg: "String should match pattern '^[0-9 +()-]*[0-9][0-9 +()-]*$'",
+      },
+      { type: "value_error", loc: ["body", "contact_email"], msg: "bad address" },
+    ]);
+    expect(profileSaveErrorText(err, "Failed")).toBe(
+      "Phone may contain only digits, spaces, +, -, (, and ), with at least one digit; " +
+        "Contact email: bad address",
+    );
+  });
+
+  it("keeps the message of a phone 422 that is not the character rule", () => {
+    const err = axiosLike(422, [
+      { type: "string_too_long", loc: ["body", "phone"], msg: "String should have at most 32 characters" },
+    ]);
+    expect(profileSaveErrorText(err, "Failed")).toBe(
+      "Phone: String should have at most 32 characters",
+    );
+  });
+
   it("labels the name field", () => {
     const err = axiosLike(422, [
       { loc: ["body", "full_name"], msg: "String should have at least 1 character" },
