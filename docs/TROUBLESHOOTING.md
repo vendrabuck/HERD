@@ -44,6 +44,15 @@ Second most common: config service started but `config.json` was never written. 
 
 Check with `make logs` or `docker compose logs <service>`; the startup error message names the missing setting.
 
+### A service exits at startup with `column <table>.<name> does not exist`
+
+The stack was upgraded in place and the new release added a column that a startup read names, before `make migrate` ran (the schema is stamped at the previous release, so startup never runs `create_all`; see [OPERATIONS.md](OPERATIONS.md#upgrade-path)). The log ends with `Application startup failed. Exiting.`, the service's healthcheck never passes, and `make up` reports `dependency failed to start: container <project>-<svc>-1 is unhealthy`. Run the service's migration, then restart it:
+
+- Under `make up`: `make migrate-<svc>`, then `docker compose restart <svc>`. The dev reloader keeps the crashed container running, so the exec works.
+- Under `make prod`: the container crash-loops and `docker compose exec` races the restarts, so use a one-off container: `docker compose -f docker-compose.yml run --rm <svc> alembic upgrade head`, then `docker compose -f docker-compose.yml restart <svc>`.
+
+Since issue #1261 auth's own startup seed reads only ids, so `column users.<name> does not exist` from the superadmin or "Not Grouped" seed no longer happens; the remedy above still applies to any other startup read.
+
 ### `make up` refuses to start, or the page hangs after `make up` following `make everything`
 
 A successful `make everything` leaves its seeded gate stack (compose project `<dir>-gate`, for example `herd-public-gate`) serving `https://localhost` (or the `HERD_GATEWAY_BIND` address, issue #1256) on host ports 80 and 443. The dev stack publishes the same ports, so the two cannot run together. `make up`, `make dev`, and `make prod` therefore refuse to start while another compose project publishes host port 80 or 443, with a message such as:
