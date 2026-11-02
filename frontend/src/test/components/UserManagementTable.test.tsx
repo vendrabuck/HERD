@@ -56,7 +56,7 @@ function listHandler(items: User[] = USERS) {
 }
 
 describe("UserManagementTable profile column (issue #1252)", () => {
-  it("shows a Name column and an Edit profile control on every row, the superadmin's included", async () => {
+  it("shows a Name column and an Edit profile control on every row, superadmin included", async () => {
     server.use(listHandler());
     renderTable();
     expect(await screen.findByRole("cell", { name: "User One" })).toBeInTheDocument();
@@ -66,7 +66,7 @@ describe("UserManagementTable profile column (issue #1252)", () => {
     expect(screen.getByRole("button", { name: "Edit profile of root" })).toBeInTheDocument();
   });
 
-  it("PATCHes the chosen account's changed fields and refetches the list", async () => {
+  it("PATCHes only the changed fields of the chosen account and refetches the list", async () => {
     let captured: { url: string; body: unknown } | null = null;
     let listCalls = 0;
     server.use(
