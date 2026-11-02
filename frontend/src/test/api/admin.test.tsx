@@ -69,7 +69,7 @@ describe("admin api hooks", () => {
     expect((captured as { role: string }).role).toBe("admin");
   });
 
-  it("useUpdateUserProfile PATCHes the id route and leaves another user's cache alone", async () => {
+  it("useUpdateUserProfile PATCHes the id route and leaves the cache of another user alone", async () => {
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     });
