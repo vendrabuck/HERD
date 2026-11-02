@@ -5,7 +5,12 @@ import type { ReactNode } from "react";
 import { describe, it, expect } from "vitest";
 
 import { server } from "../mocks/server";
-import { useAllUsers, usePaginatedUsers, useSetUserRole } from "@/api/admin";
+import {
+  useAllUsers,
+  usePaginatedUsers,
+  useSetUserRole,
+  useUpdateUserProfile,
+} from "@/api/admin";
 
 function wrapper({ children }: { children: ReactNode }) {
   const client = new QueryClient({
@@ -62,5 +67,29 @@ describe("admin api hooks", () => {
       await result.current.mutateAsync({ userId: "u1", role: "admin" });
     });
     expect((captured as { role: string }).role).toBe("admin");
+  });
+
+  it("useUpdateUserProfile PATCHes the id route and leaves another user's cache alone", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    client.setQueryData(["currentUser"], { id: "admin", full_name: "Admin" });
+    let captured: { path: string; body: unknown } | null = null;
+    server.use(
+      http.patch("/api/auth/users/u1/profile", async ({ request }) => {
+        captured = { path: new URL(request.url).pathname, body: await request.json() };
+        return HttpResponse.json({ ...USER, full_name: "U Person" });
+      }),
+    );
+    const { result } = renderHook(() => useUpdateUserProfile(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    });
+    await act(async () => {
+      await result.current.mutateAsync({ userId: "u1", profile: { contact_email: null } });
+    });
+    expect(captured).toEqual({ path: "/api/auth/users/u1/profile", body: { contact_email: null } });
+    expect(client.getQueryData(["currentUser"])).toEqual({ id: "admin", full_name: "Admin" });
   });
 });

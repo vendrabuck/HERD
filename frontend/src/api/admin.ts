@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient, keepPreviousData } from "@tanstack/react-query";
-import type { User } from "@/types/auth.types";
+import type { ProfileUpdate, User } from "@/types/auth.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
 
@@ -17,6 +17,17 @@ async function fetchAllUsers(): Promise<User[]> {
 
 async function setUserRole({ userId, role }: { userId: string; role: string }): Promise<User> {
   const resp = await apiClient.put<User>(`/auth/users/${userId}/role`, { role });
+  return resp.data;
+}
+
+async function updateUserProfile({
+  userId,
+  profile,
+}: {
+  userId: string;
+  profile: ProfileUpdate;
+}): Promise<User> {
+  const resp = await apiClient.patch<User>(`/auth/users/${userId}/profile`, profile);
   return resp.data;
 }
 
@@ -41,5 +52,24 @@ export function useSetUserRole() {
   return useMutation({
     mutationFn: setUserRole,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["adminUsers"] }),
+  });
+}
+
+/**
+ * Save any account's profile from the Users page (issue #1252; admin or
+ * superadmin). Refetches the user list, and when the edited account is the
+ * caller's own, replaces the cached current user as the self edit does.
+ */
+export function useUpdateUserProfile() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: updateUserProfile,
+    onSuccess: (user) => {
+      const current = queryClient.getQueryData<User>(["currentUser"]);
+      if (current && current.id === user.id) {
+        queryClient.setQueryData(["currentUser"], user);
+      }
+      queryClient.invalidateQueries({ queryKey: ["adminUsers"] });
+    },
   });
 }

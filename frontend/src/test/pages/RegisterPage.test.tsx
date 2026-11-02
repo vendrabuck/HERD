@@ -103,4 +103,73 @@ describe("RegisterPage", () => {
     );
     expect(mockNavigate).not.toHaveBeenCalled();
   });
+
+  // Issue #1252: the optional name, prefilled from the username.
+  it("prefills Name from the username until the name is edited", () => {
+    renderWithProviders(<RegisterPage />);
+    const name = screen.getByLabelText("Name") as HTMLInputElement;
+    fireEvent.change(screen.getByLabelText("Username"), { target: { value: "jdoe" } });
+    expect(name.value).toBe("jdoe");
+    fireEvent.change(name, { target: { value: "Jane Doe" } });
+    fireEvent.change(screen.getByLabelText("Username"), { target: { value: "jdoe2" } });
+    expect(name.value).toBe("Jane Doe");
+  });
+
+  it("sends the edited name as full_name", async () => {
+    let captured: unknown = null;
+    server.use(
+      http.post("/api/auth/register", async ({ request }) => {
+        captured = await request.json();
+        return HttpResponse.json({ id: "u1" }, { status: 201 });
+      }),
+    );
+    renderWithProviders(<RegisterPage />);
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "j@test" } });
+    fireEvent.change(screen.getByLabelText("Username"), { target: { value: "jdoe" } });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "  Jane Doe " } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "password" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create account" }));
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalled());
+    expect(captured).toEqual({
+      email: "j@test",
+      username: "jdoe",
+      password: "password",
+      full_name: "Jane Doe",
+    });
+  });
+
+  it("omits full_name when the name is cleared, so the API stores the username", async () => {
+    let captured: unknown = null;
+    server.use(
+      http.post("/api/auth/register", async ({ request }) => {
+        captured = await request.json();
+        return HttpResponse.json({ id: "u1" }, { status: 201 });
+      }),
+    );
+    renderWithProviders(<RegisterPage />);
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "j@test" } });
+    fireEvent.change(screen.getByLabelText("Username"), { target: { value: "jdoe" } });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "  " } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "password" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create account" }));
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalled());
+    expect(captured).toEqual({ email: "j@test", username: "jdoe", password: "password" });
+  });
+
+  it("toasts a generic message, never a raw list, for a 422 on another field", async () => {
+    server.use(
+      http.post("/api/auth/register", () =>
+        HttpResponse.json(
+          { detail: [{ loc: ["body", "username"], msg: "String should match pattern" }] },
+          { status: 422 },
+        ),
+      ),
+    );
+    renderWithProviders(<RegisterPage />);
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "j@test" } });
+    fireEvent.change(screen.getByLabelText("Username"), { target: { value: "j d" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "password" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create account" }));
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Registration failed"));
+  });
 });

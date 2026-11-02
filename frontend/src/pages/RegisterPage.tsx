@@ -3,23 +3,32 @@ import { Link, useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
 import { useRegister } from "@/api/auth";
 import { Button } from "@/components/ui/Button";
+import { profileSaveErrorText } from "@/lib/errors";
+import { FULL_NAME_MAX_LENGTH } from "@/lib/profileEdit";
 
 export function RegisterPage() {
   const navigate = useNavigate();
   const register = useRegister();
   const [form, setForm] = useState({ email: "", username: "", password: "" });
+  // Issue #1252: the name is prefilled from the username and follows it until
+  // the user edits the name field. Blank is sent as no name, which the API
+  // stores as the username.
+  const [fullName, setFullName] = useState("");
+  const [nameEdited, setNameEdited] = useState(false);
+  const shownName = nameEdited ? fullName : form.username;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    const name = shownName.trim();
     try {
-      await register.mutateAsync(form);
+      await register.mutateAsync(name ? { ...form, full_name: name } : form);
       toast.success("Account created. Please sign in.");
       navigate("/login", { replace: true });
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Registration failed";
-      toast.error(msg);
+      // A string detail (the 409 collision) as is; a 422 naming the name
+      // field per field; anything else (a 422 list for another field) the
+      // generic text, never a raw list, which would crash the Toaster.
+      toast.error(profileSaveErrorText(err, "Registration failed"));
     }
   };
 
@@ -61,6 +70,23 @@ export function RegisterPage() {
               className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
               placeholder="johndoe"
             />
+          </div>
+
+          <div>
+            <label htmlFor="reg-full-name" className="block text-sm font-medium text-gray-700 mb-1">Name</label>
+            <input
+              id="reg-full-name"
+              type="text"
+              maxLength={FULL_NAME_MAX_LENGTH}
+              value={shownName}
+              onChange={(e) => {
+                setNameEdited(true);
+                setFullName(e.target.value);
+              }}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              placeholder="John Doe"
+            />
+            <p className="text-xs text-gray-500 mt-1">Shown to other users. Defaults to your username.</p>
           </div>
 
           <div>

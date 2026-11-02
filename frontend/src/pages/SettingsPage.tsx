@@ -1,5 +1,9 @@
 import { useState } from "react";
 import toast from "react-hot-toast";
+import { useCurrentUser, useUpdateMyProfile } from "@/api/auth";
+import { ProfileForm } from "@/components/profile/ProfileForm";
+import { profileSaveErrorText } from "@/lib/errors";
+import type { ProfileUpdate } from "@/types/auth.types";
 import {
   useNotificationPreferences,
   useUpdateNotificationPreferences,
@@ -21,7 +25,11 @@ const OUTBOUND_CHANNELS: Array<{
   label: string;
   hint: string;
 }> = [
-  { key: "email", label: "Email", hint: "Send notifications to your account email." },
+  {
+    key: "email",
+    label: "Email",
+    hint: "Send notifications to your contact email, or to your sign-in email when none is set.",
+  },
   { key: "chat", label: "Chat", hint: "Post notifications to the configured chat channel." },
   { key: "webhook", label: "Webhook", hint: "POST notifications to the configured webhook." },
 ];
@@ -32,6 +40,47 @@ const DEFAULT_CHANNELS: NotificationChannels = {
   chat: false,
   webhook: false,
 };
+
+/**
+ * The caller's own profile (issue #1252): name, contact email, phone. A save
+ * replaces the cached current user (useUpdateMyProfile), which remounts the
+ * form through its key with the saved values as the new baseline.
+ */
+function ProfileSection() {
+  const { data: user } = useCurrentUser();
+  const update = useUpdateMyProfile();
+
+  const handleSave = async (profile: ProfileUpdate) => {
+    try {
+      await update.mutateAsync(profile);
+      toast.success("Profile saved");
+    } catch (err) {
+      toast.error(profileSaveErrorText(err, "Failed to save profile"));
+    }
+  };
+
+  return (
+    <section
+      aria-labelledby="settings-profile-heading"
+      className="bg-white rounded border border-gray-200 p-4 mb-4"
+    >
+      <h2 id="settings-profile-heading" className="text-base font-semibold mb-3">
+        Profile
+      </h2>
+      {user ? (
+        <ProfileForm
+          key={`${user.id}:${user.updated_at ?? ""}:${user.full_name}:${user.contact_email ?? ""}:${user.phone ?? ""}`}
+          user={user}
+          idPrefix="settings-profile"
+          isPending={update.isPending}
+          onSave={handleSave}
+        />
+      ) : (
+        <p className="text-sm text-gray-600">Loading profile...</p>
+      )}
+    </section>
+  );
+}
 
 export function SettingsPage() {
   const { data: prefs, isLoading } = useNotificationPreferences();
@@ -68,6 +117,9 @@ export function SettingsPage() {
     }
   };
 
+  // The whole page waits for the preferences, as it did before the Profile
+  // section existed: the Settings heading appearing means the Notifications
+  // section is there too, which the Selenium settings tests rely on.
   if (isLoading) {
     return <div className="p-6 text-sm text-gray-600">Loading preferences...</div>;
   }
@@ -75,6 +127,8 @@ export function SettingsPage() {
   return (
     <div className="p-6 max-w-2xl">
       <h1 className="text-xl font-semibold mb-4">Settings</h1>
+
+      <ProfileSection />
 
       <section className="bg-white rounded border border-gray-200 p-4">
         <h2 className="text-base font-semibold mb-3">Notifications</h2>

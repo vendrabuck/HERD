@@ -8,6 +8,7 @@ import { HelpCircle } from "lucide-react";
 import { NotificationBell } from "@/components/NotificationBell";
 import { APP_VERSION } from "@/lib/appVersion";
 import { MANUAL_URL } from "@/lib/links";
+import { displayName } from "@/lib/profileEdit";
 
 const NAV_ITEMS = [
   { to: "/inventory", label: "Inventory" },
@@ -256,7 +257,9 @@ export function AppLayout() {
             Settings
           </NavLink>
           {user && (
-            <span className="text-sm text-gray-300">{user.username}</span>
+            <span className="text-sm text-gray-300" title={user.username}>
+              {displayName(user)}
+            </span>
           )}
           <button
             onClick={handleLogout}
