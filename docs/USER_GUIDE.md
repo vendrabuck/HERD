@@ -232,9 +232,9 @@ The **Profile** section of Settings shows your sign-in email and username (read-
 
 - **Name** (required): the name shown in the header and on the admin Users page. It starts as your username, or as the name you typed when you registered.
 - **Contact email** (optional): where email notifications go. Leave it blank and they go to your sign-in email. A change reaches the notifications service within about 30 seconds.
-- **Phone** (optional): digits, spaces, `+`, `-`, `(`, and `)`, up to 32 characters. It is stored and shown only; HERD never calls or texts it.
+- **Phone** (optional): digits, spaces, `+`, `-`, `(`, and `)`, with at least one digit, up to 32 characters. It is stored and shown only; HERD never calls or texts it.
 
-Change a field and choose **Save profile**; only the fields you changed are sent. LDAP accounts edit these three fields the same way; the directory still owns the username and sign-in email. Admins and the superadmin can edit any account's profile from **Admin > Users** with the row's **Edit profile** control.
+Change a field and choose **Save profile**; only the fields you changed are sent. LDAP accounts edit these three fields the same way; the directory still owns the username and sign-in email. Nothing copies the directory into the name: when a directory sync corrects an LDAP account's username, a name that was still the old username keeps showing it until you edit it. Admins and the superadmin can edit any account's profile from **Admin > Users** with the row's **Edit profile** control.
 
 There is no password change in HERD today: no route sets a local account's password after registration. LDAP-authenticated users change their password in the directory; HERD doesn't store one for them.
 

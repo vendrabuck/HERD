@@ -82,6 +82,7 @@ A user can:
 - View existing backend cabling connections (read-only)
 - Check ACL permissions on resources (own permissions)
 - List resources accessible to them via ACL grants
+- Edit their own profile (name, contact email, phone) on Settings
 
 A user cannot:
 - Add, modify, or remove devices from the inventory
@@ -89,8 +90,7 @@ A user cannot:
 - Create, update, or delete user groups
 - Add or remove group members
 - Create, view, or delete ACL grants
-- View or manage other users' accounts, except that every user edits their own profile
-  (name, contact email, phone) on Settings
+- View or manage other users' accounts
 
 ### Admin
 
@@ -1973,7 +1973,7 @@ The two profile routes (issue #1252) write only `full_name`, `contact_email`, an
 effective role and deliberately not role-gated: an admin or the superadmin may name any
 account, active or not, the superadmin's included; a user may name only their own id,
 and any other id answers 404 `User not found`, byte-identical to an unknown id and
-decided before any lookup, the same own-rows convention as `/api/notifications`. An
+decided before any read of the named account, the same own-rows convention as `/api/notifications`. An
 unknown key (`role`, `email`, `username`, `is_active`, and so on) is a 422; role and
 activation keep their own routes.
 

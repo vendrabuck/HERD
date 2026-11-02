@@ -1163,9 +1163,12 @@ check.
   #1252), with the response shape unchanged, so notifications addresses email there
   with no change of its own. A changed address reaches notifications within its contact
   cache TTL (`PREFERENCES_CACHE_TTL_SECONDS`, 30 s by default); nothing invalidates the
-  cache on a profile write. \
+  cache on a profile write. The contact-email answer is pinned by the two
+  `contact_email` tests in `test_internal.py` and the integration test; the
+  notifications test cited here stubs auth's answer and proves only the other half, that
+  the email dispatcher addresses SMTP to whatever `email` the route returns. \
   Enforced in: `services/auth/app/routers/internal.py` (`get_user_contact`); `services/notifications/app/services/contact_client.py` (`ContactClient`) \
-  Pinned by: `services/auth/tests/test_internal.py` (`test_internal_user_contact_returns_email_and_username`, `test_internal_user_contact_404_for_unknown_user`, `test_internal_user_contact_returns_contact_email_when_set`, `test_internal_user_contact_returns_login_email_when_contact_email_is_null`); `services/notifications/tests/test_email_dispatcher.py` (`test_email_is_addressed_to_the_contact_email_auth_reports`); `tests/integration/test_user_profile_flow.py` (`test_contact_route_answers_contact_email_then_the_login_email`)
+  Pinned by: `services/auth/tests/test_internal.py` (`test_internal_user_contact_returns_email_and_username`, `test_internal_user_contact_404_for_unknown_user`, `test_internal_user_contact_returns_contact_email_when_set`, `test_internal_user_contact_returns_login_email_when_contact_email_is_null`); `tests/integration/test_user_profile_flow.py` (`test_contact_route_answers_contact_email_then_the_login_email`); `services/notifications/tests/test_email_dispatcher.py` (`test_email_is_addressed_to_the_contact_email_auth_reports`)
 - **IAM-INTERNAL-5.** The internal groups route answers the same shape as
   `GET /groups/user/{user_id}`, and 404 for an unknown or inactive account. \
   Enforced in: `services/auth/app/routers/internal.py` (`get_user_groups_internal`) \
@@ -1317,11 +1320,11 @@ changes them.
 - **IAM-PROFILE-1.** On `PATCH /users/{id}/profile` a caller whose effective role is
   `user` may name only their own id; any other id, existing or not, active or not,
   answers 404 `User not found` byte-identical to an unknown id. The refusal is decided
-  before any read of the users table, so neither the answer nor the work done depends
-  on whether the account exists. The route does not use `require_role`, which would
-  answer 403. \
+  before any read of the named account (only the caller's own row has been read, by
+  `get_current_user`), so neither the answer nor the work done depends on whether the
+  account exists. The route does not use `require_role`, which would answer 403. \
   Enforced in: `services/auth/app/routers/admin.py` (`update_user_profile_by_id`, `PROFILE_EDIT_ANY_ROLES`) \
-  Pinned by: `services/auth/tests/test_user_profile_routes.py` (`test_user_naming_another_id_gets_404_byte_identical_to_an_unknown_id`, `test_user_naming_another_inactive_id_gets_the_same_404`, `test_user_naming_own_id_on_the_id_route_edits_own_profile`, `test_user_refusal_on_another_id_makes_no_lookup`); `tests/integration/test_user_profile_flow.py` (`test_user_naming_another_id_gets_the_unknown_id_404`)
+  Pinned by: `services/auth/tests/test_user_profile_routes.py` (`test_user_naming_another_id_gets_404_byte_identical_to_an_unknown_id`, `test_user_naming_another_inactive_id_gets_the_same_404`, `test_user_naming_own_id_on_the_id_route_edits_own_profile`, `test_user_refusal_on_another_id_makes_no_lookup`, `test_user_refusal_over_http_reads_no_users_row_after_the_caller`); `tests/integration/test_user_profile_flow.py` (`test_user_naming_another_id_gets_the_unknown_id_404`)
 - **IAM-PROFILE-2.** A caller whose effective role is `admin` or `superadmin` may edit
   any account's profile, active or inactive, the superadmin's included; an unknown id
   answers 404 `User not found`. The decision uses the effective role (IAM-ROLE-2), so
@@ -1335,7 +1338,7 @@ changes them.
   `extra_forbidden` and nothing is written; role and activation keep their own routes.
   The service function refuses any other column name as a second line. \
   Enforced in: `services/auth/app/schemas/auth.py` (`ProfileUpdateRequest`); `services/auth/app/services/auth_service.py` (`update_user_profile`, `PROFILE_FIELDS`) \
-  Pinned by: `services/auth/tests/test_profile_schema.py` (`test_non_profile_key_refused_as_extra`); `services/auth/tests/test_user_profile_routes.py` (`test_non_profile_key_is_a_422_and_the_account_is_unchanged`, `test_id_route_refuses_a_non_profile_key_even_for_an_admin`)
+  Pinned by: `services/auth/tests/test_profile_schema.py` (`test_non_profile_key_refused_as_extra`); `services/auth/tests/test_user_profile_routes.py` (`test_non_profile_key_is_a_422_and_the_account_is_unchanged`, `test_id_route_refuses_a_non_profile_key_even_for_an_admin`, `test_update_user_profile_refuses_a_non_profile_column_and_writes_nothing`)
 - **IAM-PROFILE-4.** PATCH semantics: an omitted key is unchanged; `null` on
   `contact_email` or `phone` clears it, and an empty or all-white-space string is read
   as `null`; `null` on `full_name` is a 422 `Value error, full_name may not be null`
@@ -1357,8 +1360,12 @@ changes them.
 - **IAM-PROFILE-7.** An LDAP account edits its profile by the same rules. Phase 1 reads
   no directory display-name or telephone attribute: provisioning (login or sync) sets
   `full_name` to the username and leaves the other two empty, and sync never writes a
-  profile field. The directory still owns `username` and the login email. \
-  Enforced in: `services/auth/app/services/auth_service.py` (`create_ldap_user`) \
+  profile field. The directory still owns `username` and the login email. So when sync
+  repairs an account's username (IAM-SYNC-12), a `full_name` that was still the
+  provisioned or backfilled username keeps the OLD username until someone edits it. The
+  explicit `full_name=username` in `create_ldap_user` sets it; the model's insert
+  default `_default_full_name` is the second line. \
+  Enforced in: `services/auth/app/services/auth_service.py` (`create_ldap_user`); `services/auth/app/models/user.py` (`_default_full_name`) \
   Pinned by: `services/auth/tests/test_user_profile_routes.py` (`test_ldap_account_may_edit_its_profile`); `services/auth/tests/test_auth_ldap.py` (`test_ldap_login_jit_provision_sets_full_name_to_username`)
 - **IAM-PROFILE-8.** Each write logs one INFO line with action `user_profile_updated`,
   `user_id`, and `changed_fields`, the sorted names of the fields whose stored value
@@ -1367,8 +1374,10 @@ changes them.
   Pinned by: `services/auth/tests/test_user_profile_routes.py` (`test_profile_write_logs_one_line_with_changed_field_names_and_no_values`)
 - **IAM-PROFILE-9.** Every account has a `full_name`. `RegisterRequest.full_name` is
   optional with IAM-PROFILE-5's bounds, and omitted or `null` stores the username; the
-  startup seed and LDAP provisioning store the username; the column is NOT NULL with an
-  insert-time default copying the row's username; migration 0009 adds the three
+  startup seed and LDAP provisioning store the username. The creation functions pass
+  the name explicitly, and the column's insert-time default copying the row's username
+  (`_default_full_name`) is the second line, so the tests here cannot tell which of the
+  two stored it; the column is NOT NULL; migration 0009 adds the three
   columns, backfills `full_name` from `username` on existing rows, then makes it NOT
   NULL. \
   Enforced in: `services/auth/app/schemas/auth.py` (`RegisterRequest`); `services/auth/app/services/auth_service.py` (`create_user`, `create_ldap_user`); `services/auth/app/models/user.py` (`_default_full_name`); `services/auth/migrations/versions/0009_user_profile.py` (`upgrade`, `downgrade`) \
@@ -1381,17 +1390,21 @@ changes them.
 - **IAM-PROFILE-11.** The Settings Profile section and the Users page Edit profile
   dialog show the sign-in email and username read-only, require a name, send only the
   fields that changed (a blank optional field as `null`), and report a 422 per field as
-  `<Label>: <message>`. A successful self edit, or an admin's edit of their own row,
+  `<Label>: <message>`, except that a phone breaking the character rule reads
+  `Phone may contain only digits, spaces, +, -, (, and ), with at least one digit`
+  instead of the regular expression. The Users page Name column, like the header, shows
+  `full_name` and falls back to the username. A successful self edit, or an admin's edit of their own row,
   replaces the cached current user, so the header shows the new name at once. The
   header shows `full_name`, falling back to the username. Register prefills Name from
   the username until the name is edited, and omits it when blank. \
   Enforced in: `frontend/src/components/profile/ProfileForm.tsx` (`ProfileForm`); `frontend/src/lib/profileEdit.ts` (`profileEditPayload`, `displayName`); `frontend/src/lib/errors.ts` (`profileSaveErrorText`); `frontend/src/api/auth.ts` (`useUpdateMyProfile`); `frontend/src/api/admin.ts` (`useUpdateUserProfile`); `frontend/src/pages/RegisterPage.tsx` (`RegisterPage`) \
-  Pinned by: `frontend/src/test/pages/SettingsPage.test.tsx` (`prefills the editable fields and shows the login identity read-only`, `disables Save profile until a field changes and while the name is blank`, `PATCHes only the changed fields and refreshes the cached current user`, `toasts a 422 per field through profileSaveErrorText`); `frontend/src/test/components/UserManagementTable.test.tsx` (`shows a Name column and an Edit profile control on every row, superadmin included`, `PATCHes only the changed fields of the chosen account and refetches the list`, `an admin editing their own row also refreshes the cached current user`); `frontend/src/test/components/AppLayout.test.tsx` (`shows the full name in the header (issue #1252)`, `falls back to the username when the full name is empty (issue #1252)`); `frontend/src/test/pages/RegisterPage.test.tsx` (`prefills Name from the username until the name is edited`, `omits full_name when the name is cleared, so the API stores the username`); `frontend/src/test/lib/profileEdit.test.ts` (`sends only the changed name, trimmed`, `sends a cleared contact email and phone as null`)
+  Pinned by: `frontend/src/test/pages/SettingsPage.test.tsx` (`prefills the editable fields and shows the login identity read-only`, `disables Save profile until a field changes and while the name is blank`, `PATCHes only the changed fields and refreshes the cached current user`, `toasts a 422 per field through profileSaveErrorText`); `frontend/src/test/components/UserManagementTable.test.tsx` (`shows a Name column and an Edit profile control on every row, superadmin included`, `PATCHes only the changed fields of the chosen account and refetches the list`, `an admin editing their own row also refreshes the cached current user`, `shows the username in the Name column when the payload has no full name`); `frontend/src/test/lib/errors.test.ts` (`words the phone character rule instead of showing the regex`); `frontend/src/test/components/AppLayout.test.tsx` (`shows the full name in the header (issue #1252)`, `falls back to the username when the full name is empty (issue #1252)`); `frontend/src/test/pages/RegisterPage.test.tsx` (`prefills Name from the username until the name is edited`, `omits full_name when the name is cleared, so the API stores the username`); `frontend/src/test/lib/profileEdit.test.ts` (`sends only the changed name, trimmed`, `sends a cleared contact email and phone as null`)
 
 **Out of scope.** SMS or any call to the phone number; a `department` field (the
 obvious next column, same rules); avatars; mapping a directory attribute onto a profile
 field; changing the login email or username; notification cache invalidation on a
-profile write.
+profile write; refreshing a name that still equals an old username after a directory
+sync renames the account (IAM-PROFILE-7).
 
 ## 9. Errors
 
