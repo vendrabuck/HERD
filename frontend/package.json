@@ -32,6 +32,7 @@
   },
   "overrides": {
     "@babel/core": "^7.29.6",
+    "minimatch": "^11.0.1",
     "eslint-plugin-react-hooks": {
       "eslint": "$eslint"
     }
