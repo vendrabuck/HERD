@@ -22,10 +22,17 @@ FROM frrouting/frr@sha256:990e83490108b686fd6df3b1cafa6bdbb2714acb00eedb9a896939
 #
 # openssh pinned 2026-09-12 (issue #783) to the version present in the
 # running nos-test-frr container (`apk info -v openssh` inside it), on
-# Alpine 3.16.2. To bump: rebuild without the pin first to see what version
+# Alpine 3.16.2 (then 9.0_p1-r5).
+#
+# Moved 2026-11-06 from 9.0_p1-r5 to 9.0_p1-r6: Alpine 3.16's repository
+# dropped r5, so every fresh build failed with "openssh-9.0_p1-r6: breaks:
+# world[openssh=9.0_p1-r5]" (an unpinned install on this base image now
+# resolves to 9.0_p1-r6).
+#
+# To bump: rebuild without the pin first to see what version
 # `apk add --no-cache openssh` resolves to on the then-current base image,
 # then pin that exact string.
-RUN apk add --no-cache openssh=9.0_p1-r5 \
+RUN apk add --no-cache openssh=9.0_p1-r6 \
  && ssh-keygen -A \
  && adduser -D -s /usr/bin/vtysh netadmin \
  && echo "netadmin:netadmin" | chpasswd \
