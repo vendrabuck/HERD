@@ -71,7 +71,7 @@ to `reservations.md`.
 | GET | `/status` | anyone, no token | 200 | AI-PROV-5, AI-PROV-6, AI-PROV-7, AI-PROV-8 |
 | POST | `/generate` | any signed-in user | 200 | AI-PROV-2, AI-GEN-1 to AI-GEN-16, AI-UPLOAD-1 to AI-UPLOAD-18, AI-RESOLVE-1 to AI-RESOLVE-15, AI-QUOTA-2 |
 | POST | `/commit` | any signed-in user; upstream services apply their own rules to the caller's JWT | 200 | AI-COMMIT-1 to AI-COMMIT-19 |
-| POST | `/reservations/{id}/assistant` | the reservation's owner (first turn); the conversation's creator on the same reservation (later turns) | 200 | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-TURN-1 to AI-TURN-8, AI-TOOL-1 to AI-TOOL-11, AI-WRITE-1 to AI-WRITE-3 |
+| POST | `/reservations/{id}/assistant` | the reservation's owner (first turn); the conversation's creator on the same reservation (later turns) | 200 | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-TURN-1 to AI-TURN-9, AI-TOOL-1 to AI-TOOL-11, AI-WRITE-1 to AI-WRITE-3 |
 | POST | `/reservations/{id}/assistant/stream` | as above | 200 (`text/event-stream`) | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-STREAM-1 to AI-STREAM-7, AI-TOOL-1 to AI-TOOL-11, AI-WRITE-1 to AI-WRITE-3 |
 | POST | `/templates/suggest-identity` | admin or superadmin | 200 | AI-PROV-2, AI-IDENT-1 to AI-IDENT-4, AI-QUOTA-2 |
 | GET | `/quota` | any signed-in user (own usage) | 200 | AI-QUOTA-7 |
@@ -863,8 +863,8 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   Pinned by: `services/ai-orchestrator/tests/test_reservation_assistant.py` (`test_buffered_deadline_during_persist_does_not_interrupt_or_duplicate`, `test_buffered_deadline_during_persist_with_side_effect_persists_once`, `test_stream_deadline_during_persist_emits_done_not_error`)
 - **AI-TURN-5.** A buffered turn that fails before any write side effect is rolled back and
   answers 504 `Assistant did not respond within <N>s` on the deadline, 503
-  `AI provider is unreachable`, or 502 `Assistant call failed` for any other `AIError`;
-  provider text never reaches the client. \
+  `AI provider is unreachable`, or 502 `Assistant call failed` for any other `AIError`
+  (and for any other exception, AI-TURN-9); provider text never reaches the client. \
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant`) \
   Pinned by: `services/ai-orchestrator/tests/test_reservation_assistant.py` (`test_overall_timeout_returns_504`, `test_buffered_provider_unreachable_returns_503`, `test_ai_error_returns_502`, `test_buffered_incomplete_turn_with_no_side_effect_still_rolls_back`); `services/ai-orchestrator/tests/test_reservation_assistant_coverage.py` (`test_buffered_route_ai_error_maps_to_502_with_generic_detail`)
 - **AI-TURN-6.** The same failures after a write tool recorded a side effect keep the turn:
@@ -883,6 +883,17 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
 - **AI-TURN-8.** A finished turn's tokens are recorded after the commit. \
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`_persist_turn`) \
   Pinned by: `services/ai-orchestrator/tests/test_reservation_assistant.py` (`test_assistant_records_usage_when_quota_enabled`); `services/ai-orchestrator/tests/test_reservation_assistant_coverage.py` (`test_buffered_route_records_usage_against_quota`)
+- **AI-TURN-9.** Any other exception the loop raises (an exception class none of the
+  AI-TURN-5 branches names, such as a bug in a tool handler or a database error inside the
+  loop) is handled like an `AIError`: before any write side effect the turn is rolled back,
+  the tokens already spent are metered, and the route answers 502 `Assistant call failed`,
+  never FastAPI's plain 500; after a write landed the turn is kept as AI-TURN-6 describes,
+  with `incomplete: "ai_error"`. Either way it logs one ERROR line,
+  `ai_assistant_unexpected_error`, carrying `reservation_id` and `error_class` (the class
+  name only, with no message and no traceback). This is the buffered twin of AI-STREAM-6
+  (#1280). \
+  Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant`, `ASSISTANT_CALL_FAILED_DETAIL`, `INCOMPLETE_REASON_AI_ERROR`) \
+  Pinned by: `services/ai-orchestrator/tests/test_reservation_assistant.py` (`test_buffered_unnamed_exception_rolls_back_and_answers_502`, `test_buffered_unnamed_exception_after_a_landed_write_keeps_the_turn`, `test_buffered_unnamed_exception_meters_tokens_spent`)
 - **AI-STREAM-1.** The streaming route does the token, provider, quota, conversation, and
   seed checks before the stream opens, so their failures are ordinary HTTP statuses. \
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant_stream`) \
@@ -1726,10 +1737,7 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
   hundreds of MiB is held in memory while the page walk runs; the per-file upload cap
   bounds the compressed size only, and the tgz reader's ceilings do not apply to a PDF.
 
-(#1039 is resolved by AI-CONV-13.)
-- #1280: the buffered `POST /reservations/{id}/assistant` route catches only the timeout,
-  the provider-unavailable error, and `AIError`, so any other exception answers FastAPI's
-  plain 500 instead of the 502 `Assistant call failed` the streaming route guarantees.
+(#1039 is resolved by AI-CONV-13; #1280 is resolved by AI-TURN-9.)
 
 ### Limits by decision
 
