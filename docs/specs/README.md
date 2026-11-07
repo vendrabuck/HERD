@@ -24,6 +24,9 @@ tests at the commit named in its header. It is descriptive, not aspirational.
 | Which role may call which endpoint? | [`../ROLES.md`](../ROLES.md) |
 | What shipped, and when? | [`../../FEATURES.md`](../../FEATURES.md), [`../../CHANGELOG.md`](../../CHANGELOG.md) |
 | What is planned? | [`../../PLANNED_FEATURES.md`](../../PLANNED_FEATURES.md) |
+| How is the code organized, which helper is the one to use? | [`CONVENTIONS.md`](CONVENTIONS.md) |
+| How do I install, run, gate, and release? | [`DEVELOPMENT.md`](DEVELOPMENT.md) |
+| How do I write and run tests? | [`TESTING.md`](TESTING.md) |
 
 A specification links to those documents instead of repeating them. It never
 restates the full permission matrix, an ADR's argument, or a how-to.
@@ -52,6 +55,18 @@ Features, Errors, Interactions with other services, Configuration, Test coverage
 and Known limits and gaps. The cross-cutting tables (sections 4 to 7 and 9) come
 before or after the features so each fact has one home; [`TEMPLATE.md`](TEMPLATE.md)
 gives the columns of each.
+
+## Developer guides
+
+Three files in this directory are developer guides, not specifications:
+[`DEVELOPMENT.md`](DEVELOPMENT.md) (install, run, the validation gates, git and CI,
+migrations, releases), [`TESTING.md`](TESTING.md) (writing and running tests at every
+level), and [`CONVENTIONS.md`](CONVENTIONS.md) (how the code is organized, the one
+helper for each job). They hold the workflow, test, and code-organization rules that
+apply across every area. They have no template sections and no rule identifiers, and
+the conventions below do not apply to them. Like this README, they are named in
+uppercase; every lowercase file here is a specification. The drift guard checks their
+repository paths and relative links only.
 
 ## Conventions
 
@@ -149,6 +164,10 @@ not finished.
     marked `Pinned by: none`;
   - leaves out a section heading of the template.
   A withdrawn rule says "withdrawn" in its text and needs no references.
+- This README and the three developer guides get the first of those checks only:
+  every repository path they name must exist in a fresh clone (a generated or ignored
+  file does not count, and the host's build output can hide that) and every relative
+  link must resolve.
 - The header's "Verified at" line names the commit the document was last checked
   against in full. A partial update leaves that line alone.
 

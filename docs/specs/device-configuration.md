@@ -1526,6 +1526,10 @@ None at present.
   `_recover_masked_kwargs` docstring) (CFG-RUN-7). A run that a direct `POST /execute`
   started with masked arguments and no `config_version_id` cannot be retried; a new run
   is the way (CFG-RUN-7).
+- Execution's driver-package extractor (`_extract_tar_gz` in
+  `services/execution/app/services/driver_loader.py`) bounds the extracted size by a sum of
+  `member.size`, which a pax-header flood passes; left as is at the #1195 triage because
+  driver packages are admin-uploaded trusted code and the loop-blocking limit is documented.
 
 ### Rules with no test
 

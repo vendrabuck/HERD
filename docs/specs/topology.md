@@ -1766,6 +1766,9 @@ None at present.
   `TopologyEditorPage.tsx` (issue #1066).
 - CSV import and export do not carry nodes with no edge or network elements; JSON is the
   lossless format (TOPO-BULK-3). Recorded in [BULK_IMPORT_EXPORT.md](../BULK_IMPORT_EXPORT.md).
+- A canvas node with a label but no `data.device` object is not a topology-template role
+  (the malformed shape behind #989): the shared predicates classify it as neither device nor
+  element. Decision to review (#989).
 
 ### Rules with no test
 

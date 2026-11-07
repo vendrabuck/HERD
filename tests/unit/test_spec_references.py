@@ -4,8 +4,9 @@ No stack, no database, no network: this only reads markdown and source files. A
 specification names repository paths, the symbols that enforce each rule, and the tests
 that pin it; a rename, a deleted test, or a moved file would otherwise leave it pointing
 at nothing without anyone noticing. Every specification (every docs/specs/*.md except
-README.md and TEMPLATE.md) must pass every check below; README.md gets the path and link
-checks only, since it is the index, not a specification.
+README.md, TEMPLATE.md, and the developer guides in GUIDES) must pass every check below;
+README.md and the guides (DEVELOPMENT.md, TESTING.md, CONVENTIONS.md) get the path and
+link checks only, since the README is the index and the guides are not specifications.
 
 What counts as what (the rules docs/specs/README.md promises):
 
@@ -98,6 +99,10 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SPECS_DIR = REPO_ROOT / "docs" / "specs"
 NOT_SPECIFICATIONS = {"README.md", "TEMPLATE.md"}
+# Developer guides that live beside the specifications but are not specifications: they
+# have no template sections and no rule identifiers, so they are checked for repository
+# paths and relative links only.
+GUIDES = {"DEVELOPMENT.md", "TESTING.md", "CONVENTIONS.md"}
 
 REPO_DIRS = (
     "services",
@@ -566,7 +571,8 @@ def check_document(
 
 
 def _specifications() -> list[Path]:
-    return sorted(p for p in SPECS_DIR.glob("*.md") if p.name not in NOT_SPECIFICATIONS)
+    skip = NOT_SPECIFICATIONS | GUIDES
+    return sorted(p for p in SPECS_DIR.glob("*.md") if p.name not in skip)
 
 
 # The real documents.
@@ -587,6 +593,17 @@ def test_specs_index_paths_and_links_resolve():
     readme = SPECS_DIR / "README.md"
     problems = check_document(readme, REPO_ROOT, [], is_spec=False)
     assert not problems, "README.md:\n" + "\n".join(problems)
+
+
+@pytest.mark.parametrize("doc", sorted(SPECS_DIR / g for g in GUIDES), ids=lambda p: p.name)
+def test_guide_paths_and_links_resolve(doc: Path):
+    problems = check_document(doc, REPO_ROOT, [], is_spec=False)
+    assert not problems, f"{doc.name}:\n" + "\n".join(problems)
+
+
+def test_every_listed_guide_exists():
+    for name in sorted(GUIDES):
+        assert (SPECS_DIR / name).is_file(), f"GUIDES lists {name}, which is not in docs/specs/"
 
 
 def test_template_names_every_gap_list_and_citing_section():

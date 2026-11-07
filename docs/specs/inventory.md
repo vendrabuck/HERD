@@ -1514,6 +1514,11 @@ Documentation that disagrees with the code: [ROLES.md](../ROLES.md) and
 [ENV_VARS.md](../ENV_VARS.md) each make an inventory statement the code contradicts
 (the driver connection types and template types, and whether the MinIO bucket must
 exist); #1025 tracks the corrections.
+- Three older device-scoped reads (`GET /devices/{id}`, `GET /ports/{id}`,
+  `GET /device-groups/device/{id}`) carry inline visibility checks that test existence before
+  visibility, so during an auth outage an unknown id answers 404 while a hidden existing id
+  answers 503, where the shared helper's routes answer 503 for both. Verified and judged
+  negligible on 2026-10-06; no issue.
 
 ### Rules with no test
 

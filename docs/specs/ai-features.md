@@ -1727,6 +1727,9 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
   bounds the compressed size only, and the tgz reader's ceilings do not apply to a PDF.
 
 (#1039 is resolved by AI-CONV-13.)
+- #1280: the buffered `POST /reservations/{id}/assistant` route catches only the timeout,
+  the provider-unavailable error, and `AIError`, so any other exception answers FastAPI's
+  plain 500 instead of the 502 `Assistant call failed` the streaming route guarantees.
 
 ### Limits by decision
 
@@ -1772,6 +1775,13 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
 Where the AI guides, docstrings, or UI text disagree with the code, the rules above
 describe the code; issue #1041 corrected every disagreement found when this document was
 written.
+- Context-file tgz extraction bounds CPU time only through the decompressed-stream ceiling:
+  an upload of 250 to 356 KB whose members each sit behind 64 KiB of minimal pax records costs
+  20 to 27 s of one worker thread, the same before and after #1201, because an archive-wide
+  pax-record cap would refuse honest PAX archives (GNU tar writes an `x` header per member);
+  a child process under `RLIMIT_CPU`, shareable with #1202, is the cleaner bound. Compose
+  sets no memory limit on ai-orchestrator. Owner decision recorded in the #1205 review, not
+  filed as an issue.
 
 ### Rules with no test
 
