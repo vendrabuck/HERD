@@ -888,10 +888,10 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   loop) is handled like an `AIError`: before any write side effect the turn is rolled back,
   the tokens already spent are metered, and the route answers 502 `Assistant call failed`,
   never FastAPI's plain 500; after a write landed the turn is kept as AI-TURN-6 describes,
-  with `incomplete: "ai_error"`. Either way it logs one ERROR line,
-  `ai_assistant_unexpected_error`, carrying `reservation_id` and `error_class` (the class
-  name only, with no message and no traceback). This is the buffered twin of AI-STREAM-6
-  (#1280). \
+  with `incomplete: "ai_error"`. The response and the stored rows never carry the
+  exception's text. Either way it logs one ERROR line, `ai_assistant_unexpected_error`,
+  carrying `reservation_id`, `error_class`, and the traceback, as the streaming guard
+  does. This is the buffered twin of AI-STREAM-6 (#1280). \
   Enforced in: `services/ai-orchestrator/app/routes/reservation_assistant.py` (`reservation_assistant`, `ASSISTANT_CALL_FAILED_DETAIL`, `INCOMPLETE_REASON_AI_ERROR`) \
   Pinned by: `services/ai-orchestrator/tests/test_reservation_assistant.py` (`test_buffered_unnamed_exception_rolls_back_and_answers_502`, `test_buffered_unnamed_exception_after_a_landed_write_keeps_the_turn`, `test_buffered_unnamed_exception_meters_tokens_spent`)
 - **AI-STREAM-1.** The streaming route does the token, provider, quota, conversation, and

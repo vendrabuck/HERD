@@ -2187,20 +2187,25 @@ async def test_buffered_unnamed_exception_rolls_back_and_answers_502(caplog):
         )
     assert recovered.status_code == 200, recovered.text
 
+    # The sanitizing contract: neither the response nor any stored row
+    # carries the exception text.
+    assert "secret-path" not in failed.text
+    rows = await _load_db_messages(conv_id)
+    assert "secret-path" not in json.dumps(rows, default=str)
+    assert "secret-path" not in recovered.text
+
+    # The log line names the class and carries the traceback for the
+    # operator, as the streaming guard's does.
     records = _unexpected_error_records(caplog)
     assert len(records) == 1
-    formatted_text = JSONFormatter("ai-orchestrator").format(records[0])
-    formatted = json.loads(formatted_text)
+    formatted = json.loads(JSONFormatter("ai-orchestrator").format(records[0]))
     assert formatted["level"] == "ERROR"
     assert formatted["message"] == "ai_assistant_unexpected_error"
     assert formatted["error_class"] == "RuntimeError"
     assert formatted["reservation_id"] == str(RESERVATION_ID)
-    # Class name only: neither the message nor a traceback reaches the line.
-    assert "exception" not in formatted
-    assert _UNNAMED_EXCEPTION_TEXT not in formatted_text
-    assert "secret-path" not in formatted_text
-    # Nor the client.
-    assert "secret-path" not in failed.text
+    assert "exception" in formatted
+    assert formatted["exception"].startswith("Traceback (most recent call last):")
+    assert "RuntimeError" in formatted["exception"]
 
 
 async def test_buffered_unnamed_exception_after_a_landed_write_keeps_the_turn(caplog):

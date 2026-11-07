@@ -534,10 +534,12 @@ async def reservation_assistant(
         # in a tool handler, a database error inside the loop) answers the
         # same neutral 502 as an AIError instead of FastAPI's plain 500. The
         # #871 carve-out holds: a write that already landed keeps the turn and
-        # answers 200 with `incomplete: "ai_error"`. Logged by class name only:
-        # an unnamed exception's text can carry an internal URL or upstream
-        # body, and the log line must not.
-        logger.error(
+        # answers 200 with `incomplete: "ai_error"`. The response and the
+        # stored rows carry no exception text (an unnamed exception's text can
+        # carry an internal URL or upstream body); the log line carries the
+        # traceback for the operator, like the streaming guard, since an
+        # unnamed exception is a bug by definition.
+        logger.exception(
             "ai_assistant_unexpected_error",
             extra={
                 "reservation_id": str(reservation_id),
