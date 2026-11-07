@@ -54,7 +54,7 @@ NATS_URL=nats://nats:4222
 The `AUTH_SECRET_KEY` and `INTERNAL_API_TOKEN` should be unique random strings. Every backend service except config refuses to start while `AUTH_SECRET_KEY` is blank, still a `<...>` placeholder, or not usable as an HMAC key (a PEM block or ssh key, a truncated or lone `-----BEGIN` line included, or a JSON Web Key), and `AUTH_ALGORITHM` must be `HS256`, `HS384`, or `HS512`.
 The superadmin account is created on first startup only; these values are ignored on subsequent restarts.
 
-By default Traefik publishes the gateway (ports 80 and 443) on every IPv4 interface, so the stack answers at `https://localhost` and at each address the host has. To serve it on one address only, for example the wired NIC of a host that also has wifi, add `HERD_GATEWAY_BIND=<that address>` to `.env` (issue #1256; `.env.example` carries a commented example). `localhost` and every other interface are then refused, and the Makefile's seed, test, and gate targets address the stack at `https://<that address>` instead of `https://localhost`; `make gateway-url` prints the URL it derived. A browser at an IP address still warns about the certificate (step 3 below, issue #1239).
+By default Traefik publishes the gateway (ports 80 and 443) on every IPv4 interface, so the stack answers at `https://localhost` and at each address the host has. To serve it on one address only, for example the wired NIC of a host that also has wifi, add `HERD_GATEWAY_BIND=<that address>` to `.env` (issue #1256; `.env.example` carries a commented example). `localhost` and every other interface are then refused, and the Makefile's seed, test, and gate targets address the stack at `https://<that address>` instead of `https://localhost`; `make gateway-url` prints the URL it derived. `make certs` (step 3) names that address in the gateway's certificate, so a browser there stops warning once the certificate is trusted.
 
 `SECRETS_KEK` is the encryption key for the secrets service (base64-encoded 32
 bytes, not hex). It is required for `make prod`; the dev stack (`make up`)
@@ -64,14 +64,30 @@ unrecoverable, and there is no default.
 
 ## 3. TLS certificates (HTTPS)
 
-The repository includes a pre-generated certificate chain for `localhost` / `127.0.0.1` in `infra/traefik/certs/`, but not its private key: `infra/traefik/certs/server.key` is not tracked. Without that file Traefik logs `Unable to parse certificate ... failed to find any PEM data in key input` and serves its own self-signed `TRAEFIK DEFAULT CERT`, so the browser warns even after you trust `root-ca.crt`; generate your own chain and key with the steps below, keeping `localhost` and `127.0.0.1` among the SANs (issue #1239 tracks a generated setup). Those steps are also what you need to reach the stack from another machine on your network by a different host name. Access by IP address needs more than an IP SAN: a client connecting by IP sends no SNI, and `dynamic.yml` sets no default certificate, so Traefik answers with its own default certificate whatever the chain holds (issue #1239 tracks setting one). The steps:
+The repository tracks no certificate and no key for the gateway. `make certs` generates them, and `make up` (step 4), `make dev`, `make prod`, and the gates run it first, so a fresh clone is served its own certificate without a separate step (issue #1239). Run it by hand to see what it does:
 
-1. Generate a new PKI chain (Root CA, Intermediate CA, Server cert with your IP as SAN)
-2. Place files in `infra/traefik/certs/`
-3. Update `infra/traefik/dynamic.yml` if filenames differ
-4. Update `CORS_ORIGINS` in `.env` to match your IP
+```bash
+make certs
+```
 
-To trust the certs on client machines, install `infra/traefik/certs/root-ca.crt` as a trusted root CA.
+When `infra/traefik/certs/server.key` does not exist it writes two files there, the ones `infra/traefik/dynamic.yml` loads:
+
+- `server.key`, a new RSA 2048 key (mode 0600);
+- `server-chain.crt`, a SELF-SIGNED certificate for that key, valid for ten years (3650 days), with no CA chain.
+
+Its subject alternative names are `DNS:localhost` and `IP:127.0.0.1`, plus `IP:<address>` when `.env` (or the environment) sets `HERD_GATEWAY_BIND` to an address other than `0.0.0.0`, plus every entry of `CERT_SANS`, a comma-separated list of `DNS:<name>` and `IP:<address>` entries for any other name or address clients use, for example `make certs CERT_SANS=DNS:lab.example.com,IP:192.0.2.20`. `dynamic.yml` also makes it Traefik's default certificate, so a client that connects by IP address (and so sends no SNI) gets it too.
+
+`make certs` never writes over an existing key. With both files present it prints one line and changes nothing; with the key present but `server-chain.crt` missing it issues a new certificate for that key and leaves the key as it is. To regenerate both on purpose, for example after adding a `CERT_SANS` entry or changing `HERD_GATEWAY_BIND`, run `make certs CERT_FORCE=1`; it says it is regenerating over the existing key. A Traefik that is already running keeps serving the old certificate until it is recreated: `docker compose up -d --no-deps --force-recreate traefik`.
+
+The certificate is self-signed, so every client warns until you trust it by hand. `make certs` prints the commands and runs none of them (they need administrator rights):
+
+- Ubuntu or Debian: `sudo cp infra/traefik/certs/server-chain.crt /usr/local/share/ca-certificates/herd-dev.crt && sudo update-ca-certificates` (the file name must end in `.crt`). Chrome and Firefox on Linux keep their own stores; import the file there as an authority if they still warn.
+- Windows: copy `server-chain.crt` to the machine and import it into the Local Computer store under Trusted Root Certification Authorities (`certutil -addstore Root server-chain.crt` in an administrator prompt, or double-click the file and choose Install Certificate).
+- macOS: add it to the System keychain and mark it Always Trust. macOS 10.15 and later refuse TLS server certificates valid for more than 825 days even when trusted, so a ten-year certificate still warns there; issue one of your own (below) for a Mac client.
+
+After `CERT_FORCE=1` every client must trust the new certificate again. The host-side harnesses (seed, integration, contract, e2e, load) skip certificate verification, so they need no trust step.
+
+To use a certificate of your own instead (a CA-signed one, or a shorter validity), put its full chain in `infra/traefik/certs/server-chain.crt` and its key in `infra/traefik/certs/server.key` before the first `make up`; `make certs` then leaves both alone. Set `CORS_ORIGINS` in `.env` to include the address clients browse to.
 
 ## 4. Build and start all services
 

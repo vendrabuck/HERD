@@ -93,6 +93,13 @@ jobs:
       - name: Start LDAP test server
         run: make ldap-up
 
+      # The stack starts with a bare `docker compose up`, not `make up`, so the
+      # gateway's self-signed certificate is generated here first (issue #1239),
+      # as on a fresh clone. Without it Traefik cannot build its default TLS store
+      # and answers no TLS handshake at all.
+      - name: Generate the gateway TLS certificate
+        run: make certs
+
       - name: Start stack
         run: docker compose up -d
 

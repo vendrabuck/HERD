@@ -44,6 +44,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "check_gateway_ports_free.sh"
+CERTS_SCRIPT = REPO_ROOT / "scripts" / "make_certs.sh"
 MAKEFILE = REPO_ROOT / "Makefile"
 BASE_COMPOSE = REPO_ROOT / "docker-compose.yml"
 DEV_OVERRIDE = REPO_ROOT / "docker-compose.override.yml"
@@ -415,12 +416,14 @@ def test_gate_stack_up_depends_on_the_gate_guard():
 def _checkout(
     tmp_path: Path, dirname: str, compose: bool = False, dotenv: str | None = None
 ) -> Path:
-    """A scratch copy of the checkout's Makefile and guard script, with a
+    """A scratch copy of the checkout's Makefile, guard script, and the
+    certificate script the start targets also run (issue #1239), with a
     scratch `.env` holding `dotenv` when given."""
     root = tmp_path / dirname
     (root / "scripts").mkdir(parents=True)
     shutil.copy2(MAKEFILE, root / "Makefile")
     shutil.copy2(SCRIPT, root / "scripts" / SCRIPT.name)
+    shutil.copy2(CERTS_SCRIPT, root / "scripts" / CERTS_SCRIPT.name)
     if compose:
         (root / "docker-compose.yml").write_text("services:\n  a:\n    image: busybox\n")
     if dotenv is not None:

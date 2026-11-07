@@ -107,7 +107,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 # Self-documenting help is the default goal: a bare `make` prints the target list.
 .DEFAULT_GOAL := help
 
-.PHONY: help version gateway-url audit master master-quick master-clean everything everything-noload \
+.PHONY: help version gateway-url certs audit master master-quick master-clean everything everything-noload \
 	up dev prod down build logs restart \
 	migrate test coverage \
 	$(addprefix test-,$(SERVICES)) \
@@ -495,7 +495,7 @@ _assert-gate-ports-free:
 # its seeded gate stack. Without the guard this gate's Traefik could not bind,
 # and the seed, integration, and e2e phases (all addressed to $(GATEWAY_URL))
 # would run against that other, serving stack and write into its database.
-_master-stack-up: _assert-gate-ports-free
+_master-stack-up: _assert-gate-ports-free certs
 	@if [ "$$GATE_NO_CACHE" = "1" ]; then $(GATE_COMPOSE) build --no-cache; fi
 	$(GATE_COMPOSE) up -d --build
 
@@ -528,12 +528,32 @@ COMPOSE_OWN_PROJECT_CMD = docker compose config 2>/dev/null | sed -n 's/^name: /
 
 # -- Docker Compose -----------------------------------------------------------
 
+# The gateway's TLS certificate (issue #1239). Traefik loads the two files
+# infra/traefik/dynamic.yml names, server-chain.crt and server.key, for SNI
+# clients and as the default certificate (the one a client connecting by IP
+# address, with no SNI, is served). Neither file is tracked, so this target
+# generates them, once: when server.key is ABSENT it writes a new key and a
+# ten-year self-signed certificate whose SANs are DNS:localhost, IP:127.0.0.1,
+# IP:<HERD_GATEWAY_BIND> when that is set to an address other than 0.0.0.0
+# (GATEWAY_BIND above, from the environment or .env), and every entry of
+# CERT_SANS (comma-separated DNS:<name> and IP:<address> entries). When the
+# key exists it prints one line and runs no openssl, except that a key whose
+# certificate is missing gets a new self-signed certificate (the key is never
+# rewritten). CERT_FORCE=1 regenerates both and says so. `make up`, `dev`,
+# `prod`, and the gate's `_master-stack-up` depend on it, so a fresh clone is
+# served this certificate rather than Traefik's built-in default by
+# construction, and on a checkout that has its files the dependency changes
+# nothing. ci.yml's integration job and nightly.yml start their stacks with a
+# bare `docker compose up`, so each runs `make certs` as a step first. Deliberately $(MAKE)-free, so `make -n certs` stays a dry run.
+certs:  ## Generate the gateway's self-signed TLS certificate if it has no key (CERT_SANS, CERT_FORCE=1)
+	@HERD_CERT_BIND="$(GATEWAY_BIND)" CERT_SANS="$(CERT_SANS)" CERT_FORCE="$(CERT_FORCE)" sh scripts/make_certs.sh infra/traefik/certs
+
 up: dev  ## Start the full stack in dev mode (hot reload), alias of dev
 
-dev: _assert-gateway-ports-free  ## Start the full stack in dev mode (build + detached)
+dev: _assert-gateway-ports-free certs  ## Start the full stack in dev mode (build + detached)
 	docker compose up --build -d
 
-prod: _assert-gateway-ports-free  ## Start the stack without dev overrides (no reload)
+prod: _assert-gateway-ports-free certs  ## Start the stack without dev overrides (no reload)
 	docker compose -f docker-compose.yml up --build -d
 
 # Refuses `make up`/`dev`/`prod` while ANOTHER compose project (typically the

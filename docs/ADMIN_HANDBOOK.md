@@ -328,5 +328,5 @@ Without either, switch `AUTH_METHOD` back to `local` in the config editor, make 
 
 - Password reset for a locked-out user. You'd need to update the auth DB directly or delete and re-register the user.
 - Schema migration across services in one click. Use `make migrate`; see [OPERATIONS.md](OPERATIONS.md#upgrade-path).
-- Cert rotation from the UI. Replace files under `infra/traefik/certs/` and restart Traefik.
+- Cert rotation from the UI. Run `make certs CERT_FORCE=1` (or replace the two files under `infra/traefik/certs/`) and recreate Traefik; see [OPERATIONS.md](OPERATIONS.md#tls-certificate-rotation).
 - Inspect or replay NATS DLQ from the UI. Use the `nats` CLI (see [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq)).
