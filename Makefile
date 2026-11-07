@@ -114,7 +114,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	$(addprefix coverage-,$(SERVICES)) \
 	$(addprefix migrate-,$(DB_SERVICES)) \
 	$(addprefix shell-,$(DB_SERVICES)) \
-	test-frontend test-frontend-tz check-image-lock test-integration test-integration-service test-contract test-load test-load-ui test-e2e test-e2e-seeded test-e2e-stop test-auth-ldap ai-eval \
+	test-frontend test-frontend-tz check-image-lock test-integration test-integration-ai test-integration-service test-contract test-load test-load-ui test-e2e test-e2e-seeded test-e2e-stop test-auth-ldap ai-eval \
 	test-root coverage-parallel coverage-frontend \
 	install frontend-install frontend-dev lint format clean clean-data gate-clean gate-down seed seed-frr seed-nos \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset _gate-ldap-tests \
@@ -246,6 +246,8 @@ master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + gate s
 		$(MAKE) test-contract && \
 		echo "" && echo "=== Integration tests ===" && \
 		$(MAKE) test-integration COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
+		echo "" && echo "=== Model-dependent AI integration tests (no fail-fast) ===" && \
+		$(MAKE) test-integration-ai COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== E2E tests ===" && \
 		$(MAKE) test-e2e COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== LDAP-mode stack tests (gate auth switched to LDAP) ===" && \
@@ -383,6 +385,8 @@ everything: gate-clean  ## Full gate: CI checks + coverage + live LDAP + NOS dia
 		$(MAKE) test-contract && \
 		echo "" && echo "=== Integration tests ===" && \
 		$(MAKE) test-integration COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
+		echo "" && echo "=== Model-dependent AI integration tests (no fail-fast) ===" && \
+		$(MAKE) test-integration-ai COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== E2E tests ===" && \
 		$(MAKE) test-e2e COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== LDAP-mode stack tests (gate auth switched to LDAP) ===" && \
@@ -647,8 +651,18 @@ test-frontend:  ## Run the frontend vitest suite
 test-frontend-tz:  ## Run the frontend vitest suite under TZ=America/Los_Angeles (as ci.yml does)
 	cd frontend && TZ=America/Los_Angeles npm test
 
-test-integration:  ## Run cross-service integration tests (needs a running stack)
-	uv run pytest tests/integration/ -v --timeout=30 -x
+# The assistant tests marked `ai_model` assert a live model's own tool-call
+# choices (issue #1270): a small local model does not make the same choice every
+# time, so they run in their own invocation, test-integration-ai, without -x.
+# test-integration keeps -x and leaves them out, so one model miss cannot stop
+# the deterministic suite, and the AI run reports every model-dependent test. Both
+# gates run both targets and fail on either; the split isolates, it does not
+# forgive. Pinned by tests/unit/test_ai_model_marker_wiring.py.
+test-integration:  ## Run cross-service integration tests, model-dependent AI tests excluded (needs a running stack)
+	uv run pytest tests/integration/ -v --timeout=30 -x -m "not ai_model"
+
+test-integration-ai:  ## Run the model-dependent AI integration tests (marker ai_model), no fail-fast (needs a running stack)
+	uv run pytest tests/integration/ -v --timeout=30 -m ai_model
 
 # Contract: OpenAPI shape-signature snapshots. Each service's /openapi.json is
 # fetched from the live stack and compared against tests/contract/snapshots/<svc>.json.

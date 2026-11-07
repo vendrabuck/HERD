@@ -16,6 +16,13 @@ Two scenarios are exercised against the live stack:
 The second test catches the failure modes unit tests cannot: wrong
 service URLs, Traefik path-prefix mismatches, real inventory rejecting
 the JWT, and the live SDK message shape diverging from our fixtures.
+
+The tests that judge the model's own tool-call choices carry
+`@pytest.mark.ai_model` (issue #1270): `make test-integration` leaves them out
+and `make test-integration-ai` runs them without -x, so one miss by a small
+local model cannot stop the rest of the integration suite. The non-owner 404
+test is not marked: its answer is decided before any model call.
+tests/unit/test_ai_model_marker_wiring.py pins the marking rule.
 """
 
 import uuid
@@ -90,6 +97,7 @@ async def admin_reservation(admin_client, fresh_device):
 # pytest --timeout=30 so the slow-but-legitimate assistant loop is not
 # strangled; the client timeout remains the real guard.
 @pytest.mark.timeout(150)
+@pytest.mark.ai_model
 async def test_assistant_loop_response_shape_against_live_stack(
     base_url, admin_token, admin_reservation
 ):
@@ -162,6 +170,7 @@ async def test_assistant_loop_response_shape_against_live_stack(
 # 180s. Override the global pytest --timeout=30 so it is not strangled; the
 # client timeout remains the real guard.
 @pytest.mark.timeout(210)
+@pytest.mark.ai_model
 async def test_assistant_write_flow_discovers_schema_first(
     base_url, admin_token, admin_reservation
 ):
@@ -268,10 +277,38 @@ async def test_assistant_reservation_404_for_non_owner(base_url, user_token, adm
     assert resp.json() == unknown.json(), (resp.text, unknown.text)
 
 
-# Live model call with a documentation lookup: the httpx client below allows
-# 180s. Override the global pytest --timeout=30 for the same reason as the
-# tests above; the client timeout remains the real guard.
-@pytest.mark.timeout(210)
+def _searched_without_reading(resp: httpx.Response) -> bool:
+    """The one first-turn shape the docs-lookup test retries (issue #1270).
+
+    True only for a 200 whose tool calls hold at least one `search_docs`, where
+    no documentation tool call errored and no `read_doc` of the `herd-manual`
+    corpus comes after the first search. That is the model choosing to answer
+    from the search results alone, which a small local model sometimes does.
+    Every other failing shape (a non-200, zero `search_docs` calls, an erroring
+    tool) is the stale-image or empty-registry defect the test exists to catch,
+    and is never retried.
+    """
+    if resp.status_code != 200:
+        return False
+    calls = resp.json()["tool_calls"]
+    names = [c["name"] for c in calls]
+    if "search_docs" not in names:
+        return False
+    if any(c["name"] in {"search_docs", "read_doc"} and c["error"] for c in calls):
+        return False
+    first_search = names.index("search_docs")
+    return not any(
+        c["name"] == "read_doc" and "herd-manual" in c["arguments_summary"]
+        for c in calls[first_search + 1 :]
+    )
+
+
+# Live model call with a documentation lookup, at most twice: the httpx client
+# below allows 180s per turn, so the test allows two turns plus overhead.
+# Override the global pytest --timeout=30 for the same reason as the tests
+# above; the client timeout remains the real guard.
+@pytest.mark.timeout(400)
+@pytest.mark.ai_model
 async def test_assistant_answers_a_herd_how_to_from_the_manual(
     base_url, admin_token, admin_reservation
 ):
@@ -283,6 +320,11 @@ async def test_assistant_answers_a_herd_how_to_from_the_manual(
     missing from the ai-orchestrator image (the service has no dev mount, so a
     stale image is the likely failure), the source registry coming up empty in
     the container, and the tools never reaching the provider's tool list.
+
+    One retry (issue #1270): when the first turn searched without error and
+    then answered without reading the manual, the same question is asked once
+    more and the second answer is judged by the same assertions. A second miss
+    in a row fails. Any other shape fails on the first turn.
     """
     if not ai_provider_configured():
         pytest.skip("AI provider not configured on this host; live docs lookup not exercised")
@@ -299,12 +341,29 @@ async def test_assistant_answers_a_herd_how_to_from_the_manual(
         if not status_resp.json().get("enabled"):
             pytest.skip("ai-orchestrator reports disabled; container env may not match runner env")
 
-        resp = await client.post(
-            f"{base_url}/ai/reservations/{reservation['id']}/assistant",
-            json={"question": question},
-            headers={"Authorization": f"Bearer {admin_token}"},
-        )
+        async def ask() -> httpx.Response:
+            return await client.post(
+                f"{base_url}/ai/reservations/{reservation['id']}/assistant",
+                json={"question": question},
+                headers={"Authorization": f"Bearer {admin_token}"},
+            )
 
+        resp = await ask()
+        retried = _searched_without_reading(resp)
+        if retried:
+            first_names = [c["name"] for c in resp.json()["tool_calls"]]
+            print(
+                "issue #1270 retry taken: the first turn searched the docs without "
+                f"reading the manual (tool calls {first_names}); asking once more"
+            )
+            resp = await ask()
+
+    attempt = (
+        " (second attempt: the first turn searched without reading the manual and "
+        "was retried once, issue #1270)"
+        if retried
+        else ""
+    )
     assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
     body = resp.json()
     calls = body["tool_calls"]
@@ -321,10 +380,10 @@ async def test_assistant_answers_a_herd_how_to_from_the_manual(
         if call["name"] == "read_doc" and "herd-manual" in call["arguments_summary"]
     ]
     assert read_positions, (
-        f"a search hit must be followed by a read of the manual page; saw {calls}"
+        f"a search hit must be followed by a read of the manual page; saw {calls}{attempt}"
     )
     assert max(read_positions) > first_search, (
-        f"read_doc must follow the search that found the page; order was {names}"
+        f"read_doc must follow the search that found the page; order was {names}{attempt}"
     )
     assert not any(c["name"] in {"search_docs", "read_doc"} and c["error"] for c in calls), (
         f"documentation tool calls must not error: {calls}"
