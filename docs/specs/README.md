@@ -24,6 +24,9 @@ tests at the commit named in its header. It is descriptive, not aspirational.
 | Which role may call which endpoint? | [`../ROLES.md`](../ROLES.md) |
 | What shipped, and when? | [`../../FEATURES.md`](../../FEATURES.md), [`../../CHANGELOG.md`](../../CHANGELOG.md) |
 | What is planned? | [`../../PLANNED_FEATURES.md`](../../PLANNED_FEATURES.md) |
+| How is the code organized, which helper is the one to use? | [`../CONVENTIONS.md`](../CONVENTIONS.md) |
+| How do I install, run, gate, and release? | [`../DEVELOPMENT.md`](../DEVELOPMENT.md) |
+| How do I write and run tests? | [`../TESTING.md`](../TESTING.md) |
 
 A specification links to those documents instead of repeating them. It never
 restates the full permission matrix, an ADR's argument, or a how-to.
