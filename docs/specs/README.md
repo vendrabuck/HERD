@@ -165,7 +165,9 @@ not finished.
   - leaves out a section heading of the template.
   A withdrawn rule says "withdrawn" in its text and needs no references.
 - This README and the three developer guides get the first of those checks only:
-  every repository path they name must exist and every relative link must resolve.
+  every repository path they name must exist in a fresh clone (a generated or ignored
+  file does not count, and the host's build output can hide that) and every relative
+  link must resolve.
 - The header's "Verified at" line names the commit the document was last checked
   against in full. A partial update leaves that line alone.
 
