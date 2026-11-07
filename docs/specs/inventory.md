@@ -925,9 +925,9 @@ download, delete); routes under `/drivers`. The package format is in
   `MAX_DRIVER_METADATA_BYTES` (1 MiB), by its declared size (zip `file_size`, tar
   `size`) or by what a capped read of at most that many bytes plus one returns, is
   refused with 422 `driver_metadata.json is larger than 1048576 bytes; nothing was
-  stored`, and a `.tar.gz` is read through `herd_common.bounded_tar.BoundedTarStream`,
+  stored`, and a `.tar.gz` is opened through `herd_common.bounded_tar.open_bounded_tar`,
   so a pax extended header or GNU long name over `MAX_TAR_READ_BYTES` (1 MiB) is
-  refused before it is read into memory with 422 `Driver package has a tar header
+  refused at its header block, before it is read into memory (issue #1279), with 422 `Driver package has a tar header
   record over 1048576 bytes (a pax extended header or GNU long name); nothing was
   stored` (the execution-side rule is CFG-LOAD-3). Both refusals happen before the file
   is stored, on create and on file replace, so a refused replace leaves the stored file
@@ -1480,7 +1480,7 @@ INV-PORT-6, by a throwaway script against the service on SQLite with foreign key
 
 ### Open defects
 
-None at present.
+None at present. (#1279 is resolved by INV-DRV-7.)
 
 ### Limits by decision
 

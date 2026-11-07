@@ -303,7 +303,9 @@ def test_archive_one_entry_over_the_ceiling_is_refused(tmp_path, monkeypatch, fi
 # --- A tar header record is never read past MAX_TAR_READ_BYTES (issue #1179) ---
 #
 # tarfile reads a pax extended header (x, g) or a GNU long name or long link (L, K)
-# whole, in one read, before the member it describes exists to be checked. Before
+# before the member it describes exists to be checked: in one read on 3.12, in 1 MiB
+# chunks on 3.13.18, which no per-read bound of 1 MiB refuses (issue #1279), so the
+# header is now refused at its header block from its declared size. Before
 # #1179 a 389 KB upload declaring a 400 MB pax header raised the process's peak RSS
 # by about 500 MiB, and then extracted.
 

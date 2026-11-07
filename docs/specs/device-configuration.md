@@ -1141,18 +1141,23 @@ is WIRE-DRIVER-7 in `provisioning-and-wiring.md`.
   (`Driver package has more than 10000 entries; nothing was extracted` or
   `Driver package declares more than 104857600 bytes uncompressed; nothing was extracted`),
   and tar headers are read one at a time so a member past a ceiling is never
-  decompressed. A tar is read through `herd_common.bounded_tar.BoundedTarStream`, which
-  refuses any single read over `MAX_TAR_READ_BYTES` (1 MiB; inventory's upload reads
-  through the same stream, INV-DRV-7), so a pax extended header or GNU long name or long link
-  declaring more, which tarfile would read whole before the member it describes can be
-  checked, raises `TarReadLimitError`, which extraction maps to `PackageLimitError`
+  decompressed. A tar is opened through `herd_common.bounded_tar.open_bounded_tar`
+  (inventory's upload opens it the same way, INV-DRV-7): a pax extended header, a GNU
+  long name or long link, or a Solaris extended header whose record, rounded up to the
+  512-byte block, is over `MAX_TAR_READ_BYTES` (1 MiB) is refused at its header block by
+  `BoundedTarInfo`, from the size it declares and before any of the record is read, and
+  no single read from the decompressed stream may exceed that bound (`BoundedTarStream`,
+  the second line). Either raises `TarReadLimitError`, which extraction maps to
+  `PackageLimitError`
   (`Driver package has a tar header record over 1048576 bytes (a pax extended header or GNU long name); nothing was extracted`)
-  before it is read into memory (issue #1179). The package validator extracts through
+  before the record is read into memory (issues #1179 and #1279). The header check does
+  not depend on how tarfile reads the record: Python 3.13.18 reads it in 1 MiB chunks,
+  which the per-read bound alone no longer refused. The package validator extracts through
   the same function. Any other name, a corrupt archive, or an archive past a ceiling
   raises `DriverPackageError` naming only the cause's class, and the directory is
   removed. \
-  Enforced in: `services/execution/app/services/driver_loader.py` (`extract_driver_package`, `_extract_tar_gz`, `_check_archive_limits`, `MAX_ARCHIVE_ENTRIES`, `MAX_EXTRACTED_BYTES`, `TAR_READ_REFUSAL`, `PackageLimitError`, `load_driver`); `services/common/herd_common/bounded_tar.py` (`BoundedTarStream`, `MAX_TAR_READ_BYTES`, `TarReadLimitError`) \
-  Pinned by: `services/execution/tests/test_driver_loader.py` (`test_extract_zip`, `test_extract_unsupported_format`); `services/execution/tests/test_driver_loader_advanced.py` (`test_extract_tar_gz`, `test_extract_tgz`); `services/execution/tests/test_driver_loader_security.py` (`test_zip_traversal_does_not_escape_destination`, `test_zip_absolute_path_entry_is_contained`, `test_zip_corrupt_archive_raises`, `test_tar_gz_corrupt_archive_raises`, `test_tar_gz_symlink_escape_is_blocked_by_data_filter`, `test_tar_gz_traversal_blocked_by_data_filter`, `test_extraction_ceilings_are_the_documented_constants`, `test_zip_declaring_more_than_the_byte_ceiling_is_refused_before_writing`, `test_tar_gz_declaring_more_than_the_byte_ceiling_is_refused_before_writing`, `test_zip_with_more_than_the_entry_ceiling_is_refused_before_writing`, `test_tar_gz_with_more_than_the_entry_ceiling_is_refused_before_writing`, `test_archive_exactly_at_both_ceilings_extracts`, `test_archive_one_byte_over_the_ceiling_is_refused`, `test_archive_one_entry_over_the_ceiling_is_refused`, `test_tar_read_bound_is_the_documented_constant`, `test_an_oversized_tar_header_record_is_refused_before_it_is_read`, `test_a_pax_header_just_under_the_read_bound_extracts`, `test_a_well_formed_pax_header_just_over_the_read_bound_is_refused`, `test_long_member_names_still_extract`, `test_member_data_larger_than_the_read_bound_extracts`); `services/common/tests/test_bounded_tar.py` (`test_a_read_over_the_bound_or_unbounded_is_refused_without_reading`, `test_member_data_over_the_bound_is_read_in_chunks`, `test_one_whole_read_of_member_data_over_the_bound_is_refused`); `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_extraction_failure`, `test_load_driver_extraction_failure_sanitizes_foreign_text`, `test_load_driver_refuses_archive_over_the_entry_ceiling`)
+  Enforced in: `services/execution/app/services/driver_loader.py` (`extract_driver_package`, `_extract_tar_gz`, `_check_archive_limits`, `MAX_ARCHIVE_ENTRIES`, `MAX_EXTRACTED_BYTES`, `TAR_READ_REFUSAL`, `PackageLimitError`, `load_driver`); `services/common/herd_common/bounded_tar.py` (`open_bounded_tar`, `BoundedTarInfo`, `EXTENDED_HEADER_TYPES`, `BoundedTarStream`, `MAX_TAR_READ_BYTES`, `TarReadLimitError`) \
+  Pinned by: `services/execution/tests/test_driver_loader.py` (`test_extract_zip`, `test_extract_unsupported_format`); `services/execution/tests/test_driver_loader_advanced.py` (`test_extract_tar_gz`, `test_extract_tgz`); `services/execution/tests/test_driver_loader_security.py` (`test_zip_traversal_does_not_escape_destination`, `test_zip_absolute_path_entry_is_contained`, `test_zip_corrupt_archive_raises`, `test_tar_gz_corrupt_archive_raises`, `test_tar_gz_symlink_escape_is_blocked_by_data_filter`, `test_tar_gz_traversal_blocked_by_data_filter`, `test_extraction_ceilings_are_the_documented_constants`, `test_zip_declaring_more_than_the_byte_ceiling_is_refused_before_writing`, `test_tar_gz_declaring_more_than_the_byte_ceiling_is_refused_before_writing`, `test_zip_with_more_than_the_entry_ceiling_is_refused_before_writing`, `test_tar_gz_with_more_than_the_entry_ceiling_is_refused_before_writing`, `test_archive_exactly_at_both_ceilings_extracts`, `test_archive_one_byte_over_the_ceiling_is_refused`, `test_archive_one_entry_over_the_ceiling_is_refused`, `test_tar_read_bound_is_the_documented_constant`, `test_an_oversized_tar_header_record_is_refused_before_it_is_read`, `test_a_pax_header_just_under_the_read_bound_extracts`, `test_a_well_formed_pax_header_just_over_the_read_bound_is_refused`, `test_long_member_names_still_extract`, `test_member_data_larger_than_the_read_bound_extracts`); `services/common/tests/test_bounded_tar.py` (`test_a_read_over_the_bound_or_unbounded_is_refused_without_reading`, `test_member_data_over_the_bound_is_read_in_chunks`, `test_one_whole_read_of_member_data_over_the_bound_is_refused`, `test_an_extended_header_over_the_bound_is_refused_at_its_header_block`, `test_the_header_check_alone_refuses_without_the_read_bound`, `test_control_a_plain_tarinfo_reads_the_whole_record`, `test_a_long_name_record_at_the_bound_is_read_and_one_byte_over_is_refused`, `test_a_3000_byte_path_extracts_through_both_guards`, `test_tarfile_still_has_the_methods_bounded_tar_info_uses`, `test_open_bounded_tar_refuses_a_tarinfo_without_the_header_check`); `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_extraction_failure`, `test_load_driver_extraction_failure_sanitizes_foreign_text`, `test_load_driver_refuses_archive_over_the_entry_ceiling`)
 - **CFG-LOAD-4.** The extracted package must hold `driver.py` with a plain top-level
   `class Driver` statement that provides every method `REQUIRED_METHODS` lists for the
   template's connection type (an unknown connection type fails). `load_driver` checks
@@ -1481,7 +1486,7 @@ confirmed by reading only.
 
 ### Open defects
 
-None at present.
+None at present. (#1279 is resolved by CFG-LOAD-3.)
 
 ### Limits by decision
 

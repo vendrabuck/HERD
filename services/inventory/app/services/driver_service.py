@@ -3,13 +3,12 @@ import hashlib
 import io
 import json
 import logging
-import tarfile
 import uuid
 import zipfile
 from typing import IO
 
 from fastapi import HTTPException
-from herd_common.bounded_tar import TAR_READ_LIMIT_TEXT, BoundedTarStream, TarReadLimitError
+from herd_common.bounded_tar import TAR_READ_LIMIT_TEXT, TarReadLimitError, open_bounded_tar
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,7 +26,7 @@ ALLOWED_EXTENSIONS = {".zip", ".tar.gz"}
 # capped compressed (DRIVER_MAX_SIZE_BYTES), but a small, highly compressible entry
 # could otherwise expand in memory in this process. A real metadata file is a few
 # hundred bytes. It must not exceed MAX_TAR_READ_BYTES: a tar member is read in one
-# call of at most its declared size through BoundedTarStream.
+# call of at most its declared size through herd_common's BoundedTarStream.
 MAX_DRIVER_METADATA_BYTES = 1024 * 1024
 
 METADATA_TOO_LARGE_DETAIL = (
@@ -71,9 +70,9 @@ def _parse_driver_metadata(filename: str, file_data: bytes) -> dict:
     Two failures are refused instead, with a 422 that names the bound and nothing
     stored (issue #1180), because they are about the package's size, not its
     content: a metadata entry over MAX_DRIVER_METADATA_BYTES (declared or read),
-    and a tar header record over MAX_TAR_READ_BYTES, which the tar is read through
-    ``herd_common.bounded_tar.BoundedTarStream`` to catch before it is read into
-    memory.
+    and a tar header record over MAX_TAR_READ_BYTES, which the tar is opened through
+    ``herd_common.bounded_tar.open_bounded_tar`` to refuse at its header block,
+    before it is read into memory (issue #1279).
     """
     lower = filename.lower()
     try:
@@ -87,7 +86,7 @@ def _parse_driver_metadata(filename: str, file_data: bytes) -> dict:
                     raw = _read_metadata_bytes(entry, info.file_size)
         elif lower.endswith(".tar.gz") or lower.endswith(".tgz"):
             with gzip.GzipFile(fileobj=io.BytesIO(file_data), mode="rb") as gz:
-                with tarfile.open(fileobj=BoundedTarStream(gz), mode="r:") as tf:
+                with open_bounded_tar(gz) as tf:
                     try:
                         member = tf.getmember("driver_metadata.json")
                     except KeyError:

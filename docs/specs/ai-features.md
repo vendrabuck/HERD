@@ -354,18 +354,19 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   untrusted context; with no files the prompt is sent alone. \
   Enforced in: `services/ai-orchestrator/app/services/ai_client.py` (`propose_topology`) \
   Pinned by: `services/ai-orchestrator/tests/test_ai_client.py` (`test_propose_topology_prepends_file_context_when_present`, `test_propose_topology_omits_file_context_wrapper_when_absent`)
-- **AI-UPLOAD-8.** A tgz is read through `herd_common.bounded_tar.BoundedTarStream`, which
-  refuses any single read from the decompressed stream over `MAX_TAR_READ_BYTES` (1 MiB;
-  the driver readers' rules are CFG-LOAD-3 in `device-configuration.md` and INV-DRV-7 in
-  `inventory.md`). A pax extended header or a GNU long name or long link declaring more,
-  which tarfile would read whole before the member it describes can be checked, is
-  refused before it is read into memory, and the request fails as a whole (issue #1192).
+- **AI-UPLOAD-8.** A tgz is opened through `herd_common.bounded_tar.open_bounded_tar`
+  with `_BoundedTarInfo`, a subclass of the shared `BoundedTarInfo` (the driver readers'
+  rules are CFG-LOAD-3 in `device-configuration.md` and INV-DRV-7 in `inventory.md`). A
+  pax extended header or a GNU long name or long link whose record, rounded up to the
+  512-byte block, is over `MAX_TAR_READ_BYTES` (1 MiB) is refused at its header block,
+  before any of the record is read into memory, and no single read from the decompressed
+  stream may exceed that bound; the request fails as a whole (issues #1192 and #1279).
   Since issue #1201 the header ceilings of AI-UPLOAD-15, both under this bound, refuse
   such a header first with their own detail, so no upload reaches this bound's refusal,
   400 `The tgz archive has a tar header record over 1048576 bytes (a pax extended header
   or GNU long name); nothing was extracted`; it stays as the second line, pinned with
   those ceilings raised past it. \
-  Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`_extract_tgz`, `TGZ_READ_LIMIT_DETAIL`); `services/common/herd_common/bounded_tar.py` (`BoundedTarStream`, `MAX_TAR_READ_BYTES`, `TarReadLimitError`) \
+  Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`_extract_tgz`, `TGZ_READ_LIMIT_DETAIL`); `services/common/herd_common/bounded_tar.py` (`open_bounded_tar`, `BoundedTarInfo`, `EXTENDED_HEADER_TYPES`, `BoundedTarStream`, `MAX_TAR_READ_BYTES`, `TarReadLimitError`) \
   Pinned by: `services/ai-orchestrator/tests/test_extractor_branches.py` (`test_tgz_header_record_over_the_read_bound_is_refused_before_it_is_read`, `test_tgz_well_formed_pax_header_just_over_the_read_bound_is_refused`, `test_tgz_pax_header_just_under_the_read_bound_extracts`, `test_tgz_long_member_names_still_extract`, `test_tgz_read_refusal_and_member_chunk_follow_the_shared_bound`); `services/ai-orchestrator/tests/test_generate.py` (`test_generate_tgz_with_an_oversized_tar_header_answers_400`)
 - **AI-UPLOAD-9.** A text member's data is read in chunks of `_MEMBER_READ_CHUNK_BYTES`
   (64 KiB), never in one call, because one read of a member is one read of up to that
@@ -1737,7 +1738,7 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
   hundreds of MiB is held in memory while the page walk runs; the per-file upload cap
   bounds the compressed size only, and the tgz reader's ceilings do not apply to a PDF.
 
-(#1039 is resolved by AI-CONV-13; #1280 is resolved by AI-TURN-9.)
+(#1039 is resolved by AI-CONV-13; #1279 is resolved by AI-UPLOAD-8; #1280 is resolved by AI-TURN-9.)
 
 ### Limits by decision
 
