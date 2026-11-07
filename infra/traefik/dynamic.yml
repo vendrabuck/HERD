@@ -1,4 +1,15 @@
+# The gateway's TLS certificate (issue #1239). `make certs` writes both files
+# (a self-signed certificate and its key; neither is tracked). They are listed
+# under `certificates` for clients that send SNI and under the default store's
+# `defaultCertificate` for clients that send none, which includes every client
+# that connects by IP address; without the second entry those clients are
+# served Traefik's built-in `TRAEFIK DEFAULT CERT`.
 tls:
   certificates:
     - certFile: /etc/traefik/certs/server-chain.crt
       keyFile: /etc/traefik/certs/server.key
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /etc/traefik/certs/server-chain.crt
+        keyFile: /etc/traefik/certs/server.key

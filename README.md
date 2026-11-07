@@ -310,9 +310,9 @@ make frontend-dev    # Run frontend dev server
 - Business event logging: login/register, role changes, device CRUD, reservation lifecycle, group membership changes
 
 ### TLS / HTTPS
-- Traefik terminates TLS with a custom PKI chain (Root CA, Intermediate CA, Server cert)
+- Traefik terminates TLS with a self-signed certificate that `make certs` generates on first `make up` (ten years; SANs `localhost`, `127.0.0.1`, and the `HERD_GATEWAY_BIND` address), never over an existing key
 - Port 80 redirects to HTTPS on port 443
-- Install `infra/traefik/certs/root-ca.crt` as a trusted root CA on client machines
+- Trust `infra/traefik/certs/server-chain.crt` by hand on client machines (FRESH_SETUP.md step 3), or supply your own certificate and key
 
 ## Service Details
 

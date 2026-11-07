@@ -189,27 +189,24 @@ Durable CONSUMERS get the same add-or-update treatment, for the same reason (iss
 
 ## TLS certificate rotation
 
-Certs live in `infra/traefik/certs/`. `infra/traefik/dynamic.yml` loads exactly two files: `server-chain.crt` (leaf plus intermediate, concatenated) and `server.key`. Rotating `server.crt` alone changes nothing Traefik serves; regenerate the chain file.
-
-The repository tracks the certificate files but NOT the private key: `server.key` has never been committed. Without it Traefik logs `Unable to parse certificate ... failed to find any PEM data in key input` and serves its own self-signed `TRAEFIK DEFAULT CERT`, which no client trusts, so a fresh clone needs a key and a matching chain of its own (issue #1239). A client that sends no SNI, which includes every client that connects by IP address, is also served Traefik's default certificate, because `dynamic.yml` sets no default certificate.
+Certs live in `infra/traefik/certs/`. `infra/traefik/dynamic.yml` loads exactly two files there, `server-chain.crt` (the certificate, followed by any intermediates) and `server.key`, both as the certificate for clients that send SNI and as the default store's `defaultCertificate`, which is what a client that sends no SNI gets; every client that connects by IP address is one. Neither file is tracked (issue #1239), and the repository no longer ships the old root, intermediate, and leaf certificates.
 
 ```
 infra/traefik/certs/
-  root-ca.crt          # distribute to clients; not loaded by Traefik
-  intermediate-ca.crt
-  server.crt           # leaf; input to server-chain.crt
-  server-chain.crt     # loaded by Traefik (certFile)
-  server.key           # loaded by Traefik (keyFile); NOT tracked, you provide it
+  README.md            # tracked, so the directory exists in every clone
+  server-chain.crt     # loaded by Traefik (certFile); written by make certs, or yours
+  server.key           # loaded by Traefik (keyFile); written by make certs, or yours
 ```
 
-To rotate:
+`make certs` (which `make up`, `make dev`, `make prod`, and the gates' stack start run first) generates them when `server.key` is absent: an RSA 2048 key and a self-signed certificate valid for ten years, subject `CN=HERD dev gateway`, with the subject alternative names `DNS:localhost`, `IP:127.0.0.1`, `IP:<HERD_GATEWAY_BIND>` when that is set to an address other than `0.0.0.0` (read from the environment or `.env`, as the gateway URL is), and every entry of `CERT_SANS` (comma-separated `DNS:<name>` and `IP:<address>` entries; anything else is refused and nothing is written). It never writes over an existing key: with both files present it prints one line and runs no openssl; with the key present and `server-chain.crt` missing it issues a new self-signed certificate for the existing key. Trusting the certificate on clients is a manual step (FRESH_SETUP.md step 3 has the Ubuntu, Windows, and macOS commands); nothing in the Makefile installs it.
 
-1. Generate a new PKI chain (keep the same filenames for a drop-in rotation, or update `dynamic.yml` if you change names).
-2. Replace the files in `infra/traefik/certs/`.
-3. Bounce Traefik: `docker compose restart traefik`. No other service restart is needed; backends don't serve TLS themselves.
-4. Re-distribute `root-ca.crt` to client machines (install it as a trusted root CA).
+To rotate the generated certificate (a new name or address, or a suspected key leak):
 
-The SAN in `server.crt` must match the hostname or IP users hit (e.g. `IP:192.0.2.10` or `DNS:lab.example.com`). Bumping this requires regenerating the server cert with the new SAN.
+1. `make certs CERT_FORCE=1`, with `CERT_SANS=...` if clients use names or addresses beyond localhost and the bind address. It regenerates the key and the certificate and says so.
+2. Recreate Traefik so it loads them: `docker compose up -d --no-deps --force-recreate traefik` (add `-p <project>` for the gate stack). Traefik watches `dynamic.yml`, not the certificate files, so a running gateway keeps the old certificate until then. Recreate rather than restart a Traefik created before #1240 (see the restart rule in [DEVELOPMENT.md](specs/DEVELOPMENT.md#gateway-ports-guard-and-traefik)).
+3. Trust the new certificate on every client again.
+
+To use a certificate of your own (a CA-signed one, or a validity macOS accepts, at most 825 days), write its full chain to `server-chain.crt` and its key to `server.key`, then recreate Traefik as above. `make certs` leaves an existing pair alone, so it never replaces yours; do not pass `CERT_FORCE=1` afterwards. The SAN list must name every host name and IP address users browse to (for example `IP:192.0.2.10` or `DNS:lab.example.com`).
 
 ## Secrets-service key rotation
 

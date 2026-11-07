@@ -150,7 +150,7 @@ If you run a service on a different host or port, update the URL in `.env` or th
 
 | `HERD_GATEWAY_BIND` | unset (every IPv4 interface, `0.0.0.0`) | Host address Traefik publishes ports 80 and 443 on (issue #1256). A compose-level knob, not a Settings field: `docker-compose.yml` interpolates `${HERD_GATEWAY_BIND:-0.0.0.0}` into the two gateway port entries, read from the shell environment or `.env`, and no service reads it. Set it to one IPv4 address (for example the wired NIC of a host that also has wifi) to serve the stack at that address only: `localhost` and every other interface are then refused. The Traefik dashboard stays on `127.0.0.1:8080` whatever the value. The Makefile reads the same value (the environment or command line first, else the last `HERD_GATEWAY_BIND=` line of `.env`) and derives the address its host-side harnesses use: `localhost` for unset, empty, or `0.0.0.0`, otherwise the value as written; `make gateway-url` prints the result, and it becomes the default of the exported `HERD_BASE_URL` and `E2E_HOST_BASE_URL`. A browser at the bound address warns about the certificate until #1239 lands (see TROUBLESHOOTING.md). |
 
-TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env var for cert paths. See [OPERATIONS.md](OPERATIONS.md#tls-certificate-rotation).
+TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env var for cert paths. `make certs` generates them and reads `HERD_GATEWAY_BIND` for the certificate's names; `CERT_SANS` and `CERT_FORCE` are `make` variables, not stack settings. See [OPERATIONS.md](OPERATIONS.md#tls-certificate-rotation).
 
 ## NATS
 

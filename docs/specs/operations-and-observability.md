@@ -1342,12 +1342,13 @@ tab.
 ### 8.16 Compose and image guards
 
 **What it does.** Static tests keep the deployment files honest: every setting can be set
-from `.env`, nothing but the gateway listens beyond the host, and the images run the
-locked dependency set.
+from `.env`, nothing but the gateway listens beyond the host, the gateway serves a
+certificate the checkout generated, and the images run the locked dependency set.
 
 **Surfaces.** `docker-compose.yml`, `docker-compose.override.yml`, the service
-Dockerfiles, and the unit tests under `tests/unit/` named below; the CI backend job
-(`.github/workflows/ci.yml`).
+Dockerfiles, the Makefile's `certs` target with `scripts/make_certs.sh` and
+`infra/traefik/dynamic.yml`, and the unit tests under `tests/unit/` named below; the CI
+backend job (`.github/workflows/ci.yml`).
 
 **Rules.**
 
@@ -1380,6 +1381,21 @@ Dockerfiles, and the unit tests under `tests/unit/` named below; the CI backend 
   packages installed in it differ from the locked export. \
   Enforced in: `scripts/check_image_matches_lock.py` (`main`) \
   Pinned by: `tests/unit/test_check_image_matches_lock.py` (`test_main_matching_sets_pass`, `test_main_version_mismatch_fails_with_exact_message`, `test_main_missing_from_image_fails_with_exact_message`, `test_main_unexpected_in_image_fails_with_exact_message`)
+- **OPS-GUARD-5.** The gateway serves a certificate the checkout generated, never
+  Traefik's built-in one, to clients with and without SNI (issue #1239). No certificate
+  or key is tracked; `make certs` writes `server.key` and a self-signed
+  `server-chain.crt` valid for 3650 days, with the subject alternative names
+  `DNS:localhost`, `IP:127.0.0.1`, the `HERD_GATEWAY_BIND` address unless it is unset or
+  `0.0.0.0`, and each `CERT_SANS` entry (an entry that is not `DNS:<name>` or
+  `IP:<address>` is refused and nothing is written), only when the key is absent; with
+  both files present it runs no openssl and changes nothing, with the key present and
+  the certificate missing it issues a certificate for that key, and only `CERT_FORCE`
+  regenerates the key. `make dev`, `make prod` (so `make up`), and the gate's stack
+  start depend on it after their ports guard, and `infra/traefik/dynamic.yml` names the
+  same two files under `tls.certificates` and as the default store's
+  `defaultCertificate`. \
+  Enforced in: `Makefile` (`certs`, `_master-stack-up`); `scripts/make_certs.sh` (`CERT_SANS`, `CERT_FORCE`, `HERD_CERT_BIND`); `infra/traefik/dynamic.yml` (`defaultCertificate`) \
+  Pinned by: `tests/unit/test_make_certs_wiring.py` (`test_stack_start_targets_depend_on_certs_after_their_ports_guard`, `test_start_targets_reach_make_certs_through_real_make`, `test_present_key_and_certificate_run_no_openssl_and_change_nothing`, `test_missing_certificate_is_issued_for_the_existing_key`, `test_fresh_checkout_gets_a_ten_year_certificate_naming_the_bind_address`, `test_every_interface_bind_names_only_localhost`, `test_cert_sans_entries_are_added_once_each`, `test_malformed_cert_sans_entry_is_refused_and_writes_nothing`, `test_cert_force_regenerates_both_and_says_so`, `test_dynamic_config_serves_the_pair_to_sni_and_no_sni_clients`, `test_no_certificate_or_key_is_tracked`)
 
 **Out of scope.** The build-identifier wiring guard (OPS-BUILD-2, OPS-BUILD-3); the NATS
 CLI documentation guard (OPS-NATS-14).
