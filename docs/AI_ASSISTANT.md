@@ -170,7 +170,7 @@ Errors:
 - 401: missing or invalid bearer token
 - 404: reservation does not exist or caller does not own it; **or** a `conversation_id` was supplied that does not exist, was created by a different user, or belongs to a different reservation (404 not 403 to avoid leaking existence)
 - 422: question empty or longer than 4000 characters
-- 502: the LLM call failed, or it ended a turn with no text content before any tool ran. If a tool already ran in that turn, the assistant instead returns 200 with a fixed fallback answer ("I ran the steps above but did not produce a summary...") and persists the turn, since the tool's side effects are real and should not be discarded.
+- 502: the LLM call failed, the turn failed for any other unexpected reason (the detail is always the fixed `Assistant call failed`, never the error's own text; the error and its traceback go to the server log), or it ended a turn with no text content before any tool ran. If a tool already ran in that turn, the assistant instead returns 200 with a fixed fallback answer ("I ran the steps above but did not produce a summary...") and persists the turn, since the tool's side effects are real and should not be discarded.
 - 503: no AI provider configured (`AI_PROVIDER=anthropic` needs `AI_API_KEY` or `AI_BASE_URL` set, either one; `AI_PROVIDER=openai_compat` needs `AI_BASE_URL` set), or a configured provider is unreachable, or (first turn only) reservations or inventory could not answer the seed read: "Could not read the reservation or its devices; retry the request."
 - 504: assistant or seed gather exceeded its deadline (90s overall by default; configurable)
 

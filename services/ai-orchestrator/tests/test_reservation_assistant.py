@@ -2131,3 +2131,125 @@ async def test_later_turn_reads_neither_the_reservation_nor_its_devices(async_cl
             )
             assert later.status_code == 200, later.text
     assert gathers["n"] == 1
+
+
+# --- An exception class no branch names (issue #1280) ---
+#
+# The buffered twin of AI-STREAM-6: any exception the loop raises that is not
+# a timeout, an unreachable provider, or an AIError answers the neutral 502
+# after a rollback, or keeps the turn when a write already landed (AI-TURN-6).
+# These tests build their own client with raise_app_exceptions=False, so a
+# route that lets the exception escape shows up as the plain 500 a real
+# caller would get, not as an exception raised inside the test.
+
+_UNNAMED_EXCEPTION_TEXT = "http://inventory:8000/internal/secret-path answered garbage"
+
+
+def _client_seeing_unhandled_500s() -> AsyncClient:
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    return AsyncClient(transport=transport, base_url="http://test")
+
+
+def _unexpected_error_records(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage() == "ai_assistant_unexpected_error"]
+
+
+async def test_buffered_unnamed_exception_rolls_back_and_answers_502(caplog):
+    from app.routes.reservation_assistant import ASSISTANT_CALL_FAILED_DETAIL
+    from herd_common.logging import JSONFormatter
+
+    _override_seed()
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with _client_seeing_unhandled_500s() as client:
+        conv_id = await _start_conversation(client, headers)
+
+        _override_ai(raises=RuntimeError(_UNNAMED_EXCEPTION_TEXT))
+        with caplog.at_level(logging.WARNING):
+            failed = await client.post(
+                _url(),
+                json={"question": "turn two", "conversation_id": conv_id},
+                headers=headers,
+            )
+        assert failed.status_code == 502, failed.text
+        assert failed.json() == {"detail": ASSISTANT_CALL_FAILED_DETAIL}
+
+        # The failed turn rolled back: only turn one is stored.
+        rows = await _load_db_messages(conv_id)
+        _assert_no_orphan_trailing_user(rows)
+        assert [r for r, _ in rows] == ["USER", "ASSISTANT"]
+
+        # The conversation is not wedged.
+        _override_ai(answer="turn three answer")
+        recovered = await client.post(
+            _url(),
+            json={"question": "turn three", "conversation_id": conv_id},
+            headers=headers,
+        )
+    assert recovered.status_code == 200, recovered.text
+
+    # The sanitizing contract: neither the response nor any stored row
+    # carries the exception text.
+    assert "secret-path" not in failed.text
+    rows = await _load_db_messages(conv_id)
+    assert "secret-path" not in json.dumps(rows, default=str)
+    assert "secret-path" not in recovered.text
+
+    # The log line names the class and carries the traceback for the
+    # operator, as the streaming guard's does.
+    records = _unexpected_error_records(caplog)
+    assert len(records) == 1
+    formatted = json.loads(JSONFormatter("ai-orchestrator").format(records[0]))
+    assert formatted["level"] == "ERROR"
+    assert formatted["message"] == "ai_assistant_unexpected_error"
+    assert formatted["error_class"] == "RuntimeError"
+    assert formatted["reservation_id"] == str(RESERVATION_ID)
+    assert "exception" in formatted
+    assert formatted["exception"].startswith("Traceback (most recent call last):")
+    assert "RuntimeError" in formatted["exception"]
+
+
+async def test_buffered_unnamed_exception_after_a_landed_write_keeps_the_turn(caplog):
+    job_id, version_id, device_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    tool_calls, side_effects, segments = _pre_raise_write_tool_state(job_id, version_id, device_id)
+    _override_seed()
+    _override_ai(
+        raises=RuntimeError(_UNNAMED_EXCEPTION_TEXT),
+        pre_raise_tool_calls=tool_calls,
+        pre_raise_side_effects=side_effects,
+        pre_raise_segments=segments,
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    with caplog.at_level(logging.WARNING):
+        async with _client_seeing_unhandled_500s() as client:
+            resp = await client.post(_url(), json={"question": "apply it"}, headers=headers)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["answer"] == INCOMPLETE_AFTER_TOOLS_ANSWER
+    assert body["incomplete"] == "ai_error"
+    assert body["stop_reason"] == "incomplete"
+    assert [t["name"] for t in body["tool_calls"]] == ["schedule_config_apply"]
+    assert body["pending_apply"]["job_id"] == str(job_id)
+    assert "secret-path" not in resp.text
+
+    rows = await _load_db_messages(body["conversation_id"])
+    _assert_no_orphan_trailing_user(rows)
+    assert [r for r, _ in rows] == ["USER", "ASSISTANT", "TOOL", "ASSISTANT"]
+
+    # Still logged once, by class, even though the turn was kept.
+    records = _unexpected_error_records(caplog)
+    assert len(records) == 1
+    assert records[0].error_class == "RuntimeError"
+
+
+async def test_buffered_unnamed_exception_meters_tokens_spent(monkeypatch):
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 1000)
+    _override_seed()
+    _override_spending_then_raising_ai(RuntimeError("boom"))
+    token = _user_token()
+    async with _client_seeing_unhandled_500s() as client:
+        resp = await client.post(
+            _url(), json={"question": "q"}, headers={"Authorization": f"Bearer {token}"}
+        )
+    assert resp.status_code == 502, resp.text
+    assert await _today_total_for(token) == 50

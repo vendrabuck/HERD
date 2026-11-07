@@ -528,6 +528,42 @@ async def reservation_assistant(
             status.HTTP_502_BAD_GATEWAY,
             ASSISTANT_CALL_FAILED_DETAIL,
         ) from exc
+    except Exception as exc:
+        # Issue #1280, the buffered twin of the streaming route's outer guard
+        # (#1037): an exception class none of the branches above names (a bug
+        # in a tool handler, a database error inside the loop) answers the
+        # same neutral 502 as an AIError instead of FastAPI's plain 500. The
+        # #871 carve-out holds: a write that already landed keeps the turn and
+        # answers 200 with `incomplete: "ai_error"`. The response and the
+        # stored rows carry no exception text (an unnamed exception's text can
+        # carry an internal URL or upstream body); the log line carries the
+        # traceback for the operator, like the streaming guard, since an
+        # unnamed exception is a bug by definition.
+        logger.exception(
+            "ai_assistant_unexpected_error",
+            extra={
+                "reservation_id": str(reservation_id),
+                "error_class": type(exc).__name__,
+            },
+        )
+        incomplete_response = await _finalize_incomplete_turn(
+            db=db,
+            conversation=conversation,
+            dispatcher=dispatcher,
+            segments=partial_segments,
+            usage=partial_usage,
+            user_id=user_id,
+            question=body.question,
+            reason=INCOMPLETE_REASON_AI_ERROR,
+        )
+        if incomplete_response is not None:
+            return incomplete_response
+        await db.rollback()
+        await usage_repo.record_failed_usage(db, user_id, partial_usage)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            ASSISTANT_CALL_FAILED_DETAIL,
+        ) from exc
 
     # Issue #904: the overall deadline bounds only the model-and-tool loop
     # above. Persisting a completed turn runs outside it, so a deadline can
