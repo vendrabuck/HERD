@@ -28,6 +28,7 @@ testpaths = ["tests"]
 filterwarnings = ["error"]
 markers = [
     "seeded_skip_ok(reason): skip is expected even on a seeded stack (issue #629)",
+    "ai_model: asserts a model's own tool-call choices against a live provider; runs only in the separate, no-fail-fast invocation (issue #1270)",
 ]
 
 [dependency-groups]
