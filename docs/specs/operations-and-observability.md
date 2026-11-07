@@ -1393,9 +1393,11 @@ backend job (`.github/workflows/ci.yml`).
   regenerates the key. `make dev`, `make prod` (so `make up`), and the gate's stack
   start depend on it after their ports guard, and `infra/traefik/dynamic.yml` names the
   same two files under `tls.certificates` and as the default store's
-  `defaultCertificate`. \
-  Enforced in: `Makefile` (`certs`, `_master-stack-up`); `scripts/make_certs.sh` (`CERT_SANS`, `CERT_FORCE`, `HERD_CERT_BIND`); `infra/traefik/dynamic.yml` (`defaultCertificate`) \
-  Pinned by: `tests/unit/test_make_certs_wiring.py` (`test_stack_start_targets_depend_on_certs_after_their_ports_guard`, `test_start_targets_reach_make_certs_through_real_make`, `test_present_key_and_certificate_run_no_openssl_and_change_nothing`, `test_missing_certificate_is_issued_for_the_existing_key`, `test_fresh_checkout_gets_a_ten_year_certificate_naming_the_bind_address`, `test_every_interface_bind_names_only_localhost`, `test_cert_sans_entries_are_added_once_each`, `test_malformed_cert_sans_entry_is_refused_and_writes_nothing`, `test_cert_force_regenerates_both_and_says_so`, `test_dynamic_config_serves_the_pair_to_sni_and_no_sni_clients`, `test_no_certificate_or_key_is_tracked`)
+  `defaultCertificate`. Every GitHub workflow job that starts the stack with a bare
+  `docker compose up` (ci.yml's integration job, nightly.yml's full-stack job) runs a
+  `make certs` step before it. \
+  Enforced in: `Makefile` (`certs`, `_master-stack-up`); `scripts/make_certs.sh` (`CERT_SANS`, `CERT_FORCE`, `HERD_CERT_BIND`); `infra/traefik/dynamic.yml` (`defaultCertificate`); `.github/workflows/ci.yml` (`make certs`); `.github/workflows/nightly.yml` (`make certs`) \
+  Pinned by: `tests/unit/test_make_certs_wiring.py` (`test_stack_start_targets_depend_on_certs_after_their_ports_guard`, `test_start_targets_reach_make_certs_through_real_make`, `test_present_key_and_certificate_run_no_openssl_and_change_nothing`, `test_missing_certificate_is_issued_for_the_existing_key`, `test_fresh_checkout_gets_a_ten_year_certificate_naming_the_bind_address`, `test_every_interface_bind_names_only_localhost`, `test_cert_sans_entries_are_added_once_each`, `test_malformed_cert_sans_entry_is_refused_and_writes_nothing`, `test_cert_force_regenerates_both_and_says_so`, `test_dynamic_config_serves_the_pair_to_sni_and_no_sni_clients`, `test_no_certificate_or_key_is_tracked`, `test_every_workflow_stack_start_follows_a_make_certs_step`, `test_no_other_workflow_starts_the_stack`)
 
 **Out of scope.** The build-identifier wiring guard (OPS-BUILD-2, OPS-BUILD-3); the NATS
 CLI documentation guard (OPS-NATS-14).

@@ -3,7 +3,9 @@
 # under `certificates` for clients that send SNI and under the default store's
 # `defaultCertificate` for clients that send none, which includes every client
 # that connects by IP address; without the second entry those clients are
-# served Traefik's built-in `TRAEFIK DEFAULT CERT`.
+# served Traefik's built-in `TRAEFIK DEFAULT CERT`. If the pair cannot be
+# loaded, Traefik builds no default store and answers no TLS handshake at all:
+# run `make certs` and recreate Traefik (docs/TROUBLESHOOTING.md).
 tls:
   certificates:
     - certFile: /etc/traefik/certs/server-chain.crt

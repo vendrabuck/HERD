@@ -2,7 +2,9 @@
 # Generate the gateway's self-signed TLS certificate when it has no key
 # (issue #1239). `make certs` runs this, and `make up`, `dev`, `prod`, and the
 # gate's stack start depend on it, so a fresh clone is served this certificate
-# instead of Traefik's built-in `TRAEFIK DEFAULT CERT`.
+# instead of Traefik's built-in `TRAEFIK DEFAULT CERT`. CI's integration job and
+# nightly start their stacks with a bare `docker compose up`, so each runs
+# `make certs` as a step first and is served this same self-signed certificate.
 #
 # Usage: make_certs.sh <certs directory>
 #

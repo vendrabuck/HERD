@@ -14,7 +14,19 @@ where the key existed. The fix:
 - `make up`, `dev`, `prod`, and the gate's `_master-stack-up` depend on it;
 - `dynamic.yml` names the same pair for SNI clients and as the default
   store's `defaultCertificate`;
-- no certificate or key is tracked, only the directory's README.
+- no certificate or key is tracked, only the directory's README;
+- every GitHub workflow job that starts the stack with a bare
+  `docker compose up` (ci.yml's integration job, nightly.yml's full-stack
+  job) runs a `make certs` step before it, so CI and nightly are served the
+  same self-signed certificate a fresh clone gets. Without it Traefik cannot
+  build its default TLS store and answers no handshake at all (PR #1284's
+  first CI run timed out waiting for the stack's health URL).
+
+Workflow limits: a step counts as the certificate step only when its whole
+`run` is `make certs`; a compose call naming its own file (`-f`, `--file`) or
+project (`-p`, `--project-name`), such as the NOS lab's, is not the stack; a
+`docker compose up` inside a script or a make target the step calls is not
+seen (`make up`, `dev`, `prod`, and the gate depend on `certs` themselves).
 
 Everything runs through real `make` in scratch copies of the checkout (the
 Makefile and the two scripts it calls), with a stub `docker` on PATH and
@@ -24,6 +36,7 @@ read back with the real `openssl`.
 
 import hashlib
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -40,6 +53,8 @@ CERTS_SCRIPT = REPO_ROOT / "scripts" / "make_certs.sh"
 PORTS_SCRIPT = REPO_ROOT / "scripts" / "check_gateway_ports_free.sh"
 DYNAMIC = REPO_ROOT / "infra" / "traefik" / "dynamic.yml"
 BASE_COMPOSE = REPO_ROOT / "docker-compose.yml"
+WORKFLOWS = REPO_ROOT / ".github" / "workflows"
+STACK_WORKFLOWS = ("ci.yml", "nightly.yml")
 
 HAS_MAKE = shutil.which("make") is not None
 HAS_OPENSSL = shutil.which("openssl") is not None
@@ -441,3 +456,106 @@ def test_no_certificate_or_key_is_tracked():
         check=True,
     ).stdout.split()
     assert tracked == [f"{CERTS.as_posix()}/README.md"]
+
+
+# -- the GitHub workflows -----------------------------------------------------
+
+_OTHER_STACK_OPTIONS = ("-f", "--file", "-p", "--project-name")
+
+
+def _commands(run: str) -> list[list[str]]:
+    """The words of each command in a step's `run` text: continuation lines
+    joined, comments dropped, split on `&&`, `||`, `;`, and `|`."""
+    commands = []
+    for line in run.replace("\\\n", " ").splitlines():
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        lexer.commenters = "#"
+        current: list[str] = []
+        for word in lexer:
+            if word in ("&&", "||", ";", "|", "&"):
+                if current:
+                    commands.append(current)
+                current = []
+            else:
+                current.append(word)
+        if current:
+            commands.append(current)
+    return commands
+
+
+def _starts_the_stack(words: list[str]) -> bool:
+    """`docker compose ... up ...` against the repository's own compose files."""
+    if words[:2] != ["docker", "compose"] or "up" not in words[2:]:
+        return False
+    options = words[2 : words.index("up", 2)]
+    return not any(
+        word in _OTHER_STACK_OPTIONS
+        or word.startswith(tuple(f"{o}=" for o in _OTHER_STACK_OPTIONS))
+        for word in options
+    )
+
+
+def _stack_starts_without_certs(workflow: dict) -> tuple[list[str], int]:
+    """(jobs whose stack start has no earlier `make certs` step, stack starts seen)."""
+    missing, seen = [], 0
+    for job_name, job in workflow["jobs"].items():
+        certs_done = False
+        for step in job.get("steps", []):
+            run = step.get("run")
+            if not isinstance(run, str):
+                continue
+            if run.strip() == "make certs" and not step.get("continue-on-error"):
+                certs_done = True
+                continue
+            if any(_starts_the_stack(words) for words in _commands(run)):
+                seen += 1
+                if not certs_done:
+                    missing.append(f"{job_name}: {step.get('name', run.strip())}")
+    return missing, seen
+
+
+@pytest.mark.parametrize("name", STACK_WORKFLOWS)
+def test_every_workflow_stack_start_follows_a_make_certs_step(name):
+    workflow = yaml.safe_load((WORKFLOWS / name).read_text())
+    missing, seen = _stack_starts_without_certs(workflow)
+    assert seen >= 1, f"{name}: no `docker compose up` step found; the scan is stale"
+    assert missing == [], f"{name}: stack started before `make certs`: {missing}"
+
+
+def test_no_other_workflow_starts_the_stack():
+    """A new workflow that starts the stack must be added to STACK_WORKFLOWS."""
+    for path in sorted(WORKFLOWS.glob("*.y*ml")):
+        if path.name in STACK_WORKFLOWS:
+            continue
+        _, seen = _stack_starts_without_certs(yaml.safe_load(path.read_text()) or {"jobs": {}})
+        assert seen == 0, f"{path.name} starts the stack; add it to STACK_WORKFLOWS"
+
+
+@pytest.mark.parametrize(
+    ("steps", "missing"),
+    [
+        ([{"run": "make certs"}, {"run": "docker compose up -d"}], []),
+        ([{"run": "docker compose up -d"}, {"run": "make certs"}], ["j: docker compose up -d"]),
+        ([{"run": "docker compose up -d --wait"}], ["j: docker compose up -d --wait"]),
+        (
+            [{"run": "make certs || true\ndocker compose up -d"}],
+            ["j: make certs || true\ndocker compose up -d"],
+        ),
+        (
+            [{"run": "make certs", "continue-on-error": True}, {"run": "docker compose up -d"}],
+            ["j: docker compose up -d"],
+        ),
+        (
+            [{"run": "docker compose -p herd-nos-test -f infra/nos-test/docker-compose.yml up -d"}],
+            [],
+        ),
+        (
+            [{"run": "docker compose build\ndocker compose up -d"}],
+            ["j: docker compose build\ndocker compose up -d"],
+        ),
+    ],
+)
+def test_the_workflow_scan_reads_step_order_and_the_stack_compose(steps, missing):
+    found, _ = _stack_starts_without_certs({"jobs": {"j": {"steps": steps}}})
+    assert found == missing

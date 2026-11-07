@@ -543,7 +543,8 @@ COMPOSE_OWN_PROJECT_CMD = docker compose config 2>/dev/null | sed -n 's/^name: /
 # `prod`, and the gate's `_master-stack-up` depend on it, so a fresh clone is
 # served this certificate rather than Traefik's built-in default by
 # construction, and on a checkout that has its files the dependency changes
-# nothing. Deliberately $(MAKE)-free, so `make -n certs` stays a dry run.
+# nothing. ci.yml's integration job and nightly.yml start their stacks with a
+# bare `docker compose up`, so each runs `make certs` as a step first. Deliberately $(MAKE)-free, so `make -n certs` stays a dry run.
 certs:  ## Generate the gateway's self-signed TLS certificate if it has no key (CERT_SANS, CERT_FORCE=1)
 	@HERD_CERT_BIND="$(GATEWAY_BIND)" CERT_SANS="$(CERT_SANS)" CERT_FORCE="$(CERT_FORCE)" sh scripts/make_certs.sh infra/traefik/certs
 
