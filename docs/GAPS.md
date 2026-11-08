@@ -81,8 +81,8 @@ unsaved-routing-changes warning). `TopologyEditorPage.tsx` itself is now at 96.7
   state on a 503 and the empty-range message. Calendar rendering, month navigation,
   and reservation-click handling are still untested.
 
-Measured frontend coverage at the v0.6.0 release gate is 91.0% lines (89.65% statements, 82.09% branches, 89.14% functions; 1,636 tests, 148 test files).
-The per-file percentages below date from the 2026-09-09 refresh and were not re-measured for v0.6.0.
+Measured frontend coverage at the v0.7.0 release gate is 94.43% lines (92.99% statements, 86.15% branches, 92.28% functions; 2,030 tests, 166 test files).
+The per-file percentages below date from the 2026-09-09 refresh and were not re-measured for v0.7.0.
 The files below 85% lines, all predating v0.2.0, grouped by area with a note on
 what a test would still need to cover:
 
@@ -152,7 +152,7 @@ clients have a suite but stay below 85% lines on error and edge-case branches:
 
 ## E2E
 
-`tests/e2e/` has 66 test files and 200 tests across Selenium and Playwright (collected on main on 2026-10-10; the v0.6.0 release gate ran 178: 130 passed and 48 skipped unseeded, 174 passed and 4 exempt skips seeded; see README.md's Testing section). Remaining UI gaps:
+`tests/e2e/` has 68 test files and 206 tests across Selenium and Playwright (collected on main on 2026-11-08; the v0.7.0 release gate ran 206: 148 passed and 58 skipped unseeded, 202 passed and 4 exempt skips seeded; see README.md's Testing section). Remaining UI gaps:
 
 - [HIGH] AI Generate generate-to-commit flow. `tests/e2e/test_ai_generate_dialog.py`
   covers opening the dialog, the empty-prompt disabled state, and escape-to-close,
