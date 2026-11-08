@@ -34,6 +34,7 @@
       <li><a href="#templates">2 · Create a template</a></li>
       <li><a href="#devices">3 · Create devices</a></li>
       <li><a href="#groups">4 · Device &amp; user groups</a></li>
+      <li><a href="#users">Users and profiles</a></li>
       <li><a href="#perms">5 · Grant permissions</a></li>
       <li><a href="#dynamic">6 · Hypervisors (optional)</a></li>
       <li><a href="#about">7 · Check versions</a></li>
@@ -195,6 +196,9 @@
       <li><b>Save.</b> The group exists; now grant access to it (next step).</li>
     </ol>
     <p>User groups are symmetrical: <b>User Groups &rarr; New group</b>, add members, save. New registrations auto-join <code>Not Grouped</code> until you move them. Anyone can list group names, which pickers and grants need, but opening a group to see its members and their emails is admin-only.</p>
+
+    <p class="sectitle" id="users">Users and profiles</p>
+    <p>Open <b>Administration</b>, then <b>Users</b>. The page is headed <b>User Management</b> and lists every account with the columns Name, Username, Email, Role, Created, Profile, and, for a superadmin only, Action. Name shows the account's display name, else its username. <b>Edit profile</b> in the Profile column opens a centred dialog titled <b>Edit profile</b> with the same form the account sees in Settings: <b>Name</b>, <b>Contact email</b>, <b>Phone</b>, then <b>Save profile</b> and <b>Cancel</b>. An admin or superadmin edits any account's profile this way, active or not; a save toasts "Profile saved" and closes the dialog. The sign-in email and username are shown read-only, and no screen changes them. Through the API a user who names any account but their own gets 404 <code>User not found</code>, the same answer as an unknown id. The Action column's <b>Promote to admin</b> and <b>Demote to user</b> follow the <a href="#roles">roles table</a> above.</p>
 
     <p class="sectitle" id="perms">Step 5 &middot; Grant permissions (the unlock)</p>
     <p>This is the line that makes everything visible to users. On the device group, attach the user groups that should see it.</p>

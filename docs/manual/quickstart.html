@@ -116,7 +116,7 @@
 
     <h2 class="sec" id="register">No account yet</h2>
     <p class="sectitle">Registering</p>
-    <p>Click <b>Register</b> on the sign-in card. You'll get a short form; submit it and you're issued the default <code>user</code> role. That's enough to browse and reserve &mdash; admin powers are granted separately by a superadmin.</p>
+    <p>Click <b>Register</b> on the sign-in card. You'll get a short form; submit it and you're issued the default <code>user</code> role. That's enough to browse and reserve &mdash; admin powers are granted separately by a superadmin. The form asks for Email, Username, <b>Name</b>, and Password; Name is "Shown to other users. Defaults to your username.", so it is prefilled from the username until you type there.</p>
 
     <div class="accordion">
       <summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">The Register button is greyed out</span><span class="hint">LDAP / AD shops</span></summary>
@@ -178,7 +178,7 @@
                 <a>Administration</a>
               </span>
               <span class="grow"></span>
-              <span class="right"><span class="bell" style="position:static;" data-anno="7" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg></span><span class="bell" data-anno="6" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg><span class="dot">3</span></span><a>Settings</a><span class="u">you</span><a>Logout</a></span>
+              <span class="right"><span class="bell" style="position:static;" data-anno="7" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg></span><span class="bell" data-anno="6" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg><span class="dot">3</span></span><a>Settings</a><span class="u" data-anno="8" data-anno-pin="b" data-anno-arrow data-anno-color="blue">Sara Kim</span><a>Logout</a></span>
             </div>
           </div>
         </div>
@@ -194,6 +194,7 @@
       <li><b>Reporting</b> <span class="badge admin-only">admin only</span> &mdash; utilization numbers for leadership. The tab is visible to everyone, but opening it as a non-admin gets you redirected away (that's fine).</li>
       <li><b>The bell</b> &mdash; notifications about your reservations. The number is your unread count.</li>
       <li><b>The help icon</b> (a question mark in a circle, accessible name "Help"), left of the bell. It opens this manual at <a href="https://vendrabuck.github.io/HERD/manual/">vendrabuck.github.io/HERD/manual/</a> in a new tab.</li>
+      <li><b>Your name.</b> The right-hand group ends with <b>Settings</b>, your display name, and <b>Logout</b>. Hover the name to see your username. You change the name in the <a href="user-notifications.html#settings">Profile card of Settings</a>.</li>
     </ol>
 
     <h2 class="sec" id="next">Keep going</h2>
