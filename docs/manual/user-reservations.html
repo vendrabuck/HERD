@@ -83,12 +83,12 @@
                 <span class="hd-btn primary sm" data-anno="1" data-anno-pin="l" data-anno-arrow><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14M5 12h14"/></svg> New Reservation</span>
               </div>
               <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start;">
-                <div class="hd-card" style="flex:0 0 240px;max-width:100%;padding:12px 14px;" data-anno="9" data-anno-pin="t" data-anno-arrow data-anno-color="blue">
+                <div class="hd-card" style="flex:0 0 240px;max-width:100%;padding:12px 14px;" data-anno="9" data-anno-pin="b" data-anno-arrow data-anno-color="blue">
                   <div style="font-size:12px;font-weight:600;color:var(--gray-700);margin-bottom:8px;">Filters</div>
                   <div class="hd-field"><label class="hd-label">Search reservations</label><div class="hd-input" style="color:var(--gray-400);">Purpose or reservation ID...</div></div>
                   <div class="hd-field"><label class="hd-label">Status</label><div class="hd-select">All</div></div>
                   <div class="hd-field"><label class="hd-label">Category</label><div class="hd-select">All</div></div>
-                  <div class="hd-field"><label class="hd-label">Period</label><div class="hd-select">Upcoming</div></div>
+                  <div class="hd-field"><label class="hd-label">Period</label><div class="hd-select">All</div></div>
                   <div style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--gray-600);margin-bottom:10px;" data-anno="7" data-anno-pin="l" data-anno-arrow data-anno-color="blue"><span style="width:14px;height:14px;border-radius:3px;background:var(--blue-600);display:inline-block;vertical-align:middle;"></span>All reservations</div>
                   <span class="hd-btn secondary sm" style="width:100%;justify-content:center;background:#fff;border-color:var(--gray-300);">Clear filters</span>
                 </div>
@@ -104,15 +104,15 @@
                     <table class="hd-table hd-compact">
                       <thead><tr>
                         <th style="width:32px;" data-anno="5" data-anno-pin="l" data-anno-arrow><span style="width:14px;height:14px;border:1px solid var(--gray-300);border-radius:3px;background:#fff;display:inline-block;vertical-align:middle;"></span></th>
-                        <th>ID</th><th>Owner</th><th>Status</th><th>Topo ID</th><th>Topology</th><th>Devices</th>
-                        <th data-anno="8" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><span style="display:inline-flex;align-items:center;gap:4px;color:var(--gray-900);">Period <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:11px;height:11px;"><path d="m6 9 6 6 6-6"/></svg></span></th>
-                        <th>Purpose</th><th></th>
+                        <th>ID</th>
+                        <th data-anno="8" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><span style="display:inline-flex;align-items:center;gap:4px;color:var(--gray-900);">Owner <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:11px;height:11px;"><path d="m6 9 6 6 6-6"/></svg></span></th>
+                        <th>Status</th><th>Topo ID</th><th>Topology</th><th>Devices</th><th>Period</th><th>Purpose</th><th></th>
                       </tr></thead>
                       <tbody>
+                        <tr><td><span style="width:14px;height:14px;border:1px solid var(--gray-300);border-radius:3px;background:#fff;display:inline-block;vertical-align:middle;"></span></td><td class="mono">deadbeef</td><td>admin</td><td><span class="hd-badge completed">COMPLETED</span></td><td class="mono">4b2d7e10</td><td><span class="hd-badge physical">PHYSICAL</span></td><td style="white-space:nowrap;">3 devices</td><td style="white-space:nowrap;">5/18/2026 to 5/25/2026</td><td>Driver cert run</td><td></td></tr>
+                        <tr><td><span style="width:14px;height:14px;border:1px solid var(--gray-300);border-radius:3px;background:#fff;display:inline-block;vertical-align:middle;"></span></td><td class="mono">f1a2b3c4</td><td>jordan</td><td><span class="hd-badge active" data-anno="4" data-anno-pin="b" data-anno-arrow>ACTIVE</span></td><td class="mono">9a81c0d2</td><td><span class="hd-badge physical">PHYSICAL</span></td><td style="white-space:nowrap;">4 devices</td><td style="white-space:nowrap;">5/28/2026 to 6/4/2026</td><td>HA failover regression</td><td><span style="color:#dc2626;font-weight:500;">Cancel</span></td></tr>
                         <tr style="background:#eff6ff;"><td><span style="width:14px;height:14px;border-radius:3px;background:var(--blue-600);display:inline-block;vertical-align:middle;"></span></td><td class="mono">a9b8c7d6</td><td>sara.k</td><td><span class="hd-badge pending">PENDING</span></td><td class="mono">c0ffee12</td><td><span class="hd-badge cloud">CLOUD</span></td><td style="white-space:nowrap;">2 devices</td><td style="white-space:nowrap;">5/30/2026 to 5/31/2026</td><td>VPC peering smoke test</td><td><span style="color:#dc2626;font-weight:500;">Cancel</span></td></tr>
                         <tr style="background:#eff6ff;"><td><span style="width:14px;height:14px;border-radius:3px;background:var(--blue-600);display:inline-block;vertical-align:middle;"></span></td><td class="mono">1234abcd</td><td>sara.k</td><td><span class="hd-badge provision">PENDING_PROVISION</span></td><td class="mono">9a81c0d2</td><td><span class="hd-badge physical">PHYSICAL</span></td><td style="white-space:nowrap;">6 devices</td><td style="white-space:nowrap;">5/30/2026 to 6/2/2026</td><td>Spine-leaf burn-in</td><td><span style="color:#dc2626;font-weight:500;">Cancel</span></td></tr>
-                        <tr><td><span style="width:14px;height:14px;border:1px solid var(--gray-300);border-radius:3px;background:#fff;display:inline-block;vertical-align:middle;"></span></td><td class="mono">f1a2b3c4</td><td>jordan</td><td><span class="hd-badge active" data-anno="4" data-anno-pin="b" data-anno-arrow>ACTIVE</span></td><td class="mono">9a81c0d2</td><td><span class="hd-badge physical">PHYSICAL</span></td><td style="white-space:nowrap;">4 devices</td><td style="white-space:nowrap;">5/28/2026 to 6/4/2026</td><td>HA failover regression</td><td><span style="color:#dc2626;font-weight:500;">Cancel</span></td></tr>
-                        <tr><td><span style="width:14px;height:14px;border:1px solid var(--gray-300);border-radius:3px;background:#fff;display:inline-block;vertical-align:middle;"></span></td><td class="mono">deadbeef</td><td>admin</td><td><span class="hd-badge completed">COMPLETED</span></td><td class="mono">4b2d7e10</td><td><span class="hd-badge physical">PHYSICAL</span></td><td style="white-space:nowrap;">3 devices</td><td style="white-space:nowrap;">5/18/2026 to 5/25/2026</td><td>Driver cert run</td><td></td></tr>
                       </tbody>
                     </table>
                   </div></div>
@@ -122,7 +122,7 @@
           </div>
         </div>
       </div>
-      <p class="shotcap"><b>The reservations list.</b> Your bookings, newest on top; the Filters panel at the left searches and narrows the list, and a click on a sortable heading changes the order. Here an admin has ticked All reservations at the bottom of the panel and set Period to Upcoming: two of sara.k's future bookings are selected, the list is sorted by Period with the latest start first, and jordan's ACTIVE row offers the admin Cancel but not Release.</p>
+      <p class="shotcap"><b>The reservations list.</b> Your bookings, newest on top; the Filters panel at the left searches and narrows the list, and a click on a sortable heading changes the order. Here an admin has ticked All reservations at the bottom of the panel: two of sara.k's future bookings are selected, the list is sorted by Owner, and jordan's ACTIVE row offers the admin Cancel but not Release.</p>
     </figure>
 
     <ol class="legend">
