@@ -26,7 +26,12 @@ import zlib
 from dataclasses import dataclass
 from typing import IO
 
-from herd_common.bounded_tar import TAR_READ_LIMIT_TEXT, BoundedTarStream, TarReadLimitError
+from herd_common.bounded_tar import (
+    TAR_READ_LIMIT_TEXT,
+    BoundedTarInfo,
+    TarReadLimitError,
+    open_bounded_tar,
+)
 
 from app.config import settings
 from app.schemas.generate import ExtractedFile
@@ -179,8 +184,12 @@ class _CeilingStream:
         return self._raw.tell()
 
 
-class _BoundedTarInfo(tarfile.TarInfo):
+class _BoundedTarInfo(BoundedTarInfo):
     """The TarInfo class the tgz walk opens its archive with (issue #1201).
+
+    It extends herd_common's ``BoundedTarInfo`` (issue #1279), whose check that one
+    extended header's record is at most MAX_TAR_READ_BYTES runs after these ceilings,
+    in ``super()._proc_member``; these ceilings are lower, so they refuse first.
 
     tarfile builds every header through this class (``TarFile.open(tarinfo=...)``), so
     these overrides see each header before tarfile acts on it. ``_proc_member`` is the
@@ -342,13 +351,14 @@ def _read_member(f: IO[bytes], want: int) -> bytes:
 def _extract_tgz(data: bytes, remaining_budget: int) -> str:
     """Extract text members from a gzipped tar, stopping when the budget runs out.
 
-    The tar is read through ``herd_common.bounded_tar.BoundedTarStream``, so no single
-    read from the decompressed stream exceeds MAX_TAR_READ_BYTES: a pax or GNU
-    long-name header declaring more is refused with TGZ_READ_LIMIT_DETAIL before it
-    is read into memory (issue #1192). Since issue #1201 the header ceilings below,
-    both under that bound, refuse such a header first, so that refusal is the second
-    line. Opening with ``tarfile.open(mode="r:gz")``
-    instead reads through tarfile's own gzip stream, which that bound cannot see.
+    The tar is opened through ``herd_common.bounded_tar.open_bounded_tar``: a pax or
+    GNU long-name header declaring more than MAX_TAR_READ_BYTES is refused with
+    TGZ_READ_LIMIT_DETAIL at its header block, before it is read into memory, and no
+    single read from the decompressed stream exceeds that bound (issues #1192 and
+    #1279). Since issue #1201 the header ceilings below, both under that bound, refuse
+    such a header first, so that refusal is the second line. Opening with
+    ``tarfile.open(mode="r:gz")`` instead reads through tarfile's own gzip stream,
+    which that bound cannot see.
     Every failure of the gzip layer is raised as ``tarfile.ReadError``, the class
     tarfile's gzip mode gives a body that is not gzip, so it ends as an
     ExtractionError like any other unreadable archive.
@@ -384,8 +394,7 @@ def _extract_tgz(data: bytes, remaining_budget: int) -> str:
     try:
         with gzip.GzipFile(fileobj=io.BytesIO(data), mode="rb") as gz:
             try:
-                stream = BoundedTarStream(_CeilingStream(gz))
-                with tarfile.open(fileobj=stream, mode="r:", tarinfo=_BoundedTarInfo) as tar:
+                with open_bounded_tar(_CeilingStream(gz), tarinfo=_BoundedTarInfo) as tar:
                     entries = 0
                     while (member := tar.next()) is not None:
                         # tarfile keeps every member it reads; this walk never looks back.

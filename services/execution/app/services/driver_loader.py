@@ -12,7 +12,7 @@ from pathlib import Path
 
 import httpx
 from herd_common.bounded_tar import MAX_TAR_READ_BYTES as MAX_TAR_READ_BYTES
-from herd_common.bounded_tar import TAR_READ_LIMIT_TEXT, BoundedTarStream, TarReadLimitError
+from herd_common.bounded_tar import TAR_READ_LIMIT_TEXT, TarReadLimitError, open_bounded_tar
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -128,9 +128,10 @@ async def download_driver_package(driver_id: uuid.UUID) -> bytes:
 # decision, not settings.
 MAX_EXTRACTED_BYTES = 100 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 10_000
-# MAX_TAR_READ_BYTES, the largest single read the tar reader may make from the
-# decompressed stream (issue #1179), lives in herd_common.bounded_tar since #1180, which
-# shares it with inventory's driver upload; it is re-exported from this module above.
+# MAX_TAR_READ_BYTES, the largest tar header record and the largest single read the
+# tar reader may make from the decompressed stream (issues #1179 and #1279), lives in
+# herd_common.bounded_tar since #1180, which shares it with inventory's driver upload;
+# it is re-exported from this module above.
 # The refusal text for a tar header record over that bound:
 TAR_READ_REFUSAL = f"Driver package has a {TAR_READ_LIMIT_TEXT}; nothing was extracted"
 
@@ -160,7 +161,7 @@ def _extract_tar_gz(package_bytes: bytes, dest_dir: Path) -> None:
     """The tar branch of extract_driver_package; see its docstring for the rules."""
     with gzip.GzipFile(fileobj=io.BytesIO(package_bytes), mode="rb") as raw:
         try:
-            tf = tarfile.open(fileobj=BoundedTarStream(raw), mode="r:")
+            tf = open_bounded_tar(raw)
         except OSError as exc:
             # What tarfile.open(mode="r:gz") raises for a stream that is not gzip.
             raise tarfile.ReadError("not a gzip file") from exc
@@ -184,10 +185,11 @@ def extract_driver_package(package_bytes: bytes, filename: str, dest_dir: Path) 
     reads no more than an entry's ``file_size`` and tarfile writes exactly a member's
     ``size``.
 
-    A tar is read through ``herd_common.bounded_tar.BoundedTarStream``, so no single
-    read from the decompressed stream exceeds MAX_TAR_READ_BYTES: a pax or GNU
-    long-name header declaring more is refused before it is read into memory, raised
-    here as ``PackageLimitError`` with TAR_READ_REFUSAL (issue #1179). Member
+    A tar is opened through ``herd_common.bounded_tar.open_bounded_tar``: a pax or GNU
+    long-name header declaring more than MAX_TAR_READ_BYTES is refused at its header
+    block, before its record is read into memory, and no single read from the
+    decompressed stream exceeds that bound; either refusal is raised here as
+    ``PackageLimitError`` with TAR_READ_REFUSAL (issues #1179 and #1279). Member
     headers are read one at a time and the scan stops at the first one past a
     ceiling; skipping over member data still decompresses it in small chunks, and
     extraction then decompresses the stream a second time from the start. The work
