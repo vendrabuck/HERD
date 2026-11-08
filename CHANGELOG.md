@@ -14,8 +14,8 @@
   verified with PyJWT instead of python-jose, through one helper,
   `herd_common.jwt_codec.decode_access_token`, which passes exactly one algorithm and a 10
   second leeway (#1186). Non-admin template reads now mask password-field defaults the way
-  device reads mask password values. The settings check and the template masking close the
-  two draft security advisories published with this release.
+  device reads mask password values. The settings check and the template masking are the
+  fixes for the two security advisories addressed by this release.
 - Untrusted input is bounded earlier. A driver package's files no longer run in the
   sandbox child before its resource limits apply: the child starts in Python's isolated
   mode and puts the package on its path only after the limits are set (#1180). An uploaded
