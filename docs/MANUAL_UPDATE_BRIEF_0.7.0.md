@@ -1,6 +1,6 @@
 # Brief for Claude Design: bring the HERD manual up to v0.7.0
 
-Repo: vendrabuck/HERD, branch main at `<main commit after the 0.8.0.dev0 bump>`
+Repo: vendrabuck/HERD, branch main at `c6d2ec76`
 (0.8.0.dev0). The manual is the HTML under `docs/manual/` (22 pages plus
 `assets/`: 16 ordinary pages and six release pages), published at
 <https://vendrabuck.github.io/HERD/manual/>. Its last content edit was a98d7d45
