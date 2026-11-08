@@ -2,6 +2,88 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-08
+
+- A hardening release. The 177 entries under Delivery detail are 115 fixes, 31 test
+  changes, 18 documentation changes, 4 behavior changes, 4 additions, 1 security change, 3
+  list-page features, and the upgrade note for the Traefik change.
+- Token settings are checked when a service starts. Every service that checks access
+  tokens validates `AUTH_SECRET_KEY` and `AUTH_ALGORITHM` as its settings load, so a blank
+  or placeholder key, or one that cannot serve as an HMAC secret, stops the service with a
+  message naming the variable instead of signing tokens with it. Tokens are signed and
+  verified with PyJWT instead of python-jose, through one helper,
+  `herd_common.jwt_codec.decode_access_token`, which passes exactly one algorithm and a 10
+  second leeway (#1186). Non-admin template reads now mask password-field defaults the way
+  device reads mask password values. The settings check and the template masking close the
+  two draft security advisories published with this release.
+- Untrusted input is bounded earlier. A driver package's files no longer run in the
+  sandbox child before its resource limits apply: the child starts in Python's isolated
+  mode and puts the package on its path only after the limits are set (#1180). An uploaded
+  tar whose pax extended header or GNU long name is over 1 MiB is refused at the header
+  block, before any of the record is read; the earlier per-read bound did not hold on
+  Python 3.13.18, which reads such a record in 1 MiB chunks (#1279). The e2e Selenium
+  container publishes its WebDriver and noVNC ports on 127.0.0.1 only (#964). The buffered
+  reservation assistant route answers 502 without the exception's text when a turn fails
+  with an exception class it does not name, where it used to answer a plain 500 (#1280).
+- A stack shares its host more safely. `HERD_GATEWAY_BIND` publishes the gateway on one
+  host address (#1256). Each stack's Traefik now discovers only its own compose project's
+  containers, and `make up`, `make dev`, and `make prod` refuse to start while another
+  compose project publishes port 80 or 443; recreate Traefik after pulling, as the upgrade
+  note below says. `make certs` writes a self-signed gateway certificate valid for ten
+  years, so a fresh clone is no longer served Traefik's built-in certificate, and the TLS
+  store names that pair as its default (#1239). Auth boots on a stack upgraded in place
+  before `make migrate` when the new release adds a column to `users` (#1261). `make
+  everything` runs the ci.yml checks it used to skip, among them `uv lock --check`, the
+  frontend suite under `TZ=America/Los_Angeles`, and the `package-lock.json` sync check.
+- Accounts have profiles, and the list pages have a filter panel. Every account has a
+  required display name and an optional contact email and phone number, which the account
+  edits on Settings and an admin edits from Admin > Users (#1252). List pages share a left
+  filter panel (#957). The Topologies page gains search, an Owner filter, sortable
+  columns, and multi-select delete (#958), and the Reservations page can be searched and
+  filtered by Status, Category, and Period, with the choices saved per user (#959).
+- Webhook subscriptions can be paused, and several interface defects are fixed. An admin
+  can pause and resume a webhook subscription with `PATCH /api/v1/webhooks/{id}`, keeping
+  its delivery ledger; a paused subscription receives no event and nothing is replayed on
+  resume (#1078). Modal dialogs open centred again; Tailwind 4's base styles had pinned
+  them to the top-left corner in every release through 0.6.0 (#979). Toasts appear at the
+  bottom centre, where they no longer cover the topology editor's Save button (#942), and
+  the Settings page scrolls again (#1260).
+- Reservation edits follow the rules create follows (#994 to #1000). A device edit commits
+  under a status guard, so a PATCH that races a cancel, release, auto-complete, or
+  activation keeps nothing and answers 409, and inventory is written only for an `ACTIVE`
+  reservation (#994). An edit can no longer stretch a reservation past
+  `RESERVATION_MAX_DURATION_SECONDS` (#995), and a device added to a `PENDING` reservation
+  is judged by the window conflict check (#999). Both provisioning backstops time from a
+  new `provision_started_at` stamp, so a purpose edit no longer restarts the timeout
+  (#997). The calendar answers 503 to a non-admin when device visibility cannot be
+  verified, instead of showing every user's reservations (#1000).
+- Wiring and dynamic instances recover from failures that used to strand them. VLAN
+  numbers are unique across everything reachable through the current cabling, transit
+  switches included, so a cable change no longer lets two reservations share a number in
+  one fabric (#1003). The background wiring retry no longer stalls on a ledger whose
+  oldest `FAILED` rows it will never drive (#1190), and one reservation's failed upstream
+  read no longer stops the retry for every other reservation in that layer (#1204).
+  Execution no longer reads a 401 or 403 from inventory as a missing device or template,
+  so during an `INTERNAL_API_TOKEN` rotation a live switch's wiring rows are retried
+  instead of pinned `FAILED` (#1203), and a reservation lifecycle event refused the same
+  way is retried instead of dropped (#1215). Ending a reservation runs a keyed destroy for
+  a dynamic instance whose create never reported a handle, and the #896 compensation path
+  uses it too; existing Hypervisor recipes must accept `instance_ref=None` (#937). A
+  ledger write that loses the FAILED-to-ACTIVE compare-and-swap returns the winner's row
+  instead of raising `MissingGreenlet` (#1152).
+- Tests prove what they claim. A test-effectiveness sweep read every test file in the
+  repository, verified 75 high-severity findings by mutation, and landed the fixes (#1134
+  to #1148, #1158); it also found the ledger defect above (#1152). Three Playwright tests
+  order their read-backs by the HTTP response of the action they wait on instead of a
+  toast an earlier action left on screen (#1169). The assistant integration tests that
+  judge the local model's own tool choices carry an `ai_model` marker and run in a
+  separate invocation after every deterministic integration test, so one model miss no
+  longer leaves the rest of the suite unrun (#1270). The NOS lab's SR Linux healthcheck
+  waits for an SSH banner (#1263), and the FRR image builds again with its openssh pin
+  moved to the version Alpine 3.16 still carries (#1268).
+
+### Delivery detail
+
 - Fixed: an uploaded tar with an oversized pax extended header or GNU long name is refused again on Python 3.13.18 (#1279). The bound from #1179, #1180, and #1192 was a per-read limit, `herd_common.bounded_tar.BoundedTarStream` refusing any single read over `MAX_TAR_READ_BYTES` (1 MiB), which worked because tarfile on 3.12 reads such a header's whole record in one call. Python 3.13.18 reads it in 1 MiB chunks (tarfile's `_safe_read`, gh-151497), every chunk passed the bound, and a driver package or AI generate tgz declaring an 8 MiB record was read into memory in full instead of being refused, and in the GNU long-name case extraction started. The bound is now a header check: `BoundedTarInfo` refuses an extended header (pax `x` and `g`, Solaris `X`, GNU `L` and `K`) whose record, rounded up to its 512-byte block, is over `MAX_TAR_READ_BYTES`, at the header block and before any of the record is read, whatever size of reads tarfile makes. Every uploaded tar is opened through one helper, `open_bounded_tar`, which passes that class (ai-orchestrator's `_BoundedTarInfo` now extends it) and keeps the per-read bound as the second line; the refusals are unchanged: execution's `PackageLimitError`, inventory's 422, and ai-orchestrator's 400, each with the same detail. HERD's images and CI run 3.12, which was not affected; the five tests per service that failed on 3.13.18 pass on both.
 - Added: `make certs` generates the gateway's TLS certificate, so a fresh clone is no longer served Traefik's built-in `TRAEFIK DEFAULT CERT` (#1239). The repository never tracked `infra/traefik/certs/server.key`, so the tracked chain could not load anywhere but a host that had supplied its own key, and `dynamic.yml` set no default certificate, so a client connecting by IP address (no SNI) got Traefik's own even there. `make certs` (`scripts/make_certs.sh`) writes `server.key` and a self-signed `server-chain.crt` valid for ten years, naming `localhost`, `127.0.0.1`, the `HERD_GATEWAY_BIND` address, and any `CERT_SANS` entries, only when the key is absent: with both files present it changes nothing, with the key present and the certificate missing it issues a certificate for that key, and `CERT_FORCE=1` regenerates both. `make up`, `dev`, `prod`, and the gate's stack start run it first, and CI's integration job and nightly, which start their stacks with a bare `docker compose up`, run it as a step before that; `dynamic.yml` names the pair as the default certificate too, so a pair that does not load now means no TLS handshake at all rather than the built-in certificate. The tracked root, intermediate, and leaf certificates are removed (no consumer; their key was never public), and `infra/traefik/certs/README.md` keeps the directory. Trusting the certificate stays a manual step (FRESH_SETUP.md step 3). `tests/unit/test_make_certs_wiring.py` pins it through real `make` in scratch checkouts; spec rule OPS-GUARD-5.
 - Fixed: the buffered reservation assistant route (`POST /reservations/{id}/assistant`) no longer answers FastAPI's plain 500 when the turn fails with an exception class it does not name (#1280). It now does what the streaming route already did: before any write tool landed, the turn is rolled back, its spent tokens are metered, and the route answers 502 `Assistant call failed`; after a write landed, the turn is kept and answered 200 with `incomplete: "ai_error"`. Neither the response nor the stored rows carry the exception's text; the failure is logged once as `ai_assistant_unexpected_error` with its class and traceback, as the streaming route logs it (spec rule AI-TURN-9).
