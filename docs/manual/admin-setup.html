@@ -227,14 +227,15 @@
                   <div class="hd-field"><label class="hd-label">Hypervisor Type</label><div class="hd-input" data-anno="2" data-anno-pin="b" data-anno-arrow data-anno-color="blue">proxmox</div></div>
                   <div class="hd-field"><label class="hd-label">Secret</label><div class="hd-select" data-anno="3" data-anno-pin="b" data-anno-arrow>pve-api-token (api_key)</div></div>
                 </div>
-                <label style="display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--gray-700);"><span style="width:16px;height:16px;border-radius:4px;background:var(--blue-600);display:inline-flex;align-items:center;justify-content:center;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"><path d="m5 13 4 4L19 7"/></svg></span> Enabled</label>
+                <div class="hd-field"><label class="hd-label">Bookable by device group</label><div class="hd-select" data-anno="5" data-anno-pin="l" data-anno-arrow data-anno-color="blue">Admins only</div><div style="font-size:11px;color:var(--gray-500);margin-top:4px;">Users whose user groups have a permission on this device group can see and book the dynamic templates that use this hypervisor. Admins can always book them.</div></div>
+                <label style="display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--gray-700);"><span style="width:16px;height:16px;border-radius:4px;background:var(--blue-600);display:inline-flex;align-items:center;justify-content:center;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"><path d="m5 13 4 4L19 7"/></svg></span> <span data-anno="6" data-anno-pin="r" data-anno-arrow data-anno-color="blue">Enabled</span></label>
               </div>
               <div class="mfoot"><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary" data-anno="4" data-anno-pin="t" data-anno-arrow>Register</span></div>
             </div>
           </div></div>
         </div>
       </div>
-      <p class="shotcap"><b>Registering a hypervisor</b> (Administration &rarr; Hypervisors). It joins the table with its type, endpoint, and secret.</p>
+      <p class="shotcap"><b>Registering a hypervisor</b> (Administration &rarr; Hypervisors). It joins the table with its type, endpoint, secret, a <b>Bookable by</b> column, and an <b>Enabled</b> column that reads Yes or No.</p>
     </figure>
 
     <ol class="legend">
@@ -242,6 +243,8 @@
       <li><b>Hypervisor Type.</b> Free text matched by the recipe driver: <code>proxmox</code>, <code>vsphere</code>, <code>libvirt</code>, and so on.</li>
       <li><b>Secret.</b> Credentials, referenced from the secrets store &mdash; create the secret first or this list is empty.</li>
       <li><b>Register.</b> Deleting later fails while any template references it, same as drivers.</li>
+      <li><b>Bookable by device group.</b> <b>Admins only</b> (the default) or one of your device groups. With a group chosen, users whose user groups hold a permission on that group can see and book the dynamic templates that use this hypervisor; admins can always book them. To everyone else a template on the hypervisor is hidden and answers exactly like an unknown one. Every hypervisor that existed before 0.7.0 starts as Admins only until you assign a group.</li>
+      <li><b>Enabled.</b> While unticked, a booking of a template on this hypervisor is refused with a 422 naming the hypervisor, and execution creates no instance on it for a booking taken earlier.</li>
     </ol>
 
     <div class="callout calm">
