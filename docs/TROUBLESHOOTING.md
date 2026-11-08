@@ -303,7 +303,7 @@ tgz limits below are constants in the code, not settings.
 | `The tgz archive has more than 65536 bytes of pax extended headers and GNU long names in front of one member; nothing was extracted` | Over 64 KiB of those headers together before one member, each counted rounded up to its 512-byte block. |
 | `The tgz archive has more than 4096 bytes of pax global headers; nothing was extracted` | Over 4 KiB of pax global headers in the archive, counted the same way (`git archive` writes 52 bytes). |
 | `The tgz archive has a sparse member, which is not supported; nothing was extracted` | A sparse member in any GNU format, or any pax record whose keyword starts with `GNU.sparse.`. |
-| `The tgz archive has a tar header record over 1048576 bytes (a pax extended header or GNU long name); nothing was extracted` | One read over 1 MiB from the decompressed tar stream. The 64 KiB header ceiling refuses such a header first, so this is the second line and no upload reaches it. |
+| `The tgz archive has a tar header record over 1048576 bytes (a pax extended header or GNU long name); nothing was extracted` | One pax extended header or GNU long name over 1 MiB, or one read over 1 MiB from the decompressed tar stream. The 64 KiB header ceiling refuses such a header first, so this is the second line and no upload reaches it. |
 
 The extractor repeats the file count and per-file checks (`Too many files: ...` and `File
 '<name>' is N bytes, exceeds limit of M`) as defense in depth; the route's chunked read

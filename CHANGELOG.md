@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Docs: accuracy sweep after v0.7.0. SECURITY.md names v0.7.0 as the latest release; README.md counts eight locust user classes (`DeviceConfigUser` joined in #1100); docs/ENV_VARS.md no longer says the bound-address certificate warning lasts until #1239 lands, and docs/GAPS.md aims its certificate check at the certificate `make certs` writes instead of a committed CA; docs/USER_GUIDE.md places the Inventory search and filters in the left filter panel (#957); docs/ARCHITECTURE.md, docs/DRIVERS.md, docs/AI_GENERATE.md, and docs/TROUBLESHOOTING.md describe the 1 MiB tar header bound as the header check #1279 made it, not a per-read bound; and `docs/specs/identity-and-access.md` section 13 records the three documents issue #1010 named as corrected instead of still disagreeing. Three older errors found on the way: docs/ADMIN_HANDBOOK.md no longer tells the superadmin to change a password HERD cannot change, docs/GAPS.md names the auth health route `/api/auth/health`, and `docs/specs/DEVELOPMENT.md` gives the gate stack's address as the gateway URL rather than localhost.
+
 ## [0.7.0] - 2026-11-08
 
 - A hardening release. The 177 entries under Delivery detail are 115 fixes, 31 test

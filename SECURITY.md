@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-HERD is developed on `main` and tagged for release (the latest is v0.6.0, with a `release/0.6.0` branch at the tagged commit). There is no long-term-support branch today; fixes land on `main`, so please run the latest release or a recent commit.
+HERD is developed on `main` and tagged for release (the latest is v0.7.0, with a `release/0.7.0` branch at the tagged commit). There is no long-term-support branch today; fixes land on `main`, so please run the latest release or a recent commit.
 
 | Version | Supported |
 | ------- | --------- |

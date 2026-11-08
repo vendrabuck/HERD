@@ -151,8 +151,8 @@ Expand a row to see device audit info (who created/modified, when), device-group
 
 Click a row to open the device detail page. A left-hand sidebar on that page shows the same audit and group information (created / modified dates, created-by and modified-by names, device groups, and the user groups that have access through each device group), so you do not need to navigate back to the table to see it.
 
-Above the table, the Inventory page has a name search box (a case-insensitive substring
-match) and three filters: **Status** (`AVAILABLE`, `RESERVED`, `OFFLINE`, `MAINTENANCE`),
+In the panel on the left of the table (issue #957), the Inventory page has a name search
+box (a case-insensitive substring match) and three filters: **Status** (`AVAILABLE`, `RESERVED`, `OFFLINE`, `MAINTENANCE`),
 **Template**, and **Topology** (`PHYSICAL`, `CLOUD`). Each filter has an **All** option that
 applies no restriction. The Template list shows each device template with its vendor and
 model, so choosing a template is also how you filter by vendor or model. Filters combine

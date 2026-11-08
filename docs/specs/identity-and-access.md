@@ -1563,10 +1563,10 @@ None at present.
 - The deactivation breaker's denominator is every LDAP account, inactive ones included
   (IAM-SWEEP-7). Recorded in ADR 0011 (as amended 2026-08-12: one pass over all LDAP
   users).
-- Three documents disagree with the rules here, tracked as issue #1010: the handbook's
-  superadmin promotion (IAM-USER-3), the FEATURES.md statement that superadmin accounts
-  remain local (IAM-LDAP-1, IAM-USER-9), and the SECURITY.md statement that rotating the
-  secret invalidates every live session (IAM-JWT-1, IAM-SESSION-1).
+- Issue #1010 corrected three documents that disagreed with the rules here: the
+  handbook's superadmin promotion (IAM-USER-3), the FEATURES.md statement that superadmin
+  accounts remain local (IAM-LDAP-1, IAM-USER-9), and the SECURITY.md statement that
+  rotating the secret invalidates every live session (IAM-JWT-1, IAM-SESSION-1).
 
 ### Rules with no test
 
