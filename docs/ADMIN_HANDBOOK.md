@@ -28,7 +28,7 @@ that endpoint is rejected 403. Full API-level matrix with every endpoint:
 
 The superadmin is seeded from env vars on first startup. After that:
 
-1. **Log in as superadmin**, change the password if you used a default.
+1. **Log in as superadmin.** HERD has no password change or reset route, so the seeded `SUPERADMIN_PASSWORD` stays the account's password; do not seed a default.
 2. **Promote anyone else who needs admin**: `PUT /api/auth/users/{id}/role` with body `{"role": "admin"}` (or use the admin UI if exposed).
 3. **Create a few user groups** to start (e.g. `networking`, `security`, `qa`). New users land in `Not Grouped` automatically.
 4. **Upload one or more drivers** (see [Seeding drivers](#seeding-drivers) below).

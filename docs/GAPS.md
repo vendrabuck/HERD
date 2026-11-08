@@ -24,7 +24,7 @@ MEDIUM, LOW) and a concrete target file path.
   `traefik` command in `docker-compose.yml`, is pinned by
   `tests/unit/test_gateway_ports_guard.py`; the private key is not tracked,
   issue #1239). Target: a small integration check that
-  fetches `/api/auth/healthz` with `verify=True` against the certificate `make certs` writes.
+  fetches `/api/auth/health` with `verify=True` against the certificate `make certs` writes.
 - **[MEDIUM] Alembic up/down tests.** Migrations run implicitly through the
   integration stack setup; no explicit test verifies `alembic upgrade head`
   from empty and `alembic downgrade -1` against every revision per service.
