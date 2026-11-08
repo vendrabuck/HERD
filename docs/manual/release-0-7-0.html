@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>HERD Manual: Release 0.6.0</title>
+<title>HERD Manual: Release 0.7.0</title>
 <link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
 <link rel="stylesheet" href="assets/manual.css" />
 <link rel="stylesheet" href="assets/app.css" />
@@ -75,7 +75,7 @@
 
     <h2 class="sec" id="what">The short version</h2>
     <p class="sectitle">What 0.7.0 is</p>
-    <p>0.6.0 was about the two screens you live in. 0.7.0 is a hardening release: most of its 177 changelog entries fix behaviour you never see, and two of them close security advisories. The visible part is smaller and worth knowing. Every account now has a display name, with an optional contact email and phone number, edited in the Profile section of Settings; the header shows the name instead of the username. The Inventory, Reservations, and Topologies lists share a left Filters panel: the Inventory filters moved into it unchanged, the Reservations list can be searched and filtered by Status, Category, and Period, and the Topologies list gains search, an Owner filter, sortable headings, and a multi-select delete.</p>
+    <p>0.6.0 was about the two screens you live in. 0.7.0 is a hardening release: most of its 177 changelog entries fix behaviour you never see, and two of them address security advisories. The visible part is smaller and worth knowing. Every account now has a display name, with an optional contact email and phone number, edited in the Profile section of Settings; the header shows the name instead of the username. The Inventory, Reservations, and Topologies lists share a left Filters panel: the Inventory filters moved into it unchanged, the Reservations list can be searched and filtered by Status, Category, and Period, and the Topologies list gains search, an Owner filter, sortable headings, and a multi-select delete.</p>
     <p>Under the floor, a service refuses to start when <code>AUTH_SECRET_KEY</code> is blank, still the placeholder, or unusable as an HMAC secret, and names the variable. A stack can be published on one host address, each stack's Traefik sees only its own compose project, and <code>make certs</code> writes a self-signed gateway certificate so a fresh clone is served its own. Reservation edits now follow the rules create follows, a topology or a port cannot be deleted while something depends on it, and an admin can pause a webhook subscription. Modal dialogs open centred, toasts appear at the bottom centre, and the Settings page scrolls again.</p>
 
     <h2 class="sec" id="highlights">The contents</h2>
@@ -118,7 +118,7 @@
       <li>Fifteen Postgres-live suites against the gate database, hard-required, 69 tests in all.</li>
       <li>Load: 20 simulated users for one minute, 660 requests, 0 failures, median 13 ms, p95 120 ms.</li>
     </ul>
-    <p>New in the gate this release: <code>make everything</code> runs the ci.yml checks it used to skip, among them <code>uv lock --check</code>, the frontend suite under <code>TZ=America/Los_Angeles</code>, and the <code>package-lock.json</code> sync check. The release gate is unchanged: a clean full validation run (lint, format check, every unit suite with coverage, frontend build, contract snapshots, integration, end-to-end, and load, against a rebuilt ephemeral stack) at the tagged commit, plus the same branch-protection ruleset on <code>main</code> described on the <a href="release-0-1-0.html#quality">0.1.0 page</a>. The ruleset also covers <code>release/*</code> branches.</p>
+    <p>New in the gate this release: <code>make everything</code> runs the ci.yml checks it used to skip, among them <code>uv lock --check</code>, the frontend suite under <code>TZ=America/Los_Angeles</code>, and the <code>package-lock.json</code> sync check (changelog, the Delivery detail entry "<code>make everything</code> runs the ci.yml checks it used to skip"). The release gate is unchanged: a clean full validation run (lint, format check, every unit suite with coverage, frontend build, contract snapshots, integration, end-to-end, and load, against a rebuilt ephemeral stack) at the tagged commit, plus the same branch-protection ruleset on <code>main</code> described on the <a href="release-0-1-0.html#quality">0.1.0 page</a>. The ruleset also covers <code>release/*</code> branches.</p>
 
     <h2 class="sec" id="boundaries">The honest part</h2>
     <p class="sectitle">Known boundaries</p>
