@@ -38,18 +38,27 @@ against the real tree and against fixture trees):
 Limits:
 
 - Check 3 knows only the four phrasings above. A new way of saying the same thing, such
-  as "the latest release is 0.3.0", passes.
+  as "the latest release is 0.3.0", passes. Text in HTML comments and in attribute values
+  (`alt`, `title`, a meta description) is not read, and words that meet only across a tag
+  with no whitespace on either side (`now<b>describes</b>`) do not match.
 - The guard judges no other prose on any page. An ordinary page that names a version in
   its text goes stale unnoticed.
-- The previous and next links at the foot of release pages are not checked. Neither is
-  the header link's class, nor any sidebar entry's text.
-- Only files directly in `docs/manual/` are read, and only those whose names match the
-  pattern are release pages. A misnamed one (`release-0-8.html`) is an ordinary page to
+- The previous and next links at the foot of release pages, and every release link
+  outside the header, the sidebar, and the dek, are not checked. Neither is the header
+  link's class, nor any sidebar entry's text.
+- Only files directly in `docs/manual/` are read. A release page misnamed so that it does
+  not match the pattern (`release-0-8.html`, `Release-0-8-0.html`) is an ordinary page to
   this guard and gets only the header check.
 - Links are compared by the last path segment of the href, so `../release-0-7-0.html`
   and `release-0-7-0.html#what` both target `release-0-7-0.html`.
-- Text in HTML comments and in attribute values (`alt`, `title`, a meta description) is
-  not read.
+- The dek runs from a `<p>` start tag whose class includes `dek` to the next `</p>`,
+  `<p>` start tag, or block-level start tag (`div`, `ul`, `ol`, `table`, `section`,
+  `main`, `aside`, `header`, `footer`, `nav`, `h1` to `h6`, `pre`, `blockquote`,
+  `figure`, `hr`). Check 4 does not judge what the dek says around the link, or what
+  else it links.
+- HTML is read with the standard library's forgiving parser: an unclosed `<header>` or
+  `<aside>` runs to the end of the page, and an unclosed `<a>` runs to the next `<a>` that
+  has an `href`, or to the next `</a>`.
 """
 
 import re
@@ -456,6 +465,21 @@ def test_sidebar_missing_the_newest_release(manual: Path):
     ]
 
 
+def test_sidebar_in_the_wrong_order(manual: Path):
+    _edit(
+        manual / "release-0-2-0.html",
+        '      <li><a href="release-0-3-0.html">Release 0.3.0</a></li>\n'
+        '      <li><a href="release-0-2-0.html" class="active">Release 0.2.0</a></li>\n',
+        '      <li><a href="release-0-2-0.html" class="active">Release 0.2.0</a></li>\n'
+        '      <li><a href="release-0-3-0.html">Release 0.3.0</a></li>\n',
+    )
+    assert check_sidebars(manual) == [
+        "release-0-2-0.html: sidebar release links are "
+        "[release-0-2-0.html, release-0-3-0.html, release-0-1-0.html], "
+        "expected newest first [release-0-3-0.html, release-0-2-0.html, release-0-1-0.html]"
+    ]
+
+
 def test_sidebar_with_the_active_class_on_the_wrong_entry(manual: Path):
     _edit(
         manual / "release-0-2-0.html",
@@ -531,6 +555,17 @@ def test_dek_without_the_successor_link(manual: Path):
         manual / "release-0-1-0.html",
         'The release after it is <a href="release-0-2-0.html">0.2.0</a>.',
         "The release after it is 0.2.0.",
+    )
+    assert check_successor_links(manual) == [
+        "release-0-1-0.html: dek does not link the next release page, release-0-2-0.html"
+    ]
+
+
+def test_dek_linking_a_later_release_that_is_not_the_immediate_successor(manual: Path):
+    _edit(
+        manual / "release-0-1-0.html",
+        'The release after it is <a href="release-0-2-0.html">0.2.0</a>.',
+        'The release after it is <a href="release-0-3-0.html">0.3.0</a>.',
     )
     assert check_successor_links(manual) == [
         "release-0-1-0.html: dek does not link the next release page, release-0-2-0.html"
