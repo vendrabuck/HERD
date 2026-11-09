@@ -21,6 +21,7 @@ from pathlib import Path
 import httpx
 import pytest
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -168,6 +169,57 @@ def format_sessionfinish_report(skips: list[tuple[str, str]], exempt: list[tuple
 # so this never grows across a session and never leaks staled pages.
 _pw_console_log: dict[int, list[str]] = {}
 
+# Browser objects created while the current test runs (issue #1266), as
+# (kind, object) pairs: kind "playwright" holds a Page, kind "selenium" a
+# WebDriver. A login helper that times out inside a fixture raises before the
+# test function receives the page or driver, so item.funcargs never holds it
+# and the setup-failure branch of the artifact hook has nothing to look up;
+# pw_page and _open_selenium_driver register the object here the moment it
+# exists instead. pytest_runtest_makereport clears the list after every phase
+# of every test (passed, skipped, or failed, in setup, call, or teardown), so
+# nothing one test registered is ever seen while the next test runs.
+_setup_browsers: list[tuple[str, object]] = []
+
+
+def register_setup_browser(kind: str, browser) -> None:
+    """Record a page ("playwright") or driver ("selenium") a fixture just created.
+
+    The failure-artifact hook captures every registered object when the
+    test's SETUP phase fails. Registration is cheap and never read on a
+    passing test; the hook empties the list after each phase.
+    """
+    _setup_browsers.append((kind, browser))
+
+
+# One <input ...> start tag, quote-aware so a `>` inside a quoted attribute
+# value does not end the match early.
+_INPUT_TAG_RE = re.compile(r"""<input\b(?:"[^"]*"|'[^']*'|[^'">])*>""", re.IGNORECASE)
+_PASSWORD_TYPE_RE = re.compile(
+    r"""\stype\s*=\s*(?:"password"|'password'|password(?=[\s/>]))""", re.IGNORECASE
+)
+_VALUE_ATTR_RE = re.compile(r"""(\svalue\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+)""", re.IGNORECASE)
+REDACTED = "[redacted]"
+
+
+def redact_password_values(html: str) -> str:
+    """Replace the value attribute of every password input with `[redacted]`.
+
+    React reflects a controlled input's value into its `value` ATTRIBUTE
+    (react-dom sets `defaultValue` on every update), so the serialized DOM of
+    a login page that timed out after the form was filled carries the typed
+    password in plain text. Every page.html the artifact hook writes goes
+    through this first. Inputs of any other type are left exactly as they
+    were; a password input with no value attribute is left as it was.
+    """
+
+    def _scrub(match: re.Match) -> str:
+        tag = match.group(0)
+        if not _PASSWORD_TYPE_RE.search(tag):
+            return tag
+        return _VALUE_ATTR_RE.sub(lambda m: f'{m.group(1)}"{REDACTED}"', tag)
+
+    return _INPUT_TAG_RE.sub(_scrub, html)
+
 
 @dataclass
 class FailureCapture:
@@ -271,7 +323,7 @@ def _capture_playwright(page) -> FailureCapture:
     except Exception as exc:
         capture.errors.append(f"url: {exc}")
     try:
-        capture.html = page.content()
+        capture.html = redact_password_values(page.content())
     except Exception as exc:
         capture.errors.append(f"content: {exc}")
     try:
@@ -288,7 +340,7 @@ def _capture_selenium(driver) -> FailureCapture:
     except Exception as exc:
         capture.errors.append(f"current_url: {exc}")
     try:
-        capture.html = driver.page_source
+        capture.html = redact_password_values(driver.page_source)
     except Exception as exc:
         capture.errors.append(f"page_source: {exc}")
     try:
@@ -315,7 +367,7 @@ def _write_and_annotate(report: pytest.TestReport, nodeid: str, capture: Failure
     report.sections.append(("e2e failure artifacts", "\n".join([str(out_dir), *written])))
 
 
-def _capture_failure_artifacts(item: pytest.Item, report: pytest.TestReport) -> None:
+def _capture_failure_artifacts(item: pytest.Item, report: pytest.TestReport, nodeid: str) -> bool:
     """Locate the browser fixture(s) a failing test used and write artifacts for each.
 
     Order of precedence: pw_page (one page), then pw_contexts (the test
@@ -326,57 +378,102 @@ def _capture_failure_artifacts(item: pytest.Item, report: pytest.TestReport) -> 
     that finally runs inside the call phase, before this hook, so the pages
     are gone by the time it fires. Use pw_contexts instead. The Selenium
     lookup order is arbitrary but safe: no e2e test requests more than one
-    of those three fixtures.
+    of those three fixtures. `nodeid` names the directory (the report's own
+    nodeid for a call failure, the `setup-` one for a setup failure).
+    Returns whether anything was written.
     """
     funcargs = getattr(item, "funcargs", {})
 
     pw_page = funcargs.get("pw_page")
     if pw_page is not None:
-        _write_and_annotate(report, report.nodeid, _capture_playwright(pw_page))
-        return
+        _write_and_annotate(report, nodeid, _capture_playwright(pw_page))
+        return True
 
     pool = funcargs.get("pw_contexts")
     if pool is not None:
         pages = [page for context in pool.contexts for page in context.pages]
         for index, page in enumerate(pages, start=1):
-            _write_and_annotate(report, f"{report.nodeid}[page{index}]", _capture_playwright(page))
-        return
+            _write_and_annotate(report, f"{nodeid}[page{index}]", _capture_playwright(page))
+        return bool(pages)
 
     for fixture_name in ("browser", "logged_in_browser", "admin_browser"):
         driver = funcargs.get(fixture_name)
         if driver is not None:
-            _write_and_annotate(report, report.nodeid, _capture_selenium(driver))
-            return
+            _write_and_annotate(report, nodeid, _capture_selenium(driver))
+            return True
+    return False
+
+
+SETUP_ARTIFACT_PREFIX = "setup-"
+NO_BROWSER_NOTE = "no page or driver was open when setup failed"
+_CAPTURERS = {"playwright": _capture_playwright, "selenium": _capture_selenium}
+_KIND_LABELS = {"playwright": "page", "selenium": "driver"}
+
+
+def _capture_setup_failure_artifacts(item: pytest.Item, report: pytest.TestReport) -> None:
+    """Write artifacts for a test whose SETUP phase failed (issue #1266).
+
+    The directory is the report's nodeid with a `setup-` prefix, so a setup
+    failure never overwrites or is mistaken for a call failure's directory.
+    Lookup order: every page or driver registered in _setup_browsers during
+    this test (one directory, or with more than one object a [page<n>] or
+    [driver<n>] suffix each); else the objects the test's resolved fixtures
+    already hold (item.funcargs, the call-phase lookup, which finds a
+    module-scoped driver an EARLIER test created and that this test's setup
+    resolved before another fixture raised); else traceback.txt, an empty
+    console.log, and a meta.txt whose last line is NO_BROWSER_NOTE.
+    """
+    nodeid = f"{SETUP_ARTIFACT_PREFIX}{report.nodeid}"
+    targets = list(_setup_browsers)
+    if targets:
+        for index, (kind, browser) in enumerate(targets, start=1):
+            suffix = f"[{_KIND_LABELS[kind]}{index}]" if len(targets) > 1 else ""
+            _write_and_annotate(report, nodeid + suffix, _CAPTURERS[kind](browser))
+        return
+    if _capture_failure_artifacts(item, report, nodeid):
+        return
+    _write_and_annotate(report, nodeid, FailureCapture(errors=[NO_BROWSER_NOTE]))
 
 
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
-    """Capture browser state to disk when a test fails during its call phase.
+    """Capture browser state to disk when a test fails in its setup or call phase.
 
-    Only fires for report.when == "call" and report.failed: a setup-phase
-    failure (a fixture that raised before the browser did anything
-    interesting, or a plain skip) is not a browser-state failure worth
-    capturing. Every browser interaction is wrapped in FailureCapture's
-    helpers, and the whole capture-and-write step sits under one
-    `except Exception`, so a capture failure never masks the original test
-    failure or turns it into an error. New-style `wrapper=True` (pytest 8+)
-    rather than the old `hookwrapper=True`: with the old style an escaping
-    BaseException (Ctrl-C mid-screenshot) surfaced as a pluggy teardown
-    warning, which `filterwarnings = ["error"]` turned into an INTERNALERROR
-    that destroyed the whole session's results; with the new style a
-    KeyboardInterrupt propagates as an ordinary interrupt.
+    A CALL failure writes under the sanitized nodeid; a SETUP failure (a
+    fixture that raised, the login helpers' timeouts above all, issue #1266)
+    writes under the same name prefixed `setup-`, see
+    _capture_setup_failure_artifacts. Nothing is written for a passing
+    phase, a skip, or a teardown failure. After every phase, whatever the
+    outcome, _setup_browsers is emptied in a `finally`, so a page or driver
+    registered for one test is never captured for another.
+
+    Every browser interaction is wrapped in FailureCapture's helpers, and
+    the whole capture-and-write step sits under one `except Exception`, so a
+    capture failure never masks the original test failure or turns it into
+    an error. New-style `wrapper=True` (pytest 8+) rather than the old
+    `hookwrapper=True`: with the old style an escaping BaseException (Ctrl-C
+    mid-screenshot) surfaced as a pluggy teardown warning, which
+    `filterwarnings = ["error"]` turned into an INTERNALERROR that destroyed
+    the whole session's results; with the new style a KeyboardInterrupt
+    propagates as an ordinary interrupt.
     """
-    report = yield
-
-    if report.when != "call" or not report.failed:
-        return report
-
     try:
-        _capture_failure_artifacts(item, report)
-    except Exception as exc:
-        report.sections.append(("e2e failure artifacts", f"failed to write artifacts: {exc}"))
+        report = yield
 
-    return report
+        if report.failed and report.when in ("setup", "call"):
+            try:
+                if report.when == "setup":
+                    _capture_setup_failure_artifacts(item, report)
+                else:
+                    _capture_failure_artifacts(item, report, report.nodeid)
+            except Exception as exc:
+                report.sections.append(
+                    ("e2e failure artifacts", f"failed to write artifacts: {exc}")
+                )
+
+        return report
+    finally:
+        _setup_browsers.clear()
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list) -> None:
@@ -472,12 +569,37 @@ def _wait_for_selenium(url, retries=12, delay=5):
     raise RuntimeError(f"Selenium Hub not reachable at {status_url} after {retries} attempts")
 
 
+LOGIN_FORM_TIMEOUT_MESSAGE = "the login form (#login-email) did not render"
+
+# The HTTP status of every `POST /api/auth/login` the page has an answer for,
+# from the Resource Timing buffer (`responseStatus`, Chrome 109 and later).
+# A request still in flight has no entry, so an empty list means no login
+# response arrived. Plain `function` expressions, not arrow functions, so the
+# source keeps to the repository's no-arrow style rule.
+_LOGIN_STATUSES_JS = (
+    "return performance.getEntriesByType('resource')"
+    ".filter(function (e) { return e.name.split('?')[0].endsWith('/api/auth/login'); })"
+    ".map(function (e) { return e.responseStatus; });"
+)
+
+
 def _do_login(driver, url, email, password):
-    """Navigate to login page and authenticate."""
+    """Navigate to the login page, sign in, and wait for the URL to reach /topology.
+
+    The login page navigates to /topology only after `POST /api/auth/login`
+    answered 2xx (LoginPage.tsx), so the final wait is on the URL change,
+    not on an element of the next page. Selenium cannot wait on the POST
+    itself the way pw_login does, so when the URL wait times out the
+    TimeoutException names where the page is and the status of every login
+    response the page received (issue #1266); see
+    _raise_selenium_login_timeout.
+    """
     driver.get(f"{url}/login")
     wait = WebDriverWait(driver, WAIT_TIMEOUT)
 
-    email_input = wait.until(EC.presence_of_element_located((By.ID, "login-email")))
+    email_input = wait.until(
+        EC.presence_of_element_located((By.ID, "login-email")), LOGIN_FORM_TIMEOUT_MESSAGE
+    )
     password_input = driver.find_element(By.ID, "login-password")
 
     email_input.clear()
@@ -488,7 +610,39 @@ def _do_login(driver, url, email, password):
     submit = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
     submit.click()
 
-    wait.until(EC.url_contains("/topology"))
+    try:
+        wait.until(EC.url_contains("/topology"))
+        return
+    except TimeoutException:
+        pass
+    _raise_selenium_login_timeout(driver)
+
+
+def _raise_selenium_login_timeout(driver) -> None:
+    """Raise the post-login TimeoutException with what the page shows (issue #1266).
+
+    A separate function, raising outside any `except` block, on purpose:
+    pytest prints the arguments of the first and last traceback frames
+    under its default `--tb=auto` (and of every frame under `--tb=long`),
+    so the frame that raises must not be one that holds the password, and
+    no chained exception may carry _do_login's frame as the first frame of
+    its own traceback. Each probe is best-effort: a browser that no longer
+    answers turns into "(unavailable: <class name>)" in the message.
+    """
+    try:
+        where = driver.current_url
+    except Exception as exc:
+        where = f"(unavailable: {type(exc).__name__})"
+    try:
+        statuses = driver.execute_script(_LOGIN_STATUSES_JS)
+    except Exception as exc:
+        statuses = f"(unavailable: {type(exc).__name__})"
+    if statuses == []:
+        statuses = "none"
+    raise TimeoutException(
+        f"login did not reach /topology within {WAIT_TIMEOUT}s; the page is at {where}; "
+        f"POST /api/auth/login statuses the page received: {statuses}"
+    )
 
 
 def _get_jwt_from_browser(driver):
@@ -662,11 +816,16 @@ def pw_page(pw_browser):
     Registers console/pageerror listeners into the module-level
     _pw_console_log dict, keyed by id(page), so pytest_runtest_makereport can
     attach the browser console transcript to a failure's artifacts; the
-    entry is popped on teardown so nothing leaks across tests.
+    entry is popped on teardown so nothing leaks across tests. The page is
+    also registered with register_setup_browser, so a fixture that logs in
+    on it and raises during setup still leaves its artifacts (issue #1266):
+    this teardown runs after the setup report, so the page is still open
+    when the hook captures it.
     """
     context = pw_browser.new_context(ignore_https_errors=True)
     page = context.new_page()
     try:
+        register_setup_browser("playwright", page)
         _register_console_listeners(page)
         yield page
     finally:
@@ -682,12 +841,61 @@ def pw_login(page, email: str = ADMIN_EMAIL, password: str = ADMIN_PASSWORD) -> 
     the Selenium `_do_login` above so both stacks exercise the identical login
     form; kept as a plain function (not a fixture) since each test needs to
     choose its own pw_page and, for the roles test, log in as a specific user.
+
+    Anchored on the login action's own response (the #1169 rule, issue
+    #1266): the click sits INSIDE `page.expect_response` on `POST
+    /api/auth/login`, so the listener exists before the request leaves. A
+    login that never answers fails in expect_response; a non-200 fails at
+    once with an AssertionError naming the status and the response body
+    (the password redacted); only a 200 goes on to wait for /topology, with
+    `wait_until="commit"`, because the login page moves there with a
+    client-side navigate and no document load belongs to the login. A 200's
+    body carries the tokens and is never read. No current caller expects a
+    login to fail; a test that does should submit the form itself and
+    assert on the response, not call this helper.
     """
     page.goto(f"{HOST_BASE_URL}/login")
     page.fill("#login-email", email)
     page.fill("#login-password", password)
-    page.click("button[type='submit']")
-    page.wait_for_url("**/topology**")
+    with page.expect_response(pw_is_login_post) as info:
+        page.click("button[type='submit']")
+    response = info.value
+    if response.status != 200:
+        _fail_login(response.status, _redacted_login_body(response, password))
+    page.wait_for_url("**/topology**", wait_until="commit")
+
+
+def pw_is_login_post(response) -> bool:
+    """True for the response to `POST /api/auth/login` (the query string ignored)."""
+    return response.request.method == "POST" and response.url.split("?", 1)[0].endswith(
+        "/api/auth/login"
+    )
+
+
+def _redacted_login_body(response, password: str) -> str:
+    """A non-200 login response's body with the password replaced by `[redacted]`.
+
+    FastAPI's 422 echoes the offending request input, which can be the
+    password or the whole body, so both the raw and the JSON-escaped forms
+    of the password are replaced. Called only for a non-200.
+    """
+    try:
+        body = response.text()
+    except Exception as exc:
+        return f"(body unavailable: {type(exc).__name__})"
+    for form in (password, json.dumps(password)[1:-1]):
+        if form:
+            body = body.replace(form, REDACTED)
+    return body
+
+
+def _fail_login(status: int, body: str) -> None:
+    """Raise the non-200 login failure.
+
+    Its own frame on purpose: pytest prints the arguments of the last
+    traceback frame under `--tb=auto`, and this one holds no password.
+    """
+    raise AssertionError(f"POST /api/auth/login answered {status}, expected 200: {body}")
 
 
 def pw_token(page) -> str | None:
@@ -907,39 +1115,52 @@ def host_base_url():
     return HOST_BASE_URL
 
 
+def _open_selenium_driver(request, base_url, credentials=None):
+    """Start a remote Chrome session whose quit() cannot be skipped (issue #1266).
+
+    The quit is registered with `request.addfinalizer` BEFORE anything that
+    can raise after the session exists (implicitly_wait, the login). pytest
+    runs a fixture's finalizers at the end of its scope even when the
+    fixture raised after adding them, so a login that times out in a
+    module-scoped fixture no longer leaks one of the `standalone-chrome`
+    container's three sessions; the old `yield driver` then `driver.quit()`
+    shape skipped the quit whenever the login raised before the yield.
+    The quit waits for the module's end rather than running at once, so the
+    driver is still open when the setup-failure artifact hook captures it
+    (the driver is also registered with register_setup_browser). pytest
+    caches a module-scoped fixture's error and raises it again for every
+    later test of the module that requests the fixture, without running the
+    fixture again, so the held session is never asked for twice.
+    `credentials` is an (email, password) pair to sign in with, or None for
+    a driver that stays signed out.
+    """
+    _wait_for_selenium(SELENIUM_HUB)
+    driver = webdriver.Remote(command_executor=SELENIUM_HUB, options=_make_chrome_options())
+    request.addfinalizer(driver.quit)
+    register_setup_browser("selenium", driver)
+    driver.implicitly_wait(5)
+    if credentials is not None:
+        email, password = credentials
+        _do_login(driver, base_url, email, password)
+    return driver
+
+
 @pytest.fixture(scope="module")
-def browser(base_url):
+def browser(request, base_url):
     """Module-scoped remote Chrome WebDriver (not logged in)."""
-    _wait_for_selenium(SELENIUM_HUB)
-    options = _make_chrome_options()
-    driver = webdriver.Remote(command_executor=SELENIUM_HUB, options=options)
-    driver.implicitly_wait(5)
-    yield driver
-    driver.quit()
+    return _open_selenium_driver(request, base_url)
 
 
 @pytest.fixture(scope="module")
-def logged_in_browser(base_url):
+def logged_in_browser(request, base_url):
     """Browser logged in as admin (always available, no seed needed)."""
-    _wait_for_selenium(SELENIUM_HUB)
-    options = _make_chrome_options()
-    driver = webdriver.Remote(command_executor=SELENIUM_HUB, options=options)
-    driver.implicitly_wait(5)
-    _do_login(driver, base_url, ADMIN_EMAIL, ADMIN_PASSWORD)
-    yield driver
-    driver.quit()
+    return _open_selenium_driver(request, base_url, (ADMIN_EMAIL, ADMIN_PASSWORD))
 
 
 @pytest.fixture(scope="module")
-def admin_browser(base_url):
+def admin_browser(request, base_url):
     """Browser session logged in as admin."""
-    _wait_for_selenium(SELENIUM_HUB)
-    options = _make_chrome_options()
-    driver = webdriver.Remote(command_executor=SELENIUM_HUB, options=options)
-    driver.implicitly_wait(5)
-    _do_login(driver, base_url, ADMIN_EMAIL, ADMIN_PASSWORD)
-    yield driver
-    driver.quit()
+    return _open_selenium_driver(request, base_url, (ADMIN_EMAIL, ADMIN_PASSWORD))
 
 
 @pytest.fixture(scope="session")
