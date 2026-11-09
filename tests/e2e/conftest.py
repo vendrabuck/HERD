@@ -24,6 +24,7 @@ from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.remote.command import Command
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -61,11 +62,31 @@ HOST_BASE_URL = os.environ.get("E2E_HOST_BASE_URL", "https://localhost")
 # Selenium Hub URL (exposed to host via port mapping).
 SELENIUM_HUB = os.environ.get("SELENIUM_HUB", "http://localhost:4444/wd/hub")
 
+REDACTED = "[redacted]"
+
+
+class _Secret(str):
+    """A password that pytest never prints (issue #1266).
+
+    pytest renders traceback arguments (`--tb=long`, the first and last frames
+    under `--tb=auto`) and `-l` locals through saferepr, which calls repr(),
+    so a frame holding a _Secret shows `'[redacted]'` there and in the
+    traceback.txt the failure-artifact hook writes. Everything that USES the
+    value sees the real text: it is a str, so typing it, `str(secret)`,
+    f-strings, comparison, and JSON encoding are unchanged.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return repr(REDACTED)
+
+
 # Admin credentials. Fall back through E2E_* (per-run override) to SUPERADMIN_*
 # (matches what the stack actually seeds from .env) to a generic default.
 ADMIN_EMAIL = os.environ.get("E2E_EMAIL") or os.environ.get("SUPERADMIN_EMAIL", "admin@example.com")
-ADMIN_PASSWORD = os.environ.get("E2E_PASSWORD") or os.environ.get(
-    "SUPERADMIN_PASSWORD", "admin123!"
+ADMIN_PASSWORD = _Secret(
+    os.environ.get("E2E_PASSWORD") or os.environ.get("SUPERADMIN_PASSWORD", "admin123!")
 )
 
 WAIT_TIMEOUT = 15
@@ -194,11 +215,34 @@ def register_setup_browser(kind: str, browser) -> None:
 # One <input ...> start tag, quote-aware so a `>` inside a quoted attribute
 # value does not end the match early.
 _INPUT_TAG_RE = re.compile(r"""<input\b(?:"[^"]*"|'[^']*'|[^'">])*>""", re.IGNORECASE)
-_PASSWORD_TYPE_RE = re.compile(
-    r"""\stype\s*=\s*(?:"password"|'password'|password(?=[\s/>]))""", re.IGNORECASE
-)
-_VALUE_ATTR_RE = re.compile(r"""(\svalue\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+)""", re.IGNORECASE)
-REDACTED = "[redacted]"
+# One attribute after the tag name: whitespace, a name, and an optional value
+# (double-quoted, single-quoted, or bare), read left to right from the tag name.
+_ATTR_RE = re.compile(r"""\s+([^\s"'<>/=]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+))?""")
+
+
+def _scrub_input_tag(tag: str) -> str:
+    """Redact the `value` attribute of one <input> start tag when its `type` is password.
+
+    The attributes are tokenized in order, so text that only looks like
+    `value=` or `type=password` inside another attribute's quoted value is
+    never mistaken for the attribute itself.
+    """
+    pos = len("<input")
+    is_password = False
+    value_spans = []
+    while (match := _ATTR_RE.match(tag, pos)) is not None:
+        name, raw = match.group(1).lower(), match.group(2)
+        if raw is not None:
+            if name == "type" and raw.strip("\"'").lower() == "password":
+                is_password = True
+            elif name == "value":
+                value_spans.append(match.span(2))
+        pos = match.end()
+    if not is_password:
+        return tag
+    for start, end in reversed(value_spans):
+        tag = f'{tag[:start]}"{REDACTED}"{tag[end:]}'
+    return tag
 
 
 def redact_password_values(html: str) -> str:
@@ -211,14 +255,7 @@ def redact_password_values(html: str) -> str:
     through this first. Inputs of any other type are left exactly as they
     were; a password input with no value attribute is left as it was.
     """
-
-    def _scrub(match: re.Match) -> str:
-        tag = match.group(0)
-        if not _PASSWORD_TYPE_RE.search(tag):
-            return tag
-        return _VALUE_ATTR_RE.sub(lambda m: f'{m.group(1)}"{REDACTED}"', tag)
-
-    return _INPUT_TAG_RE.sub(_scrub, html)
+    return _INPUT_TAG_RE.sub(lambda match: _scrub_input_tag(match.group(0)), html)
 
 
 @dataclass
@@ -348,10 +385,24 @@ def _capture_selenium(driver) -> FailureCapture:
     except Exception as exc:
         capture.errors.append(f"screenshot: {exc}")
     try:
-        capture.console = [str(entry) for entry in driver.get_log("browser")]
-    except Exception:  # console log support varies by driver and browser
-        pass
+        capture.console = [str(entry) for entry in _selenium_browser_log(driver)]
+    except Exception as exc:
+        capture.errors.append(f"console: {exc}")
     return capture
+
+
+def _selenium_browser_log(driver) -> list:
+    """The browser console log of a remote Chrome session (issue #1266).
+
+    The fixtures create `webdriver.Remote`, which has no `get_log` method
+    (only the local Chromium drivers do), so the log is read with the
+    getLog command itself. It holds entries only because
+    _make_chrome_options asks for `goog:loggingPrefs` browser ALL. A Grid
+    that refuses the command raises, and the caller writes the error into
+    meta.txt as a `console:` line instead of leaving console.log silently
+    empty.
+    """
+    return driver.execute(Command.GET_LOG, {"type": "browser"})["value"]
 
 
 def _write_and_annotate(report: pytest.TestReport, nodeid: str, capture: FailureCapture) -> None:
@@ -405,7 +456,11 @@ def _capture_failure_artifacts(item: pytest.Item, report: pytest.TestReport, nod
 
 
 SETUP_ARTIFACT_PREFIX = "setup-"
-NO_BROWSER_NOTE = "no page or driver was open when setup failed"
+NO_BROWSER_NOTE = (
+    "no page or driver was registered or resolved for this test (none existed yet, "
+    "or pytest re-raised a cached module-scoped fixture error without resolving "
+    "the fixture again)"
+)
 _CAPTURERS = {"playwright": _capture_playwright, "selenium": _capture_selenium}
 _KIND_LABELS = {"playwright": "page", "selenium": "driver"}
 
@@ -417,10 +472,11 @@ def _capture_setup_failure_artifacts(item: pytest.Item, report: pytest.TestRepor
     failure never overwrites or is mistaken for a call failure's directory.
     Lookup order: every page or driver registered in _setup_browsers during
     this test (one directory, or with more than one object a [page<n>] or
-    [driver<n>] suffix each); else the objects the test's resolved fixtures
-    already hold (item.funcargs, the call-phase lookup, which finds a
-    module-scoped driver an EARLIER test created and that this test's setup
-    resolved before another fixture raised); else traceback.txt, an empty
+    [driver<n>] suffix each); else what the test's already-resolved fixtures
+    hold (item.funcargs, the call-phase lookup: `pw_page`, every open page of
+    `pw_contexts`, or a Selenium driver, which is how a module-scoped driver
+    an EARLIER test created is found when this test's setup resolved it
+    before another fixture raised); else traceback.txt, an empty
     console.log, and a meta.txt whose last line is NO_BROWSER_NOTE.
     """
     nodeid = f"{SETUP_ARTIFACT_PREFIX}{report.nodeid}"
@@ -551,6 +607,8 @@ def _make_chrome_options():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
+    # Keep the browser console log so a failure's console.log has entries (#1266).
+    options.set_capability("goog:loggingPrefs", {"browser": "ALL"})
     return options
 
 
@@ -592,8 +650,10 @@ def _do_login(driver, url, email, password):
     itself the way pw_login does, so when the URL wait times out the
     TimeoutException names where the page is and the status of every login
     response the page received (issue #1266); see
-    _raise_selenium_login_timeout.
+    _raise_selenium_login_timeout. `password` is rebound as a _Secret at
+    entry, so this frame never prints it even when a caller passes a plain str.
     """
+    password = _Secret(password)
     driver.get(f"{url}/login")
     wait = WebDriverWait(driver, WAIT_TIMEOUT)
 
@@ -852,8 +912,11 @@ def pw_login(page, email: str = ADMIN_EMAIL, password: str = ADMIN_PASSWORD) -> 
     client-side navigate and no document load belongs to the login. A 200's
     body carries the tokens and is never read. No current caller expects a
     login to fail; a test that does should submit the form itself and
-    assert on the response, not call this helper.
+    assert on the response, not call this helper. `password` is rebound as a
+    _Secret at entry, so this frame never prints it even when a caller passes
+    a plain str.
     """
+    password = _Secret(password)
     page.goto(f"{HOST_BASE_URL}/login")
     page.fill("#login-email", email)
     page.fill("#login-password", password)
@@ -876,14 +939,22 @@ def _redacted_login_body(response, password: str) -> str:
     """A non-200 login response's body with the password replaced by `[redacted]`.
 
     FastAPI's 422 echoes the offending request input, which can be the
-    password or the whole body, so both the raw and the JSON-escaped forms
-    of the password are replaced. Called only for a non-200.
+    password or the whole body, so the raw password and both of its JSON
+    forms are replaced: ASCII-escaped, and escaped with ensure_ascii=False
+    (how FastAPI serializes, which differs for a non-ASCII password that also
+    holds a quote, a backslash, or a control character). Called only for a
+    non-200.
     """
     try:
         body = response.text()
     except Exception as exc:
         return f"(body unavailable: {type(exc).__name__})"
-    for form in (password, json.dumps(password)[1:-1]):
+    forms = (
+        password,
+        json.dumps(password)[1:-1],
+        json.dumps(password, ensure_ascii=False)[1:-1],
+    )
+    for form in forms:
         if form:
             body = body.replace(form, REDACTED)
     return body
@@ -1132,8 +1203,11 @@ def _open_selenium_driver(request, base_url, credentials=None):
     later test of the module that requests the fixture, without running the
     fixture again, so the held session is never asked for twice.
     `credentials` is an (email, password) pair to sign in with, or None for
-    a driver that stays signed out.
+    a driver that stays signed out; its password is rebound as a _Secret at
+    entry so this frame never prints it.
     """
+    if credentials is not None:
+        credentials = (credentials[0], _Secret(credentials[1]))
     _wait_for_selenium(SELENIUM_HUB)
     driver = webdriver.Remote(command_executor=SELENIUM_HUB, options=_make_chrome_options())
     request.addfinalizer(driver.quit)
