@@ -53,7 +53,7 @@ import pytest
 from ._device_teardown import delete_device_checked
 from ._nats_helpers import fetch_events_for_reservation, probe_nats, publish_raw
 from ._topology_teardown import delete_topology_checked
-from ._wiring_retry import poll_wiring_retry
+from ._wiring_retry import matching_retry_rows, poll_wiring_retry
 from .conftest import _psql
 
 pytestmark = pytest.mark.asyncio
@@ -346,16 +346,59 @@ async def _find_in_flight_run(
     return None
 
 
-async def _poll_run_in_flight(
+# Issue #1238: how long after the first stale-writer retry a re-fire may still be
+# sent. It covers one claim window of a background tick that fetched the switch
+# before the arming PUT: an instant login, then three fast failing connect_ports
+# attempts. In the 600-run soak of 2026-11-09 that claim was released 0.25 to 0.6 s
+# after the manual retry answered, so 10 s is wide margin, not a measured bound.
+_STALE_REFIRE_WINDOW = 10.0
+# The answer `_stale_retry_answer` gives for a call that drove nothing because
+# another channel held the row's claim (issue #817).
+_IN_PROGRESS_ANSWER = "200 in_progress"
+
+
+def _stale_retry_answer(task: asyncio.Task, row_id: str) -> str:
+    """One stale-writer retry call's answer for one ledger row, as short text.
+
+    "pending" while the POST has not answered, "cancelled", "raised <class>", or
+    "<HTTP status> <outcomes>", where the outcomes are those the retry answer reports
+    for the row with id `row_id`, comma-joined, or "-" when the answer does not name
+    the row (any non-200 answer included). The re-fire decision and the canary's
+    failure message both read this one function, so the message shows exactly what
+    the decision saw.
+    """
+    if not task.done():
+        return "pending"
+    if task.cancelled():
+        return "cancelled"
+    exc = task.exception()
+    if exc is not None:
+        return f"raised {type(exc).__name__}"
+    resp = task.result()
+    body = resp.json() if resp.status_code == 200 else None
+    rows = matching_retry_rows(
+        resp.status_code, body, lambda row: str(row.get("id")) == str(row_id)
+    )
+    outcomes = ",".join(str(row.get("outcome")) for row in rows) or "-"
+    return f"{resp.status_code} {outcomes}"
+
+
+async def _poll_login_refiring_stale_retry(
     client,
     reservation_id: str,
-    device_id: str,
-    action: str | None = None,
+    switch_id: str,
+    row_id: str,
+    writers: list[asyncio.Task],
     *,
-    timeout: float = 6.0,
+    login_timeout: float = 6.0,
+    refire_window: float = _STALE_REFIRE_WINDOW,
+    interval: float = 0.25,
 ) -> dict | None:
-    """Poll until an in-flight (non-terminal) execution run for (reservation, device)
-    appears, optionally restricted to a single `action`.
+    """Poll for an in-flight (non-terminal) per-switch `login` run, re-firing the
+    stale-writer retry while the background tick holds the row's claim.
+
+    `writers` holds the retry tasks already fired, the first one by the caller; it is
+    appended to in place, so the caller can await every task this fired.
 
     Issue #817: since the background retry tick can claim a FAILED row's
     `claimed_until` stamp before a concurrent manual retry call does, WHICHEVER
@@ -364,14 +407,44 @@ async def _poll_run_in_flight(
     without ever touching the driver. A test that wants to prove a writer is
     genuinely mid-drive must poll the run ledger, not assume the channel it itself
     fired is the one driving.
+
+    Issue #1238: a tick that fetched the switch before the knobs were armed logs in
+    instantly, so no login is in flight to see, and once it releases the claim
+    nothing drives the row until the next tick, about 60 s later. So on each poll
+    with no login in flight, while `refire_window` seconds have not passed since
+    this call started and the LATEST task in `writers` answered "in_progress" for
+    `row_id`, one more retry is fired, unawaited (a call that does drive holds the
+    armed context for seconds), and the login watch restarts: it ends
+    `login_timeout` seconds after the last call fired. The poll therefore returns
+    None no later than `refire_window + login_timeout` seconds after it starts, plus
+    the one poll that notices, and sends at most one re-fire per `interval`, never
+    while the previous call is unanswered.
+
+    Re-firing on the "in_progress" answer, rather than waiting for the row's
+    `attempts` (the tick's failure write adds to it in the same UPDATE that clears
+    the claim; wiring-status does not expose `claimed_until`), uses the manual
+    channel's own claim check as the observable: it costs one read-only call that
+    drives nothing while the claim is held, and needs no baseline `attempts` read,
+    which would race the very write it waits for.
     """
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
-        run = await _find_in_flight_run(client, reservation_id, device_id, action)
+    loop = asyncio.get_event_loop()
+    refire_deadline = loop.time() + refire_window
+    login_deadline = loop.time() + login_timeout
+    while True:
+        run = await _find_in_flight_run(client, reservation_id, switch_id, "login")
         if run is not None:
             return run
-        await asyncio.sleep(0.25)
-    return None
+        now = loop.time()
+        if now < refire_deadline and _stale_retry_answer(writers[-1], row_id) == (
+            _IN_PROGRESS_ANSWER
+        ):
+            writers.append(
+                asyncio.create_task(client.post(f"/reservations/{reservation_id}/wiring/retry"))
+            )
+            login_deadline = now + login_timeout
+        elif now >= login_deadline:
+            return None
+        await asyncio.sleep(interval)
 
 
 async def test_failed_build_surfaces_and_manual_retry_recovers(
@@ -610,6 +683,27 @@ async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
     attempt) when the winner landed. If the drive finishes before the winner
     runs, the canary still fails loudly instead of letting the test pass
     without exercising the race.
+
+    Issue #1238: the tick can also fetch the switch BEFORE step 2's arming
+    PUT. It then carries the unarmed, fast context: its login is instant, it
+    claims the row and fails its three connect_ports attempts in under a
+    second or so, and a retry-1 that lands inside that claim drives nothing
+    and answers "in_progress" in milliseconds; nothing else drives the row
+    until the next tick, about 60 s later. So step 2 does not fire retry-1
+    just once. While no login run is in flight and the latest retry-1 call
+    has answered "in_progress" for the FAILED row, it fires retry-1 again,
+    unawaited, at most once per 0.25 s poll and only within 10 s of the
+    first call; every call restarts the 6 s login watch, so step 2 gives up
+    about 16 s after the first call at the latest. The first call after the
+    tick's failure write clears the claim is the one that drives, with the
+    armed context. Step 4 awaits every retry-1 call, and on an earlier
+    failure the finally cancels and awaits any still pending. The login
+    check stays the final word: the test still fails there, now naming every
+    retry-1 answer for the row in firing order, if the claim outlasts the
+    10 s window, if retry-1 answers anything but "in_progress" without a
+    login appearing (no re-fire is sent for that), or if no writer reaches
+    its login for any other reason. Which channel's login it saw is not
+    recorded.
     """
     nats_err = await probe_nats()
     if nats_err:
@@ -624,6 +718,8 @@ async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
     connections = []
     reservation_id = None
     topology_id = None
+    # Every retry-1 call step 2 fires (issue #1238), in firing order.
+    stale_writers: list[asyncio.Task] = []
     try:
         connections.append(await _connect(admin_client, dut_a["id"], switch["id"], "p1"))
         connections.append(await _connect(admin_client, dut_b["id"], switch["id"], "p2"))
@@ -660,8 +756,8 @@ async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
             },
         )
         assert upd.status_code == 200, upd.text
-        stale_writer = asyncio.create_task(
-            admin_client.post(f"/reservations/{reservation_id}/wiring/retry")
+        stale_writers.append(
+            asyncio.create_task(admin_client.post(f"/reservations/{reservation_id}/wiring/retry"))
         )
         # Wait for a writer to actually be mid-drive before the knobs change
         # under it, WITHOUT waiting so long that it has already claimed the
@@ -673,12 +769,19 @@ async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
         # or the background tick if it wins the race to start first) going
         # non-terminal: that proves a writer has fetched the armed context and
         # is blocked in it, while leaving the connect_ports row's claim still
-        # open for the winner below to take.
-        in_flight = await _poll_run_in_flight(admin_client, reservation_id, switch["id"], "login")
+        # open for the winner below to take. Issue #1238: while retry-1 keeps
+        # answering "in_progress" (a tick holding the claim with the unarmed
+        # context), the poll fires retry-1 again; see the docstring for the
+        # bounds.
+        in_flight = await _poll_login_refiring_stale_retry(
+            admin_client, reservation_id, switch["id"], failed["id"], stale_writers
+        )
         assert in_flight is not None, (
             "no writer (retry-1's own call or the background tick, issue #817) "
             "ever entered its per-switch login before the knobs changed; the "
-            "interleaving never got set up"
+            "interleaving never got set up; retry-1 answers for row "
+            f"{failed['id']} in firing order (issue #1238): "
+            f"{[_stale_retry_answer(task, failed['id']) for task in stale_writers]}"
         )
 
         # Step 3: clear the knobs and run the winner to completion mid-window.
@@ -707,12 +810,14 @@ async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
         assert won is not None, "the winning retry never flipped the row ACTIVE"
         attempts_after_win = won["attempts"]
 
-        # Step 4: retry-1's own call completes; whatever it reports (a real
+        # Step 4: every retry-1 call completes; whatever each reports (a real
         # "still_failed" outcome if it won the claim, or an immediate
         # "in_progress" if the tick did, issue #817) is dropped in favor of
-        # the winner's ACTIVE row below.
-        stale_resp = await stale_writer
-        assert stale_resp.status_code == 200, stale_resp.text
+        # the winner's ACTIVE row below. All of them are awaited, so none is
+        # left pending (issue #1238).
+        for task in stale_writers:
+            stale_resp = await task
+            assert stale_resp.status_code == 200, stale_resp.text
 
         final = await _wiring_status(admin_client, reservation_id)
         rows = final["connections"]
@@ -724,6 +829,11 @@ async def test_stale_wiring_writer_does_not_clobber_concurrent_winner(
             "stale writer inflated attempts on the ACTIVE row"
         )
     finally:
+        # Issue #1238: on a failure before step 4, no retry-1 call outlives the
+        # test. Cancelling a finished task does nothing.
+        for task in stale_writers:
+            task.cancel()
+        await asyncio.gather(*stale_writers, return_exceptions=True)
         if reservation_id:
             await admin_client.delete(f"/reservations/{reservation_id}")
         if topology_id:

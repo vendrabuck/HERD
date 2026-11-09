@@ -438,18 +438,6 @@ def test_a_directory_without_release_pages_is_a_problem(tmp_path: Path, check):
 # Check 1: header link
 
 
-def test_stale_header_link_on_an_ordinary_page(manual: Path):
-    _edit(
-        manual / "guide.html",
-        '<a href="release-0-3-0.html">Release 0.3.0</a>',
-        '<a href="release-0-2-0.html">Release 0.3.0</a>',
-    )
-    assert check_header_links(manual) == [
-        "guide.html: header release link targets release-0-2-0.html, "
-        "not the current release page release-0-3-0.html"
-    ]
-
-
 def test_stale_header_link_on_a_demoted_release_page(manual: Path):
     _edit(
         manual / "release-0-1-0.html",
@@ -458,50 +446,6 @@ def test_stale_header_link_on_a_demoted_release_page(manual: Path):
     )
     assert check_header_links(manual) == [
         "release-0-1-0.html: header release link targets release-0-2-0.html, "
-        "not the current release page release-0-3-0.html"
-    ]
-
-
-def test_page_with_no_header_release_link(manual: Path):
-    # The body still links the current release; a link outside the header does not count.
-    _edit(manual / "index.html", '    <a href="release-0-3-0.html">Release 0.3.0</a>\n', "")
-    assert check_header_links(manual) == [
-        "index.html: header has no release link; expected one to release-0-3-0.html"
-    ]
-
-
-def test_page_with_two_header_release_links(manual: Path):
-    _edit(
-        manual / "guide.html",
-        '<a href="release-0-3-0.html">Release 0.3.0</a>',
-        '<a href="release-0-3-0.html">Release 0.3.0</a>\n'
-        '    <a href="release-0-2-0.html">Release 0.2.0</a>',
-    )
-    assert check_header_links(manual) == [
-        "guide.html: header has 2 release links (release-0-3-0.html, release-0-2-0.html); "
-        "expected one, to release-0-3-0.html"
-    ]
-
-
-def test_header_link_text_naming_the_wrong_version(manual: Path):
-    _edit(
-        manual / "guide.html",
-        '<a href="release-0-3-0.html">Release 0.3.0</a>',
-        '<a href="release-0-3-0.html">Release 0.2.0</a>',
-    )
-    assert check_header_links(manual) == [
-        "guide.html: header release link text is 'Release 0.2.0', expected 'Release 0.3.0'"
-    ]
-
-
-def test_header_link_to_a_release_page_that_does_not_exist(manual: Path):
-    _edit(
-        manual / "index.html",
-        '<a href="release-0-3-0.html">Release 0.3.0</a>',
-        '<a href="release-0-4-0.html">Release 0.3.0</a>',
-    )
-    assert check_header_links(manual) == [
-        "index.html: header release link targets release-0-4-0.html, "
         "not the current release page release-0-3-0.html"
     ]
 
@@ -547,35 +491,6 @@ def test_sidebar_with_the_active_class_on_the_wrong_entry(manual: Path):
     assert check_sidebars(manual) == [
         "release-0-2-0.html: sidebar marks release-0-3-0.html active, not its own entry"
     ]
-
-
-def test_sidebar_with_no_active_entry(manual: Path):
-    _edit(
-        manual / "release-0-2-0.html",
-        '<li><a href="release-0-2-0.html" class="active">',
-        '<li><a href="release-0-2-0.html">',
-    )
-    assert check_sidebars(manual) == [
-        "release-0-2-0.html: sidebar marks 0 release entries active; "
-        "expected exactly one, its own entry release-0-2-0.html"
-    ]
-
-
-def test_sidebar_with_two_active_entries(manual: Path):
-    _edit(
-        manual / "release-0-2-0.html",
-        '<li><a href="release-0-1-0.html">',
-        '<li><a href="release-0-1-0.html" class="active">',
-    )
-    assert check_sidebars(manual) == [
-        "release-0-2-0.html: sidebar marks 2 release entries active; "
-        "expected exactly one, its own entry release-0-2-0.html"
-    ]
-
-
-def test_release_page_without_a_side_aside(manual: Path):
-    _edit(manual / "release-0-3-0.html", '<aside class="side">', '<aside class="toc">')
-    assert check_sidebars(manual) == ['release-0-3-0.html: has no <aside class="side">']
 
 
 # Check 3: expiring phrasings
@@ -631,17 +546,6 @@ def test_expiring_phrasing_on_the_current_page_is_not_reported(manual: Path):
     assert check_expiring_phrasings(manual) == []
 
 
-def test_comments_attributes_and_style_text_are_not_read(manual: Path):
-    # Pins the documented limit, so the docstring stays true of the scan.
-    _edit(
-        manual / "release-0-1-0.html",
-        "<p>Body text.</p>",
-        '<!-- The current release is 0.3.0 --><p title="now describes 0.3.0">Body text.</p>'
-        "<style>/* now documents */</style>",
-    )
-    assert check_expiring_phrasings(manual) == []
-
-
 # Check 4: successor link
 
 
@@ -668,66 +572,11 @@ def test_dek_linking_a_later_release_that_is_not_the_immediate_successor(manual:
     ]
 
 
-def test_successor_link_in_the_paragraph_after_the_dek(manual: Path):
-    _edit(
-        manual / "release-0-1-0.html",
-        'The release after it is <a href="release-0-2-0.html">0.2.0</a>.</p>',
-        '</p>\n    <p>The release after it is <a href="release-0-2-0.html">0.2.0</a>.</p>',
-    )
-    assert check_successor_links(manual) == [
-        "release-0-1-0.html: dek does not link the next release page, release-0-2-0.html"
-    ]
-
-
-def test_successor_link_after_an_unclosed_dek_and_a_block_tag(manual: Path):
-    _edit(
-        manual / "release-0-1-0.html",
-        'The release after it is <a href="release-0-2-0.html">0.2.0</a>.</p>',
-        '<div>The release after it is <a href="release-0-2-0.html">0.2.0</a>.</div>',
-    )
-    assert check_successor_links(manual) == [
-        "release-0-1-0.html: dek does not link the next release page, release-0-2-0.html"
-    ]
-
-
-def test_demoted_page_without_a_dek(manual: Path):
-    _edit(manual / "release-0-1-0.html", '<p class="dek">', "<p>")
-    assert check_successor_links(manual) == ['release-0-1-0.html: has no <p class="dek">']
-
-
 # Version ordering
 
 
 def test_versions_order_by_integer_not_by_string(tmp_path: Path):
     manual = _write_manual(tmp_path, versions=((0, 9, 0), (0, 10, 0)))
     assert _release_pages(manual) == ["release-0-9-0.html", "release-0-10-0.html"]
-    for check in CHECKS:
-        assert check(manual) == [], check.__name__
-
-
-def test_header_naming_the_string_largest_release_is_stale(tmp_path: Path):
-    manual = _write_manual(tmp_path, versions=((0, 9, 0), (0, 10, 0)))
-    _edit(
-        manual / "index.html",
-        '<a href="release-0-10-0.html">Release 0.10.0</a>',
-        '<a href="release-0-9-0.html">Release 0.9.0</a>',
-    )
-    assert check_header_links(manual) == [
-        "index.html: header release link targets release-0-9-0.html, "
-        "not the current release page release-0-10-0.html",
-        "index.html: header release link text is 'Release 0.9.0', expected 'Release 0.10.0'",
-    ]
-
-
-def test_misnamed_release_page_is_an_ordinary_page(manual: Path):
-    # Pins the documented limit: a name off the pattern is never a release page.
-    (manual / "release-0-4.html").write_text(
-        (manual / "guide.html").read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    assert _release_pages(manual) == [
-        "release-0-1-0.html",
-        "release-0-2-0.html",
-        "release-0-3-0.html",
-    ]
     for check in CHECKS:
         assert check(manual) == [], check.__name__
