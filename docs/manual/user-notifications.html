@@ -20,7 +20,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-6-0.html">Release 0.6.0</a>
+    <a href="release-0-7-0.html">Release 0.7.0</a>
   </nav>
 </header>
 
@@ -135,16 +135,26 @@
 
     <h2 class="sec" id="settings">Making it quieter (or louder)</h2>
     <p class="sectitle">Tuning what you get</p>
-    <p>From <b>Settings</b>, open the Notifications section. Two levels of control: which channels carry notifications (the in-app bell is one of the four toggles, there's no separate master switch), and which of six event types you want at all:</p>
+    <p><b>Settings</b> has two cards: <b>Profile</b> on top (legend item 4) and <b>Notifications</b> under it. In Notifications there are two levels of control: which channels carry notifications (the in-app bell is one of the four toggles, there's no separate master switch), and which of seven event types you want at all:</p>
 
     <figure class="shot">
       <div class="shot-frame">
         <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/settings</span></div>
         <div class="shot-stage">
           <div class="hd">
-            <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a>Inventory</a><a>Topology</a><a>Reservations</a></span><span class="grow"></span><span class="right"><a class="active" style="color:#fff">Settings</a><span class="u">sara.k</span></span></div>
+            <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a>Inventory</a><a>Topology</a><a>Reservations</a></span><span class="grow"></span><span class="right"><a class="active" style="color:#fff">Settings</a><span class="u">Sara Kim</span></span></div>
             <div class="hd-body">
               <div class="hd-h1">Settings</div>
+              <div class="hd-card" style="max-width:560px;margin-bottom:18px;" data-anno="4" data-anno-pin="l" data-anno-arrow data-anno-color="blue">
+                <div class="head">Profile</div>
+                <div style="padding:16px 18px;">
+                  <div style="display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:13px;margin-bottom:14px;"><span style="color:var(--gray-500);">Sign-in email</span><span>sara.k@yourcompany.com</span><span style="color:var(--gray-500);">Username</span><span>sara.k</span></div>
+                  <div class="hd-field"><label class="hd-label">Name</label><div class="hd-input">Sara Kim</div></div>
+                  <div class="hd-field"><label class="hd-label">Contact email</label><div class="hd-input" style="color:var(--gray-400);">Optional</div><div style="font-size:11px;color:var(--gray-500);margin-top:4px;">Where email notifications go. Leave blank to use the sign-in email.</div></div>
+                  <div class="hd-field"><label class="hd-label">Phone</label><div class="hd-input" style="color:var(--gray-400);">Optional</div><div style="font-size:11px;color:var(--gray-500);margin-top:4px;">Stored and shown only. HERD does not call or text this number.</div></div>
+                  <div style="margin-top:6px;"><span class="hd-btn primary sm" style="opacity:.5;">Save profile</span></div>
+                </div>
+              </div>
               <div class="hd-card" style="max-width:560px;">
                 <div class="head">Notifications</div>
                 <div style="padding:16px 18px;">
@@ -165,7 +175,7 @@
                     <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation completed</div>
                     <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation expiring soon</div>
                     <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--blue-600);border-radius:4px;background:var(--blue-600)"></span> Reservation failed</div>
-                    <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--gray-300);border-radius:4px"></span> Device health changed</div>
+                    <div style="display:flex;align-items:center;gap:9px;padding:5px 0;font-size:13px;color:var(--gray-700)"><span style="width:16px;height:16px;border:1px solid var(--gray-300);border-radius:4px"></span> Device health changes</div>
                   </div>
                   <div style="margin-top:14px;"><span class="hd-btn primary sm" data-anno="3" data-anno-pin="t" data-anno-arrow>Save</span></div>
                 </div>
@@ -174,13 +184,14 @@
           </div>
         </div>
       </div>
-      <p class="shotcap"><b>The Notifications settings.</b> Channel toggles on top, seven per-event checkboxes below.</p>
+      <p class="shotcap"><b>The Settings page.</b> The Profile card on top, then Notifications: channel toggles, seven per-event checkboxes, and Save.</p>
     </figure>
 
     <ol class="legend">
       <li><b>Channels.</b> Four independent toggles: in-app, email, chat, webhook. There's no separate master switch; turning off "Show in-app notifications" silences just the bell (without deleting history), the same way turning off email only stops email. In-app and email are on here; chat and webhook are off, and outbound channels start off until you enable them.</li>
-      <li><b>Per-event toggles.</b> Seven individual checkboxes: the six reservation lifecycle events (confirmed, updated, cancelled, completed, expiring soon, failed) plus device health changed. Here, device-health is unchecked. Anything unchecked stops arriving; missing entries default to on.</li>
+      <li><b>Per-event toggles.</b> Seven individual checkboxes: the six reservation lifecycle events (confirmed, updated, cancelled, completed, expiring soon, failed) plus <b>Device health changes</b>. Here, device-health is unchecked. Anything unchecked stops arriving; missing entries default to on.</li>
       <li><b>Save.</b> Applies to new events immediately &mdash; no restart, no reload.</li>
+      <li><b>Profile.</b> Your <b>Sign-in email</b> and <b>Username</b> are shown read-only; they are your login identity and no screen changes them. Under them are three fields: <b>Name</b> (required, 1 to 200 characters, need not be unique; "Name is required." appears under it when blank), <b>Contact email</b> (optional; hint "Where email notifications go. Leave blank to use the sign-in email."), and <b>Phone</b> (optional; hint "Stored and shown only. HERD does not call or text this number."; digits, spaces, <code>+</code>, <code>-</code>, <code>(</code>, and <code>)</code>, at least one digit, up to 32 characters). Clearing an optional field and saving removes the value. <b>Save profile</b> stays disabled until a field changed; a save shows the toast "Profile saved", or the server's reason. Email notifications go to the contact email when one is set, else to the sign-in email, and a change takes effect within about 30 seconds. LDAP accounts edit the same three fields; nothing is read from the directory for them. The header shows your name, with your username on hover.</li>
     </ol>
 
     <div class="callout calm">
@@ -191,13 +202,13 @@
     <h2 class="sec" id="profile">Account basics</h2>
     <p class="sectitle">Profile &amp; password</p>
     <ul class="list">
-      <li>Your profile holds the basics: email, username, role, and group memberships.</li>
-      <li><b>Changing your password:</b> use the profile page if your version exposes it. <strong>LDAP users change it in the company directory</strong> &mdash; HERD doesn't store one for you.</li>
+      <li>Your profile holds the basics: sign-in email, username, name, optional contact email and phone, role, and group memberships. You edit the name, contact email, and phone in the <a href="#settings">Profile card of Settings</a>.</li>
+      <li><b>Changing your password:</b> HERD has no password change screen or route. <strong>LDAP users change it in the company directory</strong>; HERD doesn't store one for you. Local accounts ask an admin.</li>
       <li><b>Forgot your password?</b> There's no self-serve reset today. Contact an admin.</li>
     </ul>
     <div class="callout tip">
       <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/><path d="M9 21h6"/></svg></span>
-      <div><p>Your Inventory filters and page-size choices are already saved automatically &mdash; no setting needed. Set them once and they stick.</p></div>
+      <div><p>Your Inventory filters and page-size choices are already saved automatically &mdash; no setting needed. Set them once and they stick. The <a href="user-topology.html#open">Topologies</a> and <a href="user-reservations.html#list">Reservations</a> searches, filters, and sorts are saved the same way.</p></div>
     </div>
 
     <div class="foot">

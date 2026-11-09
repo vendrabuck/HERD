@@ -20,7 +20,7 @@
     <a href="admin-setup.html">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-6-0.html">Release 0.6.0</a>
+    <a href="release-0-7-0.html">Release 0.7.0</a>
   </nav>
 </header>
 
@@ -63,7 +63,63 @@
 
     <h2 class="sec" id="open">Getting there</h2>
     <p class="sectitle">Opening the editor</p>
-    <p>Click <b>Topology</b> in the nav, then either pick a saved topology or hit <b>New topology</b>. You land on a dotted canvas with a floating palette in the corner and a toolbar across the top.</p>
+    <p>Click <b>Topology</b> in the nav, then either pick a saved topology or hit <b>New Topology</b>, give the new one a name in the dialog that opens, and click <b>Create</b>. Either way you land on a dotted canvas with a floating palette in the corner and a toolbar across the top.</p>
+
+    <p>The <b>Topology</b> tab lands you on the <b>Topologies</b> list first, with the total beside the heading, the <b>Export JSON</b>, <b>Export CSV</b>, <b>Import</b>, and <b>New Topology</b> buttons at the right, a left <b>Filters</b> panel, and the table beside it. On a narrow window the panel stacks above the table. Click a row to open that topology in the editor.</p>
+
+    <figure class="shot">
+      <div class="shot-frame">
+        <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/topology</span></div>
+        <div class="shot-stage">
+          <div class="hd">
+            <div class="hd-top"><span class="brand">HERD</span><span class="nav"><a>Inventory</a><a class="active">Topology</a><a>Reservations</a></span><span class="grow"></span><span class="right"><span class="u">Sara Kim</span><a>Logout</a></span></div>
+            <div class="hd-body">
+              <div class="hd-h1" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">Topologies <span style="font-size:13px;font-weight:400;color:var(--gray-400);margin-right:auto;">(3)</span><span style="display:inline-flex;gap:8px;"><span class="hd-btn secondary sm" style="background:#fff;border-color:var(--gray-300);">Export JSON</span><span class="hd-btn secondary sm" style="background:#fff;border-color:var(--gray-300);">Export CSV</span><span class="hd-btn secondary sm" style="background:#fff;border-color:var(--gray-300);">Import</span><span class="hd-btn primary sm" data-anno="1" data-anno-pin="t" data-anno-arrow>New Topology</span></span></div>
+              <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start;">
+                <div class="hd-card" style="flex:0 0 240px;max-width:100%;padding:12px 14px;" data-anno="2" data-anno-pin="b" data-anno-arrow data-anno-color="blue">
+                  <div class="hd-field"><label class="hd-label">Search topologies</label><div class="hd-input" style="color:var(--gray-400);">Search by name...</div></div>
+                  <div class="hd-field"><label class="hd-label">Owner</label><div class="hd-select">Mine</div></div>
+                  <span class="hd-btn secondary sm" style="width:100%;justify-content:center;background:#fff;border-color:var(--gray-300);">Clear filters</span>
+                </div>
+                <div style="flex:1 1 320px;min-width:0;">
+                  <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:12px;padding:8px 14px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:var(--radius-lg);font-size:13px;" data-anno="4" data-anno-pin="l" data-anno-arrow data-anno-color="blue">
+                    <span style="font-weight:500;color:var(--gray-900);">1 selected</span>
+                    <span style="font-size:12px;padding:5px 10px;border-radius:4px;border:1px solid #fca5a5;color:#b91c1c;">Delete selected</span>
+                    <span style="margin-left:auto;font-size:12px;color:var(--gray-600);">Clear selection</span>
+                  </div>
+                  <div class="hd-card"><div style="overflow-x:auto;">
+                    <table class="hd-table hd-compact">
+                      <thead><tr>
+                        <th style="width:32px;"><span style="width:14px;height:14px;border:1px solid var(--gray-300);border-radius:3px;background:#fff;display:inline-block;vertical-align:middle;"></span></th>
+                        <th>Name</th><th>Owner</th><th>Created</th>
+                        <th data-anno="3" data-anno-pin="b" data-anno-arrow data-anno-color="blue"><span style="display:inline-flex;align-items:center;gap:4px;color:var(--gray-900);">Updated <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:11px;height:11px;"><path d="m6 9 6 6 6-6"/></svg></span></th>
+                        <th></th>
+                      </tr></thead>
+                      <tbody>
+                        <tr><td><span style="width:14px;height:14px;border:1px solid var(--gray-300);border-radius:3px;background:#fff;display:inline-block;vertical-align:middle;"></span></td><td class="name">Spine-leaf</td><td>sara.k</td><td style="white-space:nowrap;">5/12/2026</td><td style="white-space:nowrap;">5/29/2026</td><td style="white-space:nowrap;"><span style="color:var(--blue-600);font-weight:500;margin-right:10px;">Clone</span><span style="color:#dc2626;font-weight:500;">Delete</span></td></tr>
+                        <tr style="background:#eff6ff;"><td><span style="width:14px;height:14px;border-radius:3px;background:var(--blue-600);display:inline-block;vertical-align:middle;"></span></td><td class="name">HA failover pair<div style="font-size:11px;color:#b91c1c;margin-top:2px;" data-anno="5" data-anno-pin="r" data-anno-arrow>Not deleted: In use by 1 reservation. Cancel it or wait for it to end, then delete again.</div></td><td>sara.k</td><td style="white-space:nowrap;">4/30/2026</td><td style="white-space:nowrap;">5/27/2026</td><td style="white-space:nowrap;"><span style="color:var(--blue-600);font-weight:500;margin-right:10px;">Clone</span><span style="color:#dc2626;font-weight:500;">Delete</span></td></tr>
+                        <tr><td><span style="width:14px;height:14px;border:1px solid var(--gray-300);border-radius:3px;background:#fff;display:inline-block;vertical-align:middle;"></span></td><td class="name">VPC peering</td><td>sara.k</td><td style="white-space:nowrap;">3/14/2026</td><td style="white-space:nowrap;">5/2/2026</td><td style="white-space:nowrap;"><span style="color:var(--blue-600);font-weight:500;margin-right:10px;">Clone</span><span style="color:#dc2626;font-weight:500;">Delete</span></td></tr>
+                      </tbody>
+                    </table>
+                  </div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="shotcap"><b>The Topologies list.</b> The Owner filter is set to Mine, so sara.k sees only her own three topologies, most recently updated first. A bulk delete of two rows just ran: one was deleted and left the selection, and the row a reservation still uses stays ticked with the server's reason under its name.</p>
+    </figure>
+
+    <ol class="legend">
+      <li><b>New Topology.</b> Opens a dialog titled <b>New Topology</b> with a <b>Name</b> field (placeholder "My Lab Topology") and <b>Create</b>; the editor opens on a blank canvas once you create it. The three buttons to its left export the list as JSON or CSV and import a file; see <a href="admin-equipment.html#bulk">bulk import and export</a>.</li>
+      <li><b>The Filters panel.</b> <b>Search topologies</b> (placeholder "Search by name...") matches anywhere in the name, ignoring case. <b>Owner</b> is <b>All</b> or <b>Mine</b>. <b>Clear filters</b> appears only while a filter or search text is active. The search, the Owner choice, and the sort are saved per user and restored on your next visit; a saved value that is no longer valid falls back to the default. An empty result reads "No topologies match these filters." when a filter is on, else "No topologies yet. Create one to get started."</li>
+      <li><b>Sortable headings.</b> <b>Name</b>, <b>Owner</b>, <b>Created</b>, and <b>Updated</b> sort. The first click sorts ascending, the second descending, and the third returns to the default order, most recently updated first. Changing the sort returns you to page one. The last column holds <b>Clone</b> and, on a topology you may delete, <b>Delete</b>; the row's own <b>Delete</b> asks first, in a dialog titled "Delete topology?" ("This will permanently delete this topology and its canvas data."). The header checkbox selects every row on the page (accessible name "Select all topologies on this page").</li>
+      <li><b>The selection bar.</b> Tick rows and a bar above the table shows "N selected", <b>Delete selected</b>, and <b>Clear selection</b>. You can delete a topology you created; an admin or superadmin can delete any. The confirmation is titled <b>Delete Topologies</b> and counts what will run and what is skipped: "Delete 2 of the 3 selected topologies? This permanently deletes them and their canvas data and cannot be undone. 1 will be skipped: not yours." The confirm button reads "Delete 2 topologies" and the dismiss button "Keep topologies". When no ticked row qualifies, <b>Delete selected</b> is disabled and a note says "None of the selected topologies can be deleted: 2 not yours." A success toast says "Deleted 3 topologies"; with failures an error toast says "Deleted 2, failed 1", followed by the reason when every failure shares one. The selection is dropped when the page, the search, the Owner filter, or the sort changes.</li>
+      <li><b>A row the server refused.</b> It stays ticked, with "Not deleted: <i>reason</i>" under its name. A topology that a PENDING, PENDING_PROVISION, or ACTIVE <a href="user-reservations.html#list">reservation</a> references cannot be deleted; the server answers 409 <code>topology_in_use</code>, and the toast or the row note reads "In use by 2 reservations. Cancel them or wait for them to end, then delete again." COMPLETED, CANCELLED, and FAILED reservations do not block a delete.</li>
+    </ol>
+
+    <p>Once you are in the editor, the layout is the same whether you opened a saved topology or started a new one:</p>
 
     <figure class="shot">
       <div class="shot-frame">

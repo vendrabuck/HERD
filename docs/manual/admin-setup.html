@@ -20,7 +20,7 @@
     <a href="admin-setup.html" class="active">Admin setup</a>
     <a href="troubleshooting.html">Troubleshooting</a>
     <a href="glossary.html">Glossary</a>
-    <a href="release-0-6-0.html">Release 0.6.0</a>
+    <a href="release-0-7-0.html">Release 0.7.0</a>
   </nav>
 </header>
 
@@ -34,6 +34,7 @@
       <li><a href="#templates">2 · Create a template</a></li>
       <li><a href="#devices">3 · Create devices</a></li>
       <li><a href="#groups">4 · Device &amp; user groups</a></li>
+      <li><a href="#users">Users and profiles</a></li>
       <li><a href="#perms">5 · Grant permissions</a></li>
       <li><a href="#dynamic">6 · Hypervisors (optional)</a></li>
       <li><a href="#about">7 · Check versions</a></li>
@@ -196,6 +197,9 @@
     </ol>
     <p>User groups are symmetrical: <b>User Groups &rarr; New group</b>, add members, save. New registrations auto-join <code>Not Grouped</code> until you move them. Anyone can list group names, which pickers and grants need, but opening a group to see its members and their emails is admin-only.</p>
 
+    <p class="sectitle" id="users">Users and profiles</p>
+    <p>Open <b>Administration</b>, then <b>Users</b>. The page is headed <b>User Management</b> and lists every account with the columns Name, Username, Email, Role, Created, Profile, and, for a superadmin only, Action. Name shows the account's display name, else its username. <b>Edit profile</b> in the Profile column opens a centred dialog titled <b>Edit profile</b> with the same form the account sees in Settings: <b>Name</b>, <b>Contact email</b>, <b>Phone</b>, then <b>Save profile</b> and <b>Cancel</b>. An admin or superadmin edits any account's profile this way, active or not; a save toasts "Profile saved" and closes the dialog. The sign-in email and username are shown read-only, and no screen changes them. Through the API a user who names any account but their own gets 404 <code>User not found</code>, the same answer as an unknown id. The Action column's <b>Promote to admin</b> and <b>Demote to user</b> follow the <a href="#roles">roles table</a> above.</p>
+
     <p class="sectitle" id="perms">Step 5 &middot; Grant permissions (the unlock)</p>
     <p>This is the line that makes everything visible to users. On the device group, attach the user groups that should see it.</p>
     <div class="callout tip">
@@ -223,14 +227,15 @@
                   <div class="hd-field"><label class="hd-label">Hypervisor Type</label><div class="hd-input" data-anno="2" data-anno-pin="b" data-anno-arrow data-anno-color="blue">proxmox</div></div>
                   <div class="hd-field"><label class="hd-label">Secret</label><div class="hd-select" data-anno="3" data-anno-pin="b" data-anno-arrow>pve-api-token (api_key)</div></div>
                 </div>
-                <label style="display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--gray-700);"><span style="width:16px;height:16px;border-radius:4px;background:var(--blue-600);display:inline-flex;align-items:center;justify-content:center;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"><path d="m5 13 4 4L19 7"/></svg></span> Enabled</label>
+                <div class="hd-field"><label class="hd-label">Bookable by device group</label><div class="hd-select" data-anno="5" data-anno-pin="l" data-anno-arrow data-anno-color="blue">Admins only</div><div style="font-size:11px;color:var(--gray-500);margin-top:4px;">Users whose user groups have a permission on this device group can see and book the dynamic templates that use this hypervisor. Admins can always book them.</div></div>
+                <label style="display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--gray-700);"><span style="width:16px;height:16px;border-radius:4px;background:var(--blue-600);display:inline-flex;align-items:center;justify-content:center;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"><path d="m5 13 4 4L19 7"/></svg></span> <span data-anno="6" data-anno-pin="r" data-anno-arrow data-anno-color="blue">Enabled</span></label>
               </div>
               <div class="mfoot"><span class="hd-btn secondary">Cancel</span><span class="hd-btn primary" data-anno="4" data-anno-pin="t" data-anno-arrow>Register</span></div>
             </div>
           </div></div>
         </div>
       </div>
-      <p class="shotcap"><b>Registering a hypervisor</b> (Administration &rarr; Hypervisors). It joins the table with its type, endpoint, and secret.</p>
+      <p class="shotcap"><b>Registering a hypervisor</b> (Administration &rarr; Hypervisors). It joins the table with its type, endpoint, secret, a <b>Bookable by</b> column, and an <b>Enabled</b> column that reads Yes or No.</p>
     </figure>
 
     <ol class="legend">
@@ -238,6 +243,8 @@
       <li><b>Hypervisor Type.</b> Free text matched by the recipe driver: <code>proxmox</code>, <code>vsphere</code>, <code>libvirt</code>, and so on.</li>
       <li><b>Secret.</b> Credentials, referenced from the secrets store &mdash; create the secret first or this list is empty.</li>
       <li><b>Register.</b> Deleting later fails while any template references it, same as drivers.</li>
+      <li><b>Bookable by device group.</b> <b>Admins only</b> (the default) or one of your device groups. With a group chosen, users whose user groups hold a permission on that group can see and book the dynamic templates that use this hypervisor; admins can always book them. To everyone else a template on the hypervisor is hidden and answers exactly like an unknown one. Every hypervisor that existed before 0.7.0 starts as Admins only until you assign a group.</li>
+      <li><b>Enabled.</b> While unticked, a booking of a template on this hypervisor is refused with a 422 naming the hypervisor, and execution creates no instance on it for a booking taken earlier.</li>
     </ol>
 
     <div class="callout calm">
@@ -284,15 +291,15 @@
         <div class="chrome"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="addr">herd.lab/admin/about</span></div>
         <div class="shot-stage">
           <div class="hd">
-            <div class="hd-top"><span class="brand" style="white-space:nowrap;">HERD <span style="font-size:11px;font-weight:400;color:var(--chrome-fg-muted);white-space:nowrap;">v0.6.0</span></span><span class="nav"><a>Inventory</a><a>Topology</a><a>Reservations</a><a class="active">Administration</a></span><span class="grow"></span><span class="right"><span class="u">admin</span></span></div>
+            <div class="hd-top"><span class="brand" style="white-space:nowrap;">HERD <span style="font-size:11px;font-weight:400;color:var(--chrome-fg-muted);white-space:nowrap;">v0.7.0</span></span><span class="nav"><a>Inventory</a><a>Topology</a><a>Reservations</a><a class="active">Administration</a></span><span class="grow"></span><span class="right"><span class="u">admin</span></span></div>
             <div class="hd-body">
               <div class="hd-h1" style="justify-content:space-between;">About <span class="hd-btn secondary sm" style="background:#fff;border-color:var(--gray-300);" data-anno="1" data-anno-pin="l" data-anno-arrow>Refresh</span></div>
               <div class="hd-card" style="padding:14px 16px;margin-bottom:18px;">
                 <div style="font-size:14px;font-weight:600;color:var(--gray-900);margin-bottom:10px;">Frontend</div>
                 <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;font-size:13px;">
-                  <div><div style="font-size:11px;text-transform:uppercase;color:var(--gray-500);margin-bottom:3px;">Version</div><div style="font-weight:500;color:var(--gray-900);">0.6.0</div></div>
-                  <div><div style="font-size:11px;text-transform:uppercase;color:var(--gray-500);margin-bottom:3px;">Build</div><div class="mono" style="font-size:12px;color:var(--gray-900);">v0.6.0</div></div>
-                  <div><div style="font-size:11px;text-transform:uppercase;color:var(--gray-500);margin-bottom:3px;">Build date</div><div style="font-weight:500;color:var(--gray-900);">2026-10-01 14:05 UTC</div></div>
+                  <div><div style="font-size:11px;text-transform:uppercase;color:var(--gray-500);margin-bottom:3px;">Version</div><div style="font-weight:500;color:var(--gray-900);">0.7.0</div></div>
+                  <div><div style="font-size:11px;text-transform:uppercase;color:var(--gray-500);margin-bottom:3px;">Build</div><div class="mono" style="font-size:12px;color:var(--gray-900);">v0.7.0</div></div>
+                  <div><div style="font-size:11px;text-transform:uppercase;color:var(--gray-500);margin-bottom:3px;">Build date</div><div style="font-weight:500;color:var(--gray-900);">2026-11-08 18:20 UTC</div></div>
                 </div>
               </div>
               <div style="font-size:14px;font-weight:600;color:var(--gray-900);margin-bottom:10px;">Services</div>
@@ -300,11 +307,11 @@
                 <table class="hd-table" style="min-width:560px;">
                   <thead><tr><th>Service</th><th>Version</th><th>Build</th><th>Build date</th><th>Status</th></tr></thead>
                   <tbody>
-                    <tr><td class="name">ACL</td><td>0.6.0</td><td class="mono">v0.6.0</td><td>2026-10-01 14:05 UTC</td><td><span style="font-size:12px;font-weight:500;color:#15803d;">reachable</span></td></tr>
-                    <tr style="background:#fffbeb;" data-anno="2" data-anno-pin="l" data-anno-arrow><td class="name">AI Orchestrator</td><td>0.5.0 <span style="font-size:11px;font-weight:500;padding:1px 6px;border-radius:4px;background:#fef3c7;color:#92400e;">differs</span></td><td class="mono">v0.5.0 <span style="font-size:11px;font-weight:500;padding:1px 6px;border-radius:4px;background:#fef3c7;color:#92400e;">differs</span></td><td>2026-09-15 09:12 UTC</td><td><span style="font-size:12px;font-weight:500;color:#15803d;">reachable</span></td></tr>
-                    <tr><td class="name">Auth</td><td>0.6.0</td><td class="mono">v0.6.0</td><td>2026-10-01 14:05 UTC</td><td><span style="font-size:12px;font-weight:500;color:#15803d;">reachable</span></td></tr>
+                    <tr><td class="name">ACL</td><td>0.7.0</td><td class="mono">v0.7.0</td><td>2026-11-08 18:20 UTC</td><td><span style="font-size:12px;font-weight:500;color:#15803d;">reachable</span></td></tr>
+                    <tr style="background:#fffbeb;" data-anno="2" data-anno-pin="l" data-anno-arrow><td class="name">AI Orchestrator</td><td>0.6.0 <span style="font-size:11px;font-weight:500;padding:1px 6px;border-radius:4px;background:#fef3c7;color:#92400e;">differs</span></td><td class="mono">v0.6.0 <span style="font-size:11px;font-weight:500;padding:1px 6px;border-radius:4px;background:#fef3c7;color:#92400e;">differs</span></td><td>2026-10-01 14:05 UTC</td><td><span style="font-size:12px;font-weight:500;color:#15803d;">reachable</span></td></tr>
+                    <tr><td class="name">Auth</td><td>0.7.0</td><td class="mono">v0.7.0</td><td>2026-11-08 18:20 UTC</td><td><span style="font-size:12px;font-weight:500;color:#15803d;">reachable</span></td></tr>
                     <tr data-anno="3" data-anno-pin="r" data-anno-arrow data-anno-color="blue"><td class="name">Cabling</td><td style="color:var(--gray-400)">-</td><td style="color:var(--gray-400)">-</td><td style="color:var(--gray-400)">-</td><td><span style="font-size:12px;font-weight:500;color:#dc2626;">unreachable</span></td></tr>
-                    <tr><td class="name">Config</td><td>0.6.0</td><td class="mono">v0.6.0</td><td>2026-10-01 14:05 UTC</td><td><span style="font-size:12px;font-weight:500;color:#15803d;">reachable</span></td></tr>
+                    <tr><td class="name">Config</td><td>0.7.0</td><td class="mono">v0.7.0</td><td>2026-11-08 18:20 UTC</td><td><span style="font-size:12px;font-weight:500;color:#15803d;">reachable</span></td></tr>
                     <tr><td class="name" style="color:var(--gray-400);">7 more rows</td><td></td><td></td><td></td><td></td></tr>
                   </tbody>
                 </table>
@@ -318,7 +325,7 @@
 
     <ol class="legend">
       <li><b>Refresh</b> asks every service again. Each service is queried on its own, so one that is down cannot blank the rest of the table.</li>
-      <li><b>A "differs" row.</b> The row turns amber and the badge sits on the version or the build that does not match the frontend's. A build of <code>dev</code> is never flagged. The backend's <code>0.6.0.dev0</code> and the frontend's <code>0.6.0-dev</code> count as the same version; so do <code>0.6.0rc1</code> and <code>0.6.0-rc.1</code>, while <code>0.6.0rc1</code> and <code>0.6.0-rc.2</code> do not. A build date reads like "2026-09-19 22:18 UTC".</li>
+      <li><b>A "differs" row.</b> The row turns amber and the badge sits on the version or the build that does not match the frontend's. A build of <code>dev</code> is never flagged. The backend's <code>0.7.0.dev0</code> and the frontend's <code>0.7.0-dev</code> count as the same version; so do <code>0.7.0rc1</code> and <code>0.7.0-rc.1</code>, while <code>0.7.0rc1</code> and <code>0.7.0-rc.2</code> do not. A build date reads like "2026-09-19 22:18 UTC".</li>
       <li><b>Status</b> is one of <b>reachable</b>, <b>unreachable</b> (the service did not answer), or <b>invalid response</b> (it answered 200 with a body that is not a version record, such as a proxy's error page; the row shows dashes and no skew badge).</li>
     </ol>
 

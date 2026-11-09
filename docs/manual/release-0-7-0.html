@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HERD Manual: Release 0.7.0</title>
+<link rel="icon" type="image/svg+xml" href="assets/herd-logo.svg" />
+<link rel="stylesheet" href="assets/manual.css" />
+<link rel="stylesheet" href="assets/app.css" />
+<style>
+  /* release-page only: the version identity strip */
+  .relmeta{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--gray-200);border:1px solid var(--gray-200);border-radius:var(--radius-lg);overflow:hidden;margin:26px 0 8px;}
+  .relmeta div{background:#fff;padding:14px 16px;}
+  .relmeta .k{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--gray-500);margin:0 0 4px;}
+  .relmeta .v{font-family:var(--font-mono);font-size:15px;color:var(--gray-900);margin:0;font-variant-numeric:tabular-nums;}
+  @media(max-width:680px){.relmeta{grid-template-columns:1fr;}}
+</style>
+</head>
+<body>
+
+<header class="manualbar">
+  <a class="wm" href="index.html"><img src="assets/herd-logo.svg" alt="" /><span>HERD<br><small>User manual</small></span></a>
+  <button class="navtoggle" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <nav>
+    <a href="quickstart.html">Quick start</a>
+    <a href="user-reservations.html">Reservations</a>
+    <a href="user-topology.html">Topology</a>
+    <a href="admin-setup.html">Admin setup</a>
+    <a href="troubleshooting.html">Troubleshooting</a>
+    <a href="glossary.html">Glossary</a>
+    <a href="release-0-7-0.html" class="active">Release 0.7.0</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="side">
+    <p class="eyebrow">On this page</p>
+    <ul>
+      <li><a href="#what">What 0.7.0 is</a></li>
+      <li><a href="#highlights">What shipped</a></li>
+      <li><a href="#quality">Quality bar</a></li>
+      <li><a href="#boundaries">Known boundaries</a></li>
+      <li><a href="#manual">Reading the manual against this release</a></li>
+    </ul>
+    <p class="eyebrow">Shared reference</p>
+    <ul>
+      <li><a href="troubleshooting.html">Troubleshooting</a></li>
+      <li><a href="glossary.html">Glossary</a></li>
+      <li><a href="release-0-7-0.html" class="active">Release 0.7.0</a></li>
+      <li><a href="release-0-6-0.html">Release 0.6.0</a></li>
+      <li><a href="release-0-5-0.html">Release 0.5.0</a></li>
+      <li><a href="release-0-4-0.html">Release 0.4.0</a></li>
+      <li><a href="release-0-3-0.html">Release 0.3.0</a></li>
+      <li><a href="release-0-2-0.html">Release 0.2.0</a></li>
+      <li><a href="release-0-1-0.html">Release 0.1.0</a></li>
+    </ul>
+  </aside>
+
+  <main class="main">
+    <span class="kicker shared">Shared reference</span>
+    <h1 class="title">Release 0.7.0</h1>
+    <p class="dek">The version this manual documents. 0.7.0 is a hardening release that also gives every account a profile and gives the list pages a left filter panel. A service refuses to start on a blank or unusable token key, template password defaults are masked from non-admins, and a stack on a shared host no longer reads another stack's containers. The Topologies and Reservations lists search and filter, the Topologies list sorts and deletes several rows at once, dialogs open centred, and toasts appear at the bottom centre.</p>
+
+    <div class="relmeta">
+      <div><p class="k">Version</p><p class="v">v0.7.0</p></div>
+      <div><p class="k">Released</p><p class="v">2026-11-08</p></div>
+      <div><p class="k">Tagged commit</p><p class="v">9fc48ba0</p></div>
+    </div>
+    <p class="shotcap">Source of record: the <a href="https://github.com/vendrabuck/HERD/releases/tag/v0.7.0">v0.7.0 release notes</a> and <a href="https://github.com/vendrabuck/HERD/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</p>
+
+    <div class="lost">
+      <div class="h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg> Read this before you file a bug</div>
+      <p>Some of the things you might expect to find are not missing by accident. The <a href="#boundaries">Known boundaries</a> section below lists what 0.7.0 deliberately does not do yet. Check it first.</p>
+    </div>
+
+    <h2 class="sec" id="what">The short version</h2>
+    <p class="sectitle">What 0.7.0 is</p>
+    <p>0.6.0 was about the two screens you live in. 0.7.0 is a hardening release: most of its 177 changelog entries fix behaviour you never see, and two of them address security advisories. The visible part is smaller and worth knowing. Every account now has a display name, with an optional contact email and phone number, edited in the Profile section of Settings; the header shows the name instead of the username. The Inventory, Reservations, and Topologies lists share a left Filters panel: the Inventory filters moved into it unchanged, the Reservations list can be searched and filtered by Status, Category, and Period, and the Topologies list gains search, an Owner filter, sortable headings, and a multi-select delete.</p>
+    <p>Under the floor, a service refuses to start when <code>AUTH_SECRET_KEY</code> is blank, still the placeholder, or unusable as an HMAC secret, and names the variable. A stack can be published on one host address, each stack's Traefik sees only its own compose project, and <code>make certs</code> writes a self-signed gateway certificate so a fresh clone is served its own. Reservation edits now follow the rules create follows, a topology or a port cannot be deleted while something depends on it, and an admin can pause a webhook subscription. Modal dialogs open centred, toasts appear at the bottom centre, and the Settings page scrolls again.</p>
+
+    <h2 class="sec" id="highlights">The contents</h2>
+    <p class="sectitle">What shipped</p>
+    <div class="cardgrid c2" style="margin-top:18px;">
+      <div class="gcard" style="cursor:default;"><span class="num">01</span><h3>Accounts have profiles</h3><p>Every account has a required display name and an optional contact email and phone number. You edit yours in the <b>Profile</b> section of Settings; an admin edits any account from <b>Administration</b>, then <b>Users</b>, with <b>Edit profile</b>. The header shows your name, with your username on hover. Email notifications go to the contact email when one is set. <a href="user-notifications.html#profile">Your profile &rarr;</a> <a href="admin-setup.html#users">Users and profiles &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">02</span><h3>List pages have a filter panel</h3><p>The Inventory filters moved into a left <b>Filters</b> panel with no change in behaviour. The Reservations list can be searched and filtered by <b>Status</b>, <b>Category</b>, and <b>Period</b>, and the choices are saved per user. The Topologies list gains search, an <b>Owner</b> filter, sortable headings, and multi-select delete. <a href="user-reservations.html#list">The reservations list &rarr;</a> <a href="user-topology.html#open">The topologies list &rarr;</a> <a href="admin-equipment.html#inspect">The Inventory page &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">03</span><h3>Token settings are checked when a service starts</h3><p>A blank, placeholder, or unusable <code>AUTH_SECRET_KEY</code>, or an <code>AUTH_ALGORITHM</code> other than HS256, HS384, or HS512, stops the service with a message naming the variable instead of signing tokens with it. Two security advisories are addressed by this release: this check, and the template password masking listed under "Also in this release" below. <a href="troubleshooting.html#admin">A service exits at startup &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">04</span><h3>A stack shares its host more safely</h3><p><code>HERD_GATEWAY_BIND</code> publishes the gateway on one address. Each stack's Traefik reads only its own compose project, and <code>make up</code> refuses to start while another project holds port 80 or 443. <code>make certs</code> writes a ten-year self-signed gateway certificate, so a fresh clone is served its own instead of Traefik's built-in one. <a href="troubleshooting.html#admin">make up is refused &rarr;</a> <a href="quickstart.html#signin">The certificate warning &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">05</span><h3>Reservation edits follow the rules create follows</h3><p>An edit that races a cancel, release, or auto-complete keeps nothing and answers 409. An edit cannot stretch a reservation past <code>RESERVATION_MAX_DURATION_SECONDS</code>, and a device added to a PENDING reservation is judged by the window conflict check. The provisioning timeout no longer restarts on a purpose edit. The calendar answers 503 to a non-admin when device visibility cannot be verified, instead of showing everyone's bookings. <a href="user-reservations.html#detail">The detail modal &rarr;</a> <a href="user-reservations.html#calendar">The calendar &rarr;</a></p></div>
+      <div class="gcard" style="cursor:default;"><span class="num">06</span><h3>Interface fixes</h3><p>Modal dialogs open centred; Tailwind 4 had pinned them to the top-left corner in every release through 0.6.0. Toasts appear at the bottom centre, where they no longer cover the topology editor's Save button. The Settings page scrolls again.</p></div>
+    </div>
+
+    <p class="sectitle" style="margin-top:34px;">Also in this release</p>
+    <ul class="list">
+      <li>An admin can pause and resume an outbound webhook subscription with <code>PATCH /api/v1/webhooks/{id}</code> and the body <code>{"is_active": false}</code> or <code>{"is_active": true}</code>; a paused subscription receives no event, and nothing is replayed on resume. <a href="https://github.com/vendrabuck/HERD/blob/main/docs/EXTERNAL_API.md">docs/EXTERNAL_API.md &rarr;</a></li>
+      <li>A hypervisor has a <b>Bookable by device group</b> setting, and its <b>Enabled</b> flag is now enforced: a non-admin sees and books a hypervisor's dynamic templates only through a device group their user groups hold a permission on, and a booking on a disabled hypervisor is refused. <a href="admin-setup.html#dynamic">Register a hypervisor &rarr;</a></li>
+      <li>A topology cannot be deleted while a PENDING, PENDING_PROVISION, or ACTIVE reservation uses it, and a port cannot be deleted or renamed while a cable names it. <a href="user-topology.html#open">The topologies list &rarr;</a> <a href="admin-equipment.html#inspect">Ports &rarr;</a></li>
+      <li>Hardened: non-admin template reads mask password-field defaults the way device reads mask password values; the sandbox child for driver packages starts in Python's isolated mode and puts the package on its path only after its resource limits are set; an uploaded tar archive with an oversized header record is refused at the header block; the e2e Selenium container publishes on 127.0.0.1 only; the config login limits failed attempts and answers 429; webhook destinations must resolve to public addresses; a non-admin reservation owner's execution run list shows only runs on devices they can see.</li>
+      <li>Import dry runs are full rehearsals for devices, templates, and topologies, so the dry-run report matches the committing report row for row. The template export and import carry a <code>hypervisor_name</code> column, and the device export leaves out dynamic-instance devices. <a href="admin-equipment.html#bulk">Bulk import and export &rarr;</a></li>
+      <li>Wiring and dynamic instances recover from failures that used to strand them: VLAN numbers are unique across everything reachable through the current cabling, the background wiring retry no longer stalls on <code>FAILED</code> rows it will never drive, and an upstream 401 or 403 during an <code>INTERNAL_API_TOKEN</code> rotation is retried instead of recorded as a missing device.</li>
+      <li>Auth boots on a stack upgraded in place before <code>make migrate</code>; a reservation that lands <code>FAILED</code> notifies its owner; the buffered assistant route answers 502 <code>Assistant call failed</code> instead of a plain 500.</li>
+      <li>Developer facing: tokens are signed and verified with PyJWT through one helper (<code style="white-space:normal;word-break:break-all;">herd_common.jwt_codec.decode_access_token</code>, 10 second leeway); existing Hypervisor recipes must accept <code>instance_ref=None</code>; three developer guides, <code>docs/specs/DEVELOPMENT.md</code>, <code>docs/specs/TESTING.md</code>, and <code>docs/specs/CONVENTIONS.md</code>; a test-effectiveness sweep read every test file and landed its fixes; <code>make everything</code> now runs the ci.yml checks it used to skip.</li>
+    </ul>
+    <p>Upgrade notes. After pulling 0.7.0, recreate Traefik (<code>make up</code>, or <code>docker compose up -d</code>) before anything restarts it: a Traefik container created before 0.7.0 still mounts the deleted <code>infra/traefik/traefik.yml</code>, and restarting it fails with a <code>not a directory</code> mount error. A stack whose <code>AUTH_SECRET_KEY</code> is unset, blank, still the placeholder, or not usable as an HMAC key now refuses to start, naming the variable; if a configuration was saved in the config UI, fix the value there. This release adds migrations (among them auth 0009, inventory 0022 and 0024, and a reservations column, <code>provision_started_at</code>), so run <code>make migrate</code> after pulling.</p>
+
+    <p>The architecture is unchanged from 0.1.0: twelve FastAPI services behind Traefik, one PostgreSQL schema and migration chain per service, NATS JetStream with transactional outboxes for events. The <a href="release-0-1-0.html#architecture">0.1.0 architecture section</a> still describes it.</p>
+
+    <h2 class="sec" id="quality">What it was tested against</h2>
+    <p class="sectitle">Quality bar</p>
+    <p>Measured at the tagged commit by the full <code>make everything</code> run on 2026-11-08:</p>
+    <ul class="list">
+      <li>9,158 backend unit tests passed across the 13 service suites (7,898) plus the repo-root suite (1,260), with 112 skipped; backend line coverage 97.0% (24,625 statements, 741 missed) with every service at 95% or higher.</li>
+      <li>2,030 frontend tests via vitest in 166 test files, run a second time under <code>TZ=America/Los_Angeles</code> with the same result; coverage is 94.43% lines, 92.99% statements, 86.15% branches, and 92.28% functions.</li>
+      <li>12 OpenAPI contract snapshot suites.</li>
+      <li>271 cross-service integration tests: 259 run in the main pass, 3 model-dependent assistant tests run in their own pass after it, the 6 LDAP-mode tests run in their own phase against the gate stack, and 3 are gated on an AI provider or other stack configuration.</li>
+      <li>206 end-to-end browser tests, run twice: 148 passed and 58 device-gated skipped on the unseeded stack, and 202 passed again on the seeded stack with no unexpected skip allowed (4 exempt).</li>
+      <li>41 live-LDAP tests against the checked-in <code>infra/ldap-test</code> directory, hard-required in the gate.</li>
+      <li>28 driver tests against real FRRouting and Nokia SR Linux nodes in the checked-in lab, run on every pull request and inside the gate.</li>
+      <li>Fifteen Postgres-live suites against the gate database, hard-required, 69 tests in all.</li>
+      <li>Load: 20 simulated users for one minute, 660 requests, 0 failures, median 13 ms, p95 120 ms.</li>
+    </ul>
+    <p>New in the gate this release: <code>make everything</code> runs the ci.yml checks it used to skip, among them <code>uv lock --check</code>, the frontend suite under <code>TZ=America/Los_Angeles</code>, and the <code>package-lock.json</code> sync check (changelog, the Delivery detail entry "<code>make everything</code> runs the ci.yml checks it used to skip"). The release gate is unchanged: a clean full validation run (lint, format check, every unit suite with coverage, frontend build, contract snapshots, integration, end-to-end, and load, against a rebuilt ephemeral stack) at the tagged commit, plus the same branch-protection ruleset on <code>main</code> described on the <a href="release-0-1-0.html#quality">0.1.0 page</a>. The ruleset also covers <code>release/*</code> branches.</p>
+
+    <h2 class="sec" id="boundaries">The honest part</h2>
+    <p class="sectitle">Known boundaries</p>
+    <p>These are limits of 0.7.0, not bugs. If you hit one, the answer is "not yet", not "file a ticket". None of 0.6.0's boundaries closed in this release; five are new.</p>
+    <ul class="list">
+      <li><b>Network element provisioning (anchored VLANs) is a later phase.</b> Elements are canvas objects today: they attach, save, validate, and diff, but nothing is provisioned from them.</li>
+      <li><b>Manual wiring retry is not exposed through the external API.</b> The <code>/api/v1</code> wiring-status passthrough is deliberately read-only; retrying a failed connection is an interactive, owner-gated action.</li>
+      <li><b>A failed VLAN removal is logged, not blocked on.</b> If <code>delete_vlan</code> fails on last-free, the allocation is already released and the empty definition lingers on the switch until an operator removes it. Bounded lingering is the accepted trade.</li>
+      <li><b>AI recipe authoring is dark by default.</b> Unchanged from 0.1.0: it stays behind <code>AI_RECIPE_AUTHORING_ENABLED</code>.</li>
+      <li><b>Driver packages are trusted code.</b> Unchanged from 0.1.0: POSIX <code>setrlimit</code> caps and a subprocess boundary are resource bounding, not OS-level isolation.</li>
+      <li><b>Purpose classification is off by default.</b> It needs a configured AI provider and <code>AI_PURPOSE_CLASSIFICATION_ENABLED</code>. A suggestion never writes the confirmed category by itself; an owner or an admin does.</li>
+      <li><b>Config-version history for a device outside your groups answers "Device not found".</b> The same answer as the device page gives. That is the visibility rule catching up, not a missing device.</li>
+      <li><b>A route that names a virtual router needs a driver that declares it.</b> Only a driver declaring <code>supports_vrf</code> drives one; on any other driver the route is refused as <code>l3_vrf_unsupported</code> and stays visible in the Wiring tab until the intent or the driver changes. The shipped <code>frr_l3</code> driver declares it.</li>
+      <li><b>The assistant's web sources are off by default.</b> They stay behind <code>AI_DOCS_WEB_ENABLED</code> and are limited to operator-allowlisted https prefixes; the built-in manual and any configured folders are on.</li>
+      <li><b>A delete right after a cancel can still precede teardown.</b> Execution tears down a cancelled reservation's wiring asynchronously, so a device delete issued in that window can still be refused as in use for a moment. The delete guard answers 503 when cabling or reservations cannot be asked.</li>
+      <li><b>Webhook delivery is at-least-once.</b> A crash while a POST is in flight can still deliver the same event again. Receivers should treat an event id they have already seen as a repeat.</li>
+      <li><b>Classify now can show on a finished reservation that is not yet eligible.</b> A reservation that ended before classification existed and was never swept or backfilled shows the button and answers "This reservation is not ready to be classified." Run <b>Classify history</b> first.</li>
+      <li><b>The Period column sorts by start time.</b> There is no heading that sorts by end time in the UI; the API accepts <code>sort_by=end_time</code>.</li>
+      <li><b>The About page's skew check is strong evidence on a clean tagged build and weak on a dirty one.</b> The build string names the commit an image was built from, not its bytes, so two images built from the same dirty tree read as identical.</li>
+      <li><b>The generated gateway certificate is self-signed.</b> Every client warns until you trust <code>server-chain.crt</code> by hand. macOS 10.15 and later refuse a TLS server certificate valid for more than 825 days even when trusted, so the ten-year certificate still warns there until you issue a shorter one of your own.</li>
+      <li><b>The phone number on a profile is stored and shown only.</b> Nothing calls or texts it.</li>
+      <li><b>Pausing a webhook subscription is an API call only.</b> No screen exposes it, and resuming does not replay the events it missed. A delivery already under way when you pause finishes and is recorded.</li>
+      <li><b>A hypervisor created before 0.7.0 starts admin-only.</b> Until an admin assigns a device group to it, a non-admin sees none of its dynamic templates.</li>
+      <li><b>Hypervisor recipes written before 0.7.0 must accept <code>instance_ref=None</code>.</b> Ending a reservation now runs a keyed destroy for a dynamic instance whose create never reported a handle, and the recipe is called with no handle.</li>
+    </ul>
+
+    <div class="callout warn">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg></span>
+      <div><p>Some manual pages describe screens that only appear when a feature is configured, for example the <b>AI Assistant</b> tab, the <b>Use AI</b> button, the <b>LDAP Sync</b> page's actions, the <b>Purpose Review</b> queue, and the <b>Classify now</b> button. On an install where the feature is off, those surfaces are hidden or inactive. That is the feature gate, not a broken deployment.</p></div>
+    </div>
+
+    <h2 class="sec" id="manual">Version and docs</h2>
+    <p class="sectitle">Reading the manual against this release</p>
+    <p>This manual is published from the repository and now documents <b>0.7.0</b>. The <a href="release-0-6-0.html">0.6.0 page</a> remains as the record of the previous release, and links the 0.5.0 and earlier records in turn. If a screen in front of you does not match a page here, check your deployed version before assuming the page is wrong: it shows beside the HERD wordmark in the header and on the sign-in card.</p>
+    <div class="callout calm">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></span>
+      <div><p>Full release notes, the tag, and the changelog live in the repository: <a href="https://github.com/vendrabuck/HERD/releases/tag/v0.7.0">github.com/vendrabuck/HERD releases/tag/v0.7.0</a>.</p></div>
+    </div>
+
+    <div class="foot">
+      <p>HERD User Manual &middot; Release 0.7.0</p>
+      <div class="pagenav">
+        <a href="release-0-6-0.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg> Release 0.6.0</a>
+        <a href="index.html">Home <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/manual.js"></script>
+</body>
+</html>
