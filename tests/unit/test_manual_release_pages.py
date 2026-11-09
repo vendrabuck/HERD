@@ -57,8 +57,8 @@ Limits:
   `figure`, `hr`). Check 4 does not judge what the dek says around the link, or what
   else it links.
 - HTML is read with the standard library's forgiving parser: an unclosed `<header>` or
-  `<aside>` runs to the end of the page, and an unclosed `<a>` runs to the next `<a>` or
-  `</a>`.
+  `<aside>` runs to the end of the page, and an unclosed `<a>` runs to the next `<a>` that
+  has an `href`, or to the next `</a>`.
 """
 
 import re
@@ -79,28 +79,8 @@ EXPIRING_PHRASES = (
     "The version this manual documents",
 )
 _DEK_ENDERS = frozenset(
-    {
-        "div",
-        "ul",
-        "ol",
-        "table",
-        "section",
-        "main",
-        "aside",
-        "header",
-        "footer",
-        "nav",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        "pre",
-        "blockquote",
-        "figure",
-        "hr",
-    }
+    "div ul ol table section main aside header footer nav "
+    "h1 h2 h3 h4 h5 h6 pre blockquote figure hr".split()
 )
 
 
