@@ -828,13 +828,18 @@ records only the failing nodeid, nothing else.
 `tests/e2e/conftest.py` writes durable failure artifacts to disk for any e2e test that
 fails during its call phase, keyed by the test's sanitized nodeid, under
 `HERD_E2E_ARTIFACT_DIR` (default `<tempdir>/herd-e2e-artifacts`, e.g.
-`/tmp/herd-e2e-artifacts` on Linux; see `docs/ENV_VARS.md`). Each failing test gets its own
-subdirectory containing:
+`/tmp/herd-e2e-artifacts` on Linux; see `docs/ENV_VARS.md`). A test that fails during its
+setup phase (a fixture raised, such as a login timeout) gets the same files under the same
+name prefixed `setup-`; when no page or driver existed yet, that directory holds only the
+traceback, an empty console log, and a meta.txt saying so (`docs/specs/TESTING.md` has
+the lookup order). Each failing test gets its own subdirectory containing:
 
 - `screenshot.png`: full-page screenshot at the moment of failure.
-- `page.html`: the DOM at the moment of failure.
-- `console.log`: browser console messages (Playwright tests only reliably; Selenium's is
-  best-effort and may be empty if the driver doesn't support it).
+- `page.html`: the DOM at the moment of failure, with the value of every password input
+  replaced by `[redacted]`.
+- `console.log`: browser console messages. Selenium sessions ask for the browser log and
+  the hook reads it with the getLog command; if the Grid refuses that, meta.txt carries a
+  `console:` line with the error.
 - `traceback.txt`: the pytest failure traceback.
 - `meta.txt`: the page URL and a UTC timestamp, plus any capture-step failures (e.g. a
   screenshot that itself timed out).

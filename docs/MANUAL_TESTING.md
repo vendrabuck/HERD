@@ -14,8 +14,10 @@ here.
 
 E2E note: the `standalone-chrome` container caps concurrent sessions at 3
 (`SE_NODE_MAX_SESSIONS=3`, `docker-compose.override.yml`). A pytest fixture
-that raises before its `yield` leaks a session slot until the container is
-recreated; within one e2e run this surfaces as later tests queuing for up
+that creates a driver and raises before quitting it leaks a session slot
+until the container is recreated (the conftest's own Selenium fixtures
+register the quit as a finalizer before they log in, issue #1266, so a
+login that raises there no longer leaks); within one e2e run this surfaces as later tests queuing for up
 to `SE_SESSION_REQUEST_TIMEOUT` (300s) before failing to acquire a browser
 session, not a clean failure at the point of the leak. Recover with
 `docker compose --profile e2e up -d --force-recreate selenium`, the same
