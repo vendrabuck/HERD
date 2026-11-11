@@ -802,11 +802,13 @@ async def test_a_full_waiting_line_is_refused_at_once(tmp_path, monkeypatch, poo
         monkeypatch.setattr(extractor, "_PDF_CHILD_PATH", _sleeping_child(tmp_path, 1))
         monkeypatch.setattr(extractor, "MAX_CONCURRENT_PDF_READS", 1)
         monkeypatch.setattr(extractor, "MAX_PDF_READ_WAITERS", 1)
+        monkeypatch.setattr(extractor, "PDF_SLOT_WAIT_SECONDS", 10)
         name, detail = "doc.pdf", PDF_READER_BUSY_DETAIL
     else:
         monkeypatch.setattr(extractor, "_extract_one", stand_in)
         monkeypatch.setattr(extractor, "MAX_CONCURRENT_FILE_READS", 1)
         monkeypatch.setattr(extractor, "MAX_FILE_READ_WAITERS", 1)
+        monkeypatch.setattr(extractor, "FILE_SLOT_WAIT_SECONDS", 10)
         name, detail = "doc.json", extractor.FILE_READER_BUSY_DETAIL
     first = asyncio.ensure_future(extract_files([(name, b"{}")]))
     await _until(lambda: pool_state(pool) is not None and pool_state(pool)[0] == 0)
