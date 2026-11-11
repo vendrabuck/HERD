@@ -1,6 +1,6 @@
-import { useEffect } from "react";
+import { StrictMode, useEffect } from "react";
 import { http, HttpResponse } from "msw";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes, useNavigate, type NavigateFunction } from "react-router-dom";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -32,8 +32,19 @@ vi.mock("@xyflow/react", async () => {
   const actual = await vi.importActual<typeof import("@xyflow/react")>("@xyflow/react");
   return {
     ...actual,
-    ReactFlow: (props: { nodes?: Array<{ id: string }>; children?: React.ReactNode }) => (
-      <div>
+    ReactFlow: (props: {
+      nodes?: Array<{ id: string }>;
+      onDrop?: React.DragEventHandler;
+      nodesConnectable?: boolean;
+      deleteKeyCode?: string | null;
+      children?: React.ReactNode;
+    }) => (
+      <div
+        data-testid="react-flow"
+        data-connectable={String(props.nodesConnectable)}
+        data-delete-key={String(props.deleteKeyCode)}
+        onDrop={props.onDrop}
+      >
         <ul aria-label="canvas nodes">
           {(props.nodes ?? []).map((n) => (
             <li key={n.id}>{n.id}</li>
@@ -124,6 +135,18 @@ const FORK = {
   draft_restored_from_id: null,
 };
 
+const VERSION_A1 = {
+  id: "va-1",
+  topology_id: "A",
+  version_number: 1,
+  name: "Topology A",
+  description: "first save of A",
+  created_by: "u",
+  author_name: "u",
+  created_at: "2026-05-02T00:00:00Z",
+  restored_from_id: null,
+};
+
 // Per-device-id holds on the inventory batch call (the hydration step).
 const holds = new Map<string, Promise<void>>();
 function holdHydration(deviceId: string): () => void {
@@ -168,6 +191,19 @@ function handlers() {
       HttpResponse.json({ items: [RESERVATION], total: 1, skip: 0, limit: 500 }),
     ),
     http.get("/api/ai/status", () => HttpResponse.json({ enabled: false })),
+    http.get("/api/cabling/topologies/:id/versions", ({ params }) =>
+      HttpResponse.json(
+        params.id === "A"
+          ? { items: [VERSION_A1], total: 1, skip: 0, limit: 200 }
+          : { items: [], total: 0, skip: 0, limit: 200 },
+      ),
+    ),
+    http.get("/api/cabling/topologies/A/versions/va-1", () =>
+      HttpResponse.json({
+        ...VERSION_A1,
+        canvas_data: { nodes: [deviceNode("v1-node", "d-v1")], edges: [], selectedEdgeLayer: "L2" },
+      }),
+    ),
   ];
 }
 
@@ -183,11 +219,11 @@ function NavProbe({ onNavigate }: { onNavigate: (navigate: NavigateFunction) => 
 
 // One QueryClient per sequence, so a revisit within a sequence is a real
 // cached revisit (data present at once, refetched in the background).
-function renderApp(initial: string) {
+function renderApp(initial: string, strict = false) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const app = (
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[initial]}>
         <NavProbe onNavigate={keepNavigate} />
@@ -197,8 +233,9 @@ function renderApp(initial: string) {
           <Route path="/login" element={<div>login page</div>} />
         </Routes>
       </MemoryRouter>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  return render(strict ? <StrictMode>{app}</StrictMode> : app);
 }
 
 async function go(path: string) {
@@ -230,6 +267,9 @@ async function openAndWaitReady(name: string, nodeIds: string[]) {
   await screen.findByText(name);
   await waitFor(() => expect(saveButton()).toBeEnabled());
   expect(canvasNodeIds()).toEqual(nodeIds);
+  expect(screen.queryByText("Loading canvas...")).not.toBeInTheDocument();
+  expect(screen.getByTestId("react-flow")).toHaveAttribute("data-connectable", "true");
+  expect(screen.getByTestId("react-flow")).toHaveAttribute("data-delete-key", "Delete");
 }
 
 async function clickSaveAndExpectPut(id: string, nodeIds: string[]) {
@@ -245,6 +285,10 @@ async function expectNotReadyAndUnsavable() {
   await settle();
   expect(canvasNodeIds()).toEqual([]);
   expect(useTopologyStore.getState().nodes).toEqual([]);
+  expect(screen.getByRole("status")).toHaveTextContent("Loading canvas...");
+  // No connect and no Delete key on a canvas that is still loading.
+  expect(screen.getByTestId("react-flow")).toHaveAttribute("data-connectable", "false");
+  expect(screen.getByTestId("react-flow")).toHaveAttribute("data-delete-key", "null");
   expect(saveButton()).toBeDisabled();
   expect(screen.getByRole("button", { name: /Reserve Topology/ })).toBeDisabled();
   expect(screen.getByRole("button", { name: "Save as Template" })).toBeDisabled();
@@ -417,29 +461,31 @@ describe("TopologyEditorPage canvas identity (issue #1315)", () => {
 
   it("logout clears the canvas; the next user opening a topology never sees the last one's", async () => {
     act(() => useAuthStore.getState().setTokens("access-1", "refresh-1"));
-    renderApp("/topology/A");
-    await openAndWaitReady("Topology A", ["a-node"]);
+    try {
+      renderApp("/topology/A");
+      await openAndWaitReady("Topology A", ["a-node"]);
 
-    // The logout path: navigate away from the editor and clear the session.
-    await go("/login");
-    await screen.findByText("login page");
-    expect(useTopologyStore.getState().nodes.map((n) => n.id)).toEqual(["a-node"]);
-    act(() => useAuthStore.getState().clearAuth());
-    expect(useTopologyStore.getState().nodes).toEqual([]);
+      // Signing out empties the store at once, even before the editor unmounts.
+      act(() => useAuthStore.getState().clearAuth());
+      expect(useTopologyStore.getState().nodes).toEqual([]);
+      await go("/login");
+      await screen.findByText("login page");
 
-    // Another user signs in and opens a topology whose hydration is slow.
-    act(() => useAuthStore.getState().setTokens("access-2", "refresh-2"));
-    const releaseB = holdHydration("d-b");
-    await go("/topology/B");
-    await screen.findByText("Topology B");
-    await expectNotReadyAndUnsavable();
-    releaseB();
-    await openAndWaitReady("Topology B", ["b-node"]);
-    await clickSaveAndExpectPut("B", ["b-node"]);
-    act(() => useAuthStore.getState().clearAuth());
+      // Another user signs in and opens a topology whose hydration is slow.
+      act(() => useAuthStore.getState().setTokens("access-2", "refresh-2"));
+      const releaseB = holdHydration("d-b");
+      await go("/topology/B");
+      await screen.findByText("Topology B");
+      await expectNotReadyAndUnsavable();
+      releaseB();
+      await openAndWaitReady("Topology B", ["b-node"]);
+      await clickSaveAndExpectPut("B", ["b-node"]);
+    } finally {
+      act(() => useAuthStore.getState().clearAuth());
+    }
   });
 
-  it("live edit is unaffected: the fork canvas loads, Commit waits for it, no topology PUT", async () => {
+  it("entering live edit after A: the canvas is empty while the fork loads, then shows the fork and enables Commit", async () => {
     renderApp("/topology/A");
     await openAndWaitReady("Topology A", ["a-node"]);
 
@@ -458,5 +504,123 @@ describe("TopologyEditorPage canvas identity (issue #1315)", () => {
     expect(canvasNodeIds()).toEqual(["fork-node"]);
     expect(screen.getByRole("button", { name: "Clear canvas" })).toBeEnabled();
     expect(puts).toEqual([]);
+  });
+
+  it("A, then B pending, then back to A in place: Save stays disabled until A's own load lands", async () => {
+    renderApp("/topology/A");
+    await openAndWaitReady("Topology A", ["a-node"]);
+
+    const releaseB = holdHydration("d-b");
+    await go("/topology/B");
+    await screen.findByText("Topology B");
+    const releaseA = holdHydration("d-a");
+    await go("/topology/A");
+    await screen.findByText("Topology A");
+    await expectNotReadyAndUnsavable();
+
+    releaseA();
+    await openAndWaitReady("Topology A", ["a-node"]);
+    releaseB();
+    await settle();
+    expect(canvasNodeIds()).toEqual(["a-node"]);
+    await clickSaveAndExpectPut("A", ["a-node"]);
+    expect(puts.filter((p) => p.nodeIds.length === 0)).toEqual([]);
+  });
+
+  it("a version preview on A does not survive going to B in place: no exit control, B's canvas, Save PUTs B's nodes", async () => {
+    renderApp("/topology/A");
+    await openAndWaitReady("Topology A", ["a-node"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    const row = (await screen.findByText("first save of A")).closest("div.px-4") as HTMLElement;
+    fireEvent.click(within(row).getByRole("button", { name: "View" }));
+    await screen.findByRole("button", { name: /Exit preview \(v1\)/ });
+
+    await go("/topology/B");
+    await openAndWaitReady("Topology B", ["b-node"]);
+    expect(screen.queryByRole("button", { name: /Exit preview/ })).not.toBeInTheDocument();
+    await clickSaveAndExpectPut("B", ["b-node"]);
+  });
+
+  it("a version preview of A that resolves after going to B never reaches B's canvas", async () => {
+    renderApp("/topology/A");
+    await openAndWaitReady("Topology A", ["a-node"]);
+
+    const releaseV1 = holdHydration("d-v1");
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    const row = (await screen.findByText("first save of A")).closest("div.px-4") as HTMLElement;
+    fireEvent.click(within(row).getByRole("button", { name: "View" }));
+    await settle();
+
+    await go("/topology/B");
+    await openAndWaitReady("Topology B", ["b-node"]);
+    releaseV1();
+    await settle();
+    expect(canvasNodeIds()).toEqual(["b-node"]);
+    await clickSaveAndExpectPut("B", ["b-node"]);
+  });
+
+  it("a fork hydration that resolves after leaving live edit never reaches the next editor", async () => {
+    renderApp(`/topology/T?reservationId=${RES_ID}`);
+    const releaseFork = holdHydration("d-fork");
+    expect(await screen.findByRole("button", { name: "Loading fork..." })).toBeDisabled();
+
+    await go("/topology/E");
+    await openAndWaitReady("Topology E", []);
+    releaseFork();
+    await settle();
+    expect(canvasNodeIds()).toEqual([]);
+    expect(useTopologyStore.getState().nodes).toEqual([]);
+    await clickSaveAndExpectPut("E", []);
+  });
+
+  it("the same topology switching between plain mode and live edit loads each source on its own", async () => {
+    renderApp("/topology/T");
+    await openAndWaitReady("Topology T", ["parent-node"]);
+
+    const releaseFork = holdHydration("d-fork");
+    await go(`/topology/T?reservationId=${RES_ID}`);
+    expect(await screen.findByRole("button", { name: "Loading fork..." })).toBeDisabled();
+    await settle();
+    expect(canvasNodeIds()).toEqual([]);
+    releaseFork();
+    expect(await screen.findByRole("button", { name: "Commit to reservation" })).toBeEnabled();
+    expect(canvasNodeIds()).toEqual(["fork-node"]);
+
+    const releaseT = holdHydration("d-parent");
+    await go("/topology/T");
+    await screen.findByText("Topology T");
+    await expectNotReadyAndUnsavable();
+    releaseT();
+    await openAndWaitReady("Topology T", ["parent-node"]);
+    await clickSaveAndExpectPut("T", ["parent-node"]);
+  });
+
+  it("a device dropped while the canvas loads is refused, so the load never silently replaces an edit", async () => {
+    renderApp("/topology/A");
+    await openAndWaitReady("Topology A", ["a-node"]);
+
+    const releaseB = holdHydration("d-b");
+    await go("/topology/B");
+    await screen.findByText("Topology B");
+    const dropped = { id: "d-new", name: "d-new", topology_type: "PHYSICAL", status: "AVAILABLE" };
+    fireEvent.drop(screen.getByTestId("react-flow"), {
+      dataTransfer: {
+        getData: (type: string) => (type === "application/herd-device" ? JSON.stringify(dropped) : ""),
+      },
+    });
+    await expectNotReadyAndUnsavable();
+
+    releaseB();
+    await openAndWaitReady("Topology B", ["b-node"]);
+    await clickSaveAndExpectPut("B", ["b-node"]);
+  });
+
+  it("under StrictMode's double mount the editor still loads A and saves A's canvas", async () => {
+    renderApp("/topology/B", true);
+    await openAndWaitReady("Topology B", ["b-node"]);
+    await go("/topology/A");
+    await openAndWaitReady("Topology A", ["a-node"]);
+    await clickSaveAndExpectPut("A", ["a-node"]);
   });
 });
