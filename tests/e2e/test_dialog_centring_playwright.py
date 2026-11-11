@@ -72,7 +72,7 @@ def test_confirm_dialog_is_centred(pw_page, viewport):
         expect(delete).to_be_visible()
         delete.click()
         dialog = pw_page.locator("dialog[open]")
-        expect(dialog.locator("#confirm-dialog-title")).to_be_visible()
+        expect(dialog).to_have_accessible_name("Delete topology?")
         _assert_centred(pw_page, viewport)
 
         dialog.get_by_role("button", name="Cancel", exact=True).click()
@@ -90,7 +90,7 @@ def test_modal_is_centred(pw_page, viewport):
     _open_topologies(pw_page, viewport)
     pw_page.get_by_role("button", name="New Topology", exact=True).click()
     dialog = pw_page.locator("dialog[open]")
-    expect(dialog.locator("#modal-title")).to_have_text("New Topology")
+    expect(dialog).to_have_accessible_name("New Topology")
     _assert_centred(pw_page, viewport)
 
     dialog.get_by_role("button", name="Cancel", exact=True).click()
@@ -102,7 +102,7 @@ def test_bulk_import_dialog_is_centred(pw_page, viewport):
     _open_topologies(pw_page, viewport)
     pw_page.get_by_role("button", name="Import", exact=True).click()
     dialog = pw_page.locator("dialog[open]")
-    expect(dialog.locator("#bulk-import-title")).to_have_text("Import topologies")
+    expect(dialog).to_have_accessible_name("Import topologies")
     _assert_centred(pw_page, viewport)
 
     dialog.get_by_role("button", name="Close", exact=True).click()

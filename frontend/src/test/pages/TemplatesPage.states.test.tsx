@@ -1,10 +1,15 @@
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { MemoryRouter } from "react-router-dom";
+import userEvent from "@testing-library/user-event";
+import { renderInCountingRouter, tabTo } from "../rowNavigationHarness";
 
-// Mock react-router-dom
+// Mock react-router-dom: only useNavigate; Link and MemoryRouter stay real
+// because the row's name cell is a Link (issue #1317).
 const mockNavigate = vi.fn();
-vi.mock("react-router-dom", () => ({
+vi.mock("react-router-dom", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("react-router-dom")>()),
   useNavigate: () => mockNavigate,
 }));
 
@@ -82,7 +87,9 @@ function renderPage() {
   });
   return render(
     <QueryClientProvider client={client}>
-      <TemplatesPage />
+      <MemoryRouter>
+        <TemplatesPage />
+      </MemoryRouter>
     </QueryClientProvider>,
   );
 }
@@ -160,7 +167,7 @@ describe("TemplatesPage row rendering and non-admin visibility", () => {
 
   it("clicking a row navigates to its editor page", () => {
     renderPage();
-    fireEvent.click(screen.getByText("Edge Router"));
+    fireEvent.click(screen.getByText("Edge Router").closest("tr") as HTMLElement);
     expect(mockNavigate).toHaveBeenCalledWith("/templates/t-device");
   });
 
@@ -249,6 +256,35 @@ describe("TemplatesPage delete flow", () => {
   it("clicking a row's Delete button does not also navigate to the editor", () => {
     renderPage();
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+});
+
+describe("TemplatesPage keyboard row navigation (issue #1317)", () => {
+  it("Tab reaches the name link and Enter opens the editor, navigating once", async () => {
+    const user = userEvent.setup();
+    const { navigations } = renderInCountingRouter(<TemplatesPage />, "/templates");
+    const link = screen.getByRole("link", { name: "Edge Router" });
+    expect(link).toHaveAttribute("href", "/templates/t-device");
+
+    await tabTo(user, link);
+    await user.keyboard("{Enter}");
+
+    await screen.findByTestId("destination");
+    expect(navigations).toEqual(["/templates/t-device"]);
+    // The row's mouse handler (the mocked navigate) did not fire as well.
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
+  it("a click on the row's Duplicate button does not navigate", async () => {
+    mockUser = { id: "user-1", role: "admin" };
+    const user = userEvent.setup();
+    const { navigations } = renderInCountingRouter(<TemplatesPage />, "/templates");
+    const row = screen.getByRole("link", { name: "Edge Router" }).closest("tr") as HTMLElement;
+
+    await user.click(within(row).getByTitle("Duplicate template"));
+
+    expect(navigations).toEqual([]);
     expect(mockNavigate).not.toHaveBeenCalled();
   });
 });

@@ -120,7 +120,7 @@ def test_hypervisor_registration_and_dynamic_template_authoring(pw_page):
         pw_page.goto(f"{HOST_BASE_URL}/admin/hypervisors")
         pw_page.get_by_role("button", name="Register Hypervisor").click()
         dialog = pw_page.locator("dialog[open]")
-        expect(dialog.locator("#modal-title")).to_have_text("Register Hypervisor")
+        expect(dialog).to_have_accessible_name("Register Hypervisor")
 
         pw_page.fill("#hv-name", hv_name)
         pw_page.fill("#hv-endpoint", "https://e2e-proxmox.example.local:8006")
@@ -146,7 +146,7 @@ def test_hypervisor_registration_and_dynamic_template_authoring(pw_page):
         row = pw_page.locator("tr", has_text=hv_name)
         row.get_by_role("button", name="Edit", exact=True).click()
         edit_dialog = pw_page.locator("dialog[open]")
-        expect(edit_dialog.locator("#modal-title")).to_have_text("Edit Hypervisor")
+        expect(edit_dialog).to_have_accessible_name("Edit Hypervisor")
         pw_page.uncheck("#hv-enabled")
         pw_page.get_by_role("button", name="Save", exact=True).click()
         expect(pw_page.locator("dialog[open]")).to_have_count(0)

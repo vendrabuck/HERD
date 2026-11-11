@@ -537,7 +537,7 @@ def test_assistant_stream_token_by_token(pw_page):
         expect(row).to_be_visible(timeout=15000)
         row.click()
         dialog = pw_page.locator("dialog[open]")
-        expect(dialog.locator("#modal-title")).to_have_text("Reservation")
+        expect(dialog).to_have_accessible_name("Reservation")
         dialog.get_by_role("button", name="AI Assistant", exact=True).click()
 
         # The streaming chat UI is behind a build-time flag (VITE_AI_CHAT_ENABLED);
