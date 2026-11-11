@@ -11,15 +11,29 @@ client can upload, while an honest archive (git archive output with its small pa
 global header, a PAX archive with long UTF-8 paths, a GNU archive of 10,000 members, a
 text member of several megabytes) extracts unchanged. The constants are the ceilings
 below, each refusing the whole file with a fixed 400 detail ending "nothing was
-extracted"; `_extract_tgz` says how they combine. The PDF reader has no such bound yet
-(issue #1202).
+extracted"; `_extract_tgz` says how they combine.
+
+The PDF reader keeps a stronger invariant (issue #1202): no PDF, whatever its bytes,
+can make this process use memory or CPU past fixed ceilings, because the parse never
+runs here. Each PDF is read in a child process (``_pdf_child.py``, started through
+``capped_child.run_capped_child``) that sets RLIMIT_AS, RLIMIT_CPU, RLIMIT_FSIZE,
+RLIMIT_NOFILE, and RLIMIT_CORE on itself before it reads the upload or imports
+pdfplumber, so the kernel enforces them on every code path of the parser. This process
+bounds what it keeps of the child's output, kills the child's process group at a
+wall-clock deadline, and runs at most MAX_CONCURRENT_PDF_READS children at once.
+
+JSON is parsed and pretty-printed here, with two bounds of its own (issue #1202): the
+pretty-printing stops once it passes the character budget, and a document nested too
+deep to parse or print is returned as its raw text.
 """
 
+import asyncio
 import codecs
 import gzip
 import io
 import json
 import logging
+import os
 import re
 import tarfile
 import zlib
@@ -35,6 +49,8 @@ from herd_common.bounded_tar import (
 
 from app.config import settings
 from app.schemas.generate import ExtractedFile
+from app.services import _pdf_child
+from app.services.capped_child import Outcome, ReaderBusy, acquire_slot, run_capped_child
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +123,49 @@ TGZ_SPARSE_DETAIL = (
     "The tgz archive has a sparse member, which is not supported; nothing was extracted"
 )
 
+# The PDF reader's ceilings (issue #1202). Fixed, not settings: each is set from
+# measurement (docs/specs/ai-features.md, AI-UPLOAD-19 to AI-UPLOAD-22, has the
+# numbers), and the compose memory limit is sized from them.
+#
+# The child's address space (RLIMIT_AS). Python with pdfplumber imported maps 47 MiB
+# (VmPeak); 60 real PDFs of 100 KB to 28 MB read to the default character budget
+# peaked at 202 MiB VmPeak, 187 MiB VmHWM (125 MiB VmPeak for the ones under the 5 MiB
+# upload cap), so this is 2.5 times the largest honest peak measured.
+PDF_ADDRESS_SPACE_BYTES = 512 * 1024 * 1024
+# CPU seconds the child may use (RLIMIT_CPU soft; the hard limit is one second later).
+# The slowest honest read under the upload cap took 5.05 CPU seconds (a 4 MB manual
+# read to the budget); four times that.
+PDF_CPU_SECONDS = 20
+# Wall-clock seconds from the child's start to its end, the kill included: the CPU
+# limit plus room for a loaded host.
+PDF_WALL_SECONDS = 30
+# Open descriptors in the child; enough for the imports, which open one file at a time.
+PDF_NOFILE = 32
+# PDF children running at once, service-wide, and how long a read waits for a slot.
+MAX_CONCURRENT_PDF_READS = 2
+PDF_SLOT_WAIT_SECONDS = 30
+
+PDF_MEMORY_DETAIL = (
+    "The PDF needs more memory to read than the reader allows; nothing was extracted"
+)
+PDF_READER_FAILED_DETAIL = "The PDF reader failed; nothing was extracted"
+PDF_READER_BUSY_DETAIL = "The PDF reader is busy; try again shortly"
+PDF_UNAVAILABLE_DETAIL = "PDF extraction not available: pdfplumber is not installed"
+
+_PDF_CHILD_PATH = os.path.abspath(_pdf_child.__file__)
+
+
+def pdf_cpu_detail() -> str:
+    return (
+        f"The PDF needs more than {PDF_CPU_SECONDS} seconds of processing to read; "
+        "nothing was extracted"
+    )
+
+
+def pdf_deadline_detail() -> str:
+    return f"The PDF took longer than {PDF_WALL_SECONDS} seconds to read; nothing was extracted"
+
+
 # The extended header types counted against MAX_TGZ_MEMBER_HEADER_BYTES.
 _MEMBER_HEADER_TYPES = (
     tarfile.XHDTYPE,
@@ -138,6 +197,15 @@ _LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 
 class ExtractionError(Exception):
     """Raised for invalid, oversized, or unparsable files."""
+
+
+class ExtractionBusy(Exception):
+    """Every PDF reader slot stayed taken for PDF_SLOT_WAIT_SECONDS (the route's 503)."""
+
+
+class ExtractionUnavailable(Exception):
+    """The PDF reader itself failed: its child could not start, could not apply its
+    limits, or broke the protocol (the route's 500). Never caused by the file alone."""
 
 
 class _TgzLimitError(Exception):
@@ -316,23 +384,73 @@ def _safe_member_name(name: str) -> str:
     return _LONE_SURROGATE.sub("\ufffd", name)
 
 
-def _extract_pdf(data: bytes) -> str:
-    try:
-        import pdfplumber
-    except ImportError as e:
-        raise ExtractionError("PDF extraction not available: pdfplumber is not installed") from e
+async def _extract_pdf(data: bytes, budget: int) -> str:
+    """The PDF's text, read in a capped child, at most ``budget + 1`` characters.
 
-    parts: list[str] = []
+    The child returns the text the reader before issue #1202 returned, cut one
+    character past the budget, so ``extract_files`` sets the truncated flag exactly as
+    before. Every other ending is a fixed refusal, logged by its outcome word only.
+    """
     try:
-        with pdfplumber.open(io.BytesIO(data)) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text() or ""
-                if text:
-                    parts.append(text)
-    except Exception as e:
+        async with acquire_slot(MAX_CONCURRENT_PDF_READS, PDF_SLOT_WAIT_SECONDS):
+            result = await run_capped_child(
+                _PDF_CHILD_PATH,
+                [str(budget), str(PDF_ADDRESS_SPACE_BYTES), str(PDF_CPU_SECONDS), str(PDF_NOFILE)],
+                data,
+                wall_seconds=PDF_WALL_SECONDS,
+                # An honest child writes at most budget + 1 characters of UTF-8 (four
+                # bytes at most each, a lone surrogate three); a byte more is malformed.
+                max_stdout_bytes=4 * (budget + 1),
+                status_prefix=_pdf_child.STATUS_PREFIX,
+                exit_codes=_pdf_child.EXIT_CODES,
+            )
+    except ReaderBusy as e:
+        logger.warning("pdf read refused", extra={"outcome": "busy"})
+        raise ExtractionBusy(PDF_READER_BUSY_DETAIL) from e
+
+    outcome = result.outcome
+    if outcome is Outcome.OK:
+        try:
+            return result.stdout.decode("utf-8", "surrogatepass")
+        except UnicodeDecodeError:
+            outcome = Outcome.MALFORMED
+    logger.warning("pdf read refused", extra={"outcome": outcome.value})
+    if outcome is Outcome.PARSE_ERROR:
         # Issue #1036: the parser's own text stays out of the 400 detail.
-        raise ExtractionError(f"Failed to parse PDF ({type(e).__name__})") from e
-    return "\n\n".join(parts)
+        raise ExtractionError(f"Failed to parse PDF ({result.class_name})")
+    if outcome is Outcome.MEMORY:
+        raise ExtractionError(PDF_MEMORY_DETAIL)
+    if outcome is Outcome.CPU:
+        raise ExtractionError(pdf_cpu_detail())
+    if outcome is Outcome.DEADLINE:
+        raise ExtractionError(pdf_deadline_detail())
+    if outcome is Outcome.UNAVAILABLE:
+        raise ExtractionError(PDF_UNAVAILABLE_DETAIL)
+    raise ExtractionUnavailable(PDF_READER_FAILED_DETAIL)
+
+
+def _extract_json(data: bytes, budget: int) -> str:
+    """Pretty-printed JSON, the output ``json.dumps(indent=2, sort_keys=True)`` gives,
+    built one piece at a time and stopped once it passes ``budget`` characters (issue
+    #1202): indentation grows with depth, so a 92 KB upload of nested arrays printed
+    to 83 million characters. A document that is not JSON, or nested too deep to parse
+    or print (RecursionError), is returned as its raw text."""
+    text = _decode_text(data)
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, RecursionError):
+        return text
+    parts: list[str] = []
+    used = 0
+    try:
+        for chunk in json.JSONEncoder(indent=2, sort_keys=True).iterencode(parsed):
+            parts.append(chunk)
+            used += len(chunk)
+            if used > budget:
+                break
+    except RecursionError:
+        return text
+    return "".join(parts)
 
 
 def _read_member(f: IO[bytes], want: int) -> bytes:
@@ -439,20 +557,21 @@ def _extract_one(raw: _Raw, remaining_budget: int) -> str:
         )
 
     if ext == ".pdf":
-        return _extract_pdf(raw.data)
+        raise AssertionError("a PDF is read by _extract_pdf, in a capped child")
     if ext in (".tgz", ".tar.gz"):
         return _extract_tgz(raw.data, remaining_budget)
     if ext == ".json":
-        try:
-            parsed = json.loads(_decode_text(raw.data))
-            return json.dumps(parsed, indent=2, sort_keys=True)
-        except json.JSONDecodeError:
-            return _decode_text(raw.data)
+        return _extract_json(raw.data, remaining_budget)
     return _decode_text(raw.data)
 
 
-def extract_files(uploads: list[tuple[str, bytes]]) -> list[ExtractedFile]:
+async def extract_files(uploads: list[tuple[str, bytes]]) -> list[ExtractedFile]:
     """Extract text from each already-fully-read upload.
+
+    A PDF is read in a capped child process (``_extract_pdf``); every other type is
+    extracted in a worker thread (issue #1195): walking a tgz up to its ceilings is
+    synchronous work of up to seconds, which on the event loop would stall every other
+    request to the service, ``/health`` included.
 
     Re-checks the file-count and per-file size caps here as defense in
     depth. The caller is expected to have already enforced both, incrementally,
@@ -480,7 +599,12 @@ def extract_files(uploads: list[tuple[str, bytes]]) -> list[ExtractedFile]:
             results.append(ExtractedFile(filename=filename, text="", truncated=True))
             continue
 
-        text = _extract_one(_Raw(filename=filename, data=data), remaining_budget=remaining)
+        if _extension(filename) == ".pdf":
+            text = await _extract_pdf(data, remaining)
+        else:
+            text = await asyncio.to_thread(
+                _extract_one, _Raw(filename=filename, data=data), remaining
+            )
         truncated = False
         if len(text) > remaining:
             text = text[:remaining]

@@ -1,15 +1,22 @@
 """Unit tests for app.services.extractor."""
 
+import asyncio
 import io
 import tarfile
 
 import pytest
 from app import config as config_module
+from app.services import extractor
 from app.services.extractor import (
     ExtractionError,
-    extract_files,
     render_file_context,
 )
+
+
+def extract_files(uploads):
+    """The extractor's entry point is a coroutine since issue #1202 (a PDF is read in a
+    capped child process); these synchronous tests run it to completion."""
+    return asyncio.run(extractor.extract_files(uploads))
 
 
 def test_extract_plain_text():

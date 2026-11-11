@@ -16,7 +16,6 @@ from app.database import Base, engine
 from app.main import app
 from app.routes import generate as generate_module
 from app.routes.generate import _inventory_provider, _read_uploads
-from app.schemas.generate import ExtractedFile
 from app.services import extractor as extractor_module
 from app.services import generator as generator_module
 from app.services import usage_repo
@@ -1608,13 +1607,13 @@ async def test_generate_tgz_of_consecutive_headers_that_recurse_answers_400(
 
     # The real extraction, unchanged; this only notes which thread ran it.
     ran_in: list[threading.Thread] = []
-    real_extract_files = generate_module.extract_files
+    real_extract_one = extractor_module._extract_one
 
-    def recording_extract_files(uploads):
+    def recording_extract_one(raw, remaining_budget):
         ran_in.append(threading.current_thread())
-        return real_extract_files(uploads)
+        return real_extract_one(raw, remaining_budget)
 
-    monkeypatch.setattr(generate_module, "extract_files", recording_extract_files)
+    monkeypatch.setattr(extractor_module, "_extract_one", recording_extract_one)
     app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
     calls = _override_inventory({"EX3400": 4})
 
@@ -1628,23 +1627,24 @@ async def test_generate_tgz_of_consecutive_headers_that_recurse_answers_400(
 
 
 async def test_read_uploads_runs_the_extraction_off_the_event_loop(monkeypatch):
-    """Issue #1195: the extraction is synchronous work of up to seconds, so it must
-    not run on the event loop. The stand-in below blocks its caller until a coroutine
-    on the same loop releases it. Off the loop, that coroutine runs while the
-    extraction waits, and the wait ends released. On the loop, nothing else can run:
-    the wait times out unreleased, which fails the test instead of hanging it."""
+    """Issue #1195: the extraction of a non-PDF file is synchronous work of up to
+    seconds, so it must not run on the event loop (a PDF is read in a child process,
+    issue #1202). The stand-in below blocks its caller until a coroutine on the same
+    loop releases it. Off the loop, that coroutine runs while the extraction waits, and
+    the wait ends released. On the loop, nothing else can run: the wait times out
+    unreleased, which fails the test instead of hanging it."""
     started = threading.Event()
     release = threading.Event()
     seen: dict[str, object] = {}
 
-    def blocking_extract(uploads):
-        seen["uploads"] = uploads
+    def blocking_extract(raw, remaining_budget):
+        seen["uploads"] = [(raw.filename, raw.data)]
         seen["thread"] = threading.current_thread()
         started.set()
         seen["released"] = release.wait(timeout=5)
-        return [ExtractedFile(filename="notes.txt", text="extracted", truncated=False)]
+        return "extracted"
 
-    monkeypatch.setattr(generate_module, "extract_files", blocking_extract)
+    monkeypatch.setattr(extractor_module, "_extract_one", blocking_extract)
 
     async def release_once_the_extraction_is_waiting() -> None:
         while not started.is_set():
@@ -1666,16 +1666,93 @@ async def test_read_uploads_maps_an_extraction_error_from_the_worker_thread_to_4
     """An ExtractionError raised in the worker thread is the same 400 it was when the
     extraction ran inline, with the error's own text as the detail."""
 
-    def refusing_extract(uploads):
+    def refusing_extract(raw, remaining_budget):
         raise generate_module.ExtractionError("refused in the worker thread")
 
-    monkeypatch.setattr(generate_module, "extract_files", refusing_extract)
+    monkeypatch.setattr(extractor_module, "_extract_one", refusing_extract)
 
     with pytest.raises(HTTPException) as exc_info:
         await _read_uploads([_CountingUploadFile("notes.txt", b"hello")])
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "refused in the worker thread"
+
+
+@pytest.mark.parametrize(
+    ("error", "status_code", "detail"),
+    [
+        (
+            extractor_module.ExtractionBusy(extractor_module.PDF_READER_BUSY_DETAIL),
+            503,
+            "The PDF reader is busy; try again shortly",
+        ),
+        (
+            extractor_module.ExtractionUnavailable(extractor_module.PDF_READER_FAILED_DETAIL),
+            500,
+            "The PDF reader failed; nothing was extracted",
+        ),
+    ],
+    ids=["busy-503", "reader-failed-500"],
+)
+async def test_read_uploads_maps_the_pdf_reader_outcomes(monkeypatch, error, status_code, detail):
+    """Issue #1202: no free PDF reader slot within the wait is a 503 (as the route's
+    other overloads of a dependency, inventory and the provider, are), and a failure of
+    the reader itself is a 500; each with its fixed detail."""
+
+    async def failing_extract_files(uploads):
+        raise error
+
+    monkeypatch.setattr(generate_module, "extract_files", failing_extract_files)
+    with pytest.raises(HTTPException) as exc_info:
+        await _read_uploads([_CountingUploadFile("doc.pdf", b"%PDF-1.4")])
+    assert (exc_info.value.status_code, exc_info.value.detail) == (status_code, detail)
+
+
+async def test_generate_hostile_pdf_answers_400_with_the_fixed_reason(async_client):
+    """Issue #1202: an 833-byte PDF whose CID font names 40 million widths, which built
+    a 3 GB dict in the service before, answers the upload path's 400 with the memory
+    refusal; the child hit its address-space limit, not the service. Neither inventory
+    nor the provider is called."""
+    from tests._pdf_builders import cid_widths_pdf
+
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    calls = _override_inventory({"EX3400": 4})
+    files = [("files", ("doc.pdf", cid_widths_pdf(40_000_000), "application/pdf"))]
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, files=files, headers=headers)
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "The PDF needs more memory to read than the reader allows; nothing was extracted"
+    )
+    assert calls["n"] == 0
+
+
+async def test_generate_json_nested_past_the_recursion_limit_answers_200(async_client, monkeypatch):
+    """Issue #1202: a JSON upload of 100,000 nested arrays raised RecursionError in the
+    parse, which the route did not catch, and answered 500. It is now read as text that
+    is not JSON, cut to the budget, and the request proceeds."""
+    _override_inventory({"EX3400": 4})
+    _override_resolver(monkeypatch)
+    _override_ai(
+        {
+            "purpose": "pair",
+            "devices": [
+                {"role": "a", "template_name": "EX3400"},
+                {"role": "b", "template_name": "EX3400"},
+            ],
+            "edges": [{"source_role": "a", "target_role": "b", "layer": "L2"}],
+            "notes": "",
+        }
+    )
+    deep = b"[" * 100_000 + b"]" * 100_000
+    files = [("files", ("deep.json", deep, "application/json"))]
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, files=files, headers=headers)
+    assert resp.status_code == 200, resp.text
+    (summary,) = resp.json()["file_summaries"]
+    assert summary["truncated"] is True
 
 
 async def test_generate_tgz_member_name_that_is_not_utf8_reaches_the_provider(

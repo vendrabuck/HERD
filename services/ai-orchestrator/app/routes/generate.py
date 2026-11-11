@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -17,7 +16,12 @@ from app.services.ai_client import (
     ai_is_configured,
     get_ai_client,
 )
-from app.services.extractor import ExtractionError, extract_files
+from app.services.extractor import (
+    ExtractionBusy,
+    ExtractionError,
+    ExtractionUnavailable,
+    extract_files,
+)
 from app.services.generator import (
     INVENTORY_UNAVAILABLE_DETAIL,
     GeneratorError,
@@ -94,10 +98,11 @@ async def _read_uploads(files: list[UploadFile] | None) -> list[ExtractedFile]:
     oversized or excessive upload from being buffered in memory in the first
     place.
 
-    The extraction itself runs in a worker thread (issue #1195): walking a tgz
-    up to its ceilings, or parsing a PDF, is synchronous work of up to seconds,
-    and run on the event loop it would stall every other request to the
-    service, `/health` included.
+    The extraction never runs on the event loop: a PDF is read in a capped child
+    process and every other type in a worker thread (issues #1195 and #1202). A
+    refusal is the 400 with its fixed detail; no free PDF reader slot within the
+    wait is a 503, and a failure of the reader itself is a 500, each with a fixed
+    detail.
     """
     if not files:
         return []
@@ -140,9 +145,13 @@ async def _read_uploads(files: list[UploadFile] | None) -> list[ExtractedFile]:
     if not uploads:
         return []
     try:
-        return await asyncio.to_thread(extract_files, uploads)
+        return await extract_files(uploads)
     except ExtractionError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+    except ExtractionBusy as e:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(e)) from e
+    except ExtractionUnavailable as e:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(e)) from e
 
 
 @router.post("", response_model=GenerateResponse)
