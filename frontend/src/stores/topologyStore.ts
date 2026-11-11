@@ -20,6 +20,7 @@ import type {
 } from "@/types/topology.types";
 import { genId } from "@/lib/id";
 import { isDeviceNode } from "@/lib/canvasNodes";
+import { useAuthStore } from "@/stores/authStore";
 
 // Shared by addEnrichedEdge and addEnrichedEdges (issue #517 review round 3
 // item 9): every enriched edge, whether created one at a time or in a batch,
@@ -281,3 +282,14 @@ export const useTopologyStore = create<TopologyState>()((set) => ({
       edges: state.edges.filter((e) => !e.data?.isProposal),
     })),
 }));
+
+// Issue #1315: a canvas never outlives the session that loaded it. Any path
+// that signs the user out (the logout button, a failed token refresh) ends in
+// authStore.clearAuth, which flips isAuthenticated off; the canvas is cleared
+// on that edge, so the next user never starts from the previous user's
+// canvas. A token refresh keeps isAuthenticated true and clears nothing.
+useAuthStore.subscribe((state, prev) => {
+  if (prev.isAuthenticated && !state.isAuthenticated) {
+    useTopologyStore.getState().clearTopology();
+  }
+});
