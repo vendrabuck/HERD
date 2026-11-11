@@ -56,8 +56,15 @@ from herd_common.bounded_tar import MAX_TAR_READ_BYTES
 
 def extract_files(uploads):
     """The extractor's entry point is a coroutine since issue #1202 (a PDF is read in a
-    capped child process); these synchronous tests run it to completion."""
-    return asyncio.run(extractor.extract_files(uploads))
+    capped child process); these synchronous tests run it to completion on a loop of
+    their own. Not asyncio.run, which sets and then clears the thread's current loop
+    and so leaves a later caller of get_event_loop an unclosed loop."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(extractor.extract_files(uploads))
+    finally:
+        loop.run_until_complete(loop.shutdown_default_executor())
+        loop.close()
 
 
 # --- _extension: .tar.gz aliases to .tgz (line 37-38) ---

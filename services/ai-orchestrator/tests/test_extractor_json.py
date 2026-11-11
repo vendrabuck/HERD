@@ -25,14 +25,15 @@ _BUDGET = 80_000
 
 
 def _extract(data: bytes, budget: int = _BUDGET):
-    async def run():
-        return await extractor.extract_files([("data.json", data)])
-
     original = config_module.settings.upload_max_extracted_chars
     config_module.settings.upload_max_extracted_chars = budget
+    # A loop of its own, not asyncio.run, which clears the thread's current loop.
+    loop = asyncio.new_event_loop()
     try:
-        (result,) = asyncio.run(run())
+        (result,) = loop.run_until_complete(extractor.extract_files([("data.json", data)]))
     finally:
+        loop.run_until_complete(loop.shutdown_default_executor())
+        loop.close()
         config_module.settings.upload_max_extracted_chars = original
     return result
 
