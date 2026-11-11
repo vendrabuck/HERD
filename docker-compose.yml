@@ -797,6 +797,10 @@ services:
       - "traefik.http.routers.ai-orchestrator.middlewares=ai-orchestrator-strip"
     networks:
       - herd-net
+    # Issue #1202: two capped PDF reader children of 512 MiB address space each, plus
+    # 512 MiB for the service (docs/specs/ai-features.md, AI-UPLOAD-22). The restart
+    # policy brings the service back if the kernel kills it at this limit.
+    mem_limit: 1536m
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
