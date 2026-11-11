@@ -4,6 +4,7 @@ import toast from "react-hot-toast";
 import { usePaginatedGroups, useDeleteGroup } from "@/api/groups";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
+import { errorDetail } from "@/lib/errors";
 
 export function GroupsPage() {
   const navigate = useNavigate();
@@ -21,9 +22,7 @@ export function GroupsPage() {
       await deleteGroup.mutateAsync(deleteId);
       toast.success("Group deleted");
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to delete group";
+      const msg = errorDetail(err, "Failed to delete group");
       toast.error(msg);
     }
     setDeleteId(null);

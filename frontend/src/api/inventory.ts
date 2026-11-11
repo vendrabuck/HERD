@@ -4,6 +4,7 @@ import type { Device, DeviceCreate, DeviceUpdate, DeviceFilters } from "@/types/
 import type { PaginatedResponse } from "@/types/pagination.types";
 import type { CanvasData, DeviceNodeData } from "@/types/topology.types";
 import apiClient from "./client";
+import { responseDetail } from "@/lib/errors";
 
 // Query-key factory. Splits the "devices" namespace into list queries (paginated,
 // all-names, simple filtered) and detail queries (per-id). Mutations invalidate
@@ -269,7 +270,7 @@ export function usePaginatedDevices(
 
 /** The connection count of a `device_cabled` delete refusal, or null for any other error. */
 export function deviceCabledCount(err: unknown): number | null {
-  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
+  const detail = responseDetail(err);
   if (!detail || typeof detail !== "object") return null;
   const { error, connection_count } = detail as { error?: unknown; connection_count?: unknown };
   if (error !== "device_cabled") return null;
@@ -277,7 +278,7 @@ export function deviceCabledCount(err: unknown): number | null {
 }
 
 export function deleteDeviceErrorMessage(err: unknown): string {
-  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
+  const detail = responseDetail(err);
   if (typeof detail === "string") return detail;
   if (detail && typeof detail === "object" && (detail as { error?: string }).error === "device_in_use") {
     const { reservation_ids, transit_reservation_ids } = detail as {

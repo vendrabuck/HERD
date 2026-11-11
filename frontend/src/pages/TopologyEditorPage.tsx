@@ -29,7 +29,7 @@ import {
   forkL3IntentInvalidDetail,
   forkL3IntentMalformedDetail,
 } from "@/api/reservations";
-import { errorDetail } from "@/lib/errors";
+import { errorDetail, responseDetail, restoreBlockedDetail } from "@/lib/errors";
 import { useForkVersionPreview } from "@/hooks/useForkVersionPreview";
 import { usePathfindPairs, type DevicePair } from "@/api/connections";
 import { useAIStatus } from "@/api/ai";
@@ -1333,13 +1333,15 @@ function TopologyEditorInner() {
         } else if (l3Unavailable) {
           toast.error("Could not verify routing intent: inventory unavailable");
         } else {
-          const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data
-            ?.detail;
+          const detail = responseDetail(err);
+          const objectMessage =
+            detail && typeof detail === "object" && !Array.isArray(detail)
+              ? (detail as { message?: unknown }).message
+              : undefined;
           const message =
-            typeof detail === "string"
-              ? detail
-              : (detail as { message?: string } | undefined)?.message ??
-                "Failed to save the reservation fork";
+            typeof objectMessage === "string" && objectMessage
+              ? objectMessage
+              : errorDetail(err, "Failed to save the reservation fork");
           toast.error(message);
         }
         return;
@@ -1504,13 +1506,17 @@ function TopologyEditorInner() {
         setPreviewVersion(null);
         toast.success(`Restored v${restoreTarget.version_number}`);
       } catch (err) {
-        const response = (err as { response?: { status?: number; data?: { detail?: unknown } } })
-          .response;
-        if (response?.status === 409) {
-          const detail = response.data?.detail as
-            | { reservations?: Array<{ id: string; status: string; end_time?: string }> }
-            | undefined;
-          setBlockingReservations(detail?.reservations ?? []);
+        const blocked = restoreBlockedDetail(err);
+        if (blocked) {
+          setBlockingReservations(
+            blocked.reservations
+              .filter((r) => typeof r.id === "string" && r.id)
+              .map((r) => ({
+                id: r.id as string,
+                status: typeof r.status === "string" ? r.status : "",
+                ...(typeof r.end_time === "string" ? { end_time: r.end_time } : {}),
+              })),
+          );
         } else {
           toast.error("Restore failed");
         }
@@ -1931,9 +1937,7 @@ function TopologyEditorInner() {
                 setShowSaveAsTemplate(false);
                 setTemplateName("");
               } catch (err: unknown) {
-                const detail = (err as { response?: { data?: { detail?: string } } })?.response
-                  ?.data?.detail;
-                setTemplateError(detail ?? "Failed to save template");
+                setTemplateError(errorDetail(err, "Failed to save template"));
               }
             }}
           >
@@ -1948,6 +1952,7 @@ function TopologyEditorInner() {
               type="text"
               value={templateName}
               onChange={(e) => setTemplateName(e.target.value)}
+              maxLength={100}
               autoFocus
               className="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
               placeholder="Standard 2-spine 4-leaf"

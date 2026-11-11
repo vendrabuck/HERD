@@ -181,7 +181,7 @@ describe("DeviceConfigSection", () => {
     expect(receivedBody).toEqual({ config: { vlan: 100 }, description: "first cut" });
   });
 
-  it("shows a create refusal's string detail and never renders a validation list", async () => {
+  it("shows a create refusal's string detail and a validation list as text (#1314)", async () => {
     let calls = 0;
     server.use(
       http.get(VERSIONS_URL, () => HttpResponse.json({ items: [], total: 0, skip: 0, limit: 50 })),
@@ -204,9 +204,7 @@ describe("DeviceConfigSection", () => {
     expect(await screen.findByText("config does not match the schema")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Save" }));
-    expect(
-      await screen.findByText("Request failed with status code 422"),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("config: bad")).toBeInTheDocument();
   });
 
   describe("Apply dialog and Restore refusals (issue #1098)", () => {

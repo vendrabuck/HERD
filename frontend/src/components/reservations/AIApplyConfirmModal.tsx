@@ -1,4 +1,3 @@
-import { isAxiosError } from "axios";
 import toast from "react-hot-toast";
 import { Modal } from "@/components/ui/Modal";
 import {
@@ -8,6 +7,7 @@ import {
 } from "@/api/deviceConfigJobs";
 import { useCommandLog } from "@/api/executions";
 import type { PendingApply } from "@/types/ai.types";
+import { errorDetail } from "@/lib/errors";
 
 interface Props {
   pendingApply: PendingApply;
@@ -36,12 +36,7 @@ export function AIApplyConfirmModal({ pendingApply, planText, onClose }: Props) 
       toast.success("Real apply scheduled. Watch the device's apply jobs for the result.");
       onClose();
     } catch (err) {
-      if (isAxiosError(err)) {
-        const detail = err.response?.data?.detail;
-        toast.error(detail || "Failed to confirm apply");
-      } else {
-        toast.error("Failed to confirm apply");
-      }
+      toast.error(errorDetail(err, "Failed to confirm apply"));
     }
   };
 

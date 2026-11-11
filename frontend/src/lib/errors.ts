@@ -1,21 +1,92 @@
 import type { AICommitTopologyUnwireableDetail } from "@/types/ai.types";
 
 /**
- * A HERD backend service returns error detail as either a plain string or,
- * on a pydantic validation failure, a list of error objects. Passing that
- * list straight to toast.error renders raw objects as a React child and
- * throws inside the Toaster, which sits outside the ErrorBoundary in
- * App.tsx and blanks the app. Only ever surface a string; anything else
- * (a list, undefined, a non-string) falls back to the caller-supplied
- * message.
+ * The raw `detail` of an axios error's response body, typed `unknown` on
+ * purpose: the one place outside this module that reads it is a structured
+ * narrower that checks the shape itself. Rendering code never calls this;
+ * it calls `errorDetail` (issue #1314).
+ */
+export function responseDetail(err: unknown): unknown {
+  return (err as { response?: { data?: { detail?: unknown } } } | null | undefined)?.response
+    ?.data?.detail;
+}
+
+/** The most entries of a pydantic 422 list `detailText` names before "and N more". */
+export const VALIDATION_DETAIL_MAX_ITEMS = 3;
+
+/** The most characters (code points) `detailText` returns for a 422 list. */
+export const VALIDATION_DETAIL_MAX_LENGTH = 300;
+
+// FastAPI prefixes every validation location with where the value came from;
+// the field path after it is what a person can act on.
+const VALIDATION_LOCATION_SOURCES = new Set(["body", "query", "path", "header", "cookie"]);
+
+function validationEntryText(entry: unknown): string | null {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+  const { loc, msg } = entry as { loc?: unknown; msg?: unknown };
+  if (typeof msg !== "string" || !msg.trim()) return null;
+  let where = "";
+  if (
+    Array.isArray(loc) &&
+    loc.every((part) => typeof part === "string" || typeof part === "number")
+  ) {
+    const parts = loc.map(String);
+    if (parts.length > 1 && VALIDATION_LOCATION_SOURCES.has(parts[0])) parts.shift();
+    where = parts.join(".");
+  }
+  return where ? where + ": " + msg.trim() : msg.trim();
+}
+
+function boundedText(text: string, max: number): string {
+  const points = Array.from(text);
+  return points.length <= max ? text : points.slice(0, max - 3).join("") + "...";
+}
+
+/**
+ * The ONE normalizer from an error body's `detail` to display text (issue
+ * #1314). A HERD backend service answers with a plain string, or, on a
+ * pydantic validation failure (FastAPI's default 422), a list of
+ * {type, loc, msg, input, ctx} objects. A non-empty string passes through
+ * unchanged. A list whose every entry carries a string `msg` becomes
+ * "field: message" per entry (the location without its body/query/path
+ * source, dotted), the first VALIDATION_DETAIL_MAX_ITEMS joined with "; "
+ * plus " (and N more)", cut to VALIDATION_DETAIL_MAX_LENGTH characters. The
+ * `input` echo is never shown. Anything else (an empty string or list, an
+ * object, a number, null, a nested list, an entry without `msg`) is the
+ * caller's fallback, so the result is always a string.
+ */
+export function detailText(detail: unknown, fallback: string): string {
+  if (typeof detail === "string") return detail.trim() ? detail : fallback;
+  if (!Array.isArray(detail) || detail.length === 0) return fallback;
+  const entries: string[] = [];
+  for (const entry of detail) {
+    const text = validationEntryText(entry);
+    if (text === null) return fallback;
+    entries.push(text);
+  }
+  const shown = entries.slice(0, VALIDATION_DETAIL_MAX_ITEMS).join("; ");
+  const rest = entries.length - VALIDATION_DETAIL_MAX_ITEMS;
+  return boundedText(
+    rest > 0 ? shown + " (and " + rest + " more)" : shown,
+    VALIDATION_DETAIL_MAX_LENGTH,
+  );
+}
+
+/**
+ * The display text of a failed request: `detailText` of the axios error's
+ * response detail. Passing a raw detail to toast.error or into JSX renders an
+ * object as a React child and throws (before issue #1344 that blanked the
+ * whole app, header included); every error handler in the UI goes through
+ * this (or a structured narrower below), and the `no-restricted-syntax` rule
+ * in eslint.config.js refuses the old `detail?: string` cast and any
+ * `.data.detail` read outside this module.
  *
  * Single-sourced here (previously duplicated across HypervisorsPage,
  * GrantsPage, RecipeDraftPanel, api/reservations.ts, and api/topologies.ts)
  * so the guard cannot silently regress in a new call site.
  */
 export function errorDetail(err: unknown, fallback: string): string {
-  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
-  return typeof detail === "string" ? detail : fallback;
+  return detailText(responseDetail(err), fallback);
 }
 
 /**
@@ -37,10 +108,9 @@ export function structuredDetail<T>(
   status: number,
   matches: (detail: Record<string, unknown>) => boolean,
 ): T | null {
-  const response = (err as { response?: { status?: number; data?: { detail?: unknown } } })
-    ?.response;
+  const response = (err as { response?: { status?: number } })?.response;
   if (response?.status !== status) return null;
-  const detail = response.data?.detail;
+  const detail = responseDetail(err);
   if (detail && typeof detail === "object" && matches(detail as Record<string, unknown>)) {
     return detail as T;
   }
@@ -435,7 +505,7 @@ export const PHONE_PATTERN_TEXT =
  * a 422 entry for another field included, falls back to `fallback`.
  */
 export function profileSaveErrorText(err: unknown, fallback: string): string {
-  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
+  const detail = responseDetail(err);
   if (typeof detail === "string") return detail;
   if (!Array.isArray(detail) || detail.length === 0) return fallback;
   const parts: string[] = [];

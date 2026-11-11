@@ -7,6 +7,7 @@ import { useGroup, useCreateGroup, useUpdateGroup, useBulkAddMembers, useBulkRem
 import { useAllUsers } from "@/api/admin";
 import { TransferList } from "@/components/ui/TransferList";
 import type { TransferItem } from "@/components/ui/TransferList";
+import { errorDetail } from "@/lib/errors";
 
 export function GroupDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -90,9 +91,7 @@ export function GroupDetailPage() {
         toast.success("User group updated");
       }
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to save group";
+      const msg = errorDetail(err, "Failed to save group");
       toast.error(msg);
     }
   };
@@ -102,9 +101,7 @@ export function GroupDetailPage() {
       const result = await bulkAdd.mutateAsync({ groupId: id!, userIds: ids });
       toast.success(`${result.added} member(s) added${result.skipped ? `, ${result.skipped} skipped` : ""}`);
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to add members";
+      const msg = errorDetail(err, "Failed to add members");
       toast.error(msg);
     }
   };
@@ -114,9 +111,7 @@ export function GroupDetailPage() {
       const result = await bulkRemove.mutateAsync({ groupId: id!, userIds: ids });
       toast.success(`${result.removed} member(s) removed`);
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to remove members";
+      const msg = errorDetail(err, "Failed to remove members");
       toast.error(msg);
     }
   };

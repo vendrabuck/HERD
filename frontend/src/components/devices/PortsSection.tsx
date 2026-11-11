@@ -8,7 +8,7 @@ import { useAllDeviceNames } from "@/api/inventory";
 import { DynamicFieldRenderer } from "@/components/devices/DynamicFieldRenderer";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Modal } from "@/components/ui/Modal";
-import { deletePortErrorText } from "@/lib/errors";
+import { deletePortErrorText, errorDetail } from "@/lib/errors";
 import type { Port } from "@/types/port.types";
 import type { DeviceTemplate } from "@/types/template.types";
 
@@ -94,9 +94,7 @@ export function PortsSection({ deviceId, isAdmin }: PortsSectionProps) {
       toast.success("Port added");
       resetForm();
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to create port";
+      const msg = errorDetail(err, "Failed to create port");
       toast.error(msg);
     }
   };
@@ -133,9 +131,7 @@ export function PortsSection({ deviceId, isAdmin }: PortsSectionProps) {
       toast.success(`${result.length} ports created`);
       resetBulkForm();
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to create ports";
+      const msg = errorDetail(err, "Failed to create ports");
       toast.error(msg);
     }
   };

@@ -2,7 +2,9 @@ import {
   configApplyErrorText,
   configRestoreErrorText,
   deletePortErrorText,
+  detailText,
   driverCannotConfigureDetail,
+  errorDetail,
   formatRestoreBlocked,
   restoreBlockedDetail,
   formatMixedTypesDetail,
@@ -16,6 +18,8 @@ import {
   topologyDeleteErrorText,
   topologyInUseDetail,
   topologyUnconnectableDetail,
+  VALIDATION_DETAIL_MAX_ITEMS,
+  VALIDATION_DETAIL_MAX_LENGTH,
   type TopologyMixedTypesDetail,
   type TopologyUnconnectableDetail,
 } from "@/lib/errors";
@@ -23,6 +27,110 @@ import {
 function axiosLike(status: number, detail: unknown) {
   return { response: { status, data: { detail } } };
 }
+
+// Issue #1314: every shape a response detail can take, and the one string
+// errorDetail gives for it. A FastAPI 422 entry is {type, loc, msg, input, ctx}.
+const FALLBACK = "Fallback text";
+const TOO_LONG = "String should have at most 100 characters";
+
+function entry(loc: unknown, msg: unknown, extra: Record<string, unknown> = {}) {
+  return { type: "string_too_long", loc, msg, input: "SECRET-INPUT", ...extra };
+}
+
+const DETAIL_SHAPES: [string, unknown, string][] = [
+  ["a plain string passes through", "Name already in use", "Name already in use"],
+  ["an empty string falls back", "", FALLBACK],
+  ["a blank string falls back", "   ", FALLBACK],
+  ["undefined falls back", undefined, FALLBACK],
+  ["null falls back", null, FALLBACK],
+  ["a number falls back", 422, FALLBACK],
+  ["a boolean falls back", true, FALLBACK],
+  ["an object falls back, even one with a message", { message: "x", error: "e" }, FALLBACK],
+  ["an empty list falls back", [], FALLBACK],
+  ["a body field drops the body source", [entry(["body", "name"], TOO_LONG)], "name: " + TOO_LONG],
+  [
+    "a query parameter drops the query source",
+    [entry(["query", "limit"], "Input should be a valid integer")],
+    "limit: Input should be a valid integer",
+  ],
+  [
+    "a nested location is dotted, list indexes included",
+    [entry(["body", "ports", 0, "name"], "Field required")],
+    "ports.0.name: Field required",
+  ],
+  ["a bare source location is kept", [entry(["body"], "Field required")], "body: Field required"],
+  ["an entry without loc is its msg alone", [{ msg: "Value error, bad" }], "Value error, bad"],
+  [
+    "a location with a non-scalar part is dropped, the msg kept",
+    [entry(["body", { x: 1 }], "Field required")],
+    "Field required",
+  ],
+  [
+    "two entries are joined with a semicolon",
+    [entry(["body", "name"], TOO_LONG), entry(["body", "description"], "Field required")],
+    "name: " + TOO_LONG + "; description: Field required",
+  ],
+  ["an entry without msg falls back", [{ type: "missing", loc: ["body", "name"] }], FALLBACK],
+  ["an entry with a non-string msg falls back", [entry(["body", "name"], { m: 1 })], FALLBACK],
+  ["an entry with a blank msg falls back", [entry(["body", "name"], "  ")], FALLBACK],
+  ["a null entry falls back", [null], FALLBACK],
+  ["a string entry falls back", ["just text"], FALLBACK],
+  ["a nested list falls back", [[entry(["body", "name"], TOO_LONG)]], FALLBACK],
+  [
+    "one bad entry among good ones falls back",
+    [entry(["body", "name"], TOO_LONG), { loc: ["body", "x"] }],
+    FALLBACK,
+  ],
+];
+
+describe("errorDetail and detailText shapes (issue #1314)", () => {
+  it.each(DETAIL_SHAPES)("%s", (_label, detail, expected) => {
+    const text = errorDetail(axiosLike(422, detail), FALLBACK);
+    expect(typeof text).toBe("string");
+    expect(text).toBe(expected);
+    expect(detailText(detail, FALLBACK)).toBe(expected);
+  });
+
+  it("never shows the input echo of a 422 entry", () => {
+    expect(errorDetail(axiosLike(422, [entry(["body", "name"], TOO_LONG)]), FALLBACK)).not.toContain(
+      "SECRET-INPUT",
+    );
+  });
+
+  it("falls back for an error without a response, or not an object at all", () => {
+    for (const err of [new Error("Network Error"), null, undefined, "boom", 7, { response: null }]) {
+      expect(errorDetail(err, FALLBACK)).toBe(FALLBACK);
+    }
+  });
+
+  it("names the first entries and counts the rest", () => {
+    const many = Array.from({ length: VALIDATION_DETAIL_MAX_ITEMS + 2 }, (_, i) =>
+      entry(["body", "f" + i], "Field required"),
+    );
+    expect(errorDetail(axiosLike(422, many), FALLBACK)).toBe(
+      "f0: Field required; f1: Field required; f2: Field required (and 2 more)",
+    );
+  });
+
+  it("cuts a long 422 text to the length bound with an ellipsis", () => {
+    const text = errorDetail(axiosLike(422, [entry(["body", "name"], "x".repeat(1000))]), FALLBACK);
+    expect(text).toHaveLength(VALIDATION_DETAIL_MAX_LENGTH);
+    expect(text.startsWith("name: xxx")).toBe(true);
+    expect(text.endsWith("...")).toBe(true);
+  });
+
+  it("cuts by code point, never leaving half a surrogate pair", () => {
+    const wide = "\u{20000}".repeat(VALIDATION_DETAIL_MAX_LENGTH);
+    const text = errorDetail(axiosLike(422, [{ msg: wide }]), FALLBACK);
+    expect(Array.from(text)).toHaveLength(VALIDATION_DETAIL_MAX_LENGTH);
+    expect(text).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+  });
+
+  it("leaves a long plain string alone (only the 422 list is bounded)", () => {
+    const long = "y".repeat(VALIDATION_DETAIL_MAX_LENGTH * 2);
+    expect(errorDetail(axiosLike(400, long), FALLBACK)).toBe(long);
+  });
+});
 
 const DETAIL: TopologyUnconnectableDetail = {
   error: "topology_unconnectable",
@@ -274,7 +382,8 @@ describe("configApplyErrorText (issue #1098)", () => {
     expect(
       configApplyErrorText(axiosLike(500, { error: "driver_cannot_configure" }), "Apply failed"),
     ).toBe("Apply failed");
-    expect(configApplyErrorText(axiosLike(422, [{ msg: "bad" }]), "Schedule failed")).toBe(
+    // A 422 list entry without a string msg is not readable text (issue #1314).
+    expect(configApplyErrorText(axiosLike(422, [{ type: "bad" }]), "Schedule failed")).toBe(
       "Schedule failed",
     );
     expect(configApplyErrorText(new Error("network"), "Apply request failed")).toBe(
@@ -381,7 +490,7 @@ describe("loginRetryAfterSeconds and loginRetryAfterText", () => {
   });
 
   it("writes the sentence itself when the 429 detail is not a string", () => {
-    expect(loginRetryAfterText(locked({}, [{ msg: "x" }]))).toBe(
+    expect(loginRetryAfterText(locked({}, { msg: "x" }))).toBe(
       "Too many failed login attempts; try again later",
     );
   });
