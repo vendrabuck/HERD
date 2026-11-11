@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useId, useRef } from "react";
 
 interface ConfirmDialogProps {
   open: boolean;
@@ -22,6 +22,9 @@ export function ConfirmDialog({
   onCancel,
 }: ConfirmDialogProps) {
   const dialogRef = useRef<HTMLDialogElement>(null);
+  // Per-instance ids (issue #1318): one ConfirmDialog is mounted per list row.
+  const titleId = useId();
+  const descId = useId();
   // Hold the latest onCancel in a ref so the native 'cancel' listener below can
   // be installed once and still call the current callback on every invocation.
   const onCancelRef = useRef(onCancel);
@@ -54,14 +57,14 @@ export function ConfirmDialog({
     <dialog
       ref={dialogRef}
       className="m-auto rounded-lg shadow-xl border border-gray-200 p-0 backdrop:bg-black/40 max-w-sm w-full"
-      aria-labelledby="confirm-dialog-title"
-      aria-describedby="confirm-dialog-desc"
+      aria-labelledby={titleId}
+      aria-describedby={descId}
     >
       <div className="p-6">
-        <h2 id="confirm-dialog-title" className="text-lg font-semibold text-gray-900 mb-2">
+        <h2 id={titleId} className="text-lg font-semibold text-gray-900 mb-2">
           {title}
         </h2>
-        <p id="confirm-dialog-desc" className="text-sm text-gray-600 mb-6">
+        <p id={descId} className="text-sm text-gray-600 mb-6">
           {description}
         </p>
         <div className="flex justify-end gap-3">

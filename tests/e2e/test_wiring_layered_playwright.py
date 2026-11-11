@@ -406,7 +406,7 @@ def test_wiring_tab_layered_l2_membership_retry_and_release(pw_page):
         row.click()
 
         dialog = pw_page.locator("dialog[open]")
-        expect(dialog.locator("#modal-title")).to_have_text("Reservation")
+        expect(dialog).to_have_accessible_name("Reservation")
         dialog.get_by_role("button", name="Wiring", exact=True).click()
 
         expect(dialog.get_by_text("L2 VLAN memberships", exact=True)).to_be_visible()
@@ -478,7 +478,7 @@ def test_wiring_tab_layered_l2_membership_retry_and_release(pw_page):
         expect(row).to_be_visible()
         row.click()
         dialog = pw_page.locator("dialog[open]")
-        expect(dialog.locator("#modal-title")).to_have_text("Reservation")
+        expect(dialog).to_have_accessible_name("Reservation")
         dialog.get_by_role("button", name="Wiring", exact=True).click()
         expect(dialog.get_by_text("L2 VLAN memberships", exact=True)).to_be_visible()
         expect(dialog.get_by_text("RELEASED", exact=True).first).to_be_visible()

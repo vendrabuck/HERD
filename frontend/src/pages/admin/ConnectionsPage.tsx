@@ -320,12 +320,8 @@ export function ConnectionsPage() {
         </div>
       </div>
 
-      {/* Both create surfaces mount only while open: Modal hardcodes
-          id="modal-title", so two mounted Modals would put duplicate ids in the
-          document and every aria-labelledby would resolve to the first one. */}
-      {showCreate && (
       <Modal
-        open
+        open={showCreate}
         onClose={closeCreateModal}
         title="Create Connection"
         className="max-w-lg"
@@ -494,7 +490,6 @@ export function ConnectionsPage() {
           </div>
         </div>
       </Modal>
-      )}
 
       {/* Mounted only while open so its device/port queries never run in the
           background behind the single-pair modal. */}

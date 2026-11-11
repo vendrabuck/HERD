@@ -141,8 +141,11 @@ describe("ConnectionsPage", () => {
     expect(
       await screen.findByRole("dialog", { name: /Create multiple connections/i }),
     ).toBeInTheDocument();
-    // The single-pair form is not mounted at all in multi mode.
-    expect(screen.queryByText("Port A")).not.toBeInTheDocument();
+    // The single-pair Modal stays mounted but closed in multi mode (issue
+    // #1318 removed the mount-only-while-open workaround); a closed dialog is
+    // out of the accessibility tree, so no dialog carries its name.
+    expect(screen.queryByRole("dialog", { name: "Create Connection" })).toBe(null);
+    expect(screen.getByText("Port A").closest("dialog")).not.toHaveAttribute("open");
   });
 
   it("the Single toggle switches the create button back to the single-pair modal", async () => {

@@ -219,7 +219,7 @@ def test_drop_attach_save_reload_validate(pw_page):
         pw_page.mouse.up()
 
         dialog = pw_page.locator("dialog[open]")
-        expect(dialog.locator("#modal-title")).to_have_text(
+        expect(dialog).to_have_accessible_name(
             f"Attach {device['name']} to VLAN segment", timeout=10_000
         )
 
