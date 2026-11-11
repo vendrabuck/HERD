@@ -2,7 +2,12 @@ import { useState, useEffect, useMemo } from "react";
 import { Link } from "react-router-dom";
 import toast from "react-hot-toast";
 import { TOAST_CLEARANCE_CLASS } from "@/lib/toastClearance";
-import { loginRetryAfterSeconds, loginRetryAfterText } from "@/lib/errors";
+import {
+  errorDetail,
+  loginRetryAfterSeconds,
+  loginRetryAfterText,
+  structuredDetail,
+} from "@/lib/errors";
 import { ArrowLeft, Eye, EyeOff, ChevronDown, ChevronRight } from "lucide-react";
 import { useConfigStore } from "@/stores/configStore";
 import {
@@ -346,9 +351,15 @@ function ConfigEditor() {
       await saveSettings.mutateAsync(values);
       toast.success("Configuration saved");
     } catch (err: unknown) {
+      // The config service refuses an invalid value with 422 {errors: [string]}.
+      const invalid = structuredDetail<{ errors: unknown[] }>(err, 422, (d) =>
+        Array.isArray(d.errors),
+      );
+      const first = invalid?.errors[0];
       const msg =
-        (err as { response?: { data?: { detail?: { errors?: string[] } } } })?.response
-          ?.data?.detail?.errors?.[0] ?? "Failed to save configuration";
+        typeof first === "string" && first
+          ? first
+          : errorDetail(err, "Failed to save configuration");
       toast.error(msg);
     }
   };

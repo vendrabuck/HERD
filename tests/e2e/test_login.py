@@ -49,7 +49,7 @@ def test_login_failure_shows_error(browser, base_url):
     submit.click()
 
     # Wait for error toast to appear (use visibility, not just presence)
-    error_xpath = "//*[contains(text(), 'Invalid email or password')]"
+    error_xpath = "//*[contains(text(), 'Invalid credentials')]"
     wait.until(EC.visibility_of_element_located((By.XPATH, error_xpath)))
 
 

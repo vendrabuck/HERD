@@ -4,6 +4,7 @@ import toast from "react-hot-toast";
 import { usePaginatedDeviceGroups, useDeleteDeviceGroup } from "@/api/deviceGroups";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
+import { errorDetail } from "@/lib/errors";
 import { ROW_PRIMARY_CONTROL_CLASS, rowClick } from "@/lib/rowNavigation";
 
 export function DeviceGroupsPage() {
@@ -22,9 +23,7 @@ export function DeviceGroupsPage() {
       await deleteGroup.mutateAsync(deleteId);
       toast.success("Device group deleted");
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to delete device group";
+      const msg = errorDetail(err, "Failed to delete device group");
       toast.error(msg);
     }
     setDeleteId(null);

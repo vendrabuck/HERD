@@ -17,6 +17,7 @@ import type {
   FieldDefinition,
   SectionDefinition,
 } from "@/types/template.types";
+import { errorDetail } from "@/lib/errors";
 
 const DEFAULT_FIELD: FieldDefinition = {
   key: "",
@@ -112,9 +113,7 @@ export function TemplateEditorPage() {
         `Suggested: ${suggestion.vendor}, ${suggestion.model} (confidence: ${suggestion.confidence})`,
       );
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to suggest identity";
+      const msg = errorDetail(err, "Failed to suggest identity");
       toast.error(msg);
     }
   };
@@ -266,9 +265,7 @@ export function TemplateEditorPage() {
         setEditing(false);
       }
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to save template";
+      const msg = errorDetail(err, "Failed to save template");
       toast.error(msg);
     }
   };

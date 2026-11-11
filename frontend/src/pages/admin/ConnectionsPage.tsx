@@ -14,6 +14,7 @@ import { Pagination } from "@/components/ui/Pagination";
 import { MultiConnectDialog } from "@/components/admin/connections/MultiConnectDialog";
 import { cn } from "@/lib/cn";
 import type { ConnectionCreate } from "@/types/connection.types";
+import { errorDetail } from "@/lib/errors";
 
 // The multi-connection dialog is the default create surface; the original
 // single-pair modal survives behind this toggle, the same way the topology
@@ -109,9 +110,7 @@ export function ConnectionsPage() {
       toast.success("Connection created");
       closeCreateModal();
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to create connection";
+      const msg = errorDetail(err, "Failed to create connection");
       toast.error(msg);
     }
   };
@@ -135,9 +134,7 @@ export function ConnectionsPage() {
       await deleteConnection.mutateAsync(deleteId);
       toast.success("Connection deleted");
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to delete connection";
+      const msg = errorDetail(err, "Failed to delete connection");
       toast.error(msg);
     }
     setDeleteId(null);

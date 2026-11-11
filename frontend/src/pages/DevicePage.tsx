@@ -18,6 +18,7 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { DeviceInfoPanel } from "@/components/inventory/DeviceInfoPanel";
 import { deviceEditPayload, type DeviceEditFields } from "@/lib/deviceEdit";
 import type { TopologyType, DeviceStatus } from "@/types/device.types";
+import { errorDetail } from "@/lib/errors";
 
 const STATUS_COLORS: Record<string, string> = {
   AVAILABLE: "bg-green-100 text-green-800",
@@ -93,9 +94,7 @@ export function DevicePage() {
       toast.success("Device updated");
       setEditing(false);
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to update device";
+      const msg = errorDetail(err, "Failed to update device");
       toast.error(msg);
     }
   };
