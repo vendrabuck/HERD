@@ -754,6 +754,20 @@ def test_a_boundary_inside_an_excluded_region_is_not_a_boundary(manual: Path, wr
     assert _records(manual, "guide.html")[2]["text"] == "Body two."
 
 
+def test_an_excluded_sectitle_right_after_a_section_h2_is_not_its_heading(manual: Path):
+    _edit(
+        manual / "guide.html",
+        '<p class="sectitle">Title one</p>',
+        '<p class="sectitle foot">Hidden title</p>',
+    )
+    assert _records(manual, "guide.html")[1] == {
+        "anchor": "first",
+        "heading": "Eyebrow one",
+        "eyebrow": "",
+        "text": "Body one.",
+    }
+
+
 def test_text_between_a_section_h2_and_a_sectitle_cancels_the_sectitle(manual: Path):
     _edit(
         manual / "guide.html",

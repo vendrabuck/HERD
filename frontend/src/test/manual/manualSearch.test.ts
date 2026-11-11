@@ -348,9 +348,9 @@ describe("result shape", () => {
 
   it("never cuts a snippet between the halves of a surrogate pair", () => {
     const emoji = "\u{1F600}";
-    // No spaces, so the cut falls back to fixed offsets that land on even indexes,
-    // which are low surrogates after the two-letter prefix.
-    const text = "xy" + emoji.repeat(150) + "needle" + emoji.repeat(150);
+    // No spaces, so both cuts fall back to fixed offsets; the "!" on each side of the
+    // match shifts the pairs by one, so those offsets land on low surrogates.
+    const text = "xy" + emoji.repeat(150) + "!needle!" + emoji.repeat(150);
     const [r] = S.search(index([PAGE], [sec("a", "A", text)]), "needle").results;
     const snippet = joined(r.snippetParts);
     expect(snippet).toContain("needle");
