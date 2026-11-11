@@ -97,7 +97,7 @@ def test_driver_upload_and_delete(pw_page):
         pw_page.get_by_role("button", name="Upload Driver").click()
 
         dialog = pw_page.locator("dialog[open]")
-        expect(dialog.locator("#modal-title")).to_have_text("Upload Driver")
+        expect(dialog).to_have_accessible_name("Upload Driver")
 
         pw_page.fill("#driver-name", driver_name)
         pw_page.fill("#driver-desc", "e2e-pw mock l1 driver")
@@ -128,7 +128,7 @@ def test_driver_upload_and_delete(pw_page):
         row.get_by_role("button", name="Delete", exact=True).click()
 
         confirm = pw_page.locator("dialog[open]")
-        expect(confirm.locator("#confirm-dialog-title")).to_have_text("Delete Driver")
+        expect(confirm).to_have_accessible_name("Delete Driver")
         confirm.get_by_role("button", name="Delete", exact=True).click()
         expect(pw_page.locator("tr", has_text=driver_name)).to_have_count(0)
 
@@ -250,7 +250,7 @@ def test_connection_create_and_delete_own_devices(pw_page):
         pw_page.get_by_role("button", name="Single", exact=True).click()
         pw_page.get_by_role("button", name="Create Connection").click()
         dialog = pw_page.locator("dialog[open]")
-        expect(dialog.locator("#modal-title")).to_have_text("Create Connection")
+        expect(dialog).to_have_accessible_name("Create Connection")
 
         _select_device(pw_page, device_a["name"])
         expect(dialog.get_by_text(device_a["name"], exact=True)).to_be_visible()

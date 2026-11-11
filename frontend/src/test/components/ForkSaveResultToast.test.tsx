@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import { cleanup, render, screen, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi } from "vitest";
 
 import { ForkSaveResultToast } from "@/components/topology-editor/ForkSaveResultToast";
@@ -162,5 +162,84 @@ describe("ForkSaveResultToast", () => {
     };
     expect(skippedEdgeText(edge)).toBe("dev-a p1 to 01234567 p2");
     expect(skippedEdgeText(edge, { "dev-a": "A", "0123456789ab": "B" })).toBe("A p1 to B p2");
+  });
+});
+
+// Issue #1321: the summary reports every layer the save reports. Connection
+// deltas (L1, L2, and L3 wires alike) count in the first line; the routing
+// intent reconcile's l3_routes_built and l3_routes_released get a line of
+// their own whenever either is non-zero.
+describe("ForkSaveResultToast layer summary (issue #1321)", () => {
+  const EMPTY: ForkSaveResult = {
+    fork_id: "f-1",
+    version_number: 7,
+    released: [],
+    built: [],
+    unchanged_count: 3,
+    l3_routes_built: 0,
+    l3_routes_released: 0,
+  };
+  const wire = (layer: string) => ({
+    device_a_id: "aaaaaaaa1111",
+    port_a: "eth1",
+    device_b_id: "bbbbbbbb2222",
+    port_b: "eth2",
+    layer,
+  });
+
+  function summary(result: ForkSaveResult): string[] {
+    const { container } = render(<ForkSaveResultToast result={result} onDismiss={vi.fn()} />);
+    return Array.from(container.querySelectorAll("p.text-xs")).map((p) => p.textContent ?? "");
+  }
+
+  it("L1 only: the connection line counts the wire, no route line", () => {
+    expect(summary({ ...EMPTY, built: [wire("L1")] })).toEqual([
+      "Released 0, built 1, unchanged 3",
+    ]);
+  });
+
+  it("L2 only: the connection line counts the wire, no route line", () => {
+    expect(summary({ ...EMPTY, released: [wire("L2")] })).toEqual([
+      "Released 1, built 0, unchanged 3",
+    ]);
+  });
+
+  it("L3 routes only: a routing-only commit reports the routes it built and released", () => {
+    expect(summary({ ...EMPTY, l3_routes_built: 2 })).toEqual([
+      "Released 0, built 0, unchanged 3",
+      "Routes released 0, built 2",
+    ]);
+    cleanup();
+    expect(summary({ ...EMPTY, l3_routes_released: 1 })).toEqual([
+      "Released 0, built 0, unchanged 3",
+      "Routes released 1, built 0",
+    ]);
+  });
+
+  it("mixed: wires on every layer plus routes are all reported", () => {
+    expect(
+      summary({
+        ...EMPTY,
+        released: [wire("L1"), wire("L3")],
+        built: [wire("L2")],
+        l3_routes_built: 3,
+        l3_routes_released: 2,
+      }),
+    ).toEqual(["Released 2, built 1, unchanged 3", "Routes released 2, built 3"]);
+  });
+
+  it("all zero: only the connection line, no route line", () => {
+    expect(summary(EMPTY)).toEqual(["Released 0, built 0, unchanged 3"]);
+    expect(screen.queryByText(/Routes/)).not.toBeInTheDocument();
+  });
+
+  it("an older response without the route fields reads as zero routes", () => {
+    const {
+      l3_routes_built: _built,
+      l3_routes_released: _released,
+      ...older
+    } = { ...EMPTY, built: [wire("L2")] };
+    expect(summary(older)).toEqual(["Released 0, built 1, unchanged 3"]);
+    expect(screen.queryByText(/Routes/)).not.toBeInTheDocument();
   });
 });

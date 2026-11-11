@@ -49,7 +49,7 @@ def test_connection_create_and_delete(pw_page):
         pw_page.get_by_role("button", name="Single", exact=True).click()
         pw_page.get_by_role("button", name="Create Connection").click()
         dialog = pw_page.locator("dialog[open]")
-        expect(dialog.locator("#modal-title")).to_have_text("Create Connection")
+        expect(dialog).to_have_accessible_name("Create Connection")
 
         # Scoped to the dialog: the connections table underneath can already
         # list many existing rows for these device names (e.g. a hub cabled

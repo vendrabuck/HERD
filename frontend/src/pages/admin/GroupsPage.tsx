@@ -1,10 +1,11 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
 import { usePaginatedGroups, useDeleteGroup } from "@/api/groups";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import { errorDetail } from "@/lib/errors";
+import { ROW_PRIMARY_CONTROL_CLASS, rowClick } from "@/lib/rowNavigation";
 
 export function GroupsPage() {
   const navigate = useNavigate();
@@ -62,9 +63,13 @@ export function GroupsPage() {
                     <tr
                       key={group.id}
                       className="hover:bg-gray-50 cursor-pointer"
-                      onClick={() => navigate(`/admin/groups/${group.id}`)}
+                      onClick={rowClick(() => navigate(`/admin/groups/${group.id}`))}
                     >
-                      <td className="px-4 py-3 font-medium text-gray-900">{group.name}</td>
+                      <td className="px-4 py-3 font-medium text-gray-900">
+                        <Link to={`/admin/groups/${group.id}`} className={ROW_PRIMARY_CONTROL_CLASS}>
+                          {group.name}
+                        </Link>
+                      </td>
                       <td className="px-4 py-3 text-gray-600">
                         {group.description || "-"}
                       </td>

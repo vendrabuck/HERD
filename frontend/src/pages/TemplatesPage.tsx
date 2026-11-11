@@ -1,10 +1,11 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
 import { useQueryClient } from "@tanstack/react-query";
 import { usePaginatedTemplates, useDeleteTemplate, useCreateTemplate } from "@/api/templates";
 import { useAuthStore } from "@/stores/authStore";
 import { isAdminRole } from "@/lib/roles";
+import { ROW_PRIMARY_CONTROL_CLASS, rowClick } from "@/lib/rowNavigation";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import { BulkImportExport } from "@/components/ui/BulkImportExport";
@@ -194,7 +195,7 @@ export function TemplatesPage() {
                   <tr
                     key={t.id}
                     className="border-b border-gray-100 hover:bg-gray-50 cursor-pointer"
-                    onClick={() => navigate(`/templates/${t.id}`)}
+                    onClick={rowClick(() => navigate(`/templates/${t.id}`))}
                   >
                     <td className="px-4 py-2">
                       {t.icon ? (
@@ -208,7 +209,9 @@ export function TemplatesPage() {
                       )}
                     </td>
                     <td className="px-4 py-2 text-sm font-medium text-gray-900">
-                      {t.name}
+                      <Link to={`/templates/${t.id}`} className={ROW_PRIMARY_CONTROL_CLASS}>
+                        {t.name}
+                      </Link>
                     </td>
                     <td className="px-4 py-2 text-sm text-gray-500 capitalize">
                       {t.template_type}

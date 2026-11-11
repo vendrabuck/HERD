@@ -42,6 +42,7 @@ import {
 } from "@/lib/reservationFilters";
 import type { ReservationFilterState, ReservationPeriod } from "@/lib/reservationFilters";
 import { purposeCategoryLabel } from "@/lib/purposeCategories";
+import { ROW_PRIMARY_CONTROL_CLASS, reservationOpenLabel, rowClick } from "@/lib/rowNavigation";
 import { Pagination } from "@/components/ui/Pagination";
 import { FilterSelect, ListFilterLayout, ListFilterPanel } from "@/components/ui/ListFilterPanel";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
@@ -142,7 +143,7 @@ function ReservationRow({
   return (
     <tr
       className={`border-b border-gray-100 hover:bg-gray-50 cursor-pointer ${selected ? "bg-blue-50" : ""}`}
-      onClick={onClick}
+      onClick={rowClick(onClick)}
     >
       <td className="px-2.5 py-3 w-8" onClick={(e) => e.stopPropagation()}>
         <input
@@ -153,7 +154,18 @@ function ReservationRow({
           className="h-4 w-4 rounded border-gray-300"
         />
       </td>
-      <td className="px-2.5 py-3 text-sm font-mono text-gray-500">{shortId}</td>
+      <td className="px-2.5 py-3 text-sm font-mono text-gray-500">
+        {/* The reservation detail is a dialog, not a route, so the primary
+            control is a button (issue #1317). */}
+        <button
+          type="button"
+          onClick={onClick}
+          aria-label={reservationOpenLabel(shortId, reservation.purpose)}
+          className={ROW_PRIMARY_CONTROL_CLASS}
+        >
+          {shortId}
+        </button>
+      </td>
       <td
         className="px-2.5 py-3 text-sm text-gray-500 max-w-20 truncate"
         title={reservation.owner_name || reservation.user_id}
