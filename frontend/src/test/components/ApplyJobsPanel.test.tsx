@@ -151,10 +151,11 @@ describe("ApplyJobsPanel (CFG-UI-5)", () => {
   });
 
   it("never toasts an object detail; a non-string refusal falls back", async () => {
+    // A list entry without a string msg has no readable text (issue #1314).
     server.use(
       http.get(JOBS_URL, () => HttpResponse.json(page([makeJob()]))),
       http.delete("/api/inventory/apply-jobs/:id", () =>
-        HttpResponse.json({ detail: [{ msg: "bad id" }] }, { status: 422 }),
+        HttpResponse.json({ detail: [{ type: "uuid_parsing" }] }, { status: 422 }),
       ),
     );
     const user = userEvent.setup();

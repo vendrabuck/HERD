@@ -6,6 +6,7 @@ import { describe, it, expect } from "vitest";
 
 import { server } from "../mocks/server";
 import {
+  deleteDeviceErrorMessage,
   useDevice,
   useDevices,
   usePaginatedDevices,
@@ -353,5 +354,25 @@ describe("hydrateCanvasNodes", () => {
     // Even with no fresh data, the node must render through DeviceNode, not the
     // blank default renderer, so the discriminator is set regardless.
     expect(hydrated.nodes[0].type).toBe("deviceNode");
+  });
+});
+
+describe("deleteDeviceErrorMessage text shapes (issue #1314)", () => {
+  const err = (detail: unknown) => ({ response: { status: 409, data: { detail } } });
+
+  it("never returns an empty string: a blank detail falls back", () => {
+    expect(deleteDeviceErrorMessage(err(""))).toBe("Failed to delete device");
+    expect(deleteDeviceErrorMessage(err("   "))).toBe("Failed to delete device");
+  });
+
+  it("passes a string detail through, bounded", () => {
+    expect(deleteDeviceErrorMessage(err("Device not found"))).toBe("Device not found");
+    expect(deleteDeviceErrorMessage(err("x".repeat(5000)))).toHaveLength(1000);
+  });
+
+  it("reads a 422 list as its text and falls back for any other shape", () => {
+    expect(deleteDeviceErrorMessage(err([{ loc: ["path", "id"], msg: "bad" }]))).toBe("id: bad");
+    expect(deleteDeviceErrorMessage(err({ error: "other" }))).toBe("Failed to delete device");
+    expect(deleteDeviceErrorMessage(err(42))).toBe("Failed to delete device");
   });
 });

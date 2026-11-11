@@ -70,7 +70,7 @@ export function DeviceConfigSection({ deviceId }: Props) {
       setCreateDescription("");
       toast.success("Config version created");
     } catch (err: unknown) {
-      setCreateError(errorDetail(err, err instanceof Error ? err.message : "Failed"));
+      setCreateError(errorDetail(err, "Could not save the config version. Try again."));
     }
   };
 

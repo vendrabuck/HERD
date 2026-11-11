@@ -14,6 +14,7 @@ import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import toast from "react-hot-toast";
+import { errorDetail } from "@/lib/errors";
 
 export function TopologyTemplatesPage() {
   const user = useAuthStore((s) => s.user);
@@ -188,8 +189,7 @@ function InstantiateTemplateDialog({
       });
       onCreated(topology.id);
     } catch (err: unknown) {
-      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      toast.error(detail ?? "Instantiate failed");
+      toast.error(errorDetail(err, "Instantiate failed"));
     }
   };
 
