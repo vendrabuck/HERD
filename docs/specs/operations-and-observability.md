@@ -658,9 +658,13 @@ service's lifespan; `infra/postgres/init.sql`; the upgrade order in
   Pinned by: `services/common/tests/test_consumer_schema_gate.py` (`test_stop_cancels_pending_gate`, `test_stop_is_noop_when_never_gated`, `test_cancel_mid_query_does_not_leak_the_connection`)
 - **OPS-SCHEMA-9.** Service schemas are created by `infra/postgres/init.sql`, which runs
   only on an empty data volume; a new service's schema on an existing volume needs that
-  volume recreated or the schema created by hand. \
-  Enforced in: `infra/postgres/init.sql` (`CREATE SCHEMA`) \
-  Pinned by: none
+  volume recreated or the schema created by hand. The file names no role and no
+  database: it runs as `POSTGRES_USER` connected to `POSTGRES_DB`, that role owns the
+  schemas it creates, and the database search path is set through
+  `current_database()`, so any `POSTGRES_USER` and `POSTGRES_DB` initialize (issue
+  #1325). \
+  Enforced in: `infra/postgres/init.sql` (`CREATE SCHEMA`, `current_database`) \
+  Pinned by: `tests/unit/test_postgres_init.py` (`test_init_files_name_no_role_or_database`, `test_init_sql_still_creates_every_service_schema_and_sets_the_search_path`)
 
 **Out of scope.** Each service's own migrations. Which consumers use the gate
 (`provisioning-and-wiring.md`, WIRE-CONSUME-5, and `integration.md`).
@@ -1575,7 +1579,6 @@ None at present.
 - OPS-BUILD-1: the Makefile's build identifier and date.
 - OPS-LOG-9: the config service's plain-text logging.
 - OPS-SET-9: settings read once at import.
-- OPS-SCHEMA-9: schemas created only on an empty volume.
 - OPS-OUTBOX-14: the relay does not republish an acknowledged event.
 - OPS-NATS-13: JetStream store durability under `make prod`.
 - OPS-HEALTH-10: the device check writes no health status row and stages no event.
