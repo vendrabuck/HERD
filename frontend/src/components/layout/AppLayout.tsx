@@ -6,6 +6,7 @@ import { isAdminRole } from "@/lib/roles";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { HelpCircle } from "lucide-react";
 import { NotificationBell } from "@/components/NotificationBell";
+import { RouteErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { APP_VERSION } from "@/lib/appVersion";
 import { MANUAL_URL } from "@/lib/links";
 import { displayName } from "@/lib/profileEdit";
@@ -272,7 +273,9 @@ export function AppLayout() {
       </header>
 
       <div className="flex-1 overflow-hidden">
-        <Outlet />
+        <RouteErrorBoundary>
+          <Outlet />
+        </RouteErrorBoundary>
       </div>
     </div>
   );
