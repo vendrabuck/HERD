@@ -13,14 +13,20 @@ What is read: every file docker-compose.yml mounts under
 `/docker-entrypoint-initdb.d/` (the init files), with `--` comments and the contents
 of single-quoted strings blanked out, except that a string right after `format(`, or
 right after a `||`, is kept, since that is SQL the script executes. In what remains,
-the guard fails on a statement that names a role or a database: `GRANT ... TO`, `REVOKE ... FROM`,
-`OWNER TO`, `AUTHORIZATION`, `CREATE`, `ALTER`, or `DROP` of a `ROLE`, `USER`, or
-`DATABASE` followed by anything but the `%I` placeholder, `SET ROLE`, `SET SESSION
-AUTHORIZATION`, and psql's `\\c` or `\\connect`; and on the word `herd`, the default
-user and database name, anywhere.
+the guard fails on a statement that names a role or a database: `GRANT ... TO`,
+`REVOKE ... FROM`, `OWNER TO`, `AUTHORIZATION`, `REASSIGN OWNED BY`, `DROP OWNED BY`,
+`FOR ROLE` or `FOR USER`, `CREATE`, `ALTER`, or `DROP` of a `ROLE`, `USER`, or
+`DATABASE` and `COMMENT ON DATABASE`, each followed by anything but the `%I`
+placeholder, `SET ROLE`, `SET SESSION AUTHORIZATION`, and psql's `\\c` or
+`\\connect`; and on the word `herd`, the default user and database name, anywhere.
+Separately, with comments removed but strings intact, every `format(...)` call is
+split into its top-level arguments, and an argument after the template that holds a
+quoted string fails: a literal name passed as a `format()` argument (only computed
+values such as `current_database()` pass).
 
 Limits: read as text, never run against Postgres. Not seen: a name built at run time
-(`EXECUTE` of a variable, a name in a string that neither follows `format(` nor `||`),
+(`EXECUTE` of a variable; a name in a string that neither follows `format(` or `||`
+nor is an argument of `format()`, such as `quote_ident('lab')`),
 a block comment (`/* */`), and an init file mounted by a compose file other than
 docker-compose.yml. Dollar-quoted text (a `DO $$ ... $$` body) is read as SQL, not as
 a string.
@@ -49,6 +55,12 @@ _FORBIDDEN = [
         "names a role or database",
     ),
     (re.compile(r"\bSET\s+ROLE\b", re.I), "SET ROLE names a role"),
+    (
+        re.compile(r"\bCOMMENT\s+ON\s+DATABASE\s+(?!%I\b)", re.I),
+        "COMMENT ON DATABASE names a database",
+    ),
+    (re.compile(r"\b(REASSIGN|DROP)\s+OWNED\s+BY\b", re.I), "OWNED BY names a role"),
+    (re.compile(r"\bFOR\s+(ROLE|USER)\b", re.I), "FOR ROLE names a role"),
     (re.compile(r"^\s*\\c(onnect)?\b", re.I | re.M), "psql \\connect names a database"),
     (re.compile(r"\bherd\b", re.I), "names herd, the default user and database"),
 ]
@@ -96,9 +108,76 @@ def _executed_text(sql: str) -> str:
     return "".join(out)
 
 
+def _without_comments(sql: str) -> str:
+    """The SQL with `--` comments removed and every string left intact."""
+    out = []
+    i = 0
+    in_string = False
+    while i < len(sql):
+        c = sql[i]
+        if in_string:
+            out.append(c)
+            if c == "'":
+                if sql.startswith("''", i):
+                    out.append("'")
+                    i += 2
+                    continue
+                in_string = False
+        elif c == "'":
+            in_string = True
+            out.append(c)
+        elif sql.startswith("--", i):
+            end = sql.find("\n", i)
+            i = len(sql) if end == -1 else end
+            continue
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def format_arguments(sql: str) -> list[list[str]]:
+    """The top-level arguments of every `format(...)` call, comments removed."""
+    text = _without_comments(sql)
+    calls = []
+    for match in re.finditer(r"\bformat\s*\(", text, re.I):
+        i, depth, in_string = match.end(), 1, False
+        args, current = [], []
+        while i < len(text) and depth:
+            c = text[i]
+            if in_string:
+                if c == "'" and text.startswith("''", i):
+                    current.append("''")
+                    i += 2
+                    continue
+                in_string = c != "'"
+            elif c == "'":
+                in_string = True
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            elif c == "," and depth == 1:
+                args.append("".join(current))
+                current = []
+                i += 1
+                continue
+            if depth:
+                current.append(c)
+            i += 1
+        args.append("".join(current))
+        calls.append([a.strip() for a in args])
+    return calls
+
+
 def init_problems(sql: str) -> list[str]:
     text = _executed_text(sql)
-    problems = []
+    problems = [
+        f"a literal passed to format() as an argument names a role or database: {arg!r}"
+        for args in format_arguments(sql)
+        for arg in args[1:]
+        if "'" in arg
+    ]
     for statement in text.split(";"):
         for pattern, why in _FORBIDDEN:
             m = pattern.search(statement)
@@ -160,6 +239,12 @@ def test_init_sql_still_creates_every_service_schema_and_sets_the_search_path():
         "\\connect lab",
         "DO $$ BEGIN EXECUTE format('ALTER DATABASE herd SET x TO y'); END $$;",
         "DO $$ BEGIN EXECUTE format('GRANT ALL ON SCHEMA a ' || 'TO someone'); END $$;",
+        "COMMENT ON DATABASE lab IS 'x';",
+        "REASSIGN OWNED BY labadmin TO postgres;",
+        "DROP OWNED BY labadmin;",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE labadmin IN SCHEMA a REVOKE ALL ON TABLES FROM PUBLIC;",
+        "DO $$ BEGIN EXECUTE format('ALTER DATABASE %I SET search_path TO public', 'lab'); END $$;",
+        "DO $$ BEGIN EXECUTE format('COMMENT ON DATABASE %I IS %L', 'lab', 'x'); END $$;",
     ],
 )
 def test_detector_refuses_a_literal_role_or_database(sql):
@@ -174,6 +259,9 @@ def test_detector_refuses_a_literal_role_or_database(sql):
         "DO $$ BEGIN EXECUTE format('ALTER DATABASE %I SET search_path TO public, a', "
         "current_database()); END $$;",
         "COMMENT ON SCHEMA a IS 'owned by the herd user';",
+        "DO $$ BEGIN EXECUTE format('COMMENT ON DATABASE %I IS ''x''', "
+        "current_database()); END $$;",
+        "SELECT format('%s', upper(current_user));",
     ],
 )
 def test_detector_passes_name_free_sql(sql):

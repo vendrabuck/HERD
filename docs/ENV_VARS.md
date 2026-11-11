@@ -56,10 +56,10 @@ Read by every database service (auth, inventory, reservations, cabling, acl, exe
 | Variable | Default | Purpose |
 |---|---|---|
 | `DB_POOL_SIZE` | `5` | Connections a service process keeps open in its pool. At least 1. |
-| `DB_MAX_OVERFLOW` | `5` | Extra connections a process may open beyond `DB_POOL_SIZE` under load, closed again when returned. At least 0. |
+| `DB_MAX_OVERFLOW` | `10` | Extra connections a process may open beyond `DB_POOL_SIZE` under load, closed again when returned. At least 0. |
 | `DB_POOL_PRE_PING` | `true` | Test a pooled connection with a round trip before handing it out, so a connection that died in a Postgres restart is replaced instead of failing one request. |
 
-The budget: one service process opens at most `DB_POOL_SIZE + DB_MAX_OVERFLOW` connections, so the eleven database services open at most 11 x (5 + 5) = 110 with the defaults. The compose `postgres` service runs with `-c max_connections=200`, which leaves 200 - 110 = 90 for psql sessions, `make migrate`, and the Postgres-live test suites. Each extra execution replica (`EXECUTION_POLLER_ONLY=true`) adds another 10. Raising either variable on all eleven services by one adds 11. SQLite URLs (the services' unit tests) take only `DB_POOL_PRE_PING`: SQLAlchemy chooses their pool, and the in-memory one refuses size arguments. `tests/unit/test_compose_capacity.py` fails when the compose defaults add up to more than `max_connections`.
+The budget: one service process opens at most `DB_POOL_SIZE + DB_MAX_OVERFLOW` connections, so the eleven database services open at most 11 x (5 + 10) = 165 with the defaults, which are SQLAlchemy's own pool defaults made explicit. The compose `postgres` service runs with `-c max_connections=200`, which leaves 200 - 165 = 35 for psql sessions, `make migrate`, and the Postgres-live test suites. Each extra execution replica (`EXECUTION_POLLER_ONLY=true`) adds another 15. Raising either variable on all eleven services by one adds 11. SQLite URLs (the services' unit tests) take only `DB_POOL_PRE_PING`: SQLAlchemy chooses their pool, and the in-memory one refuses size arguments. `tests/unit/test_compose_capacity.py` fails when the compose defaults add up to more than `max_connections`, and when this paragraph or docs/OPERATIONS.md stops stating the arithmetic the compose defaults give.
 
 ## Superadmin seed (first-run only)
 

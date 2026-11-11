@@ -96,14 +96,14 @@ def test_subclass_inherits_settings_customise_sources_without_override():
 # --- Database pool settings (issue #1352) ------------------------------------------
 
 
-def test_pool_settings_default_to_five_five_and_pre_ping(tmp_path, monkeypatch):
+def test_pool_settings_default_to_five_ten_and_pre_ping(tmp_path, monkeypatch):
     for name in ("DB_POOL_SIZE", "DB_MAX_OVERFLOW", "DB_POOL_PRE_PING"):
         monkeypatch.delenv(name, raising=False)
     base_settings = _reload_base_settings(monkeypatch, str(tmp_path / "absent.json"))
     settings = _representative_settings_cls(base_settings)()
     assert (settings.db_pool_size, settings.db_max_overflow, settings.db_pool_pre_ping) == (
         5,
-        5,
+        10,
         True,
     )
 

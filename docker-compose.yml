@@ -113,7 +113,7 @@ services:
   # constraint would match no container and take every route down.
   traefik:
     logging: *default-logging
-    image: traefik:v3.6.10@sha256:c549d482c55d7a797398562064f35428cc53e748d84d7190997930e7b31bcc32
+    image: traefik:v3.7.18@sha256:9c437ac4f09ce6f4980a8544902d3475fdf70a1a7c578729581d2535dfa7d635
     command:
       - "--api.dashboard=true"
       - "--api.insecure=true"
@@ -163,8 +163,8 @@ services:
     logging: *default-logging
     image: postgres:16.15-alpine@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139
     # max_connections (issue #1352): the eleven database services hold at most
-    # 11 x (DB_POOL_SIZE + DB_MAX_OVERFLOW) = 11 x (5 + 5) = 110 connections with
-    # the defaults; 200 leaves 90 for psql sessions, `make migrate`, and the
+    # 11 x (DB_POOL_SIZE + DB_MAX_OVERFLOW) = 11 x (5 + 10) = 165 connections with
+    # the defaults; 200 leaves 35 for psql sessions, `make migrate`, and the
     # Postgres-live suites. Takes effect when the container is recreated.
     command: ["postgres", "-c", "max_connections=200"]
     environment:
@@ -225,7 +225,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: auth
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
@@ -292,7 +292,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: inventory
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
@@ -346,7 +346,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: reservations
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
@@ -413,7 +413,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: integration
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
@@ -467,7 +467,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: secrets
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
@@ -519,7 +519,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: acl
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
@@ -563,7 +563,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: user_profile
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
@@ -607,7 +607,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: notifications
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
@@ -672,7 +672,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: cabling
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
@@ -716,7 +716,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: execution
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
@@ -803,7 +803,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: ai_orchestrator
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}

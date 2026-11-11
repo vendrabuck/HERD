@@ -662,9 +662,11 @@ service's lifespan; `infra/postgres/init.sql`; the upgrade order in
   database: it runs as `POSTGRES_USER` connected to `POSTGRES_DB`, that role owns the
   schemas it creates, and the database search path is set through
   `current_database()`, so any `POSTGRES_USER` and `POSTGRES_DB` initialize (issue
-  #1325). \
+  #1325). That the file runs only on an empty data volume is the postgres image's
+  entrypoint behavior; no HERD test exercises it. The tests pin the file's text and,
+  against a running stack, that it ran to its last statement. \
   Enforced in: `infra/postgres/init.sql` (`CREATE SCHEMA`, `current_database`) \
-  Pinned by: `tests/unit/test_postgres_init.py` (`test_init_files_name_no_role_or_database`, `test_init_sql_still_creates_every_service_schema_and_sets_the_search_path`)
+  Pinned by: `tests/unit/test_postgres_init.py` (`test_init_files_name_no_role_or_database`, `test_init_sql_still_creates_every_service_schema_and_sets_the_search_path`); `tests/integration/test_postgres_init_applied.py` (`test_init_script_set_the_database_search_path`, `test_init_script_schemas_exist_and_belong_to_the_connected_user`)
 
 **Out of scope.** Each service's own migrations. Which consumers use the gate
 (`provisioning-and-wiring.md`, WIRE-CONSUME-5, and `integration.md`).

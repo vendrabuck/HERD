@@ -22,9 +22,11 @@ everything under it, a line starting with `!` re-includes, and the last matching
 line wins.
 
 What is read: every `build:` stanza in the compose files `tests/unit/test_image_pins.py`
-discovers (its `context` relative to the compose file, its `dockerfile` relative to
-the context, `Dockerfile` by default); for each, the ignore file Docker applies
-(`<Dockerfile>.dockerignore` beside the Dockerfile when it exists, otherwise
+discovers (the tracked files, through `git ls-files`, inside a git work tree; a
+filesystem walk only when git cannot list them, so an untracked local Dockerfile on a
+developer host is not judged): its `context` relative to the compose file, its
+`dockerfile` relative to the context (`Dockerfile` by default); for each, the ignore
+file Docker applies (`<Dockerfile>.dockerignore` beside the Dockerfile when it exists, otherwise
 `.dockerignore` at the context root); and in the Dockerfile every COPY and ADD
 without `--from=`, each word but the last being a source (flags dropped, the JSON
 form read as a list, globs matched against tracked files). Tracked files come from

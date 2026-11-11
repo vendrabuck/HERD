@@ -24,8 +24,9 @@ Connection pool (issue #1352): every service passes its `db_pool_size`,
 `db_max_overflow`, and `db_pool_pre_ping` settings (HerdBaseSettings, env
 `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_PRE_PING`), so one process holds at
 most pool_size + max_overflow connections. The defaults below are those
-settings' defaults: 5 + 5, so the eleven database services hold at most
-11 x 10 = 110 connections, under the compose Postgres `max_connections=200`.
+settings' defaults: 5 + 10 (SQLAlchemy's own defaults), so the eleven database
+services hold at most 11 x 15 = 165 connections, under the compose Postgres
+`max_connections=200`.
 SQLite URLs (the services' unit tests) get only `pool_pre_ping`: SQLAlchemy
 picks a pool for them that takes no size arguments (an in-memory database
 uses StaticPool, which refuses `pool_size` and `max_overflow`).
@@ -43,7 +44,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 DEFAULT_POOL_SIZE = 5
-DEFAULT_MAX_OVERFLOW = 5
+DEFAULT_MAX_OVERFLOW = 10
 DEFAULT_POOL_PRE_PING = True
 
 

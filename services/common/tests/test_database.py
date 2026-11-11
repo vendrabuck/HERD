@@ -94,9 +94,9 @@ def test_postgres_engine_gets_the_pool_defaults_and_pre_ping():
     """No connection is opened: building an engine only configures its pool."""
     engine, _, _, _ = make_database(PG_URL)
     pool = engine.sync_engine.pool
-    assert (DEFAULT_POOL_SIZE, DEFAULT_MAX_OVERFLOW, DEFAULT_POOL_PRE_PING) == (5, 5, True)
+    assert (DEFAULT_POOL_SIZE, DEFAULT_MAX_OVERFLOW, DEFAULT_POOL_PRE_PING) == (5, 10, True)
     assert pool.size() == 5
-    assert pool._max_overflow == 5
+    assert pool._max_overflow == 10
     assert pool._pre_ping is True
 
 

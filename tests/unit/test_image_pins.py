@@ -11,13 +11,16 @@ No stack, no Docker, no registry: the files are read as text and YAML only.
 
 What is read:
 
-- Dockerfiles: every file named `Dockerfile` (or ending in `.Dockerfile`) under the
-  repository root, skipping directories whose name starts with `.` and every
-  `node_modules`; in each, the image of every `FROM` and every `COPY --from=` /
+- Which files: inside a git work tree, the TRACKED files (`git ls-files`, so an
+  untracked local Dockerfile or compose file on a developer host is not read);
+  only when git cannot list them, a walk of the repository root that skips
+  directories whose name starts with `.` and every `node_modules`.
+- Dockerfiles: every such file named `Dockerfile` (or ending in `.Dockerfile`); in
+  each, the image of every `FROM` and every `COPY --from=` /
   `ADD --from=` (continuation lines joined, comments dropped). A `FROM` or `--from`
   that names an earlier stage of the same file (by its `AS` name or its index), and
   `FROM scratch`, are not images and pass.
-- Compose files: every `docker-compose*.yml` or `compose*.yml` found the same way;
+- Compose files: every such `docker-compose*.yml` or `compose*.yml` (or `.yaml`);
   in each, the `image:` of every service under `services:`. A service that also has
   a `build:` key names an image this repository builds itself, and passes.
 
@@ -26,19 +29,23 @@ The rule for one reference `[registry/]name[:tag][@sha256:<64 hex>]`:
 - a digest, when present, is exactly `sha256:` and 64 lowercase hex characters;
 - with a digest and no tag, the reference passes (a digest is immutable);
 - otherwise the tag must be present, must not be `latest`, and must start with a
-  version of at least three numeric parts (`v3.6.10`, `3.12.16-slim`,
+  version of at least three numeric parts (`v3.7.18`, `3.12.16-slim`,
   `4.43.0-20260404`), so a major-only or major.minor tag (`22-alpine`, `3.12-slim`,
   `v3`) fails. The one exception is `_TWO_PART_VERSION_IMAGES`: an image whose
   upstream numbers each release with two parts (PostgreSQL since 10: `16.15` is one
-  release) may use a two-part version.
+  release) may use a two-part version;
+- a pre-release fails even with a full version: a `-` or `.` separated part of the
+  tag after the version (or text right after it) that reads `rc`, `alpha`, `beta`,
+  `a`, `b`, `ea`, `pre`, `preview`, `dev`, `nightly`, `canary`, or `snapshot`,
+  optionally followed by a number (`v3.7.0-rc.2`, `3.13.0rc1`, `1.0.0-beta1`).
 
 Limits. The files are read as text, not built or rendered:
 
 - not seen: an image named only through a build argument or a variable (`FROM
   ${BASE}` and an interpolated compose `image:` are refused, not resolved), `RUN
   --mount=from=<image>`, an image a script or the Makefile pulls or runs by name, a
-  compose file under a hidden directory or `node_modules`, and a Dockerfile under any
-  other name;
+  Dockerfile under any other name, and, on the fallback walk only, a file under a
+  hidden directory or `node_modules`;
 - not judged: whether the tag and the digest name the same image, whether either
   exists in its registry, and whether the version is the newest. Dependabot's
   `docker` and `docker-compose` ecosystems (`.github/dependabot.yml`) propose the
@@ -49,6 +56,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -66,9 +74,27 @@ _TWO_PART_VERSION_IMAGES = {
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _THREE_PART = re.compile(r"v?\d+\.\d+\.\d+(?![0-9])")
 _TWO_PART = re.compile(r"v?\d+\.\d+(?![0-9.])")
+_PRE_RELEASE = re.compile(
+    r"(rc|alpha|beta|a|b|ea|pre|preview|dev|nightly|canary|snapshot)\d*", re.IGNORECASE
+)
+
+
+def _tracked(root: Path) -> list[Path] | None:
+    """Tracked files that exist, or None when git cannot list them."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"], capture_output=True, check=True
+        ).stdout.decode()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return [root / p for p in sorted(out.split("\0")) if p and (root / p).is_file()]
 
 
 def _walk(root: Path):
+    tracked = _tracked(root)
+    if tracked is not None:
+        yield from tracked
+        return
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d != "node_modules")
         for name in sorted(filenames):
@@ -109,7 +135,14 @@ def reference_problem(ref: str) -> str | None:
         return f"{ref!r} has no tag, which means latest"
     if tag == "latest":
         return f"{ref!r} uses the floating latest tag"
-    if _THREE_PART.match(tag):
+    version = _THREE_PART.match(tag)
+    if version is None and name.rsplit("/", 1)[-1] in _TWO_PART_VERSION_IMAGES:
+        version = _TWO_PART.match(tag)
+    if version is not None:
+        rest = tag[version.end() :]
+        parts = [rest.lstrip("-.+_")] + rest.replace(".", "-").split("-")
+        if any(_PRE_RELEASE.fullmatch(part) for part in parts if part):
+            return f"{ref!r}: tag {tag!r} is a pre-release"
         return None
     short_name = name.rsplit("/", 1)[-1]
     if short_name in _TWO_PART_VERSION_IMAGES and _TWO_PART.match(tag):
@@ -243,8 +276,8 @@ _HEX = "0" * 64
 @pytest.mark.parametrize(
     "ref",
     [
-        "traefik:v3.6.10",
-        f"traefik:v3.6.10@sha256:{_HEX}",
+        "traefik:v3.7.18",
+        f"traefik:v3.7.18@sha256:{_HEX}",
         f"python:3.12.16-slim@sha256:{_HEX}",
         "selenium/standalone-chrome:4.43.0-20260404",
         "ghcr.io/nokia/srlinux:26.7.2-519",
@@ -252,6 +285,9 @@ _HEX = "0" * 64
         "osixia/openldap:1.5.0",
         "localhost:5000/team/tool:1.2.3",
         "postgres:16.15-alpine",
+        "nginx:1.30.6-alpine",
+        "node:22.23.4-alpine3.22",
+        "debian:12.11.0-bookworm-slim",
     ],
 )
 def test_pinned_references_pass(ref):
@@ -276,6 +312,12 @@ def test_pinned_references_pass(ref):
         "frrouting/frr@sha256:abc",
         "${BASE_IMAGE}",
         "python:3.12.16-slim@sha256:" + "A" * 64,
+        "traefik:v3.7.0-rc.2",
+        "python:3.13.0rc1-slim",
+        "node:24.0.0-beta1-alpine",
+        "nginx:1.31.0-alpha",
+        "traefik:v3.7.0-ea.1",
+        "postgres:17.0-rc1-alpine",
     ],
 )
 def test_floating_references_fail(ref):
@@ -285,7 +327,7 @@ def test_floating_references_fail(ref):
 def test_dockerfile_scan_skips_local_stages_and_reads_copy_from_images():
     text = (
         "# a comment naming FROM python:latest\n"
-        f"FROM ghcr.io/astral-sh/uv:0.9.3@sha256:{_HEX} AS uv\n"
+        f"FROM ghcr.io/astral-sh/uv:0.13.7@sha256:{_HEX} AS uv\n"
         "FROM --platform=$BUILDPLATFORM node:22.23.4-alpine AS build\n"
         "RUN echo hi\n"
         "FROM build AS test\n"
@@ -298,7 +340,7 @@ def test_dockerfile_scan_skips_local_stages_and_reads_copy_from_images():
     )
     refs = dockerfile_references(text)
     assert refs == [
-        (2, f"ghcr.io/astral-sh/uv:0.9.3@sha256:{_HEX}"),
+        (2, f"ghcr.io/astral-sh/uv:0.13.7@sha256:{_HEX}"),
         (3, "node:22.23.4-alpine"),
         (9, "ghcr.io/astral-sh/uv:latest"),
         (11, "busybox"),
@@ -322,4 +364,26 @@ def test_compose_scan_exempts_built_images_and_reads_the_rest():
     assert compose_references(text) == [
         ("gateway", "traefik:latest"),
         ("db", "postgres:16.15-alpine"),
+    ]
+
+
+def test_discovery_reads_tracked_files_only(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "svc").mkdir()
+    (tmp_path / "svc" / "Dockerfile").write_text("FROM python:3.12.16-slim\n")
+    (tmp_path / "local").mkdir()
+    (tmp_path / "local" / "Dockerfile").write_text("FROM python:latest\n")
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "svc/Dockerfile"], check=True)
+    assert dockerfiles(tmp_path) == [tmp_path / "svc" / "Dockerfile"]
+    assert compose_files(tmp_path) == []
+
+
+def test_discovery_walks_the_tree_outside_a_git_work_tree(tmp_path):
+    for rel in ("a/Dockerfile", ".hidden/Dockerfile", "node_modules/x/Dockerfile", "b.Dockerfile"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("FROM scratch\n")
+    assert sorted(p.relative_to(tmp_path).as_posix() for p in dockerfiles(tmp_path)) == [
+        "a/Dockerfile",
+        "b.Dockerfile",
     ]

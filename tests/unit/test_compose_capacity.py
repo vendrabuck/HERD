@@ -11,21 +11,25 @@ Two settings that `make prod` used to leave at defaults:
   through `herd_common.database.make_database`, which opens at most `pool_size +
   max_overflow` connections per process; SQLAlchemy's defaults (5 + 10) gave
   11 x 15 = 165 against Postgres' default `max_connections` of 100. The pool is now
-  set from `DB_POOL_SIZE` and `DB_MAX_OVERFLOW` (defaults 5 and 5) and Postgres runs
-  with `-c max_connections=200`, so the defaults need 11 x 10 = 110.
+  set explicitly from `DB_POOL_SIZE` and `DB_MAX_OVERFLOW` (defaults 5 and 10,
+  SQLAlchemy's own) and Postgres runs with `-c max_connections=200`, so the defaults
+  need 11 x 15 = 165.
 
 What is checked, without a stack or Docker (YAML and Python ASTs only):
 
-- every service of every compose file `tests/unit/test_image_pins.py` discovers has a
+- every service of every compose file `tests/unit/test_image_pins.py` discovers (the
+  tracked files through `git ls-files`, a filesystem walk only as a fallback) has a
   `logging` mapping equal to the one above, after YAML anchors resolve; a service in
   `docker-compose.override.yml` that `docker-compose.yml` also defines is covered by
   the base file's block, since compose merges the two;
 - in `docker-compose.yml`, every service whose environment sets `DATABASE_URL` sets
   `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, and `DB_POOL_PRE_PING` as `${VAR:-default}`, and
   the sum over those services of the two size defaults is at most the
-  `max_connections` the postgres service's `command` passes; and the numbers are
-  exactly eleven services, 110, and 200, the arithmetic docs/ENV_VARS.md and
-  docs/OPERATIONS.md state, so a change to either fails until the docs follow;
+  `max_connections` the postgres service's `command` passes; and, computed from
+  those compose defaults (never from literals here), docs/ENV_VARS.md states
+  `<services> x (<size> + <overflow>) = <total>` and `<max_connections> - <total> =
+  <headroom>`, and docs/OPERATIONS.md states the first, so a changed default fails
+  until the docs follow;
 - every `services/*/app/database.py` calls `make_database` with
   `pool_size=settings.db_pool_size`, `max_overflow=settings.db_max_overflow`, and
   `pool_pre_ping=settings.db_pool_pre_ping`.
@@ -123,13 +127,32 @@ def test_every_compose_service_rotates_its_logs():
 
 
 def test_database_pools_fit_within_postgres_max_connections():
-    names, total, limit, problems = pool_budget(yaml.safe_load(BASE.read_text())["services"])
+    services = yaml.safe_load(BASE.read_text())["services"]
+    names, total, limit, problems = pool_budget(services)
     assert not problems, "\n".join(problems)
     assert len(names) == 11, f"expected the eleven database services, found {sorted(names)}"
-    assert (total, limit) == (110, 200), (
-        f"11 services x (5 + 5) = 110 under max_connections=200 is what docs/ENV_VARS.md "
-        f"and docs/OPERATIONS.md state; the compose file now gives {total} and {limit}"
+
+
+def test_docs_state_the_budget_the_compose_defaults_give():
+    services = yaml.safe_load(BASE.read_text())["services"]
+    names, total, limit, _ = pool_budget(services)
+    pairs = {
+        tuple(
+            int(_DEFAULTED.fullmatch(str(services[n]["environment"][v])).group("default"))
+            for v in ("DB_POOL_SIZE", "DB_MAX_OVERFLOW")
+        )
+        for n in names
+    }
+    assert len(pairs) == 1, f"the database services use different pool defaults: {pairs}"
+    ((size, overflow),) = pairs
+    product = f"{len(names)} x ({size} + {overflow}) = {total}"
+    headroom = f"{limit} - {total} = {limit - total}"
+    env_vars = (REPO_ROOT / "docs" / "ENV_VARS.md").read_text()
+    operations = (REPO_ROOT / "docs" / "OPERATIONS.md").read_text()
+    assert product in env_vars and headroom in env_vars, (
+        f"docs/ENV_VARS.md must state {product!r} and {headroom!r}"
     )
+    assert product in operations, f"docs/OPERATIONS.md must state {product!r}"
 
 
 def test_every_service_passes_its_pool_settings_to_make_database():
