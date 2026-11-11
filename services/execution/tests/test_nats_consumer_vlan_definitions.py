@@ -63,10 +63,13 @@ def _db_session_factory():
     return lambda: _Ctx()
 
 
-SW_L2 = str(uuid.uuid4())
-SW_MID = str(uuid.uuid4())
-SW_L2_B = str(uuid.uuid4())
-SW_L2_C = str(uuid.uuid4())
+# Fixed, ordered ids (issue #1209 review): defined_switch_ids is stored sorted, so with
+# these SW_L2 < SW_MID < SW_L2_B < SW_L2_C always, and a test that cuts the stored order
+# at SW_MID has the same strength on every run.
+SW_L2 = "11111111-1111-4111-8111-111111111111"
+SW_MID = "22222222-2222-4222-8222-222222222222"
+SW_L2_B = "33333333-3333-4333-8333-333333333333"
+SW_L2_C = "44444444-4444-4444-8444-444444444444"
 SW_L1 = str(uuid.uuid4())
 DUT1 = str(uuid.uuid4())
 DUT2 = str(uuid.uuid4())
@@ -766,19 +769,16 @@ async def test_reconcile_release_tail_upstream_failure_still_stamps_the_version(
     """The same catch through the reconcile's L2 apply tail. Version 1 defines the
     chain's VLAN on SW_L2, SW_MID, SW_L2_B (stored sorted); version 2 drops every wire,
     so the allocation is orphaned and released, and SW_MID's read (transit-only, read
-    by nothing else in this delivery) fails at its delete. The deletes stop for this
-    allocation at SW_MID: the switches sorted before it are deleted and trimmed, SW_MID
-    and every switch after it stay listed. The reconcile completes and stamps version
-    2 (before #1209 the error escaped the apply and nacked the reconcile). The switch
-    ids are random, so SW_MID's position in the stored order varies by run; the
-    deterministic trim case is the multi-switch test above."""
+    by nothing else in this delivery) fails at its delete. The switch ids are fixed and
+    ordered, so SW_MID always sits in the middle of the stored order: SW_L2's delete
+    runs and is trimmed, SW_MID and SW_L2_B (never tried) stay listed. The reconcile
+    completes and stamps version 2 (before #1209 the error escaped the apply and nacked
+    the reconcile)."""
     from app.models.reservation_wiring_state import ReservationWiringState
 
     await _reconcile(CHAIN_WIRES, fork_version=1)
     (alloc,) = await _allocation()
-    stored = [str(s) for s in alloc.defined_switch_ids]
-    assert set(stored) == {SW_L2, SW_MID, SW_L2_B}
-    cut = stored.index(SW_MID)
+    assert alloc.defined_switch_ids == [SW_L2, SW_MID, SW_L2_B], "stored sorted"
 
     execute_fn, calls = _recorder()
     with ExitStack() as stack:
@@ -791,9 +791,9 @@ async def test_reconcile_release_tail_upstream_failure_still_stamps_the_version(
                 {"reservation_id": RES_ID, "fork_version": 2}, _db_session_factory()
             )
 
-    assert [c[1] for c in calls if c[0] == "delete_vlan"] == stored[:cut]
+    assert [c[1] for c in calls if c[0] == "delete_vlan"] == [SW_L2]
     (released,) = await _allocation("RELEASED")
-    assert released.defined_switch_ids == stored[cut:]
+    assert released.defined_switch_ids == [SW_MID, SW_L2_B]
     assert {r.status for r in await _membership_rows()} == {"RELEASED"}
     async with TestSessionLocal() as s:
         state = (
@@ -806,7 +806,7 @@ async def test_reconcile_release_tail_upstream_failure_still_stamps_the_version(
     assert state.last_applied_fork_version == 2, "the reconcile completed and stamped"
     (record,) = _upstream_failed_records(caplog)
     payload = _assert_class_name_only(record)
-    assert payload["switch_ids"] == stored[cut:]
+    assert payload["switch_ids"] == [SW_MID, SW_L2_B]
 
 
 async def test_release_does_not_catch_an_exception_other_than_transient_upstream():

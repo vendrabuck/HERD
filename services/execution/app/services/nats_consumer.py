@@ -3014,11 +3014,13 @@ async def _release_orphaned_allocations(
         RELEASED (allocation lifecycle is a database decision, never coupled to hardware
         cleanup) and bounded lingering of an empty VLAN definition is accepted; there is
         deliberately no free-after-delete state and no parked row.
-      - Upstream failure (issue #1209): when a delete cannot start because inventory
-        cannot answer the switch or template read (_run_vlan_definition_op raises
-        TransientUpstreamError before any driver call), the remaining deletes of THAT
-        allocation are not attempted. Only the switches whose delete succeeded before
-        it leave defined_switch_ids; the failing switch and every switch not yet tried
+      - Upstream failure (issue #1209): when a delete cannot start because the switch
+        or template read fails (inventory answered anything but the record or a 404: a
+        5xx, a 401 or 403 during an INTERNAL_API_TOKEN rotation, a malformed body; or
+        could not be reached), _run_vlan_definition_op raises TransientUpstreamError
+        before any driver call, and the remaining deletes of THAT allocation are not
+        attempted. Only the switches whose delete succeeded before it leave
+        defined_switch_ids; the failing switch and every switch not yet tried
         stay listed, because their definition may still be on the switch. One line is
         logged with the action `vlan_delete_upstream_failed` and the exception's class
         name only (its text can carry upstream detail), and the pass continues with the
@@ -3027,8 +3029,9 @@ async def _release_orphaned_allocations(
         unjudged skip).
 
     Any other exception (a database error from a session, a commit, or an execution run
-    write; a malformed inventory record) is not caught here and propagates to the
-    caller, as everywhere else in this module: it is not specific to one allocation.
+    write; an inventory record missing a field the driver load needs) is not caught
+    here and propagates to the caller, as everywhere else in this module: it is not
+    specific to one allocation.
     """
     from datetime import datetime, timezone
 

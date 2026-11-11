@@ -406,14 +406,19 @@ confirming no live reservation uses that VLAN number there. See
 ### Log action `vlan_delete_upstream_failed`
 
 The same situation from the inventory side (issue #1209): a `delete_vlan` could not start
-because inventory did not answer the read of the switch or its template. No driver call
-ran on the switches the line lists in `switch_ids` (the failing switch and the ones of the
-same allocation not tried after it), so the empty definition stays on them; the
-allocation is already released, the pass went on with the other allocations, and nothing
-retries the delete. `error_class` names the exception class only. Once inventory is
-healthy, remove the definition by hand on each listed switch the same way, after
-confirming no live reservation uses that VLAN number there. Leaving a switch in a
-known-good state is otherwise the switch driver's job; see
+because the read of the switch or its template failed: inventory answered anything but
+the record or a 404 (a 5xx, a 401 or 403 during an `INTERNAL_API_TOKEN` rotation, a
+malformed body) or could not be reached. No driver call ran on the switches the line
+lists in `switch_ids` (the failing switch and the ones of the same allocation not tried
+after it), so the empty definition stays on them; the allocation is already released,
+the pass went on with the other allocations, and nothing retries the delete.
+`error_class` names the exception class only. First find out why the read failed: a 401
+or 403 means execution's `INTERNAL_API_TOKEN` does not match inventory's (a rotation
+that has not reached every service, which waiting will not fix; restart every service
+with the same token), while a 5xx or a connection failure means inventory itself was
+unhealthy. Once the read works again, remove the definition by hand on each listed
+switch, after confirming no live reservation uses that VLAN number there. Leaving a
+switch in a known-good state is otherwise the switch driver's job; see
 [DRIVERS.md](DRIVERS.md#when-methods-are-called-1).
 
 ### Wiring row `FAILED` with `driver load failed: <ClassName>`

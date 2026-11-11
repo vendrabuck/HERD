@@ -99,8 +99,8 @@ call is caught the same way in tick mode: the L2 retry's release of the allocati
 superseded rows left orphaned, which runs after the per-reservation loop and after the
 read-back and skip accounting (action `wiring_retry_superseded_release_upstream_failed`,
 class name only); the outcomes stand. Since issue #1209 that release isolates its own
-delete_vlan switch reads per allocation, so this catch is a backstop that no read
-inside the release reaches today. Nothing wider than TransientUpstreamError is
+delete_vlan switch reads per allocation, so this catch is a backstop: no
+TransientUpstreamError escapes the release today. Nothing wider than TransientUpstreamError is
 caught: any exception those catches do not take still drops the layer for the tick
 (WIRE-RETRY-15). The catch never leaves a drive claim behind, because no
 upstream read sits between a row's claim and its record in any layer's apply. Only the
@@ -591,7 +591,7 @@ async def _reattempt_l2_rows(
     The superseded rows' allocation release runs last, after the read-back and the
     skip accounting. Since issue #1209 the release catches a failed delete_vlan switch
     or template read per allocation itself (action `vlan_delete_upstream_failed`), so
-    no read inside it raises TransientUpstreamError today. The catch here stays as a
+    no TransientUpstreamError escapes it today. The catch here stays as a
     backstop: in tick mode a TransientUpstreamError that still escapes the release is
     logged with the action `wiring_retry_superseded_release_upstream_failed` and the
     class name only, and the outcomes are still returned; on the manual channel it
@@ -849,8 +849,8 @@ async def _reattempt_l2_rows(
                     raise
                 # Tick mode: the rows' outcomes stand. A backstop since issue #1209:
                 # the release isolates its own delete_vlan switch reads per allocation
-                # (vlan_delete_upstream_failed), so no read inside it raises this
-                # today. If one ever does, the allocations the release had not reached
+                # (vlan_delete_upstream_failed), so no TransientUpstreamError escapes
+                # it today. If one ever does, the allocations the release had not reached
                 # stay as they are and no later tick re-drives them.
                 logger.warning(
                     "wiring retry tick: an upstream read failed while releasing the "

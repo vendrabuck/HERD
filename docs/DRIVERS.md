@@ -858,7 +858,7 @@ VLAN definition lifecycle is coupled to the per-fabric allocation (issue #442, d
 |---|---|
 | VLAN definition (a fabric allocation's first built membership, or a scope growth) | login(), create_vlan(vlan_id), logout(), once per switch in the definition scope, before the first add_to_vlan on that switch |
 | Membership reconcile (activation, fork save, heal, retry) | login(), remove_from_vlan(port, vlan_id) for each departed port, add_to_vlan(port, vlan_id, tag) for each joined port, logout() |
-| Reservation ended (cancelled, completed, failed) | membership removes as above, driven strictly from the stored ledger; then login(), delete_vlan(vlan_id), logout() per switch the VLAN was defined on (skipped when the number was re-allocated in the switch's current cabling component; skipped, with the definition left in place and a `vlan_delete_unjudged` log line, when cabling cannot answer that question; and stopped for that allocation, with the definition left in place on the switches not reached and a `vlan_delete_upstream_failed` log line, when inventory cannot answer the switch or template read) |
+| Reservation ended (cancelled, completed, failed) | membership removes as above, driven strictly from the stored ledger; then login(), delete_vlan(vlan_id), logout() per switch the VLAN was defined on (skipped when the number was re-allocated in the switch's current cabling component; skipped, with the definition left in place and a `vlan_delete_unjudged` log line, when cabling cannot answer that question; and stopped for that allocation, with the definition left in place on the switches not reached and a `vlan_delete_upstream_failed` log line, when the switch or template read fails because inventory answered anything but the record or a 404 (a 5xx, a 401 or 403 during an `INTERNAL_API_TOKEN` rotation, a malformed body) or could not be reached) |
 | Device added to HERD or admin health check | login(), status(), logout() |
 
 The definition scope is transit-inclusive: it covers every L2 switch the reservation's
@@ -867,11 +867,11 @@ which carry the VLAN but hold no port membership in it. A create_vlan failure fa
 dependent membership builds on that switch (parked as FAILED wiring rows, retryable); a
 delete_vlan failure is logged and tolerated.
 
-A VLAN definition left on a switch after a failed or skipped delete_vlan is a limit by
-decision: the allocation is released anyway and HERD never re-drives that delete.
-Leaving the switch in a known-good state for your network is the driver's
-responsibility; for example, a driver can default its ports when it first logs in to
-the switch.
+A VLAN definition left on a switch after a failed, unjudged, or upstream-stopped
+delete_vlan is a limit by decision: the allocation is released anyway and HERD never
+re-drives that delete. Leaving the switch in a known-good state for your network is the
+driver's responsibility; for example, a driver that defaults its ports and prunes VLANs
+it finds unused when it first logs in to the switch.
 
 Unlike L1 operations (which pair two ports), L2 membership operations are per-port: each
 DUT port connected to an L2 switch yields one add_to_vlan or remove_from_vlan call.

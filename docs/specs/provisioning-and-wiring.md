@@ -790,9 +790,10 @@ WIRE-VLAN-4.
   succeeded leave `defined_switch_ids`. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_release_orphaned_allocations`); `services/execution/app/services/vlan_service.py` (`find_superseding_allocation`, `allocation_reaches`) \
   Pinned by: `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_delete_on_last_free_per_switch`, `test_delete_skipped_when_vlan_reallocated_on_fabric`, `test_delete_failure_logs_and_continues`, `test_delete_skipped_when_a_cable_joined_the_switch_to_the_winners_component`, `test_delete_runs_when_the_components_split_after_the_winner_was_allocated`, `test_supersession_lookup_failure_skips_the_delete_and_continues`, `test_no_same_number_allocation_asks_cabling_nothing`); `tests/integration/test_vlan_assignment.py` (`test_vlan_released_on_reservation_cancel`)
-- **WIRE-VLAN-12.** When inventory cannot answer the switch or template read of one of
-  an allocation's deletes (`TransientUpstreamError`, raised before any driver call for
-  that switch), the rest of that allocation's deletes are not attempted: the switches
+- **WIRE-VLAN-12.** When the switch or template read of one of an allocation's deletes
+  fails because inventory answered anything but the record or a 404 (a 5xx, a 401 or
+  403 during an `INTERNAL_API_TOKEN` rotation, a malformed body) or could not be reached
+  (`TransientUpstreamError`, raised before any driver call for that switch), the rest of that allocation's deletes are not attempted: the switches
   whose delete succeeded before it leave `defined_switch_ids`, the failing switch and
   every switch not yet tried stay listed, the allocation stays released, one line is
   logged with the action `vlan_delete_upstream_failed` carrying `error_class` (the
@@ -805,7 +806,7 @@ WIRE-VLAN-4.
   leaving a switch in a known-good state is the L2 driver's responsibility for its
   network ([DRIVERS.md](../DRIVERS.md)). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_release_orphaned_allocations`, `_run_vlan_definition_op`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_release_upstream_failure_skips_only_that_allocation`, `test_release_upstream_failure_on_a_later_switch_keeps_what_is_not_proven_deleted`, `test_reconcile_release_tail_upstream_failure_still_stamps_the_version`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_release_tail_upstream_failure_releases_every_other_allocation`); `services/execution/tests/test_wiring_retry_upstream_isolation.py` (`test_l2_superseded_allocation_release_failure_keeps_the_outcomes`, `test_manual_retry_superseded_release_switch_read_failure_reports_the_outcome`)
+  Pinned by: `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_release_upstream_failure_skips_only_that_allocation`, `test_release_upstream_failure_on_a_later_switch_keeps_what_is_not_proven_deleted`, `test_reconcile_release_tail_upstream_failure_still_stamps_the_version`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_release_tail_upstream_failure_releases_every_other_allocation`); `services/execution/tests/test_wiring_retry_upstream_isolation.py` (`test_l2_superseded_allocation_release_failure_keeps_the_outcomes`, `test_manual_retry_superseded_release_switch_read_failure_reports_the_outcome`, `test_l2_apply_tail_delete_read_failure_is_not_a_reservation_skip`)
 - **WIRE-VLAN-13.** Only `TransientUpstreamError` is caught that way: any other
   exception from the switch read of an allocation's delete propagates out of the pass,
   that allocation stays released with its switches listed, and the allocations after it
@@ -1201,7 +1202,7 @@ interface in section 8.15.
   counted. The L2 retry settles its read-back and these counts before it releases the
   allocations its superseded rows left orphaned. That release catches a failed
   `delete_vlan` switch or template read per allocation itself (WIRE-VLAN-12, #1209), so
-  no read inside it raises today; the tick keeps a backstop around it, and a
+  no TransientUpstreamError escapes it today; the tick keeps a backstop around it, and a
   TransientUpstreamError that still escapes the release leaves the outcomes standing
   and logs one warning with the action
   `wiring_retry_superseded_release_upstream_failed` and the class name only. Only
@@ -1479,13 +1480,16 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
   allocation holds the number) leaves the VLAN defined on its switches (WIRE-VLAN-11);
   nothing re-drives that delete. Recorded in issue #1065 and the docstring of
   `_release_orphaned_allocations`.
-- A release whose switch or template read fails in inventory leaves the VLAN defined on
-  the switches its deletes did not reach, with the allocation released (WIRE-VLAN-12);
-  nothing re-drives that delete. The owner chose to fail open and release rather than
-  keep the allocation `ACTIVE` until a delete can run: a VLAN definition left on a
-  switch after a failed or skipped delete is accepted, and leaving the switch in a
+- A release whose switch or template read fails (inventory answered anything but the
+  record or a 404, such as a 5xx, a 401 or 403 during an `INTERNAL_API_TOKEN` rotation,
+  or a malformed body, or could not be reached) leaves the VLAN defined on the switches
+  its deletes did not reach, with the allocation released (WIRE-VLAN-12); nothing
+  re-drives that delete. The owner chose to fail open and release rather than keep the
+  allocation `ACTIVE` until a delete can run: a VLAN definition left on a switch after a
+  failed, unjudged, or upstream-stopped delete is accepted, and leaving the switch in a
   known-good state is the L2 driver author's responsibility for their network, for
-  example a driver that defaults its ports when it first logs in to the switch.
+  example a driver that defaults its ports and prunes VLANs it finds unused when it
+  first logs in to the switch.
   Recorded in issue #1209, [DRIVERS.md](../DRIVERS.md), and the docstring of
   `_release_orphaned_allocations`.
 

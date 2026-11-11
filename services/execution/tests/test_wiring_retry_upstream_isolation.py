@@ -690,6 +690,53 @@ async def test_manual_retry_still_propagates_the_superseded_release_failure():
     assert (await _snapshot("l2"))[c_id][0] == "RELEASED"
 
 
+async def test_l2_apply_tail_delete_read_failure_is_not_a_reservation_skip(caplog):
+    """A delete read failure at the tail of ONE reservation's L2 apply inside the tick
+    (issue #1209 review). A's release row sits on a healthy member switch; A's
+    allocation is also defined on a transit switch whose inventory read fails, which
+    only the allocation-release tail of A's apply reads. B's row is healthy.
+
+    The release catches the read for A's allocation itself: A's row is driven and
+    RELEASED, A's allocation is released with only the transit switch still listed,
+    and one `vlan_delete_upstream_failed` line is logged. Nothing escapes A's apply, so
+    the tick's per-reservation catch never fires: no
+    `wiring_retry_reservation_upstream_failed` line, `skipped_upstream` 0, and both
+    rows count as released. Before #1209 the error escaped A's apply into that catch,
+    which logged A as an upstream skip (with 0 rows unchanged, since A's row was
+    already driven)."""
+    res_a, res_b = uuid.uuid4(), uuid.uuid4()
+    member_a, transit_a = uuid.uuid4(), uuid.uuid4()
+    (a_id,) = await _seed_release_rows("l2", res_a, [member_a], created_at=OLD)
+    (b_id,) = await _seed_release_rows("l2", res_b, [GOOD_SWITCH], created_at=NEWER, vlan_id=1002)
+    async with TestSessionLocal() as s:
+        await s.execute(
+            update(VlanAssignment)
+            .where(VlanAssignment.reservation_id == res_a)
+            .values(defined_switch_ids=[str(member_a), str(transit_a)])
+        )
+        await s.commit()
+
+    caplog.set_level(logging.WARNING, logger="app.services.wiring_retry_service")
+    caplog.set_level(logging.WARNING, logger="app.services.nats_consumer")
+    with _upstream("l2", {transit_a}) as calls:
+        stats = await run_wiring_retry_tick(_db_session_factory())
+
+    after = await _snapshot("l2")
+    assert after[a_id][0] == "RELEASED" and after[b_id][0] == "RELEASED"
+    assert calls.count("remove_from_vlan") == 2
+    alloc_a = await _allocation_of(res_a)
+    assert (alloc_a.status, alloc_a.defined_switch_ids) == ("RELEASED", [str(transit_a)])
+    assert stats["l2_rows_retried"] == 2
+    assert (stats["released"], stats["still_failed"], stats["skipped_upstream"]) == (2, 0, 0)
+    assert _isolation_records(caplog) == [], "A's apply did not raise, so A is not a skip"
+    (record,) = _vlan_delete_upstream_records(caplog)
+    formatted = JSONFormatter("execution").format(record)
+    assert f'"reservation_id": "{res_a}"' in formatted
+    assert f'"switch_ids": ["{transit_a}"]' in formatted
+    assert '"error_class": "TransientUpstreamError"' in formatted
+    assert "hunter2" not in formatted and "10.9.8.7" not in formatted
+
+
 # --- Controls: the catch is no wider than it says --------------------------
 
 
