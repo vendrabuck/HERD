@@ -101,7 +101,7 @@ def test_refresh_in_one_tab_keeps_the_other_tab_signed_in(pw_contexts):
     assert refresh_a.value.status == 200, refresh_a.value.text()
     expect(page_a).not_to_have_url(re.compile(r"/login"))
     _wait_for_new_refresh_token(page_a, refresh_1)
-    access_2, refresh_2 = _stored_tokens(page_a)
+    _access_2, refresh_2 = _stored_tokens(page_a)
     assert refresh_2 and refresh_2 != refresh_1
 
     # The rotation is real: auth now refuses the token both tabs started with.
@@ -130,7 +130,9 @@ def test_refresh_in_one_tab_keeps_the_other_tab_signed_in(pw_contexts):
     page_a.reload()
     expect(page_a).not_to_have_url(re.compile(r"/login"), timeout=WAIT_MS)
     assert pw_api(page_a, "GET", "/auth/me").status_code == 200
-    assert access_2 != access_3
+    # The access tokens are not compared: two tokens minted for one account in
+    # the same second carry the same claims and are byte-identical, so only the
+    # refresh tokens, which are random, prove the two rotations.
 
     # Log the test's session out: revoke the live refresh token.
     _, live_refresh = _stored_tokens(page_a)
