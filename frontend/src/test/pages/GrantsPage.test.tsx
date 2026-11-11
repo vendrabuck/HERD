@@ -209,7 +209,7 @@ describe("GrantsPage", () => {
     );
   });
 
-  it("falls back to a generic message instead of rendering a list-shaped detail", async () => {
+  it("toasts a list-shaped detail as readable text instead of rendering the list", async () => {
     // FastAPI/pydantic validation errors shape `detail` as a list of error
     // objects, not a string. Passing that straight to toast.error would throw
     // "Objects are not valid as a React child" inside the Toaster, which
@@ -237,7 +237,8 @@ describe("GrantsPage", () => {
     });
     fireEvent.click(form.getByRole("button", { name: "Create" }));
 
-    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Failed to create grant"));
+    // Issue #1314: errorDetail formats the list as "field: message".
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("resource_id: bad uuid"));
   });
 
   it("renders an error state when the grants query fails", async () => {

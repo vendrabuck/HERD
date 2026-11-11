@@ -147,7 +147,9 @@ def _open_detail(page, reservation) -> None:
     row = page.locator("table tbody tr", has_text=reservation["purpose"])
     expect(row).to_be_visible(timeout=WAIT_MS)
     row.click()
-    expect(page.get_by_role("button", name="Classify now")).to_be_visible(timeout=WAIT_MS)
+    expect(page.get_by_role("button", name="Classify now", exact=True)).to_be_visible(
+        timeout=WAIT_MS
+    )
 
 
 def _park_pointer(page) -> None:
@@ -166,7 +168,7 @@ def test_classify_now_matches_the_real_backend_answer(pw_page, pw_cancelled_rese
         lambda r: r.request.method == "POST" and r.url.endswith(f"/purpose-review/{rid}/classify"),
         timeout=WAIT_MS,
     ) as response_info:
-        pw_page.get_by_role("button", name="Classify now").click()
+        pw_page.get_by_role("button", name="Classify now", exact=True).click()
     _park_pointer(pw_page)
     response = response_info.value
 
@@ -177,7 +179,7 @@ def test_classify_now_matches_the_real_backend_answer(pw_page, pw_cancelled_rese
         expect(pw_page.get_by_text(DISABLED_MESSAGE, exact=True)).to_be_visible(timeout=WAIT_MS)
         assert readback.get("purpose_suggestion") is None
         # The refusal leaves the button in place so the admin can retry later.
-        expect(pw_page.get_by_role("button", name="Classify now")).to_be_enabled()
+        expect(pw_page.get_by_role("button", name="Classify now", exact=True)).to_be_enabled()
         return
 
     assert response.status == 200, (
@@ -193,7 +195,7 @@ def test_classify_now_matches_the_real_backend_answer(pw_page, pw_cancelled_rese
             timeout=WAIT_MS
         )
         assert readback["purpose_suggestion"]["top_category"] == suggestion["top_category"]
-        expect(pw_page.get_by_role("button", name="Classify now")).to_have_count(0)
+        expect(pw_page.get_by_role("button", name="Classify now", exact=True)).to_have_count(0)
     else:
         assert body["outcome"] in OUTCOME_MESSAGES, body["outcome"]
         expect(pw_page.get_by_text(OUTCOME_MESSAGES[body["outcome"]], exact=True)).to_be_visible(
@@ -201,7 +203,7 @@ def test_classify_now_matches_the_real_backend_answer(pw_page, pw_cancelled_rese
         )
         assert body["purpose_suggestion"] is None
         assert readback.get("purpose_suggestion") is None
-        expect(pw_page.get_by_role("button", name="Classify now")).to_be_enabled()
+        expect(pw_page.get_by_role("button", name="Classify now", exact=True)).to_be_enabled()
 
 
 def test_classify_now_is_absent_on_a_reservation_that_is_not_terminal(pw_page):
@@ -236,7 +238,7 @@ def test_classify_now_is_absent_on_a_reservation_that_is_not_terminal(pw_page):
         expect(row).to_be_visible(timeout=WAIT_MS)
         row.click()
         expect(pw_page.get_by_text("Purpose category", exact=True)).to_be_visible(timeout=WAIT_MS)
-        expect(pw_page.get_by_role("button", name="Classify now")).to_have_count(0)
+        expect(pw_page.get_by_role("button", name="Classify now", exact=True)).to_have_count(0)
     finally:
         log_cleanup_failure(
             "reservation",
@@ -275,18 +277,18 @@ def test_classify_now_ui_with_intercepted_200_response(pw_page, pw_cancelled_res
 
     pw_page.route(re.compile(r".*/purpose-review/.+/classify$"), fulfill)
     _open_detail(pw_page, pw_cancelled_reservation)
-    pw_page.get_by_role("button", name="Classify now").click()
+    pw_page.get_by_role("button", name="Classify now", exact=True).click()
     _park_pointer(pw_page)
 
     if outcome == "ok":
         expect(
             pw_page.get_by_text("Suggested category: QA and regression.", exact=True)
         ).to_be_visible(timeout=WAIT_MS)
-        expect(pw_page.get_by_role("button", name="Classify now")).to_have_count(0)
+        expect(pw_page.get_by_role("button", name="Classify now", exact=True)).to_have_count(0)
     else:
         expect(pw_page.get_by_text(OUTCOME_MESSAGES[outcome], exact=True)).to_be_visible(
             timeout=WAIT_MS
         )
-        expect(pw_page.get_by_role("button", name="Classify now")).to_be_enabled()
+        expect(pw_page.get_by_role("button", name="Classify now", exact=True)).to_be_enabled()
     # Nothing reached the backend, so the row has no suggestion.
     assert pw_api(pw_page, "GET", f"/reservations/{rid}").json().get("purpose_suggestion") is None

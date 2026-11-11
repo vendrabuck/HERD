@@ -288,6 +288,19 @@ describe("ReportingPage", () => {
     );
   });
 
+  it("shows fixed text, never the transport message, for a non-string detail (#1314)", async () => {
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        HttpResponse.json({ detail: { error: "internal" } }, { status: 500 }),
+      ),
+    );
+    renderWithProviders(<ReportingPage />);
+    expect(
+      await screen.findByText("Failed to load report. Try again in a moment."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/status code/)).not.toBeInTheDocument();
+  });
+
   it("shows an error strip when the report request fails", async () => {
     server.use(
       http.get("/api/reservations/reports/utilization", () =>

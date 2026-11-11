@@ -5,6 +5,7 @@ import { useAuthStore } from "@/stores/authStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { HelpCircle } from "lucide-react";
 import { NotificationBell } from "@/components/NotificationBell";
+import { RouteErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { APP_VERSION } from "@/lib/appVersion";
 import { MANUAL_URL } from "@/lib/links";
 import { displayName } from "@/lib/profileEdit";
@@ -209,7 +210,9 @@ export function AppLayout() {
       </header>
 
       <main id="main-content" ref={mainRef} tabIndex={-1} className="flex-1 overflow-hidden focus:outline-none">
-        <Outlet />
+        <RouteErrorBoundary>
+          <Outlet />
+        </RouteErrorBoundary>
       </main>
     </div>
   );

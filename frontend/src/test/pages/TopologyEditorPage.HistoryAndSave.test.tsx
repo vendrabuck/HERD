@@ -431,7 +431,7 @@ describe("TopologyEditorPage version history", () => {
     server.use(
       ...baseHandlers(),
       http.post(`/api/cabling/topologies/${TOPO_ID}/versions/v-1/restore`, () =>
-        HttpResponse.json({ detail: "boom" }, { status: 500 }),
+        HttpResponse.json({}, { status: 500 }),
       ),
     );
     await renderPageWithCanvas([deviceNode("n-live", "d-live")]);

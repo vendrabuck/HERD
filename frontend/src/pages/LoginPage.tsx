@@ -1,14 +1,17 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
 import { Wrench } from "lucide-react";
 import { useLogin } from "@/api/auth";
 import { useConfigStatus } from "@/api/config";
 import { Button } from "@/components/ui/Button";
 import { APP_VERSION } from "@/lib/appVersion";
+import { loginErrorText, returnPathFromState } from "@/lib/login";
+import { tokenSubject } from "@/stores/authStore";
 
 export function LoginPage() {
   const navigate = useNavigate();
+  const location = useLocation();
   const login = useLogin();
   const [form, setForm] = useState({ email: "", password: "" });
   const { data: configStatus } = useConfigStatus();
@@ -22,10 +25,12 @@ export function LoginPage() {
       return;
     }
     try {
-      await login.mutateAsync(form);
-      navigate("/topology");
-    } catch {
-      toast.error("Invalid email or password");
+      const tokens = await login.mutateAsync(form);
+      navigate(returnPathFromState(location.state, tokenSubject(tokens.access_token)), {
+        replace: true,
+      });
+    } catch (err) {
+      toast.error(loginErrorText(err));
     }
   };
 
@@ -56,16 +61,27 @@ export function LoginPage() {
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label htmlFor="login-email" className="block text-sm font-medium text-gray-700 mb-1">Email</label>
+            {/* type="text", not "email": in LDAP mode this is the directory
+                login name, which need not contain an @ (IAM-LDAP-2, issue
+                #1335). The backend validates the value in both modes. */}
             <input
               id="login-email"
-              type="email"
+              type="text"
+              autoComplete="username"
+              inputMode="email"
+              autoCapitalize="none"
+              spellCheck={false}
               required
               disabled={!!isUnconfigured}
               value={form.email}
               onChange={(e) => setForm({ ...form, email: e.target.value })}
               className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:bg-gray-100"
               placeholder="you@example.com"
+              aria-describedby="login-email-help"
             />
+            <p id="login-email-help" className="mt-1 text-xs text-gray-500">
+              Directory accounts: enter your directory login name.
+            </p>
           </div>
 
           <div>
@@ -73,6 +89,7 @@ export function LoginPage() {
             <input
               id="login-password"
               type="password"
+              autoComplete="current-password"
               required
               disabled={!!isUnconfigured}
               value={form.password}
@@ -104,8 +121,9 @@ export function LoginPage() {
           to="/config"
           className="absolute bottom-4 right-4 p-2 text-gray-400 hover:text-gray-600 transition-colors"
           title="System Configuration"
+          aria-label="System configuration"
         >
-          <Wrench className="w-5 h-5" />
+          <Wrench className="w-5 h-5" aria-hidden="true" />
         </Link>
       </div>
     </div>

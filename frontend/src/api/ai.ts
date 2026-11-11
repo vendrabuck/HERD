@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuthStore } from "@/stores/authStore";
 import apiClient from "./client";
+import { detailText } from "@/lib/errors";
 import type {
   AICommitRequest,
   AICommitResponse,
@@ -139,7 +140,9 @@ async function streamReservationAssistant(
     // Surface a shaped error the caller maps like the buffered path's axios error.
     let detail: string | undefined;
     try {
-      detail = (await resp.json())?.detail;
+      // The same normalizer as the axios paths (issue #1314): a 422 list
+      // becomes its readable text, any other non-string shape stays undefined.
+      detail = detailText((await resp.json())?.detail, "") || undefined;
     } catch {
       // non-JSON body; leave detail undefined
     }

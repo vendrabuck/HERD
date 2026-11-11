@@ -5,6 +5,7 @@ import { isAxiosError } from "axios";
 import { Modal } from "@/components/ui/Modal";
 import { useAIGenerate } from "@/api/ai";
 import {
+  errorDetail,
   formatMixedTypesDetail,
   formatUnconnectableDetail,
   topologyMixedTypesDetail,
@@ -98,16 +99,17 @@ export function AIDialog({ open, onClose, onProposal }: AIDialogProps) {
       }
       if (isAxiosError(err)) {
         if (err.response?.status === 503) {
-          const detail = err.response.data?.detail;
           toast.error(
-            detail ??
+            errorDetail(
+              err,
               "AI features are not configured. Ask an administrator to configure an AI provider.",
+            ),
           );
         } else if (err.response?.status === 400) {
-          const detail = err.response.data?.detail ?? "Invalid upload";
+          const detail = errorDetail(err, "Invalid upload");
           toast.error(`Upload rejected: ${detail}`);
         } else if (err.response?.status === 502) {
-          const detail = err.response.data?.detail ?? "Upstream error";
+          const detail = errorDetail(err, "Upstream error");
           toast.error(`AI proposal rejected: ${detail}`);
         } else {
           toast.error("Failed to generate topology");
