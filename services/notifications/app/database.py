@@ -3,4 +3,9 @@ from sqlalchemy.ext.asyncio import AsyncSession  # noqa: F401 (re-exported for c
 
 from app.config import settings
 
-engine, AsyncSessionLocal, Base, get_db = make_database(settings.database_url)
+engine, AsyncSessionLocal, Base, get_db = make_database(
+    settings.database_url,
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_max_overflow,
+    pool_pre_ping=settings.db_pool_pre_ping,
+)

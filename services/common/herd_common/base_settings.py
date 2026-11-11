@@ -13,9 +13,15 @@ merges model_config down the inheritance chain, so a subclass may still
 override or extend it locally.
 """
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
 from herd_common.config_loader import herd_settings_sources
+from herd_common.database import (
+    DEFAULT_MAX_OVERFLOW,
+    DEFAULT_POOL_PRE_PING,
+    DEFAULT_POOL_SIZE,
+)
 
 
 class HerdBaseSettings(BaseSettings):
@@ -32,6 +38,14 @@ class HerdBaseSettings(BaseSettings):
     """
 
     model_config = {"env_file": ".env", "case_sensitive": False, "hide_input_in_errors": True}
+
+    # Database connection pool (issue #1352), passed to herd_common.database.make_database
+    # by every service's app/database.py. One process holds at most
+    # db_pool_size + db_max_overflow connections; db_pool_pre_ping tests a pooled
+    # connection before use, so one that died in a Postgres restart is replaced.
+    db_pool_size: int = Field(default=DEFAULT_POOL_SIZE, ge=1)
+    db_max_overflow: int = Field(default=DEFAULT_MAX_OVERFLOW, ge=0)
+    db_pool_pre_ping: bool = DEFAULT_POOL_PRE_PING
 
     @classmethod
     def settings_customise_sources(
