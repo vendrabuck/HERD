@@ -112,7 +112,7 @@ def test_wiring_dialog_two_pairs_persist_as_distinct_edges(pw_page):
         pw_page.mouse.up()
 
         dialog = pw_page.locator("dialog[open]")
-        expect(dialog.locator("#modal-title")).to_have_text(
+        expect(dialog).to_have_accessible_name(
             f"Wire {device_a['name']} to {device_b['name']}"
         )
 
@@ -130,7 +130,7 @@ def test_wiring_dialog_two_pairs_persist_as_distinct_edges(pw_page):
         pw_page.mouse.move(tx, ty, steps=5)
         pw_page.mouse.up()
         dialog = pw_page.locator("dialog[open]")
-        expect(dialog.locator("#modal-title")).to_have_text(
+        expect(dialog).to_have_accessible_name(
             f"Wire {device_a['name']} to {device_b['name']}"
         )
 

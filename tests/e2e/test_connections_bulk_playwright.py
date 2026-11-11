@@ -234,7 +234,7 @@ def _open_multi_dialog(page, device_a, device_b):
     page.get_by_role("button", name="Create Connection").click()
 
     dialog = page.locator("dialog[open]")
-    expect(dialog.locator("#modal-title")).to_have_text("Create multiple connections")
+    expect(dialog).to_have_accessible_name("Create multiple connections")
 
     _select_device(page, device_a["name"])
     _select_device(page, device_b["name"])

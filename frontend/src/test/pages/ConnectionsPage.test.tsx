@@ -141,8 +141,12 @@ describe("ConnectionsPage", () => {
     expect(
       await screen.findByRole("dialog", { name: /Create multiple connections/i }),
     ).toBeInTheDocument();
-    // The single-pair form is not mounted at all in multi mode.
+    // The single-pair form is not mounted at all in multi mode, so none of its
+    // controls can shadow the multi dialog's for a first-match locator.
     expect(screen.queryByText("Port A")).not.toBeInTheDocument();
+    for (const input of screen.getAllByPlaceholderText("Search devices...")) {
+      expect(input.closest("dialog[open]")).not.toBe(null);
+    }
   });
 
   it("the Single toggle switches the create button back to the single-pair modal", async () => {
