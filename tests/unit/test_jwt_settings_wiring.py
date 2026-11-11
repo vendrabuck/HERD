@@ -1,6 +1,6 @@
 """Every access-token decode goes through the one shared helper and names exactly
-one algorithm, and every service's access-token settings use the shared startup
-validation.
+one algorithm, the one ID-token decode is its own allowed helper, and every
+service's access-token settings use the shared startup validation.
 
 Two AST scans; nothing is imported or executed.
 
@@ -42,9 +42,11 @@ Every reference must be the function of a call (a bare reference handed on, as i
   of the innermost function or class around the call (`f`, `outer.inner`,
   `Class.method`, `<module>`), so a nested function or a method that reuses an
   allowed name is a different site and is refused, and each allowed site must
-  hold exactly its count of decode calls (the helper one). The table holds only
-  the config service's session decode, which may not import `herd_common`; an
-  entry nothing matches fails as stale;
+  hold exactly its count of decode calls (the helper one). The table holds two
+  entries: the config service's session decode, which may not import
+  `herd_common`, and `decode_id_token` in `herd_common/jwt_codec.py`, the
+  OpenID Connect ID-token decode (ADR 0016); an entry nothing matches fails as
+  stale;
 - pass the token and the key as the only positional arguments, with no `*args`
   and no `**kwargs`;
 - pass `algorithms=` as a list literal of exactly one element, not starred;
@@ -66,7 +68,9 @@ alias assignment, or (a class) a call (`vars(jwt)`, `run(jwt)`, `(jwt,)`,
 `get_unverified_header` on the package, `jwt.api_jws`, or a `PyJWS` class or
 instance, under the same spellings or imported by name from `jwt` or
 `jwt.api_jws`, may appear only inside a function named in
-`UNVERIFIED_READ_ALLOWED` with a reason. The table is empty today; an entry
+`UNVERIFIED_READ_ALLOWED` with a reason. The table holds one entry, the auth
+service's `_unverified_kid_and_alg` in `app/services/oidc_service.py`, which reads
+an ID token's `kid` and `alg` to choose the verifying key (ADR 0016); an entry
 nothing matches fails as stale. (A decode with `verify_signature` off, the other
 unverified read, is refused by the call rule above.)
 
@@ -97,8 +101,8 @@ default that is one of HS256, HS384, HS512 (pydantic does not validate a default
   target, another import), at module level, in a class, or in a function.
 
 The config service has no `app/config.py` and is skipped by the settings scan by
-construction; the decode scan reads it, and its session decode is the one
-`DIRECT_DECODE_ALLOWED` entry.
+construction; the decode scan reads it, and its session decode is one of the two
+`DIRECT_DECODE_ALLOWED` entries.
 
 Limits. What the scans cannot see:
 
@@ -138,7 +142,11 @@ Limits. What the scans cannot see:
   added by a base class other than the one in the file, or a `model_validator`;
   `Field` and `Annotated` are recognized by name (a local function named `Field`
   that returns a default is read as pydantic's);
-- whether the decode result is used, or whether the code is reached at all.
+- whether the decode result is used, what an allowed unverified read's result is
+  used for, or whether the code is reached at all; the scan does not evaluate
+  which algorithms an allowed site's one-element list names at runtime, so that
+  `decode_id_token` admits only asymmetric algorithms is pinned by
+  `services/common/tests/test_jwt_codec.py`, not here.
 """
 
 import ast
@@ -190,10 +198,23 @@ DIRECT_DECODE_ALLOWED: dict[tuple[str, str], tuple[int, str]] = {
         "does not ship it), so it verifies its own config session token, signed with "
         "CONFIG_SESSION_SECRET, not an access token",
     ),
+    ("services/common/herd_common/jwt_codec.py", "decode_id_token"): (
+        1,
+        "the OpenID Connect ID-token decode (ADR 0016, issue #37): an identity "
+        "provider's asymmetric signature, a pinned algorithm from ID_TOKEN_ALGORITHMS, "
+        "and the issuer, audience, and required-claim checks an access token does not "
+        "have; kept beside decode_access_token so every PyJWT decode is in one module",
+    ),
 }
 
-# (path relative to the repo, qualified function path) to reason. Empty by design.
-UNVERIFIED_READ_ALLOWED: dict[tuple[str, str], str] = {}
+# (path relative to the repo, qualified function path) to reason.
+UNVERIFIED_READ_ALLOWED: dict[tuple[str, str], str] = {
+    ("services/auth/app/services/oidc_service.py", "_unverified_kid_and_alg"): (
+        "ADR 0016: the ID token's header names the JWKS key (kid) and algorithm (alg) "
+        "that verify it, so both are read before key selection; alg must equal the "
+        "pinned algorithm and the signature is then verified by decode_id_token"
+    ),
+}
 
 # The four app functions that verify a token, each through the shared helper.
 HELPER_CALL_SITES = {

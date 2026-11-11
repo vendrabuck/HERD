@@ -9,19 +9,36 @@ is not an `InvalidTokenError`), and a token the previous library signed still
 verifies.
 Over HTTP: every one of those failures answers 401 `Could not validate
 credentials` with `WWW-Authenticate: Bearer`, and only the key error is logged.
+
+`decode_id_token` (ADR 0016, the OpenID Connect ID-token decode) is pinned at the
+bottom: it verifies under each of the nine asymmetric algorithms, passes exactly
+one algorithm with the issuer, audience, leeway, and required claims, refuses
+every HS algorithm and `none` before decoding (an HMAC token keyed by the client
+secret or by the public key PEM included), and each claim failure raises its
+exact class from a token that otherwise verifies. Keys are generated per session.
 """
 
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import time
 
 import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from fastapi import Depends, FastAPI
 from herd_common import jwt_codec
 from herd_common.auth import make_auth_dependencies
-from herd_common.jwt_codec import ACCESS_TOKEN_LEEWAY_SECONDS, decode_access_token
+from herd_common.jwt_codec import (
+    ACCESS_TOKEN_LEEWAY_SECONDS,
+    ID_TOKEN_ALGORITHMS,
+    ID_TOKEN_REQUIRED_CLAIMS,
+    decode_access_token,
+    decode_id_token,
+)
 from herd_common.logging import JSONFormatter
 from httpx import ASGITransport, AsyncClient
 from jwt.warnings import InsecureKeyLengthWarning
@@ -269,3 +286,337 @@ async def test_a_token_the_previous_library_signed_answers_200_over_http():
     resp = await _get(_app(INTEROP_KEY), INTEROP_TOKEN)
     assert resp.status_code == 200
     assert resp.json() == {"sub": INTEROP_CLAIMS["sub"]}
+
+
+# --- decode_id_token, the OpenID Connect ID-token decode (ADR 0016, issue #37) ---
+#
+# Keys are generated in the test session; no key material is committed.
+
+ISSUER = "https://idp.test/realms/herd"
+CLIENT_ID = "herd-client"
+CLIENT_SECRET = "client-secret-0123456789abcdef0123456789"
+NONCE = "nonce-value-for-the-flow"
+
+
+@pytest.fixture(scope="module")
+def id_keys() -> dict:
+    return {
+        "rsa": rsa.generate_private_key(public_exponent=65537, key_size=2048),
+        "other_rsa": rsa.generate_private_key(public_exponent=65537, key_size=2048),
+        "P-256": ec.generate_private_key(ec.SECP256R1()),
+        "P-384": ec.generate_private_key(ec.SECP384R1()),
+        "P-521": ec.generate_private_key(ec.SECP521R1()),
+    }
+
+
+def _key_for(algorithm: str, keys: dict):
+    curves = {"ES256": "P-256", "ES384": "P-384", "ES512": "P-521"}
+    return keys[curves[algorithm]] if algorithm in curves else keys["rsa"]
+
+
+def _id_claims(**changes) -> dict:
+    now = _now()
+    claims = {
+        "iss": ISSUER,
+        "aud": CLIENT_ID,
+        "sub": "subject-1",
+        "exp": now + 300,
+        "iat": now,
+        "nonce": NONCE,
+    }
+    for name, value in changes.items():
+        if value is _DROP:
+            claims.pop(name)
+        else:
+            claims[name] = value
+    return claims
+
+
+_DROP = object()
+
+
+def _id_token(claims: dict, private_key, algorithm: str = "RS256") -> str:
+    return jwt.encode(claims, private_key, algorithm=algorithm)
+
+
+def _b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _forged_hmac_token(claims: dict, secret: bytes, algorithm: str = "HS256") -> str:
+    """An HMAC token built by hand, as an attacker would: PyJWT's own encode
+    refuses a PEM block as an HMAC secret, so it cannot build this one."""
+    digest = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}
+    header = _b64(json.dumps({"alg": algorithm, "typ": "JWT"}).encode())
+    payload = _b64(json.dumps(claims).encode())
+    signing_input = f"{header}.{payload}".encode()
+    signature = hmac.new(secret, signing_input, digest[algorithm]).digest()
+    return f"{header}.{payload}.{_b64(signature)}"
+
+
+def _public(private_key):
+    return private_key.public_key()
+
+
+def _public_pem(private_key) -> bytes:
+    return private_key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+
+
+def _decode_id(token: str, key, algorithm: str = "RS256") -> dict:
+    return decode_id_token(token, key, algorithm, issuer=ISSUER, audience=CLIENT_ID)
+
+
+def test_id_token_algorithms_are_exactly_the_nine_asymmetric_ones():
+    assert ID_TOKEN_ALGORITHMS == (
+        "RS256",
+        "RS384",
+        "RS512",
+        "PS256",
+        "PS384",
+        "PS512",
+        "ES256",
+        "ES384",
+        "ES512",
+    )
+
+
+def test_id_token_required_claims_are_the_adr_six():
+    assert ID_TOKEN_REQUIRED_CLAIMS == ("exp", "iat", "iss", "aud", "sub", "nonce")
+
+
+@pytest.mark.parametrize("algorithm", ID_TOKEN_ALGORITHMS)
+def test_a_good_id_token_verifies_under_each_algorithm(algorithm, id_keys):
+    private_key = _key_for(algorithm, id_keys)
+    claims = _id_claims()
+    token = _id_token(claims, private_key, algorithm)
+    assert _decode_id(token, _public(private_key), algorithm) == claims
+
+
+def test_a_good_id_token_verifies_with_a_pyjwk_key(id_keys):
+    jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(_public(id_keys["rsa"])))
+    claims = _id_claims()
+    token = _id_token(claims, id_keys["rsa"])
+    assert _decode_id(token, jwt.PyJWK(jwk, algorithm="RS256")) == claims
+
+
+def test_id_decode_is_given_one_algorithm_issuer_audience_leeway_and_required_claims(
+    monkeypatch, id_keys
+):
+    seen: list = []
+    real_decode = jwt_codec.jwt.decode
+
+    def recording_decode(*args, **kwargs):
+        seen.append((args[1:], kwargs))
+        return real_decode(*args, **kwargs)
+
+    monkeypatch.setattr(jwt_codec.jwt, "decode", recording_decode)
+    key = _public(id_keys["rsa"])
+    _decode_id(_id_token(_id_claims(), id_keys["rsa"]), key)
+    assert seen == [
+        (
+            (key,),
+            {
+                "algorithms": ["RS256"],
+                "issuer": ISSUER,
+                "audience": CLIENT_ID,
+                "leeway": 10,
+                "options": {"require": ["exp", "iat", "iss", "aud", "sub", "nonce"]},
+            },
+        )
+    ]
+
+
+# Algorithms a caller might pass that the helper refuses before any decode.
+_REFUSED_ID_ALGORITHMS = ["HS256", "HS384", "HS512", "none", "None", "", "rs256", "EdDSA"]
+
+
+@pytest.mark.parametrize("algorithm", _REFUSED_ID_ALGORITHMS)
+def test_id_decode_refuses_a_non_asymmetric_algorithm_before_decoding(
+    algorithm, monkeypatch, id_keys
+):
+    calls: list = []
+    monkeypatch.setattr(jwt_codec.jwt, "decode", lambda *a, **k: calls.append(1))
+    token = _forged_hmac_token(_id_claims(), CLIENT_SECRET.encode())
+    with pytest.raises(jwt.InvalidAlgorithmError) as exc_info:
+        decode_id_token(token, CLIENT_SECRET, algorithm, issuer=ISSUER, audience=CLIENT_ID)
+    assert str(exc_info.value) == "The specified alg value is not allowed"
+    assert calls == []
+
+
+@pytest.mark.parametrize("hmac_algorithm", ["HS256", "HS384", "HS512"])
+def test_id_decode_refuses_an_hmac_token_keyed_by_the_client_secret(hmac_algorithm, id_keys):
+    token = _forged_hmac_token(_id_claims(), CLIENT_SECRET.encode(), hmac_algorithm)
+    with pytest.raises(jwt.InvalidAlgorithmError):
+        _decode_id(token, _public(id_keys["rsa"]))
+    # Even handed the client secret itself as the key.
+    with pytest.raises(jwt.InvalidAlgorithmError):
+        _decode_id(token, CLIENT_SECRET)
+
+
+def test_id_decode_refuses_an_hmac_token_keyed_by_the_public_key_pem(id_keys):
+    pem = _public_pem(id_keys["rsa"])
+    token = _forged_hmac_token(_id_claims(), pem)
+    for key in (pem, pem.decode(), _public(id_keys["rsa"])):
+        with pytest.raises(jwt.InvalidAlgorithmError):
+            _decode_id(token, key)
+
+
+def test_id_decode_refuses_alg_none(id_keys):
+    token = _unsigned_token(_id_claims())
+    with pytest.raises(jwt.InvalidAlgorithmError):
+        _decode_id(token, _public(id_keys["rsa"]))
+
+
+def test_id_decode_refuses_another_asymmetric_algorithm_than_the_pinned_one(id_keys):
+    token = _id_token(_id_claims(), id_keys["rsa"], "RS384")
+    with pytest.raises(jwt.InvalidAlgorithmError):
+        _decode_id(token, _public(id_keys["rsa"]), "RS256")
+    token = _id_token(_id_claims(), id_keys["rsa"], "PS256")
+    with pytest.raises(jwt.InvalidAlgorithmError):
+        _decode_id(token, _public(id_keys["rsa"]), "RS256")
+
+
+def test_id_decode_refuses_an_empty_expected_issuer_or_audience(id_keys):
+    claims = _id_claims(iss="", aud="")
+    token = _id_token(claims, id_keys["rsa"])
+    key = _public(id_keys["rsa"])
+    with pytest.raises(jwt.InvalidIssuerError):
+        decode_id_token(token, key, "RS256", issuer="", audience=CLIENT_ID)
+    with pytest.raises(jwt.InvalidAudienceError):
+        decode_id_token(token, key, "RS256", issuer=ISSUER, audience="")
+
+
+# Each refusal flips exactly one thing of a token that otherwise verifies
+# (test_a_good_id_token_verifies_under_each_algorithm): (claim changes, signing
+# key name, exact class, exact message).
+_ID_FAILURES = {
+    "wrong-signing-key": (
+        {},
+        "other_rsa",
+        jwt.InvalidSignatureError,
+        "Signature verification failed",
+    ),
+    "iss-different": (
+        {"iss": "https://evil.test/realms/herd"},
+        "rsa",
+        jwt.InvalidIssuerError,
+        "Invalid issuer",
+    ),
+    "iss-trailing-slash": ({"iss": ISSUER + "/"}, "rsa", jwt.InvalidIssuerError, "Invalid issuer"),
+    "iss-missing": (
+        {"iss": _DROP},
+        "rsa",
+        jwt.MissingRequiredClaimError,
+        'Token is missing the "iss" claim',
+    ),
+    "aud-different": (
+        {"aud": "other-client"},
+        "rsa",
+        jwt.InvalidAudienceError,
+        "Audience doesn't match",
+    ),
+    "aud-list-without-client": (
+        {"aud": ["other-client", "third"]},
+        "rsa",
+        jwt.InvalidAudienceError,
+        "Audience doesn't match",
+    ),
+    "aud-missing": (
+        {"aud": _DROP},
+        "rsa",
+        jwt.MissingRequiredClaimError,
+        'Token is missing the "aud" claim',
+    ),
+    "exp-past-the-leeway": (
+        {"exp": "PAST12"},
+        "rsa",
+        jwt.ExpiredSignatureError,
+        "Signature has expired",
+    ),
+    "exp-missing": (
+        {"exp": _DROP},
+        "rsa",
+        jwt.MissingRequiredClaimError,
+        'Token is missing the "exp" claim',
+    ),
+    "iat-past-the-leeway": (
+        {"iat": "FUTURE12"},
+        "rsa",
+        jwt.ImmatureSignatureError,
+        "The token is not yet valid (iat)",
+    ),
+    "iat-missing": (
+        {"iat": _DROP},
+        "rsa",
+        jwt.MissingRequiredClaimError,
+        'Token is missing the "iat" claim',
+    ),
+    "nbf-past-the-leeway": (
+        {"nbf": "FUTURE12"},
+        "rsa",
+        jwt.ImmatureSignatureError,
+        "The token is not yet valid (nbf)",
+    ),
+    "sub-missing": (
+        {"sub": _DROP},
+        "rsa",
+        jwt.MissingRequiredClaimError,
+        'Token is missing the "sub" claim',
+    ),
+    "sub-not-a-string": (
+        {"sub": 7},
+        "rsa",
+        jwt.exceptions.InvalidSubjectError,
+        "Subject must be a string",
+    ),
+    "nonce-missing": (
+        {"nonce": _DROP},
+        "rsa",
+        jwt.MissingRequiredClaimError,
+        'Token is missing the "nonce" claim',
+    ),
+    "nonce-null": (
+        {"nonce": None},
+        "rsa",
+        jwt.MissingRequiredClaimError,
+        'Token is missing the "nonce" claim',
+    ),
+}
+
+
+def _resolve_times(changes: dict) -> dict:
+    now = _now()
+    marks = {"PAST12": now - 12, "FUTURE12": now + 12}
+    return {k: marks.get(v, v) if isinstance(v, str) else v for k, v in changes.items()}
+
+
+@pytest.mark.parametrize("name", sorted(_ID_FAILURES))
+def test_each_id_token_failure_raises_its_exact_class(name, id_keys):
+    changes, signer, error_class, message = _ID_FAILURES[name]
+    token = _id_token(_id_claims(**_resolve_times(changes)), id_keys[signer])
+    with pytest.raises(jwt.PyJWTError) as exc_info:
+        _decode_id(token, _public(id_keys["rsa"]))
+    assert type(exc_info.value) is error_class
+    assert str(exc_info.value) == message
+
+
+def test_a_tampered_id_token_payload_is_refused(id_keys):
+    header, _, signature = _id_token(_id_claims(), id_keys["rsa"]).split(".")
+    forged = _b64(json.dumps(_id_claims(sub="someone-else")).encode())
+    with pytest.raises(jwt.InvalidSignatureError):
+        _decode_id(f"{header}.{forged}.{signature}", _public(id_keys["rsa"]))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{"exp": -5}, {"iat": 5}, {"nbf": 5}, {"aud": [CLIENT_ID]}, {"aud": [CLIENT_ID, "other"]}],
+    ids=["exp-inside-leeway", "iat-inside-leeway", "nbf-inside-leeway", "aud-list", "aud-multi"],
+)
+def test_id_token_inside_the_leeway_or_with_an_aud_list_verifies(changes, id_keys):
+    now = _now()
+    resolved = {k: (now + v if k in ("exp", "iat", "nbf") else v) for k, v in changes.items()}
+    claims = _id_claims(**resolved)
+    token = _id_token(claims, id_keys["rsa"])
+    assert _decode_id(token, _public(id_keys["rsa"])) == claims
