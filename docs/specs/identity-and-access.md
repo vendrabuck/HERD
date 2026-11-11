@@ -1384,32 +1384,45 @@ sends signed-out visitors to the login page, and keeps admin pages away from non
 
 **Surfaces.** `frontend/src/stores/authStore.ts`, `frontend/src/api/client.ts`,
 `frontend/src/api/auth.ts`, `frontend/src/components/guards.tsx`,
-`frontend/src/routes.tsx`, `frontend/src/lib/roles.ts`,
-`frontend/src/components/layout/AppLayout.tsx`.
+`frontend/src/routes.tsx`, `frontend/src/lib/roles.ts`, `frontend/src/lib/login.ts`,
+`frontend/src/pages/LoginPage.tsx`, `frontend/src/components/layout/AppLayout.tsx`.
 
 **Rules.**
 
-- **IAM-UI-1.** The access and refresh tokens live in `localStorage`; the app counts as
-  signed in whenever an access token is stored. \
+- **IAM-UI-1.** The access and refresh tokens live in `localStorage`, so every tab of
+  one browser profile shares them; the app counts as signed in whenever an access token
+  is stored. \
   Enforced in: `frontend/src/stores/authStore.ts` (`useAuthStore`) \
   Pinned by: `frontend/src/test/stores/authStore.test.ts` (`setTokens persists to localStorage and updates state`, `reads tokens from localStorage on initialization`, `initializes with null tokens when localStorage is empty`, `is not authenticated from a stored refresh token alone`, `clearAuth removes tokens and resets state`)
-- **IAM-UI-2.** A 401 on any call other than login and refresh triggers one refresh;
-  concurrent 401s wait for that single refresh and are retried with the new token, and
-  each request is retried at most once. \
-  Enforced in: `frontend/src/api/client.ts` (`apiClient`, `processQueue`) \
-  Pinned by: `frontend/src/test/api/client.test.ts` (`refreshes token and retries original request on 401`, `queues concurrent 401s behind a single refresh and retries all of them`, `does not loop refresh when the refresh endpoint itself returns 401`, `does not attempt refresh for non-401 errors`)
-- **IAM-UI-3.** A failed refresh, or a 401 with no stored refresh token, clears the
-  stored tokens and rejects every waiting request. \
-  Enforced in: `frontend/src/api/client.ts` (`apiClient`) \
-  Pinned by: `frontend/src/test/api/client.test.ts` (`clears auth when 401 received with no refresh token`, `clears auth when refresh request itself fails`, `rejects queued requests when the shared refresh fails`)
+- **IAM-UI-2.** A 401 on any call other than login and refresh is decided on the tokens
+  storage holds at that moment, not on the tab's memory: when storage holds an access
+  token other than the one the request carried, the request is retried with it and no
+  refresh is sent; otherwise the tab refreshes with the stored refresh token. One
+  refresh at a time runs per tab: every 401 that arrives while it is in flight waits for
+  it, then is retried with its access token or rejected with its error. Each request is
+  retried at most once, and the refresh request times out after 15 s
+  (`REFRESH_TIMEOUT_MS`). When storage cannot be read, the tab uses its own memory. \
+  Enforced in: `frontend/src/api/client.ts` (`apiClient`, `freshAccessToken`, `refreshOnce`, `REFRESH_TIMEOUT_MS`) \
+  Pinned by: `frontend/src/test/api/client.test.ts` (`refreshes token and retries original request on 401`, `queues concurrent 401s behind a single refresh and retries all of them`, `does not loop refresh when the refresh endpoint itself returns 401`, `does not attempt refresh for non-401 errors`); `frontend/src/test/api/clientMultiTab.test.ts` (`A refreshes, then B's request with the rotated-away token 401s: B retries with A's token and never posts R1`, `storage that throws: the tab refreshes from its own memory and still signs out on a refusal`)
+- **IAM-UI-3.** Only a 401 from the refresh route ends the session (auth refuses a used
+  refresh token with no grace window, IAM-SESSION-2), and it clears the shared tokens
+  only when storage still holds the refused refresh token, or none; when storage holds
+  another one, the tab adopts what is stored and retries with it. A 401 when no refresh
+  token is stored also clears them. Either way every waiting request is rejected. A
+  refresh that fails any other way (no answer, a timeout, a 5xx) rejects the waiting
+  requests and keeps the tokens, so an auth outage does not sign anyone out. \
+  Enforced in: `frontend/src/api/client.ts` (`refreshOnce`, `onRefreshRefused`) \
+  Pinned by: `frontend/src/test/api/client.test.ts` (`clears auth when 401 received with no refresh token`, `clears auth when refresh request itself fails`, `rejects queued requests when the shared refresh fails`); `frontend/src/test/api/clientMultiTab.test.ts` (`B's refresh is in flight when A's completes: B's late refusal adopts what A stored, and storage is never cleared`, `a genuinely revoked session signs out every tab`, `a refresh that fails without a 401 keeps the shared tokens, and a later request refreshes normally`)
 - **IAM-UI-4.** Logout clears the stored tokens and cached data even when the server
   call fails. \
   Enforced in: `frontend/src/api/auth.ts` (`useLogout`) \
   Pinned by: `frontend/src/test/api/auth.test.tsx` (`useLogout clears auth even when the server errors`); `tests/e2e/test_register_and_roles.py` (`test_logout_returns_to_login_and_clears_tokens`)
-- **IAM-UI-5.** `AuthGuard` sends a signed-out visitor to `/login`; `GuestGuard` sends a
-  signed-in visitor away from `/login` and `/register` to `/topology`. \
+- **IAM-UI-5.** `AuthGuard` sends a signed-out visitor to `/login`, recording the path,
+  query, and hash they asked for (IAM-UI-13); `GuestGuard` sends a signed-in visitor away
+  from `/login` and `/register` to that recorded path when it is safe, else to
+  `/topology`. \
   Enforced in: `frontend/src/components/guards.tsx` (`AuthGuard`, `GuestGuard`) \
-  Pinned by: `frontend/src/test/components/guards.test.tsx` (`redirects an unauthenticated user to /login`, `redirects an authenticated user to /topology`, `renders children for an authenticated user`, `renders children for an unauthenticated user`)
+  Pinned by: `frontend/src/test/components/guards.test.tsx` (`redirects an unauthenticated user to /login`, `redirects an authenticated user to /topology`, `renders children for an authenticated user`, `renders children for an unauthenticated user`, `AuthGuard records the path, query, and hash it was asked for`, `GuestGuard sends a signed-in visitor to the safe recorded path`, `GuestGuard ignores an unsafe recorded path`)
 - **IAM-UI-6.** `AdminGuard` renders nothing until the account is loaded, then sends a
   non-admin to `/topology`. It is a convenience: the backend gates every admin route on
   its own. \
@@ -1424,16 +1437,70 @@ sends signed-out visitors to the login page, and keeps admin pages away from non
   Enforced in: `frontend/src/lib/roles.ts` (`isAdminRole`); `frontend/src/components/layout/AppLayout.tsx` (`AppLayout`) \
   Pinned by: `frontend/src/test/lib/roles.test.ts` (`returns true for admin`, `returns true for superadmin`, `returns false for user`, `is case-sensitive: Admin does not count`); `tests/e2e/test_register_and_roles.py` (`test_non_admin_has_no_administration_menu`)
 - **IAM-UI-9.** The login form is disabled and refuses to submit while the config
-  service reports the system unconfigured; any login failure shows one message, `Invalid
-  email or password`. \
-  Enforced in: `frontend/src/pages/LoginPage.tsx` (`LoginPage`) \
-  Pinned by: `frontend/src/test/pages/LoginPage.test.tsx` (`shows the unconfigured banner and disables fields when configured=false`, `toasts an error when login is rejected`)
+  service reports the system unconfigured. A login failure is named by its cause and
+  never shows server text: only a 401 shows `Invalid credentials. Check the email or
+  username and the password.`; no answer (a network error or a timeout), a 404 (the
+  gateway's answer while auth is down), and any 5xx show `Could not reach HERD. Try again
+  in a moment.`; a 422 names the length limits of IAM-LOGIN-3; a 429 shows `Too many
+  sign-in attempts.` with the `Retry-After` wait when it is a whole number of seconds;
+  any other status shows `Sign-in failed with an unexpected answer. Try again in a
+  moment.` Auth itself answers a login with no 429 and no 403 (IAM-LOGIN-1). \
+  Enforced in: `frontend/src/pages/LoginPage.tsx` (`LoginPage`); `frontend/src/lib/login.ts` (`loginErrorText`) \
+  Pinned by: `frontend/src/test/pages/LoginPage.test.tsx` (`shows the unconfigured banner and disables fields when configured=false`, `toasts an error when login is rejected`, `a network error says HERD is unreachable`, `a 422 names the length limits instead of the credentials`, `a 429 says to wait, with the Retry-After seconds`, `a 403 gets the unexpected-answer wording, never the server's text`); `frontend/src/test/lib/login.test.ts` (`calls only a 401 a credential refusal`, `gives a 429 the rate-limit wording, with the wait when Retry-After is whole seconds`)
 - **IAM-UI-10.** Registration success sends the user to `/login`; a failure shows the
   server's detail. \
   Enforced in: `frontend/src/pages/RegisterPage.tsx` (`RegisterPage`) \
   Pinned by: `frontend/src/test/pages/RegisterPage.test.tsx` (`navigates to /login and toasts on success`, `toasts the backend detail on failure`)
+- **IAM-UI-11.** Each tab mirrors the other tabs' writes: on a `storage` event for
+  `access_token` or `refresh_token`, or for a whole-storage clear, it re-reads both keys
+  and takes them as its own state without writing storage. A login, refresh, or logout
+  in one tab therefore reaches every other tab, and a logout in one tab signs every tab
+  out. The refresh token is written before the access token and the access token is
+  removed first, so a tab that reads a new access token finds its refresh token already
+  stored. When storage cannot be read or written, the tab works from its own memory and
+  sees no other tab. \
+  Enforced in: `frontend/src/stores/authStore.ts` (`useAuthStore`, `startStorageSync`, `readStoredTokens`) \
+  Pinned by: `frontend/src/test/stores/authStore.test.ts` (`adopts tokens another tab stored when the storage event arrives`, `signs this tab out when another tab removes the tokens`, `signs this tab out when another tab clears the whole storage (key null)`, `ignores a storage event for an unrelated key`, `writes the refresh token before the access token and removes the access token first`, `keeps working from memory when storage throws`, `starts signed out instead of throwing when getItem throws`)
+- **IAM-UI-12.** Where the browser offers Web Locks (`navigator.locks`, which exists only
+  in a secure context such as HTTPS), a refresh holds the exclusive lock
+  `herd-auth-refresh`, so one refresh runs at a time across all tabs, and a tab that
+  gets the lock after another tab refreshed adopts that result (IAM-UI-2) instead of
+  refreshing. Without Web Locks there is no cross-tab exclusion: two tabs can send the
+  same refresh token, auth admits one (IAM-SESSION-2), and a tab whose refresh is refused
+  while storage still holds the refused token polls storage for up to 2 s
+  (`UNLOCKED_REFUSAL_GRACE_MS`) for the other tab's write before it clears. A refreshed
+  pair is stored only when storage still holds the refresh token that was sent; when it
+  does not (another tab logged out or logged in meanwhile), the pair is revoked with
+  `POST /logout` and the tab follows storage, so a refresh in flight never undoes a
+  logout. The race left without Web Locks: when the winning tab's pair reaches storage
+  more than 2 s after the losing tab's refusal, the loser clears storage, the winner then
+  revokes its pair instead of storing it, and every tab ends signed out. \
+  Enforced in: `frontend/src/api/client.ts` (`freshAccessToken`, `REFRESH_LOCK_NAME`, `UNLOCKED_REFUSAL_GRACE_MS`, `onRefreshRefused`, `commitRefreshed`) \
+  Pinned by: `frontend/src/test/api/clientMultiTab.test.ts` (`both tabs 401 at the same moment with Web Locks: one refresh serves both`, `both tabs 401 at the same moment without Web Locks: the refused tab waits for the winner's write and adopts it`, `without Web Locks, a winner whose write lands after the grace leaves every tab consistently signed out and revokes its new pair`, `A logs out while B's request is in flight: B's 401 sends no refresh and signs B out`, `A logs out while B's refresh is in flight: the logout wins and B's new pair is revoked, not stored`); `tests/e2e/test_multi_tab_session_playwright.py` (`test_refresh_in_one_tab_keeps_the_other_tab_signed_in`)
+- **IAM-UI-13.** A recorded return path is honored only when it is a string that starts
+  with exactly one `/`, holds no backslash and no control character (C0, DEL, or C1),
+  resolves against the page's origin to that origin, and is not `/login` or `/register`;
+  anything else goes to `/topology`. After a successful sign-in the login page goes to
+  the honored path, replacing the login entry in history. A session that ends under the
+  401 handling (IAM-UI-3) reaches `/login` through `AuthGuard`, so it records the page
+  the same way. \
+  Enforced in: `frontend/src/lib/login.ts` (`safeReturnPath`, `returnPathFromState`, `DEFAULT_AFTER_LOGIN`); `frontend/src/components/guards.tsx` (`AuthGuard`, `GuestGuard`); `frontend/src/pages/LoginPage.tsx` (`LoginPage`) \
+  Pinned by: `frontend/src/test/pages/LoginReturnFlow.test.tsx` (`a signed-out deep link returns to that page after sign-in`, `a session that expires mid-page (refresh refused) returns to that page after sign-in`, `a recorded //evil.example never leaves the app`); `frontend/src/test/pages/LoginPage.test.tsx` (`returns to the recorded page, query and hash included`); `frontend/src/test/lib/login.test.ts` (`returns a safe recorded path`)
+- **IAM-UI-14.** The login identifier field (`id` `login-email`) is a plain text input
+  labeled `Email or username`, with that placeholder, `autocomplete` `username`, and
+  `inputmode` `email`, and with no client-side email validation, because in LDAP mode
+  the identifier is the directory login name (IAM-LDAP-2), which need not contain an
+  `@`. The page does not know the active mode, so the field is the same in both modes;
+  the request body keeps the field name `email`. The password input has `autocomplete`
+  `current-password`, and the icon-only configuration link is named `System
+  configuration`. \
+  Enforced in: `frontend/src/pages/LoginPage.tsx` (`LoginPage`) \
+  Pinned by: `frontend/src/test/pages/LoginPage.test.tsx` (`is a text field with username autocomplete and an email keyboard, never type=email`, `submits a plain directory login name with no @ in the email field`, `names the icon-only configuration link`)
 
-**Out of scope.** Theming and preferences (`operations-and-observability.md`).
+**Out of scope.** Theming and preferences (`operations-and-observability.md`). The
+login page does not yet adapt to the authentication mode: it shows the Register link in
+LDAP mode too, where registration answers 409; the mode-aware page waits for the public
+`GET /api/auth/login-options` route that ADR 0016 adds.
 
 ### 8.18 User profile
 
