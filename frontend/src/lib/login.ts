@@ -36,20 +36,32 @@ export function safeReturnPath(value: unknown): string | null {
 
 /**
  * The location state AuthGuard records when it sends a signed-out visitor to
- * /login: the path, query, and hash they asked for.
+ * /login: the path, query, and hash they asked for, and the subject of the
+ * account that was last signed in in this tab (null when none was).
  */
 export interface LoginRedirectState {
   from: string;
+  sub: string | null;
 }
 
-/** Where to go after a sign-in, from the login route's location state. */
-export function returnPathFromState(state: unknown): string {
-  const from = (state as { from?: unknown } | null | undefined)?.from;
-  return safeReturnPath(from) ?? DEFAULT_AFTER_LOGIN;
+/**
+ * Where to go after a sign-in, from the login route's location state and the
+ * subject of the account now signed in. The recorded path is honored only
+ * when it is safe and was recorded for the same account (or for no account,
+ * a first visit); another account goes to the default page, so it never
+ * lands on the previous account's page.
+ */
+export function returnPathFromState(state: unknown, subject: string | null): string {
+  const recorded = state as { from?: unknown; sub?: unknown } | null | undefined;
+  const from = safeReturnPath(recorded?.from);
+  if (from === null) return DEFAULT_AFTER_LOGIN;
+  const sub = recorded?.sub ?? null;
+  if (sub === null) return from;
+  return typeof sub === "string" && sub === subject ? from : DEFAULT_AFTER_LOGIN;
 }
 
 export const LOGIN_INVALID_CREDENTIALS =
-  "Invalid credentials. Check the email or username and the password.";
+  "Invalid credentials. Check your email or login name and your password.";
 export const LOGIN_UNREACHABLE = "Could not reach HERD. Try again in a moment.";
 export const LOGIN_INPUT_REFUSED =
   "HERD could not accept these sign-in details. The email or username can be at most 255 characters and the password at most 72.";
@@ -59,7 +71,7 @@ export const LOGIN_RATE_LIMITED = "Too many sign-in attempts. Wait a moment, the
 /**
  * The toast for a failed `POST /api/auth/login` (issue #1333). Only a 401 is
  * a credential refusal (IAM-LOGIN-1, IAM-LDAP-5). No answer at all (network
- * error, timeout), a 404 (the gateway has no route while auth is down), and
+ * error, the client timeout LOGIN_TIMEOUT_MS), a 404 (the gateway has no route while auth is down), and
  * any 5xx (a gateway 502 or 504 included) mean HERD could not be reached. A
  * 422 is the request schema's length limits (IAM-LOGIN-3). Auth sends no 429
  * or 403 on login today; a 429 from anything in front of it gets the rate

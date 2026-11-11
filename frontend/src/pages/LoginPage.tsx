@@ -7,6 +7,7 @@ import { useConfigStatus } from "@/api/config";
 import { Button } from "@/components/ui/Button";
 import { APP_VERSION } from "@/lib/appVersion";
 import { loginErrorText, returnPathFromState } from "@/lib/login";
+import { tokenSubject } from "@/stores/authStore";
 
 export function LoginPage() {
   const navigate = useNavigate();
@@ -24,8 +25,10 @@ export function LoginPage() {
       return;
     }
     try {
-      await login.mutateAsync(form);
-      navigate(returnPathFromState(location.state), { replace: true });
+      const tokens = await login.mutateAsync(form);
+      navigate(returnPathFromState(location.state, tokenSubject(tokens.access_token)), {
+        replace: true,
+      });
     } catch (err) {
       toast.error(loginErrorText(err));
     }
@@ -57,7 +60,7 @@ export function LoginPage() {
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
-            <label htmlFor="login-email" className="block text-sm font-medium text-gray-700 mb-1">Email or username</label>
+            <label htmlFor="login-email" className="block text-sm font-medium text-gray-700 mb-1">Email</label>
             {/* type="text", not "email": in LDAP mode this is the directory
                 login name, which need not contain an @ (IAM-LDAP-2, issue
                 #1335). The backend validates the value in both modes. */}
@@ -73,8 +76,12 @@ export function LoginPage() {
               value={form.email}
               onChange={(e) => setForm({ ...form, email: e.target.value })}
               className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:bg-gray-100"
-              placeholder="Email or username"
+              placeholder="you@example.com"
+              aria-describedby="login-email-help"
             />
+            <p id="login-email-help" className="mt-1 text-xs text-gray-500">
+              Directory accounts: enter your directory login name.
+            </p>
           </div>
 
           <div>

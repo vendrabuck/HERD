@@ -1,6 +1,10 @@
 import { http, HttpResponse } from "msw";
 import type { AxiosInstance } from "axios";
 import { server } from "../mocks/server";
+import { fakeJwt } from "../fixtures/jwt";
+
+/** Alice's n-th access token (JWT-shaped, so the store can read its account). */
+const T = (n: number) => fakeJwt("alice", n);
 
 /*
  * Issue #1316: two tabs of one browser profile, simulated as two fresh module
@@ -29,6 +33,7 @@ interface Tab {
   client: AxiosInstance;
   store: typeof import("@/stores/authStore").useAuthStore;
   stop: () => void;
+  logout: typeof import("@/api/client").logoutUnderRefreshLock;
 }
 
 const openTabs: Tab[] = [];
@@ -41,6 +46,7 @@ async function openTab(): Promise<Tab> {
     client: clientModule.default,
     store: storeModule.useAuthStore,
     stop: storeModule.stopStorageSync,
+    logout: clientModule.logoutUnderRefreshLock,
   };
   openTabs.push(tab);
   return tab;
@@ -94,7 +100,7 @@ function installAuthModel(liveRefresh: string[] = ["R1"]): AuthModel {
       let pair: { access_token: string; refresh_token: string } | null = null;
       if (accepted) {
         minted += 1;
-        pair = { access_token: `T${minted}`, refresh_token: `R${minted}` };
+        pair = { access_token: T(minted), refresh_token: `R${minted}` };
         model.live.add(pair.refresh_token);
         model.validAccess.add(pair.access_token);
       }
@@ -125,22 +131,47 @@ function installAuthModel(liveRefresh: string[] = ["R1"]): AuthModel {
   return model;
 }
 
-/** A fake LockManager shared by every tab: one FIFO exclusive lock per name. */
+/**
+ * A fake LockManager shared by every tab: one FIFO exclusive lock per name.
+ * Like the real one it takes `request(name, callback)` or
+ * `request(name, { signal }, callback)`, and a request still waiting when its
+ * signal aborts rejects with an AbortError and never runs its callback.
+ */
 function installFakeWebLocks() {
   const tails = new Map<string, Promise<unknown>>();
   const fake = {
     grants: 0,
-    request<T>(name: string, callback: () => Promise<T>): Promise<T> {
+    aborted: 0,
+    request<T>(
+      name: string,
+      optionsOrCallback: { signal?: AbortSignal } | (() => Promise<T>),
+      maybeCallback?: () => Promise<T>,
+    ): Promise<T> {
+      const callback =
+        typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback!;
+      const signal = typeof optionsOrCallback === "function" ? undefined : optionsOrCallback.signal;
       const previous = tails.get(name) ?? Promise.resolve();
-      const run = previous.then(() => {
+      let abortedFirst = false;
+      let isGranted = false;
+      const aborted = new Promise<never>((_, reject) => {
+        signal?.addEventListener("abort", () => {
+          if (isGranted) return;
+          abortedFirst = true;
+          fake.aborted += 1;
+          reject(new DOMException("aborted", "AbortError"));
+        });
+      });
+      const granted = previous.then(() => {
+        if (abortedFirst) throw new DOMException("aborted", "AbortError");
+        isGranted = true;
         fake.grants += 1;
         return callback();
       });
       tails.set(
         name,
-        run.catch(() => undefined),
+        granted.catch(() => undefined),
       );
-      return run;
+      return signal ? Promise.race([granted, aborted]) : granted;
     },
   };
   Object.defineProperty(navigator, "locks", { value: fake, configurable: true });
@@ -169,32 +200,32 @@ afterEach(() => {
 describe("two tabs share one rotating session (issue #1316)", () => {
   it("A refreshes, then B's request with the rotated-away token 401s: B retries with A's token and never posts R1", async () => {
     const model = installAuthModel();
-    signIn("T1", "R1");
+    signIn(T(1), "R1");
     const a = await openTab();
     const b = await openTab();
 
-    await expect(a.client.get("/thing")).resolves.toMatchObject({ data: { token: "T2" } });
+    await expect(a.client.get("/thing")).resolves.toMatchObject({ data: { token: T(2) } });
     // No storage event reaches B: its memory still holds T1 and R1.
-    expect(b.store.getState().accessToken).toBe("T1");
+    expect(b.store.getState().accessToken).toBe(T(1));
 
-    await expect(b.client.get("/thing")).resolves.toMatchObject({ data: { token: "T2" } });
+    await expect(b.client.get("/thing")).resolves.toMatchObject({ data: { token: T(2) } });
     expect(model.refreshCalls).toEqual(["R1"]);
-    expect(b.store.getState().accessToken).toBe("T2");
+    expect(b.store.getState().accessToken).toBe(T(2));
     expect(b.store.getState().refreshToken).toBe("R2");
-    expect(stored()).toEqual({ access: "T2", refresh: "R2" });
+    expect(stored()).toEqual({ access: T(2), refresh: "R2" });
   });
 
   it("A refreshes and the storage event reaches B: B's next request carries the new token at once", async () => {
     const model = installAuthModel();
-    signIn("T1", "R1");
+    signIn(T(1), "R1");
     const a = await openTab();
     const b = await openTab();
 
     await a.client.get("/thing");
     deliverStorageEvent();
-    expect(b.store.getState().accessToken).toBe("T2");
+    expect(b.store.getState().accessToken).toBe(T(2));
 
-    await expect(b.client.get("/thing")).resolves.toMatchObject({ data: { token: "T2" } });
+    await expect(b.client.get("/thing")).resolves.toMatchObject({ data: { token: T(2) } });
     expect(model.refreshCalls).toEqual(["R1"]);
   });
 
@@ -202,16 +233,16 @@ describe("two tabs share one rotating session (issue #1316)", () => {
     const model = installAuthModel();
     model.refreshDelays = [30];
     const locks = installFakeWebLocks();
-    signIn("T1", "R1");
+    signIn(T(1), "R1");
     const a = await openTab();
     const b = await openTab();
 
     const [ra, rb] = await Promise.all([a.client.get("/thing"), b.client.get("/thing")]);
-    expect(ra.data).toEqual({ token: "T2" });
-    expect(rb.data).toEqual({ token: "T2" });
+    expect(ra.data).toEqual({ token: T(2) });
+    expect(rb.data).toEqual({ token: T(2) });
     expect(model.refreshCalls).toEqual(["R1"]);
     expect(locks.grants).toBe(2);
-    expect(stored()).toEqual({ access: "T2", refresh: "R2" });
+    expect(stored()).toEqual({ access: T(2), refresh: "R2" });
     expect(a.store.getState().isAuthenticated).toBe(true);
     expect(b.store.getState().isAuthenticated).toBe(true);
   });
@@ -220,15 +251,15 @@ describe("two tabs share one rotating session (issue #1316)", () => {
     const model = installAuthModel();
     // The first refresh (the winner) answers late; the second, refused, at once.
     model.refreshDelays = [150, 0];
-    signIn("T1", "R1");
+    signIn(T(1), "R1");
     const a = await openTab();
     const b = await openTab();
 
     const [ra, rb] = await Promise.all([a.client.get("/thing"), b.client.get("/thing")]);
-    expect(ra.data).toEqual({ token: "T2" });
-    expect(rb.data).toEqual({ token: "T2" });
+    expect(ra.data).toEqual({ token: T(2) });
+    expect(rb.data).toEqual({ token: T(2) });
     expect(model.refreshCalls).toEqual(["R1", "R1"]);
-    expect(stored()).toEqual({ access: "T2", refresh: "R2" });
+    expect(stored()).toEqual({ access: T(2), refresh: "R2" });
     expect(a.store.getState().isAuthenticated).toBe(true);
     expect(b.store.getState().isAuthenticated).toBe(true);
     expect(model.logoutCalls).toEqual([]);
@@ -240,7 +271,7 @@ describe("two tabs share one rotating session (issue #1316)", () => {
     // request starts before that answer, so B also posts R1; its refusal
     // answers after 100 ms, when A has already written T2 and R2.
     model.refreshDelays = [40, 100];
-    signIn("T1", "R1");
+    signIn(T(1), "R1");
     const a = await openTab();
     const b = await openTab();
     const removeItem = vi.spyOn(Storage.prototype, "removeItem");
@@ -249,18 +280,18 @@ describe("two tabs share one rotating session (issue #1316)", () => {
     await sleep(5);
     const pb = b.client.get("/thing");
     const [ra, rb] = await Promise.all([pa, pb]);
-    expect(ra.data).toEqual({ token: "T2" });
-    expect(rb.data).toEqual({ token: "T2" });
+    expect(ra.data).toEqual({ token: T(2) });
+    expect(rb.data).toEqual({ token: T(2) });
     expect(model.refreshCalls).toEqual(["R1", "R1"]);
     expect(removeItem).not.toHaveBeenCalled();
-    expect(stored()).toEqual({ access: "T2", refresh: "R2" });
+    expect(stored()).toEqual({ access: T(2), refresh: "R2" });
   });
 
   it("without Web Locks, a winner whose write lands after the grace leaves every tab consistently signed out and revokes its new pair", async () => {
-    const { UNLOCKED_REFUSAL_GRACE_MS } = await import("@/api/client");
+    const { REFUSAL_GRACE_MS } = await import("@/api/client");
     const model = installAuthModel();
-    model.refreshDelays = [UNLOCKED_REFUSAL_GRACE_MS + 400, 0];
-    signIn("T1", "R1");
+    model.refreshDelays = [REFUSAL_GRACE_MS + 400, 0];
+    signIn(T(1), "R1");
     const a = await openTab();
     const b = await openTab();
 
@@ -277,7 +308,7 @@ describe("two tabs share one rotating session (issue #1316)", () => {
   it("A logs out while B's request is in flight: B's 401 sends no refresh and signs B out", async () => {
     const model = installAuthModel();
     model.protectedDelay = 50;
-    signIn("T1", "R1");
+    signIn(T(1), "R1");
     const a = await openTab();
     const b = await openTab();
 
@@ -294,7 +325,7 @@ describe("two tabs share one rotating session (issue #1316)", () => {
   it("A logs out while B's refresh is in flight: the logout wins and B's new pair is revoked, not stored", async () => {
     const model = installAuthModel();
     model.refreshDelays = [60];
-    signIn("T1", "R1");
+    signIn(T(1), "R1");
     const a = await openTab();
     const b = await openTab();
 
@@ -312,7 +343,7 @@ describe("two tabs share one rotating session (issue #1316)", () => {
   it("a genuinely revoked session signs out every tab", async () => {
     const model = installAuthModel([]);
     installFakeWebLocks();
-    signIn("T1", "R1");
+    signIn(T(1), "R1");
     const a = await openTab();
     const b = await openTab();
 
@@ -326,11 +357,11 @@ describe("two tabs share one rotating session (issue #1316)", () => {
     await expect(b.client.get("/thing")).rejects.toMatchObject({ response: { status: 401 } });
     // B had nothing left to refresh with, so it sent nothing.
     expect(model.refreshCalls).toEqual(["R1"]);
-  });
+  }, 10000);
 
   it("a genuinely revoked session signs out without Web Locks too, after the grace", async () => {
     const model = installAuthModel([]);
-    signIn("T1", "R1");
+    signIn(T(1), "R1");
     const a = await openTab();
 
     await expect(a.client.get("/thing")).rejects.toMatchObject({ response: { status: 401 } });
@@ -341,7 +372,7 @@ describe("two tabs share one rotating session (issue #1316)", () => {
 
   it("a refresh that fails without a 401 keeps the shared tokens, and a later request refreshes normally", async () => {
     const model = installAuthModel();
-    signIn("T1", "R1");
+    signIn(T(1), "R1");
     const a = await openTab();
     server.use(
       http.post("/api/auth/refresh", () => HttpResponse.json({ detail: "x" }, { status: 503 }), {
@@ -350,10 +381,10 @@ describe("two tabs share one rotating session (issue #1316)", () => {
     );
 
     await expect(a.client.get("/thing")).rejects.toMatchObject({ response: { status: 503 } });
-    expect(stored()).toEqual({ access: "T1", refresh: "R1" });
+    expect(stored()).toEqual({ access: T(1), refresh: "R1" });
     expect(a.store.getState().isAuthenticated).toBe(true);
 
-    await expect(a.client.get("/thing")).resolves.toMatchObject({ data: { token: "T2" } });
+    await expect(a.client.get("/thing")).resolves.toMatchObject({ data: { token: T(2) } });
     expect(model.refreshCalls).toEqual(["R1"]);
   });
 
@@ -370,10 +401,10 @@ describe("two tabs share one rotating session (issue #1316)", () => {
     });
     const a = await openTab();
     expect(a.store.getState().isAuthenticated).toBe(false);
-    a.store.getState().setTokens("T1", "R1");
+    a.store.getState().setTokens(T(1), "R1");
 
-    await expect(a.client.get("/thing")).resolves.toMatchObject({ data: { token: "T2" } });
-    expect(a.store.getState().accessToken).toBe("T2");
+    await expect(a.client.get("/thing")).resolves.toMatchObject({ data: { token: T(2) } });
+    expect(a.store.getState().accessToken).toBe(T(2));
     expect(model.refreshCalls).toEqual(["R1"]);
 
     model.validAccess.clear();
@@ -382,4 +413,144 @@ describe("two tabs share one rotating session (issue #1316)", () => {
     expect(model.refreshCalls).toEqual(["R1", "R2"]);
     expect(a.store.getState().isAuthenticated).toBe(false);
   }, 10000);
+
+  it("with Web Locks, a lock holder that still reads the refused token waits for the other tab's write and adopts it", async () => {
+    // Another tab already rotated R1 into R2 at auth, but its storage write
+    // has not reached this tab's view yet when this tab holds the lock.
+    const model = installAuthModel(["R2"]);
+    model.validAccess.add(T(2));
+    installFakeWebLocks();
+    signIn(T(1), "R1");
+    const a = await openTab();
+
+    const pending = a.client.get("/thing");
+    await sleep(100);
+    expect(model.refreshCalls).toEqual(["R1"]);
+    signIn(T(2), "R2");
+
+    await expect(pending).resolves.toMatchObject({ data: { token: T(2) } });
+    expect(stored()).toEqual({ access: T(2), refresh: "R2" });
+    expect(a.store.getState().isAuthenticated).toBe(true);
+  }, 10000);
+
+  it("a tab whose lock wait times out goes on without the lock instead of waiting forever", async () => {
+    const { LOCK_WAIT_TIMEOUT_MS } = await import("@/api/client");
+    const model = installAuthModel();
+    const locks = installFakeWebLocks();
+    signIn(T(1), "R1");
+    const a = await openTab();
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      // A frozen tab holds the lock and never lets go.
+      void locks.request("herd-auth-refresh", () => new Promise<never>(() => {}));
+      const pending = a.client.get("/thing");
+      await vi.advanceTimersByTimeAsync(LOCK_WAIT_TIMEOUT_MS - 1000);
+      expect(model.refreshCalls).toEqual([]);
+      await vi.advanceTimersByTimeAsync(2000);
+      await expect(pending).resolves.toMatchObject({ data: { token: T(2) } });
+      expect(model.refreshCalls).toEqual(["R1"]);
+      expect(locks.aborted).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a request is retried at most once: a retry that answers 500 is not retried again", async () => {
+    installAuthModel();
+    signIn(T(1), "R1");
+    const a = await openTab();
+    let hits = 0;
+    server.use(
+      http.get("/api/once", () => {
+        hits += 1;
+        return hits === 1
+          ? HttpResponse.json({ detail: "expired" }, { status: 401 })
+          : HttpResponse.json({ detail: "boom" }, { status: 500 });
+      }),
+    );
+    await expect(a.client.get("/once")).rejects.toMatchObject({ response: { status: 500 } });
+    expect(hits).toBe(2);
+  });
+
+  it("a request is retried at most once: a retry that answers 401 again is rejected without another refresh", async () => {
+    const model = installAuthModel();
+    signIn(T(1), "R1");
+    const a = await openTab();
+    let hits = 0;
+    server.use(
+      http.get("/api/once", () => {
+        hits += 1;
+        return HttpResponse.json({ detail: "expired" }, { status: 401 });
+      }),
+    );
+    await expect(a.client.get("/once")).rejects.toMatchObject({ response: { status: 401 } });
+    expect(hits).toBe(2);
+    expect(model.refreshCalls).toEqual(["R1"]);
+  });
+
+  it("a 401 while storage holds another account's token signs this tab out and never sends that token", async () => {
+    const model = installAuthModel();
+    signIn(T(1), "R1");
+    const a = await openTab();
+    const seen: string[] = [];
+    server.use(
+      http.get("/api/thing", ({ request }) => {
+        seen.push(request.headers.get("Authorization") ?? "");
+        return HttpResponse.json({ detail: "expired" }, { status: 401 });
+      }),
+    );
+    // Another tab logged out and bob logged in; this tab saw no event yet.
+    signIn(fakeJwt("bob", 1), "RB");
+
+    await expect(a.client.get("/thing")).rejects.toMatchObject({ response: { status: 401 } });
+    expect(seen).toEqual([`Bearer ${T(1)}`]);
+    expect(model.refreshCalls).toEqual([]);
+    expect(a.store.getState().accessToken).toBeNull();
+    // Bob's session in storage is untouched, and the tab adopts it next.
+    expect(stored()).toEqual({ access: fakeJwt("bob", 1), refresh: "RB" });
+    await vi.waitFor(() => expect(a.store.getState().accessToken).toBe(fakeJwt("bob", 1)));
+  });
+
+  it("storage that fails a write: the tab keeps its new pair in memory and never adopts the older stored one", async () => {
+    const model = installAuthModel();
+    signIn(T(1), "R1");
+    const a = await openTab();
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("full", "QuotaExceededError");
+    });
+
+    await expect(a.client.get("/thing")).resolves.toMatchObject({ data: { token: T(2) } });
+    expect(stored()).toEqual({ access: T(1), refresh: "R1" });
+    expect(a.store.getState().refreshToken).toBe("R2");
+
+    // T2 expires: the tab refreshes with R2 from memory, not T1 or R1 from storage.
+    model.validAccess.delete(T(2));
+    await expect(a.client.get("/thing")).resolves.toMatchObject({ data: { token: T(3) } });
+    expect(model.refreshCalls).toEqual(["R1", "R2"]);
+    expect(a.store.getState().isAuthenticated).toBe(true);
+  });
+
+  it("logout waits for another tab's refresh holding the lock and revokes the token that refresh stored, not this tab's stale one", async () => {
+    const model = installAuthModel();
+    model.refreshDelays = [80];
+    installFakeWebLocks();
+    signIn(T(1), "R1");
+    const a = await openTab();
+    const b = await openTab();
+
+    const refreshing = b.client.get("/thing");
+    await sleep(20);
+    expect(model.refreshCalls).toEqual(["R1"]);
+    // A never saw B's write (no storage event): its memory still holds R1.
+    const sent: string[] = [];
+    await a.logout(async (token) => {
+      sent.push(token);
+      model.live.delete(token);
+    });
+    await expect(refreshing).resolves.toMatchObject({ data: { token: T(2) } });
+    expect(sent).toEqual(["R2"]);
+    expect(model.live.has("R2")).toBe(false);
+    expect(stored()).toEqual({ access: null, refresh: null });
+    expect(a.store.getState().isAuthenticated).toBe(false);
+  });
 });

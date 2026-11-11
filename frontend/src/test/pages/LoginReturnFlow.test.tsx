@@ -59,7 +59,7 @@ function renderApp(initial: string) {
 }
 
 async function signIn() {
-  fireEvent.change(await screen.findByLabelText("Email or username"), {
+  fireEvent.change(await screen.findByLabelText("Email"), {
     target: { value: "u@test" },
   });
   fireEvent.change(screen.getByLabelText("Password"), { target: { value: "pw" } });
@@ -84,11 +84,13 @@ describe("login return path through the guards (issue #1333)", () => {
     expect(await screen.findByText("At /topology/abc?tab=wiring#n1")).toBeInTheDocument();
   });
 
-  it("a session that expires mid-page (refresh refused) returns to that page after sign-in", async () => {
+  it("a session that expires mid-page (refresh refused) returns to that page after sign-in", { timeout: 10000 }, async () => {
     useAuthStore.getState().setTokens("T1", "R1");
     // A lock keeps the refusal immediate (no unlocked grace wait).
     Object.defineProperty(navigator, "locks", {
-      value: { request: (_n: string, cb: () => Promise<unknown>) => cb() },
+      value: {
+        request: (_n: string, _o: unknown, cb: () => Promise<unknown>) => cb(),
+      },
       configurable: true,
     });
     server.use(
@@ -105,7 +107,11 @@ describe("login return path through the guards (issue #1333)", () => {
       renderApp("/reservations/r-1?view=wiring");
       expect(screen.getByText("At /reservations/r-1?view=wiring")).toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: "Load" }));
-      await waitFor(() => expect(screen.getByRole("button", { name: "Sign in" })).toBeInTheDocument());
+      // The refusal is final only after the refusal grace (REFUSAL_GRACE_MS, 2 s).
+      await waitFor(
+        () => expect(screen.getByRole("button", { name: "Sign in" })).toBeInTheDocument(),
+        { timeout: 5000 },
+      );
       await signIn();
       expect(await screen.findByText("At /reservations/r-1?view=wiring")).toBeInTheDocument();
     } finally {

@@ -4,6 +4,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 
 import { AuthGuard, GuestGuard } from "@/components/guards";
 import { useAuthStore } from "@/stores/authStore";
+import { fakeJwt } from "../fixtures/jwt";
 
 // AuthGuard and GuestGuard redirect declaratively via <Navigate>, unlike
 // AdminGuard's useNavigate side effect, so a real MemoryRouter with a
@@ -46,7 +47,7 @@ function renderGuestGuardRoute(initialEntry: string) {
 }
 
 beforeEach(() => {
-  useAuthStore.setState({ isAuthenticated: false });
+  useAuthStore.setState({ isAuthenticated: false, accessToken: null, lastSubject: null });
 });
 
 describe("AuthGuard", () => {
@@ -144,6 +145,66 @@ describe("return path (issue #1333)", () => {
 
   it("GuestGuard ignores an unsafe recorded path", () => {
     renderSignedInLogin({ from: "//evil.example" });
+    expect(screen.getByText("Topology page")).toBeInTheDocument();
+  });
+});
+
+describe("return path account binding (issue #1333 review)", () => {
+  function ShowRecorded() {
+    const location = useLocation();
+    const state = location.state as { from?: unknown; sub?: unknown } | null;
+    return <p>Recorded {String(state?.from)} for {String(state?.sub)}</p>;
+  }
+
+  it("AuthGuard records the account that was last signed in with the path", () => {
+    useAuthStore.setState({ isAuthenticated: false, lastSubject: "alice" });
+    render(
+      <MemoryRouter initialEntries={["/reservations/alice-res-1"]}>
+        <Routes>
+          <Route
+            path="/reservations/:id"
+            element={
+              <AuthGuard>
+                <p>Protected content</p>
+              </AuthGuard>
+            }
+          />
+          <Route path="/login" element={<ShowRecorded />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("Recorded /reservations/alice-res-1 for alice")).toBeInTheDocument();
+  });
+
+  function renderSignedInAs(token: string) {
+    useAuthStore.setState({ isAuthenticated: true, accessToken: token });
+    render(
+      <MemoryRouter
+        initialEntries={[{ pathname: "/login", state: { from: "/inventory", sub: "alice" } }]}
+      >
+        <Routes>
+          <Route
+            path="/login"
+            element={
+              <GuestGuard>
+                <p>Login form</p>
+              </GuestGuard>
+            }
+          />
+          <Route path="/topology" element={<p>Topology page</p>} />
+          <Route path="/inventory" element={<p>Inventory page</p>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  it("GuestGuard returns the same account to its recorded page", () => {
+    renderSignedInAs(fakeJwt("alice"));
+    expect(screen.getByText("Inventory page")).toBeInTheDocument();
+  });
+
+  it("GuestGuard sends another account to /topology", () => {
+    renderSignedInAs(fakeJwt("bob"));
     expect(screen.getByText("Topology page")).toBeInTheDocument();
   });
 });

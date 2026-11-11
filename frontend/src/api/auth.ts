@@ -6,11 +6,13 @@ import type {
   TokenResponse,
   User,
 } from "@/types/auth.types";
-import apiClient from "./client";
+import apiClient, { LOGIN_TIMEOUT_MS, logoutUnderRefreshLock, withClientTimeout } from "./client";
 import { useAuthStore } from "@/stores/authStore";
 
 async function login(data: LoginRequest): Promise<TokenResponse> {
-  const resp = await apiClient.post<TokenResponse>("/auth/login", data);
+  const resp = await withClientTimeout(LOGIN_TIMEOUT_MS, (signal) =>
+    apiClient.post<TokenResponse>("/auth/login", data, { signal }),
+  );
   return resp.data;
 }
 
@@ -61,10 +63,7 @@ export function useCurrentUser() {
 export function useLogout() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: () => {
-      const refreshToken = useAuthStore.getState().refreshToken ?? "";
-      return logout(refreshToken);
-    },
+    mutationFn: () => logoutUnderRefreshLock(logout),
     onSettled: () => {
       useAuthStore.getState().clearAuth();
       queryClient.clear();

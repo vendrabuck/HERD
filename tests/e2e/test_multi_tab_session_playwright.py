@@ -10,9 +10,14 @@ Two pages in ONE browser context are two tabs of one profile: they share
 localStorage, receive each other's `storage` events, and share Web Locks.
 The access token lives 30 minutes, too long to wait for, so each page's next
 API GET is answered once with a fabricated 401 through `page.route`; the
-refresh that follows is real. Tab A refreshes first; tab B then gets its 401
-WITHOUT a reload (a client-side navigation), so it acts on whatever its own
-tab state is at that moment, exactly as a user's second tab would.
+refresh that follows is real. Tab A refreshes first. In a real browser tab B
+then adopts A's new pair through the `storage` event before it acts; B acts
+WITHOUT a reload (a client-side navigation), so its fabricated 401 arrives
+carrying A's new access token and B refreshes with A's new refresh token.
+Before the fix B kept the pair it loaded with and refreshed the rotated-away
+one. Every storage read waits for the page to have written the new pair
+(`page.wait_for_function`), since a refresh response arrives before the page
+stores its result. The test logs its session out at the end.
 
 The effect is read back from the backend: the refresh token both tabs started
 with is refused by auth afterwards (the rotation really happened), and each
@@ -61,6 +66,16 @@ def _is_refresh_post(response) -> bool:
     )
 
 
+def _wait_for_new_refresh_token(page, previous: str) -> None:
+    """Wait until this page's storage holds a refresh token other than `previous`."""
+    page.wait_for_function(
+        "r => localStorage.getItem('refresh_token') !== null"
+        " && localStorage.getItem('refresh_token') !== r",
+        arg=previous,
+        timeout=WAIT_MS,
+    )
+
+
 def _stored_tokens(page) -> tuple[str | None, str | None]:
     return tuple(
         page.evaluate(
@@ -85,6 +100,7 @@ def test_refresh_in_one_tab_keeps_the_other_tab_signed_in(pw_contexts):
         page_a.reload()
     assert refresh_a.value.status == 200, refresh_a.value.text()
     expect(page_a).not_to_have_url(re.compile(r"/login"))
+    _wait_for_new_refresh_token(page_a, refresh_1)
     access_2, refresh_2 = _stored_tokens(page_a)
     assert refresh_2 and refresh_2 != refresh_1
 
@@ -106,6 +122,7 @@ def test_refresh_in_one_tab_keeps_the_other_tab_signed_in(pw_contexts):
     assert sent == {"refresh_token": refresh_2}, sent
 
     # Both tabs hold one live session, read back from the backend.
+    _wait_for_new_refresh_token(page_b, refresh_2)
     access_3, refresh_3 = _stored_tokens(page_b)
     assert refresh_3 and refresh_3 not in (refresh_1, refresh_2)
     assert _stored_tokens(page_a) == (access_3, refresh_3)
@@ -114,3 +131,8 @@ def test_refresh_in_one_tab_keeps_the_other_tab_signed_in(pw_contexts):
     expect(page_a).not_to_have_url(re.compile(r"/login"), timeout=WAIT_MS)
     assert pw_api(page_a, "GET", "/auth/me").status_code == 200
     assert access_2 != access_3
+
+    # Log the test's session out: revoke the live refresh token.
+    _, live_refresh = _stored_tokens(page_a)
+    with httpx.Client(verify=False, timeout=30.0) as client:
+        client.post(f"{HOST_BASE_URL}/api/auth/logout", json={"refresh_token": live_refresh})

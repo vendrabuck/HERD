@@ -54,15 +54,44 @@ describe("safeReturnPath", () => {
 
 describe("returnPathFromState", () => {
   it("returns a safe recorded path", () => {
-    expect(returnPathFromState({ from: "/inventory?q=x" })).toBe("/inventory?q=x");
+    expect(returnPathFromState({ from: "/inventory?q=x" }, null)).toBe("/inventory?q=x");
   });
 
   it.each([null, undefined, "x", {}, { from: "//evil.example" }, { from: 7 }])(
     "falls back to the default page for %j",
     (state) => {
-      expect(returnPathFromState(state)).toBe(DEFAULT_AFTER_LOGIN);
+      expect(returnPathFromState(state, "alice")).toBe(DEFAULT_AFTER_LOGIN);
     },
   );
+});
+
+describe("returnPathFromState account binding", () => {
+  it("honors a path recorded for the account now signed in", () => {
+    expect(returnPathFromState({ from: "/reservations/r1", sub: "alice" }, "alice")).toBe(
+      "/reservations/r1",
+    );
+  });
+
+  it("honors a path recorded when no account was signed in (a first visit)", () => {
+    expect(returnPathFromState({ from: "/reservations/r1", sub: null }, "bob")).toBe(
+      "/reservations/r1",
+    );
+  });
+
+  it.each([
+    ["another account", "bob"],
+    ["an account that cannot be read", null],
+  ])("sends %s to the default page", (_label, subject) => {
+    expect(returnPathFromState({ from: "/reservations/r1", sub: "alice" }, subject)).toBe(
+      DEFAULT_AFTER_LOGIN,
+    );
+  });
+
+  it("treats a non-string recorded account as a mismatch", () => {
+    expect(returnPathFromState({ from: "/reservations/r1", sub: 7 }, "alice")).toBe(
+      DEFAULT_AFTER_LOGIN,
+    );
+  });
 });
 
 describe("loginErrorText", () => {
