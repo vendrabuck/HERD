@@ -12,8 +12,8 @@ database is now named through `current_database()`.
 What is read: every file docker-compose.yml mounts under
 `/docker-entrypoint-initdb.d/` (the init files), with `--` comments and the contents
 of single-quoted strings blanked out, except that a string right after `format(`, or
-right after a `||`, is kept, since that is SQL the script executes. In what remains, the guard fails on
-a statement that names a role or a database: `GRANT ... TO`, `REVOKE ... FROM`,
+right after a `||`, is kept, since that is SQL the script executes. In what remains,
+the guard fails on a statement that names a role or a database: `GRANT ... TO`, `REVOKE ... FROM`,
 `OWNER TO`, `AUTHORIZATION`, `CREATE`, `ALTER`, or `DROP` of a `ROLE`, `USER`, or
 `DATABASE` followed by anything but the `%I` placeholder, `SET ROLE`, `SET SESSION
 AUTHORIZATION`, and psql's `\\c` or `\\connect`; and on the word `herd`, the default
