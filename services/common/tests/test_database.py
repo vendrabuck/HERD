@@ -5,9 +5,21 @@ URL, and a Base usable for create_all. Each call must return its own Base class
 (fresh DeclarativeBase subclass), since every service owns its own metadata.
 """
 
-from herd_common.database import make_database
-from sqlalchemy import Column, Integer, String, select
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+import pytest
+from herd_common.database import (
+    DEFAULT_MAX_OVERFLOW,
+    DEFAULT_POOL_PRE_PING,
+    DEFAULT_POOL_SIZE,
+    engine_options,
+    make_database,
+)
+from sqlalchemy import Column, Integer, String, select, text
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.orm import DeclarativeBase
 
 
@@ -71,3 +83,53 @@ def test_each_call_returns_a_distinct_base():
     _, _, base_b, _ = make_database("sqlite+aiosqlite:///:memory:")
     assert base_a is not base_b
     assert base_a.metadata is not base_b.metadata
+
+
+# --- Connection pool (issue #1352) -------------------------------------------------
+
+PG_URL = "postgresql+asyncpg://user:pw@postgres:5432/herd"
+
+
+def test_postgres_engine_gets_the_pool_defaults_and_pre_ping():
+    """No connection is opened: building an engine only configures its pool."""
+    engine, _, _, _ = make_database(PG_URL)
+    pool = engine.sync_engine.pool
+    assert (DEFAULT_POOL_SIZE, DEFAULT_MAX_OVERFLOW, DEFAULT_POOL_PRE_PING) == (5, 5, True)
+    assert pool.size() == 5
+    assert pool._max_overflow == 5
+    assert pool._pre_ping is True
+
+
+def test_postgres_engine_takes_the_pool_arguments_it_is_given():
+    engine, _, _, _ = make_database(PG_URL, pool_size=3, max_overflow=0, pool_pre_ping=False)
+    pool = engine.sync_engine.pool
+    assert (pool.size(), pool._max_overflow, pool._pre_ping) == (3, 0, False)
+
+
+def test_engine_options_per_dialect():
+    assert engine_options(PG_URL, pool_size=2, max_overflow=7, pool_pre_ping=True) == {
+        "echo": False,
+        "pool_pre_ping": True,
+        "pool_size": 2,
+        "max_overflow": 7,
+    }
+    for url in ("sqlite+aiosqlite:///:memory:", "sqlite+aiosqlite:////tmp/x.db"):
+        assert engine_options(url, pool_size=2, max_overflow=7, pool_pre_ping=True) == {
+            "echo": False,
+            "pool_pre_ping": True,
+        }
+
+
+def test_sqlite_size_arguments_are_dropped_because_its_pool_refuses_them():
+    """The branch exists because SQLAlchemy refuses size arguments for this pool."""
+    with pytest.raises(TypeError, match="pool_size"):
+        create_async_engine("sqlite+aiosqlite:///:memory:", pool_size=5, max_overflow=5)
+    engine, _, _, _ = make_database("sqlite+aiosqlite:///:memory:", pool_size=5, max_overflow=5)
+    assert engine.sync_engine.pool._pre_ping is True
+
+
+async def test_sqlite_engine_with_pre_ping_still_runs_queries():
+    engine, session_local, _, _ = make_database("sqlite+aiosqlite:///:memory:")
+    async with session_local() as session:
+        assert (await session.execute(text("select 1"))).scalar_one() == 1
+    await engine.dispose()

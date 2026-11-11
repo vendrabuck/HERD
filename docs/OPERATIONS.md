@@ -307,6 +307,8 @@ The `wiring_retry_tick` line carries these fields. `rows_due` is the rows the ti
 
 Configure verbosity per service via `LOG_LEVEL` (default `INFO`; use `DEBUG` for investigations and remember to turn it back down).
 
+Log rotation (issue #1352): every service in every compose file the repository ships uses Docker's `json-file` driver with `max-size: "10m"` and `max-file: "5"` (the `x-logging` anchor at the top of each file), so each container keeps at most five files of 10 MB, 50 MB in all, and `docker compose logs` reaches back only that far. Before #1352 no service set a limit, and a container's log grew until the disk filled unless the host's `daemon.json` set one. A changed logging block applies when the container is recreated (`docker compose up -d`), not on a restart; Traefik's access log (`--accessLog=true`, one line per request) is the fastest to rotate.
+
 ## Healthchecks and monitoring
 
 - `docker compose ps` shows per-container health. Unhealthy containers need a logs inspection.
@@ -319,6 +321,7 @@ There is no built-in Prometheus/Grafana stack; roll your own based on the JSON l
 ## Scaling and sizing
 
 - Postgres: single node by default. Horizontal scaling would require adding a pooler (PgBouncer) and replication; not in the default compose.
+- Database connections (issue #1352): each of the eleven database services opens at most `DB_POOL_SIZE + DB_MAX_OVERFLOW` connections, 5 + 5 by default, so 11 x 10 = 110 against the compose Postgres `max_connections=200`, leaving 90 for psql, `make migrate`, and test harnesses. Every extra execution replica adds another 10. Past `max_connections` a new connection fails with `too many clients already`, so keep 11 x (`DB_POOL_SIZE` + `DB_MAX_OVERFLOW`) plus 10 per extra replica under 200, or raise `max_connections` in the postgres `command` of `docker-compose.yml`. `max_connections` takes effect only when the postgres container is recreated (`docker compose up -d postgres`). `docs/ENV_VARS.md` has the variables.
 - Services are stateless; scale by bumping `replicas` in compose and putting Traefik or another load balancer in front. Today they run 1x each.
 - Health polling scales horizontally (issue #24): run extra execution replicas with `EXECUTION_POLLER_ONLY=true` (background machinery only, no API routers) and set `HEALTH_POLL_SCHEDULER_ENABLED=false` on the API replicas for a clean split. Concurrent pollers against one schema are safe: due rows are claimed via `SELECT ... FOR UPDATE SKIP LOCKED` plus a conditional update, so two replicas never poll the same device. Bound each replica with `HEALTH_POLL_BATCH_SIZE` and `HEALTH_POLL_MAX_CONCURRENCY`, and watch the per-tick `health_tick` log (`rows_due` versus `polls_fired`) to decide when to add a replica.
 - NATS JetStream is a single node. Under `make prod` message persistence is in the `nats-data` volume; the dev and gate stacks keep JetStream state in an unmounted directory, so it does not survive a recreate (see JetStream durability above). For HA, cluster three NATS nodes.
