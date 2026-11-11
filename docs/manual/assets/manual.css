@@ -239,7 +239,7 @@ kbd{font-family:var(--font-mono);font-size:12px;background:#fff;border:1px solid
 /* ---------- search (issue #1298): box injected into .manualbar by manual.js ---------- */
 .manualbar .wm{flex:none;}
 .msearch{position:relative;margin-left:auto;flex:0 1 240px;min-width:110px;}
-.msearch-label{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;}
+.msearch-sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;}
 /* Above the sidebar breakpoint the nav keeps its one row and the search box gives way. */
 @media (min-width:981px){.manualbar nav{flex-shrink:0;}}
 .msearch-input{
@@ -262,8 +262,8 @@ kbd{font-family:var(--font-mono);font-size:12px;background:#fff;border:1px solid
   border-radius:var(--radius-lg);box-shadow:var(--shadow-xl);padding:6px;z-index:60;
 }
 .msearch-panel[hidden]{display:none;}
-.msearch-status{margin:0;padding:6px 10px 4px;font-size:12px;color:var(--gray-500);}
-.msearch-status.empty{padding:12px 10px;font-size:14px;color:var(--gray-600);}
+.msearch-count{margin:0;padding:6px 10px 4px;font-size:12px;color:var(--gray-500);}
+.msearch-count.empty{padding:12px 10px;font-size:14px;color:var(--gray-600);}
 .msearch-option{display:block;padding:9px 10px;border-radius:var(--radius-md);color:inherit;transition:background .12s;}
 .msearch-option:hover,.msearch-option[aria-selected="true"]{background:var(--blue-50);text-decoration:none;color:inherit;}
 .msearch-option[aria-selected="true"]{box-shadow:inset 2px 0 0 var(--blue-600);}
@@ -275,15 +275,19 @@ kbd{font-family:var(--font-mono);font-size:12px;background:#fff;border:1px solid
 .msearch-option mark{background:var(--blue-100);color:var(--gray-900);border-radius:2px;padding:0 1px;}
 
 /* ---------- responsive ---------- */
+/* The nav collapses behind the toggle at the sidebar breakpoint: below about
+   980 px its seven links, the wordmark, and the search box no longer fit on
+   one row of the 56 px bar (issue #1298). */
 @media (max-width:980px){
   .shell{grid-template-columns:1fr;gap:0;}
   .side{display:none;}
-}
-@media (max-width:720px){
   .manualbar nav{display:none;position:absolute;top:56px;left:0;right:0;background:var(--chrome-bg);flex-direction:column;padding:8px;gap:2px;border-top:1px solid var(--chrome-bg-hover);}
   .manualbar nav.open{display:flex;}
   .navtoggle{display:flex;}
-  .msearch{flex:1 1 auto;min-width:0;}
+  .msearch{flex:1 1 auto;min-width:0;max-width:420px;}
+}
+@media (max-width:720px){
+  .msearch{max-width:none;}
   .msearch-key{display:none;}
   .msearch-panel{position:fixed;top:64px;left:8px;right:8px;width:auto;max-height:calc(100vh - 80px);}
   .cardgrid.c2,.cardgrid.c3{grid-template-columns:1fr;}

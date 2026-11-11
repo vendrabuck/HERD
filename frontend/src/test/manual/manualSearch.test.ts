@@ -120,6 +120,26 @@ describe("parseQuery", () => {
     ]);
   });
 
+  it("keeps a dotted version as one term and splits a letter run off its front", () => {
+    expect(S.parseQuery("Release v0.7.0 notes 3.13.12")).toEqual([
+      { term: "release", prefix: false },
+      { term: "v", prefix: false },
+      { term: "0.7.0", prefix: false },
+      { term: "notes", prefix: false },
+      { term: "3.13.12", prefix: true },
+    ]);
+    expect(S.parseQuery("version 0.7.0.")).toEqual([
+      { term: "version", prefix: false },
+      { term: "0.7.0", prefix: true },
+    ]);
+    expect(S.parseQuery("eth1/1 ge-0/0")).toEqual([
+      { term: "eth1", prefix: false },
+      { term: "1", prefix: false },
+      { term: "ge", prefix: false },
+      { term: "0", prefix: true },
+    ]);
+  });
+
   it.each(["", "   ", "--- / ,", "\u2014"])("has no terms for %j", (query) => {
     expect(S.parseQuery(query)).toEqual([]);
     expect(S.search(index([PAGE], [sec("a", "Anything", "words")]), query)).toEqual({
@@ -172,6 +192,19 @@ describe("matching", () => {
     // Both match; live.html has "glossary" in its body, glossary.html only in its title.
     // Heading hits tie (fork), the exact heading wins.
     expect(anchors(found)).toEqual(["glossary.html#fork", "live.html#x"]);
+  });
+
+  it("never counts a page-title match as a heading hit", () => {
+    const idx = index(
+      [
+        { file: "a.html", title: "Fork guide", kind: "page" },
+        { file: "b.html", title: "Other", kind: "page" },
+      ],
+      [sec("a", "Alpha", "fork", 0), sec("b", "Beta", "fork fork", 1)],
+    );
+    // With title credit a.html#a would lead on heading hits; without it b.html#b
+    // leads on body count.
+    expect(anchors(S.search(idx, "fork"))).toEqual(["b.html#b", "a.html#a"]);
   });
 
   it("searches the eyebrow as heading text", () => {
@@ -252,6 +285,27 @@ describe("ranking", () => {
     ]);
   });
 
+  it("puts a page whose title holds the queried version first, even an earlier release", () => {
+    const idx = index(
+      [
+        { file: "release-0-3-0.html", title: "Release 0.3.0", kind: "earlier-release" },
+        { file: "release-0-4-0.html", title: "Release 0.4.0", kind: "release" },
+        PAGE,
+      ],
+      [
+        sec("", "Release 0.3.0", "What 0.3.0 shipped.", 0),
+        sec("up", "Upgrading from 0.3.0", "0.3.0 0.3.0", 1),
+        sec("x", "Something", "0.3.0 0.3.0 0.3.0", 2),
+      ],
+    );
+    expect(anchors(S.search(idx, "0.3.0"))).toEqual([
+      "release-0-3-0.html#",
+      "release-0-4-0.html#up",
+      "guide.html#x",
+    ]);
+    expect(marked(S.search(idx, "0.3.0").results[0].headingParts)).toEqual(["0.3.0"]);
+  });
+
   it("is deterministic across runs and does not depend on the limit", () => {
     const sections = Array.from({ length: 30 }, (_, i) => sec(`s${i}`, "Same", "fork"));
     const idx = index([PAGE], sections);
@@ -292,6 +346,17 @@ describe("result shape", () => {
     expect(marked(r.snippetParts)).toEqual(["needle"]);
   });
 
+  it("never cuts a snippet between the halves of a surrogate pair", () => {
+    const emoji = "\u{1F600}";
+    // No spaces, so the cut falls back to fixed offsets that land on even indexes,
+    // which are low surrogates after the two-letter prefix.
+    const text = "xy" + emoji.repeat(150) + "needle" + emoji.repeat(150);
+    const [r] = S.search(index([PAGE], [sec("a", "A", text)]), "needle").results;
+    const snippet = joined(r.snippetParts);
+    expect(snippet).toContain("needle");
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(snippet)).toBe(false);
+  });
+
   it("starts the snippet at the body start when only the heading matched", () => {
     const [r] = S.search(index([PAGE], [sec("a", "Fork", "Short body.")]), "fork").results;
     expect(r.snippetParts).toEqual([{ text: "Short body.", mark: false }]);
@@ -330,6 +395,18 @@ describe("the committed index", () => {
     expect(anchors(S.search(real, query))[0]).toBe(first);
   });
 
+  const releases = real.pages.filter((p) => p.kind === "release" || p.kind === "earlier-release");
+
+  it("has seven release pages", () => {
+    expect(releases.map((p) => p.file).sort()).toEqual(
+      [1, 2, 3, 4, 5, 6, 7].map((n) => `release-0-${n}-0.html`),
+    );
+  });
+
+  it.each([1, 2, 3, 4, 5, 6, 7])("ranks release-0-%i-0.html first for its version", (n) => {
+    expect(S.search(real, `0.${n}.0`).results[0].file).toBe(`release-0-${n}-0.html`);
+  });
+
   it("ranks no earlier release page above a current page", () => {
     for (const query of ["fork", "reservation", "ldap", "release"]) {
       const kinds = S.search(real, query).results.map((r) => r.kind);
@@ -344,22 +421,39 @@ describe("the committed index", () => {
 describe("browser rendering (jsdom)", () => {
   const win = window as unknown as { HERD_MANUAL_SEARCH_INDEX?: Index; __pwned?: number };
 
-  function boot(idx: Index) {
+  // Run the file as the browser does (no `module` in scope) under a minimal
+  // header. `idx` is preset as the global when given, as if the index had
+  // already loaded; without it the box must load the index itself.
+  function boot(idx?: Index) {
+    document.head.querySelectorAll("script").forEach((s) => s.remove());
     document.body.textContent = "";
     const header = document.createElement("header");
     header.className = "manualbar";
     header.appendChild(document.createElement("nav"));
     document.body.appendChild(header);
-    win.HERD_MANUAL_SEARCH_INDEX = idx;
-    // Run the file as the browser does: no `module` in scope.
+    if (idx) win.HERD_MANUAL_SEARCH_INDEX = idx;
     new Function("module", manualJs)(undefined);
     return document.getElementById("msearch-input") as HTMLInputElement;
   }
 
   function type(input: HTMLInputElement, value: string) {
+    input.focus();
     input.value = value;
     input.dispatchEvent(new Event("input"));
   }
+
+  function key(target: EventTarget, k: string, init: KeyboardEventInit = {}) {
+    target.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true, ...init }));
+  }
+
+  function indexScripts(): HTMLScriptElement[] {
+    return Array.from(document.querySelectorAll("script")).filter((s) =>
+      s.src.endsWith("assets/search-index.js"),
+    );
+  }
+
+  const live = () => document.getElementById("msearch-status") as HTMLElement;
+  const shown = () => document.querySelector(".msearch-count") as HTMLElement;
 
   afterEach(() => {
     delete win.HERD_MANUAL_SEARCH_INDEX;
@@ -367,15 +461,25 @@ describe("browser rendering (jsdom)", () => {
     document.body.textContent = "";
   });
 
-  it("injects a labelled combobox into the header", () => {
+  it("injects a labelled combobox, a shortcut hint, and a live region outside the panel", () => {
     const input = boot(index([PAGE], []));
     expect(input.closest("header.manualbar")).not.toBeNull();
     expect(input.getAttribute("role")).toBe("combobox");
     expect(input.getAttribute("aria-controls")).toBe("msearch-results");
     expect(input.getAttribute("aria-expanded")).toBe("false");
+    expect(input.getAttribute("aria-keyshortcuts")).toBe("/");
+    expect(input.hasAttribute("aria-describedby")).toBe(false);
+    expect(document.querySelector(".msearch-key")?.getAttribute("aria-hidden")).toBe("true");
     const label = document.querySelector(`label[for="${input.id}"]`);
     expect(label?.textContent).toBe("Search the manual");
     expect(document.getElementById("msearch-results")?.getAttribute("role")).toBe("listbox");
+    // The live region exists, empty, before any query, and is not inside the hidden panel.
+    expect(live().getAttribute("role")).toBe("status");
+    expect(live().getAttribute("aria-live")).toBe("polite");
+    expect(live().textContent).toBe("");
+    expect(live().closest(".msearch-panel")).toBeNull();
+    expect(live().closest(".msearch")).not.toBeNull();
+    expect(shown().getAttribute("aria-hidden")).toBe("true");
   });
 
   it("renders markup-looking text inert, with the match as a <mark> element", () => {
@@ -395,39 +499,107 @@ describe("browser rendering (jsdom)", () => {
     expect(win.__pwned).toBeUndefined();
   });
 
-  it("shows a visible no-results state", () => {
+  it("shows a visible no-results state and announces it", () => {
     const input = boot(index([PAGE], [sec("a", "A", "words")]));
     type(input, "zzzz");
-    expect(document.getElementById("msearch-status")?.textContent).toBe("No results for \u201czzzz\u201d.");
+    expect(shown().textContent).toBe("No results for \u201czzzz\u201d.");
+    expect(shown().className).toBe("msearch-count empty");
+    expect(live().textContent).toBe("No results for \u201czzzz\u201d.");
     expect(document.querySelectorAll('[role="option"]').length).toBe(0);
     expect(input.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it.each([
+    [1, "1 result"],
+    [3, "3 results"],
+    [20, "20 results"],
+    [25, "Top 20 of 25 results"],
+  ])("with %i matches says %j and lists at most 20", (n, text) => {
+    const sections = Array.from({ length: n }, (_, i) => sec(`s${i}`, "Fork", "x"));
+    const input = boot(index([PAGE], sections));
+    type(input, "fork");
+    expect(shown().textContent).toBe(text);
+    expect(live().textContent).toBe(text);
+    expect(document.querySelectorAll('[role="option"]').length).toBe(Math.min(n, 20));
   });
 
   it("moves the active option with the arrow keys and closes on Escape", () => {
     const input = boot(index([PAGE], [sec("a", "Fork", "x"), sec("b", "Fork two", "y")]));
     type(input, "fork");
-    const key = (k: string) => input.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true }));
-    key("ArrowDown");
+    key(input, "ArrowDown");
     expect(input.getAttribute("aria-activedescendant")).toBe("msearch-opt-0");
-    key("ArrowDown");
+    key(input, "ArrowDown");
     expect(input.getAttribute("aria-activedescendant")).toBe("msearch-opt-1");
     expect(document.getElementById("msearch-opt-1")?.getAttribute("aria-selected")).toBe("true");
-    key("ArrowDown");
+    key(input, "ArrowDown");
     expect(input.getAttribute("aria-activedescendant")).toBe("msearch-opt-0");
-    key("ArrowUp");
+    key(input, "ArrowUp");
     expect(input.getAttribute("aria-activedescendant")).toBe("msearch-opt-1");
-    key("Escape");
+    key(input, "Escape");
     expect(input.getAttribute("aria-expanded")).toBe("false");
     expect(input.hasAttribute("aria-activedescendant")).toBe(false);
     expect(input.value).toBe("fork");
-    key("Escape");
+    key(input, "Escape");
     expect(input.value).toBe("");
   });
 
-  it("says so when the index did not load", () => {
+  it("focuses the search on a plain / from the page", () => {
     const input = boot(index([PAGE], []));
-    delete win.HERD_MANUAL_SEARCH_INDEX;
+    key(document.body, "/");
+    expect(document.activeElement).toBe(input);
+  });
+
+  it.each([
+    ["Ctrl", { ctrlKey: true }],
+    ["Meta", { metaKey: true }],
+    ["Alt", { altKey: true }],
+  ])("ignores %s+/", (_name, init) => {
+    const input = boot(index([PAGE], []));
+    key(document.body, "/", init);
+    expect(document.activeElement).not.toBe(input);
+  });
+
+  it("leaves / alone while another field has focus", () => {
+    const input = boot(index([PAGE], []));
+    const other = document.createElement("textarea");
+    document.body.appendChild(other);
+    other.focus();
+    key(other, "/");
+    expect(document.activeElement).toBe(other);
+    expect(document.activeElement).not.toBe(input);
+  });
+
+  it("loads the index on first use only, and answers a query typed before it arrives", () => {
+    const input = boot();
+    expect(indexScripts()).toHaveLength(0);
     type(input, "fork");
-    expect(document.getElementById("msearch-status")?.textContent).toBe("The search index did not load.");
+    expect(indexScripts()).toHaveLength(1);
+    expect(shown().textContent).toBe("Loading the search index\u2026");
+    expect(live().textContent).toBe("Loading the search index\u2026");
+    expect(document.querySelectorAll('[role="option"]').length).toBe(0);
+    type(input, "fork");
+    expect(indexScripts()).toHaveLength(1);
+    win.HERD_MANUAL_SEARCH_INDEX = index([PAGE], [sec("a", "Fork", "x")]);
+    indexScripts()[0].dispatchEvent(new Event("load"));
+    expect(shown().textContent).toBe("1 result");
+    expect(document.querySelectorAll('[role="option"]').length).toBe(1);
+  });
+
+  it.each([
+    ["an error event", (s: HTMLScriptElement) => s.dispatchEvent(new Event("error"))],
+    ["a load that sets no global", (s: HTMLScriptElement) => s.dispatchEvent(new Event("load"))],
+  ])("says the index did not load after %s", (_name, fire) => {
+    const input = boot();
+    type(input, "fork");
+    fire(indexScripts()[0]);
+    expect(shown().textContent).toBe("The search index did not load.");
+    expect(live().textContent).toBe("The search index did not load.");
+  });
+
+  it("does not add the index script when the global is already present", () => {
+    const input = boot(index([PAGE], [sec("a", "Fork", "x")]));
+    type(input, "fork");
+    expect(indexScripts()).toHaveLength(0);
+    expect(shown().textContent).toBe("1 result");
   });
 });

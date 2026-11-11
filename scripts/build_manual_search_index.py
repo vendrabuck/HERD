@@ -4,9 +4,10 @@ The manual under `docs/manual/` is hand-written static HTML served by GitHub Pag
 opened from `file://` as well, so its search runs entirely in the browser from a prebuilt
 index: this script walks `docs/manual/*.html` and writes
 `docs/manual/assets/search-index.js`, which assigns the index to the global
-`window.HERD_MANUAL_SEARCH_INDEX` (a script tag works from `file://`, where `fetch` is
-refused). `docs/manual/assets/manual.js` reads that global and does the matching. The
-standard library only; no third-party dependency.
+`window.HERD_MANUAL_SEARCH_INDEX` (a script element works from `file://`, where `fetch`
+is refused). No page loads it directly: `docs/manual/assets/manual.js` adds a script
+element for it the first time a reader focuses or types in the search box, then reads
+that global and does the matching. The standard library only; no third-party dependency.
 
 Usage, from the repo root (or `make manual-index`):
 
@@ -19,16 +20,27 @@ committed file differs, so a page edit must be followed by a regeneration.
 What a record is:
 
 - Pages are the `*.html` files directly in the manual directory, in file-name order.
-  A page's title is its `<title>` text with the `HERD Manual: ` prefix removed; a page
-  with no `<title>` is an error.
+  Every page name must match `[a-z0-9-]+.html` (it becomes part of a result link), or
+  the build stops. Pages are read as UTF-8, a leading byte order mark ignored. A page's
+  title is the text of the `<title>` inside its `<head>` (an SVG `<title>` in the body
+  does not count) with the `HERD Manual: ` prefix removed; a page with no such
+  `<title>` is an error.
 - A page is cut into sections at its section boundaries, in document order:
   1. an `<h2>` whose class includes `sec` (the manual's section headings, the targets
      of each page's "On this page" sidebar). Its heading is the text of the
      `<p class="sectitle">` that immediately follows it, when one does, and its eyebrow
      is the `<h2>` text; otherwise the heading is the `<h2>` text and the eyebrow is
      empty.
-  2. a `<div>` whose parent is a `<dl>` whose class includes `gloss` (one glossary
-     entry). Its heading is the text of its `<dt>`; its eyebrow is empty.
+     Any text, or any other start tag, between the `<h2>` and the `<p>` means no
+     sectitle follows.
+  2. a `<p>` whose class includes `sectitle`, that carries an `id`, and that is not the
+     sectitle of a section `<h2>` as in 1 (a step heading that a sidebar links on its
+     own, as on `admin-setup.html`). Its heading is its own text; its eyebrow is empty.
+     A `<p class="sectitle">` with no `id` that follows no section `<h2>` is body text.
+  3. a `<div>` whose parent is a `<dl>` whose class includes `gloss` (one glossary
+     entry). Its heading is the text of its `<dt>` (a `<dt>` anywhere else is body
+     text); its eyebrow is empty.
+  A boundary inside an excluded region (below) is not a boundary.
   Every boundary must carry an `id`, which becomes the record's anchor; a boundary
   without one stops the build with an error naming the page, the line, and a suggested
   id, so the fix is made in the page and every result link lands on a real element.
@@ -38,12 +50,14 @@ What a record is:
   with no text is dropped.
 - Indexed text is every text node outside the excluded chrome: `<script>`, `<style>`,
   `<template>`, `<noscript>`, `<header>`, `<nav>`, `<aside>`, and any element whose
-  class includes `foot` or `pagenav` or whose id is `totop`. Heading, eyebrow, and dt
+  class includes `foot`, `pagenav`, or `shot-stage` (the drawn UI mockups, whose labels
+  would otherwise glue into tokens such as `InventoryTopologyReservations`) or whose id
+  is `totop`. Heading, eyebrow, and dt
   text is not repeated in the body. Character references are decoded; every start or
   end tag except the inline phrasing tags (`a`, `abbr`, `b`, `cite`, `code`, `em`, `i`,
   `kbd`, `mark`, `q`, `s`, `small`, `strong`, `sub`, `sup`, `u`, `var`) counts as a word
   break; each whitespace run (`&nbsp;` included) collapses to one space.
-- Body text is not truncated: the whole manual indexes to about 250 KB. The guard holds
+- Body text is not truncated: the whole manual indexes to about 240 KB. The guard holds
   the file under `SIZE_BUDGET_BYTES`; past it, cap per-section text here and say so.
 - A page's kind is `release` for the newest `release-X-Y-Z.html` (ordered by the integer
   triple, as in `tests/unit/test_manual_release_pages.py`), `earlier-release` for every
@@ -56,8 +70,8 @@ the pages encode as entities).
 
 Limits: the parser is the standard library's forgiving `HTMLParser`, so an unclosed
 excluded element (say an `<aside>` with no end tag) hides the rest of the page from the
-index; a heading that is not one of the two boundary kinds above (an `<h3>`, a mockup's
-`<h2>` inside a figure) is body text of the section it sits in; text in attribute
+index; a heading that is not one of the three boundary kinds above (an `<h3>`, an `<h2>`
+without the `sec` class) is body text of the section it sits in; text in attribute
 values (`alt`, `title`, `aria-label`) and HTML comments is not indexed.
 """
 
@@ -81,8 +95,9 @@ TITLE_PREFIX = "HERD Manual: "
 SIZE_BUDGET_BYTES = 400_000
 
 RELEASE_NAME = re.compile(r"^release-(\d+)-(\d+)-(\d+)\.html$")
+PAGE_NAME = re.compile(r"^[a-z0-9-]+\.html$")
 EXCLUDED_TAGS = frozenset("script style template noscript header nav aside".split())
-EXCLUDED_CLASSES = frozenset({"foot", "pagenav"})
+EXCLUDED_CLASSES = frozenset({"foot", "pagenav", "shot-stage"})
 EXCLUDED_IDS = frozenset({"totop"})
 INLINE_TAGS = frozenset("a abbr b cite code em i kbd mark q s small strong sub sup u var".split())
 VOID_TAGS = frozenset(
@@ -173,7 +188,7 @@ class _PageParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
         classes = tuple((values.get("class") or "").split())
-        if tag == "title" and not self._excluded:
+        if tag == "title" and not self._excluded and any(e.tag == "head" for e in self._stack):
             self._in_title = True
             self.has_title = True
         if tag not in INLINE_TAGS:
@@ -185,15 +200,20 @@ class _PageParser(HTMLParser):
             or (values.get("id") or "") in EXCLUDED_IDS
         )
         capture = False
+        sectitle = tag == "p" and "sectitle" in classes and not excluded and not self._excluded
+        followed = False
         if self._await_sectitle:
             self._await_sectitle = False
-            if tag == "p" and "sectitle" in classes and not self._excluded:
+            if sectitle:
                 section = self.sections[-1]
                 section.eyebrow, section.heading = section.heading, []
-                capture = True
+                capture = followed = True
         if not excluded and not self._excluded:
             parent = self._stack[-1] if self._stack else None
-            if tag == "h2" and "sec" in classes:
+            if sectitle and not followed and (values.get("id") or "").strip():
+                self._start_section(values)
+                capture = True
+            elif tag == "h2" and "sec" in classes:
                 self._start_section(values)
                 capture = True
             elif tag == "div" and parent and parent.tag == "dl" and "gloss" in parent.classes:
@@ -247,7 +267,7 @@ def _release_kinds(names: list[str]) -> dict[str, str]:
 def parse_page(path: Path) -> tuple[str, list[dict[str, str]]]:
     """Return a page's title and its section records (without the page index)."""
     parser = _PageParser(path.name)
-    parser.feed(path.read_text(encoding="utf-8"))
+    parser.feed(path.read_text(encoding="utf-8-sig"))
     parser.close()
     if not parser.has_title:
         raise ManualIndexError(f"{path.name}: has no <title>")
@@ -289,6 +309,12 @@ def build_index(manual_dir: Path = MANUAL_DIR) -> dict:
     paths = sorted(p for p in manual_dir.glob("*.html") if p.is_file())
     if not paths:
         raise ManualIndexError(f"{manual_dir}: no *.html pages")
+    misnamed = [p.name for p in paths if not PAGE_NAME.match(p.name)]
+    if misnamed:
+        raise ManualIndexError(
+            f"page file names must match [a-z0-9-]+.html (they become result links): "
+            f"{', '.join(misnamed)}"
+        )
     kinds = _release_kinds([p.name for p in paths])
     pages, sections = [], []
     for page_index, path in enumerate(paths):
@@ -333,13 +359,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     output = args.output or args.manual_dir / "assets" / "search-index.js"
     try:
-        text = generate(args.manual_dir)
+        index = build_index(args.manual_dir)
     except ManualIndexError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    current = output.read_text(encoding="utf-8") if output.is_file() else None
+    data = render_index(index).encode("utf-8")
+    current = output.read_bytes() if output.is_file() else None
     if args.check:
-        if current != text:
+        if current != data:
             print(
                 f"{output} is stale: run `{REGENERATE_COMMAND}` and commit the result",
                 file=sys.stderr,
@@ -347,12 +374,11 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"{output} is current")
         return 0
-    if current != text:
-        output.write_text(text, encoding="utf-8")
-    index = build_index(args.manual_dir)
+    if current != data:
+        output.write_bytes(data)
     print(
         f"{output}: {len(index['pages'])} pages, {len(index['sections'])} sections, "
-        f"{len(text.encode('utf-8'))} bytes"
+        f"{len(data)} bytes"
     )
     return 0
 
