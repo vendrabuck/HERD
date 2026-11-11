@@ -12,11 +12,16 @@
 # and this image build (`uv export --frozen` refuses to run against a stale
 # lock), so drift between what CI tests and what ships in a container is
 # structurally impossible. Regenerate with `uv lock` to fix either failure.
-FROM python:3.12-slim
+# The uv binary comes from a named stage, not `COPY --from=<image>`: Dependabot's
+# docker ecosystem reads only FROM lines, so this is the form it keeps current
+# (issue #1300). Tag and digest are bumped together, by Dependabot or by hand.
+FROM ghcr.io/astral-sh/uv:0.9.3@sha256:ecfea7316b266ba82a5e9efb052339ca410dd774dc01e134a30890e6b85c7cd1 AS uv
+
+FROM python:3.12.16-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=uv /uv /usr/local/bin/uv
 
 # Workspace lock and pyprojects live under /lock, kept out of /app so they
 # never collide with the service's own pyproject.toml-driven package

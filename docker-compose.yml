@@ -101,7 +101,7 @@ services:
   # form refuses to render the file if it is ever empty, because an empty
   # constraint would match no container and take every route down.
   traefik:
-    image: traefik:latest
+    image: traefik:v3.6.10@sha256:c549d482c55d7a797398562064f35428cc53e748d84d7190997930e7b31bcc32
     command:
       - "--api.dashboard=true"
       - "--api.insecure=true"
@@ -148,7 +148,7 @@ services:
 
   # --- PostgreSQL ---
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16.15-alpine@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -175,7 +175,7 @@ services:
   # (volumes merge; command is a scalar and replaces), so make up and the gate
   # stack keep starting with empty streams.
   nats:
-    image: nats:2.10-alpine
+    image: nats:2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
     command: ["-js", "-sd", "/data", "-m", "8222"]
     ports:
       - "127.0.0.1:4222:4222"  # no broker authentication: loopback only

@@ -1,12 +1,14 @@
 """Guard for issue #991: no tracked document runs the `nats` CLI inside the NATS service.
 
-The compose `nats` service runs `nats:2.10-alpine`, which ships only
-`nats-server`, so `docker compose exec nats nats ...` fails with "executable
+The compose `nats` service runs a `nats:2.10.<patch>-alpine` image, which ships
+only `nats-server`, so `docker compose exec nats nats ...` fails with "executable
 file not found". The operator documents use a one-off `natsio/nats-box`
 container on the stack network instead. This fails if the broken form comes
 back in any tracked markdown or HTML file, and checks that the image the docs
 rely on is still the CLI-less one, so the guard is retired deliberately if the
-service image ever changes.
+service image ever changes. Since issue #1300 the image is pinned to an exact
+2.10 patch release with its digest: a patch bump within 2.10 still passes the
+image check, and any other change of image, line, or variant fails it.
 """
 
 import re
@@ -49,7 +51,9 @@ def test_pattern_catches_the_broken_form():
 
 def test_nats_service_image_is_the_cli_less_server_image():
     compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-    assert re.search(r"^\s+image:\s*nats:2\.10-alpine\s*$", compose, re.MULTILINE), (
+    assert re.search(
+        r"^\s+image:\s*nats:2\.10\.\d+-alpine(@sha256:[0-9a-f]{64})?\s*$", compose, re.MULTILINE
+    ), (
         "the nats service image changed; recheck whether it ships the nats CLI "
         "before keeping or retiring this guard (issue #991)"
     )

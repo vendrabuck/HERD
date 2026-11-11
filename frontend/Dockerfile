@@ -1,5 +1,5 @@
 # Build stage
-FROM node:22-alpine AS build
+FROM node:22.23.4-alpine@sha256:0e1754758c2df4cfa3e68d59e2e1b7374bb7fd9ea6328eaaacf15cc934af8202 AS build
 
 WORKDIR /app
 
@@ -7,7 +7,7 @@ WORKDIR /app
 # context (that is the later `COPY . .`): frontend/.npmrc sets
 # engine-strict=true (issue #885) so that a local `npm ci`/`npm install`
 # refuses on an npm older than package.json's engines.npm floor. This
-# image's base, node:22-alpine, ships whatever npm was bundled with that
+# image's base, node:22 on Alpine, ships whatever npm was bundled with that
 # tag, which is not guaranteed to meet that floor. Keeping .npmrc out of
 # the build context until after the install step means engine-strict is
 # never in effect here, so the bundled npm only WARNS on an engines
@@ -37,8 +37,8 @@ ENV VITE_HERD_BUILD=${VITE_HERD_BUILD} VITE_HERD_BUILD_DATE=${VITE_HERD_BUILD_DA
 
 RUN npm run build
 
-# Serve stage
-FROM nginx:1.25-alpine
+# Serve stage: the nginx stable line (1.30), not mainline.
+FROM nginx:1.30.6-alpine@sha256:583b7f2fce1cdb8da5ad5c39ebd3c33b98b87d493190e548bdee1fa8c619c311
 
 COPY --from=build /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf

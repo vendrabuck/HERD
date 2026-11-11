@@ -597,7 +597,7 @@ docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
 
 If any row comes back, do not replay; destroy the instance by hand instead.
 
-The `nats:2.10-alpine` service image ships only `nats-server`, no `nats` CLI, so publish
+The `nats:2.10.29-alpine` service image ships only `nats-server`, no `nats` CLI, so publish
 from a one-off `natsio/nats-box` container on the stack's network
 (`<compose project>_herd-net`, for example `herd-public_herd-net`):
 
