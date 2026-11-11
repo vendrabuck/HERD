@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import toast from "react-hot-toast";
 import { ChevronDown, ChevronUp } from "lucide-react";
@@ -15,6 +15,7 @@ import { useAuthStore } from "@/stores/authStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { topologyDeleteErrorText } from "@/lib/errors";
 import { applySettled } from "@/lib/reservationBulk";
+import { ROW_PRIMARY_CONTROL_CLASS, rowClick } from "@/lib/rowNavigation";
 import {
   BULK_DELETE_KEEP_LABEL,
   BULK_DELETE_TITLE,
@@ -107,7 +108,7 @@ function TopologyRow({
   return (
     <tr
       className={`border-b border-gray-100 hover:bg-gray-50 cursor-pointer ${selected ? "bg-blue-50" : ""}`}
-      onClick={() => navigate(`/topology/${topology.id}`)}
+      onClick={rowClick(() => navigate(`/topology/${topology.id}`))}
     >
       <td className="px-4 py-3 w-8" onClick={(e) => e.stopPropagation()}>
         <input
@@ -119,7 +120,9 @@ function TopologyRow({
         />
       </td>
       <td className="px-4 py-3 text-sm font-medium text-blue-600 hover:text-blue-800">
-        {topology.name}
+        <Link to={`/topology/${topology.id}`} className={ROW_PRIMARY_CONTROL_CLASS}>
+          {topology.name}
+        </Link>
         {failure !== undefined && (
           <span className="block text-xs font-normal text-red-600">
             Not deleted{failure ? `: ${failure}` : ""}

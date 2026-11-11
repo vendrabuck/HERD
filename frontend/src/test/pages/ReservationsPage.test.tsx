@@ -2,6 +2,8 @@ import { http, HttpResponse } from "msw";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
+import userEvent from "@testing-library/user-event";
+import { renderInCountingRouter, tabTo } from "../rowNavigationHarness";
 import type { ReactNode } from "react";
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
 
@@ -895,5 +897,41 @@ describe("ReservationsPage", () => {
       expect(rowBox(1)).toBeChecked();
       expect(rowBox(2)).toBeChecked();
     });
+  });
+});
+
+describe("ReservationsPage keyboard row access (issue #1317)", () => {
+  function oneReservation() {
+    server.use(
+      http.get("/api/reservations/", () =>
+        HttpResponse.json({ items: [RESERVATION], total: 1, skip: 0, limit: 50 }),
+      ),
+    );
+  }
+
+  it("Tab reaches the reservation id button and Enter opens the detail dialog", async () => {
+    oneReservation();
+    const user = userEvent.setup();
+    const { navigations } = renderInCountingRouter(<ReservationsPage />, "/reservations");
+    const open = await screen.findByRole("button", { name: "Open reservation 11111111" });
+    expect(open).toHaveTextContent("11111111");
+
+    await tabTo(user, open);
+    await user.keyboard("{Enter}");
+
+    expect(screen.getByTestId("reservation-detail-modal")).toHaveTextContent(RESERVATION.id);
+    expect(navigations).toEqual([]);
+  });
+
+  it("a click on the row select checkbox does not open the detail dialog", async () => {
+    oneReservation();
+    const user = userEvent.setup();
+    renderInCountingRouter(<ReservationsPage />, "/reservations");
+    const checkbox = await screen.findByRole("checkbox", { name: "Select reservation 11111111" });
+
+    await user.click(checkbox);
+
+    expect(checkbox).toBeChecked();
+    expect(screen.queryByTestId("reservation-detail-modal")).not.toBeInTheDocument();
   });
 });

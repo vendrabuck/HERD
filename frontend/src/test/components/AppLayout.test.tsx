@@ -1,8 +1,11 @@
 import { http, HttpResponse } from "msw";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { MemoryRouter, Route, Routes, createMemoryRouter, RouterProvider, useLocation } from "react-router-dom";
+import { act } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, it, expect, beforeEach } from "vitest";
+import { ADMIN_NAV } from "@/lib/adminNav";
 
 import { server } from "../mocks/server";
 import { AppLayout } from "@/components/layout/AppLayout";
@@ -312,5 +315,211 @@ describe("AppLayout", () => {
     fireEvent.click(usersLink);
     // The click handler closes the dropdown synchronously.
     expect(screen.queryByRole("link", { name: "Users" })).not.toBeInTheDocument();
+  });
+});
+
+function renderLayoutInDataRouter(initialEntry = "/inventory") {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, refetchInterval: false } },
+  });
+  const router = createMemoryRouter(
+    [{ element: <AppLayout />, children: [{ path: "*", element: <LocationProbe /> }] }],
+    { initialEntries: [initialEntry] },
+  );
+  const utils = render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return { ...utils, router };
+}
+
+describe("AppLayout Administration disclosure, keyboard (issue #1317)", () => {
+  async function adminButton() {
+    server.use(http.get("/api/auth/me", () => HttpResponse.json(user({ role: "admin" }))));
+    const utils = renderLayoutInDataRouter("/inventory");
+    await screen.findByText("alice");
+    return { ...utils, button: screen.getByRole("button", { name: "Administration" }) };
+  }
+
+  it("is a disclosure button: collapsed, controlling a hidden list of every ADMIN_NAV link", async () => {
+    const { button } = await adminButton();
+    expect(button).toHaveAttribute("aria-expanded", "false");
+    // A disclosure, not an ARIA menu: no menu role and no aria-haspopup.
+    expect(button).not.toHaveAttribute("aria-haspopup");
+    expect(screen.queryByRole("menu")).toBe(null);
+    const panel = document.getElementById(button.getAttribute("aria-controls") ?? "");
+    expect(panel).not.toBe(null);
+    expect(panel).not.toBeVisible();
+    // The panel's links come from ADMIN_NAV, in order.
+    const hrefs = [...(panel as HTMLElement).querySelectorAll("a")].map((a) => a.getAttribute("href"));
+    expect(hrefs).toEqual(ADMIN_NAV.map((item) => item.to));
+  });
+
+  it("Tab focuses the button, Enter opens it, Tab walks its links, Escape closes and restores focus", async () => {
+    const { button } = await adminButton();
+    const kb = userEvent.setup();
+
+    while (document.activeElement !== button) await kb.tab();
+    await kb.keyboard("{Enter}");
+    expect(button).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("link", { name: "Add Device" })).toBeVisible();
+
+    // The next Tab stops are the links themselves, in ADMIN_NAV order.
+    for (const item of ADMIN_NAV.slice(0, 3)) {
+      await kb.tab();
+      expect(document.activeElement).toBe(screen.getByRole("link", { name: item.label }));
+    }
+
+    await kb.keyboard("{Escape}");
+    expect(button).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("link", { name: "Add Device" })).toBe(null);
+    expect(document.activeElement).toBe(button);
+  });
+
+  it("Space toggles it open and closed", async () => {
+    const { button } = await adminButton();
+    const kb = userEvent.setup();
+    button.focus();
+    await kb.keyboard(" ");
+    expect(button).toHaveAttribute("aria-expanded", "true");
+    await kb.keyboard(" ");
+    expect(button).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("Enter on a link navigates to it and closes the panel", async () => {
+    const { button } = await adminButton();
+    const kb = userEvent.setup();
+    button.focus();
+    await kb.keyboard("{Enter}");
+    await kb.tab();
+    await kb.tab();
+    expect(document.activeElement).toBe(screen.getByRole("link", { name: "User Groups" }));
+    await kb.keyboard("{Enter}");
+    await waitFor(() =>
+      expect(screen.getByTestId("location-probe")).toHaveTextContent("/admin/groups"),
+    );
+    expect(button).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("closes on a route change made elsewhere", async () => {
+    const { button, router } = await adminButton();
+    const kb = userEvent.setup();
+    button.focus();
+    await kb.keyboard("{Enter}");
+    expect(button).toHaveAttribute("aria-expanded", "true");
+
+    await act(async () => {
+      await router.navigate("/topology");
+    });
+
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/topology");
+    expect(button).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("closes on a click outside it", async () => {
+    const { button } = await adminButton();
+    const kb = userEvent.setup();
+    await kb.click(button);
+    expect(button).toHaveAttribute("aria-expanded", "true");
+    await kb.click(screen.getByTestId("location-probe"));
+    expect(button).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("closes when keyboard focus leaves it", async () => {
+    const { button } = await adminButton();
+    const kb = userEvent.setup();
+    button.focus();
+    await kb.keyboard("{Enter}");
+    // Shift+Tab from the button moves focus to the main nav, outside the disclosure.
+    await kb.tab({ shift: true });
+    expect(document.activeElement).toBe(screen.getByRole("link", { name: "Reporting" }));
+    expect(button).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("a click while hover-opened keeps it open (the e2e helper hovers, then clicks)", async () => {
+    const { button } = await adminButton();
+    const kb = userEvent.setup();
+    // userEvent.click moves the pointer onto the button first, which fires
+    // mouseenter on the wrapper and opens it by hover.
+    await kb.click(button);
+    expect(button).toHaveAttribute("aria-expanded", "true");
+    // Pinned by the click: leaving with the mouse no longer closes it.
+    fireEvent.mouseLeave(button.parentElement as HTMLElement);
+    expect(button).toHaveAttribute("aria-expanded", "true");
+    // A second click closes it.
+    await kb.click(button);
+    expect(button).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("hover alone opens it and mouse leave closes it, with aria-expanded tracking both", async () => {
+    const { button } = await adminButton();
+    fireEvent.mouseEnter(button.parentElement as HTMLElement);
+    expect(button).toHaveAttribute("aria-expanded", "true");
+    fireEvent.mouseLeave(button.parentElement as HTMLElement);
+    expect(button).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("is absent for a plain user, and no admin link is in the document", async () => {
+    server.use(http.get("/api/auth/me", () => HttpResponse.json(user({ role: "user" }))));
+    renderLayoutInDataRouter("/inventory");
+    await screen.findByText("alice");
+    expect(screen.queryByRole("button", { name: "Administration" })).toBe(null);
+    for (const item of ADMIN_NAV) {
+      expect(document.querySelector(`a[href="${item.to}"]`), item.to).toBe(null);
+    }
+  });
+});
+
+describe("AppLayout landmarks and titles (issue #1317)", () => {
+  it("wraps the routed content in a main landmark that the skip link focuses", async () => {
+    server.use(http.get("/api/auth/me", () => HttpResponse.json(user())));
+    renderLayoutInDataRouter("/inventory");
+    await screen.findByText("alice");
+    const main = screen.getByRole("main");
+    expect(main).toContainElement(screen.getByTestId("location-probe"));
+    expect(screen.getAllByRole("main")).toHaveLength(1);
+
+    const kb = userEvent.setup();
+    await kb.tab();
+    const skip = screen.getByRole("link", { name: "Skip to main content" });
+    // The skip link is the first Tab stop on the page.
+    expect(document.activeElement).toBe(skip);
+    expect(skip).toHaveAttribute("href", `#${main.id}`);
+    await kb.keyboard("{Enter}");
+    expect(document.activeElement).toBe(main);
+  });
+
+  it("names the primary navigation", async () => {
+    server.use(http.get("/api/auth/me", () => HttpResponse.json(user())));
+    renderLayoutInDataRouter("/inventory");
+    await screen.findByText("alice");
+    expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
+  });
+
+  it("sets document.title per route and restores the original title on unmount", async () => {
+    document.title = "HERD original";
+    server.use(http.get("/api/auth/me", () => HttpResponse.json(user({ role: "admin" }))));
+    const { router, unmount } = renderLayoutInDataRouter("/inventory");
+    await screen.findByText("alice");
+    expect(document.title).toBe("Inventory - HERD");
+
+    await act(async () => {
+      await router.navigate("/topology/abc");
+    });
+    expect(document.title).toBe("Topology editor - HERD");
+
+    await act(async () => {
+      await router.navigate("/admin/ldap-sync");
+    });
+    expect(document.title).toBe("LDAP Sync - HERD");
+
+    await act(async () => {
+      await router.navigate("/no-such-page");
+    });
+    expect(document.title).toBe("HERD original");
+
+    unmount();
+    expect(document.title).toBe("HERD original");
   });
 });
