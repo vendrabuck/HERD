@@ -3014,6 +3014,24 @@ async def _release_orphaned_allocations(
         RELEASED (allocation lifecycle is a database decision, never coupled to hardware
         cleanup) and bounded lingering of an empty VLAN definition is accepted; there is
         deliberately no free-after-delete state and no parked row.
+      - Upstream failure (issue #1209): when a delete cannot start because the switch
+        or template read fails (inventory answered anything but the record or a 404: a
+        5xx, a 401 or 403 during an INTERNAL_API_TOKEN rotation, a malformed body; or
+        could not be reached), _run_vlan_definition_op raises TransientUpstreamError
+        before any driver call, and the remaining deletes of THAT allocation are not
+        attempted. Only the switches whose delete succeeded before it leave
+        defined_switch_ids; the failing switch and every switch not yet tried
+        stay listed, because their definition may still be on the switch. One line is
+        logged with the action `vlan_delete_upstream_failed` and the exception's class
+        name only (its text can carry upstream detail), and the pass continues with the
+        next allocation. The error is not re-raised for the same reasons as the
+        unjudged case; nothing re-drives these deletes (a limit by decision, like the
+        unjudged skip).
+
+    Any other exception (a database error from a session, a commit, or an execution run
+    write; an inventory record missing a field the driver load needs) is not caught
+    here and propagates to the caller, as everywhere else in this module: it is not
+    specific to one allocation.
     """
     from datetime import datetime, timezone
 
@@ -3074,10 +3092,37 @@ async def _release_orphaned_allocations(
             continue
 
         remaining: list[str] = []
-        for switch_id in defined:
-            ok, _attempts, err = await _run_vlan_definition_op(
-                switch_id, "delete_vlan", row.vlan_id, row.reservation_id, ctx, get_db_session
-            )
+        for index, switch_id in enumerate(defined):
+            try:
+                ok, _attempts, err = await _run_vlan_definition_op(
+                    switch_id, "delete_vlan", row.vlan_id, row.reservation_id, ctx, get_db_session
+                )
+            except TransientUpstreamError as exc:
+                # Issue #1209: this allocation only. The switch read failed before any
+                # driver call, so this switch and the ones not yet tried keep their
+                # definition and stay listed; deletes that already succeeded are trimmed
+                # below. Class name only: the error text can carry upstream detail.
+                not_reached = defined[index:]
+                remaining.extend(not_reached)
+                logger.error(
+                    "Skipping delete_vlan for VLAN %d on switches %s (allocation %s, "
+                    "reservation %s): an upstream read failed (%s); the definition may "
+                    "linger on those switches and nothing re-drives the delete",
+                    row.vlan_id,
+                    not_reached,
+                    row.id,
+                    row.reservation_id,
+                    type(exc).__name__,
+                    extra={
+                        "action": "vlan_delete_upstream_failed",
+                        "error_class": type(exc).__name__,
+                        "vlan_assignment_id": str(row.id),
+                        "reservation_id": str(row.reservation_id),
+                        "vlan_id": row.vlan_id,
+                        "switch_ids": not_reached,
+                    },
+                )
+                break
             if ok:
                 continue
             remaining.append(switch_id)

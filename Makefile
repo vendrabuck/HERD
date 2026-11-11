@@ -10,11 +10,11 @@ DB_SERVICES := auth inventory reservations cabling acl execution user-profile no
 # workspace ruff config's default discovery and lint/format must target it
 # explicitly. Add new repo-root packages or scripts here so they are linted and
 # format-checked locally and in CI. Today this is the seedtools seeding package
-# (issue #791), the CI image-vs-lock guard script (issue #593), the AI generate
-# evaluation harness (tests/ai_eval/), and the repo-root unit tests
-# (tests/unit/); the rest of tests/ is not covered by make lint or CI's ruff
-# steps.
-ROOT_PY := seedtools/ scripts/check_image_matches_lock.py tests/ai_eval/ tests/unit/
+# (issue #791), the CI image-vs-lock guard script (issue #593), the manual search
+# index generator (issue #1298), the AI generate evaluation harness
+# (tests/ai_eval/), and the repo-root unit tests (tests/unit/); the rest of
+# tests/ is not covered by make lint or CI's ruff steps.
+ROOT_PY := seedtools/ scripts/check_image_matches_lock.py scripts/build_manual_search_index.py tests/ai_eval/ tests/unit/
 
 # The ephemeral master/everything gate stack runs in its OWN compose project so
 # its volumes never collide with the dev stack's: the gate is always born fresh
@@ -116,7 +116,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	$(addprefix shell-,$(DB_SERVICES)) \
 	test-frontend test-frontend-tz check-image-lock test-integration test-integration-ai test-integration-service test-contract test-load test-load-ui test-e2e test-e2e-seeded test-e2e-stop test-auth-ldap ai-eval \
 	test-root coverage-parallel coverage-frontend \
-	install frontend-install frontend-dev lint format clean clean-data gate-clean gate-down seed seed-frr seed-nos \
+	install frontend-install frontend-dev manual-index lint format clean clean-data gate-clean gate-down seed seed-frr seed-nos \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset _gate-ldap-tests \
 	nos-up nos-down nos-status nos-logs nos-reset nos-attach nos-detach \
 	nos-test-dialect nos-test-feature \
@@ -1320,6 +1320,12 @@ frontend-install:  ## Install frontend deps (npm install)
 
 frontend-dev:  ## Run the Vite dev server
 	cd frontend && npm run dev
+
+# The manual's search index (issue #1298): docs/manual/assets/search-index.js is
+# generated from docs/manual/*.html, so rerun this after ANY manual page edit and
+# commit both. tests/unit/test_manual_search_index.py fails while it is stale.
+manual-index:  ## Regenerate the manual's search index after a manual page edit
+	uv run python scripts/build_manual_search_index.py
 
 ## --- Lint and format ---
 

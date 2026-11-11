@@ -236,15 +236,60 @@ kbd{font-family:var(--font-mono);font-size:12px;background:#fff;border:1px solid
 #totop:hover{background:var(--chrome-bg-hover);transform:translateY(-2px);}
 #totop svg{width:20px;height:20px;}
 
+/* ---------- search (issue #1298): box injected into .manualbar by manual.js ---------- */
+.manualbar .wm{flex:none;}
+.msearch{position:relative;margin-left:auto;flex:0 1 240px;min-width:110px;}
+.msearch-sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;}
+/* Above the sidebar breakpoint the nav keeps its one row and the search box gives way. */
+@media (min-width:981px){.manualbar nav{flex-shrink:0;}}
+.msearch-input{
+  width:100%;height:34px;padding:0 30px 0 11px;border-radius:var(--radius-lg);
+  border:1px solid var(--chrome-active);background:var(--chrome-bg-hover);color:var(--chrome-fg);
+  font-family:var(--font-sans);font-size:13.5px;transition:border-color .15s,background .15s;
+}
+.msearch-input::placeholder{color:var(--chrome-fg-muted);}
+.msearch-input:hover{border-color:var(--gray-500);}
+.msearch-input:focus{outline:none;border-color:var(--blue-500);box-shadow:0 0 0 2px var(--blue-500);background:var(--chrome-bg);}
+.msearch-input::-webkit-search-cancel-button{display:none;}
+.msearch-key{
+  position:absolute;right:8px;top:50%;transform:translateY(-50%);pointer-events:none;
+  background:transparent;color:var(--chrome-fg-muted);border-color:var(--chrome-active);box-shadow:none;font-size:11px;
+}
+.msearch:focus-within .msearch-key{display:none;}
+.msearch-panel{
+  position:absolute;top:calc(100% + 10px);right:0;width:min(520px,calc(100vw - 32px));max-height:min(70vh,560px);
+  overflow-y:auto;background:var(--card);color:var(--gray-900);border:1px solid var(--gray-200);
+  border-radius:var(--radius-lg);box-shadow:var(--shadow-xl);padding:6px;z-index:60;
+}
+.msearch-panel[hidden]{display:none;}
+.msearch-count{margin:0;padding:6px 10px 4px;font-size:12px;color:var(--gray-500);}
+.msearch-count.empty{padding:12px 10px;font-size:14px;color:var(--gray-600);}
+.msearch-option{display:block;padding:9px 10px;border-radius:var(--radius-md);color:inherit;transition:background .12s;}
+.msearch-option:hover,.msearch-option[aria-selected="true"]{background:var(--blue-50);text-decoration:none;color:inherit;}
+.msearch-option[aria-selected="true"]{box-shadow:inset 2px 0 0 var(--blue-600);}
+.msearch-option:focus-visible{outline:2px solid var(--blue-500);outline-offset:-2px;}
+.msearch-meta{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--gray-500);margin-bottom:1px;}
+.msearch-tag{font-size:11px;font-weight:500;color:var(--gray-600);background:var(--gray-100);border-radius:var(--radius-sm);padding:1px 6px;}
+.msearch-heading{display:block;font-size:14px;font-weight:600;color:var(--gray-900);line-height:1.4;}
+.msearch-snippet{display:block;font-size:13px;color:var(--gray-600);line-height:1.45;margin-top:2px;overflow-wrap:anywhere;}
+.msearch-option mark{background:var(--blue-100);color:var(--gray-900);border-radius:2px;padding:0 1px;}
+
 /* ---------- responsive ---------- */
+/* The nav collapses behind the toggle at the sidebar breakpoint: below about
+   980 px its seven links, the wordmark, and the search box no longer fit on
+   one row of the 56 px bar (issue #1298). */
 @media (max-width:980px){
   .shell{grid-template-columns:1fr;gap:0;}
   .side{display:none;}
-}
-@media (max-width:720px){
   .manualbar nav{display:none;position:absolute;top:56px;left:0;right:0;background:var(--chrome-bg);flex-direction:column;padding:8px;gap:2px;border-top:1px solid var(--chrome-bg-hover);}
   .manualbar nav.open{display:flex;}
   .navtoggle{display:flex;}
+  .msearch{flex:1 1 auto;min-width:0;max-width:420px;}
+}
+@media (max-width:720px){
+  .msearch{max-width:none;}
+  .msearch-key{display:none;}
+  .msearch-panel{position:fixed;top:64px;left:8px;right:8px;width:auto;max-height:calc(100vh - 80px);}
   .cardgrid.c2,.cardgrid.c3{grid-template-columns:1fr;}
   h1.title{font-size:30px;}
   .stepblock{padding-left:52px;}
@@ -252,7 +297,7 @@ kbd{font-family:var(--font-mono);font-size:12px;background:#fff;border:1px solid
 
 /* ---------- print ---------- */
 @media print{
-  .manualbar,.side,#totop,.cmd .copy,.navtoggle,.pagenav{display:none!important;}
+  .manualbar,.side,#totop,.msearch,.cmd .copy,.navtoggle,.pagenav{display:none!important;}
   body{background:#fff;}
   .shell{display:block;max-width:100%;padding:0;}
   .main{padding-top:0;}
