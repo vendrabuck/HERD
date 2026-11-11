@@ -237,10 +237,9 @@ describe("DeviceConfigSection", () => {
       renderWithProviders(<DeviceConfigSection deviceId={DEVICE_ID} />);
       await screen.findByText("v1");
       await user.click(screen.getByRole("button", { name: "Apply" }));
-      // Every Modal titles itself through id="modal-title", so the section's
-      // several modals share one id; find the dialog through its heading.
-      const heading = await screen.findByRole("heading", { name: "Apply config to device" });
-      const dialog = heading.closest("dialog") as HTMLElement;
+      // Each Modal names itself from its own title (issue #1318), so the
+      // dialog is found by its accessible name even with several mounted.
+      const dialog = await screen.findByRole("dialog", { name: "Apply config to device" });
       return { user, dialog };
     }
 

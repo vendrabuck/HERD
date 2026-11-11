@@ -320,9 +320,10 @@ export function ConnectionsPage() {
         </div>
       </div>
 
-      {/* Both create surfaces mount only while open: Modal hardcodes
-          id="modal-title", so two mounted Modals would put duplicate ids in the
-          document and every aria-labelledby would resolve to the first one. */}
+      {/* Mounted only while open: each open starts from a fresh DOM, and the
+          closed form's controls (its two "Search devices..." inputs and its
+          Cancel button) are never in the document for a first-match locator
+          to land on instead of the open multi dialog's. */}
       {showCreate && (
       <Modal
         open

@@ -2,6 +2,8 @@ import { http, HttpResponse } from "msw";
 import { act, render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
+import userEvent from "@testing-library/user-event";
+import { renderInCountingRouter, tabTo } from "../rowNavigationHarness";
 import type { ReactNode } from "react";
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
 
@@ -1376,5 +1378,66 @@ describe("InventoryPage", () => {
       expect(screen.getByText("Page 2 of 3")).toBeInTheDocument();
       vi.useRealTimers();
     });
+  });
+});
+
+describe("InventoryPage keyboard row navigation (issue #1317)", () => {
+  const DEVICE_PATH = "/inventory/aaaaaaaa-1111-2222-3333-444444444444";
+
+  function oneDevice() {
+    server.use(
+      http.get("/api/inventory/devices", () =>
+        HttpResponse.json({ items: [makeDevice()], total: 1, skip: 0, limit: 50 }),
+      ),
+    );
+  }
+
+  it("Tab reaches the device name link and Enter opens the device page, navigating once", async () => {
+    oneDevice();
+    const user = userEvent.setup();
+    const { navigations } = renderInCountingRouter(<InventoryPage />, "/inventory");
+    const link = await screen.findByRole("link", { name: "fw-edge-01" });
+    expect(link).toHaveAttribute("href", DEVICE_PATH);
+
+    await tabTo(user, link);
+    await user.keyboard("{Enter}");
+
+    await screen.findByTestId("destination");
+    // Exactly one navigation: the row's own click handler ignored the click
+    // the Enter key dispatched on the link.
+    expect(navigations).toEqual([DEVICE_PATH]);
+  });
+
+  it("a mouse click on the name link navigates once, not twice", async () => {
+    oneDevice();
+    const user = userEvent.setup();
+    const { navigations } = renderInCountingRouter(<InventoryPage />, "/inventory");
+    await user.click(await screen.findByRole("link", { name: "fw-edge-01" }));
+    await screen.findByTestId("destination");
+    expect(navigations).toEqual([DEVICE_PATH]);
+  });
+
+  it("a click elsewhere on the row still opens the device (mouse convenience)", async () => {
+    oneDevice();
+    const user = userEvent.setup();
+    const { navigations } = renderInCountingRouter(<InventoryPage />, "/inventory");
+    const row = (await screen.findByRole("link", { name: "fw-edge-01" })).closest("tr") as HTMLElement;
+    await user.click(within(row).getByText("FW-3600"));
+    await screen.findByTestId("destination");
+    expect(navigations).toEqual([DEVICE_PATH]);
+  });
+
+  it("clicks on the row checkbox, expand button, and duplicate button do not navigate", async () => {
+    oneDevice();
+    const user = userEvent.setup();
+    const { navigations } = renderInCountingRouter(<InventoryPage />, "/inventory");
+    const row = (await screen.findByRole("link", { name: "fw-edge-01" })).closest("tr") as HTMLElement;
+
+    await user.click(within(row).getByRole("checkbox"));
+    expect(within(row).getByRole("checkbox")).toBeChecked();
+    await user.click(within(row).getByRole("button", { name: "Expand ports" }));
+    await user.click(within(row).getByTitle("Duplicate device"));
+
+    expect(navigations).toEqual([]);
   });
 });
