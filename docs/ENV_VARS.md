@@ -142,8 +142,8 @@ startup warning naming the variables (never their values), and single sign-on
 answers unavailable until they are fixed. Fixed in code, not settings: discovery
 and JWKS cached for 3600 s, a JWKS refetch for an unknown signing key at most once
 per 60 s, HTTP timeouts of 5 s to connect and 10 s for each read or write, an
-overall deadline of 10 s on each request to the identity provider, and the 10 s
-clock-skew leeway the access-token check uses.
+overall deadline of 10 s on each request to the identity provider, and a 60 s
+clock-skew leeway on ID tokens (HERD's own access tokens keep 10 s).
 
 | Variable | Default | Purpose |
 |---|---|---|

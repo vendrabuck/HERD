@@ -30,7 +30,9 @@ use, which callers log through `herd_common.auth.log_unusable_key`.
 `decode_id_token` is the second decode (ADR 0016, issue #37): an OpenID Connect
 ID token, signed by the identity provider with an asymmetric key from its JWKS.
 It is a separate helper, not a mode of `decode_access_token`, so neither decode
-can be widened by a caller of the other. It shares the leeway constant, passes
+can be widened by a caller of the other. It uses its own leeway,
+`ID_TOKEN_LEEWAY_SECONDS` (60 s, an owner decision of 2026-11-11: the
+provider's clock is not HERD's, and the nonce already prevents replay), passes
 exactly one algorithm, which must be one of `ID_TOKEN_ALGORITHMS` (never `none`,
 never an HS algorithm, so a token MACed with the client secret or with the
 public key bytes is refused whatever the caller passes), requires `exp`, `iat`,
@@ -48,6 +50,11 @@ entry.
 import jwt
 
 ACCESS_TOKEN_LEEWAY_SECONDS = 10
+
+# ID tokens only (ADR 0016 D8, owner decision 2026-11-11): the identity provider's
+# clock is not HERD's, and the flow's nonce already prevents replay. HERD's own
+# access tokens keep ACCESS_TOKEN_LEEWAY_SECONDS.
+ID_TOKEN_LEEWAY_SECONDS = 60
 
 # The ID-token algorithms HERD accepts, all asymmetric (ADR 0016, D8). The auth
 # service's `OIDC_ID_TOKEN_ALGORITHM` Literal holds exactly these values, pinned
@@ -104,7 +111,7 @@ def decode_id_token(token: str, key, algorithm: str, *, issuer: str, audience: s
         algorithms=[algorithm],
         issuer=issuer,
         audience=audience,
-        leeway=ACCESS_TOKEN_LEEWAY_SECONDS,
+        leeway=ID_TOKEN_LEEWAY_SECONDS,
         options={
             "require": list(ID_TOKEN_REQUIRED_CLAIMS),
             "enforce_minimum_key_length": True,

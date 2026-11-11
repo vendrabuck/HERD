@@ -188,12 +188,12 @@ Implementation notes the phases must follow:
 - `herd_common.jwt_codec` gains `decode_id_token(token, key, algorithm, *, issuer,
   audience)`: one `jwt.decode` call with `algorithms=[algorithm]` (a one-element
   list, as the guard demands), `issuer=`, `audience=`,
-  `leeway=ACCESS_TOKEN_LEEWAY_SECONDS`, and `options={"require": ["exp", "iat",
+  `leeway=ID_TOKEN_LEEWAY_SECONDS` (60 s, see D8), and `options={"require": ["exp", "iat",
   "iss", "aud", "sub", "nonce"]}`. The guard gets one `DIRECT_DECODE_ALLOWED` entry
   for it (count 1, with a reason) and one `UNVERIFIED_READ_ALLOWED` entry for the one
   function that reads the header's `kid` and `alg` before key selection. Placing the
-  helper in `jwt_codec.py` keeps every PyJWT decode in one reviewed module and shares
-  the leeway constant; the guard's `DECODE_HELPER` stays the access-token helper.
+  helper in `jwt_codec.py` keeps every PyJWT decode in one reviewed module beside
+  both leeway constants; the guard's `DECODE_HELPER` stays the access-token helper.
 - Keys come from the JWKS through `jwt.PyJWKSet` (needs `cryptography`), never
   through `jwt.PyJWKClient`, which fetches with blocking `urllib` and has its own
   cache we would not control.
@@ -397,7 +397,11 @@ in-repo HTTP client timeouts of 5 to 15 s (for example
   `AUTH_ALGORITHM` (IAM-JWT-4). Never `none`, never an HS algorithm (an HS ID token
   keyed by the client secret is not supported). The header's `alg` must equal it and
   the selected JWK's `kty` must fit it, before the decode.
-- Clock skew: `ACCESS_TOKEN_LEEWAY_SECONDS` (10 s), reused, not a new knob.
+- Clock skew: `ID_TOKEN_LEEWAY_SECONDS`, 60 s, in `herd_common.jwt_codec`, not a
+  setting. Decided by the owner on 2026-11-11: 60 seconds for ID tokens, because the
+  provider's clock is not HERD's and the nonce already prevents replay. HERD's own
+  access tokens keep `ACCESS_TOKEN_LEEWAY_SECONDS` (10 s). (The first draft reused
+  the 10 s constant.)
 - HTTP: one `httpx.AsyncClient` per call with `httpx.Timeout(10.0, connect=5.0)`
   (5 s to connect, 10 s for each read or write) and an overall 10 s deadline on each
   request, body included, through `asyncio.timeout` (corrected in phase 1: httpx's
@@ -565,7 +569,7 @@ Not per PR: the live levels, exactly as LDAP's. Adding Dex to the advisory per-P
 | Algorithm confusion, `alg: none`, HS with the client secret | one pinned asymmetric algorithm, the guard's one-element list, `kty` check (D8) |
 | Signing-key rotation | `kid` miss triggers a rate-floored JWKS refetch (D8) |
 | `at_hash` | not checked, by decision: HERD never uses the IdP access token (no userinfo call, nothing forwarded), so the hash would bind nothing HERD consumes; it is recorded so a later userinfo call adds the check with it |
-| Expired or future tokens | `exp` and `iat` required, 10 s leeway (D8) |
+| Expired or future tokens | `exp` and `iat` required, 60 s ID-token leeway (D8) |
 | Open redirect | `next` stored server-side and sanitized; `OIDC_REDIRECT_URI` fixed (D11) |
 | Host-header injection into redirects | no URL is derived from request headers (D11) |
 | Token leakage through URLs and logs | handoff by cookie and POST (D3); log rules (D9) |

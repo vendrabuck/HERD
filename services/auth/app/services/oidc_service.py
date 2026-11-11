@@ -46,8 +46,8 @@ that can verify the pinned algorithm (`kty`, for EC `crv`, `use` absent or
 `sig`, `alg` absent or the pinned one) are selected FIRST, and exactly one of
 them has the `kid`; the signature verifies under
 `herd_common.jwt_codec.decode_id_token` (exact `iss`, `aud` containing the
-client id, `exp` and `iat` required, `exp`, `iat`, and `nbf` with the 10 s
-leeway, an RSA key of at least 2048 bits); when `aud` holds more than one value
+client id, `exp` and `iat` required, `exp`, `iat`, and `nbf` with the 60 s
+ID-token leeway, an RSA key of at least 2048 bits); when `aud` holds more than one value
 `azp` is required, and when `azp` is present it equals the client id; `nonce`
 equals the flow's nonce (constant-time compare); `sub` is a string of at most
 255 characters that is not empty or white space only and holds no control
@@ -508,7 +508,10 @@ async def _signing_key(kid: str, algorithm: str) -> jwt.PyJWK:
         now = clock()
         last = _cache.last_jwks_fetch_at
         if last is None or now - last >= JWKS_REFETCH_FLOOR_SECONDS:
-            _cache.last_jwks_fetch_at = now
+            # No stamp here: _fetch_jwks stamps the floor as its first statement,
+            # before its first suspension, and nothing is awaited between reading
+            # the cache above and this check, so concurrent misses cannot both
+            # pass the floor (test_misses_arriving_during_an_in_flight_fetch_...).
             _cache.jwks.invalidate()
             logger.info(
                 "OIDC JWKS refetched for a key id it did not hold",

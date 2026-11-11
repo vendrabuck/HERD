@@ -12,7 +12,8 @@ credentials` with `WWW-Authenticate: Bearer`, and only the key error is logged.
 
 `decode_id_token` (ADR 0016, the OpenID Connect ID-token decode) is pinned at the
 bottom: it verifies under each of the nine asymmetric algorithms, passes exactly
-one algorithm with the issuer, audience, leeway, and required claims, refuses
+one algorithm with the issuer, audience, its own 60 s leeway (58 s accepted, 62 s
+refused, for `exp`, `iat`, and `nbf`), and required claims, refuses
 every HS algorithm and `none` before decoding (an HMAC token keyed by the client
 secret or by the public key PEM included), and each claim failure raises its
 exact class from a token that otherwise verifies. Keys are generated per session.
@@ -35,6 +36,7 @@ from herd_common.auth import make_auth_dependencies
 from herd_common.jwt_codec import (
     ACCESS_TOKEN_LEEWAY_SECONDS,
     ID_TOKEN_ALGORITHMS,
+    ID_TOKEN_LEEWAY_SECONDS,
     ID_TOKEN_REQUIRED_CLAIMS,
     decode_access_token,
     decode_id_token,
@@ -421,7 +423,7 @@ def test_id_decode_is_given_one_algorithm_issuer_audience_leeway_and_required_cl
                 "algorithms": ["RS256"],
                 "issuer": ISSUER,
                 "audience": CLIENT_ID,
-                "leeway": 10,
+                "leeway": 60,
                 "options": {
                     "require": ["exp", "iat", "iss", "aud", "sub", "nonce"],
                     "enforce_minimum_key_length": True,
@@ -533,7 +535,7 @@ _ID_FAILURES = {
         'Token is missing the "aud" claim',
     ),
     "exp-past-the-leeway": (
-        {"exp": "PAST12"},
+        {"exp": "PAST62"},
         "rsa",
         jwt.ExpiredSignatureError,
         "Signature has expired",
@@ -545,7 +547,7 @@ _ID_FAILURES = {
         'Token is missing the "exp" claim',
     ),
     "iat-past-the-leeway": (
-        {"iat": "FUTURE12"},
+        {"iat": "FUTURE62"},
         "rsa",
         jwt.ImmatureSignatureError,
         "The token is not yet valid (iat)",
@@ -557,7 +559,7 @@ _ID_FAILURES = {
         'Token is missing the "iat" claim',
     ),
     "nbf-past-the-leeway": (
-        {"nbf": "FUTURE12"},
+        {"nbf": "FUTURE62"},
         "rsa",
         jwt.ImmatureSignatureError,
         "The token is not yet valid (nbf)",
@@ -591,7 +593,7 @@ _ID_FAILURES = {
 
 def _resolve_times(changes: dict) -> dict:
     now = _now()
-    marks = {"PAST12": now - 12, "FUTURE12": now + 12}
+    marks = {"PAST62": now - 62, "FUTURE62": now + 62}
     return {k: marks.get(v, v) if isinstance(v, str) else v for k, v in changes.items()}
 
 
@@ -614,7 +616,9 @@ def test_a_tampered_id_token_payload_is_refused(id_keys):
 
 @pytest.mark.parametrize(
     "changes",
-    [{"exp": -5}, {"iat": 5}, {"nbf": 5}, {"aud": [CLIENT_ID]}, {"aud": [CLIENT_ID, "other"]}],
+    # 58 s: inside the 60 s ID-token leeway with 2 s of margin for the clock tick,
+    # and outside the 10 s access-token leeway, so a decode left at 10 s fails here.
+    [{"exp": -58}, {"iat": 58}, {"nbf": 58}, {"aud": [CLIENT_ID]}, {"aud": [CLIENT_ID, "other"]}],
     ids=["exp-inside-leeway", "iat-inside-leeway", "nbf-inside-leeway", "aud-list", "aud-multi"],
 )
 def test_id_token_inside_the_leeway_or_with_an_aud_list_verifies(changes, id_keys):
@@ -645,3 +649,18 @@ def test_id_decode_accepts_an_rsa_key_of_exactly_2048_bits(id_keys):
     claims = _id_claims()
     assert id_keys["rsa"].key_size == 2048
     assert _decode_id(_id_token(claims, id_keys["rsa"]), _public(id_keys["rsa"])) == claims
+
+
+def test_id_token_leeway_is_sixty_seconds_and_the_access_leeway_stays_ten():
+    # Owner decision 2026-11-11: 60 s for ID tokens only.
+    assert ID_TOKEN_LEEWAY_SECONDS == 60
+    assert ACCESS_TOKEN_LEEWAY_SECONDS == 10
+
+
+@pytest.mark.parametrize("name", ["exp", "iat", "nbf"])
+def test_an_access_token_58_seconds_past_the_access_leeway_is_still_refused(name):
+    """The ID-token leeway must not leak into the access-token decode."""
+    now = _now()
+    claims = {"sub": "user-1", name: now - 58 if name == "exp" else now + 58}
+    with pytest.raises(jwt.PyJWTError):
+        decode_access_token(_token(claims), KEY, ALG)

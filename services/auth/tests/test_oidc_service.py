@@ -411,9 +411,10 @@ async def test_each_accepted_algorithm_verifies_with_a_key_of_its_type(
         {"aud": [CLIENT_ID]},
         {"aud": [CLIENT_ID, "other-client"], "azp": CLIENT_ID},
         {"azp": CLIENT_ID},
-        {"exp": -5},
-        {"iat": 5},
-        {"nbf": 5},
+        # 58 s: just inside the 60 s ID-token leeway, outside the access 10 s.
+        {"exp": -58},
+        {"iat": 58},
+        {"nbf": 58},
         {"jwk_alg": "RS256", "jwk_use": "sig"},
     ],
     ids=[
@@ -454,9 +455,10 @@ def _drop(name):
 
 def _claim(name, value):
     def change(spec, idp, keys, monkeypatch):
-        if value in ("PAST12", "FUTURE12"):
+        if value in ("PAST62", "FUTURE62"):
             now = int(datetime.now(UTC).timestamp())
-            spec.claims[name] = now - 12 if value == "PAST12" else now + 12
+            # 62 s: just outside the 60 s ID-token leeway, 2 s of margin.
+            spec.claims[name] = now - 62 if value == "PAST62" else now + 62
         else:
             spec.claims[name] = value
 
@@ -596,16 +598,16 @@ REFUSALS: dict[str, tuple[Any, str, str | None]] = {
     ),
     "azp-another-client": (_claim("azp", "other-client"), "azp_mismatch", None),
     # Time.
-    "exp-past-the-leeway": (_claim("exp", "PAST12"), "id_token_invalid", "ExpiredSignatureError"),
+    "exp-past-the-leeway": (_claim("exp", "PAST62"), "id_token_invalid", "ExpiredSignatureError"),
     "exp-missing": (_drop("exp"), "id_token_invalid", "MissingRequiredClaimError"),
     "iat-past-the-leeway": (
-        _claim("iat", "FUTURE12"),
+        _claim("iat", "FUTURE62"),
         "id_token_invalid",
         "ImmatureSignatureError",
     ),
     "iat-missing": (_drop("iat"), "id_token_invalid", "MissingRequiredClaimError"),
     "nbf-past-the-leeway": (
-        _claim("nbf", "FUTURE12"),
+        _claim("nbf", "FUTURE62"),
         "id_token_invalid",
         "ImmatureSignatureError",
     ),
