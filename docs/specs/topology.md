@@ -1400,6 +1400,22 @@ routes `GET` and `PUT /topologies/{id}`, `POST /pathfind/batch`,
   refuses to instantiate until every role has a device. \
   Enforced in: `frontend/src/pages/TopologyTemplatesPage.tsx` (`TopologyTemplatesPage`) \
   Pinned by: `frontend/src/test/pages/TopologyTemplatesPage.test.tsx` (`derives unique roles from canvas_data nodes, filtering out nodes with no role`, `blocks submit with a toast when a role has no device assigned`, `submits name and role_assignments once every role has a device, then navigates`)
+- **TOPO-UI-13.** The canvas shown and saved for `/topology/:id` is always topology
+  `:id`'s canvas, or a loading or error state (issue #1315). The canvas store is global,
+  so the editor clears it on mount and on every change of the id or the `reservationId`
+  query parameter, and the store clears itself when the session signs out
+  (`isAuthenticated` turns false; a token refresh clears nothing). A canvas is ready
+  only once the load for the current id and reservation has landed; until then Save,
+  Reserve, Save as Template, and Clear canvas are disabled, and Save refuses in its
+  handler too. Every deferred store write of the load, the hydrated canvas and the
+  live-edit empty clear alike, carries a request token that an id change or an unmount
+  invalidates, so a hydration that returns late for an earlier id is dropped. When the
+  topology fetch fails outside live edit the editor renders "Topology not found" for a
+  404 or "Could not load this topology" otherwise, with a way back to the list, and no
+  canvas or write action. A topology just created (no `canvas_data`) opens empty and
+  saves empty. \
+  Enforced in: `frontend/src/pages/TopologyEditorPage.tsx` (`canvasReady`, `canvasLoadRequestRef`, `handleSave`); `frontend/src/stores/topologyStore.ts` (`useAuthStore.subscribe`) \
+  Pinned by: `frontend/src/test/pages/TopologyEditorPage.CanvasIdentity.test.tsx` (`TopologyEditorPage canvas identity (issue #1315)`, `B's hydration resolves after navigating to C: the late B canvas is dropped`, `B's hydration resolves after navigating to a new, empty topology: the canvas stays empty`, `B's hydration resolves after the editor unmounted: it never reaches the next editor`, `a new topology with no canvas opened after A: empty canvas, Save PUTs an empty canvas`, `unmount and remount the same id: not ready until this mount's load lands`, `logout clears the canvas; the next user opening a topology never sees the last one's`, `live edit is unaffected: the fork canvas loads, Commit waits for it, no topology PUT`); `frontend/src/test/stores/topologyStore.test.ts` (`clearAuth after a signed-in session empties the canvas`, `a token refresh (setTokens while signed in) keeps the canvas`)
 
 **Out of scope.** The AI generate and commit dialogs are `ai-features.md`; the reserve
 modal is `reservations.md`.
@@ -1551,13 +1567,15 @@ reservation's fork opens read-only.
   Enforced in: `frontend/src/lib/forkDiff.ts` (`edgeIdentityKey`, `diffForkCanvases`) \
   Pinned by: `frontend/src/test/lib/forkDiff.test.ts` (`does not report churn for the same wire re-drawn under a new edge id`, `uses multiset semantics for same-key edges, not set membership (coordinator review)`, `differs when the port names differ`, `reports a change when the destination text differs, even if it would canonicalize to the same network`)
 - **TOPO-UIFORK-9.** A successful commit shows the version and the released, built, and
-  unchanged counts, with the skipped attachment count only when above zero. When the
+  unchanged counts, with the skipped attachment count only when above zero, and a
+  `Routes released N, built M` line from `l3_routes_released` and `l3_routes_built`
+  when either is above zero (a missing field reads as 0, issue #1321). When the
   save lists `constrained_edges_skipped` (TOPO-FORK-18), the toast names each such line
   as device name and port to device name and port (short id when the canvas has no
   name, "any port" for an unconstrained side) outside the expandable detail, and the
   toast stays until dismissed (issue #1007). \
   Enforced in: `frontend/src/components/topology-editor/ForkSaveResultToast.tsx` (`ForkSaveResultToast`); `frontend/src/lib/forkSaveResult.ts` (`skippedEdgeText`); `frontend/src/pages/TopologyEditorPage.tsx` (`handleCommitToReservation`) \
-  Pinned by: `frontend/src/test/components/ForkSaveResultToast.test.tsx` (`shows the version and released/built/unchanged counts`, `omits the element attachments clause when the count is undefined or zero`, `shows the element attachments clause when the count is greater than zero`, `names each line the save could not wire on its chosen ports (issue #1007)`, `omits the not-wired block when the list is absent or empty`); `tests/e2e/test_fork_save_skipped_edge_playwright.py` (`test_fork_save_toast_names_a_line_on_unjoined_ports`)
+  Pinned by: `frontend/src/test/components/ForkSaveResultToast.test.tsx` (`shows the version and released/built/unchanged counts`, `omits the element attachments clause when the count is undefined or zero`, `shows the element attachments clause when the count is greater than zero`, `names each line the save could not wire on its chosen ports (issue #1007)`, `omits the not-wired block when the list is absent or empty`, `L3 routes only: a routing-only commit reports the routes it built and released`, `mixed: wires on every layer plus routes are all reported`, `all zero: only the connection line, no route line`, `an older response without the route fields reads as zero routes`); `tests/e2e/test_fork_save_skipped_edge_playwright.py` (`test_fork_save_toast_names_a_line_on_unjoined_ports`)
 
 - **TOPO-UIFORK-10.** The `invalid_edges` of the newest draft PUT, when the canvas on
   screen is still the one that PUT carried, mark each named line red with its reason in
