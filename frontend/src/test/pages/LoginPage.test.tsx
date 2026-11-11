@@ -24,6 +24,7 @@ vi.mock("react-hot-toast", () => ({
 import { server } from "../mocks/server";
 import { LoginPage } from "@/pages/LoginPage";
 import { APP_VERSION } from "@/lib/appVersion";
+import { fakeJwt } from "../fixtures/jwt";
 
 function renderWithProviders(node: ReactNode) {
   const client = new QueryClient({
@@ -43,7 +44,7 @@ beforeEach(() => {
 });
 
 describe("LoginPage", () => {
-  it("renders the email, password, and submit controls", () => {
+  it("renders the identifier, password, and submit controls", () => {
     renderWithProviders(<LoginPage />);
     expect(screen.getByLabelText("Email")).toBeInTheDocument();
     const pw = screen.getByLabelText("Password") as HTMLInputElement;
@@ -98,7 +99,9 @@ describe("LoginPage", () => {
       target: { value: "password" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
-    await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith("/topology"));
+    await waitFor(() =>
+      expect(mockNavigate).toHaveBeenCalledWith("/topology", { replace: true }),
+    );
   });
 
   it("toasts an error when login is rejected", async () => {
@@ -119,8 +122,197 @@ describe("LoginPage", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
     await waitFor(() =>
-      expect(toastError).toHaveBeenCalledWith("Invalid email or password"),
+      expect(toastError).toHaveBeenCalledWith(
+        "Invalid credentials. Check your email or login name and your password.",
+      ),
     );
     expect(mockNavigate).not.toHaveBeenCalled();
   });
+});
+
+// Issue #1335: in LDAP mode the identifier is the directory login name
+// (IAM-LDAP-2), which need not contain an @, and the page cannot yet tell the
+// mode, so the field must accept any text in both modes.
+describe("LoginPage identifier field (issue #1335)", () => {
+  it("is a text field with username autocomplete and an email keyboard, never type=email", () => {
+    renderWithProviders(<LoginPage />);
+    const id = screen.getByRole("textbox", { name: "Email" }) as HTMLInputElement;
+    expect(id.type).toBe("text");
+    expect(id.getAttribute("autocomplete")).toBe("username");
+    expect(id.getAttribute("inputmode")).toBe("email");
+    expect(id.placeholder).toBe("you@example.com");
+    expect(id).toHaveAccessibleDescription("Directory accounts: enter your directory login name.");
+    expect(id.id).toBe("login-email");
+    const pw = screen.getByLabelText("Password") as HTMLInputElement;
+    expect(pw.getAttribute("autocomplete")).toBe("current-password");
+    expect(pw.placeholder).toBe("password");
+  });
+
+  it("submits a plain directory login name with no @ in the email field", async () => {
+    let body: unknown = null;
+    server.use(
+      http.get("/api/config/status", () => HttpResponse.json({ configured: true })),
+      http.post("/api/auth/login", async ({ request }) => {
+        body = await request.json();
+        return HttpResponse.json({ access_token: "a", refresh_token: "r" });
+      }),
+    );
+    renderWithProviders(<LoginPage />);
+    const id = screen.getByLabelText("Email") as HTMLInputElement;
+    fireEvent.change(id, { target: { value: "ldapit-eng1" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "pw" } });
+    // The browser's own constraint validation is what blocked the form before.
+    expect(id.checkValidity()).toBe(true);
+    expect(id.closest("form")!.checkValidity()).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await waitFor(() => expect(body).toEqual({ email: "ldapit-eng1", password: "pw" }));
+  });
+
+  it("names the icon-only configuration link", () => {
+    renderWithProviders(<LoginPage />);
+    expect(screen.getByRole("link", { name: "System configuration" })).toHaveAttribute(
+      "href",
+      "/config",
+    );
+  });
+});
+
+// Issue #1333: only a 401 from the login route is a wrong credential.
+describe("LoginPage failure messages (issue #1333)", () => {
+  async function submitAndGetToast(loginHandler: Parameters<typeof http.post>[1]) {
+    server.use(
+      http.get("/api/config/status", () => HttpResponse.json({ configured: true })),
+      http.post("/api/auth/login", loginHandler),
+    );
+    renderWithProviders(<LoginPage />);
+    fireEvent.change(screen.getByLabelText("Email"), {
+      target: { value: "u@test" },
+    });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "pw" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await waitFor(() => expect(toastError).toHaveBeenCalledTimes(1));
+    expect(mockNavigate).not.toHaveBeenCalled();
+    return toastError.mock.calls[0][0] as string;
+  }
+
+  const UNREACHABLE = "Could not reach HERD. Try again in a moment.";
+
+  it.each([502, 503, 504, 500, 404])(
+    "a %i says HERD is unreachable, not that the password is wrong",
+    async (status) => {
+      const text = await submitAndGetToast(() =>
+        HttpResponse.json({ detail: "upstream boom" }, { status }),
+      );
+      expect(text).toBe(UNREACHABLE);
+    },
+  );
+
+  it("a network error says HERD is unreachable", async () => {
+    const text = await submitAndGetToast(() => HttpResponse.error());
+    expect(text).toBe(UNREACHABLE);
+  });
+
+  it("a 422 names the length limits instead of the credentials", async () => {
+    const text = await submitAndGetToast(() =>
+      HttpResponse.json({ detail: [{ msg: "too long" }] }, { status: 422 }),
+    );
+    expect(text).toBe(
+      "HERD could not accept these sign-in details. The email or username can be at most 255 characters and the password at most 72.",
+    );
+  });
+
+  it("a 429 says to wait, with the Retry-After seconds", async () => {
+    const text = await submitAndGetToast(() =>
+      HttpResponse.json({ detail: "slow down" }, { status: 429, headers: { "Retry-After": "30" } }),
+    );
+    expect(text).toBe("Too many sign-in attempts. Try again in 30 seconds.");
+  });
+
+  it("a login that never answers is given up after 15 seconds and says HERD is unreachable", async () => {
+    server.use(
+      http.get("/api/config/status", () => HttpResponse.json({ configured: true })),
+      http.post("/api/auth/login", () => new Promise<never>(() => {})),
+    );
+    renderWithProviders(<LoginPage />);
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "u@test" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "pw" } });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(toastError).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+    } finally {
+      vi.useRealTimers();
+    }
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith(UNREACHABLE));
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
+  it("a 403 gets the unexpected-answer wording, never the server's text", async () => {
+    const text = await submitAndGetToast(() =>
+      HttpResponse.json({ detail: "forbidden by proxy" }, { status: 403 }),
+    );
+    expect(text).toBe("Sign-in failed with an unexpected answer. Try again in a moment.");
+  });
+});
+
+describe("LoginPage return path (issue #1333)", () => {
+  function renderAt(state: unknown, accessToken = "a") {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    server.use(
+      http.get("/api/config/status", () => HttpResponse.json({ configured: true })),
+      http.post("/api/auth/login", () =>
+        HttpResponse.json({ access_token: accessToken, refresh_token: "r" }),
+      ),
+    );
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={[{ pathname: "/login", state }]}>
+          <LoginPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.change(screen.getByLabelText("Email"), {
+      target: { value: "u@test" },
+    });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "pw" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+  }
+
+  const renderAtAs = renderAt;
+
+  it("returns the same account to the page recorded for it", async () => {
+    renderAtAs({ from: "/reservations/alice-res-1", sub: "alice" }, fakeJwt("alice"));
+    await waitFor(() =>
+      expect(mockNavigate).toHaveBeenCalledWith("/reservations/alice-res-1", { replace: true }),
+    );
+  });
+
+  it("sends another account to /topology, never to the page recorded for the previous one", async () => {
+    renderAtAs({ from: "/reservations/alice-res-1", sub: "alice" }, fakeJwt("bob"));
+    await waitFor(() =>
+      expect(mockNavigate).toHaveBeenCalledWith("/topology", { replace: true }),
+    );
+    expect(mockNavigate).not.toHaveBeenCalledWith("/reservations/alice-res-1", expect.anything());
+  });
+
+  it("returns to the recorded page, query and hash included", async () => {
+    renderAt({ from: "/topology/abc?tab=wiring#n1" });
+    await waitFor(() =>
+      expect(mockNavigate).toHaveBeenCalledWith("/topology/abc?tab=wiring#n1", { replace: true }),
+    );
+  });
+
+  it.each(["//evil.example/x", "https://evil.example", "/\\evil.example"])(
+    "refuses the unsafe return path %s and goes to /topology",
+    async (from) => {
+      renderAt({ from });
+      await waitFor(() =>
+        expect(mockNavigate).toHaveBeenCalledWith("/topology", { replace: true }),
+      );
+    },
+  );
 });
