@@ -1103,7 +1103,8 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # tables. It commits its own users, identities, and flows under random tags,
 # seeds foreign rows of each kind, asserts every foreign row unchanged, and
 # deletes all of them in a finally; it holds a users-table lock that blocks
-# inserts (never reads) for well under a second per race.
+# writes (never reads) for well under a second per race, and row locks on
+# its own flow rows only.
 # tests/unit/test_pg_live_gate_wiring.py fails if a new *_live_pg.py file is
 # written and then wired into nothing.
 _gate-pg-live-tests:

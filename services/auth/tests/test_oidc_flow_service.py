@@ -35,6 +35,7 @@ from app.services.oidc_flow_service import (
     HANDOFF_TTL,
     PRUNE_AFTER,
     PRUNE_BATCH,
+    SECRET_MIN_LENGTH,
     ClaimedFlow,
     claim_flow,
     complete_flow,
@@ -54,6 +55,12 @@ TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 T0 = datetime(2026, 11, 11, 12, 0, 0, tzinfo=timezone.utc)
 VERIFIER = "v" * 64
 TINY = timedelta(microseconds=1)
+
+
+def sec(tag: str) -> str:
+    """A secret of realistic length (the store refuses one under 43 characters),
+    distinct per tag."""
+    return f"{tag}-" + "x" * SECRET_MIN_LENGTH
 
 
 @pytest.fixture(autouse=True)
@@ -111,9 +118,9 @@ class Secrets:
 
     def __init__(self) -> None:
         tag = uuid.uuid4().hex
-        self.state = f"state-{tag}"
-        self.binding = f"binding-{tag}"
-        self.handoff = f"handoff-{tag}"
+        self.state = sec(f"state-{tag}")
+        self.binding = sec(f"binding-{tag}")
+        self.handoff = sec(f"handoff-{tag}")
         self.nonce = f"nonce-{tag}"
 
 
@@ -282,17 +289,17 @@ async def test_start_flow_stores_hashes_never_the_raw_state_or_binding(clock):
     async with TestSessionLocal() as db:
         flow_id = await start_flow(
             db,
-            state="raw-state-value",
+            state=sec("raw-state-value"),
             nonce="raw-nonce-value",
             code_verifier=VERIFIER,
-            binding_secret="raw-binding-value",
+            binding_secret=sec("raw-binding-value"),
             next_path="/devices",
         )
     row = await _row(flow_id)
-    assert row.state_hash == _sha("raw-state-value")
-    assert row.binding_hash == _sha("raw-binding-value")
+    assert row.state_hash == _sha(sec("raw-state-value"))
+    assert row.binding_hash == _sha(sec("raw-binding-value"))
     stored = _all_column_text(row)
-    for raw in ("raw-state-value", "raw-binding-value"):
+    for raw in (sec("raw-state-value"), sec("raw-binding-value"), "raw-state-value"):
         assert not any(raw in value for value in stored), raw
     # D2: the nonce is compared verbatim to the ID token, so it is stored as is;
     # the verifier must be sent to the token endpoint, so it is too, until claim.
@@ -309,23 +316,23 @@ async def test_claim_nulls_the_verifier_and_complete_stores_only_the_handoff_has
         uid = await _user(db)
         flow_id = await start_flow(
             db,
-            state="st",
+            state=sec("st"),
             nonce="no",
             code_verifier=VERIFIER,
-            binding_secret="bi",
+            binding_secret=sec("bi"),
             next_path=None,
         )
-        claimed = await claim_flow(db, state="st", binding_secret="bi")
+        claimed = await claim_flow(db, state=sec("st"), binding_secret=sec("bi"))
         assert claimed is not None and claimed.code_verifier == VERIFIER
         row = await _row(flow_id)
         assert row.code_verifier is None
         assert not any(VERIFIER in value for value in _all_column_text(row))
 
         clock.now = T0 + timedelta(seconds=5)
-        assert await complete_flow(db, flow_id, user_id=uid, handoff_secret="raw-handoff")
+        assert await complete_flow(db, flow_id, user_id=uid, handoff_secret=sec("raw-handoff"))
     row = await _row(flow_id)
-    assert row.handoff_hash == _sha("raw-handoff")
-    assert not any("raw-handoff" in value for value in _all_column_text(row))
+    assert row.handoff_hash == _sha(sec("raw-handoff"))
+    assert not any(sec("raw-handoff") in value for value in _all_column_text(row))
     assert row.user_id == uid
     assert _aware(row.handoff_expires_at) == T0 + timedelta(seconds=5) + HANDOFF_TTL
 
@@ -364,7 +371,7 @@ async def test_claim_with_a_wrong_binding_secret_leaves_the_row_pending_and_usab
     s = Secrets()
     async with TestSessionLocal() as db:
         flow_id = await _pending(db, s, T0 + FLOW_TTL)
-        assert await claim_flow(db, state=s.state, binding_secret="not-the-binding") is None
+        assert await claim_flow(db, state=s.state, binding_secret=sec("not-the-binding")) is None
         row = await _row(flow_id)
         assert row.status == FLOW_PENDING and row.code_verifier == VERIFIER
         assert (await claim_flow(db, state=s.state, binding_secret=s.binding)) is not None
@@ -375,7 +382,7 @@ async def test_claim_with_an_unknown_state_matches_nothing(clock):
     s = Secrets()
     async with TestSessionLocal() as db:
         flow_id = await _pending(db, s, T0 + FLOW_TTL)
-        assert await claim_flow(db, state="unknown", binding_secret=s.binding) is None
+        assert await claim_flow(db, state=sec("unknown"), binding_secret=s.binding) is None
     assert (await _row(flow_id)).status == FLOW_PENDING
 
 
@@ -459,7 +466,7 @@ async def test_complete_expiry_boundary(clock, offset, completes):
             handoff_expires_at=T0 + FLOW_TTL,
         )
         clock.now = T0 + FLOW_TTL + offset
-        assert await complete_flow(db, flow_id, user_id=uid, handoff_secret="h") is completes
+        assert await complete_flow(db, flow_id, user_id=uid, handoff_secret=sec("h")) is completes
     assert (await _row(flow_id)).status == (FLOW_AUTHENTICATED if completes else FLOW_CLAIMED)
 
 
@@ -472,10 +479,10 @@ async def test_complete_and_fail_exclude_each_other(clock):
         second, _ = await _insert_row(
             db, FLOW_CLAIMED, user_id=uid, expires_at=T0 + FLOW_TTL, handoff_expires_at=T0
         )
-        assert await complete_flow(db, first, user_id=uid, handoff_secret="h1") is True
+        assert await complete_flow(db, first, user_id=uid, handoff_secret=sec("h1")) is True
         assert await fail_flow(db, first) is False
         assert await fail_flow(db, second) is True
-        assert await complete_flow(db, second, user_id=uid, handoff_secret="h2") is False
+        assert await complete_flow(db, second, user_id=uid, handoff_secret=sec("h2")) is False
     assert (await _row(first)).status == FLOW_AUTHENTICATED
     assert (await _row(second)).status == FLOW_FAILED
 
@@ -500,7 +507,7 @@ async def test_complete_with_a_handoff_hash_another_row_holds_writes_nothing(clo
 async def test_complete_and_fail_on_an_unknown_id_match_nothing(clock):
     async with TestSessionLocal() as db:
         uid = await _user(db)
-        assert await complete_flow(db, uuid.uuid4(), user_id=uid, handoff_secret="h") is False
+        assert await complete_flow(db, uuid.uuid4(), user_id=uid, handoff_secret=sec("h")) is False
         assert await fail_flow(db, uuid.uuid4()) is False
 
 
@@ -550,7 +557,7 @@ async def test_exchange_with_a_wrong_handoff_secret_leaves_the_row_authenticated
             expires_at=T0 + FLOW_TTL,
             handoff_expires_at=T0 + HANDOFF_TTL,
         )
-        assert await exchange_handoff(db, handoff_secret="wrong") is None
+        assert await exchange_handoff(db, handoff_secret=sec("wrong")) is None
         assert await exchange_handoff(db, handoff_secret=s.handoff) is not None
 
 
@@ -593,20 +600,23 @@ async def test_full_flow_from_start_to_exchange(clock):
         uid = await _user(db)
         flow_id = await start_flow(
             db,
-            state="s",
+            state=sec("s"),
             nonce="n",
             code_verifier=VERIFIER,
-            binding_secret="b",
+            binding_secret=sec("b"),
             next_path="/reservations?tab=mine",
         )
         clock.now = T0 + timedelta(seconds=30)
-        claimed = await claim_flow(db, state="s", binding_secret="b")
+        claimed = await claim_flow(db, state=sec("s"), binding_secret=sec("b"))
         assert claimed == ClaimedFlow(
             id=flow_id, nonce="n", code_verifier=VERIFIER, next_path="/reservations?tab=mine"
         )
-        assert await complete_flow(db, flow_id, user_id=uid, handoff_secret="h") is True
+        assert await complete_flow(db, flow_id, user_id=uid, handoff_secret=sec("h")) is True
         clock.now = T0 + timedelta(seconds=40)
-        assert await exchange_handoff(db, handoff_secret="h") == (uid, "/reservations?tab=mine")
+        assert await exchange_handoff(db, handoff_secret=sec("h")) == (
+            uid,
+            "/reservations?tab=mine",
+        )
     assert (await _row(flow_id)).status == FLOW_EXCHANGED
 
 
@@ -617,7 +627,9 @@ async def test_full_flow_from_start_to_exchange(clock):
     "field", ["state", "nonce", "binding_secret"], ids=["state", "nonce", "binding"]
 )
 async def test_start_flow_refuses_an_empty_secret(clock, field):
-    kwargs = dict(state="s", nonce="n", code_verifier=VERIFIER, binding_secret="b", next_path="/")
+    kwargs = dict(
+        state=sec("s"), nonce="n", code_verifier=VERIFIER, binding_secret=sec("b"), next_path="/"
+    )
     kwargs[field] = ""
     async with TestSessionLocal() as db:
         with pytest.raises(ValueError):
@@ -629,7 +641,12 @@ async def test_start_flow_refuses_an_empty_secret(clock, field):
 async def test_start_flow_verifier_length_bounds(clock, length, ok):
     async with TestSessionLocal() as db:
         call = start_flow(
-            db, state="s", nonce="n", code_verifier="a" * length, binding_secret="b", next_path="/"
+            db,
+            state=sec("s"),
+            nonce="n",
+            code_verifier="a" * length,
+            binding_secret=sec("b"),
+            next_path="/",
         )
         if ok:
             await call
@@ -642,15 +659,20 @@ async def test_start_flow_verifier_length_bounds(clock, length, ok):
 async def test_start_flow_refuses_a_reused_state(clock):
     async with TestSessionLocal() as db:
         await start_flow(
-            db, state="s", nonce="n", code_verifier=VERIFIER, binding_secret="b", next_path="/"
+            db,
+            state=sec("s"),
+            nonce="n",
+            code_verifier=VERIFIER,
+            binding_secret=sec("b"),
+            next_path="/",
         )
         with pytest.raises(IntegrityError):
             await start_flow(
                 db,
-                state="s",
+                state=sec("s"),
                 nonce="n2",
                 code_verifier=VERIFIER,
-                binding_secret="b2",
+                binding_secret=sec("b2"),
                 next_path="/",
             )
     assert await _count() == 1
@@ -667,7 +689,12 @@ async def _seed_at(expires_at: datetime, status: str) -> uuid.UUID:
 
 async def _start(db, state: str = "new-state") -> uuid.UUID:
     return await start_flow(
-        db, state=state, nonce="n", code_verifier=VERIFIER, binding_secret="b", next_path="/"
+        db,
+        state=sec(state),
+        nonce="n",
+        code_verifier=VERIFIER,
+        binding_secret=sec("b"),
+        next_path="/",
     )
 
 
@@ -745,7 +772,7 @@ async def test_a_live_handoff_can_never_be_prunable(clock):
             db, FLOW_CLAIMED, user_id=uid, expires_at=T0 + FLOW_TTL, handoff_expires_at=T0
         )
         clock.now = T0 + FLOW_TTL - TINY
-        assert await complete_flow(db, flow_id, user_id=uid, handoff_secret="late") is True
+        assert await complete_flow(db, flow_id, user_id=uid, handoff_secret=sec("late")) is True
     row = await _row(flow_id)
     assert _aware(row.handoff_expires_at) < _aware(row.expires_at) + PRUNE_AFTER
     clock.now = _aware(row.handoff_expires_at) - TINY
@@ -808,10 +835,10 @@ async def test_start_flow_stores_the_sanitized_next_path(clock):
     async with TestSessionLocal() as db:
         flow_id = await start_flow(
             db,
-            state="s",
+            state=sec("s"),
             nonce="n",
             code_verifier=VERIFIER,
-            binding_secret="b",
+            binding_secret=sec("b"),
             next_path="//evil.example",
         )
     assert (await _row(flow_id)).next_path == "/topology"
@@ -822,11 +849,11 @@ async def test_start_flow_stores_the_sanitized_next_path(clock):
 
 async def test_no_flow_operation_logs_a_secret(clock, caplog):
     secrets = {
-        "state": "LOGSTATE-0123456789",
-        "binding": "LOGBINDING-0123456789",
+        "state": "LOGSTATE-0123456789" + "z" * 40,
+        "binding": "LOGBINDING-0123456789" + "z" * 40,
         "nonce": "LOGNONCE-0123456789",
         "verifier": "LOGVERIFIER-" + "x" * 40,
-        "handoff": "LOGHANDOFF-0123456789",
+        "handoff": "LOGHANDOFF-0123456789" + "z" * 40,
     }
     with caplog.at_level(logging.DEBUG, logger="app"):
         async with TestSessionLocal() as db:
@@ -839,13 +866,13 @@ async def test_no_flow_operation_logs_a_secret(clock, caplog):
                 binding_secret=secrets["binding"],
                 next_path="/",
             )
-            await claim_flow(db, state=secrets["state"], binding_secret="wrong")
-            await claim_flow(db, state="unknown", binding_secret=secrets["binding"])
+            await claim_flow(db, state=secrets["state"], binding_secret=sec("wrong"))
+            await claim_flow(db, state=sec("unknown"), binding_secret=secrets["binding"])
             await claim_flow(db, state=secrets["state"], binding_secret=secrets["binding"])
             await claim_flow(db, state=secrets["state"], binding_secret=secrets["binding"])
             await complete_flow(db, flow_id, user_id=uid, handoff_secret=secrets["handoff"])
             await complete_flow(db, flow_id, user_id=uid, handoff_secret=secrets["handoff"])
-            await exchange_handoff(db, handoff_secret="wrong")
+            await exchange_handoff(db, handoff_secret=sec("wrong"))
             await exchange_handoff(db, handoff_secret=secrets["handoff"])
             await exchange_handoff(db, handoff_secret=secrets["handoff"])
             await fail_flow(db, flow_id)
@@ -858,3 +885,113 @@ async def test_no_flow_operation_logs_a_secret(clock, caplog):
         for name, value in secrets.items():
             assert value not in text, f"{name} leaked into a log record"
             assert _sha(value) not in text, f"the {name} hash leaked into a log record"
+
+
+# --- review round: secret lengths, non-string next, the best-effort prune ----------
+
+
+@pytest.mark.parametrize("field", ["state", "binding_secret"])
+@pytest.mark.parametrize(
+    "value,ok",
+    [("a" * 42, False), ("a" * 43, True), ("", False), (None, False)],
+    ids=["42", "43", "empty", "none"],
+)
+async def test_start_flow_minimum_secret_length(clock, field, value, ok):
+    kwargs = dict(
+        state=sec("s"), nonce="n", code_verifier=VERIFIER, binding_secret=sec("b"), next_path="/"
+    )
+    kwargs[field] = value
+    async with TestSessionLocal() as db:
+        if ok:
+            await start_flow(db, **kwargs)
+        else:
+            with pytest.raises(ValueError):
+                await start_flow(db, **kwargs)
+    assert await _count() == (1 if ok else 0)
+
+
+@pytest.mark.parametrize(
+    "handoff,ok",
+    [("", False), ("h", False), ("a" * 42, False), (None, False), ("a" * 43, True)],
+    ids=["empty", "1", "42", "none", "43"],
+)
+async def test_complete_flow_minimum_handoff_length(clock, handoff, ok):
+    async with TestSessionLocal() as db:
+        uid = await _user(db)
+        flow_id, _ = await _insert_row(
+            db, FLOW_CLAIMED, user_id=uid, expires_at=T0 + FLOW_TTL, handoff_expires_at=T0
+        )
+        if ok:
+            assert await complete_flow(db, flow_id, user_id=uid, handoff_secret=handoff) is True
+        else:
+            with pytest.raises(ValueError):
+                await complete_flow(db, flow_id, user_id=uid, handoff_secret=handoff)
+    assert (await _row(flow_id)).status == (FLOW_AUTHENTICATED if ok else FLOW_CLAIMED)
+
+
+@pytest.mark.parametrize(
+    "raw", [123, b"/topology", ["/devices"], ("/x",), object()], ids=lambda v: type(v).__name__
+)
+def test_next_path_non_string_is_replaced_not_raised(raw):
+    assert sanitize_next_path(raw) == DEFAULT_NEXT_PATH
+
+
+async def test_prune_failure_never_fails_the_begin(clock, caplog):
+    """The prune is best effort: a database error in it is rolled back, logged
+    once by class name, and the flow is still created."""
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.sql.dml import Delete
+
+    old = await _seed_at(T0 - PRUNE_AFTER - timedelta(minutes=1), FLOW_FAILED)
+
+    async def boom():
+        raise OperationalError("DELETE FROM oidc_login_flows", {}, Exception("deadlock"))
+
+    class _FailingDelete:
+        def __init__(self, inner) -> None:
+            self._inner = inner
+
+        async def execute(self, statement, *args, **kwargs):
+            if isinstance(statement, Delete):
+                await boom()
+            return await self._inner.execute(statement, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    with caplog.at_level(logging.WARNING, logger="app.services.oidc_flow_service"):
+        async with TestSessionLocal() as db:
+            flow_id = await _start(_FailingDelete(db), "after-a-failed-prune")
+    assert (await _row(flow_id)).status == FLOW_PENDING
+    assert (await _row(old)).status == FLOW_FAILED, "the failed prune must delete nothing"
+    records = [r for r in caplog.records if getattr(r, "action", None) == "oidc_flow_prune_failed"]
+    assert len(records) == 1
+    assert records[0].error_class == "OperationalError"
+    assert "deadlock" not in records[0].getMessage()
+
+
+async def test_prune_selects_its_batch_for_update_skip_locked(clock):
+    """On Postgres the batch must skip rows another prune holds (no waiting, no
+    deadlock between concurrent begins); pinned on the compiled statement."""
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.sql.dml import Delete
+
+    seen = []
+
+    class _Recorder:
+        def __init__(self, inner) -> None:
+            self._inner = inner
+
+        async def execute(self, statement, *args, **kwargs):
+            if isinstance(statement, Delete):
+                seen.append(str(statement.compile(dialect=postgresql.dialect())))
+            return await self._inner.execute(statement, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    async with TestSessionLocal() as db:
+        await _start(_Recorder(db))
+    [sql] = seen
+    assert "FOR UPDATE SKIP LOCKED" in sql
+    assert "LIMIT" in sql

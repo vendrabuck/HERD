@@ -47,6 +47,7 @@ bound every wait, so a lost race fails in seconds instead of hanging the gate.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import time
 import uuid
@@ -73,6 +74,7 @@ from app.services.auth_service import (
 )
 from app.services.oidc_flow_service import (
     PRUNE_AFTER,
+    PRUNE_BATCH,
     claim_flow,
     complete_flow,
     exchange_handoff,
@@ -100,6 +102,7 @@ _CONNECT_ARGS = {
 
 N = 6
 VERIFIER = "v" * 64
+PRUNE_LOOP_BOUND = 20
 
 
 def _make_engine():
@@ -173,7 +176,9 @@ class Ledger:
 
     def __init__(self, session_factory) -> None:
         self.sf = session_factory
-        self.tag = uuid.uuid4().hex[:12]
+        # 44 characters, so every secret built from it ("st-" + tag and the
+        # like) clears the store's 43-character minimum.
+        self.tag = uuid.uuid4().hex + uuid.uuid4().hex[:12]
         self.foreign_tag = uuid.uuid4().hex[:12]
         self.issuer = f"https://oidc-live-{self.tag}.example.invalid"
         self.flow_ids: set[uuid.UUID] = set()
@@ -349,9 +354,12 @@ async def ledger(session_factory):
         await lg.cleanup()
 
 
-async def _wait_for_blocked(engine, statement_prefix: str, n: int, timeout: float = 10.0) -> None:
+async def _wait_for_blocked(
+    engine, statement_prefix: str | tuple[str, ...], n: int, timeout: float = 10.0
+) -> None:
     """Wait until n backends of this database wait on a lock while running a
-    statement that starts with `statement_prefix`."""
+    statement that starts with `statement_prefix` (or with any of several)."""
+    prefixes = (statement_prefix,) if isinstance(statement_prefix, str) else statement_prefix
     deadline = time.monotonic() + timeout
     seen = -1
     while time.monotonic() < deadline:
@@ -361,9 +369,9 @@ async def _wait_for_blocked(engine, statement_prefix: str, n: int, timeout: floa
                     text(
                         "SELECT count(*) FROM pg_stat_activity"
                         " WHERE datname = current_database() AND wait_event_type = 'Lock'"
-                        " AND query LIKE :p"
+                        " AND query LIKE ANY(:p)"
                     ),
-                    {"p": statement_prefix + "%"},
+                    {"p": [p + "%" for p in prefixes]},
                 )
             ).scalar_one()
         if seen >= n:
@@ -385,6 +393,15 @@ async def _race_on_flow_row(engine, flow_id, calls, statement_prefix: str, n_blo
         finally:
             await holder.rollback()
         return await asyncio.gather(*tasks)
+
+
+async def _present(session_factory, ids: set) -> set:
+    async with session_factory() as db:
+        return set(
+            (await db.execute(select(OidcLoginFlow.id).where(OidcLoginFlow.id.in_(ids))))
+            .scalars()
+            .all()
+        )
 
 
 async def _flow(session_factory, flow_id) -> OidcLoginFlow:
@@ -531,8 +548,10 @@ async def test_expired_rows_are_neither_claimable_nor_exchangeable_on_timestampt
 
 
 async def test_start_flow_prunes_only_rows_more_than_an_hour_expired(session_factory, ledger):
-    """The gate holds no other prunable flow (the feature is dark), so one
-    start_flow's batch of 500 reaches every prunable row seeded here."""
+    """A used ledger may hold any number of other prunable flows, and one batch
+    deletes at most 500 of them in no set order, so start_flow is called until
+    none of this test's prunable rows remain (bounded), and the rows that must
+    be kept are checked after every call."""
     uid = await ledger.user("pruner")
     now = _now()
     prunable, kept = set(), set()
@@ -548,18 +567,100 @@ async def test_start_flow_prunes_only_rows_more_than_an_hour_expired(session_fac
         )
         prunable.add(old)
         kept |= {recent, live}
-    await ledger.start("st-" + ledger.tag, "bi-" + ledger.tag)
-    async with session_factory() as db:
-        present = set(
-            (
-                await db.execute(
-                    select(OidcLoginFlow.id).where(OidcLoginFlow.id.in_(prunable | kept))
-                )
-            )
-            .scalars()
-            .all()
+    for attempt in range(PRUNE_LOOP_BOUND):
+        await ledger.start(f"st{attempt}-{ledger.tag}", f"bi{attempt}-{ledger.tag}")
+        present = await _present(session_factory, prunable | kept)
+        assert kept <= present, f"a row inside the hour was pruned on call {attempt + 1}"
+        if not present & prunable:
+            break
+    else:
+        pytest.fail(f"own prunable rows survived {PRUNE_LOOP_BOUND} start_flow calls")
+    await ledger.assert_foreign_untouched()
+
+
+async def test_prune_skips_rows_another_transaction_holds(pg_engine, session_factory, ledger):
+    """A concurrent begin must neither wait on nor fail over prunable rows
+    another transaction has locked (FOR UPDATE SKIP LOCKED): start_flow returns
+    within a short timeout, creates its flow, and leaves the held rows."""
+    uid = await ledger.user("held-pruner")
+    old = _now() - PRUNE_AFTER - timedelta(minutes=2)
+    held = set()
+    for status in FLOW_STATUSES:
+        flow_id, *_ = await ledger.insert_flow(status, user_id=uid, expires_at=old)
+        held.add(flow_id)
+    async with pg_engine.connect() as holder:
+        await holder.execute(
+            text("SELECT id FROM oidc_login_flows WHERE id = ANY(:ids) FOR UPDATE"),
+            {"ids": list(held)},
         )
-    assert present == kept
+        try:
+            flow_id = await asyncio.wait_for(
+                ledger.start("st-held-" + ledger.tag, "bi-held-" + ledger.tag), timeout=5
+            )
+        finally:
+            await holder.rollback()
+    assert (await _flow(session_factory, flow_id)).status == FLOW_PENDING
+    assert await _present(session_factory, held) == held
+    await ledger.assert_foreign_untouched()
+
+
+async def test_concurrent_begins_on_a_table_full_of_prunable_rows_all_succeed(
+    session_factory, ledger
+):
+    """A burst of begins over more prunable rows than one batch: every begin
+    creates its flow (a prune that loses a race is skipped, never fatal)."""
+    uid = await ledger.user("burst")
+    old = _now() - PRUNE_AFTER - timedelta(minutes=2)
+    async with session_factory() as db:
+        for _ in range(3 * PRUNE_BATCH // 100):
+            db.add_all(
+                [
+                    OidcLoginFlow(
+                        state_hash=uuid.uuid4().hex,
+                        binding_hash="b",
+                        nonce="n",
+                        next_path="/",
+                        status=FLOW_FAILED,
+                        user_id=uid,
+                        expires_at=old,
+                    )
+                    for _ in range(100)
+                ]
+            )
+            await db.flush()
+        await db.commit()
+    results = await asyncio.gather(
+        *(ledger.start(f"burst{i}-{ledger.tag}", f"bi{i}-{ledger.tag}") for i in range(20)),
+        return_exceptions=True,
+    )
+    assert [r for r in results if isinstance(r, BaseException)] == []
+    assert len(set(results)) == 20
+    await ledger.assert_foreign_untouched()
+
+
+async def test_exchange_refused_while_the_user_is_deactivated_then_admitted(
+    session_factory, ledger
+):
+    """The exchange re-checks the user in its own UPDATE: deactivated between
+    the callback and the exchange gets nothing and leaves the row usable;
+    reactivated within the handoff window gets the user."""
+    uid = await ledger.user("toggled")
+    state, binding = "st-" + ledger.tag, "bi-" + ledger.tag
+    flow_id = await ledger.start(state, binding, next_path="/devices")
+    handoff = "h-" + ledger.tag
+    async with session_factory() as db:
+        assert await claim_flow(db, state=state, binding_secret=binding) is not None
+        assert await complete_flow(db, flow_id, user_id=uid, handoff_secret=handoff)
+    for active, expected in ((False, None), (True, (uid, "/devices"))):
+        async with session_factory() as db:
+            await db.execute(
+                text("UPDATE users SET is_active = :a WHERE id = :id"), {"a": active, "id": uid}
+            )
+            await db.commit()
+        async with session_factory() as db:
+            assert await exchange_handoff(db, handoff_secret=handoff) == expected
+        status = (await _flow(session_factory, flow_id)).status
+        assert status == (FLOW_EXCHANGED if active else FLOW_AUTHENTICATED)
     await ledger.assert_foreign_untouched()
 
 
@@ -567,14 +668,17 @@ async def test_start_flow_prunes_only_rows_more_than_an_hour_expired(session_fac
 
 
 async def _race_on_users_insert(pg_engine, calls, n_blocking: int):
-    """Block inserts into users (reads still pass) while every call runs its
-    lookups and collision checks, wait until n_blocking calls are blocked on
-    the INSERT, then release."""
+    """Block writes to users (reads still pass) while every call runs its
+    lookups and collision checks, wait until n_blocking calls are blocked,
+    either on the INSERT or on the first-login advisory lock another call
+    holds, then release."""
     async with pg_engine.connect() as holder:
         await holder.execute(text("LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE"))
         tasks = [asyncio.create_task(c()) for c in calls]
         try:
-            await _wait_for_blocked(pg_engine, "INSERT INTO users", n_blocking)
+            await _wait_for_blocked(
+                pg_engine, ("INSERT INTO users", "SELECT pg_advisory_xact_lock"), n_blocking
+            )
         finally:
             await holder.rollback()
         return await asyncio.gather(*tasks)
@@ -669,4 +773,85 @@ async def test_case_insensitive_email_collision_on_postgres(session_factory, led
         )
         == 0
     )
+    await ledger.assert_foreign_untouched()
+
+
+def _case_variants(base: str, n: int) -> list[str]:
+    """n distinct spellings of base that differ only in letter case."""
+    variants = [base]
+    for i, ch in enumerate(base):
+        if len(variants) == n:
+            break
+        if ch.isalpha():
+            variants.append(base[:i] + ch.upper() + base[i + 1 :])
+    assert len(set(variants)) == n
+    return variants
+
+
+@pytest.mark.parametrize("field", ["email", "username"])
+async def test_concurrent_first_logins_differing_only_in_case_create_one_account(
+    pg_engine, session_factory, ledger, field
+):
+    """N first logins of DIFFERENT subjects whose emails (or usernames) differ
+    only in letter case. The unique constraints are case-sensitive, so only the
+    first-login advisory locks keep the case-insensitive refusal true here."""
+    if field == "email":
+        emails = [f"{v}@{ledger.tag}.example.invalid" for v in _case_variants("victim", N)]
+        logins = [ledger.login(f"case-{i}", email=e) for i, e in enumerate(emails)]
+        same = func.lower(User.email) == emails[0]
+    else:
+        names = _case_variants(f"victim-{ledger.tag}", N)
+        logins = [ledger.login(f"case-{i}", username=u) for i, u in enumerate(names)]
+        same = func.lower(User.username) == names[0].lower()
+
+    def resolver(login):
+        async def call():
+            async with session_factory() as db:
+                user = await resolve_federated_user(db, login)
+                return None if user is None else user.id
+
+        return call
+
+    results = await _race_on_users_insert(pg_engine, [resolver(lg) for lg in logins], N)
+    assert len([r for r in results if r is not None]) == 1, results
+    assert await _count_where(session_factory, same) == 1
+    assert (
+        await _count_where(
+            session_factory, FederatedIdentity.issuer == ledger.issuer, model=FederatedIdentity
+        )
+        == 1
+    )
+    await ledger.assert_foreign_untouched()
+
+
+UNSTORABLE = {"nul": "\x00", "surrogate": "\ud800"}
+
+
+@pytest.mark.parametrize("char", sorted(UNSTORABLE))
+@pytest.mark.parametrize("field", ["issuer", "subject", "email", "username"])
+async def test_unstorable_character_in_a_claim_is_refused_not_raised(
+    session_factory, ledger, field, char
+):
+    """Postgres rejects NUL in text and asyncpg cannot encode a lone surrogate;
+    without the checks the identity lookup or the insert raises (a DBAPIError
+    whose text embeds the bound claim). Each must be a plain refusal."""
+    login = ledger.login("unstorable")
+    value = getattr(login, field)
+    bad = dataclasses.replace(login, **{field: value[:3] + UNSTORABLE[char] + value[3:]})
+    async with session_factory() as db:
+        assert await resolve_federated_user(db, bad) is None
+    assert (
+        await _count_where(session_factory, User.email.like(f"%@{ledger.tag}.example.invalid")) == 0
+    )
+    await ledger.assert_foreign_untouched()
+
+
+async def test_control_characters_in_full_name_are_replaced_on_postgres(session_factory, ledger):
+    login = dataclasses.replace(ledger.login("named"), full_name="Ada\x00Love\ud800lace")
+    async with session_factory() as db:
+        user = await resolve_federated_user(db, login)
+    assert user is not None
+    async with session_factory() as db:
+        stored = (await db.execute(select(User.full_name).where(User.id == user.id))).scalar_one()
+    assert stored == "Ada Love lace"
     await ledger.assert_foreign_untouched()

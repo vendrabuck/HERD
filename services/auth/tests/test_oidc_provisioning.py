@@ -455,3 +455,214 @@ async def test_refusal_logs_carry_no_claim_values(caplog):
             assert value not in text, f"{value} reached a log record"
         if record in _refusals(caplog):
             assert "MARKER-USERNAME" not in text
+
+
+# --- review round: unstorable and look-alike claim content ----------------------------
+
+# Characters Postgres cannot store (NUL and other Cc; a lone surrogate, Cs) and
+# an invisible format character (Cf). SQLite stores all of them, so these unit
+# tests prove the refusal happens; test_oidc_flow_service_live_pg.py proves
+# Postgres would have raised without it.
+NUL, UNIT_SEP, DEL, SURROGATE, ZWSP = "\x00", "\x1f", "\x7f", "\ud800", "​"
+
+IDENTITY_KEY_CASES = [
+    ("issuer", None, "issuer_invalid"),
+    ("issuer", "", "issuer_invalid"),
+    ("issuer", "   ", "issuer_invalid"),
+    ("issuer", "https://idp.example/" + "i" * 236, "issuer_invalid"),
+    ("issuer", ISSUER + NUL, "issuer_invalid"),
+    ("issuer", ISSUER + UNIT_SEP, "issuer_invalid"),
+    ("issuer", ISSUER + SURROGATE, "issuer_invalid"),
+    ("subject", None, "subject_invalid"),
+    ("subject", "", "subject_invalid"),
+    ("subject", " \t ", "subject_invalid"),
+    ("subject", "s" * 256, "subject_invalid"),
+    ("subject", "sub" + NUL + "x", "subject_invalid"),
+    ("subject", "sub" + DEL, "subject_invalid"),
+    ("subject", "sub" + SURROGATE, "subject_invalid"),
+]
+
+
+@pytest.mark.parametrize(
+    "field,value,reason",
+    IDENTITY_KEY_CASES,
+    ids=[f"{f}-{i}" for i, (f, _, _) in enumerate(IDENTITY_KEY_CASES)],
+)
+async def test_issuer_and_subject_refused_before_the_identity_lookup(
+    monkeypatch, caplog, field, value, reason
+):
+    async def no_lookup(*args, **kwargs):
+        raise AssertionError("the identity lookup ran on an unchecked issuer or subject")
+
+    monkeypatch.setattr(auth_service, "_find_federated_identity", no_lookup)
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        async with TestSessionLocal() as db:
+            assert await resolve_federated_user(db, _login(**{field: value})) is None
+    assert await _counts() == (0, 0)
+    [record] = _refusals(caplog)
+    assert record.reason == reason
+
+
+def test_issuer_at_255_characters_is_accepted_by_the_key_check():
+    login = _login(issuer="https://idp.example/" + "i" * 235)
+    assert len(login.issuer) == 255
+    assert auth_service._identity_key_refusal(login) is None
+
+
+NAME_CASES = [
+    ({"email": " alice@example.com"}, "email_invalid"),
+    ({"email": "alice@example.com "}, "email_invalid"),
+    ({"email": "alice@example.com\n"}, "email_invalid"),
+    ({"email": "ali" + ZWSP + "ce@example.com"}, "email_invalid"),
+    ({"email": "alice@example.com" + NUL}, "email_invalid"),
+    ({"email": "al" + NUL + "ice@example.com"}, "email_invalid"),
+    ({"email": "alice" + SURROGATE + "@example.com"}, "email_invalid"),
+    ({"email": "alice.example.com"}, "email_invalid"),
+    ({"email": "alice@@example.com"}, "email_invalid"),
+    ({"email": "a@b@example.com"}, "email_invalid"),
+    ({"email": "@example.com"}, "email_invalid"),
+    ({"email": "alice@"}, "email_invalid"),
+    ({"email_verified": "false"}, "email_unverified"),
+    ({"email_verified": 0}, "email_unverified"),
+    ({"email": 42}, "email_missing"),
+    ({"username": " alice"}, "username_invalid"),
+    ({"username": "alice "}, "username_invalid"),
+    ({"username": "ali" + ZWSP + "ce"}, "username_invalid"),
+    ({"username": "ali" + NUL + "ce"}, "username_invalid"),
+    ({"username": "alice" + DEL}, "username_invalid"),
+    ({"username": "alice" + SURROGATE}, "username_invalid"),
+    ({"username": 42}, "username_missing"),
+]
+
+
+@pytest.mark.parametrize(
+    "overrides,reason", NAME_CASES, ids=[f"{r}-{i}" for i, (_, r) in enumerate(NAME_CASES)]
+)
+async def test_email_and_username_content_refusals(caplog, overrides, reason):
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        async with TestSessionLocal() as db:
+            assert await resolve_federated_user(db, _login(**overrides)) is None
+    assert await _counts() == (0, 0)
+    [record] = _refusals(caplog)
+    assert record.reason == reason
+
+
+LOOKALIKES = {
+    "leading-space": (" admin@t.example", "email_invalid"),
+    "trailing-space": ("admin@t.example ", "email_invalid"),
+    "zero-width-space": ("ad" + ZWSP + "min@t.example", "email_invalid"),
+    "case": ("ADMIN@T.EXAMPLE", "email_taken"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(LOOKALIKES))
+async def test_lookalike_of_an_existing_email_is_refused(kind):
+    async with TestSessionLocal() as db:
+        await create_user(db, "admin@t.example", "admin", "password123")
+    email, _ = LOOKALIKES[kind]
+    async with TestSessionLocal() as db:
+        assert await resolve_federated_user(db, _login(email=email, username="other")) is None
+    assert await _counts() == (1, 0)
+
+
+@pytest.mark.parametrize(
+    "email", ["admın@t.example", "ａdmin@t.example"], ids=["dotless-i", "fullwidth-a"]
+)
+async def test_visible_unicode_lookalikes_are_distinct_emails_today(email):
+    """No Unicode normalization or confusable check exists yet (no owner
+    decision): a visible look-alike is a different email and is provisioned.
+    Pinned so a change here is deliberate; see IAM-OIDC-10."""
+    async with TestSessionLocal() as db:
+        await create_user(db, "admin@t.example", "admin", "password123")
+        assert await resolve_federated_user(db, _login(email=email, username="other")) is not None
+
+
+@pytest.mark.parametrize(
+    "full_name,stored",
+    [
+        ("Ali" + NUL + "ce", "Ali ce"),
+        ("Alice\nLiddell", "Alice Liddell"),
+        (NUL + UNIT_SEP, "alice"),
+        (SURROGATE + "Alice", "Alice"),
+        ("Ali" + ZWSP + "ce", "Ali" + ZWSP + "ce"),
+        (42, "alice"),
+    ],
+    ids=["nul", "newline", "only-controls", "surrogate", "zero-width-kept", "non-string"],
+)
+async def test_full_name_control_characters_are_replaced(full_name, stored):
+    async with TestSessionLocal() as db:
+        user = await resolve_federated_user(db, _login(full_name=full_name))
+    assert (await _load(user.id)).full_name == stored
+
+
+BAD_CHARACTERS = [NUL, UNIT_SEP, DEL, SURROGATE, ZWSP, "\n", " "]
+
+
+@pytest.mark.parametrize("field", ["issuer", "subject", "email", "username", "full_name"])
+@pytest.mark.parametrize("bad", BAD_CHARACTERS, ids=[repr(c) for c in BAD_CHARACTERS])
+@pytest.mark.parametrize("where", ["start", "middle", "end"])
+async def test_resolve_never_raises_on_claim_content(field, bad, where):
+    base = getattr(_login(), field)
+    value = {"start": bad + base, "middle": base[:2] + bad + base[2:], "end": base + bad}[where]
+    async with TestSessionLocal() as db:
+        result = await resolve_federated_user(db, _login(**{field: value}))
+    assert result is None or isinstance(result, User)
+
+
+# --- the first-login advisory locks (Postgres only; wiring checked here) -----------------
+
+
+async def test_first_login_takes_both_name_locks_in_key_order_before_the_checks(monkeypatch):
+    calls: list[tuple[str, object]] = []
+
+    async def record_lock(session, key):
+        calls.append(("lock", key))
+
+    real_email_taken = auth_service._email_taken
+
+    async def record_email_taken(db, email):
+        calls.append(("email_taken", email))
+        return await real_email_taken(db, email)
+
+    monkeypatch.setattr(auth_service, "xact_lock", record_lock)
+    monkeypatch.setattr(auth_service, "_email_taken", record_email_taken)
+    async with TestSessionLocal() as db:
+        assert await resolve_federated_user(db, _login(email="Victim@X.example")) is not None
+    locks = [k for kind, k in calls if kind == "lock"]
+    assert len(locks) == 2 and locks == sorted(locks)
+    assert [kind for kind, _ in calls].index("email_taken") == 2
+    from herd_common.advisory_lock import advisory_key_from_string
+
+    assert advisory_key_from_string("oidc-first-login-email:victim@x.example") in locks
+    assert advisory_key_from_string("oidc-first-login-username:alice") in locks
+
+
+async def test_name_lock_keys_ignore_case(monkeypatch):
+    keys: list[list[int]] = []
+
+    async def record_lock(session, key):
+        keys[-1].append(key)
+
+    monkeypatch.setattr(auth_service, "xact_lock", record_lock)
+    for i, (email, username) in enumerate(
+        [("Victim@X.example", "Bob"), ("victim@x.example", "BOB")]
+    ):
+        keys.append([])
+        async with TestSessionLocal() as db:
+            await resolve_federated_user(
+                db, _login(subject=f"sub-{i}", email=email, username=username)
+            )
+    assert keys[0] == keys[1] and len(keys[0]) == 2
+
+
+async def test_refusals_before_the_insert_take_no_name_lock(monkeypatch):
+    taken = []
+
+    async def record_lock(session, key):
+        taken.append(key)
+
+    monkeypatch.setattr(auth_service, "xact_lock", record_lock)
+    async with TestSessionLocal() as db:
+        assert await resolve_federated_user(db, _login(email_verified=False)) is None
+        assert await resolve_federated_user(db, _login(subject="")) is None
+    assert taken == []

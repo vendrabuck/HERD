@@ -21,6 +21,26 @@ must send to the token endpoint and which the claim sets to NULL.
 
 Nothing here logs a secret, the nonce, or the verifier (D9): the flow id is the
 correlation key. No route calls this module yet; phase 3 adds them.
+
+Contract for callers (phase 3):
+
+- Every function here ends by committing or rolling back the session it is
+  handed. `start_flow` commits twice (the prune, then the insert), so it also
+  commits any work the caller left pending in that session; a rollback
+  expires every ORM instance the session holds, so read what you need (for
+  example `user.id`) into a local before calling `complete_flow`.
+- `start_flow` raises ValueError, naming no value, for a malformed secret (a
+  state or binding secret under 43 characters, an empty nonce, a verifier
+  outside 43 to 128 characters), and IntegrityError when the state was already
+  used. It never fails because of the prune (see `_prune_expired`).
+- `next` is sanitized inside `start_flow`; the stored `next_path`, and so the
+  value `claim_flow` and `exchange_handoff` return, is only ever the
+  sanitized one.
+- `complete_flow` raises ValueError for a handoff secret under 43 characters
+  and returns False when the row is not `claimed`, when the flow has expired,
+  and on an IntegrityError (a handoff hash another row holds, an unknown user).
+- `claim_flow` and `exchange_handoff` return None for every refusal; `fail_flow`
+  returns False when the row is not `claimed`.
 """
 
 from __future__ import annotations
@@ -34,7 +54,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 from sqlalchemy import delete, exists, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.oidc_login_flow import (
@@ -58,6 +78,10 @@ PRUNE_AFTER = timedelta(hours=1)
 PRUNE_BATCH = 500
 NEXT_PATH_MAX_LENGTH = 512
 DEFAULT_NEXT_PATH = "/topology"
+# The state, binding, and handoff secrets are 32 random bytes in base64url
+# (ADR 0016, Cookies and IdP-facing requests): 43 characters. A shorter one is
+# a caller bug that would store a guessable row.
+SECRET_MIN_LENGTH = 43
 # RFC 7636 section 4.1.
 CODE_VERIFIER_MIN_LENGTH = 43
 CODE_VERIFIER_MAX_LENGTH = 128
@@ -78,15 +102,15 @@ class ClaimedFlow:
     next_path: str
 
 
-def sanitize_next_path(raw: str | None) -> str:
+def sanitize_next_path(raw: object) -> str:
     """Return `raw` when it is a safe same-origin path, else `/topology` (D11).
 
-    Accepted only when it is at most 512 characters, starts with exactly one
-    `/` (not `//`), contains no backslash and no control character, and
-    `urlsplit` finds no scheme and no netloc. Anything else is replaced
-    silently, never refused.
+    Accepted only when it is a string of at most 512 characters, starts with
+    exactly one `/` (not `//`), contains no backslash and no control character
+    (Unicode category Cc), and `urlsplit` finds no scheme and no netloc.
+    Anything else, a non-string included, is replaced silently, never refused.
     """
-    if not raw or len(raw) > NEXT_PATH_MAX_LENGTH:
+    if not isinstance(raw, str) or not raw or len(raw) > NEXT_PATH_MAX_LENGTH:
         return DEFAULT_NEXT_PATH
     if not raw.startswith("/") or raw.startswith("//"):
         return DEFAULT_NEXT_PATH
@@ -102,25 +126,43 @@ def sanitize_next_path(raw: str | None) -> str:
 
 async def _prune_expired(db: AsyncSession, now: datetime) -> None:
     """Delete, in its own transaction, at most PRUNE_BATCH rows whose expires_at
-    is more than PRUNE_AFTER in the past, whatever their status.
+    is more than PRUNE_AFTER in the past, whatever their status. Best effort.
 
     No live row qualifies: a pending row is claimable only before expires_at,
     `complete_flow` refuses after it, so a handoff expires at most HANDOFF_TTL
     after it, and PRUNE_AFTER is far longer than HANDOFF_TTL.
+
+    The batch is selected `FOR UPDATE SKIP LOCKED` (SQLite renders no locking
+    clause), so concurrent prunes take disjoint rows instead of waiting on, or
+    deadlocking with, each other. Any database error is rolled back and
+    logged by class name only; the caller goes on to its insert, so a prune
+    never fails a sign-in.
     """
     cutoff = now - PRUNE_AFTER
     batch = (
         select(OidcLoginFlow.id)
         .where(OidcLoginFlow.expires_at < cutoff)
         .limit(PRUNE_BATCH)
+        .with_for_update(skip_locked=True)
         .scalar_subquery()
     )
-    await db.execute(
-        delete(OidcLoginFlow)
-        .where(OidcLoginFlow.id.in_(batch))
-        .execution_options(synchronize_session=False)
-    )
-    await db.commit()
+    try:
+        await db.execute(
+            delete(OidcLoginFlow)
+            .where(OidcLoginFlow.id.in_(batch))
+            .execution_options(synchronize_session=False)
+        )
+        await db.commit()
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        logger.warning(
+            "OIDC flow prune skipped",
+            extra={"action": "oidc_flow_prune_failed", "error_class": type(exc).__name__},
+        )
+
+
+def _long_enough(secret: object) -> bool:
+    return isinstance(secret, str) and len(secret) >= SECRET_MIN_LENGTH
 
 
 async def start_flow(
@@ -136,11 +178,16 @@ async def start_flow(
 
     `state` and `binding_secret` are stored as hashes, `nonce` and
     `code_verifier` as given, `next_path` after `sanitize_next_path`. Raises
-    ValueError (naming no value) for an empty secret or a verifier outside the
-    RFC 7636 length range, so a caller bug cannot store a guessable row.
+    ValueError (naming no value) when `state` or `binding_secret` is under 43
+    characters, `nonce` is empty, or the verifier is outside the RFC 7636
+    length range, so a caller bug cannot store a guessable row; IntegrityError
+    (after a rollback) when the state was already used. Commits the prune and
+    the insert separately; see the module docstring for the session contract.
     """
-    if not state or not nonce or not binding_secret:
-        raise ValueError("state, nonce, and binding_secret must be non-empty")
+    if not _long_enough(state) or not _long_enough(binding_secret):
+        raise ValueError("state and binding_secret must be at least 43 characters")
+    if not isinstance(nonce, str) or not nonce:
+        raise ValueError("nonce must be non-empty")
     if not CODE_VERIFIER_MIN_LENGTH <= len(code_verifier) <= CODE_VERIFIER_MAX_LENGTH:
         raise ValueError("code_verifier must be 43 to 128 characters")
 
@@ -157,7 +204,11 @@ async def start_flow(
         expires_at=now + FLOW_TTL,
     )
     db.add(flow)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise
     return flow.id
 
 
@@ -235,10 +286,12 @@ async def complete_flow(
 
     Re-asserts `expires_at > now` as well as `status='claimed'`, so no handoff
     is born after the flow's own lifetime and the prune rule can never reach a
-    live handoff. The handoff expires HANDOFF_TTL from now.
+    live handoff. The handoff expires HANDOFF_TTL from now. Raises ValueError
+    for a handoff secret under 43 characters; returns False, after a rollback,
+    for a row that is not `claimed`, an expired flow, or an IntegrityError.
     """
-    if not handoff_secret:
-        raise ValueError("handoff_secret must be non-empty")
+    if not _long_enough(handoff_secret):
+        raise ValueError("handoff_secret must be at least 43 characters")
     now = _utcnow()
     try:
         result = await db.execute(
