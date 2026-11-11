@@ -226,6 +226,7 @@ Each pg-live suite runs against the gate's real Postgres in master's `_gate-pg-l
 | Suite file | What it proves |
 |---|---|
 | `services/auth/tests/test_ldap_sync_service_live_pg.py` | LDAP sync service behavior against real Postgres |
+| `services/auth/tests/test_oidc_flow_service_live_pg.py` | the OIDC flow store's compare-and-swaps and JIT provisioning under real contention (ADR 0016 phase 2): N claims of one state, N exchanges of one handoff, completion racing failure, N first logins of one identity, N first logins sharing one email, each with exactly one winner; contention is forced by holding the flow row (`FOR UPDATE`) or blocking inserts into `users` until every task is waiting in `pg_stat_activity`; own rows under random tags, seeded foreign rows of every kind snapshotted |
 | `services/common/tests/test_advisory_lock_live_pg.py` | Postgres advisory-lock behavior |
 | `services/cabling/tests/test_fork_restore_save_race_live_pg.py` | fork restore/save race ordering (issue #626) |
 | `services/execution/tests/test_wiring_retry_claim_race_live_pg.py` | concurrent retry-channel row-claim race (issue #817), scoped to its own reservation on a used ledger (issue #819) |
