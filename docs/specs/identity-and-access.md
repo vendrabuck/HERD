@@ -6,7 +6,7 @@
 | Verified at | commit `61bebe96` (`v0.6.0-76-g61bebe96`), 2026-10-05 |
 | Owning services | auth (`services/auth/`), acl (`services/acl/`), the shared `herd_common` auth, internal-token, and ACL helpers (`services/common/herd_common/`) |
 | Other services involved | every service that verifies a JWT (all but config), notifications (admin and contact lookups), inventory (group lookups, ACL and reservation-owner checks), secrets (ACL checks), reservations (batch group lookup, the reservation-owner answer), an LDAP or Active Directory server |
-| Design records | [ADR 0011](../design/0011-ldap-group-sync.md) |
+| Design records | [ADR 0011](../design/0011-ldap-group-sync.md), [ADR 0016](../design/0016-oidc-single-sign-on.md) |
 | Related guides | [ROLES.md](../ROLES.md), [ARCHITECTURE.md](../ARCHITECTURE.md) (Authentication, Machine-token exchange), [ADMIN_HANDBOOK.md](../ADMIN_HANDBOOK.md), [ENV_VARS.md](../ENV_VARS.md), [SECURITY.md](../../SECURITY.md) |
 
 All API paths below are each service's own paths. Through the gateway the auth
@@ -201,23 +201,28 @@ are plain ORM writes; only one sync run can execute at a time (IAM-SERIAL-1).
 - **IAM-OIDC-1.** A new OIDC flow row is `pending`, expires 600 s after it is written,
   and stores the SHA-256 hashes of `state` and the binding secret, never the raw values;
   the `nonce` and the PKCE verifier are stored as given (the callback compares the
-  first verbatim and must send the second). An empty `state`, `nonce`, or binding
-  secret, or a verifier outside 43 to 128 characters, is a `ValueError` and writes
-  nothing. Nothing in the flow store logs a secret, the nonce, or the verifier; the
-  flow id is the correlation key. \
+  first verbatim and must send the second). A `state` or binding secret under 43
+  characters (32 random bytes in base64url) or not a string, an empty `nonce`, or a
+  verifier outside 43 to 128 characters is a `ValueError` and writes nothing; a reused
+  `state` is an `IntegrityError`, after a rollback. Nothing in the flow store logs a
+  secret, the nonce, or the verifier; the flow id is the correlation key. \
   Enforced in: `services/auth/app/services/oidc_flow_service.py` (`start_flow`, `FLOW_TTL`); `services/auth/app/models/oidc_login_flow.py` (`OidcLoginFlow`) \
-  Pinned by: `services/auth/tests/test_oidc_flow_service.py` (`test_start_flow_stores_hashes_never_the_raw_state_or_binding`, `test_start_flow_refuses_an_empty_secret`, `test_start_flow_verifier_length_bounds`, `test_no_flow_operation_logs_a_secret`)
+  Pinned by: `services/auth/tests/test_oidc_flow_service.py` (`test_start_flow_stores_hashes_never_the_raw_state_or_binding`, `test_start_flow_refuses_an_empty_secret`, `test_start_flow_minimum_secret_length`, `test_start_flow_verifier_length_bounds`, `test_start_flow_refuses_a_reused_state`, `test_no_flow_operation_logs_a_secret`)
 - **IAM-OIDC-2.** The return path stored in a flow row is the requested `next` only when
   it is at most 512 characters, starts with exactly one `/`, holds no backslash and no
-  control character, and has no scheme or host; anything else, an absent value
-  included, is stored as `/topology`, silently. \
+  control character, and has no scheme or host; anything else, an absent or
+  non-string value included, is stored as `/topology`, silently. The stored value is
+  only ever the sanitized one, so it is what a claim and an exchange return. \
   Enforced in: `services/auth/app/services/oidc_flow_service.py` (`sanitize_next_path`, `start_flow`) \
-  Pinned by: `services/auth/tests/test_oidc_flow_service.py` (`test_next_path_accepted`, `test_next_path_replaced_by_topology`, `test_start_flow_stores_the_sanitized_next_path`)
+  Pinned by: `services/auth/tests/test_oidc_flow_service.py` (`test_next_path_accepted`, `test_next_path_replaced_by_topology`, `test_next_path_non_string_is_replaced_not_raised`, `test_start_flow_stores_the_sanitized_next_path`)
 - **IAM-OIDC-3.** Before each insert, in its own committed transaction, `start_flow`
   deletes at most 500 flow rows whose `expires_at` is more than one hour past, in any
-  status; a row at or inside that hour, and every live row, stays. \
+  status and in no set order; a row at or inside that hour, and every live row, stays.
+  On Postgres the batch is selected `FOR UPDATE SKIP LOCKED`, so a row another
+  transaction holds is skipped, not waited on. The prune is best effort: a database
+  error in it is rolled back and logged once by class name, and the insert still runs. \
   Enforced in: `services/auth/app/services/oidc_flow_service.py` (`_prune_expired`, `PRUNE_AFTER`, `PRUNE_BATCH`) \
-  Pinned by: `services/auth/tests/test_oidc_flow_service.py` (`test_prune_boundary_by_status`, `test_prune_deletes_at_most_one_batch_per_start`, `test_prune_commits_in_its_own_transaction_before_the_insert`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_start_flow_prunes_only_rows_more_than_an_hour_expired`)
+  Pinned by: `services/auth/tests/test_oidc_flow_service.py` (`test_prune_boundary_by_status`, `test_prune_deletes_at_most_one_batch_per_start`, `test_prune_commits_in_its_own_transaction_before_the_insert`, `test_prune_failure_never_fails_the_begin`, `test_prune_selects_its_batch_for_update_skip_locked`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_start_flow_prunes_only_rows_more_than_an_hour_expired`, `test_prune_skips_rows_another_transaction_holds`, `test_concurrent_begins_on_a_table_full_of_prunable_rows_all_succeed`)
 - **IAM-OIDC-4.** A claim moves a flow from `pending` to `claimed` with one conditional
   update requiring the state hash, the binding hash, `pending`, and an unexpired row at
   write time, and sets the verifier to NULL; it returns the flow id, nonce, verifier,
@@ -227,10 +232,12 @@ are plain ORM writes; only one sync run can execute at a time (IAM-SERIAL-1).
   Pinned by: `services/auth/tests/test_oidc_flow_service.py` (`test_status_by_operation_matrix_live_rows`, `test_status_by_operation_matrix_expired_rows`, `test_claim_expiry_boundary`, `test_claim_with_a_wrong_binding_secret_leaves_the_row_pending_and_usable`, `test_claim_loses_to_a_claim_that_lands_between_its_read_and_its_update`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_concurrent_claims_of_one_state_have_exactly_one_winner`, `test_wrong_binding_claims_racing_the_right_one_change_nothing`)
 - **IAM-OIDC-5.** Completion moves a flow from `claimed` to `authenticated` only while
   the row is unexpired, attaching the user, the SHA-256 hash of the handoff secret, and
-  a handoff expiry 60 s ahead; a handoff hash another row holds writes nothing. So no
-  handoff outlives its flow by more than 60 s. \
+  a handoff expiry 60 s ahead. It answers False, writing nothing, for an expired flow
+  and on an IntegrityError (a handoff hash another row holds, an unknown user), and
+  raises `ValueError` for a handoff secret under 43 characters. So no handoff outlives
+  its flow by more than 60 s. \
   Enforced in: `services/auth/app/services/oidc_flow_service.py` (`complete_flow`, `HANDOFF_TTL`) \
-  Pinned by: `services/auth/tests/test_oidc_flow_service.py` (`test_status_by_operation_matrix_live_rows`, `test_complete_expiry_boundary`, `test_complete_with_a_handoff_hash_another_row_holds_writes_nothing`, `test_a_live_handoff_can_never_be_prunable`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_complete_racing_fail_on_one_claimed_row_has_exactly_one_winner`)
+  Pinned by: `services/auth/tests/test_oidc_flow_service.py` (`test_status_by_operation_matrix_live_rows`, `test_complete_expiry_boundary`, `test_complete_with_a_handoff_hash_another_row_holds_writes_nothing`, `test_complete_flow_minimum_handoff_length`, `test_a_live_handoff_can_never_be_prunable`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_complete_racing_fail_on_one_claimed_row_has_exactly_one_winner`)
 - **IAM-OIDC-6.** Failure moves a flow from `claimed` to `failed`, expired or not, and
   from no other status; completion and failure exclude each other. \
   Enforced in: `services/auth/app/services/oidc_flow_service.py` (`fail_flow`) \
@@ -241,7 +248,7 @@ are plain ORM writes; only one sync run can execute at a time (IAM-SERIAL-1).
   and return path, or nothing. Of concurrent exchanges of one handoff exactly one gets
   the user. \
   Enforced in: `services/auth/app/services/oidc_flow_service.py` (`exchange_handoff`) \
-  Pinned by: `services/auth/tests/test_oidc_flow_service.py` (`test_status_by_operation_matrix_live_rows`, `test_exchange_expiry_boundary`, `test_exchange_refused_for_an_inactive_user_in_every_status`, `test_exchange_checks_its_own_rows_user_not_any_active_user`, `test_second_exchange_of_one_handoff_gets_nothing`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_concurrent_exchanges_of_one_handoff_have_exactly_one_winner`, `test_expired_rows_are_neither_claimable_nor_exchangeable_on_timestamptz`)
+  Pinned by: `services/auth/tests/test_oidc_flow_service.py` (`test_status_by_operation_matrix_live_rows`, `test_exchange_expiry_boundary`, `test_exchange_refused_for_an_inactive_user_in_every_status`, `test_exchange_checks_its_own_rows_user_not_any_active_user`, `test_second_exchange_of_one_handoff_gets_nothing`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_concurrent_exchanges_of_one_handoff_have_exactly_one_winner`, `test_expired_rows_are_neither_claimable_nor_exchangeable_on_timestamptz`, `test_exchange_refused_while_the_user_is_deactivated_then_admitted`)
 - **IAM-OIDC-8.** A known (issuer, subject) signs in as its linked account only when that
   account is an active `oidc` account; the login writes the identity's `last_login_at`
   and never changes the account's email, username, name, or role, whatever the
@@ -249,18 +256,33 @@ are plain ORM writes; only one sync run can execute at a time (IAM-SERIAL-1).
   Enforced in: `services/auth/app/services/auth_service.py` (`resolve_federated_user`, `_returning_federated_login`) \
   Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_returning_login_returns_the_same_user_and_updates_nothing_but_last_login`, `test_returning_login_refused_for_an_inactive_user_and_last_login_untouched`, `test_identity_linked_to_a_non_oidc_account_is_refused`, `test_identity_whose_user_is_gone_is_refused`)
 - **IAM-OIDC-9.** A first login creates an active `oidc` account with no password hash,
-  role user, and `full_name` from the login (truncated to 200 characters) or the
-  username, together with its federated identity in one transaction, then adds it to
-  "Not Grouped". It is refused when the subject is empty or over 255 characters, the
-  email is absent, over 255 characters, or `email_verified` is false (an absent claim is
-  accepted), or the username is absent or over 100 characters. \
+  role user, and `full_name` from the login (each Cc or Cs character replaced by a
+  space, stripped, cut to 200 characters) or the username when that leaves nothing,
+  together with its federated identity in one transaction, then adds it to "Not
+  Grouped". It is refused when the email is absent, not a string, empty, or whitespace
+  only (`email_missing`); `email_verified` is present and not true (`email_unverified`;
+  an absent claim is accepted); the email has leading or trailing whitespace, a Cc, Cf,
+  or Cs character, or not exactly one `@` with text on both sides (`email_invalid`);
+  the email is over 255 characters (`email_too_long`); the username is absent, not a
+  string, empty, or whitespace only (`username_missing`); it has leading or trailing
+  whitespace or a Cc, Cf, or Cs character (`username_invalid`); or it is over 100
+  characters (`username_too_long`). No other character rule applies to either. \
   Enforced in: `services/auth/app/services/auth_service.py` (`resolve_federated_user`, `create_oidc_user`, `_first_login_refusal`, `FederatedLogin`) \
-  Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_first_login_creates_an_oidc_user_with_no_password_and_role_user`, `test_first_login_full_name_defaults_and_truncation`, `test_first_login_auto_assigns_not_grouped`, `test_email_verified_true_or_absent_is_accepted`, `test_values_at_the_column_width_are_accepted`, `test_first_login_refusal_creates_nothing_and_logs_one_fixed_reason`, `test_create_oidc_user_rolls_back_both_rows_on_a_conflict`)
+  Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_first_login_creates_an_oidc_user_with_no_password_and_role_user`, `test_first_login_full_name_defaults_and_truncation`, `test_full_name_control_characters_are_replaced`, `test_first_login_auto_assigns_not_grouped`, `test_email_verified_true_or_absent_is_accepted`, `test_values_at_the_column_width_are_accepted`, `test_first_login_refusal_creates_nothing_and_logs_one_fixed_reason`, `test_email_and_username_content_refusals`, `test_create_oidc_user_rolls_back_both_rows_on_a_conflict`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_control_characters_in_full_name_are_replaced_on_postgres`)
 - **IAM-OIDC-10.** A first login whose email or username is held by any account, local,
-  LDAP, or `oidc`, active or not, compared case-insensitively, is refused; no account is
-  linked, converted, or changed. \
-  Enforced in: `services/auth/app/services/auth_service.py` (`resolve_federated_user`, `_email_taken`, `_username_taken`) \
-  Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_collision_matrix_refuses_and_never_links`, `test_collision_refusal_holds_for_an_inactive_existing_account`, `test_another_account_taking_the_email_inside_the_window_is_refused`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_case_insensitive_email_collision_on_postgres`, `test_concurrent_first_logins_of_different_subjects_with_one_email_create_one_user`)
+  LDAP, or `oidc`, active or not, compared case-insensitively with the database's
+  `lower()`, is refused; no account is linked, converted, or changed. This holds between
+  concurrent first logins on Postgres: the check and the insert run under
+  transaction-scoped advisory locks on the case-folded email and username, taken in key
+  order, so of first logins whose emails or usernames differ only in case one account
+  is created. On SQLite the locks are a no-op, so the unit suites prove the refusal and
+  the lock wiring, and only the Postgres-live suite proves the concurrent case. The lock
+  key folds with Python's `str.casefold`, which agrees with `lower()` for ASCII; outside
+  ASCII the two may differ. There is no Unicode normalization or confusable check: a
+  visible look-alike (a dotless i, a fullwidth letter) is a different email or
+  username and is provisioned. \
+  Enforced in: `services/auth/app/services/auth_service.py` (`resolve_federated_user`, `_email_taken`, `_username_taken`, `_lock_first_login_names`) \
+  Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_collision_matrix_refuses_and_never_links`, `test_collision_refusal_holds_for_an_inactive_existing_account`, `test_another_account_taking_the_email_inside_the_window_is_refused`, `test_lookalike_of_an_existing_email_is_refused`, `test_visible_unicode_lookalikes_are_distinct_emails_today`, `test_first_login_takes_both_name_locks_in_key_order_before_the_checks`, `test_name_lock_keys_ignore_case`, `test_refusals_before_the_insert_take_no_name_lock`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_case_insensitive_email_collision_on_postgres`, `test_concurrent_first_logins_of_different_subjects_with_one_email_create_one_user`, `test_concurrent_first_logins_differing_only_in_case_create_one_account`)
 - **IAM-OIDC-11.** Concurrent first logins of one (issuer, subject) create one account
   and one identity, and every one of them signs in as that account: a login that loses
   a collision check or the insert to it looks the identity up again and proceeds as a
@@ -272,6 +294,26 @@ are plain ORM writes; only one sync run can execute at a time (IAM-SERIAL-1).
   name, issuer, or subject. \
   Enforced in: `services/auth/app/services/auth_service.py` (`_refuse_federated`) \
   Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_refusal_logs_carry_no_claim_values`, `test_first_login_refusal_creates_nothing_and_logs_one_fixed_reason`)
+- **IAM-OIDC-13.** `resolve_federated_user` returns the account or nothing for every
+  login and never raises on claim content. The issuer and subject are refused
+  (`issuer_invalid`, `subject_invalid`) before the identity lookup when either is not a
+  string, empty, whitespace only, over 255 characters, or holds a Cc or Cs character
+  (Postgres rejects NUL in text and a lone surrogate cannot be encoded, so the lookup
+  itself would raise); every other claim is checked by IAM-OIDC-9 before anything is
+  written. SQLite stores NUL, so only the Postgres-live suite shows the raise these
+  checks prevent. \
+  Enforced in: `services/auth/app/services/auth_service.py` (`resolve_federated_user`, `_identity_key_refusal`, `_first_login_refusal`, `_clean_full_name`) \
+  Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_issuer_and_subject_refused_before_the_identity_lookup`, `test_issuer_at_255_characters_is_accepted_by_the_key_check`, `test_resolve_never_raises_on_claim_content`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_unstorable_character_in_a_claim_is_refused_not_raised`)
+- **IAM-OIDC-14.** Every flow-store function, on every outcome, and
+  `resolve_federated_user` on every refusal, ends by committing or rolling back the
+  session it is handed; a successful `resolve_federated_user` commits its writes and
+  then reloads the user it returns, a read that leaves a transaction open (as
+  `create_user` does). `start_flow` commits the prune and then the insert, so it also
+  commits work its caller left pending, and a rollback expires the ORM instances the
+  session holds. Claims and exchanges answer nothing, and completions and failures
+  False, for every refusal. \
+  Enforced in: `services/auth/app/services/oidc_flow_service.py` (`start_flow`, `claim_flow`, `complete_flow`, `fail_flow`, `exchange_handoff`); `services/auth/app/services/auth_service.py` (`resolve_federated_user`, `_returning_federated_login`) \
+  Pinned by: `services/auth/tests/test_oidc_flow_service.py` (`test_every_flow_function_ends_its_transaction_on_every_outcome`, `test_start_flow_commits_work_its_caller_left_pending`); `services/auth/tests/test_oidc_provisioning.py` (`test_resolve_ends_its_transaction_on_every_refusal_and_commits_a_success`)
 
 ## 5. API surface
 

@@ -565,8 +565,9 @@ async def resolve_federated_user(db: AsyncSession, login: FederatedLogin) -> Use
     refuses and never links. On Postgres the check and the insert run under
     `_lock_first_login_names`, so the case-insensitive refusal also holds
     between concurrent first logins. Every refusal is logged once with a
-    fixed `reason` and returns None. Like the flow store, it commits or rolls
-    back the session it is handed.
+    fixed `reason` and returns None. Every refusal ends with a rollback; a
+    success commits its writes and then reloads the returned user, which
+    leaves a read transaction open, as `create_user` does.
 
     A concurrent first login of the same identity is not a collision: when a
     collision check or the insert loses to it, the identity is looked up once

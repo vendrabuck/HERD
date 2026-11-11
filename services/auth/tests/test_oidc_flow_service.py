@@ -995,3 +995,37 @@ async def test_prune_selects_its_batch_for_update_skip_locked(clock):
     [sql] = seen
     assert "FOR UPDATE SKIP LOCKED" in sql
     assert "LIMIT" in sql
+
+
+# --- the session contract (IAM-OIDC-14) -------------------------------------------------
+
+
+async def test_every_flow_function_ends_its_transaction_on_every_outcome(clock):
+    async with TestSessionLocal() as db:
+        uid = await _user(db)
+        flow_id = await _start(db, "contract")
+        assert not db.in_transaction()
+        steps = [
+            lambda: claim_flow(db, state="no-such-state", binding_secret=sec("b")),
+            lambda: claim_flow(db, state=sec("contract"), binding_secret=sec("wrong")),
+            lambda: claim_flow(db, state=sec("contract"), binding_secret=sec("b")),
+            lambda: claim_flow(db, state=sec("contract"), binding_secret=sec("b")),
+            lambda: fail_flow(db, uuid.uuid4()),
+            lambda: complete_flow(db, flow_id, user_id=uid, handoff_secret=sec("contract-h")),
+            lambda: complete_flow(db, flow_id, user_id=uid, handoff_secret=sec("contract-h")),
+            lambda: exchange_handoff(db, handoff_secret=sec("wrong")),
+            lambda: exchange_handoff(db, handoff_secret=sec("contract-h")),
+            lambda: exchange_handoff(db, handoff_secret=sec("contract-h")),
+        ]
+        for step in steps:
+            await step()
+            assert not db.in_transaction()
+
+
+async def test_start_flow_commits_work_its_caller_left_pending(clock):
+    async with TestSessionLocal() as db:
+        db.add(User(email="pending@example.com", username="pending", auth_source="local"))
+        await _start(db, "commits-pending")
+    async with TestSessionLocal() as other:
+        found = await other.execute(select(User.id).where(User.username == "pending"))
+        assert found.scalar_one_or_none() is not None

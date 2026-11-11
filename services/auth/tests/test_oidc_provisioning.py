@@ -666,3 +666,26 @@ async def test_refusals_before_the_insert_take_no_name_lock(monkeypatch):
         assert await resolve_federated_user(db, _login(email_verified=False)) is None
         assert await resolve_federated_user(db, _login(subject="")) is None
     assert taken == []
+
+
+async def test_resolve_ends_its_transaction_on_every_refusal_and_commits_a_success():
+    """IAM-OIDC-14: every refusal rolls back; a success commits its writes (seen
+    from another session) and returns a loaded user."""
+    await _existing("local")
+    async with TestSessionLocal() as db:
+        for login in (
+            _login(subject=""),
+            _login(email_verified=False),
+            _login(email="bob@example.com"),
+        ):
+            assert await resolve_federated_user(db, login) is None
+            assert not db.in_transaction()
+        for _ in range(2):  # the first login, then the returning one
+            user = await resolve_federated_user(db, _login())
+            assert user is not None and user.username == "alice"
+            async with TestSessionLocal() as other:
+                found = await other.execute(select(User.id).where(User.id == user.id))
+                assert found.scalar_one_or_none() == user.id
+        await auth_service.set_user_active(db, user.id, False)
+        assert await resolve_federated_user(db, _login()) is None
+        assert not db.in_transaction()
