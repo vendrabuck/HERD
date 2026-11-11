@@ -58,9 +58,28 @@ export default tseslint.config(
             "Do not type an error's detail as string (a 422 detail is a list); use errorDetail from @/lib/errors (issue #1314).",
         },
         {
+          selector: "TSSatisfiesExpression TSPropertySignature[key.name='detail'] TSStringKeyword",
+          message:
+            "Do not claim an error's detail is a string (a 422 detail is a list); use errorDetail from @/lib/errors (issue #1314).",
+        },
+        {
           selector: "MemberExpression[property.name='detail'][object.property.name='data']",
           message:
             "Do not read .data.detail directly; use errorDetail, responseDetail, or a structuredDetail narrower from @/lib/errors (issue #1314).",
+        },
+        {
+          selector:
+            "MemberExpression[computed=true][property.value='detail'][object.property.name='data']",
+          message:
+            "Do not read .data[\"detail\"] directly; use errorDetail, responseDetail, or a structuredDetail narrower from @/lib/errors (issue #1314).",
+        },
+        {
+          // const { detail } = x.data, x?.data, (x as T).data; and the nested
+          // const { data: { detail } } = x.response.
+          selector:
+            ":matches(VariableDeclarator[init.property.name='data'], VariableDeclarator[init.expression.property.name='data'], Property[key.name='data']) > ObjectPattern > Property[key.name='detail']",
+          message:
+            "Do not destructure detail from a response's data; use errorDetail, responseDetail, or a structuredDetail narrower from @/lib/errors (issue #1314).",
         },
       ],
     },

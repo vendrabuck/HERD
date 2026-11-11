@@ -1,20 +1,22 @@
 import { http, HttpResponse } from "msw";
-import { render, screen, fireEvent, act, within } from "@testing-library/react";
+import { render, screen, fireEvent, act, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Node } from "@xyflow/react";
 
-// Issue #1314: the Save as template dialog's inline error state. Cabling
+// Issue #1314: error text in the editor. First the Save as template dialog's
+// inline error state, then the version restore refusal toast. Cabling
 // refuses a name over 100 characters with FastAPI's default 422, whose detail
 // is a LIST of objects; the old `detail?: string` cast stored that list in
 // state and rendered it as a React child, which threw and blanked the app.
 // The harness mirrors TopologyEditorPage.HistoryAndSave.test.tsx, kept in its
 // own file so the editor's other suites stay untouched.
 
+const { toastError } = vi.hoisted(() => ({ toastError: vi.fn() }));
 vi.mock("react-hot-toast", () => ({
   default: Object.assign(vi.fn(), {
-    error: vi.fn(),
+    error: toastError,
     success: vi.fn(),
     custom: vi.fn(),
     dismiss: vi.fn(),
@@ -76,6 +78,18 @@ const VALIDATION_422 = {
   ],
 };
 
+const VERSION_1 = {
+  id: "v-1",
+  topology_id: TOPO_ID,
+  version_number: 1,
+  name: "Validation topology",
+  description: "first save",
+  created_by: "u",
+  author_name: "u",
+  created_at: "2026-05-02T00:00:00Z",
+  restored_from_id: null,
+};
+
 function baseHandlers() {
   return [
     http.get(`/api/cabling/topologies/${TOPO_ID}`, () => HttpResponse.json(TOPOLOGY)),
@@ -87,7 +101,7 @@ function baseHandlers() {
       HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 }),
     ),
     http.get(`/api/cabling/topologies/${TOPO_ID}/versions`, () =>
-      HttpResponse.json({ items: [], total: 0, skip: 0, limit: 200 }),
+      HttpResponse.json({ items: [VERSION_1], total: 1, skip: 0, limit: 200 }),
     ),
   ];
 }
@@ -185,5 +199,74 @@ describe("TopologyEditorPage Save as template validation (issue #1314)", () => {
     // The echoed input is never shown.
     expect(within(templateForm()).queryByText(new RegExp("n{101}"))).toBeNull();
     consoleError.mockRestore();
+  });
+});
+
+async function restoreVersion1() {
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  await screen.findByText("v1");
+  const row = screen.getByText("v1").closest("div.px-4") as HTMLElement;
+  fireEvent.click(within(row).getByRole("button", { name: "Restore" }));
+  const title = await screen.findByText("Restore version v1");
+  const dialog = title.closest("dialog") as HTMLElement;
+  fireEvent.click(within(dialog).getByRole("button", { name: "Restore" }));
+  return dialog;
+}
+
+describe("TopologyEditorPage restore refusal text (issue #1314)", () => {
+  it("shows a string refusal detail, such as a 403, in the toast", async () => {
+    server.use(
+      ...baseHandlers(),
+      http.post(`/api/cabling/topologies/${TOPO_ID}/versions/v-1/restore`, () =>
+        HttpResponse.json({ detail: "Not authorized to modify this topology" }, { status: 403 }),
+      ),
+    );
+    await renderEditor();
+    await restoreVersion1();
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith("Not authorized to modify this topology"),
+    );
+  });
+
+  it("falls back to Restore failed for a blocked 409 whose entries carry no id", async () => {
+    server.use(
+      ...baseHandlers(),
+      http.post(`/api/cabling/topologies/${TOPO_ID}/versions/v-1/restore`, () =>
+        HttpResponse.json(
+          {
+            detail: {
+              message: "Topology has active reservations; restore blocked",
+              reservations: [{ status: "ACTIVE" }, { id: 7, status: "ACTIVE" }],
+            },
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+    await renderEditor();
+    const dialog = await restoreVersion1();
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Restore failed"));
+    expect(within(dialog).queryByRole("list")).not.toBeInTheDocument();
+  });
+
+  it("lists the blocking reservations with a string id", async () => {
+    server.use(
+      ...baseHandlers(),
+      http.post(`/api/cabling/topologies/${TOPO_ID}/versions/v-1/restore`, () =>
+        HttpResponse.json(
+          {
+            detail: {
+              message: "Topology has active reservations; restore blocked",
+              reservations: [{ id: "res-1", status: "ACTIVE", end_time: null }, { status: "X" }],
+            },
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+    await renderEditor();
+    const dialog = await restoreVersion1();
+    expect(await within(dialog).findByText("res-1 (ACTIVE)")).toBeInTheDocument();
+    expect(toastError).not.toHaveBeenCalled();
   });
 });

@@ -17,6 +17,9 @@ export const VALIDATION_DETAIL_MAX_ITEMS = 3;
 /** The most characters (code points) `detailText` returns for a 422 list. */
 export const VALIDATION_DETAIL_MAX_LENGTH = 300;
 
+/** The most characters (code points) `detailText` returns for a plain string. */
+export const STRING_DETAIL_MAX_LENGTH = 1000;
+
 // FastAPI prefixes every validation location with where the value came from;
 // the field path after it is what a person can act on.
 const VALIDATION_LOCATION_SOURCES = new Set(["body", "query", "path", "header", "cookie"]);
@@ -30,7 +33,9 @@ function validationEntryText(entry: unknown): string | null {
     Array.isArray(loc) &&
     loc.every((part) => typeof part === "string" || typeof part === "number")
   ) {
-    const parts = loc.map(String);
+    // An empty or blank part names nothing; dropping it keeps `body.` and
+    // `.: msg` off the screen.
+    const parts = loc.map(String).filter((part) => part.trim() !== "");
     if (parts.length > 1 && VALIDATION_LOCATION_SOURCES.has(parts[0])) parts.shift();
     where = parts.join(".");
   }
@@ -43,20 +48,39 @@ function boundedText(text: string, max: number): string {
 }
 
 /**
+ * One line from the readable texts of a 422 list's entries: the first
+ * VALIDATION_DETAIL_MAX_ITEMS joined with "; ", then " (and N more)", cut to
+ * VALIDATION_DETAIL_MAX_LENGTH characters. Shared by `detailText` and
+ * `profileSaveErrorText`, so neither formatter is unbounded.
+ */
+function joinValidationEntries(entries: string[]): string {
+  const shown = entries.slice(0, VALIDATION_DETAIL_MAX_ITEMS).join("; ");
+  const rest = entries.length - VALIDATION_DETAIL_MAX_ITEMS;
+  return boundedText(
+    rest > 0 ? shown + " (and " + rest + " more)" : shown,
+    VALIDATION_DETAIL_MAX_LENGTH,
+  );
+}
+
+/**
  * The ONE normalizer from an error body's `detail` to display text (issue
  * #1314). A HERD backend service answers with a plain string, or, on a
  * pydantic validation failure (FastAPI's default 422), a list of
- * {type, loc, msg, input, ctx} objects. A non-empty string passes through
- * unchanged. A list whose every entry carries a string `msg` becomes
- * "field: message" per entry (the location without its body/query/path
- * source, dotted), the first VALIDATION_DETAIL_MAX_ITEMS joined with "; "
+ * {type, loc, msg, input, ctx} objects. A non-blank string passes through,
+ * cut to STRING_DETAIL_MAX_LENGTH characters. A list whose every entry
+ * carries a string `msg` becomes "field: message" per entry (the location's
+ * non-blank parts dotted, without a leading body, query, path, header, or
+ * cookie source unless that source is all there is), the first
+ * VALIDATION_DETAIL_MAX_ITEMS joined with "; "
  * plus " (and N more)", cut to VALIDATION_DETAIL_MAX_LENGTH characters. The
  * `input` echo is never shown. Anything else (an empty string or list, an
  * object, a number, null, a nested list, an entry without `msg`) is the
  * caller's fallback, so the result is always a string.
  */
 export function detailText(detail: unknown, fallback: string): string {
-  if (typeof detail === "string") return detail.trim() ? detail : fallback;
+  if (typeof detail === "string") {
+    return detail.trim() ? boundedText(detail, STRING_DETAIL_MAX_LENGTH) : fallback;
+  }
   if (!Array.isArray(detail) || detail.length === 0) return fallback;
   const entries: string[] = [];
   for (const entry of detail) {
@@ -64,12 +88,7 @@ export function detailText(detail: unknown, fallback: string): string {
     if (text === null) return fallback;
     entries.push(text);
   }
-  const shown = entries.slice(0, VALIDATION_DETAIL_MAX_ITEMS).join("; ");
-  const rest = entries.length - VALIDATION_DETAIL_MAX_ITEMS;
-  return boundedText(
-    rest > 0 ? shown + " (and " + rest + " more)" : shown,
-    VALIDATION_DETAIL_MAX_LENGTH,
-  );
+  return joinValidationEntries(entries);
 }
 
 /**
@@ -498,15 +517,17 @@ export const PHONE_PATTERN_TEXT =
 
 /**
  * Toast text for a failed profile save (issue #1252). A plain string detail
- * (404 "User not found") is shown as is. A pydantic 422 list naming the
- * profile fields becomes one "<Label>: <message>" per field, joined with
- * "; ", so a bad phone and a bad address are both reported; a phone that
- * breaks the character rule reads PHONE_PATTERN_TEXT, not the regex. Anything else,
- * a 422 entry for another field included, falls back to `fallback`.
+ * (404 "User not found") goes through `detailText` (bounded; blank falls
+ * back). A pydantic 422 list naming the profile fields becomes one
+ * "<Label>: <message>" per field, joined and bounded the way `detailText`
+ * joins a list (issue #1314), so a bad phone and a bad address are both
+ * reported; a phone that breaks the character rule reads PHONE_PATTERN_TEXT,
+ * not the regex. Anything else, a 422 entry for another field included,
+ * falls back to `fallback`.
  */
 export function profileSaveErrorText(err: unknown, fallback: string): string {
   const detail = responseDetail(err);
-  if (typeof detail === "string") return detail;
+  if (typeof detail === "string") return detailText(detail, fallback);
   if (!Array.isArray(detail) || detail.length === 0) return fallback;
   const parts: string[] = [];
   for (const entry of detail) {
@@ -522,5 +543,5 @@ export function profileSaveErrorText(err: unknown, fallback: string): string {
       parts.push(`${label}: ${msg}`);
     }
   }
-  return parts.join("; ");
+  return joinValidationEntries(parts);
 }

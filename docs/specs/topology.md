@@ -1151,7 +1151,7 @@ editor's Save as Template; the seven `/templates` routes in section 5.
   through `errorDetail`: a string detail as is, a 422 validation list as `field: message`
   per entry. The editor stays mounted; the list is never rendered as an object (#1314). \
   Enforced in: `frontend/src/pages/TopologyEditorPage.tsx` (`errorDetail`); `frontend/src/lib/errors.ts` (`detailText`) \
-  Pinned by: `frontend/src/test/pages/TopologyEditorPage.TemplateValidation.test.tsx` (`caps the name input at the 100-character limit of cabling`, `shows a 422 validation list as readable text and the editor stays mounted`); `frontend/src/test/lib/errors.test.ts` (`errorDetail and detailText shapes (issue #1314)`)
+  Pinned by: `frontend/src/test/pages/TopologyEditorPage.ErrorText.test.tsx` (`caps the name input at the 100-character limit of cabling`, `shows a 422 validation list as readable text and the editor stays mounted`); `frontend/src/test/lib/errors.test.ts` (`errorDetail and detailText shapes (issue #1314)`)
 
 **Out of scope.** Inventory device and port templates (`/api/inventory/templates`) are a
 different thing (`inventory.md`).

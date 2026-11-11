@@ -62,3 +62,21 @@ describe("App toaster placement", () => {
     expect(style.justifyContent).toBe("center");
   });
 });
+
+describe("App root boundary and the Toaster (issue #1344)", () => {
+  it("shows the last-resort page when a toast throws while rendering", async () => {
+    // React and the boundary log the caught error; keep the run quiet.
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(<App />);
+    // The #1314 crash: an object handed to a toast cannot render as a child.
+    // The Toaster sits inside the root boundary, so the boundary catches it
+    // instead of the whole root unmounting to a blank page.
+    act(() => {
+      toast.error({ loc: ["body", "name"], msg: "bad" } as unknown as string);
+    });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Something went wrong");
+    expect(screen.getByRole("button", { name: "Reload page" })).toBeInTheDocument();
+    consoleError.mockRestore();
+  });
+});

@@ -1,4 +1,4 @@
-import { Component } from "react";
+import { Component, useState } from "react";
 import type { ErrorInfo, ReactNode } from "react";
 import { Link, useLocation } from "react-router-dom";
 
@@ -59,29 +59,41 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
   }
 }
 
-function RouteErrorFallback() {
+function RouteErrorFallback({ onRetry, showTopologyLink }: {
+  onRetry: () => void;
+  showTopologyLink: boolean;
+}) {
   return (
     <div className="h-full overflow-y-auto">
       <div role="alert" className="max-w-lg mx-auto mt-16 p-6 bg-white border border-gray-200 rounded-lg">
         <h2 className="text-lg font-semibold text-gray-900 mb-2">This page could not be displayed</h2>
         <p className="text-sm text-gray-600 mb-4">
-          Something went wrong while showing this page. Use the navigation above to open another
-          page, or reload this one to try again.
+          Something went wrong while showing this page. Try again, use the navigation above to
+          open another page, or reload.
         </p>
         <div className="flex gap-2">
           <button
             type="button"
-            onClick={reloadPage}
+            onClick={onRetry}
             className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
+          >
+            Try again
+          </button>
+          <button
+            type="button"
+            onClick={reloadPage}
+            className="px-4 py-2 text-sm font-medium text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
           >
             Reload page
           </button>
-          <Link
-            to="/topology"
-            className="px-4 py-2 text-sm font-medium text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
-          >
-            Go to Topology
-          </Link>
+          {showTopologyLink && (
+            <Link
+              to="/topology"
+              className="px-4 py-2 text-sm font-medium text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
+            >
+              Go to Topology
+            </Link>
+          )}
         </div>
       </div>
     </div>
@@ -91,13 +103,26 @@ function RouteErrorFallback() {
 /**
  * The per-route boundary inside AppLayout (issue #1344): a page that throws
  * while rendering is replaced by a fixed message while the header and
- * navigation stay. It is keyed on the location pathname, so navigating to
- * another route mounts a fresh boundary and that route renders normally.
+ * navigation stay. It is keyed on the location pathname plus a retry count:
+ * navigating to another pathname mounts a fresh boundary (and a fresh page),
+ * and the fallback's Try again bumps the count, which remounts the same
+ * route. A query string or hash change keeps the key, so it neither resets
+ * the boundary nor remounts the page. Go to Topology is offered only off
+ * `/topology`, where following it would change nothing.
  */
 export function RouteErrorBoundary({ children }: { children: ReactNode }) {
   const { pathname } = useLocation();
+  const [retries, setRetries] = useState(0);
   return (
-    <ErrorBoundary key={pathname} fallback={<RouteErrorFallback />}>
+    <ErrorBoundary
+      key={pathname + "#" + retries}
+      fallback={
+        <RouteErrorFallback
+          onRetry={() => setRetries((n) => n + 1)}
+          showTopologyLink={pathname !== "/topology"}
+        />
+      }
+    >
       {children}
     </ErrorBoundary>
   );

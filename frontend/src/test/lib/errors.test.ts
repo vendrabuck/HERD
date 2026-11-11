@@ -20,6 +20,7 @@ import {
   topologyUnconnectableDetail,
   VALIDATION_DETAIL_MAX_ITEMS,
   VALIDATION_DETAIL_MAX_LENGTH,
+  STRING_DETAIL_MAX_LENGTH,
   type TopologyMixedTypesDetail,
   type TopologyUnconnectableDetail,
 } from "@/lib/errors";
@@ -59,6 +60,12 @@ const DETAIL_SHAPES: [string, unknown, string][] = [
     "ports.0.name: Field required",
   ],
   ["a bare source location is kept", [entry(["body"], "Field required")], "body: Field required"],
+  [
+    "empty and blank location parts are dropped",
+    [entry(["body", "", " ", "name", ""], "Field required")],
+    "name: Field required",
+  ],
+  ["a location of only blank parts after the source keeps the source", [entry(["body", "", ""], "m")], "body: m"],
   ["an entry without loc is its msg alone", [{ msg: "Value error, bad" }], "Value error, bad"],
   [
     "a location with a non-scalar part is dropped, the msg kept",
@@ -126,9 +133,20 @@ describe("errorDetail and detailText shapes (issue #1314)", () => {
     expect(text).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
   });
 
-  it("leaves a long plain string alone (only the 422 list is bounded)", () => {
-    const long = "y".repeat(VALIDATION_DETAIL_MAX_LENGTH * 2);
-    expect(errorDetail(axiosLike(400, long), FALLBACK)).toBe(long);
+  it.each([
+    ["one under the cap", STRING_DETAIL_MAX_LENGTH - 1, false],
+    ["at the cap", STRING_DETAIL_MAX_LENGTH, false],
+    ["one over the cap", STRING_DETAIL_MAX_LENGTH + 1, true],
+    ["a megabyte", 1_000_000, true],
+  ])("bounds a plain string detail: %s", (_label, length, cut) => {
+    const long = "y".repeat(length);
+    const text = errorDetail(axiosLike(400, long), FALLBACK);
+    if (cut) {
+      expect(text).toHaveLength(STRING_DETAIL_MAX_LENGTH);
+      expect(text.endsWith("...")).toBe(true);
+    } else {
+      expect(text).toBe(long);
+    }
   });
 });
 
@@ -508,6 +526,36 @@ describe("loginRetryAfterSeconds and loginRetryAfterText", () => {
   });
 });
 
+
+describe("profileSaveErrorText bounds and blanks (issue #1314)", () => {
+  it("falls back for an empty or blank string detail", () => {
+    expect(profileSaveErrorText(axiosLike(404, ""), "Save failed")).toBe("Save failed");
+    expect(profileSaveErrorText(axiosLike(404, "  "), "Save failed")).toBe("Save failed");
+  });
+
+  it("bounds a long string detail", () => {
+    const text = profileSaveErrorText(axiosLike(400, "z".repeat(5000)), "Save failed");
+    expect(text).toHaveLength(STRING_DETAIL_MAX_LENGTH);
+  });
+
+  it("joins a 422 list with the shared item count and length bound", () => {
+    const many = [
+      { loc: ["body", "full_name"], msg: "a".repeat(400), type: "string_too_long" },
+      { loc: ["body", "phone"], msg: "bad", type: "value_error" },
+      { loc: ["body", "contact_email"], msg: "bad", type: "value_error" },
+      { loc: ["body", "phone"], msg: "worse", type: "value_error" },
+    ];
+    const text = profileSaveErrorText(axiosLike(422, many), "Save failed");
+    expect(text).toHaveLength(VALIDATION_DETAIL_MAX_LENGTH);
+    expect(text.startsWith("Name: aaa")).toBe(true);
+    expect(text.endsWith("...")).toBe(true);
+
+    const four = many.map((e) => ({ ...e, msg: "bad" }));
+    expect(profileSaveErrorText(axiosLike(422, four), "Save failed")).toBe(
+      "Name: bad; Phone: bad; Contact email: bad (and 1 more)",
+    );
+  });
+});
 
 describe("profileSaveErrorText (issue #1252)", () => {
   it("shows a string detail as is", () => {

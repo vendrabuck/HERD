@@ -1507,18 +1507,17 @@ function TopologyEditorInner() {
         toast.success(`Restored v${restoreTarget.version_number}`);
       } catch (err) {
         const blocked = restoreBlockedDetail(err);
-        if (blocked) {
-          setBlockingReservations(
-            blocked.reservations
-              .filter((r) => typeof r.id === "string" && r.id)
-              .map((r) => ({
-                id: r.id as string,
-                status: typeof r.status === "string" ? r.status : "",
-                ...(typeof r.end_time === "string" ? { end_time: r.end_time } : {}),
-              })),
-          );
+        const rows = (blocked?.reservations ?? [])
+          .filter((r) => typeof r.id === "string" && r.id)
+          .map((r) => ({
+            id: r.id as string,
+            status: typeof r.status === "string" ? r.status : "",
+            ...(typeof r.end_time === "string" ? { end_time: r.end_time } : {}),
+          }));
+        if (rows.length > 0) {
+          setBlockingReservations(rows);
         } else {
-          toast.error("Restore failed");
+          toast.error(errorDetail(err, "Restore failed"));
         }
       }
     },

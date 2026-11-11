@@ -207,6 +207,22 @@ describe("DeviceConfigSection", () => {
     expect(await screen.findByText("config: bad")).toBeInTheDocument();
   });
 
+  it("shows fixed text, never the transport message, when a create fails without a string detail", async () => {
+    server.use(
+      http.get(VERSIONS_URL, () => HttpResponse.json({ items: [], total: 0, skip: 0, limit: 50 })),
+      http.post(VERSIONS_URL, () => HttpResponse.json({ error: "internal" }, { status: 500 })),
+    );
+    const user = userEvent.setup();
+    renderWithProviders(<DeviceConfigSection deviceId={DEVICE_ID} />);
+    await screen.findByText("No config versions yet.");
+    await user.click(screen.getByRole("button", { name: "New version" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    expect(
+      await screen.findByText("Could not save the config version. Try again."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/status code/)).not.toBeInTheDocument();
+  });
+
   describe("Apply dialog and Restore refusals (issue #1098)", () => {
     const VERSION_URL = `${VERSIONS_URL}/ver-1`;
     const GATE_MESSAGE =
