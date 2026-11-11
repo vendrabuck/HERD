@@ -533,55 +533,208 @@ async def _seed_superseded_cleanup_case(cleanup_switch: uuid.UUID) -> tuple:
         return res_c, c_row.id
 
 
+async def _allocation_of(reservation_id: uuid.UUID) -> VlanAssignment:
+    async with TestSessionLocal() as s:
+        return (
+            await s.execute(
+                select(VlanAssignment).where(VlanAssignment.reservation_id == reservation_id)
+            )
+        ).scalar_one()
+
+
+def _vlan_delete_upstream_records(caplog) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records if getattr(r, "action", None) == "vlan_delete_upstream_failed"
+    ]
+
+
+def _release_raising_for(superseded_alloc: uuid.UUID):
+    """A stand-in for _release_orphaned_allocations that raises TransientUpstreamError
+    (with UPSTREAM_TEXT) for the call releasing `superseded_alloc`, the retry's
+    post-loop release, and delegates every other call (each reservation's L2 apply
+    tail) to the real function."""
+    real = nats_consumer._release_orphaned_allocations
+
+    async def _release(vlan_assignment_ids, get_db_session, ctx):
+        if superseded_alloc in set(vlan_assignment_ids):
+            raise TransientUpstreamError(UPSTREAM_TEXT)
+        return await real(vlan_assignment_ids, get_db_session, ctx)
+
+    return _release
+
+
+def _backstop_records(caplog) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if getattr(r, "action", None) == SUPERSEDED_RELEASE_UPSTREAM_FAILED_ACTION
+    ]
+
+
 async def test_l2_superseded_allocation_release_failure_keeps_the_outcomes(caplog):
     """The reviewer's probe. A's two L2 release rows sit on a failing switch (the
     per-reservation catch), B's release row is healthy, and C's row is superseded, so
     its allocation is released after the per-reservation loop; that release's
-    delete_vlan switch read fails too. The skips are settled before the cleanup and the
-    cleanup's TransientUpstreamError is caught in tick mode, so the layer's outcomes,
-    skipped_upstream, and A's log line all survive, and the cleanup failure gets its own
-    line with the class name only."""
+    delete_vlan switch read fails too. Since #1209 the release catches that read for
+    C's allocation itself (released, its switch still listed, one
+    `vlan_delete_upstream_failed` line with the class name only), so nothing reaches
+    the tick's backstop and its line is not logged. The layer's outcomes,
+    skipped_upstream, and A's log line all survive as before."""
     res_a, res_b = uuid.uuid4(), uuid.uuid4()
     failing_switch, cleanup_switch = uuid.uuid4(), uuid.uuid4()
     a_ids = await _seed_release_rows("l2", res_a, [failing_switch] * 2, created_at=OLD)
     (b_id,) = await _seed_release_rows("l2", res_b, [GOOD_SWITCH], created_at=NEWER, vlan_id=1002)
-    _res_c, c_id = await _seed_superseded_cleanup_case(cleanup_switch)
+    res_c, c_id = await _seed_superseded_cleanup_case(cleanup_switch)
     before = await _snapshot("l2")
 
     caplog.set_level(logging.WARNING, logger="app.services.wiring_retry_service")
+    caplog.set_level(logging.WARNING, logger="app.services.nats_consumer")
     with _upstream("l2", {failing_switch, cleanup_switch}) as calls:
         stats = await run_wiring_retry_tick(_db_session_factory())
 
     after = await _snapshot("l2")
     assert after[b_id][0] == "RELEASED" and after[c_id][0] == "RELEASED"
     assert calls.count("remove_from_vlan") == 1, "only B's row reached the driver"
-    assert "delete_vlan" not in calls, "the cleanup stopped at its switch read"
+    assert "delete_vlan" not in calls, "C's delete stopped at its switch read"
     assert {i: after[i] for i in a_ids} == {i: before[i] for i in a_ids}
     assert stats["l2_rows_retried"] == 4
     assert (stats["released"], stats["superseded"], stats["still_failed"]) == (1, 1, 2)
     assert stats["skipped_upstream"] == 2
     assert len(_isolation_records(caplog)) == 1, "A's line is still logged"
-    (cleanup,) = [
-        r
-        for r in caplog.records
-        if getattr(r, "action", None) == SUPERSEDED_RELEASE_UPSTREAM_FAILED_ACTION
-    ]
+    alloc_c = await _allocation_of(res_c)
+    assert alloc_c.status == "RELEASED"
+    assert alloc_c.defined_switch_ids == [str(cleanup_switch)]
+    (record,) = _vlan_delete_upstream_records(caplog)
+    formatted = JSONFormatter("execution").format(record)
+    assert '"error_class": "TransientUpstreamError"' in formatted
+    assert "hunter2" not in formatted and "10.9.8.7" not in formatted
+    assert _backstop_records(caplog) == [], "the release no longer raises into the tick"
+
+
+async def test_l2_superseded_release_backstop_keeps_the_outcomes(caplog):
+    """The tick's backstop around the superseded rows' release (issue #1204 review)
+    still holds when a TransientUpstreamError does escape the release (forced here by
+    replacing the release, since no read inside it raises today): the outcomes and the
+    skip accounting stand, and one line carries the backstop action and the class name
+    only."""
+    res_a, res_b = uuid.uuid4(), uuid.uuid4()
+    failing_switch, cleanup_switch = uuid.uuid4(), uuid.uuid4()
+    await _seed_release_rows("l2", res_a, [failing_switch] * 2, created_at=OLD)
+    (b_id,) = await _seed_release_rows("l2", res_b, [GOOD_SWITCH], created_at=NEWER, vlan_id=1002)
+    res_c, c_id = await _seed_superseded_cleanup_case(cleanup_switch)
+    c_alloc = (await _allocation_of(res_c)).id
+
+    caplog.set_level(logging.WARNING, logger="app.services.wiring_retry_service")
+    with (
+        _upstream("l2", {failing_switch}),
+        patch.object(
+            nats_consumer,
+            "_release_orphaned_allocations",
+            new=_release_raising_for(c_alloc),
+        ),
+    ):
+        stats = await run_wiring_retry_tick(_db_session_factory())
+
+    after = await _snapshot("l2")
+    assert after[b_id][0] == "RELEASED" and after[c_id][0] == "RELEASED"
+    assert stats["l2_rows_retried"] == 4
+    assert (stats["released"], stats["superseded"], stats["still_failed"]) == (1, 1, 2)
+    assert stats["skipped_upstream"] == 2
+    assert len(_isolation_records(caplog)) == 1
+    (cleanup,) = _backstop_records(caplog)
     formatted = JSONFormatter("execution").format(cleanup)
     assert '"error_class": "TransientUpstreamError"' in formatted
     assert "hunter2" not in formatted and "10.9.8.7" not in formatted
 
 
-async def test_manual_retry_still_propagates_the_superseded_release_failure():
-    """On the manual channel the same cleanup failure still propagates (503,
-    WIRE-RETRY-12); the superseded row itself is already RELEASED."""
+async def test_manual_retry_superseded_release_switch_read_failure_reports_the_outcome(caplog):
+    """Since #1209 the manual channel no longer answers 503 for a failed delete_vlan
+    switch read in the superseded rows' release: the release catches it per allocation,
+    so the retry returns the row's `superseded` outcome, and the allocation is released
+    with its switch still listed and one `vlan_delete_upstream_failed` line."""
     cleanup_switch = uuid.uuid4()
     res_c, c_id = await _seed_superseded_cleanup_case(cleanup_switch)
 
-    with _upstream("l2", {cleanup_switch}):
+    caplog.set_level(logging.WARNING, logger="app.services.nats_consumer")
+    with _upstream("l2", {cleanup_switch}) as calls:
+        result = await reattempt_reservation(res_c, _db_session_factory())
+
+    assert [r["outcome"] for r in result["results"]] == ["superseded"]
+    assert (await _snapshot("l2"))[c_id][0] == "RELEASED"
+    assert "delete_vlan" not in calls
+    alloc_c = await _allocation_of(res_c)
+    assert (alloc_c.status, alloc_c.defined_switch_ids) == ("RELEASED", [str(cleanup_switch)])
+    assert len(_vlan_delete_upstream_records(caplog)) == 1
+
+
+async def test_manual_retry_still_propagates_the_superseded_release_failure():
+    """On the manual channel a TransientUpstreamError that escapes the superseded rows'
+    release (forced here by replacing the release, since no read inside it raises
+    since #1209) still propagates (503, WIRE-RETRY-12); the superseded row itself is
+    already RELEASED."""
+    cleanup_switch = uuid.uuid4()
+    res_c, c_id = await _seed_superseded_cleanup_case(cleanup_switch)
+
+    c_alloc = (await _allocation_of(res_c)).id
+    with (
+        _upstream("l2", set()),
+        patch.object(
+            nats_consumer,
+            "_release_orphaned_allocations",
+            new=_release_raising_for(c_alloc),
+        ),
+    ):
         with pytest.raises(TransientUpstreamError):
             await reattempt_reservation(res_c, _db_session_factory())
 
     assert (await _snapshot("l2"))[c_id][0] == "RELEASED"
+
+
+async def test_l2_apply_tail_delete_read_failure_is_not_a_reservation_skip(caplog):
+    """A delete read failure at the tail of ONE reservation's L2 apply inside the tick
+    (issue #1209 review). A's release row sits on a healthy member switch; A's
+    allocation is also defined on a transit switch whose inventory read fails, which
+    only the allocation-release tail of A's apply reads. B's row is healthy.
+
+    The release catches the read for A's allocation itself: A's row is driven and
+    RELEASED, A's allocation is released with only the transit switch still listed,
+    and one `vlan_delete_upstream_failed` line is logged. Nothing escapes A's apply, so
+    the tick's per-reservation catch never fires: no
+    `wiring_retry_reservation_upstream_failed` line, `skipped_upstream` 0, and both
+    rows count as released. Before #1209 the error escaped A's apply into that catch,
+    which logged A as an upstream skip (with 0 rows unchanged, since A's row was
+    already driven)."""
+    res_a, res_b = uuid.uuid4(), uuid.uuid4()
+    member_a, transit_a = uuid.uuid4(), uuid.uuid4()
+    (a_id,) = await _seed_release_rows("l2", res_a, [member_a], created_at=OLD)
+    (b_id,) = await _seed_release_rows("l2", res_b, [GOOD_SWITCH], created_at=NEWER, vlan_id=1002)
+    async with TestSessionLocal() as s:
+        await s.execute(
+            update(VlanAssignment)
+            .where(VlanAssignment.reservation_id == res_a)
+            .values(defined_switch_ids=[str(member_a), str(transit_a)])
+        )
+        await s.commit()
+
+    caplog.set_level(logging.WARNING, logger="app.services.wiring_retry_service")
+    caplog.set_level(logging.WARNING, logger="app.services.nats_consumer")
+    with _upstream("l2", {transit_a}) as calls:
+        stats = await run_wiring_retry_tick(_db_session_factory())
+
+    after = await _snapshot("l2")
+    assert after[a_id][0] == "RELEASED" and after[b_id][0] == "RELEASED"
+    assert calls.count("remove_from_vlan") == 2
+    alloc_a = await _allocation_of(res_a)
+    assert (alloc_a.status, alloc_a.defined_switch_ids) == ("RELEASED", [str(transit_a)])
+    assert stats["l2_rows_retried"] == 2
+    assert (stats["released"], stats["still_failed"], stats["skipped_upstream"]) == (2, 0, 0)
+    assert _isolation_records(caplog) == [], "A's apply did not raise, so A is not a skip"
+    (record,) = _vlan_delete_upstream_records(caplog)
+    formatted = JSONFormatter("execution").format(record)
+    assert f'"reservation_id": "{res_a}"' in formatted
+    assert f'"switch_ids": ["{transit_a}"]' in formatted
+    assert '"error_class": "TransientUpstreamError"' in formatted
+    assert "hunter2" not in formatted and "10.9.8.7" not in formatted
 
 
 # --- Controls: the catch is no wider than it says --------------------------
