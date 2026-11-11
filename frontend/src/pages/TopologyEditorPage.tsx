@@ -15,6 +15,7 @@ import {
   type OnConnect,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import { isAxiosError } from "axios";
 import toast from "react-hot-toast";
 
 import { useTopology, useUpdateTopology, useRestoreVersion, validateTopology } from "@/api/topologies";
@@ -185,7 +186,7 @@ function TopologyEditorInner() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { screenToFlowPosition } = useReactFlow();
-  const { data: topology, isLoading } = useTopology(id);
+  const { data: topology, isLoading, isError, error: topologyError } = useTopology(id);
   const updateTopology = useUpdateTopology();
 
   // Reservation-bound ("live edit") mode: entered via
@@ -663,6 +664,17 @@ function TopologyEditorInner() {
   // from a superseded or exited preview can never clobber the store after the
   // fact (issue #627).
   const previewRequestRef = useRef(0);
+  // Issue #1315: the canvas store is global, so a canvas is "ready" only once
+  // the load effect below has loaded it for THIS id and reservation (the key),
+  // and the write actions (Save, Reserve, Save as Template, Clear) are gated
+  // on it. Derived during render, so the first render after an id change is
+  // already not ready. The request token, like previewRequestRef, is bumped
+  // by every load and by the reset effect's cleanup (id change and unmount),
+  // so a late hydration for a previous id or a gone editor is dropped.
+  const canvasKey = `${id ?? ""}|${reservationId ?? ""}`;
+  const [canvasLoadedFor, setCanvasLoadedFor] = useState<string | null>(null);
+  const canvasReady = canvasLoadedFor === canvasKey;
+  const canvasLoadRequestRef = useRef(0);
   const restoreVersion = useRestoreVersion(id);
   const createTemplate = useCreateTemplateFromTopology();
 
@@ -677,10 +689,20 @@ function TopologyEditorInner() {
   // topology: the fork carries its own canvas (deep-copied from the parent at
   // creation, then diverging per save). forkLoaded gates the autosave so loading
   // the fork never counts as an edit.
+  //
+  // Issue #1315: the global store still holds whatever the previous editor
+  // instance or id loaded, so it is cleared on mount and on every id or
+  // reservation change, before any load (this effect is declared first, so it
+  // runs first). Every deferred store write below checks its request token.
+  useEffect(() => {
+    clearTopology();
+  }, [id, reservationId, clearTopology]);
   useEffect(() => {
     if (isLiveEdit) {
       if (fork && !initializedRef.current) {
         initializedRef.current = true;
+        const token = ++canvasLoadRequestRef.current;
+        const isCurrent = () => canvasLoadRequestRef.current === token;
         // Round-2 review G2 (issue #34): clear any stale L3 validation
         // result from whatever source this component was previously
         // rendering, BEFORE loading (or clearing to empty) the new source's
@@ -690,11 +712,19 @@ function TopologyEditorInner() {
         const persisted = fork.canvas_data;
         const applyLoad =
           persisted && persisted.nodes
-            ? hydrateAndLoadCanvas(persisted, loadCanvas)
-            : Promise.resolve().then(() => clearTopology());
+            ? hydrateAndLoadCanvas(persisted, (canvas) => {
+                if (isCurrent()) loadCanvas(canvas);
+              })
+            : Promise.resolve().then(() => {
+                if (isCurrent()) clearTopology();
+              });
         // Flip forkLoaded off the sync effect body (in a promise callback) so the
         // autosave baseline is seeded only once the loaded canvas is in the store.
-        applyLoad.finally(() => setForkLoaded(true));
+        applyLoad.finally(() => {
+          if (!isCurrent()) return;
+          setForkLoaded(true);
+          setCanvasLoadedFor(canvasKey);
+        });
       }
       return;
     }
@@ -702,13 +732,22 @@ function TopologyEditorInner() {
       initializedRef.current = true;
       setRouteProblems([]);
       setServerEdgeProblems(EMPTY_SERVER_EDGE_PROBLEMS);
+      const token = ++canvasLoadRequestRef.current;
       if (topology.canvas_data) {
-        void hydrateAndLoadCanvas(topology.canvas_data, loadCanvas);
+        void hydrateAndLoadCanvas(topology.canvas_data, (canvas) => {
+          if (canvasLoadRequestRef.current !== token) return;
+          loadCanvas(canvas);
+          setCanvasLoadedFor(canvasKey);
+        });
       } else {
         clearTopology();
+        // Off the sync effect body, as the live-edit branch does.
+        void Promise.resolve().then(() => {
+          if (canvasLoadRequestRef.current === token) setCanvasLoadedFor(canvasKey);
+        });
       }
     }
-  }, [isLiveEdit, fork, topology, loadCanvas, clearTopology]);
+  }, [isLiveEdit, fork, topology, loadCanvas, clearTopology, canvasKey]);
 
   // Debounced fork-draft autosave: PUTs the loose canvas a couple of seconds
   // after edits pause and flushes on unmount. Enabled only for an editable
@@ -730,6 +769,8 @@ function TopologyEditorInner() {
   useEffect(() => {
     return () => {
       initializedRef.current = false;
+      // Issue #1315: a hydration still in flight belongs to the old id.
+      canvasLoadRequestRef.current += 1;
       setForkLoaded(false);
     };
   }, [id, reservationId]);
@@ -1165,7 +1206,9 @@ function TopologyEditorInner() {
   }, [rejectProposalNodes]);
 
   const handleSave = async () => {
-    if (!id) return;
+    // Issue #1315: the disabled button is not the only guard; never PUT a
+    // canvas that was not loaded for this id.
+    if (!id || !canvasReady) return;
     const trimmed = description.trim();
     try {
       await updateTopology.mutateAsync({
@@ -1527,6 +1570,26 @@ function TopologyEditorInner() {
     );
   }
 
+  // Issue #1315: a failed topology fetch in plain mode renders no canvas and
+  // no write action, only the reason and the way back. Live edit is driven
+  // by the fork, so it keeps its own loading path.
+  if (!isLiveEdit && !topology && isError) {
+    const notFound = isAxiosError(topologyError) && topologyError.response?.status === 404;
+    return (
+      <div className="flex flex-col items-center justify-center gap-3 h-full">
+        <p role="alert" className="text-sm text-red-600">
+          {notFound ? "Topology not found" : "Could not load this topology"}
+        </p>
+        <button
+          onClick={() => navigate("/topology")}
+          className="text-sm text-blue-600 hover:text-blue-800 px-2 py-1 rounded hover:bg-blue-50"
+        >
+          Back to topologies
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full overflow-hidden">
       {/* Main canvas area (full width) */}
@@ -1599,12 +1662,17 @@ function TopologyEditorInner() {
                 onClick={() => {
                   // Review fix F5: a warning, never a block (the gate is the
                   // authority; the brief's rule).
+                  if (!canvasReady) return;
                   if (hasUnsavedRoutingChanges) {
                     toast("Unsaved routing changes are not checked until you save");
                   }
                   setShowReserveModal(true);
                 }}
-                disabled={(allDeviceIds.length === 0 && dynamicPrefill.length === 0) || hasInvalidEdges}
+                disabled={
+                  !canvasReady ||
+                  (allDeviceIds.length === 0 && dynamicPrefill.length === 0) ||
+                  hasInvalidEdges
+                }
                 title={
                   hasInvalidEdges
                     ? `Cannot reserve: ${invalidEdges.length} edge${invalidEdges.length !== 1 ? "s" : ""} have no physical path or use uncabled ports`
@@ -1629,7 +1697,7 @@ function TopologyEditorInner() {
             {!isLiveEdit && (
               <button
                 onClick={handleSave}
-                disabled={updateTopology.isPending || !!previewVersion}
+                disabled={!canvasReady || updateTopology.isPending || !!previewVersion}
                 className="text-sm text-green-600 hover:text-green-800 px-2 py-1 rounded hover:bg-green-50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {updateTopology.isPending ? "Saving..." : "Save"}
@@ -1644,7 +1712,7 @@ function TopologyEditorInner() {
             {!isLiveEdit && (
               <button
                 onClick={() => setShowSaveAsTemplate(true)}
-                disabled={!!previewVersion}
+                disabled={!canvasReady || !!previewVersion}
                 className="text-sm text-gray-700 hover:text-gray-900 px-2 py-1 rounded hover:bg-gray-100 disabled:opacity-50"
               >
                 Save as Template
@@ -1660,7 +1728,7 @@ function TopologyEditorInner() {
             )}
             <button
               onClick={() => setShowClearConfirm(true)}
-              disabled={!!previewVersion || isReadOnly}
+              disabled={!canvasReady || !!previewVersion || isReadOnly}
               className="text-sm text-red-600 hover:text-red-800 px-2 py-1 rounded hover:bg-red-50 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               Clear canvas

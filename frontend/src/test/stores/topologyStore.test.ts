@@ -1,4 +1,5 @@
 import { useTopologyStore } from "@/stores/topologyStore";
+import { useAuthStore } from "@/stores/authStore";
 import type { Node, Edge } from "@xyflow/react";
 import type {
   DeviceNodeData,
@@ -472,5 +473,38 @@ describe("topologyStore", () => {
       useTopologyStore.getState().setNodeL3Routes("missing", [route()]);
       expect(useTopologyStore.getState().nodes).toEqual(before);
     });
+  });
+});
+
+// Issue #1315: the canvas is cleared on the authenticated-to-signed-out edge
+// (authStore.clearAuth, reached by the logout button and by a failed token
+// refresh), and on nothing else the auth store does.
+describe("topologyStore clears on sign-out (issue #1315)", () => {
+  const seeded = () => useTopologyStore.getState().loadCanvas({ nodes: [makeNode("n1")], edges: [] });
+  const nodeIds = () => useTopologyStore.getState().nodes.map((n) => n.id);
+
+  it("clearAuth after a signed-in session empties the canvas", () => {
+    useAuthStore.getState().setTokens("a1", "r1");
+    seeded();
+    useAuthStore.getState().clearAuth();
+    expect(useTopologyStore.getState().nodes).toEqual([]);
+    expect(useTopologyStore.getState().edges).toEqual([]);
+  });
+
+  it("a token refresh (setTokens while signed in) keeps the canvas", () => {
+    useAuthStore.getState().setTokens("a1", "r1");
+    seeded();
+    useAuthStore.getState().setTokens("a2", "r2");
+    expect(nodeIds()).toEqual(["n1"]);
+    useAuthStore.getState().clearAuth();
+  });
+
+  it("setUser changes and a clearAuth while already signed out keep the canvas", () => {
+    useAuthStore.getState().clearAuth();
+    seeded();
+    useAuthStore.getState().setUser(null);
+    useAuthStore.getState().clearAuth();
+    expect(nodeIds()).toEqual(["n1"]);
+    useTopologyStore.getState().clearTopology();
   });
 });
