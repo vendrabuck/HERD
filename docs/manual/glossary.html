@@ -40,73 +40,73 @@
     <p class="dek">The vocabulary HERD uses, in plain words. When a screen throws a term at you and you nod along pretending to know it &mdash; this is where you quietly look it up.</p>
 
     <dl class="gloss">
-      <div><dt>DUT<span class="mono">Device Under Test</span></dt><dd>A device you reserve and run tests against &mdash; a firewall, a server, a traffic generator. In HERD terms these are <code>Management</code>-type devices, and they're the only things you drag onto the topology canvas.</dd></div>
+      <div id="dut"><dt>DUT<span class="mono">Device Under Test</span></dt><dd>A device you reserve and run tests against &mdash; a firewall, a server, a traffic generator. In HERD terms these are <code>Management</code>-type devices, and they're the only things you drag onto the topology canvas.</dd></div>
 
-      <div><dt>Device</dt><dd>One piece of equipment in HERD. Created from a template, lives in inventory, can be reserved and placed on a canvas. Has ports.</dd></div>
+      <div id="device"><dt>Device</dt><dd>One piece of equipment in HERD. Created from a template, lives in inventory, can be reserved and placed on a canvas. Has ports.</dd></div>
 
-      <div><dt>Port</dt><dd>A connection point on a device (e.g. <code>eth1/1</code>). Cables connect one port to another. A port with no cable can't carry a topology link.</dd></div>
+      <div id="port"><dt>Port</dt><dd>A connection point on a device (e.g. <code>eth1/1</code>). Cables connect one port to another. A port with no cable can't carry a topology link.</dd></div>
 
-      <div><dt>Template</dt><dd>A reusable schema that describes a class of device or port: which fields it has, their defaults, and (for devices) which driver runs it. You don't reserve a template &mdash; you reserve the devices made from it. <a href="admin-setup.html#templates">Creating templates &rarr;</a></dd></div>
+      <div id="template"><dt>Template</dt><dd>A reusable schema that describes a class of device or port: which fields it has, their defaults, and (for devices) which driver runs it. You don't reserve a template &mdash; you reserve the devices made from it. <a href="admin-setup.html#templates">Creating templates &rarr;</a></dd></div>
 
-      <div><dt>Driver</dt><dd>A Python package that teaches HERD how to log into and configure a real piece of hardware. Templates point at drivers; admins upload them. <a href="admin-setup.html#drivers">Uploading drivers &rarr;</a></dd></div>
+      <div id="driver"><dt>Driver</dt><dd>A Python package that teaches HERD how to log into and configure a real piece of hardware. Templates point at drivers; admins upload them. <a href="admin-setup.html#drivers">Uploading drivers &rarr;</a></dd></div>
 
-      <div><dt>Connection type</dt><dd>A label on a driver that classifies the device: <code>Management</code> (a DUT), or <code>Layer 1 / 2 / 3 Switch</code> (infrastructure). It decides how the device behaves and which driver methods get called.</dd></div>
+      <div id="connection-type"><dt>Connection type</dt><dd>A label on a driver that classifies the device: <code>Management</code> (a DUT), or <code>Layer 1 / 2 / 3 Switch</code> (infrastructure). It decides how the device behaves and which driver methods get called.</dd></div>
 
-      <div><dt>Topology</dt><dd>A saved diagram of devices and the connections between them. You build it on the canvas, then a reservation can use it. <a href="user-topology.html">Building a topology &rarr;</a></dd></div>
+      <div id="topology"><dt>Topology</dt><dd>A saved diagram of devices and the connections between them. You build it on the canvas, then a reservation can use it. <a href="user-topology.html">Building a topology &rarr;</a></dd></div>
 
-      <div><dt>Reservation</dt><dd>A time-boxed claim on one or more devices, optionally tied to a topology. Making one is how you say "this gear is mine for this window." <a href="user-reservations.html">Reserving &rarr;</a></dd></div>
+      <div id="reservation"><dt>Reservation</dt><dd>A time-boxed claim on one or more devices, optionally tied to a topology. Making one is how you say "this gear is mine for this window." <a href="user-reservations.html">Reserving &rarr;</a></dd></div>
 
-      <div><dt>Exclusive device</dt><dd>A device only one reservation can hold at a time (DUTs, individual instruments). Its status flips to <span class="badge reserved">RESERVED</span> while held. Booking it for an overlapping window fails with a conflict.</dd></div>
+      <div id="exclusive-device"><dt>Exclusive device</dt><dd>A device only one reservation can hold at a time (DUTs, individual instruments). Its status flips to <span class="badge reserved">RESERVED</span> while held. Booking it for an overlapping window fails with a conflict.</dd></div>
 
-      <div><dt>Non-exclusive / shared device</dt><dd>Infrastructure that many reservations use at once (shared switches, fabrics). Its status never changes on reserve or release &mdash; it's plumbing everyone shares.</dd></div>
+      <div id="non-exclusive-shared-device"><dt>Non-exclusive / shared device</dt><dd>Infrastructure that many reservations use at once (shared switches, fabrics). Its status never changes on reserve or release &mdash; it's plumbing everyone shares.</dd></div>
 
-      <div><dt>Fork</dt><dd>A reservation's private copy of its topology, created at activation, with its own version history. The fork history panel previews any version read-only, diffs two versions or a version against the draft, and restores a version to the draft for the next commit. Live edits land here, never on the master topology. <a href="user-live-editing.html#fork">Live editing &rarr;</a></dd></div>
+      <div id="fork"><dt>Fork</dt><dd>A reservation's private copy of its topology, created at activation, with its own version history. The fork history panel previews any version read-only, diffs two versions or a version against the draft, and restores a version to the draft for the next commit. Live edits land here, never on the master topology. <a href="user-live-editing.html#fork">Live editing &rarr;</a></dd></div>
 
-      <div><dt>L1 / L2 / L3</dt><dd>The network layer of a connection. <b>L1</b> = physical cabling (gray, dashed). <b>L2</b> = Ethernet / VLAN (blue, solid). <b>L3</b> = IP / routing (green, dashed). L2 and L3 are logical overlays that still need a real L1 path underneath.</dd></div>
+      <div id="l1-l2-l3"><dt>L1 / L2 / L3</dt><dd>The network layer of a connection. <b>L1</b> = physical cabling (gray, dashed). <b>L2</b> = Ethernet / VLAN (blue, solid). <b>L3</b> = IP / routing (green, dashed). L2 and L3 are logical overlays that still need a real L1 path underneath.</dd></div>
 
-      <div><dt>Routing intent</dt><dd>A Layer 3 Switch's per-switch route table (destination, next hop, interface, virtual router), edited in the topology editor's Routing panel and carried on the switch's canvas node. Checked when you save a topology, save a reservation's fork, or create a reservation; when present, the execution service applies it in precedence over the switch's stored config version. <a href="user-topology.html#connect">Routing intent &rarr;</a></dd></div>
+      <div id="routing-intent"><dt>Routing intent</dt><dd>A Layer 3 Switch's per-switch route table (destination, next hop, interface, virtual router), edited in the topology editor's Routing panel and carried on the switch's canvas node. Checked when you save a topology, save a reservation's fork, or create a reservation; when present, the execution service applies it in precedence over the switch's stored config version. <a href="user-topology.html#connect">Routing intent &rarr;</a></dd></div>
 
-      <div><dt>Pathfinding &amp; hops</dt><dd>HERD checks whether two devices can actually reach each other through the recorded cabling. A valid link shows <span class="badge available">"N hops"</span> (the number of switches in between); an impossible one shows <span class="badge failed">"no path"</span>.</dd></div>
+      <div id="pathfinding-hops"><dt>Pathfinding &amp; hops</dt><dd>HERD checks whether two devices can actually reach each other through the recorded cabling. A valid link shows <span class="badge available">"N hops"</span> (the number of switches in between); an impossible one shows <span class="badge failed">"no path"</span>.</dd></div>
 
-      <div><dt>Fabric</dt><dd>A connected cluster of L2 switches and the ports linking them. Used to keep VLAN ids unique <em>within</em> a fabric while letting isolated fabrics reuse the same ids.</dd></div>
+      <div id="fabric"><dt>Fabric</dt><dd>A connected cluster of L2 switches and the ports linking them. Used to keep VLAN ids unique <em>within</em> a fabric while letting isolated fabrics reuse the same ids.</dd></div>
 
-      <div><dt>Network element</dt><dd>A non-device canvas object that device ports attach to: a VLAN segment, a subnet, an external cloud, or a patch trunk. Saved with the topology, validated on fork save, never provisioned today. <a href="user-topology.html#elements">Network elements &rarr;</a></dd></div>
+      <div id="network-element"><dt>Network element</dt><dd>A non-device canvas object that device ports attach to: a VLAN segment, a subnet, an external cloud, or a patch trunk. Saved with the topology, validated on fork save, never provisioned today. <a href="user-topology.html#elements">Network elements &rarr;</a></dd></div>
 
-      <div><dt>Ghost / proposed node</dt><dd>A device the AI has <em>proposed</em> but you haven't committed yet &mdash; dashed border, semi-transparent, tagged <span class="badge" style="background:#faf5ff;color:var(--proposal)">PROPOSED</span>. Accept to make it real, reject to discard. <a href="user-ai.html#ghost">AI proposals &rarr;</a></dd></div>
+      <div id="ghost-proposed-node"><dt>Ghost / proposed node</dt><dd>A device the AI has <em>proposed</em> but you haven't committed yet &mdash; dashed border, semi-transparent, tagged <span class="badge" style="background:#faf5ff;color:var(--proposal)">PROPOSED</span>. Accept to make it real, reject to discard. <a href="user-ai.html#ghost">AI proposals &rarr;</a></dd></div>
 
-      <div><dt>Device group</dt><dd>A named collection of devices. Device groups control <strong>visibility</strong>: non-admin users only see devices in groups their user group has access to.</dd></div>
+      <div id="device-group"><dt>Device group</dt><dd>A named collection of devices. Device groups control <strong>visibility</strong>: non-admin users only see devices in groups their user group has access to.</dd></div>
 
-      <div><dt>User group</dt><dd>A named collection of people. You grant a user group access to a device group, and everyone in it can then see and reserve that gear. <a href="admin-setup.html#groups">Groups &rarr;</a></dd></div>
+      <div id="user-group"><dt>User group</dt><dd>A named collection of people. You grant a user group access to a device group, and everyone in it can then see and reserve that gear. <a href="admin-setup.html#groups">Groups &rarr;</a></dd></div>
 
-      <div><dt>No Pool / Not Grouped</dt><dd>The default landing groups. New <em>devices</em> auto-join <code>No Pool</code>; new <em>users</em> auto-join <code>Not Grouped</code> &mdash; so nothing is ever unassigned the moment it's created. You move them into real groups afterward.</dd></div>
+      <div id="no-pool-not-grouped"><dt>No Pool / Not Grouped</dt><dd>The default landing groups. New <em>devices</em> auto-join <code>No Pool</code>; new <em>users</em> auto-join <code>Not Grouped</code> &mdash; so nothing is ever unassigned the moment it's created. You move them into real groups afterward.</dd></div>
 
-      <div><dt>Role</dt><dd>What you're allowed to do. <span class="badge" style="background:var(--gray-100);color:var(--gray-600)">user</span> reserves gear; <span class="badge admin-only">admin</span> manages devices, templates, groups; <span class="badge" style="background:#faf5ff;color:var(--proposal)">superadmin</span> additionally promotes/demotes other people.</dd></div>
+      <div id="role"><dt>Role</dt><dd>What you're allowed to do. <span class="badge" style="background:var(--gray-100);color:var(--gray-600)">user</span> reserves gear; <span class="badge admin-only">admin</span> manages devices, templates, groups; <span class="badge" style="background:#faf5ff;color:var(--proposal)">superadmin</span> additionally promotes/demotes other people.</dd></div>
 
-      <div><dt>Provisioning</dt><dd>The automatic backend work that fires when a reservation goes <span class="badge active">ACTIVE</span> &mdash; flipping exclusive devices to reserved, wiring L1 ports, setting up L2 VLANs. You don't trigger it; it just happens.</dd></div>
+      <div id="provisioning"><dt>Provisioning</dt><dd>The automatic backend work that fires when a reservation goes <span class="badge active">ACTIVE</span> &mdash; flipping exclusive devices to reserved, wiring L1 ports, setting up L2 VLANs. You don't trigger it; it just happens.</dd></div>
 
-      <div><dt>AI assistant</dt><dd>A chat on each reservation's <b>AI Assistant</b> tab that answers questions about <em>that</em> reservation by reading live data with your permissions. Read-only by default. <a href="user-assistant.html">The assistant &rarr;</a></dd></div>
+      <div id="ai-assistant"><dt>AI assistant</dt><dd>A chat on each reservation's <b>AI Assistant</b> tab that answers questions about <em>that</em> reservation by reading live data with your permissions. Read-only by default. <a href="user-assistant.html">The assistant &rarr;</a></dd></div>
 
-      <div><dt>Config version</dt><dd>A numbered snapshot of a device's configuration, captured every time one is applied. You can view, diff two versions, or restore an older one. <a href="admin-health-config.html#config">Config versions &rarr;</a></dd></div>
+      <div id="config-version"><dt>Config version</dt><dd>A numbered snapshot of a device's configuration, captured every time one is applied. You can view, diff two versions, or restore an older one. <a href="admin-health-config.html#config">Config versions &rarr;</a></dd></div>
 
-      <div><dt>Dry run</dt><dd>A simulated config apply: the driver records the exact commands it <em>would</em> send without touching the device, so you can review them before promoting to a real apply. The driver has to support it. <a href="admin-health-config.html#schedule">Scheduled apply &rarr;</a></dd></div>
+      <div id="dry-run"><dt>Dry run</dt><dd>A simulated config apply: the driver records the exact commands it <em>would</em> send without touching the device, so you can review them before promoting to a real apply. The driver has to support it. <a href="admin-health-config.html#schedule">Scheduled apply &rarr;</a></dd></div>
 
-      <div><dt>Device health</dt><dd>The result of HERD polling a device on a schedule &mdash; a badge of <span class="badge" style="background:var(--status-available-bg);color:var(--status-available-fg)">HEALTHY</span>, <span class="badge" style="background:var(--res-provision-bg);color:var(--res-provision-fg)">DEGRADED</span>, <span class="badge" style="background:var(--status-maintenance-bg);color:var(--status-maintenance-fg)">UNREACHABLE</span>, or <span class="badge" style="background:var(--status-offline-bg);color:var(--status-offline-fg)">UNKNOWN</span>. Opt in per device or template. <a href="admin-health-config.html#health">Health monitoring &rarr;</a></dd></div>
+      <div id="device-health"><dt>Device health</dt><dd>The result of HERD polling a device on a schedule &mdash; a badge of <span class="badge" style="background:var(--status-available-bg);color:var(--status-available-fg)">HEALTHY</span>, <span class="badge" style="background:var(--res-provision-bg);color:var(--res-provision-fg)">DEGRADED</span>, <span class="badge" style="background:var(--status-maintenance-bg);color:var(--status-maintenance-fg)">UNREACHABLE</span>, or <span class="badge" style="background:var(--status-offline-bg);color:var(--status-offline-fg)">UNKNOWN</span>. Opt in per device or template. <a href="admin-health-config.html#health">Health monitoring &rarr;</a></dd></div>
 
-      <div><dt>Notification channel</dt><dd>Where a notification is delivered: the always-on in-app <b>bell</b>, plus opt-in <b>email</b>, <b>chat</b> (Slack-style), and <b>webhook</b>. Outbound channels are off until you turn them on. <a href="user-notifications.html#channels">Channels &rarr;</a></dd></div>
+      <div id="notification-channel"><dt>Notification channel</dt><dd>Where a notification is delivered: the always-on in-app <b>bell</b>, plus opt-in <b>email</b>, <b>chat</b> (Slack-style), and <b>webhook</b>. Outbound channels are off until you turn them on. <a href="user-notifications.html#channels">Channels &rarr;</a></dd></div>
 
-      <div><dt>Reusable topology template</dt><dd>A topology promoted to a named, ready-to-clone starting point for everyone &mdash; the canonical "standard rig." <b>Cloning</b> copies any topology as a fresh editable diagram. <a href="user-topology.html#reuse">Cloning &amp; templates &rarr;</a></dd></div>
+      <div id="reusable-topology-template"><dt>Reusable topology template</dt><dd>A topology promoted to a named, ready-to-clone starting point for everyone &mdash; the canonical "standard rig." <b>Cloning</b> copies any topology as a fresh editable diagram. <a href="user-topology.html#reuse">Cloning &amp; templates &rarr;</a></dd></div>
 
-      <div><dt>LDAP / Active Directory</dt><dd>An optional sign-in method where people use their company directory credentials and HERD provisions their account on first login. A deployment setting; the superadmin always stays local.</dd></div>
+      <div id="ldap-active-directory"><dt>LDAP / Active Directory</dt><dd>An optional sign-in method where people use their company directory credentials and HERD provisions their account on first login. A deployment setting; the superadmin always stays local.</dd></div>
 
-      <div><dt>Directory group sync</dt><dd>The LDAP-to-HERD group mapping reconcile: mapped directory groups drive HERD group membership on an interval or on demand, with an optional sweep that deactivates users the directory no longer lists. <a href="admin-ldap-sync.html">LDAP sync &rarr;</a></dd></div>
+      <div id="directory-group-sync"><dt>Directory group sync</dt><dd>The LDAP-to-HERD group mapping reconcile: mapped directory groups drive HERD group membership on an interval or on demand, with an optional sweep that deactivates users the directory no longer lists. <a href="admin-ldap-sync.html">LDAP sync &rarr;</a></dd></div>
 
       <div id="ai-suggested-purpose"><dt>AI-suggested purpose</dt><dd>A lab purpose category the AI orchestrator proposes at reservation creation or at reservation end, with a confidence distribution. It never writes itself into the reservation: it waits on the admin-only Purpose Review page until accepted, overridden, or dismissed. Reports in its own bucket, separate from confirmed categories, until then. <a href="admin-purpose-review.html">Purpose review &rarr;</a></dd></div>
 
-      <div><dt>Purpose category</dt><dd>The confirmed lab purpose on a reservation, from a closed taxonomy your deployment configures. Set by the owner or an admin, or accepted from an <a href="#ai-suggested-purpose">AI-suggested purpose</a>. In reporting, every device in the reservation inherits it, transit gear included. <a href="admin-reporting.html#tables">Purpose reporting &rarr;</a></dd></div>
+      <div id="purpose-category"><dt>Purpose category</dt><dd>The confirmed lab purpose on a reservation, from a closed taxonomy your deployment configures. Set by the owner or an admin, or accepted from an <a href="#ai-suggested-purpose">AI-suggested purpose</a>. In reporting, every device in the reservation inherits it, transit gear included. <a href="admin-reporting.html#tables">Purpose reporting &rarr;</a></dd></div>
 
-      <div><dt>Transit gear</dt><dd>A switch or router a reservation's wiring passes through without being reserved. The by-device report counts it under the reservation's purpose, in its own transit columns; a suggested-but-unconfirmed category reports separately (see <a href="#ai-suggested-purpose">AI-suggested purpose</a>). <a href="admin-reporting.html#tables">Purpose reporting &rarr;</a></dd></div>
+      <div id="transit-gear"><dt>Transit gear</dt><dd>A switch or router a reservation's wiring passes through without being reserved. The by-device report counts it under the reservation's purpose, in its own transit columns; a suggested-but-unconfirmed category reports separately (see <a href="#ai-suggested-purpose">AI-suggested purpose</a>). <a href="admin-reporting.html#tables">Purpose reporting &rarr;</a></dd></div>
 
-      <div><dt>Release / version<span class="mono">v0.7.0</span></dt><dd>The tagged version of HERD your deployment runs. This manual documents <b>0.7.0</b>; when a screen does not match a page here, check the version first. The version shows beside the HERD wordmark in the header and on the sign-in screen. <a href="release-0-7-0.html">Release 0.7.0 &rarr;</a></dd></div>
+      <div id="release-version"><dt>Release / version<span class="mono">v0.7.0</span></dt><dd>The tagged version of HERD your deployment runs. This manual documents <b>0.7.0</b>; when a screen does not match a page here, check the version first. The version shows beside the HERD wordmark in the header and on the sign-in screen. <a href="release-0-7-0.html">Release 0.7.0 &rarr;</a></dd></div>
     </dl>
 
     <div class="callout tip" style="margin-top:32px;">
@@ -125,6 +125,7 @@
 </div>
 
 <button id="totop" aria-label="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m18 15-6-6-6 6"/></svg></button>
+<script src="assets/search-index.js"></script>
 <script src="assets/manual.js"></script>
 </body>
 </html>
