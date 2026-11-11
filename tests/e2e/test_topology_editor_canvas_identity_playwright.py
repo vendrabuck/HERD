@@ -23,6 +23,7 @@ skips; the seeded pass must not.
 import re
 import uuid
 
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import expect
 
 from .conftest import (
@@ -90,7 +91,18 @@ def test_opening_b_after_a_never_saves_a_canvas_into_b(pw_page):
         save = pw_page.get_by_role("button", name="Save", exact=True)
         expect(save).to_be_enabled(timeout=WAIT_MS)
 
-        pw_page.route(BATCH_ROUTE, lambda route: held.append(route))
+        # The handler holds B's device batch call until the test releases it.
+        # Held routes are continued while the handler is still installed:
+        # removing the handler first leaves them already handled.
+        releasing = {"now": False}
+
+        def _hold_or_pass(route):
+            if releasing["now"]:
+                route.continue_()
+            else:
+                held.append(route)
+
+        pw_page.route(BATCH_ROUTE, _hold_or_pass)
         with pw_page.expect_request(BATCH_ROUTE, timeout=WAIT_MS):
             _navigate_in_app(pw_page, f"/topology/{topo_b}")
         expect(pw_page.get_by_text(f"{prefix}-b", exact=True)).to_be_visible(timeout=WAIT_MS)
@@ -99,10 +111,9 @@ def test_opening_b_after_a_never_saves_a_canvas_into_b(pw_page):
         expect(save).to_be_disabled()
         expect(pw_page.locator('[data-id="n-a"]')).to_have_count(0)
 
-        pw_page.unroute(BATCH_ROUTE)
-        for route in held:
-            route.continue_()
-        held.clear()
+        releasing["now"] = True
+        while held:
+            held.pop().continue_()
         expect(pw_page.locator('[data-id="n-b"]')).to_be_visible(timeout=WAIT_MS)
         expect(pw_page.locator('[data-id="n-a"]')).to_have_count(0)
         expect(save).to_be_enabled(timeout=WAIT_MS)
@@ -118,8 +129,12 @@ def test_opening_b_after_a_never_saves_a_canvas_into_b(pw_page):
         assert _node_ids(pw_page, topo_b) == ["n-b"]
         assert _node_ids(pw_page, topo_a) == ["n-a"]
     finally:
-        for route in held:
-            route.continue_()
+        while held:
+            try:
+                held.pop().continue_()
+            except PlaywrightError:
+                # The page or the route is already gone; cleanup goes on.
+                pass
         for topology_id in created:
             resp = pw_api(
                 pw_page, "DELETE", f"/cabling/topologies/{topology_id}", allow_errors=True
