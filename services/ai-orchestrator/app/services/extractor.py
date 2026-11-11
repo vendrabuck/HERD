@@ -29,6 +29,8 @@ deep to parse or print is returned as its raw text.
 
 import asyncio
 import codecs
+import contextvars
+import functools
 import gzip
 import io
 import json
@@ -50,7 +52,13 @@ from herd_common.bounded_tar import (
 from app.config import settings
 from app.schemas.generate import ExtractedFile
 from app.services import _pdf_child
-from app.services.capped_child import Outcome, ReaderBusy, acquire_slot, run_capped_child
+from app.services.capped_child import (
+    Outcome,
+    ReaderBusy,
+    acquire,
+    acquire_slot,
+    run_capped_child,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,12 +152,31 @@ PDF_NOFILE = 32
 # PDF children running at once, service-wide, and how long a read waits for a slot.
 MAX_CONCURRENT_PDF_READS = 2
 PDF_SLOT_WAIT_SECONDS = 30
+# Reads that may wait for a PDF slot at once; one more is refused at once. A waiting
+# request holds its uploads (up to 25 MiB) in memory, so the line is bounded too.
+MAX_PDF_READ_WAITERS = 8
+# The reads of every other type run in this process, in a worker thread, so their
+# memory is not under a kernel limit: they get a pool of their own with the same
+# shape. A 5 MiB JSON array of small arrays grew the process by 159 MiB, measured.
+MAX_CONCURRENT_FILE_READS = 2
+FILE_SLOT_WAIT_SECONDS = 30
+MAX_FILE_READ_WAITERS = 8
+# Charged against the caller's daily AI token quota (when one is set) for a PDF read
+# that ends at a resource limit (memory, the kernel's kill, CPU, or the deadline), so
+# a user cannot hold the readers with hostile files for free: 20,000 tokens is the
+# chars/4 estimate of the full default character budget (80,000 characters), what
+# the largest honest upload could put in front of the model.
+PDF_REFUSAL_CHARGE_TOKENS = 20_000
 
 PDF_MEMORY_DETAIL = (
     "The PDF needs more memory to read than the reader allows; nothing was extracted"
 )
+PDF_KILLED_DETAIL = (
+    "The PDF reader was ended by the kernel (memory or hard CPU limit); nothing was extracted"
+)
 PDF_READER_FAILED_DETAIL = "The PDF reader failed; nothing was extracted"
 PDF_READER_BUSY_DETAIL = "The PDF reader is busy; try again shortly"
+FILE_READER_BUSY_DETAIL = "The file reader is busy; try again shortly"
 PDF_UNAVAILABLE_DETAIL = "PDF extraction not available: pdfplumber is not installed"
 
 _PDF_CHILD_PATH = os.path.abspath(_pdf_child.__file__)
@@ -197,6 +224,12 @@ _LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 
 class ExtractionError(Exception):
     """Raised for invalid, oversized, or unparsable files."""
+
+
+class PdfLimitRefusal(ExtractionError):
+    """A PDF read that ended at a resource limit: memory, the kernel's kill, CPU, or
+    the deadline. Still the 400 with its fixed detail; the route also charges
+    PDF_REFUSAL_CHARGE_TOKENS against the caller's quota."""
 
 
 class ExtractionBusy(Exception):
@@ -384,15 +417,22 @@ def _safe_member_name(name: str) -> str:
     return _LONE_SURROGATE.sub("\ufffd", name)
 
 
-async def _extract_pdf(data: bytes, budget: int) -> str:
+async def _extract_pdf(data: bytes, budget: int, owner: object | None = None) -> str:
     """The PDF's text, read in a capped child, at most ``budget + 1`` characters.
 
     The child returns the text the reader before issue #1202 returned, cut one
     character past the budget, so ``extract_files`` sets the truncated flag exactly as
     before. Every other ending is a fixed refusal, logged by its outcome word only.
+    ``owner`` (the caller's user id) may hold or wait for one PDF slot at a time.
     """
     try:
-        async with acquire_slot(MAX_CONCURRENT_PDF_READS, PDF_SLOT_WAIT_SECONDS):
+        async with acquire_slot(
+            "pdf",
+            MAX_CONCURRENT_PDF_READS,
+            PDF_SLOT_WAIT_SECONDS,
+            MAX_PDF_READ_WAITERS,
+            owner=owner,
+        ):
             result = await run_capped_child(
                 _PDF_CHILD_PATH,
                 [str(budget), str(PDF_ADDRESS_SPACE_BYTES), str(PDF_CPU_SECONDS), str(PDF_NOFILE)],
@@ -419,14 +459,48 @@ async def _extract_pdf(data: bytes, budget: int) -> str:
         # Issue #1036: the parser's own text stays out of the 400 detail.
         raise ExtractionError(f"Failed to parse PDF ({result.class_name})")
     if outcome is Outcome.MEMORY:
-        raise ExtractionError(PDF_MEMORY_DETAIL)
+        raise PdfLimitRefusal(PDF_MEMORY_DETAIL)
+    if outcome is Outcome.KILLED:
+        raise PdfLimitRefusal(PDF_KILLED_DETAIL)
     if outcome is Outcome.CPU:
-        raise ExtractionError(pdf_cpu_detail())
+        raise PdfLimitRefusal(pdf_cpu_detail())
     if outcome is Outcome.DEADLINE:
-        raise ExtractionError(pdf_deadline_detail())
+        raise PdfLimitRefusal(pdf_deadline_detail())
     if outcome is Outcome.UNAVAILABLE:
         raise ExtractionError(PDF_UNAVAILABLE_DETAIL)
     raise ExtractionUnavailable(PDF_READER_FAILED_DETAIL)
+
+
+async def _extract_in_thread(raw: "_Raw", budget: int) -> str:
+    """``_extract_one`` in a worker thread, holding a slot of the in-process pool until
+    the thread itself ends. A cancelled request does not stop a thread, so the slot is
+    given back by the thread's own completion, never by the cancellation: at most
+    MAX_CONCURRENT_FILE_READS such reads run at once, whatever is cancelled."""
+    try:
+        release = await acquire(
+            "file", MAX_CONCURRENT_FILE_READS, FILE_SLOT_WAIT_SECONDS, MAX_FILE_READ_WAITERS
+        )
+    except ReaderBusy as e:
+        logger.warning("file read refused", extra={"outcome": "busy"})
+        raise ExtractionBusy(FILE_READER_BUSY_DETAIL) from e
+    loop = asyncio.get_running_loop()
+    context = contextvars.copy_context()
+    try:
+        future = loop.run_in_executor(
+            None, functools.partial(context.run, _extract_one, raw, budget)
+        )
+    except BaseException:
+        release()
+        raise
+
+    def finished(done: asyncio.Future) -> None:
+        release()
+        # Retrieved here, so a read whose caller was cancelled logs nothing.
+        if not done.cancelled():
+            done.exception()
+
+    future.add_done_callback(finished)
+    return await asyncio.shield(future)
 
 
 def _extract_json(data: bytes, budget: int) -> str:
@@ -565,13 +639,16 @@ def _extract_one(raw: _Raw, remaining_budget: int) -> str:
     return _decode_text(raw.data)
 
 
-async def extract_files(uploads: list[tuple[str, bytes]]) -> list[ExtractedFile]:
+async def extract_files(
+    uploads: list[tuple[str, bytes]], owner: object | None = None
+) -> list[ExtractedFile]:
     """Extract text from each already-fully-read upload.
 
-    A PDF is read in a capped child process (``_extract_pdf``); every other type is
-    extracted in a worker thread (issue #1195): walking a tgz up to its ceilings is
-    synchronous work of up to seconds, which on the event loop would stall every other
-    request to the service, ``/health`` included.
+    A PDF is read in a capped child process (``_extract_pdf``), at most one at a time
+    per ``owner``; every other type is extracted in a worker thread (issue #1195),
+    under the in-process pool (``_extract_in_thread``): walking a tgz up to its
+    ceilings is synchronous work of up to seconds, which on the event loop would stall
+    every other request to the service, ``/health`` included.
 
     Re-checks the file-count and per-file size caps here as defense in
     depth. The caller is expected to have already enforced both, incrementally,
@@ -600,11 +677,9 @@ async def extract_files(uploads: list[tuple[str, bytes]]) -> list[ExtractedFile]
             continue
 
         if _extension(filename) == ".pdf":
-            text = await _extract_pdf(data, remaining)
+            text = await _extract_pdf(data, remaining, owner)
         else:
-            text = await asyncio.to_thread(
-                _extract_one, _Raw(filename=filename, data=data), remaining
-            )
+            text = await _extract_in_thread(_Raw(filename=filename, data=data), remaining)
         truncated = False
         if len(text) > remaining:
             text = text[:remaining]

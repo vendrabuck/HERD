@@ -69,7 +69,7 @@ to `reservations.md`.
 | Method | Path | Who may call | Success | Rules |
 |---|---|---|---|---|
 | GET | `/status` | anyone, no token | 200 | AI-PROV-5, AI-PROV-6, AI-PROV-7, AI-PROV-8 |
-| POST | `/generate` | any signed-in user | 200 | AI-PROV-2, AI-GEN-1 to AI-GEN-16, AI-UPLOAD-1 to AI-UPLOAD-24, AI-RESOLVE-1 to AI-RESOLVE-15, AI-QUOTA-2 |
+| POST | `/generate` | any signed-in user | 200 | AI-PROV-2, AI-GEN-1 to AI-GEN-16, AI-UPLOAD-1 to AI-UPLOAD-25, AI-RESOLVE-1 to AI-RESOLVE-15, AI-QUOTA-2 |
 | POST | `/commit` | any signed-in user; upstream services apply their own rules to the caller's JWT | 200 | AI-COMMIT-1 to AI-COMMIT-19 |
 | POST | `/reservations/{id}/assistant` | the reservation's owner (first turn); the conversation's creator on the same reservation (later turns) | 200 | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-TURN-1 to AI-TURN-9, AI-TOOL-1 to AI-TOOL-11, AI-WRITE-1 to AI-WRITE-3 |
 | POST | `/reservations/{id}/assistant/stream` | as above | 200 (`text/event-stream`) | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-STREAM-1 to AI-STREAM-7, AI-TOOL-1 to AI-TOOL-11, AI-WRITE-1 to AI-WRITE-3 |
@@ -548,32 +548,54 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   | Outcome | How it is told | Answer |
   |---|---|---|
   | read | status `ok`, exit 0 | the text, cut to the budget with the `truncated` flag (AI-UPLOAD-6, AI-UPLOAD-23) |
-  | memory limit | status `memory` (a MemoryError, alone or wrapped by pdfplumber), exit 3; or SIGKILL the service did not send, SIGSEGV, SIGABRT, or SIGBUS | 400 `The PDF needs more memory to read than the reader allows; nothing was extracted` |
+  | memory limit | status `memory` (a MemoryError, alone or wrapped by pdfplumber), exit 3 | 400 `The PDF needs more memory to read than the reader allows; nothing was extracted` |
+  | ended by the kernel | SIGKILL the service did not send, SIGSEGV, SIGABRT, or SIGBUS | 400 `The PDF reader was ended by the kernel (memory or hard CPU limit); nothing was extracted` |
   | CPU limit | SIGXCPU | 400 `The PDF needs more than 20 seconds of processing to read; nothing was extracted` |
   | wall-clock deadline | the service's kill at `PDF_WALL_SECONDS` | 400 `The PDF took longer than 30 seconds to read; nothing was extracted` |
   | parse failure | status `parse-error <ClassName>`, exit 2 | 400 `Failed to parse PDF (<ClassName>)` |
   | pdfplumber missing | status `unavailable`, exit 5 | 400 `PDF extraction not available: pdfplumber is not installed` |
   | reader failure | the child could not start, could not apply its limits (status `limits-failed`, exit 4), wrote past an output cap, or ended any other way (no status, a malformed one, one that disagrees with the exit code, another signal) | 500 `The PDF reader failed; nothing was extracted` |
 
-  A SIGKILL the service did not send is read as memory: the child does not catch SIGXCPU,
-  so the CPU soft limit ends it first, and the other sender is the out-of-memory killer
-  (AI-UPLOAD-22). \
+  The "ended by the kernel" outcome does not tell memory from CPU: a SIGKILL the service
+  did not send comes from the RLIMIT_CPU hard limit or the out-of-memory killer
+  (AI-UPLOAD-22), and SIGSEGV, SIGABRT, and SIGBUS are how C code can end when an
+  allocation fails under RLIMIT_AS. The child does not catch SIGXCPU, so the CPU soft
+  limit normally ends it first with the CPU answer. \
   Enforced in: `services/ai-orchestrator/app/services/capped_child.py` (`classify`, `Outcome`); `services/ai-orchestrator/app/services/_pdf_child.py` (`_finish`, `caused_by_memory`, `EXIT_CODES`); `services/ai-orchestrator/app/services/extractor.py` (`_extract_pdf`); `services/ai-orchestrator/app/routes/generate.py` (`_read_uploads`) \
   Pinned by: `services/ai-orchestrator/tests/test_extractor_pdf.py` (`test_the_status_is_read_strictly`, `test_a_child_that_exits_zero_with_a_malformed_status_is_a_reader_failure`, `test_a_child_that_cannot_start_is_a_reader_failure`, `test_a_child_without_pdfplumber_answers_the_unavailable_400`, `test_a_refusal_logs_its_outcome_word_and_no_file_text`, `test_caused_by_memory_follows_the_chain`); `services/ai-orchestrator/tests/test_generate.py` (`test_generate_hostile_pdf_answers_400_with_the_fixed_reason`, `test_read_uploads_maps_the_pdf_reader_outcomes`)
-- **AI-UPLOAD-22.** At most `MAX_CONCURRENT_PDF_READS` (2) PDF children run at once in a
-  service process; a read waits at most `PDF_SLOT_WAIT_SECONDS` (30) for a slot and then
-  the request answers 503 `The PDF reader is busy; try again shortly`, the status the
-  route gives every other dependency it cannot use for now (429 is the per-user quota).
-  The service runs one uvicorn process, so this is the service-wide cap. Compose gives
-  ai-orchestrator `mem_limit: 1536m` and `restart: unless-stopped`: two children of at
-  most 512 MiB of address space each are 1024 MiB, leaving 512 MiB for the service itself
-  (117 MiB resident after import, measured), its buffered uploads (at most 25 MiB a
-  request), and the extraction it does in process (the tgz walk, bounded by AI-UPLOAD-17,
-  and the JSON parse). If the container still reaches the limit, the kernel kills a
-  process in it: a child, which answers the memory 400, or the service, which compose
+- **AI-UPLOAD-22.** Every extraction runs under a concurrency cap, in one of two pools of
+  the same shape, each service-wide (the service runs one uvicorn process). The `pdf`
+  pool runs at most `MAX_CONCURRENT_PDF_READS` (2) children; the `file` pool runs at most
+  `MAX_CONCURRENT_FILE_READS` (2) reads of every other type, in worker threads of the
+  service process. A read waits at most `PDF_SLOT_WAIT_SECONDS` or
+  `FILE_SLOT_WAIT_SECONDS` (30) for a slot; when no slot is free and
+  `MAX_PDF_READ_WAITERS` or `MAX_FILE_READ_WAITERS` (8) reads already wait, it does not
+  wait at all. Either way the request answers 503 `The PDF reader is busy; try again
+  shortly` or `The file reader is busy; try again shortly`, the status the route gives
+  every other dependency it cannot use for now (429 is the per-user quota). One user may
+  hold or wait for one PDF slot at a time: a second PDF read by the same user while the
+  first is in flight is refused at once with the PDF busy answer. A slot, a place in
+  line, and a user's mark are given back on every way out, cancellation included; an
+  in-process read gives its slot back only when its thread ends, so a cancelled request
+  does not let a third thread start beside two still running.
+
+  What is bounded how: a PDF child's memory and CPU are enforced by the kernel
+  (AI-UPLOAD-19). An in-process read is bounded only by the upload cap and this
+  concurrency cap, not by a kernel limit: the JSON parse holds up to about 32 times its
+  upload (159 MiB, measured, for a 5 MiB array of empty nested arrays; 128 MiB for one of
+  empty objects), and the tgz walk the constants of AI-UPLOAD-17 (its hostile-shape tests
+  hold its growth under 16 MiB). Compose gives ai-orchestrator `mem_limit: 2048m` and
+  `restart: unless-stopped`. The arithmetic: two PDF children of at most 512 MiB of address
+  space (1024 MiB); two in-process reads of at most 192 MiB each, the measured worst case
+  rounded up (384 MiB); the uploads of every request that holds or waits for a slot, 2 + 8
+  in each pool, at most 25 MiB each (500 MiB); and the service itself, 117 MiB resident
+  after import, measured (128 MiB): 2036 MiB. Not counted: requests still reading their
+  bodies, which hold up to 25 MiB each and whose number nothing caps; the memory limit is
+  the backstop for them. If the container reaches the limit, the kernel kills a process in
+  it: a child, which answers the "ended by the kernel" 400, or the service, which compose
   restarts. No test exercises the memory limit or the restart policy. \
-  Enforced in: `services/ai-orchestrator/app/services/capped_child.py` (`acquire_slot`, `ReaderBusy`); `services/ai-orchestrator/app/services/extractor.py` (`_extract_pdf`, `MAX_CONCURRENT_PDF_READS`, `PDF_SLOT_WAIT_SECONDS`); `services/ai-orchestrator/app/routes/generate.py` (`_read_uploads`); `docker-compose.yml` (`mem_limit`, `restart`) \
-  Pinned by: `services/ai-orchestrator/tests/test_extractor_pdf.py` (`test_at_most_the_cap_of_children_run_at_once`); `services/ai-orchestrator/tests/test_generate.py` (`test_read_uploads_maps_the_pdf_reader_outcomes`)
+  Enforced in: `services/ai-orchestrator/app/services/capped_child.py` (`acquire`, `acquire_slot`, `pool_state`, `ReaderBusy`); `services/ai-orchestrator/app/services/extractor.py` (`_extract_pdf`, `_extract_in_thread`, `MAX_CONCURRENT_PDF_READS`, `PDF_SLOT_WAIT_SECONDS`, `MAX_PDF_READ_WAITERS`, `MAX_CONCURRENT_FILE_READS`, `FILE_SLOT_WAIT_SECONDS`, `MAX_FILE_READ_WAITERS`); `services/ai-orchestrator/app/routes/generate.py` (`_read_uploads`, `generate`); `docker-compose.yml` (`mem_limit`, `restart`) \
+  Pinned by: `services/ai-orchestrator/tests/test_extractor_pdf.py` (`test_at_most_the_cap_of_children_run_at_once`, `test_one_pdf_read_at_a_time_per_user`, `test_every_way_out_of_a_pdf_read_gives_back_its_slot_and_its_user`, `test_a_cancelled_wait_for_a_slot_gives_back_its_place_and_its_user`, `test_in_process_reads_are_capped_and_a_cancelled_one_holds_its_slot`, `test_a_full_waiting_line_is_refused_at_once`, `test_a_second_cancellation_during_cleanup_still_reaps_the_child`, `test_cancellation_at_any_stage_logs_no_unretrieved_exception`); `services/ai-orchestrator/tests/test_generate.py` (`test_read_uploads_maps_the_pdf_reader_outcomes`)
 - **AI-UPLOAD-23.** An honest PDF reads as it did before issue #1202: the text and the
   `truncated` flag equal what pdfplumber's walk of every page, joined by a blank line and
   cut to the same budget, gives. The child stops the walk at the first page that takes the
@@ -587,10 +609,24 @@ route `POST /generate` (multipart form, response `GenerateResponse` in
   character budget (issue #1202: indentation grows with depth, so a 91.8 KB upload printed
   to 82.8 million characters). A document nested too deep to parse or to print
   (RecursionError) is passed raw like one that is not JSON, never a 500. The parse itself
-  runs in the service process, in a worker thread: its memory is bounded by the upload cap
-  times what Python makes of the parsed values, not by a kernel limit. \
+  runs in the service process, in a worker thread of the `file` pool (AI-UPLOAD-22): its
+  memory is bounded by the upload cap times what Python makes of the parsed values (up to
+  about 32 times, measured) and by that pool's cap, not by a kernel limit. \
   Enforced in: `services/ai-orchestrator/app/services/extractor.py` (`_extract_json`) \
   Pinned by: `services/ai-orchestrator/tests/test_extractor_json.py` (`test_nested_arrays_print_at_most_the_budget_with_bounded_memory`, `test_nesting_past_the_parse_limit_is_returned_as_raw_text`, `test_recursion_in_the_printing_is_returned_as_raw_text`, `test_the_real_printer_recursing_past_the_limit_is_raw_text`, `test_honest_json_prints_exactly_as_before`); `services/ai-orchestrator/tests/test_generate.py` (`test_generate_json_nested_past_the_recursion_limit_answers_200`)
+- **AI-UPLOAD-25.** A PDF read that ends at a resource limit (the memory, "ended by the
+  kernel", CPU, or deadline answer of AI-UPLOAD-21) is charged `PDF_REFUSAL_CHARGE_TOKENS`
+  (20,000) input tokens against the caller's daily quota through
+  `usage_repo.record_failed_usage`, so a user cannot hold the PDF readers with hostile files
+  for free; the 400 and its detail are unchanged, and a parse failure, which ends at once,
+  is not charged. 20,000 is the chars/4 estimate (the repository's own fallback) of the
+  default character budget of 80,000, what the largest honest upload could put in front of
+  the model. With `AI_DAILY_TOKEN_QUOTA` 100,000, five such reads exhaust the day and the
+  sixth request answers 429 before any read. With the default quota of 0 nothing is
+  charged, as for every other usage row (AI-QUOTA-1); the per-user cap of AI-UPLOAD-22 is
+  the bound that holds then. \
+  Enforced in: `services/ai-orchestrator/app/routes/generate.py` (`generate`); `services/ai-orchestrator/app/services/extractor.py` (`PdfLimitRefusal`, `PDF_REFUSAL_CHARGE_TOKENS`, `_extract_pdf`) \
+  Pinned by: `services/ai-orchestrator/tests/test_generate.py` (`test_generate_pdf_read_at_a_resource_limit_is_charged_against_the_quota`, `test_five_limit_refusals_exhaust_a_100k_quota`)
 
 **Out of scope.** Choosing ports: the proposal never names a port for a device-to-device
 edge (section 8.3). Saving the canvas as the user's own topology, which the topology editor
@@ -1686,11 +1722,13 @@ stream opens are `error` frames, listed at the end.
 | 400 | `The tgz archive has more than 4096 bytes of pax global headers; nothing was extracted` | a tgz upload whose pax global headers declare more than 4 KiB together | AI-UPLOAD-15 |
 | 400 | `The tgz archive has a sparse member, which is not supported; nothing was extracted` | a tgz upload holding a GNU sparse member in any format | AI-UPLOAD-16 |
 | 400 | `The PDF needs more memory to read than the reader allows; nothing was extracted` | the PDF reader's child ran out of its address space | AI-UPLOAD-19, AI-UPLOAD-21 |
+| 400 | `The PDF reader was ended by the kernel (memory or hard CPU limit); nothing was extracted` | the PDF reader's child was ended by a signal the service did not send | AI-UPLOAD-19, AI-UPLOAD-21 |
 | 400 | `The PDF needs more than 20 seconds of processing to read; nothing was extracted` | the PDF reader's child ran out of CPU time | AI-UPLOAD-19, AI-UPLOAD-21 |
 | 400 | `The PDF took longer than 30 seconds to read; nothing was extracted` | the PDF reader's child was killed at the wall-clock deadline | AI-UPLOAD-20, AI-UPLOAD-21 |
 | 400 | `PDF extraction not available: pdfplumber is not installed` | the PDF reader cannot import pdfplumber | AI-UPLOAD-21 |
 | 500 | `The PDF reader failed; nothing was extracted` | the PDF reader's child could not start, could not apply its limits, or broke its protocol | AI-UPLOAD-19, AI-UPLOAD-20, AI-UPLOAD-21 |
-| 503 | `The PDF reader is busy; try again shortly` | no PDF reader slot came free within 30 seconds | AI-UPLOAD-22 |
+| 503 | `The PDF reader is busy; try again shortly` | no PDF reader slot came free within 30 seconds, eight reads already wait, or the caller already has a PDF read in flight | AI-UPLOAD-22 |
+| 503 | `The file reader is busy; try again shortly` | no in-process reader slot came free within 30 seconds, or eight reads already wait | AI-UPLOAD-22 |
 | 400 | `start must not be after end` or `date range too large; max 366 days` | bad usage report range | AI-QUOTA-8 |
 | 401 | `Not authenticated` or `Could not validate credentials` | no token or a bad token on any route but status, health, and version | AI-GEN-1, AI-COMMIT-1, AI-STREAM-1, AI-QUOTA-6, AI-QUOTA-8 |
 | 403 | `Admin or superadmin role required` | identity, usage, or recipe routes as a user | AI-IDENT-1, AI-QUOTA-8, AI-RECIPE-2 |
@@ -1821,7 +1859,7 @@ the upload read chunk (64 KiB).
 | Browser end-to-end | `tests/e2e/test_ai_feature_gate.py`, `test_ai_generate_dialog.py`, `test_recipe_panel_gate.py`, `test_tier2_playwright.py` (`test_assistant_stream_token_by_token`) | The dialog and stream tests skip when the stack has no provider; the gates run |
 | Measurement | `tests/ai_eval/` (`make ai-eval`) | Opt-in, in no gate (AI-EVAL-1) |
 
-The upload readers (AI-UPLOAD-1 to AI-UPLOAD-24) are reached only by the unit tests and the
+The upload readers (AI-UPLOAD-1 to AI-UPLOAD-25) are reached only by the unit tests and the
 in-process route tests: the gate and CI stacks configure no AI provider, so `/generate`
 answers 503 there before it reads an upload (AI-GEN-2), and no functional test on a running
 stack, integration, load, or browser test reaches them. The compose memory limit and
@@ -1836,7 +1874,7 @@ integration, browser, and evaluation suites were read, not run. `test_vllm_live.
 ### Open defects
 
 None at this commit. (#1039 is resolved by AI-CONV-13; #1202 by AI-UPLOAD-19 to
-AI-UPLOAD-24; #1279 by AI-UPLOAD-8; #1280 by AI-TURN-9.)
+AI-UPLOAD-25; #1279 by AI-UPLOAD-8; #1280 by AI-TURN-9.)
 
 ### Limits by decision
 
@@ -1895,10 +1933,11 @@ written.
   The slowest of the 60 real PDFs measured (6.9 MB of scanned pages, over the upload cap,
   with no text) took 48 CPU seconds; an image-only PDF yields no text anyway. Raising
   `UPLOAD_MAX_EXTRACTED_CHARS` makes honest reads walk further and take longer.
-- The JSON parse runs in the service process (AI-UPLOAD-24): a 5 MiB upload of small
-  objects or empty arrays parses to roughly twenty times its size in Python objects. It
-  is bounded by the upload cap, not by a kernel limit; moving it into the capped child
-  would bound it the same way as a PDF.
+- The JSON parse and the tgz walk run in the service process (AI-UPLOAD-22,
+  AI-UPLOAD-24): a 5 MiB upload of empty nested arrays parses to about 32 times its size
+  in Python objects. They are bounded by the upload cap and the `file` pool's
+  concurrency cap, not by a kernel limit; moving them into a capped child would bound
+  them the same way as a PDF.
 
 ### Rules with no test
 

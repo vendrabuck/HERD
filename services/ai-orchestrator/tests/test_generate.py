@@ -1699,7 +1699,7 @@ async def test_read_uploads_maps_the_pdf_reader_outcomes(monkeypatch, error, sta
     other overloads of a dependency, inventory and the provider, are), and a failure of
     the reader itself is a 500; each with its fixed detail."""
 
-    async def failing_extract_files(uploads):
+    async def failing_extract_files(uploads, owner=None):
         raise error
 
     monkeypatch.setattr(generate_module, "extract_files", failing_extract_files)
@@ -2154,3 +2154,65 @@ async def test_pathfind_batch_fails_closed_when_cabling_cannot_answer(
     with pytest.raises(CablingUnavailableError) as excinfo:
         await cabling_client.fetch_pathfind_batch("caller-jwt", [("s0", "t0")])
     assert str(excinfo.value) == message
+
+
+@pytest.mark.parametrize(
+    ("detail", "refusal", "charged"),
+    [
+        (extractor_module.PDF_MEMORY_DETAIL, extractor_module.PdfLimitRefusal, 20_000),
+        (extractor_module.PDF_KILLED_DETAIL, extractor_module.PdfLimitRefusal, 20_000),
+        ("Failed to parse PDF (PdfminerException)", extractor_module.ExtractionError, 0),
+    ],
+    ids=["memory-limit-charged", "kernel-kill-charged", "parse-failure-free"],
+)
+async def test_generate_pdf_read_at_a_resource_limit_is_charged_against_the_quota(
+    async_client, monkeypatch, detail, refusal, charged
+):
+    """Issue #1202: a PDF read that ends at a resource limit books
+    PDF_REFUSAL_CHARGE_TOKENS against the caller's quota, so hostile uploads that hold
+    the readers are not free; the 400 and its detail are unchanged. A parse failure,
+    which ends at once, is not charged. The provider and inventory are never called."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 100_000)
+    assert extractor_module.PDF_REFUSAL_CHARGE_TOKENS == 20_000
+
+    async def refusing_extract_files(uploads, owner=None):
+        assert owner == uuid.UUID(_USER_ID)
+        raise refusal(detail)
+
+    monkeypatch.setattr(generate_module, "extract_files", refusing_extract_files)
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    calls = _override_inventory({"EX3400": 4})
+    files = [("files", ("doc.pdf", b"%PDF-1.4", "application/pdf"))]
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    async with async_client as client:
+        resp = await client.post("/generate", data={"prompt": "x"}, files=files, headers=headers)
+    assert (resp.status_code, resp.json()["detail"]) == (400, detail)
+    assert calls["n"] == 0
+    async with _TestSessionLocal() as db:
+        assert await usage_repo.get_today_total(db, uuid.UUID(_USER_ID)) == charged
+
+
+async def test_five_limit_refusals_exhaust_a_100k_quota(async_client, monkeypatch):
+    """The arithmetic in AI-UPLOAD-25: with AI_DAILY_TOKEN_QUOTA 100,000, five refused
+    reads book 100,000 tokens and the sixth request answers 429 before any read."""
+    monkeypatch.setattr(config_module.settings, "ai_daily_token_quota", 100_000)
+    reads = {"n": 0}
+
+    async def refusing_extract_files(uploads, owner=None):
+        reads["n"] += 1
+        raise extractor_module.PdfLimitRefusal(extractor_module.PDF_MEMORY_DETAIL)
+
+    monkeypatch.setattr(generate_module, "extract_files", refusing_extract_files)
+    app.dependency_overrides[get_ai_client] = lambda: _ExplodingAI()
+    _override_inventory({"EX3400": 4})
+    files = [("files", ("doc.pdf", b"%PDF-1.4", "application/pdf"))]
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    statuses = []
+    async with async_client as client:
+        for _ in range(6):
+            resp = await client.post(
+                "/generate", data={"prompt": "x"}, files=files, headers=headers
+            )
+            statuses.append(resp.status_code)
+    assert statuses == [400] * 5 + [429]
+    assert reads["n"] == 5

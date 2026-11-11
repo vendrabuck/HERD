@@ -23,8 +23,10 @@ the child, whatever the child does:
 - it reads the outcome only from the exit status, the signal that ended the child,
   and one fixed-format status line, the last line of stderr, matched strictly.
 
-Concurrent children are capped by ``acquire_slot``: a module-wide limit with a bounded
-wait, so the number of children, and so their combined memory ceiling, is fixed.
+Concurrency is capped by named pools (``acquire``, ``acquire_slot``): a fixed number of
+slots, a bounded wait, a bounded number of waiters, and optionally one slot per owner,
+so the number of children, and so their combined memory ceiling, is fixed. The
+extractor uses a second pool for the reads it does in process.
 """
 
 import asyncio
@@ -35,7 +37,8 @@ import re
 import signal
 import sys
 import weakref
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 # What the parent keeps of a child's stderr: the status line is short; an honest child
 # writes nothing else there (it switches logging and warnings off), so a child that
@@ -51,6 +54,11 @@ class Outcome(enum.Enum):
     OK = "ok"
     PARSE_ERROR = "parse-error"
     MEMORY = "memory"
+    # Ended by a signal the parent did not send: the kernel at a limit (SIGKILL from
+    # the RLIMIT_CPU hard limit or the out-of-memory killer) or C code whose allocation
+    # failed under RLIMIT_AS (SIGSEGV, SIGABRT, SIGBUS). Which of these it was cannot
+    # be told from the status alone.
+    KILLED = "killed"
     CPU = "cpu"
     DEADLINE = "deadline"
     UNAVAILABLE = "unavailable"
@@ -74,12 +82,11 @@ class ChildResult:
 
 # The signals that mean the child ran out of a limit. SIGXCPU is RLIMIT_CPU's soft
 # limit. SIGKILL that the parent did not send is the RLIMIT_CPU hard limit or the
-# kernel's out-of-memory killer; the child does not catch SIGXCPU, so the soft limit
-# ends it first and an unexplained SIGKILL is read as memory. SIGSEGV, SIGABRT, and
-# SIGBUS are how C code (the interpreter's allocator included) can end when an
-# allocation fails under RLIMIT_AS.
+# kernel's out-of-memory killer, and SIGSEGV, SIGABRT, and SIGBUS are how C code (the
+# interpreter's allocator included) can end when an allocation fails under RLIMIT_AS:
+# all four are Outcome.KILLED, memory or the hard CPU limit, not told apart.
 _CPU_SIGNALS = frozenset({signal.SIGXCPU})
-_MEMORY_SIGNALS = frozenset({signal.SIGKILL, signal.SIGSEGV, signal.SIGABRT, signal.SIGBUS})
+_KILLED_SIGNALS = frozenset({signal.SIGKILL, signal.SIGSEGV, signal.SIGABRT, signal.SIGBUS})
 
 
 def _status_pattern(prefix: str) -> re.Pattern[bytes]:
@@ -101,9 +108,11 @@ async def _feed(stream: asyncio.StreamWriter, data: bytes) -> None:
     with contextlib.suppress(BrokenPipeError, ConnectionResetError):
         stream.write(data)
         await stream.drain()
-    with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-        stream.close()
-        await stream.wait_closed()
+    # Closed without awaiting wait_closed(): cancelling that await (the deadline, a
+    # cancelled request) cancels the protocol's own close future, and asyncio then
+    # fails setting its result when the pipe closes ("invalid state", logged by the
+    # loop). The cleanup reaps the child; nothing here needs the close confirmed.
+    stream.close()
 
 
 async def _read_bounded(stream: asyncio.StreamReader, cap: int, on_over) -> tuple[bytes, bool]:
@@ -162,8 +171,8 @@ def classify(
         sig = -returncode
         if sig in _CPU_SIGNALS:
             return Outcome.CPU, None
-        if sig in _MEMORY_SIGNALS:
-            return Outcome.MEMORY, None
+        if sig in _KILLED_SIGNALS:
+            return Outcome.KILLED, None
         return Outcome.MALFORMED, None
     lines = [line for line in stderr.split(b"\n") if line.strip()]
     if not lines:
@@ -181,6 +190,41 @@ def classify(
     return Outcome(word), None
 
 
+# Cleanup tasks of children whose start was cancelled, kept referenced until done.
+_BACKGROUND: set[asyncio.Task] = set()
+
+
+async def _kill_and_reap(proc: asyncio.subprocess.Process) -> None:
+    _killpg(proc.pid)
+    if proc.stdin is not None:
+        proc.stdin.close()
+    await proc.wait()
+
+
+def _reap_after_cancelled_start(spawn: asyncio.Future) -> None:
+    """The request was cancelled while the child was starting. The start is left to
+    finish (cancelling it inside asyncio's pipe setup leaves a future whose
+    CancelledError nobody retrieves), and then the child is killed and reaped."""
+    if spawn.cancelled() or spawn.exception() is not None:
+        return
+    task = asyncio.ensure_future(_kill_and_reap(spawn.result()))
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+
+
+async def _uncancellable(awaitable: asyncio.Future) -> None:
+    """Await `awaitable` to its end whatever cancellations arrive meanwhile, then
+    raise CancelledError if any did."""
+    cancelled = False
+    while not awaitable.done():
+        try:
+            await asyncio.shield(awaitable)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+
+
 async def run_capped_child(
     script: str,
     args: list[str],
@@ -193,8 +237,8 @@ async def run_capped_child(
 ) -> ChildResult:
     """Run ``sys.executable -I -B script *args`` with ``stdin`` as its input, under
     the parent-side bounds in the module docstring, and return how it ended."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
+    spawn = asyncio.ensure_future(
+        asyncio.create_subprocess_exec(
             sys.executable,
             "-I",
             "-B",
@@ -207,6 +251,12 @@ async def run_capped_child(
             cwd="/",
             start_new_session=True,
         )
+    )
+    try:
+        proc = await asyncio.shield(spawn)
+    except asyncio.CancelledError:
+        spawn.add_done_callback(_reap_after_cancelled_start)
+        raise
     except OSError:
         return ChildResult(Outcome.START_FAILED)
 
@@ -218,7 +268,17 @@ async def run_capped_child(
         over_cap = True
         _killpg(pgid)
 
-    tasks: list[asyncio.Task] = []
+    tasks: list[asyncio.Future] = []
+
+    async def cleanup() -> None:
+        _killpg(pgid)
+        for task in tasks:
+            task.cancel()
+        if proc.returncode is None:
+            # SIGKILL cannot be caught, so this wait is short.
+            await proc.wait()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     try:
         try:
             async with asyncio.timeout(wall_seconds):
@@ -242,7 +302,7 @@ async def run_capped_child(
         except TimeoutError:
             return ChildResult(Outcome.DEADLINE)
         except OSError:
-            # pidfd_open is missing or refused; the finally kills and reaps the child.
+            # pidfd_open is missing or refused; the cleanup kills and reaps the child.
             return ChildResult(Outcome.START_FAILED)
         if over_cap:
             return ChildResult(Outcome.MALFORMED)
@@ -251,47 +311,110 @@ async def run_capped_child(
             return ChildResult(outcome, class_name=class_name)
         return ChildResult(Outcome.OK, stdout=stdout)
     finally:
-        # Every path: deadline, cancellation, an error in this function, success.
-        _killpg(pgid)
-        for task in tasks:
-            task.cancel()
-        if proc.returncode is None:
-            # SIGKILL cannot be caught, so this wait is short. It is shielded: a
-            # second cancellation ends this await, not the wait, and the loop's child
-            # watcher reaps the child either way.
-            await asyncio.shield(proc.wait())
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Every path: deadline, cancellation, an error in this function, success. The
+        # cleanup runs to its end even if the caller is cancelled again meanwhile, so
+        # the child is reaped and every pipe task finished before this returns.
+        await _uncancellable(asyncio.ensure_future(cleanup()))
 
 
-# --- Concurrency cap ---
+# --- Concurrency caps ---
 
 
 class ReaderBusy(Exception):
-    """No capped-child slot came free within the wait."""
+    """No slot came free within the wait, the waiting line is full, or the owner
+    already holds or waits for a slot of the same pool."""
 
 
-# One semaphore per event loop: asyncio primitives bind to the loop that first waits
-# on them, and the tests run many loops in one process. The service runs one loop, so
-# there it is one module-wide cap.
-_SLOTS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+@dataclass
+class _Pool:
+    limit: int
+    slots: asyncio.Semaphore
+    waiting: int = 0
+    owners: set = field(default_factory=set)
+
+
+# One set of pools per event loop: asyncio primitives bind to the loop that first
+# waits on them, and the tests run many loops in one process. The service runs one
+# loop, so there each pool is one service-wide cap.
+_POOLS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, _Pool]]" = (
     weakref.WeakKeyDictionary()
 )
 
 
-@contextlib.asynccontextmanager
-async def acquire_slot(limit: int, wait_seconds: float):
-    """Hold one of `limit` slots while the body runs; wait at most `wait_seconds` for
-    one, then raise ReaderBusy. ``limit`` is read on the loop's first use."""
-    loop = asyncio.get_running_loop()
-    slots = _SLOTS.get(loop)
-    if slots is None:
-        slots = _SLOTS[loop] = asyncio.Semaphore(limit)
+def _pool(name: str, limit: int) -> _Pool:
+    pools = _POOLS.setdefault(asyncio.get_running_loop(), {})
+    if name not in pools:
+        pools[name] = _Pool(limit=limit, slots=asyncio.Semaphore(limit))
+    return pools[name]
+
+
+def pool_state(name: str) -> tuple[int, int, int, frozenset] | None:
+    """(free slots, limit, waiting, owners) of the running loop's pool `name`, or None
+    before its first use. For tests and diagnostics."""
+    pool = _POOLS.get(asyncio.get_running_loop(), {}).get(name)
+    if pool is None:
+        return None
+    return pool.slots._value, pool.limit, pool.waiting, frozenset(pool.owners)
+
+
+async def acquire(
+    name: str,
+    limit: int,
+    wait_seconds: float,
+    max_waiters: int,
+    owner: object | None = None,
+) -> Callable[[], None]:
+    """Take one of `limit` slots of pool `name` and return the function that gives it
+    back (idempotent). Raise ReaderBusy at once when `owner` already holds or waits for
+    a slot of this pool, or when no slot is free and `max_waiters` already wait; after
+    `wait_seconds` without a slot. The owner mark and the waiting count are undone on
+    every way out, cancellation included."""
+    pool = _pool(name, limit)
+    if owner is not None:
+        if owner in pool.owners:
+            raise ReaderBusy
+        pool.owners.add(owner)
     try:
-        async with asyncio.timeout(wait_seconds):
-            await slots.acquire()
-    except TimeoutError:
-        raise ReaderBusy from None
+        if pool.slots.locked() and pool.waiting >= max_waiters:
+            raise ReaderBusy
+        pool.waiting += 1
+        try:
+            async with asyncio.timeout(wait_seconds):
+                await pool.slots.acquire()
+        except TimeoutError:
+            raise ReaderBusy from None
+        finally:
+            pool.waiting -= 1
+    except BaseException:
+        if owner is not None:
+            pool.owners.discard(owner)
+        raise
+
+    released = False
+
+    def release() -> None:
+        nonlocal released
+        if released:
+            return
+        released = True
+        pool.slots.release()
+        if owner is not None:
+            pool.owners.discard(owner)
+
+    return release
+
+
+@contextlib.asynccontextmanager
+async def acquire_slot(
+    name: str,
+    limit: int,
+    wait_seconds: float,
+    max_waiters: int,
+    owner: object | None = None,
+):
+    """Hold one slot of pool `name` while the body runs (see ``acquire``)."""
+    release = await acquire(name, limit, wait_seconds, max_waiters, owner)
     try:
         yield
     finally:
-        slots.release()
+        release()

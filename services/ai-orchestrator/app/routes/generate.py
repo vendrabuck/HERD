@@ -17,9 +17,11 @@ from app.services.ai_client import (
     get_ai_client,
 )
 from app.services.extractor import (
+    PDF_REFUSAL_CHARGE_TOKENS,
     ExtractionBusy,
     ExtractionError,
     ExtractionUnavailable,
+    PdfLimitRefusal,
     extract_files,
 )
 from app.services.generator import (
@@ -32,6 +34,7 @@ from app.services.inventory_client import (
     InventoryUnavailableError,
     fetch_inventory_summary,
 )
+from app.services.llm_provider import Usage
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +83,9 @@ def _inventory_provider(
 _UPLOAD_READ_CHUNK_BYTES = 64 * 1024
 
 
-async def _read_uploads(files: list[UploadFile] | None) -> list[ExtractedFile]:
+async def _read_uploads(
+    files: list[UploadFile] | None, owner: uuid.UUID | None = None
+) -> list[ExtractedFile]:
     """Read the uploaded parts, enforcing the count and size caps before
     anything is fully buffered (issue #705).
 
@@ -145,7 +150,7 @@ async def _read_uploads(files: list[UploadFile] | None) -> list[ExtractedFile]:
     if not uploads:
         return []
     try:
-        return await extract_files(uploads)
+        return await extract_files(uploads, owner=owner)
     except ExtractionError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
     except ExtractionBusy as e:
@@ -173,7 +178,17 @@ async def generate(
     user_id = uuid.UUID(user["sub"])
     await usage_repo.enforce_quota(db, user_id)
 
-    extracted = await _read_uploads(files)
+    try:
+        extracted = await _read_uploads(files, owner=user_id)
+    except HTTPException as e:
+        # Issue #1202: a PDF read that ended at a resource limit is charged a fixed
+        # amount against the caller's quota (when one is set), so hostile files that
+        # hold the readers are not free. The 400 is unchanged.
+        if isinstance(e.__cause__, PdfLimitRefusal):
+            await usage_repo.record_failed_usage(
+                db, user_id, Usage(input_tokens=PDF_REFUSAL_CHARGE_TOKENS, output_tokens=0)
+            )
+        raise
 
     # Only now, with every local gate passed, is inventory read (issue #1035).
     inventory = await load_inventory()

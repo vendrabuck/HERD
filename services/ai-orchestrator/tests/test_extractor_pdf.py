@@ -13,17 +13,20 @@ wall-clock timeout, so a broken build fails instead of hanging the suite.
 """
 
 import asyncio
+import gc
 import json
 import logging
 import os
 import signal
 import sys
+import threading
 import time
+import uuid
 
 import pytest
 from app import config as config_module
 from app.services import _pdf_child, extractor
-from app.services.capped_child import Outcome, classify, run_capped_child
+from app.services.capped_child import Outcome, classify, pool_state, run_capped_child
 from app.services.extractor import (
     PDF_MEMORY_DETAIL,
     PDF_READER_BUSY_DETAIL,
@@ -59,6 +62,7 @@ _TABLE_WALL_SECONDS = 8
 _PARENT_GROWTH_KIB = 32 * 1024
 
 MEMORY = PDF_MEMORY_DETAIL
+KILLED = extractor.PDF_KILLED_DETAIL
 CPU = (
     f"The PDF needs more than {_TABLE_CPU_SECONDS} seconds of processing to read; "
     "nothing was extracted"
@@ -125,6 +129,24 @@ async def _outcome(data: bytes) -> str:
     except ExtractionError as e:
         return str(e)
     return "ok"
+
+
+@pytest.fixture(autouse=True)
+def no_child_outlives_the_test():
+    """Kill, with its whole group, any child a test leaves behind, so a regression in
+    the parent's own kill fails one test instead of leaking processes into the next."""
+    before = live_children()
+    yield
+    for pid in live_children() - before:
+        for kill in (os.killpg, os.kill):
+            try:
+                kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
 
 
 @pytest.fixture
@@ -256,6 +278,7 @@ async def test_a_child_that_writes_without_end_is_killed_at_the_cap(tmp_path, fd
     assert live_children() == children
 
 
+@pytest.mark.timeout(20)
 async def test_a_child_that_ignores_sigterm_is_killed_at_the_deadline(tmp_path):
     script = _script(
         tmp_path,
@@ -269,6 +292,7 @@ async def test_a_child_that_ignores_sigterm_is_killed_at_the_deadline(tmp_path):
     assert live_children() == children
 
 
+@pytest.mark.timeout(20)
 async def test_a_grandchild_that_outlives_the_child_is_killed_with_its_group(tmp_path):
     """The child forks a grandchild that keeps the output pipes open and sleeps, then
     exits ok. The group kill after the child's exit ends the grandchild, so the pipes
@@ -345,9 +369,10 @@ async def test_the_child_leads_its_own_group_with_an_empty_environment_and_three
         (2, b"FAKE-STATUS parse-error 9Bad\n", (Outcome.MALFORMED, None)),
         (0, b"OTHER-STATUS ok\n", (Outcome.MALFORMED, None)),
         (-signal.SIGXCPU, b"", (Outcome.CPU, None)),
-        (-signal.SIGKILL, b"", (Outcome.MEMORY, None)),
-        (-signal.SIGSEGV, b"FAKE-STATUS ok\n", (Outcome.MEMORY, None)),
-        (-signal.SIGABRT, b"", (Outcome.MEMORY, None)),
+        (-signal.SIGKILL, b"", (Outcome.KILLED, None)),
+        (-signal.SIGSEGV, b"FAKE-STATUS ok\n", (Outcome.KILLED, None)),
+        (-signal.SIGABRT, b"", (Outcome.KILLED, None)),
+        (-signal.SIGBUS, b"", (Outcome.KILLED, None)),
         (-signal.SIGTERM, b"", (Outcome.MALFORMED, None)),
     ],
 )
@@ -372,6 +397,7 @@ async def test_a_child_that_cannot_start_is_a_reader_failure(monkeypatch):
     assert str(exc.value) == PDF_READER_FAILED_DETAIL
 
 
+@pytest.mark.timeout(20)
 async def test_cancelling_the_read_kills_and_reaps_the_child(tmp_path):
     script = _script(tmp_path, "time.sleep(600)\n")
     children = live_children()
@@ -413,6 +439,7 @@ async def test_at_most_the_cap_of_children_run_at_once(tmp_path, monkeypatch, wa
         assert str(busy) == PDF_READER_BUSY_DETAIL
     else:
         assert [r[0].text for r in results] == ["done"] * 3
+    assert_pool_restored("pdf", 2)
 
 
 def test_the_reader_runs_under_uvloop():
@@ -611,3 +638,259 @@ async def test_a_second_file_gets_what_the_first_left(monkeypatch):
     first, second = await extract_files([("a.pdf", pdf), ("b.pdf", pdf)])
     assert (first.text, first.truncated) == ("Page one\n\nPa", True)
     assert (second.text, second.truncated) == ("", True)
+
+
+# --- Pools: one PDF read per user, waiting lines, the in-process pool, their release ---
+
+
+def assert_pool_restored(name: str, limit: int) -> None:
+    """After the reads end, every slot is free, nobody waits, and no user is marked:
+    no way out leaks a slot, releases one twice, or leaves a user locked out."""
+    assert pool_state(name) == (limit, limit, 0, frozenset())
+
+
+def _sleeping_child(tmp_path, seconds: float) -> str:
+    return _script(
+        tmp_path,
+        f"time.sleep({seconds})\nos.write(1, b'done')\nos.write(2, b'HERD-PDF-STATUS ok\\n')\n",
+    )
+
+
+async def _until(predicate, seconds: float = 10) -> None:
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        assert time.monotonic() < deadline, "condition never held"
+        await asyncio.sleep(0.005)
+
+
+def _holds(owner) -> bool:
+    state = pool_state("pdf")
+    return state is not None and owner in state[3]
+
+
+@pytest.mark.timeout(30)
+async def test_one_pdf_read_at_a_time_per_user(tmp_path, monkeypatch):
+    """A user with a PDF read in flight who starts another is refused at once with the
+    busy answer, while another user reads beside them; once the first read ends the
+    same user reads again."""
+    monkeypatch.setattr(extractor, "_PDF_CHILD_PATH", _sleeping_child(tmp_path, 1))
+    alice, bob = uuid.uuid4(), uuid.uuid4()
+    first = asyncio.ensure_future(extract_files([("a.pdf", b"%PDF-1.4")], owner=alice))
+    await _until(lambda: _holds(alice))
+
+    start = time.monotonic()
+    with pytest.raises(ExtractionBusy) as exc:
+        await extract_files([("b.pdf", b"%PDF-1.4")], owner=alice)
+    assert str(exc.value) == PDF_READER_BUSY_DETAIL
+    assert time.monotonic() - start < 0.5
+
+    other = await extract_files([("c.pdf", b"%PDF-1.4")], owner=bob)
+    assert other[0].text == "done"
+    assert (await first)[0].text == "done"
+    assert_pool_restored("pdf", 2)
+    assert (await extract_files([("d.pdf", b"%PDF-1.4")], owner=alice))[0].text == "done"
+    assert_pool_restored("pdf", 2)
+
+
+_WAYS_OUT = {
+    "read": ("os.write(1, b'x')\nos.write(2, b'HERD-PDF-STATUS ok\\n')\n", None),
+    "parse-error": (
+        "os.write(2, b'HERD-PDF-STATUS parse-error KeyError\\n')\nos._exit(2)\n",
+        ExtractionError,
+    ),
+    "malformed": ("os.write(2, b'nonsense\\n')\n", ExtractionUnavailable),
+    "deadline": ("time.sleep(600)\n", ExtractionError),
+    "cancelled": ("time.sleep(600)\n", asyncio.CancelledError),
+}
+
+
+@pytest.mark.timeout(60)
+async def test_every_way_out_of_a_pdf_read_gives_back_its_slot_and_its_user(tmp_path, monkeypatch):
+    """Three rounds of every ending (read, parse error, malformed, deadline, and the
+    request cancelled while the child runs), each by the same user: after each the
+    pool is whole and the user can read again."""
+    monkeypatch.setattr(extractor, "PDF_WALL_SECONDS", 0.5)
+    owner = uuid.uuid4()
+    for round_ in range(3):
+        for way, (body, raised) in _WAYS_OUT.items():
+            path = tmp_path / f"{way}-{round_}.py"
+            path.write_text("import os, time\n" + body)
+            monkeypatch.setattr(extractor, "_PDF_CHILD_PATH", str(path))
+            task = asyncio.ensure_future(extract_files([("doc.pdf", b"%PDF-1.4")], owner=owner))
+            if way == "cancelled":
+                await _until(lambda: _holds(owner))
+                await asyncio.sleep(0.2)
+                task.cancel()
+            if raised is None:
+                assert (await task)[0].text == "x"
+            else:
+                with pytest.raises(raised):
+                    await task
+            assert_pool_restored("pdf", 2)
+
+
+@pytest.mark.timeout(30)
+async def test_a_cancelled_wait_for_a_slot_gives_back_its_place_and_its_user(tmp_path, monkeypatch):
+    monkeypatch.setattr(extractor, "_PDF_CHILD_PATH", _sleeping_child(tmp_path, 1))
+    monkeypatch.setattr(extractor, "MAX_CONCURRENT_PDF_READS", 1)
+    holder, waiter = uuid.uuid4(), uuid.uuid4()
+    held = asyncio.ensure_future(extract_files([("a.pdf", b"%PDF-1.4")], owner=holder))
+    await _until(lambda: _holds(holder))
+    waiting = asyncio.ensure_future(extract_files([("b.pdf", b"%PDF-1.4")], owner=waiter))
+    await _until(lambda: pool_state("pdf")[2] == 1)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    assert pool_state("pdf")[2:] == (0, frozenset({holder}))
+    await held
+    assert_pool_restored("pdf", 1)
+
+
+class _BlockingExtract:
+    """A stand-in for _extract_one that counts the threads inside it and holds each
+    until released."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.inside = 0
+        self.most = 0
+        self.entered = 0
+        self.release = threading.Event()
+
+    def __call__(self, raw, remaining_budget):
+        with self.lock:
+            self.inside += 1
+            self.entered += 1
+            self.most = max(self.most, self.inside)
+        try:
+            assert self.release.wait(timeout=20)
+            return "text"
+        finally:
+            with self.lock:
+                self.inside -= 1
+
+
+@pytest.mark.timeout(30)
+async def test_in_process_reads_are_capped_and_a_cancelled_one_holds_its_slot(monkeypatch):
+    """Four JSON reads at once with a cap of two: two threads run, and cancelling the
+    request of a running one does not let a third start, because its thread still
+    runs; once released, every read finishes and the pool is whole."""
+    stand_in = _BlockingExtract()
+    monkeypatch.setattr(extractor, "_extract_one", stand_in)
+    reads = [asyncio.ensure_future(extract_files([(f"d{i}.json", b"{}")])) for i in range(4)]
+    await _until(lambda: stand_in.entered == 2)
+    reads[0].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reads[0]
+    await asyncio.sleep(0.3)
+    assert stand_in.entered == 2
+    stand_in.release.set()
+    results = await asyncio.gather(*reads[1:])
+    assert [r[0].text for r in results] == ["text"] * 3
+    assert stand_in.most == 2
+    await _until(lambda: pool_state("file") == (2, 2, 0, frozenset()))
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("pool", ["pdf", "file"])
+async def test_a_full_waiting_line_is_refused_at_once(tmp_path, monkeypatch, pool):
+    """One slot, one place in line: the first read holds the slot, the second waits,
+    and the third is refused at once with the busy answer instead of holding its
+    upload in memory in an unbounded line."""
+    stand_in = _BlockingExtract()
+    if pool == "pdf":
+        monkeypatch.setattr(extractor, "_PDF_CHILD_PATH", _sleeping_child(tmp_path, 1))
+        monkeypatch.setattr(extractor, "MAX_CONCURRENT_PDF_READS", 1)
+        monkeypatch.setattr(extractor, "MAX_PDF_READ_WAITERS", 1)
+        name, detail = "doc.pdf", PDF_READER_BUSY_DETAIL
+    else:
+        monkeypatch.setattr(extractor, "_extract_one", stand_in)
+        monkeypatch.setattr(extractor, "MAX_CONCURRENT_FILE_READS", 1)
+        monkeypatch.setattr(extractor, "MAX_FILE_READ_WAITERS", 1)
+        name, detail = "doc.json", extractor.FILE_READER_BUSY_DETAIL
+    first = asyncio.ensure_future(extract_files([(name, b"{}")]))
+    await _until(lambda: pool_state(pool) is not None and pool_state(pool)[0] == 0)
+    second = asyncio.ensure_future(extract_files([(name, b"{}")]))
+    await _until(lambda: pool_state(pool)[2] == 1)
+    start = time.monotonic()
+    with pytest.raises(ExtractionBusy) as exc:
+        await extract_files([(name, b"{}")])
+    assert str(exc.value) == detail
+    assert time.monotonic() - start < 0.5
+    stand_in.release.set()
+    await first
+    await second
+    await _until(lambda: pool_state(pool) == (1, 1, 0, frozenset()))
+
+
+@pytest.mark.timeout(20)
+async def test_a_second_cancellation_during_cleanup_still_reaps_the_child(tmp_path):
+    """The request is cancelled, then cancelled again while the cleanup waits for the
+    killed child: the read still returns only once the child is reaped, so no child or
+    zombie is left at that moment."""
+    script = _script(tmp_path, "time.sleep(600)\n")
+    children = live_children()
+    task = asyncio.ensure_future(_run(script, wall=60))
+    await _until(lambda: bool(live_children() - children))
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert live_children() == children
+
+
+@pytest.mark.timeout(90)
+async def test_cancellation_at_any_stage_logs_no_unretrieved_exception(tmp_path, monkeypatch):
+    """Cancel a read while it waits for a slot, at each of the first 40 steps of the
+    child's start, while the child runs, and twice during the cleanup: the loop reports
+    no exception nobody retrieved (the start's own pipe setup used to leave one) and
+    every child is gone afterwards."""
+    loop = asyncio.get_running_loop()
+    reported: list[str] = []
+    loop.set_exception_handler(
+        lambda _loop, context: reported.append(f"{context['message']} {context.get('exception')!r}")
+    )
+    monkeypatch.setattr(extractor, "_PDF_CHILD_PATH", _sleeping_child(tmp_path, 600))
+    monkeypatch.setattr(extractor, "MAX_CONCURRENT_PDF_READS", 1)
+    children = live_children()
+
+    async def cancel_after(steps: int, *, twice: bool = False, settle: bool = True) -> None:
+        task = asyncio.ensure_future(extract_files([("doc.pdf", b"%PDF-1.4")]))
+        for _ in range(steps):
+            await asyncio.sleep(0)
+        task.cancel()
+        if twice:
+            await asyncio.sleep(0)
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        if settle:
+            await _until(lambda: live_children() == children)
+
+    try:
+        # While waiting for the slot another read holds.
+        holder = asyncio.ensure_future(extract_files([("h.pdf", b"%PDF-1.4")]))
+        await _until(lambda: bool(live_children() - children))
+        await cancel_after(5, settle=False)
+        assert pool_state("pdf")[2] == 0
+        holder.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await holder
+        await _until(lambda: live_children() == children)
+        # During the start, step by step.
+        for steps in range(40):
+            await cancel_after(steps)
+        # While the child runs, and twice during the cleanup.
+        for steps in (200, 400):
+            await cancel_after(steps)
+            await cancel_after(steps, twice=True)
+        gc.collect()
+        await asyncio.sleep(0.1)
+        gc.collect()
+    finally:
+        loop.set_exception_handler(None)
+    assert reported == []
+    assert_pool_restored("pdf", 1)
