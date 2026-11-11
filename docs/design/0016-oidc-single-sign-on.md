@@ -4,9 +4,12 @@ Status: Proposed 2026-11-11. Scope set by the owner: this ADR first, then OIDC o
 (authorization-code flow with PKCE, just-in-time users, config service, login UI),
 built in the phases below; SAML 2.0 is deferred to a follow-up issue. Thirteen
 decision points are listed under Decision, each marked DECIDED-BY-PRECEDENT (with the
-precedent cited) or OWNER DECISION (with a recommendation); the five OWNER DECISION
-items are repeated as one-word questions at the end. No code in this doc. Context
-verified against the HERD-public tree at `d27a9973` on 2026-11-11.
+precedent cited) or DECIDED BY THE OWNER. The five owner decisions (D1, D5, D7, D10,
+D12) were put to the owner as open questions in the first draft and decided by the
+owner on 2026-11-11, each as recommended; "Owner decisions" at the end lists them. The
+status stays Proposed until phase 6 ships and this record is amended as built. No code
+in this doc. Context verified against the HERD-public tree at `d27a9973` on
+2026-11-11.
 
 ## Context
 
@@ -141,8 +144,8 @@ Relevant existing fabric, verified:
 All new HTTP routes live on the auth service; nothing downstream changes.
 
 1. The login page asks auth `GET /login-options` (public) which method is active.
-2. The "Sign in with" button (the provider's display name follows) navigates the browser to `GET /api/auth/oidc/login`.
-   Auth creates a flow row (state, nonce, PKCE verifier, safe `next` path, a hash of
+2. The "Sign in with" button (the provider's display name follows) navigates the
+   browser to `GET /api/auth/oidc/login`. Auth creates a flow row (state, nonce, PKCE verifier, safe `next` path, a hash of
    a browser-binding secret), sets the binding secret as an HttpOnly cookie, and
    answers 302 to the IdP's authorization endpoint (`response_type=code`,
    `code_challenge_method=S256`, `response_mode=query`).
@@ -162,11 +165,12 @@ All new HTTP routes live on the auth service; nothing downstream changes.
 From step 4 on, the session is an ordinary HERD session: same JWT, same refresh
 rotation, same logout.
 
-### D1. Library: hand-rolled on httpx plus PyJWT, not authlib (OWNER DECISION)
+### D1. Library: hand-rolled on httpx plus PyJWT, not authlib (DECIDED BY THE OWNER)
 
-Recommendation: hand-roll the relying-party flow (discovery, authorization URL, code
-exchange, JWKS) on `httpx`, and verify the ID token with PyJWT through a second
-named decode helper. Tradeoff: about 300 lines of protocol code we own, against a new
+Decided by the owner on 2026-11-11, as recommended: hand-roll the relying-party flow
+(discovery, authorization URL, code exchange, JWKS) on `httpx`, and verify the ID
+token with PyJWT through a second named decode helper in `herd_common.jwt_codec`.
+Tradeoff: about 300 lines of protocol code we own, against a new
 dependency whose JOSE verification the repository's one-decode guard cannot see.
 
 Options considered:
@@ -310,7 +314,7 @@ login (IAM-LDAP-8).
 - Linking an existing local or LDAP account to an IdP identity is out of scope for v1
   (see Out of scope).
 
-### D5. `AUTH_METHOD=oidc` is an exclusive third mode; break-glass is an opt-in local superadmin login (OWNER DECISION)
+### D5. `AUTH_METHOD=oidc` is an exclusive third mode; break-glass is an opt-in local superadmin login (DECIDED BY THE OWNER, break-glass part)
 
 The exclusive mode itself is DECIDED-BY-PRECEDENT: `auth_method` is one global
 switch (`config.py:38-41`, IAM-LDAP-1), and in OIDC mode `POST /login` refuses and
@@ -318,18 +322,23 @@ switch (`config.py:38-41`, IAM-LDAP-1), and in OIDC mode `POST /login` refuses a
 rejected for v1: it doubles every refusal rule and the login page's states for no
 issue-stated need.
 
-The owner decision is break-glass. Recommendation: a new setting
-`OIDC_BREAK_GLASS_LOCAL_SUPERADMIN` (default `false`). When true, `POST /login` in
-OIDC mode accepts exactly one class of account: `auth_source="local"` with role
-`superadmin`; every other account gets the same 401 `Invalid credentials` and the
-dummy-hash timing equalization (IAM-LOGIN-2) still runs. Tradeoff: it reopens a
+Break-glass was decided by the owner on 2026-11-11, as recommended: a new setting
+`OIDC_BREAK_GLASS_LOCAL_SUPERADMIN` (default `false`). When false, `POST /login` in
+OIDC mode answers 401 `Invalid credentials` for every account, after running bcrypt
+against the dummy hash (IAM-LOGIN-2), so a refusal takes the same time as a wrong
+password. When true, `POST /login` in OIDC mode accepts exactly one class of account:
+`auth_source="local"`, role `superadmin`, `is_active` true, correct password; every
+other account (a local admin or user, an `oidc` or `ldap` account, an unknown email)
+gets the same 401 `Invalid credentials` with the same timing equalization. Auth logs
+one WARNING at startup whenever the setting is true in OIDC mode, so an operator who
+leaves it on sees it. Tradeoff: it reopens a
 password surface in an SSO deployment (default off keeps IAM-LDAP-1 semantics
 exactly), but under OIDC the IdP is often a third-party service HERD's operators
 cannot repair, and the LDAP-era break-glass (a superadmin API token minted in advance)
 needs foresight that a fresh OIDC deployment cannot have: with the switch off, a fresh
 OIDC install has no way to promote its first admin short of switching back to `local`.
-The alternative (mirror LDAP exactly, document the API-token path) is consistent and
-smaller, and is the fallback if the owner declines.
+The rejected alternative was to mirror LDAP exactly and document only the API-token
+path. The API-token path and the pre-switch refresh token still work as in LDAP mode.
 
 Refresh and API-token exchange keep ignoring the mode (IAM-USER-9), so existing
 sessions and API tokens survive an IdP outage until they expire.
@@ -344,7 +353,7 @@ the env seed (IAM-BOOT-1); under OIDC the seeded account is local, so it can sig
 only through D5's break-glass switch or an API token. Optional claim-to-role mapping
 and group claims are out.
 
-### D7. Session lifetime is HERD's refresh rotation; logout is local only (OWNER DECISION, on RP-initiated logout)
+### D7. Session lifetime is HERD's refresh rotation; logout is local only (DECIDED BY THE OWNER, on RP-initiated logout)
 
 DECIDED-BY-PRECEDENT for the lifetime: the issue says to carry the federated session
 into HERD's refresh rotation. HERD requests no IdP refresh token (no
@@ -357,9 +366,10 @@ disabled at the IdP keeps working in HERD until its refresh token expires or an 
 deactivates it in HERD; SCIM and back-channel logout, which would close that gap, are
 out of scope per the issue.
 
-Owner decision: RP-initiated logout through the IdP's `end_session_endpoint`.
-Recommendation: not in v1; HERD logout stays local (`POST /logout` revokes the HERD
-refresh token, IAM-UI-4). Tradeoff: after a HERD logout, "Sign in with SSO" may
+RP-initiated logout through the IdP's `end_session_endpoint` was decided by the owner
+on 2026-11-11, as recommended: not in v1, and it stays under Out of scope, consistent
+with issue #37, which keeps IdP-driven logout out of the first iteration. HERD logout
+stays local (`POST /logout` revokes the HERD refresh token, IAM-UI-4). Tradeoff: after a HERD logout, "Sign in with SSO" may
 re-enter silently while the IdP session lives, which surprises a user on a shared
 machine; doing it right needs the ID token kept as `id_token_hint` and a registered
 post-logout redirect URI, and is a clean follow-up.
@@ -427,7 +437,7 @@ Log and response rules for every OIDC module:
 - A caplog-based unit test drives every failure branch and asserts that none of the
   secret values above appears in any record (the shape of the #1252 profile-log rule).
 
-### D10. Config service gets the schema; the active method comes from auth's `GET /login-options`, not config's `GET /status` (OWNER DECISION)
+### D10. Config service gets the schema; the active method comes from auth's `GET /login-options`, not config's `GET /status` (DECIDED BY THE OWNER, on the source of the active method)
 
 DECIDED-BY-PRECEDENT for the bootstrap schema (ADR 0011 phase 5 added its keys;
 the issue audit names the gap): `AUTH_METHOD` gains the option `oidc`, and a new
@@ -438,19 +448,24 @@ guard does not cover the config service (CONVENTIONS, Config service), so this i
 checked by hand and by a config-service test that every `OIDC_*` schema key has a
 compose line.
 
-Owner decision: where the login page learns the active method. The issue says "the
-config-status path". Recommendation: a public `GET /login-options` on AUTH, answering
-from auth's live Settings: `{"auth_method": "local" | "ldap" | "oidc",
-"registration_open": bool, "password_login": bool, "sso": {"provider_name": str,
-"login_path": "/api/auth/oidc/login"} | null}`; config's `GET /status` stays
-unchanged. Tradeoff: one more request on the login page, but it is the only answer
+Where the login page learns the active method was decided by the owner on
+2026-11-11, as recommended: from a new public `GET /login-options` on AUTH, answering
+from auth's live Settings (shape in the API surface section below); config's
+`GET /status` stays unchanged. This departs, deliberately, from the wording of
+issue #37 ("Surface the active method through the config-status path the frontend already
+consults") and from its audit comment, which lists a `GET /status` change as a work
+item; that work item is closed by this decision, not done. The reason is staleness.
+Tradeoff: one more request on the login page, but it is the only answer
 that cannot lie. The config service can compute only what the config ladder SAYS, not
 what auth RUNS: a saved but unapplied `config.json` would report the new method early,
 and `_gate-ldap-stack-tests` already recreates only auth with `AUTH_METHOD=ldap`
 while config keeps `local`, so a config-sourced answer is wrong in our own gate today.
 It also keeps the herd_common-free config service from growing a second copy of the
 precedence ladder. `registration_open` lets the page hide Register in LDAP mode too,
-where `/register` already answers 409. The frontend treats any error from
+where `/register` already answers 409 while `LoginPage.tsx:96-101` still shows the
+link; that LDAP-mode change ships with phase 4 and is visible as soon as phases 3 and
+4 are both merged, ahead of phase 6, by decision (it removes a link that can only
+fail). The frontend treats any error from
 `GET /login-options` as local mode (the password form, today's behavior): the backend
 enforces the mode regardless, so this fallback widens nothing.
 
@@ -485,10 +500,15 @@ boundaries (CONVENTIONS throughout).
   address (`https://192.168.1.27/api/auth/oidc/callback`), never localhost; the
   certificate warning of issue #1239 applies to the callback like any other page.
 
-### D12. Test IdP and the five QA levels (OWNER DECISION, on the IdP)
+### D12. Test IdP and the five QA levels (DECIDED BY THE OWNER, on the IdP)
 
-Recommendation: Dex (`ghcr.io/dexidp/dex`, pinned by digest) as the containerized
-IdP, in a checked-in `infra/oidc-test/` lab that mirrors `infra/ldap-test/`. Tradeoff:
+Decided by the owner on 2026-11-11, as recommended: Dex (`ghcr.io/dexidp/dex`, pinned
+by digest) as the containerized IdP, in a checked-in `infra/oidc-test/` lab that
+mirrors `infra/ldap-test/`, with the measure-first step kept: phase 5a measures the
+three candidates and proves Dex against the issuer-reachability mechanism and PKCE
+and nonce enforcement before phase 5b builds on it. If Dex fails any of those, phase
+5a stops and returns the choice to the owner with the measurements; it does not
+switch IdPs on its own. Tradeoff:
 Dex is a real OIDC provider (its PKCE, nonce, and signing behavior are the behavior we
 must interoperate with) with a real login form for the browser test, at a fraction of
 Keycloak's footprint; it is less configurable per test than a mock, which is fine
@@ -564,7 +584,7 @@ Not per PR: the live levels, exactly as LDAP's. Adding Dex to the advisory per-P
 | `OIDC_PROVIDER_NAME` | `single sign-on` | Button text, "Sign in with ..." |
 | `OIDC_REQUIRE_HTTPS` | `true` | Refuse non-https issuer, endpoints, and redirect URI; false only for a lab, logs a warning |
 | `OIDC_CA_CERT` | empty | CA bundle path inside the container for a private IdP CA |
-| `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN` | `false` | D5, only if the owner approves it |
+| `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN` | `false` | D5: when true, `POST /login` in OIDC mode admits local superadmin accounts only; logs a startup warning when true in OIDC mode |
 
 Each one lands as a Settings field in `services/auth/app/config.py`, a
 `${VAR:-default}` line in the auth service's compose `environment:` block with the
@@ -580,21 +600,124 @@ refetch floor 60 s, HTTP timeouts 5 s connect and 10 s overall, prune batch 500,
 
 ### API surface (the contract phases 3 and 4 build against)
 
-Auth service paths; through the gateway each is prefixed with `/api/auth`.
+Paths are the auth service's own; through the gateway each is prefixed with
+`/api/auth` (the browser and the SPA use the prefixed form). "Not in OIDC mode" means
+`settings.auth_method != "oidc"`. Every fixed detail below is the exact string, used
+verbatim in the code and asserted verbatim in tests. A 404 or 401 body is FastAPI's
+`{"detail": "<string>"}`; a 422 is FastAPI's default validation body.
 
-| Method and path | Auth | Answer |
+#### Response models (`services/auth/app/schemas/auth.py`)
+
+| Model | Fields |
+|---|---|
+| `SsoOptions` | `provider_name: str` (the `OIDC_PROVIDER_NAME` value) |
+| `LoginOptionsResponse` | `auth_method: Literal["local", "ldap", "oidc"]`, `registration_open: bool`, `password_login: bool`, `sso: Optional[SsoOptions]` (null outside OIDC mode) |
+| `OidcExchangeRequest` | no fields, `model_config = {"extra": "forbid"}`; the body is exactly `{}` |
+| `OidcExchangeResponse` | subclasses `TokenResponse` (`access_token: str`, `refresh_token: str`, `token_type: str = "bearer"`) and adds `next: str` |
+
+`GET /login-options` answers, per mode:
+
+| `auth_method` | `registration_open` | `password_login` | `sso` |
+|---|---|---|---|
+| `local` | `true` | `true` | `null` |
+| `ldap` | `false` | `true` | `null` |
+| `oidc` | `false` | the value of `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN` | `{"provider_name": ...}`, also when OIDC settings are incomplete (the begin route then answers `unavailable`) |
+
+#### Routes
+
+| Method and path | Caller credential | Request | Success | Failures (status, fixed detail or Location) |
+|---|---|---|---|---|
+| `GET /login-options` | none | none | 200 `LoginOptionsResponse` (table above); `Cache-Control: no-store` | none; answers in every mode |
+| `GET /oidc/login` | none | optional query `next` (D11; an invalid value becomes `/topology`, never an error) | 302, `Location` = the IdP authorization URL (see IdP-facing requests), sets `herd_oidc_flow`; `Cache-Control: no-store` | 404 `Single sign-on is not enabled` when not in OIDC mode; 302 `Location: /login?sso_error=unavailable` when OIDC settings are incomplete or discovery cannot be fetched or validated |
+| `GET /oidc/callback` | `herd_oidc_flow` cookie | query `state`, and either `code` or `error`; optional `error_description` (logged only) and `iss`; other parameters ignored | 302 `Location: /login/sso`, sets `herd_oidc_handoff`, clears `herd_oidc_flow`; `Cache-Control: no-store` | 404 `Single sign-on is not enabled` when not in OIDC mode; otherwise always a 302 that clears `herd_oidc_flow`, `Location` per the callback outcome table below |
+| `POST /oidc/exchange` | `herd_oidc_handoff` cookie | JSON body `{}` (`OidcExchangeRequest`) | 200 `OidcExchangeResponse`, clears `herd_oidc_handoff`; `Cache-Control: no-store` | 404 `Single sign-on is not enabled` when not in OIDC mode; 422 for a missing, non-JSON, or non-empty body; 401 `Single sign-on session expired; sign in again` when the cookie is missing, unknown, already exchanged, expired, or its user is now inactive (the cookie is cleared on the 401 too) |
+| `POST /login` | none | `LoginRequest`, unchanged | local and LDAP modes unchanged; OIDC mode with `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN=true` and an active local superadmin with the right password: 200 `TokenResponse` | OIDC mode, every other case: 401 `Invalid credentials` with `WWW-Authenticate: Bearer`, after the dummy-hash bcrypt (D5) |
+| `POST /register` | none | `RegisterRequest`, unchanged | local mode unchanged | OIDC mode: 409 `Local registration is disabled; this deployment uses single sign-on.`, before the body is used (the IAM-REG-1 shape); LDAP mode unchanged |
+| `POST /refresh`, `POST /logout`, `POST /tokens/exchange` | unchanged | unchanged | unchanged in every mode (IAM-USER-9) | unchanged |
+
+Callback outcome (first matching row wins; every failure row also moves a claimed flow
+row to `failed`):
+
+| Condition | `Location` |
+|---|---|
+| `state` missing, no `pending` row for it, the row expired, `herd_oidc_flow` missing, or its hash differs from `binding_hash` | `/login?sso_error=failed` |
+| `error=access_denied` | `/login?sso_error=cancelled` |
+| any other `error` value, or neither `code` nor `error` present | `/login?sso_error=failed` |
+| `iss` present and not equal to `OIDC_ISSUER` | `/login?sso_error=failed` |
+| OIDC settings incomplete; discovery, JWKS, or token endpoint unreachable, timed out, non-JSON, or answering 5xx | `/login?sso_error=unavailable` |
+| token endpoint answers 4xx (for example `invalid_grant`) or no `id_token` | `/login?sso_error=failed` |
+| ID-token verification fails (any D8 or D13 rule) | `/login?sso_error=failed` |
+| provisioning refused (D4: email missing or unverified, email or username taken, username too long) | `/login?sso_error=failed` |
+| linked user inactive | `/login?sso_error=failed` |
+| success | `/login/sso` |
+
+#### Cookies
+
+| Name | Value | Attributes | Set by | Cleared by |
+|---|---|---|---|---|
+| `herd_oidc_flow` | 32 random bytes, base64url | HttpOnly, Secure, SameSite=Lax, Max-Age 600, Path = the D11 cookie path | `GET /oidc/login` (a second begin in another tab replaces it, so the first tab's callback then fails as `failed`) | every callback response |
+| `herd_oidc_handoff` | 32 random bytes, base64url | HttpOnly, Secure, SameSite=Strict, Max-Age 60, same Path | a successful callback | every exchange response |
+
+"Cleared" means a `Set-Cookie` with the same name and Path, an empty value, and
+Max-Age 0.
+
+#### IdP-facing requests
+
+- Authorization URL: the discovery document's `authorization_endpoint` with query
+  `response_type=code`, `client_id`, `redirect_uri` (`OIDC_REDIRECT_URI`), `scope`
+  (`OIDC_SCOPES`), `state`, `nonce`, `code_challenge` (base64url of the SHA-256 of the
+  verifier, no padding), `code_challenge_method=S256`, `response_mode=query`.
+  `state` and `nonce` are 32 random bytes, base64url; the verifier is 64 characters
+  from the RFC 7636 unreserved set.
+- Token request: `POST` to `token_endpoint`, form-encoded `grant_type=authorization_code`,
+  `code`, `redirect_uri`, `code_verifier`, with HTTP Basic authentication of the
+  form-urlencoded `OIDC_CLIENT_ID` and `OIDC_CLIENT_SECRET` (RFC 6749 section 2.3.1).
+  Only `id_token` is read from the answer.
+
+#### Frontend contract (phase 4)
+
+- `LoginPage` calls `GET /api/auth/login-options` on mount. On any error it renders
+  today's page unchanged (D10). With `sso` present it renders a primary button
+  `Sign in with {provider_name}` that sets `window.location.href` to
+  `/api/auth/oidc/login` (no `next` in v1; the backend defaults to `/topology`). The
+  password form renders when `password_login` is true; in OIDC mode it sits behind a
+  collapsed "Administrator sign-in" toggle. The Register link renders only when
+  `registration_open` is true, which hides it in LDAP mode.
+- `LoginPage` reads `sso_error` from the query string and shows one toast:
+  `cancelled` gives `Sign-in was cancelled.`; `unavailable` gives
+  `Single sign-on is unavailable right now. Try again later.`; `failed` and any other
+  value give `Single sign-on failed. If this continues, contact an administrator.`
+  Then it removes the parameter with a `replace` navigation.
+- New route `/login/sso` (`frontend/src/pages/OidcCompletePage.tsx`, outside
+  `AppLayout`, under `GuestGuard`) posts `{}` to `/api/auth/oidc/exchange` exactly
+  once per mount, guarded by a ref so React StrictMode's double effect cannot spend
+  the single-use handoff twice. On 200 it calls `setTokens`, invalidates
+  `currentUser`, and navigates to `next` with `replace`; on any error it navigates to
+  `/login?sso_error=failed` with `replace`.
+- `frontend/src/api/client.ts` adds `/auth/oidc/exchange` to the paths the refresh
+  interceptor skips, beside `/auth/refresh` and `/auth/login`.
+
+#### Internal interfaces between phases
+
+These signatures let phases 1 and 2 be built in parallel and joined in phase 3. Every
+function is `async`; secrets passed in are the raw values, and only their SHA-256
+hashes (`hash_token`) are stored.
+
+| Phase and module | Function and arguments | Returns |
 |---|---|---|
-| `GET /login-options` | none | 200 JSON (D10), every mode |
-| `GET /oidc/login?next=<path>` | none | 302 to the IdP and sets `herd_oidc_flow`; 302 `/login?sso_error=unavailable` on IdP or config failure; 404 `Single sign-on is not enabled` when not in OIDC mode |
-| `GET /oidc/callback` | none (state plus binding cookie) | 302 `/login/sso` and sets `herd_oidc_handoff`, clears `herd_oidc_flow`; 302 `/login?sso_error=cancelled` or `failed` or `unavailable`; 404 when not in OIDC mode |
-| `POST /oidc/exchange` | handoff cookie | 200 `OidcExchangeResponse`; 401 `Single sign-on session expired; sign in again`; 404 when not in OIDC mode |
-| `POST /login` | none | OIDC mode: 401 `Invalid credentials` for every account, except a local superadmin when D5's switch is on |
-| `POST /register` | none | OIDC mode: 409 `Local registration is disabled; this deployment uses single sign-on.` |
+| 1, `oidc_service.py` | `build_authorization_request()` | `AuthorizationRequest`, a frozen dataclass: `url`, `state`, `nonce`, `code_verifier` |
+| 1, `oidc_service.py` | `redeem_code(code, code_verifier, nonce)` (fetch discovery and JWKS, exchange, verify) | `VerifiedIdToken`, a frozen dataclass: `issuer`, `subject`, `email` (optional), `email_verified` (optional bool), `username_claim` (optional), `name` (optional) |
+| 2, `oidc_flow_service.py` | `start_flow(db, *, state, nonce, code_verifier, binding_secret, next_path)` | the new flow id (`uuid.UUID`) |
+| 2, `oidc_flow_service.py` | `claim_flow(db, *, state, binding_secret)` | `ClaimedFlow` (`id`, `nonce`, `code_verifier`, `next_path`), or None when no guarded UPDATE matched |
+| 2, `oidc_flow_service.py` | `complete_flow(db, flow_id, *, user_id, handoff_secret)`; `fail_flow(db, flow_id)` | bool, whether the guarded UPDATE matched |
+| 2, `oidc_flow_service.py` | `exchange_handoff(db, *, handoff_secret)` | a (user id, `next_path`) pair, or None |
+| 2, `auth_service.py` | `resolve_federated_user(db, login)`, where `login` is a `FederatedLogin` frozen dataclass (`issuer`, `subject`, `email`, `email_verified`, `username`, `full_name`) defined in phase 2 | the `User`, or None for every D4 refusal and every inactive user, each logged with a fixed `reason` in `extra` |
 
-The frontend adds the SPA route `/login/sso` (outside `AppLayout`, under
-`GuestGuard`), adds `/auth/oidc/exchange` to the refresh interceptor's skip list in
-`frontend/src/api/client.ts`, and maps `sso_error` to three fixed messages on
-`LoginPage`.
+Phase 1's errors are `OidcUnavailableError` (the callback maps it to `unavailable`)
+and `OidcRejectedError` (mapped to `failed`); neither carries IdP text in its `str()`.
+The modules live under `services/auth/app/services/`. Phase 3 maps `VerifiedIdToken`
+to `FederatedLogin` (username is the claim value, or the email when the claim is
+absent; `full_name` is `name` truncated to 200 characters, or the username).
 
 ## Consequences
 
@@ -632,16 +755,21 @@ included.
   `UNVERIFIED_READ_ALLOWED` entry, docstring updated to stay exactly true.
 - `services/auth/app/services/oidc_service.py` (new): discovery fetch and validation,
   JWKS cache and key selection, authorization-URL builder (PKCE S256), code exchange,
-  ID-token verification (`azp`, nonce, `email_verified`), the transport seam.
-- `services/auth/app/config.py`: the twelve (or eleven, per D5) settings, the
-  algorithm `Literal`, a startup-warning helper; `auth_method` is NOT widened.
+  ID-token verification (`azp`, nonce, `email_verified`), the transport seam; the
+  phase 1 signatures under "Internal interfaces between phases".
+- `services/auth/app/config.py`: all twelve settings of the Settings section,
+  `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN` included (its field only; its behavior lands in
+  phase 3), the algorithm `Literal`, and a startup-warning helper (missing settings,
+  `OIDC_REQUIRE_HTTPS=false`, break-glass on); `auth_method` is NOT widened.
 - `docker-compose.yml` (auth block), `.env.example`, `docs/ENV_VARS.md` (new OIDC
   section).
 - `services/auth/pyproject.toml` (`pyjwt[crypto]`), `services/common/pyproject.toml`
   (dev `pyjwt[crypto]`), `uv.lock` (one `uv lock`; `uv lock --check` is a gate step).
-- Tests: `services/auth/tests/test_oidc_service.py`, `test_oidc_settings.py`,
-  `services/common/tests/test_jwt_codec.py` additions (unit level; every claim and
-  algorithm refusal with a mutation proof for the guard change).
+- Tests: `services/auth/tests/test_oidc_service.py`, `test_oidc_settings.py` (every
+  default, the compose pairing through the existing guard, the algorithm refusal at
+  load, each startup warning), `services/common/tests/test_jwt_codec.py` additions
+  (unit level; every claim and algorithm refusal, with a mutation proof for the guard
+  change).
 - Docs: `docs/specs/identity-and-access.md` (IAM-JWT-5 text names the second
   decode), `docs/specs/CONVENTIONS.md` (Auth and identity: the second decode helper and
   the OIDC log rules).
@@ -653,10 +781,11 @@ included.
   imported in `services/auth/app/main.py` beside the other models so `create_all`
   sees them.
 - `services/auth/app/services/oidc_flow_service.py` (new): create with pruning,
-  claim, authenticate, fail, exchange; every transition one guarded UPDATE.
-- `services/auth/app/services/auth_service.py`: `create_oidc_user` and the
-  (issuer, sub) resolver with the D4 refusals, taking a plain input dataclass defined
-  in this phase (so it does not import phase 1's module).
+  claim, authenticate, fail, exchange; every transition one guarded UPDATE; the phase
+  2 signatures under "Internal interfaces between phases".
+- `services/auth/app/services/auth_service.py`: `create_oidc_user` and
+  `resolve_federated_user` with the D4 refusals, taking the `FederatedLogin`
+  dataclass defined in this phase (so it does not import phase 1's module).
 - Tests: `services/auth/tests/test_oidc_flow_service.py`,
   `test_oidc_provisioning.py` (unit, SQLite); `test_oidc_flow_service_live_pg.py`
   (Postgres-live races) added to the `_gate-pg-live-tests` recipe in the `Makefile`
@@ -667,38 +796,57 @@ included.
 ### Phase 3: routes and mode wiring, still dark (L)
 
 - `services/auth/app/routers/oidc.py` (new): `GET /oidc/login`, `GET /oidc/callback`,
-  `POST /oidc/exchange`; `GET /login-options` (on `routers/auth.py` or the new
-  router); cookie helpers deriving Path from `OIDC_REDIRECT_URI`.
-- `services/auth/app/schemas/auth.py`: `LoginOptionsResponse`,
-  `OidcExchangeResponse`.
-- `services/auth/app/services/auth_service.py`: `authenticate_user` refuses in OIDC
-  mode (with D5's exception if approved); `services/auth/app/routers/auth.py`:
-  `register` 409 in OIDC mode.
+  `POST /oidc/exchange`, with the callback outcome table and the cookie table of the
+  API surface section; cookie helpers deriving Path from `OIDC_REDIRECT_URI`.
+- `services/auth/app/routers/auth.py`: `GET /login-options`, answering in every mode
+  per the per-mode table (so `registration_open` is `false` in LDAP mode from this
+  phase on); `register` 409 in OIDC mode.
+- `services/auth/app/schemas/auth.py`: `SsoOptions`, `LoginOptionsResponse`,
+  `OidcExchangeRequest`, `OidcExchangeResponse`.
+- `services/auth/app/services/auth_service.py`: `authenticate_user` in OIDC mode
+  refuses every account, or with `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN=true` admits only
+  an active local superadmin (D5), running the dummy-hash bcrypt on every refusal.
 - `services/auth/app/main.py`: include the router.
 - `tests/contract/snapshots/auth.json`: regenerated with
   `HERD_UPDATE_OPENAPI_SNAPSHOTS=1 make test-contract` against a running stack.
-- Tests: `services/auth/tests/test_oidc_routes.py` (functional, MockTransport IdP:
-  happy path to `GET /me` and `POST /refresh`, and every refusal in D13 over HTTP);
-  additions to `test_auth_ldap.py` style mode tests for `/login` and `/register`.
-- Docs: spec API surface, Errors, and Features sections; `docs/ROLES.md` endpoint
-  matrix (four public routes).
+- Tests (functional, through the real auth app; MockTransport IdP):
+  `services/auth/tests/test_oidc_routes.py`, the happy path to `GET /me` and
+  `POST /refresh`, every row of the callback outcome table, every exchange failure,
+  each cookie's attributes, and every refusal in D13 over HTTP;
+  `services/auth/tests/test_login_options.py`, all three modes including
+  `password_login` following the break-glass setting;
+  `services/auth/tests/test_oidc_break_glass.py`: in OIDC mode with the setting off,
+  a local superadmin with the right password gets 401; with it on, that superadmin gets
+  200 while a local admin, a local user, an `oidc` account, an `ldap` account, an
+  inactive local superadmin, and an unknown email each get 401 `Invalid credentials`;
+  the dummy hash runs on every refusal (asserted by spying on `verify_password`); and
+  the startup warning fires only when the setting is true in OIDC mode. `/register`
+  409 in OIDC mode beside the LDAP-mode tests in `test_auth_ldap.py`.
+- Docs: spec API surface, Errors, and Features sections (the break-glass rule numbered
+  with its tests); `docs/ROLES.md` endpoint matrix (four public routes).
 
 ### Phase 4: frontend, still dark (M)
 
 - `frontend/src/api/auth.ts` (`useLoginOptions`, `exchangeOidcHandoff`),
   `frontend/src/types/auth.types.ts`, `frontend/src/api/client.ts` (skip list).
-- `frontend/src/pages/LoginPage.tsx`: SSO button when `auth_method == "oidc"`,
-  password form only when `password_login`, Register link only when
-  `registration_open`, the three `sso_error` messages; the fallback on a
-  `/login-options` error is today's form (D10).
+- `frontend/src/pages/LoginPage.tsx`, per "Frontend contract (phase 4)": SSO button
+  when `sso` is present, password form only when `password_login` (behind the
+  "Administrator sign-in" toggle in OIDC mode), Register link only when
+  `registration_open` (this hides it in LDAP mode; record it in the phase's CHANGELOG
+  line as a visible LDAP-mode change), the three `sso_error` messages; the fallback on
+  a `/login-options` error is today's page (D10).
 - `frontend/src/pages/OidcCompletePage.tsx` (new) and `frontend/src/routes.tsx`
   (`/login/sso` under `GuestGuard`); `frontend/src/test/pages/pageScrollContainer.test.tsx`
   (`OUTSIDE_LAYOUT_PAGES`); `frontend/src/test/routes.test.tsx` if its literal lists
   change.
-- Tests: vitest for both pages and the API hooks with msw handlers; the existing
+- Tests: vitest for both pages and the API hooks with msw handlers: each mode's
+  rendering, the Register link absent in LDAP mode and present in local mode, the
+  error fallback, each `sso_error` message and its removal from the URL, a single
+  exchange POST under StrictMode, and both exchange outcomes; the existing
   `LoginPage.test.tsx` cases keep passing in local mode.
 - Dark by construction: until phase 3 is deployed, `GET /login-options` answers 404
-  and the page renders today's form.
+  and the page renders today's form; after phase 3, only the LDAP-mode Register link
+  changes before phase 6.
 
 ### Phase 5a: the OIDC test lab and the live service suite (S to M)
 
@@ -710,8 +858,11 @@ included.
   `_gate-ldap-tests`.
 - `services/auth/tests/test_oidc_service_live.py` (functional, live Dex: discovery,
   JWKS, a full code exchange driven over HTTP through Dex's login form).
-- Proves the issuer-reachability mechanism of D12 and measures the three candidate
-  images; if Dex fails it, this phase reopens D12 before 5b.
+- Measure first (D12, decided): before the lab files are final, record image size
+  and cold-start time for Dex, Keycloak, and mock-oauth2-server, prove the
+  issuer-reachability mechanism, and prove that Dex refuses a wrong `code_verifier`
+  and echoes the `nonce`. If Dex fails any of those, stop and return the choice to the
+  owner with the numbers.
 - Docs: `docs/specs/TESTING.md` (an OIDC test directory section beside the LDAP one),
   `docs/specs/DEVELOPMENT.md` (targets).
 
@@ -722,10 +873,15 @@ included.
   auth with `AUTH_METHOD=oidc` and the lab settings, run, restore local mode in a
   trap), wired into `master`, `everything`, and `.github/workflows/nightly.yml`
   (start and stop steps beside the LDAP ones, diagnostics before teardown).
-- `tests/integration/test_oidc_auth.py`, `tests/load/locustfile.py`
-  (`OidcLoginUser`), `tests/e2e/test_oidc_login_playwright.py`,
-  `tests/e2e/conftest.py` (`pw_oidc_browser`).
-- Docs: `docs/specs/TESTING.md`, `docs/GAPS.md` if any level stays partial.
+- `tests/integration/test_oidc_auth.py` (including `GET /login-options` and, with
+  break-glass off as the phase configures it, the seeded superadmin's `POST /login`
+  refused), `tests/load/locustfile.py` (`OidcLoginUser`),
+  `tests/e2e/test_oidc_login_playwright.py`, `tests/e2e/conftest.py`
+  (`pw_oidc_browser`).
+- Coverage gap, by decision: break-glass ON is exercised at the functional level
+  (phase 3) only, not against a running stack, because a second recreate of the gate
+  auth service costs a full restart cycle for one branch; recorded in `docs/GAPS.md`.
+- Docs: `docs/specs/TESTING.md`, `docs/GAPS.md`.
 
 ### Phase 6: light up (M)
 
@@ -766,7 +922,7 @@ per phase; the second PR to land rebases them. Phase 5a also edits the `Makefile
 - SAML 2.0 (follow-up issue, below).
 - Directory or IdP group claims as a membership source; claim-to-role mapping (D6).
 - IdP-initiated, back-channel, or front-channel logout; RP-initiated logout (D7,
-  recommended deferral).
+  deferred by the owner on 2026-11-11).
 - SCIM provisioning and deprovisioning.
 - More than one IdP per deployment; local plus OIDC side by side (D5).
 - Linking or converting an existing local or LDAP account to a federated identity.
@@ -791,14 +947,16 @@ difference from D11 that ADR must justify), XML signature validation (a library
 choice: signxml or python3-saml, with an XML-hardening review), SP metadata
 publication, and an IdP test container that speaks SAML.
 
-## Open questions for the owner
+## Owner decisions
 
-Each can be answered in one word.
+The first draft put five questions to the owner. All five were decided by the owner on
+2026-11-11, each as recommended; no owner question remains open. The one condition
+still pending is the phase 5a measurement, which can return D12 to the owner.
 
-1. D1 library: `handrolled` or `authlib`? Recommended: handrolled.
-2. D5 break-glass: add the opt-in local superadmin login, `yes` or `no`?
-   Recommended: yes (default off).
-3. D7 RP-initiated logout in v1: `yes` or `no`? Recommended: no.
-4. D10 source of the active method: `auth` (`GET /login-options`) or `config`
-   (`GET /status`)? Recommended: auth.
-5. D12 test IdP: `dex`, `keycloak`, or `mock`? Recommended: dex.
+| Decision | Outcome | Lands in |
+|---|---|---|
+| D1 library | hand-rolled on httpx plus PyJWT, `decode_id_token` in `herd_common.jwt_codec` | phase 1 |
+| D5 break-glass | exclusive `oidc` mode with `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN`, default off | field in phase 1; behavior and tests in phase 3; stack check (off) in phase 5b; handbook in phase 6 |
+| D7 RP-initiated logout | not in v1; stays in Out of scope | none |
+| D10 active-method source | auth's public `GET /login-options`; config's `GET /status` unchanged, departing from the issue's wording because of staleness | endpoint in phase 3; login page and the LDAP-mode Register link in phase 4 |
+| D12 test IdP | Dex, measured and proved first | phase 5a, then 5b |
