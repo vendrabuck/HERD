@@ -10,8 +10,10 @@ redelivery/heal of the whole apply. Same harness as test_nats_consumer_l2_reconc
 in-memory SQLite, mocked sandbox, driven through handle_wiring_changed.
 """
 
+import json
 import logging
 import uuid
+from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -19,12 +21,14 @@ from app.database import Base
 from app.models.l2_port_assignment import L2PortAssignment
 from app.models.vlan_assignment import VlanAssignment
 from app.services.nats_consumer import (
+    TransientUpstreamError,
     _derive_l2_definition_scope,
     _derive_l2_memberships,
     _FetchContext,
     _release_orphaned_allocations,
     handle_wiring_changed,
 )
+from herd_common.logging import JSONFormatter
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -59,9 +63,13 @@ def _db_session_factory():
     return lambda: _Ctx()
 
 
-SW_L2 = str(uuid.uuid4())
-SW_MID = str(uuid.uuid4())
-SW_L2_B = str(uuid.uuid4())
+# Fixed, ordered ids (issue #1209 review): defined_switch_ids is stored sorted, so with
+# these SW_L2 < SW_MID < SW_L2_B < SW_L2_C always, and a test that cuts the stored order
+# at SW_MID has the same strength on every run.
+SW_L2 = "11111111-1111-4111-8111-111111111111"
+SW_MID = "22222222-2222-4222-8222-222222222222"
+SW_L2_B = "33333333-3333-4333-8333-333333333333"
+SW_L2_C = "44444444-4444-4444-8444-444444444444"
 SW_L1 = str(uuid.uuid4())
 DUT1 = str(uuid.uuid4())
 DUT2 = str(uuid.uuid4())
@@ -91,6 +99,7 @@ DEVICES = {
     SW_L2: _dev(SW_L2, "Layer 2 Switch", "L2-A"),
     SW_MID: _dev(SW_MID, "Layer 2 Switch", "L2-MID"),
     SW_L2_B: _dev(SW_L2_B, "Layer 2 Switch", "L2-B"),
+    SW_L2_C: _dev(SW_L2_C, "Layer 2 Switch", "L2-C"),
     SW_L1: _dev(SW_L1, "Layer 1 Switch", "L1"),
     DUT1: _dev(DUT1, "Server", "dut1"),
     DUT2: _dev(DUT2, "Server", "dut2"),
@@ -577,6 +586,258 @@ async def test_no_same_number_allocation_asks_cabling_nothing():
         ("delete_vlan", SW_L2, 300)
     ]
     fetch.assert_not_awaited()
+
+
+# --- an upstream read failing inside one allocation's deletes (issue #1209) ---
+#
+# The invariant: a TransientUpstreamError raised while one orphaned allocation's
+# delete_vlan reads its switch or template from inventory never stops the pass from
+# handling the allocations after it, and never leaves defined_switch_ids claiming less
+# than may be on the hardware (the switches not proven deleted stay listed) or more
+# (a switch whose delete succeeded is trimmed). The failing read happens before any
+# driver call, so the failing switch's definition is still there.
+
+# The text a failing read carries. It must never reach the log line.
+UPSTREAM_TEXT = "inventory answered 500: db password=hunter2 at 10.9.8.7"
+UPSTREAM_FAILED_ACTION = "vlan_delete_upstream_failed"
+
+
+def _inventory_failing_for(failing: set[str], read: str):
+    """Patches for inventory's switch and template reads. For a switch in `failing`,
+    the `read` named ("device" or "template") raises TransientUpstreamError carrying
+    UPSTREAM_TEXT; every other read answers from DEVICES and TEMPLATE_DATA."""
+
+    async def _device(device_id, client=None):
+        if str(device_id) in failing:
+            if read == "device":
+                raise TransientUpstreamError(UPSTREAM_TEXT)
+            return {**DEVICES[str(device_id)], "template_id": "tmpl-unreadable"}
+        return DEVICES.get(str(device_id))
+
+    async def _template(template_id, client=None):
+        if template_id == "tmpl-unreadable":
+            raise TransientUpstreamError(UPSTREAM_TEXT)
+        return TEMPLATE_DATA
+
+    return [
+        patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device)),
+        patch("app.services.nats_consumer._fetch_template", new=AsyncMock(side_effect=_template)),
+    ]
+
+
+async def _release_in_order(va_ids, failing, read="device", execute_fn=None, calls=None):
+    """Run _release_orphaned_allocations over `va_ids` IN THE ORDER GIVEN (a list: the
+    function only iterates its argument, and a set would make "the allocation after
+    the failing one" depend on hashing). No allocation here has a same-number rival,
+    so cabling must never be asked."""
+    if execute_fn is None:
+        execute_fn, calls = _recorder()
+    with ExitStack() as stack:
+        for p in _inventory_failing_for(failing, read):
+            stack.enter_context(p)
+        stack.enter_context(
+            patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/d"))
+        )
+        stack.enter_context(
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn)
+        )
+        stack.enter_context(
+            patch(
+                "app.services.vlan_service.fetch_fabric_id",
+                new=AsyncMock(side_effect=AssertionError("cabling must not be asked")),
+            )
+        )
+        await _release_orphaned_allocations(
+            list(va_ids), _db_session_factory(), _FetchContext(None)
+        )
+    return calls
+
+
+async def _allocations_by_id(va_ids):
+    async with TestSessionLocal() as s:
+        rows = (
+            (await s.execute(select(VlanAssignment).where(VlanAssignment.id.in_(list(va_ids)))))
+            .scalars()
+            .all()
+        )
+    return {r.id: r for r in rows}
+
+
+def _upstream_failed_records(caplog):
+    return [r for r in caplog.records if getattr(r, "action", None) == UPSTREAM_FAILED_ACTION]
+
+
+def _assert_class_name_only(record):
+    """The formatted line names the exception class and carries none of its text."""
+    formatted = JSONFormatter("execution").format(record)
+    payload = json.loads(formatted)
+    assert payload["action"] == "vlan_delete_upstream_failed"
+    assert payload["error_class"] == "TransientUpstreamError"
+    assert "TransientUpstreamError" in payload["message"]
+    for leaked in ("hunter2", "10.9.8.7", "inventory answered"):
+        assert leaked not in formatted, f"upstream text {leaked!r} reached the log line"
+    return payload
+
+
+@pytest.mark.parametrize("read", ["device", "template"])
+@pytest.mark.parametrize("failing_index", [0, 1, 2])
+async def test_release_upstream_failure_skips_only_that_allocation(failing_index, read, caplog):
+    """Three orphaned allocations, each defined on its own switch; the switch (or
+    template) read of the one at `failing_index` raises. Every other allocation is
+    released and its delete runs and trims its switch, before and AFTER the failing
+    one; the failing allocation is released with its switch still listed (no driver
+    call reached it, so the definition is still there); one line is logged with the
+    fixed action and the class name only; the call does not raise."""
+    switches = [SW_L2, SW_MID, SW_L2_B]
+    vlans = [100, 200, 300]
+    ids = [
+        await _seed_allocation(RES_ID, uuid.uuid4(), vlan, [sw], [sw])
+        for sw, vlan in zip(switches, vlans, strict=True)
+    ]
+    failing = switches[failing_index]
+
+    with caplog.at_level(logging.ERROR, logger="app.services.nats_consumer"):
+        calls = await _release_in_order(ids, {failing}, read)
+
+    expected_deletes = [
+        (sw, vlan)
+        for i, (sw, vlan) in enumerate(zip(switches, vlans, strict=True))
+        if i != failing_index
+    ]
+    assert [(c[1], c[3]) for c in calls if c[0] == "delete_vlan"] == expected_deletes
+    assert failing not in {c[1] for c in calls}, "no driver session opened on the failing switch"
+    rows = await _allocations_by_id(ids)
+    for i, va_id in enumerate(ids):
+        assert rows[va_id].status == "RELEASED"
+        expected_defined = [failing] if i == failing_index else []
+        assert rows[va_id].defined_switch_ids == expected_defined, (
+            f"allocation {i}: defined_switch_ids must list exactly what may still be defined"
+        )
+    (record,) = _upstream_failed_records(caplog)
+    payload = _assert_class_name_only(record)
+    assert payload["vlan_assignment_id"] == str(ids[failing_index])
+    assert payload["reservation_id"] == RES_ID
+    assert payload["vlan_id"] == vlans[failing_index]
+    assert payload["switch_ids"] == [failing]
+    assert not [r for r in caplog.records if getattr(r, "action", None) == "vlan_delete_unjudged"]
+
+
+@pytest.mark.parametrize("first_delete", ["succeeds", "fails_at_the_driver"])
+async def test_release_upstream_failure_on_a_later_switch_keeps_what_is_not_proven_deleted(
+    first_delete, caplog
+):
+    """A multi-switch allocation defined on [SW_L2, SW_MID, SW_L2_B] (stored order),
+    then a single-switch allocation on SW_L2_C. SW_MID's read raises.
+
+    - SW_L2 was handled before the failure: when its delete succeeded it leaves
+      defined_switch_ids; when its delete failed at the driver it stays listed (the
+      existing delete-failure rule).
+    - SW_MID (the failing read) and SW_L2_B (never attempted: the rest of THIS
+      allocation's deletes stop at the failure) stay listed.
+    - The next allocation is still released and its delete runs."""
+    order = [SW_L2, SW_MID, SW_L2_B]
+    multi = await _seed_allocation(RES_ID, uuid.uuid4(), 100, order, order)
+    after = await _seed_allocation(RES_ID, uuid.uuid4(), 200, [SW_L2_C], [SW_L2_C])
+    if first_delete == "succeeds":
+        execute_fn, calls = _recorder()
+    else:
+        execute_fn, calls = _recorder(fail={"delete_vlan"}, fail_on_switch=SW_L2)
+
+    with caplog.at_level(logging.ERROR, logger="app.services.nats_consumer"):
+        await _release_in_order([multi, after], {SW_MID}, execute_fn=execute_fn, calls=calls)
+
+    deleted_on = [c[1] for c in calls if c[0] == "delete_vlan"]
+    assert SW_MID not in deleted_on and SW_L2_B not in deleted_on
+    assert deleted_on[-1] == SW_L2_C, "the next allocation's delete still runs"
+    assert set(deleted_on[:-1]) == {SW_L2}
+    rows = await _allocations_by_id([multi, after])
+    assert rows[multi].status == "RELEASED" and rows[after].status == "RELEASED"
+    if first_delete == "succeeds":
+        assert rows[multi].defined_switch_ids == [SW_MID, SW_L2_B], (
+            "the switch whose delete succeeded is trimmed; the rest stay listed"
+        )
+    else:
+        assert rows[multi].defined_switch_ids == [SW_L2, SW_MID, SW_L2_B]
+    assert rows[after].defined_switch_ids == []
+    (record,) = _upstream_failed_records(caplog)
+    payload = _assert_class_name_only(record)
+    assert payload["vlan_assignment_id"] == str(multi)
+    assert payload["switch_ids"] == [SW_MID, SW_L2_B], "the switches the deletes did not reach"
+
+
+async def test_reconcile_release_tail_upstream_failure_still_stamps_the_version(caplog):
+    """The same catch through the reconcile's L2 apply tail. Version 1 defines the
+    chain's VLAN on SW_L2, SW_MID, SW_L2_B (stored sorted); version 2 drops every wire,
+    so the allocation is orphaned and released, and SW_MID's read (transit-only, read
+    by nothing else in this delivery) fails at its delete. The switch ids are fixed and
+    ordered, so SW_MID always sits in the middle of the stored order: SW_L2's delete
+    runs and is trimmed, SW_MID and SW_L2_B (never tried) stay listed. The reconcile
+    completes and stamps version 2 (before #1209 the error escaped the apply and nacked
+    the reconcile)."""
+    from app.models.reservation_wiring_state import ReservationWiringState
+
+    await _reconcile(CHAIN_WIRES, fork_version=1)
+    (alloc,) = await _allocation()
+    assert alloc.defined_switch_ids == [SW_L2, SW_MID, SW_L2_B], "stored sorted"
+
+    execute_fn, calls = _recorder()
+    with ExitStack() as stack:
+        for p in _patches(execute_fn, []):
+            stack.enter_context(p)
+        for p in _inventory_failing_for({SW_MID}, "device"):
+            stack.enter_context(p)
+        with caplog.at_level(logging.ERROR, logger="app.services.nats_consumer"):
+            await handle_wiring_changed(
+                {"reservation_id": RES_ID, "fork_version": 2}, _db_session_factory()
+            )
+
+    assert [c[1] for c in calls if c[0] == "delete_vlan"] == [SW_L2]
+    (released,) = await _allocation("RELEASED")
+    assert released.defined_switch_ids == [SW_MID, SW_L2_B]
+    assert {r.status for r in await _membership_rows()} == {"RELEASED"}
+    async with TestSessionLocal() as s:
+        state = (
+            await s.execute(
+                select(ReservationWiringState).where(
+                    ReservationWiringState.reservation_id == uuid.UUID(RES_ID)
+                )
+            )
+        ).scalar_one()
+    assert state.last_applied_fork_version == 2, "the reconcile completed and stamped"
+    (record,) = _upstream_failed_records(caplog)
+    payload = _assert_class_name_only(record)
+    assert payload["switch_ids"] == [SW_MID, SW_L2_B]
+
+
+async def test_release_does_not_catch_an_exception_other_than_transient_upstream():
+    """Control: the catch is no wider than TransientUpstreamError. Any other exception
+    from a switch read (here a RuntimeError) still propagates out of the pass; the
+    allocation in hand is already RELEASED and keeps its switch listed, and the one
+    after it is not reached and stays ACTIVE. A catch widened to Exception fails here."""
+    first = await _seed_allocation(RES_ID, uuid.uuid4(), 100, [SW_L2], [SW_L2])
+    second = await _seed_allocation(RES_ID, uuid.uuid4(), 200, [SW_L2_B], [SW_L2_B])
+
+    async def _device(device_id, client=None):
+        raise RuntimeError("not an upstream outage")
+
+    execute_fn, calls = _recorder()
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device))
+        )
+        stack.enter_context(
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn)
+        )
+        with pytest.raises(RuntimeError, match="not an upstream outage"):
+            await _release_orphaned_allocations(
+                [first, second], _db_session_factory(), _FetchContext(None)
+            )
+
+    assert calls == []
+    rows = await _allocations_by_id([first, second])
+    assert rows[first].status == "RELEASED"
+    assert rows[first].defined_switch_ids == [SW_L2]
+    assert (rows[second].status, rows[second].defined_switch_ids) == ("ACTIVE", [SW_L2_B])
 
 
 # --- idempotency ---

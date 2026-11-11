@@ -98,7 +98,9 @@ reservation; the tick reports the rows left unchanged as `skipped_upstream`. One
 call is caught the same way in tick mode: the L2 retry's release of the allocations its
 superseded rows left orphaned, which runs after the per-reservation loop and after the
 read-back and skip accounting (action `wiring_retry_superseded_release_upstream_failed`,
-class name only); the outcomes stand. Nothing wider than TransientUpstreamError is
+class name only); the outcomes stand. Since issue #1209 that release isolates its own
+delete_vlan switch reads per allocation, so this catch is a backstop: no
+TransientUpstreamError escapes the release today. Nothing wider than TransientUpstreamError is
 caught: any exception those catches do not take still drops the layer for the tick
 (WIRE-RETRY-15). The catch never leaves a drive claim behind, because no
 upstream read sits between a row's claim and its record in any layer's apply. Only the
@@ -152,8 +154,9 @@ logger = logging.getLogger(__name__)
 # The fixed log action for a reservation a retry tick passes over because an upstream
 # read failed inside its layer apply (issue #1204).
 RESERVATION_UPSTREAM_FAILED_ACTION = "wiring_retry_reservation_upstream_failed"
-# The fixed log action for an upstream read failing inside the L2 retry's release of
-# the allocations its superseded rows left orphaned (issue #1204 review).
+# The fixed log action for a TransientUpstreamError escaping the L2 retry's release of
+# the allocations its superseded rows left orphaned (issue #1204 review); a backstop
+# since issue #1209, which catches the release's own switch reads per allocation.
 SUPERSEDED_RELEASE_UPSTREAM_FAILED_ACTION = "wiring_retry_superseded_release_upstream_failed"
 
 
@@ -586,10 +589,13 @@ async def _reattempt_l2_rows(
     `upstream_skips` None (the manual channel) the error propagates (503).
 
     The superseded rows' allocation release runs last, after the read-back and the
-    skip accounting. In tick mode a TransientUpstreamError from it (a delete_vlan switch
-    read) is logged with the action `wiring_retry_superseded_release_upstream_failed`
-    and the class name only, and the outcomes are still returned; on the manual channel
-    it propagates (503).
+    skip accounting. Since issue #1209 the release catches a failed delete_vlan switch
+    or template read per allocation itself (action `vlan_delete_upstream_failed`), so
+    no TransientUpstreamError escapes it today. The catch here stays as a
+    backstop: in tick mode a TransientUpstreamError that still escapes the release is
+    logged with the action `wiring_retry_superseded_release_upstream_failed` and the
+    class name only, and the outcomes are still returned; on the manual channel it
+    propagates (503).
     """
     from app.models.vlan_assignment import VlanAssignment
     from app.services.l2_membership_service import record_l2_failed, release_l2_membership
@@ -841,9 +847,11 @@ async def _reattempt_l2_rows(
             except TransientUpstreamError as exc:
                 if upstream_skips is None:
                     raise
-                # Tick mode: the rows' outcomes stand. An upstream read inside the
-                # cleanup (a delete_vlan switch read) stops the cleanup's remaining
-                # allocations for this tick; they are not re-driven by a later tick.
+                # Tick mode: the rows' outcomes stand. A backstop since issue #1209:
+                # the release isolates its own delete_vlan switch reads per allocation
+                # (vlan_delete_upstream_failed), so no TransientUpstreamError escapes
+                # it today. If one ever does, the allocations the release had not reached
+                # stay as they are and no later tick re-drives them.
                 logger.warning(
                     "wiring retry tick: an upstream read failed while releasing the "
                     "allocations of superseded L2 rows (%s); the row outcomes stand, "
