@@ -1401,21 +1401,29 @@ routes `GET` and `PUT /topologies/{id}`, `POST /pathfind/batch`,
   Enforced in: `frontend/src/pages/TopologyTemplatesPage.tsx` (`TopologyTemplatesPage`) \
   Pinned by: `frontend/src/test/pages/TopologyTemplatesPage.test.tsx` (`derives unique roles from canvas_data nodes, filtering out nodes with no role`, `blocks submit with a toast when a role has no device assigned`, `submits name and role_assignments once every role has a device, then navigates`)
 - **TOPO-UI-13.** The canvas shown and saved for `/topology/:id` is always topology
-  `:id`'s canvas, or a loading or error state (issue #1315). The canvas store is global,
-  so the editor clears it on mount and on every change of the id or the `reservationId`
-  query parameter, and the store clears itself when the session signs out
-  (`isAuthenticated` turns false; a token refresh clears nothing). A canvas is ready
-  only once the load for the current id and reservation has landed; until then Save,
-  Reserve, Save as Template, and Clear canvas are disabled, and Save refuses in its
-  handler too. Every deferred store write of the load, the hydrated canvas and the
-  live-edit empty clear alike, carries a request token that an id change or an unmount
-  invalidates, so a hydration that returns late for an earlier id is dropped. When the
-  topology fetch fails outside live edit the editor renders "Topology not found" for a
-  404 or "Could not load this topology" otherwise, with a way back to the list, and no
-  canvas or write action. A topology just created (no `canvas_data`) opens empty and
-  saves empty. \
-  Enforced in: `frontend/src/pages/TopologyEditorPage.tsx` (`canvasReady`, `canvasLoadRequestRef`, `handleSave`); `frontend/src/stores/topologyStore.ts` (`useAuthStore.subscribe`) \
-  Pinned by: `frontend/src/test/pages/TopologyEditorPage.CanvasIdentity.test.tsx` (`TopologyEditorPage canvas identity (issue #1315)`, `B's hydration resolves after navigating to C: the late B canvas is dropped`, `B's hydration resolves after navigating to a new, empty topology: the canvas stays empty`, `B's hydration resolves after the editor unmounted: it never reaches the next editor`, `a new topology with no canvas opened after A: empty canvas, Save PUTs an empty canvas`, `unmount and remount the same id: not ready until this mount's load lands`, `logout clears the canvas; the next user opening a topology never sees the last one's`, `live edit is unaffected: the fork canvas loads, Commit waits for it, no topology PUT`); `frontend/src/test/stores/topologyStore.test.ts` (`clearAuth after a signed-in session empties the canvas`, `a token refresh (setTokens while signed in) keeps the canvas`)
+  `:id`'s canvas, or a loading or error state (issue #1315). The page remounts its
+  editor for every distinct pair of id and `reservationId` query parameter, so no
+  editor state (version preview, restore target, AI proposal, dialogs, readiness)
+  outlives the canvas it belongs to. The canvas store is global, so each editor clears
+  it in a layout effect when it mounts and again when it unmounts, and the store clears
+  itself when the session signs out (`isAuthenticated` turns false; a token refresh
+  clears nothing). A canvas is ready only once that editor's own load has landed; until
+  then a "Loading canvas..." status covers the canvas, Save, Reserve, Save as Template,
+  Clear canvas, History, and Use AI are disabled, Save and Reserve also refuse in their
+  handlers, and a drop, a new connection, an AI proposal, dragging, selecting, and the
+  Delete key are refused. A request token, bumped when the load starts and when the
+  editor unmounts, guards the load's deferred writes (the hydrated canvas, the
+  live-edit empty clear, and the readiness flip) and every later wholesale canvas
+  replacement (parent version preview, exit, and restore, and the fork history's
+  preview, diff, exit, and restore), so one that resolves after its editor unmounted is
+  dropped. When the topology fetch fails outside live edit the editor renders "Topology
+  not found" for a 404 or "Could not load this topology" otherwise, with a way back to
+  the list, and no canvas or write action. A topology just created (no `canvas_data`)
+  opens empty and saves empty. Reserve's own readiness check is not pinned separately:
+  with drops refused nothing can put a device on a canvas that is not ready; nor are
+  the History, Use AI, drag, and select gates. \
+  Enforced in: `frontend/src/pages/TopologyEditorPage.tsx` (`TopologyEditorPage`, `canvasReady`, `canvasLoadRequestRef`, `ownsCanvas`, `handleSave`, `onDrop`); `frontend/src/stores/topologyStore.ts` (`useAuthStore.subscribe`) \
+  Pinned by: `frontend/src/test/pages/TopologyEditorPage.CanvasIdentity.test.tsx` (`TopologyEditorPage canvas identity (issue #1315)`, `B's hydration resolves after navigating to C: the late B canvas is dropped`, `B's hydration resolves after navigating to a new, empty topology: the canvas stays empty`, `B's hydration resolves after the editor unmounted: it never reaches the next editor`, `a new topology with no canvas opened after A: empty canvas, Save PUTs an empty canvas`, `unmount and remount the same id: not ready until this mount's load lands`, `logout clears the canvas; the next user opening a topology never sees the last one's`, `entering live edit after A: the canvas is empty while the fork loads, then shows the fork and enables Commit`, `A, then B pending, then back to A in place: Save stays disabled until A's own load lands`, `a version preview on A does not survive going to B in place: no exit control, B's canvas, Save PUTs B's nodes`, `a version preview of A that resolves after going to B never reaches B's canvas`, `a fork hydration that resolves after leaving live edit never reaches the next editor`, `the same topology switching between plain mode and live edit loads each source on its own`, `a device dropped while the canvas loads is refused, so the load never silently replaces an edit`); `frontend/src/test/stores/topologyStore.test.ts` (`clearAuth after a signed-in session empties the canvas`, `a token refresh (setTokens while signed in) keeps the canvas`); `tests/e2e/test_topology_editor_canvas_identity_playwright.py` (`test_opening_b_after_a_never_saves_a_canvas_into_b`)
 
 **Out of scope.** The AI generate and commit dialogs are `ai-features.md`; the reserve
 modal is `reservations.md`.
