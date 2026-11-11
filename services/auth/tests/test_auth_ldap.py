@@ -131,6 +131,56 @@ async def test_local_mode_blocks_ldap_user(monkeypatch):
     assert result is None
 
 
+@pytest.mark.asyncio
+async def test_local_mode_blocks_oidc_user(caplog):
+    """ADR 0016: an `oidc` account is refused by the local path exactly as an
+    LDAP one is. The row carries a real hash the password matches, so the
+    auth_source check is the only thing that can refuse it."""
+    import logging
+
+    async with TestSessionLocal() as db:
+        db.add(
+            User(
+                email="oidcuser@example.com",
+                username="oidcuser",
+                hashed_password=auth_service.get_password_hash("anything"),
+                auth_source="oidc",
+            )
+        )
+        await db.commit()
+        with caplog.at_level(logging.WARNING, logger="app.services.auth_service"):
+            result = await authenticate_user(db, "oidcuser@example.com", "anything")
+    assert result is None
+    assert [r.reason for r in caplog.records if hasattr(r, "reason")] == ["wrong_auth_source"]
+
+
+@pytest.mark.asyncio
+async def test_ldap_mode_rejects_existing_oidc_account(client, ldap_mode, fake_bind):
+    """ADR 0016: an LDAP login whose directory email belongs to an `oidc`
+    account is refused (IAM-LDAP-9 covers every non-LDAP source) and the
+    account is not converted."""
+    from app.services.auth_service import FederatedLogin, create_oidc_user
+
+    async with TestSessionLocal() as db:
+        await create_oidc_user(
+            db,
+            FederatedLogin(
+                issuer="https://idp.example.test",
+                subject="sub-alice",
+                email="alice@example.com",
+                email_verified=True,
+                username="alice-sso",
+                full_name=None,
+            ),
+        )
+    resp = await client.post("/login", json={"email": "alice", "password": "good"})
+    assert resp.status_code == 401
+    async with TestSessionLocal() as db:
+        row = (await db.execute(select(User).where(User.email == "alice@example.com"))).scalar_one()
+        assert row.auth_source == "oidc"
+        assert row.username == "alice-sso"
+
+
 def test_auth_service_exposes_create_ldap_user():
     # Sanity check that the helper is importable from the service module.
     assert callable(auth_service.create_ldap_user)

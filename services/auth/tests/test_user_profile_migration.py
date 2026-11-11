@@ -109,18 +109,12 @@ def _script_directory() -> ScriptDirectory:
     return ScriptDirectory.from_config(cfg)
 
 
-def test_auth_migration_chain_is_linear_with_0009_at_head():
+def test_0009_follows_0008_in_the_auth_migration_chain():
+    """The chain's linearity and its head are pinned by the newest revision's
+    test (test_oidc_sso_migration.py since 0010); this one keeps 0009's place."""
     script = _script_directory()
-    assert script.get_heads() == ["0009"]
-    revisions = list(script.walk_revisions())
-    on_disk = {
-        p.stem.split("_", 1)[0] for p in (_AUTH_DIR / "migrations" / "versions").glob("*.py")
-    }
-    assert {r.revision for r in revisions} == on_disk
-    assert [r.revision for r in revisions if r.down_revision is None] == ["0001"]
-    down_revisions = [r.down_revision for r in revisions if r.down_revision is not None]
-    assert len(down_revisions) == len(set(down_revisions))
     assert script.get_revision("0009").down_revision == "0008"
+    assert "0009" in {r.revision for r in script.walk_revisions()}
 
 
 def test_fresh_schema_declares_the_same_columns_as_the_migration():
