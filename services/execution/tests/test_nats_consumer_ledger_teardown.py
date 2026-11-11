@@ -903,3 +903,119 @@ async def test_cancelled_event_whose_check_is_refused_naks_then_tears_down(statu
     assert state is not None and state.frozen is True
     dynamic_teardown.assert_awaited_once()
     assert unexpected == []
+
+
+# --- an upstream read failing in the L2 apply's allocation-release tail (issue #1209) ---
+
+
+async def test_teardown_release_tail_upstream_failure_releases_every_other_allocation(caplog):
+    """The L2 apply ends with the orphaned-allocation release. Three allocations each
+    lose their one membership in the teardown; B is also defined on a transit switch
+    whose inventory read fails at its delete_vlan (the membership pass never reads that
+    switch, so the failure surfaces only in the release tail). The read failure is
+    caught for B alone: A and C are released and fully undefined, B is released with
+    exactly the switch the delete did not reach still listed (its member switch, read
+    and cached by the membership pass, is deleted and trimmed), one
+    `vlan_delete_upstream_failed` line carries the class name only, the teardown goes
+    on to L3 in the same pass, and another reservation's allocation on the same switches
+    is untouched. Before #1209 the error escaped the L2 apply: the teardown raised
+    before L3, and whichever of A and C came after B in the release stayed ACTIVE with
+    no memberships."""
+    from app.services.nats_consumer import TransientUpstreamError
+    from herd_common.logging import JSONFormatter
+
+    upstream_text = "inventory answered 500: db password=hunter2 at 10.9.8.7"
+    member = {name: str(uuid.uuid4()) for name in ("a", "b", "c")}
+    transit_b = str(uuid.uuid4())
+    devices = {
+        **DEVICES,
+        **{sid: _dev(sid, "Layer 2 Switch", f"L2-{n}") for n, sid in member.items()},
+    }
+    defined = {"a": [member["a"]], "b": [member["b"], transit_b], "c": [member["c"]]}
+    ids = {}
+    async with TestSessionLocal() as s:
+        for n, vlan in (("a", 101), ("b", 102), ("c", 103)):
+            va = VlanAssignment(
+                reservation_id=uuid.UUID(RES_ID),
+                fabric_id=uuid.uuid4(),
+                vlan_id=vlan,
+                switch_device_ids=list(defined[n]),
+                defined_switch_ids=list(defined[n]),
+                status="ACTIVE",
+            )
+            s.add(va)
+            await s.flush()
+            ids[n] = va.id
+            s.add(
+                L2PortAssignment(
+                    reservation_id=uuid.UUID(RES_ID),
+                    vlan_assignment_id=va.id,
+                    switch_device_id=uuid.UUID(member[n]),
+                    port="0/0/5",
+                    status="ACTIVE",
+                    intended="ACTIVE",
+                )
+            )
+        # A foreign reservation's live allocation on the same switches: never touched.
+        foreign = VlanAssignment(
+            reservation_id=uuid.uuid4(),
+            fabric_id=uuid.uuid4(),
+            vlan_id=900,
+            switch_device_ids=[member["b"], transit_b],
+            defined_switch_ids=[member["b"], transit_b],
+            status="ACTIVE",
+        )
+        s.add(foreign)
+        await s.commit()
+        foreign_id = foreign.id
+    await _seed_l3()
+
+    async def _device(device_id, client=None):
+        if str(device_id) == transit_b:
+            raise TransientUpstreamError(upstream_text)
+        return devices.get(str(device_id))
+
+    calls: list[tuple[str, str]] = []
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        calls.append((action, context.get("HERD_device_id")))
+        return SUCCESS_RESULT
+
+    with ExitStack() as stack:
+        for p in _driver_patches(execute_fn):
+            stack.enter_context(p)
+        stack.enter_context(
+            patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device))
+        )
+        with caplog.at_level(logging.ERROR, logger="app.services.nats_consumer"):
+            await _teardown_from_ledgers(RES_ID, _FetchContext(None), _db_session_factory())
+
+    async with TestSessionLocal() as s:
+        rows = {r.id: r for r in (await s.execute(select(VlanAssignment))).scalars().all()}
+    for n in ("a", "b", "c"):
+        assert rows[ids[n]].status == "RELEASED", f"allocation {n} is released"
+    assert rows[ids["a"]].defined_switch_ids == []
+    assert rows[ids["c"]].defined_switch_ids == []
+    assert rows[ids["b"]].defined_switch_ids == [transit_b], (
+        "only the switch the delete did not reach stays listed"
+    )
+    assert (rows[foreign_id].status, rows[foreign_id].defined_switch_ids) == (
+        "ACTIVE",
+        [member["b"], transit_b],
+    )
+    deletes = sorted(sid for action, sid in calls if action == "delete_vlan")
+    assert deletes == sorted(member.values()), "no driver session on the unreadable switch"
+    assert await _statuses(L2PortAssignment) == ["RELEASED"] * 3
+    assert await _statuses(RouteAssignment) == ["RELEASED"], "the teardown went on to L3"
+    assert ("remove_route", SW_L3) in calls
+
+    (record,) = [
+        r for r in caplog.records if getattr(r, "action", None) == "vlan_delete_upstream_failed"
+    ]
+    formatted = JSONFormatter("execution").format(record)
+    payload = json.loads(formatted)
+    assert payload["error_class"] == "TransientUpstreamError"
+    assert payload["vlan_assignment_id"] == str(ids["b"])
+    assert payload["switch_ids"] == [transit_b]
+    for leaked in ("hunter2", "10.9.8.7", "inventory answered"):
+        assert leaked not in formatted

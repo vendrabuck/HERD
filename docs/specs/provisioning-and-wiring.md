@@ -566,7 +566,9 @@ state transitions are WIRE-ORDER-1 and WIRE-FREEZE-1.
   and a terminal teardown leaves the ACTIVE rows of the failing layer and of every
   later layer unchanged (#1203). A FAILED intended-ACTIVE L3 pin is the exception
   that a 5xx shares: teardown parks it intended RELEASED before the switch is read
-  (#1001), and the release-direction retry tick finishes it. \
+  (#1001), and the release-direction retry tick finishes it. The read of a switch or its
+  template for an allocation's `delete_vlan` is the other exception: it stops only that
+  allocation's deletes and is not re-raised (WIRE-VLAN-12). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_device`, `_fetch_template`, `_inventory_record_or_none`) \
   Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_returns_the_body_on_200`, `test_inventory_read_returns_none_only_on_404`, `test_inventory_read_raises_transient_on_every_other_status`, `test_inventory_read_raises_transient_on_a_malformed_200_body`, `test_inventory_read_raises_transient_on_transport_error`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_inventory_auth_error_naks_and_never_pins`); `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_inventory_auth_error_on_switch_read_raises_and_pins_nothing`)
 - **WIRE-ORDER-12.** Within one event each device and each switch's latest config is
@@ -788,6 +790,28 @@ WIRE-VLAN-4.
   succeeded leave `defined_switch_ids`. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_release_orphaned_allocations`); `services/execution/app/services/vlan_service.py` (`find_superseding_allocation`, `allocation_reaches`) \
   Pinned by: `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_delete_on_last_free_per_switch`, `test_delete_skipped_when_vlan_reallocated_on_fabric`, `test_delete_failure_logs_and_continues`, `test_delete_skipped_when_a_cable_joined_the_switch_to_the_winners_component`, `test_delete_runs_when_the_components_split_after_the_winner_was_allocated`, `test_supersession_lookup_failure_skips_the_delete_and_continues`, `test_no_same_number_allocation_asks_cabling_nothing`); `tests/integration/test_vlan_assignment.py` (`test_vlan_released_on_reservation_cancel`)
+- **WIRE-VLAN-12.** When inventory cannot answer the switch or template read of one of
+  an allocation's deletes (`TransientUpstreamError`, raised before any driver call for
+  that switch), the rest of that allocation's deletes are not attempted: the switches
+  whose delete succeeded before it leave `defined_switch_ids`, the failing switch and
+  every switch not yet tried stay listed, the allocation stays released, one line is
+  logged with the action `vlan_delete_upstream_failed` carrying `error_class` (the
+  exception's class name, never its text), `vlan_assignment_id`, `reservation_id`,
+  `vlan_id`, and `switch_ids` (the switches left listed by this failure), and the pass
+  continues with the next allocation without raising. So the reconcile still stamps its
+  version, the terminal teardown goes on to L3, and both retry channels report their
+  outcomes. By decision (#1209) HERD fails open here: the allocation is released rather
+  than kept `ACTIVE`, the definition left on those switches is never re-driven, and
+  leaving a switch in a known-good state is the L2 driver's responsibility for its
+  network ([DRIVERS.md](../DRIVERS.md)). \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_release_orphaned_allocations`, `_run_vlan_definition_op`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_release_upstream_failure_skips_only_that_allocation`, `test_release_upstream_failure_on_a_later_switch_keeps_what_is_not_proven_deleted`, `test_reconcile_release_tail_upstream_failure_still_stamps_the_version`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_release_tail_upstream_failure_releases_every_other_allocation`); `services/execution/tests/test_wiring_retry_upstream_isolation.py` (`test_l2_superseded_allocation_release_failure_keeps_the_outcomes`, `test_manual_retry_superseded_release_switch_read_failure_reports_the_outcome`)
+- **WIRE-VLAN-13.** Only `TransientUpstreamError` is caught that way: any other
+  exception from the switch read of an allocation's delete propagates out of the pass,
+  that allocation stays released with its switches listed, and the allocations after it
+  are not reached and stay as they were. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_release_orphaned_allocations`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_release_does_not_catch_an_exception_other_than_transient_upstream`)
 
 **Out of scope.** How cabling computes a fabric (`topology.md`).
 
@@ -1175,10 +1199,13 @@ interface in section 8.15.
   included. Rows an apply drove before the read failed keep their new state and are not
   counted, and a row the other channel claimed reads back `in_progress` and is not
   counted. The L2 retry settles its read-back and these counts before it releases the
-  allocations its superseded rows left orphaned, and a TransientUpstreamError from that
-  release (a `delete_vlan` switch read) is caught too: the outcomes stand and one warning
-  is logged with the action `wiring_retry_superseded_release_upstream_failed` and the
-  class name only. Only TransientUpstreamError is caught this way, and only by the tick
+  allocations its superseded rows left orphaned. That release catches a failed
+  `delete_vlan` switch or template read per allocation itself (WIRE-VLAN-12, #1209), so
+  no read inside it raises today; the tick keeps a backstop around it, and a
+  TransientUpstreamError that still escapes the release leaves the outcomes standing
+  and logs one warning with the action
+  `wiring_retry_superseded_release_upstream_failed` and the class name only. Only
+  TransientUpstreamError is caught this way, and only by the tick
   (the manual channel is WIRE-RETRY-12); an exception these catches do not take drops
   the layer (WIRE-RETRY-15). Before
   #1204 the error escaped the layer and the tick left the layer's whole selection
@@ -1190,7 +1217,7 @@ interface in section 8.15.
   no driver call, in each ledger. Known limit by decision: an outage counts no attempt,
   so it never retires rows, and the batch is not reordered (Limits by decision). \
   Enforced in: `services/execution/app/services/wiring_retry_service.py` (`run_wiring_retry_tick`, `_reattempt_rows`, `_reattempt_l2_rows`, `_reattempt_l3_rows`, `_record_upstream_skips`); `services/execution/app/services/l1_assignment_service.py` (`due_failed_rows`); `services/execution/app/services/l2_membership_service.py` (`due_failed_l2_rows`); `services/execution/app/services/route_service.py` (`due_failed_route_rows`) \
-  Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_tick_respects_batch_cap`, `test_tick_skips_rows_past_max_attempts`); `services/execution/tests/test_wiring_claim.py` (`test_l1_claimed_row_is_invisible_to_the_tick_select`, `test_l1_expired_claim_is_reclaimable`); `services/execution/tests/test_wiring_due.py` (`test_due_statement_locks_the_ledger_table_only`, `test_unverifiable_build_rows_still_fill_the_batch_while_the_upstream_fails`); `services/execution/tests/test_wiring_retry_due_predicate_live_pg.py` (`test_due_select_locks_its_ledger_row_and_no_wiring_state_row`); `services/execution/tests/test_wiring_retry_upstream_isolation.py` (`test_failing_reservation_leaves_only_its_own_rows_unchanged`, `test_isolation_does_not_depend_on_which_reservation_is_applied_first`, `test_l2_fabric_lookup_failure_skips_only_that_reservation`, `test_rows_driven_before_the_apply_raised_are_not_counted_unchanged`, `test_a_row_the_other_channel_holds_is_in_progress_not_skipped_upstream`, `test_l2_superseded_allocation_release_failure_keeps_the_outcomes`); `services/execution/tests/test_wiring_retry_l2.py` (`test_nil_allocation_build_retry_fabric_outage_fails_closed`)
+  Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_tick_respects_batch_cap`, `test_tick_skips_rows_past_max_attempts`); `services/execution/tests/test_wiring_claim.py` (`test_l1_claimed_row_is_invisible_to_the_tick_select`, `test_l1_expired_claim_is_reclaimable`); `services/execution/tests/test_wiring_due.py` (`test_due_statement_locks_the_ledger_table_only`, `test_unverifiable_build_rows_still_fill_the_batch_while_the_upstream_fails`); `services/execution/tests/test_wiring_retry_due_predicate_live_pg.py` (`test_due_select_locks_its_ledger_row_and_no_wiring_state_row`); `services/execution/tests/test_wiring_retry_upstream_isolation.py` (`test_failing_reservation_leaves_only_its_own_rows_unchanged`, `test_isolation_does_not_depend_on_which_reservation_is_applied_first`, `test_l2_fabric_lookup_failure_skips_only_that_reservation`, `test_rows_driven_before_the_apply_raised_are_not_counted_unchanged`, `test_a_row_the_other_channel_holds_is_in_progress_not_skipped_upstream`, `test_l2_superseded_allocation_release_failure_keeps_the_outcomes`, `test_l2_superseded_release_backstop_keeps_the_outcomes`); `services/execution/tests/test_wiring_retry_l2.py` (`test_nil_allocation_build_retry_fabric_outage_fails_closed`)
 - **WIRE-RETRY-14.** The three selects leave out rows with a pinned reason and
   build-direction rows of frozen reservations, so neither kind counts toward a batch and a
   ledger full of them cannot keep a newer retryable row from being selected;
@@ -1352,7 +1379,7 @@ Events are in section 6; the internal routes this area serves are in section 7.
 | Out | reservations | `GET /internal/{id}` (internal token, 10 s) | corroborate an event's status | Fail closed: a 404 or a non-corroborating 200 acks without acting (WIRE-GATE-2); any other answer (401, 403, 409, 422, 5xx) or a transport error nacks (WIRE-GATE-3) |
 | Out | cabling | `GET /internal/forks/{id}` (internal token, 10 s) | the intended hops and routing intent | Fail closed: 404 is an empty set; any other non-200 or transport nacks the event (WIRE-ORDER-6), and a retry drives no build row of that reservation (WIRE-RETRY-7) |
 | Out | cabling | `GET /fabric/internal?device_id` (internal token, 10 s) | the current fabric of an L2 switch, the reachability test for VLAN uniqueness | Fail closed: any non-200, transport error, or bad body nacks the event; in a retry the tick logs it and the manual route answers 503 (WIRE-VLAN-6) |
-| Out | inventory | `GET /devices/{id}/internal`, `GET /templates/{id}/internal` (internal token, 10 s) | classify hop endpoints, load switch drivers | any non-200 other than 404, or a transport error, nacks the event (WIRE-ORDER-11); in a retry the tick logs it and the manual route answers 503; a 404 reads as missing (WIRE-PAIR-4, WIRE-L1-3) |
+| Out | inventory | `GET /devices/{id}/internal`, `GET /templates/{id}/internal` (internal token, 10 s) | classify hop endpoints, load switch drivers | any non-200 other than 404, or a transport error, nacks the event (WIRE-ORDER-11); in a retry the tick logs it and the manual route answers 503; a 404 reads as missing (WIRE-PAIR-4, WIRE-L1-3); for an allocation's `delete_vlan` it stops only that allocation's deletes, logged and not re-raised (WIRE-VLAN-12) |
 | Out | inventory | `GET /devices/{id}/config-versions/latest/internal` (internal token, 10 s) | L3 config routes and the drive gate | 5xx, 401, 403, or transport nacks (WIRE-ORDER-14, WIRE-L3-18); 404 or another non-200 below 500 means no config (WIRE-L3-4, WIRE-L3-16) |
 | Out | inventory | `GET /drivers/{id}/internal-download` (through the driver loader) | fetch a driver package on a cache miss | The switch's rows are parked FAILED and retryable by both retry channels; a broken package is parked non-retryable (WIRE-DRIVER-7); in the VRF capability check a failed download nacks instead (WIRE-L3-14) |
 | Out | driver package | `login`, `connect_ports`, `disconnect_ports`, `create_vlan`, `delete_vlan`, `add_to_vlan`, `remove_from_vlan`, `configure_route`, `remove_route`, `logout` in the sandbox | change the switch | Three attempts in line, then a FAILED row; never nacks (WIRE-DRIVER-2, WIRE-DRIVER-4) |
@@ -1409,13 +1436,6 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
   the retry tick leaves it out, a manual retry reports it `not_retryable`, and a fork
   re-save needs an ACTIVE reservation. The connection it describes may still be live on
   the hardware.
-- #1209 (WIRE-VLAN-11): a `TransientUpstreamError` from the switch read or driver session
-  of a `delete_vlan` in the release pass is not caught per allocation. The exception
-  leaves the allocation in hand released with its `defined_switch_ids` untrimmed (the
-  definition may still be on the switch) and leaves every later orphaned allocation in
-  the set unreleased and ACTIVE with no memberships; the retry path does not select the
-  already-released superseded rows again, so nothing finishes the job. The fabric lookup
-  failure (`vlan_delete_unjudged`) is the part that is caught.
 
 ### Limits by decision
 
@@ -1458,6 +1478,15 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
 - A release whose supersession cannot be judged (cabling unreachable while another
   allocation holds the number) leaves the VLAN defined on its switches (WIRE-VLAN-11);
   nothing re-drives that delete. Recorded in issue #1065 and the docstring of
+  `_release_orphaned_allocations`.
+- A release whose switch or template read fails in inventory leaves the VLAN defined on
+  the switches its deletes did not reach, with the allocation released (WIRE-VLAN-12);
+  nothing re-drives that delete. The owner chose to fail open and release rather than
+  keep the allocation `ACTIVE` until a delete can run: a VLAN definition left on a
+  switch after a failed or skipped delete is accepted, and leaving the switch in a
+  known-good state is the L2 driver author's responsibility for their network, for
+  example a driver that defaults its ports when it first logs in to the switch.
+  Recorded in issue #1209, [DRIVERS.md](../DRIVERS.md), and the docstring of
   `_release_orphaned_allocations`.
 
 ### Rules with no test
