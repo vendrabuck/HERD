@@ -426,6 +426,50 @@ describe("AppLayout Administration disclosure, keyboard (issue #1317)", () => {
     expect(button).toHaveAttribute("aria-expanded", "false");
   });
 
+  it("closes on a pointerdown outside it that moves no focus", async () => {
+    const { button } = await adminButton();
+    const kb = userEvent.setup();
+    button.focus();
+    await kb.keyboard("{Enter}");
+    expect(button).toHaveAttribute("aria-expanded", "true");
+    // The HERD wordmark is not focusable, so no blur can close the panel; only
+    // the outside-pointerdown listener can.
+    fireEvent.pointerDown(screen.getByText("HERD"));
+    expect(button).toHaveAttribute("aria-expanded", "false");
+    expect(document.activeElement).toBe(button);
+  });
+
+  it("a pointerdown inside it does not close it", async () => {
+    const { button } = await adminButton();
+    const kb = userEvent.setup();
+    button.focus();
+    await kb.keyboard("{Enter}");
+    fireEvent.pointerDown(screen.getByRole("link", { name: "Drivers" }));
+    expect(button).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("stays open with focus kept when the mouse leaves while a link inside holds focus", async () => {
+    const { button } = await adminButton();
+    const kb = userEvent.setup();
+    const wrapper = button.parentElement as HTMLElement;
+    fireEvent.mouseEnter(wrapper);
+    expect(button).toHaveAttribute("aria-expanded", "true");
+    button.focus();
+    await kb.tab();
+    const link = screen.getByRole("link", { name: ADMIN_NAV[0].label });
+    expect(document.activeElement).toBe(link);
+
+    fireEvent.mouseLeave(wrapper);
+
+    expect(button).toHaveAttribute("aria-expanded", "true");
+    expect(link).toBeVisible();
+    expect(document.activeElement).toBe(link);
+    // Pinned now: Escape still closes it and returns focus to the button.
+    await kb.keyboard("{Escape}");
+    expect(button).toHaveAttribute("aria-expanded", "false");
+    expect(document.activeElement).toBe(button);
+  });
+
   it("closes when keyboard focus leaves it", async () => {
     const { button } = await adminButton();
     const kb = userEvent.setup();

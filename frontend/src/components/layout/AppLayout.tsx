@@ -109,7 +109,12 @@ export function AppLayout() {
                 ref={adminWrapperRef}
                 className="relative"
                 onMouseEnter={() => setAdminOpenedBy((by) => by ?? "hover")}
-                onMouseLeave={() => setAdminOpenedBy((by) => (by === "hover" ? null : by))}
+                onMouseLeave={() => {
+                  // A hover-open panel that holds keyboard focus is pinned, not
+                  // closed: hiding it would drop focus to the body.
+                  const focusInside = adminWrapperRef.current?.contains(document.activeElement) ?? false;
+                  setAdminOpenedBy((by) => (by !== "hover" ? by : focusInside ? "toggle" : null));
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "Escape" && adminOpen) {
                     e.stopPropagation();

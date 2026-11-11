@@ -72,7 +72,7 @@ def test_confirm_dialog_is_centred(pw_page, viewport):
         expect(delete).to_be_visible()
         delete.click()
         dialog = pw_page.locator("dialog[open]")
-        expect(dialog.get_by_role("heading")).to_be_visible()
+        expect(dialog).to_have_accessible_name("Delete topology?")
         _assert_centred(pw_page, viewport)
 
         dialog.get_by_role("button", name="Cancel", exact=True).click()

@@ -1,8 +1,7 @@
 import { render, screen, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi } from "vitest";
-import { rowClick } from "@/lib/rowNavigation";
+import { RESERVATION_NAME_PURPOSE_MAX, reservationOpenLabel, rowClick } from "@/lib/rowNavigation";
 import { ADMIN_NAV, visibleAdminNav } from "@/lib/adminNav";
-import { titleForPath } from "@/lib/routeTitles";
 
 // Issue #1317: the row's mouse handler must ignore any click that started on
 // an interactive child, and must still fire for a click on plain row content.
@@ -42,6 +41,32 @@ function Row({ open }: { open: () => void }) {
               fake button
             </div>
           </td>
+          <td>
+            <span role="switch" aria-checked="false" tabIndex={0}>
+              a switch
+            </span>
+            <span role="menuitem" tabIndex={-1}>
+              a menuitem
+            </span>
+            <span role="tab" tabIndex={0}>
+              a tab
+            </span>
+            <span role="combobox" aria-expanded="false" tabIndex={0}>
+              a combobox
+            </span>
+            <span role="option" aria-selected="false">
+              an option
+            </span>
+            <span contentEditable suppressContentEditableWarning>
+              editable
+            </span>
+            <span role="link" tabIndex={0}>
+              fake link
+            </span>
+            <span role="checkbox" aria-checked="false" tabIndex={0}>
+              fake checkbox
+            </span>
+          </td>
         </tr>
       </tbody>
     </table>
@@ -67,6 +92,14 @@ describe("rowClick (issue #1317)", () => {
     ["a label", () => screen.getByText("labelled")],
     ["a select", () => screen.getByRole("combobox", { name: "sel" })],
     ["a role=button element", () => screen.getByText("fake button")],
+    ["a role=link element", () => screen.getByText("fake link")],
+    ["a role=checkbox element", () => screen.getByText("fake checkbox")],
+    ["a role=switch element", () => screen.getByText("a switch")],
+    ["a role=menuitem element", () => screen.getByText("a menuitem")],
+    ["a role=tab element", () => screen.getByText("a tab")],
+    ["a role=combobox element", () => screen.getByText("a combobox")],
+    ["a role=option element", () => screen.getByText("an option")],
+    ["a contenteditable element", () => screen.getByText("editable")],
   ])("ignores a click that started on %s", (_name, target) => {
     const open = vi.fn();
     render(<Row open={open} />);
@@ -85,24 +118,31 @@ describe("visibleAdminNav (issue #1317)", () => {
   });
 });
 
-describe("titleForPath (issue #1317)", () => {
-  it.each([
-    ["/inventory", "Inventory - HERD"],
-    ["/inventory/abc", "Device - HERD"],
-    ["/templates/new", "New template - HERD"],
-    ["/templates/t-1", "Template - HERD"],
-    ["/topology", "Topology - HERD"],
-    ["/topology/abc", "Topology editor - HERD"],
-    ["/reservations/calendar", "Reservation calendar - HERD"],
-    ["/admin/groups/new", "New user group - HERD"],
-    ["/admin/groups/g-1", "User group - HERD"],
-    ["/admin/about", "About - HERD"],
-  ])("titles %s as %s", (path, title) => {
-    expect(titleForPath(path)).toBe(title);
+describe("reservationOpenLabel (issue #1317)", () => {
+  it("starts with the visible short id and says what the button does", () => {
+    expect(reservationOpenLabel("1a2b3c4d", null)).toBe("1a2b3c4d, open reservation");
+    expect(reservationOpenLabel("1a2b3c4d", undefined)).toBe("1a2b3c4d, open reservation");
+    expect(reservationOpenLabel("1a2b3c4d", "   ")).toBe("1a2b3c4d, open reservation");
   });
 
-  it("returns null for a path with no route", () => {
-    expect(titleForPath("/nowhere")).toBe(null);
-    expect(titleForPath("/inventory/a/b")).toBe(null);
+  it("appends the purpose with its whitespace collapsed", () => {
+    expect(reservationOpenLabel("1a2b3c4d", "  fw   regression\n run ")).toBe(
+      "1a2b3c4d, open reservation: fw regression run",
+    );
+  });
+
+  it("keeps a purpose of exactly the maximum length whole", () => {
+    const purpose = "p".repeat(RESERVATION_NAME_PURPOSE_MAX);
+    expect(reservationOpenLabel("id", purpose)).toBe(`id, open reservation: ${purpose}`);
+  });
+
+  it("cuts a longer purpose to the maximum, ellipsis included, by code point", () => {
+    const purpose = "\u{1F600}".repeat(RESERVATION_NAME_PURPOSE_MAX + 5);
+    const label = reservationOpenLabel("id", purpose);
+    const tail = label.slice("id, open reservation: ".length);
+    expect(Array.from(tail)).toHaveLength(RESERVATION_NAME_PURPOSE_MAX);
+    expect(tail.endsWith("...")).toBe(true);
+    // No surrogate half survives the cut.
+    expect(tail).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
   });
 });

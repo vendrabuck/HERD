@@ -42,7 +42,7 @@ import {
 } from "@/lib/reservationFilters";
 import type { ReservationFilterState, ReservationPeriod } from "@/lib/reservationFilters";
 import { purposeCategoryLabel } from "@/lib/purposeCategories";
-import { ROW_PRIMARY_CONTROL_CLASS, rowClick } from "@/lib/rowNavigation";
+import { ROW_PRIMARY_CONTROL_CLASS, reservationOpenLabel, rowClick } from "@/lib/rowNavigation";
 import { Pagination } from "@/components/ui/Pagination";
 import { FilterSelect, ListFilterLayout, ListFilterPanel } from "@/components/ui/ListFilterPanel";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
@@ -160,7 +160,7 @@ function ReservationRow({
         <button
           type="button"
           onClick={onClick}
-          aria-label={`Open reservation ${shortId}`}
+          aria-label={reservationOpenLabel(shortId, reservation.purpose)}
           className={ROW_PRIMARY_CONTROL_CLASS}
         >
           {shortId}

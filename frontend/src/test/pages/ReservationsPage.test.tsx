@@ -913,7 +913,9 @@ describe("ReservationsPage keyboard row access (issue #1317)", () => {
     oneReservation();
     const user = userEvent.setup();
     const { navigations } = renderInCountingRouter(<ReservationsPage />, "/reservations");
-    const open = await screen.findByRole("button", { name: "Open reservation 11111111" });
+    const open = await screen.findByRole("button", {
+      name: "11111111, open reservation: fw test",
+    });
     expect(open).toHaveTextContent("11111111");
 
     await tabTo(user, open);

@@ -23,6 +23,11 @@ const INTERACTIVE_SELECTOR = [
   "[role='button']",
   "[role='link']",
   "[role='checkbox']",
+  "[role='switch']",
+  "[role='menuitem']",
+  "[role='tab']",
+  "[role='combobox']",
+  "[role='option']",
   "[contenteditable='true']",
 ].join(", ");
 
@@ -53,4 +58,26 @@ export function rowClick(open: () => void) {
     if (isInteractiveChildClick(event)) return;
     open();
   };
+}
+
+/** Longest purpose, in code points, carried into a reservation row's control name. */
+export const RESERVATION_NAME_PURPOSE_MAX = 60;
+
+/**
+ * Accessible name for the Reservations row's open button (issue #1317). It
+ * STARTS with the visible short id (WCAG 2.5.3, so speech input can say what
+ * it sees), then says what the button does, then the purpose when there is
+ * one, whitespace collapsed and cut to RESERVATION_NAME_PURPOSE_MAX code
+ * points with "..." so a long purpose does not flood a screen reader.
+ */
+export function reservationOpenLabel(shortId: string, purpose: string | null | undefined): string {
+  const base = `${shortId}, open reservation`;
+  const text = (purpose ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return base;
+  const points = Array.from(text);
+  const cut =
+    points.length > RESERVATION_NAME_PURPOSE_MAX
+      ? `${points.slice(0, RESERVATION_NAME_PURPOSE_MAX - 3).join("").trimEnd()}...`
+      : text;
+  return `${base}: ${cut}`;
 }

@@ -320,8 +320,13 @@ export function ConnectionsPage() {
         </div>
       </div>
 
+      {/* Mounted only while open: each open starts from a fresh DOM, and the
+          closed form's controls (its two "Search devices..." inputs and its
+          Cancel button) are never in the document for a first-match locator
+          to land on instead of the open multi dialog's. */}
+      {showCreate && (
       <Modal
-        open={showCreate}
+        open
         onClose={closeCreateModal}
         title="Create Connection"
         className="max-w-lg"
@@ -490,6 +495,7 @@ export function ConnectionsPage() {
           </div>
         </div>
       </Modal>
+      )}
 
       {/* Mounted only while open so its device/port queries never run in the
           background behind the single-pair modal. */}
