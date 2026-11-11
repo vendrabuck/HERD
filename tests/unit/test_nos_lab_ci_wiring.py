@@ -129,14 +129,24 @@ def test_ci_dialect_job_is_independent_and_uploads_lab_logs_on_failure():
 
 
 def test_nightly_runs_the_feature_target_with_the_right_project_name():
+    """The feature target must see COMPOSE_PROJECT_NAME=herd, the nightly stack's
+    project, or nos-attach looks for a CURDIR-derived network that does not exist.
+    Since issue #1313 the job sets it once in its env block; neither the step's env
+    nor its command line may set another value."""
+    data = yaml.safe_load(NIGHTLY_WORKFLOW_PATH.read_text())
+    job = data["jobs"]["full-stack"]
+    assert job.get("env", {}).get("COMPOSE_PROJECT_NAME") == "herd", (
+        "nightly's full-stack job must set COMPOSE_PROJECT_NAME: herd in its env block"
+    )
     steps = _workflow_steps(NIGHTLY_WORKFLOW_PATH)
     index = _step_index(steps, "make nos-test-feature")
-    run = steps[index]["run"]
-    assert "make nos-test-feature COMPOSE_PROJECT_NAME=herd" in run, (
-        "nightly's stack is the default-named `herd` compose project, so the "
-        "feature target must be called with COMPOSE_PROJECT_NAME=herd or "
-        "nos-attach looks for a CURDIR-derived network that does not exist"
+    step = steps[index]
+    run = step["run"]
+    assert "COMPOSE_PROJECT_NAME" not in (step.get("env") or {}), (
+        "the step must not override the job's COMPOSE_PROJECT_NAME"
     )
+    for match in re.finditer(r"COMPOSE_PROJECT_NAME=(\S+)", run):
+        assert match.group(1) == "herd", f"the step passes COMPOSE_PROJECT_NAME={match.group(1)}"
     assert "make nos-up" in run, "the feature target does not boot the lab itself"
 
 
