@@ -1063,7 +1063,7 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 	$(SUBMAKE) seed-nos && \
 	HERD_TEST_NOS_REQUIRED=1 uv run pytest $(NOS_FEATURE_TESTS) -v
 
-# Postgres-live suites: every services/*/tests/*_live_pg.py (fifteen today,
+# Postgres-live suites: every services/*/tests/*_live_pg.py (sixteen today,
 # in auth, common, cabling, execution, reservations, and inventory), each run
 # from its own service directory. They prove what the SQLite engine every unit
 # suite uses cannot: advisory locks, row locks and SKIP LOCKED, native enum and
@@ -1097,6 +1097,13 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # transaction. Only its three lock tests commit, two rows each (a ledger row
 # hidden from the stack's own retry tick by an attempts value above any cap,
 # and its reservation_wiring_state row), deleted in a finally.
+# The auth suite added for ADR 0016 phase 2 (the OIDC flow store and JIT
+# provisioning races) needs the migrated auth schema with migration 0010's two
+# tables. It commits its own users, identities, and flows under random tags,
+# seeds foreign rows of each kind, asserts every foreign row unchanged, and
+# deletes all of them in a finally; it holds a users-table lock that blocks
+# writes (never reads) for well under a second per race, and row locks on
+# its own flow rows only.
 # tests/unit/test_pg_live_gate_wiring.py fails if a new *_live_pg.py file is
 # written and then wired into nothing.
 _gate-pg-live-tests:
@@ -1109,6 +1116,8 @@ _gate-pg-live-tests:
 	echo "Postgres-live suites against 127.0.0.1:$${pgport}/$${pgdb:-herd}"; \
 	(cd services/auth && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_ldap_sync_service_live_pg.py -v) && \
+	(cd services/auth && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_oidc_flow_service_live_pg.py -v) && \
 	(cd services/common && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_advisory_lock_live_pg.py -v) && \
 	(cd services/common && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
