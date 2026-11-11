@@ -5,6 +5,7 @@ import { isAxiosError } from "axios";
 import toast from "react-hot-toast";
 import { useReservationAssistant } from "@/api/ai";
 import type { PendingApply, ToolCall } from "@/types/ai.types";
+import { errorDetail } from "@/lib/errors";
 
 const MAX_QUESTION_LENGTH = 4000;
 
@@ -62,7 +63,7 @@ export function AIAssistantTabLegacy({
       setPendingApply?.(null);
       if (isAxiosError(err)) {
         const status = err.response?.status;
-        const detail = err.response?.data?.detail;
+        const detail = errorDetail(err, "");
         if (status === 503) {
           toast.error("AI feature is not configured");
         } else if (status === 404) {

@@ -17,6 +17,7 @@ import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { TransferList } from "@/components/ui/TransferList";
 import type { TransferItem } from "@/components/ui/TransferList";
+import { errorDetail } from "@/lib/errors";
 
 export function DeviceGroupDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -139,9 +140,7 @@ export function DeviceGroupDetailPage() {
         toast.success("Device group updated");
       }
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to save device group";
+      const msg = errorDetail(err, "Failed to save device group");
       toast.error(msg);
     }
   };
@@ -152,9 +151,7 @@ export function DeviceGroupDetailPage() {
       toast.success("Device group deleted");
       navigate("/admin/device-groups");
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to delete device group";
+      const msg = errorDetail(err, "Failed to delete device group");
       toast.error(msg);
     }
     setShowDeleteConfirm(false);
@@ -165,9 +162,7 @@ export function DeviceGroupDetailPage() {
       const result = await bulkAddDevices.mutateAsync({ groupId: id!, deviceIds: ids });
       toast.success(`${result.added} device(s) added${result.skipped ? `, ${result.skipped} skipped` : ""}`);
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to add devices";
+      const msg = errorDetail(err, "Failed to add devices");
       toast.error(msg);
     }
   };
@@ -177,9 +172,7 @@ export function DeviceGroupDetailPage() {
       const result = await bulkRemoveDevices.mutateAsync({ groupId: id!, deviceIds: ids });
       toast.success(`${result.removed} device(s) removed`);
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to remove devices";
+      const msg = errorDetail(err, "Failed to remove devices");
       toast.error(msg);
     }
   };
@@ -189,9 +182,7 @@ export function DeviceGroupDetailPage() {
       const result = await bulkAddUG.mutateAsync({ groupId: id!, userGroupIds: ids });
       toast.success(`${result.added} user group(s) assigned${result.skipped ? `, ${result.skipped} skipped` : ""}`);
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to assign user groups";
+      const msg = errorDetail(err, "Failed to assign user groups");
       toast.error(msg);
     }
   };
@@ -201,9 +192,7 @@ export function DeviceGroupDetailPage() {
       const result = await bulkRemoveUG.mutateAsync({ groupId: id!, userGroupIds: ids });
       toast.success(`${result.removed} user group(s) removed`);
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to remove user groups";
+      const msg = errorDetail(err, "Failed to remove user groups");
       toast.error(msg);
     }
   };

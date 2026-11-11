@@ -12,6 +12,7 @@ import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import type { ConnectionType } from "@/types/driver.types";
+import { errorDetail } from "@/lib/errors";
 
 const CONNECTION_TYPES: ConnectionType[] = [
   "Management",
@@ -78,9 +79,7 @@ export function DriversPage() {
       setUploadConnectionType("");
       setUploadFile(null);
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to upload driver";
+      const msg = errorDetail(err, "Failed to upload driver");
       toast.error(msg);
     }
   };
@@ -91,9 +90,7 @@ export function DriversPage() {
       await deleteDriver.mutateAsync(deleteId);
       toast.success("Driver deleted");
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to delete driver";
+      const msg = errorDetail(err, "Failed to delete driver");
       toast.error(msg);
     }
     setDeleteId(null);

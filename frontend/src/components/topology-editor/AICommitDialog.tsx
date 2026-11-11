@@ -1,10 +1,9 @@
 import { useState } from "react";
 import toast from "react-hot-toast";
-import { isAxiosError } from "axios";
 
 import { Modal } from "@/components/ui/Modal";
 import { useAICommit } from "@/api/ai";
-import { aiCommitTopologyUnwireableDetail } from "@/lib/errors";
+import { aiCommitTopologyUnwireableDetail, errorDetail } from "@/lib/errors";
 // Plain-words rendering of cabling's InvalidEdge.reason vocabulary, shared
 // with the topology editor's edge labels (issue #1066).
 import { invalidEdgeReasonText } from "@/lib/edgeProblems";
@@ -121,11 +120,9 @@ function CommitForm({ proposal, onClose, onCommitted }: FormProps) {
           (edge) => `${edge.source_role} to ${edge.target_role}: ${invalidEdgeReasonText(edge.reason)}`,
         );
         toast.error(`Commit failed: cannot wire this topology\n${lines.join("\n")}`);
-      } else if (isAxiosError(err)) {
-        const detail = err.response?.data?.detail;
-        toast.error(detail ? `Commit failed: ${detail}` : "Commit failed");
       } else {
-        toast.error("Commit failed");
+        const detail = errorDetail(err, "");
+        toast.error(detail ? `Commit failed: ${detail}` : "Commit failed");
       }
     }
   };

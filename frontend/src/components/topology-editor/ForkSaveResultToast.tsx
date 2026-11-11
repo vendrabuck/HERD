@@ -25,13 +25,19 @@ function DeltaRow({ delta, tone }: { delta: ForkConnectionDelta; tone: "release"
 }
 
 // Custom react-hot-toast body for a successful fork reconcile (ADR 0006
-// Decision 6). Shows the released/built/unchanged counts, expandable to the
+// Decision 6). Shows the released/built/unchanged counts (plus the L3 routes
+// released and built when either is non-zero, issue #1321), expandable to the
 // per-connection release and build lists. Lines the save could not wire on
 // their chosen ports (issue #1007) are always listed, never behind the toggle.
 export function ForkSaveResultToast({ result, onDismiss, deviceLabels }: ForkSaveResultToastProps) {
   const [expanded, setExpanded] = useState(false);
   const skipped = result.constrained_edges_skipped ?? [];
   const hasDetail = result.released.length > 0 || result.built.length > 0;
+  // Issue #1321: the Layer 3 routing-intent reconcile's own counts (ADR 0014),
+  // so a routing-only commit does not read as "built 0". An older response
+  // without the fields reads as 0 for each.
+  const routesReleased = result.l3_routes_released ?? 0;
+  const routesBuilt = result.l3_routes_built ?? 0;
 
   return (
     <div className="bg-white border border-gray-200 rounded-lg shadow-lg px-4 py-3 max-w-md w-full">
@@ -42,6 +48,11 @@ export function ForkSaveResultToast({ result, onDismiss, deviceLabels }: ForkSav
             Released {result.released.length}, built {result.built.length}, unchanged{" "}
             {result.unchanged_count}
           </p>
+          {(routesReleased > 0 || routesBuilt > 0) && (
+            <p className="text-xs text-gray-600 mt-0.5">
+              Routes released {routesReleased}, built {routesBuilt}
+            </p>
+          )}
           {!!result.element_attachments_skipped && result.element_attachments_skipped > 0 && (
             <p className="text-xs text-gray-600 mt-0.5">
               {result.element_attachments_skipped} element attachment

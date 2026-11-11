@@ -5,6 +5,7 @@ import { useTemplates } from "@/api/templates";
 import { DynamicFieldRenderer } from "@/components/devices/DynamicFieldRenderer";
 import type { TopologyType, DeviceStatus } from "@/types/device.types";
 import type { DeviceTemplate } from "@/types/template.types";
+import { errorDetail } from "@/lib/errors";
 
 const TOPOLOGY_TYPES: { label: string; value: TopologyType }[] = [
   { label: "Physical", value: "PHYSICAL" },
@@ -78,9 +79,7 @@ export function CreateDeviceForm() {
       toast.success("Device created");
       setForm(INITIAL_FORM);
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to create device";
+      const msg = errorDetail(err, "Failed to create device");
       toast.error(msg);
     }
   };

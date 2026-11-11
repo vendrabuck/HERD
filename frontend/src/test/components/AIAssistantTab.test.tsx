@@ -584,6 +584,62 @@ describe("AIAssistantChat (Branch 3, streaming)", () => {
     expect(screen.getByText(/boom/)).toBeInTheDocument();
   });
 
+  it("shows the fixed text for an error frame whose message is not a string (#1314)", async () => {
+    server.use(
+      http.post(STREAM_URL, () =>
+        sseStream([{ event: "error", data: { message: { detail: "object" } } }]),
+      ),
+    );
+    renderWithProviders(<ChatHarness />);
+    fireEvent.change(screen.getByTestId("assistant-input"), {
+      target: { value: "anything" },
+    });
+    fireEvent.click(screen.getByTestId("assistant-send"));
+
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Assistant failed"));
+    expect(screen.getByText("Assistant failed")).toBeInTheDocument();
+  });
+
+  it("names only string tools in a status frame and survives a malformed one (#1314)", async () => {
+    const encoder = new TextEncoder();
+    const frame = (f: { event: string; data: unknown }) =>
+      encoder.encode(`event: ${f.event}\ndata: ${JSON.stringify(f.data)}\n\n`);
+    let releaseDone: () => void = () => {};
+    const doneReleased = new Promise<void>((resolve) => {
+      releaseDone = resolve;
+    });
+    server.use(
+      http.post(STREAM_URL, () => {
+        const body = new ReadableStream<Uint8Array>({
+          async start(controller) {
+            controller.enqueue(
+              frame({ event: "status", data: { message: { x: 1 }, tools: "get_device" } }),
+            );
+            controller.enqueue(
+              frame({ event: "status", data: { tools: [{ x: 1 }, "get_device"] } }),
+            );
+            await doneReleased;
+            controller.enqueue(frame(doneFrame({ answer: "fine" })));
+            controller.close();
+          },
+        });
+        return new HttpResponse(body, { headers: { "Content-Type": "text/event-stream" } });
+      }),
+    );
+    renderWithProviders(<ChatHarness />);
+    fireEvent.change(screen.getByTestId("assistant-input"), {
+      target: { value: "use a tool" },
+    });
+    fireEvent.click(screen.getByTestId("assistant-send"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("assistant-status")).toHaveTextContent("Running get_device..."),
+    );
+    releaseDone();
+    expect(await screen.findByText("fine")).toBeInTheDocument();
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
   it("toasts a mapped message on a pre-stream 503", async () => {
     server.use(
       http.post(STREAM_URL, () =>

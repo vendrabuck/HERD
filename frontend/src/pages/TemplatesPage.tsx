@@ -11,6 +11,7 @@ import { Pagination } from "@/components/ui/Pagination";
 import { BulkImportExport } from "@/components/ui/BulkImportExport";
 import { exportTemplates, importTemplates } from "@/api/bulk";
 import type { DeviceTemplate } from "@/types/template.types";
+import { errorDetail } from "@/lib/errors";
 
 function fieldCount(template: DeviceTemplate): number {
   return template.sections.reduce((sum, s) => sum + s.fields.length, 0);
@@ -80,10 +81,7 @@ export function TemplatesPage() {
       });
       toast.success("Template duplicated");
     } catch (err: unknown) {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail;
-      toast.error(detail ?? "Failed to duplicate template");
+      toast.error(errorDetail(err, "Failed to duplicate template"));
     }
   };
 
@@ -93,9 +91,7 @@ export function TemplatesPage() {
       await deleteTemplate.mutateAsync(deleteTarget.id);
       toast.success("Template deleted");
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to delete template";
+      const msg = errorDetail(err, "Failed to delete template");
       toast.error(msg);
     }
     setDeleteTarget(null);

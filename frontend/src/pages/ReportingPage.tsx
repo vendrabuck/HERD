@@ -13,6 +13,7 @@ import { SkeletonRows } from "@/components/ui/Skeleton";
 import { PurposeCategoryTag } from "@/components/reservations/PurposeCategoryTag";
 import { isUnclassifiedCategory, purposeCategoryLabel } from "@/lib/purposeCategories";
 import { csvSafeCell } from "@/lib/csvSafety";
+import { errorDetail } from "@/lib/errors";
 
 function triggerCsvDownload(filename: string, body: string): void {
   const blob = new Blob([body], { type: "text/csv;charset=utf-8" });
@@ -183,7 +184,7 @@ export function ReportingPage() {
 
         {report.isError && (
           <AlertStrip variant="error">
-            Failed to load report. {report.error instanceof Error ? report.error.message : ""}
+            Failed to load report. {errorDetail(report.error, "Try again in a moment.")}
           </AlertStrip>
         )}
 
