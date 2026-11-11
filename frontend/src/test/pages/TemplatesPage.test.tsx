@@ -1,10 +1,13 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { MemoryRouter } from "react-router-dom";
 
-// Mock react-router-dom
+// Mock react-router-dom: only useNavigate; Link and MemoryRouter stay real
+// because the row's name cell is a Link (issue #1317).
 const mockNavigate = vi.fn();
-vi.mock("react-router-dom", () => ({
+vi.mock("react-router-dom", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("react-router-dom")>()),
   useNavigate: () => mockNavigate,
 }));
 
@@ -89,7 +92,9 @@ function renderPage() {
   });
   return render(
     <QueryClientProvider client={client}>
-      <TemplatesPage />
+      <MemoryRouter>
+        <TemplatesPage />
+      </MemoryRouter>
     </QueryClientProvider>,
   );
 }

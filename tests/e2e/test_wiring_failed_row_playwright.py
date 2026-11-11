@@ -393,7 +393,7 @@ def test_wiring_tab_failed_row_and_retry(pw_page):
         row.click()
 
         dialog = pw_page.locator("dialog[open]")
-        expect(dialog.locator("#modal-title")).to_have_text("Reservation")
+        expect(dialog).to_have_accessible_name("Reservation")
         dialog.get_by_role("button", name="Wiring", exact=True).click()
 
         expect(dialog.get_by_text("FAILED", exact=True)).to_be_visible()

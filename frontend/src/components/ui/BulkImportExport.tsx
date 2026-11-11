@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import toast from "react-hot-toast";
 import type { BulkFormat, BulkImportReport } from "@/api/bulk";
 
@@ -28,6 +28,8 @@ export function BulkImportExport({
   const [report, setReport] = useState<BulkImportReport | null>(null);
   const [busy, setBusy] = useState(false);
   const dialogRef = useRef<HTMLDialogElement>(null);
+  // Per-instance title id (issue #1318), like Modal and ConfirmDialog.
+  const titleId = useId();
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -107,11 +109,11 @@ export function BulkImportExport({
       <dialog
         ref={dialogRef}
         className="m-auto rounded-lg shadow-xl border border-gray-200 p-0 backdrop:bg-black/40 max-w-2xl w-full"
-        aria-labelledby="bulk-import-title"
+        aria-labelledby={titleId}
         onClose={close}
       >
         <div className="p-6">
-          <h2 id="bulk-import-title" className="text-lg font-semibold text-gray-900 mb-1">
+          <h2 id={titleId} className="text-lg font-semibold text-gray-900 mb-1">
             Import {resourceLabel}
           </h2>
           <p className="text-sm text-gray-600 mb-4">

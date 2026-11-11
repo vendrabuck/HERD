@@ -775,30 +775,6 @@ def log_cleanup_failure(resource: str, resource_id: str, resp) -> None:
         print(f"cleanup left {resource} {resource_id} behind: {resp.status_code} {resp.text}")
 
 
-def open_admin_menu(driver):
-    """Open the Administration dropdown in the header nav.
-
-    Tolerant of the button being labeled either "Administration" or "Admin".
-    Returns when the dropdown menu is visible.
-    """
-    wait = WebDriverWait(driver, WAIT_TIMEOUT)
-    trigger = wait.until(
-        EC.element_to_be_clickable(
-            (
-                By.XPATH,
-                "//button[contains(., 'Administration') or contains(., 'Admin')]",
-            )
-        )
-    )
-    trigger.click()
-    # Any link under the revealed menu confirms it opened.
-    wait.until(
-        EC.visibility_of_element_located(
-            (By.XPATH, "//a[contains(@href, '/admin/') or contains(@href, '/templates')]")
-        )
-    )
-
-
 @pytest.fixture(scope="session")
 def pw_browser():
     """Playwright Chromium (headless), shared across the session.

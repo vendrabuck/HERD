@@ -16,6 +16,7 @@ import { useDeviceConnections } from "@/api/connections";
 import { useTemplates } from "@/api/templates";
 import { useAuthStore } from "@/stores/authStore";
 import { isAdminRole } from "@/lib/roles";
+import { ROW_PRIMARY_CONTROL_CLASS, rowClick } from "@/lib/rowNavigation";
 import {
   DEVICE_STATUSES,
   TOPOLOGY_TYPES,
@@ -153,7 +154,7 @@ function ExpandedPortsRow({ device, deviceNameMap, colSpan }: {
 
 function DeviceRow({ device, isAdmin, onCopy, onClick, selected, onToggle, showCheckbox, expanded, onToggleExpand }: { device: Device; isAdmin: boolean; onCopy: (device: Device) => void; onClick: () => void; selected: boolean; onToggle: () => void; showCheckbox: boolean; expanded: boolean; onToggleExpand: () => void }) {
   return (
-    <tr className="border-b border-gray-100 hover:bg-gray-50 cursor-pointer" onClick={onClick}>
+    <tr className="border-b border-gray-100 hover:bg-gray-50 cursor-pointer" onClick={rowClick(onClick)}>
       <td className="w-10 px-2 py-2">
         <button
           onClick={(e) => { e.stopPropagation(); onToggleExpand(); }}
@@ -174,7 +175,11 @@ function DeviceRow({ device, isAdmin, onCopy, onClick, selected, onToggle, showC
           />
         </td>
       )}
-      <td className="px-4 py-2 text-sm font-medium text-gray-900">{device.name}</td>
+      <td className="px-4 py-2 text-sm font-medium text-gray-900">
+        <Link to={`/inventory/${device.id}`} className={ROW_PRIMARY_CONTROL_CLASS}>
+          {device.name}
+        </Link>
+      </td>
       <td className="px-4 py-2 text-sm text-gray-600">
         <span className="inline-flex items-center gap-1.5">
           {device.template_icon ? (
