@@ -422,7 +422,10 @@ def test_id_decode_is_given_one_algorithm_issuer_audience_leeway_and_required_cl
                 "issuer": ISSUER,
                 "audience": CLIENT_ID,
                 "leeway": 10,
-                "options": {"require": ["exp", "iat", "iss", "aud", "sub", "nonce"]},
+                "options": {
+                    "require": ["exp", "iat", "iss", "aud", "sub", "nonce"],
+                    "enforce_minimum_key_length": True,
+                },
             },
         )
     ]
@@ -620,3 +623,25 @@ def test_id_token_inside_the_leeway_or_with_an_aud_list_verifies(changes, id_key
     claims = _id_claims(**resolved)
     token = _id_token(claims, id_keys["rsa"])
     assert _decode_id(token, _public(id_keys["rsa"])) == claims
+
+
+def test_id_decode_refuses_an_rsa_key_under_2048_bits(id_keys):
+    """PyJWT's minimum key length is ON for ID tokens: a 1024-bit provider key
+    raises InvalidKeyError instead of verifying with a warning (the access-token
+    decode keeps it off). Signing with the short key warns, as PyJWT does."""
+    short_key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+    with pytest.warns(InsecureKeyLengthWarning):
+        token = _id_token(_id_claims(), short_key)
+    with pytest.raises(jwt.PyJWTError) as exc_info:
+        _decode_id(token, _public(short_key))
+    assert type(exc_info.value) is jwt.InvalidKeyError
+    assert str(exc_info.value) == (
+        "The RSA key is 1024 bits long, which is below the minimum recommended size "
+        "of 2048 bits. See NIST SP 800-131A."
+    )
+
+
+def test_id_decode_accepts_an_rsa_key_of_exactly_2048_bits(id_keys):
+    claims = _id_claims()
+    assert id_keys["rsa"].key_size == 2048
+    assert _decode_id(_id_token(claims, id_keys["rsa"]), _public(id_keys["rsa"])) == claims

@@ -7,7 +7,7 @@ notifications' `get_bearer_credentials`, and the settings round trip in
 a PyJWT decode called anywhere else in the scanned code, except the config
 service's own session decode, which may not import `herd_common`.
 
-Two choices are made here, once, by decision (issue #1186):
+Two choices are made for `decode_access_token`, once, by decision (issue #1186):
 
 - `leeway` is `ACCESS_TOKEN_LEEWAY_SECONDS` (10 s). PyJWT applies it to `exp`,
   `nbf`, and `iat`: a token is accepted up to 10 s after its `exp`, and an `iat`
@@ -35,7 +35,10 @@ exactly one algorithm, which must be one of `ID_TOKEN_ALGORITHMS` (never `none`,
 never an HS algorithm, so a token MACed with the client secret or with the
 public key bytes is refused whatever the caller passes), requires `exp`, `iat`,
 `iss`, `aud`, `sub`, and `nonce`, checks `iss` for exact equality and `aud` for
-membership, and refuses an empty expected issuer or audience. It does not
+membership, refuses an empty expected issuer or audience, and, unlike the
+access-token decode, turns PyJWT's minimum key length ON
+(`enforce_minimum_key_length`), so an RSA provider key under 2048 bits raises
+`jwt.InvalidKeyError` instead of verifying with a warning. It does not
 compare the nonce, check `azp`, or refuse an empty `sub`; the auth service's
 `oidc_service` does, because those need the flow's state.
 `tests/unit/test_jwt_settings_wiring.py` admits it as one `DIRECT_DECODE_ALLOWED`
@@ -82,8 +85,12 @@ def decode_id_token(token: str, key, algorithm: str, *, issuer: str, audience: s
 
     Raises `jwt.InvalidAlgorithmError` before any decode when `algorithm` is not
     one of `ID_TOKEN_ALGORITHMS`, `jwt.InvalidIssuerError` or
-    `jwt.InvalidAudienceError` when the expected value is empty, and any other
-    `jwt.PyJWTError` for a token or key that does not verify.
+    `jwt.InvalidAudienceError` when the expected value is empty,
+    `jwt.InvalidKeyError` for an RSA key under 2048 bits (PyJWT's minimum; EC
+    keys have no PyJWT minimum, the curve fixes their size), and any other
+    `jwt.PyJWTError` for a token or key that does not verify (PyJWT 2.15 turns
+    a `RecursionError` from a deeply nested header or payload into
+    `jwt.DecodeError` itself).
     """
     if algorithm not in ID_TOKEN_ALGORITHMS:
         raise jwt.InvalidAlgorithmError("The specified alg value is not allowed")
@@ -98,5 +105,8 @@ def decode_id_token(token: str, key, algorithm: str, *, issuer: str, audience: s
         issuer=issuer,
         audience=audience,
         leeway=ACCESS_TOKEN_LEEWAY_SECONDS,
-        options={"require": list(ID_TOKEN_REQUIRED_CLAIMS)},
+        options={
+            "require": list(ID_TOKEN_REQUIRED_CLAIMS),
+            "enforce_minimum_key_length": True,
+        },
     )

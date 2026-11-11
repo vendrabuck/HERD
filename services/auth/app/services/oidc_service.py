@@ -19,36 +19,55 @@ Two entry points, the phase 1 half of "Internal interfaces between phases":
   form-urlencoded), reads only `id_token` from the answer, verifies it, and
   returns a `VerifiedIdToken`.
 
-Two errors, neither carrying IdP text in its `str()`: `OidcUnavailableError`
-(the provider could not be asked or answered unusably: settings incomplete,
-transport error, timeout, non-200, non-JSON, a discovery or JWKS document that
-fails validation, a token endpoint 5xx) and `OidcRejectedError` (the provider
-answered and the answer is refused: a token endpoint 4xx, no `id_token`, any
-ID-token rule). Each carries a fixed `reason` from this module and is raised
-`from None`, so no upstream exception text rides along as its cause.
+Two errors, and only these two leave either entry point for any input the
+provider shapes (`tests/test_oidc_service.py`, the hostile-shape table), neither
+carrying IdP text in its `str()`: `OidcUnavailableError` (the provider could not
+be asked or answered unusably: settings incomplete, transport error, timeout or
+the overall deadline, non-200, a body that is not usable JSON, a discovery or
+JWKS document that fails validation, a token endpoint 5xx or other non-200,
+non-4xx status) and `OidcRejectedError` (the provider answered and the answer is
+refused: a token endpoint 4xx, a JSON answer with no usable `id_token`, any
+ID-token rule). Each carries a fixed `reason` from this module. Every one raised
+while another exception is being handled is raised `from None`, so no upstream
+exception rides along as its cause or context.
 
-ID-token rules, every one required: the header names a `kid` and an `alg`
-equal to `OIDC_ID_TOKEN_ALGORITHM`; exactly one JWKS key has that `kid`, its
-`kty` (and for EC its `crv`) fits the algorithm, its `use` is absent or `sig`,
-and its `alg` is absent or the pinned one; the signature verifies under
+HTTP: one `httpx.AsyncClient` per request, `httpx.Timeout(10.0, connect=5.0)`
+(5 s to connect, 10 s for each read, write, or pool wait), no redirect followed,
+TLS verified (`OIDC_CA_CERT` as the bundle when set), and an overall deadline of
+`HTTP_DEADLINE_SECONDS` (10 s) around each whole request, body included, since
+httpx's timeouts bound each operation and a server that drips bytes never trips
+them. Callers queued behind the cache lock wait for the request in flight, so
+one caller can wait longer than 10 s in total.
+
+ID-token rules, every one required: the token is printable ASCII; its header
+names a `kid` and an `alg` equal to `OIDC_ID_TOKEN_ALGORITHM`, and its `typ`,
+when present, is not an RFC 9068 access-token type (`at+jwt`); the JWKS keys
+that can verify the pinned algorithm (`kty`, for EC `crv`, `use` absent or
+`sig`, `alg` absent or the pinned one) are selected FIRST, and exactly one of
+them has the `kid`; the signature verifies under
 `herd_common.jwt_codec.decode_id_token` (exact `iss`, `aud` containing the
 client id, `exp` and `iat` required, `exp`, `iat`, and `nbf` with the 10 s
-leeway); when `aud` holds more than one value `azp` is required, and when `azp`
-is present it equals the client id; `nonce` equals the flow's nonce
-(constant-time compare); `sub` is a non-empty string of at most 255
-characters. `at_hash` is not checked, by decision (ADR 0016 D13).
+leeway, an RSA key of at least 2048 bits); when `aud` holds more than one value
+`azp` is required, and when `azp` is present it equals the client id; `nonce`
+equals the flow's nonce (constant-time compare); `sub` is a string of at most
+255 characters that is not empty or white space only and holds no control
+character or lone surrogate. An optional claim (`email`, the username claim,
+`name`) that is not a non-empty string, or holds a control character or lone
+surrogate, is returned as None. `at_hash` is not checked, by decision (ADR 0016
+D13).
 
 Discovery (`{OIDC_ISSUER}/.well-known/openid-configuration`, one trailing slash
 of the issuer dropped for the URL only) must be a JSON object whose `issuer`
 equals `OIDC_ISSUER` exactly, whose `authorization_endpoint`, `token_endpoint`,
-and `jwks_uri` are absolute URLs, whose every `*_endpoint` value and `jwks_uri`
-is https unless `OIDC_REQUIRE_HTTPS` is false, whose `response_types_supported`
-contains `code`, and whose `code_challenge_methods_supported`, when present,
-contains `S256`; the authorization endpoint may carry its own query (RFC 6749
-section 3.1) but no fragment and none of the parameter names HERD sends.
+and `jwks_uri` are absolute printable-ASCII URLs with a host and no userinfo,
+whose every `*_endpoint` value and `jwks_uri` is such a URL and https unless
+`OIDC_REQUIRE_HTTPS` is false, whose `response_types_supported` contains `code`,
+and whose `code_challenge_methods_supported`, when present, contains `S256`; the
+authorization endpoint may carry its own query (RFC 6749 section 3.1) but no
+fragment and none of the parameter names HERD sends, even with a blank value.
 Discovery and JWKS are each cached for 3600 s in a `SingletonTTLCache`; a
-failed fetch is returned as `Uncached` and never stored. A `kid` that is not
-in the cached JWKS refetches it only when no JWKS fetch was attempted in the
+failed fetch is returned as `Uncached` and never stored. A `kid` that no key in
+the cached JWKS has refetches it only when no JWKS fetch was attempted in the
 last 60 s, so a token with a random `kid` cannot drive more than one IdP fetch
 a minute; the token is refused when the `kid` is still unknown.
 
@@ -57,20 +76,26 @@ integration service's `destination.py`): `transport` (None in production;
 tests set an `httpx.MockTransport`) and `clock` (`time.monotonic`). Tests call
 `reset_caches()` between cases.
 
-Log rule (ADR 0016 D9): never logged, in a message or in `extra`: the client
-secret, the authorization code, `state`, `nonce`, the PKCE verifier, the ID
-token, and any text the provider sent (an `error_description`, a response
-body, a claim, a `kid`). A failure logs one WARNING with a fixed message and
-`extra` holding `action`, the fixed `reason`, and where they apply the
-exception class name, the HTTP status, and the RFC 6749 section 5.2 error code
-when it is one of the six registered values (anything else is logged as
-`other`). This is stricter than ADR 0016 D9, which allows truncated upstream
-text in the message; the stricter reading is deliberate, since a provider's
-error text can echo the code it refused.
+Log rule (ADR 0016 D9), for the log lines this module writes: never logged, in
+a message or in `extra`: the client secret, the authorization code, `state`,
+`nonce`, the PKCE verifier, the ID token, and any text the provider sent (an
+`error_description`, a response body, a claim, a `kid`). A failure logs one
+WARNING with a fixed message and `extra` holding `action`, the fixed `reason`,
+and where they apply the exception class name, the HTTP status, and the RFC
+6749 section 5.2 error code when it is one of the six registered values
+(anything else is logged as `other`). This is stricter than ADR 0016 D9, which
+allows truncated upstream text in the message; the stricter reading is
+deliberate, since a provider's error text can echo the code it refused.
+Third-party loggers are outside that rule: the `httpx` logger writes one INFO
+line per request with the method, the URL (for discovery-supplied endpoints,
+provider text), and the status; the `httpcore` logger writes the response
+headers at DEBUG, which `herd_common.logging.setup_logging` keeps out by
+setting `httpcore` to INFO.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -79,6 +104,7 @@ import secrets
 import ssl
 import string
 import time
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -97,7 +123,11 @@ logger = logging.getLogger(__name__)
 DISCOVERY_TTL_SECONDS = 3600
 JWKS_TTL_SECONDS = 3600
 JWKS_REFETCH_FLOOR_SECONDS = 60
+# httpx's timeouts bound each operation (connect, each read, each write), not
+# the request: a server that sends a byte every few seconds never trips a read
+# timeout. HTTP_DEADLINE_SECONDS bounds each whole request, body included.
 HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+HTTP_DEADLINE_SECONDS = 10.0
 STATE_BYTES = 32
 NONCE_BYTES = 32
 CODE_VERIFIER_LENGTH = 64
@@ -131,6 +161,14 @@ _KEY_TYPES: dict[str, tuple[str, str | None]] = {
     "ES384": ("EC", "P-384"),
     "ES512": ("EC", "P-521"),
 }
+
+# RFC 9068 access-token `typ` values, refused in an ID-token header.
+_ACCESS_TOKEN_TYPES = frozenset({"at+jwt", "application/at+jwt"})
+
+# Raised by `response.json()` for a body that is not usable JSON: ValueError
+# covers invalid JSON, invalid UTF-8, and an integer over the digit limit;
+# RecursionError is deeply nested JSON.
+_JSON_ERRORS = (ValueError, RecursionError)
 
 # RFC 6749 section 5.2, the only token-endpoint error codes ever logged verbatim.
 _OAUTH_ERROR_CODES = frozenset(
@@ -290,23 +328,38 @@ def _client() -> httpx.AsyncClient:
     )
 
 
+def _printable_ascii(value: str) -> bool:
+    """ASCII with no space or control character (a URL as sent on the wire)."""
+    return value.isascii() and all(0x20 < ord(ch) < 0x7F for ch in value)
+
+
 def _endpoint_ok(value: object) -> bool:
-    """An absolute URL with a host and no fragment, https unless not required."""
-    if not isinstance(value, str) or not value or value != value.strip():
+    """An absolute printable-ASCII URL with a host, no userinfo, and no fragment,
+    https unless not required."""
+    if not isinstance(value, str) or not value or not _printable_ascii(value):
         return False
     try:
         parts = urlsplit(value)
     except ValueError:
         return False
     schemes = ("https",) if settings.oidc_require_https else ("https", "http")
-    return parts.scheme in schemes and bool(parts.netloc) and not parts.fragment
+    return (
+        parts.scheme in schemes
+        and bool(parts.netloc)
+        and "@" not in parts.netloc
+        and "#" not in value
+    )
 
 
 async def _get_json(url: str, failure_prefix: str) -> Any:
     """GET url and return its parsed JSON body, or a `_FetchFailure` (logged)."""
     try:
-        async with _client() as client:
-            response = await client.get(url, headers={"Accept": "application/json"})
+        async with asyncio.timeout(HTTP_DEADLINE_SECONDS):
+            async with _client() as client:
+                response = await client.get(url, headers={"Accept": "application/json"})
+    except TimeoutError:
+        _log_failure("oidc_unavailable", f"{failure_prefix}_deadline", {})
+        return _FetchFailure(f"{failure_prefix}_deadline")
     except (httpx.HTTPError, httpx.InvalidURL) as exc:
         _log_failure(
             "oidc_unavailable",
@@ -323,7 +376,7 @@ async def _get_json(url: str, failure_prefix: str) -> Any:
         return _FetchFailure(f"{failure_prefix}_status")
     try:
         return response.json()
-    except ValueError as exc:
+    except _JSON_ERRORS as exc:
         _log_failure(
             "oidc_unavailable",
             f"{failure_prefix}_not_json",
@@ -362,7 +415,9 @@ def _validate_discovery(document: Any) -> _Discovery | str:
         if not isinstance(methods, list) or "S256" not in methods:
             return "discovery_s256_unsupported"
     own_query = urlsplit(document["authorization_endpoint"]).query
-    if any(name in AUTHORIZATION_PARAMETERS for name, _ in parse_qsl(own_query)):
+    if any(
+        name in AUTHORIZATION_PARAMETERS for name, _ in parse_qsl(own_query, keep_blank_values=True)
+    ):
         return "discovery_endpoint_invalid"
     return _Discovery(
         authorization_endpoint=document["authorization_endpoint"],
@@ -408,7 +463,7 @@ async def _fetch_jwks() -> tuple[dict[str, Any], ...] | Uncached[_FetchFailure]:
     try:
         # Validation only: refuses a set with no key PyJWT can load.
         jwt.PyJWKSet.from_dict({"keys": keys})
-    except jwt.PyJWTError as exc:
+    except (jwt.PyJWTError, TypeError, ValueError) as exc:
         _log_failure("oidc_unavailable", "jwks_invalid", {"error_class": type(exc).__name__})
         return Uncached(_FetchFailure("jwks_invalid"))
     return tuple(keys)
@@ -421,43 +476,56 @@ async def _jwks() -> tuple[dict[str, Any], ...]:
     return result
 
 
+def _key_misfit(jwk: dict[str, Any], algorithm: str) -> str | None:
+    """Why a JWK cannot verify `algorithm`, or None when it can."""
+    expected_kty, expected_crv = _KEY_TYPES[algorithm]
+    if jwk.get("kty") != expected_kty or (
+        expected_crv is not None and jwk.get("crv") != expected_crv
+    ):
+        return "key_type_mismatch"
+    if jwk.get("use", "sig") != "sig":
+        return "key_use_mismatch"
+    if jwk.get("alg", algorithm) != algorithm:
+        return "key_algorithm_mismatch"
+    return None
+
+
 def _keys_with_kid(keys: tuple[dict[str, Any], ...], kid: str) -> list[dict[str, Any]]:
     return [key for key in keys if key.get("kid") == kid]
 
 
 async def _signing_key(kid: str, algorithm: str) -> jwt.PyJWK:
-    found = _keys_with_kid(await _jwks(), kid)
-    if not found:
+    """The one JWKS key that has `kid` and can verify `algorithm`.
+
+    Keys are filtered by `kty`, `crv`, `use`, and `alg` FIRST, so a `kid`
+    shared by a signing key and, say, an encryption key selects the signing
+    key; two suitable keys with one `kid` are refused as ambiguous. A `kid` no
+    key in the set has triggers the floored refetch; a `kid` held only by
+    unsuitable keys does not (a refetch would not change the answer).
+    """
+    named = _keys_with_kid(await _jwks(), kid)
+    if not named:
         now = clock()
         last = _cache.last_jwks_fetch_at
         if last is None or now - last >= JWKS_REFETCH_FLOOR_SECONDS:
-            # _fetch_jwks stamps too, before its first suspension; stamping here
-            # as well keeps the floor from depending on when the fetch runs
-            # (for example behind the cache lock), so concurrent misses refetch once.
             _cache.last_jwks_fetch_at = now
             _cache.jwks.invalidate()
             logger.info(
                 "OIDC JWKS refetched for a key id it did not hold",
                 extra={"action": "oidc_jwks_refetch"},
             )
-            found = _keys_with_kid(await _jwks(), kid)
-    if not found:
+            named = _keys_with_kid(await _jwks(), kid)
+    if not named:
         raise _rejected("unknown_kid")
-    if len(found) > 1:
+    suitable = [key for key in named if _key_misfit(key, algorithm) is None]
+    if not suitable:
+        misfits = {_key_misfit(key, algorithm) for key in named}
+        raise _rejected(misfits.pop() if len(misfits) == 1 else "no_suitable_key")
+    if len(suitable) > 1:
         raise _rejected("ambiguous_kid")
-    jwk = found[0]
-    expected_kty, expected_crv = _KEY_TYPES[algorithm]
-    if jwk.get("kty") != expected_kty or (
-        expected_crv is not None and jwk.get("crv") != expected_crv
-    ):
-        raise _rejected("key_type_mismatch")
-    if jwk.get("use", "sig") != "sig":
-        raise _rejected("key_use_mismatch")
-    if jwk.get("alg", algorithm) != algorithm:
-        raise _rejected("key_algorithm_mismatch")
     try:
-        return jwt.PyJWK(jwk, algorithm=algorithm)
-    except jwt.PyJWTError as exc:
+        return jwt.PyJWK(suitable[0], algorithm=algorithm)
+    except (jwt.PyJWTError, TypeError, ValueError) as exc:
         raise _rejected("key_unusable", error_class=type(exc).__name__) from None
 
 
@@ -469,14 +537,21 @@ def _unverified_kid_and_alg(id_token: str) -> tuple[str, str]:
 
     The one unverified read in the repository (`UNVERIFIED_READ_ALLOWED` in
     `tests/unit/test_jwt_settings_wiring.py`). Both values only select and
-    check a key; the signature is verified afterwards by `decode_id_token`.
+    check a key; the signature is verified afterwards by `decode_id_token`. A
+    header whose `typ` names an RFC 9068 access token (`at+jwt`) is refused
+    here too, so an access token the provider issued is never read as an ID
+    token. The caller has already refused a token that is not printable ASCII.
     """
     try:
         header = jwt.get_unverified_header(id_token)
-    except jwt.PyJWTError as exc:
+    # RecursionError: as at the decode, PyJWT 2.15 maps it to DecodeError itself.
+    except (jwt.PyJWTError, RecursionError) as exc:
         raise _rejected("malformed_token", error_class=type(exc).__name__) from None
     kid = header.get("kid")
     alg = header.get("alg")
+    typ = header.get("typ")
+    if isinstance(typ, str) and typ.lower() in _ACCESS_TOKEN_TYPES:
+        raise _rejected("access_token_type")
     if not isinstance(kid, str) or not kid:
         raise _rejected("missing_kid")
     if not isinstance(alg, str):
@@ -484,8 +559,17 @@ def _unverified_kid_and_alg(id_token: str) -> tuple[str, str]:
     return kid, alg
 
 
+def _has_control_or_surrogate(value: str) -> bool:
+    """Any Unicode control character (category Cc, NUL included, which a
+    Postgres text column refuses) or lone surrogate (Cs, which cannot be
+    encoded as UTF-8)."""
+    return any(unicodedata.category(ch) in ("Cc", "Cs") for ch in value)
+
+
 def _optional_string(value: Any) -> str | None:
-    return value if isinstance(value, str) and value else None
+    if not isinstance(value, str) or not value or _has_control_or_surrogate(value):
+        return None
+    return value
 
 
 def _email_verified(claims: dict[str, Any]) -> bool | None:
@@ -498,6 +582,10 @@ def _email_verified(claims: dict[str, Any]) -> bool | None:
 async def _verify_id_token(id_token: str, nonce: str) -> VerifiedIdToken:
     algorithm = settings.oidc_id_token_algorithm
     client_id = settings.oidc_client_id
+    if not _printable_ascii(id_token):
+        # A compact JWS is base64url and dots; anything else is refused before
+        # PyJWT reads it (a lone surrogate would raise UnicodeEncodeError there).
+        raise _rejected("malformed_token")
     kid, alg = _unverified_kid_and_alg(id_token)
     if alg != algorithm:
         raise _rejected("algorithm_mismatch")
@@ -506,7 +594,13 @@ async def _verify_id_token(id_token: str, nonce: str) -> VerifiedIdToken:
         claims = decode_id_token(
             id_token, key, algorithm, issuer=settings.oidc_issuer, audience=client_id
         )
-    except jwt.PyJWTError as exc:
+    except jwt.InvalidKeyError as exc:
+        # With a key already built by PyJWK, only the minimum-key-length check
+        # (an RSA key under 2048 bits) raises this at decode time.
+        raise _rejected("key_too_short", error_class=type(exc).__name__) from None
+    except (jwt.PyJWTError, RecursionError) as exc:
+        # PyJWT 2.15 already turns a RecursionError from a deeply nested payload
+        # into DecodeError; caught here too so another PyJWT cannot let it escape.
         raise _rejected("id_token_invalid", error_class=type(exc).__name__) from None
 
     audience = claims["aud"]
@@ -518,13 +612,22 @@ async def _verify_id_token(id_token: str, nonce: str) -> VerifiedIdToken:
         raise _rejected("azp_mismatch")
 
     claimed_nonce = claims.get("nonce")
-    if not isinstance(claimed_nonce, str) or not hmac.compare_digest(
-        claimed_nonce.encode("utf-8"), nonce.encode("utf-8")
+    # HERD's nonces are base64url, so a non-ASCII claim cannot match (and could
+    # not be encoded for the compare if it held a lone surrogate).
+    if (
+        not isinstance(claimed_nonce, str)
+        or not claimed_nonce.isascii()
+        or not hmac.compare_digest(claimed_nonce.encode("ascii"), nonce.encode("utf-8"))
     ):
         raise _rejected("nonce_mismatch")
 
     subject = claims.get("sub")
-    if not isinstance(subject, str) or not subject or len(subject) > MAX_SUBJECT_LENGTH:
+    if (
+        not isinstance(subject, str)
+        or not subject.strip()
+        or len(subject) > MAX_SUBJECT_LENGTH
+        or _has_control_or_surrogate(subject)
+    ):
         raise _rejected("subject_invalid")
 
     return VerifiedIdToken(
@@ -543,10 +646,10 @@ async def _verify_id_token(id_token: str, nonce: str) -> VerifiedIdToken:
 def _oauth_error_code(response: httpx.Response) -> str:
     try:
         body = response.json()
-    except ValueError:
+    except _JSON_ERRORS:
         return "other"
     error = body.get("error") if isinstance(body, dict) else None
-    return error if error in _OAUTH_ERROR_CODES else "other"
+    return error if isinstance(error, str) and error in _OAUTH_ERROR_CODES else "other"
 
 
 async def _exchange_code(token_endpoint: str, code: str, code_verifier: str) -> str:
@@ -561,10 +664,13 @@ async def _exchange_code(token_endpoint: str, code: str, code_verifier: str) -> 
         "code_verifier": code_verifier,
     }
     try:
-        async with _client() as client:
-            response = await client.post(
-                token_endpoint, data=form, auth=auth, headers={"Accept": "application/json"}
-            )
+        async with asyncio.timeout(HTTP_DEADLINE_SECONDS):
+            async with _client() as client:
+                response = await client.post(
+                    token_endpoint, data=form, auth=auth, headers={"Accept": "application/json"}
+                )
+    except TimeoutError:
+        raise _unavailable("token_deadline") from None
     except (httpx.HTTPError, httpx.InvalidURL) as exc:
         raise _unavailable("token_transport", error_class=type(exc).__name__) from None
     status = response.status_code
@@ -576,7 +682,7 @@ async def _exchange_code(token_endpoint: str, code: str, code_verifier: str) -> 
         raise _unavailable("token_status", status_code=status)
     try:
         body = response.json()
-    except ValueError as exc:
+    except _JSON_ERRORS as exc:
         raise _unavailable("token_not_json", error_class=type(exc).__name__) from None
     id_token = body.get("id_token") if isinstance(body, dict) else None
     if not isinstance(id_token, str) or not id_token:

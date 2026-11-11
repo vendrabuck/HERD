@@ -206,6 +206,23 @@ def test_the_defaults_name_the_four_unset_variables(clean_env):
         ({"oidc_username_claim": ""}, "OIDC_USERNAME_CLAIM"),
         ({"oidc_email_claim": " "}, "OIDC_EMAIL_CLAIM"),
         ({"oidc_ca_cert": "/nonexistent/ca.pem"}, "OIDC_CA_CERT"),
+        # Userinfo would be sent as Basic credentials on discovery.
+        ({"oidc_issuer": "https://u:p@idp.test/realms/herd"}, "OIDC_ISSUER"),
+        ({"oidc_issuer": "https://u@idp.test/realms/herd"}, "OIDC_ISSUER"),
+        ({"oidc_issuer": "https://idp.test/realms/herd?"}, "OIDC_ISSUER"),
+        ({"oidc_issuer": "https://idp.test/realms/herd#"}, "OIDC_ISSUER"),
+        ({"oidc_issuer": "https://idp.test/r\u00e9alms/herd"}, "OIDC_ISSUER"),
+        (
+            {"oidc_redirect_uri": "https://u:p@herd.test/api/auth/oidc/callback"},
+            "OIDC_REDIRECT_URI",
+        ),
+        ({"oidc_redirect_uri": "https://herd.test/api/auth/oidc/callback?"}, "OIDC_REDIRECT_URI"),
+        ({"oidc_redirect_uri": "https://herd.test/api/auth/oidc/callback#"}, "OIDC_REDIRECT_URI"),
+        ({"oidc_redirect_uri": "https://herd.test/api/../oidc/callback"}, "OIDC_REDIRECT_URI"),
+        ({"oidc_redirect_uri": "https://herd.test/api/%2e%2e/oidc/callback"}, "OIDC_REDIRECT_URI"),
+        ({"oidc_redirect_uri": "https://herd.test/api/%2E%2e/oidc/callback"}, "OIDC_REDIRECT_URI"),
+        ({"oidc_redirect_uri": "https://herd.test/api/auth/oidc/callback\t"}, "OIDC_REDIRECT_URI"),
+        ({"oidc_redirect_uri": "https://herd.test/a pi/auth/oidc/callback"}, "OIDC_REDIRECT_URI"),
     ],
 )
 def test_each_missing_or_invalid_setting_is_named(changes, variable):
@@ -328,3 +345,8 @@ def test_all_three_warnings_fire_together_in_order(caplog):
         "oidc_https_not_required",
         "oidc_break_glass_enabled",
     ]
+
+
+def test_a_single_dot_segment_and_dots_inside_a_segment_are_not_refused():
+    loaded = oidc_settings(oidc_redirect_uri="https://herd.test/a..b/./api/auth/oidc/callback")
+    assert oidc_configuration_problems(loaded) == []

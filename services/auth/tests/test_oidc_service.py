@@ -14,6 +14,13 @@ What is pinned:
   the public key PEM, another asymmetric algorithm, a key of the wrong type);
 - discovery, JWKS, and the token endpoint fail closed, each failure class with
   its own reason, and no failure is cached (the next call fetches again);
+- only `OidcUnavailableError` or `OidcRejectedError` ever leaves an entry point
+  for provider-shaped input: `test_a_hostile_shape_yields_only_the_two_error_classes`
+  feeds every endpoint every body shape and every field the code reads every
+  hostile JSON value (856 cases, `test_the_hostile_shape_table_size`), each
+  mapped to the outcome the documented rule names;
+- each request is cut at the overall deadline even when the server never
+  answers or stalls mid-body (`test_a_request_that_never_completes_is_cut_at_the_deadline`);
 - discovery and JWKS are cached for 3600 s, and an unknown `kid` refetches the
   JWKS at most once per 60 s, concurrent misses included;
 - the authorization URL carries exactly the ADR's parameters, with S256 PKCE
@@ -25,7 +32,8 @@ What is pinned:
   appears (client secret, code, verifier, nonce, state, ID token, IdP access
   token, error description, response body, claim values, key id), so every
   success and failure path below is also a hygiene test; each failure test
-  also checks the exception's `str()` and `repr()` and that it has no cause.
+  also checks the exception's `str()` and `repr()`, that it has no cause, and
+  that any context it was raised in is suppressed (`from None`).
 """
 
 from __future__ import annotations
@@ -56,9 +64,10 @@ from app.services.oidc_service import (
 )
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.x509.oid import NameOID
 from herd_common.logging import JSONFormatter
+from jwt.warnings import InsecureKeyLengthWarning
 
 ISSUER = "https://idp.test/realms/herd"
 DISCOVERY_URL = ISSUER + "/.well-known/openid-configuration"
@@ -110,6 +119,7 @@ def keys() -> dict:
         "rsa": rsa.generate_private_key(public_exponent=65537, key_size=2048),
         "rsa_rotated": rsa.generate_private_key(public_exponent=65537, key_size=2048),
         "attacker": rsa.generate_private_key(public_exponent=65537, key_size=2048),
+        "rsa_1024": rsa.generate_private_key(public_exponent=65537, key_size=1024),
         "P-256": ec.generate_private_key(ec.SECP256R1()),
         "P-384": ec.generate_private_key(ec.SECP384R1()),
         "P-521": ec.generate_private_key(ec.SECP521R1()),
@@ -147,6 +157,16 @@ def base_claims() -> dict:
     }
 
 
+def signed_raw(keys: dict, payload: bytes, header: bytes | None = None) -> str:
+    """A compact RS256 JWS over exact payload (and header) bytes, signed with the
+    provider's key, for shapes `jwt.encode` cannot produce."""
+    if header is None:
+        header = json.dumps({"alg": "RS256", "typ": "JWT", "kid": KID}).encode()
+    signing_input = f"{_b64(header)}.{_b64(payload)}".encode()
+    signature = keys["rsa"].sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    return f"{signing_input.decode()}.{_b64(signature)}"
+
+
 @dataclass
 class TokenSpec:
     """How to build one ID token; the default is a valid RS256 token."""
@@ -158,8 +178,12 @@ class TokenSpec:
     hmac_secret: bytes | None = None
     unsigned: bool = False
     tamper_sub: bool = False
+    header_extra: dict = field(default_factory=dict)
+    raw: str | None = None
 
     def build(self, keys: dict) -> str:
+        if self.raw is not None:
+            return self.raw
         header = {"alg": self.algorithm, "typ": "JWT"}
         if self.kid is not None:
             header["kid"] = self.kid
@@ -175,15 +199,30 @@ class TokenSpec:
                 self.hmac_secret, f"{head}.{body}".encode(), digest[self.algorithm]
             ).digest()
             return f"{head}.{body}.{_b64(mac)}"
-        extra_headers = {"kid": self.kid} if self.kid is not None else None
-        token = jwt.encode(
-            self.claims, keys[self.signer], algorithm=self.algorithm, headers=extra_headers
-        )
+        extra_headers = {"kid": self.kid} if self.kid is not None else {}
+        extra_headers.update(self.header_extra)
+        if self.signer == "rsa_1024":
+            with pytest.warns(InsecureKeyLengthWarning):
+                token = jwt.encode(
+                    self.claims, keys[self.signer], algorithm=self.algorithm, headers=extra_headers
+                )
+        else:
+            token = jwt.encode(
+                self.claims, keys[self.signer], algorithm=self.algorithm, headers=extra_headers
+            )
         if self.tamper_sub:
             head, _, signature = token.split(".")
             forged = dict(self.claims, sub="SENTINEL-someone-else")
             token = f"{head}.{_b64(json.dumps(forged).encode())}.{signature}"
         return token
+
+
+def json_response(document: Any, status: int = 200) -> httpx.Response:
+    """A JSON answer encoded with json.dumps (ASCII-escaped), so a lone surrogate
+    in a test document reaches the code under test instead of failing here."""
+    return httpx.Response(
+        status, content=json.dumps(document).encode(), headers={"content-type": "application/json"}
+    )
 
 
 class FakeClock:
@@ -229,17 +268,21 @@ class FakeIdP:
         if name in self.overrides:
             return self.overrides[name](request)
         if name == "discovery":
-            return httpx.Response(200, json=self.discovery)
+            return json_response(self.discovery)
         if name == "jwks":
-            return httpx.Response(200, json=self.jwks)
+            return json_response(self.jwks)
         if name == "token":
+            # json.dumps escapes non-ASCII (a lone surrogate included) as httpx's
+            # json= would not.
+            body = {
+                "access_token": IDP_ACCESS_TOKEN,
+                "token_type": "Bearer",
+                "id_token": self.id_token,
+            }
             return httpx.Response(
                 200,
-                json={
-                    "access_token": IDP_ACCESS_TOKEN,
-                    "token_type": "Bearer",
-                    "id_token": self.id_token,
-                },
+                content=json.dumps(body).encode(),
+                headers={"content-type": "application/json"},
             )
         return httpx.Response(404, text=IDP_BODY_TEXT)
 
@@ -286,7 +329,10 @@ def assert_clean_error(error: Exception, idp: FakeIdP | None = None) -> None:
     texts = [str(error), repr(error), *(str(arg) for arg in error.args)]
     extra = (idp.extra_secrets + [idp.id_token or ""]) if idp is not None else []
     assert secret_findings(texts, extra) == []
+    # `raise ... from None` sets __suppress_context__; without it an exception
+    # raised while handling another carries that one as __context__.
     assert error.__cause__ is None
+    assert error.__context__ is None or error.__suppress_context__ is True
 
 
 def failure_records(caplog, action: str) -> list[logging.LogRecord]:
@@ -468,6 +514,27 @@ def _two_keys_share_the_kid(spec, idp, keys, monkeypatch):
     idp.jwks["keys"].append(public_jwk(keys["rsa_rotated"], KID))
 
 
+def _short_rsa_key(spec, idp, keys, monkeypatch):
+    idp.jwks = {"keys": [public_jwk(keys["rsa_1024"], KID)]}
+    spec.signer = "rsa_1024"
+
+
+def _kid_held_by_two_unsuitable_keys(spec, idp, keys, monkeypatch):
+    idp.jwks = {
+        "keys": [
+            public_jwk(keys["rsa"], KID, use="enc"),
+            public_jwk(keys["P-256"], KID),
+        ]
+    }
+
+
+def _raw_token(make):
+    def change(spec, idp, keys, monkeypatch):
+        spec.raw = make(keys)
+
+    return change
+
+
 # (change, reason, the PyJWT class logged for an id_token_invalid reason)
 REFUSALS: dict[str, tuple[Any, str, str | None]] = {
     # Signature and key selection.
@@ -552,6 +619,41 @@ REFUSALS: dict[str, tuple[Any, str, str | None]] = {
     "sub-empty": (_claim("sub", ""), "subject_invalid", None),
     "sub-not-a-string": (_claim("sub", 42), "id_token_invalid", "InvalidSubjectError"),
     "sub-over-255-characters": (_claim("sub", "S" * 256), "subject_invalid", None),
+    "sub-white-space-only": (_claim("sub", " \t "), "subject_invalid", None),
+    "sub-with-nul": (_claim("sub", "SENTINEL-a\x00b"), "subject_invalid", None),
+    "sub-with-unit-separator": (_claim("sub", "SENTINEL-a\x1fb"), "subject_invalid", None),
+    "sub-with-del": (_claim("sub", "SENTINEL-a\x7fb"), "subject_invalid", None),
+    "sub-with-lone-surrogate": (_claim("sub", "SENTINEL-a\ud800"), "subject_invalid", None),
+    "nonce-lone-surrogate": (_claim("nonce", "\ud800"), "nonce_mismatch", None),
+    # Access tokens (RFC 9068) are not ID tokens.
+    "typ-at+jwt": (_spec(header_extra={"typ": "at+jwt"}), "access_token_type", None),
+    "typ-application-at+jwt-upper-case": (
+        _spec(header_extra={"typ": "application/AT+JWT"}),
+        "access_token_type",
+        None,
+    ),
+    # Key strength: PyJWT's minimum, enforced for ID tokens.
+    "rsa-key-under-2048-bits": (_short_rsa_key, "key_too_short", "InvalidKeyError"),
+    # Key selection filters by suitability first.
+    "kid-held-only-by-unsuitable-keys": (
+        _kid_held_by_two_unsuitable_keys,
+        "no_suitable_key",
+        None,
+    ),
+    # Token text PyJWT must never see, or must never get to raise past us.
+    "token-not-ascii": (_raw_token(lambda keys: "SENTINEL-\u00e9.a.b"), "malformed_token", None),
+    "token-lone-surrogate": (_raw_token(lambda keys: "\ud800.a.b"), "malformed_token", None),
+    "token-with-space": (_raw_token(lambda keys: "SENTINEL a.b.c"), "malformed_token", None),
+    "header-deeply-nested": (
+        _raw_token(lambda keys: _b64(b"[" * 100_000 + b"]" * 100_000) + ".e30.c2ln"),
+        "malformed_token",
+        "DecodeError",
+    ),
+    "payload-deeply-nested-and-signed": (
+        _raw_token(lambda keys: signed_raw(keys, b"[" * 100_000 + b"]" * 100_000)),
+        "id_token_invalid",
+        "DecodeError",
+    ),
 }
 
 
@@ -587,6 +689,9 @@ def test_the_refusal_matrix_covers_every_id_token_rule():
         "azp_mismatch",
         "nonce_mismatch",
         "subject_invalid",
+        "access_token_type",
+        "key_too_short",
+        "no_suitable_key",
     }
     pyjwt_classes = {cls for _, reason, cls in REFUSALS.values() if reason == "id_token_invalid"}
     assert pyjwt_classes == {
@@ -597,6 +702,7 @@ def test_the_refusal_matrix_covers_every_id_token_rule():
         "ExpiredSignatureError",
         "ImmatureSignatureError",
         "InvalidSubjectError",
+        "DecodeError",
     }
 
 
@@ -680,6 +786,34 @@ def _discovery_answer(answer):
 
 
 DISCOVERY_FAILURES = {
+    "authorization-endpoint-query-names-state-blank": (
+        _discovery_change(authorization_endpoint=AUTHORIZATION_ENDPOINT + "?state=&nonce"),
+        "discovery_endpoint_invalid",
+    ),
+    "authorization-endpoint-bare-fragment": (
+        _discovery_change(authorization_endpoint=AUTHORIZATION_ENDPOINT + "#"),
+        "discovery_endpoint_invalid",
+    ),
+    "token-endpoint-userinfo": (
+        _discovery_change(token_endpoint="https://u:p@idp.test/token"),
+        "discovery_endpoint_invalid",
+    ),
+    "jwks-uri-non-ascii": (
+        _discovery_change(jwks_uri="https://idp.test/c\u00e9rts"),
+        "discovery_endpoint_invalid",
+    ),
+    "token-endpoint-with-space": (
+        _discovery_change(token_endpoint="https://idp.test/to ken"),
+        "discovery_endpoint_invalid",
+    ),
+    "token-endpoint-lone-surrogate": (
+        _discovery_change(token_endpoint="https://idp.test/\ud800"),
+        "discovery_endpoint_invalid",
+    ),
+    "status-200-deeply-nested": (
+        _discovery_answer(answers(200, content=b"[" * 100_000 + b"]" * 100_000)),
+        "discovery_not_json",
+    ),
     "connect-error": (_discovery_answer(raises(httpx.ConnectError)), "discovery_transport"),
     "connect-timeout": (_discovery_answer(raises(httpx.ConnectTimeout)), "discovery_transport"),
     "read-timeout": (_discovery_answer(raises(httpx.ReadTimeout)), "discovery_transport"),
@@ -1278,3 +1412,381 @@ def test_the_secret_check_finds_a_planted_secret():
     record = logging.LogRecord("x", logging.WARNING, __file__, 1, "m", (), None)
     record.reason = NONCE
     assert secret_findings([JSONFormatter("auth").format(record)]) != []
+
+
+# --- key selection filters by suitability first ---
+
+
+@pytest.mark.parametrize(
+    "neighbour",
+    ["rsa-enc", "ec", "rsa-other-alg"],
+)
+async def test_a_kid_shared_with_an_unsuitable_key_selects_the_suitable_one(neighbour, idp, keys):
+    other = {
+        "rsa-enc": public_jwk(keys["rsa_rotated"], KID, use="enc"),
+        "ec": public_jwk(keys["P-256"], KID),
+        "rsa-other-alg": public_jwk(keys["rsa_rotated"], KID, alg="RS512"),
+    }[neighbour]
+    idp.jwks = {"keys": [other, public_jwk(keys["rsa"], KID)]}
+    idp.use_token()
+    assert (await redeem()).subject == SUBJECT
+
+
+# --- optional claims holding a control character or lone surrogate ---
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["SENTINEL-a\x00b", "SENTINEL-a\nb", "SENTINEL-a\x07b", "SENTINEL-a\x9fb", "SENTINEL-a\ud800"],
+    ids=["nul", "newline", "bell", "c1-control", "lone-surrogate"],
+)
+@pytest.mark.parametrize("claim", ["email", "preferred_username", "name"])
+async def test_an_optional_claim_with_a_control_character_is_none(claim, value, idp):
+    spec = TokenSpec()
+    spec.claims[claim] = value
+    idp.use_token(spec)
+    verified = await redeem()
+    field_name = {"email": "email", "preferred_username": "username_claim", "name": "name"}[claim]
+    assert getattr(verified, field_name) is None
+    assert verified.subject == SUBJECT
+
+
+# --- the overall request deadline ---
+
+
+def _never_answers():
+    async def answer(request: httpx.Request) -> httpx.Response:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    return answer
+
+
+def _drips_then_stalls():
+    async def body():
+        yield b'{"issuer": '
+        await asyncio.Event().wait()
+
+    async def answer(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body(), headers={"content-type": "application/json"})
+
+    return answer
+
+
+def test_the_overall_deadline_is_ten_seconds_beside_the_httpx_timeouts():
+    assert oidc_service.HTTP_DEADLINE_SECONDS == 10.0
+    assert oidc_service.HTTP_TIMEOUT == httpx.Timeout(10.0, connect=5.0)
+
+
+@pytest.mark.parametrize("stall", ["no-answer", "body-stalls-after-a-byte"])
+@pytest.mark.parametrize(
+    ("endpoint", "reason"),
+    [("discovery", "discovery_deadline"), ("jwks", "jwks_deadline"), ("token", "token_deadline")],
+)
+async def test_a_request_that_never_completes_is_cut_at_the_deadline(
+    endpoint, reason, stall, idp, monkeypatch, caplog
+):
+    # The deadline is shortened for the test; its value is pinned above.
+    monkeypatch.setattr(oidc_service, "HTTP_DEADLINE_SECONDS", 0.05)
+    idp.overrides[endpoint] = _never_answers() if stall == "no-answer" else _drips_then_stalls()
+    idp.use_token()
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await expect_unavailable(redeem, idp, caplog, reason)
+    assert loop.time() - started < 2.0
+    # Not cached: the provider recovers and the next call succeeds.
+    idp.overrides.clear()
+    assert (await redeem()).subject == SUBJECT
+
+
+# --- the refetch floor while a fetch is in flight ---
+
+
+async def test_misses_arriving_during_an_in_flight_fetch_older_than_the_floor_refetch_once(idp):
+    """A JWKS fetch starts (and stamps the floor) at t=1000 and blocks; two
+    misses for an unknown kid arrive at t=1061, past the floor, and queue on the
+    cache lock behind it. When it completes, exactly one refetch follows."""
+    gate = asyncio.Event()
+
+    async def gated(request: httpx.Request) -> httpx.Response:
+        await gate.wait()
+        return json_response(idp.jwks)
+
+    idp.overrides["jwks"] = gated
+    idp.use_token(TokenSpec(kid="SENTINEL-kid-unknown"))
+    first = asyncio.create_task(redeem())
+    while idp.counts["jwks"] < 1:
+        await asyncio.sleep(0)
+    idp.clock.now += 61
+    later = [asyncio.create_task(redeem()) for _ in range(2)]
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert idp.counts["jwks"] == 1
+    gate.set()
+    results = await asyncio.gather(first, *later, return_exceptions=True)
+    assert all(isinstance(r, OidcRejectedError) and r.reason == "unknown_kid" for r in results)
+    assert idp.counts["jwks"] == 2
+
+
+# --- hostile shapes: only the two error classes ever leave an entry point ---
+#
+# Every endpoint gets every body shape, and every field the code reads gets
+# every hostile JSON value, spliced in as raw JSON bytes so shapes json.dumps
+# cannot produce (depth, numbers past the digit limit) reach the code. The
+# outcome must be the one the documented rule names: unavailable when the
+# provider could not be read (no usable JSON, a document that fails
+# validation, a 5xx or other non-200, non-4xx status), rejected when it
+# answered and was refused (a 4xx, an answer or token that breaks a rule), and
+# never any other exception.
+
+DEEP = b"[" * 100_000 + b"]" * 100_000
+
+# name: (raw bytes, whether json.loads accepts it)
+BODY_SHAPES: dict[str, tuple[bytes, bool]] = {
+    "empty": (b"", False),
+    "not-json": (b"SENTINEL-not-json", False),
+    "non-utf8": (b"\xff\xfe\xfd", False),
+    # json.loads decodes bytes with "surrogatepass": this parses to a string.
+    "utf8-encoded-surrogate": (b'"\xed\xa0\x80"', True),
+    "deeply-nested-array": (DEEP, False),
+    "deeply-nested-object": (b'{"a":' * 50_000 + b"1" + b"}" * 50_000, False),
+    "integer-past-the-digit-limit": (b"1" * 5000, False),
+    "object-with-an-integer-past-the-limit": (b'{"x": ' + b"1" * 5000 + b"}", False),
+    "json-null": (b"null", True),
+    "json-true": (b"true", True),
+    "json-number": (b"7", True),
+    "json-string": (b'"SENTINEL-scalar"', True),
+    "json-lone-surrogate-string": (b'"\\ud800"', True),
+    "json-nan": (b"NaN", True),
+    "json-array": (b"[]", True),
+    "json-array-of-objects": (b"[{}]", True),
+    "json-empty-object": (b"{}", True),
+}
+
+# name: (raw JSON value, whether json.loads accepts a document holding it)
+VALUE_SHAPES: dict[str, tuple[bytes, bool]] = {
+    "null": (b"null", True),
+    "true": (b"true", True),
+    "false": (b"false", True),
+    "number": (b"7", True),
+    "negative": (b"-1", True),
+    "float": (b"1.5", True),
+    "float-overflow": (b"1e999", True),
+    "huge-integer": (b"9" * 400, True),
+    "integer-past-the-digit-limit": (b"9" * 5000, False),
+    "empty-list": (b"[]", True),
+    "list-of-strings": (b'["SENTINEL-x"]', True),
+    "list-of-objects": (b"[{}]", True),
+    "empty-object": (b"{}", True),
+    "nested-object": (b'{"a": {"b": []}}', True),
+    "empty-string": (b'""', True),
+    "lone-surrogate": (b'"\\ud800"', True),
+    "control-character": (b'"SENTINEL-a\\u0000b"', True),
+    "non-ascii": (b'"SENTINEL-\\u00e9t\\u00e9"', True),
+    "deeply-nested": (DEEP, False),
+}
+
+PLACEHOLDER = "SENTINEL-PLACEHOLDER-VALUE"
+
+
+def splice(document: dict, field_name: str, raw_value: bytes) -> bytes:
+    """`document` as JSON bytes with `field_name` set to the raw JSON value."""
+    placed = dict(document, **{field_name: PLACEHOLDER})
+    return json.dumps(placed).encode().replace(json.dumps(PLACEHOLDER).encode(), raw_value)
+
+
+def raw_answer(body: bytes, status: int = 200):
+    return lambda request: httpx.Response(
+        status, content=body, headers={"content-type": "application/json"}
+    )
+
+
+async def outcome_of(call, idp) -> str:
+    """ "ok", "unavailable", or "rejected"; any other exception fails the test."""
+    try:
+        await call()
+    except OidcUnavailableError as exc:
+        assert_clean_error(exc, idp)
+        return "unavailable"
+    except OidcRejectedError as exc:
+        assert_clean_error(exc, idp)
+        return "rejected"
+    return "ok"
+
+
+UNAVAILABLE = frozenset({"unavailable"})
+REJECTED = frozenset({"rejected"})
+OK = frozenset({"ok"})
+OK_OR_REJECTED = frozenset({"ok", "rejected"})
+UNAVAILABLE_OR_REJECTED = frozenset({"unavailable", "rejected"})
+
+DISCOVERY_FIELDS = (
+    "issuer",
+    "authorization_endpoint",
+    "token_endpoint",
+    "jwks_uri",
+    "userinfo_endpoint",
+    "response_types_supported",
+    "code_challenge_methods_supported",
+)
+JWK_FIELDS = ("kid", "kty", "alg", "use", "n", "e")
+CLAIM_FIELDS = (
+    "iss",
+    "aud",
+    "sub",
+    "nonce",
+    "azp",
+    "exp",
+    "iat",
+    "nbf",
+    "email",
+    "email_verified",
+    "preferred_username",
+    "name",
+)
+HEADER_FIELDS = ("kid", "alg", "typ")
+STATUS_CODES = (100, 199, 201, 204, 299, 301, 399, 400, 401, 404, 499, 500, 502, 599, 999)
+
+
+def _claim_expectation(field_name: str, value_name: str, parses: bool) -> frozenset:
+    if not parses:
+        return REJECTED  # the signed payload is not JSON: DecodeError
+    if field_name in ("iss", "aud", "nonce"):
+        return REJECTED  # no hostile value equals the expected one
+    if field_name == "sub":
+        return OK if value_name == "non-ascii" else REJECTED
+    if field_name == "azp":
+        return OK if value_name == "null" else REJECTED
+    if field_name in ("exp", "iat", "nbf"):
+        return OK_OR_REJECTED  # a huge exp, a past iat, or a past nbf is valid
+    return OK  # optional claims map a hostile value to None (or False)
+
+
+def _hostile_cases() -> dict[str, tuple]:
+    cases: dict[str, tuple] = {}
+    for name, (body, _) in BODY_SHAPES.items():
+        cases[f"discovery-body-{name}"] = ("discovery-body", body, None, UNAVAILABLE)
+        cases[f"jwks-body-{name}"] = ("jwks-body", body, None, UNAVAILABLE)
+    for name, (body, parses) in BODY_SHAPES.items():
+        cases[f"token-200-body-{name}"] = (
+            "token-body",
+            body,
+            200,
+            REJECTED if parses else UNAVAILABLE,
+        )
+        cases[f"token-400-body-{name}"] = ("token-body", body, 400, REJECTED)
+        cases[f"token-503-body-{name}"] = ("token-body", body, 503, UNAVAILABLE)
+        cases[f"id-token-header-{name}"] = ("header-bytes", body, None, REJECTED)
+        cases[f"id-token-payload-{name}"] = ("payload-bytes", body, None, REJECTED)
+    for status in STATUS_CODES:
+        cases[f"token-status-{status}"] = (
+            "token-status",
+            b"",
+            status,
+            REJECTED if 400 <= status < 500 else UNAVAILABLE,
+        )
+    for value_name, (raw, parses) in VALUE_SHAPES.items():
+        for field_name in DISCOVERY_FIELDS:
+            cases[f"discovery-{field_name}-{value_name}"] = (
+                "discovery-field",
+                raw,
+                field_name,
+                UNAVAILABLE,
+            )
+        cases[f"jwks-keys-{value_name}"] = ("jwks-keys", raw, None, UNAVAILABLE)
+        for field_name in JWK_FIELDS:
+            for beside in ("alone", "beside-a-valid-key"):
+                cases[f"jwk-{field_name}-{value_name}-{beside}"] = (
+                    f"jwk-field-{beside}",
+                    raw,
+                    field_name,
+                    UNAVAILABLE_OR_REJECTED if parses else UNAVAILABLE,
+                )
+        cases[f"token-id-token-{value_name}"] = (
+            "token-field",
+            raw,
+            "id_token",
+            REJECTED if parses else UNAVAILABLE,
+        )
+        for field_name in ("error", "error_description"):
+            cases[f"token-400-{field_name}-{value_name}"] = (
+                "token-error-field",
+                raw,
+                field_name,
+                REJECTED,
+            )
+        for field_name in CLAIM_FIELDS:
+            cases[f"claim-{field_name}-{value_name}"] = (
+                "claim",
+                raw,
+                field_name,
+                _claim_expectation(field_name, value_name, parses),
+            )
+        for field_name in HEADER_FIELDS:
+            cases[f"header-{field_name}-{value_name}"] = (
+                "header-field",
+                raw,
+                field_name,
+                OK_OR_REJECTED if field_name == "typ" else REJECTED,
+            )
+    return cases
+
+
+HOSTILE_CASES = _hostile_cases()
+
+
+def test_the_hostile_shape_table_size():
+    # 17 body shapes, 19 value shapes, 15 statuses; recomputed so a shape or a
+    # field added to a table cannot silently drop out of the sweep.
+    bodies, values = len(BODY_SHAPES), len(VALUE_SHAPES)
+    per_value = len(DISCOVERY_FIELDS) + 1 + 2 * len(JWK_FIELDS) + 1 + 2
+    per_value += len(CLAIM_FIELDS) + len(HEADER_FIELDS)
+    expected = 2 * bodies + 5 * bodies + len(STATUS_CODES) + values * per_value
+    assert len(HOSTILE_CASES) == expected == 856
+
+
+@pytest.mark.parametrize("name", sorted(HOSTILE_CASES))
+async def test_a_hostile_shape_yields_only_the_two_error_classes(name, idp, keys):
+    kind, raw, detail, expected = HOSTILE_CASES[name]
+    header = {"alg": "RS256", "typ": "JWT", "kid": KID}
+    if kind == "discovery-body":
+        idp.overrides["discovery"] = raw_answer(raw)
+    elif kind == "discovery-field":
+        idp.overrides["discovery"] = raw_answer(splice(idp.discovery, detail, raw))
+    elif kind == "jwks-body":
+        idp.overrides["jwks"] = raw_answer(raw)
+    elif kind == "jwks-keys":
+        idp.overrides["jwks"] = raw_answer(splice({}, "keys", raw))
+    elif kind.startswith("jwk-field-"):
+        key = json.loads(splice(public_jwk(keys["rsa"], KID), detail, b'"SENTINEL-slot"'))
+        others = (
+            [json.dumps(public_jwk(keys["rsa_rotated"], "SENTINEL-other")).encode()]
+            if kind.endswith("beside-a-valid-key")
+            else []
+        )
+        hostile = splice(public_jwk(keys["rsa"], KID), detail, raw)
+        assert key[detail] == "SENTINEL-slot"
+        idp.overrides["jwks"] = raw_answer(b'{"keys": [' + b", ".join([hostile, *others]) + b"]}")
+    elif kind == "token-body":
+        idp.overrides["token"] = raw_answer(raw, detail)
+    elif kind == "token-status":
+        idp.overrides["token"] = raw_answer(raw, detail)
+    elif kind == "token-field":
+        idp.overrides["token"] = raw_answer(splice({"access_token": "x"}, detail, raw))
+    elif kind == "token-error-field":
+        idp.overrides["token"] = raw_answer(splice({"error": "invalid_grant"}, detail, raw), 400)
+    elif kind == "claim":
+        idp.id_token = signed_raw(keys, splice(base_claims(), detail, raw))
+    elif kind == "header-field":
+        idp.id_token = signed_raw(
+            keys, json.dumps(base_claims()).encode(), splice(header, detail, raw)
+        )
+    elif kind == "header-bytes":
+        idp.id_token = signed_raw(keys, json.dumps(base_claims()).encode(), raw)
+    elif kind == "payload-bytes":
+        idp.id_token = signed_raw(keys, raw)
+    else:
+        raise AssertionError(kind)
+    if idp.id_token is None:
+        idp.use_token()
+    assert await outcome_of(redeem, idp) in expected

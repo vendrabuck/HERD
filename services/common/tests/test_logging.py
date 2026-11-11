@@ -358,7 +358,7 @@ def test_setup_logging_configures_root_logger():
     original_level = root.level
     original_noisy_levels = {
         name: logging.getLogger(name).level
-        for name in ("uvicorn.access", "uvicorn.error", "sqlalchemy.engine")
+        for name in ("uvicorn.access", "uvicorn.error", "sqlalchemy.engine", "httpcore")
     }
     try:
         setup_logging("test-svc")
@@ -367,6 +367,7 @@ def test_setup_logging_configures_root_logger():
         # Noisy loggers suppressed
         assert logging.getLogger("uvicorn.access").level == logging.WARNING
         assert logging.getLogger("sqlalchemy.engine").level == logging.WARNING
+        assert logging.getLogger("httpcore").level == logging.INFO
     finally:
         # setup_logging replaces the root logger's handlers wholesale (issue
         # #534 test-isolation follow-up): restore them so later tests in this
@@ -403,3 +404,23 @@ async def test_request_logging_middleware_emits_access_record(caplog):
     assert record.path == "/ping"
     assert record.status_code == 200
     assert isinstance(record.duration_ms, float)
+
+
+def test_setup_logging_keeps_httpcore_debug_lines_out_even_at_debug_level():
+    """httpcore's DEBUG lines carry outbound response headers (ADR 0016 log rule);
+    LOG_LEVEL=DEBUG must not let them through."""
+    root = logging.getLogger()
+    original_handlers = list(root.handlers)
+    original_level = root.level
+    httpcore_logger = logging.getLogger("httpcore")
+    original_httpcore_level = httpcore_logger.level
+    try:
+        setup_logging("test-svc", level="DEBUG")
+        assert root.level == logging.DEBUG
+        assert not logging.getLogger("httpcore.http11").isEnabledFor(logging.DEBUG)
+        assert logging.getLogger("httpx").isEnabledFor(logging.INFO)
+    finally:
+        root.handlers.clear()
+        root.handlers.extend(original_handlers)
+        root.setLevel(original_level)
+        httpcore_logger.setLevel(original_httpcore_level)

@@ -398,8 +398,11 @@ in-repo HTTP client timeouts of 5 to 15 s (for example
   keyed by the client secret is not supported). The header's `alg` must equal it and
   the selected JWK's `kty` must fit it, before the decode.
 - Clock skew: `ACCESS_TOKEN_LEEWAY_SECONDS` (10 s), reused, not a new knob.
-- HTTP: one `httpx.AsyncClient` per call with `httpx.Timeout(10.0, connect=5.0)`,
-  `follow_redirects=False`, TLS verification on, `OIDC_CA_CERT` as the trust bundle
+- HTTP: one `httpx.AsyncClient` per call with `httpx.Timeout(10.0, connect=5.0)`
+  (5 s to connect, 10 s for each read or write) and an overall 10 s deadline on each
+  request, body included, through `asyncio.timeout` (corrected in phase 1: httpx's
+  timeouts bound each operation, not the request, so a server that drips bytes
+  never trips them), `follow_redirects=False`, TLS verification on, `OIDC_CA_CERT` as the trust bundle
   when set (the `LDAP_CA_CERT` precedent). A test seam replaces the transport
   (`httpx.MockTransport`), the module-attribute seam pattern of
   `services/integration/app/services/destination.py` (`resolver`); no new test
@@ -531,7 +534,8 @@ Chromium switch `--host-resolver-rules=MAP oidc-test <gateway bind address>` in 
 dedicated `pw_oidc_browser` fixture (the shared `pw_browser` stays untouched). The
 lab runs plain HTTP, so the gate phase sets `OIDC_REQUIRE_HTTPS=false`, the
 `LDAP_USE_TLS=false` precedent of the LDAP lab; auth logs a startup warning whenever
-that setting is false (the `LDAP_TLS_VALIDATE` precedent).
+that setting is false in OIDC mode (the `LDAP_TLS_VALIDATE` precedent; clarified in
+phase 1: outside OIDC mode the setting is inert, so no warning fires there).
 
 Levels, matching the existing harnesses:
 
@@ -595,7 +599,8 @@ from booting (the LDAP precedent, IAM-LDAP-5, keeps the break-glass and refresh 
 alive); auth logs one startup warning naming the missing variables, and
 `GET /oidc/login` answers 302 to `/login?sso_error=unavailable`. Fixed in code, not
 settings: flow TTL 600 s, handoff TTL 60 s, discovery and JWKS TTL 3600 s, JWKS
-refetch floor 60 s, HTTP timeouts 5 s connect and 10 s overall, prune batch 500,
+refetch floor 60 s, HTTP timeouts 5 s connect and 10 s per read or write with a 10 s
+overall deadline per request, prune batch 500,
 `next` cap 512 characters.
 
 ### API surface (the contract phases 3 and 4 build against)

@@ -1,7 +1,7 @@
 import logging
 import os
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from herd_common.auth_settings import AuthSecretKey, JwtAlgorithm
 from herd_common.base_settings import HerdBaseSettings
@@ -230,8 +230,13 @@ def effective_ldap_sync_run_stale_seconds() -> int:
 
 
 def _absolute_url_ok(value: str, require_https: bool) -> bool:
-    """True when value is an absolute URL with a host, no query, and no fragment,
-    whose scheme is https (or http when require_https is false)."""
+    """True when value is an absolute URL whose scheme is https (or http when
+    require_https is false), with a host, written in printable ASCII (no space
+    or control character), with no userinfo (`user:pass@`, which httpx would
+    send as Basic credentials), no query and no fragment (not even a bare `?`
+    or `#`), and no `..` path segment (percent-encoded ones included)."""
+    if not value or not (value.isascii() and all(0x20 < ord(ch) < 0x7F for ch in value)):
+        return False
     try:
         parts = urlsplit(value)
     except ValueError:
@@ -240,9 +245,10 @@ def _absolute_url_ok(value: str, require_https: bool) -> bool:
     return (
         parts.scheme in schemes
         and bool(parts.netloc)
-        and not parts.query
-        and not parts.fragment
-        and value == value.strip()
+        and "@" not in parts.netloc
+        and "?" not in value
+        and "#" not in value
+        and ".." not in unquote(parts.path).split("/")
     )
 
 
@@ -253,7 +259,8 @@ def oidc_configuration_problems(config: Settings) -> list[str]:
     list reaches a log line and OIDC_CLIENT_SECRET is one of the names. Checked:
     OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, and OIDC_REDIRECT_URI set;
     the issuer and the redirect URI absolute, https unless OIDC_REQUIRE_HTTPS is
-    false, with no query or fragment; the redirect URI's path ending in
+    false, printable ASCII, with no userinfo, no query or fragment (not even a
+    bare `?` or `#`), and no `..` path segment; the redirect URI's path ending in
     /oidc/callback (ADR 0016 D11); OIDC_SCOPES naming openid; the two claim
     names set; OIDC_CA_CERT, when set, naming an existing file. A value of white
     space only counts as missing.

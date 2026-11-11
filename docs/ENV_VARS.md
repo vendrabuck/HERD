@@ -130,20 +130,27 @@ LDAP_USE_TLS=true
 Not active yet. These settings belong to OpenID Connect single sign-on (ADR 0016,
 `docs/design/0016-oidc-single-sign-on.md`, issue #37), which is being built in
 phases: the auth service reads them today, but `AUTH_METHOD` does not accept `oidc`
-until the feature ships, so setting them changes nothing. Once it ships they are
-consulted only when `AUTH_METHOD=oidc`. Incomplete or invalid settings in that mode
-never stop auth from booting: auth logs one startup warning naming the variables
-(never their values), and single sign-on answers unavailable until they are fixed.
-Fixed in code, not settings: discovery and JWKS cached for 3600 s, a JWKS refetch
-for an unknown signing key at most once per 60 s, HTTP timeouts of 5 s to connect
-and 10 s overall, and the 10 s clock-skew leeway the access-token check uses.
+until the feature ships, so setting them to well-formed values changes nothing.
+One carve-out applies in every mode, today included: three of them are validated
+when auth loads its settings, and a refused value stops auth from starting, as a
+refused `AUTH_ALGORITHM` does. They are `OIDC_ID_TOKEN_ALGORITHM` with a value
+outside the list below, and `OIDC_REQUIRE_HTTPS` or
+`OIDC_BREAK_GLASS_LOCAL_SUPERADMIN` with a value that is not a boolean. Once the
+feature ships the others are consulted only when `AUTH_METHOD=oidc`, and incomplete
+or invalid values of them in that mode never stop auth from booting: auth logs one
+startup warning naming the variables (never their values), and single sign-on
+answers unavailable until they are fixed. Fixed in code, not settings: discovery
+and JWKS cached for 3600 s, a JWKS refetch for an unknown signing key at most once
+per 60 s, HTTP timeouts of 5 s to connect and 10 s for each read or write, an
+overall deadline of 10 s on each request to the identity provider, and the 10 s
+clock-skew leeway the access-token check uses.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `OIDC_ISSUER` | (empty) | Issuer URL, exactly the string the identity provider puts in `iss`; its discovery document must name the same issuer byte for byte. Absolute, no query or fragment, https unless `OIDC_REQUIRE_HTTPS=false`. |
+| `OIDC_ISSUER` | (empty) | Issuer URL, exactly the string the identity provider puts in `iss`; its discovery document must name the same issuer byte for byte, so copy it from the `issuer` value of the provider's discovery document (`<issuer>/.well-known/openid-configuration`) exactly, including a trailing slash if it has one. Absolute, printable ASCII, no userinfo (`user:pass@`), no query or fragment, no `..` path segment, https unless `OIDC_REQUIRE_HTTPS=false`. |
 | `OIDC_CLIENT_ID` | (empty) | Client id registered at the identity provider; an ID token's `aud` must contain it. |
 | `OIDC_CLIENT_SECRET` | (empty) | Confidential-client secret, sent to the token endpoint with HTTP Basic authentication (`client_secret_basic`). Never logged. |
-| `OIDC_REDIRECT_URI` | (empty) | The public callback URL registered at the identity provider: the address users browse to, never derived from request headers. Absolute, https unless `OIDC_REQUIRE_HTTPS=false`, no query or fragment, path ending in `/oidc/callback` (normally `https://<gateway address>/api/auth/oidc/callback`). |
+| `OIDC_REDIRECT_URI` | (empty) | The public callback URL registered at the identity provider: the address users browse to, never derived from request headers. Absolute, printable ASCII, https unless `OIDC_REQUIRE_HTTPS=false`, no userinfo, no query or fragment (not even a bare `?` or `#`), no `..` path segment, path ending in `/oidc/callback` (normally `https://<gateway address>/api/auth/oidc/callback`). |
 | `OIDC_SCOPES` | `openid email profile` | Requested scopes, space separated; must contain `openid`. |
 | `OIDC_ID_TOKEN_ALGORITHM` | `RS256` | The one accepted ID-token signing algorithm: `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `ES256`, `ES384`, or `ES512`. Any other value, `none` and every HS algorithm included, is refused at startup. |
 | `OIDC_USERNAME_CLAIM` | `preferred_username` | ID-token claim used as the HERD username when a federated user is first provisioned. |
