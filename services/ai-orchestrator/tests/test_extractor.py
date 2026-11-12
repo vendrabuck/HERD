@@ -1,15 +1,29 @@
 """Unit tests for app.services.extractor."""
 
+import asyncio
 import io
 import tarfile
 
 import pytest
 from app import config as config_module
+from app.services import extractor
 from app.services.extractor import (
     ExtractionError,
-    extract_files,
     render_file_context,
 )
+
+
+def extract_files(uploads):
+    """The extractor's entry point is a coroutine since issue #1202 (a PDF is read in a
+    capped child process); these synchronous tests run it to completion on a loop of
+    their own. Not asyncio.run, which sets and then clears the thread's current loop
+    and so leaves a later caller of get_event_loop an unclosed loop."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(extractor.extract_files(uploads))
+    finally:
+        loop.run_until_complete(loop.shutdown_default_executor())
+        loop.close()
 
 
 def test_extract_plain_text():
