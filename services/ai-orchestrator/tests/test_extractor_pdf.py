@@ -55,7 +55,11 @@ _MIB = 1024 * 1024
 # The limits the hostile table runs under: the shipped address space, and CPU and wall
 # limits lowered so a CPU-bound shape costs seconds, not the shipped 20 and 30.
 _TABLE_CPU_SECONDS = 4
-_TABLE_WALL_SECONDS = 8
+# The wall clock is far above the CPU limit so that, on a slow or busy CI runner where
+# a CPU-bound child gets only part of a core, the CPU limit still ends the read first
+# (8 s here once let a starved child reach the deadline). A shape that does end at the
+# deadline is a stuck child, which no shape in the table should be.
+_TABLE_WALL_SECONDS = 20
 # How much the pytest process's resident peak may grow across one read: the upload is
 # built before the peak is reset, so this covers the copy the pipe write may hold and
 # the text kept.
