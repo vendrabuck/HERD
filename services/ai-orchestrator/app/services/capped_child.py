@@ -117,7 +117,17 @@ async def _feed(stream: asyncio.StreamWriter, data: bytes) -> None:
 
 async def _read_bounded(stream: asyncio.StreamReader, cap: int, on_over) -> tuple[bytes, bool]:
     """Read to EOF, keeping at most `cap` bytes. Past `cap`, call `on_over` (which
-    kills the child) and stop reading at once: returns (the first `cap` bytes, True)."""
+    kills the child), then read on to EOF discarding every byte: returns (the first
+    `cap` bytes, True).
+
+    The discarding read is what lets the child be reaped. A stream nobody reads pauses
+    its pipe transport once its buffer is full, a paused transport never sees EOF, and
+    asyncio's ``Process.wait()`` returns only after every pipe has disconnected, so
+    stopping at the cap left ``wait()`` hanging until the deadline whenever the child
+    had written enough before the kill landed (seen on a CI runner as a deadline where
+    the cap was due). The killed child closes its end at once, so the drain is short,
+    and it keeps nothing.
+    """
     chunks: list[bytes] = []
     kept = 0
     while True:
@@ -127,6 +137,8 @@ async def _read_bounded(stream: asyncio.StreamReader, cap: int, on_over) -> tupl
         if kept + len(chunk) > cap:
             chunks.append(chunk[: cap - kept])
             on_over()
+            while await stream.read(_READ_CHUNK_BYTES):
+                pass
             return b"".join(chunks), True
         chunks.append(chunk)
         kept += len(chunk)

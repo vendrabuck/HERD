@@ -278,6 +278,24 @@ async def test_a_child_that_writes_without_end_is_killed_at_the_cap(tmp_path, fd
     assert live_children() == children
 
 
+async def test_a_stream_over_its_cap_is_read_to_its_end_so_the_pipe_can_close():
+    """Past the cap the reader discards the rest of the stream up to EOF. Stopping at
+    the cap leaves the buffer full, the pipe transport paused, EOF never read, and
+    ``Process.wait()`` hanging to the deadline (a CI failure: deadline, not malformed).
+    """
+    from app.services.capped_child import _read_bounded
+
+    stream = asyncio.StreamReader(limit=64 * 1024)
+    stream.feed_data(b"x" * (1024 * 1024))
+    stream.feed_eof()
+    calls = []
+    kept, over = await _read_bounded(stream, 64 * 1024, lambda: calls.append(1))
+    assert over is True
+    assert len(kept) == 64 * 1024
+    assert calls == [1]
+    assert stream.at_eof()
+
+
 @pytest.mark.timeout(20)
 async def test_a_child_that_ignores_sigterm_is_killed_at_the_deadline(tmp_path):
     script = _script(
