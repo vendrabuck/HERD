@@ -91,3 +91,46 @@ def test_subclass_inherits_settings_customise_sources_without_override():
     assert Settings.settings_customise_sources.__func__ is (
         HerdBaseSettings.settings_customise_sources.__func__
     )
+
+
+# --- Database pool settings (issue #1352) ------------------------------------------
+
+
+def test_pool_settings_default_to_five_ten_and_pre_ping(tmp_path, monkeypatch):
+    for name in ("DB_POOL_SIZE", "DB_MAX_OVERFLOW", "DB_POOL_PRE_PING"):
+        monkeypatch.delenv(name, raising=False)
+    base_settings = _reload_base_settings(monkeypatch, str(tmp_path / "absent.json"))
+    settings = _representative_settings_cls(base_settings)()
+    assert (settings.db_pool_size, settings.db_max_overflow, settings.db_pool_pre_ping) == (
+        5,
+        10,
+        True,
+    )
+
+
+def test_pool_settings_read_their_env_vars(tmp_path, monkeypatch):
+    base_settings = _reload_base_settings(monkeypatch, str(tmp_path / "absent.json"))
+    monkeypatch.setenv("DB_POOL_SIZE", "3")
+    monkeypatch.setenv("DB_MAX_OVERFLOW", "0")
+    monkeypatch.setenv("DB_POOL_PRE_PING", "false")
+    settings = _representative_settings_cls(base_settings)()
+    assert (settings.db_pool_size, settings.db_max_overflow, settings.db_pool_pre_ping) == (
+        3,
+        0,
+        False,
+    )
+
+
+def test_pool_settings_refuse_an_empty_pool_or_negative_overflow(tmp_path, monkeypatch):
+    import pydantic
+    import pytest
+
+    base_settings = _reload_base_settings(monkeypatch, str(tmp_path / "absent.json"))
+    settings_cls = _representative_settings_cls(base_settings)
+    monkeypatch.setenv("DB_POOL_SIZE", "0")
+    with pytest.raises(pydantic.ValidationError, match="db_pool_size"):
+        settings_cls()
+    monkeypatch.setenv("DB_POOL_SIZE", "5")
+    monkeypatch.setenv("DB_MAX_OVERFLOW", "-1")
+    with pytest.raises(pydantic.ValidationError, match="db_max_overflow"):
+        settings_cls()

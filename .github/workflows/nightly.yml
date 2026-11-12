@@ -23,17 +23,8 @@
 # Postgres-live suite (services/*/tests/*_live_pg.py) runs against the stack's
 # own Postgres, via `make _gate-ldap-stack-tests` / `make _gate-pg-live-tests`
 # (the same internal targets master/everything use, see the Makefile's LDAP
-# comment block). Unlike those gates, this job never passes -p to `docker compose`
-# (`docker compose build` / `up -d` above use the plain default project), so
-# COMPOSE_PROJECT_NAME is set explicitly to match: actions/checkout@v7 checks
-# this repository out into $GITHUB_WORKSPACE, which the runner sets to
-# <work>/<repo-name>/<repo-name>; this repository's GitHub name is "HERD"
-# (`gh repo view` on this remote reports name "HERD", nameWithOwner
-# "vendrabuck/HERD", independent of the local clone directory's own name), so
-# the checkout directory basename is "HERD" and `docker compose`'s default
-# project-name derivation (lowercase, invalid characters stripped; "HERD" has
-# none) resolves to "herd" -- the same project docker compose itself already
-# uses for every other step in this job.
+# comment block). The job sets COMPOSE_PROJECT_NAME=herd once, in its env block, so
+# every step and make target addresses the same compose project (issue #1313).
 name: Nightly
 
 on:
@@ -52,6 +43,11 @@ jobs:
   full-stack:
     runs-on: ubuntu-latest
     env:
+      # The one compose project name for every step: the bare `docker compose`
+      # calls, the make targets, and the test code that runs `docker compose`
+      # all read it. The NOS and LDAP labs are unaffected: the Makefile pins
+      # their projects with -p.
+      COMPOSE_PROJECT_NAME: herd
       # Per-test e2e failure artifacts (screenshot, page, console, traceback) are
       # written under this directory by tests/e2e/conftest.py; pointing it into the
       # workspace lets the failure upload below carry them. Without this they land
@@ -59,13 +55,16 @@ jobs:
       HERD_E2E_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          # The same uv release the service images copy (tests/unit/test_uv_pins.py).
+          version: "0.13.7"
 
       - name: Cache uv
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/uv
           key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
@@ -121,7 +120,7 @@ jobs:
         run: make test-e2e
 
       - name: LDAP-mode stack tests
-        run: make _gate-ldap-stack-tests COMPOSE_PROJECT_NAME=herd
+        run: make _gate-ldap-stack-tests
 
       - name: Postgres-live suites (every services/*/tests/*_live_pg.py)
         run: make _gate-pg-live-tests
@@ -138,9 +137,8 @@ jobs:
       # in PR CI: they need a booted, seeded stack with the lab attached to
       # its network. `make nos-test-feature` attaches the lab, runs
       # `make seed-nos`, runs the suites hard-required, and always detaches.
-      # COMPOSE_PROJECT_NAME=herd for the same reason the LDAP-mode step
-      # passes it: this job's stack is the default-named `herd` project, not
-      # a CURDIR-derived one (see the header comment).
+      # The target finds the stack's network from COMPOSE_PROJECT_NAME, which
+      # the job's env block sets to herd (see the header comment).
       #
       # Placement is deliberate, on both sides. AFTER the seeded e2e pass:
       # the L2 suite reuses the `nos-lab-*` devices `make seed-nos` creates
@@ -165,7 +163,7 @@ jobs:
           # via-stack tests down with it. See docs/NOS_LAB.md.
           sudo modprobe vrf dummy || echo "vrf/dummy modules unavailable; VRF tests will skip"
           make nos-up
-          make nos-test-feature COMPOSE_PROJECT_NAME=herd
+          make nos-test-feature
 
       - name: Load test (locust, headless)
         run: HERD_BASE_URL=https://localhost make test-load
@@ -193,7 +191,7 @@ jobs:
 
       - name: Upload failure artifacts
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nightly-failure-artifacts
           path: |

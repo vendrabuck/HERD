@@ -26,8 +26,19 @@ networks:
   nos-test:
     name: herd-nos-test-net
 
+# Container log rotation (issue #1352): Docker's json-file driver, at most five
+# files of 10 MB per container (50 MB in all), oldest dropped first. Every
+# service references this anchor; tests/unit/test_compose_capacity.py fails on a
+# service without it.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   srl:
+    logging: *default-logging
     # Pinned 2026-09-12 (issue #783): this is the exact build that booted
     # nos-test-srl (org.opencontainers.image.version label 26.7.2-519,
     # confirmed against ghcr.io). The drivers' rejection classification keys
@@ -105,6 +116,7 @@ services:
       start_period: 30s
 
   frr:
+    logging: *default-logging
     build:
       context: ./frr
     container_name: nos-test-frr

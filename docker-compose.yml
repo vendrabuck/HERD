@@ -1,6 +1,17 @@
+# Container log rotation (issue #1352): Docker's json-file driver, at most five
+# files of 10 MB per container (50 MB in all), oldest dropped first. Every
+# service references this anchor; tests/unit/test_compose_capacity.py fails on a
+# service without it.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   # --- Config Service ---
   config:
+    logging: *default-logging
     build:
       context: .
       dockerfile: services/config/Dockerfile
@@ -101,7 +112,8 @@ services:
   # form refuses to render the file if it is ever empty, because an empty
   # constraint would match no container and take every route down.
   traefik:
-    image: traefik:latest
+    logging: *default-logging
+    image: traefik:v3.7.18@sha256:9c437ac4f09ce6f4980a8544902d3475fdf70a1a7c578729581d2535dfa7d635
     command:
       - "--api.dashboard=true"
       - "--api.insecure=true"
@@ -148,7 +160,13 @@ services:
 
   # --- PostgreSQL ---
   postgres:
-    image: postgres:16-alpine
+    logging: *default-logging
+    image: postgres:16.15-alpine@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139
+    # max_connections (issue #1352): the eleven database services hold at most
+    # 11 x (DB_POOL_SIZE + DB_MAX_OVERFLOW) = 11 x (5 + 10) = 165 connections with
+    # the defaults; 200 leaves 35 for psql sessions, `make migrate`, and the
+    # Postgres-live suites. Takes effect when the container is recreated.
+    command: ["postgres", "-c", "max_connections=200"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -175,7 +193,8 @@ services:
   # (volumes merge; command is a scalar and replaces), so make up and the gate
   # stack keep starting with empty streams.
   nats:
-    image: nats:2.10-alpine
+    logging: *default-logging
+    image: nats:2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
     command: ["-js", "-sd", "/data", "-m", "8222"]
     ports:
       - "127.0.0.1:4222:4222"  # no broker authentication: loopback only
@@ -193,6 +212,7 @@ services:
 
   # --- Auth Service ---
   auth:
+    logging: *default-logging
     build:
       context: .
       dockerfile: services/auth/Dockerfile
@@ -204,6 +224,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: auth
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${AUTH_ACCESS_TOKEN_EXPIRE_MINUTES:-30}
@@ -258,6 +281,7 @@ services:
 
   # --- Inventory Service ---
   inventory:
+    logging: *default-logging
     build:
       context: .
       dockerfile: services/inventory/Dockerfile
@@ -267,6 +291,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: inventory
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
@@ -308,6 +335,7 @@ services:
 
   # --- Reservations Service ---
   reservations:
+    logging: *default-logging
     build:
       context: .
       dockerfile: services/reservations/Dockerfile
@@ -317,6 +345,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: reservations
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       INVENTORY_SERVICE_URL: http://inventory:8000
@@ -371,6 +402,7 @@ services:
 
   # --- Integration Service (versioned v1 external API facade) ---
   integration:
+    logging: *default-logging
     build:
       context: .
       dockerfile: services/integration/Dockerfile
@@ -380,6 +412,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: integration
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       RESERVATIONS_SERVICE_URL: http://reservations:8000
@@ -421,6 +456,7 @@ services:
 
   # --- Secrets Service (encrypted-at-rest credential store) ---
   secrets:
+    logging: *default-logging
     build:
       context: .
       dockerfile: services/secrets/Dockerfile
@@ -430,6 +466,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: secrets
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       ACL_SERVICE_URL: http://acl:8000
@@ -469,6 +508,7 @@ services:
 
   # --- ACL Service ---
   acl:
+    logging: *default-logging
     build:
       context: .
       dockerfile: services/acl/Dockerfile
@@ -478,6 +518,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: acl
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
@@ -509,6 +552,7 @@ services:
 
   # --- User Profile Service ---
   user-profile:
+    logging: *default-logging
     build:
       context: .
       dockerfile: services/user-profile/Dockerfile
@@ -518,6 +562,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: user_profile
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
@@ -549,6 +596,7 @@ services:
 
   # --- Notifications Service ---
   notifications:
+    logging: *default-logging
     build:
       context: .
       dockerfile: services/notifications/Dockerfile
@@ -558,6 +606,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: notifications
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
@@ -610,6 +661,7 @@ services:
 
   # --- Cabling Service ---
   cabling:
+    logging: *default-logging
     build:
       context: .
       dockerfile: services/cabling/Dockerfile
@@ -619,6 +671,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: cabling
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
@@ -650,6 +705,7 @@ services:
 
   # --- Execution Service ---
   execution:
+    logging: *default-logging
     build:
       context: .
       dockerfile: services/execution/Dockerfile
@@ -659,6 +715,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: execution
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       INVENTORY_SERVICE_URL: http://inventory:8000
@@ -733,6 +792,7 @@ services:
 
   # --- AI Orchestrator Service ---
   ai-orchestrator:
+    logging: *default-logging
     build:
       context: .
       dockerfile: services/ai-orchestrator/Dockerfile
@@ -742,6 +802,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_SCHEMA: ai_orchestrator
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_PRE_PING: ${DB_POOL_PRE_PING:-true}
       SECRET_KEY: ${AUTH_SECRET_KEY}
       ALGORITHM: ${AUTH_ALGORITHM:-HS256}
       CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost}
@@ -813,6 +876,7 @@ services:
 
   # --- Frontend ---
   frontend:
+    logging: *default-logging
     build:
       context: ./frontend
       dockerfile: Dockerfile
