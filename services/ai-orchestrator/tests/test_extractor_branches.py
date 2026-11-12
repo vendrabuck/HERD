@@ -2,8 +2,7 @@
 
 test_extractor.py covers the main happy paths and the top-level rejections;
 this module pins the remaining branches: the .tar.gz extension alias, the
-latin-1 decode fallback, the pdfplumber-missing ImportError, a parseable
-multi-page PDF, and the per-member skips in the tgz reader (non-file member,
+latin-1 decode fallback, and the per-member skips in the tgz reader (non-file member,
 oversized member, char-budget break, and an extractfile()-returns-None member).
 
 The last section pins the bounded tar read (issue #1192): a tar header record over
@@ -26,7 +25,7 @@ name is never turned into a refusal, and a text member cut inside a UTF-8 charac
 still decodes as UTF-8.
 """
 
-import builtins
+import asyncio
 import gzip
 import inspect
 import io
@@ -47,14 +46,26 @@ from app.services.extractor import (
     _CeilingStream,
     _decode_text,
     _extension,
-    _extract_pdf,
     _extract_tgz,
     _safe_member_name,
     _TgzLimitError,
-    extract_files,
     render_file_context,
 )
 from herd_common.bounded_tar import MAX_TAR_READ_BYTES
+
+
+def extract_files(uploads):
+    """The extractor's entry point is a coroutine since issue #1202 (a PDF is read in a
+    capped child process); these synchronous tests run it to completion on a loop of
+    their own. Not asyncio.run, which sets and then clears the thread's current loop
+    and so leaves a later caller of get_event_loop an unclosed loop."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(extractor.extract_files(uploads))
+    finally:
+        loop.run_until_complete(loop.shutdown_default_executor())
+        loop.close()
+
 
 # --- _extension: .tar.gz aliases to .tgz (line 37-38) ---
 
@@ -86,55 +97,6 @@ def test_decode_text_falls_back_to_latin1():
     decoded = _decode_text(b"caf\xff")
     assert decoded.startswith("caf")
     assert len(decoded) == 4
-
-
-# --- _extract_pdf: pdfplumber missing -> ExtractionError (lines 53-54) ---
-
-
-def test_extract_pdf_missing_pdfplumber_raises(monkeypatch):
-    real_import = builtins.__import__
-
-    def fake_import(name, *args, **kwargs):
-        if name == "pdfplumber":
-            raise ImportError("no pdfplumber")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-    with pytest.raises(ExtractionError, match="pdfplumber is not installed"):
-        _extract_pdf(b"%PDF-1.4 whatever")
-
-
-# --- _extract_pdf: a parseable multi-page document collects page text (59-65) ---
-
-
-def test_extract_pdf_collects_page_text(monkeypatch):
-    class _Page:
-        def __init__(self, text):
-            self._text = text
-
-        def extract_text(self):
-            return self._text
-
-    class _PDF:
-        # Page 2 returns "" so the `if text:` guard (line 61) skips it.
-        pages = [_Page("page one body"), _Page("")]
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    class _FakePlumber:
-        @staticmethod
-        def open(_fileobj):
-            return _PDF()
-
-    import sys
-
-    monkeypatch.setitem(sys.modules, "pdfplumber", _FakePlumber)
-    out = _extract_pdf(b"%PDF-fake")
-    assert out == "page one body"
 
 
 # --- _extract_tgz member-skip branches (76, 80, 82, 85) ---

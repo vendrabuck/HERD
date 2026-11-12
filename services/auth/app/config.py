@@ -1,5 +1,7 @@
 import logging
+import os
 from typing import Literal
+from urllib.parse import unquote, urlsplit
 
 from herd_common.auth_settings import AuthSecretKey, JwtAlgorithm
 from herd_common.base_settings import HerdBaseSettings
@@ -15,6 +17,16 @@ logger = logging.getLogger(__name__)
 # app.tasks.ldap_sync_loop imports app.services.ldap_sync_service, which
 # imports this module: importing the other way would be a cycle.
 MIN_LDAP_SYNC_INTERVAL_SECONDS = 60
+
+# ADR 0016 D8: the ID-token algorithms OIDC_ID_TOKEN_ALGORITHM admits, all
+# asymmetric. Equal to herd_common.jwt_codec.ID_TOKEN_ALGORITHMS, pinned by
+# tests/test_oidc_settings.py (a Literal must be spelled out to be one).
+OidcIdTokenAlgorithm = Literal[
+    "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512"
+]
+
+# The path OIDC_REDIRECT_URI must end in (ADR 0016 D11).
+OIDC_CALLBACK_PATH_SUFFIX = "/oidc/callback"
 
 
 class Settings(HerdBaseSettings):
@@ -97,6 +109,30 @@ class Settings(HerdBaseSettings):
     # server against, e.g. a pinned internal CA. Used when ldap_tls_validate is
     # True; when empty the system trust store is used.
     ldap_ca_cert: str = ""
+
+    # OpenID Connect single sign-on (ADR 0016, issue #37). Consulted only when
+    # auth_method == "oidc", which auth_method above does not admit yet: the
+    # feature stays dark until ADR 0016 phase 6 widens it. Incomplete settings
+    # never stop auth from booting (the LDAP precedent); see
+    # oidc_configuration_problems and log_oidc_startup_warnings below.
+    oidc_issuer: str = ""
+    oidc_client_id: str = ""
+    # Sent to the token endpoint with client_secret_basic; never logged.
+    oidc_client_secret: str = ""
+    oidc_redirect_uri: str = ""
+    oidc_scopes: str = "openid email profile"
+    # The one accepted ID-token algorithm; anything else is refused at load.
+    oidc_id_token_algorithm: OidcIdTokenAlgorithm = "RS256"
+    oidc_username_claim: str = "preferred_username"
+    oidc_email_claim: str = "email"
+    oidc_provider_name: str = "single sign-on"
+    # False only for a lab IdP served over plain HTTP; logs a startup warning.
+    oidc_require_https: bool = True
+    # Optional CA bundle path (inside the container) for a private IdP CA; when
+    # empty the system trust store is used.
+    oidc_ca_cert: str = ""
+    # ADR 0016 D5. The field only; POST /login reads it from ADR 0016 phase 3.
+    oidc_break_glass_local_superadmin: bool = False
 
     log_level: str = "INFO"
 
@@ -191,3 +227,108 @@ def effective_ldap_sync_run_stale_seconds() -> int:
         )
         return floor
     return raw
+
+
+def _absolute_url_ok(value: str, require_https: bool) -> bool:
+    """True when value is an absolute URL whose scheme is https (or http when
+    require_https is false), with a host, written in printable ASCII (no space
+    or control character), with no userinfo (`user:pass@`, which httpx would
+    send as Basic credentials), no query and no fragment (not even a bare `?`
+    or `#`), and no `..` path segment (percent-encoded ones included)."""
+    if not value or not (value.isascii() and all(0x20 < ord(ch) < 0x7F for ch in value)):
+        return False
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    schemes = ("https",) if require_https else ("https", "http")
+    return (
+        parts.scheme in schemes
+        and bool(parts.netloc)
+        and "@" not in parts.netloc
+        and "?" not in value
+        and "#" not in value
+        and ".." not in unquote(parts.path).split("/")
+    )
+
+
+def oidc_configuration_problems(config: Settings) -> list[str]:
+    """The OIDC settings that are missing or invalid, by variable name.
+
+    Empty when single sign-on can be attempted. Names only, never values: the
+    list reaches a log line and OIDC_CLIENT_SECRET is one of the names. Checked:
+    OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, and OIDC_REDIRECT_URI set;
+    the issuer and the redirect URI absolute, https unless OIDC_REQUIRE_HTTPS is
+    false, printable ASCII, with no userinfo, no query or fragment (not even a
+    bare `?` or `#`), and no `..` path segment; the redirect URI's path ending in
+    /oidc/callback (ADR 0016 D11); OIDC_SCOPES naming openid; the two claim
+    names set; OIDC_CA_CERT, when set, naming an existing file. A value of white
+    space only counts as missing.
+    """
+    problems: list[str] = []
+    require_https = config.oidc_require_https
+    if not _absolute_url_ok(config.oidc_issuer, require_https):
+        problems.append("OIDC_ISSUER")
+    if not config.oidc_client_id.strip():
+        problems.append("OIDC_CLIENT_ID")
+    if not config.oidc_client_secret.strip():
+        problems.append("OIDC_CLIENT_SECRET")
+    redirect = config.oidc_redirect_uri
+    if not (
+        _absolute_url_ok(redirect, require_https)
+        and urlsplit(redirect).path.endswith(OIDC_CALLBACK_PATH_SUFFIX)
+    ):
+        problems.append("OIDC_REDIRECT_URI")
+    if "openid" not in config.oidc_scopes.split():
+        problems.append("OIDC_SCOPES")
+    if not config.oidc_username_claim.strip():
+        problems.append("OIDC_USERNAME_CLAIM")
+    if not config.oidc_email_claim.strip():
+        problems.append("OIDC_EMAIL_CLAIM")
+    if config.oidc_ca_cert and not os.path.isfile(config.oidc_ca_cert):
+        problems.append("OIDC_CA_CERT")
+    return problems
+
+
+def log_oidc_startup_warnings(config: Settings) -> list[str]:
+    """Log the OIDC startup warnings and return their actions, in order.
+
+    Fires only when config.auth_method == "oidc" (ADR 0016: every OIDC setting
+    is consulted only in that mode), and then, each at most once:
+
+    - `oidc_settings_incomplete` when oidc_configuration_problems is not empty,
+      naming the variables (never their values); auth still boots, and single
+      sign-on answers unavailable;
+    - `oidc_https_not_required` when OIDC_REQUIRE_HTTPS is false;
+    - `oidc_break_glass_enabled` when OIDC_BREAK_GLASS_LOCAL_SUPERADMIN is true.
+
+    ADR 0016 phase 3 calls this from the lifespan; until auth_method admits
+    "oidc" it never fires.
+    """
+    if config.auth_method != "oidc":
+        return []
+    fired: list[str] = []
+    problems = oidc_configuration_problems(config)
+    if problems:
+        logger.warning(
+            "OIDC settings missing or invalid: %s; single sign-on is unavailable "
+            "until they are set",
+            ", ".join(problems),
+            extra={"action": "oidc_settings_incomplete", "settings": problems},
+        )
+        fired.append("oidc_settings_incomplete")
+    if not config.oidc_require_https:
+        logger.warning(
+            "OIDC_REQUIRE_HTTPS is false: the issuer, its endpoints, and the "
+            "redirect URI may use plain HTTP; use this only for a lab identity provider",
+            extra={"action": "oidc_https_not_required"},
+        )
+        fired.append("oidc_https_not_required")
+    if config.oidc_break_glass_local_superadmin:
+        logger.warning(
+            "OIDC_BREAK_GLASS_LOCAL_SUPERADMIN is true: POST /login admits local "
+            "superadmin accounts with a password in single sign-on mode",
+            extra={"action": "oidc_break_glass_enabled"},
+        )
+        fired.append("oidc_break_glass_enabled")
+    return fired

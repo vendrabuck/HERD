@@ -218,3 +218,8 @@ def setup_logging(service_name: str, level: str = "INFO") -> None:
     # Suppress noisy loggers
     for name in ("uvicorn.access", "uvicorn.error", "sqlalchemy.engine"):
         logging.getLogger(name).setLevel(logging.WARNING)
+    # httpcore logs only at DEBUG, and its DEBUG lines carry the response
+    # headers of every outbound call (an identity provider's among them, ADR
+    # 0016); INFO keeps them out even when LOG_LEVEL is DEBUG. httpx's own INFO
+    # line (method, URL, status) stays.
+    logging.getLogger("httpcore").setLevel(logging.INFO)

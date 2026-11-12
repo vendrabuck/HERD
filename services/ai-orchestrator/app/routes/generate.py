@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -17,7 +16,14 @@ from app.services.ai_client import (
     ai_is_configured,
     get_ai_client,
 )
-from app.services.extractor import ExtractionError, extract_files
+from app.services.extractor import (
+    PDF_REFUSAL_CHARGE_TOKENS,
+    ExtractionBusy,
+    ExtractionError,
+    ExtractionUnavailable,
+    PdfLimitRefusal,
+    extract_files,
+)
 from app.services.generator import (
     INVENTORY_UNAVAILABLE_DETAIL,
     GeneratorError,
@@ -28,6 +34,7 @@ from app.services.inventory_client import (
     InventoryUnavailableError,
     fetch_inventory_summary,
 )
+from app.services.llm_provider import Usage
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +83,9 @@ def _inventory_provider(
 _UPLOAD_READ_CHUNK_BYTES = 64 * 1024
 
 
-async def _read_uploads(files: list[UploadFile] | None) -> list[ExtractedFile]:
+async def _read_uploads(
+    files: list[UploadFile] | None, owner: uuid.UUID | None = None
+) -> list[ExtractedFile]:
     """Read the uploaded parts, enforcing the count and size caps before
     anything is fully buffered (issue #705).
 
@@ -94,10 +103,11 @@ async def _read_uploads(files: list[UploadFile] | None) -> list[ExtractedFile]:
     oversized or excessive upload from being buffered in memory in the first
     place.
 
-    The extraction itself runs in a worker thread (issue #1195): walking a tgz
-    up to its ceilings, or parsing a PDF, is synchronous work of up to seconds,
-    and run on the event loop it would stall every other request to the
-    service, `/health` included.
+    The extraction never runs on the event loop: a PDF is read in a capped child
+    process and every other type in a worker thread (issues #1195 and #1202). A
+    refusal is the 400 with its fixed detail; no free PDF reader slot within the
+    wait is a 503, and a failure of the reader itself is a 500, each with a fixed
+    detail.
     """
     if not files:
         return []
@@ -140,9 +150,13 @@ async def _read_uploads(files: list[UploadFile] | None) -> list[ExtractedFile]:
     if not uploads:
         return []
     try:
-        return await asyncio.to_thread(extract_files, uploads)
+        return await extract_files(uploads, owner=owner)
     except ExtractionError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+    except ExtractionBusy as e:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(e)) from e
+    except ExtractionUnavailable as e:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(e)) from e
 
 
 @router.post("", response_model=GenerateResponse)
@@ -164,7 +178,17 @@ async def generate(
     user_id = uuid.UUID(user["sub"])
     await usage_repo.enforce_quota(db, user_id)
 
-    extracted = await _read_uploads(files)
+    try:
+        extracted = await _read_uploads(files, owner=user_id)
+    except HTTPException as e:
+        # Issue #1202: a PDF read that ended at a resource limit is charged a fixed
+        # amount against the caller's quota (when one is set), so hostile files that
+        # hold the readers are not free. The 400 is unchanged.
+        if isinstance(e.__cause__, PdfLimitRefusal):
+            await usage_repo.record_failed_usage(
+                db, user_id, Usage(input_tokens=PDF_REFUSAL_CHARGE_TOKENS, output_tokens=0)
+            )
+        raise
 
     # Only now, with every local gate passed, is inventory read (issue #1035).
     inventory = await load_inventory()
