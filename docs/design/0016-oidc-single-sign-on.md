@@ -188,12 +188,12 @@ Implementation notes the phases must follow:
 - `herd_common.jwt_codec` gains `decode_id_token(token, key, algorithm, *, issuer,
   audience)`: one `jwt.decode` call with `algorithms=[algorithm]` (a one-element
   list, as the guard demands), `issuer=`, `audience=`,
-  `leeway=ACCESS_TOKEN_LEEWAY_SECONDS`, and `options={"require": ["exp", "iat",
+  `leeway=ID_TOKEN_LEEWAY_SECONDS` (60 s, see D8), and `options={"require": ["exp", "iat",
   "iss", "aud", "sub", "nonce"]}`. The guard gets one `DIRECT_DECODE_ALLOWED` entry
   for it (count 1, with a reason) and one `UNVERIFIED_READ_ALLOWED` entry for the one
   function that reads the header's `kid` and `alg` before key selection. Placing the
-  helper in `jwt_codec.py` keeps every PyJWT decode in one reviewed module and shares
-  the leeway constant; the guard's `DECODE_HELPER` stays the access-token helper.
+  helper in `jwt_codec.py` keeps every PyJWT decode in one reviewed module beside
+  both leeway constants; the guard's `DECODE_HELPER` stays the access-token helper.
 - Keys come from the JWKS through `jwt.PyJWKSet` (needs `cryptography`), never
   through `jwt.PyJWKClient`, which fetches with blocking `urllib` and has its own
   cache we would not control.
@@ -397,9 +397,16 @@ in-repo HTTP client timeouts of 5 to 15 s (for example
   `AUTH_ALGORITHM` (IAM-JWT-4). Never `none`, never an HS algorithm (an HS ID token
   keyed by the client secret is not supported). The header's `alg` must equal it and
   the selected JWK's `kty` must fit it, before the decode.
-- Clock skew: `ACCESS_TOKEN_LEEWAY_SECONDS` (10 s), reused, not a new knob.
-- HTTP: one `httpx.AsyncClient` per call with `httpx.Timeout(10.0, connect=5.0)`,
-  `follow_redirects=False`, TLS verification on, `OIDC_CA_CERT` as the trust bundle
+- Clock skew: `ID_TOKEN_LEEWAY_SECONDS`, 60 s, in `herd_common.jwt_codec`, not a
+  setting. Decided by the owner on 2026-11-11: 60 seconds for ID tokens, because the
+  provider's clock is not HERD's and the nonce already prevents replay. HERD's own
+  access tokens keep `ACCESS_TOKEN_LEEWAY_SECONDS` (10 s). (The first draft reused
+  the 10 s constant.)
+- HTTP: one `httpx.AsyncClient` per call with `httpx.Timeout(10.0, connect=5.0)`
+  (5 s to connect, 10 s for each read or write) and an overall 10 s deadline on each
+  request, body included, through `asyncio.timeout` (corrected in phase 1: httpx's
+  timeouts bound each operation, not the request, so a server that drips bytes
+  never trips them), `follow_redirects=False`, TLS verification on, `OIDC_CA_CERT` as the trust bundle
   when set (the `LDAP_CA_CERT` precedent). A test seam replaces the transport
   (`httpx.MockTransport`), the module-attribute seam pattern of
   `services/integration/app/services/destination.py` (`resolver`); no new test
@@ -531,7 +538,8 @@ Chromium switch `--host-resolver-rules=MAP oidc-test <gateway bind address>` in 
 dedicated `pw_oidc_browser` fixture (the shared `pw_browser` stays untouched). The
 lab runs plain HTTP, so the gate phase sets `OIDC_REQUIRE_HTTPS=false`, the
 `LDAP_USE_TLS=false` precedent of the LDAP lab; auth logs a startup warning whenever
-that setting is false (the `LDAP_TLS_VALIDATE` precedent).
+that setting is false in OIDC mode (the `LDAP_TLS_VALIDATE` precedent; clarified in
+phase 1: outside OIDC mode the setting is inert, so no warning fires there).
 
 Levels, matching the existing harnesses:
 
@@ -561,7 +569,7 @@ Not per PR: the live levels, exactly as LDAP's. Adding Dex to the advisory per-P
 | Algorithm confusion, `alg: none`, HS with the client secret | one pinned asymmetric algorithm, the guard's one-element list, `kty` check (D8) |
 | Signing-key rotation | `kid` miss triggers a rate-floored JWKS refetch (D8) |
 | `at_hash` | not checked, by decision: HERD never uses the IdP access token (no userinfo call, nothing forwarded), so the hash would bind nothing HERD consumes; it is recorded so a later userinfo call adds the check with it |
-| Expired or future tokens | `exp` and `iat` required, 10 s leeway (D8) |
+| Expired or future tokens | `exp` and `iat` required, 60 s ID-token leeway (D8) |
 | Open redirect | `next` stored server-side and sanitized; `OIDC_REDIRECT_URI` fixed (D11) |
 | Host-header injection into redirects | no URL is derived from request headers (D11) |
 | Token leakage through URLs and logs | handoff by cookie and POST (D3); log rules (D9) |
@@ -595,7 +603,8 @@ from booting (the LDAP precedent, IAM-LDAP-5, keeps the break-glass and refresh 
 alive); auth logs one startup warning naming the missing variables, and
 `GET /oidc/login` answers 302 to `/login?sso_error=unavailable`. Fixed in code, not
 settings: flow TTL 600 s, handoff TTL 60 s, discovery and JWKS TTL 3600 s, JWKS
-refetch floor 60 s, HTTP timeouts 5 s connect and 10 s overall, prune batch 500,
+refetch floor 60 s, HTTP timeouts 5 s connect and 10 s per read or write with a 10 s
+overall deadline per request, prune batch 500,
 `next` cap 512 characters.
 
 ### API surface (the contract phases 3 and 4 build against)
