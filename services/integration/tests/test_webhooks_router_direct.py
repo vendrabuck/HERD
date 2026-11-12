@@ -421,14 +421,32 @@ async def test_echo_receiver_delay_ms_sleeps_and_is_clamped(monkeypatch):
     assert slept == [6.0, webhooks_mod.SINK_MAX_DELAY_MS / 1000]
 
 
+def _routes(routes) -> list[tuple[str, set[str]]]:
+    """(path, methods) of every route the app serves. FastAPI 0.16x keeps an included
+    router as one wrapper entry in ``app.routes`` and exposes its routes, with their
+    full paths, through ``effective_candidates()``; older releases list the routes
+    themselves. Both shapes are walked, so the check does not depend on the release."""
+    found: list[tuple[str, set[str]]] = []
+    for route in routes:
+        if hasattr(route, "effective_candidates"):
+            found.extend(_routes(route.effective_candidates()))
+        else:
+            original = getattr(route, "original_route", route)
+            found.append(
+                (getattr(route, "path", ""), set(getattr(original, "methods", None) or ()))
+            )
+    return found
+
+
 def test_sink_routes_stay_out_of_the_published_schema():
     from fastapi import FastAPI
 
     app = FastAPI()
     app.include_router(webhooks_mod.test_sink_router)
 
-    assert "/webhooks/echo" in {r.path for r in app.routes}
-    assert "/webhooks/echo/hits" in {r.path for r in app.routes}
+    paths = {path for path, _ in _routes(app.routes)}
+    assert "/webhooks/echo" in paths
+    assert "/webhooks/echo/hits" in paths
     assert not [p for p in app.openapi()["paths"] if p.startswith("/webhooks/echo")]
 
 
