@@ -12,6 +12,7 @@ import {
 } from "@/api/ai";
 import { AI_CHAT_ENABLED } from "@/config/featureFlags";
 import type { ChatMessage, PendingApply, ToolCall } from "@/types/ai.types";
+import { detailText } from "@/lib/errors";
 import { AIAssistantTabLegacy } from "./AIAssistantTabLegacy";
 
 const MAX_QUESTION_LENGTH = 4000;
@@ -131,9 +132,11 @@ function ChatAssistant({
           accumulated = "";
           setStreamingText("");
         }
-        setStatusText(
-          ev.tools.length > 0 ? `Running ${ev.tools.join(", ")}` : "Analyzing",
-        );
+        // A frame's fields are untrusted JSON: only string tool names are shown.
+        const tools = Array.isArray(ev.tools)
+          ? ev.tools.filter((tool): tool is string => typeof tool === "string")
+          : [];
+        setStatusText(tools.length > 0 ? `Running ${tools.join(", ")}` : "Analyzing");
       } else if (ev.type === "token") {
         accumulated += ev.text;
         setStreamingText(accumulated);
@@ -163,7 +166,9 @@ function ChatAssistant({
         setPendingApply?.(result.pending_apply ?? null);
       } else if (ev.type === "error") {
         // A failure after the stream opened (timeout or LLM failure).
-        pushErrorBubble(ev.message || "Assistant failed");
+        // The frame's message is untrusted JSON: the same normalizer as an
+        // HTTP error detail, so a non-string never reaches the bubble (#1314).
+        pushErrorBubble(detailText(ev.message, "Assistant failed"));
       }
     };
 

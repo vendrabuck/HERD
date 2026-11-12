@@ -268,7 +268,7 @@ describe("HypervisorsPage", () => {
     );
   });
 
-  it("create failure with a list-shaped detail falls back to a generic message", async () => {
+  it("create failure with a list-shaped detail toasts its readable text (#1314)", async () => {
     mockCreateHypervisor.mutateAsync.mockRejectedValueOnce({
       response: {
         data: {
@@ -292,9 +292,7 @@ describe("HypervisorsPage", () => {
     )!;
     fireEvent.click(submitBtn);
 
-    await waitFor(() =>
-      expect(mockToastError).toHaveBeenCalledWith("Failed to register hypervisor"),
-    );
+    await waitFor(() => expect(mockToastError).toHaveBeenCalledWith("secret_id: bad uuid"));
     // The raw array must never reach toast.error.
     expect(mockToastError).not.toHaveBeenCalledWith(expect.any(Array));
   });

@@ -1039,9 +1039,8 @@ nos-test-dialect:  ## Run the NOS lab dialect suites (boots the lab if it is not
 # trap is armed BEFORE the attach so a failure anywhere, including inside
 # nos-attach's own loop, still leaves the lab off the stack's network.
 # COMPOSE_PROJECT_NAME selects which stack: it flows through to
-# nos-attach/nos-detach, which is why nightly calls this target with
-# COMPOSE_PROJECT_NAME=herd (its stack is the default-named project, not a
-# CURDIR-derived one).
+# nos-attach/nos-detach, which is why nightly's full-stack job sets
+# COMPOSE_PROJECT_NAME=herd in its environment (issue #1313).
 #
 # Credentials: the two suites authenticate against the stack as its
 # superadmin and read SEED_EMAIL/SEED_PASSWORD, else
@@ -1064,7 +1063,7 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 	$(SUBMAKE) seed-nos && \
 	HERD_TEST_NOS_REQUIRED=1 uv run pytest $(NOS_FEATURE_TESTS) -v
 
-# Postgres-live suites: every services/*/tests/*_live_pg.py (fifteen today,
+# Postgres-live suites: every services/*/tests/*_live_pg.py (sixteen today,
 # in auth, common, cabling, execution, reservations, and inventory), each run
 # from its own service directory. They prove what the SQLite engine every unit
 # suite uses cannot: advisory locks, row locks and SKIP LOCKED, native enum and
@@ -1098,6 +1097,13 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # transaction. Only its three lock tests commit, two rows each (a ledger row
 # hidden from the stack's own retry tick by an attempts value above any cap,
 # and its reservation_wiring_state row), deleted in a finally.
+# The auth suite added for ADR 0016 phase 2 (the OIDC flow store and JIT
+# provisioning races) needs the migrated auth schema with migration 0010's two
+# tables. It commits its own users, identities, and flows under random tags,
+# seeds foreign rows of each kind, asserts every foreign row unchanged, and
+# deletes all of them in a finally; it holds a users-table lock that blocks
+# writes (never reads) for well under a second per race, and row locks on
+# its own flow rows only.
 # tests/unit/test_pg_live_gate_wiring.py fails if a new *_live_pg.py file is
 # written and then wired into nothing.
 _gate-pg-live-tests:
@@ -1110,6 +1116,8 @@ _gate-pg-live-tests:
 	echo "Postgres-live suites against 127.0.0.1:$${pgport}/$${pgdb:-herd}"; \
 	(cd services/auth && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_ldap_sync_service_live_pg.py -v) && \
+	(cd services/auth && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_oidc_flow_service_live_pg.py -v) && \
 	(cd services/common && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_advisory_lock_live_pg.py -v) && \
 	(cd services/common && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
@@ -1173,10 +1181,11 @@ _gate-pg-live-tests:
 # compose project COMPOSE_PROJECT_NAME names, not only the master/everything
 # gate project: master/everything pass COMPOSE_PROJECT_NAME=$(GATE_PROJECT)
 # (see the "make exports command-line variables to recipe environments" note
-# near GATE_PROJECT's definition), while nightly.yml's plain `docker compose
-# up -d` stack has no such override, so this target resolves the SAME default
-# project docker compose itself would (falls back to $(GATE_PROJECT) only
-# when COMPOSE_PROJECT_NAME is entirely unset, e.g. a standalone local run).
+# near GATE_PROJECT's definition), while nightly.yml's full-stack job sets
+# COMPOSE_PROJECT_NAME=herd in its environment for every step, its plain
+# `docker compose up -d` included, so this target resolves the same project as
+# the stack (falls back to $(GATE_PROJECT) only when COMPOSE_PROJECT_NAME is
+# entirely unset, e.g. a standalone local run).
 _gate-ldap-stack-tests:
 	@net=$${COMPOSE_PROJECT_NAME:-$(GATE_PROJECT)}_herd-net; \
 	auth_cid=$$(docker compose ps -q auth 2>/dev/null); \

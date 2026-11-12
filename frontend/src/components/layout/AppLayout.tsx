@@ -1,14 +1,16 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { NavLink, Outlet, useNavigate, useLocation } from "react-router-dom";
 import { useCurrentUser, useLogout } from "@/api/auth";
 import { useAuthStore } from "@/stores/authStore";
-import { isAdminRole } from "@/lib/roles";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { HelpCircle } from "lucide-react";
 import { NotificationBell } from "@/components/NotificationBell";
+import { RouteErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { APP_VERSION } from "@/lib/appVersion";
 import { MANUAL_URL } from "@/lib/links";
 import { displayName } from "@/lib/profileEdit";
+import { visibleAdminNav } from "@/lib/adminNav";
+import { useRouteTitle } from "@/hooks/useRouteTitle";
 
 const NAV_ITEMS = [
   { to: "/inventory", label: "Inventory" },
@@ -23,7 +25,30 @@ export function AppLayout() {
   const logout = useLogout();
   const navigate = useNavigate();
   const location = useLocation();
-  const [adminOpen, setAdminOpen] = useState(false);
+  // How the Administration disclosure was opened: "hover" closes again on
+  // mouse leave, "toggle" (click, Enter, Space) stays open until toggled,
+  // Escape, an outside click, focus leaving it, or a route change.
+  const [adminOpenedBy, setAdminOpenedBy] = useState<"hover" | "toggle" | null>(null);
+  const adminOpen = adminOpenedBy !== null;
+  const adminMenuId = useId();
+  const adminButtonRef = useRef<HTMLButtonElement>(null);
+  const adminWrapperRef = useRef<HTMLDivElement>(null);
+  const mainRef = useRef<HTMLElement>(null);
+  const [menuPathname, setMenuPathname] = useState(location.pathname);
+  if (menuPathname !== location.pathname) {
+    setMenuPathname(location.pathname);
+    setAdminOpenedBy(null);
+  }
+  useRouteTitle(location.pathname);
+
+  useEffect(() => {
+    if (!adminOpen) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (!adminWrapperRef.current?.contains(e.target as Node)) setAdminOpenedBy(null);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [adminOpen]);
 
   useEffect(() => {
     useAuthStore.getState().setUser(user ?? null);
@@ -36,11 +61,21 @@ export function AppLayout() {
     navigate("/login");
   };
 
-  const isAdmin = isAdminRole(user?.role);
+  const adminLinks = visibleAdminNav(user?.role);
   const adminActive = location.pathname.startsWith("/admin");
 
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-gray-100">
+      <a
+        href="#main-content"
+        onClick={(e) => {
+          e.preventDefault();
+          mainRef.current?.focus();
+        }}
+        className="sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:z-50 focus:px-3 focus:py-2 focus:rounded focus:bg-white focus:text-blue-600 focus:text-sm focus:ring-2 focus:ring-blue-500"
+      >
+        Skip to main content
+      </a>
       <header className="flex items-center justify-between px-4 py-2 bg-gray-900 text-white shrink-0 border-b border-gray-800">
         <div className="flex items-center gap-4">
           <span className="flex items-baseline gap-1.5">
@@ -49,7 +84,7 @@ export function AppLayout() {
               v{APP_VERSION}
             </span>
           </span>
-          <nav className="flex gap-1">
+          <nav aria-label="Main" className="flex gap-1">
             {NAV_ITEMS.map((item) => (
               <NavLink
                 key={item.to}
@@ -66,14 +101,41 @@ export function AppLayout() {
                 {item.label}
               </NavLink>
             ))}
-            {isAdmin && (
+            {adminLinks.length > 0 && (
+              // A disclosure, not an ARIA menu (issue #1317): the button
+              // toggles on click, Enter, or Space and exposes aria-expanded;
+              // the entries are ordinary links reached with Tab. Hover still
+              // opens it for mouse users; a click while hover-opened pins it.
               <div
+                ref={adminWrapperRef}
                 className="relative"
-                onMouseEnter={() => setAdminOpen(true)}
-                onMouseLeave={() => setAdminOpen(false)}
+                onMouseEnter={() => setAdminOpenedBy((by) => by ?? "hover")}
+                onMouseLeave={() => {
+                  // A hover-open panel that holds keyboard focus is pinned, not
+                  // closed: hiding it would drop focus to the body.
+                  const focusInside = adminWrapperRef.current?.contains(document.activeElement) ?? false;
+                  setAdminOpenedBy((by) => (by !== "hover" ? by : focusInside ? "toggle" : null));
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape" && adminOpen) {
+                    e.stopPropagation();
+                    setAdminOpenedBy(null);
+                    adminButtonRef.current?.focus();
+                  }
+                }}
+                onBlur={(e) => {
+                  const next = e.relatedTarget as Node | null;
+                  if (next && !e.currentTarget.contains(next)) setAdminOpenedBy(null);
+                }}
               >
                 <button
+                  ref={adminButtonRef}
                   type="button"
+                  aria-expanded={adminOpen}
+                  aria-controls={adminMenuId}
+                  onClick={() =>
+                    setAdminOpenedBy((by) => (by === "hover" ? "toggle" : by ? null : "toggle"))
+                  }
                   className={`text-sm px-3 py-1 rounded transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 ${
                     adminActive
                       ? "bg-gray-700 text-white"
@@ -82,153 +144,29 @@ export function AppLayout() {
                 >
                   Administration
                 </button>
-                {adminOpen && (
-                  <div className="absolute left-0 top-full bg-gray-800 rounded shadow-lg py-1 min-w-40 z-50">
-                    <NavLink
-                      to="/admin/add-device"
-                      onClick={() => setAdminOpen(false)}
-                      className={({ isActive }) =>
-                        `block px-4 py-2 text-sm transition-colors ${
-                          isActive
-                            ? "bg-gray-700 text-white"
-                            : "text-gray-300 hover:text-white hover:bg-gray-700"
-                        }`
-                      }
-                    >
-                      Add Device
-                    </NavLink>
-                    <NavLink
-                      to="/admin/groups"
-                      onClick={() => setAdminOpen(false)}
-                      className={({ isActive }) =>
-                        `block px-4 py-2 text-sm transition-colors ${
-                          isActive
-                            ? "bg-gray-700 text-white"
-                            : "text-gray-300 hover:text-white hover:bg-gray-700"
-                        }`
-                      }
-                    >
-                      User Groups
-                    </NavLink>
-                    <NavLink
-                      to="/admin/device-groups"
-                      onClick={() => setAdminOpen(false)}
-                      className={({ isActive }) =>
-                        `block px-4 py-2 text-sm transition-colors ${
-                          isActive
-                            ? "bg-gray-700 text-white"
-                            : "text-gray-300 hover:text-white hover:bg-gray-700"
-                        }`
-                      }
-                    >
-                      Device Groups
-                    </NavLink>
-                    <NavLink
-                      to="/admin/connections"
-                      onClick={() => setAdminOpen(false)}
-                      className={({ isActive }) =>
-                        `block px-4 py-2 text-sm transition-colors ${
-                          isActive
-                            ? "bg-gray-700 text-white"
-                            : "text-gray-300 hover:text-white hover:bg-gray-700"
-                        }`
-                      }
-                    >
-                      Connections
-                    </NavLink>
-                    <NavLink
-                      to="/admin/drivers"
-                      onClick={() => setAdminOpen(false)}
-                      className={({ isActive }) =>
-                        `block px-4 py-2 text-sm transition-colors ${
-                          isActive
-                            ? "bg-gray-700 text-white"
-                            : "text-gray-300 hover:text-white hover:bg-gray-700"
-                        }`
-                      }
-                    >
-                      Drivers
-                    </NavLink>
-                    <NavLink
-                      to="/admin/grants"
-                      onClick={() => setAdminOpen(false)}
-                      className={({ isActive }) =>
-                        `block px-4 py-2 text-sm transition-colors ${
-                          isActive
-                            ? "bg-gray-700 text-white"
-                            : "text-gray-300 hover:text-white hover:bg-gray-700"
-                        }`
-                      }
-                    >
-                      Grants
-                    </NavLink>
-                    <NavLink
-                      to="/admin/hypervisors"
-                      onClick={() => setAdminOpen(false)}
-                      className={({ isActive }) =>
-                        `block px-4 py-2 text-sm transition-colors ${
-                          isActive
-                            ? "bg-gray-700 text-white"
-                            : "text-gray-300 hover:text-white hover:bg-gray-700"
-                        }`
-                      }
-                    >
-                      Hypervisors
-                    </NavLink>
-                    <NavLink
-                      to="/admin/ldap-sync"
-                      onClick={() => setAdminOpen(false)}
-                      className={({ isActive }) =>
-                        `block px-4 py-2 text-sm transition-colors ${
-                          isActive
-                            ? "bg-gray-700 text-white"
-                            : "text-gray-300 hover:text-white hover:bg-gray-700"
-                        }`
-                      }
-                    >
-                      LDAP Sync
-                    </NavLink>
-                    <NavLink
-                      to="/admin/purpose-review"
-                      onClick={() => setAdminOpen(false)}
-                      className={({ isActive }) =>
-                        `block px-4 py-2 text-sm transition-colors ${
-                          isActive
-                            ? "bg-gray-700 text-white"
-                            : "text-gray-300 hover:text-white hover:bg-gray-700"
-                        }`
-                      }
-                    >
-                      Purpose Review
-                    </NavLink>
-                    <NavLink
-                      to="/admin/users"
-                      onClick={() => setAdminOpen(false)}
-                      className={({ isActive }) =>
-                        `block px-4 py-2 text-sm transition-colors ${
-                          isActive
-                            ? "bg-gray-700 text-white"
-                            : "text-gray-300 hover:text-white hover:bg-gray-700"
-                        }`
-                      }
-                    >
-                      Users
-                    </NavLink>
-                    <NavLink
-                      to="/admin/about"
-                      onClick={() => setAdminOpen(false)}
-                      className={({ isActive }) =>
-                        `block px-4 py-2 text-sm transition-colors ${
-                          isActive
-                            ? "bg-gray-700 text-white"
-                            : "text-gray-300 hover:text-white hover:bg-gray-700"
-                        }`
-                      }
-                    >
-                      About
-                    </NavLink>
-                  </div>
-                )}
+                <ul
+                  id={adminMenuId}
+                  hidden={!adminOpen}
+                  className="absolute left-0 top-full bg-gray-800 rounded shadow-lg py-1 min-w-40 z-50"
+                >
+                  {adminLinks.map((item) => (
+                    <li key={item.to}>
+                      <NavLink
+                        to={item.to}
+                        onClick={() => setAdminOpenedBy(null)}
+                        className={({ isActive }) =>
+                          `block px-4 py-2 text-sm transition-colors focus:outline-none focus:ring-2 focus:ring-inset focus:ring-blue-500 ${
+                            isActive
+                              ? "bg-gray-700 text-white"
+                              : "text-gray-300 hover:text-white hover:bg-gray-700"
+                          }`
+                        }
+                      >
+                        {item.label}
+                      </NavLink>
+                    </li>
+                  ))}
+                </ul>
               </div>
             )}
           </nav>
@@ -271,9 +209,11 @@ export function AppLayout() {
         </div>
       </header>
 
-      <div className="flex-1 overflow-hidden">
-        <Outlet />
-      </div>
+      <main id="main-content" ref={mainRef} tabIndex={-1} className="flex-1 overflow-hidden focus:outline-none">
+        <RouteErrorBoundary>
+          <Outlet />
+        </RouteErrorBoundary>
+      </main>
     </div>
   );
 }

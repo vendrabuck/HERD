@@ -1,10 +1,15 @@
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { MemoryRouter } from "react-router-dom";
+import userEvent from "@testing-library/user-event";
+import { renderInCountingRouter, tabTo } from "../rowNavigationHarness";
 
-// Mock react-router-dom
+// Mock react-router-dom: only useNavigate; Link and MemoryRouter stay real
+// because the row's name cell is a Link (issue #1317).
 const mockNavigate = vi.fn();
-vi.mock("react-router-dom", () => ({
+vi.mock("react-router-dom", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("react-router-dom")>()),
   useNavigate: () => mockNavigate,
 }));
 
@@ -82,7 +87,9 @@ function renderPage() {
   });
   return render(
     <QueryClientProvider client={client}>
-      <TopologyPage />
+      <MemoryRouter>
+        <TopologyPage />
+      </MemoryRouter>
     </QueryClientProvider>,
   );
 }
@@ -155,7 +162,7 @@ describe("TopologyPage list rendering and row permissions", () => {
 
   it("clicking a row navigates to the topology editor by id", () => {
     renderPage();
-    fireEvent.click(screen.getByText("My Lab"));
+    fireEvent.click(screen.getByText("My Lab").closest("tr") as HTMLElement);
     expect(mockNavigate).toHaveBeenCalledWith("/topology/topo-mine");
   });
 });
@@ -306,5 +313,33 @@ describe("TopologyPage modal Cancel buttons", () => {
     await waitFor(() => expect(mockCloneTopology.mutateAsync).toHaveBeenCalledTimes(1));
     expect(mockNavigate).not.toHaveBeenCalled();
     expect(screen.getByLabelText("Name for the clone")).toHaveValue("My Lab (copy)");
+  });
+});
+
+describe("TopologyPage keyboard row navigation (issue #1317)", () => {
+  it("Tab reaches the name link and Enter opens the editor, navigating once", async () => {
+    const user = userEvent.setup();
+    const { navigations } = renderInCountingRouter(<TopologyPage />, "/topology");
+    const link = screen.getByRole("link", { name: "My Lab" });
+    expect(link).toHaveAttribute("href", "/topology/topo-mine");
+
+    await tabTo(user, link);
+    await user.keyboard("{Enter}");
+
+    await screen.findByTestId("destination");
+    expect(navigations).toEqual(["/topology/topo-mine"]);
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
+  it("a click on the row's select checkbox selects the row and does not navigate", async () => {
+    const user = userEvent.setup();
+    const { navigations } = renderInCountingRouter(<TopologyPage />, "/topology");
+    const checkbox = screen.getByRole("checkbox", { name: "Select topology My Lab" });
+
+    await user.click(checkbox);
+
+    expect(checkbox).toBeChecked();
+    expect(navigations).toEqual([]);
+    expect(mockNavigate).not.toHaveBeenCalled();
   });
 });

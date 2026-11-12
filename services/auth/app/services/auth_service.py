@@ -1,16 +1,19 @@
 import logging
+import unicodedata
 import uuid
 from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from herd_common.advisory_lock import advisory_key_from_string, xact_lock
 from herd_common.pagination import paginate
 from passlib.context import CryptContext
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.models.federated_identity import SUBJECT_MAX_LENGTH, FederatedIdentity
 from app.models.user import RefreshToken, Role, User
 from app.services import ldap_service
 from app.utils.jwt import create_access_token, create_refresh_token, hash_token
@@ -306,6 +309,304 @@ async def create_ldap_user(
     )
     await _auto_assign_not_grouped(db, user, not_grouped)
     return user
+
+
+@dataclass(frozen=True)
+class FederatedLogin:
+    """One verified IdP sign-in, as provisioning sees it (ADR 0016, D4).
+
+    Defined here, not in the OIDC protocol module, so this module never imports
+    it; the callback (phase 3) maps a verified ID token onto it: `username` is
+    the configured claim's value, or the email when the claim is absent;
+    `full_name` is the `name` claim truncated to 200 characters, or the
+    username. `email_verified` is None when the token carries no such claim.
+
+    Every field is untrusted IdP content: `resolve_federated_user` validates
+    each one before any of it reaches a query, so it returns a User or None for
+    every value and never raises on claim content.
+    """
+
+    issuer: str
+    subject: str
+    email: str | None
+    email_verified: bool | None
+    username: str | None
+    full_name: str | None
+
+
+# Column widths of users.email, users.username, and users.full_name. A longer
+# value is refused (email, username) or truncated (full_name) here, never left
+# to the database to reject. The issuer column is Text, but it sits in a
+# unique index with the subject, so it gets the subject's bound.
+_EMAIL_MAX_LENGTH = 255
+_USERNAME_MAX_LENGTH = 100
+_FULL_NAME_MAX_LENGTH = 200
+_ISSUER_MAX_LENGTH = 255
+
+# Unicode categories Postgres cannot store in a text column through asyncpg:
+# control characters (Cc, NUL among them, which Postgres rejects) and lone
+# surrogates (Cs, which cannot be encoded as UTF-8). SQLite stores both, so
+# only the Postgres-live suite can show the raise these checks prevent.
+_UNSTORABLE = frozenset({"Cc", "Cs"})
+# For an email or username also the invisible format characters (Cf, the
+# zero-width space among them), which would let a look-alike of an existing
+# account pass the collision check.
+_FORBIDDEN_IN_NAMES = _UNSTORABLE | {"Cf"}
+
+
+def _has_category(value: str, categories: frozenset[str]) -> bool:
+    return any(unicodedata.category(ch) in categories for ch in value)
+
+
+def _clean_full_name(raw: object, username: str) -> str:
+    """The display name to store: each Cc or Cs character becomes a space, the
+    result is stripped and cut to 200 characters, and an empty result (or a
+    non-string) falls back to the username."""
+    if not isinstance(raw, str):
+        return username
+    cleaned = "".join(" " if unicodedata.category(ch) in _UNSTORABLE else ch for ch in raw)
+    return cleaned.strip()[:_FULL_NAME_MAX_LENGTH].strip() or username
+
+
+def _refuse_federated(reason: str, *, user_id: uuid.UUID | None = None) -> None:
+    """Log one refused federated login and return None for the caller to pass on.
+
+    Only the fixed reason and, when an account is already known, its HERD id are
+    logged: never the email, username, name, issuer, or subject the IdP sent.
+    """
+    extra: dict[str, str] = {"action": "login_failure", "source": "oidc", "reason": reason}
+    if user_id is not None:
+        extra["user_id"] = str(user_id)
+    logger.warning("OIDC login refused: %s", reason, extra=extra)
+    return None
+
+
+async def create_oidc_user(db: AsyncSession, login: FederatedLogin) -> User:
+    """Create an `oidc` account and its federated identity in ONE transaction.
+
+    `auth_source="oidc"`, no password hash, role user, `full_name` from the
+    login (control characters replaced, truncated to 200 characters) or the
+    username; then the "Not Grouped" auto-assign every new account gets. On an
+    IntegrityError (a concurrent first login of the same identity, or another
+    account taking the email or username in the window) the transaction is
+    rolled back, neither row survives, and the error is raised for the caller.
+    It does NOT validate the email, username, issuer, or subject: callers go
+    through `resolve_federated_user`, which does.
+    """
+    if not login.email or not login.username:
+        raise ValueError("an oidc account needs an email and a username")
+    full_name = _clean_full_name(login.full_name, login.username)
+    user = User(
+        email=login.email,
+        username=login.username,
+        full_name=full_name,
+        hashed_password=None,
+        auth_source="oidc",
+        role=Role.USER,
+    )
+    db.add(user)
+    try:
+        await db.flush()
+        db.add(FederatedIdentity(user_id=user.id, issuer=login.issuer, subject=login.subject))
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise
+    await db.refresh(user)
+    logger.info(
+        "OIDC user provisioned",
+        extra={"action": "oidc_provision", "user_id": str(user.id)},
+    )
+    await _auto_assign_not_grouped(db, user)
+    return user
+
+
+async def _find_federated_identity(
+    db: AsyncSession, issuer: str, subject: str
+) -> FederatedIdentity | None:
+    result = await db.execute(
+        select(FederatedIdentity).where(
+            FederatedIdentity.issuer == issuer, FederatedIdentity.subject == subject
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _returning_federated_login(db: AsyncSession, identity: FederatedIdentity) -> User | None:
+    """The federated row decides (D4): nothing stored on the user is updated,
+    only the identity's last_login_at, and only for a login that is admitted."""
+    identity_id = identity.id
+    user_id = identity.user_id
+    user = await get_user_by_id(db, user_id)
+    if user is None:
+        reason = "user_missing"
+    elif user.auth_source != "oidc":
+        # Cannot exist (both rows are created together); refused defensively.
+        reason = "wrong_auth_source"
+    elif not user.is_active:
+        reason = "inactive"
+    else:
+        reason = None
+    if reason is not None:
+        await db.rollback()
+        return _refuse_federated(reason, user_id=user_id)
+    await db.execute(
+        update(FederatedIdentity)
+        .where(FederatedIdentity.id == identity_id)
+        .values(last_login_at=datetime.now(timezone.utc))
+    )
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+async def _email_taken(db: AsyncSession, email: str) -> bool:
+    # lower() on BOTH sides, in the database: Python's str.lower() and the
+    # database's lower() disagree outside ASCII (SQLite folds ASCII only).
+    result = await db.execute(
+        select(User.id).where(func.lower(User.email) == func.lower(email)).limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def _username_taken(db: AsyncSession, username: str) -> bool:
+    result = await db.execute(
+        select(User.id).where(func.lower(User.username) == func.lower(username)).limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+def _identity_key_refusal(login: FederatedLogin) -> str | None:
+    """Checks on (issuer, subject), run BEFORE the identity lookup, since a
+    value Postgres cannot store would make the lookup itself raise."""
+    for reason, value, limit in (
+        ("issuer_invalid", login.issuer, _ISSUER_MAX_LENGTH),
+        ("subject_invalid", login.subject, SUBJECT_MAX_LENGTH),
+    ):
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value) > limit
+            or _has_category(value, _UNSTORABLE)
+        ):
+            return reason
+    return None
+
+
+def _name_is_clean(value: str) -> bool:
+    return value == value.strip() and not _has_category(value, _FORBIDDEN_IN_NAMES)
+
+
+def _first_login_refusal(login: FederatedLogin) -> str | None:
+    """The D4 checks that need no database, as a fixed reason, or None.
+
+    Email: absent, empty, or whitespace only is `email_missing`; an
+    `email_verified` that is present and not true is `email_unverified` (an
+    absent claim is accepted, ADR 0016 D4); leading or trailing whitespace, a
+    Cc, Cf, or Cs character, or anything but exactly one `@` with text on both
+    sides is `email_invalid`; over 255 characters is `email_too_long`. The
+    username likewise: `username_missing`, `username_invalid`,
+    `username_too_long` (over 100). No other character rule applies yet.
+    """
+    email = login.email
+    if not isinstance(email, str) or not email.strip():
+        return "email_missing"
+    if login.email_verified is not None and login.email_verified is not True:
+        return "email_unverified"
+    local, _, domain = email.partition("@")
+    if not _name_is_clean(email) or email.count("@") != 1 or not local or not domain:
+        return "email_invalid"
+    if len(email) > _EMAIL_MAX_LENGTH:
+        return "email_too_long"
+    username = login.username
+    if not isinstance(username, str) or not username.strip():
+        return "username_missing"
+    if not _name_is_clean(username):
+        return "username_invalid"
+    if len(username) > _USERNAME_MAX_LENGTH:
+        return "username_too_long"
+    return None
+
+
+async def _lock_first_login_names(db: AsyncSession, email: str, username: str) -> None:
+    """Serialize first logins that could collide, on Postgres only.
+
+    Takes transaction-scoped advisory locks (`pg_advisory_xact_lock`) keyed on
+    the case-folded email and the case-folded username, in ascending key order
+    so two logins can never wait on each other in a cycle. They are held until
+    the caller's commit (the insert) or rollback (a refusal), so of concurrent
+    first logins whose emails or usernames differ only in case, one checks and
+    inserts at a time and the others then see its row. A no-op on any other
+    dialect (`herd_common.advisory_lock.xact_lock`): the SQLite unit suites
+    cannot prove this; the Postgres-live suite does. The fold is Python's
+    `str.casefold`, which equates at least every pair SQL `lower()` equates
+    for ASCII; outside ASCII the database's `lower()` may differ.
+    """
+    keys = sorted(
+        {
+            advisory_key_from_string("oidc-first-login-email:" + email.casefold()),
+            advisory_key_from_string("oidc-first-login-username:" + username.casefold()),
+        }
+    )
+    for key in keys:
+        await xact_lock(db, key)
+
+
+async def resolve_federated_user(db: AsyncSession, login: FederatedLogin) -> User | None:
+    """The HERD account for a verified IdP login, or None (ADR 0016, D4).
+
+    Returns the User or None for every input and never raises on claim
+    content: the issuer and subject are checked before the identity lookup,
+    and every other claim before anything is written. A known (issuer,
+    subject) returns its user when that user is an active `oidc` account. A
+    first login provisions a new account only when the email and username pass
+    `_first_login_refusal` and no account of ANY source holds the email
+    (compared case-insensitively) or the username (likewise); a collision
+    refuses and never links. On Postgres the check and the insert run under
+    `_lock_first_login_names`, so the case-insensitive refusal also holds
+    between concurrent first logins. Every refusal is logged once with a
+    fixed `reason` and returns None. Every refusal ends with a rollback; a
+    success commits its writes and then reloads the returned user, which
+    leaves a read transaction open, as `create_user` does.
+
+    A concurrent first login of the same identity is not a collision: when a
+    collision check or the insert loses to it, the identity is looked up once
+    more and, when it now exists, the login proceeds as a returning one. So N
+    concurrent first logins create one account and every one of them gets it.
+    """
+    reason = _identity_key_refusal(login)
+    if reason is not None:
+        await db.rollback()
+        return _refuse_federated(reason)
+    identity = await _find_federated_identity(db, login.issuer, login.subject)
+    if identity is not None:
+        return await _returning_federated_login(db, identity)
+
+    reason = _first_login_refusal(login)
+    if reason is not None:
+        await db.rollback()
+        return _refuse_federated(reason)
+
+    await _lock_first_login_names(db, login.email, login.username)
+    collision = None
+    if await _email_taken(db, login.email):
+        collision = "email_taken"
+    elif await _username_taken(db, login.username):
+        collision = "username_taken"
+    if collision is None:
+        try:
+            return await create_oidc_user(db, login)
+        except IntegrityError:
+            collision = "provision_conflict"
+
+    # Lost to a concurrent first login of this same identity? Then it is a
+    # returning login now; otherwise the collision is with another account.
+    await db.rollback()
+    identity = await _find_federated_identity(db, login.issuer, login.subject)
+    if identity is not None:
+        return await _returning_federated_login(db, identity)
+    await db.rollback()
+    return _refuse_federated(collision)
 
 
 async def set_user_role(

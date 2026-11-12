@@ -14,6 +14,7 @@ import { Pagination } from "@/components/ui/Pagination";
 import { MultiConnectDialog } from "@/components/admin/connections/MultiConnectDialog";
 import { cn } from "@/lib/cn";
 import type { ConnectionCreate } from "@/types/connection.types";
+import { errorDetail } from "@/lib/errors";
 
 // The multi-connection dialog is the default create surface; the original
 // single-pair modal survives behind this toggle, the same way the topology
@@ -109,9 +110,7 @@ export function ConnectionsPage() {
       toast.success("Connection created");
       closeCreateModal();
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to create connection";
+      const msg = errorDetail(err, "Failed to create connection");
       toast.error(msg);
     }
   };
@@ -135,9 +134,7 @@ export function ConnectionsPage() {
       await deleteConnection.mutateAsync(deleteId);
       toast.success("Connection deleted");
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to delete connection";
+      const msg = errorDetail(err, "Failed to delete connection");
       toast.error(msg);
     }
     setDeleteId(null);
@@ -320,9 +317,10 @@ export function ConnectionsPage() {
         </div>
       </div>
 
-      {/* Both create surfaces mount only while open: Modal hardcodes
-          id="modal-title", so two mounted Modals would put duplicate ids in the
-          document and every aria-labelledby would resolve to the first one. */}
+      {/* Mounted only while open: each open starts from a fresh DOM, and the
+          closed form's controls (its two "Search devices..." inputs and its
+          Cancel button) are never in the document for a first-match locator
+          to land on instead of the open multi dialog's. */}
       {showCreate && (
       <Modal
         open

@@ -1,16 +1,87 @@
 version: 2
 updates:
-  - package-ecosystem: "pip"
+  # The uv ecosystem reads the root pyproject.toml workspace and regenerates
+  # uv.lock in the same pull request, which the pip ecosystem never did.
+  - package-ecosystem: "uv"
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      uv-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "npm"
     directory: "/frontend"
     schedule:
       interval: "weekly"
+    groups:
+      npm-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Base images of the service and frontend Dockerfiles. Dependabot reads FROM
+  # lines only, which is why the service Dockerfiles take the uv binary from a
+  # named stage. infra/nos-test/frr is left out: its digest-only FRR image is
+  # bumped by hand with a live lab check (see the Dockerfile's header).
+  - package-ecosystem: "docker"
+    directories:
+      - "/services/*"
+      - "/frontend"
+    schedule:
+      interval: "weekly"
+    groups:
+      docker-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # CI tests on Python 3.12 only.
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+      # The frontend stays on nginx's stable line (even minor, 1.30); the next
+      # minor is mainline (odd), so a line move is made by hand.
+      - dependency-name: "nginx"
+        update-types:
+          - "version-update:semver-minor"
+
+  # Images named by `image:` in the compose files.
+  - package-ecosystem: "docker-compose"
+    directories:
+      - "/"
+      - "/infra/ldap-test"
+      - "/infra/nos-test"
+    schedule:
+      interval: "weekly"
+    groups:
+      compose-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # A new major cannot read the existing data volume.
+      - dependency-name: "postgres"
+        update-types:
+          - "version-update:semver-major"
+      # A minor or major upgrade of the JetStream store is one-way, and
+      # tests/unit/test_docs_nats_cli_form.py pins the 2.10 line.
+      - dependency-name: "nats"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+      # Bumped by hand with an e2e run; per-PR CI runs no e2e.
+      - dependency-name: "selenium/standalone-chrome"

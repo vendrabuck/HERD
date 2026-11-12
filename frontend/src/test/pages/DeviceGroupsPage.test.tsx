@@ -4,6 +4,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import userEvent from "@testing-library/user-event";
+import { renderInCountingRouter, tabTo } from "../rowNavigationHarness";
 
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
 vi.mock("react-hot-toast", () => ({ default: toast }));
@@ -106,8 +108,8 @@ describe("DeviceGroupsPage", () => {
   it("navigates to the device group detail route when a row is clicked", async () => {
     server.use(deviceGroupsHandler(DEVICE_GROUPS));
     renderWithProviders(<DeviceGroupsPage />);
-    const row = await screen.findByText("Edge Firewalls");
-    fireEvent.click(row);
+    const name = await screen.findByText("Edge Firewalls");
+    fireEvent.click(name.closest("tr") as HTMLElement);
     expect(navigateSpy).toHaveBeenCalledWith("/admin/device-groups/dg-1");
   });
 
@@ -209,5 +211,36 @@ describe("DeviceGroupsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Next" }));
 
     await waitFor(() => expect(capturedSkip).toBe("50"));
+  });
+});
+
+describe("DeviceGroupsPage keyboard row navigation (issue #1317)", () => {
+  it("Tab reaches the name link and Enter opens the detail page, navigating once", async () => {
+    server.use(deviceGroupsHandler(DEVICE_GROUPS));
+    const user = userEvent.setup();
+    const { navigations } = renderInCountingRouter(<DeviceGroupsPage />, "/admin/device-groups");
+    const link = await screen.findByRole("link", { name: "Edge Firewalls" });
+    expect(link).toHaveAttribute("href", "/admin/device-groups/dg-1");
+
+    await tabTo(user, link);
+    await user.keyboard("{Enter}");
+
+    await screen.findByTestId("destination");
+    expect(navigations).toEqual(["/admin/device-groups/dg-1"]);
+    // The row's mouse handler stayed out of it: no second navigation.
+    expect(navigateSpy).not.toHaveBeenCalled();
+  });
+
+  it("a click on the row's Delete button opens the confirm dialog and does not navigate", async () => {
+    server.use(deviceGroupsHandler(DEVICE_GROUPS));
+    const user = userEvent.setup();
+    const { navigations } = renderInCountingRouter(<DeviceGroupsPage />, "/admin/device-groups");
+    const row = (await screen.findByRole("link", { name: "Edge Firewalls" })).closest("tr") as HTMLElement;
+
+    await user.click(within(row).getByRole("button", { name: "Delete" }));
+
+    expect(screen.getByRole("dialog", { name: /Delete/ })).toBeInTheDocument();
+    expect(navigations).toEqual([]);
+    expect(navigateSpy).not.toHaveBeenCalled();
   });
 });

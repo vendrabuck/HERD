@@ -1,15 +1,17 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
 import { useQueryClient } from "@tanstack/react-query";
 import { usePaginatedTemplates, useDeleteTemplate, useCreateTemplate } from "@/api/templates";
 import { useAuthStore } from "@/stores/authStore";
 import { isAdminRole } from "@/lib/roles";
+import { ROW_PRIMARY_CONTROL_CLASS, rowClick } from "@/lib/rowNavigation";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import { BulkImportExport } from "@/components/ui/BulkImportExport";
 import { exportTemplates, importTemplates } from "@/api/bulk";
 import type { DeviceTemplate } from "@/types/template.types";
+import { errorDetail } from "@/lib/errors";
 
 function fieldCount(template: DeviceTemplate): number {
   return template.sections.reduce((sum, s) => sum + s.fields.length, 0);
@@ -79,10 +81,7 @@ export function TemplatesPage() {
       });
       toast.success("Template duplicated");
     } catch (err: unknown) {
-      const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail;
-      toast.error(detail ?? "Failed to duplicate template");
+      toast.error(errorDetail(err, "Failed to duplicate template"));
     }
   };
 
@@ -92,9 +91,7 @@ export function TemplatesPage() {
       await deleteTemplate.mutateAsync(deleteTarget.id);
       toast.success("Template deleted");
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to delete template";
+      const msg = errorDetail(err, "Failed to delete template");
       toast.error(msg);
     }
     setDeleteTarget(null);
@@ -198,7 +195,7 @@ export function TemplatesPage() {
                   <tr
                     key={t.id}
                     className="border-b border-gray-100 hover:bg-gray-50 cursor-pointer"
-                    onClick={() => navigate(`/templates/${t.id}`)}
+                    onClick={rowClick(() => navigate(`/templates/${t.id}`))}
                   >
                     <td className="px-4 py-2">
                       {t.icon ? (
@@ -212,7 +209,9 @@ export function TemplatesPage() {
                       )}
                     </td>
                     <td className="px-4 py-2 text-sm font-medium text-gray-900">
-                      {t.name}
+                      <Link to={`/templates/${t.id}`} className={ROW_PRIMARY_CONTROL_CLASS}>
+                        {t.name}
+                      </Link>
                     </td>
                     <td className="px-4 py-2 text-sm text-gray-500 capitalize">
                       {t.template_type}

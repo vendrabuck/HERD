@@ -181,7 +181,7 @@ describe("DeviceConfigSection", () => {
     expect(receivedBody).toEqual({ config: { vlan: 100 }, description: "first cut" });
   });
 
-  it("shows a create refusal's string detail and never renders a validation list", async () => {
+  it("shows a create refusal's string detail and a validation list as text (#1314)", async () => {
     let calls = 0;
     server.use(
       http.get(VERSIONS_URL, () => HttpResponse.json({ items: [], total: 0, skip: 0, limit: 50 })),
@@ -204,9 +204,23 @@ describe("DeviceConfigSection", () => {
     expect(await screen.findByText("config does not match the schema")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByText("config: bad")).toBeInTheDocument();
+  });
+
+  it("shows fixed text, never the transport message, when a create fails without a string detail", async () => {
+    server.use(
+      http.get(VERSIONS_URL, () => HttpResponse.json({ items: [], total: 0, skip: 0, limit: 50 })),
+      http.post(VERSIONS_URL, () => HttpResponse.json({ error: "internal" }, { status: 500 })),
+    );
+    const user = userEvent.setup();
+    renderWithProviders(<DeviceConfigSection deviceId={DEVICE_ID} />);
+    await screen.findByText("No config versions yet.");
+    await user.click(screen.getByRole("button", { name: "New version" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
     expect(
-      await screen.findByText("Request failed with status code 422"),
+      await screen.findByText("Could not save the config version. Try again."),
     ).toBeInTheDocument();
+    expect(screen.queryByText(/status code/)).not.toBeInTheDocument();
   });
 
   describe("Apply dialog and Restore refusals (issue #1098)", () => {
@@ -237,10 +251,9 @@ describe("DeviceConfigSection", () => {
       renderWithProviders(<DeviceConfigSection deviceId={DEVICE_ID} />);
       await screen.findByText("v1");
       await user.click(screen.getByRole("button", { name: "Apply" }));
-      // Every Modal titles itself through id="modal-title", so the section's
-      // several modals share one id; find the dialog through its heading.
-      const heading = await screen.findByRole("heading", { name: "Apply config to device" });
-      const dialog = heading.closest("dialog") as HTMLElement;
+      // Each Modal names itself from its own title (issue #1318), so the
+      // dialog is found by its accessible name even with several mounted.
+      const dialog = await screen.findByRole("dialog", { name: "Apply config to device" });
       return { user, dialog };
     }
 

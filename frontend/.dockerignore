@@ -1,0 +1,28 @@
+# Build context of the frontend image (docker-compose.yml builds it with
+# `context: ./frontend`). The Dockerfile installs node_modules with `npm ci` from
+# package-lock.json and then runs `COPY . .`, so nothing the host installed or
+# built may be in the context: it would be copied over the image's own install.
+# .npmrc is deliberately NOT excluded; the Dockerfile's comment explains why it
+# must arrive with `COPY . .`. tests/unit/test_dockerignore.py fails when a COPY
+# source is excluded.
+node_modules
+dist
+coverage
+test-results
+playwright-report
+.vite
+.eslintcache
+*.tsbuildinfo
+*.log
+
+# Local env files: Vite reads .env, .env.local, .env.<mode>, and
+# .env.<mode>.local during `npm run build` and bakes VITE_* values into the bundle.
+.env
+.env.*
+!.env.example
+
+.git
+.idea
+.vscode
+*.swp
+.DS_Store

@@ -49,6 +49,18 @@ These must be set before the stack will run. The config service first-run flow w
 | `POSTGRES_DB` | `herd` | postgres, all backend services | Database name. |
 | `POSTGRES_PORT` | `5433` | docker-compose host binding | Host port Postgres is published on, bound to `127.0.0.1` only (`docker-compose.yml` line 122, issue #708). Not read by any service; they reach Postgres on the compose network at `postgres:5432`. |
 
+## Database connection pool
+
+Read by every database service (auth, inventory, reservations, cabling, acl, execution, ai-orchestrator, user-profile, notifications, integration, secrets; not config) through `HerdBaseSettings` and passed to `herd_common.database.make_database` (issue #1352). `docker-compose.yml` passes all three to each of the eleven.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DB_POOL_SIZE` | `5` | Connections a service process keeps open in its pool. At least 1. |
+| `DB_MAX_OVERFLOW` | `10` | Extra connections a process may open beyond `DB_POOL_SIZE` under load, closed again when returned. At least 0. |
+| `DB_POOL_PRE_PING` | `true` | Test a pooled connection with a round trip before handing it out, so a connection that died in a Postgres restart is replaced instead of failing one request. |
+
+The budget: one service process opens at most `DB_POOL_SIZE + DB_MAX_OVERFLOW` connections, so the eleven database services open at most 11 x (5 + 10) = 165 with the defaults, which are SQLAlchemy's own pool defaults made explicit. The compose `postgres` service runs with `-c max_connections=200`, which leaves 200 - 165 = 35 for psql sessions, `make migrate`, and the Postgres-live test suites. Each extra execution replica (`EXECUTION_POLLER_ONLY=true`) adds another 15. Raising either variable on all eleven services by one adds 11. SQLite URLs (the services' unit tests) take only `DB_POOL_PRE_PING`: SQLAlchemy chooses their pool, and the in-memory one refuses size arguments. `tests/unit/test_compose_capacity.py` fails when the compose defaults add up to more than `max_connections`, and when this paragraph or docs/OPERATIONS.md stops stating the arithmetic the compose defaults give.
+
 ## Superadmin seed (first-run only)
 
 Read once at startup to create the seeded superadmin. Ignored on subsequent restarts; changing them post-seed does nothing.

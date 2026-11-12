@@ -613,10 +613,10 @@ def test_reservation_create_dynamic_via_modal(pw_page):
         row = pw_page.locator("tr", has_text=purpose)
         expect(row).to_be_visible()
         row.click()
-        # Scope to the open detail dialog: the (closed) create modal shares the
-        # #modal-title id, so an unscoped locator resolves to two elements.
+        # Scope to the open detail dialog: the closed create modal is also
+        # mounted, so an unscoped dialog locator resolves to two elements.
         detail = pw_page.locator("dialog[open]")
-        expect(detail.locator("#modal-title")).to_have_text("Reservation")
+        expect(detail).to_have_accessible_name("Reservation")
         detail.get_by_role("button", name="Cancel", exact=True).click()
         pw_page.get_by_role("button", name="Cancel reservation", exact=True).click()
 

@@ -276,6 +276,12 @@ export interface ForkSaveResult {
   // explicitly (declarative attachments never become a wiring hop). Optional
   // since the backend defaults it to 0 and older responses may omit it.
   element_attachments_skipped?: number;
+  // ADR 0014 phase 1 (issue #34): the routing-intent reconcile's counts, as
+  // cabling's ForkSaveResponse names them (int, defaulted to 0). Optional
+  // since an older response may omit them; a missing count reads as 0
+  // (issue #1321).
+  l3_routes_built?: number;
+  l3_routes_released?: number;
   // Issue #1007: port-constrained edges the save built nothing for (no cable
   // path leaves and arrives on the chosen ports, and the save never falls back
   // to other ports). Optional since older responses omit it.

@@ -1,0 +1,35 @@
+# Build context of the twelve service images (docker-compose.yml builds each with
+# `context: .`, and ci.yml's image-versus-lock check builds ai-orchestrator from the
+# same directory). Everything is left out, then only the paths the service
+# Dockerfiles COPY are let back in, so the context never carries VCS data,
+# virtualenvs, local env files, generated keys and certificates, or local folders.
+# tests/unit/test_dockerignore.py fails when a COPY source is excluded.
+*
+!pyproject.toml
+!uv.lock
+!services
+!docs/manual
+
+# Inside the paths let back in: virtualenvs, caches, test and coverage output,
+# node packages, build output, env files, keys, certificates, and editor files.
+**/.venv
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/.coverage
+**/.coverage.*
+**/htmlcov*
+**/coverage*.xml
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+**/*.crt
+**/.idea
+**/.vscode
+**/*.swp
+**/.DS_Store

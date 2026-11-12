@@ -1,3 +1,14 @@
+# Container log rotation (issue #1352): Docker's json-file driver, at most five
+# files of 10 MB per container (50 MB in all), oldest dropped first. A service
+# this file adds (selenium) references this anchor; the services it only
+# overrides merge with docker-compose.yml's, which carry it already.
+# tests/unit/test_compose_capacity.py fails on a service without it.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   config:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
@@ -158,6 +169,7 @@ services:
   # pins that this file adds no second 8080 binding.
 
   selenium:
+    logging: *default-logging
     # Pinned 2026-09-12 (issue #783): this was the digest `latest` resolved
     # to at pin time (Selenium release 4.43.0-20260404, confirmed against
     # registry-1.docker.io). PR #768's healthcheck below calls

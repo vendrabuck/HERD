@@ -33,10 +33,12 @@ def test_reservation_detail_modal_opens(admin_browser, base_url, transient_reser
 
     _click_reservation_row(admin_browser)
 
-    # Modal title "Reservation" appears.
+    # Modal title "Reservation" appears. Scoped to the open dialog: an unscoped
+    # text match resolves first to the page's <title> ("Reservations - HERD"),
+    # which is never visible.
     wait.until(
         EC.visibility_of_element_located(
-            (By.XPATH, "//*[contains(text(), 'Reservation')]")
+            (By.XPATH, "//dialog[@open]//*[contains(text(), 'Reservation')]")
         )
     )
     # Five tab buttons: Details, Inventory, Routes, Wiring, Schedule.
