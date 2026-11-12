@@ -55,7 +55,11 @@ _MIB = 1024 * 1024
 # The limits the hostile table runs under: the shipped address space, and CPU and wall
 # limits lowered so a CPU-bound shape costs seconds, not the shipped 20 and 30.
 _TABLE_CPU_SECONDS = 4
-_TABLE_WALL_SECONDS = 8
+# The wall clock is far above the CPU limit so that, on a slow or busy CI runner where
+# a CPU-bound child gets only part of a core, the CPU limit still ends the read first
+# (8 s here once let a starved child reach the deadline). A shape that does end at the
+# deadline is a stuck child, which no shape in the table should be.
+_TABLE_WALL_SECONDS = 20
 # How much the pytest process's resident peak may grow across one read: the upload is
 # built before the peak is reset, so this covers the copy the pipe write may hold and
 # the text kept.
@@ -177,9 +181,12 @@ _EXPECTED = {
     "tounicode-range-of-4e9": {MEMORY, CPU},
     "two-million-q": {CPU, MEMORY},
     "200k-rectangles": {CPU, MEMORY},
-    "form-drawn-10000-times": {CPU},
+    # These two finish inside the shipped limits (80,000 characters in 4.4 s; 5
+    # characters in 6.5 s) and sit at the table's 4 s CPU limit: a faster host ends
+    # them with the text, a slower one with the CPU refusal. Both are bounded answers.
+    "form-drawn-10000-times": {"ok", CPU},
     "object-stream-of-15m-numbers": {CPU, MEMORY},
-    "450k-fresh-names": {CPU},
+    "450k-fresh-names": {"ok", CPU},
     "cid-widths-range-40m": {MEMORY},
     "truetype-cmap-32767-full-segments": {CPU},
     "rc4-stream-of-4.9-mb": {CPU},
