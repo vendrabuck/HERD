@@ -177,9 +177,12 @@ _EXPECTED = {
     "tounicode-range-of-4e9": {MEMORY, CPU},
     "two-million-q": {CPU, MEMORY},
     "200k-rectangles": {CPU, MEMORY},
-    "form-drawn-10000-times": {CPU},
+    # These two finish inside the shipped limits (80,000 characters in 4.4 s; 5
+    # characters in 6.5 s) and sit at the table's 4 s CPU limit: a faster host ends
+    # them with the text, a slower one with the CPU refusal. Both are bounded answers.
+    "form-drawn-10000-times": {"ok", CPU},
     "object-stream-of-15m-numbers": {CPU, MEMORY},
-    "450k-fresh-names": {CPU},
+    "450k-fresh-names": {"ok", CPU},
     "cid-widths-range-40m": {MEMORY},
     "truetype-cmap-32767-full-segments": {CPU},
     "rc4-stream-of-4.9-mb": {CPU},
