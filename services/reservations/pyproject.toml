@@ -38,7 +38,14 @@ packages = ["app"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # pytest-asyncio 1.4 warns at configure time that this option is unset. Setting
+    # it would change the loop of every session-scoped async fixture in
+    # tests/integration (unset keeps each fixture's own caching scope), so only the
+    # warning is ignored, by its exact text, until those fixtures name loop_scope.
+    'ignore:The configuration option "asyncio_default_fixture_loop_scope" is unset:pytest.PytestDeprecationWarning',
+]
 
 [tool.coverage.run]
 # FastAPI endpoint handlers run inside anyio worker threads under

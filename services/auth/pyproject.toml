@@ -47,4 +47,6 @@ filterwarnings = [
     "ignore:'crypt' is deprecated:DeprecationWarning",
     "ignore:tagMap is deprecated:DeprecationWarning",
     "ignore:typeMap is deprecated:DeprecationWarning",
+    # pytest-asyncio 1.4: see the root pyproject.toml.
+    'ignore:The configuration option "asyncio_default_fixture_loop_scope" is unset:pytest.PytestDeprecationWarning',
 ]

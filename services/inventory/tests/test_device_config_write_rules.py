@@ -298,13 +298,30 @@ async def test_restore_without_description_is_labelled_with_the_source_number():
 # --- CFG-VER-15 ----------------------------------------------------------------
 
 
+def _routes(routes) -> list[tuple[str, set[str]]]:
+    """(path, methods) of every route the app serves. FastAPI 0.16x keeps an included
+    router as one wrapper entry in ``app.routes`` and exposes its routes, with their
+    full paths, through ``effective_candidates()``; older releases list the routes
+    themselves. Both shapes are walked, so the check does not depend on the release."""
+    found: list[tuple[str, set[str]]] = []
+    for route in routes:
+        if hasattr(route, "effective_candidates"):
+            found.extend(_routes(route.effective_candidates()))
+        else:
+            original = getattr(route, "original_route", route)
+            found.append(
+                (getattr(route, "path", ""), set(getattr(original, "methods", None) or ()))
+            )
+    return found
+
+
 def test_no_route_deletes_or_edits_a_config_version():
     """Every config-version route reads or appends; none deletes, replaces, or edits."""
-    version_routes = [r for r in app.routes if "config-versions" in getattr(r, "path", "")]
+    version_routes = [(p, m) for p, m in _routes(app.routes) if "config-versions" in p]
     assert version_routes, "the config-version routes were not found on the app"
-    for route in version_routes:
-        assert route.methods <= {"GET", "HEAD", "POST"}, (route.path, route.methods)
-    posts = {r.path for r in version_routes if "POST" in r.methods}
+    for path, methods in version_routes:
+        assert methods <= {"GET", "HEAD", "POST"}, (path, methods)
+    posts = {path for path, methods in version_routes if "POST" in methods}
     assert posts == {
         "/devices/{device_id}/config-versions",
         "/devices/{device_id}/config-versions/{version_id}/restore",

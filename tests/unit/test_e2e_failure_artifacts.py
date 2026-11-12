@@ -1019,6 +1019,11 @@ def test_the_hook_and_the_fixtures_in_a_real_pytest_run(tmp_path, tb_args):
             "-q",
             "-W",
             "error",
+            # The inner run has no config file, so the pytest-asyncio 1.4 warning the
+            # repo's configs ignore (see pyproject.toml) is ignored here the same way.
+            "-W",
+            'ignore:The configuration option "asyncio_default_fixture_loop_scope" is unset'
+            ":pytest.PytestDeprecationWarning",
             *tb_args,
             str(tmp_path),
         ],
