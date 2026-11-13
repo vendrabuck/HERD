@@ -1,3 +1,13 @@
+"""Driver package object storage: MinIO when MINIO_ENDPOINT is set, else a local directory.
+
+Every function here is synchronous and blocking (a MinIO network round trip, or a
+local file read, write, or unlink of up to DRIVER_MAX_SIZE_BYTES). An async caller
+runs ``upload_object``, ``download_object`` and ``delete_object`` through
+``asyncio.to_thread``, never on the event loop (issue #1327); ``driver_service`` is
+the only caller. ``init_storage`` runs once in the lifespan, before the app serves a
+request.
+"""
+
 import io
 import logging
 from pathlib import Path

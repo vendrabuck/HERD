@@ -965,7 +965,7 @@ download, delete); routes under `/drivers`. The package format is in
   `Cannot delete driver: templates still reference it`); otherwise the archive delete
   is attempted, its failure ignored, and the row removed. \
   Enforced in: `services/inventory/app/services/driver_service.py` (`delete_driver`) \
-  Pinned by: `services/inventory/tests/test_drivers.py` (`test_delete_driver_referenced_by_template`, `test_delete_driver`); `services/inventory/tests/test_driver_service_unit.py` (`test_delete_driver_swallows_storage_delete_error`)
+  Pinned by: `services/inventory/tests/test_drivers.py` (`test_delete_driver_referenced_by_template`, `test_delete_driver`); `services/inventory/tests/test_driver_service_unit.py` (`test_delete_driver_swallows_storage_delete_error`); `services/inventory/tests/test_driver_storage_offload.py` (`test_a_driver_referenced_by_a_template_is_refused_before_any_storage_call`)
 - **INV-DRV-14.** Storage is MinIO when `MINIO_ENDPOINT` is set (the bucket is created
   at startup when missing) and the local directory `DRIVER_STORAGE_PATH` otherwise. \
   Enforced in: `services/inventory/app/storage.py` (`init_storage`) \
@@ -974,6 +974,15 @@ download, delete); routes under `/drivers`. The package format is in
   resolves outside the storage root. \
   Enforced in: `services/inventory/app/storage.py` (`_resolve_local`) \
   Pinned by: `services/inventory/tests/test_storage.py` (`test_upload_local_rejects_traversal_key`, `test_download_local_rejects_traversal_key`, `test_delete_local_rejects_traversal_key`)
+- **INV-DRV-19.** A driver upload, file replacement, download, or delete does its
+  blocking work off the event loop (issue #1327): the upload's SHA256, the
+  `driver_metadata.json` read, and every storage write, read, and delete (a MinIO round
+  trip or a local file operation) run in a worker thread through `asyncio.to_thread`,
+  so the service answers other requests, `GET /health` among them, while one is in
+  flight. A 422 refusal raised by the metadata read in the worker reaches the caller
+  unchanged, and nothing is stored. \
+  Enforced in: `services/inventory/app/services/driver_service.py` (`_inspect_package`, `create_driver`, `replace_driver_file`, `download_driver`, `delete_driver`); `services/inventory/app/storage.py` (`upload_object`, `download_object`, `delete_object`) \
+  Pinned by: `services/inventory/tests/test_driver_storage_offload.py` (`test_driver_upload_hashes_parses_and_stores_off_the_event_loop`, `test_a_refused_oversized_metadata_upload_still_parses_off_the_event_loop`, `test_duplicate_name_cleanup_delete_runs_off_the_event_loop`, `test_file_replace_parses_stores_and_deletes_off_the_event_loop`, `test_both_download_routes_read_storage_off_the_event_loop`, `test_driver_delete_removes_the_object_off_the_event_loop`, `test_health_answers_while_a_driver_upload_is_blocked_in_storage`)
 - **INV-DRV-16.** The drivers page requires a name, a connection type (Hypervisor
   included), and a file before it uploads, and shows the
   server's detail on a refusal. \
@@ -1464,7 +1473,7 @@ The calls other services make to inventory are section 7.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/inventory/tests/` (`test_*_unit.py`, `test_template_schema_validators.py`, `test_schema_bounds.py`, `test_storage.py`, `test_storage_constraints.py`, `test_device_delete_guard.py`); `services/common/tests/test_csv_safety.py`; `tests/unit/test_poll_floor_parity.py`; frontend `frontend/src/test/api/deleteDeviceErrorMessage.test.ts` | SQLite in memory; `test_storage_constraints.py` turns on SQLite foreign keys, no other inventory suite does |
-| Functional (through the service API) | `services/inventory/tests/test_devices.py`, `test_templates.py`, `test_ports.py`, `test_drivers.py`, `test_driver_metadata_bounds.py`, `test_hypervisors.py`, `test_device_groups.py`, `test_bulk.py`, `test_devices_internal.py`, `test_device_read_visibility_gate.py`, `test_rbac_denial.py`, and siblings; frontend page tests under `frontend/src/test/pages/` | Upstream services are patched; the delete guard is patched to pass in most suites |
+| Functional (through the service API) | `services/inventory/tests/test_devices.py`, `test_templates.py`, `test_ports.py`, `test_drivers.py`, `test_driver_metadata_bounds.py`, `test_driver_storage_offload.py`, `test_hypervisors.py`, `test_device_groups.py`, `test_bulk.py`, `test_devices_internal.py`, `test_device_read_visibility_gate.py`, `test_rbac_denial.py`, and siblings; frontend page tests under `frontend/src/test/pages/` | Upstream services are patched; the delete guard is patched to pass in most suites |
 | Integration (running stack) | `tests/integration/test_device_delete_guard.py`, `test_device_group_visibility.py`, `test_device_batch_fetch.py`, `test_bulk_import_export.py`, `test_driver_flow.py`, `test_dynamic_resources.py`, `test_provisioning_failed.py` | Run by the advisory CI `integration` job and the gates |
 | Stress and load | `tests/load/locustfile.py` (`InventoryBrowser`, `BulkExporter`) | Read and export load only; no write load on inventory |
 | Browser end-to-end | `tests/e2e/test_inventory_filters_playwright.py`, `test_inventory_expanded_playwright.py`, `test_inventory_saved_search_late_load_playwright.py`, `test_inventory_effects_playwright.py`, `test_templates_playwright.py`, `test_dynamic_template_authoring_playwright.py`, `test_device_groups.py`, `test_drivers.py`, `test_bulk_import_export.py`, `test_add_device_ui.py` | Nightly and the gates, not per-PR CI |
