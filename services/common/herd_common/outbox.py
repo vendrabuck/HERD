@@ -321,8 +321,11 @@ async def run_outbox_relay(
     """Background relay: drain unpublished rows to JetStream, prune old ones.
 
     Mirrors the health scheduler's tick/backoff/cancellation shape. `get_nats` is
-    called each tick so a reconnect (or a connection that was None at startup) is
-    picked up. The connection must report `is_connected` before we publish: a
+    called each tick, so a client that reconnects is picked up, and so is a
+    connection that was None when the relay started IF the caller assigns one
+    later. The relay never connects by itself: when the caller's connect failed
+    and nothing assigns a connection afterwards, rows wait unpublished until the
+    service restarts. The connection must report `is_connected` before we publish: a
     JetStream publish on a disconnected client can block the loop, and the
     services connect with infinite reconnect, so during a broker outage the relay
     just waits at the base cadence (not escalating backoff) until the client

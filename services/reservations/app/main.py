@@ -52,7 +52,26 @@ async def lifespan(app: FastAPI):
         )
         logger.info("JetStream stream HERD_RESERVATIONS ready")
     except Exception:
-        logger.warning("NATS unavailable at %s, events will be skipped", settings.nats_url)
+        # Nothing assigns app.state.nats after this lifespan, so the two failures
+        # differ (RES-EVENT-4, OPS-NATS-1). A failed connect leaves no connection
+        # for the life of the process: the outbox relay publishes nothing and
+        # events wait in the outbox until a restart with the broker reachable.
+        # A connect that succeeded but whose stream ensure failed keeps the
+        # connection: the relay publishes, each publish fails while the stream is
+        # missing, and the rows stay in the outbox and are retried every tick.
+        if app.state.nats is None:
+            logger.warning(
+                "NATS unavailable at %s; events wait in the outbox until the service "
+                "is restarted with the broker reachable",
+                settings.nats_url,
+            )
+        else:
+            logger.warning(
+                "JetStream stream HERD_RESERVATIONS could not be ensured at %s; events "
+                "wait in the outbox and the relay retries them every tick until the "
+                "stream exists",
+                settings.nats_url,
+            )
 
     # Start expiration background task
     from app.tasks.expiration import expiration_loop, purpose_classify_loop
@@ -70,8 +89,11 @@ async def lifespan(app: FastAPI):
     )
 
     # Start the transactional-outbox relay (issue #21): drain unpublished outbox
-    # rows to JetStream and prune old ones. get_nats is read each tick so a
-    # reconnect (or a connection that was None at startup) is picked up.
+    # rows to JetStream and prune old ones. get_nats is read each tick, so an
+    # established connection that drops is waited out until the client
+    # reconnects. Nothing assigns app.state.nats after the connect above: when
+    # that connect failed it stays None, and events wait in the outbox until the
+    # service is restarted with the broker reachable (RES-EVENT-4).
     outbox_task = asyncio.create_task(
         run_outbox_relay(
             AsyncSessionLocal,
