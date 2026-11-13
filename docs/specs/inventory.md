@@ -521,11 +521,11 @@ areas call `check_device_read_visibility` for their own device-scoped reads
 - **INV-VIS-2.** The user groups are read from auth's `GET /groups/user/{id}` with the
   caller's own JWT. A transport error or a non-200 answer fails closed with 503; it
   never falls back to showing every device. \
-  Enforced in: `services/inventory/app/routers/device_groups.py` (`_fetch_user_group_ids`) \
+  Enforced in: `services/inventory/app/services/auth_groups.py` (`fetch_user_group_ids`) \
   Pinned by: `services/inventory/tests/test_device_groups.py` (`test_fetch_user_group_ids_raises_on_auth_service_5xx`, `test_fetch_user_group_ids_raises_on_connection_error`); `services/inventory/tests/test_devices.py` (`test_device_list_fails_closed_on_auth_outage`)
 - **INV-VIS-3.** A visibility lookup without an Authorization header to forward answers
   500. \
-  Enforced in: `services/inventory/app/routers/device_groups.py` (`_fetch_user_group_ids`) \
+  Enforced in: `services/inventory/app/services/auth_groups.py` (`fetch_user_group_ids`) \
   Pinned by: `services/inventory/tests/test_device_groups.py` (`test_fetch_user_group_ids_missing_authorization_raises_500`)
 - **INV-VIS-4.** `GET /devices` for a non-admin returns only visible devices and forces
   `dut_only` on, so a granted non-Management device is not listed. \
@@ -840,13 +840,13 @@ to one or more user groups; that grant is what lets a non-admin see a device.
 - **INV-GRP-11.** It lists each group the device is in with its granted user groups,
   whose names are read from auth's `GET /groups` with the caller's JWT; an auth failure
   answers 503. \
-  Enforced in: `services/inventory/app/routers/device_groups.py` (`get_device_groups_for_device_endpoint`, `_fetch_user_group_names`) \
+  Enforced in: `services/inventory/app/routers/device_groups.py` (`get_device_groups_for_device_endpoint`); `services/inventory/app/services/auth_groups.py` (`fetch_user_group_names`) \
   Pinned by: `services/inventory/tests/test_device_groups.py` (`test_device_groups_for_device_resolves_names`, `test_device_groups_for_device_returns_503_when_auth_service_down`, `test_fetch_user_group_names_success_maps_wanted_ids`)
 - **INV-GRP-12.** The name lookup pages through auth's group list at auth's maximum
   page size (500) until every wanted user group is named or the list ends, so a user
   group on any page gets its name; only a user group auth no longer lists has a null
   name. A failure on any page answers the 503 of INV-GRP-11. \
-  Enforced in: `services/inventory/app/routers/device_groups.py` (`_fetch_user_group_names`, `_AUTH_GROUP_PAGE_SIZE`) \
+  Enforced in: `services/inventory/app/services/auth_groups.py` (`fetch_user_group_names`, `AUTH_GROUP_PAGE_SIZE`) \
   Pinned by: `services/inventory/tests/test_device_groups.py` (`test_fetch_user_group_names_pages_until_every_wanted_id_is_named`, `test_fetch_user_group_names_stops_once_every_wanted_id_is_named`, `test_fetch_user_group_names_unknown_id_stops_at_end_of_list_with_no_name`, `test_fetch_user_group_names_second_page_failure_is_503`)
 - **INV-GRP-13.** For a non-admin, a hidden device answers the same 404 as an unknown
   one (INV-VIS-6). \

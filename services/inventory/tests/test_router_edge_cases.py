@@ -348,7 +348,7 @@ async def test_non_admin_list_runs_real_visibility_resolution(client):
     }
     app.dependency_overrides[get_current_user_payload] = lambda: user_payload
     with patch(
-        "app.routers.device_groups._fetch_user_group_ids",
+        "app.services.auth_groups.fetch_user_group_ids",
         new=AsyncMock(return_value=[]),
     ):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
