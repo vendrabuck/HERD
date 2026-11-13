@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import string
 import typing
 from pathlib import Path
 
@@ -350,3 +351,44 @@ def test_all_three_warnings_fire_together_in_order(caplog):
 def test_a_single_dot_segment_and_dots_inside_a_segment_are_not_refused():
     loaded = oidc_settings(oidc_redirect_uri="https://herd.test/a..b/./api/auth/oidc/callback")
     assert oidc_configuration_problems(loaded) == []
+
+
+# --- the redirect path's character set (ADR 0016 D11, amended in phase 3) ---
+
+ALLOWED_PATH_CHARACTERS = set(string.ascii_letters + string.digits + "-._~/%")
+# Every ASCII character outside the set (controls, space, comma, ";", "=", and
+# the rest), plus non-ASCII ones: a Latin letter, a Cyrillic look-alike, and a
+# Unicode line separator.
+REFUSED_PATH_CHARACTERS = [chr(c) for c in range(0x80) if chr(c) not in ALLOWED_PATH_CHARACTERS] + [
+    "\u00e9",
+    "\u0430",
+    "\u2028",
+]
+
+
+def test_the_allowed_redirect_path_characters_are_exactly_the_set():
+    assert config._REDIRECT_PATH_CHARACTERS == ALLOWED_PATH_CHARACTERS
+    loaded = oidc_settings(oidc_redirect_uri="https://herd.test/AZaz09-._~%41/oidc/callback")
+    assert config.oidc_cookie_path(loaded) == "/AZaz09-._~%41/oidc"
+    assert oidc_configuration_problems(loaded) == []
+
+
+@pytest.mark.parametrize(
+    "character", REFUSED_PATH_CHARACTERS, ids=[f"U+{ord(c):04X}" for c in REFUSED_PATH_CHARACTERS]
+)
+def test_each_refused_redirect_path_character_yields_no_cookie_path(character):
+    """One case per refused character, each pinned on its own: it is outside
+    `_REDIRECT_PATH_CHARACTERS`, and a redirect URI whose path holds it gives no
+    cookie path and is reported invalid. `;` is the attribute separator Starlette
+    would write unquoted into the cookies' Path."""
+    assert character not in config._REDIRECT_PATH_CHARACTERS
+    loaded = oidc_settings(oidc_redirect_uri=f"https://herd.test/a{character}b/oidc/callback")
+    assert config.oidc_cookie_path(loaded) is None
+    assert "OIDC_REDIRECT_URI" in oidc_configuration_problems(loaded)
+
+
+def test_a_semicolon_alone_is_refused_in_the_redirect_path():
+    """No `=` beside it, so only the character-set rule can refuse it."""
+    loaded = oidc_settings(oidc_redirect_uri="https://herd.test/x;Secure/oidc/callback")
+    assert config.oidc_cookie_path(loaded) is None
+    assert oidc_configuration_problems(loaded) == ["OIDC_REDIRECT_URI"]

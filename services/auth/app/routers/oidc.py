@@ -35,7 +35,9 @@ token) or anything the provider sent (the `error` and `error_description`
 parameters, the `iss` parameter, a claim, a `VerifiedIdToken`). Refusals log
 a fixed `reason`; the flow id is the correlation key. The catch-all around the
 login and callback bodies logs the exception's class name only, never
-`exc_info` and never its message, and answers `unavailable`.
+`exc_info` and never its message, and answers `unavailable`; the one around
+the exchange's body (after FastAPI has validated it) does the same and answers
+the exchange's 401.
 """
 
 from __future__ import annotations
@@ -159,8 +161,16 @@ def federated_login_from_token(verified: VerifiedIdToken) -> FederatedLogin:
     interfaces): the username by option C (`oidc_username`: the username claim
     when it fits `OIDC_USERNAME_PATTERN`, else the email when it does, else
     None, which a first login refuses), and `full_name` as the `name` claim cut
-    to 200 characters, or the username."""
+    to 200 characters, or the username.
+
+    `username_unusable` is True when no username fits although a candidate was
+    present, a candidate being the claim or the email as a string: the
+    verified token holds each as a non-empty string or None, so "present"
+    means not None. A first login then fails as `username_invalid`; with no
+    candidate at all the reason is `username_missing`, though the email
+    checks, which run first, refuse such a login as `email_missing`."""
     username = oidc_username(verified.username_claim, verified.email)
+    candidate_present = isinstance(verified.username_claim, str) or isinstance(verified.email, str)
     full_name = verified.name[:FULL_NAME_MAX_LENGTH] if verified.name else username
     return FederatedLogin(
         issuer=verified.issuer,
@@ -169,6 +179,7 @@ def federated_login_from_token(verified: VerifiedIdToken) -> FederatedLogin:
         email_verified=verified.email_verified,
         username=username,
         full_name=full_name,
+        username_unusable=username is None and candidate_present,
     )
 
 
@@ -399,8 +410,11 @@ async def oidc_exchange(
     401 `Single sign-on session expired; sign in again` when the cookie is
     missing, unknown, already exchanged, expired, or its user is inactive, the
     last checked twice: in the exchange's own guarded update and again on the
-    reloaded account just before tokens are issued. The 200 and the 401 both
-    clear the cookie.
+    reloaded account just before tokens are issued. Any other exception after
+    the body is validated, before or after the handoff row is consumed, is
+    logged once by class name only and answers the same 401. The 200 and every
+    401 carry no-store and clear the cookie; the 404 outside OIDC mode and a
+    422 answer before this function runs, so they leave it.
     """
     handoff_secret = request.cookies.get(HANDOFF_COOKIE)
     if not handoff_secret:
@@ -409,23 +423,29 @@ async def oidc_exchange(
             extra={"action": "oidc_exchange_refused", "reason": "missing_handoff_cookie"},
         )
         return _exchange_refused()
-    exchanged = await oidc_flow_service.exchange_handoff(db, handoff_secret=handoff_secret)
-    if exchanged is None:
-        # exchange_handoff has logged the fixed reason.
+    try:
+        exchanged = await oidc_flow_service.exchange_handoff(db, handoff_secret=handoff_secret)
+        if exchanged is None:
+            # exchange_handoff has logged the fixed reason.
+            return _exchange_refused()
+        user_id, next_path = exchanged
+        user = await auth_service.get_user_by_id(db, user_id)
+        if user is None or not user.is_active:
+            logger.warning(
+                "OIDC handoff exchange refused",
+                extra={
+                    "action": "oidc_exchange_refused",
+                    "reason": "user_inactive_after_exchange",
+                    "user_id": str(user_id),
+                },
+            )
+            return _exchange_refused()
+        access_token, refresh_token = await auth_service.create_tokens_for_user(db, user)
+    except Exception as exc:
+        # Class name only, as in the begin and the callback: a database error's
+        # message carries the statement's bound parameters.
+        _log_unexpected("exchange", exc)
         return _exchange_refused()
-    user_id, next_path = exchanged
-    user = await auth_service.get_user_by_id(db, user_id)
-    if user is None or not user.is_active:
-        logger.warning(
-            "OIDC handoff exchange refused",
-            extra={
-                "action": "oidc_exchange_refused",
-                "reason": "user_inactive_after_exchange",
-                "user_id": str(user_id),
-            },
-        )
-        return _exchange_refused()
-    access_token, refresh_token = await auth_service.create_tokens_for_user(db, user)
     logger.info(
         "OIDC sign-in completed",
         extra={"action": "login_success", "source": "oidc", "user_id": str(user_id)},

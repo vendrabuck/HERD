@@ -522,10 +522,20 @@ async def test_begin_passes_the_raw_next_to_the_flow_store(monkeypatch, client, 
         ("oidc_client_id", " "),
         ("oidc_redirect_uri", "https://herd.test/api/auth/oidc/other"),
         ("oidc_redirect_uri", "https://herd.test/x;Domain=evil.example/oidc/callback"),
+        ("oidc_redirect_uri", "https://herd.test/x;Secure/oidc/callback"),
         ("oidc_redirect_uri", "https://herd.test/a,b/oidc/callback"),
         ("oidc_redirect_uri", "http://herd.test/api/auth/oidc/callback"),
     ],
-    ids=["issuer", "secret", "client-id", "path", "cookie-injection", "comma", "http"],
+    ids=[
+        "issuer",
+        "secret",
+        "client-id",
+        "path",
+        "cookie-injection",
+        "semicolon-without-equals",
+        "comma",
+        "http",
+    ],
 )
 async def test_begin_with_incomplete_settings_answers_unavailable(
     monkeypatch, client, idp, setting, value
@@ -825,6 +835,11 @@ async def test_a_replayed_callback_fails_and_never_redeems_the_code_twice(client
         ({"error": "access_denied", "error_description": IDP_ERROR_TEXT}, CANCELLED),
         ({"error": "access_denied", "code": CODE}, CANCELLED),
         ({"error": "server_error", "code": CODE}, FAILED),
+        ({"error": "access_denied_x"}, FAILED),
+        ({"error": "access_denied "}, FAILED),
+        ({"error": "Access_Denied"}, FAILED),
+        ({"error": "ACCESS_DENIED"}, FAILED),
+        ({"error": "xaccess_denied"}, FAILED),
         ({"error": "SENTINEL-not-registered", "error_description": IDP_ERROR_TEXT}, FAILED),
         ({"error": ""}, FAILED),
         ({}, FAILED),
@@ -835,6 +850,11 @@ async def test_a_replayed_callback_fails_and_never_redeems_the_code_twice(client
         "access-denied-description",
         "access-denied-with-code",
         "server-error",
+        "access-denied-suffix",
+        "access-denied-trailing-space",
+        "access-denied-mixed-case",
+        "access-denied-upper-case",
+        "access-denied-prefix",
         "unregistered-error",
         "empty-error",
         "no-code-no-error",
@@ -982,23 +1002,42 @@ async def _local_account(email: str = "owner@example.test", username: str = "own
 
 
 PROVISIONING_REFUSALS = {
-    "email-missing": {"email": DROP},
-    "email-unverified": {"email_verified": False},
-    "email-taken-by-a-local-account": {"email": "OWNER@example.test"},
-    "username-taken": {"preferred_username": "Owner"},
-    "no-usable-username": {"preferred_username": "bad name", "email": "o'brien@example.test"},
+    "email-missing": ({"email": DROP}, "email_missing"),
+    "email-and-claim-missing": (
+        {"email": DROP, "preferred_username": DROP},
+        "email_missing",
+    ),
+    "email-unverified": ({"email_verified": False}, "email_unverified"),
+    "email-taken-by-a-local-account": ({"email": "OWNER@example.test"}, "email_taken"),
+    "username-taken": ({"preferred_username": "Owner"}, "username_taken"),
+    "no-usable-username": (
+        {"preferred_username": "bad name", "email": "o'brien@example.test"},
+        "username_invalid",
+    ),
+    "claim-absent-email-unusable": (
+        {"preferred_username": DROP, "email": "o'brien@example.test"},
+        "username_invalid",
+    ),
 }
 
 
 @pytest.mark.parametrize("case", sorted(PROVISIONING_REFUSALS))
-async def test_provisioning_refusals_answer_failed_and_link_nothing(client, idp, case):
+async def test_provisioning_refusals_answer_failed_and_link_nothing(client, idp, caplog, case):
     """D4 over HTTP, D13 account takeover through email: the local account is never
-    linked or changed, and nothing is created."""
+    linked or changed, nothing is created, and the refusal carries its fixed
+    reason (option C: `username_invalid` whenever a candidate was present)."""
     local = await _local_account()
-    idp.claim_changes.update(PROVISIONING_REFUSALS[case])
+    changes, reason = PROVISIONING_REFUSALS[case]
+    idp.claim_changes.update(changes)
     begun = await begin(client, idp)
     response = await complete_callback(client, idp, begun)
     assert response.headers["location"] == FAILED
+    refusals = [
+        r.reason
+        for r in caplog.get_records("call")
+        if r.name == "app.services.auth_service" and getattr(r, "action", None) == "login_failure"
+    ]
+    assert refusals == [reason]
     assert (await flow_row(begun.state)).status == "failed"
     users, identities, _ = await counts()
     assert (users, identities) == (1, 0)
@@ -1069,7 +1108,36 @@ def test_federated_login_from_token_maps_every_field():
     hopeless = oidc_router.federated_login_from_token(
         VerifiedIdToken(ISSUER, "sub-1", "o'brien@example.test", True, "bad name", None)
     )
-    assert (hopeless.username, hopeless.full_name) == (None, None)
+    assert (hopeless.username, hopeless.full_name, hopeless.username_unusable) == (
+        None,
+        None,
+        True,
+    )
+    assert login.username_unusable is False and nameless.username_unusable is False
+
+
+@pytest.mark.parametrize(
+    "claim,email,username,unusable",
+    [
+        ("alice", "alice@example.test", "alice", False),
+        ("alice", "o'brien@example.test", "alice", False),
+        ("alice", None, "alice", False),
+        ("bad name", "alice@example.test", "alice@example.test", False),
+        (None, "alice@example.test", "alice@example.test", False),
+        ("bad name", "o'brien@example.test", None, True),
+        (None, "o'brien@example.test", None, True),
+        ("bad name", None, None, True),
+        ("   ", None, None, True),
+        (None, None, None, False),
+    ],
+)
+def test_option_c_mapping_table(claim, email, username, unusable):
+    """The ADR's option C table: `username_unusable` is set exactly when no
+    username fits and at least one candidate string was present."""
+    login = oidc_router.federated_login_from_token(
+        VerifiedIdToken(ISSUER, "sub-1", email, True, claim, None)
+    )
+    assert (login.username, login.username_unusable) == (username, unusable)
 
 
 async def test_complete_flow_false_fails_the_row_and_answers_failed(monkeypatch, client, idp):
@@ -1221,6 +1289,39 @@ async def test_exchange_rechecks_the_user_after_the_handoff_is_consumed(
     assert (await counts())[2] == 0
     [record] = records(caplog, "oidc_exchange_refused")
     assert record.reason == "user_inactive_after_exchange"
+
+
+@pytest.mark.parametrize("point", ["before-consume", "after-consume", "minting"])
+async def test_exchange_catch_all_answers_401_and_logs_the_class_only(
+    monkeypatch, client, idp, caplog, point
+):
+    """Supervisor decision (D9 consistency): an unexpected exception after the
+    body is validated, before the handoff row is consumed or after, answers the
+    exchange's 401 with no-store, clears the cookie, issues no token, and is
+    logged once by class name only."""
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("SENTINEL-unexpected-message")
+
+    target = {
+        "before-consume": (oidc_flow_service, "exchange_handoff"),
+        "after-consume": (auth_service, "get_user_by_id"),
+        "minting": (auth_service, "create_tokens_for_user"),
+    }[point]
+    begun, _, handoff = await sign_in(client, idp)
+    monkeypatch.setattr(*target, boom)
+    response = await exchange(client, handoff)
+    assert (response.status_code, response.json()) == (401, EXCHANGE_REFUSED)
+    assert response.headers["cache-control"] == "no-store"
+    cleared = set_cookies(response)[oidc_router.HANDOFF_COOKIE]
+    assert (cleared["value"], cleared["max-age"], cleared["path"]) == ('""', "0", COOKIE_PATH)
+    assert (await counts())[2] == 0
+    expected_status = "authenticated" if point == "before-consume" else "exchanged"
+    assert (await flow_row(begun.state)).status == expected_status
+    [record] = records(caplog, "oidc_internal_error")
+    assert (record.step, record.error_class) == ("exchange", "RuntimeError")
+    assert record.exc_info is None and record.exc_text is None
+    assert "SENTINEL-unexpected-message" not in record.getMessage()
 
 
 @pytest.mark.parametrize(

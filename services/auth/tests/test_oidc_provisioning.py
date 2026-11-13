@@ -786,3 +786,32 @@ async def test_a_returning_login_ignores_the_username():
         async with TestSessionLocal() as db:
             again = await resolve_federated_user(db, _login(username=username))
         assert again is not None and again.id == first.id
+
+
+@pytest.mark.parametrize(
+    "username,unusable,reason",
+    [
+        (None, True, "username_invalid"),
+        (None, False, "username_missing"),
+        ("", True, "username_missing"),
+        ("bad name", False, "username_invalid"),
+    ],
+)
+async def test_username_unusable_selects_the_refusal_reason(caplog, username, unusable, reason):
+    """Option C reasons (supervisor decision): a None username is
+    `username_invalid` when the mapping found a candidate that did not fit
+    (`username_unusable`), else `username_missing`; the flag changes nothing
+    when a username string is passed."""
+    login = dataclasses.replace(_login(username=username), username_unusable=unusable)
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        async with TestSessionLocal() as db:
+            assert await resolve_federated_user(db, login) is None
+    assert await _counts() == (0, 0)
+    [record] = _refusals(caplog)
+    assert record.reason == reason
+
+
+async def test_username_unusable_is_ignored_when_the_username_fits():
+    login = dataclasses.replace(_login(), username_unusable=True)
+    async with TestSessionLocal() as db:
+        assert await resolve_federated_user(db, login) is not None

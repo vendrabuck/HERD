@@ -320,9 +320,13 @@ class FederatedLogin:
     it; the callback (`app.routers.oidc.federated_login_from_token`) maps a
     verified ID token onto it: `username` is `oidc_username(claim, email)`, the
     owner's option C (None when neither the claim nor the email fits
-    `OIDC_USERNAME_PATTERN`); `full_name` is the `name` claim truncated to 200
+    `OIDC_USERNAME_PATTERN`); `username_unusable` is True exactly when the
+    username is None although a candidate (the claim or the email) was present,
+    so a first login is refused as `username_invalid` rather than
+    `username_missing`; `full_name` is the `name` claim truncated to 200
     characters, or the username. `email_verified` is None when the token
-    carries no such claim.
+    carries no such claim. `username_unusable` defaults to False, so a caller
+    that sets `username` itself keeps the reasons below unchanged.
 
     Every field is untrusted IdP content: `resolve_federated_user` validates
     each one before any of it reaches a query, so it returns a User or None for
@@ -335,6 +339,7 @@ class FederatedLogin:
     email_verified: bool | None
     username: str | None
     full_name: str | None
+    username_unusable: bool = False
 
 
 # Column widths of users.email, users.username, and users.full_name. A longer
@@ -371,8 +376,10 @@ def oidc_username(username_claim: object, email: object) -> str | None:
 
     The configured username claim when it is a string matching
     `OIDC_USERNAME_PATTERN` in full; else the email when it is; else None,
-    which `resolve_federated_user` refuses at a first login as
-    `username_missing`. A returning login never reads it (IAM-OIDC-8).
+    which `resolve_federated_user` refuses at a first login (as
+    `username_invalid` when the caller marks the login `username_unusable`,
+    which the callback does whenever a candidate was present). A returning
+    login never reads it (IAM-OIDC-8).
     """
     for candidate in (username_claim, email):
         if isinstance(candidate, str) and OIDC_USERNAME_PATTERN.fullmatch(candidate):
@@ -531,7 +538,9 @@ def _first_login_refusal(login: FederatedLogin) -> str | None:
     absent claim is accepted, ADR 0016 D4); leading or trailing whitespace, a
     Cc, Cf, or Cs character, or anything but exactly one `@` with text on both
     sides is `email_invalid`; over 255 characters is `email_too_long`. The
-    username likewise: `username_missing`, `username_invalid`,
+    username likewise: `username_invalid` when it is None and
+    `username_unusable` is True (option C found a candidate but none fit),
+    else `username_missing`, `username_invalid`,
     `username_too_long` (over 100), and then `username_invalid` for any
     username `OIDC_USERNAME_PATTERN` does not match in full (option C; the
     callback already passes only a matching username or None, so this is the
@@ -548,6 +557,8 @@ def _first_login_refusal(login: FederatedLogin) -> str | None:
     if len(email) > _EMAIL_MAX_LENGTH:
         return "email_too_long"
     username = login.username
+    if username is None and login.username_unusable is True:
+        return "username_invalid"
     if not isinstance(username, str) or not username.strip():
         return "username_missing"
     if not _name_is_clean(username):
