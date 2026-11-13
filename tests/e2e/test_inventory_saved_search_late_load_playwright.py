@@ -43,6 +43,22 @@ def _is_page_list_request(request) -> bool:
     return parse_qs(parsed.query).get("limit") != ["500"]
 
 
+def _wait_until_held(page, held: list) -> None:
+    """Wait for the page's preferences GET to reach the route handler.
+
+    The app sends that GET only after `/auth/me` has answered, while the Inventory
+    page renders its filters and its first list request without waiting for either,
+    so the filters can be visible a moment before the GET exists. Asserting on
+    `held` straight after the filters appear raced that round trip (a nightly
+    failure on 2026-11-12); this polls for up to five seconds instead.
+    """
+    for _ in range(100):
+        if held:
+            return
+        page.wait_for_timeout(50)
+    raise AssertionError("the preferences GET was not held")
+
+
 def _search_of(request) -> str | None:
     return (parse_qs(urlparse(request.url).query).get("search") or [None])[0]
 
@@ -84,7 +100,7 @@ def test_late_loading_saved_search_survives_an_immediate_filter_change(pw_page):
             status_select = pw_page.get_by_label("Status", exact=True)
             expect(status_select).to_be_visible()
             expect(search).to_have_value("")
-            assert held, "the preferences GET was not held"
+            _wait_until_held(pw_page, held)
             assert list_searches and list_searches[0] is None
 
             for route in held:
@@ -171,7 +187,7 @@ def test_filter_change_while_preferences_load_is_held_keeps_saved_search(pw_page
                 pw_page.goto(f"{HOST_BASE_URL}/inventory")
             status_select = pw_page.get_by_label("Status", exact=True)
             expect(status_select).to_be_visible()
-            assert held, "the preferences GET was not held"
+            _wait_until_held(pw_page, held)
 
             status_select.select_option("MAINTENANCE")
             # Well past the 200 ms preference debounce: a write built from the
