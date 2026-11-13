@@ -1760,6 +1760,10 @@ Authorization: Bearer <admin-token>
 | `/api/auth/login` | POST | open | open | open |
 | `/api/auth/refresh` | POST | open | open | open |
 | `/api/auth/logout` | POST | open | open | open |
+| `/api/auth/login-options` | GET | open | open | open |
+| `/api/auth/oidc/login` | GET | open | open | open |
+| `/api/auth/oidc/callback` | GET | open | open | open |
+| `/api/auth/oidc/exchange` | POST | open | open | open |
 | `/api/auth/me` | GET | yes | yes | yes |
 | `/api/auth/me/profile` | PATCH | yes (own) | yes (own) | yes (own) |
 | `/api/auth/groups` | GET | yes | yes | yes |
@@ -1937,7 +1941,12 @@ full build string to any caller, so treat the commit hash as public on a reachab
 deployment.
 
 `POST /api/auth/logout` carries no auth dependency; it revokes the refresh token passed
-in the request body, mirroring `/login` and `/refresh`. `PATCH /api/reservations/{id}`
+in the request body, mirroring `/login` and `/refresh`. `GET /api/auth/login-options`
+tells the login page which sign-in methods the deployment offers, in every mode. The
+three `/api/auth/oidc/` routes (single sign-on, ADR 0016) answer 404 unless
+`AUTH_METHOD=oidc`, which no deployment can select until ADR 0016 phase 6; they take no
+bearer token, and the callback and the exchange act only for a browser holding the
+one-time cookie the previous step set. `PATCH /api/reservations/{id}`
 is owner-scoped: any authenticated user may call it, but the update only ever applies to
 a reservation the caller owns (404 otherwise), with no admin bypass.
 

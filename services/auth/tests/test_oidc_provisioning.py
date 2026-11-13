@@ -23,10 +23,12 @@ from app.models.group import UserGroup
 from app.models.user import Role, User
 from app.services import auth_service
 from app.services.auth_service import (
+    OIDC_USERNAME_PATTERN,
     FederatedLogin,
     create_oidc_user,
     create_tokens_for_user,
     create_user,
+    oidc_username,
     resolve_federated_user,
     rotate_refresh_token,
 )
@@ -689,3 +691,98 @@ async def test_resolve_ends_its_transaction_on_every_refusal_and_commits_a_succe
         await auth_service.set_user_active(db, user.id, False)
         assert await resolve_federated_user(db, _login()) is None
         assert not db.in_transaction()
+
+
+# --- option C: the username rule for oidc accounts (ADR 0016 D4, amended in phase 3) ---
+
+GOOD = "alice@example.com"
+UNUSABLE_EMAIL = "o'brien@example.com"
+
+OPTION_C = [
+    # (claim, email, expected username)
+    ("alice", GOOD, "alice"),
+    ("Alice.Smith_2+ops@corp-1", GOOD, "Alice.Smith_2+ops@corp-1"),
+    ("a", GOOD, "a"),
+    ("7", GOOD, "7"),
+    ("a" * 100, GOOD, "a" * 100),
+    ("a" * 101, GOOD, GOOD),
+    ("a" * 101, "b" * 89 + "@example.com", None),
+    ("a" * 101, "b" * 88 + "@example.com", "b" * 88 + "@example.com"),
+    ("bad name", GOOD, GOOD),
+    ("bad name", UNUSABLE_EMAIL, None),
+    ("", GOOD, GOOD),
+    ("", "", None),
+    (None, GOOD, GOOD),
+    (None, None, None),
+    (42, GOOD, GOOD),
+    (".alice", GOOD, GOOD),
+    ("_alice", GOOD, GOOD),
+    ("@alice", GOOD, GOOD),
+    ("+alice", GOOD, GOOD),
+    ("-alice", GOOD, GOOD),
+    ("alice", ".alice@example.com", "alice"),
+    (None, "-alice@example.com", None),
+    ("\uff41lice", GOOD, GOOD),
+    ("\u0430lice", GOOD, GOOD),
+    ("\u00e5lice", GOOD, GOOD),
+    ("alice\u0301", GOOD, GOOD),
+    ("\u0661\u0662\u0663", GOOD, GOOD),
+    ("ali\u200bce", GOOD, GOOD),
+    ("alice\n", GOOD, GOOD),
+    ("alice\r\n", GOOD, GOOD),
+    ("ali\x00ce", GOOD, GOOD),
+    ("alice\t", GOOD, GOOD),
+    ("alice\x7f", GOOD, GOOD),
+    ("alice ", GOOD, GOOD),
+    (" alice", GOOD, GOOD),
+    ("al/ice", GOOD, GOOD),
+    ("al;ice", GOOD, GOOD),
+    ("al'ice", GOOD, GOOD),
+    ("alice", "alice@example.com\n", "alice"),
+    (None, "alice@example.com\n", None),
+    (None, "\u0430lice@example.com", None),
+]
+
+
+@pytest.mark.parametrize(
+    "claim,email,expected", OPTION_C, ids=[f"case-{i}" for i in range(len(OPTION_C))]
+)
+def test_option_c_picks_the_claim_then_the_email_then_nothing(claim, email, expected):
+    """The owner's option C over the whole input space: a matching claim; a
+    non-matching claim (too long, leading punctuation, non-ASCII look-alikes,
+    combining marks, other digits, invisible, control, white space, other ASCII
+    punctuation) falling back to a matching email; neither; empty; 100 against 101
+    characters; a trailing newline, which `$` would have let through."""
+    assert oidc_username(claim, email) == expected
+
+
+def test_option_c_pattern_is_the_owners_allowlist():
+    assert OIDC_USERNAME_PATTERN.pattern == r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}"
+    allowed = {chr(c) for c in range(0x110000) if OIDC_USERNAME_PATTERN.fullmatch("a" + chr(c))}
+    expected = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._@+-")
+    assert allowed == expected
+    first = {chr(c) for c in range(0x110000) if OIDC_USERNAME_PATTERN.fullmatch(chr(c))}
+    assert first == expected - set("._@+-")
+
+
+@pytest.mark.parametrize("username", ["bad name", "\u00e5lice", ".alice", "al;ice", "alice\u0301"])
+async def test_first_login_refuses_a_username_outside_the_allowlist(caplog, username):
+    """The provisioning check is the second line: a direct caller passing a
+    username outside the allowlist is refused as username_invalid."""
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        async with TestSessionLocal() as db:
+            assert await resolve_federated_user(db, _login(username=username)) is None
+    assert await _counts() == (0, 0)
+    [record] = _refusals(caplog)
+    assert record.reason == "username_invalid"
+
+
+async def test_a_returning_login_ignores_the_username():
+    """Option C applies at provisioning only: a known identity signs in whatever
+    username the token now carries, unusable or absent included."""
+    async with TestSessionLocal() as db:
+        first = await resolve_federated_user(db, _login())
+    for username in ("bad name", None):
+        async with TestSessionLocal() as db:
+            again = await resolve_federated_user(db, _login(username=username))
+        assert again is not None and again.id == first.id

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -7,11 +7,13 @@ from app.database import get_db
 from app.dependencies.auth import get_current_user
 from app.models.user import User
 from app.schemas.auth import (
+    LoginOptionsResponse,
     LoginRequest,
     LogoutRequest,
     ProfileUpdateRequest,
     RefreshRequest,
     RegisterRequest,
+    SsoOptions,
     TokenResponse,
     UserResponse,
 )
@@ -28,13 +30,50 @@ from app.services.auth_service import (
 
 router = APIRouter(tags=["auth"])
 
+REGISTER_DISABLED_LDAP_DETAIL = (
+    "Local registration is disabled; this deployment uses LDAP authentication."
+)
+REGISTER_DISABLED_OIDC_DETAIL = (
+    "Local registration is disabled; this deployment uses single sign-on."
+)
+
+
+@router.get("/login-options", response_model=LoginOptionsResponse)
+async def login_options(response: Response):
+    """Which sign-in methods the login page offers (ADR 0016 D10), from this
+    process's live settings; public, answered in every mode, never cached.
+
+    `password_login` is true in local and LDAP mode and, in OIDC mode, the
+    value of OIDC_BREAK_GLASS_LOCAL_SUPERADMIN. `sso` is present only in OIDC
+    mode, also when the OIDC settings are incomplete (the begin route then
+    answers `unavailable`).
+    """
+    response.headers["Cache-Control"] = "no-store"
+    method = settings.auth_method
+    if method == "oidc":
+        return LoginOptionsResponse(
+            auth_method="oidc",
+            registration_open=False,
+            password_login=settings.oidc_break_glass_local_superadmin,
+            sso=SsoOptions(provider_name=settings.oidc_provider_name),
+        )
+    return LoginOptionsResponse(
+        auth_method=method,
+        registration_open=method == "local",
+        password_login=True,
+        sso=None,
+    )
+
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     if settings.auth_method == "ldap":
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Local registration is disabled; this deployment uses LDAP authentication.",
+            status_code=status.HTTP_409_CONFLICT, detail=REGISTER_DISABLED_LDAP_DETAIL
+        )
+    if settings.auth_method == "oidc":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=REGISTER_DISABLED_OIDC_DETAIL
         )
     # Single generic 409 for any collision (email OR username, pre-check OR the
     # IntegrityError race below). Distinct messages let an unauthenticated caller

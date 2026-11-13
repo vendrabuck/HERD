@@ -72,6 +72,27 @@ async def test_register_blocked_when_ldap_mode(client, ldap_mode):
 
 
 @pytest.mark.asyncio
+async def test_register_blocked_when_oidc_mode(client, monkeypatch):
+    """ADR 0016 D5: in OIDC mode registration answers 409 with the fixed detail
+    before the body is used: a body naming an existing account gets this 409,
+    not the collision one, and nothing is created."""
+    monkeypatch.setattr(settings, "auth_method", "oidc", raising=False)
+    async with TestSessionLocal() as db:
+        await create_user(db, "taken@example.com", "taken", "password123")
+    for body in (
+        {"email": "new@example.com", "username": "new", "password": "password123"},
+        {"email": "taken@example.com", "username": "taken", "password": "password123"},
+    ):
+        resp = await client.post("/register", json=body)
+        assert resp.status_code == 409
+        assert resp.json() == {
+            "detail": "Local registration is disabled; this deployment uses single sign-on."
+        }
+    async with TestSessionLocal() as db:
+        assert len((await db.execute(select(User))).scalars().all()) == 1
+
+
+@pytest.mark.asyncio
 async def test_ldap_login_jit_provisions_user(client, ldap_mode, fake_bind):
     resp = await client.post("/login", json={"email": "alice", "password": "good"})
     assert resp.status_code == 200

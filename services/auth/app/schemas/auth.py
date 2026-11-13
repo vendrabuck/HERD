@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, field_validator
 
@@ -52,6 +52,34 @@ class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
+
+
+class OidcExchangeResponse(TokenResponse):
+    """`POST /oidc/exchange` (ADR 0016 D3): the `POST /login` body plus `next`,
+    the sanitized same-origin path the SPA navigates to."""
+
+    next: str
+
+
+class OidcExchangeRequest(BaseModel):
+    """`POST /oidc/exchange` takes exactly `{}`: no field is defined and any
+    key is refused (ADR 0016 D3)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SsoOptions(BaseModel):
+    provider_name: str
+
+
+class LoginOptionsResponse(BaseModel):
+    """`GET /login-options`: which sign-in methods the login page offers, from
+    auth's live settings (ADR 0016 D10)."""
+
+    auth_method: Literal["local", "ldap", "oidc"]
+    registration_open: bool
+    password_login: bool
+    sso: SsoOptions | None
 
 
 class RefreshRequest(BaseModel):
