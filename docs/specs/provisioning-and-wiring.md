@@ -93,7 +93,9 @@ No transition leaves `RELEASED` (WIRE-LEDGER-10).
 | From | To | Performed by | Guard | Stages | Rule |
 |---|---|---|---|---|---|
 | (none) | `ACTIVE` | `find_or_assign_allocation` | no ACTIVE allocation of the reservation reaches the component; number held by no ACTIVE allocation that reaches it | nothing | WIRE-VLAN-1, WIRE-VLAN-2, WIRE-VLAN-3 |
-| `ACTIVE` | `RELEASED` | `_release_orphaned_allocations` | zero ACTIVE memberships reference it | nothing | WIRE-VLAN-4 |
+| `ACTIVE` | `RELEASED` | `release_allocation_if_orphaned`, called by `_release_orphaned_allocations` | compare-and-swap: one UPDATE matching the row only while its status is `ACTIVE` and no ACTIVE membership references it | nothing | WIRE-VLAN-4 |
+
+These are the only two status writes on an allocation; no transition leaves `RELEASED`.
 
 **Wiring state row.** It has no status column; two fields move.
 
@@ -116,7 +118,9 @@ build flips and retry failure writes are SQL compare-and-swaps on status; the tw
 reconcile writers compare the pinned routes under a row lock; a partial-unique index per
 ledger is the final arbiter for ACTIVE rows (WIRE-LEDGER-3); the two retry channels
 exclude each other with the claim stamp (WIRE-CLAIM-1). Freeze is monotonic, and every
-build recorder re-checks it at record time (WIRE-LEDGER-4).
+build recorder re-checks it at record time (WIRE-LEDGER-4). An allocation's release is a
+compare-and-swap too, so of two passes releasing one allocation exactly one drives its
+`delete_vlan` (WIRE-VLAN-4).
 
 **Rules.**
 
@@ -252,9 +256,18 @@ build recorder re-checks it at record time (WIRE-LEDGER-4).
   Pinned by: `services/execution/tests/test_vlan_service_edges.py` (`test_assign_vlan_raises_when_all_in_use`)
 - **WIRE-VLAN-4.** After a membership pass, each allocation that a removal in that pass
   touched is released when it has no ACTIVE membership left; a port moved within one
-  fabric keeps its allocation. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_release_orphaned_allocations`); `services/execution/app/services/l2_membership_service.py` (`count_active_memberships_for_vlan`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_reconcile_last_release_frees_allocation`, `test_reconcile_move_within_fabric_keeps_allocation`); `services/execution/tests/test_l2_membership_service.py` (`test_count_active_memberships_tracks_allocation_lifecycle`)
+  fabric keeps its allocation. The release is a compare-and-swap (#1357): one UPDATE
+  that sets `RELEASED` and `released_at` only while the row is `ACTIVE` and no ACTIVE
+  membership references it, and the row count decides the winner. A pass whose write
+  matches nothing lost a race (another pass released the allocation, or a membership
+  joined it, after this pass's orphan check): it logs one line at INFO with the action
+  `vlan_release_lost_race` and `vlan_assignment_id`, drives no `delete_vlan`, leaves
+  `defined_switch_ids` alone, raises nothing, and goes on with the next allocation. A
+  row that is not ACTIVE when the pass first reads it is skipped with no line. The
+  winner's deletes (WIRE-VLAN-11) start from the row as it was released, so a switch
+  defined after the orphan check is undefined too. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_release_orphaned_allocations`); `services/execution/app/services/vlan_service.py` (`release_allocation_if_orphaned`); `services/execution/app/services/l2_membership_service.py` (`count_active_memberships_for_vlan`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_reconcile_last_release_frees_allocation`, `test_reconcile_move_within_fabric_keeps_allocation`); `services/execution/tests/test_l2_membership_service.py` (`test_count_active_memberships_tracks_allocation_lifecycle`); `services/execution/tests/test_vlan_service.py` (`test_release_cas_releases_an_active_orphan_and_nothing_else`, `test_release_cas_loses_on_a_row_that_is_not_active`, `test_release_cas_loses_when_a_membership_joined_since_the_check`, `test_release_cas_ignores_memberships_that_are_not_active`, `test_release_cas_second_release_of_one_row_loses`); `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_release_lost_to_a_concurrent_release_drives_no_delete`, `test_release_lost_to_a_concurrent_join_keeps_the_allocation_active`, `test_release_loser_never_touches_a_reallocation_of_the_same_number`, `test_release_deletes_from_the_row_as_released_not_the_copy_read_before`, `test_two_interleaved_release_passes_release_and_undefine_once`); `services/execution/tests/test_vlan_release_cas_live_pg.py` (`test_two_concurrent_releases_of_one_allocation_have_exactly_one_winner`, `test_a_join_committed_after_the_orphan_check_keeps_the_allocation_active`, `test_the_loser_never_touches_a_new_allocation_of_the_same_number`)
 - **WIRE-ORDER-1.** `stamp_last_applied` inserts the wiring state row or raises its
   version; it never lowers the version and never clears `frozen`, including when it loses
   an insert race. \

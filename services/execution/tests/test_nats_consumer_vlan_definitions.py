@@ -881,6 +881,222 @@ async def test_release_orphaned_allocations_no_active_row_is_a_defensive_no_op()
     assert calls == [], "nothing to release: no driver call may fire"
 
 
+# --- the release is a compare-and-swap; a lost race drives nothing (issue #1357) ---
+
+LOST_RACE_ACTION = "vlan_release_lost_race"
+
+
+def _racing_release(competitor):
+    """A stand-in for vlan_service.release_allocation_if_orphaned that first lets
+    `competitor(db, allocation_id)` write and commit on the releaser's own session (a
+    concurrent writer landing after the orphan check and before the guarded write),
+    then runs the real compare-and-swap."""
+    from app.services import vlan_service
+
+    real = vlan_service.release_allocation_if_orphaned
+
+    async def _release(db, allocation_id):
+        await competitor(db, allocation_id)
+        await db.commit()
+        return await real(db, allocation_id)
+
+    return patch("app.services.vlan_service.release_allocation_if_orphaned", new=_release)
+
+
+def _lost_race_records(caplog):
+    return [r for r in caplog.records if getattr(r, "action", None) == LOST_RACE_ACTION]
+
+
+async def _competing_release(db, allocation_id):
+    from sqlalchemy import update
+
+    await db.execute(
+        update(VlanAssignment)
+        .where(VlanAssignment.id == allocation_id)
+        .values(status="RELEASED")
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def _competing_join(db, allocation_id):
+    db.add(
+        L2PortAssignment(
+            reservation_id=uuid.UUID(RES_ID),
+            vlan_assignment_id=allocation_id,
+            switch_device_id=uuid.UUID(SW_L2),
+            port="0/0/7",
+            intended="ACTIVE",
+            status="ACTIVE",
+        )
+    )
+
+
+async def _release_with(va_ids, *extra_patches):
+    execute_fn, calls = _recorder()
+    with ExitStack() as stack:
+        for p in _patches(execute_fn, []):
+            stack.enter_context(p)
+        for p in extra_patches:
+            stack.enter_context(p)
+        await _release_orphaned_allocations(
+            list(va_ids), _db_session_factory(), _FetchContext(None)
+        )
+    return calls
+
+
+async def test_release_lost_to_a_concurrent_release_drives_no_delete(caplog):
+    """Another pass releases the allocation after this pass's orphan check: this pass's
+    guarded write matches nothing, so it drives no delete_vlan, leaves
+    defined_switch_ids to the winner, logs the fixed lost-race action once, and still
+    releases the next allocation in its set."""
+    lost = await _seed_allocation(RES_ID, uuid.uuid4(), 100, [SW_L2], [SW_L2])
+    after = await _seed_allocation(RES_ID, uuid.uuid4(), 200, [SW_L2_B], [SW_L2_B])
+    raced = {"done": False}
+
+    async def _competitor(db, allocation_id):
+        if allocation_id == lost and not raced["done"]:
+            raced["done"] = True
+            await _competing_release(db, allocation_id)
+
+    with caplog.at_level(logging.INFO, logger="app.services.nats_consumer"):
+        calls = await _release_with([lost, after], _racing_release(_competitor))
+
+    assert [(c[1], c[3]) for c in calls if c[0] == "delete_vlan"] == [(SW_L2_B, 200)], (
+        "only the allocation this pass released is undefined"
+    )
+    rows = await _allocations_by_id([lost, after])
+    assert rows[lost].status == "RELEASED"
+    assert rows[lost].defined_switch_ids == [SW_L2], "the loser never trims the winner's list"
+    assert rows[after].status == "RELEASED" and rows[after].defined_switch_ids == []
+    (record,) = _lost_race_records(caplog)
+    assert record.vlan_assignment_id == str(lost)
+    assert record.levelno == logging.INFO
+
+
+async def test_release_lost_to_a_concurrent_join_keeps_the_allocation_active(caplog):
+    """A membership joins the allocation after the orphan check: the guarded write
+    names "no ACTIVE membership", so it matches nothing, the allocation stays ACTIVE
+    with its definitions, and no delete_vlan strips the VLAN the new member uses."""
+    alloc = await _seed_allocation(RES_ID, uuid.uuid4(), 100, [SW_L2], [SW_L2])
+
+    with caplog.at_level(logging.INFO, logger="app.services.nats_consumer"):
+        calls = await _release_with([alloc], _racing_release(_competing_join))
+
+    assert calls == []
+    row = (await _allocations_by_id([alloc]))[alloc]
+    assert (row.status, row.released_at, row.defined_switch_ids) == ("ACTIVE", None, [SW_L2])
+    assert len(_lost_race_records(caplog)) == 1
+
+
+async def test_release_loser_never_touches_a_reallocation_of_the_same_number(caplog):
+    """The winner released the allocation and the same reservation was then given a
+    NEW allocation with the same number on the same fabric before this pass's guarded
+    write ran. The loser's write is keyed to the old row's id, so the new ACTIVE row
+    keeps its status and definitions and no delete_vlan runs against it."""
+    old = await _seed_allocation(RES_ID, FABRIC, 100, [SW_L2], [SW_L2])
+    fresh: dict = {}
+
+    async def _competitor(db, allocation_id):
+        await _competing_release(db, allocation_id)
+        await db.commit()
+        row = VlanAssignment(
+            reservation_id=uuid.UUID(RES_ID),
+            fabric_id=FABRIC,
+            vlan_id=100,
+            switch_device_ids=[SW_L2],
+            defined_switch_ids=[SW_L2],
+            status="ACTIVE",
+        )
+        db.add(row)
+        await db.flush()
+        fresh["id"] = row.id
+
+    with caplog.at_level(logging.INFO, logger="app.services.nats_consumer"):
+        calls = await _release_with([old], _racing_release(_competitor))
+
+    assert calls == []
+    rows = await _allocations_by_id([old, fresh["id"]])
+    assert rows[old].status == "RELEASED"
+    assert (rows[fresh["id"]].status, rows[fresh["id"]].defined_switch_ids) == (
+        "ACTIVE",
+        [SW_L2],
+    )
+    assert len(_lost_race_records(caplog)) == 1
+
+
+async def test_release_deletes_from_the_row_as_released_not_the_copy_read_before(caplog):
+    """A define pass records SW_L2_B on the allocation after this pass's orphan check
+    and before its guarded write (the row is still ACTIVE with no member, so the
+    release wins). The delete pass works from the row as released, so SW_L2_B is
+    undefined too and the trim does not drop it from the list unseen."""
+    from sqlalchemy import update
+
+    alloc = await _seed_allocation(RES_ID, uuid.uuid4(), 100, [SW_L2], [SW_L2])
+
+    async def _competing_define(db, allocation_id):
+        await db.execute(
+            update(VlanAssignment)
+            .where(VlanAssignment.id == allocation_id)
+            .values(defined_switch_ids=[SW_L2, SW_L2_B])
+            .execution_options(synchronize_session=False)
+        )
+
+    calls = await _release_with([alloc], _racing_release(_competing_define))
+
+    assert sorted(c[1] for c in calls if c[0] == "delete_vlan") == sorted([SW_L2, SW_L2_B])
+    row = (await _allocations_by_id([alloc]))[alloc]
+    assert (row.status, row.defined_switch_ids) == ("RELEASED", [])
+
+
+async def test_two_interleaved_release_passes_release_and_undefine_once(caplog):
+    """Two release passes over the same orphaned allocation, both past their orphan
+    check before either writes (an asyncio barrier holds each at the guarded write):
+    exactly one releases it and drives its delete_vlan, the other logs the lost race.
+    The row-level proof on a real Postgres is test_vlan_release_cas_live_pg.py."""
+    import asyncio
+
+    from app.services import vlan_service
+
+    alloc = await _seed_allocation(RES_ID, uuid.uuid4(), 100, [SW_L2, SW_L2_B], [SW_L2, SW_L2_B])
+    real = vlan_service.release_allocation_if_orphaned
+    barrier = asyncio.Barrier(2)
+    outcomes: list[bool] = []
+
+    async def _gated(db, allocation_id):
+        await barrier.wait()
+        won = await real(db, allocation_id)
+        outcomes.append(won)
+        return won
+
+    execute_fn, calls = _recorder()
+    with ExitStack() as stack:
+        for p in _patches(execute_fn, []):
+            stack.enter_context(p)
+        stack.enter_context(
+            patch("app.services.vlan_service.release_allocation_if_orphaned", new=_gated)
+        )
+        with caplog.at_level(logging.INFO, logger="app.services.nats_consumer"):
+            await asyncio.wait_for(
+                asyncio.gather(
+                    _release_orphaned_allocations(
+                        [alloc], _db_session_factory(), _FetchContext(None)
+                    ),
+                    _release_orphaned_allocations(
+                        [alloc], _db_session_factory(), _FetchContext(None)
+                    ),
+                ),
+                timeout=30,
+            )
+
+    assert sorted(outcomes) == [False, True]
+    assert sorted(c[1] for c in calls if c[0] == "delete_vlan") == sorted([SW_L2, SW_L2_B]), (
+        "one set of deletes, not two"
+    )
+    row = (await _allocations_by_id([alloc]))[alloc]
+    assert (row.status, row.defined_switch_ids) == ("RELEASED", [])
+    assert len(_lost_race_records(caplog)) == 1
+
+
 # --- zero membership delta but the definition SCOPE still changed (issue #442) ---
 
 

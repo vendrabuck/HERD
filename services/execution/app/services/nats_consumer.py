@@ -2993,6 +2993,14 @@ async def _release_orphaned_allocations(
     to a different port on the same fabric leaves the fabric with one member and its
     allocation intact; only a fabric whose last member truly left is freed.
 
+    The release itself is a compare-and-swap (issue #1357) through
+    vlan_service.release_allocation_if_orphaned: one guarded UPDATE that matches only
+    while the row is ACTIVE with no ACTIVE membership. Two callers can reach one
+    allocation at once (a reservation's L2 apply tail and the retry channels' release
+    of superseded rows); the one that loses the swap logs the fixed action
+    `vlan_release_lost_race`, drives no delete_vlan, and the pass goes on with the next
+    allocation. A row that is not ACTIVE when first read is skipped silently, as before.
+
     The undefine half of the shared allocation-transition step (issue #442, Option B):
     on last-free, delete_vlan runs per switch in defined_switch_ids (what create_vlan
     provably defined, never the raw scope). Guards, per the decision:
@@ -3033,11 +3041,13 @@ async def _release_orphaned_allocations(
     here and propagates to the caller, as everywhere else in this module: it is not
     specific to one allocation.
     """
-    from datetime import datetime, timezone
-
     from app.models.vlan_assignment import VlanAssignment
     from app.services.l2_membership_service import count_active_memberships_for_vlan
-    from app.services.vlan_service import FabricResolver, find_superseding_allocation
+    from app.services.vlan_service import (
+        FabricResolver,
+        find_superseding_allocation,
+        release_allocation_if_orphaned,
+    )
 
     resolver = FabricResolver()
     for va_id in vlan_assignment_ids:
@@ -3054,9 +3064,23 @@ async def _release_orphaned_allocations(
             ).scalar_one_or_none()
             if row is None:
                 continue
-            row.status = "RELEASED"
-            row.released_at = datetime.now(timezone.utc)
-            await db.commit()
+            if not await release_allocation_if_orphaned(db, va_id):
+                # Issue #1357: the row changed between the reads above and the guarded
+                # write (another pass released it, or a membership joined it). The
+                # winner owns whatever comes next; this pass drives nothing for it.
+                logger.info(
+                    "Skipped releasing VLAN allocation %s: it was released or joined "
+                    "by a concurrent writer after the orphan check",
+                    va_id,
+                    extra={
+                        "action": "vlan_release_lost_race",
+                        "vlan_assignment_id": str(va_id),
+                    },
+                )
+                continue
+            # Re-read after the claim: the delete pass works from the row as it stood
+            # when this pass released it, not from the copy loaded before the write.
+            await db.refresh(row)
             logger.info("Released orphaned VLAN allocation %s (last membership left)", va_id)
 
         defined = [str(s) for s in (row.defined_switch_ids or [])]

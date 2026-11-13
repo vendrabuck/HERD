@@ -25,19 +25,25 @@ The release-side supersession guard (find_superseding_allocation, issue #1065) u
 the same reachability rule: a freed number's delete_vlan is skipped when another live
 allocation holding it reaches the current component of a switch the number is
 defined on.
+
+An allocation is written twice in its life, both here: the INSERT of an ACTIVE row in
+find_or_assign_allocation, and the ACTIVE to RELEASED compare-and-swap in
+release_allocation_if_orphaned (issue #1357). Nothing else sets its status.
 """
 
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 
 import httpx
 from herd_common import advisory_lock
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.models.l2_port_assignment import L2PortAssignment
 from app.models.vlan_assignment import VlanAssignment
 from app.services.nats_consumer import PermanentEventError, TransientUpstreamError
 
@@ -179,6 +185,49 @@ async def find_superseding_allocation(
             if await allocation_reaches(rival, fid, resolver):
                 return rival.id
     return None
+
+
+async def release_allocation_if_orphaned(db: AsyncSession, allocation_id: uuid.UUID) -> bool:
+    """Release an orphaned allocation: the ONE ACTIVE to RELEASED write (issue #1357).
+
+    A compare-and-swap, the discipline every ledger status write follows: one UPDATE
+    whose WHERE names the state the release was decided on, the row still ACTIVE AND no
+    ACTIVE membership referencing it, setting status RELEASED and released_at. The row
+    count decides: True when this call released the row (and committed), False when
+    the row was already RELEASED, is absent, or gained an ACTIVE membership since the
+    caller's orphan check (the session is rolled back and nothing was written). A
+    caller that gets False drives nothing for the allocation: the writer that won
+    (another release pass) owns its delete_vlan, and a joined membership keeps it live.
+
+    The membership predicate is part of the guarded UPDATE, not only of the caller's
+    earlier count, so a join committed between that count and this statement keeps
+    the allocation ACTIVE. On Postgres two concurrent releases of one row serialize
+    on its row lock and the second re-checks status = 'ACTIVE' against the committed
+    RELEASED row, so exactly one wins.
+    """
+    live_member = (
+        select(L2PortAssignment.id)
+        .where(
+            L2PortAssignment.vlan_assignment_id == allocation_id,
+            L2PortAssignment.status == "ACTIVE",
+        )
+        .exists()
+    )
+    result = await db.execute(
+        update(VlanAssignment)
+        .where(
+            VlanAssignment.id == allocation_id,
+            VlanAssignment.status == "ACTIVE",
+            ~live_member,
+        )
+        .values(status="RELEASED", released_at=datetime.now(timezone.utc))
+        .execution_options(synchronize_session=False)
+    )
+    if (result.rowcount or 0) != 1:
+        await db.rollback()
+        return False
+    await db.commit()
+    return True
 
 
 async def _reachable_active(
