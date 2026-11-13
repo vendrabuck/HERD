@@ -5,7 +5,7 @@ description = "HERD Configuration Service"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.162.4",
-    "uvicorn[standard]>=0.30.0",
+    "uvicorn[standard]>=0.54.0",
     "bcrypt>=4.0.0,<4.1",
     "pyjwt>=2.15.0",
     "docker>=7.0.0",
