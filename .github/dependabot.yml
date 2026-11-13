@@ -53,6 +53,10 @@ updates:
         update-types:
           - "version-update:semver-major"
           - "version-update:semver-minor"
+      # CI builds and tests the frontend on Node 22 only (ci.yml setup-node).
+      - dependency-name: "node"
+        update-types:
+          - "version-update:semver-major"
       # The frontend stays on nginx's stable line (even minor, 1.30); the next
       # minor is mainline (odd), so a line move is made by hand.
       - dependency-name: "nginx"
