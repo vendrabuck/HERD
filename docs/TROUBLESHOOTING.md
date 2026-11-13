@@ -85,7 +85,7 @@ Remedy: run `make certs`, then recreate Traefik so it loads the files: `docker c
 Either:
 - The `AUTH_SECRET_KEY` changed after tokens were issued. Access tokens signed with the old key are refused everywhere, but refresh tokens do not depend on the key, so the client's silent refresh normally recovers on its own; a user needs to log in again only when the refresh fails too. See [SECURITY.md](../SECURITY.md) for ending sessions after a rotation.
 - Clock skew between the auth service (which signs the token) and another backend service (which verifies it) is more than 10 seconds: every service accepts a token up to 10 seconds past its expiry and refuses one issued more than 10 seconds in its future.
-- The bearer token expired (30 min default). The auth client should refresh automatically; if it's stuck, clear local storage and log in fresh.
+- The bearer token expired (30 min default). The auth client refreshes it automatically, and every open tab shares the refreshed session (issue #1316); when the refresh itself is refused, the client signs the user out and the sign-in page returns them, with the same account, to the page that needed it.
 
 ### LDAP login fails immediately
 
@@ -316,8 +316,9 @@ oversized binaries), or, for the three settings, raise them in `.env` and run `m
 new environment, or raise them in the config UI and click **Save and Restart** (the
 settings are listed in [ENV_VARS.md](ENV_VARS.md)). `make restart` does not pick up a `.env`
 edit: `docker compose restart` keeps each container's creation-time environment. A raised `UPLOAD_MAX_FILE_BYTES` does not lift the fixed tgz
-ceilings. The PDF reader has no
-memory bound of its own yet (issue #1202).
+ceilings. The PDF reader's limits (memory, CPU, wall time, and how many PDFs are read at
+once) are fixed too, and its 400, 500, and 503 refusals are listed in
+[AI_GENERATE.md](AI_GENERATE.md) (issue #1202).
 
 ## Drivers and execution
 
@@ -703,8 +704,8 @@ Symptom: `docker compose logs notifications` shows `sqlalchemy.exc.DBAPIError ..
 Root cause: the postgres init script (`infra/postgres/init.sql`) didn't pre-create the `notifications` schema for older checkouts. Pull the latest `init.sql`, or patch the running database:
 
 ```bash
-docker compose exec postgres psql -U herd -d herd -c \
-  "CREATE SCHEMA IF NOT EXISTS notifications; GRANT ALL PRIVILEGES ON SCHEMA notifications TO herd;"
+docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
+  "CREATE SCHEMA IF NOT EXISTS notifications;"
 docker compose restart notifications
 ```
 

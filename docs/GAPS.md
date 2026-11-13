@@ -3,7 +3,7 @@
 Tracking doc for test coverage not yet implemented. Shipped work lives under
 the usual service test directories; this file is the backlog.
 
-Last audit: 2026-05-04, refreshed 2026-09-09. When you close a gap, delete the
+Last audit: 2026-05-04, refreshed 2026-11-13. When you close a gap, delete the
 entry. When a new one surfaces, add it with a severity tag (CRITICAL, HIGH,
 MEDIUM, LOW) and a concrete target file path.
 
@@ -90,7 +90,9 @@ what a test would still need to cover:
   initial render, but the save-and-restart flow (compose-project self-check plus
   restart confirmation) is untested.
 - [LOW] `frontend/src/App.tsx`: `src/test/App.test.tsx` (issue #942) now mounts it
-  and pins the `Toaster` placement; router wiring and the `ErrorBoundary` are still
+  and pins the `Toaster` placement. `ErrorBoundary` and the per-route
+  `RouteErrorBoundary` (issue #1344) have suites of their own, and `routes.test.tsx`
+  walks the route table without rendering it; the rendered router wiring is still
   exercised only indirectly through page tests that render individual routed
   components.
 - [LOW] Device-config panels: `frontend/src/components/device-config/DeviceConfigSection.tsx`
@@ -148,11 +150,13 @@ clients have a suite but stay below 85% lines on error and edge-case branches:
 
 - All four stores under `frontend/src/stores/` (`authStore`, `configStore`,
   `preferencesStore`, `topologyStore`) now carry tests; no gap.
-- `frontend/src/hooks/` does not exist; no gap.
+- The four hooks under `frontend/src/hooks/` carry tests: `useForkAutosave`,
+  `useForkVersionPreview`, and `usePurposeSuggestion` in `frontend/src/test/hooks/`,
+  and `useRouteTitle` (issue #1317) through `AppLayout.test.tsx`; no gap.
 
 ## E2E
 
-`tests/e2e/` has 68 test files and 206 tests across Selenium and Playwright (collected on main on 2026-11-08; the v0.7.0 release gate ran 206: 148 passed and 58 skipped unseeded, 202 passed and 4 exempt skips seeded; see README.md's Testing section). Remaining UI gaps:
+`tests/e2e/` has 71 test files and 221 tests across Selenium and Playwright (the 2026-11-12 nightly collected 221 unseeded: 157 passed, 63 skipped, 1 failed; the v0.7.0 release gate ran 206: 148 passed and 58 skipped unseeded, 202 passed and 4 exempt skips seeded; see README.md's Testing section). Remaining UI gaps:
 
 - [HIGH] AI Generate generate-to-commit flow. `tests/e2e/test_ai_generate_dialog.py`
   covers opening the dialog, the empty-prompt disabled state, and escape-to-close,

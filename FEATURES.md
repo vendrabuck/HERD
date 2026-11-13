@@ -17,7 +17,7 @@ one per area; all ten areas are written.
 
 ## Identity and access
 
-- **Local authentication** (Shipped): username and password auth with bcrypt-hashed
+- **Local authentication** (Shipped): email and password sign-in with bcrypt-hashed
   passwords and JWT issuance with refresh-token rotation.
 - **LDAP / Active Directory authentication** (Shipped): pluggable via `AUTH_METHOD=ldap`.
   Users JIT-provision on first successful bind. The seeded superadmin account stays
@@ -472,7 +472,9 @@ one per area; all ten areas are written.
   the release tags (`git describe`), so it needs no counter to maintain. (Issue #846.)
 - **In-app help link** (Shipped, issue #960): the `?` icon in the header, beside the
   notification bell, opens the published user manual at
-  <https://vendrabuck.github.io/HERD/manual/> in a new tab.
+  <https://vendrabuck.github.io/HERD/manual/> in a new tab. Every manual page has a
+  search box in its header that searches the whole manual from a prebuilt index
+  (issue #1298).
 - **Config service** (Shipped): zero-database web UI for configuring HERD on first
   start. Values saved through the UI take precedence over `.env`; an auto-bootstrapped
   config file stays subordinate, so pure-`.env` setups behave unchanged.
