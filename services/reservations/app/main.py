@@ -57,8 +57,11 @@ async def lifespan(app: FastAPI):
         # for the life of the process: the outbox relay publishes nothing and
         # events wait in the outbox until a restart with the broker reachable.
         # A connect that succeeded but whose stream ensure failed keeps the
-        # connection: the relay publishes, each publish fails while the stream is
-        # missing, and the rows stay in the outbox and are retried every tick.
+        # connection, and the relay publishes. The ensure fails on a create of a
+        # missing stream or on an update of an existing one (execution may have
+        # created it): with the stream there, publishes succeed at once; while it
+        # is missing, each publish fails and its row stays in the outbox and is
+        # retried every tick.
         if app.state.nats is None:
             logger.warning(
                 "NATS unavailable at %s; events wait in the outbox until the service "
@@ -67,9 +70,10 @@ async def lifespan(app: FastAPI):
             )
         else:
             logger.warning(
-                "JetStream stream HERD_RESERVATIONS could not be ensured at %s; events "
-                "wait in the outbox and the relay retries them every tick until the "
-                "stream exists",
+                "JetStream stream HERD_RESERVATIONS could not be created or updated at "
+                "%s; the connection is kept, so events publish if the stream exists, "
+                "and while it is missing they wait in the outbox and the relay retries "
+                "them every tick",
                 settings.nats_url,
             )
 

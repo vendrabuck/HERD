@@ -39,8 +39,12 @@ async def _ensure_health_stream(app: FastAPI) -> None:
     Idempotent: ensure_stream creates the stream if it does not exist, or
     updates it in place if it exists with a different configuration (e.g. a
     changed max_age on an upgraded-in-place stack); a matching existing
-    config is a no-op. Non-fatal if NATS is down so the service still boots;
-    the health scheduler simply drops publish attempts in that case.
+    config is a no-op. Non-fatal so the service still boots: with no NATS
+    connection it returns at once, and a failed ensure is logged. The health
+    scheduler never publishes; it stages transition events in the outbox, and
+    they wait there unpublished while the relay has no connection, or are
+    retried every relay tick while a publish fails (for example while the
+    stream is missing).
     """
     nc = getattr(app.state, "nats", None)
     if nc is None:

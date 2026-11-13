@@ -133,7 +133,7 @@ async def test_lifespan_starts_without_nats_using_the_real_client(monkeypatch, c
         "service is restarted with the broker reachable"
     ) in caplog.text
     assert "skipped" not in caplog.text
-    assert "could not be ensured" not in caplog.text
+    assert "could not be created or updated" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -141,9 +141,9 @@ async def test_lifespan_names_a_failed_stream_ensure_apart_from_a_failed_connect
     monkeypatch, caplog
 ):
     """Issue #1337: when the connect succeeds but ensuring HERD_RESERVATIONS fails,
-    the connection is kept (the relay publishes, and its failed publishes leave the
-    rows in the outbox for the next tick), so the warning must not say the broker
-    is unavailable or that a restart is needed."""
+    the connection is kept and the relay publishes: at once if the stream exists
+    (an update failed), every tick while it is missing (a create failed). The
+    warning must not say the broker is unavailable or that a restart is needed."""
     from app.main import lifespan
 
     monkeypatch.setattr(settings, "nats_url", "nats://broker:4222")
@@ -170,9 +170,10 @@ async def test_lifespan_names_a_failed_stream_ensure_apart_from_a_failed_connect
         await asyncio.wait_for(_run(), timeout=10)
 
     assert (
-        "JetStream stream HERD_RESERVATIONS could not be ensured at nats://broker:4222; "
-        "events wait in the outbox and the relay retries them every tick until the "
-        "stream exists"
+        "JetStream stream HERD_RESERVATIONS could not be created or updated at "
+        "nats://broker:4222; the connection is kept, so events publish if the stream "
+        "exists, and while it is missing they wait in the outbox and the relay retries "
+        "them every tick"
     ) in caplog.text
     assert "NATS unavailable" not in caplog.text
     assert "restarted" not in caplog.text
