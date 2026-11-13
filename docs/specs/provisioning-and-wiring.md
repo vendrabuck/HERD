@@ -584,10 +584,19 @@ state transitions are WIRE-ORDER-1 and WIRE-FREEZE-1.
   allocation's deletes and is not re-raised (WIRE-VLAN-12). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_device`, `_fetch_template`, `_inventory_record_or_none`) \
   Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_returns_the_body_on_200`, `test_inventory_read_returns_none_only_on_404`, `test_inventory_read_raises_transient_on_every_other_status`, `test_inventory_read_raises_transient_on_a_malformed_200_body`, `test_inventory_read_raises_transient_on_transport_error`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_inventory_auth_error_naks_and_never_pins`); `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_inventory_auth_error_on_switch_read_raises_and_pins_nothing`)
-- **WIRE-ORDER-12.** Within one event each device and each switch's latest config is
-  fetched at most once. \
+- **WIRE-ORDER-12.** Within one fetch context each device, each switch's latest config,
+  and each template read through it is requested at most once, whether the read
+  answered or failed. A context lives for one reservation event, or for one layer's
+  pass of one retry tick or manual retry. A read that raised `TransientUpstreamError` is
+  remembered as failed (#1358): every later read of the same record in that context
+  raises a new error of the same class with the same arguments and makes no request, so
+  an inventory outage costs one read timeout per record per context. In a retry pass
+  that covers several reservations, a switch whose read failed for one reservation is
+  not read again for another in that pass. Nothing is remembered across contexts: a
+  redelivered event, the next tick, or the next manual retry reads again. Any other
+  exception is not remembered. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_FetchContext`) \
-  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_fetch_context_memoizes_device_and_config_fetches`)
+  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_fetch_context_memoizes_device_and_config_fetches`, `test_fetch_context_remembers_a_failed_read_for_the_context_only`, `test_fetch_context_does_not_remember_other_exceptions`); `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_release_pass_reads_a_failed_switch_once_however_many_allocations`, `test_next_release_pass_reads_the_failed_switch_again`)
 - **WIRE-ORDER-13.** A device removed from an ACTIVE reservation reaches execution as a
   `wiring_changed` whose `released` holds cabling's pruned hops and whose `built` is
   empty (RES-FORK-16); it is applied like any other event, so the removed device's
@@ -812,14 +821,18 @@ WIRE-VLAN-4.
   logged with the action `vlan_delete_upstream_failed` carrying `error_class` (the
   exception's class name, never its text), `vlan_assignment_id`, `reservation_id`,
   `vlan_id`, and `switch_ids` (the switches left listed by this failure), and the pass
-  continues with the next allocation without raising. So the reconcile still stamps its
+  continues with the next allocation without raising. The failed read is not repeated
+  in the pass (WIRE-ORDER-12, #1358): each later allocation defined on that switch, or on
+  a switch with the same template, is stopped at once with its own
+  `vlan_delete_upstream_failed` line, so an outage costs one read timeout per switch per
+  pass, not one per allocation. So the reconcile still stamps its
   version, the terminal teardown goes on to L3, and both retry channels report their
   outcomes. By decision (#1209) HERD fails open here: the allocation is released rather
   than kept `ACTIVE`, the definition left on those switches is never re-driven, and
   leaving a switch in a known-good state is the L2 driver's responsibility for its
   network ([DRIVERS.md](../DRIVERS.md)). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_release_orphaned_allocations`, `_run_vlan_definition_op`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_release_upstream_failure_skips_only_that_allocation`, `test_release_upstream_failure_on_a_later_switch_keeps_what_is_not_proven_deleted`, `test_reconcile_release_tail_upstream_failure_still_stamps_the_version`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_release_tail_upstream_failure_releases_every_other_allocation`); `services/execution/tests/test_wiring_retry_upstream_isolation.py` (`test_l2_superseded_allocation_release_failure_keeps_the_outcomes`, `test_manual_retry_superseded_release_switch_read_failure_reports_the_outcome`, `test_l2_apply_tail_delete_read_failure_is_not_a_reservation_skip`)
+  Pinned by: `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_release_upstream_failure_skips_only_that_allocation`, `test_release_upstream_failure_on_a_later_switch_keeps_what_is_not_proven_deleted`, `test_reconcile_release_tail_upstream_failure_still_stamps_the_version`, `test_release_pass_reads_a_failed_switch_once_however_many_allocations`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_release_tail_upstream_failure_releases_every_other_allocation`); `services/execution/tests/test_wiring_retry_upstream_isolation.py` (`test_l2_superseded_allocation_release_failure_keeps_the_outcomes`, `test_manual_retry_superseded_release_switch_read_failure_reports_the_outcome`, `test_l2_apply_tail_delete_read_failure_is_not_a_reservation_skip`)
 - **WIRE-VLAN-13.** Only `TransientUpstreamError` is caught that way: any other
   exception from the switch read of an allocation's delete propagates out of the pass,
   that allocation stays released with its switches listed, and the allocations after it

@@ -728,28 +728,54 @@ class _FetchContext:
     (404), so a missing far end or config is classified at most once per
     event. The client is owned by the caller (handle_reservation_event); these
     helpers never close it.
+
+    A FAILED read is remembered too (issue #1358): a device, latest-config, or
+    template read that raised TransientUpstreamError is not attempted again through
+    this context, and every later read of the same record raises a new error of the
+    same class with the same arguments at once. Without this, a release pass that
+    isolates a failed switch read per allocation paid one inventory timeout per
+    allocation on that switch while inventory was down. The memory lives exactly as
+    long as the context (one reservation event, or one retry pass of one layer), never
+    longer, so a recovered inventory is read again by the next event or tick. Any
+    other exception is not remembered.
     """
 
     def __init__(self, client):
         self._client = client
         self._device_cache: dict[str, dict | None] = {}
         self._config_cache: dict[str, dict | None] = {}
+        self._template_cache: dict[str, dict | None] = {}
+        self._failed_reads: dict[tuple[str, str], TransientUpstreamError] = {}
 
     @property
     def client(self):
         return self._client
 
+    async def _read_once(self, kind: str, key: str, cache: dict, fetch) -> dict | None:
+        """Return cache[key], fetching it on the first call only, success or failure."""
+        if key in cache:
+            return cache[key]
+        failed = self._failed_reads.get((kind, key))
+        if failed is not None:
+            raise type(failed)(*failed.args)
+        try:
+            cache[key] = await fetch(key, self._client)
+        except TransientUpstreamError as exc:
+            self._failed_reads[(kind, key)] = exc
+            raise
+        return cache[key]
+
     async def get_device(self, device_id: str) -> dict | None:
         """Return a far-end device, classifying it at most once per event."""
-        if device_id not in self._device_cache:
-            self._device_cache[device_id] = await _fetch_device(device_id, self._client)
-        return self._device_cache[device_id]
+        return await self._read_once("device", device_id, self._device_cache, _fetch_device)
 
     async def get_latest_config(self, device_id: str) -> dict | None:
         """Return a device's latest config version, fetching at most once per event."""
-        if device_id not in self._config_cache:
-            self._config_cache[device_id] = await _fetch_latest_config(device_id, self._client)
-        return self._config_cache[device_id]
+        return await self._read_once("config", device_id, self._config_cache, _fetch_latest_config)
+
+    async def get_template(self, template_id: str) -> dict | None:
+        """Return a switch template, fetching it at most once per event."""
+        return await self._read_once("template", template_id, self._template_cache, _fetch_template)
 
 
 def _route_run_identity(destination, next_hop, interface, virtual_router=None) -> tuple[str, str]:
@@ -2705,9 +2731,7 @@ async def _run_vlan_definition_op(
     switch_uuid = uuid.UUID(switch_id)
     switch_data = await ctx.get_device(switch_id)
     template_data = (
-        await _fetch_template(switch_data.get("template_id", ""), ctx.client)
-        if switch_data
-        else None
+        await ctx.get_template(switch_data.get("template_id", "")) if switch_data else None
     )
     if switch_data is None:
         return False, 0, f"{WIRING_UNRESOLVABLE_REASON}: L2 switch {switch_id} not found"
@@ -3034,7 +3058,11 @@ async def _release_orphaned_allocations(
         name only (its text can carry upstream detail), and the pass continues with the
         next allocation. The error is not re-raised for the same reasons as the
         unjudged case; nothing re-drives these deletes (a limit by decision, like the
-        unjudged skip).
+        unjudged skip). The failed read is remembered by `ctx` for the rest of the
+        pass (issue #1358), so a later allocation defined on the same switch (or one
+        sharing its template) is stopped at once with its own line and no second
+        inventory request: an outage costs one read timeout per switch per pass, not
+        one per allocation.
 
     Any other exception (a database error from a session, a commit, or an execution run
     write; an inventory record missing a field the driver load needs) is not caught

@@ -840,6 +840,131 @@ async def test_release_does_not_catch_an_exception_other_than_transient_upstream
     assert (rows[second].status, rows[second].defined_switch_ids) == ("ACTIVE", [SW_L2_B])
 
 
+# --- a failed switch read is read once per pass (issue #1358) ---
+
+
+class _CountingInventory:
+    """Inventory reads that count every request. While `down` holds a switch id, that
+    switch's `read` ("device" or "template") raises TransientUpstreamError carrying
+    UPSTREAM_TEXT; set `down` to an empty set to model a recovered inventory."""
+
+    def __init__(self, down: set[str], read: str):
+        self.down = set(down)
+        self.read = read
+        self.device_reads: list[str] = []
+        self.template_reads: list[str] = []
+
+    async def device(self, device_id, client=None):
+        self.device_reads.append(str(device_id))
+        if self.read == "device":
+            if str(device_id) in self.down:
+                raise TransientUpstreamError(UPSTREAM_TEXT)
+            return DEVICES.get(str(device_id))
+        # Template mode: every switch has its own template, so reads count per switch.
+        return {**DEVICES[str(device_id)], "template_id": f"tmpl-{device_id}"}
+
+    async def template(self, template_id, client=None):
+        self.template_reads.append(template_id)
+        if template_id.startswith("tmpl-") and template_id[5:] in self.down:
+            raise TransientUpstreamError(UPSTREAM_TEXT)
+        return TEMPLATE_DATA
+
+    def reads_of(self, switch_id: str) -> int:
+        if self.read == "device":
+            return self.device_reads.count(switch_id)
+        return self.template_reads.count(f"tmpl-{switch_id}")
+
+
+async def _release_pass(va_ids, inventory: _CountingInventory):
+    """One release pass (one fresh _FetchContext) over `va_ids` in the order given."""
+    execute_fn, calls = _recorder()
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                "app.services.nats_consumer._fetch_device",
+                new=AsyncMock(side_effect=inventory.device),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "app.services.nats_consumer._fetch_template",
+                new=AsyncMock(side_effect=inventory.template),
+            )
+        )
+        stack.enter_context(
+            patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/d"))
+        )
+        stack.enter_context(
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn)
+        )
+        stack.enter_context(
+            patch(
+                "app.services.vlan_service.fetch_fabric_id",
+                new=AsyncMock(side_effect=AssertionError("cabling must not be asked")),
+            )
+        )
+        await _release_orphaned_allocations(
+            list(va_ids), _db_session_factory(), _FetchContext(None)
+        )
+    return calls
+
+
+@pytest.mark.parametrize("read", ["device", "template"])
+@pytest.mark.parametrize("n", [1, 3, 6])
+async def test_release_pass_reads_a_failed_switch_once_however_many_allocations(n, read, caplog):
+    """n orphaned allocations defined on SW_MID, whose switch (or template) read fails,
+    with an allocation on the healthy SW_L2_B placed in the middle of the pass. SW_MID
+    is requested exactly once in the pass whatever n is; each of its allocations is
+    still released with SW_MID listed and gets its own vlan_delete_upstream_failed line
+    (class name only); SW_L2_B is read, its delete runs, and it is trimmed."""
+    on_mid = [
+        await _seed_allocation(RES_ID, uuid.uuid4(), 100 + i, [SW_MID], [SW_MID]) for i in range(n)
+    ]
+    healthy = await _seed_allocation(RES_ID, uuid.uuid4(), 900, [SW_L2_B], [SW_L2_B])
+    order = on_mid[: n // 2] + [healthy] + on_mid[n // 2 :]
+    inventory = _CountingInventory({SW_MID}, read)
+
+    with caplog.at_level(logging.ERROR, logger="app.services.nats_consumer"):
+        calls = await _release_pass(order, inventory)
+
+    assert inventory.reads_of(SW_MID) == 1, "one request for the failing switch per pass"
+    assert [(c[1], c[3]) for c in calls if c[0] == "delete_vlan"] == [(SW_L2_B, 900)]
+    assert SW_MID not in {c[1] for c in calls}
+    rows = await _allocations_by_id(order)
+    for va_id in on_mid:
+        assert (rows[va_id].status, rows[va_id].defined_switch_ids) == ("RELEASED", [SW_MID])
+    assert (rows[healthy].status, rows[healthy].defined_switch_ids) == ("RELEASED", [])
+    records = _upstream_failed_records(caplog)
+    assert len(records) == n
+    assert sorted(_assert_class_name_only(r)["vlan_assignment_id"] for r in records) == sorted(
+        str(v) for v in on_mid
+    )
+    assert all(_assert_class_name_only(r)["switch_ids"] == [SW_MID] for r in records)
+
+
+@pytest.mark.parametrize("read", ["device", "template"])
+async def test_next_release_pass_reads_the_failed_switch_again(read, caplog):
+    """The memory of a failed read ends with its pass: a later pass (a fresh context)
+    over another allocation on the same switch reads it again, and with inventory
+    recovered its delete runs and the switch is trimmed."""
+    first = [
+        await _seed_allocation(RES_ID, uuid.uuid4(), 100 + i, [SW_MID], [SW_MID]) for i in range(2)
+    ]
+    inventory = _CountingInventory({SW_MID}, read)
+    with caplog.at_level(logging.ERROR, logger="app.services.nats_consumer"):
+        await _release_pass(first, inventory)
+    assert inventory.reads_of(SW_MID) == 1
+
+    later = await _seed_allocation(RES_ID, uuid.uuid4(), 300, [SW_MID], [SW_MID])
+    inventory.down = set()
+    calls = await _release_pass([later], inventory)
+
+    assert inventory.reads_of(SW_MID) == 2, "the next pass made a new request"
+    assert [(c[1], c[3]) for c in calls if c[0] == "delete_vlan"] == [(SW_MID, 300)]
+    row = (await _allocations_by_id([later]))[later]
+    assert (row.status, row.defined_switch_ids) == ("RELEASED", [])
+
+
 # --- idempotency ---
 
 

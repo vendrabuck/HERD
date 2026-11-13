@@ -924,8 +924,9 @@ async def test_fetch_device_raises_on_transport_error():
 async def test_fetch_context_memoizes_device_and_config_fetches():
     """_FetchContext's per-event memoization contract, re-expressed from the retired
     shared-ctx tests: a device (present or 404-None) and a latest-config are fetched at
-    most once per event, and a TransientUpstreamError is NOT cached (a NAK retry should
-    refetch)."""
+    most once per event. A TransientUpstreamError is not cached as a value; since
+    issue #1358 it is remembered as a failure for the life of the context, and a NAK
+    redelivery (a new event, so a fresh context) fetches again."""
     from app.services.nats_consumer import _FetchContext
 
     device = {"id": "dev-1", "connection_type": "Layer 1 Switch"}
@@ -951,10 +952,75 @@ async def test_fetch_context_memoizes_device_and_config_fetches():
         ctx = _FetchContext(None)
         with pytest.raises(TransientUpstreamError):
             await ctx.get_device("dev-3")
-        # The error was not cached as a value: a retry attempts the fetch again.
+        # Remembered for this context (issue #1358): raised again with no new fetch.
         with pytest.raises(TransientUpstreamError):
             await ctx.get_device("dev-3")
+        assert boom.await_count == 1
+        # A NAK redelivery handles a new event with a fresh context: it fetches again.
+        with pytest.raises(TransientUpstreamError):
+            await _FetchContext(None).get_device("dev-3")
         assert boom.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("getter", "fetcher"),
+    [
+        ("get_device", "_fetch_device"),
+        ("get_latest_config", "_fetch_latest_config"),
+        ("get_template", "_fetch_template"),
+    ],
+)
+async def test_fetch_context_remembers_a_failed_read_for_the_context_only(getter, fetcher):
+    """Issue #1358: a read that raised TransientUpstreamError is attempted once per
+    context. Every later read of the same key raises the same class with the same
+    arguments and makes no request; another key is still read; a fresh context (the
+    next event or retry pass) reads the failed key again and caches its answer."""
+    from app.services.nats_consumer import _FetchContext
+
+    record = {"id": "ok"}
+    calls: list[str] = []
+
+    async def _fetch(key, client=None):
+        calls.append(key)
+        if key == "down" and calls.count("down") == 1:
+            raise TransientUpstreamError(f"{fetcher} {key}: upstream 503")
+        return record
+
+    with patch(f"app.services.nats_consumer.{fetcher}", new=AsyncMock(side_effect=_fetch)):
+        ctx = _FetchContext(None)
+        with pytest.raises(TransientUpstreamError) as first:
+            await getattr(ctx, getter)("down")
+        for _ in range(3):
+            with pytest.raises(TransientUpstreamError) as again:
+                await getattr(ctx, getter)("down")
+            assert type(again.value) is type(first.value)
+            assert again.value.args == first.value.args
+            assert again.value is not first.value
+        assert calls == ["down"], "one request for the failed key in this context"
+
+        assert await getattr(ctx, getter)("up") == record
+        assert calls == ["down", "up"], "a failure of one key never blocks another"
+
+        fresh = _FetchContext(None)
+        assert await getattr(fresh, getter)("down") == record
+        assert await getattr(fresh, getter)("down") == record
+        assert calls == ["down", "up", "down"], "no memory across contexts; success cached"
+
+
+@pytest.mark.asyncio
+async def test_fetch_context_does_not_remember_other_exceptions():
+    """Only TransientUpstreamError is remembered: any other exception from a read is
+    not, so the next read of that key makes a request again."""
+    from app.services.nats_consumer import _FetchContext
+
+    fetch = AsyncMock(side_effect=[RuntimeError("not an upstream outage"), {"id": "d"}])
+    with patch("app.services.nats_consumer._fetch_device", new=fetch):
+        ctx = _FetchContext(None)
+        with pytest.raises(RuntimeError):
+            await ctx.get_device("d")
+        assert await ctx.get_device("d") == {"id": "d"}
+    assert fetch.await_count == 2
 
 
 @pytest.mark.asyncio
