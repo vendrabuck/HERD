@@ -5,7 +5,7 @@ description = "HERD Authentication Service"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.162.4",
-    "uvicorn[standard]>=0.30.0",
+    "uvicorn[standard]>=0.54.0",
     "sqlalchemy[asyncio]>=2.1.8",
     "asyncpg>=0.29.0",
     "alembic>=1.13.0",
