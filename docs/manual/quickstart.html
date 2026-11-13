@@ -88,7 +88,7 @@
       <li><b>The wrench (admins only).</b> If HERD has never been configured, an admin uses this to do first-run setup. As a regular user you will never touch it &mdash; ignore it.</li>
       <li><b>Email.</b> Your work email, <em>or</em> your directory username if your company wired HERD to its login system. If unsure, try email first.</li>
       <li><b>Sign in.</b> Already have an account? Type your details and click here. Done.</li>
-      <li><b>Register.</b> No account yet? Click here first. (Unless it's greyed out &mdash; see below.)</li>
+      <li><b>Register.</b> No account yet? Click here first. (If your company signs you in through its directory, you don't need it; see below.)</li>
     </ol>
     <p>The small grey <code>v0.7.0</code> beside the title is the version of HERD this deployment runs. The same version shows beside the HERD wordmark in the header once you are in; the build and build date are on the admin <a href="admin-setup.html#about">About page</a>.</p>
 
@@ -104,8 +104,8 @@
         <p>If your company uses LDAP / Active Directory, type your <strong>directory username</strong> (not necessarily your email) and your normal corporate password. HERD doesn't store that password &mdash; it checks it against the directory.</p>
       </div></div>
       <div class="stepblock"><div class="stepbody">
-        <h3 class="step">You land on the Reservations page</h3>
-        <p>That's home base. If it's empty, that's normal &mdash; <a href="#empty">jump to the empty-screen section</a>.</p>
+        <h3 class="step">You land on the Topology page</h3>
+        <p>That's the Topologies list, unless you were sent to sign in from another page; then you go back to that page. If it's empty, that's normal &mdash; <a href="#empty">jump to the empty-screen section</a>.</p>
       </div></div>
     </div>
 
@@ -119,9 +119,9 @@
     <p>Click <b>Register</b> on the sign-in card. You'll get a short form; submit it and you're issued the default <code>user</code> role. That's enough to browse and reserve &mdash; admin powers are granted separately by a superadmin. The form asks for Email, Username, <b>Name</b>, and Password; Name is "Shown to other users. Defaults to your username.", so it is prefilled from the username until you type there.</p>
 
     <div class="accordion">
-      <summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">The Register button is greyed out</span><span class="hint">LDAP / AD shops</span></summary>
+      <summary><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg><span class="lbl">Registering says local registration is disabled</span><span class="hint">LDAP / AD shops</span></summary>
       <div class="acc-body">
-        <p>If your company connected HERD to its corporate directory, self-registration is turned off on purpose. You don't need it: your HERD account is created <strong>automatically the first time you log in</strong> with your directory credentials. Just sign in &mdash; the account appears behind the scenes.</p>
+        <p>If your company connected HERD to its corporate directory, self-registration is turned off on purpose: the Register form still opens, but submitting it answers <code>Local registration is disabled; this deployment uses LDAP authentication.</code> You don't need it: your HERD account is created <strong>automatically the first time you log in</strong> with your directory credentials. Just sign in &mdash; the account appears behind the scenes.</p>
       </div>
     </div>
 

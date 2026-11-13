@@ -6,7 +6,7 @@ Operational playbook for administrators. For the permission matrix, see [ROLES.m
 
 | Task | User | Admin | Superadmin |
 |---|:---:|:---:|:---:|
-| Register, log in, change own password | yes | yes | yes |
+| Register, log in, edit own profile | yes | yes | yes |
 | Browse inventory (within visibility) | yes | yes | yes |
 | Create/cancel own reservations | yes | yes | yes |
 | List every user's reservations (`GET /reservations/?all=true`) | - | yes | yes |

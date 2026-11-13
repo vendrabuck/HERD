@@ -17,7 +17,7 @@ Please do **not** open a public issue for suspected security vulnerabilities.
 
 Use GitHub's private vulnerability reporting (the "Report a vulnerability" button under the repository's Security tab) to send a description of the issue and reproduction steps to the maintainer privately. If that is unavailable, open a GitHub issue titled "Security contact request" (no details) and the maintainer will reach out privately to take the report off the public tracker.
 
-You can expect an acknowledgment within one week. We aim to triage and provide an initial assessment within two weeks. Accepted issues will be patched on `main`; a write-up is published after the fix ships. Published advisories are listed at <https://github.com/vendrabuck/HERD/security/advisories>; three were published with v0.6.0.
+You can expect an acknowledgment within one week. We aim to triage and provide an initial assessment within two weeks. Accepted issues will be patched on `main`; a write-up is published after the fix ships. Published advisories are listed at <https://github.com/vendrabuck/HERD/security/advisories>; five are published: three with v0.6.0, and two for issues fixed in v0.7.0, published on 2026-11-11.
 
 ## What counts as a security issue
 
