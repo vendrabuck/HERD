@@ -488,7 +488,7 @@ schema and never appear in `config.json` or the config editor.
 | Variable | Default | Set by | Purpose |
 |---|---|---|---|
 | `HERD_BUILD` | `dev` | Makefile, computed unless already set | `git describe --tags --always --dirty` run against the checkout. The tag alone at a tagged release commit (`v0.5.0`); otherwise `vX.Y.Z-N-g<hash>` counting commits since the last tag; a bare short hash when no tag is reachable (a shallow clone with no tags fetched, the default for `actions/checkout` in `ci.yml` and `nightly.yml`); a `-dirty` suffix when the working tree has uncommitted changes. |
-| `HERD_BUILD_DATE` | (empty) | Makefile, computed unless already set | The HEAD commit date, normalized to UTC ISO 8601 (`TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd`). Deliberately the commit date, not the wall clock at build time: a wall-clock value changes on every `make up`, which would change every image ID and recreate all 13 containers on every start, while the commit date is stable for a given commit and reproducible. |
+| `HERD_BUILD_DATE` | (empty) | Makefile, computed unless already set | The HEAD commit date, normalized to UTC ISO 8601 (`TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd`). Deliberately the commit date, not the wall clock at build time: a wall-clock value changes on every `make up`, which would change every image ID and recreate all 14 containers HERD builds (the twelve services, the restarter, and the frontend) on every start, while the commit date is stable for a given commit and reproducible. |
 
 Both variables degrade without error when git is missing or the checkout is not a
 repository: `HERD_BUILD` falls back to the literal `dev` and `HERD_BUILD_DATE` to an

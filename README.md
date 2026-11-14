@@ -540,7 +540,7 @@ make test-load-ui        # Locust with web UI
 ## CI (GitHub Actions)
 
 Four jobs run on push/PR to main, plus a scheduled nightly workflow:
-- **backend**: lockfile drift check (uv lock --check), install deps (uv sync), lint (ruff check), format check (ruff format --check), test all 13 services (pytest), coverage report
+- **backend**: lockfile drift check (uv lock --check), install deps (uv sync), lint (ruff check), format check (ruff format --check), test the 13 backend suites, the repo-root guards, and the restarter (pytest), coverage report
 - **frontend**: install deps (npm ci), lint (eslint), test (vitest, run twice: under the runner's UTC clock and under `TZ=America/Los_Angeles`), build (vite)
 - **integration** (advisory): boots the full ephemeral stack and runs the contract and integration suites
 - **nos-dialect** (advisory): boots the checked-in emulated-gear lab (a real Nokia SR Linux node and a real FRRouting node, `infra/nos-test/`) and runs the four driver-dialect suites against them; no HERD stack involved
