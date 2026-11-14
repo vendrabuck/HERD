@@ -328,7 +328,7 @@ async def test_device_groups_for_device_non_admin_visible_returns_group_data():
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
             device_id, group_id, user_group_id = await _seed_grouped_device(ac)
             ug_names.return_value = {uuid.UUID(user_group_id): "Network Engineers"}
-            with patch("app.routers.device_groups._fetch_user_group_names", new=ug_names):
+            with patch("app.services.auth_groups.fetch_user_group_names", new=ug_names):
                 admin_resp = await ac.get(f"/device-groups/device/{device_id}")
         assert admin_resp.status_code == 200
         assert len(admin_resp.json()) == 1
@@ -341,7 +341,7 @@ async def test_device_groups_for_device_non_admin_visible_returns_group_data():
                 "app.services.device_visibility._resolve_visible_device_ids",
                 new=AsyncMock(return_value={uuid.UUID(device_id)}),
             ),
-            patch("app.routers.device_groups._fetch_user_group_names", new=ug_names),
+            patch("app.services.auth_groups.fetch_user_group_names", new=ug_names),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
                 user_resp = await ac.get(f"/device-groups/device/{device_id}")

@@ -537,7 +537,7 @@ async def test_new_device_auto_assigned_to_no_pool(client):
 
 @pytest.mark.asyncio
 @patch(
-    "app.routers.device_groups._fetch_user_group_ids",
+    "app.services.auth_groups.fetch_user_group_ids",
     new_callable=AsyncMock,
 )
 async def test_visible_devices_returns_ids(mock_fetch, client):
@@ -565,7 +565,7 @@ async def test_visible_devices_returns_ids(mock_fetch, client):
 
 @pytest.mark.asyncio
 @patch(
-    "app.routers.device_groups._fetch_user_group_ids",
+    "app.services.auth_groups.fetch_user_group_ids",
     new_callable=AsyncMock,
 )
 async def test_visible_devices_no_permissions(mock_fetch, client):
@@ -580,7 +580,7 @@ async def test_visible_devices_no_permissions(mock_fetch, client):
 
 @pytest.mark.asyncio
 @patch(
-    "app.routers.device_groups._fetch_user_group_ids",
+    "app.services.auth_groups.fetch_user_group_ids",
     new_callable=AsyncMock,
 )
 async def test_visible_devices_auth_failure_returns_empty(mock_fetch, client):
@@ -609,7 +609,7 @@ async def test_visible_devices_requires_auth():
 
 @pytest.mark.asyncio
 @patch(
-    "app.routers.device_groups._fetch_user_group_ids",
+    "app.services.auth_groups.fetch_user_group_ids",
     new_callable=AsyncMock,
 )
 async def test_visible_devices_foreign_user_forbidden_for_user_role(mock_fetch, user_client):
@@ -624,7 +624,7 @@ async def test_visible_devices_foreign_user_forbidden_for_user_role(mock_fetch, 
 
 @pytest.mark.asyncio
 @patch(
-    "app.routers.device_groups._fetch_user_group_ids",
+    "app.services.auth_groups.fetch_user_group_ids",
     new_callable=AsyncMock,
 )
 async def test_visible_devices_self_lookup_allowed_for_user_role(mock_fetch, user_client):
@@ -657,7 +657,7 @@ async def test_visible_devices_self_lookup_allowed_for_user_role(mock_fetch, use
 
 @pytest.mark.asyncio
 @patch(
-    "app.routers.device_groups._fetch_user_group_ids",
+    "app.services.auth_groups.fetch_user_group_ids",
     new_callable=AsyncMock,
 )
 async def test_visible_devices_admin_foreign_user_allowed(mock_fetch, client):
@@ -670,7 +670,7 @@ async def test_visible_devices_admin_foreign_user_allowed(mock_fetch, client):
 
 @pytest.mark.asyncio
 @patch(
-    "app.routers.device_groups._fetch_user_group_ids",
+    "app.services.auth_groups.fetch_user_group_ids",
     new_callable=AsyncMock,
 )
 async def test_visible_devices_superadmin_foreign_user_allowed(mock_fetch):
@@ -702,7 +702,7 @@ async def test_fetch_user_group_ids_raises_on_auth_service_5xx():
     """
     from unittest.mock import MagicMock
 
-    from app.routers.device_groups import _fetch_user_group_ids
+    from app.services.auth_groups import fetch_user_group_ids
     from fastapi import HTTPException
 
     mock_resp = MagicMock()
@@ -716,7 +716,7 @@ async def test_fetch_user_group_ids_raises_on_auth_service_5xx():
 
     with patch("herd_common.internal_client.httpx.AsyncClient", return_value=mock_client):
         with pytest.raises(HTTPException) as excinfo:
-            await _fetch_user_group_ids(uuid.uuid4(), "Bearer fake-token")
+            await fetch_user_group_ids(uuid.uuid4(), "Bearer fake-token")
 
     assert excinfo.value.status_code == 503
     assert "500" in excinfo.value.detail
@@ -726,7 +726,7 @@ async def test_fetch_user_group_ids_raises_on_auth_service_5xx():
 async def test_fetch_user_group_ids_raises_on_connection_error():
     """Connection error surfaces as HTTPException(503) (issue #131)."""
     import httpx
-    from app.routers.device_groups import _fetch_user_group_ids
+    from app.services.auth_groups import fetch_user_group_ids
     from fastapi import HTTPException
 
     mock_client = AsyncMock()
@@ -736,7 +736,7 @@ async def test_fetch_user_group_ids_raises_on_connection_error():
 
     with patch("herd_common.internal_client.httpx.AsyncClient", return_value=mock_client):
         with pytest.raises(HTTPException) as excinfo:
-            await _fetch_user_group_ids(uuid.uuid4(), "Bearer fake-token")
+            await fetch_user_group_ids(uuid.uuid4(), "Bearer fake-token")
 
     assert excinfo.value.status_code == 503
     assert "unreachable" in excinfo.value.detail
@@ -747,7 +747,7 @@ async def test_fetch_user_group_names_raises_on_auth_service_5xx():
     """Non-200 from auth service surfaces as HTTPException(503)."""
     from unittest.mock import MagicMock
 
-    from app.routers.device_groups import _fetch_user_group_names
+    from app.services.auth_groups import fetch_user_group_names
     from fastapi import HTTPException
 
     mock_resp = MagicMock()
@@ -761,7 +761,7 @@ async def test_fetch_user_group_names_raises_on_auth_service_5xx():
 
     with patch("herd_common.internal_client.httpx.AsyncClient", return_value=mock_client):
         with pytest.raises(HTTPException) as excinfo:
-            await _fetch_user_group_names([uuid.uuid4()], "Bearer fake-token")
+            await fetch_user_group_names([uuid.uuid4()], "Bearer fake-token")
 
     assert excinfo.value.status_code == 503
 
@@ -769,11 +769,11 @@ async def test_fetch_user_group_names_raises_on_auth_service_5xx():
 @pytest.mark.asyncio
 async def test_fetch_user_group_names_empty_input_returns_empty_map_without_call():
     """Empty user_group_ids list returns {} without contacting auth service."""
-    from app.routers.device_groups import _fetch_user_group_names
+    from app.services.auth_groups import fetch_user_group_names
 
     mock_client = AsyncMock()
     with patch("herd_common.internal_client.httpx.AsyncClient", return_value=mock_client):
-        result = await _fetch_user_group_names([], "Bearer fake-token")
+        result = await fetch_user_group_names([], "Bearer fake-token")
 
     assert result == {}
     mock_client.request.assert_not_called()
@@ -781,7 +781,7 @@ async def test_fetch_user_group_names_empty_input_returns_empty_map_without_call
 
 @pytest.mark.asyncio
 @patch(
-    "app.routers.device_groups._fetch_user_group_ids",
+    "app.services.auth_groups.fetch_user_group_ids",
     new_callable=AsyncMock,
 )
 async def test_visible_devices_endpoint_returns_503_when_auth_service_down(mock_fetch, client):
@@ -795,7 +795,7 @@ async def test_visible_devices_endpoint_returns_503_when_auth_service_down(mock_
 
 @pytest.mark.asyncio
 @patch(
-    "app.routers.device_groups._fetch_user_group_names",
+    "app.services.auth_groups.fetch_user_group_names",
     new_callable=AsyncMock,
 )
 async def test_device_groups_for_device_returns_503_when_auth_service_down(mock_fetch, client):
@@ -847,7 +847,7 @@ async def test_update_device_group_not_found(client):
 
 @pytest.mark.asyncio
 @patch(
-    "app.routers.device_groups._fetch_user_group_names",
+    "app.services.auth_groups.fetch_user_group_names",
     new_callable=AsyncMock,
 )
 async def test_device_groups_for_device_resolves_names(mock_names, client):
@@ -875,12 +875,12 @@ async def test_device_groups_for_device_resolves_names(mock_names, client):
     assert body[0]["user_groups"][0]["user_group_name"] == "Network Engineers"
 
 
-# --- _fetch_user_group_ids / _fetch_user_group_names success branches ---
+# --- fetch_user_group_ids / fetch_user_group_names success branches ---
 
 
 @pytest.mark.asyncio
 async def test_fetch_user_group_ids_success_parses_ids():
-    from app.routers.device_groups import _fetch_user_group_ids
+    from app.services.auth_groups import fetch_user_group_ids
 
     gid = uuid.uuid4()
 
@@ -897,33 +897,33 @@ async def test_fetch_user_group_ids_success_parses_ids():
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
     with patch("herd_common.internal_client.httpx.AsyncClient", return_value=mock_client):
-        ids = await _fetch_user_group_ids(uuid.uuid4(), "Bearer t")
+        ids = await fetch_user_group_ids(uuid.uuid4(), "Bearer t")
     assert ids == [gid]
 
 
 @pytest.mark.asyncio
 async def test_fetch_user_group_ids_missing_authorization_raises_500():
-    from app.routers.device_groups import _fetch_user_group_ids
+    from app.services.auth_groups import fetch_user_group_ids
     from fastapi import HTTPException
 
     with pytest.raises(HTTPException) as exc:
-        await _fetch_user_group_ids(uuid.uuid4(), None)
+        await fetch_user_group_ids(uuid.uuid4(), None)
     assert exc.value.status_code == 500
 
 
 @pytest.mark.asyncio
 async def test_fetch_user_group_names_missing_authorization_raises_500():
-    from app.routers.device_groups import _fetch_user_group_names
+    from app.services.auth_groups import fetch_user_group_names
     from fastapi import HTTPException
 
     with pytest.raises(HTTPException) as exc:
-        await _fetch_user_group_names([uuid.uuid4()], None)
+        await fetch_user_group_names([uuid.uuid4()], None)
     assert exc.value.status_code == 500
 
 
 @pytest.mark.asyncio
 async def test_fetch_user_group_names_success_maps_wanted_ids():
-    from app.routers.device_groups import _fetch_user_group_names
+    from app.services.auth_groups import fetch_user_group_names
 
     wanted = uuid.uuid4()
     other = uuid.uuid4()
@@ -947,14 +947,14 @@ async def test_fetch_user_group_names_success_maps_wanted_ids():
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
     with patch("herd_common.internal_client.httpx.AsyncClient", return_value=mock_client):
-        name_map = await _fetch_user_group_names([wanted], "Bearer t")
+        name_map = await fetch_user_group_names([wanted], "Bearer t")
     assert name_map == {wanted: "Wanted"}
 
 
 @pytest.mark.asyncio
 async def test_fetch_user_group_names_connection_error_raises_503():
     import httpx
-    from app.routers.device_groups import _fetch_user_group_names
+    from app.services.auth_groups import fetch_user_group_names
     from fastapi import HTTPException
 
     mock_client = AsyncMock()
@@ -964,7 +964,7 @@ async def test_fetch_user_group_names_connection_error_raises_503():
 
     with patch("herd_common.internal_client.httpx.AsyncClient", return_value=mock_client):
         with pytest.raises(HTTPException) as exc:
-            await _fetch_user_group_names([uuid.uuid4()], "Bearer t")
+            await fetch_user_group_names([uuid.uuid4()], "Bearer t")
     assert exc.value.status_code == 503
     assert "unreachable" in exc.value.detail
 
@@ -1097,7 +1097,7 @@ def _groups_page(groups: list[tuple[uuid.UUID, str]], total: int):
 async def test_fetch_user_group_names_pages_until_every_wanted_id_is_named():
     """issue #1021: a wanted group on auth's second page used to resolve to a
     null name. The lookup now pages at auth's maximum page size."""
-    from app.routers import device_groups as dg
+    from app.services import auth_groups as ag
 
     first_page = [(uuid.uuid4(), f"g{i}") for i in range(500)]
     late = uuid.uuid4()
@@ -1107,8 +1107,8 @@ async def test_fetch_user_group_names_pages_until_every_wanted_id_is_named():
         _groups_page([(uuid.uuid4(), "other"), (late, "Late Group")], total=502),
     ]
     fake = AsyncMock(side_effect=pages)
-    with patch.object(dg, "call_service", new=fake):
-        name_map = await dg._fetch_user_group_names([early, late], "Bearer t")
+    with patch.object(ag, "call_service", new=fake):
+        name_map = await ag.fetch_user_group_names([early, late], "Bearer t")
 
     assert name_map == {early: "g3", late: "Late Group"}
     assert [c.kwargs["params"] for c in fake.await_args_list] == [
@@ -1119,12 +1119,12 @@ async def test_fetch_user_group_names_pages_until_every_wanted_id_is_named():
 
 @pytest.mark.asyncio
 async def test_fetch_user_group_names_stops_once_every_wanted_id_is_named():
-    from app.routers import device_groups as dg
+    from app.services import auth_groups as ag
 
     first_page = [(uuid.uuid4(), f"g{i}") for i in range(500)]
     fake = AsyncMock(return_value=_groups_page(first_page, total=5000))
-    with patch.object(dg, "call_service", new=fake):
-        name_map = await dg._fetch_user_group_names([first_page[0][0]], "Bearer t")
+    with patch.object(ag, "call_service", new=fake):
+        name_map = await ag.fetch_user_group_names([first_page[0][0]], "Bearer t")
     assert name_map == {first_page[0][0]: "g0"}
     assert fake.await_count == 1
 
@@ -1133,13 +1133,13 @@ async def test_fetch_user_group_names_stops_once_every_wanted_id_is_named():
 async def test_fetch_user_group_names_unknown_id_stops_at_end_of_list_with_no_name():
     """A deleted user group is absent from every page: the lookup reads to the
     end of the list and returns no name for it, never looping."""
-    from app.routers import device_groups as dg
+    from app.services import auth_groups as ag
 
     first_page = [(uuid.uuid4(), f"g{i}") for i in range(500)]
     pages = [_groups_page(first_page, total=500), _groups_page([], total=500)]
     fake = AsyncMock(side_effect=pages)
-    with patch.object(dg, "call_service", new=fake):
-        name_map = await dg._fetch_user_group_names([uuid.uuid4()], "Bearer t")
+    with patch.object(ag, "call_service", new=fake):
+        name_map = await ag.fetch_user_group_names([uuid.uuid4()], "Bearer t")
     assert name_map == {}
     assert fake.await_count == 1
 
@@ -1147,14 +1147,14 @@ async def test_fetch_user_group_names_unknown_id_stops_at_end_of_list_with_no_na
 @pytest.mark.asyncio
 async def test_fetch_user_group_names_second_page_failure_is_503():
     import httpx
-    from app.routers import device_groups as dg
+    from app.services import auth_groups as ag
     from fastapi import HTTPException
 
     first_page = [(uuid.uuid4(), f"g{i}") for i in range(500)]
     pages = [_groups_page(first_page, total=900), httpx.Response(502, text="bad gateway")]
     fake = AsyncMock(side_effect=pages)
-    with patch.object(dg, "call_service", new=fake):
+    with patch.object(ag, "call_service", new=fake):
         with pytest.raises(HTTPException) as exc:
-            await dg._fetch_user_group_names([uuid.uuid4()], "Bearer t")
+            await ag.fetch_user_group_names([uuid.uuid4()], "Bearer t")
     assert exc.value.status_code == 503
     assert exc.value.detail == "auth service returned 502 when fetching group names"
