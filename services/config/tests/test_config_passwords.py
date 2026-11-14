@@ -171,3 +171,133 @@ def test_an_operator_password_over_72_bytes_seeds_and_verifies(monkeypatch):
     assert verify_password(long_password[:71]) is False
     change_password("short-pass-1")
     assert verify_password(long_password) is False
+
+
+# -- The unusable-file ERROR is about the stored side only ----------------------------
+
+# Raw JSON bodies, so an escape such as a lone surrogate reaches the route as the
+# client wrote it. Every one is a string the route accepts.
+_HOSTILE_STRING_BODIES = {
+    "lone_surrogate": b'{"password": "\\ud800"}',
+    "lone_low_surrogate": b'{"password": "ab\\udfffcd"}',
+    "surrogate_after_byte_72": b'{"password": "' + b"a" * 80 + b'\\ud800"}',
+    "nul": b'{"password": "\\u0000"}',
+    "nul_inside": b'{"password": "test-config\\u0000pass"}',
+    "empty": b'{"password": ""}',
+    "over_long": b'{"password": "' + b"q" * 100_000 + b'"}',
+    "bcrypt_hash_as_password": b'{"password": "$2b$04$abcdefghijklmnopqrstuuabcdefghijklmnopqrstuvwxyz01234"}',
+}
+# Bodies the schema refuses before the password is checked.
+_HOSTILE_NON_STRING_BODIES = {
+    "null": b'{"password": null}',
+    "number": b'{"password": 12345}',
+    "list": b'{"password": ["test-config-pass"]}',
+    "object": b'{"password": {"a": 1}}',
+}
+
+
+def _unusable_records(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if config_store.UNUSABLE_HASH_MESSAGE in r.getMessage()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", _HOSTILE_STRING_BODIES.values(), ids=_HOSTILE_STRING_BODIES.keys())
+async def test_a_hostile_client_password_against_a_good_auth_file_never_blames_the_file(
+    body, async_client, caplog
+):
+    """A 401, and no record naming the auth file: the operator's runbook for that
+    line is to delete the file, so the client must not be able to produce it."""
+    config_store.load_auth()  # the good file, seeded from CONFIG_ADMIN_PASSWORD
+    with caplog.at_level(logging.DEBUG):
+        resp = await async_client.post(
+            "/login", content=body, headers={"content-type": "application/json"}
+        )
+    assert (resp.status_code, resp.json()) == (401, {"detail": "Invalid password"})
+    assert _unusable_records(caplog) == []
+    assert verify_password("test-config-pass") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body", _HOSTILE_NON_STRING_BODIES.values(), ids=_HOSTILE_NON_STRING_BODIES.keys()
+)
+async def test_a_non_string_client_password_is_refused_by_the_schema_without_blaming_the_file(
+    body, async_client, caplog
+):
+    config_store.load_auth()
+    with caplog.at_level(logging.DEBUG):
+        resp = await async_client.post(
+            "/login", content=body, headers={"content-type": "application/json"}
+        )
+    assert resp.status_code == 422
+    assert _unusable_records(caplog) == []
+
+
+_HOSTILE_PASSWORDS = {
+    "lone_surrogate": "\ud800",
+    "surrogate_after_byte_72": "a" * 80 + "\ud800",
+    "nul": "\x00",
+    "none": None,
+    "bytes": b"test-config-pass",
+    "integer": 7,
+}
+
+
+@pytest.mark.parametrize("password", _HOSTILE_PASSWORDS.values(), ids=_HOSTILE_PASSWORDS.keys())
+def test_check_password_logs_nothing_for_a_hostile_password_and_a_good_hash(password, caplog):
+    stored = bcrypt.hashpw(b"test-config-pass", bcrypt.gensalt(4)).decode()
+    with caplog.at_level(logging.DEBUG):
+        assert config_store._check_password(password, stored) is False
+    assert _unusable_records(caplog) == []
+
+
+_UNUSABLE_STORED = {
+    "none": None,
+    "integer": 7,
+    "empty": "",
+    "garbage": "garbage",
+    "cost_03": "$2b$03$" + "a" * 53,
+    "lone_surrogate_in_file": "$2b$04$\ud800" + "a" * 52,
+}
+
+
+@pytest.mark.parametrize("stored", _UNUSABLE_STORED.values(), ids=_UNUSABLE_STORED.keys())
+@pytest.mark.parametrize(
+    "password",
+    ["test-config-pass", *_HOSTILE_PASSWORDS.values()],
+    ids=["good", *_HOSTILE_PASSWORDS.keys()],
+)
+def test_an_unusable_stored_hash_is_reported_exactly_once_whatever_the_password(
+    stored, password, caplog
+):
+    """The other half of the iff: the stored side still reports itself, once,
+    also when the client's password is hostile too."""
+    with caplog.at_level(logging.DEBUG):
+        assert config_store._check_password(password, stored) is False
+    records = _unusable_records(caplog)
+    assert [r.levelno for r in records] == [logging.ERROR]
+    if isinstance(stored, str) and stored:
+        assert stored not in records[0].getMessage()
+
+
+def test_a_change_password_that_cannot_be_encoded_keeps_the_file_and_blames_nothing(caplog):
+    """change-password never reaches the check, so it cannot log the unusable-file
+    line; a new password that is not UTF-8 encodable is refused (the route's 500
+    is pre-existing) and the stored hash is left as it was."""
+    config_store.load_auth()
+    with caplog.at_level(logging.DEBUG), pytest.raises(UnicodeEncodeError):
+        change_password("new-pass-\ud800-x")
+    assert _unusable_records(caplog) == []
+    assert verify_password("test-config-pass") is True
+
+
+@pytest.mark.parametrize("password", _HOSTILE_PASSWORDS.values(), ids=_HOSTILE_PASSWORDS.keys())
+def test_a_hostile_password_never_matches_a_hash_of_the_empty_password(password, caplog):
+    """A refused password is checked against the stored hash with an empty
+    placeholder secret, only to report a broken file; the answer stays False
+    even when the stored hash is the hash of the empty password."""
+    stored = bcrypt.hashpw(b"", bcrypt.gensalt(4)).decode()
+    assert config_store._check_password("", stored) is True
+    with caplog.at_level(logging.DEBUG):
+        assert config_store._check_password(password, stored) is False
+    assert _unusable_records(caplog) == []

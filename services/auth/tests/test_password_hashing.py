@@ -209,6 +209,16 @@ def test_a_refused_password_is_false_after_one_dummy_check(password, bcrypt_spy)
     assert bcrypt_spy["checkpw"] == [(b"", passwords.DUMMY_HASH.encode())]
 
 
+@pytest.mark.parametrize("password", _REFUSED_PASSWORDS.values(), ids=_REFUSED_PASSWORDS.keys())
+def test_a_refused_password_against_a_good_hash_logs_nothing(password, caplog, cheap_hashes):
+    """The unusable-hash WARNING is about the stored side only: no password a
+    client sends can produce it against a usable hash."""
+    stored = passwords.hash_password("a" * 80)
+    with caplog.at_level(logging.DEBUG):
+        assert passwords.verify_password(password, stored) is False
+    assert [r for r in caplog.records if r.name == "app.services.passwords"] == []
+
+
 def test_4096_bytes_is_still_accepted(cheap_hashes):
     password = "\u00e9" * 2048
     assert len(password.encode()) == passwords.MAX_PASSWORD_BYTES

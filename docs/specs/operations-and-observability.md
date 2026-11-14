@@ -498,9 +498,13 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   regenerated; removing the file is the operator's recovery. A file that parses but
   holds no usable hash (not an object, the key missing, not a string, or a value bcrypt
   cannot read) denies every login the same way, with a 401 and one ERROR log naming the
-  class only, never the value (before issue #1355 most of these were a 500). \
+  class only, never the value (before issue #1355 most of these were a 500). That ERROR
+  is logged exactly when the stored value is unusable, whatever the client sent: a
+  client password that cannot be a password (a lone surrogate, a NUL, an over-long or
+  non-string value) is refused with no log line, and against an unusable file the line
+  is still logged once. \
   Enforced in: `services/config/app/config_store.py` (`load_auth`, `verify_password`, `ConfigAuthError`, `_check_password`, `UNUSABLE_HASH_MESSAGE`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_verify_password_fails_closed`, `test_default_password_not_regenerated_on_corrupt`, `test_login_with_corrupt_auth_file`); `services/config/tests/test_config_passwords.py` (`test_an_unusable_auth_file_refuses_login_without_raising`, `test_login_against_an_unusable_auth_file_is_401_not_500`)
+  Pinned by: `services/config/tests/test_config.py` (`test_verify_password_fails_closed`, `test_default_password_not_regenerated_on_corrupt`, `test_login_with_corrupt_auth_file`); `services/config/tests/test_config_passwords.py` (`test_an_unusable_auth_file_refuses_login_without_raising`, `test_login_against_an_unusable_auth_file_is_401_not_500`, `test_a_hostile_client_password_against_a_good_auth_file_never_blames_the_file`, `test_a_non_string_client_password_is_refused_by_the_schema_without_blaming_the_file`, `test_check_password_logs_nothing_for_a_hostile_password_and_a_good_hash`, `test_an_unusable_stored_hash_is_reported_exactly_once_whatever_the_password`, `test_a_change_password_that_cannot_be_encoded_keeps_the_file_and_blames_nothing`, `test_a_hostile_password_never_matches_a_hash_of_the_empty_password`)
 - **OPS-CONFIG-8.** `POST /change-password` needs a session and a new password of 8 to 32
   characters, and marks the password rotated. \
   Enforced in: `services/config/app/main.py` (`change_password_endpoint`, `ChangePasswordRequest`) \

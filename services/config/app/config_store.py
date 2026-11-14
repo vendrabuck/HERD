@@ -45,16 +45,29 @@ def _hash_password(password: str) -> str:
 
 
 def _check_password(password: str, hashed: object) -> bool:
-    """True when `password` matches `hashed`; False, never an exception, for a
-    stored value bcrypt cannot read (logged by class name, never the value)."""
+    """True when `password` matches `hashed`; False, never an exception, otherwise.
+
+    The unusable-hash ERROR is about the STORED value only: it is logged exactly
+    when `hashed` is not a string bcrypt can read (by class name, never the
+    value), whatever the client sent. A client password that cannot be a
+    password (not a string, not encodable as UTF-8) is refused with no log, and
+    the stored value is still checked so a broken file is still reported.
+    """
+    secret: bytes | None = None
+    if isinstance(password, str):
+        try:
+            secret = _password_bytes(password)
+        except UnicodeEncodeError:
+            secret = None
     if not isinstance(hashed, str):
         logger.error("%s (%s)", UNUSABLE_HASH_MESSAGE, type(hashed).__name__)
         return False
     try:
-        return bcrypt.checkpw(_password_bytes(password), hashed.encode())
+        matched = bcrypt.checkpw(b"" if secret is None else secret, hashed.encode())
     except ValueError as exc:
         logger.error("%s (%s)", UNUSABLE_HASH_MESSAGE, type(exc).__name__)
         return False
+    return secret is not None and matched
 
 
 # -- Auth file --
