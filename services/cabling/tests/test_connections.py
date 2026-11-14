@@ -832,7 +832,7 @@ async def test_non_admin_list_connections_missing_authorization_header(user_clie
 
     The user_client fixture overrides get_current_user_payload directly, so
     this can happen in practice only if the header is dropped somewhere
-    upstream; mirrors inventory's _fetch_user_group_ids guard for the same
+    upstream; mirrors inventory's auth_groups.fetch_user_group_ids guard for the same
     case.
     """
     resp = await user_client.get("/connections")

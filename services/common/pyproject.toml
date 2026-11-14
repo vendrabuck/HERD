@@ -4,7 +4,7 @@ version = "0.8.0.dev0"
 description = "Shared utilities for HERD services"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.162.2",
+    "fastapi>=0.162.4",
     "pyjwt>=2.15.0",
     "jsonschema>=4.21.0",
 ]
@@ -13,7 +13,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
-    "pyjwt[crypto]>=2.15.0",
+    "pyjwt[crypto]>=2.15.1",
 ]
 
 [build-system]

@@ -840,6 +840,213 @@ async def test_release_does_not_catch_an_exception_other_than_transient_upstream
     assert (rows[second].status, rows[second].defined_switch_ids) == ("ACTIVE", [SW_L2_B])
 
 
+# --- a failed switch read is read once per pass (issue #1358) ---
+
+
+class _CountingInventory:
+    """Inventory reads that count every request. While `down` holds a switch id, that
+    switch's `read` ("device" or "template") raises TransientUpstreamError carrying
+    UPSTREAM_TEXT; set `down` to an empty set to model a recovered inventory."""
+
+    def __init__(self, down: set[str], read: str):
+        self.down = set(down)
+        self.read = read
+        self.device_reads: list[str] = []
+        self.template_reads: list[str] = []
+
+    async def device(self, device_id, client=None):
+        self.device_reads.append(str(device_id))
+        if self.read == "device":
+            if str(device_id) in self.down:
+                raise TransientUpstreamError(UPSTREAM_TEXT)
+            return DEVICES.get(str(device_id))
+        # Template mode: every switch has its own template, so reads count per switch.
+        return {**DEVICES[str(device_id)], "template_id": f"tmpl-{device_id}"}
+
+    async def template(self, template_id, client=None):
+        self.template_reads.append(template_id)
+        if template_id.startswith("tmpl-") and template_id[5:] in self.down:
+            raise TransientUpstreamError(UPSTREAM_TEXT)
+        return TEMPLATE_DATA
+
+    def reads_of(self, switch_id: str) -> int:
+        if self.read == "device":
+            return self.device_reads.count(switch_id)
+        return self.template_reads.count(f"tmpl-{switch_id}")
+
+
+async def _release_pass(va_ids, inventory: _CountingInventory, ctx=None):
+    """One release pass over `va_ids` in the order given, on `ctx` (a fresh
+    _FetchContext unless the test passes the one it shares between passes)."""
+    execute_fn, calls = _recorder()
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                "app.services.nats_consumer._fetch_device",
+                new=AsyncMock(side_effect=inventory.device),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "app.services.nats_consumer._fetch_template",
+                new=AsyncMock(side_effect=inventory.template),
+            )
+        )
+        stack.enter_context(
+            patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/d"))
+        )
+        stack.enter_context(
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn)
+        )
+        stack.enter_context(
+            patch(
+                "app.services.vlan_service.fetch_fabric_id",
+                new=AsyncMock(side_effect=AssertionError("cabling must not be asked")),
+            )
+        )
+        await _release_orphaned_allocations(
+            list(va_ids), _db_session_factory(), ctx if ctx is not None else _FetchContext(None)
+        )
+    return calls
+
+
+@pytest.mark.parametrize("read", ["device", "template"])
+@pytest.mark.parametrize("n", [1, 3, 6])
+async def test_release_pass_reads_a_failed_switch_once_however_many_allocations(n, read, caplog):
+    """n orphaned allocations defined on SW_MID, whose switch (or template) read fails,
+    with an allocation on the healthy SW_L2_B placed in the middle of the pass. SW_MID
+    is requested exactly once in the pass whatever n is; each of its allocations is
+    still released with SW_MID listed and gets its own vlan_delete_upstream_failed line
+    (class name only); SW_L2_B is read, its delete runs, and it is trimmed."""
+    on_mid = [
+        await _seed_allocation(RES_ID, uuid.uuid4(), 100 + i, [SW_MID], [SW_MID]) for i in range(n)
+    ]
+    healthy = await _seed_allocation(RES_ID, uuid.uuid4(), 900, [SW_L2_B], [SW_L2_B])
+    order = on_mid[: n // 2] + [healthy] + on_mid[n // 2 :]
+    inventory = _CountingInventory({SW_MID}, read)
+
+    with caplog.at_level(logging.ERROR, logger="app.services.nats_consumer"):
+        calls = await _release_pass(order, inventory)
+
+    assert inventory.reads_of(SW_MID) == 1, "one request for the failing switch per pass"
+    assert [(c[1], c[3]) for c in calls if c[0] == "delete_vlan"] == [(SW_L2_B, 900)]
+    assert SW_MID not in {c[1] for c in calls}
+    rows = await _allocations_by_id(order)
+    for va_id in on_mid:
+        assert (rows[va_id].status, rows[va_id].defined_switch_ids) == ("RELEASED", [SW_MID])
+    assert (rows[healthy].status, rows[healthy].defined_switch_ids) == ("RELEASED", [])
+    records = _upstream_failed_records(caplog)
+    assert len(records) == n
+    assert sorted(_assert_class_name_only(r)["vlan_assignment_id"] for r in records) == sorted(
+        str(v) for v in on_mid
+    )
+    assert all(_assert_class_name_only(r)["switch_ids"] == [SW_MID] for r in records)
+
+
+@pytest.mark.parametrize("shared_context", [False, True], ids=["fresh_context", "same_context"])
+@pytest.mark.parametrize("read", ["device", "template"])
+async def test_next_release_pass_reads_the_failed_switch_again(read, shared_context, caplog):
+    """The memory of a failed read ends with its pass: a later pass over another
+    allocation on the same switch reads it again, also when both passes run on the
+    SAME _FetchContext object (one event's apply tails, or one retry tick), and with
+    inventory recovered its delete runs and the switch is trimmed."""
+    ctx = _FetchContext(None) if shared_context else None
+    first = [
+        await _seed_allocation(RES_ID, uuid.uuid4(), 100 + i, [SW_MID], [SW_MID]) for i in range(2)
+    ]
+    inventory = _CountingInventory({SW_MID}, read)
+    with caplog.at_level(logging.ERROR, logger="app.services.nats_consumer"):
+        await _release_pass(first, inventory, ctx)
+    assert inventory.reads_of(SW_MID) == 1
+
+    later = await _seed_allocation(RES_ID, uuid.uuid4(), 300, [SW_MID], [SW_MID])
+    inventory.down = set()
+    calls = await _release_pass([later], inventory, ctx)
+
+    assert inventory.reads_of(SW_MID) == 2, "the next pass made a new request"
+    assert [(c[1], c[3]) for c in calls if c[0] == "delete_vlan"] == [(SW_MID, 300)]
+    row = (await _allocations_by_id([later]))[later]
+    assert (row.status, row.defined_switch_ids) == ("RELEASED", [])
+
+
+@pytest.mark.parametrize("read", ["device", "template"])
+async def test_release_pass_reads_each_of_two_failing_switches_once(read, caplog):
+    """Two failing switches and a healthy one in one pass, interleaved: SW_MID carries
+    three allocations, SW_L2_C two, SW_L2_B one. Each failing switch is requested
+    exactly once, the healthy one is read and its delete runs, and every allocation on
+    a failing switch gets its own line naming only that switch."""
+    mid = [
+        await _seed_allocation(RES_ID, uuid.uuid4(), 100 + i, [SW_MID], [SW_MID]) for i in range(3)
+    ]
+    c = [
+        await _seed_allocation(RES_ID, uuid.uuid4(), 200 + i, [SW_L2_C], [SW_L2_C])
+        for i in range(2)
+    ]
+    healthy = await _seed_allocation(RES_ID, uuid.uuid4(), 900, [SW_L2_B], [SW_L2_B])
+    order = [mid[0], c[0], healthy, mid[1], c[1], mid[2]]
+    inventory = _CountingInventory({SW_MID, SW_L2_C}, read)
+
+    with caplog.at_level(logging.ERROR, logger="app.services.nats_consumer"):
+        calls = await _release_pass(order, inventory)
+
+    assert (inventory.reads_of(SW_MID), inventory.reads_of(SW_L2_C)) == (1, 1)
+    assert inventory.reads_of(SW_L2_B) == 1
+    assert [(x[1], x[3]) for x in calls if x[0] == "delete_vlan"] == [(SW_L2_B, 900)]
+    rows = await _allocations_by_id(order)
+    for va_id, sw in [*((v, SW_MID) for v in mid), *((v, SW_L2_C) for v in c)]:
+        assert (rows[va_id].status, rows[va_id].defined_switch_ids) == ("RELEASED", [sw])
+    assert rows[healthy].defined_switch_ids == []
+    switch_of = {str(v): SW_MID for v in mid} | {str(v): SW_L2_C for v in c}
+    records = _upstream_failed_records(caplog)
+    assert len(records) == 5
+    for r in records:
+        payload = _assert_class_name_only(r)
+        assert payload["switch_ids"] == [switch_of[payload["vlan_assignment_id"]]]
+
+
+# --- the lost-race line is only for a lost race (issue #1357 review) ---
+
+
+async def test_a_held_allocation_logs_no_lost_race_line(caplog):
+    """An allocation that still has an ACTIVE membership is not orphaned: the pass
+    skips it at the read-only count, before any write, so no lost-race line is logged
+    and nothing is driven (that line is only for a write that lost a race)."""
+    alloc = await _seed_allocation(RES_ID, uuid.uuid4(), 100, [SW_L2], [SW_L2])
+    async with TestSessionLocal() as s:
+        await _competing_join(s, alloc)
+        await s.commit()
+
+    with caplog.at_level(logging.DEBUG, logger="app.services.nats_consumer"):
+        calls = await _release_with([alloc])
+
+    assert calls == []
+    assert _lost_race_records(caplog) == []
+    assert (await _allocations_by_id([alloc]))[alloc].status == "ACTIVE"
+
+
+async def test_an_allocation_already_released_is_skipped_with_no_line(caplog):
+    """A RELEASED allocation handed to a pass (the retry channels pass allocations of
+    superseded rows that may be released already) is skipped at the ACTIVE read with
+    no line at all, no write, and no driver call: released_at stays as it was."""
+    from sqlalchemy import update
+
+    alloc = await _seed_allocation(RES_ID, uuid.uuid4(), 100, [SW_L2], [SW_L2])
+    async with TestSessionLocal() as s:
+        await s.execute(
+            update(VlanAssignment).where(VlanAssignment.id == alloc).values(status="RELEASED")
+        )
+        await s.commit()
+
+    with caplog.at_level(logging.DEBUG, logger="app.services.nats_consumer"):
+        calls = await _release_with([alloc])
+
+    assert calls == []
+    assert [r for r in caplog.records if str(alloc) in r.getMessage()] == []
+    assert _lost_race_records(caplog) == []
+    row = (await _allocations_by_id([alloc]))[alloc]
+    assert (row.status, row.released_at, row.defined_switch_ids) == ("RELEASED", None, [SW_L2])
+
+
 # --- idempotency ---
 
 
@@ -879,6 +1086,222 @@ async def test_release_orphaned_allocations_no_active_row_is_a_defensive_no_op()
         await _release_orphaned_allocations({va_id}, _db_session_factory(), _FetchContext(None))
 
     assert calls == [], "nothing to release: no driver call may fire"
+
+
+# --- the release is a compare-and-swap; a lost race drives nothing (issue #1357) ---
+
+LOST_RACE_ACTION = "vlan_release_lost_race"
+
+
+def _racing_release(competitor):
+    """A stand-in for vlan_service.release_allocation_if_orphaned that first lets
+    `competitor(db, allocation_id)` write and commit on the releaser's own session (a
+    concurrent writer landing after the orphan check and before the guarded write),
+    then runs the real compare-and-swap."""
+    from app.services import vlan_service
+
+    real = vlan_service.release_allocation_if_orphaned
+
+    async def _release(db, allocation_id):
+        await competitor(db, allocation_id)
+        await db.commit()
+        return await real(db, allocation_id)
+
+    return patch("app.services.vlan_service.release_allocation_if_orphaned", new=_release)
+
+
+def _lost_race_records(caplog):
+    return [r for r in caplog.records if getattr(r, "action", None) == LOST_RACE_ACTION]
+
+
+async def _competing_release(db, allocation_id):
+    from sqlalchemy import update
+
+    await db.execute(
+        update(VlanAssignment)
+        .where(VlanAssignment.id == allocation_id)
+        .values(status="RELEASED")
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def _competing_join(db, allocation_id):
+    db.add(
+        L2PortAssignment(
+            reservation_id=uuid.UUID(RES_ID),
+            vlan_assignment_id=allocation_id,
+            switch_device_id=uuid.UUID(SW_L2),
+            port="0/0/7",
+            intended="ACTIVE",
+            status="ACTIVE",
+        )
+    )
+
+
+async def _release_with(va_ids, *extra_patches):
+    execute_fn, calls = _recorder()
+    with ExitStack() as stack:
+        for p in _patches(execute_fn, []):
+            stack.enter_context(p)
+        for p in extra_patches:
+            stack.enter_context(p)
+        await _release_orphaned_allocations(
+            list(va_ids), _db_session_factory(), _FetchContext(None)
+        )
+    return calls
+
+
+async def test_release_lost_to_a_concurrent_release_drives_no_delete(caplog):
+    """Another pass releases the allocation after this pass's orphan check: this pass's
+    guarded write matches nothing, so it drives no delete_vlan, leaves
+    defined_switch_ids to the winner, logs the fixed lost-race action once, and still
+    releases the next allocation in its set."""
+    lost = await _seed_allocation(RES_ID, uuid.uuid4(), 100, [SW_L2], [SW_L2])
+    after = await _seed_allocation(RES_ID, uuid.uuid4(), 200, [SW_L2_B], [SW_L2_B])
+    raced = {"done": False}
+
+    async def _competitor(db, allocation_id):
+        if allocation_id == lost and not raced["done"]:
+            raced["done"] = True
+            await _competing_release(db, allocation_id)
+
+    with caplog.at_level(logging.INFO, logger="app.services.nats_consumer"):
+        calls = await _release_with([lost, after], _racing_release(_competitor))
+
+    assert [(c[1], c[3]) for c in calls if c[0] == "delete_vlan"] == [(SW_L2_B, 200)], (
+        "only the allocation this pass released is undefined"
+    )
+    rows = await _allocations_by_id([lost, after])
+    assert rows[lost].status == "RELEASED"
+    assert rows[lost].defined_switch_ids == [SW_L2], "the loser never trims the winner's list"
+    assert rows[after].status == "RELEASED" and rows[after].defined_switch_ids == []
+    (record,) = _lost_race_records(caplog)
+    assert record.vlan_assignment_id == str(lost)
+    assert record.levelno == logging.INFO
+
+
+async def test_release_lost_to_a_concurrent_join_keeps_the_allocation_active(caplog):
+    """A membership joins the allocation after the orphan check: the guarded write
+    names "no ACTIVE membership", so it matches nothing, the allocation stays ACTIVE
+    with its definitions, and no delete_vlan strips the VLAN the new member uses."""
+    alloc = await _seed_allocation(RES_ID, uuid.uuid4(), 100, [SW_L2], [SW_L2])
+
+    with caplog.at_level(logging.INFO, logger="app.services.nats_consumer"):
+        calls = await _release_with([alloc], _racing_release(_competing_join))
+
+    assert calls == []
+    row = (await _allocations_by_id([alloc]))[alloc]
+    assert (row.status, row.released_at, row.defined_switch_ids) == ("ACTIVE", None, [SW_L2])
+    assert len(_lost_race_records(caplog)) == 1
+
+
+async def test_release_loser_never_touches_a_reallocation_of_the_same_number(caplog):
+    """The winner released the allocation and the same reservation was then given a
+    NEW allocation with the same number on the same fabric before this pass's guarded
+    write ran. The loser's write is keyed to the old row's id, so the new ACTIVE row
+    keeps its status and definitions and no delete_vlan runs against it."""
+    old = await _seed_allocation(RES_ID, FABRIC, 100, [SW_L2], [SW_L2])
+    fresh: dict = {}
+
+    async def _competitor(db, allocation_id):
+        await _competing_release(db, allocation_id)
+        await db.commit()
+        row = VlanAssignment(
+            reservation_id=uuid.UUID(RES_ID),
+            fabric_id=FABRIC,
+            vlan_id=100,
+            switch_device_ids=[SW_L2],
+            defined_switch_ids=[SW_L2],
+            status="ACTIVE",
+        )
+        db.add(row)
+        await db.flush()
+        fresh["id"] = row.id
+
+    with caplog.at_level(logging.INFO, logger="app.services.nats_consumer"):
+        calls = await _release_with([old], _racing_release(_competitor))
+
+    assert calls == []
+    rows = await _allocations_by_id([old, fresh["id"]])
+    assert rows[old].status == "RELEASED"
+    assert (rows[fresh["id"]].status, rows[fresh["id"]].defined_switch_ids) == (
+        "ACTIVE",
+        [SW_L2],
+    )
+    assert len(_lost_race_records(caplog)) == 1
+
+
+async def test_release_deletes_from_the_row_as_released_not_the_copy_read_before(caplog):
+    """A define pass records SW_L2_B on the allocation after this pass's orphan check
+    and before its guarded write (the row is still ACTIVE with no member, so the
+    release wins). The delete pass works from the row as released, so SW_L2_B is
+    undefined too and the trim does not drop it from the list unseen."""
+    from sqlalchemy import update
+
+    alloc = await _seed_allocation(RES_ID, uuid.uuid4(), 100, [SW_L2], [SW_L2])
+
+    async def _competing_define(db, allocation_id):
+        await db.execute(
+            update(VlanAssignment)
+            .where(VlanAssignment.id == allocation_id)
+            .values(defined_switch_ids=[SW_L2, SW_L2_B])
+            .execution_options(synchronize_session=False)
+        )
+
+    calls = await _release_with([alloc], _racing_release(_competing_define))
+
+    assert sorted(c[1] for c in calls if c[0] == "delete_vlan") == sorted([SW_L2, SW_L2_B])
+    row = (await _allocations_by_id([alloc]))[alloc]
+    assert (row.status, row.defined_switch_ids) == ("RELEASED", [])
+
+
+async def test_two_interleaved_release_passes_release_and_undefine_once(caplog):
+    """Two release passes over the same orphaned allocation, both past their orphan
+    check before either writes (an asyncio barrier holds each at the guarded write):
+    exactly one releases it and drives its delete_vlan, the other logs the lost race.
+    The row-level proof on a real Postgres is test_vlan_release_cas_live_pg.py."""
+    import asyncio
+
+    from app.services import vlan_service
+
+    alloc = await _seed_allocation(RES_ID, uuid.uuid4(), 100, [SW_L2, SW_L2_B], [SW_L2, SW_L2_B])
+    real = vlan_service.release_allocation_if_orphaned
+    barrier = asyncio.Barrier(2)
+    outcomes: list[bool] = []
+
+    async def _gated(db, allocation_id):
+        await barrier.wait()
+        won = await real(db, allocation_id)
+        outcomes.append(won)
+        return won
+
+    execute_fn, calls = _recorder()
+    with ExitStack() as stack:
+        for p in _patches(execute_fn, []):
+            stack.enter_context(p)
+        stack.enter_context(
+            patch("app.services.vlan_service.release_allocation_if_orphaned", new=_gated)
+        )
+        with caplog.at_level(logging.INFO, logger="app.services.nats_consumer"):
+            await asyncio.wait_for(
+                asyncio.gather(
+                    _release_orphaned_allocations(
+                        [alloc], _db_session_factory(), _FetchContext(None)
+                    ),
+                    _release_orphaned_allocations(
+                        [alloc], _db_session_factory(), _FetchContext(None)
+                    ),
+                ),
+                timeout=30,
+            )
+
+    assert sorted(outcomes) == [False, True]
+    assert sorted(c[1] for c in calls if c[0] == "delete_vlan") == sorted([SW_L2, SW_L2_B]), (
+        "one set of deletes, not two"
+    )
+    row = (await _allocations_by_id([alloc]))[alloc]
+    assert (row.status, row.defined_switch_ids) == ("RELEASED", [])
+    assert len(_lost_race_records(caplog)) == 1
 
 
 # --- zero membership delta but the definition SCOPE still changed (issue #442) ---

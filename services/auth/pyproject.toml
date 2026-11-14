@@ -4,12 +4,12 @@ version = "0.8.0.dev0"
 description = "HERD Authentication Service"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.162.2",
-    "uvicorn[standard]>=0.30.0",
+    "fastapi>=0.162.4",
+    "uvicorn[standard]>=0.54.0",
     "sqlalchemy[asyncio]>=2.1.8",
     "asyncpg>=0.29.0",
     "alembic>=1.13.0",
-    "pyjwt[crypto]>=2.15.0",
+    "pyjwt[crypto]>=2.15.1",
     "passlib[bcrypt]>=1.7.4",
     "bcrypt>=4.0.0,<4.1",
     "pydantic-settings>=2.3.0",

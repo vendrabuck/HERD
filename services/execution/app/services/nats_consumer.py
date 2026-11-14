@@ -728,28 +728,86 @@ class _FetchContext:
     (404), so a missing far end or config is classified at most once per
     event. The client is owned by the caller (handle_reservation_event); these
     helpers never close it.
+
+    A read that raises is NOT remembered here: the next read of that record requests
+    it again. The context outlives a single decision (in the retry tick one context
+    serves every reservation of a layer and the release of superseded rows), and a
+    failure remembered across those would turn one reservation's retryable blip into
+    another allocation's permanent skip. The one place that remembers failures is a
+    release pass, through its own _ReleasePassReads view (issue #1358).
     """
 
     def __init__(self, client):
         self._client = client
         self._device_cache: dict[str, dict | None] = {}
         self._config_cache: dict[str, dict | None] = {}
+        self._template_cache: dict[str, dict | None] = {}
 
     @property
     def client(self):
         return self._client
 
+    async def _read_once(self, key: str, cache: dict, fetch) -> dict | None:
+        """Return cache[key], fetching it until a read answers (a 404 included)."""
+        if key not in cache:
+            cache[key] = await fetch(key, self._client)
+        return cache[key]
+
     async def get_device(self, device_id: str) -> dict | None:
         """Return a far-end device, classifying it at most once per event."""
-        if device_id not in self._device_cache:
-            self._device_cache[device_id] = await _fetch_device(device_id, self._client)
-        return self._device_cache[device_id]
+        return await self._read_once(device_id, self._device_cache, _fetch_device)
 
     async def get_latest_config(self, device_id: str) -> dict | None:
         """Return a device's latest config version, fetching at most once per event."""
-        if device_id not in self._config_cache:
-            self._config_cache[device_id] = await _fetch_latest_config(device_id, self._client)
-        return self._config_cache[device_id]
+        return await self._read_once(device_id, self._config_cache, _fetch_latest_config)
+
+    async def get_template(self, template_id: str) -> dict | None:
+        """Return a switch template, fetching it at most once per event."""
+        return await self._read_once(template_id, self._template_cache, _fetch_template)
+
+
+class _ReleasePassReads:
+    """One allocation release pass's view of a _FetchContext (issue #1358).
+
+    _release_orphaned_allocations builds a new one on every call. Reads go through
+    the context, so the context's caches of answered reads are shared, but this view
+    keeps its OWN map of reads that raised TransientUpstreamError, empty when the pass
+    starts. Within the pass a remembered switch or template read is not requested
+    again: the later read raises a new error of the same class with the same
+    arguments, chained to the first, so an inventory outage costs one read timeout per
+    switch per pass instead of one per allocation on that switch.
+
+    The map is never written to the context and never read from it, so a failure from
+    outside the pass (an apply's read, another reservation's read in the same retry
+    tick) is never consulted here, and none is carried to the next pass, even one
+    that shares the same context object. In a release pass a skipped delete_vlan is
+    never re-driven (WIRE-VLAN-12), so a remembered failure must not outlive the pass
+    that saw it. Any other exception is not remembered.
+    """
+
+    def __init__(self, ctx: _FetchContext):
+        self._ctx = ctx
+        self._failed: dict[tuple[str, str], TransientUpstreamError] = {}
+
+    @property
+    def client(self):
+        return self._ctx.client
+
+    async def _read(self, kind: str, key: str, read) -> dict | None:
+        failed = self._failed.get((kind, key))
+        if failed is not None:
+            raise type(failed)(*failed.args) from failed
+        try:
+            return await read(key)
+        except TransientUpstreamError as exc:
+            self._failed[(kind, key)] = exc
+            raise
+
+    async def get_device(self, device_id: str) -> dict | None:
+        return await self._read("device", device_id, self._ctx.get_device)
+
+    async def get_template(self, template_id: str) -> dict | None:
+        return await self._read("template", template_id, self._ctx.get_template)
 
 
 def _route_run_identity(destination, next_hop, interface, virtual_router=None) -> tuple[str, str]:
@@ -2677,10 +2735,14 @@ async def _run_vlan_definition_op(
     action: str,
     vlan_id: int,
     res_uuid: uuid.UUID,
-    ctx: "_FetchContext",
+    ctx: "_FetchContext | _ReleasePassReads",
     get_db_session,
 ) -> tuple[bool, int, str | None]:
     """Drive one create_vlan/delete_vlan definition op on a switch (issue #442).
+
+    `ctx` is the event's _FetchContext for a create, and the release pass's
+    _ReleasePassReads view for a delete (issue #1358); only get_device, get_template,
+    and client are used.
 
     A self-contained driver session (login, action, best-effort logout) with one
     execution_run audit row for the definition action itself, result-gated through
@@ -2705,9 +2767,7 @@ async def _run_vlan_definition_op(
     switch_uuid = uuid.UUID(switch_id)
     switch_data = await ctx.get_device(switch_id)
     template_data = (
-        await _fetch_template(switch_data.get("template_id", ""), ctx.client)
-        if switch_data
-        else None
+        await ctx.get_template(switch_data.get("template_id", "")) if switch_data else None
     )
     if switch_data is None:
         return False, 0, f"{WIRING_UNRESOLVABLE_REASON}: L2 switch {switch_id} not found"
@@ -2993,6 +3053,14 @@ async def _release_orphaned_allocations(
     to a different port on the same fabric leaves the fabric with one member and its
     allocation intact; only a fabric whose last member truly left is freed.
 
+    The release itself is a compare-and-swap (issue #1357) through
+    vlan_service.release_allocation_if_orphaned: one guarded UPDATE that matches only
+    while the row is ACTIVE with no ACTIVE membership. Two callers can reach one
+    allocation at once (a reservation's L2 apply tail and the retry channels' release
+    of superseded rows); the one that loses the swap logs the fixed action
+    `vlan_release_lost_race`, drives no delete_vlan, and the pass goes on with the next
+    allocation. A row that is not ACTIVE when first read is skipped silently, as before.
+
     The undefine half of the shared allocation-transition step (issue #442, Option B):
     on last-free, delete_vlan runs per switch in defined_switch_ids (what create_vlan
     provably defined, never the raw scope). Guards, per the decision:
@@ -3026,20 +3094,30 @@ async def _release_orphaned_allocations(
         name only (its text can carry upstream detail), and the pass continues with the
         next allocation. The error is not re-raised for the same reasons as the
         unjudged case; nothing re-drives these deletes (a limit by decision, like the
-        unjudged skip).
+        unjudged skip). The failed read is remembered for the rest of THIS pass only
+        (issue #1358, a _ReleasePassReads view built per call), so a later allocation
+        defined on the same switch (or one sharing its template) is stopped at once
+        with its own line and no second inventory request: an outage costs one read
+        timeout per switch per pass, not one per allocation. A failure seen before the
+        pass started, by an apply or by another reservation in the same retry tick,
+        is never consulted, and the next pass reads again.
 
     Any other exception (a database error from a session, a commit, or an execution run
     write; an inventory record missing a field the driver load needs) is not caught
     here and propagates to the caller, as everywhere else in this module: it is not
     specific to one allocation.
     """
-    from datetime import datetime, timezone
-
     from app.models.vlan_assignment import VlanAssignment
     from app.services.l2_membership_service import count_active_memberships_for_vlan
-    from app.services.vlan_service import FabricResolver, find_superseding_allocation
+    from app.services.vlan_service import (
+        FabricResolver,
+        find_superseding_allocation,
+        release_allocation_if_orphaned,
+    )
 
     resolver = FabricResolver()
+    # Issue #1358: this pass's own memory of failed inventory reads, empty on every call.
+    reads = _ReleasePassReads(ctx)
     for va_id in vlan_assignment_ids:
         async with get_db_session() as db:
             if await count_active_memberships_for_vlan(db, va_id) > 0:
@@ -3054,9 +3132,23 @@ async def _release_orphaned_allocations(
             ).scalar_one_or_none()
             if row is None:
                 continue
-            row.status = "RELEASED"
-            row.released_at = datetime.now(timezone.utc)
-            await db.commit()
+            if not await release_allocation_if_orphaned(db, va_id):
+                # Issue #1357: the row changed between the reads above and the guarded
+                # write (another pass released it, or a membership joined it). The
+                # winner owns whatever comes next; this pass drives nothing for it.
+                logger.info(
+                    "Skipped releasing VLAN allocation %s: it was released or joined "
+                    "by a concurrent writer after the orphan check",
+                    va_id,
+                    extra={
+                        "action": "vlan_release_lost_race",
+                        "vlan_assignment_id": str(va_id),
+                    },
+                )
+                continue
+            # Re-read after the claim: the delete pass works from the row as it stood
+            # when this pass released it, not from the copy loaded before the write.
+            await db.refresh(row)
             logger.info("Released orphaned VLAN allocation %s (last membership left)", va_id)
 
         defined = [str(s) for s in (row.defined_switch_ids or [])]
@@ -3095,7 +3187,7 @@ async def _release_orphaned_allocations(
         for index, switch_id in enumerate(defined):
             try:
                 ok, _attempts, err = await _run_vlan_definition_op(
-                    switch_id, "delete_vlan", row.vlan_id, row.reservation_id, ctx, get_db_session
+                    switch_id, "delete_vlan", row.vlan_id, row.reservation_id, reads, get_db_session
                 )
             except TransientUpstreamError as exc:
                 # Issue #1209: this allocation only. The switch read failed before any

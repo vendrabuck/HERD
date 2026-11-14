@@ -1,13 +1,10 @@
 import logging
 import uuid
 
-import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from herd_common.auth import ADMIN_ROLES
-from herd_common.internal_client import ForwardedAuth, call_service
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
 from app.database import get_db
 from app.dependencies.auth import get_current_user_payload, require_admin
 from app.models.device import Device
@@ -25,6 +22,7 @@ from app.schemas.device_group import (
     DeviceGroupUpdate,
     PaginatedDeviceGroupResponse,
 )
+from app.services import auth_groups
 from app.services.device_group_service import (
     bulk_add_devices,
     bulk_add_user_groups,
@@ -216,7 +214,7 @@ async def get_device_groups_for_device_endpoint(
             all_ug_ids.add(p.user_group_id)
 
     # Resolve user group names from auth service
-    ug_name_map = await _fetch_user_group_names(list(all_ug_ids), authorization)
+    ug_name_map = await auth_groups.fetch_user_group_names(list(all_ug_ids), authorization)
 
     result = []
     for g in groups:
@@ -384,124 +382,3 @@ async def bulk_remove_user_groups_endpoint(
         extra={"action": "device_group_remove_permissions", "group_id": str(group_id)},
     )
     return BulkRemoveResult(removed=removed, not_found=not_found)
-
-
-def _auth_base() -> str:
-    return settings.auth_service_url.rstrip("/")
-
-
-async def _fetch_user_group_ids(user_id: uuid.UUID, authorization: str | None) -> list[uuid.UUID]:
-    """Fetch user's group IDs from the auth service, forwarding the caller JWT.
-
-    Raises HTTPException(503) on upstream failure. Callers that want fail-open
-    behavior (e.g. show-all-devices on auth outage) must wrap this call in
-    their own try/except.
-
-    A None authorization is a contract violation (the bearer dep on each route
-    guarantees it's present) and raises HTTPException(500).
-    """
-    if authorization is None:
-        raise HTTPException(
-            status_code=500,
-            detail="internal: missing Authorization header while resolving user groups",
-        )
-    try:
-        resp = await call_service(
-            _auth_base(),
-            "GET",
-            f"/groups/user/{user_id}",
-            timeout=10.0,
-            auth=ForwardedAuth(authorization=authorization),
-        )
-    except httpx.HTTPError as exc:
-        logger.error("auth service unreachable while fetching groups for user %s: %s", user_id, exc)
-        raise HTTPException(
-            status_code=503, detail="auth service unreachable while fetching user groups"
-        ) from exc
-
-    if resp.status_code != 200:
-        logger.error(
-            "auth service returned %s for user %s groups: %s",
-            resp.status_code,
-            user_id,
-            resp.text[:200],
-        )
-        raise HTTPException(
-            status_code=503,
-            detail=f"auth service returned {resp.status_code} when fetching user groups",
-        )
-
-    groups = resp.json()
-    return [uuid.UUID(g["id"]) for g in groups]
-
-
-# Auth's GET /groups caps `limit` at 500 (services/auth/app/routers/groups.py).
-_AUTH_GROUP_PAGE_SIZE = 500
-
-
-async def _fetch_user_group_names(
-    user_group_ids: list[uuid.UUID],
-    authorization: str | None,
-) -> dict[uuid.UUID, str]:
-    """Fetch user group names from the auth service. Returns a map of id to name.
-
-    Raises HTTPException(503) on upstream failure. A None authorization raises
-    HTTPException(500); the bearer dep on each route guarantees it's present.
-    """
-    if not user_group_ids:
-        return {}
-    if authorization is None:
-        raise HTTPException(
-            status_code=500,
-            detail="internal: missing Authorization header while resolving group names",
-        )
-    # Page through auth's group list until every wanted id is named or the list
-    # ends (issue #1021). Reading one default page (50, oldest first) left every
-    # later group with a null name. Auth has no by-ids lookup open to a non-admin
-    # caller, so paging at auth's maximum page size is the narrowest read.
-    wanted = set(user_group_ids)
-    name_map: dict[uuid.UUID, str] = {}
-    skip = 0
-    while True:
-        try:
-            resp = await call_service(
-                _auth_base(),
-                "GET",
-                "/groups",
-                timeout=10.0,
-                auth=ForwardedAuth(authorization=authorization),
-                params={"skip": skip, "limit": _AUTH_GROUP_PAGE_SIZE},
-            )
-        except httpx.HTTPError as exc:
-            logger.error("auth service unreachable while fetching group names: %s", exc)
-            raise HTTPException(
-                status_code=503, detail="auth service unreachable while fetching group names"
-            ) from exc
-
-        if resp.status_code != 200:
-            logger.error(
-                "auth service returned %s for group names: %s",
-                resp.status_code,
-                resp.text[:200],
-            )
-            raise HTTPException(
-                status_code=503,
-                detail=f"auth service returned {resp.status_code} when fetching group names",
-            )
-
-        data = resp.json()
-        groups = data.get("items", data) if isinstance(data, dict) else data
-        for g in groups:
-            gid = uuid.UUID(g["id"])
-            if gid in wanted:
-                name_map[gid] = g["name"]
-
-        skip += len(groups)
-        total = data.get("total") if isinstance(data, dict) else None
-        if (
-            len(name_map) == len(wanted)
-            or not isinstance(data, dict)
-            or len(groups) < _AUTH_GROUP_PAGE_SIZE
-            or (isinstance(total, int) and skip >= total)
-        ):
-            return name_map

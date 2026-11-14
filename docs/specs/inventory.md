@@ -152,9 +152,9 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 | GET | `/drivers` | any signed-in user | 200 | INV-AUTH-1, INV-DRV-1 |
 | GET | `/drivers/{id}` | any signed-in user | 200 | INV-AUTH-1, INV-DRV-1 |
 | GET | `/drivers/{id}/download` | any signed-in user | 200 | INV-AUTH-1, INV-DRV-2, INV-DRV-17 |
-| POST | `/drivers` (multipart) | admin | 201 | INV-AUTH-2, INV-DRV-3 to INV-DRV-9 |
+| POST | `/drivers` (multipart) | admin | 201 | INV-AUTH-2, INV-DRV-3 to INV-DRV-9, INV-DRV-20 |
 | PUT | `/drivers/{id}` | admin | 200 | INV-AUTH-2, INV-DRV-10, INV-DRV-11 |
-| PUT | `/drivers/{id}/file` (multipart) | admin | 200 | INV-AUTH-2, INV-DRV-3, INV-DRV-4, INV-DRV-12, INV-DRV-18 |
+| PUT | `/drivers/{id}/file` (multipart) | admin | 200 | INV-AUTH-2, INV-DRV-3, INV-DRV-4, INV-DRV-12, INV-DRV-18, INV-DRV-20 |
 | DELETE | `/drivers/{id}` | admin | 204 | INV-AUTH-2, INV-DRV-13 |
 | GET | `/drivers/{id}/config-schema` | any signed-in user | 200 | none here; belongs to `device-configuration.md` |
 | GET | `/hypervisors` | admin | 200 | INV-HYP-1 |
@@ -521,11 +521,11 @@ areas call `check_device_read_visibility` for their own device-scoped reads
 - **INV-VIS-2.** The user groups are read from auth's `GET /groups/user/{id}` with the
   caller's own JWT. A transport error or a non-200 answer fails closed with 503; it
   never falls back to showing every device. \
-  Enforced in: `services/inventory/app/routers/device_groups.py` (`_fetch_user_group_ids`) \
+  Enforced in: `services/inventory/app/services/auth_groups.py` (`fetch_user_group_ids`) \
   Pinned by: `services/inventory/tests/test_device_groups.py` (`test_fetch_user_group_ids_raises_on_auth_service_5xx`, `test_fetch_user_group_ids_raises_on_connection_error`); `services/inventory/tests/test_devices.py` (`test_device_list_fails_closed_on_auth_outage`)
 - **INV-VIS-3.** A visibility lookup without an Authorization header to forward answers
   500. \
-  Enforced in: `services/inventory/app/routers/device_groups.py` (`_fetch_user_group_ids`) \
+  Enforced in: `services/inventory/app/services/auth_groups.py` (`fetch_user_group_ids`) \
   Pinned by: `services/inventory/tests/test_device_groups.py` (`test_fetch_user_group_ids_missing_authorization_raises_500`)
 - **INV-VIS-4.** `GET /devices` for a non-admin returns only visible devices and forces
   `dut_only` on, so a granted non-Management device is not listed. \
@@ -840,13 +840,13 @@ to one or more user groups; that grant is what lets a non-admin see a device.
 - **INV-GRP-11.** It lists each group the device is in with its granted user groups,
   whose names are read from auth's `GET /groups` with the caller's JWT; an auth failure
   answers 503. \
-  Enforced in: `services/inventory/app/routers/device_groups.py` (`get_device_groups_for_device_endpoint`, `_fetch_user_group_names`) \
+  Enforced in: `services/inventory/app/routers/device_groups.py` (`get_device_groups_for_device_endpoint`); `services/inventory/app/services/auth_groups.py` (`fetch_user_group_names`) \
   Pinned by: `services/inventory/tests/test_device_groups.py` (`test_device_groups_for_device_resolves_names`, `test_device_groups_for_device_returns_503_when_auth_service_down`, `test_fetch_user_group_names_success_maps_wanted_ids`)
 - **INV-GRP-12.** The name lookup pages through auth's group list at auth's maximum
   page size (500) until every wanted user group is named or the list ends, so a user
   group on any page gets its name; only a user group auth no longer lists has a null
   name. A failure on any page answers the 503 of INV-GRP-11. \
-  Enforced in: `services/inventory/app/routers/device_groups.py` (`_fetch_user_group_names`, `_AUTH_GROUP_PAGE_SIZE`) \
+  Enforced in: `services/inventory/app/services/auth_groups.py` (`fetch_user_group_names`, `AUTH_GROUP_PAGE_SIZE`) \
   Pinned by: `services/inventory/tests/test_device_groups.py` (`test_fetch_user_group_names_pages_until_every_wanted_id_is_named`, `test_fetch_user_group_names_stops_once_every_wanted_id_is_named`, `test_fetch_user_group_names_unknown_id_stops_at_end_of_list_with_no_name`, `test_fetch_user_group_names_second_page_failure_is_503`)
 - **INV-GRP-13.** For a non-admin, a hidden device answers the same 404 as an unknown
   one (INV-VIS-6). \
@@ -960,12 +960,12 @@ download, delete); routes under `/drivers`. The package format is in
   key differs (a failed delete is ignored), and updates the file name, size, and
   SHA256. \
   Enforced in: `services/inventory/app/services/driver_service.py` (`replace_driver_file`) \
-  Pinned by: `services/inventory/tests/test_drivers.py` (`test_replace_driver_file`); `services/inventory/tests/test_driver_service_unit.py` (`test_replace_driver_file_success`, `test_replace_driver_file_swallows_delete_error_for_old_key`); `tests/integration/test_driver_flow.py` (`test_replace_driver_file_updates_sha256`)
+  Pinned by: `services/inventory/tests/test_drivers.py` (`test_replace_driver_file`); `services/inventory/tests/test_driver_service_unit.py` (`test_replace_driver_file_success`, `test_replace_driver_file_swallows_delete_error_for_old_key`); `tests/integration/test_driver_flow.py` (`test_replace_driver_file_updates_sha256`); `services/inventory/tests/test_driver_storage_consistency.py` (`test_a_same_name_replace_keeps_the_archive_it_just_stored`)
 - **INV-DRV-13.** A package any template references cannot be deleted (409
   `Cannot delete driver: templates still reference it`); otherwise the archive delete
   is attempted, its failure ignored, and the row removed. \
   Enforced in: `services/inventory/app/services/driver_service.py` (`delete_driver`) \
-  Pinned by: `services/inventory/tests/test_drivers.py` (`test_delete_driver_referenced_by_template`, `test_delete_driver`); `services/inventory/tests/test_driver_service_unit.py` (`test_delete_driver_swallows_storage_delete_error`)
+  Pinned by: `services/inventory/tests/test_drivers.py` (`test_delete_driver_referenced_by_template`, `test_delete_driver`); `services/inventory/tests/test_driver_service_unit.py` (`test_delete_driver_swallows_storage_delete_error`); `services/inventory/tests/test_driver_storage_offload.py` (`test_a_driver_referenced_by_a_template_is_refused_before_any_storage_call`)
 - **INV-DRV-14.** Storage is MinIO when `MINIO_ENDPOINT` is set (the bucket is created
   at startup when missing) and the local directory `DRIVER_STORAGE_PATH` otherwise. \
   Enforced in: `services/inventory/app/storage.py` (`init_storage`) \
@@ -974,6 +974,29 @@ download, delete); routes under `/drivers`. The package format is in
   resolves outside the storage root. \
   Enforced in: `services/inventory/app/storage.py` (`_resolve_local`) \
   Pinned by: `services/inventory/tests/test_storage.py` (`test_upload_local_rejects_traversal_key`, `test_download_local_rejects_traversal_key`, `test_delete_local_rejects_traversal_key`)
+- **INV-DRV-19.** A driver upload, file replacement, download, or delete does its
+  blocking work off the event loop (issue #1327): the upload's SHA256, the
+  `driver_metadata.json` read, and every storage write, read, and delete (a MinIO round
+  trip or a local file operation) run in a worker thread through `asyncio.to_thread`,
+  so the service answers other requests, `GET /health` among them, while one is in
+  flight. A 422 refusal raised by the metadata read in the worker reaches the caller
+  unchanged, and nothing is stored. \
+  Enforced in: `services/inventory/app/services/driver_service.py` (`_inspect_package`, `create_driver`, `replace_driver_file`, `download_driver`, `delete_driver`) \
+  Pinned by: `services/inventory/tests/test_driver_storage_offload.py` (`test_driver_upload_hashes_parses_and_stores_off_the_event_loop`, `test_a_refused_oversized_metadata_upload_still_parses_off_the_event_loop`, `test_duplicate_name_cleanup_delete_runs_off_the_event_loop`, `test_file_replace_parses_stores_and_deletes_off_the_event_loop`, `test_both_download_routes_read_storage_off_the_event_loop`, `test_driver_delete_removes_the_object_off_the_event_loop`, `test_health_answers_while_a_driver_upload_is_blocked_in_storage`)
+- **INV-DRV-20.** The archive is stored before the row changes: a storage failure on
+  create answers 500 and commits no row, and a storage failure on file replace answers
+  500 and leaves the row naming the old archive, which is still stored and still
+  downloads. \
+  Enforced in: `services/inventory/app/services/driver_service.py` (`create_driver`, `replace_driver_file`) \
+  Pinned by: `services/inventory/tests/test_driver_storage_consistency.py` (`test_a_storage_failure_on_create_commits_no_row`, `test_a_storage_failure_on_replace_leaves_the_row_on_the_old_archive`)
+- **INV-DRV-21.** On local storage a write replaces the object atomically (issue
+  #1327 review): the bytes go to a dot-prefixed `.tmp` file in the same directory,
+  which is renamed onto the key, so a read concurrent with any number of writes of the
+  same key returns exactly one complete version, never a truncated or mixed one, and a
+  failed write leaves the previous object and no temporary file. The temporary name
+  ends in `.tmp`, so it can never be a package file name (INV-DRV-3). \
+  Enforced in: `services/inventory/app/storage.py` (`upload_object`, `_write_local_atomically`) \
+  Pinned by: `services/inventory/tests/test_storage_atomic_write.py` (`test_concurrent_readers_of_one_key_always_get_one_complete_version`, `test_a_reader_holding_the_file_open_keeps_the_version_it_opened`, `test_a_failed_write_leaves_the_old_object_and_no_temporary_file`, `test_a_failed_first_write_leaves_nothing_behind`, `test_the_temporary_name_can_never_be_a_driver_storage_key`)
 - **INV-DRV-16.** The drivers page requires a name, a connection type (Hypervisor
   included), and a file before it uploads, and shows the
   server's detail on a refusal. \
@@ -1422,6 +1445,7 @@ other error carries `detail` as a string or as the object shown.
 | 422 | `Import file must be UTF-8 encoded; re-save it as UTF-8 and retry` | an import file that is not valid UTF-8 | INV-BULK-20 |
 | 422 | `generated port names would exceed 255 characters; ...` (validation list) | a bulk port create whose last generated name is too long | INV-PORT-6 |
 | 500 | `internal: missing Authorization header while resolving user groups` or `... group names` | a visibility or name lookup with no header to forward | INV-VIS-3 |
+| 500 | `Internal Server Error` (the framework's unhandled-error answer) | the driver archive could not be stored on upload or file replace; no row is committed or changed | INV-DRV-20 |
 | 503 | `auth service unreachable while fetching user groups` or `auth service returned <status> when fetching user groups` | visibility lookup failed | INV-VIS-2, INV-VIS-6, INV-VIS-8, INV-BATCH-5 |
 | 503 | `auth service unreachable while fetching group names` or `auth service returned <status> when fetching group names` | by-device group name lookup failed | INV-GRP-11 |
 | 503 | `Could not verify device is not in use` | the delete guard could not ask reservations or cabling | INV-DEL-5 |
@@ -1463,8 +1487,8 @@ The calls other services make to inventory are section 7.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/inventory/tests/` (`test_*_unit.py`, `test_template_schema_validators.py`, `test_schema_bounds.py`, `test_storage.py`, `test_storage_constraints.py`, `test_device_delete_guard.py`); `services/common/tests/test_csv_safety.py`; `tests/unit/test_poll_floor_parity.py`; frontend `frontend/src/test/api/deleteDeviceErrorMessage.test.ts` | SQLite in memory; `test_storage_constraints.py` turns on SQLite foreign keys, no other inventory suite does |
-| Functional (through the service API) | `services/inventory/tests/test_devices.py`, `test_templates.py`, `test_ports.py`, `test_drivers.py`, `test_driver_metadata_bounds.py`, `test_hypervisors.py`, `test_device_groups.py`, `test_bulk.py`, `test_devices_internal.py`, `test_device_read_visibility_gate.py`, `test_rbac_denial.py`, and siblings; frontend page tests under `frontend/src/test/pages/` | Upstream services are patched; the delete guard is patched to pass in most suites |
+| Unit | `services/inventory/tests/` (`test_*_unit.py`, `test_template_schema_validators.py`, `test_schema_bounds.py`, `test_storage.py`, `test_storage_atomic_write.py`, `test_storage_constraints.py`, `test_device_delete_guard.py`); `services/common/tests/test_csv_safety.py`; `tests/unit/test_poll_floor_parity.py`; frontend `frontend/src/test/api/deleteDeviceErrorMessage.test.ts` | SQLite in memory; `test_storage_constraints.py` turns on SQLite foreign keys, no other inventory suite does |
+| Functional (through the service API) | `services/inventory/tests/test_devices.py`, `test_templates.py`, `test_ports.py`, `test_drivers.py`, `test_driver_metadata_bounds.py`, `test_driver_storage_offload.py`, `test_driver_storage_consistency.py`, `test_hypervisors.py`, `test_device_groups.py`, `test_bulk.py`, `test_devices_internal.py`, `test_device_read_visibility_gate.py`, `test_rbac_denial.py`, and siblings; frontend page tests under `frontend/src/test/pages/` | Upstream services are patched; the delete guard is patched to pass in most suites |
 | Integration (running stack) | `tests/integration/test_device_delete_guard.py`, `test_device_group_visibility.py`, `test_device_batch_fetch.py`, `test_bulk_import_export.py`, `test_driver_flow.py`, `test_dynamic_resources.py`, `test_provisioning_failed.py` | Run by the advisory CI `integration` job and the gates |
 | Stress and load | `tests/load/locustfile.py` (`InventoryBrowser`, `BulkExporter`) | Read and export load only; no write load on inventory |
 | Browser end-to-end | `tests/e2e/test_inventory_filters_playwright.py`, `test_inventory_expanded_playwright.py`, `test_inventory_saved_search_late_load_playwright.py`, `test_inventory_effects_playwright.py`, `test_templates_playwright.py`, `test_dynamic_template_authoring_playwright.py`, `test_device_groups.py`, `test_drivers.py`, `test_bulk_import_export.py`, `test_add_device_ui.py` | Nightly and the gates, not per-PR CI |

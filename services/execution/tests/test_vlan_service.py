@@ -478,3 +478,123 @@ async def test_row_inserted_before_the_lock_is_seen_under_it(shared_engine, monk
 
     assert keys == [vlan_service._ALLOCATION_LOCK_KEY]
     assert vlan != preferred
+
+
+# --- release_allocation_if_orphaned: the ACTIVE to RELEASED compare-and-swap (#1357) ---
+
+
+async def _seed_vlan_row(db, reservation_id, vlan_id, status="ACTIVE", fabric=FABRIC_A):
+    row = VlanAssignment(
+        reservation_id=uuid.UUID(reservation_id),
+        fabric_id=fabric,
+        vlan_id=vlan_id,
+        switch_device_ids=[SWITCH_1],
+        defined_switch_ids=[SWITCH_1],
+        status=status,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return row.id
+
+
+async def _seed_membership(db, reservation_id, allocation_id, status, port="0/0/1"):
+    from app.models.l2_port_assignment import L2PortAssignment
+
+    db.add(
+        L2PortAssignment(
+            reservation_id=uuid.UUID(reservation_id),
+            vlan_assignment_id=allocation_id,
+            switch_device_id=uuid.UUID(SWITCH_1),
+            port=port,
+            intended="RELEASED" if status != "ACTIVE" else "ACTIVE",
+            status=status,
+        )
+    )
+    await db.commit()
+
+
+async def _snapshot(db):
+    rows = (
+        (await db.execute(select(VlanAssignment).execution_options(populate_existing=True)))
+        .scalars()
+        .all()
+    )
+    return {r.id: (r.status, r.released_at, r.vlan_id, list(r.defined_switch_ids)) for r in rows}
+
+
+async def test_release_cas_releases_an_active_orphan_and_nothing_else(db):
+    """The guarded write flips exactly the named row ACTIVE to RELEASED and stamps
+    released_at; every other row (another reservation's ACTIVE row on the same number,
+    an older RELEASED row, an ACTIVE row with a live member) is untouched."""
+    rid, other = str(uuid.uuid4()), str(uuid.uuid4())
+    mine = await _seed_vlan_row(db, rid, 100)
+    rival = await _seed_vlan_row(db, other, 100, fabric=FABRIC_B)
+    await _seed_vlan_row(db, other, 200, status="RELEASED")
+    held = await _seed_vlan_row(db, other, 300)
+    await _seed_membership(db, other, held, "ACTIVE")
+    before = await _snapshot(db)
+
+    assert await vlan_service.release_allocation_if_orphaned(db, mine) is True
+
+    after = await _snapshot(db)
+    assert after[mine][0] == "RELEASED" and after[mine][1] is not None
+    assert after[mine][2:] == before[mine][2:], "number and defined switches are kept"
+    assert {k: v for k, v in after.items() if k != mine} == {
+        k: v for k, v in before.items() if k != mine
+    }
+    assert after[rival][0] == "ACTIVE"
+
+
+@pytest.mark.parametrize("case", ["already_released", "absent"])
+async def test_release_cas_loses_on_a_row_that_is_not_active(db, case):
+    """A row that is not ACTIVE (a concurrent pass released it first) or does not
+    exist matches nothing: False, and no row changes, including released_at."""
+    rid = str(uuid.uuid4())
+    target = (
+        await _seed_vlan_row(db, rid, 100, status="RELEASED")
+        if case == "already_released"
+        else uuid.uuid4()
+    )
+    await _seed_vlan_row(db, str(uuid.uuid4()), 100, fabric=FABRIC_B)
+    before = await _snapshot(db)
+
+    assert await vlan_service.release_allocation_if_orphaned(db, target) is False
+
+    assert await _snapshot(db) == before
+
+
+async def test_release_cas_loses_when_a_membership_joined_since_the_check(db):
+    """The membership predicate is inside the guarded UPDATE: an allocation that holds
+    an ACTIVE membership is not released even when the caller's own count said zero."""
+    rid = str(uuid.uuid4())
+    alloc = await _seed_vlan_row(db, rid, 100)
+    await _seed_membership(db, rid, alloc, "ACTIVE")
+
+    assert await vlan_service.release_allocation_if_orphaned(db, alloc) is False
+
+    assert (await _snapshot(db))[alloc][0] == "ACTIVE"
+
+
+@pytest.mark.parametrize("member_status", ["RELEASED", "FAILED"])
+async def test_release_cas_ignores_memberships_that_are_not_active(db, member_status):
+    """Only an ACTIVE membership holds the allocation: RELEASED history and FAILED rows
+    referencing it do not (the same predicate as count_active_memberships_for_vlan)."""
+    rid = str(uuid.uuid4())
+    alloc = await _seed_vlan_row(db, rid, 100)
+    await _seed_membership(db, rid, alloc, member_status)
+
+    assert await vlan_service.release_allocation_if_orphaned(db, alloc) is True
+    assert (await _snapshot(db))[alloc][0] == "RELEASED"
+
+
+async def test_release_cas_second_release_of_one_row_loses(db):
+    """Two releases of one allocation: the first wins, the second matches nothing and
+    leaves the first one's released_at in place."""
+    rid = str(uuid.uuid4())
+    alloc = await _seed_vlan_row(db, rid, 100)
+
+    assert await vlan_service.release_allocation_if_orphaned(db, alloc) is True
+    first = (await _snapshot(db))[alloc]
+    assert await vlan_service.release_allocation_if_orphaned(db, alloc) is False
+    assert (await _snapshot(db))[alloc] == first
