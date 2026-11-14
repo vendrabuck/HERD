@@ -21,7 +21,7 @@
     "@xyflow/react": "^12.12.1",
     "axios": "^1.21.1",
     "clsx": "^2.1.1",
-    "lucide-react": "^1.71.0",
+    "lucide-react": "^1.72.0",
     "react": "^19.2.4",
     "react-dom": "^19.3.1",
     "react-hot-toast": "^2.6.1",
@@ -57,7 +57,7 @@
     "tailwindcss": "^4.3.3",
     "typescript": "^5.4.5",
     "typescript-eslint": "^8.72.2",
-    "vite": "^8.3.7",
+    "vite": "^8.3.8",
     "vitest": "^5.0.5"
   }
 }
