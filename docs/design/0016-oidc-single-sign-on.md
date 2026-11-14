@@ -292,10 +292,37 @@ login (IAM-LDAP-8).
   `email`; an absent email refuses, as an LDAP entry without email refuses,
   IAM-LDAP-5) and refuse when `email_verified` is present and false. If any `users`
   row has that email compared case-insensitively, refuse: the local or LDAP account is
-  never linked or converted, and the federated user sees the generic failure. If the
-  username (configured claim, default `preferred_username`; the email itself when the
-  claim is absent; refused when longer than 100 characters) is taken, refuse, no
-  retry, no rename. Otherwise create the user (`auth_source="oidc"`,
+  never linked or converted, and the federated user sees the generic failure. The
+  username follows the owner's option C (an owner decision, amended into this record
+  in phase 3): the configured claim (default `preferred_username`) when it matches the
+  ASCII allowlist `^[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}$` in full (1 to 100 characters,
+  a letter or digit first), else the email when it matches, else the first login is
+  refused; the match is a full match, so a trailing newline, which `$` alone would
+  admit, does not pass, and no non-ASCII look-alike ever does. (The first draft took
+  the claim when present, the email only when the claim was absent, and refused a
+  claim longer than 100 characters; option C falls back to the email instead.) The
+  refusal reason follows whether any candidate was present (supervisor decision in
+  the phase 3 review), where present means a string, which `VerifiedIdToken` keeps
+  only when it is non-empty and free of control characters and lone surrogates:
+
+  | Username claim | Email | Username | First login |
+  |---|---|---|---|
+  | fits | present | the claim | proceeds to the next check |
+  | absent, or present and not fitting | fits | the email | proceeds to the next check |
+  | present, not fitting | present, not fitting | none | refused `username_invalid` |
+  | absent | present, not fitting | none | refused `username_invalid` |
+  | any | absent | the claim when it fits, else none | refused `email_missing` |
+
+  The email checks run before the username checks, so an email they refuse (absent,
+  unverified, malformed, too long) is refused with its own reason whatever the
+  username; that is why the last row never reaches a username reason, and why
+  `username_missing` (no candidate present at all) is never the reason through the
+  callback and remains only for a direct caller of `resolve_federated_user`. The
+  callback sets `FederatedLogin.username_unusable` whenever it found no username but a
+  candidate was present: the third and fourth rows, and the last row with a claim
+  that does not fit, where the email refusal comes first.
+  A returning login never reads the username. If the chosen username is taken,
+  refuse, no retry, no rename. Otherwise create the user (`auth_source="oidc"`,
   `hashed_password=None`, role `user`, `full_name` from the `name` claim truncated to
   200 characters or the username) and the federated row in ONE transaction, then
   auto-assign "Not Grouped" through `_auto_assign_not_grouped` like every new account
@@ -436,6 +463,10 @@ Log and response rules for every OIDC module:
   the correlation key.
 - IdP error text (`error_description`, a token-endpoint error body) is logged in the
   message only, truncated to 200 characters; it never reaches a response or a URL.
+  As built (phases 1 and 3) the rule is stricter: no provider text is logged at all.
+  The callback ignores `error_description` and logs only whether `error` was
+  `access_denied`; the protocol module logs the RFC 6749 error code only when it is a
+  registered one.
   The browser sees one of three fixed `sso_error` codes: `cancelled` (IdP
   `error=access_denied`), `unavailable` (D8), `failed` (everything else: bad token,
   collision, inactive account, expired flow).
@@ -486,7 +517,11 @@ boundaries (CONVENTIONS throughout).
   `X-Forwarded-Host`. It must be absolute, `https` (unless `OIDC_REQUIRE_HTTPS=false`),
   carry no query or fragment, and its path must end in `/oidc/callback`; the cookie
   Path for both cookies is that path minus `/callback` (normally `/api/auth/oidc`), so
-  auth needs no separate public-prefix setting.
+  auth needs no separate public-prefix setting. Amended in phase 3: the path must also
+  hold only RFC 3986 unreserved characters, `/`, and `%`, because it becomes the
+  cookies' Path attribute, which Starlette writes unquoted, so a `;` there would end
+  the attribute and inject another (a `Domain`, say); any other character makes the
+  redirect URI invalid (`oidc_configuration_problems`).
 - `next` (query parameter on `GET /oidc/login`) is stored in the flow row, never sent
   to the IdP. Accepted only when it is at most 512 characters, starts with exactly
   one `/` (not `//`, not `/\`), contains no backslash or control character, and
@@ -500,6 +535,38 @@ boundaries (CONVENTIONS throughout).
   not Strict ones; `response_mode=query` keeps it a GET. An attacker who sends a
   victim a callback URL carrying the attacker's own code and state fails the binding
   check in the victim's browser.
+- What the binding cookie does and does not defend against (added in phase 3). It is
+  host-only (no `Domain` attribute), so no sibling host is sent it, and HttpOnly, so
+  no script reads it. It defends against an attacker who cannot write a cookie that
+  the victim's browser sends to HERD's host: the attacker's callback URL, opened in
+  the victim's browser, arrives with no binding cookie or one that hashes to another
+  row, and the claim fails. It does not defend against an attacker who can write
+  such a cookie, for example a sibling subdomain under the same registrable domain
+  setting `herd_oidc_flow` with `Domain=` the parent domain (cookie tossing), or a
+  network attacker answering a plain-HTTP request to such a host where HSTS does not
+  cover it. That attacker begins a flow, plants its binding secret in the victim's
+  browser, and sends the victim the callback URL with the attacker's own code and
+  state; the claim succeeds and the victim is signed in to the attacker's account
+  (login CSRF). When the browser holds both the victim's own cookie and a tossed one,
+  auth reads the last `herd_oidc_flow` in the `Cookie` header (Starlette's parsing),
+  whose order the browser sets (longer Path first, then older first), so a tossed
+  cookie can also make the victim's own sign-in fail. The handoff cookie has the same
+  limit by the same mechanism, with no flow cookie and no callback in the victim's
+  browser: the attacker signs in at the provider in their own browser, takes the
+  `herd_oidc_handoff` secret from their own callback's `Set-Cookie` without
+  exchanging it, tosses it into the victim's browser with a Path that covers
+  `/oidc/exchange`, and sends the victim to `/login/sso` within the handoff's 60 s.
+  That page's exchange is a same-origin request from HERD's own page, so the browser
+  sends the tossed cookie whatever its SameSite, and the victim is signed in to the
+  attacker's account: the same login-CSRF class, open on the same condition. Neither
+  variant gives the attacker the victim's account or tokens: both HERD cookies are
+  host-only and HttpOnly, so the victim's own binding and handoff secrets never reach
+  a sibling host or a script, and the exchange answers tokens only to a JSON request,
+  which a foreign origin, a sibling subdomain included, cannot send without the CORS
+  preflight auth refuses unless `CORS_ORIGINS` names that origin. The `__Host-` cookie prefix would make the
+  browser refuse a tossed cookie, but it requires `Path=/`, which the path scoping
+  above rules out; a deployment that shares its registrable domain with hosts it does
+  not trust should treat login CSRF as open.
 - When the callback carries an `iss` parameter (RFC 9207), it must equal
   `OIDC_ISSUER`.
 - Gateway address: the IdP registration and `OIDC_REDIRECT_URI` must use the address
@@ -639,7 +706,7 @@ verbatim in the code and asserted verbatim in tests. A 404 or 401 body is FastAP
 | `GET /login-options` | none | none | 200 `LoginOptionsResponse` (table above); `Cache-Control: no-store` | none; answers in every mode |
 | `GET /oidc/login` | none | optional query `next` (D11; an invalid value becomes `/topology`, never an error) | 302, `Location` = the IdP authorization URL (see IdP-facing requests), sets `herd_oidc_flow`; `Cache-Control: no-store` | 404 `Single sign-on is not enabled` when not in OIDC mode; 302 `Location: /login?sso_error=unavailable` when OIDC settings are incomplete or discovery cannot be fetched or validated |
 | `GET /oidc/callback` | `herd_oidc_flow` cookie | query `state`, and either `code` or `error`; optional `error_description` (logged only) and `iss`; other parameters ignored | 302 `Location: /login/sso`, sets `herd_oidc_handoff`, clears `herd_oidc_flow`; `Cache-Control: no-store` | 404 `Single sign-on is not enabled` when not in OIDC mode; otherwise always a 302 that clears `herd_oidc_flow`, `Location` per the callback outcome table below |
-| `POST /oidc/exchange` | `herd_oidc_handoff` cookie | JSON body `{}` (`OidcExchangeRequest`) | 200 `OidcExchangeResponse`, clears `herd_oidc_handoff`; `Cache-Control: no-store` | 404 `Single sign-on is not enabled` when not in OIDC mode; 422 for a missing, non-JSON, or non-empty body; 401 `Single sign-on session expired; sign in again` when the cookie is missing, unknown, already exchanged, expired, or its user is now inactive (the cookie is cleared on the 401 too) |
+| `POST /oidc/exchange` | `herd_oidc_handoff` cookie | JSON body `{}` (`OidcExchangeRequest`) | 200 `OidcExchangeResponse`, clears `herd_oidc_handoff`; `Cache-Control: no-store` | 404 `Single sign-on is not enabled` when not in OIDC mode; 422 for a missing, non-JSON, or non-empty body (as built: also a body sent without a JSON Content-Type, by FastAPI's strict content type; a 422 consumes nothing and does not clear the cookie); 401 `Single sign-on session expired; sign in again` when the cookie is missing, unknown, already exchanged, expired, or its user is now inactive, and (as built) when any other exception is raised after the body is validated, logged by class name only (the cookie is cleared on every 401 too) |
 | `POST /login` | none | `LoginRequest`, unchanged | local and LDAP modes unchanged; OIDC mode with `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN=true` and an active local superadmin with the right password: 200 `TokenResponse` | OIDC mode, every other case: 401 `Invalid credentials` with `WWW-Authenticate: Bearer`, after the dummy-hash bcrypt (D5) |
 | `POST /register` | none | `RegisterRequest`, unchanged | local mode unchanged | OIDC mode: 409 `Local registration is disabled; this deployment uses single sign-on.`, before the body is used (the IAM-REG-1 shape); LDAP mode unchanged |
 | `POST /refresh`, `POST /logout`, `POST /tokens/exchange` | unchanged | unchanged | unchanged in every mode (IAM-USER-9) | unchanged |
@@ -658,17 +725,33 @@ row to `failed`):
 | ID-token verification fails (any D8 or D13 rule) | `/login?sso_error=failed` |
 | provisioning refused (D4: email missing or unverified, email or username taken, username too long) | `/login?sso_error=failed` |
 | linked user inactive | `/login?sso_error=failed` |
+| the flow row cannot be completed (`complete_flow` answers False) | `/login?sso_error=failed` |
 | success | `/login/sso` |
+
+As built (phase 3): any other exception raised while the callback runs, at any row,
+answers `/login?sso_error=unavailable` and fails a claimed row; it is logged once by
+exception class name only, with no traceback and no message. `GET /oidc/login` has the
+same catch-all, and maps a `ValueError` from the flow store to `unavailable` too.
+`POST /oidc/exchange` has one around everything after FastAPI validates the body
+(consuming the handoff, reloading the account, minting the tokens): the exception is
+logged the same way, so no database error's bound parameters reach a log, and the
+answer is the exchange's 401, cookie cleared. Every answer the three routes' own code
+produces carries `Cache-Control: no-store`; a 422 does not, nor would a 500 raised
+outside the catch-alls (in FastAPI's dependency handling, or while building a response
+after a catch-all's scope). Outside OIDC mode each route answers its 404 before
+reading any input, so a malformed body gets the 404, not a 422.
 
 #### Cookies
 
 | Name | Value | Attributes | Set by | Cleared by |
 |---|---|---|---|---|
 | `herd_oidc_flow` | 32 random bytes, base64url | HttpOnly, Secure, SameSite=Lax, Max-Age 600, Path = the D11 cookie path | `GET /oidc/login` (a second begin in another tab replaces it, so the first tab's callback then fails as `failed`) | every callback response |
-| `herd_oidc_handoff` | 32 random bytes, base64url | HttpOnly, Secure, SameSite=Strict, Max-Age 60, same Path | a successful callback | every exchange response |
+| `herd_oidc_handoff` | 32 random bytes, base64url | HttpOnly, Secure, SameSite=Strict, Max-Age 60, same Path | a successful callback | every 200 and 401 exchange response, the catch-all's 401 included (as built: the 404 outside OIDC mode and a 422 answer before the route's code runs, set no cookie, and so leave it) |
 
 "Cleared" means a `Set-Cookie` with the same name and Path, an empty value, and
-Max-Age 0.
+Max-Age 0. As built it is Starlette's `delete_cookie`: the value is written `""`, the
+cookie's own SameSite, HttpOnly, and Secure attributes are repeated, and an `expires`
+of the current time is added.
 
 #### IdP-facing requests
 
@@ -720,13 +803,16 @@ hashes (`hash_token`) are stored.
 | 2, `oidc_flow_service.py` | `claim_flow(db, *, state, binding_secret)` | `ClaimedFlow` (`id`, `nonce`, `code_verifier`, `next_path`), or None when no guarded UPDATE matched |
 | 2, `oidc_flow_service.py` | `complete_flow(db, flow_id, *, user_id, handoff_secret)`; `fail_flow(db, flow_id)` | bool, whether the guarded UPDATE matched |
 | 2, `oidc_flow_service.py` | `exchange_handoff(db, *, handoff_secret)` | a (user id, `next_path`) pair, or None |
-| 2, `auth_service.py` | `resolve_federated_user(db, login)`, where `login` is a `FederatedLogin` frozen dataclass (`issuer`, `subject`, `email`, `email_verified`, `username`, `full_name`) defined in phase 2 | the `User`, or None for every D4 refusal and every inactive user, each logged with a fixed `reason` in `extra` |
+| 2, `auth_service.py` | `resolve_federated_user(db, login)`, where `login` is a `FederatedLogin` frozen dataclass (`issuer`, `subject`, `email`, `email_verified`, `username`, `full_name`) defined in phase 2, plus `username_unusable` (bool, default False) added in phase 3 | the `User`, or None for every D4 refusal and every inactive user, each logged with a fixed `reason` in `extra` |
 
 Phase 1's errors are `OidcUnavailableError` (the callback maps it to `unavailable`)
 and `OidcRejectedError` (mapped to `failed`); neither carries IdP text in its `str()`.
 The modules live under `services/auth/app/services/`. Phase 3 maps `VerifiedIdToken`
-to `FederatedLogin` (username is the claim value, or the email when the claim is
-absent; `full_name` is `name` truncated to 200 characters, or the username).
+to `FederatedLogin` (`federated_login_from_token` in `app/routers/oidc.py`; username by
+option C, D4: the claim when it fits the allowlist, else the email when it does, else
+None with `username_unusable` set when a candidate was present, which a first login
+refuses as D4's table says; `full_name` is `name` truncated to 200 characters, or the
+username).
 
 ## Consequences
 
@@ -817,7 +903,11 @@ included.
   an active local superadmin (D5), running the dummy-hash bcrypt on every refusal.
 - `services/auth/app/main.py`: include the router.
 - `tests/contract/snapshots/auth.json`: regenerated with
-  `HERD_UPDATE_OPENAPI_SNAPSHOTS=1 make test-contract` against a running stack.
+  `HERD_UPDATE_OPENAPI_SNAPSHOTS=1 make test-contract` against a running stack. As
+  built, regenerated without a stack: the contract test's own `_signature` applied to
+  the auth app's `app.openapi()`; every entry the change did not add came out
+  byte-equal to the committed snapshot, so the diff is the four routes and four
+  schemas alone.
 - Tests (functional, through the real auth app; MockTransport IdP):
   `services/auth/tests/test_oidc_routes.py`, the happy path to `GET /me` and
   `POST /refresh`, every row of the callback outcome table, every exchange failure,
@@ -959,7 +1049,8 @@ publication, and an IdP test container that speaks SAML.
 ## Owner decisions
 
 The first draft put five questions to the owner. All five were decided by the owner on
-2026-11-11, each as recommended; no owner question remains open. The one condition
+2026-11-11, each as recommended; no owner question remains open. A sixth owner decision,
+the username rule (option C), was made before phase 3 and is the last row below. The one condition
 still pending is the phase 5a measurement, which can return D12 to the owner.
 
 | Decision | Outcome | Lands in |
@@ -969,3 +1060,4 @@ still pending is the phase 5a measurement, which can return D12 to the owner.
 | D7 RP-initiated logout | not in v1; stays in Out of scope | none |
 | D10 active-method source | auth's public `GET /login-options`; config's `GET /status` unchanged, departing from the issue's wording because of staleness | endpoint in phase 3; login page and the LDAP-mode Register link in phase 4 |
 | D12 test IdP | Dex, measured and proved first | phase 5a, then 5b |
+| D4 username, option C (added in phase 3) | the username claim when it fits `^[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}$`, else the email when it fits, else the first login is refused | phase 3 |

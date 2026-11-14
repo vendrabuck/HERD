@@ -1,4 +1,5 @@
 import logging
+import re
 import unicodedata
 import uuid
 from collections.abc import Collection
@@ -316,10 +317,16 @@ class FederatedLogin:
     """One verified IdP sign-in, as provisioning sees it (ADR 0016, D4).
 
     Defined here, not in the OIDC protocol module, so this module never imports
-    it; the callback (phase 3) maps a verified ID token onto it: `username` is
-    the configured claim's value, or the email when the claim is absent;
-    `full_name` is the `name` claim truncated to 200 characters, or the
-    username. `email_verified` is None when the token carries no such claim.
+    it; the callback (`app.routers.oidc.federated_login_from_token`) maps a
+    verified ID token onto it: `username` is `oidc_username(claim, email)`, the
+    owner's option C (None when neither the claim nor the email fits
+    `OIDC_USERNAME_PATTERN`); `username_unusable` is True exactly when the
+    username is None although a candidate (the claim or the email) was present,
+    so a first login is refused as `username_invalid` rather than
+    `username_missing`; `full_name` is the `name` claim truncated to 200
+    characters, or the username. `email_verified` is None when the token
+    carries no such claim. `username_unusable` defaults to False, so a caller
+    that sets `username` itself keeps the reasons below unchanged.
 
     Every field is untrusted IdP content: `resolve_federated_user` validates
     each one before any of it reaches a query, so it returns a User or None for
@@ -332,6 +339,7 @@ class FederatedLogin:
     email_verified: bool | None
     username: str | None
     full_name: str | None
+    username_unusable: bool = False
 
 
 # Column widths of users.email, users.username, and users.full_name. A longer
@@ -352,6 +360,31 @@ _UNSTORABLE = frozenset({"Cc", "Cs"})
 # zero-width space among them), which would let a look-alike of an existing
 # account pass the collision check.
 _FORBIDDEN_IN_NAMES = _UNSTORABLE | {"Cf"}
+
+# The username rule for `oidc` accounts, the owner's option C (ADR 0016 D4 as
+# amended in phase 3): ASCII only, a letter or digit first, then up to 99 of
+# letters, digits, ".", "_", "@", "+", and "-", so 1 to 100 characters. The
+# owner wrote it `^[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}$`; it is applied with
+# `fullmatch` and no anchors, because `$` also matches before a trailing
+# newline. `[A-Za-z0-9]` in a str pattern is the ASCII ranges only, so a
+# fullwidth, Cyrillic, or other non-ASCII look-alike never matches.
+OIDC_USERNAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}")
+
+
+def oidc_username(username_claim: object, email: object) -> str | None:
+    """The username a new `oidc` account gets (option C), or None.
+
+    The configured username claim when it is a string matching
+    `OIDC_USERNAME_PATTERN` in full; else the email when it is; else None,
+    which `resolve_federated_user` refuses at a first login (as
+    `username_invalid` when the caller marks the login `username_unusable`,
+    which the callback does whenever a candidate was present). A returning
+    login never reads it (IAM-OIDC-8).
+    """
+    for candidate in (username_claim, email):
+        if isinstance(candidate, str) and OIDC_USERNAME_PATTERN.fullmatch(candidate):
+            return candidate
+    return None
 
 
 def _has_category(value: str, categories: frozenset[str]) -> bool:
@@ -505,8 +538,13 @@ def _first_login_refusal(login: FederatedLogin) -> str | None:
     absent claim is accepted, ADR 0016 D4); leading or trailing whitespace, a
     Cc, Cf, or Cs character, or anything but exactly one `@` with text on both
     sides is `email_invalid`; over 255 characters is `email_too_long`. The
-    username likewise: `username_missing`, `username_invalid`,
-    `username_too_long` (over 100). No other character rule applies yet.
+    username likewise: `username_invalid` when it is None and
+    `username_unusable` is True (option C found a candidate but none fit),
+    else `username_missing`, `username_invalid`,
+    `username_too_long` (over 100), and then `username_invalid` for any
+    username `OIDC_USERNAME_PATTERN` does not match in full (option C; the
+    callback already passes only a matching username or None, so this is the
+    second line for a direct caller).
     """
     email = login.email
     if not isinstance(email, str) or not email.strip():
@@ -519,12 +557,16 @@ def _first_login_refusal(login: FederatedLogin) -> str | None:
     if len(email) > _EMAIL_MAX_LENGTH:
         return "email_too_long"
     username = login.username
+    if username is None and login.username_unusable is True:
+        return "username_invalid"
     if not isinstance(username, str) or not username.strip():
         return "username_missing"
     if not _name_is_clean(username):
         return "username_invalid"
     if len(username) > _USERNAME_MAX_LENGTH:
         return "username_too_long"
+    if not OIDC_USERNAME_PATTERN.fullmatch(username):
+        return "username_invalid"
     return None
 
 
@@ -818,9 +860,70 @@ async def _authenticate_ldap(db: AsyncSession, email: str, password: str) -> Use
     return user
 
 
+def _refuse_password_login_in_oidc_mode(email: str, reason: str) -> None:
+    logger.warning(
+        "Login refused in single sign-on mode: %s",
+        reason,
+        extra={"action": "login_failure", "email": email, "reason": reason, "source": "oidc"},
+    )
+    return None
+
+
+async def _authenticate_oidc_mode(db: AsyncSession, email: str, password: str) -> User | None:
+    """`POST /login` while `auth_method == "oidc"` (ADR 0016 D5, break-glass).
+
+    With OIDC_BREAK_GLASS_LOCAL_SUPERADMIN false, every account is refused
+    after one bcrypt against the dummy hash; the database is not read. With it
+    true, exactly one class of account is admitted: an existing account found
+    by exact email that is `auth_source="local"`, role superadmin, active, has
+    a password hash, and whose password verifies. Every other account (unknown
+    email, `oidc` or `ldap`, a local admin or user, an inactive superadmin) is
+    refused after one bcrypt against the dummy hash, BEFORE its own hash is
+    looked at, so an ineligible account's password is never checked. An
+    eligible account with a wrong password is refused after the one bcrypt
+    against its own hash, the same work its success costs. So every answer,
+    admitted or refused, costs exactly one bcrypt (IAM-LOGIN-2's
+    equalization). Each refusal logs one WARNING with a fixed `reason`; an
+    admission logs one WARNING too (`oidc_break_glass_login`), so every use of
+    the switch is visible.
+    """
+    if not settings.oidc_break_glass_local_superadmin:
+        verify_password(password, _DUMMY_HASH)
+        return _refuse_password_login_in_oidc_mode(email, "password_login_disabled")
+    user = await get_user_by_email(db, email)
+    if (
+        user is None
+        or user.auth_source != "local"
+        or user.role != Role.SUPERADMIN
+        or not user.is_active
+        or not user.hashed_password
+    ):
+        verify_password(password, _DUMMY_HASH)
+        return _refuse_password_login_in_oidc_mode(email, "break_glass_not_eligible")
+    if not verify_password(password, user.hashed_password):
+        return _refuse_password_login_in_oidc_mode(email, "wrong_password")
+    logger.warning(
+        "Break-glass login of a local superadmin in single sign-on mode",
+        extra={
+            "action": "oidc_break_glass_login",
+            "user_id": str(user.id),
+            "email": email,
+        },
+    )
+    return user
+
+
 async def authenticate_user(db: AsyncSession, email: str, password: str) -> User | None:
+    """The account a `POST /login` admits, or None; one backend per mode.
+
+    LDAP mode binds against the directory, OIDC mode admits only the D5
+    break-glass account (`_authenticate_oidc_mode`), and local mode checks the
+    stored bcrypt hash.
+    """
     if settings.auth_method == "ldap":
         return await _authenticate_ldap(db, email, password)
+    if settings.auth_method == "oidc":
+        return await _authenticate_oidc_mode(db, email, password)
     return await _authenticate_local(db, email, password)
 
 

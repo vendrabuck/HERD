@@ -1,5 +1,6 @@
 import logging
 import os
+import string
 from typing import Literal
 from urllib.parse import unquote, urlsplit
 
@@ -27,6 +28,13 @@ OidcIdTokenAlgorithm = Literal[
 
 # The path OIDC_REDIRECT_URI must end in (ADR 0016 D11).
 OIDC_CALLBACK_PATH_SUFFIX = "/oidc/callback"
+
+# The characters OIDC_REDIRECT_URI's path may hold: RFC 3986 unreserved
+# characters, "/", and "%" (percent-encoding). Both OIDC cookies take their
+# Path from it (oidc_cookie_path), and Starlette writes the Path attribute
+# unquoted, so a ";" there would end the attribute and start another (a
+# Domain, say). Anything outside this set makes the redirect URI invalid.
+_REDIRECT_PATH_CHARACTERS = frozenset(string.ascii_letters + string.digits + "-._~/%")
 
 
 class Settings(HerdBaseSettings):
@@ -131,7 +139,9 @@ class Settings(HerdBaseSettings):
     # Optional CA bundle path (inside the container) for a private IdP CA; when
     # empty the system trust store is used.
     oidc_ca_cert: str = ""
-    # ADR 0016 D5. The field only; POST /login reads it from ADR 0016 phase 3.
+    # ADR 0016 D5: when true, POST /login in OIDC mode admits an active local
+    # superadmin with the right password and refuses every other account
+    # (auth_service._authenticate_oidc_mode).
     oidc_break_glass_local_superadmin: bool = False
 
     log_level: str = "INFO"
@@ -252,6 +262,24 @@ def _absolute_url_ok(value: str, require_https: bool) -> bool:
     )
 
 
+def oidc_cookie_path(config: Settings) -> str | None:
+    """The Path of both OIDC cookies (ADR 0016 D11), or None.
+
+    It is the path of OIDC_REDIRECT_URI minus its final `/callback` (normally
+    `/api/auth/oidc`), so auth needs no public-prefix setting. None when
+    OIDC_REDIRECT_URI is not a usable redirect URI: not an absolute URL by
+    `_absolute_url_ok`, a path not ending in /oidc/callback, or a path holding
+    any character outside `_REDIRECT_PATH_CHARACTERS`.
+    """
+    redirect = config.oidc_redirect_uri
+    if not _absolute_url_ok(redirect, config.oidc_require_https):
+        return None
+    path = urlsplit(redirect).path
+    if not path.endswith(OIDC_CALLBACK_PATH_SUFFIX) or not set(path) <= _REDIRECT_PATH_CHARACTERS:
+        return None
+    return path[: -len("/callback")]
+
+
 def oidc_configuration_problems(config: Settings) -> list[str]:
     """The OIDC settings that are missing or invalid, by variable name.
 
@@ -261,7 +289,8 @@ def oidc_configuration_problems(config: Settings) -> list[str]:
     the issuer and the redirect URI absolute, https unless OIDC_REQUIRE_HTTPS is
     false, printable ASCII, with no userinfo, no query or fragment (not even a
     bare `?` or `#`), and no `..` path segment; the redirect URI's path ending in
-    /oidc/callback (ADR 0016 D11); OIDC_SCOPES naming openid; the two claim
+    /oidc/callback (ADR 0016 D11) and holding only RFC 3986 unreserved
+    characters, `/`, and `%` (`oidc_cookie_path`); OIDC_SCOPES naming openid; the two claim
     names set; OIDC_CA_CERT, when set, naming an existing file. A value of white
     space only counts as missing.
     """
@@ -273,11 +302,7 @@ def oidc_configuration_problems(config: Settings) -> list[str]:
         problems.append("OIDC_CLIENT_ID")
     if not config.oidc_client_secret.strip():
         problems.append("OIDC_CLIENT_SECRET")
-    redirect = config.oidc_redirect_uri
-    if not (
-        _absolute_url_ok(redirect, require_https)
-        and urlsplit(redirect).path.endswith(OIDC_CALLBACK_PATH_SUFFIX)
-    ):
+    if oidc_cookie_path(config) is None:
         problems.append("OIDC_REDIRECT_URI")
     if "openid" not in config.oidc_scopes.split():
         problems.append("OIDC_SCOPES")
@@ -302,8 +327,8 @@ def log_oidc_startup_warnings(config: Settings) -> list[str]:
     - `oidc_https_not_required` when OIDC_REQUIRE_HTTPS is false;
     - `oidc_break_glass_enabled` when OIDC_BREAK_GLASS_LOCAL_SUPERADMIN is true.
 
-    ADR 0016 phase 3 calls this from the lifespan; until auth_method admits
-    "oidc" it never fires.
+    `app.main.lifespan` calls this at startup; until auth_method admits "oidc"
+    (ADR 0016 phase 6) it never fires outside tests.
     """
     if config.auth_method != "oidc":
         return []

@@ -320,7 +320,9 @@ def idp(monkeypatch, keys, caplog):
     yield fake
     oidc_service.reset_caches()
     formatter = JSONFormatter("auth")
-    formatted = [formatter.format(record) for record in caplog.records]
+    # In a fixture's teardown caplog.records holds only the teardown phase.
+    phases = [*caplog.get_records("setup"), *caplog.get_records("call")]
+    formatted = [formatter.format(record) for record in phases]
     extra = fake.extra_secrets + ([fake.id_token] if fake.id_token else [])
     assert secret_findings(formatted, extra) == []
 

@@ -31,7 +31,7 @@ numbered in section 8.
 
 | Actor | May | May not |
 |---|---|---|
-| Unauthenticated caller | Register (local mode only), log in, refresh, log out, exchange an API token, read `/health` and `/version` | Anything else; every other route answers 401 |
+| Unauthenticated caller | Register (local mode only), log in, refresh, log out, exchange an API token, read the login options, use the three single sign-on routes (OIDC mode only, which no deployment can select until ADR 0016 phase 6), read `/health` and `/version` | Anything else; every other route answers 401 |
 | User | Read their own account, edit their own profile (name, contact email, phone), list groups by name, read any user's group memberships, ask the acl service about their own access | Read a group's members, change any group, list users, change roles or activation, create API tokens, manage grants, ask about another user's access |
 | Admin | Everything a user may; list users; edit any account's profile, the superadmin's included; activate any account; deactivate any account other than their own and the superadmin's; manage groups and members; manage directory mappings and run directory sync; create API tokens for any principal of their rank or lower; list and revoke every API token; manage grants; ask about any user's access | Change any role; assign the superadmin role; deactivate the superadmin or themselves; mint a token above their own rank |
 | Superadmin | Everything an admin may; set any other non-superadmin account's role to user or admin; mint superadmin tokens | Change their own role or another superadmin's; assign the superadmin role; deactivate themselves |
@@ -51,7 +51,7 @@ numbered in section 8.
 | "Not Grouped" | An ordinary group, found by that exact name, that holds users who belong to no other group | auth | `user_groups` |
 | Directory mapping | One directory group DN mirrored into one HERD group | auth | `ldap_group_mappings` (`LdapGroupMapping` in `services/auth/app/models/ldap_group_mapping.py`) |
 | Sync run | The audit row of one directory sync pass: trigger, status, counters, capped detail | auth | `ldap_sync_runs` (`LdapSyncRun` in `services/auth/app/models/ldap_sync_run.py`) |
-| OIDC login flow | One single sign-on attempt (ADR 0016): the SHA-256 hashes of its `state`, its browser-binding secret, and, once authenticated, its handoff secret; the `nonce` as issued; the PKCE verifier until the callback claims the row; the sanitized return path; a status; the flow expiry (600 s) and the handoff expiry (60 s). No route writes it yet: the service functions are dark until ADR 0016 phase 3 | auth | `oidc_login_flows` (`OidcLoginFlow` in `services/auth/app/models/oidc_login_flow.py`) |
+| OIDC login flow | One single sign-on attempt (ADR 0016): the SHA-256 hashes of its `state`, its browser-binding secret, and, once authenticated, its handoff secret; the `nonce` as issued; the PKCE verifier until the callback claims the row; the sanitized return path; a status; the flow expiry (600 s) and the handoff expiry (60 s). Written only by the single sign-on routes, which answer only in OIDC mode (IAM-OIDC-15) | auth | `oidc_login_flows` (`OidcLoginFlow` in `services/auth/app/models/oidc_login_flow.py`) |
 | Federated identity | One identity-provider account, keyed by the ID token's (`iss`, `sub`) pair, linked to exactly one `oidc` account; never keyed by email. Holds `last_login_at` | auth | `federated_identities` (`FederatedIdentity` in `services/auth/app/models/federated_identity.py`) |
 | Resource grant | A user group's `view` or `manage` permission on one resource. `group_id` is a bare auth id and `resource_id` a bare id of another service's resource, neither with a foreign key | acl | `resource_grants` (`ResourceGrant` in `services/acl/app/models/grant.py`) |
 | Internal token | The shared secret `INTERNAL_API_TOKEN` sent as `X-Internal-Token` on service-to-service calls with no acting user | every service | environment |
@@ -84,7 +84,7 @@ API token, a sync run, and an OIDC login flow.
 
 | From | To | Performed by | Guard | Stages | Rule |
 |---|---|---|---|---|---|
-| (none) | account `active` | `POST /register`; LDAP login; directory sync provisioning; startup seed; OIDC first login (`resolve_federated_user`, no route yet) | see the feature rules | nothing | IAM-ACCT-6, IAM-OIDC-9 |
+| (none) | account `active` | `POST /register`; LDAP login; directory sync provisioning; startup seed; OIDC first login (`GET /oidc/callback` through `resolve_federated_user`) | see the feature rules | nothing | IAM-ACCT-6, IAM-OIDC-9 |
 | account `active` | account `inactive (manual)` | `POST /users/{id}/deactivate` | admin; not self; not the superadmin | nothing | IAM-ACCT-1 |
 | any account status | account `active` | `POST /users/{id}/activate` | admin | nothing | IAM-ACCT-2 |
 | account `active` | account `inactive (sync)` | directory sync deactivation sweep | proven absent or disabled; breaker not tripped; row still active at write time | nothing | IAM-ACCT-3 |
@@ -97,11 +97,11 @@ API token, a sync run, and an OIDC login flow.
 | (none) | run `running` | sync-now, interval tick, direct `run_sync` | run slot acquired | nothing | IAM-RUN-1 |
 | run `running` | `success`, `partial`, `aborted`, `failed` | the run's own finalizer | see rules | nothing | IAM-RUN-2, IAM-RUN-3, IAM-RUN-4, IAM-RUN-5 |
 | run `running` | run `failed` | stale-run reaper | older than the stale threshold, still `running` at write time | nothing | IAM-RUN-6 |
-| (none) | OIDC flow `pending` | `start_flow` (no route yet) | none; prunes first | nothing | IAM-OIDC-1, IAM-OIDC-3 |
-| OIDC flow `pending` | OIDC flow `claimed` | `claim_flow` | state and binding hashes match, `pending`, unexpired, all at write time | nothing | IAM-OIDC-4 |
-| OIDC flow `claimed` | OIDC flow `authenticated` | `complete_flow` | `claimed`, unexpired, at write time | nothing | IAM-OIDC-5 |
-| OIDC flow `claimed` | OIDC flow `failed` | `fail_flow` | `claimed` at write time | nothing | IAM-OIDC-6 |
-| OIDC flow `authenticated` | OIDC flow `exchanged` | `exchange_handoff` | handoff hash matches, `authenticated`, handoff unexpired, user active, all at write time | nothing | IAM-OIDC-7 |
+| (none) | OIDC flow `pending` | `GET /oidc/login` (`start_flow`) | none; prunes first | nothing | IAM-OIDC-1, IAM-OIDC-3, IAM-OIDC-17 |
+| OIDC flow `pending` | OIDC flow `claimed` | `GET /oidc/callback` (`claim_flow`) | state and binding hashes match, `pending`, unexpired, all at write time | nothing | IAM-OIDC-4 |
+| OIDC flow `claimed` | OIDC flow `authenticated` | `GET /oidc/callback` (`complete_flow`) | `claimed`, unexpired, at write time | nothing | IAM-OIDC-5 |
+| OIDC flow `claimed` | OIDC flow `failed` | `GET /oidc/callback` (`fail_flow`), on every failure after the claim | `claimed` at write time | nothing | IAM-OIDC-6, IAM-OIDC-18 |
+| OIDC flow `authenticated` | OIDC flow `exchanged` | `POST /oidc/exchange` (`exchange_handoff`) | handoff hash matches, `authenticated`, handoff unexpired, user active, all at write time | nothing | IAM-OIDC-7, IAM-OIDC-20 |
 
 The deactivation sweep and the manual endpoints are the only writers of `is_active`;
 nothing deletes a user account.
@@ -149,8 +149,8 @@ are plain ORM writes; only one sync run can execute at a time (IAM-SERIAL-1).
   Pinned by: `services/auth/tests/test_auth.py` (`test_inactive_user_blocked_from_me_and_refresh`); `services/auth/tests/test_auth_service_unit.py` (`test_authenticate_user_rejects_deactivated_local_user`); `services/auth/tests/test_auth_ldap.py` (`test_ldap_login_inactive_user_returns_401`); `services/auth/tests/test_api_tokens.py` (`test_exchange_inactive_principal_returns_none`); `services/auth/tests/test_internal.py` (`test_internal_user_groups_404_for_inactive_user`)
 - **IAM-ACCT-6.** Every account is created active: by registration (local, role user),
   by LDAP login or directory sync provisioning (LDAP, role user, no password hash), by
-  OIDC first-login provisioning (`oidc`, role user, no password hash; no route calls it
-  yet), or by the startup seed (local, role superadmin). \
+  OIDC first-login provisioning (`oidc`, role user, no password hash; reached only
+  through `GET /oidc/callback` in OIDC mode), or by the startup seed (local, role superadmin). \
   Enforced in: `services/auth/app/services/auth_service.py` (`create_user`, `create_ldap_user`, `create_oidc_user`); `services/auth/app/models/user.py` (`User`) \
   Pinned by: `services/auth/tests/test_routers_direct.py` (`test_register_endpoint_success`); `services/auth/tests/test_ldap_sync_service.py` (`test_preprovision_creates_ldap_user_without_password`); `services/auth/tests/test_oidc_provisioning.py` (`test_first_login_creates_an_oidc_user_with_no_password_and_role_user`); `services/auth/tests/test_main.py` (`test_seed_superadmin_creates_new_superadmin`)
 - **IAM-SESSION-1.** Login and refresh each issue one new refresh token: a random UUID4
@@ -265,10 +265,14 @@ are plain ORM writes; only one sync run can execute at a time (IAM-SERIAL-1).
   or Cs character, or not exactly one `@` with text on both sides (`email_invalid`);
   the email is over 255 characters (`email_too_long`); the username is absent, not a
   string, empty, or whitespace only (`username_missing`); it has leading or trailing
-  whitespace or a Cc, Cf, or Cs character (`username_invalid`); or it is over 100
-  characters (`username_too_long`). No other character rule applies to either. \
-  Enforced in: `services/auth/app/services/auth_service.py` (`resolve_federated_user`, `create_oidc_user`, `_first_login_refusal`, `FederatedLogin`) \
-  Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_first_login_creates_an_oidc_user_with_no_password_and_role_user`, `test_first_login_full_name_defaults_and_truncation`, `test_full_name_control_characters_are_replaced`, `test_first_login_auto_assigns_not_grouped`, `test_email_verified_true_or_absent_is_accepted`, `test_values_at_the_column_width_are_accepted`, `test_first_login_refusal_creates_nothing_and_logs_one_fixed_reason`, `test_email_and_username_content_refusals`, `test_create_oidc_user_rolls_back_both_rows_on_a_conflict`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_control_characters_in_full_name_are_replaced_on_postgres`)
+  whitespace or a Cc, Cf, or Cs character (`username_invalid`); it is over 100
+  characters (`username_too_long`); or it does not match the option C allowlist
+  `OIDC_USERNAME_PATTERN` in full (`username_invalid`, IAM-OIDC-19); a username of
+  None is `username_invalid` instead of `username_missing` when the login is marked
+  `username_unusable` (IAM-OIDC-19). No other
+  character rule applies to the email. \
+  Enforced in: `services/auth/app/services/auth_service.py` (`resolve_federated_user`, `create_oidc_user`, `_first_login_refusal`, `FederatedLogin`, `OIDC_USERNAME_PATTERN`) \
+  Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_first_login_refuses_a_username_outside_the_allowlist`, `test_first_login_creates_an_oidc_user_with_no_password_and_role_user`, `test_first_login_full_name_defaults_and_truncation`, `test_full_name_control_characters_are_replaced`, `test_first_login_auto_assigns_not_grouped`, `test_email_verified_true_or_absent_is_accepted`, `test_values_at_the_column_width_are_accepted`, `test_first_login_refusal_creates_nothing_and_logs_one_fixed_reason`, `test_email_and_username_content_refusals`, `test_create_oidc_user_rolls_back_both_rows_on_a_conflict`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_control_characters_in_full_name_are_replaced_on_postgres`)
 - **IAM-OIDC-10.** A first login whose email or username is held by any account, local,
   LDAP, or `oidc`, active or not, compared case-insensitively with the database's
   `lower()`, is refused; no account is linked, converted, or changed. This holds between
@@ -321,8 +325,12 @@ Auth service:
 
 | Method | Path | Who may call | Success | Rules |
 |---|---|---|---|---|
+| GET | `/login-options` | anyone, unauthenticated; every mode | 200 | IAM-OIDC-16 |
 | POST | `/register` | anyone, unauthenticated; local mode only | 201 | IAM-REG-1 to IAM-REG-6, IAM-PROFILE-9 |
-| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-4, IAM-LDAP-1 to IAM-LDAP-11 |
+| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-4, IAM-LDAP-1 to IAM-LDAP-11, IAM-OIDC-21 |
+| GET | `/oidc/login` | anyone, unauthenticated; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-17 |
+| GET | `/oidc/callback` | anyone holding the `herd_oidc_flow` cookie; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-18, IAM-OIDC-19 |
+| POST | `/oidc/exchange` | anyone holding the `herd_oidc_handoff` cookie; OIDC mode only, else 404 | 200 | IAM-OIDC-15, IAM-OIDC-20 |
 | POST | `/refresh` | anyone holding a refresh token | 200 | IAM-SESSION-1, IAM-SESSION-2, IAM-JWT-2 |
 | POST | `/logout` | anyone, unauthenticated | 204 | IAM-SESSION-3 |
 | GET | `/me` | any signed-in active account | 200 | IAM-JWT-3, IAM-ROLE-8, IAM-PROFILE-10 |
@@ -405,9 +413,10 @@ account with an email, a username, and a password, then sign in with it.
 **Rules.**
 
 - **IAM-REG-1.** When `AUTH_METHOD=ldap`, registration is refused with 409 before the
-  body is used. \
-  Enforced in: `services/auth/app/routers/auth.py` (`register`) \
-  Pinned by: `services/auth/tests/test_auth_ldap.py` (`test_register_blocked_when_ldap_mode`)
+  body is used; in OIDC mode likewise, with the detail `Local registration is disabled;
+  this deployment uses single sign-on.`, also for a body naming an existing account. \
+  Enforced in: `services/auth/app/routers/auth.py` (`register`, `REGISTER_DISABLED_LDAP_DETAIL`, `REGISTER_DISABLED_OIDC_DETAIL`) \
+  Pinned by: `services/auth/tests/test_auth_ldap.py` (`test_register_blocked_when_ldap_mode`, `test_register_blocked_when_oidc_mode`)
 - **IAM-REG-2.** The email must be a valid address; the username 3 to 32 characters of
   letters, digits, `_`, and `-`; the password 8 to 72 characters (72 is bcrypt's input
   limit). \
@@ -1661,6 +1670,130 @@ field; changing the login email or username; notification cache invalidation on 
 profile write; refreshing a name that still equals an old username after a directory
 sync renames the account (IAM-PROFILE-7).
 
+### 8.19 Single sign-on (OpenID Connect), dark until ADR 0016 phase 6
+
+**What it does.** On a deployment set to `AUTH_METHOD=oidc`, the login page offers a
+"Sign in with" button that sends the browser to the identity provider; the provider
+sends it back, auth signs the person in (creating their account on the first visit),
+and the page trades a one-time cookie for the usual HERD tokens. Nobody can select that
+mode yet: `AUTH_METHOD` accepts only `local` and `ldap` until ADR 0016 phase 6, so on
+every deployment today the three single sign-on routes answer 404, and only
+`GET /login-options` and the LDAP-mode `registration_open` value are visible. The flow
+store and provisioning rules are IAM-OIDC-1 to IAM-OIDC-14 in section 4; the design is
+[ADR 0016](../design/0016-oidc-single-sign-on.md).
+
+**Surfaces.** Routes `GET /login-options` (`services/auth/app/routers/auth.py`) and
+`GET /oidc/login`, `GET /oidc/callback`, `POST /oidc/exchange`
+(`services/auth/app/routers/oidc.py`); `POST /login` in OIDC mode. No user interface
+yet (ADR 0016 phase 4).
+
+**Rules.**
+
+- **IAM-OIDC-15.** Outside OIDC mode, `GET /oidc/login`, `GET /oidc/callback`, and
+  `POST /oidc/exchange` each answer 404 `Single sign-on is not enabled` with
+  `Cache-Control: no-store`, before any query parameter, cookie, or body is read (a
+  malformed body gets the 404, not a 422), with no database session opened and no
+  cookie set. \
+  Enforced in: `services/auth/app/routers/oidc.py` (`_SingleSignOnRoute`, `NOT_ENABLED_DETAIL`) \
+  Pinned by: `services/auth/tests/test_oidc_routes.py` (`test_every_route_answers_404_outside_oidc_mode_before_reading_input`)
+- **IAM-OIDC-16.** `GET /login-options` answers in every mode, unauthenticated, with
+  `Cache-Control: no-store` and no database read: local mode `registration_open` true,
+  `password_login` true, `sso` null; LDAP mode `registration_open` false,
+  `password_login` true, `sso` null; OIDC mode `registration_open` false,
+  `password_login` equal to `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN`, `sso` holding
+  `provider_name` (`OIDC_PROVIDER_NAME`), also when the OIDC settings are incomplete.
+  The break-glass setting changes nothing outside OIDC mode. \
+  Enforced in: `services/auth/app/routers/auth.py` (`login_options`); `services/auth/app/schemas/auth.py` (`LoginOptionsResponse`, `SsoOptions`) \
+  Pinned by: `services/auth/tests/test_login_options.py` (`test_login_options_per_mode`, `test_sso_is_offered_in_oidc_mode_even_with_incomplete_settings`, `test_login_options_is_public_and_ignores_a_bad_bearer`)
+- **IAM-OIDC-17.** `GET /oidc/login` answers 302 to the provider's authorization URL
+  (the parameters of ADR 0016, IdP-facing requests; `redirect_uri` is always
+  `OIDC_REDIRECT_URI`, never derived from a request header), stores a `pending` flow
+  row whose return path is the raw `next` as the flow store sanitizes it (IAM-OIDC-2),
+  and sets `herd_oidc_flow` to a 43-character secret with HttpOnly, Secure,
+  SameSite=Lax, Max-Age 600, no Domain, and the Path that is `OIDC_REDIRECT_URI`'s path
+  minus `/callback`. That path may hold only RFC 3986 unreserved characters, `/`, and
+  `%`; any other character makes `OIDC_REDIRECT_URI` invalid, since the Path attribute
+  is written unquoted. With incomplete settings, a discovery failure, a `ValueError`
+  from the flow store, or any other exception (logged once by class name, with no
+  traceback or message), it answers 302 `/login?sso_error=unavailable` and sets no
+  cookie. Every answer carries `Cache-Control: no-store`. \
+  Enforced in: `services/auth/app/routers/oidc.py` (`oidc_login`, `_set_cookie`, `_log_unexpected`); `services/auth/app/config.py` (`oidc_cookie_path`, `oidc_configuration_problems`, `_REDIRECT_PATH_CHARACTERS`) \
+  Pinned by: `services/auth/tests/test_oidc_routes.py` (`test_begin_redirects_to_the_provider_and_sets_the_flow_cookie`, `test_both_cookies_take_their_path_from_the_redirect_uri`, `test_begin_passes_the_raw_next_to_the_flow_store`, `test_begin_with_incomplete_settings_answers_unavailable`, `test_begin_when_discovery_fails_answers_unavailable`, `test_begin_maps_a_flow_store_value_error_to_unavailable`, `test_begin_catch_all_answers_unavailable_and_logs_the_class_only`, `test_begin_prunes_rows_expired_more_than_an_hour`, `test_no_url_is_derived_from_request_headers`); `services/auth/tests/test_oidc_settings.py` (`test_the_allowed_redirect_path_characters_are_exactly_the_set`, `test_each_refused_redirect_path_character_yields_no_cookie_path`, `test_a_semicolon_alone_is_refused_in_the_redirect_path`)
+- **IAM-OIDC-18.** `GET /oidc/callback` always answers 302 with `Cache-Control:
+  no-store` and a `Set-Cookie` clearing `herd_oidc_flow`, its `Location` the first
+  matching row: a missing or empty `state`, a missing `herd_oidc_flow`, or a claim that
+  fails (unknown state, expired row, wrong binding) gives `failed` and leaves the row
+  as it was; after a claim, an `error` parameter gives `cancelled` when it is
+  `access_denied` and `failed` otherwise; no `code` gives `failed`; an `iss` parameter
+  that is present (empty included) and not exactly `OIDC_ISSUER` gives `failed`; the
+  provider unavailable (`OidcUnavailableError`) gives `unavailable`; the provider's
+  answer refused (`OidcRejectedError`) gives `failed`; provisioning refused or an
+  inactive account gives `failed`; `complete_flow` answering False gives `failed`;
+  success gives `/login/sso` and sets `herd_oidc_handoff` to a 43-character secret
+  with HttpOnly, Secure, SameSite=Strict, Max-Age 60, and the same Path. The code is
+  redeemed with the claimed row's verifier and nonce. Every failure after the claim
+  moves the row to `failed`. Any other exception gives `unavailable`, fails a claimed
+  row, and is logged once by class name only. The user id is read before
+  `complete_flow`, which can expire the account's ORM instance. \
+  Enforced in: `services/auth/app/routers/oidc.py` (`oidc_callback`, `_finish_claimed`, `_fail`) \
+  Pinned by: `services/auth/tests/test_oidc_routes.py` (`test_full_sign_in_reaches_me_and_refresh`, `test_a_returning_login_reuses_the_account`, `test_the_claimed_flows_nonce_and_verifier_reach_redeem_code`, `test_callback_before_the_claim_answers_failed`, `test_a_second_begin_replaces_the_cookie_and_the_first_tab_fails`, `test_login_csrf_with_the_attackers_state_fails_in_the_victims_browser`, `test_a_replayed_callback_fails_and_never_redeems_the_code_twice`, `test_callback_error_and_code_rows`, `test_the_rfc_9207_iss_parameter_must_equal_the_issuer`, `test_provider_unavailable_after_the_claim_answers_unavailable`, `test_token_endpoint_refusals_answer_failed`, `test_every_id_token_refusal_answers_failed`, `test_at_hash_is_not_checked_by_decision`, `test_provisioning_refusals_answer_failed_and_link_nothing`, `test_an_inactive_linked_account_is_refused_at_the_callback`, `test_complete_flow_false_fails_the_row_and_answers_failed`, `test_the_user_id_is_read_before_complete_flow_can_expire_it`, `test_callback_catch_all_answers_unavailable_and_logs_the_class_only`)
+- **IAM-OIDC-19.** A new `oidc` account's username follows the owner's option C: the
+  configured username claim when it matches `^[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}$` in
+  full (ASCII only, a letter or digit first, 1 to 100 characters, no trailing
+  newline), else the email when it does, else none. A first login with none is refused
+  as `username_invalid` when a candidate was present (the claim or the email held as a
+  string; the callback sets `username_unusable`), and as `username_missing` only when
+  neither was, a case the email checks, which run first, always refuse earlier as
+  `email_missing`. A returning login never reads it. The `name` claim cut to 200
+  characters, or the username, is the full name passed to provisioning. \
+  Enforced in: `services/auth/app/routers/oidc.py` (`federated_login_from_token`); `services/auth/app/services/auth_service.py` (`oidc_username`, `OIDC_USERNAME_PATTERN`, `_first_login_refusal`, `username_unusable`) \
+  Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_option_c_picks_the_claim_then_the_email_then_nothing`, `test_option_c_pattern_is_the_owners_allowlist`, `test_a_returning_login_ignores_the_username`, `test_username_unusable_selects_the_refusal_reason`, `test_username_unusable_is_ignored_when_the_username_fits`); `services/auth/tests/test_oidc_routes.py` (`test_option_c_username_over_http`, `test_federated_login_from_token_maps_every_field`, `test_option_c_mapping_table`, `test_provisioning_refusals_answer_failed_and_link_nothing`)
+- **IAM-OIDC-20.** `POST /oidc/exchange` takes exactly `{}` sent with a JSON
+  Content-Type (anything else is FastAPI's 422, which consumes nothing) and consumes
+  the `herd_oidc_handoff` cookie once, answering 200 with `access_token`,
+  `refresh_token`, `token_type` `bearer`, and `next` (the stored, sanitized return
+  path). It answers 401 `Single sign-on session expired; sign in again` when the cookie
+  is missing, unknown, already exchanged, or expired, or its account is inactive, the
+  last checked in the exchange's own conditional update and again on the reloaded
+  account just before tokens are issued. Any other exception after the body is
+  validated, before or after the handoff row is consumed, is logged once by class
+  name only (no traceback, no message) and answers the same 401, with no token
+  issued. The 200 and every 401 carry `Cache-Control: no-store` and clear the cookie;
+  the 404 outside OIDC mode and a 422 come before the route's code and leave it. The
+  tokens are an ordinary session: `GET /me` and `POST /refresh` accept them. \
+  Enforced in: `services/auth/app/routers/oidc.py` (`oidc_exchange`, `_exchange_refused`); `services/auth/app/schemas/auth.py` (`OidcExchangeRequest`, `OidcExchangeResponse`) \
+  Pinned by: `services/auth/tests/test_oidc_routes.py` (`test_full_sign_in_reaches_me_and_refresh`, `test_exchange_without_a_cookie_answers_401_and_clears_it`, `test_exchange_refusals_answer_401`, `test_exchange_refused_for_a_user_deactivated_after_the_callback`, `test_exchange_rechecks_the_user_after_the_handoff_is_consumed`, `test_exchange_catch_all_answers_401_and_logs_the_class_only`, `test_exchange_body_must_be_an_empty_json_object`, `test_exchange_accepts_a_charset_parameter`, `test_exchange_never_answers_a_next_outside_the_origin`)
+- **IAM-OIDC-21.** In OIDC mode `POST /login` answers 401 `Invalid credentials` with
+  `WWW-Authenticate: Bearer` for every account while `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN`
+  is false, after one bcrypt against the dummy hash and with no database read. While
+  it is true, it admits exactly an account found by exact email that is local, role
+  superadmin, active, holds a password hash, and whose password verifies, and logs the
+  admission at WARNING (`oidc_break_glass_login`); every other account gets the same
+  401 after one bcrypt against the dummy hash, its own hash never checked, and a wrong
+  password on the eligible account gets it after the one bcrypt against that account's
+  own hash. So each answer costs exactly one bcrypt. Refresh and API-token exchange do
+  not check the mode. \
+  Enforced in: `services/auth/app/services/auth_service.py` (`authenticate_user`, `_authenticate_oidc_mode`, `_DUMMY_HASH`); `services/auth/app/routers/auth.py` (`login`) \
+  Pinned by: `services/auth/tests/test_oidc_break_glass.py` (`test_switch_off_refuses_the_local_superadmin_without_reading_the_database`, `test_switch_on_admits_an_active_local_superadmin`, `test_switch_on_refuses_every_other_account_after_the_dummy_hash`, `test_switch_on_refuses_a_wrong_password_after_one_bcrypt_on_its_own_hash`, `test_switch_is_inert_in_local_mode`, `test_refresh_keeps_working_in_oidc_mode`)
+- **IAM-OIDC-22.** At startup the lifespan logs, in OIDC mode only, one WARNING each for
+  incomplete OIDC settings (naming the variables, never their values),
+  `OIDC_REQUIRE_HTTPS=false`, and `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN=true`. \
+  Enforced in: `services/auth/app/main.py` (`lifespan`); `services/auth/app/config.py` (`log_oidc_startup_warnings`) \
+  Pinned by: `services/auth/tests/test_oidc_break_glass.py` (`test_lifespan_warns_about_break_glass_only_when_on_in_oidc_mode`); `services/auth/tests/test_oidc_settings.py` (`test_no_oidc_warning_fires_outside_oidc_mode`, `test_incomplete_settings_fire_one_warning_naming_the_variables_not_their_values`, `test_https_not_required_fires_its_warning`, `test_break_glass_on_fires_its_warning`)
+- **IAM-OIDC-23.** No single sign-on route logs a secret or provider text: not the
+  binding or handoff secret, `state`, `code`, `nonce`, the verifier, the authorization
+  URL, an ID token or a `VerifiedIdToken`, the provider's or HERD's tokens, the
+  `error`, `error_description`, or `iss` parameters, or a claim value. Refusals log a
+  fixed `reason` and the flow id; the three catch-alls log an exception's class name
+  only. \
+  Enforced in: `services/auth/app/routers/oidc.py` (`_log_refusal`, `_log_unexpected`) \
+  Pinned by: `services/auth/tests/test_oidc_routes.py` (`test_no_route_logs_the_authorization_url_or_a_verified_token`, `test_full_sign_in_reaches_me_and_refresh`)
+
+**Out of scope.** The login page and the `/login/sso` page (ADR 0016 phase 4); a live
+identity provider, the stack integration, load, and browser levels (phases 5a and 5b);
+selecting the mode (phase 6). Login CSRF by an attacker who can write a cookie for
+HERD's host, such as a sibling subdomain, is not closed (ADR 0016 D11).
+
 ## 9. Errors
 
 FastAPI validation errors (422) carry `detail` as a list of `{loc, msg, type}`; every
@@ -1676,7 +1809,8 @@ other error carries `detail` as a string. A 401 from a bearer check also sends
 | 400 | `Token role cannot exceed the principal's role` | token role above its principal | IAM-APITOK-3 |
 | 401 | `Not authenticated` (FastAPI) | no Authorization header on a JWT-guarded route, auth or acl | IAM-JWT-3, IAM-CLAIM-1 |
 | 401 | `Could not validate credentials` | bad, expired, or subjectless token; in auth also an unknown or inactive account | IAM-JWT-3, IAM-ACCT-5, IAM-CLAIM-1 |
-| 401 | `Invalid credentials` | any login refusal, local or LDAP | IAM-LOGIN-1, IAM-LDAP-5, IAM-LDAP-9, IAM-LDAP-10 |
+| 401 | `Invalid credentials` | any login refusal, local, LDAP, or OIDC mode | IAM-LOGIN-1, IAM-LDAP-5, IAM-LDAP-9, IAM-LDAP-10, IAM-OIDC-21 |
+| 401 | `Single sign-on session expired; sign in again` | handoff exchange refused | IAM-OIDC-20 |
 | 401 | `Invalid or expired refresh token` | refresh refused | IAM-SESSION-2 |
 | 401 | `Invalid or expired token` | API token exchange refused | IAM-APITOK-8 |
 | 401 | `Invalid subject in token` | another service's `caller_id` on a non-UUID `sub` | IAM-CLAIM-3 |
@@ -1685,6 +1819,7 @@ other error carries `detail` as a string. A 401 from a bearer check also sends
 | 403 | `Admin or superadmin role required` | an acl grant route as a non-admin claim | IAM-ACL-4, IAM-CLAIM-2 |
 | 403 | `Cannot query permissions for another user` | acl check, batch, or resources about someone else | IAM-ACL-8 |
 | 403 | `Invalid internal token` | an internal route with a wrong token | IAM-INTERNAL-2 |
+| 404 | `Single sign-on is not enabled` | any single sign-on route outside OIDC mode | IAM-OIDC-15 |
 | 404 | `User not found` | role change, activate, deactivate, add member, profile edit, or an internal lookup on an unknown account; internal groups on an inactive one; a user's profile edit naming any account but their own | IAM-USER-5, IAM-ACCT-1, IAM-ACCT-2, IAM-GROUP-6, IAM-INTERNAL-4, IAM-INTERNAL-5, IAM-PROFILE-1 |
 | 404 | `Principal user not found` | token create for an unknown principal | IAM-APITOK-1 |
 | 404 | `Group not found` | any group route on an unknown group (admin caller) | IAM-GROUP-6, IAM-GROUP-7, IAM-GROUP-8, IAM-GROUP-9 |
@@ -1695,6 +1830,7 @@ other error carries `detail` as a string. A 401 from a bearer check also sends
 | 404 | `Grant not found` | read or delete an unknown grant | IAM-ACL-4 |
 | 404 | `Users not found: <ids>` | bulk add naming an id with no account | IAM-GROUP-13 |
 | 409 | `Local registration is disabled; this deployment uses LDAP authentication.` | register in LDAP mode | IAM-REG-1 |
+| 409 | `Local registration is disabled; this deployment uses single sign-on.` | register in OIDC mode | IAM-REG-1 |
 | 409 | `Email or username already exists` | register collision | IAM-REG-3 |
 | 409 | `Cannot deactivate your own account` | deactivate oneself | IAM-ACCT-1 |
 | 409 | `A group with this name already exists` | group create or rename collision | IAM-GROUP-3 |
@@ -1764,7 +1900,7 @@ cap 20 per category; prune cadence 24 hours; bulk and batch caps 500.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/auth/tests/` (in-memory SQLite, `test_profile_schema.py`, `test_user_profile_migration.py`, `test_effective_role_unit.py`, `test_api_tokens.py`, `test_ldap_service.py`, `test_ldap_sync_service.py`, `test_ldap_sync_service_scaling.py`, `test_ldap_sync_stale_run_reaper.py`, `test_ldap_sync_loop.py`, `test_oidc_flow_service.py`, `test_oidc_provisioning.py`, `test_oidc_sso_migration.py`); `services/acl/tests/test_grant_service_unit.py`, `test_auth_client.py`, `test_schema_validators.py`; `services/common/tests/test_auth.py`, `test_auth_settings.py`, `test_internal_auth.py`, `test_acl.py`; `services/notifications/tests/test_router.py` (its token decode); `tests/unit/test_jwt_settings_wiring.py`; `frontend/src/test/` (`api/client.test.ts`, `stores/authStore.test.ts`, `lib/roles.test.ts`, `components/guards.test.tsx`, `components/AdminGuard.test.tsx`, `routes.test.tsx`, the admin page tests) | SQLite has no advisory locks, so only the in-process half of the run slot is exercised here |
-| Functional (through the service API) | `services/auth/tests/test_auth.py`, `test_user_profile_routes.py`, `test_groups.py`, `test_internal.py`, `test_ldap_sync.py`, `test_effective_role_http.py`, `test_auth_ldap.py`; `services/acl/tests/test_grants.py`, `test_internal.py`; the live suites `services/auth/tests/test_ldap_service_live.py` (real directory) and the real-Postgres suites `services/auth/tests/test_ldap_sync_service_live_pg.py` and `services/auth/tests/test_oidc_flow_service_live_pg.py` (the OIDC flow store and provisioning races) | The live-LDAP suite runs in the gates' live-LDAP phase; the Postgres suites in `_gate-pg-live-tests`. The OIDC flow store and provisioning have unit and Postgres-live tests only until their routes land (ADR 0016 phases 3, 5a, and 5b add the functional, integration, load, and browser levels) |
+| Functional (through the service API) | `services/auth/tests/test_auth.py`, `test_user_profile_routes.py`, `test_groups.py`, `test_internal.py`, `test_ldap_sync.py`, `test_effective_role_http.py`, `test_auth_ldap.py`, `test_oidc_routes.py` (the single sign-on routes against a fake identity provider), `test_login_options.py`, `test_oidc_break_glass.py`; `services/acl/tests/test_grants.py`, `test_internal.py`; the live suites `services/auth/tests/test_ldap_service_live.py` (real directory) and the real-Postgres suites `services/auth/tests/test_ldap_sync_service_live_pg.py` and `services/auth/tests/test_oidc_flow_service_live_pg.py` (the OIDC flow store and provisioning races) | The live-LDAP suite runs in the gates' live-LDAP phase; the Postgres suites in `_gate-pg-live-tests`. The single sign-on routes have unit and functional (fake provider, in-memory SQLite) tests only; the flow store and provisioning beneath them have Postgres-live tests, but no route is driven against a real Postgres yet, a gap open until ADR 0016 phases 5a and 5b add the live-provider, integration (running stack), load, and browser levels |
 | Integration (running stack) | `tests/integration/test_auth_flow.py`, `test_user_profile_flow.py`, `test_acl_flow.py`, `test_ldap_auth.py`, `test_ldap_sync_admin.py` | The LDAP ones run only in the gates' LDAP-mode phase |
 | Stress and load | `tests/load/locustfile.py` (every user logs in; `ACLChecker` exercises the check route; `NotificationUser` edits its own profile name) | No load test covers refresh, the token exchange, or a sync run |
 | Browser end-to-end | `tests/e2e/test_login.py`, `test_register_and_roles.py`, `test_roles_playwright.py`, `test_user_profile_playwright.py`, `test_admin_guard_redirect_playwright.py`, `test_user_groups_playwright.py`, `test_acl_grants_playwright.py`, `test_ldap_sync_admin_playwright.py`, `test_ldap_login.py` | Runs nightly and in the gates; the LDAP login tests are exempt skips on the local-mode gate stack |

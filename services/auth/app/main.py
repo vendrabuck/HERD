@@ -9,7 +9,7 @@ from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.schema_init import create_all_and_stamp
 from herd_common.version import add_version_route, service_version
 
-from app.config import settings
+from app.config import log_oidc_startup_warnings, settings
 from app.database import AsyncSessionLocal, Base, engine
 from app.models.api_token import ApiToken  # noqa: F401
 from app.models.federated_identity import FederatedIdentity  # noqa: F401
@@ -23,6 +23,7 @@ from app.routers.auth import router as auth_router
 from app.routers.groups import router as groups_router
 from app.routers.internal import router as internal_router
 from app.routers.ldap_sync import router as ldap_sync_router
+from app.routers.oidc import router as oidc_router
 from app.routers.tokens import router as tokens_router
 from app.tasks.ldap_sync_loop import (
     effective_interval_seconds,
@@ -110,6 +111,9 @@ async def lifespan(app: FastAPI):
     )
     await _seed_superadmin()
     await _seed_not_grouped()
+    # ADR 0016: one WARNING each for incomplete OIDC settings, a plain-HTTP
+    # lab provider, and the break-glass switch; silent outside OIDC mode.
+    log_oidc_startup_warnings(settings)
 
     # ADR 0011 phase 5: the LDAP group sync interval loop, started only when
     # both auth_method == "ldap" and ldap_group_sync_enabled are true (dark
@@ -147,6 +151,7 @@ app.include_router(admin_router)
 app.include_router(groups_router)
 app.include_router(internal_router)
 app.include_router(ldap_sync_router)
+app.include_router(oidc_router)
 app.include_router(tokens_router)
 
 

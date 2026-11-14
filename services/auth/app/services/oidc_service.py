@@ -3,8 +3,8 @@ the code exchange, and ID-token verification (ADR 0016 phase 1, issue #37).
 
 Dark by construction: every entry point refuses with `OidcUnavailableError`
 unless `settings.auth_method == "oidc"`, which `Settings` does not admit until
-ADR 0016 phase 6; tests reach the code by setting the attribute directly. No
-route calls this module yet (phase 3 adds them).
+ADR 0016 phase 6; tests reach the code by setting the attribute directly. The
+routes in `app/routers/oidc.py` (phase 3) are its only callers.
 
 Two entry points, the phase 1 half of "Internal interfaces between phases":
 
@@ -190,7 +190,7 @@ clock: Callable[[], float] = time.monotonic
 class OidcUnavailableError(Exception):
     """The identity provider could not be asked, or answered unusably.
 
-    Phase 3 maps it to `sso_error=unavailable`. `str()` is fixed text naming
+    The callback and the begin route map it to `sso_error=unavailable`. `str()` is fixed text naming
     only `reason`, one of this module's constants.
     """
 
@@ -202,7 +202,7 @@ class OidcUnavailableError(Exception):
 class OidcRejectedError(Exception):
     """The identity provider answered and the answer is refused.
 
-    Phase 3 maps it to `sso_error=failed`. `str()` is fixed text naming only
+    The callback maps it to `sso_error=failed`. `str()` is fixed text naming only
     `reason`, one of this module's constants.
     """
 
@@ -224,7 +224,7 @@ class AuthorizationRequest:
 
 @dataclass(frozen=True)
 class VerifiedIdToken:
-    """The claims phase 3 needs from a verified ID token.
+    """The claims the callback needs from a verified ID token.
 
     `email`, `username_claim`, and `name` are the configured claims when they
     are non-empty strings, else None. `email_verified` is the claim when it is

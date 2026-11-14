@@ -20,9 +20,10 @@ verbatim to the ID token's claim, and the PKCE verifier, which the callback
 must send to the token endpoint and which the claim sets to NULL.
 
 Nothing here logs a secret, the nonce, or the verifier (D9): the flow id is the
-correlation key. No route calls this module yet; phase 3 adds them.
+correlation key. The routes in `app/routers/oidc.py` (ADR 0016 phase 3) are its
+only callers.
 
-Contract for callers (phase 3):
+Contract for callers:
 
 - Every function here ends by committing or rolling back the session it is
   handed. `start_flow` commits twice (the prune, then the insert), so it also
