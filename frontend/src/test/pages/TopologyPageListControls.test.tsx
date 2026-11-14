@@ -36,6 +36,7 @@ vi.mock("react-hot-toast", () => ({ default: { success: toastSuccess, error: toa
 vi.mock("@/api/bulk", () => ({ exportTopologies: vi.fn(), importTopologies: vi.fn() }));
 
 import { server } from "../mocks/server";
+import { recordSentRequests } from "../sentRequests";
 import { TopologyPage } from "@/pages/TopologyPage";
 import { useAuthStore } from "@/stores/authStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
@@ -70,12 +71,24 @@ const topo = (n: number, createdBy = ME) => ({
 
 type Row = ReturnType<typeof topo>;
 
-/** Serve `items` for every list request and record each request's params. */
+const LIST_PATH = "/api/cabling/topologies";
+
+/**
+ * Serve `items` for every list request and record each request's params in the
+ * order the page SENT them. Under msw 3 two list requests in flight together
+ * can reach the handler in the other order (see ../sentRequests.ts), and these
+ * tests read the page's last request.
+ */
 function serveList(items: Row[], total = items.length) {
   const seen: URLSearchParams[] = [];
+  const sent = recordSentRequests((request) => {
+    const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === LIST_PATH) seen.push(url.searchParams);
+  });
   server.use(
-    http.get("/api/cabling/topologies", ({ request }) => {
-      seen.push(new URL(request.url).searchParams);
+    http.get(LIST_PATH, ({ request }) => {
+      // An answered request the recorder never saw would leave `seen` short.
+      if (!sent.wasSent(request.url)) throw new Error(`list request not recorded: ${request.url}`);
       return HttpResponse.json({ items, total, skip: 0, limit: 50 });
     }),
   );

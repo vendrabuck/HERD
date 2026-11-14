@@ -26,6 +26,8 @@ if (typeof globalThis.ResizeObserver === "undefined") {
   };
 }
 
-beforeAll(() => server.listen({ onUnhandledRequest: "bypass" }));
+// msw 3 renamed `onUnhandledRequest` to `onUnhandledFrame`; an unknown key is a
+// type error and at runtime falls back to the "warn" default.
+beforeAll(() => server.listen({ onUnhandledFrame: "bypass" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());

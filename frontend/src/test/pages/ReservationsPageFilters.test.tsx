@@ -19,6 +19,7 @@ vi.mock("@/components/reservations/ReservationDetailModal", () => ({
 vi.mock("react-hot-toast", () => ({ default: { success: vi.fn(), error: vi.fn() } }));
 
 import { server } from "../mocks/server";
+import { recordSentRequests } from "../sentRequests";
 import { ReservationsPage } from "@/pages/ReservationsPage";
 import { useAuthStore } from "@/stores/authStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
@@ -69,12 +70,25 @@ function renderPage() {
   );
 }
 
+const LIST_PATH = "/api/reservations/";
+
+/**
+ * Serve the list and record each list request's params in the order the page
+ * SENT them. Under msw 3 two list requests in flight together can reach the
+ * handler in the other order (see ../sentRequests.ts), and these tests read
+ * the page's last request.
+ */
 function serve(items = [row(1)], total = 100, categories = ["qa_regression", "training"]) {
   const seen: URLSearchParams[] = [];
+  const sent = recordSentRequests((request) => {
+    const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === LIST_PATH) seen.push(url.searchParams);
+  });
   server.use(
     http.get("/api/reservations/purpose-categories", () => HttpResponse.json({ categories })),
-    http.get("/api/reservations/", ({ request }) => {
-      seen.push(new URL(request.url).searchParams);
+    http.get(LIST_PATH, ({ request }) => {
+      // An answered request the recorder never saw would leave `seen` short.
+      if (!sent.wasSent(request.url)) throw new Error(`list request not recorded: ${request.url}`);
       return HttpResponse.json({ items, total, skip: 0, limit: 50 });
     }),
   );

@@ -5,6 +5,7 @@ import type { ReactNode } from "react";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
 import { server } from "../mocks/server";
+import { recordSentRequests } from "../sentRequests";
 import {
   LOGIN_OPTIONS_PATH,
   OIDC_EXCHANGE_PATH,
@@ -136,13 +137,17 @@ describe("useLoginOptions", () => {
 
 describe("exchangeOidcHandoff", () => {
   it("posts exactly {} as JSON, with credentials, and returns the tokens and a safe next", async () => {
-    const seen: Array<{ body: string; type: string | null; credentials: RequestCredentials }> = [];
+    // Credentials are read where the app sends the request: under msw 3 a
+    // handler's request.credentials can belong to an earlier request on the
+    // same kept-alive socket (see sentRequests.ts).
+    const sent = recordSentRequests();
+    const seen: Array<{ body: string; type: string | null; recorded: boolean }> = [];
     server.use(
       http.post("/api/auth/oidc/exchange", async ({ request }) => {
         seen.push({
           body: await request.text(),
           type: request.headers.get("Content-Type"),
-          credentials: request.credentials,
+          recorded: sent.wasSent(request.url),
         });
         return HttpResponse.json({
           access_token: "A1",
@@ -160,7 +165,10 @@ describe("exchangeOidcHandoff", () => {
     expect(seen).toHaveLength(1);
     expect(seen[0].body).toBe("{}");
     expect(seen[0].type).toMatch(/^application\/json/);
-    expect(seen[0].credentials).toBe("include");
+    expect(seen[0].recorded).toBe(true);
+    expect(sent.filter((r) => r.url.endsWith("/api/auth/oidc/exchange"))).toEqual([
+      { method: "POST", url: expect.stringMatching(/\/api\/auth\/oidc\/exchange$/), withCredentials: true },
+    ]);
   });
 
   it("stores nothing itself: the caller adopts the tokens", async () => {

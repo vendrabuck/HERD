@@ -387,7 +387,12 @@ describe("TopologyEditorPage fork server edge verdicts (issue #1066)", () => {
       },
     ];
     toastCustom.mockClear();
-    fireEvent.click(screen.getByRole("button", { name: "Commit to reservation" }));
+    // The first commit still settles the device set (its PATCH) after the save
+    // toast, and the button reads "Committing..." until it does: commit again
+    // once it is back, as a user would.
+    const commitAgain = await screen.findByRole("button", { name: "Commit to reservation" });
+    expect(commitAgain).toBeEnabled();
+    fireEvent.click(commitAgain);
     await waitFor(() => expect(toastCustom).toHaveBeenCalled());
     await waitFor(() => expect(renderedReason("e-unjoined")).toBe("no_port_path"));
   });

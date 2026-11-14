@@ -127,7 +127,11 @@ describe("connections api hooks", () => {
       ]);
     });
     expect(response).toMatchObject({ created: 1, rejected: 1 });
-    expect(result.current.isSuccess).toBe(true);
+    // React Query publishes the settled state to the hook on a setTimeout(0)
+    // (notifyManager), so it can trail the resolved promise; it must still
+    // settle as a success, never an error.
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.isError).toBe(false);
   });
 
   it("useDeleteConnection DELETEs by id", async () => {

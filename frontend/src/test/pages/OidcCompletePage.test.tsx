@@ -19,6 +19,7 @@ vi.mock("react-hot-toast", () => ({
 }));
 
 import { server } from "../mocks/server";
+import { recordSentRequests, type SentRequests } from "../sentRequests";
 import { AuthGuard, GuestGuard } from "@/components/guards";
 import { LoginPage } from "@/pages/LoginPage";
 import { OidcCompletePage } from "@/pages/OidcCompletePage";
@@ -110,7 +111,11 @@ function renderAt(initial: string | string[], { strict = false }: { strict?: boo
   return { ...view, client, tree };
 }
 
-let exchangeCalls: Array<{ body: string; credentials: RequestCredentials; auth: string | null }> = [];
+let exchangeCalls: Array<{ body: string; auth: string | null; recorded: boolean }> = [];
+// Every request the app sent in this test, in send order, with its credentials
+// mode (see sentRequests.ts for why a handler cannot report either under msw 3).
+let sent: SentRequests;
+const sentExchanges = () => sent.filter((r) => r.url.endsWith("/api/auth/oidc/exchange"));
 let refreshCalls = 0;
 let consoleSpies: Array<ReturnType<typeof vi.spyOn>> = [];
 
@@ -119,8 +124,8 @@ function answerExchange(answer: () => Response | Promise<Response>) {
     http.post("/api/auth/oidc/exchange", async ({ request }) => {
       exchangeCalls.push({
         body: await request.text(),
-        credentials: request.credentials,
         auth: request.headers.get("Authorization"),
+        recorded: sent.wasSent(request.url),
       });
       return answer();
     }),
@@ -140,6 +145,7 @@ function consoleText(): string {
 }
 
 beforeEach(() => {
+  sent = recordSentRequests();
   visited = [];
   ssoStates = [];
   router.navigate = null;
@@ -165,8 +171,13 @@ beforeEach(() => {
   );
 });
 
-afterEach(() => {
+afterEach(async () => {
   consoleSpies.forEach((spy) => spy.mockRestore());
+  // Under msw 3 a request reaches its handler some event-loop turns after the
+  // app sends it. A test that ends with its exchange still on the way would
+  // have it answered, and counted, by the next test's handler: hold each test
+  // until every exchange it sent has reached this test's handler.
+  await waitFor(() => expect(exchangeCalls).toHaveLength(sentExchanges().length));
 });
 
 describe("OidcCompletePage (ADR 0016 phase 4)", () => {
@@ -182,7 +193,10 @@ describe("OidcCompletePage (ADR 0016 phase 4)", () => {
     await waitFor(() => expect(screen.getByTestId("where")).toHaveTextContent("/inventory?tab=x#y REPLACE"));
     expect(exchangeCalls).toHaveLength(1);
     expect(exchangeCalls[0].body).toBe("{}");
-    expect(exchangeCalls[0].credentials).toBe("include");
+    expect(exchangeCalls[0].recorded).toBe(true);
+    expect(sentExchanges()).toEqual([
+      { method: "POST", url: expect.stringMatching(/\/api\/auth\/oidc\/exchange$/), withCredentials: true },
+    ]);
     expect(exchangeCalls[0].auth).toBeNull();
     expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe(ACCESS);
     expect(localStorage.getItem(REFRESH_TOKEN_KEY)).toBe(REFRESH);
