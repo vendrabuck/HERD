@@ -122,7 +122,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	oidc-up oidc-down oidc-status _gate-oidc-tests \
 	nos-up nos-down nos-status nos-logs nos-reset nos-attach nos-detach \
 	nos-test-dialect nos-test-feature \
-	_gate-ldap-stack-tests _gate-pg-live-tests \
+	_gate-ldap-stack-tests _gate-oidc-stack-tests _gate-pg-live-tests \
 	_master-stack-up _master-wait-healthy _master-stack-down _everything-seed _clean-images _test-e2e-run \
 	_assert-gateway-ports-free _assert-gate-ports-free \
 	_collect-stack-diagnostics
@@ -234,7 +234,7 @@ master-quick:  ## Fast gate: lock check + format + lint + unit + frontend + buil
 	@echo ""
 	@echo "=== master-quick complete ==="
 
-master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + live OIDC + gate stack contract/integration/e2e + LDAP-mode stack + Postgres-live suites
+master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + live OIDC + gate stack contract/integration/e2e + LDAP-mode and OIDC-mode stack + Postgres-live suites
 	@echo ""
 	@echo "=== Live LDAP auth tests ==="
 	$(MAKE) _gate-ldap-tests
@@ -257,6 +257,8 @@ master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + live O
 		$(MAKE) test-e2e COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== LDAP-mode stack tests (gate auth switched to LDAP) ===" && \
 		$(MAKE) _gate-ldap-stack-tests COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
+		echo "" && echo "=== OIDC-mode stack tests (gate auth switched to OIDC) ===" && \
+		$(MAKE) _gate-oidc-stack-tests COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== Postgres-live suites (every services/*/tests/*_live_pg.py, real Postgres) ===" && \
 		$(MAKE) _gate-pg-live-tests
 	@echo ""
@@ -399,6 +401,8 @@ everything: gate-clean  ## Full gate: CI checks + coverage + live LDAP + live OI
 		$(MAKE) test-e2e COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
 		echo "" && echo "=== LDAP-mode stack tests (gate auth switched to LDAP) ===" && \
 		$(MAKE) _gate-ldap-stack-tests COMPOSE_PROJECT_NAME=$(GATE_PROJECT) && \
+		echo "" && echo "=== OIDC-mode stack tests (gate auth switched to OIDC) ===" && \
+		$(MAKE) _gate-oidc-stack-tests COMPOSE_PROJECT_NAME=$(GATE_PROJECT) OIDC_STACK_LOAD=$(EVERYTHING_LOAD) && \
 		echo "" && echo "=== Postgres-live suites (every services/*/tests/*_live_pg.py, real Postgres) ===" && \
 		$(MAKE) _gate-pg-live-tests && \
 		echo "" && echo "=== Seeding gate stack ===" && \
@@ -1348,6 +1352,137 @@ _gate-ldap-stack-tests:
 		HERD_TEST_LDAP_PORT=$(HERD_TEST_LDAP_PORT) \
 		uv run pytest tests/integration/test_ldap_auth.py tests/integration/test_ldap_sync_admin.py \
 			-v --timeout=60
+
+# Gate phase used by master and everything right after _gate-ldap-stack-tests,
+# and by nightly.yml (ADR 0016 phase 5b, D12): proves the STACK signs users in
+# through an OpenID Connect provider. The _gate-ldap-stack-tests shape, step
+# for step: refuse when the stack's config.json was saved through the config
+# UI (it would outrank the AUTH_METHOD and OIDC_* overrides below); start
+# infra/oidc-test only if no container named oidc-test runs (and stop it
+# afterward only then); connect it to the stack's network with the alias
+# oidc-test, so the gate's auth container reaches the issuer
+# http://oidc-test:5556/dex by the same name the host-side browser maps with
+# --host-resolver-rules; recreate ONLY auth with AUTH_METHOD=oidc and the lab's
+# settings; run the suites; and restore local mode in a trap that also runs on
+# failure (recreate auth with its default env, wait for healthy, disconnect,
+# stop the lab if this phase started it).
+#
+# The lab settings: the issuer above over plain HTTP (OIDC_REQUIRE_HTTPS=false,
+# the LDAP_USE_TLS=false precedent), the lab's static client `herd` and its
+# test-only secret (infra/oidc-test/dex.yaml), the provider name `Dex` (the
+# button reads "Sign in with Dex"), break-glass OFF (so the seeded superadmin's
+# password login must be refused), and OIDC_REDIRECT_URI derived from
+# GATEWAY_URL, the address the stack is browsed at (`make gateway-url`): the
+# lab's dex.yaml template registers exactly that callback, from the same
+# HERD_GATEWAY_BIND, beside https://localhost's. A lab started earlier from
+# another bind address would not have this callback registered; Dex then
+# answers its sign-in page with `Unregistered redirect_uri` and the suites
+# fail saying so (`make oidc-down` first).
+#
+# Suites, in order: tests/integration/test_oidc_auth.py (HERD_INTEGRATION_OIDC=1
+# hard-requires it), the locust class OidcLoginUser only when OIDC_STACK_LOAD=1
+# (everything passes its EVERYTHING_LOAD; master runs no load phase), and the
+# Playwright test tests/e2e/test_oidc_login_playwright.py (HERD_E2E_OIDC=1
+# hard-requires it). Without those variables the same files skip, so the
+# ordinary test-integration, test-e2e, and test-load runs against a local-mode
+# stack never select them.
+#
+# Like _gate-ldap-stack-tests it inlines $(OIDC_COMPOSE) instead of calling
+# $(MAKE) oidc-up / oidc-down, so its recipe holds no $(MAKE) line and a dry
+# run only prints. Bare `docker compose` throughout, for the
+# COMPOSE_PROJECT_NAME reason given above _gate-ldap-stack-tests.
+OIDC_STACK_LOAD ?= 0
+OIDC_STACK_REDIRECT_URI := $(GATEWAY_URL)/api/auth/oidc/callback
+
+_gate-oidc-stack-tests:
+	@net=$${COMPOSE_PROJECT_NAME:-$(GATE_PROJECT)}_herd-net; \
+	auth_cid=$$(docker compose ps -q auth 2>/dev/null); \
+	if [ -z "$$auth_cid" ]; then \
+		echo "No running auth container for project $${COMPOSE_PROJECT_NAME:-$(GATE_PROJECT)} (docker compose ps -q auth returned nothing)."; \
+		echo "This target recreates an ALREADY-RUNNING gate stack's auth service; it does not start one."; \
+		echo "Bring the target stack up first (e.g. make _master-stack-up / make up), or check COMPOSE_PROJECT_NAME."; \
+		exit 1; \
+	fi; \
+	config_cid=$$(docker compose ps -q config 2>/dev/null); \
+	if [ -n "$$config_cid" ] && \
+		docker compose exec -T config test -f /data/herd-config/config.json 2>/dev/null && \
+		! docker compose exec -T config test -f /data/herd-config/config.bootstrapped 2>/dev/null; then \
+		echo "This stack's config.json was saved through the config UI (no config.bootstrapped marker)."; \
+		echo "Per herd_common.config_loader precedence it now outranks environment variables, so this target's AUTH_METHOD=oidc / OIDC_* overrides would be silently ignored."; \
+		echo "Restore config.bootstrapped, or clear the relevant keys via the config UI, then retry."; \
+		exit 1; \
+	fi; \
+	oidc_started=0; \
+	if ! docker ps --format '{{.Names}}' | grep -q '^oidc-test$$'; then \
+		echo "Starting infra/oidc-test (OIDC test provider)..."; \
+		HERD_GATEWAY_BIND=$(GATEWAY_BIND) HERD_TEST_OIDC_PORT=$(HERD_TEST_OIDC_PORT) $(OIDC_COMPOSE) up -d --wait; \
+		oidc_started=1; \
+	else \
+		echo "OIDC test provider already running; leaving it up afterward."; \
+	fi; \
+	connect_out=$$(docker network connect --alias oidc-test "$$net" oidc-test 2>&1); \
+	rc=$$?; \
+	if [ $$rc -ne 0 ] && ! echo "$$connect_out" | grep -qi "already"; then \
+		echo "$$connect_out"; \
+		echo "Failed to connect oidc-test to $$net"; \
+		if [ "$$oidc_started" = 1 ]; then $(OIDC_COMPOSE) down -v --remove-orphans; fi; \
+		exit 1; \
+	fi; \
+	wait_auth_healthy() { \
+		to=$$1; s=$$(date +%s); \
+		cid=$$(docker compose ps -q auth); \
+		until [ "$$(docker inspect -f '{{.State.Health.Status}}' "$$cid" 2>/dev/null)" = "healthy" ]; do \
+			n=$$(date +%s); \
+			if [ $$((n - s)) -gt $$to ]; then \
+				echo "Timed out after $${to}s waiting for gate auth to report healthy"; \
+				return 1; \
+			fi; \
+			sleep 2; \
+		done; \
+		echo "Gate auth healthy after $$(( $$(date +%s) - s ))s"; \
+	}; \
+	restore() { \
+		rc=$$?; \
+		echo ""; \
+		echo "=== Restoring gate auth to local mode ==="; \
+		docker compose up -d --no-deps --force-recreate auth; \
+		wait_auth_healthy 90 || true; \
+		docker network disconnect "$$net" oidc-test 2>/dev/null || true; \
+		if [ "$$oidc_started" = 1 ]; then $(OIDC_COMPOSE) down -v --remove-orphans; fi; \
+		exit $$rc; \
+	}; \
+	trap restore EXIT INT TERM; \
+	echo "" && echo "=== Recreating gate auth in OIDC mode ===" && \
+	AUTH_METHOD=oidc \
+		OIDC_ISSUER=http://oidc-test:5556/dex \
+		OIDC_CLIENT_ID=herd \
+		OIDC_CLIENT_SECRET=herd-oidc-test-client-secret \
+		OIDC_REDIRECT_URI=$(OIDC_STACK_REDIRECT_URI) \
+		OIDC_REQUIRE_HTTPS=false \
+		OIDC_PROVIDER_NAME=Dex \
+		OIDC_BREAK_GLASS_LOCAL_SUPERADMIN=false \
+		docker compose up -d --no-deps --force-recreate auth && \
+	wait_auth_healthy 90 && \
+	echo "" && echo "=== OIDC integration tests against the gate stack ===" && \
+	HERD_INTEGRATION_OIDC=1 \
+		HERD_TEST_OIDC_HOST=$(HERD_TEST_OIDC_HOST) \
+		HERD_TEST_OIDC_PORT=$(HERD_TEST_OIDC_PORT) \
+		uv run pytest tests/integration/test_oidc_auth.py -v --timeout=60 && \
+	if [ "$(OIDC_STACK_LOAD)" = 1 ]; then \
+		echo "" && echo "=== OIDC sign-in load (locust OidcLoginUser, 30 s) ===" && \
+		(cd tests/load && HERD_LOAD_OIDC=1 \
+			HERD_TEST_OIDC_HOST=$(HERD_TEST_OIDC_HOST) \
+			HERD_TEST_OIDC_PORT=$(HERD_TEST_OIDC_PORT) \
+			uv run locust -f locustfile.py OidcLoginUser --host $(LOAD_HOST) \
+				--headless -u 5 -r 5 --run-time 30s); \
+	else \
+		echo "" && echo "=== Skipping the OIDC sign-in load (OIDC_STACK_LOAD=$(OIDC_STACK_LOAD)) ==="; \
+	fi && \
+	echo "" && echo "=== OIDC browser e2e against the gate stack ===" && \
+	HERD_E2E_OIDC=1 \
+		HERD_TEST_OIDC_HOST=$(HERD_TEST_OIDC_HOST) \
+		HERD_TEST_OIDC_PORT=$(HERD_TEST_OIDC_PORT) \
+		uv run pytest tests/e2e/test_oidc_login_playwright.py -v --tb=short
 
 ## --- Coverage ---
 
