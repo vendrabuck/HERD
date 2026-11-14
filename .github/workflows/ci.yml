@@ -54,14 +54,15 @@ jobs:
 
       # Scope mirrors the Makefile's lint/format targets: services/ plus the
       # repo-root Python in ROOT_PY (the seedtools package, the image-vs-lock
-      # guard script, the manual search index generator, and the AI generate
-      # evaluation harness under tests/ai_eval/), so a style violation there
-      # fails CI the same way it fails `make lint` locally.
+      # guard script, the manual search index generator, the AI generate
+      # evaluation harness under tests/ai_eval/, the repo-root unit tests, and the
+      # restarter under infra/restarter/), so a style violation there fails CI the
+      # same way it fails `make lint` locally.
       - name: Lint
-        run: uv run ruff check services/ seedtools/ scripts/check_image_matches_lock.py scripts/build_manual_search_index.py tests/ai_eval/ tests/unit/
+        run: uv run ruff check services/ seedtools/ scripts/check_image_matches_lock.py scripts/build_manual_search_index.py tests/ai_eval/ tests/unit/ infra/restarter/
 
       - name: Format check
-        run: uv run ruff format --check services/ seedtools/ scripts/check_image_matches_lock.py scripts/build_manual_search_index.py tests/ai_eval/ tests/unit/
+        run: uv run ruff format --check services/ seedtools/ scripts/check_image_matches_lock.py scripts/build_manual_search_index.py tests/ai_eval/ tests/unit/ infra/restarter/
 
       # Image-vs-lock guard (issue #593): every service Dockerfile now installs
       # from `uv export --frozen` instead of resolving dependencies fresh at
@@ -93,8 +94,8 @@ jobs:
         run: docker rmi herd-ci-image-check:ai-orchestrator || true
 
       # Single pass: pytest runs once with coverage across every service in the
-      # Makefile's SERVICES list (plus the repo-root tests/unit suite via the
-      # test-root prerequisite). This is the pass/fail signal AND the artifact
+      # Makefile's SERVICES list (plus the repo-root tests/unit suite and the
+      # restarter's suite via the test-root and test-restarter prerequisites). This is the pass/fail signal AND the artifact
       # source, so a new service is covered automatically with no edit here.
       # -j4 matches the 4 vCPUs on ubuntu-latest; -Otarget keeps each suite's
       # output contiguous so failures stay readable.

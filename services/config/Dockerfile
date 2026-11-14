@@ -42,7 +42,12 @@ COPY services/config/app/ app/
 
 RUN uv pip install --system --no-deps --no-sources -e .
 
-RUN mkdir -p /data/herd-config
+# Non-root, like every service image (issue #1326). The data directory is created
+# owned by appuser, so a fresh herd-config volume copies that ownership up; a volume
+# an earlier root-run image created needs the one-time chown in docs/OPERATIONS.md,
+# and until then the service logs that command and answers writes 503.
+RUN useradd --no-create-home --shell /bin/false appuser
+RUN mkdir -p /data/herd-config && chown appuser:appuser /data/herd-config
 
 # Build identifier (issue #846), stamped in as late as possible so a changed
 # build string invalidates only this metadata layer, never the uv export /
@@ -52,6 +57,8 @@ RUN mkdir -p /data/herd-config
 ARG HERD_BUILD=dev
 ARG HERD_BUILD_DATE=
 ENV HERD_BUILD=${HERD_BUILD} HERD_BUILD_DATE=${HERD_BUILD_DATE}
+
+USER appuser
 
 EXPOSE 8000
 

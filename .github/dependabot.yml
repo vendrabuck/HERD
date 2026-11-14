@@ -32,13 +32,14 @@ updates:
           - "minor"
           - "patch"
 
-  # Base images of the service and frontend Dockerfiles. Dependabot reads FROM
-  # lines only, which is why the service Dockerfiles take the uv binary from a
-  # named stage. infra/nos-test/frr is left out: its digest-only FRR image is
+  # Base images of the service, restarter, and frontend Dockerfiles. Dependabot
+  # reads FROM lines only, which is why the service Dockerfiles take the uv binary
+  # from a named stage. infra/nos-test/frr is left out: its digest-only FRR image is
   # bumped by hand with a live lab check (see the Dockerfile's header).
   - package-ecosystem: "docker"
     directories:
       - "/services/*"
+      - "/infra/restarter"
       - "/frontend"
     schedule:
       interval: "weekly"

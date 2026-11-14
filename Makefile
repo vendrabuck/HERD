@@ -12,9 +12,10 @@ DB_SERVICES := auth inventory reservations cabling acl execution user-profile no
 # format-checked locally and in CI. Today this is the seedtools seeding package
 # (issue #791), the CI image-vs-lock guard script (issue #593), the manual search
 # index generator (issue #1298), the AI generate evaluation harness
-# (tests/ai_eval/), and the repo-root unit tests (tests/unit/); the rest of
-# tests/ is not covered by make lint or CI's ruff steps.
-ROOT_PY := seedtools/ scripts/check_image_matches_lock.py scripts/build_manual_search_index.py tests/ai_eval/ tests/unit/
+# (tests/ai_eval/), the repo-root unit tests (tests/unit/), and the restarter with
+# its tests (infra/restarter/, issue #1326); the rest of tests/ is not covered by
+# make lint or CI's ruff steps.
+ROOT_PY := seedtools/ scripts/check_image_matches_lock.py scripts/build_manual_search_index.py tests/ai_eval/ tests/unit/ infra/restarter/
 
 # The ephemeral master/everything gate stack runs in its OWN compose project so
 # its volumes never collide with the dev stack's: the gate is always born fresh
@@ -115,7 +116,7 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	$(addprefix migrate-,$(DB_SERVICES)) \
 	$(addprefix shell-,$(DB_SERVICES)) \
 	test-frontend test-frontend-tz check-image-lock test-integration test-integration-ai test-integration-service test-contract test-load test-load-ui test-e2e test-e2e-seeded test-e2e-stop test-auth-ldap ai-eval \
-	test-root coverage-parallel coverage-frontend \
+	test-root test-restarter coverage-parallel coverage-frontend \
 	install frontend-install frontend-dev manual-index lint format clean clean-data gate-clean gate-down seed seed-frr seed-nos \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset _gate-ldap-tests \
 	nos-up nos-down nos-status nos-logs nos-reset nos-attach nos-detach \
@@ -643,7 +644,13 @@ $(addprefix migrate-,$(DB_SERVICES)):
 test-root:  ## Run the repo-root unit tests (tests/unit, no stack needed)
 	uv run pytest tests/unit/ -v
 
-test: test-root  ## Run every backend service's unit suite (plus tests/unit)
+# The restarter (infra/restarter/, issue #1326) is not a service under services/,
+# so the per-service loops never reach its suite either; test, coverage, and
+# coverage-parallel (CI's backend job) depend on this target as they do on test-root.
+test-restarter:  ## Run the restarter's suite (infra/restarter/tests, no stack needed)
+	uv run pytest infra/restarter/tests/ -v
+
+test: test-root test-restarter  ## Run every backend service's unit suite (plus tests/unit and the restarter)
 	@for svc in $(SERVICES); do \
 		echo ">>> test $$svc"; \
 		(cd services/$$svc && uv run pytest tests/ -v) || exit $$?; \
@@ -1284,7 +1291,7 @@ _gate-ldap-stack-tests:
 # Set COV_XML=1 to additionally emit a coverage-<svc>.xml report at the repo
 # root for each service (used by CI as both the test gate and artifact source).
 
-coverage: test-root  ## Run every backend suite under coverage (COV_XML=1 emits xml)
+coverage: test-root test-restarter  ## Run every backend suite under coverage (COV_XML=1 emits xml)
 	@for svc in $(SERVICES); do \
 		pkg=app; [ "$$svc" = "common" ] && pkg=herd_common; \
 		echo ">>> coverage $$svc ($$pkg)"; \
@@ -1296,7 +1303,7 @@ coverage: test-root  ## Run every backend suite under coverage (COV_XML=1 emits 
 # `make -j4 coverage-parallel COV_XML=1` runs four suites at once (each suite
 # runs in its own service dir, so .coverage data files never collide). CI uses
 # this; `coverage` keeps the sequential loop for readable local output.
-coverage-parallel: test-root $(addprefix coverage-,$(SERVICES))  ## coverage, parallel-safe via make -j (CI)
+coverage-parallel: test-root test-restarter $(addprefix coverage-,$(SERVICES))  ## coverage, parallel-safe via make -j (CI)
 
 # Per-service coverage. Default emits an html report for local browsing;
 # COV_XML=1 swaps it for the xml report CI uploads (coverage-<svc>.xml at the

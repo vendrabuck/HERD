@@ -8,7 +8,6 @@ dependencies = [
     "uvicorn[standard]>=0.54.0",
     "bcrypt>=4.0.0,<4.1",
     "pyjwt>=2.15.0",
-    "docker>=7.0.0",
 ]
 
 [project.optional-dependencies]

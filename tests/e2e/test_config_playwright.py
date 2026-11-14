@@ -13,9 +13,9 @@ Scope notes:
   (issue #256). Dev and CI stacks set CONFIG_ADMIN_PASSWORD in
   docker-compose.override.yml, which counts as rotated; on a stack where
   /api/config/status reports password_changed false these tests skip.
-- Save and Restart is deliberately NOT covered here: it bounces the stack,
-  which would break every test after it. It needs a serial, last-in-run
-  slot (tracked in issue #388).
+- Save and Restart runs only with HERD_E2E_RESTART=1: it bounces every
+  service that reads config.json, which would break every test after it.
+  nightly.yml runs it alone, as its last test step (issue #1326).
 - The round-trip edits LDAP_USER_FILTER, inert while AUTH_METHOD is local,
   and restores the exact prior settings afterward. Restoring VALUES is not
   the whole story: every save_config() deletes the config.bootstrapped
@@ -28,8 +28,8 @@ Scope notes:
   is accepted; CI's ephemeral stack does not care either way.
 """
 
+import importlib.util
 import os
-import re
 import subprocess
 import time
 from pathlib import Path
@@ -54,6 +54,19 @@ SAVED_TOAST = "Configuration saved"
 # Container path of the precedence marker (services/config/app/config_store.py).
 BOOTSTRAP_MARKER = "/data/herd-config/config.bootstrapped"
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _restart_allowlist() -> list[str]:
+    """The restarter's RESTART_SERVICES (A), read from its module file.
+
+    tests/unit/test_restarter_compose_guard.py pins A to the compose services that
+    mount herd-config:/etc/herd:ro, so the panel must list exactly these.
+    """
+    path = REPO_ROOT / "infra" / "restarter" / "restarter.py"
+    spec = importlib.util.spec_from_file_location("herd_restarter_e2e", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return sorted(module.RESTART_SERVICES)
 
 
 def _config_exec(cmd: str) -> "subprocess.CompletedProcess[str]":
@@ -221,14 +234,18 @@ def test_config_save_and_restart_gated(pw_page, config_api, preserve_precedence_
 
     Gated behind HERD_E2E_RESTART=1 and MUST NOT run implicitly or concurrently
     with any other test or agent: clicking Save and Restart bounces every
-    service in this compose project, which would break anything else in flight.
-    Issue #388 item 1 flags it as needing a serial, last-in-run slot; this test
-    is that slot. It is the case that would have caught the #373 restart bug.
+    service that reads config.json, which would break anything else in flight.
+    Issue #388 item 1 flags it as needing a serial, last-in-run slot; nightly.yml
+    runs it alone as its last test step (issue #1326). It is the case that would
+    have caught the #373 restart bug, and the one run of the real restart path:
+    config, then the restarter on herd-ctl, then the Docker socket.
 
-    Effect assertions: the restart-result panel renders with a Restarted list,
-    the config service comes back healthy (its status endpoint answers 200),
-    and the edited value is readable via the config API afterward.
+    Effect assertions: the restart-result panel lists exactly the restarter's
+    allowlist, in its sorted order, and no error; the config service comes back
+    healthy (its status endpoint answers 200); and the edited value is readable
+    via the config API afterward.
     """
+    expected = "Restarted: " + ", ".join(_restart_allowlist())
     baseline = config_api.get("/api/config/settings").json()["values"]
     try:
         _ui_login(pw_page)
@@ -238,8 +255,11 @@ def test_config_save_and_restart_gated(pw_page, config_api, preserve_precedence_
 
         # The restart-result panel is the UI acknowledgment (issue #373's blind
         # spot); the health poll and API read-back below are the real effect.
-        expect(pw_page.get_by_text("Restart Result")).to_be_visible(timeout=90_000)
-        expect(pw_page.get_by_text(re.compile(r"Restarted:"))).to_be_visible(timeout=90_000)
+        panel = pw_page.locator("div", has=pw_page.get_by_text("Restart Result", exact=True)).last
+        expect(panel).to_be_visible(timeout=720_000)
+        expect(panel.get_by_text(expected, exact=True)).to_be_visible(timeout=10_000)
+        # The errors list is red text under the Restarted line; none must render.
+        expect(panel.locator("p.text-red-600, div.text-red-600")).to_have_count(0)
 
         deadline = time.monotonic() + 90.0
         healthy = False

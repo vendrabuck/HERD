@@ -23,7 +23,8 @@
 # Postgres-live suite (services/*/tests/*_live_pg.py) runs against the stack's
 # own Postgres, via `make _gate-ldap-stack-tests` / `make _gate-pg-live-tests`
 # (the same internal targets master/everything use, see the Makefile's LDAP
-# comment block). The job sets COMPOSE_PROJECT_NAME=herd once, in its env block, so
+# comment block). Its last test step runs the config page's Save and Restart
+# through the real restart path, which no other job or gate runs (issue #1326). The job sets COMPOSE_PROJECT_NAME=herd once, in its env block, so
 # every step and make target addresses the same compose project (issue #1313).
 name: Nightly
 
@@ -167,6 +168,18 @@ jobs:
 
       - name: Load test (locust, headless)
         run: HERD_BASE_URL=https://localhost make test-load
+
+      # Save and Restart through the real restart path (issue #1326, ADR 0017): the
+      # config page asks the restarter, which restarts every service that reads
+      # config.json, and the test asserts the Restart Result panel lists exactly
+      # those services. It is the LAST test step on purpose: the restart bounces
+      # them, and no step after it needs them warm (the steps below only collect
+      # diagnostics on a failure and stop the two labs). It needs no Selenium: the
+      # test drives Playwright's own Chromium.
+      - name: Config Save and Restart (real restart path, runs last)
+        env:
+          HERD_E2E_RESTART: "1"
+        run: uv run pytest tests/e2e/test_config_playwright.py::test_config_save_and_restart_gated -v --tb=short
 
       # Issue #648: this ordering is an invariant in both directions. It must
       # come AFTER every test phase it is meant to cover (an `if: failure()`

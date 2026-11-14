@@ -2,15 +2,20 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
 from app import login_limits
 from app.auth import create_session_token, require_config_session
 from app.config_schema import CONFIG_SCHEMA, SCHEMA_KEYS
 from app.config_store import (
+    DATA_DIR_NOT_WRITABLE_DETAIL,
     bootstrap_from_env,
     change_password,
+    data_dir_remedy,
+    data_dir_writable,
     is_configured,
     is_password_changed,
     load_config,
@@ -26,7 +31,13 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    bootstrap_from_env()
+    # A data directory this non-root process cannot write (a volume from a root-run
+    # image, issue #1326) is named in ONE error line with its fix; the service still
+    # starts and serves reads, and the first-boot bootstrap, which writes, is skipped.
+    if data_dir_writable():
+        bootstrap_from_env()
+    else:
+        logger.error(data_dir_remedy())
     yield
 
 
@@ -48,6 +59,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(PermissionError)
+async def data_dir_not_writable(_request: Request, exc: PermissionError) -> JSONResponse:
+    """A write the data directory refuses is 503 with a fixed detail, never a 500.
+
+    The exception text (a path) and the remedy go to the log; the body is a constant.
+    """
+    logger.error("%s (%s)", data_dir_remedy(), type(exc).__name__)
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": DATA_DIR_NOT_WRITABLE_DETAIL},
+    )
 
 
 # -- Schemas --
@@ -224,5 +248,6 @@ async def update_settings(
 async def apply_config(_rotated: None = Depends(require_password_rotated)):
     if not is_configured():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No configuration to apply")
-    result = restart_services()
-    return result
+    # One parameterless call to the restarter (ADR 0017); nothing from this request
+    # is passed on. It blocks for the whole restart, so it runs in a worker thread.
+    return await run_in_threadpool(restart_services)

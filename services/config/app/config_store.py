@@ -23,6 +23,42 @@ def _ensure_data_dir() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
+# The config service runs as a non-root user (issue #1326). A herd-config volume
+# created by an earlier, root-run image holds root-owned files it cannot write: reads
+# keep working, and every write answers 503 with this detail until the operator runs
+# the one-time command data_dir_remedy() names.
+DATA_DIR_NOT_WRITABLE_DETAIL = (
+    "The config data directory is not writable; the config service log names the one-time fix"
+)
+
+
+def data_dir_remedy() -> str:
+    """The one log line naming the data directory, this process's uid, and the fix."""
+    uid, gid = os.getuid(), os.getgid()
+    return (
+        f"config data directory {DATA_DIR} is not writable by uid {uid}; run: "
+        f"docker compose run --rm --no-deps --user root config chown -R {uid}:{gid} {DATA_DIR}"
+    )
+
+
+def data_dir_writable() -> bool:
+    """True when this process can create, replace, and delete the service's files.
+
+    The directory needs write and search permission (create, delete); each of the
+    three files that already exists needs write permission (replace in place).
+    """
+    try:
+        _ensure_data_dir()
+    except OSError:
+        return False
+    if not os.access(DATA_DIR, os.W_OK | os.X_OK):
+        return False
+    for path in (CONFIG_FILE, AUTH_FILE, _bootstrap_marker_file()):
+        if os.path.exists(path) and not os.access(path, os.W_OK):
+            return False
+    return True
+
+
 def _bootstrap_marker_file() -> str:
     # Derived at call time so the test fixture's DATA_DIR monkeypatch applies.
     return os.path.join(DATA_DIR, "config.bootstrapped")

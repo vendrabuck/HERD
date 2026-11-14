@@ -1,0 +1,5 @@
+# Build context of the restarter image (docker-compose.yml builds it with
+# `context: ./infra/restarter`). The image copies one file; everything else here,
+# its tests included, stays out of the context.
+*
+!restarter.py
