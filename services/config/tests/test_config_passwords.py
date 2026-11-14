@@ -185,7 +185,9 @@ _HOSTILE_STRING_BODIES = {
     "nul_inside": b'{"password": "test-config\\u0000pass"}',
     "empty": b'{"password": ""}',
     "over_long": b'{"password": "' + b"q" * 100_000 + b'"}',
-    "bcrypt_hash_as_password": b'{"password": "$2b$04$abcdefghijklmnopqrstuuabcdefghijklmnopqrstuvwxyz01234"}',
+    "bcrypt_hash_as_password": (
+        b'{"password": "$2b$04$abcdefghijklmnopqrstuuabcdefghijklmnopqrstuvwxyz01234"}'
+    ),
 }
 # Bodies the schema refuses before the password is checked.
 _HOSTILE_NON_STRING_BODIES = {
