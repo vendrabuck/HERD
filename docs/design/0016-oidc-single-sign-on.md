@@ -1041,6 +1041,21 @@ included.
   (phase 3) only, not against a running stack, because a second recreate of the gate
   auth service costs a full restart cycle for one branch; recorded in `docs/GAPS.md`.
 - Docs: `docs/specs/TESTING.md`, `docs/GAPS.md`.
+- As built, the lab's redirect URIs (decided by the owner on 2026-11-14): templated
+  from the environment, so no tracked file names a host address. `dex.yaml` is a
+  gomplate template for the static client's `redirectURIs`, rendered by the Dex
+  image's own entrypoint (it renders every `dex serve` argument ending in `.yaml`
+  with the gomplate it ships, v5.2.0 in v2.46.1); the lab's compose file passes
+  `HERD_GATEWAY_BIND` into the container. `https://localhost/api/auth/oidc/callback`
+  is always registered (the phase 5a live suite, and a stack bound to every
+  interface, as on the GitHub runner), and `https://<HERD_GATEWAY_BIND>/api/auth/oidc/callback`
+  is added when that variable holds an address other than `0.0.0.0`, the rule
+  `make gateway-url` follows. Proved live: with the bind set, a full code flow
+  through Dex's login form and the token endpoint succeeds for each of the two
+  callbacks; with it `0.0.0.0` or empty, only localhost's does; every unregistered
+  callback tried (another address, `0.0.0.0`, plain `http`, the unrendered
+  template text) gets Dex's 400 `Unregistered redirect_uri`; and the live suite
+  passes unchanged against each.
 
 ### Phase 6: light up (M)
 
