@@ -462,7 +462,9 @@ short-lived access token and a refresh token.
   against a fixed dummy hash, so response time does not reveal whether the email exists.
   Every local-mode answer (success, wrong password, unknown email, inactive account,
   LDAP account, local account without a hash, unusable stored hash, refused password)
-  costs exactly one bcrypt computation at cost 12 and hashes nothing new (IAM-HASH-5). \
+  costs exactly one bcrypt computation and hashes nothing new: at cost 12 for every
+  refusal that uses the dummy hash, and at the stored hash's own cost otherwise, which
+  is 12 for every hash HERD wrote (IAM-HASH-5). \
   Enforced in: `services/auth/app/services/auth_service.py` (`_authenticate_local`, `_DUMMY_HASH`); `services/auth/app/services/passwords.py` (`verify_password`, `DUMMY_HASH`) \
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_every_local_login_answer_costs_one_bcrypt_at_the_configured_cost`, `test_the_dummy_hash_has_the_ident_and_cost_of_every_new_hash`)
 - **IAM-LOGIN-3.** The login identifier is 1 to 255 characters and the password at most
@@ -1905,7 +1907,7 @@ it on the pre-#1355 commit, is replayed by the tests
   such a password is the 401 `Invalid credentials` (under passlib it was a 500);
   registration and the seed fail with the ValueError, as before. \
   Enforced in: `services/auth/app/services/passwords.py` (`_password_bytes`, `MAX_PASSWORD_BYTES`) \
-  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_a_refused_password_never_hashes`, `test_a_refused_password_is_false_after_one_dummy_check`, `test_4096_bytes_is_still_accepted`, `test_a_password_passlib_refused_to_hash_is_still_refused`, `test_a_login_with_a_nul_password_is_401_not_500`)
+  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_a_refused_password_never_hashes`, `test_a_refused_password_is_false_after_one_dummy_check`, `test_a_refused_password_against_a_good_hash_logs_nothing`, `test_4096_bytes_is_still_accepted`, `test_a_password_passlib_refused_to_hash_is_still_refused`, `test_a_login_with_a_nul_password_is_401_not_500`)
 - **IAM-HASH-4.** A stored hash is usable when it reads `$<ident>$<cost>$` followed by a
   22-character salt and a 31-character checksum in bcrypt's alphabet, with ident `2`,
   `2a`, `2b`, or `2y` and a two-digit cost from 04 to 31. `$2x$` and every other value
@@ -1913,9 +1915,12 @@ it on the pre-#1355 commit, is replayed by the tests
   after one check against the dummy hash, with one WARNING `Stored password hash is not
   a usable bcrypt hash` that holds neither the hash nor the password. A login against an
   unusable hash is the 401 `Invalid credentials` (under passlib it was a 500). A `$2$`
-  hash is checked as passlib emulated it (the password repeated to 72 bytes, under
-  `$2a$`), and the unused low bits of the final salt and checksum characters are cleared
-  before the check, as passlib did. \
+  hash is checked as passlib emulated it, with the password repeated to 72 bytes: the
+  new code checks it under `$2a$`, where passlib on bcrypt 4.0.1 used its fallback
+  ident `$2b$`, and the result is the same because `$2a$` and `$2b$` differ only for
+  inputs over 72 bytes, which never reach bcrypt here (IAM-HASH-2). The unused low bits
+  of the final salt and checksum characters are cleared before the check, as passlib
+  did. \
   Enforced in: `services/auth/app/services/passwords.py` (`_usable_hash`, `_STORED_HASH`, `_clear_low_bits`, `UNUSABLE_HASH_MESSAGE`) \
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_an_unusable_stored_hash_is_false_after_one_dummy_check`, `test_a_bcrypt_error_on_an_admitted_hash_is_false_after_one_dummy_check`, `test_a_login_against_an_unusable_stored_hash_is_401_not_500`, `test_every_legacy_passlib_decision_is_kept`)
 - **IAM-HASH-5.** Every `verify_password` call runs exactly one bcrypt computation:

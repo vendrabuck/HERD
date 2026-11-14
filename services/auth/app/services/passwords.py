@@ -16,8 +16,11 @@ module does:
   raises ValueError and `verify_password` returns False.
 - A stored hash is usable when it reads `$<ident>$<cost>$<22-char salt><31-char
   checksum>` with ident `2`, `2a`, `2b`, or `2y` and cost 04 to 31. `$2x$` and every
-  other shape are refused. A `$2$` hash is checked as passlib emulated it: the
-  password repeated to 72 bytes, under `$2a$`.
+  other shape are refused. A `$2$` hash is checked as passlib emulated it, with
+  the password repeated to 72 bytes. This module checks that under `$2a$`;
+  passlib on bcrypt 4.0.1 used its fallback ident `$2b$`. The result is the same,
+  because `$2a$` and `$2b$` differ only for inputs over 72 bytes, and the secret
+  here is never longer than 72.
 - The unused low bits of the last salt character (4 bits) and the last checksum
   character (2 bits) are cleared before checking, as passlib did (it warned).
 - New hashes are `$2b$` at cost 12 (`BCRYPT_IDENT`, `BCRYPT_ROUNDS`), passlib's
@@ -25,9 +28,10 @@ module does:
   nothing rehashes on login (passlib's `needs_update` was never called).
 
 Every `verify_password` call runs exactly one bcrypt computation: against the stored
-hash when it is usable and the password is acceptable, else against `DUMMY_HASH`,
-whose ident and cost are the ones new hashes get. So a refusal costs what a check
-costs (IAM-LOGIN-2). Both functions are synchronous and CPU-bound; callers run them
+hash, at that hash's own cost, when it is usable and the password is acceptable, else
+against `DUMMY_HASH`, at cost 12, the ident and cost new hashes get. Every hash HERD
+wrote is cost 12, so a refusal costs what a check of a real account costs
+(IAM-LOGIN-2). Both functions are synchronous and CPU-bound; callers run them
 on the event loop today, as they did with passlib.
 """
 
