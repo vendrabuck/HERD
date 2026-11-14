@@ -233,6 +233,7 @@ def test_discovery_finds_the_known_build_and_compose_files():
         "docker-compose.override.yml",
         "infra/ldap-test/docker-compose.yml",
         "infra/nos-test/docker-compose.yml",
+        "infra/oidc-test/docker-compose.yml",
     } <= composes
 
 

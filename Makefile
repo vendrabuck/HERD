@@ -115,10 +115,11 @@ cov_pkg = $(if $(filter common,$(1)),herd_common,app)
 	$(addprefix coverage-,$(SERVICES)) \
 	$(addprefix migrate-,$(DB_SERVICES)) \
 	$(addprefix shell-,$(DB_SERVICES)) \
-	test-frontend test-frontend-tz check-image-lock test-integration test-integration-ai test-integration-service test-contract test-load test-load-ui test-e2e test-e2e-seeded test-e2e-stop test-auth-ldap ai-eval \
+	test-frontend test-frontend-tz check-image-lock test-integration test-integration-ai test-integration-service test-contract test-load test-load-ui test-e2e test-e2e-seeded test-e2e-stop test-auth-ldap test-auth-oidc ai-eval \
 	test-root test-restarter coverage-restarter coverage-parallel coverage-frontend \
 	install frontend-install frontend-dev manual-index lint format clean clean-data gate-clean gate-down seed seed-frr seed-nos \
 	ldap-up ldap-down ldap-status ldap-logs ldap-reset _gate-ldap-tests \
+	oidc-up oidc-down oidc-status _gate-oidc-tests \
 	nos-up nos-down nos-status nos-logs nos-reset nos-attach nos-detach \
 	nos-test-dialect nos-test-feature \
 	_gate-ldap-stack-tests _gate-pg-live-tests \
@@ -233,10 +234,13 @@ master-quick:  ## Fast gate: lock check + format + lint + unit + frontend + buil
 	@echo ""
 	@echo "=== master-quick complete ==="
 
-master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + gate stack contract/integration/e2e + LDAP-mode stack + Postgres-live suites
+master: gate-clean master-quick  ## Full gate: master-quick + live LDAP + live OIDC + gate stack contract/integration/e2e + LDAP-mode stack + Postgres-live suites
 	@echo ""
 	@echo "=== Live LDAP auth tests ==="
 	$(MAKE) _gate-ldap-tests
+	@echo ""
+	@echo "=== Live OIDC auth tests ==="
+	$(MAKE) _gate-oidc-tests
 	@echo ""
 	@echo "=== Starting ephemeral stack for integration + e2e ==="
 	@# Always tear the stack down, even if integration or e2e fails.
@@ -331,7 +335,7 @@ master-clean: _clean-images  ## master with this checkout's dev and gate images 
 # way); only the load-test tail is skipped.
 EVERYTHING_LOAD ?= 1
 
-everything: gate-clean  ## Full gate: CI checks + coverage + live LDAP + NOS dialect + stack phases + seed + seeded e2e + load; leaves the seeded gate stack up
+everything: gate-clean  ## Full gate: CI checks + coverage + live LDAP + live OIDC + NOS dialect + stack phases + seed + seeded e2e + load; leaves the seeded gate stack up
 	@echo ""
 	@echo "=== Checking uv.lock is in sync (fails instead of rewriting it) ==="
 	uv lock --check
@@ -356,6 +360,9 @@ everything: gate-clean  ## Full gate: CI checks + coverage + live LDAP + NOS dia
 	@echo ""
 	@echo "=== Live LDAP auth tests ==="
 	$(MAKE) _gate-ldap-tests
+	@echo ""
+	@echo "=== Live OIDC auth tests ==="
+	$(MAKE) _gate-oidc-tests
 	@echo ""
 	@echo "=== NOS lab dialect tests (real SR Linux and FRR, no stack) ==="
 	$(MAKE) nos-test-dialect
@@ -770,7 +777,7 @@ _collect-stack-diagnostics:
 		docker compose logs --no-color --timestamps "$$svc" > "$(DIAG_DIR)/logs-$$svc.txt" || true; \
 	done
 
-## --- Test labs (LDAP, NOS) ---
+## --- Test labs (LDAP, OIDC, NOS) ---
 
 # -- LDAP test server (infra/ldap-test) ---------------------------------------
 #
@@ -876,6 +883,66 @@ _gate-ldap-tests:
 	fi; \
 	trap 'if [ "$$started" = 1 ]; then $(MAKE) ldap-down; fi' EXIT INT TERM; \
 	$(MAKE) test-auth-ldap
+
+# -- OIDC test provider (infra/oidc-test) -------------------------------------
+#
+# A checked-in Dex (ghcr.io/dexidp/dex) compose file under infra/oidc-test with
+# a static client for HERD and the fixture users the live OIDC auth tests
+# assert (ADR 0016 phase 5a, D12). Stateless: down discards every session,
+# code, and signing key; up starts again from infra/oidc-test/dex.yaml. The
+# compose healthcheck fetches the discovery document from inside the
+# container, so `up --wait` returns once Dex can answer a sign-in.
+#
+# The issuer is http://oidc-test:5556/dex. The port publishes on
+# HERD_GATEWAY_BIND (GATEWAY_BIND above, read from the environment or `.env`,
+# passed explicitly because compose reads no repo-root `.env` for a file under
+# infra/), and the live suite connects to HERD_TEST_OIDC_HOST: the bind address
+# when one is set, 127.0.0.1 when it is empty or 0.0.0.0.
+#
+# The master and everything gates run the suite through _gate-oidc-tests,
+# which hard-requires the provider (HERD_TEST_OIDC_REQUIRED=1 turns the
+# unreachable-provider skip into a failure) and stops it afterward only if
+# the gate started it; a provider you started yourself is left running.
+# Pinned with -p for the reason LDAP_COMPOSE is: an exported
+# COMPOSE_PROJECT_NAME must never redirect these commands to another project.
+OIDC_COMPOSE := docker compose -p herd-oidc-test -f infra/oidc-test/docker-compose.yml
+HERD_TEST_OIDC_HOST ?= $(if $(filter-out 0.0.0.0,$(GATEWAY_BIND)),$(GATEWAY_BIND),127.0.0.1)
+HERD_TEST_OIDC_PORT ?= 5556
+
+oidc-up:  ## Start the checked-in OIDC test provider (infra/oidc-test, Dex), wait until it answers
+	HERD_GATEWAY_BIND=$(GATEWAY_BIND) HERD_TEST_OIDC_PORT=$(HERD_TEST_OIDC_PORT) $(OIDC_COMPOSE) up -d --wait
+	@echo "OIDC test provider up: issuer http://oidc-test:5556/dex, published on $(HERD_TEST_OIDC_HOST):$(HERD_TEST_OIDC_PORT)"
+
+# --remove-orphans is safe for the reason it is in ldap-down: the project is
+# pinned with -p and owned by this one compose file.
+oidc-down:  ## Stop and remove the OIDC test provider
+	$(OIDC_COMPOSE) down -v --remove-orphans
+
+oidc-status:  ## Show the OIDC test provider's container status
+	$(OIDC_COMPOSE) ps
+
+# Run only the live OIDC auth tests, hard-required the way test-auth-ldap is:
+# with the provider down every test fails with the remedy instead of
+# skipping. `make oidc-up test-auth-oidc` starts the provider first.
+test-auth-oidc:  ## Run the live OIDC auth tests against Dex (no skips; needs oidc-up)
+	cd services/auth && HERD_TEST_OIDC_HOST=$(HERD_TEST_OIDC_HOST) HERD_TEST_OIDC_PORT=$(HERD_TEST_OIDC_PORT) \
+		HERD_TEST_OIDC_REQUIRED=1 uv run pytest tests/test_oidc_service_live.py -v
+
+# Gate phase used by master and everything, the _gate-ldap-tests shape: boot
+# the provider if (and only if) it is not already running, run the
+# hard-required tests, then tear down only what this run started; the trap
+# covers the failure path too. It reuses any running container named
+# oidc-test as it finds it, so a provider started from another checkout or
+# from an older dex.yaml must be stopped first (`make oidc-down`).
+_gate-oidc-tests:
+	@started=0; \
+	if ! docker ps --format '{{.Names}}' | grep -q '^oidc-test$$'; then \
+		$(MAKE) oidc-up; started=1; \
+	else \
+		echo "OIDC test provider already running; leaving it up afterward."; \
+	fi; \
+	trap 'if [ "$$started" = 1 ]; then $(MAKE) oidc-down; fi' EXIT INT TERM; \
+	$(MAKE) test-auth-oidc
 
 # Checked-in emulated-gear test lab (infra/nos-test, docs/NOS_LAB.md): phase 0
 # of the emulated-gear test tier (ADR 0010). License-free, needs no external

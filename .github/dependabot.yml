@@ -80,6 +80,7 @@ updates:
       - "/"
       - "/infra/ldap-test"
       - "/infra/nos-test"
+      - "/infra/oidc-test"
     schedule:
       interval: "weekly"
     groups:

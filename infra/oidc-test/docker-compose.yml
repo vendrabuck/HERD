@@ -1,0 +1,61 @@
+# Checked-in OpenID Connect test provider for the live OIDC auth tests
+# (services/auth/tests/test_oidc_service_live.py) and the master/everything
+# gate's OIDC phase (ADR 0016 phase 5a, D12).
+#
+# Dex (ghcr.io/dexidp/dex) with the static client and fixture users in
+# ./dex.yaml. Every secret in that file (the client secret, the fixture
+# password) is a test-only value for this lab; never reuse one anywhere real.
+#
+# The issuer is http://oidc-test:5556/dex, one URL for every client: a
+# container on a Docker network reaches the container by the alias
+# `oidc-test`, and a host-side client maps the name to the published address
+# (the live suite through its transport, a browser through
+# --host-resolver-rules). Plain HTTP only, so HERD runs against it with
+# OIDC_REQUIRE_HTTPS=false.
+#
+# Deliberately stateless: storage is Dex's in-memory store and there are no
+# volumes, so `docker compose down` discards every session, code, and signing
+# key and the next `up` starts from ./dex.yaml alone.
+#
+# The port publishes on HERD_GATEWAY_BIND, the same knob and the same
+# unset-case default as the gateway in the repository's docker-compose.yml;
+# `make oidc-up` passes the value it derives from the environment or `.env`.
+
+name: herd-oidc-test
+
+# Container log rotation (issue #1352): Docker's json-file driver, at most five
+# files of 10 MB per container (50 MB in all), oldest dropped first. Every
+# service references this anchor; tests/unit/test_compose_capacity.py fails on a
+# service without it.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  dex:
+    logging: *default-logging
+    image: ghcr.io/dexidp/dex:v2.46.1@sha256:65b72ca0f4b0bf6d4ada84ec21da8851782563404ac7b8f926923d27ceced9ab
+    container_name: oidc-test
+    command: ["dex", "serve", "/etc/dex/dex.yaml"]
+    ports:
+      - "${HERD_GATEWAY_BIND:-0.0.0.0}:${HERD_TEST_OIDC_PORT:-5556}:5556"
+    volumes:
+      - ./dex.yaml:/etc/dex/dex.yaml:ro
+    healthcheck:
+      # Healthy means the discovery document answers, which Dex serves only
+      # after its signing keys exist, so the first token can be signed.
+      test:
+        [
+          "CMD",
+          "wget",
+          "-q",
+          "-O",
+          "/dev/null",
+          "http://127.0.0.1:5556/dex/.well-known/openid-configuration",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+      start_period: 2s
