@@ -746,9 +746,10 @@ async def run_health_scheduler_loop(
     failures (e.g. DB unreachable) back off exponentially up to a cap; a
     healthy tick resets to the base interval.
 
-    `nc` is the NATS client used to publish health-transition events
-    (iter 2). Pass None to disable publishing without changing the
-    `health_poll_notify_enabled` config flag.
+    `nc` is passed through to `fire_poll` for call-site compatibility and
+    is unused: health-transition events (iter 2) are staged in the outbox
+    and published by the outbox relay, so None does not stop them;
+    `health_poll_notify_enabled` alone decides whether they are staged.
     """
     base_interval = settings.health_poll_scheduler_tick_seconds
     max_backoff = max(base_interval * 10, 300)
@@ -787,10 +788,13 @@ async def start_health_scheduler(app) -> None:
     """Start the scheduler as a background task on the FastAPI app.
 
     Stored under app.state.health_scheduler_task so the shutdown hook
-    can cancel and await it. Reads `app.state.nats` (set by
-    `start_nats_consumer` which runs first in main.py lifespan) to
-    publish iter-2 transition events. If NATS connect failed earlier
-    the scheduler still works; transition events just get dropped.
+    can cancel and await it. Passes `app.state.nats` to the loop for
+    call-site compatibility only; the scheduler never publishes. A
+    transition event is staged in the outbox in the same transaction as
+    the status update (`fire_poll`), and the outbox relay publishes it.
+    Without a NATS connection the scheduler still works and its
+    transition events wait in the outbox, unpublished, until the relay
+    has a connection (OPS-NATS-1: a failed connect needs a restart).
     """
     if not settings.health_poll_scheduler_enabled:
         logger.info("health scheduler disabled; skipping startup")

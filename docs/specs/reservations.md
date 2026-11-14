@@ -1123,6 +1123,19 @@ caller.
   then lost is recovered by the client's unlimited reconnect. \
   Enforced in: `services/reservations/app/main.py` (`lifespan`); `services/common/herd_common/jetstream.py` (`connect_nats`) \
   Pinned by: `services/reservations/tests/test_main_task_lifecycle.py` (`test_lifespan_starts_without_nats_using_the_real_client`, `test_lifespan_creates_and_cancels_expiration_and_purpose_classify_tasks`)
+- **RES-EVENT-5.** The startup warning states what happens to events (issue #1337). A
+  failed connect logs `NATS unavailable at <url>; events wait in the outbox until the
+  service is restarted with the broker reachable`. A connect that succeeds while
+  ensuring the `HERD_RESERVATIONS` stream fails (a create of a missing stream, or an
+  update of one that exists, which execution may have created) keeps the connection,
+  so the relay publishes: at once when the stream exists, and while it is missing each
+  failed publish leaves its row in the outbox for the next tick
+  (`operations-and-observability.md`, OPS-OUTBOX-6). That case logs `JetStream stream
+  HERD_RESERVATIONS could not be created or updated at <url>; the connection is kept,
+  so events publish if the stream exists, and while it is missing they wait in the
+  outbox and the relay retries them every tick`. Neither says events are skipped. \
+  Enforced in: `services/reservations/app/main.py` (`lifespan`) \
+  Pinned by: `services/reservations/tests/test_main_task_lifecycle.py` (`test_lifespan_starts_without_nats_using_the_real_client`, `test_lifespan_names_a_failed_stream_ensure_apart_from_a_failed_connect`)
 
 **Out of scope.** The relay, deduplication headers, and consumer behavior are shared
 infrastructure (`operations-and-observability.md`); what consumers do is in their own

@@ -23,6 +23,7 @@ from app.config import settings
 from app.models.device import Device
 from app.models.hypervisor import Hypervisor
 from app.models.template import DeviceTemplate
+from app.services import auth_groups
 from app.services.manage_guard import _is_admin
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ async def _resolve_visible_device_ids(
     """Resolve the set of device IDs a non-admin user can see via their groups.
 
     Fails closed: if the auth service is unreachable or errors,
-    `_fetch_user_group_ids` raises HTTPException(503) and that propagates so the
+    `auth_groups.fetch_user_group_ids` raises HTTPException(503) and that propagates so the
     request fails rather than falling back to showing every device. A user who
     legitimately belongs to no groups resolves to an empty set (sees no DUTs),
     which is distinct from an auth-service outage.
@@ -47,10 +48,9 @@ async def _resolve_visible_device_ids(
     device read gated through this function shows a non-admin owner the device
     that represents their dynamic instance.
     """
-    from app.routers.device_groups import _fetch_user_group_ids
     from app.services.device_group_service import get_visible_device_ids
 
-    user_group_ids = await _fetch_user_group_ids(user_id, authorization)
+    user_group_ids = await auth_groups.fetch_user_group_ids(user_id, authorization)
     visible = await get_visible_device_ids(db, user_group_ids)
     return visible | await _instance_devices_held_by(db, user_id, visible)
 
@@ -138,7 +138,7 @@ async def resolve_visible_dynamic_hypervisor_ids(
     permission on: the same DeviceGroupPermission rows that grant physical
     devices. A hypervisor with no device group is in nobody's set. Fails
     closed like device visibility: an auth outage raises the 503 of
-    `_fetch_user_group_ids`, and a malformed subject resolves to the empty set.
+    `auth_groups.fetch_user_group_ids`, and a malformed subject resolves to the empty set.
     """
     if _is_admin(payload):
         return None
@@ -146,10 +146,9 @@ async def resolve_visible_dynamic_hypervisor_ids(
         user_id = uuid.UUID(payload["sub"])
     except (KeyError, ValueError):
         return set()
-    from app.routers.device_groups import _fetch_user_group_ids
     from app.services.device_group_service import get_permitted_device_group_ids
 
-    user_group_ids = await _fetch_user_group_ids(user_id, authorization)
+    user_group_ids = await auth_groups.fetch_user_group_ids(user_id, authorization)
     group_ids = await get_permitted_device_group_ids(db, user_group_ids)
     if not group_ids:
         return set()

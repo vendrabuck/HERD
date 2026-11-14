@@ -32,7 +32,7 @@ Session = async_sessionmaker(engine, expire_on_commit=False)
 
 USER_ID = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
 USER_GROUP = uuid.uuid4()
-GROUPS = "app.routers.device_groups._fetch_user_group_ids"
+GROUPS = "app.services.auth_groups.fetch_user_group_ids"
 CALL = "app.services.device_visibility.call_service"
 INTERNAL_TOKEN = "internal-test-token"
 

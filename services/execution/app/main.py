@@ -39,8 +39,12 @@ async def _ensure_health_stream(app: FastAPI) -> None:
     Idempotent: ensure_stream creates the stream if it does not exist, or
     updates it in place if it exists with a different configuration (e.g. a
     changed max_age on an upgraded-in-place stack); a matching existing
-    config is a no-op. Non-fatal if NATS is down so the service still boots;
-    the health scheduler simply drops publish attempts in that case.
+    config is a no-op. Non-fatal so the service still boots: with no NATS
+    connection it returns at once, and a failed ensure is logged. The health
+    scheduler never publishes; it stages transition events in the outbox, and
+    they wait there unpublished while the relay has no connection, or are
+    retried every relay tick while a publish fails (for example while the
+    stream is missing).
     """
     nc = getattr(app.state, "nats", None)
     if nc is None:
@@ -100,8 +104,15 @@ async def start_outbox_relay(app: FastAPI) -> None:
 
     Drains unpublished OutboxEvent rows (staged by the health scheduler in the
     same transaction as the status update) to JetStream and prunes old ones.
-    `get_nats` is read each tick via app.state.nats, so a NATS connection that
-    was None at startup, or a later reconnect, is picked up without a restart.
+    `get_nats` is read each tick via app.state.nats, which start_nats_consumer
+    sets only when its connect succeeds, and nothing retries a failed connect.
+    A consumer start deferred by the issue #463 schema gate that connects after
+    boot is used from the relay's next tick, with no restart, and an
+    established connection that drops is waited out until the client
+    reconnects. A connect that failed (at boot or in the deferred start)
+    leaves app.state.nats unset: the relay publishes nothing, and events wait
+    in the outbox until the service is restarted with the broker reachable
+    (OPS-NATS-1).
     Mirrors start_health_scheduler: stored on app.state for shutdown to cancel.
     """
     task = asyncio.create_task(
