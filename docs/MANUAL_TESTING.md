@@ -93,15 +93,20 @@ port over ssh (`ssh -L 7900:127.0.0.1:7900 <host>`) and open
 
 - Why manual: the restart-scope behavior (issue #373, PR #383) is about
   OTHER compose projects on the host, and CI runs no second project.
-  The single-project restart is covered by unit tests with a fake docker
-  client.
-- Cadence: on change to services/config/ restart logic.
+  Since issue #1326 the scoping lives in the restarter (`infra/restarter/`),
+  whose unit tests pin it against a fake Docker daemon that lists other
+  projects' containers, and nightly.yml runs the single-project restart
+  for real; this check is the one against a real second project.
+- Cadence: on change to `infra/restarter/` or to the config service's
+  restart client.
 - Preconditions: HERD up via `make prod`; a second unrelated compose
   project running on the same host.
 - Steps: change a schema key in the config UI; Save and Restart; watch
   `docker ps` timestamps for both projects.
-- Expected: only HERD services restart; the unrelated project's
-  containers keep their uptime; the changed key is live afterward
+- Expected: only the eleven HERD services that read `config.json`
+  restart (the Restart Result panel lists them); config, traefik,
+  postgres, nats, frontend, and restarter keep their uptime, and so do the
+  unrelated project's containers; the changed key is live afterward
   (verify via the relevant service's behavior or /api/config).
 
 ## M5. LDAP login edge cases against a real directory

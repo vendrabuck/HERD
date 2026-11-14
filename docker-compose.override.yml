@@ -25,7 +25,6 @@ services:
     volumes:
       - ./services/config/app:/app/app
       - herd-config:/data/herd-config
-      - /var/run/docker.sock:/var/run/docker.sock:ro
 
   auth:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload

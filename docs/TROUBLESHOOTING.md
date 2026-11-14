@@ -13,6 +13,14 @@ Common failure modes and how to diagnose them. Organized by what the user sees.
 
 See [OPERATIONS.md](OPERATIONS.md#config-service-first-run).
 
+### The config page saves nothing: 503 "The config data directory is not writable"
+
+The config service runs as a non-root user since issue #1326, and the `herd-config` volume was created by an earlier release whose files belong to root. Reads keep working. `docker compose logs config` carries one line, `config data directory /data/herd-config is not writable by uid <uid>; run: ...`, naming the command. Run it once (it is the one in [OPERATIONS.md](OPERATIONS.md#upgrade-path), with `-f docker-compose.yml` under `make prod`); no restart is needed afterward.
+
+### Save and Restart reports `Cannot reach the restart service: <Class>`
+
+The config service could not get an answer from the `restarter` container. Check it is up and healthy with `docker compose ps restarter` and read `docker compose logs restarter`. A stack upgraded with `make restart` instead of `make up` or `make prod` has no restarter yet (and still runs the old config image): run `make up` (`make prod` on a production host). `A restart is already in progress` means another Save and Restart is still running; wait for its result.
+
 ### The config page says `Too many failed login attempts`
 
 The config login limits failed attempts. A waiting login is answered HTTP 429 `Too many

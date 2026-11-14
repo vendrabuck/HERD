@@ -72,9 +72,10 @@ services:
       # fixed in services/config/app/login_limits.py).
       CONFIG_LOGIN_MAX_ATTEMPTS: ${CONFIG_LOGIN_MAX_ATTEMPTS:-20}
       CONFIG_LOGIN_LOCKOUT_SECONDS: ${CONFIG_LOGIN_LOCKOUT_SECONDS:-300}
+    # No Docker socket (issue #1326): Save and Restart asks the restarter below over
+    # herd-ctl, the internal network only the two of them join (ADR 0017).
     volumes:
       - herd-config:/data/herd-config
-      - /var/run/docker.sock:/var/run/docker.sock:ro
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.config.rule=PathPrefix(`/api/config`)"
@@ -85,9 +86,50 @@ services:
       - "traefik.http.routers.config.middlewares=config-strip"
     networks:
       - herd-net
+      - herd-ctl
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # --- Restarter (Save and Restart's Docker access, issue #1326, ADR 0017) ---
+  #
+  # The one HERD container that holds the Docker socket (Traefik, below, holds it
+  # for discovery; issue #1424 tracks narrowing that). Its whole API is a
+  # parameterless POST /restart, which restarts the services that mount
+  # herd-config:/etc/herd:ro within THIS compose project, and GET /health. It is on
+  # herd-ctl only (internal: no route off the host, no gateway route), with no ports,
+  # no traefik labels, a read-only root filesystem, no capabilities, and
+  # no-new-privileges. It runs as root inside, which opens the root-owned socket
+  # with no capability (see infra/restarter/Dockerfile). The project comes from the
+  # same COMPOSE_PROJECT_NAME interpolation Traefik's constraint uses; the :? form
+  # refuses to render the file when it is empty. The socket's :ro stops the file
+  # from being replaced and does not limit the API.
+  # tests/unit/test_restarter_compose_guard.py pins all of the above.
+  restarter:
+    logging: *default-logging
+    build:
+      context: ./infra/restarter
+      args:
+        HERD_BUILD: ${HERD_BUILD:-dev}
+        HERD_BUILD_DATE: ${HERD_BUILD_DATE:-}
+    environment:
+      HERD_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:?the compose project name is empty (needs Docker Compose 2.27.1 or later); the restarter would not know its project}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - herd-ctl
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-I", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -915,6 +957,11 @@ services:
 networks:
   herd-net:
     driver: bridge
+  # Save and Restart's private link: config and restarter only, and internal, so
+  # nothing on it reaches beyond the host (issue #1326).
+  herd-ctl:
+    driver: bridge
+    internal: true
 
 volumes:
   postgres-data:

@@ -11,7 +11,8 @@ What is checked, as text and YAML only:
 - every `services/*/Dockerfile` has exactly one `FROM` naming
   `ghcr.io/astral-sh/uv`, and all twelve name the same reference (tag and digest);
 - the final stage of every service Dockerfile starts from the same `python`
-  reference (tag and digest);
+  reference (tag and digest), and so does the final stage of the restarter's
+  `infra/restarter/Dockerfile` (issue #1326), which installs nothing and takes no uv;
 - every workflow step under `.github/workflows/` that uses `astral-sh/setup-uv`
   passes `with: version:` equal to the tag of that uv reference.
 
@@ -36,6 +37,7 @@ from tests.unit.test_image_pins import (
 UV_IMAGE = "ghcr.io/astral-sh/uv"
 SERVICE_DOCKERFILES = sorted((REPO_ROOT / "services").glob("*/Dockerfile"))
 WORKFLOWS = sorted((REPO_ROOT / ".github" / "workflows").glob("*.y*ml"))
+RESTARTER_DOCKERFILE = REPO_ROOT / "infra" / "restarter" / "Dockerfile"
 
 
 def uv_references(text: str) -> list[str]:
@@ -89,6 +91,15 @@ def pin_problems(dockerfiles: dict[str, str], workflows: dict[str, dict]) -> lis
     return problems
 
 
+def restarter_base_problems(service_dockerfiles: dict[str, str], restarter: str) -> list[str]:
+    """The restarter's final base must be the one base every service image starts from."""
+    bases = sorted({final_base(text) for text in service_dockerfiles.values()})
+    mine = final_base(restarter)
+    if bases != [mine]:
+        return [f"the restarter starts from {mine}, the service images from {bases}"]
+    return []
+
+
 def test_service_images_and_ci_use_one_uv_and_one_python_base():
     assert len(SERVICE_DOCKERFILES) == 12
     dockerfiles = {str(p.relative_to(REPO_ROOT)): p.read_text() for p in SERVICE_DOCKERFILES}
@@ -132,3 +143,21 @@ def test_detector_refuses_a_split_uv_a_split_base_and_a_drifted_ci():
     assert pin_problems({"a": _dockerfile()}, {"ci": {"jobs": {}}}) == [
         "no workflow step uses astral-sh/setup-uv"
     ]
+
+
+def test_the_restarter_starts_from_the_service_images_python_base():
+    dockerfiles = {str(p.relative_to(REPO_ROOT)): p.read_text() for p in SERVICE_DOCKERFILES}
+    assert restarter_base_problems(dockerfiles, RESTARTER_DOCKERFILE.read_text()) == []
+
+
+def test_detector_refuses_a_restarter_on_another_base():
+    services = {"a": _dockerfile(), "b": _dockerfile()}
+    assert restarter_base_problems(services, f"FROM {_PY}\nCOPY x /x\n") == []
+    for other in (
+        "python:3.12.15-slim@sha256:" + "2" * 64,
+        "python:3.12.16-slim@sha256:" + "4" * 64,
+        "python:3.12.16-slim",
+    ):
+        assert restarter_base_problems(services, f"FROM {other}\n") == [
+            f"the restarter starts from {other}, the service images from {[_PY]}"
+        ]

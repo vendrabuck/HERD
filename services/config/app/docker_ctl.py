@@ -1,81 +1,102 @@
+"""Save and Restart's one outbound call: ask the restarter to restart (ADR 0017).
+
+The config service holds no Docker socket (issue #1326). `restart_services` makes one
+parameterless `POST /restart` to the restarter on the internal `herd-ctl` network;
+the restarter decides the compose project and the services to restart. Nothing from
+the config request reaches that call.
+
+The answer passed back to `POST /apply` is always `{restarted, errors}` built here:
+
+- a 200 whose body is exactly that shape (two lists of short printable strings) is
+  passed through;
+- a 409 is the restarter's single-flight refusal, reported as IN_PROGRESS_ERROR;
+- any other status is `The restart service answered HTTP <status>`;
+- a 200 with any other body is UNEXPECTED_BODY_ERROR;
+- no answer is `Cannot reach the restart service: <ExceptionClass>`.
+
+The restarter's body is never echoed when it fails those checks, and an exception's
+text goes to the log only (issue #1086). Standard library only: the config image
+ships no HTTP client package.
+"""
+
+from __future__ import annotations
+
+import http.client
+import json
 import logging
-import socket
 
 logger = logging.getLogger(__name__)
 
-# Services to skip when restarting (always keep running)
-SKIP_SERVICES = {"config", "traefik", "postgres", "nats", "frontend"}
+RESTARTER_HOST = "restarter"
+RESTARTER_PORT = 8000
+RESTART_PATH = "/restart"
+# Above the restarter's PASS_DEADLINE_SECONDS (660 s, one deadline for its whole
+# pass however many containers match), so the restarter, not this client, is the one
+# that gives up. tests/unit/test_restarter_compose_guard.py pins the order.
+RESTART_TIMEOUT_SECONDS = 720.0
 
-PROJECT_LABEL = "com.docker.compose.project"
-SERVICE_LABEL = "com.docker.compose.service"
+IN_PROGRESS_ERROR = "A restart is already in progress"
+UNEXPECTED_BODY_ERROR = "The restart service answered an unexpected body"
+MAX_RESPONSE_BYTES = 64 * 1024
+MAX_ENTRIES = 64
+MAX_ENTRY_CHARS = 200
 
 
-def _own_compose_project(client) -> str | None:
-    """Return the compose project of the container this code runs in.
+def _error(message: str) -> dict:
+    return {"restarted": [], "errors": [message]}
 
-    A container's default hostname is its own container id, so inspecting it
-    yields our own labels. Returns None when the project cannot be determined
-    (not running in a container, custom hostname, missing label); the caller
-    must fail closed rather than restart unscoped, because a bare
-    service-label filter matches every compose project on the host
-    (issue #373: an apply restarted an unrelated stack).
-    """
-    try:
-        me = client.containers.get(socket.gethostname())
-    except Exception:
+
+def _validated(body: bytes) -> dict | None:
+    """The restarter's answer when it is exactly `{restarted, errors}`; else None."""
+    if len(body) > MAX_RESPONSE_BYTES:
         return None
-    return me.labels.get(PROJECT_LABEL) or None
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or set(data) != {"restarted", "errors"}:
+        return None
+    for key in ("restarted", "errors"):
+        entries = data[key]
+        if not isinstance(entries, list) or len(entries) > MAX_ENTRIES:
+            return None
+        for entry in entries:
+            if not isinstance(entry, str) or not entry or len(entry) > MAX_ENTRY_CHARS:
+                return None
+            if not entry.isprintable():
+                return None
+    return {"restarted": list(data["restarted"]), "errors": list(data["errors"])}
 
 
 def restart_services() -> dict:
-    """Restart the HERD application services of this compose project via Docker API.
+    """Ask the restarter to restart this stack's config-reading services.
 
-    Returns a dict with 'restarted' (list of names) and 'errors' (list of strings).
-    An error names what failed and the exception CLASS only; the exception text
-    (a socket path, a daemon URL, an API error body) goes to the log, never to
-    the response (issue #1086).
+    Blocking: `POST /apply` runs it in a worker thread.
     """
     try:
-        import docker
-    except ImportError:
-        return {"restarted": [], "errors": ["Docker SDK not installed"]}
-
-    result = {"restarted": [], "errors": []}
-
-    try:
-        client = docker.from_env()
-    except Exception as exc:
-        result["errors"].append(f"Cannot connect to Docker: {type(exc).__name__}")
-        logger.error("Cannot connect to Docker: %s", exc)
-        return result
-
-    project = _own_compose_project(client)
-    if project is None:
-        result["errors"].append(
-            "Cannot determine this container's compose project; refusing an "
-            "unscoped restart (it would hit every compose project on this host)"
+        conn = http.client.HTTPConnection(
+            RESTARTER_HOST, RESTARTER_PORT, timeout=RESTART_TIMEOUT_SECONDS
         )
-        return result
-
-    try:
-        containers = client.containers.list(
-            filters={"label": [f"{PROJECT_LABEL}={project}", SERVICE_LABEL]}
-        )
-    except Exception as exc:
-        result["errors"].append(f"Cannot list containers: {type(exc).__name__}")
-        logger.error("Cannot list containers: %s", exc)
-        return result
-
-    for container in containers:
-        service_name = container.labels.get(SERVICE_LABEL, "")
-        if service_name in SKIP_SERVICES:
-            continue
         try:
-            container.restart(timeout=30)
-            result["restarted"].append(service_name)
-            logger.info("Restarted service: %s", service_name)
-        except Exception as exc:
-            result["errors"].append(f"Failed to restart {service_name}: {type(exc).__name__}")
-            logger.error("Failed to restart %s: %s", service_name, exc)
+            conn.request("POST", RESTART_PATH, body=b"")
+            response = conn.getresponse()
+            status = response.status
+            body = response.read(MAX_RESPONSE_BYTES + 1)
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.error("Cannot reach the restart service: %r", exc)
+        return _error(f"Cannot reach the restart service: {type(exc).__name__}")
 
+    if status == 409:
+        return _error(IN_PROGRESS_ERROR)
+    if status != 200:
+        logger.error("The restart service answered HTTP %d: %r", status, body[:500])
+        return _error(f"The restart service answered HTTP {status}")
+    result = _validated(body)
+    if result is None:
+        logger.error("The restart service answered an unexpected body: %r", body[:500])
+        return _error(UNEXPECTED_BODY_ERROR)
+    for name in result["restarted"]:
+        logger.info("Restarted service: %s", name)
     return result

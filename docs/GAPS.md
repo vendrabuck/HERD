@@ -205,11 +205,6 @@ nightly say nothing about them.
   nightly.yml boots the directory (`make ldap-up`) but never runs this suite. Target:
   a `make test-auth-ldap` step in `.github/workflows/nightly.yml` after the
   existing `make ldap-up` step.
-- **[LOW] Config Save and Restart e2e.** `tests/e2e/test_config_playwright.py`
-  `test_config_save_and_restart_gated` skips unless `HERD_E2E_RESTART=1` (and carries
-  `seeded_skip_ok`); no workflow, Makefile target, or compose file sets the variable.
-  `docs/MANUAL_TESTING.md` (M4) covers the production-like restart by hand. Target: an
-  opt-in nightly step with `HERD_E2E_RESTART=1`, run last because it bounces the stack.
 - **[LOW] Live OpenAI-compatible provider smoke.**
   `services/ai-orchestrator/tests/integration/test_vllm_live.py` (2 tests) skips
   through its module `pytestmark` unless `HERD_VLLM_BASE_URL` is set; no workflow,

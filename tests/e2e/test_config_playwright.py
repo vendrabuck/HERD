@@ -13,9 +13,9 @@ Scope notes:
   (issue #256). Dev and CI stacks set CONFIG_ADMIN_PASSWORD in
   docker-compose.override.yml, which counts as rotated; on a stack where
   /api/config/status reports password_changed false these tests skip.
-- Save and Restart is deliberately NOT covered here: it bounces the stack,
-  which would break every test after it. It needs a serial, last-in-run
-  slot (tracked in issue #388).
+- Save and Restart runs only with HERD_E2E_RESTART=1: it bounces every
+  service that reads config.json, which would break every test after it.
+  nightly.yml runs it alone, as its last test step (issue #1326).
 - The round-trip edits LDAP_USER_FILTER, inert while AUTH_METHOD is local,
   and restores the exact prior settings afterward. Restoring VALUES is not
   the whole story: every save_config() deletes the config.bootstrapped
@@ -28,10 +28,12 @@ Scope notes:
   is accepted; CI's ephemeral stack does not care either way.
 """
 
+import importlib.util
+import json
 import os
-import re
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -54,6 +56,86 @@ SAVED_TOAST = "Configuration saved"
 # Container path of the precedence marker (services/config/app/config_store.py).
 BOOTSTRAP_MARKER = "/data/herd-config/config.bootstrapped"
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _restart_allowlist() -> list[str]:
+    """The restarter's RESTART_SERVICES (A), read from its module file.
+
+    tests/unit/test_restarter_compose_guard.py pins A to the compose services that
+    mount herd-config:/etc/herd:ro, so the panel must list exactly these.
+    """
+    path = REPO_ROOT / "infra" / "restarter" / "restarter.py"
+    spec = importlib.util.spec_from_file_location("herd_restarter_e2e", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return sorted(module.RESTART_SERVICES)
+
+
+# How long the services in the allowlist get to be running and healthy again after
+# the Restart Result panel appears. Docker answers a restart once the container has
+# started, not once its healthcheck passes; each service's healthcheck runs every 15 s
+# with a start period of at most 10 s (docker-compose.yml).
+RESTART_HEALTHY_SECONDS = 300.0
+# The panel waits for the whole restart: the restarter's PASS_DEADLINE_SECONDS (660 s)
+# under the config client's 720 s timeout, so a restarter that gives up shows as an
+# error entry in the panel rather than as a Playwright timeout.
+RESTART_PANEL_MS = 780_000
+
+
+def _docker(*argv: str) -> str:
+    """Run a docker CLI command on the host and return stdout; fail the test, never skip."""
+    try:
+        done = subprocess.run(
+            ["docker", *argv], capture_output=True, text=True, cwd=REPO_ROOT, timeout=60
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        pytest.fail(f"docker {' '.join(argv[:3])} could not run on this host: {exc!r}")
+    if done.returncode != 0:
+        pytest.fail(f"docker {' '.join(argv[:3])} failed: {done.stderr.strip()[:300]}")
+    return done.stdout
+
+
+def _started_at(text: str) -> datetime:
+    """Docker's StartedAt (RFC 3339, nanoseconds, Z) as an aware datetime."""
+    stamp, _, fraction = text.rstrip("Z").partition(".")
+    micro = (fraction + "000000")[:6]
+    return datetime.fromisoformat(f"{stamp}.{micro}").replace(tzinfo=timezone.utc)
+
+
+def _containers(services: list[str]) -> dict[str, dict]:
+    """Every container of these compose services (stopped ones included), by id:
+    its service, StartedAt, and health status ("none" without a healthcheck)."""
+    ids = _docker("compose", "ps", "-a", "-q", *services).split()
+    if not ids:
+        return {}
+    found = {}
+    for item in json.loads(_docker("inspect", *ids)):
+        state = item["State"]
+        found[item["Id"]] = {
+            "service": item["Config"]["Labels"].get("com.docker.compose.service"),
+            "started": _started_at(state["StartedAt"]),
+            "health": (state.get("Health") or {}).get("Status", "none"),
+            "running": state.get("Running", False),
+        }
+    return found
+
+
+def _not_back(services: list[str], before: dict[str, dict]) -> dict[str, list[str]]:
+    """Services whose containers are not all restarted and healthy, with the reasons."""
+    now = _containers(services)
+    problems: dict[str, list[str]] = {}
+    for container_id, old in before.items():
+        new = now.get(container_id)
+        reason = None
+        if new is None:
+            reason = f"container {container_id[:12]} is gone"
+        elif not new["started"] > old["started"]:
+            reason = f"container {container_id[:12]} was not restarted"
+        elif not new["running"] or new["health"] != "healthy":
+            reason = f"container {container_id[:12]} is {new['health']}"
+        if reason:
+            problems.setdefault(old["service"], []).append(reason)
+    return problems
 
 
 def _config_exec(cmd: str) -> "subprocess.CompletedProcess[str]":
@@ -217,18 +299,28 @@ def test_config_full_cycle_edit_and_restore_via_ui(pw_page, config_api, preserve
     "deliberately opt-in only (HERD_E2E_RESTART=1); no seed makes this safe to run implicitly"
 )
 def test_config_save_and_restart_gated(pw_page, config_api, preserve_precedence_marker):
-    """Save and Restart: persists a value AND restarts services, asserted by effect.
+    """Save and Restart restarts exactly the allowlist, and every one of them returns.
 
     Gated behind HERD_E2E_RESTART=1 and MUST NOT run implicitly or concurrently
     with any other test or agent: clicking Save and Restart bounces every
-    service in this compose project, which would break anything else in flight.
-    Issue #388 item 1 flags it as needing a serial, last-in-run slot; this test
-    is that slot. It is the case that would have caught the #373 restart bug.
+    service that reads config.json, which would break anything else in flight.
+    nightly.yml runs it alone as its last test step (issue #1326). It drives the
+    real restart path, config to the restarter on herd-ctl to the Docker socket,
+    and reads container state from the host's docker CLI, which it requires.
 
-    Effect assertions: the restart-result panel renders with a Restarted list,
-    the config service comes back healthy (its status endpoint answers 200),
-    and the edited value is readable via the config API afterward.
+    Assertions, in order: before the click every service in the restarter's
+    allowlist has at least one container; the Restart Result panel names exactly
+    the allowlist, in sorted order, and renders no error line; within
+    RESTART_HEALTHY_SECONDS every one of those containers has a StartedAt later
+    than before the click (it was restarted) and is running and healthy, else the
+    test fails naming each service that did not return and why; the saved value
+    reads back through the config API.
     """
+    allowlist = _restart_allowlist()
+    expected = "Restarted: " + ", ".join(allowlist)
+    before = _containers(allowlist)
+    missing = sorted(set(allowlist) - {c["service"] for c in before.values()})
+    assert not missing, f"no container before the click for {missing}"
     baseline = config_api.get("/api/config/settings").json()["values"]
     try:
         _ui_login(pw_page)
@@ -236,24 +328,23 @@ def test_config_save_and_restart_gated(pw_page, config_api, preserve_precedence_
 
         pw_page.get_by_role("button", name="Save and Restart").click()
 
-        # The restart-result panel is the UI acknowledgment (issue #373's blind
-        # spot); the health poll and API read-back below are the real effect.
-        expect(pw_page.get_by_text("Restart Result")).to_be_visible(timeout=90_000)
-        expect(pw_page.get_by_text(re.compile(r"Restarted:"))).to_be_visible(timeout=90_000)
+        # The panel reflects the restarter's answer, which Docker gives once each
+        # container has started; the container poll below is the real effect.
+        panel = pw_page.locator("div", has=pw_page.get_by_text("Restart Result", exact=True)).last
+        expect(panel).to_be_visible(timeout=RESTART_PANEL_MS)
+        expect(panel.get_by_text(expected, exact=True)).to_be_visible(timeout=10_000)
+        # The errors list is red text under the Restarted line; none must render.
+        expect(panel.locator("p.text-red-600, div.text-red-600")).to_have_count(0)
 
-        deadline = time.monotonic() + 90.0
-        healthy = False
-        while time.monotonic() < deadline:
-            try:
-                with httpx.Client(base_url=HOST_BASE_URL, verify=False, timeout=10.0) as probe:
-                    status = probe.get("/api/config/status")
-                if status.status_code == 200 and status.json().get("configured"):
-                    healthy = True
-                    break
-            except httpx.HTTPError:
-                pass
-            time.sleep(2.0)
-        assert healthy, "config service did not report healthy after Save and Restart"
+        deadline = time.monotonic() + RESTART_HEALTHY_SECONDS
+        problems = _not_back(allowlist, before)
+        while problems and time.monotonic() < deadline:
+            time.sleep(3.0)
+            problems = _not_back(allowlist, before)
+        assert not problems, (
+            f"services not restarted and healthy {RESTART_HEALTHY_SECONDS:.0f} s after the "
+            f"panel: {problems}"
+        )
 
         saved = config_api.get("/api/config/settings").json()["values"]
         assert saved["LDAP_USER_FILTER"] == SENTINEL_FILTER

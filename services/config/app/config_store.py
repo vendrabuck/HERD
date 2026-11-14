@@ -19,8 +19,52 @@ class ConfigAuthError(Exception):
     """Raised when the config auth file exists but cannot be read/parsed."""
 
 
+class DataDirNotWritable(PermissionError):
+    """The auth file is missing and the data directory cannot take a new one.
+
+    A PermissionError, so a route that meets it answers main.py's 503; read paths
+    that can do without the file (is_password_changed) catch it instead.
+    """
+
+
 def _ensure_data_dir() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
+
+
+# The config service runs as a non-root user (issue #1326). A herd-config volume
+# created by an earlier, root-run image holds root-owned files it cannot write: reads
+# keep working, and every write answers 503 with this detail until the operator runs
+# the one-time command data_dir_remedy() names.
+DATA_DIR_NOT_WRITABLE_DETAIL = (
+    "The config data directory is not writable; the config service log names the one-time fix"
+)
+
+
+def data_dir_remedy() -> str:
+    """The one log line naming the data directory, this process's uid, and the fix."""
+    uid, gid = os.getuid(), os.getgid()
+    return (
+        f"config data directory {DATA_DIR} is not writable by uid {uid}; run: "
+        f"docker compose run --rm --no-deps --user root config chown -R {uid}:{gid} {DATA_DIR}"
+    )
+
+
+def data_dir_writable() -> bool:
+    """True when this process can create, replace, and delete the service's files.
+
+    The directory needs write and search permission (create, delete); each of the
+    three files that already exists needs write permission (replace in place).
+    """
+    try:
+        _ensure_data_dir()
+    except OSError:
+        return False
+    if not os.access(DATA_DIR, os.W_OK | os.X_OK):
+        return False
+    for path in (CONFIG_FILE, AUTH_FILE, _bootstrap_marker_file()):
+        if os.path.exists(path) and not os.access(path, os.W_OK):
+            return False
+    return True
 
 
 def _bootstrap_marker_file() -> str:
@@ -106,8 +150,12 @@ def _default_auth() -> dict:
 
 
 def load_auth() -> dict:
-    _ensure_data_dir()
     if not os.path.exists(AUTH_FILE):
+        # Checked BEFORE a password is generated: on a directory that cannot keep
+        # the file, a generated password would be logged, never stored, and
+        # regenerated (with a bcrypt hash) on every call (issue #1326).
+        if not data_dir_writable():
+            raise DataDirNotWritable(f"cannot create {AUTH_FILE}")
         auth = _default_auth()
         _save_auth(auth)
         return auth
@@ -153,8 +201,9 @@ def change_password(new_password: str) -> None:
 def is_password_changed() -> bool:
     try:
         return load_auth().get("password_changed", False)
-    except ConfigAuthError:
-        # Keep the public /status endpoint up; report the safe default.
+    except (ConfigAuthError, DataDirNotWritable):
+        # Keep the public /status endpoint up; report the safe default. An
+        # unwritable directory with no auth file has no password yet.
         return False
 
 

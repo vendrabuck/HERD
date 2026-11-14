@@ -4,9 +4,9 @@
 |---|---|
 | Area prefix | `OPS` (used in rule identifiers, for example `OPS-OUTBOX-1`) |
 | Verified at | commit `cd3eaeed` (`v0.6.0-215-gcd3eaeed`), 2026-10-08 |
-| Owning services | common (`services/common/herd_common/`: logging, settings sources, schema lifecycle, outbox, JetStream helpers, version), config (`services/config/`), secrets (`services/secrets/`), user-profile (`services/user-profile/`), execution (the device health scheduler and its read routes), reservations (the utilization report routes); the About, Config, and Reporting pages in `frontend/` |
-| Other services involved | every backend service (each serves `/health` and `/version`, logs through the shared formatter, and resolves settings through the shared sources), inventory (the poll registry route, the secret reference lookup), auth (user groups for the report), cabling (transit devices for the report), acl (secret grants), notifications and integration (consumers of health events), NATS JetStream, Postgres, Docker (the config service's restart) |
-| Design records | [ADR 0003](../design/0003-encrypted-credential-store.md), [ADR 0013](../design/0013-lab-purpose-classification.md) |
+| Owning services | common (`services/common/herd_common/`: logging, settings sources, schema lifecycle, outbox, JetStream helpers, version), config (`services/config/`) and its restarter (`infra/restarter/`), secrets (`services/secrets/`), user-profile (`services/user-profile/`), execution (the device health scheduler and its read routes), reservations (the utilization report routes); the About, Config, and Reporting pages in `frontend/` |
+| Other services involved | every backend service (each serves `/health` and `/version`, logs through the shared formatter, and resolves settings through the shared sources), inventory (the poll registry route, the secret reference lookup), auth (user groups for the report), cabling (transit devices for the report), acl (secret grants), notifications and integration (consumers of health events), NATS JetStream, Postgres, Docker (reached only by the restarter, for the config service's restart) |
+| Design records | [ADR 0003](../design/0003-encrypted-credential-store.md), [ADR 0013](../design/0013-lab-purpose-classification.md), [ADR 0017](../design/0017-config-restart-without-the-docker-socket.md) |
 | Related guides | [OPERATIONS.md](../OPERATIONS.md), [TROUBLESHOOTING.md](../TROUBLESHOOTING.md), [ENV_VARS.md](../ENV_VARS.md), [LOAD_TESTING.md](../LOAD_TESTING.md), [ADMIN_HANDBOOK.md](../ADMIN_HANDBOOK.md), [ARCHITECTURE.md](../ARCHITECTURE.md), [ROLES.md](../ROLES.md), [FRESH_SETUP.md](../../FRESH_SETUP.md) |
 
 Paths in the route tables are each service's own paths. Through the gateway they are
@@ -47,7 +47,7 @@ beyond role (secret grants, own-row preferences) are numbered in section 8.
 | Actor | May | May not |
 |---|---|---|
 | Unauthenticated caller | Read `/health` and `/version` on every service; read the config service's status and field schema; log in to the config service with its password | Anything else |
-| Config operator (config-page password, not a HERD account) | Read the merged settings (secret values masked), change the config password, save settings and restart this compose project's services once the password is rotated (OPS-CONFIG-9) | Save or restart before rotating a generated password; restart services of another compose project (OPS-CONFIG-13) |
+| Config operator (config-page password, not a HERD account) | Read the merged settings (secret values masked), change the config password, save settings and restart this compose project's services that read `config.json` once the password is rotated (OPS-CONFIG-9) | Save or restart before rotating a generated password; restart services of another compose project or outside the restart set, or pass anything to the restart (OPS-CONFIG-13, OPS-CONFIG-14) |
 | User | Read the health snapshot of a device they can see (OPS-HEALTH-1); read, replace, merge, and reset their own preferences; list and read the secrets they hold a `view` or `manage` grant on, and reveal those they hold `manage` on | List all health snapshots; read reports; create, edit, delete, or rotate secrets; read another user's preferences |
 | Admin | Everything a user may; list health snapshots; read the utilization report and its CSV; create, list, read, reveal, edit, and delete every secret; rotate the data-encryption key; open the About page | Delete a secret a hypervisor references (OPS-SECRET-13) |
 | Superadmin | Same as admin | Same as admin |
@@ -126,7 +126,7 @@ while it is still due, so concurrent schedulers and replicas poll disjoint rows
 | GET | `/schema` (config) | anyone | 200 | OPS-CONFIG-10 |
 | GET | `/settings` (config) | config session | 200 | OPS-CONFIG-10 |
 | PUT | `/settings` (config) | config session, password rotated | 200 | OPS-CONFIG-9, OPS-CONFIG-11, OPS-CONFIG-12, OPS-CONFIG-23 |
-| POST | `/apply` (config) | config session, password rotated | 200 | OPS-CONFIG-9, OPS-CONFIG-13 to OPS-CONFIG-16 |
+| POST | `/apply` (config) | config session, password rotated | 200 | OPS-CONFIG-9, OPS-CONFIG-13 to OPS-CONFIG-16, OPS-CONFIG-24 |
 | POST | `/secrets` (secrets) | admin | 201 | OPS-SECRET-1, OPS-SECRET-2 |
 | GET | `/secrets` (secrets) | any signed-in user | 200 | OPS-SECRET-5 |
 | GET | `/secrets/{secret_id}` (secrets) | admin, or a `view` or `manage` grant | 200 | OPS-SECRET-6 |
@@ -169,6 +169,8 @@ never fails the message (`provisioning-and-wiring.md`, WIRE-GATE-1, WIRE-DISPATC
 | GET | `/internal/secrets/by-name/{name}/value` (secrets) | `X-Internal-Token` | none in the services today | `{id, name, data}` | OPS-SECRET-9, OPS-SECRET-10 |
 | GET | `/preferences/internal?user_id` (user-profile) | `X-Internal-Token` | notifications (channel and event opt-outs) | the user's preferences, created empty if missing | OPS-PREF-7 |
 | POST | `/device-check` (execution) | `X-Internal-Token` | none in the services today | `{run_id, device_id, status, output, error}` | OPS-HEALTH-6 to OPS-HEALTH-10 |
+| POST | `/restart` (restarter) | none; reachable only on the internal `herd-ctl` network | config (`POST /apply`) | `{restarted, errors}`, or 409 | OPS-CONFIG-13, OPS-CONFIG-25 to OPS-CONFIG-28 |
+| GET | `/health` (restarter) | none; reachable only on `herd-ctl` | the compose healthcheck | `{status, service}` | OPS-CONFIG-25 |
 
 This area calls inventory's `GET /devices/health-config` (`inventory.md`, INV-POLL-3) and
 `GET /hypervisors/by-secret/{id}/internal` (`inventory.md`); their answers are specified
@@ -454,8 +456,10 @@ config service cannot be reached, the form stays enabled and a sign-in goes to a
 usual (IAM-UI-9 in `identity-and-access.md`).
 
 **Surfaces.** `services/config/app/` (`main.py`, `config_store.py`, `auth.py`,
-`docker_ctl.py`, `config_schema.py`, `auth_rules.py`); `frontend/src/pages/ConfigPage.tsx` and
-`frontend/src/stores/configStore.ts`. The login page's use of `GET /status` is
+`docker_ctl.py`, `config_schema.py`, `auth_rules.py`); the restarter,
+`infra/restarter/restarter.py`, the one HERD container that holds the Docker socket
+([ADR 0017](../design/0017-config-restart-without-the-docker-socket.md));
+`frontend/src/pages/ConfigPage.tsx` and `frontend/src/stores/configStore.ts`. The login page's use of `GET /status` is
 `identity-and-access.md` (IAM-UI-9).
 
 **Rules.**
@@ -533,26 +537,39 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   empty. \
   Enforced in: `services/config/app/main.py` (`update_settings`, `SCHEMA_KEYS`); `services/config/app/config_schema.py` (`SCHEMA_KEYS`); `services/config/app/config_store.py` (`save_config`, `load_config`) \
   Pinned by: `services/config/tests/test_config.py` (`test_save_settings_refuses_keys_outside_the_schema`, `test_save_settings_with_unknown_key_leaves_existing_file_unchanged`, `test_unknown_key_is_refused_before_the_required_check`, `test_save_settings_with_schema_keys_only_saves`, `test_save_settings_keeps_keys_already_in_the_file_outside_the_schema`, `test_load_config_non_object_returns_empty`, `test_save_settings_missing_required`, `test_save_config_blank_required`, `test_save_and_get_settings`)
-- **OPS-CONFIG-13.** `POST /apply` restarts only containers of the config service's own
-  compose project, read from its own container's label; when that label cannot be read
-  it restarts nothing and reports an error. \
-  Enforced in: `services/config/app/docker_ctl.py` (`restart_services`, `_own_compose_project`) \
-  Pinned by: `services/config/tests/test_docker_ctl.py` (`test_restart_services_scopes_to_own_project`, `test_restart_services_fails_closed_when_self_lookup_fails`, `test_restart_services_fails_closed_when_own_project_label_missing`)
-- **OPS-CONFIG-14.** The restart skips `config`, `traefik`, `postgres`, `nats`, and
-  `frontend`, and restarts each other service with a 30 second timeout. \
-  Enforced in: `services/config/app/docker_ctl.py` (`SKIP_SERVICES`, `restart_services`) \
-  Pinned by: `services/config/tests/test_docker_ctl.py` (`test_restart_services_restarts_non_skipped`, `test_restart_services_never_restarts_a_skipped_service`, `test_restart_services_skips_every_known_service`, `test_skip_services_is_exactly_the_expected_names`)
+- **OPS-CONFIG-13.** `POST /apply` makes one call, a `POST /restart` with no query and
+  an empty body to the restarter at `restarter:8000` on the internal `herd-ctl`
+  network; nothing from the apply request (query, body, headers, session) is passed
+  on. The restarter restarts only containers of its own compose project,
+  `HERD_COMPOSE_PROJECT`, which compose sets from `COMPOSE_PROJECT_NAME`; when that is
+  unset or blank it makes no Docker request and its one error is
+  `HERD_COMPOSE_PROJECT is unset or blank; refusing a restart that is not scoped to one compose project`. \
+  Enforced in: `services/config/app/docker_ctl.py` (`restart_services`, `RESTART_PATH`); `services/config/app/main.py` (`apply_config`); `infra/restarter/restarter.py` (`run_restart`, `PROJECT_ENV`, `PROJECT_UNSET_ERROR`) \
+  Pinned by: `services/config/tests/test_docker_ctl.py` (`test_the_one_call_is_a_bare_post_restart`, `test_apply_passes_nothing_from_the_request_on`); `infra/restarter/tests/test_restarter_docker.py` (`test_restarts_exactly_the_allowlist_within_the_project`, `test_unset_or_blank_project_refuses_with_no_docker_request`)
+- **OPS-CONFIG-14.** The restarter restarts each container of the daemon's container
+  list whose own labels name its project and a service in `RESTART_SERVICES`, the
+  eleven services that mount `herd-config:/etc/herd:ro` (acl, ai-orchestrator, auth,
+  cabling, execution, integration, inventory, notifications, reservations, secrets,
+  user-profile), every replica of such a service included, in service order, each with
+  a 30 second stop timeout. A one-off container (`com.docker.compose.oneoff=True`, from
+  `docker compose run`) and any other container (config, traefik, postgres, nats,
+  frontend, selenium, the restarter, a container of another project, one without
+  labels) is never restarted, also when the daemon's answer includes it. The answer's
+  `restarted` names each service once, sorted, when every one of its containers
+  restarted; each container that did not adds one `errors` entry (OPS-CONFIG-16). \
+  Enforced in: `infra/restarter/restarter.py` (`RESTART_SERVICES`, `ONEOFF_LABEL`, `STOP_TIMEOUT_SECONDS`, `run_restart`) \
+  Pinned by: `infra/restarter/tests/test_restarter_docker.py` (`test_restart_services_is_exactly_the_expected_literal`, `test_restarts_exactly_the_allowlist_within_the_project`, `test_only_running_members_of_a_are_restarted`, `test_every_replica_is_restarted_and_the_service_is_named_once`, `test_a_service_with_one_failed_replica_is_not_listed_as_restarted`, `test_a_one_off_container_is_never_restarted`); `tests/unit/test_restarter_compose_guard.py` (`test_restart_allowlist_equals_the_services_that_read_config_json`)
 - **OPS-CONFIG-15.** `POST /apply` with no `config.json` is 400 `No configuration to
   apply`. \
   Enforced in: `services/config/app/main.py` (`apply_config`) \
   Pinned by: `services/config/tests/test_config.py` (`test_apply_not_configured`)
-- **OPS-CONFIG-16.** `POST /apply` answers 200 `{restarted, errors}`; each per-service
-  failure, a missing Docker SDK, an unreachable Docker daemon, and a failed listing are
-  entries in `errors`. An entry names what failed and the exception class only
-  (`Failed to restart <service>: <ClassName>`, `Cannot connect to Docker: <ClassName>`,
-  `Cannot list containers: <ClassName>`); the exception text goes to the log message. \
-  Enforced in: `services/config/app/docker_ctl.py` (`restart_services`) \
-  Pinned by: `services/config/tests/test_docker_ctl.py` (`test_restart_services_collects_errors`, `test_restart_services_returns_error_when_docker_sdk_missing`, `test_restart_services_returns_error_when_from_env_fails`, `test_restart_services_returns_error_when_list_fails`)
+- **OPS-CONFIG-16.** The restarter reports each failure as an entry in `errors` that
+  names what failed and the exception class only (`Cannot connect to Docker: <ClassName>`,
+  `Cannot list containers: <ClassName>`, `Failed to restart <service>: <ClassName>`); the
+  exception text, the daemon's answer included, goes to its log. A list failure
+  restarts nothing; a failed restart does not stop the others. \
+  Enforced in: `infra/restarter/restarter.py` (`run_restart`, `DockerAPIError`, `UnexpectedDockerResponse`, `UnexpectedContainerId`) \
+  Pinned by: `infra/restarter/tests/test_restarter_docker.py` (`test_missing_socket_is_cannot_connect_with_the_class_only`, `test_list_failure_is_cannot_list_with_the_class_only`, `test_a_malformed_list_answer_is_cannot_list`, `test_a_failed_restart_names_the_service_and_class_and_the_rest_go_on`, `test_restart_is_accepted_on_any_2xx_and_refused_otherwise`)
 - **OPS-CONFIG-17.** Session tokens are signed with `CONFIG_SESSION_SECRET` when set,
   else a random per-process key, so a restart ends every session; an expired, tampered,
   or foreign-key token is 401. \
@@ -563,8 +580,12 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   Enforced in: `frontend/src/stores/configStore.ts` (`setConfigToken`, `clearConfigToken`); `frontend/src/pages/ConfigPage.tsx` (`ConfigPage`) \
   Pinned by: `frontend/src/test/stores/configStore.test.ts` (`setConfigToken updates the state and persists to sessionStorage`, `clearConfigToken nulls the state and removes the sessionStorage entry`); `frontend/src/test/pages/ConfigPage.test.tsx` (`renders the config login form when no token is present`, `posts the password and stores the token on success`, `toasts an error when the config login is rejected`)
 - **OPS-CONFIG-19.** Save and Restart saves, then applies, and shows the restarted
-  services and each error under "Restart Result". \
-  Enforced in: `frontend/src/pages/ConfigPage.tsx` (`handleSaveAndRestart`) \
+  services and each error under "Restart Result". The browser test runs only with
+  `HERD_E2E_RESTART=1`; nightly.yml sets it in its last test step, where the test
+  asserts the panel lists exactly `RESTART_SERVICES` and no error, then that every
+  container of those services has a later start time than before the click and is
+  running and healthy within 300 seconds (issue #1326). \
+  Enforced in: `frontend/src/pages/ConfigPage.tsx` (`handleSaveAndRestart`); `.github/workflows/nightly.yml` (`HERD_E2E_RESTART`) \
   Pinned by: `tests/e2e/test_config_playwright.py` (`test_config_save_and_restart_gated`)
 - **OPS-CONFIG-20.** Against a running stack, a value saved in the config page reads back
   through `GET /settings`. \
@@ -613,6 +634,63 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   with `AUTH_SECRET_KEY cannot be used as an HMAC secret; set it in .env, or in the config UI if a configuration was saved there, to a random value, for example the output of openssl rand -hex 32`. \
   Enforced in: `services/config/app/auth_rules.py` (`auth_setting_errors`, `secret_key_refused`, `algorithm_refused`, `SECRET_KEY_REFUSED_MESSAGE`, `ALGORITHM_REFUSED_MESSAGE`); `services/config/app/config_store.py` (`save_config`, `bootstrap_from_env`) \
   Pinned by: `services/config/tests/test_auth_rules.py` (`test_messages_are_the_shared_modules_spelled_identically`, `test_the_copy_refuses_the_secrets_the_shared_rule_refuses`, `test_the_copy_refuses_other_algorithms`, `test_save_refuses_a_blank_or_placeholder_secret_and_writes_nothing`, `test_save_refuses_an_rs256_algorithm_and_writes_nothing`, `test_save_reports_every_refusal_together`, `test_save_refusal_leaves_an_existing_file_unchanged`, `test_put_refuses_with_the_shared_message_and_leaves_the_file`, `test_put_keeping_a_stored_placeholder_secret_is_refused`, `test_put_keeping_an_env_placeholder_secret_is_refused`, `test_bootstrap_with_a_placeholder_secret_writes_nothing`, `test_bootstrap_with_an_rs256_algorithm_writes_nothing`, `test_bootstrap_with_good_auth_settings_writes`)
+
+- **OPS-CONFIG-24.** The config service passes the restarter's 200 body through only
+  when it is exactly `{restarted, errors}`, two lists of at most 64 printable strings
+  of 1 to 200 characters, in at most 64 KiB. Otherwise `POST /apply` answers one
+  `errors` entry: `Cannot reach the restart service: <ClassName>` (no answer within
+  720 seconds, a refused connection, an unresolvable name), `A restart is already in
+  progress` (a 409), `The restart service answered HTTP <status>` (any other status),
+  or `The restart service answered an unexpected body`. The restarter's body is never
+  echoed in those cases; it goes to the log. \
+  Enforced in: `services/config/app/docker_ctl.py` (`restart_services`, `_validated`, `IN_PROGRESS_ERROR`, `UNEXPECTED_BODY_ERROR`, `RESTART_TIMEOUT_SECONDS`) \
+  Pinned by: `services/config/tests/test_docker_ctl.py` (`test_the_answer_is_passed_through_when_it_has_exactly_the_shape`, `test_a_409_is_the_in_progress_entry`, `test_another_status_is_named_and_the_body_never_echoed`, `test_any_other_200_body_is_the_unexpected_body_entry`, `test_a_refused_connection_is_cannot_reach_with_the_class_only`, `test_an_unresolvable_restarter_is_cannot_reach`, `test_a_silent_restarter_times_out`, `test_apply_passes_the_409_on_as_an_error_entry`)
+- **OPS-CONFIG-25.** The restarter's HTTP surface is `POST /restart` and `GET /health`
+  (`{"status": "ok", "service": "restarter"}`, with no Docker call). `POST /restart`
+  ignores its query string, body, and headers. Any other path is 404 `Not found` and
+  another method on those two paths is 405 `Method not allowed` with `Allow`. A request
+  with `Transfer-Encoding`, or a Content-Length that is not one whole number, is 400;
+  a body over 4096 bytes is 413; more than 32 headers is 431. Every answer is JSON,
+  carries a status line, and closes the connection; a client that sends nothing is
+  dropped after 10 seconds. \
+  Enforced in: `infra/restarter/restarter.py` (`RestarterHandler`, `_ROUTES`, `MAX_REQUEST_BODY_BYTES`, `MAX_REQUEST_HEADERS`, `REQUEST_READ_TIMEOUT_SECONDS`) \
+  Pinned by: `infra/restarter/tests/test_restarter_http.py` (`test_post_restart_answers_the_result_shape`, `test_no_request_parameter_reaches_docker`, `test_any_other_path_is_404_and_reaches_no_docker_call`, `test_another_method_on_restart_is_405`, `test_head_is_405_with_no_body`, `test_another_method_on_health_is_405`, `test_health_answers_without_asking_docker`, `test_a_body_framing_the_server_does_not_take_is_refused`, `test_an_overlong_request_line_is_414_json`, `test_too_many_headers_is_431_json`, `test_garbage_is_400_json`, `test_an_http_0_9_request_line_still_gets_a_status_line_and_json`, `test_a_client_that_sends_nothing_is_dropped_and_others_are_served`)
+- **OPS-CONFIG-26.** The restarter's Docker requests are only
+  `GET /v1.44/containers/json` with exactly the filter
+  `{"label":["com.docker.compose.project=<project>"]}` and
+  `POST /v1.44/containers/<id>/restart?t=30`, where `<id>` is 64 lowercase hex
+  characters; a listed id of any other shape is never put in a path and is reported
+  as `Failed to restart <service>: UnexpectedContainerId`. \
+  Enforced in: `infra/restarter/restarter.py` (`DOCKER_API_VERSION`, `_CONTAINER_ID`, `run_restart`) \
+  Pinned by: `infra/restarter/tests/test_restarter_docker.py` (`test_restarts_exactly_the_allowlist_within_the_project`, `test_an_odd_container_id_never_reaches_a_path`)
+- **OPS-CONFIG-27.** One restart pass runs at a time: a `POST /restart` while another
+  runs is 409 `A restart is already in progress` and reaches no Docker call. The pass
+  releases the lock when it ends, also after a failed pass or an unexpected error
+  (then 500 `Internal Server Error`). \
+  Enforced in: `infra/restarter/restarter.py` (`RestarterServer`, `IN_PROGRESS_DETAIL`) \
+  Pinned by: `infra/restarter/tests/test_restarter_http.py` (`test_single_flight_under_twenty_concurrent_calls`, `test_the_lock_is_released_after_a_failed_pass`, `test_the_lock_is_released_after_an_unexpected_failure`)
+- **OPS-CONFIG-28.** The restarter reads each whole daemon answer within its own
+  deadline, 10 seconds for the list and 60 seconds for each restart, and refuses an
+  answer over 4 MiB; no call runs past one deadline for the whole pass,
+  `PASS_DEADLINE_SECONDS`, a fixed 660 seconds however many containers match. A
+  container not reached by then is reported as
+  `Failed to restart <service>: PassDeadlineExceeded`, so a hung or slow daemon ends a
+  pass within 660 seconds plus the time to write the answer; the config service waits
+  720 seconds. \
+  Enforced in: `infra/restarter/restarter.py` (`LIST_DEADLINE_SECONDS`, `RESTART_DEADLINE_SECONDS`, `PASS_DEADLINE_SECONDS`, `PassDeadlineExceeded`, `MAX_DOCKER_RESPONSE_BYTES`); `services/config/app/docker_ctl.py` (`RESTART_TIMEOUT_SECONDS`) \
+  Pinned by: `infra/restarter/tests/test_restarter_docker.py` (`test_a_hung_daemon_times_out_within_the_deadline`, `test_a_trickling_daemon_is_cut_off_at_the_whole_answer_deadline`, `test_an_oversized_list_answer_is_refused`, `test_the_pass_deadline_is_a_fixed_constant_above_one_list_and_one_restart`, `test_the_whole_pass_ends_at_the_pass_deadline_however_many_containers_match`, `test_a_pass_deadline_shorter_than_the_list_deadline_bounds_the_list`); `tests/unit/test_restarter_compose_guard.py` (`test_config_client_outlasts_the_restarters_worst_case`)
+- **OPS-CONFIG-29.** The config service runs as `appuser`. When it cannot write its data
+  directory or one of its files (a volume an earlier root-run image created), startup
+  logs one error line, `config data directory <dir> is not writable by uid <uid>; run:
+  docker compose run --rm --no-deps --user root config chown -R <uid>:<gid> <dir>`, and
+  skips the first-boot bootstrap. `GET /status` and `GET /schema` still answer 200;
+  with no auth file in such a directory `/status` reports `password_changed` false and
+  no password is generated, hashed, or logged. Login and the session reads work when
+  the auth file exists. A write the directory refuses, and a login that would have to
+  create the auth file, is 503 `The config data directory is not writable; the config
+  service log names the one-time fix` with the remedy logged again, never a 500. \
+  Enforced in: `services/config/Dockerfile` (`appuser`); `services/config/app/config_store.py` (`data_dir_writable`, `data_dir_remedy`, `DATA_DIR_NOT_WRITABLE_DETAIL`, `DataDirNotWritable`, `load_auth`, `is_password_changed`); `services/config/app/main.py` (`lifespan`, `data_dir_not_writable`) \
+  Pinned by: `services/config/tests/test_data_dir.py` (`test_the_remedy_names_the_directory_the_uid_and_the_command`, `test_a_read_only_directory_is_not_writable`, `test_one_read_only_file_makes_the_directory_not_writable`, `test_startup_logs_one_error_line_and_skips_the_bootstrap`, `test_startup_on_a_writable_directory_logs_no_error_and_bootstraps`, `test_reads_are_served_from_a_read_only_directory`, `test_status_with_no_auth_file_on_a_read_only_directory_generates_nothing`, `test_a_refused_write_is_503_with_the_fixed_detail`, `test_a_first_login_that_cannot_write_the_auth_file_is_503`); `tests/unit/test_dockerfile_users.py` (`test_the_image_runs_as_a_non_root_user_unless_exempt`)
 
 **Out of scope.** The superadmin seed that reads `SUPERADMIN_*` (`identity-and-access.md`,
 IAM-BOOT-1 to IAM-BOOT-5); the meaning of each field (each area's Configuration section).
@@ -1417,6 +1495,37 @@ backend job (`.github/workflows/ci.yml`).
   Enforced in: `Makefile` (`certs`, `_master-stack-up`); `scripts/make_certs.sh` (`CERT_SANS`, `CERT_FORCE`, `HERD_CERT_BIND`); `infra/traefik/dynamic.yml` (`defaultCertificate`); `.github/workflows/ci.yml` (`make certs`); `.github/workflows/nightly.yml` (`make certs`) \
   Pinned by: `tests/unit/test_make_certs_wiring.py` (`test_stack_start_targets_depend_on_certs_after_their_ports_guard`, `test_start_targets_reach_make_certs_through_real_make`, `test_present_key_and_certificate_run_no_openssl_and_change_nothing`, `test_missing_certificate_is_issued_for_the_existing_key`, `test_fresh_checkout_gets_a_ten_year_certificate_naming_the_bind_address`, `test_every_interface_bind_names_only_localhost`, `test_cert_sans_entries_are_added_once_each`, `test_malformed_cert_sans_entry_is_refused_and_writes_nothing`, `test_cert_force_regenerates_both_and_says_so`, `test_dynamic_config_serves_the_pair_to_sni_and_no_sni_clients`, `test_no_certificate_or_key_is_tracked`, `test_every_workflow_stack_start_follows_a_make_certs_step`, `test_no_other_workflow_starts_the_stack`)
 
+- **OPS-GUARD-6.** In `docker-compose.yml` and `docker-compose.override.yml` together,
+  the services whose mounts reach the Docker socket are exactly the restarter and
+  Traefik. A host path reaches it when, normalized, it is `/var/run/docker.sock`,
+  `/run/docker.sock`, or a directory above one of them by whole path components; the
+  mount may be a bind, a named volume whose `driver_opts.device` is such a path, or a
+  top-level `configs` or `secrets` file the service uses, and no such top-level entry
+  may exist at all. No service uses `volumes_from` or `extends`, or a `network_mode` of
+  `service:` or `container:`. Traefik's socket mount names the socket itself. The
+  restarter mounts exactly the socket at `/var/run/docker.sock`, is on the `herd-ctl`
+  network only, publishes no port, carries no `traefik.*` label, and sets none of
+  `user`, `devices`, `privileged`, `cap_add`, `pid`, `ipc`, `network_mode`, `configs`,
+  or `secrets`; only config and the restarter join `herd-ctl`, which is
+  `internal: true`, not external, not renamed, and not aliased by another network's
+  `name`; the restarter runs with `read_only: true`, a `cap_drop` containing `ALL`,
+  and `no-new-privileges` (any of its three spellings), which the override does not
+  change; its `HERD_COMPOSE_PROJECT` is one `${COMPOSE_PROJECT_NAME:?...}`
+  substitution; and the services other than config that mount `herd-config` equal
+  `RESTART_SERVICES`, each read-only at `/etc/herd`. Traefik's other mounts and keys
+  are out of this guard's reach by decision; issue #1424 tracks its socket. \
+  Enforced in: `docker-compose.yml` (`restarter`, `herd-ctl`); `docker-compose.override.yml` (`config`) \
+  Pinned by: `tests/unit/test_restarter_compose_guard.py` (`test_socket_holders_are_exactly_restarter_and_traefik`, `test_restarter_is_on_herd_ctl_only_with_no_ports_or_gateway_route`, `test_only_config_and_restarter_join_the_internal_herd_ctl`, `test_restarter_runs_read_only_without_capabilities`, `test_restarter_project_is_the_compose_project_name`, `test_restart_allowlist_equals_the_services_that_read_config_json`, `test_reaches_socket_compares_whole_components`, `test_each_check_fails_on_a_broken_file`, `test_no_check_fails_on_an_honest_change`)
+- **OPS-GUARD-7.** Every `services/*/Dockerfile` ships a final stage that runs as a
+  non-root user: the last `USER` of the final stage, or, when it has none, of the
+  earlier stage its `FROM` names, followed through every such link; a stage built
+  from an image starts as root, and `root`, any all-zero number (`0`, `00`, `0000`),
+  an empty user, and a user spelled through a variable count as root. The restarter's
+  `infra/restarter/Dockerfile` is the one exemption, by path with its reason, and must
+  still run as root. \
+  Enforced in: `services/config/Dockerfile` (`appuser`); `infra/restarter/Dockerfile` (`root`) \
+  Pinned by: `tests/unit/test_dockerfile_users.py` (`test_every_service_dockerfile_is_scanned`, `test_the_image_runs_as_a_non_root_user_unless_exempt`, `test_every_exemption_names_a_scanned_file`, `test_reads_root`, `test_reads_non_root`)
+
 **Out of scope.** The build-identifier wiring guard (OPS-BUILD-2, OPS-BUILD-3); the NATS
 CLI documentation guard (OPS-NATS-14).
 
@@ -1433,7 +1542,13 @@ CLI documentation guard (OPS-NATS-14).
 | 422 | `{"errors": ["Unknown settings: <KEY>, ..."]}` | a config save naming a key outside `CONFIG_SCHEMA` | OPS-CONFIG-12 |
 | 422 | `{"errors": ["AUTH_SECRET_KEY is unset, blank, or still a placeholder; ...", "AUTH_ALGORITHM must be one of HS256, HS384, HS512"]}` (either or both) | a config save with a missing, blank, or placeholder `AUTH_SECRET_KEY`, or a set `AUTH_ALGORITHM` outside the three | OPS-CONFIG-23 |
 | 400 | `No configuration to apply` | config apply with no `config.json` | OPS-CONFIG-15 |
-| 200 | `{"restarted": [...], "errors": [...]}` | config apply; failures are entries in `errors` | OPS-CONFIG-13, OPS-CONFIG-16 |
+| 200 | `{"restarted": [...], "errors": [...]}` | config apply; failures are entries in `errors` | OPS-CONFIG-13, OPS-CONFIG-16, OPS-CONFIG-24 |
+| 503 | `The config data directory is not writable; the config service log names the one-time fix` | a config write (login's first auth file, change-password, save) the data directory refuses | OPS-CONFIG-29 |
+| 409 | `A restart is already in progress` | a restarter `POST /restart` while another runs | OPS-CONFIG-27 |
+| 404 | `Not found` | a restarter request to any path but `/restart` and `/health` | OPS-CONFIG-25 |
+| 405 | `Method not allowed`, with `Allow` | a restarter request to `/restart` with a method other than POST, or to `/health` with one other than GET | OPS-CONFIG-25 |
+| 400 | `Transfer-Encoding is not accepted`, `Content-Length must be one whole number` | a restarter request with a chunked body or a Content-Length that is not one whole number | OPS-CONFIG-25 |
+| 413 | `Request body too large` | a restarter request body over 4096 bytes | OPS-CONFIG-25 |
 | 403 | `Admin or superadmin role required` | a non-admin lists health snapshots, reads a report, or writes a secret | OPS-HEALTH-3, OPS-REPORT-1, OPS-SECRET-1 |
 | 422 | `Invalid last_status: <value>` | an unknown health filter that matches nothing | OPS-HEALTH-4 |
 | 500 | `Internal API token not configured` | a device check while execution has no internal token | OPS-HEALTH-6 |
@@ -1486,7 +1601,8 @@ Startup refusals (no HTTP answer; the container exits or waits):
 | Out (reservations, report) | inventory | `GET /devices` with the caller's token (10 s, paged by 500) | fleet section | Fail open: `fleet` null, or 503 for the fleet CSV (OPS-REPORT-11, OPS-REPORT-14) |
 | Out (reservations, report) | auth | `POST /groups/users/groups` with the caller's token (5 s) | group section | Fail open: every user `Ungrouped` (OPS-REPORT-5) |
 | Out (reservations, report) | execution | `GET /runs` with the caller's token (5 s) | run count | Fail open: null (OPS-REPORT-12) |
-| Out (config) | Docker | the socket's container list and restart | Save and Restart | Reported in `errors`; nothing restarted when its own project is unknown (OPS-CONFIG-13, OPS-CONFIG-16) |
+| Out (config) | restarter | `POST /restart` on `herd-ctl` (720 s) | Save and Restart | Reported as one `errors` entry with a fixed sentence; the restarter's body is passed through only in the expected shape (OPS-CONFIG-24) |
+| Out (restarter) | Docker | the container list (10 s) and one restart per container (60 s each) over the host socket | Save and Restart | Reported in `errors` by exception class; nothing restarted when the project is unset (OPS-CONFIG-13, OPS-CONFIG-16, OPS-CONFIG-28) |
 | In | every service | reads `config.json` at import | settings | A missing or corrupt file falls back to the environment (OPS-SET-3, OPS-SET-4) |
 
 ## 11. Configuration
@@ -1503,6 +1619,7 @@ Startup refusals (no HTTP answer; the container exits or waits):
 | `CONFIG_SESSION_SECRET` (config) | empty | Session signing key; empty means a random per-process key (OPS-CONFIG-17) |
 | `CONFIG_LOGIN_MAX_ATTEMPTS` (config) | `20` | Failed config logins across all sources, within the lockout window, that make every source wait (OPS-CONFIG-22) |
 | `CONFIG_LOGIN_LOCKOUT_SECONDS` (config) | `300` | The cross-source window and wait (OPS-CONFIG-22) |
+| `HERD_COMPOSE_PROJECT` (restarter) | set by compose from `COMPOSE_PROJECT_NAME`; not an `.env` setting | The compose project whose services a restart may touch; unset or blank refuses (OPS-CONFIG-13) |
 | `OUTBOX_RELAY_TICK_SECONDS` (reservations, execution) | `5.0` | Relay base cadence (OPS-OUTBOX-7) |
 | `OUTBOX_BATCH_SIZE` | `100` | Rows per relay pass (OPS-OUTBOX-4) |
 | `OUTBOX_RETENTION_SECONDS` | `604800` | Age after which published rows are pruned (OPS-OUTBOX-8) |
@@ -1528,7 +1645,8 @@ Startup refusals (no HTTP answer; the container exits or waits):
 
 Fixed in code, not configurable: the 10 s outbox publish timeout and the hourly prune;
 the five-minute poll claim window; the 5 s and 60 s schema-gate poll and warning
-periods; the 30-minute config session; the per-source config login schedule (two free
+periods; the 30-minute config session; the restarter's allowlist, its 30 s stop
+timeout, its 10 s list and 60 s restart deadlines, and the config client's 720 s wait; the per-source config login schedule (two free
 failures, then 1 s doubling to 60 s, a source forgotten after 15 quiet minutes, at most
 10,000 sources kept); the 500-reservation transit chunk and the
 100,000-device fleet stop; the preference caps of 200 keys, 64 KB, and page sizes of 1
@@ -1538,16 +1656,19 @@ to 500.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/common/tests/` (`test_logging.py`, `test_config_loader.py`, `test_base_settings.py`, `test_schema_init.py`, `test_consumer_schema_gate.py`, `test_outbox.py`, `test_jetstream.py`, `test_version.py`); `services/execution/tests/test_health_scheduler*.py`; `services/config/tests/`; `services/secrets/tests/test_crypto.py`, `test_keyring.py`; `services/reservations/tests/test_reporting_*.py`, `test_fleet_report.py`, `test_transit_gear_rollup.py`; the `tests/unit/` guards (`test_compose_settings_wiring.py`, `test_compose_ports.py`, `test_build_args_wiring.py`, `test_consumer_heartbeat_wiring.py`, `test_docs_nats_cli_form.py`, `test_check_image_matches_lock.py`); the frontend tests named in sections 8.3, 8.6, 8.11, and 8.14 | SQLite in memory; the scheduler's concurrency is driven within one process |
+| Unit | `services/common/tests/` (`test_logging.py`, `test_config_loader.py`, `test_base_settings.py`, `test_schema_init.py`, `test_consumer_schema_gate.py`, `test_outbox.py`, `test_jetstream.py`, `test_version.py`); `services/execution/tests/test_health_scheduler*.py`; `services/config/tests/`; `services/secrets/tests/test_crypto.py`, `test_keyring.py`; `services/reservations/tests/test_reporting_*.py`, `test_fleet_report.py`, `test_transit_gear_rollup.py`; `infra/restarter/tests/` (the restarter against a fake Docker daemon on a Unix socket, and its HTTP surface in process); the `tests/unit/` guards (`test_restarter_compose_guard.py`, `test_dockerfile_users.py`, `test_compose_settings_wiring.py`, `test_compose_ports.py`, `test_build_args_wiring.py`, `test_consumer_heartbeat_wiring.py`, `test_docs_nats_cli_form.py`, `test_check_image_matches_lock.py`); the frontend tests named in sections 8.3, 8.6, 8.11, and 8.14 | SQLite in memory; the scheduler's concurrency is driven within one process |
 | Functional (through the service API) | each service's `test_version.py`; `services/execution/tests/test_health_endpoints.py`; the device check tests in `services/execution/tests/test_api_endpoints.py`, `test_router_endpoints.py`, and `test_router_direct.py`; `services/config/tests/test_config.py`, `test_config_passwords.py`; `services/secrets/tests/test_api.py`; `services/user-profile/tests/test_preferences*.py`; the report route tests in `test_fleet_report.py` | httpx against the app |
-| Integration (running stack) | `tests/integration/test_device_check_internal_fetch.py`, `test_outbox_durability.py`, `test_nats_consumer_configs_live.py`, `test_health_alerting_flow.py`, `test_secrets_flow.py`, `test_reporting.py`, `test_dlq_and_idempotency.py`; the live-Postgres suite `services/common/tests/test_outbox_wake_live_pg.py` | No running-stack test covers the config service, a scheduler poll end to end (the alerting test publishes its own events), or a JetStream store surviving a recreate |
-| Stress and load | `tests/load/locustfile.py` ([LOAD_TESTING.md](../LOAD_TESTING.md)) | The load test drives reservations, inventory, ACL, export, validation, notifications, and bulk cabling; none of its users polls health, reads reports, or touches secrets or the config service. Scheduler fleet scale is covered only by the unit bounds in section 8.10 |
-| Browser end-to-end | `tests/e2e/test_about_page_playwright.py`, `tests/e2e/test_config_playwright.py` (Save and Restart runs only with `HERD_E2E_RESTART=1`), `tests/e2e/test_config.py`, `tests/e2e/test_reporting_page.py` | No browser test covers the health badge or the help link |
+| Integration (running stack) | `tests/integration/test_restarter_isolation.py` (no socket in config, config not root, the restarter answering on `herd-ctl` and unresolvable from `herd-net`; it never restarts; the absence of a gateway route is pinned statically by OPS-GUARD-6, since Traefik could not reach `herd-ctl` even with labels), `tests/integration/test_device_check_internal_fetch.py`, `test_outbox_durability.py`, `test_nats_consumer_configs_live.py`, `test_health_alerting_flow.py`, `test_secrets_flow.py`, `test_reporting.py`, `test_dlq_and_idempotency.py`; the live-Postgres suite `services/common/tests/test_outbox_wake_live_pg.py` | No running-stack integration test sends a restart (the nightly browser step does), covers a scheduler poll end to end (the alerting test publishes its own events), or covers a JetStream store surviving a recreate |
+| Stress and load | `tests/load/locustfile.py` ([LOAD_TESTING.md](../LOAD_TESTING.md)) | The load test drives reservations, inventory, ACL, export, validation, notifications, and bulk cabling; none of its users polls health, reads reports, or touches secrets or the config service. Save and Restart cannot be load tested, since a restart bounces the stack under test; its concurrency property (one pass at a time under twenty concurrent calls) is pinned at the unit level (OPS-CONFIG-27). Scheduler fleet scale is covered only by the unit bounds in section 8.10 |
+| Browser end-to-end | `tests/e2e/test_about_page_playwright.py`, `tests/e2e/test_config_playwright.py` (Save and Restart runs only with `HERD_E2E_RESTART=1`, which nightly.yml sets in its last test step), `tests/e2e/test_config.py`, `tests/e2e/test_reporting_page.py` | No browser test covers the health badge or the help link |
 
 Not run for this document: nothing was checked against a running stack. The
 integration, live-Postgres, load, and browser suites were read, not run; `tests/unit/`
 was run. The startup behavior with an unreachable broker (OPS-NATS-1) was reproduced on
-the host with the installed NATS client against a closed local port.
+the host with the installed NATS client against a closed local port. The restarter rules
+(OPS-CONFIG-13 to OPS-CONFIG-16, OPS-CONFIG-24 to OPS-CONFIG-29) were written at
+`86765c9e` from their unit and functional suites, which were run; their integration test
+and the nightly browser step were not run against a stack.
 
 ## 13. Known limits and gaps
 
@@ -1584,6 +1705,14 @@ None at present.
   replicas count separately, and a cross-source wait applies to the operator too
   (OPS-CONFIG-22). Recorded in the module docstring of
   `services/config/app/login_limits.py`.
+- The restarter runs as root inside its container, because the host's Docker socket
+  is root-owned, and Traefik still holds the full socket for discovery; the restarter
+  is hardened instead (OPS-GUARD-6, OPS-GUARD-7). Recorded in
+  [ADR 0017](../design/0017-config-restart-without-the-docker-socket.md); issue #1424
+  tracks Traefik.
+- The config service's restart set is an allowlist (OPS-CONFIG-14): a new service is
+  not restarted until it mounts the config file, when the guard makes the list follow.
+  Recorded in [ADR 0017](../design/0017-config-restart-without-the-docker-socket.md).
 - The config session ends on every config-service restart unless
   `CONFIG_SESSION_SECRET` is set (OPS-CONFIG-17). Recorded in issue #246 and the
   docstring of `_load_session_secret`.

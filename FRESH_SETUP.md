@@ -114,8 +114,8 @@ make prod
 docker compose ps
 ```
 
-All containers should show `(healthy)`. Expect 16 services:
-postgres, nats, traefik, config, auth, inventory, reservations, cabling, acl, execution, ai-orchestrator, user-profile, notifications, integration, secrets, frontend.
+All containers should show `(healthy)`. Expect 17 services:
+postgres, nats, traefik, config, restarter, auth, inventory, reservations, cabling, acl, execution, ai-orchestrator, user-profile, notifications, integration, secrets, frontend.
 
 Check logs if any service is unhealthy:
 

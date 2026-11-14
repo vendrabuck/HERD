@@ -10,7 +10,8 @@ and tests/unit/test_nos_lab_ci_wiring.py.
 
 The Dockerfile checks pin POSITION, not presence (issue #1158). Each file is read as
 instructions grouped by build stage (keyword and arguments split on any whitespace,
-continuations joined, comments dropped). For a service, in the stage that ships: each
+continuations joined, comments dropped). For a service and for the restarter
+(`infra/restarter/Dockerfile`, issue #1326), in the stage that ships: each
 of the two variables is declared by exactly one ARG instruction, with the pinned
 text; exactly one ENV instruction sets them, with the pinned text, after both ARG
 lines; and no RUN, COPY, or ADD follows the first ARG line, which covers an install
@@ -46,6 +47,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_PATH = REPO_ROOT / "docker-compose.yml"
 FRONTEND_DOCKERFILE = REPO_ROOT / "frontend" / "Dockerfile"
 SERVICE_DOCKERFILES = sorted((REPO_ROOT / "services").glob("*/Dockerfile"))
+# The restarter (issue #1326) is built and stamped like a service image, so its
+# Dockerfile gets the same position checks.
+RESTARTER_DOCKERFILE = REPO_ROOT / "infra" / "restarter" / "Dockerfile"
+BACKEND_DOCKERFILES = [*SERVICE_DOCKERFILES, RESTARTER_DOCKERFILE]
 
 # Exact defaults the interface contract pins: unset means the literal "dev" for the
 # build string and empty for the date.
@@ -76,12 +81,13 @@ def test_every_build_service_is_covered_by_this_test():
     """Guards against a new service being added with no build: stanza noticed, or an
     existing one being renamed and silently dropped out of the checks below."""
     services = _services_with_build_stanza()
-    assert len(services) == 13, (
-        f"expected 12 backend services plus frontend (13 build stanzas), found "
+    assert len(services) == 14, (
+        f"expected 12 backend services, the restarter, and frontend (14 build stanzas), found "
         f"{len(services)}: {sorted(services)}. If a service was added or removed, "
         "update this count and the checks in this file deliberately."
     )
     assert "frontend" in services
+    assert "restarter" in services
 
 
 def test_every_compose_build_stanza_carries_the_build_args():
@@ -275,7 +281,7 @@ def test_every_service_dockerfile_declares_the_build_args_and_env():
     )
     problems = [
         f"{dockerfile.relative_to(REPO_ROOT)}: {problem}"
-        for dockerfile in SERVICE_DOCKERFILES
+        for dockerfile in BACKEND_DOCKERFILES
         for problem in service_build_arg_problems(dockerfile.read_text())
     ]
     assert not problems, "\n".join(problems)
@@ -289,7 +295,7 @@ def test_frontend_dockerfile_declares_vite_build_args_before_npm_run_build():
 def test_compose_builds_the_dockerfiles_this_test_reads():
     """The position checks above mean nothing for a service compose builds from
     another file, or from an earlier stage of the same file."""
-    checked = {p.resolve() for p in (*SERVICE_DOCKERFILES, FRONTEND_DOCKERFILE)}
+    checked = {p.resolve() for p in (*BACKEND_DOCKERFILES, FRONTEND_DOCKERFILE)}
     problems = []
     for name, definition in _services_with_build_stanza().items():
         build = definition["build"]

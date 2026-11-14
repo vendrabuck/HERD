@@ -27,6 +27,8 @@ PostgreSQL 16 (a schema per service, no cross-schema joins) and NATS JetStream f
 
 Each service has its own Docker container, its own Alembic migration chain, and its own `app/config.py` settings.
 
+One more container is not a service: the `restarter` (`infra/restarter/`), a standard-library HTTP server that holds the Docker socket so the gateway-routed config service does not. Its only caller is the config service's Save and Restart, over `herd-ctl`, an internal network only the two of them join; it restarts the services that read `config.json` in its own compose project ([ADR 0017](design/0017-config-restart-without-the-docker-socket.md)).
+
 ## Cross-cutting technology
 
 - **Python 3.12** with async FastAPI + SQLAlchemy 2.x + asyncpg. Unit tests use SQLite in-memory via aiosqlite.
@@ -472,8 +474,8 @@ HERD is built as 12 independent services rather than a modular monolith. This se
 ### What that costs
 
 - **Cross-service queries are HTTP, not SQL.** The reservations service's reporting `by_group` rollup batches its auth lookup into one `POST /groups/users/groups` call carrying every distinct user id (`reporting_service.fetch_user_groups_map`, issues #140/#131) rather than issuing it per-user, but a modular monolith would JOIN a single `auth.users` table in-process with no network hop at all. The cross-service cost here is one auth round trip per report plus building the per-user group index in memory from that response, versus a query planner doing the join.
-- **Eleven Alembic migration trees, twelve Dockerfiles, eleven service configurations.** The eleven DB-backed services each own a migration tree and an `app/config.py`; `config` ships a Dockerfile but has no database or Alembic tree, and `common` is a shared library with neither a Dockerfile nor a config. Cross-cutting changes (a new common field, a logging format change, a dependency bump) touch multiple services. Integration tests are the only end-to-end validation path for cross-service flows.
-- **Operational surface.** A first-time deployer brings up a Postgres with 11 schemas, NATS with the `HERD_RESERVATIONS`, `HERD_HEALTH`, and `HERD_DLQ` streams plus five DLQ subjects, and 12 service containers behind Traefik. The `config` service mitigates this by handling first-start setup through the UI, but the surface itself is real.
+- **Eleven Alembic migration trees, twelve service Dockerfiles, eleven service configurations.** The eleven DB-backed services each own a migration tree and an `app/config.py`; `config` ships a Dockerfile but has no database or Alembic tree, and `common` is a shared library with neither a Dockerfile nor a config. The restarter's Dockerfile under `infra/restarter/` is a thirteenth image with no settings. Cross-cutting changes (a new common field, a logging format change, a dependency bump) touch multiple services. Integration tests are the only end-to-end validation path for cross-service flows.
+- **Operational surface.** A first-time deployer brings up a Postgres with 11 schemas, NATS with the `HERD_RESERVATIONS`, `HERD_HEALTH`, and `HERD_DLQ` streams plus five DLQ subjects, and 12 service containers plus the restarter behind Traefik. The `config` service mitigates this by handling first-start setup through the UI, but the surface itself is real.
 - **For a single-deployer adoption, a modular monolith would have lower operational overhead.** That is a fair criticism and acknowledged here.
 
 ### When the microservice trade-off pays off
