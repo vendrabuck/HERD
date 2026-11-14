@@ -9,7 +9,7 @@ import {
   useNavigate,
   useNavigationType,
 } from "react-router-dom";
-import { StrictMode } from "react";
+import { StrictMode, useEffect } from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const { toastFn, toastError } = vi.hoisted(() => ({ toastFn: vi.fn(), toastError: vi.fn() }));
@@ -37,7 +37,7 @@ const FAILED = "Single sign-on failed. If this continues, contact an administrat
 let visited: string[] = [];
 let ssoStates: unknown[] = [];
 // The router's navigate, so a test can move the app the way a click would.
-let routerNavigate: ReturnType<typeof useNavigate> | null = null;
+const router: { navigate: ReturnType<typeof useNavigate> | null } = { navigate: null };
 
 function Where() {
   const location = useLocation();
@@ -57,7 +57,10 @@ function Where() {
 
 function Recorder() {
   const location = useLocation();
-  routerNavigate = useNavigate();
+  const navigate = useNavigate();
+  useEffect(() => {
+    router.navigate = navigate;
+  }, [navigate]);
   const entry = location.pathname + location.search + location.hash;
   if (visited[visited.length - 1] !== entry) visited.push(entry);
   if (location.pathname === "/login/sso" && location.state) ssoStates.push(location.state);
@@ -139,7 +142,7 @@ function consoleText(): string {
 beforeEach(() => {
   visited = [];
   ssoStates = [];
-  routerNavigate = null;
+  router.navigate = null;
   exchangeCalls = [];
   refreshCalls = 0;
   toastFn.mockClear();
@@ -395,7 +398,7 @@ describe("OidcCompletePage (ADR 0016 phase 4)", () => {
       await waitFor(() => expect(exchangeCalls).toHaveLength(1));
       // The app moves on (a link, Back) while the router stays mounted.
       await act(async () => {
-        routerNavigate!("/before");
+        router.navigate!("/before");
       });
       await waitFor(() => expect(screen.getByTestId("where")).toHaveTextContent(/^\/before PUSH$/));
       release();
