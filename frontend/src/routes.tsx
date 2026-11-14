@@ -3,6 +3,7 @@
 // interim bridge, not a pattern to copy for other element trees.
 import { Navigate, Outlet, Route } from "react-router-dom";
 import { LoginPage } from "@/pages/LoginPage";
+import { OidcCompletePage } from "@/pages/OidcCompletePage";
 import { RegisterPage } from "@/pages/RegisterPage";
 import { ConfigPage } from "@/pages/ConfigPage";
 import { InventoryPage } from "@/pages/InventoryPage";
@@ -31,6 +32,7 @@ import { DevicePage } from "@/pages/DevicePage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { AuthGuard, GuestGuard, AdminGuard } from "@/components/guards";
+import { SSO_COMPLETE_PATH } from "@/lib/sso";
 
 export const appRouteElements = (
   <>
@@ -41,6 +43,14 @@ export const appRouteElements = (
       element={
         <GuestGuard>
           <LoginPage />
+        </GuestGuard>
+      }
+    />
+    <Route
+      path={SSO_COMPLETE_PATH}
+      element={
+        <GuestGuard>
+          <OidcCompletePage />
         </GuestGuard>
       }
     />

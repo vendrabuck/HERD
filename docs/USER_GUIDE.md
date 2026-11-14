@@ -16,7 +16,7 @@ This guide walks a lab engineer through day-to-day use of HERD. If you are an ad
 
 1. Open `https://<your-host>` (e.g. `https://localhost` for a local install).
 2. The first time the site loads, you may see a banner about the system not being configured; that is for administrators. If you see it and the login form is disabled, ask your admin to finish the [config-service first-run](OPERATIONS.md#config-service-first-run).
-3. Click **Register** if you do not have an account, or **Sign in** if you do. Registration gives you the default `user` role; promoting users to `admin` is handled by a superadmin (see [ROLES.md](ROLES.md)). If your admin has wired HERD up to your company's directory (LDAP / Active Directory), the **Register** button still renders, but the backend rejects it with 409; your account is instead created automatically the first time you log in with your directory credentials, so use **Sign in** and type your directory username (not necessarily your email) into the **Email** field, which accepts a login name without an `@`.
+3. Click **Register** if you do not have an account, or **Sign in** if you do. Registration gives you the default `user` role; promoting users to `admin` is handled by a superadmin (see [ROLES.md](ROLES.md)). If your admin has wired HERD up to your company's directory (LDAP / Active Directory), the sign-in card shows no **Register** link, and the registration page, opened by its address, answers that local registration is disabled; your account is instead created automatically the first time you log in with your directory credentials, so use **Sign in** and type your directory username (not necessarily your email) into the **Email** field, which accepts a login name without an `@`.
 
 ### What you can see
 

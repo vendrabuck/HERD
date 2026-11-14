@@ -148,8 +148,12 @@ async function expectAliceSignedOutCleanly() {
     timeout: 5000,
   });
   expect(cacheSizeAtSignOut).toEqual([0]);
-  // Only the login page's own config-status query has been created since.
-  expect(client.getQueryCache().getAll().map((q) => q.queryKey[0])).toEqual(["configStatus"]);
+  // Only the login page's own queries have been created since: config status
+  // and the sign-in method (ADR 0016 phase 4), neither tied to an account.
+  expect(client.getQueryCache().getAll().map((q) => q.queryKey[0]).sort()).toEqual([
+    "configStatus",
+    "loginOptions",
+  ]);
   expect(usePreferencesStore.getState().savedFilters).toEqual({});
   expect(usePreferencesStore.getState().loaded).toBe(false);
 }

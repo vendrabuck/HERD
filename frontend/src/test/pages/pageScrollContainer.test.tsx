@@ -65,7 +65,7 @@ import { AppLayout } from "@/components/layout/AppLayout";
 // Pages the route table renders OUTSIDE AppLayout. They are full-screen
 // pages that centre a card with `min-h-screen` and the document scrolls them.
 // The route walk below must find exactly this set outside the layout.
-const OUTSIDE_LAYOUT_PAGES = ["ConfigPage", "LoginPage", "RegisterPage"];
+const OUTSIDE_LAYOUT_PAGES = ["ConfigPage", "LoginPage", "OidcCompletePage", "RegisterPage"];
 
 // Pages under AppLayout that deliberately do NOT scroll as a page.
 // TopologyEditorPage: `flex h-full overflow-hidden` by design; the React Flow
