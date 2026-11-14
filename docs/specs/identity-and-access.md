@@ -1408,7 +1408,8 @@ sends signed-out visitors to the login page, and keeps admin pages away from non
 `frontend/src/api/auth.ts`, `frontend/src/components/guards.tsx`,
 `frontend/src/routes.tsx`, `frontend/src/lib/roles.ts`, `frontend/src/lib/login.ts`,
 `frontend/src/pages/LoginPage.tsx`, `frontend/src/queryClient.ts`,
-`frontend/src/components/layout/AppLayout.tsx`.
+`frontend/src/components/layout/AppLayout.tsx`. The single sign-on parts of the login
+page and the `/login/sso` page are in section 8.19.
 
 **Rules.**
 
@@ -1417,7 +1418,8 @@ sends signed-out visitors to the login page, and keeps admin pages away from non
   is stored. \
   Enforced in: `frontend/src/stores/authStore.ts` (`useAuthStore`) \
   Pinned by: `frontend/src/test/stores/authStore.test.ts` (`setTokens persists to localStorage and updates state`, `reads tokens from localStorage on initialization`, `initializes with null tokens when localStorage is empty`, `is not authenticated from a stored refresh token alone`, `clearAuth removes tokens and resets state`)
-- **IAM-UI-2.** A 401 on any call other than login, refresh, and logout is decided on
+- **IAM-UI-2.** A 401 on any call other than login, refresh, logout, the login-options
+  read, and the single sign-on handoff exchange (IAM-OIDC-24) is decided on
   the tokens storage holds at that moment, not on the tab's memory: when storage holds an
   access token of the same account other than the one the request carried, the request
   is retried with it and no refresh is sent; otherwise the tab refreshes with the stored
@@ -1427,7 +1429,7 @@ sends signed-out visitors to the login page, and keeps admin pages away from non
   retried with its access token or rejected with its error. Each request is retried at
   most once, and the refresh request times out after 15 s (`REFRESH_TIMEOUT_MS`). When
   storage cannot be used (IAM-UI-11), the tab uses its own memory. \
-  Enforced in: `frontend/src/api/client.ts` (`apiClient`, `freshAccessToken`, `refreshOnce`, `adoptStored`, `REFRESH_TIMEOUT_MS`) \
+  Enforced in: `frontend/src/api/client.ts` (`apiClient`, `freshAccessToken`, `refreshOnce`, `adoptStored`, `REFRESH_TIMEOUT_MS`, `skipsRefresh`) \
   Pinned by: `frontend/src/test/api/client.test.ts` (`refreshes token and retries original request on 401`, `queues concurrent 401s behind a single refresh and retries all of them`, `does not loop refresh when the refresh endpoint itself returns 401`, `does not attempt refresh for non-401 errors`); `frontend/src/test/api/clientMultiTab.test.ts` (`A refreshes, then B's request with the rotated-away token 401s: B retries with A's token and never posts R1`, `storage that throws: the tab refreshes from its own memory and still signs out on a refusal`, `a request is retried at most once: a retry that answers 500 is not retried again`, `a request is retried at most once: a retry that answers 401 again is rejected without another refresh`, `a 401 while storage holds another account's token signs this tab out and never sends that token`)
 - **IAM-UI-3.** Only a 401 from the refresh route ends the session (auth refuses a used
   refresh token with no grace window and no other effect, IAM-SESSION-2). A refused tab
@@ -1449,10 +1451,10 @@ sends signed-out visitors to the login page, and keeps admin pages away from non
   Pinned by: `frontend/src/test/api/auth.test.tsx` (`useLogout clears auth even when the server errors`); `frontend/src/test/api/clientMultiTab.test.ts` (`logout waits for another tab's refresh holding the lock and revokes the token that refresh stored, not this tab's stale one`); `tests/e2e/test_register_and_roles.py` (`test_logout_returns_to_login_and_clears_tokens`)
 - **IAM-UI-5.** `AuthGuard` sends a signed-out visitor to `/login`, recording the path,
   query, and hash they asked for and the account last signed in in the tab (IAM-UI-13);
-  `GuestGuard` sends a signed-in visitor away from `/login` and `/register` to that
-  recorded path when IAM-UI-13 honors it, else to `/topology`. \
+  `GuestGuard` sends a signed-in visitor away from `/login`, `/login/sso`, and
+  `/register` to that recorded path when IAM-UI-13 honors it, else to `/topology`. \
   Enforced in: `frontend/src/components/guards.tsx` (`AuthGuard`, `GuestGuard`) \
-  Pinned by: `frontend/src/test/components/guards.test.tsx` (`redirects an unauthenticated user to /login`, `redirects an authenticated user to /topology`, `renders children for an authenticated user`, `renders children for an unauthenticated user`, `AuthGuard records the path, query, and hash it was asked for`, `AuthGuard records the account that was last signed in with the path`, `GuestGuard sends a signed-in visitor to the safe recorded path`, `GuestGuard ignores an unsafe recorded path`, `GuestGuard returns the same account to its recorded page`, `GuestGuard sends another account to /topology`)
+  Pinned by: `frontend/src/test/components/guards.test.tsx` (`redirects an unauthenticated user to /login`, `redirects an authenticated user to /topology`, `renders children for an authenticated user`, `renders children for an unauthenticated user`, `AuthGuard records the path, query, and hash it was asked for`, `AuthGuard records the account that was last signed in with the path`, `GuestGuard sends a signed-in visitor to the safe recorded path`, `GuestGuard ignores an unsafe recorded path`, `GuestGuard returns the same account to its recorded page`, `GuestGuard sends another account to /topology`); `frontend/src/test/routes.test.tsx` (`the GuestGuard paths are exactly /login, /login/sso, and /register`)
 - **IAM-UI-6.** `AdminGuard` renders nothing until the account is loaded, then sends a
   non-admin to `/topology`. It is a convenience: the backend gates every admin route on
   its own. \
@@ -1519,7 +1521,8 @@ sends signed-out visitors to the login page, and keeps admin pages away from non
   Pinned by: `frontend/src/test/api/clientMultiTab.test.ts` (`both tabs 401 at the same moment with Web Locks: one refresh serves both`, `both tabs 401 at the same moment without Web Locks: the refused tab waits for the winner's write and adopts it`, `without Web Locks, a winner whose write lands after the grace leaves every tab consistently signed out and revokes its new pair`, `A logs out while B's request is in flight: B's 401 sends no refresh and signs B out`, `A logs out while B's refresh is in flight: the logout wins and B's new pair is revoked, not stored`, `a tab whose lock wait times out goes on without the lock instead of waiting forever`, `logout waits for another tab's refresh holding the lock and revokes the token that refresh stored, not this tab's stale one`); `tests/e2e/test_multi_tab_session_playwright.py` (`test_refresh_in_one_tab_keeps_the_other_tab_signed_in`)
 - **IAM-UI-13.** A recorded return path is honored only when it is a string that starts
   with exactly one `/`, holds no backslash and no control character (C0, DEL, or C1),
-  resolves against the page's origin to that origin, and is not `/login` or `/register`,
+  resolves against the page's origin to that origin, and is not `/login`, `/login/sso`,
+  or `/register`,
   and only when it was recorded for the account now signing in: `AuthGuard` records the
   `sub` of the last access token the tab held (`lastSubject`, kept across a sign-out), and
   a path recorded with no account (a first visit) is honored for any account. Anything
@@ -1533,8 +1536,8 @@ sends signed-out visitors to the login page, and keeps admin pages away from non
   `inputmode` `email`, described (`aria-describedby`) by the line `Directory accounts:
   enter your directory login name.`, and with no client-side email validation, because
   in LDAP mode the identifier is the directory login name (IAM-LDAP-2), which need not
-  contain an `@`. The page does not know the active mode, so the field is the same in
-  both modes; the request body keeps the field name `email`. The password input has
+  contain an `@`. The field is the same in every mode, wherever the page shows it
+  (IAM-OIDC-24); the request body keeps the field name `email`. The password input has
   `autocomplete` `current-password`, and the icon-only configuration link is named
   `System configuration`. \
   Enforced in: `frontend/src/pages/LoginPage.tsx` (`LoginPage`) \
@@ -1556,10 +1559,9 @@ sends signed-out visitors to the login page, and keeps admin pages away from non
   Enforced in: `frontend/src/stores/authStore.ts` (`useAuthStore`, `tokenSubject`) \
   Pinned by: `frontend/src/test/stores/authStore.test.ts` (`a late-processed logout then login as another account passes through exactly one sign-out edge and ends as that account`, `a same-account token adoption emits no sign-out edge`, `a token whose account cannot be read counts as another account`)
 
-**Out of scope.** Theming and preferences (`operations-and-observability.md`). The
-login page does not yet adapt to the authentication mode: it shows the Register link in
-LDAP mode too, where registration answers 409; the mode-aware page waits for the public
-`GET /api/auth/login-options` route that ADR 0016 adds.
+**Out of scope.** Theming and preferences (`operations-and-observability.md`). How the
+login page adapts to the authentication mode, including hiding the Register link in
+LDAP mode, is section 8.19 (IAM-OIDC-24).
 
 ### 8.18 User profile
 
@@ -1677,15 +1679,19 @@ sync renames the account (IAM-PROFILE-7).
 sends it back, auth signs the person in (creating their account on the first visit),
 and the page trades a one-time cookie for the usual HERD tokens. Nobody can select that
 mode yet: `AUTH_METHOD` accepts only `local` and `ldap` until ADR 0016 phase 6, so on
-every deployment today the three single sign-on routes answer 404, and only
-`GET /login-options` and the LDAP-mode `registration_open` value are visible. The flow
+every deployment today the three single sign-on routes answer 404, and the only visible
+effects are `GET /login-options` and, driven by it, the login page dropping its Register
+link in LDAP mode (IAM-OIDC-24); a local-mode login page is unchanged. The flow
 store and provisioning rules are IAM-OIDC-1 to IAM-OIDC-14 in section 4; the design is
 [ADR 0016](../design/0016-oidc-single-sign-on.md).
 
 **Surfaces.** Routes `GET /login-options` (`services/auth/app/routers/auth.py`) and
 `GET /oidc/login`, `GET /oidc/callback`, `POST /oidc/exchange`
-(`services/auth/app/routers/oidc.py`); `POST /login` in OIDC mode. No user interface
-yet (ADR 0016 phase 4).
+(`services/auth/app/routers/oidc.py`); `POST /login` in OIDC mode. In the browser:
+`frontend/src/pages/LoginPage.tsx`, `frontend/src/pages/OidcCompletePage.tsx` (route
+`/login/sso`), `frontend/src/lib/sso.ts`, `frontend/src/api/auth.ts`
+(`useLoginOptions`, `exchangeOidcHandoff`), `frontend/src/api/client.ts` (the refresh
+skip list).
 
 **Rules.**
 
@@ -1789,8 +1795,71 @@ yet (ADR 0016 phase 4).
   Enforced in: `services/auth/app/routers/oidc.py` (`_log_refusal`, `_log_unexpected`) \
   Pinned by: `services/auth/tests/test_oidc_routes.py` (`test_no_route_logs_the_authorization_url_or_a_verified_token`, `test_full_sign_in_reaches_me_and_refresh`)
 
-**Out of scope.** The login page and the `/login/sso` page (ADR 0016 phase 4); a live
-identity provider, the stack integration, load, and browser levels (phases 5a and 5b);
+- **IAM-OIDC-24.** The login page renders from the `GET /api/auth/login-options`
+  answer alone: a `Sign in with {provider_name}` button exactly when `sso` is an object
+  (`single sign-on` stands in for a `provider_name` that is not a non-blank string), the
+  password form exactly when `password_login` is true, behind a collapsed
+  `Administrator sign-in` disclosure (a button with `aria-expanded` and `aria-controls`)
+  when `sso` is present too, and the Register link exactly when `registration_open` is
+  true, so LDAP mode shows no Register link. While the request is pending (it has no
+  client timeout, so a request that never answers keeps it pending; issue #1420), and on
+  any error (no answer, a 404 from a backend without the route, a 5xx, a body that is not
+  JSON, and a body that is not an object with boolean `password_login` and
+  `registration_open`, an `sso` that is null, absent, or a non-array object, and at
+  least one way to sign in), the page is exactly today's: the password form and the
+  Register link, so an OIDC-mode page shows the password form until its answer
+  arrives (#1420). The local-mode answer renders the same markup as that fallback and
+  keeps the same input elements. Behind the toggle the form's submit is a secondary
+  button, so the page has one primary action; everywhere else it stays primary. `auth_method` is not read for rendering. The
+  login-options read is not retried or refetched on window focus, and a 401 from it or from the handoff exchange
+  never starts a token refresh: the refresh interceptor's skip list matches the request
+  path's end against `/auth/refresh`, `/auth/login`, `/auth/logout`,
+  `/auth/login-options`, and `/auth/oidc/exchange`, each on its own. \
+  Enforced in: `frontend/src/lib/sso.ts` (`parseLoginOptions`, `loginPageView`, `LEGACY_LOGIN_VIEW`, `DEFAULT_SSO_PROVIDER_NAME`); `frontend/src/pages/LoginPage.tsx` (`LoginPage`); `frontend/src/api/auth.ts` (`useLoginOptions`, `getLoginOptions`, `LOGIN_OPTIONS_PATH`); `frontend/src/api/client.ts` (`REFRESH_SKIP_PATHS`, `skipsRefresh`) \
+  Pinned by: `frontend/src/test/lib/sso.test.ts` (`parseLoginOptions and loginPageView: the full input space`, `the backend's %s answer`, `refuses %s as an answer, so the page is today's`, `local mode renders exactly today's page`); `frontend/src/test/pages/LoginPageSso.test.tsx` (`keeps one primary action: the form's submit is secondary behind the toggle`, `leaves the submit primary wherever the form is not behind the toggle`, `local mode: today's form and the Register link, no single sign-on`, `LDAP mode: today's form with no Register link (registration answers 409 there)`, `OIDC mode, break-glass off: only the Sign in with button`, `OIDC mode, break-glass on: the button, and the password form behind a collapsed toggle`, `sso present %s, password_login %s, registration_open %s`, `renders today's page while the answer is pending`, `on %s renders byte-for-byte today's page`, `local mode's answer renders byte-for-byte today's page`, `LDAP mode's answer differs from today's page by the Register line alone`, `a local-mode answer keeps the same input elements, so a filled-in form survives it`, `is a collapsed disclosure that reveals the password form it controls`, `opens and closes from the keyboard, keeps focus on itself, and the form follows it in tab order`, `the form behind it signs in exactly like today's form`); `frontend/src/test/api/sso.test.tsx` (`errors on %s, and is not retried`, `is not refetched when the window regains focus`, `a 401 from it never triggers a token refresh`, `a 401 from it never triggers a token refresh, even with a stored session`); `frontend/src/test/api/client.test.ts` (`is exactly the sign-in, refresh, logout, login-options, and handoff exchange routes`, `a 401 from %s is passed through with no refresh`, `skipsRefresh(%s) is %s`, `a 401 from a route not on the list still refreshes and retries`)
+- **IAM-OIDC-25.** The `Sign in with` button starts single sign-on with one top-level
+  navigation (`window.location.assign`, never a request from the page) to exactly
+  `/api/auth/oidc/login`, with no query: no `next` in v1, so the backend's `/topology`
+  applies, and nothing from the page's URL or state is passed. The frontend never builds
+  the provider's URL. The button is disabled while the config service reports the
+  system unconfigured, like the form (IAM-UI-9), and the provider name renders as text. \
+  Enforced in: `frontend/src/lib/sso.ts` (`SSO_LOGIN_URL`); `frontend/src/lib/topLevelNavigation.ts` (`navigateTopLevel`); `frontend/src/pages/LoginPage.tsx` (`LoginPage`) \
+  Pinned by: `frontend/src/test/pages/LoginPageSso.test.tsx` (`starts the flow with one top-level navigation to the fixed begin route, never an XHR`, `is keyboard operable`, `is disabled while the system is unconfigured, like the form`, `renders the provider name as text, never as markup`)
+- **IAM-OIDC-26.** When the login page's URL carries `sso_error`, it shows one toast
+  with a fixed message and never the raw value: `cancelled` gives `Sign-in was
+  cancelled.` (a neutral toast), `unavailable` gives `Single sign-on is unavailable right
+  now. Try again later.`, and `failed` or any other value, empty included, gives `Single
+  sign-on failed. If this continues, contact an administrator.` (error toasts). It then
+  removes that parameter alone with a replace navigation, keeping the rest of the query,
+  the hash, and the location state (the return path of IAM-UI-13), so Back and a reload
+  do not show it again. The toast shows once per location even when React runs the
+  effect twice, and whatever the login-options answer. \
+  Enforced in: `frontend/src/lib/sso.ts` (`ssoErrorMessage`, `SSO_ERROR_PARAM`, `SSO_ERROR_CANCELLED`, `SSO_ERROR_UNAVAILABLE`, `SSO_ERROR_FAILED`); `frontend/src/pages/LoginPage.tsx` (`LoginPage`, `SSO_ERROR_TOAST_ID`) \
+  Pinned by: `frontend/src/test/lib/sso.test.ts` (`are exactly the ADR's wording`, `maps %s to its own message`, `maps any other value, %j included, to the failed message and never echoes it`); `frontend/src/test/pages/LoginPageSso.test.tsx` (`%s shows its fixed message once`, `any other value (%j) shows the failed message and is never reflected into the page`, `removes only that parameter, with a replace, keeping the rest of the URL and the return-path state`, `does nothing without the parameter: no toast, no navigation`, `toasts once under StrictMode's double effect`, `shows the message even when /login-options fails`)
+- **IAM-OIDC-27.** `/login/sso`, outside the app layout and under `GuestGuard`, posts
+  exactly `{}` as JSON, with credentials, to `/api/auth/oidc/exchange` once per mount
+  (a ref holds across React StrictMode's second effect and every re-render), with the
+  15 s client timeout of `LOGIN_TIMEOUT_MS`. The server may already have consumed the
+  handoff when that timeout fires; the user then sees the failed message and signs in
+  again. A 200 whose body holds a non-empty `access_token` and `refresh_token` is a
+  success; its `next` is kept only when IAM-UI-13's checks honor it, else `/topology`.
+  On success the page records that path as its location's return path (state
+  `{from: next, sub}`, a replace, where `sub` is the subject of the exchanged access
+  token, never null, so `GuestGuard` honors the path only for that account), and once
+  that has committed adopts the pair through the one function a password login uses
+  (`setTokens`, then a refetch of the signed-in user), so `GuestGuard` replaces the page
+  with the path. On any other outcome (a 401, any other status, no answer, a timeout, a
+  body without the pair, an access token whose subject cannot be read) nothing is stored
+  and the page replaces itself with `/login?sso_error=failed`. Either replace leaves the
+  entry before `/login/sso` one Back away, and Back never posts again. An answer that
+  arrives after the page unmounted (for example after another tab's sign-in made
+  `GuestGuard` send the tab away) causes no navigation, no token adoption, and no
+  message. No token or server text is written to a URL, the console, or the page. \
+  Enforced in: `frontend/src/pages/OidcCompletePage.tsx` (`OidcCompletePage`); `frontend/src/api/auth.ts` (`exchangeOidcHandoff`, `adoptSignInTokens`, `OIDC_EXCHANGE_PATH`); `frontend/src/lib/sso.ts` (`parseOidcExchange`, `SSO_COMPLETE_PATH`, `SSO_EXCHANGE_FAILED_PATH`); `frontend/src/lib/login.ts` (`safeReturnPath`); `frontend/src/routes.tsx` (`appRouteElements`) \
+  Pinned by: `frontend/src/test/pages/OidcCompletePage.test.tsx` (`shows a status line while the exchange runs`, `posts {} once with credentials, stores the pair like a password login, and replaces itself with next`, `refetches the signed-in user, as a password login does`, `spends the handoff exactly once under StrictMode's double effect and on re-render`, `navigates only within the app: next %j lands on /topology`, `on %s stores nothing and shows the failed message on the login page`, `an exchange that never answers is given up after 15 seconds as a failure`, `writes no token to a URL or the console, on success or failure`, `a visitor already signed in is sent on by GuestGuard and spends no handoff`, `records the return path bound to the exchanged token's account, never to any account`, `an access token whose account cannot be read is a failure that stores nothing`, `the review's race: another tab signs in while the exchange is in flight; its late %s changes nothing`, `after the page unmounts, a late %s causes no navigation, no token adoption, and no toast`, `a return path the flow recorded for one account is not honored for another`, `on %s the page replaces itself: Back lands on the page before it and never re-posts`); `frontend/src/test/lib/sso.test.ts` (`replaces %s with /topology`, `refuses an answer with %s`, `the completion page is never a return path (it sits under GuestGuard)`); `frontend/src/test/api/sso.test.tsx` (`posts exactly {} as JSON, with credentials, and returns the tokens and a safe next`, `rejects on %s with no server text in the error`, `stores the pair in shared storage, signs the tab in, and refetches the current user`, `is what useLogin runs on success`); `frontend/src/test/routes.test.tsx` (`renders OidcCompletePage inside GuestGuard, outside AuthGuard and AppLayout`); `frontend/src/test/pages/pageScrollContainer.test.tsx` (`the outside-layout allowlist is exactly the pages the route table renders outside AppLayout`)
+
+**Out of scope.** A live identity provider, the stack integration, load, and browser
+levels (phases 5a and 5b), including any browser run of the login page in OIDC mode;
 selecting the mode (phase 6). Login CSRF by an attacker who can write a cookie for
 HERD's host, such as a sibling subdomain, is not closed (ADR 0016 D11).
 
@@ -1899,11 +1968,11 @@ cap 20 per category; prune cadence 24 hours; bulk and batch caps 500.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/auth/tests/` (in-memory SQLite, `test_profile_schema.py`, `test_user_profile_migration.py`, `test_effective_role_unit.py`, `test_api_tokens.py`, `test_ldap_service.py`, `test_ldap_sync_service.py`, `test_ldap_sync_service_scaling.py`, `test_ldap_sync_stale_run_reaper.py`, `test_ldap_sync_loop.py`, `test_oidc_flow_service.py`, `test_oidc_provisioning.py`, `test_oidc_sso_migration.py`); `services/acl/tests/test_grant_service_unit.py`, `test_auth_client.py`, `test_schema_validators.py`; `services/common/tests/test_auth.py`, `test_auth_settings.py`, `test_internal_auth.py`, `test_acl.py`; `services/notifications/tests/test_router.py` (its token decode); `tests/unit/test_jwt_settings_wiring.py`; `frontend/src/test/` (`api/client.test.ts`, `stores/authStore.test.ts`, `lib/roles.test.ts`, `components/guards.test.tsx`, `components/AdminGuard.test.tsx`, `routes.test.tsx`, the admin page tests) | SQLite has no advisory locks, so only the in-process half of the run slot is exercised here |
+| Unit | `services/auth/tests/` (in-memory SQLite, `test_profile_schema.py`, `test_user_profile_migration.py`, `test_effective_role_unit.py`, `test_api_tokens.py`, `test_ldap_service.py`, `test_ldap_sync_service.py`, `test_ldap_sync_service_scaling.py`, `test_ldap_sync_stale_run_reaper.py`, `test_ldap_sync_loop.py`, `test_oidc_flow_service.py`, `test_oidc_provisioning.py`, `test_oidc_sso_migration.py`); `services/acl/tests/test_grant_service_unit.py`, `test_auth_client.py`, `test_schema_validators.py`; `services/common/tests/test_auth.py`, `test_auth_settings.py`, `test_internal_auth.py`, `test_acl.py`; `services/notifications/tests/test_router.py` (its token decode); `tests/unit/test_jwt_settings_wiring.py`; `frontend/src/test/` (`api/client.test.ts`, `stores/authStore.test.ts`, `lib/roles.test.ts`, `components/guards.test.tsx`, `components/AdminGuard.test.tsx`, `routes.test.tsx`, the admin page tests; single sign-on in the browser: `lib/sso.test.ts`, `api/sso.test.tsx`, `pages/LoginPageSso.test.tsx`, `pages/OidcCompletePage.test.tsx`, msw standing in for auth) | SQLite has no advisory locks, so only the in-process half of the run slot is exercised here |
 | Functional (through the service API) | `services/auth/tests/test_auth.py`, `test_user_profile_routes.py`, `test_groups.py`, `test_internal.py`, `test_ldap_sync.py`, `test_effective_role_http.py`, `test_auth_ldap.py`, `test_oidc_routes.py` (the single sign-on routes against a fake identity provider), `test_login_options.py`, `test_oidc_break_glass.py`; `services/acl/tests/test_grants.py`, `test_internal.py`; the live suites `services/auth/tests/test_ldap_service_live.py` (real directory) and the real-Postgres suites `services/auth/tests/test_ldap_sync_service_live_pg.py` and `services/auth/tests/test_oidc_flow_service_live_pg.py` (the OIDC flow store and provisioning races) | The live-LDAP suite runs in the gates' live-LDAP phase; the Postgres suites in `_gate-pg-live-tests`. The single sign-on routes have unit and functional (fake provider, in-memory SQLite) tests only; the flow store and provisioning beneath them have Postgres-live tests, but no route is driven against a real Postgres yet, a gap open until ADR 0016 phases 5a and 5b add the live-provider, integration (running stack), load, and browser levels |
 | Integration (running stack) | `tests/integration/test_auth_flow.py`, `test_user_profile_flow.py`, `test_acl_flow.py`, `test_ldap_auth.py`, `test_ldap_sync_admin.py` | The LDAP ones run only in the gates' LDAP-mode phase |
 | Stress and load | `tests/load/locustfile.py` (every user logs in; `ACLChecker` exercises the check route; `NotificationUser` edits its own profile name) | No load test covers refresh, the token exchange, or a sync run |
-| Browser end-to-end | `tests/e2e/test_login.py`, `test_register_and_roles.py`, `test_roles_playwright.py`, `test_user_profile_playwright.py`, `test_admin_guard_redirect_playwright.py`, `test_user_groups_playwright.py`, `test_acl_grants_playwright.py`, `test_ldap_sync_admin_playwright.py`, `test_ldap_login.py` | Runs nightly and in the gates; the LDAP login tests are exempt skips on the local-mode gate stack |
+| Browser end-to-end | `tests/e2e/test_login.py`, `test_register_and_roles.py`, `test_roles_playwright.py`, `test_user_profile_playwright.py`, `test_admin_guard_redirect_playwright.py`, `test_user_groups_playwright.py`, `test_acl_grants_playwright.py`, `test_ldap_sync_admin_playwright.py`, `test_ldap_login.py` | Runs nightly and in the gates; the LDAP login tests are exempt skips on the local-mode gate stack. No browser test drives the OIDC-mode login page or `/login/sso` yet (ADR 0016 phase 5b); `test_login.py` pins the local-mode page, which `GET /login-options` now drives |
 
 Not run for this document: only the drift guard and the repository-root unit suite were
 run. The auth, acl, and common service suites, the live-LDAP and live-Postgres suites,
@@ -1913,7 +1982,10 @@ the integration suite, the frontend tests, and the browser suite were read, not 
 
 ### Open defects
 
-None at present.
+- Issue #1420, which blocks ADR 0016 phase 6: while `GET /api/auth/login-options` is
+  pending the login page renders today's page, password form included, and the request
+  has no client timeout, so an OIDC-mode page shows the password form until its answer
+  arrives, and indefinitely when the request hangs (IAM-OIDC-24).
 
 ### Limits by decision
 

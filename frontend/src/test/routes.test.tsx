@@ -2,10 +2,11 @@ import { isValidElement, type ReactNode } from "react";
 import { createRoutesFromElements, Outlet, type RouteObject } from "react-router-dom";
 import { describe, it, expect } from "vitest";
 import { appRouteElements } from "@/routes";
-import { AuthGuard, AdminGuard } from "@/components/guards";
+import { AuthGuard, AdminGuard, GuestGuard } from "@/components/guards";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { ADMIN_NAV } from "@/lib/adminNav";
 import { ROUTE_TITLES } from "@/lib/routeTitles";
+import { OidcCompletePage } from "@/pages/OidcCompletePage";
 
 // Issue #551: structural walk via createRoutesFromElements (public API), no
 // render, so AppLayout and the pages never mount. AdminGuard.test.tsx pins
@@ -194,5 +195,27 @@ describe("ROUTE_TITLES covers the AppLayout routes (issue #1317)", () => {
       expect(titled, pattern).toContain(pattern);
     }
     expect(new Set(patterns).size).toBe(patterns.length);
+  });
+});
+
+// ADR 0016 phase 4: the single sign-on completion page is a guest page
+// outside the app layout, like /login and /register.
+describe("the /login/sso route (ADR 0016)", () => {
+  const guestPaths = flattenRoutes(routeObjects)
+    .filter((route) => typeof route.path === "string" && elementTreeContains(route.element, GuestGuard))
+    .map((route) => route.path)
+    .sort();
+
+  it("the GuestGuard paths are exactly /login, /login/sso, and /register", () => {
+    expect(guestPaths).toEqual(["/login", "/login/sso", "/register"]);
+  });
+
+  it("renders OidcCompletePage inside GuestGuard, outside AuthGuard and AppLayout", () => {
+    const route = flattenRoutes(routeObjects).find((r) => r.path === "/login/sso");
+    expect(route).toBeDefined();
+    expect(elementTreeContains(route!.element, GuestGuard)).toBe(true);
+    expect(elementTreeContains(route!.element, OidcCompletePage)).toBe(true);
+    expect(guardsByPath.get("/login/sso")).toEqual({ adminGuarded: false, authGuarded: false });
+    expect(pathsUnderAppLayout(routeObjects, false, [])).not.toContain("/login/sso");
   });
 });
