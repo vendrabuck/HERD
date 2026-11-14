@@ -931,7 +931,9 @@ test-auth-oidc:  ## Run the live OIDC auth tests against Dex (no skips; needs oi
 # Gate phase used by master and everything, the _gate-ldap-tests shape: boot
 # the provider if (and only if) it is not already running, run the
 # hard-required tests, then tear down only what this run started; the trap
-# covers the failure path too.
+# covers the failure path too. It reuses any running container named
+# oidc-test as it finds it, so a provider started from another checkout or
+# from an older dex.yaml must be stopped first (`make oidc-down`).
 _gate-oidc-tests:
 	@started=0; \
 	if ! docker ps --format '{{.Names}}' | grep -q '^oidc-test$$'; then \

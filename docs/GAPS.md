@@ -206,7 +206,7 @@ nightly say nothing about them.
   a `make test-auth-ldap` step in `.github/workflows/nightly.yml` after the
   existing `make ldap-up` step.
 - **[MEDIUM] Live OIDC auth suite.** `services/auth/tests/test_oidc_service_live.py`
-  (7 tests, ADR 0016 phase 5a) skips through its module `pytestmark` unless
+  (8 tests, ADR 0016 phase 5a) skips through its module `pytestmark` unless
   `HERD_TEST_OIDC_REQUIRED` is set or a provider answers at
   `HERD_TEST_OIDC_HOST`/`HERD_TEST_OIDC_PORT`. It runs only through `make
   test-auth-oidc`, which `make master` and `make everything` call through

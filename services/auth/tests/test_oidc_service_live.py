@@ -5,28 +5,42 @@ Functional level: HERD's real OIDC code (`oidc_service`, and the routes in
 `test_oidc_routes.py`) against a real identity provider, the Dex in
 infra/oidc-test. Each sign-in is driven over HTTP through Dex's own login form,
 with no browser. The locally signed tokens of the unit and routes suites cannot
-catch a provider that behaves differently from the fake; these tests can, and
-each one fails if HERD stops sending PKCE, stops checking the nonce, or reads
-the wrong claim (the mutation proofs are recorded in docs/specs/TESTING.md).
+catch a provider that behaves differently from the fake; these tests can. As a
+whole the suite fails if HERD stops sending PKCE, stops sending or checking the
+nonce, reads the wrong claim or the wrong subject, finds an identity by issuer
+alone, refuses Dex's signing keys, ignores `email_verified`, skips the email
+collision check, or logs Dex's error text; each test fails under at least one
+of those mutations, and no test catches all of them (the mutation table in
+docs/specs/TESTING.md says which test catches which).
 
 Skipped automatically when nothing listens on HERD_TEST_OIDC_HOST and
 HERD_TEST_OIDC_PORT (default 127.0.0.1:5556), so `make test-auth` stays green
 without the provider. To run: `make oidc-up test-auth-oidc`. Setting
 HERD_TEST_OIDC_REQUIRED=1 (as `make test-auth-oidc` and the gates do) turns the
-skip into a failure of every test that names the remedy.
+skip into a failure of every test that names the remedy. When the port answers
+but the discovery document there is not this lab's (another server on the
+port, or a Dex started from an older dex.yaml), every test fails with the cause
+and the remedy, required or not, as the live LDAP suite does for a stale seed.
 
 Issuer reachability: the issuer is `http://oidc-test:5556/dex` for every
 client. This host-side suite cannot resolve `oidc-test`, so `oidc_service`'s
-`transport` seam gets `_MappedTransport`, which connects to the published
-address while every URL and the Host header stay the issuer's. It changes where
-the TCP connection goes and nothing else: discovery, the authorization URL,
-the token request, and every check are HERD's own code.
+`transport` seam gets `_MappedTransport`. Before each request goes out it
+rewrites the request URL's host and port from `oidc-test:5556` to the published
+address; the Host header, fixed when the request was built, still names the
+issuer. Every URL HERD builds or checks (the discovery URL, the endpoints in the
+discovery document, the issuer in the token) is the issuer's before the
+transport sees it, and HERD reads only a response's status and body, never its
+URL, so the rewrite cannot change a decision HERD makes. Two side effects: the
+rewritten URL is what `response.request.url` and httpx's request log line show,
+and a client given a transport no longer applies its own `verify=` setting,
+which is moot here because the lab is plain HTTP.
 
 Fixtures, from infra/oidc-test/dex.yaml (test-only values):
 
 - alice@oidc.example.com: `preferred_username` alice.sso, `name` Alice Example;
 - user1@herd.dev: the email of a seeded local account (collision);
-- bob@oidc.example.com: `email_verified` false.
+- bob@oidc.example.com: `email_verified` false;
+- carol@oidc.example.com: a second normal user (`preferred_username` carol.sso).
 
 Every user's password is `oidc-test-password`; the client is `herd` with the
 secret `herd-oidc-test-client-secret`.
@@ -34,6 +48,8 @@ secret `herd-oidc-test-client-secret`.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
 import re
@@ -51,6 +67,7 @@ from app.routers import oidc as oidc_router
 from app.services import oidc_service
 from app.services.auth_service import create_user
 from app.services.oidc_service import OidcRejectedError
+from herd_common.logging import JSONFormatter
 from sqlalchemy import func, select
 
 from tests._harness import TestSessionLocal
@@ -68,6 +85,17 @@ PASSWORD = "oidc-test-password"
 ALICE = "alice@oidc.example.com"
 COLLIDER = "user1@herd.dev"
 UNVERIFIED = "bob@oidc.example.com"
+CAROL = "carol@oidc.example.com"
+ALICE_USER_ID = "6f1c5a0e-1b7e-4d0a-9a51-0c6b1f0e0001"
+CAROL_USER_ID = "6f1c5a0e-1b7e-4d0a-9a51-0c6b1f0e0004"
+# alice's `sub` as Dex v2.46.1 sent it in the phase 5a measurement (2026-11-14);
+# dex_subject() derives it from ALICE_USER_ID, and the full sign-in test checks both.
+ALICE_SUBJECT = "CiQ2ZjFjNWEwZS0xYjdlLTRkMGEtOWE1MS0wYzZiMWYwZTAwMDESBWxvY2Fs"
+
+# What Dex answers a wrong code_verifier with (phase 5a measurement): none of it
+# may reach an emitted log line.
+DEX_PKCE_ERROR_DESCRIPTION = "Invalid code_verifier."
+DEX_PKCE_ERROR_BODY = '{"error":"invalid_grant","error_description":"Invalid code_verifier."}'
 
 SUCCESS = "/login/sso"
 FAILED = "/login?sso_error=failed"
@@ -93,6 +121,42 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _foreign_provider_problem() -> str | None:
+    """Why whatever answers on the port is not infra/oidc-test's Dex, or None.
+
+    The issuer is the lab's own, and the PKCE methods are dex.yaml's (S256
+    only), which a Dex started from another configuration would not advertise."""
+    url = f"http://{OIDC_HOST}:{OIDC_PORT}/dex/.well-known/openid-configuration"
+    try:
+        response = httpx.get(url, headers={"Host": f"{ISSUER_HOST}:{ISSUER_PORT}"}, timeout=5.0)
+    except httpx.HTTPError as exc:
+        return f"the discovery request failed ({type(exc).__name__})"
+    if response.status_code != 200:
+        return f"the discovery document answered HTTP {response.status_code}"
+    try:
+        document = response.json()
+    except ValueError:
+        return "the discovery document is not JSON"
+    if not isinstance(document, dict) or document.get("issuer") != ISSUER:
+        issuer = document.get("issuer") if isinstance(document, dict) else None
+        return f"the discovery document names the issuer {issuer!r}, not {ISSUER!r}"
+    if document.get("code_challenge_methods_supported") != ["S256"]:
+        return "the provider's PKCE methods are not infra/oidc-test/dex.yaml's (an older dex.yaml?)"
+    return None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _fail_on_a_foreign_provider():
+    if _OIDC_REACHABLE:
+        problem = _foreign_provider_problem()
+        if problem is not None:
+            pytest.fail(
+                f"Something answers at {OIDC_HOST}:{OIDC_PORT} but it is not the "
+                f"infra/oidc-test provider: {problem}. Run `make oidc-down oidc-up`, or "
+                f"stop whatever listens on port {OIDC_PORT} (`ss -ltnp`)."
+            )
+
+
 @pytest.fixture(autouse=True)
 def _fail_when_required_but_unreachable():
     if _OIDC_REQUIRED and not _OIDC_REACHABLE:
@@ -104,10 +168,13 @@ def _fail_when_required_but_unreachable():
 
 
 class _MappedTransport(httpx.AsyncHTTPTransport):
-    """Connects `oidc-test:5556` to the published address; the request URL's host
-    is replaced only for the connection, so the Host header, set when the request
-    was built, still names the issuer (curl's --resolve, Chromium's
-    --host-resolver-rules)."""
+    """Sends a request for `oidc-test:5556` to the published address instead.
+
+    It rewrites `request.url` itself (httpx has no public hook for the connect
+    target), so the response's request URL and httpx's log line show the
+    published address; the Host header, set when the request was built, still
+    names the issuer, as with curl's --resolve. The module docstring says why
+    this cannot change a decision HERD makes."""
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.url.host == ISSUER_HOST and request.url.port == ISSUER_PORT:
@@ -155,7 +222,10 @@ async def dex_sign_in(authorization_url: str, email: str) -> dict[str, str]:
     the query Dex redirects to REDIRECT_URI with (`code` and `state`, or `error`).
 
     Redirects inside Dex are followed by hand; the one to REDIRECT_URI is not
-    (it names HERD's callback, which the caller drives itself)."""
+    (it names HERD's callback, which the caller drives itself). The first request
+    goes through `_MappedTransport`; later ones are joined to the rewritten
+    response URL, so they address the published address directly, which Dex
+    accepts since it does not check the Host header."""
     async with httpx.AsyncClient(transport=_MappedTransport(), follow_redirects=False) as dex:
 
         async def follow(response: httpx.Response) -> httpx.Response:
@@ -237,6 +307,53 @@ async def row_counts() -> tuple[int, int]:
     return users, identities
 
 
+def dex_subject(user_id: str, connector_id: str = "local") -> str:
+    """The `sub` Dex issues for a static user: the unpadded base64url encoding of a
+    protobuf message with the userID as field 1 and the connector id as field 2,
+    each a length-delimited string (tags 0x0A and 0x12)."""
+    message = b"".join(
+        bytes([tag, len(value)]) + value
+        for tag, value in ((0x0A, user_id.encode()), (0x12, connector_id.encode()))
+    )
+    return base64.urlsafe_b64encode(message).rstrip(b"=").decode("ascii")
+
+
+async def signed_in_profile(client, email: str) -> dict:
+    """A full sign-in as `email` through the routes; returns `GET /me`'s body."""
+    callback = await route_sign_in(client, email)
+    assert callback.headers["location"] == SUCCESS
+    exchanged = await exchange(client, _cookie(callback, oidc_router.HANDOFF_COOKIE))
+    assert exchanged.status_code == 200, exchanged.text
+    me = await client.get(
+        "/me", headers={"Authorization": f"Bearer {exchanged.json()['access_token']}"}
+    )
+    assert me.status_code == 200, me.text
+    return me.json()
+
+
+def _string_values(value) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for item in value.values() for s in _string_values(item)]
+    if isinstance(value, list):
+        return [s for item in value for s in _string_values(item)]
+    return []
+
+
+def emitted_text(records: list[logging.LogRecord]) -> list[str]:
+    """Each record as auth emits it, through the real JSONFormatter (extras
+    included), plus every string value of the decoded line, so text that JSON
+    escapes (a quoted body) is matched as it was logged."""
+    formatter = JSONFormatter("auth")
+    texts: list[str] = []
+    for record in records:
+        line = formatter.format(record)
+        texts.append(line)
+        texts.extend(_string_values(json.loads(line)))
+    return texts
+
+
 def refusal_reasons(caplog) -> list[str]:
     return [
         r.reason
@@ -278,6 +395,7 @@ async def test_full_sign_in_through_the_routes_provisions_then_reuses_the_accoun
     """GET /oidc/login, Dex's login form, GET /oidc/callback, POST /oidc/exchange,
     then GET /me: the account is provisioned from Dex's claims (username from
     `preferred_username`, full name from `name`), and a second sign-in reuses it."""
+    assert dex_subject(ALICE_USER_ID) == ALICE_SUBJECT
     callback = await route_sign_in(client, ALICE)
     assert callback.headers["location"] == SUCCESS
     handoff = _cookie(callback, oidc_router.HANDOFF_COOKIE)
@@ -302,24 +420,36 @@ async def test_full_sign_in_through_the_routes_provisions_then_reuses_the_accoun
     assert user.auth_source == "oidc"
     assert user.hashed_password is None
     assert identity.issuer == ISSUER
+    assert identity.subject == ALICE_SUBJECT
     assert identity.user_id == user.id
 
-    again = await route_sign_in(client, ALICE)
-    assert again.headers["location"] == SUCCESS
-    second = await exchange(client, _cookie(again, oidc_router.HANDOFF_COOKIE))
-    assert second.status_code == 200, second.text
-    me_again = await client.get(
-        "/me", headers={"Authorization": f"Bearer {second.json()['access_token']}"}
-    )
-    assert me_again.json()["id"] == profile["id"]
+    again = await signed_in_profile(client, ALICE)
+    assert again["id"] == profile["id"]
     assert await row_counts() == (1, 1)
+
+
+async def test_a_second_dex_user_gets_a_separate_account(live_oidc, client):
+    """The identity is the issuer AND the subject: carol, from the same issuer,
+    signs in after alice and gets her own account and her own identity row."""
+    alice = await signed_in_profile(client, ALICE)
+    carol = await signed_in_profile(client, CAROL)
+
+    assert carol["id"] != alice["id"]
+    assert (carol["email"], carol["username"]) == (CAROL, "carol.sso")
+    async with TestSessionLocal() as db:
+        identities = (await db.execute(select(FederatedIdentity))).scalars().all()
+    assert {(str(i.user_id), i.issuer, i.subject) for i in identities} == {
+        (alice["id"], ISSUER, dex_subject(ALICE_USER_ID)),
+        (carol["id"], ISSUER, dex_subject(CAROL_USER_ID)),
+    }
+    assert await row_counts() == (2, 2)
 
 
 async def test_a_wrong_code_verifier_is_refused_by_dex(live_oidc, caplog):
     """Dex enforces PKCE: the code HERD's own authorization request obtained is
     refused at the token endpoint with another verifier, which HERD maps to
     `token_refused` with none of Dex's error text."""
-    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.DEBUG)
     request = await oidc_service.build_authorization_request()
     params = await dex_sign_in(request.url, ALICE)
     assert "error" not in params, f"Dex refused the authorization request: {params['error']}"
@@ -334,8 +464,17 @@ async def test_a_wrong_code_verifier_is_refused_by_dex(live_oidc, caplog):
     assert [(r.reason, r.status_code, r.oauth_error) for r in records] == [
         ("token_refused", 400, "invalid_grant")
     ]
-    # Dex's error_description ("Invalid code_verifier.") reaches no log record.
-    assert not [r for r in caplog.records if "code_verifier." in r.getMessage()]
+    # Nothing Dex sent, neither its error_description nor its body, reaches an
+    # emitted log line: in a message or in any extra field.
+    emitted = emitted_text(caplog.get_records("call"))
+    assert emitted, "no log record reached the leak check"
+    leaks = [
+        text
+        for text in emitted
+        for needle in (DEX_PKCE_ERROR_DESCRIPTION, DEX_PKCE_ERROR_BODY)
+        if needle in text
+    ]
+    assert leaks == []
 
 
 async def test_a_nonce_other_than_the_flow_nonce_is_refused_by_herd(live_oidc):

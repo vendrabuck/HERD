@@ -591,8 +591,8 @@ signed tokens.
 
 | Candidate | For | Against |
 |---|---|---|
-| Keycloak | most realistic, every feature | heaviest image and slowest start of the three (measured in phase 5a: 265.0 MB download for 26.8.2, 17.5 s to 17.9 s from container start to a discovery answer in `start-dev`), realm-import JSON to maintain |
-| Dex | real provider, small and fast to start (measured in phase 5a: 50.5 MB download for v2.46.1, 0.26 s to 0.34 s from container start to a discovery answer), static-password login form, YAML config | fixed users per config file; claim names confirmed in phase 5a: Dex emits `sub`, `email`, `email_verified`, `name` (from a static user's `name`, else its `username`), and `preferred_username` (from `preferredUsername`), so the default `OIDC_USERNAME_CLAIM=preferred_username` needs no change |
+| Keycloak | most realistic, every feature | heaviest image and slowest start of the three (measured in phase 5a: 265.1 MB download for 26.8.2, 17.5 s to 17.9 s from container start to a discovery answer in `start-dev`), realm-import JSON to maintain |
+| Dex | real provider, small and fast to start (measured in phase 5a: 50.6 MB download for v2.46.1, 0.26 s to 0.34 s from container start to a discovery answer), static-password login form, YAML config | fixed users per config file; claim names confirmed in phase 5a: Dex emits `sub`, `email`, `email_verified`, `name` (from a static user's `name`, else its `username`), and `preferred_username` (from `preferredUsername`), so the default `OIDC_USERNAME_CLAIM=preferred_username` needs no change |
 | navikt/mock-oauth2-server | programmable claims per request, fast | a mock: whether it enforces PKCE was not verified for this ADR (phase 5a measured 149.0 MB and 1.2 s, and its discovery advertises `plain` beside `S256`; its enforcement stayed untested, since Dex passed), and a lenient IdP hides exactly the defects the live tier exists to catch; acceptable fallback only if phase 5a confirms PKCE and nonce enforcement |
 
 Issuer reachability is the hard constraint: the issuer URL must be identical for the

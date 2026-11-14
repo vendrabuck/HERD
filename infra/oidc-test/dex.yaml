@@ -14,7 +14,11 @@
 #   and never linked (ADR 0016 D4).
 # - bob@oidc.example.com: emailVerified false, so a first sign-in must be
 #   refused as unverified (ADR 0016 D4).
-# The userID values are fixed, so each user's `sub` is the same on every start.
+# - carol@oidc.example.com: a second normal user, who signs in after alice and
+#   must get her own HERD account (the identity is the issuer AND the subject).
+# The userID values are fixed, so each user's `sub` is the same on every start:
+# Dex's `sub` is the unpadded base64url encoding of a protobuf message holding
+# the userID (field 1) and the connector id `local` (field 2).
 
 issuer: http://oidc-test:5556/dex
 
@@ -72,3 +76,10 @@ staticPasswords:
     preferredUsername: bob.sso
     emailVerified: false
     userID: 6f1c5a0e-1b7e-4d0a-9a51-0c6b1f0e0003
+  - email: carol@oidc.example.com
+    hash: "$2b$10$KazWi/TG9YCHfjwJlYWvL.7iUxUKEBlptbL2RNnTxAaFQ0LSRWUey"
+    username: carol
+    name: Carol Example
+    preferredUsername: carol.sso
+    emailVerified: true
+    userID: 6f1c5a0e-1b7e-4d0a-9a51-0c6b1f0e0004
