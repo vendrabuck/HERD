@@ -200,10 +200,20 @@ async def release_allocation_if_orphaned(db: AsyncSession, allocation_id: uuid.U
     (another release pass) owns its delete_vlan, and a joined membership keeps it live.
 
     The membership predicate is part of the guarded UPDATE, not only of the caller's
-    earlier count, so a join committed between that count and this statement keeps
-    the allocation ACTIVE. On Postgres two concurrent releases of one row serialize
-    on its row lock and the second re-checks status = 'ACTIVE' against the committed
-    RELEASED row, so exactly one wins.
+    earlier count, so a join that COMMITS after that count and before this statement
+    takes its snapshot keeps the allocation ACTIVE. A join still uncommitted when the
+    statement runs is not seen: the release wins and the join then commits an ACTIVE
+    membership on a RELEASED allocation, because the join side
+    (record_l2_membership_active) does not check that the allocation is still ACTIVE.
+    On Postgres two concurrent releases of one row serialize on its row lock and the
+    second re-checks status = 'ACTIVE' against the committed RELEASED row, so exactly
+    one wins.
+
+    Warning to callers: this function ends the caller's transaction either way. On a
+    win it commits `db`, so anything the caller left pending in that session is
+    committed with the release. On a loss it rolls `db` back, so anything the caller
+    left pending is discarded and every object loaded in the session is expired. Call
+    it on a session with nothing pending, and re-read any row needed afterwards.
     """
     live_member = (
         select(L2PortAssignment.id)

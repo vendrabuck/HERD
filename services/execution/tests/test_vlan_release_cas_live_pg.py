@@ -31,8 +31,11 @@ execution schema. Every test runs on random reservation ids, seeds FOREIGN rows 
 other random reservations (an ACTIVE allocation holding the same VLAN number on
 another fabric with an ACTIVE membership, a RELEASED allocation, and a RELEASED
 membership row of another reservation pointing at the allocation under test), snapshots
-every vlan_assignments and l2_port_assignments row it does not own before and after,
-asserts nothing changed, and deletes its own and its seeded rows in a finally. The
+every vlan_assignments and l2_port_assignments row it does not own before and after and
+asserts nothing changed, asserts it wrote no execution_runs row for its foreign
+reservation, and deletes its own and its seeded rows in a finally. It does not
+snapshot all of execution_runs: that table is the append-only audit of every driver
+action, and a live gate stack's own retry tick may append to it during the run. The
 fabric lookup answers a fresh fabric id for every switch it was not told about, so no
 allocation already in the ledger can ever read as superseding.
 
@@ -355,6 +358,20 @@ async def _own_delete_runs(session_factory, h: _Harness) -> int:
         )
 
 
+async def _runs_of(session_factory, reservation_id: uuid.UUID) -> int:
+    """Every execution_runs row of one reservation, whatever its action."""
+    async with session_factory() as s:
+        return len(
+            (
+                await s.execute(
+                    select(ExecutionRun.id).where(ExecutionRun.reservation_id == reservation_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
 async def _cleanup(session_factory, h: _Harness):
     ids = [h.reservation, h.foreign]
     async with session_factory() as s:
@@ -364,16 +381,19 @@ async def _cleanup(session_factory, h: _Harness):
         await s.commit()
 
 
-async def _waiting_on_lock(pg_engine, needle: str) -> int:
+async def _waiting_on_lock(pg_engine, application_name: str) -> int:
+    """How many of THIS test's releaser backends (tagged with `application_name`) wait
+    on a lock in their guarded UPDATE. Other sessions on the database, such as a live
+    gate stack's own, are never counted."""
     async with pg_engine.connect() as conn:
         return (
             await conn.execute(
                 text(
                     "SELECT count(*) FROM pg_stat_activity "
                     "WHERE wait_event_type = 'Lock' AND datname = current_database() "
-                    "AND query ILIKE :needle"
+                    "AND application_name = :app AND query ILIKE 'UPDATE vlan_assignments%'"
                 ),
-                {"needle": needle},
+                {"app": application_name},
             )
         ).scalar_one()
 
@@ -387,6 +407,7 @@ async def test_two_concurrent_releases_of_one_allocation_have_exactly_one_winner
 ):
     h = _Harness()
     vlan_id = await _free_vlan_number(session_factory)
+    releaser_engine = None
     try:
         alloc = await _seed(session_factory, h, vlan_id)
         before = await _foreign_snapshot(session_factory, h)
@@ -398,7 +419,20 @@ async def test_two_concurrent_releases_of_one_allocation_have_exactly_one_winner
             outcomes.append(won)
             return won
 
-        get_db = _session_ctx(session_factory)
+        # The two releasers run on their own engine, tagged so the lock poll below counts
+        # only their backends.
+        app_name = f"herd-test-1357-{uuid.uuid4().hex[:12]}"
+        releaser_engine = create_async_engine(
+            PG_DSN,
+            connect_args={
+                "server_settings": {
+                    "search_path": EXECUTION_SCHEMA,
+                    "lock_timeout": LOCK_TIMEOUT,
+                    "application_name": app_name,
+                }
+            },
+        )
+        get_db = _session_ctx(async_sessionmaker(releaser_engine, expire_on_commit=False))
         with h.patches(release=_recorded), caplog.at_level(logging.INFO):
             async with pg_engine.connect() as holder:
                 # Hold the row so both guarded UPDATEs queue on its lock together.
@@ -412,7 +446,7 @@ async def test_two_concurrent_releases_of_one_allocation_have_exactly_one_winner
                     for _ in range(2)
                 ]
                 for _ in range(200):
-                    if await _waiting_on_lock(pg_engine, "UPDATE vlan_assignments%") == 2:
+                    if await _waiting_on_lock(pg_engine, app_name) == 2:
                         break
                     await asyncio.sleep(0.02)
                 else:
@@ -430,7 +464,10 @@ async def test_two_concurrent_releases_of_one_allocation_have_exactly_one_winner
         assert row.released_at is not None
         assert len(_lost_race_records(caplog)) == 1
         assert await _foreign_snapshot(session_factory, h) == before
+        assert await _runs_of(session_factory, h.foreign) == 0
     finally:
+        if releaser_engine is not None:
+            await releaser_engine.dispose()
         await _cleanup(session_factory, h)
 
 
@@ -485,6 +522,7 @@ async def test_a_join_committed_after_the_orphan_check_keeps_the_allocation_acti
         )
         assert len(_lost_race_records(caplog)) == 1
         assert await _foreign_snapshot(session_factory, h) == before
+        assert await _runs_of(session_factory, h.foreign) == 0
     finally:
         await _cleanup(session_factory, h)
 
@@ -541,5 +579,6 @@ async def test_the_loser_never_touches_a_new_allocation_of_the_same_number(sessi
         assert rows[fresh_id].defined_switch_ids == list(h.switches)
         assert len(_lost_race_records(caplog)) == 1
         assert await _foreign_snapshot(session_factory, h) == before
+        assert await _runs_of(session_factory, h.foreign) == 0
     finally:
         await _cleanup(session_factory, h)

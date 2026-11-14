@@ -1100,8 +1100,10 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # The execution suite added for issue #1357 (the VLAN allocation release
 # compare-and-swap) needs the migrated execution schema as well. It commits its
 # own allocations, memberships, and delete_vlan execution runs under random
-# reservation ids plus seeded foreign rows, asserts every row it does not own
-# unchanged, and deletes its own and its seeded rows in a finally.
+# reservation ids plus seeded foreign rows, asserts every vlan_assignments and
+# l2_port_assignments row it does not own unchanged and no execution_runs row
+# written for its foreign reservation, and deletes its own and its seeded rows
+# in a finally.
 # The auth suite added for ADR 0016 phase 2 (the OIDC flow store and JIT
 # provisioning races) needs the migrated auth schema with migration 0010's two
 # tables. It commits its own users, identities, and flows under random tags,

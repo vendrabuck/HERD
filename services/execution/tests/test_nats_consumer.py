@@ -924,9 +924,8 @@ async def test_fetch_device_raises_on_transport_error():
 async def test_fetch_context_memoizes_device_and_config_fetches():
     """_FetchContext's per-event memoization contract, re-expressed from the retired
     shared-ctx tests: a device (present or 404-None) and a latest-config are fetched at
-    most once per event. A TransientUpstreamError is not cached as a value; since
-    issue #1358 it is remembered as a failure for the life of the context, and a NAK
-    redelivery (a new event, so a fresh context) fetches again."""
+    most once per event, and a TransientUpstreamError is NOT cached (a NAK retry should
+    refetch)."""
     from app.services.nats_consumer import _FetchContext
 
     device = {"id": "dev-1", "connection_type": "Layer 1 Switch"}
@@ -952,13 +951,9 @@ async def test_fetch_context_memoizes_device_and_config_fetches():
         ctx = _FetchContext(None)
         with pytest.raises(TransientUpstreamError):
             await ctx.get_device("dev-3")
-        # Remembered for this context (issue #1358): raised again with no new fetch.
+        # The error was not cached as a value: a retry attempts the fetch again.
         with pytest.raises(TransientUpstreamError):
             await ctx.get_device("dev-3")
-        assert boom.await_count == 1
-        # A NAK redelivery handles a new event with a fresh context: it fetches again.
-        with pytest.raises(TransientUpstreamError):
-            await _FetchContext(None).get_device("dev-3")
         assert boom.await_count == 2
 
 
@@ -971,12 +966,42 @@ async def test_fetch_context_memoizes_device_and_config_fetches():
         ("get_template", "_fetch_template"),
     ],
 )
-async def test_fetch_context_remembers_a_failed_read_for_the_context_only(getter, fetcher):
-    """Issue #1358: a read that raised TransientUpstreamError is attempted once per
-    context. Every later read of the same key raises the same class with the same
-    arguments and makes no request; another key is still read; a fresh context (the
-    next event or retry pass) reads the failed key again and caches its answer."""
+async def test_fetch_context_caches_answers_and_never_remembers_a_failure(getter, fetcher):
+    """The shared context caches a read that answered and remembers no failure
+    (issue #1358 review): after a TransientUpstreamError the next read of the same
+    record requests it again, on the same context object."""
     from app.services.nats_consumer import _FetchContext
+
+    record = {"id": "ok"}
+    calls: list[str] = []
+
+    async def _fetch(key, client=None):
+        calls.append(key)
+        if calls.count(key) == 1:
+            raise TransientUpstreamError(f"{fetcher} {key}: upstream 503")
+        return record
+
+    with patch(f"app.services.nats_consumer.{fetcher}", new=AsyncMock(side_effect=_fetch)):
+        ctx = _FetchContext(None)
+        with pytest.raises(TransientUpstreamError):
+            await getattr(ctx, getter)("k")
+        assert await getattr(ctx, getter)("k") == record
+        assert await getattr(ctx, getter)("k") == record
+    assert calls == ["k", "k"], "refetched after the failure, then cached"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("getter", "fetcher"),
+    [("get_device", "_fetch_device"), ("get_template", "_fetch_template")],
+)
+async def test_release_pass_reads_remember_a_failure_for_that_view_only(getter, fetcher):
+    """A _ReleasePassReads view (issue #1358): a read that raised TransientUpstreamError
+    is requested once through the view, and every later read of it raises a new error
+    of the same class with the same arguments, chained to the first. The failure is
+    not written to the shared context (its own read requests again) and is not seen
+    by a second view over the same context. Answers go through the context's cache."""
+    from app.services.nats_consumer import _FetchContext, _ReleasePassReads
 
     record = {"id": "ok"}
     calls: list[str] = []
@@ -989,37 +1014,41 @@ async def test_fetch_context_remembers_a_failed_read_for_the_context_only(getter
 
     with patch(f"app.services.nats_consumer.{fetcher}", new=AsyncMock(side_effect=_fetch)):
         ctx = _FetchContext(None)
+        view = _ReleasePassReads(ctx)
         with pytest.raises(TransientUpstreamError) as first:
-            await getattr(ctx, getter)("down")
+            await getattr(view, getter)("down")
         for _ in range(3):
             with pytest.raises(TransientUpstreamError) as again:
-                await getattr(ctx, getter)("down")
+                await getattr(view, getter)("down")
             assert type(again.value) is type(first.value)
             assert again.value.args == first.value.args
             assert again.value is not first.value
-        assert calls == ["down"], "one request for the failed key in this context"
+            assert again.value.__cause__ is first.value
+        assert calls == ["down"], "one request for the failed key in this view"
 
+        assert await getattr(view, getter)("up") == record
         assert await getattr(ctx, getter)("up") == record
-        assert calls == ["down", "up"], "a failure of one key never blocks another"
+        assert calls == ["down", "up"], "an answer through the view fills the context cache"
 
-        fresh = _FetchContext(None)
-        assert await getattr(fresh, getter)("down") == record
-        assert await getattr(fresh, getter)("down") == record
-        assert calls == ["down", "up", "down"], "no memory across contexts; success cached"
+        second = _ReleasePassReads(ctx)
+        assert await getattr(second, getter)("down") == record
+        assert calls == ["down", "up", "down"], "a new view, same context: read again"
+        assert await getattr(ctx, getter)("down") == record
+        assert calls == ["down", "up", "down"], "and its answer is cached on the context"
 
 
 @pytest.mark.asyncio
-async def test_fetch_context_does_not_remember_other_exceptions():
-    """Only TransientUpstreamError is remembered: any other exception from a read is
-    not, so the next read of that key makes a request again."""
-    from app.services.nats_consumer import _FetchContext
+async def test_release_pass_reads_do_not_remember_other_exceptions():
+    """Only TransientUpstreamError is remembered by a release-pass view: any other
+    exception from a read is not, so the next read makes a request again."""
+    from app.services.nats_consumer import _FetchContext, _ReleasePassReads
 
     fetch = AsyncMock(side_effect=[RuntimeError("not an upstream outage"), {"id": "d"}])
     with patch("app.services.nats_consumer._fetch_device", new=fetch):
-        ctx = _FetchContext(None)
+        view = _ReleasePassReads(_FetchContext(None))
         with pytest.raises(RuntimeError):
-            await ctx.get_device("d")
-        assert await ctx.get_device("d") == {"id": "d"}
+            await view.get_device("d")
+        assert await view.get_device("d") == {"id": "d"}
     assert fetch.await_count == 2
 
 

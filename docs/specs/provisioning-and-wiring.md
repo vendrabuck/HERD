@@ -263,11 +263,18 @@ compare-and-swap too, so of two passes releasing one allocation exactly one driv
   joined it, after this pass's orphan check): it logs one line at INFO with the action
   `vlan_release_lost_race` and `vlan_assignment_id`, drives no `delete_vlan`, leaves
   `defined_switch_ids` alone, raises nothing, and goes on with the next allocation. A
-  row that is not ACTIVE when the pass first reads it is skipped with no line. The
-  winner's deletes (WIRE-VLAN-11) start from the row as it was released, so a switch
-  defined after the orphan check is undefined too. \
+  row that is not ACTIVE when the pass first reads it, and one that still has an ACTIVE
+  membership at the orphan check, is skipped with no line. The winner's deletes
+  (WIRE-VLAN-11) start from the row as re-read after the release, so a switch whose
+  definition was committed before that re-read is undefined too. The guard sees only
+  committed work: a join that commits before the guarded UPDATE takes its snapshot
+  keeps the allocation ACTIVE, but neither the join side (`record_l2_membership_active`)
+  nor the define append (`_define_pending_for_allocations`) checks that the allocation
+  is still ACTIVE, so a join still uncommitted when the UPDATE runs then commits an
+  ACTIVE membership on a RELEASED allocation, and a definition appended after the
+  winner's re-read is never deleted. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_release_orphaned_allocations`); `services/execution/app/services/vlan_service.py` (`release_allocation_if_orphaned`); `services/execution/app/services/l2_membership_service.py` (`count_active_memberships_for_vlan`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_reconcile_last_release_frees_allocation`, `test_reconcile_move_within_fabric_keeps_allocation`); `services/execution/tests/test_l2_membership_service.py` (`test_count_active_memberships_tracks_allocation_lifecycle`); `services/execution/tests/test_vlan_service.py` (`test_release_cas_releases_an_active_orphan_and_nothing_else`, `test_release_cas_loses_on_a_row_that_is_not_active`, `test_release_cas_loses_when_a_membership_joined_since_the_check`, `test_release_cas_ignores_memberships_that_are_not_active`, `test_release_cas_second_release_of_one_row_loses`); `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_release_lost_to_a_concurrent_release_drives_no_delete`, `test_release_lost_to_a_concurrent_join_keeps_the_allocation_active`, `test_release_loser_never_touches_a_reallocation_of_the_same_number`, `test_release_deletes_from_the_row_as_released_not_the_copy_read_before`, `test_two_interleaved_release_passes_release_and_undefine_once`); `services/execution/tests/test_vlan_release_cas_live_pg.py` (`test_two_concurrent_releases_of_one_allocation_have_exactly_one_winner`, `test_a_join_committed_after_the_orphan_check_keeps_the_allocation_active`, `test_the_loser_never_touches_a_new_allocation_of_the_same_number`)
+  Pinned by: `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_reconcile_last_release_frees_allocation`, `test_reconcile_move_within_fabric_keeps_allocation`); `services/execution/tests/test_l2_membership_service.py` (`test_count_active_memberships_tracks_allocation_lifecycle`); `services/execution/tests/test_vlan_service.py` (`test_release_cas_releases_an_active_orphan_and_nothing_else`, `test_release_cas_loses_on_a_row_that_is_not_active`, `test_release_cas_loses_when_a_membership_joined_since_the_check`, `test_release_cas_ignores_memberships_that_are_not_active`, `test_release_cas_second_release_of_one_row_loses`); `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_release_lost_to_a_concurrent_release_drives_no_delete`, `test_release_lost_to_a_concurrent_join_keeps_the_allocation_active`, `test_release_loser_never_touches_a_reallocation_of_the_same_number`, `test_release_deletes_from_the_row_as_released_not_the_copy_read_before`, `test_two_interleaved_release_passes_release_and_undefine_once`, `test_a_held_allocation_logs_no_lost_race_line`, `test_an_allocation_already_released_is_skipped_with_no_line`); `services/execution/tests/test_vlan_release_cas_live_pg.py` (`test_two_concurrent_releases_of_one_allocation_have_exactly_one_winner`, `test_a_join_committed_after_the_orphan_check_keeps_the_allocation_active`, `test_the_loser_never_touches_a_new_allocation_of_the_same_number`)
 - **WIRE-ORDER-1.** `stamp_last_applied` inserts the wiring state row or raises its
   version; it never lowers the version and never clears `frozen`, including when it loses
   an insert race. \
@@ -585,18 +592,14 @@ state transitions are WIRE-ORDER-1 and WIRE-FREEZE-1.
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_device`, `_fetch_template`, `_inventory_record_or_none`) \
   Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_returns_the_body_on_200`, `test_inventory_read_returns_none_only_on_404`, `test_inventory_read_raises_transient_on_every_other_status`, `test_inventory_read_raises_transient_on_a_malformed_200_body`, `test_inventory_read_raises_transient_on_transport_error`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_inventory_auth_error_naks_and_never_pins`); `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_inventory_auth_error_on_switch_read_raises_and_pins_nothing`)
 - **WIRE-ORDER-12.** Within one fetch context each device, each switch's latest config,
-  and each template read through it is requested at most once, whether the read
-  answered or failed. A context lives for one reservation event, or for one layer's
-  pass of one retry tick or manual retry. A read that raised `TransientUpstreamError` is
-  remembered as failed (#1358): every later read of the same record in that context
-  raises a new error of the same class with the same arguments and makes no request, so
-  an inventory outage costs one read timeout per record per context. In a retry pass
-  that covers several reservations, a switch whose read failed for one reservation is
-  not read again for another in that pass. Nothing is remembered across contexts: a
-  redelivered event, the next tick, or the next manual retry reads again. Any other
-  exception is not remembered. \
+  and each template read through `get_template` is fetched at most once when the read
+  answers (a 404 included). A context lives for one reservation event, or for one
+  layer's pass of one retry tick or manual retry. A read that raises is not remembered
+  by the context: the next read of that record, in the same context or another,
+  requests it again. The one place a failed read is remembered is a single allocation
+  release pass (WIRE-VLAN-12). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_FetchContext`) \
-  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_fetch_context_memoizes_device_and_config_fetches`, `test_fetch_context_remembers_a_failed_read_for_the_context_only`, `test_fetch_context_does_not_remember_other_exceptions`); `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_release_pass_reads_a_failed_switch_once_however_many_allocations`, `test_next_release_pass_reads_the_failed_switch_again`)
+  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_fetch_context_memoizes_device_and_config_fetches`, `test_fetch_context_caches_answers_and_never_remembers_a_failure`); `services/execution/tests/test_wiring_retry_upstream_isolation.py` (`test_a_blip_in_one_reservations_apply_does_not_stop_anothers_superseded_delete`)
 - **WIRE-ORDER-13.** A device removed from an ACTIVE reservation reaches execution as a
   `wiring_changed` whose `released` holds cabling's pruned hops and whose `built` is
   empty (RES-FORK-16); it is applied like any other event, so the removed device's
@@ -822,17 +825,22 @@ WIRE-VLAN-4.
   exception's class name, never its text), `vlan_assignment_id`, `reservation_id`,
   `vlan_id`, and `switch_ids` (the switches left listed by this failure), and the pass
   continues with the next allocation without raising. The failed read is not repeated
-  in the pass (WIRE-ORDER-12, #1358): each later allocation defined on that switch, or on
-  a switch with the same template, is stopped at once with its own
-  `vlan_delete_upstream_failed` line, so an outage costs one read timeout per switch per
-  pass, not one per allocation. So the reconcile still stamps its
+  in the pass (#1358): each call of `_release_orphaned_allocations` reads through its
+  own `_ReleasePassReads` view of the fetch context, which shares the context's answered
+  reads and starts with an empty memory of failed ones, so each later allocation of the
+  pass defined on that switch, or on a switch with the same template, is stopped at once
+  with its own `vlan_delete_upstream_failed` line and no new request: an outage costs one
+  read timeout per switch per pass, not one per allocation. A failure seen outside the
+  pass (an apply's read, or another reservation's read in the same retry tick) is never
+  consulted, and none is carried to the next pass, even one on the same context, because
+  a delete skipped here is never re-driven. So the reconcile still stamps its
   version, the terminal teardown goes on to L3, and both retry channels report their
   outcomes. By decision (#1209) HERD fails open here: the allocation is released rather
   than kept `ACTIVE`, the definition left on those switches is never re-driven, and
   leaving a switch in a known-good state is the L2 driver's responsibility for its
   network ([DRIVERS.md](../DRIVERS.md)). \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_release_orphaned_allocations`, `_run_vlan_definition_op`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_release_upstream_failure_skips_only_that_allocation`, `test_release_upstream_failure_on_a_later_switch_keeps_what_is_not_proven_deleted`, `test_reconcile_release_tail_upstream_failure_still_stamps_the_version`, `test_release_pass_reads_a_failed_switch_once_however_many_allocations`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_release_tail_upstream_failure_releases_every_other_allocation`); `services/execution/tests/test_wiring_retry_upstream_isolation.py` (`test_l2_superseded_allocation_release_failure_keeps_the_outcomes`, `test_manual_retry_superseded_release_switch_read_failure_reports_the_outcome`, `test_l2_apply_tail_delete_read_failure_is_not_a_reservation_skip`)
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_release_orphaned_allocations`, `_run_vlan_definition_op`, `_ReleasePassReads`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_release_upstream_failure_skips_only_that_allocation`, `test_release_upstream_failure_on_a_later_switch_keeps_what_is_not_proven_deleted`, `test_reconcile_release_tail_upstream_failure_still_stamps_the_version`, `test_release_pass_reads_a_failed_switch_once_however_many_allocations`, `test_release_pass_reads_each_of_two_failing_switches_once`, `test_next_release_pass_reads_the_failed_switch_again`); `services/execution/tests/test_nats_consumer.py` (`test_release_pass_reads_remember_a_failure_for_that_view_only`, `test_release_pass_reads_do_not_remember_other_exceptions`); `services/execution/tests/test_wiring_retry_upstream_isolation.py` (`test_a_blip_in_one_reservations_apply_does_not_stop_anothers_superseded_delete`, `test_a_failure_in_one_release_pass_does_not_reach_a_later_pass_in_the_same_tick`, `test_a_failed_intent_read_does_not_stop_the_same_reservations_release_tail`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_release_tail_upstream_failure_releases_every_other_allocation`); `services/execution/tests/test_wiring_retry_upstream_isolation.py` (`test_l2_superseded_allocation_release_failure_keeps_the_outcomes`, `test_manual_retry_superseded_release_switch_read_failure_reports_the_outcome`, `test_l2_apply_tail_delete_read_failure_is_not_a_reservation_skip`)
 - **WIRE-VLAN-13.** Only `TransientUpstreamError` is caught that way: any other
   exception from the switch read of an allocation's delete propagates out of the pass,
   that allocation stays released with its switches listed, and the allocations after it
