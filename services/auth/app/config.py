@@ -56,9 +56,13 @@ class Settings(HerdBaseSettings):
     superadmin_password: str = ""
 
     # Authentication backend: "local" uses bcrypt-hashed passwords stored in the
-    # users table; "ldap" binds against the configured directory server instead.
-    # The toggle is global: only one backend is active at a time.
-    auth_method: Literal["local", "ldap"] = "local"
+    # users table; "ldap" binds against the configured directory server instead;
+    # "oidc" signs users in through an OpenID Connect provider (ADR 0016). The
+    # toggle is global: only one backend is active at a time. "oidc" is
+    # admitted since ADR 0016 phase 5b, so the stack tests can run auth in that
+    # mode; it is not yet supported for operators (absent from the config page
+    # and the handbook until phase 6).
+    auth_method: Literal["local", "ldap", "oidc"] = "local"
 
     # LDAP / Active Directory settings. Only consulted when auth_method == "ldap".
     ldap_server_url: str = ""
@@ -119,8 +123,8 @@ class Settings(HerdBaseSettings):
     ldap_ca_cert: str = ""
 
     # OpenID Connect single sign-on (ADR 0016, issue #37). Consulted only when
-    # auth_method == "oidc", which auth_method above does not admit yet: the
-    # feature stays dark until ADR 0016 phase 6 widens it. Incomplete settings
+    # auth_method == "oidc", which an operator reaches only by setting
+    # AUTH_METHOD by hand until ADR 0016 phase 6 supports it. Incomplete settings
     # never stop auth from booting (the LDAP precedent); see
     # oidc_configuration_problems and log_oidc_startup_warnings below.
     oidc_issuer: str = ""
@@ -327,8 +331,7 @@ def log_oidc_startup_warnings(config: Settings) -> list[str]:
     - `oidc_https_not_required` when OIDC_REQUIRE_HTTPS is false;
     - `oidc_break_glass_enabled` when OIDC_BREAK_GLASS_LOCAL_SUPERADMIN is true.
 
-    `app.main.lifespan` calls this at startup; until auth_method admits "oidc"
-    (ADR 0016 phase 6) it never fires outside tests.
+    `app.main.lifespan` calls this at startup.
     """
     if config.auth_method != "oidc":
         return []

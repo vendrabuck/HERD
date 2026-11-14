@@ -1287,7 +1287,7 @@ def test_the_dataclasses_are_frozen():
             setattr(obj, name, "x")
 
 
-# --- dark by construction, and incomplete settings ---
+# --- off outside OIDC mode, and incomplete settings ---
 
 
 @pytest.mark.parametrize("mode", ["local", "ldap"])

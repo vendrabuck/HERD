@@ -1944,7 +1944,9 @@ deployment.
 in the request body, mirroring `/login` and `/refresh`. `GET /api/auth/login-options`
 tells the login page which sign-in methods the deployment offers, in every mode. The
 three `/api/auth/oidc/` routes (single sign-on, ADR 0016) answer 404 unless
-`AUTH_METHOD=oidc`, which no deployment can select until ADR 0016 phase 6; they take no
+`AUTH_METHOD=oidc`, which auth accepts when set by hand in the environment since ADR 0016
+phase 5b but which is not yet supported for operators (absent from the config page and
+the handbook until phase 6); they take no
 bearer token, and the callback and the exchange act only for a browser holding the
 one-time cookie the previous step set. `PATCH /api/reservations/{id}`
 is owner-scoped: any authenticated user may call it, but the update only ever applies to

@@ -78,7 +78,7 @@ Read once at startup to create the seeded superadmin. Ignored on subsequent rest
 | `AUTH_ALGORITHM` | `HS256` | JWT signing algorithm: `HS256`, `HS384`, or `HS512`. Any other value, RS* included, is refused at startup with `AUTH_ALGORITHM must be one of HS256, HS384, HS512`, and the config UI refuses to save one. |
 | `AUTH_ACCESS_TOKEN_EXPIRE_MINUTES` | `30` | Access token lifetime. |
 | `AUTH_REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Refresh token lifetime. |
-| `AUTH_METHOD` | `local` | Authentication backend. `local` uses bcrypt-hashed passwords in the HERD database; `ldap` binds against the directory server configured below. Only one is active at a time. |
+| `AUTH_METHOD` | `local` | Authentication backend. `local` uses bcrypt-hashed passwords in the HERD database; `ldap` binds against the directory server configured below. Only one is active at a time. Auth also accepts `oidc` (OpenID Connect single sign-on, below), which is not yet supported for operators: the config page does not offer it, and a UI-saved `config.json` outranks the environment. |
 
 ## LDAP / Active Directory
 
@@ -139,16 +139,18 @@ LDAP_USE_TLS=true
 
 ## OpenID Connect single sign-on
 
-Not active yet. These settings belong to OpenID Connect single sign-on (ADR 0016,
-`docs/design/0016-oidc-single-sign-on.md`, issue #37), which is being built in
-phases: the auth service reads them today, but `AUTH_METHOD` does not accept `oidc`
-until the feature ships, so setting them to well-formed values changes nothing.
-One carve-out applies in every mode, today included: three of them are validated
+Not supported for operators yet. These settings belong to OpenID Connect single
+sign-on (ADR 0016, `docs/design/0016-oidc-single-sign-on.md`, issue #37), which is
+being built in phases. Auth accepts `AUTH_METHOD=oidc` when it is set by hand in the
+environment (since ADR 0016 phase 5b, so the gates and nightly can run the stack in
+that mode), but the config page does not offer it and the handbook does not describe
+it until phase 6; in any other mode, setting these to well-formed values changes
+nothing. One carve-out applies in every mode: three of them are validated
 when auth loads its settings, and a refused value stops auth from starting, as a
 refused `AUTH_ALGORITHM` does. They are `OIDC_ID_TOKEN_ALGORITHM` with a value
 outside the list below, and `OIDC_REQUIRE_HTTPS` or
-`OIDC_BREAK_GLASS_LOCAL_SUPERADMIN` with a value that is not a boolean. Once the
-feature ships the others are consulted only when `AUTH_METHOD=oidc`, and incomplete
+`OIDC_BREAK_GLASS_LOCAL_SUPERADMIN` with a value that is not a boolean. The others
+are consulted only when `AUTH_METHOD=oidc`, and incomplete
 or invalid values of them in that mode never stop auth from booting: auth logs one
 startup warning naming the variables (never their values), and single sign-on
 answers unavailable until they are fixed. Fixed in code, not settings: discovery

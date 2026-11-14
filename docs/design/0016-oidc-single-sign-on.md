@@ -886,10 +886,16 @@ username).
 
 ## Delivery phases
 
-Every phase is one PR that leaves main green and the feature dark: `oidc` is not a
-legal `AUTH_METHOD` value until phase 6, so no operator can reach the new code
-before then; tests reach it by setting `settings.auth_method` with `monkeypatch`, the
-way `services/auth/tests/test_auth_ldap.py` sets `ldap`. Every phase updates
+Every phase is one PR that leaves main green and the feature dark: as planned, `oidc`
+was not a legal `AUTH_METHOD` value until phase 6, so no operator could reach the new
+code before then; unit and functional tests reach it by setting `settings.auth_method`
+with `monkeypatch`, the way `services/auth/tests/test_auth_ldap.py` sets `ldap`.
+Amended in phase 5b (decided by the owner on 2026-11-14): auth admits `oidc` from phase
+5b on, because phase 5b recreates the gate's auth service in that mode and auth refused
+to start with a value its `Literal` did not admit. From that merge the mode is reachable
+by an operator who sets `AUTH_METHOD=oidc` by hand in the environment; it is still
+absent from the config page and the handbook, and not supported for operators, until
+phase 6. See the phase 5b as-built notes. Every phase updates
 `CHANGELOG.md` (Unreleased) and, where it adds behavior or a route, the
 identity-and-access specification in the same PR with numbered rules (a new `IAM-OIDC`
 topic). Sizes are rough: S under 300 changed lines, M 300 to 900, L over 900, tests
@@ -908,7 +914,8 @@ included.
 - `services/auth/app/config.py`: all twelve settings of the Settings section,
   `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN` included (its field only; its behavior lands in
   phase 3), the algorithm `Literal`, and a startup-warning helper (missing settings,
-  `OIDC_REQUIRE_HTTPS=false`, break-glass on); `auth_method` is NOT widened.
+  `OIDC_REQUIRE_HTTPS=false`, break-glass on); `auth_method` is NOT widened (it was
+  widened later, in phase 5b, by owner decision).
 - `docker-compose.yml` (auth block), `.env.example`, `docs/ENV_VARS.md` (new OIDC
   section).
 - `services/auth/pyproject.toml` (`pyjwt[crypto]`), `services/common/pyproject.toml`
@@ -1041,6 +1048,21 @@ included.
   (phase 3) only, not against a running stack, because a second recreate of the gate
   auth service costs a full restart cycle for one branch; recorded in `docs/GAPS.md`.
 - Docs: `docs/specs/TESTING.md`, `docs/GAPS.md`.
+- As built, `auth_method` widened here (decided by the owner on 2026-11-14), moving
+  phase 6's first bullet into this phase: `services/auth/app/config.py` declares
+  `auth_method: Literal["local", "ldap", "oidc"]`, and
+  `services/auth/tests/test_oidc_settings.py` asserts that `AUTH_METHOD=oidc` loads and
+  that any other value is refused with the `Literal` error. Reason: this phase recreates
+  the gate's auth service with `AUTH_METHOD=oidc`, and auth refused to start with a
+  value its `Literal` did not admit (a `ValidationError` at import), so no stack-level
+  test could run before phase 6. The config service is not changed: its `AUTH_METHOD`
+  options stay `local` and `ldap`, so a UI-saved `config.json`, which outranks the
+  environment, can only name those two, and the gate's OIDC stack phase refuses to run
+  where one exists, as the LDAP stack phase does. Consequence, stated plainly: from this
+  merge an operator who sets `AUTH_METHOD=oidc` by hand reaches the mode before issues
+  #1399 (no recovery path when a first login collides, so an `OIDC_ISSUER` change locks
+  out every SSO user) and #1420 (the login page shows the password form while
+  `GET /login-options` is pending) are settled, so both block the 0.8.0 release.
 - As built, the lab's redirect URIs (decided by the owner on 2026-11-14): templated
   from the environment, so no tracked file names a host address. `dex.yaml` is a
   gomplate template for the static client's `redirectURIs`, rendered by the Dex
@@ -1059,7 +1081,8 @@ included.
 
 ### Phase 6: light up (M)
 
-- `services/auth/app/config.py`: `auth_method: Literal["local", "ldap", "oidc"]`.
+- `services/auth/app/config.py`: `auth_method: Literal["local", "ldap", "oidc"]`. Done
+  in phase 5b (owner decision, 2026-11-14); phase 6 keeps the rest of this list.
 - `services/config/app/config_schema.py`: the `oidc` option and the `OIDC` group;
   the config service's compose block gets the `OIDC_*` lines;
   `services/config/tests/` asserts the option, the group, and the compose pairing.
@@ -1081,7 +1104,7 @@ included.
 | 4 | this ADR's API table only | 1, 2, 3, 5a |
 | 5a | 1 | 2, 3, 4 |
 | 5b | 3, 4, 5a | none |
-| 6 | 5b | none |
+| 6 | 5b (which also widened `auth_method`) | none |
 
 Phases 1, 2, and 4 touch disjoint source files (phase 1: `config.py`,
 `oidc_service.py`, `jwt_codec.py`, the guard, compose, `.env.example`,
@@ -1125,7 +1148,9 @@ publication, and an IdP test container that speaks SAML.
 
 The first draft put five questions to the owner. All five were decided by the owner on
 2026-11-11, each as recommended; no owner question remains open. A sixth owner decision,
-the username rule (option C), was made before phase 3 and is the last row below. The one condition
+the username rule (option C), was made before phase 3; two more, the early `auth_method`
+widening and the lab's templated redirect URIs, were made in phase 5b; they are the last
+three rows below. The one condition
 that could return D12 to the owner, the phase 5a measurement, is met: Dex was the
 smallest and fastest of the three, and it passed the issuer-reachability proof, refused
 a wrong `code_verifier` (`invalid_grant`), accepted the right one, and echoed the
@@ -1139,3 +1164,5 @@ a wrong `code_verifier` (`invalid_grant`), accepted the right one, and echoed th
 | D10 active-method source | auth's public `GET /login-options`; config's `GET /status` unchanged, departing from the issue's wording because of staleness | endpoint in phase 3; login page and the LDAP-mode Register link in phase 4 |
 | D12 test IdP | Dex, measured and proved first | phase 5a, then 5b |
 | D4 username, option C (added in phase 3) | the username claim when it fits `^[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}$`, else the email when it fits, else the first login is refused | phase 3 |
+| `auth_method` widened early (added in phase 5b, 2026-11-14) | auth admits `oidc` from phase 5b, since the stack tests cannot recreate auth in a mode it refuses; the config page and handbook stay phase 6; issues #1399 and #1420 block the 0.8.0 release | phase 5b |
+| Lab redirect URIs (added in phase 5b, 2026-11-14) | templated from `HERD_GATEWAY_BIND`, no host address in a tracked file | phase 5b |
