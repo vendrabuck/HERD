@@ -205,6 +205,15 @@ nightly say nothing about them.
   nightly.yml boots the directory (`make ldap-up`) but never runs this suite. Target:
   a `make test-auth-ldap` step in `.github/workflows/nightly.yml` after the
   existing `make ldap-up` step.
+- **[MEDIUM] Live OIDC auth suite.** `services/auth/tests/test_oidc_service_live.py`
+  (7 tests, ADR 0016 phase 5a) skips through its module `pytestmark` unless
+  `HERD_TEST_OIDC_REQUIRED` is set or a provider answers at
+  `HERD_TEST_OIDC_HOST`/`HERD_TEST_OIDC_PORT`. It runs only through `make
+  test-auth-oidc`, which `make master` and `make everything` call through
+  `_gate-oidc-tests`. No workflow boots `infra/oidc-test`, so ci.yml's backend job
+  skips it and nightly.yml never runs it. Target: ADR 0016 phase 5b, which adds the
+  provider's start and stop steps to `.github/workflows/nightly.yml`; a step there
+  running `make test-auth-oidc` closes this gap.
 - **[LOW] Live OpenAI-compatible provider smoke.**
   `services/ai-orchestrator/tests/integration/test_vllm_live.py` (2 tests) skips
   through its module `pytestmark` unless `HERD_VLLM_BASE_URL` is set; no workflow,

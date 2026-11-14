@@ -591,13 +591,16 @@ signed tokens.
 
 | Candidate | For | Against |
 |---|---|---|
-| Keycloak | most realistic, every feature | heaviest image and slowest start of the three (to be measured in phase 5a before it is ruled out on numbers), realm-import JSON to maintain |
-| Dex | real provider, small and fast to start (to be measured), static-password login form, YAML config | fixed users per config file; claim names to confirm (`preferred_username` versus `name`, settable through `OIDC_USERNAME_CLAIM`) |
-| navikt/mock-oauth2-server | programmable claims per request, fast | a mock: whether it enforces PKCE was not verified for this ADR, and a lenient IdP hides exactly the defects the live tier exists to catch; acceptable fallback only if phase 5a confirms PKCE and nonce enforcement |
+| Keycloak | most realistic, every feature | heaviest image and slowest start of the three (measured in phase 5a: 265.0 MB download for 26.8.2, 17.5 s to 17.9 s from container start to a discovery answer in `start-dev`), realm-import JSON to maintain |
+| Dex | real provider, small and fast to start (measured in phase 5a: 50.5 MB download for v2.46.1, 0.26 s to 0.34 s from container start to a discovery answer), static-password login form, YAML config | fixed users per config file; claim names confirmed in phase 5a: Dex emits `sub`, `email`, `email_verified`, `name` (from a static user's `name`, else its `username`), and `preferred_username` (from `preferredUsername`), so the default `OIDC_USERNAME_CLAIM=preferred_username` needs no change |
+| navikt/mock-oauth2-server | programmable claims per request, fast | a mock: whether it enforces PKCE was not verified for this ADR (phase 5a measured 149.0 MB and 1.2 s, and its discovery advertises `plain` beside `S256`; its enforcement stayed untested, since Dex passed), and a lenient IdP hides exactly the defects the live tier exists to catch; acceptable fallback only if phase 5a confirms PKCE and nonce enforcement |
 
 Issuer reachability is the hard constraint: the issuer URL must be identical for the
 auth container (discovery, token, JWKS) and for the browser. Recommended mechanism,
-proved in phase 5a: Dex joins the gate stack network with the alias `oidc-test` (the
+proved in phase 5a on a throwaway network (a container using the alias `oidc-test`
+and a host-side client mapping the name to the published address fetched
+byte-identical discovery documents naming the same issuer; joining the gate network
+itself is phase 5b's step): Dex joins the gate stack network with the alias `oidc-test` (the
 `docker network connect` step `_gate-ldap-stack-tests` uses for `ldap-test`) and
 publishes its port on `${HERD_GATEWAY_BIND}`; the issuer is
 `http://oidc-test:5556/dex`; the host-side Playwright browser maps the name with the
@@ -1014,6 +1017,13 @@ included.
   owner with the numbers.
 - Docs: `docs/specs/TESTING.md` (an OIDC test directory section beside the LDAP one),
   `docs/specs/DEVELOPMENT.md` (targets).
+- As built: Dex v2.46.1 pinned by digest; the lab sets `oauth2.pkce.enforce: true` with
+  S256 as the only method, stricter than Dex's default (which accepts an authorization
+  request without a challenge and offers `plain`), so a HERD that stopped sending PKCE
+  fails the live suite; the lab enables only the `authorization_code` grant. The live
+  suite reaches the issuer from the host through `oidc_service.transport`, which maps
+  `oidc-test` to the published address. `docs/specs/TESTING.md` ("OIDC test provider")
+  has the measurement table, the fixtures, and the mutation record.
 
 ### Phase 5b: stack integration, load, and browser e2e (M)
 
@@ -1101,7 +1111,10 @@ publication, and an IdP test container that speaks SAML.
 The first draft put five questions to the owner. All five were decided by the owner on
 2026-11-11, each as recommended; no owner question remains open. A sixth owner decision,
 the username rule (option C), was made before phase 3 and is the last row below. The one condition
-still pending is the phase 5a measurement, which can return D12 to the owner.
+that could return D12 to the owner, the phase 5a measurement, is met: Dex was the
+smallest and fastest of the three, and it passed the issuer-reachability proof, refused
+a wrong `code_verifier` (`invalid_grant`), accepted the right one, and echoed the
+`nonce` in the ID token.
 
 | Decision | Outcome | Lands in |
 |---|---|---|
