@@ -28,12 +28,33 @@ def _bootstrap_marker_file() -> str:
     return os.path.join(DATA_DIR, "config.bootstrapped")
 
 
+# bcrypt reads at most 72 bytes of a password. bcrypt 4.0.1 dropped the rest
+# silently; bcrypt 5 raises instead, so the cut is explicit (#1355) and every
+# stored hash keeps verifying with exactly the passwords it accepted before.
+BCRYPT_MAX_BYTES = 72
+BCRYPT_ROUNDS = 12
+UNUSABLE_HASH_MESSAGE = "Config auth file holds no usable password hash; login refused"
+
+
+def _password_bytes(password: str) -> bytes:
+    return password.encode()[:BCRYPT_MAX_BYTES]
+
+
 def _hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    return bcrypt.hashpw(_password_bytes(password), bcrypt.gensalt(BCRYPT_ROUNDS)).decode()
 
 
-def _check_password(password: str, hashed: str) -> bool:
-    return bcrypt.checkpw(password.encode(), hashed.encode())
+def _check_password(password: str, hashed: object) -> bool:
+    """True when `password` matches `hashed`; False, never an exception, for a
+    stored value bcrypt cannot read (logged by class name, never the value)."""
+    if not isinstance(hashed, str):
+        logger.error("%s (%s)", UNUSABLE_HASH_MESSAGE, type(hashed).__name__)
+        return False
+    try:
+        return bcrypt.checkpw(_password_bytes(password), hashed.encode())
+    except ValueError as exc:
+        logger.error("%s (%s)", UNUSABLE_HASH_MESSAGE, type(exc).__name__)
+        return False
 
 
 # -- Auth file --
@@ -100,7 +121,10 @@ def verify_password(password: str) -> bool:
     except ConfigAuthError:
         # Fail closed: deny login when the auth file is present but corrupt.
         return False
-    return _check_password(password, auth["password_hash"])
+    # A file that parses but holds no hash (not an object, or the key missing)
+    # fails closed the same way.
+    stored = auth.get("password_hash") if isinstance(auth, dict) else None
+    return _check_password(password, stored)
 
 
 def change_password(new_password: str) -> None:

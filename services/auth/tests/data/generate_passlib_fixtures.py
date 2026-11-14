@@ -161,7 +161,9 @@ def main() -> None:
     for rounds in (4, 5, 6, 8, 10, 11):
         stored = passlib_bcrypt.using(rounds=rounds).hash("ascii-at-another-cost")
         cases.append(_case("cost", f"rounds {rounds}/self", FAST, "ascii-at-another-cost", stored))
-        cases.append(_case("cost", f"rounds {rounds}/wrong", FAST, "ascii-at-another-cost!", stored))
+        cases.append(
+            _case("cost", f"rounds {rounds}/wrong", FAST, "ascii-at-another-cost!", stored)
+        )
 
     # 6. Malformed stored values derived from one valid hash.
     pw = "malformed-base"
@@ -200,9 +202,13 @@ def main() -> None:
         stored = passlib_bcrypt.using(ident=ident, rounds=4).hash("padding")
         for ch in BCRYPT64:
             salt_variant = stored[:28] + ch + stored[29:]
-            cases.append(_case("padding", f"${ident}$/salt_final={ch}", FAST, "padding", salt_variant))
+            cases.append(
+                _case("padding", f"${ident}$/salt_final={ch}", FAST, "padding", salt_variant)
+            )
             sum_variant = stored[:-1] + ch
-            cases.append(_case("padding", f"${ident}$/checksum_final={ch}", FAST, "padding", sum_variant))
+            cases.append(
+                _case("padding", f"${ident}$/checksum_final={ch}", FAST, "padding", sum_variant)
+            )
 
     # Store each distinct password once; a case names it by key.
     passwords: dict[str, str] = {}

@@ -133,7 +133,9 @@ def main() -> None:
         cases.append(_case("malformed", label, pw, stored))
     stored = _old_hash("padding", 4)
     for ch in BCRYPT64:
-        cases.append(_case("padding", f"salt_final={ch}", "padding", stored[:28] + ch + stored[29:]))
+        cases.append(
+            _case("padding", f"salt_final={ch}", "padding", stored[:28] + ch + stored[29:])
+        )
         cases.append(_case("padding", f"checksum_final={ch}", "padding", stored[:-1] + ch))
 
     passwords: dict[str, str] = {}
