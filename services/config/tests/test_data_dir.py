@@ -154,8 +154,54 @@ async def test_a_refused_write_is_503_with_the_fixed_detail(tmp_config_dir, asyn
     assert not os.path.exists(config_store.CONFIG_FILE)
 
 
-async def test_a_first_login_that_cannot_write_the_auth_file_is_503(tmp_config_dir, async_client):
+@pytest.fixture
+def hash_calls(monkeypatch):
+    """Count bcrypt hashes; the generated-password path hashes before it writes."""
+    calls = []
+    real = config_store.bcrypt.hashpw
+
+    def counting(password, salt):
+        calls.append(1)
+        return real(password, salt)
+
+    monkeypatch.setattr(config_store.bcrypt, "hashpw", counting)
+    return calls
+
+
+async def test_status_with_no_auth_file_on_a_read_only_directory_generates_nothing(
+    tmp_config_dir, async_client, monkeypatch, caplog, hash_calls
+):
+    # No CONFIG_ADMIN_PASSWORD: the missing-file branch would generate, log, and hash
+    # a one-time password it could never store.
+    monkeypatch.delenv("CONFIG_ADMIN_PASSWORD", raising=False)
+    caplog.set_level(logging.DEBUG)
+
+    with _read_only(tmp_config_dir):
+        answers = [await async_client.get("/status") for _ in range(5)]
+
+    for answer in answers:
+        assert (answer.status_code, answer.json()) == (
+            200,
+            {"configured": False, "password_changed": False},
+        )
+    assert hash_calls == []
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert not any("password" in r.getMessage() for r in caplog.records)
+    assert not os.path.exists(config_store.AUTH_FILE)
+
+
+async def test_a_first_login_that_cannot_write_the_auth_file_is_503(
+    tmp_config_dir, async_client, monkeypatch, caplog, hash_calls
+):
+    monkeypatch.delenv("CONFIG_ADMIN_PASSWORD", raising=False)
+    caplog.set_level(logging.DEBUG)
+
     with _read_only(tmp_config_dir):
         response = await async_client.post("/login", json={"password": "test-config-pass"})
 
     assert (response.status_code, response.json()) == (503, {"detail": DETAIL})
+    assert hash_calls == []
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == [
+        f"{_expected_remedy(tmp_config_dir)} (DataDirNotWritable)"
+    ]
+    assert not any("generated" in r.getMessage() for r in caplog.records)

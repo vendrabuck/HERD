@@ -73,18 +73,25 @@ later), and nothing else:
 - `GET /v1.44/containers/json` with exactly the filter
   `{"label":["com.docker.compose.project=P"]}`;
 - `POST /v1.44/containers/<id>/restart?t=30` for each listed container whose own
-  labels name project P and a service in the allowlist A (D3), where `<id>` must be
-  64 lowercase hex characters, in service order.
+  labels name project P and a service in the allowlist A (D3) and that is not a
+  one-off container (`com.docker.compose.oneoff=True`), where `<id>` must be 64
+  lowercase hex characters, in service order. Every replica of a service is
+  restarted; the answer's `restarted` names each service once, sorted, when every one
+  of its containers restarted, and each container that did not adds one `errors`
+  entry.
 
-It reads each daemon answer within one deadline (10 seconds for the list, 60 for each
-restart), so a hung or slow daemon cannot hold the single-flight lock past a bounded
-worst case (670 seconds with eleven services). Its errors keep the class-name-only
-wording the config service used (`Cannot connect to Docker: <Class>`,
-`Cannot list containers: <Class>`, `Failed to restart <service>: <Class>`).
+It reads each daemon answer within its own deadline (10 seconds for the list, 60 for
+each restart), and no call runs past one deadline for the whole pass, a fixed 660
+seconds however many containers match; a container not reached by then is reported as
+`Failed to restart <service>: PassDeadlineExceeded`. So a hung or slow daemon cannot
+hold the single-flight lock past 660 seconds plus the time to write the answer. Its
+errors keep the class-name-only wording the config service used
+(`Cannot connect to Docker: <Class>`, `Cannot list containers: <Class>`,
+`Failed to restart <service>: <Class>`).
 
 The config service's `docker_ctl.py` becomes a standard-library HTTP client of
 `http://restarter:8000/restart`, with a 720 second timeout (above the restarter's
-worst case). It passes a 200 through only when the body is exactly
+660 second pass deadline). It passes a 200 through only when the body is exactly
 `{restarted, errors}` with two lists of short printable strings, and otherwise answers
 a fixed sentence: `Cannot reach the restart service: <Class>`,
 `The restart service answered HTTP <status>`,
@@ -140,8 +147,11 @@ instead:
   CHANGELOG;
 - at startup the service checks that it can write the data directory and its files;
   when it cannot, it logs ONE error line naming the directory, its uid, and that
-  command, skips the first-boot bootstrap (which writes), and keeps serving reads;
-- a write the directory then refuses is 503
+  command, and skips the first-boot bootstrap (which writes); `GET /status` and
+  `GET /schema` still answer, and with no auth file the status reports the password
+  not rotated without generating, hashing, or logging one;
+- a write the directory then refuses, and a login that would have to create the auth
+  file, is 503
   `The config data directory is not writable; the config service log names the one-time fix`,
   never a 500, and the log line repeats the remedy.
 
@@ -170,6 +180,7 @@ Let D(c) be the set of Docker API requests a process in container c can cause.
 | Nothing in a restarter request (query, body, headers, path suffix) reaches a Docker call | `infra/restarter/tests/test_restarter_http.py` (`test_no_request_parameter_reaches_docker`, `test_any_other_path_is_404_and_reaches_no_docker_call`) |
 | The restarter's Docker requests are a subset of {the list with exactly the project filter, a restart of a 64-hex id with `t=30`}, and the restarted ids are exactly A intersected with containers(P) | `infra/restarter/tests/test_restarter_docker.py` (`test_restarts_exactly_the_allowlist_within_the_project`, `test_an_odd_container_id_never_reaches_a_path`) |
 | An unset or blank project makes no Docker request | `infra/restarter/tests/test_restarter_docker.py` (`test_unset_or_blank_project_refuses_with_no_docker_request`) |
+| A pass ends by one fixed deadline whatever the number of containers, under the config client's timeout | `infra/restarter/tests/test_restarter_docker.py` (`test_the_whole_pass_ends_at_the_pass_deadline_however_many_containers_match`); `tests/unit/test_restarter_compose_guard.py` (`test_config_client_outlasts_the_restarters_worst_case`) |
 | One restart pass at a time | `infra/restarter/tests/test_restarter_http.py` (`test_single_flight_under_twenty_concurrent_calls`) |
 | Socket holders in both compose files are exactly {restarter, traefik} | `tests/unit/test_restarter_compose_guard.py` (`test_socket_holders_are_exactly_restarter_and_traefik`) |
 | The restarter is on `herd-ctl` only, with no ports and no `traefik.*` label; only config and restarter join `herd-ctl`, which is internal | `tests/unit/test_restarter_compose_guard.py` (`test_restarter_is_on_herd_ctl_only_with_no_ports_or_gateway_route`, `test_only_config_and_restarter_join_the_internal_herd_ctl`) |
@@ -232,4 +243,9 @@ Let D(c) be the set of Docker API requests a process in container c can cause.
   invariant and guard, not a parameter on `POST /restart`);
 - the deployment moves to rootless Docker (the socket then belongs to the rootless
   user, and D7's reasoning changes) or off Compose;
+- the daemon runs with userns-remap: the restarter's uid 0 then maps to an
+  unprivileged host uid that does not own the socket, so D7's reasoning no longer
+  holds and the restart fails until it is revisited;
+- Docker raises its minimum API version above the pinned `v1.44`: every restart then
+  fails with `Cannot list containers: DockerAPIError` until `DOCKER_API_VERSION` moves;
 - issue #1424 lands and Traefik's socket goes behind a read-only proxy.

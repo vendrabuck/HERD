@@ -1,6 +1,7 @@
 # The restarter (issue #1326, ADR 0017): the one HERD process that holds the Docker
-# socket. Standard library only, so the image is the services' Python base and one
-# file; no package is installed.
+# socket. Standard library only, so the image is the services' Python base (tag and
+# digest, pinned equal by tests/unit/test_uv_pins.py) and one file; no package is
+# installed.
 #
 # It runs as root, by decision: the host socket is owned by root (mode 0660, group
 # docker), so uid 0 opens it with no capability, and a non-root user with the docker

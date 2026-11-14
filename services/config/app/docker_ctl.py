@@ -30,9 +30,9 @@ logger = logging.getLogger(__name__)
 RESTARTER_HOST = "restarter"
 RESTARTER_PORT = 8000
 RESTART_PATH = "/restart"
-# Above the restarter's worst case (its WORST_CASE_SECONDS, 670 s: the list plus a
-# 60 s deadline for each of eleven restarts), so the restarter, not this client, is
-# the one that gives up. tests/unit/test_restarter_compose_guard.py pins the order.
+# Above the restarter's PASS_DEADLINE_SECONDS (660 s, one deadline for its whole
+# pass however many containers match), so the restarter, not this client, is the one
+# that gives up. tests/unit/test_restarter_compose_guard.py pins the order.
 RESTART_TIMEOUT_SECONDS = 720.0
 
 IN_PROGRESS_ERROR = "A restart is already in progress"

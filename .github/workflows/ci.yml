@@ -95,8 +95,9 @@ jobs:
 
       # Single pass: pytest runs once with coverage across every service in the
       # Makefile's SERVICES list (plus the repo-root tests/unit suite and the
-      # restarter's suite via the test-root and test-restarter prerequisites). This is the pass/fail signal AND the artifact
-      # source, so a new service is covered automatically with no edit here.
+      # restarter's suite via the test-root and coverage-restarter prerequisites).
+      # This is the pass/fail signal AND the artifact source, so a new service is
+      # covered automatically with no edit here.
       # -j4 matches the 4 vCPUs on ubuntu-latest; -Otarget keeps each suite's
       # output contiguous so failures stay readable.
       - name: Backend unit tests + coverage (all services)

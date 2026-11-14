@@ -55,6 +55,8 @@ class FakeDaemon:
     list_chunked: bool = False
     restart_status: dict = field(default_factory=dict)  # id to status, default 204
     list_gate: threading.Event | None = None  # the list answer waits for this
+    restart_hang: set = field(default_factory=set)  # ids whose restart never answers
+    hang_release: threading.Event = field(default_factory=threading.Event)
     list_entered: threading.Event = field(default_factory=threading.Event)
     requests: list = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -148,6 +150,9 @@ def _daemon_handler(daemon: FakeDaemon):
         def do_POST(self):
             parsed = self._record()
             cid = parsed.path.split("/")[3] if parsed.path.count("/") >= 4 else ""
+            if cid in daemon.restart_hang:
+                daemon.hang_release.wait(30)
+                return
             status = daemon.restart_status.get(cid, 204)
             body = b"" if status == 204 else b'{"message":"daemon secret text /var/lib/x"}'
             self._answer(status, body)

@@ -6,9 +6,12 @@ this checks what Docker actually built from them, without restarting anything:
 - the config container has no Docker socket and does not run as root;
 - from config, the restarter answers on herd-ctl (its health route, and 404 for any
   other path), so the one link Save and Restart needs is up;
-- from auth, a service on herd-net only, the name `restarter` does not resolve;
-- through the gateway, no route reaches the restarter: the frontend's catch-all
-  answers `/api/restarter/health` with the page, not the restarter's JSON.
+- from auth, a service on herd-net only, the name `restarter` does not resolve.
+
+That the gateway has no route to the restarter is not checked here: Traefik cannot
+reach herd-ctl even with labels, so a request through the gateway would pass either
+way. tests/unit/test_restarter_compose_guard.py pins the cause instead (no `traefik.*`
+label, no port, no network but herd-ctl).
 
 It never sends `POST /restart`: that bounces the stack, and runs only in nightly.yml's
 last step (tests/e2e/test_config_playwright.py, test_config_save_and_restart_gated).
@@ -20,15 +23,11 @@ the project, as tests/integration/conftest.py's `_psql` does.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 
-import httpx
 import pytest
 
 from .conftest import REPO_ROOT
-
-GATEWAY = os.getenv("HERD_BASE_URL", "https://localhost/api").rsplit("/api", 1)[0]
 
 _PROBE = (
     "import json, urllib.request, urllib.error\n"
@@ -81,16 +80,3 @@ def test_a_herd_net_only_service_cannot_resolve_the_restarter():
     probe = _exec("auth", "python", "-c", _RESOLVE)
     assert probe.returncode == 0, probe.stderr
     assert probe.stdout.strip() == "UNRESOLVED"
-
-
-def test_the_gateway_has_no_route_to_the_restarter():
-    with httpx.Client(verify=False, timeout=15.0) as client:
-        response = client.get(f"{GATEWAY}/api/restarter/health")
-    is_restarter = False
-    if "application/json" in response.headers.get("content-type", ""):
-        try:
-            body = response.json()
-        except ValueError:
-            body = None
-        is_restarter = isinstance(body, dict) and body.get("service") == "restarter"
-    assert not is_restarter, response.text[:200]

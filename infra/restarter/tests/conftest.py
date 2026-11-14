@@ -21,6 +21,7 @@ def daemon(tmp_path):
     yield fake
     if fake.list_gate is not None:
         fake.list_gate.set()
+    fake.hang_release.set()
     server.shutdown()
     server.server_close()
 

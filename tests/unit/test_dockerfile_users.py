@@ -5,12 +5,16 @@ service ran as root; the other eleven service images switch to `appuser`. This g
 reads every `services/*/Dockerfile` and the restarter's `infra/restarter/Dockerfile`
 and fails when the user the final stage runs as is root.
 
-The user is the argument of the last `USER` instruction of the final stage (the stage
-the image ships; a `USER` in an earlier build stage does not carry over). Root is: no
-`USER` in the final stage, a user part (before any `:`) of `root` or `0`, or a user
-spelled through a variable (`${U}`, refused because it cannot be judged as text).
-Instructions are read with `dockerfile_stages` from tests/unit/test_build_args_wiring.py
-(continuations joined, comments dropped, a new stage at every FROM).
+The user of a stage is the argument of its last `USER` instruction. A stage with no
+`USER` inherits the user of the stage its `FROM` names when that is an earlier stage of
+the same file (by its `AS` name, matched without regard to case, or by its index),
+followed through every such link; a stage built `FROM` an image starts as root. The
+image runs as the user of its final stage. That user is root when it is `root`, a
+number equal to zero however written (`0`, `00`, `0000`), empty, or spelled through a
+variable (`${U}`, refused because it cannot be judged as text); only the part before
+any `:` is judged. Instructions are read with `dockerfile_stages` from
+tests/unit/test_build_args_wiring.py (continuations joined, comments dropped, a new
+stage at every FROM).
 
 Exemptions are by path, each with its reason, in ROOT_EXEMPT. An exempt image must
 still run as root, so an exemption that no longer applies fails until it is removed.
@@ -44,15 +48,46 @@ ROOT_EXEMPT = {
 }
 
 
-def runs_as_root(text: str) -> bool:
+def _stage_ref(from_args: str) -> str:
+    """The image or stage name a FROM names, flags and `AS <name>` dropped."""
+    words = [w for w in from_args.split() if not w.startswith("--")]
+    return words[0] if words else ""
+
+
+def _stage_name(from_args: str) -> str | None:
+    words = [w for w in from_args.split() if not w.startswith("--")]
+    if len(words) >= 3 and words[1].lower() == "as":
+        return words[2].lower()
+    return None
+
+
+def final_user(text: str) -> str | None:
+    """The user the final stage runs as, following FROM <earlier stage> links; None is root."""
     stages = dockerfile_stages(text)
-    if not stages:
+    names: dict[str, int] = {}
+    users: list[str | None] = []
+    for index, stage in enumerate(stages):
+        from_args = stage[0][2] if stage and stage[0][1] == "FROM" else ""
+        declared = [args for _, keyword, args in stage if keyword == "USER"]
+        if declared:
+            user = declared[-1]
+        else:
+            ref = _stage_ref(from_args).lower()
+            parent = names.get(ref, int(ref) if ref.isdigit() and int(ref) < index else None)
+            user = users[parent] if parent is not None else None
+        users.append(user)
+        name = _stage_name(from_args)
+        if name is not None:
+            names[name] = index
+    return users[-1] if users else None
+
+
+def runs_as_root(text: str) -> bool:
+    user = final_user(text)
+    if user is None:
         return True
-    users = [args for _, keyword, args in stages[-1] if keyword == "USER"]
-    if not users:
-        return True
-    user = users[-1].split(":", 1)[0].strip()
-    return user in ("root", "0", "") or "$" in user
+    name = user.split(":", 1)[0].strip()
+    return name in ("root", "") or (name.isdigit() and int(name) == 0) or "$" in name
 
 
 def _relative(path: Path) -> str:
@@ -93,6 +128,10 @@ def test_every_exemption_names_a_scanned_file():
         "FROM python:3\nUSER ${APP_USER}\n",
         "FROM python:3\n# USER appuser\n",
         "",
+        "FROM python:3\nUSER 00\n",
+        "FROM python:3\nUSER 0000:0\n",
+        "FROM python:3 AS base\nUSER appuser\nFROM base AS next\nUSER root\nFROM next\n",
+        "FROM python:3 AS base\nFROM base\nRUN true\n",
     ],
     ids=[
         "no-user",
@@ -105,6 +144,10 @@ def test_every_exemption_names_a_scanned_file():
         "variable",
         "commented-out",
         "empty",
+        "double-zero",
+        "zero-padded-with-group",
+        "inherits-root-through-a-chain",
+        "inherits-root-from-an-image-stage",
     ],
 )
 def test_reads_root(text):
@@ -120,8 +163,23 @@ def test_reads_root(text):
         "FROM python:3 AS build\nUSER root\nFROM python:3\nUSER appuser\n",
         "FROM python:3\nuser appuser\n",
         "FROM python:3\nUSER root\nRUN chown x\nUSER \\\n  appuser\n",
+        'FROM python:3 AS base\nUSER appuser\nFROM base\nCMD ["x"]\n',
+        "FROM python:3 AS Base\nUSER 1000\nFROM base AS mid\nRUN true\nFROM mid\n",
+        "FROM python:3\nUSER appuser\nFROM 0\n",
+        "FROM python:3\nUSER 1001\n",
     ],
-    ids=["name", "uid-gid", "name-group", "root-in-build-stage", "lower-case", "continued"],
+    ids=[
+        "name",
+        "uid-gid",
+        "name-group",
+        "root-in-build-stage",
+        "lower-case",
+        "continued",
+        "inherits-from-a-named-stage",
+        "inherits-through-a-chain",
+        "inherits-by-index",
+        "uid-1001",
+    ],
 )
 def test_reads_non_root(text):
     assert not runs_as_root(text)

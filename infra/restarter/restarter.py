@@ -17,16 +17,26 @@ What it asks Docker, and nothing else (API version fixed at DOCKER_API_VERSION):
   where P is HERD_COMPOSE_PROJECT from its own environment (compose sets it from
   COMPOSE_PROJECT_NAME). Unset or blank: it refuses and makes no Docker request.
 - `POST /v1.44/containers/<64 hex id>/restart?t=30`, once for each listed container
-  whose own labels name project P and a service in RESTART_SERVICES, in service order.
+  whose own labels name project P and a service in RESTART_SERVICES and that is not a
+  one-off container (`com.docker.compose.oneoff=True`, from `docker compose run`), in
+  service order. Every replica of a service is restarted.
 
-Errors name what failed and the exception class only; the exception text goes to the
-log (issue #1086). Standard library only: no third-party package, no herd_common.
+The answer's `restarted` names each service once, sorted, when every one of its
+containers restarted; each container that did not adds one `errors` entry. Errors
+name what failed and the exception class only; the exception text goes to the log
+(issue #1086). Standard library only: no third-party package, no herd_common.
 
-Limits: the Docker client reads a whole answer within one deadline per request
-(LIST_DEADLINE_SECONDS, RESTART_DEADLINE_SECONDS), so a hung or trickling daemon
-cannot hold the single-flight lock past WORST_CASE_SECONDS; the request side relies
-on http.server's own line limits (65536 bytes per line, at most 100 headers) plus
-MAX_REQUEST_HEADERS, MAX_REQUEST_BODY_BYTES, and a per-read socket timeout.
+Deadlines: each Docker answer is read whole within its own deadline
+(LIST_DEADLINE_SECONDS for the list, RESTART_DEADLINE_SECONDS for one restart), and
+neither runs past one deadline for the whole pass, PASS_DEADLINE_SECONDS, however many
+containers match. A container not reached by then is reported as
+`Failed to restart <service>: PassDeadlineExceeded`. So a hung or trickling daemon
+cannot hold the single-flight lock past PASS_DEADLINE_SECONDS plus the time to write
+the answer.
+
+Limits: the request side relies on http.server's own line limits (65536 bytes per
+line, at most 100 headers) plus MAX_REQUEST_HEADERS, MAX_REQUEST_BODY_BYTES, and a
+per-read socket timeout.
 """
 
 from __future__ import annotations
@@ -48,6 +58,7 @@ DOCKER_SOCKET = "/var/run/docker.sock"
 DOCKER_API_VERSION = "v1.44"
 PROJECT_LABEL = "com.docker.compose.project"
 SERVICE_LABEL = "com.docker.compose.service"
+ONEOFF_LABEL = "com.docker.compose.oneoff"
 PROJECT_ENV = "HERD_COMPOSE_PROJECT"
 
 # A: exactly the compose services that mount herd-config:/etc/herd:ro, the services
@@ -72,9 +83,10 @@ RESTART_SERVICES = frozenset(
 STOP_TIMEOUT_SECONDS = 30
 LIST_DEADLINE_SECONDS = 10.0
 RESTART_DEADLINE_SECONDS = STOP_TIMEOUT_SECONDS + 30.0
-# The longest one POST /restart can take; the config service's client timeout must
-# exceed it (tests/unit/test_restarter_compose_guard.py).
-WORST_CASE_SECONDS = LIST_DEADLINE_SECONDS + len(RESTART_SERVICES) * RESTART_DEADLINE_SECONDS
+# The longest one POST /restart can take, the list included, whatever the number of
+# containers; a fixed constant, not derived from the allowlist. The config service's
+# client timeout must exceed it (tests/unit/test_restarter_compose_guard.py).
+PASS_DEADLINE_SECONDS = 660.0
 MAX_DOCKER_RESPONSE_BYTES = 4 * 1024 * 1024
 
 LISTEN_PORT = 8000
@@ -103,6 +115,10 @@ class UnexpectedDockerResponse(Exception):
 
 class UnexpectedContainerId(Exception):
     """A listed container id is not 64 lowercase hex characters."""
+
+
+class PassDeadlineExceeded(Exception):
+    """The pass deadline passed before this container's restart was sent."""
 
 
 # -- Docker client: one request per connection, one deadline per request --
@@ -220,6 +236,11 @@ def _call(socket_path: str, method: str, target: str, deadline_seconds: float):
 
 def run_restart(project: str | None, socket_path: str = DOCKER_SOCKET) -> dict:
     """Restart RESTART_SERVICES within compose project `project`; never raises."""
+    pass_deadline = time.monotonic() + PASS_DEADLINE_SECONDS
+
+    def budget(limit: float) -> float:
+        return min(limit, pass_deadline - time.monotonic())
+
     result: dict = {"restarted": [], "errors": []}
     if project is None or not project.strip():
         logger.error(PROJECT_UNSET_ERROR)
@@ -231,14 +252,15 @@ def run_restart(project: str | None, socket_path: str = DOCKER_SOCKET) -> dict:
         f"/{DOCKER_API_VERSION}/containers/json?{urllib.parse.urlencode({'filters': filters})}"
     )
     try:
-        sock = _connect(socket_path, LIST_DEADLINE_SECONDS)
+        list_budget = budget(LIST_DEADLINE_SECONDS)
+        sock = _connect(socket_path, list_budget)
     except Exception as exc:
         result["errors"].append(f"Cannot connect to Docker: {type(exc).__name__}")
         logger.error("Cannot connect to Docker: %r", exc)
         return result
     try:
         try:
-            status, body = _exchange(sock, "GET", list_target, LIST_DEADLINE_SECONDS)
+            status, body = _exchange(sock, "GET", list_target, list_budget)
         finally:
             sock.close()
         if status != 200:
@@ -256,26 +278,34 @@ def run_restart(project: str | None, socket_path: str = DOCKER_SOCKET) -> dict:
         labels = item.get("Labels") if isinstance(item, dict) else None
         if not isinstance(labels, dict) or labels.get(PROJECT_LABEL) != project:
             continue
+        if labels.get(ONEOFF_LABEL) == "True":
+            continue
         service = labels.get(SERVICE_LABEL)
         if isinstance(service, str) and service in RESTART_SERVICES:
             targets.append((service, item.get("Id")))
     targets.sort(key=lambda target: (target[0], str(target[1])))
 
+    restarted, failed = set(), set()
     for service, container_id in targets:
         try:
             if not isinstance(container_id, str) or not _CONTAINER_ID.fullmatch(container_id):
                 raise UnexpectedContainerId(repr(container_id)[:100])
+            remaining = budget(RESTART_DEADLINE_SECONDS)
+            if remaining <= 0:
+                raise PassDeadlineExceeded(f"{PASS_DEADLINE_SECONDS} s pass deadline")
             target = (
                 f"/{DOCKER_API_VERSION}/containers/{container_id}/restart?t={STOP_TIMEOUT_SECONDS}"
             )
-            status, body = _call(socket_path, "POST", target, RESTART_DEADLINE_SECONDS)
+            status, body = _call(socket_path, "POST", target, remaining)
             if not 200 <= status < 300:
                 raise DockerAPIError(f"HTTP {status}: {body[:200]!r}")
-            result["restarted"].append(service)
-            logger.info("Restarted service: %s", service)
+            restarted.add(service)
+            logger.info("Restarted service: %s (container %s)", service, container_id[:12])
         except Exception as exc:
+            failed.add(service)
             result["errors"].append(f"Failed to restart {service}: {type(exc).__name__}")
             logger.error("Failed to restart %s: %r", service, exc)
+    result["restarted"] = sorted(restarted - failed)
     return result
 
 

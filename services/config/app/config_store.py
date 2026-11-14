@@ -19,6 +19,14 @@ class ConfigAuthError(Exception):
     """Raised when the config auth file exists but cannot be read/parsed."""
 
 
+class DataDirNotWritable(PermissionError):
+    """The auth file is missing and the data directory cannot take a new one.
+
+    A PermissionError, so a route that meets it answers main.py's 503; read paths
+    that can do without the file (is_password_changed) catch it instead.
+    """
+
+
 def _ensure_data_dir() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -108,8 +116,12 @@ def _default_auth() -> dict:
 
 
 def load_auth() -> dict:
-    _ensure_data_dir()
     if not os.path.exists(AUTH_FILE):
+        # Checked BEFORE a password is generated: on a directory that cannot keep
+        # the file, a generated password would be logged, never stored, and
+        # regenerated (with a bcrypt hash) on every call (issue #1326).
+        if not data_dir_writable():
+            raise DataDirNotWritable(f"cannot create {AUTH_FILE}")
         auth = _default_auth()
         _save_auth(auth)
         return auth
@@ -152,8 +164,9 @@ def change_password(new_password: str) -> None:
 def is_password_changed() -> bool:
     try:
         return load_auth().get("password_changed", False)
-    except ConfigAuthError:
-        # Keep the public /status endpoint up; report the safe default.
+    except (ConfigAuthError, DataDirNotWritable):
+        # Keep the public /status endpoint up; report the safe default. An
+        # unwritable directory with no auth file has no password yet.
         return False
 
 

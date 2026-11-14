@@ -246,7 +246,7 @@ def test_a_hung_daemon_times_out_within_the_deadline(daemon, monkeypatch):
 def test_a_trickling_daemon_is_cut_off_at_the_whole_answer_deadline(tmp_path, monkeypatch):
     # A per-read timeout alone would never fire here: a byte arrives every 0.1 s. The
     # deadline covers the whole answer, so the single-flight lock cannot be held past
-    # WORST_CASE_SECONDS by a slow daemon.
+    # PASS_DEADLINE_SECONDS by a slow daemon.
     monkeypatch.setattr(restarter, "LIST_DEADLINE_SECONDS", 0.6)
     path = str(tmp_path / "trickle.sock")
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -310,12 +310,96 @@ def test_restart_is_accepted_on_any_2xx_and_refused_otherwise(daemon):
     }
 
 
-def test_worst_case_covers_the_list_and_every_restart():
-    assert restarter.WORST_CASE_SECONDS == (
-        restarter.LIST_DEADLINE_SECONDS
-        + len(restarter.RESTART_SERVICES) * restarter.RESTART_DEADLINE_SECONDS
+def test_the_pass_deadline_is_a_fixed_constant_above_one_list_and_one_restart():
+    assert restarter.PASS_DEADLINE_SECONDS == 660.0
+    assert restarter.PASS_DEADLINE_SECONDS >= (
+        restarter.LIST_DEADLINE_SECONDS + restarter.RESTART_DEADLINE_SECONDS
     )
     assert restarter.RESTART_DEADLINE_SECONDS > restarter.STOP_TIMEOUT_SECONDS
+
+
+def _replica(service: str, n: int) -> dict:
+    return container(service, cid=f"{n:064x}")
+
+
+def test_every_replica_is_restarted_and_the_service_is_named_once(daemon):
+    replicas = [_replica("auth", n) for n in (1, 2, 3)]
+    daemon.containers = [*replicas, container("acl")]
+
+    result = restarter.run_restart(PROJECT, daemon.socket_path)
+
+    assert result == {"restarted": ["acl", "auth"], "errors": []}
+    assert sorted(daemon.restarted_ids()) == sorted(
+        [c["Id"] for c in replicas] + [container("acl")["Id"]]
+    )
+    _assert_every_request_is_allowed(daemon)
+
+
+def test_a_service_with_one_failed_replica_is_not_listed_as_restarted(daemon):
+    replicas = [_replica("auth", n) for n in (1, 2, 3)]
+    daemon.containers = replicas
+    daemon.restart_status[replicas[1]["Id"]] = 500
+
+    result = restarter.run_restart(PROJECT, daemon.socket_path)
+
+    assert result == {"restarted": [], "errors": ["Failed to restart auth: DockerAPIError"]}
+    assert len(daemon.restarted_ids()) == 3
+
+
+def test_a_one_off_container_is_never_restarted(daemon):
+    oneoff = container("auth", cid="a" * 64)
+    oneoff["Labels"][restarter.ONEOFF_LABEL] = "True"
+    service = container("auth", cid="b" * 64)
+    service["Labels"][restarter.ONEOFF_LABEL] = "False"
+    daemon.containers = [oneoff, service]
+
+    result = restarter.run_restart(PROJECT, daemon.socket_path)
+
+    assert result == {"restarted": ["auth"], "errors": []}
+    assert daemon.restarted_ids() == ["b" * 64]
+
+
+def test_the_whole_pass_ends_at_the_pass_deadline_however_many_containers_match(
+    daemon, monkeypatch
+):
+    # acl answers at once, the first auth replica never answers, and the containers
+    # after it are not reached before the pass deadline: one error per container, by
+    # class name, and the pass ends near the deadline, not after a full restart
+    # deadline per container.
+    # Each call alone would be allowed 3 s; the 0.6 s pass deadline must cut it short.
+    monkeypatch.setattr(restarter, "PASS_DEADLINE_SECONDS", 0.6)
+    monkeypatch.setattr(restarter, "RESTART_DEADLINE_SECONDS", 3.0)
+    replicas = [_replica("auth", n) for n in (1, 2, 3)]
+    daemon.containers = [container("acl"), *replicas, container("cabling")]
+    daemon.restart_hang = {replicas[0]["Id"]}
+
+    started = time.monotonic()
+    result = restarter.run_restart(PROJECT, daemon.socket_path)
+    elapsed = time.monotonic() - started
+
+    assert result == {
+        "restarted": ["acl"],
+        "errors": [
+            "Failed to restart auth: TimeoutError",
+            "Failed to restart auth: PassDeadlineExceeded",
+            "Failed to restart auth: PassDeadlineExceeded",
+            "Failed to restart cabling: PassDeadlineExceeded",
+        ],
+    }
+    assert daemon.restarted_ids() == [container("acl")["Id"], replicas[0]["Id"]]
+    assert elapsed < 1.8
+
+
+def test_a_pass_deadline_shorter_than_the_list_deadline_bounds_the_list(daemon, monkeypatch):
+    monkeypatch.setattr(restarter, "PASS_DEADLINE_SECONDS", 0.4)
+    daemon.list_gate = threading.Event()
+    daemon.containers = [container("auth")]
+
+    started = time.monotonic()
+    result = restarter.run_restart(PROJECT, daemon.socket_path)
+
+    assert result == {"restarted": [], "errors": ["Cannot list containers: TimeoutError"]}
+    assert time.monotonic() - started < 2.5
 
 
 def test_restarter_imports_only_the_standard_library():
