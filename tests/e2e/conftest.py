@@ -1125,7 +1125,10 @@ def _ensure_config_seeded():
             status_resp = client.get("/api/config/status")
             if status_resp.status_code == 200 and status_resp.json().get("configured"):
                 return
-            login_resp = client.post("/api/config/login", json={"password": "admin123!"})
+            login_resp = client.post(
+                "/api/config/login",
+                json={"password": os.environ.get("CONFIG_ADMIN_PASSWORD") or "admin123!"},
+            )
             if login_resp.status_code != 200:
                 return
             token = login_resp.json()["token"]

@@ -147,9 +147,11 @@ cp .env.example .env
 make up        # dev mode: hot-reload + volume mounts
 
 # Open https://localhost, click the wrench icon on the login page,
-# log in with the config password (set CONFIG_ADMIN_PASSWORD, or read the
-# one-time password from `docker compose logs config`), change it, fill out all
-# required fields, and click "Save and Restart".
+# log in with the config password, fill out all required fields, and click
+# "Save and Restart". The password is CONFIG_ADMIN_PASSWORD when you set it.
+# Left unset, `make up` uses the dev default admin123! (set your own on any
+# stack other machines can reach), and `make prod` generates a one-time
+# password: read it from `docker compose logs config` and change it first.
 ```
 
 **Option B: Configure via .env file**
