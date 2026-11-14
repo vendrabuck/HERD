@@ -737,6 +737,177 @@ async def test_l2_apply_tail_delete_read_failure_is_not_a_reservation_skip(caplo
     assert "hunter2" not in formatted and "10.9.8.7" not in formatted
 
 
+# --- A failure remembered by one release pass only (issue #1358 review) ----
+
+
+@contextmanager
+def _blip(once: set[uuid.UUID]):
+    """L2 upstream seam where each switch in `once` fails its FIRST device read only
+    (a blip: retryable for whoever saw it). Yields (reads, calls): reads maps a device
+    id to its read count, calls records (action, device_id) of every driver call."""
+    once_ids = {str(d) for d in once}
+    reads: dict[str, int] = {}
+    calls: list[tuple[str, str]] = []
+
+    async def _device(device_id, client=None):
+        key = str(device_id)
+        reads[key] = reads.get(key, 0) + 1
+        if key in once_ids and reads[key] == 1:
+            raise TransientUpstreamError(UPSTREAM_TEXT)
+        if key.startswith("dut-"):
+            return {"id": key, "name": "dut", "connection_type": "Server"}
+        return {
+            "id": key,
+            "name": "switch",
+            "template_id": "tmpl-1",
+            "driver_id": str(DRIVER_ID),
+            "driver_sha256": "sha256abc",
+            "driver_filename": "driver.zip",
+            "connection_type": "Layer 2 Switch",
+            "field_data": {"ip": "10.0.0.1"},
+        }
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        calls.append((action, context.get("HERD_device_id")))
+        return SUCCESS
+
+    with ExitStack() as stack:
+        for p in (
+            patch("app.services.nats_consumer._fetch_device", new=AsyncMock(side_effect=_device)),
+            patch(
+                "app.services.nats_consumer._fetch_template",
+                new=AsyncMock(return_value=TEMPLATE_DATA),
+            ),
+            patch(
+                "app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")
+            ),
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+        ):
+            stack.enter_context(p)
+        yield reads, calls
+
+
+def _deletes(calls) -> list[str]:
+    return sorted(device for action, device in calls if action == "delete_vlan")
+
+
+async def test_a_blip_in_one_reservations_apply_does_not_stop_anothers_superseded_delete():
+    """The review's scenario, through the real tick. Switch X blips once while
+    reservation A's L2 apply reads it (A is skipped for the tick, retryable). Later in
+    the same tick, C's superseded allocation, defined on X, is released. That release
+    pass reads X again (it never consults a failure from outside itself), the read
+    answers, delete_vlan runs on X, and C's defined_switch_ids is empty. Remembering
+    A's failure on the shared context instead would release C with X listed, a
+    definition no later pass would ever delete (WIRE-VLAN-12)."""
+    res_a = uuid.uuid4()
+    switch_x = uuid.uuid4()
+    a_ids = await _seed_release_rows("l2", res_a, [switch_x] * 2, created_at=OLD)
+    res_c, c_id = await _seed_superseded_cleanup_case(switch_x)
+    before = await _snapshot("l2")
+
+    with _blip({switch_x}) as (reads, calls):
+        stats = await run_wiring_retry_tick(_db_session_factory())
+
+    assert reads[str(switch_x)] == 2, "A's apply read X, then C's release read it again"
+    assert _deletes(calls) == [str(switch_x)]
+    after = await _snapshot("l2")
+    assert {i: after[i] for i in a_ids} == {i: before[i] for i in a_ids}, "A stays retryable"
+    assert after[c_id][0] == "RELEASED"
+    assert stats["skipped_upstream"] == 2
+    alloc_c = await _allocation_of(res_c)
+    assert (alloc_c.status, alloc_c.defined_switch_ids) == ("RELEASED", [])
+
+
+async def test_a_failure_in_one_release_pass_does_not_reach_a_later_pass_in_the_same_tick():
+    """The same tick, but the earlier failure happens INSIDE a release pass: A's
+    release row on a healthy member switch M is driven, and the release tail of A's
+    apply blips on X (A's allocation is also defined on X), so A's allocation is
+    released with X still listed. C's superseded allocation on X is then released by
+    a later pass on the same context: X is read again and its delete runs."""
+    res_a = uuid.uuid4()
+    member_m, switch_x = uuid.uuid4(), uuid.uuid4()
+    (a_id,) = await _seed_release_rows("l2", res_a, [member_m], created_at=OLD)
+    async with TestSessionLocal() as s:
+        await s.execute(
+            update(VlanAssignment)
+            .where(VlanAssignment.reservation_id == res_a)
+            .values(defined_switch_ids=[str(member_m), str(switch_x)])
+        )
+        await s.commit()
+    res_c, c_id = await _seed_superseded_cleanup_case(switch_x)
+
+    with _blip({switch_x}) as (reads, calls):
+        await run_wiring_retry_tick(_db_session_factory())
+
+    assert reads[str(switch_x)] == 2
+    assert _deletes(calls) == sorted([str(member_m), str(switch_x)])
+    alloc_a = await _allocation_of(res_a)
+    assert (alloc_a.status, alloc_a.defined_switch_ids) == ("RELEASED", [str(switch_x)])
+    alloc_c = await _allocation_of(res_c)
+    assert (alloc_c.status, alloc_c.defined_switch_ids) == ("RELEASED", [])
+    assert (await _snapshot("l2"))[a_id][0] == "RELEASED"
+
+
+async def test_a_failed_intent_read_does_not_stop_the_same_reservations_release_tail():
+    """One reservation, A: a FAILED build row on switch X and a FAILED release row on
+    member switch M, both on A's allocation, which is defined on M and X. The tick's
+    build-intent check reads X first and it blips: A's build row is left FAILED for the
+    tick. A's release row is still applied, and the release tail of that apply (a new
+    release pass) reads X again, so both deletes run and the allocation's
+    defined_switch_ids is empty. Inside a single apply a failed read escapes the apply
+    before its tail runs, so this is the reachable form of "an earlier failure for the
+    same reservation"."""
+    res_a = uuid.uuid4()
+    member_m, switch_x = uuid.uuid4(), uuid.uuid4()
+    (release_id,) = await _seed_release_rows("l2", res_a, [member_m], created_at=OLD)
+    async with TestSessionLocal() as s:
+        alloc = (
+            await s.execute(select(VlanAssignment).where(VlanAssignment.reservation_id == res_a))
+        ).scalar_one()
+        alloc.defined_switch_ids = [str(member_m), str(switch_x)]
+        build = L2PortAssignment(
+            reservation_id=res_a,
+            switch_device_id=switch_x,
+            port="p9",
+            vlan_assignment_id=alloc.id,
+            status="FAILED",
+            intended="ACTIVE",
+            attempts=1,
+            last_error="driver timeout",
+            created_at=OLD + timedelta(minutes=1),
+        )
+        s.add(build)
+        await s.commit()
+        build_id = build.id
+    wires = [
+        {
+            "device_a_id": "dut-1",
+            "port_a": "eth0",
+            "device_b_id": str(switch_x),
+            "port_b": "p9",
+            "layer": "L1",
+        }
+    ]
+    before = await _snapshot("l2")
+
+    with (
+        _blip({switch_x}) as (reads, calls),
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(return_value=wires),
+        ),
+    ):
+        await run_wiring_retry_tick(_db_session_factory())
+
+    assert reads[str(switch_x)] == 2, "the intent check read X, then the tail read it again"
+    assert _deletes(calls) == sorted([str(member_m), str(switch_x)])
+    after = await _snapshot("l2")
+    assert after[build_id] == before[build_id], "the build row stays FAILED for the tick"
+    assert after[release_id][0] == "RELEASED"
+    alloc_a = await _allocation_of(res_a)
+    assert (alloc_a.status, alloc_a.defined_switch_ids) == ("RELEASED", [])
+
+
 # --- Controls: the catch is no wider than it says --------------------------
 
 
