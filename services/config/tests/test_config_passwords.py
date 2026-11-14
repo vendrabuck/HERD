@@ -293,7 +293,25 @@ def test_a_change_password_that_cannot_be_encoded_keeps_the_file_and_blames_noth
     assert verify_password("test-config-pass") is True
 
 
-@pytest.mark.parametrize("password", _HOSTILE_PASSWORDS.values(), ids=_HOSTILE_PASSWORDS.keys())
+# The passwords the check refuses outright. A NUL is not among them: the config
+# service always hashed it as a byte, and bcrypt itself makes "\x00" match a hash
+# of "" (the old bcrypt 4.0.1 code accepted that pair too, see the legacy table).
+_REFUSED_PASSWORDS = {
+    k: v for k, v in _HOSTILE_PASSWORDS.items() if not isinstance(v, str) or "\ud800" in v
+}
+
+
+def test_the_refused_set_is_the_non_strings_and_the_non_encodable():
+    assert sorted(_REFUSED_PASSWORDS) == [
+        "bytes",
+        "integer",
+        "lone_surrogate",
+        "none",
+        "surrogate_after_byte_72",
+    ]
+
+
+@pytest.mark.parametrize("password", _REFUSED_PASSWORDS.values(), ids=_REFUSED_PASSWORDS.keys())
 def test_a_hostile_password_never_matches_a_hash_of_the_empty_password(password, caplog):
     """A refused password is checked against the stored hash with an empty
     placeholder secret, only to report a broken file; the answer stays False
