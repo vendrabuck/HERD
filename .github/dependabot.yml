@@ -21,6 +21,16 @@ updates:
         update-types:
           - "minor"
           - "patch"
+    ignore:
+      # msw stays on 2.x by decision (2026-11-14). msw 3 catches jsdom's
+      # XMLHttpRequest at the socket: handlers can run out of send order, a
+      # handler's request.credentials can belong to an earlier request on the
+      # same connection, and a late request can be answered by the next test's
+      # handler. The migration was tried and parked on the closed PR #1434;
+      # lift this ignore to revisit it.
+      - dependency-name: "msw"
+        update-types:
+          - "version-update:semver-major"
 
   - package-ecosystem: "github-actions"
     directory: "/"
