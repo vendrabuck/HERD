@@ -42,3 +42,18 @@ export interface RegisterRequest {
   // Optional (issue #1252): omitted stores the username as the name.
   full_name?: string;
 }
+
+// GET /api/auth/login-options (ADR 0016), as parseLoginOptions in
+// src/lib/sso.ts keeps it. auth_method is informational only (null when the
+// answer names a method this build does not know); the page renders from the
+// other three fields.
+export interface SsoOptions {
+  provider_name: string;
+}
+
+export interface LoginOptions {
+  auth_method: "local" | "ldap" | "oidc" | null;
+  registration_open: boolean;
+  password_login: boolean;
+  sso: SsoOptions | null;
+}

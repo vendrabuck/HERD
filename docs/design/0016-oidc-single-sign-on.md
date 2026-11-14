@@ -789,6 +789,42 @@ of the current time is added.
 - `frontend/src/api/client.ts` adds `/auth/oidc/exchange` to the paths the refresh
   interceptor skips, beside `/auth/refresh` and `/auth/login`.
 
+As built (phase 4; the rules are IAM-OIDC-24 to IAM-OIDC-27 in
+`docs/specs/identity-and-access.md`):
+
+- Rendering is a pure function of three fields of the answer
+  (`frontend/src/lib/sso.ts`, `loginPageView`): the button exactly when `sso` is an
+  object, the form exactly when `password_login` is true (behind the toggle when `sso` is
+  present too), Register exactly when `registration_open` is true. `auth_method` is not
+  read. An answer is valid only as an object with boolean `password_login` and
+  `registration_open`, an `sso` that is null, absent, or a non-array object, and at least
+  one way to sign in; anything else, and the pending state, is D10's fallback, today's
+  page, whose markup the local-mode answer reproduces exactly (same input elements, so a
+  form filled in while the answer was pending, or found by an e2e helper before it,
+  survives it). A `provider_name` that is not a non-blank string becomes `single
+  sign-on`, the backend's default.
+- The toggle is a disclosure button (`aria-expanded`, `aria-controls`); the form's
+  submit is an outline button beside the "Sign in with" button, so the page keeps one
+  primary action. The button navigates with `window.location.assign`, equivalent to
+  setting `href`, through `frontend/src/lib/topLevelNavigation.ts` so tests can replace it.
+- `sso_error`: `cancelled` is a neutral toast, the other two error toasts; one toast id
+  and a ref keyed on the location keep it to one toast under StrictMode. The replace
+  navigation removes that parameter alone and keeps the rest of the query, the hash, and
+  the location state (the return path of IAM-UI-13).
+- `/login/sso` does not call `navigate(next)` itself. React Router applies a navigation
+  as a transition while the token store updates synchronously, so `setTokens` followed by
+  `navigate(next)` let `GuestGuard` redirect on the old location (to `/topology`) first;
+  a test through the real guards caught it. The page instead records `next` as its
+  location's return path (`{from: next, sub: null}`, a replace), adopts the tokens once
+  that state has committed, and `GuestGuard` replaces the page with it. `next` passes
+  `safeReturnPath` twice (when the answer is parsed, and in `GuestGuard`), which now also
+  refuses `/login/sso`. The exchange is sent with `withCredentials` and the 15 s login
+  timeout; a 200 without a non-empty token pair is a failure.
+- The refresh skip list (`REFRESH_SKIP_PATHS`, `skipsRefresh`) matches the end of the
+  request path rather than a substring, and lists `/auth/login-options` too: under the
+  substring match `/auth/login` covered it by accident, so no entry could be tested on
+  its own.
+
 #### Internal interfaces between phases
 
 These signatures let phases 1 and 2 be built in parallel and joined in phase 3. Every

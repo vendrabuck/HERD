@@ -4,8 +4,9 @@ import { loginRetryAfterSeconds } from "@/lib/errors";
 export const DEFAULT_AFTER_LOGIN = "/topology";
 
 // Pages a return path must never name: going back to them after a sign-in
-// would bounce through GuestGuard instead of reaching a page.
-const NOT_A_RETURN_PATH = new Set(["/login", "/register"]);
+// would bounce through GuestGuard instead of reaching a page. `/login/sso` is
+// the single sign-on completion page (ADR 0016 phase 4), also under GuestGuard.
+const NOT_A_RETURN_PATH = new Set(["/login", "/register", "/login/sso"]);
 
 // C0 controls, DEL, and C1 controls (issue #1333).
 // eslint-disable-next-line no-control-regex
@@ -15,7 +16,8 @@ const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/;
  * The return path `value` names, when it is safe to navigate to, else null
  * (issue #1333). Safe means a same-origin absolute path: a string that starts
  * with exactly one `/`, holds no backslash and no control character, resolves
- * against this origin to this origin, and is not the login or register page.
+ * against this origin to this origin, and is not the login, register, or
+ * single sign-on completion page.
  * So `//evil.example`, `/\evil.example`, `https://evil.example`,
  * `javascript:...`, and a relative `topology` are all refused.
  */

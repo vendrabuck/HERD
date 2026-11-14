@@ -40,6 +40,7 @@ describe("safeReturnPath", () => {
     ["the login page", "/login"],
     ["the login page with a query", "/login?x=1"],
     ["the register page", "/register"],
+    ["the single sign-on completion page", "/login/sso"],
   ])("refuses %s", (_label, path) => {
     expect(safeReturnPath(path)).toBeNull();
   });

@@ -1,7 +1,7 @@
 import { http, HttpResponse } from "msw";
 import { server } from "../mocks/server";
 import { useAuthStore } from "@/stores/authStore";
-import apiClient from "@/api/client";
+import apiClient, { REFRESH_SKIP_PATHS, skipsRefresh } from "@/api/client";
 
 describe("apiClient interceptors", () => {
   beforeEach(() => {
@@ -115,7 +115,7 @@ describe("apiClient interceptors", () => {
     );
 
     await expect(apiClient.get("/test-endpoint")).rejects.toThrow();
-    // isAuthUrl short-circuits the 401 on /auth/refresh, so it is hit once only.
+    // skipsRefresh short-circuits the 401 on /auth/refresh, so it is hit once only.
     expect(refreshCalls).toBe(1);
   });
 
@@ -188,5 +188,82 @@ describe("apiClient interceptors", () => {
     expect(results[1].status).toBe("rejected");
     expect(useAuthStore.getState().accessToken).toBeNull();
     expect(useAuthStore.getState().isAuthenticated).toBe(false);
+  });
+});
+
+// ADR 0016 phase 4: a 401 from these routes is an answer about the request,
+// never an expired access token, so no refresh runs. Each entry stands alone:
+// `/auth/login` does not cover `/auth/login-options` by prefix.
+describe("refresh skip list (ADR 0016)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useAuthStore.setState({ accessToken: null, refreshToken: null, user: null, isAuthenticated: false });
+  });
+
+  it("is exactly the sign-in, refresh, logout, login-options, and handoff exchange routes", () => {
+    expect([...REFRESH_SKIP_PATHS].sort()).toEqual(
+      ["/auth/login", "/auth/login-options", "/auth/logout", "/auth/oidc/exchange", "/auth/refresh"].sort(),
+    );
+  });
+
+  it.each([
+    ["/auth/login", "post"],
+    ["/auth/logout", "post"],
+    ["/auth/login-options", "get"],
+    ["/auth/oidc/exchange", "post"],
+  ] as const)("a 401 from %s is passed through with no refresh", async (path, method) => {
+    useAuthStore.getState().setTokens("old-access", "valid-refresh");
+    let refreshCalls = 0;
+    let calls = 0;
+    server.use(
+      http[method](`/api${path}`, () => {
+        calls += 1;
+        return HttpResponse.json({ detail: "refused" }, { status: 401 });
+      }),
+      http.post("/api/auth/refresh", () => {
+        refreshCalls += 1;
+        return HttpResponse.json({ access_token: "new-access", refresh_token: "new-refresh" });
+      }),
+    );
+    await expect(apiClient.request({ url: path, method, data: {} })).rejects.toThrow();
+    expect(calls).toBe(1);
+    expect(refreshCalls).toBe(0);
+    expect(useAuthStore.getState().accessToken).toBe("old-access");
+  });
+
+  it.each([
+    ["/auth/login", true],
+    ["/auth/login?x=1", true],
+    ["/auth/login-options", true],
+    ["/auth/login-options?x=1#y", true],
+    ["/auth/oidc/exchange", true],
+    ["/auth/refresh", true],
+    ["/auth/logout", true],
+    ["/auth/me", false],
+    ["/auth/login-history", false],
+    ["/auth/oidc/exchange-other", false],
+    ["/auth/oidc/login", false],
+    ["/auth/register", false],
+    [undefined, false],
+  ] as const)("skipsRefresh(%s) is %s", (url, skipped) => {
+    expect(skipsRefresh(url)).toBe(skipped);
+  });
+
+  it("a 401 from a route not on the list still refreshes and retries", async () => {
+    useAuthStore.getState().setTokens("old-access", "valid-refresh");
+    let refreshCalls = 0;
+    server.use(
+      http.get("/api/auth/login-history", ({ request }) =>
+        request.headers.get("Authorization") === "Bearer new-access"
+          ? HttpResponse.json({ ok: true })
+          : HttpResponse.json({ detail: "expired" }, { status: 401 }),
+      ),
+      http.post("/api/auth/refresh", () => {
+        refreshCalls += 1;
+        return HttpResponse.json({ access_token: "new-access", refresh_token: "new-refresh" });
+      }),
+    );
+    await expect(apiClient.get("/auth/login-history")).resolves.toMatchObject({ data: { ok: true } });
+    expect(refreshCalls).toBe(1);
   });
 });

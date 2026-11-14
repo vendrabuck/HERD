@@ -250,17 +250,39 @@ export async function logoutUnderRefreshLock(
   });
 }
 
+/**
+ * Routes whose 401 is an answer about the request itself, never an expired
+ * access token, so the interceptor below passes it through without a refresh:
+ * the sign-in routes, logout, the public login-options read, and the single
+ * sign-on handoff exchange (ADR 0016: a refused handoff is final, and the page
+ * sending it has no session to refresh). Each entry matches the request path
+ * (query string ignored) when the path ends with it, so `/auth/login` does not
+ * also cover `/auth/login-options`; every entry stands on its own.
+ */
+export const REFRESH_SKIP_PATHS: readonly string[] = [
+  "/auth/refresh",
+  "/auth/login",
+  "/auth/logout",
+  "/auth/login-options",
+  "/auth/oidc/exchange",
+];
+
+export function skipsRefresh(url: string | undefined): boolean {
+  const path = (url ?? "").split(/[?#]/, 1)[0];
+  return REFRESH_SKIP_PATHS.some((skipped) => path.endsWith(skipped));
+}
+
 apiClient.interceptors.response.use(
   (response) => response,
   async (error: AxiosError) => {
     const originalRequest = error.config as RetryableRequest | undefined;
     if (!originalRequest) return Promise.reject(error);
 
-    const url = originalRequest.url ?? "";
-    const isAuthUrl =
-      url.includes("/auth/refresh") || url.includes("/auth/login") || url.includes("/auth/logout");
-
-    if (error.response?.status !== 401 || isAuthUrl || originalRequest._retry) {
+    if (
+      error.response?.status !== 401 ||
+      skipsRefresh(originalRequest.url) ||
+      originalRequest._retry
+    ) {
       return Promise.reject(error);
     }
 
