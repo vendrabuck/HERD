@@ -1,0 +1,74 @@
+# Dex configuration for the OIDC test provider (infra/oidc-test, ADR 0016 D12).
+#
+# TEST-ONLY VALUES: the client secret and the fixture password below exist for
+# this lab and for services/auth/tests/test_oidc_service_live.py, which asserts
+# them. Never reuse either anywhere real.
+#
+# Fixture users (password `oidc-test-password` for all; hash is bcrypt, cost 10):
+# - alice@oidc.example.com: the normal user. `username`, `name`, and
+#   `preferredUsername` are three different values, so a test can tell which
+#   claim HERD read: Dex emits `name` from `name` (from `username` when `name`
+#   is unset) and `preferred_username` from `preferredUsername`.
+# - user1@herd.dev: the collision user. Its email equals the seeded local
+#   account user1 (seedtools/catalog.py), so a first sign-in must be refused
+#   and never linked (ADR 0016 D4).
+# - bob@oidc.example.com: emailVerified false, so a first sign-in must be
+#   refused as unverified (ADR 0016 D4).
+# The userID values are fixed, so each user's `sub` is the same on every start.
+
+issuer: http://oidc-test:5556/dex
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+logger:
+  level: info
+  format: json
+
+oauth2:
+  # Only the grant HERD uses; the token-exchange, device, and refresh grants
+  # Dex enables by default are off.
+  grantTypes: ["authorization_code"]
+  responseTypes: ["code"]
+  skipApprovalScreen: true
+  alwaysShowLoginScreen: false
+  # Stricter than Dex's default (enforce false, S256 and plain): an
+  # authorization request without an S256 code_challenge is refused, so a HERD
+  # that stopped sending PKCE fails the live suite instead of passing it.
+  pkce:
+    enforce: true
+    codeChallengeMethodsSupported: ["S256"]
+
+staticClients:
+  - id: herd
+    name: HERD
+    # Test-only value.
+    secret: herd-oidc-test-client-secret
+    redirectURIs:
+      - https://localhost/api/auth/oidc/callback
+
+enablePasswordDB: true
+
+staticPasswords:
+  - email: alice@oidc.example.com
+    hash: "$2b$10$KazWi/TG9YCHfjwJlYWvL.7iUxUKEBlptbL2RNnTxAaFQ0LSRWUey"
+    username: alice
+    name: Alice Example
+    preferredUsername: alice.sso
+    emailVerified: true
+    userID: 6f1c5a0e-1b7e-4d0a-9a51-0c6b1f0e0001
+  - email: user1@herd.dev
+    hash: "$2b$10$KazWi/TG9YCHfjwJlYWvL.7iUxUKEBlptbL2RNnTxAaFQ0LSRWUey"
+    username: collide
+    preferredUsername: collide.sso
+    emailVerified: true
+    userID: 6f1c5a0e-1b7e-4d0a-9a51-0c6b1f0e0002
+  - email: bob@oidc.example.com
+    hash: "$2b$10$KazWi/TG9YCHfjwJlYWvL.7iUxUKEBlptbL2RNnTxAaFQ0LSRWUey"
+    username: bob
+    preferredUsername: bob.sso
+    emailVerified: false
+    userID: 6f1c5a0e-1b7e-4d0a-9a51-0c6b1f0e0003
