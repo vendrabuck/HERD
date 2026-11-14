@@ -219,6 +219,18 @@ TLS is handled by Traefik with certs in `infra/traefik/certs/`; there is no env 
 The config page login password is set by `CONFIG_ADMIN_PASSWORD`; there is no longer a
 hardcoded default. Config service auth is separate from HERD JWT.
 
+The dev, gate, and CI stacks load `docker-compose.override.yml`, which passes
+`${CONFIG_ADMIN_PASSWORD:-admin123!}`: unset or empty gives those stacks the documented
+test password, and a value in `.env` or the environment wins. `make prod` does not load
+the override. The variable is read only when the auth file does not exist yet (first
+use), so changing it on an existing `herd-config` volume has no effect until
+`config_auth.json` is removed from that volume.
+
+Compose interpolates the value and the e2e suite reads `.env` itself, and the two parse
+differently: in `.env`, single-quote a value that contains `$`, and do not use ` #` or
+leading or trailing spaces. A value that the two read differently makes the e2e seeding
+login fail. The same limit applies to `SUPERADMIN_PASSWORD`.
+
 The config page saves only the settings its schema lists (`GET /api/config/schema`): a save
 naming any other key is refused with 422 and writes nothing. A key you place in
 `config.json` by hand outside the schema is not shown in the editor and is carried over
