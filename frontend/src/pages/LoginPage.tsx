@@ -113,9 +113,12 @@ export function LoginPage() {
         />
       </div>
 
+      {/* Behind the Administrator sign-in toggle (single sign-on mode) the
+          submit is secondary, so the page keeps one primary action, the
+          "Sign in with" button; everywhere else it is today's primary. */}
       <Button
         type="submit"
-        variant="primary"
+        variant={view.passwordForm === "toggle" ? "secondary" : "primary"}
         disabled={login.isPending || !!isUnconfigured}
         aria-busy={login.isPending}
         className="w-full"

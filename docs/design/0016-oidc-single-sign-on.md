@@ -798,14 +798,21 @@ As built (phase 4; the rules are IAM-OIDC-24 to IAM-OIDC-27 in
   present too), Register exactly when `registration_open` is true. `auth_method` is not
   read. An answer is valid only as an object with boolean `password_login` and
   `registration_open`, an `sso` that is null, absent, or a non-array object, and at least
-  one way to sign in; anything else, and the pending state, is D10's fallback, today's
-  page, whose markup the local-mode answer reproduces exactly (same input elements, so a
-  form filled in while the answer was pending, or found by an e2e helper before it,
-  survives it). A `provider_name` that is not a non-blank string becomes `single
-  sign-on`, the backend's default.
-- The toggle is a disclosure button (`aria-expanded`, `aria-controls`); the form's
-  submit is an outline button beside the "Sign in with" button, so the page keeps one
-  primary action. The button navigates with `window.location.assign`, equivalent to
+  one way to sign in; anything else is D10's fallback, today's page, whose markup the
+  local-mode answer reproduces exactly (same input elements, so a form filled in while
+  the answer was pending, or found by an e2e helper before it, survives it). A
+  `provider_name` that is not a non-blank string becomes `single sign-on`, the backend's
+  default.
+- The pending state is today's page too: while the `GET /login-options` request is
+  pending, the password form and the Register link render, and the request has no
+  client timeout, so a request that never answers leaves today's page up. In OIDC mode
+  the password form therefore shows until the answer arrives. Accepted for this phase
+  and filed as issue #1420, which blocks phase 6.
+- The toggle is a disclosure button (`aria-expanded`, `aria-controls`); behind it the
+  form's submit is a secondary button (the design system's gray-100 variant), so the page
+  keeps one primary action, the "Sign in with" button. Wherever the form is not behind
+  the toggle (local and LDAP mode, and the fallback) the submit stays primary, so that
+  markup is unchanged. The button navigates with `window.location.assign`, equivalent to
   setting `href`, through `frontend/src/lib/topLevelNavigation.ts` so tests can replace it.
 - `sso_error`: `cancelled` is a neutral toast, the other two error toasts; one toast id
   and a ref keyed on the location keep it to one toast under StrictMode. The replace
@@ -815,11 +822,18 @@ As built (phase 4; the rules are IAM-OIDC-24 to IAM-OIDC-27 in
   as a transition while the token store updates synchronously, so `setTokens` followed by
   `navigate(next)` let `GuestGuard` redirect on the old location (to `/topology`) first;
   a test through the real guards caught it. The page instead records `next` as its
-  location's return path (`{from: next, sub: null}`, a replace), adopts the tokens once
-  that state has committed, and `GuestGuard` replaces the page with it. `next` passes
-  `safeReturnPath` twice (when the answer is parsed, and in `GuestGuard`), which now also
-  refuses `/login/sso`. The exchange is sent with `withCredentials` and the 15 s login
-  timeout; a 200 without a non-empty token pair is a failure.
+  location's return path (`{from: next, sub}`, a replace, where `sub` is the subject of
+  the exchanged access token, so `GuestGuard` honors the path for that account only;
+  an access token whose subject cannot be read is a failure), adopts the tokens once
+  that state has committed, and `GuestGuard` replaces the page with it. An answer that
+  arrives after the page unmounted is dropped (no navigation, no adoption, no message):
+  the review of this phase reproduced a race in which another tab's sign-in sent the
+  page away and the late answer then replaced the other account's page with the flow's
+  `next`. `next` passes `safeReturnPath` twice (when the answer is parsed, and in
+  `GuestGuard`), which now also refuses `/login/sso`. The exchange is sent with
+  `withCredentials` and the 15 s login timeout; a 200 without a non-empty token pair is a
+  failure. A timeout can come after the server consumed the handoff; the user then sees
+  the failed message and signs in again.
 - The refresh skip list (`REFRESH_SKIP_PATHS`, `skipsRefresh`) matches the end of the
   request path rather than a substring, and lists `/auth/login-options` too: under the
   substring match `/auth/login` covered it by accident, so no entry could be tested on

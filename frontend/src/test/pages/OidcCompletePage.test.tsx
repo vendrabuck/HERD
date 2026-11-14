@@ -1,7 +1,14 @@
 import { http, HttpResponse } from "msw";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes, useLocation, useNavigationType } from "react-router-dom";
+import {
+  MemoryRouter,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+  useNavigationType,
+} from "react-router-dom";
 import { StrictMode } from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
@@ -25,33 +32,45 @@ const ACCESS = fakeJwt("sso-user-1");
 const REFRESH = "REFRESH-SECRET-VALUE";
 const FAILED = "Single sign-on failed. If this continues, contact an administrator.";
 
-// Every location the app passes through, in order.
+// Every location the app passes through, in order, and the location state of
+// each /login/sso entry.
 let visited: string[] = [];
+let ssoStates: unknown[] = [];
+// The router's navigate, so a test can move the app the way a click would.
+let routerNavigate: ReturnType<typeof useNavigate> | null = null;
 
 function Where() {
   const location = useLocation();
   const navigationType = useNavigationType();
+  const navigate = useNavigate();
   return (
-    <p data-testid="where">
-      {location.pathname + location.search + location.hash} {navigationType}
-    </p>
+    <div>
+      <p data-testid="where">
+        {location.pathname + location.search + location.hash} {navigationType}
+      </p>
+      <button type="button" onClick={() => navigate(-1)}>
+        Back
+      </button>
+    </div>
   );
 }
 
 function Recorder() {
   const location = useLocation();
+  routerNavigate = useNavigate();
   const entry = location.pathname + location.search + location.hash;
   if (visited[visited.length - 1] !== entry) visited.push(entry);
+  if (location.pathname === "/login/sso" && location.state) ssoStates.push(location.state);
   return null;
 }
 
-function renderAt(initial: string, { strict = false }: { strict?: boolean } = {}) {
+function renderAt(initial: string | string[], { strict = false }: { strict?: boolean } = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   const tree = (
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={[initial]}>
+      <MemoryRouter initialEntries={Array.isArray(initial) ? initial : [initial]}>
         <Recorder />
         <Routes>
           <Route
@@ -71,6 +90,7 @@ function renderAt(initial: string, { strict = false }: { strict?: boolean } = {}
               </GuestGuard>
             }
           />
+          <Route path="/before" element={<Where />} />
           <Route
             path="*"
             element={
@@ -118,6 +138,8 @@ function consoleText(): string {
 
 beforeEach(() => {
   visited = [];
+  ssoStates = [];
+  routerNavigate = null;
   exchangeCalls = [];
   refreshCalls = 0;
   toastFn.mockClear();
@@ -297,4 +319,144 @@ describe("OidcCompletePage (ADR 0016 phase 4)", () => {
     await act(async () => {});
     expect(exchangeCalls).toHaveLength(0);
   });
+
+  it("records the return path bound to the exchanged token's account, never to any account", async () => {
+    answerExchange(success("/inventory"));
+    renderAt("/login/sso");
+    await waitFor(() => expect(screen.getByTestId("where")).toHaveTextContent("/inventory"));
+    expect(ssoStates).toContainEqual({ from: "/inventory", sub: "sso-user-1" });
+    expect(ssoStates.every((state) => (state as { sub?: unknown }).sub === "sso-user-1")).toBe(true);
+  });
+
+  it("an access token whose account cannot be read is a failure that stores nothing", async () => {
+    answerExchange(() =>
+      HttpResponse.json({ access_token: "not-a-jwt", refresh_token: REFRESH, next: "/inventory" }),
+    );
+    renderAt("/login/sso");
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith(FAILED, { id: "sso-error" }));
+    expect(useAuthStore.getState().isAuthenticated).toBe(false);
+    expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBeNull();
+  });
+
+  it.each(["success", "failure"] as const)(
+    "the review's race: another tab signs in while the exchange is in flight; its late %s changes nothing",
+    async (outcome) => {
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      answerExchange(async () => {
+        await gate;
+        return outcome === "success"
+          ? success("/inventory/sso-only-page")()
+          : HttpResponse.json({ detail: "expired" }, { status: 401 });
+      });
+      renderAt("/login/sso");
+      await waitFor(() => expect(exchangeCalls).toHaveLength(1));
+
+      // Another tab signs in as a different account; this tab adopts it.
+      const other = fakeJwt("other-account");
+      localStorage.setItem(REFRESH_TOKEN_KEY, "OTHER-REFRESH");
+      localStorage.setItem(ACCESS_TOKEN_KEY, other);
+      await act(async () => {
+        window.dispatchEvent(new StorageEvent("storage", { key: ACCESS_TOKEN_KEY }));
+      });
+      await waitFor(() => expect(screen.getByTestId("where")).toHaveTextContent("/topology REPLACE"));
+
+      release();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      expect(visited).toEqual(["/login/sso", "/topology"]);
+      expect(screen.getByTestId("where")).toHaveTextContent("/topology REPLACE");
+      expect(useAuthStore.getState().accessToken).toBe(other);
+      expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe(other);
+      expect(localStorage.getItem(REFRESH_TOKEN_KEY)).toBe("OTHER-REFRESH");
+      expect(toastError).not.toHaveBeenCalled();
+      expect(toastFn).not.toHaveBeenCalled();
+      expect(exchangeCalls).toHaveLength(1);
+    },
+  );
+
+  it.each(["success", "failure"] as const)(
+    "after the page unmounts, a late %s causes no navigation, no token adoption, and no toast",
+    async (outcome) => {
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      answerExchange(async () => {
+        await gate;
+        return outcome === "success"
+          ? success("/inventory")()
+          : HttpResponse.json({ detail: "expired" }, { status: 401 });
+      });
+      renderAt("/login/sso");
+      await waitFor(() => expect(exchangeCalls).toHaveLength(1));
+      // The app moves on (a link, Back) while the router stays mounted.
+      await act(async () => {
+        routerNavigate!("/before");
+      });
+      await waitFor(() => expect(screen.getByTestId("where")).toHaveTextContent(/^\/before PUSH$/));
+      release();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      expect(visited).toEqual(["/login/sso", "/before"]);
+      expect(screen.getByTestId("where")).toHaveTextContent(/^\/before PUSH$/);
+      expect(ssoStates).toEqual([]);
+      expect(useAuthStore.getState().isAuthenticated).toBe(false);
+      expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBeNull();
+      expect(toastError).not.toHaveBeenCalled();
+      expect(toastFn).not.toHaveBeenCalled();
+    },
+  );
+
+  it("a return path the flow recorded for one account is not honored for another", () => {
+    useAuthStore.getState().setTokens(fakeJwt("other-account"), "R");
+    render(
+      <MemoryRouter
+        initialEntries={[{ pathname: "/login/sso", state: { from: "/inventory/x", sub: "sso-user-1" } }]}
+      >
+        <Recorder />
+        <Routes>
+          <Route
+            path="/login/sso"
+            element={
+              <GuestGuard>
+                <p>sso page</p>
+              </GuestGuard>
+            }
+          />
+          <Route path="*" element={<Where />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("where")).toHaveTextContent("/topology REPLACE");
+  });
+
+  it.each([
+    ["success", "/inventory"],
+    ["failure", "/login"],
+  ] as const)(
+    "on %s the page replaces itself: Back lands on the page before it and never re-posts",
+    async (outcome, landing) => {
+      answerExchange(
+        outcome === "success"
+          ? success("/inventory")
+          : () => HttpResponse.json({ detail: "expired" }, { status: 401 }),
+      );
+      renderAt(["/before", "/login/sso"]);
+      await waitFor(() => expect(screen.getByTestId("where")).toHaveTextContent(new RegExp(`^${landing} REPLACE$`)));
+      await act(async () => {
+        screen.getByRole("button", { name: "Back" }).click();
+      });
+      await waitFor(() => expect(screen.getByTestId("where")).toHaveTextContent(/^\/before POP$/));
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      expect(exchangeCalls).toHaveLength(1);
+      expect(visited[visited.length - 1]).toBe("/before");
+    },
+  );
 });

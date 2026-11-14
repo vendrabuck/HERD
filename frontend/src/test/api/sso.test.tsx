@@ -1,6 +1,6 @@
 import { http, HttpResponse } from "msw";
-import { renderHook, waitFor } from "@testing-library/react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider, focusManager } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
@@ -85,6 +85,35 @@ describe("useLoginOptions", () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: 3, retryDelay: 1 } } });
     const { result } = renderHook(() => useLoginOptions(), { wrapper: makeWrapper(client) });
     await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(calls).toBe(1);
+  });
+
+  it("is not refetched when the window regains focus", async () => {
+    let calls = 0;
+    server.use(
+      http.get("/api/auth/login-options", () => {
+        calls += 1;
+        return HttpResponse.json({
+          auth_method: "local",
+          registration_open: true,
+          password_login: true,
+          sso: null,
+        });
+      }),
+    );
+    // staleTime 0 (the default): a query that allowed it would refetch on focus.
+    const { result } = renderHook(() => useLoginOptions(), { wrapper: makeWrapper(newClient()) });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(calls).toBe(1);
+    try {
+      act(() => {
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      focusManager.setFocused(undefined);
+    }
     expect(calls).toBe(1);
   });
 

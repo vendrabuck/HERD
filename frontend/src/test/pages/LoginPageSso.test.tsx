@@ -398,6 +398,28 @@ describe("the Administrator sign-in toggle (ADR 0016)", () => {
     expect(toggle).toHaveAttribute("aria-expanded", "false");
   });
 
+  it("keeps one primary action: the form's submit is secondary behind the toggle", async () => {
+    answerOptions(() => HttpResponse.json(OIDC_ON));
+    const { client, page } = renderLogin();
+    await settled(client, "success");
+    await userEvent.click(screen.getByRole("button", { name: "Administrator sign-in" }));
+    const submit = screen.getByRole("button", { name: "Sign in" });
+    expect(submit).toHaveClass("bg-gray-100");
+    expect(submit).not.toHaveClass("bg-blue-600");
+    const primaries = [...page().querySelectorAll("button")].filter((b) => b.classList.contains("bg-blue-600"));
+    expect(primaries).toEqual([screen.getByRole("button", { name: "Sign in with Acme SSO" })]);
+  });
+
+  it("leaves the submit primary wherever the form is not behind the toggle", async () => {
+    for (const options of [LOCAL, LDAP]) {
+      answerOptions(() => HttpResponse.json(options));
+      const { client, unmount } = renderLogin();
+      await settled(client, "success");
+      expect(screen.getByRole("button", { name: "Sign in" })).toHaveClass("bg-blue-600");
+      unmount();
+    }
+  });
+
   it("the form behind it signs in exactly like today's form", async () => {
     let body: unknown = null;
     server.use(

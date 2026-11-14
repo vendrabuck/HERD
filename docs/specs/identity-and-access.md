@@ -1801,19 +1801,22 @@ skip list).
   password form exactly when `password_login` is true, behind a collapsed
   `Administrator sign-in` disclosure (a button with `aria-expanded` and `aria-controls`)
   when `sso` is present too, and the Register link exactly when `registration_open` is
-  true, so LDAP mode shows no Register link. While the answer is pending, and on any
-  error (no answer, a 404 from a backend without the route, a 5xx, a body that is not
+  true, so LDAP mode shows no Register link. While the request is pending (it has no
+  client timeout, so a request that never answers keeps it pending; issue #1420), and on
+  any error (no answer, a 404 from a backend without the route, a 5xx, a body that is not
   JSON, and a body that is not an object with boolean `password_login` and
   `registration_open`, an `sso` that is null, absent, or a non-array object, and at
   least one way to sign in), the page is exactly today's: the password form and the
-  Register link. The local-mode answer renders the same markup as that fallback and
-  keeps the same input elements. `auth_method` is not read for rendering. The
-  login-options read is not retried, and a 401 from it or from the handoff exchange
+  Register link, so an OIDC-mode page shows the password form until its answer
+  arrives (#1420). The local-mode answer renders the same markup as that fallback and
+  keeps the same input elements. Behind the toggle the form's submit is a secondary
+  button, so the page has one primary action; everywhere else it stays primary. `auth_method` is not read for rendering. The
+  login-options read is not retried or refetched on window focus, and a 401 from it or from the handoff exchange
   never starts a token refresh: the refresh interceptor's skip list matches the request
   path's end against `/auth/refresh`, `/auth/login`, `/auth/logout`,
   `/auth/login-options`, and `/auth/oidc/exchange`, each on its own. \
   Enforced in: `frontend/src/lib/sso.ts` (`parseLoginOptions`, `loginPageView`, `LEGACY_LOGIN_VIEW`, `DEFAULT_SSO_PROVIDER_NAME`); `frontend/src/pages/LoginPage.tsx` (`LoginPage`); `frontend/src/api/auth.ts` (`useLoginOptions`, `getLoginOptions`, `LOGIN_OPTIONS_PATH`); `frontend/src/api/client.ts` (`REFRESH_SKIP_PATHS`, `skipsRefresh`) \
-  Pinned by: `frontend/src/test/lib/sso.test.ts` (`parseLoginOptions and loginPageView: the full input space`, `the backend's %s answer`, `refuses %s as an answer, so the page is today's`, `local mode renders exactly today's page`); `frontend/src/test/pages/LoginPageSso.test.tsx` (`local mode: today's form and the Register link, no single sign-on`, `LDAP mode: today's form with no Register link (registration answers 409 there)`, `OIDC mode, break-glass off: only the Sign in with button`, `OIDC mode, break-glass on: the button, and the password form behind a collapsed toggle`, `sso present %s, password_login %s, registration_open %s`, `renders today's page while the answer is pending`, `on %s renders byte-for-byte today's page`, `local mode's answer renders byte-for-byte today's page`, `LDAP mode's answer differs from today's page by the Register line alone`, `a local-mode answer keeps the same input elements, so a filled-in form survives it`, `is a collapsed disclosure that reveals the password form it controls`, `opens and closes from the keyboard, keeps focus on itself, and the form follows it in tab order`, `the form behind it signs in exactly like today's form`); `frontend/src/test/api/sso.test.tsx` (`errors on %s, and is not retried`, `a 401 from it never triggers a token refresh`, `a 401 from it never triggers a token refresh, even with a stored session`); `frontend/src/test/api/client.test.ts` (`is exactly the sign-in, refresh, logout, login-options, and handoff exchange routes`, `a 401 from %s is passed through with no refresh`, `skipsRefresh(%s) is %s`, `a 401 from a route not on the list still refreshes and retries`)
+  Pinned by: `frontend/src/test/lib/sso.test.ts` (`parseLoginOptions and loginPageView: the full input space`, `the backend's %s answer`, `refuses %s as an answer, so the page is today's`, `local mode renders exactly today's page`); `frontend/src/test/pages/LoginPageSso.test.tsx` (`keeps one primary action: the form's submit is secondary behind the toggle`, `leaves the submit primary wherever the form is not behind the toggle`, `local mode: today's form and the Register link, no single sign-on`, `LDAP mode: today's form with no Register link (registration answers 409 there)`, `OIDC mode, break-glass off: only the Sign in with button`, `OIDC mode, break-glass on: the button, and the password form behind a collapsed toggle`, `sso present %s, password_login %s, registration_open %s`, `renders today's page while the answer is pending`, `on %s renders byte-for-byte today's page`, `local mode's answer renders byte-for-byte today's page`, `LDAP mode's answer differs from today's page by the Register line alone`, `a local-mode answer keeps the same input elements, so a filled-in form survives it`, `is a collapsed disclosure that reveals the password form it controls`, `opens and closes from the keyboard, keeps focus on itself, and the form follows it in tab order`, `the form behind it signs in exactly like today's form`); `frontend/src/test/api/sso.test.tsx` (`errors on %s, and is not retried`, `is not refetched when the window regains focus`, `a 401 from it never triggers a token refresh`, `a 401 from it never triggers a token refresh, even with a stored session`); `frontend/src/test/api/client.test.ts` (`is exactly the sign-in, refresh, logout, login-options, and handoff exchange routes`, `a 401 from %s is passed through with no refresh`, `skipsRefresh(%s) is %s`, `a 401 from a route not on the list still refreshes and retries`)
 - **IAM-OIDC-25.** The `Sign in with` button starts single sign-on with one top-level
   navigation (`window.location.assign`, never a request from the page) to exactly
   `/api/auth/oidc/login`, with no query: no `next` in v1, so the backend's `/topology`
@@ -1836,18 +1839,24 @@ skip list).
 - **IAM-OIDC-27.** `/login/sso`, outside the app layout and under `GuestGuard`, posts
   exactly `{}` as JSON, with credentials, to `/api/auth/oidc/exchange` once per mount
   (a ref holds across React StrictMode's second effect and every re-render), with the
-  15 s client timeout of `LOGIN_TIMEOUT_MS`. A 200 whose body holds a non-empty
-  `access_token` and `refresh_token` is a success; its `next` is kept only when
-  IAM-UI-13's checks honor it, else `/topology`. On success the page records that path
-  as its location's return path (state `{from: next, sub: null}`, a replace), and once
+  15 s client timeout of `LOGIN_TIMEOUT_MS`. The server may already have consumed the
+  handoff when that timeout fires; the user then sees the failed message and signs in
+  again. A 200 whose body holds a non-empty `access_token` and `refresh_token` is a
+  success; its `next` is kept only when IAM-UI-13's checks honor it, else `/topology`.
+  On success the page records that path as its location's return path (state
+  `{from: next, sub}`, a replace, where `sub` is the subject of the exchanged access
+  token, never null, so `GuestGuard` honors the path only for that account), and once
   that has committed adopts the pair through the one function a password login uses
   (`setTokens`, then a refetch of the signed-in user), so `GuestGuard` replaces the page
   with the path. On any other outcome (a 401, any other status, no answer, a timeout, a
-  body without the pair) nothing is stored and the page replaces itself with
-  `/login?sso_error=failed`. No token or server text is written to a URL, the console,
-  or the page. \
+  body without the pair, an access token whose subject cannot be read) nothing is stored
+  and the page replaces itself with `/login?sso_error=failed`. Either replace leaves the
+  entry before `/login/sso` one Back away, and Back never posts again. An answer that
+  arrives after the page unmounted (for example after another tab's sign-in made
+  `GuestGuard` send the tab away) causes no navigation, no token adoption, and no
+  message. No token or server text is written to a URL, the console, or the page. \
   Enforced in: `frontend/src/pages/OidcCompletePage.tsx` (`OidcCompletePage`); `frontend/src/api/auth.ts` (`exchangeOidcHandoff`, `adoptSignInTokens`, `OIDC_EXCHANGE_PATH`); `frontend/src/lib/sso.ts` (`parseOidcExchange`, `SSO_COMPLETE_PATH`, `SSO_EXCHANGE_FAILED_PATH`); `frontend/src/lib/login.ts` (`safeReturnPath`); `frontend/src/routes.tsx` (`appRouteElements`) \
-  Pinned by: `frontend/src/test/pages/OidcCompletePage.test.tsx` (`shows a status line while the exchange runs`, `posts {} once with credentials, stores the pair like a password login, and replaces itself with next`, `refetches the signed-in user, as a password login does`, `spends the handoff exactly once under StrictMode's double effect and on re-render`, `navigates only within the app: next %j lands on /topology`, `on %s stores nothing and shows the failed message on the login page`, `an exchange that never answers is given up after 15 seconds as a failure`, `writes no token to a URL or the console, on success or failure`, `a visitor already signed in is sent on by GuestGuard and spends no handoff`); `frontend/src/test/lib/sso.test.ts` (`replaces %s with /topology`, `refuses an answer with %s`, `the completion page is never a return path (it sits under GuestGuard)`); `frontend/src/test/api/sso.test.tsx` (`posts exactly {} as JSON, with credentials, and returns the tokens and a safe next`, `rejects on %s with no server text in the error`, `stores the pair in shared storage, signs the tab in, and refetches the current user`, `is what useLogin runs on success`); `frontend/src/test/routes.test.tsx` (`renders OidcCompletePage inside GuestGuard, outside AuthGuard and AppLayout`); `frontend/src/test/pages/pageScrollContainer.test.tsx` (`the outside-layout allowlist is exactly the pages the route table renders outside AppLayout`)
+  Pinned by: `frontend/src/test/pages/OidcCompletePage.test.tsx` (`shows a status line while the exchange runs`, `posts {} once with credentials, stores the pair like a password login, and replaces itself with next`, `refetches the signed-in user, as a password login does`, `spends the handoff exactly once under StrictMode's double effect and on re-render`, `navigates only within the app: next %j lands on /topology`, `on %s stores nothing and shows the failed message on the login page`, `an exchange that never answers is given up after 15 seconds as a failure`, `writes no token to a URL or the console, on success or failure`, `a visitor already signed in is sent on by GuestGuard and spends no handoff`, `records the return path bound to the exchanged token's account, never to any account`, `an access token whose account cannot be read is a failure that stores nothing`, `the review's race: another tab signs in while the exchange is in flight; its late %s changes nothing`, `after the page unmounts, a late %s causes no navigation, no token adoption, and no toast`, `a return path the flow recorded for one account is not honored for another`, `on %s the page replaces itself: Back lands on the page before it and never re-posts`); `frontend/src/test/lib/sso.test.ts` (`replaces %s with /topology`, `refuses an answer with %s`, `the completion page is never a return path (it sits under GuestGuard)`); `frontend/src/test/api/sso.test.tsx` (`posts exactly {} as JSON, with credentials, and returns the tokens and a safe next`, `rejects on %s with no server text in the error`, `stores the pair in shared storage, signs the tab in, and refetches the current user`, `is what useLogin runs on success`); `frontend/src/test/routes.test.tsx` (`renders OidcCompletePage inside GuestGuard, outside AuthGuard and AppLayout`); `frontend/src/test/pages/pageScrollContainer.test.tsx` (`the outside-layout allowlist is exactly the pages the route table renders outside AppLayout`)
 
 **Out of scope.** A live identity provider, the stack integration, load, and browser
 levels (phases 5a and 5b), including any browser run of the login page in OIDC mode;
@@ -1973,7 +1982,10 @@ the integration suite, the frontend tests, and the browser suite were read, not 
 
 ### Open defects
 
-None at present.
+- Issue #1420, which blocks ADR 0016 phase 6: while `GET /api/auth/login-options` is
+  pending the login page renders today's page, password form included, and the request
+  has no client timeout, so an OIDC-mode page shows the password form until its answer
+  arrives, and indefinitely when the request hangs (IAM-OIDC-24).
 
 ### Limits by decision
 
