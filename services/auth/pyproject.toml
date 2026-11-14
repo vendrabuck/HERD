@@ -10,8 +10,7 @@ dependencies = [
     "asyncpg>=0.29.0",
     "alembic>=1.13.0",
     "pyjwt[crypto]>=2.15.1",
-    "passlib[bcrypt]>=1.7.4",
-    "bcrypt>=4.0.0,<4.1",
+    "bcrypt>=5.0.0",
     "pydantic-settings>=2.3.0",
     "pydantic[email]>=2.14.3",
     "python-multipart>=0.0.9",
@@ -44,7 +43,6 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 filterwarnings = [
     "error",
-    "ignore:'crypt' is deprecated:DeprecationWarning",
     "ignore:tagMap is deprecated:DeprecationWarning",
     "ignore:typeMap is deprecated:DeprecationWarning",
     # pytest-asyncio 1.4: see the root pyproject.toml.

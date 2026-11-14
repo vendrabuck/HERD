@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 
 from herd_common.advisory_lock import advisory_key_from_string, xact_lock
 from herd_common.pagination import paginate
-from passlib.context import CryptContext
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,24 +15,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models.federated_identity import SUBJECT_MAX_LENGTH, FederatedIdentity
 from app.models.user import RefreshToken, Role, User
-from app.services import ldap_service
+from app.services import ldap_service, passwords
 from app.utils.jwt import create_access_token, create_refresh_token, hash_token
 
 logger = logging.getLogger(__name__)
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 # Pre-computed hash used when the user is not found, so that bcrypt always runs
-# and login timing does not reveal whether an email exists.
-_DUMMY_HASH = pwd_context.hash("not-a-real-password")
+# and login timing does not reveal whether an email exists. Same ident and cost
+# as every new hash (app/services/passwords.py).
+_DUMMY_HASH = passwords.DUMMY_HASH
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    """One bcrypt check; False, never an exception, for any refusal (#1355)."""
+    return passwords.verify_password(plain_password, hashed_password)
 
 
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    """A new bcrypt hash of the password's first 72 UTF-8 bytes (#1355)."""
+    return passwords.hash_password(password)
 
 
 async def get_user_by_email(db: AsyncSession, email: str) -> User | None:
