@@ -1076,13 +1076,15 @@ included.
   `HERD_GATEWAY_BIND` into the container. `https://localhost/api/auth/oidc/callback`
   is always registered (the phase 5a live suite, and a stack bound to every
   interface, as on the GitHub runner), and `https://<HERD_GATEWAY_BIND>/api/auth/oidc/callback`
-  is added when that variable holds an address other than `0.0.0.0`, the rule
-  `make gateway-url` follows. Proved live: with the bind set, a full code flow
+  is added when that variable, trimmed, is a host other than `0.0.0.0` and `localhost` (an IPv4 dotted quad, a DNS name, or a bracketed IPv6 literal, and nothing else: a value holding whitespace, a newline, a quote, a slash, or a port registers localhost alone), the rule `make gateway-url` follows. Proved live: with the bind set, a full code flow
   through Dex's login form and the token endpoint succeeds for each of the two
   callbacks; with it `0.0.0.0` or empty, only localhost's does; every unregistered
   callback tried (another address, `0.0.0.0`, plain `http`, the unrendered
   template text) gets Dex's 400 `Unregistered redirect_uri`; and the live suite
-  passes unchanged against each.
+  passes unchanged against each. Tightened in the phase 5b review: the bind must match that host pattern,
+  proved by rendering hostile values (a quoted second URI, a newline followed by a
+  second entry, `::1`, a port, a path, a space), each of which renders localhost alone,
+  and by a live Dex started with the quoted value refusing both its parts.
 - As built, the suites (2026-11-14). `_gate-oidc-stack-tests` follows
   `_gate-ldap-stack-tests` step for step and also sets `OIDC_PROVIDER_NAME=Dex`; it
   runs in `master` and `everything` right after the LDAP-mode phase and in nightly
