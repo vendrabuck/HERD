@@ -3,11 +3,10 @@ import { NavLink, Outlet, useNavigate, useLocation } from "react-router-dom";
 import { useCurrentUser, useLogout } from "@/api/auth";
 import { useAuthStore } from "@/stores/authStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
-import { HelpCircle } from "lucide-react";
 import { NotificationBell } from "@/components/NotificationBell";
+import { HeaderHelpLink } from "@/components/layout/HeaderHelpLink";
 import { RouteErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { APP_VERSION } from "@/lib/appVersion";
-import { MANUAL_URL } from "@/lib/links";
 import { displayName } from "@/lib/profileEdit";
 import { visibleAdminNav } from "@/lib/adminNav";
 import { useRouteTitle } from "@/hooks/useRouteTitle";
@@ -172,15 +171,7 @@ export function AppLayout() {
           </nav>
         </div>
         <div className="flex items-center gap-3">
-          <a
-            href={MANUAL_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-            aria-label="Help"
-            className="text-gray-300 hover:text-white p-1 rounded hover:bg-gray-700 transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500"
-          >
-            <HelpCircle size={18} />
-          </a>
+          <HeaderHelpLink />
           <NotificationBell />
           <NavLink
             to="/settings"
