@@ -26,6 +26,14 @@ OidcIdTokenAlgorithm = Literal[
     "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512"
 ]
 
+# The authentication backends, one global switch (Settings.auth_method). The
+# ONE definition: the response models that report the mode
+# (schemas/auth.py LoginOptionsResponse, schemas/ldap_sync.py
+# LdapSyncStatusResponse) import it, so a mode Settings admits can never fail
+# to serialize there (the phase 5b review found the LDAP sync status answering
+# 500 in OIDC mode while it kept its own two-value Literal).
+AuthMethod = Literal["local", "ldap", "oidc"]
+
 # The path OIDC_REDIRECT_URI must end in (ADR 0016 D11).
 OIDC_CALLBACK_PATH_SUFFIX = "/oidc/callback"
 
@@ -62,7 +70,7 @@ class Settings(HerdBaseSettings):
     # admitted since ADR 0016 phase 5b, so the stack tests can run auth in that
     # mode; it is not yet supported for operators (absent from the config page
     # and the handbook until phase 6).
-    auth_method: Literal["local", "ldap", "oidc"] = "local"
+    auth_method: AuthMethod = "local"
 
     # LDAP / Active Directory settings. Only consulted when auth_method == "ldap".
     ldap_server_url: str = ""

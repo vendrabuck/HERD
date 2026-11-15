@@ -1,5 +1,5 @@
 export interface LdapSyncStatus {
-  auth_method: "local" | "ldap";
+  auth_method: "local" | "ldap" | "oidc";
   group_sync_enabled: boolean;
   sync_interval_seconds: number;
 }

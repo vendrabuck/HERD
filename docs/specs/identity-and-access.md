@@ -1194,17 +1194,18 @@ copy of the auth service.
   Enforced in: `services/auth/app/services/ldap_sync_service.py` (`start_background_run`) \
   Pinned by: none
 - **IAM-LOOP-7.** The status route answers `{auth_method, group_sync_enabled,
-  sync_interval_seconds}` in any auth mode, with the effective interval, not the raw
-  setting. \
+  sync_interval_seconds}` in any auth mode, `oidc` included (its `auth_method` type is
+  `AuthMethod` in `services/auth/app/config.py`, the one `Settings` uses), with the
+  effective interval, not the raw setting. \
   Enforced in: `services/auth/app/routers/ldap_sync.py` (`get_sync_status`) \
-  Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_status_reports_ldap_mode`, `test_status_reports_local_mode`, `test_status_reports_the_clamped_interval_not_the_raw_setting`, `test_status_never_409s_under_local_mode`)
+  Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_status_reports_ldap_mode`, `test_status_reports_local_mode`, `test_status_reports_oidc_mode`, `test_status_reports_the_clamped_interval_not_the_raw_setting`, `test_status_never_409s_under_local_mode`)
 - **IAM-LOOP-8.** Runs list newest first (id breaks ties); an unknown run id answers 404. \
   Enforced in: `services/auth/app/routers/ldap_sync.py` (`list_sync_runs`, `get_sync_run`) \
   Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_list_runs_paginates_newest_first`, `test_get_missing_run_is_404`)
 - **IAM-LOOP-9.** The admin page disables mapping create and sync-now unless the status
   says LDAP mode, and shows the interval only when the loop is on. \
   Enforced in: `frontend/src/pages/admin/LdapSyncPage.tsx` (`LdapSyncPage`) \
-  Pinned by: `frontend/src/test/pages/LdapSyncPage.test.tsx` (`local-auth mode shows the inactive banner and disables create/sync-now`, `ldap mode with the loop enabled shows the interval and enables actions`, `ldap mode with the loop disabled notes manual-only sync`)
+  Pinned by: `frontend/src/test/pages/LdapSyncPage.test.tsx` (`local-auth mode shows the inactive banner and disables create/sync-now`, `single sign-on mode keeps create/sync-now disabled (fail closed)`, `ldap mode with the loop enabled shows the interval and enables actions`, `ldap mode with the loop disabled notes manual-only sync`)
 - **IAM-LOOP-10.** The page shows a `running` row older than 30 minutes as `running
   (stale)` and polls the runs list every 2 seconds while any run is running and not
   stale. The 30 minutes is a display hint below the reaper's threshold by decision

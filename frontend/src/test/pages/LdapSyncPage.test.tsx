@@ -233,6 +233,22 @@ describe("LdapSyncPage", () => {
     expect(screen.getByText(SAMPLE_MAPPING.group_dn)).toBeInTheDocument();
   });
 
+  it("single sign-on mode keeps create/sync-now disabled (fail closed)", () => {
+    // auth answers auth_method "oidc" since ADR 0016 phase 5b; only "ldap"
+    // enables the directory actions.
+    mockUseLdapSyncStatus.mockReturnValue({
+      data: { auth_method: "oidc", group_sync_enabled: false, sync_interval_seconds: 3600 },
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    });
+    render(<LdapSyncPage />);
+    expect(screen.getByRole("button", { name: "Create mapping" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Sync now" })).toBeDisabled();
+    expect(screen.queryByText(/Automatic sync runs every/)).not.toBeInTheDocument();
+    expect(screen.getByText(SAMPLE_MAPPING.group_dn)).toBeInTheDocument();
+  });
+
   it("ldap mode with the loop enabled shows the interval and enables actions", () => {
     render(<LdapSyncPage />);
     expect(screen.getByText(/Automatic sync runs every 1 hour/)).toBeInTheDocument();

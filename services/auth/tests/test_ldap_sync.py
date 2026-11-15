@@ -312,6 +312,23 @@ async def test_status_reports_local_mode(monkeypatch, admin_client):
 
 
 @pytest.mark.asyncio
+async def test_status_reports_oidc_mode(monkeypatch, admin_client):
+    # The status model takes its mode type from Settings (config.AuthMethod);
+    # with its own two-value Literal this answered 500 in OIDC mode (the ADR
+    # 0016 phase 5b review).
+    monkeypatch.setattr(settings, "auth_method", "oidc", raising=False)
+    monkeypatch.setattr(settings, "ldap_group_sync_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "ldap_sync_interval_seconds", 3600, raising=False)
+    resp = await admin_client.get("/admin/ldap-sync/status")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "auth_method": "oidc",
+        "group_sync_enabled": False,
+        "sync_interval_seconds": 3600,
+    }
+
+
+@pytest.mark.asyncio
 async def test_status_reports_the_clamped_interval_not_the_raw_setting(monkeypatch, admin_client):
     # The status endpoint must report what the interval LOOP actually uses
     # (tasks.ldap_sync_loop.effective_interval_seconds's 60s floor), not the
