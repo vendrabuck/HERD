@@ -78,7 +78,7 @@ Read once at startup to create the seeded superadmin. Ignored on subsequent rest
 | `AUTH_ALGORITHM` | `HS256` | JWT signing algorithm: `HS256`, `HS384`, or `HS512`. Any other value, RS* included, is refused at startup with `AUTH_ALGORITHM must be one of HS256, HS384, HS512`, and the config UI refuses to save one. |
 | `AUTH_ACCESS_TOKEN_EXPIRE_MINUTES` | `30` | Access token lifetime. |
 | `AUTH_REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Refresh token lifetime. |
-| `AUTH_METHOD` | `local` | Authentication backend. `local` uses bcrypt-hashed passwords in the HERD database; `ldap` binds against the directory server configured below. Only one is active at a time. Auth also accepts `oidc` (OpenID Connect single sign-on, below), which is not yet supported for operators: the config page does not offer it, and a UI-saved `config.json` outranks the environment. |
+| `AUTH_METHOD` | `local` | Authentication backend. `local` uses bcrypt-hashed passwords in the HERD database; `ldap` binds against the directory server configured below. Only one is active at a time. Auth also accepts `oidc` (OpenID Connect single sign-on, below), which is not yet supported for operators: the config page's dropdown does not offer it, though the config service does not check the value, so its bootstrap copies an `oidc` from the environment into `config.json` and a save writes whatever value it is sent. |
 
 ## LDAP / Active Directory
 
@@ -141,10 +141,11 @@ LDAP_USE_TLS=true
 
 Not supported for operators yet. These settings belong to OpenID Connect single
 sign-on (ADR 0016, `docs/design/0016-oidc-single-sign-on.md`, issue #37), which is
-being built in phases. Auth accepts `AUTH_METHOD=oidc` when it is set by hand in the
-environment (since ADR 0016 phase 5b, so the gates and nightly can run the stack in
-that mode), but the config page does not offer it and the handbook does not describe
-it until phase 6; in any other mode, setting these to well-formed values changes
+being built in phases. Auth accepts `AUTH_METHOD=oidc` (since ADR 0016 phase 5b, so the
+gates and nightly can run the stack in that mode), from the environment or from
+`config.json`; the config service does not check the value against its dropdown, which
+offers only `local` and `ldap`, and the handbook does not describe the mode until phase
+6; in any other mode, setting these to well-formed values changes
 nothing. One carve-out applies in every mode: three of them are validated
 when auth loads its settings, and a refused value stops auth from starting, as a
 refused `AUTH_ALGORITHM` does. They are `OIDC_ID_TOKEN_ALGORITHM` with a value

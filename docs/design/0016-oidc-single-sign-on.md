@@ -893,9 +893,9 @@ with `monkeypatch`, the way `services/auth/tests/test_auth_ldap.py` sets `ldap`.
 Amended in phase 5b (decided by the owner on 2026-11-14): auth admits `oidc` from phase
 5b on, because phase 5b recreates the gate's auth service in that mode and auth refused
 to start with a value its `Literal` did not admit. From that merge the mode is reachable
-by an operator who sets `AUTH_METHOD=oidc` by hand in the environment; it is still
-absent from the config page and the handbook, and not supported for operators, until
-phase 6. See the phase 5b as-built notes. Every phase updates
+by an operator who sets `AUTH_METHOD=oidc`, in the environment or in `config.json`
+(the config service does not check the value); it is still absent from the config
+page's dropdown and the handbook, and not supported for operators, until phase 6. See the phase 5b as-built notes. Every phase updates
 `CHANGELOG.md` (Unreleased) and, where it adds behavior or a route, the
 identity-and-access specification in the same PR with numbered rules (a new `IAM-OIDC`
 topic). Sizes are rough: S under 300 changed lines, M 300 to 900, L over 900, tests
@@ -1056,10 +1056,15 @@ included.
   the gate's auth service with `AUTH_METHOD=oidc`, and auth refused to start with a
   value its `Literal` did not admit (a `ValidationError` at import), so no stack-level
   test could run before phase 6. The config service is not changed: its `AUTH_METHOD`
-  options stay `local` and `ldap`, so a UI-saved `config.json`, which outranks the
-  environment, can only name those two, and the gate's OIDC stack phase refuses to run
-  where one exists, as the LDAP stack phase does. Consequence, stated plainly: from this
-  merge an operator who sets `AUTH_METHOD=oidc` by hand reaches the mode before issues
+  dropdown options stay `local` and `ldap`, but it does not check a value against
+  them, so with `AUTH_METHOD=oidc` in its environment its first-boot bootstrap copies
+  `oidc` into `config.json`, and a save (`PUT /api/config/settings`) writes whatever
+  value it is sent (corrected in the phase 5b review; an earlier wording said a saved
+  `config.json` could only name `local` or `ldap`). The gate's OIDC stack phase refuses
+  to run where a UI-saved `config.json` exists, whatever it names, as the LDAP stack
+  phase does, because that file outranks the environment the phase sets. Consequence,
+  stated plainly: from this merge an operator who sets `AUTH_METHOD=oidc` reaches the
+  mode before issues
   #1399 (no recovery path when a first login collides, so an `OIDC_ISSUER` change locks
   out every SSO user) and #1420 (the login page shows the password form while
   `GET /login-options` is pending) are settled, so both block the 0.8.0 release.

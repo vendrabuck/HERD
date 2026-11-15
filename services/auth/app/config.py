@@ -68,8 +68,8 @@ class Settings(HerdBaseSettings):
     # "oidc" signs users in through an OpenID Connect provider (ADR 0016). The
     # toggle is global: only one backend is active at a time. "oidc" is
     # admitted since ADR 0016 phase 5b, so the stack tests can run auth in that
-    # mode; it is not yet supported for operators (absent from the config page
-    # and the handbook until phase 6).
+    # mode; it is not yet supported for operators (absent from the config
+    # page's dropdown and the handbook until phase 6).
     auth_method: AuthMethod = "local"
 
     # LDAP / Active Directory settings. Only consulted when auth_method == "ldap".
@@ -131,8 +131,8 @@ class Settings(HerdBaseSettings):
     ldap_ca_cert: str = ""
 
     # OpenID Connect single sign-on (ADR 0016, issue #37). Consulted only when
-    # auth_method == "oidc", which an operator reaches only by setting
-    # AUTH_METHOD by hand until ADR 0016 phase 6 supports it. Incomplete settings
+    # auth_method == "oidc", which auth admits since ADR 0016 phase 5b but which
+    # is not supported for operators until phase 6. Incomplete settings
     # never stop auth from booting (the LDAP precedent); see
     # oidc_configuration_problems and log_oidc_startup_warnings below.
     oidc_issuer: str = ""

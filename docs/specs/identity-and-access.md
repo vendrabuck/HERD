@@ -1686,12 +1686,12 @@ sync renames the account (IAM-PROFILE-7).
 sends it back, auth signs the person in (creating their account on the first visit),
 and the page trades a one-time cookie for the usual HERD tokens. The mode is not yet
 supported for operators: auth accepts `AUTH_METHOD=oidc` since ADR 0016 phase 5b, so the
-gates and nightly can run the stack in that mode, but only when it is set by hand in the
-environment; the config page offers only `local` and `ldap`, and the handbook does not
-describe the mode, until phase 6. A UI-saved `config.json` outranks the environment, so
-on a deployment with one, `AUTH_METHOD` is whatever the page saved (`local` or `ldap`),
-and the gate's OIDC stack phase refuses to run there. On every deployment that has not
-set the variable by hand, the three single sign-on routes answer 404, and the only
+gates and nightly can run the stack in that mode, and the handbook does not describe the
+mode until phase 6. Auth reads `AUTH_METHOD` from its environment, or from `config.json`
+once a save through the config service has made that file outrank the environment
+(OPS-SET-1). The config service does not check dropdown values: with `AUTH_METHOD=oidc` in its own environment (compose passes it the same `.env` value), its first-boot bootstrap copies `oidc` into `config.json`, and a save (`PUT /api/config/settings`) writes whatever `AUTH_METHOD` it is sent; the config page's `AUTH_METHOD` dropdown offers only `local` and `ldap`. The gate's OIDC stack phase refuses to run where a saved
+`config.json` exists, whatever it names. On every deployment whose `AUTH_METHOD` is not
+`oidc`, the three single sign-on routes answer 404, and the only
 visible effects are `GET /login-options` and, driven by it, the login page dropping its
 Register link in LDAP mode (IAM-OIDC-24); a local-mode login page is unchanged. The flow
 store and provisioning rules are IAM-OIDC-1 to IAM-OIDC-14 in section 4; the design is
@@ -2037,7 +2037,7 @@ Calls into this area are in section 7 and the forwarded-JWT group routes noted u
 | `AUTH_REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Refresh token lifetime |
 | `INTERNAL_API_TOKEN` | empty | Shared service secret; empty makes auth's and acl's internal routes answer 503 and the shared helpers answer false |
 | `SUPERADMIN_EMAIL`, `SUPERADMIN_USERNAME`, `SUPERADMIN_PASSWORD` | empty | First-startup superadmin; any empty skips the seed |
-| `AUTH_METHOD` | `local` | `local` or `ldap`; one backend for every login |
+| `AUTH_METHOD` | `local` | `local`, `ldap`, or `oidc` (not yet supported for operators, section 8.19); one backend for every login |
 | `LDAP_SERVER_URL`, `LDAP_BIND_DN`, `LDAP_BIND_PASSWORD`, `LDAP_USER_BASE_DN` | empty | Directory location and service account |
 | `LDAP_USER_FILTER` | `(sAMAccountName={username})` | Login search filter |
 | `LDAP_EMAIL_ATTRIBUTE`, `LDAP_USERNAME_ATTRIBUTE` | `mail`, `sAMAccountName` | Identity attributes |
