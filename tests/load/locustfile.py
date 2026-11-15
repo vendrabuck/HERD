@@ -818,9 +818,10 @@ class DeviceConfigUser(HerdUser):
 # services/auth/app/services/oidc_flow_service.py), so a short run cannot wait
 # for its own rows to qualify; instead, after one sequential warm-up sign-in
 # each as alice and carol, the two OIDC_LOAD_USERS (so concurrent first logins
-# never race to provision the same account), test_start plants EXPIRED_FLOW_ROWS rows that expired two
-# hours ago, and at the end every one of them must be gone (each begin prunes
-# up to 500) and the rows created since the run started must equal the begins
+# never race to provision the same account), test_start plants
+# EXPIRED_FLOW_ROWS rows that expired two hours ago, and at the end every one
+# of them must be gone (each begin prunes up to 500) and the rows created since
+# the run started must equal the begins
 # this process counted: exactly one row per sign-in, none left over. Accounts
 # federated with the lab's issuer, and any planted row left, are deleted when
 # locust quits (nothing is deleted before the run).
