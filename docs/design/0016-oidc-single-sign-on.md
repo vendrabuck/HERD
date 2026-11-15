@@ -1078,6 +1078,23 @@ included.
   callback tried (another address, `0.0.0.0`, plain `http`, the unrendered
   template text) gets Dex's 400 `Unregistered redirect_uri`; and the live suite
   passes unchanged against each.
+- As built, the suites (2026-11-14). `_gate-oidc-stack-tests` follows
+  `_gate-ldap-stack-tests` step for step and also sets `OIDC_PROVIDER_NAME=Dex`; it
+  runs in `master` and `everything` right after the LDAP-mode phase and in nightly
+  as its own step after the LDAP-mode step. Each suite is selected by its own
+  variable (`HERD_INTEGRATION_OIDC`, `HERD_LOAD_OIDC`, `HERD_E2E_OIDC`) and skips
+  without it; the e2e skip carries `seeded_skip_ok`. Three departures from the
+  level table above, each forced by the lab or the run length: the cancelled
+  sign-in in the browser test is the browser sent to the callback with
+  `error=access_denied` and its own flow's state, because the lab skips Dex's
+  approval screen and so has no cancel button; the load class cannot wait the hour
+  after expiry that pruning needs, so it plants 1000 rows that expired two hours ago
+  and requires every one pruned, plus exactly one new flow row per begin; and the
+  collision user's local account is inserted through Postgres when absent, because
+  the stack is unseeded at this phase and OIDC mode refuses registration (the
+  accounts the suites provision are deleted the same way, since auth has no API
+  that deletes a user). `docs/specs/TESTING.md` ("OIDC test provider") has the
+  detail.
 
 ### Phase 6: light up (M)
 
