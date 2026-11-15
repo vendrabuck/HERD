@@ -1380,8 +1380,9 @@ _gate-ldap-stack-tests:
 # fail saying so (`make oidc-down` first).
 #
 # Suites, in order: tests/integration/test_oidc_auth.py (HERD_INTEGRATION_OIDC=1
-# hard-requires it), the locust class OidcLoginUser only when OIDC_STACK_LOAD=1
-# (everything passes its EVERYTHING_LOAD; master runs no load phase), and the
+# hard-requires it), the locust class OidcLoginUser unless OIDC_STACK_LOAD is 0,
+# the default (the truth rule of EVERYTHING_LOAD, which everything passes, so
+# everything-noload skips this load run too; master runs no load phase), and the
 # Playwright test tests/e2e/test_oidc_login_playwright.py (HERD_E2E_OIDC=1
 # hard-requires it). Without those variables the same files skip, so the
 # ordinary test-integration, test-e2e, and test-load runs against a local-mode
@@ -1468,7 +1469,7 @@ _gate-oidc-stack-tests:
 		HERD_TEST_OIDC_HOST=$(HERD_TEST_OIDC_HOST) \
 		HERD_TEST_OIDC_PORT=$(HERD_TEST_OIDC_PORT) \
 		uv run pytest tests/integration/test_oidc_auth.py -v --timeout=60 && \
-	if [ "$(OIDC_STACK_LOAD)" = 1 ]; then \
+	if [ "$(OIDC_STACK_LOAD)" != "0" ]; then \
 		echo "" && echo "=== OIDC sign-in load (locust OidcLoginUser, 30 s) ===" && \
 		(cd tests/load && HERD_LOAD_OIDC=1 \
 			HERD_TEST_OIDC_HOST=$(HERD_TEST_OIDC_HOST) \
