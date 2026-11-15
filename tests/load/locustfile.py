@@ -1,6 +1,6 @@
 """Locust load test definitions for HERD.
 
-Eight user classes simulating different usage patterns:
+Eight user classes simulating different usage patterns, selected by default:
 - ReservationUser: creates, lists, queries calendar, releases reservations
 - InventoryBrowser: browses devices, templates, and the topologies list
 - BulkExporter: exports devices, templates, and topologies; dry-runs a device import
@@ -14,6 +14,11 @@ Eight user classes simulating different usage patterns:
   what it created
 - DeviceConfigUser: writes and reads config versions, the driver config schema,
   and the apply-job list on one device of its own, deleted at the end
+
+A ninth, OidcLoginUser (ADR 0016 phase 5b), signs in through the OIDC test
+provider; it is abstract unless HERD_LOAD_OIDC=1 and runs only in the
+Makefile's _gate-oidc-stack-tests phase, against a stack in OIDC mode (see its
+section at the end of this file).
 
 Note on the outbound notification channels and expiry reminder (ROADMAP #40):
 the dispatch side is a NATS consumer with no synchronous request surface, so it
@@ -33,7 +38,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import urllib3
-from locust import HttpUser, between, task
+from locust import HttpUser, between, events, task
+from locust.clients import HttpSession
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -792,3 +798,309 @@ class DeviceConfigUser(HerdUser):
             f"/api/inventory/devices/{self._device_id}/apply-jobs",
             name="/api/inventory/devices/[id]/apply-jobs",
         )
+
+
+# --- Single sign-on (ADR 0016 phase 5b, D12 level 4) ---------------------------
+#
+# OidcLoginUser drives the whole OpenID Connect redirect chain over HTTP: the
+# begin route, Dex's own login form (infra/oidc-test), the callback, the
+# handoff exchange, then a refresh and `GET /me` with the new token. It needs a
+# stack whose auth runs in OIDC mode against the lab, which only the Makefile's
+# _gate-oidc-stack-tests phase provides, so the class is abstract (never
+# selected) unless HERD_LOAD_OIDC=1, and that phase also names it on the
+# command line (`locust -f locustfile.py OidcLoginUser`), so the password-login
+# classes above never run against an OIDC-mode stack.
+#
+# What a run asserts: every request answers exactly what the chain expects
+# (any other status, a 5xx included, is a locust failure, and any failure or
+# task exception makes locust exit 1), and the flow table stays bounded. Rows
+# are pruned only once they expired more than an hour ago (PRUNE_AFTER in
+# services/auth/app/services/oidc_flow_service.py), so a short run cannot wait
+# for its own rows to qualify; instead, after one sequential warm-up sign-in
+# per fixture user (so concurrent first logins never race to provision the
+# same account), test_start plants EXPIRED_FLOW_ROWS rows that expired two
+# hours ago, and at the end every one of them must be gone (each begin prunes
+# up to 500) and the rows created since the run started must equal the begins
+# this process counted: exactly one row per sign-in, none left over. Accounts
+# federated with the lab's issuer are deleted at the end, as the integration
+# and e2e suites do.
+
+OIDC_LOAD = os.getenv("HERD_LOAD_OIDC") == "1"
+OIDC_TEST_HOST = os.getenv("HERD_TEST_OIDC_HOST", "127.0.0.1")
+OIDC_TEST_PORT = int(os.getenv("HERD_TEST_OIDC_PORT", "5556"))
+OIDC_ISSUER = "http://oidc-test:5556/dex"
+OIDC_PASSWORD = "oidc-test-password"
+OIDC_LOAD_USERS = ("alice@oidc.example.com", "carol@oidc.example.com")
+EXPIRED_FLOW_ROWS = 1000
+EXPIRED_STATE_PREFIX = "oidc-load-expired-"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+_oidc_run = {"begins": 0, "started_at": None, "rows_before": 0, "problem": None}
+
+
+def _psql(sql: str) -> str:
+    """One statement in the stack's Postgres through `docker compose exec`
+    (COMPOSE_PROJECT_NAME picks the project); its tuples-only output."""
+    import subprocess
+
+    cmd = [
+        "docker",
+        "compose",
+        "exec",
+        "-T",
+        "postgres",
+        "psql",
+        "-U",
+        os.getenv("POSTGRES_USER", "herd"),
+        "-d",
+        os.getenv("POSTGRES_DB", "herd"),
+        "-tA",
+        "-c",
+        sql,
+    ]
+    result = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError(f"psql failed ({result.returncode}): {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def _dex_url(url: str) -> str:
+    """`url` with the issuer's host and port replaced by the lab's published address."""
+    prefix = "http://oidc-test:5556"
+    if url.startswith(prefix):
+        return f"http://{OIDC_TEST_HOST}:{OIDC_TEST_PORT}" + url[len(prefix) :]
+    return url
+
+
+def _expect(client, method, url, name, statuses, check=None, **kwargs):
+    """One request; the response when its status is in `statuses` and `check`
+    (which returns a problem string or None) finds nothing, else None after
+    marking it a locust failure."""
+    with client.request(
+        method,
+        url,
+        name=name,
+        catch_response=True,
+        allow_redirects=False,
+        verify=False,
+        **kwargs,
+    ) as resp:
+        if resp.status_code not in statuses:
+            resp.failure(f"HTTP {resp.status_code}, expected {sorted(statuses)}")
+            return None
+        problem = check(resp) if check else None
+        if problem:
+            resp.failure(problem)
+            return None
+        resp.success()
+        return resp
+
+
+def _oidc_sign_in(client, email: str) -> bool:
+    """The full chain as `email` on `client` (one cookie jar, one browser)."""
+    import re
+    from html import unescape
+    from urllib.parse import parse_qs, urljoin, urlsplit
+
+    def to_issuer(resp):
+        location = resp.headers.get("location", "")
+        return None if location.startswith(f"{OIDC_ISSUER}/auth?") else f"Location {location!r}"
+
+    begin = _expect(client, "GET", "/api/auth/oidc/login", "/api/auth/oidc/login", {302}, to_issuer)
+    if begin is None:
+        return False
+    _oidc_run["begins"] += 1
+    authorization_url = begin.headers["location"]
+    redirect_uri = parse_qs(urlsplit(authorization_url).query)["redirect_uri"][0]
+
+    url, resp, posted = _dex_url(authorization_url), None, False
+    for _ in range(10):
+        resp = _expect(client, "GET", url, "dex: authorization", {200, 302, 303})
+        if resp is None:
+            return False
+        if resp.status_code == 200:
+            # A page after the form post (Dex's "invalid credentials" page, say),
+            # or a page with no form, is a broken chain: raised, so locust
+            # counts it as a task exception and exits 1.
+            if posted:
+                raise AssertionError(f"Dex answered a page after the login post at {url}")
+            form = re.search(r'<form[^>]*action="([^"]*)"', resp.text)
+            if form is None:
+                raise AssertionError(f"no login form at {url}")
+            resp = _expect(
+                client,
+                "POST",
+                urljoin(url, unescape(form.group(1))),
+                "dex: login form",
+                {302, 303},
+                data={"login": email, "password": OIDC_PASSWORD},
+            )
+            if resp is None:
+                return False
+            posted = True
+        location = urljoin(url, resp.headers["location"])
+        if location.startswith(redirect_uri + "?"):
+            break
+        url = _dex_url(location)
+    else:
+        raise AssertionError("Dex redirected more than ten times")
+
+    def to_completion(resp):
+        location = resp.headers.get("location", "")
+        return None if location == "/login/sso" else f"Location {location!r}"
+
+    if _expect(client, "GET", location, "/api/auth/oidc/callback", {302}, to_completion) is None:
+        return False
+
+    def with_tokens(resp):
+        body = resp.json()
+        return None if body.get("access_token") and body.get("refresh_token") else "no tokens"
+
+    exchange = _expect(
+        client,
+        "POST",
+        "/api/auth/oidc/exchange",
+        "/api/auth/oidc/exchange",
+        {200},
+        with_tokens,
+        json={},
+    )
+    if exchange is None:
+        return False
+    refreshed = _expect(
+        client,
+        "POST",
+        "/api/auth/refresh",
+        "/api/auth/refresh",
+        {200},
+        with_tokens,
+        json={"refresh_token": exchange.json()["refresh_token"]},
+    )
+    if refreshed is None:
+        return False
+
+    def is_signer(resp):
+        return None if resp.json().get("email") == email else "another account"
+
+    me = _expect(
+        client,
+        "GET",
+        "/api/auth/me",
+        "/api/auth/me",
+        {200},
+        is_signer,
+        headers={"Authorization": f"Bearer {refreshed.json()['access_token']}"},
+    )
+    return me is not None
+
+
+class OidcLoginUser(HttpUser):
+    """Signs in through the OIDC lab, refreshes, and reads `/me`, over and over.
+
+    Abstract unless HERD_LOAD_OIDC=1 (see the section comment above)."""
+
+    abstract = not OIDC_LOAD
+    weight = 1
+    wait_time = between(0.5, 1.5)
+
+    @task
+    def sign_in(self):
+        # A fresh cookie jar per sign-in, as a fresh browser.
+        self.client.cookies.clear()
+        _oidc_sign_in(self.client, random.choice(OIDC_LOAD_USERS))
+
+
+def _delete_oidc_load_rows() -> None:
+    _psql(
+        "DELETE FROM auth.users WHERE id IN (SELECT user_id FROM auth.federated_identities "
+        f"WHERE issuer = '{OIDC_ISSUER}')"
+    )
+    _psql(f"DELETE FROM auth.oidc_login_flows WHERE state_hash LIKE '{EXPIRED_STATE_PREFIX}%'")
+
+
+@events.test_start.add_listener
+def _oidc_test_start(environment, **kwargs):
+    if not OIDC_LOAD:
+        return
+    import requests
+
+    try:
+        options = requests.get(
+            f"{environment.host}/api/auth/login-options", verify=False, timeout=15
+        )
+        mode = options.json().get("auth_method") if options.status_code == 200 else None
+        if mode != "oidc":
+            raise RuntimeError(f"the stack's auth_method is {mode!r}, not 'oidc'")
+        _oidc_run["started_at"] = _psql("SELECT now()")
+        _oidc_run["rows_before"] = int(_psql("SELECT count(*) FROM auth.oidc_login_flows"))
+        warm_up = HttpSession(
+            base_url=environment.host, request_event=environment.events.request, user=None
+        )
+        for email in OIDC_LOAD_USERS:
+            if not _oidc_sign_in(warm_up, email):
+                raise RuntimeError(f"the warm-up sign-in as {email} failed")
+        _psql(
+            "INSERT INTO auth.oidc_login_flows (id, state_hash, binding_hash, nonce, "
+            "code_verifier, next_path, status, created_at, expires_at) SELECT "
+            f"gen_random_uuid(), '{EXPIRED_STATE_PREFIX}' || g, 'oidc-load-expired', 'n', NULL, "
+            "'/topology', 'failed', now() - interval '3 hours', now() - interval '2 hours' "
+            f"FROM generate_series(1, {EXPIRED_FLOW_ROWS}) AS g"
+        )
+    except Exception as exc:
+        _oidc_run["problem"] = f"OIDC load setup failed: {exc}"
+        logger.error(_oidc_run["problem"])
+        environment.runner.quit()
+
+
+@events.quitting.add_listener
+def _oidc_quitting(environment, **kwargs):
+    if not OIDC_LOAD or _oidc_run["started_at"] is None:
+        if OIDC_LOAD and _oidc_run["problem"]:
+            environment.process_exit_code = 1
+        return
+    problems = [_oidc_run["problem"]] if _oidc_run["problem"] else []
+    try:
+        left = int(
+            _psql(
+                "SELECT count(*) FROM auth.oidc_login_flows "
+                f"WHERE state_hash LIKE '{EXPIRED_STATE_PREFIX}%'"
+            )
+        )
+        created = int(
+            _psql(
+                "SELECT count(*) FROM auth.oidc_login_flows WHERE created_at >= "
+                f"'{_oidc_run['started_at']}'::timestamptz"
+            )
+        )
+        total = int(_psql("SELECT count(*) FROM auth.oidc_login_flows"))
+        begins = _oidc_run["begins"]
+        logger.info(
+            "OIDC load: %d begins, %d flow rows created, %d of %d expired rows left, "
+            "%d rows before, %d after",
+            begins,
+            created,
+            left,
+            EXPIRED_FLOW_ROWS,
+            _oidc_run["rows_before"],
+            total,
+        )
+        if left:
+            problems.append(f"{left} of {EXPIRED_FLOW_ROWS} expired flow rows were not pruned")
+        if created != begins:
+            problems.append(f"{created} flow rows were created for {begins} begins")
+        if total > _oidc_run["rows_before"] + begins:
+            problems.append(
+                f"the flow table holds {total} rows, more than {_oidc_run['rows_before']} "
+                f"before plus {begins} begins"
+            )
+    except Exception as exc:
+        problems.append(f"the flow-table check failed: {exc}")
+    finally:
+        try:
+            _delete_oidc_load_rows()
+        except Exception as exc:
+            problems.append(f"cleanup failed: {exc}")
+    for problem in problems:
+        logger.error(problem)
+    if problems:
+        environment.process_exit_code = 1
