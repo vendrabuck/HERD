@@ -1482,7 +1482,6 @@ _gate-oidc-stack-tests:
 	echo "" && echo "=== OIDC browser e2e against the gate stack ===" && \
 	HERD_E2E_OIDC=1 \
 		HERD_TEST_OIDC_HOST=$(HERD_TEST_OIDC_HOST) \
-		HERD_TEST_OIDC_PORT=$(HERD_TEST_OIDC_PORT) \
 		uv run pytest tests/e2e/test_oidc_login_playwright.py -v --tb=short
 
 ## --- Coverage ---

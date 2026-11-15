@@ -825,9 +825,15 @@ class DeviceConfigUser(HerdUser):
 # federated with the lab's issuer are deleted at the end, as the integration
 # and e2e suites do.
 
-OIDC_LOAD = os.getenv("HERD_LOAD_OIDC") == "1"
-OIDC_TEST_HOST = os.getenv("HERD_TEST_OIDC_HOST", "127.0.0.1")
-OIDC_TEST_PORT = int(os.getenv("HERD_TEST_OIDC_PORT", "5556"))
+# The environment this class reads; the gate phase sets exactly these, which
+# tests/unit/test_oidc_stack_gate_wiring.py pins by reading these constants.
+OIDC_LOAD_SELECTOR_ENV = "HERD_LOAD_OIDC"
+OIDC_TEST_HOST_ENV = "HERD_TEST_OIDC_HOST"
+OIDC_TEST_PORT_ENV = "HERD_TEST_OIDC_PORT"
+
+OIDC_LOAD = os.getenv(OIDC_LOAD_SELECTOR_ENV) == "1"
+OIDC_TEST_HOST = os.getenv(OIDC_TEST_HOST_ENV, "127.0.0.1")
+OIDC_TEST_PORT = int(os.getenv(OIDC_TEST_PORT_ENV, "5556"))
 OIDC_ISSUER = "http://oidc-test:5556/dex"
 OIDC_PASSWORD = "oidc-test-password"
 OIDC_LOAD_USERS = ("alice@oidc.example.com", "carol@oidc.example.com")

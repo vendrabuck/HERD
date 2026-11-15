@@ -872,7 +872,8 @@ def pw_page(pw_browser):
 # The address the OIDC test provider (infra/oidc-test) publishes on, which the
 # Makefile's _gate-oidc-stack-tests passes: the gateway bind address, or
 # 127.0.0.1 when that is unset or 0.0.0.0.
-OIDC_TEST_HOST = os.environ.get("HERD_TEST_OIDC_HOST", "127.0.0.1")
+OIDC_TEST_HOST_ENV = "HERD_TEST_OIDC_HOST"
+OIDC_TEST_HOST = os.environ.get(OIDC_TEST_HOST_ENV, "127.0.0.1")
 
 
 @pytest.fixture(scope="session")

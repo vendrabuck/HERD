@@ -50,8 +50,14 @@ import httpx
 import pytest
 from conftest import BASE_URL, SEED_EMAIL, SEED_PASSWORD, _psql
 
-OIDC_HOST = os.getenv("HERD_TEST_OIDC_HOST", "127.0.0.1")
-OIDC_PORT = int(os.getenv("HERD_TEST_OIDC_PORT", "5556"))
+# The environment this suite reads; the gate phase sets exactly these, which
+# tests/unit/test_oidc_stack_gate_wiring.py pins by reading these constants.
+SELECTOR_ENV = "HERD_INTEGRATION_OIDC"
+OIDC_HOST_ENV = "HERD_TEST_OIDC_HOST"
+OIDC_PORT_ENV = "HERD_TEST_OIDC_PORT"
+
+OIDC_HOST = os.getenv(OIDC_HOST_ENV, "127.0.0.1")
+OIDC_PORT = int(os.getenv(OIDC_PORT_ENV, "5556"))
 ISSUER_HOST = "oidc-test"
 ISSUER_PORT = 5556
 ISSUER = f"http://{ISSUER_HOST}:{ISSUER_PORT}/dex"
@@ -81,8 +87,8 @@ REGISTER_DISABLED_DETAIL = "Local registration is disabled; this deployment uses
 pytestmark = [
     pytest.mark.asyncio,
     pytest.mark.skipif(
-        os.getenv("HERD_INTEGRATION_OIDC") != "1",
-        reason="HERD_INTEGRATION_OIDC not set; the stack is not configured for OIDC auth.",
+        os.getenv(SELECTOR_ENV) != "1",
+        reason=f"{SELECTOR_ENV} not set; the stack is not configured for OIDC auth.",
     ),
 ]
 
@@ -126,7 +132,7 @@ def _stack_in_oidc_mode():
             pass
     except OSError:
         pytest.fail(
-            f"HERD_INTEGRATION_OIDC=1 but no OIDC provider answers at {OIDC_HOST}:{OIDC_PORT}; "
+            f"{SELECTOR_ENV}=1 but no OIDC provider answers at {OIDC_HOST}:{OIDC_PORT}; "
             "run this through `make _gate-oidc-stack-tests`, or `make oidc-up` first."
         )
     try:
@@ -134,13 +140,13 @@ def _stack_in_oidc_mode():
             resp = client.get(f"{BASE_URL}/auth/login-options")
     except httpx.HTTPError as exc:
         pytest.fail(
-            f"HERD_INTEGRATION_OIDC=1 but the stack at {BASE_URL} does not answer "
+            f"{SELECTOR_ENV}=1 but the stack at {BASE_URL} does not answer "
             f"({type(exc).__name__}); check HERD_BASE_URL."
         )
     mode = resp.json().get("auth_method") if resp.status_code == 200 else None
     if mode != "oidc":
         pytest.fail(
-            f"HERD_INTEGRATION_OIDC=1 but GET /api/auth/login-options answers {resp.status_code} "
+            f"{SELECTOR_ENV}=1 but GET /api/auth/login-options answers {resp.status_code} "
             f"with auth_method {mode!r}, not 'oidc'; the gate phase recreates auth in OIDC mode."
         )
 

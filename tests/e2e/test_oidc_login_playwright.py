@@ -48,11 +48,15 @@ CANCELLED_MESSAGE = "Sign-in was cancelled."
 FAILED_MESSAGE = "Single sign-on failed. If this continues, contact an administrator."
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+# The variable that selects this module; the gate phase sets it, and
+# tests/unit/test_oidc_stack_gate_wiring.py pins that by reading this constant
+# (and conftest.py's OIDC_TEST_HOST_ENV).
+SELECTOR_ENV = "HERD_E2E_OIDC"
 
 pytestmark = [
     pytest.mark.skipif(
-        os.environ.get("HERD_E2E_OIDC") != "1",
-        reason="HERD_E2E_OIDC not set; the stack is not configured for OIDC auth.",
+        os.environ.get(SELECTOR_ENV) != "1",
+        reason=f"{SELECTOR_ENV} not set; the stack is not configured for OIDC auth.",
     ),
     pytest.mark.seeded_skip_ok(
         "gate stack runs AUTH_METHOD=local; the OIDC-mode stack phase runs this file "
@@ -105,7 +109,7 @@ def _stack_in_oidc_mode():
     mode = resp.json().get("auth_method") if resp.status_code == 200 else None
     if mode != "oidc":
         pytest.fail(
-            f"HERD_E2E_OIDC=1 but GET /api/auth/login-options answers {resp.status_code} with "
+            f"{SELECTOR_ENV}=1 but GET /api/auth/login-options answers {resp.status_code} with "
             f"auth_method {mode!r}, not 'oidc'; the gate phase recreates auth in OIDC mode."
         )
     _delete_federated_accounts()
