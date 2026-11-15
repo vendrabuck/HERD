@@ -401,7 +401,8 @@ async def test_the_seeded_superadmin_password_login_is_refused_with_break_glass_
     _, _, auth_source, role, is_active = _account_row(SEED_EMAIL)
     assert (auth_source, role, is_active) == ("local", "SUPERADMIN", "true")
     stored = _sql(f"SELECT hashed_password FROM auth.users WHERE email = {_quote(SEED_EMAIL)}")
-    assert bcrypt.checkpw(SEED_PASSWORD.encode(), stored.encode()), (
+    # Auth hashes the password's first 72 bytes (services/auth/app/services/passwords.py).
+    assert bcrypt.checkpw(SEED_PASSWORD.encode()[:72], stored.encode()), (
         "SEED_PASSWORD is not the seeded superadmin's password; the refusal would prove nothing"
     )
     async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
