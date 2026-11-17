@@ -1424,14 +1424,15 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
 **What it does.** The `?` icon in the header opens the published user manual in a new
 tab.
 
-**Surfaces.** `frontend/src/lib/links.ts`, `frontend/src/components/layout/AppLayout.tsx`.
+**Surfaces.** `frontend/src/lib/links.ts`, `frontend/src/components/layout/HeaderHelpLink.tsx`,
+`frontend/src/components/layout/AppLayout.tsx` (AppLayout renders the link).
 
 **Rules.**
 
 - **OPS-HELP-1.** The header links to `MANUAL_URL`, the published manual address, defined
   once. \
-  Enforced in: `frontend/src/lib/links.ts` (`MANUAL_URL`); `frontend/src/components/layout/AppLayout.tsx` (`MANUAL_URL`) \
-  Pinned by: `frontend/src/test/components/AppLayout.test.tsx` (`renders a Settings link and a help link to the published manual`)
+  Enforced in: `frontend/src/lib/links.ts` (`MANUAL_URL`); `frontend/src/components/layout/HeaderHelpLink.tsx` (`MANUAL_URL`) \
+  Pinned by: `frontend/src/test/components/AppLayout.test.tsx` (`renders a Settings link and a help link to the published manual`); `frontend/src/test/components/HeaderHelpLink.test.tsx` (`is a link named Help that points at the published manual`)
 
 **Out of scope.** The manual's content (`docs/manual/`).
 
