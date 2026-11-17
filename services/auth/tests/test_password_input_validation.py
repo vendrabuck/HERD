@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from app.models.user import User
+from app.models.user import Role, User
 from app.schemas.auth import LoginRequest, RegisterRequest
 from app.services import passwords
 from pydantic import ValidationError
@@ -231,37 +231,79 @@ async def test_a_register_with_an_honest_8_character_password_still_succeeds(cli
     assert await _user_count() == 1
 
 
-# -- 3. No 422 echoes a submitted password --------------------------------------------
+# -- 3. No 422 holds a submitted password ---------------------------------------------
+#
+# The guarantee (IAM-HASH-9) is about passwords: no 422 carries pydantic's `input`
+# or `ctx`, and every error a password field can raise has fixed text. The matrix
+# below drives every way a password-bearing body can fail, for each schema that
+# carries one, and checks the password appears nowhere in the response. A failure
+# that is not itself a 422 (an extra key, a NUL at login) is paired with a broken
+# sibling so the body still fails validation with the password in it.
 
-_SECRET = "Sup3r-secret-Value"
-_ECHO_CASES = {
-    "register_too_short": (
+_PW = "Pw-Secret-7731"
+_SHORT_PW = "Pw-S3c!"  # 7 characters, under the register minimum
+
+_REGISTER_OK = {"email": "e@example.com", "username": "abc"}
+_LOGIN_OK = {"email": "e@example.com"}
+
+_PASSWORD_FAILURES = {
+    # register
+    "register-missing_sibling": ("/register", {"email": "e@example.com", "password": _PW}),
+    "register-bad_sibling": ("/register", {**_REGISTER_OK, "username": "a b", "password": _PW}),
+    "register-wrong_type_list": ("/register", {**_REGISTER_OK, "password": [_PW]}),
+    "register-wrong_type_object": ("/register", {**_REGISTER_OK, "password": {_PW: _PW}}),
+    "register-too_short": ("/register", {**_REGISTER_OK, "password": _SHORT_PW}),
+    "register-too_long": ("/register", {**_REGISTER_OK, "password": _PW + "x" * 80}),
+    "register-nul": ("/register", {**_REGISTER_OK, "password": _PW + "\x00"}),
+    "register-surrogate": ("/register", {**_REGISTER_OK, "password": _PW + "\ud800"}),
+    "register-extra_key": (
         "/register",
-        {"email": "e@example.com", "username": "abc", "password": "Sh0rt-x"},
+        {"email": "e@example.com", "password": _PW, "password_confirm": _PW},
     ),
-    "register_too_long": (
-        "/register",
-        {"email": "e@example.com", "username": "abc", "password": _SECRET + "x" * 60},
-    ),
-    "register_bad_email": (
-        "/register",
-        {"email": "not-an-email", "username": "abc", "password": _SECRET},
-    ),
-    "register_missing_username": ("/register", {"email": "e@example.com", "password": _SECRET}),
-    "login_too_long": ("/login", {"email": "e@example.com", "password": _SECRET + "x" * 60}),
-    "login_missing_email": ("/login", {"password": _SECRET}),
-    "login_password_not_a_string": ("/login", {"email": "e@example.com", "password": [_SECRET]}),
+    # login
+    "login-missing_sibling": ("/login", {"password": _PW}),
+    "login-empty_sibling": ("/login", {"email": "", "password": _PW}),
+    "login-wrong_type_list": ("/login", {**_LOGIN_OK, "password": [_PW]}),
+    "login-wrong_type_object": ("/login", {**_LOGIN_OK, "password": {_PW: _PW}}),
+    "login-too_long": ("/login", {**_LOGIN_OK, "password": _PW + "x" * 80}),
+    "login-nul": ("/login", {"password": _PW + "\x00"}),  # alone a NUL is the 401
+    "login-surrogate": ("/login", {**_LOGIN_OK, "password": _PW + "\ud800"}),
+    "login-extra_key": ("/login", {"password": _PW, "password_confirm": _PW}),
 }
 
 
-@pytest.mark.parametrize("case", _ECHO_CASES.values(), ids=_ECHO_CASES.keys())
+@pytest.mark.parametrize("case", _PASSWORD_FAILURES.values(), ids=_PASSWORD_FAILURES.keys())
 async def test_a_422_never_echoes_the_submitted_password(client, case):
     path, body = case
-    response = await client.post(path, json=body)
+    # json.dumps writes a lone surrogate as its escape, which json= cannot send.
+    response = await client.post(path, content=json.dumps(body).encode(), headers=JSON)
     assert response.status_code == 422, response.text
-    assert "Sh0rt-x" not in response.text and _SECRET not in response.text
+    assert _PW not in response.text and _SHORT_PW not in response.text
     for error in response.json()["detail"]:
         assert set(error) == {"type", "loc", "msg"}
+
+
+async def test_msg_and_loc_can_still_quote_submitted_text(make_client):
+    """Known and accepted (IAM-HASH-9): the handler drops `input` and `ctx`, not
+    every byte a caller sent. `msg` is the validator's own text and can quote part
+    of an email or UUID; `loc` names the keys the caller sent. None of these is a
+    password field. A change here is a change to the rule, not a test fix."""
+    async with make_client(mock_user(Role.ADMIN)) as ac:
+        bad_char = await ac.post(
+            "/register", json={**_REGISTER_OK, "email": "a@sec_ret.com", "password": _PW}
+        )
+        ip_literal = await ac.post(
+            "/register", json={**_REGISTER_OK, "email": "secret@[1.2.3.999]", "password": _PW}
+        )
+        bad_uuid = await ac.get("/groups/Zz-not-a-uuid")
+        extra_key = await ac.patch("/me/profile", json={"MyPassw0rd!": "x"})
+    for response in (bad_char, ip_literal, bad_uuid, extra_key):
+        assert response.status_code == 422, response.text
+        assert _PW not in response.text
+    assert "'_'" in bad_char.json()["detail"][0]["msg"]
+    assert "1.2.3.999" in ip_literal.json()["detail"][0]["msg"]
+    assert "`Z`" in bad_uuid.json()["detail"][0]["msg"]
+    assert extra_key.json()["detail"][0]["loc"] == ["body", "MyPassw0rd!"]
 
 
 async def test_a_surrogate_dict_key_is_422_not_500(make_client):

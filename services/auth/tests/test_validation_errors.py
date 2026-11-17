@@ -13,7 +13,11 @@ from __future__ import annotations
 import json
 
 from app.main import app
-from app.validation_errors import validation_error_handler
+from app.validation_errors import (
+    RENDERED_KEYS,
+    restrict_validation_error_schema,
+    validation_error_handler,
+)
 from fastapi.exceptions import RequestValidationError
 
 
@@ -89,3 +93,30 @@ async def test_the_handler_keeps_honest_non_ascii_text_unchanged():
         [{"type": "value_error", "loc": ("body", "full_name"), "msg": "Caf\u00e9 \U0001f511"}]
     )
     assert body["detail"][0]["msg"] == "Caf\u00e9 \U0001f511"
+
+
+# -- The advertised shape ---------------------------------------------------------------
+
+
+def test_the_openapi_document_advertises_exactly_the_rendered_keys():
+    """The OpenAPI `ValidationError` lists `type`, `loc`, and `msg` only, the keys
+    the handler sends, and still requires all three; FastAPI's default also listed
+    `input` and `ctx`."""
+    app.openapi_schema = None  # rebuild through the override, not a cached copy
+    component = app.openapi()["components"]["schemas"]["ValidationError"]
+    assert set(component["properties"]) == set(RENDERED_KEYS) == {"type", "loc", "msg"}
+    assert sorted(component["required"]) == ["loc", "msg", "type"]
+    assert app.openapi() is app.openapi()  # built once, then cached
+
+
+async def test_every_rendered_error_has_exactly_the_advertised_keys():
+    advertised = set(app.openapi()["components"]["schemas"]["ValidationError"]["properties"])
+    _, body = await _render(
+        [{"type": "missing", "loc": ("body", "x"), "msg": "Field required", "input": {}}]
+    )
+    assert [set(error) for error in body["detail"]] == [advertised]
+
+
+def test_restrict_leaves_a_document_without_the_component_alone():
+    document = {"openapi": "3.1.0", "paths": {}}
+    assert restrict_validation_error_schema(document) == {"openapi": "3.1.0", "paths": {}}

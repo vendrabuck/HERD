@@ -4,7 +4,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.exceptions import RequestValidationError
 from herd_common.cors import add_cors_middleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.schema_init import create_all_and_stamp
@@ -31,7 +30,7 @@ from app.tasks.ldap_sync_loop import (
     ldap_group_sync_loop_enabled,
     ldap_sync_loop,
 )
-from app.validation_errors import validation_error_handler
+from app.validation_errors import install_validation_errors
 
 setup_logging("auth", level=settings.log_level)
 logger = logging.getLogger(__name__)
@@ -148,8 +147,10 @@ add_cors_middleware(app, settings.cors_origins)
 
 app.add_middleware(RequestLoggingMiddleware)
 
-# A 422 never echoes a submitted value and never fails to encode (issue #1426).
-app.add_exception_handler(RequestValidationError, validation_error_handler)
+# Every 422 is `{type, loc, msg}`: no `input` or `ctx`, so no submitted password,
+# and it always encodes (issue #1426). `msg` and `loc` can still quote part of an
+# email, a UUID, or a key name (see app/validation_errors.py).
+install_validation_errors(app)
 
 app.include_router(auth_router)
 app.include_router(admin_router)

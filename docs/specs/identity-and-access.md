@@ -1772,7 +1772,7 @@ skip list).
   Enforced in: `services/auth/app/routers/oidc.py` (`federated_login_from_token`); `services/auth/app/services/auth_service.py` (`oidc_username`, `OIDC_USERNAME_PATTERN`, `_first_login_refusal`, `username_unusable`) \
   Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_option_c_picks_the_claim_then_the_email_then_nothing`, `test_option_c_pattern_is_the_owners_allowlist`, `test_a_returning_login_ignores_the_username`, `test_username_unusable_selects_the_refusal_reason`, `test_username_unusable_is_ignored_when_the_username_fits`); `services/auth/tests/test_oidc_routes.py` (`test_option_c_username_over_http`, `test_federated_login_from_token_maps_every_field`, `test_option_c_mapping_table`, `test_provisioning_refusals_answer_failed_and_link_nothing`)
 - **IAM-OIDC-20.** `POST /oidc/exchange` takes exactly `{}` sent with a JSON
-  Content-Type (anything else is FastAPI's 422, which consumes nothing) and consumes
+  Content-Type (anything else is a 422, which consumes nothing) and consumes
   the `herd_oidc_handoff` cookie once, answering 200 with `access_token`,
   `refresh_token`, `token_type` `bearer`, and `next` (the stored, sanitized return
   path). It answers 401 `Single sign-on session expired; sign in again` when the cookie
@@ -1963,15 +1963,20 @@ it on the pre-#1355 commit, is replayed by the tests
   bound, and passlib is not installed; importing and first use raise no warning. \
   Enforced in: `services/auth/pyproject.toml` (`bcrypt>=5.0.0`) \
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_passlib_is_not_installed`, `test_import_and_first_use_raise_no_warning`)
-- **IAM-HASH-9.** No 422 the auth service answers holds a submitted value, so none
-  echoes a password (issue #1426): each validation error is rendered as exactly
-  `{type, loc, msg}`, without pydantic's `input` (for a missing field, the whole body)
-  or `ctx`, and any lone surrogate in `loc` or `msg` is replaced with U+FFFD, so the
-  body always encodes and the 422 never becomes a 500. Every other service, the acl
-  grant and check routes included, still renders FastAPI's default 422, which echoes
-  `input`. \
-  Enforced in: `services/auth/app/validation_errors.py` (`validation_error_handler`, `render_validation_errors`); `services/auth/app/main.py` (`app`) \
-  Pinned by: `services/auth/tests/test_validation_errors.py` (`test_the_handler_is_installed_for_request_validation_errors`, `test_the_handler_keeps_type_loc_msg_and_drops_input_ctx_and_everything_else`, `test_the_handler_replaces_a_lone_surrogate_in_loc_and_msg_and_keeps_integers`, `test_the_handler_keeps_honest_non_ascii_text_unchanged`); `services/auth/tests/test_password_input_validation.py` (`test_a_422_never_echoes_the_submitted_password`, `test_a_surrogate_dict_key_is_422_not_500`, `test_a_surrogate_in_another_register_field_is_422_not_500`)
+- **IAM-HASH-9.** No 422 the auth service answers carries pydantic's `input` or
+  `ctx` (issue #1426): each validation error is rendered as exactly `{type, loc,
+  msg}`, the shape auth's OpenAPI document advertises, and any lone surrogate in
+  `loc` or `msg` is replaced with U+FFFD, so the body always encodes and the 422 never
+  becomes a 500. So no 422 holds a submitted password, for every way a registration or
+  login password can fail: each error a password field raises has fixed text. It is
+  not a promise that no submitted text appears: `msg` is the validator's own text and
+  can quote part of another field's value (an email's invalid character or its
+  IP-literal domain, the character at fault in a UUID), and `loc` names the keys the
+  caller sent, an unknown key on an `extra="forbid"` body included. Every other
+  service, the acl grant and check routes included, still renders FastAPI's default
+  422, which echoes `input`. \
+  Enforced in: `services/auth/app/validation_errors.py` (`validation_error_handler`, `render_validation_errors`, `install_validation_errors`, `restrict_validation_error_schema`, `RENDERED_KEYS`); `services/auth/app/main.py` (`app`) \
+  Pinned by: `services/auth/tests/test_validation_errors.py` (`test_the_handler_is_installed_for_request_validation_errors`, `test_the_handler_keeps_type_loc_msg_and_drops_input_ctx_and_everything_else`, `test_the_handler_replaces_a_lone_surrogate_in_loc_and_msg_and_keeps_integers`, `test_the_handler_keeps_honest_non_ascii_text_unchanged`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_every_rendered_error_has_exactly_the_advertised_keys`); `services/auth/tests/test_password_input_validation.py` (`test_a_422_never_echoes_the_submitted_password`, `test_msg_and_loc_can_still_quote_submitted_text`, `test_a_surrogate_dict_key_is_422_not_500`, `test_a_surrogate_in_another_register_field_is_422_not_500`)
 
 **Out of scope.** The config service's own password is in
 `operations-and-observability.md` (OPS-CONFIG-6); the cost ceiling of IAM-HASH-4 is
@@ -1981,8 +1986,9 @@ goes to the directory (IAM-LDAP-1), and its 72-character bound is issue #1404.
 ## 9. Errors
 
 FastAPI validation errors (422) carry `detail` as a list; in the auth service each
-item is exactly `{type, loc, msg}` with no submitted value (IAM-HASH-9), and the acl
-service's items are FastAPI's default, which adds `input`. Every other error carries
+item is exactly `{type, loc, msg}`, with no `input` or `ctx` and so no submitted
+password, though `msg` and `loc` can quote part of an email, a UUID, or a key name
+(IAM-HASH-9); the acl service's items are FastAPI's default, which adds `input`. Every other error carries
 `detail` as a string. A 401 from a bearer check also sends
 `WWW-Authenticate: Bearer`.
 
