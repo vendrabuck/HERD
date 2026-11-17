@@ -801,11 +801,10 @@ As built (phase 4; the rules are IAM-OIDC-24 to IAM-OIDC-27 in
   present too), Register exactly when `registration_open` is true. `auth_method` is not
   read. An answer is valid only as an object with boolean `password_login` and
   `registration_open`, an `sso` that is null, absent, or a non-array object, and at least
-  one way to sign in; anything else is D10's fallback, today's page, whose markup the
-  local-mode answer reproduces exactly (same input elements, so a form filled in while
-  the answer was pending, or found by an e2e helper before it, survives it). A
-  `provider_name` that is not a non-blank string becomes `single sign-on`, the backend's
-  default.
+  one way to sign in; anything else is D10's fallback, today's page, whose form the
+  local-mode answer reproduces exactly (since #1420 the fallback after a failure also
+  carries a notice above that form; see the next item). A `provider_name` that is not a
+  non-blank string becomes `single sign-on`, the backend's default.
 - The pending state was today's page too in phase 4: while the `GET /login-options`
   request was pending, the password form and the Register link rendered, with no client
   timeout, so an OIDC-mode page showed the password form until the answer arrived.
@@ -817,9 +816,20 @@ As built (phase 4; the rules are IAM-OIDC-24 to IAM-OIDC-27 in
   refetched in place, because TanStack Query puts a query with no answer back to
   pending when it fetches again, which would take the fallback form away from under a
   user filling it in; and a confirmed answer stays up when a later background refetch
-  fails. D10's rule for an error is unchanged: today's page. The fallback no longer
-  covers the pending state, which is the one deliberate departure from the Frontend
-  contract above ("On any error it renders today's page unchanged" still holds).
+  fails. A timeout counts as a failure, like a 404, a 5xx, no network, or an invalid
+  body. The review of the fix found that a failure then left an OIDC-mode user on a
+  password form the server refuses, with no way back short of a reload (on main the
+  button appeared whenever the slow answer arrived), so the fallback after a failure,
+  and only then, carries a `role="alert"` notice above the unchanged form, `Sign-in
+  options could not be loaded.`, with a `Try again` button: the user can retry, which
+  shows the pending state again and then the answer, each attempt under the same 5 s
+  limit, with repeated clicks sending one request. Text typed into the fallback form
+  survives a retry that fails again; a retry that confirms single sign-on keeps the
+  email and drops the password, so it does not reappear behind the toggle. The notice
+  was the supervisor's choice from the issue's options, pending the owner's
+  confirmation. Two deliberate departures from the Frontend contract above follow: the
+  fallback no longer covers the pending state, and after a failure it is today's page
+  plus that notice (the form itself is unchanged).
 - The toggle is a disclosure button (`aria-expanded`, `aria-controls`); behind it the
   form's submit is a secondary button (the design system's gray-100 variant), so the page
   keeps one primary action, the "Sign in with" button. Wherever the form is not behind
