@@ -806,11 +806,20 @@ As built (phase 4; the rules are IAM-OIDC-24 to IAM-OIDC-27 in
   the answer was pending, or found by an e2e helper before it, survives it). A
   `provider_name` that is not a non-blank string becomes `single sign-on`, the backend's
   default.
-- The pending state is today's page too: while the `GET /login-options` request is
-  pending, the password form and the Register link render, and the request has no
-  client timeout, so a request that never answers leaves today's page up. In OIDC mode
-  the password form therefore shows until the answer arrives. Accepted for this phase
-  and filed as issue #1420, which blocks phase 6.
+- The pending state was today's page too in phase 4: while the `GET /login-options`
+  request was pending, the password form and the Register link rendered, with no client
+  timeout, so an OIDC-mode page showed the password form until the answer arrived.
+  Accepted for that phase and filed as issue #1420. Amended by the fix of #1420
+  (IAM-OIDC-28): the page renders no sign-in method until the request settles, only a
+  `role="status"` region with placeholder bars of the local-mode form's height; the
+  request is aborted after 5 s (`LOGIN_OPTIONS_TIMEOUT_MS`), which ends in D10's
+  fallback; it is sent even while the browser reports itself offline and never
+  refetched in place, because TanStack Query puts a query with no answer back to
+  pending when it fetches again, which would take the fallback form away from under a
+  user filling it in; and a confirmed answer stays up when a later background refetch
+  fails. D10's rule for an error is unchanged: today's page. The fallback no longer
+  covers the pending state, which is the one deliberate departure from the Frontend
+  contract above ("On any error it renders today's page unchanged" still holds).
 - The toggle is a disclosure button (`aria-expanded`, `aria-controls`); behind it the
   form's submit is a secondary button (the design system's gray-100 variant), so the page
   keeps one primary action, the "Sign in with" button. Wherever the form is not behind
@@ -1067,7 +1076,8 @@ included.
   mode before issues
   #1399 (no recovery path when a first login collides, so an `OIDC_ISSUER` change locks
   out every SSO user) and #1420 (the login page shows the password form while
-  `GET /login-options` is pending) are settled, so both block the 0.8.0 release.
+  `GET /login-options` is pending; since fixed, IAM-OIDC-28) are settled, so both block
+  the 0.8.0 release.
 - As built, the lab's redirect URIs (decided by the owner on 2026-11-14): templated
   from the environment, so no tracked file names a host address. `dex.yaml` is a
   gomplate template for the static client's `redirectURIs`, rendered by the Dex
