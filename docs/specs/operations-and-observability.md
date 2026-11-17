@@ -499,7 +499,7 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   no arguments, so neither the value nor anything derived from it is logged. Fixing the
   variable is the recovery (before issue #1428 this was a 500 on `/status` and on
   login). \
-  Enforced in: `services/config/app/config_store.py` (`_initial_password`, `load_auth`, `password_problem`, `ENV_PASSWORD_REFUSED_LOG`) \
+  Enforced in: `services/config/app/config_store.py` (`_initial_password`, `load_auth`, `password_problem`, `ENV_VALUE_REFUSED_LOG`) \
   Pinned by: `services/config/tests/test_config.py` (`test_old_default_password_rejected`, `test_random_seed_used_and_unrotated`, `test_env_password_is_used_and_marks_rotated`); `services/config/tests/test_config_passwords.py` (`test_the_environment_cannot_hold_a_nul`, `test_an_admin_password_that_is_not_utf8_seeds_nothing_and_fails_closed`, `test_the_only_refusal_an_environment_value_can_reach_is_not_utf8`, `test_a_blank_admin_password_still_means_a_generated_one`, `test_a_legal_admin_password_of_any_length_seeds_and_signs_in`)
 - **OPS-CONFIG-6.** `POST /login` checks the password against the stored bcrypt hash and
   answers a session token valid for 30 minutes plus `password_changed`; a wrong password

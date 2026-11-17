@@ -644,7 +644,7 @@ async def test_an_admin_password_that_is_not_utf8_seeds_nothing_and_fails_closed
     assert records and all(
         (r.levelno, r.msg, r.args) == (logging.ERROR, ENV_REFUSED_LOG, ()) for r in records
     )
-    assert config_store.ENV_PASSWORD_REFUSED_LOG == ENV_REFUSED_LOG
+    assert config_store.ENV_VALUE_REFUSED_LOG == ENV_REFUSED_LOG
     # Fixing the variable is the recovery: nothing was stored in the meantime.
     monkeypatch.setenv("CONFIG_ADMIN_PASSWORD", "envpass-fixed")
     assert verify_password("envpass-fixed") is True
