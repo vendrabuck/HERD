@@ -25,9 +25,10 @@ string holding one as `string_unicode`, with a fixed message, at the parent's
 `loc` for a key), but a 500 is the price of being wrong, so each one is replaced
 with U+FFFD and the body always encodes.
 
-Nothing here is auth-specific, but only auth installs it: every other service still
-uses FastAPI's default, echo and surrogate 500 included (the config service's case
-is issue #1428).
+Nothing here is auth-specific. The config service installs its own standalone copy
+(`services/config/app/validation_errors.py`, issue #1428; it imports neither
+herd_common nor auth, so the two are kept in step by hand). Every other service
+still uses FastAPI's default, echo and surrogate 500 included.
 """
 
 from __future__ import annotations
