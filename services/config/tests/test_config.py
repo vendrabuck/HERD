@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 
 import pytest
 from app.config_store import (
@@ -244,7 +245,12 @@ class TestChangePasswordEndpoint:
             json={"new_password": "short"},
             headers=headers,
         )
-        assert resp.status_code == 422
+        # A string detail that never echoes the password (issue #1428).
+        assert (resp.status_code, resp.json()) == (
+            422,
+            {"detail": "Password must be at least 8 characters"},
+        )
+        assert "short".encode() not in resp.content
 
     @pytest.mark.asyncio
     async def test_change_password_too_long(self, async_client):
@@ -257,7 +263,12 @@ class TestChangePasswordEndpoint:
             json={"new_password": "a" * 33},
             headers=headers,
         )
-        assert resp.status_code == 422
+        # A string detail that never echoes the password (issue #1428).
+        assert (resp.status_code, resp.json()) == (
+            422,
+            {"detail": "Password must be at most 32 characters"},
+        )
+        assert ("a" * 33).encode() not in resp.content
 
     @pytest.mark.asyncio
     async def test_change_password_unauthenticated(self, async_client):
@@ -669,3 +680,224 @@ class TestSettingsKeysLimitedToSchema:
         assert saved["HAND_PLACED_KEY"] == "v"
         # The masked secrets resolved back to the file's values.
         assert saved["POSTGRES_PASSWORD"] == "secret"
+
+
+# -- issue #1427: an auth file that is valid JSON but not an object --
+
+# Every JSON value that is not an object, plus objects whose password_changed is
+# not the JSON boolean true. Each one reads as "not rotated".
+_NON_OBJECT_AUTH = {
+    "list": [1, 2],
+    "string": "str",
+    "number": 42,
+    "float": 1.5,
+    "null": None,
+    "true": True,
+    "false": False,
+    "empty_list": [],
+}
+_NOT_ROTATED_OBJECTS = {
+    "empty_object": {},
+    "string_yes": {"password_changed": "yes"},
+    "string_true": {"password_changed": "true"},
+    "one": {"password_changed": 1},
+    "list_true": {"password_changed": [True]},
+    "null": {"password_changed": None},
+    "false": {"password_changed": False},
+}
+ROTATE_FIRST_DETAIL = "Change the config password before modifying or applying configuration"
+STORE_UNUSABLE_DETAIL = (
+    "The config password store is unusable; the config service log names the cause"
+)
+
+
+def _write_auth_json(tmp_config_dir, payload) -> str:
+    path = os.path.join(tmp_config_dir, "config_auth.json")
+    with open(path, "w") as f:
+        json.dump(payload, f)
+    return path
+
+
+class TestAuthFileNotAnObject:
+    @pytest.mark.parametrize(
+        "payload",
+        [*_NON_OBJECT_AUTH.values(), *_NOT_ROTATED_OBJECTS.values()],
+        ids=[*(f"file_{k}" for k in _NON_OBJECT_AUTH), *(f"obj_{k}" for k in _NOT_ROTATED_OBJECTS)],
+    )
+    def test_is_password_changed_is_false_unless_the_stored_value_is_json_true(
+        self, payload, tmp_config_dir
+    ):
+        _write_auth_json(tmp_config_dir, payload)
+        assert is_password_changed() is False
+
+    def test_is_password_changed_is_true_for_json_true(self, tmp_config_dir):
+        _write_auth_json(tmp_config_dir, {"password_changed": True})
+        assert is_password_changed() is True
+
+    @pytest.mark.parametrize("payload", _NON_OBJECT_AUTH.values(), ids=_NON_OBJECT_AUTH.keys())
+    def test_load_auth_refuses_a_file_that_is_not_an_object(self, payload, tmp_config_dir, caplog):
+        path = _write_auth_json(tmp_config_dir, payload)
+        before = Path(path).read_text()
+        with caplog.at_level("ERROR"), pytest.raises(ConfigAuthError):
+            load_auth()
+        # One ERROR naming the class only, and the file is left as it was.
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert errors == [
+            "Config auth file holds no usable password hash; login refused "
+            f"({type(payload).__name__})"
+        ]
+        assert Path(path).read_text() == before
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("configured", [False, True], ids=["unconfigured", "configured"])
+    @pytest.mark.parametrize("payload", _NON_OBJECT_AUTH.values(), ids=_NON_OBJECT_AUTH.keys())
+    async def test_status_answers_200_not_rotated_for_a_file_that_is_not_an_object(
+        self, payload, configured, async_client, tmp_config_dir
+    ):
+        if configured:
+            with open(os.path.join(tmp_config_dir, "config.json"), "w") as f:
+                json.dump({"POSTGRES_USER": "test"}, f)
+        _write_auth_json(tmp_config_dir, payload)
+        resp = await async_client.get("/status")
+        assert (resp.status_code, resp.json()) == (
+            200,
+            {"configured": configured, "password_changed": False},
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "payload",
+        [*_NON_OBJECT_AUTH.values(), *_NOT_ROTATED_OBJECTS.values()],
+        ids=[*(f"file_{k}" for k in _NON_OBJECT_AUTH), *(f"obj_{k}" for k in _NOT_ROTATED_OBJECTS)],
+    )
+    async def test_a_session_from_before_the_file_changed_cannot_write_or_apply(
+        self, payload, async_client, tmp_config_dir
+    ):
+        # A session issued against the good file outlives the file's change; the
+        # write surface reads the new file and answers 403, never 500 or 200.
+        headers = await _session_headers(async_client)
+        with open(os.path.join(tmp_config_dir, "config.json"), "w") as f:
+            json.dump(_REQUIRED_VALUES, f)
+        config_before = load_config()
+        if isinstance(payload, dict):
+            # Keep a usable hash, so only password_changed is malformed.
+            payload = {"password_hash": load_auth()["password_hash"], **payload}
+        _write_auth_json(tmp_config_dir, payload)
+        put = await async_client.put(
+            "/settings", json={"values": _REQUIRED_VALUES}, headers=headers
+        )
+        assert (put.status_code, put.json()) == (403, {"detail": ROTATE_FIRST_DETAIL})
+        apply = await async_client.post("/apply", headers=headers)
+        assert (apply.status_code, apply.json()) == (403, {"detail": ROTATE_FIRST_DETAIL})
+        assert load_config() == config_before
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", ["[1, 2]", '"str"', "42", "null", "true", "{bad"])
+    async def test_change_password_from_an_old_session_never_rewrites_an_unusable_file(
+        self, body, async_client, tmp_config_dir
+    ):
+        # Fail closed: the session cannot turn an unusable file into a fresh,
+        # rotated one; the operator's recovery stays removing the file.
+        headers = await _session_headers(async_client)
+        path = os.path.join(tmp_config_dir, "config_auth.json")
+        with open(path, "w") as f:
+            f.write(body)
+        resp = await async_client.post(
+            "/change-password", json={"new_password": "newpass123"}, headers=headers
+        )
+        assert (resp.status_code, resp.json()) == (503, {"detail": STORE_UNUSABLE_DETAIL})
+        assert Path(path).read_text() == body
+        login = await async_client.post("/login", json={"password": "newpass123"})
+        assert login.status_code == 401
+
+
+# -- Every way json.load and open can fail on the two files (#1427 review) --------
+
+# Contents json.load refuses with something other than JSONDecodeError: a byte that
+# is not UTF-8 (UnicodeDecodeError), nesting deeper than the parser's recursion limit
+# (RecursionError), and an integer longer than Python's int digit limit (ValueError).
+# A directory where the file should be is an OSError. MemoryError on a huge file is
+# not handled (out of scope).
+_UNREADABLE_CONTENTS = {
+    "unparseable": b"{bad",
+    "not_utf8": b'{"password_hash": "\xff\xfe", "password_changed": true}',
+    "nested_too_deep": b"[" * 100_000,
+    "int_over_digit_limit": b"1" * 5000,
+    "is_a_directory": None,
+}
+
+
+def _write_unreadable(path: str, content: bytes | None) -> None:
+    if content is None:
+        os.mkdir(path)
+    else:
+        Path(path).write_bytes(content)
+
+
+def _snapshot(path: str):
+    return "<dir>" if os.path.isdir(path) else Path(path).read_bytes()
+
+
+@pytest.mark.parametrize("content", _UNREADABLE_CONTENTS.values(), ids=_UNREADABLE_CONTENTS.keys())
+class TestUnreadableFilesFailClosed:
+    def test_load_auth_raises_config_auth_error(self, content, tmp_config_dir):
+        _write_unreadable(os.path.join(tmp_config_dir, "config_auth.json"), content)
+        with pytest.raises(ConfigAuthError):
+            load_auth()
+        assert verify_password(CFG_PASSWORD) is False
+        assert is_password_changed() is False
+
+    def test_load_config_ignores_it(self, content, tmp_config_dir):
+        _write_unreadable(os.path.join(tmp_config_dir, "config.json"), content)
+        assert load_config() == {}
+
+    @pytest.mark.asyncio
+    async def test_every_route_fails_closed_on_an_unreadable_auth_file(
+        self, content, async_client, tmp_config_dir
+    ):
+        headers = await _session_headers(async_client)
+        path = os.path.join(tmp_config_dir, "config_auth.json")
+        os.remove(path)
+        _write_unreadable(path, content)
+        status_resp = await async_client.get("/status")
+        assert (status_resp.status_code, status_resp.json()) == (
+            200,
+            {"configured": False, "password_changed": False},
+        )
+        login = await async_client.post("/login", json={"password": CFG_PASSWORD})
+        assert (login.status_code, login.json()) == (401, {"detail": "Invalid password"})
+        put = await async_client.put(
+            "/settings", json={"values": _REQUIRED_VALUES}, headers=headers
+        )
+        assert (put.status_code, put.json()) == (403, {"detail": ROTATE_FIRST_DETAIL})
+        apply = await async_client.post("/apply", headers=headers)
+        assert (apply.status_code, apply.json()) == (403, {"detail": ROTATE_FIRST_DETAIL})
+        change = await async_client.post(
+            "/change-password", json={"new_password": "newpass123"}, headers=headers
+        )
+        assert (change.status_code, change.json()) == (503, {"detail": STORE_UNUSABLE_DETAIL})
+        assert _snapshot(path) == ("<dir>" if content is None else content)
+        assert not os.path.exists(os.path.join(tmp_config_dir, "config.json"))
+
+    @pytest.mark.asyncio
+    async def test_the_settings_routes_treat_an_unreadable_config_file_as_corrupt(
+        self, content, async_client, tmp_config_dir, monkeypatch
+    ):
+        # The existing corrupt-file answer: the editor shows the environment's values,
+        # and a save writes a new file (OPS-CONFIG-10).
+        monkeypatch.setenv("POSTGRES_USER", "env-user")
+        headers = await _session_headers(async_client)
+        path = os.path.join(tmp_config_dir, "config.json")
+        _write_unreadable(path, content)
+        get = await async_client.get("/settings", headers=headers)
+        assert get.status_code == 200
+        assert get.json()["values"]["POSTGRES_USER"] == "env-user"
+        status_resp = await async_client.get("/status")
+        assert status_resp.json() == {"configured": True, "password_changed": True}
+        if content is None:
+            return  # a directory cannot be replaced by a save; the read side is the point
+        put = await async_client.put(
+            "/settings", json={"values": _REQUIRED_VALUES}, headers=headers
+        )
+        assert (put.status_code, put.json()) == (200, {"message": "Configuration saved"})
+        assert load_config() == _REQUIRED_VALUES
