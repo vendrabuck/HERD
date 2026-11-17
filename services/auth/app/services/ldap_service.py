@@ -31,14 +31,19 @@ from dataclasses import dataclass
 
 import anyio
 from ldap3 import BASE, NONE, SIMPLE, SUBTREE, Connection, Server, Tls
-from ldap3.core.exceptions import LDAPCommunicationError, LDAPException, LDAPInvalidDnError
+from ldap3.core.exceptions import (
+    LDAPCommunicationError,
+    LDAPException,
+    LDAPInvalidDnError,
+    LDAPPasswordIsMandatoryError,
+    LDAPSASLPrepError,
+)
 from ldap3.core.results import (
-    RESULT_BUSY,
     RESULT_INVALID_DN_SYNTAX,
     RESULT_NO_SUCH_OBJECT,
     RESULT_SUCCESS,
-    RESULT_UNAVAILABLE,
 )
+from ldap3.protocol.sasl.sasl import validate_simple_password
 from ldap3.utils.conv import escape_filter_chars
 from ldap3.utils.dn import safe_dn
 
@@ -397,24 +402,28 @@ def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
         return entry.entry_dn, attrs
 
 
-# Result codes a refused user bind can carry that describe the directory rather
-# than the account (RFC 4511: busy, unavailable). They prove nothing about the
-# password, so they are an outage. Every other refusal code (invalidCredentials,
-# and the codes directories use for a disabled, locked, or expired account) is
-# the directory's answer about this login and stays a refusal: telling those
-# apart would reveal that the account exists.
-_USER_BIND_UNAVAILABLE_CODES = frozenset({RESULT_BUSY, RESULT_UNAVAILABLE})
+# Errors ldap3 raises client-side, inside bind(), about the submitted password
+# itself (RFC 4013 SASLprep refusing a character, an empty password). They depend
+# on the input, never on the directory, so they are a refusal: as an outage they
+# would answer an existing user (the only one who reaches the user bind)
+# differently from an unknown one. _bind_user_sync refuses these passwords before
+# any directory call (_password_refused_by_saslprep); this is the second guard.
+_USER_BIND_INPUT_REFUSALS = (LDAPSASLPrepError, LDAPPasswordIsMandatoryError)
 
 
 def _bind_as_user(user_dn: str, password: str) -> bool:
     """Bind as user_dn with the submitted password.
 
-    True when the directory accepted the bind, False when it refused it with a
-    code that is about the account. Raises LdapUnavailableError when the bind
-    could not be attempted or answered (connection, TLS, or timeout errors) or
-    was refused for a reason in _USER_BIND_UNAVAILABLE_CODES (issue #1403). The
-    connection carries the same receive timeout as the service connection, so a
-    directory that accepts the connection and never answers ends here instead of
+    True when the directory accepted the bind. False for every answer the
+    directory gave, whatever the result code (invalidCredentials, the codes
+    directories use for a disabled, locked, or expired account, and busy or
+    unavailable too), and for a password ldap3 refuses client-side
+    (_USER_BIND_INPUT_REFUSALS). Only an existing user reaches this bind, so any
+    answer here but the refusal would tell an existing account from an unknown
+    one (the #1403 review). Raises LdapUnavailableError only when the bind could
+    not be attempted or answered at all: the connection could not be built or
+    opened, TLS failed, or no answer came within the receive timeout (the
+    service connection's 30 s), which ends a silent directory here instead of
     holding the worker thread.
     """
     try:
@@ -436,16 +445,42 @@ def _bind_as_user(user_dn: str, password: str) -> bool:
                 "ldaps://"
             ):
                 conn.start_tls()
-            if conn.bind():
-                return True
+            return bool(conn.bind())
+        except _USER_BIND_INPUT_REFUSALS:
+            return False
         except LDAPException as exc:
             raise LdapUnavailableError(f"user bind failed: {exc}") from exc
-        result_code = (conn.result or {}).get("result")
-        if result_code in _USER_BIND_UNAVAILABLE_CODES:
-            raise LdapUnavailableError(f"user bind refused with result code {result_code}")
-        return False
     finally:
         _close_connection(conn)
+
+
+def _password_refused_by_saslprep(username: str, password: str) -> bool:
+    """True when ldap3 would refuse this password client-side in the user bind.
+
+    ldap3 prepares every simple-bind password with SASLprep (RFC 4013,
+    validate_simple_password) inside bind() and raises for an ASCII or other
+    control character (NUL and tab included), a private-use, non-character, or
+    tagging code point, a display-changing character, mixed right-to-left and
+    left-to-right text, or a password that maps to nothing. Asked here, before
+    any directory call, the refusal is the same 401 for every username, with no
+    directory traffic and one log line that names the username and the error
+    class, never the password or a part of it. Asked only at the user bind, it
+    would be reachable for existing users alone (the #1403 review's oracle).
+    """
+    try:
+        validate_simple_password(password)
+    except LDAPException as exc:
+        logger.warning(
+            "LDAP login refused before any directory call: the password is not a valid "
+            "simple-bind password (SASLprep)",
+            extra={
+                "action": "ldap_password_refused",
+                "username": username,
+                "exception_class": type(exc).__name__,
+            },
+        )
+        return True
+    return False
 
 
 def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
@@ -456,10 +491,11 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
     username attributes. The search filters on ldap_user_filter (injected with
     escaped username to prevent LDAP filter injection).
 
-    Returns the LdapIdentity on success and None for every answer the directory
-    gave about this login: an empty password (refused before any call, since an
-    LDAP simple bind with one succeeds anonymously), no matching entry, a refused
-    user bind, or an entry without the email attribute.
+    Returns the LdapIdentity on success and None for every refusal: an empty
+    password (refused before any call, since an LDAP simple bind with one
+    succeeds anonymously), a password SASLprep refuses (also before any call,
+    _password_refused_by_saslprep), no matching entry, a refused user bind, or an
+    entry without the email attribute.
 
     Raises LdapUnavailableError whenever the directory could not be asked:
     incomplete configuration (logged at ERROR), or any connection, TLS,
@@ -475,6 +511,8 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
         )
     if not password:
         # LDAP anonymous bind succeeds with an empty password; reject early.
+        return None
+    if _password_refused_by_saslprep(username, password):
         return None
     try:
         try:
@@ -534,9 +572,9 @@ async def bind_user(username: str, password: str) -> LdapIdentity | None:
 
 
 # ---------------------------------------------------------------------------
-# ADR 0011 group-sync directory client. Unlike the login path above, these
-# raise LdapUnavailableError when the directory cannot be asked; None (or a
-# skip_reason) is reserved for answers the directory actually gave.
+# ADR 0011 group-sync directory client. Like the login path above (since issue
+# #1403), these raise LdapUnavailableError when the directory cannot be asked;
+# None (or a skip_reason) is reserved for answers the directory actually gave.
 # ---------------------------------------------------------------------------
 
 # Proven-absent result codes for base-scope DN lookups. ldap3 reports a base

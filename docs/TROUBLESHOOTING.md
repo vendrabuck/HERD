@@ -138,6 +138,7 @@ A 401 `Invalid credentials` means the directory answered and refused this login,
 
 - User not found under `LDAP_USER_BASE_DN`, or the `LDAP_USER_FILTER` does not match (e.g. the directory uses `uid=` not `sAMAccountName=`). The log line is `ldap_user_not_found`. When EVERY user gets this, the filter is the likely cause.
 - The password is wrong, or the directory refuses the account (disabled, locked, expired). The log line is `ldap_bind_failure` with the user's DN.
+- The password holds a character the LDAP client refuses before sending it (a tab, another control character, a private-use character, or mixed right-to-left and left-to-right text; RFC 4013 SASLprep). Nothing is sent to the directory; the log line is `ldap_password_refused` with the username.
 - The directory entry has no `mail` attribute (or whatever `LDAP_EMAIL_ATTRIBUTE` is set to). HERD refuses to provision a user it cannot address by email; the log line is `ldap_missing_email`.
 - The email returned by the directory collides with an existing local account. Either delete the local row or set `AUTH_METHOD=local` temporarily.
 

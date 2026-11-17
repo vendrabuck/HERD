@@ -327,7 +327,7 @@ Auth service:
 |---|---|---|---|---|
 | GET | `/login-options` | anyone, unauthenticated; every mode | 200 | IAM-OIDC-16 |
 | POST | `/register` | anyone, unauthenticated; local mode only | 201 | IAM-REG-1 to IAM-REG-6, IAM-PROFILE-9 |
-| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-6, IAM-LDAP-1 to IAM-LDAP-12, IAM-OIDC-21 |
+| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-6, IAM-LDAP-1 to IAM-LDAP-13, IAM-OIDC-21 |
 | GET | `/oidc/login` | anyone, unauthenticated; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-17 |
 | GET | `/oidc/callback` | anyone holding the `herd_oidc_flow` cookie; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-18, IAM-OIDC-19 |
 | POST | `/oidc/exchange` | anyone holding the `herd_oidc_handoff` cookie; OIDC mode only, else 404 | 200 | IAM-OIDC-15, IAM-OIDC-20 |
@@ -482,18 +482,19 @@ short-lived access token and a refresh token.
 - **IAM-LOGIN-5.** A login password holding a lone surrogate is the 422
   `string_unicode` at `["body", "password"]`. The login body has no NUL check, by
   decision (issue #1426): in local mode and the break-glass login a NUL reaches
-  `verify_password` and is the 401 of IAM-HASH-3; LDAP mode passes the password to the
-  directory as before. \
+  `verify_password` and is the 401 of IAM-HASH-3; in LDAP mode it is the 401 of
+  IAM-LDAP-13, before any directory call. \
   Enforced in: `services/auth/app/schemas/auth.py` (`LoginRequest`); `services/auth/app/validation_errors.py` (`validation_error_handler`) \
-  Pinned by: `services/auth/tests/test_password_input_validation.py` (`test_login_with_a_lone_surrogate_is_422_string_unicode`, `test_login_with_a_nul_stays_401`, `test_login_schema_still_takes_a_nul_so_login_answers_401`); `services/auth/tests/test_login_password_bound.py` (`test_a_long_lone_surrogate_is_string_unicode_in_every_mode`, `test_ldap_mode_still_passes_a_nul_to_the_directory`)
+  Pinned by: `services/auth/tests/test_password_input_validation.py` (`test_login_with_a_lone_surrogate_is_422_string_unicode`, `test_login_with_a_nul_stays_401`, `test_login_schema_still_takes_a_nul_so_login_answers_401`); `services/auth/tests/test_login_password_bound.py` (`test_a_long_lone_surrogate_is_string_unicode_in_every_mode`, `test_ldap_mode_refuses_a_nul_before_the_directory`)
 - **IAM-LOGIN-6.** The login password bound is the bound of the mode that judges the
   password (issue #1404), read from the live `AUTH_METHOD` when the request arrives: at
   most 72 characters in local mode and for the OIDC break-glass login, which check a
   bcrypt hash (registration's bound, IAM-REG-2), and at most 1024 characters in LDAP
   mode, where every login, a local account's included, goes to the directory and is
   never hashed (IAM-LDAP-1). The LDAP bound is only a ceiling on the request: 1024
-  characters are at most 4096 UTF-8 bytes, the most hashing takes (IAM-HASH-3), and
-  the password reaches the directory unchanged. A longer password is the 422
+  characters are at most 4096 UTF-8 bytes, the most hashing takes (IAM-HASH-3). HERD
+  hands the password to ldap3 unchanged, and ldap3 prepares it with SASLprep before the
+  bind is sent (IAM-LDAP-13). A longer password is the 422
   `string_too_long` at `["body", "password"]` with `String should have at most <N>
   characters`, N the mode's bound, and never reaches the judge; past 1024 characters
   every mode names 1024, the schema's ceiling, which runs first. The bound counts
@@ -533,11 +534,14 @@ account automatically.
 - **IAM-LDAP-5.** Every answer the directory gives about the login itself is the 401
   `Invalid credentials`: a search that succeeds with no match (an unknown login name,
   or an entry the filter leaves out), a user bind the directory refuses with any result
-  code but busy or unavailable (a wrong password, and the codes directories use for a
-  disabled, locked, or expired account, so the answer never tells an existing account
-  from an unknown one), and an entry without the email attribute. \
-  Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_search_user`, `_bind_as_user`, `_USER_BIND_UNAVAILABLE_CODES`) \
-  Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_not_found`, `test_bind_user_missing_email_rejected`, `test_bind_user_answers_none_for_what_the_directory_said`); `services/auth/tests/test_ldap_login_outage.py` (`test_what_the_directory_said_stays_the_401`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_unknown_user_returns_none`, `test_login_endpoint_rejects_bad_password_against_live_ldap`)
+  code at all (a wrong password, the codes directories use for a disabled, locked, or
+  expired account, and busy or unavailable too: only an existing user reaches the user
+  bind, so any other answer there would tell an existing account from an unknown one),
+  and an entry without the email attribute. A search that found the user is a match
+  whatever its result code, as ldap3 reports one (a size- or time-limited search that
+  returned the entry signs in). \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_search_user`, `_bind_as_user`, `_checked_search`) \
+  Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_not_found`, `test_bind_user_missing_email_rejected`, `test_bind_user_answers_none_for_what_the_directory_said`, `test_bind_user_a_limited_search_that_found_the_user_still_signs_in`); `services/auth/tests/test_ldap_login_outage.py` (`test_what_the_directory_said_stays_the_401`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_unknown_user_returns_none`, `test_login_endpoint_rejects_bad_password_against_live_ldap`)
 - **IAM-LDAP-6.** Every directory connection uses StartTLS before binding unless the
   URL is `ldaps://` or `LDAP_USE_TLS` is false, and validates the server certificate
   unless `LDAP_TLS_VALIDATE` is false (which logs a warning); `LDAP_CA_CERT` names a CA
@@ -572,8 +576,13 @@ account automatically.
   timed-out connection, a TLS failure, a refused service-account bind (anonymous
   included), a search that raises or ends with any result code but success (a missing
   base DN, a referral that cannot be followed, busy, access denied), and a user bind
-  that raises, times out (30 s receive timeout, as on the service connection), or is
-  refused as busy or unavailable. It is still fail closed: no session, no account
+  that could not be attempted or answered at all: its connection could not be built or
+  opened, TLS failed, or no answer came within the 30 s receive timeout (as on the
+  service connection). Those last three happen on a fresh connection to the same
+  server whatever the username, so a client cannot cause them for existing accounts
+  alone; a directory that delays the user bind of existing accounts past 30 s would
+  still answer them 503, and is not known among the directories HERD targets. It is
+  still fail closed: no session, no account
   created, no local fallback (IAM-LDAP-1), and the body never holds the directory
   client's text. The client logs one WARNING `LDAP unavailable during login` (action
   `ldap_error`, the client's text in the message, the cause's class in
@@ -582,6 +591,25 @@ account automatically.
   password. \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_search_user`, `_bind_as_user`, `_checked_search`); `services/auth/app/services/auth_service.py` (`_authenticate_ldap`); `services/auth/app/routers/auth.py` (`login`, `LOGIN_DIRECTORY_UNAVAILABLE_DETAIL`) \
   Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_raises_unavailable_when_the_directory_could_not_be_asked`, `test_bind_user_missing_config_raises_unavailable`, `test_user_bind_connection_has_the_receive_timeout`); `services/auth/tests/test_ldap_login_outage.py` (`test_an_outage_is_503_with_the_fixed_detail_and_no_session`, `test_incomplete_configuration_is_503`, `test_an_outage_never_falls_back_to_a_local_password`); `services/auth/tests/test_auth_ldap.py` (`test_ldap_login_directory_unavailable_returns_503`); `services/auth/tests/test_ldap_service_live.py` (`test_bad_service_account_raises_unavailable`, `test_bind_user_unreachable_server_raises_unavailable`, `test_bind_user_missing_base_dn_raises_unavailable`, `test_login_endpoint_unreachable_directory_is_503`, `test_login_endpoint_bad_service_account_is_503`)
+- **IAM-LDAP-13.** ldap3 prepares every simple-bind password with SASLprep (RFC 4013)
+  inside the bind and refuses, client-side, a password holding an ASCII or other
+  control character (NUL and tab included), a private-use, non-character, or tagging
+  code point, a display-changing character, or mixed right-to-left and left-to-right
+  text, or one that maps to nothing. Login asks the same check
+  (`validate_simple_password`) before any directory call, after the empty-password
+  check of IAM-LDAP-4, and refuses such a password with the 401 `Invalid credentials`
+  for every username, with no directory traffic and one WARNING (action
+  `ldap_password_refused`, the username and the error class, never the password or a
+  part of it) (the #1403 review: asked only at the user bind, which an existing user
+  alone reaches, it answered existing users 503 and unknown ones 401). The user bind
+  treats the same refusal as a refusal too. A character SASLprep maps instead of
+  refusing reaches the directory mapped: a soft hyphen maps to nothing, a
+  non-breaking space to a space, a fullwidth letter to ASCII, so a directory password
+  that literally holds one can never match (ldap3's behavior, not HERD's). Timing: a
+  pre-check refusal makes no directory round trip where an unknown user costs one
+  search; the difference depends on the password alone, the same for every username. \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`_password_refused_by_saslprep`, `_bind_user_sync`, `_bind_as_user`, `_USER_BIND_INPUT_REFUSALS`) \
+  Pinned by: `services/auth/tests/test_ldap_login_input_oracle.py` (`test_a_password_saslprep_refuses_gets_the_same_answer_for_every_username`, `test_the_route_answers_known_and_unknown_users_identically`, `test_the_user_bind_itself_refuses_what_saslprep_refuses`, `test_a_password_saslprep_maps_goes_to_the_directory_mapped`); `services/auth/tests/test_login_password_bound.py` (`test_ldap_mode_refuses_a_nul_before_the_directory`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_answers_known_and_unknown_users_alike_for_a_saslprep_refusal`, `test_bind_user_a_saslprep_mapped_password_reaches_the_directory_mapped`)
 
 **Out of scope.** Roles never come from the directory (ADR 0011, Blast radius). SAML and
 OIDC do not exist (issue #37).
@@ -2044,7 +2072,7 @@ password, though `msg` and `loc` can quote part of an email, a UUID, or a key na
 | 400 | `Token role cannot exceed the principal's role` | token role above its principal | IAM-APITOK-3 |
 | 401 | `Not authenticated` (FastAPI) | no Authorization header on a JWT-guarded route, auth or acl | IAM-JWT-3, IAM-CLAIM-1 |
 | 401 | `Could not validate credentials` | bad, expired, or subjectless token; in auth also an unknown or inactive account | IAM-JWT-3, IAM-ACCT-5, IAM-CLAIM-1 |
-| 401 | `Invalid credentials` | any login refusal, local, LDAP, or OIDC mode | IAM-LOGIN-1, IAM-LDAP-5, IAM-LDAP-9, IAM-LDAP-10, IAM-OIDC-21 |
+| 401 | `Invalid credentials` | any login refusal, local, LDAP, or OIDC mode | IAM-LOGIN-1, IAM-LDAP-5, IAM-LDAP-9, IAM-LDAP-10, IAM-LDAP-13, IAM-OIDC-21 |
 | 401 | `Single sign-on session expired; sign in again` | handoff exchange refused | IAM-OIDC-20 |
 | 401 | `Invalid or expired refresh token` | refresh refused | IAM-SESSION-2 |
 | 401 | `Invalid or expired token` | API token exchange refused | IAM-APITOK-8 |
@@ -2157,8 +2185,8 @@ the integration suite, the frontend tests, and the browser suite were read, not 
 ### Limits by decision
 
 - The login body has no NUL check, so a login password holding a NUL is not a 422: in
-  local mode it is the 401 `Invalid credentials`, and LDAP mode is unchanged
-  (IAM-LOGIN-5, IAM-HASH-3). Recorded in issue #1426 (Expected and Suggested fix).
+  local mode it is the 401 `Invalid credentials`, and in LDAP mode the same 401 before
+  any directory call (IAM-LOGIN-5, IAM-HASH-3, IAM-LDAP-13). Recorded in issue #1426 (Expected and Suggested fix).
 - An admin may mint an API token for any principal of equal or lower rank, including
   another admin, and then act as that account (IAM-APITOK-2). Recorded in issue #312 and
   the comment in `create_token`; [SECURITY.md](../../SECURITY.md) treats admins as

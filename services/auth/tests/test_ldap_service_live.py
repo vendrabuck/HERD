@@ -348,6 +348,29 @@ async def test_login_endpoint_unreachable_directory_is_503(monkeypatch, ldap_set
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("password", ["\t", "Pass\x00word1", "Pass\ue000word1"])
+async def test_login_endpoint_answers_known_and_unknown_users_alike_for_a_saslprep_refusal(
+    ldap_settings, http_client, password
+):
+    """The #1403 review's oracle against a real directory: a password ldap3's
+    SASLprep refuses is the same 401 for an existing and an unknown user."""
+    answers = [
+        await http_client.post("/login", json={"email": login, "password": password})
+        for login in ("user4", "does-not-exist")
+    ]
+    assert [(r.status_code, r.json()) for r in answers] == [
+        (401, {"detail": "Invalid credentials"})
+    ] * 2
+
+
+@pytest.mark.asyncio
+async def test_bind_user_a_saslprep_mapped_password_reaches_the_directory_mapped(ldap_settings):
+    """SASLprep maps a soft hyphen to nothing before the bind is sent (RFC 4013,
+    ldap3), so "Pass<soft hyphen>word1" binds as user1's "Password1"."""
+    assert await ldap_service.bind_user("user1", "Pass\u00adword1") is not None
+
+
+@pytest.mark.asyncio
 async def test_login_endpoint_bad_service_account_is_503(monkeypatch, ldap_settings, http_client):
     monkeypatch.setattr(settings, "ldap_bind_password", "wrong-admin-pw", raising=False)
     resp = await http_client.post("/login", json={"email": "user4", "password": USER_PW})
@@ -728,9 +751,9 @@ async def test_run_sync_dangling_mapping_applies_nothing(ldap_settings, db_sessi
 # ---------------------------------------------------------------------------
 
 # All 25 seeded people (50-seed-people.ldif) plus nouid1 (mail but no uid,
-# 60-seed-groups.ldif) plus the four ldapit-* identities (mail but no uid
-# quirk does not apply to them, 70-seed-integration.ldif, issue #572) carry a
-# mail attribute; nomail1 deliberately does not.
+# 60-seed-groups.ldif) plus the five ldapit-* identities (70-seed-integration.ldif:
+# ldapit-admin and ldapit-eng1..3 from issue #572, ldapit-longpass from #1404; each
+# has both mail and uid) carry a mail attribute; nomail1 deliberately does not.
 _ALL_SEEDED_PRESENT_EMAILS = frozenset(
     {f"user{n}@company.local" for n in range(1, 26)}
     | {"nouid1@company.local"}

@@ -14,6 +14,17 @@ result code (0 is success) or an exception to raise, and a search is a result
 code plus entries or an exception. Whether an outcome means "refused" or "could
 not be asked" is decided by `ldap_service` alone; this fake only plays the
 directory, so it cannot implement the behavior under test.
+
+Limits, so no test leans on them for input-dependent behavior:
+
+- `bind()` skips everything ldap3 does on the client before a bind is sent, SASLprep
+  of the password above all (`validate_simple_password` raises `LDAPSASLPrepError`
+  for a tab, a NUL, a private-use character, and more). A test whose answer depends
+  on the submitted password or username uses the real ldap3 `MOCK_SYNC` directory
+  in tests/_mock_directory.py instead; the tests here use plain ASCII passwords.
+- `search()` returns what ldap3 returns (`Connection.search`: True whenever the
+  response holds an entry, whatever the result code), so a non-success code that
+  comes with entries (sizeLimitExceeded, timeLimitExceeded) still reads as a match.
 """
 
 from __future__ import annotations
@@ -115,7 +126,8 @@ class _FakeConnection:
         code, entries = outcome
         self.result = {"result": code, "description": f"code {code}"}
         self.entries = list(entries)
-        return code == RESULT_SUCCESS and bool(entries)
+        # ldap3: `True if searchResDone and len(response) > 0`, whatever the code.
+        return bool(entries)
 
     def unbind(self) -> bool:
         return True

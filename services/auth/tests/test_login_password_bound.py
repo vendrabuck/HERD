@@ -6,8 +6,8 @@ exactly: a longer password is the same 422 it always was and never reaches the
 check. LDAP mode sends the password to the directory in a bind and never hashes
 it (IAM-LDAP-1: every login in LDAP mode goes to the directory, a local account
 included), so it takes up to 1024 characters, a ceiling on the request only, and
-passes the password through unchanged. NUL and lone-surrogate handling is IAM-LOGIN-5's
-and does not change.
+hands the password to ldap3 for the bind. NUL and lone-surrogate handling is
+IAM-LOGIN-5's: in LDAP mode a NUL is refused before the directory (IAM-LDAP-13).
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from app.schemas import auth as schemas
 from app.services import ldap_service
 from app.services.auth_service import create_user
 
+from tests import _mock_directory
 from tests._harness import TestSessionLocal
 
 JSON = {"content-type": "application/json"}
@@ -129,12 +130,18 @@ async def test_ldap_mode_refuses_past_1024_before_the_directory(client, ldap_mod
     assert ldap_mode == [] and judge_calls == []
 
 
-async def test_ldap_mode_still_passes_a_nul_to_the_directory(client, ldap_mode):
-    """IAM-LOGIN-5 unchanged: LDAP mode passes a NUL through, now past 72 too."""
+async def test_ldap_mode_refuses_a_nul_before_the_directory(client, monkeypatch):
+    """IAM-LOGIN-5 and IAM-LDAP-13, through a real ldap3 Connection (MOCK_SYNC): a
+    NUL passes the schema at any length up to 1024, and ldap3's SASLprep would
+    refuse it in the bind, so LDAP mode answers the 401 before any directory call,
+    for an existing user exactly as for an unknown one."""
+    directory = _mock_directory.configure(monkeypatch, settings, ldap_service)
     password = "a" * 90 + "\x00" + "b" * 9
-    response = await _login(client, password)
-    assert response.status_code == 200, response.text
-    assert ldap_mode == [password]
+    directory.add_user("alice", password.replace("\x00", ""))
+    for login in ("alice", "nobody"):
+        response = await _login(client, password, email=login)
+        assert (response.status_code, response.json()) == (401, {"detail": "Invalid credentials"})
+    assert directory.connections == []
 
 
 async def test_ldap_mode_a_long_lone_surrogate_is_still_string_unicode(client, ldap_mode):

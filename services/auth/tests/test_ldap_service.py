@@ -31,7 +31,9 @@ from ldap3.core.results import (
     RESULT_INVALID_CREDENTIALS,
     RESULT_NO_SUCH_OBJECT,
     RESULT_REFERRAL,
+    RESULT_SIZE_LIMIT_EXCEEDED,
     RESULT_SUCCESS,
+    RESULT_TIME_LIMIT_EXCEEDED,
     RESULT_UNAVAILABLE,
     RESULT_UNWILLING_TO_PERFORM,
 )
@@ -193,8 +195,6 @@ _UNAVAILABLE_CLASSES = {
         {"ldap_use_tls": True},
     ),
     "user_bind_slow_directory": ({"user_bind": LDAPResponseTimeoutError("no response")}, {}),
-    "user_bind_busy": ({"user_bind": RESULT_BUSY}, {}),
-    "user_bind_unavailable": ({"user_bind": RESULT_UNAVAILABLE}, {}),
 }
 
 
@@ -223,10 +223,10 @@ async def test_bind_user_raises_unavailable_when_the_directory_could_not_be_aske
 
 
 # (name, FakeDirectory overrides). Every one is an answer the directory gave
-# about THIS login, so it is the refusal (401), whatever the account's state:
-# a disabled or locked account answers with the same codes a wrong password does
-# on the directories HERD targets, and telling them apart would reveal that the
-# account exists.
+# about THIS login, so it is the refusal (401), whatever the code: only an
+# existing user reaches the user bind, so any other answer there (an outage for
+# busy or unavailable included, the #1403 review) would reveal that the account
+# exists.
 _REFUSAL_CLASSES = {
     "user_not_found": {"search": (RESULT_SUCCESS, [])},
     "wrong_password": {"user_bind": RESULT_INVALID_CREDENTIALS},
@@ -234,6 +234,8 @@ _REFUSAL_CLASSES = {
     "account_inappropriate_auth": {"user_bind": RESULT_INAPPROPRIATE_AUTHENTICATION},
     "account_locked_constraint": {"user_bind": RESULT_CONSTRAINT_VIOLATION},
     "account_access_denied": {"user_bind": RESULT_INSUFFICIENT_ACCESS_RIGHTS},
+    "user_bind_busy": {"user_bind": RESULT_BUSY},
+    "user_bind_unavailable": {"user_bind": RESULT_UNAVAILABLE},
     "missing_email": {"search": (RESULT_SUCCESS, [alice_entry(mail=[])])},
 }
 
@@ -257,6 +259,17 @@ async def test_bind_user_success_through_the_connection_seam(directory):
         username="alice", email="alice@example.com", dn=USER_DN
     )
     assert directory.user_bind_passwords == [_PASSWORD]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [RESULT_SIZE_LIMIT_EXCEEDED, RESULT_TIME_LIMIT_EXCEEDED])
+async def test_bind_user_a_limited_search_that_found_the_user_still_signs_in(directory, code):
+    """ldap3's search() is True whenever the response holds an entry, whatever the
+    result code (Connection.search), so a size- or time-limited search that found
+    the user is a match, as it was before #1403."""
+    directory.search = (code, [alice_entry()])
+    identity = await ldap_service.bind_user("alice", _PASSWORD)
+    assert identity is not None and identity.dn == USER_DN
 
 
 @pytest.mark.asyncio

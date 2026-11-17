@@ -4,10 +4,12 @@ The invariant: a login answer tells "your credentials are wrong" apart from "the
 directory could not be asked", without revealing whether an account exists and
 without turning an outage into a local-password fallback. So every answer the
 directory gave about this login (no such user, a refused bind, an entry without the
-email attribute) stays the 401 `Invalid credentials`, and every way the directory
+email attribute, and any result code of the user bind, busy included) stays the 401
+`Invalid credentials`, and every way the directory
 could not be asked (incomplete configuration, a refused connection, a TLS failure,
-a refused service-account bind, a search error or non-success result, a dropped or
-slow user bind) is the 503 `Directory unavailable, credentials not checked`, with no
+a refused service-account bind, a search error or non-success result, a user bind
+whose connection fails, fails TLS, or times out) is the 503 `Directory unavailable,
+credentials not checked`, with no
 session, no account created, and no directory text in the body.
 
 These run the real route, auth_service, and ldap_service code; only ldap3's
@@ -94,7 +96,6 @@ _OUTAGES = {
     "search_busy": {"search": (RESULT_BUSY, [])},
     "user_bind_connect_error": {"user_bind": LDAPSocketOpenError(DIRECTORY_TEXT)},
     "user_bind_slow_directory": {"user_bind": LDAPResponseTimeoutError(DIRECTORY_TEXT)},
-    "user_bind_busy": {"user_bind": RESULT_BUSY},
 }
 
 
@@ -132,6 +133,8 @@ _REFUSALS = {
     "user_not_found": {"search": (RESULT_SUCCESS, [])},
     "wrong_password": {"user_bind": RESULT_INVALID_CREDENTIALS},
     "account_refused_by_directory": {"user_bind": RESULT_UNWILLING_TO_PERFORM},
+    # Only an existing user reaches the user bind, so busy there is a refusal too.
+    "user_bind_busy": {"user_bind": RESULT_BUSY},
     "missing_email": {"search": (RESULT_SUCCESS, [alice_entry(mail=[])])},
 }
 
