@@ -479,10 +479,13 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   Enforced in: `services/config/app/config_store.py` (`save_config`) \
   Pinned by: `services/config/tests/test_bootstrap.py` (`test_save_config_clears_bootstrap_marker`)
 - **OPS-CONFIG-4.** `GET /status` answers `configured` (the file exists) and
-  `password_changed`; a corrupt auth file reports `password_changed` false instead of
-  failing. \
-  Enforced in: `services/config/app/main.py` (`get_status`); `services/config/app/config_store.py` (`is_configured`, `is_password_changed`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_status_unconfigured`, `test_status_configured`, `test_status_with_corrupt_auth_file`)
+  `password_changed`, which is true only when the auth file is a JSON object whose
+  `password_changed` is the JSON boolean `true`. An auth file that is corrupt or not an
+  object (a list, a string, a number, `null`, a boolean), or whose `password_changed` is
+  anything else (`"yes"`, `1`, `null`, missing), reports `password_changed` false with a
+  200 instead of failing (before issue #1427 a file that was not an object was a 500). \
+  Enforced in: `services/config/app/main.py` (`get_status`); `services/config/app/config_store.py` (`is_configured`, `is_password_changed`, `load_auth`) \
+  Pinned by: `services/config/tests/test_config.py` (`test_status_unconfigured`, `test_status_configured`, `test_status_with_corrupt_auth_file`, `test_status_answers_200_not_rotated_for_a_file_that_is_not_an_object`, `test_is_password_changed_is_false_unless_the_stored_value_is_json_true`, `test_is_password_changed_is_true_for_json_true`)
 - **OPS-CONFIG-5.** On first use the config password is `CONFIG_ADMIN_PASSWORD` when set,
   counted as rotated; otherwise a random password is generated, logged once at WARNING,
   and counted as not rotated. No fixed default exists. \
@@ -506,17 +509,25 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   is logged exactly when the stored value is unusable, whatever the client sent: a
   password that is not a string or cannot be encoded as UTF-8 (a lone surrogate) is
   refused with no log line, any other password (a NUL, an over-long one) is checked as
-  usual, and against an unusable file the line is still logged once. \
-  Enforced in: `services/config/app/config_store.py` (`load_auth`, `verify_password`, `ConfigAuthError`, `_check_password`, `UNUSABLE_HASH_MESSAGE`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_verify_password_fails_closed`, `test_default_password_not_regenerated_on_corrupt`, `test_login_with_corrupt_auth_file`); `services/config/tests/test_config_passwords.py` (`test_an_unusable_auth_file_refuses_login_without_raising`, `test_login_against_an_unusable_auth_file_is_401_not_500`, `test_a_hostile_client_password_against_a_good_auth_file_never_blames_the_file`, `test_a_non_string_client_password_is_refused_by_the_schema_without_blaming_the_file`, `test_check_password_logs_nothing_for_a_hostile_password_and_a_good_hash`, `test_an_unusable_stored_hash_is_reported_exactly_once_whatever_the_password`, `test_a_change_password_that_cannot_be_encoded_keeps_the_file_and_blames_nothing`, `test_a_hostile_password_never_matches_a_hash_of_the_empty_password`)
+  usual, and against an unusable file the line is still logged once. A file that is
+  not an object is refused by `load_auth` itself, so every reader fails closed the
+  same way. Nothing rewrites an unreadable or non-object file: a `POST /change-password`
+  from a session issued before the file became unusable answers 503 `The config password
+  store is unusable; the config service log names the cause` and leaves the file as it
+  was (before issue #1427 it was a 500). \
+  Enforced in: `services/config/app/config_store.py` (`load_auth`, `verify_password`, `ConfigAuthError`, `_check_password`, `UNUSABLE_HASH_MESSAGE`, `STORE_UNUSABLE_DETAIL`); `services/config/app/main.py` (`config_store_unusable`) \
+  Pinned by: `services/config/tests/test_config.py` (`test_verify_password_fails_closed`, `test_default_password_not_regenerated_on_corrupt`, `test_login_with_corrupt_auth_file`); `services/config/tests/test_config_passwords.py` (`test_an_unusable_auth_file_refuses_login_without_raising`, `test_login_against_an_unusable_auth_file_is_401_not_500`, `test_a_hostile_client_password_against_a_good_auth_file_never_blames_the_file`, `test_a_non_string_client_password_is_refused_by_the_schema_without_blaming_the_file`, `test_check_password_logs_nothing_for_a_hostile_password_and_a_good_hash`, `test_an_unusable_stored_hash_is_reported_exactly_once_whatever_the_password`, `test_a_change_password_that_cannot_be_encoded_keeps_the_file_and_blames_nothing`, `test_a_hostile_password_never_matches_a_hash_of_the_empty_password`); `services/config/tests/test_config.py` (`test_load_auth_refuses_a_file_that_is_not_an_object`, `test_change_password_from_an_old_session_never_rewrites_an_unusable_file`)
 - **OPS-CONFIG-8.** `POST /change-password` needs a session and a new password of 8 to 32
   characters, and marks the password rotated. \
   Enforced in: `services/config/app/main.py` (`change_password_endpoint`, `ChangePasswordRequest`) \
   Pinned by: `services/config/tests/test_config.py` (`test_change_password`, `test_change_password_too_short`, `test_change_password_too_long`, `test_change_password_unauthenticated`)
 - **OPS-CONFIG-9.** `PUT /settings` and `POST /apply` answer 403 `Change the config
-  password before modifying or applying configuration` until the password is rotated. \
-  Enforced in: `services/config/app/main.py` (`require_password_rotated`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_put_settings_locked_until_rotated`, `test_apply_locked_until_rotated`, `test_write_allowed_with_operator_password`)
+  password before modifying or applying configuration` until the password is rotated,
+  read on every request as OPS-CONFIG-4 reads it: a session issued before the auth file
+  became unusable, or before its `password_changed` became anything but `true`, gets the
+  403 and writes nothing. \
+  Enforced in: `services/config/app/main.py` (`require_password_rotated`); `services/config/app/config_store.py` (`is_password_changed`) \
+  Pinned by: `services/config/tests/test_config.py` (`test_put_settings_locked_until_rotated`, `test_apply_locked_until_rotated`, `test_write_allowed_with_operator_password`, `test_a_session_from_before_the_file_changed_cannot_write_or_apply`)
 - **OPS-CONFIG-10.** `GET /schema` lists the editable fields to anyone; `GET /settings`
   needs a session and answers the environment values overlaid by the file's values,
   limited to the schema's keys, with every non-empty secret field shown as `********`. \
@@ -1545,6 +1556,7 @@ CLI documentation guard (OPS-NATS-14).
 | 400 | `No configuration to apply` | config apply with no `config.json` | OPS-CONFIG-15 |
 | 200 | `{"restarted": [...], "errors": [...]}` | config apply; failures are entries in `errors` | OPS-CONFIG-13, OPS-CONFIG-16, OPS-CONFIG-24 |
 | 503 | `The config data directory is not writable; the config service log names the one-time fix` | a config write (login's first auth file, change-password, save) the data directory refuses | OPS-CONFIG-29 |
+| 503 | `The config password store is unusable; the config service log names the cause` | a config change-password while the auth file is unreadable or not a JSON object | OPS-CONFIG-7 |
 | 409 | `A restart is already in progress` | a restarter `POST /restart` while another runs | OPS-CONFIG-27 |
 | 404 | `Not found` | a restarter request to any path but `/restart` and `/health` | OPS-CONFIG-25 |
 | 405 | `Method not allowed`, with `Allow` | a restarter request to `/restart` with a method other than POST, or to `/health` with one other than GET | OPS-CONFIG-25 |

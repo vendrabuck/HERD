@@ -16,7 +16,19 @@ AUTH_FILE = os.path.join(DATA_DIR, "config_auth.json")
 
 
 class ConfigAuthError(Exception):
-    """Raised when the config auth file exists but cannot be read/parsed."""
+    """The stored config password cannot be used, so no login can succeed.
+
+    Raised when the auth file exists but cannot be read or parsed, or parses to
+    something other than a JSON object. Callers fail closed: login is refused,
+    /status reports not rotated, and nothing rewrites the file (main.py answers a
+    route that meets it with 503 and STORE_UNUSABLE_DETAIL).
+    """
+
+
+# The body of a 503 for ConfigAuthError: fixed text, never a path or a value.
+STORE_UNUSABLE_DETAIL = (
+    "The config password store is unusable; the config service log names the cause"
+)
 
 
 class DataDirNotWritable(PermissionError):
@@ -161,13 +173,20 @@ def load_auth() -> dict:
         return auth
     try:
         with open(AUTH_FILE) as f:
-            return json.load(f)
+            loaded = json.load(f)
     except (json.JSONDecodeError, OSError) as exc:
         # Fail closed: do NOT regenerate the default here, that would silently
         # reset the admin password. Recovery is operator-driven: remove the
         # corrupt file and the missing-file branch above regenerates the default.
         logger.error("Corrupt config auth file %s: %s", AUTH_FILE, exc)
         raise ConfigAuthError(f"corrupt auth file {AUTH_FILE}") from exc
+    if not isinstance(loaded, dict):
+        # Valid JSON that is not an object holds no hash and no rotation flag:
+        # fail closed exactly like a corrupt file (issue #1427), and name the
+        # class only, never the value.
+        logger.error("%s (%s)", UNUSABLE_HASH_MESSAGE, type(loaded).__name__)
+        raise ConfigAuthError(f"auth file {AUTH_FILE} is not a JSON object")
+    return loaded
 
 
 def _save_auth(auth: dict) -> None:
@@ -182,16 +201,15 @@ def verify_password(password: str) -> bool:
     except ConfigAuthError:
         # Fail closed: deny login when the auth file is present but corrupt.
         return False
-    # A file that parses but holds no hash (not an object, or the key missing)
-    # fails closed the same way.
-    stored = auth.get("password_hash") if isinstance(auth, dict) else None
-    return _check_password(password, stored)
+    # load_auth answers an object or raises; an object that holds no hash (the
+    # key missing) fails closed the same way, in _check_password.
+    return _check_password(password, auth.get("password_hash"))
 
 
 def change_password(new_password: str) -> None:
-    # Unreachable with a corrupt auth file: this is only called behind
-    # require_config_session, which requires a successful login, and
-    # verify_password now denies login when the auth file is corrupt.
+    # Reached with an unusable auth file only by a session issued before the file
+    # broke; load_auth's ConfigAuthError then propagates (main.py: 503) and the
+    # file is never rewritten, so a session cannot turn it into a rotated one.
     auth = load_auth()
     auth["password_hash"] = _hash_password(new_password)
     auth["password_changed"] = True
@@ -199,11 +217,17 @@ def change_password(new_password: str) -> None:
 
 
 def is_password_changed() -> bool:
+    """True only when the stored flag is the JSON boolean true (issue #1427).
+
+    Any other stored value ("yes", 1, null, missing) is not rotated, so the write
+    surface stays locked; it never reads a truthy non-boolean as rotated.
+    """
     try:
-        return load_auth().get("password_changed", False)
+        return load_auth().get("password_changed") is True
     except (ConfigAuthError, DataDirNotWritable):
         # Keep the public /status endpoint up; report the safe default. An
-        # unwritable directory with no auth file has no password yet.
+        # unusable file, or an unwritable directory with no auth file, has no
+        # usable password.
         return False
 
 

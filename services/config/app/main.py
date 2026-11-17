@@ -12,6 +12,8 @@ from app.auth import create_session_token, require_config_session
 from app.config_schema import CONFIG_SCHEMA, SCHEMA_KEYS
 from app.config_store import (
     DATA_DIR_NOT_WRITABLE_DETAIL,
+    STORE_UNUSABLE_DETAIL,
+    ConfigAuthError,
     bootstrap_from_env,
     change_password,
     data_dir_remedy,
@@ -71,6 +73,19 @@ async def data_dir_not_writable(_request: Request, exc: PermissionError) -> JSON
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content={"detail": DATA_DIR_NOT_WRITABLE_DETAIL},
+    )
+
+
+@app.exception_handler(ConfigAuthError)
+async def config_store_unusable(_request: Request, exc: ConfigAuthError) -> JSONResponse:
+    """A route that meets an unusable password store answers 503, never a 500.
+
+    Only change-password can: login and /status catch ConfigAuthError themselves.
+    load_auth already logged the cause; the body is a constant.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": STORE_UNUSABLE_DETAIL},
     )
 
 
