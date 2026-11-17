@@ -245,7 +245,12 @@ class TestChangePasswordEndpoint:
             json={"new_password": "short"},
             headers=headers,
         )
-        assert resp.status_code == 422
+        # A string detail that never echoes the password (issue #1428).
+        assert (resp.status_code, resp.json()) == (
+            422,
+            {"detail": "Password must be at least 8 characters"},
+        )
+        assert "short".encode() not in resp.content
 
     @pytest.mark.asyncio
     async def test_change_password_too_long(self, async_client):
@@ -258,7 +263,12 @@ class TestChangePasswordEndpoint:
             json={"new_password": "a" * 33},
             headers=headers,
         )
-        assert resp.status_code == 422
+        # A string detail that never echoes the password (issue #1428).
+        assert (resp.status_code, resp.json()) == (
+            422,
+            {"detail": "Password must be at most 32 characters"},
+        )
+        assert ("a" * 33).encode() not in resp.content
 
     @pytest.mark.asyncio
     async def test_change_password_unauthenticated(self, async_client):

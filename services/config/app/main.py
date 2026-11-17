@@ -5,7 +5,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
 
 from app import login_limits
 from app.auth import create_session_token, require_config_session
@@ -14,6 +14,7 @@ from app.config_store import (
     DATA_DIR_NOT_WRITABLE_DETAIL,
     STORE_UNUSABLE_DETAIL,
     ConfigAuthError,
+    InvalidPassword,
     bootstrap_from_env,
     change_password,
     data_dir_remedy,
@@ -97,16 +98,11 @@ class LoginRequest(BaseModel):
 
 
 class ChangePasswordRequest(BaseModel):
+    # Only the type is checked here. Which strings may become the password is
+    # config_store.new_password_problem, judged by change_password itself: a
+    # pydantic refusal would echo the password in the 422, and a lone surrogate
+    # in that echo cannot be rendered at all (issue #1428).
     new_password: str
-
-    @field_validator("new_password")
-    @classmethod
-    def validate_password_length(cls, v: str) -> str:
-        if len(v) < 8:
-            raise ValueError("Password must be at least 8 characters")
-        if len(v) > 32:
-            raise ValueError("Password must be at most 32 characters")
-        return v
 
 
 class SaveSettingsRequest(BaseModel):
@@ -184,7 +180,11 @@ async def change_password_endpoint(
     req: ChangePasswordRequest,
     _session: dict = Depends(require_config_session),
 ):
-    change_password(req.new_password)
+    try:
+        change_password(req.new_password)
+    except InvalidPassword as exc:
+        # A fixed detail, never the submitted value.
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from None
     return {"message": "Password changed"}
 
 

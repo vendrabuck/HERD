@@ -488,9 +488,17 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   Pinned by: `services/config/tests/test_config.py` (`test_status_unconfigured`, `test_status_configured`, `test_status_with_corrupt_auth_file`, `test_status_answers_200_not_rotated_for_a_file_that_is_not_an_object`, `test_is_password_changed_is_false_unless_the_stored_value_is_json_true`, `test_is_password_changed_is_true_for_json_true`)
 - **OPS-CONFIG-5.** On first use the config password is `CONFIG_ADMIN_PASSWORD` when set,
   counted as rotated; otherwise a random password is generated, logged once at WARNING,
-  and counted as not rotated. No fixed default exists. \
-  Enforced in: `services/config/app/config_store.py` (`_initial_password`, `load_auth`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_old_default_password_rejected`, `test_random_seed_used_and_unrotated`, `test_env_password_is_used_and_marks_rotated`)
+  and counted as not rotated. No fixed default exists. A blank or whitespace-only value
+  counts as unset; any other value is used as set, of any length, once it passes
+  OPS-CONFIG-8's character rule (`password_problem`). The environment cannot hold a NUL,
+  but a byte that is not UTF-8 arrives as a lone surrogate: such a value seeds nothing.
+  No auth file is written and no password is generated, every login is a 401, `/status`
+  reports `password_changed` false, and each use logs one ERROR, `CONFIG_ADMIN_PASSWORD is
+  not a usable config password (Password must be valid UTF-8 text); no auth file written,
+  login refused`, never the value. Fixing the variable is the recovery (before issue
+  #1428 this was a 500 on `/status` and on login). \
+  Enforced in: `services/config/app/config_store.py` (`_initial_password`, `load_auth`, `password_problem`) \
+  Pinned by: `services/config/tests/test_config.py` (`test_old_default_password_rejected`, `test_random_seed_used_and_unrotated`, `test_env_password_is_used_and_marks_rotated`); `services/config/tests/test_config_passwords.py` (`test_the_environment_cannot_hold_a_nul`, `test_an_admin_password_that_is_not_utf8_seeds_nothing_and_fails_closed`, `test_a_blank_admin_password_still_means_a_generated_one`, `test_a_legal_admin_password_of_any_length_seeds_and_signs_in`)
 - **OPS-CONFIG-6.** `POST /login` checks the password against the stored bcrypt hash and
   answers a session token valid for 30 minutes plus `password_changed`; a wrong password
   is 401 `Invalid password`. Only the first 72 UTF-8 bytes of a password reach bcrypt,
@@ -498,29 +506,50 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   equal (a 32-character change-password value can be 128 bytes). bcrypt 4.0.1 cut there
   silently and bcrypt 5 raises, so the cut is explicit (issue #1355); a table of 284
   decisions the bcrypt 4.0.1 code made is replayed by the tests. New hashes are `$2b$` at
-  cost 12. \
-  Enforced in: `services/config/app/main.py` (`login`); `services/config/app/auth.py` (`create_session_token`, `_EXPIRE_MINUTES`); `services/config/app/config_store.py` (`_password_bytes`, `_hash_password`, `_check_password`, `BCRYPT_MAX_BYTES`, `BCRYPT_ROUNDS`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_login_success`, `test_login_wrong_password`); `services/config/tests/test_auth.py` (`test_create_session_token_round_trips`); `services/config/tests/test_config_passwords.py` (`test_every_legacy_decision_is_kept`, `test_two_passwords_match_exactly_when_their_first_72_utf8_bytes_match`, `test_bcrypt_never_receives_more_than_72_bytes`, `test_new_hashes_are_2b_at_cost_12`, `test_a_stored_legacy_hash_over_72_bytes_still_signs_in`, `test_change_password_to_32_multibyte_characters_then_sign_in`, `test_an_operator_password_over_72_bytes_seeds_and_verifies`)
+  cost 12. A login password that is empty, holds a NUL anywhere, or cannot be encoded as
+  UTF-8 never signs in, whatever the stored hash (issue #1429): bcrypt appends a NUL to
+  the key and repeats it, so a hash of NULs alone matches the empty password and every
+  run of NULs, and bcrypt alone cannot be trusted with these. Of the 284 replayed
+  decisions, the 13 accepted pairs whose password is empty or holds a NUL are now
+  refused, by name. An operator whose stored password holds a NUL (only a crafted
+  change-password request before #1429 could store one; a browser field cannot type a
+  NUL) can no longer sign in with it and recovers by removing the auth file
+  (OPS-CONFIG-7). One door stays open until that operator acts: a hash stored from a
+  password with NUL separators, such as `ab`, NUL, `ab`, NUL, `ab`, still matches the
+  NUL-free password `ab`, because their bcrypt keys are equal. \
+  Enforced in: `services/config/app/main.py` (`login`); `services/config/app/auth.py` (`create_session_token`, `_EXPIRE_MINUTES`); `services/config/app/config_store.py` (`_password_bytes`, `_hash_password`, `_check_password`, `password_problem`, `BCRYPT_MAX_BYTES`, `BCRYPT_ROUNDS`) \
+  Pinned by: `services/config/tests/test_config.py` (`test_login_success`, `test_login_wrong_password`); `services/config/tests/test_auth.py` (`test_create_session_token_round_trips`); `services/config/tests/test_config_passwords.py` (`test_every_legacy_decision_is_kept`, `test_two_passwords_match_exactly_when_their_first_72_utf8_bytes_match`, `test_bcrypt_never_receives_more_than_72_bytes`, `test_new_hashes_are_2b_at_cost_12`, `test_a_stored_legacy_hash_over_72_bytes_still_signs_in`, `test_change_password_to_32_multibyte_characters_then_sign_in`, `test_an_operator_password_over_72_bytes_seeds_and_verifies`, `test_eight_nuls_never_become_the_password_and_the_empty_password_never_signs_in`, `test_a_legacy_hash_of_a_password_with_a_nul_never_signs_in_with_a_nul_or_empty_password`, `test_a_legacy_nul_separated_hash_still_matches_its_shorter_twin`, `test_every_refused_nul_or_empty_password_has_a_different_bcrypt_twin`)
 - **OPS-CONFIG-7.** A present but unreadable auth file denies every login and is never
   regenerated; removing the file is the operator's recovery. A file that parses but
   holds no usable hash (not an object, the key missing, not a string, or a value bcrypt
   cannot read) denies every login the same way, with a 401 and one ERROR log naming the
   class only, never the value (before issue #1355 most of these were a 500). That ERROR
   is logged exactly when the stored value is unusable, whatever the client sent: a
-  password that is not a string or cannot be encoded as UTF-8 (a lone surrogate) is
-  refused with no log line, any other password (a NUL, an over-long one) is checked as
-  usual, and against an unusable file the line is still logged once. A file that is
+  password that is not a string, or that OPS-CONFIG-8's character rule refuses (empty, a
+  NUL, a lone surrogate), is refused with no log line, any other password (an over-long
+  one) is checked as usual, and against an unusable file the line is still logged once. A file that is
   not an object is refused by `load_auth` itself, so every reader fails closed the
   same way. Nothing rewrites an unreadable or non-object file: a `POST /change-password`
   from a session issued before the file became unusable answers 503 `The config password
   store is unusable; the config service log names the cause` and leaves the file as it
   was (before issue #1427 it was a 500). \
   Enforced in: `services/config/app/config_store.py` (`load_auth`, `verify_password`, `ConfigAuthError`, `_check_password`, `UNUSABLE_HASH_MESSAGE`, `STORE_UNUSABLE_DETAIL`); `services/config/app/main.py` (`config_store_unusable`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_verify_password_fails_closed`, `test_default_password_not_regenerated_on_corrupt`, `test_login_with_corrupt_auth_file`); `services/config/tests/test_config_passwords.py` (`test_an_unusable_auth_file_refuses_login_without_raising`, `test_login_against_an_unusable_auth_file_is_401_not_500`, `test_a_hostile_client_password_against_a_good_auth_file_never_blames_the_file`, `test_a_non_string_client_password_is_refused_by_the_schema_without_blaming_the_file`, `test_check_password_logs_nothing_for_a_hostile_password_and_a_good_hash`, `test_an_unusable_stored_hash_is_reported_exactly_once_whatever_the_password`, `test_a_change_password_that_cannot_be_encoded_keeps_the_file_and_blames_nothing`, `test_a_hostile_password_never_matches_a_hash_of_the_empty_password`); `services/config/tests/test_config.py` (`test_load_auth_refuses_a_file_that_is_not_an_object`, `test_change_password_from_an_old_session_never_rewrites_an_unusable_file`)
+  Pinned by: `services/config/tests/test_config.py` (`test_verify_password_fails_closed`, `test_default_password_not_regenerated_on_corrupt`, `test_login_with_corrupt_auth_file`); `services/config/tests/test_config_passwords.py` (`test_an_unusable_auth_file_refuses_login_without_raising`, `test_login_against_an_unusable_auth_file_is_401_not_500`, `test_a_hostile_client_password_against_a_good_auth_file_never_blames_the_file`, `test_a_non_string_client_password_is_refused_by_the_schema_without_blaming_the_file`, `test_check_password_logs_nothing_for_a_hostile_password_and_a_good_hash`, `test_an_unusable_stored_hash_is_reported_exactly_once_whatever_the_password`, `test_a_change_password_that_is_refused_keeps_the_file_and_blames_nothing`, `test_a_hostile_password_never_matches_a_hash_of_the_empty_password`, `test_the_refused_set_is_the_non_strings_the_non_encodable_nul_and_empty`); `services/config/tests/test_config.py` (`test_load_auth_refuses_a_file_that_is_not_an_object`, `test_change_password_from_an_old_session_never_rewrites_an_unusable_file`)
 - **OPS-CONFIG-8.** `POST /change-password` needs a session and a new password of 8 to 32
-  characters, and marks the password rotated. \
-  Enforced in: `services/config/app/main.py` (`change_password_endpoint`, `ChangePasswordRequest`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_change_password`, `test_change_password_too_short`, `test_change_password_too_long`, `test_change_password_unauthenticated`)
+  characters, counted as code points, not bytes, and marks the password rotated. One
+  character rule, `password_problem`, decides which strings can be a config password at
+  every entry point (this route, login, `CONFIG_ADMIN_PASSWORD`), and hashing itself
+  refuses what it refuses: no NUL anywhere (issue #1429), encodable as UTF-8, so no lone
+  surrogate (issue #1428), and not empty. Every other character is accepted, other
+  control characters included. A refusal is a 422 whose `detail` is a string that never
+  holds the submitted value, and the stored hash is unchanged. The length is judged
+  first: `Password must be at least 8 characters`, `Password must be at most 32
+  characters`; then `Password must not contain a NUL character`; then `Password must be
+  valid UTF-8 text`. Before these issues eight NULs were accepted (and then the empty
+  password signed in), a lone surrogate was a 500, and the length refusals were a
+  validation list that echoed the password. \
+  Enforced in: `services/config/app/main.py` (`change_password_endpoint`, `ChangePasswordRequest`); `services/config/app/config_store.py` (`password_problem`, `new_password_problem`, `change_password`, `_hash_password`, `InvalidPassword`) \
+  Pinned by: `services/config/tests/test_config.py` (`test_change_password`, `test_change_password_too_short`, `test_change_password_too_long`, `test_change_password_unauthenticated`); `services/config/tests/test_config_passwords.py` (`test_change_password_refuses_an_illegal_password_without_echo_and_keeps_the_file`, `test_change_password_accepts_every_other_password_and_it_signs_in`, `test_password_problem_enumerates_the_space`, `test_every_legal_password_in_the_space_hashes_and_signs_in`, `test_new_password_problem_checks_the_bound_in_characters_then_the_rule`, `test_an_illegal_password_never_reaches_bcrypt`)
 - **OPS-CONFIG-9.** `PUT /settings` and `POST /apply` answer 403 `Change the config
   password before modifying or applying configuration` until the password is rotated,
   read on every request as OPS-CONFIG-4 reads it: a session issued before the auth file
@@ -1549,7 +1578,7 @@ CLI documentation guard (OPS-NATS-14).
 | 429 | `Too many failed login attempts; try again later`, with `Retry-After` | config login while its source, or every source, is waiting after failed attempts | OPS-CONFIG-22 |
 | 401 | `Session expired`, `Invalid session token` | a config route with an expired or bad session token | OPS-CONFIG-17 |
 | 403 | `Change the config password before modifying or applying configuration` | config save or apply before the password is rotated | OPS-CONFIG-9 |
-| 422 | validation list | a new config password outside 8 to 32 characters | OPS-CONFIG-8 |
+| 422 | `Password must be at least 8 characters`, `Password must be at most 32 characters`, `Password must not contain a NUL character`, `Password must be valid UTF-8 text` | a new config password outside 8 to 32 characters, holding a NUL, or holding a lone surrogate (judged in that order) | OPS-CONFIG-8 |
 | 422 | `{"errors": ["<KEY> is required", ...]}` | a config save missing a required field, including a masked secret with no source | OPS-CONFIG-11, OPS-CONFIG-12 |
 | 422 | `{"errors": ["Unknown settings: <KEY>, ..."]}` | a config save naming a key outside `CONFIG_SCHEMA` | OPS-CONFIG-12 |
 | 422 | `{"errors": ["AUTH_SECRET_KEY is unset, blank, or still a placeholder; ...", "AUTH_ALGORITHM must be one of HS256, HS384, HS512"]}` (either or both) | a config save with a missing, blank, or placeholder `AUTH_SECRET_KEY`, or a set `AUTH_ALGORITHM` outside the three | OPS-CONFIG-23 |
