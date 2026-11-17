@@ -15,17 +15,25 @@ module does:
   (`MAX_PASSWORD_BYTES`), or not encodable as UTF-8, is refused: `hash_password`
   raises ValueError and `verify_password` returns False.
 - A stored hash is usable when it reads `$<ident>$<cost>$<22-char salt><31-char
-  checksum>` with ident `2`, `2a`, `2b`, or `2y` and cost 04 to 31. `$2x$` and every
-  other shape are refused. A `$2$` hash is checked as passlib emulated it, with
-  the password repeated to 72 bytes. This module checks that under `$2a$`;
-  passlib on bcrypt 4.0.1 used its fallback ident `$2b$`. The result is the same,
-  because `$2a$` and `$2b$` differ only for inputs over 72 bytes, and the secret
-  here is never longer than 72.
+  checksum>` with ident `2`, `2a`, `2b`, or `2y` and cost 04 to `MAX_VERIFY_COST`
+  (14). `$2x$` and every other shape are refused. A `$2$` hash is checked as
+  passlib emulated it, with the password repeated to 72 bytes. This module checks
+  that under `$2a$`; passlib on bcrypt 4.0.1 used its fallback ident `$2b$`. The
+  result is the same, because `$2a$` and `$2b$` differ only for inputs over 72
+  bytes, and the secret here is never longer than 72.
 - The unused low bits of the last salt character (4 bits) and the last checksum
   character (2 bits) are cleared before checking, as passlib did (it warned).
 - New hashes are `$2b$` at cost 12 (`BCRYPT_IDENT`, `BCRYPT_ROUNDS`), passlib's
   defaults. A stored hash at any other usable cost still verifies at its own cost;
   nothing rehashes on login (passlib's `needs_update` was never called).
+
+One deliberate departure from passlib (issue #1425): passlib checked a well-formed
+hash at any cost up to 31, and each cost step doubles the work, so a cost-31 row
+held the single-worker event loop for about 31 hours per login attempt. A hash
+above `MAX_VERIFY_COST` is unusable here, refused like any other unusable hash
+without bcrypt ever running on it. HERD writes only cost 12, and no recorded
+passlib decision (`tests/data/passlib_1_7_4_fixtures.json`) is above the ceiling,
+so no stored hash HERD or passlib wrote changes its answer.
 
 Every `verify_password` call runs exactly one bcrypt computation: against the stored
 hash, at that hash's own cost, when it is usable and the password is acceptable, else
@@ -50,6 +58,11 @@ BCRYPT_IDENT = b"2b"
 BCRYPT_MAX_BYTES = 72
 # passlib's MAX_PASSWORD_SIZE: a longer password was refused, never truncated.
 MAX_PASSWORD_BYTES = 4096
+# The highest stored-hash cost verify_password will compute (issue #1425). Two
+# steps above BCRYPT_ROUNDS: room to raise the cost of new hashes twice, and one
+# check stays under about a second on the dev host (cost 14 measured 0.87 s).
+# It must never fall below BCRYPT_ROUNDS, or every new hash would be unusable.
+MAX_VERIFY_COST = 14
 
 _BCRYPT64 = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 _STORED_HASH = re.compile(
@@ -90,7 +103,7 @@ def _usable_hash(stored_hash: object) -> tuple[bytes, bool] | None:
     if not isinstance(stored_hash, str):
         return None
     match = _STORED_HASH.fullmatch(stored_hash)
-    if match is None:
+    if match is None or int(match["cost"]) > MAX_VERIFY_COST:
         return None
     salt = match["salt"][:-1] + _clear_low_bits(match["salt"][-1], 4)
     checksum = match["checksum"][:-1] + _clear_low_bits(match["checksum"][-1], 2)

@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from app.config import settings
 from app.models.user import Role, User
-from app.services import auth_service
+from app.services import auth_service, passwords
 from app.services.auth_service import (
     FederatedLogin,
     create_ldap_user,
@@ -204,6 +204,33 @@ async def test_switch_on_refuses_a_wrong_password_after_one_bcrypt_on_its_own_ha
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         _assert_invalid(await _login(client, email, "wrong-password-1"))
     assert bcrypt_calls == [stored_hash]
+    assert _reasons(caplog) == ["wrong_password"]
+
+
+async def test_switch_on_refuses_a_superadmin_hash_above_the_cost_ceiling_at_dummy_cost(
+    monkeypatch, client, oidc_mode, break_glass, caplog
+):
+    """Issue #1425 on the break-glass path: an eligible superadmin whose row holds
+    a cost-31 hash (a direct database write) gets the wrong-password 401, and the
+    only bcrypt that runs is the cost-12 dummy check. The bcrypt spy never
+    computes, so a regression fails fast instead of running a cost-31 check."""
+    email, _ = await _account("superadmin")
+    costly = "$2b$31$" + "abcdefghijklmnopqrstuu" + "a" * 31
+    async with TestSessionLocal() as db:
+        user = await auth_service.get_user_by_email(db, email)
+        user.hashed_password = costly
+        await db.commit()
+    checked: list[bytes] = []
+
+    def checkpw(secret: bytes, hashed: bytes) -> bool:
+        checked.append(hashed)
+        return False
+
+    monkeypatch.setattr(passwords.bcrypt, "checkpw", checkpw)
+    break_glass(True)
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        _assert_invalid(await _login(client, email))
+    assert checked == [passwords.DUMMY_HASH.encode()]
     assert _reasons(caplog) == ["wrong_password"]
 
 

@@ -464,7 +464,7 @@ short-lived access token and a refresh token.
   LDAP account, local account without a hash, unusable stored hash, refused password)
   costs exactly one bcrypt computation and hashes nothing new: at cost 12 for every
   refusal that uses the dummy hash, and at the stored hash's own cost otherwise, which
-  is 12 for every hash HERD wrote (IAM-HASH-5). \
+  is 12 for every hash HERD wrote and never above 14 (IAM-HASH-4, IAM-HASH-5). \
   Enforced in: `services/auth/app/services/auth_service.py` (`_authenticate_local`, `_DUMMY_HASH`); `services/auth/app/services/passwords.py` (`verify_password`, `DUMMY_HASH`) \
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_every_local_login_answer_costs_one_bcrypt_at_the_configured_cost`, `test_the_dummy_hash_has_the_ident_and_cost_of_every_new_hash`)
 - **IAM-LOGIN-3.** The login identifier is 1 to 255 characters and the password at most
@@ -1888,9 +1888,11 @@ it on the pre-#1355 commit, is replayed by the tests
 
 - **IAM-HASH-1.** `verify_password` accepts exactly the (password, stored hash) pairs
   passlib accepted and answers False for every other pair, including every pair on
-  which passlib raised; it never raises. \
+  which passlib raised; it never raises. One departure, by decision (issue #1425): a
+  hash above the cost ceiling of IAM-HASH-4, which passlib checked, is refused. No
+  hash HERD or passlib wrote and no recorded passlib decision is above the ceiling. \
   Enforced in: `services/auth/app/services/passwords.py` (`verify_password`, `_usable_hash`, `_password_bytes`) \
-  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_every_legacy_passlib_decision_is_kept`, `test_the_legacy_table_came_from_the_production_passlib_configuration`, `test_login_with_a_hash_passlib_stored_decides_as_passlib_did`)
+  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_every_legacy_passlib_decision_is_kept`, `test_the_legacy_table_came_from_the_production_passlib_configuration`, `test_login_with_a_hash_passlib_stored_decides_as_passlib_did`, `test_every_cost_above_the_ceiling_is_refused_after_one_dummy_check`)
 - **IAM-HASH-2.** The password is encoded as UTF-8 and only its first 72 bytes reach
   bcrypt, on hashing and on checking: two passwords match exactly when their first 72
   UTF-8 bytes are equal, also when the cut falls inside a multi-byte character. So a
@@ -1910,8 +1912,11 @@ it on the pre-#1355 commit, is replayed by the tests
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_a_refused_password_never_hashes`, `test_a_refused_password_is_false_after_one_dummy_check`, `test_a_refused_password_against_a_good_hash_logs_nothing`, `test_4096_bytes_is_still_accepted`, `test_a_password_passlib_refused_to_hash_is_still_refused`, `test_a_login_with_a_nul_password_is_401_not_500`)
 - **IAM-HASH-4.** A stored hash is usable when it reads `$<ident>$<cost>$` followed by a
   22-character salt and a 31-character checksum in bcrypt's alphabet, with ident `2`,
-  `2a`, `2b`, or `2y` and a two-digit cost from 04 to 31. `$2x$` and every other value
-  (NULL, empty, garbage, truncated, another scheme) are unusable: the answer is False
+  `2a`, `2b`, or `2y` and a two-digit cost from 04 to 14, the ceiling `MAX_VERIFY_COST`
+  (issue #1425: each cost step doubles the work, and passlib's top of 31 held the event
+  loop about 31 hours per login). `$2x$`, a well-formed hash at cost 15 to 31, and every
+  other value (NULL, empty, garbage, truncated, another scheme) are unusable: bcrypt
+  never runs on such a hash, and the answer is False
   after one check against the dummy hash, with one WARNING `Stored password hash is not
   a usable bcrypt hash` that holds neither the hash nor the password. A login against an
   unusable hash is the 401 `Invalid credentials` (under passlib it was a 500). A `$2$`
@@ -1921,8 +1926,8 @@ it on the pre-#1355 commit, is replayed by the tests
   inputs over 72 bytes, which never reach bcrypt here (IAM-HASH-2). The unused low bits
   of the final salt and checksum characters are cleared before the check, as passlib
   did. \
-  Enforced in: `services/auth/app/services/passwords.py` (`_usable_hash`, `_STORED_HASH`, `_clear_low_bits`, `UNUSABLE_HASH_MESSAGE`) \
-  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_an_unusable_stored_hash_is_false_after_one_dummy_check`, `test_a_bcrypt_error_on_an_admitted_hash_is_false_after_one_dummy_check`, `test_a_login_against_an_unusable_stored_hash_is_401_not_500`, `test_every_legacy_passlib_decision_is_kept`)
+  Enforced in: `services/auth/app/services/passwords.py` (`_usable_hash`, `_STORED_HASH`, `MAX_VERIFY_COST`, `_clear_low_bits`, `UNUSABLE_HASH_MESSAGE`) \
+  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_an_unusable_stored_hash_is_false_after_one_dummy_check`, `test_a_bcrypt_error_on_an_admitted_hash_is_false_after_one_dummy_check`, `test_a_login_against_an_unusable_stored_hash_is_401_not_500`, `test_every_legacy_passlib_decision_is_kept`, `test_the_cost_ceiling_is_14_and_admits_every_hash_herd_writes`, `test_every_cost_above_the_ceiling_is_refused_after_one_dummy_check`, `test_a_hash_at_the_ceiling_is_checked_unchanged_at_its_own_cost`, `test_a_login_against_a_hash_above_the_cost_ceiling_is_the_wrong_password_401`); `services/auth/tests/test_oidc_break_glass.py` (`test_switch_on_refuses_a_superadmin_hash_above_the_cost_ceiling_at_dummy_cost`)
 - **IAM-HASH-5.** Every `verify_password` call runs exactly one bcrypt computation:
   against the stored hash, at that hash's own cost, when it is usable and the password is
   acceptable, else against `DUMMY_HASH`. The dummy hash is made by `hash_password`, so it
@@ -1930,10 +1935,11 @@ it on the pre-#1355 commit, is replayed by the tests
   Enforced in: `services/auth/app/services/passwords.py` (`verify_password`, `_refuse_after_dummy_check`, `DUMMY_HASH`) \
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_the_dummy_hash_has_the_ident_and_cost_of_every_new_hash`, `test_a_usable_hash_is_checked_once_at_its_own_cost_and_never_rehashed`, `test_every_local_login_answer_costs_one_bcrypt_at_the_configured_cost`)
 - **IAM-HASH-6.** New hashes are `$2b$` at cost 12, passlib's defaults. A stored hash at
-  another usable cost still verifies at its own cost, and nothing rehashes or rewrites a
-  stored hash on login (passlib's `needs_update` was never called). \
+  another usable cost (04 to 14, IAM-HASH-4) still verifies at its own cost, and
+  nothing rehashes or rewrites a stored hash on login (passlib's `needs_update` was
+  never called). \
   Enforced in: `services/auth/app/services/passwords.py` (`hash_password`, `BCRYPT_ROUNDS`, `BCRYPT_IDENT`) \
-  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_the_dummy_hash_has_the_ident_and_cost_of_every_new_hash`, `test_a_usable_hash_is_checked_once_at_its_own_cost_and_never_rehashed`, `test_a_login_at_another_cost_succeeds_and_leaves_the_stored_hash_alone`)
+  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_the_dummy_hash_has_the_ident_and_cost_of_every_new_hash`, `test_a_usable_hash_is_checked_once_at_its_own_cost_and_never_rehashed`, `test_a_login_at_another_cost_succeeds_and_leaves_the_stored_hash_alone`, `test_a_hash_at_the_ceiling_is_checked_unchanged_at_its_own_cost`, `test_the_answer_at_the_ceiling_is_what_bcrypt_says`)
 - **IAM-HASH-7.** Hashing and checking are synchronous and run on the event loop, as
   they did under passlib; a check at cost 12 holds the loop for its duration. \
   Enforced in: `services/auth/app/services/auth_service.py` (`_authenticate_local`, `_authenticate_oidc_mode`, `create_user`) \
@@ -1944,7 +1950,8 @@ it on the pre-#1355 commit, is replayed by the tests
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_passlib_is_not_installed`, `test_import_and_first_use_raise_no_warning`)
 
 **Out of scope.** The config service's own password is in
-`operations-and-observability.md` (OPS-CONFIG-6). LDAP mode never hashes: the password
+`operations-and-observability.md` (OPS-CONFIG-6); the cost ceiling of IAM-HASH-4 is
+auth's only, and the config service's check has none (issue #1425). LDAP mode never hashes: the password
 goes to the directory (IAM-LDAP-1), and its 72-character bound is issue #1404.
 
 ## 9. Errors
