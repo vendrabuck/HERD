@@ -878,6 +878,20 @@ run artifact (7-day retention) alongside the compose diagnostics; a nightly e2e 
 screenshots, page HTML, console logs, and tracebacks are downloadable from the run's
 Actions page, not just the local `<tempdir>/herd-e2e-artifacts` default.
 
+### NOS lab: every FRR save fails with `Can't open configuration file /etc/frr/staticd.conf.XXXXXX.`
+
+The frr_mgmt live tests (`make nos-test-dialect`) report `success: False` with that error
+for any change that has to be saved, while the change itself applied, and the host's
+kernel log has `apparmor="DENIED" operation="mknod" profile="staticd"`. The host loads
+an enforcing AppArmor profile for FRR's staticd (Ubuntu 26.04 does, including GitHub's
+`ubuntu-latest` runner), and the FRR lab node was started unconfined, so that profile
+attached to the node's own staticd. The checked-in compose file runs the node under
+`apparmor=docker-default` to prevent exactly this. Check with
+`docker exec nos-test-frr sh -c 'cat /proc/$(pidof staticd)/attr/current'`:
+`staticd (enforce)` means the node predates the option or was started from an edited
+compose file; `make nos-reset` recreates it. `docs/NOS_LAB.md` ("The two nodes") has the
+mechanism.
+
 ## Logs and where to look
 
 - **Global tail**: `make logs` (all containers).

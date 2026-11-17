@@ -42,6 +42,34 @@ Both nodes run `privileged: true`: SR Linux manages its own network
 namespaces and interfaces at boot, and FRR's zebra/staticd daemons program
 the kernel routing table and need raw-socket access.
 
+The FRR node also sets `security_opt: [apparmor=docker-default]`, and
+`tests/unit/test_nos_lab_compose.py` pins it. A privileged container
+defaults to AppArmor `unconfined`, and an unconfined process that execs a
+binary is attached to any host profile whose path matches it. Ubuntu 26.04's
+`apparmor` package (5.0.2) loads enforcing profiles for eighteen FRR daemons,
+among them `staticd` for `/usr/lib/frr/staticd`, which grants the daemon no
+write in `/etc/frr`. The lab keeps per-daemon config files (it has no
+`frr.conf`), so on such a host every `write memory` printed
+`Can't open configuration file /etc/frr/staticd.conf.XXXXXX.` and the
+kernel logged `apparmor="DENIED" operation="mknod" profile="staticd"`; the
+`nos-dialect` job went red that way once GitHub's `ubuntu-latest` became
+ubuntu-26.04 (2026-11-16). Under `docker-default` every exec inherits the
+container's own profile, so no host per-binary profile applies, and the
+privileges above are unchanged. Docker ignores the option on a host without
+AppArmor. Any host is affected when it loads such profiles, a workstation as
+much as a runner. To check a running node, run
+`docker exec nos-test-frr sh -c 'cat /proc/$(pidof staticd)/attr/current'`:
+it must print `docker-default (enforce)`, and `staticd (enforce)` means the
+node was started from a compose file without the option (`make nos-reset`
+recreates it).
+
+The SR Linux node stays unconfined. Its Debian-based image contains binaries
+Ubuntu 26.04 also profiles (`dash`, `ip`, `sysctl`, `unix_chkpwd`, `locale`,
+`lsblk`, and others), but on the ubuntu-26.04 runner its boot and all ten SR
+Linux dialect tests logged no AppArmor denial, so it carries no option. If an
+`apparmor="DENIED"` line naming an SR Linux process ever appears in
+`journalctl -k`, the same option is the first thing to try.
+
 The lab is deliberately stateless, the same design `infra/ldap-test/` uses:
 neither service has a named volume, so `docker compose down` (via
 `make nos-down`) discards all node state, and the next `up` (via
