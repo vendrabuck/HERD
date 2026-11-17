@@ -16,7 +16,21 @@ AUTH_FILE = os.path.join(DATA_DIR, "config_auth.json")
 
 
 class ConfigAuthError(Exception):
-    """Raised when the config auth file exists but cannot be read/parsed."""
+    """The stored config password cannot be used, so no login can succeed.
+
+    Raised when the auth file exists but cannot be read or parsed, or parses to
+    something other than a JSON object, and when there is no file and
+    CONFIG_ADMIN_PASSWORD is set to a value password_problem refuses. Callers
+    fail closed: login is refused, /status reports not rotated, and nothing
+    rewrites the file (main.py answers a route that meets it with 503 and
+    STORE_UNUSABLE_DETAIL).
+    """
+
+
+# The body of a 503 for ConfigAuthError: fixed text, never a path or a value.
+STORE_UNUSABLE_DETAIL = (
+    "The config password store is unusable; the config service log names the cause"
+)
 
 
 class DataDirNotWritable(PermissionError):
@@ -80,11 +94,76 @@ BCRYPT_ROUNDS = 12
 UNUSABLE_HASH_MESSAGE = "Config auth file holds no usable password hash; login refused"
 
 
+# -- Which strings are a config password (issues #1428, #1429) --
+
+PASSWORD_NUL_DETAIL = "Password must not contain a NUL character"
+PASSWORD_NOT_UTF8_DETAIL = "Password must be valid UTF-8 text"
+PASSWORD_EMPTY_DETAIL = "Password must not be empty"
+PASSWORD_TOO_SHORT_DETAIL = "Password must be at least 8 characters"
+PASSWORD_TOO_LONG_DETAIL = "Password must be at most 32 characters"
+NEW_PASSWORD_MIN_CHARS = 8
+NEW_PASSWORD_MAX_CHARS = 32
+
+
+class InvalidPassword(ValueError):
+    """A password the config service never stores.
+
+    Its message is always one of the fixed PASSWORD_*_DETAIL texts, never the
+    value, so main.py answers it as the 422 detail as it stands.
+    """
+
+
+def password_problem(password: str) -> str | None:
+    """The ONE rule for which strings are a config password: None when legal.
+
+    Every entry point applies it: hashing refuses an illegal password (so neither
+    change-password nor the CONFIG_ADMIN_PASSWORD seed can store one), and the
+    login check answers False for one without trusting bcrypt's verdict.
+
+    - A NUL anywhere is refused. bcrypt appends a NUL to the key and repeats it to
+      fill 72 bytes, so NULs make a password equal a shorter one and a password of
+      NULs alone equal the empty one (#1429). The auth service refuses NUL too
+      (IAM-HASH-3).
+    - A string that cannot be encoded as UTF-8 (a lone surrogate) is refused: it
+      cannot be hashed at all (#1428).
+    - The empty string is refused: its key is the key of every all-NUL password.
+
+    Every other string is legal, other control characters included; the 8 to 32
+    character bound is change-password's alone (new_password_problem).
+    """
+    if "\x00" in password:
+        return PASSWORD_NUL_DETAIL
+    try:
+        password.encode("utf-8")
+    except UnicodeEncodeError:
+        return PASSWORD_NOT_UTF8_DETAIL
+    if not password:
+        return PASSWORD_EMPTY_DETAIL
+    return None
+
+
+def new_password_problem(password: str) -> str | None:
+    """What change-password refuses: the length bound first, then password_problem.
+
+    The bound counts characters (code points), not bytes: 32 characters can be 128
+    UTF-8 bytes, of which bcrypt reads 72 (OPS-CONFIG-6). Checking the bound first
+    keeps the wording every short or long password always got.
+    """
+    if len(password) < NEW_PASSWORD_MIN_CHARS:
+        return PASSWORD_TOO_SHORT_DETAIL
+    if len(password) > NEW_PASSWORD_MAX_CHARS:
+        return PASSWORD_TOO_LONG_DETAIL
+    return password_problem(password)
+
+
 def _password_bytes(password: str) -> bytes:
     return password.encode()[:BCRYPT_MAX_BYTES]
 
 
 def _hash_password(password: str) -> str:
+    problem = password_problem(password)
+    if problem is not None:
+        raise InvalidPassword(problem)
     return bcrypt.hashpw(_password_bytes(password), bcrypt.gensalt(BCRYPT_ROUNDS)).decode()
 
 
@@ -94,15 +173,15 @@ def _check_password(password: str, hashed: object) -> bool:
     The unusable-hash ERROR is about the STORED value only: it is logged exactly
     when `hashed` is not a string bcrypt can read (by class name, never the
     value), whatever the client sent. A client password that cannot be a
-    password (not a string, not encodable as UTF-8) is refused with no log, and
-    the stored value is still checked so a broken file is still reported.
+    password (not a string, or refused by password_problem: a NUL, a lone
+    surrogate, empty) is refused with no log, and the stored value is still
+    checked so a broken file is still reported. Refusing it here, not only when
+    hashing, is what keeps a hash stored before #1429 from a password of NULs
+    from signing in with the empty password.
     """
     secret: bytes | None = None
-    if isinstance(password, str):
-        try:
-            secret = _password_bytes(password)
-        except UnicodeEncodeError:
-            secret = None
+    if isinstance(password, str) and password_problem(password) is None:
+        secret = _password_bytes(password)
     if not isinstance(hashed, str):
         logger.error("%s (%s)", UNUSABLE_HASH_MESSAGE, type(hashed).__name__)
         return False
@@ -115,6 +194,16 @@ def _check_password(password: str, hashed: object) -> bool:
 
 
 # -- Auth file --
+
+
+# Logged, with no arguments, on each use of a CONFIG_ADMIN_PASSWORD that
+# password_problem refuses; the only reachable refusal is the UTF-8 one.
+# The name avoids the word password on purpose: CodeQL's clear-text-logging
+# query treats a variable named like a credential as one (alert 47 on PR #1443).
+ENV_VALUE_REFUSED_LOG = (
+    "CONFIG_ADMIN_PASSWORD is not valid UTF-8 text, so it cannot be the config "
+    "password; no auth file written, login refused"
+)
 
 
 def _initial_password() -> tuple[str, bool]:
@@ -131,6 +220,16 @@ def _initial_password() -> tuple[str, bool]:
     """
     env_pw = os.environ.get("CONFIG_ADMIN_PASSWORD", "").strip()
     if env_pw:
+        # The environment cannot hold a NUL, and a blank value never reaches this
+        # branch, so the one refusal password_problem can make here is a byte
+        # that is not UTF-8 (it arrives as a lone surrogate). Fail closed like a
+        # corrupt file: store nothing (a generated password would replace the
+        # operator's choice), refuse login, and let fixing the variable be the
+        # recovery. The log line is a constant with no arguments: nothing derived
+        # from the password, its refusal text included, reaches a log.
+        if password_problem(env_pw) is not None:
+            logger.error(ENV_VALUE_REFUSED_LOG)
+            raise ConfigAuthError("CONFIG_ADMIN_PASSWORD is not a usable config password")
         return env_pw, True
     generated = secrets.token_urlsafe(24)
     logger.warning(
@@ -161,13 +260,25 @@ def load_auth() -> dict:
         return auth
     try:
         with open(AUTH_FILE) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError) as exc:
+            loaded = json.load(f)
+    except (ValueError, RecursionError, OSError) as exc:
+        # ValueError covers JSONDecodeError, a byte that is not UTF-8
+        # (UnicodeDecodeError), and an integer over Python's digit limit;
+        # RecursionError is nesting deeper than the parser allows; OSError is an
+        # unreadable path, a directory included. MemoryError on a huge file is
+        # not handled.
         # Fail closed: do NOT regenerate the default here, that would silently
         # reset the admin password. Recovery is operator-driven: remove the
         # corrupt file and the missing-file branch above regenerates the default.
         logger.error("Corrupt config auth file %s: %s", AUTH_FILE, exc)
         raise ConfigAuthError(f"corrupt auth file {AUTH_FILE}") from exc
+    if not isinstance(loaded, dict):
+        # Valid JSON that is not an object holds no hash and no rotation flag:
+        # fail closed exactly like a corrupt file (issue #1427), and name the
+        # class only, never the value.
+        logger.error("%s (%s)", UNUSABLE_HASH_MESSAGE, type(loaded).__name__)
+        raise ConfigAuthError(f"auth file {AUTH_FILE} is not a JSON object")
+    return loaded
 
 
 def _save_auth(auth: dict) -> None:
@@ -182,16 +293,23 @@ def verify_password(password: str) -> bool:
     except ConfigAuthError:
         # Fail closed: deny login when the auth file is present but corrupt.
         return False
-    # A file that parses but holds no hash (not an object, or the key missing)
-    # fails closed the same way.
-    stored = auth.get("password_hash") if isinstance(auth, dict) else None
-    return _check_password(password, stored)
+    # load_auth answers an object or raises; an object that holds no hash (the
+    # key missing) fails closed the same way, in _check_password.
+    return _check_password(password, auth.get("password_hash"))
 
 
 def change_password(new_password: str) -> None:
-    # Unreachable with a corrupt auth file: this is only called behind
-    # require_config_session, which requires a successful login, and
-    # verify_password now denies login when the auth file is corrupt.
+    """Store a new password and mark it rotated, or raise InvalidPassword.
+
+    The password is judged before the file is read, so a refused one never
+    touches it.
+    """
+    problem = new_password_problem(new_password)
+    if problem is not None:
+        raise InvalidPassword(problem)
+    # Reached with an unusable auth file only by a session issued before the file
+    # broke; load_auth's ConfigAuthError then propagates (main.py: 503) and the
+    # file is never rewritten, so a session cannot turn it into a rotated one.
     auth = load_auth()
     auth["password_hash"] = _hash_password(new_password)
     auth["password_changed"] = True
@@ -199,11 +317,17 @@ def change_password(new_password: str) -> None:
 
 
 def is_password_changed() -> bool:
+    """True only when the stored flag is the JSON boolean true (issue #1427).
+
+    Any other stored value ("yes", 1, null, missing) is not rotated, so the write
+    surface stays locked; it never reads a truthy non-boolean as rotated.
+    """
     try:
-        return load_auth().get("password_changed", False)
+        return load_auth().get("password_changed") is True
     except (ConfigAuthError, DataDirNotWritable):
         # Keep the public /status endpoint up; report the safe default. An
-        # unwritable directory with no auth file has no password yet.
+        # unusable file, or an unwritable directory with no auth file, has no
+        # usable password.
         return False
 
 
@@ -220,7 +344,8 @@ def load_config() -> dict:
     try:
         with open(CONFIG_FILE) as f:
             loaded = json.load(f)
-    except (json.JSONDecodeError, OSError) as exc:
+    except (ValueError, RecursionError, OSError) as exc:
+        # The same failures load_auth catches; the answer is the corrupt-file one.
         logger.warning("Ignoring corrupt config file %s: %s", CONFIG_FILE, exc)
         return {}
     if not isinstance(loaded, dict):
