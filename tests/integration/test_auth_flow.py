@@ -96,3 +96,31 @@ async def test_unauthenticated_returns_401(base_url):
     async with httpx.AsyncClient(base_url=base_url, verify=False, timeout=30.0) as client:
         resp = await client.get("/auth/me")
         assert resp.status_code in (401, 403)
+
+
+async def test_register_with_a_refused_password_is_422_through_the_gateway(base_url):
+    """Issue #1426 through Traefik: a lone surrogate and a NUL in the password,
+    sent as raw JSON escapes, reach auth unchanged and answer 422 (not 500), with
+    no submitted value in the body. Validation runs before the route's mode check,
+    so the answer is the same on a local- or LDAP-mode stack, and nothing is created."""
+    import httpx
+
+    headers = {"content-type": "application/json"}
+    cases = {
+        "\\ud800": ("string_unicode", None),
+        "\\u0000": ("value_error", "Value error, Password must not contain a NUL character"),
+    }
+    async with httpx.AsyncClient(base_url=base_url, verify=False, timeout=30.0) as client:
+        for escape, (error_type, msg) in cases.items():
+            body = (
+                '{"email": "refused-pw@herd.example", "username": "refused-pw", '
+                '"password": "abcdefg' + escape + '"}'
+            ).encode()
+            resp = await client.post("/auth/register", content=body, headers=headers)
+            assert resp.status_code == 422, resp.text
+            (error,) = resp.json()["detail"]
+            assert (error["type"], error["loc"]) == (error_type, ["body", "password"])
+            assert set(error) == {"type", "loc", "msg"}
+            if msg is not None:
+                assert error["msg"] == msg
+            assert "abcdefg" not in resp.text

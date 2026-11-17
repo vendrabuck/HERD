@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, 
 from app.config import AuthMethod
 from app.models.user import Role
 from app.schemas.pagination import Paginated
+from app.services.passwords import validate_password
 
 # Profile field bounds (issue #1252). full_name is stripped of leading and
 # trailing white space and must then be 1 to 200 characters (the column is
@@ -40,6 +41,11 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=8, max_length=72)
     # Optional display name (issue #1252): omitted or null stores the username.
     full_name: FullName | None = None
+
+    # Refuse here exactly what hashing would refuse (a NUL), so registration
+    # answers 422, not a 500 from create_user (issue #1426). LoginRequest has no
+    # such check by decision: a NUL at login is the 401 of IAM-HASH-3.
+    _password_is_hashable = field_validator("password")(validate_password)
 
 
 class LoginRequest(BaseModel):

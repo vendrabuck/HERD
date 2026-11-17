@@ -54,15 +54,27 @@ def cheap_hashes(monkeypatch):
     monkeypatch.setattr(passwords, "BCRYPT_ROUNDS", 4)
 
 
+# The highest cost the spy below actually computes: the cost of every hash HERD
+# writes, read once at import, before any fixture monkeypatches BCRYPT_ROUNDS. A
+# check above it is recorded and answered False without running, so a regression
+# that lets a high-cost hash through (issue #1425) fails an assertion in
+# milliseconds instead of holding the test for hours. Tied to BCRYPT_ROUNDS so that
+# raising the cost of new hashes does not make the spy refuse the real ones.
+_SPY_MAX_COMPUTED_COST = passwords.BCRYPT_ROUNDS
+
+
 @pytest.fixture
 def bcrypt_spy(monkeypatch) -> dict[str, list]:
     """Every bcrypt computation, by entry point: the secret and hash checkpw got,
-    and the secret hashpw got."""
+    and the secret hashpw got. A checkpw above `_SPY_MAX_COMPUTED_COST` is
+    recorded but never computed."""
     calls: dict[str, list] = {"checkpw": [], "hashpw": [], "gensalt": []}
     real_checkpw, real_hashpw, real_gensalt = bcrypt.checkpw, bcrypt.hashpw, bcrypt.gensalt
 
     def checkpw(secret, hashed):
         calls["checkpw"].append((secret, hashed))
+        if _cost(hashed.decode()) > _SPY_MAX_COMPUTED_COST:
+            return False
         return real_checkpw(secret, hashed)
 
     def hashpw(secret, salt):
@@ -245,6 +257,13 @@ _UNUSABLE_HASHES = {
     "unicode_digit_cost": "$2b$\u0661\u0662$" + _VALID[7:],
     "non_ascii": _VALID[:-1] + "\u00e9",
     "md5_crypt": "$1$saltsalt$2vN3oTUt4pk6p9I4j6CT1/",
+    # Well formed, but above the cost ceiling (issue #1425), for every ident the
+    # pattern admits; the spy never computes them, so a regression is cheap.
+    **{
+        f"ident_{ident}_cost_{cost}": f"${ident}${cost}$" + _VALID[7:]
+        for ident in ("2", "2a", "2b", "2y")
+        for cost in ("15", "16", "20", "31")
+    },
 }
 
 
@@ -284,6 +303,59 @@ def test_a_bcrypt_error_on_an_admitted_hash_is_false_after_one_dummy_check(monke
     (record,) = [r for r in caplog.records if r.name == "app.services.passwords"]
     assert (record.getMessage(), record.error) == (passwords.UNUSABLE_HASH_MESSAGE, "ValueError")
     assert _VALID not in record.getMessage() + repr(record.__dict__)
+
+
+# -- 3b. The cost ceiling (issue #1425) ---------------------------------------------
+
+_IDENTS = ("2", "2a", "2b", "2y")
+
+
+def _hash_at(ident: str, cost: int) -> str:
+    return f"${ident}${cost:02d}$" + _VALID[7:]
+
+
+def test_the_cost_ceiling_is_14_and_admits_every_hash_herd_writes():
+    """The ceiling is the owner's fixed bound; it must never fall below the cost
+    of new hashes and the dummy hash, or every account would be unusable."""
+    assert passwords.MAX_VERIFY_COST == 14
+    assert passwords.BCRYPT_ROUNDS <= passwords.MAX_VERIFY_COST
+    assert _cost(passwords.DUMMY_HASH) <= passwords.MAX_VERIFY_COST
+
+
+def test_every_cost_above_the_ceiling_is_refused_after_one_dummy_check(bcrypt_spy):
+    """The whole space: every ident the pattern admits at every cost from the
+    ceiling plus one to 31 (the pattern's own top). One test, not 68."""
+    seen = {}
+    for ident in _IDENTS:
+        for cost in range(passwords.MAX_VERIFY_COST + 1, 32):
+            bcrypt_spy["checkpw"].clear()
+            verdict = passwords.verify_password("pw", _hash_at(ident, cost))
+            seen[(ident, cost)] = (verdict, list(bcrypt_spy["checkpw"]))
+    expected = (False, [(b"", passwords.DUMMY_HASH.encode())])
+    assert {key: value for key, value in seen.items() if value != expected} == {}
+    assert len(seen) == 4 * (31 - passwords.MAX_VERIFY_COST)
+
+
+@pytest.mark.parametrize("ident", _IDENTS)
+def test_a_hash_at_the_ceiling_is_checked_unchanged_at_its_own_cost(ident, bcrypt_spy, caplog):
+    """The other side of the boundary: cost 14 still reaches bcrypt, once, at
+    its own cost (a `$2$` hash under `$2a$` with the password repeated, as
+    IAM-HASH-4 states), and logs nothing. The spy records it without computing."""
+    stored = _hash_at(ident, passwords.MAX_VERIFY_COST)
+    with caplog.at_level(logging.DEBUG):
+        passwords.verify_password("pw", stored)
+    expected_hash = stored.replace("$2$", "$2a$", 1) if ident == "2" else stored
+    expected_secret = (b"pw" * 36) if ident == "2" else b"pw"
+    assert bcrypt_spy["checkpw"] == [(expected_secret, expected_hash.encode())]
+    assert [r for r in caplog.records if r.name == "app.services.passwords"] == []
+
+
+def test_the_answer_at_the_ceiling_is_what_bcrypt_says(monkeypatch):
+    """At or below the ceiling the verdict is bcrypt's, True included: the
+    ceiling refuses by cost alone, never by result."""
+    stored = _hash_at("2b", passwords.MAX_VERIFY_COST)
+    monkeypatch.setattr(bcrypt, "checkpw", lambda secret, hashed: hashed == stored.encode())
+    assert passwords.verify_password("pw", stored) is True
 
 
 # -- 4. Timing: one bcrypt per check, the dummy at the configured cost ----------------
@@ -407,6 +479,28 @@ async def test_a_login_against_an_unusable_stored_hash_is_401_not_500(client, ca
         assert "not-a-real-hash" not in text and "pw-for-broken" not in text
 
 
+async def test_a_login_against_a_hash_above_the_cost_ceiling_is_the_wrong_password_401(
+    client, bcrypt_spy, caplog
+):
+    """Issue #1425: a cost-31 row (a direct database write) answers the same 401
+    as a wrong password after one cost-12 dummy check, never a check at cost 31,
+    and the log names neither hash nor password."""
+    stored = _hash_at("2b", 31)
+    await _add_user("costly@example.test", stored)
+    bcrypt_spy["checkpw"].clear()
+    with caplog.at_level(logging.WARNING):
+        response = await client.post(
+            "/login", json={"email": "costly@example.test", "password": "pw-for-costly"}
+        )
+    assert (response.status_code, response.json()) == (401, INVALID)
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert bcrypt_spy["checkpw"] == [(b"", passwords.DUMMY_HASH.encode())]
+    assert any(r.getMessage() == passwords.UNUSABLE_HASH_MESSAGE for r in caplog.records)
+    for record in caplog.records:
+        text = record.getMessage() + repr(record.__dict__)
+        assert stored not in text and "pw-for-costly" not in text
+
+
 async def test_a_login_at_another_cost_succeeds_and_leaves_the_stored_hash_alone(client):
     stored = bcrypt.hashpw(b"low-cost-password", bcrypt.gensalt(4)).decode()
     await _add_user("lowcost@example.test", stored)
@@ -426,6 +520,7 @@ _LOGIN_PATHS = {
     "ldap_account": ("ldap@example.test", "right-password", 401),
     "local_without_hash": ("nohash@example.test", "right-password", 401),
     "unusable_hash": ("broken@example.test", "right-password", 401),
+    "hash_above_cost_ceiling": ("costly@example.test", "right-password", 401),
     "nul_password": ("ok@example.test", "right\x00password", 401),
 }
 
@@ -442,6 +537,7 @@ async def test_every_local_login_answer_costs_one_bcrypt_at_the_configured_cost(
     await _add_user("ldap@example.test", None, source="ldap")
     await _add_user("nohash@example.test", None)
     await _add_user("broken@example.test", "garbage")
+    await _add_user("costly@example.test", _hash_at("2b", 31))
     for calls in bcrypt_spy.values():
         calls.clear()
     email, password, status = path

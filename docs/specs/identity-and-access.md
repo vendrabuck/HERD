@@ -327,7 +327,7 @@ Auth service:
 |---|---|---|---|---|
 | GET | `/login-options` | anyone, unauthenticated; every mode | 200 | IAM-OIDC-16 |
 | POST | `/register` | anyone, unauthenticated; local mode only | 201 | IAM-REG-1 to IAM-REG-6, IAM-PROFILE-9 |
-| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-4, IAM-LDAP-1 to IAM-LDAP-11, IAM-OIDC-21 |
+| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-5, IAM-LDAP-1 to IAM-LDAP-11, IAM-OIDC-21 |
 | GET | `/oidc/login` | anyone, unauthenticated; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-17 |
 | GET | `/oidc/callback` | anyone holding the `herd_oidc_flow` cookie; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-18, IAM-OIDC-19 |
 | POST | `/oidc/exchange` | anyone holding the `herd_oidc_handoff` cookie; OIDC mode only, else 404 | 200 | IAM-OIDC-15, IAM-OIDC-20 |
@@ -420,9 +420,13 @@ account with an email, a username, and a password, then sign in with it.
 - **IAM-REG-2.** The email must be a valid address; the username 3 to 32 characters of
   letters, digits, `_`, and `-`; the password 8 to 72 characters. The bound counts
   characters, not bytes: a longer UTF-8 form is accepted and hashed on its first 72
-  bytes (IAM-HASH-2). \
-  Enforced in: `services/auth/app/schemas/auth.py` (`RegisterRequest`) \
-  Pinned by: `services/auth/tests/test_auth.py` (`test_register_invalid_email`, `test_register_username_too_short`, `test_register_username_invalid_chars`, `test_register_username_max_length`, `test_register_password_too_short`, `test_register_password_too_long`)
+  bytes (IAM-HASH-2). The password must also be one hashing accepts, and exactly that
+  (IAM-HASH-3, issue #1426): one holding a NUL character is the 422 `value_error` at
+  `["body", "password"]` with the message `Value error, Password must not contain a
+  NUL character`, and one holding a lone surrogate is the 422 `string_unicode` there.
+  No account is created. \
+  Enforced in: `services/auth/app/schemas/auth.py` (`RegisterRequest`); `services/auth/app/services/passwords.py` (`validate_password`, `PASSWORD_NUL_MESSAGE`) \
+  Pinned by: `services/auth/tests/test_auth.py` (`test_register_invalid_email`, `test_register_username_too_short`, `test_register_username_invalid_chars`, `test_register_username_max_length`, `test_register_password_too_short`, `test_register_password_too_long`); `services/auth/tests/test_password_input_validation.py` (`test_register_accepts_a_password_exactly_when_hashing_does`, `test_register_schema_names_the_password_and_the_pinned_message`, `test_register_with_a_nul_is_422_with_the_pinned_wording_and_creates_nothing`, `test_register_with_a_lone_surrogate_is_422_string_unicode_and_creates_nothing`, `test_a_register_with_an_honest_8_character_password_still_succeeds`); `tests/integration/test_auth_flow.py` (`test_register_with_a_refused_password_is_422_through_the_gateway`)
 - **IAM-REG-3.** An email or username that already exists, found by the pre-check or by
   a concurrent insert, answers one generic 409 `Email or username already exists`. \
   Enforced in: `services/auth/app/routers/auth.py` (`register`) \
@@ -464,7 +468,7 @@ short-lived access token and a refresh token.
   LDAP account, local account without a hash, unusable stored hash, refused password)
   costs exactly one bcrypt computation and hashes nothing new: at cost 12 for every
   refusal that uses the dummy hash, and at the stored hash's own cost otherwise, which
-  is 12 for every hash HERD wrote (IAM-HASH-5). \
+  is 12 for every hash HERD wrote and never above 14 (IAM-HASH-4, IAM-HASH-5). \
   Enforced in: `services/auth/app/services/auth_service.py` (`_authenticate_local`, `_DUMMY_HASH`); `services/auth/app/services/passwords.py` (`verify_password`, `DUMMY_HASH`) \
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_every_local_login_answer_costs_one_bcrypt_at_the_configured_cost`, `test_the_dummy_hash_has_the_ident_and_cost_of_every_new_hash`)
 - **IAM-LOGIN-3.** The login identifier is 1 to 255 characters and the password at most
@@ -475,6 +479,13 @@ short-lived access token and a refresh token.
   token_type: "bearer"}`. \
   Enforced in: `services/auth/app/routers/auth.py` (`login`); `services/auth/app/schemas/auth.py` (`TokenResponse`) \
   Pinned by: `services/auth/tests/test_auth.py` (`test_login`)
+- **IAM-LOGIN-5.** A login password holding a lone surrogate is the 422
+  `string_unicode` at `["body", "password"]`. The login body has no NUL check, by
+  decision (issue #1426): in local mode and the break-glass login a NUL reaches
+  `verify_password` and is the 401 of IAM-HASH-3; LDAP mode passes the password to the
+  directory as before. \
+  Enforced in: `services/auth/app/schemas/auth.py` (`LoginRequest`); `services/auth/app/validation_errors.py` (`validation_error_handler`) \
+  Pinned by: `services/auth/tests/test_password_input_validation.py` (`test_login_with_a_lone_surrogate_is_422_string_unicode`, `test_login_with_a_nul_stays_401`, `test_login_schema_still_takes_a_nul_so_login_answers_401`)
 
 **Out of scope.** Rate limiting and lockout after failed attempts do not exist.
 
@@ -1767,7 +1778,7 @@ skip list).
   Enforced in: `services/auth/app/routers/oidc.py` (`federated_login_from_token`); `services/auth/app/services/auth_service.py` (`oidc_username`, `OIDC_USERNAME_PATTERN`, `_first_login_refusal`, `username_unusable`) \
   Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_option_c_picks_the_claim_then_the_email_then_nothing`, `test_option_c_pattern_is_the_owners_allowlist`, `test_a_returning_login_ignores_the_username`, `test_username_unusable_selects_the_refusal_reason`, `test_username_unusable_is_ignored_when_the_username_fits`); `services/auth/tests/test_oidc_routes.py` (`test_option_c_username_over_http`, `test_federated_login_from_token_maps_every_field`, `test_option_c_mapping_table`, `test_provisioning_refusals_answer_failed_and_link_nothing`)
 - **IAM-OIDC-20.** `POST /oidc/exchange` takes exactly `{}` sent with a JSON
-  Content-Type (anything else is FastAPI's 422, which consumes nothing) and consumes
+  Content-Type (anything else is a 422, which consumes nothing) and consumes
   the `herd_oidc_handoff` cookie once, answering 200 with `access_token`,
   `refresh_token`, `token_type` `bearer`, and `next` (the stored, sanitized return
   path). It answers 401 `Single sign-on session expired; sign in again` when the cookie
@@ -1895,9 +1906,11 @@ it on the pre-#1355 commit, is replayed by the tests
 
 - **IAM-HASH-1.** `verify_password` accepts exactly the (password, stored hash) pairs
   passlib accepted and answers False for every other pair, including every pair on
-  which passlib raised; it never raises. \
+  which passlib raised; it never raises. One departure, by decision (issue #1425): a
+  hash above the cost ceiling of IAM-HASH-4, which passlib checked, is refused. No
+  hash HERD or passlib wrote and no recorded passlib decision is above the ceiling. \
   Enforced in: `services/auth/app/services/passwords.py` (`verify_password`, `_usable_hash`, `_password_bytes`) \
-  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_every_legacy_passlib_decision_is_kept`, `test_the_legacy_table_came_from_the_production_passlib_configuration`, `test_login_with_a_hash_passlib_stored_decides_as_passlib_did`)
+  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_every_legacy_passlib_decision_is_kept`, `test_the_legacy_table_came_from_the_production_passlib_configuration`, `test_login_with_a_hash_passlib_stored_decides_as_passlib_did`, `test_every_cost_above_the_ceiling_is_refused_after_one_dummy_check`)
 - **IAM-HASH-2.** The password is encoded as UTF-8 and only its first 72 bytes reach
   bcrypt, on hashing and on checking: two passwords match exactly when their first 72
   UTF-8 bytes are equal, also when the cut falls inside a multi-byte character. So a
@@ -1910,15 +1923,22 @@ it on the pre-#1355 commit, is replayed by the tests
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_two_passwords_match_exactly_when_their_first_72_utf8_bytes_match`, `test_bcrypt_never_receives_more_than_the_first_72_bytes`, `test_a_30_character_password_over_72_bytes_registers_and_signs_in_on_its_first_72_bytes`)
 - **IAM-HASH-3.** A password holding a NUL character (anywhere, also past byte 72),
   longer than 4096 UTF-8 bytes, or not encodable as UTF-8 is refused, as passlib refused
-  it: `hash_password` raises ValueError and `verify_password` answers False. A login with
-  such a password is the 401 `Invalid credentials` (under passlib it was a 500);
-  registration and the seed fail with the ValueError, as before. \
-  Enforced in: `services/auth/app/services/passwords.py` (`_password_bytes`, `MAX_PASSWORD_BYTES`) \
-  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_a_refused_password_never_hashes`, `test_a_refused_password_is_false_after_one_dummy_check`, `test_a_refused_password_against_a_good_hash_logs_nothing`, `test_4096_bytes_is_still_accepted`, `test_a_password_passlib_refused_to_hash_is_still_refused`, `test_a_login_with_a_nul_password_is_401_not_500`)
+  it: `hash_password` raises ValueError and `verify_password` answers False. The rule
+  is defined once, as `validate_password`, whose ValueError messages are fixed and hold
+  no part of the password (issue #1426). Registration applies it before hashing, so a
+  refused password there is a 422 (IAM-REG-2); the seed fails startup with the
+  ValueError. A login with a NUL is the 401 `Invalid credentials` (under passlib it was
+  a 500); a login with a lone surrogate never reaches the check (IAM-LOGIN-5), and no
+  request password reaches 4096 bytes within the 72-character bounds. \
+  Enforced in: `services/auth/app/services/passwords.py` (`validate_password`, `_encoded_password`, `_password_bytes`, `MAX_PASSWORD_BYTES`) \
+  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_a_refused_password_never_hashes`, `test_a_refused_password_is_false_after_one_dummy_check`, `test_a_refused_password_against_a_good_hash_logs_nothing`, `test_4096_bytes_is_still_accepted`, `test_a_password_passlib_refused_to_hash_is_still_refused`, `test_a_login_with_a_nul_password_is_401_not_500`); `services/auth/tests/test_password_input_validation.py` (`test_validate_password_refuses_a_nul_anywhere_with_the_pinned_message`, `test_validate_password_refuses_the_rest_with_a_message_that_holds_no_input`, `test_validate_password_returns_an_honest_password_unchanged`); `services/auth/tests/test_main.py` (`test_seed_superadmin_refuses_a_password_hashing_refuses`)
 - **IAM-HASH-4.** A stored hash is usable when it reads `$<ident>$<cost>$` followed by a
   22-character salt and a 31-character checksum in bcrypt's alphabet, with ident `2`,
-  `2a`, `2b`, or `2y` and a two-digit cost from 04 to 31. `$2x$` and every other value
-  (NULL, empty, garbage, truncated, another scheme) are unusable: the answer is False
+  `2a`, `2b`, or `2y` and a two-digit cost from 04 to 14, the ceiling `MAX_VERIFY_COST`
+  (issue #1425: each cost step doubles the work, and passlib's top of 31 held the event
+  loop about 31 hours per login). `$2x$`, a well-formed hash at cost 15 to 31, and every
+  other value (NULL, empty, garbage, truncated, another scheme) are unusable: bcrypt
+  never runs on such a hash, and the answer is False
   after one check against the dummy hash, with one WARNING `Stored password hash is not
   a usable bcrypt hash` that holds neither the hash nor the password. A login against an
   unusable hash is the 401 `Invalid credentials` (under passlib it was a 500). A `$2$`
@@ -1928,8 +1948,8 @@ it on the pre-#1355 commit, is replayed by the tests
   inputs over 72 bytes, which never reach bcrypt here (IAM-HASH-2). The unused low bits
   of the final salt and checksum characters are cleared before the check, as passlib
   did. \
-  Enforced in: `services/auth/app/services/passwords.py` (`_usable_hash`, `_STORED_HASH`, `_clear_low_bits`, `UNUSABLE_HASH_MESSAGE`) \
-  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_an_unusable_stored_hash_is_false_after_one_dummy_check`, `test_a_bcrypt_error_on_an_admitted_hash_is_false_after_one_dummy_check`, `test_a_login_against_an_unusable_stored_hash_is_401_not_500`, `test_every_legacy_passlib_decision_is_kept`)
+  Enforced in: `services/auth/app/services/passwords.py` (`_usable_hash`, `_STORED_HASH`, `MAX_VERIFY_COST`, `_clear_low_bits`, `UNUSABLE_HASH_MESSAGE`) \
+  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_an_unusable_stored_hash_is_false_after_one_dummy_check`, `test_a_bcrypt_error_on_an_admitted_hash_is_false_after_one_dummy_check`, `test_a_login_against_an_unusable_stored_hash_is_401_not_500`, `test_every_legacy_passlib_decision_is_kept`, `test_the_cost_ceiling_is_14_and_admits_every_hash_herd_writes`, `test_every_cost_above_the_ceiling_is_refused_after_one_dummy_check`, `test_a_hash_at_the_ceiling_is_checked_unchanged_at_its_own_cost`, `test_a_login_against_a_hash_above_the_cost_ceiling_is_the_wrong_password_401`); `services/auth/tests/test_oidc_break_glass.py` (`test_switch_on_refuses_a_superadmin_hash_above_the_cost_ceiling_at_dummy_cost`)
 - **IAM-HASH-5.** Every `verify_password` call runs exactly one bcrypt computation:
   against the stored hash, at that hash's own cost, when it is usable and the password is
   acceptable, else against `DUMMY_HASH`. The dummy hash is made by `hash_password`, so it
@@ -1937,10 +1957,11 @@ it on the pre-#1355 commit, is replayed by the tests
   Enforced in: `services/auth/app/services/passwords.py` (`verify_password`, `_refuse_after_dummy_check`, `DUMMY_HASH`) \
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_the_dummy_hash_has_the_ident_and_cost_of_every_new_hash`, `test_a_usable_hash_is_checked_once_at_its_own_cost_and_never_rehashed`, `test_every_local_login_answer_costs_one_bcrypt_at_the_configured_cost`)
 - **IAM-HASH-6.** New hashes are `$2b$` at cost 12, passlib's defaults. A stored hash at
-  another usable cost still verifies at its own cost, and nothing rehashes or rewrites a
-  stored hash on login (passlib's `needs_update` was never called). \
+  another usable cost (04 to 14, IAM-HASH-4) still verifies at its own cost, and
+  nothing rehashes or rewrites a stored hash on login (passlib's `needs_update` was
+  never called). \
   Enforced in: `services/auth/app/services/passwords.py` (`hash_password`, `BCRYPT_ROUNDS`, `BCRYPT_IDENT`) \
-  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_the_dummy_hash_has_the_ident_and_cost_of_every_new_hash`, `test_a_usable_hash_is_checked_once_at_its_own_cost_and_never_rehashed`, `test_a_login_at_another_cost_succeeds_and_leaves_the_stored_hash_alone`)
+  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_the_dummy_hash_has_the_ident_and_cost_of_every_new_hash`, `test_a_usable_hash_is_checked_once_at_its_own_cost_and_never_rehashed`, `test_a_login_at_another_cost_succeeds_and_leaves_the_stored_hash_alone`, `test_a_hash_at_the_ceiling_is_checked_unchanged_at_its_own_cost`, `test_the_answer_at_the_ceiling_is_what_bcrypt_says`)
 - **IAM-HASH-7.** Hashing and checking are synchronous and run on the event loop, as
   they did under passlib; a check at cost 12 holds the loop for its duration. \
   Enforced in: `services/auth/app/services/auth_service.py` (`_authenticate_local`, `_authenticate_oidc_mode`, `create_user`) \
@@ -1949,15 +1970,33 @@ it on the pre-#1355 commit, is replayed by the tests
   bound, and passlib is not installed; importing and first use raise no warning. \
   Enforced in: `services/auth/pyproject.toml` (`bcrypt>=5.0.0`) \
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_passlib_is_not_installed`, `test_import_and_first_use_raise_no_warning`)
+- **IAM-HASH-9.** No 422 the auth service answers carries pydantic's `input` or
+  `ctx` (issue #1426): each validation error is rendered as exactly `{type, loc,
+  msg}`, the shape auth's OpenAPI document advertises, and any lone surrogate in
+  `loc` or `msg` is replaced with U+FFFD, so the body always encodes and the 422 never
+  becomes a 500. So no 422 holds a submitted password, for every way a registration or
+  login password can fail: each error a password field raises has fixed text. It is
+  not a promise that no submitted text appears: `msg` is the validator's own text and
+  can quote part of another field's value (an email's invalid character or its
+  IP-literal domain, the character at fault in a UUID), and `loc` names the keys the
+  caller sent, an unknown key on an `extra="forbid"` body included. Every other
+  service, the acl grant and check routes included, still renders FastAPI's default
+  422, which echoes `input`. \
+  Enforced in: `services/auth/app/validation_errors.py` (`validation_error_handler`, `render_validation_errors`, `install_validation_errors`, `restrict_validation_error_schema`, `RENDERED_KEYS`); `services/auth/app/main.py` (`app`) \
+  Pinned by: `services/auth/tests/test_validation_errors.py` (`test_the_handler_is_installed_for_request_validation_errors`, `test_the_handler_keeps_type_loc_msg_and_drops_input_ctx_and_everything_else`, `test_the_handler_replaces_a_lone_surrogate_in_loc_and_msg_and_keeps_integers`, `test_the_handler_keeps_honest_non_ascii_text_unchanged`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_every_rendered_error_has_exactly_the_advertised_keys`); `services/auth/tests/test_password_input_validation.py` (`test_a_422_never_echoes_the_submitted_password`, `test_msg_and_loc_can_still_quote_submitted_text`, `test_a_surrogate_dict_key_is_422_not_500`, `test_a_surrogate_in_another_register_field_is_422_not_500`)
 
 **Out of scope.** The config service's own password is in
-`operations-and-observability.md` (OPS-CONFIG-6). LDAP mode never hashes: the password
+`operations-and-observability.md` (OPS-CONFIG-6); the cost ceiling of IAM-HASH-4 is
+auth's only, and the config service's check has none (issue #1425). LDAP mode never hashes: the password
 goes to the directory (IAM-LDAP-1), and its 72-character bound is issue #1404.
 
 ## 9. Errors
 
-FastAPI validation errors (422) carry `detail` as a list of `{loc, msg, type}`; every
-other error carries `detail` as a string. A 401 from a bearer check also sends
+FastAPI validation errors (422) carry `detail` as a list; in the auth service each
+item is exactly `{type, loc, msg}`, with no `input` or `ctx` and so no submitted
+password, though `msg` and `loc` can quote part of an email, a UUID, or a key name
+(IAM-HASH-9); the acl service's items are FastAPI's default, which adds `input`. Every other error carries
+`detail` as a string. A 401 from a bearer check also sends
 `WWW-Authenticate: Bearer`.
 
 | Status | Error key or detail | When | Rule |
@@ -2000,7 +2039,7 @@ other error carries `detail` as a string. A 401 from a bearer check also sends
 | 409 | `Directory sync requires auth_method=ldap` | sync-now outside LDAP mode | IAM-SERIAL-2 |
 | 409 | `A sync run is already in progress`, `A sync run is already in progress on another replica` | sync-now while a run holds the slot | IAM-SERIAL-1 |
 | 409 | `This grant already exists` | duplicate grant | IAM-ACL-2 |
-| 422 | validation list | registration, login, profile, group, bulk, mapping, token, grant, or check body out of bounds; a profile body with a key other than the three profile fields, or a null or empty `full_name`; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-PROFILE-3, IAM-PROFILE-4, IAM-PROFILE-5, IAM-LOGIN-3, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2 |
+| 422 | validation list | registration, login, profile, group, bulk, mapping, token, grant, or check body out of bounds; a registration password holding a NUL or a lone surrogate, or a login password holding a lone surrogate; a profile body with a key other than the three profile fields, or a null or empty `full_name`; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-PROFILE-3, IAM-PROFILE-4, IAM-PROFILE-5, IAM-LOGIN-3, IAM-LOGIN-5, IAM-HASH-9, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2 |
 | 422 | `group_dn does not resolve in the directory` | mapping DN proven absent | IAM-MAP-3 |
 | 503 | `Directory unavailable, mapping not validated` | mapping create while the directory cannot be asked | IAM-MAP-3 |
 | 503 | `Internal API token not configured` | an internal route with no token configured | IAM-INTERNAL-2 |
@@ -2059,8 +2098,8 @@ cap 20 per category; prune cadence 24 hours; bulk and batch caps 500.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/auth/tests/` (in-memory SQLite, `test_profile_schema.py`, `test_user_profile_migration.py`, `test_effective_role_unit.py`, `test_api_tokens.py`, `test_ldap_service.py`, `test_ldap_sync_service.py`, `test_ldap_sync_service_scaling.py`, `test_ldap_sync_stale_run_reaper.py`, `test_ldap_sync_loop.py`, `test_oidc_flow_service.py`, `test_oidc_provisioning.py`, `test_oidc_sso_migration.py`, `test_password_hashing.py` (the 802 recorded passlib decisions)); `services/acl/tests/test_grant_service_unit.py`, `test_auth_client.py`, `test_schema_validators.py`; `services/common/tests/test_auth.py`, `test_auth_settings.py`, `test_internal_auth.py`, `test_acl.py`; `services/notifications/tests/test_router.py` (its token decode); `tests/unit/test_jwt_settings_wiring.py`; `frontend/src/test/` (`api/client.test.ts`, `stores/authStore.test.ts`, `lib/roles.test.ts`, `components/guards.test.tsx`, `components/AdminGuard.test.tsx`, `routes.test.tsx`, the admin page tests; single sign-on in the browser: `lib/sso.test.ts`, `api/sso.test.tsx`, `pages/LoginPageSso.test.tsx`, `pages/OidcCompletePage.test.tsx`, msw standing in for auth) | SQLite has no advisory locks, so only the in-process half of the run slot is exercised here |
-| Functional (through the service API) | `services/auth/tests/test_auth.py`, `test_user_profile_routes.py`, `test_groups.py`, `test_internal.py`, `test_ldap_sync.py`, `test_effective_role_http.py`, `test_auth_ldap.py`, `test_oidc_routes.py` (the single sign-on routes against a fake identity provider), `test_login_options.py`, `test_oidc_break_glass.py`, `test_password_hashing.py` (logins against stored legacy hashes); `services/acl/tests/test_grants.py`, `test_internal.py`; the live suites `services/auth/tests/test_ldap_service_live.py` (real directory) and the real-Postgres suites `services/auth/tests/test_ldap_sync_service_live_pg.py` and `services/auth/tests/test_oidc_flow_service_live_pg.py` (the OIDC flow store and provisioning races) | The live-LDAP suite runs in the gates' live-LDAP phase; the Postgres suites in `_gate-pg-live-tests`. The single sign-on routes have unit and functional (fake provider, in-memory SQLite) tests only; the flow store and provisioning beneath them have Postgres-live tests, but no route is driven against a real Postgres yet, a gap open until ADR 0016 phases 5a and 5b add the live-provider, integration (running stack), load, and browser levels |
+| Unit | `services/auth/tests/` (in-memory SQLite, `test_profile_schema.py`, `test_user_profile_migration.py`, `test_effective_role_unit.py`, `test_api_tokens.py`, `test_ldap_service.py`, `test_ldap_sync_service.py`, `test_ldap_sync_service_scaling.py`, `test_ldap_sync_stale_run_reaper.py`, `test_ldap_sync_loop.py`, `test_oidc_flow_service.py`, `test_oidc_provisioning.py`, `test_oidc_sso_migration.py`, `test_password_hashing.py` (the 802 recorded passlib decisions), `test_validation_errors.py`); `services/acl/tests/test_grant_service_unit.py`, `test_auth_client.py`, `test_schema_validators.py`; `services/common/tests/test_auth.py`, `test_auth_settings.py`, `test_internal_auth.py`, `test_acl.py`; `services/notifications/tests/test_router.py` (its token decode); `tests/unit/test_jwt_settings_wiring.py`; `frontend/src/test/` (`api/client.test.ts`, `stores/authStore.test.ts`, `lib/roles.test.ts`, `components/guards.test.tsx`, `components/AdminGuard.test.tsx`, `routes.test.tsx`, the admin page tests; single sign-on in the browser: `lib/sso.test.ts`, `api/sso.test.tsx`, `pages/LoginPageSso.test.tsx`, `pages/OidcCompletePage.test.tsx`, msw standing in for auth) | SQLite has no advisory locks, so only the in-process half of the run slot is exercised here |
+| Functional (through the service API) | `services/auth/tests/test_auth.py`, `test_user_profile_routes.py`, `test_groups.py`, `test_internal.py`, `test_ldap_sync.py`, `test_effective_role_http.py`, `test_auth_ldap.py`, `test_oidc_routes.py` (the single sign-on routes against a fake identity provider), `test_login_options.py`, `test_oidc_break_glass.py`, `test_password_hashing.py` (logins against stored legacy hashes), `test_password_input_validation.py` (the password rule and the 422 body at the real routes); `services/acl/tests/test_grants.py`, `test_internal.py`; the live suites `services/auth/tests/test_ldap_service_live.py` (real directory) and the real-Postgres suites `services/auth/tests/test_ldap_sync_service_live_pg.py` and `services/auth/tests/test_oidc_flow_service_live_pg.py` (the OIDC flow store and provisioning races) | The live-LDAP suite runs in the gates' live-LDAP phase; the Postgres suites in `_gate-pg-live-tests`. The single sign-on routes have unit and functional (fake provider, in-memory SQLite) tests only; the flow store and provisioning beneath them have Postgres-live tests, but no route is driven against a real Postgres yet, a gap open until ADR 0016 phases 5a and 5b add the live-provider, integration (running stack), load, and browser levels |
 | Integration (running stack) | `tests/integration/test_auth_flow.py`, `test_user_profile_flow.py`, `test_acl_flow.py`, `test_ldap_auth.py`, `test_ldap_sync_admin.py` | The LDAP ones run only in the gates' LDAP-mode phase |
 | Stress and load | `tests/load/locustfile.py` (every user logs in; `ACLChecker` exercises the check route; `NotificationUser` edits its own profile name) | No load test covers refresh, the token exchange, or a sync run |
 | Browser end-to-end | `tests/e2e/test_login.py`, `test_register_and_roles.py`, `test_roles_playwright.py`, `test_user_profile_playwright.py`, `test_admin_guard_redirect_playwright.py`, `test_user_groups_playwright.py`, `test_acl_grants_playwright.py`, `test_ldap_sync_admin_playwright.py`, `test_ldap_login.py` | Runs nightly and in the gates; the LDAP login tests are exempt skips on the local-mode gate stack. No browser test drives the OIDC-mode login page or `/login/sso` yet (ADR 0016 phase 5b); `test_login.py` pins the local-mode page, which `GET /login-options` now drives |
@@ -2080,6 +2119,9 @@ the integration suite, the frontend tests, and the browser suite were read, not 
 
 ### Limits by decision
 
+- The login body has no NUL check, so a login password holding a NUL is not a 422: in
+  local mode it is the 401 `Invalid credentials`, and LDAP mode is unchanged
+  (IAM-LOGIN-5, IAM-HASH-3). Recorded in issue #1426 (Expected and Suggested fix).
 - An admin may mint an API token for any principal of equal or lower rank, including
   another admin, and then act as that account (IAM-APITOK-2). Recorded in issue #312 and
   the comment in `create_token`; [SECURITY.md](../../SECURITY.md) treats admins as

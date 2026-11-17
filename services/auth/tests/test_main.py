@@ -143,6 +143,40 @@ async def test_seed_superadmin_skips_partial_env_vars():
         assert await superadmin_exists(db) is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "password, message",
+    [
+        ("strong\x00pass1", "Password must not contain a NUL character"),
+        # A non-UTF-8 byte in the environment arrives as a lone surrogate.
+        ("strong\udcffpass1", "Password must be encodable as UTF-8"),
+    ],
+    ids=["nul", "surrogate"],
+)
+async def test_seed_superadmin_refuses_a_password_hashing_refuses(password, message):
+    """IAM-HASH-3: the seed applies the same password rule as registration
+    (`validate_password`, through `hash_password`). Startup fails loudly with
+    the fixed message, which holds no part of the password, and writes no row."""
+    with (
+        patch("app.main.settings") as mock_settings,
+        patch("app.main.AsyncSessionLocal", TestSessionLocal),
+    ):
+        mock_settings.superadmin_email = "sa@test.com"
+        mock_settings.superadmin_username = "superadmin"
+        mock_settings.superadmin_password = password
+
+        from app.main import _seed_superadmin
+
+        with pytest.raises(ValueError) as caught:
+            await _seed_superadmin()
+
+    assert str(caught.value) == message
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None or caught.value.__suppress_context__
+    async with TestSessionLocal() as db:
+        assert await superadmin_exists(db) is False
+
+
 # --- _seed_not_grouped ---
 
 

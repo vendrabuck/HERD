@@ -401,7 +401,7 @@ async def oidc_exchange(
 ):
     """Trade the one-time handoff cookie for HERD tokens, once.
 
-    The body must be exactly `{}` sent as JSON, else FastAPI's default 422.
+    The body must be exactly `{}` sent as JSON, else a 422 (IAM-HASH-9 shape).
     FastAPI's strict content type (on by default) reads a body as JSON only
     when Content-Type is `application/json` or another `application/*+json`;
     with none, or any other, the body stays bytes and the model refuses it.
