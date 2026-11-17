@@ -5,13 +5,16 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
 
 from app import login_limits
 from app.auth import create_session_token, require_config_session
 from app.config_schema import CONFIG_SCHEMA, SCHEMA_KEYS
 from app.config_store import (
     DATA_DIR_NOT_WRITABLE_DETAIL,
+    STORE_UNUSABLE_DETAIL,
+    ConfigAuthError,
+    InvalidPassword,
     bootstrap_from_env,
     change_password,
     data_dir_remedy,
@@ -24,6 +27,7 @@ from app.config_store import (
     verify_password,
 )
 from app.docker_ctl import restart_services
+from app.validation_errors import install_validation_errors
 from app.version import add_version_route, service_version
 
 logger = logging.getLogger(__name__)
@@ -46,6 +50,10 @@ app = FastAPI(
     version=service_version(),
     lifespan=lifespan,
 )
+
+# Every 422 is rendered as {type, loc, msg}: never pydantic's input or ctx, so never
+# a submitted password, and never a 500 on a lone surrogate (app/validation_errors.py).
+install_validation_errors(app)
 
 # The wildcard origin is deliberate (this is the one service that does not use
 # herd_common's CORS helper). Credentials are never allowed: the config session
@@ -74,6 +82,19 @@ async def data_dir_not_writable(_request: Request, exc: PermissionError) -> JSON
     )
 
 
+@app.exception_handler(ConfigAuthError)
+async def config_store_unusable(_request: Request, exc: ConfigAuthError) -> JSONResponse:
+    """A route that meets an unusable password store answers 503, never a 500.
+
+    Only change-password can: login and /status catch ConfigAuthError themselves.
+    load_auth already logged the cause; the body is a constant.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": STORE_UNUSABLE_DETAIL},
+    )
+
+
 # -- Schemas --
 
 
@@ -82,16 +103,11 @@ class LoginRequest(BaseModel):
 
 
 class ChangePasswordRequest(BaseModel):
+    # Only the type is checked here. Which strings may become the password is
+    # config_store.new_password_problem, judged by change_password itself: a
+    # pydantic refusal would echo the password in the 422, and a lone surrogate
+    # in that echo cannot be rendered at all (issue #1428).
     new_password: str
-
-    @field_validator("new_password")
-    @classmethod
-    def validate_password_length(cls, v: str) -> str:
-        if len(v) < 8:
-            raise ValueError("Password must be at least 8 characters")
-        if len(v) > 32:
-            raise ValueError("Password must be at most 32 characters")
-        return v
 
 
 class SaveSettingsRequest(BaseModel):
@@ -169,7 +185,11 @@ async def change_password_endpoint(
     req: ChangePasswordRequest,
     _session: dict = Depends(require_config_session),
 ):
-    change_password(req.new_password)
+    try:
+        change_password(req.new_password)
+    except InvalidPassword as exc:
+        # A fixed detail, never the submitted value.
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from None
     return {"message": "Password changed"}
 
 
