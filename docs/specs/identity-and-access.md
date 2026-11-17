@@ -574,13 +574,15 @@ account automatically.
   unavailable, credentials not checked` (issue #1403): incomplete configuration
   (`LDAP_SERVER_URL` or `LDAP_USER_BASE_DN` empty), a malformed server URL, a refused or
   timed-out connection, a TLS failure, a refused service-account bind (anonymous
-  included), a search that raises or ends with any result code but success (a missing
-  base DN, a referral that cannot be followed, busy, access denied), and a user bind
+  included), a search that raises, or that found no entry and ended with any result code but
+  success (a missing base DN, a referral that cannot be followed, busy, access denied;
+  a limited search that returned the entry is a match, IAM-LDAP-5), and a user bind
   that could not be attempted or answered at all: its connection could not be built or
   opened, TLS failed, or no answer came within the 30 s receive timeout (as on the
-  service connection). Those last three happen on a fresh connection to the same
-  server whatever the username, so a client cannot cause them for existing accounts
-  alone; a directory that delays the user bind of existing accounts past 30 s would
+  service connection). The cause of those last three does not depend on the username, and a
+  client cannot cause them through HERD, but only an existing username reaches the
+  user bind, so during an intermittently failing directory an existing username sees a
+  503 somewhat more often than an unknown one; a directory that delays the user bind of existing accounts past 30 s would
   still answer them 503, and is not known among the directories HERD targets. It is
   still fail closed: no session, no account
   created, no local fallback (IAM-LDAP-1), and the body never holds the directory

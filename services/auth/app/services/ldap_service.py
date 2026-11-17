@@ -369,9 +369,11 @@ def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
     search matched, or None only when the directory PROVED there is no match: a
     successful search with zero entries (issue #1403). Every other outcome
     raises LdapUnavailableError: the service connection could not be opened,
-    TLS-negotiated, or bound; the search raised; or it ended with any result
-    code but success (noSuchObject on a misconfigured base DN, a referral that
-    could not be followed, busy, access denied). Like the presence probe, a
+    TLS-negotiated, or bound; the search raised; or it found no entry and ended
+    with any result code but success (noSuchObject on a misconfigured base DN, a
+    referral that could not be followed, busy, access denied). A limited search
+    that returned the entry is a match (ldap3 reports a non-empty response as
+    found, whatever the result code). Like the presence probe, a
     failed search under the configured base proves nothing about the user. The
     search_filter is template'd with the escaped username to prevent filter
     injection. This function is always synchronous (blocking ldap3 calls);
