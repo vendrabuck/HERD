@@ -16,9 +16,11 @@ export const LOGIN_OPTIONS_PATH = "/auth/login-options";
 /**
  * The client-side limit on `GET /api/auth/login-options` (issue #1420). The
  * route reads no database (IAM-OIDC-16), so an answer slower than this means
- * auth is in trouble; the page then shows D10's fallback deliberately instead
- * of its pending state forever. Kept well under the e2e helpers' 15 s wait
- * for the form, so a hung request still lets them find the fallback.
+ * auth is in trouble; the page then shows D10's fallback deliberately, with a
+ * Try again notice, instead of its pending state forever. Each Try again
+ * attempt gets the same limit. Kept well under the e2e helpers' waits for the
+ * form (Selenium `_do_login` 15 s, Playwright `pw_login` the 30 s action
+ * default), so a hung request still lets them find the fallback.
  */
 export const LOGIN_OPTIONS_TIMEOUT_MS = 5000;
 /** The single sign-on handoff exchange (ADR 0016 D3); on the refresh interceptor's skip list. */

@@ -231,12 +231,13 @@ describe("loginOptionsFailed: the notice shows only for a failure with no confir
     expect(LOGIN_OPTIONS_FAILED_MESSAGE).toBe("Sign-in options could not be loaded.");
   });
 
-  it.each<[string, boolean, LoginOptions | undefined, boolean]>([
+  const OUTCOMES: Array<[string, boolean, LoginOptions | undefined, boolean]> = [
     ["pending", false, undefined, false],
     ["failed, nothing confirmed", true, undefined, true],
     ["a confirmed local answer", false, LOCAL, false],
     ["a confirmed answer whose background refetch failed", false, LOCAL, true],
-  ])("%s: notice shown is %s", (_label, expected, data, isError) => {
+  ];
+  it.each(OUTCOMES)("%s: notice shown is %s", (_label, expected, data, isError) => {
     expect(loginOptionsFailed({ data, isError })).toBe(expected);
   });
 });

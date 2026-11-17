@@ -203,8 +203,10 @@ export function LoginPage() {
         {optionsFailed && (
           // D10's fallback because the request failed, never for a confirmed
           // answer (issue #1420 review). Try again goes back to the pending
-          // state; cancelRefetch false joins a request already in flight, so
-          // repeated clicks send one request, each attempt under the 5 s limit.
+          // state, each attempt under the 5 s limit. Repeated clicks send one
+          // request: TanStack Query joins a fetch in flight for a query with
+          // no data (it cancels only when data exists, which never holds
+          // while this notice shows); cancelRefetch false states it.
           <div
             role="alert"
             className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800"
