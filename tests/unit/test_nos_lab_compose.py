@@ -105,6 +105,33 @@ def test_both_services_declare_a_healthcheck():
         assert service["healthcheck"].get("test"), f"service {name!r} healthcheck has no test"
 
 
+def test_frr_node_runs_under_the_docker_default_apparmor_profile():
+    """The FRR node is privileged, and a privileged container defaults to
+    AppArmor `unconfined`, where every exec is attached to any host profile
+    whose path matches the binary. Ubuntu 26.04 hosts load an enforcing
+    `staticd` profile for /usr/lib/frr/staticd that denies the daemon its
+    temporary config file, so every `write memory` on the node failed with
+    "Can't open configuration file /etc/frr/staticd.conf.XXXXXX." (the
+    ubuntu-latest runner from 2026-11-16 on). docs/NOS_LAB.md has the detail.
+
+    The scan reads the parsed YAML, so comments and key order do not matter.
+    It passes only when the `frr` service's `security_opt` is a list whose
+    entries beginning with `apparmor` are exactly one, the string
+    `apparmor=docker-default`. A missing option, any other profile
+    (`unconfined` included), a second apparmor entry, and the legacy
+    `apparmor:docker-default` spelling all fail.
+    """
+    service = _load_nos_compose()["services"]["frr"]
+    options = service.get("security_opt", [])
+    assert isinstance(options, list), f"frr security_opt must be a list, got {options!r}"
+    apparmor = [str(option) for option in options if str(option).startswith("apparmor")]
+    assert apparmor == ["apparmor=docker-default"], (
+        "the privileged FRR lab node must run under `apparmor=docker-default`, or "
+        "an Ubuntu 26.04 host's staticd profile attaches to its staticd and every "
+        f"write memory fails; found apparmor entries {apparmor!r} (docs/NOS_LAB.md)"
+    )
+
+
 def test_published_ports_match_defaults():
     data = _load_nos_compose()
     srl_ports = data["services"]["srl"]["ports"]
