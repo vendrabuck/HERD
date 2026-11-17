@@ -869,6 +869,48 @@ def pw_page(pw_browser):
         context.close()
 
 
+# The address the OIDC test provider (infra/oidc-test) publishes on, which the
+# Makefile's _gate-oidc-stack-tests passes: the gateway bind address, or
+# 127.0.0.1 when that is unset or 0.0.0.0.
+OIDC_TEST_HOST_ENV = "HERD_TEST_OIDC_HOST"
+OIDC_TEST_HOST = os.environ.get(OIDC_TEST_HOST_ENV, "127.0.0.1")
+
+
+@pytest.fixture(scope="session")
+def pw_oidc_browser(pw_browser):
+    """A second headless Chromium that resolves the OIDC lab's issuer host (ADR 0016 D12).
+
+    The issuer is http://oidc-test:5556/dex for every client, the gate's auth
+    container included, so the browser must reach the same name: the Chromium
+    switch `--host-resolver-rules=MAP oidc-test <OIDC_TEST_HOST>` maps it to the
+    address the lab publishes on, and the URL, the Host header, and every
+    redirect still name `oidc-test`. A DEDICATED browser so the shared
+    pw_browser stays untouched: it is launched from pw_browser's own
+    BrowserType (one Playwright driver per session; a second sync_playwright()
+    inside the same session is not supported), and closed at session end.
+    """
+    browser = pw_browser.browser_type.launch(
+        args=[f"--host-resolver-rules=MAP oidc-test {OIDC_TEST_HOST}"]
+    )
+    yield browser
+    browser.close()
+
+
+@pytest.fixture
+def pw_oidc_page(pw_oidc_browser):
+    """pw_page's shape on pw_oidc_browser: a fresh context trusting the dev TLS
+    certificate, console listeners, and the setup-failure registry."""
+    context = pw_oidc_browser.new_context(ignore_https_errors=True)
+    page = context.new_page()
+    try:
+        register_setup_browser("playwright", page)
+        _register_console_listeners(page)
+        yield page
+    finally:
+        _pw_console_log.pop(id(page), None)
+        context.close()
+
+
 def pw_login(page, email: str = ADMIN_EMAIL, password: str = ADMIN_PASSWORD) -> None:
     """Log in through the main app UI (Playwright), waiting for the post-login redirect.
 

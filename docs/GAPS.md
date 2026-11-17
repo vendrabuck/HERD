@@ -29,6 +29,16 @@ MEDIUM, LOW) and a concrete target file path.
   integration stack setup; no explicit test verifies `alembic upgrade head`
   from empty and `alembic downgrade -1` against every revision per service.
   Target: `services/<svc>/tests/test_migrations.py` per service that owns a schema.
+- **[LOW] OIDC break-glass ON against a running stack (by decision, ADR 0016
+  phase 5b).** `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN=true` is exercised at the
+  functional level only (`services/auth/tests/test_oidc_break_glass.py`, phase 3),
+  not against a running stack: `_gate-oidc-stack-tests` recreates the gate's auth
+  with the switch OFF, and `tests/integration/test_oidc_auth.py` proves the seeded
+  superadmin's password login is refused there. A second recreate of the gate auth
+  service with the switch on costs a full restart cycle for one branch, so it was
+  left out by decision. Target, if it is ever wanted: a second recreate inside the
+  same phase, after the OFF suites, with one integration test admitting the
+  seeded superadmin and refusing a local user.
 - **[MEDIUM] DB enum rejection on Postgres.** `services/inventory/tests/test_storage_constraints.py`
   covers uniqueness, FK, and cascade on SQLite; Postgres-native enum rejection
   of out-of-range values is not exercised. Target: gate a Postgres fixture in
@@ -156,7 +166,9 @@ clients have a suite but stay below 85% lines on error and edge-case branches:
 
 ## E2E
 
-`tests/e2e/` has 71 test files and 221 tests across Selenium and Playwright (the 2026-11-12 nightly collected 221 unseeded: 157 passed, 63 skipped, 1 failed; the v0.7.0 release gate ran 206: 148 passed and 58 skipped unseeded, 202 passed and 4 exempt skips seeded; see README.md's Testing section). Remaining UI gaps:
+`tests/e2e/` has 72 test files and 224 tests across Selenium and Playwright (the
+three in `test_oidc_login_playwright.py` run only in the OIDC-mode stack phase and
+skip as exempt elsewhere; the 2026-11-12 nightly collected 221 unseeded: 157 passed, 63 skipped, 1 failed; the v0.7.0 release gate ran 206: 148 passed and 58 skipped unseeded, 202 passed and 4 exempt skips seeded; see README.md's Testing section). Remaining UI gaps:
 
 - [HIGH] AI Generate generate-to-commit flow. `tests/e2e/test_ai_generate_dialog.py`
   covers opening the dialog, the empty-prompt disabled state, and escape-to-close,
@@ -183,6 +195,10 @@ plus a dry-run import), notifications (unread-count, list, preferences write), a
 routed-topology validation task, bulk connection creation (`POST /connections/bulk`),
 and device configuration (`DeviceConfigUser`: config versions, the config-schema
 proxy, and the apply-job list on a device of its own; no apply or schedule).
+`OidcLoginUser` (ADR 0016 phase 5b) drives the single sign-on chain through the OIDC
+test provider, only in the OIDC-mode stack phase (`HERD_LOAD_OIDC=1`); a 30 s run of
+five users, so it shows the chain holds under concurrency and the flow table is
+pruned, not a throughput figure.
 Missing coverage:
 
 - [MEDIUM] Topology write endpoints (create, update, canvas save, versions) beyond
@@ -210,10 +226,10 @@ nightly say nothing about them.
   `HERD_TEST_OIDC_REQUIRED` is set or a provider answers at
   `HERD_TEST_OIDC_HOST`/`HERD_TEST_OIDC_PORT`. It runs only through `make
   test-auth-oidc`, which `make master` and `make everything` call through
-  `_gate-oidc-tests`. No workflow boots `infra/oidc-test`, so ci.yml's backend job
-  skips it and nightly.yml never runs it. Target: ADR 0016 phase 5b, which adds the
-  provider's start and stop steps to `.github/workflows/nightly.yml`; a step there
-  running `make test-auth-oidc` closes this gap.
+  `_gate-oidc-tests`. ci.yml's backend job has no provider, so it skips there, and
+  nightly.yml boots the provider (`make oidc-up`, for the OIDC-mode stack phase of
+  ADR 0016 phase 5b) but never runs this suite. Target: a `make test-auth-oidc` step
+  in `.github/workflows/nightly.yml` after the existing `make oidc-up` step.
 - **[LOW] Live OpenAI-compatible provider smoke.**
   `services/ai-orchestrator/tests/integration/test_vllm_live.py` (2 tests) skips
   through its module `pytestmark` unless `HERD_VLLM_BASE_URL` is set; no workflow,

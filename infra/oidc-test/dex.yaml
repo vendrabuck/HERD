@@ -51,8 +51,27 @@ staticClients:
     name: HERD
     # Test-only value.
     secret: herd-oidc-test-client-secret
+    # Templated (ADR 0016 phase 5b; decided by the owner on 2026-11-14): the
+    # callback of every address the stack may be browsed at, so no tracked
+    # file names a host address. https://localhost is always registered (the
+    # live suite, and a stack bound to every interface); a second entry,
+    # https://<HERD_GATEWAY_BIND>, is added when that variable, trimmed, is a
+    # host other than 0.0.0.0 and localhost, the rule `make gateway-url`
+    # follows: an IPv4 dotted quad, a DNS name, or a bracketed IPv6 literal,
+    # and nothing else (no whitespace or newline inside, no quote, slash, or
+    # port), so a hostile value can never add a second entry. The
+    # image's entrypoint renders this file with gomplate before Dex reads it
+    # (it does so for every `dex serve` argument ending in .yaml), and the
+    # lab's compose file passes HERD_GATEWAY_BIND into the container. The
+    # template actions sit in YAML comments so the unrendered file still
+    # parses; rendering leaves an empty `#` comment line in their place.
     redirectURIs:
       - https://localhost/api/auth/oidc/callback
+      # {{- $bind := getenv "HERD_GATEWAY_BIND" "" | strings.TrimSpace }}
+      # {{- $host := `^(([0-9]{1,3}\.){3}[0-9]{1,3}|[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*|\[[0-9A-Fa-f:.]+\])$` }}
+      # {{- if and (regexp.Match $host $bind) (ne $bind "0.0.0.0") (ne $bind "localhost") }}
+      - "https://{{ $bind }}/api/auth/oidc/callback"
+      # {{- end }}
 
 enablePasswordDB: true
 

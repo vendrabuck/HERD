@@ -1,9 +1,10 @@
 """OpenID Connect relying-party protocol: discovery, JWKS, the authorization URL,
 the code exchange, and ID-token verification (ADR 0016 phase 1, issue #37).
 
-Dark by construction: every entry point refuses with `OidcUnavailableError`
-unless `settings.auth_method == "oidc"`, which `Settings` does not admit until
-ADR 0016 phase 6; tests reach the code by setting the attribute directly. The
+Every entry point refuses with `OidcUnavailableError` unless
+`settings.auth_method == "oidc"` (admitted since ADR 0016 phase 5b, not
+supported for operators until phase 6); unit tests reach the code by setting
+the attribute directly. The
 routes in `app/routers/oidc.py` (phase 3) are its only callers.
 
 Two entry points, the phase 1 half of "Internal interfaces between phases":

@@ -30,6 +30,7 @@ from app.tasks.ldap_sync_loop import (
     ldap_group_sync_loop_enabled,
     ldap_sync_loop,
 )
+from app.validation_errors import install_validation_errors
 
 setup_logging("auth", level=settings.log_level)
 logger = logging.getLogger(__name__)
@@ -145,6 +146,11 @@ app = FastAPI(
 add_cors_middleware(app, settings.cors_origins)
 
 app.add_middleware(RequestLoggingMiddleware)
+
+# Every 422 is `{type, loc, msg}`: no `input` or `ctx`, so no submitted password,
+# and it always encodes (issue #1426). `msg` and `loc` can still quote part of an
+# email, a UUID, or a key name (see app/validation_errors.py).
+install_validation_errors(app)
 
 app.include_router(auth_router)
 app.include_router(admin_router)

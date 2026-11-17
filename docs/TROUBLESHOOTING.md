@@ -95,6 +95,33 @@ Either:
 - Clock skew between the auth service (which signs the token) and another backend service (which verifies it) is more than 10 seconds: every service accepts a token up to 10 seconds past its expiry and refuses one issued more than 10 seconds in its future.
 - The bearer token expired (30 min default). The auth client refreshes it automatically, and every open tab shares the refreshed session (issue #1316); when the refresh itself is refused, the client signs the user out and the sign-in page returns them, with the same account, to the page that needed it.
 
+### One local account always gets `Invalid credentials` after an upgrade (bcrypt cost above 14)
+
+Since issue #1425 the auth service refuses a stored password hash whose bcrypt cost is above 14 without checking it (a cost-31 check held the service for about 31 hours). HERD itself writes only cost 12, so such a row exists only after a direct database write or an import of hashes made elsewhere. That account's every password login answers 401 `Invalid credentials`, exactly like a wrong password, and `docker compose logs auth` shows the WARNING `Stored password hash is not a usable bcrypt hash` on each attempt (it names neither the account nor the hash).
+
+Find the rows the ceiling refuses (the pattern is the auth service's own usable-hash shape at costs 15 to 31):
+
+```bash
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
+SELECT id, email, auth_source, split_part(hashed_password, '$', 3) AS cost
+  FROM auth.users
+ WHERE hashed_password ~ '^\$(2|2a|2b|2y)\$(1[5-9]|2[0-9]|3[01])\$[./A-Za-z0-9]{53}$';
+SQL
+```
+
+Remedy: reset each listed account's password. HERD has no reset route, so write a new cost-12 hash directly. Generate it inside the auth container (the prompt does not echo, and the password stays out of your shell history), then store it and give the user the new password:
+
+```bash
+docker compose exec auth python -c \
+  "import getpass; from app.services.passwords import hash_password; print(hash_password(getpass.getpass('New password: ')))"
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -v hash='<the printed hash>' -v email='<the account email>' <<'SQL'
+UPDATE auth.users SET hashed_password = :'hash' WHERE email = :'email';
+SQL
+```
+
+Use a password of 8 to 72 characters with no NUL character, the rules registration applies; `hash_password` refuses one it cannot hash. The account signs in at once, with no restart.
+
 ### LDAP login fails immediately
 
 When `AUTH_METHOD=ldap` (see [ENV_VARS.md](ENV_VARS.md#ldap--active-directory)), a 401 on every login typically means one of:

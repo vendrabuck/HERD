@@ -1,9 +1,9 @@
 import uuid
 from datetime import datetime
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.config import AuthMethod
 from app.schemas.pagination import Paginated
 
 
@@ -14,7 +14,7 @@ class LdapSyncStatusResponse(BaseModel):
     # loop is on. Deliberately minimal: extends the ADR's ratified
     # {auth_method} shape with the two settings the page needs for honest
     # interval-loop context, nothing else.
-    auth_method: Literal["local", "ldap"]
+    auth_method: AuthMethod
     group_sync_enabled: bool
     sync_interval_seconds: int
 

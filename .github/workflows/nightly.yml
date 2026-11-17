@@ -23,9 +23,19 @@
 # Postgres-live suite (services/*/tests/*_live_pg.py) runs against the stack's
 # own Postgres, via `make _gate-ldap-stack-tests` / `make _gate-pg-live-tests`
 # (the same internal targets master/everything use, see the Makefile's LDAP
-# comment block). Its last test step runs the config page's Save and Restart
-# through the real restart path, which no other job or gate runs (issue #1326). The job sets COMPOSE_PROJECT_NAME=herd once, in its env block, so
-# every step and make target addresses the same compose project (issue #1313).
+# comment block). After the LDAP-mode phase the same is done for OpenID Connect
+# (ADR 0016 phase 5b): infra/oidc-test (Dex) boots alongside the stack, and
+# `make _gate-oidc-stack-tests` switches auth to OIDC mode, runs
+# tests/integration/test_oidc_auth.py, the locust class OidcLoginUser, and the
+# Playwright test tests/e2e/test_oidc_login_playwright.py, then restores local
+# mode. The stack is browsed at https://localhost here (no HERD_GATEWAY_BIND), so
+# the redirect URI is https://localhost/api/auth/oidc/callback, which the lab
+# always registers.
+#
+# The job's last test step runs the config page's Save and Restart through the
+# real restart path, which no other job or gate runs (issue #1326). The job sets
+# COMPOSE_PROJECT_NAME=herd once, in its env block, so every step and make
+# target addresses the same compose project (issue #1313).
 name: Nightly
 
 on:
@@ -93,6 +103,9 @@ jobs:
       - name: Start LDAP test server
         run: make ldap-up
 
+      - name: Start OIDC test provider
+        run: make oidc-up
+
       # The stack starts with a bare `docker compose up`, not `make up`, so the
       # gateway's self-signed certificate is generated here first (issue #1239),
       # as on a fresh clone. Without it Traefik cannot build its default TLS store
@@ -122,6 +135,13 @@ jobs:
 
       - name: LDAP-mode stack tests
         run: make _gate-ldap-stack-tests
+
+      # After the LDAP-mode phase, which restored local mode, and before the
+      # seeded e2e pass, which needs local mode again: the phase restores it in
+      # a trap. OIDC_STACK_LOAD=1 adds the short OidcLoginUser locust run, as
+      # `make everything` does.
+      - name: OIDC-mode stack tests
+        run: make _gate-oidc-stack-tests OIDC_STACK_LOAD=1
 
       - name: Postgres-live suites (every services/*/tests/*_live_pg.py)
         run: make _gate-pg-live-tests
@@ -174,8 +194,8 @@ jobs:
       # config.json, and the test asserts the Restart Result panel lists exactly
       # those services. It is the LAST test step on purpose: the restart bounces
       # them, and no step after it needs them warm (the steps below only collect
-      # diagnostics on a failure and stop the two labs). It needs no Selenium: the
-      # test drives Playwright's own Chromium.
+      # diagnostics on a failure and stop the three labs, LDAP, OIDC, and NOS).
+      # It needs no Selenium: the test drives Playwright's own Chromium.
       #
       # IPv6 is switched off on the runner first, and that is load-bearing. The
       # browser runs on the Docker host. Restarting a container removes and
@@ -200,12 +220,13 @@ jobs:
       # failed yet by the time the runner reaches it, it is skipped and never
       # revisited, so placing it any earlier would leave later phases -- seed,
       # seeded e2e, load test -- with no diagnostics at all on failure). It
-      # must also come BEFORE "Stop LDAP test server": that step runs
-      # unconditionally (if: always()) and tears down the ldap-test container
-      # regardless of position, so collecting after it would mean an
-      # LDAP-phase failure could never show ldap-test's state or logs in the
-      # snapshot. Nothing between the Postgres-live phase and the load test
-      # needs the LDAP container, so it stays up, unused, until here. Same
+      # must also come BEFORE "Stop LDAP test server" and "Stop OIDC test
+      # provider": those steps run unconditionally (if: always()) and tear down
+      # the ldap-test and oidc-test containers regardless of position, so
+      # collecting after them would mean an LDAP- or OIDC-phase failure could
+      # never show that container's state or logs in the snapshot. Nothing
+      # between the Postgres-live phase and the load test needs either lab
+      # container, so both stay up, unused, until here. Same
       # shared Makefile collector as the CI integration job (_collect-
       # stack-diagnostics), so the two jobs cannot drift apart.
       - name: Collect stack diagnostics
@@ -214,6 +235,8 @@ jobs:
           make _collect-stack-diagnostics
           docker compose -p herd-nos-test -f infra/nos-test/docker-compose.yml \
             logs --tail 400 > nos-lab-logs.txt 2>&1 || true
+          docker compose -p herd-oidc-test -f infra/oidc-test/docker-compose.yml \
+            logs --tail 400 > oidc-lab-logs.txt 2>&1 || true
 
       - name: Upload failure artifacts
         if: failure()
@@ -226,12 +249,17 @@ jobs:
             compose-logs.txt
             logs-*.txt
             nos-lab-logs.txt
+            oidc-lab-logs.txt
             e2e-artifacts/**
           retention-days: 7
 
       - name: Stop LDAP test server
         if: always()
         run: make ldap-down
+
+      - name: Stop OIDC test provider
+        if: always()
+        run: make oidc-down
 
       - name: Stop NOS test lab
         if: always()

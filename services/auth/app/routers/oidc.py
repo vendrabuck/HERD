@@ -16,8 +16,8 @@ and the phase 2 flow store (`oidc_flow_service`):
 - `POST /oidc/exchange` consumes the handoff cookie once and answers the
   `POST /login` token body plus `next`.
 
-Dark: outside `auth_method == "oidc"` (which `Settings` does not admit until
-ADR 0016 phase 6) each route answers 404 `Single sign-on is not enabled`
+Off outside `auth_method == "oidc"` (admitted since ADR 0016 phase 5b, not
+supported for operators until phase 6): each route answers 404 `Single sign-on is not enabled`
 before FastAPI reads its query, cookies, or body, and opens no database
 session (`_SingleSignOnRoute`).
 
@@ -401,7 +401,7 @@ async def oidc_exchange(
 ):
     """Trade the one-time handoff cookie for HERD tokens, once.
 
-    The body must be exactly `{}` sent as JSON, else FastAPI's default 422.
+    The body must be exactly `{}` sent as JSON, else a 422 (IAM-HASH-9 shape).
     FastAPI's strict content type (on by default) reads a body as JSON only
     when Content-Type is `application/json` or another `application/*+json`;
     with none, or any other, the body stays bytes and the model refuses it.
