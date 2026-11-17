@@ -1,9 +1,12 @@
-"""Unit tests for ldap_service.bind_user.
+"""Unit tests for ldap_service.bind_user and the sync-facing directory client.
 
-These tests stub the two internal helpers (_search_user, _bind_as_user) so we
-can assert the orchestration + filter escaping without spinning up a real
-ldap3 mock directory. The thin wrappers around ldap3 Connection are exercised
-in the integration stack, not here.
+The first tests stub the two internal helpers (_search_user, _bind_as_user) to
+assert the orchestration and filter escaping. The failure-class tests (issue
+#1403) replace only ldap3's Connection with the scripted directory in
+tests/_fake_directory.py, so the real classification code runs: what the
+directory said about a login is a refusal (None), and a directory that could not
+be asked raises LdapUnavailableError. The real directory is exercised by
+test_ldap_service_live.py.
 """
 
 import ssl
@@ -12,11 +15,31 @@ from contextlib import contextmanager
 import pytest
 from app.config import settings
 from app.services import ldap_service
-from ldap3.core.exceptions import LDAPException
-from ldap3.core.results import RESULT_NO_SUCH_OBJECT, RESULT_SUCCESS
+from ldap3.core.exceptions import (
+    LDAPException,
+    LDAPInvalidFilterError,
+    LDAPResponseTimeoutError,
+    LDAPSocketOpenError,
+    LDAPSocketReceiveError,
+    LDAPStartTLSError,
+)
+from ldap3.core.results import (
+    RESULT_BUSY,
+    RESULT_CONSTRAINT_VIOLATION,
+    RESULT_INAPPROPRIATE_AUTHENTICATION,
+    RESULT_INSUFFICIENT_ACCESS_RIGHTS,
+    RESULT_INVALID_CREDENTIALS,
+    RESULT_NO_SUCH_OBJECT,
+    RESULT_REFERRAL,
+    RESULT_SUCCESS,
+    RESULT_UNAVAILABLE,
+    RESULT_UNWILLING_TO_PERFORM,
+)
 from ldap3.utils.conv import escape_filter_chars
 
-_USER_DN = "CN=alice,OU=Users,DC=example,DC=com"
+from tests._fake_directory import USER_DN, FakeDirectory, alice_entry
+
+_USER_DN = USER_DN
 
 
 @pytest.fixture(autouse=True)
@@ -104,9 +127,159 @@ async def test_bind_user_missing_email_rejected(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_bind_user_missing_config_returns_none(monkeypatch):
-    monkeypatch.setattr(settings, "ldap_server_url", "", raising=False)
-    assert await ldap_service.bind_user("alice", "correct-horse") is None
+@pytest.mark.parametrize("setting", ["ldap_server_url", "ldap_user_base_dn"])
+async def test_bind_user_missing_config_raises_unavailable(monkeypatch, setting):
+    """Issue #1403: incomplete configuration is the operator's problem, so it is
+    "the directory could not be asked", never a refusal of the user's password."""
+
+    def boom(*_a, **_kw):
+        raise AssertionError("no directory call is made without a configuration")
+
+    monkeypatch.setattr(ldap_service, "_search_user", boom)
+    monkeypatch.setattr(ldap_service, "_bind_as_user", boom)
+    monkeypatch.setattr(settings, setting, "", raising=False)
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        await ldap_service.bind_user("alice", "correct-horse")
+
+
+# --- Issue #1403: every failure class of a login, through the real client code
+#     with only ldap3's Connection replaced (tests/_fake_directory.py). The
+#     invariant: bind_user answers None only for what the directory said about
+#     this login, and raises LdapUnavailableError whenever it could not be asked.
+
+_PASSWORD = "correct-horse-battery"
+
+
+@pytest.fixture
+def directory(monkeypatch):
+    fake = FakeDirectory(service_dn=settings.ldap_bind_dn)
+    monkeypatch.setattr(ldap_service, "Connection", fake.connection)
+    return fake
+
+
+# (name, FakeDirectory overrides, settings overrides)
+_UNAVAILABLE_CLASSES = {
+    "service_connect_refused": (
+        {"service_bind": LDAPSocketOpenError("socket connection error: Connection refused")},
+        {},
+    ),
+    "service_connect_timeout": (
+        {"service_bind": LDAPSocketOpenError("socket connection error: timed out")},
+        {},
+    ),
+    "service_tls_failure": (
+        {"service_start_tls": LDAPStartTLSError("wrap socket error: certificate verify failed")},
+        {"ldap_use_tls": True},
+    ),
+    "service_bind_refused": ({"service_bind": RESULT_INVALID_CREDENTIALS}, {}),
+    "anonymous_bind_refused": (
+        {"service_bind": RESULT_INAPPROPRIATE_AUTHENTICATION},
+        {"ldap_bind_dn": ""},
+    ),
+    "malformed_server_url": ({}, {"ldap_server_url": "ldap://mock:notaport"}),
+    "search_transport_error": ({"search": LDAPSocketReceiveError("connection reset")}, {}),
+    "search_slow_directory": ({"search": LDAPResponseTimeoutError("no response")}, {}),
+    "search_bad_filter_config": ({"search": LDAPInvalidFilterError("malformed filter")}, {}),
+    "search_base_dn_missing": ({"search": (RESULT_NO_SUCH_OBJECT, [])}, {}),
+    "search_referral": ({"search": (RESULT_REFERRAL, [])}, {}),
+    "search_busy": ({"search": (RESULT_BUSY, [])}, {}),
+    "search_access_denied": ({"search": (RESULT_INSUFFICIENT_ACCESS_RIGHTS, [])}, {}),
+    "user_bind_connect_error": (
+        {"user_bind": LDAPSocketOpenError("socket connection error: Connection refused")},
+        {},
+    ),
+    "user_bind_tls_failure": (
+        {"user_start_tls": LDAPStartTLSError("wrap socket error: certificate verify failed")},
+        {"ldap_use_tls": True},
+    ),
+    "user_bind_slow_directory": ({"user_bind": LDAPResponseTimeoutError("no response")}, {}),
+    "user_bind_busy": ({"user_bind": RESULT_BUSY}, {}),
+    "user_bind_unavailable": ({"user_bind": RESULT_UNAVAILABLE}, {}),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides,config", _UNAVAILABLE_CLASSES.values(), ids=_UNAVAILABLE_CLASSES.keys()
+)
+async def test_bind_user_raises_unavailable_when_the_directory_could_not_be_asked(
+    monkeypatch, directory, overrides, config, caplog
+):
+    for name, value in config.items():
+        monkeypatch.setattr(settings, name, value, raising=False)
+    if "ldap_bind_dn" in config:
+        directory.service_dn = None
+    for name, value in overrides.items():
+        setattr(directory, name, value)
+    with caplog.at_level("WARNING", logger="app.services.ldap_service"):
+        with pytest.raises(ldap_service.LdapUnavailableError):
+            await ldap_service.bind_user("alice", _PASSWORD)
+    outage = [r for r in caplog.records if getattr(r, "action", None) == "ldap_error"]
+    assert len(outage) == 1, [r.getMessage() for r in caplog.records]
+    assert outage[0].levelname == "WARNING"
+    for record in caplog.records:
+        assert _PASSWORD not in record.getMessage()
+        assert _PASSWORD not in str(record.__dict__)
+
+
+# (name, FakeDirectory overrides). Every one is an answer the directory gave
+# about THIS login, so it is the refusal (401), whatever the account's state:
+# a disabled or locked account answers with the same codes a wrong password does
+# on the directories HERD targets, and telling them apart would reveal that the
+# account exists.
+_REFUSAL_CLASSES = {
+    "user_not_found": {"search": (RESULT_SUCCESS, [])},
+    "wrong_password": {"user_bind": RESULT_INVALID_CREDENTIALS},
+    "account_disabled_unwilling": {"user_bind": RESULT_UNWILLING_TO_PERFORM},
+    "account_inappropriate_auth": {"user_bind": RESULT_INAPPROPRIATE_AUTHENTICATION},
+    "account_locked_constraint": {"user_bind": RESULT_CONSTRAINT_VIOLATION},
+    "account_access_denied": {"user_bind": RESULT_INSUFFICIENT_ACCESS_RIGHTS},
+    "missing_email": {"search": (RESULT_SUCCESS, [alice_entry(mail=[])])},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overrides", _REFUSAL_CLASSES.values(), ids=_REFUSAL_CLASSES.keys())
+async def test_bind_user_answers_none_for_what_the_directory_said(directory, overrides, caplog):
+    for name, value in overrides.items():
+        setattr(directory, name, value)
+    with caplog.at_level("INFO", logger="app.services.ldap_service"):
+        assert await ldap_service.bind_user("alice", _PASSWORD) is None
+    assert not [r for r in caplog.records if getattr(r, "action", None) == "ldap_error"]
+    for record in caplog.records:
+        assert _PASSWORD not in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_bind_user_success_through_the_connection_seam(directory):
+    identity = await ldap_service.bind_user("alice", _PASSWORD)
+    assert identity == ldap_service.LdapIdentity(
+        username="alice", email="alice@example.com", dn=USER_DN
+    )
+    assert directory.user_bind_passwords == [_PASSWORD]
+
+
+@pytest.mark.asyncio
+async def test_bind_user_unknown_user_never_binds_as_a_user(directory):
+    directory.search = (RESULT_SUCCESS, [])
+    assert await ldap_service.bind_user("alice", _PASSWORD) is None
+    assert directory.user_bind_passwords == []
+
+
+@pytest.mark.asyncio
+async def test_bind_user_empty_password_opens_no_connection(directory):
+    assert await ldap_service.bind_user("alice", "") is None
+    assert directory.built == []
+
+
+@pytest.mark.asyncio
+async def test_user_bind_connection_has_the_receive_timeout(directory):
+    """A directory that accepts the user bind's connection and never answers
+    must end in the outage answer, not hold a worker thread forever."""
+    await ldap_service.bind_user("alice", _PASSWORD)
+    user_connections = [c for c in directory.built if c.get("user") == USER_DN]
+    assert len(user_connections) == 1
+    assert user_connections[0]["receive_timeout"] == ldap_service._RECEIVE_TIMEOUT_SECONDS
 
 
 def test_filter_escaping_via_ldap3_conv():
@@ -124,6 +297,7 @@ class _FakeConnection:
     def __init__(self, calls, *_a, **_kw):
         self._calls = calls
         self.entries = []
+        self.result = None
 
     def start_tls(self):
         self._calls.append("start_tls")
@@ -134,6 +308,8 @@ class _FakeConnection:
         return True
 
     def search(self, *_a, **_kw):
+        # A successful search with no match: the directory's "no such user".
+        self.result = {"result": RESULT_SUCCESS}
         return False
 
     def unbind(self):

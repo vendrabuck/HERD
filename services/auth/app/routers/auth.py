@@ -27,8 +27,12 @@ from app.services.auth_service import (
     rotate_refresh_token,
     update_user_profile,
 )
+from app.services.ldap_service import LdapUnavailableError
 
 router = APIRouter(tags=["auth"])
+
+# Fixed 503 detail for an LDAP-mode login the directory could not check.
+LOGIN_DIRECTORY_UNAVAILABLE_DETAIL = "Directory unavailable, credentials not checked"
 
 REGISTER_DISABLED_LDAP_DETAIL = (
     "Local registration is disabled; this deployment uses LDAP authentication."
@@ -92,7 +96,17 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
 
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
-    user = await authenticate_user(db, body.email, body.password)
+    try:
+        user = await authenticate_user(db, body.email, body.password)
+    except LdapUnavailableError:
+        # Issue #1403: LDAP mode could not ask the directory, so the credentials
+        # were never judged; a 401 would tell the user their password is wrong.
+        # The directory client's text is in the log only (auth_service and
+        # ldap_service each logged it); the detail is fixed.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=LOGIN_DIRECTORY_UNAVAILABLE_DETAIL,
+        )
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

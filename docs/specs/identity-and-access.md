@@ -327,7 +327,7 @@ Auth service:
 |---|---|---|---|---|
 | GET | `/login-options` | anyone, unauthenticated; every mode | 200 | IAM-OIDC-16 |
 | POST | `/register` | anyone, unauthenticated; local mode only | 201 | IAM-REG-1 to IAM-REG-6, IAM-PROFILE-9 |
-| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-5, IAM-LDAP-1 to IAM-LDAP-11, IAM-OIDC-21 |
+| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-5, IAM-LDAP-1 to IAM-LDAP-12, IAM-OIDC-21 |
 | GET | `/oidc/login` | anyone, unauthenticated; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-17 |
 | GET | `/oidc/callback` | anyone holding the `herd_oidc_flow` cookie; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-18, IAM-OIDC-19 |
 | POST | `/oidc/exchange` | anyone holding the `herd_oidc_handoff` cookie; OIDC mode only, else 404 | 200 | IAM-OIDC-15, IAM-OIDC-20 |
@@ -516,11 +516,14 @@ account automatically.
   simple bind with an empty password would succeed anonymously). \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`) \
   Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_empty_password_rejected`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_empty_password_rejected`)
-- **IAM-LDAP-5.** Login fails closed with 401: incomplete configuration, a directory
-  that cannot be reached or bound, a search with no match, a refused user bind, an
-  entry without the email attribute, and any LDAP error all refuse. \
-  Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_search_user`) \
-  Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_not_found`, `test_bind_user_missing_email_rejected`, `test_bind_user_missing_config_returns_none`); `services/auth/tests/test_ldap_service_live.py` (`test_bad_service_account_returns_none`, `test_bind_user_unknown_user_returns_none`)
+- **IAM-LDAP-5.** Every answer the directory gives about the login itself is the 401
+  `Invalid credentials`: a search that succeeds with no match (an unknown login name,
+  or an entry the filter leaves out), a user bind the directory refuses with any result
+  code but busy or unavailable (a wrong password, and the codes directories use for a
+  disabled, locked, or expired account, so the answer never tells an existing account
+  from an unknown one), and an entry without the email attribute. \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_search_user`, `_bind_as_user`, `_USER_BIND_UNAVAILABLE_CODES`) \
+  Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_not_found`, `test_bind_user_missing_email_rejected`, `test_bind_user_answers_none_for_what_the_directory_said`); `services/auth/tests/test_ldap_login_outage.py` (`test_what_the_directory_said_stays_the_401`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_unknown_user_returns_none`, `test_login_endpoint_rejects_bad_password_against_live_ldap`)
 - **IAM-LDAP-6.** Every directory connection uses StartTLS before binding unless the
   URL is `ldaps://` or `LDAP_USE_TLS` is false, and validates the server certificate
   unless `LDAP_TLS_VALIDATE` is false (which logs a warning); `LDAP_CA_CERT` names a CA
@@ -549,6 +552,22 @@ account automatically.
   value, or the typed login name when the entry has none. \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`) \
   Pinned by: none
+- **IAM-LDAP-12.** When the directory cannot be asked, login answers 503 `Directory
+  unavailable, credentials not checked` (issue #1403): incomplete configuration
+  (`LDAP_SERVER_URL` or `LDAP_USER_BASE_DN` empty), a malformed server URL, a refused or
+  timed-out connection, a TLS failure, a refused service-account bind (anonymous
+  included), a search that raises or ends with any result code but success (a missing
+  base DN, a referral that cannot be followed, busy, access denied), and a user bind
+  that raises, times out (30 s receive timeout, as on the service connection), or is
+  refused as busy or unavailable. It is still fail closed: no session, no account
+  created, no local fallback (IAM-LDAP-1), and the body never holds the directory
+  client's text. The client logs one WARNING `LDAP unavailable during login` (action
+  `ldap_error`, the client's text in the message, the cause's class in
+  `exception_class`; incomplete configuration logs one ERROR instead), and auth logs a
+  WARNING `login_failure` with reason `directory_unavailable`; no line holds the
+  password. \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_search_user`, `_bind_as_user`, `_checked_search`); `services/auth/app/services/auth_service.py` (`_authenticate_ldap`); `services/auth/app/routers/auth.py` (`login`, `LOGIN_DIRECTORY_UNAVAILABLE_DETAIL`) \
+  Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_raises_unavailable_when_the_directory_could_not_be_asked`, `test_bind_user_missing_config_raises_unavailable`, `test_user_bind_connection_has_the_receive_timeout`); `services/auth/tests/test_ldap_login_outage.py` (`test_an_outage_is_503_with_the_fixed_detail_and_no_session`, `test_incomplete_configuration_is_503`, `test_an_outage_never_falls_back_to_a_local_password`); `services/auth/tests/test_auth_ldap.py` (`test_ldap_login_directory_unavailable_returns_503`); `services/auth/tests/test_ldap_service_live.py` (`test_bad_service_account_raises_unavailable`, `test_bind_user_unreachable_server_raises_unavailable`, `test_bind_user_missing_base_dn_raises_unavailable`, `test_login_endpoint_unreachable_directory_is_503`, `test_login_endpoint_bad_service_account_is_503`)
 
 **Out of scope.** Roles never come from the directory (ADR 0011, Blast radius). SAML and
 OIDC do not exist (issue #37).
@@ -1491,7 +1510,8 @@ page and the `/login/sso` page are in section 8.19.
   never shows server text: only a 401 shows `Invalid credentials. Check your email or
   login name and your password.`; no answer (a network error, or no answer within the
   15 s client timeout `LOGIN_TIMEOUT_MS`), a 404 (the gateway's answer while auth is
-  down), and any 5xx show `Could not reach HERD. Try again in a moment.`; a 422 names the
+  down), and any 5xx (LDAP mode's 503 for a directory that cannot be asked, IAM-LDAP-12,
+  included) show `Could not reach HERD. Try again in a moment.`; a 422 names the
   length limits of IAM-LOGIN-3; a 429 shows `Too many sign-in attempts.` with the
   `Retry-After` wait when it is a whole number of seconds; any other status shows
   `Sign-in failed with an unexpected answer. Try again in a moment.` Auth itself answers a
@@ -2041,6 +2061,7 @@ password, though `msg` and `loc` can quote part of an email, a UUID, or a key na
 | 409 | `This grant already exists` | duplicate grant | IAM-ACL-2 |
 | 422 | validation list | registration, login, profile, group, bulk, mapping, token, grant, or check body out of bounds; a registration password holding a NUL or a lone surrogate, or a login password holding a lone surrogate; a profile body with a key other than the three profile fields, or a null or empty `full_name`; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-PROFILE-3, IAM-PROFILE-4, IAM-PROFILE-5, IAM-LOGIN-3, IAM-LOGIN-5, IAM-HASH-9, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2 |
 | 422 | `group_dn does not resolve in the directory` | mapping DN proven absent | IAM-MAP-3 |
+| 503 | `Directory unavailable, credentials not checked` | LDAP-mode login while the directory cannot be asked | IAM-LDAP-12 |
 | 503 | `Directory unavailable, mapping not validated` | mapping create while the directory cannot be asked | IAM-MAP-3 |
 | 503 | `Internal API token not configured` | an internal route with no token configured | IAM-INTERNAL-2 |
 
@@ -2055,7 +2076,7 @@ Calls into this area are in section 7 and the forwarded-JWT group routes noted u
 
 | Direction | Peer | Call | Purpose | On failure |
 |---|---|---|---|---|
-| Out (auth) | LDAP directory | search and bind at login | password check, identity | Fail closed: 401 (IAM-LDAP-5) |
+| Out (auth) | LDAP directory | search and bind at login | password check, identity | Fail closed: 401 when the directory refuses the login (IAM-LDAP-5), 503 when it cannot be asked (IAM-LDAP-12) |
 | Out (auth) | LDAP directory | base search of the group DN | mapping validation | Fail closed: 503 when it cannot be asked, 422 when it proves absence (IAM-MAP-3) |
 | Out (auth) | LDAP directory | group fetch, member resolution, paged email enumeration | sync and sweep | Fail closed per group (IAM-SYNC-2) and for the whole sweep (IAM-SWEEP-5); the run ends `partial` |
 | Out (acl) | auth | `GET /groups/user/{user_id}` (caller's JWT, 10 s) | group set for a check | Fail closed: no groups, so not allowed (IAM-ACL-9) |
@@ -2091,7 +2112,7 @@ Calls into this area are in section 7 and the forwarded-JWT group routes noted u
 | `LDAP_SYNC_DEACTIVATION_MAX_PERCENT`, `LDAP_SYNC_DEACTIVATION_MIN_COUNT` | `20`, `3` | Breaker terms |
 
 Fixed in code: LDAP connect timeout 10 s and receive timeout 30 s on the service
-connection (the login user bind sets no receive timeout); paged search size 500; detail
+connection and on the login user bind (IAM-LDAP-12); paged search size 500; detail
 cap 20 per category; prune cadence 24 hours; bulk and batch caps 500.
 
 ## 12. Test coverage map

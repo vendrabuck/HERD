@@ -188,9 +188,36 @@ async def test_bind_user_filter_metacharacters_are_escaped(ldap_settings):
 
 
 @pytest.mark.asyncio
-async def test_bad_service_account_returns_none(monkeypatch, ldap_settings):
+async def test_bad_service_account_raises_unavailable(monkeypatch, ldap_settings):
+    """Issue #1403: a refused service-account bind proves nothing about the
+    user's password, so it is an outage (the login's 503), never a refusal."""
     monkeypatch.setattr(settings, "ldap_bind_password", "wrong-admin-pw", raising=False)
-    assert await ldap_service.bind_user("user1", USER_PW) is None
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        await ldap_service.bind_user("user1", USER_PW)
+
+
+def _refused_url() -> str:
+    """An ldap:// URL on a port nothing listens on (bound, then released)."""
+    with socket.socket() as probe:
+        probe.bind((LDAP_HOST, 0))
+        refused_port = probe.getsockname()[1]
+    return f"ldap://{LDAP_HOST}:{refused_port}"
+
+
+@pytest.mark.asyncio
+async def test_bind_user_unreachable_server_raises_unavailable(monkeypatch, ldap_settings):
+    monkeypatch.setattr(settings, "ldap_server_url", _refused_url(), raising=False)
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        await ldap_service.bind_user("user1", USER_PW)
+
+
+@pytest.mark.asyncio
+async def test_bind_user_missing_base_dn_raises_unavailable(monkeypatch, ldap_settings):
+    """A base DN the directory does not hold answers noSuchObject: a
+    misconfiguration that proves nothing about the user, so an outage."""
+    monkeypatch.setattr(settings, "ldap_user_base_dn", f"ou=gone,{BASE_DN}", raising=False)
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        await ldap_service.bind_user("user1", USER_PW)
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +307,26 @@ async def test_login_endpoint_succeeds_against_live_ldap(ldap_settings, http_cli
 async def test_login_endpoint_rejects_bad_password_against_live_ldap(ldap_settings, http_client):
     resp = await http_client.post("/login", json={"email": "user4", "password": "nope"})
     assert resp.status_code == 401
+    assert resp.json() == {"detail": "Invalid credentials"}
+
+
+@pytest.mark.asyncio
+async def test_login_endpoint_unreachable_directory_is_503(monkeypatch, ldap_settings, http_client):
+    """Issue #1403 against a real socket: a refused connection is the 503, so the
+    user is not told their (correct) password is wrong."""
+    monkeypatch.setattr(settings, "ldap_server_url", _refused_url(), raising=False)
+    resp = await http_client.post("/login", json={"email": "user4", "password": USER_PW})
+    assert (resp.status_code, resp.json()) == (
+        503,
+        {"detail": "Directory unavailable, credentials not checked"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_login_endpoint_bad_service_account_is_503(monkeypatch, ldap_settings, http_client):
+    monkeypatch.setattr(settings, "ldap_bind_password", "wrong-admin-pw", raising=False)
+    resp = await http_client.post("/login", json={"email": "user4", "password": USER_PW})
+    assert resp.status_code == 503
 
 
 # ---------------------------------------------------------------------------

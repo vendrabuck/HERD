@@ -113,7 +113,9 @@ async def test_ldap_user_wrong_password_returns_401(base_url):
             f"{base_url}/auth/login",
             json={"email": LDAP_USER, "password": "definitely-not-correct"},
         )
-    assert resp.status_code == 401
+    # A refusal by a reachable directory stays the 401, never the outage 503
+    # (issue #1403).
+    assert (resp.status_code, resp.json()) == (401, {"detail": "Invalid credentials"})
 
 
 async def test_ldap_unknown_user_returns_401(base_url):
@@ -122,7 +124,7 @@ async def test_ldap_unknown_user_returns_401(base_url):
             f"{base_url}/auth/login",
             json={"email": "does-not-exist-in-directory", "password": LDAP_PASSWORD},
         )
-    assert resp.status_code == 401
+    assert (resp.status_code, resp.json()) == (401, {"detail": "Invalid credentials"})
 
 
 async def test_ldap_login_provisions_ldap_user(base_url):
