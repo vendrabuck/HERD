@@ -196,6 +196,14 @@ def _check_password(password: str, hashed: object) -> bool:
 # -- Auth file --
 
 
+# Logged, with no arguments, on each use of a CONFIG_ADMIN_PASSWORD that
+# password_problem refuses; the only reachable refusal is the UTF-8 one.
+ENV_PASSWORD_REFUSED_LOG = (
+    "CONFIG_ADMIN_PASSWORD is not valid UTF-8 text, so it cannot be the config "
+    "password; no auth file written, login refused"
+)
+
+
 def _initial_password() -> tuple[str, bool]:
     """Resolve the config-page password seeded on first boot.
 
@@ -210,17 +218,15 @@ def _initial_password() -> tuple[str, bool]:
     """
     env_pw = os.environ.get("CONFIG_ADMIN_PASSWORD", "").strip()
     if env_pw:
-        # The environment cannot hold a NUL, but a byte that is not UTF-8 arrives
-        # as a lone surrogate. Fail closed like a corrupt file: store nothing (a
-        # generated password would replace the operator's choice), refuse login,
-        # and let fixing the variable be the recovery. The value is never logged.
-        problem = password_problem(env_pw)
-        if problem is not None:
-            logger.error(
-                "CONFIG_ADMIN_PASSWORD is not a usable config password (%s); "
-                "no auth file written, login refused",
-                problem,
-            )
+        # The environment cannot hold a NUL, and a blank value never reaches this
+        # branch, so the one refusal password_problem can make here is a byte
+        # that is not UTF-8 (it arrives as a lone surrogate). Fail closed like a
+        # corrupt file: store nothing (a generated password would replace the
+        # operator's choice), refuse login, and let fixing the variable be the
+        # recovery. The log line is a constant with no arguments: nothing derived
+        # from the password, its refusal text included, reaches a log.
+        if password_problem(env_pw) is not None:
+            logger.error(ENV_PASSWORD_REFUSED_LOG)
             raise ConfigAuthError("CONFIG_ADMIN_PASSWORD is not a usable config password")
         return env_pw, True
     generated = secrets.token_urlsafe(24)

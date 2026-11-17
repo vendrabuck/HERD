@@ -608,8 +608,8 @@ async def test_a_legacy_nul_separated_hash_still_matches_its_shorter_twin(
 # surrogate (Python's surrogateescape), which cannot be hashed.
 
 ENV_REFUSED_LOG = (
-    "CONFIG_ADMIN_PASSWORD is not a usable config password (Password must be valid UTF-8 "
-    "text); no auth file written, login refused"
+    "CONFIG_ADMIN_PASSWORD is not valid UTF-8 text, so it cannot be the config "
+    "password; no auth file written, login refused"
 )
 
 
@@ -636,12 +636,31 @@ async def test_an_admin_password_that_is_not_utf8_seeds_nothing_and_fails_closed
     assert (login.status_code, login.json()) == (401, {"detail": "Invalid password"})
     assert (login_raw.status_code, login_raw.json()) == (401, {"detail": "Invalid password"})
     assert not (Path(tmp_config_dir) / "config_auth.json").exists()
-    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
-    assert set(messages) == {ENV_REFUSED_LOG}
-    assert all("envpass" not in m for m in messages)
+    records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert {r.getMessage() for r in records} == {ENV_REFUSED_LOG}
+    assert all("envpass" not in r.getMessage() for r in records)
+    # The call takes nothing derived from the password: a constant message and no
+    # arguments, so neither the value nor its refusal text reaches the log.
+    assert records and all(
+        (r.levelno, r.msg, r.args) == (logging.ERROR, ENV_REFUSED_LOG, ()) for r in records
+    )
+    assert config_store.ENV_PASSWORD_REFUSED_LOG == ENV_REFUSED_LOG
     # Fixing the variable is the recovery: nothing was stored in the meantime.
     monkeypatch.setenv("CONFIG_ADMIN_PASSWORD", "envpass-fixed")
     assert verify_password("envpass-fixed") is True
+
+
+def test_the_only_refusal_an_environment_value_can_reach_is_not_utf8():
+    """The fixed log text names the UTF-8 cause because it is the only one an
+    environment value can reach: it cannot hold a NUL, and a blank value means a
+    generated password. If password_problem gains another refusal an environment
+    value can reach, this fails and the fixed text must be revisited."""
+    reachable = {
+        config_store.password_problem(value.strip())
+        for value, _problem in _PASSWORD_SPACE.values()
+        if "\x00" not in value and value.strip()
+    }
+    assert reachable == {None, "Password must be valid UTF-8 text"}
 
 
 @pytest.mark.parametrize("value", ["", "   ", "\t\n"], ids=["empty", "spaces", "whitespace"])

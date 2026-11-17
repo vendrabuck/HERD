@@ -493,12 +493,14 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   OPS-CONFIG-8's character rule (`password_problem`). The environment cannot hold a NUL,
   but a byte that is not UTF-8 arrives as a lone surrogate: such a value seeds nothing.
   No auth file is written and no password is generated, every login is a 401, `/status`
-  reports `password_changed` false, and each use logs one ERROR, `CONFIG_ADMIN_PASSWORD is
-  not a usable config password (Password must be valid UTF-8 text); no auth file written,
-  login refused`, never the value. Fixing the variable is the recovery (before issue
-  #1428 this was a 500 on `/status` and on login). \
-  Enforced in: `services/config/app/config_store.py` (`_initial_password`, `load_auth`, `password_problem`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_old_default_password_rejected`, `test_random_seed_used_and_unrotated`, `test_env_password_is_used_and_marks_rotated`); `services/config/tests/test_config_passwords.py` (`test_the_environment_cannot_hold_a_nul`, `test_an_admin_password_that_is_not_utf8_seeds_nothing_and_fails_closed`, `test_a_blank_admin_password_still_means_a_generated_one`, `test_a_legal_admin_password_of_any_length_seeds_and_signs_in`)
+  reports `password_changed` false, and each use (each `/status` read, each login
+  attempt) logs one ERROR, the fixed text `CONFIG_ADMIN_PASSWORD is not valid UTF-8
+  text, so it cannot be the config password; no auth file written, login refused` with
+  no arguments, so neither the value nor anything derived from it is logged. Fixing the
+  variable is the recovery (before issue #1428 this was a 500 on `/status` and on
+  login). \
+  Enforced in: `services/config/app/config_store.py` (`_initial_password`, `load_auth`, `password_problem`, `ENV_PASSWORD_REFUSED_LOG`) \
+  Pinned by: `services/config/tests/test_config.py` (`test_old_default_password_rejected`, `test_random_seed_used_and_unrotated`, `test_env_password_is_used_and_marks_rotated`); `services/config/tests/test_config_passwords.py` (`test_the_environment_cannot_hold_a_nul`, `test_an_admin_password_that_is_not_utf8_seeds_nothing_and_fails_closed`, `test_the_only_refusal_an_environment_value_can_reach_is_not_utf8`, `test_a_blank_admin_password_still_means_a_generated_one`, `test_a_legal_admin_password_of_any_length_seeds_and_signs_in`)
 - **OPS-CONFIG-6.** `POST /login` checks the password against the stored bcrypt hash and
   answers a session token valid for 30 minutes plus `password_changed`; a wrong password
   is 401 `Invalid password`. Only the first 72 UTF-8 bytes of a password reach bcrypt,
