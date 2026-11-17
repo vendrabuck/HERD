@@ -49,8 +49,9 @@ splits them; a name in a comment or an `echo` is not a command):
 
 In `master` and `everything`: a `$(MAKE)`, `$(SUBMAKE)`, or `make` command naming
 the phase, after the one naming `_gate-ldap-stack-tests`, whose failure fails the
-recipe and which carries none of `-n`, `-q`, `-t`, `-i`, `--dry-run`, `--question`,
-`--touch`, `--ignore-errors`. In nightly.yml's full-stack job: a step running
+recipe and which carries none of `-n`, `-q`, `-t`, `-i`, `--dry-run`, `--just-print`,
+`--recon`, `--question`, `--touch`, `--ignore-errors` as a separate word (a bundled
+short option such as `-in` is not judged). In nightly.yml's full-stack job: a step running
 `make oidc-up` before the step running `make _gate-oidc-stack-tests`, which comes
 after the step running `make _gate-ldap-stack-tests` and before the step running
 `make test-e2e-seeded`, carries no `if:` and no `continue-on-error`, and whose

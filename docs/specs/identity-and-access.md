@@ -1689,7 +1689,7 @@ supported for operators: auth accepts `AUTH_METHOD=oidc` since ADR 0016 phase 5b
 gates and nightly can run the stack in that mode, and the handbook does not describe the
 mode until phase 6. Auth reads `AUTH_METHOD` from its environment, or from `config.json`
 once a save through the config service has made that file outrank the environment
-(OPS-SET-1). The config service does not check dropdown values: with `AUTH_METHOD=oidc` in its own environment (compose passes it the same `.env` value), its first-boot bootstrap copies `oidc` into `config.json`, and a save (`PUT /api/config/settings`) writes whatever `AUTH_METHOD` it is sent; the config page's `AUTH_METHOD` dropdown offers only `local` and `ldap`. The gate's OIDC stack phase refuses to run where a saved
+(OPS-SET-1). The config service does not check dropdown values: with `AUTH_METHOD=oidc` in its own environment (compose passes it the same `.env` value), its first-boot bootstrap copies `oidc` into `config.json`, and a save (`PUT /api/config/settings`) writes whatever `AUTH_METHOD` it is sent; the config page's `AUTH_METHOD` dropdown offers only `local` and `ldap`. The gate's OIDC stack phase refuses to run where a UI-saved
 `config.json` exists, whatever it names. On every deployment whose `AUTH_METHOD` is not
 `oidc`, the three single sign-on routes answer 404, and the only
 visible effects are `GET /login-options` and, driven by it, the login page dropping its
