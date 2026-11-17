@@ -173,6 +173,17 @@ def _validity(crt: Path) -> timedelta:
     return end - start
 
 
+def _name(crt: Path, field: str) -> str:
+    """The certificate's `subject` or `issuer` name, printed in the pinned
+    RFC 2253 form (`CN=HERD dev gateway`). openssl's default name format is
+    not stable across versions: 3.0 prints `CN = HERD dev gateway` and 3.5
+    (the ubuntu-26.04 runner image) prints `CN=HERD dev gateway`."""
+    text = _openssl("x509", "-in", str(crt), "-noout", f"-{field}", "-nameopt", "RFC2253")
+    label, _, name = text.strip().partition("=")
+    assert label == field, text
+    return name
+
+
 def _key_matches(crt: Path, key: Path) -> bool:
     from_crt = _openssl("x509", "-in", str(crt), "-noout", "-pubkey")
     from_key = _openssl("pkey", "-in", str(key), "-pubout")
@@ -338,8 +349,8 @@ def test_fresh_checkout_gets_a_ten_year_certificate_naming_the_bind_address(tmp_
     assert abs(_validity(crt) - TEN_YEARS) <= timedelta(days=1)
     assert stat.S_IMODE(key.stat().st_mode) == 0o600
     assert _key_matches(crt, key)
-    subject = _openssl("x509", "-in", str(crt), "-noout", "-subject", "-issuer")
-    assert subject.count("CN = HERD dev gateway") == 2, subject  # self-signed
+    assert _name(crt, "subject") == "CN=HERD dev gateway"
+    assert _name(crt, "issuer") == _name(crt, "subject")  # self-signed
     text = _openssl("x509", "-in", str(crt), "-noout", "-text")
     assert "CA:FALSE" in text and "TLS Web Server Authentication" in text
     assert "sudo update-ca-certificates" in result.stdout
