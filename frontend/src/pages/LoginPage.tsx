@@ -12,7 +12,9 @@ import { loginErrorText, returnPathFromState } from "@/lib/login";
 import {
   SSO_ERROR_CANCELLED,
   SSO_ERROR_PARAM,
+  LOGIN_OPTIONS_FAILED_MESSAGE,
   SSO_LOGIN_URL,
+  loginOptionsFailed,
   settledLoginPageView,
   ssoErrorMessage,
 } from "@/lib/sso";
@@ -34,7 +36,24 @@ export function LoginPage() {
   // Issue #1420: null while the answer is pending, which renders no sign-in
   // method at all; a confirmed answer renders what it states; a failure with
   // no confirmed answer renders today's page (ADR 0016 D10).
-  const view = settledLoginPageView({ data: loginOptions.data, isError: loginOptions.isError });
+  const optionsOutcome = { data: loginOptions.data, isError: loginOptions.isError };
+  const view = settledLoginPageView(optionsOutcome);
+  const optionsFailed = loginOptionsFailed(optionsOutcome);
+  const { refetch: refetchLoginOptions } = loginOptions;
+
+  // A password typed into D10's fallback does not follow the form behind the
+  // Administrator sign-in toggle, or into a page with no form, once a retry
+  // confirms single sign-on (issue #1420). The email is kept.
+  // Adjusted during render when the placement changes (React's pattern for
+  // state derived from a changed value), not in an effect.
+  const passwordFormPlacement = view?.passwordForm;
+  const [placementSeen, setPlacementSeen] = useState(passwordFormPlacement);
+  if (placementSeen !== passwordFormPlacement) {
+    setPlacementSeen(passwordFormPlacement);
+    if ((passwordFormPlacement === "toggle" || passwordFormPlacement === "none") && form.password) {
+      setForm({ ...form, password: "" });
+    }
+  }
 
   const isUnconfigured = configStatus && !configStatus.configured;
 
@@ -178,6 +197,26 @@ export function LoginPage() {
               </div>
               <Skeleton className="h-5 w-1/2 mx-auto mt-4" />
             </div>
+          </div>
+        )}
+
+        {optionsFailed && (
+          // D10's fallback because the request failed, never for a confirmed
+          // answer (issue #1420 review). Try again goes back to the pending
+          // state; cancelRefetch false joins a request already in flight, so
+          // repeated clicks send one request, each attempt under the 5 s limit.
+          <div
+            role="alert"
+            className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800"
+          >
+            <p>{LOGIN_OPTIONS_FAILED_MESSAGE}</p>
+            <button
+              type="button"
+              onClick={() => void refetchLoginOptions({ cancelRefetch: false })}
+              className="font-medium text-blue-700 hover:underline focus:outline-none focus:ring-2 focus:ring-blue-500 rounded"
+            >
+              Try again
+            </button>
           </div>
         )}
 

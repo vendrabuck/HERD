@@ -148,6 +148,20 @@ export function settledLoginPageView({ data, isError }: LoginOptionsOutcome): Lo
   return null;
 }
 
+/** The notice above D10's fallback when the request failed (issue #1420 review). */
+export const LOGIN_OPTIONS_FAILED_MESSAGE = "Sign-in options could not be loaded.";
+
+/**
+ * True exactly when the page shows D10's fallback BECAUSE the request failed
+ * (an error answer, an invalid body, no answer within the client limit, or
+ * no network) with no answer confirmed before it. Never true for a confirmed
+ * answer, local mode's included, whose markup is the same form: the notice
+ * and its Try again button are what tell the two apart.
+ */
+export function loginOptionsFailed({ data, isError }: LoginOptionsOutcome): boolean {
+  return data === undefined && isError;
+}
+
 /** A successful `POST /api/auth/oidc/exchange`, validated. */
 export interface OidcExchangeResult {
   access_token: string;

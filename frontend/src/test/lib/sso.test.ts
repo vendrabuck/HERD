@@ -11,6 +11,8 @@ import {
   SSO_LOGIN_URL,
   loginPageView,
   parseLoginOptions,
+  LOGIN_OPTIONS_FAILED_MESSAGE,
+  loginOptionsFailed,
   parseOidcExchange,
   settledLoginPageView,
   ssoErrorMessage,
@@ -219,6 +221,23 @@ describe("settledLoginPageView: pending, answered, and failed", () => {
     expect(settledLoginPageView({ data, isError: false })).toEqual(loginPageView(data));
     expect(settledLoginPageView({ data, isError: true })).toEqual(loginPageView(data));
     expect(settledLoginPageView({ data, isError: true })).not.toEqual(LEGACY_LOGIN_VIEW);
+  });
+});
+
+describe("loginOptionsFailed: the notice shows only for a failure with no confirmed answer", () => {
+  const LOCAL: LoginOptions = { auth_method: "local", registration_open: true, password_login: true, sso: null };
+
+  it("is the exact wording", () => {
+    expect(LOGIN_OPTIONS_FAILED_MESSAGE).toBe("Sign-in options could not be loaded.");
+  });
+
+  it.each<[string, boolean, LoginOptions | undefined, boolean]>([
+    ["pending", false, undefined, false],
+    ["failed, nothing confirmed", true, undefined, true],
+    ["a confirmed local answer", false, LOCAL, false],
+    ["a confirmed answer whose background refetch failed", false, LOCAL, true],
+  ])("%s: notice shown is %s", (_label, expected, data, isError) => {
+    expect(loginOptionsFailed({ data, isError })).toBe(expected);
   });
 });
 
