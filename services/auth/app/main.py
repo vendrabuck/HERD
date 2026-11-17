@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from herd_common.cors import add_cors_middleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.schema_init import create_all_and_stamp
@@ -30,6 +31,7 @@ from app.tasks.ldap_sync_loop import (
     ldap_group_sync_loop_enabled,
     ldap_sync_loop,
 )
+from app.validation_errors import validation_error_handler
 
 setup_logging("auth", level=settings.log_level)
 logger = logging.getLogger(__name__)
@@ -145,6 +147,9 @@ app = FastAPI(
 add_cors_middleware(app, settings.cors_origins)
 
 app.add_middleware(RequestLoggingMiddleware)
+
+# A 422 never echoes a submitted value and never fails to encode (issue #1426).
+app.add_exception_handler(RequestValidationError, validation_error_handler)
 
 app.include_router(auth_router)
 app.include_router(admin_router)

@@ -13,7 +13,11 @@ module does:
   same password, even when the cut falls inside a multi-byte character.
 - A password holding a NUL character, or longer than 4096 UTF-8 bytes
   (`MAX_PASSWORD_BYTES`), or not encodable as UTF-8, is refused: `hash_password`
-  raises ValueError and `verify_password` returns False.
+  raises ValueError and `verify_password` returns False. `validate_password` is
+  that rule alone, the ONE definition of a legal password (issue #1426):
+  `RegisterRequest` runs it as a field validator, so registration refuses exactly
+  what hashing refuses, as a 422. Its messages are fixed and never hold the
+  password.
 - A stored hash is usable when it reads `$<ident>$<cost>$<22-char salt><31-char
   checksum>` with ident `2`, `2a`, `2b`, or `2y` and cost 04 to `MAX_VERIFY_COST`
   (14). `$2x$` and every other shape are refused. A `$2$` hash is checked as
@@ -71,17 +75,44 @@ _STORED_HASH = re.compile(
 )
 UNUSABLE_HASH_MESSAGE = "Stored password hash is not a usable bcrypt hash"
 
+# validate_password's refusals. Fixed text: a message never holds the password, so
+# it is safe in a 422 body, a log line, or a startup traceback.
+PASSWORD_NOT_A_STRING_MESSAGE = "Password must be a string"
+PASSWORD_NOT_UTF8_MESSAGE = "Password must be encodable as UTF-8"
+PASSWORD_TOO_LONG_MESSAGE = f"Password must be at most {MAX_PASSWORD_BYTES} bytes as UTF-8"
+PASSWORD_NUL_MESSAGE = "Password must not contain a NUL character"
+
+
+def _encoded_password(password: object) -> bytes:
+    """The whole UTF-8 form of a legal password; ValueError for a refused one."""
+    if not isinstance(password, str):
+        raise ValueError(PASSWORD_NOT_A_STRING_MESSAGE)
+    try:
+        raw = password.encode("utf-8")
+    except UnicodeEncodeError:  # a lone surrogate
+        # from None: UnicodeEncodeError's own text quotes the offending character.
+        raise ValueError(PASSWORD_NOT_UTF8_MESSAGE) from None
+    if len(raw) > MAX_PASSWORD_BYTES:
+        raise ValueError(PASSWORD_TOO_LONG_MESSAGE)
+    if b"\x00" in raw:
+        raise ValueError(PASSWORD_NUL_MESSAGE)
+    return raw
+
+
+def validate_password(password: str) -> str:
+    """`password` unchanged if `hash_password` would take it, else ValueError.
+
+    The one definition of a legal password at every entry point that sets one
+    (issue #1426). It decides exactly what hashing decides, never more: the
+    length bounds of a request schema are separate rules (IAM-REG-2).
+    """
+    _encoded_password(password)
+    return password
+
 
 def _password_bytes(password: str) -> bytes:
     """The bytes bcrypt reads for `password`; ValueError for a refused password."""
-    if not isinstance(password, str):
-        raise ValueError("password must be a string")
-    raw = password.encode("utf-8")  # UnicodeEncodeError, a ValueError, for a lone surrogate
-    if len(raw) > MAX_PASSWORD_BYTES:
-        raise ValueError(f"password is longer than {MAX_PASSWORD_BYTES} bytes")
-    if b"\x00" in raw:
-        raise ValueError("password contains a NUL character")
-    return raw[:BCRYPT_MAX_BYTES]
+    return _encoded_password(password)[:BCRYPT_MAX_BYTES]
 
 
 def hash_password(password: str) -> str:
