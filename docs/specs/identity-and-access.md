@@ -31,7 +31,7 @@ numbered in section 8.
 
 | Actor | May | May not |
 |---|---|---|
-| Unauthenticated caller | Register (local mode only), log in, refresh, log out, exchange an API token, read the login options, use the three single sign-on routes (OIDC mode only, which no deployment can select until ADR 0016 phase 6), read `/health` and `/version` | Anything else; every other route answers 401 |
+| Unauthenticated caller | Register (local mode only), log in, refresh, log out, exchange an API token, read the login options, use the three single sign-on routes (OIDC mode only, not yet supported for operators: see section 8.19), read `/health` and `/version` | Anything else; every other route answers 401 |
 | User | Read their own account, edit their own profile (name, contact email, phone), list groups by name, read any user's group memberships, ask the acl service about their own access | Read a group's members, change any group, list users, change roles or activation, create API tokens, manage grants, ask about another user's access |
 | Admin | Everything a user may; list users; edit any account's profile, the superadmin's included; activate any account; deactivate any account other than their own and the superadmin's; manage groups and members; manage directory mappings and run directory sync; create API tokens for any principal of their rank or lower; list and revoke every API token; manage grants; ask about any user's access | Change any role; assign the superadmin role; deactivate the superadmin or themselves; mint a token above their own rank |
 | Superadmin | Everything an admin may; set any other non-superadmin account's role to user or admin; mint superadmin tokens | Change their own role or another superadmin's; assign the superadmin role; deactivate themselves |
@@ -610,8 +610,8 @@ service checks on its own; the browser renews it silently with the refresh token
   not logged. Two other PyJWT decodes exist, and a repository guard fails on any
   further one: the config service's own session decode (it may not import
   `herd_common`), and `decode_id_token` beside `decode_access_token`, the OpenID Connect
-  ID-token decode ([ADR 0016](../design/0016-oidc-single-sign-on.md), dark until its
-  phase 6). That decode passes exactly one algorithm, which must be one of the nine
+  ID-token decode ([ADR 0016](../design/0016-oidc-single-sign-on.md), not supported
+  for operators until its phase 6). That decode passes exactly one algorithm, which must be one of the nine
   asymmetric ones in `ID_TOKEN_ALGORITHMS`
   (never `none`, never an HS algorithm, so an HMAC token keyed by the client secret or by
   the public key is refused before any decode), requires `exp`, `iat`, `iss`, `aud`,
@@ -1194,17 +1194,18 @@ copy of the auth service.
   Enforced in: `services/auth/app/services/ldap_sync_service.py` (`start_background_run`) \
   Pinned by: none
 - **IAM-LOOP-7.** The status route answers `{auth_method, group_sync_enabled,
-  sync_interval_seconds}` in any auth mode, with the effective interval, not the raw
-  setting. \
+  sync_interval_seconds}` in any auth mode, `oidc` included (its `auth_method` type is
+  `AuthMethod` in `services/auth/app/config.py`, the one `Settings` uses), with the
+  effective interval, not the raw setting. \
   Enforced in: `services/auth/app/routers/ldap_sync.py` (`get_sync_status`) \
-  Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_status_reports_ldap_mode`, `test_status_reports_local_mode`, `test_status_reports_the_clamped_interval_not_the_raw_setting`, `test_status_never_409s_under_local_mode`)
+  Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_status_reports_ldap_mode`, `test_status_reports_local_mode`, `test_status_reports_oidc_mode`, `test_status_reports_the_clamped_interval_not_the_raw_setting`, `test_status_never_409s_under_local_mode`)
 - **IAM-LOOP-8.** Runs list newest first (id breaks ties); an unknown run id answers 404. \
   Enforced in: `services/auth/app/routers/ldap_sync.py` (`list_sync_runs`, `get_sync_run`) \
   Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_list_runs_paginates_newest_first`, `test_get_missing_run_is_404`)
 - **IAM-LOOP-9.** The admin page disables mapping create and sync-now unless the status
   says LDAP mode, and shows the interval only when the loop is on. \
   Enforced in: `frontend/src/pages/admin/LdapSyncPage.tsx` (`LdapSyncPage`) \
-  Pinned by: `frontend/src/test/pages/LdapSyncPage.test.tsx` (`local-auth mode shows the inactive banner and disables create/sync-now`, `ldap mode with the loop enabled shows the interval and enables actions`, `ldap mode with the loop disabled notes manual-only sync`)
+  Pinned by: `frontend/src/test/pages/LdapSyncPage.test.tsx` (`local-auth mode shows the inactive banner and disables create/sync-now`, `single sign-on mode keeps create/sync-now disabled (fail closed)`, `ldap mode with the loop enabled shows the interval and enables actions`, `ldap mode with the loop disabled notes manual-only sync`)
 - **IAM-LOOP-10.** The page shows a `running` row older than 30 minutes as `running
   (stale)` and polls the runs list every 2 seconds while any run is running and not
   stale. The 30 minutes is a display hint below the reaper's threshold by decision
@@ -1678,16 +1679,21 @@ field; changing the login email or username; notification cache invalidation on 
 profile write; refreshing a name that still equals an old username after a directory
 sync renames the account (IAM-PROFILE-7).
 
-### 8.19 Single sign-on (OpenID Connect), dark until ADR 0016 phase 6
+### 8.19 Single sign-on (OpenID Connect), not supported for operators until ADR 0016 phase 6
 
 **What it does.** On a deployment set to `AUTH_METHOD=oidc`, the login page offers a
 "Sign in with" button that sends the browser to the identity provider; the provider
 sends it back, auth signs the person in (creating their account on the first visit),
-and the page trades a one-time cookie for the usual HERD tokens. Nobody can select that
-mode yet: `AUTH_METHOD` accepts only `local` and `ldap` until ADR 0016 phase 6, so on
-every deployment today the three single sign-on routes answer 404, and the only visible
-effects are `GET /login-options` and, driven by it, the login page dropping its Register
-link in LDAP mode (IAM-OIDC-24); a local-mode login page is unchanged. The flow
+and the page trades a one-time cookie for the usual HERD tokens. The mode is not yet
+supported for operators: auth accepts `AUTH_METHOD=oidc` since ADR 0016 phase 5b, so the
+gates and nightly can run the stack in that mode, and the handbook does not describe the
+mode until phase 6. Auth reads `AUTH_METHOD` from its environment, or from `config.json`
+once a save through the config service has made that file outrank the environment
+(OPS-SET-1). The config service does not check dropdown values: with `AUTH_METHOD=oidc` in its own environment (compose passes it the same `.env` value), its first-boot bootstrap copies `oidc` into `config.json`, and a save (`PUT /api/config/settings`) writes whatever `AUTH_METHOD` it is sent; the config page's `AUTH_METHOD` dropdown offers only `local` and `ldap`. The gate's OIDC stack phase refuses to run where a UI-saved
+`config.json` exists, whatever it names. On every deployment whose `AUTH_METHOD` is not
+`oidc`, the three single sign-on routes answer 404, and the only
+visible effects are `GET /login-options` and, driven by it, the login page dropping its
+Register link in LDAP mode (IAM-OIDC-24); a local-mode login page is unchanged. The flow
 store and provisioning rules are IAM-OIDC-1 to IAM-OIDC-14 in section 4; the design is
 [ADR 0016](../design/0016-oidc-single-sign-on.md).
 
@@ -1864,9 +1870,10 @@ skip list).
   Enforced in: `frontend/src/pages/OidcCompletePage.tsx` (`OidcCompletePage`); `frontend/src/api/auth.ts` (`exchangeOidcHandoff`, `adoptSignInTokens`, `OIDC_EXCHANGE_PATH`); `frontend/src/lib/sso.ts` (`parseOidcExchange`, `SSO_COMPLETE_PATH`, `SSO_EXCHANGE_FAILED_PATH`); `frontend/src/lib/login.ts` (`safeReturnPath`); `frontend/src/routes.tsx` (`appRouteElements`) \
   Pinned by: `frontend/src/test/pages/OidcCompletePage.test.tsx` (`shows a status line while the exchange runs`, `posts {} once with credentials, stores the pair like a password login, and replaces itself with next`, `refetches the signed-in user, as a password login does`, `spends the handoff exactly once under StrictMode's double effect and on re-render`, `navigates only within the app: next %j lands on /topology`, `on %s stores nothing and shows the failed message on the login page`, `an exchange that never answers is given up after 15 seconds as a failure`, `writes no token to a URL or the console, on success or failure`, `a visitor already signed in is sent on by GuestGuard and spends no handoff`, `records the return path bound to the exchanged token's account, never to any account`, `an access token whose account cannot be read is a failure that stores nothing`, `the review's race: another tab signs in while the exchange is in flight; its late %s changes nothing`, `after the page unmounts, a late %s causes no navigation, no token adoption, and no toast`, `a return path the flow recorded for one account is not honored for another`, `on %s the page replaces itself: Back lands on the page before it and never re-posts`); `frontend/src/test/lib/sso.test.ts` (`replaces %s with /topology`, `refuses an answer with %s`, `the completion page is never a return path (it sits under GuestGuard)`); `frontend/src/test/api/sso.test.tsx` (`posts exactly {} as JSON, with credentials, and returns the tokens and a safe next`, `rejects on %s with no server text in the error`, `stores the pair in shared storage, signs the tab in, and refetches the current user`, `is what useLogin runs on success`); `frontend/src/test/routes.test.tsx` (`renders OidcCompletePage inside GuestGuard, outside AuthGuard and AppLayout`); `frontend/src/test/pages/pageScrollContainer.test.tsx` (`the outside-layout allowlist is exactly the pages the route table renders outside AppLayout`)
 
-**Out of scope.** A live identity provider, the stack integration, load, and browser
-levels (phases 5a and 5b), including any browser run of the login page in OIDC mode;
-selecting the mode (phase 6). Login CSRF by an attacker who can write a cookie for
+**Out of scope.** The live and stack-level tests (phase 5a's live service suite against
+the Dex lab; phase 5b's integration, load, and browser tests against a stack whose auth
+the gate recreates in OIDC mode) are described in `docs/specs/TESTING.md`, not here;
+operator support for the mode (the config page option and the handbook, phase 6). Login CSRF by an attacker who can write a cookie for
 HERD's host, such as a sibling subdomain, is not closed (ADR 0016 D11).
 
 ### 8.20 Password hashing
@@ -2030,7 +2037,7 @@ Calls into this area are in section 7 and the forwarded-JWT group routes noted u
 | `AUTH_REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Refresh token lifetime |
 | `INTERNAL_API_TOKEN` | empty | Shared service secret; empty makes auth's and acl's internal routes answer 503 and the shared helpers answer false |
 | `SUPERADMIN_EMAIL`, `SUPERADMIN_USERNAME`, `SUPERADMIN_PASSWORD` | empty | First-startup superadmin; any empty skips the seed |
-| `AUTH_METHOD` | `local` | `local` or `ldap`; one backend for every login |
+| `AUTH_METHOD` | `local` | `local`, `ldap`, or `oidc` (not yet supported for operators, section 8.19); one backend for every login |
 | `LDAP_SERVER_URL`, `LDAP_BIND_DN`, `LDAP_BIND_PASSWORD`, `LDAP_USER_BASE_DN` | empty | Directory location and service account |
 | `LDAP_USER_FILTER` | `(sAMAccountName={username})` | Login search filter |
 | `LDAP_EMAIL_ATTRIBUTE`, `LDAP_USERNAME_ATTRIBUTE` | `mail`, `sAMAccountName` | Identity attributes |

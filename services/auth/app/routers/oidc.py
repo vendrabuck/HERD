@@ -16,8 +16,8 @@ and the phase 2 flow store (`oidc_flow_service`):
 - `POST /oidc/exchange` consumes the handoff cookie once and answers the
   `POST /login` token body plus `next`.
 
-Dark: outside `auth_method == "oidc"` (which `Settings` does not admit until
-ADR 0016 phase 6) each route answers 404 `Single sign-on is not enabled`
+Off outside `auth_method == "oidc"` (admitted since ADR 0016 phase 5b, not
+supported for operators until phase 6): each route answers 404 `Single sign-on is not enabled`
 before FastAPI reads its query, cookies, or body, and opens no database
 session (`_SingleSignOnRoute`).
 

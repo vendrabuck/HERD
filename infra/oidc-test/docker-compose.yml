@@ -20,6 +20,8 @@
 # The port publishes on HERD_GATEWAY_BIND, the same knob and the same
 # unset-case default as the gateway in the repository's docker-compose.yml;
 # `make oidc-up` passes the value it derives from the environment or `.env`.
+# The same value reaches the container, where dex.yaml's template registers
+# the HERD callback at that address beside https://localhost's.
 
 name: herd-oidc-test
 
@@ -39,6 +41,10 @@ services:
     image: ghcr.io/dexidp/dex:v2.46.1@sha256:65b72ca0f4b0bf6d4ada84ec21da8851782563404ac7b8f926923d27ceced9ab
     container_name: oidc-test
     command: ["dex", "serve", "/etc/dex/dex.yaml"]
+    # Read by dex.yaml's template (the static client's redirect URIs); the
+    # image's entrypoint renders that file with gomplate before Dex starts.
+    environment:
+      HERD_GATEWAY_BIND: ${HERD_GATEWAY_BIND:-}
     ports:
       - "${HERD_GATEWAY_BIND:-0.0.0.0}:${HERD_TEST_OIDC_PORT:-5556}:5556"
     volumes:

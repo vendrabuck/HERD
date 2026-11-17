@@ -1,6 +1,7 @@
 """The OpenID Connect settings (ADR 0016 phase 1, issue #37): every default, the
-algorithm Literal refused at load, `AUTH_METHOD` still refusing `oidc` (the
-feature stays dark), the compose pairing of all twelve variables, what
+algorithm Literal refused at load, `AUTH_METHOD` admitting `oidc` (since ADR
+0016 phase 5b; not supported for operators until phase 6) and refusing any
+other value, the compose pairing of all twelve variables, what
 `oidc_configuration_problems` reports, and exactly when each startup warning
 fires.
 
@@ -67,11 +68,8 @@ def clean_env(monkeypatch):
 
 
 def oidc_settings(**changes) -> Settings:
-    """A Settings model in OIDC mode. `auth_method` does not admit "oidc" at
-    load, so it is set after construction, the way the service tests set it."""
-    loaded = Settings(**{**COMPLETE, **changes})
-    loaded.auth_method = "oidc"
-    return loaded
+    """A Settings model in OIDC mode with the complete settings, plus `changes`."""
+    return Settings(**{**COMPLETE, "auth_method": "oidc", **changes})
 
 
 # --- defaults and load-time validation ---
@@ -111,11 +109,23 @@ def test_any_other_algorithm_is_refused_at_load_without_echoing_it(algorithm, cl
     assert "input_value" not in str(exc_info.value)
 
 
-def test_auth_method_still_refuses_oidc_so_the_feature_stays_dark(clean_env):
+def test_auth_method_admits_oidc_from_the_environment(clean_env):
+    # ADR 0016 phase 5b widened the Literal so the gate can recreate auth in
+    # OIDC mode; the config page still offers only local and ldap (phase 6).
     clean_env.setenv("AUTH_METHOD", "oidc")
+    assert Settings().auth_method == "oidc"
+
+
+def test_auth_method_refuses_any_other_value_with_the_literal_error(clean_env):
+    clean_env.setenv("AUTH_METHOD", "saml")
     with pytest.raises(ValidationError) as exc_info:
         Settings()
-    assert [e["loc"] for e in exc_info.value.errors()] == [("auth_method",)]
+    errors = exc_info.value.errors()
+    assert [(e["loc"], e["type"], e["msg"]) for e in errors] == [
+        (("auth_method",), "literal_error", "Input should be 'local', 'ldap' or 'oidc'")
+    ]
+    # HerdBaseSettings hides the refused input from the error text.
+    assert "saml" not in str(exc_info.value)
 
 
 @pytest.mark.parametrize(

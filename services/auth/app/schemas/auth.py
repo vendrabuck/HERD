@@ -1,9 +1,10 @@
 import uuid
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, field_validator
 
+from app.config import AuthMethod
 from app.models.user import Role
 from app.schemas.pagination import Paginated
 
@@ -76,7 +77,7 @@ class LoginOptionsResponse(BaseModel):
     """`GET /login-options`: which sign-in methods the login page offers, from
     auth's live settings (ADR 0016 D10)."""
 
-    auth_method: Literal["local", "ldap", "oidc"]
+    auth_method: AuthMethod
     registration_open: bool
     password_login: bool
     sso: SsoOptions | None
