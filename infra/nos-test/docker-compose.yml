@@ -122,6 +122,18 @@ services:
     container_name: nos-test-frr
     hostname: frr
     privileged: true
+    # Docker's own container profile instead of `unconfined`, the privileged
+    # default. An unconfined process that execs a binary is attached to any
+    # host AppArmor profile whose path matches it, and Ubuntu 26.04 hosts load
+    # enforcing profiles for the FRR daemons: its `staticd` profile attached
+    # to this node's /usr/lib/frr/staticd and denied the daemon creating
+    # /etc/frr/staticd.conf.XXXXXX, so every `write memory` failed (the
+    # ubuntu-latest runner from 2026-11-16 on). Under docker-default every exec
+    # inherits the container's profile, so no host per-binary profile applies;
+    # the privileges above are unchanged. Docker ignores the option on a host
+    # without AppArmor. See docs/NOS_LAB.md.
+    security_opt:
+      - apparmor=docker-default
     networks:
       - nos-test
     ports:
