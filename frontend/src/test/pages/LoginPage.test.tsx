@@ -41,12 +41,20 @@ beforeEach(() => {
   mockNavigate.mockClear();
   toastError.mockClear();
   toastSuccess.mockClear();
+  // A local-mode answer: the form renders once it arrives (issue #1420: no
+  // sign-in method renders while it is pending), so each test finds the form
+  // with a findBy query rather than assuming it is there at first render.
+  server.use(
+    http.get("/api/auth/login-options", () =>
+      HttpResponse.json({ auth_method: "local", registration_open: true, password_login: true, sso: null }),
+    ),
+  );
 });
 
 describe("LoginPage", () => {
-  it("renders the identifier, password, and submit controls", () => {
+  it("renders the identifier, password, and submit controls", async () => {
     renderWithProviders(<LoginPage />);
-    expect(screen.getByLabelText("Email")).toBeInTheDocument();
+    expect(await screen.findByLabelText("Email")).toBeInTheDocument();
     const pw = screen.getByLabelText("Password") as HTMLInputElement;
     expect(pw).toBeInTheDocument();
     expect(pw.placeholder).toBe("password");
@@ -73,7 +81,7 @@ describe("LoginPage", () => {
         screen.getByText(/System requires initial configuration/i),
       ).toBeInTheDocument(),
     );
-    expect(screen.getByLabelText("Email")).toBeDisabled();
+    expect(await screen.findByLabelText("Email")).toBeDisabled();
     expect(screen.getByLabelText("Password")).toBeDisabled();
     expect(screen.getByRole("button", { name: "Sign in" })).toBeDisabled();
   });
@@ -92,7 +100,7 @@ describe("LoginPage", () => {
       ),
     );
     renderWithProviders(<LoginPage />);
-    fireEvent.change(screen.getByLabelText("Email"), {
+    fireEvent.change(await screen.findByLabelText("Email"), {
       target: { value: "u@test" },
     });
     fireEvent.change(screen.getByLabelText("Password"), {
@@ -114,7 +122,7 @@ describe("LoginPage", () => {
       ),
     );
     renderWithProviders(<LoginPage />);
-    fireEvent.change(screen.getByLabelText("Email"), {
+    fireEvent.change(await screen.findByLabelText("Email"), {
       target: { value: "u@test" },
     });
     fireEvent.change(screen.getByLabelText("Password"), {
@@ -134,9 +142,9 @@ describe("LoginPage", () => {
 // (IAM-LDAP-2), which need not contain an @, and the page cannot yet tell the
 // mode, so the field must accept any text in both modes.
 describe("LoginPage identifier field (issue #1335)", () => {
-  it("is a text field with username autocomplete and an email keyboard, never type=email", () => {
+  it("is a text field with username autocomplete and an email keyboard, never type=email", async () => {
     renderWithProviders(<LoginPage />);
-    const id = screen.getByRole("textbox", { name: "Email" }) as HTMLInputElement;
+    const id = (await screen.findByRole("textbox", { name: "Email" })) as HTMLInputElement;
     expect(id.type).toBe("text");
     expect(id.getAttribute("autocomplete")).toBe("username");
     expect(id.getAttribute("inputmode")).toBe("email");
@@ -158,7 +166,7 @@ describe("LoginPage identifier field (issue #1335)", () => {
       }),
     );
     renderWithProviders(<LoginPage />);
-    const id = screen.getByLabelText("Email") as HTMLInputElement;
+    const id = (await screen.findByLabelText("Email")) as HTMLInputElement;
     fireEvent.change(id, { target: { value: "ldapit-eng1" } });
     fireEvent.change(screen.getByLabelText("Password"), { target: { value: "pw" } });
     // The browser's own constraint validation is what blocked the form before.
@@ -185,7 +193,7 @@ describe("LoginPage failure messages (issue #1333)", () => {
       http.post("/api/auth/login", loginHandler),
     );
     renderWithProviders(<LoginPage />);
-    fireEvent.change(screen.getByLabelText("Email"), {
+    fireEvent.change(await screen.findByLabelText("Email"), {
       target: { value: "u@test" },
     });
     fireEvent.change(screen.getByLabelText("Password"), { target: { value: "pw" } });
@@ -234,7 +242,7 @@ describe("LoginPage failure messages (issue #1333)", () => {
       http.post("/api/auth/login", () => new Promise<never>(() => {})),
     );
     renderWithProviders(<LoginPage />);
-    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "u@test" } });
+    fireEvent.change(await screen.findByLabelText("Email"), { target: { value: "u@test" } });
     fireEvent.change(screen.getByLabelText("Password"), { target: { value: "pw" } });
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
@@ -258,7 +266,7 @@ describe("LoginPage failure messages (issue #1333)", () => {
 });
 
 describe("LoginPage return path (issue #1333)", () => {
-  function renderAt(state: unknown, accessToken = "a") {
+  async function renderAt(state: unknown, accessToken = "a") {
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     });
@@ -275,7 +283,7 @@ describe("LoginPage return path (issue #1333)", () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
-    fireEvent.change(screen.getByLabelText("Email"), {
+    fireEvent.change(await screen.findByLabelText("Email"), {
       target: { value: "u@test" },
     });
     fireEvent.change(screen.getByLabelText("Password"), { target: { value: "pw" } });
@@ -285,14 +293,14 @@ describe("LoginPage return path (issue #1333)", () => {
   const renderAtAs = renderAt;
 
   it("returns the same account to the page recorded for it", async () => {
-    renderAtAs({ from: "/reservations/alice-res-1", sub: "alice" }, fakeJwt("alice"));
+    await renderAtAs({ from: "/reservations/alice-res-1", sub: "alice" }, fakeJwt("alice"));
     await waitFor(() =>
       expect(mockNavigate).toHaveBeenCalledWith("/reservations/alice-res-1", { replace: true }),
     );
   });
 
   it("sends another account to /topology, never to the page recorded for the previous one", async () => {
-    renderAtAs({ from: "/reservations/alice-res-1", sub: "alice" }, fakeJwt("bob"));
+    await renderAtAs({ from: "/reservations/alice-res-1", sub: "alice" }, fakeJwt("bob"));
     await waitFor(() =>
       expect(mockNavigate).toHaveBeenCalledWith("/topology", { replace: true }),
     );
@@ -300,7 +308,7 @@ describe("LoginPage return path (issue #1333)", () => {
   });
 
   it("returns to the recorded page, query and hash included", async () => {
-    renderAt({ from: "/topology/abc?tab=wiring#n1" });
+    await renderAt({ from: "/topology/abc?tab=wiring#n1" });
     await waitFor(() =>
       expect(mockNavigate).toHaveBeenCalledWith("/topology/abc?tab=wiring#n1", { replace: true }),
     );
@@ -309,7 +317,7 @@ describe("LoginPage return path (issue #1333)", () => {
   it.each(["//evil.example/x", "https://evil.example", "/\\evil.example"])(
     "refuses the unsafe return path %s and goes to /topology",
     async (from) => {
-      renderAt({ from });
+      await renderAt({ from });
       await waitFor(() =>
         expect(mockNavigate).toHaveBeenCalledWith("/topology", { replace: true }),
       );

@@ -1,7 +1,7 @@
 import { http, HttpResponse } from "msw";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, focusManager, onlineManager } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes, useLocation, useNavigationType } from "react-router-dom";
 import { StrictMode, type ReactNode } from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -19,7 +19,11 @@ vi.mock("react-hot-toast", () => ({
 vi.mock("@/lib/topLevelNavigation", () => ({ navigateTopLevel }));
 
 import { server } from "../mocks/server";
+import { flushPending } from "../flushPending";
+import { fakeJwt } from "../fixtures/jwt";
 import { LoginPage } from "@/pages/LoginPage";
+import { GuestGuard } from "@/components/guards";
+import { LOGIN_OPTIONS_TIMEOUT_MS } from "@/api/auth";
 import { useAuthStore } from "@/stores/authStore";
 
 // ADR 0016 phase 4: the login page driven by GET /api/auth/login-options, its
@@ -54,12 +58,22 @@ interface RenderOptions {
   initial?: string | { pathname: string; search?: string; hash?: string; state?: unknown };
   strict?: boolean;
   probe?: boolean;
+  /** A client from an earlier render, to model a second visit in the same page load. */
+  client?: QueryClient;
 }
 
-function renderLogin({ initial = "/login", strict = false, probe = false }: RenderOptions = {}) {
-  const client = new QueryClient({
+function newClient() {
+  return new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
+}
+
+function renderLogin({
+  initial = "/login",
+  strict = false,
+  probe = false,
+  client = newClient(),
+}: RenderOptions = {}) {
   let tree: ReactNode = (
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[initial]}>
@@ -92,13 +106,93 @@ async function settled(client: QueryClient, status: "success" | "error") {
   await waitFor(() => expect(client.getQueryState(["loginOptions"])?.status).toBe(status));
 }
 
-/** The page as it renders before any answer: today's page. */
-function legacyHtml(): string {
-  answerOptions(() => new Promise<never>(() => {}) as never);
-  const { page, unmount } = renderLogin();
+/**
+ * The page as it renders once the request has failed: the failure notice
+ * (issue #1420 review) above today's page (ADR 0016 D10). The failure cases
+ * are compared to it as is, the local-mode answer without the notice. Since
+ * issue #1420 it is no longer what renders while pending.
+ */
+async function failedHtml(): Promise<string> {
+  answerOptions(() => HttpResponse.json({ detail: "Not Found" }, { status: 404 }));
+  const { client, page, unmount } = renderLogin();
+  await settled(client, "error");
   const html = page().innerHTML;
   unmount();
   return html;
+}
+
+/** `html` with the failure notice (the one role=alert element) removed. */
+function withoutNotice(html: string): string {
+  const holder = document.createElement("div");
+  holder.innerHTML = html;
+  const notices = holder.querySelectorAll("[role='alert']");
+  expect(notices).toHaveLength(1);
+  notices[0].remove();
+  return holder.innerHTML;
+}
+
+const OPTIONS_FAILED = "Sign-in options could not be loaded.";
+
+function notice() {
+  return screen.queryByRole("alert");
+}
+
+function tryAgain() {
+  return screen.queryByRole("button", { name: "Try again" });
+}
+
+/**
+ * A login-options handler held until `release` is called with the answer, and
+ * a promise that resolves once the request has reached it, so a test asserts
+ * the pending state after the request is provably in flight, never by timing.
+ */
+function heldOptions() {
+  let arrived: () => void = () => {};
+  const reached = new Promise<void>((resolve) => {
+    arrived = resolve;
+  });
+  let answer: (body: unknown) => void = () => {};
+  const gate = new Promise<unknown>((resolve) => {
+    answer = resolve;
+  });
+  let calls = 0;
+  answerOptions(async () => {
+    calls += 1;
+    arrived();
+    return HttpResponse.json((await gate) as Record<string, unknown>);
+  });
+  return {
+    reached,
+    calls: () => calls,
+    release: (body: unknown) => act(async () => answer(body)),
+  };
+}
+
+/**
+ * Records whether an element matching `selector` was EVER inserted into the
+ * document, even one a later commit removed again: every added node is
+ * checked, not only what the document holds when the test looks.
+ */
+function everRendered(selector: string) {
+  let seen = document.querySelector(selector) !== null;
+  const check = (records: MutationRecord[]) => {
+    for (const record of records) {
+      for (const node of record.addedNodes) {
+        if (node instanceof Element && (node.matches(selector) || node.querySelector(selector))) {
+          seen = true;
+        }
+      }
+    }
+  };
+  const observer = new MutationObserver(check);
+  observer.observe(document.body, { childList: true, subtree: true });
+  return {
+    seen: () => {
+      check(observer.takeRecords());
+      return seen;
+    },
+    stop: () => observer.disconnect(),
+  };
 }
 
 beforeEach(() => {
@@ -119,6 +213,25 @@ function controls() {
     submit: screen.queryByRole("button", { name: "Sign in" }),
     register: screen.queryByRole("link", { name: "Register" }),
   };
+}
+
+interface ControlsShape {
+  sso: boolean;
+  toggle: boolean;
+  form: boolean;
+  register: boolean;
+}
+
+function controlsShape(present: Partial<ControlsShape>): ControlsShape {
+  return { sso: false, toggle: false, form: false, register: false, ...present };
+}
+
+/** Which sign-in controls the page shows; the form counts only when all three of its controls are there. */
+function presentControls(): ControlsShape {
+  const c = controls();
+  const parts = [c.email, c.password, c.submit].filter((el) => el !== null).length;
+  if (parts !== 0 && parts !== 3) throw new Error(`a partial password form: ${parts} of 3 controls`);
+  return { sso: c.sso !== null, toggle: c.toggle !== null, form: parts === 3, register: c.register !== null };
 }
 
 describe("LoginPage rendering is a pure function of /login-options (ADR 0016)", () => {
@@ -219,17 +332,166 @@ describe("LoginPage rendering is a pure function of /login-options (ADR 0016)", 
   });
 });
 
-describe("LoginPage fallback to today's page (ADR 0016 D10)", () => {
-  it("renders today's page while the answer is pending", () => {
-    answerOptions(() => new Promise<never>(() => {}) as never);
-    renderLogin();
+describe("LoginPage while /login-options is pending (issue #1420)", () => {
+  it("renders no sign-in method while the answer is pending", async () => {
+    const held = heldOptions();
+    const { page } = renderLogin();
+    await held.reached;
     const c = controls();
     expect(c.sso).toBeNull();
-    expect(c.email).toBeInTheDocument();
-    expect(c.password).toBeInTheDocument();
-    expect(c.register).toBeInTheDocument();
+    expect(c.toggle).toBeNull();
+    expect(c.email).toBeNull();
+    expect(c.password).toBeNull();
+    expect(c.submit).toBeNull();
+    expect(c.register).toBeNull();
+    expect(screen.queryByText(/No account\?/)).toBeNull();
+    expect(page().querySelector("form, input")).toBeNull();
   });
 
+  it("announces the pending state as a polite status, with the placeholder bars hidden from assistive technology", async () => {
+    const held = heldOptions();
+    renderLogin();
+    await held.reached;
+    const status = screen.getByRole("status");
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(status).toHaveTextContent("Loading sign-in options...");
+    const bars = status.querySelectorAll(".animate-pulse");
+    expect(bars.length).toBeGreaterThan(0);
+    for (const bar of bars) expect(status).toContainElement(bar.closest<HTMLElement>("[aria-hidden='true']"));
+    await held.release(LOCAL);
+    await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
+  });
+
+  it("keeps the header, the version, and the configuration link while pending", async () => {
+    const held = heldOptions();
+    renderLogin();
+    await held.reached;
+    expect(screen.getByRole("heading", { name: "HERD" })).toBeInTheDocument();
+    expect(screen.getByTestId("app-version-login")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "System configuration" })).toHaveAttribute("href", "/config");
+  });
+
+  it("shows the unconfigured banner while pending: it depends on the config service, not on the method", async () => {
+    server.use(http.get("/api/config/status", () => HttpResponse.json({ configured: false })));
+    const held = heldOptions();
+    renderLogin();
+    await held.reached;
+    await screen.findByText(/System requires initial configuration/);
+    expect(controls().email).toBeNull();
+    expect(controls().sso).toBeNull();
+  });
+
+  const MODES: Array<[string, Record<string, unknown>, ReturnType<typeof controlsShape>]> = [
+    ["local", LOCAL, controlsShape({ form: true, register: true })],
+    ["LDAP", LDAP, controlsShape({ form: true })],
+    ["OIDC, break-glass off", OIDC_OFF, controlsShape({ sso: true })],
+    ["OIDC, break-glass on", OIDC_ON, controlsShape({ sso: true, toggle: true })],
+  ];
+  it.each(MODES)("%s: nothing before the answer, then exactly what it states", async (_label, answer, shape) => {
+    const held = heldOptions();
+    const { client } = renderLogin();
+    await held.reached;
+    expect(presentControls()).toEqual(controlsShape({}));
+    await held.release(answer);
+    await settled(client, "success");
+    expect(presentControls()).toEqual(shape);
+    expect(screen.queryByRole("status")).toBeNull();
+    // A confirmed answer, local mode's included, never shows the failure notice.
+    expect(notice()).toBeNull();
+    expect(tryAgain()).toBeNull();
+    expect(held.calls()).toBe(1);
+  });
+
+  it.each([
+    ["break-glass off", OIDC_OFF],
+    ["break-glass on", OIDC_ON],
+  ] as const)("OIDC mode, %s: the password form and the Register link are never in the document, from first render to the answer", async (_label, answer) => {
+    const form = everRendered("#login-email, #login-password, button[type='submit']");
+    const register = everRendered("a[href='/register']");
+    try {
+      const held = heldOptions();
+      const { client } = renderLogin();
+      await held.reached;
+      await held.release(answer);
+      await settled(client, "success");
+      await screen.findByRole("button", { name: "Sign in with Acme SSO" });
+      expect(form.seen()).toBe(false);
+      expect(register.seen()).toBe(false);
+    } finally {
+      form.stop();
+      register.stop();
+    }
+  });
+
+  it("does not move focus when the answer arrives: a focused configuration link keeps it", async () => {
+    const held = heldOptions();
+    renderLogin();
+    await held.reached;
+    const user = userEvent.setup();
+    await user.tab();
+    const wrench = screen.getByRole("link", { name: "System configuration" });
+    expect(wrench).toHaveFocus();
+    await held.release(OIDC_ON);
+    await screen.findByRole("button", { name: "Sign in with Acme SSO" });
+    expect(wrench).toHaveFocus();
+  });
+
+  it("a request that never answers ends in the failure notice and today's page at the client timeout, not before", async () => {
+    answerOptions(() => new Promise<never>(() => {}) as never);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      renderLogin();
+      await act(() => vi.advanceTimersByTimeAsync(LOGIN_OPTIONS_TIMEOUT_MS - 1));
+      expect(screen.getByRole("status")).toHaveTextContent("Loading sign-in options...");
+      expect(controls().email).toBeNull();
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      // TanStack notifies observers on a zero-delay timer, also fake here.
+      await act(() => vi.advanceTimersByTimeAsync(10));
+    } finally {
+      vi.useRealTimers();
+    }
+    await screen.findByLabelText("Email");
+    const c = controls();
+    expect(c.password).toBeInTheDocument();
+    expect(c.register).toBeInTheDocument();
+    expect(c.sso).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(notice()).toHaveTextContent(OPTIONS_FAILED);
+    expect(tryAgain()).toBeInTheDocument();
+  });
+
+  it("a signed-in visitor is sent on by GuestGuard before the page asks which method is active", async () => {
+    let calls = 0;
+    answerOptions(() => {
+      calls += 1;
+      return HttpResponse.json(LOCAL);
+    });
+    useAuthStore.getState().setTokens(fakeJwt("alice"), "R");
+    render(
+      <QueryClientProvider client={newClient()}>
+        <MemoryRouter initialEntries={["/login"]}>
+          <Routes>
+            <Route
+              path="/login"
+              element={
+                <GuestGuard>
+                  <LoginPage />
+                </GuestGuard>
+              }
+            />
+            <Route path="/topology" element={<div data-testid="landed" />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    await screen.findByTestId("landed");
+    await flushPending();
+    expect(calls).toBe(0);
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+});
+
+describe("LoginPage after an answer or a failure (ADR 0016 D10, issue #1420)", () => {
   const OPTIONS_FAILURES: Array<[string, () => Response]> = [
     ["a 404 from a backend without phase 3", () => HttpResponse.json({ detail: "Not Found" }, { status: 404 })],
     ["a 500", () => HttpResponse.json({ detail: "boom" }, { status: 500 })],
@@ -243,30 +505,41 @@ describe("LoginPage fallback to today's page (ADR 0016 D10)", () => {
     ["a partial body", () => HttpResponse.json({ sso: { provider_name: "Acme" } })],
     ["ill-typed fields", () => HttpResponse.json({ ...OIDC_OFF, password_login: "false" })],
   ];
-  it.each(OPTIONS_FAILURES)("on %s renders byte-for-byte today's page", async (_label, answer) => {
-    const legacy = legacyHtml();
+  it.each(OPTIONS_FAILURES)("on %s renders the failure notice above byte-for-byte today's page", async (_label, answer) => {
+    const failed = await failedHtml();
     answerOptions(answer);
     const { client, page } = renderLogin();
     await settled(client, "error");
-    expect(page().innerHTML).toBe(legacy);
+    expect(page().innerHTML).toBe(failed);
+    expect(notice()).toHaveTextContent(OPTIONS_FAILED);
+    expect(notice()).toContainElement(tryAgain());
+    expect(presentControls()).toEqual(controlsShape({ form: true, register: true }));
     expect(screen.queryByText("boom")).toBeNull();
   });
 
-  it("local mode's answer renders byte-for-byte today's page", async () => {
-    const legacy = legacyHtml();
+  it("today's page is the password form and the Register link, with no single sign-on", async () => {
+    answerOptions(() => HttpResponse.json({ detail: "boom" }, { status: 500 }));
+    const { client } = renderLogin();
+    await settled(client, "error");
+    expect(presentControls()).toEqual(controlsShape({ form: true, register: true }));
+  });
+
+  it("local mode's answer renders byte-for-byte today's page, without the failure notice", async () => {
+    const failed = await failedHtml();
     answerOptions(() => HttpResponse.json(LOCAL));
     const { client, page } = renderLogin();
     await settled(client, "success");
-    expect(page().innerHTML).toBe(legacy);
+    expect(page().innerHTML).toBe(withoutNotice(failed));
+    expect(notice()).toBeNull();
   });
 
   it("LDAP mode's answer differs from today's page by the Register line alone", async () => {
-    const legacy = legacyHtml();
+    const failed = await failedHtml();
     answerOptions(() => HttpResponse.json(LDAP));
     const { client, page } = renderLogin();
     await settled(client, "success");
     const expected = document.createElement("div");
-    expected.innerHTML = legacy;
+    expected.innerHTML = withoutNotice(failed);
     const registerLine = [...expected.querySelectorAll("p")].find((p) =>
       p.textContent?.startsWith("No account?"),
     );
@@ -275,24 +548,238 @@ describe("LoginPage fallback to today's page (ADR 0016 D10)", () => {
     expect(page().innerHTML).toBe(expected.innerHTML);
   });
 
-  it("a local-mode answer keeps the same input elements, so a filled-in form survives it", async () => {
-    let release: () => void = () => {};
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    answerOptions(async () => {
-      await gate;
-      return HttpResponse.json(LOCAL);
+  it("today's page stays put under a user filling it in: no refetch on focus or on a network reconnect", async () => {
+    let calls = 0;
+    answerOptions(() => {
+      calls += 1;
+      return HttpResponse.json({ detail: "boom" }, { status: 500 });
     });
     const { client } = renderLogin();
+    await settled(client, "error");
     const email = screen.getByLabelText("Email") as HTMLInputElement;
-    const password = screen.getByLabelText("Password") as HTMLInputElement;
     await userEvent.type(email, "u@test");
-    release();
-    await settled(client, "success");
+    expect(email).toHaveFocus();
+    try {
+      act(() => {
+        onlineManager.setOnline(false);
+        onlineManager.setOnline(true);
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+      });
+      await flushPending();
+    } finally {
+      onlineManager.setOnline(true);
+      focusManager.setFocused(undefined);
+    }
+    // A refetch would have put the query back to pending and removed the form.
+    expect(calls).toBe(1);
+    expect(screen.queryByRole("status")).toBeNull();
     expect(screen.getByLabelText("Email")).toBe(email);
-    expect(screen.getByLabelText("Password")).toBe(password);
+    expect(email).toHaveFocus();
     expect(email.value).toBe("u@test");
+  });
+
+  it("a second visit after a failure asks again, pending until the answer", async () => {
+    answerOptions(() => HttpResponse.json({ detail: "boom" }, { status: 500 }));
+    const first = renderLogin();
+    await settled(first.client, "error");
+    first.unmount();
+    const held = heldOptions();
+    renderLogin({ client: first.client });
+    await held.reached;
+    expect(presentControls()).toEqual(controlsShape({}));
+    expect(screen.getByRole("status")).toHaveTextContent("Loading sign-in options...");
+    await held.release(OIDC_OFF);
+    await settled(first.client, "success");
+    expect(presentControls()).toEqual(controlsShape({ sso: true }));
+  });
+
+  it("a confirmed answer stays up when a background refetch fails", async () => {
+    answerOptions(() => HttpResponse.json(OIDC_OFF));
+    const { client } = renderLogin();
+    await settled(client, "success");
+    answerOptions(() => HttpResponse.json({ detail: "boom" }, { status: 500 }));
+    await act(async () => {
+      await client.refetchQueries({ queryKey: ["loginOptions"] });
+    });
+    await settled(client, "error");
+    expect(presentControls()).toEqual(controlsShape({ sso: true }));
+    expect(notice()).toBeNull();
+  });
+
+  it("a second visit in the same page load renders the cached answer at once, with no pending state", async () => {
+    answerOptions(() => HttpResponse.json(OIDC_OFF));
+    const first = renderLogin();
+    await settled(first.client, "success");
+    first.unmount();
+    const form = everRendered("#login-email, a[href='/register']");
+    try {
+      heldOptions();
+      renderLogin({ client: first.client });
+      expect(screen.getByRole("button", { name: "Sign in with Acme SSO" })).toBeInTheDocument();
+      expect(screen.queryByRole("status")).toBeNull();
+      await flushPending();
+      expect(form.seen()).toBe(false);
+    } finally {
+      form.stop();
+    }
+  });
+});
+
+describe("the failure notice and Try again (issue #1420 review)", () => {
+  const CAUSES: Array<[string, () => Response]> = [
+    ["a 404", () => HttpResponse.json({ detail: "Not Found" }, { status: 404 })],
+    ["a 5xx", () => HttpResponse.json({ detail: "boom" }, { status: 502 })],
+    ["a network failure", () => HttpResponse.error()],
+    ["an invalid body", () => HttpResponse.json({ password_login: "yes" })],
+  ];
+  it.each(CAUSES)("%s shows the notice and a Try again button above today's form", async (_label, answer) => {
+    answerOptions(answer);
+    const { client } = renderLogin();
+    await settled(client, "error");
+    expect(notice()).toHaveTextContent(OPTIONS_FAILED);
+    expect(tryAgain()).toHaveAttribute("type", "button");
+    expect(presentControls()).toEqual(controlsShape({ form: true, register: true }));
+    // Above the form, in document order.
+    expect(notice()!.compareDocumentPosition(screen.getByLabelText("Email"))).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("a browser offline at load still sends the request; its failure shows the notice", async () => {
+    let calls = 0;
+    answerOptions(() => {
+      calls += 1;
+      return HttpResponse.error();
+    });
+    onlineManager.setOnline(false);
+    try {
+      const { client } = renderLogin();
+      await settled(client, "error");
+    } finally {
+      onlineManager.setOnline(true);
+    }
+    expect(calls).toBe(1);
+    expect(notice()).toHaveTextContent(OPTIONS_FAILED);
+  });
+
+  it("Try again goes back to pending, then renders the confirmed OIDC answer: form and Register gone, the button present", async () => {
+    answerOptions(() => HttpResponse.json({ detail: "boom" }, { status: 500 }));
+    const { client } = renderLogin();
+    await settled(client, "error");
+    const held = heldOptions();
+    await userEvent.click(tryAgain()!);
+    await held.reached;
+    await flushPending();
+    expect(screen.getByRole("status")).toHaveTextContent("Loading sign-in options...");
+    expect(presentControls()).toEqual(controlsShape({}));
+    expect(notice()).toBeNull();
+    await held.release(OIDC_OFF);
+    await settled(client, "success");
+    expect(presentControls()).toEqual(controlsShape({ sso: true }));
+    expect(notice()).toBeNull();
+  });
+
+  it("Try again that fails again returns to today's page with the notice", async () => {
+    let calls = 0;
+    answerOptions(() => {
+      calls += 1;
+      return HttpResponse.json({ detail: "boom" }, { status: 500 });
+    });
+    const { client } = renderLogin();
+    await settled(client, "error");
+    await userEvent.click(tryAgain()!);
+    await waitFor(() => expect(calls).toBe(2));
+    await settled(client, "error");
+    await screen.findByRole("alert");
+    expect(notice()).toHaveTextContent(OPTIONS_FAILED);
+    expect(presentControls()).toEqual(controlsShape({ form: true, register: true }));
+  });
+
+  it("repeated clicks on Try again send one request", async () => {
+    answerOptions(() => HttpResponse.json({ detail: "boom" }, { status: 500 }));
+    const { client } = renderLogin();
+    await settled(client, "error");
+    const held = heldOptions();
+    const button = tryAgain()!;
+    fireEvent.click(button);
+    // Still in the document: the page re-renders only on TanStack's next tick.
+    expect(button.isConnected).toBe(true);
+    fireEvent.click(button);
+    fireEvent.click(button);
+    await held.reached;
+    await flushPending();
+    expect(held.calls()).toBe(1);
+    await held.release(LOCAL);
+    await settled(client, "success");
+    expect(held.calls()).toBe(1);
+  });
+
+  it("each retry gets the same client limit: a retry that never answers ends in the notice again", async () => {
+    answerOptions(() => HttpResponse.json({ detail: "boom" }, { status: 500 }));
+    const { client } = renderLogin();
+    await settled(client, "error");
+    answerOptions(() => new Promise<never>(() => {}) as never);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      fireEvent.click(tryAgain()!);
+      await act(() => vi.advanceTimersByTimeAsync(LOGIN_OPTIONS_TIMEOUT_MS - 1));
+      expect(screen.getByRole("status")).toHaveTextContent("Loading sign-in options...");
+      expect(notice()).toBeNull();
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      await act(() => vi.advanceTimersByTimeAsync(10));
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(await screen.findByRole("alert")).toHaveTextContent(OPTIONS_FAILED);
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("text typed into today's form survives a retry that fails again", async () => {
+    answerOptions(() => HttpResponse.json({ detail: "boom" }, { status: 500 }));
+    const { client } = renderLogin();
+    await settled(client, "error");
+    await userEvent.type(screen.getByLabelText("Email"), "u@test");
+    await userEvent.type(screen.getByLabelText("Password"), "pw");
+    const held = heldOptions();
+    await userEvent.click(tryAgain()!);
+    await held.reached;
+    await flushPending();
+    expect(screen.queryByLabelText("Email")).toBeNull();
+    await act(async () => {
+      held.release(null);
+    });
+    await screen.findByRole("alert");
+    expect(screen.getByLabelText("Email")).toHaveValue("u@test");
+    expect(screen.getByLabelText("Password")).toHaveValue("pw");
+  });
+
+  it("a retry that confirms local mode keeps the email and the password", async () => {
+    answerOptions(() => HttpResponse.json({ detail: "boom" }, { status: 500 }));
+    const { client } = renderLogin();
+    await settled(client, "error");
+    await userEvent.type(screen.getByLabelText("Email"), "u@test");
+    await userEvent.type(screen.getByLabelText("Password"), "pw");
+    answerOptions(() => HttpResponse.json(LOCAL));
+    await userEvent.click(tryAgain()!);
+    await settled(client, "success");
+    await waitFor(() => expect(notice()).toBeNull());
+    expect(screen.getByLabelText("Email")).toHaveValue("u@test");
+    expect(screen.getByLabelText("Password")).toHaveValue("pw");
+  });
+
+  it("a retry that confirms single sign-on keeps the email but drops the password behind the toggle", async () => {
+    answerOptions(() => HttpResponse.json({ detail: "boom" }, { status: 500 }));
+    const { client } = renderLogin();
+    await settled(client, "error");
+    await userEvent.type(screen.getByLabelText("Email"), "root@test");
+    await userEvent.type(screen.getByLabelText("Password"), "pw");
+    answerOptions(() => HttpResponse.json(OIDC_ON));
+    await userEvent.click(tryAgain()!);
+    await settled(client, "success");
+    await userEvent.click(await screen.findByRole("button", { name: "Administrator sign-in" }));
+    expect(screen.getByLabelText("Email")).toHaveValue("root@test");
+    expect(screen.getByLabelText("Password")).toHaveValue("");
   });
 });
 

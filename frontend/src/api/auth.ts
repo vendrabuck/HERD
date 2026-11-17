@@ -13,6 +13,16 @@ import { parseLoginOptions, parseOidcExchange, type OidcExchangeResult } from "@
 
 /** Public, every mode (ADR 0016); on the refresh interceptor's skip list. */
 export const LOGIN_OPTIONS_PATH = "/auth/login-options";
+/**
+ * The client-side limit on `GET /api/auth/login-options` (issue #1420). The
+ * route reads no database (IAM-OIDC-16), so an answer slower than this means
+ * auth is in trouble; the page then shows D10's fallback deliberately, with a
+ * Try again notice, instead of its pending state forever. Each Try again
+ * attempt gets the same limit. Kept well under the e2e helpers' waits for the
+ * form (Selenium `_do_login` 15 s, Playwright `pw_login` the 30 s action
+ * default), so a hung request still lets them find the fallback.
+ */
+export const LOGIN_OPTIONS_TIMEOUT_MS = 5000;
 /** The single sign-on handoff exchange (ADR 0016 D3); on the refresh interceptor's skip list. */
 export const OIDC_EXCHANGE_PATH = "/auth/oidc/exchange";
 
@@ -67,19 +77,29 @@ export function useLogin() {
 /**
  * `GET /api/auth/login-options`, validated by parseLoginOptions; a body that
  * is not a valid answer rejects like a failed request, so the page falls back
- * to today's form (ADR 0016 D10).
+ * to today's form (ADR 0016 D10). A request that has not answered within
+ * LOGIN_OPTIONS_TIMEOUT_MS is aborted and rejects the same way (issue #1420).
  */
 export async function getLoginOptions(): Promise<LoginOptions> {
-  const resp = await apiClient.get<unknown>(LOGIN_OPTIONS_PATH);
+  const resp = await withClientTimeout(LOGIN_OPTIONS_TIMEOUT_MS, (signal) =>
+    apiClient.get<unknown>(LOGIN_OPTIONS_PATH, { signal }),
+  );
   const options = parseLoginOptions(resp.data);
   if (!options) throw new Error("Unusable login options answer");
   return options;
 }
 
 /**
- * The active sign-in method for the login page. Not retried and not refetched
- * on focus: the page renders today's form until an answer arrives and on any
- * error, so a retry would only delay nothing.
+ * The active sign-in method for the login page. The page shows no sign-in
+ * method until this settles (issue #1420), so it settles as fast as it can:
+ * not retried (a failure is D10's fallback at once), and sent even while the
+ * browser reports itself offline (`networkMode: "always"`), because a paused
+ * query would keep the page pending with no request and so no timeout to end
+ * it. Never refetched in place, on window focus or on a network reconnect: a
+ * refetch of a query with no answer puts it back to pending, which would take
+ * D10's fallback form away from under a user filling it in. (TanStack Query
+ * already defaults `refetchOnReconnect` to false under `networkMode:
+ * "always"`; it is stated here so dropping the network mode cannot turn it on.)
  */
 export function useLoginOptions() {
   return useQuery({
@@ -87,6 +107,8 @@ export function useLoginOptions() {
     queryFn: getLoginOptions,
     retry: false,
     refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    networkMode: "always",
   });
 }
 

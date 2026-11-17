@@ -1,18 +1,21 @@
+import axios from "axios";
 import { http, HttpResponse } from "msw";
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { QueryClient, QueryClientProvider, focusManager } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, focusManager, onlineManager } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
 import { server } from "../mocks/server";
 import {
   LOGIN_OPTIONS_PATH,
+  LOGIN_OPTIONS_TIMEOUT_MS,
   OIDC_EXCHANGE_PATH,
   adoptSignInTokens,
   exchangeOidcHandoff,
   useLogin,
   useLoginOptions,
 } from "@/api/auth";
+import { LOGIN_TIMEOUT_MS } from "@/api/client";
 import { ACCESS_TOKEN_KEY, REFRESH_TOKEN_KEY, useAuthStore } from "@/stores/authStore";
 
 // ADR 0016 phase 4: the login-options read and the handoff exchange.
@@ -113,6 +116,82 @@ describe("useLoginOptions", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     } finally {
       focusManager.setFocused(undefined);
+    }
+    expect(calls).toBe(1);
+  });
+
+  it("is not refetched when the network reconnects", async () => {
+    let calls = 0;
+    server.use(
+      http.get("/api/auth/login-options", () => {
+        calls += 1;
+        return HttpResponse.json({ detail: "boom" }, { status: 500 });
+      }),
+    );
+    const { result } = renderHook(() => useLoginOptions(), { wrapper: makeWrapper(newClient()) });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(calls).toBe(1);
+    try {
+      act(() => {
+        onlineManager.setOnline(false);
+        onlineManager.setOnline(true);
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      onlineManager.setOnline(true);
+    }
+    expect(calls).toBe(1);
+    expect(result.current.isError).toBe(true);
+  });
+
+  it("gives up after LOGIN_OPTIONS_TIMEOUT_MS, 5 seconds, so a hung request reaches the fallback", async () => {
+    expect(LOGIN_OPTIONS_TIMEOUT_MS).toBe(5000);
+    // Under the e2e helpers' 15 s wait for the form, and the login's own limit.
+    expect(LOGIN_OPTIONS_TIMEOUT_MS).toBeLessThan(LOGIN_TIMEOUT_MS);
+    let arrived: () => void = () => {};
+    const reached = new Promise<void>((resolve) => {
+      arrived = resolve;
+    });
+    server.use(
+      http.get("/api/auth/login-options", () => {
+        arrived();
+        return new Promise<never>(() => {});
+      }),
+    );
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let result: { current: ReturnType<typeof useLoginOptions> };
+    try {
+      ({ result } = renderHook(() => useLoginOptions(), { wrapper: makeWrapper(newClient()) }));
+      await act(async () => {
+        await reached;
+      });
+      await act(() => vi.advanceTimersByTimeAsync(LOGIN_OPTIONS_TIMEOUT_MS - 1));
+      expect(result.current.isPending).toBe(true);
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      await act(() => vi.advanceTimersByTimeAsync(10));
+    } finally {
+      vi.useRealTimers();
+    }
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    // The client's own abort, not an answer: axios rejects with a cancel.
+    expect(axios.isCancel(result.current.error)).toBe(true);
+  });
+
+  it("is sent even while the browser reports itself offline, so the page never waits on a paused query", async () => {
+    let calls = 0;
+    server.use(
+      http.get("/api/auth/login-options", () => {
+        calls += 1;
+        return HttpResponse.json({ auth_method: "local", registration_open: true, password_login: true, sso: null });
+      }),
+    );
+    onlineManager.setOnline(false);
+    try {
+      const { result } = renderHook(() => useLoginOptions(), { wrapper: makeWrapper(newClient()) });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(result.current.fetchStatus).toBe("idle");
+    } finally {
+      onlineManager.setOnline(true);
     }
     expect(calls).toBe(1);
   });

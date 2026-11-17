@@ -1769,7 +1769,8 @@ once a save through the config service has made that file outrank the environmen
 `config.json` exists, whatever it names. On every deployment whose `AUTH_METHOD` is not
 `oidc`, the three single sign-on routes answer 404, and the only
 visible effects are `GET /login-options` and, driven by it, the login page dropping its
-Register link in LDAP mode (IAM-OIDC-24); a local-mode login page is unchanged. The flow
+Register link in LDAP mode (IAM-OIDC-24); a local-mode login page is unchanged once
+the answer arrives, and shows the pending state of IAM-OIDC-28 until then. The flow
 store and provisioning rules are IAM-OIDC-1 to IAM-OIDC-14 in section 4; the design is
 [ADR 0016](../design/0016-oidc-single-sign-on.md).
 
@@ -1889,22 +1890,25 @@ skip list).
   password form exactly when `password_login` is true, behind a collapsed
   `Administrator sign-in` disclosure (a button with `aria-expanded` and `aria-controls`)
   when `sso` is present too, and the Register link exactly when `registration_open` is
-  true, so LDAP mode shows no Register link. While the request is pending (it has no
-  client timeout, so a request that never answers keeps it pending; issue #1420), and on
-  any error (no answer, a 404 from a backend without the route, a 5xx, a body that is not
-  JSON, and a body that is not an object with boolean `password_login` and
-  `registration_open`, an `sso` that is null, absent, or a non-array object, and at
-  least one way to sign in), the page is exactly today's: the password form and the
-  Register link, so an OIDC-mode page shows the password form until its answer
-  arrives (#1420). The local-mode answer renders the same markup as that fallback and
-  keeps the same input elements. Behind the toggle the form's submit is a secondary
-  button, so the page has one primary action; everywhere else it stays primary. `auth_method` is not read for rendering. The
-  login-options read is not retried or refetched on window focus, and a 401 from it or from the handoff exchange
-  never starts a token refresh: the refresh interceptor's skip list matches the request
-  path's end against `/auth/refresh`, `/auth/login`, `/auth/logout`,
-  `/auth/login-options`, and `/auth/oidc/exchange`, each on its own. \
-  Enforced in: `frontend/src/lib/sso.ts` (`parseLoginOptions`, `loginPageView`, `LEGACY_LOGIN_VIEW`, `DEFAULT_SSO_PROVIDER_NAME`); `frontend/src/pages/LoginPage.tsx` (`LoginPage`); `frontend/src/api/auth.ts` (`useLoginOptions`, `getLoginOptions`, `LOGIN_OPTIONS_PATH`); `frontend/src/api/client.ts` (`REFRESH_SKIP_PATHS`, `skipsRefresh`) \
-  Pinned by: `frontend/src/test/lib/sso.test.ts` (`parseLoginOptions and loginPageView: the full input space`, `the backend's %s answer`, `refuses %s as an answer, so the page is today's`, `local mode renders exactly today's page`); `frontend/src/test/pages/LoginPageSso.test.tsx` (`keeps one primary action: the form's submit is secondary behind the toggle`, `leaves the submit primary wherever the form is not behind the toggle`, `local mode: today's form and the Register link, no single sign-on`, `LDAP mode: today's form with no Register link (registration answers 409 there)`, `OIDC mode, break-glass off: only the Sign in with button`, `OIDC mode, break-glass on: the button, and the password form behind a collapsed toggle`, `sso present %s, password_login %s, registration_open %s`, `renders today's page while the answer is pending`, `on %s renders byte-for-byte today's page`, `local mode's answer renders byte-for-byte today's page`, `LDAP mode's answer differs from today's page by the Register line alone`, `a local-mode answer keeps the same input elements, so a filled-in form survives it`, `is a collapsed disclosure that reveals the password form it controls`, `opens and closes from the keyboard, keeps focus on itself, and the form follows it in tab order`, `the form behind it signs in exactly like today's form`); `frontend/src/test/api/sso.test.tsx` (`errors on %s, and is not retried`, `is not refetched when the window regains focus`, `a 401 from it never triggers a token refresh`, `a 401 from it never triggers a token refresh, even with a stored session`); `frontend/src/test/api/client.test.ts` (`is exactly the sign-in, refresh, logout, login-options, and handoff exchange routes`, `a 401 from %s is passed through with no refresh`, `skipsRefresh(%s) is %s`, `a 401 from a route not on the list still refreshes and retries`)
+  true, so LDAP mode shows no Register link. On any failure with no answer confirmed
+  before it (no answer within the client timeout of IAM-OIDC-28, a 404 from a backend
+  without the route, a 5xx, a body that is not JSON, and a body that is not an object
+  with boolean `password_login` and `registration_open`, an `sso` that is null, absent,
+  or a non-array object, and at least one way to sign in), the page is exactly today's
+  (ADR 0016 D10): the password form and the Register link, under the failure notice of
+  IAM-OIDC-28. A confirmed answer stays up when a later background refetch fails. The
+  local-mode answer renders exactly that fallback's markup without the notice. Behind
+  the toggle the form's
+  submit is a secondary button, so the page has one primary action; everywhere else it
+  stays primary. `auth_method` is not read for rendering. The login-options read is not
+  retried and never refetched in place (not on window focus, not on a network
+  reconnect), so D10's fallback form stays put under a user filling it in, and a 401
+  from it or from the handoff exchange never starts a token refresh: the refresh
+  interceptor's skip list matches the request path's end against `/auth/refresh`,
+  `/auth/login`, `/auth/logout`, `/auth/login-options`, and `/auth/oidc/exchange`, each
+  on its own. \
+  Enforced in: `frontend/src/lib/sso.ts` (`parseLoginOptions`, `loginPageView`, `settledLoginPageView`, `LEGACY_LOGIN_VIEW`, `DEFAULT_SSO_PROVIDER_NAME`); `frontend/src/pages/LoginPage.tsx` (`LoginPage`); `frontend/src/api/auth.ts` (`useLoginOptions`, `getLoginOptions`, `LOGIN_OPTIONS_PATH`); `frontend/src/api/client.ts` (`REFRESH_SKIP_PATHS`, `skipsRefresh`) \
+  Pinned by: `frontend/src/test/lib/sso.test.ts` (`parseLoginOptions and loginPageView: the full input space`, `the backend's %s answer`, `refuses %s as an answer, so the page is today's`, `local mode renders exactly today's page`, `a failure with no confirmed answer is today's page (ADR 0016 D10)`, `a confirmed %s answer renders what it states, whether or not a later refetch failed`); `frontend/src/test/pages/LoginPageSso.test.tsx` (`keeps one primary action: the form's submit is secondary behind the toggle`, `leaves the submit primary wherever the form is not behind the toggle`, `local mode: today's form and the Register link, no single sign-on`, `LDAP mode: today's form with no Register link (registration answers 409 there)`, `OIDC mode, break-glass off: only the Sign in with button`, `OIDC mode, break-glass on: the button, and the password form behind a collapsed toggle`, `sso present %s, password_login %s, registration_open %s`, `on %s renders the failure notice above byte-for-byte today's page`, `today's page is the password form and the Register link, with no single sign-on`, `local mode's answer renders byte-for-byte today's page, without the failure notice`, `LDAP mode's answer differs from today's page by the Register line alone`, `today's page stays put under a user filling it in: no refetch on focus or on a network reconnect`, `a confirmed answer stays up when a background refetch fails`, `is a collapsed disclosure that reveals the password form it controls`, `opens and closes from the keyboard, keeps focus on itself, and the form follows it in tab order`, `the form behind it signs in exactly like today's form`); `frontend/src/test/api/sso.test.tsx` (`errors on %s, and is not retried`, `is not refetched when the window regains focus`, `is not refetched when the network reconnects`, `a 401 from it never triggers a token refresh`, `a 401 from it never triggers a token refresh, even with a stored session`); `frontend/src/test/api/client.test.ts` (`is exactly the sign-in, refresh, logout, login-options, and handoff exchange routes`, `a 401 from %s is passed through with no refresh`, `skipsRefresh(%s) is %s`, `a 401 from a route not on the list still refreshes and retries`)
 - **IAM-OIDC-25.** The `Sign in with` button starts single sign-on with one top-level
   navigation (`window.location.assign`, never a request from the page) to exactly
   `/api/auth/oidc/login`, with no query: no `next` in v1, so the backend's `/topology`
@@ -1945,6 +1949,31 @@ skip list).
   message. No token or server text is written to a URL, the console, or the page. \
   Enforced in: `frontend/src/pages/OidcCompletePage.tsx` (`OidcCompletePage`); `frontend/src/api/auth.ts` (`exchangeOidcHandoff`, `adoptSignInTokens`, `OIDC_EXCHANGE_PATH`); `frontend/src/lib/sso.ts` (`parseOidcExchange`, `SSO_COMPLETE_PATH`, `SSO_EXCHANGE_FAILED_PATH`); `frontend/src/lib/login.ts` (`safeReturnPath`); `frontend/src/routes.tsx` (`appRouteElements`) \
   Pinned by: `frontend/src/test/pages/OidcCompletePage.test.tsx` (`shows a status line while the exchange runs`, `posts {} once with credentials, stores the pair like a password login, and replaces itself with next`, `refetches the signed-in user, as a password login does`, `spends the handoff exactly once under StrictMode's double effect and on re-render`, `navigates only within the app: next %j lands on /topology`, `on %s stores nothing and shows the failed message on the login page`, `an exchange that never answers is given up after 15 seconds as a failure`, `writes no token to a URL or the console, on success or failure`, `a visitor already signed in is sent on by GuestGuard and spends no handoff`, `records the return path bound to the exchanged token's account, never to any account`, `an access token whose account cannot be read is a failure that stores nothing`, `the review's race: another tab signs in while the exchange is in flight; its late %s changes nothing`, `after the page unmounts, a late %s causes no navigation, no token adoption, and no toast`, `a return path the flow recorded for one account is not honored for another`, `on %s the page replaces itself: Back lands on the page before it and never re-posts`); `frontend/src/test/lib/sso.test.ts` (`replaces %s with /topology`, `refuses an answer with %s`, `the completion page is never a return path (it sits under GuestGuard)`); `frontend/src/test/api/sso.test.tsx` (`posts exactly {} as JSON, with credentials, and returns the tokens and a safe next`, `rejects on %s with no server text in the error`, `stores the pair in shared storage, signs the tab in, and refetches the current user`, `is what useLogin runs on success`); `frontend/src/test/routes.test.tsx` (`renders OidcCompletePage inside GuestGuard, outside AuthGuard and AppLayout`); `frontend/src/test/pages/pageScrollContainer.test.tsx` (`the outside-layout allowlist is exactly the pages the route table renders outside AppLayout`)
+- **IAM-OIDC-28.** Until the `GET /api/auth/login-options` request settles, the login
+  page renders no sign-in method (issue #1420): no password form, no `Sign in with`
+  button, no `Administrator sign-in` toggle, and no Register link. It shows the card's
+  header and version, the configuration link, and the unconfigured banner when the
+  config service reports the system unconfigured (IAM-UI-9), with placeholder bars (the
+  `Skeleton` component, hidden from assistive technology) in the form's place inside a
+  `role="status"` `aria-live="polite"` region whose text is `Loading sign-in
+  options...`; the bars take the local-mode form's height and Register line. The
+  request is aborted after `LOGIN_OPTIONS_TIMEOUT_MS` (5 s), which ends in IAM-OIDC-24's
+  fallback, today's page; it is sent even while the browser reports itself offline, so
+  the page never waits on a query paused with no request. The answer replaces the
+  pending state without moving focus. A second visit in the same page load renders an
+  answer the query already holds at once, with no pending state; a second visit after a
+  failure asks again and is pending until the answer. A signed-in visitor is sent on by
+  `GuestGuard` before the page mounts, so the request is never sent. A timeout counts as
+  a failure. When the page shows IAM-OIDC-24's fallback because the request failed
+  (never for a confirmed answer, local mode's included), a `role="alert"` notice above
+  the unchanged form says `Sign-in options could not be loaded.` and holds a `Try again`
+  button, which refetches: the page shows the pending state again, then the answer or
+  the fallback with the notice. Each attempt has the same 5 s limit, and repeated clicks
+  send one request. Text typed into the fallback form survives a retry that fails again
+  and one that confirms local or LDAP mode; a retry that confirms single sign-on keeps
+  the email and drops the password, so it does not reappear behind the toggle. \
+  Enforced in: `frontend/src/lib/sso.ts` (`settledLoginPageView`, `loginOptionsFailed`, `LOGIN_OPTIONS_FAILED_MESSAGE`); `frontend/src/pages/LoginPage.tsx` (`LoginPage`); `frontend/src/api/auth.ts` (`getLoginOptions`, `useLoginOptions`, `LOGIN_OPTIONS_TIMEOUT_MS`); `frontend/src/components/guards.tsx` (`GuestGuard`) \
+  Pinned by: `frontend/src/test/lib/sso.test.ts` (`settledLoginPageView: pending, answered, and failed`, `no answer and no failure yet is the pending state, null: no sign-in method at all`, `loginOptionsFailed: the notice shows only for a failure with no confirmed answer`, `is the exact wording`, `%s: notice shown is %s`); `frontend/src/test/pages/LoginPageSso.test.tsx` (`LoginPage while /login-options is pending (issue #1420)`, `renders no sign-in method while the answer is pending`, `announces the pending state as a polite status, with the placeholder bars hidden from assistive technology`, `keeps the header, the version, and the configuration link while pending`, `shows the unconfigured banner while pending: it depends on the config service, not on the method`, `%s: nothing before the answer, then exactly what it states`, `OIDC mode, %s: the password form and the Register link are never in the document, from first render to the answer`, `does not move focus when the answer arrives: a focused configuration link keeps it`, `a request that never answers ends in the failure notice and today's page at the client timeout, not before`, `a signed-in visitor is sent on by GuestGuard before the page asks which method is active`, `a second visit in the same page load renders the cached answer at once, with no pending state`, `a second visit after a failure asks again, pending until the answer`, `the failure notice and Try again (issue #1420 review)`, `%s shows the notice and a Try again button above today's form`, `a browser offline at load still sends the request; its failure shows the notice`, `Try again goes back to pending, then renders the confirmed OIDC answer: form and Register gone, the button present`, `Try again that fails again returns to today's page with the notice`, `repeated clicks on Try again send one request`, `each retry gets the same client limit: a retry that never answers ends in the notice again`, `text typed into today's form survives a retry that fails again`, `a retry that confirms local mode keeps the email and the password`, `a retry that confirms single sign-on keeps the email but drops the password behind the toggle`); `frontend/src/test/api/sso.test.tsx` (`gives up after LOGIN_OPTIONS_TIMEOUT_MS, 5 seconds, so a hung request reaches the fallback`, `is sent even while the browser reports itself offline, so the page never waits on a paused query`); `tests/e2e/test_login_pending_playwright.py` (`test_no_sign_in_method_renders_until_login_options_answers`, `test_an_oidc_answer_never_lets_the_password_form_render`, `test_a_login_options_request_that_never_answers_falls_back_to_the_password_form`); `tests/e2e/test_oidc_login_playwright.py` (`test_sign_in_with_dex_lands_signed_in_and_logout_returns_to_the_button`)
 
 **Out of scope.** The live and stack-level tests (phase 5a's live service suite against
 the Dex lab; phase 5b's integration, load, and browser tests against a stack whose auth
@@ -2169,7 +2198,7 @@ cap 20 per category; prune cadence 24 hours; bulk and batch caps 500.
 | Functional (through the service API) | `services/auth/tests/test_auth.py`, `test_user_profile_routes.py`, `test_groups.py`, `test_internal.py`, `test_ldap_sync.py`, `test_effective_role_http.py`, `test_auth_ldap.py`, `test_oidc_routes.py` (the single sign-on routes against a fake identity provider), `test_login_options.py`, `test_oidc_break_glass.py`, `test_password_hashing.py` (logins against stored legacy hashes), `test_password_input_validation.py` (the password rule and the 422 body at the real routes); `services/acl/tests/test_grants.py`, `test_internal.py`; the live suites `services/auth/tests/test_ldap_service_live.py` (real directory) and the real-Postgres suites `services/auth/tests/test_ldap_sync_service_live_pg.py` and `services/auth/tests/test_oidc_flow_service_live_pg.py` (the OIDC flow store and provisioning races) | The live-LDAP suite runs in the gates' live-LDAP phase; the Postgres suites in `_gate-pg-live-tests`. The single sign-on routes have unit and functional (fake provider, in-memory SQLite) tests only; the flow store and provisioning beneath them have Postgres-live tests, but no route is driven against a real Postgres yet, a gap open until ADR 0016 phases 5a and 5b add the live-provider, integration (running stack), load, and browser levels |
 | Integration (running stack) | `tests/integration/test_auth_flow.py`, `test_user_profile_flow.py`, `test_acl_flow.py`, `test_ldap_auth.py`, `test_ldap_sync_admin.py` | The LDAP ones run only in the gates' LDAP-mode phase |
 | Stress and load | `tests/load/locustfile.py` (every user logs in; `ACLChecker` exercises the check route; `NotificationUser` edits its own profile name) | No load test covers refresh, the token exchange, or a sync run |
-| Browser end-to-end | `tests/e2e/test_login.py`, `test_register_and_roles.py`, `test_roles_playwright.py`, `test_user_profile_playwright.py`, `test_admin_guard_redirect_playwright.py`, `test_user_groups_playwright.py`, `test_acl_grants_playwright.py`, `test_ldap_sync_admin_playwright.py`, `test_ldap_login.py` | Runs nightly and in the gates; the LDAP login tests are exempt skips on the local-mode gate stack. No browser test drives the OIDC-mode login page or `/login/sso` yet (ADR 0016 phase 5b); `test_login.py` pins the local-mode page, which `GET /login-options` now drives |
+| Browser end-to-end | `tests/e2e/test_login.py`, `test_register_and_roles.py`, `test_roles_playwright.py`, `test_user_profile_playwright.py`, `test_admin_guard_redirect_playwright.py`, `test_user_groups_playwright.py`, `test_acl_grants_playwright.py`, `test_ldap_sync_admin_playwright.py`, `test_ldap_login.py`, `test_login_pending_playwright.py`, `test_oidc_login_playwright.py` | Runs nightly and in the gates; the LDAP login tests are exempt skips on the local-mode gate stack, and `test_oidc_login_playwright.py` runs only in the gates' and nightly's OIDC stack phase (ADR 0016 phase 5b). `test_login.py` pins the local-mode page, which `GET /login-options` drives; `test_login_pending_playwright.py` holds that request in the browser to pin the pending state (IAM-OIDC-28) |
 
 Not run for this document: only the drift guard and the repository-root unit suite were
 run. The auth, acl, and common service suites, the live-LDAP and live-Postgres suites,
@@ -2179,10 +2208,15 @@ the integration suite, the frontend tests, and the browser suite were read, not 
 
 ### Open defects
 
-- Issue #1420, which blocks ADR 0016 phase 6: while `GET /api/auth/login-options` is
-  pending the login page renders today's page, password form included, and the request
-  has no client timeout, so an OIDC-mode page shows the password form until its answer
-  arrives, and indefinitely when the request hangs (IAM-OIDC-24).
+- Issue #1396: the identity provider's responses have no size bound, and its JWKS no
+  key-count bound (hardening before OIDC mode is supported).
+- Issue #1399: a first OIDC login that collides with an existing account has no
+  recovery path, so an `OIDC_ISSUER` change locks out every single sign-on user.
+- Issue #1400: visible Unicode look-alikes of an existing email are provisioned as
+  separate accounts.
+
+(#1420 is resolved by IAM-OIDC-28, #1403 by IAM-LDAP-12 and IAM-LDAP-13, and #1404 by
+IAM-LOGIN-6.)
 
 ### Limits by decision
 

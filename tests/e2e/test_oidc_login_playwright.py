@@ -35,7 +35,13 @@ import httpx
 import pytest
 from playwright.sync_api import expect
 
-from .conftest import HOST_BASE_URL, pw_api, pw_token
+from .conftest import (
+    HOST_BASE_URL,
+    pw_api,
+    pw_login_form_was_inserted,
+    pw_token,
+    pw_watch_login_page,
+)
 
 ISSUER = "http://oidc-test:5556/dex"
 PASSWORD = "oidc-test-password"
@@ -131,15 +137,19 @@ def _is_logout(response) -> bool:
 
 def _open_login_page(page):
     """The login page in OIDC mode, once the login-options answer has rendered:
-    the button, and neither the password form, its toggle, nor Register."""
+    the button, and neither the password form, its toggle, nor Register, which
+    were never inserted at all, from the first byte of the document (issue
+    #1420: the page renders no sign-in method while the answer is pending)."""
+    pw_watch_login_page(page)
     page.goto(f"{HOST_BASE_URL}/login")
     button = page.get_by_role("button", name=SIGN_IN_LABEL, exact=True)
     expect(button).to_be_visible()
-    # The answer has committed once the button shows (issue #1420: before it,
-    # the pending page renders the password form), so these hold from here on.
     expect(page.locator("#login-email")).to_have_count(0)
     expect(page.get_by_role("button", name="Administrator sign-in", exact=True)).to_have_count(0)
     expect(page.get_by_role("link", name="Register", exact=True)).to_have_count(0)
+    assert pw_login_form_was_inserted(page) is False, (
+        "the password form or the Register link was inserted before the OIDC answer rendered"
+    )
     return button
 
 

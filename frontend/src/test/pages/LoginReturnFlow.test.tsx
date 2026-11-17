@@ -71,6 +71,10 @@ beforeEach(() => {
   useAuthStore.setState({ accessToken: null, refreshToken: null, user: null, isAuthenticated: false });
   server.use(
     http.get("/api/config/status", () => HttpResponse.json({ configured: true })),
+    // The login page renders its form only once this answers (issue #1420).
+    http.get("/api/auth/login-options", () =>
+      HttpResponse.json({ auth_method: "local", registration_open: true, password_login: true, sso: null }),
+    ),
     http.post("/api/auth/login", () =>
       HttpResponse.json({ access_token: "T9", refresh_token: "R9" }),
     ),

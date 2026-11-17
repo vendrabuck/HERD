@@ -122,6 +122,10 @@ beforeEach(() => {
   usePreferencesStore.setState({ savedFilters: { inventory: { search: "alice" } }, loaded: true });
   server.use(
     http.get("/api/config/status", () => HttpResponse.json({ configured: true })),
+    // The login page renders its form only once this answers (issue #1420).
+    http.get("/api/auth/login-options", () =>
+      HttpResponse.json({ auth_method: "local", registration_open: true, password_login: true, sso: null }),
+    ),
     http.get("/api/reservations/:id", ({ request }) => {
       const token = (request.headers.get("Authorization") ?? "").replace("Bearer ", "");
       return tokenSubject(token) === "alice"

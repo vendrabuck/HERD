@@ -77,7 +77,12 @@ def registered_user(browser, base_url):
 def test_register_lands_on_login_page(registered_user, browser):
     """Submitting the registration form navigates to the login page."""
     assert "/login" in browser.current_url
-    assert browser.find_element(By.ID, "login-email").is_displayed()
+    # The form renders only once GET /api/auth/login-options answers (issue
+    # #1420), so wait for it rather than assume it is there on arrival.
+    email_input = WebDriverWait(browser, WAIT).until(
+        EC.visibility_of_element_located((By.ID, "login-email"))
+    )
+    assert email_input.is_displayed()
 
 
 def test_registered_user_can_login(registered_user, browser, base_url):
