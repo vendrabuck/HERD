@@ -5,6 +5,7 @@ import { ChevronRight, Wrench } from "lucide-react";
 import { useLogin, useLoginOptions } from "@/api/auth";
 import { useConfigStatus } from "@/api/config";
 import { Button } from "@/components/ui/Button";
+import { Skeleton } from "@/components/ui/Skeleton";
 import { APP_VERSION } from "@/lib/appVersion";
 import { cn } from "@/lib/cn";
 import { loginErrorText, returnPathFromState } from "@/lib/login";
@@ -12,7 +13,7 @@ import {
   SSO_ERROR_CANCELLED,
   SSO_ERROR_PARAM,
   SSO_LOGIN_URL,
-  loginPageView,
+  settledLoginPageView,
   ssoErrorMessage,
 } from "@/lib/sso";
 import { navigateTopLevel } from "@/lib/topLevelNavigation";
@@ -30,8 +31,10 @@ export function LoginPage() {
   const adminPanelId = useId();
   const { data: configStatus } = useConfigStatus();
   const loginOptions = useLoginOptions();
-  // ADR 0016 D10: pending and every error render today's page.
-  const view = loginPageView(loginOptions.isSuccess ? loginOptions.data : null);
+  // Issue #1420: null while the answer is pending, which renders no sign-in
+  // method at all; a confirmed answer renders what it states; a failure with
+  // no confirmed answer renders today's page (ADR 0016 D10).
+  const view = settledLoginPageView({ data: loginOptions.data, isError: loginOptions.isError });
 
   const isUnconfigured = configStatus && !configStatus.configured;
 
@@ -118,7 +121,7 @@ export function LoginPage() {
           "Sign in with" button; everywhere else it is today's primary. */}
       <Button
         type="submit"
-        variant={view.passwordForm === "toggle" ? "secondary" : "primary"}
+        variant={view?.passwordForm === "toggle" ? "secondary" : "primary"}
         disabled={login.isPending || !!isUnconfigured}
         aria-busy={login.isPending}
         className="w-full"
@@ -152,7 +155,33 @@ export function LoginPage() {
           </div>
         )}
 
-        {view.ssoLabel !== null && (
+        {view === null && (
+          // The pending state (issue #1420): no form, no single sign-on
+          // button, no Register link until the server says which apply. The
+          // bars take the place of today's form and Register line, so a
+          // local-mode answer does not move the card; the text is for screen
+          // readers, as the app's other loading regions are role="status".
+          <div role="status" aria-live="polite">
+            <span className="sr-only">Loading sign-in options...</span>
+            <div aria-hidden="true">
+              <div className="space-y-4">
+                <div>
+                  <Skeleton className="h-5 w-12 mb-1" />
+                  <Skeleton className="h-[38px]" />
+                  <Skeleton className="h-4 w-3/4 mt-1" />
+                </div>
+                <div>
+                  <Skeleton className="h-5 w-16 mb-1" />
+                  <Skeleton className="h-[38px]" />
+                </div>
+                <Skeleton className="h-9" />
+              </div>
+              <Skeleton className="h-5 w-1/2 mx-auto mt-4" />
+            </div>
+          </div>
+        )}
+
+        {view !== null && view.ssoLabel !== null && (
           <Button
             variant="primary"
             className="w-full break-words"
@@ -163,7 +192,7 @@ export function LoginPage() {
           </Button>
         )}
 
-        {view.passwordForm === "toggle" && (
+        {view?.passwordForm === "toggle" && (
           <div className="mt-4 border-t border-gray-200 pt-4">
             <button
               type="button"
@@ -184,9 +213,9 @@ export function LoginPage() {
           </div>
         )}
 
-        {view.passwordForm === "shown" && passwordForm}
+        {view?.passwordForm === "shown" && passwordForm}
 
-        {view.registerLink && (
+        {view?.registerLink && (
           <p className="text-center text-sm text-gray-500 mt-4">
             No account?{" "}
             <Link to="/register" className="text-blue-600 hover:underline font-medium">

@@ -57,10 +57,11 @@ export interface LoginPageView {
 }
 
 /**
- * Today's page (ADR 0016 D10): what renders while the answer is pending and on
- * ANY error (no answer, a 404 from a backend without the route, a 5xx, a body
+ * Today's page (ADR 0016 D10): what renders on ANY error (no answer within
+ * the client timeout, a 404 from a backend without the route, a 5xx, a body
  * that is not a valid answer). The backend enforces the mode regardless, so
- * this fallback widens nothing.
+ * this fallback widens nothing. It is NOT what renders while the answer is
+ * pending (issue #1420): see settledLoginPageView.
  */
 export const LEGACY_LOGIN_VIEW: LoginPageView = {
   ssoLabel: null,
@@ -106,8 +107,8 @@ export function parseLoginOptions(body: unknown): LoginOptions | null {
 }
 
 /**
- * The login page as a pure function of the parsed answer (null: pending or
- * any error, today's page). The SSO button renders exactly when `sso` is
+ * The login page as a pure function of the parsed answer (null: a failed
+ * request, today's page). The SSO button renders exactly when `sso` is
  * present; the password form exactly when `password_login` is true, behind
  * the toggle when `sso` is present too; the Register link exactly when
  * `registration_open` is true.
@@ -118,6 +119,31 @@ export function loginPageView(options: LoginOptions | null): LoginPageView {
   let passwordForm: LoginPageView["passwordForm"] = "none";
   if (options.password_login) passwordForm = ssoLabel ? "toggle" : "shown";
   return { ssoLabel, passwordForm, registerLink: options.registration_open };
+}
+
+/** The two facts of the login-options query the page decides from. */
+export interface LoginOptionsOutcome {
+  /** The last answer the server confirmed, kept by the query even when a later refetch failed. */
+  data: LoginOptions | undefined;
+  /** True once the request failed and no answer was ever confirmed beside it. */
+  isError: boolean;
+}
+
+/**
+ * What the login page renders, or null for the pending state, which shows
+ * no sign-in method at all (issue #1420): the page never renders a method the
+ * server has not confirmed, except D10's fallback after a failure.
+ * - A confirmed answer wins, even when a later background refetch failed:
+ *   the method it names is still the one the server stated.
+ * - With no confirmed answer, a failure is D10's fallback, today's page; a
+ *   refetch that is still running after it leaves the fallback up rather
+ *   than taking the form away again.
+ * - With neither, the request has not settled: null.
+ */
+export function settledLoginPageView({ data, isError }: LoginOptionsOutcome): LoginPageView | null {
+  if (data !== undefined) return loginPageView(data);
+  if (isError) return LEGACY_LOGIN_VIEW;
+  return null;
 }
 
 /** A successful `POST /api/auth/oidc/exchange`, validated. */

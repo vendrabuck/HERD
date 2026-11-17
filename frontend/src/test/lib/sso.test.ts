@@ -12,8 +12,10 @@ import {
   loginPageView,
   parseLoginOptions,
   parseOidcExchange,
+  settledLoginPageView,
   ssoErrorMessage,
 } from "@/lib/sso";
+import type { LoginOptions } from "@/types/auth.types";
 
 // ADR 0016 phase 4: the login page is a pure function of the
 // GET /api/auth/login-options answer, and today's page on anything else.
@@ -141,7 +143,7 @@ describe("parseLoginOptions and loginPageView: the full input space", () => {
     expect(LEGACY_LOGIN_VIEW).toEqual({ ssoLabel: null, passwordForm: "shown", registerLink: true });
   });
 
-  it("no answer yet, or an error, is today's page", () => {
+  it("a failed request (no parsed answer) is today's page", () => {
     expect(loginPageView(null)).toEqual(LEGACY_LOGIN_VIEW);
   });
 
@@ -188,6 +190,35 @@ describe("parseLoginOptions and loginPageView: the full input space", () => {
     expect(missing?.auth_method).toBeNull();
     expect(loginPageView(unknown)).toEqual(loginPageView(known));
     expect(loginPageView(missing)).toEqual(loginPageView(known));
+  });
+});
+
+// Issue #1420: the page never renders a sign-in method the server has not
+// confirmed, except D10's fallback after a failure.
+describe("settledLoginPageView: pending, answered, and failed", () => {
+  const OIDC: LoginOptions = {
+    auth_method: "oidc",
+    registration_open: false,
+    password_login: false,
+    sso: { provider_name: "Acme" },
+  };
+  const LDAP: LoginOptions = { auth_method: "ldap", registration_open: false, password_login: true, sso: null };
+
+  it("no answer and no failure yet is the pending state, null: no sign-in method at all", () => {
+    expect(settledLoginPageView({ data: undefined, isError: false })).toBeNull();
+  });
+
+  it("a failure with no confirmed answer is today's page (ADR 0016 D10)", () => {
+    expect(settledLoginPageView({ data: undefined, isError: true })).toBe(LEGACY_LOGIN_VIEW);
+  });
+
+  it.each([
+    ["OIDC", OIDC],
+    ["LDAP", LDAP],
+  ] as const)("a confirmed %s answer renders what it states, whether or not a later refetch failed", (_label, data) => {
+    expect(settledLoginPageView({ data, isError: false })).toEqual(loginPageView(data));
+    expect(settledLoginPageView({ data, isError: true })).toEqual(loginPageView(data));
+    expect(settledLoginPageView({ data, isError: true })).not.toEqual(LEGACY_LOGIN_VIEW);
   });
 });
 
