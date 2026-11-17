@@ -946,6 +946,48 @@ def pw_login(page, email: str = ADMIN_EMAIL, password: str = ADMIN_PASSWORD) -> 
     page.wait_for_url("**/topology**", wait_until="commit")
 
 
+# Issue #1420: what the login page must never insert before GET
+# /api/auth/login-options has confirmed it (the password form's fields and the
+# Register link). Read by pw_watch_login_page.
+_LOGIN_FORM_SELECTOR = "#login-email, #login-password, a[href='/register']"
+_LOGIN_FORM_WATCH_JS = (
+    "(() => {"
+    "  window.__herdLoginFormInserted = false;"
+    f"  const selector = {json.dumps(_LOGIN_FORM_SELECTOR)};"
+    "  new MutationObserver((records) => {"
+    "    for (const record of records) {"
+    "      for (const node of record.addedNodes) {"
+    "        if (node.nodeType === 1 && (node.matches(selector) || node.querySelector(selector))) {"
+    "          window.__herdLoginFormInserted = true;"
+    "        }"
+    "      }"
+    "    }"
+    "  }).observe(document, { childList: true, subtree: true });"
+    "})();"
+)
+_LOGIN_FORM_READ_JS = (
+    "() => new Promise((resolve) =>"
+    "  setTimeout(() => resolve(window.__herdLoginFormInserted === true), 0))"
+)
+
+
+def pw_watch_login_page(page) -> None:
+    """Record, from the first byte of every document `page` loads, whether the
+    password form or the Register link is EVER inserted, even when a later
+    render removes it (issue #1420). Call before `page.goto`; read the record
+    with pw_login_form_was_inserted. A MutationObserver installed by an init
+    script sees every insertion, so a flash between two auto-waits is caught,
+    which `to_have_count(0)` after the page settled cannot see."""
+    page.add_init_script(_LOGIN_FORM_WATCH_JS)
+
+
+def pw_login_form_was_inserted(page) -> bool:
+    """True when the current document inserted the password form or the
+    Register link at any point since it loaded (see pw_watch_login_page)."""
+    # Read on a later task, so the observer has had every queued record.
+    return bool(page.evaluate(_LOGIN_FORM_READ_JS))
+
+
 def pw_is_login_post(response) -> bool:
     """True for the response to `POST /api/auth/login` (the query string ignored)."""
     return response.request.method == "POST" and response.url.split("?", 1)[0].endswith(

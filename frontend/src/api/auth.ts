@@ -95,7 +95,9 @@ export async function getLoginOptions(): Promise<LoginOptions> {
  * query would keep the page pending with no request and so no timeout to end
  * it. Never refetched in place, on window focus or on a network reconnect: a
  * refetch of a query with no answer puts it back to pending, which would take
- * D10's fallback form away from under a user filling it in.
+ * D10's fallback form away from under a user filling it in. (TanStack Query
+ * already defaults `refetchOnReconnect` to false under `networkMode:
+ * "always"`; it is stated here so dropping the network mode cannot turn it on.)
  */
 export function useLoginOptions() {
   return useQuery({
