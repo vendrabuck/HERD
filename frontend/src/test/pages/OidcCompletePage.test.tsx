@@ -265,7 +265,8 @@ describe("OidcCompletePage (ADR 0016 phase 4)", () => {
     // The login page read the parameter and replaced it away.
     await waitFor(() => expect(screen.getByTestId("where")).toHaveTextContent(/^\/login REPLACE$/));
     expect(visited).toEqual(["/login/sso", "/login?sso_error=failed", "/login"]);
-    expect(screen.getByLabelText("Email")).toBeInTheDocument();
+    // The form renders once the login-options answer arrives (issue #1420).
+    expect(await screen.findByLabelText("Email")).toBeInTheDocument();
     expect(exchangeCalls).toHaveLength(1);
     expect(refreshCalls).toBe(0);
     expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBeNull();
