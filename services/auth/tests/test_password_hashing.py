@@ -55,10 +55,12 @@ def cheap_hashes(monkeypatch):
 
 
 # The highest cost the spy below actually computes: the cost of every hash HERD
-# writes. A check above it is recorded and answered False without running, so a
-# regression that lets a high-cost hash through (issue #1425) fails an assertion
-# in milliseconds instead of holding the test for hours.
-_SPY_MAX_COMPUTED_COST = 12
+# writes, read once at import, before any fixture monkeypatches BCRYPT_ROUNDS. A
+# check above it is recorded and answered False without running, so a regression
+# that lets a high-cost hash through (issue #1425) fails an assertion in
+# milliseconds instead of holding the test for hours. Tied to BCRYPT_ROUNDS so that
+# raising the cost of new hashes does not make the spy refuse the real ones.
+_SPY_MAX_COMPUTED_COST = passwords.BCRYPT_ROUNDS
 
 
 @pytest.fixture
