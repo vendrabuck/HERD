@@ -120,6 +120,30 @@ describe("useLoginOptions", () => {
     expect(calls).toBe(1);
   });
 
+  it("is not refetched when the network reconnects", async () => {
+    let calls = 0;
+    server.use(
+      http.get("/api/auth/login-options", () => {
+        calls += 1;
+        return HttpResponse.json({ detail: "boom" }, { status: 500 });
+      }),
+    );
+    const { result } = renderHook(() => useLoginOptions(), { wrapper: makeWrapper(newClient()) });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(calls).toBe(1);
+    try {
+      act(() => {
+        onlineManager.setOnline(false);
+        onlineManager.setOnline(true);
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      onlineManager.setOnline(true);
+    }
+    expect(calls).toBe(1);
+    expect(result.current.isError).toBe(true);
+  });
+
   it("gives up after LOGIN_OPTIONS_TIMEOUT_MS, 5 seconds, so a hung request reaches the fallback", async () => {
     expect(LOGIN_OPTIONS_TIMEOUT_MS).toBe(5000);
     // Under the e2e helpers' 15 s wait for the form, and the login's own limit.

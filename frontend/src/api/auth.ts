@@ -90,10 +90,12 @@ export async function getLoginOptions(): Promise<LoginOptions> {
 /**
  * The active sign-in method for the login page. The page shows no sign-in
  * method until this settles (issue #1420), so it settles as fast as it can:
- * not retried (a failure is D10's fallback at once), not refetched on focus,
- * and sent even while the browser reports itself offline (`networkMode:
- * "always"`), because a paused query would keep the page pending with no
- * request and so no timeout to end it.
+ * not retried (a failure is D10's fallback at once), and sent even while the
+ * browser reports itself offline (`networkMode: "always"`), because a paused
+ * query would keep the page pending with no request and so no timeout to end
+ * it. Never refetched in place, on window focus or on a network reconnect: a
+ * refetch of a query with no answer puts it back to pending, which would take
+ * D10's fallback form away from under a user filling it in.
  */
 export function useLoginOptions() {
   return useQuery({
@@ -101,6 +103,7 @@ export function useLoginOptions() {
     queryFn: getLoginOptions,
     retry: false,
     refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
     networkMode: "always",
   });
 }

@@ -1,7 +1,7 @@
 import { http, HttpResponse } from "msw";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, focusManager, onlineManager } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes, useLocation, useNavigationType } from "react-router-dom";
 import { StrictMode, type ReactNode } from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -518,24 +518,50 @@ describe("LoginPage after an answer or a failure (ADR 0016 D10, issue #1420)", (
     expect(page().innerHTML).toBe(expected.innerHTML);
   });
 
-  it("a form filled in on today's page survives a later local-mode answer, same input elements", async () => {
-    answerOptions(() => HttpResponse.json({ detail: "boom" }, { status: 500 }));
+  it("today's page stays put under a user filling it in: no refetch on focus or on a network reconnect", async () => {
+    let calls = 0;
+    answerOptions(() => {
+      calls += 1;
+      return HttpResponse.json({ detail: "boom" }, { status: 500 });
+    });
     const { client } = renderLogin();
     await settled(client, "error");
     const email = screen.getByLabelText("Email") as HTMLInputElement;
-    const password = screen.getByLabelText("Password") as HTMLInputElement;
     await userEvent.type(email, "u@test");
-    const held = heldOptions();
-    void client.refetchQueries({ queryKey: ["loginOptions"] });
-    await held.reached;
-    // A refetch after a failure leaves today's page up while it runs.
-    expect(screen.getByLabelText("Email")).toBe(email);
+    expect(email).toHaveFocus();
+    try {
+      act(() => {
+        onlineManager.setOnline(false);
+        onlineManager.setOnline(true);
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+      });
+      await flushPending();
+    } finally {
+      onlineManager.setOnline(true);
+      focusManager.setFocused(undefined);
+    }
+    // A refetch would have put the query back to pending and removed the form.
+    expect(calls).toBe(1);
     expect(screen.queryByRole("status")).toBeNull();
-    await held.release(LOCAL);
-    await settled(client, "success");
     expect(screen.getByLabelText("Email")).toBe(email);
-    expect(screen.getByLabelText("Password")).toBe(password);
+    expect(email).toHaveFocus();
     expect(email.value).toBe("u@test");
+  });
+
+  it("a second visit after a failure asks again, pending until the answer", async () => {
+    answerOptions(() => HttpResponse.json({ detail: "boom" }, { status: 500 }));
+    const first = renderLogin();
+    await settled(first.client, "error");
+    first.unmount();
+    const held = heldOptions();
+    renderLogin({ client: first.client });
+    await held.reached;
+    expect(presentControls()).toEqual(controlsShape({}));
+    expect(screen.getByRole("status")).toHaveTextContent("Loading sign-in options...");
+    await held.release(OIDC_OFF);
+    await settled(first.client, "success");
+    expect(presentControls()).toEqual(controlsShape({ sso: true }));
   });
 
   it("a confirmed answer stays up when a background refetch fails", async () => {

@@ -135,10 +135,12 @@ export interface LoginOptionsOutcome {
  * server has not confirmed, except D10's fallback after a failure.
  * - A confirmed answer wins, even when a later background refetch failed:
  *   the method it names is still the one the server stated.
- * - With no confirmed answer, a failure is D10's fallback, today's page; a
- *   refetch that is still running after it leaves the fallback up rather
- *   than taking the form away again.
- * - With neither, the request has not settled: null.
+ * - With no confirmed answer, a failure is D10's fallback, today's page.
+ * - With neither, the request has not settled: null. TanStack Query puts a
+ *   query with no data back to pending when it fetches again, so a refetch
+ *   after a failure is pending too; useLoginOptions never refetches in place
+ *   (no focus, reconnect, or retry refetch), so that happens only when the
+ *   page mounts again, never under a form the user is filling in.
  */
 export function settledLoginPageView({ data, isError }: LoginOptionsOutcome): LoginPageView | null {
   if (data !== undefined) return loginPageView(data);
