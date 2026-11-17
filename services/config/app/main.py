@@ -27,6 +27,7 @@ from app.config_store import (
     verify_password,
 )
 from app.docker_ctl import restart_services
+from app.validation_errors import install_validation_errors
 from app.version import add_version_route, service_version
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,10 @@ app = FastAPI(
     version=service_version(),
     lifespan=lifespan,
 )
+
+# Every 422 is rendered as {type, loc, msg}: never pydantic's input or ctx, so never
+# a submitted password, and never a 500 on a lone surrogate (app/validation_errors.py).
+install_validation_errors(app)
 
 # The wildcard origin is deliberate (this is the one service that does not use
 # herd_common's CORS helper). Credentials are never allowed: the config session

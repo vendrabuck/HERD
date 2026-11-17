@@ -253,7 +253,12 @@ def load_auth() -> dict:
     try:
         with open(AUTH_FILE) as f:
             loaded = json.load(f)
-    except (json.JSONDecodeError, OSError) as exc:
+    except (ValueError, RecursionError, OSError) as exc:
+        # ValueError covers JSONDecodeError, a byte that is not UTF-8
+        # (UnicodeDecodeError), and an integer over Python's digit limit;
+        # RecursionError is nesting deeper than the parser allows; OSError is an
+        # unreadable path, a directory included. MemoryError on a huge file is
+        # not handled.
         # Fail closed: do NOT regenerate the default here, that would silently
         # reset the admin password. Recovery is operator-driven: remove the
         # corrupt file and the missing-file branch above regenerates the default.
@@ -331,7 +336,8 @@ def load_config() -> dict:
     try:
         with open(CONFIG_FILE) as f:
             loaded = json.load(f)
-    except (json.JSONDecodeError, OSError) as exc:
+    except (ValueError, RecursionError, OSError) as exc:
+        # The same failures load_auth catches; the answer is the corrupt-file one.
         logger.warning("Ignoring corrupt config file %s: %s", CONFIG_FILE, exc)
         return {}
     if not isinstance(loaded, dict):

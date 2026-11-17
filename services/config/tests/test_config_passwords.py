@@ -784,3 +784,45 @@ def test_an_illegal_password_never_reaches_bcrypt(password, monkeypatch):
         config_store._hash_password(password)
     assert str(err.value) == config_store.password_problem(password)
     assert calls == []
+
+
+# -- The bound counts characters, not bytes or UTF-16 units (OPS-CONFIG-8) ---------
+# One key emoji is 1 character, 4 UTF-8 bytes, and 2 UTF-16 units, so a bound
+# counted in bytes or in UTF-16 units decides differently at both ends.
+_KEY = "\U0001f511"
+_BOUND_IN_CHARACTERS = {
+    "7_emoji_too_short": (_KEY * 7, 422, "Password must be at least 8 characters"),
+    "8_emoji": (_KEY * 8, 200, None),
+    "32_emoji": (_KEY * 32, 200, None),
+    "33_emoji_too_long": (_KEY * 33, 422, "Password must be at most 32 characters"),
+}
+
+
+@pytest.mark.parametrize(
+    ("password", "status", "detail"),
+    _BOUND_IN_CHARACTERS.values(),
+    ids=_BOUND_IN_CHARACTERS.keys(),
+)
+def test_new_password_problem_counts_characters(password, status, detail):
+    assert len(password.encode()) == 4 * len(password)
+    assert len(password.encode("utf-16-le")) == 4 * len(password)
+    assert config_store.new_password_problem(password) == detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("password", "status", "detail"),
+    _BOUND_IN_CHARACTERS.values(),
+    ids=_BOUND_IN_CHARACTERS.keys(),
+)
+async def test_change_password_bound_counts_characters_over_http(
+    password, status, detail, async_client
+):
+    headers = await _session(async_client)
+    resp = await _post_raw(
+        async_client, "/change-password", _json_body("new_password", password), headers
+    )
+    expected = {"detail": detail} if detail else {"message": "Password changed"}
+    assert (resp.status_code, resp.json()) == (status, expected)
+    login = await _post_raw(async_client, "/login", _json_body("password", password))
+    assert login.status_code == (200 if status == 200 else 401)

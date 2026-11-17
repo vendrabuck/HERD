@@ -809,3 +809,95 @@ class TestAuthFileNotAnObject:
         assert Path(path).read_text() == body
         login = await async_client.post("/login", json={"password": "newpass123"})
         assert login.status_code == 401
+
+
+# -- Every way json.load and open can fail on the two files (#1427 review) --------
+
+# Contents json.load refuses with something other than JSONDecodeError: a byte that
+# is not UTF-8 (UnicodeDecodeError), nesting deeper than the parser's recursion limit
+# (RecursionError), and an integer longer than Python's int digit limit (ValueError).
+# A directory where the file should be is an OSError. MemoryError on a huge file is
+# not handled (out of scope).
+_UNREADABLE_CONTENTS = {
+    "unparseable": b"{bad",
+    "not_utf8": b'{"password_hash": "\xff\xfe", "password_changed": true}',
+    "nested_too_deep": b"[" * 100_000,
+    "int_over_digit_limit": b"1" * 5000,
+    "is_a_directory": None,
+}
+
+
+def _write_unreadable(path: str, content: bytes | None) -> None:
+    if content is None:
+        os.mkdir(path)
+    else:
+        Path(path).write_bytes(content)
+
+
+def _snapshot(path: str):
+    return "<dir>" if os.path.isdir(path) else Path(path).read_bytes()
+
+
+@pytest.mark.parametrize("content", _UNREADABLE_CONTENTS.values(), ids=_UNREADABLE_CONTENTS.keys())
+class TestUnreadableFilesFailClosed:
+    def test_load_auth_raises_config_auth_error(self, content, tmp_config_dir):
+        _write_unreadable(os.path.join(tmp_config_dir, "config_auth.json"), content)
+        with pytest.raises(ConfigAuthError):
+            load_auth()
+        assert verify_password(CFG_PASSWORD) is False
+        assert is_password_changed() is False
+
+    def test_load_config_ignores_it(self, content, tmp_config_dir):
+        _write_unreadable(os.path.join(tmp_config_dir, "config.json"), content)
+        assert load_config() == {}
+
+    @pytest.mark.asyncio
+    async def test_every_route_fails_closed_on_an_unreadable_auth_file(
+        self, content, async_client, tmp_config_dir
+    ):
+        headers = await _session_headers(async_client)
+        path = os.path.join(tmp_config_dir, "config_auth.json")
+        os.remove(path)
+        _write_unreadable(path, content)
+        status_resp = await async_client.get("/status")
+        assert (status_resp.status_code, status_resp.json()) == (
+            200,
+            {"configured": False, "password_changed": False},
+        )
+        login = await async_client.post("/login", json={"password": CFG_PASSWORD})
+        assert (login.status_code, login.json()) == (401, {"detail": "Invalid password"})
+        put = await async_client.put(
+            "/settings", json={"values": _REQUIRED_VALUES}, headers=headers
+        )
+        assert (put.status_code, put.json()) == (403, {"detail": ROTATE_FIRST_DETAIL})
+        apply = await async_client.post("/apply", headers=headers)
+        assert (apply.status_code, apply.json()) == (403, {"detail": ROTATE_FIRST_DETAIL})
+        change = await async_client.post(
+            "/change-password", json={"new_password": "newpass123"}, headers=headers
+        )
+        assert (change.status_code, change.json()) == (503, {"detail": STORE_UNUSABLE_DETAIL})
+        assert _snapshot(path) == ("<dir>" if content is None else content)
+        assert not os.path.exists(os.path.join(tmp_config_dir, "config.json"))
+
+    @pytest.mark.asyncio
+    async def test_the_settings_routes_treat_an_unreadable_config_file_as_corrupt(
+        self, content, async_client, tmp_config_dir, monkeypatch
+    ):
+        # The existing corrupt-file answer: the editor shows the environment's values,
+        # and a save writes a new file (OPS-CONFIG-10).
+        monkeypatch.setenv("POSTGRES_USER", "env-user")
+        headers = await _session_headers(async_client)
+        path = os.path.join(tmp_config_dir, "config.json")
+        _write_unreadable(path, content)
+        get = await async_client.get("/settings", headers=headers)
+        assert get.status_code == 200
+        assert get.json()["values"]["POSTGRES_USER"] == "env-user"
+        status_resp = await async_client.get("/status")
+        assert status_resp.json() == {"configured": True, "password_changed": True}
+        if content is None:
+            return  # a directory cannot be replaced by a save; the read side is the point
+        put = await async_client.put(
+            "/settings", json={"values": _REQUIRED_VALUES}, headers=headers
+        )
+        assert (put.status_code, put.json()) == (200, {"message": "Configuration saved"})
+        assert load_config() == _REQUIRED_VALUES

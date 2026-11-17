@@ -456,7 +456,7 @@ config service cannot be reached, the form stays enabled and a sign-in goes to a
 usual (IAM-UI-9 in `identity-and-access.md`).
 
 **Surfaces.** `services/config/app/` (`main.py`, `config_store.py`, `auth.py`,
-`docker_ctl.py`, `config_schema.py`, `auth_rules.py`); the restarter,
+`docker_ctl.py`, `config_schema.py`, `auth_rules.py`, `validation_errors.py`); the restarter,
 `infra/restarter/restarter.py`, the one HERD container that holds the Docker socket
 ([ADR 0017](../design/0017-config-restart-without-the-docker-socket.md));
 `frontend/src/pages/ConfigPage.tsx` and `frontend/src/stores/configStore.ts`. The login page's use of `GET /status` is
@@ -520,7 +520,12 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   Enforced in: `services/config/app/main.py` (`login`); `services/config/app/auth.py` (`create_session_token`, `_EXPIRE_MINUTES`); `services/config/app/config_store.py` (`_password_bytes`, `_hash_password`, `_check_password`, `password_problem`, `BCRYPT_MAX_BYTES`, `BCRYPT_ROUNDS`) \
   Pinned by: `services/config/tests/test_config.py` (`test_login_success`, `test_login_wrong_password`); `services/config/tests/test_auth.py` (`test_create_session_token_round_trips`); `services/config/tests/test_config_passwords.py` (`test_every_legacy_decision_is_kept`, `test_two_passwords_match_exactly_when_their_first_72_utf8_bytes_match`, `test_bcrypt_never_receives_more_than_72_bytes`, `test_new_hashes_are_2b_at_cost_12`, `test_a_stored_legacy_hash_over_72_bytes_still_signs_in`, `test_change_password_to_32_multibyte_characters_then_sign_in`, `test_an_operator_password_over_72_bytes_seeds_and_verifies`, `test_eight_nuls_never_become_the_password_and_the_empty_password_never_signs_in`, `test_a_legacy_hash_of_a_password_with_a_nul_never_signs_in_with_a_nul_or_empty_password`, `test_a_legacy_nul_separated_hash_still_matches_its_shorter_twin`, `test_every_refused_nul_or_empty_password_has_a_different_bcrypt_twin`)
 - **OPS-CONFIG-7.** A present but unreadable auth file denies every login and is never
-  regenerated; removing the file is the operator's recovery. A file that parses but
+  regenerated; removing the file is the operator's recovery. Unreadable is every way
+  `open` and `json.load` can fail short of running out of memory: unparseable JSON, a
+  byte that is not UTF-8, nesting deeper than the parser allows, an integer over
+  Python's digit limit, and a path that cannot be opened or is a directory (the middle
+  three were a 500 on `/status`, login, save, and change-password before the issue
+  #1427 review). A file that parses but
   holds no usable hash (not an object, the key missing, not a string, or a value bcrypt
   cannot read) denies every login the same way, with a 401 and one ERROR log naming the
   class only, never the value (before issue #1355 most of these were a 500). That ERROR
@@ -534,7 +539,7 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   store is unusable; the config service log names the cause` and leaves the file as it
   was (before issue #1427 it was a 500). \
   Enforced in: `services/config/app/config_store.py` (`load_auth`, `verify_password`, `ConfigAuthError`, `_check_password`, `UNUSABLE_HASH_MESSAGE`, `STORE_UNUSABLE_DETAIL`); `services/config/app/main.py` (`config_store_unusable`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_verify_password_fails_closed`, `test_default_password_not_regenerated_on_corrupt`, `test_login_with_corrupt_auth_file`); `services/config/tests/test_config_passwords.py` (`test_an_unusable_auth_file_refuses_login_without_raising`, `test_login_against_an_unusable_auth_file_is_401_not_500`, `test_a_hostile_client_password_against_a_good_auth_file_never_blames_the_file`, `test_a_non_string_client_password_is_refused_by_the_schema_without_blaming_the_file`, `test_check_password_logs_nothing_for_a_hostile_password_and_a_good_hash`, `test_an_unusable_stored_hash_is_reported_exactly_once_whatever_the_password`, `test_a_change_password_that_is_refused_keeps_the_file_and_blames_nothing`, `test_a_hostile_password_never_matches_a_hash_of_the_empty_password`, `test_the_refused_set_is_the_non_strings_the_non_encodable_nul_and_empty`); `services/config/tests/test_config.py` (`test_load_auth_refuses_a_file_that_is_not_an_object`, `test_change_password_from_an_old_session_never_rewrites_an_unusable_file`)
+  Pinned by: `services/config/tests/test_config.py` (`test_verify_password_fails_closed`, `test_default_password_not_regenerated_on_corrupt`, `test_login_with_corrupt_auth_file`); `services/config/tests/test_config_passwords.py` (`test_an_unusable_auth_file_refuses_login_without_raising`, `test_login_against_an_unusable_auth_file_is_401_not_500`, `test_a_hostile_client_password_against_a_good_auth_file_never_blames_the_file`, `test_a_non_string_client_password_is_refused_by_the_schema_without_blaming_the_file`, `test_check_password_logs_nothing_for_a_hostile_password_and_a_good_hash`, `test_an_unusable_stored_hash_is_reported_exactly_once_whatever_the_password`, `test_a_change_password_that_is_refused_keeps_the_file_and_blames_nothing`, `test_a_hostile_password_never_matches_a_hash_of_the_empty_password`, `test_the_refused_set_is_the_non_strings_the_non_encodable_nul_and_empty`); `services/config/tests/test_config.py` (`test_load_auth_refuses_a_file_that_is_not_an_object`, `test_change_password_from_an_old_session_never_rewrites_an_unusable_file`, `test_load_auth_raises_config_auth_error`, `test_every_route_fails_closed_on_an_unreadable_auth_file`)
 - **OPS-CONFIG-8.** `POST /change-password` needs a session and a new password of 8 to 32
   characters, counted as code points, not bytes, and marks the password rotated. One
   character rule, `password_problem`, decides which strings can be a config password at
@@ -547,9 +552,10 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   characters`; then `Password must not contain a NUL character`; then `Password must be
   valid UTF-8 text`. Before these issues eight NULs were accepted (and then the empty
   password signed in), a lone surrogate was a 500, and the length refusals were a
-  validation list that echoed the password. \
+  validation list that echoed the password. A body whose `new_password` is missing or
+  not a string is OPS-CONFIG-30's validation list. \
   Enforced in: `services/config/app/main.py` (`change_password_endpoint`, `ChangePasswordRequest`); `services/config/app/config_store.py` (`password_problem`, `new_password_problem`, `change_password`, `_hash_password`, `InvalidPassword`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_change_password`, `test_change_password_too_short`, `test_change_password_too_long`, `test_change_password_unauthenticated`); `services/config/tests/test_config_passwords.py` (`test_change_password_refuses_an_illegal_password_without_echo_and_keeps_the_file`, `test_change_password_accepts_every_other_password_and_it_signs_in`, `test_password_problem_enumerates_the_space`, `test_every_legal_password_in_the_space_hashes_and_signs_in`, `test_new_password_problem_checks_the_bound_in_characters_then_the_rule`, `test_an_illegal_password_never_reaches_bcrypt`)
+  Pinned by: `services/config/tests/test_config.py` (`test_change_password`, `test_change_password_too_short`, `test_change_password_too_long`, `test_change_password_unauthenticated`); `services/config/tests/test_config_passwords.py` (`test_change_password_refuses_an_illegal_password_without_echo_and_keeps_the_file`, `test_change_password_accepts_every_other_password_and_it_signs_in`, `test_password_problem_enumerates_the_space`, `test_every_legal_password_in_the_space_hashes_and_signs_in`, `test_new_password_problem_checks_the_bound_in_characters_then_the_rule`, `test_an_illegal_password_never_reaches_bcrypt`, `test_new_password_problem_counts_characters`, `test_change_password_bound_counts_characters_over_http`)
 - **OPS-CONFIG-9.** `PUT /settings` and `POST /apply` answer 403 `Change the config
   password before modifying or applying configuration` until the password is rotated,
   read on every request as OPS-CONFIG-4 reads it: a session issued before the auth file
@@ -559,9 +565,13 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   Pinned by: `services/config/tests/test_config.py` (`test_put_settings_locked_until_rotated`, `test_apply_locked_until_rotated`, `test_write_allowed_with_operator_password`, `test_a_session_from_before_the_file_changed_cannot_write_or_apply`)
 - **OPS-CONFIG-10.** `GET /schema` lists the editable fields to anyone; `GET /settings`
   needs a session and answers the environment values overlaid by the file's values,
-  limited to the schema's keys, with every non-empty secret field shown as `********`. \
-  Enforced in: `services/config/app/main.py` (`get_schema`, `get_settings`, `SCHEMA_KEYS`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_schema`, `test_get_settings_includes_env_values_when_no_file`, `test_get_settings_file_overrides_env`, `test_get_settings_redacts_env_secrets`, `test_settings_unauthenticated`, `test_get_settings_answers_schema_keys_only`)
+  limited to the schema's keys, with every non-empty secret field shown as `********`.
+  A `config.json` that is not a JSON object, or that OPS-CONFIG-7 would call unreadable,
+  is logged at WARNING and read as empty: the editor shows the environment's values and
+  a save writes a new file (the non-UTF-8, too-deep, and over-long-integer cases were a
+  500 on `GET /settings` and `PUT /settings` before the issue #1427 review). \
+  Enforced in: `services/config/app/main.py` (`get_schema`, `get_settings`, `SCHEMA_KEYS`); `services/config/app/config_store.py` (`load_config`) \
+  Pinned by: `services/config/tests/test_config.py` (`test_schema`, `test_get_settings_includes_env_values_when_no_file`, `test_get_settings_file_overrides_env`, `test_get_settings_redacts_env_secrets`, `test_settings_unauthenticated`, `test_get_settings_answers_schema_keys_only`, `test_get_settings_with_corrupt_config_file`, `test_load_config_ignores_it`, `test_the_settings_routes_treat_an_unreadable_config_file_as_corrupt`)
 - **OPS-CONFIG-11.** A secret field sent back as `********` keeps the file's value, else
   the environment's; with neither it is dropped, and the placeholder itself is never
   written. \
@@ -731,6 +741,22 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   service log names the one-time fix` with the remedy logged again, never a 500. \
   Enforced in: `services/config/Dockerfile` (`appuser`); `services/config/app/config_store.py` (`data_dir_writable`, `data_dir_remedy`, `DATA_DIR_NOT_WRITABLE_DETAIL`, `DataDirNotWritable`, `load_auth`, `is_password_changed`); `services/config/app/main.py` (`lifespan`, `data_dir_not_writable`) \
   Pinned by: `services/config/tests/test_data_dir.py` (`test_the_remedy_names_the_directory_the_uid_and_the_command`, `test_a_read_only_directory_is_not_writable`, `test_one_read_only_file_makes_the_directory_not_writable`, `test_startup_logs_one_error_line_and_skips_the_bootstrap`, `test_startup_on_a_writable_directory_logs_no_error_and_bootstraps`, `test_reads_are_served_from_a_read_only_directory`, `test_status_with_no_auth_file_on_a_read_only_directory_generates_nothing`, `test_a_refused_write_is_503_with_the_fixed_detail`, `test_a_first_login_that_cannot_write_the_auth_file_is_503`); `tests/unit/test_dockerfile_users.py` (`test_the_image_runs_as_a_non_root_user_unless_exempt`)
+- **OPS-CONFIG-30.** No 422 the config service answers carries pydantic's `input` or
+  `ctx`: each validation error is rendered as exactly `{type, loc, msg}`, the shape the
+  config service's OpenAPI document advertises, and any lone surrogate in `loc` or `msg`
+  is replaced with U+FFFD, so the body always encodes and the 422 never becomes a 500.
+  So no 422 holds a submitted password, for every way a login or change-password body
+  can fail (the field missing, misspelled, a number, a list, an object, a lone
+  surrogate, a body that is not an object or not JSON): each error a password field
+  raises has fixed text, and which strings may become the password is OPS-CONFIG-8's
+  fixed-string 422. It is not a promise that no submitted text appears: `msg` is the
+  validator's own text and could quote part of a value, and `loc` names the keys the
+  caller sent. The handler is a standalone copy of the auth service's (IAM-HASH-9),
+  because the config service imports neither `herd_common` nor auth; before it, `{"password":
+  ["\ud800"]}` on login and `{"np": "abcdefg\ud800"}` on change-password were 500s and
+  every other refusal echoed its input. \
+  Enforced in: `services/config/app/validation_errors.py` (`validation_error_handler`, `render_validation_errors`, `install_validation_errors`, `restrict_validation_error_schema`, `RENDERED_KEYS`); `services/config/app/main.py` (`app`) \
+  Pinned by: `services/config/tests/test_validation_errors.py` (`test_the_handler_is_installed_for_request_validation_errors`, `test_the_handler_keeps_type_loc_msg_and_drops_input_ctx_and_everything_else`, `test_the_handler_replaces_a_lone_surrogate_in_loc_and_msg_and_keeps_integers`, `test_the_handler_keeps_honest_non_ascii_text_unchanged`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_every_rendered_error_has_exactly_the_advertised_keys`, `test_login_never_echoes_the_password`, `test_change_password_never_echoes_the_password`, `test_save_settings_never_echoes_a_secret_in_a_malformed_body`, `test_the_review_inputs_are_a_clean_422`)
 
 **Out of scope.** The superadmin seed that reads `SUPERADMIN_*` (`identity-and-access.md`,
 IAM-BOOT-1 to IAM-BOOT-5); the meaning of each field (each area's Configuration section).
@@ -1585,7 +1611,8 @@ CLI documentation guard (OPS-NATS-14).
 | 400 | `No configuration to apply` | config apply with no `config.json` | OPS-CONFIG-15 |
 | 200 | `{"restarted": [...], "errors": [...]}` | config apply; failures are entries in `errors` | OPS-CONFIG-13, OPS-CONFIG-16, OPS-CONFIG-24 |
 | 503 | `The config data directory is not writable; the config service log names the one-time fix` | a config write (login's first auth file, change-password, save) the data directory refuses | OPS-CONFIG-29 |
-| 503 | `The config password store is unusable; the config service log names the cause` | a config change-password while the auth file is unreadable or not a JSON object | OPS-CONFIG-7 |
+| 503 | `The config password store is unusable; the config service log names the cause` | a config change-password, from a session issued earlier, while the auth file is unreadable or not a JSON object, or while there is no auth file and `CONFIG_ADMIN_PASSWORD` holds a value OPS-CONFIG-8's rule refuses | OPS-CONFIG-7, OPS-CONFIG-5 |
+| 422 | validation list, each item exactly `{type, loc, msg}` | a config login, change-password, or save body that is not the documented shape (a field missing or of the wrong type, a body that is not a JSON object) | OPS-CONFIG-30 |
 | 409 | `A restart is already in progress` | a restarter `POST /restart` while another runs | OPS-CONFIG-27 |
 | 404 | `Not found` | a restarter request to any path but `/restart` and `/health` | OPS-CONFIG-25 |
 | 405 | `Method not allowed`, with `Allow` | a restarter request to `/restart` with a method other than POST, or to `/health` with one other than GET | OPS-CONFIG-25 |
