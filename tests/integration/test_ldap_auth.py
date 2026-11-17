@@ -127,6 +127,21 @@ async def test_ldap_unknown_user_returns_401(base_url):
     assert (resp.status_code, resp.json()) == (401, {"detail": "Invalid credentials"})
 
 
+async def test_ldap_user_with_a_100_character_password_signs_in(base_url):
+    """Issue #1404: in LDAP mode the login password goes to the directory, not
+    to bcrypt, so the 72-character bound of local mode does not apply. The user
+    is uid=ldapit-longpass (infra/ldap-test/ldif/70-seed-integration.ldif); the
+    module-scoped cleanup deletes its JIT-provisioned row with the others."""
+    long_password = ("long-passphrase-" * 7)[:100]
+    async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+        resp = await client.post(
+            f"{base_url}/auth/login",
+            json={"email": "ldapit-longpass", "password": long_password},
+        )
+    assert resp.status_code == 200, resp.text
+    assert "access_token" in resp.json()
+
+
 async def test_ldap_login_provisions_ldap_user(base_url):
     """After login, /auth/me confirms the JIT-provisioned identity's email
     and username, and a direct Postgres read-back confirms auth_source='ldap'

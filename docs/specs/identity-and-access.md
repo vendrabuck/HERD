@@ -327,7 +327,7 @@ Auth service:
 |---|---|---|---|---|
 | GET | `/login-options` | anyone, unauthenticated; every mode | 200 | IAM-OIDC-16 |
 | POST | `/register` | anyone, unauthenticated; local mode only | 201 | IAM-REG-1 to IAM-REG-6, IAM-PROFILE-9 |
-| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-5, IAM-LDAP-1 to IAM-LDAP-12, IAM-OIDC-21 |
+| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-6, IAM-LDAP-1 to IAM-LDAP-12, IAM-OIDC-21 |
 | GET | `/oidc/login` | anyone, unauthenticated; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-17 |
 | GET | `/oidc/callback` | anyone holding the `herd_oidc_flow` cookie; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-18, IAM-OIDC-19 |
 | POST | `/oidc/exchange` | anyone holding the `herd_oidc_handoff` cookie; OIDC mode only, else 404 | 200 | IAM-OIDC-15, IAM-OIDC-20 |
@@ -471,8 +471,8 @@ short-lived access token and a refresh token.
   is 12 for every hash HERD wrote and never above 14 (IAM-HASH-4, IAM-HASH-5). \
   Enforced in: `services/auth/app/services/auth_service.py` (`_authenticate_local`, `_DUMMY_HASH`); `services/auth/app/services/passwords.py` (`verify_password`, `DUMMY_HASH`) \
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_every_local_login_answer_costs_one_bcrypt_at_the_configured_cost`, `test_the_dummy_hash_has_the_ident_and_cost_of_every_new_hash`)
-- **IAM-LOGIN-3.** The login identifier is 1 to 255 characters and the password at most
-  72. \
+- **IAM-LOGIN-3.** The login identifier is 1 to 255 characters. The password bound is
+  IAM-LOGIN-6. \
   Enforced in: `services/auth/app/schemas/auth.py` (`LoginRequest`) \
   Pinned by: none
 - **IAM-LOGIN-4.** A successful login answers `{access_token, refresh_token,
@@ -485,7 +485,21 @@ short-lived access token and a refresh token.
   `verify_password` and is the 401 of IAM-HASH-3; LDAP mode passes the password to the
   directory as before. \
   Enforced in: `services/auth/app/schemas/auth.py` (`LoginRequest`); `services/auth/app/validation_errors.py` (`validation_error_handler`) \
-  Pinned by: `services/auth/tests/test_password_input_validation.py` (`test_login_with_a_lone_surrogate_is_422_string_unicode`, `test_login_with_a_nul_stays_401`, `test_login_schema_still_takes_a_nul_so_login_answers_401`)
+  Pinned by: `services/auth/tests/test_password_input_validation.py` (`test_login_with_a_lone_surrogate_is_422_string_unicode`, `test_login_with_a_nul_stays_401`, `test_login_schema_still_takes_a_nul_so_login_answers_401`); `services/auth/tests/test_login_password_bound.py` (`test_a_long_lone_surrogate_is_string_unicode_in_every_mode`, `test_ldap_mode_still_passes_a_nul_to_the_directory`)
+- **IAM-LOGIN-6.** The login password bound is the bound of the mode that judges the
+  password (issue #1404), read from the live `AUTH_METHOD` when the request arrives: at
+  most 72 characters in local mode and for the OIDC break-glass login, which check a
+  bcrypt hash (registration's bound, IAM-REG-2), and at most 1024 characters in LDAP
+  mode, where every login, a local account's included, goes to the directory and is
+  never hashed (IAM-LDAP-1). The LDAP bound is only a ceiling on the request: 1024
+  characters are at most 4096 UTF-8 bytes, the most hashing takes (IAM-HASH-3), and
+  the password reaches the directory unchanged. A longer password is the 422
+  `string_too_long` at `["body", "password"]` with `String should have at most <N>
+  characters`, N the mode's bound, and never reaches the judge; past 1024 characters
+  every mode names 1024, the schema's ceiling, which runs first. The bound counts
+  characters, not bytes. \
+  Enforced in: `services/auth/app/schemas/auth.py` (`LoginRequest`, `login_password_max_length`, `PASSWORD_MAX_LENGTH`, `LDAP_LOGIN_PASSWORD_MAX_LENGTH`) \
+  Pinned by: `services/auth/tests/test_login_password_bound.py` (`test_every_mode_has_its_judges_bound`, `test_the_ldap_bound_never_exceeds_the_hashing_bound`, `test_ldap_mode_passes_a_long_password_to_the_directory_unchanged`, `test_ldap_mode_takes_1024_four_byte_characters`, `test_ldap_mode_refuses_past_1024_before_the_directory`, `test_local_mode_refuses_73_with_the_unchanged_422_before_bcrypt`, `test_local_mode_past_1024_is_refused_at_the_ceiling_of_every_mode`, `test_local_mode_signs_in_with_72`, `test_local_mode_422_matches_registrations`, `test_oidc_break_glass_refuses_73_before_bcrypt`, `test_oidc_break_glass_takes_72`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_long_password_reaches_the_directory_unchanged`, `test_login_endpoint_accepts_a_100_character_directory_password`); `tests/integration/test_ldap_auth.py` (`test_ldap_user_with_a_100_character_password_signs_in`)
 
 **Out of scope.** Rate limiting and lockout after failed attempts do not exist.
 
@@ -1512,12 +1526,13 @@ page and the `/login/sso` page are in section 8.19.
   15 s client timeout `LOGIN_TIMEOUT_MS`), a 404 (the gateway's answer while auth is
   down), and any 5xx (LDAP mode's 503 for a directory that cannot be asked, IAM-LDAP-12,
   included) show `Could not reach HERD. Try again in a moment.`; a 422 names the
-  length limits of IAM-LOGIN-3; a 429 shows `Too many sign-in attempts.` with the
+  length limits of IAM-LOGIN-3 and IAM-LOGIN-6, both password bounds, since the page
+  cannot tell which mode judged it; a 429 shows `Too many sign-in attempts.` with the
   `Retry-After` wait when it is a whole number of seconds; any other status shows
   `Sign-in failed with an unexpected answer. Try again in a moment.` Auth itself answers a
   login with no 429 and no 403 (IAM-LOGIN-1). \
   Enforced in: `frontend/src/pages/LoginPage.tsx` (`LoginPage`); `frontend/src/lib/login.ts` (`loginErrorText`); `frontend/src/api/auth.ts` (`useLogin`); `frontend/src/api/client.ts` (`LOGIN_TIMEOUT_MS`, `withClientTimeout`) \
-  Pinned by: `frontend/src/test/pages/LoginPage.test.tsx` (`shows the unconfigured banner and disables fields when configured=false`, `toasts an error when login is rejected`, `a network error says HERD is unreachable`, `a login that never answers is given up after 15 seconds and says HERD is unreachable`, `a 422 names the length limits instead of the credentials`, `a 429 says to wait, with the Retry-After seconds`, `a 403 gets the unexpected-answer wording, never the server's text`); `frontend/src/test/lib/login.test.ts` (`calls only a 401 a credential refusal`, `gives a 429 the rate-limit wording, with the wait when Retry-After is whole seconds`)
+  Pinned by: `frontend/src/test/pages/LoginPage.test.tsx` (`shows the unconfigured banner and disables fields when configured=false`, `toasts an error when login is rejected`, `a network error says HERD is unreachable`, `a login that never answers is given up after 15 seconds and says HERD is unreachable`, `a 422 names the length limits instead of the credentials`, `a 429 says to wait, with the Retry-After seconds`, `a 403 gets the unexpected-answer wording, never the server's text`); `frontend/src/test/lib/login.test.ts` (`calls only a 401 a credential refusal`, `names both password bounds on a 422, since the page cannot tell which mode judged it`, `gives a 429 the rate-limit wording, with the wait when Retry-After is whole seconds`)
 - **IAM-UI-10.** Registration success sends the user to `/login`; a failure shows the
   server's detail. \
   Enforced in: `frontend/src/pages/RegisterPage.tsx` (`RegisterPage`) \
@@ -1949,7 +1964,8 @@ it on the pre-#1355 commit, is replayed by the tests
   refused password there is a 422 (IAM-REG-2); the seed fails startup with the
   ValueError. A login with a NUL is the 401 `Invalid credentials` (under passlib it was
   a 500); a login with a lone surrogate never reaches the check (IAM-LOGIN-5), and no
-  request password reaches 4096 bytes within the 72-character bounds. \
+  password a request sends to hashing reaches 4096 bytes: registration, local login,
+  and the break-glass login take at most 72 characters (IAM-REG-2, IAM-LOGIN-6). \
   Enforced in: `services/auth/app/services/passwords.py` (`validate_password`, `_encoded_password`, `_password_bytes`, `MAX_PASSWORD_BYTES`) \
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_a_refused_password_never_hashes`, `test_a_refused_password_is_false_after_one_dummy_check`, `test_a_refused_password_against_a_good_hash_logs_nothing`, `test_4096_bytes_is_still_accepted`, `test_a_password_passlib_refused_to_hash_is_still_refused`, `test_a_login_with_a_nul_password_is_401_not_500`); `services/auth/tests/test_password_input_validation.py` (`test_validate_password_refuses_a_nul_anywhere_with_the_pinned_message`, `test_validate_password_refuses_the_rest_with_a_message_that_holds_no_input`, `test_validate_password_returns_an_honest_password_unchanged`); `services/auth/tests/test_main.py` (`test_seed_superadmin_refuses_a_password_hashing_refuses`)
 - **IAM-HASH-4.** A stored hash is usable when it reads `$<ident>$<cost>$` followed by a
@@ -2008,7 +2024,7 @@ it on the pre-#1355 commit, is replayed by the tests
 **Out of scope.** The config service's own password is in
 `operations-and-observability.md` (OPS-CONFIG-6); the cost ceiling of IAM-HASH-4 is
 auth's only, and the config service's check has none (issue #1425). LDAP mode never hashes: the password
-goes to the directory (IAM-LDAP-1), and its 72-character bound is issue #1404.
+goes to the directory (IAM-LDAP-1), with a login bound of 1024 characters (IAM-LOGIN-6).
 
 ## 9. Errors
 
@@ -2059,7 +2075,7 @@ password, though `msg` and `loc` can quote part of an email, a UUID, or a key na
 | 409 | `Directory sync requires auth_method=ldap` | sync-now outside LDAP mode | IAM-SERIAL-2 |
 | 409 | `A sync run is already in progress`, `A sync run is already in progress on another replica` | sync-now while a run holds the slot | IAM-SERIAL-1 |
 | 409 | `This grant already exists` | duplicate grant | IAM-ACL-2 |
-| 422 | validation list | registration, login, profile, group, bulk, mapping, token, grant, or check body out of bounds; a registration password holding a NUL or a lone surrogate, or a login password holding a lone surrogate; a profile body with a key other than the three profile fields, or a null or empty `full_name`; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-PROFILE-3, IAM-PROFILE-4, IAM-PROFILE-5, IAM-LOGIN-3, IAM-LOGIN-5, IAM-HASH-9, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2 |
+| 422 | validation list | registration, login, profile, group, bulk, mapping, token, grant, or check body out of bounds; a registration password holding a NUL or a lone surrogate, or a login password holding a lone surrogate; a profile body with a key other than the three profile fields, or a null or empty `full_name`; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-PROFILE-3, IAM-PROFILE-4, IAM-PROFILE-5, IAM-LOGIN-3, IAM-LOGIN-5, IAM-LOGIN-6, IAM-HASH-9, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2 |
 | 422 | `group_dn does not resolve in the directory` | mapping DN proven absent | IAM-MAP-3 |
 | 503 | `Directory unavailable, credentials not checked` | LDAP-mode login while the directory cannot be asked | IAM-LDAP-12 |
 | 503 | `Directory unavailable, mapping not validated` | mapping create while the directory cannot be asked | IAM-MAP-3 |
@@ -2181,7 +2197,7 @@ the integration suite, the frontend tests, and the browser suite were read, not 
 ### Rules with no test
 
 - IAM-SESSION-1: refresh token storage as a hash and its lifetime.
-- IAM-LOGIN-3: the login identifier and password bounds.
+- IAM-LOGIN-3: the login identifier bound.
 - IAM-HASH-7: hashing on the event loop (by decision, unchanged from passlib).
 - IAM-LDAP-11: the username fallback to the typed login name.
 - IAM-JWT-1: the claim set and lifetime of a login access token.

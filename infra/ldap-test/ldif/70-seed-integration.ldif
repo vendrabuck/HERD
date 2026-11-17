@@ -52,6 +52,20 @@ sn: Eng3
 mail: ldapit-eng3@company.local
 userPassword: Password1
 
+# Issue #1404: a directory password longer than bcrypt's 72 bytes. In LDAP
+# mode the login password goes to the directory, never to bcrypt, so this
+# user signs in with all 100 characters. The password is
+# ("long-passphrase-" * 7)[:100]; the live suite and the stack integration
+# test build it the same way. Kept before cn=herd-it-eng, which must stay the
+# last entry (the healthcheck probes it).
+dn: uid=ldapit-longpass,ou=people,dc=company,dc=local
+objectClass: inetOrgPerson
+uid: ldapit-longpass
+cn: Integration Long Password
+sn: Longpass
+mail: ldapit-longpass@company.local
+userPassword: long-passphrase-long-passphrase-long-passphrase-long-passphrase-long-passphrase-long-passphrase-long
+
 dn: cn=herd-it-eng,ou=groups,dc=company,dc=local
 objectClass: groupOfNames
 cn: herd-it-eng

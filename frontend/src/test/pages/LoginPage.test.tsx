@@ -217,7 +217,7 @@ describe("LoginPage failure messages (issue #1333)", () => {
       HttpResponse.json({ detail: [{ msg: "too long" }] }, { status: 422 }),
     );
     expect(text).toBe(
-      "HERD could not accept these sign-in details. The email or username can be at most 255 characters and the password at most 72.",
+      "HERD could not accept these sign-in details. The email or username can be at most 255 characters, and the password at most 72 characters, or 1024 for a directory account.",
     );
   });
 

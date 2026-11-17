@@ -66,7 +66,7 @@ export const LOGIN_INVALID_CREDENTIALS =
   "Invalid credentials. Check your email or login name and your password.";
 export const LOGIN_UNREACHABLE = "Could not reach HERD. Try again in a moment.";
 export const LOGIN_INPUT_REFUSED =
-  "HERD could not accept these sign-in details. The email or username can be at most 255 characters and the password at most 72.";
+  "HERD could not accept these sign-in details. The email or username can be at most 255 characters, and the password at most 72 characters, or 1024 for a directory account.";
 export const LOGIN_UNEXPECTED = "Sign-in failed with an unexpected answer. Try again in a moment.";
 export const LOGIN_RATE_LIMITED = "Too many sign-in attempts. Wait a moment, then try again.";
 

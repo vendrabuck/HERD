@@ -19,6 +19,8 @@ Expected directory layout:
             cn=nouid1             (mail but no uid attribute)
             uid=ldapit-admin      (see 70-seed-integration.ldif)
             uid=ldapit-eng1..3    (see 70-seed-integration.ldif)
+            uid=ldapit-longpass   (a 100-character password, LONG_PASSWORD;
+                                   issue #1404)
         ou=groups              (groupOfNames; see 60-seed-groups.ldif)
             cn=herd-eng        (user1..user3)
             cn=herd-qa         (user4, user5)
@@ -66,6 +68,9 @@ PEOPLE_DN = f"ou=people,{BASE_DN}"
 ADMIN_DN = f"cn=admin,{BASE_DN}"
 ADMIN_PW = "admin"
 USER_PW = "Password1"
+# uid=ldapit-longpass's password (70-seed-integration.ldif, issue #1404).
+LONG_PASSWORD_USER = "ldapit-longpass"
+LONG_PASSWORD = ("long-passphrase-" * 7)[:100]
 
 
 def _ldap_reachable() -> bool:
@@ -88,7 +93,10 @@ pytestmark = pytest.mark.skipif(
 def _seed_is_current() -> bool:
     """Probe the last-loaded fixture of each fixture-adding LDIF file:
     cn=herd-stale (60-seed-groups.ldif) and cn=herd-it-eng
-    (70-seed-integration.ldif, issue #572, added after herd-stale).
+    (70-seed-integration.ldif, issue #572, added after herd-stale), plus
+    uid=ldapit-longpass (issue #1404), which was added to
+    70-seed-integration.ldif later but before its last entry, so a directory
+    seeded from a checkout between the two holds herd-it-eng without it.
 
     The stateless container reseeds only on `up`, so a container started
     from an older checkout answers for user1 while lacking one or both sets
@@ -105,9 +113,13 @@ def _seed_is_current() -> bool:
         server = ldap3.Server(LDAP_URL, get_info=ldap3.NONE, connect_timeout=5)
         conn = ldap3.Connection(server, user=ADMIN_DN, password=ADMIN_PW, auto_bind=True)
         try:
-            for cn in ("herd-stale", "herd-it-eng"):
+            for dn in (
+                f"cn=herd-stale,ou=groups,{BASE_DN}",
+                f"cn=herd-it-eng,ou=groups,{BASE_DN}",
+                f"uid=ldapit-longpass,{PEOPLE_DN}",
+            ):
                 ok = conn.search(
-                    f"cn={cn},ou=groups,{BASE_DN}",
+                    dn,
                     "(objectClass=*)",
                     search_scope=ldap3.BASE,
                     attributes=["cn"],
@@ -134,8 +146,8 @@ def _fail_when_required_but_unreachable():
 def _fail_on_stale_seed():
     if _LDAP_REACHABLE and not _seed_is_current():
         pytest.fail(
-            f"LDAP server at {LDAP_URL} is reachable but missing the group fixtures "
-            "(60-seed-groups.ldif and/or 70-seed-integration.ldif); it was seeded "
+            f"LDAP server at {LDAP_URL} is reachable but missing fixtures "
+            "of 60-seed-groups.ldif and/or 70-seed-integration.ldif; it was seeded "
             "from an older checkout. Run `make ldap-reset` to reseed."
         )
 
@@ -209,6 +221,19 @@ async def test_bind_user_unreachable_server_raises_unavailable(monkeypatch, ldap
     monkeypatch.setattr(settings, "ldap_server_url", _refused_url(), raising=False)
     with pytest.raises(ldap_service.LdapUnavailableError):
         await ldap_service.bind_user("user1", USER_PW)
+
+
+@pytest.mark.asyncio
+async def test_bind_user_long_password_reaches_the_directory_unchanged(ldap_settings):
+    """Issue #1404's premise against a real directory: a password far past
+    bcrypt's 72 bytes is the directory's to judge, all of it."""
+    assert len(LONG_PASSWORD) == 100
+    identity = await ldap_service.bind_user(LONG_PASSWORD_USER, LONG_PASSWORD)
+    assert identity is not None
+    assert identity.email == f"{LONG_PASSWORD_USER}@company.local"
+    # The same first 72 characters with another tail is refused: nothing cuts
+    # the password the way bcrypt would.
+    assert await ldap_service.bind_user(LONG_PASSWORD_USER, LONG_PASSWORD[:72] + "y" * 28) is None
 
 
 @pytest.mark.asyncio
@@ -327,6 +352,17 @@ async def test_login_endpoint_bad_service_account_is_503(monkeypatch, ldap_setti
     monkeypatch.setattr(settings, "ldap_bind_password", "wrong-admin-pw", raising=False)
     resp = await http_client.post("/login", json={"email": "user4", "password": USER_PW})
     assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_login_endpoint_accepts_a_100_character_directory_password(
+    ldap_settings, http_client
+):
+    """Issue #1404: LDAP mode does not cap the login password at bcrypt's 72."""
+    resp = await http_client.post(
+        "/login", json={"email": LONG_PASSWORD_USER, "password": LONG_PASSWORD}
+    )
+    assert resp.status_code == 200, resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +739,7 @@ _ALL_SEEDED_PRESENT_EMAILS = frozenset(
         "ldapit-eng1@company.local",
         "ldapit-eng2@company.local",
         "ldapit-eng3@company.local",
+        "ldapit-longpass@company.local",
     }
 )
 
