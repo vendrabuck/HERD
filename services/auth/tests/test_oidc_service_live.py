@@ -66,6 +66,7 @@ from app.models.user import Role, User
 from app.routers import oidc as oidc_router
 from app.services import oidc_service
 from app.services.auth_service import create_user
+from app.services.federated_identity_service import identity_fingerprint
 from app.services.oidc_service import OidcRejectedError
 from app.utils.jwt import create_access_token
 from herd_common.logging import JSONFormatter
@@ -580,7 +581,14 @@ async def test_an_issuer_change_is_refused_by_dex_sign_in_then_recovered_by_the_
     assert await row_counts() == (2, 1)
 
     dry = await _rewrite(client, headers, PREVIOUS_ISSUER, ISSUER, dry_run=True)
-    assert dry == {"dry_run": True, "matched": 1, "conflicts": 0, "rewritten": 0}
+    assert dry == {
+        "dry_run": True,
+        "matched": 1,
+        "conflicts": 0,
+        "rewritten": 0,
+        "collisions": [],
+        "collisions_truncated": False,
+    }
     assert (await _rewrite(client, headers, PREVIOUS_ISSUER, ISSUER))["rewritten"] == 1
 
     again = await signed_in_profile(client, ALICE)
@@ -614,3 +622,40 @@ async def test_a_reissued_subject_is_refused_by_dex_sign_in_then_recovered_by_th
         ISSUER,
         ALICE_SUBJECT,
     )
+
+
+async def test_a_refused_dex_sign_in_leaves_a_candidate_and_a_relink_by_it_recovers_the_account(
+    live_oidc, client, caplog
+):
+    """Owner decision of 2026-11-18: the refused sign-in's identity is kept as a
+    relink candidate against alice's account, the superadmin reads it (its
+    fingerprint, never the subject) and relinks by its id, and her next Dex
+    sign-in lands in the same account."""
+    caplog.set_level(logging.INFO)
+    headers = await _superadmin_headers()
+    alice = await signed_in_profile(client, ALICE)
+    await _relink(client, headers, alice["id"], ISSUER, "subject-before-the-reissue")
+
+    callback = await route_sign_in(client, ALICE)
+    assert callback.headers["location"] == FAILED
+    listing = await client.get(
+        f"/users/{alice['id']}/federated-identity/candidates", headers=headers
+    )
+    assert listing.status_code == 200, listing.text
+    body = listing.json()
+    assert body["captured_total"] == 1
+    [candidate] = body["candidates"]
+    assert candidate["issuer"] == ISSUER
+    assert candidate["fingerprint"] == identity_fingerprint(ISSUER, ALICE_SUBJECT)
+    assert ALICE_SUBJECT not in listing.text
+
+    relinked = await client.put(
+        f"/users/{alice['id']}/federated-identity",
+        json={"candidate_id": candidate["id"]},
+        headers=headers,
+    )
+    assert relinked.status_code == 200, relinked.text
+    again = await signed_in_profile(client, ALICE)
+    assert again["id"] == alice["id"]
+    after = await client.get(f"/users/{alice['id']}/federated-identity/candidates", headers=headers)
+    assert after.json()["candidates"] == []

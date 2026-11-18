@@ -16,6 +16,7 @@ from app.config import settings
 from app.models.federated_identity import SUBJECT_MAX_LENGTH, FederatedIdentity
 from app.models.user import RefreshToken, Role, User
 from app.services import ldap_service, passwords
+from app.services.federated_identity_service import capture_relink_candidate
 from app.utils.jwt import create_access_token, create_refresh_token, hash_token
 
 logger = logging.getLogger(__name__)
@@ -467,9 +468,17 @@ async def _find_federated_identity(
 
 async def _returning_federated_login(db: AsyncSession, identity: FederatedIdentity) -> User | None:
     """The federated row decides (D4): nothing stored on the user is updated,
-    only the identity's last_login_at, and only for a login that is admitted."""
+    only the identity's last_login_at, and only for a login that is admitted.
+
+    The last_login_at write is a compare-and-swap on the row as it was read
+    (its id, account, issuer, and subject): when a superadmin relink or issuer
+    rewrite committed between the read and the write, it matches no row and the
+    login is refused as `identity_changed` (issue #1399 review), so a sign-in in
+    flight never completes on a pair that no longer names the account."""
     identity_id = identity.id
     user_id = identity.user_id
+    issuer = identity.issuer
+    subject = identity.subject
     user = await get_user_by_id(db, user_id)
     if user is None:
         reason = "user_missing"
@@ -483,11 +492,20 @@ async def _returning_federated_login(db: AsyncSession, identity: FederatedIdenti
     if reason is not None:
         await db.rollback()
         return _refuse_federated(reason, user_id=user_id)
-    await db.execute(
+    written = await db.execute(
         update(FederatedIdentity)
-        .where(FederatedIdentity.id == identity_id)
+        .where(
+            FederatedIdentity.id == identity_id,
+            FederatedIdentity.user_id == user_id,
+            FederatedIdentity.issuer == issuer,
+            FederatedIdentity.subject == subject,
+        )
         .values(last_login_at=datetime.now(timezone.utc))
+        .execution_options(synchronize_session=False)
     )
+    if written.rowcount != 1:
+        await db.rollback()
+        return _refuse_federated("identity_changed", user_id=user_id)
     await db.commit()
     await db.refresh(user)
     return user
@@ -658,7 +676,49 @@ async def resolve_federated_user(db: AsyncSession, login: FederatedLogin) -> Use
     if identity is not None:
         return await _returning_federated_login(db, identity)
     await db.rollback()
-    return _refuse_federated(collision)
+    _refuse_federated(collision)
+    if collision == "email_taken":
+        await _capture_relink_candidate(db, login)
+    return None
+
+
+async def _capture_relink_candidate(db: AsyncSession, login: FederatedLogin) -> None:
+    """Keep the refused pair as a relink candidate (issue #1399, owner decision
+    2026-11-18) when an `oidc` account holds the email; never raises.
+
+    Runs after the refusal is decided and logged, in its own transaction, so it
+    cannot change the answer: the caller returns None whatever happens here. A
+    failure is rolled back and logged by exception class name only. The log
+    line names the account and the candidate, never the issuer or subject
+    (IAM-OIDC-12)."""
+    try:
+        outcome = await capture_relink_candidate(
+            db, email=login.email, issuer=login.issuer, subject=login.subject
+        )
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "OIDC relink candidate not captured",
+            extra={
+                "action": "oidc_relink_candidate_capture_failed",
+                "exception_class": type(exc).__name__,
+            },
+        )
+        return
+    if outcome is not None:
+        logger.info(
+            "OIDC relink candidate captured",
+            extra={
+                "action": "oidc_relink_candidate_captured",
+                "user_id": str(outcome.user_id),
+                "candidate_id": str(outcome.candidate_id),
+                "new": outcome.new,
+                "evicted": outcome.evicted,
+            },
+        )
 
 
 async def set_user_role(

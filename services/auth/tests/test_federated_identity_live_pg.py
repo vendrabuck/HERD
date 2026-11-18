@@ -48,11 +48,17 @@ import asyncio
 import os
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from app.models.federated_identity import FederatedIdentity
+from app.models.federated_relink_candidate import (
+    CANDIDATES_PER_ACCOUNT,
+    FederatedRelinkCandidate,
+    FederatedRelinkCaptureTotal,
+)
 from app.models.user import Role, User
-from app.services import federated_identity_service
+from app.services import auth_service, federated_identity_service
 from app.services.auth_service import (
     FederatedLogin,
     create_ldap_user,
@@ -219,6 +225,26 @@ class Ledger:
                 db.add(user)
                 await db.flush()
                 db.add(FederatedIdentity(user_id=user.id, issuer=issuer, subject="sub-a"))
+                await db.flush()
+                # A live relink candidate for the foreign account, with its
+                # total: captures for the tests' own accounts must leave both.
+                now = datetime.now(timezone.utc)
+                db.add(
+                    FederatedRelinkCandidate(
+                        user_id=user.id,
+                        issuer=issuer,
+                        subject="sub-a",
+                        created_at=now,
+                        last_seen_at=now,
+                        expires_at=now + timedelta(hours=23),
+                        attempts=1,
+                    )
+                )
+                db.add(
+                    FederatedRelinkCaptureTotal(
+                        user_id=user.id, captured_total=1, last_captured_at=now
+                    )
+                )
                 await db.commit()
 
     async def snapshot(self) -> dict:
@@ -244,14 +270,42 @@ class Ledger:
                     FederatedIdentity.last_login_at,
                 ).where(FederatedIdentity.user_id.not_in(self._own_user_ids()))
             )
+            # Foreign candidates that cannot expire during a test (a capture
+            # legitimately prunes expired rows anywhere in the table).
+            horizon = datetime.now(timezone.utc) + timedelta(minutes=5)
+            candidates = await db.execute(
+                select(
+                    FederatedRelinkCandidate.id,
+                    FederatedRelinkCandidate.user_id,
+                    FederatedRelinkCandidate.subject,
+                    FederatedRelinkCandidate.attempts,
+                    FederatedRelinkCandidate.expires_at,
+                ).where(
+                    FederatedRelinkCandidate.user_id.not_in(self._own_user_ids()),
+                    FederatedRelinkCandidate.expires_at > horizon,
+                )
+            )
+            totals = await db.execute(
+                select(
+                    FederatedRelinkCaptureTotal.user_id, FederatedRelinkCaptureTotal.captured_total
+                ).where(FederatedRelinkCaptureTotal.user_id.not_in(self._own_user_ids()))
+            )
             return {
                 "users": {r.id: tuple(r) for r in users},
                 "identities": {r.id: tuple(r) for r in idents},
+                "candidates": {r.id: tuple(r) for r in candidates},
+                "totals": {r.user_id: r.captured_total for r in totals},
             }
 
     async def assert_foreign_untouched(self) -> None:
         after = await self.snapshot()
-        assert after == self.before
+        before_candidates = self.before["candidates"]
+        assert {k: v for k, v in after["candidates"].items() if k in before_candidates} == (
+            before_candidates
+        )
+        assert {k: v for k, v in after.items() if k != "candidates"} == {
+            k: v for k, v in self.before.items() if k != "candidates"
+        }
 
     async def own_identities(self) -> list[tuple[uuid.UUID, str, str]]:
         async with self.sf() as db:
@@ -515,4 +569,118 @@ async def test_a_relink_refused_as_taken_on_postgres_keeps_the_old_identity(
     assert sorted(await ledger.own_identities()) == sorted(
         [(a, ledger.old, "sub-a"), (b, ledger.old, "sub-b")]
     )
+    await ledger.assert_foreign_untouched()
+
+
+async def _candidates_of(session_factory, user_id) -> list[tuple]:
+    async with session_factory() as db:
+        rows = await db.execute(
+            select(FederatedRelinkCandidate.subject, FederatedRelinkCandidate.attempts).where(
+                FederatedRelinkCandidate.user_id == user_id
+            )
+        )
+        total = (
+            await db.execute(
+                select(FederatedRelinkCaptureTotal.captured_total).where(
+                    FederatedRelinkCaptureTotal.user_id == user_id
+                )
+            )
+        ).scalar_one_or_none()
+        return sorted(tuple(r) for r in rows), total
+
+
+async def _captures_released_together(engine, session_factory, logins) -> list:
+    """Block every write to the candidate table, start one refused login per
+    entry, wait until every one is blocked (on the capture lock, or, for the one
+    holding it, on the table), release, and return the outcomes. Without the
+    capture lock all of them would wait at their first write and then race."""
+
+    def refuse(login):
+        async def call():
+            async with session_factory() as db:
+                return await resolve_federated_user(db, login)
+
+        return call
+
+    async with engine.connect() as holder:
+        await holder.execute(
+            text("LOCK TABLE federated_relink_candidates IN SHARE ROW EXCLUSIVE MODE")
+        )
+        tasks = [asyncio.create_task(refuse(login)()) for login in logins]
+        try:
+            await _wait_for_blocked(
+                engine,
+                ("SELECT pg_advisory_xact_lock", "DELETE FROM federated_relink_candidates"),
+                len(logins),
+            )
+        finally:
+            await holder.rollback()
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_concurrent_captures_of_distinct_pairs_keep_the_cap_and_count_every_pair(
+    pg_engine, session_factory, ledger
+):
+    a = await ledger.account("a", ledger.old)
+    n = CANDIDATES_PER_ACCOUNT + 2
+    logins = [
+        auth_service.FederatedLogin(
+            issuer=ledger.old,
+            subject=f"flood-{i}",
+            email=ledger.email("a"),
+            email_verified=True,
+            username=f"flood{i}-{ledger.tag}",
+            full_name=None,
+        )
+        for i in range(n)
+    ]
+    outcomes = await _captures_released_together(pg_engine, session_factory, logins)
+    assert outcomes == [None] * n
+    rows, total = await _candidates_of(session_factory, a)
+    assert len(rows) == CANDIDATES_PER_ACCOUNT and total == n
+    await ledger.assert_invariant()
+    await ledger.assert_foreign_untouched()
+
+
+async def test_concurrent_captures_of_one_pair_are_one_candidate(
+    pg_engine, session_factory, ledger
+):
+    a = await ledger.account("a", ledger.old)
+    login = auth_service.FederatedLogin(
+        issuer=ledger.old,
+        subject="same-pair",
+        email=ledger.email("a"),
+        email_verified=True,
+        username=f"same-{ledger.tag}",
+        full_name=None,
+    )
+    outcomes = await _captures_released_together(pg_engine, session_factory, [login] * N)
+    assert outcomes == [None] * N
+    assert await _candidates_of(session_factory, a) == ([("same-pair", N)], 1)
+    await ledger.assert_foreign_untouched()
+
+
+async def test_a_login_in_flight_when_a_relink_commits_is_refused_on_postgres(
+    monkeypatch, session_factory, ledger
+):
+    """Review finding 5: the login read (old issuer, sub-a) and its account, a
+    relink committed, and the login's last_login_at compare-and-swap then
+    matches no row, so the login is refused instead of completing."""
+    a = await ledger.account("a", ledger.old)
+    real_get = auth_service.get_user_by_id
+
+    async def relink_lands_between_read_and_write(db, user_id):
+        async with session_factory() as other:
+            await relink_identity(other, a, issuer=ledger.old, subject="sub-a-reissued")
+        return await real_get(db, user_id)
+
+    monkeypatch.setattr(auth_service, "get_user_by_id", relink_lands_between_read_and_write)
+    async with session_factory() as db:
+        assert (
+            await resolve_federated_user(db, ledger.login("a", issuer=ledger.old, subject="sub-a"))
+            is None
+        )
+        assert not db.in_transaction()
+    assert await ledger.own_identities() == [(a, ledger.old, "sub-a-reissued")]
+    await ledger.assert_invariant()
     await ledger.assert_foreign_untouched()

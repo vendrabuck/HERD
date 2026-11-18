@@ -393,3 +393,47 @@ def test_identity_key_bounds_are_the_column_widths():
     assert identity_key_part_ok("y" * 255, 255) is True
     assert identity_key_part_ok("y" * 256, 255) is False
     assert auth_service._identity_key_refusal is _identity_key_refusal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"issuer": OLD},
+        {"subject": "s"},
+        {"issuer": OLD, "subject": "s", "candidate_id": uuid.uuid4()},
+    ],
+)
+async def test_relink_takes_exactly_one_form_of_target(kwargs):
+    a = await _oidc("a")
+    async with TestSessionLocal() as db:
+        with pytest.raises(ValueError):
+            await relink_identity(db, a, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_login_in_flight_when_a_rewrite_commits_is_refused(monkeypatch):
+    """The last_login_at compare-and-swap names the issuer too: a rewrite that
+    lands between the login's read and its write refuses the login."""
+    a = await _oidc("a")
+    real_get = auth_service.get_user_by_id
+
+    async def rewrite_lands(db, user_id):
+        async with TestSessionLocal() as other:
+            await rewrite_issuer(other, old_issuer=OLD, new_issuer=NEW, dry_run=False)
+        return await real_get(db, user_id)
+
+    monkeypatch.setattr(auth_service, "get_user_by_id", rewrite_lands)
+    login = FederatedLogin(
+        issuer=OLD,
+        subject="sub-a",
+        email="a@example.test",
+        email_verified=True,
+        username="a",
+        full_name=None,
+    )
+    async with TestSessionLocal() as db:
+        assert await auth_service.resolve_federated_user(db, login) is None
+        assert not db.in_transaction()
+    assert (await _rows())[a][1] == NEW

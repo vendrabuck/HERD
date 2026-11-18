@@ -13,6 +13,10 @@ from app.config import log_oidc_startup_warnings, settings
 from app.database import AsyncSessionLocal, Base, engine
 from app.models.api_token import ApiToken  # noqa: F401
 from app.models.federated_identity import FederatedIdentity  # noqa: F401
+from app.models.federated_relink_candidate import (  # noqa: F401
+    FederatedRelinkCandidate,
+    FederatedRelinkCaptureTotal,
+)
 from app.models.group import GroupMember, UserGroup  # noqa: F401
 from app.models.ldap_group_mapping import LdapGroupMapping  # noqa: F401
 from app.models.ldap_sync_run import LdapSyncRun  # noqa: F401

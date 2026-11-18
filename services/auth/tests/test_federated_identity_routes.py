@@ -25,19 +25,27 @@ database error answering a fixed 500 logged by class name only.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
 from app.config import settings
 from app.models.federated_identity import FederatedIdentity
+from app.models.federated_relink_candidate import (
+    FederatedRelinkCandidate,
+    FederatedRelinkCaptureTotal,
+)
 from app.models.user import Role, User
 from app.routers import federated_identities as routes
-from app.services import oidc_service
+from app.services import auth_service, federated_identity_service, oidc_service
 from app.services.api_token_service import create_api_token
-from app.services.auth_service import get_password_hash
+from app.services.auth_service import FederatedLogin, get_password_hash, resolve_federated_user
+from app.services.federated_identity_service import identity_fingerprint
 from app.utils.jwt import create_access_token
 from cryptography.hazmat.primitives.asymmetric import rsa
 from herd_common.logging import JSONFormatter
@@ -67,6 +75,7 @@ FORBIDDEN = {"detail": "You do not have permission to perform this action"}
 NOT_AUTHENTICATED = {"detail": "Not authenticated"}
 BAD_CREDENTIALS = {"detail": "Could not validate credentials"}
 SA_PASSWORD = "superadmin-password-1"
+NO_COLLISIONS = {"collisions": [], "collisions_truncated": False}
 
 
 def relink_path(user_id) -> str:
@@ -219,7 +228,13 @@ async def test_both_routes_answer_in_every_auth_mode(monkeypatch, client, supera
         json={"old_issuer": ISSUER, "new_issuer": NEW_ISSUER, "dry_run": False},
         headers=bearer(superadmin),
     )
-    assert resp.json() == {"dry_run": False, "matched": 1, "conflicts": 0, "rewritten": 1}
+    assert resp.json() == {
+        "dry_run": False,
+        "matched": 1,
+        "conflicts": 0,
+        "rewritten": 1,
+        **NO_COLLISIONS,
+    }
     resp = await client.put(
         relink_path(victim.id),
         json={"issuer": ISSUER, "subject": REISSUED},
@@ -277,7 +292,13 @@ async def test_a_superadmin_api_token_minted_before_the_switch_can_recover_in_oi
         json={"old_issuer": ISSUER, "new_issuer": NEW_ISSUER, "dry_run": True},
         headers=headers,
     )
-    assert resp.json() == {"dry_run": True, "matched": 1, "conflicts": 0, "rewritten": 0}
+    assert resp.json() == {
+        "dry_run": True,
+        "matched": 1,
+        "conflicts": 0,
+        "rewritten": 0,
+        **NO_COLLISIONS,
+    }
 
 
 # --- the issuer rewrite ---
@@ -292,13 +313,13 @@ async def test_rewrite_dry_run_then_write_answer_the_counts(client, superadmin, 
     resp = await client.post(REWRITE, json=body, headers=bearer(superadmin))
     assert (resp.status_code, resp.json()) == (
         200,
-        {"dry_run": True, "matched": 2, "conflicts": 0, "rewritten": 0},
+        {"dry_run": True, "matched": 2, "conflicts": 0, "rewritten": 0, **NO_COLLISIONS},
     )
     assert (await identities())[a.id][0] == ISSUER
     resp = await client.post(REWRITE, json={**body, "dry_run": False}, headers=bearer(superadmin))
     assert (resp.status_code, resp.json()) == (
         200,
-        {"dry_run": False, "matched": 2, "conflicts": 0, "rewritten": 2},
+        {"dry_run": False, "matched": 2, "conflicts": 0, "rewritten": 2, **NO_COLLISIONS},
     )
     after = await identities()
     assert (after[a.id][0], after[b.id][0], after[other.id][0]) == (
@@ -323,25 +344,47 @@ async def test_rewrite_dry_run_then_write_answer_the_counts(client, superadmin, 
 async def test_rewrite_with_a_conflict_is_refused_409_with_the_count_and_changes_nothing(
     client, superadmin, audit
 ):
-    await make_oidc("a")
-    await make_oidc("b")
-    await make_oidc("held-a", issuer=NEW_ISSUER, subject="sub-a")
+    a = await make_oidc("a")
+    b = await make_oidc("b")
+    held_a = await make_oidc("held-a", issuer=NEW_ISSUER, subject="sub-a")
     before = await identities()
     body = {"old_issuer": ISSUER, "new_issuer": NEW_ISSUER, "dry_run": False}
     resp = await client.post(REWRITE, json=body, headers=bearer(superadmin))
     assert resp.status_code == 409
     assert resp.json() == {
         "detail": "Rewrite refused: 1 federated identity would collide with an identity "
-        "already under the new issuer; nothing was changed"
+        "already under the new issuer; nothing was changed",
+        "conflicts": 1,
+        "collisions": [
+            {"old_issuer_account_id": str(a.id), "new_issuer_account_id": str(held_a.id)}
+        ],
+        "collisions_truncated": False,
     }
-    await make_oidc("held-b", issuer=NEW_ISSUER, subject="sub-b")
+    held_b = await make_oidc("held-b", issuer=NEW_ISSUER, subject="sub-b")
     resp = await client.post(REWRITE, json=body, headers=bearer(superadmin))
+    pairs = sorted(
+        [
+            {"old_issuer_account_id": str(a.id), "new_issuer_account_id": str(held_a.id)},
+            {"old_issuer_account_id": str(b.id), "new_issuer_account_id": str(held_b.id)},
+        ],
+        key=lambda p: p["old_issuer_account_id"],
+    )
     assert resp.json() == {
         "detail": "Rewrite refused: 2 federated identities would collide with an identity "
-        "already under the new issuer; nothing was changed"
+        "already under the new issuer; nothing was changed",
+        "conflicts": 2,
+        "collisions": pairs,
+        "collisions_truncated": False,
     }
     dry = await client.post(REWRITE, json={**body, "dry_run": True}, headers=bearer(superadmin))
-    assert dry.json() == {"dry_run": True, "matched": 2, "conflicts": 2, "rewritten": 0}
+    assert dry.json() == {
+        "dry_run": True,
+        "matched": 2,
+        "conflicts": 2,
+        "rewritten": 0,
+        "collisions": pairs,
+        "collisions_truncated": False,
+    }
     after = await identities()
     assert {k: v for k, v in after.items() if k in before} == before
     refusals = [r for r in audit_records(audit) if r.outcome == "refused_conflict"]
@@ -516,7 +559,7 @@ async def test_relink_refusals(client, superadmin, audit):
 @pytest.mark.parametrize(
     ("body", "loc", "error_type"),
     [
-        ({"issuer": ISSUER}, ["body", "subject"], "missing"),
+        ({"issuer": ISSUER}, ["body"], "relink_target"),
         (
             {"issuer": ISSUER, "subject": "s", "user_id": "x"},
             ["body", "user_id"],
@@ -651,7 +694,13 @@ async def test_story_an_issuer_change_is_refused_then_recovered_by_the_rewrite(
 
     body = {"old_issuer": ISSUER, "new_issuer": NEW_ISSUER, "dry_run": True}
     dry = await client.post(REWRITE, json=body, headers=bearer(superadmin))
-    assert dry.json() == {"dry_run": True, "matched": 1, "conflicts": 0, "rewritten": 0}
+    assert dry.json() == {
+        "dry_run": True,
+        "matched": 1,
+        "conflicts": 0,
+        "rewritten": 0,
+        **NO_COLLISIONS,
+    }
     await refused_sign_in(client, idp)
     done = await client.post(REWRITE, json={**body, "dry_run": False}, headers=bearer(superadmin))
     assert done.json()["rewritten"] == 1
@@ -751,3 +800,541 @@ def test_the_route_constants_are_the_specified_wording():
         "oidc_issuer_rewrite",
         "oidc_identity_relink",
     )
+
+
+# --- relink candidates (owner decision A, 2026-11-18) ---
+
+ATTACKER = "SENTINEL-subject-attacker"
+
+
+def candidates_path(user_id) -> str:
+    return f"/users/{user_id}/federated-identity/candidates"
+
+
+async def candidate_rows() -> list[tuple]:
+    async with TestSessionLocal() as db:
+        rows = (await db.execute(select(FederatedRelinkCandidate))).scalars().all()
+        return sorted((r.user_id, r.issuer, r.subject, r.attempts) for r in rows)
+
+
+async def captured_total(user_id) -> int | None:
+    async with TestSessionLocal() as db:
+        return (
+            await db.execute(
+                select(FederatedRelinkCaptureTotal.captured_total).where(
+                    FederatedRelinkCaptureTotal.user_id == uuid.UUID(str(user_id))
+                )
+            )
+        ).scalar_one_or_none()
+
+
+async def read_candidates(client, superadmin, user_id) -> dict:
+    resp = await client.get(candidates_path(user_id), headers=bearer(superadmin))
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def login_as(email: str, subject: str, *, username: str = "someone") -> FederatedLogin:
+    return FederatedLogin(
+        issuer=ISSUER,
+        subject=subject,
+        email=email,
+        email_verified=True,
+        username=username,
+        full_name=None,
+    )
+
+
+async def refuse(login: FederatedLogin) -> None:
+    async with TestSessionLocal() as db:
+        assert await resolve_federated_user(db, login) is None
+        assert not db.in_transaction()
+
+
+_CLOCK_BASE = datetime.now(timezone.utc)
+
+
+def shift_capture_clock(monkeypatch, seconds: float, base: datetime = _CLOCK_BASE) -> None:
+    monkeypatch.setattr(
+        federated_identity_service, "_utcnow", lambda: base + timedelta(seconds=seconds)
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_on_an_oidc_accounts_email_captures_a_candidate(
+    client, superadmin, idp, caplog
+):
+    caplog.set_level(logging.INFO)
+    account = await signed_in_account(client, idp)
+    idp.claim_changes["sub"] = REISSUED
+    await refused_sign_in(client, idp)
+    listing = await read_candidates(client, superadmin, account)
+    assert listing["user_id"] == account and listing["captured_total"] == 1
+    [candidate] = listing["candidates"]
+    assert sorted(candidate) == [
+        "attempts",
+        "created_at",
+        "expires_at",
+        "fingerprint",
+        "id",
+        "issuer",
+        "last_seen_at",
+    ]
+    assert candidate["issuer"] == ISSUER and candidate["attempts"] == 1
+    assert candidate["fingerprint"] == identity_fingerprint(ISSUER, REISSUED)
+    created = datetime.fromisoformat(candidate["created_at"])
+    expires = datetime.fromisoformat(candidate["expires_at"])
+    assert expires - created == timedelta(hours=24)
+    assert REISSUED not in json.dumps(listing)
+    # The refused sign-in still answered exactly the generic failure, and the
+    # capture's own log line names the account and the candidate only.
+    captured = [
+        r for r in caplog.records if getattr(r, "action", None) == "oidc_relink_candidate_captured"
+    ]
+    assert [(r.user_id, r.candidate_id, r.new) for r in captured] == [
+        (account, candidate["id"], True)
+    ]
+    formatter = JSONFormatter("auth")
+    for record in caplog.records:
+        if record.name in ("aiosqlite",) or (
+            record.name == "httpx" and " http://test/" in record.getMessage()
+        ):
+            continue
+        assert REISSUED not in formatter.format(record)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("holder", ["local", "ldap", "local-superadmin", "oidc-superadmin"])
+async def test_no_candidate_when_the_email_holder_is_not_an_ordinary_oidc_account(holder):
+    source = "oidc" if holder.startswith("oidc") else holder.split("-")[0]
+    role = Role.SUPERADMIN if holder.endswith("superadmin") else Role.USER
+    user = await make_user(f"h-{holder}", source=source, role=role)
+    await refuse(login_as(user.email, "sub-x", username="unique-x"))
+    assert await candidate_rows() == []
+    assert await captured_total(user.id) is None
+
+
+@pytest.mark.asyncio
+async def test_no_candidate_for_a_username_only_collision_or_any_other_refusal():
+    holder = await make_oidc("holder")
+    # Username taken, email free: refused as username_taken, no candidate.
+    await refuse(login_as("free@example.test", "sub-x", username=holder.username))
+    # Email unverified: refused before the collision check, no candidate.
+    async with TestSessionLocal() as db:
+        login = login_as(holder.email, "sub-y")
+        assert (
+            await resolve_federated_user(
+                db,
+                FederatedLogin(**{**login.__dict__, "email_verified": False}),
+            )
+            is None
+        )
+    assert await candidate_rows() == []
+
+
+@pytest.mark.asyncio
+async def test_no_candidate_when_the_login_succeeds(client, superadmin, idp):
+    account = await signed_in_account(client, idp)
+    assert await signed_in_account(client, idp) == account
+    assert await candidate_rows() == []
+    listing = await read_candidates(client, superadmin, account)
+    assert listing == {"user_id": account, "captured_total": 0, "candidates": []}
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_pair_is_one_candidate_with_more_attempts(monkeypatch, client, superadmin):
+    holder = await make_oidc("holder")
+    shift_capture_clock(monkeypatch, 0)
+    await refuse(login_as(holder.email, ATTACKER))
+    shift_capture_clock(monkeypatch, 60)
+    await refuse(login_as(holder.email, ATTACKER))
+    assert await candidate_rows() == [(holder.id, ISSUER, ATTACKER, 2)]
+    [candidate] = (await read_candidates(client, superadmin, holder.id))["candidates"]
+    assert candidate["attempts"] == 2
+    assert datetime.fromisoformat(candidate["last_seen_at"]) - datetime.fromisoformat(
+        candidate["created_at"]
+    ) == timedelta(seconds=60)
+    assert await captured_total(holder.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_expires_after_24_hours(monkeypatch, client, superadmin):
+    holder = await make_oidc("holder")
+    shift_capture_clock(monkeypatch, 0)
+    await refuse(login_as(holder.email, ATTACKER))
+    candidate_id = (await read_candidates(client, superadmin, holder.id))["candidates"][0]["id"]
+    shift_capture_clock(monkeypatch, 24 * 3600 - 1)
+    assert len((await read_candidates(client, superadmin, holder.id))["candidates"]) == 1
+    shift_capture_clock(monkeypatch, 24 * 3600)
+    listing = await read_candidates(client, superadmin, holder.id)
+    assert listing["candidates"] == [] and listing["captured_total"] == 1
+    resp = await client.put(
+        relink_path(holder.id), json={"candidate_id": candidate_id}, headers=bearer(superadmin)
+    )
+    assert (resp.status_code, resp.json()) == (
+        404,
+        {"detail": "Relink candidate not found for this account"},
+    )
+    # The next capture prunes it.
+    await refuse(login_as(holder.email, "sub-later"))
+    assert await candidate_rows() == [(holder.id, ISSUER, "sub-later", 1)]
+
+
+@pytest.mark.asyncio
+async def test_the_per_account_cap_keeps_the_newest_five_and_the_total_keeps_counting(
+    monkeypatch, client, superadmin
+):
+    holder = await make_oidc("holder")
+    other = await make_oidc("other")
+    await refuse(login_as(other.email, "x-other"))
+    for i in range(7):
+        shift_capture_clock(monkeypatch, i)
+        await refuse(login_as(holder.email, f"flood-{i}"))
+    listing = await read_candidates(client, superadmin, holder.id)
+    assert listing["captured_total"] == 7
+    assert [c["fingerprint"] for c in listing["candidates"]] == [
+        identity_fingerprint(ISSUER, f"flood-{i}") for i in (6, 5, 4, 3, 2)
+    ]
+    # Another account's candidate is untouched by this account's cap.
+    assert (other.id, ISSUER, "x-other", 1) in await candidate_rows()
+
+
+@pytest.mark.asyncio
+async def test_the_global_cap_drops_the_oldest_candidates_in_the_table(monkeypatch):
+    monkeypatch.setattr(federated_identity_service, "CANDIDATES_GLOBAL_CAP", 3)
+    a = await make_oidc("a")
+    b = await make_oidc("b")
+    for i, (holder, subject) in enumerate(
+        [(a, "a-1"), (b, "b-1"), (a, "a-2"), (b, "b-2"), (a, "a-3")]
+    ):
+        shift_capture_clock(monkeypatch, i)
+        await refuse(login_as(holder.email, subject))
+    assert sorted(r[2] for r in await candidate_rows()) == ["a-2", "a-3", "b-2"]
+    assert (await captured_total(a.id), await captured_total(b.id)) == (3, 2)
+
+
+@pytest.mark.asyncio
+async def test_a_capture_failure_never_changes_the_refusal(monkeypatch, client, idp, caplog):
+    caplog.set_level(logging.INFO)
+    account = await signed_in_account(client, idp)
+
+    async def broken(db, **kwargs):
+        raise OperationalError("INSERT ... " + REISSUED, {"subject": REISSUED}, Exception(REISSUED))
+
+    monkeypatch.setattr(auth_service, "capture_relink_candidate", broken)
+    idp.claim_changes["sub"] = REISSUED
+    await refused_sign_in(client, idp)
+    failures = [
+        r
+        for r in caplog.records
+        if getattr(r, "action", None) == "oidc_relink_candidate_capture_failed"
+    ]
+    assert [(r.levelname, r.exception_class) for r in failures] == [("WARNING", "OperationalError")]
+    assert all(r.exc_info is None and REISSUED not in r.getMessage() for r in failures)
+    refusals = [r.reason for r in caplog.records if getattr(r, "action", None) == "login_failure"]
+    assert refusals == ["email_taken"]
+    assert await candidate_rows() == []
+    assert account
+
+
+@pytest.mark.asyncio
+async def test_only_a_superadmin_may_read_candidates_and_the_gate_runs_before_the_lookup(client):
+    holder = await make_oidc("holder")
+    user = await make_user("plain")
+    admin = await make_user("adm", role=Role.ADMIN)
+    sa = await make_user("sa", role=Role.SUPERADMIN)
+    for target in (holder.id, uuid.uuid4()):
+        for headers, code, detail in (
+            ({}, 401, NOT_AUTHENTICATED),
+            (bearer(user), 403, FORBIDDEN),
+            (bearer(admin), 403, FORBIDDEN),
+            (bearer(sa, Role.ADMIN), 403, FORBIDDEN),
+        ):
+            resp = await client.get(candidates_path(target), headers=headers)
+            assert (resp.status_code, resp.json()) == (code, detail)
+    resp = await client.get(candidates_path(uuid.uuid4()), headers=bearer(sa))
+    assert (resp.status_code, resp.json()) == (404, {"detail": "User not found"})
+    resp = await client.get(candidates_path(user.id), headers=bearer(sa))
+    assert (resp.status_code, resp.json()) == (409, {"detail": routes.NOT_OIDC_DETAIL})
+
+
+@pytest.mark.asyncio
+async def test_story_relink_by_candidate_then_the_next_login_succeeds(
+    client, superadmin, idp, caplog
+):
+    caplog.set_level(logging.INFO)
+    account = await signed_in_account(client, idp)
+    idp.claim_changes["sub"] = REISSUED
+    await refused_sign_in(client, idp)
+    [candidate] = (await read_candidates(client, superadmin, account))["candidates"]
+    resp = await client.put(
+        relink_path(account), json={"candidate_id": candidate["id"]}, headers=bearer(superadmin)
+    )
+    assert resp.status_code == 200, resp.text
+    assert (resp.json()["issuer"], resp.json()["subject"]) == (ISSUER, REISSUED)
+    # Consumed: no live candidate is left, and the total keeps its count.
+    listing = await read_candidates(client, superadmin, account)
+    assert (listing["candidates"], listing["captured_total"]) == ([], 1)
+    assert await signed_in_account(client, idp) == account
+    [line] = [r for r in audit_records(caplog) if r.outcome == "relinked"]
+    assert (line.via, line.candidate_id, line.candidates_discarded) == (
+        "candidate",
+        candidate["id"],
+        1,
+    )
+    assert line.new_fingerprint == candidate["fingerprint"]
+    assert line.old_fingerprint == identity_fingerprint(ISSUER, SUBJECT)
+
+
+@pytest.mark.asyncio
+async def test_story_a_planted_candidate_never_links_without_the_superadmin(
+    client, superadmin, idp
+):
+    """Anyone who signs in at the provider with an account carrying the
+    victim's email plants a candidate. Two live candidates; nothing links; the
+    superadmin, having confirmed with the person which attempt was theirs,
+    relinks by that candidate; the attacker stays refused."""
+    account = await signed_in_account(client, idp)
+    idp.claim_changes["sub"] = ATTACKER
+    await refused_sign_in(client, idp)
+    idp.claim_changes["sub"] = REISSUED
+    await refused_sign_in(client, idp)
+    listing = await read_candidates(client, superadmin, account)
+    assert (len(listing["candidates"]), listing["captured_total"]) == (2, 2)
+    # Nothing linked on its own: both still refused, the identity unchanged.
+    await refused_sign_in(client, idp)
+    idp.claim_changes["sub"] = ATTACKER
+    await refused_sign_in(client, idp)
+    assert await identities() == {uuid.UUID(account): (ISSUER, SUBJECT)}
+    person = next(
+        c
+        for c in listing["candidates"]
+        if c["fingerprint"] == identity_fingerprint(ISSUER, REISSUED)
+    )
+    resp = await client.put(
+        relink_path(account), json={"candidate_id": person["id"]}, headers=bearer(superadmin)
+    )
+    assert resp.status_code == 200
+    await refused_sign_in(client, idp)  # the attacker
+    idp.claim_changes["sub"] = REISSUED
+    assert await signed_in_account(client, idp) == account
+    # The attacker's refused attempt after the relink is a fresh candidate.
+    assert [
+        c["fingerprint"] for c in (await read_candidates(client, superadmin, account))["candidates"]
+    ] == [identity_fingerprint(ISSUER, ATTACKER)]
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_of_another_account_is_refused_and_changes_nothing(
+    monkeypatch, client, superadmin
+):
+    victim = await make_oidc("victim")
+    other = await make_oidc("other")
+    await refuse(login_as(other.email, "sub-for-other"))
+    [foreign] = (await read_candidates(client, superadmin, other.id))["candidates"]
+    before = (await identities(), await candidate_rows())
+    for target in (foreign["id"], str(uuid.uuid4())):
+        resp = await client.put(
+            relink_path(victim.id), json={"candidate_id": target}, headers=bearer(superadmin)
+        )
+        assert (resp.status_code, resp.json()) == (
+            404,
+            {"detail": "Relink candidate not found for this account"},
+        )
+    assert (await identities(), await candidate_rows()) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"issuer": ISSUER},
+        {"subject": "s"},
+        {"issuer": ISSUER, "subject": "s", "candidate_id": str(uuid.UUID(int=1))},
+        {"subject": "s", "candidate_id": str(uuid.UUID(int=1))},
+        {"issuer": None, "subject": None, "candidate_id": None},
+    ],
+)
+async def test_the_relink_takes_exactly_one_of_the_pair_and_a_candidate_id(
+    client, superadmin, body
+):
+    victim = await make_oidc("victim")
+    resp = await client.put(relink_path(victim.id), json=body, headers=bearer(superadmin))
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == [
+        {
+            "type": "relink_target",
+            "loc": ["body"],
+            "msg": "send either issuer and subject, or candidate_id, and not both",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_typed_relink_also_discards_the_accounts_candidates(client, superadmin):
+    holder = await make_oidc("holder")
+    await refuse(login_as(holder.email, ATTACKER))
+    resp = await client.put(
+        relink_path(holder.id),
+        json={"issuer": ISSUER, "subject": REISSUED},
+        headers=bearer(superadmin),
+    )
+    assert resp.status_code == 200
+    assert await candidate_rows() == []
+
+
+# --- the colliding account pairs (owner decision B) ---
+
+
+@pytest.mark.asyncio
+async def test_the_collision_list_is_capped_with_a_flag_and_the_total(
+    monkeypatch, client, superadmin
+):
+    monkeypatch.setattr(federated_identity_service, "COLLISIONS_LIST_CAP", 2)
+    for name in ("a", "b", "c"):
+        await make_oidc(name)
+        await make_oidc(f"held-{name}", issuer=NEW_ISSUER, subject=f"sub-{name}")
+    body = {"old_issuer": ISSUER, "new_issuer": NEW_ISSUER, "dry_run": True}
+    dry = (await client.post(REWRITE, json=body, headers=bearer(superadmin))).json()
+    assert (dry["conflicts"], len(dry["collisions"]), dry["collisions_truncated"]) == (3, 2, True)
+    resp = await client.post(REWRITE, json={**body, "dry_run": False}, headers=bearer(superadmin))
+    refused = resp.json()
+    assert (resp.status_code, refused["conflicts"], refused["collisions_truncated"]) == (
+        409,
+        3,
+        True,
+    )
+    assert refused["collisions"] == dry["collisions"]
+    assert all(
+        sorted(p) == ["new_issuer_account_id", "old_issuer_account_id"]
+        for p in refused["collisions"]
+    )
+
+
+# --- keyed fingerprints in the audit (owner decision C) ---
+
+
+def test_the_fingerprint_is_a_truncated_hmac_under_a_key_derived_from_the_jwt_secret(monkeypatch):
+    monkeypatch.setattr(settings, "secret_key", "k" * 64)
+    key = hmac.new(b"k" * 64, b"herd-auth/oidc-identity-fingerprint/v1", hashlib.sha256).digest()
+    expected = hmac.new(key, json.dumps([ISSUER, "s"]).encode(), hashlib.sha256).hexdigest()[:16]
+    assert identity_fingerprint(ISSUER, "s") == expected
+    assert len(expected) == 16
+    raw = hmac.new(b"k" * 64, json.dumps([ISSUER, "s"]).encode(), hashlib.sha256).hexdigest()[:16]
+    assert expected != raw
+    assert identity_fingerprint(ISSUER) != identity_fingerprint(ISSUER, "")
+    monkeypatch.setattr(settings, "secret_key", "j" * 64)
+    assert identity_fingerprint(ISSUER, "s") != expected
+
+
+@pytest.mark.asyncio
+async def test_audit_lines_carry_fingerprints_and_never_the_pairs(client, superadmin, audit):
+    victim = await make_oidc("victim")
+    await client.put(
+        relink_path(victim.id),
+        json={"issuer": ISSUER, "subject": REISSUED},
+        headers=bearer(superadmin),
+    )
+    await client.post(
+        REWRITE,
+        json={"old_issuer": ISSUER, "new_issuer": NEW_ISSUER, "dry_run": True},
+        headers=bearer(superadmin),
+    )
+    relink, rewrite = audit_records(audit)
+    assert (relink.old_fingerprint, relink.new_fingerprint, relink.via) == (
+        identity_fingerprint(ISSUER, "sub-victim"),
+        identity_fingerprint(ISSUER, REISSUED),
+        "pair",
+    )
+    assert (rewrite.old_issuer_fingerprint, rewrite.new_issuer_fingerprint) == (
+        identity_fingerprint(ISSUER),
+        identity_fingerprint(NEW_ISSUER),
+    )
+    assert_no_identity_text(audit, ISSUER, REISSUED, "sub-victim")
+
+
+# --- a sign-in in flight when a relink commits (review finding 5) ---
+
+
+@pytest.mark.asyncio
+async def test_a_login_in_flight_when_a_relink_commits_is_refused(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    victim = await make_oidc("victim")
+    real_get = auth_service.get_user_by_id
+
+    async def relink_lands_between_read_and_write(db, user_id):
+        async with TestSessionLocal() as other:
+            await federated_identity_service.relink_identity(
+                other, victim.id, issuer=ISSUER, subject=REISSUED
+            )
+        return await real_get(db, user_id)
+
+    monkeypatch.setattr(auth_service, "get_user_by_id", relink_lands_between_read_and_write)
+    async with TestSessionLocal() as db:
+        assert await resolve_federated_user(db, login_as(victim.email, "sub-victim")) is None
+        assert not db.in_transaction()
+    reasons = [r.reason for r in caplog.records if getattr(r, "action", None) == "login_failure"]
+    assert reasons == ["identity_changed"]
+    assert await identities() == {victim.id: (ISSUER, REISSUED)}
+
+
+@pytest.mark.asyncio
+async def test_reactivating_an_account_restores_its_refresh_tokens(client, superadmin, idp):
+    """What the runbook says about sessions: neither a relink nor a deactivation
+    revokes a refresh token; a deactivated account cannot refresh, and after a
+    reactivation the old refresh token works again."""
+    _, _, handoff = await sign_in(client, idp)
+    tokens = (await exchange(client, handoff)).json()
+    me = await client.get("/me", headers={"Authorization": f"Bearer {tokens['access_token']}"})
+    account = me.json()["id"]
+    await client.put(
+        relink_path(account),
+        json={"issuer": ISSUER, "subject": REISSUED},
+        headers=bearer(superadmin),
+    )
+    await client.post(f"/users/{account}/deactivate", headers=bearer(superadmin))
+    refused = await client.post("/refresh", json={"refresh_token": tokens["refresh_token"]})
+    assert refused.status_code == 401
+    await client.post(f"/users/{account}/activate", headers=bearer(superadmin))
+    again = await client.post("/refresh", json={"refresh_token": tokens["refresh_token"]})
+    assert again.status_code == 200
+
+
+# --- docs truth (review finding 7) ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", [REWRITE, "/users/{id}/federated-identity"])
+async def test_a_body_that_is_not_json_is_a_422_before_the_role_gate(client, path):
+    """FastAPI decodes the body before it runs the dependencies, so a body that
+    is not JSON answers 422 `json_invalid` even with no token; the answer is the
+    same for any id and any caller, so it says nothing about accounts."""
+    user = await make_user("plain")
+    answers = []
+    for target, headers in ((uuid.uuid4(), {}), (user.id, bearer(user))):
+        url = path.replace("{id}", str(target))
+        method = "POST" if path == REWRITE else "PUT"
+        resp = await client.request(
+            method, url, content=b"{", headers={"Content-Type": "application/json", **headers}
+        )
+        assert resp.status_code == 422
+        answers.append(resp.json())
+    assert answers[0] == answers[1]
+    assert [e["type"] for e in answers[0]["detail"]] == ["json_invalid"]
+    resp = await client.get(candidates_path(uuid.uuid4()))
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_a_lone_surrogate_in_a_subject_is_refused_as_identity_key_invalid(client, superadmin):
+    victim = await make_oidc("victim")
+    resp = await client.put(
+        relink_path(victim.id),
+        content=b'{"issuer": "https://idp.test", "subject": "a\\ud800b"}',
+        headers={"Content-Type": "application/json", **bearer(superadmin)},
+    )
+    assert resp.status_code == 422
+    assert [(e["loc"], e["type"]) for e in resp.json()["detail"]] == [
+        (["body", "subject"], "identity_key_invalid")
+    ]
