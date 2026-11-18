@@ -4,10 +4,18 @@ IAM-HASH-7), against a running local-mode stack.
 Every request this suite sends reaches auth from one source address (Traefik sees
 the test host), the same address the rest of the integration suite, the e2e
 suite, and the load run sign in from. So these tests spend that one allowance
-carefully: the responsiveness test uses a handful of attempts, and the limit test,
-which must use all of it to see a 429, waits for the whole allowance to refill
-before it returns, so the tests that run after it start as if it never ran. That
-wait is the allowance's refill time, about a minute with the defaults.
+carefully. The responsiveness test uses eleven attempts. The limit test must use
+all of it to see a 429, so afterwards, also when an assertion fails, it waits one
+whole AUTH_LOGIN_WINDOW_SECONDS plus a margin: the allowance refills
+AUTH_LOGIN_MAX_ATTEMPTS attempts per window, so one window after its last counted
+attempt the source's allowance is whole again, however much of it the tests
+before had used. With the defaults that wait is 63 seconds, which is why the test
+carries its own timeout: `make test-integration` runs with `--timeout=30` and the
+nightly with `--timeout=60`.
+
+It runs in the default integration run on purpose, so the property is proven in
+the per-PR integration job, in `make master` and `make everything`, and nightly
+(docs/specs/TESTING.md).
 """
 
 import asyncio
@@ -29,6 +37,22 @@ MAX_ATTEMPTS_TO_EXHAUST = 400
 BATCH = 10
 
 
+def _window_seconds() -> int:
+    """The stack's AUTH_LOGIN_WINDOW_SECONDS, as auth reads it: the value the
+    environment (and the repo's .env, which the integration conftest loads) gives
+    compose, else the default of 60 that docker-compose.yml and auth's Settings
+    share; a value below 1 is the default there too."""
+    try:
+        value = int(os.getenv("AUTH_LOGIN_WINDOW_SECONDS") or 60)
+    except ValueError:
+        return 60
+    return value if value >= 1 else 60
+
+
+# One whole window plus a margin for the requests in flight and clock rounding.
+RESTORE_SECONDS = _window_seconds() + 3
+
+
 async def _local_mode(client: httpx.AsyncClient) -> None:
     options = await client.get("/auth/login-options")
     if options.status_code != 200 or options.json().get("auth_method") != "local":
@@ -42,16 +66,27 @@ def _wrong_login() -> dict:
 async def test_other_auth_routes_answer_while_logins_are_hashing(base_url):
     """Eight concurrent wrong-password logins each cost one bcrypt; while they
     run, `GET /auth/login-options` keeps answering, because the checks run on
-    worker threads. The bound is structural: half the time one login takes
-    alone (about one check), timed first on the same stack. With the checks on
-    the event loop, nearly every probe waited behind at least one whole check,
-    so the median probe was at least that long."""
+    worker threads.
+
+    The bound is generous on purpose: the median probe must take under half of
+    what one login takes alone (the median of three lone logins, so one lucky
+    fast login does not tighten it). With the checks off the loop a probe takes a
+    few milliseconds while a login takes about a fifth of a second, and both slow
+    down together on a slow runner, so the margin holds there. With the checks on
+    the event loop, a probe that arrives while a check runs waits for the rest of
+    it and for the checks queued with it, so the median probe is about half a
+    check or more: this test will usually, not certainly, catch that. The proof
+    that the loop stays free is in-process
+    (services/auth/tests/test_password_hashing_off_loop.py)."""
     async with httpx.AsyncClient(base_url=base_url, verify=False, timeout=60.0) as client:
         await _local_mode(client)
-        started = time.perf_counter()
-        alone = await client.post("/auth/login", json=_wrong_login())
-        one_login = time.perf_counter() - started
-        assert alone.status_code == 401
+        lone = []
+        for _ in range(3):
+            started = time.perf_counter()
+            alone = await client.post("/auth/login", json=_wrong_login())
+            lone.append(time.perf_counter() - started)
+            assert alone.status_code == 401
+        one_login = sorted(lone)[1]
 
         probes: list[float] = []
         done = asyncio.Event()
@@ -76,26 +111,28 @@ async def test_other_auth_routes_answer_while_logins_are_hashing(base_url):
     assert median < one_login / 2, (median, one_login, probes)
 
 
+@pytest.mark.timeout(RESTORE_SECONDS + 120)
 async def test_a_source_past_its_allowance_gets_the_fixed_429_for_every_account(base_url):
     async with httpx.AsyncClient(base_url=base_url, verify=False, timeout=60.0) as client:
         await _local_mode(client)
-        admitted = 0
-        limited = None
-        while limited is None and admitted < MAX_ATTEMPTS_TO_EXHAUST:
-            answers = await asyncio.gather(
-                *(client.post("/auth/login", json=_wrong_login()) for _ in range(BATCH))
-            )
-            for answer in answers:
-                if answer.status_code == 429:
-                    limited = limited or answer
-                else:
-                    assert answer.status_code == 401, answer.text
-                    admitted += 1
-        assert limited is not None, f"no 429 after {admitted} attempts from one source"
+        spent = False
         try:
+            admitted = 0
+            limited = None
+            while limited is None and admitted < MAX_ATTEMPTS_TO_EXHAUST:
+                spent = True
+                answers = await asyncio.gather(
+                    *(client.post("/auth/login", json=_wrong_login()) for _ in range(BATCH))
+                )
+                for answer in answers:
+                    if answer.status_code == 429:
+                        limited = limited or answer
+                    else:
+                        assert answer.status_code == 401, answer.text
+                        admitted += 1
+            assert limited is not None, f"no 429 after {admitted} attempts from one source"
             assert limited.json() == LIMITED
-            retry_after = int(limited.headers["Retry-After"])
-            assert retry_after >= 1
+            assert int(limited.headers["Retry-After"]) >= 1
 
             # The answer is the same for the seeded admin with the right password,
             # for an unknown account, and for a client that names another source
@@ -113,10 +150,11 @@ async def test_a_source_past_its_allowance_gets_the_fixed_429_for_every_account(
                 assert "access_token" not in resp.text
         finally:
             # Leave the source's allowance whole for every test that runs after
-            # this one: the full refill takes about admitted * retry_after seconds
-            # (retry_after rounds the refill interval up, so this over-waits).
-            wait = admitted * int(limited.headers.get("Retry-After", "1")) + 2 if limited else 0
-            await asyncio.sleep(min(wait, 600))
+            # this one, also when an assertion above failed: a refused attempt
+            # counts nothing, so one whole window after the last admitted attempt
+            # the allowance has refilled completely, whatever it held before.
+            if spent:
+                await asyncio.sleep(RESTORE_SECONDS)
 
         recovered = await client.post(
             "/auth/login", json={"email": SEED_EMAIL, "password": SEED_PASSWORD}
