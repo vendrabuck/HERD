@@ -62,11 +62,13 @@ import httpx
 import pytest
 from app.config import settings
 from app.models.federated_identity import FederatedIdentity
-from app.models.user import User
+from app.models.user import Role, User
 from app.routers import oidc as oidc_router
 from app.services import oidc_service
 from app.services.auth_service import create_user
+from app.services.federated_identity_service import identity_fingerprint
 from app.services.oidc_service import OidcRejectedError
+from app.utils.jwt import create_access_token
 from herd_common.logging import JSONFormatter
 from sqlalchemy import func, select
 
@@ -519,3 +521,141 @@ async def test_a_dex_user_whose_email_is_unverified_is_refused(live_oidc, client
     assert callback.headers["location"] == FAILED
     assert refusal_reasons(caplog) == ["email_unverified"]
     assert await row_counts() == (0, 0)
+
+
+# --- recovery through the superadmin routes (issue #1399) ---
+#
+# The lab's Dex serves one issuer, and a static user's subject is fixed by its
+# userID, so neither an issuer change nor a reissued subject can happen at Dex
+# itself. Each test instead puts HERD's stored identity where an issuer change
+# or a reissued subject leaves it (through the recovery routes themselves, so
+# no row is written by hand), then shows Dex's real sign-in refused, runs the
+# recovery, and shows Dex's next real sign-in landing in the same account.
+
+PREVIOUS_ISSUER = "http://oidc-test:5556/dex-previous"
+
+
+async def _superadmin_headers() -> dict[str, str]:
+    async with TestSessionLocal() as db:
+        sa = await create_user(
+            db, "root@herd.example", "root", "root-password-1", role=Role.SUPERADMIN
+        )
+    token = create_access_token(
+        {"sub": str(sa.id), "username": sa.username, "email": sa.email, "role": "superadmin"}
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def _rewrite(client, headers, old: str, new: str, dry_run: bool = False) -> dict:
+    resp = await client.post(
+        "/admin/federated-identities/rewrite-issuer",
+        json={"old_issuer": old, "new_issuer": new, "dry_run": dry_run},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def _relink(client, headers, user_id: str, issuer: str, subject: str) -> None:
+    resp = await client.put(
+        f"/users/{user_id}/federated-identity",
+        json={"issuer": issuer, "subject": subject},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+
+async def test_an_issuer_change_is_refused_by_dex_sign_in_then_recovered_by_the_rewrite(
+    live_oidc, client, caplog
+):
+    caplog.set_level(logging.INFO)
+    headers = await _superadmin_headers()
+    alice = await signed_in_profile(client, ALICE)
+    # HERD's state after OIDC_ISSUER moved from PREVIOUS_ISSUER to Dex's issuer:
+    # alice's identity still names the previous one.
+    assert (await _rewrite(client, headers, ISSUER, PREVIOUS_ISSUER))["rewritten"] == 1
+
+    callback = await route_sign_in(client, ALICE)
+    assert callback.headers["location"] == FAILED
+    assert refusal_reasons(caplog) == ["email_taken"]
+    assert await row_counts() == (2, 1)
+
+    dry = await _rewrite(client, headers, PREVIOUS_ISSUER, ISSUER, dry_run=True)
+    assert dry == {
+        "dry_run": True,
+        "matched": 1,
+        "conflicts": 0,
+        "rewritten": 0,
+        "collisions": [],
+        "collisions_truncated": False,
+    }
+    assert (await _rewrite(client, headers, PREVIOUS_ISSUER, ISSUER))["rewritten"] == 1
+
+    again = await signed_in_profile(client, ALICE)
+    assert again["id"] == alice["id"]
+    assert await row_counts() == (2, 1)
+
+
+async def test_a_reissued_subject_is_refused_by_dex_sign_in_then_recovered_by_the_relink(
+    live_oidc, client, caplog
+):
+    caplog.set_level(logging.INFO)
+    headers = await _superadmin_headers()
+    alice = await signed_in_profile(client, ALICE)
+    # HERD's state when alice's account was linked to a subject Dex no longer
+    # issues her (an account deleted and recreated at the provider).
+    await _relink(client, headers, alice["id"], ISSUER, "subject-before-the-reissue")
+
+    callback = await route_sign_in(client, ALICE)
+    assert callback.headers["location"] == FAILED
+    assert refusal_reasons(caplog) == ["email_taken"]
+
+    # The superadmin reads alice's subject at the provider (for this lab, the
+    # encoding of her userID in dex.yaml) and names it.
+    await _relink(client, headers, alice["id"], ISSUER, dex_subject(ALICE_USER_ID))
+    again = await signed_in_profile(client, ALICE)
+    assert again["id"] == alice["id"]
+    async with TestSessionLocal() as db:
+        identity = (await db.execute(select(FederatedIdentity))).scalar_one()
+    assert (str(identity.user_id), identity.issuer, identity.subject) == (
+        alice["id"],
+        ISSUER,
+        ALICE_SUBJECT,
+    )
+
+
+async def test_a_refused_dex_sign_in_leaves_a_candidate_and_a_relink_by_it_recovers_the_account(
+    live_oidc, client, caplog
+):
+    """Owner decision of 2026-11-18: the refused sign-in's identity is kept as a
+    relink candidate against alice's account, the superadmin reads it (its
+    fingerprint, never the subject) and relinks by its id, and her next Dex
+    sign-in lands in the same account."""
+    caplog.set_level(logging.INFO)
+    headers = await _superadmin_headers()
+    alice = await signed_in_profile(client, ALICE)
+    await _relink(client, headers, alice["id"], ISSUER, "subject-before-the-reissue")
+
+    callback = await route_sign_in(client, ALICE)
+    assert callback.headers["location"] == FAILED
+    listing = await client.get(
+        f"/users/{alice['id']}/federated-identity/candidates", headers=headers
+    )
+    assert listing.status_code == 200, listing.text
+    body = listing.json()
+    assert body["captured_total"] == 1
+    [candidate] = body["candidates"]
+    assert candidate["issuer"] == ISSUER
+    assert candidate["fingerprint"] == identity_fingerprint(ISSUER, ALICE_SUBJECT)
+    assert ALICE_SUBJECT not in listing.text
+
+    relinked = await client.put(
+        f"/users/{alice['id']}/federated-identity",
+        json={"candidate_id": candidate["id"]},
+        headers=headers,
+    )
+    assert relinked.status_code == 200, relinked.text
+    again = await signed_in_profile(client, ALICE)
+    assert again["id"] == alice["id"]
+    after = await client.get(f"/users/{alice['id']}/federated-identity/candidates", headers=headers)
+    assert after.json()["candidates"] == []

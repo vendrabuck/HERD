@@ -1190,6 +1190,13 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # deletes all of them in a finally; it holds a users-table lock that blocks
 # writes (never reads) for well under a second per race, and row locks on
 # its own flow rows only.
+# The auth suite added for issue #1399 (the superadmin issuer rewrite and
+# identity relink) needs the same tables. It commits its own accounts and
+# identities under random tags, seeds foreign accounts whose identities share
+# its subjects under other issuers, asserts every foreign users and
+# federated_identities row unchanged, and deletes all of them in a finally; it
+# holds a federated_identities table lock that blocks writes (never reads), or
+# one of its own account rows FOR UPDATE, for well under a second per race.
 # tests/unit/test_pg_live_gate_wiring.py fails if a new *_live_pg.py file is
 # written and then wired into nothing.
 _gate-pg-live-tests:
@@ -1204,6 +1211,8 @@ _gate-pg-live-tests:
 		uv run pytest tests/test_ldap_sync_service_live_pg.py -v) && \
 	(cd services/auth && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_oidc_flow_service_live_pg.py -v) && \
+	(cd services/auth && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_federated_identity_live_pg.py -v) && \
 	(cd services/common && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_advisory_lock_live_pg.py -v) && \
 	(cd services/common && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
