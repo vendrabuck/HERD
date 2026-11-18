@@ -348,6 +348,65 @@ async def test_login_endpoint_unreachable_directory_is_503(monkeypatch, ldap_set
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "template",
+    [
+        "(uid={user})",
+        "(uid={0})",
+        "(uid={username}",
+        "(uid=user4)",
+        "(|(uid={username})(uid=user4))",
+        "(!(uid={username}))",
+    ],
+)
+async def test_login_endpoint_unusable_filter_is_503_for_every_login(
+    monkeypatch, ldap_settings, http_client, template
+):
+    """Issue #1446 against a real directory: an LDAP_USER_FILTER that is not a
+    usable template is the 503 for a known and an unknown login alike: never a
+    500, and, for a filter without {username}, never the sign-in as user4 that
+    such a filter would give any login name holding user4's password."""
+    monkeypatch.setattr(settings, "ldap_user_filter", template, raising=False)
+    answers = [
+        await http_client.post("/login", json={"email": login, "password": USER_PW})
+        for login in ("user4", "does-not-exist")
+    ]
+    assert [(r.status_code, r.json()) for r in answers] == [
+        (503, {"detail": "Directory unavailable, credentials not checked"})
+    ] * 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", [" ", "\t", "\u3000"])
+async def test_login_endpoint_a_blank_name_never_becomes_a_presence_filter(
+    monkeypatch, ldap_settings, http_client, name
+):
+    """The #1446 second review against a real directory: ldap3 strips the value,
+    so a blank name made `(uid=*{username})` the presence filter `(uid=*)`, and
+    the first entry's password signed in as that entry. Refused before any
+    directory call, like an empty password."""
+    monkeypatch.setattr(settings, "ldap_user_filter", "(uid=*{username})", raising=False)
+    resp = await http_client.post("/login", json={"email": name, "password": USER_PW})
+    assert (resp.status_code, resp.json()) == (401, {"detail": "Invalid credentials"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("template", ["({username})", "(&(objectClass=*)({username}))"])
+async def test_login_endpoint_a_login_name_never_supplies_an_assertion(
+    monkeypatch, ldap_settings, http_client, template
+):
+    """The #1446 review's bypass against a real directory: with the login name
+    standing for a whole assertion, `uid=user4` and user4's password signed in.
+    Such a template is refused, so the answer is the 503."""
+    monkeypatch.setattr(settings, "ldap_user_filter", template, raising=False)
+    resp = await http_client.post("/login", json={"email": "uid=user4", "password": USER_PW})
+    assert (resp.status_code, resp.json()) == (
+        503,
+        {"detail": "Directory unavailable, credentials not checked"},
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("password", ["\t", "Pass\x00word1", "Pass\ue000word1"])
 async def test_login_endpoint_answers_known_and_unknown_users_alike_for_a_saslprep_refusal(
     ldap_settings, http_client, password
@@ -1033,3 +1092,87 @@ async def test_interval_loop_produces_a_run_row_against_live_directory(
         assert emails == {f"user{n}@company.local" for n in (1, 2, 3)}
     finally:
         await file_engine.dispose()
+
+
+# -- Issue #1448: a binary attribute value never becomes account data -------------
+#
+# OpenLDAP enforces the mail and uid syntaxes, so a value that is not UTF-8 cannot
+# sit in either; the real case is a setting pointed at a binary attribute. A
+# temporary entry (added and deleted here, so the seeded layout and
+# _ALL_SEEDED_PRESENT_EMAILS stay as they are, and no `make ldap-reset` is needed)
+# carries a jpegPhoto whose octets are not UTF-8, and the tests point
+# LDAP_EMAIL_ATTRIBUTE or LDAP_USERNAME_ATTRIBUTE at it.
+
+BINARY_UID = "binary-tmp-1"
+BINARY_DN = f"uid={BINARY_UID},{PEOPLE_DN}"
+# A JPEG start-of-image and JFIF header: 0xFF is never UTF-8.
+BINARY_VALUE = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+
+
+@pytest.fixture
+def binary_person():
+    conn = _admin_conn()
+    try:
+        _safe_delete(conn, BINARY_DN)
+        conn.add(
+            BINARY_DN,
+            attributes={
+                "objectClass": ["inetOrgPerson"],
+                "uid": BINARY_UID,
+                "cn": "Binary Tmp1",
+                "sn": "Tmp1",
+                "mail": f"{BINARY_UID}@company.local",
+                "userPassword": USER_PW,
+                "jpegPhoto": BINARY_VALUE,
+            },
+        )
+        assert conn.result["result"] == 0, conn.result
+        yield BINARY_DN
+    finally:
+        _safe_delete(conn, BINARY_DN)
+        conn.unbind()
+
+
+@pytest.mark.asyncio
+async def test_bind_user_binary_username_attribute_falls_back_to_login_name(
+    monkeypatch, ldap_settings, binary_person
+):
+    monkeypatch.setattr(settings, "ldap_username_attribute", "jpegPhoto", raising=False)
+    identity = await ldap_service.bind_user(BINARY_UID, USER_PW)
+    assert identity is not None
+    assert (identity.username, identity.email) == (BINARY_UID, f"{BINARY_UID}@company.local")
+
+
+@pytest.mark.asyncio
+async def test_login_endpoint_binary_email_attribute_is_401(
+    monkeypatch, ldap_settings, http_client, binary_person
+):
+    monkeypatch.setattr(settings, "ldap_email_attribute", "jpegPhoto", raising=False)
+    resp = await http_client.post("/login", json={"email": BINARY_UID, "password": USER_PW})
+    assert (resp.status_code, resp.json()) == (401, {"detail": "Invalid credentials"})
+
+
+@pytest.mark.asyncio
+async def test_resolve_member_binary_email_attribute_is_missing_email(
+    monkeypatch, ldap_settings, binary_person
+):
+    monkeypatch.setattr(settings, "ldap_email_attribute", "jpegPhoto", raising=False)
+    resolution = await ldap_service.resolve_member(binary_person)
+    assert resolution == ldap_service.LdapMemberResolution(
+        None, ldap_service.MEMBER_SKIP_MISSING_EMAIL
+    )
+
+
+@pytest.mark.asyncio
+async def test_present_emails_leaves_out_a_binary_value(monkeypatch, ldap_settings, binary_person):
+    """The one entry with a jpegPhoto holds a value that is not text: the
+    enumeration finds the entry and collects nothing from it (before #1448 it
+    collected the text of the bytes repr)."""
+    monkeypatch.setattr(settings, "ldap_email_attribute", "jpegPhoto", raising=False)
+    present = await ldap_service.present_emails()
+    assert present == frozenset()
+    # The entry is listed but its email cannot be read; its uid can, so the
+    # sweep holds back only that account (IAM-SWEEP-10).
+    assert present.unreadable_entries == 1
+    assert present.held_usernames == {BINARY_UID}
+    assert present.unidentified_entries == 0

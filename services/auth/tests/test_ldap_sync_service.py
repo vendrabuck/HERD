@@ -163,18 +163,21 @@ def _enable_deactivation(
 
 def _install_presence(monkeypatch, present, disabled=None) -> None:
     """Fake ldap_service.present_emails/disabled_emails. present/disabled are
-    a frozenset[str] or an Exception to raise."""
+    a set of emails (a PresentEmails passes through, to carry
+    unreadable_entries) or an Exception to raise."""
 
     async def fake_present_emails(*, run_holder=None):
         if isinstance(present, Exception):
             raise present
-        return frozenset(present)
+        if isinstance(present, ldap_service.PresentEmails):
+            return present
+        return ldap_service.PresentEmails(present)
 
     async def fake_disabled_emails(*, run_holder=None):
         value = disabled if disabled is not None else frozenset()
         if isinstance(value, Exception):
             raise value
-        return frozenset(value)
+        return ldap_service.PresentEmails(value)
 
     monkeypatch.setattr(ldap_service, "present_emails", fake_present_emails)
     monkeypatch.setattr(ldap_service, "disabled_emails", fake_disabled_emails)
