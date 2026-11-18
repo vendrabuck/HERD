@@ -1026,8 +1026,10 @@ USERNAME_MAX_LENGTH = User.__table__.c.username.type.length
 
 # Unicode categories a text value may not hold: controls (Cc: NUL, which
 # Postgres cannot store, tab, newline, escape, DEL, C1), format characters (Cf:
-# right-to-left override, zero-width space and joiners, byte order mark, soft
-# hyphen), line and paragraph separators (Zl, Zp), and surrogates (Cs).
+# bidi embeddings, overrides, and isolates, zero width space, word joiner, byte
+# order mark, soft hyphen; the zero width non-joiner and joiner are allowed only
+# between letters or marks, see _JOINERS), line and paragraph separators (Zl,
+# Zp), and surrogates (Cs).
 _REFUSED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
 
 
@@ -1035,6 +1037,30 @@ def _is_noncharacter(code_point: int) -> bool:
     """The 66 Unicode noncharacters: U+FDD0 to U+FDEF and the last two code
     points of every plane (U+FFFE, U+FFFF, U+1FFFE, ...)."""
     return 0xFDD0 <= code_point <= 0xFDEF or (code_point & 0xFFFE) == 0xFFFE
+
+
+# The zero width non-joiner and joiner: format characters (Cf) that Persian and
+# Indic text needs inside words, so they are allowed between two letters or
+# marks (Unicode categories L* and M*) and refused anywhere else.
+_JOINERS = frozenset({"\u200c", "\u200d"})
+
+
+def _is_letter_or_mark(ch: str) -> bool:
+    return unicodedata.category(ch)[0] in "LM"
+
+
+def _refused_character(value: str, index: int) -> bool:
+    """True when value[index] may not appear in a text value: a character of
+    _REFUSED_CATEGORIES or a noncharacter, except a joiner (_JOINERS) between
+    two letters or marks."""
+    ch = value[index]
+    if ch in _JOINERS:
+        return not (
+            0 < index < len(value) - 1
+            and _is_letter_or_mark(value[index - 1])
+            and _is_letter_or_mark(value[index + 1])
+        )
+    return unicodedata.category(ch) in _REFUSED_CATEGORIES or _is_noncharacter(ord(ch))
 
 
 def _text_value(value: object, max_length: int | None = None) -> str | None:
@@ -1049,7 +1075,9 @@ def _text_value(value: object, max_length: int | None = None) -> str | None:
 
     - is not empty once Unicode white space is stripped (a lone space or
       no-break space is no address and no name);
-    - holds no character of _REFUSED_CATEGORIES and no noncharacter;
+    - holds no character of _REFUSED_CATEGORIES and no noncharacter, except
+      a zero width non-joiner or joiner between two letters or marks
+      (_refused_character);
     - is at most max_length characters, when given (the column it is bound for).
 
     Every other value is None, including any type but `str` and `bytes` (an int
@@ -1064,9 +1092,8 @@ def _text_value(value: object, max_length: int | None = None) -> str | None:
             return None
     if not isinstance(value, str) or not value.strip():
         return None
-    for ch in value:
-        if unicodedata.category(ch) in _REFUSED_CATEGORIES or _is_noncharacter(ord(ch)):
-            return None
+    if any(_refused_character(value, index) for index in range(len(value))):
+        return None
     if max_length is not None and len(value) > max_length:
         return None
     return value

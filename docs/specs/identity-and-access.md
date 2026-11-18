@@ -662,9 +662,11 @@ account automatically.
   read of an identity attribute goes through one conversion. A value is text when it is
   a `str`, or `bytes` that decode as strict UTF-8, that is not empty once Unicode white
   space is stripped, and that holds no control character (Cc, NUL included, which
-  Postgres cannot store), format character (Cf: right-to-left override, zero-width
-  space and joiners, byte order mark, soft hyphen), line or paragraph separator (Zl,
-  Zp), surrogate, or noncharacter; an email must also fit the 255-character email
+  Postgres cannot store), format character (Cf: the bidi embeddings, overrides, and
+  isolates, zero width space, word joiner, byte order mark, soft hyphen; the zero
+  width non-joiner and joiner, which Persian and Indic text needs, only between two
+  letters or marks and never at either end), line or paragraph separator (Zl, Zp),
+  surrogate, or noncharacter; an email must also fit the 255-character email
   column and a username the 100-character username column. A value that passes is used
   exactly as the directory gave it; anything else is left out and counts as absent. So
   login refuses an entry with no email value that is text (IAM-LDAP-5) and falls back
@@ -682,7 +684,7 @@ account automatically.
   so `bytes` became the text of its repr (`"b'\\xff...'"`) and was provisioned as the
   email or username; such accounts stay as they are (see the CHANGELOG upgrade note and
   TROUBLESHOOTING). \
-  Enforced in: `services/auth/app/services/ldap_service.py` (`_text_value`, `_text_values`, `_first_text_value`, `_REFUSED_CATEGORIES`, `EMAIL_MAX_LENGTH`, `USERNAME_MAX_LENGTH`, `_bind_user_sync`, `_resolution_for`, `_fetch_group_sync`, `_paged_user_emails_sync`) \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`_text_value`, `_text_values`, `_first_text_value`, `_REFUSED_CATEGORIES`, `_refused_character`, `_JOINERS`, `EMAIL_MAX_LENGTH`, `USERNAME_MAX_LENGTH`, `_bind_user_sync`, `_resolution_for`, `_fetch_group_sync`, `_paged_user_emails_sync`) \
   Pinned by: `services/auth/tests/test_ldap_attribute_text.py` (`test_text_value_is_text_or_none`, `test_the_bounds_are_the_columns`, `test_a_value_longer_than_its_column_is_not_text`, `test_ldap3_returns_a_value_that_is_not_utf8_as_bytes`, `test_a_login_whose_only_email_is_not_text_is_refused`, `test_a_login_whose_email_holds_no_usable_text_is_refused`, `test_an_email_longer_than_the_column_is_refused`, `test_two_entries_whose_email_is_a_space_never_share_an_account`, `test_the_first_text_email_is_used`, `test_the_attributes_are_read_only_after_the_user_bind`, `test_the_route_refuses_an_email_that_is_not_text_and_creates_nothing`, `test_the_route_provisions_only_text`, `test_a_member_whose_identity_is_not_text_is_skipped_as_missing`, `test_a_member_with_a_text_value_after_a_binary_one_resolves`, `test_a_group_name_or_member_that_is_not_text_is_left_out`, `test_the_enumeration_leaves_out_what_is_not_text_with_one_line`, `test_a_sync_pass_never_provisions_a_bytes_repr_and_keeps_removals_suppressed`, `test_a_mapping_of_a_group_whose_name_is_not_text_caches_the_dn`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_binary_email_attribute_is_401`, `test_resolve_member_binary_email_attribute_is_missing_email`, `test_present_emails_leaves_out_a_binary_value`)
 
 **Out of scope.** Roles never come from the directory (ADR 0011, Blast radius). SAML and

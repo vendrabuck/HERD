@@ -68,7 +68,16 @@ VALUES = {
     "spaces_and_tab": (" \u3000 ", None),
     "right_to_left_override": ("carol\u202e@example.com", None),
     "zero_width_space": ("car\u200bol", None),
-    "zero_width_non_joiner": ("car\u200col", None),
+    "zero_width_non_joiner_alone": ("\u200c", None),
+    "zero_width_non_joiner_first": ("\u200c\u0645\u06cc", None),
+    "zero_width_non_joiner_last": ("\u0645\u06cc\u200c", None),
+    "zero_width_joiner_last": ("\u0915\u094d\u200d", None),
+    "zero_width_non_joiner_after_a_digit": ("1\u200c\u0645", None),
+    "zero_width_non_joiner_before_a_space": ("\u0645\u200c \u06cc", None),
+    "zero_width_joiner_in_an_emoji_sequence": ("\U0001f468\u200d\U0001f469", None),
+    "left_to_right_embedding": ("carol\u202a", None),
+    "right_to_left_isolate": ("\u2067carol\u2069", None),
+    "word_joiner": ("car\u2060ol", None),
     "byte_order_mark": ("\ufeffcarol", None),
     "soft_hyphen": ("car\u00adol", None),
     "line_separator": ("carol\u2028", None),
@@ -89,6 +98,17 @@ VALUES = {
     "plus_email": ("user+tag@example.com", "user+tag@example.com"),
     "idn_email": ("j\u00f6rg@b\u00fccher.example", "j\u00f6rg@b\u00fccher.example"),
     "inner_space": ("Mary Ann", "Mary Ann"),
+    # The zero width non-joiner and joiner between letters or marks (Persian,
+    # Indic scripts) are text.
+    "persian_with_zero_width_non_joiner": (
+        "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645",
+        "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645",
+    ),
+    "devanagari_conjunct_with_zero_width_joiner": (
+        "\u0915\u094d\u200d\u0937",
+        "\u0915\u094d\u200d\u0937",
+    ),
+    "latin_letters_around_a_joiner": ("car\u200col", "car\u200col"),
     "surrounding_space_kept": (" carol ", " carol "),
 }
 
