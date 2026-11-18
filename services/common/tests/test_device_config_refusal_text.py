@@ -82,7 +82,7 @@ KEYWORD_CASES: dict[str, tuple[dict, dict, str]] = {
     "pattern": (
         _obj(password={"type": "string", "pattern": "^[a-z]+$"}),
         {"password": CANARY},
-        "at password: must match the schema's pattern",
+        "at ['password']: must match the schema's pattern",
     ),
     "minLength": (
         _obj(line={"type": "string", "minLength": 50}),

@@ -513,7 +513,9 @@ both services.
   taken from the config (the path, or a field `additionalProperties` refuses) is masked
   as CFG-EXEC-8 masks a string, cut to 64 characters, and quoted with `repr` (so a
   control character or a lone surrogate is written as its escape) unless it is a plain
-  identifier, which is written bare. A field name the schema defines (`required`,
+  identifier, which is written bare; a path whose FIRST part is a credential keyword
+  token is written quoted (`at ['password']: ...`), because `password: ...` reads to
+  CFG-EXEC-8's line rule as a credential (issue #1464). A field name the schema defines (`required`,
   `dependentRequired`) is shown in full from the registry; from a driver-published
   schema only when it is a plain name of at most 64 characters (a letter or `_`, then
   letters, digits, `_`, `-`, or `.`), and otherwise counted (`needs a required field`,
@@ -529,8 +531,8 @@ both services.
   kept apart on the error (`prefix`, `reason`); the reason's rule words never use a
   credential keyword, so CFG-EXEC-10's mask, which covers the reason only, leaves a
   clean refusal unchanged, and no device name changes it. \
-  Enforced in: `services/common/herd_common/device_config.py` (`ConfigValidationError`, `schema_error_text`, `_rule_text`, `_schema_names_text`, `_is_schema_name`, `_path_text`, `_name_text`) \
-  Pinned by: `services/common/tests/test_device_config_refusal_text.py` (`test_published_schema_free_text_is_not_quoted`, `test_schema_values_are_shown_when_the_caller_allows_them`, `test_a_long_or_structured_schema_value_is_never_quoted`, `test_format_rule_names_the_format_only`, `test_plain_key_is_written_bare_and_other_keys_are_quoted`, `test_a_key_that_reads_like_a_credential_line_is_masked`, `test_a_long_key_is_cut`, `test_a_key_with_a_control_character_or_lone_surrogate_is_escaped`, `test_a_path_deeper_than_the_cap_is_cut`, `test_refusal_words_survive_the_stored_error_mask_unchanged`, `test_published_schema_names_are_shown_only_when_plain`, `test_registry_path_shows_every_required_name`, `test_the_prefix_holds_the_device_name_and_the_reason_the_rest`, `test_the_non_schema_refusals_split_the_same_way`)
+  Enforced in: `services/common/herd_common/device_config.py` (`ConfigValidationError`, `schema_error_text`, `_rule_text`, `_schema_names_text`, `_is_schema_name`, `_path_text`, `_name_text`); `services/common/herd_common/config_redaction.py` (`is_keyword_token`) \
+  Pinned by: `services/common/tests/test_device_config_refusal_text.py` (`test_refusal_names_path_and_rule_never_the_value`, `test_published_schema_free_text_is_not_quoted`, `test_schema_values_are_shown_when_the_caller_allows_them`, `test_a_long_or_structured_schema_value_is_never_quoted`, `test_format_rule_names_the_format_only`, `test_plain_key_is_written_bare_and_other_keys_are_quoted`, `test_a_key_that_reads_like_a_credential_line_is_masked`, `test_a_long_key_is_cut`, `test_a_key_with_a_control_character_or_lone_surrogate_is_escaped`, `test_a_path_deeper_than_the_cap_is_cut`, `test_refusal_words_survive_the_stored_error_mask_unchanged`, `test_published_schema_names_are_shown_only_when_plain`, `test_registry_path_shows_every_required_name`, `test_the_prefix_holds_the_device_name_and_the_reason_the_rest`, `test_the_non_schema_refusals_split_the_same_way`); `services/common/tests/test_config_redaction.py` (`test_is_keyword_token_is_the_line_rules_token`)
 
 **Out of scope.** The assistant's schema tool (`ai-features.md`, AI-TOOL-7) and the AI
 commit's own config check (AI-COMMIT-3), both built on the registry here. What the
@@ -890,21 +892,32 @@ is WIRE-DRIVER-6 in `provisioning-and-wiring.md`.
   Enforced in: `services/execution/app/services/execution_service.py` (`run_driver_action`, `redact_context_for_logging`, `extract_password_keys`) \
   Pinned by: `services/execution/tests/test_api_endpoints.py` (`test_execute_success`); `services/execution/tests/test_execution_service.py` (`test_redact_context`, `test_extract_password_keys`)
 - **CFG-EXEC-8.** A non-empty `method_kwargs` is stored in `input_params` under
-  `method_kwargs` only as a masked copy, for every action: a value under a key whose name
-  matches the log formatter's credential key pattern is `[redacted]`, and inside a string
-  everything after a credential keyword token (`password`, `passwd`, `passphrase`,
-  `secret`, `community`, `key`, `key-string`, `md5`, `authentication`, `auth`, or a
-  hyphenated or underscored name ending in one) on the same line is `[redacted]`.
-  `authentication` and `auth` (issue #1464) catch FRR's `ip rip authentication string`,
-  `ip nhrp authentication`, and `tcp-md5-auth` secrets and also mask the mode word after
-  `ip ospf authentication`. Both rules are heuristics with the limits section 13 lists.
+  `method_kwargs` only as a masked copy, for every action, and the copy holds no value
+  the mask recognizes; a value it does not recognize is stored as sent (the limits are
+  in section 13). The mask (`config_redaction.py`, whose module docstring states each
+  rule exactly) has three rules. A value under a key is `[redacted]` when the key's name
+  matches the log formatter's credential key pattern or any part of the normalized key
+  (split at case changes and at every character other than a letter or digit,
+  lowercased) is one of `password`, `passwd`, `passphrase`, `secret`, `community`, `key`,
+  `md5`, `authentication`, `auth`, `phash`, `psk`, `token`, `bearer` (so
+  `authentication-key`, `key_string`, `pre_shared_key`, and `tacacsKey` are masked). A
+  string that is a JSON object or array of at most 256 KiB is masked as that structure
+  and written back as JSON. In any other string, each line has a `scheme://user:x@`
+  password masked and then everything after the first credential keyword token
+  `[redacted]`: one of those words or `key-string`, alone or after a prefix ending in
+  `-` or `_` (`hashed-password`, `pre-shared-key`, `wpa-psk`, `tcp-md5-auth`), starting
+  the line or after white space or one of `"{[(,;?&`, and followed by white space, `:`,
+  `=`, a quote, or the end of the line (`Password: x`, `PASSWORD=x`, `key:x` are
+  masked). Issue #1464 added `authentication`, `auth`, `phash`, `psk`, `token`, and
+  `bearer`, the key-part rule, the punctuation forms, embedded JSON, and URL passwords;
+  `authentication` and `auth` also mask the mode word after `ip ospf authentication`.
   The assistant's tools that relay a stored config version or a run row apply the same
   mask before the text reaches a model provider (`ai-features.md`, AI-TOOL-12).
-  `method_kwargs_redacted` records
-  whether anything was masked, and a `config_version_id` the caller sent is stored
-  beside it. The driver receives the arguments as sent. \
-  Enforced in: `services/execution/app/services/execution_service.py` (`create_execution_run`); `services/common/herd_common/config_redaction.py` (`redact_config`, `redact_command_text`) \
-  Pinned by: `services/execution/tests/test_run_arguments_storage.py` (`test_configure_run_stores_no_credential_value_from_an_frr_config`, `test_run_without_credentials_stores_its_arguments_as_sent`, `test_internal_execute_records_the_config_version`, `test_create_execution_run_masks_any_action_arguments`); `services/common/tests/test_config_redaction.py` (`test_frr_config_keeps_no_credential_value`, `test_value_under_a_credential_named_key_is_masked_whole`, `test_configuration_without_credentials_is_unchanged`, `test_words_that_only_contain_a_keyword_are_not_keywords`, `test_frr_lines_whose_secret_follows_an_authentication_keyword_are_masked`, `test_a_line_that_ends_at_an_authentication_keyword_is_unchanged`, `test_words_that_only_contain_auth_are_not_keywords`, `test_known_limits_are_left_as_written`)
+  `method_kwargs_redacted` records whether anything was masked, and a
+  `config_version_id` the caller sent is stored beside it. The driver receives the
+  arguments as sent. \
+  Enforced in: `services/execution/app/services/execution_service.py` (`create_execution_run`); `services/common/herd_common/config_redaction.py` (`redact_config`, `redact_command_text`, `_key_is_credential`, `_KEY_PARTS`, `_KEYWORD_IN_LINE`, `_URL_USERINFO`, `_embedded_json`, `_MAX_EMBEDDED_JSON_CHARS`) \
+  Pinned by: `services/execution/tests/test_run_arguments_storage.py` (`test_configure_run_stores_no_credential_value_from_an_frr_config`, `test_run_without_credentials_stores_its_arguments_as_sent`, `test_internal_execute_records_the_config_version`, `test_create_execution_run_masks_any_action_arguments`); `services/common/tests/test_config_redaction.py` (`test_frr_config_keeps_no_credential_value`, `test_value_under_a_credential_named_key_is_masked_whole`, `test_configuration_without_credentials_is_unchanged`, `test_words_that_only_contain_a_keyword_are_not_keywords`, `test_frr_lines_whose_secret_follows_an_authentication_keyword_are_masked`, `test_a_line_that_ends_at_an_authentication_keyword_is_unchanged`, `test_words_that_only_contain_auth_are_not_keywords`, `test_known_limits_are_left_as_written`, `test_keys_the_line_keywords_name_are_masked_as_keys`, `test_keys_whose_parts_are_not_keywords_are_left_alone`, `test_a_keyword_with_punctuation_attached_masks_its_value`, `test_ordinary_colons_and_equals_are_left_alone`, `test_new_keywords_mask_the_rest_of_their_line`, `test_a_url_password_is_masked`, `test_json_inside_a_string_is_masked_as_a_structure`, `test_json_without_credentials_is_kept_byte_for_byte`, `test_text_that_only_looks_like_json_is_line_masked`, `test_embedded_json_is_bounded_in_size_and_depth`)
 - **CFG-EXEC-9.** A driver load failure ends the run `FAILED` with
   `driver load failed: <ClassName>` (the wrapped cause's class when there is one); the
   exception text goes to the log message only. \
@@ -1542,16 +1555,21 @@ None at present. (#1279 is resolved by CFG-LOAD-3.)
 ### Limits by decision
 
 - The credential mask is a heuristic (the `config_redaction.py` module docstring,
-  "Limits") (CFG-EXEC-8). The key rule reads key names against the log formatter's
-  pattern (`password`, `passwd`, `secret`, `authorization`, `api_key`, `kek`, `cookie`,
-  `credential`, `jwt`, `bearer`, `private_key`, `ssh_key`, `community`, `token` except
-  `token_id` and `token_count`), so a secret under any other key name (`psk`, `md5`,
-  `key`, `passphrase`, `pre_shared_key`) is not masked unless its value carries a
-  keyword; the string rule masks only what follows a keyword token on its line, so a
-  secret in free text with no keyword before it is not masked. No in-repo driver's
-  configuration schema has a credential-bearing field the key rule misses (the
-  registry's fields and `frr_mgmt`'s `commands` and `command`, checked for issue #1464);
-  a new driver whose schema has one extends the pattern in `herd_common`, never a copy.
+  "Limits") (CFG-EXEC-8). Not masked: a secret under a key none of whose parts is a
+  keyword and that the log pattern does not match (`pw`, `pass`, `otp`, `pin`,
+  `privkey`, `keystring`, `hash`); a secret in free text with no keyword before it on its
+  line, including a secret on the line or list item after the one ending in a keyword
+  (`password` then `S3cret`: masking the next item would also cut the command after
+  every `no password` line, so it stays a limit), a keyword glued to its value
+  (`passwordS3cret`, a mistyped device echo), a split or abbreviated keyword
+  (`pass word`, `pw=`), and encoded text (base64); a keyword right after a single quote
+  (Python's `repr` of a dict); and a secret written as a key name itself. `ao` (a TCP-AO
+  option, which names a key chain), `priv` (SNMPv3's privacy password, always after
+  `auth`), and `pass` and `pw` (plain words in firewall and pseudowire configuration) are
+  not keywords on purpose. No in-repo driver's configuration schema has a
+  credential-bearing field the key rule misses (the registry's fields and `frr_mgmt`'s
+  `commands` and `command`, checked for issue #1464); a new driver whose schema has one
+  extends the pattern in `herd_common`, never a copy.
 - A driver's dry-run declaration is trusted ([DRIVERS.md](../DRIVERS.md), "Dry-run
   support") (CFG-DRY-4).
 - Driver packages are trusted code and the sandbox limits resources only
@@ -1592,9 +1610,12 @@ None at present. (#1279 is resolved by CFG-LOAD-3.)
   are never edited in place, so a version id names one configuration (the
   `_recover_masked_kwargs` docstring) (CFG-RUN-7). A run that a direct `POST /execute`
   started with masked arguments and no `config_version_id` cannot be retried; a new run
-  is the way (CFG-RUN-7). A run masked before issue #1464 widened the keywords, whose
-  configuration also holds an `authentication` or `auth` line, no longer equals its
-  re-masked version and its retry is refused the same way (CFG-RUN-7, CFG-EXEC-8).
+  is the way (CFG-RUN-7). A run masked before issue #1464 widened the mask, whose
+  configuration also holds something the wider mask now matches (an `authentication`,
+  `auth`, `phash`, `psk`, `token`, or `bearer` line, a keyword with `:` or `=` attached,
+  a URL password, JSON in a string, or a key such as `pre_shared_key`), no longer equals
+  its re-masked version and its retry is refused the same way; a run whose
+  configuration holds none of those retries as before (CFG-RUN-7, CFG-EXEC-8).
 - A run refused before issue #1457 keeps the old refusal text in its row, which can
   quote the refused configuration, credentials included. Every run read withholds it
   (CFG-RUN-8), but a direct database read, a log line written before the upgrade, and

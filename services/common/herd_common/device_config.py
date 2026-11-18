@@ -20,7 +20,7 @@ from typing import Any
 
 import jsonschema
 
-from herd_common.config_redaction import redact_command_text
+from herd_common.config_redaction import is_keyword_token, redact_command_text
 
 # Connection types whose driver CONTRACT includes `configure` (issue #839).
 # Capability comes from the contract, not a declared flag and not code
@@ -299,7 +299,15 @@ def _path_text(path: Iterable[Any]) -> str:
     for part in parts[:_MAX_PATH_PARTS]:
         if isinstance(part, int) and not isinstance(part, bool):
             out += f"[{part}]"
-        elif isinstance(part, str) and len(part) <= _MAX_NAME_CHARS and _PLAIN_KEY.fullmatch(part):
+        elif (
+            isinstance(part, str)
+            and len(part) <= _MAX_NAME_CHARS
+            and _PLAIN_KEY.fullmatch(part)
+            and (out or not is_keyword_token(part))
+        ):
+            # A path that STARTS with a bare credential keyword (`password: ...`)
+            # would read to the stored-error mask as a credential line; it is
+            # written quoted (`['password']`) instead (issue #1464).
             out += f".{part}" if out else part
         else:
             out += f"[{_name_text(part)}]"
