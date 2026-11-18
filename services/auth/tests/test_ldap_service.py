@@ -24,6 +24,7 @@ from ldap3.core.exceptions import (
     LDAPStartTLSError,
 )
 from ldap3.core.results import (
+    RESULT_ADMIN_LIMIT_EXCEEDED,
     RESULT_BUSY,
     RESULT_CONSTRAINT_VIOLATION,
     RESULT_INAPPROPRIATE_AUTHENTICATION,
@@ -39,7 +40,7 @@ from ldap3.core.results import (
 )
 from ldap3.utils.conv import escape_filter_chars
 
-from tests._fake_directory import USER_DN, FakeDirectory, alice_entry
+from tests._fake_directory import USER_DN, FakeDirectory, FakeEntry, alice_entry
 
 _USER_DN = USER_DN
 
@@ -261,15 +262,87 @@ async def test_bind_user_success_through_the_connection_seam(directory):
     assert directory.user_bind_passwords == [_PASSWORD]
 
 
+# --- Issue #1447: a login signs in only as the single entry the filter matches for
+#     that name. More than one match is refused like no match: None, after one
+#     search and no user bind, with one ERROR that names the setting and never a DN.
+
+
+def _person(n: int) -> FakeEntry:
+    return FakeEntry(
+        f"CN=alice{n},OU=Users,DC=example,DC=com",
+        {"mail": [f"alice{n}@example.com"], "sAMAccountName": ["alice"]},
+    )
+
+
+# (result code, entries): every answer that proves more than one entry matches.
+_AMBIGUOUS_ANSWERS = {
+    "two_entries": (RESULT_SUCCESS, [_person(1), _person(2)]),
+    "two_entries_and_more_behind_the_limit": (RESULT_SIZE_LIMIT_EXCEEDED, [_person(1), _person(2)]),
+    "two_entries_then_a_time_limit": (RESULT_TIME_LIMIT_EXCEEDED, [_person(1), _person(2)]),
+    # The directory's own size limit is 1: it sent one and says more matched.
+    "one_entry_under_a_server_limit_of_one": (RESULT_SIZE_LIMIT_EXCEEDED, [_person(1)]),
+    # A directory that ignores the requested limit.
+    "three_entries": (RESULT_SUCCESS, [_person(1), _person(2), _person(3)]),
+    # One entry reached twice (RFC 4511 lets alias dereferencing return it twice).
+    "the_same_entry_twice": (RESULT_SUCCESS, [_person(1), _person(1)]),
+}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("code", [RESULT_SIZE_LIMIT_EXCEEDED, RESULT_TIME_LIMIT_EXCEEDED])
-async def test_bind_user_a_limited_search_that_found_the_user_still_signs_in(directory, code):
-    """ldap3's search() is True whenever the response holds an entry, whatever the
-    result code (Connection.search), so a size- or time-limited search that found
-    the user is a match, as it was before #1403."""
+@pytest.mark.parametrize("answer", _AMBIGUOUS_ANSWERS.values(), ids=_AMBIGUOUS_ANSWERS.keys())
+async def test_bind_user_refuses_a_name_more_than_one_entry_matches(directory, answer, caplog):
+    directory.search = answer
+    _code, entries = answer
+    with caplog.at_level("INFO", logger="app.services.ldap_service"):
+        assert await ldap_service.bind_user("alice", _PASSWORD) is None
+    # One connection, the service account's, and no user bind: no password tried.
+    assert [c.get("user") for c in directory.built] == [settings.ldap_bind_dn]
+    assert directory.user_bind_passwords == []
+    assert [r.action for r in caplog.records] == ["ldap_user_ambiguous"]
+    (record,) = caplog.records
+    assert record.levelname == "ERROR"
+    assert (record.setting, record.count) == ("LDAP_USER_FILTER", max(len(entries), 2))
+    assert "LDAP_USER_FILTER" in record.getMessage()
+    for entry in entries:
+        for value in (record.getMessage(), *vars(record).values()):
+            assert not (isinstance(value, str) and entry.entry_dn.lower() in value.lower())
+            assert not (isinstance(value, str) and "alice1@" in value)
+
+
+@pytest.mark.asyncio
+async def test_the_login_search_asks_for_two_entries(directory):
+    """Two are enough to know a name is ambiguous, and no login fetches an
+    unbounded result whatever the filter matches."""
+    await ldap_service.bind_user("alice", _PASSWORD)
+    assert [s["size_limit"] for s in directory.searches] == [2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [RESULT_TIME_LIMIT_EXCEEDED, RESULT_ADMIN_LIMIT_EXCEEDED])
+async def test_bind_user_one_entry_from_a_search_that_stopped_early_is_unavailable(
+    directory, code, caplog
+):
+    """A search that stopped before it finished (a time or administrative limit)
+    with one entry does not prove that entry is the only match, so it is the
+    outage, as the same search with no entry is (IAM-LDAP-12). Before #1447 the
+    entry signed in."""
     directory.search = (code, [alice_entry()])
+    with caplog.at_level("WARNING", logger="app.services.ldap_service"):
+        with pytest.raises(ldap_service.LdapUnavailableError):
+            await ldap_service.bind_user("alice", _PASSWORD)
+    assert directory.user_bind_passwords == []
+    assert [r.action for r in caplog.records] == ["ldap_error"]
+    directory.search = (code, [])
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        await ldap_service.bind_user("nobody", _PASSWORD)
+
+
+@pytest.mark.asyncio
+async def test_bind_user_one_entry_and_success_still_signs_in(directory):
+    directory.search = (RESULT_SUCCESS, [alice_entry()])
     identity = await ldap_service.bind_user("alice", _PASSWORD)
     assert identity is not None and identity.dn == USER_DN
+    assert directory.user_bind_passwords == [_PASSWORD]
 
 
 @pytest.mark.asyncio
