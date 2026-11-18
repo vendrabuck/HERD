@@ -25,12 +25,13 @@ from __future__ import annotations
 
 import logging
 import ssl
+import string
 from collections.abc import Sequence
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 
 import anyio
-from ldap3 import BASE, NONE, SIMPLE, SUBTREE, Connection, Server, Tls
+from ldap3 import BASE, DEREF_ALWAYS, NONE, SIMPLE, SUBTREE, Connection, Server, Tls
 from ldap3.core.exceptions import (
     LDAPCommunicationError,
     LDAPException,
@@ -43,11 +44,12 @@ from ldap3.core.results import (
     RESULT_NO_SUCH_OBJECT,
     RESULT_SUCCESS,
 )
+from ldap3.operation.search import search_operation
 from ldap3.protocol.sasl.sasl import validate_simple_password
 from ldap3.utils.conv import escape_filter_chars
 from ldap3.utils.dn import safe_dn
 
-from app.config import settings
+from app.config import Settings, settings
 
 logger = logging.getLogger(__name__)
 
@@ -362,6 +364,166 @@ async def run_connection():
             await anyio.to_thread.run_sync(holder.close)
 
 
+# ---------------------------------------------------------------------------
+# LDAP_USER_FILTER, the login search template (issue #1446, IAM-LDAP-14). The
+# template is operator configuration, so a defect in it is the directory not
+# being askable (503), never a refusal of the user (401) and never a 500.
+# ---------------------------------------------------------------------------
+
+USER_FILTER_SETTING = "LDAP_USER_FILTER"
+# The one replacement field the template admits.
+USER_FILTER_FIELD = "username"
+
+# Defect codes (the `reason` of the ldap_user_filter_invalid log line).
+USER_FILTER_UNBALANCED_BRACE = "unbalanced_brace"
+USER_FILTER_UNKNOWN_FIELD = "unknown_field"
+USER_FILTER_NO_FIELD = "no_username_field"
+USER_FILTER_INVALID_FILTER = "invalid_filter"
+
+# The login name the filter's LDAP syntax is checked with. It holds every
+# character escape_filter_chars escapes, plus a space, an "=", and a non-ASCII
+# letter, so the check sees the escaped form a real login name can take. The
+# check never uses the submitted login name, so whether the template is usable
+# can never depend on who is signing in.
+_USER_FILTER_PROBE = "probe*()\\\x00 =é"
+
+
+class LdapUserFilterError(ValueError):
+    """LDAP_USER_FILTER cannot be used; `reason` is one of the USER_FILTER_* codes.
+
+    The message describes the template's defect only: it never holds a login
+    name, since the check never sees one.
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def render_user_filter(template: str, username: str) -> str:
+    """The login search filter: template with every {username} replaced by the
+    filter-escaped username (RFC 4515, ldap3's escape_filter_chars).
+
+    Strict on purpose (issue #1446): the only replacement field is `{username}`,
+    with no conversion (`!r`) and no format spec; `{{` and `}}` are a literal
+    brace, as in str.format. Raises LdapUserFilterError for a single brace that
+    is not doubled (USER_FILTER_UNBALANCED_BRACE), any other field, a positional
+    or empty one (`{0}`, `{}`), and attribute or index access
+    (`{username.__class__}`, `{username[0]}`) included (USER_FILTER_UNKNOWN_FIELD),
+    and a template with no `{username}` at all, which would find the same entry
+    for every login name (USER_FILTER_NO_FIELD). The username is inserted as
+    text, never formatted, so nothing in it is interpreted. The ONE way the login
+    filter is built; `user_filter_problem` adds the LDAP syntax check.
+    """
+    try:
+        pieces = list(string.Formatter().parse(template))
+    except ValueError as exc:
+        raise LdapUserFilterError(
+            USER_FILTER_UNBALANCED_BRACE,
+            f"{USER_FILTER_SETTING} has a single brace; write a literal brace as {{{{ or }}}}",
+        ) from exc
+    rendered: list[str] = []
+    fields = 0
+    for literal, field, spec, conversion in pieces:
+        rendered.append(literal)
+        if field is None:
+            continue
+        if field != USER_FILTER_FIELD or spec or conversion:
+            raise LdapUserFilterError(
+                USER_FILTER_UNKNOWN_FIELD,
+                f"{USER_FILTER_SETTING} has a placeholder other than {{username}}; "
+                "{username} is the only one, written exactly so",
+            )
+        fields += 1
+        rendered.append(escape_filter_chars(username))
+    if not fields:
+        raise LdapUserFilterError(
+            USER_FILTER_NO_FIELD,
+            f"{USER_FILTER_SETTING} has no {{username}} placeholder, so it would find "
+            "the same entry for every login name",
+        )
+    return "".join(rendered)
+
+
+def user_filter_problem(template: str) -> LdapUserFilterError | None:
+    """Why the template cannot be used as LDAP_USER_FILTER, or None when it can.
+
+    The template rules of render_user_filter, then the LDAP syntax: the filter
+    rendered with a fixed probe login name must build into a search request
+    exactly as `Connection.search` builds it (ldap3's parser, client-side, no
+    directory call), or it is USER_FILTER_INVALID_FILTER (an unbalanced
+    parenthesis, two filters side by side without `(&...)`, a missing `=`).
+    Escaping makes every login name an assertion-value literal, so a template
+    that passes holds for every login name. Not checked: where `{username}`
+    sits; a template that puts it outside an assertion value, such as
+    `({username}=x)`, parses and is the operator's to avoid.
+    """
+    try:
+        rendered = render_user_filter(template, _USER_FILTER_PROBE)
+    except LdapUserFilterError as exc:
+        return exc
+    try:
+        search_operation(
+            "",
+            rendered,
+            SUBTREE,
+            DEREF_ALWAYS,
+            ["objectClass"],
+            0,
+            0,
+            False,
+            True,
+            True,
+            None,
+            validator=None,
+            check_names=True,
+        )
+    except LDAPException as exc:
+        problem = LdapUserFilterError(
+            USER_FILTER_INVALID_FILTER,
+            f"{USER_FILTER_SETTING} is not a valid LDAP filter once {{username}} is "
+            f"substituted ({exc})",
+        )
+        problem.__cause__ = exc
+        return problem
+    return None
+
+
+def _log_user_filter_problem(problem: LdapUserFilterError, when: str) -> None:
+    """One ERROR naming the setting, the defect, and the class; never a login name."""
+    logger.error(
+        "%s; %s",
+        problem,
+        when,
+        extra={
+            "action": "ldap_user_filter_invalid",
+            "setting": USER_FILTER_SETTING,
+            "reason": problem.reason,
+            "exception_class": type(problem.__cause__ or problem).__name__,
+        },
+    )
+
+
+def log_ldap_startup_problems(config: Settings) -> list[str]:
+    """Log the LDAP settings problems found at startup and return their actions.
+
+    Fires only when config.auth_method == "ldap" (every LDAP setting is inert in
+    the other modes). Today it checks LDAP_USER_FILTER (user_filter_problem) and
+    logs one ERROR `ldap_user_filter_invalid` naming the setting and the defect,
+    never the template's value. Auth still boots, the OIDC and LDAP precedent
+    (an incomplete configuration never stops auth): every LDAP login then answers
+    the IAM-LDAP-12 503 until the setting is fixed and auth restarted.
+    `app.main.lifespan` calls this at startup.
+    """
+    if config.auth_method != "ldap":
+        return []
+    problem = user_filter_problem(config.ldap_user_filter)
+    if problem is None:
+        return []
+    _log_user_filter_problem(problem, "every LDAP login answers 503 until it is fixed")
+    return ["ldap_user_filter_invalid"]
+
+
 def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
     """Bind as service account, then search for the user DN and attributes.
 
@@ -375,13 +537,17 @@ def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
     that returned the entry is a match (ldap3 reports a non-empty response as
     found, whatever the result code). Like the presence probe, a
     failed search under the configured base proves nothing about the user. The
-    search_filter is template'd with the escaped username to prevent filter
-    injection. This function is always synchronous (blocking ldap3 calls);
+    search_filter is built by render_user_filter with the escaped username to
+    prevent filter injection; a template it refuses raises LdapUnavailableError
+    too (_bind_user_sync refuses one before this is called, so that is the
+    backstop). This function is always synchronous (blocking ldap3 calls);
     callers use anyio.to_thread to dispatch it.
     """
+    try:
+        search_filter = render_user_filter(settings.ldap_user_filter, username)
+    except LdapUserFilterError as exc:
+        raise LdapUnavailableError(str(exc)) from exc
     with _service_connection() as conn:
-        safe_username = escape_filter_chars(username)
-        search_filter = settings.ldap_user_filter.format(username=safe_username)
         found = _checked_search(
             conn,
             search_base=settings.ldap_user_base_dn,
@@ -500,7 +666,10 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
     entry without the email attribute.
 
     Raises LdapUnavailableError whenever the directory could not be asked:
-    incomplete configuration (logged at ERROR), or any connection, TLS,
+    incomplete configuration (logged at ERROR), an LDAP_USER_FILTER that
+    user_filter_problem refuses (logged at ERROR, action
+    ldap_user_filter_invalid, with no login name: issue #1446; asked before
+    anything that depends on the username or password), or any connection, TLS,
     service-account bind, search, or user-bind failure (logged once at WARNING,
     action ldap_error, with the client's text in the message and the cause's
     class name in exception_class; never the password). Callers wrap this in
@@ -511,6 +680,10 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
         raise LdapUnavailableError(
             "LDAP is not fully configured (ldap_server_url or ldap_user_base_dn is empty)"
         )
+    filter_problem = user_filter_problem(settings.ldap_user_filter)
+    if filter_problem is not None:
+        _log_user_filter_problem(filter_problem, "login cannot be checked")
+        raise LdapUnavailableError(str(filter_problem)) from filter_problem
     if not password:
         # LDAP anonymous bind succeeds with an empty password; reject early.
         return None

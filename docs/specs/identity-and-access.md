@@ -327,7 +327,7 @@ Auth service:
 |---|---|---|---|---|
 | GET | `/login-options` | anyone, unauthenticated; every mode | 200 | IAM-OIDC-16 |
 | POST | `/register` | anyone, unauthenticated; local mode only | 201 | IAM-REG-1 to IAM-REG-6, IAM-PROFILE-9 |
-| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-6, IAM-LDAP-1 to IAM-LDAP-13, IAM-OIDC-21 |
+| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-6, IAM-LDAP-1 to IAM-LDAP-14, IAM-OIDC-21 |
 | GET | `/oidc/login` | anyone, unauthenticated; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-17 |
 | GET | `/oidc/callback` | anyone holding the `herd_oidc_flow` cookie; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-18, IAM-OIDC-19 |
 | POST | `/oidc/exchange` | anyone holding the `herd_oidc_handoff` cookie; OIDC mode only, else 404 | 200 | IAM-OIDC-15, IAM-OIDC-20 |
@@ -519,8 +519,9 @@ account automatically.
   Enforced in: `services/auth/app/services/auth_service.py` (`authenticate_user`) \
   Pinned by: `services/auth/tests/test_auth_ldap.py` (`test_ldap_mode_rejects_existing_local_account`)
 - **IAM-LDAP-2.** The login `email` field is the directory login name; it is
-  filter-escaped and substituted into `LDAP_USER_FILTER`. \
-  Enforced in: `services/auth/app/services/ldap_service.py` (`_search_user`) \
+  filter-escaped and substituted into `LDAP_USER_FILTER` (the template's rules are
+  IAM-LDAP-14). \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`_search_user`, `render_user_filter`) \
   Pinned by: `services/auth/tests/test_ldap_service.py` (`test_filter_escaping_via_ldap3_conv`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_filter_metacharacters_are_escaped`)
 - **IAM-LDAP-3.** Login binds twice: first as the service account (anonymously when
   `LDAP_BIND_DN` is empty) to search `LDAP_USER_BASE_DN` and take the first match, then
@@ -572,7 +573,8 @@ account automatically.
   Pinned by: none
 - **IAM-LDAP-12.** When the directory cannot be asked, login answers 503 `Directory
   unavailable, credentials not checked` (issue #1403): incomplete configuration
-  (`LDAP_SERVER_URL` or `LDAP_USER_BASE_DN` empty), a malformed server URL, a refused or
+  (`LDAP_SERVER_URL` or `LDAP_USER_BASE_DN` empty), an `LDAP_USER_FILTER` that
+  IAM-LDAP-14 refuses, a malformed server URL, a refused or
   timed-out connection, a TLS failure, a refused service-account bind (anonymous
   included), a search that raises, or that found no entry and ended with any result code but
   success (a missing base DN, a referral that cannot be followed, busy, access denied;
@@ -588,7 +590,8 @@ account automatically.
   created, no local fallback (IAM-LDAP-1), and the body never holds the directory
   client's text. The client logs one WARNING `LDAP unavailable during login` (action
   `ldap_error`, the client's text in the message, the cause's class in
-  `exception_class`; incomplete configuration logs one ERROR instead), and auth logs a
+  `exception_class`; incomplete configuration and an unusable `LDAP_USER_FILTER` log
+  one ERROR instead), and auth logs a
   WARNING `login_failure` with reason `directory_unavailable`; no line holds the
   password. \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_search_user`, `_bind_as_user`, `_checked_search`); `services/auth/app/services/auth_service.py` (`_authenticate_ldap`); `services/auth/app/routers/auth.py` (`login`, `LOGIN_DIRECTORY_UNAVAILABLE_DETAIL`) \
@@ -612,6 +615,30 @@ account automatically.
   search; the difference depends on the password alone, the same for every username. \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_password_refused_by_saslprep`, `_bind_user_sync`, `_bind_as_user`, `_USER_BIND_INPUT_REFUSALS`) \
   Pinned by: `services/auth/tests/test_ldap_login_input_oracle.py` (`test_a_password_saslprep_refuses_gets_the_same_answer_for_every_username`, `test_the_route_answers_known_and_unknown_users_identically`, `test_the_user_bind_itself_refuses_what_saslprep_refuses`, `test_a_password_saslprep_maps_goes_to_the_directory_mapped`); `services/auth/tests/test_login_password_bound.py` (`test_ldap_mode_refuses_a_nul_before_the_directory`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_answers_known_and_unknown_users_alike_for_a_saslprep_refusal`, `test_bind_user_a_saslprep_mapped_password_reaches_the_directory_mapped`)
+
+- **IAM-LDAP-14.** `LDAP_USER_FILTER` is a strict template (issue #1446). Its only
+  replacement field is `{username}`, written exactly so: no other name, no positional
+  or empty field (`{0}`, `{}`), no attribute or index access (`{username.__class__}`,
+  `{username[0]}`), no conversion or format spec. `{{` and `}}` are literal braces, and
+  the template must hold `{username}` at least once (a filter without it would find
+  the same entry for every login name, so any name with that entry's password would
+  sign in as it). The login name is filter-escaped and inserted as text, never
+  formatted. The filter rendered with a fixed probe name must also build into a search
+  request through ldap3's own parser, client-side. A template that breaks any of these
+  (an unknown, positional, or empty field, a single brace, no `{username}`, or an
+  invalid LDAP filter such as an unbalanced parenthesis or two filters side by side)
+  makes every LDAP login answer the 503 of IAM-LDAP-12, before any directory call and
+  before the empty-password check, so the answer is the same for every login name and
+  password, with one ERROR (action `ldap_user_filter_invalid`, the setting in
+  `setting`, the defect in `reason`, the class in `exception_class`, never the login
+  name). Before the fix `str.format` raised and the login answered 500. In LDAP mode
+  auth logs the same ERROR once at startup and still boots, as it does for an
+  incomplete configuration; a value saved on the config page takes effect at the next
+  auth start and is checked then. Where `{username}` sits is not checked: a template
+  that puts it outside an assertion value, such as `({username}=x)`, parses and is the
+  operator's to avoid. \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`render_user_filter`, `user_filter_problem`, `_bind_user_sync`, `_search_user`, `log_ldap_startup_problems`); `services/auth/app/main.py` (`lifespan`) \
+  Pinned by: `services/auth/tests/test_ldap_user_filter.py` (`test_every_defect_is_found_with_its_reason`, `test_a_usable_template_has_no_problem`, `test_render_never_interprets_the_login_name`, `test_a_login_gets_the_same_outage_for_every_name_and_password`, `test_the_search_itself_never_raises_anything_but_unavailable`, `test_startup_reports_a_defect_once_in_ldap_mode`, `test_startup_is_silent_outside_ldap_mode`, `test_the_lifespan_reports_it_and_still_boots`, `test_the_route_answers_503_never_500`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_unusable_filter_is_503_for_every_login`)
 
 **Out of scope.** Roles never come from the directory (ADR 0011, Blast radius). SAML and
 OIDC do not exist (issue #37).
@@ -2136,7 +2163,7 @@ password, though `msg` and `loc` can quote part of an email, a UUID, or a key na
 | 409 | `This grant already exists` | duplicate grant | IAM-ACL-2 |
 | 422 | validation list | registration, login, profile, group, bulk, mapping, token, grant, or check body out of bounds; a registration password holding a NUL or a lone surrogate, or a login password holding a lone surrogate; a profile body with a key other than the three profile fields, or a null or empty `full_name`; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-PROFILE-3, IAM-PROFILE-4, IAM-PROFILE-5, IAM-LOGIN-3, IAM-LOGIN-5, IAM-LOGIN-6, IAM-HASH-9, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2 |
 | 422 | `group_dn does not resolve in the directory` | mapping DN proven absent | IAM-MAP-3 |
-| 503 | `Directory unavailable, credentials not checked` | LDAP-mode login while the directory cannot be asked | IAM-LDAP-12 |
+| 503 | `Directory unavailable, credentials not checked` | LDAP-mode login while the directory cannot be asked, an unusable `LDAP_USER_FILTER` included | IAM-LDAP-12, IAM-LDAP-14 |
 | 503 | `Directory unavailable, mapping not validated` | mapping create while the directory cannot be asked | IAM-MAP-3 |
 | 503 | `Internal API token not configured` | an internal route with no token configured | IAM-INTERNAL-2 |
 
@@ -2174,7 +2201,7 @@ Calls into this area are in section 7 and the forwarded-JWT group routes noted u
 | `SUPERADMIN_EMAIL`, `SUPERADMIN_USERNAME`, `SUPERADMIN_PASSWORD` | empty | First-startup superadmin; any empty skips the seed |
 | `AUTH_METHOD` | `local` | `local`, `ldap`, or `oidc` (not yet supported for operators, section 8.19); one backend for every login |
 | `LDAP_SERVER_URL`, `LDAP_BIND_DN`, `LDAP_BIND_PASSWORD`, `LDAP_USER_BASE_DN` | empty | Directory location and service account |
-| `LDAP_USER_FILTER` | `(sAMAccountName={username})` | Login search filter |
+| `LDAP_USER_FILTER` | `(sAMAccountName={username})` | Login search filter; `{username}` is its only placeholder and `{{` and `}}` are literal braces (IAM-LDAP-14) |
 | `LDAP_EMAIL_ATTRIBUTE`, `LDAP_USERNAME_ATTRIBUTE` | `mail`, `sAMAccountName` | Identity attributes |
 | `LDAP_USE_TLS`, `LDAP_TLS_VALIDATE`, `LDAP_CA_CERT` | `true`, `true`, empty | TLS and certificate checking |
 | `LDAP_GROUP_MEMBER_ATTRIBUTE`, `LDAP_GROUP_NAME_ATTRIBUTE` | `member`, `cn` | Group entry attributes |

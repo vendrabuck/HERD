@@ -348,6 +348,27 @@ async def test_login_endpoint_unreachable_directory_is_503(monkeypatch, ldap_set
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "template", ["(uid={user})", "(uid={0})", "(uid={username}", "(uid=user4)"]
+)
+async def test_login_endpoint_unusable_filter_is_503_for_every_login(
+    monkeypatch, ldap_settings, http_client, template
+):
+    """Issue #1446 against a real directory: an LDAP_USER_FILTER that is not a
+    usable template is the 503 for a known and an unknown login alike: never a
+    500, and, for a filter without {username}, never the sign-in as user4 that
+    such a filter would give any login name holding user4's password."""
+    monkeypatch.setattr(settings, "ldap_user_filter", template, raising=False)
+    answers = [
+        await http_client.post("/login", json={"email": login, "password": USER_PW})
+        for login in ("user4", "does-not-exist")
+    ]
+    assert [(r.status_code, r.json()) for r in answers] == [
+        (503, {"detail": "Directory unavailable, credentials not checked"})
+    ] * 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("password", ["\t", "Pass\x00word1", "Pass\ue000word1"])
 async def test_login_endpoint_answers_known_and_unknown_users_alike_for_a_saslprep_refusal(
     ldap_settings, http_client, password

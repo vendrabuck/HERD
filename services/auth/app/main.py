@@ -25,6 +25,7 @@ from app.routers.internal import router as internal_router
 from app.routers.ldap_sync import router as ldap_sync_router
 from app.routers.oidc import router as oidc_router
 from app.routers.tokens import router as tokens_router
+from app.services.ldap_service import log_ldap_startup_problems
 from app.tasks.ldap_sync_loop import (
     effective_interval_seconds,
     ldap_group_sync_loop_enabled,
@@ -115,6 +116,8 @@ async def lifespan(app: FastAPI):
     # ADR 0016: one WARNING each for incomplete OIDC settings, a plain-HTTP
     # lab provider, and the break-glass switch; silent outside OIDC mode.
     log_oidc_startup_warnings(settings)
+    # Issue #1446: one ERROR for an unusable LDAP_USER_FILTER; LDAP mode only.
+    log_ldap_startup_problems(settings)
 
     # ADR 0011 phase 5: the LDAP group sync interval loop, started only when
     # both auth_method == "ldap" and ldap_group_sync_enabled are true (dark

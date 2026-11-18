@@ -133,6 +133,7 @@ A 503 `Directory unavailable, credentials not checked` on every login means HERD
 - TLS handshake fails. Start with `LDAP_USE_TLS=false` and a plain `ldap://` URL against a lab server to confirm the rest of the config, then re-enable TLS once the DN / filter are known good.
 - `LDAP_USER_BASE_DN` does not exist in the directory (the search answers `noSuchObject`), or the search is refused (access rights, a referral to another server).
 - `LDAP_SERVER_URL` or `LDAP_USER_BASE_DN` is empty: auth logs the ERROR `LDAP not fully configured; login cannot be checked`.
+- `LDAP_USER_FILTER` is not a usable template: auth logs the ERROR `ldap_user_filter_invalid` once at startup and at every login, with the defect in `reason` (`unknown_field` for a placeholder other than `{username}`, such as `{user}` or `{0}`; `unbalanced_brace` for a single `{` or `}`, write a literal brace as `{{` or `}}`; `no_username_field` when `{username}` is missing; `invalid_filter` when the result is not an LDAP filter, such as an unbalanced parenthesis). No directory call is made. Fix the value and restart auth.
 
 A 401 `Invalid credentials` means the directory answered and refused this login, so it is the user's to fix:
 
