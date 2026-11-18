@@ -6,7 +6,8 @@ nesting depth: a deep and wide document cost gigabytes and seconds (review of #1
 It is now `herd_common.validation_errors.holds_lone_surrogate`, one serialization in
 C. Each test bounds the check by the parse it follows, peak memory and time (here the check
 is one serialization of the parsed values; the bound is 5 times the parse, as for the
-other callers, whose check includes a parse too), which holds pinned to one core, on a fast host, and under load.
+other callers, whose check includes a parse too), which holds pinned to one core, on a
+fast host, and under load.
 """
 
 from __future__ import annotations
