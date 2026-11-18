@@ -509,18 +509,28 @@ both services.
   Enforced in: `services/execution/app/services/execution_service.py` (`run_driver_action`); `services/execution/app/services/driver_loader.py` (`get_driver_config_schema`) \
   Pinned by: `services/execution/tests/test_execution_service_edges.py` (`test_configure_validation_runs_after_load_driver`, `test_configure_registry_fallback_when_no_published_schema`)
 - **CFG-SCHEMA-13.** A refusal names, besides the path and the keyword, only the
-  schema's numbers (bounds and counts), JSON type names, format names, and the field
-  names a schema requires or forbids. A field name from the config is masked as
-  CFG-EXEC-8 masks a string, cut to 64 characters, and quoted with `repr` (so a control
-  character or a lone surrogate is written as its escape) unless it is a plain
-  identifier, which is written bare. A schema's free text (an `enum` or `const` value,
-  a `pattern`) is quoted only from the registry, at most ten scalar values or a
-  pattern of at most 128 characters; a driver-published schema's free text is never
-  quoted (`must be one of the values the schema allows`, `must match the schema's pattern`).
-  The rule words never use a credential keyword, so CFG-EXEC-10's mask leaves a clean
-  refusal unchanged. \
-  Enforced in: `services/common/herd_common/device_config.py` (`schema_error_text`, `_rule_text`, `_path_text`, `_name_text`) \
-  Pinned by: `services/common/tests/test_device_config_refusal_text.py` (`test_published_schema_free_text_is_not_quoted`, `test_schema_values_are_shown_when_the_caller_allows_them`, `test_a_long_or_structured_schema_value_is_never_quoted`, `test_format_rule_names_the_format_only`, `test_plain_key_is_written_bare_and_other_keys_are_quoted`, `test_a_key_that_reads_like_a_credential_line_is_masked`, `test_a_long_key_is_cut`, `test_a_key_with_a_control_character_or_lone_surrogate_is_escaped`, `test_a_path_deeper_than_the_cap_is_cut`, `test_refusal_words_survive_the_stored_error_mask_unchanged`)
+  schema's numbers (bounds and counts), JSON type names, and field names. A field name
+  taken from the config (the path, or a field `additionalProperties` refuses) is masked
+  as CFG-EXEC-8 masks a string, cut to 64 characters, and quoted with `repr` (so a
+  control character or a lone surrogate is written as its escape) unless it is a plain
+  identifier, which is written bare. A field name the schema defines (`required`,
+  `dependentRequired`) is shown in full from the registry; from a driver-published
+  schema only when it is a plain name of at most 64 characters (a letter or `_`, then
+  letters, digits, `_`, `-`, or `.`), and otherwise counted (`needs a required field`,
+  `needs the field 'address' and 2 other required fields`, `a field needs ...`). A
+  schema's free text (an `enum` or `const` value, a `pattern`) is quoted only from the
+  registry, at most ten scalar values or a pattern of at most 128 characters; a
+  driver-published schema's free text is never quoted
+  (`must be one of the values the schema allows`, `must match the schema's pattern`).
+  The `format` keyword is not enforced: neither validator is built with a format
+  checker, so no refusal names a format today; the rule text for it
+  (`must be a valid <format>`) is there for when one is. The refusal's text is a
+  prefix (`device` or `device '<name>'`, the name quoted with `repr`) and a reason,
+  kept apart on the error (`prefix`, `reason`); the reason's rule words never use a
+  credential keyword, so CFG-EXEC-10's mask, which covers the reason only, leaves a
+  clean refusal unchanged, and no device name changes it. \
+  Enforced in: `services/common/herd_common/device_config.py` (`ConfigValidationError`, `schema_error_text`, `_rule_text`, `_schema_names_text`, `_is_schema_name`, `_path_text`, `_name_text`) \
+  Pinned by: `services/common/tests/test_device_config_refusal_text.py` (`test_published_schema_free_text_is_not_quoted`, `test_schema_values_are_shown_when_the_caller_allows_them`, `test_a_long_or_structured_schema_value_is_never_quoted`, `test_format_rule_names_the_format_only`, `test_plain_key_is_written_bare_and_other_keys_are_quoted`, `test_a_key_that_reads_like_a_credential_line_is_masked`, `test_a_long_key_is_cut`, `test_a_key_with_a_control_character_or_lone_surrogate_is_escaped`, `test_a_path_deeper_than_the_cap_is_cut`, `test_refusal_words_survive_the_stored_error_mask_unchanged`, `test_published_schema_names_are_shown_only_when_plain`, `test_registry_path_shows_every_required_name`, `test_the_prefix_holds_the_device_name_and_the_reason_the_rest`, `test_the_non_schema_refusals_split_the_same_way`)
 
 **Out of scope.** The assistant's schema tool (`ai-features.md`, AI-TOOL-7) and the AI
 commit's own config check (AI-COMMIT-3), both built on the registry here. What the
@@ -895,12 +905,15 @@ is WIRE-DRIVER-6 in `provisioning-and-wiring.md`.
   Enforced in: `services/execution/app/services/execution_service.py` (`run_driver_action`); `services/execution/app/services/driver_loader.py` (`driver_load_failure_text`) \
   Pinned by: `services/execution/tests/test_driver_load_sanitize_run.py` (`test_run_driver_action_download_failure_stores_class_name_only`, `test_run_driver_action_extraction_failure_stores_class_name_only`, `test_run_driver_action_validate_parse_failure_stores_class_name_only`); `services/execution/tests/test_api_endpoints.py` (`test_execute_driver_load_failure_never_returns_foreign_text`)
 - **CFG-EXEC-10.** A `configure` call's `method_kwargs` is validated as 8.3 says; a
-  refusal ends the run `FAILED` with the validator's message, masked as CFG-EXEC-8
-  masks a string (`redact_command_text`), and answers 422 with the same text, which
-  holds no value from the configuration (CFG-SCHEMA-4), in the row, the answer, the
-  run list, or a log line. Other actions are not validated. \
+  refusal ends the run `FAILED` with the validator's message and answers 422 with the
+  same text, which holds no value from the configuration (CFG-SCHEMA-4), in the row,
+  the answer, the run list, or a log line. Before it is stored, the message's reason
+  is masked as CFG-EXEC-8 masks a string (`redact_command_text`); its prefix, which
+  holds the device's name, is kept as written, so a name such as `core key switch`
+  never cuts the refusal short and execution's text equals inventory's for the same
+  refusal. Other actions are not validated. \
   Enforced in: `services/execution/app/services/execution_service.py` (`run_driver_action`, `_drive_run`) \
-  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_manual_execute_validates_configure_kwargs`, `test_internal_execute_validates_configure_kwargs`, `test_manual_execute_skips_validation_for_non_configure_actions`); `services/execution/tests/test_config_refusal_text.py` (`test_refused_configure_never_carries_a_config_value`, `test_a_refusal_text_that_holds_a_credential_line_is_masked_before_it_is_stored`)
+  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_manual_execute_validates_configure_kwargs`, `test_internal_execute_validates_configure_kwargs`, `test_manual_execute_skips_validation_for_non_configure_actions`); `services/execution/tests/test_config_refusal_text.py` (`test_refused_configure_never_carries_a_config_value`, `test_a_refusal_text_that_holds_a_credential_line_is_masked_before_it_is_stored`, `test_a_device_name_with_a_credential_keyword_keeps_the_whole_refusal`); `services/inventory/tests/test_device_configs.py` (`test_refusal_for_a_device_name_with_a_credential_keyword_is_the_shared_text`)
 - **CFG-EXEC-11.** A driver that raised is recorded as `driver raised <ClassName>`, its
   message logged only; a failure the driver returned keeps the driver's own `error`, or
   `driver reported failure` when it gave none. \
@@ -989,6 +1002,15 @@ reservation can list the runs tagged with it.
   `method_kwargs_redacted`), is retried with its stored arguments. \
   Enforced in: `services/execution/app/routers/executions.py` (`retry_run`, `_recover_masked_kwargs`) \
   Pinned by: `services/execution/tests/test_run_arguments_storage.py` (`test_retry_reads_a_masked_configuration_back_from_its_config_version`, `test_retry_of_a_masked_run_without_a_config_version_is_refused`, `test_retry_refuses_a_version_that_does_not_match_the_run`, `test_retry_fails_closed_when_the_config_version_cannot_be_read`, `test_retry_of_an_unmasked_run_reuses_its_stored_arguments`)
+- **CFG-RUN-8.** Every run execution answers (the list, the detail, an execute, a
+  retry) shows a configure refusal stored before issue #1457, whose message could quote
+  the refused configuration, as its prefix followed by
+  `config failed schema validation (details withheld; recorded before values were removed from these messages)`.
+  Such text is `device` or `device` and a `repr`-quoted name, then
+  `: config failed schema validation: ` (today's text has ` at ` after `validation`);
+  any other `error` is answered as stored. The row itself is not changed. \
+  Enforced in: `services/execution/app/schemas/execution.py` (`ExecutionRunResponse`); `services/common/herd_common/device_config.py` (`withhold_legacy_refusal_text`, `LEGACY_REFUSAL_WITHHELD`) \
+  Pinned by: `services/execution/tests/test_config_refusal_text.py` (`test_a_refusal_stored_before_the_fix_is_withheld_by_every_run_read`); `services/common/tests/test_device_config_refusal_text.py` (`test_an_old_refusal_keeps_its_prefix_and_loses_its_message`, `test_any_other_text_is_returned_unchanged`, `test_every_refusal_the_builder_writes_is_left_alone_on_read`)
 
 **Out of scope.** The wiring status and wiring retry routes, which are not run history
 (`provisioning-and-wiring.md`).
@@ -1554,11 +1576,12 @@ None at present. (#1279 is resolved by CFG-LOAD-3.)
   `_recover_masked_kwargs` docstring) (CFG-RUN-7). A run that a direct `POST /execute`
   started with masked arguments and no `config_version_id` cannot be retried; a new run
   is the way (CFG-RUN-7).
-- A run refused before issue #1457 keeps the old refusal text, which can quote the
-  refused configuration, credentials included; nothing rewrites it. Such a row's
-  `error` reads `...: config failed schema validation: <message>` (the new text has
-  ` at <path>` after `validation`); [OPERATIONS.md](../OPERATIONS.md), "Upgrade path",
-  has the query that finds them and an optional rewrite (CFG-EXEC-10).
+- A run refused before issue #1457 keeps the old refusal text in its row, which can
+  quote the refused configuration, credentials included. Every run read withholds it
+  (CFG-RUN-8), but a direct database read, a log line written before the upgrade, and
+  an assistant tool result already stored in `assistant_messages.content_blocks` still
+  hold it; [OPERATIONS.md](../OPERATIONS.md), "Upgrade path", has the query that finds
+  the rows and an optional rewrite (CFG-EXEC-10).
 - A refusal shows a field name of the config as it was sent, masked only after a
   credential keyword, so a credential typed as a field name is shown; a field name is
   not a place for one (CFG-SCHEMA-13).
