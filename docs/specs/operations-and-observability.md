@@ -413,15 +413,30 @@ subclasses `HerdBaseSettings`. The full ladder for operators is in
   resolves from the environment as if the file did not exist. \
   Enforced in: `services/common/herd_common/config_loader.py` (`HerdJsonConfigSource`, `_load_json`) \
   Pinned by: `services/common/tests/test_config_loader.py` (`test_herd_sources_env_applies_for_keys_absent_from_file`, `test_herd_sources_pure_env_when_file_missing`); `services/common/tests/test_base_settings.py` (`test_pure_env_when_config_file_missing`)
-- **OPS-SET-4.** An empty or whitespace-only string in the file means unset, and an
-  unreadable or corrupt file is logged and treated as empty, never as a boot failure. \
+- **OPS-SET-4.** An empty or whitespace-only string in the file means unset, and no
+  content of the file is a boot failure: a file that is not a readable JSON object is
+  treated as missing (OPS-SET-3) with one WARNING naming the path and the failure's
+  class, never the content. That covers unparseable JSON (an empty file and a UTF-8 BOM
+  included), a byte that is not UTF-8 (the file is read as UTF-8 whatever the locale),
+  nesting deeper than the parser allows, an integer over Python's 4300-digit limit, a
+  directory or an unreadable file at the path, and valid JSON that is not an object (a
+  list, a string, a number, a boolean, `null`); the config service's own loader treats
+  the same contents the same way (`config_store.load_config`). A `MemoryError` on a huge
+  file is not handled. A value of the wrong type inside a valid object is not this rule:
+  the field's own validation judges it, as it judges an environment value, and a
+  refusal stops the service at import with a message naming the field, never the
+  value (`HerdBaseSettings` sets `hide_input_in_errors`); the `POSTGRES_*` parts are
+  OPS-SET-5's. \
   Enforced in: `services/common/herd_common/config_loader.py` (`HerdJsonConfigSource`, `_load_json`) \
-  Pinned by: `services/common/tests/test_config_loader.py` (`test_source_skips_empty_string_values`, `test_source_falls_back_when_config_json_is_corrupt`)
+  Pinned by: `services/common/tests/test_config_loader.py` (`test_source_skips_empty_string_values`, `test_source_falls_back_when_config_json_is_corrupt`, `test_unusable_config_file_is_ignored_with_one_warning`, `test_unusable_config_file_leaves_every_key_to_the_environment`, `test_directory_in_place_of_config_file_is_ignored`, `test_unreadable_config_file_is_ignored`, `test_config_file_is_read_as_utf8_whatever_the_locale`); `services/acl/tests/test_settings_config_file.py` (`test_settings_load_from_the_environment_whatever_the_file_holds`, `test_settings_load_from_a_directory_in_place_of_the_file`); `services/user-profile/tests/test_settings_config_file.py` (`test_settings_load_from_the_environment_whatever_the_file_holds`, `test_settings_load_from_a_directory_in_place_of_the_file`)
 - **OPS-SET-5.** The file's `AUTH_*` keys map to the services' unprefixed names, and the
   file's `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` build a percent-encoded
-  `DATABASE_URL` against `postgres:5432` only when all three are set. \
-  Enforced in: `services/common/herd_common/config_loader.py` (`_KEY_MAP`, `_build_database_url`) \
-  Pinned by: `services/common/tests/test_config_loader.py` (`test_source_maps_auth_keys`, `test_source_builds_database_url_when_postgres_fields_present`, `test_source_url_encodes_special_chars_in_password`, `test_source_skips_database_url_when_postgres_incomplete`)
+  `DATABASE_URL` against `postgres:5432` only when all three are set. When all three
+  are set and one is not text (a number, a boolean, a list, an object, or a string
+  holding a lone surrogate), no URL is derived and one WARNING names the keys, never
+  the values. \
+  Enforced in: `services/common/herd_common/config_loader.py` (`_KEY_MAP`, `_build_database_url`, `_is_url_text`) \
+  Pinned by: `services/common/tests/test_config_loader.py` (`test_source_maps_auth_keys`, `test_source_builds_database_url_when_postgres_fields_present`, `test_source_url_encodes_special_chars_in_password`, `test_source_skips_database_url_when_postgres_incomplete`, `test_postgres_part_that_is_not_text_leaves_database_url_underived`)
 - **OPS-SET-6.** A `DATABASE_URL` in the environment always beats the file-derived one,
   in both orders. \
   Enforced in: `services/common/herd_common/config_loader.py` (`HerdJsonConfigSource`) \

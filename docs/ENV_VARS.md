@@ -19,6 +19,7 @@ Guard rails, in both modes:
 - An empty string saved in `config.json` means "unset": the key falls through to the environment, so clearing an optional field in the UI hands it back to `.env`. Required fields cannot be cleared in the UI (the save is rejected); to hand a required key back to the environment, edit or delete `config.json` on the `herd-config` volume (deleting it re-runs the auto-bootstrap on the next config-service start).
 - A `DATABASE_URL` set in the environment always outranks the URL derived from the file's `POSTGRES_*` values; the derived form hardcodes the in-compose `postgres:5432` host and exists only as a fallback.
 - Keys outside the config schema (the dev/test knobs, `SECRETS_KEK`, and so on) never appear in `config.json` and always resolve from the environment.
+- A `config.json` that is not a readable JSON object (unparseable, not UTF-8, a list or a scalar, a directory, an unreadable file) never stops a service from starting: each service logs one WARNING naming the path and the failure's class and resolves every key as if the file were missing. A value of the wrong type inside a valid file is refused by that setting at startup, as a bad environment value is.
 
 Upgrading from a version without the marker: an existing `config.json` with no `config.bootstrapped` beside it is treated as UI-saved (file-first). To hand control back to the environment, create an empty `config.bootstrapped` file next to `config.json` on the volume.
 

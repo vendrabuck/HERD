@@ -2,7 +2,10 @@
 
 import importlib
 import json
+import logging
+import os
 
+import pytest
 from pydantic_settings import BaseSettings
 from sqlalchemy.engine import make_url
 
@@ -170,6 +173,175 @@ def test_source_falls_back_when_config_json_is_corrupt(tmp_path, monkeypatch):
     # import/construction time; it falls back to {} so env/defaults apply.
     source = loader.HerdJsonConfigSource(S)
     assert source() == {}
+
+
+# --- No content of config.json stops a service from starting (#1451) ----------------
+
+# The two WARNING lines, exactly; {path} is filled with the file's path.
+_CORRUPT = "Ignoring corrupt HERD config file {{path}} ({cls})"
+_NOT_OBJECT = "Ignoring HERD config file {{path}}: not a JSON object ({cls})"
+
+# Every content that is not a readable JSON object, with the WARNING it logs.
+# Built as bytes so the not-UTF-8 and the BOM cases are exact; the deep nesting is
+# past CPython's default recursion limit and the integer past its 4300-digit limit.
+_UNUSABLE_CONTENTS = [
+    pytest.param(b"{broken", _CORRUPT.format(cls="JSONDecodeError"), id="unparseable"),
+    pytest.param(b"", _CORRUPT.format(cls="JSONDecodeError"), id="empty-file"),
+    pytest.param(b"  \n", _CORRUPT.format(cls="JSONDecodeError"), id="whitespace-only"),
+    pytest.param(
+        b'{"CORS_ORIGINS": "\xff"}', _CORRUPT.format(cls="UnicodeDecodeError"), id="not-utf8"
+    ),
+    pytest.param(
+        b'\xef\xbb\xbf{"CORS_ORIGINS": "x"}', _CORRUPT.format(cls="JSONDecodeError"), id="utf8-bom"
+    ),
+    pytest.param(
+        b"[" * 100_000 + b"]" * 100_000, _CORRUPT.format(cls="RecursionError"), id="nested-too-deep"
+    ),
+    pytest.param(
+        b'{"CORS_ORIGINS": ' + b"9" * 5000 + b"}",
+        _CORRUPT.format(cls="ValueError"),
+        id="int-over-digit-limit",
+    ),
+    pytest.param(b"[1, 2]", _NOT_OBJECT.format(cls="list"), id="list"),
+    pytest.param(b'"CORS_ORIGINS"', _NOT_OBJECT.format(cls="str"), id="string"),
+    pytest.param(b"42", _NOT_OBJECT.format(cls="int"), id="number"),
+    pytest.param(b"1.5", _NOT_OBJECT.format(cls="float"), id="float"),
+    pytest.param(b"null", _NOT_OBJECT.format(cls="NoneType"), id="null"),
+    pytest.param(b"true", _NOT_OBJECT.format(cls="bool"), id="true"),
+]
+
+
+def _loader_warnings(caplog):
+    return [r for r in caplog.records if r.name == "herd_common.config_loader"]
+
+
+@pytest.mark.parametrize(("content", "expected"), _UNUSABLE_CONTENTS)
+def test_unusable_config_file_is_ignored_with_one_warning(
+    tmp_path, monkeypatch, caplog, content, expected
+):
+    config_file = tmp_path / "config.json"
+    config_file.write_bytes(content)
+    loader = _reload_loader(monkeypatch, str(config_file))
+    caplog.set_level(logging.WARNING, logger="herd_common.config_loader")
+
+    class S(BaseSettings):
+        cors_origins: str = "default"
+        database_url: str = ""
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert loader.HerdJsonConfigSource(S)() == {}
+    records = _loader_warnings(caplog)
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    # Names the path and the class, never the content.
+    assert records[0].getMessage() == expected.format(path=config_file)
+
+
+@pytest.mark.parametrize(("content", "expected"), _UNUSABLE_CONTENTS)
+def test_unusable_config_file_leaves_every_key_to_the_environment(
+    tmp_path, monkeypatch, content, expected
+):
+    # OPS-SET-3 and OPS-SET-4: the file is treated as missing, in file-first order.
+    config_file = tmp_path / "config.json"
+    config_file.write_bytes(content)
+    loader = _reload_loader(monkeypatch, str(config_file))
+    monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
+
+    settings = _herd_ordered_settings(loader)()
+    assert settings.cors_origins == "https://from-env"
+    assert settings.log_level == "INFO"
+
+
+def test_directory_in_place_of_config_file_is_ignored(tmp_path, monkeypatch, caplog):
+    config_dir = tmp_path / "config.json"
+    config_dir.mkdir()
+    loader = _reload_loader(monkeypatch, str(config_dir))
+    caplog.set_level(logging.WARNING, logger="herd_common.config_loader")
+    monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
+
+    settings = _herd_ordered_settings(loader)()
+    assert settings.cors_origins == "https://from-env"
+    records = _loader_warnings(caplog)
+    assert len(records) == 1
+    assert records[0].getMessage() == _CORRUPT.format(cls="IsADirectoryError").format(
+        path=config_dir
+    )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_unreadable_config_file_is_ignored(tmp_path, monkeypatch, caplog):
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({"CORS_ORIGINS": "https://from-file"}))
+    config_file.chmod(0)
+    loader = _reload_loader(monkeypatch, str(config_file))
+    caplog.set_level(logging.WARNING, logger="herd_common.config_loader")
+    monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
+
+    try:
+        settings = _herd_ordered_settings(loader)()
+    finally:
+        config_file.chmod(0o600)
+    assert settings.cors_origins == "https://from-env"
+    records = _loader_warnings(caplog)
+    assert len(records) == 1
+    assert records[0].getMessage() == _CORRUPT.format(cls="PermissionError").format(
+        path=config_file
+    )
+
+
+def test_config_file_is_read_as_utf8_whatever_the_locale(tmp_path, monkeypatch):
+    # A non-ASCII value reads the same under a C or ASCII locale as under UTF-8:
+    # the loader names the encoding instead of inheriting the container's.
+    config_file = tmp_path / "config.json"
+    config_file.write_bytes('{"CORS_ORIGINS": "https://caf\u00e9.example"}'.encode())
+    loader = _reload_loader(monkeypatch, str(config_file))
+    real_open = open
+
+    def ascii_default_open(file, mode="r", *args, encoding=None, **kwargs):
+        # Stand in for a locale whose default encoding is ASCII.
+        return real_open(file, mode, *args, encoding=encoding or "ascii", **kwargs)
+
+    monkeypatch.setattr("builtins.open", ascii_default_open)
+    assert loader._load_json() == {"CORS_ORIGINS": "https://caf\u00e9.example"}
+
+
+@pytest.mark.parametrize(
+    ("parts", "not_text"),
+    [
+        pytest.param({"POSTGRES_USER": 5}, "POSTGRES_USER", id="number-user"),
+        pytest.param({"POSTGRES_DB": 1.5}, "POSTGRES_DB", id="float-db"),
+        pytest.param({"POSTGRES_DB": {"a": 1}}, "POSTGRES_DB", id="object-db"),
+        pytest.param({"POSTGRES_PASSWORD": ["pw"]}, "POSTGRES_PASSWORD", id="list-password"),
+        pytest.param({"POSTGRES_PASSWORD": True}, "POSTGRES_PASSWORD", id="true-password"),
+        pytest.param(
+            {"POSTGRES_PASSWORD": "\ud800"}, "POSTGRES_PASSWORD", id="lone-surrogate-password"
+        ),
+    ],
+)
+def test_postgres_part_that_is_not_text_leaves_database_url_underived(
+    tmp_path, monkeypatch, caplog, parts, not_text
+):
+    # A valid object whose POSTGRES_* part is not text: URL.create raised TypeError,
+    # the rendering UnicodeEncodeError, at import; a list or boolean password was
+    # stringified into a wrong URL. The URL is now left to the environment, with one
+    # WARNING naming the key and never the value.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    content = {"POSTGRES_USER": "herd", "POSTGRES_PASSWORD": "pw", "POSTGRES_DB": "herd"}
+    content.update(parts)
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps(content))
+    loader = _reload_loader(monkeypatch, str(config_file))
+    caplog.set_level(logging.WARNING, logger="herd_common.config_loader")
+
+    class S(BaseSettings):
+        database_url: str = ""
+
+    assert "database_url" not in loader.HerdJsonConfigSource(S)()
+    records = _loader_warnings(caplog)
+    assert len(records) == 1
+    assert records[0].getMessage() == (
+        f"Not deriving DATABASE_URL from HERD config file {config_file}: {not_text} must be text"
+    )
 
 
 def _herd_ordered_settings(loader):
