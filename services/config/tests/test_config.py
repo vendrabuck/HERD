@@ -682,6 +682,64 @@ class TestSettingsKeysLimitedToSchema:
         assert saved["POSTGRES_PASSWORD"] == "secret"
 
 
+# -- OPS-CONFIG-31: a lone surrogate in a save is refused before anything else --
+
+_SUR = chr(0xD800)  # built, so no source escape is decoded early
+
+
+def _escaped(value) -> bytes:
+    """A raw body with every non-ASCII code point escaped (`json=` cannot send a lone
+    surrogate)."""
+    return json.dumps(value, ensure_ascii=True).encode("ascii")
+
+
+class TestSettingsMustBeValidText:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "values",
+        [
+            {**_REQUIRED_VALUES, "POSTGRES_PASSWORD": "pw" + _SUR},
+            {**_REQUIRED_VALUES, "LOG_LEVEL": {"nested": ["x" + _SUR]}},
+            # an unknown key holding one: before this rule, its echo in the
+            # unknown-key detail was a 500
+            {**_REQUIRED_VALUES, "NOT_A_SETTING" + _SUR: "x"},
+            # checked before the required fields too
+            {"POSTGRES_USER": _SUR},
+        ],
+        ids=["value", "nested_value", "unknown_key", "before_required"],
+    )
+    async def test_a_lone_surrogate_is_the_fixed_422_and_writes_nothing(
+        self, async_client, tmp_config_dir, values
+    ):
+        headers = await _session_headers(async_client)
+        ok = await async_client.put("/settings", json={"values": _REQUIRED_VALUES}, headers=headers)
+        assert ok.status_code == 200
+        config_path = os.path.join(tmp_config_dir, "config.json")
+        with open(config_path) as f:
+            before = f.read()
+        resp = await async_client.put(
+            "/settings",
+            content=_escaped({"values": values}),
+            headers={**headers, "content-type": "application/json"},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == {"errors": ["Settings must be valid UTF-8 text"]}
+        with open(config_path) as f:
+            assert f.read() == before
+
+    @pytest.mark.asyncio
+    async def test_a_surrogate_pair_and_other_non_ascii_text_are_saved(self, async_client):
+        headers = await _session_headers(async_client)
+        body = {**_REQUIRED_VALUES, "POSTGRES_PASSWORD": "päss-\U0001f511"}
+        resp = await async_client.put(
+            "/settings",
+            content=_escaped({"values": body}),
+            headers={**headers, "content-type": "application/json"},
+        )
+        assert resp.status_code == 200
+        assert load_config()["POSTGRES_PASSWORD"] == "päss-\U0001f511"
+
+
 # -- issue #1427: an auth file that is valid JSON but not an object --
 
 # Every JSON value that is not an object, plus objects whose password_changed is
