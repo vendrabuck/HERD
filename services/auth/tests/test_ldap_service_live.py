@@ -1054,3 +1054,81 @@ async def test_interval_loop_produces_a_run_row_against_live_directory(
         assert emails == {f"user{n}@company.local" for n in (1, 2, 3)}
     finally:
         await file_engine.dispose()
+
+
+# -- Issue #1448: a binary attribute value never becomes account data -------------
+#
+# OpenLDAP enforces the mail and uid syntaxes, so a value that is not UTF-8 cannot
+# sit in either; the real case is a setting pointed at a binary attribute. A
+# temporary entry (added and deleted here, so the seeded layout and
+# _ALL_SEEDED_PRESENT_EMAILS stay as they are, and no `make ldap-reset` is needed)
+# carries a jpegPhoto whose octets are not UTF-8, and the tests point
+# LDAP_EMAIL_ATTRIBUTE or LDAP_USERNAME_ATTRIBUTE at it.
+
+BINARY_UID = "binary-tmp-1"
+BINARY_DN = f"uid={BINARY_UID},{PEOPLE_DN}"
+# A JPEG start-of-image and JFIF header: 0xFF is never UTF-8.
+BINARY_VALUE = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+
+
+@pytest.fixture
+def binary_person():
+    conn = _admin_conn()
+    try:
+        _safe_delete(conn, BINARY_DN)
+        conn.add(
+            BINARY_DN,
+            attributes={
+                "objectClass": ["inetOrgPerson"],
+                "uid": BINARY_UID,
+                "cn": "Binary Tmp1",
+                "sn": "Tmp1",
+                "mail": f"{BINARY_UID}@company.local",
+                "userPassword": USER_PW,
+                "jpegPhoto": BINARY_VALUE,
+            },
+        )
+        assert conn.result["result"] == 0, conn.result
+        yield BINARY_DN
+    finally:
+        _safe_delete(conn, BINARY_DN)
+        conn.unbind()
+
+
+@pytest.mark.asyncio
+async def test_bind_user_binary_username_attribute_falls_back_to_login_name(
+    monkeypatch, ldap_settings, binary_person
+):
+    monkeypatch.setattr(settings, "ldap_username_attribute", "jpegPhoto", raising=False)
+    identity = await ldap_service.bind_user(BINARY_UID, USER_PW)
+    assert identity is not None
+    assert (identity.username, identity.email) == (BINARY_UID, f"{BINARY_UID}@company.local")
+
+
+@pytest.mark.asyncio
+async def test_login_endpoint_binary_email_attribute_is_401(
+    monkeypatch, ldap_settings, http_client, binary_person
+):
+    monkeypatch.setattr(settings, "ldap_email_attribute", "jpegPhoto", raising=False)
+    resp = await http_client.post("/login", json={"email": BINARY_UID, "password": USER_PW})
+    assert (resp.status_code, resp.json()) == (401, {"detail": "Invalid credentials"})
+
+
+@pytest.mark.asyncio
+async def test_resolve_member_binary_email_attribute_is_missing_email(
+    monkeypatch, ldap_settings, binary_person
+):
+    monkeypatch.setattr(settings, "ldap_email_attribute", "jpegPhoto", raising=False)
+    resolution = await ldap_service.resolve_member(binary_person)
+    assert resolution == ldap_service.LdapMemberResolution(
+        None, ldap_service.MEMBER_SKIP_MISSING_EMAIL
+    )
+
+
+@pytest.mark.asyncio
+async def test_present_emails_leaves_out_a_binary_value(monkeypatch, ldap_settings, binary_person):
+    """The one entry with a jpegPhoto holds a value that is not text: the
+    enumeration finds the entry and collects nothing from it (before #1448 it
+    collected the text of the bytes repr)."""
+    monkeypatch.setattr(settings, "ldap_email_attribute", "jpegPhoto", raising=False)
+    assert await ldap_service.present_emails() == frozenset()

@@ -109,8 +109,8 @@ keeping pruning out of the manual path, not an oversight.
 | `LDAP_BIND_PASSWORD` | (empty) | Service-account password. |
 | `LDAP_USER_BASE_DN` | (empty) | Search base, e.g. `OU=Users,DC=example,DC=com`. |
 | `LDAP_USER_FILTER` | `(sAMAccountName={username})` | Search filter. `{username}` is substituted with the escaped login input; it is the only placeholder, it must appear at least once, and a literal brace is written `{{` or `}}`. Any other placeholder (`{user}`, `{0}`), a single brace, or a filter ldap3 cannot parse makes every LDAP login answer 503 and logs the ERROR `ldap_user_filter_invalid` naming the defect, at startup and at each login; auth still starts. |
-| `LDAP_EMAIL_ATTRIBUTE` | `mail` | Directory attribute providing the user's email. Users without this attribute cannot log in. |
-| `LDAP_USERNAME_ATTRIBUTE` | `sAMAccountName` | Directory attribute used as the HERD username. |
+| `LDAP_EMAIL_ATTRIBUTE` | `mail` | Directory attribute providing the user's email. Users without this attribute cannot log in. Only a text value counts: a value that is not UTF-8 (a binary attribute), is empty, or holds a control character is ignored with the WARNING `ldap_attribute_not_text`, and the first text value of a multi-valued attribute is used. |
+| `LDAP_USERNAME_ATTRIBUTE` | `sAMAccountName` | Directory attribute used as the HERD username. Only a text value counts, as for `LDAP_EMAIL_ATTRIBUTE`; with none, login uses the typed login name and group sync skips the member as `missing_username`. |
 | `LDAP_GROUP_MEMBER_ATTRIBUTE` | `member` | Group entry attribute holding member DNs (Active Directory and `groupOfNames` use `member`; `posixGroup` `memberUid` is out of scope). Consulted by the ADR 0011 group sync. |
 | `LDAP_GROUP_NAME_ATTRIBUTE` | `cn` | Group entry attribute cached as a mapping's display name. Consulted by the ADR 0011 group sync. |
 | `LDAP_GROUP_SYNC_ENABLED` | `false` | Start the background loop that reconciles directory groups on an interval (ADR 0011 phase 5). Dark by default: admin-managed mappings and on-demand sync-now work regardless of this setting. Also requires `AUTH_METHOD=ldap`. |

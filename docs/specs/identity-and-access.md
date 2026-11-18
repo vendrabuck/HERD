@@ -327,7 +327,7 @@ Auth service:
 |---|---|---|---|---|
 | GET | `/login-options` | anyone, unauthenticated; every mode | 200 | IAM-OIDC-16 |
 | POST | `/register` | anyone, unauthenticated; local mode only | 201 | IAM-REG-1 to IAM-REG-6, IAM-PROFILE-9 |
-| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-6, IAM-LDAP-1 to IAM-LDAP-14, IAM-OIDC-21 |
+| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-6, IAM-LDAP-1 to IAM-LDAP-15, IAM-OIDC-21 |
 | GET | `/oidc/login` | anyone, unauthenticated; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-17 |
 | GET | `/oidc/callback` | anyone holding the `herd_oidc_flow` cookie; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-18, IAM-OIDC-19 |
 | POST | `/oidc/exchange` | anyone holding the `herd_oidc_handoff` cookie; OIDC mode only, else 404 | 200 | IAM-OIDC-15, IAM-OIDC-20 |
@@ -538,7 +538,8 @@ account automatically.
   code at all (a wrong password, the codes directories use for a disabled, locked, or
   expired account, and busy or unavailable too: only an existing user reaches the user
   bind, so any other answer there would tell an existing account from an unknown one),
-  and an entry without the email attribute. A search that found the user is a match
+  and an entry with no email value that is text (no email attribute, or only values
+  IAM-LDAP-15 leaves out). A search that found the user is a match
   whatever its result code, as ldap3 reports one (a size- or time-limited search that
   returned the entry signs in). \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_search_user`, `_bind_as_user`, `_checked_search`) \
@@ -567,10 +568,10 @@ account automatically.
   (IAM-SYNC-9, IAM-SYNC-12). \
   Enforced in: `services/auth/app/services/auth_service.py` (`_authenticate_ldap`) \
   Pinned by: `services/auth/tests/test_auth_ldap.py` (`test_ldap_login_username_collision_returns_401`)
-- **IAM-LDAP-11.** The provisioned username is the entry's `LDAP_USERNAME_ATTRIBUTE`
-  value, or the typed login name when the entry has none. \
-  Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`) \
-  Pinned by: none
+- **IAM-LDAP-11.** The provisioned username is the entry's first `LDAP_USERNAME_ATTRIBUTE`
+  value that is text (IAM-LDAP-15), or the typed login name when the entry has none. \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_first_text_value`) \
+  Pinned by: `services/auth/tests/test_ldap_attribute_text.py` (`test_a_missing_username_falls_back_to_the_login_name`, `test_a_username_that_is_not_text_falls_back_to_the_login_name`, `test_a_text_username_attribute_is_used`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_binary_username_attribute_falls_back_to_login_name`)
 - **IAM-LDAP-12.** When the directory cannot be asked, login answers 503 `Directory
   unavailable, credentials not checked` (issue #1403): incomplete configuration
   (`LDAP_SERVER_URL` or `LDAP_USER_BASE_DN` empty), an `LDAP_USER_FILTER` that
@@ -639,6 +640,28 @@ account automatically.
   operator's to avoid. \
   Enforced in: `services/auth/app/services/ldap_service.py` (`render_user_filter`, `user_filter_problem`, `_bind_user_sync`, `_search_user`, `log_ldap_startup_problems`); `services/auth/app/main.py` (`lifespan`) \
   Pinned by: `services/auth/tests/test_ldap_user_filter.py` (`test_every_defect_is_found_with_its_reason`, `test_a_usable_template_has_no_problem`, `test_render_never_interprets_the_login_name`, `test_a_login_gets_the_same_outage_for_every_name_and_password`, `test_the_search_itself_never_raises_anything_but_unavailable`, `test_startup_reports_a_defect_once_in_ldap_mode`, `test_startup_is_silent_outside_ldap_mode`, `test_the_lifespan_reports_it_and_still_boots`, `test_the_route_answers_503_never_500`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_unusable_filter_is_503_for_every_login`)
+
+- **IAM-LDAP-15.** A directory attribute value that is not text never becomes account
+  data (issue #1448). ldap3 returns a value that is not UTF-8 as `bytes`, and every
+  read of an identity attribute goes through one conversion: a value is text when it
+  is a `str`, or `bytes` that decode as strict UTF-8, that is not empty and holds no
+  control character (Unicode category Cc, NUL included, which Postgres cannot store);
+  anything else is left out and counts as absent. So login refuses an entry with no
+  email value that is text (IAM-LDAP-5) and falls back to the login name for the
+  username (IAM-LDAP-11); member resolution skips the member as `missing_email` or
+  `missing_username` (IAM-SYNC-4, which suppress the group's removals, IAM-SYNC-5);
+  the group's display name falls back to its DN (IAM-MAP-4); a member value that is
+  not text is left out of the group's member list; and the presence enumeration
+  leaves the value out (IAM-SWEEP-2). Of a multi-valued attribute, the first value
+  that is text in the directory's order is the one used. Each read that left a value
+  out logs one WARNING (action `ldap_attribute_not_text`, the attribute, the DN, the
+  count, and the value classes, never a value); the enumeration logs one for the whole
+  pass. Login reads the attributes only after the user bind succeeded, so the
+  difference is reachable only with the user's password. Before the fix each read
+  called `str()` on the raw value, so `bytes` became the text of its repr
+  (`"b'\\xff...'"`) and was provisioned as the email or username. \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`_text_value`, `_text_values`, `_first_text_value`, `_bind_user_sync`, `_resolution_for`, `_fetch_group_sync`, `_paged_user_emails_sync`) \
+  Pinned by: `services/auth/tests/test_ldap_attribute_text.py` (`test_text_value_is_text_or_none`, `test_ldap3_returns_a_value_that_is_not_utf8_as_bytes`, `test_a_login_whose_only_email_is_not_text_is_refused`, `test_a_login_whose_email_holds_no_usable_text_is_refused`, `test_the_first_text_email_is_used`, `test_the_attributes_are_read_only_after_the_user_bind`, `test_the_route_refuses_an_email_that_is_not_text_and_creates_nothing`, `test_the_route_provisions_only_text`, `test_a_member_whose_identity_is_not_text_is_skipped_as_missing`, `test_a_member_with_a_text_value_after_a_binary_one_resolves`, `test_a_group_name_or_member_that_is_not_text_is_left_out`, `test_the_enumeration_leaves_out_what_is_not_text_with_one_line`, `test_a_sync_pass_never_provisions_a_bytes_repr_and_keeps_removals_suppressed`, `test_a_mapping_of_a_group_whose_name_is_not_text_caches_the_dn`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_binary_email_attribute_is_401`, `test_resolve_member_binary_email_attribute_is_missing_email`, `test_present_emails_leaves_out_a_binary_value`)
 
 **Out of scope.** Roles never come from the directory (ADR 0011, Blast radius). SAML and
 OIDC do not exist (issue #37).
@@ -1039,8 +1062,8 @@ group so the HERD group's membership follows the directory.
   Enforced in: `services/auth/app/routers/ldap_sync.py` (`create_mapping`, `MAPPING_DIRECTORY_UNAVAILABLE_DETAIL`); `services/auth/app/services/ldap_service.py` (`fetch_group`, `_base_entry`) \
   Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_create_mapping_dangling_dn_is_422`, `test_create_mapping_directory_outage_is_503_not_422`, `test_create_mapping_503_detail_never_carries_directory_text`); `services/auth/tests/test_ldap_service_live.py` (`test_fetch_group_nonexistent_dn_is_dangling_none`, `test_fetch_group_invalid_dn_syntax_is_proven_unresolvable`)
 - **IAM-MAP-4.** The stored DN is the canonical DN the directory returned, not the typed
-  one; the cached display name is the group's `LDAP_GROUP_NAME_ATTRIBUTE` cut to 255
-  characters, or the DN when the attribute is missing. \
+  one; the cached display name is the group's first `LDAP_GROUP_NAME_ATTRIBUTE` value
+  that is text (IAM-LDAP-15) cut to 255 characters, or the DN when it has none. \
   Enforced in: `services/auth/app/routers/ldap_sync.py` (`create_mapping`); `services/auth/app/services/ldap_service.py` (`_fetch_group_sync`) \
   Pinned by: `services/auth/tests/test_ldap_sync.py` (`test_create_mapping_stores_canonical_directory_dn`, `test_create_mapping_truncates_long_directory_name`); `services/auth/tests/test_ldap_service.py` (`test_fetch_group_missing_name_attribute_falls_back_to_dn`)
 - **IAM-MAP-5.** An entry with no members is accepted with a `warning` in the response,
@@ -1096,7 +1119,8 @@ removes anyone when the directory could not be read completely.
   Enforced in: `services/auth/app/services/ldap_sync_service.py` (`_reconcile_mapping`) \
   Pinned by: none
 - **IAM-SYNC-4.** A member the directory proves unusable is counted and skipped without
-  failing the group: `not_found` (entry gone), `missing_email`, `missing_username`. \
+  failing the group: `not_found` (entry gone), `missing_email`, `missing_username` (an
+  attribute with no value that is text counts as missing, IAM-LDAP-15). \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_resolution_for`); `services/auth/app/services/ldap_sync_service.py` (`_reconcile_mapping`) \
   Pinned by: `services/auth/tests/test_ldap_sync_service.py` (`test_member_skip_reasons_counted_without_failing_group`); `services/auth/tests/test_ldap_service_live.py` (`test_resolve_member_skip_reasons`)
 - **IAM-SYNC-5.** When any member of a group skipped as `missing_email` or
@@ -1185,7 +1209,7 @@ turned off earlier once they reappear. A circuit breaker stops a mass deactivati
   Enforced in: `services/auth/app/services/ldap_sync_service.py` (`_run_deactivation_sweep`) \
   Pinned by: `services/auth/tests/test_ldap_sync_service.py` (`test_sweep_disabled_when_setting_off`)
 - **IAM-SWEEP-2.** Presence is one paged enumeration of every email attribute value
-  (lowercased) under `LDAP_USER_BASE_DN`; a failed page or a non-success result raises
+  that is text (lowercased, IAM-LDAP-15) under `LDAP_USER_BASE_DN`; a failed page or a non-success result raises
   instead of returning a partial set. \
   Enforced in: `services/auth/app/services/ldap_service.py` (`present_emails`, `_paged_user_emails_sync`) \
   Pinned by: `services/auth/tests/test_ldap_service.py` (`test_present_emails_collects_across_multiple_pages_lowercased`, `test_present_emails_collects_multivalued_attribute`, `test_present_emails_missing_control_after_success_ends_pages`, `test_present_emails_raises_on_non_success_page`, `test_present_emails_raises_on_ldap_exception`)
@@ -2130,7 +2154,7 @@ password, though `msg` and `loc` can quote part of an email, a UUID, or a key na
 | 400 | `Token role cannot exceed the principal's role` | token role above its principal | IAM-APITOK-3 |
 | 401 | `Not authenticated` (FastAPI) | no Authorization header on a JWT-guarded route, auth or acl | IAM-JWT-3, IAM-CLAIM-1 |
 | 401 | `Could not validate credentials` | bad, expired, or subjectless token; in auth also an unknown or inactive account | IAM-JWT-3, IAM-ACCT-5, IAM-CLAIM-1 |
-| 401 | `Invalid credentials` | any login refusal, local, LDAP, or OIDC mode | IAM-LOGIN-1, IAM-LDAP-5, IAM-LDAP-9, IAM-LDAP-10, IAM-LDAP-13, IAM-OIDC-21 |
+| 401 | `Invalid credentials` | any login refusal, local, LDAP, or OIDC mode | IAM-LOGIN-1, IAM-LDAP-5, IAM-LDAP-9, IAM-LDAP-10, IAM-LDAP-13, IAM-LDAP-15, IAM-OIDC-21 |
 | 401 | `Single sign-on session expired; sign in again` | handoff exchange refused | IAM-OIDC-20 |
 | 401 | `Invalid or expired refresh token` | refresh refused | IAM-SESSION-2 |
 | 401 | `Invalid or expired token` | API token exchange refused | IAM-APITOK-8 |
@@ -2290,7 +2314,6 @@ IAM-LOGIN-6.)
 - IAM-SESSION-1: refresh token storage as a hash and its lifetime.
 - IAM-LOGIN-3: the login identifier bound.
 - IAM-HASH-7: hashing on the event loop (by decision, unchanged from passlib).
-- IAM-LDAP-11: the username fallback to the typed login name.
 - IAM-JWT-1: the claim set and lifetime of a login access token.
 - IAM-JWT-2: a refresh reissuing the current database role.
 - IAM-ROLE-8: `GET /me` reporting the stored role.

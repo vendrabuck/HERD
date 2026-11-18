@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import ssl
 import string
+import unicodedata
 from collections.abc import Sequence
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -663,7 +664,8 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
     password (refused before any call, since an LDAP simple bind with one
     succeeds anonymously), a password SASLprep refuses (also before any call,
     _password_refused_by_saslprep), no matching entry, a refused user bind, or an
-    entry without the email attribute.
+    entry without the email attribute (or with no value of it that is text,
+    issue #1448).
 
     Raises LdapUnavailableError whenever the directory could not be asked:
     incomplete configuration (logged at ERROR), an LDAP_USER_FILTER that
@@ -724,10 +726,23 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
         )
         raise
 
-    email_values = attrs.get(settings.ldap_email_attribute) or []
-    username_values = attrs.get(settings.ldap_username_attribute) or []
-    email = str(email_values[0]) if email_values else ""
-    ldap_username = str(username_values[0]) if username_values else username
+    # Issue #1448: a value that is not text counts as absent (IAM-LDAP-15), so
+    # no email is the refusal below and no username falls back to the login
+    # name (IAM-LDAP-11). Both are read only after the user bind succeeded, so
+    # neither is reachable without the user's password.
+    email = _first_text_value(
+        attrs.get(settings.ldap_email_attribute) or [],
+        attribute=settings.ldap_email_attribute,
+        dn=user_dn,
+    )
+    ldap_username = (
+        _first_text_value(
+            attrs.get(settings.ldap_username_attribute) or [],
+            attribute=settings.ldap_username_attribute,
+            dn=user_dn,
+        )
+        or username
+    )
     if not email:
         logger.warning(
             "LDAP user has no email attribute; cannot provision HERD account",
@@ -834,8 +849,84 @@ def _base_entry(conn: Connection, dn: str, attributes: list[str]):
 
 
 def _attr_values(entry, attr: str) -> list:
-    """Values of an attribute on an ldap3 Entry, [] when absent."""
+    """Values of an attribute on an ldap3 Entry, [] when absent.
+
+    Raw: a value may be `bytes` (see _text_value). Nothing may turn one into
+    account data or a log line except through _text_value.
+    """
     return list(entry[attr].values) if attr in entry else []
+
+
+def _text_value(value: object) -> str | None:
+    """A directory attribute value as text, or None when it is not text (issue
+    #1448, IAM-LDAP-15). The ONE conversion of a directory value to a string:
+    never `str()` one, which turns `bytes` into the text of its repr (`"b'...'"`).
+
+    ldap3 decodes each value as UTF-8 and, with no schema loaded (this module
+    asks for none, get_info=NONE), returns the raw `bytes` when that fails, so a
+    value that is not UTF-8 arrives as `bytes`. Text is a `str`, or `bytes` that
+    decode as strict UTF-8, that is not empty and holds no control character
+    (Unicode category Cc: NUL, which Postgres cannot store in a text column, tab,
+    newline, escape, DEL, the C1 range). Every other value is None: `bytes` that
+    are not UTF-8, an empty or control-holding value, and any other type (an int
+    or a datetime, which a schema-aware ldap3 would return and this module never
+    asks for).
+    """
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(value, str) or not value:
+        return None
+    if any(unicodedata.category(ch) == "Cc" for ch in value):
+        return None
+    return value
+
+
+def _text_values(values: Sequence[object]) -> tuple[list[str], list[str]]:
+    """The values that are text, in the order the directory returned them, and
+    the class names of the ones that are not (for the log line; never a value)."""
+    texts: list[str] = []
+    refused: list[str] = []
+    for value in values:
+        text = _text_value(value)
+        if text is None:
+            refused.append(type(value).__name__)
+        else:
+            texts.append(text)
+    return texts, refused
+
+
+def _log_values_not_text(attribute: str, dn: str, refused: list[str]) -> None:
+    """One WARNING per attribute read that left values out: the attribute, the
+    entry (or search base) DN, the count, and the value classes, never a value."""
+    logger.warning(
+        "LDAP attribute %s of %s holds %d value(s) that are not text; they are ignored",
+        attribute,
+        dn,
+        len(refused),
+        extra={
+            "action": "ldap_attribute_not_text",
+            "attribute": attribute,
+            "dn": dn,
+            "count": len(refused),
+            "value_classes": sorted(set(refused)),
+        },
+    )
+
+
+def _first_text_value(values: Sequence[object], *, attribute: str, dn: str) -> str | None:
+    """The first value of a single-valued use (an email, a username, a display
+    name) that is text, or None when none is: a value that is not text counts
+    as absent, so the caller's missing-attribute rule applies. When values are
+    left out, logs one WARNING (_log_values_not_text). Of a multi-valued
+    attribute whose first value is not text and whose second is, the second is
+    used: the first text value in the directory's order."""
+    texts, refused = _text_values(values)
+    if refused:
+        _log_values_not_text(attribute, dn, refused)
+    return texts[0] if texts else None
 
 
 def _is_transport_failure(exc: LdapUnavailableError) -> bool:
@@ -890,23 +981,30 @@ def _fetch_group_sync(
     )
     if entry is None:
         return None
-    name_values = _attr_values(entry, name_attr)
-    if not name_values:
-        # A group without its display-name attribute is still usable; the DN
-        # stands in so the cached directory_name is never empty.
+    name = _first_text_value(_attr_values(entry, name_attr), attribute=name_attr, dn=group_dn)
+    if name is None:
+        # A group without its display-name attribute (or with no text value
+        # in it) is still usable; the DN stands in so the cached
+        # directory_name is never empty.
         logger.warning(
-            "LDAP group has no %s attribute; falling back to its DN",
+            "LDAP group has no text %s value; falling back to its DN",
             name_attr,
             extra={"action": "ldap_group_missing_name", "dn": group_dn},
         )
     # An entry lacking the member attribute yields an empty tuple: AD models
     # an empty group that way, so it cannot be refused outright. Note this
     # also means fetch_group proves existence, not group-ness; mapping
-    # validation warns on an empty member_dns.
+    # validation warns on an empty member_dns. A member value that is not text
+    # names no entry HERD can look up, so it is left out and logged; before
+    # issue #1448 the text of its bytes repr went on as a DN, which resolved as
+    # not_found, a skip that never suppresses removals either.
+    member_dns, refused = _text_values(_attr_values(entry, member_attr))
+    if refused:
+        _log_values_not_text(member_attr, group_dn, refused)
     return LdapGroupEntry(
         dn=entry.entry_dn,
-        name=str(name_values[0]) if name_values else group_dn,
-        member_dns=tuple(str(v) for v in _attr_values(entry, member_attr)),
+        name=name if name is not None else group_dn,
+        member_dns=tuple(member_dns),
     )
 
 
@@ -917,19 +1015,24 @@ def _resolution_for(conn: Connection, member_dn: str) -> LdapMemberResolution:
     )
     if entry is None:
         return LdapMemberResolution(None, MEMBER_SKIP_NOT_FOUND)
-    email_values = _attr_values(entry, settings.ldap_email_attribute)
-    username_values = _attr_values(entry, settings.ldap_username_attribute)
-    if not email_values:
-        return LdapMemberResolution(None, MEMBER_SKIP_MISSING_EMAIL)
-    if not username_values:
-        return LdapMemberResolution(None, MEMBER_SKIP_MISSING_USERNAME)
-    return LdapMemberResolution(
-        LdapIdentity(
-            username=str(username_values[0]),
-            email=str(email_values[0]),
-            dn=entry.entry_dn,
-        )
+    # A value that is not text counts as absent (issue #1448, IAM-LDAP-15), so
+    # it is the missing_email or missing_username skip, which suppresses the
+    # group's removals this pass (IAM-SYNC-5).
+    email = _first_text_value(
+        _attr_values(entry, settings.ldap_email_attribute),
+        attribute=settings.ldap_email_attribute,
+        dn=entry.entry_dn,
     )
+    username = _first_text_value(
+        _attr_values(entry, settings.ldap_username_attribute),
+        attribute=settings.ldap_username_attribute,
+        dn=entry.entry_dn,
+    )
+    if email is None:
+        return LdapMemberResolution(None, MEMBER_SKIP_MISSING_EMAIL)
+    if username is None:
+        return LdapMemberResolution(None, MEMBER_SKIP_MISSING_USERNAME)
+    return LdapMemberResolution(LdapIdentity(username=username, email=email, dn=entry.entry_dn))
 
 
 def _resolve_member_sync(member_dn: str) -> LdapMemberResolution:
@@ -1052,7 +1155,9 @@ def _paged_user_emails_sync(
 ) -> frozenset[str]:
     """Paged SUBTREE enumeration under ldap_user_base_dn, collecting every
     value of ldap_email_attribute (lowercased) across every matching entry
-    (an entry may be multi-valued; every value is included).
+    (an entry may be multi-valued; every value is included) that is text: a
+    value that is not (_text_value) is left out, with one WARNING for the
+    whole enumeration (issue #1448).
 
     Loops the paged-results cookie, held on ONE connection for the whole
     enumeration, until the directory reports it exhausted. A missing paging
@@ -1072,6 +1177,7 @@ def _paged_user_emails_sync(
 
     def _do(conn: Connection) -> frozenset[str]:
         emails: set[str] = set()
+        refused: list[str] = []
         cookie: bytes = b""
         while True:
             try:
@@ -1095,8 +1201,9 @@ def _paged_user_emails_sync(
             if result_code != RESULT_SUCCESS:
                 raise LdapUnavailableError(f"{description} failed: {conn.result}")
             for entry in conn.entries:
-                for value in _attr_values(entry, email_attr):
-                    emails.add(str(value).lower())
+                texts, entry_refused = _text_values(_attr_values(entry, email_attr))
+                emails.update(text.lower() for text in texts)
+                refused.extend(entry_refused)
             controls = (conn.result or {}).get("controls") or {}
             page_control = controls.get(_PAGED_COOKIE_OID)
             if not page_control:
@@ -1106,6 +1213,11 @@ def _paged_user_emails_sync(
             cookie = (page_control.get("value") or {}).get("cookie") or b""
             if not cookie:
                 break
+        if refused:
+            # One line per enumeration, not per entry: a value that is not
+            # text matches no HERD account (issue #1448), as its bytes repr
+            # never did either.
+            _log_values_not_text(email_attr, settings.ldap_user_base_dn, refused)
         return frozenset(emails)
 
     return _call_with_connection(_do, holder)
