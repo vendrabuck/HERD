@@ -1,9 +1,11 @@
 """The config service's request-validation (422) handler.
 
-A standalone copy of the auth service's `app/validation_errors.py` (issue #1426),
-with the same behavior and guarantee: the config service imports neither
-herd_common nor auth (CONVENTIONS, Config service), so the two copies are kept in
-step by hand.
+A standalone copy of the shared `herd_common.validation_errors`, the handler every
+other service installs (first written for auth, issue #1426), with the same
+behavior and guarantee: the config service imports neither herd_common nor auth
+(CONVENTIONS, Config service), so the copy is kept in step by hand, and
+`tests/test_validation_errors.py` (`test_the_code_is_identical_to_the_shared_module`)
+fails when its code, docstrings aside, differs from the shared module's.
 
 FastAPI's default handler renders each pydantic error with its `input`: for a
 login or change-password body that is the submitted password, and for a missing

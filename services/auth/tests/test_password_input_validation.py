@@ -10,8 +10,8 @@ step. The pre-check is pinned EQUAL to the hashing step over a corpus of passwor
 never stricter. `LoginRequest` is deliberately unchanged: a NUL at login stays the
 401 of IAM-HASH-3, and a lone surrogate is refused by pydantic's own `str` check.
 
-Every 422 here also passes through auth's validation handler
-(`app/validation_errors.py`): the response never echoes a submitted value. Raw
+Every 422 here also passes through the shared validation handler auth installs
+(`herd_common.validation_errors`): the response never echoes a submitted value. Raw
 bodies are sent with `content=`, because `json=` cannot encode a lone surrogate.
 """
 
