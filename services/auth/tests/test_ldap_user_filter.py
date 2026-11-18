@@ -60,6 +60,54 @@ DEFECTS = {
         "LDAPInvalidFilterError",
     ),
     "no_assertion": ("(&(uid={username})())", "invalid_filter", "LDAPInvalidFilterError"),
+    # The fix round (review of #1446): a template in which the login name could
+    # supply an attribute, an assertion, or a whole filter. `uid=alice` would
+    # complete `({username})` into `(uid=alice)`.
+    "name_is_the_whole_assertion": ("({username})", "invalid_filter", "LDAPInvalidFilterError"),
+    "name_is_an_and_member": (
+        "(&(objectClass=*)({username}))",
+        "invalid_filter",
+        "LDAPInvalidFilterError",
+    ),
+    "name_is_the_attribute": ("({username}=x)", "username_outside_value", "LdapUserFilterError"),
+    "name_inside_the_attribute": (
+        "(uid{username}=x)",
+        "username_outside_value",
+        "LdapUserFilterError",
+    ),
+    "name_is_the_matching_rule": (
+        "(uid:{username}:=x)",
+        "username_outside_value",
+        "LdapUserFilterError",
+    ),
+    "or_with_a_fixed_branch": (
+        "(|(uid={username})(uid=user4))",
+        "or_branch_without_username",
+        "LdapUserFilterError",
+    ),
+    "nested_or_with_a_fixed_branch": (
+        "(&(objectClass=person)(|(uid={username})(&(cn=x)(sn=y))))",
+        "or_branch_without_username",
+        "LdapUserFilterError",
+    ),
+    "negated_name": ("(!(uid={username}))", "username_negated", "LdapUserFilterError"),
+    "negated_name_inside_and": (
+        "(&(objectClass=person)(!(uid={username})))",
+        "username_negated",
+        "LdapUserFilterError",
+    ),
+    # Exceptions that escaped the first cut: auth then failed to boot.
+    "deeply_nested": (
+        "(&" * 990 + "(uid={username})" + ")" * 990,
+        "invalid_filter",
+        "RecursionError",
+    ),
+    "lone_surrogate": ("(uid={username}\udcff)", "invalid_filter", "UnicodeEncodeError"),
+    "too_long": (
+        "(uid={username})" + " " * 4096,
+        "too_long",
+        "LdapUserFilterError",
+    ),
 }
 
 USABLE = [
@@ -69,8 +117,29 @@ USABLE = [
     "(|(uid={username})(mail={username}))",
     "(uid={username:})",
     "(description={{literal}}{username})",
+    # Allowed but discouraged (ENV_VARS): they match more than the named entry.
     "(cn=*{username}*)",
+    "(uid={username}*)",
+    "(uid~={username})",
+    "(uid>={username})",
+    "(uid:caseExactMatch:={username})",
+    # The common Active Directory shape: a negation WITHOUT the name.
+    "(&(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2))"
+    "(sAMAccountName={username}))",
+    # An OR without the name is a constraint, not an alternative.
+    "(&(|(objectClass=person)(objectClass=user))(uid={username}))",
+    "(|(&(uid={username})(objectClass=person))(&(mail={username})(objectClass=user)))",
+    "(uid={username})" + " " * (4096 - len("(uid={username})")),
 ]
+
+
+@pytest.fixture(autouse=True)
+def _fresh_verdicts():
+    """user_filter_problem is memoized per template string; start every test
+    with an empty cache so a counting stand-in sees every check."""
+    ldap_service.user_filter_problem.cache_clear()
+    yield
+    ldap_service.user_filter_problem.cache_clear()
 
 
 @pytest.fixture
@@ -129,10 +198,12 @@ def test_the_search_itself_never_raises_anything_but_unavailable(
 ):
     """The backstop inside _search_user, for a caller that skipped the pre-check:
     a template defect is LdapUnavailableError there too, never KeyError,
-    IndexError, or ValueError."""
+    IndexError, ValueError, RecursionError, or UnicodeEncodeError, and no
+    connection is opened."""
     monkeypatch.setattr(settings, "ldap_user_filter", template)
     with pytest.raises(ldap_service.LdapUnavailableError):
         ldap_service._search_user(KNOWN)
+    assert directory.connections == []
 
 
 # -- 2. A login in that state --------------------------------------------------------------
@@ -165,6 +236,50 @@ def test_a_usable_template_still_signs_in_and_refuses(directory, monkeypatch):
     assert _outcome(KNOWN, GOOD) == "identity"
     assert _outcome(KNOWN, "wrong") == "refusal"
     assert _outcome(UNKNOWN, GOOD) == "refusal"
+
+
+@pytest.mark.parametrize(
+    "template", ["({username})", "(&(objectClass=*)({username}))", "(|(uid={username})(uid=bob))"]
+)
+def test_a_login_name_can_never_supply_an_assertion(directory, monkeypatch, template):
+    """The review's bypass: with `({username})` accepted, the login name
+    `uid=alice` and alice's password signed in; `(|...(uid=bob))` signs any name
+    in as bob with bob's password. All are refused before any directory call."""
+    directory.add_user("bob", "bob-password")
+    monkeypatch.setattr(settings, "ldap_user_filter", template)
+    for name, password in (("uid=alice", GOOD), ("anyone", "bob-password"), (KNOWN, GOOD)):
+        assert _outcome(name, password) == "outage"
+    assert directory.connections == []
+
+
+def test_the_probes_keep_the_makeup_the_check_relies_on():
+    """The check is only as strong as its probe names: two different plain
+    alphanumeric names that cannot occur by accident, and one holding every
+    character escape_filter_chars escapes, every filter operator character, a
+    space, a comma, and a non-ASCII letter."""
+    first, second, nasty = ldap_service._USER_FILTER_PROBES
+    assert first != second
+    assert first.isalnum() and first.isascii() and second.isalnum() and second.isascii()
+    assert len(first) >= 8 and first.lower() == first and second.lower() == second
+    for ch in "*()\\\x00=~<>:, ":
+        assert ch in nasty, repr(ch)
+    assert any(not ch.isascii() for ch in nasty)
+
+
+def test_the_check_runs_once_per_template(directory, monkeypatch):
+    calls = []
+    real = ldap_service._check_user_filter
+
+    def counting(template):
+        calls.append(template)
+        return real(template)
+
+    monkeypatch.setattr(ldap_service, "_check_user_filter", counting)
+    monkeypatch.setattr(settings, "ldap_user_filter", "(uid={username})")
+    ldap_service.log_ldap_startup_problems(settings.model_copy(update={"auth_method": "ldap"}))
+    for _ in range(3):
+        assert _outcome(KNOWN, GOOD) == "identity"
+    assert calls == ["(uid={username})"]
 
 
 def test_a_name_holding_template_syntax_is_only_a_name(directory):
@@ -207,11 +322,16 @@ def test_startup_is_silent_for_a_usable_template(caplog):
     assert caplog.records == []
 
 
-async def test_the_lifespan_reports_it_and_still_boots(monkeypatch, caplog):
+@pytest.mark.parametrize(
+    "template",
+    ["(uid={user})", "(&" * 990 + "(uid={username})" + ")" * 990, "(uid={username}\udcff)"],
+    ids=["unknown_field", "recursion", "surrogate"],
+)
+async def test_the_lifespan_reports_it_and_still_boots(monkeypatch, caplog, template):
     from app.main import lifespan
 
     monkeypatch.setattr(settings, "auth_method", "ldap", raising=False)
-    monkeypatch.setattr(settings, "ldap_user_filter", "(uid={user})", raising=False)
+    monkeypatch.setattr(settings, "ldap_user_filter", template, raising=False)
     with (
         patch("app.main.create_all_and_stamp", AsyncMock()),
         patch("app.main._seed_superadmin", AsyncMock()),
@@ -239,7 +359,29 @@ async def _user_count() -> int:
         return (await db.execute(select(func.count()).select_from(User))).scalar_one()
 
 
-@pytest.mark.parametrize("template", ["(uid={user})", "(uid={0})", "(uid={username}){"])
+@pytest.mark.parametrize(
+    "template",
+    [
+        "(uid={user})",
+        "(uid={0})",
+        "(uid={username}){",
+        "({username})",
+        "(|(uid={username})(uid=user4))",
+        "(&" * 990 + "(uid={username})" + ")" * 990,
+        "(uid={username}\udcff)",
+        "(uid={username})" + " " * 5000,
+    ],
+    ids=[
+        "unknown",
+        "positional",
+        "brace",
+        "whole_assertion",
+        "or_branch",
+        "deep",
+        "surrogate",
+        "long",
+    ],
+)
 async def test_the_route_answers_503_never_500(client, directory, monkeypatch, template):
     monkeypatch.setattr(settings, "ldap_user_filter", template)
     answers = []

@@ -349,7 +349,15 @@ async def test_login_endpoint_unreachable_directory_is_503(monkeypatch, ldap_set
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "template", ["(uid={user})", "(uid={0})", "(uid={username}", "(uid=user4)"]
+    "template",
+    [
+        "(uid={user})",
+        "(uid={0})",
+        "(uid={username}",
+        "(uid=user4)",
+        "(|(uid={username})(uid=user4))",
+        "(!(uid={username}))",
+    ],
 )
 async def test_login_endpoint_unusable_filter_is_503_for_every_login(
     monkeypatch, ldap_settings, http_client, template
@@ -366,6 +374,22 @@ async def test_login_endpoint_unusable_filter_is_503_for_every_login(
     assert [(r.status_code, r.json()) for r in answers] == [
         (503, {"detail": "Directory unavailable, credentials not checked"})
     ] * 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("template", ["({username})", "(&(objectClass=*)({username}))"])
+async def test_login_endpoint_a_login_name_never_supplies_an_assertion(
+    monkeypatch, ldap_settings, http_client, template
+):
+    """The #1446 review's bypass against a real directory: with the login name
+    standing for a whole assertion, `uid=user4` and user4's password signed in.
+    Such a template is refused, so the answer is the 503."""
+    monkeypatch.setattr(settings, "ldap_user_filter", template, raising=False)
+    resp = await http_client.post("/login", json={"email": "uid=user4", "password": USER_PW})
+    assert (resp.status_code, resp.json()) == (
+        503,
+        {"detail": "Directory unavailable, credentials not checked"},
+    )
 
 
 @pytest.mark.asyncio

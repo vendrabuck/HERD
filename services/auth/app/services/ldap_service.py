@@ -23,6 +23,7 @@ the event loop.
 
 from __future__ import annotations
 
+import functools
 import logging
 import ssl
 import string
@@ -45,7 +46,9 @@ from ldap3.core.results import (
     RESULT_NO_SUCH_OBJECT,
     RESULT_SUCCESS,
 )
-from ldap3.operation.search import search_operation
+from ldap3.operation.search import NOT as SEARCH_NOT
+from ldap3.operation.search import OR as SEARCH_OR
+from ldap3.operation.search import parse_filter, search_operation
 from ldap3.protocol.sasl.sasl import validate_simple_password
 from ldap3.utils.conv import escape_filter_chars
 from ldap3.utils.dn import safe_dn
@@ -380,13 +383,26 @@ USER_FILTER_UNBALANCED_BRACE = "unbalanced_brace"
 USER_FILTER_UNKNOWN_FIELD = "unknown_field"
 USER_FILTER_NO_FIELD = "no_username_field"
 USER_FILTER_INVALID_FILTER = "invalid_filter"
+USER_FILTER_TOO_LONG = "too_long"
+USER_FILTER_OUTSIDE_VALUE = "username_outside_value"
+USER_FILTER_NEGATED = "username_negated"
+USER_FILTER_OR_BRANCH = "or_branch_without_username"
 
-# The login name the filter's LDAP syntax is checked with. It holds every
-# character escape_filter_chars escapes, plus a space, an "=", and a non-ASCII
-# letter, so the check sees the escaped form a real login name can take. The
-# check never uses the submitted login name, so whether the template is usable
-# can never depend on who is signing in.
-_USER_FILTER_PROBE = "probe*()\\\x00 =é"
+# A template longer than this is refused unread (a sane bound: real filters are
+# well under 1 KB, and a 1 MB one cost seconds to check).
+USER_FILTER_MAX_LENGTH = 4096
+
+# The login names the template is checked with (never the submitted one, so the
+# verdict depends on the template alone). Two plain alphanumeric probes find
+# where {username} lands in the parse tree; the third holds every character
+# escape_filter_chars escapes plus the characters of every filter operator, a
+# space, and a non-ASCII letter, so a template whose parse a real name could
+# change is refused. The probes are pinned by tests: the check is only as good
+# as their makeup.
+_USER_FILTER_PROBES = ("herdprobe7q3", "herdprobe2k9", "probe*()\\\x00 =~=>=<=:=,é")
+
+_FILTER_VALUE_KEYS = ("value", "initial", "any", "final")
+_FILTER_NAME_KEYS = ("attr", "matchingRule")
 
 
 class LdapUserFilterError(ValueError):
@@ -414,7 +430,7 @@ def render_user_filter(template: str, username: str) -> str:
     and a template with no `{username}` at all, which would find the same entry
     for every login name (USER_FILTER_NO_FIELD). The username is inserted as
     text, never formatted, so nothing in it is interpreted. The ONE way the login
-    filter is built; `user_filter_problem` adds the LDAP syntax check.
+    filter is built; `user_filter_problem` adds the structural checks.
     """
     try:
         pieces = list(string.Formatter().parse(template))
@@ -446,48 +462,161 @@ def render_user_filter(template: str, username: str) -> str:
     return "".join(rendered)
 
 
-def user_filter_problem(template: str) -> LdapUserFilterError | None:
-    """Why the template cannot be used as LDAP_USER_FILTER, or None when it can.
+def _filter_nodes(rendered: str) -> list[tuple[int, int, int | None, dict]]:
+    """The parse tree of a rendered filter, as ldap3 builds it for the search
+    request (`search_operation`, the same parser and encoder), flattened in
+    depth-first order to (index, tag, parent index, assertion) tuples. Iterative,
+    so a deep filter cannot exhaust the stack here."""
+    search_operation(
+        "",
+        rendered,
+        SUBTREE,
+        DEREF_ALWAYS,
+        ["objectClass"],
+        0,
+        0,
+        False,
+        True,
+        True,
+        None,
+        validator=None,
+        check_names=True,
+    )
+    root = parse_filter(rendered, None, True, True, None, True)
+    nodes: list[tuple[int, int, int | None, dict]] = []
+    stack: list[tuple[object, int | None]] = [(root, None)]
+    while stack:
+        node, parent = stack.pop()
+        index = len(nodes)
+        nodes.append((index, node.tag, parent, dict(node.assertion or {})))
+        stack.extend((child, index) for child in reversed(node.elements))
+    return nodes
 
-    The template rules of render_user_filter, then the LDAP syntax: the filter
-    rendered with a fixed probe login name must build into a search request
-    exactly as `Connection.search` builds it (ldap3's parser, client-side, no
-    directory call), or it is USER_FILTER_INVALID_FILTER (an unbalanced
-    parenthesis, two filters side by side without `(&...)`, a missing `=`).
-    Escaping makes every login name an assertion-value literal, so a template
-    that passes holds for every login name. Not checked: where `{username}`
-    sits; a template that puts it outside an assertion value, such as
-    `({username}=x)`, parses and is the operator's to avoid.
+
+def _value_parts(assertion: dict) -> list[bytes]:
+    parts: list[bytes] = []
+    for key in _FILTER_VALUE_KEYS:
+        value = assertion.get(key)
+        if value is None:
+            continue
+        parts.extend(value if isinstance(value, list) else [value])
+    return parts
+
+
+def _structure_problem(template: str) -> tuple[str, str] | None:
+    """Where {username} lands in the parsed filter, checked with the probes.
+
+    Every render must parse to the same tree: the same tags and parents, the same
+    attribute descriptions, matching rules, and dnAttributes flags, and assertion
+    values that differ only by the probe (so no login name can add, remove, or
+    move an assertion), and the first probe may never sit in an attribute
+    description or a matching rule (USER_FILTER_OUTSIDE_VALUE). The two overlap
+    on purpose: the second states the rule, the first catches any parse a login
+    name's characters could change (none is known: escaping makes them literal).
+    No `(!...)` may hold {username}
+    (USER_FILTER_NEGATED: it would match every entry but the named one), and an
+    `(|...)` that holds {username} must hold it in every branch
+    (USER_FILTER_OR_BRANCH: a branch without it matches whatever the login name,
+    so any name with that entry's password would sign in as it). With those, an
+    entry matches only through an assertion whose value holds the login name.
     """
+    probe = _USER_FILTER_PROBES[0]
+    trees = [_filter_nodes(render_user_filter(template, name)) for name in _USER_FILTER_PROBES]
+    base = trees[0]
+    probe_bytes = probe.encode()
+    for name, tree in zip(_USER_FILTER_PROBES[1:], trees[1:]):
+        name_bytes = escape_filter_chars(name).encode()
+        if len(tree) != len(base):
+            return USER_FILTER_OUTSIDE_VALUE, "a login name can change the filter's structure"
+        for (_, tag, parent, assertion), (_, other_tag, other_parent, other) in zip(base, tree):
+            if (tag, parent) != (other_tag, other_parent) or set(assertion) != set(other):
+                return USER_FILTER_OUTSIDE_VALUE, "a login name can change the filter's structure"
+            for key in assertion:
+                if key in _FILTER_VALUE_KEYS:
+                    mine = assertion[key] if isinstance(assertion[key], list) else [assertion[key]]
+                    theirs = other[key] if isinstance(other[key], list) else [other[key]]
+                    expected = [part.replace(probe_bytes, name_bytes) for part in mine]
+                    if expected != theirs:
+                        return (
+                            USER_FILTER_OUTSIDE_VALUE,
+                            "a login name can change the filter's structure",
+                        )
+                elif assertion[key] != other[key]:
+                    return USER_FILTER_OUTSIDE_VALUE, "{username} is not inside an assertion value"
+    holds_probe: dict[int, bool] = {}
+    for index, _tag, _parent, assertion in base:
+        for key in _FILTER_NAME_KEYS:
+            if probe.lower() in str(assertion.get(key) or "").lower():
+                return USER_FILTER_OUTSIDE_VALUE, "{username} is not inside an assertion value"
+        holds_probe[index] = any(probe_bytes in part for part in _value_parts(assertion))
+    # Propagate "holds {username}" up the tree: children come after parents in
+    # depth-first order, so walk it backwards.
+    for index, _tag, parent, _assertion in reversed(base):
+        if parent is not None and holds_probe[index]:
+            holds_probe[parent] = True
+    for index, tag, _parent, _assertion in base:
+        if not holds_probe[index]:
+            continue
+        children = [child for child, _t, parent, _a in base if parent == index]
+        if tag == SEARCH_NOT:
+            return USER_FILTER_NEGATED, "{username} is inside a (!...) negation"
+        if tag == SEARCH_OR and not all(holds_probe[child] for child in children):
+            return (
+                USER_FILTER_OR_BRANCH,
+                "an (|...) branch without {username} matches whatever the login name",
+            )
+    return None
+
+
+def _check_user_filter(template: str) -> LdapUserFilterError | None:
+    """The uncached check behind user_filter_problem."""
+    if len(template) > USER_FILTER_MAX_LENGTH:
+        return LdapUserFilterError(
+            USER_FILTER_TOO_LONG,
+            f"{USER_FILTER_SETTING} is longer than {USER_FILTER_MAX_LENGTH} characters",
+        )
     try:
-        rendered = render_user_filter(template, _USER_FILTER_PROBE)
+        found = _structure_problem(template)
     except LdapUserFilterError as exc:
         return exc
-    try:
-        search_operation(
-            "",
-            rendered,
-            SUBTREE,
-            DEREF_ALWAYS,
-            ["objectClass"],
-            0,
-            0,
-            False,
-            True,
-            True,
-            None,
-            validator=None,
-            check_names=True,
-        )
-    except LDAPException as exc:
+    except Exception as exc:  # any failure to build the filter is a defect
         problem = LdapUserFilterError(
             USER_FILTER_INVALID_FILTER,
             f"{USER_FILTER_SETTING} is not a valid LDAP filter once {{username}} is "
-            f"substituted ({exc})",
+            f"substituted ({type(exc).__name__})",
         )
         problem.__cause__ = exc
         return problem
-    return None
+    if found is None:
+        return None
+    reason, detail = found
+    return LdapUserFilterError(reason, f"{USER_FILTER_SETTING} is refused: {detail}")
+
+
+@functools.lru_cache(maxsize=16)
+def user_filter_problem(template: str) -> LdapUserFilterError | None:
+    """Why the template cannot be used as LDAP_USER_FILTER, or None when it can.
+
+    Checked, in order, with fixed probe login names and never the submitted one:
+    at most USER_FILTER_MAX_LENGTH characters (USER_FILTER_TOO_LONG); the
+    template rules of render_user_filter; then the rendered filter must build
+    into a search request exactly as `Connection.search` builds it (ldap3's
+    parser and encoder, client-side, no directory call), and any exception while
+    doing so (an LDAP syntax error, a RecursionError from a deeply nested
+    template, a UnicodeEncodeError from a lone surrogate an environment variable
+    can carry) is USER_FILTER_INVALID_FILTER with its class logged; then the
+    structural rules of _structure_problem. Escaping makes the login name a
+    literal inside an assertion value, so what is checked does not depend on it.
+
+    Not refused: a {username} inside a substring, approximate, or ordering
+    assertion (`(uid={username}*)`, `(uid~={username})`, `(uid>={username})`),
+    which matches more entries than the named one; the first match signs in with
+    its own password. Discouraged in ENV_VARS.
+
+    Memoized per template string (the verdict depends on the string alone), so a
+    login never re-runs the check after the first.
+    """
+    return _check_user_filter(template)
 
 
 def _log_user_filter_problem(problem: LdapUserFilterError, when: str) -> None:
@@ -539,15 +668,16 @@ def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
     found, whatever the result code). Like the presence probe, a
     failed search under the configured base proves nothing about the user. The
     search_filter is built by render_user_filter with the escaped username to
-    prevent filter injection; a template it refuses raises LdapUnavailableError
-    too (_bind_user_sync refuses one before this is called, so that is the
-    backstop). This function is always synchronous (blocking ldap3 calls);
+    prevent filter injection; a template user_filter_problem refuses raises
+    LdapUnavailableError before any connection (_bind_user_sync refuses one
+    first, so this is the backstop; the verdict is memoized, so asking twice
+    costs nothing). This function is always synchronous (blocking ldap3 calls);
     callers use anyio.to_thread to dispatch it.
     """
-    try:
-        search_filter = render_user_filter(settings.ldap_user_filter, username)
-    except LdapUserFilterError as exc:
-        raise LdapUnavailableError(str(exc)) from exc
+    problem = user_filter_problem(settings.ldap_user_filter)
+    if problem is not None:
+        raise LdapUnavailableError(str(problem)) from problem
+    search_filter = render_user_filter(settings.ldap_user_filter, username)
     with _service_connection() as conn:
         found = _checked_search(
             conn,

@@ -617,30 +617,43 @@ account automatically.
   Enforced in: `services/auth/app/services/ldap_service.py` (`_password_refused_by_saslprep`, `_bind_user_sync`, `_bind_as_user`, `_USER_BIND_INPUT_REFUSALS`) \
   Pinned by: `services/auth/tests/test_ldap_login_input_oracle.py` (`test_a_password_saslprep_refuses_gets_the_same_answer_for_every_username`, `test_the_route_answers_known_and_unknown_users_identically`, `test_the_user_bind_itself_refuses_what_saslprep_refuses`, `test_a_password_saslprep_maps_goes_to_the_directory_mapped`); `services/auth/tests/test_login_password_bound.py` (`test_ldap_mode_refuses_a_nul_before_the_directory`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_answers_known_and_unknown_users_alike_for_a_saslprep_refusal`, `test_bind_user_a_saslprep_mapped_password_reaches_the_directory_mapped`)
 
-- **IAM-LDAP-14.** `LDAP_USER_FILTER` is a strict template (issue #1446). Its only
-  replacement field is `{username}`, written exactly so: no other name, no positional
-  or empty field (`{0}`, `{}`), no attribute or index access (`{username.__class__}`,
-  `{username[0]}`), no conversion or format spec. `{{` and `}}` are literal braces, and
-  the template must hold `{username}` at least once (a filter without it would find
-  the same entry for every login name, so any name with that entry's password would
-  sign in as it). The login name is filter-escaped and inserted as text, never
-  formatted. The filter rendered with a fixed probe name must also build into a search
-  request through ldap3's own parser, client-side. A template that breaks any of these
-  (an unknown, positional, or empty field, a single brace, no `{username}`, or an
-  invalid LDAP filter such as an unbalanced parenthesis or two filters side by side)
-  makes every LDAP login answer the 503 of IAM-LDAP-12, before any directory call and
-  before the empty-password check, so the answer is the same for every login name and
+- **IAM-LDAP-14.** `LDAP_USER_FILTER` is a strict template, checked without any
+  login name (issue #1446). Its only replacement field is `{username}`, written
+  exactly so: no other name, no positional or empty field (`{0}`, `{}`), no attribute or
+  index access (`{username.__class__}`, `{username[0]}`), no conversion or format spec.
+  `{{` and `}}` are literal braces, and the template must hold `{username}` at least
+  once. The login name is filter-escaped and inserted as text, never formatted. The
+  check then refuses, in this order: a template over 4096 characters (`too_long`); one
+  that does not build into a search request through ldap3's own parser and encoder,
+  client-side, rendered with fixed probe names, where any exception while building
+  counts (`invalid_filter`, the exception's class logged: an LDAP syntax error, a
+  `RecursionError` from deep nesting, a `UnicodeEncodeError` from a lone surrogate an
+  environment variable can carry); and, from the parse tree of three renders (two
+  different plain alphanumeric probe names and one holding every escaped character,
+  every operator character, a space, a comma, and a non-ASCII letter), a template whose
+  tree differs between the renders other than in the probe inside assertion values, or
+  where `{username}` falls outside an assertion value, in an attribute description or
+  a matching rule (`username_outside_value`); one with `{username}` inside a `(!...)`
+  (`username_negated`); and one with an `(|...)` that holds `{username}` in some branch
+  but not all (`or_branch_without_username`). So the login name can never supply an
+  attribute, an assertion, or a whole filter (`({username})` with the login name
+  `uid=alice` is refused), and every entry the filter matches matches through an
+  assertion whose value holds the login name; a filter without `{username}`, or with a
+  branch without it, would match an entry whatever the name, so any name with that
+  entry's password would sign in as it. Allowed but discouraged: `{username}` in a
+  substring, approximate, or ordering assertion (`(uid={username}*)`,
+  `(uid~={username})`, `(uid>={username})`), which matches more than the named entry, so
+  the first match signs in with its own password (and see issue #1447 for two matches).
+  A refused template makes every LDAP login answer the 503 of IAM-LDAP-12, before any
+  directory call and before the empty-password check, the same for every login name and
   password, with one ERROR (action `ldap_user_filter_invalid`, the setting in
   `setting`, the defect in `reason`, the class in `exception_class`, never the login
-  name). Before the fix `str.format` raised and the login answered 500. In LDAP mode
-  auth logs the same ERROR once at startup and still boots, as it does for an
-  incomplete configuration; a value saved on the config page takes effect at the next
-  auth start and is checked then. Where `{username}` sits is not checked: a template
-  that puts it outside an assertion value, such as `({username}=x)`, parses and is the
-  operator's to avoid. \
-  Enforced in: `services/auth/app/services/ldap_service.py` (`render_user_filter`, `user_filter_problem`, `_bind_user_sync`, `_search_user`, `log_ldap_startup_problems`); `services/auth/app/main.py` (`lifespan`) \
-  Pinned by: `services/auth/tests/test_ldap_user_filter.py` (`test_every_defect_is_found_with_its_reason`, `test_a_usable_template_has_no_problem`, `test_render_never_interprets_the_login_name`, `test_a_login_gets_the_same_outage_for_every_name_and_password`, `test_the_search_itself_never_raises_anything_but_unavailable`, `test_startup_reports_a_defect_once_in_ldap_mode`, `test_startup_is_silent_outside_ldap_mode`, `test_the_lifespan_reports_it_and_still_boots`, `test_the_route_answers_503_never_500`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_unusable_filter_is_503_for_every_login`)
-
+  name). In LDAP mode auth logs the same ERROR once at startup and still boots. The
+  verdict is memoized per template string, so the check runs once per value, and a
+  value saved on the config page takes effect at the next auth start. Before the fix
+  `str.format` raised and the login answered 500. \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`render_user_filter`, `user_filter_problem`, `_check_user_filter`, `_structure_problem`, `_filter_nodes`, `_USER_FILTER_PROBES`, `USER_FILTER_MAX_LENGTH`, `_bind_user_sync`, `_search_user`, `log_ldap_startup_problems`); `services/auth/app/main.py` (`lifespan`) \
+  Pinned by: `services/auth/tests/test_ldap_user_filter.py` (`test_every_defect_is_found_with_its_reason`, `test_a_usable_template_has_no_problem`, `test_render_never_interprets_the_login_name`, `test_a_login_gets_the_same_outage_for_every_name_and_password`, `test_a_login_name_can_never_supply_an_assertion`, `test_the_probes_keep_the_makeup_the_check_relies_on`, `test_the_check_runs_once_per_template`, `test_the_search_itself_never_raises_anything_but_unavailable`, `test_startup_reports_a_defect_once_in_ldap_mode`, `test_startup_is_silent_outside_ldap_mode`, `test_the_lifespan_reports_it_and_still_boots`, `test_the_route_answers_503_never_500`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_unusable_filter_is_503_for_every_login`)
 - **IAM-LDAP-15.** A directory attribute value that is not text never becomes account
   data (issue #1448). ldap3 returns a value that is not UTF-8 as `bytes`, and every
   read of an identity attribute goes through one conversion: a value is text when it
@@ -2263,6 +2276,9 @@ the integration suite, the frontend tests, and the browser suite were read, not 
   key-count bound (hardening before OIDC mode is supported).
 - Issue #1399: a first OIDC login that collides with an existing account has no
   recovery path, so an `OIDC_ISSUER` change locks out every single sign-on user.
+- Issue #1447: when `LDAP_USER_FILTER` matches two directory entries, login takes
+  the first one the directory returns (IAM-LDAP-3); a substring filter allowed by
+  IAM-LDAP-14 makes that more likely.
 - Issue #1400: visible Unicode look-alikes of an existing email are provisioned as
   separate accounts.
 
@@ -2287,6 +2303,12 @@ IAM-LOGIN-6.)
   in the API Reference by Role table of [ROLES.md](../ROLES.md).
 - Internal routes are reachable through the gateway by anyone who holds the internal
   token. Recorded in [SECURITY.md](../../SECURITY.md) (Threat model).
+- An unusable `LDAP_USER_FILTER` logs its ERROR at every LDAP login, not once
+  (IAM-LDAP-14), the same as an incomplete configuration (IAM-LDAP-12). Recorded in the
+  issue #1446 review.
+- A filter that matches more than the named entry (a substring, approximate, or
+  ordering assertion on `{username}`) is allowed; the first match signs in with its own
+  password (IAM-LDAP-14). Recorded in `docs/ENV_VARS.md` as discouraged.
 - LDAP login refuses a username collision while sync recovers it (IAM-LDAP-10,
   IAM-SYNC-7). Recorded in the comments of `_authenticate_ldap` and `_ensure_ldap_user`.
 - The seeded superadmin is local and cannot log in under `AUTH_METHOD=ldap`
