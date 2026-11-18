@@ -881,11 +881,15 @@ def test_an_escape_heavy_body_costs_a_bounded_number_of_passes(make):
     ids=["ascii_objects", "cjk_text", "other_escapes_only"],
 )
 def test_a_body_with_no_surrogate_marker_is_passed_after_two_searches(body):
-    """No `\\u` and no 0xED byte: two `in` searches, no copy, a fraction of one
-    `bytes.lower` pass (the early exit)."""
+    """No `\\u` and no 0xED byte: two `in` searches and no copy (the early exit).
+
+    The memory bound is what proves the exit: without it the scan copies the body.
+    The time bound is loose on purpose (two substring searches cost about one
+    `bytes.lower` pass, and a 1x bound failed once on a CI runner under coverage:
+    0.82 ms against 0.74 ms); it only catches a scan that does several passes."""
     assert _raw_text_holds_a_lone_surrogate(body) is False
     assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 64 * 1024
-    assert _best_time(lambda: _raw_text_holds_a_lone_surrogate(body)) < _best_time(
+    assert _best_time(lambda: _raw_text_holds_a_lone_surrogate(body)) < 4 * _best_time(
         lambda: body.lower()
     )
 
