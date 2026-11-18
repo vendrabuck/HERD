@@ -25,6 +25,8 @@ Limits, so no test leans on them for input-dependent behavior:
 - `search()` returns what ldap3 returns (`Connection.search`: True whenever the
   response holds an entry, whatever the result code), so a non-success code that
   comes with entries (sizeLimitExceeded, timeLimitExceeded) still reads as a match.
+  It returns the scripted entries whatever `size_limit` asked for, as a directory
+  that ignores the client's limit would; `searches` records what was asked.
 """
 
 from __future__ import annotations
@@ -84,6 +86,8 @@ class FakeDirectory:
     built: list[dict] = field(default_factory=list)
     # Every password a user bind was attempted with.
     user_bind_passwords: list[str] = field(default_factory=list)
+    # The keyword arguments of every search, in order (size_limit among them).
+    searches: list[dict] = field(default_factory=list)
 
     def connection(self, _server, **kwargs) -> _FakeConnection:
         self.built.append(kwargs)
@@ -119,7 +123,8 @@ class _FakeConnection:
         self.result = {"result": outcome, "description": f"code {outcome}"}
         return outcome == RESULT_SUCCESS
 
-    def search(self, **_kwargs) -> bool:
+    def search(self, **kwargs) -> bool:
+        self._directory.searches.append(kwargs)
         outcome = self._directory.search
         if isinstance(outcome, BaseException):
             raise outcome

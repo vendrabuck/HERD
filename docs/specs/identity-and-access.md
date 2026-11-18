@@ -338,7 +338,7 @@ Auth service:
 |---|---|---|---|---|
 | GET | `/login-options` | anyone, unauthenticated; every mode | 200 | IAM-OIDC-16 |
 | POST | `/register` | anyone, unauthenticated; local mode only | 201 | IAM-REG-1 to IAM-REG-6, IAM-PROFILE-9 |
-| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-6, IAM-LDAP-1 to IAM-LDAP-15, IAM-OIDC-21 |
+| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-6, IAM-LDAP-1 to IAM-LDAP-16, IAM-OIDC-21 |
 | GET | `/oidc/login` | anyone, unauthenticated; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-17 |
 | GET | `/oidc/callback` | anyone holding the `herd_oidc_flow` cookie; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-18, IAM-OIDC-19 |
 | POST | `/oidc/exchange` | anyone holding the `herd_oidc_handoff` cookie; OIDC mode only, else 404 | 200 | IAM-OIDC-15, IAM-OIDC-20 |
@@ -538,8 +538,8 @@ account automatically.
   Enforced in: `services/auth/app/services/ldap_service.py` (`_search_user`, `render_user_filter`) \
   Pinned by: `services/auth/tests/test_ldap_service.py` (`test_filter_escaping_via_ldap3_conv`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_filter_metacharacters_are_escaped`)
 - **IAM-LDAP-3.** Login binds twice: first as the service account (anonymously when
-  `LDAP_BIND_DN` is empty) to search `LDAP_USER_BASE_DN` and take the first match, then
-  as that entry's DN with the submitted password. \
+  `LDAP_BIND_DN` is empty) to search `LDAP_USER_BASE_DN` for the one entry the filter
+  matches (IAM-LDAP-16), then as that entry's DN with the submitted password. \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_search_user`, `_bind_as_user`) \
   Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_success`, `test_bind_user_wrong_password`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_success_returns_identity`)
 - **IAM-LDAP-4.** An empty password is refused before any directory call (an LDAP
@@ -553,11 +553,12 @@ account automatically.
   expired account, and busy or unavailable too: only an existing user reaches the user
   bind, so any other answer there would tell an existing account from an unknown one),
   and an entry with no email value that is text (no email attribute, or only values
-  IAM-LDAP-15 leaves out). A search that found the user is a match
-  whatever its result code, as ldap3 reports one (a size- or time-limited search that
-  returned the entry signs in). \
+  IAM-LDAP-15 leaves out). A search that returned one entry is a match only when it
+  ended in success; more than one entry is IAM-LDAP-16, and one entry with any other
+  result code is IAM-LDAP-16 or IAM-LDAP-12 (before issue #1447 a size- or time-limited
+  search that returned an entry signed in as it). \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_search_user`, `_bind_as_user`, `_checked_search`) \
-  Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_not_found`, `test_bind_user_missing_email_rejected`, `test_bind_user_answers_none_for_what_the_directory_said`, `test_bind_user_a_limited_search_that_found_the_user_still_signs_in`); `services/auth/tests/test_ldap_login_outage.py` (`test_what_the_directory_said_stays_the_401`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_unknown_user_returns_none`, `test_login_endpoint_rejects_bad_password_against_live_ldap`)
+  Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_not_found`, `test_bind_user_missing_email_rejected`, `test_bind_user_answers_none_for_what_the_directory_said`, `test_bind_user_one_entry_and_success_still_signs_in`); `services/auth/tests/test_ldap_login_outage.py` (`test_what_the_directory_said_stays_the_401`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_unknown_user_returns_none`, `test_login_endpoint_rejects_bad_password_against_live_ldap`)
 - **IAM-LDAP-6.** Every directory connection uses StartTLS before binding unless the
   URL is `ldaps://` or `LDAP_USE_TLS` is false, and validates the server certificate
   unless `LDAP_TLS_VALIDATE` is false (which logs a warning); `LDAP_CA_CERT` names a CA
@@ -598,8 +599,11 @@ account automatically.
   IAM-LDAP-14 refuses, a malformed server URL, a refused or
   timed-out connection, a TLS failure, a refused service-account bind (anonymous
   included), a search that raises, or that found no entry and ended with any result code but
-  success (a missing base DN, a referral that cannot be followed, busy, access denied;
-  a limited search that returned the entry is a match, IAM-LDAP-5), and a user bind
+  success (a missing base DN, a referral that cannot be followed, busy, access denied),
+  or that found one entry and ended with any result code but success or
+  `sizeLimitExceeded` (a time or administrative limit: a search that stopped early does
+  not prove the entry is the only match, IAM-LDAP-16; the same 503 a name with no entry
+  gets from that search), and a user bind
   that could not be attempted or answered at all: its connection could not be built or
   opened, TLS failed, or no answer came within the 30 s receive timeout (as on the
   service connection). The cause of those last three does not depend on the username, and a
@@ -616,7 +620,7 @@ account automatically.
   WARNING `login_failure` with reason `directory_unavailable`; no line holds the
   password. \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_search_user`, `_bind_as_user`, `_checked_search`); `services/auth/app/services/auth_service.py` (`_authenticate_ldap`); `services/auth/app/routers/auth.py` (`login`, `LOGIN_DIRECTORY_UNAVAILABLE_DETAIL`) \
-  Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_raises_unavailable_when_the_directory_could_not_be_asked`, `test_bind_user_missing_config_raises_unavailable`, `test_user_bind_connection_has_the_receive_timeout`); `services/auth/tests/test_ldap_login_outage.py` (`test_an_outage_is_503_with_the_fixed_detail_and_no_session`, `test_incomplete_configuration_is_503`, `test_an_outage_never_falls_back_to_a_local_password`); `services/auth/tests/test_auth_ldap.py` (`test_ldap_login_directory_unavailable_returns_503`); `services/auth/tests/test_ldap_service_live.py` (`test_bad_service_account_raises_unavailable`, `test_bind_user_unreachable_server_raises_unavailable`, `test_bind_user_missing_base_dn_raises_unavailable`, `test_login_endpoint_unreachable_directory_is_503`, `test_login_endpoint_bad_service_account_is_503`)
+  Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_raises_unavailable_when_the_directory_could_not_be_asked`, `test_bind_user_missing_config_raises_unavailable`, `test_user_bind_connection_has_the_receive_timeout`, `test_bind_user_one_entry_from_a_search_that_stopped_early_is_unavailable`); `services/auth/tests/test_ldap_login_outage.py` (`test_an_outage_is_503_with_the_fixed_detail_and_no_session`, `test_incomplete_configuration_is_503`, `test_an_outage_never_falls_back_to_a_local_password`); `services/auth/tests/test_auth_ldap.py` (`test_ldap_login_directory_unavailable_returns_503`); `services/auth/tests/test_ldap_service_live.py` (`test_bad_service_account_raises_unavailable`, `test_bind_user_unreachable_server_raises_unavailable`, `test_bind_user_missing_base_dn_raises_unavailable`, `test_login_endpoint_unreachable_directory_is_503`, `test_login_endpoint_bad_service_account_is_503`)
 - **IAM-LDAP-13.** ldap3 prepares every simple-bind password with SASLprep (RFC 4013)
   inside the bind and refuses, client-side, a password holding an ASCII or other
   control character (NUL and tab included), a private-use, non-character, or tagging
@@ -674,8 +678,9 @@ account automatically.
   the comparison is kept as the test of that property, and a test pins that it refuses
   a template once a name could reshape it. Allowed but discouraged: `{username}` in a
   substring, approximate, or ordering assertion (`(uid={username}*)`,
-  `(uid~={username})`, `(uid>={username})`), which matches more than the named entry, so
-  the first match signs in with its own password (and see issue #1447 for two matches).
+  `(uid~={username})`, `(uid>={username})`), which matches more than the named entry: a
+  name it matches to one entry signs in as that entry with that entry's password, and a
+  name it matches to more than one is refused (IAM-LDAP-16).
   A refused template makes every LDAP login answer the 503 of IAM-LDAP-12, before any
   directory call and before the empty-password check, the same for every login name and
   password, with one ERROR (action `ldap_user_filter_invalid`, the setting in
@@ -715,6 +720,33 @@ account automatically.
   TROUBLESHOOTING). \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_text_value`, `_text_values`, `_first_text_value`, `_REFUSED_CATEGORIES`, `_refused_character`, `_JOINERS`, `EMAIL_MAX_LENGTH`, `USERNAME_MAX_LENGTH`, `_bind_user_sync`, `_resolution_for`, `_fetch_group_sync`, `_paged_user_emails_sync`) \
   Pinned by: `services/auth/tests/test_ldap_attribute_text.py` (`test_text_value_is_text_or_none`, `test_the_bounds_are_the_columns`, `test_a_value_longer_than_its_column_is_not_text`, `test_ldap3_returns_a_value_that_is_not_utf8_as_bytes`, `test_a_login_whose_only_email_is_not_text_is_refused`, `test_a_login_whose_email_holds_no_usable_text_is_refused`, `test_an_email_longer_than_the_column_is_refused`, `test_two_entries_whose_email_is_a_space_never_share_an_account`, `test_the_first_text_email_is_used`, `test_the_attributes_are_read_only_after_the_user_bind`, `test_the_route_refuses_an_email_that_is_not_text_and_creates_nothing`, `test_the_route_provisions_only_text`, `test_a_member_whose_identity_is_not_text_is_skipped_as_missing`, `test_a_member_with_a_text_value_after_a_binary_one_resolves`, `test_a_group_name_or_member_that_is_not_text_is_left_out`, `test_the_enumeration_leaves_out_what_is_not_text_with_one_line`, `test_a_sync_pass_never_provisions_a_bytes_repr_and_keeps_removals_suppressed`, `test_a_mapping_of_a_group_whose_name_is_not_text_caches_the_dn`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_binary_email_attribute_is_401`, `test_resolve_member_binary_email_attribute_is_missing_email`, `test_present_emails_leaves_out_a_binary_value`)
+- **IAM-LDAP-16.** An LDAP login signs in only as the single entry `LDAP_USER_FILTER`
+  matches for that name (issue #1447); zero matches and more than one match are both
+  refusals that look the same to the client. The login search asks the directory for at
+  most two entries. Two entries returned, whatever the result code, or one entry with
+  `sizeLimitExceeded` (the directory's own size limit is one, and it says more matched
+  than it sent), is ambiguous: the 401 `Invalid credentials` whatever the password, with
+  the status, body, and headers of an unknown name and of a wrong password, no bind as
+  any entry (no password is tried, so no lockout counter is touched), no account
+  created, and one ERROR (action `ldap_user_ambiguous`, `setting` `LDAP_USER_FILTER`,
+  `count` the matches the answer proves, at least 2, and the login name in `username`
+  as on the `ldap_user_not_found` line; never a DN or any attribute of the entries).
+  Auth's own line is the `login_failure` a wrong password logs. An empty password is
+  refused before the search (IAM-LDAP-4), as for every name. Timing: an ambiguous name
+  costs what an unknown name costs, one service connection and one search with no user
+  bind; its search carries up to two entries' email and username attributes where an
+  unknown name's carries none. Only entries count: a search result reference (a
+  continuation into another server's part of the tree, which Active Directory sends on
+  many searches from the domain root) is not an entry and is not followed, so a match
+  behind one is not seen. One entry returned twice, which RFC 4511 allows through alias
+  dereferencing, is refused too: the count does not compare DNs. A directory that cuts
+  the answer to one entry and still reports success would hide a second match; one that
+  honors the requested limit of two sends the second entry. Before the fix login took
+  the first entry the directory returned, so a second person matching the same name
+  could never sign in, and under a substring filter (IAM-LDAP-14) a prefix signed in as
+  whichever entry came first, with that entry's password. \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`_search_user`, `_bind_user_sync`, `_AmbiguousLoginNameError`, `_LOGIN_SEARCH_SIZE_LIMIT`, `_checked_search`) \
+  Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_refuses_a_name_more_than_one_entry_matches`, `test_the_login_search_asks_for_two_entries`, `test_bind_user_one_entry_and_success_still_signs_in`); `services/auth/tests/test_ldap_login_ambiguous.py` (`test_the_mock_directory_holds_two_entries_for_one_name`, `test_a_name_two_entries_match_is_refused_whatever_the_password`, `test_an_ambiguous_name_costs_what_an_unknown_name_costs`, `test_one_entry_still_signs_in`, `test_a_substring_filter_refuses_a_prefix_two_entries_match`, `test_a_substring_filter_still_signs_in_a_name_one_entry_matches`, `test_a_search_result_reference_is_not_an_entry`, `test_the_route_answers_an_ambiguous_name_like_an_unknown_name_and_a_wrong_password`, `test_the_route_still_signs_in_a_name_one_entry_matches`, `test_the_route_refuses_a_prefix_two_entries_match_under_a_substring_filter`); `services/auth/tests/test_ldap_service_live.py` (`test_the_directory_answers_both_ambiguous_shapes`, `test_login_endpoint_refuses_a_name_two_entries_match`, `test_bind_user_refuses_a_prefix_many_entries_match`)
 
 **Out of scope.** Roles never come from the directory (ADR 0011, Blast radius). SAML and
 OIDC do not exist (issue #37).
@@ -2398,7 +2430,7 @@ name (IAM-HASH-9). Every other error carries
 | 400 | `Token role cannot exceed the principal's role` | token role above its principal | IAM-APITOK-3 |
 | 401 | `Not authenticated` (FastAPI) | no Authorization header on a JWT-guarded route, auth or acl | IAM-JWT-3, IAM-CLAIM-1 |
 | 401 | `Could not validate credentials` | bad, expired, or subjectless token; in auth also an unknown or inactive account | IAM-JWT-3, IAM-ACCT-5, IAM-CLAIM-1 |
-| 401 | `Invalid credentials` | any login refusal, local, LDAP, or OIDC mode | IAM-LOGIN-1, IAM-LDAP-5, IAM-LDAP-9, IAM-LDAP-10, IAM-LDAP-11, IAM-LDAP-13, IAM-LDAP-14, IAM-LDAP-15, IAM-OIDC-21 |
+| 401 | `Invalid credentials` | any login refusal, local, LDAP, or OIDC mode | IAM-LOGIN-1, IAM-LDAP-5, IAM-LDAP-9, IAM-LDAP-10, IAM-LDAP-11, IAM-LDAP-13, IAM-LDAP-14, IAM-LDAP-15, IAM-LDAP-16, IAM-OIDC-21 |
 | 401 | `Single sign-on session expired; sign in again` | handoff exchange refused | IAM-OIDC-20 |
 | 401 | `Invalid or expired refresh token` | refresh refused | IAM-SESSION-2 |
 | 401 | `Invalid or expired token` | API token exchange refused | IAM-APITOK-8 |
@@ -2496,7 +2528,7 @@ cap 20 per category; prune cadence 24 hours; bulk and batch caps 500.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/auth/tests/` (in-memory SQLite, `test_profile_schema.py`, `test_user_profile_migration.py`, `test_effective_role_unit.py`, `test_api_tokens.py`, `test_ldap_service.py`, `test_ldap_sync_service.py`, `test_ldap_sync_service_scaling.py`, `test_ldap_sync_stale_run_reaper.py`, `test_ldap_sync_loop.py`, `test_oidc_flow_service.py`, `test_oidc_provisioning.py`, `test_oidc_sso_migration.py`, `test_relink_candidates_migration.py`, `test_federated_identity_service.py`, `test_password_hashing.py` (the 802 recorded passlib decisions), `test_validation_errors.py`); `services/acl/tests/test_grant_service_unit.py`, `test_auth_client.py`, `test_schema_validators.py`; `services/common/tests/test_auth.py`, `test_auth_settings.py`, `test_internal_auth.py`, `test_acl.py`; `services/notifications/tests/test_router.py` (its token decode); `tests/unit/test_jwt_settings_wiring.py`; `frontend/src/test/` (`api/client.test.ts`, `stores/authStore.test.ts`, `lib/roles.test.ts`, `components/guards.test.tsx`, `components/AdminGuard.test.tsx`, `routes.test.tsx`, the admin page tests; single sign-on in the browser: `lib/sso.test.ts`, `api/sso.test.tsx`, `pages/LoginPageSso.test.tsx`, `pages/OidcCompletePage.test.tsx`, msw standing in for auth) | SQLite has no advisory locks, so only the in-process half of the run slot is exercised here |
-| Functional (through the service API) | `services/auth/tests/test_auth.py`, `test_user_profile_routes.py`, `test_groups.py`, `test_internal.py`, `test_ldap_sync.py`, `test_effective_role_http.py`, `test_auth_ldap.py`, `test_oidc_routes.py` (the single sign-on routes against a fake identity provider), `test_federated_identity_routes.py` (the recovery routes with real tokens, and the recovery stories through the single sign-on routes), `test_login_options.py`, `test_oidc_break_glass.py`, `test_password_hashing.py` (logins against stored legacy hashes), `test_password_input_validation.py` (the password rule and the 422 body at the real routes); `services/acl/tests/test_grants.py`, `test_internal.py`; the live suites `services/auth/tests/test_ldap_service_live.py` (real directory) and the real-Postgres suites `services/auth/tests/test_ldap_sync_service_live_pg.py` and `services/auth/tests/test_oidc_flow_service_live_pg.py` (the OIDC flow store and provisioning races) and `services/auth/tests/test_federated_identity_live_pg.py` (the recovery routes' races) | The live-LDAP suite runs in the gates' live-LDAP phase; the Postgres suites in `_gate-pg-live-tests`. The single sign-on routes have unit and functional (fake provider, in-memory SQLite) tests only; the flow store and provisioning beneath them have Postgres-live tests, but no route is driven against a real Postgres yet, a gap open until ADR 0016 phases 5a and 5b add the live-provider, integration (running stack), load, and browser levels |
+| Functional (through the service API) | `services/auth/tests/test_auth.py`, `test_user_profile_routes.py`, `test_groups.py`, `test_internal.py`, `test_ldap_sync.py`, `test_effective_role_http.py`, `test_auth_ldap.py`, `test_ldap_login_ambiguous.py` (LDAP logins through a real ldap3 `MOCK_SYNC` directory), `test_oidc_routes.py` (the single sign-on routes against a fake identity provider), `test_federated_identity_routes.py` (the recovery routes with real tokens, and the recovery stories through the single sign-on routes), `test_login_options.py`, `test_oidc_break_glass.py`, `test_password_hashing.py` (logins against stored legacy hashes), `test_password_input_validation.py` (the password rule and the 422 body at the real routes); `services/acl/tests/test_grants.py`, `test_internal.py`; the live suites `services/auth/tests/test_ldap_service_live.py` (real directory) and the real-Postgres suites `services/auth/tests/test_ldap_sync_service_live_pg.py` and `services/auth/tests/test_oidc_flow_service_live_pg.py` (the OIDC flow store and provisioning races) and `services/auth/tests/test_federated_identity_live_pg.py` (the recovery routes' races) | The live-LDAP suite runs in the gates' live-LDAP phase; the Postgres suites in `_gate-pg-live-tests`. The single sign-on routes have unit and functional (fake provider, in-memory SQLite) tests only; the flow store and provisioning beneath them have Postgres-live tests, but no route is driven against a real Postgres yet, a gap open until ADR 0016 phases 5a and 5b add the live-provider, integration (running stack), load, and browser levels |
 | Integration (running stack) | `tests/integration/test_auth_flow.py`, `test_user_profile_flow.py`, `test_acl_flow.py`, `test_ldap_auth.py`, `test_ldap_sync_admin.py` | The LDAP ones run only in the gates' LDAP-mode phase |
 | Stress and load | `tests/load/locustfile.py` (every user logs in; `ACLChecker` exercises the check route; `NotificationUser` edits its own profile name) | No load test covers refresh, the token exchange, or a sync run |
 | Browser end-to-end | `tests/e2e/test_login.py`, `test_register_and_roles.py`, `test_roles_playwright.py`, `test_user_profile_playwright.py`, `test_admin_guard_redirect_playwright.py`, `test_user_groups_playwright.py`, `test_acl_grants_playwright.py`, `test_ldap_sync_admin_playwright.py`, `test_ldap_login.py`, `test_login_pending_playwright.py`, `test_oidc_login_playwright.py` | Runs nightly and in the gates; the LDAP login tests are exempt skips on the local-mode gate stack, and `test_oidc_login_playwright.py` runs only in the gates' and nightly's OIDC stack phase (ADR 0016 phase 5b). `test_login.py` pins the local-mode page, which `GET /login-options` drives; `test_login_pending_playwright.py` holds that request in the browser to pin the pending state (IAM-OIDC-28) |
@@ -2511,14 +2543,11 @@ the integration suite, the frontend tests, and the browser suite were read, not 
 
 - Issue #1396: the identity provider's responses have no size bound, and its JWKS no
   key-count bound (hardening before OIDC mode is supported).
-- Issue #1447: when `LDAP_USER_FILTER` matches two directory entries, login takes
-  the first one the directory returns (IAM-LDAP-3); a substring filter allowed by
-  IAM-LDAP-14 makes that more likely.
 - Issue #1400: visible Unicode look-alikes of an existing email are provisioned as
   separate accounts.
 
 (#1420 is resolved by IAM-OIDC-28, #1399 by IAM-OIDC-29 to IAM-OIDC-39, #1403 by
-IAM-LDAP-12 and IAM-LDAP-13, and #1404 by IAM-LOGIN-6.)
+IAM-LDAP-12 and IAM-LDAP-13, #1404 by IAM-LOGIN-6, and #1447 by IAM-LDAP-16.)
 
 ### Limits by decision
 
@@ -2550,8 +2579,13 @@ IAM-LDAP-12 and IAM-LDAP-13, and #1404 by IAM-LOGIN-6.)
   unreadable and hold back every unproven deactivation (IAM-SWEEP-10). Recorded in
   that rule; visible as an ERROR and in `held_passes`.
 - A filter that matches more than the named entry (a substring, approximate, or
-  ordering assertion on `{username}`) is allowed; the first match signs in with its own
-  password (IAM-LDAP-14). Recorded in `docs/ENV_VARS.md` as discouraged.
+  ordering assertion on `{username}`) is allowed: a name it matches to one entry signs
+  in as that entry with that entry's password, and a name it matches to more than one
+  is refused (IAM-LDAP-14, IAM-LDAP-16). Recorded in `docs/ENV_VARS.md` as discouraged.
+- The login search does not follow search result references, so a second match in
+  another server's part of the tree is not seen, and a directory that cuts the answer
+  to one entry while reporting success would hide a second match (IAM-LDAP-16).
+  Recorded in that rule and the docstring of `_search_user`.
 - LDAP login refuses a username collision while sync recovers it (IAM-LDAP-10,
   IAM-SYNC-7). Recorded in the comments of `_authenticate_ldap` and `_ensure_ldap_user`.
 - The seeded superadmin is local and cannot log in under `AUTH_METHOD=ldap`
