@@ -110,8 +110,8 @@ MAX_REPORTED_LOCATIONS = 10
 # body. A body that holds a lone surrogate is refused whether or not the search finds
 # it; the search only names where, exactly for a body of up to this many elements and
 # for a surrogate among its first this many otherwise. Measured on a development host
-# pinned to one core, a step costs 0.2 to 0.3 microseconds, so the search takes at most
-# about 6 ms, whatever the body.
+# pinned to one core over 1 MB bodies of seven shapes, the full budget took 4.4 to 9.5
+# ms (0.2 to 0.5 microseconds a step), whatever the body's size.
 LOCATION_SEARCH_BUDGET = 20_000
 # The longest `loc`, in characters of its parts, one reported item may carry, and the
 # most characters all reported `loc`s may carry together. A longer `loc` is left out
