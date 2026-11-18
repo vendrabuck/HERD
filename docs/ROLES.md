@@ -65,6 +65,7 @@ is issued with the lower role.
 | List all user accounts | | yes | yes |
 | Promote a user to admin | | | yes |
 | Demote an admin to user | | | yes |
+| Rewrite the single sign-on issuer of every linked account, or relink one single sign-on account to a named identity | | | yes |
 
 ---
 
@@ -133,6 +134,10 @@ or removed through the API.
 The superadmin has all admin capabilities plus:
 
 - Set any user's role to `user` or `admin` (`PUT /api/auth/users/{id}/role`)
+- Recover single sign-on accounts (issue #1399, API only): rewrite the issuer of every
+  linked identity under one issuer (`POST /api/auth/admin/federated-identities/rewrite-issuer`)
+  and relink one `oidc` account to a named identity
+  (`PUT /api/auth/users/{id}/federated-identity`); see Admin Management below
 
 The superadmin's own role cannot be changed via the API. Demoting the superadmin
 requires direct database access, which is intentional.
@@ -214,6 +219,45 @@ Rules enforced by the API:
 - The superadmin cannot be deactivated by anyone through the API
   (`POST /users/{id}/deactivate` answers 400); `activate` has no such
   carve-out, so an inactive superadmin row is always recoverable in one call.
+
+### Rewrite the single sign-on issuer (superadmin, any auth mode)
+
+```
+POST /api/auth/admin/federated-identities/rewrite-issuer
+Authorization: Bearer <superadmin-token>
+Content-Type: application/json
+
+{ "old_issuer": "https://idp.example.com/realms/herd",
+  "new_issuer": "https://idp.example.com/realms/herd/",
+  "dry_run": true }
+```
+
+Moves every single sign-on identity whose issuer is exactly `old_issuer` to
+`new_issuer`, for a planned `OIDC_ISSUER` change whose provider keeps each person's
+`sub`. `dry_run` is required. Answers `{dry_run, matched, conflicts, rewritten}`; 400
+when the two issuers are equal; 409 with the count, nothing changed, when any subject
+already has an identity under `new_issuer`. The full procedure is in
+[OPERATIONS.md](OPERATIONS.md), "Changing the OIDC issuer".
+
+### Relink a single sign-on account (superadmin, any auth mode)
+
+```
+PUT /api/auth/users/{user_id}/federated-identity
+Authorization: Bearer <superadmin-token>
+Content-Type: application/json
+
+{ "issuer": "https://idp.example.com/realms/herd", "subject": "<the person's new sub>" }
+```
+
+Replaces the `oidc` account's identity with exactly that pair, so a person whose
+provider reissued their `sub` signs in to the account they already have. Answers the
+identity `{user_id, issuer, subject, created_at, last_login_at}`; 404 for an unknown
+account; 409 for a local or LDAP account (never linked) and for a pair another account
+holds. Nothing ever links an account by email. See [OPERATIONS.md](OPERATIONS.md), "A
+user's first single sign-on login is refused as a collision".
+
+Both routes refuse an admin (403). In single sign-on mode the superadmin signs in
+through `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN` or a superadmin API token.
 
 ---
 
@@ -1779,9 +1823,11 @@ Authorization: Bearer <admin-token>
 | `/api/auth/groups/users/groups` | POST | yes | yes | yes |
 | `/api/auth/users` | GET | | yes | yes |
 | `/api/auth/users/{id}/role` | PUT | | | yes |
+| `/api/auth/users/{id}/federated-identity` | PUT | | | yes |
 | `/api/auth/users/{id}/activate` | POST | | yes | yes |
 | `/api/auth/users/{id}/deactivate` | POST | | yes | yes |
 | `/api/auth/users/{id}/profile` | PATCH | yes (own id only) | yes | yes |
+| `/api/auth/admin/federated-identities/rewrite-issuer` | POST | | | yes |
 | `/api/auth/admin/ldap-sync/status` | GET | | yes | yes |
 | `/api/auth/admin/ldap-sync/mappings` | POST | | yes | yes |
 | `/api/auth/admin/ldap-sync/mappings` | GET | | yes | yes |

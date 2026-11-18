@@ -257,6 +257,137 @@ management wraps your `.env`, and note that database backups (above) are
 useless for secret recovery without the KEK from the same era, which is a
 feature.
 
+## Single sign-on recovery
+
+Applies when `AUTH_METHOD=oidc` (ADR 0016; not yet supported for operators until its
+phase 6). Every single sign-on account is linked to exactly one identity, the pair of
+the ID token's `iss` (the issuer) and `sub` (the provider's id for the person), compared
+as exact strings. HERD never links a sign-in to an account by email: a sign-in whose
+pair is unknown is a first sign-in, and it is refused when its email or username
+belongs to any account. Two superadmin routes repair the link, API only (issue #1399):
+`POST /api/auth/admin/federated-identities/rewrite-issuer` and
+`PUT /api/auth/users/{user_id}/federated-identity`. Neither changes an account id, so
+groups, grants, reservations, and tokens are kept. The rules are IAM-OIDC-29 to
+IAM-OIDC-35 in [identity-and-access.md](specs/identity-and-access.md).
+
+The commands below run from any machine that reaches the gateway. Set `GW` to the
+address users browse to (for example `GW=https://herd.example.com`); add curl's
+`--cacert <file>` when the client does not trust the gateway's certificate. They
+use `jq`.
+
+### Getting a superadmin session in OIDC mode
+
+Both routes answer only a superadmin, in any `AUTH_METHOD`. In OIDC mode the
+superadmin is the local account seeded from `SUPERADMIN_EMAIL`, and password sign-in is
+refused unless `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN=true`. Use whichever of these you
+have:
+
+- Break-glass on: `TOKEN=$(curl -sS -X POST "$GW/api/auth/login" -H 'Content-Type: application/json' -d '{"email": "<superadmin email>", "password": "<superadmin password>"}' | jq -r .access_token)`
+- A superadmin API token minted earlier (`POST /api/auth/tokens` with `"role": "superadmin"`): `TOKEN=$(curl -sS -X POST "$GW/api/auth/tokens/exchange" -H 'Content-Type: application/json' -d '{"token": "<api token>"}' | jq -r .access_token)`
+- A superadmin session that is still signed in (its refresh token works in every mode).
+
+With none of them, set `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN=true` in `.env` (or on the
+config page, whose saved `config.json` outranks `.env`), recreate auth with
+`docker compose up -d auth`, and use the first line. Set it back to `false` and
+recreate auth again when you are done; auth logs a WARNING at startup and at every such
+sign-in while it is on. An access token lasts `AUTH_ACCESS_TOKEN_EXPIRE_MINUTES`
+(default 30); fetch a new one the same way when it expires.
+
+### Changing the OIDC issuer
+
+Use this when `OIDC_ISSUER` must change while the provider keeps every person's `sub`:
+a renamed provider URL, a tenant URL change, a trailing slash added or dropped to match
+a new discovery document, or a provider migration that preserves user ids. If the new
+provider issues different `sub` values, do NOT use the rewrite: it would give each
+account to whoever holds the same `sub` string at the new provider; relink people one
+at a time instead (next section).
+
+1. Get a superadmin session (above) and keep it for the whole change.
+2. Dry run, from the issuer accounts were linked under (the current `OIDC_ISSUER`,
+   exactly, trailing slash included) to the new one:
+
+   ```bash
+   curl -sS -X POST "$GW/api/auth/admin/federated-identities/rewrite-issuer" \
+     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"old_issuer": "https://idp.example.com/realms/herd", "new_issuer": "https://idp.example.com/realms/herd/", "dry_run": true}'
+   ```
+
+   The answer is `{"dry_run": true, "matched": N, "conflicts": C, "rewritten": 0}`.
+   `matched` should be the number of single sign-on accounts; 0 means `old_issuer` is
+   not the stored string. `conflicts` must be 0 (see "If the rewrite refuses" below
+   when it is not).
+3. Run it: the same command with `"dry_run": false`. It answers `"rewritten": N`, or
+   409 `Rewrite refused: ...; nothing was changed` with the count.
+4. Change `OIDC_ISSUER` to the new value (`.env`, or the config page) and recreate
+   auth: `docker compose up -d auth`.
+5. Verify: one person signs in with single sign-on and lands in their own account.
+
+Between steps 3 and 4 a sign-in that still carries the old issuer is refused as a
+collision and creates nothing, and while `OIDC_ISSUER` names an issuer the provider's
+discovery document does not, every sign-in answers "Single sign-on is unavailable" and
+nothing is created at all; keep the window short and tell users. Do not swap steps 3
+and 4: with the new issuer configured and the rewrite not yet run, a returning person
+whose provider email changed since their account was created is given a second account
+under the new issuer, whose identity then makes the rewrite refuse.
+
+If the rewrite refuses (or a dry run shows `conflicts`), or the issuer was already
+changed before this runbook was followed and someone signed in since: a person was given
+a second account under the new issuer. Find it with
+`curl -sS "$GW/api/auth/users?limit=500" -H "Authorization: Bearer $TOKEN" | jq '.items[] | {id, email, username, created_at}'`
+(page with `skip` past 500 accounts): the newer account, holding the person's current
+provider email. Retire its identity to a subject no provider issues, deactivate it, and
+run step 3 again:
+
+```bash
+curl -sS -X PUT "$GW/api/auth/users/<second account id>/federated-identity" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"issuer": "<new issuer>", "subject": "retired-<second account id>"}'
+curl -sS -X POST "$GW/api/auth/users/<second account id>/deactivate" -H "Authorization: Bearer $TOKEN"
+```
+
+Nothing deletes an account; the deactivated one keeps its email and username.
+
+### A user's first single sign-on login is refused as a collision
+
+The person sees "Single sign-on failed. If this continues, contact an administrator."
+Auth's log says why, without any claim value:
+
+```bash
+docker compose logs --no-log-prefix auth | jq -R 'fromjson? | select(.action == "login_failure" and .source == "oidc") | {timestamp, reason, user_id}'
+```
+
+- `email_taken` or `username_taken` for a person who has signed in with single sign-on
+  before: their provider now names them differently. If `OIDC_ISSUER` changed, follow
+  the previous section. If the provider reissued their `sub` (their account there was
+  deleted and recreated), relink their HERD account to the new `sub`:
+  1. Find the account id: `curl -sS "$GW/api/auth/users?limit=500" -H "Authorization: Bearer $TOKEN" | jq '.items[] | select(.email == "<their email>") | .id'`
+  2. Read the person's new `sub` at the provider (Keycloak: the user's ID; Okta: the
+     user's id; Dex: the base64url encoding of its user id and connector). Microsoft
+     Entra ID issues a different `sub` per application and its portal does not show it.
+     HERD does not log a refused sign-in's `sub`.
+  3. Relink, with the issuer exactly as `OIDC_ISSUER` holds it:
+
+     ```bash
+     curl -sS -X PUT "$GW/api/auth/users/<account id>/federated-identity" \
+       -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+       -d '{"issuer": "<OIDC_ISSUER value>", "subject": "<new sub>"}'
+     ```
+
+     The answer is the identity, `{user_id, issuer, subject, created_at, last_login_at}`.
+     409 `Only a single sign-on account can be linked to an identity` means the account
+     is local or LDAP; 409 `This identity is already linked to another account` means
+     another account holds that `sub` (a second account: see "If the rewrite refuses" in
+     the previous section).
+  4. The person signs in again and lands in their account. Their old `sub` no longer
+     signs in.
+- `email_taken` or `username_taken` for a person who never signed in with single
+  sign-on: a local or LDAP account created before the switch holds that email or
+  username. HERD does not link or convert such an account (ADR 0016, Out of scope), and
+  neither route does. The person can be given a different email or username at the
+  provider, so the first sign-in provisions a new account; carrying the old account's
+  groups and ownership over is a manual step.
+- Check the `sub` before every relink: whoever signs in with that `sub` gets the account.
+
 ## Backup and restore
 
 What to preserve:
