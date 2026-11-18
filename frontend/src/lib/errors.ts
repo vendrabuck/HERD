@@ -502,6 +502,27 @@ export function loginRetryAfterText(err: unknown): string | null {
   return errorDetail(err, LOGIN_LOCKED_FALLBACK);
 }
 
+/** The config change-password toast for every failure but a refused password. */
+export const CONFIG_CHANGE_PASSWORD_FALLBACK = "Failed to change password";
+
+/**
+ * The text for a failed config `POST /change-password` (issue #1452). A 422
+ * whose detail is a string is the server's refusal of the new password
+ * (OPS-CONFIG-8): one of its fixed sentences (`Password must be at least 8
+ * characters`, `... at most 32 characters`, `... must not contain a NUL
+ * character`, `... must be valid UTF-8 text`), which never hold the submitted
+ * value, so it is shown as is. Anything else, a 422 validation list
+ * (OPS-CONFIG-30, whose `msg` could quote part of a value), the 503 for an
+ * unusable password store, a 401, a 5xx, or no answer, is
+ * CONFIG_CHANGE_PASSWORD_FALLBACK.
+ */
+export function configChangePasswordErrorText(err: unknown): string {
+  const status = (err as { response?: { status?: number } } | null | undefined)?.response?.status;
+  const detail = responseDetail(err);
+  if (status !== 422 || typeof detail !== "string") return CONFIG_CHANGE_PASSWORD_FALLBACK;
+  return detailText(detail, CONFIG_CHANGE_PASSWORD_FALLBACK);
+}
+
 // Field labels for the profile 422 list (issue #1252), matching the labels on
 // the Settings Profile section and the Users page Edit profile dialog.
 const PROFILE_FIELD_LABELS: Record<string, string> = {

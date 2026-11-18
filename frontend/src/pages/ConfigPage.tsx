@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import toast from "react-hot-toast";
 import { TOAST_CLEARANCE_CLASS } from "@/lib/toastClearance";
 import {
+  configChangePasswordErrorText,
   errorDetail,
   loginRetryAfterSeconds,
   loginRetryAfterText,
@@ -10,6 +11,7 @@ import {
 } from "@/lib/errors";
 import { ArrowLeft, Eye, EyeOff, ChevronDown, ChevronRight } from "lucide-react";
 import { useConfigStore } from "@/stores/configStore";
+import { configPasswordLengthOk } from "@/lib/configPassword";
 import {
   useConfigLogin,
   useChangeConfigPassword,
@@ -121,7 +123,8 @@ function PasswordChange({ onChanged }: { onChanged: () => void }) {
       toast.error("Passwords do not match");
       return;
     }
-    if (newPassword.length < 8 || newPassword.length > 32) {
+    // Characters are code points, as the server counts them (issue #1452).
+    if (!configPasswordLengthOk(newPassword)) {
       toast.error("Password must be 8 to 32 characters");
       return;
     }
@@ -129,8 +132,9 @@ function PasswordChange({ onChanged }: { onChanged: () => void }) {
       await changePassword.mutateAsync(newPassword);
       toast.success("Config password changed");
       onChanged();
-    } catch {
-      toast.error("Failed to change password");
+    } catch (err) {
+      // The server's own sentence for a refused password, else the generic text.
+      toast.error(configChangePasswordErrorText(err));
     }
   };
 
@@ -150,12 +154,13 @@ function PasswordChange({ onChanged }: { onChanged: () => void }) {
           >
             New Password (8-32 characters)
           </label>
+          {/* No minLength or maxLength on either input: they count UTF-16 units, and
+              maxLength cuts a pasted value, so the bound is configPasswordLengthOk's
+              code point count alone (issue #1452). */}
           <input
             id="new-password"
             type="password"
             required
-            minLength={8}
-            maxLength={32}
             value={newPassword}
             onChange={(e) => setNewPassword(e.target.value)}
             className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
@@ -173,8 +178,6 @@ function PasswordChange({ onChanged }: { onChanged: () => void }) {
             id="confirm-password"
             type="password"
             required
-            minLength={8}
-            maxLength={32}
             value={confirmPassword}
             onChange={(e) => setConfirmPassword(e.target.value)}
             className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"

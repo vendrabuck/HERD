@@ -87,10 +87,11 @@ def _vrf_fixture_reason() -> str:
     The fixture depends on the DOCKER HOST's kernel: `ip link add ... type vrf`
     needs the host's `vrf` module (and `dummy` for the member interface), which a
     container cannot load for itself, so `infra/nos-test/frr/start.sh` creates it
-    best-effort and boots the node either way (a GitHub Actions runner without
-    the modules is the known case). Probing here, rather than asserting inside
-    each test, keeps a host-capability gap a visible SKIP with a fix attached
-    instead of a red test that says nothing about the cause.
+    best-effort and boots the node either way (the CI workflows load the modules
+    on the runner first; a host without them gets the skip). Probing here,
+    rather than asserting inside each test, keeps a host-capability gap a
+    visible SKIP with a fix attached instead of a red test that says nothing
+    about the cause.
     """
     if not _FRR_REACHABLE:
         return ""  # the lab-reachability gate above already covers this
