@@ -38,7 +38,11 @@ from app.routers.executions import (
 from app.services import execution_service as ex_service
 from fastapi import HTTPException
 from herd_common.config_redaction import REDACTED_VALUE, redact_config
-from herd_common.device_config import ConfigValidationError
+from herd_common.device_config import (
+    LEGACY_REFUSAL_WITHHELD,
+    ConfigValidationError,
+    validate_device_config_with_schema,
+)
 from herd_common.logging import JSONFormatter
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -132,11 +136,11 @@ async def admin_client():
     app.dependency_overrides.clear()
 
 
-def _mock_pipeline(monkeypatch, schema: dict | None) -> MagicMock:
+def _mock_pipeline(monkeypatch, schema: dict | None, name: str = "edge-1") -> MagicMock:
     """Mock everything around the validation; the validators stay real."""
     device = {
         "id": DEVICE_ID,
-        "name": "edge-1",
+        "name": name,
         "driver_id": DRIVER_ID,
         "driver_sha256": "sha",
         "driver_filename": "driver.zip",
@@ -235,8 +239,10 @@ async def test_refused_configure_never_carries_a_config_value(
 async def test_a_refusal_text_that_holds_a_credential_line_is_masked_before_it_is_stored(
     db_session_and_patches,
 ):
-    """The second layer: whatever the validator's text, the stored error and the
-    422 detail are the CFG-EXEC-8 masked copy, and they are equal."""
+    """The second layer: whatever the validator's reason, the stored error and the
+    422 detail carry its CFG-EXEC-8 masked copy, and they are equal. The prefix,
+    which holds the device's name, is left as the validator wrote it: masking it
+    would cut the refusal off after `key`."""
     db, raised = db_session_and_patches
     with pytest.raises(HTTPException) as exc:
         await ex_service.run_driver_action(
@@ -248,7 +254,7 @@ async def test_a_refusal_text_that_holds_a_credential_line_is_masked_before_it_i
                 "driver_filename": "driver.zip",
                 "connection_type": "Management",
                 "field_data": {},
-                "name": "edge-1",
+                "name": "core key switch",
             },
             {"sections": []},
             "configure",
@@ -257,7 +263,9 @@ async def test_a_refusal_text_that_holds_a_credential_line_is_masked_before_it_i
         )
     assert exc.value.status_code == 422
     assert exc.value.__cause__ is None
-    expected = f"device 'edge-1': refused line neighbor 192.0.2.1 password {REDACTED_VALUE}"
+    expected = (
+        f"device 'core key switch': refused line neighbor 192.0.2.1 password {REDACTED_VALUE}"
+    )
     assert exc.value.detail == expected
     run = await _only_run()
     assert run.error == expected
@@ -272,7 +280,7 @@ async def db_session_and_patches(monkeypatch):
     def _raise(*_args, **_kwargs):
         raised.append(True)
         raise ConfigValidationError(
-            f"device 'edge-1': refused line neighbor 192.0.2.1 password {CANARY}"
+            "device 'core key switch'", f"refused line neighbor 192.0.2.1 password {CANARY}"
         )
 
     monkeypatch.setattr(ex_service, "load_driver", AsyncMock(return_value="/tmp/driver"))
@@ -281,3 +289,123 @@ async def db_session_and_patches(monkeypatch):
     monkeypatch.setattr(ex_service, "execute_driver_method", MagicMock())
     async with TestSessionLocal() as session:
         yield session, raised
+
+
+# --- A device name never eats the refusal (CFG-EXEC-10) ----------------------
+
+DEVICE_NAMES = [
+    "core key switch",
+    "Secret Lab SW1",
+    "lab-sw password 7",
+    "edge md5",
+    "KEY",
+    "community string rack 4",
+    "r1",
+]
+
+
+@pytest.mark.parametrize("name", DEVICE_NAMES)
+@pytest.mark.asyncio
+async def test_a_device_name_with_a_credential_keyword_keeps_the_whole_refusal(
+    admin_client, monkeypatch, name
+):
+    """The stored error and the 422 are exactly the validator's text, the same
+    text inventory answers for the same refusal
+    (services/inventory/tests/test_device_configs.py pins inventory's side
+    against the same herd_common call)."""
+    _mock_pipeline(monkeypatch, FRR_SCHEMA, name=name)
+    with pytest.raises(ConfigValidationError) as direct:
+        validate_device_config_with_schema(
+            "Management", {"command": ""}, schema=FRR_SCHEMA, role=name
+        )
+    expected = str(direct.value)
+    assert expected.endswith(
+        "config failed schema validation at command: must be at least 1 character long"
+    )
+
+    resp = await admin_client.post(
+        "/execute",
+        json={
+            "device_id": DEVICE_ID,
+            "action": "configure",
+            "user_id": USER_ID,
+            "method_kwargs": {"command": ""},
+        },
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == expected
+    assert (await _only_run()).error == expected
+    runs = await admin_client.get("/runs")
+    assert [item["error"] for item in runs.json()["items"]] == [expected]
+
+
+# --- Refusals stored before issue #1457 are withheld on read ------------------
+
+OLD_REFUSALS = [
+    f"device 'edge-1': config failed schema validation: 'neighbor 192.0.2.1 password {CANARY} x'"
+    " is too long",
+    f"device: config failed schema validation: ['enable password {CANARY}'] is not of type "
+    "'string'",
+    f"device 'core key switch': config failed schema validation: '{CANARY}' does not match "
+    "'^[a-z]+$'",
+]
+KEPT_ERRORS = [
+    "device 'edge-1': config failed schema validation at commands[0]: must be at most 512 "
+    "characters long",
+    "driver raised RuntimeError",
+    None,
+]
+
+
+async def _seed_runs(errors: list[str | None]) -> list[str]:
+    ids = []
+    async with TestSessionLocal() as session:
+        for error in errors:
+            run = ExecutionRun(
+                device_id=uuid.UUID(DEVICE_ID),
+                driver_id=uuid.UUID(DRIVER_ID),
+                driver_sha256="sha",
+                action="configure",
+                status="FAILED",
+                user_id=uuid.UUID(USER_ID),
+                input_params={},
+                error=error,
+            )
+            session.add(run)
+            await session.flush()
+            ids.append(str(run.id))
+        await session.commit()
+    return ids
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_stored_before_the_fix_is_withheld_by_every_run_read(admin_client):
+    old_ids = await _seed_runs(OLD_REFUSALS)
+    kept_ids = await _seed_runs(KEPT_ERRORS)
+
+    listed = await admin_client.get("/runs")
+    assert listed.status_code == 200
+    by_id = {item["id"]: item["error"] for item in listed.json()["items"]}
+    details = {}
+    for run_id in old_ids + kept_ids:
+        detail = await admin_client.get(f"/runs/{run_id}")
+        assert detail.status_code == 200
+        details[run_id] = detail.json()["error"]
+
+    prefixes = ["device 'edge-1'", "device", "device 'core key switch'"]
+    for run_id, prefix in zip(old_ids, prefixes, strict=True):
+        withheld = f"{prefix}: {LEGACY_REFUSAL_WITHHELD}"
+        assert by_id[run_id] == withheld
+        assert details[run_id] == withheld
+    for run_id, error in zip(kept_ids, KEPT_ERRORS, strict=True):
+        assert by_id[run_id] == error
+        assert details[run_id] == error
+    # The list is what the assistant's list_executions_for_reservation tool
+    # forwards to the model provider.
+    assert CANARY not in listed.text
+    assert all(CANARY not in text for text in details.values() if text)
+
+    # The rows themselves are unchanged: the mask is on read only.
+    async with TestSessionLocal() as session:
+        stored = [(await session.get(ExecutionRun, uuid.UUID(i))).error for i in old_ids]
+    assert stored == OLD_REFUSALS

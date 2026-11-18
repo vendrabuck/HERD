@@ -1548,3 +1548,58 @@ async def test_immediate_apply_relays_a_timeout_run_status(client):
     assert resp.json()["status"] == "timeout"
     assert resp.json()["error"] == "driver timed out"
     assert await _read_device_current_pointer(device_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name",
+    [
+        "core key switch",
+        "Secret Lab SW1",
+        "lab-sw password 7",
+        "edge md5",
+        "KEY",
+        "community string rack 4",
+        "r1",
+    ],
+)
+async def test_refusal_for_a_device_name_with_a_credential_keyword_is_the_shared_text(client, name):
+    """Inventory answers exactly the herd_common refusal; execution stores and
+    answers the same text for the same refusal
+    (services/execution/tests/test_config_refusal_text.py), so the two services
+    never differ, whatever the device's name holds."""
+    from herd_common.device_config import (
+        ConfigValidationError,
+        validate_device_config_with_schema,
+    )
+
+    tid = await _create_template(client)
+    created = await client.post(
+        "/devices",
+        json={
+            "name": name,
+            "template_id": tid,
+            "topology_type": "PHYSICAL",
+            "status": "AVAILABLE",
+            "field_data": {"model": "X"},
+        },
+    )
+    assert created.status_code == 201, created.text
+    device_id = created.json()["id"]
+    with pytest.raises(ConfigValidationError) as direct:
+        validate_device_config_with_schema(
+            "Management", {"command": ""}, schema=_FRR_SCHEMA, role=name
+        )
+    with patch(
+        "app.routers.device_configs.published_schema_for_device",
+        new=AsyncMock(return_value=_FRR_SCHEMA),
+    ):
+        resp = await client.post(
+            f"/devices/{device_id}/config-versions", json={"config": {"command": ""}}
+        )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == str(direct.value)
+    assert resp.json()["detail"] == (
+        f"device {name!r}: config failed schema validation at command: "
+        "must be at least 1 character long"
+    )

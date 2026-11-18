@@ -1,7 +1,8 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, field_serializer
+from herd_common.device_config import withhold_legacy_refusal_text
+from pydantic import BaseModel, field_serializer, field_validator
 
 
 class ExecutionRunResponse(BaseModel):
@@ -24,6 +25,14 @@ class ExecutionRunResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @field_validator("error")
+    @classmethod
+    def withhold_legacy_refusal(cls, value: str | None) -> str | None:
+        """A configure refusal stored before issue #1457 quoted the refused
+        config; every run this service answers (the list, the detail, an
+        execute, a retry) shows it with that text withheld. The row keeps it."""
+        return withhold_legacy_refusal_text(value)
 
     @field_serializer("id", "device_id", "driver_id", "user_id")
     def serialize_uuid(self, value: uuid.UUID) -> str:

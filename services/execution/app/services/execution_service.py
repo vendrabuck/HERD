@@ -681,9 +681,13 @@ async def _drive_run(
             # The refusal names where the config is wrong and which rule it broke,
             # never a value from it (herd_common.device_config, issue #1457). The
             # row is read by the reservation's owner and by the assistant, so the
-            # text is also masked the way CFG-EXEC-8 masks the stored arguments
+            # reason is also masked the way CFG-EXEC-8 masks the stored arguments
             # before it is stored; the 422 answers the same text (CFG-EXEC-10).
-            refusal_text, _ = redact_command_text(str(exc))
+            # Only the reason: the prefix holds the device's name, free text that
+            # can hold a credential keyword (`core key switch`), and masking it
+            # would cut the whole refusal off after that word.
+            masked_reason, _ = redact_command_text(exc.reason)
+            refusal_text = f"{exc.prefix}: {masked_reason}"
             run = await update_execution_run(db, run, status="FAILED", error=refusal_text)
             raise HTTPException(status_code=422, detail=refusal_text) from None
 
