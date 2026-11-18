@@ -381,8 +381,10 @@ async def test_missing_jwt_is_rejected(monkeypatch):
 
 async def test_validation_error_envelope_shape(monkeypatch):
     """A 422 from the facade's own request validation (never reaching the upstream)
-    matches FastAPI's default envelope: this is an external contract per
-    docs/EXTERNAL_API.md, so pin its shape structurally rather than by example."""
+    is the `{"detail": [...]}` envelope with each item exactly `{type, loc, msg}`:
+    this is an external contract per docs/EXTERNAL_API.md, so pin its shape
+    structurally rather than by example. Until issue #1455 each item also carried
+    pydantic's `input` (FastAPI's default), which echoed the submitted body."""
     async with _client() as c:
         resp = await c.post("/reservations", json={}, headers=_auth(_token()))
 
@@ -392,7 +394,7 @@ async def test_validation_error_envelope_shape(monkeypatch):
     assert isinstance(body["detail"], list)
     assert len(body["detail"]) > 0
     for item in body["detail"]:
-        assert set(item.keys()) == {"type", "loc", "msg", "input"}
+        assert set(item.keys()) == {"type", "loc", "msg"}
 
 
 async def test_invalid_jwt_is_401(monkeypatch):
