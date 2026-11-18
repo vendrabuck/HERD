@@ -347,8 +347,8 @@ def test_lone_surrogate_locs_is_not_limited_by_the_recursion_limit():
         (b'{"a": "\\ud83d\\\\ude00"}', [["body", "a"]]),
         (b'{"a": "\\ud83d\\ud83d\\ude00"}', [["body", "a"]]),
         (b'{"a": "\\ud83d\\ude00\\ude00"}', [["body", "a"]]),
-        # a member a later duplicate key replaces is not in the parsed value
-        (b'{"a": "\\ud800", "a": "ok"}', []),
+        # a member a later duplicate key replaces is refused all the same, at the body
+        (b'{"a": "\\ud800", "a": "ok"}', [["body"]]),
         # an escaped backslash followed by text that reads like an escape
         (b'{"a": "\\\\ud800"}', []),
         # a backslash pair, then a real escape
@@ -757,7 +757,7 @@ def test_the_locator_stops_at_its_limit_and_keeps_document_order():
     assert lone_surrogate_locs(value, limit=1) == [("a", 0)]
 
 
-_WIDE = 40  # past the size from which a container is filtered in C
+_WIDE = 40  # a wide container
 
 
 @pytest.mark.parametrize(
@@ -846,18 +846,94 @@ def test_a_body_that_holds_no_lone_surrogate_is_never_parsed(body):
     )
 
 
-def test_a_deep_and_wide_body_holding_one_costs_about_one_parse():
-    """When the body does hold one it is parsed once and searched with memory that grows
-    with the depth only: the peak is the parse's own (which FastAPI would make anyway)
-    plus a fixed margin, and the time a small multiple of it."""
-    assert body_lone_surrogate_errors(_DEEP_LONE) == [
-        {**UNICODE, "loc": ["body", *([0] * 599), 300_000]}
-    ]
-    parse_peak = _peak(lambda: json.loads(_DEEP_LONE))
-    assert _peak(lambda: body_lone_surrogate_errors(_DEEP_LONE)) < parse_peak + 1024 * 1024
-    assert _best_time(lambda: body_lone_surrogate_errors(_DEEP_LONE)) < 8 * _best_time(
-        lambda: json.loads(_DEEP_LONE)
-    )
+def _fill(unit: str, head: str, tail: str, size: int = 1 << 20) -> bytes:
+    """`unit` repeated to about `size` bytes between `head` and `tail`."""
+    return (head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail).encode()
+
+
+_LONE_TEXT = '"\\ud800"'
+# The second review's shapes (round 3): each about 1 MB, the surrogate where the search
+# reaches it last or never. Built on demand, so collecting the tests stays cheap.
+_REFUSED_SHAPES = {
+    "chain900": lambda: _fill("[" * 900 + "]" * 900 + ",", '{"name":"a","z":[', _LONE_TEXT + "]}"),
+    "empty_lists": lambda: _fill("[],", '{"name":"a","z":[', _LONE_TEXT + "]}"),
+    "triples": lambda: _fill("[[[]]],", '{"name":"a","z":[', _LONE_TEXT + "]}"),
+    "empty_objects": lambda: _fill("{},", "[", _LONE_TEXT + "]"),
+    "duplicate_key_chain900": lambda: _fill(
+        "[" * 900 + "]" * 900 + ",", '{"name":' + _LONE_TEXT + ',"name":"a","z":[', "0]}"
+    ),
+    "duplicate_key_empty_lists": lambda: _fill(
+        "[],", '{"name":' + _LONE_TEXT + ',"name":"a","z":[', "0]}"
+    ),
+    "deep600_wide": lambda: _DEEP_LONE,
+    "nested_dicts": lambda: (
+        b"{"
+        + b",".join(b'"k%d":{"a":{"b":1}}' % i for i in range((1 << 20) // 22))
+        + b',"z":"\\ud800"}'
+    ),
+}
+
+
+@pytest.mark.parametrize("make", _REFUSED_SHAPES.values(), ids=_REFUSED_SHAPES.keys())
+def test_a_refused_body_costs_at_most_about_one_more_parse(make):
+    """A body the scan says holds one is parsed once and refused; the location search
+    is bounded by its step budget and runs with the collector paused. So the whole
+    check, parse included, costs under twice the parse alone (measured 1.05 to 1.5),
+    where the walk it replaced cost 3 to 8 times, and its peak memory is the parse's
+    own plus a fixed margin. The route then never parses the body."""
+    body = make()
+    assert body_lone_surrogate_errors(body)[0]["type"] == "string_unicode"
+
+    def check(body=body):
+        return body_lone_surrogate_errors(body)
+
+    def parse(body=body):
+        return json.loads(body)
+
+    assert _best_time(check) < 2 * _best_time(parse)
+    assert _peak(check) < _peak(parse) + 1024 * 1024
+
+
+def test_a_body_whose_only_surrogate_a_duplicate_key_drops_is_refused_at_the_body():
+    """Decision (round 3): a surrogate escape in a member a later duplicate key
+    replaces is never honest input, so the body is refused without a second search
+    and without passing it on to be parsed again."""
+    body = b'{"name": "\\ud800", "name": "a"}'
+    assert json.loads(body) == {"name": "a"}
+    assert body_lone_surrogate_errors(body) == [{**UNICODE, "loc": ["body"]}]
+
+
+def test_the_search_is_bounded_by_its_budget():
+    from herd_common.validation_errors import LOCATION_SEARCH_BUDGET
+
+    early = _esc([SUR] + [0] * (LOCATION_SEARCH_BUDGET + 5))
+    late = _esc([0] * (LOCATION_SEARCH_BUDGET + 5) + [SUR])
+    assert body_lone_surrogate_errors(early) == [{**UNICODE, "loc": ["body", 0]}]
+    assert body_lone_surrogate_errors(late) == [{**UNICODE, "loc": ["body"]}]
+    value = json.loads(late)
+    assert lone_surrogate_locs(value, budget=LOCATION_SEARCH_BUDGET) == []
+    assert lone_surrogate_locs(value) == [(LOCATION_SEARCH_BUDGET + 5,)]
+
+
+def test_the_answer_is_bounded_in_size_and_never_cuts_a_key():
+    """`loc` repeats the path for each reported item, so a long key made the answer
+    ten times the body (a 16 MB key gave a 160 MB 422). A location whose parts pass
+    MAX_LOC_CHARS is left out whole, and all of them stay within MAX_LOCS_CHARS."""
+    from herd_common.validation_errors import MAX_LOC_CHARS, MAX_LOCS_CHARS
+
+    long_key = "k" * (1 << 20)
+    body = _esc({"name": "a", long_key: [SUR] * 10})
+    errors = body_lone_surrogate_errors(body)
+    assert errors == [{**UNICODE, "loc": ["body"]}]
+    assert len(json.dumps({"detail": errors})) < 300
+    fits = "k" * (MAX_LOC_CHARS - 2)  # the key plus a one-digit index: MAX_LOC_CHARS - 1
+    errors = body_lone_surrogate_errors(_esc({fits: [SUR] * 9, "short": SUR}))
+    locs = [error["loc"][1:] for error in errors]
+    assert all(loc[0] in (fits, "short") for loc in locs)  # each key whole
+    assert sum(len(str(part)) for loc in locs for part in loc) <= MAX_LOCS_CHARS
+    # eight long items fill MAX_LOCS_CHARS, the ninth is left out, "short" still fits
+    assert len(locs) == 9 and locs[-1] == ["short"]
+    assert len(json.dumps({"detail": errors})) < MAX_LOCS_CHARS + 10 * 200
 
 
 def test_the_locator_holds_memory_for_the_depth_not_the_elements():
@@ -870,7 +946,7 @@ def test_a_body_of_many_lone_surrogates_stops_at_the_tenth():
     parse_peak = _peak(lambda: json.loads(body))
     assert len(body_lone_surrogate_errors(body)) == 10
     assert _peak(lambda: body_lone_surrogate_errors(body)) < parse_peak + 1024 * 1024
-    assert _best_time(lambda: body_lone_surrogate_errors(body)) < 8 * _best_time(
+    assert _best_time(lambda: body_lone_surrogate_errors(body)) < 2 * _best_time(
         lambda: json.loads(body)
     )
 
@@ -891,7 +967,7 @@ def test_holds_lone_surrogate_costs_about_one_serialization():
             return json.loads(body)
 
         assert _peak(check) < 3 * _peak(parse)
-        assert _best_time(check) < 8 * _best_time(parse)
+        assert _best_time(check) < 3 * _best_time(parse)
 
 
 def test_through_an_app_the_check_adds_nothing_to_an_unauthenticated_request():
@@ -918,13 +994,32 @@ def test_through_an_app_the_check_adds_nothing_to_an_unauthenticated_request():
     assert with_peak < without_peak + 1024 * 1024
 
 
-def test_a_large_container_is_filtered_in_c_before_the_walk():
-    """Only the children the walk needs are yielded: containers always, strings only
-    when one of them holds a hit, every child when a key does."""
-    from herd_common.validation_errors import _children
+@pytest.mark.parametrize("shape", ["chain900", "duplicate_key_chain900", "empty_lists"])
+def test_through_an_app_a_refused_body_costs_about_what_main_pays(shape):
+    """A route behind a failing dependency, sent the review's shape with no credentials:
+    without the check FastAPI parses the body and answers 401; with it the check parses
+    it and answers 422. The request costs under twice as much."""
+    import asyncio
+    import time
 
-    assert list(_children([0] * _WIDE + [[1]])) == [(_WIDE, [1])]
-    assert list(_children([0] * _WIDE + ["ok", SUR])) == [(_WIDE, "ok"), (_WIDE + 1, SUR)]
-    keyed = {**{f"k{i}": i for i in range(_WIDE)}, "z" + SUR: 1}
-    assert len(list(_children(keyed))) == _WIDE + 1
-    assert list(_children([0] * 3)) == [(0, 0), (1, 0), (2, 0)]  # small: not filtered
+    body = _REFUSED_SHAPES[shape]()
+
+    def timed(refuse: bool) -> tuple[float, int]:
+        app = _open_app(refuse=refuse)
+
+        async def send() -> int:
+            async with _client(app) as client:
+                resp = await client.post("/guarded", content=body, headers=_JSON)
+                return resp.status_code
+
+        best, status = float("inf"), 0
+        for _ in range(3):
+            start = time.perf_counter()
+            status = asyncio.run(send())
+            best = min(best, time.perf_counter() - start)
+        return best, status
+
+    main_time, main_status = timed(False)
+    branch_time, branch_status = timed(True)
+    assert (main_status, branch_status) == (401, 422)
+    assert branch_time < 2 * main_time

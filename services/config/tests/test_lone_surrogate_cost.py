@@ -60,4 +60,4 @@ def test_the_save_check_on_deep_and_wide_values_costs_about_one_parse(leaf, expe
         return json.loads(raw)
 
     assert _peak(check) < 4 * _peak(parse)
-    assert _best_time(check) < 8 * _best_time(parse)
+    assert _best_time(check) < 3 * _best_time(parse)

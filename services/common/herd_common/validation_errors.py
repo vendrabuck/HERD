@@ -56,12 +56,15 @@ surrogate anywhere: a value, a key, nested, in a field of any type. What that
 guarantees, exactly:
 
 - The answer is the same `{"detail": [...]}` list, each item `{type, loc, msg}`, with
-  pydantic's own `string_unicode` type and message, for the first
-  `MAX_REPORTED_LOCATIONS` (10) locations in document order; the search stops there,
-  and nothing marks that more were left out. `loc` is `["body", ...]` and ends at the
-  string that holds the surrogate, or, for a key, at the object holding the key (as
-  pydantic refuses such a key on an `extra="forbid"` body); it never holds the
-  surrogate or the value.
+  pydantic's own `string_unicode` type and message. `loc` is `["body", ...]` and ends
+  at the string that holds the surrogate, or, for a key, at the object holding the key
+  (as pydantic refuses such a key on an `extra="forbid"` body); it never holds the
+  surrogate or the value. At most `MAX_REPORTED_LOCATIONS` (10) locations are
+  reported, the first in document order that the search reaches within
+  `LOCATION_SEARCH_BUDGET` steps, each whose parts total at most `MAX_LOC_CHARS`
+  characters and all within `MAX_LOCS_CHARS` (a location is left out whole, never cut);
+  with none to report, the answer is one item at `["body"]`. Nothing marks that more
+  were left out.
 - It runs only when the app reads the body, so a route that does not exist (404), a
   method not allowed (405), and a route that takes no body are unchanged. A route that
   reads its body (every route with a body parameter) reads it before its dependencies
@@ -77,13 +80,13 @@ guarantees, exactly:
 - Whether a body holds one is decided from its raw text, without parsing: a surrogate
   written as raw UTF-8 bytes, a high-surrogate escape not followed by a low one, or
   more low-surrogate escapes than pairs, each run of backslashes read by its parity.
-  Only a body that holds one (or one whose surrogate a later duplicate key replaces,
-  or that is not JSON) is parsed, and only then are the locations searched, by a walk
-  whose memory grows with the nesting depth and which stops at the tenth. So the cost
-  grows with the body's length and its number of elements, never with elements times
-  depth; it runs on the event loop, like FastAPI's own parse of the body. The measured
-  costs are in OPS-VALID-6 (`docs/specs/operations-and-observability.md`); they are
-  observations, not a bound.
+  A body the scan says holds one is parsed, and if it is JSON it is refused, always:
+  also when the surrogate is in a member a later duplicate key replaces, which no
+  honest client sends. The search for locations is bounded by its step budget and runs
+  with the cyclic collector paused. So the cost added to a body the route would have
+  parsed anyway is the scan plus the budgeted search; it runs on the event loop, like
+  FastAPI's own parse. The measured costs are in OPS-VALID-8
+  (`docs/specs/operations-and-observability.md`); they are observations, not a bound.
 - A body that is not JSON passes through, so the route answers as it would have.
 
 Every service installs it from its `app/main.py`; `tests/unit/test_validation_errors_wiring.py`
@@ -98,9 +101,9 @@ First written for auth (issue #1426), copied for config (issue #1428).
 
 from __future__ import annotations
 
+import gc
 import json
 import re
-from itertools import compress
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, status
@@ -163,6 +166,19 @@ STRING_UNICODE_MSG = "Input should be a valid string, unable to parse raw data a
 # The most locations one refusal reports. The search stops at the tenth, so a body of
 # a million lone surrogates costs no more to answer than a body of ten.
 MAX_REPORTED_LOCATIONS = 10
+# The most steps (children taken up, of any type) the location search may spend on one
+# body. A body that holds a lone surrogate is refused whether or not the search finds
+# it; the search only names where, exactly for a body of up to this many elements and
+# for a surrogate among its first this many otherwise. Measured on a development host
+# pinned to one core, a step costs 0.2 to 0.3 microseconds, so the search takes at most
+# about 6 ms, whatever the body.
+LOCATION_SEARCH_BUDGET = 20_000
+# The longest `loc`, in characters of its parts, one reported item may carry, and the
+# most characters all reported `loc`s may carry together. A longer `loc` is left out
+# whole, never cut (a cut key would name a wrong place), so a body cannot make the
+# answer larger than about this, whatever its keys.
+MAX_LOC_CHARS = 256
+MAX_LOCS_CHARS = 2048
 
 # Bytes that must be present for a UTF-8 JSON text to hold a lone surrogate: the start
 # of an escape whose first hex digit is D, or the lead byte 0xED of a surrogate written
@@ -236,56 +252,24 @@ def _raw_text_holds_a_lone_surrogate(body: bytes) -> bool:
     return _escapes_hold_a_lone_surrogate(text, _LONE_HIGH_TEXT, _ANY_LOW_TEXT, _PAIR_TEXT)
 
 
-# The types `json.loads` produces. A container whose children are all of these is
-# filtered in C before the walk sees it; any other type (a subclass, a non-JSON value)
-# makes the walk visit every child of that container.
-_JSON_TYPES = frozenset({str, dict, list, int, float, bool, type(None)})
-_STR_TYPE = frozenset({str})
-_CONTAINER_TYPES = frozenset({dict, list})
-_STR_OR_CONTAINER_TYPES = frozenset({str, dict, list})
-# Below this many children the filtering costs more than the plain loop it replaces.
-_FILTER_FROM = 16
+def _items(container: dict | list) -> Any:
+    """The (key or index, child) pairs of a container, in order."""
+    return iter(container.items()) if isinstance(container, dict) else enumerate(container)
 
 
-def _children(container: dict | list) -> Any:
-    """The (key or index, child) pairs of a container the walk must visit, in order.
-
-    A large container is filtered in C: numbers, booleans, and nulls are never yielded;
-    strings only when one of them, joined, holds a lone surrogate; and when a key does,
-    every child is yielded so the walk can find that key. So a long run of numbers or
-    clean strings costs no Python step each.
-    """
-    if isinstance(container, dict):
-        keys: Any = container
-        values: Any = container.values()
-        items: Any = container.items()
-    else:
-        keys = ()
-        values = container
-        items = enumerate(container)
-    if len(container) < _FILTER_FROM:
-        return iter(items)
-    if not (set(map(type, values)) <= _JSON_TYPES and set(map(type, keys)) <= _STR_TYPE):
-        return iter(items)
-    if _LONE_SURROGATE.search("".join(keys)):
-        return iter(items)
-    strings = "".join(compress(values, map(_STR_TYPE.__contains__, map(type, values))))
-    wanted = _STR_OR_CONTAINER_TYPES if _LONE_SURROGATE.search(strings) else _CONTAINER_TYPES
-    return compress(items, map(wanted.__contains__, map(type, values)))
-
-
-def lone_surrogate_locs(value: Any, limit: int | None = None) -> list[tuple[str | int, ...]]:
+def lone_surrogate_locs(
+    value: Any, limit: int | None = None, budget: int | None = None
+) -> list[tuple[str | int, ...]]:
     """Where a parsed JSON value holds a lone surrogate, in document order, each once,
-    stopping after `limit` locations when given.
+    stopping after `limit` locations, or after `budget` steps (children taken up, of
+    any type), when given: then the locations found so far, which may be none.
 
     A string holding one is located at itself; a key holding one at the object that
     holds the key, and that key's value is not searched. A located key or index never
     holds a surrogate. One pass with a stack of iterators and one shared path, so memory
     grows with the nesting depth only, and a location tuple is built only for a hit;
-    nothing recurses. Time is linear in the number of elements; in a large container
-    the numbers, and the strings when none of them holds a hit, are passed over in C
-    (`_children`), so the Python steps are about one per container and one per string
-    of a container that holds a hit.
+    nothing recurses. Time is one step per child taken up, so with a budget it is
+    bounded whatever the value.
     """
     found: dict[tuple[str | int, ...], None] = {}
 
@@ -299,7 +283,8 @@ def lone_surrogate_locs(value: Any, limit: int | None = None) -> list[tuple[str 
         return []
     # A dict yields (key, value) with a str key, a list (index, value) with an int.
     path: list[str | int] = []
-    stack: list[Any] = [_children(value)]
+    stack: list[Any] = [_items(value)]
+    steps = 0
     while stack:
         entry = next(stack[-1], _END)
         if entry is _END:
@@ -307,6 +292,10 @@ def lone_surrogate_locs(value: Any, limit: int | None = None) -> list[tuple[str 
             if stack:
                 path.pop()
             continue
+        if budget is not None:
+            steps += 1
+            if steps > budget:
+                break
         key, item = entry
         if isinstance(key, str) and _LONE_SURROGATE.search(key):
             if hit(tuple(path)):
@@ -317,7 +306,7 @@ def lone_surrogate_locs(value: Any, limit: int | None = None) -> list[tuple[str 
                 break
         elif isinstance(item, (dict, list)):
             path.append(key)
-            stack.append(_children(item))
+            stack.append(_items(item))
     return list(found)
 
 
@@ -338,13 +327,35 @@ def holds_lone_surrogate(value: Any) -> bool:
     return False
 
 
-def body_lone_surrogate_errors(body: bytes) -> list[dict[str, Any]]:
-    """The rendered `string_unicode` errors for a request body, empty when it is clean;
-    at most `MAX_REPORTED_LOCATIONS`, the first ones in document order.
+def _reportable(locs: list[tuple[str | int, ...]]) -> list[tuple[str | int, ...]]:
+    """The locations an answer may carry: each whose parts total at most
+    `MAX_LOC_CHARS` characters, while all of them together stay within
+    `MAX_LOCS_CHARS`. A location is kept or left out whole."""
+    kept: list[tuple[str | int, ...]] = []
+    total = 0
+    for loc in locs:
+        size = 0
+        for part in loc:
+            size += len(part) if isinstance(part, str) else len(str(part))
+            if size > MAX_LOC_CHARS:
+                break
+        if size > MAX_LOC_CHARS or total + size > MAX_LOCS_CHARS:
+            continue
+        kept.append(loc)
+        total += size
+    return kept
 
-    The raw text decides whether the body can hold one; only then is it parsed, and the
-    locations searched. Empty, too, for a body `json.loads` refuses: the route answers
-    that as it would have (FastAPI's `json_invalid`).
+
+def body_lone_surrogate_errors(body: bytes) -> list[dict[str, Any]]:
+    """The rendered `string_unicode` errors for a request body, empty when it is clean.
+
+    The raw text decides whether the body holds a lone surrogate. If it does and the
+    body is JSON, the body is refused, always: also when the surrogate is in a member a
+    later duplicate key replaces, which is never honest input. The locations are then
+    searched within `LOCATION_SEARCH_BUDGET` steps, at most `MAX_REPORTED_LOCATIONS`,
+    and kept within `MAX_LOC_CHARS` and `MAX_LOCS_CHARS`; with none to report, the
+    answer is one item at `["body"]`. Empty for a body `json.loads` refuses: the route
+    answers that as it would have (FastAPI's `json_invalid`).
     """
     if not _raw_text_holds_a_lone_surrogate(body):
         return []
@@ -352,9 +363,27 @@ def body_lone_surrogate_errors(body: bytes) -> list[dict[str, Any]]:
         parsed = json.loads(body)
     except (ValueError, RecursionError):
         return []
+    # The search runs with the cyclic garbage collector paused, and the parsed value is
+    # released before it resumes. The parse leaves every container it made pending for
+    # a full collection, which the search's own small allocations would set off: on a
+    # 1 MB body of nested lists that collection cost more than the parse. Paused, the
+    # collection that follows finds the value already gone. The pause lasts the search
+    # (bounded by LOCATION_SEARCH_BUDGET) and the release, never the parse, and puts the
+    # collector back as it was.
+    collecting = gc.isenabled()
+    gc.disable()
+    try:
+        found = lone_surrogate_locs(
+            parsed, limit=MAX_REPORTED_LOCATIONS, budget=LOCATION_SEARCH_BUDGET
+        )
+        del parsed
+    finally:
+        if collecting:
+            gc.enable()
+    locs = _reportable(found) or [()]
     return render_validation_errors(
         {"type": STRING_UNICODE_TYPE, "loc": ("body", *loc), "msg": STRING_UNICODE_MSG}
-        for loc in lone_surrogate_locs(parsed, limit=MAX_REPORTED_LOCATIONS)
+        for loc in locs
     )
 
 
