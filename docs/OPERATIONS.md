@@ -85,6 +85,32 @@ Check `AUTH_SECRET_KEY` and `AUTH_ALGORITHM` when upgrading past the access-toke
 
 Check outbound webhook subscriptions when upgrading past the webhook destination rule: a subscription whose `target_url` host resolves to a loopback, private, or other non-public address now records `failed` deliveries with `destination not allowed` and is not sent to. Under `make prod`, `WEBHOOK_ALLOWED_HOSTS` is empty; name each internal receiver there (a hostname or a CIDR) before upgrading, or re-register it at a public address. See [EXTERNAL_API.md](EXTERNAL_API.md#destination-rule).
 
+Decide what to do with older refused configure runs when upgrading past issue #1457. A `configure` run whose configuration failed schema validation stored a refusal that could quote the refused configuration, credentials included (a vtysh line with `neighbor ... password ...`), and that text is still in the run's `error`, which admins, the reservation's owner, and the assistant's run-list tool read. The upgrade rewrites nothing. The old text reads `config failed schema validation:` followed by the library's message, the new text `config failed schema validation at <path>:` followed by the rule, so this finds the old rows (run it in `docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"`; under `make prod` add `-f docker-compose.yml` after `docker compose`):
+
+```sql
+SELECT id, created_at, reservation_id
+FROM execution.execution_runs
+WHERE action = 'configure'
+  AND status = 'FAILED'
+  AND error LIKE '%: config failed schema validation: %';
+```
+
+To remove the quoted text and keep the rest of each row, run the same predicate as an update. It cannot be undone, so take a backup first if the text matters to an investigation:
+
+```sql
+UPDATE execution.execution_runs
+SET error = regexp_replace(
+  error,
+  ': config failed schema validation: .*$',
+  ': config failed schema validation (text removed after issue #1457)'
+)
+WHERE action = 'configure'
+  AND status = 'FAILED'
+  AND error LIKE '%: config failed schema validation: %';
+```
+
+Inventory's apply-job rows never stored this text (issue #1093), but inventory's warning log line `config apply: execution answered HTTP 422: <body>` from before the upgrade can hold it, until Docker's log rotation drops it.
+
 After the recreate, the admin-only About page (Administration, then About) is the fastest way to confirm every service actually landed on the new build: a row marked "differs" or "unreachable" names the service that still needs a rebuild. See `docs/ADMIN_HANDBOOK.md`.
 
 Since issue #593, `make build` installs every service's third-party dependencies from the workspace `uv.lock` (each Dockerfile runs `uv export --frozen --package <svc>` and installs that requirements file verbatim), not by resolving fresh from PyPI at build time. A checkout with a stale `uv.lock` (a `pyproject.toml` dependency bump with no matching `uv lock` run) fails the build outright, the same failure `uv lock --check` reports for a host install; run `uv lock` and rebuild.
