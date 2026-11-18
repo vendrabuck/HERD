@@ -221,7 +221,30 @@ async def test_accept_unknown_category_value_is_422():
             json={"purpose_category": "not_a_real_category"},
         )
     assert resp.status_code == 422
-    assert "Unknown purpose_category" in resp.json()["detail"]
+    assert resp.json()["detail"] == (
+        "Unknown purpose_category; allowed: " + ", ".join(settings.purpose_categories)
+    )
+    assert "not_a_real_category" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_accept_with_a_lone_surrogate_category_is_422_and_changes_nothing():
+    """Issue #1459: the echo of the value made this a 500; the shared body check
+    refuses it first, and the suggestion stays pending."""
+    rid = await _insert_reservation(purpose_suggestion=_suggestion("qa_regression"))
+    async with _client_as(ADMIN_ID, role="admin") as ac:
+        resp = await ac.post(
+            f"/admin/purpose-review/{rid}/accept",
+            content=b'{"purpose_category": "x\\ud800"}',
+            headers={"content-type": "application/json"},
+        )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"][0]["type"] == "string_unicode"
+    async with TestSessionLocal() as db:
+        res = await db.get(Reservation, rid)
+        assert res.purpose_category is None
+        assert res.purpose_category_set_by is None
+        assert res.purpose_suggestion is not None
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,11 @@ has no `app/`). For each one:
 - `app/main.py` must exist and bind, at module level, at least one name to a
   `FastAPI(...)` call (`FastAPI` imported from `fastapi`, or `fastapi.FastAPI`).
 - Every such name must be passed to the install function in a module-level
-  statement of its own (`install_validation_errors(app)`), after the assignment.
+  statement of its own (`install_validation_errors(app)`), after the assignment,
+  with no other argument. The install also adds the body check that refuses a lone
+  surrogate (`RefuseLoneSurrogates`); only the config service may turn it off, and
+  only with exactly `refuse_lone_surrogates=False` (it answers a surrogate in a
+  password itself, OPS-CONFIG-8). Any other keyword, in any service, fails.
   The install function must be bound, at module level and exactly once, by an
   import from the expected module: `from <module> import install_validation_errors`
   (any alias), or `from <package> import validation_errors` (any alias) or
@@ -44,9 +48,12 @@ Limits. The scan reads source; it executes nothing:
   always reached, but a `sys.exit()` or an exception raised before it is not
   modelled); a handler removed or replaced after install by mutating
   `app.exception_handlers` directly, by `app.router` surgery, or by a middleware
-  that rewrites 422 bodies; a custom `APIRoute` subclass (a router's `route_class`)
-  whose route handler wraps FastAPI's and could catch `RequestValidationError` and
-  answer a body of its own (auth's `_SingleSignOnRoute` in `app/routers/oidc.py` is
+  that rewrites 422 bodies; the body check removed, or a middleware placed inside
+  it, by editing `app.user_middleware` after install (each service suite's
+  `test_the_body_check_is_installed` proves the check is the innermost middleware of
+  the built app); a custom `APIRoute` subclass (a router's `route_class`) whose
+  route handler wraps FastAPI's and could catch `RequestValidationError` and answer
+  a body of its own (auth's `_SingleSignOnRoute` in `app/routers/oidc.py` is
   such a wrapper; it is benign: outside OIDC mode it answers a fixed 404 before
   validation runs, and otherwise it calls FastAPI's handler unchanged); a handler
   registered for a base class of
@@ -77,6 +84,9 @@ STANDALONE_COPY = {"config": "app.validation_errors"}
 REGISTRATION_EXEMPT = {("config", "app/validation_errors.py")}
 
 INSTALL = "install_validation_errors"
+# The one service that may install without the body check, and the exact keyword.
+BODY_CHECK_EXEMPT = {"config"}
+OPT_OUT_KEYWORD = "refuse_lone_surrogates"
 
 
 def service_dirs(services_dir: Path = SERVICES_DIR) -> list[Path]:
@@ -168,9 +178,20 @@ def fastapi_calls(source: str) -> list[int]:
     return sorted(node.lineno for node in ast.walk(tree) if _is_fastapi_call(node, names, modules))
 
 
-def install_problems(source: str, module: str) -> list[str]:
+def _opts_out(keywords: list[ast.keyword]) -> bool:
+    """Whether the keywords are exactly `refuse_lone_surrogates=False`."""
+    return (
+        len(keywords) == 1
+        and keywords[0].arg == OPT_OUT_KEYWORD
+        and isinstance(keywords[0].value, ast.Constant)
+        and keywords[0].value.value is False
+    )
+
+
+def install_problems(source: str, module: str, may_opt_out: bool = False) -> list[str]:
     """Why a service's `app/main.py` source does not install the handler from `module`
-    on every app it builds; empty when it does."""
+    on every app it builds; empty when it does. Only when `may_opt_out` may the call
+    carry `refuse_lone_surrogates=False`, and no other keyword."""
     tree = ast.parse(source)
     bindings = _module_bindings(tree)
     names, modules = _fastapi_import_names(tree)
@@ -233,7 +254,7 @@ def install_problems(source: str, module: str) -> list[str]:
         if (
             is_install
             and len(call.args) == 1
-            and not call.keywords
+            and (not call.keywords or (may_opt_out and _opts_out(call.keywords)))
             and isinstance(call.args[0], ast.Name)
         ):
             installed.setdefault(call.args[0].id, index)
@@ -305,15 +326,27 @@ def test_services_are_discovered_from_the_directory():
 
 def test_the_standalone_copy_exemption_is_not_stale():
     assert set(STANDALONE_COPY) <= {p.name for p in SERVICES}
+    assert BODY_CHECK_EXEMPT <= {p.name for p in SERVICES}
     for service, relative in REGISTRATION_EXEMPT:
         assert (SERVICES_DIR / service / relative).is_file()
 
 
+def service_problems(service: Path) -> list[str]:
+    """Why a service directory's `app/main.py` does not install the handler as its
+    service must: the expected module, and the opt-out only where it is allowed."""
+    main = service / "app" / "main.py"
+    if not main.is_file():
+        return [f"{service.name} has app/ but no app/main.py"]
+    return install_problems(
+        main.read_text(encoding="utf-8"),
+        expected_module(service.name),
+        may_opt_out=service.name in BODY_CHECK_EXEMPT,
+    )
+
+
 @pytest.mark.parametrize("service", SERVICES, ids=lambda p: p.name)
 def test_every_service_app_installs_the_shared_handler(service):
-    main = service / "app" / "main.py"
-    assert main.is_file(), f"{service.name} has app/ but no app/main.py"
-    problems = install_problems(main.read_text(encoding="utf-8"), expected_module(service.name))
+    problems = service_problems(service)
     assert not problems, f"services/{service.name}/app/main.py: {problems}"
 
 
@@ -417,6 +450,16 @@ FAILING = {
     "keyword_argument": GOOD.replace(
         "install_validation_errors(app)", "install_validation_errors(app=app)"
     ),
+    "opts_out_of_the_body_check": GOOD.replace(
+        "install_validation_errors(app)",
+        "install_validation_errors(app, refuse_lone_surrogates=False)",
+    ),
+    "a_second_positional_argument": GOOD.replace(
+        "install_validation_errors(app)", "install_validation_errors(app, False)"
+    ),
+    "keyword_splat": GOOD.replace(
+        "install_validation_errors(app)", "install_validation_errors(app, **options)"
+    ),
     "before_the_app": GOOD.replace('app = FastAPI(title="x")\n', "").replace(
         "install_validation_errors(app)\n", "install_validation_errors(app)\napp = FastAPI()\n"
     ),
@@ -435,6 +478,34 @@ def test_fixture_mains_that_pass(source):
 @pytest.mark.parametrize("source", FAILING.values(), ids=FAILING.keys())
 def test_fixture_mains_that_fail(source):
     assert install_problems(source, SHARED_MODULE) != []
+
+
+OPTED_OUT = GOOD.replace(
+    "install_validation_errors(app)", "install_validation_errors(app, refuse_lone_surrogates=False)"
+)
+
+
+def test_only_an_exempt_service_may_opt_out_of_the_body_check():
+    assert install_problems(OPTED_OUT, SHARED_MODULE, may_opt_out=True) == []
+    assert install_problems(OPTED_OUT, SHARED_MODULE) != []
+    assert install_problems(GOOD, SHARED_MODULE, may_opt_out=True) == []
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "install_validation_errors(app, refuse_lone_surrogates=0)",
+        "install_validation_errors(app, refuse_lone_surrogates=None)",
+        "install_validation_errors(app, refuse_lone_surrogates=flag)",
+        "install_validation_errors(app, refuse_lone_surrogates=False, other=1)",
+        "install_validation_errors(app, other=False)",
+        "install_validation_errors(app, **{'refuse_lone_surrogates': False})",
+        "install_validation_errors(app, False)",
+    ],
+)
+def test_an_exempt_service_may_opt_out_only_with_exactly_that_keyword(call):
+    source = GOOD.replace("install_validation_errors(app)", call)
+    assert install_problems(source, SHARED_MODULE, may_opt_out=True) != []
 
 
 def test_config_must_install_its_copy_not_the_shared_module():
@@ -486,3 +557,72 @@ def test_a_new_service_without_the_line_fails(tmp_path):
     }
     assert verdicts["old"] == []
     assert verdicts["brand-new"] != []
+
+
+def test_only_config_may_opt_out_by_service_name(tmp_path):
+    """The exemption follows the directory name: the same opted-out line passes in
+    config (with its copy's module) and fails in any other service."""
+    copy_opted_out = OPTED_OUT.replace("herd_common.validation_errors", "app.validation_errors")
+    for name, source in [
+        ("config", copy_opted_out),
+        ("secrets", OPTED_OUT),
+        ("brand-new", OPTED_OUT),
+    ]:
+        (tmp_path / name / "app").mkdir(parents=True)
+        (tmp_path / name / "app" / "main.py").write_text(source)
+    verdicts = {p.name: service_problems(p) for p in service_dirs(tmp_path)}
+    assert verdicts["config"] == []
+    assert verdicts["secrets"] != []
+    assert verdicts["brand-new"] != []
+
+
+# -- The body check follows FastAPI's JSON rule (round 4 of the #1456 review) ----------
+#
+# `RefuseLoneSurrogates` scans only a body FastAPI parses as JSON, and it assumes
+# FastAPI's default `strict_content_type=True`: with it off, FastAPI also parses a body
+# that has no content type, which the check would then not see. So no app, router, or
+# route under a service's `app/` may set it. The scan reads source: a keyword argument
+# named `strict_content_type` anywhere, or an assignment to an attribute of that name.
+
+
+def strict_content_type_settings(source: str) -> list[int]:
+    """Line numbers where a module sets `strict_content_type`."""
+    hits: set[int] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and any(
+            k.arg == "strict_content_type" for k in node.keywords
+        ):
+            hits.add(node.lineno)
+        elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(
+                isinstance(t, ast.Attribute) and t.attr == "strict_content_type" for t in targets
+            ):
+                hits.add(node.lineno)
+    return sorted(hits)
+
+
+@pytest.mark.parametrize("service", SERVICES, ids=lambda p: p.name)
+def test_no_service_turns_off_strict_content_type(service):
+    offenders = [
+        f"{path.relative_to(service).as_posix()}: lines {lines}"
+        for path in sorted((service / "app").rglob("*.py"))
+        if (lines := strict_content_type_settings(path.read_text(encoding="utf-8")))
+    ]
+    assert not offenders, f"services/{service.name}: {offenders}"
+
+
+@pytest.mark.parametrize(
+    ("source", "found"),
+    [
+        ("app = FastAPI(strict_content_type=False)\n", True),
+        ("router = APIRouter(strict_content_type=False)\n", True),
+        ("@router.post('/x', strict_content_type=False)\nasync def x():\n    pass\n", True),
+        ("app.router.strict_content_type = False\n", True),
+        ("app = FastAPI(title='x')\n", False),
+        ("# FastAPI(strict_content_type=False)\n", False),
+        ("strict_content_type = False\n", False),  # a module name, not a setting
+    ],
+)
+def test_the_strict_content_type_scan_both_ways(source, found):
+    assert bool(strict_content_type_settings(source)) is found

@@ -15,13 +15,20 @@ from app.schemas.hypervisor import HypervisorCreate, HypervisorUpdate
 
 logger = logging.getLogger(__name__)
 
+# A secret whose reveal answers 409: its stored data is not valid UTF-8 text.
+SECRET_UNREADABLE_DETAIL = (
+    "Secret data cannot be read; an admin must replace it in the secrets service"
+)
+
 
 async def validate_secret_exists(secret_id: uuid.UUID) -> None:
     """Confirm the secret exists in the secrets service, over the internal API.
 
     A 404 means the referenced secret does not exist and the registration is
-    rejected with 422. A transport error or any non-2xx/404 (including 5xx) is
-    an upstream-unreachable condition and standardizes to 503. The returned
+    rejected with 422. A 409 means it exists but its stored data cannot be read
+    until an admin replaces it (OPS-SECRET-19), also a 422. A transport error or
+    any other non-2xx (including 5xx) is an upstream-unreachable condition and
+    standardizes to 503. The returned
     plaintext is never read, stored, or logged; only the existence check
     (status code) matters here. The secret UUID is also kept out of log lines
     deliberately: nothing secret-named reaches a logger, so scanners cannot
@@ -43,6 +50,10 @@ async def validate_secret_exists(secret_id: uuid.UUID) -> None:
 
     if resp.status_code == 404:
         raise HTTPException(status_code=422, detail="Secret does not exist")
+    if resp.status_code == 409:
+        # The secret exists but its stored data cannot be read until an admin
+        # replaces it (OPS-SECRET-19): a client error to fix, not an outage.
+        raise HTTPException(status_code=422, detail=SECRET_UNREADABLE_DETAIL)
     if resp.status_code != 200:
         logger.error(
             "secrets service returned %s while validating a secret reference", resp.status_code

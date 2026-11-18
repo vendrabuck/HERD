@@ -24,9 +24,16 @@ import uuid
 import jwt
 import pytest
 from app.main import app
+from app.schemas.preferences import PreferencesPatchRequest, PreferencesReplaceRequest
 from fastapi.exceptions import RequestValidationError
-from herd_common.validation_errors import RENDERED_KEYS, validation_error_handler
+from herd_common.validation_errors import (
+    RENDERED_KEYS,
+    STRING_UNICODE_MSG,
+    RefuseLoneSurrogates,
+    validation_error_handler,
+)
 from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
 
 SECRET_KEY = "3fcbb4bf16b0e162be24d2eb59065316c1e84194669ebf9270203280b18e18f7"
 MARKER = "echo-canary-user-profile-7Kq2"
@@ -96,8 +103,10 @@ async def test_a_refused_body_never_echoes_the_submitted_value(method, path, bod
 @pytest.mark.parametrize("method", ["PUT", "PATCH"])
 async def test_a_lone_surrogate_in_a_page_sizes_key_is_a_422_not_a_500(method):
     """pydantic-core cannot build an error whose message holds a lone surrogate (it
-    raises UnicodeEncodeError and the route answers 500). `_validate_page_sizes`
-    quotes the key with `!r`, which writes a surrogate as its escape."""
+    raises UnicodeEncodeError and the route answers 500). The shared body check now
+    refuses the body before the schema runs (one item at `["body"]`), and
+    `_validate_page_sizes` still quotes the key with `!r`, which writes a
+    surrogate as its escape, for any value that reaches it another way."""
     body = {"page_sizes": {"k" + SUR: "x"}}
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -107,4 +116,46 @@ async def test_a_lone_surrogate_in_a_page_sizes_key_is_a_422_not_a_500(method):
     assert resp.status_code == 422, resp.content[:300]
     (error,) = resp.json()["detail"]
     assert set(error) == set(RENDERED_KEYS)
-    assert error["msg"] == "Value error, page_sizes['k\\ud800'] must be an integer"
+    assert (error["type"], error["loc"]) == ("string_unicode", ["body"])
+    schema = PreferencesReplaceRequest if method == "PUT" else PreferencesPatchRequest
+    with pytest.raises(ValidationError) as caught:
+        schema.model_validate(body)
+    (direct,) = caught.value.errors()
+    assert direct["msg"] == "Value error, page_sizes['k\\ud800'] must be an integer"
+
+
+# -- The shared body check refuses a lone surrogate (issues #1456, #1458, #1459) -------
+
+LOW = chr(0xDFFF)
+_BODY_ROUTES = [("PUT", "/preferences"), ("PATCH", "/preferences")]
+# Bodies no schema is consulted for: the check reads the parsed JSON, so a field the
+# route does not know, a key, and a nested value are each refused where they are.
+_SURROGATE_BODIES = {
+    "value": ({"probe": "v" + SUR}, ["body"]),
+    "key": ({"probe" + LOW: "v"}, ["body"]),
+    "nested": ({"a": [{"b": LOW + "x"}]}, ["body"]),
+}
+
+
+def test_the_body_check_is_installed():
+    """Last in the list, so innermost: every route reads its body through it."""
+    assert app.user_middleware[-1].cls is RefuseLoneSurrogates
+
+
+@pytest.mark.parametrize(("method", "path"), _BODY_ROUTES)
+@pytest.mark.parametrize(("body", "loc"), _SURROGATE_BODIES.values(), ids=_SURROGATE_BODIES.keys())
+async def test_a_lone_surrogate_anywhere_in_a_body_is_refused(method, path, body, loc):
+    resp = await _send(method, path, body, _headers())
+    assert resp.status_code == 422, resp.content[:300]
+    assert resp.json() == {
+        "detail": [{"type": "string_unicode", "loc": loc, "msg": STRING_UNICODE_MSG}]
+    }
+
+
+@pytest.mark.parametrize(("method", "path"), _BODY_ROUTES)
+async def test_an_escaped_surrogate_pair_is_not_refused_by_the_check(method, path):
+    """A character outside the BMP, sent as two escapes, is one code point once parsed.
+    A list is no route's body, so the route's own validation answers."""
+    resp = await _send(method, path, ["\U0001f511"], _headers())
+    assert resp.status_code == 422, resp.content[:300]
+    assert "string_unicode" not in resp.text

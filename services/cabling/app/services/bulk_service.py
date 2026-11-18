@@ -51,6 +51,7 @@ from typing import Any
 from fastapi import HTTPException
 from herd_common.csv_safety import csv_safe_cell, csv_unsafe_cell
 from herd_common.rehearsal import rehearsal_session
+from herd_common.validation_errors import holds_lone_surrogate
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -61,6 +62,24 @@ from app.services.device_resolver import resolve_device_names
 from app.services.reservation_guard import find_blocking_reservations
 from app.services.version_service import commit_with_new_version
 from app.services.visible_devices import resolve_caller_visibility
+
+# A JSON import file holding a lone surrogate (an escape such as \ud800 with no pair):
+# a value no response, database write, or later read can encode.
+IMPORT_NOT_TEXT_DETAIL = (
+    "Import file holds a lone surrogate escape, which is not valid text; fix it and retry"
+)
+
+# An import file that is not UTF-8 (Latin-1, Windows-1252): a client input error, the
+# same answer inventory's importers give (issue #1022).
+IMPORT_NOT_UTF8_DETAIL = "Import file must be UTF-8 encoded; re-save it as UTF-8 and retry"
+
+
+def _decode_import(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=422, detail=IMPORT_NOT_UTF8_DETAIL) from exc
+
 
 # Pinned reject reason when an import row would rewire a topology currently held
 # by another user's active reservation. Mirrors the reservation-scoped lock on
@@ -216,9 +235,11 @@ def records_to_csv(topologies: list[Topology]) -> str:
 
 def parse_json_topologies(raw: bytes) -> list[dict[str, Any]]:
     try:
-        doc = json.loads(raw.decode("utf-8-sig"))
+        doc = json.loads(_decode_import(raw))
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}") from exc
+    if holds_lone_surrogate(doc):
+        raise HTTPException(status_code=422, detail=IMPORT_NOT_TEXT_DETAIL)
     if isinstance(doc, dict) and "items" in doc:
         items = doc["items"]
     elif isinstance(doc, list):
@@ -240,7 +261,7 @@ def parse_csv_topologies(raw: bytes) -> list[dict[str, Any]]:
     edge. Node ids are synthesized deterministically from the device name so an
     edge can reference its endpoints.
     """
-    reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
+    reader = csv.DictReader(io.StringIO(_decode_import(raw)))
     by_topology: dict[str, dict[str, Any]] = {}
     for row in reader:
         # Every cell here may carry a csv_safe_cell neutralization quote

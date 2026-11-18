@@ -24,7 +24,12 @@ import jwt
 import pytest
 from app.main import app
 from fastapi.exceptions import RequestValidationError
-from herd_common.validation_errors import RENDERED_KEYS, validation_error_handler
+from herd_common.validation_errors import (
+    RENDERED_KEYS,
+    STRING_UNICODE_MSG,
+    RefuseLoneSurrogates,
+    validation_error_handler,
+)
 from httpx import ASGITransport, AsyncClient
 
 SECRET_KEY = "3fcbb4bf16b0e162be24d2eb59065316c1e84194669ebf9270203280b18e18f7"
@@ -131,3 +136,40 @@ for _path in ("/execute", "/execute/internal"):
 async def test_a_refused_body_never_echoes_the_submitted_value(method, path, body):
     resp = await _send(method, path, body, _route_headers(path))
     _assert_clean_422(resp)
+
+
+# -- The shared body check refuses a lone surrogate (issues #1456, #1458, #1459) -------
+
+LOW = chr(0xDFFF)
+_BODY_ROUTES = [("POST", "/execute"), ("POST", "/execute/internal")]
+# Bodies no schema is consulted for: the check reads the parsed JSON, so a field the
+# route does not know, a key, and a nested value are each refused where they are.
+_SURROGATE_BODIES = {
+    "value": ({"probe": "v" + SUR}, ["body"]),
+    "key": ({"probe" + LOW: "v"}, ["body"]),
+    "nested": ({"a": [{"b": LOW + "x"}]}, ["body"]),
+}
+
+
+def test_the_body_check_is_installed():
+    """Last in the list, so innermost: every route reads its body through it."""
+    assert app.user_middleware[-1].cls is RefuseLoneSurrogates
+
+
+@pytest.mark.parametrize(("method", "path"), _BODY_ROUTES)
+@pytest.mark.parametrize(("body", "loc"), _SURROGATE_BODIES.values(), ids=_SURROGATE_BODIES.keys())
+async def test_a_lone_surrogate_anywhere_in_a_body_is_refused(method, path, body, loc):
+    resp = await _send(method, path, body, _route_headers(path))
+    assert resp.status_code == 422, resp.content[:300]
+    assert resp.json() == {
+        "detail": [{"type": "string_unicode", "loc": loc, "msg": STRING_UNICODE_MSG}]
+    }
+
+
+@pytest.mark.parametrize(("method", "path"), _BODY_ROUTES)
+async def test_an_escaped_surrogate_pair_is_not_refused_by_the_check(method, path):
+    """A character outside the BMP, sent as two escapes, is one code point once parsed.
+    A list is no route's body, so the route's own validation answers."""
+    resp = await _send(method, path, ["\U0001f511"], _route_headers(path))
+    assert resp.status_code == 422, resp.content[:300]
+    assert "string_unicode" not in resp.text

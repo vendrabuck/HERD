@@ -38,9 +38,11 @@ from app.services.keyring import (
     ROTATION_CONFLICT_DETAIL,
     KeyVersionUnavailableError,
     RotationConflictError,
+    SecretDataUnreadableError,
     deserialize_data,
     key_unavailable_http,
     rotate_dek,
+    secret_data_unreadable_http,
     serialize_data,
 )
 
@@ -138,7 +140,10 @@ async def _decrypt(secret: Secret, request: Request, db: AsyncSession) -> dict:
         secret_id=secret.id,
         key_version=secret.key_version,
     )
-    return deserialize_data(plaintext)
+    try:
+        return deserialize_data(plaintext)
+    except SecretDataUnreadableError:
+        raise secret_data_unreadable_http(secret.id) from None
 
 
 @router.post("", response_model=SecretResponse, status_code=status.HTTP_201_CREATED)

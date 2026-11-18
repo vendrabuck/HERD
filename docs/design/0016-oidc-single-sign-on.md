@@ -511,9 +511,11 @@ login (IAM-LDAP-8).
     new provider.
   - Who may call: a superadmin effective role only (`require_role(Role.SUPERADMIN)`),
     an admin answers 403, checked before any account is read and before the body is
-    validated, with one exception: FastAPI decodes the body before it runs the
-    dependencies, so a body that is not JSON answers 422 `json_invalid` to anyone,
-    which says nothing about any account. In OIDC mode the superadmin is the seeded
+    validated, with two exceptions: a route reads its body before it runs the
+    dependencies, so a body that is not JSON answers 422 `json_invalid` to anyone, and
+    a body holding a lone surrogate answers the shared 422 `string_unicode` to anyone
+    (the body check of issues #1456 to #1459, OPS-VALID-6); neither says anything about
+    any account. In OIDC mode the superadmin is the seeded
     local account (IAM-USER-3), reachable through the D5 break-glass login, a
     superadmin API token exchanged at `POST /tokens/exchange`, a superadmin session
     from before the change, or by switching `AUTH_METHOD` back to `local`. With

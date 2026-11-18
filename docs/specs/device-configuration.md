@@ -880,10 +880,14 @@ is WIRE-DRIVER-6 in `provisioning-and-wiring.md`.
 - **CFG-EXEC-6.** `POST /execute/internal` needs the internal token (500
   `Internal API token not configured` when execution has none, 403
   `Invalid internal token` when the header is missing or wrong), runs only `configure`
-  (422 `internal execute is restricted to action='configure'; got '<action>'`), and
-  attributes the run to the body's `user_id`. \
-  Enforced in: `services/execution/app/routers/executions.py` (`internal_execute`, `_require_internal_token`) \
-  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_internal_execute_uses_internal_token`, `test_internal_execute_rejects_non_configure_action`, `test_require_internal_token_rejects_missing`, `test_require_internal_token_errors_when_not_configured`)
+  (422 `internal execute is restricted to action='configure'`, fixed text that never
+  holds the submitted action; issue #1458: it ended `; got '<action>'`, and a lone
+  surrogate in the action made the 422 a 500), and attributes the run to the body's
+  `user_id`. A body holding a lone surrogate anywhere is the shared 422, one
+  `string_unicode` item at `["body"]` (OPS-VALID-6 in `operations-and-observability.md`), answered when the
+  body is read, before the token check, and nothing runs. \
+  Enforced in: `services/execution/app/routers/executions.py` (`internal_execute`, `_require_internal_token`, `INTERNAL_EXECUTE_ACTION_DETAIL`) \
+  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_internal_execute_uses_internal_token`, `test_internal_execute_rejects_non_configure_action`, `test_internal_execute_with_a_lone_surrogate_action_is_422_and_runs_nothing`, `test_require_internal_token_rejects_missing`, `test_require_internal_token_errors_when_not_configured`)
 - **CFG-EXEC-7.** The run's `input_params` is the driver context with every key of a
   `password`-typed template field replaced by `***REDACTED***`, plus the keys CFG-EXEC-8
   and CFG-RUN-6 add. \
@@ -1456,7 +1460,7 @@ status.
 | 422 | `reservation_id must reference an active reservation you own that includes this device`, `reservation_id must reference an active reservation that includes this device` (an admin) | a schedule naming a reservation that fails CFG-JOB-4 or CFG-JOB-5 | CFG-JOB-4, CFG-JOB-5 |
 | 422 | `reservation_id must reference a reservation you own that includes this device`, `reservation_id must reference a reservation that includes this device` (an admin) | a `POST /execute` naming a reservation that fails CFG-EXEC-3 | CFG-EXEC-3 |
 | 422 | `this driver does not advertise dry-run support; refuse to fire a dry-run that would hit the wire` | a dry-run schedule for a driver without dry-run support | CFG-JOB-6 |
-| 422 | `internal execute is restricted to action='configure'; got '<action>'` | `POST /execute/internal` of another action | CFG-EXEC-6 |
+| 422 | `internal execute is restricted to action='configure'` | `POST /execute/internal` of another action | CFG-EXEC-6 |
 | 422 | `Only the Hypervisor connection type is supported for package validation`; `package_b64 is not valid base64`; `package exceeds the <N> byte validation limit`; `package is empty` | a validation request the route refuses | CFG-VAL-1, CFG-VAL-2 |
 | 500 | `Internal API token not configured` | an execution internal route when execution has no token | CFG-EXEC-6, CFG-VAL-1 |
 | 503 | `Could not verify the reservation; nothing was scheduled. Retry the request.` | a schedule whose reservation cannot be checked | CFG-JOB-4 |

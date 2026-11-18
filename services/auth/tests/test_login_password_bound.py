@@ -152,7 +152,7 @@ async def test_ldap_mode_a_long_lone_surrogate_is_still_string_unicode(client, l
     )
     assert response.status_code == 422, response.text
     (error,) = response.json()["detail"]
-    assert (error["type"], error["loc"]) == ("string_unicode", ["body", "password"])
+    assert (error["type"], error["loc"]) == ("string_unicode", ["body"])
     assert ldap_mode == []
 
 
@@ -187,7 +187,7 @@ async def test_a_long_lone_surrogate_is_string_unicode_in_every_mode(client, mon
         )
         assert response.status_code == 422, response.text
         (error,) = response.json()["detail"]
-        assert (error["type"], error["loc"]) == ("string_unicode", ["body", "password"])
+        assert (error["type"], error["loc"]) == ("string_unicode", ["body"])
 
 
 async def test_local_mode_signs_in_with_72(client, judge_calls):

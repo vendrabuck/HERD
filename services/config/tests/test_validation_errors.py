@@ -316,3 +316,13 @@ def test_the_code_comparison_sees_a_one_character_change(tmp_path):
         changed = tmp_path / "changed.py"
         changed.write_text(source.replace(old, new), encoding="utf-8")
         assert _code(changed) != _code(original), old
+
+
+def test_config_installs_its_copy_without_the_body_check():
+    """By decision: config answers a lone surrogate in a password itself (OPS-CONFIG-8),
+    which the shared body check would replace; its settings save refuses one itself
+    (OPS-CONFIG-31). The handler is still installed."""
+    from app.validation_errors import RefuseLoneSurrogates
+
+    assert RefuseLoneSurrogates not in [m.cls for m in app.user_middleware]
+    assert app.exception_handlers[RequestValidationError] is validation_error_handler
