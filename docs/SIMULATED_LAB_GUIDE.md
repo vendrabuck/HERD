@@ -254,9 +254,10 @@ sudo modprobe vrf dummy
 make nos-reset
 ```
 
-GitHub Actions runners are the common case; both CI jobs that touch the lab
-already run this `modprobe` and treat its failure as non-fatal, so the
-affected tests simply skip there too.
+On a GitHub Actions runner the modules are present but not loaded, and both CI
+jobs that touch the lab run this `modprobe` before booting it, so the VRF tests
+run there. Both treat a failed `modprobe` as non-fatal: on a runner image
+without the modules the VRF tests would skip there too, with the job green.
 
 **`make nos-test-feature` fails every test with "the stack rejected the seed
 credentials."** You did not export `SUPERADMIN_EMAIL`/`SUPERADMIN_PASSWORD` (or

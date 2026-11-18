@@ -413,15 +413,46 @@ subclasses `HerdBaseSettings`. The full ladder for operators is in
   resolves from the environment as if the file did not exist. \
   Enforced in: `services/common/herd_common/config_loader.py` (`HerdJsonConfigSource`, `_load_json`) \
   Pinned by: `services/common/tests/test_config_loader.py` (`test_herd_sources_env_applies_for_keys_absent_from_file`, `test_herd_sources_pure_env_when_file_missing`); `services/common/tests/test_base_settings.py` (`test_pure_env_when_config_file_missing`)
-- **OPS-SET-4.** An empty or whitespace-only string in the file means unset, and an
-  unreadable or corrupt file is logged and treated as empty, never as a boot failure. \
-  Enforced in: `services/common/herd_common/config_loader.py` (`HerdJsonConfigSource`, `_load_json`) \
-  Pinned by: `services/common/tests/test_config_loader.py` (`test_source_skips_empty_string_values`, `test_source_falls_back_when_config_json_is_corrupt`)
+- **OPS-SET-4.** An empty or whitespace-only string in the file means unset. A path
+  where nothing exists, not even a link, is a missing file (OPS-SET-3) and logs nothing.
+  Any other path that does not hold a readable JSON object is unusable: unparseable JSON
+  (an empty file and a UTF-8 BOM included), a byte that is not UTF-8 (the file is read
+  as UTF-8 whatever the locale), nesting deeper than the parser allows, an integer over
+  Python's 4300-digit limit, valid JSON that is not an object (a list, a string, a
+  number, a boolean, `null`), an unreadable file, a dangling or looping link, and a path
+  that is not a regular file (a directory, a FIFO, a socket, a device), which is refused
+  from its `stat` before any read, so a FIFO never blocks the import. What an unusable
+  file does depends on who wrote it, read from the `config.bootstrapped` marker beside
+  it (OPS-SET-2), which every service sees on its read-only `herd-config` mount. With the
+  marker, the file is the first-boot copy of the environment and is ignored with one
+  WARNING naming the path and the reason, so the environment's values, which the copy
+  held, apply. Without it, the file holds the operator's own settings (a config-page
+  save, a file from before the marker existed, a hand edit), and every service but
+  config refuses to start: the settings load raises `ConfigFileUnusable` naming the
+  path, the reason, and the remedy (repair the file, remove it to use the environment,
+  or save the settings again on the config page). Falling back to the environment there
+  could widen access (a saved `AUTH_METHOD=ldap` or `oidc` becoming compose's default
+  `local`, where registration is open) or revive an `AUTH_SECRET_KEY`,
+  `INTERNAL_API_TOKEN`, or superadmin password the operator rotated away from. Neither
+  answer quotes the content. The config service is not one of the refusing services: its
+  own reader, `config_store.load_config`, ignores every unusable path state and content
+  above with a WARNING, marker or not, so it keeps serving its page and the operator can
+  re-save from it. A valid file's values can also stop a service at import: a value of
+  the wrong type (`{"LOG_LEVEL": 5}`) is judged by the field's own validation, as an
+  environment value is, and a refusal is a `ValidationError` naming the field, never the
+  value (`HerdBaseSettings` sets `hide_input_in_errors`); the `POSTGRES_*` parts are
+  OPS-SET-5's. A `MemoryError` on a huge file is not handled. \
+  Enforced in: `services/common/herd_common/config_loader.py` (`HerdJsonConfigSource`, `_load_json`, `_read_config_object`, `ConfigFileUnusable`, `BOOTSTRAP_MARKER`); `services/config/app/config_store.py` (`load_config`, `_read_config_object`) \
+  Pinned by: `services/common/tests/test_config_loader.py` (`test_source_skips_empty_string_values`, `test_source_falls_back_when_config_json_is_corrupt`, `test_unusable_bootstrap_copy_is_ignored_with_one_warning`, `test_unusable_bootstrap_copy_leaves_every_key_to_the_environment`, `test_unusable_operator_file_refuses_to_start`, `test_unusable_path_state_is_judged_by_who_wrote_it_without_blocking`, `test_readable_file_is_read_whoever_wrote_it`, `test_missing_config_file_logs_nothing`, `test_missing_config_file_with_a_marker_logs_nothing`, `test_link_to_a_readable_file_is_read`, `test_config_file_is_read_as_utf8_whatever_the_locale`); `services/acl/tests/test_settings_config_file.py` (`test_settings_load_from_the_environment_over_an_unusable_bootstrap_copy`, `test_settings_refuse_to_load_over_an_unusable_operator_file`, `test_settings_load_a_valid_file_whose_postgres_parts_form_no_url`, `test_settings_still_read_a_readable_file`); `services/user-profile/tests/test_settings_config_file.py` (`test_settings_load_from_the_environment_over_an_unusable_bootstrap_copy`, `test_settings_refuse_to_load_over_an_unusable_operator_file`, `test_settings_load_a_valid_file_whose_postgres_parts_form_no_url`, `test_settings_still_read_a_readable_file`); `services/config/tests/test_load_config.py` (`test_load_config_ignores_an_unusable_file_naming_only_the_reason`, `test_load_config_refuses_a_path_that_is_not_a_regular_file_without_blocking`, `test_load_config_logs_nothing_for_a_missing_file`, `test_load_config_reads_utf8_whatever_the_locale`)
 - **OPS-SET-5.** The file's `AUTH_*` keys map to the services' unprefixed names, and the
   file's `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` build a percent-encoded
-  `DATABASE_URL` against `postgres:5432` only when all three are set. \
-  Enforced in: `services/common/herd_common/config_loader.py` (`_KEY_MAP`, `_build_database_url`) \
-  Pinned by: `services/common/tests/test_config_loader.py` (`test_source_maps_auth_keys`, `test_source_builds_database_url_when_postgres_fields_present`, `test_source_url_encodes_special_chars_in_password`, `test_source_skips_database_url_when_postgres_incomplete`)
+  `DATABASE_URL` against `postgres:5432` only when all three are set; `null`, an empty
+  string, and a whitespace-only string are unset (OPS-SET-4). A part that is a string
+  is used as is; an integer or a float is used as Python writes it (`12345`, `1.5`; `1e3`
+  becomes `1000.0`). A part that is a boolean, a list, an object, or a string holding a
+  lone surrogate derives no URL, and one WARNING names the keys, never the values. \
+  Enforced in: `services/common/herd_common/config_loader.py` (`_KEY_MAP`, `_build_database_url`, `_is_unset`, `_url_part`) \
+  Pinned by: `services/common/tests/test_config_loader.py` (`test_source_maps_auth_keys`, `test_source_builds_database_url_when_postgres_fields_present`, `test_source_url_encodes_special_chars_in_password`, `test_source_skips_database_url_when_postgres_incomplete`, `test_postgres_part_that_is_a_number_builds_the_url_from_its_text`, `test_postgres_part_that_cannot_be_url_text_leaves_database_url_underived`, `test_postgres_part_that_is_unset_leaves_database_url_underived_silently`)
 - **OPS-SET-6.** A `DATABASE_URL` in the environment always beats the file-derived one,
   in both orders. \
   Enforced in: `services/common/herd_common/config_loader.py` (`HerdJsonConfigSource`) \
@@ -555,9 +586,16 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   valid UTF-8 text`. Before these issues eight NULs were accepted (and then the empty
   password signed in), a lone surrogate was a 500, and the length refusals were a
   validation list that echoed the password. A body whose `new_password` is missing or
-  not a string is OPS-CONFIG-30's validation list. \
-  Enforced in: `services/config/app/main.py` (`change_password_endpoint`, `ChangePasswordRequest`); `services/config/app/config_store.py` (`password_problem`, `new_password_problem`, `change_password`, `_hash_password`, `InvalidPassword`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_change_password`, `test_change_password_too_short`, `test_change_password_too_long`, `test_change_password_unauthenticated`); `services/config/tests/test_config_passwords.py` (`test_change_password_refuses_an_illegal_password_without_echo_and_keeps_the_file`, `test_change_password_accepts_every_other_password_and_it_signs_in`, `test_password_problem_enumerates_the_space`, `test_every_legal_password_in_the_space_hashes_and_signs_in`, `test_new_password_problem_checks_the_bound_in_characters_then_the_rule`, `test_an_illegal_password_never_reaches_bcrypt`, `test_new_password_problem_counts_characters`, `test_change_password_bound_counts_characters_over_http`)
+  not a string is OPS-CONFIG-30's validation list. The config page judges the same
+  bound before it sends, counting code points (`configPasswordLengthOk`), and refuses
+  nothing else, so it is never stricter than the route; its inputs carry no `minlength`
+  or `maxlength`, which count UTF-16 units (an emoji is two) and cut a pasted value. It
+  sends the password unchanged, shows a 422 string `detail` from this route as is, and
+  shows `Failed to change password` for every other failure, the 503 and a validation
+  list included. Before issue #1452 the page refused 17 to 32 emoji, cut a pasted
+  value at 32 units, and showed only the generic text for every refusal. \
+  Enforced in: `services/config/app/main.py` (`change_password_endpoint`, `ChangePasswordRequest`); `services/config/app/config_store.py` (`password_problem`, `new_password_problem`, `change_password`, `_hash_password`, `InvalidPassword`); `frontend/src/lib/configPassword.ts` (`codePointLength`, `configPasswordLengthOk`); `frontend/src/lib/errors.ts` (`configChangePasswordErrorText`, `CONFIG_CHANGE_PASSWORD_FALLBACK`); `frontend/src/pages/ConfigPage.tsx` (`PasswordChange`) \
+  Pinned by: `frontend/src/test/lib/configPassword.test.ts` (`codePointLength (issue #1452)`, `configPasswordLengthOk (issue #1452, OPS-CONFIG-8)`, `configChangePasswordErrorText (issue #1452)`); `frontend/src/test/pages/ConfigPage.test.tsx` (`ConfigPage change password (issue #1452)`); `services/config/tests/test_config.py` (`test_change_password`, `test_change_password_too_short`, `test_change_password_too_long`, `test_change_password_unauthenticated`); `services/config/tests/test_config_passwords.py` (`test_change_password_refuses_an_illegal_password_without_echo_and_keeps_the_file`, `test_change_password_accepts_every_other_password_and_it_signs_in`, `test_password_problem_enumerates_the_space`, `test_every_legal_password_in_the_space_hashes_and_signs_in`, `test_new_password_problem_checks_the_bound_in_characters_then_the_rule`, `test_an_illegal_password_never_reaches_bcrypt`, `test_new_password_problem_counts_characters`, `test_change_password_bound_counts_characters_over_http`)
 - **OPS-CONFIG-9.** `PUT /settings` and `POST /apply` answer 403 `Change the config
   password before modifying or applying configuration` until the password is rotated,
   read on every request as OPS-CONFIG-4 reads it: a session issued before the auth file
