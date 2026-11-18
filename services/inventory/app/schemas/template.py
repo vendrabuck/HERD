@@ -48,9 +48,12 @@ class FieldDefinition(BaseModel):
                 if not isinstance(self.default, str):
                     raise ValueError("Default for dropdown field must be a string")
                 if self.default not in self.options:
-                    raise ValueError(
-                        f"Default '{self.default}' is not in options: {', '.join(self.options)}"
-                    )
+                    # Each submitted value is quoted with repr: a plain `str` takes a
+                    # lone surrogate, and pydantic-core cannot build an error whose
+                    # message holds one (it raises UnicodeEncodeError, a 500), while
+                    # repr writes it as its escape (herd_common.validation_errors).
+                    options = ", ".join(repr(option) for option in self.options)
+                    raise ValueError(f"Default {self.default!r} is not in options: {options}")
         return self
 
 

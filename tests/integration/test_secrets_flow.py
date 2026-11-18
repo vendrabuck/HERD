@@ -121,6 +121,25 @@ async def test_non_admin_cannot_create_or_rotate(user_client):
     assert resp.status_code == 403
 
 
+async def test_a_refused_create_never_echoes_the_plaintext(admin_client):
+    """Issue #1455, through the gateway: a create without `name` is refused before
+    anything is stored, and the 422 names the missing field without sending the
+    plaintext `data` back (FastAPI's default put the whole body in `input`). A lone
+    surrogate in the body is the same clean 422, never a 500."""
+    for raw in (
+        b'{"type": "password", "data": {"password": "' + CANARY.encode() + b'"}}',
+        b'{"data": {"password": "' + CANARY.encode() + b'\\ud800"}}',
+    ):
+        resp = await admin_client.post(
+            "/secrets/secrets", content=raw, headers={"content-type": "application/json"}
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert [set(error) for error in detail] == [{"type", "loc", "msg"}] * len(detail)
+        assert ["body", "name"] in [error["loc"] for error in detail]
+        assert CANARY.encode() not in resp.content
+
+
 async def test_rotation_preserves_plaintext(admin_client, secret):
     before = (await admin_client.get(f"/secrets/secrets/{secret['id']}")).json()["key_version"]
     rotate = await admin_client.post("/secrets/keys/rotate")
