@@ -4,6 +4,7 @@ import importlib
 import json
 import logging
 import os
+import threading
 
 import pytest
 from pydantic_settings import BaseSettings
@@ -175,49 +176,103 @@ def test_source_falls_back_when_config_json_is_corrupt(tmp_path, monkeypatch):
     assert source() == {}
 
 
-# --- No content of config.json stops a service from starting (#1451) ----------------
+# --- A config.json that is not a readable JSON object (#1451) ----------------------
 
-# The two WARNING lines, exactly; {path} is filled with the file's path.
-_CORRUPT = "Ignoring corrupt HERD config file {{path}} ({cls})"
-_NOT_OBJECT = "Ignoring HERD config file {{path}}: not a JSON object ({cls})"
-
-# Every content that is not a readable JSON object, with the WARNING it logs.
+# Every content that is not a readable JSON object, with the reason the WARNING names.
 # Built as bytes so the not-UTF-8 and the BOM cases are exact; the deep nesting is
 # past CPython's default recursion limit and the integer past its 4300-digit limit.
 _UNUSABLE_CONTENTS = [
-    pytest.param(b"{broken", _CORRUPT.format(cls="JSONDecodeError"), id="unparseable"),
-    pytest.param(b"", _CORRUPT.format(cls="JSONDecodeError"), id="empty-file"),
-    pytest.param(b"  \n", _CORRUPT.format(cls="JSONDecodeError"), id="whitespace-only"),
+    pytest.param(b"{broken", "JSONDecodeError", id="unparseable"),
+    pytest.param(b"", "JSONDecodeError", id="empty-file"),
+    pytest.param(b"  \n", "JSONDecodeError", id="whitespace-only"),
+    pytest.param(b'{"CORS_ORIGINS": "\xff"}', "UnicodeDecodeError", id="not-utf8"),
+    pytest.param(b'\xef\xbb\xbf{"CORS_ORIGINS": "x"}', "JSONDecodeError", id="utf8-bom"),
+    pytest.param(b"[" * 100_000 + b"]" * 100_000, "RecursionError", id="nested-too-deep"),
     pytest.param(
-        b'{"CORS_ORIGINS": "\xff"}', _CORRUPT.format(cls="UnicodeDecodeError"), id="not-utf8"
+        b'{"CORS_ORIGINS": ' + b"9" * 5000 + b"}", "ValueError", id="int-over-digit-limit"
     ),
-    pytest.param(
-        b'\xef\xbb\xbf{"CORS_ORIGINS": "x"}', _CORRUPT.format(cls="JSONDecodeError"), id="utf8-bom"
-    ),
-    pytest.param(
-        b"[" * 100_000 + b"]" * 100_000, _CORRUPT.format(cls="RecursionError"), id="nested-too-deep"
-    ),
-    pytest.param(
-        b'{"CORS_ORIGINS": ' + b"9" * 5000 + b"}",
-        _CORRUPT.format(cls="ValueError"),
-        id="int-over-digit-limit",
-    ),
-    pytest.param(b"[1, 2]", _NOT_OBJECT.format(cls="list"), id="list"),
-    pytest.param(b'"CORS_ORIGINS"', _NOT_OBJECT.format(cls="str"), id="string"),
-    pytest.param(b"42", _NOT_OBJECT.format(cls="int"), id="number"),
-    pytest.param(b"1.5", _NOT_OBJECT.format(cls="float"), id="float"),
-    pytest.param(b"null", _NOT_OBJECT.format(cls="NoneType"), id="null"),
-    pytest.param(b"true", _NOT_OBJECT.format(cls="bool"), id="true"),
+    pytest.param(b"[1, 2]", "not a JSON object: list", id="list"),
+    pytest.param(b'"CORS_ORIGINS"', "not a JSON object: str", id="string"),
+    pytest.param(b"42", "not a JSON object: int", id="number"),
+    pytest.param(b"1.5", "not a JSON object: float", id="float"),
+    pytest.param(b"null", "not a JSON object: NoneType", id="null"),
+    pytest.param(b"true", "not a JSON object: bool", id="true"),
 ]
+
+
+def _unusable_path_states():
+    """(id, builder, reason) for every path state that is not a readable regular file.
+
+    Each builder makes the state at the given path and returns a cleanup callable.
+    """
+
+    def directory(path):
+        path.mkdir()
+        return lambda: None
+
+    def fifo(path):
+        os.mkfifo(path)
+        return lambda: None
+
+    def dangling_link(path):
+        path.symlink_to(path.parent / "no-such-target.json")
+        return lambda: None
+
+    def looping_link(path):
+        other = path.parent / "loop-b.json"
+        path.symlink_to(other)
+        other.symlink_to(path)
+        return lambda: None
+
+    def unreadable(path):
+        path.write_text(json.dumps({"CORS_ORIGINS": "https://from-file"}))
+        path.chmod(0)
+        return lambda: path.chmod(0o600)
+
+    states = [
+        pytest.param(directory, "not a regular file: directory", id="directory"),
+        pytest.param(fifo, "not a regular file: FIFO", id="fifo"),
+        pytest.param(dangling_link, "FileNotFoundError", id="dangling-link"),
+        pytest.param(looping_link, "OSError", id="looping-link"),
+    ]
+    if os.geteuid() != 0:  # root reads a mode-000 file
+        states.append(pytest.param(unreadable, "PermissionError", id="unreadable"))
+    return states
+
+
+_UNUSABLE_PATH_STATES = _unusable_path_states()
 
 
 def _loader_warnings(caplog):
     return [r for r in caplog.records if r.name == "herd_common.config_loader"]
 
 
-@pytest.mark.parametrize(("content", "expected"), _UNUSABLE_CONTENTS)
+def _call_with_deadline(fn, seconds=5.0):
+    """fn()'s result, or a test failure when it has not returned in `seconds`.
+
+    A read of a FIFO with no writer blocks forever; a daemon thread keeps such a
+    regression a failure instead of a hung run.
+    """
+    result = {}
+
+    def target():
+        try:
+            result["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            result["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    assert not thread.is_alive(), f"blocked for over {seconds} s"
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
+
+
+@pytest.mark.parametrize(("content", "reason"), _UNUSABLE_CONTENTS)
 def test_unusable_config_file_is_ignored_with_one_warning(
-    tmp_path, monkeypatch, caplog, content, expected
+    tmp_path, monkeypatch, caplog, content, reason
 ):
     config_file = tmp_path / "config.json"
     config_file.write_bytes(content)
@@ -233,13 +288,15 @@ def test_unusable_config_file_is_ignored_with_one_warning(
     records = _loader_warnings(caplog)
     assert len(records) == 1
     assert records[0].levelno == logging.WARNING
-    # Names the path and the class, never the content.
-    assert records[0].getMessage() == expected.format(path=config_file)
+    # Names the path and the reason, never the content.
+    assert records[0].getMessage() == (
+        f"Ignoring unusable HERD config file {config_file} ({reason})"
+    )
 
 
-@pytest.mark.parametrize(("content", "expected"), _UNUSABLE_CONTENTS)
+@pytest.mark.parametrize(("content", "reason"), _UNUSABLE_CONTENTS)
 def test_unusable_config_file_leaves_every_key_to_the_environment(
-    tmp_path, monkeypatch, content, expected
+    tmp_path, monkeypatch, content, reason
 ):
     # OPS-SET-3 and OPS-SET-4: the file is treated as missing, in file-first order.
     config_file = tmp_path / "config.json"
@@ -252,48 +309,53 @@ def test_unusable_config_file_leaves_every_key_to_the_environment(
     assert settings.log_level == "INFO"
 
 
-def test_directory_in_place_of_config_file_is_ignored(tmp_path, monkeypatch, caplog):
-    config_dir = tmp_path / "config.json"
-    config_dir.mkdir()
-    loader = _reload_loader(monkeypatch, str(config_dir))
-    caplog.set_level(logging.WARNING, logger="herd_common.config_loader")
-    monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
-
-    settings = _herd_ordered_settings(loader)()
-    assert settings.cors_origins == "https://from-env"
-    records = _loader_warnings(caplog)
-    assert len(records) == 1
-    assert records[0].getMessage() == _CORRUPT.format(cls="IsADirectoryError").format(
-        path=config_dir
-    )
-
-
-@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
-def test_unreadable_config_file_is_ignored(tmp_path, monkeypatch, caplog):
+@pytest.mark.parametrize(("make_state", "reason"), _UNUSABLE_PATH_STATES)
+def test_unusable_path_state_is_ignored_with_one_warning_without_blocking(
+    tmp_path, monkeypatch, caplog, make_state, reason
+):
+    # A path that is not a readable regular file is refused before any read, so a
+    # FIFO never blocks import; a dangling or looping link is unusable, not missing.
     config_file = tmp_path / "config.json"
-    config_file.write_text(json.dumps({"CORS_ORIGINS": "https://from-file"}))
-    config_file.chmod(0)
-    loader = _reload_loader(monkeypatch, str(config_file))
-    caplog.set_level(logging.WARNING, logger="herd_common.config_loader")
-    monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
-
+    cleanup = make_state(config_file)
     try:
-        settings = _herd_ordered_settings(loader)()
+        loader = _reload_loader(monkeypatch, str(config_file))
+        caplog.set_level(logging.WARNING, logger="herd_common.config_loader")
+        monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
+        settings = _call_with_deadline(_herd_ordered_settings(loader))
     finally:
-        config_file.chmod(0o600)
+        cleanup()
     assert settings.cors_origins == "https://from-env"
     records = _loader_warnings(caplog)
-    assert len(records) == 1
-    assert records[0].getMessage() == _CORRUPT.format(cls="PermissionError").format(
-        path=config_file
-    )
+    assert [r.getMessage() for r in records] == [
+        f"Ignoring unusable HERD config file {config_file} ({reason})"
+    ]
+
+
+def test_missing_config_file_logs_nothing(tmp_path, monkeypatch, caplog):
+    loader = _reload_loader(monkeypatch, str(tmp_path / "config.json"))
+    caplog.set_level(logging.DEBUG, logger="herd_common.config_loader")
+    monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
+
+    assert _herd_ordered_settings(loader)().cors_origins == "https://from-env"
+    assert _loader_warnings(caplog) == []
+
+
+def test_link_to_a_readable_file_is_read(tmp_path, monkeypatch):
+    target = tmp_path / "real.json"
+    target.write_text(json.dumps({"CORS_ORIGINS": "https://from-file"}))
+    config_file = tmp_path / "config.json"
+    config_file.symlink_to(target)
+    loader = _reload_loader(monkeypatch, str(config_file))
+    monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
+
+    assert _herd_ordered_settings(loader)().cors_origins == "https://from-file"
 
 
 def test_config_file_is_read_as_utf8_whatever_the_locale(tmp_path, monkeypatch):
     # A non-ASCII value reads the same under a C or ASCII locale as under UTF-8:
     # the loader names the encoding instead of inheriting the container's.
     config_file = tmp_path / "config.json"
-    config_file.write_bytes('{"CORS_ORIGINS": "https://caf\u00e9.example"}'.encode())
+    config_file.write_bytes('{"CORS_ORIGINS": "https://café.example"}'.encode())
     loader = _reload_loader(monkeypatch, str(config_file))
     real_open = open
 
@@ -302,46 +364,99 @@ def test_config_file_is_read_as_utf8_whatever_the_locale(tmp_path, monkeypatch):
         return real_open(file, mode, *args, encoding=encoding or "ascii", **kwargs)
 
     monkeypatch.setattr("builtins.open", ascii_default_open)
-    assert loader._load_json() == {"CORS_ORIGINS": "https://caf\u00e9.example"}
+    assert loader._load_json() == {"CORS_ORIGINS": "https://café.example"}
 
 
-@pytest.mark.parametrize(
-    ("parts", "not_text"),
-    [
-        pytest.param({"POSTGRES_USER": 5}, "POSTGRES_USER", id="number-user"),
-        pytest.param({"POSTGRES_DB": 1.5}, "POSTGRES_DB", id="float-db"),
-        pytest.param({"POSTGRES_DB": {"a": 1}}, "POSTGRES_DB", id="object-db"),
-        pytest.param({"POSTGRES_PASSWORD": ["pw"]}, "POSTGRES_PASSWORD", id="list-password"),
-        pytest.param({"POSTGRES_PASSWORD": True}, "POSTGRES_PASSWORD", id="true-password"),
-        pytest.param(
-            {"POSTGRES_PASSWORD": "\ud800"}, "POSTGRES_PASSWORD", id="lone-surrogate-password"
-        ),
-    ],
-)
-def test_postgres_part_that_is_not_text_leaves_database_url_underived(
-    tmp_path, monkeypatch, caplog, parts, not_text
-):
-    # A valid object whose POSTGRES_* part is not text: URL.create raised TypeError,
-    # the rendering UnicodeEncodeError, at import; a list or boolean password was
-    # stringified into a wrong URL. The URL is now left to the environment, with one
-    # WARNING naming the key and never the value.
+_POSTGRES = {"POSTGRES_USER": "herd", "POSTGRES_PASSWORD": "pw", "POSTGRES_DB": "herd"}
+
+
+def _derived_url(tmp_path, monkeypatch, parts):
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    content = {"POSTGRES_USER": "herd", "POSTGRES_PASSWORD": "pw", "POSTGRES_DB": "herd"}
-    content.update(parts)
     config_file = tmp_path / "config.json"
-    config_file.write_text(json.dumps(content))
+    config_file.write_text(json.dumps({**_POSTGRES, **parts}))
     loader = _reload_loader(monkeypatch, str(config_file))
-    caplog.set_level(logging.WARNING, logger="herd_common.config_loader")
 
     class S(BaseSettings):
         database_url: str = ""
 
-    assert "database_url" not in loader.HerdJsonConfigSource(S)()
-    records = _loader_warnings(caplog)
-    assert len(records) == 1
-    assert records[0].getMessage() == (
-        f"Not deriving DATABASE_URL from HERD config file {config_file}: {not_text} must be text"
-    )
+    return config_file, loader.HerdJsonConfigSource(S)().get("database_url")
+
+
+@pytest.mark.parametrize(
+    ("parts", "user_password_db"),
+    [
+        pytest.param({"POSTGRES_PASSWORD": 12345}, ("herd", "12345", "herd"), id="int-password"),
+        pytest.param({"POSTGRES_PASSWORD": 1.5}, ("herd", "1.5", "herd"), id="float-password"),
+        pytest.param({"POSTGRES_PASSWORD": 0}, ("herd", "0", "herd"), id="zero-password"),
+        pytest.param({"POSTGRES_USER": 5}, ("5", "pw", "herd"), id="int-user"),
+        pytest.param({"POSTGRES_USER": 2.5}, ("2.5", "pw", "herd"), id="float-user"),
+        pytest.param({"POSTGRES_DB": 7}, ("herd", "pw", "7"), id="int-db"),
+        pytest.param({"POSTGRES_DB": 1.5}, ("herd", "pw", "1.5"), id="float-db"),
+        pytest.param(
+            {"POSTGRES_PASSWORD": "a\x00b"}, ("herd", "a\x00b", "herd"), id="nul-password"
+        ),
+    ],
+)
+def test_postgres_part_that_is_a_number_builds_the_url_from_its_text(
+    tmp_path, monkeypatch, parts, user_password_db
+):
+    # A numeric password rendered as its digits before #1451 and still does; a
+    # numeric user or database, which raised TypeError at import, now does too.
+    _, url = _derived_url(tmp_path, monkeypatch, parts)
+    parsed = make_url(url)
+    assert (parsed.username, parsed.password, parsed.database) == user_password_db
+    assert (parsed.host, parsed.port) == ("postgres", 5432)
+
+
+@pytest.mark.parametrize(
+    ("parts", "not_usable"),
+    [
+        pytest.param({"POSTGRES_PASSWORD": True}, "POSTGRES_PASSWORD", id="true-password"),
+        pytest.param({"POSTGRES_PASSWORD": False}, "POSTGRES_PASSWORD", id="false-password"),
+        pytest.param({"POSTGRES_PASSWORD": ["pw"]}, "POSTGRES_PASSWORD", id="list-password"),
+        pytest.param({"POSTGRES_PASSWORD": {"a": 1}}, "POSTGRES_PASSWORD", id="object-password"),
+        pytest.param(
+            {"POSTGRES_PASSWORD": "\ud800"}, "POSTGRES_PASSWORD", id="lone-surrogate-password"
+        ),
+        pytest.param({"POSTGRES_USER": True}, "POSTGRES_USER", id="true-user"),
+        pytest.param({"POSTGRES_USER": ["u"]}, "POSTGRES_USER", id="list-user"),
+        pytest.param({"POSTGRES_USER": "\udc00"}, "POSTGRES_USER", id="lone-surrogate-user"),
+        pytest.param({"POSTGRES_DB": {"a": 1}}, "POSTGRES_DB", id="object-db"),
+        pytest.param({"POSTGRES_DB": False}, "POSTGRES_DB", id="false-db"),
+        pytest.param(
+            {"POSTGRES_USER": [1], "POSTGRES_DB": True}, "POSTGRES_USER, POSTGRES_DB", id="two-keys"
+        ),
+    ],
+)
+def test_postgres_part_that_cannot_be_url_text_leaves_database_url_underived(
+    tmp_path, monkeypatch, caplog, parts, not_usable
+):
+    # Before #1451 a non-string user or database raised TypeError and a lone
+    # surrogate UnicodeEncodeError at import, and a list, object, or boolean
+    # password was stringified into a wrong URL. Now the URL is left to the
+    # environment, with one WARNING naming the keys and never the values.
+    caplog.set_level(logging.WARNING, logger="herd_common.config_loader")
+    config_file, url = _derived_url(tmp_path, monkeypatch, parts)
+    assert url is None
+    assert [r.getMessage() for r in _loader_warnings(caplog)] == [
+        f"Not deriving DATABASE_URL from HERD config file {config_file}: "
+        f"{not_usable} must be text or a number"
+    ]
+
+
+@pytest.mark.parametrize("key", ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"])
+@pytest.mark.parametrize(
+    "value", [None, "", "   ", "\t\n"], ids=["null", "empty", "spaces", "tab-newline"]
+)
+def test_postgres_part_that_is_unset_leaves_database_url_underived_silently(
+    tmp_path, monkeypatch, caplog, key, value
+):
+    # OPS-SET-4: an empty or whitespace-only string means unset; before this, a
+    # whitespace-only part was used and built a URL such as `   :pw@postgres`.
+    caplog.set_level(logging.WARNING, logger="herd_common.config_loader")
+    _, url = _derived_url(tmp_path, monkeypatch, {key: value})
+    assert url is None
+    assert _loader_warnings(caplog) == []
 
 
 def _herd_ordered_settings(loader):

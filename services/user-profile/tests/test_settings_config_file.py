@@ -7,6 +7,8 @@ exactly as with no file (OPS-SET-3).
 """
 
 import json
+import os
+import threading
 
 import pytest
 from app.config import Settings
@@ -24,8 +26,16 @@ _UNUSABLE_CONTENTS = [
     pytest.param(b"null", id="null"),
     pytest.param(b"true", id="true"),
     pytest.param(
-        json.dumps({"POSTGRES_USER": 5, "POSTGRES_PASSWORD": "pw", "POSTGRES_DB": "herd"}).encode(),
-        id="number-postgres-user",
+        json.dumps(
+            {"POSTGRES_USER": ["u"], "POSTGRES_PASSWORD": "pw", "POSTGRES_DB": "herd"}
+        ).encode(),
+        id="list-postgres-user",
+    ),
+    pytest.param(
+        json.dumps(
+            {"POSTGRES_USER": "u", "POSTGRES_PASSWORD": "\ud800", "POSTGRES_DB": "d"}
+        ).encode(),
+        id="lone-surrogate-postgres-password",
     ),
 ]
 
@@ -44,12 +54,32 @@ def test_settings_load_from_the_environment_whatever_the_file_holds(tmp_path, mo
     assert settings.log_level == "DEBUG"
 
 
-def test_settings_load_from_a_directory_in_place_of_the_file(tmp_path, monkeypatch):
-    config_dir = tmp_path / "config.json"
-    config_dir.mkdir()
-    monkeypatch.setattr(config_loader, "CONFIG_FILE", str(config_dir))
+def _directory(path):
+    path.mkdir()
 
-    assert Settings().database_url == "sqlite+aiosqlite:///:memory:"
+
+def _fifo(path):
+    os.mkfifo(path)
+
+
+def _dangling_link(path):
+    path.symlink_to(path.parent / "no-such-target.json")
+
+
+@pytest.mark.parametrize("make_state", [_directory, _fifo, _dangling_link])
+def test_settings_load_from_the_environment_whatever_is_at_the_path(
+    tmp_path, monkeypatch, make_state
+):
+    # A FIFO is refused before any read: the load returns instead of blocking.
+    config_file = tmp_path / "config.json"
+    make_state(config_file)
+    monkeypatch.setattr(config_loader, "CONFIG_FILE", str(config_file))
+    result = {}
+    thread = threading.Thread(target=lambda: result.update(settings=Settings()), daemon=True)
+    thread.start()
+    thread.join(5)
+    assert not thread.is_alive(), "the settings load blocked"
+    assert result["settings"].database_url == "sqlite+aiosqlite:///:memory:"
 
 
 def test_settings_still_read_a_readable_file(tmp_path, monkeypatch):

@@ -9,6 +9,7 @@ the user-facing config keys to service-specific env var names.
 import json
 import logging
 import os
+import stat
 from typing import Any
 
 from pydantic.fields import FieldInfo
@@ -37,58 +38,89 @@ _DATABASE_URL_KEYS = ("POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB")
 def _load_json() -> dict:
     """The parsed config.json object, or {} when there is none to use (OPS-SET-4).
 
-    No content of the file may stop a service from starting: every service but
-    config builds its settings from this at import. A file that is not a
-    readable JSON object is ignored with one WARNING naming the failure's class
-    (never the content), so environment values and model defaults apply,
-    exactly as for a missing file. MemoryError on a huge file is not handled.
+    A missing path (nothing there, not even a link) is not an error and logs
+    nothing (OPS-SET-3). Anything else that is not a readable JSON object is
+    ignored with one WARNING naming the path and the reason, never the content,
+    so environment values and model defaults apply. MemoryError on a huge file is
+    not handled.
     """
-    if not os.path.exists(CONFIG_FILE):
+    if not os.path.lexists(CONFIG_FILE):
         return {}
+    loaded, reason = _read_config_object(CONFIG_FILE)
+    if reason is not None:
+        logger.warning("Ignoring unusable HERD config file %s (%s)", CONFIG_FILE, reason)
+        return {}
+    return loaded
+
+
+def _read_config_object(path: str) -> tuple[dict, None] | tuple[None, str]:
+    """(object, None) for a regular file holding a JSON object, else (None, reason).
+
+    The reason is an exception's class name, `not a regular file: <kind>`, or
+    `not a JSON object: <type>`; it never quotes the content. The path is checked
+    with stat (following links) before it is opened, so a FIFO or a device is
+    refused without a read that could block import forever, and a dangling or
+    looping link is refused by its OSError. The open is non-blocking and the
+    descriptor is checked again, so a path swapped after the stat is refused too.
+    """
     try:
+        mode = os.stat(path).st_mode
+        if not stat.S_ISREG(mode):
+            return None, f"not a regular file: {_file_kind(mode)}"
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
         # An explicit encoding: the answer must not depend on the container's locale.
-        with open(CONFIG_FILE, encoding="utf-8") as f:
+        with open(fd, encoding="utf-8") as f:
+            mode = os.fstat(f.fileno()).st_mode
+            if not stat.S_ISREG(mode):
+                return None, f"not a regular file: {_file_kind(mode)}"
             loaded = json.load(f)
     except (ValueError, RecursionError, OSError) as exc:
         # ValueError covers JSONDecodeError (an empty or truncated file included),
         # a byte that is not UTF-8 (UnicodeDecodeError), and an integer over
         # Python's digit limit; RecursionError is nesting deeper than the parser
-        # allows; OSError is an unreadable path, a directory included. The same
-        # tuple the config service's own loader catches (config_store.load_config).
-        logger.warning("Ignoring corrupt HERD config file %s (%s)", CONFIG_FILE, type(exc).__name__)
-        return {}
+        # allows; OSError is an unreadable file or a dangling or looping link.
+        return None, type(exc).__name__
     if not isinstance(loaded, dict):
         # Valid JSON that is not an object (a list, a string, a number, true,
-        # null) holds no settings; treat it like a corrupt file, naming the
-        # class only, never the value.
-        logger.warning(
-            "Ignoring HERD config file %s: not a JSON object (%s)",
-            CONFIG_FILE,
-            type(loaded).__name__,
-        )
-        return {}
-    return loaded
+        # null) holds no settings; named by its type only, never its value.
+        return None, f"not a JSON object: {type(loaded).__name__}"
+    return loaded, None
+
+
+def _file_kind(mode: int) -> str:
+    for test, kind in (
+        (stat.S_ISDIR, "directory"),
+        (stat.S_ISFIFO, "FIFO"),
+        (stat.S_ISSOCK, "socket"),
+        (stat.S_ISCHR, "character device"),
+        (stat.S_ISBLK, "block device"),
+    ):
+        if test(mode):
+            return kind
+    return "other"
 
 
 def _build_database_url(data: dict) -> str | None:
     parts = {key: data.get(key) for key in _DATABASE_URL_KEYS}
-    if not all(parts.values()):
-        # A missing or empty part leaves the URL underived (OPS-SET-5).
+    if any(_is_unset(value) for value in parts.values()):
+        # A missing, null, empty, or whitespace-only part leaves the URL underived
+        # (OPS-SET-4: such a string means unset; OPS-SET-5).
         return None
-    not_text = [key for key, value in parts.items() if not _is_url_text(value)]
-    if not_text:
-        # A part that is not text leaves it underived too: URL.create raises
-        # TypeError on a non-string username or database and the rendering raises
-        # UnicodeEncodeError on a lone surrogate, either of which would stop the
-        # service at import, and a list or a boolean password would be stringified
-        # into a wrong URL. The log names the keys, never the values.
+    not_usable = [key for key, value in parts.items() if _url_part(value) is None]
+    if not_usable:
+        # A boolean, list, or object part leaves it underived too, and so does a
+        # string holding a lone surrogate: URL.create raised TypeError on a
+        # non-string username or database, the rendering raised UnicodeEncodeError
+        # on a lone surrogate, either of which stopped the service at import, and
+        # a list, object, or boolean password was stringified into a wrong URL.
+        # The log names the keys, never the values.
         logger.warning(
-            "Not deriving DATABASE_URL from HERD config file %s: %s must be text",
+            "Not deriving DATABASE_URL from HERD config file %s: %s must be text or a number",
             CONFIG_FILE,
-            ", ".join(not_text),
+            ", ".join(not_usable),
         )
         return None
-    user, password, db = parts.values()
+    user, password, db = (_url_part(value) for value in parts.values())
     # Use URL.create so each component is percent-encoded; a raw f-string
     # breaks on passwords containing @ : / # ? [ ] (issue #209).
     url = URL.create(
@@ -102,15 +134,29 @@ def _build_database_url(data: dict) -> str | None:
     return url.render_as_string(hide_password=False)
 
 
-def _is_url_text(value: object) -> bool:
-    """True for a string that encodes as UTF-8 (no lone surrogate)."""
+def _is_unset(value: object) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _url_part(value: object) -> str | None:
+    """The text a URL part is built from, or None when the value cannot be one.
+
+    A string that encodes as UTF-8 is used as is. An int or a float is used as
+    its Python text (`12345`; a float as Python writes it, so `1e3` is `1000.0`),
+    which is what the URL held before #1451 for a numeric password. A boolean (an
+    int to Python), a list, an object, and a lone surrogate are refused.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
     if not isinstance(value, str):
-        return False
+        return None
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
-        return False
-    return True
+        return None
+    return value
 
 
 def is_configured() -> bool:
