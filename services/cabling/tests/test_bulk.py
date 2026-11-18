@@ -1130,3 +1130,29 @@ async def test_a_json_import_with_a_surrogate_pair_escape_is_not_refused(admin_c
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["created"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fmt", "body"),
+    [
+        ("csv", "topology_name,source_device\ncaf\xe9,a\n".encode("latin-1")),
+        ("json", '[{"name": "caf\xe9"}]'.encode("latin-1")),
+        ("json", '[{"name": "x\ud800"}]'.encode("utf-8", "surrogatepass")),
+    ],
+    ids=["latin1_csv", "latin1_json", "raw_surrogate_bytes"],
+)
+async def test_a_non_utf8_import_file_is_422_naming_the_encoding(admin_client, fmt, body):
+    """A file that is not UTF-8 raised UnicodeDecodeError, a 500, as it did on inventory
+    before issue #1022. It is a client input error: a 422 naming the encoding."""
+    before = await _count_versions()
+    resp = await admin_client.post(
+        "/topologies/import",
+        params={"format": fmt},
+        files={"file": (f"t.{fmt}", io.BytesIO(body), "text/plain")},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {
+        "detail": "Import file must be UTF-8 encoded; re-save it as UTF-8 and retry"
+    }
+    assert await _count_versions() == before

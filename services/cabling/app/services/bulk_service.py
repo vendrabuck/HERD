@@ -73,6 +73,18 @@ IMPORT_NOT_TEXT_DETAIL = (
     "Import file holds a lone surrogate escape, which is not valid text; fix it and retry"
 )
 
+# An import file that is not UTF-8 (Latin-1, Windows-1252): a client input error, the
+# same answer inventory's importers give (issue #1022).
+IMPORT_NOT_UTF8_DETAIL = "Import file must be UTF-8 encoded; re-save it as UTF-8 and retry"
+
+
+def _decode_import(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=422, detail=IMPORT_NOT_UTF8_DETAIL) from exc
+
+
 _LOCKED_TOPOLOGY_REASON = (
     "topology is in use by an active reservation owned by another user; "
     "bulk import cannot rewire it"
@@ -223,7 +235,7 @@ def records_to_csv(topologies: list[Topology]) -> str:
 
 def parse_json_topologies(raw: bytes) -> list[dict[str, Any]]:
     try:
-        doc = json.loads(raw.decode("utf-8-sig"))
+        doc = json.loads(_decode_import(raw))
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}") from exc
     if lone_surrogate_locs(doc):
@@ -249,7 +261,7 @@ def parse_csv_topologies(raw: bytes) -> list[dict[str, Any]]:
     edge. Node ids are synthesized deterministically from the device name so an
     edge can reference its endpoints.
     """
-    reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
+    reader = csv.DictReader(io.StringIO(_decode_import(raw)))
     by_topology: dict[str, dict[str, Any]] = {}
     for row in reader:
         # Every cell here may carry a csv_safe_cell neutralization quote
