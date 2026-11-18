@@ -34,7 +34,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
-from app.config import settings
+from app.config import _absolute_url_ok, settings
 from app.models.federated_identity import FederatedIdentity
 from app.models.federated_relink_candidate import (
     FederatedRelinkCandidate,
@@ -771,14 +771,18 @@ async def test_story_the_rewrite_is_refused_when_a_returning_user_was_provisione
     )
     assert resp.status_code == 409
     assert (await identities())[uuid.UUID(account)] == (ISSUER, SUBJECT)
-    # The documented way out with these two routes alone: retire the stray
-    # account's identity to a subject no provider issues, then rewrite.
+    # The documented way out (docs/OPERATIONS.md, "If the rewrite refuses"):
+    # relink the stray account to the reserved issuer urn:herd:retired with its
+    # own id as the subject. Auth never accepts that string as OIDC_ISSUER, so no
+    # token can carry it, and the person's pair under the new issuer is freed.
+    assert not _absolute_url_ok("urn:herd:retired", False)
     retired = await client.put(
         relink_path(stray),
-        json={"issuer": NEW_ISSUER, "subject": f"retired-{stray}"},
+        json={"issuer": "urn:herd:retired", "subject": stray},
         headers=bearer(superadmin),
     )
     assert retired.status_code == 200
+    assert (await identities())[uuid.UUID(stray)] == ("urn:herd:retired", stray)
     resp = await client.post(
         REWRITE,
         json={"old_issuer": ISSUER, "new_issuer": NEW_ISSUER, "dry_run": False},

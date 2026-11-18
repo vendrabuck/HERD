@@ -393,21 +393,44 @@ login (IAM-LDAP-8).
     are one 404. Using a candidate, or relinking by a typed pair, discards every
     candidate of the account.
     - The threat, designed against: anyone who can authenticate at the provider with
-      an account carrying the victim's email can PLANT a candidate. A candidate is
-      therefore only evidence that someone tried to sign in; nothing links from it on
-      its own (the login still refuses), and the superadmin's confirmation is the
-      security step. The runbook requires confirming out of band: note the account's
-      `captured_total`, have the person attempt sign-in at an agreed minute, and
-      relink only when `captured_total` went up by exactly one and exactly one live
-      candidate exists, created in that minute. With more than one live candidate,
-      do not relink; investigate.
+      an account carrying the victim's email can PLANT a candidate. That includes a
+      token with no `email_verified` claim at all, which is accepted and captured
+      (only an explicit `false` is refused, before the collision check), and
+      Microsoft Entra ID normally omits the claim. A candidate is therefore only
+      evidence that someone tried to sign in; nothing links from it on its own (the
+      login still refuses), and the superadmin's confirmation is the security step.
+    - The agreed-minute check binds a candidate to the person by TIME only, and the
+      person's own attempt may leave no candidate at all: their provider email may no
+      longer equal the account's, the attempt may be refused as `username_invalid` or
+      `email_unverified` before the collision check, or the capture may fail (logged
+      as `oidc_relink_candidate_capture_failed`); then the only candidate in the
+      minute could be someone else's. So the runbook (review of 2026-11-18,
+      supervisor's recommendations, pre-approved by the owner) requires, before a
+      relink by candidate: `captured_total` up by exactly one and exactly one live
+      candidate created in the agreed minute; confirmation at the provider that
+      exactly one provider account carries the email and that it is the person's;
+      the person confirming they saw the sign-in failure page at that time; no
+      `oidc_relink_candidate_capture_failed` line in the window; and an out-of-band
+      channel that AUTHENTICATES the person, the help desk choosing the channel and the
+      minute (a call the person places to a number of their choosing is not enough).
+      With more than one live candidate, do not relink; investigate.
+    - Denial of recovery, accepted: any one provider account carrying the email can
+      block the candidate path indefinitely, re-planting every 24 hours so a second
+      candidate is always live. A route to clear candidates would not help, since
+      re-planting is immediate. The way out is the typed-pair relink with a subject
+      read at the provider, or removing the rogue provider account.
     - Bounds: 24 hours from the first capture (a constant, `CANDIDATE_TTL`, like the
       flow store's TTLs), at most 5 live per account and 1000 in all, a repeat of a
       pair only bumping `attempts` and `last_seen_at`. Eviction drops the OLDEST, by
       choice: dropping the newest would let a planter who filled the slots first keep
-      the person's own attempt out for a day, while dropping the oldest can only push
-      the person's candidate out by adding at least four more, and with any second
-      candidate live the runbook already forbids a relink. Flooding stays visible:
+      the person's own attempt out for a day, while dropping the oldest pushes the
+      person's candidate out only once five newer ones exist for the account, and with
+      any second candidate live the runbook already forbids a relink. The global cap
+      evicts the oldest rows of the WHOLE table, so someone able to assert the emails
+      of 200 or more single sign-on accounts (5 each) can flush other accounts'
+      candidates: denial of recovery only, visible as a `captured_total` that rose
+      while the list stayed empty. Expired rows are deleted only when a later capture
+      runs, and the caps bound them meanwhile. Flooding stays visible:
       `federated_relink_capture_totals` counts, per account and forever, the distinct
       pairs captured, so `captured_total` keeps growing while the live list is capped.
     - Only an email collision qualifies. A username-only collision has an email no
@@ -415,13 +438,23 @@ login (IAM-LDAP-8).
       the username's holder was rejected, since the username comes from a claim people
       often edit at the provider. A local, LDAP, or superadmin holder never gets a
       candidate: those accounts are never linked.
-    - What the refused user sees is unchanged: the same `failed` redirect, and the
-      capture adds a few database statements in the refusal path, no bcrypt and no
-      provider call, the same timing class as the refusal's own lookups. The capture
-      runs after the refusal is decided, in its own transaction under one
+    - What the refused user sees is the same `failed` redirect, but the timing is
+      NOT the same (corrected in the second review, which measured medians on
+      PostgreSQL 16, 200 samples each: an `email_taken` refusal with a local holder
+      2.8 ms, an `oidc` holder with a repeated pair about 5.1 ms, an `oidc` holder with
+      a new pair 7.2 ms). Decided: document, do not pad. From the timing a refused
+      caller can infer that the email belongs to an ordinary single sign-on account
+      rather than a local, LDAP, or superadmin one, and whether their candidate was
+      newly stored. The caller is already authenticated at the provider with that
+      email, so this tells them about an email they hold. Before this change the
+      refusal paths took the same time. The capture runs after the refusal is
+      decided, in its own transaction under one
       transaction-scoped advisory lock (so the caps hold between concurrent captures);
       a failure is rolled back and logged by exception class name, and the login is
-      refused all the same.
+      refused all the same. Every captured refusal takes that one global lock while
+      holding a pooled database connection, and auth sets no statement timeout;
+      logins that capture nothing never wait on it, and the rate of captures is bounded
+      by sign-ins at the provider.
   - Owner decision B (2026-11-18), naming the collisions. A rewrite's dry run and its
     409 also return, for each colliding subject, the pair of account ids (the holder
     under the old issuer, the holder under the new issuer), at most 50 with
@@ -467,8 +500,11 @@ login (IAM-LDAP-8).
     The other order (change the setting, then rewrite) leaves a window in which a
     returning person whose provider email changed since their account was created is
     provisioned a SECOND account under the new issuer, whose identity then blocks the
-    rewrite (409, naming both accounts, decision B); the runbook says how to clear that
-    with the relink. The rewrite is only for a change in which the provider keeps each
+    rewrite (409, naming both accounts, decision B); the runbook clears that by
+    relinking the second account to the reserved issuer `urn:herd:retired` with its own
+    account id as the subject (no token carries that `iss`, so it can never sign in,
+    and the person's pair under the new issuer is freed), deactivating it, and never
+    reactivating it without a relink first. The rewrite is only for a change in which the provider keeps each
     person's subject (a renamed issuer URL, a trailing slash, a migration that
     preserves user ids): applied across providers whose subject namespaces differ, it
     would hand one person's account to whoever holds the same subject string at the

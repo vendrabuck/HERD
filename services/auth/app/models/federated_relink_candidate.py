@@ -16,8 +16,10 @@ from its first capture; a repeat of the same pair bumps `attempts` and
 forever, the distinct pairs ever captured, so eviction by the caps is visible
 (`captured_total` grows while the live list cannot).
 
-Neither table is ever logged from; the subject is read only by the superadmin
-relink, which never returns it either (the read route shows a fingerprint).
+Neither table is ever logged from. The candidate LIST route never returns the
+subject (it shows the pair's fingerprint); the relink by `candidate_id` reads it
+and, like every relink, answers the identity it linked, subject included
+(IAM-OIDC-31). Expired rows are deleted only when a later capture runs.
 """
 
 import uuid

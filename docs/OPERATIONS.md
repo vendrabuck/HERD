@@ -347,14 +347,16 @@ again:
 ```bash
 curl -sS -X PUT "$GW/api/auth/users/<new_issuer_account_id>/federated-identity" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"issuer": "<new issuer>", "subject": "retired-<new_issuer_account_id>"}'
+  -d '{"issuer": "urn:herd:retired", "subject": "<new_issuer_account_id>"}'
 curl -sS -X POST "$GW/api/auth/users/<new_issuer_account_id>/deactivate" -H "Authorization: Bearer $TOKEN"
 ```
 
-The relink replaces the second account's identity with (new issuer,
-`retired-<id>`), a subject no provider issues, so nobody can sign in to it any more and
-the person's `sub` under the new issuer is free; the rewrite then gives that pair to the
-first account. Anything the person created in the second account stays there (nothing
+The relink replaces the second account's identity with (`urn:herd:retired`, its own
+account id). `urn:herd:retired` is a reserved issuer no accepted ID token ever carries
+(a token's `iss` must equal `OIDC_ISSUER`, and auth accepts only an http or https URL
+there), so nobody can sign in to that account any more, and
+the person's `sub` under the new issuer is freed; the rewrite then gives that pair to the
+first account. Never reactivate a retired account without relinking it first. Anything the person created in the second account stays there (nothing
 moves ownership between accounts, and nothing deletes an account). When
 `collisions_truncated` is true, clear the listed pairs and dry-run again for the rest.
 
@@ -370,11 +372,20 @@ docker compose logs --no-log-prefix auth | jq -R 'fromjson? | select(.action == 
 `email_taken` for a person who has signed in with single sign-on before means their
 provider now names them differently. If `OIDC_ISSUER` changed, follow the previous
 section. Otherwise the provider reissued their `sub` (their account there was deleted
-and recreated, or the provider was replaced), and their refused sign-in was kept as a
-relink candidate against their HERD account. A candidate proves only that SOMEONE
-signed in at the provider with an account carrying that email; anyone who can do that
-can plant one. The relink is the security step, so confirm with the person out of band
-first:
+and recreated, or the provider was replaced), and their refused sign-in was normally
+kept as a relink candidate against their HERD account.
+
+A candidate proves only that SOMEONE signed in at the provider with an account carrying
+that email; anyone who can do that can plant one. A token with no `email_verified`
+claim is accepted and captured (only an explicit `false` is refused, before the
+collision check), and Microsoft Entra ID normally omits the claim, so any provider
+account carrying the email can plant a candidate. The person's own attempt may also
+leave NO candidate: their provider email may no longer equal the account's, the attempt
+may be refused as `username_invalid` or `email_unverified` before the collision check,
+or the capture may fail (logged as `oidc_relink_candidate_capture_failed`); then the
+only candidate in the minute could be someone else's. The checks below bind a candidate
+to the person by time alone, which is why every precondition in step 4 is required. The
+relink is the security step:
 
 1. Find the account id: `curl -sS "$GW/api/auth/users?limit=500" -H "Authorization: Bearer $TOKEN" | jq '.items[] | select(.email == "<their email>") | .id'` (page with `skip` past 500 accounts).
 2. Read its candidates and note `captured_total`:
@@ -386,10 +397,19 @@ first:
    The answer is `{"user_id", "captured_total", "candidates": [{"id", "issuer",
    "fingerprint", "created_at", "last_seen_at", "expires_at", "attempts"}]}`, newest
    first. A candidate lives 24 hours; the subject is never shown, only a fingerprint.
-3. Agree a minute with the person (by phone, in person, or another channel you trust)
-   and have them try to sign in once then.
-4. Read the candidates again. Relink only when `captured_total` went up by exactly one,
-   exactly one live candidate exists, and its `created_at` falls in the agreed minute:
+3. Agree a minute with the person over a channel that AUTHENTICATES them, chosen by
+   you, not by them: in person with identification, or a call YOU place to a number
+   already on file. A call the person places to a number of their choosing is not
+   enough. Have them try to sign in once at that minute.
+4. Read the candidates again. Relink only when ALL of these hold:
+   - `captured_total` went up by exactly one, exactly one live candidate exists, and
+     its `created_at` falls in the agreed minute;
+   - at the provider you confirmed that exactly one provider account carries the email,
+     and that it is the person's;
+   - the person confirms, over the same authenticated channel, that they saw the
+     sign-in failure page at that time;
+   - auth's log has no `oidc_relink_candidate_capture_failed` line in the window
+     (`docker compose logs --no-log-prefix auth | jq -R 'fromjson? | select(.action == "oidc_relink_candidate_capture_failed")'`).
 
    ```bash
    curl -sS -X PUT "$GW/api/auth/users/<account id>/federated-identity" \
@@ -403,10 +423,16 @@ first:
    signs in.
 
 When more than one candidate is live, or `captured_total` grew by more than one, or the
-only candidate's time does not match, do NOT relink: someone else is signing in with an
-account carrying this email. Investigate at the provider (which accounts hold the email,
-who created them), wait for the candidates to expire, and repeat the agreed-minute
-check. A candidate that is not the person's is harmless as long as nobody relinks to it.
+only candidate's time does not match, or any other precondition fails, do NOT relink:
+someone else may be signing in with an account carrying this email. Investigate at the
+provider (which accounts hold the email, who created them). A candidate that is not the
+person's is harmless as long as nobody relinks to it.
+
+Any one provider account carrying the email can block this path indefinitely: it can
+re-plant every 24 hours so that a second candidate is always live. A route to clear
+candidates would not help, since re-planting is immediate. The way out is the typed-pair
+relink below, with a subject read at the provider, or removing the rogue provider
+account and repeating the agreed-minute check after its candidates expire.
 
 Alternative, when the provider shows the person's `sub` (Keycloak: the user's ID;
 Okta: the user's id; Dex: the unpadded base64url encoding of a protobuf message whose

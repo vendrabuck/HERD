@@ -118,7 +118,9 @@ and identity relink are judged by the unique constraints of `federated_identitie
 relinks of one account apply in turn on its row lock (IAM-OIDC-34); a returning
 login's `last_login_at` write is a compare-and-swap, so a login in flight when either
 commits is refused (IAM-OIDC-39); relink candidate captures are serialized by one
-advisory lock (IAM-OIDC-36). Manual activate and
+advisory lock (IAM-OIDC-36): each captured refusal holds that one global lock on a
+pooled connection, and auth sets no statement timeout, but logins that capture nothing
+never wait on it and captures are bounded by sign-ins at the provider. Manual activate and
 deactivate are plain ORM writes; only one sync run can execute at a time (IAM-SERIAL-1).
 
 **Rules.**
@@ -2115,7 +2117,17 @@ skip list). Recovery: `POST /admin/federated-identities/rewrite-issuer` and
   refusals on Postgres. The capture runs after the refusal is decided and logged, in its
   own transaction: the login answers exactly the refusal it would have, and a capture
   failure is rolled back and logged once at WARNING (`oidc_relink_candidate_capture_failed`)
-  with the exception's class name only. Nothing links from a candidate. \
+  with the exception's class name only. Nothing links from a candidate. Limits, by
+  decision (ADR 0016 D4 as built): the refusal answers the same redirect but not in the
+  same time (second review, PostgreSQL 16 medians: 2.8 ms for a local holder, about
+  5.1 ms for an `oidc` holder and a repeated pair, 7.2 ms for a new pair), so a refused
+  caller, already authenticated at the provider with that email, can infer that it
+  belongs to an ordinary `oidc` account and whether a candidate was newly stored; the
+  global cap evicts the oldest rows of the whole table, so someone able to assert the
+  emails of 200 or more `oidc` accounts can flush other accounts' candidates (denial of
+  recovery only, visible in `captured_total`); expired rows are deleted only when a
+  later capture runs, bounded meanwhile by the caps; a token with no `email_verified`
+  claim is captured like a verified one. \
   Enforced in: `services/auth/app/services/auth_service.py` (`resolve_federated_user`, `_capture_relink_candidate`); `services/auth/app/services/federated_identity_service.py` (`capture_relink_candidate`, `_oidc_holder_of_email`, `_evict_beyond`, `_CAPTURE_LOCK_KEY`); `services/auth/app/models/federated_relink_candidate.py` (`CANDIDATE_TTL`, `CANDIDATES_PER_ACCOUNT`, `CANDIDATES_GLOBAL_CAP`, `FederatedRelinkCandidate`, `FederatedRelinkCaptureTotal`) \
   Pinned by: `services/auth/tests/test_federated_identity_routes.py` (`test_a_refusal_on_an_oidc_accounts_email_captures_a_candidate`, `test_no_candidate_when_the_email_holder_is_not_an_ordinary_oidc_account`, `test_no_candidate_for_a_username_only_collision_or_any_other_refusal`, `test_no_candidate_when_the_login_succeeds`, `test_a_repeated_pair_is_one_candidate_with_more_attempts`, `test_a_candidate_expires_after_24_hours`, `test_the_per_account_cap_keeps_the_newest_five_and_the_total_keeps_counting`, `test_the_global_cap_drops_the_oldest_candidates_in_the_table`, `test_a_capture_failure_never_changes_the_refusal`, `test_story_a_planted_candidate_never_links_without_the_superadmin`); `services/auth/tests/test_federated_identity_live_pg.py` (`test_concurrent_captures_of_distinct_pairs_keep_the_cap_and_count_every_pair`, `test_concurrent_captures_of_one_pair_are_one_candidate`)
 - **IAM-OIDC-37.** `GET /users/{id}/federated-identity/candidates` answers 200
@@ -2426,6 +2438,16 @@ IAM-LDAP-12 and IAM-LDAP-13, and #1404 by IAM-LOGIN-6.)
 - The deactivation breaker's denominator is every LDAP account, inactive ones included
   (IAM-SWEEP-7). Recorded in ADR 0011 (as amended 2026-08-12: one pass over all LDAP
   users).
+- A single sign-on refusal whose email belongs to an ordinary `oidc` account takes
+  measurably longer than one whose email belongs to a local, LDAP, or superadmin account
+  (the relink candidate capture, IAM-OIDC-36), so the refused caller, who is already
+  authenticated at the provider with that email, can tell the two apart; before the
+  capture the paths were identical. Recorded in ADR 0016 D4 as built (document, do not
+  pad; second review of issue #1399).
+- Any one provider account carrying an `oidc` account's email can keep a second relink
+  candidate live by re-planting every 24 hours, which blocks the candidate path of
+  recovery; the typed-pair relink stays available (IAM-OIDC-31, IAM-OIDC-36). Recorded
+  in ADR 0016 D4 as built.
 - Issue #1010 corrected three documents that disagreed with the rules here: the
   handbook's superadmin promotion (IAM-USER-3), the FEATURES.md statement that superadmin
   accounts remain local (IAM-LDAP-1, IAM-USER-9), and the SECURITY.md statement that
