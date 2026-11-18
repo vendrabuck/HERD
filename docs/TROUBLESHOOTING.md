@@ -142,6 +142,23 @@ A 401 `Invalid credentials` means the directory answered and refused this login,
 - The password holds a character the LDAP client refuses before sending it (a tab, another control character, a private-use character, or mixed right-to-left and left-to-right text; RFC 4013 SASLprep). Nothing is sent to the directory; the log line is `ldap_password_refused` with the username.
 - The directory entry has no `mail` attribute (or whatever `LDAP_EMAIL_ATTRIBUTE` is set to). HERD refuses to provision a user it cannot address by email; the log line is `ldap_missing_email`. When it follows `ldap_attribute_not_text` for the same DN, the attribute is there but holds no text (a value that is not UTF-8, often because the setting names a binary attribute such as `jpegPhoto` or `objectGUID`, an empty value, or a control character); point the setting at the attribute that holds the address.
 - The email returned by the directory collides with an existing local account. Either delete the local row or set `AUTH_METHOD=local` temporarily.
+- The account was provisioned before issue #1448 from a binary attribute value, so its email or username is the text of a bytes repr, such as `b'\xffcarol@example.com'` (see "LDAP accounts with a bytes-repr email or username" below).
+
+### LDAP accounts with a bytes-repr email or username
+
+Before issue #1448 a directory value that was not UTF-8 was stored as the text of its Python bytes repr. HERD no longer does that, but rows created earlier stay. Find them on PostgreSQL (checked against the `auth.users` table; on SQLite `LIKE` ignores case and also matches `B'...`):
+
+```sql
+SELECT id, username, email, is_active
+FROM auth.users
+WHERE auth_source = 'ldap'
+  AND (email LIKE 'b''%' OR email LIKE 'b"%'
+       OR username LIKE 'b''%' OR username LIKE 'b"%');
+```
+
+- A repr email: the account can no longer sign in, because login finds the account by the directory's email, which is now either the real address (no account has it, so login provisions a new one, which is refused as a username collision while the old row holds the same username) or no text at all (the 401 above). If the person's directory entry now holds a text address, set it on the old row (`UPDATE auth.users SET email = '<address>' WHERE id = '<id>';`) so they keep their groups and role, or deactivate the old row. With the deactivation sweep on, the first sweep deactivates such a row once every directory email is readable; while any entry's email is not text, the sweep deactivates no one (`email_unreadable` in the run's `sweep` detail).
+- A repr username: login never updates a username, and group sync skips the member as `missing_username` while the username attribute holds no text. Once `LDAP_USERNAME_ATTRIBUTE` names a text attribute, the next sync renames the account of every mapped-group member (`ldap_sync_username_repaired`); rename any other by SQL (`UPDATE auth.users SET username = '<name>' WHERE id = '<id>';`). `full_name` started as the username and the user may change it.
+- Active Directory with `LDAP_USERNAME_ATTRIBUTE` set to `objectGUID` or `objectSid` (binary): every account provisioned before the fix has a repr username, new logins now take the typed login name as the username, and group sync skips every member as `missing_username`, which also holds back every removal, so mapped groups stop changing and every run is `partial`. Set `LDAP_USERNAME_ATTRIBUTE=sAMAccountName` (the default) or `userPrincipalName`, restart auth, and run a sync to repair the usernames of mapped-group members.
 
 ### `/register` returns 409 "Local registration is disabled"
 

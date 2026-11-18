@@ -61,6 +61,35 @@ VALUES = {
     "int": (1001, None),
     "datetime": (datetime(2026, 1, 1, tzinfo=timezone.utc), None),
     "none": (None, None),
+    # The review's tightening: white space alone, invisible format characters,
+    # separators, and noncharacters are no address and no name.
+    "space_only": (" ", None),
+    "no_break_space_only": ("\u00a0", None),
+    "spaces_and_tab": (" \u3000 ", None),
+    "right_to_left_override": ("carol\u202e@example.com", None),
+    "zero_width_space": ("car\u200bol", None),
+    "zero_width_non_joiner": ("car\u200col", None),
+    "byte_order_mark": ("\ufeffcarol", None),
+    "soft_hyphen": ("car\u00adol", None),
+    "line_separator": ("carol\u2028", None),
+    "paragraph_separator": ("carol\u2029", None),
+    "noncharacter_fffe": ("carol\ufffe", None),
+    "noncharacter_fdd0": ("carol\ufdd0", None),
+    "noncharacter_plane_1": ("carol\U0001ffff", None),
+    # Ordinary international names and addresses still pass, as given.
+    "accented_name": ("Jos\u00e9 M\u00fcller", "Jos\u00e9 M\u00fcller"),
+    "cjk_name": ("\u674e\u5c0f\u9f99", "\u674e\u5c0f\u9f99"),
+    "greek_name": ("\u0395\u03bb\u03ad\u03bd\u03b7", "\u0395\u03bb\u03ad\u03bd\u03b7"),
+    "arabic_name": ("\u0639\u0644\u064a", "\u0639\u0644\u064a"),
+    "devanagari_with_marks": (
+        "\u0928\u092e\u0938\u094d\u0924\u0947",
+        "\u0928\u092e\u0938\u094d\u0924\u0947",
+    ),
+    "apostrophe_email": ("o'brien@example.com", "o'brien@example.com"),
+    "plus_email": ("user+tag@example.com", "user+tag@example.com"),
+    "idn_email": ("j\u00f6rg@b\u00fccher.example", "j\u00f6rg@b\u00fccher.example"),
+    "inner_space": ("Mary Ann", "Mary Ann"),
+    "surrounding_space_kept": (" carol ", " carol "),
 }
 
 
@@ -92,6 +121,20 @@ def _assert_no_value_leaks(caplog, *values: bytes) -> None:
 @pytest.mark.parametrize("value,expected", VALUES.values(), ids=VALUES.keys())
 def test_text_value_is_text_or_none(value, expected):
     assert ldap_service._text_value(value) == expected
+
+
+def test_the_bounds_are_the_columns():
+    from app.models.user import User
+
+    assert ldap_service.EMAIL_MAX_LENGTH == User.__table__.c.email.type.length == 255
+    assert ldap_service.USERNAME_MAX_LENGTH == User.__table__.c.username.type.length == 100
+
+
+@pytest.mark.parametrize("bound", [100, 255])
+def test_a_value_longer_than_its_column_is_not_text(bound):
+    assert ldap_service._text_value("a" * bound, bound) == "a" * bound
+    assert ldap_service._text_value("a" * (bound + 1), bound) is None
+    assert ldap_service._text_value("\u00e9" * bound, bound) == "\u00e9" * bound
 
 
 def test_ldap3_returns_a_value_that_is_not_utf8_as_bytes(directory):
@@ -134,6 +177,38 @@ def test_the_first_text_email_is_used(directory, caplog, mail):
         identity = ldap_service._bind_user_sync("carol", PASSWORD)
     assert identity is not None and identity.email == "carol@example.com"
     assert _records(caplog) == [("WARNING", "ldap_attribute_not_text", "mail", ["bytes"])]
+
+
+def test_an_email_longer_than_the_column_is_refused(directory, caplog):
+    directory.add_user("carol", PASSWORD, mail="c" * 244 + "@example.com")
+    with caplog.at_level(logging.WARNING, logger="app.services.ldap_service"):
+        assert ldap_service._bind_user_sync("carol", PASSWORD) is None
+    assert [r.action for r in caplog.records] == ["ldap_attribute_not_text", "ldap_missing_email"]
+
+
+def test_two_entries_whose_email_is_a_space_never_share_an_account(directory):
+    directory.add_user("carol", PASSWORD, mail=" ")
+    directory.add_user("dave", PASSWORD, mail="\u00a0")
+    assert ldap_service._bind_user_sync("carol", PASSWORD) is None
+    assert ldap_service._bind_user_sync("dave", PASSWORD) is None
+
+
+def test_a_username_longer_than_the_column_falls_back_to_the_login_name(directory, monkeypatch):
+    monkeypatch.setattr(settings, "ldap_username_attribute", "displayName")
+    directory.add_user("dave", PASSWORD, displayName="d" * 101)
+    identity = ldap_service._bind_user_sync("dave", PASSWORD)
+    assert identity is not None and identity.username == "dave"
+
+
+def test_a_login_name_that_cannot_stand_in_is_refused(directory, monkeypatch, caplog):
+    """No usable username attribute and a login name longer than the column:
+    nothing can be provisioned, so the login is refused, never a database error."""
+    monkeypatch.setattr(settings, "ldap_username_attribute", "displayName")
+    long_name = "u" * 101
+    directory.add_user(long_name, PASSWORD)
+    with caplog.at_level(logging.WARNING, logger="app.services.ldap_service"):
+        assert ldap_service._bind_user_sync(long_name, PASSWORD) is None
+    assert [r.action for r in caplog.records] == ["ldap_missing_username"]
 
 
 def test_a_username_that_is_not_text_falls_back_to_the_login_name(directory, monkeypatch):
@@ -211,6 +286,10 @@ MEMBERS = {
     "username_not_text": ({"uid": b"\xfeg"}, ldap_service.MEMBER_SKIP_MISSING_USERNAME),
     "username_with_nul": ({"uid": "g\x00"}, ldap_service.MEMBER_SKIP_MISSING_USERNAME),
     "both_not_text": ({"mail": NOT_UTF8, "uid": b"\xfeg"}, ldap_service.MEMBER_SKIP_MISSING_EMAIL),
+    "email_space": ({"mail": " "}, ldap_service.MEMBER_SKIP_MISSING_EMAIL),
+    "email_too_long": ({"mail": "g" * 256}, ldap_service.MEMBER_SKIP_MISSING_EMAIL),
+    "username_too_long": ({"uid": "g" * 101}, ldap_service.MEMBER_SKIP_MISSING_USERNAME),
+    "username_zero_width": ({"uid": "gi\u200bna"}, ldap_service.MEMBER_SKIP_MISSING_USERNAME),
 }
 
 
@@ -247,7 +326,9 @@ def test_a_group_name_or_member_that_is_not_text_is_left_out(directory, monkeypa
     )
     with caplog.at_level(logging.WARNING, logger="app.services.ldap_service"):
         entry = ldap_service._fetch_group_sync(GROUP_DN)
-    assert entry == ldap_service.LdapGroupEntry(dn=GROUP_DN, name=GROUP_DN, member_dns=(alice,))
+    assert entry == ldap_service.LdapGroupEntry(
+        dn=GROUP_DN, name=GROUP_DN, member_dns=(alice,), unreadable_members=1
+    )
     assert [(r.action, getattr(r, "attribute", None)) for r in caplog.records] == [
         ("ldap_attribute_not_text", "displayName"),
         ("ldap_group_missing_name", None),
@@ -262,10 +343,17 @@ def test_the_enumeration_leaves_out_what_is_not_text_with_one_line(directory, ca
     with caplog.at_level(logging.WARNING, logger="app.services.ldap_service"):
         emails = ldap_service._present_emails_sync()
     assert emails == frozenset({"alice@example.com", "dave@example.com"})
+    # carol is listed but cannot be read; dave has one readable value.
+    assert emails.unreadable_entries == 1
     assert [(r.action, r.count, r.value_classes) for r in caplog.records] == [
         ("ldap_attribute_not_text", 3, ["bytes", "str"])
     ]
     _assert_no_value_leaks(caplog, NOT_UTF8)
+
+
+def test_an_enumeration_with_every_email_readable_counts_none(directory):
+    directory.add_user("alice", PASSWORD)
+    assert ldap_service._present_emails_sync().unreadable_entries == 0
 
 
 # -- 5. Sync and mapping validation end to end -------------------------------------------------
@@ -326,3 +414,120 @@ async def test_a_mapping_of_a_group_whose_name_is_not_text_caches_the_dn(
     async with TestSessionLocal() as db:
         count = (await db.execute(select(func.count()).select_from(User))).scalar_one()
     assert count == 0
+
+
+async def _seed_ldap_accounts(db, *specs) -> dict[str, User]:
+    users = {}
+    for username, email, active, by_sync in specs:
+        user = User(
+            email=email,
+            username=username,
+            auth_source="ldap",
+            role=Role.USER,
+            is_active=active,
+            deactivated_by_sync=by_sync,
+        )
+        db.add(user)
+        users[username] = user
+    await db.flush()
+    return users
+
+
+async def test_member_values_that_are_not_text_are_skipped_and_suppress_removals(
+    directory, _reap_on_the_harness_engine
+):
+    """The review's case: a group whose only two member values are not text,
+    with two HERD members. Before the fix round the run was `success`, removed
+    both, and recorded nothing."""
+    directory.add_entry(
+        GROUP_DN, {"objectClass": "groupOfNames", "cn": "eng", "member": [b"\xff1", b"\xff2"]}
+    )
+    async with TestSessionLocal() as db:
+        group = UserGroup(name="Engineering")
+        db.add(group)
+        users = await _seed_ldap_accounts(
+            db, ("ann", "ann@example.com", True, False), ("ben", "ben@example.com", True, False)
+        )
+        for user in users.values():
+            db.add(GroupMember(group_id=group.id, user_id=user.id))
+        db.add(LdapGroupMapping(group_dn=GROUP_DN, directory_name="eng", herd_group_id=group.id))
+        await db.commit()
+        run = await ldap_sync_service.run_sync(db)
+        members = (
+            await db.execute(
+                select(func.count())
+                .select_from(GroupMember)
+                .where(GroupMember.group_id == group.id)
+            )
+        ).scalar_one()
+    assert run.status == "partial"
+    assert (run.members_removed, run.members_skipped) == (0, 2)
+    assert [s["reason"] for s in run.detail["skipped_members"]] == ["not_text", "not_text"]
+    assert all(
+        s["member_dn"] == ldap_sync_service.MEMBER_DN_NOT_TEXT
+        for s in run.detail["skipped_members"]
+    )
+    assert run.detail["suppressed_removals"] == [
+        {"group_dn": GROUP_DN, "unresolved": 2, "would_remove": 2}
+    ]
+    assert members == 2
+
+
+async def _sweep(directory, monkeypatch, *, carol_mail) -> tuple:
+    monkeypatch.setattr(settings, "ldap_sync_deactivation_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "ldap_sync_deactivation_min_count", 10, raising=False)
+    directory.add_user("alice", PASSWORD)
+    directory.add_user("carol", PASSWORD, mail=carol_mail)
+    async with TestSessionLocal() as db:
+        await _seed_ldap_accounts(
+            db,
+            ("alice", "alice@example.com", True, False),
+            # Provisioned before the fix from carol's binary mail.
+            ("carol", "b'\\xffcarol@example.com'", True, False),
+            ("gone", "gone@example.com", True, False),
+            ("back", "alice2@example.com", False, True),
+        )
+        await db.commit()
+        run = await ldap_sync_service.run_sync(db)
+        rows = {u.username: u.is_active for u in (await db.execute(select(User))).scalars()}
+    return run, rows
+
+
+async def test_an_unreadable_email_in_the_directory_deactivates_no_one(
+    directory, monkeypatch, _reap_on_the_harness_engine
+):
+    """carol is listed but her email cannot be read, so absence is proven for
+    no one: neither her old repr-email account nor anyone else is deactivated,
+    and the run says why."""
+    run, rows = await _sweep(directory, monkeypatch, carol_mail=NOT_UTF8)
+    assert rows == {"alice": True, "carol": True, "gone": True, "back": False}
+    assert run.status == "partial"
+    assert run.users_deactivated == 0
+    assert run.detail["sweep"] == [
+        {"reason": "email_unreadable", "count": 1, "would_deactivate": 2}
+    ]
+
+
+async def test_a_readable_directory_still_deactivates_the_absent(
+    directory, monkeypatch, _reap_on_the_harness_engine
+):
+    """The control: with carol's email readable, the sweep proves absence as
+    before, so the repr-email account and the departed account go."""
+    run, rows = await _sweep(directory, monkeypatch, carol_mail="carol@example.com")
+    assert rows == {"alice": True, "carol": False, "gone": False, "back": False}
+    assert run.users_deactivated == 2
+
+
+async def test_reactivations_still_apply_when_deactivations_are_suppressed(
+    directory, monkeypatch, _reap_on_the_harness_engine
+):
+    directory.add_user("back", PASSWORD, mail="back@example.com")
+    monkeypatch.setattr(settings, "ldap_sync_deactivation_enabled", True, raising=False)
+    directory.add_user("carol", PASSWORD, mail=NOT_UTF8)
+    async with TestSessionLocal() as db:
+        await _seed_ldap_accounts(db, ("back", "back@example.com", False, True))
+        await db.commit()
+        run = await ldap_sync_service.run_sync(db)
+        back = (await db.execute(select(User))).scalars().one()
+    assert back.is_active is True
+    assert run.users_reactivated == 1

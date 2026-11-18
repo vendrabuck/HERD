@@ -569,9 +569,12 @@ account automatically.
   Enforced in: `services/auth/app/services/auth_service.py` (`_authenticate_ldap`) \
   Pinned by: `services/auth/tests/test_auth_ldap.py` (`test_ldap_login_username_collision_returns_401`)
 - **IAM-LDAP-11.** The provisioned username is the entry's first `LDAP_USERNAME_ATTRIBUTE`
-  value that is text (IAM-LDAP-15), or the typed login name when the entry has none. \
+  value that is text and fits the username column (IAM-LDAP-15), or the typed login
+  name when the entry has none. A login name that is not such text either (over 100
+  characters, say) cannot stand in, and the login is the 401 `Invalid credentials`,
+  logged as `ldap_missing_username`. \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_first_text_value`) \
-  Pinned by: `services/auth/tests/test_ldap_attribute_text.py` (`test_a_missing_username_falls_back_to_the_login_name`, `test_a_username_that_is_not_text_falls_back_to_the_login_name`, `test_a_text_username_attribute_is_used`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_binary_username_attribute_falls_back_to_login_name`)
+  Pinned by: `services/auth/tests/test_ldap_attribute_text.py` (`test_a_missing_username_falls_back_to_the_login_name`, `test_a_username_that_is_not_text_falls_back_to_the_login_name`, `test_a_text_username_attribute_is_used`, `test_a_username_longer_than_the_column_falls_back_to_the_login_name`, `test_a_login_name_that_cannot_stand_in_is_refused`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_binary_username_attribute_falls_back_to_login_name`)
 - **IAM-LDAP-12.** When the directory cannot be asked, login answers 503 `Directory
   unavailable, credentials not checked` (issue #1403): incomplete configuration
   (`LDAP_SERVER_URL` or `LDAP_USER_BASE_DN` empty), an `LDAP_USER_FILTER` that
@@ -656,25 +659,31 @@ account automatically.
   Pinned by: `services/auth/tests/test_ldap_user_filter.py` (`test_every_defect_is_found_with_its_reason`, `test_a_usable_template_has_no_problem`, `test_render_never_interprets_the_login_name`, `test_a_login_gets_the_same_outage_for_every_name_and_password`, `test_a_login_name_can_never_supply_an_assertion`, `test_the_probes_keep_the_makeup_the_check_relies_on`, `test_the_check_runs_once_per_template`, `test_the_search_itself_never_raises_anything_but_unavailable`, `test_startup_reports_a_defect_once_in_ldap_mode`, `test_startup_is_silent_outside_ldap_mode`, `test_the_lifespan_reports_it_and_still_boots`, `test_the_route_answers_503_never_500`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_unusable_filter_is_503_for_every_login`)
 - **IAM-LDAP-15.** A directory attribute value that is not text never becomes account
   data (issue #1448). ldap3 returns a value that is not UTF-8 as `bytes`, and every
-  read of an identity attribute goes through one conversion: a value is text when it
-  is a `str`, or `bytes` that decode as strict UTF-8, that is not empty and holds no
-  control character (Unicode category Cc, NUL included, which Postgres cannot store);
-  anything else is left out and counts as absent. So login refuses an entry with no
-  email value that is text (IAM-LDAP-5) and falls back to the login name for the
-  username (IAM-LDAP-11); member resolution skips the member as `missing_email` or
-  `missing_username` (IAM-SYNC-4, which suppress the group's removals, IAM-SYNC-5);
-  the group's display name falls back to its DN (IAM-MAP-4); a member value that is
-  not text is left out of the group's member list; and the presence enumeration
-  leaves the value out (IAM-SWEEP-2). Of a multi-valued attribute, the first value
-  that is text in the directory's order is the one used. Each read that left a value
-  out logs one WARNING (action `ldap_attribute_not_text`, the attribute, the DN, the
-  count, and the value classes, never a value); the enumeration logs one for the whole
-  pass. Login reads the attributes only after the user bind succeeded, so the
-  difference is reachable only with the user's password. Before the fix each read
-  called `str()` on the raw value, so `bytes` became the text of its repr
-  (`"b'\\xff...'"`) and was provisioned as the email or username. \
-  Enforced in: `services/auth/app/services/ldap_service.py` (`_text_value`, `_text_values`, `_first_text_value`, `_bind_user_sync`, `_resolution_for`, `_fetch_group_sync`, `_paged_user_emails_sync`) \
-  Pinned by: `services/auth/tests/test_ldap_attribute_text.py` (`test_text_value_is_text_or_none`, `test_ldap3_returns_a_value_that_is_not_utf8_as_bytes`, `test_a_login_whose_only_email_is_not_text_is_refused`, `test_a_login_whose_email_holds_no_usable_text_is_refused`, `test_the_first_text_email_is_used`, `test_the_attributes_are_read_only_after_the_user_bind`, `test_the_route_refuses_an_email_that_is_not_text_and_creates_nothing`, `test_the_route_provisions_only_text`, `test_a_member_whose_identity_is_not_text_is_skipped_as_missing`, `test_a_member_with_a_text_value_after_a_binary_one_resolves`, `test_a_group_name_or_member_that_is_not_text_is_left_out`, `test_the_enumeration_leaves_out_what_is_not_text_with_one_line`, `test_a_sync_pass_never_provisions_a_bytes_repr_and_keeps_removals_suppressed`, `test_a_mapping_of_a_group_whose_name_is_not_text_caches_the_dn`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_binary_email_attribute_is_401`, `test_resolve_member_binary_email_attribute_is_missing_email`, `test_present_emails_leaves_out_a_binary_value`)
+  read of an identity attribute goes through one conversion. A value is text when it is
+  a `str`, or `bytes` that decode as strict UTF-8, that is not empty once Unicode white
+  space is stripped, and that holds no control character (Cc, NUL included, which
+  Postgres cannot store), format character (Cf: right-to-left override, zero-width
+  space and joiners, byte order mark, soft hyphen), line or paragraph separator (Zl,
+  Zp), surrogate, or noncharacter; an email must also fit the 255-character email
+  column and a username the 100-character username column. A value that passes is used
+  exactly as the directory gave it; anything else is left out and counts as absent. So
+  login refuses an entry with no email value that is text (IAM-LDAP-5) and falls back
+  to the login name for the username (IAM-LDAP-11); member resolution skips the member
+  as `missing_email` or `missing_username` (IAM-SYNC-4); the group's display name falls
+  back to its DN (IAM-MAP-4); a member value that is not text is a `not_text` member
+  skip (IAM-SYNC-4, IAM-SYNC-5); and the presence enumeration leaves the value out and
+  counts an entry with no email value that is text (IAM-SWEEP-2, IAM-SWEEP-10). Of a
+  multi-valued attribute, the first value that is text in the directory's order is the
+  one used. Each read that left a value out logs one WARNING (action
+  `ldap_attribute_not_text`, the attribute, the DN, the count, and the value classes,
+  never a value); the enumeration logs one for the whole pass. Login reads the
+  attributes only after the user bind succeeded, so the difference is reachable only
+  with the user's password. Before the fix each read called `str()` on the raw value,
+  so `bytes` became the text of its repr (`"b'\\xff...'"`) and was provisioned as the
+  email or username; such accounts stay as they are (see the CHANGELOG upgrade note and
+  TROUBLESHOOTING). \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`_text_value`, `_text_values`, `_first_text_value`, `_REFUSED_CATEGORIES`, `EMAIL_MAX_LENGTH`, `USERNAME_MAX_LENGTH`, `_bind_user_sync`, `_resolution_for`, `_fetch_group_sync`, `_paged_user_emails_sync`) \
+  Pinned by: `services/auth/tests/test_ldap_attribute_text.py` (`test_text_value_is_text_or_none`, `test_the_bounds_are_the_columns`, `test_a_value_longer_than_its_column_is_not_text`, `test_ldap3_returns_a_value_that_is_not_utf8_as_bytes`, `test_a_login_whose_only_email_is_not_text_is_refused`, `test_a_login_whose_email_holds_no_usable_text_is_refused`, `test_an_email_longer_than_the_column_is_refused`, `test_two_entries_whose_email_is_a_space_never_share_an_account`, `test_the_first_text_email_is_used`, `test_the_attributes_are_read_only_after_the_user_bind`, `test_the_route_refuses_an_email_that_is_not_text_and_creates_nothing`, `test_the_route_provisions_only_text`, `test_a_member_whose_identity_is_not_text_is_skipped_as_missing`, `test_a_member_with_a_text_value_after_a_binary_one_resolves`, `test_a_group_name_or_member_that_is_not_text_is_left_out`, `test_the_enumeration_leaves_out_what_is_not_text_with_one_line`, `test_a_sync_pass_never_provisions_a_bytes_repr_and_keeps_removals_suppressed`, `test_a_mapping_of_a_group_whose_name_is_not_text_caches_the_dn`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_binary_email_attribute_is_401`, `test_resolve_member_binary_email_attribute_is_missing_email`, `test_present_emails_leaves_out_a_binary_value`)
 
 **Out of scope.** Roles never come from the directory (ADR 0011, Blast radius). SAML and
 OIDC do not exist (issue #37).
@@ -1133,15 +1142,18 @@ removes anyone when the directory could not be read completely.
   Pinned by: none
 - **IAM-SYNC-4.** A member the directory proves unusable is counted and skipped without
   failing the group: `not_found` (entry gone), `missing_email`, `missing_username` (an
-  attribute with no value that is text counts as missing, IAM-LDAP-15). \
+  attribute with no value that is text counts as missing, IAM-LDAP-15), and `not_text`
+  (a value of the group's member attribute that is not text, recorded with the
+  `member_dn` `(a member value that is not text)`, never the value). \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_resolution_for`); `services/auth/app/services/ldap_sync_service.py` (`_reconcile_mapping`) \
   Pinned by: `services/auth/tests/test_ldap_sync_service.py` (`test_member_skip_reasons_counted_without_failing_group`); `services/auth/tests/test_ldap_service_live.py` (`test_resolve_member_skip_reasons`)
-- **IAM-SYNC-5.** When any member of a group skipped as `missing_email` or
-  `missing_username`, no member is removed from that group this pass (recorded as
-  `suppressed_removals` when removals were due); a `not_found` skip never suppresses.
-  By decision; see ADR 0011, phase 3 amendment 1. \
+- **IAM-SYNC-5.** When any member of a group skipped as `missing_email`,
+  `missing_username`, or `not_text`, no member is removed from that group this pass
+  (recorded as `suppressed_removals` when removals were due); a `not_found` skip never
+  suppresses. By decision; see ADR 0011, phase 3 amendment 1 (`not_text` added by issue
+  #1448: the directory lists someone HERD cannot identify, which proves no one gone). \
   Enforced in: `services/auth/app/services/ldap_sync_service.py` (`_reconcile_mapping`, `_REMOVAL_SUPPRESSING_REASONS`) \
-  Pinned by: `services/auth/tests/test_ldap_sync_service.py` (`test_unidentifiable_member_skip_suppresses_group_removals`, `test_not_found_skip_does_not_suppress_removal`)
+  Pinned by: `services/auth/tests/test_ldap_sync_service.py` (`test_unidentifiable_member_skip_suppresses_group_removals`, `test_not_found_skip_does_not_suppress_removal`); `services/auth/tests/test_ldap_attribute_text.py` (`test_member_values_that_are_not_text_are_skipped_and_suppress_removals`)
 - **IAM-SYNC-6.** A member is matched to a HERD account by email. A member with no
   account is provisioned (LDAP, no password, role user) and then added. \
   Enforced in: `services/auth/app/services/ldap_sync_service.py` (`_ensure_ldap_user`, `_provision_or_recover`) \
@@ -1264,6 +1276,16 @@ turned off earlier once they reappear. A circuit breaker stops a mass deactivati
   real directory. \
   Enforced in: `services/auth/app/services/ldap_sync_service.py` (`_run_deactivation_sweep`) \
   Pinned by: `services/auth/tests/test_ldap_service_live.py` (`test_live_deactivation_and_reactivation_sweep`)
+- **IAM-SWEEP-10.** When the presence enumeration finds an entry whose email attribute
+  holds no value that is text (IAM-LDAP-15), no account is deactivated this pass and the
+  run is `partial` with a `sweep` record (`email_unreadable`, the count of such entries,
+  and how many deactivations were held back); reactivations still apply. The directory
+  still lists that person, and nothing ties the entry to one account, so no absence is
+  proven (the narrowest safe scope; IAM-SYNC-5 is the same rule for a group). By
+  decision (issue #1448 review); before it, an account provisioned from a binary email
+  was deactivated by the first sweep. \
+  Enforced in: `services/auth/app/services/ldap_sync_service.py` (`_run_deactivation_sweep`, `SWEEP_REASON_EMAIL_UNREADABLE`); `services/auth/app/services/ldap_service.py` (`PresentEmails`, `_paged_user_emails_sync`) \
+  Pinned by: `services/auth/tests/test_ldap_attribute_text.py` (`test_an_unreadable_email_in_the_directory_deactivates_no_one`, `test_a_readable_directory_still_deactivates_the_absent`, `test_reactivations_still_apply_when_deactivations_are_suppressed`, `test_an_enumeration_with_every_email_readable_counts_none`)
 
 **Out of scope.** Deactivation never deletes an account and never revokes tokens; the
 inactive checks of IAM-ACCT-5 do the blocking.

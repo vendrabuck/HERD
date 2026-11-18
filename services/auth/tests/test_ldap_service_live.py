@@ -1155,4 +1155,7 @@ async def test_present_emails_leaves_out_a_binary_value(monkeypatch, ldap_settin
     enumeration finds the entry and collects nothing from it (before #1448 it
     collected the text of the bytes repr)."""
     monkeypatch.setattr(settings, "ldap_email_attribute", "jpegPhoto", raising=False)
-    assert await ldap_service.present_emails() == frozenset()
+    present = await ldap_service.present_emails()
+    assert present == frozenset()
+    # The entry is listed but its email cannot be read (IAM-SWEEP-10).
+    assert present.unreadable_entries == 1

@@ -103,14 +103,22 @@ PROVISION_RACE_RECOVERED = "provision_race_recovered"
 # ADR 0011 phase 4: deactivation-sweep detail reasons (category "sweep").
 SWEEP_REASON_ENUMERATION_UNAVAILABLE = "enumeration_unavailable"
 SWEEP_REASON_BREAKER_TRIPPED = "breaker_tripped"
+SWEEP_REASON_EMAIL_UNREADABLE = "email_unreadable"
 
 # C4: a member the directory still lists but could not identify makes the
 # whole group's removal set unprovable, since the unresolvable entry could
 # be any current row. A proven not_found skip does NOT belong here: a
 # proven-absent DN shields nobody, so it never blocks removals.
 _REMOVAL_SUPPRESSING_REASONS = frozenset(
-    {ldap_service.MEMBER_SKIP_MISSING_EMAIL, ldap_service.MEMBER_SKIP_MISSING_USERNAME}
+    {
+        ldap_service.MEMBER_SKIP_MISSING_EMAIL,
+        ldap_service.MEMBER_SKIP_MISSING_USERNAME,
+        ldap_service.MEMBER_SKIP_NOT_TEXT,
+    }
 )
+# The member_dn recorded for a not_text skip: the value itself is never written
+# (it is not text; issue #1448).
+MEMBER_DN_NOT_TEXT = "(a member value that is not text)"
 
 
 @dataclass(frozen=True)
@@ -679,6 +687,13 @@ async def _reconcile_mapping(
                 unresolved_existing_count += 1
             continue
         proven_identities.append(resolution.identity)
+    # Issue #1448: a member value that is not text names someone the directory
+    # lists but HERD cannot identify, so, like an unidentifiable entry, it is a
+    # skip that suppresses this group's removals (IAM-SYNC-5).
+    for _ in range(entry.unreadable_members):
+        tally.skip_member(group_dn, MEMBER_DN_NOT_TEXT, ldap_service.MEMBER_SKIP_NOT_TEXT)
+        if ldap_service.MEMBER_SKIP_NOT_TEXT in _REMOVAL_SUPPRESSING_REASONS:
+            unresolved_existing_count += 1
 
     # Item 1: one batched WHERE email IN (...) per group instead of one
     # get_user_by_email SELECT per member (of plain UserSnapshot rows, see
@@ -850,6 +865,13 @@ async def _run_deactivation_sweep(
 
     candidates = (await db.execute(select(User).where(User.auth_source == "ldap"))).scalars().all()
     swept = len(candidates)
+    # Issue #1448: an entry the directory lists whose email holds no text value
+    # is a person who is present but cannot be matched to an account, so no
+    # candidate's absence is proven this pass: no deactivations (the narrowest
+    # safe scope, since nothing ties the entry to one account; the IAM-SYNC-5
+    # precedent suppresses a whole group's removals for one unidentifiable
+    # member). Reactivations still apply: they need presence, which stands.
+    unreadable = present.unreadable_entries
 
     def present_for(user: User) -> bool:
         email = user.email.lower()
@@ -868,6 +890,12 @@ async def _run_deactivation_sweep(
         (u for u in candidates if not u.is_active and u.deactivated_by_sync and present_for(u)),
         key=lambda u: str(u.id),
     )
+
+    if unreadable:
+        tally.sweep_note(
+            SWEEP_REASON_EMAIL_UNREADABLE, count=unreadable, would_deactivate=len(to_deactivate)
+        )
+        to_deactivate = []
 
     # Breaker check BEFORE applying anything: neither list has been touched
     # yet. STRICT exceeds on both terms; boundary-equal never aborts.

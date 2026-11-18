@@ -54,6 +54,7 @@ from ldap3.utils.conv import escape_filter_chars
 from ldap3.utils.dn import safe_dn
 
 from app.config import Settings, settings
+from app.models.user import User
 
 logger = logging.getLogger(__name__)
 
@@ -114,11 +115,32 @@ class LdapGroupEntry:
     (return_empty_attributes defaults to True), so emptiness of member_dns is
     the only observable signal, and mapping validation warns on it (decision
     with vendra 2026-08-12: accept with warning, never refuse).
+
+    unreadable_members counts the member values that are not text (issue
+    #1448, IAM-LDAP-15): they name no DN HERD can look up, so they are not in
+    member_dns, and the reconciler records each as a `not_text` member skip,
+    which suppresses the group's removals for the pass (IAM-SYNC-5).
     """
 
     dn: str
     name: str
     member_dns: tuple[str, ...]
+    unreadable_members: int = 0
+
+
+class PresentEmails(frozenset):
+    """The enumerated emails (a frozenset of lowercased text values) plus
+    unreadable_entries: how many matching entries held the email attribute
+    with no value that is text (issue #1448, IAM-LDAP-15). Such an entry is a
+    person the directory still lists but whose email cannot be read, so the
+    sweep may not treat anyone as absent while one exists (IAM-SWEEP-10)."""
+
+    unreadable_entries: int
+
+    def __new__(cls, emails=(), unreadable_entries: int = 0):
+        instance = super().__new__(cls, emails)
+        instance.unreadable_entries = unreadable_entries
+        return instance
 
 
 # skip_reason vocabulary for LdapMemberResolution; the reconciler persists
@@ -126,6 +148,8 @@ class LdapGroupEntry:
 MEMBER_SKIP_NOT_FOUND = "not_found"
 MEMBER_SKIP_MISSING_EMAIL = "missing_email"
 MEMBER_SKIP_MISSING_USERNAME = "missing_username"
+# A member value of the group's member attribute that is not text (issue #1448).
+MEMBER_SKIP_NOT_TEXT = "not_text"
 
 
 @dataclass(frozen=True)
@@ -856,27 +880,34 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
         )
         raise
 
-    # Issue #1448: a value that is not text counts as absent (IAM-LDAP-15), so
-    # no email is the refusal below and no username falls back to the login
-    # name (IAM-LDAP-11). Both are read only after the user bind succeeded, so
-    # neither is reachable without the user's password.
+    # Issue #1448: a value that is not text, or too long for its column, counts
+    # as absent (IAM-LDAP-15), so no email is the refusal below and no username
+    # falls back to the login name (IAM-LDAP-11), which must pass the same rule.
+    # Both are read only after the user bind succeeded, so neither is reachable
+    # without the user's password.
     email = _first_text_value(
         attrs.get(settings.ldap_email_attribute) or [],
         attribute=settings.ldap_email_attribute,
         dn=user_dn,
-    )
-    ldap_username = (
-        _first_text_value(
-            attrs.get(settings.ldap_username_attribute) or [],
-            attribute=settings.ldap_username_attribute,
-            dn=user_dn,
-        )
-        or username
+        max_length=EMAIL_MAX_LENGTH,
     )
     if not email:
         logger.warning(
             "LDAP user has no email attribute; cannot provision HERD account",
             extra={"action": "ldap_missing_email", "dn": user_dn},
+        )
+        return None
+    ldap_username = _first_text_value(
+        attrs.get(settings.ldap_username_attribute) or [],
+        attribute=settings.ldap_username_attribute,
+        dn=user_dn,
+        max_length=USERNAME_MAX_LENGTH,
+    ) or _text_value(username, USERNAME_MAX_LENGTH)
+    if not ldap_username:
+        logger.warning(
+            "LDAP user has no usable username and the login name cannot stand in; "
+            "cannot provision HERD account",
+            extra={"action": "ldap_missing_username", "dn": user_dn},
         )
         return None
     return LdapIdentity(username=ldap_username, email=email, dn=user_dn)
@@ -987,7 +1018,26 @@ def _attr_values(entry, attr: str) -> list:
     return list(entry[attr].values) if attr in entry else []
 
 
-def _text_value(value: object) -> str | None:
+# The longest email and username a HERD account can hold (the users table's
+# columns): a longer directory value counts as absent instead of failing at the
+# database (issue #1448 review).
+EMAIL_MAX_LENGTH = User.__table__.c.email.type.length
+USERNAME_MAX_LENGTH = User.__table__.c.username.type.length
+
+# Unicode categories a text value may not hold: controls (Cc: NUL, which
+# Postgres cannot store, tab, newline, escape, DEL, C1), format characters (Cf:
+# right-to-left override, zero-width space and joiners, byte order mark, soft
+# hyphen), line and paragraph separators (Zl, Zp), and surrogates (Cs).
+_REFUSED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
+
+
+def _is_noncharacter(code_point: int) -> bool:
+    """The 66 Unicode noncharacters: U+FDD0 to U+FDEF and the last two code
+    points of every plane (U+FFFE, U+FFFF, U+1FFFE, ...)."""
+    return 0xFDD0 <= code_point <= 0xFDEF or (code_point & 0xFFFE) == 0xFFFE
+
+
+def _text_value(value: object, max_length: int | None = None) -> str | None:
     """A directory attribute value as text, or None when it is not text (issue
     #1448, IAM-LDAP-15). The ONE conversion of a directory value to a string:
     never `str()` one, which turns `bytes` into the text of its repr (`"b'...'"`).
@@ -995,32 +1045,42 @@ def _text_value(value: object) -> str | None:
     ldap3 decodes each value as UTF-8 and, with no schema loaded (this module
     asks for none, get_info=NONE), returns the raw `bytes` when that fails, so a
     value that is not UTF-8 arrives as `bytes`. Text is a `str`, or `bytes` that
-    decode as strict UTF-8, that is not empty and holds no control character
-    (Unicode category Cc: NUL, which Postgres cannot store in a text column, tab,
-    newline, escape, DEL, the C1 range). Every other value is None: `bytes` that
-    are not UTF-8, an empty or control-holding value, and any other type (an int
+    decode as strict UTF-8, that:
+
+    - is not empty once Unicode white space is stripped (a lone space or
+      no-break space is no address and no name);
+    - holds no character of _REFUSED_CATEGORIES and no noncharacter;
+    - is at most max_length characters, when given (the column it is bound for).
+
+    Every other value is None, including any type but `str` and `bytes` (an int
     or a datetime, which a schema-aware ldap3 would return and this module never
-    asks for).
+    asks for). A value that passes is returned exactly as the directory gave it:
+    nothing is stripped, folded, or normalized.
     """
     if isinstance(value, bytes):
         try:
             value = value.decode("utf-8")
         except UnicodeDecodeError:
             return None
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value.strip():
         return None
-    if any(unicodedata.category(ch) == "Cc" for ch in value):
+    for ch in value:
+        if unicodedata.category(ch) in _REFUSED_CATEGORIES or _is_noncharacter(ord(ch)):
+            return None
+    if max_length is not None and len(value) > max_length:
         return None
     return value
 
 
-def _text_values(values: Sequence[object]) -> tuple[list[str], list[str]]:
+def _text_values(
+    values: Sequence[object], max_length: int | None = None
+) -> tuple[list[str], list[str]]:
     """The values that are text, in the order the directory returned them, and
     the class names of the ones that are not (for the log line; never a value)."""
     texts: list[str] = []
     refused: list[str] = []
     for value in values:
-        text = _text_value(value)
+        text = _text_value(value, max_length)
         if text is None:
             refused.append(type(value).__name__)
         else:
@@ -1046,14 +1106,17 @@ def _log_values_not_text(attribute: str, dn: str, refused: list[str]) -> None:
     )
 
 
-def _first_text_value(values: Sequence[object], *, attribute: str, dn: str) -> str | None:
+def _first_text_value(
+    values: Sequence[object], *, attribute: str, dn: str, max_length: int | None = None
+) -> str | None:
     """The first value of a single-valued use (an email, a username, a display
     name) that is text, or None when none is: a value that is not text counts
     as absent, so the caller's missing-attribute rule applies. When values are
     left out, logs one WARNING (_log_values_not_text). Of a multi-valued
     attribute whose first value is not text and whose second is, the second is
-    used: the first text value in the directory's order."""
-    texts, refused = _text_values(values)
+    used: the first text value in the directory's order. max_length bounds the
+    value for the column it is bound for; a longer one is left out the same way."""
+    texts, refused = _text_values(values, max_length)
     if refused:
         _log_values_not_text(attribute, dn, refused)
     return texts[0] if texts else None
@@ -1125,9 +1188,11 @@ def _fetch_group_sync(
     # an empty group that way, so it cannot be refused outright. Note this
     # also means fetch_group proves existence, not group-ness; mapping
     # validation warns on an empty member_dns. A member value that is not text
-    # names no entry HERD can look up, so it is left out and logged; before
-    # issue #1448 the text of its bytes repr went on as a DN, which resolved as
-    # not_found, a skip that never suppresses removals either.
+    # names no entry HERD can look up, so it is left out of member_dns, logged,
+    # and counted: the reconciler records it as a not_text skip that suppresses
+    # the group's removals, since the directory did not prove that member gone.
+    # (Before issue #1448 the text of its bytes repr went on as a DN, which
+    # resolved as not_found, a skip that never suppressed removals.)
     member_dns, refused = _text_values(_attr_values(entry, member_attr))
     if refused:
         _log_values_not_text(member_attr, group_dn, refused)
@@ -1135,6 +1200,7 @@ def _fetch_group_sync(
         dn=entry.entry_dn,
         name=name if name is not None else group_dn,
         member_dns=tuple(member_dns),
+        unreadable_members=len(refused),
     )
 
 
@@ -1152,11 +1218,13 @@ def _resolution_for(conn: Connection, member_dn: str) -> LdapMemberResolution:
         _attr_values(entry, settings.ldap_email_attribute),
         attribute=settings.ldap_email_attribute,
         dn=entry.entry_dn,
+        max_length=EMAIL_MAX_LENGTH,
     )
     username = _first_text_value(
         _attr_values(entry, settings.ldap_username_attribute),
         attribute=settings.ldap_username_attribute,
         dn=entry.entry_dn,
+        max_length=USERNAME_MAX_LENGTH,
     )
     if email is None:
         return LdapMemberResolution(None, MEMBER_SKIP_MISSING_EMAIL)
@@ -1282,12 +1350,13 @@ _PAGED_COOKIE_OID = "1.2.840.113556.1.4.319"
 
 def _paged_user_emails_sync(
     search_filter: str, description: str, holder: "RunConnection | None" = None
-) -> frozenset[str]:
+) -> PresentEmails:
     """Paged SUBTREE enumeration under ldap_user_base_dn, collecting every
     value of ldap_email_attribute (lowercased) across every matching entry
     (an entry may be multi-valued; every value is included) that is text: a
     value that is not (_text_value) is left out, with one WARNING for the
-    whole enumeration (issue #1448).
+    whole enumeration, and an entry with no text value at all is counted in
+    the result's unreadable_entries (issue #1448).
 
     Loops the paged-results cookie, held on ONE connection for the whole
     enumeration, until the directory reports it exhausted. A missing paging
@@ -1305,9 +1374,10 @@ def _paged_user_emails_sync(
     """
     email_attr = settings.ldap_email_attribute
 
-    def _do(conn: Connection) -> frozenset[str]:
+    def _do(conn: Connection) -> PresentEmails:
         emails: set[str] = set()
         refused: list[str] = []
+        unreadable_entries = 0
         cookie: bytes = b""
         while True:
             try:
@@ -1334,6 +1404,8 @@ def _paged_user_emails_sync(
                 texts, entry_refused = _text_values(_attr_values(entry, email_attr))
                 emails.update(text.lower() for text in texts)
                 refused.extend(entry_refused)
+                if entry_refused and not texts:
+                    unreadable_entries += 1
             controls = (conn.result or {}).get("controls") or {}
             page_control = controls.get(_PAGED_COOKIE_OID)
             if not page_control:
@@ -1344,22 +1416,20 @@ def _paged_user_emails_sync(
             if not cookie:
                 break
         if refused:
-            # One line per enumeration, not per entry: a value that is not
-            # text matches no HERD account (issue #1448), as its bytes repr
-            # never did either.
+            # One line per enumeration, not per entry (issue #1448).
             _log_values_not_text(email_attr, settings.ldap_user_base_dn, refused)
-        return frozenset(emails)
+        return PresentEmails(emails, unreadable_entries)
 
     return _call_with_connection(_do, holder)
 
 
-def _present_emails_sync(holder: "RunConnection | None" = None) -> frozenset[str]:
+def _present_emails_sync(holder: "RunConnection | None" = None) -> PresentEmails:
     return _paged_user_emails_sync(
         f"({settings.ldap_email_attribute}=*)", "present-emails enumeration", holder
     )
 
 
-def _disabled_emails_sync(holder: "RunConnection | None" = None) -> frozenset[str]:
+def _disabled_emails_sync(holder: "RunConnection | None" = None) -> PresentEmails:
     return _paged_user_emails_sync(
         f"(&({settings.ldap_email_attribute}=*){settings.ldap_disabled_filter})",
         "disabled-emails enumeration",
@@ -1367,8 +1437,10 @@ def _disabled_emails_sync(holder: "RunConnection | None" = None) -> frozenset[st
     )
 
 
-async def present_emails(*, run_holder: "RunConnection | None" = None) -> frozenset[str]:
-    """Every email attribute value seen under ldap_user_base_dn, lowercased.
+async def present_emails(*, run_holder: "RunConnection | None" = None) -> PresentEmails:
+    """Every email attribute value that is text seen under ldap_user_base_dn,
+    lowercased, with the count of entries whose email could not be read
+    (PresentEmails.unreadable_entries).
 
     The deactivation sweep's absence proof: a candidate whose email is not
     in this set (and was not group-presence-credited this run) is proven
@@ -1379,7 +1451,7 @@ async def present_emails(*, run_holder: "RunConnection | None" = None) -> frozen
     return await anyio.to_thread.run_sync(_present_emails_sync, run_holder)
 
 
-async def disabled_emails(*, run_holder: "RunConnection | None" = None) -> frozenset[str]:
+async def disabled_emails(*, run_holder: "RunConnection | None" = None) -> PresentEmails:
     """Every email attribute value under ldap_user_base_dn matching the
     ldap_disabled_filter setting, conjoined with the email-presence filter.
 
