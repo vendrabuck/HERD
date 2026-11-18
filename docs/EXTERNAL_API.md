@@ -128,11 +128,13 @@ the character at fault. Until issue #1455 each item also carried FastAPI's optio
 `ctx`; both were optional in the published schema and are now gone (see Versioning
 and deprecation policy).
 
-A request body that holds text which cannot be encoded as UTF-8, a lone surrogate (a
-JSON escape such as `\ud800` that is not half of a valid pair), anywhere, in any field
-or key, is answered `422` with the same validation list, one item per place, each
-`{"type": "string_unicode", "loc": [...], "msg": "Input should be a valid string,
-unable to parse raw data as a unicode string"}`, and nothing is forwarded. A
+A JSON request body that holds text which cannot be encoded as UTF-8, a lone surrogate
+(a JSON escape such as `\ud800` that is not half of a valid pair), anywhere, in any
+field or key, is answered `422` with a validation list of exactly one item,
+`{"type": "string_unicode", "loc": ["body"], "msg": "Input should be a valid string,
+unable to parse raw data as a unicode string"}`, which does not name the field, and
+nothing is forwarded. A body that is not valid JSON but holds such an escape gets the
+same answer rather than a JSON decoding error. A
 character outside the Basic Multilingual Plane written as an escaped surrogate pair
 (`\ud83d\udd11`) is one character and is accepted. Before issue #1459 such a body
 reached the facade's own call to reservations and was answered `500`.

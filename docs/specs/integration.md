@@ -201,8 +201,8 @@ the web interface's API does.
   is by decision, a security fix recorded in [EXTERNAL_API.md](../EXTERNAL_API.md)
   (Versioning and deprecation policy): neither key was ever required, and `input`
   echoed the submitted body. A body holding a lone surrogate anywhere (a field, an
-  unknown key) is the same envelope with one `string_unicode` item per location (the
-  shared body check, OPS-VALID-6), and nothing is forwarded: before issue #1459 the
+  unknown key) is the same envelope with exactly one `string_unicode` item at
+  `["body"]` (the shared body check, OPS-VALID-6), and nothing is forwarded: before issue #1459 the
   facade passed it on, httpx could not encode the forwarded body, and the facade
   answered 500. \
   Enforced in: `services/integration/app/schemas/reservation.py` (`V1ReservationRequest`); `services/common/herd_common/validation_errors.py` (`RefuseLoneSurrogates`) \

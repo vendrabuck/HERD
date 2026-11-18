@@ -437,10 +437,10 @@ account with an email, a username, and a password, then sign in with it.
   bytes (IAM-HASH-2). The password must also be one hashing accepts, and exactly that
   (IAM-HASH-3, issue #1426): one holding a NUL character is the 422 `value_error` at
   `["body", "password"]` with the message `Value error, Password must not contain a
-  NUL character`, and one holding a lone surrogate is the 422 `string_unicode` there
-  (since issues #1456 to #1459 answered by the shared body check, OPS-VALID-6 in
-  `operations-and-observability.md`, before the schema runs, with the same type, `loc`,
-  and message). No account is created. \
+  NUL character`. One holding a lone surrogate is the shared body check's 422, one
+  `string_unicode` item at `["body"]` (OPS-VALID-6 in `operations-and-observability.md`,
+  which answers before the schema runs, so the field is not named). No account is
+  created. \
   Enforced in: `services/auth/app/schemas/auth.py` (`RegisterRequest`); `services/auth/app/services/passwords.py` (`validate_password`, `PASSWORD_NUL_MESSAGE`); `services/common/herd_common/validation_errors.py` (`RefuseLoneSurrogates`) \
   Pinned by: `services/auth/tests/test_auth.py` (`test_register_invalid_email`, `test_register_username_too_short`, `test_register_username_invalid_chars`, `test_register_username_max_length`, `test_register_password_too_short`, `test_register_password_too_long`); `services/auth/tests/test_password_input_validation.py` (`test_register_accepts_a_password_exactly_when_hashing_does`, `test_register_schema_names_the_password_and_the_pinned_message`, `test_register_with_a_nul_is_422_with_the_pinned_wording_and_creates_nothing`, `test_register_with_a_lone_surrogate_is_422_string_unicode_and_creates_nothing`, `test_a_register_with_an_honest_8_character_password_still_succeeds`); `tests/integration/test_auth_flow.py` (`test_register_with_a_refused_password_is_422_through_the_gateway`)
 - **IAM-REG-3.** An email or username that already exists, found by the pre-check or by
@@ -495,9 +495,9 @@ short-lived access token and a refresh token.
   token_type: "bearer"}`. \
   Enforced in: `services/auth/app/routers/auth.py` (`login`); `services/auth/app/schemas/auth.py` (`TokenResponse`) \
   Pinned by: `services/auth/tests/test_auth.py` (`test_login`)
-- **IAM-LOGIN-5.** A login password holding a lone surrogate is the 422
-  `string_unicode` at `["body", "password"]`, answered by the shared body check
-  (OPS-VALID-6) before the schema's own refusal. The login body has no NUL check, by
+- **IAM-LOGIN-5.** A login body holding a lone surrogate, in the password or anywhere
+  else, is the shared body check's 422, one `string_unicode` item at `["body"]`
+  (OPS-VALID-6), before the schema's own refusal. The login body has no NUL check, by
   decision (issue #1426): in local mode and the break-glass login a NUL reaches
   `verify_password` and is the 401 of IAM-HASH-3; in LDAP mode it is the 401 of
   IAM-LDAP-13, before any directory call. \
@@ -2127,7 +2127,7 @@ skip list). Recovery: `POST /admin/federated-identities/rewrite-issuer` and
   it sends. Two exceptions, both by the order in which a route reads its body before its
   dependencies run (OPS-VALID-6 in `operations-and-observability.md`): a body that is
   not JSON answers 422 `json_invalid`, and a body holding a lone surrogate anywhere
-  answers the shared 422 `string_unicode` at the string that holds it, each to any
+  answers the shared 422, one `string_unicode` item at `["body"]`, each to any
   caller, with or without a token and whatever its role, the same body for any id,
   which says nothing about an account. All three answer in every
   `AUTH_METHOD`, so in OIDC mode the seeded local superadmin reaches them through the
@@ -2181,7 +2181,7 @@ skip list). Recovery: `POST /admin/federated-identities/rewrite-issuer` and
   the predicate's refusal with the fixed message `must be a non-blank string of at most
   255 characters with no control character`. A lone surrogate (a Cs character) sent as
   a JSON escape never reaches the predicate: the shared body check refuses the body
-  first with `string_unicode` at the string (OPS-VALID-6); the predicate still refuses
+  first, with one `string_unicode` item at `["body"]` (OPS-VALID-6); the predicate still refuses
   one that reaches the schema another way. A relink body with both forms, neither, or half
   a pair is a 422 `relink_target` at `["body"]` with the message `send either issuer and
   subject, or candidate_id, and not both`; a null counts as absent. \

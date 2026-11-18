@@ -878,8 +878,8 @@ routes in section 5; background work `purpose_classify_loop` every
   allowed values and never the submitted one (OPS-VALID-7 in
   `operations-and-observability.md`; issue #1459: it read `Unknown purpose_category
   '<value>'; ...`, and a lone surrogate in the value made the 422 a 500). A value
-  holding a lone surrogate is now refused before the route runs, with the shared 422
-  `string_unicode` (OPS-VALID-6), and nothing is written. \
+  holding a lone surrogate is now refused before the route runs, with the shared 422,
+  one `string_unicode` item at `["body"]` (OPS-VALID-6), and nothing is written. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`validate_purpose_category`); `services/common/herd_common/error_details.py` (`unknown_value_detail`) \
   Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_create_reservation_with_unknown_purpose_category_is_422`, `test_patch_purpose_category_unknown_category_is_422`, `test_create_with_a_lone_surrogate_category_is_422_not_500`, `test_patch_with_a_lone_surrogate_category_is_422_and_changes_nothing`); `tests/integration/test_purpose_category_flow.py` (`test_purpose_category_unknown_value_rejected_through_facade`, `test_a_lone_surrogate_in_a_facade_create_is_a_422_not_a_500`)
 - **RES-PURPOSE-2.** The owner or an admin may set or clear the category in any status,

@@ -883,8 +883,8 @@ is WIRE-DRIVER-6 in `provisioning-and-wiring.md`.
   (422 `internal execute is restricted to action='configure'`, fixed text that never
   holds the submitted action; issue #1458: it ended `; got '<action>'`, and a lone
   surrogate in the action made the 422 a 500), and attributes the run to the body's
-  `user_id`. A body holding a lone surrogate anywhere is the shared 422
-  `string_unicode` (OPS-VALID-6 in `operations-and-observability.md`), answered when the
+  `user_id`. A body holding a lone surrogate anywhere is the shared 422, one
+  `string_unicode` item at `["body"]` (OPS-VALID-6 in `operations-and-observability.md`), answered when the
   body is read, before the token check, and nothing runs. \
   Enforced in: `services/execution/app/routers/executions.py` (`internal_execute`, `_require_internal_token`, `INTERNAL_EXECUTE_ACTION_DETAIL`) \
   Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_internal_execute_uses_internal_token`, `test_internal_execute_rejects_non_configure_action`, `test_internal_execute_with_a_lone_surrogate_action_is_422_and_runs_nothing`, `test_require_internal_token_rejects_missing`, `test_require_internal_token_errors_when_not_configured`)
