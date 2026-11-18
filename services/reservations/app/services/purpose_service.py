@@ -43,6 +43,7 @@ import uuid
 from datetime import datetime, timezone
 
 import httpx
+from herd_common.error_details import unknown_value_detail
 from herd_common.internal_client import InternalTokenAuth, call_service
 from herd_common.pagination import paginate
 from sqlalchemy import select, update
@@ -72,13 +73,15 @@ def validate_purpose_category(value: str | None) -> str | None:
     Raises ValueError with a pinned message otherwise, mirroring the rest of
     this service's business-rule layer (create_reservation and friends raise
     ValueError for a caller-fixable 422; the router maps it to
-    HTTPException(422, detail=str(exc))).
+    HTTPException(422, detail=str(exc))). The message names the field and the
+    allowed values, never the submitted value (issue #1459): it echoed the value,
+    of any length, and a lone surrogate in it made the 422 a 500.
     """
     if value is None:
         return None
     allowed = settings.purpose_categories
     if value not in allowed:
-        raise ValueError(f"Unknown purpose_category '{value}'; allowed: {', '.join(allowed)}")
+        raise ValueError(unknown_value_detail("purpose_category", allowed))
     return value
 
 
