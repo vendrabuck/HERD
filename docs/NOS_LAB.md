@@ -474,9 +474,9 @@ sudo modprobe vrf dummy
 make nos-reset
 ```
 
-A GitHub Actions runner is the known case; both `ci.yml`'s `nos-dialect` job and
-`nightly.yml`'s feature-tier step run that `modprobe` before booting the lab, and
-neither treats its failure as fatal.
+The runner image does not load the modules by default, so both `ci.yml`'s
+`nos-dialect` job and `nightly.yml`'s feature-tier step run that `modprobe`
+before booting the lab, and neither treats a failure to load as fatal.
 
 Verifying a VRF route independently, the way the live tests do (never through
 the driver's own session):
