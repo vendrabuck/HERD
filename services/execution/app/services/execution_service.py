@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import httpx
 from fastapi import HTTPException
-from herd_common.config_redaction import redact_config
+from herd_common.config_redaction import redact_command_text, redact_config
 from herd_common.device_config import (
     ConfigValidationError,
     PublishedSchemaError,
@@ -678,8 +678,18 @@ async def _drive_run(
                     role=device_data.get("name") or None,
                 )
         except ConfigValidationError as exc:
-            run = await update_execution_run(db, run, status="FAILED", error=str(exc))
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            # The refusal names where the config is wrong and which rule it broke,
+            # never a value from it (herd_common.device_config, issue #1457). The
+            # row is read by the reservation's owner and by the assistant, so the
+            # reason is also masked the way CFG-EXEC-8 masks the stored arguments
+            # before it is stored; the 422 answers the same text (CFG-EXEC-10).
+            # Only the reason: the prefix holds the device's name, free text that
+            # can hold a credential keyword (`core key switch`), and masking it
+            # would cut the whole refusal off after that word.
+            masked_reason, _ = redact_command_text(exc.reason)
+            refusal_text = f"{exc.prefix}: {masked_reason}"
+            run = await update_execution_run(db, run, status="FAILED", error=refusal_text)
+            raise HTTPException(status_code=422, detail=refusal_text) from None
 
     # Fetch the driver's metadata for the dry-run gate (cheap: cached row read).
     driver_metadata = await get_driver_metadata(db, driver_id)

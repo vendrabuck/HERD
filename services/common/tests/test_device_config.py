@@ -245,14 +245,16 @@ def test_layer3_route_without_next_hop_passes():
 # --- Error chaining -----------------------------------------------------------
 
 
-def test_schema_failure_chains_original_validation_error():
-    """The raised ConfigValidationError preserves the jsonschema cause so
-    debuggers/loggers can see the underlying failure."""
-    import jsonschema
-
+def test_schema_failure_does_not_chain_the_validation_error():
+    """Issue #1457 reversed the old chaining: the jsonschema error's message
+    quotes the submitted config, and a logged traceback prints a cause and a
+    context, so the ConfigValidationError carries neither.
+    test_device_config_refusal_text.py pins the text itself."""
     with pytest.raises(ConfigValidationError) as exc:
         validate_device_config("Management", {"vlan": 99999})
-    assert isinstance(exc.value.__cause__, jsonschema.ValidationError)
+    assert exc.value.__cause__ is None
+    assert exc.value.__context__ is None
+    assert "99999" not in str(exc.value)
 
 
 # --- validate_device_config_with_schema: golden backward-compat (schema=None) -

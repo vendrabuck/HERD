@@ -1336,6 +1336,20 @@ its `config_schema()` returns an object schema for `{commands, command}` (raw
 vtysh config lines), which the registry's `additionalProperties: false`
 Management schema would otherwise reject.
 
+A config your schema refuses is answered (and, for a `configure` run, stored on the
+run) as `device '<name>': config failed schema validation at <path>: <rule>`, for
+example `at commands[0]: must be at most 512 characters long` (issue #1457). The text
+never quotes the refused value, and it never quotes your schema's own free text either:
+an `enum`, a `const`, or a `pattern` from a published schema is named only as
+`must be one of the values the schema allows` or `must match the schema's pattern`, so
+a user reads the allowed values from `GET /drivers/{id}/config-schema`. Numbers (length,
+count, and range bounds), type names, and field names are shown; a field name your
+schema defines (in `required` or `dependentRequired`) is shown only when it is a plain
+name of at most 64 characters (a letter or `_`, then letters, digits, `_`, `-`, or `.`),
+and is otherwise counted (`needs a required field`). The `format` keyword is not
+enforced: HERD builds its validators without a format checker, so a value that breaks
+your `format` is accepted today; check it in `configure` if it matters.
+
 ## Hypervisor driver contract (dynamic resources, ADR 0004, issue #32)
 
 A service recipe is an ordinary driver package whose `connection_type` is `Hypervisor`.
