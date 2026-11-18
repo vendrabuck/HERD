@@ -8,6 +8,7 @@ through cabling and a mock L1 switch.
 """
 
 import io
+import json
 import tarfile
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -75,13 +76,35 @@ async def test_purpose_category_via_v1_facade_read_back_and_patch(admin_client, 
 
 async def test_purpose_category_unknown_value_rejected_through_facade(admin_client, fresh_device):
     """An unknown category is rejected with the same 422 wording whether the
-    caller goes through the v1 facade or the interactive endpoint directly."""
+    caller goes through the v1 facade or the interactive endpoint directly. The
+    wording names the allowed values, never the submitted one (issue #1459)."""
     resp = await admin_client.post(
         "/v1/reservations",
         json=_reservation_body(fresh_device["id"], purpose_category="not_a_real_category"),
     )
     assert resp.status_code == 422
-    assert "Unknown purpose_category" in str(resp.json()["detail"])
+    assert resp.json()["detail"].startswith("Unknown purpose_category; allowed: ")
+    assert "not_a_real_category" not in resp.text
+
+
+async def test_a_lone_surrogate_in_a_facade_create_is_a_422_not_a_500(admin_client, fresh_device):
+    """Issue #1459: the facade could not encode the forwarded body (httpx refuses a
+    lone surrogate) and answered 500. The shared body check refuses it first."""
+    body = json.dumps(
+        _reservation_body(fresh_device["id"], purpose_category="x" + chr(0xD800)),
+        ensure_ascii=True,
+    ).encode("ascii")
+    resp = await admin_client.post(
+        "/v1/reservations", content=body, headers={"content-type": "application/json"}
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"] == [
+        {
+            "type": "string_unicode",
+            "loc": ["body", "purpose_category"],
+            "msg": "Input should be a valid string, unable to parse raw data as a unicode string",
+        }
+    ]
 
 
 async def test_utilization_report_by_purpose_includes_classified_reservation(
