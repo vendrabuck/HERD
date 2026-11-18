@@ -17,9 +17,10 @@ import pytest
 from app import config as config_module
 from app.database import Base, engine
 from app.main import app
-from app.models.conversation import AssistantMessage
+from app.models.conversation import AssistantConversation, AssistantMessage, MessageRole
 from app.routes.reservation_assistant import get_reservation_seed_dep
 from app.services.ai_client import AIClient, get_ai_client
+from app.services.conversation_repo import _blocks_to_json
 from app.services.llm_provider import (
     ProviderResponse,
     TextBlock,
@@ -58,9 +59,9 @@ def _configured(monkeypatch):
     app.dependency_overrides.clear()
 
 
-def _token() -> str:
+def _token(sub: uuid.UUID | None = None) -> str:
     payload = {
-        "sub": str(uuid.uuid4()),
+        "sub": str(sub or uuid.uuid4()),
         "role": "user",
         "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
     }
@@ -187,3 +188,113 @@ async def test_no_stored_credential_reaches_the_provider_or_the_stored_conversat
     stored_text = json.dumps(stored)
     assert CANARY not in stored_text
     assert "[redacted]" in stored_text
+
+
+async def test_a_conversation_stored_before_masking_is_masked_when_it_is_resent():
+    """AI-TOOL-13: a conversation whose tool results were stored unmasked (before
+    issue #1464) resends them masked on its next turn; the rows are unchanged."""
+    user_id = uuid.uuid4()
+    unmasked_config = json.dumps(
+        {"has_config": True, "version_number": 4, "config": {"commands": COMMANDS}}
+    )
+    # A run list the char cap cut: not JSON any more, so it is line-masked.
+    truncated_runs = (
+        json.dumps({"items": [{"output": json.dumps({"applied": COMMANDS})}]})[:120]
+        + "\n... [truncated: 900 chars omitted]"
+    )
+    manual_text = json.dumps({"source": "herd-manual", "text": "Set the password in the UI."})
+    tool_blocks = [
+        ToolResultBlock(tool_use_id="toolu_cfg", content=unmasked_config),
+        ToolResultBlock(tool_use_id="toolu_runs", content=truncated_runs),
+        ToolResultBlock(tool_use_id="toolu_doc", content=manual_text),
+        ToolResultBlock(tool_use_id="toolu_unknown", content=f"enable secret {CANARY}"),
+    ]
+    async with _Session() as db:
+        conv = AssistantConversation(
+            user_id=user_id,
+            reservation_id=RESERVATION_ID,
+            seed_block="<reservation/>",
+            turn_count=1,
+        )
+        db.add(conv)
+        await db.flush()
+        rows = [
+            (MessageRole.USER, [TextBlock(text="<reservation/> what is on r1?")]),
+            (
+                MessageRole.ASSISTANT,
+                [
+                    ToolUseBlock(id="toolu_cfg", name="get_device_current_config", input={}),
+                    ToolUseBlock(id="toolu_runs", name="list_executions_for_reservation", input={}),
+                    ToolUseBlock(id="toolu_doc", name="read_doc", input={}),
+                ],
+            ),
+            (MessageRole.TOOL, tool_blocks),
+            (MessageRole.ASSISTANT, [TextBlock(text="It peers with 192.0.2.1.")]),
+        ]
+        for position, (role, blocks) in enumerate(rows):
+            db.add(
+                AssistantMessage(
+                    conversation_id=conv.id,
+                    role=role,
+                    content_blocks=_blocks_to_json(blocks),
+                    position=position,
+                )
+            )
+        await db.commit()
+        conversation_id = conv.id
+        stored_tool_row = _blocks_to_json(tool_blocks)
+
+    assert CANARY in truncated_runs and CANARY in unmasked_config
+
+    class _AnswerOnly:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def call(self, **kwargs):
+            self.calls.append(kwargs)
+            return ProviderResponse(
+                content=[TextBlock(text="It is masked.")],
+                stop_reason="end_turn",
+                usage=Usage(input_tokens=5, output_tokens=5),
+                raw_model="scripted",
+            )
+
+    provider = _AnswerOnly()
+    app.dependency_overrides[get_ai_client] = lambda: AIClient(provider=provider, max_tokens=64)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/reservations/{RESERVATION_ID}/assistant",
+            json={"question": "and the password?", "conversation_id": str(conversation_id)},
+            headers={"Authorization": f"Bearer {_token(user_id)}"},
+        )
+    assert resp.status_code == 200, resp.text
+
+    assert len(provider.calls) == 1
+    sent = provider.calls[0]
+    assert CANARY not in repr(sent)
+    resent = {
+        block.tool_use_id: block.content
+        for message in sent["messages"]
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+    }
+    assert json.loads(resent["toolu_cfg"])["config"]["commands"] == [
+        "router bgp 65000",
+        " neighbor 192.0.2.1 password [redacted]",
+        " exit",
+    ]
+    assert "[redacted]" in resent["toolu_runs"]
+    assert resent["toolu_doc"] == manual_text
+    assert resent["toolu_unknown"] == "enable secret [redacted]"
+
+    async with _Session() as db:
+        row = (
+            await db.execute(
+                select(AssistantMessage).where(
+                    AssistantMessage.conversation_id == conversation_id,
+                    AssistantMessage.position == 2,
+                )
+            )
+        ).scalar_one()
+    assert row.content_blocks == stored_tool_row

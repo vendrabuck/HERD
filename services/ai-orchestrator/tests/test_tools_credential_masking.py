@@ -538,5 +538,118 @@ async def test_propose_config_change_refuses_a_payload_holding_the_redacted_mark
         )
     assert result["is_error"] is True
     assert json.loads(result["content"])["message"] == REDACTED_MARKER_REFUSAL
+    # The guidance names both units of a payload: a command line and a key.
+    assert REDACTED_MARKER_REFUSAL == (
+        "config_payload contains [redacted], a masked value from a tool result, not "
+        "the device's real text; leave out every line or key that holds it"
+    )
     # Refused before any call to inventory.
     assert seen == []
+
+
+# --- the marker keys are the tool's alone ---
+
+
+async def test_current_config_markers_are_always_the_tools_own():
+    # Nothing to mask, but the stored record carries every marker key: none of
+    # its values survives.
+    detail = _metadata(
+        config={"hostname": "r1"},
+        redacted=True,
+        note="stored note",
+        withheld=9,
+        config_withheld=True,
+        has_config=False,
+    )
+    body, _ = await _current_config(httpx.Response(200, json=detail))
+    assert body["has_config"] is True
+    assert body["redacted"] is False
+    assert "note" not in body
+    assert "withheld" not in body
+    assert "config_withheld" not in body
+    assert body["config"] == {"hostname": "r1"}
+
+
+async def test_run_list_envelope_cannot_set_a_marker():
+    body = {
+        "items": [_run_row()],
+        "total": 1,
+        "skip": 0,
+        "limit": 20,
+        "note": "upstream note",
+        "withheld": 4,
+        "redacted": True,
+        "config_withheld": True,
+        "has_config": True,
+    }
+    result = await _runs(body)
+    answer = json.loads(result["content"])
+    assert answer == {"total": 1, "skip": 0, "limit": 20, "items": [_run_row()], "redacted": False}
+
+
+async def test_withheld_version_markers_replace_the_stored_ones():
+    detail = _metadata(config=["not", "an", "object"], note="stored note", withheld=3)
+    body, _ = await _current_config(httpx.Response(200, json=detail))
+    assert body["note"] == CONFIG_WITHHELD_NOTE
+    assert "withheld" not in body
+    assert body["config_withheld"] is True
+
+
+async def test_current_config_masks_the_shapes_the_review_found_leaking():
+    # Keys the line keywords name, keywords with punctuation attached, and
+    # JSON held in a string (issue #1464 review).
+    config = {
+        "authentication-key": CANARY,
+        "key-string": CANARY,
+        "message-digest-key": CANARY,
+        "passphrase": CANARY,
+        "pre_shared_key": CANARY,
+        "tacacsKey": CANARY,
+        "wpa_passphrase": CANARY,
+        "commands": [
+            f"Password: {CANARY}",
+            f"PASSWORD={CANARY}",
+            f"login password={CANARY}",
+            f"key:{CANARY}",
+            f"set mgt-config users admin phash {CANARY}",
+            f"wpa-psk ascii {CANARY}",
+        ],
+        "blob": json.dumps({"admin-user": {"hashed-password": CANARY}}),
+    }
+    body, raw = await _current_config(httpx.Response(200, json=_metadata(config=config)))
+    assert CANARY not in raw
+    assert body["redacted"] is True
+    assert json.loads(body["config"]["blob"]) == {"admin-user": {"hashed-password": REDACTED_VALUE}}
+
+
+# --- replaying a stored tool result (AI-TOOL-13) ---
+
+
+def test_a_replayed_result_is_masked_as_a_structure_or_as_text():
+    stored = json.dumps({"config": {"commands": [f"neighbor 1 password {CANARY}"]}})
+    masked = tools.mask_replayed_tool_result("get_device_current_config", stored)
+    assert json.loads(masked) == {"config": {"commands": [f"neighbor 1 password {REDACTED_VALUE}"]}}
+    cut = stored[:60] + "\n... [truncated: 10 chars omitted]"
+    assert CANARY not in tools.mask_replayed_tool_result(None, cut)
+
+
+def test_a_replayed_documentation_result_is_resent_as_stored():
+    stored = json.dumps({"text": f"Set the password {CANARY} in the UI."})
+    assert tools.mask_replayed_tool_result("read_doc", stored) == stored
+    assert tools.mask_replayed_tool_result("search_docs", stored) == stored
+
+
+@pytest.mark.parametrize("content", [{"password": CANARY}, None, 7], ids=["dict", "none", "int"])
+def test_a_replayed_result_that_is_not_text_is_withheld(content):
+    replaced = tools.mask_replayed_tool_result("get_device", content)
+    assert json.loads(replaced) == {"withheld": True, "note": tools.REPLAY_WITHHELD_NOTE}
+
+
+def test_a_replayed_result_whose_masking_fails_is_withheld(monkeypatch):
+    def failing(value):
+        raise RuntimeError("mask failed")
+
+    monkeypatch.setattr(tools, "redact_config", failing)
+    replaced = tools.mask_replayed_tool_result("get_device", f"enable secret {CANARY}")
+    assert CANARY not in replaced
+    assert json.loads(replaced)["note"] == tools.REPLAY_WITHHELD_NOTE

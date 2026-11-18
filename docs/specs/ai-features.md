@@ -71,8 +71,8 @@ to `reservations.md`.
 | GET | `/status` | anyone, no token | 200 | AI-PROV-5, AI-PROV-6, AI-PROV-7, AI-PROV-8 |
 | POST | `/generate` | any signed-in user | 200 | AI-PROV-2, AI-GEN-1 to AI-GEN-16, AI-UPLOAD-1 to AI-UPLOAD-25, AI-RESOLVE-1 to AI-RESOLVE-15, AI-QUOTA-2 |
 | POST | `/commit` | any signed-in user; upstream services apply their own rules to the caller's JWT | 200 | AI-COMMIT-1 to AI-COMMIT-19 |
-| POST | `/reservations/{id}/assistant` | the reservation's owner (first turn); the conversation's creator on the same reservation (later turns) | 200 | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-TURN-1 to AI-TURN-9, AI-TOOL-1 to AI-TOOL-12, AI-WRITE-1 to AI-WRITE-4 |
-| POST | `/reservations/{id}/assistant/stream` | as above | 200 (`text/event-stream`) | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-STREAM-1 to AI-STREAM-7, AI-TOOL-1 to AI-TOOL-12, AI-WRITE-1 to AI-WRITE-4 |
+| POST | `/reservations/{id}/assistant` | the reservation's owner (first turn); the conversation's creator on the same reservation (later turns) | 200 | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-TURN-1 to AI-TURN-9, AI-TOOL-1 to AI-TOOL-13, AI-WRITE-1 to AI-WRITE-4 |
+| POST | `/reservations/{id}/assistant/stream` | as above | 200 (`text/event-stream`) | AI-PROV-2, AI-CONV-1 to AI-CONV-12, AI-LOOP-1 to AI-LOOP-8, AI-STREAM-1 to AI-STREAM-7, AI-TOOL-1 to AI-TOOL-13, AI-WRITE-1 to AI-WRITE-4 |
 | POST | `/templates/suggest-identity` | admin or superadmin | 200 | AI-PROV-2, AI-IDENT-1 to AI-IDENT-5, AI-QUOTA-2 |
 | GET | `/quota` | any signed-in user (own usage) | 200 | AI-QUOTA-7 |
 | GET | `/usage` | admin or superadmin | 200 | AI-QUOTA-8 |
@@ -1132,10 +1132,10 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   `method_kwargs` execution stores masked since CFG-EXEC-8, but not on a row written
   before it) and `error` field by field, and its `output`, the JSON text of what the
   driver returned (for `frr_mgmt`, the command list it applied or attempted and the
-  device's echo), parsed and masked as a structure and written back as JSON text, or
-  masked line by line when it is not JSON. An answer without a list under `items` is a
-  tool error. \
-  Enforced in: `services/ai-orchestrator/app/services/tools.py` (`_tool_list_executions_for_reservation`, `_mask_run_row`, `_mask_run_output`) \
+  device's echo), masked as a structure by the mask's JSON-in-a-string rule and
+  written back as JSON text, or line by line when it is not JSON or is over 256 KiB.
+  An answer without a list under `items` is a tool error. \
+  Enforced in: `services/ai-orchestrator/app/services/tools.py` (`_tool_list_executions_for_reservation`, `_mask_record`) \
   Pinned by: `services/ai-orchestrator/tests/test_tools.py` (`test_list_executions_schema_has_no_reservation_id_property`, `test_list_executions_injects_reservation_id_ignoring_model_input`, `test_list_executions_forwards_device_id_and_status_filters`, `test_list_executions_translates_403_to_friendly_tool_error`); `services/ai-orchestrator/tests/test_tools_credential_masking.py` (`test_run_list_masks_arguments_output_and_error`, `test_run_output_that_is_not_json_is_masked_line_by_line`, `test_run_list_without_credentials_is_returned_whole_and_marked_false`, `test_run_list_refuses_an_answer_of_an_unexpected_shape`)
 - **AI-TOOL-9.** `find_path` calls cabling `POST /pathfind` and maps a 404 to a tool error. \
   Enforced in: `services/ai-orchestrator/app/services/tools.py` (`_tool_find_path`) \
@@ -1144,18 +1144,22 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   a tool error before any HTTP call. \
   Enforced in: `services/ai-orchestrator/app/services/tools.py` (`_require_uuid`) \
   Pinned by: `services/ai-orchestrator/tests/test_tools.py` (`test_get_device_rejects_non_uuid_arg`)
-- **AI-TOOL-12.** No credential value from a stored device configuration, or from an
-  execution run that carries one, reaches a tool result, and so none reaches the
-  provider or `assistant_messages.content_blocks` (issue #1464). The three tools that
-  relay such text (`get_device_current_config`, `list_device_config_history`,
-  `list_executions_for_reservation`) mask it with `redact_config`, the rule of CFG-EXEC-8
-  (`device-configuration.md`): a value under a key whose name matches the credential key
-  pattern becomes `[redacted]`, and inside a string the rest of a line after a
-  credential keyword does. Each result carries `redacted`, true when anything was masked
-  or left out, and when it is true a fixed `note` (`REDACTED_NOTE`) telling the model
-  that `[redacted]` is not the stored text and must not be copied into a configuration;
-  the marker keys are set after the stored record is copied in, so a record cannot set
-  them. Masking fails closed, the way AI-TOOL-4 empties `field_data`: a version detail
+- **AI-TOOL-12.** No value that the credential mask recognizes, from a stored device
+  configuration or from an execution run that carries one, reaches a tool result, and
+  so none reaches the provider or `assistant_messages.content_blocks` (issue #1464); a
+  value the mask does not recognize (the limits in section 13: an unrecognized key
+  name, free text with no keyword before it, a secret on the line after its keyword)
+  is sent. The three tools that relay such text (`get_device_current_config`,
+  `list_device_config_history`, `list_executions_for_reservation`) mask it with
+  `redact_config`, the mask of CFG-EXEC-8 (`device-configuration.md`): a value under a
+  credential-named key, JSON held in a string as a structure, and in any other string a
+  URL password and the rest of a line after a credential keyword become `[redacted]`.
+  Each result carries `redacted`, true when anything was masked or left out, and when
+  it is true a fixed `note` (`REDACTED_NOTE`) telling the model that `[redacted]` is not
+  the stored text and must not be copied into a configuration. The marker keys
+  (`has_config`, `redacted`, `note`, `withheld`, `config_withheld`) are the tool's own:
+  every one the stored record or upstream envelope carried is removed and the tool
+  writes its own after, every time (`_with_markers`). Masking fails closed, the way AI-TOOL-4 empties `field_data`: a version detail
   whose `config` is not an object, that is not JSON, or whose masking raises is answered
   with its masked metadata (the listing item's when the detail is not an object), no
   `config`, `config_withheld: true`, and `CONFIG_WITHHELD_NOTE`, or with the version id
@@ -1163,8 +1167,24 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   an object or whose masking raises is left out and counted in `withheld`, with
   `ITEMS_WITHHELD_NOTE`. Nothing is ever passed through unmasked. The other tools relay
   no stored configuration; section 13 lists what each sends and the mask's limits. \
-  Enforced in: `services/ai-orchestrator/app/services/tools.py` (`_mask_record`, `_mask_run_row`, `_mask_run_output`, `_mask_items`, `_mark_masked`, `_config_version_result`, `_withheld_version_result`, `REDACTED_NOTE`, `CONFIG_WITHHELD_NOTE`, `ITEMS_WITHHELD_NOTE`); `services/common/herd_common/config_redaction.py` (`redact_config`, `redact_command_text`) \
-  Pinned by: `services/ai-orchestrator/tests/test_tools_credential_masking.py` (`test_current_config_masks_every_in_repo_driver_shape`, `test_current_config_marker_cannot_be_overwritten_by_the_stored_record`, `test_current_config_withholds_a_payload_that_is_not_an_object`, `test_current_config_withholds_a_detail_that_is_not_an_object`, `test_current_config_withholds_when_masking_the_payload_fails`, `test_current_config_keeps_only_the_id_when_nothing_can_be_masked`, `test_history_leaves_out_an_item_it_cannot_mask`, `test_history_leaves_out_an_item_whose_masking_fails`, `test_run_list_leaves_out_a_row_it_cannot_mask`, `test_run_list_leaves_out_a_row_whose_masking_fails`); `services/ai-orchestrator/tests/test_assistant_credential_masking_route.py` (`test_no_stored_credential_reaches_the_provider_or_the_stored_conversation`)
+  Enforced in: `services/ai-orchestrator/app/services/tools.py` (`_mask_record`, `_mask_items`, `_mark_masked`, `_with_markers`, `_MARKER_KEYS`, `_config_version_result`, `_withheld_version_result`, `REDACTED_NOTE`, `CONFIG_WITHHELD_NOTE`, `ITEMS_WITHHELD_NOTE`); `services/common/herd_common/config_redaction.py` (`redact_config`, `redact_command_text`) \
+  Pinned by: `services/ai-orchestrator/tests/test_tools_credential_masking.py` (`test_current_config_masks_every_in_repo_driver_shape`, `test_current_config_masks_the_shapes_the_review_found_leaking`, `test_current_config_marker_cannot_be_overwritten_by_the_stored_record`, `test_current_config_markers_are_always_the_tools_own`, `test_run_list_envelope_cannot_set_a_marker`, `test_withheld_version_markers_replace_the_stored_ones`, `test_current_config_withholds_a_payload_that_is_not_an_object`, `test_current_config_withholds_a_detail_that_is_not_an_object`, `test_current_config_withholds_when_masking_the_payload_fails`, `test_current_config_keeps_only_the_id_when_nothing_can_be_masked`, `test_history_leaves_out_an_item_it_cannot_mask`, `test_history_leaves_out_an_item_whose_masking_fails`, `test_run_list_leaves_out_a_row_it_cannot_mask`, `test_run_list_leaves_out_a_row_whose_masking_fails`); `services/ai-orchestrator/tests/test_assistant_credential_masking_route.py` (`test_no_stored_credential_reaches_the_provider_or_the_stored_conversation`)
+- **AI-TOOL-13.** A conversation's stored tool results are masked again each time the
+  conversation is loaded for a provider call, so a conversation stored before
+  AI-TOOL-12 never resends an unmasked configuration or run output (issue #1464). Each
+  stored `tool_result` block is matched to its tool by the `tool_use` block of the same
+  id; its content (a serialized tool result) goes through `redact_config`, which masks
+  JSON as a structure and other text, such as a result the char cap cut, line by line;
+  content that is not text, or whose masking raises, is replaced by
+  `{"withheld": true, "note": REPLAY_WITHHELD_NOTE}`. A result of `search_docs` or
+  `read_doc` is resent as stored (operator-approved reference text, never device data;
+  the line rule would cut every manual line that mentions a password), and an
+  unmatched result is masked. Text blocks, the user's and the assistant's, are resent
+  as stored: masking prose would cut ordinary chat at every mention of a password, so
+  an assistant turn written before issue #1464 that quoted a credential is resent
+  (section 13). The stored rows are never changed. \
+  Enforced in: `services/ai-orchestrator/app/services/conversation_repo.py` (`load_messages`, `_mask_replayed_tool_results`); `services/ai-orchestrator/app/services/tools.py` (`mask_replayed_tool_result`, `REPLAY_WITHHELD_NOTE`) \
+  Pinned by: `services/ai-orchestrator/tests/test_assistant_credential_masking_route.py` (`test_a_conversation_stored_before_masking_is_masked_when_it_is_resent`); `services/ai-orchestrator/tests/test_tools_credential_masking.py` (`test_a_replayed_result_is_masked_as_a_structure_or_as_text`, `test_a_replayed_documentation_result_is_resent_as_stored`, `test_a_replayed_result_that_is_not_text_is_withheld`, `test_a_replayed_result_whose_masking_fails_is_withheld`)
 - **AI-WRITE-1.** `propose_config_change` and `schedule_config_apply` are offered only when
   `AI_WRITE_TOOLS_ENABLED` is set, and a call to either while it is off is refused at
   dispatch (`write tools are disabled`) even if the model names it; read tools are
@@ -1190,9 +1210,11 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
 
 - **AI-WRITE-4.** `propose_config_change` refuses a `config_payload` holding `[redacted]`
   in any string or key, before any call to inventory, with the tool error
-  `config_payload contains [redacted], a masked value from a tool result, not the device's real text; leave out every line that holds it`,
+  `config_payload contains [redacted], a masked value from a tool result, not the device's real text; leave out every line or key that holds it`,
   so a masked line the model copies from a read tool (AI-TOOL-12) is never stored as the
-  device's credential (issue #1464). \
+  device's credential (issue #1464). The match is exact and case-sensitive on
+  `[redacted]`: the rule guards against the model copying masked text, not against an
+  adversary, who could write any value through the UI anyway. \
   Enforced in: `services/ai-orchestrator/app/services/tools.py` (`_tool_propose_config_change`, `_holds_redacted_marker`, `REDACTED_MARKER_REFUSAL`) \
   Pinned by: `services/ai-orchestrator/tests/test_tools_credential_masking.py` (`test_propose_config_change_refuses_a_payload_holding_the_redacted_marker`)
 
@@ -1956,11 +1978,13 @@ AI-UPLOAD-25; #1279 by AI-UPLOAD-8; #1280 by AI-TURN-9.)
   sparse member (AI-UPLOAD-16, for example a `tar --sparse` archive of a file with holes)
   is refused.
 - The credential mask of AI-TOOL-12 is CFG-EXEC-8's heuristic (`device-configuration.md`,
-  section 13, and the `config_redaction.py` module docstring): a secret under a key name
-  the pattern does not match (`psk`, `md5`, `key`, `passphrase`), a secret in free text
-  with no keyword before it on its line, and a secret written as a key name itself reach
-  the provider. Issue #1464 checked every in-repo driver's configuration fields and
-  widened the keywords for the FRR lines the mask missed.
+  section 13, and the `config_redaction.py` module docstring): a secret under a key none
+  of whose parts is a keyword (`pw`, `otp`, `privkey`), a secret in free text with no
+  keyword before it on its line, a secret on the line or list item after its keyword, a
+  keyword glued to its value, encoded text, and a secret written as a key name itself
+  reach the provider. Issue #1464 checked every in-repo driver's configuration fields
+  and widened the mask for the FRR, IOS, EOS, PAN-OS, and SR Linux forms its review
+  found.
 - What the other AI surfaces send to the provider, as reviewed for issue #1464. Not
   masked because not a stored configuration or credential by design: `get_device` and
   `get_device_ports` send every `field_data` value except password-typed fields
@@ -1980,8 +2004,12 @@ AI-UPLOAD-25; #1279 by AI-UPLOAD-8; #1280 by AI-TURN-9.)
   AI-PURPOSE-9).
 - A tool result stored before issue #1464 keeps the unmasked configuration in
   `assistant_messages.content_blocks` until the conversation is swept (AI-CONV-9,
-  AI-CONV-13); the upgrade rewrites no row ([OPERATIONS.md](../OPERATIONS.md), "Upgrade
-  path").
+  AI-CONV-13); the upgrade rewrites no row, and AI-TOOL-13 masks it whenever it is
+  resent. An assistant turn written before issue #1464 that quoted a credential is
+  resent as written on every later turn of its conversation and through purpose
+  classification's transcripts (AI-PURPOSE-9) until the sweep (24 hours idle by
+  default, longer under the purpose-classification exemption of AI-CONV-13):
+  [OPERATIONS.md](../OPERATIONS.md), "Upgrade path".
 - `GET /status` is unauthenticated and its construction probe is cached for 30 seconds
   (AI-PROV-5, AI-PROV-7): issue #606 and the docstring of `_ProviderConstructionCache`.
 - Usage rows are written only when a quota is configured (AI-QUOTA-1): the comment on

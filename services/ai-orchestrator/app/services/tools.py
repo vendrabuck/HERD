@@ -34,7 +34,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
-from herd_common.config_redaction import REDACTED_VALUE, redact_command_text, redact_config
+from herd_common.config_redaction import REDACTED_VALUE, redact_config
 
 from app.config import settings
 from app.services import docs_sources, docs_web
@@ -70,7 +70,7 @@ ITEMS_WITHHELD_NOTE = (
 )
 REDACTED_MARKER_REFUSAL = (
     f"config_payload contains {REDACTED_VALUE}, a masked value from a tool result, not "
-    f"the device's real text; leave out every line that holds it"
+    f"the device's real text; leave out every line or key that holds it"
 )
 
 
@@ -473,38 +473,6 @@ def _mask_record(record: Any) -> tuple[dict[str, Any], bool]:
     return masked, changed
 
 
-def _mask_run_output(output: Any) -> tuple[Any, bool]:
-    """Mask a run's `output`, the JSON text of what the driver returned.
-
-    The text is parsed and the structure masked, then written back as JSON: a
-    driver's returned command list (frr_mgmt's `applied` and `attempted`) is
-    stored on ONE line, where the line rule would also mask every command after
-    the first keyword. Text that is not JSON is masked line by line.
-    """
-    if output is None:
-        return None, False
-    if not isinstance(output, str):
-        return redact_config(output)
-    try:
-        parsed = json.loads(output)
-    except ValueError:
-        return redact_command_text(output)
-    masked, changed = redact_config(parsed)
-    return (json.dumps(masked) if changed else output), changed
-
-
-def _mask_run_row(row: Any) -> tuple[dict[str, Any], bool]:
-    """A masked copy of one execution run row: `output` through
-    _mask_run_output, every other field through redact_config."""
-    if not isinstance(row, dict):
-        raise _Unmaskable("run row is not an object")
-    rest, changed = _mask_record({k: v for k, v in row.items() if k != "output"})
-    if "output" in row:
-        rest["output"], output_changed = _mask_run_output(row["output"])
-        changed = changed or output_changed
-    return rest, changed
-
-
 def _mask_items(
     tool_name: str, items: list[Any], mask_one: Any
 ) -> tuple[list[dict[str, Any]], bool, int]:
@@ -529,19 +497,45 @@ def _mask_items(
     return masked_items, masked_any, withheld
 
 
+# Every key a masking tool sets on its result (issue #1464). They are removed
+# from whatever the stored record carried and then written by the tool, every
+# time, so a stored record or upstream envelope can never set or keep one.
+_MARKER_KEYS = ("has_config", "redacted", "note", "withheld", "config_withheld")
+
+
+def _with_markers(
+    record: dict[str, Any],
+    *,
+    redacted: bool,
+    notes: list[str],
+    withheld: int = 0,
+    has_config: bool | None = None,
+    config_withheld: bool = False,
+) -> dict[str, Any]:
+    """`record` without any marker key it carried, plus this tool's markers."""
+    result: dict[str, Any] = {} if has_config is None else {"has_config": has_config}
+    result.update((k, v) for k, v in record.items() if k not in _MARKER_KEYS)
+    result["redacted"] = redacted
+    if notes:
+        result["note"] = " ".join(notes)
+    if withheld:
+        result["withheld"] = withheld
+    if config_withheld:
+        result["config_withheld"] = True
+    return result
+
+
 def _mark_masked(result: dict[str, Any], masked_any: bool, withheld: int) -> dict[str, Any]:
-    """Add the `redacted` marker (and `withheld`, and the fixed note) to a
-    listing result. `redacted` is true when anything was masked or left out."""
-    result["redacted"] = masked_any or withheld > 0
+    """The listing result with its markers: `redacted` is true when anything
+    was masked or left out; `withheld` and the fixed notes as they apply."""
     notes = []
     if masked_any:
         notes.append(REDACTED_NOTE)
     if withheld:
-        result["withheld"] = withheld
         notes.append(ITEMS_WITHHELD_NOTE)
-    if notes:
-        result["note"] = " ".join(notes)
-    return result
+    return _with_markers(
+        result, redacted=masked_any or withheld > 0, notes=notes, withheld=withheld
+    )
 
 
 def _config_version_result(detail: Any, listing_item: Any, version_id: Any) -> dict[str, Any]:
@@ -563,12 +557,9 @@ def _config_version_result(detail: Any, listing_item: Any, version_id: Any) -> d
             extra={"tool": "get_device_current_config", "error_class": type(exc).__name__},
         )
         return _withheld_version_result(detail, listing_item, version_id)
-    result: dict[str, Any] = {"has_config": True, **masked}
-    result["has_config"] = True
-    result["redacted"] = changed
-    if changed:
-        result["note"] = REDACTED_NOTE
-    return result
+    return _with_markers(
+        masked, redacted=changed, notes=[REDACTED_NOTE] if changed else [], has_config=True
+    )
 
 
 def _withheld_version_result(detail: Any, listing_item: Any, version_id: Any) -> dict[str, Any]:
@@ -578,13 +569,47 @@ def _withheld_version_result(detail: Any, listing_item: Any, version_id: Any) ->
     except Exception:  # noqa: BLE001
         metadata = {}
     metadata.pop("config", None)
-    result: dict[str, Any] = {"has_config": True, **metadata}
-    result["has_config"] = True
-    result.setdefault("id", str(version_id))
-    result["config_withheld"] = True
-    result["redacted"] = True
-    result["note"] = CONFIG_WITHHELD_NOTE
-    return result
+    metadata.setdefault("id", str(version_id))
+    return _with_markers(
+        metadata,
+        redacted=True,
+        notes=[CONFIG_WITHHELD_NOTE],
+        has_config=True,
+        config_withheld=True,
+    )
+
+
+REPLAY_WITHHELD_NOTE = (
+    "HERD withheld this earlier tool result because it could not be checked for credentials."
+)
+
+
+def mask_replayed_tool_result(tool_name: str | None, content: Any) -> Any:
+    """The content of a STORED tool_result block as it is resent to the provider
+    on a later turn (issue #1464): a conversation started before masking holds
+    unmasked configs and run outputs, so every stored result is masked again on
+    load. The content is a serialized tool result: JSON is masked as a
+    structure, other text (a result the char cap cut) line by line. A result of
+    a documentation tool (`DOCS_TOOL_NAMES`) is returned as stored: it relays
+    operator-approved reference text, never device data, and the line rule
+    would cut every manual line that mentions a password. When masking fails
+    the content is replaced by a fixed note. The stored row is never changed.
+    """
+    if tool_name in DOCS_TOOL_NAMES:
+        return content
+    try:
+        if not isinstance(content, str):
+            raise _Unmaskable("tool result content is not text")
+        masked, _ = redact_config(content)
+        if not isinstance(masked, str):
+            raise _Unmaskable("masked content is not text")
+        return masked
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "ai_replayed_tool_result_withheld",
+            extra={"tool": tool_name, "error_class": type(exc).__name__},
+        )
+        return json.dumps({"withheld": True, "note": REPLAY_WITHHELD_NOTE})
 
 
 def _holds_redacted_marker(node: Any) -> bool:
@@ -1051,7 +1076,7 @@ class ToolDispatcher:
         if not isinstance(items, list):
             raise ToolError("execution answered the run list in an unexpected shape")
         masked, masked_any, withheld = _mask_items(
-            "list_executions_for_reservation", items, _mask_run_row
+            "list_executions_for_reservation", items, _mask_record
         )
         try:
             envelope, _ = _mask_record({k: v for k, v in body.items() if k != "items"})
