@@ -115,3 +115,17 @@ _CASES = {
 async def test_a_refused_body_never_echoes_the_submitted_value(method, path, body):
     resp = await _send(method, path, body, _headers())
     _assert_clean_422(resp)
+
+
+async def test_a_lone_surrogate_in_an_unknown_event_type_is_a_422_not_a_500():
+    """pydantic-core cannot build an error whose message holds a lone surrogate (it
+    raises UnicodeEncodeError and the route answers 500). `_validate_events` quotes
+    the unknown names as a list, whose `repr` writes a surrogate as its escape."""
+    body = {"target_url": "https://example.com/hook", "event_types": ["Z" + SUR]}
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/webhooks", content=_raw(body), headers=_headers())
+    assert resp.status_code == 422, resp.content[:300]
+    (error,) = resp.json()["detail"]
+    assert set(error) == set(RENDERED_KEYS)
+    assert error["msg"].startswith("Value error, unknown event_types ['Z\\ud800']; allowed: ")

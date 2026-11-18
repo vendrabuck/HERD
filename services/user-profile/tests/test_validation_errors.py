@@ -91,3 +91,20 @@ _CASES = {
 async def test_a_refused_body_never_echoes_the_submitted_value(method, path, body):
     resp = await _send(method, path, body, _headers("user"))
     _assert_clean_422(resp)
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH"])
+async def test_a_lone_surrogate_in_a_page_sizes_key_is_a_422_not_a_500(method):
+    """pydantic-core cannot build an error whose message holds a lone surrogate (it
+    raises UnicodeEncodeError and the route answers 500). `_validate_page_sizes`
+    quotes the key with `!r`, which writes a surrogate as its escape."""
+    body = {"page_sizes": {"k" + SUR: "x"}}
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.request(
+            method, "/preferences", content=_raw(body), headers=_headers("user")
+        )
+    assert resp.status_code == 422, resp.content[:300]
+    (error,) = resp.json()["detail"]
+    assert set(error) == set(RENDERED_KEYS)
+    assert error["msg"] == "Value error, page_sizes['k\\ud800'] must be an integer"

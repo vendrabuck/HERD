@@ -24,7 +24,7 @@ from herd_common.validation_errors import (
     validation_error_handler,
 )
 from httpx import ASGITransport, AsyncClient
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 MARKER = "canary-Secret-7q"
 
@@ -183,4 +183,58 @@ async def test_an_installed_app_still_names_a_refused_key_in_loc():
             "loc": ["body", MARKER],
             "msg": "Extra inputs are not permitted",
         }
+    ]
+
+
+# -- A validator's own message ----------------------------------------------------------
+
+
+class _Quoting(BaseModel):
+    plain: str = ""
+    quoted: str = ""
+
+    @field_validator("plain")
+    @classmethod
+    def _plain(cls, value: str) -> str:
+        raise ValueError(f"bad {value}")
+
+    @field_validator("quoted")
+    @classmethod
+    def _quoted(cls, value: str) -> str:
+        raise ValueError(f"bad {value!r}")
+
+
+def _quoting_app() -> FastAPI:
+    app = FastAPI()
+    install_validation_errors(app)
+
+    @app.post("/q")
+    async def q(body: _Quoting):
+        return {"ok": True}
+
+    return app
+
+
+async def test_a_validator_message_holding_a_lone_surrogate_is_a_500_the_handler_cannot_see():
+    """The rule for validator authors (OPS-VALID-5): a plain `str` takes a lone
+    surrogate, and pydantic-core cannot build an error whose message holds one. It
+    raises UnicodeEncodeError instead of a validation error, so this handler never
+    runs and the route answers 500. If a pydantic-core upgrade changes that, this
+    test says so."""
+    transport = ASGITransport(app=_quoting_app(), raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/q", content=b'{"plain": "Z\\ud800"}', headers={"Content-Type": "application/json"}
+        )
+    assert resp.status_code == 500
+
+
+async def test_a_validator_message_quoting_with_repr_is_a_clean_422():
+    async with _client(_quoting_app()) as client:
+        resp = await client.post(
+            "/q", content=b'{"quoted": "Z\\ud800"}', headers={"Content-Type": "application/json"}
+        )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == [
+        {"type": "value_error", "loc": ["body", "quoted"], "msg": "Value error, bad 'Z\\ud800'"}
     ]

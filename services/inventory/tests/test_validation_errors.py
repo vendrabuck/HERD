@@ -108,4 +108,35 @@ async def test_msg_can_still_quote_a_dropdown_default_by_documented_limit():
     assert resp.status_code == 422
     detail = resp.json()["detail"]
     assert [set(error) for error in detail] == [set(RENDERED_KEYS)]
-    assert detail[0]["msg"] == f"Value error, Default '{MARKER}' is not in options: a"
+    assert detail[0]["msg"] == f"Value error, Default '{MARKER}' is not in options: 'a'"
+
+
+_DROPDOWN_SURROGATES = {
+    "default": (
+        {"options": ["a"], "default": "Z" + SUR},
+        "Default 'Z\\ud800' is not in options: 'a'",
+    ),
+    "option": (
+        {"options": ["a" + SUR], "default": "Z"},
+        "Default 'Z' is not in options: 'a\\ud800'",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("dropdown", "msg"), _DROPDOWN_SURROGATES.values(), ids=_DROPDOWN_SURROGATES.keys()
+)
+async def test_a_lone_surrogate_the_dropdown_message_quotes_is_a_422_not_a_500(dropdown, msg):
+    """A plain `str` takes a lone surrogate, and pydantic-core cannot build an error
+    whose message holds one: it raised UnicodeEncodeError instead of a validation
+    error, so the handler never ran and the route answered 500. The message now
+    quotes each submitted value with `repr`, which writes a surrogate as its escape."""
+    field = {"key": "k", "label": "K", "type": "dropdown", **dropdown}
+    body = {"name": "t", "sections": [{"name": "s", "fields": [field]}]}
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/templates", content=_raw(body), headers=_headers())
+    assert resp.status_code == 422, resp.content[:300]
+    detail = resp.json()["detail"]
+    assert [set(error) for error in detail] == [set(RENDERED_KEYS)]
+    assert detail[0]["msg"] == "Value error, " + msg
