@@ -59,6 +59,9 @@ logger = logging.getLogger(__name__)
 # Pinned: the by-id run reads answer an unknown run and a run on a device the
 # caller may not see with this same detail.
 RUN_NOT_FOUND_DETAIL = "Execution run not found"
+# Fixed text, never the submitted action (issue #1458): the echo copied any value
+# back, and a lone surrogate in it made the 422 a 500 (CFG-EXEC-6).
+INTERNAL_EXECUTE_ACTION_DETAIL = "internal execute is restricted to action='configure'"
 
 get_current_user_payload, require_admin = make_auth_dependencies(
     secret_key=settings.secret_key,
@@ -479,7 +482,7 @@ async def internal_execute(
     if body.action != "configure":
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=(f"internal execute is restricted to action='configure'; got '{body.action}'"),
+            detail=INTERNAL_EXECUTE_ACTION_DETAIL,
         )
     device_data = await fetch_device(body.device_id)
     template_data = await fetch_template(device_data["template_id"])
