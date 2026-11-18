@@ -52,6 +52,18 @@ Second most common: config service started but `config.json` was never written. 
 
 Check with `make logs` or `docker compose logs <service>`; the startup error message names the missing setting.
 
+### A service exits at startup naming config.json
+
+The log of every service but config ends with `herd_common.config_loader.ConfigFileUnusable: HERD config file /etc/herd/config.json is unusable (<reason>). It is not the first-boot copy of the environment (no config.bootstrapped beside it), so it holds the operator's own settings, and this service will not start on environment values in their place.` followed by the remedy. `<reason>` is an exception class (`JSONDecodeError`, `UnicodeDecodeError`, `RecursionError`, `ValueError`, `PermissionError`, `FileNotFoundError` for a dangling link, `OSError` for a looping one), `not a JSON object: <type>`, or `not a regular file: <kind>`. The file was saved through the config page (or predates the bootstrap marker, or was edited by hand) and has since become unreadable or stopped being a JSON object; the services refuse to fall back to `.env` because its values may differ from the saved ones, an `AUTH_METHOD` of `ldap` or `oidc` included, whose fallback `local` opens registration (issue #1451, OPS-SET-4).
+
+Under `make prod` each service crash-loops (`docker compose ps` shows `Restarting`); under `make up` the dev reloader keeps the container up with the error in its log and the healthcheck failing. Either way `docker compose logs <svc>` shows the line above on every attempt. The config service is not affected and still serves its page. Fix it one of three ways:
+
+- Save the settings again on the config page (it shows the environment's values for any key the unusable file held, so re-enter the ones you had saved), then Save and Restart. A save cannot replace a directory or a FIFO at that path: remove it first.
+- Repair the file on the `herd-config` volume (it must be one JSON object), then `docker compose restart` the services.
+- Remove it to run on `.env` alone: `docker compose exec config rm /data/herd-config/config.json`, then restart the config service (it writes a fresh bootstrap copy with the marker when `.env` holds every required key) and the others.
+
+A file with `config.bootstrapped` beside it never stops a service this way: it is a copy of the environment, so it is ignored with one WARNING and the environment applies.
+
 ### A service exits at startup with `column <table>.<name> does not exist`
 
 The stack was upgraded in place and the new release added a column that a startup read names, before `make migrate` ran (the schema is stamped at the previous release, so startup never runs `create_all`; see [OPERATIONS.md](OPERATIONS.md#upgrade-path)). The log ends with `Application startup failed. Exiting.`, the service's healthcheck never passes, and `make up` reports `dependency failed to start: container <project>-<svc>-1 is unhealthy`. Run the service's migration, then restart it:

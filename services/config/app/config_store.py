@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import secrets
+import stat
 
 import bcrypt
 
@@ -339,21 +340,59 @@ def is_configured() -> bool:
 
 
 def load_config() -> dict:
-    if not os.path.exists(CONFIG_FILE):
+    """The config.json object, or {} when there is none to use.
+
+    The same answer for the same path state as the services' loader
+    (herd_common.config_loader._read_config_object, copied here because this
+    service imports no herd_common): a missing path is {} with no log; a path that
+    is not a regular file (checked before any read, so a FIFO never blocks), a
+    dangling link, an unreadable file, JSON that does not parse as UTF-8 text, and
+    JSON that is not an object are {} with one WARNING naming the path and the
+    reason, never the content. MemoryError on a huge file is not handled.
+    """
+    if not os.path.lexists(CONFIG_FILE):
         return {}
+    loaded, reason = _read_config_object(CONFIG_FILE)
+    if reason is not None:
+        logger.warning("Ignoring unusable config file %s (%s)", CONFIG_FILE, reason)
+        return {}
+    return loaded
+
+
+def _read_config_object(path: str) -> tuple[dict, None] | tuple[None, str]:
+    """(object, None) for a regular file holding a JSON object, else (None, reason)."""
     try:
-        with open(CONFIG_FILE) as f:
+        mode = os.stat(path).st_mode
+        if not stat.S_ISREG(mode):
+            return None, f"not a regular file: {_file_kind(mode)}"
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        with open(fd, encoding="utf-8") as f:
+            mode = os.fstat(f.fileno()).st_mode
+            if not stat.S_ISREG(mode):
+                return None, f"not a regular file: {_file_kind(mode)}"
             loaded = json.load(f)
     except (ValueError, RecursionError, OSError) as exc:
-        # The same failures load_auth catches; the answer is the corrupt-file one.
-        logger.warning("Ignoring corrupt config file %s: %s", CONFIG_FILE, exc)
-        return {}
+        # The same failures load_auth catches. Named by class only: the text of a
+        # UnicodeDecodeError quotes a byte of the file.
+        return None, type(exc).__name__
     if not isinstance(loaded, dict):
         # Valid JSON that is not an object holds no settings; treat it like a
         # corrupt file rather than handing callers a list or a scalar.
-        logger.warning("Ignoring config file %s: not a JSON object", CONFIG_FILE)
-        return {}
-    return loaded
+        return None, f"not a JSON object: {type(loaded).__name__}"
+    return loaded, None
+
+
+def _file_kind(mode: int) -> str:
+    for test, kind in (
+        (stat.S_ISDIR, "directory"),
+        (stat.S_ISFIFO, "FIFO"),
+        (stat.S_ISSOCK, "socket"),
+        (stat.S_ISCHR, "character device"),
+        (stat.S_ISBLK, "block device"),
+    ):
+        if test(mode):
+            return kind
+    return "other"
 
 
 def save_config(values: dict) -> list[str]:

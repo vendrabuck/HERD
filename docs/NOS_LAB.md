@@ -474,9 +474,14 @@ sudo modprobe vrf dummy
 make nos-reset
 ```
 
-A GitHub Actions runner is the known case; both `ci.yml`'s `nos-dialect` job and
-`nightly.yml`'s feature-tier step run that `modprobe` before booting the lab, and
-neither treats its failure as fatal.
+The GitHub Actions runner image has the modules but does not load them, so both
+`ci.yml`'s `nos-dialect` job and `nightly.yml`'s feature-tier step run
+`sudo modprobe vrf dummy` before booting the lab, and the VRF tests run and pass
+there. Neither treats a failed `modprobe` as fatal: the step prints
+`vrf/dummy modules unavailable; VRF tests will skip` and goes on, the node boots
+without the fixture, and the VRF tests skip while the job stays green. A future
+runner image without the modules would therefore show up only as skipped VRF
+tests in the job log, not as a red job.
 
 Verifying a VRF route independently, the way the live tests do (never through
 the driver's own session):
