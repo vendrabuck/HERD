@@ -585,10 +585,13 @@ account automatically.
 - **IAM-LDAP-11.** The provisioned username is the entry's first `LDAP_USERNAME_ATTRIBUTE`
   value that is text and fits the username column (IAM-LDAP-15), or the typed login
   name when the entry has none. A login name that is not such text either (over 100
-  characters, say) cannot stand in, and the login is the 401 `Invalid credentials`,
-  logged as `ldap_missing_username`. \
-  Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_first_text_value`) \
-  Pinned by: `services/auth/tests/test_ldap_attribute_text.py` (`test_a_missing_username_falls_back_to_the_login_name`, `test_a_username_that_is_not_text_falls_back_to_the_login_name`, `test_a_text_username_attribute_is_used`, `test_a_username_longer_than_the_column_falls_back_to_the_login_name`, `test_a_login_name_that_cannot_stand_in_is_refused`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_binary_username_attribute_falls_back_to_login_name`)
+  characters, say) cannot stand in: a returning user, found by email, still signs in,
+  and only a login that would provision a new account is the 401 `Invalid
+  credentials`, logged as `login_failure` with reason `missing_username`. Whether the
+  account exists is decided after a successful bind, so the difference is no existence
+  oracle. \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_first_text_value`, `LdapIdentity`); `services/auth/app/services/auth_service.py` (`_authenticate_ldap`) \
+  Pinned by: `services/auth/tests/test_ldap_attribute_text.py` (`test_a_missing_username_falls_back_to_the_login_name`, `test_a_username_that_is_not_text_falls_back_to_the_login_name`, `test_a_text_username_attribute_is_used`, `test_a_username_longer_than_the_column_falls_back_to_the_login_name`, `test_a_login_name_that_cannot_stand_in_gives_no_username`, `test_without_a_username_a_new_account_is_refused_and_a_returning_one_signs_in`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_binary_username_attribute_falls_back_to_login_name`)
 - **IAM-LDAP-12.** When the directory cannot be asked, login answers 503 `Directory
   unavailable, credentials not checked` (issue #1403): incomplete configuration
   (`LDAP_SERVER_URL` or `LDAP_USER_BASE_DN` empty), an `LDAP_USER_FILTER` that
@@ -700,7 +703,7 @@ account automatically.
   as `missing_email` or `missing_username` (IAM-SYNC-4); the group's display name falls
   back to its DN (IAM-MAP-4); a member value that is not text is a `not_text` member
   skip (IAM-SYNC-4, IAM-SYNC-5); and the presence enumeration leaves the value out and
-  counts an entry with no email value that is text (IAM-SWEEP-2, IAM-SWEEP-10). Of a
+  counts an entry with any email value that is not text, holding back the deactivations it leaves unproven (IAM-SWEEP-2, IAM-SWEEP-10). Of a
   multi-valued attribute, the first value that is text in the directory's order is the
   one used. Each read that left a value out logs one WARNING (action
   `ldap_attribute_not_text`, the attribute, the DN, the count, and the value classes,
@@ -1304,16 +1307,27 @@ turned off earlier once they reappear. A circuit breaker stops a mass deactivati
   real directory. \
   Enforced in: `services/auth/app/services/ldap_sync_service.py` (`_run_deactivation_sweep`) \
   Pinned by: `services/auth/tests/test_ldap_service_live.py` (`test_live_deactivation_and_reactivation_sweep`)
-- **IAM-SWEEP-10.** When the presence enumeration finds an entry whose email attribute
-  holds no value that is text (IAM-LDAP-15), no account is deactivated this pass and the
-  run is `partial` with a `sweep` record (`email_unreadable`, the count of such entries,
-  and how many deactivations were held back); reactivations still apply. The directory
-  still lists that person, and nothing ties the entry to one account, so no absence is
-  proven (the narrowest safe scope; IAM-SYNC-5 is the same rule for a group). By
-  decision (issue #1448 review); before it, an account provisioned from a binary email
-  was deactivated by the first sweep. \
-  Enforced in: `services/auth/app/services/ldap_sync_service.py` (`_run_deactivation_sweep`, `SWEEP_REASON_EMAIL_UNREADABLE`); `services/auth/app/services/ldap_service.py` (`PresentEmails`, `_paged_user_emails_sync`) \
-  Pinned by: `services/auth/tests/test_ldap_attribute_text.py` (`test_an_unreadable_email_in_the_directory_deactivates_no_one`, `test_a_readable_directory_still_deactivates_the_absent`, `test_reactivations_still_apply_when_deactivations_are_suppressed`, `test_an_enumeration_with_every_email_readable_counts_none`)
+- **IAM-SWEEP-10.** When the presence enumeration finds an entry with any email value
+  that is not text (IAM-LDAP-15), even beside a readable one, that person is still
+  listed and one of their addresses may be the one an account holds, so the sweep holds
+  back the deactivations it cannot prove. A deactivation the disabled filter proved
+  (IAM-SWEEP-3) is never held. Of the rest, when some such entry has no text value of
+  `LDAP_USERNAME_ATTRIBUTE` either, nothing ties it to one account and every one is
+  held; otherwise only the candidates whose stored username, casefolded, equals a
+  username value of such an entry. Reactivations and group additions are unaffected.
+  The run is `partial` with a `sweep` record (`email_unreadable`: the unreadable
+  entries, how many of them have no readable username, how many candidates were held,
+  and `held_passes`, the number of consecutive passes, this one included, that held
+  something back), and a pass that holds anything logs one ERROR (action
+  `ldap_sync_deactivation_held`). Residual risk, by decision: a person who can write
+  both their own email and username attributes (OpenLDAP with `by self write`, say;
+  IA5String admits control characters) can make both unreadable and so hold back every
+  unproven deactivation for as long as that lasts, at the cost of their own HERD login;
+  the ERROR and `held_passes` make that visible, and who can write those attributes is
+  the deployment's to decide. By decision (issue #1448 reviews); before it, an account
+  provisioned from a binary email was deactivated by the first sweep. \
+  Enforced in: `services/auth/app/services/ldap_sync_service.py` (`_run_deactivation_sweep`, `_hold_unreadable`, `_held_candidates`, `_previous_hold_passes`, `SWEEP_REASON_EMAIL_UNREADABLE`); `services/auth/app/services/ldap_service.py` (`PresentEmails`, `_paged_user_emails_sync`) \
+  Pinned by: `services/auth/tests/test_ldap_attribute_text.py` (`test_an_unreadable_email_holds_back_only_the_account_of_that_username`, `test_an_unreadable_value_beside_a_readable_one_still_holds`, `test_an_entry_with_neither_attribute_readable_holds_every_unproven_one`, `test_a_disabled_proven_deactivation_applies_under_a_narrow_hold`, `test_a_hold_that_lasts_counts_its_passes`, `test_an_unreadable_entry_that_holds_no_one_is_still_recorded`, `test_a_readable_directory_still_deactivates_the_absent`, `test_reactivations_still_apply_when_deactivations_are_suppressed`, `test_an_enumeration_with_every_email_readable_counts_none`); `services/auth/tests/test_ldap_service_live.py` (`test_present_emails_leaves_out_a_binary_value`)
 
 **Out of scope.** Deactivation never deletes an account and never revokes tokens; the
 inactive checks of IAM-ACCT-5 do the blocking.
@@ -2384,7 +2398,7 @@ name (IAM-HASH-9). Every other error carries
 | 400 | `Token role cannot exceed the principal's role` | token role above its principal | IAM-APITOK-3 |
 | 401 | `Not authenticated` (FastAPI) | no Authorization header on a JWT-guarded route, auth or acl | IAM-JWT-3, IAM-CLAIM-1 |
 | 401 | `Could not validate credentials` | bad, expired, or subjectless token; in auth also an unknown or inactive account | IAM-JWT-3, IAM-ACCT-5, IAM-CLAIM-1 |
-| 401 | `Invalid credentials` | any login refusal, local, LDAP, or OIDC mode | IAM-LOGIN-1, IAM-LDAP-5, IAM-LDAP-9, IAM-LDAP-10, IAM-LDAP-13, IAM-LDAP-14, IAM-LDAP-15, IAM-OIDC-21 |
+| 401 | `Invalid credentials` | any login refusal, local, LDAP, or OIDC mode | IAM-LOGIN-1, IAM-LDAP-5, IAM-LDAP-9, IAM-LDAP-10, IAM-LDAP-11, IAM-LDAP-13, IAM-LDAP-14, IAM-LDAP-15, IAM-OIDC-21 |
 | 401 | `Single sign-on session expired; sign in again` | handoff exchange refused | IAM-OIDC-20 |
 | 401 | `Invalid or expired refresh token` | refresh refused | IAM-SESSION-2 |
 | 401 | `Invalid or expired token` | API token exchange refused | IAM-APITOK-8 |
@@ -2527,6 +2541,14 @@ IAM-LDAP-12 and IAM-LDAP-13, and #1404 by IAM-LOGIN-6.)
 - An unusable `LDAP_USER_FILTER` logs its ERROR at every LDAP login, not once
   (IAM-LDAP-14), the same as an incomplete configuration (IAM-LDAP-12). Recorded in the
   issue #1446 review.
+- A value of `LDAP_USERNAME_ATTRIBUTE` with an emoji joiner sequence, a direction
+  mark or override, or a soft hyphen is not text (IAM-LDAP-15), so if the setting
+  names a display attribute such a member is skipped as `missing_username` on every
+  sync (and holds back that group's removals). Recorded in `docs/ENV_VARS.md`: name an
+  account-name attribute.
+- A person who can write both their own email and username attributes can make both
+  unreadable and hold back every unproven deactivation (IAM-SWEEP-10). Recorded in
+  that rule; visible as an ERROR and in `held_passes`.
 - A filter that matches more than the named entry (a substring, approximate, or
   ordering assertion on `{username}`) is allowed; the first match signs in with its own
   password (IAM-LDAP-14). Recorded in `docs/ENV_VARS.md` as discouraged.

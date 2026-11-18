@@ -865,13 +865,6 @@ async def _run_deactivation_sweep(
 
     candidates = (await db.execute(select(User).where(User.auth_source == "ldap"))).scalars().all()
     swept = len(candidates)
-    # Issue #1448: an entry the directory lists whose email holds no text value
-    # is a person who is present but cannot be matched to an account, so no
-    # candidate's absence is proven this pass: no deactivations (the narrowest
-    # safe scope, since nothing ties the entry to one account; the IAM-SYNC-5
-    # precedent suppresses a whole group's removals for one unidentifiable
-    # member). Reactivations still apply: they need presence, which stands.
-    unreadable = present.unreadable_entries
 
     def present_for(user: User) -> bool:
         email = user.email.lower()
@@ -891,11 +884,8 @@ async def _run_deactivation_sweep(
         key=lambda u: str(u.id),
     )
 
-    if unreadable:
-        tally.sweep_note(
-            SWEEP_REASON_EMAIL_UNREADABLE, count=unreadable, would_deactivate=len(to_deactivate)
-        )
-        to_deactivate = []
+    if present.unreadable_entries:
+        to_deactivate = await _hold_unreadable(db, tally, present, disabled, to_deactivate)
 
     # Breaker check BEFORE applying anything: neither list has been touched
     # yet. STRICT exceeds on both terms; boundary-equal never aborts.
@@ -936,6 +926,92 @@ async def _run_deactivation_sweep(
         tally.record_deactivated(user_id, email)
     for user_id, email in applied_reactivated:
         tally.record_reactivated(user_id, email)
+
+
+def _held_candidates(
+    present: "ldap_service.PresentEmails", disabled: frozenset[str], to_deactivate: list[User]
+) -> list[User]:
+    """The deactivation candidates IAM-SWEEP-10 holds back.
+
+    A candidate the disabled filter matched is never held: that deactivation is
+    proven by the directory saying so, not by absence. Of the rest, when any
+    entry with an unreadable email has no readable username either
+    (unidentified_entries), nothing ties it to one account, so every one is
+    held; otherwise only those whose stored username, casefolded, equals a
+    username of such an entry (held_usernames). Casefolded because a username
+    provisioned from the typed login name can differ in case from the
+    directory's value, and holding one account too many is the safe direction.
+    """
+    unproven = [u for u in to_deactivate if u.email.lower() not in disabled]
+    if present.unidentified_entries:
+        return unproven
+    return [u for u in unproven if u.username.casefold() in present.held_usernames]
+
+
+async def _previous_hold_passes(db: AsyncSession) -> int:
+    """How many passes in a row before this one held deactivations back: the
+    `held_passes` of the latest finished run's email_unreadable sweep record
+    that held anything, or 0 (one indexed read of the newest finished row)."""
+    detail = (
+        await db.execute(
+            select(LdapSyncRun.detail)
+            .where(LdapSyncRun.finished_at.is_not(None))
+            .order_by(LdapSyncRun.finished_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    for record in (detail or {}).get("sweep") or []:
+        if record.get("reason") == SWEEP_REASON_EMAIL_UNREADABLE and record.get("held"):
+            return int(record.get("held_passes") or 0)
+    return 0
+
+
+async def _hold_unreadable(
+    db: AsyncSession,
+    tally: _Tally,
+    present: "ldap_service.PresentEmails",
+    disabled: frozenset[str],
+    to_deactivate: list[User],
+) -> list[User]:
+    """IAM-SWEEP-10: hold back the deactivations an unreadable directory email
+    leaves unproven, record why, and return the deactivations that stand.
+
+    The run gets a `sweep` record (email_unreadable) with the entries that
+    could not be read, how many of them could not be identified by username,
+    how many candidates were held, and held_passes, the number of consecutive
+    passes, this one included, that held something back. A pass that holds
+    anything logs one ERROR (action ldap_sync_deactivation_held): a hold that
+    lasts is a directory problem an operator must fix, since a user who can
+    write their own email attribute could otherwise freeze deactivations.
+    """
+    held = _held_candidates(present, disabled, to_deactivate)
+    held_ids = {u.id for u in held}
+    held_passes = (await _previous_hold_passes(db)) + 1 if held else 0
+    tally.sweep_note(
+        SWEEP_REASON_EMAIL_UNREADABLE,
+        unreadable_entries=present.unreadable_entries,
+        unidentified_entries=present.unidentified_entries,
+        held=len(held),
+        held_passes=held_passes,
+    )
+    if held:
+        logger.error(
+            "LDAP deactivation sweep held back %d deactivation(s): %d directory entr(ies) "
+            "have an email value that is not text (%d with no readable username, which "
+            "holds back every unproven deactivation); held %d pass(es) in a row",
+            len(held),
+            present.unreadable_entries,
+            present.unidentified_entries,
+            held_passes,
+            extra={
+                "action": "ldap_sync_deactivation_held",
+                "held": len(held),
+                "unreadable_entries": present.unreadable_entries,
+                "unidentified_entries": present.unidentified_entries,
+                "held_passes": held_passes,
+            },
+        )
+    return [u for u in to_deactivate if u.id not in held_ids]
 
 
 async def _apply_sweep_flips(

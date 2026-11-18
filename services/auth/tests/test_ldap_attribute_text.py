@@ -220,15 +220,45 @@ def test_a_username_longer_than_the_column_falls_back_to_the_login_name(director
     assert identity is not None and identity.username == "dave"
 
 
-def test_a_login_name_that_cannot_stand_in_is_refused(directory, monkeypatch, caplog):
-    """No usable username attribute and a login name longer than the column:
-    nothing can be provisioned, so the login is refused, never a database error."""
+@pytest.mark.parametrize("login_name", ["u" * 101, "us\u202eer"], ids=["too_long", "refused_char"])
+def test_a_login_name_that_cannot_stand_in_gives_no_username(directory, monkeypatch, login_name):
+    """No usable username attribute and a login name that is not usable text:
+    the identity carries no username, and only provisioning refuses it."""
     monkeypatch.setattr(settings, "ldap_username_attribute", "displayName")
-    long_name = "u" * 101
-    directory.add_user(long_name, PASSWORD)
-    with caplog.at_level(logging.WARNING, logger="app.services.ldap_service"):
-        assert ldap_service._bind_user_sync(long_name, PASSWORD) is None
-    assert [r.action for r in caplog.records] == ["ldap_missing_username"]
+    directory.add_user(login_name, PASSWORD, mail="nameless@example.com")
+    identity = ldap_service._bind_user_sync(login_name, PASSWORD)
+    assert identity is not None
+    assert (identity.username, identity.email) == (None, "nameless@example.com")
+
+
+async def test_without_a_username_a_new_account_is_refused_and_a_returning_one_signs_in(
+    client, directory, monkeypatch, caplog
+):
+    """Issue #1448 review: a returning user is found by email and needs no
+    username, so only a login that would provision a new account is refused.
+    Both outcomes come after a successful bind, so neither tells whether an
+    account exists to anyone without the password."""
+    monkeypatch.setattr(settings, "ldap_username_attribute", "displayName")
+    new_name, old_name = "n" * 101, "o" * 101
+    directory.add_user(new_name, PASSWORD)
+    directory.add_user(old_name, PASSWORD)
+    async with TestSessionLocal() as db:
+        db.add(
+            User(
+                email=f"{old_name}@example.com",
+                username="old-account",
+                auth_source="ldap",
+                role=Role.USER,
+            )
+        )
+        await db.commit()
+    with caplog.at_level(logging.WARNING, logger="app.services.auth_service"):
+        refused = await client.post("/login", json={"email": new_name, "password": PASSWORD})
+    assert [getattr(r, "reason", None) for r in caplog.records] == ["missing_username"]
+    returning = await client.post("/login", json={"email": old_name, "password": PASSWORD})
+    assert (refused.status_code, refused.json()) == (401, {"detail": "Invalid credentials"})
+    assert returning.status_code == 200, returning.text
+    assert await _users() == [("old-account", f"{old_name}@example.com")]
 
 
 def test_a_username_that_is_not_text_falls_back_to_the_login_name(directory, monkeypatch):
@@ -363,8 +393,11 @@ def test_the_enumeration_leaves_out_what_is_not_text_with_one_line(directory, ca
     with caplog.at_level(logging.WARNING, logger="app.services.ldap_service"):
         emails = ldap_service._present_emails_sync()
     assert emails == frozenset({"alice@example.com", "dave@example.com"})
-    # carol is listed but cannot be read; dave has one readable value.
-    assert emails.unreadable_entries == 1
+    # carol and dave each have a value that cannot be read (dave beside a
+    # readable one); both have a readable username.
+    assert emails.unreadable_entries == 2
+    assert emails.held_usernames == {"carol", "dave"}
+    assert emails.unidentified_entries == 0
     assert [(r.action, r.count, r.value_classes) for r in caplog.records] == [
         ("ldap_attribute_not_text", 3, ["bytes", "str"])
     ]
@@ -513,19 +546,152 @@ async def _sweep(directory, monkeypatch, *, carol_mail) -> tuple:
     return run, rows
 
 
-async def test_an_unreadable_email_in_the_directory_deactivates_no_one(
+async def test_an_unreadable_email_holds_back_only_the_account_of_that_username(
+    directory, monkeypatch, caplog, _reap_on_the_harness_engine
+):
+    """carol is listed but her email cannot be read; her username can, so only
+    the account named carol is held back, and the departed account still goes."""
+    with caplog.at_level(logging.ERROR, logger="app.services.ldap_sync_service"):
+        run, rows = await _sweep(directory, monkeypatch, carol_mail=NOT_UTF8)
+    assert rows == {"alice": True, "carol": True, "gone": False, "back": False}
+    assert run.status == "partial"
+    assert run.users_deactivated == 1
+    assert run.detail["sweep"] == [
+        {
+            "reason": "email_unreadable",
+            "unreadable_entries": 1,
+            "unidentified_entries": 0,
+            "held": 1,
+            "held_passes": 1,
+        }
+    ]
+    assert [(r.levelname, r.action, r.held) for r in caplog.records] == [
+        ("ERROR", "ldap_sync_deactivation_held", 1)
+    ]
+
+
+@pytest.mark.parametrize(
+    "old_value,stored",
+    [
+        (NOT_UTF8, "b'\\xffcarol@example.com'"),
+        ("carol@exam\u200bple.com", "carol@exam\u200bple.com"),
+        ("carol@example.com\t", "carol@example.com\t"),
+    ],
+    ids=["binary", "zero_width_space", "trailing_tab"],
+)
+async def test_an_unreadable_value_beside_a_readable_one_still_holds(
+    directory, monkeypatch, _reap_on_the_harness_engine, old_value, stored
+):
+    """The review's case: carol's mail is [old, alias] where old cannot be read
+    and is what her account holds. Before the fix the readable alias made the
+    entry count as readable, so carol was deactivated and the run said success."""
+    monkeypatch.setattr(settings, "ldap_sync_deactivation_enabled", True, raising=False)
+    directory.add_user("carol", PASSWORD, mail=[old_value, "carol.alias@example.com"])
+    async with TestSessionLocal() as db:
+        await _seed_ldap_accounts(db, ("carol", stored, True, False))
+        await db.commit()
+        run = await ldap_sync_service.run_sync(db)
+        carol = (await db.execute(select(User))).scalars().one()
+    assert carol.is_active is True
+    assert run.status == "partial"
+    assert run.detail["sweep"][0]["held"] == 1
+
+
+def _unidentified(directory, name: str, mail) -> None:
+    """An entry with no readable username: cn in the RDN, uid not text."""
+    directory.add_entry(
+        f"cn={name},{BASE_DN}", {"objectClass": "person", "uid": b"\xff", "mail": mail}
+    )
+
+
+async def test_an_entry_with_neither_attribute_readable_holds_every_unproven_one(
     directory, monkeypatch, _reap_on_the_harness_engine
 ):
-    """carol is listed but her email cannot be read, so absence is proven for
-    no one: neither her old repr-email account nor anyone else is deactivated,
-    and the run says why."""
-    run, rows = await _sweep(directory, monkeypatch, carol_mail=NOT_UTF8)
-    assert rows == {"alice": True, "carol": True, "gone": True, "back": False}
+    """mallory's mail ends in a tab and her uid is binary, so nothing ties her
+    entry to an account: every deactivation proven only by absence is held.
+    dan's, proven by the disabled filter, still applies, and additions and
+    reactivations are unaffected."""
+    monkeypatch.setattr(settings, "ldap_sync_deactivation_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "ldap_disabled_filter", "(employeeType=disabled)")
+    alice = directory.add_user("alice", PASSWORD)
+    directory.add_user("dan", PASSWORD, employeeType="disabled")
+    directory.add_user("back", PASSWORD)
+    _unidentified(directory, "mallory", "mallory@example.com\t")
+    directory.add_entry(GROUP_DN, {"objectClass": "groupOfNames", "cn": "eng", "member": alice})
+    async with TestSessionLocal() as db:
+        group = UserGroup(name="Engineering")
+        db.add(group)
+        await _seed_ldap_accounts(
+            db,
+            ("dan", "dan@example.com", True, False),
+            ("gone", "gone@example.com", True, False),
+            ("back", "back@example.com", False, True),
+        )
+        db.add(LdapGroupMapping(group_dn=GROUP_DN, directory_name="eng", herd_group_id=group.id))
+        await db.commit()
+        run = await ldap_sync_service.run_sync(db)
+        rows = {u.username: u.is_active for u in (await db.execute(select(User))).scalars()}
+    assert rows == {"dan": False, "gone": True, "back": True, "alice": True}
+    assert (run.users_deactivated, run.users_reactivated, run.members_added) == (1, 1, 1)
+    assert run.detail["sweep"][0] == {
+        "reason": "email_unreadable",
+        "unreadable_entries": 1,
+        "unidentified_entries": 1,
+        "held": 1,
+        "held_passes": 1,
+    }
+
+
+async def test_a_disabled_proven_deactivation_applies_under_a_narrow_hold(
+    directory, monkeypatch, _reap_on_the_harness_engine
+):
+    """The review's repro: mallory's mail ends in a tab (her uid is readable),
+    and dan matches the disabled filter: dan is deactivated."""
+    monkeypatch.setattr(settings, "ldap_sync_deactivation_enabled", True, raising=False)
+    monkeypatch.setattr(settings, "ldap_disabled_filter", "(employeeType=disabled)")
+    directory.add_user("dan", PASSWORD, employeeType="disabled")
+    directory.add_user("mallory", PASSWORD, mail="mallory@example.com\t")
+    async with TestSessionLocal() as db:
+        await _seed_ldap_accounts(
+            db,
+            ("dan", "dan@example.com", True, False),
+            ("mallory", "mallory@example.com", True, False),
+        )
+        await db.commit()
+        run = await ldap_sync_service.run_sync(db)
+        rows = {u.username: u.is_active for u in (await db.execute(select(User))).scalars()}
+    assert rows == {"dan": False, "mallory": True}
+    assert run.users_deactivated == 1
+
+
+async def test_a_hold_that_lasts_counts_its_passes(
+    directory, monkeypatch, _reap_on_the_harness_engine
+):
+    monkeypatch.setattr(settings, "ldap_sync_deactivation_enabled", True, raising=False)
+    _unidentified(directory, "mallory", "mallory@example.com\t")
+    async with TestSessionLocal() as db:
+        await _seed_ldap_accounts(db, ("gone", "gone@example.com", True, False))
+        await db.commit()
+        passes = []
+        for _ in range(3):
+            run = await ldap_sync_service.run_sync(db)
+            passes.append(run.detail["sweep"][0]["held_passes"])
+    assert passes == [1, 2, 3]
+
+
+async def test_an_unreadable_entry_that_holds_no_one_is_still_recorded(
+    directory, monkeypatch, _reap_on_the_harness_engine
+):
+    monkeypatch.setattr(settings, "ldap_sync_deactivation_enabled", True, raising=False)
+    directory.add_user("carol", PASSWORD, mail=NOT_UTF8)
+    async with TestSessionLocal() as db:
+        await _seed_ldap_accounts(db, ("gone", "gone@example.com", True, False))
+        await db.commit()
+        run = await ldap_sync_service.run_sync(db)
+    assert run.users_deactivated == 1
     assert run.status == "partial"
-    assert run.users_deactivated == 0
-    assert run.detail["sweep"] == [
-        {"reason": "email_unreadable", "count": 1, "would_deactivate": 2}
-    ]
+    assert run.detail["sweep"][0]["held"] == 0
+    assert run.detail["sweep"][0]["held_passes"] == 0
 
 
 async def test_a_readable_directory_still_deactivates_the_absent(

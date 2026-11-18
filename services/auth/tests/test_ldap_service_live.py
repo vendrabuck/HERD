@@ -1171,5 +1171,8 @@ async def test_present_emails_leaves_out_a_binary_value(monkeypatch, ldap_settin
     monkeypatch.setattr(settings, "ldap_email_attribute", "jpegPhoto", raising=False)
     present = await ldap_service.present_emails()
     assert present == frozenset()
-    # The entry is listed but its email cannot be read (IAM-SWEEP-10).
+    # The entry is listed but its email cannot be read; its uid can, so the
+    # sweep holds back only that account (IAM-SWEEP-10).
     assert present.unreadable_entries == 1
+    assert present.held_usernames == {BINARY_UID}
+    assert present.unidentified_entries == 0

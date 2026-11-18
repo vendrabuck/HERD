@@ -99,7 +99,13 @@ class LdapUnavailableError(Exception):
 
 @dataclass(frozen=True)
 class LdapIdentity:
-    username: str
+    """A directory identity. username is None only from a login whose entry has
+    no usable username and whose login name cannot stand in (IAM-LDAP-11): a
+    returning user, found by email, still signs in, and only provisioning a new
+    account needs a username (auth_service._authenticate_ldap). Member
+    resolution never returns one without a username (missing_username)."""
+
+    username: str | None
     email: str
     dn: str
 
@@ -129,17 +135,37 @@ class LdapGroupEntry:
 
 
 class PresentEmails(frozenset):
-    """The enumerated emails (a frozenset of lowercased text values) plus
-    unreadable_entries: how many matching entries held the email attribute
-    with no value that is text (issue #1448, IAM-LDAP-15). Such an entry is a
-    person the directory still lists but whose email cannot be read, so the
-    sweep may not treat anyone as absent while one exists (IAM-SWEEP-10)."""
+    """The enumerated emails (a frozenset of the lowercased text values) plus
+    what the enumeration could not read (issue #1448, IAM-LDAP-15,
+    IAM-SWEEP-10):
+
+    - unreadable_entries: entries with at least one email value that is not
+      text. Such an entry is a person the directory still lists, and one of
+      their addresses cannot be read, so it may be the one a HERD account
+      holds: that account must not be treated as absent.
+    - held_usernames: the casefolded username values (LDAP_USERNAME_ATTRIBUTE,
+      text by the same rule) of those entries, so the sweep can hold back only
+      the matching accounts.
+    - unidentified_entries: those of them with no username value that is text
+      either; one such entry holds back the whole sweep.
+    """
 
     unreadable_entries: int
+    unidentified_entries: int
+    held_usernames: frozenset[str]
 
-    def __new__(cls, emails=(), unreadable_entries: int = 0):
+    def __new__(
+        cls,
+        emails=(),
+        unreadable_entries: int = 0,
+        *,
+        unidentified_entries: int = 0,
+        held_usernames=frozenset(),
+    ):
         instance = super().__new__(cls, emails)
         instance.unreadable_entries = unreadable_entries
+        instance.unidentified_entries = unidentified_entries
+        instance.held_usernames = frozenset(held_usernames)
         return instance
 
 
@@ -939,19 +965,16 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
             extra={"action": "ldap_missing_email", "dn": user_dn},
         )
         return None
+    # None when neither the attribute nor the login name is usable text: the
+    # caller refuses only a login that would provision a new account, since a
+    # returning user is found by email (issue #1448 review). Whether the account
+    # exists is decided after the bind, so this is no existence oracle.
     ldap_username = _first_text_value(
         attrs.get(settings.ldap_username_attribute) or [],
         attribute=settings.ldap_username_attribute,
         dn=user_dn,
         max_length=USERNAME_MAX_LENGTH,
     ) or _text_value(username, USERNAME_MAX_LENGTH)
-    if not ldap_username:
-        logger.warning(
-            "LDAP user has no usable username and the login name cannot stand in; "
-            "cannot provision HERD account",
-            extra={"action": "ldap_missing_username", "dn": user_dn},
-        )
-        return None
     return LdapIdentity(username=ldap_username, email=email, dn=user_dn)
 
 
@@ -1424,8 +1447,11 @@ def _paged_user_emails_sync(
     value of ldap_email_attribute (lowercased) across every matching entry
     (an entry may be multi-valued; every value is included) that is text: a
     value that is not (_text_value) is left out, with one WARNING for the
-    whole enumeration, and an entry with no text value at all is counted in
-    the result's unreadable_entries (issue #1448).
+    whole enumeration. An entry with ANY email value left out is counted in
+    the result's unreadable_entries, and its username values (read with the
+    email attribute, by the same text rule) go into held_usernames, or, when it
+    has none that is text, it counts in unidentified_entries (issue #1448,
+    IAM-SWEEP-10).
 
     Loops the paged-results cookie, held on ONE connection for the whole
     enumeration, until the directory reports it exhausted. A missing paging
@@ -1442,11 +1468,15 @@ def _paged_user_emails_sync(
     on a different connection.
     """
     email_attr = settings.ldap_email_attribute
+    username_attr = settings.ldap_username_attribute
+    attributes = list(dict.fromkeys([email_attr, username_attr]))
 
     def _do(conn: Connection) -> PresentEmails:
         emails: set[str] = set()
         refused: list[str] = []
         unreadable_entries = 0
+        unidentified_entries = 0
+        held_usernames: set[str] = set()
         cookie: bytes = b""
         while True:
             try:
@@ -1460,7 +1490,7 @@ def _paged_user_emails_sync(
                     search_base=settings.ldap_user_base_dn,
                     search_filter=search_filter,
                     search_scope=SUBTREE,
-                    attributes=[email_attr],
+                    attributes=attributes,
                     paged_size=_PAGED_SEARCH_SIZE,
                     paged_cookie=cookie or None,
                 )
@@ -1473,8 +1503,17 @@ def _paged_user_emails_sync(
                 texts, entry_refused = _text_values(_attr_values(entry, email_attr))
                 emails.update(text.lower() for text in texts)
                 refused.extend(entry_refused)
-                if entry_refused and not texts:
+                if entry_refused:
+                    # Any value left out, even beside a readable one: the
+                    # unreadable one may be the address an account holds.
                     unreadable_entries += 1
+                    usernames, _ = _text_values(
+                        _attr_values(entry, username_attr), USERNAME_MAX_LENGTH
+                    )
+                    if usernames:
+                        held_usernames.update(name.casefold() for name in usernames)
+                    else:
+                        unidentified_entries += 1
             controls = (conn.result or {}).get("controls") or {}
             page_control = controls.get(_PAGED_COOKIE_OID)
             if not page_control:
@@ -1487,7 +1526,12 @@ def _paged_user_emails_sync(
         if refused:
             # One line per enumeration, not per entry (issue #1448).
             _log_values_not_text(email_attr, settings.ldap_user_base_dn, refused)
-        return PresentEmails(emails, unreadable_entries)
+        return PresentEmails(
+            emails,
+            unreadable_entries,
+            unidentified_entries=unidentified_entries,
+            held_usernames=held_usernames,
+        )
 
     return _call_with_connection(_do, holder)
 
