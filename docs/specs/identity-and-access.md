@@ -2076,7 +2076,7 @@ it on the pre-#1355 commit, is replayed by the tests
   IP-literal domain, the character at fault in a UUID), and `loc` names the keys the
   caller sent, an unknown key on an `extra="forbid"` body included. Since issue #1455
   the handler is the shared one every service installs, the acl service included
-  (OPS-VALID-1 to OPS-VALID-4 in `operations-and-observability.md`). \
+  (OPS-VALID-1 to OPS-VALID-5 in `operations-and-observability.md`). \
   Enforced in: `services/common/herd_common/validation_errors.py` (`validation_error_handler`, `render_validation_errors`, `install_validation_errors`, `restrict_validation_error_schema`, `RENDERED_KEYS`); `services/auth/app/main.py` (`install_validation_errors`) \
   Pinned by: `services/auth/tests/test_validation_errors.py` (`test_the_handler_is_installed_for_request_validation_errors`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_every_rendered_error_has_exactly_the_advertised_keys`); `services/common/tests/test_validation_errors.py` (`test_the_handler_keeps_type_loc_msg_and_drops_input_ctx_and_everything_else`, `test_the_handler_replaces_a_lone_surrogate_in_loc_and_msg_and_keeps_integers`, `test_the_handler_keeps_honest_non_ascii_text_unchanged`); `services/auth/tests/test_password_input_validation.py` (`test_a_422_never_echoes_the_submitted_password`, `test_msg_and_loc_can_still_quote_submitted_text`, `test_a_surrogate_dict_key_is_422_not_500`, `test_a_surrogate_in_another_register_field_is_422_not_500`); `services/acl/tests/test_validation_errors.py` (`test_a_refused_body_never_echoes_the_submitted_value`)
 

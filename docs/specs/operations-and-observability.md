@@ -754,7 +754,7 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   fixed-string 422. It is not a promise that no submitted text appears: `msg` is the
   validator's own text and could quote part of a value, and `loc` names the keys the
   caller sent. The handler is a standalone copy of the shared one every other service
-  installs (OPS-VALID-1 to OPS-VALID-4), its code pinned identical to it, because the
+  installs (OPS-VALID-1 to OPS-VALID-5), its code pinned identical to it, because the
   config service imports neither `herd_common` nor auth; before it, `{"password":
   ["\ud800"]}` on login and `{"np": "abcdefg\ud800"}` on change-password were 500s and
   every other refusal echoed its input. \
@@ -1603,10 +1603,12 @@ CLI documentation guard (OPS-NATS-14).
 
 **What it does.** When a request does not have the shape a route expects (a field
 missing, a value of the wrong type, a body that is not JSON), every HERD service answers
-422 with a list that says where the problem is and what is wrong, never what was sent.
-So a refused request cannot copy a password, a secret's plaintext, a webhook signing
+422 with a list that says where the problem is and what is wrong, without a field
+holding what was sent (OPS-VALID-3 lists the text a message can still quote). So such
+a refused request cannot copy a password, a secret's plaintext, a webhook signing
 secret, or a device's credential fields into the answer, a proxy log, or a browser
-toast, and no request body can turn the 422 into a 500.
+toast, and no body that fails validation turns the 422 into a 500 (OPS-VALID-2,
+OPS-VALID-5).
 
 **Surfaces.** `services/common/herd_common/validation_errors.py`, the ONE handler, which
 each service's `app/main.py` installs; the config service's standalone copy,
@@ -1622,17 +1624,17 @@ each service's `app/main.py` installs; the config service's standalone copy,
   (IAM-HASH-9 in `identity-and-access.md`) and config (OPS-CONFIG-30) did this; every
   other service echoed `input`, which for a missing field is the whole body: a secrets
   create without `name` returned the plaintext `data`, and a webhook registration its
-  `secret`. \
+  `secret`. Because `input` is dropped, a refused body holding a lone surrogate is a 422
+  too: the echo of it was a 500, since Starlette cannot encode a surrogate as UTF-8. \
   Enforced in: `services/common/herd_common/validation_errors.py` (`render_validation_errors`, `validation_error_handler`, `restrict_validation_error_schema`, `install_validation_errors`, `RENDERED_KEYS`) \
   Pinned by: `services/common/tests/test_validation_errors.py` (`test_the_handler_keeps_type_loc_msg_and_drops_input_ctx_and_everything_else`, `test_render_takes_any_iterable_of_errors_and_an_error_without_a_loc`, `test_restrict_leaves_a_document_without_the_component_alone`, `test_install_registers_the_handler_for_request_validation_errors`, `test_install_makes_the_openapi_document_advertise_exactly_the_rendered_keys`, `test_an_installed_app_never_echoes_the_body`); `services/acl/tests/test_validation_errors.py` (`test_the_shared_handler_is_installed`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_a_refused_body_never_echoes_the_submitted_value`); `services/ai-orchestrator/tests/test_validation_errors.py` (`test_the_shared_handler_is_installed`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_a_refused_body_never_echoes_the_submitted_value`); `services/cabling/tests/test_validation_errors.py` (`test_the_shared_handler_is_installed`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_a_refused_body_never_echoes_the_submitted_value`); `services/execution/tests/test_validation_errors.py` (`test_the_shared_handler_is_installed`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_a_refused_body_never_echoes_the_submitted_value`); `services/integration/tests/test_validation_errors.py` (`test_the_shared_handler_is_installed`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_a_refused_body_never_echoes_the_submitted_value`); `services/inventory/tests/test_validation_errors.py` (`test_the_shared_handler_is_installed`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_a_refused_body_never_echoes_the_submitted_value`); `services/notifications/tests/test_validation_errors.py` (`test_the_shared_handler_is_installed`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_a_refused_body_never_echoes_the_submitted_value`); `services/reservations/tests/test_validation_errors.py` (`test_the_shared_handler_is_installed`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_a_refused_body_never_echoes_the_submitted_value`); `services/secrets/tests/test_validation_errors.py` (`test_the_shared_handler_is_installed`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_a_refused_body_never_echoes_the_submitted_value`); `services/user-profile/tests/test_validation_errors.py` (`test_the_shared_handler_is_installed`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_a_refused_body_never_echoes_the_submitted_value`); `services/auth/tests/test_validation_errors.py` (`test_the_handler_is_installed_for_request_validation_errors`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_every_rendered_error_has_exactly_the_advertised_keys`); `tests/integration/test_secrets_flow.py` (`test_a_refused_create_never_echoes_the_plaintext`)
 - **OPS-VALID-2.** Every lone surrogate in a string in `loc` or `msg` is replaced with
-  U+FFFD, so the 422 always encodes as UTF-8 and never becomes a 500. Pydantic refuses a
-  constrained string holding one as `string_unicode` with a fixed message; before #1455
-  the default handler echoed it in `input` and Starlette could not encode the answer, so
-  a lone surrogate sent as a JSON escape in such a field, or anywhere in a body that
-  failed for another reason, was a 500. \
+  U+FFFD, so an error this handler renders always encodes as UTF-8. A constrained
+  string (a length bound, a pattern) refuses a surrogate as `string_unicode` with a
+  fixed message, but a plain `str` and the keys and values of a `dict[str, str]`
+  accept one, so a key of a free-form mapping can carry one into `loc`. \
   Enforced in: `services/common/herd_common/validation_errors.py` (`_encodable`, `render_validation_errors`) \
-  Pinned by: `services/common/tests/test_validation_errors.py` (`test_the_handler_replaces_a_lone_surrogate_in_loc_and_msg_and_keeps_integers`, `test_the_handler_keeps_honest_non_ascii_text_unchanged`, `test_an_installed_app_never_echoes_the_body`); `services/secrets/tests/test_validation_errors.py` (`test_a_refused_body_never_echoes_the_submitted_value`)
+  Pinned by: `services/common/tests/test_validation_errors.py` (`test_the_handler_replaces_a_lone_surrogate_in_loc_and_msg_and_keeps_integers`, `test_the_handler_keeps_honest_non_ascii_text_unchanged`)
 - **OPS-VALID-3.** It is not a promise that no submitted text appears, by decision (the
   module docstring of `herd_common.validation_errors` records the limits). `loc` names
   the keys the caller sent where a value failed or a key was refused: an unknown key on
@@ -1641,8 +1643,8 @@ each service's `app/main.py` installs; the config service's standalone copy,
   the permitted values of an enum or literal, never the input, but quotes the character
   at fault in a UUID, an email's invalid character, and the tag of a discriminated
   union; three of the services' own validators quote input, none of them a
-  secret-bearing field: inventory's dropdown default, integration's unknown event types,
-  and user-profile's `page_sizes` key names. \
+  secret-bearing field: inventory's dropdown default and options, integration's unknown
+  event types, and user-profile's `page_sizes` key names. \
   Enforced in: `services/common/herd_common/validation_errors.py` (`render_validation_errors`) \
   Pinned by: `services/common/tests/test_validation_errors.py` (`test_an_installed_app_still_names_a_refused_key_in_loc`); `services/secrets/tests/test_validation_errors.py` (`test_loc_still_names_a_data_key_but_never_its_value_by_documented_limit`); `services/inventory/tests/test_validation_errors.py` (`test_msg_can_still_quote_a_dropdown_default_by_documented_limit`); `services/auth/tests/test_password_input_validation.py` (`test_msg_and_loc_can_still_quote_submitted_text`)
 - **OPS-VALID-4.** Every service app installs the handler: each `app/main.py` passes
@@ -1655,6 +1657,19 @@ each service's `app/main.py` installs; the config service's standalone copy,
   service is checked with no edit; its limits are in its module docstring. \
   Enforced in: `services/acl/app/main.py` (`install_validation_errors`); `services/ai-orchestrator/app/main.py` (`install_validation_errors`); `services/auth/app/main.py` (`install_validation_errors`); `services/cabling/app/main.py` (`install_validation_errors`); `services/execution/app/main.py` (`install_validation_errors`); `services/integration/app/main.py` (`install_validation_errors`); `services/inventory/app/main.py` (`install_validation_errors`); `services/notifications/app/main.py` (`install_validation_errors`); `services/reservations/app/main.py` (`install_validation_errors`); `services/secrets/app/main.py` (`install_validation_errors`); `services/user-profile/app/main.py` (`install_validation_errors`); `services/config/app/main.py` (`install_validation_errors`); `tests/unit/test_validation_errors_wiring.py` (`service_dirs`, `install_problems`, `foreign_registrations`, `STANDALONE_COPY`) \
   Pinned by: `tests/unit/test_validation_errors_wiring.py` (`test_every_service_app_installs_the_shared_handler`, `test_no_other_module_builds_an_app_or_registers_another_handler`, `test_services_are_discovered_from_the_directory`, `test_fixture_mains_that_pass`, `test_fixture_mains_that_fail`, `test_config_must_install_its_copy_not_the_shared_module`, `test_a_new_service_without_the_line_fails`); `services/config/tests/test_validation_errors.py` (`test_the_code_is_identical_to_the_shared_module`, `test_the_code_comparison_sees_a_one_character_change`)
+
+- **OPS-VALID-5.** A service's own validator never puts a submitted string into its
+  error message as is; it quotes it with `repr` (or a list's `str`, which is the `repr`
+  of each item), which writes a lone surrogate, and any control character, as its
+  escape. Pydantic-core cannot build an error whose message holds a lone surrogate: a
+  `ValueError` or `AssertionError` raised with one becomes a UnicodeEncodeError, not a
+  validation error, so the handler never runs and the route answers 500. Before this
+  rule, `POST /templates` on inventory with a dropdown default or option of `"Z\ud800"`
+  was such a 500 (#1455 review); the message now reads `Default 'x' is not in options:
+  'a', 'b'`, the options newly quoted. No guard scans for the rule; the module
+  docstring of `herd_common.validation_errors` states it for validator authors. \
+  Enforced in: `services/inventory/app/schemas/template.py` (`validate_options_and_default`); `services/integration/app/schemas/webhook.py` (`_validate_events`); `services/user-profile/app/schemas/preferences.py` (`_validate_page_sizes`) \
+  Pinned by: `services/common/tests/test_validation_errors.py` (`test_a_validator_message_holding_a_lone_surrogate_is_a_500_the_handler_cannot_see`, `test_a_validator_message_quoting_with_repr_is_a_clean_422`); `services/inventory/tests/test_validation_errors.py` (`test_a_lone_surrogate_the_dropdown_message_quotes_is_a_422_not_a_500`); `services/integration/tests/test_validation_errors.py` (`test_a_lone_surrogate_in_an_unknown_event_type_is_a_422_not_a_500`); `services/user-profile/tests/test_validation_errors.py` (`test_a_lone_surrogate_in_a_page_sizes_key_is_a_422_not_a_500`)
 
 **Out of scope.** An error body a route builds itself (`HTTPException(detail=...)`) is
 not rendered by this handler; each such detail is its area's rule. What auth's and
@@ -1678,7 +1693,7 @@ and OPS-CONFIG-8.
 | 503 | `The config data directory is not writable; the config service log names the one-time fix` | a config write (login's first auth file, change-password, save) the data directory refuses | OPS-CONFIG-29 |
 | 503 | `The config password store is unusable; the config service log names the cause` | a config change-password, from a session issued earlier, while the auth file is unreadable or not a JSON object, or while there is no auth file and `CONFIG_ADMIN_PASSWORD` holds a value OPS-CONFIG-8's rule refuses | OPS-CONFIG-7, OPS-CONFIG-5 |
 | 422 | validation list, each item exactly `{type, loc, msg}` | a config login, change-password, or save body that is not the documented shape (a field missing or of the wrong type, a body that is not a JSON object) | OPS-CONFIG-30 |
-| 422 | validation list, each item exactly `{type, loc, msg}` | any request that does not have a route's documented shape, in every service | OPS-VALID-1, OPS-VALID-2 |
+| 422 | validation list, each item exactly `{type, loc, msg}` | any request that does not have a route's documented shape, in every service | OPS-VALID-1, OPS-VALID-2, OPS-VALID-5 |
 | 409 | `A restart is already in progress` | a restarter `POST /restart` while another runs | OPS-CONFIG-27 |
 | 404 | `Not found` | a restarter request to any path but `/restart` and `/health` | OPS-CONFIG-25 |
 | 405 | `Method not allowed`, with `Allow` | a restarter request to `/restart` with a method other than POST, or to `/health` with one other than GET | OPS-CONFIG-25 |

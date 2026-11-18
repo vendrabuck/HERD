@@ -13,10 +13,21 @@ document advertise that shape. What that guarantees, exactly:
 
 - No 422 carries `input` or `ctx`, so none holds a submitted value as such: no
   secret's `data` value, password, webhook signing secret, or `field_data` value.
-- No 422 becomes a 500 because of a lone surrogate: every lone surrogate in a string
-  in `loc` or `msg` is replaced with U+FFFD, so the body always encodes. No route is
-  known to put one there (pydantic refuses a string holding one as `string_unicode`,
-  with a fixed message), but a 500 is the price of being wrong.
+- No error this handler renders becomes a 500 because of a lone surrogate: every lone
+  surrogate in a string in `loc` or `msg` is replaced with U+FFFD, so the body always
+  encodes. A constrained string (a length bound, a pattern) refuses a surrogate as
+  `string_unicode` with a fixed message; a plain `str`, and the keys and values of a
+  `dict[str, str]`, accept one. A key of a free-form mapping can therefore carry one
+  into `loc`, which is why the replacement is needed.
+- Rule for validator authors: a custom validator's message must never hold a
+  submitted string as is. Pydantic-core cannot build an error whose message holds a
+  lone surrogate: a `ValueError` or `AssertionError` raised with one becomes a
+  UnicodeEncodeError instead of a validation error (a `PydanticCustomError` fails
+  the same way when its errors are read), so this handler never runs and the route
+  answers 500. Quote a submitted value with `repr` (`{value!r}`), or a list of them
+  (whose `str` is the `repr` of each item), which writes a surrogate, and any control
+  character, as its escape. `services/common/tests/test_validation_errors.py` pins
+  both halves.
 - It is NOT a promise that no submitted text appears at all. Two keys still can:
   - `loc` names the keys the caller sent where a value failed or a key was refused:
     an unknown key on an `extra="forbid"` body, and a key of a free-form mapping.
@@ -27,10 +38,13 @@ document advertise that shape. What that guarantees, exactly:
     permitted values of an enum or literal, never the input, but a few quote part
     of it: the character at fault in a UUID, an email's invalid character or its
     IP-literal domain, the tag of a discriminated union. Three of the services' own
-    validators quote input, none of them a secret-bearing field: inventory's
-    dropdown default (`FieldDefinition.validate_options_and_default`), integration's
-    unknown event types (`WebhookCreate._validate_events`), and user-profile's
-    `page_sizes` key names (`_validate_page_sizes`).
+    validators quote input, each with `repr`, none of them a secret-bearing field:
+    inventory's dropdown default and options
+    (`FieldDefinition.validate_options_and_default`), integration's unknown event
+    types (`WebhookCreate._validate_events`), and user-profile's `page_sizes` key
+    names (`_validate_page_sizes`).
+- A body a route builds itself (`HTTPException(detail=...)`) is not rendered by this
+  handler, and some such details quote a submitted value.
 
 Every service installs it from its `app/main.py`; `tests/unit/test_validation_errors_wiring.py`
 fails when one does not. The config service, which must not import herd_common,

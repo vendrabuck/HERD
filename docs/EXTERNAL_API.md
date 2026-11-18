@@ -115,14 +115,24 @@ and an unreachable reservations service surfaces as `503`. The `{id}` in every
 `/api/v1/reservations/{id}` path must be a UUID; any other value is answered `422`
 by the facade itself and never reaches reservations.
 
-A request the facade, or the reservations service behind it, refuses as malformed is
-answered `422` with a validation list: `{"detail": [{"type": ..., "loc": [...],
-"msg": ...}, ...]}`, each item exactly those three keys. `loc` names where the problem
-is (`["body", "start_time"]`) and `msg` says what is wrong; the submitted value is
-never sent back. Until issue #1455 each item also carried FastAPI's optional `input`
-(the submitted value, for a missing field the whole body) and sometimes `ctx`; both
-were optional in the published schema and are now gone (see Versioning and
-deprecation policy).
+A request body, path, or query that does not have the documented shape (a field
+missing, a value of the wrong type, a body that is not JSON) is answered `422` with a
+validation list, by the facade or by the reservations service behind it:
+`{"detail": [{"type": ..., "loc": [...], "msg": ...}, ...]}`, each item exactly those
+three keys. `loc` names where the problem is (`["body", "start_time"]`), and it names
+the keys you sent; `msg` says what is wrong. No item carries the submitted value as a
+field of its own, but `msg` can quote part of it: an unknown webhook event type is
+named (`unknown event_types ['x']; allowed: ...`), and an invalid UUID's message names
+the character at fault. Until issue #1455 each item also carried FastAPI's optional
+`input` (the submitted value, for a missing field the whole body) and sometimes
+`ctx`; both were optional in the published schema and are now gone (see Versioning
+and deprecation policy).
+
+A `422` for a reason of the reservations service's own, on a request that has the
+documented shape, is not a validation list: it carries a string `detail`, relayed as
+reservations wrote it, and some such strings quote what you sent (an unknown
+`purpose_category` is answered `Unknown purpose_category '<value>'; allowed: <list>`,
+below).
 
 ### POST /api/v1/reservations
 
