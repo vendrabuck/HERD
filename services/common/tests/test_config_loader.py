@@ -165,13 +165,15 @@ def test_get_field_value_returns_tuple(tmp_path, monkeypatch):
 def test_source_falls_back_when_config_json_is_corrupt(tmp_path, monkeypatch):
     config_file = tmp_path / "config.json"
     config_file.write_text("{broken")
+    (tmp_path / "config.bootstrapped").write_text("marker")
     loader = _reload_loader(monkeypatch, str(config_file))
 
     class S(BaseSettings):
         secret_key: str = "default"
 
-    # A truncated/corrupt mounted config must not raise JSONDecodeError at
-    # import/construction time; it falls back to {} so env/defaults apply.
+    # A truncated bootstrap copy of the environment must not raise JSONDecodeError
+    # at import/construction time; it falls back to {} so env/defaults apply. An
+    # operator's file refuses instead (test_unusable_operator_file_refuses_to_start).
     source = loader.HerdJsonConfigSource(S)
     assert source() == {}
 
@@ -270,12 +272,34 @@ def _call_with_deadline(fn, seconds=5.0):
     return result["value"]
 
 
+def _ignored(path, reason):
+    return (
+        f"Ignoring unusable HERD config file {path} ({reason}); it is the first-boot copy "
+        "of the environment, so environment values apply"
+    )
+
+
+def _refused(path, reason):
+    return (
+        f"HERD config file {path} is unusable ({reason}). It is not the first-boot copy of "
+        "the environment (no config.bootstrapped beside it), so it holds the operator's own "
+        "settings, and this service will not start on environment values in their place. "
+        "Repair the file, remove it to use the environment, or save the settings again on "
+        "the config page."
+    )
+
+
+def _mark_bootstrapped(config_file):
+    (config_file.parent / "config.bootstrapped").write_text("marker")
+
+
 @pytest.mark.parametrize(("content", "reason"), _UNUSABLE_CONTENTS)
-def test_unusable_config_file_is_ignored_with_one_warning(
+def test_unusable_bootstrap_copy_is_ignored_with_one_warning(
     tmp_path, monkeypatch, caplog, content, reason
 ):
     config_file = tmp_path / "config.json"
     config_file.write_bytes(content)
+    _mark_bootstrapped(config_file)
     loader = _reload_loader(monkeypatch, str(config_file))
     caplog.set_level(logging.WARNING, logger="herd_common.config_loader")
 
@@ -289,18 +313,17 @@ def test_unusable_config_file_is_ignored_with_one_warning(
     assert len(records) == 1
     assert records[0].levelno == logging.WARNING
     # Names the path and the reason, never the content.
-    assert records[0].getMessage() == (
-        f"Ignoring unusable HERD config file {config_file} ({reason})"
-    )
+    assert records[0].getMessage() == _ignored(config_file, reason)
 
 
 @pytest.mark.parametrize(("content", "reason"), _UNUSABLE_CONTENTS)
-def test_unusable_config_file_leaves_every_key_to_the_environment(
+def test_unusable_bootstrap_copy_leaves_every_key_to_the_environment(
     tmp_path, monkeypatch, content, reason
 ):
-    # OPS-SET-3 and OPS-SET-4: the file is treated as missing, in file-first order.
+    # OPS-SET-3 and OPS-SET-4: the copy is treated as missing.
     config_file = tmp_path / "config.json"
     config_file.write_bytes(content)
+    _mark_bootstrapped(config_file)
     loader = _reload_loader(monkeypatch, str(config_file))
     monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
 
@@ -309,26 +332,76 @@ def test_unusable_config_file_leaves_every_key_to_the_environment(
     assert settings.log_level == "INFO"
 
 
+@pytest.mark.parametrize(("content", "reason"), _UNUSABLE_CONTENTS)
+def test_unusable_operator_file_refuses_to_start(tmp_path, monkeypatch, caplog, content, reason):
+    # No marker: the file holds the operator's choices (a config-page save, a file
+    # from before the marker, a hand edit). Falling back to the environment could
+    # widen access or revive rotated secrets, so the settings load raises, through
+    # pydantic unchanged, and nothing is logged in its place.
+    config_file = tmp_path / "config.json"
+    config_file.write_bytes(content)
+    loader = _reload_loader(monkeypatch, str(config_file))
+    caplog.set_level(logging.DEBUG, logger="herd_common.config_loader")
+    monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
+
+    with pytest.raises(loader.ConfigFileUnusable) as caught:
+        _herd_ordered_settings(loader)()
+    assert str(caught.value) == _refused(config_file, reason)
+    assert _loader_warnings(caplog) == []
+
+
+@pytest.mark.parametrize("bootstrapped", [True, False], ids=["bootstrap-copy", "operator-file"])
 @pytest.mark.parametrize(("make_state", "reason"), _UNUSABLE_PATH_STATES)
-def test_unusable_path_state_is_ignored_with_one_warning_without_blocking(
-    tmp_path, monkeypatch, caplog, make_state, reason
+def test_unusable_path_state_is_judged_by_who_wrote_it_without_blocking(
+    tmp_path, monkeypatch, caplog, make_state, reason, bootstrapped
 ):
     # A path that is not a readable regular file is refused before any read, so a
     # FIFO never blocks import; a dangling or looping link is unusable, not missing.
     config_file = tmp_path / "config.json"
     cleanup = make_state(config_file)
+    if bootstrapped:
+        _mark_bootstrapped(config_file)
     try:
         loader = _reload_loader(monkeypatch, str(config_file))
         caplog.set_level(logging.WARNING, logger="herd_common.config_loader")
         monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
-        settings = _call_with_deadline(_herd_ordered_settings(loader))
+        if bootstrapped:
+            settings = _call_with_deadline(_herd_ordered_settings(loader))
+        else:
+            with pytest.raises(loader.ConfigFileUnusable) as caught:
+                _call_with_deadline(_herd_ordered_settings(loader))
     finally:
         cleanup()
-    assert settings.cors_origins == "https://from-env"
-    records = _loader_warnings(caplog)
-    assert [r.getMessage() for r in records] == [
-        f"Ignoring unusable HERD config file {config_file} ({reason})"
-    ]
+    if bootstrapped:
+        assert settings.cors_origins == "https://from-env"
+        assert [r.getMessage() for r in _loader_warnings(caplog)] == [_ignored(config_file, reason)]
+    else:
+        assert str(caught.value) == _refused(config_file, reason)
+        assert _loader_warnings(caplog) == []
+
+
+@pytest.mark.parametrize("bootstrapped", [True, False], ids=["marker", "no-marker"])
+def test_readable_file_is_read_whoever_wrote_it(tmp_path, monkeypatch, bootstrapped):
+    # Control for the two tests above: the marker decides only what an UNUSABLE
+    # file does; a readable one is read either way (its rank is OPS-SET-1 and 2).
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({"LOG_LEVEL": "WARNING"}))
+    if bootstrapped:
+        _mark_bootstrapped(config_file)
+    loader = _reload_loader(monkeypatch, str(config_file))
+
+    assert _herd_ordered_settings(loader)().log_level == "WARNING"
+
+
+def test_missing_config_file_with_a_marker_logs_nothing(tmp_path, monkeypatch, caplog):
+    config_file = tmp_path / "config.json"
+    _mark_bootstrapped(config_file)
+    loader = _reload_loader(monkeypatch, str(config_file))
+    caplog.set_level(logging.DEBUG, logger="herd_common.config_loader")
+    monkeypatch.setenv("CORS_ORIGINS", "https://from-env")
+
+    assert _herd_ordered_settings(loader)().cors_origins == "https://from-env"
+    assert _loader_warnings(caplog) == []
 
 
 def test_missing_config_file_logs_nothing(tmp_path, monkeypatch, caplog):

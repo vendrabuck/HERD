@@ -415,24 +415,35 @@ subclasses `HerdBaseSettings`. The full ladder for operators is in
   Pinned by: `services/common/tests/test_config_loader.py` (`test_herd_sources_env_applies_for_keys_absent_from_file`, `test_herd_sources_pure_env_when_file_missing`); `services/common/tests/test_base_settings.py` (`test_pure_env_when_config_file_missing`)
 - **OPS-SET-4.** An empty or whitespace-only string in the file means unset. A path
   where nothing exists, not even a link, is a missing file (OPS-SET-3) and logs nothing.
-  Any other path that does not hold a readable JSON object is treated as missing too,
-  with one WARNING naming the path and the reason, never the content: unparseable JSON
+  Any other path that does not hold a readable JSON object is unusable: unparseable JSON
   (an empty file and a UTF-8 BOM included), a byte that is not UTF-8 (the file is read
   as UTF-8 whatever the locale), nesting deeper than the parser allows, an integer over
   Python's 4300-digit limit, valid JSON that is not an object (a list, a string, a
   number, a boolean, `null`), an unreadable file, a dangling or looping link, and a path
   that is not a regular file (a directory, a FIFO, a socket, a device), which is refused
-  from its `stat` before any read, so a FIFO never blocks the import. So the file's
-  form never stops a service at import. Its values can: a value of the wrong type
-  inside a valid object (`{"LOG_LEVEL": 5}`) is judged by the field's own validation, as
-  an environment value is, and a refusal stops the service at import with a
-  `ValidationError` naming the field, never the value (`HerdBaseSettings` sets
-  `hide_input_in_errors`); the `POSTGRES_*` parts are OPS-SET-5's. The config service's
-  own reader, `config_store.load_config`, answers every path state and content above
-  the same way, with its own WARNING text. A `MemoryError` on a huge file is not
-  handled. \
-  Enforced in: `services/common/herd_common/config_loader.py` (`HerdJsonConfigSource`, `_load_json`, `_read_config_object`); `services/config/app/config_store.py` (`load_config`, `_read_config_object`) \
-  Pinned by: `services/common/tests/test_config_loader.py` (`test_source_skips_empty_string_values`, `test_source_falls_back_when_config_json_is_corrupt`, `test_unusable_config_file_is_ignored_with_one_warning`, `test_unusable_config_file_leaves_every_key_to_the_environment`, `test_unusable_path_state_is_ignored_with_one_warning_without_blocking`, `test_missing_config_file_logs_nothing`, `test_link_to_a_readable_file_is_read`, `test_config_file_is_read_as_utf8_whatever_the_locale`); `services/acl/tests/test_settings_config_file.py` (`test_settings_load_from_the_environment_whatever_the_file_holds`, `test_settings_load_from_the_environment_whatever_is_at_the_path`); `services/user-profile/tests/test_settings_config_file.py` (`test_settings_load_from_the_environment_whatever_the_file_holds`, `test_settings_load_from_the_environment_whatever_is_at_the_path`); `services/config/tests/test_load_config.py` (`test_load_config_ignores_an_unusable_file_naming_only_the_reason`, `test_load_config_refuses_a_path_that_is_not_a_regular_file_without_blocking`, `test_load_config_logs_nothing_for_a_missing_file`, `test_load_config_reads_utf8_whatever_the_locale`)
+  from its `stat` before any read, so a FIFO never blocks the import. What an unusable
+  file does depends on who wrote it, read from the `config.bootstrapped` marker beside
+  it (OPS-SET-2), which every service sees on its read-only `herd-config` mount. With the
+  marker, the file is the first-boot copy of the environment and is ignored with one
+  WARNING naming the path and the reason, so the environment's values, which the copy
+  held, apply. Without it, the file holds the operator's own settings (a config-page
+  save, a file from before the marker existed, a hand edit), and every service but
+  config refuses to start: the settings load raises `ConfigFileUnusable` naming the
+  path, the reason, and the remedy (repair the file, remove it to use the environment,
+  or save the settings again on the config page). Falling back to the environment there
+  could widen access (a saved `AUTH_METHOD=ldap` or `oidc` becoming compose's default
+  `local`, where registration is open) or revive an `AUTH_SECRET_KEY`,
+  `INTERNAL_API_TOKEN`, or superadmin password the operator rotated away from. Neither
+  answer quotes the content. The config service is not one of the refusing services: its
+  own reader, `config_store.load_config`, ignores every unusable path state and content
+  above with a WARNING, marker or not, so it keeps serving its page and the operator can
+  re-save from it. A valid file's values can also stop a service at import: a value of
+  the wrong type (`{"LOG_LEVEL": 5}`) is judged by the field's own validation, as an
+  environment value is, and a refusal is a `ValidationError` naming the field, never the
+  value (`HerdBaseSettings` sets `hide_input_in_errors`); the `POSTGRES_*` parts are
+  OPS-SET-5's. A `MemoryError` on a huge file is not handled. \
+  Enforced in: `services/common/herd_common/config_loader.py` (`HerdJsonConfigSource`, `_load_json`, `_read_config_object`, `ConfigFileUnusable`, `BOOTSTRAP_MARKER`); `services/config/app/config_store.py` (`load_config`, `_read_config_object`) \
+  Pinned by: `services/common/tests/test_config_loader.py` (`test_source_skips_empty_string_values`, `test_source_falls_back_when_config_json_is_corrupt`, `test_unusable_bootstrap_copy_is_ignored_with_one_warning`, `test_unusable_bootstrap_copy_leaves_every_key_to_the_environment`, `test_unusable_operator_file_refuses_to_start`, `test_unusable_path_state_is_judged_by_who_wrote_it_without_blocking`, `test_readable_file_is_read_whoever_wrote_it`, `test_missing_config_file_logs_nothing`, `test_missing_config_file_with_a_marker_logs_nothing`, `test_link_to_a_readable_file_is_read`, `test_config_file_is_read_as_utf8_whatever_the_locale`); `services/acl/tests/test_settings_config_file.py` (`test_settings_load_from_the_environment_over_an_unusable_bootstrap_copy`, `test_settings_refuse_to_load_over_an_unusable_operator_file`, `test_settings_load_a_valid_file_whose_postgres_parts_form_no_url`, `test_settings_still_read_a_readable_file`); `services/user-profile/tests/test_settings_config_file.py` (`test_settings_load_from_the_environment_over_an_unusable_bootstrap_copy`, `test_settings_refuse_to_load_over_an_unusable_operator_file`, `test_settings_load_a_valid_file_whose_postgres_parts_form_no_url`, `test_settings_still_read_a_readable_file`); `services/config/tests/test_load_config.py` (`test_load_config_ignores_an_unusable_file_naming_only_the_reason`, `test_load_config_refuses_a_path_that_is_not_a_regular_file_without_blocking`, `test_load_config_logs_nothing_for_a_missing_file`, `test_load_config_reads_utf8_whatever_the_locale`)
 - **OPS-SET-5.** The file's `AUTH_*` keys map to the services' unprefixed names, and the
   file's `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` build a percent-encoded
   `DATABASE_URL` against `postgres:5432` only when all three are set; `null`, an empty

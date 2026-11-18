@@ -35,22 +35,53 @@ _KEY_MAP = {
 _DATABASE_URL_KEYS = ("POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB")
 
 
+class ConfigFileUnusable(RuntimeError):
+    """An operator's config.json that cannot be used: the service refuses to start.
+
+    Raised from the settings source at import (OPS-SET-4), so the process exits
+    with this message as the last line of its traceback.
+    """
+
+
 def _load_json() -> dict:
     """The parsed config.json object, or {} when there is none to use (OPS-SET-4).
 
     A missing path (nothing there, not even a link) is not an error and logs
-    nothing (OPS-SET-3). Anything else that is not a readable JSON object is
-    ignored with one WARNING naming the path and the reason, never the content,
-    so environment values and model defaults apply. MemoryError on a huge file is
-    not handled.
+    nothing (OPS-SET-3). A path that does not hold a readable JSON object is
+    answered by who wrote it:
+
+    - The first-boot bootstrap copy of the environment (config.bootstrapped
+      beside it) is ignored with one WARNING naming the path and the reason, so
+      environment values apply: they are the same values the copy held.
+    - Any other file holds the operator's own choices (a config-page save, a
+      file from before the marker existed, a hand edit). Falling back to the
+      environment there could widen access (an operator's `AUTH_METHOD=ldap`
+      becoming compose's default `local`, with open registration) or revive
+      secrets the operator rotated away from, so ConfigFileUnusable is raised and
+      the service does not start.
+
+    Neither path quotes the content. MemoryError on a huge file is not handled.
     """
     if not os.path.lexists(CONFIG_FILE):
         return {}
     loaded, reason = _read_config_object(CONFIG_FILE)
-    if reason is not None:
-        logger.warning("Ignoring unusable HERD config file %s (%s)", CONFIG_FILE, reason)
-        return {}
-    return loaded
+    if reason is None:
+        return loaded
+    if not os.path.exists(_bootstrap_marker_file()):
+        raise ConfigFileUnusable(
+            f"HERD config file {CONFIG_FILE} is unusable ({reason}). It is not the "
+            f"first-boot copy of the environment (no {BOOTSTRAP_MARKER} beside it), so it "
+            "holds the operator's own settings, and this service will not start on "
+            "environment values in their place. Repair the file, remove it to use the "
+            "environment, or save the settings again on the config page."
+        )
+    logger.warning(
+        "Ignoring unusable HERD config file %s (%s); it is the first-boot copy of the "
+        "environment, so environment values apply",
+        CONFIG_FILE,
+        reason,
+    )
+    return {}
 
 
 def _read_config_object(path: str) -> tuple[dict, None] | tuple[None, str]:
