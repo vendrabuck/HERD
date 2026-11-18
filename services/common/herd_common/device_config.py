@@ -157,8 +157,17 @@ class ConfigValidationError(ValueError):
     """Raised when a device's proposed config fails schema validation.
 
     Its text never holds a value taken from the config (issue #1457), so a
-    caller may return it as a 422 detail and store it on a row as is.
+    caller may return it as a 422 detail and store it on a row as is. The text
+    is `<prefix>: <reason>`: `prefix` is `device` or `device '<name>'` (the
+    device's name, inventory data, quoted with `repr`) and `reason` is the rest.
+    They are kept apart so a caller that masks the text masks only `reason`
+    and a device name can never eat the refusal (execution, CFG-EXEC-10).
     """
+
+    def __init__(self, prefix: str, reason: str) -> None:
+        super().__init__(f"{prefix}: {reason}")
+        self.prefix = prefix
+        self.reason = reason
 
 
 class PublishedSchemaError(ValueError):
@@ -264,6 +273,7 @@ def _sanitize_published_schema(schema: Any) -> dict[str, Any]:
 
 _JSON_TYPES = frozenset({"array", "boolean", "integer", "null", "number", "object", "string"})
 _PLAIN_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SCHEMA_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}")
 _FORMAT_NAME = re.compile(r"[A-Za-z0-9-]{1,32}")
 _MAX_NAME_CHARS = 64
 _MAX_PATH_PARTS = 16
@@ -303,6 +313,27 @@ def _names_text(names: list[Any]) -> str:
     if len(names) > _MAX_LISTED:
         shown += f", and {len(names) - _MAX_LISTED} more"
     return shown
+
+
+def _is_schema_name(name: Any) -> bool:
+    """Whether a field name a published schema defines may be shown: a plain
+    name of the kind the registry's own fields have (`vlan_assignments`,
+    `next_hop`), with `-` and `.` also allowed, at most _MAX_NAME_CHARS long."""
+    return isinstance(name, str) and _SCHEMA_NAME.fullmatch(name) is not None
+
+
+def _schema_names_text(names: list[Any], show_all: bool) -> str:
+    """`the field 'a'`, `the fields 'a', 'b'`, or, for names a published schema
+    defines that are not plain, `a required field` or `2 required fields`:
+    `the field 'a' and 1 other required field` when some are plain."""
+    shown = names if show_all else [n for n in names if _is_schema_name(n)]
+    hidden = len(names) - len(shown)
+    if not shown:
+        return "a required field" if hidden == 1 else f"{hidden} required fields"
+    text = f"the {_plural(len(shown), 'field', 'fields')} {_names_text(shown)}"
+    if hidden:
+        text += f" and {hidden} other required {_plural(hidden, 'field', 'fields')}"
+    return text
 
 
 def _number_text(value: Any) -> str | None:
@@ -426,7 +457,7 @@ def _rule_text(error: jsonschema.ValidationError, *, show_schema_values: bool) -
         instance = error.instance if isinstance(error.instance, dict) else {}
         missing = [n for n in (expected or []) if isinstance(n, str) and n not in instance]
         if missing:
-            return f"needs the {_plural(len(missing), 'field', 'fields')} {_names_text(missing)}"
+            return f"needs {_schema_names_text(missing, show_schema_values)}"
         return "is missing a required field"
     if keyword == "dependentRequired":
         instance = error.instance if isinstance(error.instance, dict) else {}
@@ -435,10 +466,11 @@ def _rule_text(error: jsonschema.ValidationError, *, show_schema_values: bool) -
                 continue
             missing = [n for n in needed if isinstance(n, str) and n not in instance]
             if missing:
-                return (
-                    f"field {_name_text(present)} needs the "
-                    f"{_plural(len(missing), 'field', 'fields')} {_names_text(missing)}"
-                )
+                if show_schema_values or _is_schema_name(present):
+                    subject = f"field {_name_text(present)}"
+                else:
+                    subject = "a field"
+                return f"{subject} needs {_schema_names_text(missing, show_schema_values)}"
         return "is missing a field another field depends on"
     if keyword == "additionalProperties":
         extras = _disallowed_keys(error)
@@ -483,6 +515,41 @@ def schema_error_text(error: jsonschema.ValidationError, *, show_schema_values: 
     return f"at {_path_text(error.absolute_path)}: {rule}"
 
 
+# The refusal text before issue #1457: `<prefix>: config failed schema
+# validation: <jsonschema message>`, whose message quotes the config. The prefix
+# is `device` or `device ` and a Python `repr` string (single or double quoted,
+# with backslash escapes), so this anchored pattern reads the prefix exactly and
+# then needs `: ` right after `validation`; today's text always has ` at `
+# there, so it never matches one.
+_LEGACY_REFUSAL = re.compile(
+    r"""(device(?: (?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"))?)"""
+    r": config failed schema validation: ",
+    re.DOTALL,
+)
+LEGACY_REFUSAL_WITHHELD = (
+    "config failed schema validation "
+    "(details withheld; recorded before values were removed from these messages)"
+)
+
+
+def withhold_legacy_refusal_text(text: str | None) -> str | None:
+    """A stored refusal as a reader may see it.
+
+    A run refused before issue #1457 stored jsonschema's message, which can
+    quote the refused config, credentials included. Such text keeps its prefix
+    and gets LEGACY_REFUSAL_WITHHELD in place of the rest; any other text,
+    today's refusals included, is returned unchanged. Execution applies it to
+    every run it answers (`ExecutionRunResponse`), so the stored row is left as
+    it is and the API and the assistant never see the old message.
+    """
+    if not text:
+        return text
+    match = _LEGACY_REFUSAL.match(text)
+    if match is None:
+        return text
+    return f"{match.group(1)}: {LEGACY_REFUSAL_WITHHELD}"
+
+
 def _refusal(
     prefix: str,
     config: dict[str, Any],
@@ -502,7 +569,7 @@ def _refusal(
     if error is None:
         return None
     text = schema_error_text(error, show_schema_values=show_schema_values)
-    return ConfigValidationError(f"{prefix}: config failed schema validation {text}")
+    return ConfigValidationError(prefix, f"config failed schema validation {text}")
 
 
 def validate_device_config(
@@ -531,15 +598,17 @@ def validate_device_config(
 
     if connection_type is None:
         raise ConfigValidationError(
-            f"{prefix}: config was provided but connection_type is missing; "
-            f"cannot validate against any driver schema"
+            prefix,
+            "config was provided but connection_type is missing; "
+            "cannot validate against any driver schema",
         )
 
     schema = CONFIG_SCHEMAS.get(connection_type)
     if schema is None:
         raise ConfigValidationError(
-            f"{prefix}: connection_type {connection_type!r} does not accept "
-            f"a configure action; remove `config` from this device"
+            prefix,
+            f"connection_type {connection_type!r} does not accept "
+            "a configure action; remove `config` from this device",
         )
 
     refusal = _refusal(prefix, config, schema, show_schema_values=True)
