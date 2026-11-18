@@ -156,6 +156,10 @@ class Settings(HerdBaseSettings):
     # (auth_service._authenticate_oidc_mode).
     oidc_break_glass_local_superadmin: bool = False
 
+    # Worker threads for bcrypt (app/services/passwords.py, IAM-HASH-7); 0
+    # means half the CPUs auth may run on, at least 1 and at most 4.
+    auth_password_hash_threads: int = 0
+
     log_level: str = "INFO"
 
 

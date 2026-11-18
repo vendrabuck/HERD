@@ -30,10 +30,21 @@ from app.database import Base, get_db
 from app.dependencies.auth import get_current_user
 from app.main import app
 from app.models.user import User
-from app.services import ldap_sync_service
+from app.services import ldap_sync_service, passwords
 from httpx import ASGITransport, AsyncClient
 
 from tests._harness import engine, override_get_db
+
+
+@pytest.fixture(autouse=True)
+def fresh_login_limits():
+    """A fresh hashing pool for every test: a pool left holding a slot by a
+    failed test must not starve the next one (IAM-HASH-7). Tests of the pool
+    itself install their own.
+    """
+    passwords.set_hashing_pool(None)
+    yield
+    passwords.set_hashing_pool(None)
 
 
 @pytest.fixture

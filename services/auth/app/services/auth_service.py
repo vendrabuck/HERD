@@ -36,6 +36,15 @@ def get_password_hash(password: str) -> str:
     return passwords.hash_password(password)
 
 
+async def _check_password(plain_password: str, hashed_password: str | None) -> bool:
+    """verify_password on a hashing worker thread, off the event loop (IAM-HASH-7).
+
+    Looks verify_password up at call time, so a test that replaces it sees
+    every check.
+    """
+    return await passwords.run_hashing(verify_password, plain_password, hashed_password)
+
+
 async def get_user_by_email(db: AsyncSession, email: str) -> User | None:
     result = await db.execute(select(User).where(User.email == email))
     return result.scalar_one_or_none()
@@ -237,11 +246,15 @@ async def create_user(
     role: Role = Role.USER,
     full_name: str | None = None,
 ) -> User:
+    # Hashed on a worker thread, never on the event loop (IAM-HASH-7). The
+    # register route calls this inside a hashing slot; the startup seed calls
+    # it without one.
+    hashed_password = await passwords.run_hashing(get_password_hash, password)
     user = User(
         email=email,
         username=username,
         full_name=full_name or username,
-        hashed_password=get_password_hash(password),
+        hashed_password=hashed_password,
         auth_source="local",
         role=role,
     )
@@ -736,7 +749,7 @@ async def set_user_active(
 async def _authenticate_local(db: AsyncSession, email: str, password: str) -> User | None:
     user = await get_user_by_email(db, email)
     if not user:
-        verify_password(password, _DUMMY_HASH)
+        await _check_password(password, _DUMMY_HASH)
         logger.warning(
             "Login failed: unknown email",
             extra={"action": "login_failure", "email": email},
@@ -744,7 +757,7 @@ async def _authenticate_local(db: AsyncSession, email: str, password: str) -> Us
         return None
     if user.auth_source != "local" or not user.hashed_password:
         # An LDAP-sourced user must not be able to log in via the local path.
-        verify_password(password, _DUMMY_HASH)
+        await _check_password(password, _DUMMY_HASH)
         logger.warning(
             "Login failed: wrong auth source for %s (expected local, got %s)",
             email,
@@ -756,7 +769,7 @@ async def _authenticate_local(db: AsyncSession, email: str, password: str) -> Us
             },
         )
         return None
-    if not verify_password(password, user.hashed_password):
+    if not await _check_password(password, user.hashed_password):
         logger.warning(
             "Login failed: wrong password for %s",
             email,
@@ -903,7 +916,7 @@ async def _authenticate_oidc_mode(db: AsyncSession, email: str, password: str) -
     the switch is visible.
     """
     if not settings.oidc_break_glass_local_superadmin:
-        verify_password(password, _DUMMY_HASH)
+        await _check_password(password, _DUMMY_HASH)
         return _refuse_password_login_in_oidc_mode(email, "password_login_disabled")
     user = await get_user_by_email(db, email)
     if (
@@ -913,9 +926,9 @@ async def _authenticate_oidc_mode(db: AsyncSession, email: str, password: str) -
         or not user.is_active
         or not user.hashed_password
     ):
-        verify_password(password, _DUMMY_HASH)
+        await _check_password(password, _DUMMY_HASH)
         return _refuse_password_login_in_oidc_mode(email, "break_glass_not_eligible")
-    if not verify_password(password, user.hashed_password):
+    if not await _check_password(password, user.hashed_password):
         return _refuse_password_login_in_oidc_mode(email, "wrong_password")
     logger.warning(
         "Break-glass login of a local superadmin in single sign-on mode",
@@ -935,12 +948,18 @@ async def authenticate_user(db: AsyncSession, email: str, password: str) -> User
     break-glass account (`_authenticate_oidc_mode`), and local mode checks the
     stored bcrypt hash. In LDAP mode only, `ldap_service.LdapUnavailableError`
     propagates when the directory could not be asked (issue #1403).
+
+    Local and OIDC mode run inside a hashing slot (IAM-HASH-7), entered before
+    the first query so a login waiting for a slot holds no database
+    connection; `passwords.HashingBusyError` propagates when none comes free in
+    time. LDAP mode never hashes and takes no slot.
     """
     if settings.auth_method == "ldap":
         return await _authenticate_ldap(db, email, password)
-    if settings.auth_method == "oidc":
-        return await _authenticate_oidc_mode(db, email, password)
-    return await _authenticate_local(db, email, password)
+    async with passwords.hashing_slot():
+        if settings.auth_method == "oidc":
+            return await _authenticate_oidc_mode(db, email, password)
+        return await _authenticate_local(db, email, password)
 
 
 async def create_tokens_for_user(db: AsyncSession, user: User) -> tuple[str, str]:

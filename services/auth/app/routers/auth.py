@@ -17,6 +17,7 @@ from app.schemas.auth import (
     TokenResponse,
     UserResponse,
 )
+from app.services import passwords
 from app.services.auth_service import (
     authenticate_user,
     create_tokens_for_user,
@@ -40,6 +41,27 @@ REGISTER_DISABLED_LDAP_DETAIL = (
 REGISTER_DISABLED_OIDC_DETAIL = (
     "Local registration is disabled; this deployment uses single sign-on."
 )
+
+# Fixed 503 detail when no hashing slot came free in time (IAM-HASH-7).
+HASHING_BUSY_DETAIL = "Too many password checks in progress; try again shortly"
+
+_REGISTER_RESPONSES: dict[int | str, dict] = {
+    503: {"description": "Password checking is at capacity (IAM-HASH-7)"},
+}
+_LOGIN_RESPONSES: dict[int | str, dict] = {
+    503: {
+        "description": "Password checking is at capacity (IAM-HASH-7), or in LDAP mode "
+        "the directory could not be asked (IAM-LDAP-12)",
+    },
+}
+
+
+def _hashing_busy() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=HASHING_BUSY_DETAIL,
+        headers={"Retry-After": str(passwords.HASH_RETRY_AFTER_SECONDS)},
+    )
 
 
 @router.get("/login-options", response_model=LoginOptionsResponse)
@@ -69,7 +91,12 @@ async def login_options(response: Response):
     )
 
 
-@router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/register",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=_REGISTER_RESPONSES,
+)
 async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     if settings.auth_method == "ldap":
         raise HTTPException(
@@ -79,25 +106,36 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=REGISTER_DISABLED_OIDC_DETAIL
         )
-    # Single generic 409 for any collision (email OR username, pre-check OR the
-    # IntegrityError race below). Distinct messages let an unauthenticated caller
-    # enumerate which emails and usernames already exist by reading which one
-    # comes back. Keep this wording identical across all three paths.
-    if await get_user_by_email(db, body.email) or await get_user_by_username(db, body.username):
-        raise HTTPException(status_code=409, detail="Email or username already exists")
     try:
-        user = await create_user(
-            db, body.email, body.username, body.password, full_name=body.full_name
-        )
-    except IntegrityError:
-        raise HTTPException(status_code=409, detail="Email or username already exists")
+        # The slot is entered before the duplicate check's query, so a
+        # registration waiting for one holds no database connection (IAM-HASH-7).
+        async with passwords.hashing_slot():
+            # Single generic 409 for any collision (email OR username, pre-check
+            # OR the IntegrityError race below). Distinct messages let an
+            # unauthenticated caller enumerate which emails and usernames already
+            # exist by reading which one comes back. Keep this wording identical
+            # across all three paths.
+            if await get_user_by_email(db, body.email) or await get_user_by_username(
+                db, body.username
+            ):
+                raise HTTPException(status_code=409, detail="Email or username already exists")
+            try:
+                user = await create_user(
+                    db, body.email, body.username, body.password, full_name=body.full_name
+                )
+            except IntegrityError:
+                raise HTTPException(status_code=409, detail="Email or username already exists")
+    except passwords.HashingBusyError:
+        raise _hashing_busy()
     return user
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=TokenResponse, responses=_LOGIN_RESPONSES)
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     try:
         user = await authenticate_user(db, body.email, body.password)
+    except passwords.HashingBusyError:
+        raise _hashing_busy()
     except LdapUnavailableError:
         # Issue #1403: LDAP mode could not ask the directory, so the credentials
         # were never judged; a 401 would tell the user their password is wrong.
