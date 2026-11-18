@@ -889,6 +889,14 @@ async def _authenticate_ldap(db: AsyncSession, email: str, password: str) -> Use
         return None
 
     user = await get_user_by_email(db, identity.email)
+    if user is None and identity.username is None:
+        # Issue #1448 review: only provisioning needs a username. Reached only
+        # after a successful bind, so it reveals nothing a sign-in would not.
+        logger.warning(
+            "Login failed: no usable username to provision the LDAP account",
+            extra={"action": "login_failure", "email": email, "reason": "missing_username"},
+        )
+        return None
     if user is None:
         try:
             user = await create_ldap_user(db, identity.email, identity.username)

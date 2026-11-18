@@ -35,17 +35,26 @@ class MockDirectory:
         self._seed = seed
         self.connections: list[str | None] = []
 
-    def add_user(self, uid: str, password: str) -> str:
+    def add_user(self, uid: str, password: str, **attributes) -> str:
+        """A person under BASE_DN with uid, mail `<uid>@example.com`, and the
+        password; `attributes` replace or add attributes, and a value of None
+        leaves that attribute out. A `bytes` value is stored as those octets, so
+        ldap3 decodes it the way it decodes a directory's answer (a value that is
+        not UTF-8 comes back as `bytes`)."""
         dn = f"uid={uid},{BASE_DN}"
-        self._seed.strategy.add_entry(
-            dn,
-            {
-                "uid": uid,
-                "mail": f"{uid}@example.com",
-                "userPassword": password,
-                "objectClass": "person",
-            },
-        )
+        values = {
+            "uid": uid,
+            "mail": f"{uid}@example.com",
+            "userPassword": password,
+            "objectClass": "person",
+            **attributes,
+        }
+        self.add_entry(dn, {k: v for k, v in values.items() if v is not None})
+        return dn
+
+    def add_entry(self, dn: str, attributes: dict) -> str:
+        """Any entry, such as a group (`member` holding member DNs)."""
+        self._seed.strategy.add_entry(dn, attributes)
         return dn
 
     def connection(self, _server, **kwargs) -> Connection:
