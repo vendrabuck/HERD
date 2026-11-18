@@ -104,8 +104,8 @@ async def test_a_refused_body_never_echoes_the_submitted_value(method, path, bod
 async def test_a_lone_surrogate_in_a_page_sizes_key_is_a_422_not_a_500(method):
     """pydantic-core cannot build an error whose message holds a lone surrogate (it
     raises UnicodeEncodeError and the route answers 500). The shared body check now
-    refuses the body before the schema runs (a key holding one is located at its
-    object), and `_validate_page_sizes` still quotes the key with `!r`, which writes a
+    refuses the body before the schema runs (one item at `["body"]`), and
+    `_validate_page_sizes` still quotes the key with `!r`, which writes a
     surrogate as its escape, for any value that reaches it another way."""
     body = {"page_sizes": {"k" + SUR: "x"}}
     transport = ASGITransport(app=app, raise_app_exceptions=False)
@@ -116,7 +116,7 @@ async def test_a_lone_surrogate_in_a_page_sizes_key_is_a_422_not_a_500(method):
     assert resp.status_code == 422, resp.content[:300]
     (error,) = resp.json()["detail"]
     assert set(error) == set(RENDERED_KEYS)
-    assert (error["type"], error["loc"]) == ("string_unicode", ["body", "page_sizes"])
+    assert (error["type"], error["loc"]) == ("string_unicode", ["body"])
     schema = PreferencesReplaceRequest if method == "PUT" else PreferencesPatchRequest
     with pytest.raises(ValidationError) as caught:
         schema.model_validate(body)
@@ -131,9 +131,9 @@ _BODY_ROUTES = [("PUT", "/preferences"), ("PATCH", "/preferences")]
 # Bodies no schema is consulted for: the check reads the parsed JSON, so a field the
 # route does not know, a key, and a nested value are each refused where they are.
 _SURROGATE_BODIES = {
-    "value": ({"probe": "v" + SUR}, ["body", "probe"]),
+    "value": ({"probe": "v" + SUR}, ["body"]),
     "key": ({"probe" + LOW: "v"}, ["body"]),
-    "nested": ({"a": [{"b": LOW + "x"}]}, ["body", "a", 0, "b"]),
+    "nested": ({"a": [{"b": LOW + "x"}]}, ["body"]),
 }
 
 

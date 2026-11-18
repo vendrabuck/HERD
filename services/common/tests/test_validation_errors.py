@@ -18,15 +18,14 @@ import pytest
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from herd_common.validation_errors import (
-    MAX_REPORTED_LOCATIONS,
+    LONE_SURROGATE_BODY_ERROR,
     RENDERED_KEYS,
     STRING_UNICODE_MSG,
     STRING_UNICODE_TYPE,
     RefuseLoneSurrogates,
-    body_lone_surrogate_errors,
+    _raw_text_holds_a_lone_surrogate,
     holds_lone_surrogate,
     install_validation_errors,
-    lone_surrogate_locs,
     render_validation_errors,
     restrict_validation_error_schema,
     validation_error_handler,
@@ -248,7 +247,7 @@ async def test_with_the_body_check_a_validator_never_sees_a_lone_surrogate():
         )
     assert resp.status_code == 422
     assert resp.json()["detail"] == [
-        {"type": "string_unicode", "loc": ["body", "plain"], "msg": STRING_UNICODE_MSG}
+        {"type": "string_unicode", "loc": ["body"], "msg": STRING_UNICODE_MSG}
     ]
 
 
@@ -268,7 +267,8 @@ async def test_a_validator_message_quoting_with_repr_is_a_clean_422():
 SUR = chr(0xD800)  # built, so no source escape is decoded early
 LOW = chr(0xDFFF)
 PAIR = "\U0001f511"  # one code point outside the BMP: a surrogate PAIR as JSON escapes
-UNICODE = {"type": "string_unicode", "msg": STRING_UNICODE_MSG}
+ONE_ITEM = [{"type": "string_unicode", "loc": ["body"], "msg": STRING_UNICODE_MSG}]
+_JSON = {"content-type": "application/json"}
 
 
 def _esc(value) -> bytes:
@@ -285,95 +285,61 @@ def test_the_message_is_pydantics_own_for_a_constrained_string():
         Bounded.model_validate({"s": "x" + SUR})
     (error,) = caught.value.errors()
     assert (error["type"], error["msg"]) == (STRING_UNICODE_TYPE, STRING_UNICODE_MSG)
+    assert LONE_SURROGATE_BODY_ERROR == ONE_ITEM[0]
 
 
 @pytest.mark.parametrize(
-    ("value", "locs"),
+    ("body", "refused"),
     [
-        ("x" + SUR, [()]),
-        (LOW + "x", [()]),
-        ({"a": "x" + SUR}, [("a",)]),
-        ({"a" + SUR: "v"}, [()]),
-        ({"a" + SUR: {"b": SUR}}, [()]),  # a refused key's value is not searched
-        ({"a": {"b": [1, "ok", SUR]}}, [("a", "b", 2)]),
-        ({"k" + SUR: 1, "j" + LOW: 2}, [()]),  # one container, located once
-        ([SUR, {"x": [SUR]}, "ok", {LOW: 1}], [(0,), (1, "x", 0), (3,)]),
-        ({"a": PAIR, PAIR: "b", "c": [PAIR * 3]}, []),
-        ({"a": "café 日本 한", "n": None, "t": True, "f": 1.5}, []),
-        (LOW + SUR, [()]),  # a reversed pair is two lone surrogates
-    ],
-    ids=[
-        "string",
-        "low_surrogate",
-        "value",
-        "key",
-        "key_hides_value",
-        "nested",
-        "two_keys_one_container",
-        "document_order",
-        "pairs",
-        "non_ascii",
-        "reversed_pair",
-    ],
-)
-def test_lone_surrogate_locs(value, locs):
-    assert lone_surrogate_locs(value) == locs
-
-
-def test_lone_surrogate_locs_is_not_limited_by_the_recursion_limit():
-    deep: object = SUR
-    for _ in range(5000):
-        deep = [deep]
-    (loc,) = lone_surrogate_locs(deep)
-    assert loc == (0,) * 5000
-
-
-@pytest.mark.parametrize(
-    ("body", "locs"),
-    [
-        (b'{"a": "x\\ud800"}', [["body", "a"]]),
-        (b'{"a": "x\\uDBFF"}', [["body", "a"]]),
-        (b'{"a": "\\udc00x"}', [["body", "a"]]),
-        (b'{"\\udfff": 1}', [["body"]]),
-        (b'"\\ud800"', [["body"]]),
-        (b'{"a": [1, {"b": "\\ud800"}]}', [["body", "a", 1, "b"]]),
+        (b'{"a": "x\\ud800"}', True),
+        (b'{"a": "x\\uDBFF"}', True),
+        (b'{"a": "\\udc00x"}', True),
+        (b'{"a": "x\\udE00"}', True),  # a hex digit in either case
+        (b'{"\\udfff": 1}', True),
+        (b'"\\ud800"', True),
+        (b'{"a": [1, {"b": "\\ud800"}]}', True),
         # a surrogate written as raw UTF-8 bytes: json.loads decodes with surrogatepass
-        ('{"a": "x\ud800"}'.encode("utf-8", "surrogatepass"), [["body", "a"]]),
-        # a UTF-16 document, which JSON detects from its NUL bytes and always parses
-        ('{"a": "x\ud800"}'.encode("utf-16-le", "surrogatepass"), [["body", "a"]]),
-        ('{"a": "x\ud800\u0090"}'.encode("utf-16-le", "surrogatepass"), [["body", "a"]]),
+        ('{"a": "x\ud800"}'.encode("utf-8", "surrogatepass"), True),
+        # a UTF-16 document, which JSON detects from its NUL bytes
+        ('{"a": "x\ud800"}'.encode("utf-16-le", "surrogatepass"), True),
+        ('{"a": "x\ud800\u0090"}'.encode("utf-16-le", "surrogatepass"), True),
+        ('{"a": "\\ud83d\\ude00"}'.encode("utf-16"), False),
         # a pair is one code point, but only when both halves are real escapes
-        (b'{"a": "\\\\ud83d\\ude00"}', [["body", "a"]]),
-        (b'{"a": "\\ud83d\\\\ude00"}', [["body", "a"]]),
-        (b'{"a": "\\ud83d\\ud83d\\ude00"}', [["body", "a"]]),
-        (b'{"a": "\\ud83d\\ude00\\ude00"}', [["body", "a"]]),
-        # a low escape after other escapes, which the anchored match reads past
-        (b'{"a": "\\n\\"\\u0041\\udc00"}', [["body", "a"]]),
-        (b'{"a": "\\ud800\\udc00\\n", "b": "x\\udfff"}', [["body", "b"]]),
-        # a member a later duplicate key replaces is refused all the same, at the body
-        (b'{"a": "\\ud800", "a": "ok"}', [["body"]]),
+        (b'{"a": "\\\\ud83d\\ude00"}', True),
+        (b'{"a": "\\ud83d\\\\ude00"}', True),
+        (b'{"a": "\\ud83d\\ud83d\\ude00"}', True),
+        (b'{"a": "\\ud83d\\ude00\\ude00"}', True),
+        (b'{"a": "\\n\\"\\u0041\\udc00"}', True),
+        (b'{"a": "\\ud800\\udc00\\n", "b": "x\\udfff"}', True),
+        # a member a later duplicate key replaces is refused all the same
+        (b'{"a": "\\ud800", "a": "ok"}', True),
         # an escaped backslash followed by text that reads like an escape
-        (b'{"a": "\\\\ud800"}', []),
-        # a backslash pair, then a real escape
-        (b'{"a": "\\\\\\ud800"}', [["body", "a"]]),
-        (b'{"a": "\\ud83d\\udd11"}', []),
-        (b'{"a": "\\ud55c \\uD7A3"}', []),
-        ('{"a": "한"}'.encode(), []),
-        (b"\xef\xbb\xbf" + b'{"a": "\\ud800"}', [["body", "a"]]),
-        (b'{"a": "x\\ud800"', []),  # not JSON: the route answers it as before
-        (b"a=\\ud800", []),
-        (b"", []),
+        (b'{"a": "\\\\ud800"}', False),
+        (b'{"a": "\\\\\\ud800"}', True),  # a backslash pair, then a real escape
+        (b'{"a": "\\\\\\\\ud800"}', False),
+        (b'{"a": "\\ud83d\\udd11"}', False),
+        (b'{"a": "\\uD83D\\uDD11"}', False),
+        (b'{"a": "\\ud55c \\uD7A3 \\ufffd \\uFFFD \\ue000"}', False),  # near, not surrogates
+        ('{"a": "한"}'.encode(), False),
+        (b"\xef\xbb\xbf" + b'{"a": "\\ud800"}', True),
+        # not JSON: decided from the text alone, never parsed (OPS-VALID-6)
+        (b'{"a": "x\\ud800"', True),
+        (b"a=\\ud800", True),
+        (b'{"a": "x"', False),
+        (b"", False),
     ],
     ids=[
         "value",
         "uppercase_hex",
         "low_first",
+        "mixed_case_low",
         "key",
         "bare_string",
         "nested",
         "raw_utf8_bytes",
         "utf16",
         "utf16_valid_utf8_lookalike",
+        "utf16_pair",
         "escaped_backslash_then_pair",
         "pair_then_escaped_backslash",
         "high_high_low",
@@ -383,17 +349,45 @@ def test_lone_surrogate_locs_is_not_limited_by_the_recursion_limit():
         "duplicate_key",
         "escaped_backslash",
         "backslash_pair_then_escape",
+        "two_backslash_pairs",
         "valid_pair",
-        "hangul_escapes",
+        "valid_pair_uppercase",
+        "near_escapes",
         "hangul_raw",
         "utf8_bom",
         "malformed_json",
         "not_json",
+        "malformed_clean",
         "empty",
     ],
 )
-def test_body_lone_surrogate_errors(body, locs):
-    assert body_lone_surrogate_errors(body) == [{**UNICODE, "loc": loc} for loc in locs]
+def test_the_raw_scan(body, refused):
+    assert _raw_text_holds_a_lone_surrogate(body) is refused
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ({"a": ["x", {"b": "y" + SUR}]}, True),
+        ({"k" + LOW: 1}, True),
+        ({"a": [PAIR, "café", 1, None]}, False),
+        ({1, 2}, False),  # not JSON data: walked, nothing found
+        ([0] * 40 + [{"x": [type("S", (str,), {})("x" + SUR)]}], True),  # a str subclass
+    ],
+    ids=["nested_value", "key", "clean", "not_json", "str_subclass"],
+)
+def test_holds_lone_surrogate(value, expected):
+    assert holds_lone_surrogate(value) is expected
+
+
+def test_holds_lone_surrogate_on_a_value_too_deep_to_serialize():
+    for leaf, expected in ((SUR, True), ("ok", False)):
+        deep: object = leaf
+        for _ in range(10_000):
+            deep = [deep]
+        with pytest.raises(RecursionError):
+            json.dumps(deep)
+        assert holds_lone_surrogate(deep) is expected
 
 
 class _Strict(BaseModel):
@@ -422,7 +416,7 @@ def _open_app(*, refuse: bool = True) -> FastAPI:
 
     @app.post("/raw")
     async def raw(request: Request):
-        return {"type": type(json.loads(await request.body())).__name__}
+        return {"length": len(await request.body())}
 
     @app.post("/nobody")
     async def nobody():
@@ -434,12 +428,12 @@ def _open_app(*, refuse: bool = True) -> FastAPI:
 
     @app.post("/urlencoded")
     async def urlencoded(field: str = Form(...)):
-        return {"has_surrogate": bool(lone_surrogate_locs(field))}
+        return {"has_surrogate": holds_lone_surrogate(field)}
 
     @app.get("/q/{item}")
     async def query(item: str, q: str = "", request: Request = None):  # type: ignore[assignment]
         texts = [item, q, request.headers.get("x-probe", ""), request.cookies.get("c", "")]
-        return {"has_surrogate": bool(lone_surrogate_locs(texts))}
+        return {"has_surrogate": holds_lone_surrogate(texts)}
 
     def deny():
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -451,46 +445,84 @@ def _open_app(*, refuse: bool = True) -> FastAPI:
     return app
 
 
-_JSON = {"content-type": "application/json"}
-
-
 @pytest.mark.parametrize(
-    ("path", "body", "locs"),
+    ("path", "body"),
     [
-        ("/str", {"s": "a" + SUR}, [["body", "s"]]),
-        ("/map", {"k": "v" + SUR}, [["body", "k"]]),
-        ("/map", {"k" + LOW: "v"}, [["body"]]),
-        ("/any", {"a": [{"b": SUR}]}, [["body", "a", 0, "b"]]),
-        ("/raw", [SUR, "ok", LOW], [["body", 0], ["body", 2]]),
+        ("/str", {"s": "a" + SUR}),
+        ("/map", {"k": "v" + SUR}),
+        ("/map", {"k" + LOW: "v"}),
+        ("/any", {"a": [{"b": SUR}]}),
+        ("/raw", [SUR, "ok", LOW]),
     ],
     ids=["plain_str", "mapping_value", "mapping_key", "any_nested", "raw_request_body"],
 )
-async def test_a_lone_surrogate_anywhere_in_a_body_is_a_clean_422(path, body, locs):
+async def test_a_lone_surrogate_anywhere_in_a_json_body_is_the_one_item(path, body):
     async with _client(_open_app()) as client:
         resp = await client.post(path, content=_esc(body), headers=_JSON)
     assert resp.status_code == 422, resp.text
-    assert resp.json() == {"detail": [{**UNICODE, "loc": loc} for loc in locs]}
+    assert resp.json() == {"detail": ONE_ITEM}
 
 
-@pytest.mark.parametrize("headers", [{}, {"content-type": "text/plain"}], ids=["none", "text"])
-async def test_the_check_does_not_depend_on_the_content_type(headers):
+async def test_the_answer_is_these_exact_bytes():
     async with _client(_open_app()) as client:
-        resp = await client.post("/raw", content=_esc({"a": SUR}), headers=headers)
-    assert resp.status_code == 422
-    assert resp.json()["detail"] == [{**UNICODE, "loc": ["body", "a"]}]
+        resp = await client.post("/str", content=_esc({"s": SUR}), headers=_JSON)
+    assert resp.content == (
+        b'{"detail":[{"type":"string_unicode","loc":["body"],"msg":"Input should be a valid '
+        b'string, unable to parse raw data as a unicode string"}]}'
+    )
+    assert len(resp.content) == 138
+    assert resp.headers["content-type"] == "application/json"
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "application/json",
+        "application/json; charset=utf-8",
+        "Application/JSON",
+        "application/problem+json",
+        "application/vnd.herd.v1+json",
+    ],
+)
+async def test_every_json_content_type_is_scanned(content_type):
+    async with _client(_open_app()) as client:
+        resp = await client.post(
+            "/raw", content=_esc([SUR]), headers={"content-type": content_type}
+        )
+    assert (resp.status_code, resp.json()) == (422, {"detail": ONE_ITEM})
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"content-type": "text/plain"},
+        {"content-type": "application/x-www-form-urlencoded"},
+        {"content-type": "application/octet-stream"},
+        {"content-type": "application/jsonl"},
+        {"content-type": "text/json"},
+        {},
+    ],
+    ids=["text_plain", "urlencoded", "octet_stream", "jsonl", "text_json", "none"],
+)
+async def test_a_body_fastapi_does_not_parse_as_json_is_not_scanned(headers):
+    """FastAPI parses a body as JSON only for `application/json` or an
+    `application/*+json` subtype (and, with `strict_content_type` on, not with no
+    content type at all); any other body reaches the route as it was sent."""
+    body = _esc([SUR])
+    async with _client(_open_app()) as client:
+        resp = await client.post("/raw", content=body, headers=headers)
+    assert (resp.status_code, resp.json()) == (200, {"length": len(body)})
 
 
 async def test_without_the_check_those_bodies_reach_the_route():
-    """The check is what refuses them: each type accepts a lone surrogate, and the
-    response that echoes one cannot be encoded (mutation proof for the middleware)."""
+    """The check is what refuses them: each type accepts a lone surrogate (mutation
+    proof for the middleware)."""
     async with _client(_open_app(refuse=False)) as client:
         assert (await client.post("/str", content=_esc({"s": SUR}), headers=_JSON)).json() == {
             "len": 1
         }
         resp = await client.post("/map", content=_esc({"k" + LOW: "v"}), headers=_JSON)
         assert resp.json() == {"keys": 1}
-        resp = await client.post("/raw", content=_esc([SUR]), headers=_JSON)
-        assert resp.json() == {"type": "list"}
 
 
 @pytest.mark.parametrize(
@@ -507,6 +539,17 @@ async def test_honest_text_is_accepted(body):
         resp = await client.post("/str", content=_esc(body), headers=_JSON)
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"len": len(body["s"])}
+
+
+async def test_a_body_that_is_not_json_but_holds_a_surrogate_escape_is_the_one_item():
+    """By decision (round 4): the check never parses, so a malformed body holding a
+    surrogate escape gets this 422 instead of the route's own JSON error; a malformed
+    body without one still gets FastAPI's `json_invalid`."""
+    async with _client(_open_app()) as client:
+        refused = await client.post("/str", content=b'{"s": "\\ud800', headers=_JSON)
+        malformed = await client.post("/str", content=b'{"s": "x', headers=_JSON)
+    assert (refused.status_code, refused.json()) == (422, {"detail": ONE_ITEM})
+    assert malformed.json()["detail"][0]["type"] == "json_invalid"
 
 
 async def test_a_route_that_reads_no_body_and_an_unknown_route_are_unchanged():
@@ -551,7 +594,7 @@ async def test_a_multipart_body_is_passed_through_and_cannot_carry_a_lone_surrog
         resp = await client.post("/form", content=b"\r\n".join(parts), headers=headers)
     assert resp.status_code == 200, resp.text
     assert resp.json()["field"] == "\\ud800 as text"
-    assert not lone_surrogate_locs(resp.json()["filename"])
+    assert not holds_lone_surrogate(resp.json()["filename"])
 
 
 async def test_a_query_path_header_cookie_and_urlencoded_form_cannot_carry_one():
@@ -571,7 +614,7 @@ async def test_a_query_path_header_cookie_and_urlencoded_form_cannot_carry_one()
     assert form.json() == {"has_surrogate": False}
 
 
-async def _drive(app, messages: list[dict], app_reads: int = 1) -> list[dict]:
+async def _drive(app, messages: list[dict], headers: list | None = None) -> list[dict]:
     """Run the middleware around `app` with a scripted `receive`; return what was sent."""
     sent: list[dict] = []
     queue = list(messages)
@@ -582,7 +625,9 @@ async def _drive(app, messages: list[dict], app_reads: int = 1) -> list[dict]:
     async def send(message):
         sent.append(message)
 
-    scope = {"type": "http", "method": "POST", "path": "/", "headers": []}
+    if headers is None:
+        headers = [(b"content-type", b"application/json")]
+    scope = {"type": "http", "method": "POST", "path": "/", "headers": headers}
     await RefuseLoneSurrogates(app)(scope, receive, send)
     return sent
 
@@ -604,7 +649,7 @@ async def test_a_body_split_across_messages_is_checked_whole():
             {"type": "http.request", "body": b'00"}', "more_body": False},
         ],
     )
-    assert seen["detail"] == [{**UNICODE, "loc": ["body", "a"]}]
+    assert seen["detail"] == ONE_ITEM
 
 
 async def test_a_clean_body_is_handed_on_as_one_message_and_later_reads_pass_through():
@@ -642,34 +687,32 @@ async def test_a_read_after_the_response_started_is_not_refused():
     assert [m["type"] for m in sent] == ["http.response.start", "http.response.body"]
 
 
-async def test_a_multipart_body_is_handed_on_as_it_arrives_unread():
-    """An upload is streamed to the app chunk by chunk, never buffered whole by the
-    check, and is never refused by it."""
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        b"multipart/form-data; boundary=b",
+        b"Multipart/Form-Data; boundary=b",
+        b"text/plain",
+        b"application/x-www-form-urlencoded",
+        b"application/octet-stream",
+        None,
+    ],
+    ids=["multipart", "multipart_mixed_case", "text_plain", "urlencoded", "octet_stream", "none"],
+)
+async def test_a_body_not_parsed_as_json_is_handed_on_as_it_arrives_unread(content_type):
+    """Chunk by chunk, as the server sent it: never buffered whole, never refused."""
     got = []
-    sent: list[dict] = []
     chunks = [
-        {"type": "http.request", "body": b'--b\r\n{"a": "\\ud800"}', "more_body": True},
-        {"type": "http.request", "body": b"\r\n--b--\r\n", "more_body": False},
+        {"type": "http.request", "body": b'["\\ud800",', "more_body": True},
+        {"type": "http.request", "body": b'"\\udc00"]', "more_body": False},
     ]
-    queue = list(chunks)
-
-    async def receive():
-        return queue.pop(0)
-
-    async def send(message):
-        sent.append(message)
 
     async def app(scope, receive, send):
         got.append(await receive())
         got.append(await receive())
 
-    scope = {
-        "type": "http",
-        "method": "POST",
-        "path": "/",
-        "headers": [(b"content-type", b"Multipart/Form-Data; boundary=b")],
-    }
-    await RefuseLoneSurrogates(app)(scope, receive, send)
+    headers = [] if content_type is None else [(b"content-type", content_type)]
+    await _drive(app, list(chunks), headers=headers)
     assert got == chunks
 
 
@@ -731,7 +774,7 @@ async def test_the_refusal_survives_a_base_http_middleware_in_either_order(order
         refused = await client.post("/m", content=_esc({"k": SUR}), headers=_JSON)
         honest = await client.post("/m", content=_esc({"k": PAIR}), headers=_JSON)
     assert refused.status_code == 422, refused.text
-    assert refused.json()["detail"] == [{**UNICODE, "loc": ["body", "k"]}]
+    assert refused.json()["detail"] == ONE_ITEM
     assert honest.json() == {"k": PAIR}
     assert [m.cls for m in app.user_middleware][-1] is RefuseLoneSurrogates
 
@@ -744,74 +787,18 @@ async def test_install_after_the_app_started_is_refused():
         install_validation_errors(app)
 
 
-# -- At most ten locations, and a cost that does not explode (review of #1456) --------
+# -- The cost: one scan of the raw bytes (round 4 of the #1456 review) ----------------
+#
+# Bounds are relative, never wall clock, so they hold pinned to one core and on a fast
+# host: the scan against `json.loads` of the same body (what FastAPI does with it
+# anyway) and against `bytes.lower` (one C pass over the body).
+
+_MB = 1 << 20
 
 
-def test_a_refusal_reports_the_first_ten_locations_only():
-    """A body of many lone surrogates was answered with one item each: a 10 MB body
-    gave 1,111,111 items and a 155.6 MB 422. The search stops at the tenth."""
-    assert MAX_REPORTED_LOCATIONS == 10
-    errors = body_lone_surrogate_errors(_esc([SUR] * 25))
-    assert errors == [{**UNICODE, "loc": ["body", i]} for i in range(10)]
-
-
-def test_the_locator_stops_at_its_limit_and_keeps_document_order():
-    value = {"a": [SUR, "ok", SUR], "b" + LOW: 1, "c": {"d": SUR}}
-    assert lone_surrogate_locs(value) == [("a", 0), ("a", 2), (), ("c", "d")]
-    assert lone_surrogate_locs(value, limit=2) == [("a", 0), ("a", 2)]
-    assert lone_surrogate_locs(value, limit=1) == [("a", 0)]
-
-
-_WIDE = 40  # a wide container
-
-
-@pytest.mark.parametrize(
-    ("value", "locs"),
-    [
-        ([0] * _WIDE + [[1, SUR]], [(_WIDE, 1)]),  # numbers skipped, a nested hit found
-        (["ok"] * _WIDE + [None, SUR, "ok", SUR], [(_WIDE + 1,), (_WIDE + 3,)]),
-        ({**{f"k{i}": i for i in range(_WIDE)}, "z" + SUR: {"y": SUR}}, [()]),
-        ({**{f"k{i}": "ok" for i in range(_WIDE)}, "z": [SUR]}, [("z", 0)]),
-        ([1.5, True, None, "ok"] * _WIDE, []),
-        # a str subclass is not what json.loads makes: every child is looked at
-        ([0] * _WIDE + [type("S", (str,), {})("x" + SUR)], [(_WIDE,)]),
-    ],
-    ids=["numbers", "strings", "key", "dict_values", "clean", "str_subclass"],
-)
-def test_lone_surrogate_locs_in_large_containers(value, locs):
-    assert lone_surrogate_locs(value) == locs
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        ({"a": ["x", {"b": "y" + SUR}]}, True),
-        ({"k" + LOW: 1}, True),
-        ({"a": [PAIR, "café", 1, None]}, False),
-        ({1, 2}, False),  # not JSON data: searched by the locator, which finds nothing
-    ],
-    ids=["nested_value", "key", "clean", "not_json"],
-)
-def test_holds_lone_surrogate(value, expected):
-    assert holds_lone_surrogate(value) is expected
-
-
-def test_holds_lone_surrogate_on_a_value_too_deep_to_serialize():
-    for leaf, expected in ((SUR, True), ("ok", False)):
-        deep: object = leaf
-        for _ in range(10_000):
-            deep = [deep]
-        with pytest.raises(RecursionError):
-            json.dumps(deep)
-        assert holds_lone_surrogate(deep) is expected
-
-
-# The reviewer's two attack bodies, scaled to about 1 MB, plus the deep-and-wide body
-# that must be parsed: before the fix the locator built a location tuple per element,
-# so memory grew with elements times depth (1,422 MB for the first) and time with it.
-_DEEP_PAIR = b"[" * 600 + b'"\\ud83d\\ude00",' + b"0," * 300_000 + b"0" + b"]" * 600
-_FLAT_PAIR = b'["\\ud83d\\ude00",' + b"0," * 500_000 + b"0]"
-_DEEP_LONE = b"[" * 600 + b"0," * 300_000 + b'"\\ud800"' + b"]" * 600
+def _fill(unit: str, head: str, tail: str, size: int = _MB) -> bytes:
+    """`unit` repeated to about `size` bytes between `head` and `tail`."""
+    return (head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail).encode()
 
 
 def _peak(fn) -> int:
@@ -826,7 +813,7 @@ def _peak(fn) -> int:
         tracemalloc.stop()
 
 
-def _best_time(fn, runs: int = 3) -> float:
+def _best_time(fn, runs: int = 5) -> float:
     """The fastest of `runs` timings: robust to a busy host and to a single core."""
     import time
 
@@ -838,176 +825,79 @@ def _best_time(fn, runs: int = 3) -> float:
     return best
 
 
-@pytest.mark.parametrize("body", [_DEEP_PAIR, _FLAT_PAIR], ids=["deep_pair", "flat_pair"])
-def test_a_body_that_holds_no_lone_surrogate_is_never_parsed(body):
-    """A valid pair anywhere was enough to make the check parse the body and walk it.
-    It is now decided from the raw text: no parse, no allocation that grows with the
-    body, and less time than the one parse FastAPI does anyway (bounds are relative, so
-    they hold pinned to one core and on a fast host)."""
-    assert body_lone_surrogate_errors(body) == []
-    assert _peak(lambda: body_lone_surrogate_errors(body)) < 64 * 1024
-    assert _best_time(lambda: body_lone_surrogate_errors(body)) < _best_time(
-        lambda: json.loads(body)
-    )
-
-
-def _fill(unit: str, head: str, tail: str, size: int = 1 << 20) -> bytes:
-    """`unit` repeated to about `size` bytes between `head` and `tail`."""
-    return (head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail).encode()
-
-
 _LONE_TEXT = '"\\ud800"'
-# The second review's shapes (round 3): each about 1 MB, the surrogate where the search
-# reaches it last or never. Built on demand, so collecting the tests stays cheap.
-_REFUSED_SHAPES = {
+_BS = "\\"
+# Structural bodies, a lone surrogate at the end: millions of elements, cheap to scan.
+_STRUCTURAL = {
     "chain900": lambda: _fill("[" * 900 + "]" * 900 + ",", '{"name":"a","z":[', _LONE_TEXT + "]}"),
     "empty_lists": lambda: _fill("[],", '{"name":"a","z":[', _LONE_TEXT + "]}"),
     "triples": lambda: _fill("[[[]]],", '{"name":"a","z":[', _LONE_TEXT + "]}"),
-    "empty_objects": lambda: _fill("{},", "[", _LONE_TEXT + "]"),
-    "duplicate_key_chain900": lambda: _fill(
-        "[" * 900 + "]" * 900 + ",", '{"name":' + _LONE_TEXT + ',"name":"a","z":[', "0]}"
+    "nested_dicts": lambda: _fill('{"a":{"b":1}},', "[", _LONE_TEXT + "]"),
+}
+# Escape-heavy string bodies, the scan's own worst: json.loads decodes them fast.
+_ESCAPE_HEAVY = {
+    "pairs": lambda: _fill(_BS + "ud83d" + _BS + "ude00", '{"name":"', '"}'),
+    "pairs_upper_then_low": lambda: _fill(
+        _BS + "uD83D" + _BS + "uDE00", '{"name":"', _BS + 'udc00"}'
     ),
-    "duplicate_key_empty_lists": lambda: _fill(
-        "[],", '{"name":' + _LONE_TEXT + ',"name":"a","z":[', "0]}"
-    ),
-    "deep600_wide": lambda: _DEEP_LONE,
-    "nested_dicts": lambda: (
-        b"{"
-        + b",".join(b'"k%d":{"a":{"b":1}}' % i for i in range((1 << 20) // 22))
-        + b',"z":"\\ud800"}'
-    ),
+    "backslash_pairs_then_low": lambda: _fill(_BS * 2, '{"name":"', _BS + 'udc00"}'),
+    "u0041_then_low": lambda: _fill(_BS + "u0041", '{"name":"', _BS + 'udc00"}'),
+    "four_backslashes_and_text": lambda: _fill(_BS * 4 + "ude00", '{"name":"', '"}'),
 }
 
 
-@pytest.mark.parametrize("make", _REFUSED_SHAPES.values(), ids=_REFUSED_SHAPES.keys())
-def test_a_refused_body_costs_at_most_about_one_more_parse(make):
-    """A body the scan says holds one is parsed once and refused; the location search
-    is bounded by its step budget and runs with the collector paused. So the whole
-    check, parse included, costs under twice the parse alone (measured 1.05 to 1.5),
-    where the walk it replaced cost 3 to 8 times, and its peak memory is the parse's
-    own plus a fixed margin. The route then never parses the body."""
+@pytest.mark.parametrize("make", _STRUCTURAL.values(), ids=_STRUCTURAL.keys())
+def test_a_structural_body_costs_a_small_part_of_its_parse(make):
+    """The body is refused without a parse: the scan costs under a fifth of what
+    `json.loads` of it costs (measured 0.01 to 0.04), and its memory does not grow with
+    the millions of elements (at most two copies of the bytes)."""
     body = make()
-    assert body_lone_surrogate_errors(body)[0]["type"] == "string_unicode"
-
-    def check(body=body):
-        return body_lone_surrogate_errors(body)
-
-    def parse(body=body):
-        return json.loads(body)
-
-    assert _best_time(check) < 2 * _best_time(parse)
-    assert _peak(check) < _peak(parse) + 1024 * 1024
+    assert _raw_text_holds_a_lone_surrogate(body) is True
+    scan = _best_time(lambda: _raw_text_holds_a_lone_surrogate(body))
+    assert scan < _best_time(lambda: json.loads(body)) / 5
+    assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 2.2 * len(body)
 
 
-def test_a_body_whose_only_surrogate_a_duplicate_key_drops_is_refused_at_the_body():
-    """Decision (round 3): a surrogate escape in a member a later duplicate key
-    replaces is never honest input, so the body is refused without a second search
-    and without passing it on to be parsed again."""
-    body = b'{"name": "\\ud800", "name": "a"}'
-    assert json.loads(body) == {"name": "a"}
-    assert body_lone_surrogate_errors(body) == [{**UNICODE, "loc": ["body"]}]
+@pytest.mark.parametrize("make", _ESCAPE_HEAVY.values(), ids=_ESCAPE_HEAVY.keys())
+def test_an_escape_heavy_body_costs_a_bounded_number_of_passes(make):
+    """A body of nothing but escapes is the scan's worst: a few C passes (two copies, a
+    search, eight counts), measured 9 to 28 times one `bytes.lower` pass and 2 to 8
+    times `json.loads`, which decodes such a body at about 1 ms per MB. Memory is at
+    most two copies of the bytes."""
+    body = make()
+    scan = _best_time(lambda: _raw_text_holds_a_lone_surrogate(body))
+    assert scan < 40 * _best_time(lambda: body.lower())
+    assert scan < 12 * _best_time(lambda: json.loads(body))
+    assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 2.2 * len(body)
 
 
-def test_the_search_is_bounded_by_its_budget():
-    from herd_common.validation_errors import LOCATION_SEARCH_BUDGET
-
-    early = _esc([SUR] + [0] * (LOCATION_SEARCH_BUDGET + 5))
-    late = _esc([0] * (LOCATION_SEARCH_BUDGET + 5) + [SUR])
-    assert body_lone_surrogate_errors(early) == [{**UNICODE, "loc": ["body", 0]}]
-    assert body_lone_surrogate_errors(late) == [{**UNICODE, "loc": ["body"]}]
-    value = json.loads(late)
-    assert lone_surrogate_locs(value, budget=LOCATION_SEARCH_BUDGET) == []
-    assert lone_surrogate_locs(value) == [(LOCATION_SEARCH_BUDGET + 5,)]
-
-
-def test_the_answer_is_bounded_in_size_and_never_cuts_a_key():
-    """`loc` repeats the path for each reported item, so a long key made the answer
-    ten times the body (a 16 MB key gave a 160 MB 422). A location whose parts pass
-    MAX_LOC_CHARS is left out whole, and all of them stay within MAX_LOCS_CHARS."""
-    from herd_common.validation_errors import MAX_LOC_CHARS, MAX_LOCS_CHARS
-
-    long_key = "k" * (1 << 20)
-    body = _esc({"name": "a", long_key: [SUR] * 10})
-    errors = body_lone_surrogate_errors(body)
-    assert errors == [{**UNICODE, "loc": ["body"]}]
-    assert len(json.dumps({"detail": errors})) < 300
-    fits = "k" * (MAX_LOC_CHARS - 2)  # the key plus a one-digit index: MAX_LOC_CHARS - 1
-    errors = body_lone_surrogate_errors(_esc({fits: [SUR] * 9, "short": SUR}))
-    locs = [error["loc"][1:] for error in errors]
-    assert all(loc[0] in (fits, "short") for loc in locs)  # each key whole
-    assert sum(len(str(part)) for loc in locs for part in loc) <= MAX_LOCS_CHARS
-    # eight long items fill MAX_LOCS_CHARS, the ninth is left out, "short" still fits
-    assert len(locs) == 9 and locs[-1] == ["short"]
-    assert len(json.dumps({"detail": errors})) < MAX_LOCS_CHARS + 10 * 200
-
-
-def test_the_locator_holds_memory_for_the_depth_not_the_elements():
-    parsed = json.loads(_DEEP_LONE)
-    assert _peak(lambda: lone_surrogate_locs(parsed)) < 256 * 1024
-
-
-def test_a_body_of_many_lone_surrogates_stops_at_the_tenth():
-    body = _esc([SUR] * 200_000)
-    parse_peak = _peak(lambda: json.loads(body))
-    assert len(body_lone_surrogate_errors(body)) == 10
-    assert _peak(lambda: body_lone_surrogate_errors(body)) < parse_peak + 1024 * 1024
-    assert _best_time(lambda: body_lone_surrogate_errors(body)) < 2 * _best_time(
-        lambda: json.loads(body)
+@pytest.mark.parametrize(
+    "body",
+    [
+        _fill('{"name":"device-1","rack":"r1"},', "[", "0]"),
+        _fill("日本", '["', '"]'),
+        _fill('"' + "\\n" * 8 + '",', "[", "0]"),
+    ],
+    ids=["ascii_objects", "cjk_text", "other_escapes_only"],
+)
+def test_a_body_with_no_surrogate_marker_is_passed_after_two_searches(body):
+    """No `\\u` and no 0xED byte: two `in` searches, no copy, a fraction of one
+    `bytes.lower` pass (the early exit)."""
+    assert _raw_text_holds_a_lone_surrogate(body) is False
+    assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 64 * 1024
+    assert _best_time(lambda: _raw_text_holds_a_lone_surrogate(body)) < _best_time(
+        lambda: body.lower()
     )
 
 
-def test_holds_lone_surrogate_costs_about_one_serialization():
-    """The other callers (the import checks, secrets' reveal, config's save) test a
-    parsed value: one serialization in C, so its peak memory is under three times the
-    parse's own and its time a small multiple of the parse's, at any depth (before,
-    the locator's per-element tuples made both grow with elements times depth)."""
-    for body, expected in ((_DEEP_LONE, True), (_DEEP_PAIR, False)):
-        parsed = json.loads(body)
-        assert holds_lone_surrogate(parsed) is expected
-
-        def check(parsed=parsed):
-            return holds_lone_surrogate(parsed)
-
-        def parse(body=body):
-            return json.loads(body)
-
-        assert _peak(check) < 3 * _peak(parse)
-        assert _best_time(check) < 3 * _best_time(parse)
-
-
-def test_through_an_app_the_check_adds_nothing_to_an_unauthenticated_request():
-    """The reviewer's measurement on the real acl app, in miniature: a route behind a
-    failing dependency, sent the deep pair body with no credentials. With the check the
-    request costs what it costs without it, and still answers the dependency's 401."""
-    import asyncio
-
-    def peak_of(refuse: bool) -> tuple[int, int]:
-        app = _open_app(refuse=refuse)
-
-        async def send() -> int:
-            async with _client(app) as client:
-                resp = await client.post("/guarded", content=_DEEP_PAIR, headers=_JSON)
-                return resp.status_code
-
-        status: list[int] = []
-        peak = _peak(lambda: status.append(asyncio.run(send())))
-        return status[0], peak
-
-    without_status, without_peak = peak_of(False)
-    with_status, with_peak = peak_of(True)
-    assert without_status == with_status == 401
-    assert with_peak < without_peak + 1024 * 1024
-
-
-@pytest.mark.parametrize("shape", ["chain900", "duplicate_key_chain900", "empty_lists"])
-def test_through_an_app_a_refused_body_costs_about_what_main_pays(shape):
-    """A route behind a failing dependency, sent the review's shape with no credentials:
-    without the check FastAPI parses the body and answers 401; with it the check parses
-    it and answers 422. The request costs under twice as much."""
+def test_through_an_app_a_refused_structural_body_costs_less_than_without_the_check():
+    """A route behind a failing dependency, with no credentials: without the check
+    FastAPI parses the body and answers 401; with it the body is refused (422) after
+    the scan alone, which costs less than that parse."""
     import asyncio
     import time
 
-    body = _REFUSED_SHAPES[shape]()
+    body = _STRUCTURAL["chain900"]()
 
     def timed(refuse: bool) -> tuple[float, int]:
         app = _open_app(refuse=refuse)
@@ -1027,19 +917,24 @@ def test_through_an_app_a_refused_body_costs_about_what_main_pays(shape):
     main_time, main_status = timed(False)
     branch_time, branch_status = timed(True)
     assert (main_status, branch_status) == (401, 422)
-    assert branch_time < 2 * main_time
+    assert branch_time < main_time
 
 
-@pytest.mark.parametrize(
-    "body",
-    [
-        _fill("\\ud83d\\ude00", '{"name":"', '"}'),
-        _fill("\\n", '["', '\\udc00"]'),
-        _fill("\\\\", '["', '\\udc00"]'),
-    ],
-    ids=["escaped_pairs", "newline_escapes_then_low", "escaped_backslashes_then_low"],
-)
-def test_the_raw_scan_holds_no_memory_that_grows_with_the_body(body):
-    from herd_common.validation_errors import _raw_text_holds_a_lone_surrogate
+def test_holds_lone_surrogate_costs_about_one_serialization():
+    """The callers that test a PARSED value (the import checks, secrets' reveal,
+    config's save): one serialization in C, peak memory under three times the parse's
+    own, time a small multiple of it."""
+    deep_lone = b"[" * 600 + b"0," * 300_000 + b'"\\ud800"' + b"]" * 600
+    deep_pair = b"[" * 600 + b'"\\ud83d\\ude00",' + b"0," * 300_000 + b"0" + b"]" * 600
+    for body, expected in ((deep_lone, True), (deep_pair, False)):
+        parsed = json.loads(body)
+        assert holds_lone_surrogate(parsed) is expected
 
-    assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 64 * 1024
+        def check(parsed=parsed):
+            return holds_lone_surrogate(parsed)
+
+        def parse(body=body):
+            return json.loads(body)
+
+        assert _peak(check) < 3 * _peak(parse)
+        assert _best_time(check) < 3 * _best_time(parse)

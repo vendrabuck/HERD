@@ -881,7 +881,7 @@ async def test_internal_execute_with_a_lone_surrogate_action_is_422_and_runs_not
     )
     assert resp.status_code == 422, resp.text
     (error,) = resp.json()["detail"]
-    assert (error["type"], error["loc"]) == ("string_unicode", ["body", "action"])
+    assert (error["type"], error["loc"]) == ("string_unicode", ["body"])
     fetch.assert_not_awaited()
     assert (await admin_client.get("/runs")).json()["items"] == []
 

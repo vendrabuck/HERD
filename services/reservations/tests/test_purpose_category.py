@@ -265,7 +265,7 @@ def _escaped(value) -> bytes:
 
 _STRING_UNICODE = {
     "type": "string_unicode",
-    "loc": ["body", "purpose_category"],
+    "loc": ["body"],
     "msg": "Input should be a valid string, unable to parse raw data as a unicode string",
 }
 

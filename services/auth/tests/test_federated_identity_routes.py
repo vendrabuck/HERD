@@ -1339,7 +1339,7 @@ async def test_a_lone_surrogate_in_a_subject_is_the_shared_422_before_the_role_g
     """The shared body check (OPS-VALID-6) refuses a body holding a lone surrogate when
     the route reads it, before the dependencies run, as FastAPI does for a body that is
     not JSON: every caller, with or without a token and whatever its role, gets the same
-    422 `string_unicode` at the subject, for any id, so it says nothing about accounts.
+    422 `string_unicode` at `["body"]`, for any id, so it says nothing about accounts.
     The identity-key predicate still refuses the Cs character for a value that reaches
     the schema another way."""
     victim = await make_oidc("victim")
@@ -1359,9 +1359,7 @@ async def test_a_lone_surrogate_in_a_subject_is_the_shared_422_before_the_role_g
         assert resp.status_code == 422, resp.text
         answers.append(resp.json())
     assert answers[0] == answers[1] == answers[2]
-    assert [(e["loc"], e["type"]) for e in answers[0]["detail"]] == [
-        (["body", "subject"], "string_unicode")
-    ]
+    assert [(e["loc"], e["type"]) for e in answers[0]["detail"]] == [(["body"], "string_unicode")]
     with pytest.raises(ValidationError) as caught:
         FederatedIdentityLinkRequest.model_validate(
             {"issuer": "https://idp.test", "subject": "a\ud800b"}

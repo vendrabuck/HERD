@@ -41,7 +41,7 @@ valid UTF-8 text`), and a body-level refusal would replace those pinned answers.
 
 from __future__ import annotations
 
-import gc
+import email.message
 import json
 import re
 from typing import Any
@@ -98,254 +98,129 @@ def restrict_validation_error_schema(openapi: dict[str, Any]) -> dict[str, Any]:
     return openapi
 
 
-# Pydantic's own type and message for a constrained string holding a lone surrogate,
-# so the body check's refusal reads the same as the schema's.
+# Pydantic's own type and message for a constrained string holding a lone surrogate.
+# The body check's one item reads the same, at `["body"]`.
 STRING_UNICODE_TYPE = "string_unicode"
 STRING_UNICODE_MSG = "Input should be a valid string, unable to parse raw data as a unicode string"
+LONE_SURROGATE_BODY_ERROR = {
+    "type": STRING_UNICODE_TYPE,
+    "loc": ["body"],
+    "msg": STRING_UNICODE_MSG,
+}
 
-# The most locations one refusal reports. The search stops at the tenth, so a body of
-# a million lone surrogates costs no more to answer than a body of ten.
-MAX_REPORTED_LOCATIONS = 10
-# The most steps (children taken up, of any type) the location search may spend on one
-# body. A body that holds a lone surrogate is refused whether or not the search finds
-# it; the search only names where, exactly for a body of up to this many elements and
-# for a surrogate among its first this many otherwise. Measured on a development host
-# pinned to one core over 1 MB bodies of seven shapes, the full budget took 4.4 to 9.5
-# ms (0.2 to 0.5 microseconds a step), whatever the body's size.
-LOCATION_SEARCH_BUDGET = 20_000
-# The longest `loc`, in characters of its parts, one reported item may carry, and the
-# most characters all reported `loc`s may carry together. A longer `loc` is left out
-# whole, never cut (a cut key would name a wrong place), so a body cannot make the
-# answer larger than about this, whatever its keys.
-MAX_LOC_CHARS = 256
-MAX_LOCS_CHARS = 2048
-
-# Bytes that must be present for a UTF-8 JSON text to hold a lone surrogate: the start
-# of an escape whose first hex digit is D, or the lead byte 0xED of a surrogate written
-# as raw UTF-8 bytes (`json.loads` decodes with `surrogatepass`).
-_MAY_HOLD_A_SURROGATE = (b"\\ud", b"\\uD", b"\xed")
-
-# The JSON escape grammar, for the raw scan. A backslash starts an escape only when the
-# run of backslashes it ends is odd. `json.loads` joins a high-surrogate escape
-# immediately followed by a low-surrogate escape into one code point; every other
-# surrogate escape, and every raw surrogate, stays a lone surrogate in the parsed value.
-#
-# A lone high is found by a search that starts at the first backslash of a run (a
-# backslash not preceded by one: the literal first lets the engine skip ahead), takes
-# the run's escaped-backslash pairs possessively, and needs a high escape not followed
-# by a low one, so `\\ud800` (an escaped backslash, then text) is no escape and
-# `\\\ud800` is. A lone low is found by one anchored match that reads the text from its
-# start as escapes, possessively: runs of other bytes, a backslash and the character it
-# escapes, a pair, or the `\u` of any other escape, until a low escape no pair took;
-# it runs only when the text holds a low escape at all. Both run in C,
-# never backtrack, and allocate nothing that grows with the body.
-_HEX = "[0-9a-fA-F]"
-_HIGH = "[dD][89abAB]" + _HEX * 2
-_LOW = "[dD][c-fC-F]" + _HEX * 2
-_ESCAPE = r"\\(?<!\\\\)(?:\\\\)*+u"
-_LONE_HIGH = _ESCAPE + _HIGH + r"(?!\\u" + _LOW + ")"
-_BARE_LOW = r"(?:[^\\]++|\\[^u]|\\u" + _HIGH + r"\\u" + _LOW + r"|\\u(?!" + _LOW + r"))*+\\u" + _LOW
-# A low escape's text, anywhere: without one there is no lone low to look for.
-_LOW_TEXT = r"\\u" + _LOW
-_LONE_HIGH_BYTES = re.compile(_LONE_HIGH.encode("ascii"))
-_BARE_LOW_BYTES = re.compile(_BARE_LOW.encode("ascii"))
-_LOW_TEXT_BYTES = re.compile(_LOW_TEXT.encode("ascii"))
+# The bytes a UTF-8 JSON text needs to hold a lone surrogate: the start of a `\u`
+# escape, or the lead byte 0xED of a surrogate written as raw UTF-8 bytes (`json.loads`
+# decodes with `surrogatepass`). A body with neither is passed after two searches.
 _RAW_SURROGATE_BYTES = re.compile(rb"\xed[\xa0-\xbf]")
-_LONE_HIGH_TEXT = re.compile(_LONE_HIGH)
-_BARE_LOW_TEXT = re.compile(_BARE_LOW)
-_LOW_TEXT_TEXT = re.compile(_LOW_TEXT)
+
+# The JSON escape grammar, for the raw scan. In a JSON string every backslash starts an
+# escape, so once each escaped backslash pair is replaced by one other byte, every
+# backslash left starts an escape. `json.loads` joins a high-surrogate escape
+# (`\uD800` to `\uDBFF`) immediately followed by a low-surrogate escape (`\uDC00` to
+# `\uDFFF`) into one code point; every other surrogate escape stays a lone surrogate.
+# On that copy, lower-cased (a hex digit may be either case): a high escape not
+# followed by a low one is lone (a search whose literal prefix `\ud` lets the engine
+# skip to candidates); with none, every high escape begins a pair, which holds one low,
+# so a low escape is lone exactly when there are more low escapes than high ones.
+_HIGH_NOT_PAIRED = re.compile(rb"\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f][0-9a-f]{2})")
+_LOW_ESCAPES = (b"\\udc", b"\\udd", b"\\ude", b"\\udf")
+_HIGH_ESCAPES = (b"\\ud8", b"\\ud9", b"\\uda", b"\\udb")
 
 
-def _escapes_hold_a_lone_surrogate(
-    text: Any, lone_high: re.Pattern, low_text: re.Pattern, bare_low: re.Pattern
-) -> bool:
-    if lone_high.search(text) is not None:
+def _escapes_hold_a_lone_surrogate(text: bytes) -> bool:
+    """Whether the UTF-8 JSON text `text` holds a lone surrogate escape.
+
+    Makes at most two copies of the text (the escaped backslash pairs replaced, and
+    lower-cased), each in C; the search and the eight counts are C passes too. So the
+    cost is linear in the text's length, and memory is at most about twice the text,
+    whatever its number of escapes or elements.
+    """
+    if b"\\\\" in text:
+        text = text.replace(b"\\\\", b"_")
+    text = text.lower()
+    if _HIGH_NOT_PAIRED.search(text):
         return True
-    return low_text.search(text) is not None and bare_low.match(text) is not None
-
-
-_END = object()
+    lows = sum(text.count(low) for low in _LOW_ESCAPES)
+    return lows > 0 and lows > sum(text.count(high) for high in _HIGH_ESCAPES)
 
 
 def _raw_text_holds_a_lone_surrogate(body: bytes) -> bool:
-    """Whether `json.loads(body)` would hold a lone surrogate, if `body` is JSON.
+    """Whether a JSON body holds a lone surrogate, decided from its raw text.
 
-    Decided from the raw text, without parsing: a surrogate written as raw bytes, a high
-    escape not followed by a low one, or a low escape no pair holds. Each is one pass
-    in C that allocates nothing that grows with the body, so the cost is linear in the
-    body's length and does not depend on how many elements it holds or how deeply they
-    nest. It is never False when the parsed value holds one. It can be True when the
-    value does not: for a body that is not JSON, which the parse that follows passes
-    through, and for one whose surrogate is in a member a later duplicate key replaces,
-    which is refused all the same.
+    For a body that is valid JSON the answer is exactly whether any member, also one a
+    later duplicate key replaces, holds a lone surrogate once parsed. For a body that
+    is not valid JSON it is whether its text holds a surrogate written as raw UTF-8
+    bytes or a `\\u` escape that would be one.
     """
     encoding = json.detect_encoding(body)
     if encoding in ("utf-8", "utf-8-sig"):
-        if not any(marker in body for marker in _MAY_HOLD_A_SURROGATE):
+        if b"\\u" not in body and b"\xed" not in body:
             return False
         if _RAW_SURROGATE_BYTES.search(body):
             return True
-        return _escapes_hold_a_lone_surrogate(
-            body, _LONE_HIGH_BYTES, _LOW_TEXT_BYTES, _BARE_LOW_BYTES
-        )
+        return _escapes_hold_a_lone_surrogate(body)
     try:  # UTF-16 or UTF-32, decoded exactly as `json.loads` decodes it
         text = body.decode(encoding, "surrogatepass")
     except UnicodeDecodeError:
         return False
     if _LONE_SURROGATE.search(text):
         return True
-    return _escapes_hold_a_lone_surrogate(text, _LONE_HIGH_TEXT, _LOW_TEXT_TEXT, _BARE_LOW_TEXT)
-
-
-def _items(container: dict | list) -> Any:
-    """The (key or index, child) pairs of a container, in order."""
-    return iter(container.items()) if isinstance(container, dict) else enumerate(container)
-
-
-def lone_surrogate_locs(
-    value: Any, limit: int | None = None, budget: int | None = None
-) -> list[tuple[str | int, ...]]:
-    """Where a parsed JSON value holds a lone surrogate, in document order, each once,
-    stopping after `limit` locations, or after `budget` steps (children taken up, of
-    any type), when given: then the locations found so far, which may be none.
-
-    A string holding one is located at itself; a key holding one at the object that
-    holds the key, and that key's value is not searched. A located key or index never
-    holds a surrogate. One pass with a stack of iterators and one shared path, so memory
-    grows with the nesting depth only, and a location tuple is built only for a hit;
-    nothing recurses. Time is one step per child taken up, so with a budget it is
-    bounded whatever the value.
-    """
-    found: dict[tuple[str | int, ...], None] = {}
-
-    def hit(loc: tuple[str | int, ...]) -> bool:
-        found[loc] = None
-        return limit is not None and len(found) >= limit
-
-    if isinstance(value, str):
-        return [()] if _LONE_SURROGATE.search(value) else []
-    if not isinstance(value, (dict, list)):
-        return []
-    # A dict yields (key, value) with a str key, a list (index, value) with an int.
-    path: list[str | int] = []
-    stack: list[Any] = [_items(value)]
-    steps = 0
-    while stack:
-        entry = next(stack[-1], _END)
-        if entry is _END:
-            stack.pop()
-            if stack:
-                path.pop()
-            continue
-        if budget is not None:
-            steps += 1
-            if steps > budget:
-                break
-        key, item = entry
-        if isinstance(key, str) and _LONE_SURROGATE.search(key):
-            if hit(tuple(path)):
-                break
-            continue
-        if isinstance(item, str):
-            if _LONE_SURROGATE.search(item) and hit((*path, key)):
-                break
-        elif isinstance(item, (dict, list)):
-            path.append(key)
-            stack.append(_items(item))
-    return list(found)
+    # No lone surrogate is left in the text, so it encodes; its escapes are then read
+    # as a UTF-8 body's are.
+    return _escapes_hold_a_lone_surrogate(text.encode("utf-8"))
 
 
 def holds_lone_surrogate(value: Any) -> bool:
     """Whether a parsed JSON value holds a lone surrogate in any string or key.
 
     Encodes the value once in C (`json.dumps` with `ensure_ascii=False`, then UTF-8,
-    which refuses a lone surrogate), so the cost is that of serializing it; a value too
-    deep to serialize, or one that is not JSON data, is searched with
-    `lone_surrogate_locs` instead, which stops at the first location.
+    which refuses a lone surrogate). A value too deep to serialize, or one that is not
+    JSON data, is walked instead, with a stack, until the first string that holds one.
     """
     try:
         json.dumps(value, ensure_ascii=False).encode("utf-8")
     except UnicodeEncodeError:
         return True
     except (RecursionError, TypeError, ValueError):
-        return bool(lone_surrogate_locs(value, limit=1))
+        stack = [value]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, str):
+                if _LONE_SURROGATE.search(item):
+                    return True
+            elif isinstance(item, dict):
+                stack.extend(item.keys())
+                stack.extend(item.values())
+            elif isinstance(item, list):
+                stack.extend(item)
     return False
 
 
-def _reportable(locs: list[tuple[str | int, ...]]) -> list[tuple[str | int, ...]]:
-    """The locations an answer may carry: each whose parts total at most
-    `MAX_LOC_CHARS` characters, while all of them together stay within
-    `MAX_LOCS_CHARS`. A location is kept or left out whole."""
-    kept: list[tuple[str | int, ...]] = []
-    total = 0
-    for loc in locs:
-        size = 0
-        for part in loc:
-            size += len(part) if isinstance(part, str) else len(str(part))
-            if size > MAX_LOC_CHARS:
-                break
-        if size > MAX_LOC_CHARS or total + size > MAX_LOCS_CHARS:
-            continue
-        kept.append(loc)
-        total += size
-    return kept
-
-
-def body_lone_surrogate_errors(body: bytes) -> list[dict[str, Any]]:
-    """The rendered `string_unicode` errors for a request body, empty when it is clean.
-
-    The raw text decides whether the body holds a lone surrogate. If it does and the
-    body is JSON, the body is refused, always: also when the surrogate is in a member a
-    later duplicate key replaces, which is never honest input. The locations are then
-    searched within `LOCATION_SEARCH_BUDGET` steps, at most `MAX_REPORTED_LOCATIONS`,
-    and kept within `MAX_LOC_CHARS` and `MAX_LOCS_CHARS`; with none to report, the
-    answer is one item at `["body"]`. Empty for a body `json.loads` refuses: the route
-    answers that as it would have (FastAPI's `json_invalid`).
-    """
-    if not _raw_text_holds_a_lone_surrogate(body):
-        return []
-    try:
-        parsed = json.loads(body)
-    except (ValueError, RecursionError):
-        return []
-    # The search runs with the cyclic garbage collector paused, and the parsed value is
-    # released before it resumes. The parse leaves every container it made pending for
-    # a full collection, which the search's own small allocations would set off: on a
-    # 1 MB body of nested lists that collection cost more than the parse. Paused, the
-    # collection that follows finds the value already gone. The pause lasts the search
-    # (bounded by LOCATION_SEARCH_BUDGET) and the release, never the parse, and puts the
-    # collector back as it was.
-    collecting = gc.isenabled()
-    gc.disable()
-    try:
-        found = lone_surrogate_locs(
-            parsed, limit=MAX_REPORTED_LOCATIONS, budget=LOCATION_SEARCH_BUDGET
-        )
-        del parsed
-    finally:
-        if collecting:
-            gc.enable()
-    locs = _reportable(found) or [()]
-    return render_validation_errors(
-        {"type": STRING_UNICODE_TYPE, "loc": ("body", *loc), "msg": STRING_UNICODE_MSG}
-        for loc in locs
-    )
-
-
-def _is_multipart(scope: Any) -> bool:
+def _parses_as_json(scope: Any) -> bool:
+    """Whether FastAPI would parse this request's body as JSON: its content type is
+    `application/json` or an `application/*+json` subtype. FastAPI (`strict_content_type`,
+    on by default and turned off nowhere in HERD) does not parse a body with no
+    content type, so neither does this check. The same header parsing as FastAPI's."""
     for name, value in scope.get("headers", ()):
         if name == b"content-type":
-            return value.lstrip().lower().startswith(b"multipart/")
+            message = email.message.Message()
+            message["content-type"] = value.decode("latin-1")
+            if message.get_content_maintype() != "application":
+                return False
+            subtype = message.get_content_subtype()
+            return subtype == "json" or subtype.endswith("+json")
     return False
 
 
 class RefuseLoneSurrogates:
-    """ASGI middleware: a request body holding a lone surrogate is a 422.
+    """ASGI middleware: a JSON request body holding a lone surrogate is a 422.
 
-    It wraps `receive`. The first time the app reads the body, the whole body is read,
-    checked with `body_lone_surrogate_errors`, and handed on as one message; when the
-    check finds a surrogate, the read raises `HTTPException(422)` instead, which
-    FastAPI's body reader passes on and the app's exception handling renders as
+    A body FastAPI would not parse as JSON (`_parses_as_json`) is passed through unread
+    and unbuffered. For a JSON body it wraps `receive`: the first time the app reads
+    the body, the whole body is read, scanned with `_raw_text_holds_a_lone_surrogate`
+    (no parse), and handed on as one message; when the scan finds a lone surrogate, the
+    read raises `HTTPException(422)` with the one item `LONE_SURROGATE_BODY_ERROR`,
+    which FastAPI's body reader passes on and the app's exception handling renders as
     `{"detail": [...]}`. A read made after the response has started (Starlette's
     disconnect listener on a route that never read its body) is handed on unchecked.
     """
@@ -354,7 +229,7 @@ class RefuseLoneSurrogates:
         self.app = app
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope["type"] != "http" or _is_multipart(scope):
+        if scope["type"] != "http" or not _parses_as_json(scope):
             await self.app(scope, receive, send)
             return
         read = False
@@ -380,10 +255,10 @@ class RefuseLoneSurrogates:
                 if not message.get("more_body", False):
                     break
             body = b"".join(chunks)
-            errors = [] if started else body_lone_surrogate_errors(body)
-            if errors:
+            if not started and _raw_text_holds_a_lone_surrogate(body):
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=errors
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=[dict(LONE_SURROGATE_BODY_ERROR)],
                 )
             return {"type": "http.request", "body": body, "more_body": False}
 

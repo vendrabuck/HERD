@@ -56,17 +56,17 @@ async def test_every_rendered_error_has_exactly_the_advertised_keys():
 
 # -- The shared body check refuses a lone surrogate (issues #1456, #1458, #1459) -------
 #
-# The password-specific answers (IAM-LOGIN-5, IAM-REG-2) are unchanged: the check gives
-# the same `string_unicode` at `["body", "password"]` the constrained password field
-# gave, and `["body"]` for a key (test_password_input_validation.py).
+# The check answers first, with one `string_unicode` item at `["body"]` whatever field
+# holds the surrogate, where the constrained password field answered at
+# `["body", "password"]` (OPS-VALID-6; IAM-LOGIN-5, IAM-REG-2).
 
 SUR = chr(0xD800)  # built, so no source escape is decoded early
 LOW = chr(0xDFFF)
 _SURROGATE_BODIES = {
-    "value": ({"probe": "v" + SUR}, ["body", "probe"]),
+    "value": ({"probe": "v" + SUR}, ["body"]),
     "key": ({"probe" + LOW: "v"}, ["body"]),
-    "nested": ({"a": [{"b": LOW + "x"}]}, ["body", "a", 0, "b"]),
-    "email": ({"email": "a" + SUR + "@example.com", "password": "pw"}, ["body", "email"]),
+    "nested": ({"a": [{"b": LOW + "x"}]}, ["body"]),
+    "email": ({"email": "a" + SUR + "@example.com", "password": "pw"}, ["body"]),
 }
 
 

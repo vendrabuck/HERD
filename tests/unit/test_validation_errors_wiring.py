@@ -574,3 +574,55 @@ def test_only_config_may_opt_out_by_service_name(tmp_path):
     assert verdicts["config"] == []
     assert verdicts["secrets"] != []
     assert verdicts["brand-new"] != []
+
+
+# -- The body check follows FastAPI's JSON rule (round 4 of the #1456 review) ----------
+#
+# `RefuseLoneSurrogates` scans only a body FastAPI parses as JSON, and it assumes
+# FastAPI's default `strict_content_type=True`: with it off, FastAPI also parses a body
+# that has no content type, which the check would then not see. So no app, router, or
+# route under a service's `app/` may set it. The scan reads source: a keyword argument
+# named `strict_content_type` anywhere, or an assignment to an attribute of that name.
+
+
+def strict_content_type_settings(source: str) -> list[int]:
+    """Line numbers where a module sets `strict_content_type`."""
+    hits: set[int] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and any(
+            k.arg == "strict_content_type" for k in node.keywords
+        ):
+            hits.add(node.lineno)
+        elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(
+                isinstance(t, ast.Attribute) and t.attr == "strict_content_type" for t in targets
+            ):
+                hits.add(node.lineno)
+    return sorted(hits)
+
+
+@pytest.mark.parametrize("service", SERVICES, ids=lambda p: p.name)
+def test_no_service_turns_off_strict_content_type(service):
+    offenders = [
+        f"{path.relative_to(service).as_posix()}: lines {lines}"
+        for path in sorted((service / "app").rglob("*.py"))
+        if (lines := strict_content_type_settings(path.read_text(encoding="utf-8")))
+    ]
+    assert not offenders, f"services/{service.name}: {offenders}"
+
+
+@pytest.mark.parametrize(
+    ("source", "found"),
+    [
+        ("app = FastAPI(strict_content_type=False)\n", True),
+        ("router = APIRouter(strict_content_type=False)\n", True),
+        ("@router.post('/x', strict_content_type=False)\nasync def x():\n    pass\n", True),
+        ("app.router.strict_content_type = False\n", True),
+        ("app = FastAPI(title='x')\n", False),
+        ("# FastAPI(strict_content_type=False)\n", False),
+        ("strict_content_type = False\n", False),  # a module name, not a setting
+    ],
+)
+def test_the_strict_content_type_scan_both_ways(source, found):
+    assert bool(strict_content_type_settings(source)) is found

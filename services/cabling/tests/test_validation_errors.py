@@ -104,9 +104,9 @@ _BODY_ROUTES = [("POST", "/topologies")]
 # Bodies no schema is consulted for: the check reads the parsed JSON, so a field the
 # route does not know, a key, and a nested value are each refused where they are.
 _SURROGATE_BODIES = {
-    "value": ({"probe": "v" + SUR}, ["body", "probe"]),
+    "value": ({"probe": "v" + SUR}, ["body"]),
     "key": ({"probe" + LOW: "v"}, ["body"]),
-    "nested": ({"a": [{"b": LOW + "x"}]}, ["body", "a", 0, "b"]),
+    "nested": ({"a": [{"b": LOW + "x"}]}, ["body"]),
 }
 
 

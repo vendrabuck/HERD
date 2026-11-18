@@ -149,7 +149,7 @@ async def test_a_lone_surrogate_the_dropdown_message_quotes_is_a_422_not_a_500(d
     detail = resp.json()["detail"]
     assert [set(error) for error in detail] == [set(RENDERED_KEYS)]
     assert detail[0]["type"] == "string_unicode"
-    assert detail[0]["loc"][:5] == ["body", "sections", 0, "fields", 0]
+    assert detail[0]["loc"] == ["body"]
     with pytest.raises(ValidationError) as caught:
         FieldDefinition.model_validate(field)
     (direct,) = caught.value.errors()
@@ -163,9 +163,9 @@ _BODY_ROUTES = [("POST", "/devices"), ("POST", "/templates")]
 # Bodies no schema is consulted for: the check reads the parsed JSON, so a field the
 # route does not know, a key, and a nested value are each refused where they are.
 _SURROGATE_BODIES = {
-    "value": ({"probe": "v" + SUR}, ["body", "probe"]),
+    "value": ({"probe": "v" + SUR}, ["body"]),
     "key": ({"probe" + LOW: "v"}, ["body"]),
-    "nested": ({"a": [{"b": LOW + "x"}]}, ["body", "a", 0, "b"]),
+    "nested": ({"a": [{"b": LOW + "x"}]}, ["body"]),
 }
 
 

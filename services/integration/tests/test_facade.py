@@ -215,8 +215,8 @@ _SUR = chr(0xD800)  # built, so no source escape is decoded early
 @pytest.mark.parametrize(
     ("extra", "loc"),
     [
-        ({"purpose_category": "x" + _SUR}, ["body", "purpose_category"]),
-        ({"purpose": chr(0xDFFF) + "y"}, ["body", "purpose"]),
+        ({"purpose_category": "x" + _SUR}, ["body"]),
+        ({"purpose": chr(0xDFFF) + "y"}, ["body"]),
         ({"unknown" + _SUR: 1}, ["body"]),
     ],
     ids=["purpose_category", "purpose", "unknown_key"],

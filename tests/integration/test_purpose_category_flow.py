@@ -101,7 +101,7 @@ async def test_a_lone_surrogate_in_a_facade_create_is_a_422_not_a_500(admin_clie
     assert resp.json()["detail"] == [
         {
             "type": "string_unicode",
-            "loc": ["body", "purpose_category"],
+            "loc": ["body"],
             "msg": "Input should be a valid string, unable to parse raw data as a unicode string",
         }
     ]

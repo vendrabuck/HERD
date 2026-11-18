@@ -126,7 +126,7 @@ async def test_a_refused_create_never_echoes_the_plaintext(admin_client):
     anything is stored, and the 422 names the missing field without sending the
     plaintext `data` back (FastAPI's default put the whole body in `input`). A lone
     surrogate in the body is a clean 422 too, never a 500: since issue #1456 the
-    shared body check refuses it first, at the value that holds it."""
+    shared body check refuses it first, with one item at the body (OPS-VALID-6)."""
     for raw, loc in (
         (
             b'{"type": "password", "data": {"password": "' + CANARY.encode() + b'"}}',
@@ -134,7 +134,7 @@ async def test_a_refused_create_never_echoes_the_plaintext(admin_client):
         ),
         (
             b'{"data": {"password": "' + CANARY.encode() + b'\\ud800"}}',
-            ["body", "data", "password"],
+            ["body"],
         ),
     ):
         resp = await admin_client.post(

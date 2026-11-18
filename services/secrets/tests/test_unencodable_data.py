@@ -155,9 +155,10 @@ def test_deserialize_returns_honest_data_unchanged(data):
 @pytest.mark.parametrize(
     ("data", "loc"),
     [
-        ({"password": "ab" + SUR + "cd"}, ["body", "data", "password"]),
-        ({"password": "x", "token": LOW}, ["body", "data", "token"]),
-        ({"pa" + SUR + "ss": "v"}, ["body", "data"]),
+        # the shared body check answers at the body, whatever the field (OPS-VALID-6)
+        ({"password": "ab" + SUR + "cd"}, ["body"]),
+        ({"password": "x", "token": LOW}, ["body"]),
+        ({"pa" + SUR + "ss": "v"}, ["body"]),
     ],
     ids=["value", "second_value", "key"],
 )
