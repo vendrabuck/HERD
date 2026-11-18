@@ -331,15 +331,22 @@ def test_the_standalone_copy_exemption_is_not_stale():
         assert (SERVICES_DIR / service / relative).is_file()
 
 
-@pytest.mark.parametrize("service", SERVICES, ids=lambda p: p.name)
-def test_every_service_app_installs_the_shared_handler(service):
+def service_problems(service: Path) -> list[str]:
+    """Why a service directory's `app/main.py` does not install the handler as its
+    service must: the expected module, and the opt-out only where it is allowed."""
     main = service / "app" / "main.py"
-    assert main.is_file(), f"{service.name} has app/ but no app/main.py"
-    problems = install_problems(
+    if not main.is_file():
+        return [f"{service.name} has app/ but no app/main.py"]
+    return install_problems(
         main.read_text(encoding="utf-8"),
         expected_module(service.name),
         may_opt_out=service.name in BODY_CHECK_EXEMPT,
     )
+
+
+@pytest.mark.parametrize("service", SERVICES, ids=lambda p: p.name)
+def test_every_service_app_installs_the_shared_handler(service):
+    problems = service_problems(service)
     assert not problems, f"services/{service.name}/app/main.py: {problems}"
 
 
@@ -549,4 +556,21 @@ def test_a_new_service_without_the_line_fails(tmp_path):
         for p in found
     }
     assert verdicts["old"] == []
+    assert verdicts["brand-new"] != []
+
+
+def test_only_config_may_opt_out_by_service_name(tmp_path):
+    """The exemption follows the directory name: the same opted-out line passes in
+    config (with its copy's module) and fails in any other service."""
+    copy_opted_out = OPTED_OUT.replace("herd_common.validation_errors", "app.validation_errors")
+    for name, source in [
+        ("config", copy_opted_out),
+        ("secrets", OPTED_OUT),
+        ("brand-new", OPTED_OUT),
+    ]:
+        (tmp_path / name / "app").mkdir(parents=True)
+        (tmp_path / name / "app" / "main.py").write_text(source)
+    verdicts = {p.name: service_problems(p) for p in service_dirs(tmp_path)}
+    assert verdicts["config"] == []
+    assert verdicts["secrets"] != []
     assert verdicts["brand-new"] != []

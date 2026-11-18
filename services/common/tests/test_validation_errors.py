@@ -623,6 +623,37 @@ async def test_a_read_after_the_response_started_is_not_refused():
     assert [m["type"] for m in sent] == ["http.response.start", "http.response.body"]
 
 
+async def test_a_multipart_body_is_handed_on_as_it_arrives_unread():
+    """An upload is streamed to the app chunk by chunk, never buffered whole by the
+    check, and is never refused by it."""
+    got = []
+    sent: list[dict] = []
+    chunks = [
+        {"type": "http.request", "body": b'--b\r\n{"a": "\\ud800"}', "more_body": True},
+        {"type": "http.request", "body": b"\r\n--b--\r\n", "more_body": False},
+    ]
+    queue = list(chunks)
+
+    async def receive():
+        return queue.pop(0)
+
+    async def send(message):
+        sent.append(message)
+
+    async def app(scope, receive, send):
+        got.append(await receive())
+        got.append(await receive())
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/",
+        "headers": [(b"content-type", b"Multipart/Form-Data; boundary=b")],
+    }
+    await RefuseLoneSurrogates(app)(scope, receive, send)
+    assert got == chunks
+
+
 async def test_a_disconnect_while_reading_is_handed_on():
     got = []
 
