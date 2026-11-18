@@ -5,7 +5,8 @@ Flow (when settings.auth_method == "ldap"):
 1. Open a connection to settings.ldap_server_url with TLS as configured.
 2. Bind as the service account (settings.ldap_bind_dn + bind_password).
 3. Search settings.ldap_user_base_dn with the configured filter to resolve the
-   full user DN and the email/username attributes.
+   full user DN and the email/username attributes. Exactly one entry must
+   match; a name that matches more is refused without a bind (issue #1447).
 4. Open a second connection and bind as that user DN with the submitted
    password. Success here is proof the password is correct.
 
@@ -44,6 +45,7 @@ from ldap3.core.exceptions import (
 from ldap3.core.results import (
     RESULT_INVALID_DN_SYNTAX,
     RESULT_NO_SUCH_OBJECT,
+    RESULT_SIZE_LIMIT_EXCEEDED,
     RESULT_SUCCESS,
 )
 from ldap3.operation.search import NOT as SEARCH_NOT
@@ -690,8 +692,10 @@ def user_filter_problem(template: str) -> LdapUserFilterError | None:
 
     Not refused: a {username} inside a substring, approximate, or ordering
     assertion (`(uid={username}*)`, `(uid~={username})`, `(uid>={username})`),
-    which matches more entries than the named one; the first match signs in with
-    its own password. Discouraged in ENV_VARS.
+    which matches more entries than the named one. A name it matches to one
+    entry signs in as that entry with that entry's password; a name it matches
+    to more than one is refused as ambiguous (_search_user, issue #1447).
+    Discouraged in ENV_VARS.
 
     Memoized per template string (the verdict depends on the string alone), so a
     login never re-runs the check after the first.
@@ -734,23 +738,54 @@ def log_ldap_startup_problems(config: Settings) -> list[str]:
     return ["ldap_user_filter_invalid"]
 
 
+# The login search asks the directory for at most this many entries (issue
+# #1447, IAM-LDAP-16): two are enough to know a name matches more than one, and
+# no login fetches an unbounded result whatever the filter matches.
+_LOGIN_SEARCH_SIZE_LIMIT = 2
+
+
+class _AmbiguousLoginNameError(Exception):
+    """The login search matched more than one entry (issue #1447, IAM-LDAP-16).
+
+    `at_least` is the number of matches the answer proves: the entries returned,
+    and never fewer than two. Never holds a DN or the login name. Private to this
+    module: _bind_user_sync turns it into the refusal (None) and its ERROR."""
+
+    def __init__(self, at_least: int) -> None:
+        super().__init__(f"the login search matched at least {at_least} entries")
+        self.at_least = at_least
+
+
 def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
     """Bind as service account, then search for the user DN and attributes.
 
     Returns (user_dn, {email_attr: [values], username_attr: [values]}) when the
-    search matched, or None only when the directory PROVED there is no match: a
-    successful search with zero entries (issue #1403). Every other outcome
-    raises LdapUnavailableError: the service connection could not be opened,
-    TLS-negotiated, or bound; the search raised; or it found no entry and ended
-    with any result code but success (noSuchObject on a misconfigured base DN, a
-    referral that could not be followed, busy, access denied). A limited search
-    that returned the entry is a match (ldap3 reports a non-empty response as
-    found, whatever the result code). Like the presence probe, a
-    failed search under the configured base proves nothing about the user. The
-    search_filter is built by render_user_filter with the escaped username to
-    prevent filter injection; a template user_filter_problem refuses raises
-    LdapUnavailableError before any connection (_bind_user_sync refuses one
-    first, so this is the backstop; the verdict is memoized, so asking twice
+    search matched exactly one entry, or None only when the directory PROVED there
+    is no match: a successful search with zero entries (issue #1403).
+
+    Raises _AmbiguousLoginNameError when the answer proves more than one entry
+    matches (issue #1447, IAM-LDAP-16): the search asks for at most
+    _LOGIN_SEARCH_SIZE_LIMIT entries, and two entries returned (with any result
+    code), or one entry with sizeLimitExceeded (the directory's own limit was
+    lower, and it says more matched than it sent), is ambiguous. Nothing is bound
+    as either entry, so no password is tried and no lockout counter is touched.
+    Only entries count: a search result reference (a continuation into another
+    server's part of the tree) is not an entry and is not followed, so a match
+    behind one is not seen (Active Directory sends such references for its
+    application partitions on many searches from the domain root).
+
+    Every other outcome raises LdapUnavailableError: the service connection
+    could not be opened, TLS-negotiated, or bound; the search raised; it found
+    no entry and ended with any result code but success (noSuchObject on a
+    misconfigured base DN, a referral that could not be followed, busy, access
+    denied); or it returned one entry and ended with any result code but success
+    or sizeLimitExceeded (a time limit, say): the search stopped before it
+    finished, so it does not prove the entry is the only match. Like the presence
+    probe, a failed search under the configured base proves nothing about the
+    user. The search_filter is built by render_user_filter with the escaped
+    username to prevent filter injection; a template user_filter_problem refuses
+    raises LdapUnavailableError before any connection (_bind_user_sync refuses
+    one first, so this is the backstop; the verdict is memoized, so asking twice
     costs nothing). This function is always synchronous (blocking ldap3 calls);
     callers use anyio.to_thread to dispatch it.
     """
@@ -770,10 +805,19 @@ def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
             ],
             proven_absent_codes=_PRESENCE_PROVEN_ABSENT_CODES,
             description="login user search",
+            size_limit=_LOGIN_SEARCH_SIZE_LIMIT,
         )
         if not found:
             return None
-        entry = conn.entries[0]
+        entries = list(conn.entries)
+        result_code = (conn.result or {}).get("result")
+        if len(entries) > 1 or result_code == RESULT_SIZE_LIMIT_EXCEEDED:
+            raise _AmbiguousLoginNameError(max(len(entries), 2))
+        if result_code != RESULT_SUCCESS:
+            raise LdapUnavailableError(
+                f"login user search stopped before it finished: {conn.result}"
+            )
+        (entry,) = entries
         attrs = {
             settings.ldap_email_attribute: _attr_values(entry, settings.ldap_email_attribute),
             settings.ldap_username_attribute: _attr_values(entry, settings.ldap_username_attribute),
@@ -875,9 +919,11 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
     succeeds anonymously), a login name that is white space alone (also before
     any call: ldap3 strips assertion values, so it could reshape the filter), a
     password SASLprep refuses (also before any call,
-    _password_refused_by_saslprep), no matching entry, a refused user bind, or an
-    entry without the email attribute (or with no value of it that is text,
-    issue #1448).
+    _password_refused_by_saslprep), no matching entry, more than one matching
+    entry (issue #1447: no bind is attempted, and one ERROR, action
+    ldap_user_ambiguous, names the setting and the count, never a DN), a refused
+    user bind, or an entry without the email attribute (or with no value of it
+    that is text, issue #1448).
 
     Raises LdapUnavailableError whenever the directory could not be asked:
     incomplete configuration (logged at ERROR), an LDAP_USER_FILTER that
@@ -915,7 +961,27 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
         return None
     try:
         try:
-            found = _search_user(username)
+            try:
+                found = _search_user(username)
+            except _AmbiguousLoginNameError as exc:
+                # Issue #1447: the filter does not name one entry for this name,
+                # so no entry's password is tried. Refused like an unknown name
+                # (the same 401, one search, no user bind); the operator is told
+                # which setting to fix, and never which entries matched.
+                logger.error(
+                    "LDAP login refused: %s matches %d or more directory entries for "
+                    "this login name, so no password was tried; it must match one "
+                    "entry per name",
+                    USER_FILTER_SETTING,
+                    exc.at_least,
+                    extra={
+                        "action": "ldap_user_ambiguous",
+                        "setting": USER_FILTER_SETTING,
+                        "count": exc.at_least,
+                        "username": username,
+                    },
+                )
+                return None
             if found is None:
                 logger.info(
                     "LDAP user search returned no results",
@@ -1017,6 +1083,7 @@ def _checked_search(
     attributes: list[str],
     proven_absent_codes: frozenset[int],
     description: str,
+    size_limit: int = 0,
 ) -> bool:
     """Run a search whose outcome must be classified as proof or error.
 
@@ -1026,6 +1093,9 @@ def _checked_search(
     This ladder is the module's load-bearing safety logic; every directory
     search with proof semantics must route through it so the benign-code set
     is a conscious per-call-site choice rather than a re-implementation.
+    size_limit is the most entries the directory is asked for (0, the default,
+    asks for no limit); a True result may then come with sizeLimitExceeded,
+    which the caller reads.
     """
     try:
         ok = conn.search(
@@ -1033,6 +1103,7 @@ def _checked_search(
             search_filter=search_filter,
             search_scope=search_scope,
             attributes=attributes,
+            size_limit=size_limit,
         )
     except LDAPException as exc:
         raise LdapUnavailableError(f"{description} failed: {exc}") from exc
