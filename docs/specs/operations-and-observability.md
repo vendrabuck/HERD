@@ -570,9 +570,16 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   valid UTF-8 text`. Before these issues eight NULs were accepted (and then the empty
   password signed in), a lone surrogate was a 500, and the length refusals were a
   validation list that echoed the password. A body whose `new_password` is missing or
-  not a string is OPS-CONFIG-30's validation list. \
-  Enforced in: `services/config/app/main.py` (`change_password_endpoint`, `ChangePasswordRequest`); `services/config/app/config_store.py` (`password_problem`, `new_password_problem`, `change_password`, `_hash_password`, `InvalidPassword`) \
-  Pinned by: `services/config/tests/test_config.py` (`test_change_password`, `test_change_password_too_short`, `test_change_password_too_long`, `test_change_password_unauthenticated`); `services/config/tests/test_config_passwords.py` (`test_change_password_refuses_an_illegal_password_without_echo_and_keeps_the_file`, `test_change_password_accepts_every_other_password_and_it_signs_in`, `test_password_problem_enumerates_the_space`, `test_every_legal_password_in_the_space_hashes_and_signs_in`, `test_new_password_problem_checks_the_bound_in_characters_then_the_rule`, `test_an_illegal_password_never_reaches_bcrypt`, `test_new_password_problem_counts_characters`, `test_change_password_bound_counts_characters_over_http`)
+  not a string is OPS-CONFIG-30's validation list. The config page judges the same
+  bound before it sends, counting code points (`configPasswordLengthOk`), and refuses
+  nothing else, so it is never stricter than the route; its inputs carry no `minlength`
+  or `maxlength`, which count UTF-16 units (an emoji is two) and cut a pasted value. It
+  sends the password unchanged, shows a 422 string `detail` from this route as is, and
+  shows `Failed to change password` for every other failure, the 503 and a validation
+  list included. Before issue #1452 the page refused 17 to 32 emoji, cut a pasted
+  value at 32 units, and showed only the generic text for every refusal. \
+  Enforced in: `services/config/app/main.py` (`change_password_endpoint`, `ChangePasswordRequest`); `services/config/app/config_store.py` (`password_problem`, `new_password_problem`, `change_password`, `_hash_password`, `InvalidPassword`); `frontend/src/lib/configPassword.ts` (`codePointLength`, `configPasswordLengthOk`); `frontend/src/lib/errors.ts` (`configChangePasswordErrorText`, `CONFIG_CHANGE_PASSWORD_FALLBACK`); `frontend/src/pages/ConfigPage.tsx` (`PasswordChange`) \
+  Pinned by: `frontend/src/test/lib/configPassword.test.ts` (`codePointLength (issue #1452)`, `configPasswordLengthOk (issue #1452, OPS-CONFIG-8)`, `configChangePasswordErrorText (issue #1452)`); `frontend/src/test/pages/ConfigPage.test.tsx` (`ConfigPage change password (issue #1452)`); `services/config/tests/test_config.py` (`test_change_password`, `test_change_password_too_short`, `test_change_password_too_long`, `test_change_password_unauthenticated`); `services/config/tests/test_config_passwords.py` (`test_change_password_refuses_an_illegal_password_without_echo_and_keeps_the_file`, `test_change_password_accepts_every_other_password_and_it_signs_in`, `test_password_problem_enumerates_the_space`, `test_every_legal_password_in_the_space_hashes_and_signs_in`, `test_new_password_problem_checks_the_bound_in_characters_then_the_rule`, `test_an_illegal_password_never_reaches_bcrypt`, `test_new_password_problem_counts_characters`, `test_change_password_bound_counts_characters_over_http`)
 - **OPS-CONFIG-9.** `PUT /settings` and `POST /apply` answer 403 `Change the config
   password before modifying or applying configuration` until the password is rotated,
   read on every request as OPS-CONFIG-4 reads it: a session issued before the auth file
