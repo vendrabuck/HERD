@@ -134,6 +134,26 @@ async def test_ldap_login_bad_password(client, ldap_mode, fake_bind):
 
 
 @pytest.mark.asyncio
+async def test_ldap_login_directory_unavailable_returns_503(client, ldap_mode, monkeypatch):
+    """Issue #1403: when bind_user reports that the directory could not be asked,
+    the login answers 503 with the fixed detail, never the 401 a wrong password
+    gets, and the client's text stays out of the body."""
+
+    async def _down(username, password):
+        raise ldap_service.LdapUnavailableError("socket connection error at ldap://dc01:636")
+
+    monkeypatch.setattr(ldap_service, "bind_user", _down)
+    resp = await client.post("/login", json={"email": "alice", "password": "good"})
+    assert (resp.status_code, resp.json()) == (
+        503,
+        {"detail": "Directory unavailable, credentials not checked"},
+    )
+    assert "dc01" not in resp.text
+    async with TestSessionLocal() as db:
+        assert (await db.execute(select(User))).scalars().all() == []
+
+
+@pytest.mark.asyncio
 async def test_local_mode_blocks_ldap_user(monkeypatch):
     # Default auth_method is local; an LDAP-sourced User must not authenticate
     # against the local path even if the row carries a hash the password

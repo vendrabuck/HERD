@@ -19,6 +19,8 @@ Expected directory layout:
             cn=nouid1             (mail but no uid attribute)
             uid=ldapit-admin      (see 70-seed-integration.ldif)
             uid=ldapit-eng1..3    (see 70-seed-integration.ldif)
+            uid=ldapit-longpass   (a 100-character password, LONG_PASSWORD;
+                                   issue #1404)
         ou=groups              (groupOfNames; see 60-seed-groups.ldif)
             cn=herd-eng        (user1..user3)
             cn=herd-qa         (user4, user5)
@@ -66,6 +68,9 @@ PEOPLE_DN = f"ou=people,{BASE_DN}"
 ADMIN_DN = f"cn=admin,{BASE_DN}"
 ADMIN_PW = "admin"
 USER_PW = "Password1"
+# uid=ldapit-longpass's password (70-seed-integration.ldif, issue #1404).
+LONG_PASSWORD_USER = "ldapit-longpass"
+LONG_PASSWORD = ("long-passphrase-" * 7)[:100]
 
 
 def _ldap_reachable() -> bool:
@@ -88,7 +93,10 @@ pytestmark = pytest.mark.skipif(
 def _seed_is_current() -> bool:
     """Probe the last-loaded fixture of each fixture-adding LDIF file:
     cn=herd-stale (60-seed-groups.ldif) and cn=herd-it-eng
-    (70-seed-integration.ldif, issue #572, added after herd-stale).
+    (70-seed-integration.ldif, issue #572, added after herd-stale), plus
+    uid=ldapit-longpass (issue #1404), which was added to
+    70-seed-integration.ldif later but before its last entry, so a directory
+    seeded from a checkout between the two holds herd-it-eng without it.
 
     The stateless container reseeds only on `up`, so a container started
     from an older checkout answers for user1 while lacking one or both sets
@@ -105,9 +113,13 @@ def _seed_is_current() -> bool:
         server = ldap3.Server(LDAP_URL, get_info=ldap3.NONE, connect_timeout=5)
         conn = ldap3.Connection(server, user=ADMIN_DN, password=ADMIN_PW, auto_bind=True)
         try:
-            for cn in ("herd-stale", "herd-it-eng"):
+            for dn in (
+                f"cn=herd-stale,ou=groups,{BASE_DN}",
+                f"cn=herd-it-eng,ou=groups,{BASE_DN}",
+                f"uid=ldapit-longpass,{PEOPLE_DN}",
+            ):
                 ok = conn.search(
-                    f"cn={cn},ou=groups,{BASE_DN}",
+                    dn,
                     "(objectClass=*)",
                     search_scope=ldap3.BASE,
                     attributes=["cn"],
@@ -134,8 +146,8 @@ def _fail_when_required_but_unreachable():
 def _fail_on_stale_seed():
     if _LDAP_REACHABLE and not _seed_is_current():
         pytest.fail(
-            f"LDAP server at {LDAP_URL} is reachable but missing the group fixtures "
-            "(60-seed-groups.ldif and/or 70-seed-integration.ldif); it was seeded "
+            f"LDAP server at {LDAP_URL} is reachable but missing fixtures "
+            "of 60-seed-groups.ldif and/or 70-seed-integration.ldif; it was seeded "
             "from an older checkout. Run `make ldap-reset` to reseed."
         )
 
@@ -188,9 +200,49 @@ async def test_bind_user_filter_metacharacters_are_escaped(ldap_settings):
 
 
 @pytest.mark.asyncio
-async def test_bad_service_account_returns_none(monkeypatch, ldap_settings):
+async def test_bad_service_account_raises_unavailable(monkeypatch, ldap_settings):
+    """Issue #1403: a refused service-account bind proves nothing about the
+    user's password, so it is an outage (the login's 503), never a refusal."""
     monkeypatch.setattr(settings, "ldap_bind_password", "wrong-admin-pw", raising=False)
-    assert await ldap_service.bind_user("user1", USER_PW) is None
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        await ldap_service.bind_user("user1", USER_PW)
+
+
+def _refused_url() -> str:
+    """An ldap:// URL on a port nothing listens on (bound, then released)."""
+    with socket.socket() as probe:
+        probe.bind((LDAP_HOST, 0))
+        refused_port = probe.getsockname()[1]
+    return f"ldap://{LDAP_HOST}:{refused_port}"
+
+
+@pytest.mark.asyncio
+async def test_bind_user_unreachable_server_raises_unavailable(monkeypatch, ldap_settings):
+    monkeypatch.setattr(settings, "ldap_server_url", _refused_url(), raising=False)
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        await ldap_service.bind_user("user1", USER_PW)
+
+
+@pytest.mark.asyncio
+async def test_bind_user_long_password_reaches_the_directory_unchanged(ldap_settings):
+    """Issue #1404's premise against a real directory: a password far past
+    bcrypt's 72 bytes is the directory's to judge, all of it."""
+    assert len(LONG_PASSWORD) == 100
+    identity = await ldap_service.bind_user(LONG_PASSWORD_USER, LONG_PASSWORD)
+    assert identity is not None
+    assert identity.email == f"{LONG_PASSWORD_USER}@company.local"
+    # The same first 72 characters with another tail is refused: nothing cuts
+    # the password the way bcrypt would.
+    assert await ldap_service.bind_user(LONG_PASSWORD_USER, LONG_PASSWORD[:72] + "y" * 28) is None
+
+
+@pytest.mark.asyncio
+async def test_bind_user_missing_base_dn_raises_unavailable(monkeypatch, ldap_settings):
+    """A base DN the directory does not hold answers noSuchObject: a
+    misconfiguration that proves nothing about the user, so an outage."""
+    monkeypatch.setattr(settings, "ldap_user_base_dn", f"ou=gone,{BASE_DN}", raising=False)
+    with pytest.raises(ldap_service.LdapUnavailableError):
+        await ldap_service.bind_user("user1", USER_PW)
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +332,60 @@ async def test_login_endpoint_succeeds_against_live_ldap(ldap_settings, http_cli
 async def test_login_endpoint_rejects_bad_password_against_live_ldap(ldap_settings, http_client):
     resp = await http_client.post("/login", json={"email": "user4", "password": "nope"})
     assert resp.status_code == 401
+    assert resp.json() == {"detail": "Invalid credentials"}
+
+
+@pytest.mark.asyncio
+async def test_login_endpoint_unreachable_directory_is_503(monkeypatch, ldap_settings, http_client):
+    """Issue #1403 against a real socket: a refused connection is the 503, so the
+    user is not told their (correct) password is wrong."""
+    monkeypatch.setattr(settings, "ldap_server_url", _refused_url(), raising=False)
+    resp = await http_client.post("/login", json={"email": "user4", "password": USER_PW})
+    assert (resp.status_code, resp.json()) == (
+        503,
+        {"detail": "Directory unavailable, credentials not checked"},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("password", ["\t", "Pass\x00word1", "Pass\ue000word1"])
+async def test_login_endpoint_answers_known_and_unknown_users_alike_for_a_saslprep_refusal(
+    ldap_settings, http_client, password
+):
+    """The #1403 review's oracle against a real directory: a password ldap3's
+    SASLprep refuses is the same 401 for an existing and an unknown user."""
+    answers = [
+        await http_client.post("/login", json={"email": login, "password": password})
+        for login in ("user4", "does-not-exist")
+    ]
+    assert [(r.status_code, r.json()) for r in answers] == [
+        (401, {"detail": "Invalid credentials"})
+    ] * 2
+
+
+@pytest.mark.asyncio
+async def test_bind_user_a_saslprep_mapped_password_reaches_the_directory_mapped(ldap_settings):
+    """SASLprep maps a soft hyphen to nothing before the bind is sent (RFC 4013,
+    ldap3), so "Pass<soft hyphen>word1" binds as user1's "Password1"."""
+    assert await ldap_service.bind_user("user1", "Pass\u00adword1") is not None
+
+
+@pytest.mark.asyncio
+async def test_login_endpoint_bad_service_account_is_503(monkeypatch, ldap_settings, http_client):
+    monkeypatch.setattr(settings, "ldap_bind_password", "wrong-admin-pw", raising=False)
+    resp = await http_client.post("/login", json={"email": "user4", "password": USER_PW})
+    assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_login_endpoint_accepts_a_100_character_directory_password(
+    ldap_settings, http_client
+):
+    """Issue #1404: LDAP mode does not cap the login password at bcrypt's 72."""
+    resp = await http_client.post(
+        "/login", json={"email": LONG_PASSWORD_USER, "password": LONG_PASSWORD}
+    )
+    assert resp.status_code == 200, resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -645,9 +751,9 @@ async def test_run_sync_dangling_mapping_applies_nothing(ldap_settings, db_sessi
 # ---------------------------------------------------------------------------
 
 # All 25 seeded people (50-seed-people.ldif) plus nouid1 (mail but no uid,
-# 60-seed-groups.ldif) plus the four ldapit-* identities (mail but no uid
-# quirk does not apply to them, 70-seed-integration.ldif, issue #572) carry a
-# mail attribute; nomail1 deliberately does not.
+# 60-seed-groups.ldif) plus the five ldapit-* identities (70-seed-integration.ldif:
+# ldapit-admin and ldapit-eng1..3 from issue #572, ldapit-longpass from #1404; each
+# has both mail and uid) carry a mail attribute; nomail1 deliberately does not.
 _ALL_SEEDED_PRESENT_EMAILS = frozenset(
     {f"user{n}@company.local" for n in range(1, 26)}
     | {"nouid1@company.local"}
@@ -656,6 +762,7 @@ _ALL_SEEDED_PRESENT_EMAILS = frozenset(
         "ldapit-eng1@company.local",
         "ldapit-eng2@company.local",
         "ldapit-eng3@company.local",
+        "ldapit-longpass@company.local",
     }
 )
 

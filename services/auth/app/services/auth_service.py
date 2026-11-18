@@ -795,7 +795,22 @@ async def _authenticate_ldap(db: AsyncSession, email: str, password: str) -> Use
     # authentication, while sync runs a long-lived pass whose job is to
     # repair drift and recover races proactively. Do not "fix" one to match
     # the other.
-    identity = await ldap_service.bind_user(email, password)
+    try:
+        identity = await ldap_service.bind_user(email, password)
+    except ldap_service.LdapUnavailableError:
+        # Issue #1403: the directory could not be asked, so nothing was decided
+        # about these credentials. Propagate for the route's 503; there is no
+        # local fallback in LDAP mode (IAM-LDAP-1).
+        logger.warning(
+            "Login failed: LDAP directory unavailable",
+            extra={
+                "action": "login_failure",
+                "email": email,
+                "source": "ldap",
+                "reason": "directory_unavailable",
+            },
+        )
+        raise
     if identity is None:
         logger.warning(
             "Login failed: LDAP bind rejected",
@@ -918,7 +933,8 @@ async def authenticate_user(db: AsyncSession, email: str, password: str) -> User
 
     LDAP mode binds against the directory, OIDC mode admits only the D5
     break-glass account (`_authenticate_oidc_mode`), and local mode checks the
-    stored bcrypt hash.
+    stored bcrypt hash. In LDAP mode only, `ldap_service.LdapUnavailableError`
+    propagates when the directory could not be asked (issue #1403).
     """
     if settings.auth_method == "ldap":
         return await _authenticate_ldap(db, email, password)

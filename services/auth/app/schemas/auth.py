@@ -3,11 +3,21 @@ from datetime import datetime
 from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, field_validator
+from pydantic_core import PydanticCustomError
 
-from app.config import AuthMethod
+from app.config import AuthMethod, settings
 from app.models.user import Role
 from app.schemas.pagination import Paginated
 from app.services.passwords import validate_password
+
+# Password bounds in characters (issue #1404, IAM-REG-2, IAM-LOGIN-3). A
+# password checked against a bcrypt hash (registration, local login, the OIDC
+# break-glass login) is at most PASSWORD_MAX_LENGTH, as it always was. In LDAP
+# mode the password goes to the directory in a bind and never reaches bcrypt,
+# so the login bound is only a ceiling on the request: 1024 characters, which
+# are at most 4096 UTF-8 bytes (MAX_PASSWORD_BYTES in passwords.py).
+PASSWORD_MAX_LENGTH = 72
+LDAP_LOGIN_PASSWORD_MAX_LENGTH = 1024
 
 # Profile field bounds (issue #1252). full_name is stripped of leading and
 # trailing white space and must then be 1 to 200 characters (the column is
@@ -38,7 +48,7 @@ def _blank_to_none(value: Any) -> Any:
 class RegisterRequest(BaseModel):
     email: EmailStr
     username: str = Field(min_length=3, max_length=32, pattern=r"^[a-zA-Z0-9_-]+$")
-    password: str = Field(min_length=8, max_length=72)
+    password: str = Field(min_length=8, max_length=PASSWORD_MAX_LENGTH)
     # Optional display name (issue #1252): omitted or null stores the username.
     full_name: FullName | None = None
 
@@ -48,11 +58,47 @@ class RegisterRequest(BaseModel):
     _password_is_hashable = field_validator("password")(validate_password)
 
 
+def login_password_max_length(auth_method: AuthMethod) -> int:
+    """The longest login password, in characters, the mode's judge takes (IAM-LOGIN-3).
+
+    Issue #1404: local mode and the OIDC break-glass login check a bcrypt hash,
+    so they keep registration's bound; LDAP mode sends every login, a local
+    account's included (IAM-LDAP-1), to the directory and never hashes it.
+    """
+    if auth_method == "ldap":
+        return LDAP_LOGIN_PASSWORD_MAX_LENGTH
+    return PASSWORD_MAX_LENGTH
+
+
 class LoginRequest(BaseModel):
     # Accepts an email in local mode or a directory login name (e.g.
     # sAMAccountName) in LDAP mode; both flow through authenticate_user.
     email: str = Field(min_length=1, max_length=255)
-    password: str = Field(max_length=72)
+    # max_length is the ceiling of every mode, LDAP's; the validator below
+    # applies the live mode's own bound. The constraint also keeps pydantic's
+    # lone-surrogate refusal (`string_unicode`, IAM-LOGIN-5), which pydantic
+    # runs only on a constrained string and ahead of any length check.
+    password: str = Field(
+        max_length=LDAP_LOGIN_PASSWORD_MAX_LENGTH,
+        description=(
+            f"At most {PASSWORD_MAX_LENGTH} characters in local mode and for the "
+            f"single sign-on break-glass login, {LDAP_LOGIN_PASSWORD_MAX_LENGTH} in LDAP mode."
+        ),
+    )
+
+    @field_validator("password")
+    @classmethod
+    def _password_within_the_judges_bound(cls, value: str) -> str:
+        """The same `string_too_long` error a `max_length` raises, at the bound of
+        the mode that will judge the password, read when the request arrives."""
+        limit = login_password_max_length(settings.auth_method)
+        if len(value) > limit:
+            raise PydanticCustomError(
+                "string_too_long",
+                "String should have at most {max_length} characters",
+                {"max_length": limit},
+            )
+        return value
 
 
 class TokenResponse(BaseModel):

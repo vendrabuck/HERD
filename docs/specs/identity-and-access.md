@@ -327,7 +327,7 @@ Auth service:
 |---|---|---|---|---|
 | GET | `/login-options` | anyone, unauthenticated; every mode | 200 | IAM-OIDC-16 |
 | POST | `/register` | anyone, unauthenticated; local mode only | 201 | IAM-REG-1 to IAM-REG-6, IAM-PROFILE-9 |
-| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-5, IAM-LDAP-1 to IAM-LDAP-11, IAM-OIDC-21 |
+| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-6, IAM-LDAP-1 to IAM-LDAP-13, IAM-OIDC-21 |
 | GET | `/oidc/login` | anyone, unauthenticated; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-17 |
 | GET | `/oidc/callback` | anyone holding the `herd_oidc_flow` cookie; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-18, IAM-OIDC-19 |
 | POST | `/oidc/exchange` | anyone holding the `herd_oidc_handoff` cookie; OIDC mode only, else 404 | 200 | IAM-OIDC-15, IAM-OIDC-20 |
@@ -471,8 +471,8 @@ short-lived access token and a refresh token.
   is 12 for every hash HERD wrote and never above 14 (IAM-HASH-4, IAM-HASH-5). \
   Enforced in: `services/auth/app/services/auth_service.py` (`_authenticate_local`, `_DUMMY_HASH`); `services/auth/app/services/passwords.py` (`verify_password`, `DUMMY_HASH`) \
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_every_local_login_answer_costs_one_bcrypt_at_the_configured_cost`, `test_the_dummy_hash_has_the_ident_and_cost_of_every_new_hash`)
-- **IAM-LOGIN-3.** The login identifier is 1 to 255 characters and the password at most
-  72. \
+- **IAM-LOGIN-3.** The login identifier is 1 to 255 characters. The password bound is
+  IAM-LOGIN-6. \
   Enforced in: `services/auth/app/schemas/auth.py` (`LoginRequest`) \
   Pinned by: none
 - **IAM-LOGIN-4.** A successful login answers `{access_token, refresh_token,
@@ -482,10 +482,25 @@ short-lived access token and a refresh token.
 - **IAM-LOGIN-5.** A login password holding a lone surrogate is the 422
   `string_unicode` at `["body", "password"]`. The login body has no NUL check, by
   decision (issue #1426): in local mode and the break-glass login a NUL reaches
-  `verify_password` and is the 401 of IAM-HASH-3; LDAP mode passes the password to the
-  directory as before. \
+  `verify_password` and is the 401 of IAM-HASH-3; in LDAP mode it is the 401 of
+  IAM-LDAP-13, before any directory call. \
   Enforced in: `services/auth/app/schemas/auth.py` (`LoginRequest`); `services/auth/app/validation_errors.py` (`validation_error_handler`) \
-  Pinned by: `services/auth/tests/test_password_input_validation.py` (`test_login_with_a_lone_surrogate_is_422_string_unicode`, `test_login_with_a_nul_stays_401`, `test_login_schema_still_takes_a_nul_so_login_answers_401`)
+  Pinned by: `services/auth/tests/test_password_input_validation.py` (`test_login_with_a_lone_surrogate_is_422_string_unicode`, `test_login_with_a_nul_stays_401`, `test_login_schema_still_takes_a_nul_so_login_answers_401`); `services/auth/tests/test_login_password_bound.py` (`test_a_long_lone_surrogate_is_string_unicode_in_every_mode`, `test_ldap_mode_refuses_a_nul_before_the_directory`)
+- **IAM-LOGIN-6.** The login password bound is the bound of the mode that judges the
+  password (issue #1404), read from the live `AUTH_METHOD` when the request arrives: at
+  most 72 characters in local mode and for the OIDC break-glass login, which check a
+  bcrypt hash (registration's bound, IAM-REG-2), and at most 1024 characters in LDAP
+  mode, where every login, a local account's included, goes to the directory and is
+  never hashed (IAM-LDAP-1). The LDAP bound is only a ceiling on the request: 1024
+  characters are at most 4096 UTF-8 bytes, the most hashing takes (IAM-HASH-3). HERD
+  hands the password to ldap3 unchanged, and ldap3 prepares it with SASLprep before the
+  bind is sent (IAM-LDAP-13). A longer password is the 422
+  `string_too_long` at `["body", "password"]` with `String should have at most <N>
+  characters`, N the mode's bound, and never reaches the judge; past 1024 characters
+  every mode names 1024, the schema's ceiling, which runs first. The bound counts
+  characters, not bytes. \
+  Enforced in: `services/auth/app/schemas/auth.py` (`LoginRequest`, `login_password_max_length`, `PASSWORD_MAX_LENGTH`, `LDAP_LOGIN_PASSWORD_MAX_LENGTH`) \
+  Pinned by: `services/auth/tests/test_login_password_bound.py` (`test_every_mode_has_its_judges_bound`, `test_the_ldap_bound_never_exceeds_the_hashing_bound`, `test_ldap_mode_passes_a_long_password_to_the_directory_unchanged`, `test_ldap_mode_takes_1024_four_byte_characters`, `test_ldap_mode_refuses_past_1024_before_the_directory`, `test_local_mode_refuses_73_with_the_unchanged_422_before_bcrypt`, `test_local_mode_past_1024_is_refused_at_the_ceiling_of_every_mode`, `test_local_mode_signs_in_with_72`, `test_local_mode_422_matches_registrations`, `test_oidc_break_glass_refuses_73_before_bcrypt`, `test_oidc_break_glass_takes_72`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_long_password_reaches_the_directory_unchanged`, `test_login_endpoint_accepts_a_100_character_directory_password`); `tests/integration/test_ldap_auth.py` (`test_ldap_user_with_a_100_character_password_signs_in`)
 
 **Out of scope.** Rate limiting and lockout after failed attempts do not exist.
 
@@ -516,11 +531,17 @@ account automatically.
   simple bind with an empty password would succeed anonymously). \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`) \
   Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_empty_password_rejected`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_empty_password_rejected`)
-- **IAM-LDAP-5.** Login fails closed with 401: incomplete configuration, a directory
-  that cannot be reached or bound, a search with no match, a refused user bind, an
-  entry without the email attribute, and any LDAP error all refuse. \
-  Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_search_user`) \
-  Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_not_found`, `test_bind_user_missing_email_rejected`, `test_bind_user_missing_config_returns_none`); `services/auth/tests/test_ldap_service_live.py` (`test_bad_service_account_returns_none`, `test_bind_user_unknown_user_returns_none`)
+- **IAM-LDAP-5.** Every answer the directory gives about the login itself is the 401
+  `Invalid credentials`: a search that succeeds with no match (an unknown login name,
+  or an entry the filter leaves out), a user bind the directory refuses with any result
+  code at all (a wrong password, the codes directories use for a disabled, locked, or
+  expired account, and busy or unavailable too: only an existing user reaches the user
+  bind, so any other answer there would tell an existing account from an unknown one),
+  and an entry without the email attribute. A search that found the user is a match
+  whatever its result code, as ldap3 reports one (a size- or time-limited search that
+  returned the entry signs in). \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_search_user`, `_bind_as_user`, `_checked_search`) \
+  Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_not_found`, `test_bind_user_missing_email_rejected`, `test_bind_user_answers_none_for_what_the_directory_said`, `test_bind_user_a_limited_search_that_found_the_user_still_signs_in`); `services/auth/tests/test_ldap_login_outage.py` (`test_what_the_directory_said_stays_the_401`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_unknown_user_returns_none`, `test_login_endpoint_rejects_bad_password_against_live_ldap`)
 - **IAM-LDAP-6.** Every directory connection uses StartTLS before binding unless the
   URL is `ldaps://` or `LDAP_USE_TLS` is false, and validates the server certificate
   unless `LDAP_TLS_VALIDATE` is false (which logs a warning); `LDAP_CA_CERT` names a CA
@@ -549,6 +570,48 @@ account automatically.
   value, or the typed login name when the entry has none. \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`) \
   Pinned by: none
+- **IAM-LDAP-12.** When the directory cannot be asked, login answers 503 `Directory
+  unavailable, credentials not checked` (issue #1403): incomplete configuration
+  (`LDAP_SERVER_URL` or `LDAP_USER_BASE_DN` empty), a malformed server URL, a refused or
+  timed-out connection, a TLS failure, a refused service-account bind (anonymous
+  included), a search that raises, or that found no entry and ended with any result code but
+  success (a missing base DN, a referral that cannot be followed, busy, access denied;
+  a limited search that returned the entry is a match, IAM-LDAP-5), and a user bind
+  that could not be attempted or answered at all: its connection could not be built or
+  opened, TLS failed, or no answer came within the 30 s receive timeout (as on the
+  service connection). The cause of those last three does not depend on the username, and a
+  client cannot cause them through HERD, but only an existing username reaches the
+  user bind, so during an intermittently failing directory an existing username sees a
+  503 somewhat more often than an unknown one; a directory that delays the user bind of existing accounts past 30 s would
+  still answer them 503, and is not known among the directories HERD targets. It is
+  still fail closed: no session, no account
+  created, no local fallback (IAM-LDAP-1), and the body never holds the directory
+  client's text. The client logs one WARNING `LDAP unavailable during login` (action
+  `ldap_error`, the client's text in the message, the cause's class in
+  `exception_class`; incomplete configuration logs one ERROR instead), and auth logs a
+  WARNING `login_failure` with reason `directory_unavailable`; no line holds the
+  password. \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_search_user`, `_bind_as_user`, `_checked_search`); `services/auth/app/services/auth_service.py` (`_authenticate_ldap`); `services/auth/app/routers/auth.py` (`login`, `LOGIN_DIRECTORY_UNAVAILABLE_DETAIL`) \
+  Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_raises_unavailable_when_the_directory_could_not_be_asked`, `test_bind_user_missing_config_raises_unavailable`, `test_user_bind_connection_has_the_receive_timeout`); `services/auth/tests/test_ldap_login_outage.py` (`test_an_outage_is_503_with_the_fixed_detail_and_no_session`, `test_incomplete_configuration_is_503`, `test_an_outage_never_falls_back_to_a_local_password`); `services/auth/tests/test_auth_ldap.py` (`test_ldap_login_directory_unavailable_returns_503`); `services/auth/tests/test_ldap_service_live.py` (`test_bad_service_account_raises_unavailable`, `test_bind_user_unreachable_server_raises_unavailable`, `test_bind_user_missing_base_dn_raises_unavailable`, `test_login_endpoint_unreachable_directory_is_503`, `test_login_endpoint_bad_service_account_is_503`)
+- **IAM-LDAP-13.** ldap3 prepares every simple-bind password with SASLprep (RFC 4013)
+  inside the bind and refuses, client-side, a password holding an ASCII or other
+  control character (NUL and tab included), a private-use, non-character, or tagging
+  code point, a display-changing character, or mixed right-to-left and left-to-right
+  text, or one that maps to nothing. Login asks the same check
+  (`validate_simple_password`) before any directory call, after the empty-password
+  check of IAM-LDAP-4, and refuses such a password with the 401 `Invalid credentials`
+  for every username, with no directory traffic and one WARNING (action
+  `ldap_password_refused`, the username and the error class, never the password or a
+  part of it) (the #1403 review: asked only at the user bind, which an existing user
+  alone reaches, it answered existing users 503 and unknown ones 401). The user bind
+  treats the same refusal as a refusal too. A character SASLprep maps instead of
+  refusing reaches the directory mapped: a soft hyphen maps to nothing, a
+  non-breaking space to a space, a fullwidth letter to ASCII, so a directory password
+  that literally holds one can never match (ldap3's behavior, not HERD's). Timing: a
+  pre-check refusal makes no directory round trip where an unknown user costs one
+  search; the difference depends on the password alone, the same for every username. \
+  Enforced in: `services/auth/app/services/ldap_service.py` (`_password_refused_by_saslprep`, `_bind_user_sync`, `_bind_as_user`, `_USER_BIND_INPUT_REFUSALS`) \
+  Pinned by: `services/auth/tests/test_ldap_login_input_oracle.py` (`test_a_password_saslprep_refuses_gets_the_same_answer_for_every_username`, `test_the_route_answers_known_and_unknown_users_identically`, `test_the_user_bind_itself_refuses_what_saslprep_refuses`, `test_a_password_saslprep_maps_goes_to_the_directory_mapped`); `services/auth/tests/test_login_password_bound.py` (`test_ldap_mode_refuses_a_nul_before_the_directory`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_answers_known_and_unknown_users_alike_for_a_saslprep_refusal`, `test_bind_user_a_saslprep_mapped_password_reaches_the_directory_mapped`)
 
 **Out of scope.** Roles never come from the directory (ADR 0011, Blast radius). SAML and
 OIDC do not exist (issue #37).
@@ -1491,13 +1554,15 @@ page and the `/login/sso` page are in section 8.19.
   never shows server text: only a 401 shows `Invalid credentials. Check your email or
   login name and your password.`; no answer (a network error, or no answer within the
   15 s client timeout `LOGIN_TIMEOUT_MS`), a 404 (the gateway's answer while auth is
-  down), and any 5xx show `Could not reach HERD. Try again in a moment.`; a 422 names the
-  length limits of IAM-LOGIN-3; a 429 shows `Too many sign-in attempts.` with the
+  down), and any 5xx (LDAP mode's 503 for a directory that cannot be asked, IAM-LDAP-12,
+  included) show `Could not reach HERD. Try again in a moment.`; a 422 names the
+  length limits of IAM-LOGIN-3 and IAM-LOGIN-6, both password bounds, since the page
+  cannot tell which mode judged it; a 429 shows `Too many sign-in attempts.` with the
   `Retry-After` wait when it is a whole number of seconds; any other status shows
   `Sign-in failed with an unexpected answer. Try again in a moment.` Auth itself answers a
   login with no 429 and no 403 (IAM-LOGIN-1). \
   Enforced in: `frontend/src/pages/LoginPage.tsx` (`LoginPage`); `frontend/src/lib/login.ts` (`loginErrorText`); `frontend/src/api/auth.ts` (`useLogin`); `frontend/src/api/client.ts` (`LOGIN_TIMEOUT_MS`, `withClientTimeout`) \
-  Pinned by: `frontend/src/test/pages/LoginPage.test.tsx` (`shows the unconfigured banner and disables fields when configured=false`, `toasts an error when login is rejected`, `a network error says HERD is unreachable`, `a login that never answers is given up after 15 seconds and says HERD is unreachable`, `a 422 names the length limits instead of the credentials`, `a 429 says to wait, with the Retry-After seconds`, `a 403 gets the unexpected-answer wording, never the server's text`); `frontend/src/test/lib/login.test.ts` (`calls only a 401 a credential refusal`, `gives a 429 the rate-limit wording, with the wait when Retry-After is whole seconds`)
+  Pinned by: `frontend/src/test/pages/LoginPage.test.tsx` (`shows the unconfigured banner and disables fields when configured=false`, `toasts an error when login is rejected`, `a network error says HERD is unreachable`, `a login that never answers is given up after 15 seconds and says HERD is unreachable`, `a 422 names the length limits instead of the credentials`, `a 429 says to wait, with the Retry-After seconds`, `a 403 gets the unexpected-answer wording, never the server's text`); `frontend/src/test/lib/login.test.ts` (`calls only a 401 a credential refusal`, `names both password bounds on a 422, since the page cannot tell which mode judged it`, `gives a 429 the rate-limit wording, with the wait when Retry-After is whole seconds`)
 - **IAM-UI-10.** Registration success sends the user to `/login`; a failure shows the
   server's detail. \
   Enforced in: `frontend/src/pages/RegisterPage.tsx` (`RegisterPage`) \
@@ -1958,7 +2023,8 @@ it on the pre-#1355 commit, is replayed by the tests
   refused password there is a 422 (IAM-REG-2); the seed fails startup with the
   ValueError. A login with a NUL is the 401 `Invalid credentials` (under passlib it was
   a 500); a login with a lone surrogate never reaches the check (IAM-LOGIN-5), and no
-  request password reaches 4096 bytes within the 72-character bounds. \
+  password a request sends to hashing reaches 4096 bytes: registration, local login,
+  and the break-glass login take at most 72 characters (IAM-REG-2, IAM-LOGIN-6). \
   Enforced in: `services/auth/app/services/passwords.py` (`validate_password`, `_encoded_password`, `_password_bytes`, `MAX_PASSWORD_BYTES`) \
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_a_refused_password_never_hashes`, `test_a_refused_password_is_false_after_one_dummy_check`, `test_a_refused_password_against_a_good_hash_logs_nothing`, `test_4096_bytes_is_still_accepted`, `test_a_password_passlib_refused_to_hash_is_still_refused`, `test_a_login_with_a_nul_password_is_401_not_500`); `services/auth/tests/test_password_input_validation.py` (`test_validate_password_refuses_a_nul_anywhere_with_the_pinned_message`, `test_validate_password_refuses_the_rest_with_a_message_that_holds_no_input`, `test_validate_password_returns_an_honest_password_unchanged`); `services/auth/tests/test_main.py` (`test_seed_superadmin_refuses_a_password_hashing_refuses`)
 - **IAM-HASH-4.** A stored hash is usable when it reads `$<ident>$<cost>$` followed by a
@@ -2017,7 +2083,7 @@ it on the pre-#1355 commit, is replayed by the tests
 **Out of scope.** The config service's own password is in
 `operations-and-observability.md` (OPS-CONFIG-6); the cost ceiling of IAM-HASH-4 is
 auth's only, and the config service's check has none (issue #1425). LDAP mode never hashes: the password
-goes to the directory (IAM-LDAP-1), and its 72-character bound is issue #1404.
+goes to the directory (IAM-LDAP-1), with a login bound of 1024 characters (IAM-LOGIN-6).
 
 ## 9. Errors
 
@@ -2037,7 +2103,7 @@ password, though `msg` and `loc` can quote part of an email, a UUID, or a key na
 | 400 | `Token role cannot exceed the principal's role` | token role above its principal | IAM-APITOK-3 |
 | 401 | `Not authenticated` (FastAPI) | no Authorization header on a JWT-guarded route, auth or acl | IAM-JWT-3, IAM-CLAIM-1 |
 | 401 | `Could not validate credentials` | bad, expired, or subjectless token; in auth also an unknown or inactive account | IAM-JWT-3, IAM-ACCT-5, IAM-CLAIM-1 |
-| 401 | `Invalid credentials` | any login refusal, local, LDAP, or OIDC mode | IAM-LOGIN-1, IAM-LDAP-5, IAM-LDAP-9, IAM-LDAP-10, IAM-OIDC-21 |
+| 401 | `Invalid credentials` | any login refusal, local, LDAP, or OIDC mode | IAM-LOGIN-1, IAM-LDAP-5, IAM-LDAP-9, IAM-LDAP-10, IAM-LDAP-13, IAM-OIDC-21 |
 | 401 | `Single sign-on session expired; sign in again` | handoff exchange refused | IAM-OIDC-20 |
 | 401 | `Invalid or expired refresh token` | refresh refused | IAM-SESSION-2 |
 | 401 | `Invalid or expired token` | API token exchange refused | IAM-APITOK-8 |
@@ -2068,8 +2134,9 @@ password, though `msg` and `loc` can quote part of an email, a UUID, or a key na
 | 409 | `Directory sync requires auth_method=ldap` | sync-now outside LDAP mode | IAM-SERIAL-2 |
 | 409 | `A sync run is already in progress`, `A sync run is already in progress on another replica` | sync-now while a run holds the slot | IAM-SERIAL-1 |
 | 409 | `This grant already exists` | duplicate grant | IAM-ACL-2 |
-| 422 | validation list | registration, login, profile, group, bulk, mapping, token, grant, or check body out of bounds; a registration password holding a NUL or a lone surrogate, or a login password holding a lone surrogate; a profile body with a key other than the three profile fields, or a null or empty `full_name`; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-PROFILE-3, IAM-PROFILE-4, IAM-PROFILE-5, IAM-LOGIN-3, IAM-LOGIN-5, IAM-HASH-9, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2 |
+| 422 | validation list | registration, login, profile, group, bulk, mapping, token, grant, or check body out of bounds; a registration password holding a NUL or a lone surrogate, or a login password holding a lone surrogate; a profile body with a key other than the three profile fields, or a null or empty `full_name`; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-PROFILE-3, IAM-PROFILE-4, IAM-PROFILE-5, IAM-LOGIN-3, IAM-LOGIN-5, IAM-LOGIN-6, IAM-HASH-9, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2 |
 | 422 | `group_dn does not resolve in the directory` | mapping DN proven absent | IAM-MAP-3 |
+| 503 | `Directory unavailable, credentials not checked` | LDAP-mode login while the directory cannot be asked | IAM-LDAP-12 |
 | 503 | `Directory unavailable, mapping not validated` | mapping create while the directory cannot be asked | IAM-MAP-3 |
 | 503 | `Internal API token not configured` | an internal route with no token configured | IAM-INTERNAL-2 |
 
@@ -2084,7 +2151,7 @@ Calls into this area are in section 7 and the forwarded-JWT group routes noted u
 
 | Direction | Peer | Call | Purpose | On failure |
 |---|---|---|---|---|
-| Out (auth) | LDAP directory | search and bind at login | password check, identity | Fail closed: 401 (IAM-LDAP-5) |
+| Out (auth) | LDAP directory | search and bind at login | password check, identity | Fail closed: 401 when the directory refuses the login (IAM-LDAP-5), 503 when it cannot be asked (IAM-LDAP-12) |
 | Out (auth) | LDAP directory | base search of the group DN | mapping validation | Fail closed: 503 when it cannot be asked, 422 when it proves absence (IAM-MAP-3) |
 | Out (auth) | LDAP directory | group fetch, member resolution, paged email enumeration | sync and sweep | Fail closed per group (IAM-SYNC-2) and for the whole sweep (IAM-SWEEP-5); the run ends `partial` |
 | Out (acl) | auth | `GET /groups/user/{user_id}` (caller's JWT, 10 s) | group set for a check | Fail closed: no groups, so not allowed (IAM-ACL-9) |
@@ -2120,7 +2187,7 @@ Calls into this area are in section 7 and the forwarded-JWT group routes noted u
 | `LDAP_SYNC_DEACTIVATION_MAX_PERCENT`, `LDAP_SYNC_DEACTIVATION_MIN_COUNT` | `20`, `3` | Breaker terms |
 
 Fixed in code: LDAP connect timeout 10 s and receive timeout 30 s on the service
-connection (the login user bind sets no receive timeout); paged search size 500; detail
+connection and on the login user bind (IAM-LDAP-12); paged search size 500; detail
 cap 20 per category; prune cadence 24 hours; bulk and batch caps 500.
 
 ## 12. Test coverage map
@@ -2147,18 +2214,15 @@ the integration suite, the frontend tests, and the browser suite were read, not 
   recovery path, so an `OIDC_ISSUER` change locks out every single sign-on user.
 - Issue #1400: visible Unicode look-alikes of an existing email are provisioned as
   separate accounts.
-- Issue #1403: in LDAP mode an unreachable directory answers 401 `Invalid credentials`,
-  so users are told their password is wrong.
-- Issue #1404: login caps passwords at 72 characters in LDAP mode, where the password
-  never reaches bcrypt.
 
-(#1420 is resolved by IAM-OIDC-28.)
+(#1420 is resolved by IAM-OIDC-28, #1403 by IAM-LDAP-12 and IAM-LDAP-13, and #1404 by
+IAM-LOGIN-6.)
 
 ### Limits by decision
 
 - The login body has no NUL check, so a login password holding a NUL is not a 422: in
-  local mode it is the 401 `Invalid credentials`, and LDAP mode is unchanged
-  (IAM-LOGIN-5, IAM-HASH-3). Recorded in issue #1426 (Expected and Suggested fix).
+  local mode it is the 401 `Invalid credentials`, and in LDAP mode the same 401 before
+  any directory call (IAM-LOGIN-5, IAM-HASH-3, IAM-LDAP-13). Recorded in issue #1426 (Expected and Suggested fix).
 - An admin may mint an API token for any principal of equal or lower rank, including
   another admin, and then act as that account (IAM-APITOK-2). Recorded in issue #312 and
   the comment in `create_token`; [SECURITY.md](../../SECURITY.md) treats admins as
@@ -2197,7 +2261,7 @@ the integration suite, the frontend tests, and the browser suite were read, not 
 ### Rules with no test
 
 - IAM-SESSION-1: refresh token storage as a hash and its lifetime.
-- IAM-LOGIN-3: the login identifier and password bounds.
+- IAM-LOGIN-3: the login identifier bound.
 - IAM-HASH-7: hashing on the event loop (by decision, unchanged from passlib).
 - IAM-LDAP-11: the username fallback to the typed login name.
 - IAM-JWT-1: the claim set and lifetime of a login access token.

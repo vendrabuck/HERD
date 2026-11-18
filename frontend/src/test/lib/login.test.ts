@@ -108,6 +108,13 @@ describe("loginErrorText", () => {
     expect(loginErrorText(withStatus(status))).toBe(LOGIN_UNREACHABLE);
   });
 
+  it("names both password bounds on a 422, since the page cannot tell which mode judged it", () => {
+    // Issue #1404: 72 for a local account and the break-glass login, 1024 in LDAP mode.
+    expect(loginErrorText(withStatus(422))).toBe(
+      "HERD could not accept these sign-in details. The email or username can be at most 255 characters, and the password at most 72 characters, or 1024 for a directory account.",
+    );
+  });
+
   it.each([
     ["no response (network error)", { message: "Network Error", code: "ERR_NETWORK" }],
     ["a timeout", { message: "timeout of 1ms exceeded", code: "ECONNABORTED" }],

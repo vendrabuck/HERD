@@ -11,11 +11,11 @@ Flow (when settings.auth_method == "ldap"):
 
 Beyond login binds, this module is the directory client for the ADR 0011
 group sync (docs/design/0011-ldap-group-sync.md): group entry fetch, member
-DN resolution, and the email-keyed user presence search. Those callers need
-to distinguish "the directory answered: not there" (safe to act on) from
-"the directory could not be asked" (proves nothing), so the sync-facing
-functions raise LdapUnavailableError on the latter instead of collapsing
-every failure to None the way the login path does.
+DN resolution, and the email-keyed user presence search. Every caller needs
+to distinguish "the directory answered" from "the directory could not be
+asked" (proves nothing), so every client function raises LdapUnavailableError
+on the latter. The login path (bind_user) does too since issue #1403: None is
+the directory's refusal of a login (401), the error is an outage (503).
 
 Blocking ldap3 calls are dispatched to a worker thread so they do not stall
 the event loop.
@@ -31,12 +31,19 @@ from dataclasses import dataclass
 
 import anyio
 from ldap3 import BASE, NONE, SIMPLE, SUBTREE, Connection, Server, Tls
-from ldap3.core.exceptions import LDAPCommunicationError, LDAPException, LDAPInvalidDnError
+from ldap3.core.exceptions import (
+    LDAPCommunicationError,
+    LDAPException,
+    LDAPInvalidDnError,
+    LDAPPasswordIsMandatoryError,
+    LDAPSASLPrepError,
+)
 from ldap3.core.results import (
     RESULT_INVALID_DN_SYNTAX,
     RESULT_NO_SUCH_OBJECT,
     RESULT_SUCCESS,
 )
+from ldap3.protocol.sasl.sasl import validate_simple_password
 from ldap3.utils.conv import escape_filter_chars
 from ldap3.utils.dn import safe_dn
 
@@ -358,138 +365,218 @@ async def run_connection():
 def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
     """Bind as service account, then search for the user DN and attributes.
 
-    Returns (user_dn, {email_attr: [values], username_attr: [values]}) on
-    success, or None when the connection cannot be established or the search
-    finds nothing: the login path deliberately does not distinguish directory
-    errors from absent users. A search-phase LDAPException still propagates;
-    _bind_user_sync's except LDAPException completes the None contract, as it
-    always has. The search_filter is template'd with the escaped username to
-    prevent filter injection. This function is always synchronous (blocking
-    ldap3 calls); callers use anyio.to_thread to dispatch it.
+    Returns (user_dn, {email_attr: [values], username_attr: [values]}) when the
+    search matched, or None only when the directory PROVED there is no match: a
+    successful search with zero entries (issue #1403). Every other outcome
+    raises LdapUnavailableError: the service connection could not be opened,
+    TLS-negotiated, or bound; the search raised; or it found no entry and ended
+    with any result code but success (noSuchObject on a misconfigured base DN, a
+    referral that could not be followed, busy, access denied). A limited search
+    that returned the entry is a match (ldap3 reports a non-empty response as
+    found, whatever the result code). Like the presence probe, a
+    failed search under the configured base proves nothing about the user. The
+    search_filter is template'd with the escaped username to prevent filter
+    injection. This function is always synchronous (blocking ldap3 calls);
+    callers use anyio.to_thread to dispatch it.
     """
-    try:
-        with _service_connection() as conn:
-            safe_username = escape_filter_chars(username)
-            search_filter = settings.ldap_user_filter.format(username=safe_username)
-            ok = conn.search(
-                search_base=settings.ldap_user_base_dn,
-                search_filter=search_filter,
-                search_scope=SUBTREE,
-                attributes=[
-                    settings.ldap_email_attribute,
-                    settings.ldap_username_attribute,
-                ],
-            )
-            if not ok or not conn.entries:
-                return None
-            entry = conn.entries[0]
-            attrs = {
-                settings.ldap_email_attribute: list(entry[settings.ldap_email_attribute].values)
-                if settings.ldap_email_attribute in entry
-                else [],
-                settings.ldap_username_attribute: list(
-                    entry[settings.ldap_username_attribute].values
-                )
-                if settings.ldap_username_attribute in entry
-                else [],
-            }
-            return entry.entry_dn, attrs
-    except LdapUnavailableError as exc:
-        # Keep the pre-refactor taxonomy: an outage during login logs at
-        # WARNING with the error detail (action ldap_error), so operators
-        # and alerting see a down directory, not a flood of "user not
-        # found" INFO lines.
-        logger.warning(
-            "LDAP unavailable during user search: %s",
-            exc,
-            extra={"action": "ldap_error", "username": username},
+    with _service_connection() as conn:
+        safe_username = escape_filter_chars(username)
+        search_filter = settings.ldap_user_filter.format(username=safe_username)
+        found = _checked_search(
+            conn,
+            search_base=settings.ldap_user_base_dn,
+            search_filter=search_filter,
+            search_scope=SUBTREE,
+            attributes=[
+                settings.ldap_email_attribute,
+                settings.ldap_username_attribute,
+            ],
+            proven_absent_codes=_PRESENCE_PROVEN_ABSENT_CODES,
+            description="login user search",
         )
-        return None
+        if not found:
+            return None
+        entry = conn.entries[0]
+        attrs = {
+            settings.ldap_email_attribute: _attr_values(entry, settings.ldap_email_attribute),
+            settings.ldap_username_attribute: _attr_values(entry, settings.ldap_username_attribute),
+        }
+        return entry.entry_dn, attrs
+
+
+# Errors ldap3 raises client-side, inside bind(), about the submitted password
+# itself (RFC 4013 SASLprep refusing a character, an empty password). They depend
+# on the input, never on the directory, so they are a refusal: as an outage they
+# would answer an existing user (the only one who reaches the user bind)
+# differently from an unknown one. _bind_user_sync refuses these passwords before
+# any directory call (_password_refused_by_saslprep); this is the second guard.
+_USER_BIND_INPUT_REFUSALS = (LDAPSASLPrepError, LDAPPasswordIsMandatoryError)
 
 
 def _bind_as_user(user_dn: str, password: str) -> bool:
-    server = _build_server()
-    conn = Connection(
-        server,
-        user=user_dn,
-        password=password,
-        authentication=SIMPLE,
-        auto_bind=False,
-        read_only=True,
-    )
+    """Bind as user_dn with the submitted password.
+
+    True when the directory accepted the bind. False for every answer the
+    directory gave, whatever the result code (invalidCredentials, the codes
+    directories use for a disabled, locked, or expired account, and busy or
+    unavailable too), and for a password ldap3 refuses client-side
+    (_USER_BIND_INPUT_REFUSALS). Only an existing user reaches this bind, so any
+    answer here but the refusal would tell an existing account from an unknown
+    one (the #1403 review). Raises LdapUnavailableError only when the bind could
+    not be attempted or answered at all: the connection could not be built or
+    opened, TLS failed, or no answer came within the receive timeout (the
+    service connection's 30 s), which ends a silent directory here instead of
+    holding the worker thread.
+    """
     try:
-        if settings.ldap_use_tls and not settings.ldap_server_url.lower().startswith("ldaps://"):
-            conn.start_tls()
-        if not conn.bind():
+        server = _build_server()
+        conn = Connection(
+            server,
+            user=user_dn,
+            password=password,
+            authentication=SIMPLE,
+            auto_bind=False,
+            read_only=True,
+            receive_timeout=_RECEIVE_TIMEOUT_SECONDS,
+        )
+    except LDAPException as exc:
+        raise LdapUnavailableError(f"user bind setup failed: {exc}") from exc
+    try:
+        try:
+            if settings.ldap_use_tls and not settings.ldap_server_url.lower().startswith(
+                "ldaps://"
+            ):
+                conn.start_tls()
+            return bool(conn.bind())
+        except _USER_BIND_INPUT_REFUSALS:
             return False
-        return True
+        except LDAPException as exc:
+            raise LdapUnavailableError(f"user bind failed: {exc}") from exc
     finally:
         _close_connection(conn)
 
 
+def _password_refused_by_saslprep(username: str, password: str) -> bool:
+    """True when ldap3 would refuse this password client-side in the user bind.
+
+    ldap3 prepares every simple-bind password with SASLprep (RFC 4013,
+    validate_simple_password) inside bind() and raises for an ASCII or other
+    control character (NUL and tab included), a private-use, non-character, or
+    tagging code point, a display-changing character, mixed right-to-left and
+    left-to-right text, or a password that maps to nothing. Asked here, before
+    any directory call, the refusal is the same 401 for every username, with no
+    directory traffic and one log line that names the username and the error
+    class, never the password or a part of it. Asked only at the user bind, it
+    would be reachable for existing users alone (the #1403 review's oracle).
+    """
+    try:
+        validate_simple_password(password)
+    except LDAPException as exc:
+        logger.warning(
+            "LDAP login refused before any directory call: the password is not a valid "
+            "simple-bind password (SASLprep)",
+            extra={
+                "action": "ldap_password_refused",
+                "username": username,
+                "exception_class": type(exc).__name__,
+            },
+        )
+        return True
+    return False
+
+
 def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
-    """Authenticate a user against LDAP. Returns LdapIdentity on success, None on failure.
+    """Authenticate a user against LDAP (issue #1403 split the two failure kinds).
 
     Flow: (1) bind as service account and search for the user DN; (2) bind as
     that user with the submitted password; (3) extract and return email and
     username attributes. The search filters on ldap_user_filter (injected with
-    escaped username to prevent LDAP filter injection). Returns None on any
-    failure: configuration incomplete, empty password (rejects anonymous bind),
-    service-account bind failure, search returned no results, user bind failure
-    (wrong password, disabled account, etc.), missing email attribute, or LDAP
-    exception. Callers wrap this in anyio.to_thread to keep it off the event loop.
+    escaped username to prevent LDAP filter injection).
+
+    Returns the LdapIdentity on success and None for every refusal: an empty
+    password (refused before any call, since an LDAP simple bind with one
+    succeeds anonymously), a password SASLprep refuses (also before any call,
+    _password_refused_by_saslprep), no matching entry, a refused user bind, or an
+    entry without the email attribute.
+
+    Raises LdapUnavailableError whenever the directory could not be asked:
+    incomplete configuration (logged at ERROR), or any connection, TLS,
+    service-account bind, search, or user-bind failure (logged once at WARNING,
+    action ldap_error, with the client's text in the message and the cause's
+    class name in exception_class; never the password). Callers wrap this in
+    anyio.to_thread to keep it off the event loop.
     """
     if not settings.ldap_server_url or not settings.ldap_user_base_dn:
-        logger.error("LDAP not fully configured; bind aborted")
-        return None
+        logger.error("LDAP not fully configured; login cannot be checked")
+        raise LdapUnavailableError(
+            "LDAP is not fully configured (ldap_server_url or ldap_user_base_dn is empty)"
+        )
     if not password:
         # LDAP anonymous bind succeeds with an empty password; reject early.
         return None
+    if _password_refused_by_saslprep(username, password):
+        return None
     try:
-        found = _search_user(username)
-        if found is None:
-            logger.info(
-                "LDAP user search returned no results",
-                extra={"action": "ldap_user_not_found", "username": username},
-            )
-            return None
-        user_dn, attrs = found
-        if not _bind_as_user(user_dn, password):
-            logger.warning(
-                "LDAP user bind failed (wrong password?)",
-                extra={"action": "ldap_bind_failure", "dn": user_dn},
-            )
-            return None
-
-        email_values = attrs.get(settings.ldap_email_attribute) or []
-        username_values = attrs.get(settings.ldap_username_attribute) or []
-        email = str(email_values[0]) if email_values else ""
-        ldap_username = str(username_values[0]) if username_values else username
-        if not email:
-            logger.warning(
-                "LDAP user has no email attribute; cannot provision HERD account",
-                extra={"action": "ldap_missing_email", "dn": user_dn},
-            )
-            return None
-        return LdapIdentity(username=ldap_username, email=email, dn=user_dn)
-    except LDAPException as exc:
+        try:
+            found = _search_user(username)
+            if found is None:
+                logger.info(
+                    "LDAP user search returned no results",
+                    extra={"action": "ldap_user_not_found", "username": username},
+                )
+                return None
+            user_dn, attrs = found
+            if not _bind_as_user(user_dn, password):
+                logger.warning(
+                    "LDAP user bind failed (wrong password?)",
+                    extra={"action": "ldap_bind_failure", "dn": user_dn},
+                )
+                return None
+        except LDAPException as exc:
+            # Backstop: every ldap3 call above already converts its own errors;
+            # one that does not is still an outage, never a refusal.
+            raise LdapUnavailableError(f"LDAP error during login: {exc}") from exc
+    except LdapUnavailableError as exc:
+        # One WARNING per outage with the client's detail (action ldap_error),
+        # so operators and alerting see a down directory, not a flood of "user
+        # not found" INFO lines; the caller answers without that detail.
         logger.warning(
-            "LDAP error during bind: %s",
+            "LDAP unavailable during login: %s",
             exc,
-            extra={"action": "ldap_error", "username": username},
+            extra={
+                "action": "ldap_error",
+                "username": username,
+                "exception_class": type(exc.__cause__ or exc).__name__,
+            },
+        )
+        raise
+
+    email_values = attrs.get(settings.ldap_email_attribute) or []
+    username_values = attrs.get(settings.ldap_username_attribute) or []
+    email = str(email_values[0]) if email_values else ""
+    ldap_username = str(username_values[0]) if username_values else username
+    if not email:
+        logger.warning(
+            "LDAP user has no email attribute; cannot provision HERD account",
+            extra={"action": "ldap_missing_email", "dn": user_dn},
         )
         return None
+    return LdapIdentity(username=ldap_username, email=email, dn=user_dn)
 
 
 async def bind_user(username: str, password: str) -> LdapIdentity | None:
-    """Verify the user's password against LDAP and return their identity, or None."""
+    """Verify the user's password against LDAP and return their identity, or None.
+
+    None is the directory's refusal of this login; LdapUnavailableError means
+    the directory could not be asked (see _bind_user_sync).
+    """
     return await anyio.to_thread.run_sync(_bind_user_sync, username, password)
 
 
 # ---------------------------------------------------------------------------
-# ADR 0011 group-sync directory client. Unlike the login path above, these
-# raise LdapUnavailableError when the directory cannot be asked; None (or a
-# skip_reason) is reserved for answers the directory actually gave.
+# ADR 0011 group-sync directory client. Like the login path above (since issue
+# #1403), these raise LdapUnavailableError when the directory cannot be asked;
+# None (or a skip_reason) is reserved for answers the directory actually gave.
 # ---------------------------------------------------------------------------
 
 # Proven-absent result codes for base-scope DN lookups. ldap3 reports a base
