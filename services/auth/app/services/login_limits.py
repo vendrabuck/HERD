@@ -12,7 +12,7 @@ with three differences, each deliberate:
 - It is keyed by source address only, never by the email or login name, so a
   client cannot lock a named account out, and the answer says nothing about
   whether an account exists.
-- There is no cross-source lockout: on the main login one attacker could then lock
+- There is no cross-source lockout: on the main login one client could then lock
   every user out. The bound across sources is the hashing pool instead
   (`passwords.HashingPool`, IAM-HASH-7): a flood from many addresses gets 503s
   once the pool's wait is full, and the event loop stays free.
