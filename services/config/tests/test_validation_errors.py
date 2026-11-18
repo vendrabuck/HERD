@@ -5,13 +5,17 @@ login or change-password body that is the submitted password, and for a missing
 field it is the whole body, password included. Starlette cannot encode a lone
 surrogate, so a surrogate in that echoed input turned the 422 into a 500. The
 config service renders each error as exactly `{type, loc, msg}` and replaces any
-lone surrogate in `loc` or `msg` with U+FFFD (a standalone copy of the auth
-service's handler, issue #1426; config imports neither herd_common nor auth).
+lone surrogate in `loc` or `msg` with U+FFFD (a standalone copy of the shared
+`herd_common.validation_errors`, first written for auth in issue #1426; config
+imports neither herd_common nor auth). The last test pins the copy's code identical
+to the shared module's, so the hand-kept copy cannot drift.
 """
 
 from __future__ import annotations
 
+import ast
 import json
+from pathlib import Path
 
 import pytest
 from app.main import app
@@ -154,7 +158,7 @@ async def test_the_review_inputs_are_a_clean_422(path, body, secret, async_clien
     _assert_clean(resp, [secret])
 
 
-# -- The handler itself (mirrors the auth service's tests) ---------------------------
+# -- The handler itself (mirrors herd_common's tests) -------------------------------
 
 
 REPLACEMENT = chr(0xFFFD)
@@ -255,3 +259,60 @@ async def test_every_rendered_error_has_exactly_the_advertised_keys():
 def test_restrict_leaves_a_document_without_the_component_alone():
     document = {"openapi": "3.1.0", "paths": {}}
     assert restrict_validation_error_schema(document) == {"openapi": "3.1.0", "paths": {}}
+
+
+# -- The copy is the shared module's code -------------------------------------------
+
+
+def _code(path: Path) -> str:
+    """The module's AST dump with every docstring removed: what the module does,
+    never how its prose reads."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                if isinstance(body[0].value.value, str):
+                    node.body = body[1:] or [ast.Pass()]
+    return ast.dump(tree, include_attributes=False)
+
+
+def test_the_code_is_identical_to_the_shared_module():
+    """app/validation_errors.py is a copy of herd_common.validation_errors (the config
+    image has no herd_common). Its code, every statement but the docstrings, must
+    equal the shared module's, so a change made to one copy alone fails here. A
+    source-level comparison was chosen over comparing outputs on a corpus: it sees
+    every difference, including one no corpus input reaches. On the host both are
+    importable."""
+    import herd_common.validation_errors as shared
+    from app import validation_errors as copy
+
+    assert _code(Path(copy.__file__)) == _code(Path(shared.__file__))
+    assert copy.RENDERED_KEYS == shared.RENDERED_KEYS
+
+
+def test_the_code_comparison_sees_a_one_character_change(tmp_path):
+    """The comparison is not vacuous: a changed regex, an extra key, or a changed
+    status differs, while a reworded docstring or comment does not."""
+    import herd_common.validation_errors as shared
+
+    source = Path(shared.__file__).read_text(encoding="utf-8")
+    original = tmp_path / "original.py"
+    original.write_text(source, encoding="utf-8")
+    reworded = tmp_path / "reworded.py"
+    reworded.write_text(
+        source.replace("Each error as", "Every error as").replace(
+            "# The keys every", "# Each of the keys"
+        ),
+        encoding="utf-8",
+    )
+    assert _code(reworded) == _code(original)
+    for old, new in [
+        ('"[\\ud800-\\udfff]"', '"[\\ud800-\\udbff]"'),
+        ('("type", "loc", "msg")', '("type", "loc", "msg", "input")'),
+        ("HTTP_422_UNPROCESSABLE_CONTENT", "HTTP_400_BAD_REQUEST"),
+    ]:
+        assert old in source, old
+        changed = tmp_path / "changed.py"
+        changed.write_text(source.replace(old, new), encoding="utf-8")
+        assert _code(changed) != _code(original), old

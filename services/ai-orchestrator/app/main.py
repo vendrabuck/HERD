@@ -25,6 +25,7 @@ from fastapi import FastAPI
 from herd_common.cors import add_cors_middleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.schema_init import create_all_and_stamp
+from herd_common.validation_errors import install_validation_errors
 from herd_common.version import add_version_route, service_version
 
 from app.config import settings, warn_if_anthropic_api_key_unused
@@ -94,6 +95,10 @@ app = FastAPI(
 add_cors_middleware(app, settings.cors_origins)
 
 app.add_middleware(RequestLoggingMiddleware)
+
+# Every 422 is `{type, loc, msg}`: never the submitted `input` or `ctx`, and never
+# a 500 on a lone surrogate (herd_common.validation_errors).
+install_validation_errors(app)
 
 app.include_router(generate_router)
 app.include_router(commit_router)
