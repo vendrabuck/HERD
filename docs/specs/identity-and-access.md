@@ -556,7 +556,19 @@ account automatically.
   IAM-LDAP-15 leaves out). A search that returned one entry is a match only when it
   ended in success; more than one entry is IAM-LDAP-16, and one entry with any other
   result code is IAM-LDAP-16 or IAM-LDAP-12 (before issue #1447 a size- or time-limited
-  search that returned an entry signed in as it). \
+  search that returned an entry signed in as it). Timing, by decision (issue #1449):
+  these refusals share their status, body, and headers, but not their time. A name that
+  matches exactly one entry costs one more directory round trip than a name that matches
+  none or several (a second connection, StartTLS when it is on, and the user bind), so
+  the response time can reveal that a login name names a directory entry, whatever the
+  password; unlike local mode (IAM-LOGIN-2) nothing evens this out. It is not hidden:
+  a dummy bind for every name that does not match one entry would add traffic to every
+  mistyped login and can touch lockout counters, and a time floor on every login would
+  slow every login and still leak whenever the directory answers above the floor.
+  Nothing in HERD limits the rate of login attempts (section 8.2, Out of scope), so
+  only the directory's and auth's own throughput bound how fast names can be probed,
+  unless an operator rate-limits `POST /api/auth/login` at a proxy in front of the
+  gateway. \
   Enforced in: `services/auth/app/services/ldap_service.py` (`_bind_user_sync`, `_search_user`, `_bind_as_user`, `_checked_search`) \
   Pinned by: `services/auth/tests/test_ldap_service.py` (`test_bind_user_not_found`, `test_bind_user_missing_email_rejected`, `test_bind_user_answers_none_for_what_the_directory_said`, `test_bind_user_one_entry_and_success_still_signs_in`); `services/auth/tests/test_ldap_login_outage.py` (`test_what_the_directory_said_stays_the_401`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_unknown_user_returns_none`, `test_login_endpoint_rejects_bad_password_against_live_ldap`)
 - **IAM-LDAP-6.** Every directory connection uses StartTLS before binding unless the
@@ -2586,6 +2598,11 @@ IAM-LDAP-12 and IAM-LDAP-13, #1404 by IAM-LOGIN-6, and #1447 by IAM-LDAP-16.)
   another server's part of the tree is not seen, and a directory that cuts the answer
   to one entry while reporting success would hide a second match (IAM-LDAP-16).
   Recorded in that rule and the docstring of `_search_user`.
+- In LDAP mode the response time of a refused login can tell a login name that
+  matches one directory entry from one that matches none or several: the first costs a
+  second connection and the user bind (IAM-LDAP-5). Recorded in issue #1449 (owner
+  decision, 2026-11-18: no dummy bind and no time floor). Nothing in HERD limits the
+  rate of login attempts; an operator can rate-limit at a proxy.
 - LDAP login refuses a username collision while sync recovers it (IAM-LDAP-10,
   IAM-SYNC-7). Recorded in the comments of `_authenticate_ldap` and `_ensure_ldap_user`.
 - The seeded superadmin is local and cannot log in under `AUTH_METHOD=ldap`
