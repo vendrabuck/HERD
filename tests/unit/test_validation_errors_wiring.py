@@ -17,8 +17,9 @@ has no `app/`). For each one:
   statement of its own (`install_validation_errors(app)`), after the assignment.
   The install function must be bound, at module level and exactly once, by an
   import from the expected module: `from <module> import install_validation_errors`
-  (any alias), or `from <package> import validation_errors` (any alias) and called
-  as an attribute of it. The expected module is `herd_common.validation_errors`,
+  (any alias), or `from <package> import validation_errors` (any alias) or
+  `import <module> as <alias>` and called as an attribute of that name. The
+  expected module is `herd_common.validation_errors`,
   except for the config service, which must not import herd_common and installs its
   standalone copy, `app.validation_errors` (pinned identical in code to the shared
   module by `services/config/tests/test_validation_errors.py`).
@@ -43,7 +44,12 @@ Limits. The scan reads source; it executes nothing:
   always reached, but a `sys.exit()` or an exception raised before it is not
   modelled); a handler removed or replaced after install by mutating
   `app.exception_handlers` directly, by `app.router` surgery, or by a middleware
-  that rewrites 422 bodies; a handler registered for a base class of
+  that rewrites 422 bodies; a custom `APIRoute` subclass (a router's `route_class`)
+  whose route handler wraps FastAPI's and could catch `RequestValidationError` and
+  answer a body of its own (auth's `_SingleSignOnRoute` in `app/routers/oidc.py` is
+  such a wrapper; it is benign: outside OIDC mode it answers a fixed 404 before
+  validation runs, and otherwise it calls FastAPI's handler unchanged); a handler
+  registered for a base class of
   `RequestValidationError` (`ValidationException`, `Exception`) or under an alias of
   the class name; `setattr(app, "openapi", ...)`; the shared module itself monkeypatched;
   an app object created by a factory or `type(...)` rather than a `FastAPI(...)` call;

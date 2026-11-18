@@ -54,7 +54,7 @@ _LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 def _encodable(value: Any) -> Any:
     """`value` with every lone surrogate in a string replaced by U+FFFD."""
     if isinstance(value, str):
-        return _LONE_SURROGATE.sub("�", value)
+        return _LONE_SURROGATE.sub("\ufffd", value)
     return value
 
 

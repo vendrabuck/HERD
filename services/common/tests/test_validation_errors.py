@@ -94,10 +94,10 @@ async def test_the_handler_replaces_a_lone_surrogate_in_loc_and_msg_and_keeps_in
 
 async def test_the_handler_keeps_honest_non_ascii_text_unchanged():
     status, body = await _render(
-        [{"type": "value_error", "loc": ("body", "full_name"), "msg": "Café \U0001f511"}]
+        [{"type": "value_error", "loc": ("body", "full_name"), "msg": "Caf\u00e9 \U0001f511"}]
     )
     assert status == 422
-    assert body["detail"][0]["msg"] == "Café \U0001f511"
+    assert body["detail"][0]["msg"] == "Caf\u00e9 \U0001f511"
 
 
 def test_render_takes_any_iterable_of_errors_and_an_error_without_a_loc():
