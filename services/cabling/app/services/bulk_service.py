@@ -51,6 +51,7 @@ from typing import Any
 from fastapi import HTTPException
 from herd_common.csv_safety import csv_safe_cell, csv_unsafe_cell
 from herd_common.rehearsal import rehearsal_session
+from herd_common.validation_errors import lone_surrogate_locs
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -66,6 +67,12 @@ from app.services.visible_devices import resolve_caller_visibility
 # by another user's active reservation. Mirrors the reservation-scoped lock on
 # PUT /topologies/{id}: bulk import must never silently rewire a topology out
 # from under a live reservation it does not own.
+# A JSON import file holding a lone surrogate (an escape such as \ud800 with no pair):
+# a value no response, database write, or later read can encode.
+IMPORT_NOT_TEXT_DETAIL = (
+    "Import file holds a lone surrogate escape, which is not valid text; fix it and retry"
+)
+
 _LOCKED_TOPOLOGY_REASON = (
     "topology is in use by an active reservation owned by another user; "
     "bulk import cannot rewire it"
@@ -219,6 +226,8 @@ def parse_json_topologies(raw: bytes) -> list[dict[str, Any]]:
         doc = json.loads(raw.decode("utf-8-sig"))
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}") from exc
+    if lone_surrogate_locs(doc):
+        raise HTTPException(status_code=422, detail=IMPORT_NOT_TEXT_DETAIL)
     if isinstance(doc, dict) and "items" in doc:
         items = doc["items"]
     elif isinstance(doc, list):

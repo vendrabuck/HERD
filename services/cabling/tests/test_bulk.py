@@ -28,6 +28,7 @@ from app.dependencies import get_current_user_payload
 from app.main import app
 from app.models.connection import Connection
 from app.models.topology import Topology, TopologyVersion
+from app.services.bulk_service import IMPORT_NOT_TEXT_DETAIL
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -1082,3 +1083,50 @@ def test_parse_csv_empty_port_cell_leaves_side_unconstrained():
     data = record["canvas"]["edges"][0]["data"]
     # The neutralizing quote comes back off (issue #910) and the empty cell is absent.
     assert data == {"layer": "L1", "source_port_name": "=eth0"}
+
+
+# A lone surrogate in an imported JSON file ----------------------------------------
+#
+# The file is a multipart upload, which the shared body check passes through, and its
+# JSON is parsed here: `json.loads` turns an escape such as \ud800 into a lone
+# surrogate, which no response, database write, or later read can encode.
+
+_SUR = chr(0xD800)  # built, so no source escape is decoded early
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "items",
+    [
+        [{"name": "lab" + _SUR, "canvas": {"nodes": [], "edges": []}}],
+        [{"name": "lab", "canvas": {"nodes": [{"id": "n", "data": {"label": _SUR}}], "edges": []}}],
+        {"items": [{"name": "lab", "canvas": {"nodes": [], "edges": []}}], "x" + _SUR: 1},
+    ],
+    ids=["name", "nested_canvas_value", "key"],
+)
+async def test_a_json_import_holding_a_lone_surrogate_is_a_fixed_422(admin_client, items):
+    before = await _count_versions()
+    resp = await admin_client.post(
+        "/topologies/import",
+        params={"format": "json"},
+        files={"file": ("t.json", io.BytesIO(json.dumps(items).encode()), "application/json")},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {"detail": IMPORT_NOT_TEXT_DETAIL}
+    assert IMPORT_NOT_TEXT_DETAIL == (
+        "Import file holds a lone surrogate escape, which is not valid text; fix it and retry"
+    )
+    assert await _count_versions() == before
+
+
+@pytest.mark.asyncio
+async def test_a_json_import_with_a_surrogate_pair_escape_is_not_refused(admin_client):
+    """A character outside the BMP written as two escapes is one code point once parsed."""
+    items = [{"name": "lab \U0001f511", "canvas": {"nodes": [], "edges": []}}]
+    resp = await admin_client.post(
+        "/topologies/import",
+        params={"format": "json"},
+        files={"file": ("t.json", io.BytesIO(json.dumps(items).encode()), "application/json")},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["created"] == 1
