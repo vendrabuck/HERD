@@ -1,4 +1,4 @@
-"""The ONE request-validation (422) handler every HERD service installs.
+"""The ONE request-validation (422) handler every HERD service installs (issue #1455).
 
 FastAPI's default handler renders each pydantic error with its `input` and `ctx`.
 `input` is the submitted value, and for a missing field it is the whole body: a
