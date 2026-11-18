@@ -406,7 +406,7 @@ async def _bearer(user: User) -> dict[str, str]:
 
 
 async def test_a_registration_by_an_admin_is_not_counted(client, small_limit):
-    clock = small_limit(1)
+    small_limit(1)
     for role in (Role.ADMIN, Role.SUPERADMIN):
         admin = await _account(f"{role.value}@example.com", role=role)
         headers = await _bearer(admin)
@@ -418,7 +418,6 @@ async def test_a_registration_by_an_admin_is_not_counted(client, small_limit):
             }
             response = await client.post("/register", json=body, headers=headers)
             assert response.status_code == 201, response.text
-    clock.advance(0)
     # The source's own allowance is untouched.
     assert login_limits.LIMITER.acquire("127.0.0.1") is None
 
@@ -442,6 +441,49 @@ async def test_a_registration_by_anyone_else_is_counted(client, small_limit):
         assert first.status_code in (201, 409), case
         second = await client.post("/register", json=body, headers=headers)
         assert (second.status_code, second.json()) == (429, LIMITED), case
+
+
+async def test_a_refused_registration_reads_an_account_only_for_a_token_that_verifies(
+    client, small_limit, monkeypatch
+):
+    """An absent or invalid token costs no query; a token that verifies, admin or
+    not, costs exactly one account read (the effective role needs the stored
+    role), and the refused registration then runs no duplicate check."""
+    from app.routers import auth as auth_router
+
+    user = await _account("reader@example.com")
+    headers_by_case = {
+        "no header": ({}, 0),
+        "a token that does not verify": ({"Authorization": "Bearer not-a-token"}, 0),
+        "another scheme": ({"Authorization": "Basic YWRtaW46YWRtaW4="}, 0),
+        "a user's token": (await _bearer(user), 1),
+    }
+    reads = {"by_id": 0, "by_email": 0, "by_username": 0}
+    real = {
+        "by_id": auth_router.get_user_by_id,
+        "by_email": auth_router.get_user_by_email,
+        "by_username": auth_router.get_user_by_username,
+    }
+
+    def counting(key):
+        async def wrapper(db, value):
+            reads[key] += 1
+            return await real[key](db, value)
+
+        return wrapper
+
+    monkeypatch.setattr(auth_router, "get_user_by_id", counting("by_id"))
+    monkeypatch.setattr(auth_router, "get_user_by_email", counting("by_email"))
+    monkeypatch.setattr(auth_router, "get_user_by_username", counting("by_username"))
+    body = {"email": "never@example.com", "username": "never", "password": PASSWORD}
+    for case, (headers, expected_reads) in headers_by_case.items():
+        small_limit(1)
+        login_limits.LIMITER.acquire("127.0.0.1")  # the source has nothing left
+        for key in reads:
+            reads[key] = 0
+        response = await client.post("/register", json=body, headers=headers)
+        assert (response.status_code, response.json()) == (429, LIMITED), case
+        assert reads == {"by_id": expected_reads, "by_email": 0, "by_username": 0}, case
 
 
 async def test_registration_in_ldap_or_oidc_mode_stays_409_and_counts_nothing(

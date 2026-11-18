@@ -73,8 +73,11 @@ _LOGIN_RESPONSES: dict[int | str, dict] = {
 
 def _check_attempt_allowance(request: Request) -> None:
     """Count one password attempt against the request's source address; 429 with
-    `Retry-After` when it has none left (IAM-LOGIN-7). Called before any query,
-    bcrypt, or directory call, so a refused attempt costs nothing."""
+    `Retry-After` when it has none left (IAM-LOGIN-7). Itself it queries nothing.
+    A login calls it before any query, bcrypt, or directory call, so a refused
+    login costs nothing; a registration calls it after `_registered_by_an_admin`,
+    which reads one account first when the request carries a bearer token that
+    verifies (none for an absent or invalid token)."""
     wait = login_limits.LIMITER.acquire(login_limits.request_source(request))
     if wait is not None:
         raise HTTPException(
@@ -99,9 +102,15 @@ async def _registered_by_an_admin(request: Request, db: AsyncSession) -> bool:
     Such a registration is not counted against the source's allowance
     (IAM-LOGIN-7): `make seed` registers about a thousand accounts this way from
     one address. Nothing else changes for it. Any other header, a token that does
-    not verify, or a lower role answers False, never an error. The transaction
-    the account read opened is ended here, so the connection goes back to the
-    pool before the registration waits for a hashing slot.
+    not verify, or a lower role answers False, never an error.
+
+    Cost: an absent header or a token that does not verify costs no query. A
+    token that verifies costs one account read, whatever its role, because the
+    effective role needs the stored role; a non-admin token cannot be turned
+    away before that read without trusting the claim alone. `GET /me` already
+    gives any token holder the same read. The transaction the read opened is
+    ended here, so the connection goes back to the pool before the
+    registration's allowance is counted and before it waits for a hashing slot.
     """
     scheme, token = get_authorization_scheme_param(request.headers.get("Authorization"))
     if scheme.lower() != "bearer" or not token:
@@ -163,13 +172,16 @@ async def register(request: Request, body: RegisterRequest, db: AsyncSession = D
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=REGISTER_DISABLED_OIDC_DETAIL
         )
-    # Registration hashes the password, so an unauthenticated one counts against
-    # the source's attempt allowance (IAM-LOGIN-7), before any other query.
+    # Registration hashes the password, so one without an admin's token counts
+    # against the source's attempt allowance (IAM-LOGIN-7). A bearer token that
+    # verifies costs one account read first (released before the count and the
+    # slot); an absent or invalid one costs no query.
     if not await _registered_by_an_admin(request, db):
         _check_attempt_allowance(request)
     try:
-        # The slot is entered before the duplicate check's query, so a
-        # registration waiting for one holds no database connection (IAM-HASH-7).
+        # The slot is entered before the duplicate check's query, and the token
+        # check's read (if any) was released above, so a registration waiting
+        # for a slot holds no database connection (IAM-HASH-7).
         async with passwords.hashing_slot():
             # Single generic 409 for any collision (email OR username, pre-check
             # OR the IntegrityError race below). Distinct messages let an

@@ -21,9 +21,12 @@ The allowance is a token bucket: a source starts with `max_attempts` attempts, a
 they refill evenly, one every `window_seconds / max_attempts` seconds, up to
 `max_attempts`. So a burst of `max_attempts` is admitted, and after that one
 attempt per refill interval. An attempt with no allowance left is refused with the
-whole seconds until the next one refills (at least 1), as the 429's `Retry-After`;
-the refusal costs nothing, since the routes ask before any query, bcrypt, or
-directory call.
+whole seconds until the next one refills (at least 1), as the 429's `Retry-After`.
+A refused login costs nothing: the route asks before any query, bcrypt, or
+directory call. A refused registration costs no bcrypt and no duplicate check, and
+no query at all unless it carries a bearer token that verifies, which costs the one
+account read that judges the admin exemption (`routers/auth.py`,
+`_registered_by_an_admin`).
 
 Source address and its trust assumption. Auth publishes no host port; every
 client request reaches it through Traefik, whose entry points do not trust a
