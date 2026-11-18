@@ -608,6 +608,59 @@ async def test_commit_rejects_out_of_range_vlan(async_client):
     assert resp.status_code == 422
 
 
+_CANARY = "S3cr3t-Canary-9d1e"
+
+
+@pytest.mark.parametrize(
+    ("connection_type", "config", "expected"),
+    [
+        ("Management", {"vlan": 918273645}, "at vlan: must be at most 4094"),
+        (
+            "Management",
+            {"hostname": _CANARY * 10},
+            "at hostname: must be at most 128 characters long",
+        ),
+        (
+            "Management",
+            {"description": [f"enable password {_CANARY}"]},
+            "at description: must be of type string",
+        ),
+        (
+            "Layer 3 Switch",
+            {"interfaces": [{"name": "eth0", "zone": _CANARY}]},
+            "at interfaces[0].zone: must be one of 'trust', 'untrust', 'dmz'",
+        ),
+    ],
+    ids=["vlan-maximum", "hostname-maxLength", "description-type", "zone-enum"],
+)
+async def test_commit_refusal_never_quotes_the_config(
+    async_client, caplog, connection_type, config, expected
+):
+    """Issue #1457: the 422 names the role, the field, and the rule, never a
+    value from the proposed config (it was jsonschema's own message, which
+    quotes the value)."""
+    body = _commit_body(
+        devices=[
+            {
+                "role": "fw-a",
+                "device_id": DEVICE_A,
+                "config": config,
+                "connection_type": connection_type,
+            }
+        ],
+        edges=[],
+    )
+    headers = {"Authorization": f"Bearer {_user_token()}"}
+    with caplog.at_level("DEBUG"):
+        async with async_client as client:
+            resp = await client.post("/commit", json=body, headers=headers)
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == f"device 'fw-a': config failed schema validation {expected}"
+    for text in (resp.text, caplog.text):
+        assert _CANARY not in text
+        assert "918273645" not in text
+
+
 async def test_commit_allows_no_config_on_unknown_connection_type(async_client):
     """No config present -> connection_type is ignored, commit proceeds."""
     body = _commit_body(

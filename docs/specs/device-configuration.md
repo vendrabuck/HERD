@@ -349,7 +349,7 @@ internal route of section 7.
 - **CFG-VER-3.** The config is validated as 8.3 says, and a refusal is a 422 whose
   `detail` is the validator's message. \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`_validate_config_for_device`, `create_config_version`) \
-  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_create_config_version_validates`, `test_create_config_version_unsupported_connection_type`, `test_layer2_switch_vlan_assignments_validated`)
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_create_config_version_validates`, `test_create_config_version_unsupported_connection_type`, `test_layer2_switch_vlan_assignments_validated`, `test_create_refusal_never_quotes_the_config`, `test_restore_refusal_never_quotes_the_stored_config`)
 - **CFG-VER-4.** Creating or restoring a version never moves the device's current
   config pointer; only a successful apply does (CFG-APPLY-4, CFG-SCHED-10). \
   Enforced in: `services/inventory/app/routers/device_configs.py` (`create_config_version`, `restore_config_version`) \
@@ -450,10 +450,17 @@ both services.
   string), is refused. \
   Enforced in: `services/common/herd_common/device_config.py` (`validate_device_config`) \
   Pinned by: `services/common/tests/test_device_config.py` (`test_missing_connection_type_with_config_is_rejected`, `test_unknown_connection_type_with_config_is_rejected`)
-- **CFG-SCHEMA-4.** A refusal reads `device '<name>': config failed schema validation: <message>`
-  (`device:` without a name), the message being the schema library's best match. \
-  Enforced in: `services/common/herd_common/device_config.py` (`validate_device_config`, `validate_device_config_with_schema`) \
-  Pinned by: `services/common/tests/test_device_config.py` (`test_role_prefixes_error_message_when_provided`, `test_no_role_uses_bare_device_prefix`, `test_with_published_schema_rejects_with_role_prefix`)
+- **CFG-SCHEMA-4.** A refusal reads
+  `device '<name>': config failed schema validation at <path>: <rule>` (`device:`
+  without a name), for the schema library's best match: `<path>` is where the config
+  is wrong (`commands[0]`, `interfaces[2].zone`, `vlan_assignments['ge-0/0/1']`, or
+  `the top level`) and `<rule>` is the failed keyword in fixed words
+  (`must be at most 512 characters long`, `must be of type string`,
+  `needs the field 'name'`, `does not allow the field 'bogus'`). The text holds no
+  value taken from the config, and the error is raised with no cause or context, so a
+  logged traceback cannot carry the library's own message, which quotes the value. \
+  Enforced in: `services/common/herd_common/device_config.py` (`validate_device_config`, `validate_device_config_with_schema`, `_refusal`, `schema_error_text`) \
+  Pinned by: `services/common/tests/test_device_config.py` (`test_role_prefixes_error_message_when_provided`, `test_no_role_uses_bare_device_prefix`, `test_with_published_schema_rejects_with_role_prefix`, `test_schema_failure_does_not_chain_the_validation_error`); `services/common/tests/test_device_config_refusal_text.py` (`test_every_validator_keyword_has_a_case`, `test_refusal_names_path_and_rule_never_the_value`, `test_frr_schema_refusal_never_quotes_a_line`, `test_registry_refusal_never_quotes_a_value`, `test_no_role_keeps_the_bare_device_prefix`, `test_refusal_carries_no_jsonschema_error`, `test_deep_path_through_arrays_and_objects`, `test_every_error_in_a_combinator_context_renders_without_its_value`)
 - **CFG-SCHEMA-5.** A published schema is used only after cleaning: it must be a JSON
   object, any `$ref` that is not a local `#` pointer rejects it whole, every `$id`,
   `$anchor`, `$dynamicAnchor`, `$dynamicRef`, and `$schema` key is removed, and the
@@ -501,6 +508,29 @@ both services.
   fallback to the registry. \
   Enforced in: `services/execution/app/services/execution_service.py` (`run_driver_action`); `services/execution/app/services/driver_loader.py` (`get_driver_config_schema`) \
   Pinned by: `services/execution/tests/test_execution_service_edges.py` (`test_configure_validation_runs_after_load_driver`, `test_configure_registry_fallback_when_no_published_schema`)
+- **CFG-SCHEMA-13.** A refusal names, besides the path and the keyword, only the
+  schema's numbers (bounds and counts), JSON type names, and field names. A field name
+  taken from the config (the path, or a field `additionalProperties` refuses) is masked
+  as CFG-EXEC-8 masks a string, cut to 64 characters, and quoted with `repr` (so a
+  control character or a lone surrogate is written as its escape) unless it is a plain
+  identifier, which is written bare. A field name the schema defines (`required`,
+  `dependentRequired`) is shown in full from the registry; from a driver-published
+  schema only when it is a plain name of at most 64 characters (a letter or `_`, then
+  letters, digits, `_`, `-`, or `.`), and otherwise counted (`needs a required field`,
+  `needs the field 'address' and 2 other required fields`, `a field needs ...`). A
+  schema's free text (an `enum` or `const` value, a `pattern`) is quoted only from the
+  registry, at most ten scalar values or a pattern of at most 128 characters; a
+  driver-published schema's free text is never quoted
+  (`must be one of the values the schema allows`, `must match the schema's pattern`).
+  The `format` keyword is not enforced: neither validator is built with a format
+  checker, so no refusal names a format today; the rule text for it
+  (`must be a valid <format>`) is there for when one is. The refusal's text is a
+  prefix (`device` or `device '<name>'`, the name quoted with `repr`) and a reason,
+  kept apart on the error (`prefix`, `reason`); the reason's rule words never use a
+  credential keyword, so CFG-EXEC-10's mask, which covers the reason only, leaves a
+  clean refusal unchanged, and no device name changes it. \
+  Enforced in: `services/common/herd_common/device_config.py` (`ConfigValidationError`, `schema_error_text`, `_rule_text`, `_schema_names_text`, `_is_schema_name`, `_path_text`, `_name_text`) \
+  Pinned by: `services/common/tests/test_device_config_refusal_text.py` (`test_published_schema_free_text_is_not_quoted`, `test_schema_values_are_shown_when_the_caller_allows_them`, `test_a_long_or_structured_schema_value_is_never_quoted`, `test_format_rule_names_the_format_only`, `test_plain_key_is_written_bare_and_other_keys_are_quoted`, `test_a_key_that_reads_like_a_credential_line_is_masked`, `test_a_long_key_is_cut`, `test_a_key_with_a_control_character_or_lone_surrogate_is_escaped`, `test_a_path_deeper_than_the_cap_is_cut`, `test_refusal_words_survive_the_stored_error_mask_unchanged`, `test_published_schema_names_are_shown_only_when_plain`, `test_registry_path_shows_every_required_name`, `test_the_prefix_holds_the_device_name_and_the_reason_the_rest`, `test_the_non_schema_refusals_split_the_same_way`)
 
 **Out of scope.** The assistant's schema tool (`ai-features.md`, AI-TOOL-7) and the AI
 commit's own config check (AI-COMMIT-3), both built on the registry here. What the
@@ -880,9 +910,14 @@ is WIRE-DRIVER-6 in `provisioning-and-wiring.md`.
   Pinned by: `services/execution/tests/test_driver_load_sanitize_run.py` (`test_run_driver_action_download_failure_stores_class_name_only`, `test_run_driver_action_extraction_failure_stores_class_name_only`, `test_run_driver_action_validate_parse_failure_stores_class_name_only`); `services/execution/tests/test_api_endpoints.py` (`test_execute_driver_load_failure_never_returns_foreign_text`)
 - **CFG-EXEC-10.** A `configure` call's `method_kwargs` is validated as 8.3 says; a
   refusal ends the run `FAILED` with the validator's message and answers 422 with the
-  same message. Other actions are not validated. \
-  Enforced in: `services/execution/app/services/execution_service.py` (`run_driver_action`) \
-  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_manual_execute_validates_configure_kwargs`, `test_internal_execute_validates_configure_kwargs`, `test_manual_execute_skips_validation_for_non_configure_actions`)
+  same text, which holds no value from the configuration (CFG-SCHEMA-4), in the row,
+  the answer, the run list, or a log line. Before it is stored, the message's reason
+  is masked as CFG-EXEC-8 masks a string (`redact_command_text`); its prefix, which
+  holds the device's name, is kept as written, so a name such as `core key switch`
+  never cuts the refusal short and execution's text equals inventory's for the same
+  refusal. Other actions are not validated. \
+  Enforced in: `services/execution/app/services/execution_service.py` (`run_driver_action`, `_drive_run`) \
+  Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_manual_execute_validates_configure_kwargs`, `test_internal_execute_validates_configure_kwargs`, `test_manual_execute_skips_validation_for_non_configure_actions`); `services/execution/tests/test_config_refusal_text.py` (`test_refused_configure_never_carries_a_config_value`, `test_a_refusal_text_that_holds_a_credential_line_is_masked_before_it_is_stored`, `test_a_device_name_with_a_credential_keyword_keeps_the_whole_refusal`); `services/inventory/tests/test_device_configs.py` (`test_refusal_for_a_device_name_with_a_credential_keyword_is_the_shared_text`)
 - **CFG-EXEC-11.** A driver that raised is recorded as `driver raised <ClassName>`, its
   message logged only; a failure the driver returned keeps the driver's own `error`, or
   `driver reported failure` when it gave none. \
@@ -971,6 +1006,15 @@ reservation can list the runs tagged with it.
   `method_kwargs_redacted`), is retried with its stored arguments. \
   Enforced in: `services/execution/app/routers/executions.py` (`retry_run`, `_recover_masked_kwargs`) \
   Pinned by: `services/execution/tests/test_run_arguments_storage.py` (`test_retry_reads_a_masked_configuration_back_from_its_config_version`, `test_retry_of_a_masked_run_without_a_config_version_is_refused`, `test_retry_refuses_a_version_that_does_not_match_the_run`, `test_retry_fails_closed_when_the_config_version_cannot_be_read`, `test_retry_of_an_unmasked_run_reuses_its_stored_arguments`)
+- **CFG-RUN-8.** Every run execution answers (the list, the detail, an execute, a
+  retry) shows a configure refusal stored before issue #1457, whose message could quote
+  the refused configuration, as its prefix followed by
+  `config failed schema validation (details withheld; recorded before values were removed from these messages)`.
+  Such text is `device` or `device` and a `repr`-quoted name, then
+  `: config failed schema validation: ` (today's text has ` at ` after `validation`);
+  any other `error` is answered as stored. The row itself is not changed. \
+  Enforced in: `services/execution/app/schemas/execution.py` (`ExecutionRunResponse`); `services/common/herd_common/device_config.py` (`withhold_legacy_refusal_text`, `LEGACY_REFUSAL_WITHHELD`) \
+  Pinned by: `services/execution/tests/test_config_refusal_text.py` (`test_a_refusal_stored_before_the_fix_is_withheld_by_every_run_read`); `services/common/tests/test_device_config_refusal_text.py` (`test_an_old_refusal_keeps_its_prefix_and_loses_its_message`, `test_any_other_text_is_returned_unchanged`, `test_every_refusal_the_builder_writes_is_left_alone_on_read`)
 
 **Out of scope.** The wiring status and wiring retry routes, which are not run history
 (`provisioning-and-wiring.md`).
@@ -1411,7 +1455,7 @@ status.
 | 409 | `This run stores its configuration masked and names no config version to read it back from, so it cannot be retried; start a new run instead` | a retry of a masked run with no `config_version_id` | CFG-RUN-7 |
 | 409 | `The configuration this run pushed could not be read back from its config version, so it cannot be retried; start a new run instead` | a retry whose config version is unknown or no longer matches | CFG-RUN-7 |
 | 422 | `Device has no driver-defined connection_type; cannot validate config` | a version for a device without a driver connection type | CFG-VER-2 |
-| 422 | `device '<name>': config failed schema validation: <message>` and the other validator messages | a config the schema refuses | CFG-VER-3, CFG-SCHEMA-3, CFG-SCHEMA-4, CFG-EXEC-10 |
+| 422 | `device '<name>': config failed schema validation at <path>: <rule>` and the other validator messages | a config the schema refuses | CFG-VER-3, CFG-SCHEMA-3, CFG-SCHEMA-4, CFG-SCHEMA-13, CFG-EXEC-10 |
 | 422 | `scheduled_for must be in the future`, `scheduled_for must be within <N> days from now` | a bad schedule time | CFG-JOB-1, CFG-JOB-2 |
 | 422 | `reservation_id must reference an active reservation you own that includes this device`, `reservation_id must reference an active reservation that includes this device` (an admin) | a schedule naming a reservation that fails CFG-JOB-4 or CFG-JOB-5 | CFG-JOB-4, CFG-JOB-5 |
 | 422 | `reservation_id must reference a reservation you own that includes this device`, `reservation_id must reference a reservation that includes this device` (an admin) | a `POST /execute` naming a reservation that fails CFG-EXEC-3 | CFG-EXEC-3 |
@@ -1536,6 +1580,15 @@ None at present. (#1279 is resolved by CFG-LOAD-3.)
   `_recover_masked_kwargs` docstring) (CFG-RUN-7). A run that a direct `POST /execute`
   started with masked arguments and no `config_version_id` cannot be retried; a new run
   is the way (CFG-RUN-7).
+- A run refused before issue #1457 keeps the old refusal text in its row, which can
+  quote the refused configuration, credentials included. Every run read withholds it
+  (CFG-RUN-8), but a direct database read, a log line written before the upgrade, and
+  an assistant tool result already stored in `assistant_messages.content_blocks` still
+  hold it; [OPERATIONS.md](../OPERATIONS.md), "Upgrade path", has the query that finds
+  the rows and an optional rewrite (CFG-EXEC-10).
+- A refusal shows a field name of the config as it was sent, masked only after a
+  credential keyword, so a credential typed as a field name is shown; a field name is
+  not a place for one (CFG-SCHEMA-13).
 - Execution's driver-package extractor (`_extract_tar_gz` in
   `services/execution/app/services/driver_loader.py`) bounds the extracted size by a sum of
   `member.size`, which a pax-header flood passes; left as is at the #1195 triage because

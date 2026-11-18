@@ -219,3 +219,128 @@ describe("ConfigPage (editor)", () => {
     expect(page.className.split(/\s+/)).toContain(TOAST_CLEARANCE_CLASS);
   });
 });
+
+// Issue #1452: the change-password form counts characters as the config service
+// does (code points, OPS-CONFIG-8), so an emoji is one character, never two
+// UTF-16 units; the page refuses exactly what the server's bound refuses, sends
+// the value unchanged, and shows the server's own sentence for a refused password.
+describe("ConfigPage change password (issue #1452)", () => {
+  const KEY = "\u{1F511}";
+
+  async function openPasswordChange() {
+    server.use(
+      http.post("/api/config/login", () =>
+        HttpResponse.json({ token: "ct", password_changed: false }),
+      ),
+    );
+    renderWithProviders(<ConfigPage />);
+    fireEvent.change(screen.getByLabelText("Config Password"), {
+      target: { value: "password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await screen.findByText("Change Config Password");
+  }
+
+  function submitNewPassword(value: string) {
+    fireEvent.change(screen.getByLabelText("New Password (8-32 characters)"), {
+      target: { value },
+    });
+    fireEvent.change(screen.getByLabelText("Confirm Password"), { target: { value } });
+    fireEvent.click(screen.getByRole("button", { name: "Change Password" }));
+  }
+
+  function capturePosts(respond: () => Response = () => HttpResponse.json({ message: "Password changed" })) {
+    const posted: string[] = [];
+    server.use(
+      http.post("/api/config/change-password", async ({ request }) => {
+        posted.push(((await request.json()) as { new_password: string }).new_password);
+        return respond();
+      }),
+    );
+    return posted;
+  }
+
+  it("keeps the placeholder and sets no UTF-16 length attribute on either input", async () => {
+    await openPasswordChange();
+    for (const label of ["New Password (8-32 characters)", "Confirm Password"]) {
+      const input = screen.getByLabelText(label) as HTMLInputElement;
+      expect(input.placeholder).toBe("password");
+      expect(input.hasAttribute("maxlength")).toBe(false);
+      expect(input.hasAttribute("minlength")).toBe(false);
+    }
+  });
+
+  it.each([
+    ["8 ASCII", "a".repeat(8)],
+    ["32 ASCII", "a".repeat(32)],
+    ["8 emoji", KEY.repeat(8)],
+    ["32 emoji", KEY.repeat(32)],
+    ["16 ASCII and 16 emoji", "a".repeat(16) + KEY.repeat(16)],
+    ["4 letters with combining marks", "é".repeat(4)],
+  ])("posts %s unchanged", async (_name, value) => {
+    const posted = capturePosts();
+    await openPasswordChange();
+    submitNewPassword(value);
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Config password changed"));
+    expect(posted).toEqual([value]);
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["7 ASCII", "a".repeat(7)],
+    ["33 ASCII", "a".repeat(33)],
+    ["7 emoji", KEY.repeat(7)],
+    ["33 emoji", KEY.repeat(33)],
+    ["5 ASCII and 2 emoji", "a".repeat(5) + KEY.repeat(2)],
+    ["17 ASCII and 16 emoji", "a".repeat(17) + KEY.repeat(16)],
+  ])("refuses %s on the page without a request", async (_name, value) => {
+    const posted = capturePosts();
+    await openPasswordChange();
+    submitNewPassword(value);
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith("Password must be 8 to 32 characters"),
+    );
+    expect(posted).toEqual([]);
+  });
+
+  it("shows the server's sentence for a password it refuses", async () => {
+    // Eight code points the page's bound accepts and the server's character rule
+    // refuses (a lone surrogate): the page is never stricter than the server.
+    const posted = capturePosts(() =>
+      HttpResponse.json({ detail: "Password must be valid UTF-8 text" }, { status: 422 }),
+    );
+    await openPasswordChange();
+    submitNewPassword("\uD800" + "a".repeat(7));
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith("Password must be valid UTF-8 text"),
+    );
+    expect(posted).toEqual(["\uD800" + "a".repeat(7)]);
+    expect(toastSuccess).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "the 503 for an unusable store",
+      () =>
+        HttpResponse.json(
+          { detail: "The config password store is unusable; the config service log names the cause" },
+          { status: 503 },
+        ),
+    ],
+    [
+      "a 422 validation list",
+      () =>
+        HttpResponse.json(
+          { detail: [{ type: "string_type", loc: ["body", "new_password"], msg: "Input should be a valid string" }] },
+          { status: 422 },
+        ),
+    ],
+    ["a 500", () => new HttpResponse(null, { status: 500 })],
+  ])("keeps the generic toast for %s", async (_name, respond) => {
+    capturePosts(respond);
+    await openPasswordChange();
+    submitNewPassword("a".repeat(8));
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Failed to change password"));
+    expect(toastError).toHaveBeenCalledTimes(1);
+  });
+});
