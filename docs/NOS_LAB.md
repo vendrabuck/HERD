@@ -66,9 +66,14 @@ recreates it).
 The SR Linux node stays unconfined. Its Debian-based image contains binaries
 Ubuntu 26.04 also profiles (`dash`, `ip`, `sysctl`, `unix_chkpwd`, `locale`,
 `lsblk`, and others), but on the ubuntu-26.04 runner its boot and all ten SR
-Linux dialect tests logged no AppArmor denial, so it carries no option. If an
+Linux dialect tests logged no AppArmor denial, so it carries no option. The
+option that fixes the FRR node does not suit this one: in a trial on the
+ubuntu-26.04 runner (issue #1454, 2026-11-18) the SR Linux node under
+`apparmor=docker-default` never became healthy and `make nos-up` failed, in
+both the dialect job and the nightly's feature step. If an
 `apparmor="DENIED"` line naming an SR Linux process ever appears in
-`journalctl -k`, the same option is the first thing to try.
+`journalctl -k`, the remedy is on the host (a local override for the profile
+that attached), not this compose option.
 
 The lab is deliberately stateless, the same design `infra/ldap-test/` uses:
 neither service has a named volume, so `docker compose down` (via
