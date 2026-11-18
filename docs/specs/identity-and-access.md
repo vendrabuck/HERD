@@ -423,9 +423,11 @@ account with an email, a username, and a password, then sign in with it.
   bytes (IAM-HASH-2). The password must also be one hashing accepts, and exactly that
   (IAM-HASH-3, issue #1426): one holding a NUL character is the 422 `value_error` at
   `["body", "password"]` with the message `Value error, Password must not contain a
-  NUL character`, and one holding a lone surrogate is the 422 `string_unicode` there.
-  No account is created. \
-  Enforced in: `services/auth/app/schemas/auth.py` (`RegisterRequest`); `services/auth/app/services/passwords.py` (`validate_password`, `PASSWORD_NUL_MESSAGE`) \
+  NUL character`, and one holding a lone surrogate is the 422 `string_unicode` there
+  (since issues #1456 to #1459 answered by the shared body check, OPS-VALID-6 in
+  `operations-and-observability.md`, before the schema runs, with the same type, `loc`,
+  and message). No account is created. \
+  Enforced in: `services/auth/app/schemas/auth.py` (`RegisterRequest`); `services/auth/app/services/passwords.py` (`validate_password`, `PASSWORD_NUL_MESSAGE`); `services/common/herd_common/validation_errors.py` (`RefuseLoneSurrogates`) \
   Pinned by: `services/auth/tests/test_auth.py` (`test_register_invalid_email`, `test_register_username_too_short`, `test_register_username_invalid_chars`, `test_register_username_max_length`, `test_register_password_too_short`, `test_register_password_too_long`); `services/auth/tests/test_password_input_validation.py` (`test_register_accepts_a_password_exactly_when_hashing_does`, `test_register_schema_names_the_password_and_the_pinned_message`, `test_register_with_a_nul_is_422_with_the_pinned_wording_and_creates_nothing`, `test_register_with_a_lone_surrogate_is_422_string_unicode_and_creates_nothing`, `test_a_register_with_an_honest_8_character_password_still_succeeds`); `tests/integration/test_auth_flow.py` (`test_register_with_a_refused_password_is_422_through_the_gateway`)
 - **IAM-REG-3.** An email or username that already exists, found by the pre-check or by
   a concurrent insert, answers one generic 409 `Email or username already exists`. \
@@ -480,11 +482,12 @@ short-lived access token and a refresh token.
   Enforced in: `services/auth/app/routers/auth.py` (`login`); `services/auth/app/schemas/auth.py` (`TokenResponse`) \
   Pinned by: `services/auth/tests/test_auth.py` (`test_login`)
 - **IAM-LOGIN-5.** A login password holding a lone surrogate is the 422
-  `string_unicode` at `["body", "password"]`. The login body has no NUL check, by
+  `string_unicode` at `["body", "password"]`, answered by the shared body check
+  (OPS-VALID-6) before the schema's own refusal. The login body has no NUL check, by
   decision (issue #1426): in local mode and the break-glass login a NUL reaches
   `verify_password` and is the 401 of IAM-HASH-3; in LDAP mode it is the 401 of
   IAM-LDAP-13, before any directory call. \
-  Enforced in: `services/auth/app/schemas/auth.py` (`LoginRequest`); `services/common/herd_common/validation_errors.py` (`validation_error_handler`) \
+  Enforced in: `services/auth/app/schemas/auth.py` (`LoginRequest`); `services/common/herd_common/validation_errors.py` (`validation_error_handler`, `RefuseLoneSurrogates`) \
   Pinned by: `services/auth/tests/test_password_input_validation.py` (`test_login_with_a_lone_surrogate_is_422_string_unicode`, `test_login_with_a_nul_stays_401`, `test_login_schema_still_takes_a_nul_so_login_answers_401`); `services/auth/tests/test_login_password_bound.py` (`test_a_long_lone_surrogate_is_string_unicode_in_every_mode`, `test_ldap_mode_refuses_a_nul_before_the_directory`)
 - **IAM-LOGIN-6.** The login password bound is the bound of the mode that judges the
   password (issue #1404), read from the live `AUTH_METHOD` when the request arrives: at

@@ -787,7 +787,8 @@ section 5).
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_apply_list_filters`, `_id_prefix_term`, `ID_PREFIX_MIN_HEX`) \
   Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_search_is_case_insensitive_substring_on_purpose`, `test_search_treats_like_metacharacters_literally`, `test_search_matches_short_id_prefix_and_full_id`, `test_id_prefix_term`)
 - **RES-LIST-7.** `purpose_category` must be a configured category or `none` (no
-  category); any other value is 422. \
+  category); any other value is 422 with RES-PURPOSE-1's wording, which does not hold
+  the submitted value. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_my_reservations`) \
   Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_purpose_category_value_and_none`, `test_purpose_category_unknown_is_422_with_pinned_message`)
 - **RES-LIST-8.** Time bounds must carry a timezone; `*_after` is inclusive and
@@ -872,9 +873,15 @@ routes in section 5; background work `purpose_classify_loop` every
 **Rules.**
 
 - **RES-PURPOSE-1.** A category, at create or by PATCH, must be in `PURPOSE_CATEGORIES`;
-  the list is a plain string list, so a stored value survives being removed from it. \
-  Enforced in: `services/reservations/app/services/purpose_service.py` (`validate_purpose_category`) \
-  Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_create_reservation_with_unknown_purpose_category_is_422`, `test_patch_purpose_category_unknown_category_is_422`)
+  the list is a plain string list, so a stored value survives being removed from it.
+  Any other value is 422 `Unknown purpose_category; allowed: <list>`, which names the
+  allowed values and never the submitted one (OPS-VALID-7 in
+  `operations-and-observability.md`; issue #1459: it read `Unknown purpose_category
+  '<value>'; ...`, and a lone surrogate in the value made the 422 a 500). A value
+  holding a lone surrogate is now refused before the route runs, with the shared 422
+  `string_unicode` (OPS-VALID-6), and nothing is written. \
+  Enforced in: `services/reservations/app/services/purpose_service.py` (`validate_purpose_category`); `services/common/herd_common/error_details.py` (`unknown_value_detail`) \
+  Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_create_reservation_with_unknown_purpose_category_is_422`, `test_patch_purpose_category_unknown_category_is_422`, `test_create_with_a_lone_surrogate_category_is_422_not_500`, `test_patch_with_a_lone_surrogate_category_is_422_and_changes_nothing`); `tests/integration/test_purpose_category_flow.py` (`test_purpose_category_unknown_value_rejected_through_facade`, `test_a_lone_surrogate_in_a_facade_create_is_a_422_not_a_500`)
 - **RES-PURPOSE-2.** The owner or an admin may set or clear the category in any status,
   including terminal; anyone else gets 403 (not 404). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`set_purpose_category`) \
@@ -914,9 +921,10 @@ routes in section 5; background work `purpose_classify_loop` every
   Enforced in: `services/reservations/app/services/purpose_service.py` (`list_purpose_review_items`) \
   Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_review_list_excludes_confirmed_agreeing_row`, `test_review_list_includes_confirmed_disagreeing_row`, `test_review_list_excludes_dismissed_row`)
 - **RES-PURPOSE-10.** Accept with a null body takes the suggestion's `top_category`;
-  with a value, that value (validated); the accepting admin becomes the setter. \
+  with a value, that value (validated as RES-PURPOSE-1); the accepting admin becomes the
+  setter. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`accept_purpose_suggestion`) \
-  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_accept_with_null_uses_top_category`, `test_accept_with_chosen_value_overrides_top_category`)
+  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_accept_with_null_uses_top_category`, `test_accept_with_chosen_value_overrides_top_category`, `test_accept_unknown_category_value_is_422`, `test_accept_with_a_lone_surrogate_category_is_422_and_changes_nothing`)
 - **RES-PURPOSE-11.** Dismiss sets only `purpose_suggestion_dismissed_at` and keeps the
   suggestion. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`dismiss_purpose_suggestion`) \
@@ -1230,7 +1238,7 @@ sweep, and event delivery never return an error to a caller.
 | 422 | validation list | PATCH with an empty or over-cap `device_ids` | RES-PATCH-6 |
 | 422 | validation list | list: unknown sort field or direction, unknown status, naive or bad timestamp, search over 200 characters | RES-LIST-3, RES-LIST-6, RES-LIST-8 |
 | 422 | validation list | calendar without `range_start` or `range_end`; internal route without the token header | RES-CAL-1, RES-INTERNAL-1 |
-| 422 | `Unknown purpose_category '<value>'; allowed: <list>` | an unknown category on create, purpose-category PATCH, accept, or the list filter | RES-PURPOSE-1, RES-PURPOSE-10, RES-LIST-7 |
+| 422 | `Unknown purpose_category; allowed: <list>` | an unknown category on create, purpose-category PATCH, accept, or the list filter | RES-PURPOSE-1, RES-PURPOSE-10, RES-LIST-7 |
 | 422 | `Device <id> not found in inventory` | create names a device that does not exist or that the caller cannot see | RES-CREATE-8, RES-CREATE-9 |
 | 422 | `All devices must share the same topology type. Found: ...` | create mixes physical and cloud devices | RES-CREATE-10 |
 | 422 | `The following devices are not available: <names>` | create that starts now names a device not available | RES-CREATE-11 |

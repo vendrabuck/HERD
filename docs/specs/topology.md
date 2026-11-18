@@ -191,7 +191,7 @@ writer's row lock.
 | GET | `/topologies/{id}/versions/{vid}` | any signed-in user | 200 | TOPO-VER-2, TOPO-STRIP-3 |
 | POST | `/topologies/{id}/versions/{vid}/restore` | creator, or any admin | 200 | TOPO-VER-4, TOPO-VER-5, TOPO-TVER-3 |
 | GET | `/topologies/export?format` | any signed-in user | 200 | TOPO-BULK-1 to TOPO-BULK-5 |
-| POST | `/topologies/import?format&dry_run` | any signed-in user; updates creator or admin per row | 200 | TOPO-BULK-5 to TOPO-BULK-18 |
+| POST | `/topologies/import?format&dry_run` | any signed-in user; updates creator or admin per row | 200 | TOPO-BULK-5 to TOPO-BULK-19 |
 | GET | `/templates` | any signed-in user | 200 | TOPO-TMPL-1 |
 | POST | `/templates` | any signed-in user | 201 | TOPO-TMPL-2, TOPO-TMPL-3 |
 | POST | `/templates/from-topology/{topology_id}` | any signed-in user | 201 | TOPO-TMPL-5, TOPO-TMPL-6, TOPO-TMPL-7 |
@@ -1263,6 +1263,18 @@ is the user guide.
   `skipped`, and `rejected`. \
   Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`, `_tally`) \
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_one_bad_topology_does_not_abort_batch`); `services/cabling/tests/test_route_handlers_direct.py` (`test_import_unexpected_exception_rejects_row`, `test_import_http_exception_inside_loop_rejects_row`)
+- **TOPO-BULK-19.** A file, CSV or JSON, that is not valid UTF-8 (a Latin-1 file, or a
+  surrogate written as raw bytes) answers 422 `Import file must be UTF-8 encoded; re-save
+  it as UTF-8 and retry`, the wording inventory's importers use (INV-BULK-20 in
+  `inventory.md`), and nothing is written; it was a 500. A JSON file whose parsed
+  document holds a lone surrogate (an escape such as `\ud800` with no pair) anywhere
+  answers 422 `Import file holds a lone surrogate escape, which is not valid text; fix
+  it and retry` and nothing is written: the upload is multipart, which the shared body
+  check (OPS-VALID-6 in `operations-and-observability.md`) passes through, so the
+  importer checks the JSON it parses itself. A character outside the BMP written as an
+  escaped pair is imported. \
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`_decode_import`, `parse_json_topologies`, `parse_csv_topologies`, `IMPORT_NOT_UTF8_DETAIL`, `IMPORT_NOT_TEXT_DETAIL`); `services/common/herd_common/validation_errors.py` (`lone_surrogate_locs`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_non_utf8_import_file_is_422_naming_the_encoding`, `test_a_json_import_holding_a_lone_surrogate_is_a_fixed_422`, `test_a_json_import_with_a_surrogate_pair_escape_is_not_refused`)
 
 **Out of scope.** Device and inventory template import is `inventory.md`.
 
@@ -1683,6 +1695,7 @@ other error carries `detail` as a string or the object shown.
 | 422 | `Devices belong to different device groups and share none; cross-group cabling is disabled.` | cabling across disjoint device groups; per row in bulk | TOPO-BOUND-1 |
 | 422 | `missing assignment for role '<role>'` | instantiate without a device for a role | TOPO-TMPL-8 |
 | 422 | `Invalid JSON: <error>`, `JSON import must be a list of topologies or an object with an 'items' list`, `'items' must be a list` | an unparseable or misshapen JSON import | TOPO-BULK-7 |
+| 422 | `Import file must be UTF-8 encoded; re-save it as UTF-8 and retry`, `Import file holds a lone surrogate escape, which is not valid text; fix it and retry` | an import file that is not UTF-8, or a JSON import holding a lone surrogate | TOPO-BULK-19 |
 | 422 | `{"error": "l3_intent_malformed", "node_id", "message"}` | fork save with malformed routing intent | TOPO-FORK-14 |
 | 422 | validation list | a schema bound: name lengths, bulk item count, pair count, unknown sort or owner value, missing `member_device_ids`, missing internal token header, devices batch size | TOPO-CONN-2, TOPO-CONN-12, TOPO-PATH-7, TOPO-LIST-4, TOPO-CRUD-1, TOPO-FORK-3, TOPO-FORK-13, TOPO-DEVB-1 |
 | 500 | `internal: missing Authorization header while resolving device visibility` | a non-admin request reaching a visibility-filtered route with no header (only a test harness does this) | TOPO-VIS-1 |

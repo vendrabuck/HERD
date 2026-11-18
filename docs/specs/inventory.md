@@ -1029,9 +1029,12 @@ under `/hypervisors`.
   Enforced in: `services/inventory/app/services/hypervisor_service.py` (`validate_secret_exists`) \
   Pinned by: `services/inventory/tests/test_hypervisors.py` (`test_create_hypervisor_missing_secret_422`)
 - **INV-HYP-4.** A transport error or any other non-200 answer from the secrets service
-  fails closed with 503. \
-  Enforced in: `services/inventory/app/services/hypervisor_service.py` (`validate_secret_exists`) \
-  Pinned by: `services/inventory/tests/test_hypervisors.py` (`test_create_hypervisor_secrets_transport_error_503`, `test_create_hypervisor_secrets_5xx_503`)
+  fails closed with 503, except a 409: the secret exists but its stored data cannot be
+  read until an admin replaces it (OPS-SECRET-19 in `operations-and-observability.md`),
+  which answers 422 `Secret data cannot be read; an admin must replace it in the secrets
+  service`, a fix for the caller rather than an outage. \
+  Enforced in: `services/inventory/app/services/hypervisor_service.py` (`validate_secret_exists`, `SECRET_UNREADABLE_DETAIL`) \
+  Pinned by: `services/inventory/tests/test_hypervisors.py` (`test_create_hypervisor_secrets_transport_error_503`, `test_create_hypervisor_secrets_5xx_503`, `test_create_hypervisor_with_an_unreadable_secret_is_422_not_503`)
 - **INV-HYP-5.** An update changes only the fields it names and does not consult the
   secrets service when `secret_id` is absent or unchanged. \
   Enforced in: `services/inventory/app/services/hypervisor_service.py` (`update_hypervisor`) \
@@ -1204,6 +1207,19 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   encoded; re-save it as UTF-8 and retry` for the whole file, and nothing is written. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`parse_import`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_non_utf8_import_file_is_422_naming_the_encoding`)
+- **INV-BULK-22.** A JSON import file whose parsed document holds a lone surrogate (an
+  escape such as `\ud800` with no pair) anywhere, a value, a key, or nested, answers 422
+  `Import file holds a lone surrogate escape, which is not valid text; fix it and retry`
+  for the whole file, and nothing is written. A CSV row whose JSON cell (`field_data`,
+  `sections`) holds one is rejected with the reason `a JSON cell holds a lone surrogate
+  escape, which is not valid text`; the other rows are imported. The file is a
+  multipart upload, which the shared body check (OPS-VALID-6) passes through, so the
+  importer checks the JSON it parses itself. Before issue #1456's sweep a device or
+  template name holding one made the report unencodable (a 500), and one in
+  `field_data` was stored, so every later read of the device could not encode it. A
+  character outside the BMP written as an escaped pair is imported. \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_json`, `_coerce_json_cell`, `IMPORT_NOT_TEXT_DETAIL`, `JSON_CELL_NOT_TEXT_REASON`); `services/common/herd_common/validation_errors.py` (`lone_surrogate_locs`) \
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_json_import_holding_a_lone_surrogate_is_a_fixed_422`, `test_a_csv_json_cell_holding_a_lone_surrogate_rejects_that_row_only`)
 - **INV-BULK-21.** A device export, CSV or JSON, leaves out every dynamic-instance device
   (a device carrying a `request_id`); every other device is exported. An instance device
   lives only as long as its reservation, and its dynamic template cannot hold a device,
@@ -1443,6 +1459,8 @@ other error carries `detail` as a string or as the object shown.
 | 422 | `Secret does not exist` | hypervisor with an unknown secret | INV-HYP-3, INV-HYP-6 |
 | 422 | `Invalid JSON: ...`, `JSON import must be a list of records or an object with an 'items' list`, `'items' must be a list` | unparseable JSON import | INV-BULK-4 |
 | 422 | `Import file must be UTF-8 encoded; re-save it as UTF-8 and retry` | an import file that is not valid UTF-8 | INV-BULK-20 |
+| 422 | `Import file holds a lone surrogate escape, which is not valid text; fix it and retry` | a JSON import file holding a lone surrogate | INV-BULK-22 |
+| 422 | `Secret data cannot be read; an admin must replace it in the secrets service` | hypervisor with a secret whose stored data the secrets service cannot return | INV-HYP-4, INV-HYP-6 |
 | 422 | `generated port names would exceed 255 characters; ...` (validation list) | a bulk port create whose last generated name is too long | INV-PORT-6 |
 | 500 | `internal: missing Authorization header while resolving user groups` or `... group names` | a visibility or name lookup with no header to forward | INV-VIS-3 |
 | 500 | `Internal Server Error` (the framework's unhandled-error answer) | the driver archive could not be stored on upload or file replace; no row is committed or changed | INV-DRV-20 |

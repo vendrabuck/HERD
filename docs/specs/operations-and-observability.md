@@ -125,12 +125,12 @@ while it is still due, so concurrent schedulers and replicas poll disjoint rows
 | POST | `/change-password` (config) | config session | 200 | OPS-CONFIG-8 |
 | GET | `/schema` (config) | anyone | 200 | OPS-CONFIG-10 |
 | GET | `/settings` (config) | config session | 200 | OPS-CONFIG-10 |
-| PUT | `/settings` (config) | config session, password rotated | 200 | OPS-CONFIG-9, OPS-CONFIG-11, OPS-CONFIG-12, OPS-CONFIG-23 |
+| PUT | `/settings` (config) | config session, password rotated | 200 | OPS-CONFIG-9, OPS-CONFIG-11, OPS-CONFIG-12, OPS-CONFIG-23, OPS-CONFIG-31 |
 | POST | `/apply` (config) | config session, password rotated | 200 | OPS-CONFIG-9, OPS-CONFIG-13 to OPS-CONFIG-16, OPS-CONFIG-24 |
 | POST | `/secrets` (secrets) | admin | 201 | OPS-SECRET-1, OPS-SECRET-2 |
 | GET | `/secrets` (secrets) | any signed-in user | 200 | OPS-SECRET-5 |
 | GET | `/secrets/{secret_id}` (secrets) | admin, or a `view` or `manage` grant | 200 | OPS-SECRET-6 |
-| GET | `/secrets/{secret_id}/value` (secrets) | admin, or a `manage` grant | 200 | OPS-SECRET-7, OPS-SECRET-8 |
+| GET | `/secrets/{secret_id}/value` (secrets) | admin, or a `manage` grant | 200 | OPS-SECRET-7, OPS-SECRET-8, OPS-SECRET-19 |
 | PUT | `/secrets/{secret_id}` (secrets) | admin | 200 | OPS-SECRET-11 |
 | DELETE | `/secrets/{secret_id}` (secrets) | admin | 204 | OPS-SECRET-12 to OPS-SECRET-14 |
 | POST | `/keys/rotate` (secrets) | admin | 200 | OPS-SECRET-17, OPS-SECRET-18 |
@@ -165,8 +165,8 @@ never fails the message (`provisioning-and-wiring.md`, WIRE-GATE-1, WIRE-DISPATC
 
 | Method | Path | Auth | Caller | Answers | Rules |
 |---|---|---|---|---|---|
-| GET | `/internal/secrets/{secret_id}/value` (secrets) | `X-Internal-Token` | execution (hypervisor credentials, `dynamic-resources.md`), inventory (hypervisor registration, `inventory.md`) | `{id, name, data}` | OPS-SECRET-9, OPS-SECRET-10 |
-| GET | `/internal/secrets/by-name/{name}/value` (secrets) | `X-Internal-Token` | none in the services today | `{id, name, data}` | OPS-SECRET-9, OPS-SECRET-10 |
+| GET | `/internal/secrets/{secret_id}/value` (secrets) | `X-Internal-Token` | execution (hypervisor credentials, `dynamic-resources.md`), inventory (hypervisor registration, `inventory.md`) | `{id, name, data}` | OPS-SECRET-9, OPS-SECRET-10, OPS-SECRET-19 |
+| GET | `/internal/secrets/by-name/{name}/value` (secrets) | `X-Internal-Token` | none in the services today | `{id, name, data}` | OPS-SECRET-9, OPS-SECRET-10, OPS-SECRET-19 |
 | GET | `/preferences/internal?user_id` (user-profile) | `X-Internal-Token` | notifications (channel and event opt-outs) | the user's preferences, created empty if missing | OPS-PREF-7 |
 | POST | `/device-check` (execution) | `X-Internal-Token` | none in the services today | `{run_id, device_id, status, output, error}` | OPS-HEALTH-6 to OPS-HEALTH-10 |
 | POST | `/restart` (restarter) | none; reachable only on the internal `herd-ctl` network | config (`POST /apply`) | `{restarted, errors}`, or 409 | OPS-CONFIG-13, OPS-CONFIG-25 to OPS-CONFIG-28 |
@@ -757,9 +757,21 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   installs (OPS-VALID-1 to OPS-VALID-5), its code pinned identical to it, because the
   config service imports neither `herd_common` nor auth; before it, `{"password":
   ["\ud800"]}` on login and `{"np": "abcdefg\ud800"}` on change-password were 500s and
-  every other refusal echoed its input. \
+  every other refusal echoed its input. The copy carries the shared body check for a
+  lone surrogate (OPS-VALID-6) too, but config installs it with
+  `refuse_lone_surrogates=False`, by decision: its password answers below (OPS-CONFIG-8,
+  a 401 at login) are its own, and its settings save refuses a surrogate itself
+  (OPS-CONFIG-31). \
   Enforced in: `services/config/app/validation_errors.py` (`validation_error_handler`, `render_validation_errors`, `install_validation_errors`, `restrict_validation_error_schema`, `RENDERED_KEYS`); `services/config/app/main.py` (`app`) \
   Pinned by: `services/config/tests/test_validation_errors.py` (`test_the_handler_is_installed_for_request_validation_errors`, `test_the_handler_keeps_type_loc_msg_and_drops_input_ctx_and_everything_else`, `test_the_handler_replaces_a_lone_surrogate_in_loc_and_msg_and_keeps_integers`, `test_the_handler_keeps_honest_non_ascii_text_unchanged`, `test_the_openapi_document_advertises_exactly_the_rendered_keys`, `test_every_rendered_error_has_exactly_the_advertised_keys`, `test_login_never_echoes_the_password`, `test_change_password_never_echoes_the_password`, `test_save_settings_never_echoes_a_secret_in_a_malformed_body`, `test_the_review_inputs_are_a_clean_422`, `test_the_code_is_identical_to_the_shared_module`)
+- **OPS-CONFIG-31.** A settings save whose `values` hold a lone surrogate in any key or
+  value, nested included, is refused first, before the unknown-key and required-field
+  checks, with 422 `{"errors": ["Settings must be valid UTF-8 text"]}`, and writes
+  nothing. Before it, a value was written to `config.json`, which every service reads
+  its settings from, and an unknown key holding one made the unknown-key detail
+  unencodable (a 500). Other non-ASCII text and a character outside the BMP are saved. \
+  Enforced in: `services/config/app/main.py` (`update_settings`, `SETTINGS_NOT_UTF8_DETAIL`); `services/config/app/validation_errors.py` (`lone_surrogate_locs`) \
+  Pinned by: `services/config/tests/test_config.py` (`test_a_lone_surrogate_is_the_fixed_422_and_writes_nothing`, `test_a_surrogate_pair_and_other_non_ascii_text_are_saved`)
 
 **Out of scope.** The superadmin seed that reads `SUPERADMIN_*` (`identity-and-access.md`,
 IAM-BOOT-1 to IAM-BOOT-5); the meaning of each field (each area's Configuration section).
@@ -1176,9 +1188,11 @@ check one device now, through the same login, status, and logout sequence a poll
   first, never-polled last. \
   Enforced in: `services/execution/app/routers/health.py` (`list_device_health`) \
   Pinned by: `services/execution/tests/test_health_endpoints.py` (`test_list_health_admin_only`, `test_list_health_pagination_and_filter`)
-- **OPS-HEALTH-4.** An unknown `last_status` filter answers 422 `Invalid last_status:
-  <value>` only when it matches no row. \
-  Enforced in: `services/execution/app/routers/health.py` (`list_device_health`) \
+- **OPS-HEALTH-4.** An unknown `last_status` filter answers 422 `Unknown last_status;
+  allowed: UNKNOWN, HEALTHY, DEGRADED, UNREACHABLE` only when it matches no row. The
+  detail never holds the submitted value (it read `Invalid last_status: <value>` before
+  issue #1458's sweep). \
+  Enforced in: `services/execution/app/routers/health.py` (`list_device_health`, `HEALTH_STATUSES`); `services/common/herd_common/error_details.py` (`unknown_value_detail`) \
   Pinned by: `services/execution/tests/test_health_endpoints.py` (`test_list_health_invalid_status_filter_returns_422`)
 - **OPS-HEALTH-5.** The badge shows Healthy, Degraded, Unreachable, or Unknown, with the
   last poll time (or Never polled) as its tooltip, and a placeholder while loading. \
@@ -1242,9 +1256,14 @@ hypervisor page's secret selector (`inventory.md`); key rotation in
 - **OPS-SECRET-1.** `POST /secrets` is admin only and takes a `name` of 1 to 255
   characters, a `type` of `api_key`, `ssh_key`, `password`, `token`, or `generic`
   (default `generic`), an optional `description` up to 1024 characters, and a non-empty
-  `data` object of string values; it answers 201 with metadata only. \
-  Enforced in: `services/secrets/app/routers/secrets.py` (`create_secret`); `services/secrets/app/schemas/secret.py` (`SecretCreate`, `SecretResponse`) \
-  Pinned by: `services/secrets/tests/test_api.py` (`test_admin_create_returns_metadata_only`, `test_empty_data_is_422`, `test_non_admin_cannot_create`)
+  `data` object of string values; it answers 201 with metadata only. A `data` key or
+  value holding a lone surrogate is refused with the shared 422 `string_unicode`
+  (OPS-VALID-6) and nothing is stored: before issue #1456 the plain `dict[str, str]`
+  accepted one, and every reveal of the stored secret then answered 500 (a value) or
+  returned a changed key (U+FFFD in place of the surrogate). Other non-ASCII text, a
+  character outside the BMP, and a NUL in a value are stored and returned unchanged. \
+  Enforced in: `services/secrets/app/routers/secrets.py` (`create_secret`); `services/secrets/app/schemas/secret.py` (`SecretCreate`, `SecretResponse`); `services/common/herd_common/validation_errors.py` (`RefuseLoneSurrogates`) \
+  Pinned by: `services/secrets/tests/test_api.py` (`test_admin_create_returns_metadata_only`, `test_empty_data_is_422`, `test_non_admin_cannot_create`); `services/secrets/tests/test_unencodable_data.py` (`test_a_create_holding_a_lone_surrogate_is_422_and_stores_nothing`, `test_honest_data_sent_escaped_round_trips_exactly`); `tests/integration/test_secrets_flow.py` (`test_a_lone_surrogate_in_data_is_refused_and_nothing_is_stored`)
 - **OPS-SECRET-2.** A taken name is 409 `A secret with this name already exists`. \
   Enforced in: `services/secrets/app/routers/secrets.py` (`create_secret`) \
   Pinned by: `services/secrets/tests/test_api.py` (`test_duplicate_name_is_409`); `services/secrets/tests/test_routers_direct.py` (`test_create_secret_direct_duplicate_name_is_409`)
@@ -1284,9 +1303,11 @@ hypervisor page's secret selector (`inventory.md`); key rotation in
   Pinned by: `services/secrets/tests/test_internal_router_direct.py` (`test_check_internal_token_wrong_token_raises_403`, `test_check_internal_token_empty_token_raises_403`, `test_internal_reveal_by_id_direct_wrong_token_raises_before_lookup`); `services/secrets/tests/test_api.py` (`test_internal_wrong_token_is_403`)
 - **OPS-SECRET-11.** `PUT /secrets/{secret_id}` is admin only and replaces the type and
   description when given; a given `data` replaces the whole object, re-encrypted under the
-  active key, and without it the ciphertext is untouched. The name cannot change. \
+  active key, and without it the ciphertext is untouched. The name cannot change. A
+  `data` key or value holding a lone surrogate is refused as on create (OPS-SECRET-1)
+  and the stored data is kept. \
   Enforced in: `services/secrets/app/routers/secrets.py` (`update_secret`); `services/secrets/app/schemas/secret.py` (`SecretUpdate`) \
-  Pinned by: `services/secrets/tests/test_api.py` (`test_update_data_reencrypts`); `services/secrets/tests/test_routers_direct.py` (`test_update_secret_direct_reencrypts_and_updates_metadata`, `test_update_secret_direct_no_data_leaves_ciphertext_untouched`, `test_update_secret_direct_not_found`)
+  Pinned by: `services/secrets/tests/test_api.py` (`test_update_data_reencrypts`); `services/secrets/tests/test_routers_direct.py` (`test_update_secret_direct_reencrypts_and_updates_metadata`, `test_update_secret_direct_no_data_leaves_ciphertext_untouched`, `test_update_secret_direct_not_found`); `services/secrets/tests/test_unencodable_data.py` (`test_an_update_holding_a_lone_surrogate_is_422_and_keeps_the_old_data`)
 - **OPS-SECRET-12.** `DELETE /secrets/{secret_id}` is admin only, answers 204, and 404 for
   an unknown id. \
   Enforced in: `services/secrets/app/routers/secrets.py` (`delete_secret`) \
@@ -1329,6 +1350,19 @@ hypervisor page's secret selector (`inventory.md`); key rotation in
   `Another key rotation committed first; nothing was changed. Retry.`; it never answers 500. \
   Enforced in: `services/secrets/app/services/keyring.py` (`rotate_dek`, `DEK_ROTATION_LOCK_KEY`); `services/secrets/app/routers/secrets.py` (`rotate_keys`) \
   Pinned by: `services/secrets/tests/test_keyring.py` (`test_rotation_takes_the_lock_before_reading_the_key_table`, `test_concurrent_rotation_conflict_is_refused_and_changes_nothing`); `services/secrets/tests/test_api.py` (`test_rotation_conflict_is_409_not_500`)
+- **OPS-SECRET-19.** A secret stored before OPS-SECRET-1 refused a lone surrogate can
+  hold one in a `data` key or value. Its reveal, the user reveal and both internal reveals,
+  fails closed: 409 `Stored secret data is not valid UTF-8 text; an admin must replace it
+  with PUT /secrets/{secret_id}`, logged at error with the secret's id and nothing from
+  its data, never a 500 and never the data with the surrogate replaced (a credential is
+  returned as stored or not at all). Metadata, the list, rotation, a PUT of new `data`
+  (which restores reveals), and delete work as for any secret. Inventory answers the 409
+  at hypervisor registration with a 422 (`inventory.md`), and execution's secret fetch
+  treats it as permanent, like a 404, so the message is not retried. By decision (issue
+  #1456): returning the value with U+FFFD and a flag would hand a consumer a credential
+  that differs from the stored one. \
+  Enforced in: `services/secrets/app/services/keyring.py` (`deserialize_data`, `SecretDataUnreadableError`, `secret_data_unreadable_http`, `SECRET_DATA_UNREADABLE_DETAIL`); `services/secrets/app/routers/secrets.py` (`_decrypt`); `services/secrets/app/routers/internal.py` (`_reveal`) \
+  Pinned by: `services/secrets/tests/test_unencodable_data.py` (`test_deserialize_refuses_data_holding_a_lone_surrogate`, `test_deserialize_returns_honest_data_unchanged`, `test_a_stored_lone_surrogate_is_a_fixed_409_on_every_reveal`, `test_a_stored_lone_surrogate_leaves_metadata_rotation_and_replacement_working`); `services/execution/tests/test_nats_consumer.py` (`test_fetch_secret_value_returns_none_on_an_unreadable_secret_409`)
 
 **Out of scope.** Granting `view` and `manage` (`identity-and-access.md`); hypervisor
 registration and its secret check (`inventory.md`); how execution uses a hypervisor
@@ -1608,12 +1642,16 @@ holding what was sent (OPS-VALID-3 lists the text a message can still quote). So
 a refused request cannot copy a password, a secret's plaintext, a webhook signing
 secret, or a device's credential fields into the answer, a proxy log, or a browser
 toast, and no body that fails validation turns the 422 into a 500 (OPS-VALID-2,
-OPS-VALID-5).
+OPS-VALID-5). A body holding text that cannot be encoded as UTF-8 (a lone surrogate,
+written as an escape such as `\ud800` with no pair) is refused the same way in every
+service, whatever field holds it, so no such text is stored, forwarded, or echoed
+(OPS-VALID-6).
 
-**Surfaces.** `services/common/herd_common/validation_errors.py`, the ONE handler, which
-each service's `app/main.py` installs; the config service's standalone copy,
-`services/config/app/validation_errors.py` (OPS-CONFIG-30); the wiring guard
-`tests/unit/test_validation_errors_wiring.py`.
+**Surfaces.** `services/common/herd_common/validation_errors.py`, the ONE handler and
+body check, which each service's `app/main.py` installs; the config service's
+standalone copy, `services/config/app/validation_errors.py` (OPS-CONFIG-30); the wiring
+guard `tests/unit/test_validation_errors_wiring.py`; `services/common/herd_common/error_details.py`,
+the ONE detail for a value outside a fixed set (OPS-VALID-7).
 
 **Rules.**
 
@@ -1632,7 +1670,10 @@ each service's `app/main.py` installs; the config service's standalone copy,
   U+FFFD, so an error this handler renders always encodes as UTF-8. A constrained
   string (a length bound, a pattern) refuses a surrogate as `string_unicode` with a
   fixed message, but a plain `str` and the keys and values of a `dict[str, str]`
-  accept one, so a key of a free-form mapping can carry one into `loc`. \
+  accept one, so a key of a free-form mapping could carry one into `loc`. Since
+  OPS-VALID-6 no request body reaches the schema holding one in a service that installs
+  the body check, so the replacement is defense in depth there; it is the rule in the
+  config service, which installs its copy without the check. \
   Enforced in: `services/common/herd_common/validation_errors.py` (`_encodable`, `render_validation_errors`) \
   Pinned by: `services/common/tests/test_validation_errors.py` (`test_the_handler_replaces_a_lone_surrogate_in_loc_and_msg_and_keeps_integers`, `test_the_handler_keeps_honest_non_ascii_text_unchanged`)
 - **OPS-VALID-3.** It is not a promise that no submitted text appears, by decision (the
@@ -1649,14 +1690,17 @@ each service's `app/main.py` installs; the config service's standalone copy,
   Pinned by: `services/common/tests/test_validation_errors.py` (`test_an_installed_app_still_names_a_refused_key_in_loc`); `services/secrets/tests/test_validation_errors.py` (`test_loc_still_names_a_data_key_but_never_its_value_by_documented_limit`); `services/inventory/tests/test_validation_errors.py` (`test_msg_can_still_quote_a_dropdown_default_by_documented_limit`); `services/auth/tests/test_password_input_validation.py` (`test_msg_and_loc_can_still_quote_submitted_text`)
 - **OPS-VALID-4.** Every service app installs the handler: each `app/main.py` passes
   every app it builds to `install_validation_errors` from `herd_common.validation_errors`
-  in a module-level statement, except the config service, which installs its standalone
-  copy because it must not import `herd_common`; the copy's code, docstrings aside, is
+  in a module-level statement with no other argument, which also installs the body check
+  (OPS-VALID-6), except the config service, which installs its standalone copy because
+  it must not import `herd_common`, and passes exactly `refuse_lone_surrogates=False`
+  (by decision: it answers a lone surrogate in a password itself, OPS-CONFIG-8, and its
+  settings save refuses one, OPS-CONFIG-31); the copy's code, docstrings aside, is
   identical to the shared module's. No module under a service's `app/` builds another
   FastAPI app, registers its own `RequestValidationError` handler, or replaces an app's
   `openapi`. The guard finds the services from the `services/` directory, so a new
   service is checked with no edit; its limits are in its module docstring. \
   Enforced in: `services/acl/app/main.py` (`install_validation_errors`); `services/ai-orchestrator/app/main.py` (`install_validation_errors`); `services/auth/app/main.py` (`install_validation_errors`); `services/cabling/app/main.py` (`install_validation_errors`); `services/execution/app/main.py` (`install_validation_errors`); `services/integration/app/main.py` (`install_validation_errors`); `services/inventory/app/main.py` (`install_validation_errors`); `services/notifications/app/main.py` (`install_validation_errors`); `services/reservations/app/main.py` (`install_validation_errors`); `services/secrets/app/main.py` (`install_validation_errors`); `services/user-profile/app/main.py` (`install_validation_errors`); `services/config/app/main.py` (`install_validation_errors`); `tests/unit/test_validation_errors_wiring.py` (`service_dirs`, `install_problems`, `foreign_registrations`, `STANDALONE_COPY`) \
-  Pinned by: `tests/unit/test_validation_errors_wiring.py` (`test_every_service_app_installs_the_shared_handler`, `test_no_other_module_builds_an_app_or_registers_another_handler`, `test_services_are_discovered_from_the_directory`, `test_fixture_mains_that_pass`, `test_fixture_mains_that_fail`, `test_config_must_install_its_copy_not_the_shared_module`, `test_a_new_service_without_the_line_fails`); `services/config/tests/test_validation_errors.py` (`test_the_code_is_identical_to_the_shared_module`, `test_the_code_comparison_sees_a_one_character_change`)
+  Pinned by: `tests/unit/test_validation_errors_wiring.py` (`test_every_service_app_installs_the_shared_handler`, `test_no_other_module_builds_an_app_or_registers_another_handler`, `test_services_are_discovered_from_the_directory`, `test_fixture_mains_that_pass`, `test_fixture_mains_that_fail`, `test_config_must_install_its_copy_not_the_shared_module`, `test_a_new_service_without_the_line_fails`, `test_only_an_exempt_service_may_opt_out_of_the_body_check`, `test_an_exempt_service_may_opt_out_only_with_exactly_that_keyword`); `services/config/tests/test_validation_errors.py` (`test_the_code_is_identical_to_the_shared_module`, `test_the_code_comparison_sees_a_one_character_change`, `test_config_installs_its_copy_without_the_body_check`)
 
 - **OPS-VALID-5.** A service's own validator never puts a submitted string into its
   error message as is; it quotes it with `repr` (or a list's `str`, which is the `repr`
@@ -1667,14 +1711,63 @@ each service's `app/main.py` installs; the config service's standalone copy,
   rule, `POST /templates` on inventory with a dropdown default or option of `"Z\ud800"`
   was such a 500 (#1455 review); the message now reads `Default 'x' is not in options:
   'a', 'b'`, the options newly quoted. No guard scans for the rule; the module
-  docstring of `herd_common.validation_errors` states it for validator authors. \
+  docstring of `herd_common.validation_errors` states it for validator authors. Since
+  OPS-VALID-6 a request body holding a lone surrogate is refused before any validator
+  runs, so through a route these three answer the body check's `string_unicode`; the
+  rule still holds for a validator run on any other data, and each one's `repr`
+  quoting is pinned on the schema directly. \
   Enforced in: `services/inventory/app/schemas/template.py` (`validate_options_and_default`); `services/integration/app/schemas/webhook.py` (`_validate_events`); `services/user-profile/app/schemas/preferences.py` (`_validate_page_sizes`) \
   Pinned by: `services/common/tests/test_validation_errors.py` (`test_a_validator_message_holding_a_lone_surrogate_is_a_500_the_handler_cannot_see`, `test_a_validator_message_quoting_with_repr_is_a_clean_422`); `services/inventory/tests/test_validation_errors.py` (`test_a_lone_surrogate_the_dropdown_message_quotes_is_a_422_not_a_500`); `services/integration/tests/test_validation_errors.py` (`test_a_lone_surrogate_in_an_unknown_event_type_is_a_422_not_a_500`); `services/user-profile/tests/test_validation_errors.py` (`test_a_lone_surrogate_in_a_page_sizes_key_is_a_422_not_a_500`)
 
+- **OPS-VALID-6.** Every service but config refuses a request body that holds a lone
+  surrogate (issues #1456, #1458, #1459): a plain `str` field, the keys and values of a
+  `dict[str, str]`, and a value typed `Any` accept one, and every later step that must
+  encode it as UTF-8 failed with a 500 (a JSON response, an httpx call to another
+  service, a database write, a NATS payload). `install_validation_errors` adds
+  `RefuseLoneSurrogates`, an ASGI middleware placed innermost: the first time a route
+  reads its body, the whole body is read and, if its parsed JSON holds a lone surrogate
+  in any string (a value, a key, nested, in a field of any type), the read is refused
+  with 422 `{"detail": [{"type": "string_unicode", "loc": [...], "msg": "Input should be
+  a valid string, unable to parse raw data as a unicode string"}]}`, pydantic's own type
+  and message. `loc` is `["body", ...]` ending at the string, or for a key at the object
+  that holds it; it never holds the surrogate or the value, and each location is listed
+  once, in document order. A valid surrogate pair written as two escapes is one code
+  point once parsed and is accepted, as is all other text, NUL included. The check runs
+  when the route reads its body, so an unknown route (404), a method not allowed (405),
+  and a route that takes no body answer as before; a route with a body reads it before
+  its dependencies run, so the refusal comes before authentication, as FastAPI's 422 for
+  a body that is not JSON does. A body that is not JSON passes through unchanged, and a
+  `multipart/*` body is passed through unread: Starlette decodes its fields strictly
+  (a file name falls back to Latin-1), and a query string, path, urlencoded form,
+  header, and cookie are percent-decoded with replacement or decoded as Latin-1, so
+  none can carry a lone surrogate. A JSON document a route parses itself from an
+  uploaded file is checked with `lone_surrogate_locs` by that route (`inventory.md`,
+  `topology.md`). Cost: at most three substring searches of the body; only a body
+  holding `\ud`, `\uD`, or the byte 0xED is searched with a regular expression, and only
+  one that matches is parsed a second time; a body JSON would not decode as UTF-8 (UTF-16,
+  UTF-32) is always parsed. Measured on a development host (one core) for JSON bodies of
+  about 1 MB: 0.26 ms with none of the markers, 5.7 ms when raw 0xED bytes of other
+  characters (Hangul) make the expression search run, and 24 to 30 ms when the body is
+  parsed (escaped surrogate pairs, or a lone surrogate). \
+  Enforced in: `services/common/herd_common/validation_errors.py` (`RefuseLoneSurrogates`, `body_lone_surrogate_errors`, `lone_surrogate_locs`, `install_validation_errors`, `STRING_UNICODE_MSG`) \
+  Pinned by: `services/common/tests/test_validation_errors.py` (`test_lone_surrogate_locs`, `test_lone_surrogate_locs_is_not_limited_by_the_recursion_limit`, `test_body_lone_surrogate_errors`, `test_the_message_is_pydantics_own_for_a_constrained_string`, `test_a_lone_surrogate_anywhere_in_a_body_is_a_clean_422`, `test_the_check_does_not_depend_on_the_content_type`, `test_without_the_check_those_bodies_reach_the_route`, `test_honest_text_is_accepted`, `test_a_route_that_reads_no_body_and_an_unknown_route_are_unchanged`, `test_the_refusal_comes_before_a_dependency_as_a_malformed_body_does`, `test_a_multipart_body_is_passed_through_and_cannot_carry_a_lone_surrogate`, `test_a_query_path_header_cookie_and_urlencoded_form_cannot_carry_one`, `test_a_body_split_across_messages_is_checked_whole`, `test_a_read_after_the_response_started_is_not_refused`, `test_the_refusal_survives_a_base_http_middleware_in_either_order`, `test_install_adds_the_check_unless_told_not_to`); `services/acl/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`, `test_an_escaped_surrogate_pair_is_not_refused_by_the_check`); `services/ai-orchestrator/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/auth/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_login_body_is_refused`); `services/cabling/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/execution/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/integration/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/inventory/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/notifications/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/reservations/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/secrets/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/user-profile/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`)
+- **OPS-VALID-7.** A detail a route builds itself for a value outside a fixed set names
+  the field and the allowed values, which are the service's own data, and never the
+  submitted value: `Unknown <field>; allowed: <a>, <b>`, built by the ONE helper
+  `unknown_value_detail` (issues #1458, #1459). An echo copied whatever a caller sent,
+  of any length, into the answer, a proxy log, and a toast. Its users are reservations'
+  `purpose_category` (RES-PURPOSE-1) and execution's `last_status` filter
+  (OPS-HEALTH-4); execution's internal execute names its one allowed action in fixed text
+  (CFG-EXEC-6). A detail may still quote an identifier the caller needs to see (a name in
+  a 409, an id that was not found, a field key it sent); since OPS-VALID-6 such text can
+  no longer hold a lone surrogate. \
+  Enforced in: `services/common/herd_common/error_details.py` (`unknown_value_detail`) \
+  Pinned by: `services/common/tests/test_error_details.py` (`test_the_detail_names_the_field_and_the_allowed_values_in_order`, `test_the_allowed_values_may_be_any_iterable`, `test_an_empty_allowed_set_still_names_the_field`)
+
 **Out of scope.** An error body a route builds itself (`HTTPException(detail=...)`) is
-not rendered by this handler; each such detail is its area's rule. What auth's and
-config's password fields refuse is IAM-REG-2, IAM-LOGIN-5 (`identity-and-access.md`),
-and OPS-CONFIG-8.
+not rendered by this handler; each such detail is its area's rule (OPS-VALID-7 for a
+value outside a fixed set). What auth's and config's password fields refuse is
+IAM-REG-2, IAM-LOGIN-5 (`identity-and-access.md`), and OPS-CONFIG-8.
 
 ## 9. Errors
 
@@ -1686,6 +1779,7 @@ and OPS-CONFIG-8.
 | 403 | `Change the config password before modifying or applying configuration` | config save or apply before the password is rotated | OPS-CONFIG-9 |
 | 422 | `Password must be at least 8 characters`, `Password must be at most 32 characters`, `Password must not contain a NUL character`, `Password must be valid UTF-8 text` | a new config password outside 8 to 32 characters, holding a NUL, or holding a lone surrogate (judged in that order) | OPS-CONFIG-8 |
 | 422 | `{"errors": ["<KEY> is required", ...]}` | a config save missing a required field, including a masked secret with no source | OPS-CONFIG-11, OPS-CONFIG-12 |
+| 422 | `{"errors": ["Settings must be valid UTF-8 text"]}` | a config save whose values hold a lone surrogate in a key or value (checked first) | OPS-CONFIG-31 |
 | 422 | `{"errors": ["Unknown settings: <KEY>, ..."]}` | a config save naming a key outside `CONFIG_SCHEMA` | OPS-CONFIG-12 |
 | 422 | `{"errors": ["AUTH_SECRET_KEY is unset, blank, or still a placeholder; ...", "AUTH_ALGORITHM must be one of HS256, HS384, HS512"]}` (either or both) | a config save with a missing, blank, or placeholder `AUTH_SECRET_KEY`, or a set `AUTH_ALGORITHM` outside the three | OPS-CONFIG-23 |
 | 400 | `No configuration to apply` | config apply with no `config.json` | OPS-CONFIG-15 |
@@ -1693,21 +1787,21 @@ and OPS-CONFIG-8.
 | 503 | `The config data directory is not writable; the config service log names the one-time fix` | a config write (login's first auth file, change-password, save) the data directory refuses | OPS-CONFIG-29 |
 | 503 | `The config password store is unusable; the config service log names the cause` | a config change-password, from a session issued earlier, while the auth file is unreadable or not a JSON object, or while there is no auth file and `CONFIG_ADMIN_PASSWORD` holds a value OPS-CONFIG-8's rule refuses | OPS-CONFIG-7, OPS-CONFIG-5 |
 | 422 | validation list, each item exactly `{type, loc, msg}` | a config login, change-password, or save body that is not the documented shape (a field missing or of the wrong type, a body that is not a JSON object) | OPS-CONFIG-30 |
-| 422 | validation list, each item exactly `{type, loc, msg}` | any request that does not have a route's documented shape, in every service | OPS-VALID-1, OPS-VALID-2, OPS-VALID-5 |
+| 422 | validation list, each item exactly `{type, loc, msg}` | any request that does not have a route's documented shape, in every service; a body holding a lone surrogate anywhere, in every service but config (`string_unicode`) | OPS-VALID-1, OPS-VALID-2, OPS-VALID-5, OPS-VALID-6 |
 | 409 | `A restart is already in progress` | a restarter `POST /restart` while another runs | OPS-CONFIG-27 |
 | 404 | `Not found` | a restarter request to any path but `/restart` and `/health` | OPS-CONFIG-25 |
 | 405 | `Method not allowed`, with `Allow` | a restarter request to `/restart` with a method other than POST, or to `/health` with one other than GET | OPS-CONFIG-25 |
 | 400 | `Transfer-Encoding is not accepted`, `Content-Length must be one whole number` | a restarter request with a chunked body or a Content-Length that is not one whole number | OPS-CONFIG-25 |
 | 413 | `Request body too large` | a restarter request body over 4096 bytes | OPS-CONFIG-25 |
 | 403 | `Admin or superadmin role required` | a non-admin lists health snapshots, reads a report, or writes a secret | OPS-HEALTH-3, OPS-REPORT-1, OPS-SECRET-1 |
-| 422 | `Invalid last_status: <value>` | an unknown health filter that matches nothing | OPS-HEALTH-4 |
+| 422 | `Unknown last_status; allowed: UNKNOWN, HEALTHY, DEGRADED, UNREACHABLE` | an unknown health filter that matches nothing | OPS-HEALTH-4 |
 | 500 | `Internal API token not configured` | a device check while execution has no internal token | OPS-HEALTH-6 |
 | 403 | `Invalid internal token` | a device check without the right token | OPS-HEALTH-6 |
 | 404 | `Device <id> not found`, `Template <id> not found` | a device check on a device or template inventory does not know | OPS-HEALTH-7 |
 | 503 | `Could not verify device visibility; nothing was returned. Retry the request.` | a non-admin health read whose visibility lookup cannot be answered | OPS-HEALTH-1 |
 | 503 | `Failed to fetch device: <reason>`, `Failed to fetch template: <reason>` (HERD-authored reason: an upstream status, `unreachable (<ClassName>)`, a malformed body, or a class name) | a device check when inventory cannot answer, or answers a body that is not a JSON object | OPS-HEALTH-7 |
 | 409 | `{"error": "device_has_no_driver", "message"}` | a device check on a device with no driver | OPS-HEALTH-7 |
-| 422 | validation list | a secret body outside the schema, an empty `data` | OPS-SECRET-1 |
+| 422 | validation list | a secret body outside the schema, an empty `data`, a lone surrogate in a `data` key or value | OPS-SECRET-1, OPS-SECRET-11 |
 | 409 | `A secret with this name already exists` | a taken secret name | OPS-SECRET-2 |
 | 404 | `Secret not found` | an unknown secret id or name, or a non-admin with no grant | OPS-SECRET-6, OPS-SECRET-8, OPS-SECRET-9, OPS-SECRET-12 |
 | 403 | `manage permission required` | reveal by a holder of `view` only | OPS-SECRET-8 |
@@ -1715,6 +1809,7 @@ and OPS-CONFIG-8.
 | 409 | `{"error": "secret_in_use", "hypervisor_ids", "hypervisor_names"}` | deleting a secret a hypervisor references | OPS-SECRET-13 |
 | 503 | `inventory service unreachable while checking secret references`, `inventory service returned an error while checking secret references` | the delete guard cannot ask inventory, or cannot read its 200 | OPS-SECRET-14 |
 | 409 | `Another key rotation committed first; nothing was changed. Retry.` | two rotations at once that the lock did not serialize | OPS-SECRET-18 |
+| 409 | `Stored secret data is not valid UTF-8 text; an admin must replace it with PUT /secrets/{secret_id}` | a reveal or internal reveal of a secret stored with a lone surrogate before OPS-SECRET-1 refused one | OPS-SECRET-19 |
 | 503 | `Secret key material is unavailable to this service` | a key version that is missing or does not unwrap under this process's key | OPS-SECRET-17 |
 | 401 | `Invalid subject in token` | a preferences route with a missing or non-UUID subject | OPS-PREF-1 |
 | 422 | validation list, or `merged <reason>` | a preferences body or merged result over a cap | OPS-PREF-4, OPS-PREF-5 |
@@ -1806,8 +1901,8 @@ to 500.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/common/tests/` (`test_logging.py`, `test_config_loader.py`, `test_base_settings.py`, `test_schema_init.py`, `test_consumer_schema_gate.py`, `test_outbox.py`, `test_jetstream.py`, `test_version.py`, `test_validation_errors.py`); `services/execution/tests/test_health_scheduler*.py`; `services/config/tests/`; `services/secrets/tests/test_crypto.py`, `test_keyring.py`; `services/reservations/tests/test_reporting_*.py`, `test_fleet_report.py`, `test_transit_gear_rollup.py`; `infra/restarter/tests/` (the restarter against a fake Docker daemon on a Unix socket, and its HTTP surface in process); the `tests/unit/` guards (`test_validation_errors_wiring.py`, `test_restarter_compose_guard.py`, `test_dockerfile_users.py`, `test_compose_settings_wiring.py`, `test_compose_ports.py`, `test_build_args_wiring.py`, `test_consumer_heartbeat_wiring.py`, `test_docs_nats_cli_form.py`, `test_check_image_matches_lock.py`); the frontend tests named in sections 8.3, 8.6, 8.11, and 8.14 | SQLite in memory; the scheduler's concurrency is driven within one process |
-| Functional (through the service API) | each service's `test_version.py` and `test_validation_errors.py`; `services/execution/tests/test_health_endpoints.py`; the device check tests in `services/execution/tests/test_api_endpoints.py`, `test_router_endpoints.py`, and `test_router_direct.py`; `services/config/tests/test_config.py`, `test_config_passwords.py`; `services/secrets/tests/test_api.py`; `services/user-profile/tests/test_preferences*.py`; the report route tests in `test_fleet_report.py` | httpx against the app |
+| Unit | `services/common/tests/` (`test_logging.py`, `test_config_loader.py`, `test_base_settings.py`, `test_schema_init.py`, `test_consumer_schema_gate.py`, `test_outbox.py`, `test_jetstream.py`, `test_version.py`, `test_validation_errors.py`, `test_error_details.py`); `services/execution/tests/test_health_scheduler*.py`; `services/config/tests/`; `services/secrets/tests/test_crypto.py`, `test_keyring.py`; `services/reservations/tests/test_reporting_*.py`, `test_fleet_report.py`, `test_transit_gear_rollup.py`; `infra/restarter/tests/` (the restarter against a fake Docker daemon on a Unix socket, and its HTTP surface in process); the `tests/unit/` guards (`test_validation_errors_wiring.py`, `test_restarter_compose_guard.py`, `test_dockerfile_users.py`, `test_compose_settings_wiring.py`, `test_compose_ports.py`, `test_build_args_wiring.py`, `test_consumer_heartbeat_wiring.py`, `test_docs_nats_cli_form.py`, `test_check_image_matches_lock.py`); the frontend tests named in sections 8.3, 8.6, 8.11, and 8.14 | SQLite in memory; the scheduler's concurrency is driven within one process |
+| Functional (through the service API) | each service's `test_version.py` and `test_validation_errors.py`; `services/execution/tests/test_health_endpoints.py`; the device check tests in `services/execution/tests/test_api_endpoints.py`, `test_router_endpoints.py`, and `test_router_direct.py`; `services/config/tests/test_config.py`, `test_config_passwords.py`; `services/secrets/tests/test_api.py`, `test_unencodable_data.py`; `services/user-profile/tests/test_preferences*.py`; the report route tests in `test_fleet_report.py` | httpx against the app |
 | Integration (running stack) | `tests/integration/test_restarter_isolation.py` (no socket in config, config not root, the restarter answering on `herd-ctl` and unresolvable from `herd-net`; it never restarts; the absence of a gateway route is pinned statically by OPS-GUARD-6, since Traefik could not reach `herd-ctl` even with labels), `tests/integration/test_device_check_internal_fetch.py`, `test_outbox_durability.py`, `test_nats_consumer_configs_live.py`, `test_health_alerting_flow.py`, `test_secrets_flow.py`, `test_reporting.py`, `test_dlq_and_idempotency.py`; the live-Postgres suite `services/common/tests/test_outbox_wake_live_pg.py` | No running-stack integration test sends a restart (the nightly browser step does), covers a scheduler poll end to end (the alerting test publishes its own events), or covers a JetStream store surviving a recreate |
 | Stress and load | `tests/load/locustfile.py` ([LOAD_TESTING.md](../LOAD_TESTING.md)) | The load test drives reservations, inventory, ACL, export, validation, notifications, and bulk cabling; none of its users polls health, reads reports, or touches secrets or the config service. Save and Restart cannot be load tested, since a restart bounces the stack under test; its concurrency property (one pass at a time under twenty concurrent calls) is pinned at the unit level (OPS-CONFIG-27). Scheduler fleet scale is covered only by the unit bounds in section 8.10 |
 | Browser end-to-end | `tests/e2e/test_about_page_playwright.py`, `tests/e2e/test_config_playwright.py` (Save and Restart runs only with `HERD_E2E_RESTART=1`, which nightly.yml sets in its last test step), `tests/e2e/test_config.py`, `tests/e2e/test_reporting_page.py` | No browser test covers the health badge or the help link |
@@ -1866,6 +1961,14 @@ None at present.
 - The config session ends on every config-service restart unless
   `CONFIG_SESSION_SECRET` is set (OPS-CONFIG-17). Recorded in issue #246 and the
   docstring of `_load_session_secret`.
+- The config service installs the shared 422 handler without the body check for a
+  lone surrogate (OPS-VALID-4, OPS-VALID-6): its password routes keep their own answers
+  (OPS-CONFIG-8) and its settings save refuses one itself (OPS-CONFIG-31). Recorded in
+  the module docstrings of `herd_common.validation_errors` and
+  `services/config/app/validation_errors.py`.
+- A secret stored with a lone surrogate before OPS-SECRET-1 refused one answers a 409 on
+  every reveal until an admin replaces its data; there is no sweep that lists such
+  secrets (OPS-SECRET-19). Recorded in issue #1456.
 
 ### Rules with no test
 
