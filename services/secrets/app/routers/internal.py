@@ -20,8 +20,10 @@ from app.schemas.secret import SecretValueResponse
 from app.services import crypto
 from app.services.keyring import (
     KeyVersionUnavailableError,
+    SecretDataUnreadableError,
     deserialize_data,
     key_unavailable_http,
+    secret_data_unreadable_http,
 )
 
 router = APIRouter(prefix="/internal/secrets", tags=["secrets-internal"])
@@ -47,7 +49,11 @@ async def _reveal(secret: Secret, request: Request, db: AsyncSession) -> SecretV
         secret_id=secret.id,
         key_version=secret.key_version,
     )
-    return SecretValueResponse(id=secret.id, name=secret.name, data=deserialize_data(plaintext))
+    try:
+        data = deserialize_data(plaintext)
+    except SecretDataUnreadableError:
+        raise secret_data_unreadable_http(secret.id) from None
+    return SecretValueResponse(id=secret.id, name=secret.name, data=data)
 
 
 @router.get("/{secret_id}/value", response_model=SecretValueResponse)

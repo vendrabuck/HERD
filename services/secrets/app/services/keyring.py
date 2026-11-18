@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from cryptography.exceptions import InvalidTag
 from fastapi import HTTPException
 from herd_common.advisory_lock import advisory_key_from_string, xact_lock
+from herd_common.validation_errors import lone_surrogate_locs
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +36,11 @@ DEK_ROTATION_LOCK_KEY = advisory_key_from_string("herd-secrets-dek-rotation")
 # number, no KEK detail (the log carries the version).
 KEY_VERSION_UNAVAILABLE_DETAIL = "Secret key material is unavailable to this service"
 ROTATION_CONFLICT_DETAIL = "Another key rotation committed first; nothing was changed. Retry."
+# A reveal of a secret whose stored data holds a lone surrogate (OPS-SECRET-19).
+SECRET_DATA_UNREADABLE_DETAIL = (
+    "Stored secret data is not valid UTF-8 text; an admin must replace it with "
+    "PUT /secrets/{secret_id}"
+)
 
 
 def key_unavailable_http(exc: "KeyVersionUnavailableError") -> HTTPException:
@@ -246,5 +252,34 @@ def serialize_data(data: dict) -> bytes:
     return json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
 
 
+class SecretDataUnreadableError(Exception):
+    """The decrypted data holds a lone surrogate in a key or a value.
+
+    Every create and update refuses one since issues #1455 and #1456 (the shared body
+    check), but a row written before them can hold one: `serialize_data` writes it as
+    an ASCII escape, so it encrypted, and the reveal response then could not be
+    encoded (a 500 on every reveal), or, for a key, came back with U+FFFD in place of
+    the surrogate. The reveal fails closed instead: it never returns a credential that
+    differs from the stored one. The message names nothing from the data."""
+
+    def __init__(self) -> None:
+        super().__init__("stored secret data is not valid UTF-8 text")
+
+
 def deserialize_data(plaintext: bytes) -> dict:
-    return json.loads(plaintext.decode())
+    """The data dict `serialize_data` stored. Raises SecretDataUnreadableError when a
+    key or a value holds a lone surrogate."""
+    data = json.loads(plaintext.decode())
+    if lone_surrogate_locs(data):
+        raise SecretDataUnreadableError
+    return data
+
+
+def secret_data_unreadable_http(secret_id: object) -> HTTPException:
+    """The 409 a reveal answers for SecretDataUnreadableError, logged with the id only."""
+    logger.error(
+        "secret %s holds data that is not valid UTF-8 text; replace it with PUT",
+        secret_id,
+        extra={"action": "secret_data_unreadable", "secret_id": str(secret_id)},
+    )
+    return HTTPException(status_code=409, detail=SECRET_DATA_UNREADABLE_DETAIL)
