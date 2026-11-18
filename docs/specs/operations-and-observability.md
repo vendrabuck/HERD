@@ -1766,7 +1766,7 @@ the ONE detail for a value outside a fixed set (OPS-VALID-7).
   `RefuseLoneSurrogates`, an ASGI middleware placed innermost. It looks only at a body
   FastAPI parses as JSON: content type `application/json` or an `application/*+json`
   subtype, decided with FastAPI's own header parsing; with `strict_content_type` on, as
-  everywhere in HERD (a wiring guard fails when a service turns it off), FastAPI does
+  everywhere in HERD (a wiring guard fails when a service's source sets the option at all; it is an AST scan and does not see `setattr` or `**kwargs`), FastAPI does
   not parse a body that has no content type, so neither does the check. Any other body
   (multipart, a form, `text/plain`, octet-stream, or none) is passed through unread and
   unbuffered; a query string, path, urlencoded form, multipart field, header, and
@@ -1822,7 +1822,9 @@ the ONE detail for a value outside a fixed set (OPS-VALID-7).
   literal prefix) and, with none, counts low and high surrogate escapes: a low one is
   lone exactly when there are more lows than highs. A raw UTF-8 surrogate is one more
   search. Every pass runs in C; time is linear in the body's length and memory at most
-  about two copies of the body, whatever its number of elements or escapes. It was
+  about two copies of the UTF-8 text, whatever its number of elements or escapes (a
+  UTF-16 or UTF-32 body is decoded first, so the scan alone peaked at 4.0 times the
+  body for a UTF-16 body holding a character outside the BMP). It was
   fuzzed against `json.loads` (2,600,000 bodies from two generators, zero mismatches on
   valid JSON: refused exactly when any member, also one a later duplicate key replaces,
   holds a lone surrogate). Measured through a FastAPI app whose route sits behind a
@@ -1830,8 +1832,10 @@ the ONE detail for a value outside a fixed set (OPS-VALID-7).
   check, at 1, 4, and 16 MB (observations, not a bound): a structural body refused for a
   trailing lone surrogate costs 0.01 to 0.10 times what the same request costs without
   the check, which parses it (chains of 900 nested lists 2.5 ms against 70 ms at 1 MB,
-  21 ms against 1,445 ms and 16 MB of memory against 787 MB at 16 MB), and so does a body
-  that is not JSON (0.02 to 0.07 times); a `text/plain` body costs the same as without
+  21 ms against 1,445 ms and 16 MB of memory against 787 MB at 16 MB), and so does a
+  structural body that is not JSON (0.02 to 0.07 times; a body that is not JSON and is
+  made of escapes, such as repeated `\ud`, costs 17 to 33 times, about 7 ms per MB,
+  because the parser stops at its first bad escape); a `text/plain` body costs the same as without
   the check. The scan's own worst case is a string made of escapes, which `json.loads`
   decodes at 1 to 3 ms per MB: escaped surrogate pairs, accepted, add 7.3 to 7.8 ms per
   MB, 4.9 to 7.6 times the request without the check (25 ms against 143 ms at 16 MB),

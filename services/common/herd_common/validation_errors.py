@@ -186,8 +186,9 @@ def _escapes_hold_a_lone_surrogate(text: bytes) -> bool:
 
     Makes at most two copies of the text (the escaped backslash pairs replaced, and
     lower-cased), each in C; the search and the eight counts are C passes too. So the
-    cost is linear in the text's length, and memory is at most about twice the text,
-    whatever its number of escapes or elements.
+    cost is linear in the text's length, and memory is at most about twice the UTF-8
+    text, whatever its number of escapes or elements (a UTF-16 or UTF-32 body is
+    decoded first, which adds its own copies).
     """
     if b"\\\\" in text:
         text = text.replace(b"\\\\", b"_")
