@@ -249,3 +249,41 @@ async def test_schedule_refuses_a_reservation_that_does_not_hold_the_device(
         assert jobs.json()["total"] == 0
     finally:
         await admin_client.delete(f"/reservations/{reservation['id']}")
+
+
+async def test_a_refused_frr_config_is_never_quoted_back_or_stored(admin_client, frr_device):
+    """Issue #1457 against the running stack: a config version and a direct
+    configure that break the frr_mgmt schema's line bound answer 422 naming the
+    line's position and the bound; neither the 422s, the stored run, nor the run
+    list holds the password the refused line carried."""
+    canary = f"S3cr3t-Canary-{uuid.uuid4().hex[:8]}"
+    config = {"commands": [f"neighbor 192.0.2.1 password {canary} " + "x" * 500]}
+    expected = (
+        f"device '{frr_device['name']}': config failed schema validation at commands[0]: "
+        "must be at most 512 characters long"
+    )
+
+    version = await admin_client.post(
+        f"/inventory/devices/{frr_device['id']}/config-versions", json={"config": config}
+    )
+    assert version.status_code == 422, version.text
+    assert version.json() == {"detail": expected}
+
+    run = await admin_client.post(
+        "/execution/execute",
+        json={
+            "device_id": frr_device["id"],
+            "action": "configure",
+            "user_id": str(uuid.uuid4()),
+            "method_kwargs": config,
+        },
+    )
+    assert run.status_code == 422, run.text
+    assert run.json() == {"detail": expected}
+
+    runs = await admin_client.get("/execution/runs", params={"device_id": frr_device["id"]})
+    assert runs.status_code == 200, runs.text
+    items = runs.json()["items"]
+    assert [(item["status"], item["error"]) for item in items] == [("FAILED", expected)]
+    for text in (version.text, run.text, runs.text):
+        assert canary not in text

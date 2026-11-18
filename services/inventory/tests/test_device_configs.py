@@ -880,6 +880,124 @@ async def test_restore_re_validates_against_published_schema(client):
     assert restore.status_code == 422
 
 
+# ---- a refusal never quotes the config (issue #1457) ----
+#
+# The 422 names where the config is wrong and which rule it broke, never a value
+# from it. The published schema is the FRR management driver's, read from
+# drivers/frr_mgmt/driver.py as shipped.
+
+_CANARY = "S3cr3t-Canary-9d1e"
+
+
+def _frr_published_schema() -> dict:
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[3] / "drivers" / "frr_mgmt" / "driver.py"
+    spec = importlib.util.spec_from_file_location("frr_mgmt_schema_for_inventory", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Driver.config_schema()
+
+
+_FRR_SCHEMA = _frr_published_schema()
+
+
+def _log_text(records) -> str:
+    """Every captured line as the service's formatter writes it, except
+    aiosqlite's DEBUG lines (bound SQL parameters of the test-only driver)."""
+    from herd_common.logging import JSONFormatter
+
+    formatter = JSONFormatter("inventory")
+    return "\n".join(
+        formatter.format(record) for record in records if not record.name.startswith("aiosqlite")
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("schema", "config", "expected"),
+    [
+        (
+            _FRR_SCHEMA,
+            {"commands": [f"neighbor 192.0.2.1 password {_CANARY} " + "x" * 500]},
+            "at commands[0]: must be at most 512 characters long",
+        ),
+        (
+            _FRR_SCHEMA,
+            {"commands": [f"neighbor 192.0.2.1 password {_CANARY}"] + ["!"] * 100},
+            "at commands: must have at most 100 items",
+        ),
+        (
+            _FRR_SCHEMA,
+            {"command": [f"enable password {_CANARY}"]},
+            "at command: must be of type string",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {"password": {"type": "string", "pattern": "^[a-z]+$"}},
+            },
+            {"password": _CANARY},
+            "at password: must match the schema's pattern",
+        ),
+        (None, {"hostname": _CANARY * 10}, "at hostname: must be at most 128 characters long"),
+    ],
+    ids=["frr-maxLength", "frr-maxItems", "frr-type", "published-pattern", "registry-maxLength"],
+)
+async def test_create_refusal_never_quotes_the_config(client, caplog, schema, config, expected):
+    device_id = await _create_device(client)
+    name = (await client.get(f"/devices/{device_id}")).json()["name"]
+    with (
+        patch(
+            "app.routers.device_configs.published_schema_for_device",
+            new=AsyncMock(return_value=schema),
+        ),
+        caplog.at_level("DEBUG"),
+    ):
+        resp = await client.post(f"/devices/{device_id}/config-versions", json={"config": config})
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == f"device '{name}': config failed schema validation {expected}"
+    assert _CANARY not in resp.text
+    assert _CANARY not in _log_text(caplog.records)
+    # Nothing was stored.
+    versions = await client.get(f"/devices/{device_id}/config-versions")
+    assert versions.json()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_restore_refusal_never_quotes_the_stored_config(client, caplog):
+    """A version saved under the registry, refused on restore by a schema the
+    driver published later: the 422 names the field and the rule only."""
+    device_id = await _create_device(client)
+    name = (await client.get(f"/devices/{device_id}")).json()["name"]
+    with patch(
+        "app.routers.device_configs.published_schema_for_device",
+        new=AsyncMock(return_value=None),
+    ):
+        created = await client.post(
+            f"/devices/{device_id}/config-versions", json={"config": {"hostname": _CANARY}}
+        )
+    assert created.status_code == 201
+    vid = created.json()["id"]
+
+    with (
+        patch(
+            "app.routers.device_configs.published_schema_for_device",
+            new=AsyncMock(return_value=_PUBLISHED_MGMT_SCHEMA),
+        ),
+        caplog.at_level("DEBUG"),
+    ):
+        restore = await client.post(f"/devices/{device_id}/config-versions/{vid}/restore", json={})
+    assert restore.status_code == 422
+    assert restore.json()["detail"] == (
+        f"device '{name}': config failed schema validation at hostname: "
+        "must be at most 16 characters long"
+    )
+    assert _CANARY not in restore.text
+    assert _CANARY not in _log_text(caplog.records)
+
+
 # --- GET /devices/{id}/config-versions/latest/internal (issue #20) ---
 
 
