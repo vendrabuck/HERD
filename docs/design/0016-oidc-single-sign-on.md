@@ -327,7 +327,9 @@ login (IAM-LDAP-8).
   200 characters or the username) and the federated row in ONE transaction, then
   auto-assign "Not Grouped" through `_auto_assign_not_grouped` like every new account
   (IAM-REG-5). The email refusal also covers another `oidc` account, the case of an
-  IdP that reissued a subject; recovering such a user is an admin action outside v1.
+  IdP that reissued a subject; recovering such a user is a superadmin relink, and an
+  `OIDC_ISSUER` change a superadmin issuer rewrite (as built for issue #1399, below;
+  the first draft said "an admin action outside v1").
 - Returning login: the federated row decides; the stored email, username, role, and
   full name are never updated at login (IAM-LDAP-8 analog). `last_login_at` is
   written.
@@ -340,6 +342,218 @@ login (IAM-LDAP-8).
   startup-read rule of issue #1261 (IAM-BOOT-6) is unaffected.
 - Linking an existing local or LDAP account to an IdP identity is out of scope for v1
   (see Out of scope).
+- As built, recovery (issue #1399; decided by the owner on 2026-11-18, option (a) on
+  the issue: superadmin-only routes, API only, no UI page; three further owner
+  decisions the same day, A to C below, from the adversarial review). Rules
+  IAM-OIDC-29 to IAM-OIDC-39 in `docs/specs/identity-and-access.md`; operator steps in
+  `docs/OPERATIONS.md` ("Changing the OIDC issuer", "A user's first single sign-on
+  login is refused as a collision").
+  - `POST /admin/federated-identities/rewrite-issuer`, body `{old_issuer, new_issuer,
+    dry_run}`: every identity whose issuer is exactly `old_issuer` gets `new_issuer` in
+    one UPDATE, keeping its subject, its account, its row id, and its timestamps.
+  - `PUT /users/{user_id}/federated-identity`, body `{issuer, subject}` or
+    `{candidate_id}` (exactly one form): the `oidc` account `user_id` gets exactly that
+    identity in place of the one it held, and its relink candidates are discarded.
+  - `GET /users/{user_id}/federated-identity/candidates`: the account's live relink
+    candidates (decision A).
+  - Unlink semantics, the question the decision left open. The owner's words were
+    "unlink a single identity so the person's next login links afresh". A bare unlink
+    cannot do that: the person's next sign-in is an unknown (issuer, subject) whose
+    email the unlinked account still holds, which the collision rule (IAM-OIDC-10)
+    refuses, and attaching it anyway means linking by email, which this decision
+    forbids. Three shapes were weighed against this decision's threat, an attacker
+    who controls a provider account carrying the victim's email. (1) The unlink marks
+    the account "awaiting relink" and the next sign-in whose verified email matches is
+    linked once, within an expiry: rejected, because for that window it IS link by
+    email, and the attacker who signs in first takes the account; requiring
+    `email_verified` does not close it, since providers differ on whether they verify
+    and some never send the claim. (2) The bulk and single routes both take explicit
+    (old issuer, old subject) to (new issuer, new subject) rewrites: safe, but the
+    single case needs nothing the account id does not already give. (3) A relink that
+    names the account and the exact new (issuer, subject): chosen. No claim the
+    provider sends can choose an account, so the threat stays closed; the trust moves
+    to the superadmin, who must read the person's subject at the provider, which
+    the trusted-admin model of `SECURITY.md` already covers. "Unlink, then link
+    afresh" happens in one step, so no window exists in which the account has no
+    identity.
+  - The cost of (3): the superadmin must obtain the new `sub`. Some providers show it
+    (Keycloak's user id, Okta's user id); Microsoft Entra ID issues a pairwise `sub`
+    per application that its portal does not show, and HERD does not log a refused
+    login's subject (IAM-OIDC-12). Decision A removes the cost.
+  - Owner decision A (2026-11-18), relink candidates. When a first login is refused as
+    `email_taken` (IAM-OIDC-10) and exactly one account holds that email
+    case-insensitively, and it is an `oidc` account that is not a superadmin, the
+    refused (issuer, subject) is stored as a relink candidate against that account
+    (`federated_relink_candidates`, migration 0011), never logged, readable only
+    through the superadmin route, which shows a fingerprint (decision C) in place of
+    the subject: the superadmin needs to tell candidates apart and to compare one with
+    a pair read at the provider or an audit line, not the subject itself, which is a
+    stable identifier of whoever tried. The relink takes `candidate_id` in place of a
+    typed pair; a candidate of another account, an unknown one, and an expired one
+    are one 404. Using a candidate, or relinking by a typed pair, discards every
+    candidate of the account.
+    - The threat, designed against: anyone who can authenticate at the provider with
+      an account carrying the victim's email can PLANT a candidate. That includes a
+      token with no `email_verified` claim at all, which is accepted and captured
+      (only an explicit `false` is refused, before the collision check), and
+      Microsoft Entra ID normally omits the claim. A candidate is therefore only
+      evidence that someone tried to sign in; nothing links from it on its own (the
+      login still refuses), and the superadmin's confirmation is the security step.
+    - The agreed-minute check binds a candidate to the person by TIME only, and the
+      person's own attempt may leave no candidate at all: their provider email may no
+      longer equal the account's, the attempt may be refused as `username_invalid` or
+      `email_unverified` before the collision check, or the capture may fail (logged
+      as `oidc_relink_candidate_capture_failed`); then the only candidate in the
+      minute could be someone else's. So the runbook (review of 2026-11-18,
+      supervisor's recommendations, pre-approved by the owner) requires, before a
+      relink by candidate: `captured_total` up by exactly one and exactly one live
+      candidate created in the agreed minute; confirmation at the provider that
+      exactly one provider account carries the email and that it is the person's;
+      the person confirming they saw the sign-in failure page at that time; no
+      `oidc_relink_candidate_capture_failed` line in the window; and an out-of-band
+      channel that AUTHENTICATES the person, the help desk choosing the channel and the
+      minute (a call the person places to a number of their choosing is not enough).
+      With more than one live candidate, do not relink; investigate.
+    - Denial of recovery, accepted: any one provider account carrying the email can
+      block the candidate path indefinitely, re-planting every 24 hours so a second
+      candidate is always live. A route to clear candidates would not help, since
+      re-planting is immediate. The way out is the typed-pair relink with a subject
+      read at the provider, or removing the rogue provider account.
+    - Bounds: 24 hours from the first capture (a constant, `CANDIDATE_TTL`, like the
+      flow store's TTLs), at most 5 live per account and 1000 in all, a repeat of a
+      pair only bumping `attempts` and `last_seen_at`. Eviction drops the OLDEST, by
+      choice: dropping the newest would let a planter who filled the slots first keep
+      the person's own attempt out for a day, while dropping the oldest pushes the
+      person's candidate out only once five newer ones exist for the account, and with
+      any second candidate live the runbook already forbids a relink. The global cap
+      evicts the oldest rows of the WHOLE table, so someone able to assert the emails
+      of 200 or more single sign-on accounts (5 each) can flush other accounts'
+      candidates: denial of recovery only, visible as a `captured_total` that rose
+      while the list stayed empty. Expired rows are deleted only when a later capture
+      runs, and the caps bound them meanwhile. Flooding stays visible:
+      `federated_relink_capture_totals` counts, per account and forever, the distinct
+      pairs captured, so `captured_total` keeps growing while the live list is capped.
+    - Only an email collision qualifies. A username-only collision has an email no
+      account holds, so there is no account the evidence belongs to; filing it under
+      the username's holder was rejected, since the username comes from a claim people
+      often edit at the provider. A local, LDAP, or superadmin holder never gets a
+      candidate: those accounts are never linked.
+    - What the refused user sees is the same `failed` redirect, but the timing is
+      NOT the same (corrected in the second review, which measured medians on
+      PostgreSQL 16, 200 samples each: an `email_taken` refusal with a local holder
+      2.8 ms, an `oidc` holder with a repeated pair about 5.1 ms, an `oidc` holder with
+      a new pair 7.2 ms). Decided: document, do not pad. From the timing a refused
+      caller can infer that the email belongs to an ordinary single sign-on account
+      rather than a local, LDAP, or superadmin one, and whether their candidate was
+      newly stored. The caller is already authenticated at the provider with that
+      email, so this tells them about an email they hold. Before this change the
+      refusal paths took the same time. The capture runs after the refusal is
+      decided, in its own transaction under one
+      transaction-scoped advisory lock (so the caps hold between concurrent captures);
+      a failure is rolled back and logged by exception class name, and the login is
+      refused all the same. Every captured refusal takes that one global lock while
+      holding a pooled database connection, and auth sets no statement timeout;
+      logins that capture nothing never wait on it, and the rate of captures is bounded
+      by sign-ins at the provider.
+  - Owner decision B (2026-11-18), naming the collisions. A rewrite's dry run and its
+    409 also return, for each colliding subject, the pair of account ids (the holder
+    under the old issuer, the holder under the new issuer), at most 50 with
+    `collisions_truncated` and the total in `conflicts`; ids only, no claim. The 409
+    keeps `detail` a string and adds the fields beside it.
+  - Owner decision C (2026-11-18), audit fingerprints. Relink audit lines carry the
+    fingerprints of the old and the new (issuer, subject); rewrite lines those of the
+    two issuers; the values themselves stay out of the log. The fingerprint is
+    HMAC-SHA256 over the JSON list of the values, under a key derived from
+    `AUTH_SECRET_KEY` (HMAC-SHA256 of the fixed context
+    `herd-auth/oidc-identity-fingerprint/v1`), truncated to 16 hex characters: no new
+    setting, and the derived key is never the JWT signing key itself. An investigator
+    computes the fingerprint of a suspect pair inside the auth container
+    (`docs/OPERATIONS.md`); rotating `AUTH_SECRET_KEY` changes every fingerprint, so
+    lines from before and after a rotation do not compare.
+  - The rewrite compares the exact string an ID token carries: no trailing-slash,
+    case, or whitespace normalization (D8 compares the issuer byte for byte too).
+    `dry_run` is required and must be a JSON boolean, so a write is asked for in so
+    many words; a dry run answers `matched` and `conflicts` and writes nothing. When
+    any rewritten subject already has an identity under `new_issuer`, the whole
+    operation is refused 409 with the count and nothing is written; the unique
+    constraint on (issuer, subject) is the judge, so a first login that commits a
+    colliding row after the count makes the UPDATE fail and the same 409 answer.
+    `old_issuer` equal to `new_issuer` is refused 400. Both strings, and the relink's
+    two, pass the one predicate a login's identity key passes (`identity_key_part_ok`:
+    a non-blank string of at most 255 characters with no Cc or Cs character), no
+    stricter and no looser, so a pair the routes write is a pair a login can present.
+  - No route requires OIDC mode or checks `new_issuer` against the configured
+    `OIDC_ISSUER`. The routes are data operations, and the recovery after an issuer
+    change made by mistake must run with the setting already changed, while a
+    superadmin who switched `AUTH_METHOD` back to `local` to sign in must be able to
+    run them there.
+  - Order of operations, the one the runbook gives: dry run first; then rewrite; then
+    change `OIDC_ISSUER` in `.env` and recreate auth; then run the dry run from the
+    old issuer to the new one again, and the rewrite again if `matched` is above 0;
+    then verify one sign-in. Between the rewrite and the recreate, while the provider
+    still issues the old issuer, a returning person finds no identity and is refused
+    as a collision, but a person signing in for the FIRST time is provisioned under
+    the old issuer and would be locked out after the change; the second dry run finds
+    exactly those (corrected in the review: the first draft said nothing is created in
+    that window). While `OIDC_ISSUER` names an issuer the provider's discovery document
+    does not, every sign-in answers `unavailable` and nothing is provisioned at all.
+    The other order (change the setting, then rewrite) leaves a window in which a
+    returning person whose provider email changed since their account was created is
+    provisioned a SECOND account under the new issuer, whose identity then blocks the
+    rewrite (409, naming both accounts, decision B); the runbook clears that by
+    relinking the second account to the reserved issuer `urn:herd:retired` with its own
+    account id as the subject (no token carries that `iss`, so it can never sign in,
+    and the person's pair under the new issuer is freed), deactivating it, and never
+    reactivating it without a relink first. The rewrite is only for a change in which the provider keeps each
+    person's subject (a renamed issuer URL, a trailing slash, a migration that
+    preserves user ids): applied across providers whose subject namespaces differ, it
+    would hand one person's account to whoever holds the same subject string at the
+    new provider.
+  - Who may call: a superadmin effective role only (`require_role(Role.SUPERADMIN)`),
+    an admin answers 403, checked before any account is read and before the body is
+    validated, with one exception: FastAPI decodes the body before it runs the
+    dependencies, so a body that is not JSON answers 422 `json_invalid` to anyone,
+    which says nothing about any account. In OIDC mode the superadmin is the seeded
+    local account (IAM-USER-3), reachable through the D5 break-glass login, a
+    superadmin API token exchanged at `POST /tokens/exchange`, a superadmin session
+    from before the change, or by switching `AUTH_METHOD` back to `local`. With
+    break-glass off and no token or session, the runbook's way in is to set
+    `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN=true` in `.env` and recreate auth (the config
+    page does not offer the OIDC keys before phase 6); `docs/ENV_VARS.md` says so
+    beside `OIDC_ISSUER`.
+  - Audit: every call that passes the role check logs one line with a fixed
+    `action` (`oidc_issuer_rewrite`, `oidc_identity_relink`,
+    `oidc_relink_candidates_read`), the `outcome`, the caller's id, the counts or the
+    target account id, and the fingerprints of decision C; never an issuer, a subject,
+    or a token (the IAM-OIDC-12 rule for claim values). A database error is logged by
+    exception class name only and answers a fixed 500, since its text carries the
+    statement's bound parameters.
+  - Concurrency: the database constraints keep the invariant (each account at most
+    one identity, no (issuer, subject) twice); the relink locks the account's row
+    `FOR UPDATE`, so two relinks of one account apply in turn (the last wins) rather
+    than one failing on the user_id constraint. A returning login's `last_login_at`
+    write is a compare-and-swap on the identity row as the login read it (id, account,
+    issuer, subject), so a login in flight when a relink or rewrite commits is refused
+    as `identity_changed` instead of completing on a pair that no longer names the
+    account (review finding 5; the first draft let it sign in once more). Proved on
+    Postgres in `services/auth/tests/test_federated_identity_live_pg.py`.
+  - Sessions: neither route revokes anything. Tokens issued before a relink or
+    rewrite live out their lives: an access token `AUTH_ACCESS_TOKEN_EXPIRE_MINUTES`
+    (plus the 10 s leeway), a refresh token `AUTH_REFRESH_TOKEN_EXPIRE_DAYS` through
+    rotation. Deactivating the account stops refresh and every auth route while it is
+    inactive, but revokes nothing: reactivating it lets an unexpired refresh token
+    work again. The runbook says so.
+  - No cross-schema effect: the account id never changes, so no other service sees
+    any route. A relink replaces the identity row (new row id, new `created_at`, no
+    `last_login_at`); a rewrite keeps the row.
+  - Decisions the owner might want differently, most consequential first: the
+    relink in place of a literal unlink (above); oldest-first eviction of candidates
+    and its caps (5 per account, 1000 in all, 24 hours); candidates only for an email
+    collision with an ordinary `oidc` account; the candidate list showing a
+    fingerprint, not the subject; a typed relink also discarding candidates; the
+    routes answering in every mode rather than only in OIDC mode; `dry_run` required
+    rather than defaulting to true; refusing the whole rewrite on any conflict rather
+    than rewriting the rest; no route to read an account's current identity.
 
 ### D5. `AUTH_METHOD=oidc` is an exclusive third mode; break-glass is an opt-in local superadmin login (DECIDED BY THE OWNER, break-glass part)
 
@@ -1085,7 +1299,8 @@ included.
   stated plainly: from this merge an operator who sets `AUTH_METHOD=oidc` reaches the
   mode before issues
   #1399 (no recovery path when a first login collides, so an `OIDC_ISSUER` change locks
-  out every SSO user) and #1420 (the login page shows the password form while
+  out every SSO user; since settled by the superadmin recovery routes, D4 as built and
+  IAM-OIDC-29 to IAM-OIDC-39) and #1420 (the login page shows the password form while
   `GET /login-options` is pending; since fixed, IAM-OIDC-28) are settled, so both block
   the 0.8.0 release.
 - As built, the lab's redirect URIs (decided by the owner on 2026-11-14): templated
@@ -1123,6 +1338,39 @@ included.
   that deletes a user). `docs/specs/TESTING.md` ("OIDC test provider") has the
   detail.
 
+### Recovery routes, between phases 5b and 6 (issue #1399, M)
+
+Decided by the owner on 2026-11-18 (option (a) on the issue), and a blocker of the
+0.8.0 release since phase 5b made the mode reachable. Not one of the planned phases:
+the first draft left recovery outside v1 (D4).
+
+- `services/auth/app/routers/federated_identities.py` (new):
+  `POST /admin/federated-identities/rewrite-issuer` and
+  `PUT /users/{user_id}/federated-identity`, superadmin only, every auth mode, with the
+  audit line of D4 as built; one `include_router` line in `services/auth/app/main.py`.
+- `services/auth/app/services/federated_identity_service.py` (new): `rewrite_issuer`
+  and `relink_identity`; `services/auth/app/schemas/federated_identity.py` (new): the
+  two request bodies (`extra="forbid"`) and two responses; `auth_service.py` gains the
+  shared predicate `identity_key_part_ok`, which the login's key check now calls.
+- Fix round (owner decisions A to C of 2026-11-18): migration
+  `0011_relink_candidates.py` and `services/auth/app/models/federated_relink_candidate.py`
+  (the candidate and capture-total tables), the capture in `auth_service`'s refusal
+  path, the candidate read route, the colliding account pairs, the audit
+  fingerprints, and the returning login's compare-and-swap.
+- Tests: unit (`test_federated_identity_service.py`), functional through the routes
+  with real tokens and the recovery stories through the phase 3 routes
+  (`test_federated_identity_routes.py`), Postgres-live races
+  (`test_federated_identity_live_pg.py`, in `_gate-pg-live-tests`), the live Dex suite
+  (two recovery stories in `test_oidc_service_live.py`), and the stack-level suite
+  (`tests/integration/test_oidc_auth.py`, through the gateway). Load and browser e2e do
+  not apply: two rare superadmin calls with no UI.
+- `tests/contract/snapshots/auth.json`: regenerated without a stack, the contract
+  test's own `_signature` applied to the auth app's `app.openapi()`; every existing
+  entry came out byte-equal, so the diff is the two routes and four schemas alone.
+- Docs: the spec (IAM-OIDC-29 to IAM-OIDC-39, the API surface, Errors, the open
+  defects), `docs/ENV_VARS.md` (the `OIDC_ISSUER` warning), `docs/OPERATIONS.md` (the
+  two runbook sections), `docs/ROLES.md`, `CHANGELOG.md`.
+
 ### Phase 6: light up (M)
 
 - `services/auth/app/config.py`: `auth_method: Literal["local", "ldap", "oidc"]`. Done
@@ -1148,6 +1396,7 @@ included.
 | 4 | this ADR's API table only | 1, 2, 3, 5a |
 | 5a | 1 | 2, 3, 4 |
 | 5b | 3, 4, 5a | none |
+| recovery (#1399) | 3, 5a | none (it touches the spec and CHANGELOG hotspots) |
 | 6 | 5b (which also widened `auth_method`) | none |
 
 Phases 1, 2, and 4 touch disjoint source files (phase 1: `config.py`,
@@ -1193,8 +1442,8 @@ publication, and an IdP test container that speaks SAML.
 The first draft put five questions to the owner. All five were decided by the owner on
 2026-11-11, each as recommended; no owner question remains open. A sixth owner decision,
 the username rule (option C), was made before phase 3; two more, the early `auth_method`
-widening and the lab's templated redirect URIs, were made in phase 5b; they are the last
-three rows below. The one condition
+widening and the lab's templated redirect URIs, were made in phase 5b; a ninth, the
+recovery routes of issue #1399 and their three refinements, on 2026-11-18. They are the last four rows below. The one condition
 that could return D12 to the owner, the phase 5a measurement, is met: Dex was the
 smallest and fastest of the three, and it passed the issuer-reachability proof, refused
 a wrong `code_verifier` (`invalid_grant`), accepted the right one, and echoed the
@@ -1210,3 +1459,4 @@ a wrong `code_verifier` (`invalid_grant`), accepted the right one, and echoed th
 | D4 username, option C (added in phase 3) | the username claim when it fits `^[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}$`, else the email when it fits, else the first login is refused | phase 3 |
 | `auth_method` widened early (added in phase 5b, 2026-11-14) | auth admits `oidc` from phase 5b, since the stack tests cannot recreate auth in a mode it refuses; the config page and handbook stay phase 6; issues #1399 and #1420 block the 0.8.0 release | phase 5b |
 | Lab redirect URIs (added in phase 5b, 2026-11-14) | templated from `HERD_GATEWAY_BIND`, no host address in a tracked file | phase 5b |
+| D4 recovery (added 2026-11-18, issue #1399) | option (a): superadmin-only routes, API only, a bulk issuer rewrite and a single-identity relink (the "unlink so the next login links afresh" done in one step that names the new subject, since a bare unlink plus the next login cannot link without matching by email); from the review the same day, (A) refused identities kept as relink candidates, confirmed out of band, (B) colliding account ids named by the rewrite, (C) keyed fingerprints in the audit lines | the recovery routes, between phases 5b and 6 |
