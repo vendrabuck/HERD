@@ -49,8 +49,9 @@ Off the event loop (IAM-HASH-7). A cost-12 check holds a core for about a fifth
 of a second, and auth runs one process with one event loop, so a request path
 never calls the two functions above directly: it enters `hashing_slot()` and runs
 them through `run_hashing`, which uses a worker thread (bcrypt releases the GIL
-while it computes). Two limiters, both of size `hash_threads()`, keep the work
-bounded:
+while it computes). The thread count is `effective_hash_threads`, never more than
+`available_cpus()` (the affinity mask, lowered to a cgroup CPU quota). Two
+limiters, both of that size, keep the work bounded:
 
 - the slot limiter admits at most that many requests to the hashing section at a
   time. A request waits for a slot at most `HASH_WAIT_SECONDS`, and at most
@@ -60,7 +61,7 @@ bounded:
   no database connection: the routes enter the slot before their first query.
 - the worker limiter is what `run_hashing` hands `anyio.to_thread.run_sync`, so
   bcrypt never takes a thread from anyio's shared default pool (40 threads, used
-  by every LDAP call), and never runs on more than `hash_threads()` threads at
+  by every LDAP call), and never runs on more than that many threads at
   once, slot or no slot (the startup seed calls `run_hashing` without one).
 
 The work per answer is unchanged: still exactly one bcrypt per login answer.
@@ -69,10 +70,12 @@ The work per answer is unchanged: still exactly one bcrypt per login answer.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TypeVar
 
 import anyio
@@ -220,12 +223,73 @@ class HashingBusyError(Exception):
     """No hashing slot came free within the wait bound (IAM-HASH-7)."""
 
 
-def available_cpus() -> int:
-    """The CPUs this process may run on (its affinity mask, not the host total)."""
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+PROC_SELF_CGROUP = Path("/proc/self/cgroup")
+
+
+def _read(path: Path) -> str | None:
     try:
-        return len(os.sched_getaffinity(0))
+        return path.read_text().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _quota_cpus(quota: str, period: str) -> int | None:
+    """CPUs a quota of `quota` per `period` microseconds allows, rounded up; None
+    for no quota ("max", or v1's -1) or a value that does not parse."""
+    try:
+        quota_us, period_us = int(quota), int(period)
+    except ValueError:
+        return None
+    if quota_us <= 0 or period_us <= 0:
+        return None
+    return max(1, math.ceil(quota_us / period_us))
+
+
+def cgroup_cpu_limit(
+    root: Path = CGROUP_ROOT, proc_self_cgroup: Path = PROC_SELF_CGROUP
+) -> int | None:
+    """The CPU count a cgroup CPU quota allows this process, rounded up, or None
+    when no quota applies or none can be read.
+
+    cgroup v2: `cpu.max` ("<quota> <period>" or "max <period>") in this process's
+    own cgroup (the path in /proc/self/cgroup, under `root`), else at `root`
+    itself, which inside a container's cgroup namespace is the container's own.
+    cgroup v1: `cpu.cfs_quota_us` and `cpu.cfs_period_us` under `root/cpu` or
+    `root/cpu,cpuacct` (-1 is no quota). Anything absent, unreadable, or
+    malformed reads as no quota, so the caller falls back to the affinity mask.
+    """
+    candidates = []
+    own = _read(proc_self_cgroup) or ""
+    for line in own.splitlines():
+        if line.startswith("0::"):
+            relative = line[3:].strip().lstrip("/")
+            if relative:
+                candidates.append(root / relative / "cpu.max")
+    candidates.append(root / "cpu.max")
+    for path in candidates:
+        text = _read(path)
+        if text is not None:
+            parts = text.split()
+            return _quota_cpus(parts[0], parts[1]) if len(parts) == 2 else None
+    for v1 in (root / "cpu", root / "cpu,cpuacct"):
+        quota = _read(v1 / "cpu.cfs_quota_us")
+        period = _read(v1 / "cpu.cfs_period_us")
+        if quota is not None and period is not None:
+            return _quota_cpus(quota, period)
+    return None
+
+
+def available_cpus() -> int:
+    """The CPUs this process can use: its affinity mask, lowered to a cgroup CPU
+    quota rounded up when one applies (a container limited to half a CPU counts
+    as 1, to 2.5 CPUs as 3)."""
+    try:
+        cpus = len(os.sched_getaffinity(0))
     except AttributeError:  # pragma: no cover - not Linux
-        return os.cpu_count() or 1
+        cpus = os.cpu_count() or 1
+    quota = cgroup_cpu_limit()
+    return min(cpus, quota) if quota is not None else cpus
 
 
 def auto_hash_threads(cpus: int) -> int:
@@ -235,8 +299,30 @@ def auto_hash_threads(cpus: int) -> int:
 
 
 def effective_hash_threads(configured: int, cpus: int) -> int:
-    """`configured` when it is positive, else the automatic count."""
-    return configured if configured > 0 else auto_hash_threads(cpus)
+    """`configured` when it is positive, else the automatic count; never more
+    than `cpus`.
+
+    A configured count above the CPUs auth can use is lowered to that count
+    with a WARNING: more bcrypt threads than CPUs adds no throughput, and the
+    threads then crowd the event loop off the CPU (16 threads on one core held
+    a cheap route at over a second).
+    """
+    if configured <= 0:
+        return auto_hash_threads(cpus)
+    if configured > cpus:
+        logger.warning(
+            "AUTH_PASSWORD_HASH_THREADS=%d is more than the %d CPUs auth can use; using %d",
+            configured,
+            cpus,
+            cpus,
+            extra={
+                "action": "password_hash_threads_lowered",
+                "configured": configured,
+                "cpus": cpus,
+            },
+        )
+        return cpus
+    return configured
 
 
 class HashingPool:

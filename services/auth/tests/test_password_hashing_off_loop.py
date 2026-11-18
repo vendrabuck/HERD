@@ -19,6 +19,7 @@ fast host both scale it). Run pinned to one core with `taskset -c 0` too.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 
@@ -132,12 +133,94 @@ def test_the_automatic_thread_count_is_half_the_cpus_between_1_and_4(cpus, expec
     assert passwords.effective_hash_threads(-3, cpus) == expected
 
 
-def test_a_configured_thread_count_wins():
-    assert passwords.effective_hash_threads(6, 1) == 6
+def test_a_configured_thread_count_wins_up_to_the_available_cpus(caplog):
     assert passwords.effective_hash_threads(1, 64) == 1
+    assert passwords.effective_hash_threads(6, 8) == 6
+    assert passwords.effective_hash_threads(8, 8) == 8
+    assert not caplog.records
+    with caplog.at_level(logging.WARNING, logger="app.services.passwords"):
+        assert passwords.effective_hash_threads(16, 1) == 1
+        assert passwords.effective_hash_threads(6, 4) == 4
+    lowered = [r for r in caplog.records if r.action == "password_hash_threads_lowered"]
+    assert [(r.configured, r.cpus) for r in lowered] == [(16, 1), (6, 4)]
+
+
+def _cgroup(tmp_path, files: dict[str, str], own: str | None = None):
+    for relative, text in files.items():
+        path = tmp_path / "cg" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    proc = tmp_path / "proc_self_cgroup"
+    if own is not None:
+        proc.write_text(own)
+    return passwords.cgroup_cpu_limit(tmp_path / "cg", proc)
+
+
+@pytest.mark.parametrize(
+    "cpu_max, expected",
+    [
+        ("max 100000", None),
+        ("100000 100000", 1),
+        ("50000 100000", 1),
+        ("250000 100000", 3),
+        ("400000 100000", 4),
+        ("garbage", None),
+        ("abc 100000", None),
+        ("", None),
+        ("0 100000", None),
+    ],
+)
+def test_the_cgroup_v2_quota_is_read_rounded_up(tmp_path, cpu_max, expected):
+    assert _cgroup(tmp_path, {"cpu.max": cpu_max}) == expected
+
+
+def test_no_cgroup_files_means_no_quota(tmp_path):
+    assert _cgroup(tmp_path, {}) is None
+
+
+def test_the_processes_own_cgroup_is_read_first(tmp_path):
+    files = {"cpu.max": "max 100000", "kubepods/pod1/cpu.max": "150000 100000"}
+    assert _cgroup(tmp_path, files, own="0::/kubepods/pod1\n") == 2
+    # A cgroup namespace shows the container's own cgroup as "/": the root is read.
+    assert _cgroup(tmp_path, {"cpu.max": "200000 100000"}, own="0::/\n") == 2
+
+
+@pytest.mark.parametrize(
+    "quota, period, expected",
+    [("-1", "100000", None), ("50000", "100000", 1), ("250000", "100000", 3), ("x", "y", None)],
+)
+def test_the_cgroup_v1_quota_is_read(tmp_path, quota, period, expected):
+    files = {"cpu/cpu.cfs_quota_us": quota, "cpu/cpu.cfs_period_us": period}
+    assert _cgroup(tmp_path, files) == expected
+    other = tmp_path / "other"
+    other.mkdir()
+    files = {"cpu,cpuacct/cpu.cfs_quota_us": quota, "cpu,cpuacct/cpu.cfs_period_us": period}
+    assert _cgroup(other, files) == expected
+
+
+def test_available_cpus_is_the_affinity_lowered_to_the_quota(monkeypatch):
+    monkeypatch.setattr(passwords.os, "sched_getaffinity", lambda pid: set(range(8)))
+    monkeypatch.setattr(passwords, "cgroup_cpu_limit", lambda: None)
+    assert passwords.available_cpus() == 8
+    monkeypatch.setattr(passwords, "cgroup_cpu_limit", lambda: 2)
+    assert passwords.available_cpus() == 2
+    monkeypatch.setattr(passwords, "cgroup_cpu_limit", lambda: 32)
+    assert passwords.available_cpus() == 8
+
+
+def test_a_quota_lowers_the_automatic_and_a_configured_count(monkeypatch):
+    monkeypatch.setattr(passwords.os, "sched_getaffinity", lambda pid: set(range(32)))
+    monkeypatch.setattr(passwords, "cgroup_cpu_limit", lambda: 1)
+    monkeypatch.setattr(settings, "auth_password_hash_threads", 0)
+    passwords.set_hashing_pool(None)
+    assert passwords.hashing_pool().threads == 1
+    monkeypatch.setattr(settings, "auth_password_hash_threads", 16)
+    passwords.set_hashing_pool(None)
+    assert passwords.hashing_pool().threads == 1
 
 
 def test_the_pool_is_built_from_the_setting(monkeypatch):
+    monkeypatch.setattr(passwords, "available_cpus", lambda: 8)
     monkeypatch.setattr(settings, "auth_password_hash_threads", 3)
     passwords.set_hashing_pool(None)
     built = passwords.hashing_pool()

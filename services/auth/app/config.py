@@ -164,7 +164,9 @@ class Settings(HerdBaseSettings):
     auth_login_max_attempts: int = 60
     auth_login_window_seconds: int = 60
     # Worker threads for bcrypt (app/services/passwords.py, IAM-HASH-7); 0
-    # means half the CPUs auth may run on, at least 1 and at most 4.
+    # means half the CPUs auth may use (its affinity mask, lowered to a cgroup
+    # CPU quota), at least 1 and at most 4. A value above those CPUs is lowered
+    # to them with a warning.
     auth_password_hash_threads: int = 0
 
     log_level: str = "INFO"
