@@ -54,6 +54,10 @@ services:
     container_name: nos-test-srl
     hostname: srl
     privileged: true
+    # TRIAL for issue #1454, not for merge: does SR Linux boot and pass its
+    # tests under Docker's own AppArmor profile on an Ubuntu 26.04 host?
+    security_opt:
+      - apparmor=docker-default
     user: "0"
     networks:
       - nos-test
