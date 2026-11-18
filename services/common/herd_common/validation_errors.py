@@ -46,21 +46,58 @@ document advertise that shape. What that guarantees, exactly:
 - A body a route builds itself (`HTTPException(detail=...)`) is not rendered by this
   handler, and some such details quote a submitted value.
 
+A lone surrogate is refused at the body, for every route (issues #1456, #1458, #1459).
+A plain `str` field, the keys and values of a `dict[str, str]`, and any value typed
+`Any` accept one, and every later step that must encode it as UTF-8 then fails: a
+JSON response, an httpx call to another service, a database write, a NATS payload. So
+`install_validation_errors` also installs `RefuseLoneSurrogates`, which checks each
+request body when the app reads it and answers 422 when the parsed JSON holds a lone
+surrogate anywhere: a value, a key, nested, in a field of any type. What that
+guarantees, exactly:
+
+- The answer is the same `{"detail": [...]}` list, each item `{type, loc, msg}`, with
+  pydantic's own `string_unicode` type and message. `loc` is `["body", ...]` and ends
+  at the string that holds the surrogate, or, for a key, at the object holding the key
+  (as pydantic refuses such a key on an `extra="forbid"` body); it never holds the
+  surrogate or the value.
+- It runs only when the app reads the body, so a route that does not exist (404), a
+  method not allowed (405), and a route that takes no body are unchanged. A route that
+  reads its body (every route with a body parameter) reads it before its dependencies
+  run, so the refusal comes before authentication, as FastAPI's own 422 for a body
+  that is not JSON does.
+- Every body is checked except a `multipart/*` one, which is passed through unread:
+  Starlette decodes a multipart field strictly as UTF-8 (falling back to Latin-1 for a
+  file name), so no lone surrogate can come from one. A query string, a path, an
+  urlencoded form, and a header cannot carry one either: each is percent-decoded with
+  replacement or decoded as Latin-1. A JSON document a route parses itself out of an
+  uploaded file is its own check, with `lone_surrogate_locs`.
+- The cost is at most three substring searches over the body. Only a body holding the
+  text `\\ud` or `\\uD`, or the byte 0xED (the start of a surrogate escape, or the
+  UTF-8 lead byte of a surrogate written as raw bytes), is searched with a regular
+  expression, and only a body that matches it is parsed a second time to look; a body
+  that JSON would not decode as UTF-8 (a UTF-16 or UTF-32 document) is always parsed.
+- A body that is not JSON passes through, so the route answers as it would have.
+
 Every service installs it from its `app/main.py`; `tests/unit/test_validation_errors_wiring.py`
 fails when one does not. The config service, which must not import herd_common,
 installs a standalone copy (`services/config/app/validation_errors.py`) whose code is
-pinned identical to this module's by `services/config/tests/test_validation_errors.py`.
+pinned identical to this module's by `services/config/tests/test_validation_errors.py`,
+and installs it with `refuse_lone_surrogates=False`: config already judges a lone
+surrogate in each password with an answer of its own (OPS-CONFIG-8), which the body
+check would replace. The wiring guard allows that keyword to config alone.
 First written for auth (issue #1426), copied for config (issue #1428).
 """
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.middleware import Middleware
 
 _LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 
@@ -109,14 +146,144 @@ def restrict_validation_error_schema(openapi: dict[str, Any]) -> dict[str, Any]:
     return openapi
 
 
-def install_validation_errors(app: FastAPI) -> None:
-    """Use `validation_error_handler` for every 422 and advertise its shape.
+# Pydantic's own type and message for a constrained string holding a lone surrogate,
+# so the body check's refusal reads the same as the schema's.
+STRING_UNICODE_TYPE = "string_unicode"
+STRING_UNICODE_MSG = "Input should be a valid string, unable to parse raw data as a unicode string"
+
+# A JSON escape whose first hex digit is D (`\ud800` to `\udfff` among them), or a raw
+# UTF-8 lead byte 0xED followed by 0xA0 to 0xBF: the two ways a JSON text decoded as
+# UTF-8 by `json.loads` (which uses `surrogatepass`) can produce a lone surrogate.
+_MAY_HOLD_A_SURROGATE = (b"\\ud", b"\\uD", b"\xed")
+_SURROGATE_ESCAPE_OR_BYTES = re.compile(rb"\\u[dD][89a-fA-F]|\xed[\xa0-\xbf]")
+
+
+def lone_surrogate_locs(value: Any) -> list[tuple[str | int, ...]]:
+    """Where a parsed JSON value holds a lone surrogate, in document order, each once.
+
+    A string holding one is located at itself; a key holding one at the object that
+    holds the key, whose value is then not searched. A located key or index is never
+    a string that holds a surrogate. Iterative, so a deeply nested value cannot
+    exhaust the stack.
+    """
+    found: list[tuple[str | int, ...]] = []
+    stack: list[tuple[tuple[str | int, ...], Any]] = [((), value)]
+    while stack:
+        loc, item = stack.pop()
+        if isinstance(item, str):
+            if _LONE_SURROGATE.search(item):
+                found.append(loc)
+        elif isinstance(item, dict):
+            children = []
+            for key, child in item.items():
+                if isinstance(key, str) and _LONE_SURROGATE.search(key):
+                    found.append(loc)
+                else:
+                    children.append(((*loc, key), child))
+            stack.extend(reversed(children))
+        elif isinstance(item, list):
+            stack.extend(reversed([((*loc, index), child) for index, child in enumerate(item)]))
+    return list(dict.fromkeys(found))
+
+
+def body_lone_surrogate_errors(body: bytes) -> list[dict[str, Any]]:
+    """The rendered `string_unicode` errors for a request body, empty when it is clean.
+
+    Empty, too, for a body `json.loads` refuses: the route answers that as it would
+    have (FastAPI's `json_invalid`).
+    """
+    if json.detect_encoding(body) in ("utf-8", "utf-8-sig"):
+        if not any(marker in body for marker in _MAY_HOLD_A_SURROGATE):
+            return []
+        if not _SURROGATE_ESCAPE_OR_BYTES.search(body):
+            return []
+    try:
+        parsed = json.loads(body)
+    except (ValueError, RecursionError):
+        return []
+    return render_validation_errors(
+        {"type": STRING_UNICODE_TYPE, "loc": ("body", *loc), "msg": STRING_UNICODE_MSG}
+        for loc in lone_surrogate_locs(parsed)
+    )
+
+
+def _is_multipart(scope: Any) -> bool:
+    for name, value in scope.get("headers", ()):
+        if name == b"content-type":
+            return value.lstrip().lower().startswith(b"multipart/")
+    return False
+
+
+class RefuseLoneSurrogates:
+    """ASGI middleware: a request body holding a lone surrogate is a 422.
+
+    It wraps `receive`. The first time the app reads the body, the whole body is read,
+    checked with `body_lone_surrogate_errors`, and handed on as one message; when the
+    check finds a surrogate, the read raises `HTTPException(422)` instead, which
+    FastAPI's body reader passes on and the app's exception handling renders as
+    `{"detail": [...]}`. A read made after the response has started (Starlette's
+    disconnect listener on a route that never read its body) is handed on unchecked.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http" or _is_multipart(scope):
+            await self.app(scope, receive, send)
+            return
+        read = False
+        started = False
+
+        async def send_tracking_start(message: Any) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        async def receive_checked() -> Any:
+            nonlocal read
+            if read:
+                return await receive()
+            read = True
+            chunks = []
+            while True:
+                message = await receive()
+                if message["type"] != "http.request":
+                    return message
+                chunks.append(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
+            body = b"".join(chunks)
+            errors = [] if started else body_lone_surrogate_errors(body)
+            if errors:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=errors
+                )
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        await self.app(scope, receive_checked, send_tracking_start)
+
+
+def install_validation_errors(app: FastAPI, *, refuse_lone_surrogates: bool = True) -> None:
+    """Use `validation_error_handler` for every 422 and advertise its shape, and,
+    unless `refuse_lone_surrogates` is False (the config service alone), refuse a
+    request body holding a lone surrogate with `RefuseLoneSurrogates`.
 
     The OpenAPI override is FastAPI's documented one: replace `app.openapi`
     with a function that builds the default document once, adjusts it, and
     caches it in `app.openapi_schema`.
     """
     app.add_exception_handler(RequestValidationError, validation_error_handler)
+    if refuse_lone_surrogates:
+        # Innermost, next to the routes, whatever the order of the app's other
+        # middleware: `add_middleware` would put it outermost, and a
+        # BaseHTTPMiddleware (the request logger) runs the `receive` it passes on in a
+        # task group, which wraps the refusal in an ExceptionGroup that FastAPI's body
+        # reader turns into a 400. The same guard as `add_middleware`.
+        if app.middleware_stack is not None:
+            raise RuntimeError("Cannot add middleware after an application has started")
+        app.user_middleware.append(Middleware(RefuseLoneSurrogates))
 
     def openapi() -> dict[str, Any]:
         if app.openapi_schema is None:

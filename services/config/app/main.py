@@ -53,7 +53,9 @@ app = FastAPI(
 
 # Every 422 is rendered as {type, loc, msg}: never pydantic's input or ctx, so never
 # a submitted password, and never a 500 on a lone surrogate (app/validation_errors.py).
-install_validation_errors(app)
+# Without the shared body check for a lone surrogate: config answers one in a
+# password itself (OPS-CONFIG-8), and the check would replace those answers.
+install_validation_errors(app, refuse_lone_surrogates=False)
 
 # The wildcard origin is deliberate (this is the one service that does not use
 # herd_common's CORS helper). Credentials are never allowed: the config session
