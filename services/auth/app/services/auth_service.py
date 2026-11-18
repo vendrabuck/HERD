@@ -349,7 +349,7 @@ class FederatedLogin:
 _EMAIL_MAX_LENGTH = 255
 _USERNAME_MAX_LENGTH = 100
 _FULL_NAME_MAX_LENGTH = 200
-_ISSUER_MAX_LENGTH = 255
+ISSUER_MAX_LENGTH = 255
 
 # Unicode categories Postgres cannot store in a text column through asyncpg:
 # control characters (Cc, NUL among them, which Postgres rejects) and lone
@@ -509,19 +509,29 @@ async def _username_taken(db: AsyncSession, username: str) -> bool:
     return result.scalar_one_or_none() is not None
 
 
+def identity_key_part_ok(value: object, limit: int) -> bool:
+    """Whether `value` may be an issuer or subject of a federated identity: a
+    string that is not blank, at most `limit` characters, and free of Cc and Cs
+    characters. The ONE predicate for both: a login's key check
+    (`_identity_key_refusal`) and the superadmin recovery routes' request
+    bodies (`app.schemas.federated_identity`) call it, so a pair the routes
+    accept is a pair a login can present, and the reverse (IAM-OIDC-32)."""
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and len(value) <= limit
+        and not _has_category(value, _UNSTORABLE)
+    )
+
+
 def _identity_key_refusal(login: FederatedLogin) -> str | None:
     """Checks on (issuer, subject), run BEFORE the identity lookup, since a
     value Postgres cannot store would make the lookup itself raise."""
     for reason, value, limit in (
-        ("issuer_invalid", login.issuer, _ISSUER_MAX_LENGTH),
+        ("issuer_invalid", login.issuer, ISSUER_MAX_LENGTH),
         ("subject_invalid", login.subject, SUBJECT_MAX_LENGTH),
     ):
-        if (
-            not isinstance(value, str)
-            or not value.strip()
-            or len(value) > limit
-            or _has_category(value, _UNSTORABLE)
-        ):
+        if not identity_key_part_ok(value, limit):
             return reason
     return None
 
