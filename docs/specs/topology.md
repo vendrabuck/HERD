@@ -1273,7 +1273,7 @@ is the user guide.
   check (OPS-VALID-6 in `operations-and-observability.md`) passes through, so the
   importer checks the JSON it parses itself. A character outside the BMP written as an
   escaped pair is imported. \
-  Enforced in: `services/cabling/app/services/bulk_service.py` (`_decode_import`, `parse_json_topologies`, `parse_csv_topologies`, `IMPORT_NOT_UTF8_DETAIL`, `IMPORT_NOT_TEXT_DETAIL`); `services/common/herd_common/validation_errors.py` (`lone_surrogate_locs`) \
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`_decode_import`, `parse_json_topologies`, `parse_csv_topologies`, `IMPORT_NOT_UTF8_DETAIL`, `IMPORT_NOT_TEXT_DETAIL`); `services/common/herd_common/validation_errors.py` (`holds_lone_surrogate`) \
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_non_utf8_import_file_is_422_naming_the_encoding`, `test_a_json_import_holding_a_lone_surrogate_is_a_fixed_422`, `test_a_json_import_with_a_surrogate_pair_escape_is_not_refused`)
 
 **Out of scope.** Device and inventory template import is `inventory.md`.

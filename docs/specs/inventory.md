@@ -1218,7 +1218,7 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   template name holding one made the report unencodable (a 500), and one in
   `field_data` was stored, so every later read of the device could not encode it. A
   character outside the BMP written as an escaped pair is imported. \
-  Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_json`, `_coerce_json_cell`, `IMPORT_NOT_TEXT_DETAIL`, `JSON_CELL_NOT_TEXT_REASON`); `services/common/herd_common/validation_errors.py` (`lone_surrogate_locs`) \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_json`, `_coerce_json_cell`, `IMPORT_NOT_TEXT_DETAIL`, `JSON_CELL_NOT_TEXT_REASON`); `services/common/herd_common/validation_errors.py` (`holds_lone_surrogate`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_json_import_holding_a_lone_surrogate_is_a_fixed_422`, `test_a_csv_json_cell_holding_a_lone_surrogate_rejects_that_row_only`)
 - **INV-BULK-21.** A device export, CSV or JSON, leaves out every dynamic-instance device
   (a device carrying a `request_id`); every other device is exported. An instance device
