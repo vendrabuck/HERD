@@ -21,6 +21,30 @@ The config service runs as a non-root user since issue #1326, and the `herd-conf
 
 The config service could not get an answer from the `restarter` container. Check it is up and healthy with `docker compose ps restarter` and read `docker compose logs restarter`. A stack upgraded with `make restart` instead of `make up` or `make prod` has no restarter yet (and still runs the old config image): run `make up` (`make prod` on a production host). `A restart is already in progress` means another Save and Restart is still running; wait for its result.
 
+### Sign-in says `Too many sign-in attempts`, or a script gets `429 Too many attempts; try again later`
+
+Auth counts every password attempt, successful or not, against the source address it
+comes from: a login in any mode, and a registration without an admin's access token
+(IAM-LOGIN-7). Each address may make `AUTH_LOGIN_MAX_ATTEMPTS` attempts at once (default
+60), refilling evenly over `AUTH_LOGIN_WINDOW_SECONDS` (default 60, so one a second).
+Past that the answer is HTTP 429 with a `Retry-After` header in seconds, before the
+password is checked, and the login page shows `Too many sign-in attempts. Try again in N
+seconds.` The limit is per address, never per account, so it does not mean the account
+is locked and it says nothing about the password: wait the stated seconds and sign in
+again. Everyone behind one NAT, VPN, or proxy shares one address and one allowance;
+`docker compose logs auth` shows one WARNING with action `auth_login_limited` and the
+address when an address starts being refused. If that address is a whole office,
+raise the two settings in `.env` and recreate auth (`docker compose up -d auth`); if it
+is one client, look for a script or a client stuck retrying. A test or seed script that
+signs in or registers in a burst meets the same limit from the test host: reuse one
+token, space the logins, or register through an admin's token as `make seed` does.
+Restarting auth clears every count.
+
+A `503 Too many password checks in progress; try again shortly` (the login page:
+`Could not reach HERD. Try again in a moment.`) is different: auth's bcrypt threads
+were all busy for 5 seconds (IAM-HASH-7). See the auth entry under Scaling and sizing
+in [OPERATIONS.md](OPERATIONS.md#scaling-and-sizing).
+
 ### The config page says `Too many failed login attempts`
 
 The config login limits failed attempts. A waiting login is answered HTTP 429 `Too many

@@ -326,8 +326,8 @@ Auth service:
 | Method | Path | Who may call | Success | Rules |
 |---|---|---|---|---|
 | GET | `/login-options` | anyone, unauthenticated; every mode | 200 | IAM-OIDC-16 |
-| POST | `/register` | anyone, unauthenticated; local mode only | 201 | IAM-REG-1 to IAM-REG-6, IAM-PROFILE-9 |
-| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-6, IAM-LDAP-1 to IAM-LDAP-13, IAM-OIDC-21 |
+| POST | `/register` | anyone, unauthenticated; local mode only | 201 | IAM-REG-1 to IAM-REG-6, IAM-PROFILE-9, IAM-LOGIN-7, IAM-HASH-7 |
+| POST | `/login` | anyone, unauthenticated | 200 | IAM-LOGIN-1 to IAM-LOGIN-7, IAM-LDAP-1 to IAM-LDAP-13, IAM-OIDC-21, IAM-HASH-7 |
 | GET | `/oidc/login` | anyone, unauthenticated; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-17 |
 | GET | `/oidc/callback` | anyone holding the `herd_oidc_flow` cookie; OIDC mode only, else 404 | 302 | IAM-OIDC-15, IAM-OIDC-18, IAM-OIDC-19 |
 | POST | `/oidc/exchange` | anyone holding the `herd_oidc_handoff` cookie; OIDC mode only, else 404 | 200 | IAM-OIDC-15, IAM-OIDC-20 |
@@ -502,7 +502,39 @@ short-lived access token and a refresh token.
   Enforced in: `services/auth/app/schemas/auth.py` (`LoginRequest`, `login_password_max_length`, `PASSWORD_MAX_LENGTH`, `LDAP_LOGIN_PASSWORD_MAX_LENGTH`) \
   Pinned by: `services/auth/tests/test_login_password_bound.py` (`test_every_mode_has_its_judges_bound`, `test_the_ldap_bound_never_exceeds_the_hashing_bound`, `test_ldap_mode_passes_a_long_password_to_the_directory_unchanged`, `test_ldap_mode_takes_1024_four_byte_characters`, `test_ldap_mode_refuses_past_1024_before_the_directory`, `test_local_mode_refuses_73_with_the_unchanged_422_before_bcrypt`, `test_local_mode_past_1024_is_refused_at_the_ceiling_of_every_mode`, `test_local_mode_signs_in_with_72`, `test_local_mode_422_matches_registrations`, `test_oidc_break_glass_refuses_73_before_bcrypt`, `test_oidc_break_glass_takes_72`); `services/auth/tests/test_ldap_service_live.py` (`test_bind_user_long_password_reaches_the_directory_unchanged`, `test_login_endpoint_accepts_a_100_character_directory_password`); `tests/integration/test_ldap_auth.py` (`test_ldap_user_with_a_100_character_password_signs_in`)
 
-**Out of scope.** Rate limiting and lockout after failed attempts do not exist.
+- **IAM-LOGIN-7.** Every password attempt counts against the source address it comes
+  from, admitted or refused, a success as much as a failure: `POST /login` in every
+  mode, and `POST /register` in local mode unless it carries the bearer access token of
+  an active account whose effective role (IAM-ROLE-5) is admin or superadmin (the seed
+  registers its population that way; such a registration costs one account read before
+  it is judged exempt). Each source has an allowance of `AUTH_LOGIN_MAX_ATTEMPTS`
+  attempts (default 60) that refills evenly over `AUTH_LOGIN_WINDOW_SECONDS` (default
+  60): a burst of 60, then one a second. An attempt with none left is the 429 `Too many
+  attempts; try again later` with `Retry-After` in whole seconds (at least 1, the time
+  until one attempt refills) and no `WWW-Authenticate`, answered before any query,
+  bcrypt, or directory call, with the same body and headers for every account, known
+  or unknown, right password or wrong; a refused attempt does not lengthen the wait.
+  Successes count so that one working password, which anyone can register in local
+  mode, cannot buy unlimited checks. Login and registration share the allowance.
+  Registration in LDAP or OIDC mode stays the 409 of IAM-REG-1 and counts nothing.
+  Nothing is keyed by email or login name, so no client can lock an account out and the
+  answer says nothing about whether an account exists; there is no cross-source
+  lockout, which one client could turn on everyone (the bound across sources is
+  IAM-HASH-7). The source is the last `X-Forwarded-For` entry when it parses as an IP
+  address, else the TCP peer: Traefik drops the forwarded headers a client sends and
+  appends the address it saw, so the last entry is the one no client wrote; an IPv6
+  source is keyed by its /64 network and an IPv4-mapped address as the IPv4 address.
+  The first refusal of a run logs one WARNING `auth_login_limited` with the source and
+  the wait, never an email or a password. State lives in the auth process on the
+  monotonic clock: a restart clears it, several workers or replicas would each count
+  separately, a source whose allowance has refilled is forgotten, and at most 10,000
+  sources are kept, the least recently seen dropped first. A setting below 1 falls back
+  to its default with a warning. \
+  Enforced in: `services/auth/app/services/login_limits.py` (`SourceLimiter`, `client_source`, `request_source`, `LIMITER`, `MAX_TRACKED_SOURCES`, `IPV6_PREFIX_LENGTH`, `LIMITED_ACTION`); `services/auth/app/routers/auth.py` (`login`, `register`, `_check_attempt_allowance`, `_registered_by_an_admin`, `ATTEMPTS_LIMITED_DETAIL`); `services/auth/app/config.py` (`auth_login_max_attempts`, `auth_login_window_seconds`) \
+  Pinned by: `services/auth/tests/test_login_limits.py` (`test_a_burst_of_max_attempts_is_admitted_then_refused_with_the_refill_wait`, `test_the_allowance_refills_evenly_one_attempt_per_interval`, `test_waiting_the_retry_after_always_admits_the_next_attempt`, `test_refusals_do_not_extend_the_wait`, `test_sources_are_isolated`, `test_a_source_whose_allowance_refilled_is_forgotten`, `test_tracked_sources_are_bounded_least_recently_seen_first`, `test_a_flood_of_distinct_sources_never_holds_more_than_the_cap`, `test_defaults_are_60_attempts_a_minute`, `test_a_setting_below_one_falls_back_to_its_default_with_a_warning`, `test_one_warning_per_run_of_refusals`, `test_the_last_forwarded_entry_is_the_source_never_one_the_client_wrote`, `test_a_last_entry_that_is_not_an_address_falls_back_to_the_peer_not_an_earlier_entry`, `test_an_ipv6_source_is_keyed_by_its_64_network`, `test_an_ipv4_mapped_address_is_keyed_as_ipv4`, `test_the_429_has_the_fixed_body_and_a_whole_second_retry_after`, `test_the_429_is_identical_for_known_and_unknown_accounts`, `test_a_refused_attempt_runs_no_query_no_bcrypt_and_no_directory_call`, `test_successful_logins_count_as_attempts`, `test_every_login_mode_is_limited_before_its_judge`, `test_an_unauthenticated_registration_counts_and_a_refused_one_creates_nothing`, `test_login_and_registration_share_one_allowance`, `test_a_registration_by_an_admin_is_not_counted`, `test_a_registration_by_anyone_else_is_counted`, `test_registration_in_ldap_or_oidc_mode_stays_409_and_counts_nothing`, `test_the_source_is_the_last_forwarded_entry_through_the_route`, `test_the_limited_log_line_holds_no_email_and_no_password`); `tests/integration/test_login_limits_flow.py` (`test_a_source_past_its_allowance_gets_the_fixed_429_for_every_account`)
+
+**Out of scope.** Lockout of an account after failed attempts does not exist, by
+design (IAM-LOGIN-7 is per source, never per account).
 
 ### 8.3 LDAP login and just-in-time provisioning
 
@@ -1559,8 +1591,9 @@ page and the `/login/sso` page are in section 8.19.
   length limits of IAM-LOGIN-3 and IAM-LOGIN-6, both password bounds, since the page
   cannot tell which mode judged it; a 429 shows `Too many sign-in attempts.` with the
   `Retry-After` wait when it is a whole number of seconds; any other status shows
-  `Sign-in failed with an unexpected answer. Try again in a moment.` Auth itself answers a
-  login with no 429 and no 403 (IAM-LOGIN-1). \
+  `Sign-in failed with an unexpected answer. Try again in a moment.` Auth answers a
+  login 429 for its per-source attempt limit (IAM-LOGIN-7) and never a 403; its 503 for
+  password checking at capacity (IAM-HASH-7) is a 5xx like the directory's. \
   Enforced in: `frontend/src/pages/LoginPage.tsx` (`LoginPage`); `frontend/src/lib/login.ts` (`loginErrorText`); `frontend/src/api/auth.ts` (`useLogin`); `frontend/src/api/client.ts` (`LOGIN_TIMEOUT_MS`, `withClientTimeout`) \
   Pinned by: `frontend/src/test/pages/LoginPage.test.tsx` (`shows the unconfigured banner and disables fields when configured=false`, `toasts an error when login is rejected`, `a network error says HERD is unreachable`, `a login that never answers is given up after 15 seconds and says HERD is unreachable`, `a 422 names the length limits instead of the credentials`, `a 429 says to wait, with the Retry-After seconds`, `a 403 gets the unexpected-answer wording, never the server's text`); `frontend/src/test/lib/login.test.ts` (`calls only a 401 a credential refusal`, `names both password bounds on a 422, since the page cannot tell which mode judged it`, `gives a 429 the rate-limit wording, with the wait when Retry-After is whole seconds`)
 - **IAM-UI-10.** Registration success sends the user to `/login`; a failure shows the
@@ -2057,10 +2090,22 @@ it on the pre-#1355 commit, is replayed by the tests
   never called). \
   Enforced in: `services/auth/app/services/passwords.py` (`hash_password`, `BCRYPT_ROUNDS`, `BCRYPT_IDENT`) \
   Pinned by: `services/auth/tests/test_password_hashing.py` (`test_the_dummy_hash_has_the_ident_and_cost_of_every_new_hash`, `test_a_usable_hash_is_checked_once_at_its_own_cost_and_never_rehashed`, `test_a_login_at_another_cost_succeeds_and_leaves_the_stored_hash_alone`, `test_a_hash_at_the_ceiling_is_checked_unchanged_at_its_own_cost`, `test_the_answer_at_the_ceiling_is_what_bcrypt_says`)
-- **IAM-HASH-7.** Hashing and checking are synchronous and run on the event loop, as
-  they did under passlib; a check at cost 12 holds the loop for its duration. \
-  Enforced in: `services/auth/app/services/auth_service.py` (`_authenticate_local`, `_authenticate_oidc_mode`, `create_user`) \
-  Pinned by: none (by decision; moving the work to a thread is a separate change)
+- **IAM-HASH-7.** No request hashes or checks a password on the event loop. `POST
+  /login` in local and OIDC mode and `POST /register` enter a hashing slot before their
+  first query, and every bcrypt computation (the check of a stored hash, the dummy
+  check, the break-glass check, the new hash at registration) runs on a worker thread
+  of auth's own pool of `AUTH_PASSWORD_HASH_THREADS` threads (default 0: half the CPUs
+  the auth process may run on, at least 1 and at most 4), never on anyio's shared
+  default pool, so at most that many run at once and every other route keeps
+  answering. A request waits at most 5 seconds for a slot, and at most 25 requests per
+  thread wait at once; past either bound it is the 503 `Too many password checks in
+  progress; try again shortly` with `Retry-After: 5`, before any query or check, for
+  every account alike, and never the 401. A login waiting for a slot holds no database
+  connection. LDAP mode takes no slot (its directory calls use anyio's default pool, as
+  before). The startup seed hashes on the same threads without a slot. The work of each
+  answer is unchanged (IAM-LOGIN-2, IAM-HASH-5). \
+  Enforced in: `services/auth/app/services/passwords.py` (`HashingPool`, `hashing_slot`, `run_hashing`, `HashingBusyError`, `effective_hash_threads`, `auto_hash_threads`, `HASH_WAIT_SECONDS`, `HASH_RETRY_AFTER_SECONDS`, `HASH_MAX_WAITING_PER_THREAD`); `services/auth/app/services/auth_service.py` (`authenticate_user`, `_check_password`, `create_user`); `services/auth/app/routers/auth.py` (`login`, `register`, `_hashing_busy`, `HASHING_BUSY_DETAIL`); `services/auth/app/config.py` (`auth_password_hash_threads`) \
+  Pinned by: `services/auth/tests/test_password_hashing_off_loop.py` (`test_the_automatic_thread_count_is_half_the_cpus_between_1_and_4`, `test_a_configured_thread_count_wins`, `test_the_pool_is_built_from_the_setting`, `test_at_most_threads_computations_run_at_once_never_on_the_default_pool`, `test_the_worker_limiter_binds_without_a_slot`, `test_a_slot_that_does_not_come_free_in_time_is_busy`, `test_past_the_waiting_bound_a_request_is_busy_at_once`, `test_concurrent_logins_never_block_the_event_loop`, `test_a_registration_never_blocks_the_event_loop`, `test_the_break_glass_login_never_blocks_the_event_loop`, `test_real_bcrypt_releases_the_event_loop`, `test_another_route_answers_while_every_slot_is_taken`, `test_a_login_with_no_free_slot_is_503_with_retry_after_and_checks_nothing`, `test_a_registration_with_no_free_slot_is_503_and_creates_nothing`, `test_ldap_mode_takes_no_hashing_slot`, `test_a_login_waits_for_a_slot_within_the_bound_and_then_signs_in`); `tests/integration/test_login_limits_flow.py` (`test_other_auth_routes_answer_while_logins_are_hashing`)
 - **IAM-HASH-8.** The auth service depends on bcrypt alone for hashing, with no upper
   bound, and passlib is not installed; importing and first use raise no warning. \
   Enforced in: `services/auth/pyproject.toml` (`bcrypt>=5.0.0`) \
@@ -2136,7 +2181,9 @@ password, though `msg` and `loc` can quote part of an email, a UUID, or a key na
 | 409 | `This grant already exists` | duplicate grant | IAM-ACL-2 |
 | 422 | validation list | registration, login, profile, group, bulk, mapping, token, grant, or check body out of bounds; a registration password holding a NUL or a lone surrogate, or a login password holding a lone surrogate; a profile body with a key other than the three profile fields, or a null or empty `full_name`; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-PROFILE-3, IAM-PROFILE-4, IAM-PROFILE-5, IAM-LOGIN-3, IAM-LOGIN-5, IAM-LOGIN-6, IAM-HASH-9, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2 |
 | 422 | `group_dn does not resolve in the directory` | mapping DN proven absent | IAM-MAP-3 |
+| 429 | `Too many attempts; try again later`, with `Retry-After` | a login, or a registration without an admin's token, from a source with no attempt left | IAM-LOGIN-7 |
 | 503 | `Directory unavailable, credentials not checked` | LDAP-mode login while the directory cannot be asked | IAM-LDAP-12 |
+| 503 | `Too many password checks in progress; try again shortly`, with `Retry-After: 5` | a local- or OIDC-mode login, or a registration, that got no hashing slot within 5 seconds | IAM-HASH-7 |
 | 503 | `Directory unavailable, mapping not validated` | mapping create while the directory cannot be asked | IAM-MAP-3 |
 | 503 | `Internal API token not configured` | an internal route with no token configured | IAM-INTERNAL-2 |
 
@@ -2170,6 +2217,8 @@ Calls into this area are in section 7 and the forwarded-JWT group routes noted u
 | `AUTH_ALGORITHM` | `HS256` | JWT algorithm: HS256, HS384, or HS512 (IAM-JWT-4) |
 | `AUTH_ACCESS_TOKEN_EXPIRE_MINUTES` | `30` | Access token lifetime, also the exchange's `expires_in` |
 | `AUTH_REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Refresh token lifetime |
+| `AUTH_LOGIN_MAX_ATTEMPTS`, `AUTH_LOGIN_WINDOW_SECONDS` | `60`, `60` | Per-source password attempts at once, and the seconds over which they refill (IAM-LOGIN-7) |
+| `AUTH_PASSWORD_HASH_THREADS` | `0` (half the CPUs, 1 to 4) | bcrypt worker threads (IAM-HASH-7) |
 | `INTERNAL_API_TOKEN` | empty | Shared service secret; empty makes auth's and acl's internal routes answer 503 and the shared helpers answer false |
 | `SUPERADMIN_EMAIL`, `SUPERADMIN_USERNAME`, `SUPERADMIN_PASSWORD` | empty | First-startup superadmin; any empty skips the seed |
 | `AUTH_METHOD` | `local` | `local`, `ldap`, or `oidc` (not yet supported for operators, section 8.19); one backend for every login |
@@ -2187,7 +2236,9 @@ Calls into this area are in section 7 and the forwarded-JWT group routes noted u
 | `LDAP_SYNC_DEACTIVATION_MAX_PERCENT`, `LDAP_SYNC_DEACTIVATION_MIN_COUNT` | `20`, `3` | Breaker terms |
 
 Fixed in code: LDAP connect timeout 10 s and receive timeout 30 s on the service
-connection and on the login user bind (IAM-LDAP-12); paged search size 500; detail
+connection and on the login user bind (IAM-LDAP-12); the hashing wait of 5 s, its
+`Retry-After` of 5, and 25 waiting requests per hashing thread (IAM-HASH-7); 10,000
+tracked sources and the IPv6 /64 key (IAM-LOGIN-7); paged search size 500; detail
 cap 20 per category; prune cadence 24 hours; bulk and batch caps 500.
 
 ## 12. Test coverage map
@@ -2195,9 +2246,9 @@ cap 20 per category; prune cadence 24 hours; bulk and batch caps 500.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/auth/tests/` (in-memory SQLite, `test_profile_schema.py`, `test_user_profile_migration.py`, `test_effective_role_unit.py`, `test_api_tokens.py`, `test_ldap_service.py`, `test_ldap_sync_service.py`, `test_ldap_sync_service_scaling.py`, `test_ldap_sync_stale_run_reaper.py`, `test_ldap_sync_loop.py`, `test_oidc_flow_service.py`, `test_oidc_provisioning.py`, `test_oidc_sso_migration.py`, `test_password_hashing.py` (the 802 recorded passlib decisions), `test_validation_errors.py`); `services/acl/tests/test_grant_service_unit.py`, `test_auth_client.py`, `test_schema_validators.py`; `services/common/tests/test_auth.py`, `test_auth_settings.py`, `test_internal_auth.py`, `test_acl.py`; `services/notifications/tests/test_router.py` (its token decode); `tests/unit/test_jwt_settings_wiring.py`; `frontend/src/test/` (`api/client.test.ts`, `stores/authStore.test.ts`, `lib/roles.test.ts`, `components/guards.test.tsx`, `components/AdminGuard.test.tsx`, `routes.test.tsx`, the admin page tests; single sign-on in the browser: `lib/sso.test.ts`, `api/sso.test.tsx`, `pages/LoginPageSso.test.tsx`, `pages/OidcCompletePage.test.tsx`, msw standing in for auth) | SQLite has no advisory locks, so only the in-process half of the run slot is exercised here |
-| Functional (through the service API) | `services/auth/tests/test_auth.py`, `test_user_profile_routes.py`, `test_groups.py`, `test_internal.py`, `test_ldap_sync.py`, `test_effective_role_http.py`, `test_auth_ldap.py`, `test_oidc_routes.py` (the single sign-on routes against a fake identity provider), `test_login_options.py`, `test_oidc_break_glass.py`, `test_password_hashing.py` (logins against stored legacy hashes), `test_password_input_validation.py` (the password rule and the 422 body at the real routes); `services/acl/tests/test_grants.py`, `test_internal.py`; the live suites `services/auth/tests/test_ldap_service_live.py` (real directory) and the real-Postgres suites `services/auth/tests/test_ldap_sync_service_live_pg.py` and `services/auth/tests/test_oidc_flow_service_live_pg.py` (the OIDC flow store and provisioning races) | The live-LDAP suite runs in the gates' live-LDAP phase; the Postgres suites in `_gate-pg-live-tests`. The single sign-on routes have unit and functional (fake provider, in-memory SQLite) tests only; the flow store and provisioning beneath them have Postgres-live tests, but no route is driven against a real Postgres yet, a gap open until ADR 0016 phases 5a and 5b add the live-provider, integration (running stack), load, and browser levels |
-| Integration (running stack) | `tests/integration/test_auth_flow.py`, `test_user_profile_flow.py`, `test_acl_flow.py`, `test_ldap_auth.py`, `test_ldap_sync_admin.py` | The LDAP ones run only in the gates' LDAP-mode phase |
-| Stress and load | `tests/load/locustfile.py` (every user logs in; `ACLChecker` exercises the check route; `NotificationUser` edits its own profile name) | No load test covers refresh, the token exchange, or a sync run |
+| Functional (through the service API) | `services/auth/tests/test_auth.py`, `test_user_profile_routes.py`, `test_groups.py`, `test_internal.py`, `test_ldap_sync.py`, `test_effective_role_http.py`, `test_auth_ldap.py`, `test_oidc_routes.py` (the single sign-on routes against a fake identity provider), `test_login_options.py`, `test_oidc_break_glass.py`, `test_password_hashing.py` (logins against stored legacy hashes), `test_password_input_validation.py` (the password rule and the 422 body at the real routes), `test_login_limits.py` (the per-source attempt limit, its bucket and source key as units, and its 429 at the real routes), `test_password_hashing_off_loop.py` (the hashing pool, the event loop kept free under concurrent logins, and the 503 at capacity); `services/acl/tests/test_grants.py`, `test_internal.py`; the live suites `services/auth/tests/test_ldap_service_live.py` (real directory) and the real-Postgres suites `services/auth/tests/test_ldap_sync_service_live_pg.py` and `services/auth/tests/test_oidc_flow_service_live_pg.py` (the OIDC flow store and provisioning races) | The live-LDAP suite runs in the gates' live-LDAP phase; the Postgres suites in `_gate-pg-live-tests`. The single sign-on routes have unit and functional (fake provider, in-memory SQLite) tests only; the flow store and provisioning beneath them have Postgres-live tests, but no route is driven against a real Postgres yet, a gap open until ADR 0016 phases 5a and 5b add the live-provider, integration (running stack), load, and browser levels |
+| Integration (running stack) | `tests/integration/test_auth_flow.py`, `test_user_profile_flow.py`, `test_acl_flow.py`, `test_ldap_auth.py`, `test_ldap_sync_admin.py`, `test_login_limits_flow.py` | The LDAP ones run only in the gates' LDAP-mode phase. `test_login_limits_flow.py` spends the test host's whole attempt allowance and then waits about a minute for it to refill, since every suite signs in from that one address |
+| Stress and load | `tests/load/locustfile.py` (every user logs in, waiting out a 429 from the attempt limit; `LoginLimitProbe` floods the login from the same host until the limit answers 429 and fails the run on any other answer; `ACLChecker` exercises the check route; `NotificationUser` edits its own profile name) | No load test covers refresh, the token exchange, or a sync run; nor a flood from many addresses, which one load host cannot produce through the gateway |
 | Browser end-to-end | `tests/e2e/test_login.py`, `test_register_and_roles.py`, `test_roles_playwright.py`, `test_user_profile_playwright.py`, `test_admin_guard_redirect_playwright.py`, `test_user_groups_playwright.py`, `test_acl_grants_playwright.py`, `test_ldap_sync_admin_playwright.py`, `test_ldap_login.py`, `test_login_pending_playwright.py`, `test_oidc_login_playwright.py` | Runs nightly and in the gates; the LDAP login tests are exempt skips on the local-mode gate stack, and `test_oidc_login_playwright.py` runs only in the gates' and nightly's OIDC stack phase (ADR 0016 phase 5b). `test_login.py` pins the local-mode page, which `GET /login-options` drives; `test_login_pending_playwright.py` holds that request in the browser to pin the pending state (IAM-OIDC-28) |
 
 Not run for this document: only the drift guard and the repository-root unit suite were
@@ -2223,6 +2274,13 @@ IAM-LOGIN-6.)
 - The login body has no NUL check, so a login password holding a NUL is not a 422: in
   local mode it is the 401 `Invalid credentials`, and in LDAP mode the same 401 before
   any directory call (IAM-LOGIN-5, IAM-HASH-3, IAM-LDAP-13). Recorded in issue #1426 (Expected and Suggested fix).
+- The attempt limit is per source address and per auth process (IAM-LOGIN-7): users
+  behind one address share one allowance, a restart clears every count, and with
+  several workers or replicas each counts separately. A proxy placed in front of
+  Traefik makes every client share that proxy's address. A flood from many addresses
+  is bounded by the hashing pool instead, whose 503s reach every password login while
+  it lasts (IAM-HASH-7). An admin's registrations are not counted, for the seed.
+  Recorded in the module docstring of `services/auth/app/services/login_limits.py`.
 - An admin may mint an API token for any principal of equal or lower rank, including
   another admin, and then act as that account (IAM-APITOK-2). Recorded in issue #312 and
   the comment in `create_token`; [SECURITY.md](../../SECURITY.md) treats admins as
@@ -2262,7 +2320,6 @@ IAM-LOGIN-6.)
 
 - IAM-SESSION-1: refresh token storage as a hash and its lifetime.
 - IAM-LOGIN-3: the login identifier bound.
-- IAM-HASH-7: hashing on the event loop (by decision, unchanged from passlib).
 - IAM-LDAP-11: the username fallback to the typed login name.
 - IAM-JWT-1: the claim set and lifetime of a login access token.
 - IAM-JWT-2: a refresh reissuing the current database role.
