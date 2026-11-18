@@ -12,10 +12,11 @@ ASGI): the compose wiring of the OIDC settings, the auth container reaching the
 issuer by the alias `oidc-test` on the stack network, the gateway's routing and
 prefix for the three routes, the cookies' Path through the gateway, and the
 mode's refusals on the real stack. Since issue #1399 it also drives the two
-superadmin recovery routes through the gateway (an issuer rewrite and an
-identity relink, each between a refused and a successful Dex sign-in), with a
-superadmin API token as the credential, the break-glass path that needs no
-password login in OIDC mode.
+superadmin recovery routes through the gateway (an issuer rewrite, an identity
+relink by a typed pair, and one by a relink candidate the refused sign-in left,
+each between a refused and a successful Dex sign-in), with a superadmin API
+token as the credential, the break-glass path that needs no password login in
+OIDC mode; each leaves alice's identity as it found it.
 
 Skipped unless HERD_INTEGRATION_OIDC=1 (which the gate phase sets), so the
 ordinary `make test-integration` and nightly's integration pass, both against a
@@ -554,6 +555,40 @@ async def test_a_reissued_subject_is_refused_then_recovered_by_the_relink(supera
             "PUT", path, superadmin_headers, {"issuer": ISSUER, "subject": subject}
         )
     assert (linked["user_id"], linked["issuer"], linked["subject"]) == (account, ISSUER, subject)
+    assert await _signed_in_id(ALICE) == account
+    assert _identity_count(subject) == 1
+
+
+async def test_a_refused_sign_in_leaves_a_candidate_and_a_relink_by_it_recovers(
+    superadmin_headers,
+):
+    """Owner decision of 2026-11-18: a refused Dex sign-in on alice's email is
+    kept as a relink candidate against her account; the superadmin lists it and
+    relinks by its id, and her next sign-in lands in the same account. Alice's
+    identity ends as it started, her real Dex subject."""
+    account = await _signed_in_id(ALICE)
+    path = f"/users/{account}/federated-identity"
+    subject = dex_subject(ALICE_USER_ID)
+    try:
+        # A typed relink discards any candidate an earlier test left.
+        await _admin_call(
+            "PUT", path, superadmin_headers, {"issuer": ISSUER, "subject": "oidc-it-stale-2"}
+        )
+        await _refused_sign_in(ALICE)
+        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+            listed = await client.get(
+                f"{BASE_URL}/auth{path}/candidates", headers=superadmin_headers
+            )
+        assert listed.status_code == 200, listed.text
+        candidates = listed.json()["candidates"]
+        assert [c["issuer"] for c in candidates] == [ISSUER]
+        assert subject not in listed.text
+        linked = await _admin_call(
+            "PUT", path, superadmin_headers, {"candidate_id": candidates[0]["id"]}
+        )
+        assert (linked["issuer"], linked["subject"]) == (ISSUER, subject)
+    finally:
+        await _admin_call("PUT", path, superadmin_headers, {"issuer": ISSUER, "subject": subject})
     assert await _signed_in_id(ALICE) == account
     assert _identity_count(subject) == 1
 
