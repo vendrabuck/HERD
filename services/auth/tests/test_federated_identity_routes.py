@@ -42,6 +42,7 @@ from app.models.federated_relink_candidate import (
 )
 from app.models.user import Role, User
 from app.routers import federated_identities as routes
+from app.schemas.federated_identity import FederatedIdentityLinkRequest
 from app.services import auth_service, federated_identity_service, oidc_service
 from app.services.api_token_service import create_api_token
 from app.services.auth_service import FederatedLogin, get_password_hash, resolve_federated_user
@@ -49,6 +50,7 @@ from app.services.federated_identity_service import identity_fingerprint
 from app.utils.jwt import create_access_token
 from cryptography.hazmat.primitives.asymmetric import rsa
 from herd_common.logging import JSONFormatter
+from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 
@@ -1331,14 +1333,39 @@ async def test_a_body_that_is_not_json_is_a_422_before_the_role_gate(client, pat
 
 
 @pytest.mark.asyncio
-async def test_a_lone_surrogate_in_a_subject_is_refused_as_identity_key_invalid(client, superadmin):
+async def test_a_lone_surrogate_in_a_subject_is_the_shared_422_before_the_role_gate(
+    client, superadmin
+):
+    """The shared body check (OPS-VALID-6) refuses a body holding a lone surrogate when
+    the route reads it, before the dependencies run, as FastAPI does for a body that is
+    not JSON: every caller, with or without a token and whatever its role, gets the same
+    422 `string_unicode` at the subject, for any id, so it says nothing about accounts.
+    The identity-key predicate still refuses the Cs character for a value that reaches
+    the schema another way."""
     victim = await make_oidc("victim")
-    resp = await client.put(
-        relink_path(victim.id),
-        content=b'{"issuer": "https://idp.test", "subject": "a\\ud800b"}',
-        headers={"Content-Type": "application/json", **bearer(superadmin)},
-    )
-    assert resp.status_code == 422
-    assert [(e["loc"], e["type"]) for e in resp.json()["detail"]] == [
-        (["body", "subject"], "identity_key_invalid")
+    user = await make_user("plain")
+    body = b'{"issuer": "https://idp.test", "subject": "a\\ud800b"}'
+    answers = []
+    for target, headers in (
+        (victim.id, bearer(superadmin)),
+        (victim.id, bearer(user)),
+        (uuid.uuid4(), {}),
+    ):
+        resp = await client.put(
+            relink_path(target),
+            content=body,
+            headers={"Content-Type": "application/json", **headers},
+        )
+        assert resp.status_code == 422, resp.text
+        answers.append(resp.json())
+    assert answers[0] == answers[1] == answers[2]
+    assert [(e["loc"], e["type"]) for e in answers[0]["detail"]] == [
+        (["body", "subject"], "string_unicode")
+    ]
+    with pytest.raises(ValidationError) as caught:
+        FederatedIdentityLinkRequest.model_validate(
+            {"issuer": "https://idp.test", "subject": "a\ud800b"}
+        )
+    assert [(e["loc"], e["type"]) for e in caught.value.errors()] == [
+        (("subject",), "identity_key_invalid")
     ]
