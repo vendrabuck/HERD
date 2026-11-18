@@ -186,38 +186,42 @@ MAX_LOCS_CHARS = 2048
 _MAY_HOLD_A_SURROGATE = (b"\\ud", b"\\uD", b"\xed")
 
 # The JSON escape grammar, for the raw scan. A backslash starts an escape only when the
-# run of backslashes it ends is odd. Each pattern starts at the first backslash of a run
-# (a backslash not preceded by one: the literal first lets the regular-expression engine
-# skip ahead to candidates), then takes the run's remaining escaped-backslash pairs
-# possessively, so `\\ud800` (an escaped backslash, then text) is not an escape and
-# `\\\ud800` is. `json.loads` joins a high-surrogate escape immediately followed by a
-# low-surrogate escape into one code point; every other surrogate escape, and every raw
-# surrogate, stays a lone surrogate in the parsed value. So a lone high is a high escape
-# not followed by a low one, and a lone low exists when there are more low escapes than
-# pairs (each pair holds exactly one).
+# run of backslashes it ends is odd. `json.loads` joins a high-surrogate escape
+# immediately followed by a low-surrogate escape into one code point; every other
+# surrogate escape, and every raw surrogate, stays a lone surrogate in the parsed value.
+#
+# A lone high is found by a search that starts at the first backslash of a run (a
+# backslash not preceded by one: the literal first lets the engine skip ahead), takes
+# the run's escaped-backslash pairs possessively, and needs a high escape not followed
+# by a low one, so `\\ud800` (an escaped backslash, then text) is no escape and
+# `\\\ud800` is. A lone low is found by one anchored match that reads the text from its
+# start as escapes, possessively: runs of other bytes, a backslash and the character it
+# escapes, a pair, or the `\u` of any other escape, until a low escape no pair took;
+# it runs only when the text holds a low escape at all. Both run in C,
+# never backtrack, and allocate nothing that grows with the body.
 _HEX = "[0-9a-fA-F]"
 _HIGH = "[dD][89abAB]" + _HEX * 2
 _LOW = "[dD][c-fC-F]" + _HEX * 2
 _ESCAPE = r"\\(?<!\\\\)(?:\\\\)*+u"
 _LONE_HIGH = _ESCAPE + _HIGH + r"(?!\\u" + _LOW + ")"
-_ANY_LOW = _ESCAPE + _LOW
-_PAIR = _ESCAPE + _HIGH + r"\\u" + _LOW
+_BARE_LOW = r"(?:[^\\]++|\\[^u]|\\u" + _HIGH + r"\\u" + _LOW + r"|\\u(?!" + _LOW + r"))*+\\u" + _LOW
+# A low escape's text, anywhere: without one there is no lone low to look for.
+_LOW_TEXT = r"\\u" + _LOW
 _LONE_HIGH_BYTES = re.compile(_LONE_HIGH.encode("ascii"))
-_ANY_LOW_BYTES = re.compile(_ANY_LOW.encode("ascii"))
-_PAIR_BYTES = re.compile(_PAIR.encode("ascii"))
+_BARE_LOW_BYTES = re.compile(_BARE_LOW.encode("ascii"))
+_LOW_TEXT_BYTES = re.compile(_LOW_TEXT.encode("ascii"))
 _RAW_SURROGATE_BYTES = re.compile(rb"\xed[\xa0-\xbf]")
 _LONE_HIGH_TEXT = re.compile(_LONE_HIGH)
-_ANY_LOW_TEXT = re.compile(_ANY_LOW)
-_PAIR_TEXT = re.compile(_PAIR)
+_BARE_LOW_TEXT = re.compile(_BARE_LOW)
+_LOW_TEXT_TEXT = re.compile(_LOW_TEXT)
 
 
 def _escapes_hold_a_lone_surrogate(
-    text: Any, lone_high: re.Pattern, any_low: re.Pattern, pair: re.Pattern
+    text: Any, lone_high: re.Pattern, low_text: re.Pattern, bare_low: re.Pattern
 ) -> bool:
-    if lone_high.search(text):
+    if lone_high.search(text) is not None:
         return True
-    lows = sum(1 for _ in any_low.finditer(text))
-    return lows > 0 and lows > sum(1 for _ in pair.finditer(text))
+    return low_text.search(text) is not None and bare_low.match(text) is not None
 
 
 _END = object()
@@ -227,14 +231,13 @@ def _raw_text_holds_a_lone_surrogate(body: bytes) -> bool:
     """Whether `json.loads(body)` would hold a lone surrogate, if `body` is JSON.
 
     Decided from the raw text, without parsing: a surrogate written as raw bytes, a high
-    escape not followed by a low one, or more low escapes than pairs. Each search runs
-    in C and allocates nothing that grows with the body; the counts step through the
-    low escapes and the pairs one match at a time. So the cost is linear in the body's
-    length and in its number of surrogate escapes, and does not depend on how many
-    elements it holds or how deeply they nest. It is never False
-    when the parsed value holds one. It can be True when the value does not: for a body
-    that is not JSON, or whose surrogate is in a member a later duplicate key replaces;
-    the parse that follows settles those.
+    escape not followed by a low one, or a low escape no pair holds. Each is one pass
+    in C that allocates nothing that grows with the body, so the cost is linear in the
+    body's length and does not depend on how many elements it holds or how deeply they
+    nest. It is never False when the parsed value holds one. It can be True when the
+    value does not: for a body that is not JSON, which the parse that follows passes
+    through, and for one whose surrogate is in a member a later duplicate key replaces,
+    which is refused all the same.
     """
     encoding = json.detect_encoding(body)
     if encoding in ("utf-8", "utf-8-sig"):
@@ -242,14 +245,16 @@ def _raw_text_holds_a_lone_surrogate(body: bytes) -> bool:
             return False
         if _RAW_SURROGATE_BYTES.search(body):
             return True
-        return _escapes_hold_a_lone_surrogate(body, _LONE_HIGH_BYTES, _ANY_LOW_BYTES, _PAIR_BYTES)
+        return _escapes_hold_a_lone_surrogate(
+            body, _LONE_HIGH_BYTES, _LOW_TEXT_BYTES, _BARE_LOW_BYTES
+        )
     try:  # UTF-16 or UTF-32, decoded exactly as `json.loads` decodes it
         text = body.decode(encoding, "surrogatepass")
     except UnicodeDecodeError:
         return False
     if _LONE_SURROGATE.search(text):
         return True
-    return _escapes_hold_a_lone_surrogate(text, _LONE_HIGH_TEXT, _ANY_LOW_TEXT, _PAIR_TEXT)
+    return _escapes_hold_a_lone_surrogate(text, _LONE_HIGH_TEXT, _LOW_TEXT_TEXT, _BARE_LOW_TEXT)
 
 
 def _items(container: dict | list) -> Any:

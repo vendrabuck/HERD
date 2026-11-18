@@ -347,6 +347,9 @@ def test_lone_surrogate_locs_is_not_limited_by_the_recursion_limit():
         (b'{"a": "\\ud83d\\\\ude00"}', [["body", "a"]]),
         (b'{"a": "\\ud83d\\ud83d\\ude00"}', [["body", "a"]]),
         (b'{"a": "\\ud83d\\ude00\\ude00"}', [["body", "a"]]),
+        # a low escape after other escapes, which the anchored match reads past
+        (b'{"a": "\\n\\"\\u0041\\udc00"}', [["body", "a"]]),
+        (b'{"a": "\\ud800\\udc00\\n", "b": "x\\udfff"}', [["body", "b"]]),
         # a member a later duplicate key replaces is refused all the same, at the body
         (b'{"a": "\\ud800", "a": "ok"}', [["body"]]),
         # an escaped backslash followed by text that reads like an escape
@@ -375,6 +378,8 @@ def test_lone_surrogate_locs_is_not_limited_by_the_recursion_limit():
         "pair_then_escaped_backslash",
         "high_high_low",
         "high_low_low",
+        "low_after_other_escapes",
+        "pair_then_lone_low_elsewhere",
         "duplicate_key",
         "escaped_backslash",
         "backslash_pair_then_escape",
@@ -1023,3 +1028,18 @@ def test_through_an_app_a_refused_body_costs_about_what_main_pays(shape):
     branch_time, branch_status = timed(True)
     assert (main_status, branch_status) == (401, 422)
     assert branch_time < 2 * main_time
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _fill("\\ud83d\\ude00", '{"name":"', '"}'),
+        _fill("\\n", '["', '\\udc00"]'),
+        _fill("\\\\", '["', '\\udc00"]'),
+    ],
+    ids=["escaped_pairs", "newline_escapes_then_low", "escaped_backslashes_then_low"],
+)
+def test_the_raw_scan_holds_no_memory_that_grows_with_the_body(body):
+    from herd_common.validation_errors import _raw_text_holds_a_lone_surrogate
+
+    assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 64 * 1024
