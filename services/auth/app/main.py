@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from herd_common.cors import add_cors_middleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.schema_init import create_all_and_stamp
+from herd_common.validation_errors import install_validation_errors
 from herd_common.version import add_version_route, service_version
 
 from app.config import log_oidc_startup_warnings, settings
@@ -35,7 +36,6 @@ from app.tasks.ldap_sync_loop import (
     ldap_group_sync_loop_enabled,
     ldap_sync_loop,
 )
-from app.validation_errors import install_validation_errors
 
 setup_logging("auth", level=settings.log_level)
 logger = logging.getLogger(__name__)

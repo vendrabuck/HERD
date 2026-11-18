@@ -194,8 +194,13 @@ the web interface's API does.
   Pinned by: `services/integration/tests/test_facade.py` (`test_create_forwards_jwt_and_translated_body`, `test_create_forwards_and_returns_purpose_category`, `test_create_purpose_category_defaults_to_none`)
 - **INTEG-FACADE-4.** The facade validates its own request body before any upstream call:
   `device_ids` holds 1 to 200 UUIDs, `start_time` and `end_time` are required datetimes,
-  `purpose` is at most 2000 characters; a failure is 422 in FastAPI's
-  `{"detail": [{type, loc, msg, input}]}` envelope. \
+  `purpose` is at most 2000 characters; a failure is 422 with the
+  `{"detail": [{type, loc, msg}]}` envelope, each item exactly those keys (the shared
+  handler, OPS-VALID-1 in `operations-and-observability.md`). Until issue #1455 each item
+  also carried FastAPI's optional `input` and sometimes `ctx`; removing them within v1
+  is by decision, a security fix recorded in [EXTERNAL_API.md](../EXTERNAL_API.md)
+  (Versioning and deprecation policy): neither key was ever required, and `input`
+  echoed the submitted body. \
   Enforced in: `services/integration/app/schemas/reservation.py` (`V1ReservationRequest`) \
   Pinned by: `services/integration/tests/test_facade.py` (`test_validation_error_envelope_shape`)
 - **INTEG-FACADE-5.** Every reservation in a facade answer carries exactly `id`, `status`
@@ -977,7 +982,7 @@ kinds on the Settings page.
 | 404 | `Webhook not found` | unknown subscription on read, pause or resume, delete, or deliveries | INTEG-HOOK-6, INTEG-HOOK-7, INTEG-HOOK-9, INTEG-HOOK-10 |
 | 422 | `target_url must resolve to a public address` | a webhook destination whose host is not public, not allowlisted, or does not resolve | INTEG-HOOK-2 |
 | 404 | `Notification not found` | unknown or foreign notification on mark read or delete | INTEG-INAPP-6, INTEG-INAPP-9 |
-| 422 | FastAPI validation envelope | a facade body that fails `V1ReservationRequest`; a facade reservation id that is not a UUID; a webhook body with a bad URL, unknown or empty event types, or an over-long field; a webhook PATCH body that is not exactly a boolean `is_active`; a facade list or notification list parameter out of range | INTEG-FACADE-4, INTEG-FACADE-6, INTEG-FACADE-15, INTEG-HOOK-2, INTEG-HOOK-3, INTEG-HOOK-9, INTEG-INAPP-3 |
+| 422 | validation list, each item exactly `{type, loc, msg}` | a facade body that fails `V1ReservationRequest`; a facade reservation id that is not a UUID; a webhook body with a bad URL, unknown or empty event types, or an over-long field; a webhook PATCH body that is not exactly a boolean `is_active`; a facade list or notification list parameter out of range | INTEG-FACADE-4, INTEG-FACADE-6, INTEG-FACADE-15, INTEG-HOOK-2, INTEG-HOOK-3, INTEG-HOOK-9, INTEG-INAPP-3 |
 | upstream status | upstream `detail`, body, or text | reservations refused a facade call | INTEG-FACADE-12, INTEG-FACADE-13 |
 | 503 | `Reservations service unavailable` | reservations unreachable or slower than 10 seconds | INTEG-FACADE-14 |
 | 503 | `user-profile unreachable` | user-profile unreachable on a preferences read or write | INTEG-PREFS-3 |
