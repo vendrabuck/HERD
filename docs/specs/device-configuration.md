@@ -893,12 +893,16 @@ is WIRE-DRIVER-6 in `provisioning-and-wiring.md`.
   `method_kwargs` only as a masked copy, for every action: a value under a key whose name
   matches the log formatter's credential key pattern is `[redacted]`, and inside a string
   everything after a credential keyword token (`password`, `passwd`, `passphrase`,
-  `secret`, `community`, `key`, `key-string`, `md5`, or a hyphenated or underscored
-  name ending in one) on the same line is `[redacted]`. `method_kwargs_redacted` records
+  `secret`, `community`, `key`, `key-string`, `md5`, `authentication`, `auth`, or a
+  hyphenated or underscored name ending in one) on the same line is `[redacted]`.
+  `authentication` and `auth` (issue #1464) catch FRR's `ip rip authentication string`,
+  `ip nhrp authentication`, and `tcp-md5-auth` secrets and also mask the mode word after
+  `ip ospf authentication`. Both rules are heuristics with the limits section 13 lists.
+  `method_kwargs_redacted` records
   whether anything was masked, and a `config_version_id` the caller sent is stored
   beside it. The driver receives the arguments as sent. \
   Enforced in: `services/execution/app/services/execution_service.py` (`create_execution_run`); `services/common/herd_common/config_redaction.py` (`redact_config`, `redact_command_text`) \
-  Pinned by: `services/execution/tests/test_run_arguments_storage.py` (`test_configure_run_stores_no_credential_value_from_an_frr_config`, `test_run_without_credentials_stores_its_arguments_as_sent`, `test_internal_execute_records_the_config_version`, `test_create_execution_run_masks_any_action_arguments`); `services/common/tests/test_config_redaction.py` (`test_frr_config_keeps_no_credential_value`, `test_value_under_a_credential_named_key_is_masked_whole`, `test_configuration_without_credentials_is_unchanged`, `test_words_that_only_contain_a_keyword_are_not_keywords`)
+  Pinned by: `services/execution/tests/test_run_arguments_storage.py` (`test_configure_run_stores_no_credential_value_from_an_frr_config`, `test_run_without_credentials_stores_its_arguments_as_sent`, `test_internal_execute_records_the_config_version`, `test_create_execution_run_masks_any_action_arguments`); `services/common/tests/test_config_redaction.py` (`test_frr_config_keeps_no_credential_value`, `test_value_under_a_credential_named_key_is_masked_whole`, `test_configuration_without_credentials_is_unchanged`, `test_words_that_only_contain_a_keyword_are_not_keywords`, `test_frr_lines_whose_secret_follows_an_authentication_keyword_are_masked`, `test_a_line_that_ends_at_an_authentication_keyword_is_unchanged`, `test_words_that_only_contain_auth_are_not_keywords`, `test_known_limits_are_left_as_written`)
 - **CFG-EXEC-9.** A driver load failure ends the run `FAILED` with
   `driver load failed: <ClassName>` (the wrapped cause's class when there is one); the
   exception text goes to the log message only. \
@@ -1535,6 +1539,17 @@ None at present. (#1279 is resolved by CFG-LOAD-3.)
 
 ### Limits by decision
 
+- The credential mask is a heuristic (the `config_redaction.py` module docstring,
+  "Limits") (CFG-EXEC-8). The key rule reads key names against the log formatter's
+  pattern (`password`, `passwd`, `secret`, `authorization`, `api_key`, `kek`, `cookie`,
+  `credential`, `jwt`, `bearer`, `private_key`, `ssh_key`, `community`, `token` except
+  `token_id` and `token_count`), so a secret under any other key name (`psk`, `md5`,
+  `key`, `passphrase`, `pre_shared_key`) is not masked unless its value carries a
+  keyword; the string rule masks only what follows a keyword token on its line, so a
+  secret in free text with no keyword before it is not masked. No in-repo driver's
+  configuration schema has a credential-bearing field the key rule misses (the
+  registry's fields and `frr_mgmt`'s `commands` and `command`, checked for issue #1464);
+  a new driver whose schema has one extends the pattern in `herd_common`, never a copy.
 - A driver's dry-run declaration is trusted ([DRIVERS.md](../DRIVERS.md), "Dry-run
   support") (CFG-DRY-4).
 - Driver packages are trusted code and the sandbox limits resources only
@@ -1575,7 +1590,9 @@ None at present. (#1279 is resolved by CFG-LOAD-3.)
   are never edited in place, so a version id names one configuration (the
   `_recover_masked_kwargs` docstring) (CFG-RUN-7). A run that a direct `POST /execute`
   started with masked arguments and no `config_version_id` cannot be retried; a new run
-  is the way (CFG-RUN-7).
+  is the way (CFG-RUN-7). A run masked before issue #1464 widened the keywords, whose
+  configuration also holds an `authentication` or `auth` line, no longer equals its
+  re-masked version and its retry is refused the same way (CFG-RUN-7, CFG-EXEC-8).
 - A run refused before issue #1457 keeps the old refusal text in its row, which can
   quote the refused configuration, credentials included. Every run read withholds it
   (CFG-RUN-8), but a direct database read, a log line written before the upgrade, and

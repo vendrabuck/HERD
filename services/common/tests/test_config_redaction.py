@@ -110,3 +110,42 @@ def test_structures_beyond_the_depth_cap_are_masked_whole():
     while isinstance(node, dict):
         node = node["next"]
     assert node == REDACTED_VALUE
+
+
+def test_frr_lines_whose_secret_follows_an_authentication_keyword_are_masked():
+    # Issue #1464: the FRR forms whose secret follows no password, key, or md5
+    # token. Each is reachable through the in-repo frr_mgmt driver's commands.
+    lines = {
+        " ip rip authentication string RipS3cret": " ip rip authentication",
+        " ip nhrp authentication NhrpS3cret": " ip nhrp authentication",
+        "  tcp-md5-auth PcepS3cret": "  tcp-md5-auth",
+        "snmp-server user u1 g1 v3 auth sha AuthS3cret priv aes PrivS3cret": (
+            "snmp-server user u1 g1 v3 auth"
+        ),
+    }
+    for line, kept in lines.items():
+        redacted, changed = redact_command_text(line)
+        assert changed is True, line
+        assert redacted == f"{kept} {REDACTED_VALUE}"
+
+
+def test_a_line_that_ends_at_an_authentication_keyword_is_unchanged():
+    for line in (" ip ospf authentication", "no ip rip authentication", "aaa auth"):
+        assert redact_command_text(line) == (line, False)
+
+
+def test_words_that_only_contain_auth_are_not_keywords():
+    for line in ("description author jordan", "authorized users only", "oauth2 client on"):
+        assert redact_command_text(line) == (line, False)
+
+
+def test_known_limits_are_left_as_written():
+    # Pinned so a widening of either rule is a deliberate change: a secret
+    # under a key the name pattern does not match, and a secret in free text
+    # with no keyword before it, are not masked (the module docstring's Limits).
+    redacted, changed = redact_config(
+        {"psk": "Psk5ecret", "commands": ["neighbor 192.0.2.1 remote-as 1 Fr3eText"]}
+    )
+    assert changed is False
+    assert redacted["psk"] == "Psk5ecret"
+    assert redacted["commands"] == ["neighbor 192.0.2.1 remote-as 1 Fr3eText"]
