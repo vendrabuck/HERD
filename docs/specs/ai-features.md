@@ -748,9 +748,11 @@ route `POST /commit` (body `CommitRequest`); the flow in
 - **AI-COMMIT-3.** Before any write, every device's `config` is validated against the
   `connection_type` the request supplies; a missing config passes, and a config with no or
   an unregistered connection type, an unknown key, or a bad value answers 422 with nothing
-  written. The schema registry itself is `device-configuration.md`. \
+  written; the 422 names the role, the field, and the rule, never the proposed value
+  (`device-configuration.md`, CFG-SCHEMA-4). The schema registry itself is
+  `device-configuration.md`. \
   Enforced in: `services/ai-orchestrator/app/services/committer.py` (`commit_proposal`); `services/ai-orchestrator/app/services/config_validator.py` (`validate_device_config`) \
-  Pinned by: `services/ai-orchestrator/tests/test_commit.py` (`test_commit_rejects_config_without_connection_type`, `test_commit_rejects_config_on_unsupported_connection_type`, `test_commit_rejects_unknown_config_key`, `test_commit_rejects_out_of_range_vlan`, `test_commit_allows_no_config_on_unknown_connection_type`)
+  Pinned by: `services/ai-orchestrator/tests/test_commit.py` (`test_commit_rejects_config_without_connection_type`, `test_commit_rejects_config_on_unsupported_connection_type`, `test_commit_rejects_unknown_config_key`, `test_commit_rejects_out_of_range_vlan`, `test_commit_refusal_never_quotes_the_config`, `test_commit_allows_no_config_on_unknown_connection_type`)
 - **AI-COMMIT-4.** The canvas has one `deviceNode` per device whose `data` is
   `{device: {id}, label: <role>, topologyType: "PHYSICAL"}`, placed at the request's
   position or in a row; each device-to-device edge is `{id, source, target, data: {layer}}`;
