@@ -503,6 +503,34 @@ Available device templates (template_name: available count):
 """
 
 
+def _sections_for_identity_prompt(sections: list[Any]) -> list[dict[str, Any]]:
+    """The template sections as the identity prompt carries them (issue #1464).
+
+    A password-typed field's `default` is the shared credential the template's
+    devices inherit, and an admin's editor holds it unmasked, so it is left out
+    before the sections reach the provider. Only the template's own shape goes
+    out: a section that is not an object, a `fields` that is not a list, and a
+    field that is not an object are dropped rather than sent unread.
+    """
+    cleaned: list[dict[str, Any]] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        copy = dict(section)
+        fields = copy.get("fields")
+        if fields is not None:
+            kept: list[dict[str, Any]] = []
+            for field in fields if isinstance(fields, list) else []:
+                if not isinstance(field, dict):
+                    continue
+                if str(field.get("type", "")).lower() == "password":
+                    field = {k: v for k, v in field.items() if k != "default"}
+                kept.append(field)
+            copy["fields"] = kept
+        cleaned.append(copy)
+    return cleaned
+
+
 class AIClient:
     def __init__(self, *, provider: LLMProvider, max_tokens: int) -> None:
         self._provider = provider
@@ -616,7 +644,7 @@ class AIClient:
             user_parts.append(f"<template_description>{description}</template_description>")
         if sections:
             try:
-                sections_json = json.dumps(sections)
+                sections_json = json.dumps(_sections_for_identity_prompt(sections))
             except (TypeError, ValueError):
                 sections_json = "[]"
             user_parts.append(f"<template_sections>{sections_json}</template_sections>")

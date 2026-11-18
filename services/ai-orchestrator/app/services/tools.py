@@ -12,6 +12,14 @@ JWT forwarding mirrors reservation_context.py: a shared httpx.AsyncClient
 with the caller's Bearer token. Device fetches are bounded by a Semaphore.
 Tool results are JSON-serialised and truncated to a configurable char cap to
 prevent any single tool from blowing the model's context window.
+
+Credential masking (issue #1464): every tool that relays a stored device
+configuration or a run row derived from one (get_device_current_config,
+list_device_config_history, list_executions_for_reservation) masks it with
+herd_common.config_redaction, the same rule execution applies to stored run
+arguments (CFG-EXEC-8), and marks the result with `redacted` and a fixed note.
+A result that cannot be masked is withheld, never sent as stored: a tool result
+reaches the model provider and is stored in assistant_messages.content_blocks.
 """
 
 from __future__ import annotations
@@ -26,6 +34,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
+from herd_common.config_redaction import REDACTED_VALUE, redact_command_text, redact_config
 
 from app.config import settings
 from app.services import docs_sources, docs_web
@@ -43,6 +52,26 @@ DEFAULT_TOOL_RESULT_CHAR_CAP = 8000
 DOC_WINDOW_RATIO = 0.7
 DOC_WINDOW_OVERHEAD = 200
 MIN_DOC_WINDOW = 512
+
+# Fixed notes for a masked or withheld tool result (issue #1464). Fixed text, so
+# nothing from the stored data can reach them; the model relays them as written.
+REDACTED_NOTE = (
+    "HERD replaced credential values in this result with [redacted] before sending "
+    "it. [redacted] is not the stored text: never copy it into a configuration. The "
+    "user can read the unmasked values in HERD itself."
+)
+CONFIG_WITHHELD_NOTE = (
+    "HERD withheld this configuration because it could not be checked for "
+    "credentials; only the version's metadata is shown. The user can read the "
+    "configuration in HERD itself."
+)
+ITEMS_WITHHELD_NOTE = (
+    "HERD left out entries it could not check for credentials; `withheld` counts them."
+)
+REDACTED_MARKER_REFUSAL = (
+    f"config_payload contains {REDACTED_VALUE}, a masked value from a tool result, not "
+    f"the device's real text; leave out every line that holds it"
+)
 
 
 class ToolError(Exception):
@@ -100,7 +129,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Fetch the device's latest applied configuration (version metadata "
             "plus the config payload). Returns {'has_config': false} if no "
-            "config version has ever been recorded for this device."
+            "config version has ever been recorded for this device. Credential "
+            "values are replaced with [redacted] before you see them, and "
+            "`redacted` says whether anything was; [redacted] is never the real "
+            "text, so never copy it into a config_payload. When the payload "
+            "cannot be checked, `config_withheld` is true and only metadata is "
+            "returned."
         ),
         "input_schema": {
             "type": "object",
@@ -115,9 +149,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "list_device_config_history",
         "description": (
             "List recent config versions for a device, newest first. Returns "
-            "version metadata only (id, version_number, description, author, "
-            "created_at, last_apply_run_id). Useful for reasoning about "
-            "config drift over time."
+            "{items, redacted}: version metadata only (id, version_number, "
+            "description, author, created_at, last_apply_run_id), masked like "
+            "get_device_current_config. Useful for reasoning about config drift "
+            "over time."
         ),
         "input_schema": {
             "type": "object",
@@ -181,7 +216,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "List recent execution runs for the current reservation. The "
             "reservation is fixed; you do not need to supply it. Optional "
             "filters: device_id (limit to runs on one device), status "
-            "(PENDING, RUNNING, SUCCESS, FAILED)."
+            "(PENDING, RUNNING, SUCCESS, FAILED). Credential values in a run's "
+            "arguments, output, and error are replaced with [redacted], and "
+            "`redacted` says whether anything was."
         ),
         "input_schema": {
             "type": "object",
@@ -418,6 +455,150 @@ def _flatten_password_keys_present(payload: Any, password_keys: set[str]) -> set
 
     _walk(payload)
     return found
+
+
+class _Unmaskable(Exception):
+    """A stored record is not a shape the masking helper is applied to."""
+
+
+def _mask_record(record: Any) -> tuple[dict[str, Any], bool]:
+    """A masked copy of one JSON object from upstream, and whether anything was
+    masked. Anything but an object is _Unmaskable, and so is a copy that does
+    not come back as an object."""
+    if not isinstance(record, dict):
+        raise _Unmaskable("record is not an object")
+    masked, changed = redact_config(record)
+    if not isinstance(masked, dict):
+        raise _Unmaskable("masked record is not an object")
+    return masked, changed
+
+
+def _mask_run_output(output: Any) -> tuple[Any, bool]:
+    """Mask a run's `output`, the JSON text of what the driver returned.
+
+    The text is parsed and the structure masked, then written back as JSON: a
+    driver's returned command list (frr_mgmt's `applied` and `attempted`) is
+    stored on ONE line, where the line rule would also mask every command after
+    the first keyword. Text that is not JSON is masked line by line.
+    """
+    if output is None:
+        return None, False
+    if not isinstance(output, str):
+        return redact_config(output)
+    try:
+        parsed = json.loads(output)
+    except ValueError:
+        return redact_command_text(output)
+    masked, changed = redact_config(parsed)
+    return (json.dumps(masked) if changed else output), changed
+
+
+def _mask_run_row(row: Any) -> tuple[dict[str, Any], bool]:
+    """A masked copy of one execution run row: `output` through
+    _mask_run_output, every other field through redact_config."""
+    if not isinstance(row, dict):
+        raise _Unmaskable("run row is not an object")
+    rest, changed = _mask_record({k: v for k, v in row.items() if k != "output"})
+    if "output" in row:
+        rest["output"], output_changed = _mask_run_output(row["output"])
+        changed = changed or output_changed
+    return rest, changed
+
+
+def _mask_items(
+    tool_name: str, items: list[Any], mask_one: Any
+) -> tuple[list[dict[str, Any]], bool, int]:
+    """Mask each item of a listing; an item that cannot be masked is left out
+    and counted, never passed through. Returns (items, masked_any, withheld)."""
+    masked_items: list[dict[str, Any]] = []
+    masked_any = False
+    withheld = 0
+    for item in items:
+        try:
+            masked, changed = mask_one(item)
+        except Exception as exc:  # noqa: BLE001
+            # Fail closed: whatever went wrong, the item is not sent unmasked.
+            withheld += 1
+            logger.warning(
+                "ai_tool_result_withheld",
+                extra={"tool": tool_name, "error_class": type(exc).__name__},
+            )
+            continue
+        masked_items.append(masked)
+        masked_any = masked_any or changed
+    return masked_items, masked_any, withheld
+
+
+def _mark_masked(result: dict[str, Any], masked_any: bool, withheld: int) -> dict[str, Any]:
+    """Add the `redacted` marker (and `withheld`, and the fixed note) to a
+    listing result. `redacted` is true when anything was masked or left out."""
+    result["redacted"] = masked_any or withheld > 0
+    notes = []
+    if masked_any:
+        notes.append(REDACTED_NOTE)
+    if withheld:
+        result["withheld"] = withheld
+        notes.append(ITEMS_WITHHELD_NOTE)
+    if notes:
+        result["note"] = " ".join(notes)
+    return result
+
+
+def _config_version_result(detail: Any, listing_item: Any, version_id: Any) -> dict[str, Any]:
+    """The get_device_current_config result for one version detail.
+
+    The whole detail is masked, so the config payload and any other field
+    derived from it are covered. A detail whose `config` is not an object, or
+    whose masking fails, is withheld: the result is the version's metadata
+    (masked) with no `config`, `config_withheld: true`, and a fixed note. When
+    even the metadata cannot be masked, only the version id is kept.
+    """
+    try:
+        if not isinstance(detail, dict) or not isinstance(detail.get("config"), dict):
+            raise _Unmaskable("config payload is not an object")
+        masked, changed = _mask_record(detail)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "ai_tool_result_withheld",
+            extra={"tool": "get_device_current_config", "error_class": type(exc).__name__},
+        )
+        return _withheld_version_result(detail, listing_item, version_id)
+    result: dict[str, Any] = {"has_config": True, **masked}
+    result["has_config"] = True
+    result["redacted"] = changed
+    if changed:
+        result["note"] = REDACTED_NOTE
+    return result
+
+
+def _withheld_version_result(detail: Any, listing_item: Any, version_id: Any) -> dict[str, Any]:
+    source = detail if isinstance(detail, dict) else listing_item
+    try:
+        metadata, _ = _mask_record({k: v for k, v in source.items() if k != "config"})
+    except Exception:  # noqa: BLE001
+        metadata = {}
+    metadata.pop("config", None)
+    result: dict[str, Any] = {"has_config": True, **metadata}
+    result["has_config"] = True
+    result.setdefault("id", str(version_id))
+    result["config_withheld"] = True
+    result["redacted"] = True
+    result["note"] = CONFIG_WITHHELD_NOTE
+    return result
+
+
+def _holds_redacted_marker(node: Any) -> bool:
+    """True when REDACTED_VALUE appears in any string or key of the payload."""
+    if isinstance(node, str):
+        return REDACTED_VALUE in node
+    if isinstance(node, dict):
+        return any(
+            _holds_redacted_marker(key) or _holds_redacted_marker(value)
+            for key, value in node.items()
+        )
+    if isinstance(node, list):
+        return any(_holds_redacted_marker(item) for item in node)
+    return False
 
 
 def _http_error_message(exc: httpx.HTTPError) -> str:
@@ -671,9 +852,13 @@ class ToolDispatcher:
         )
         detail_resp = await self._http.get(detail_url, headers=self._auth_headers)
         detail_resp.raise_for_status()
-        return {"has_config": True, **detail_resp.json()}
+        try:
+            detail = detail_resp.json()
+        except ValueError:
+            detail = None
+        return _config_version_result(detail, latest, version_id)
 
-    async def _tool_list_device_config_history(self, args: dict[str, Any]) -> list[dict[str, Any]]:
+    async def _tool_list_device_config_history(self, args: dict[str, Any]) -> dict[str, Any]:
         device_id = _require_uuid(args, "device_id")
         limit = int(args.get("limit", 10))
         if not 1 <= limit <= 50:
@@ -687,7 +872,13 @@ class ToolDispatcher:
             raise ToolError(f"device {device_id} not found")
         resp.raise_for_status()
         listing = resp.json()
-        return listing.get("items", []) if isinstance(listing, dict) else listing
+        items = listing.get("items", []) if isinstance(listing, dict) else listing
+        if not isinstance(items, list):
+            raise ToolError("inventory answered the config history in an unexpected shape")
+        masked, masked_any, withheld = _mask_items(
+            "list_device_config_history", items, _mask_record
+        )
+        return _mark_masked({"items": masked}, masked_any, withheld)
 
     async def _tool_get_device_config_schema(self, args: dict[str, Any]) -> dict[str, Any]:
         # Imported lazily so unit tests that do not exercise the schema-discovery
@@ -855,7 +1046,19 @@ class ToolDispatcher:
         if resp.status_code == 403:
             raise ToolError("execution runs require reservation ownership or admin role")
         resp.raise_for_status()
-        return resp.json()
+        body = resp.json()
+        items = body.get("items") if isinstance(body, dict) else None
+        if not isinstance(items, list):
+            raise ToolError("execution answered the run list in an unexpected shape")
+        masked, masked_any, withheld = _mask_items(
+            "list_executions_for_reservation", items, _mask_run_row
+        )
+        try:
+            envelope, _ = _mask_record({k: v for k, v in body.items() if k != "items"})
+        except Exception:  # noqa: BLE001
+            envelope = {}
+        envelope.pop("items", None)
+        return _mark_masked({**envelope, "items": masked}, masked_any, withheld)
 
     # --- Documentation tools (ADR 0015, gated by the enabled source set) ---
 
@@ -935,6 +1138,10 @@ class ToolDispatcher:
         if not isinstance(payload, dict):
             raise ToolError("config_payload must be an object")
         description = (args.get("description") or "")[:500]
+        # A [redacted] marker is masked text from a read tool (issue #1464), never
+        # a value: writing it would store the marker as the device's credential.
+        if _holds_redacted_marker(payload):
+            raise ToolError(REDACTED_MARKER_REFUSAL)
 
         # Password-field rejection BEFORE the write hits inventory. Inverts the
         # iter-2 strip helper: instead of dropping password keys on read, refuse

@@ -898,6 +898,8 @@ is WIRE-DRIVER-6 in `provisioning-and-wiring.md`.
   `authentication` and `auth` (issue #1464) catch FRR's `ip rip authentication string`,
   `ip nhrp authentication`, and `tcp-md5-auth` secrets and also mask the mode word after
   `ip ospf authentication`. Both rules are heuristics with the limits section 13 lists.
+  The assistant's tools that relay a stored config version or a run row apply the same
+  mask before the text reaches a model provider (`ai-features.md`, AI-TOOL-12).
   `method_kwargs_redacted` records
   whether anything was masked, and a `config_version_id` the caller sent is stored
   beside it. The driver receives the arguments as sent. \
