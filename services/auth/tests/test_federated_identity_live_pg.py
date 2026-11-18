@@ -483,14 +483,17 @@ async def test_concurrent_relinks_of_one_account_apply_in_turn(pg_engine, sessio
 
         return call
 
-    async with pg_engine.connect() as holder:
-        await holder.execute(text("SELECT id FROM users WHERE id = :id FOR UPDATE"), {"id": a})
-        tasks = [asyncio.create_task(relink(*p)()) for p in pairs]
-        try:
-            await _wait_for_blocked(pg_engine, ("SELECT users.id, users.auth_source",), N)
-        finally:
-            await holder.rollback()
-        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    # The table lock stops every task before its first write. With the account
+    # row lock, one task holds the account and waits at its DELETE while the
+    # others wait for the account; without it, all N would wait at the DELETE
+    # and, released together, all but one would fail on the user_id
+    # constraint. Either way N are blocked before the release.
+    outcomes = await _race_on_table(
+        pg_engine,
+        [relink(*p) for p in pairs],
+        ("SELECT users.id, users.auth_source", "DELETE FROM federated_identities"),
+        N,
+    )
     assert all(not isinstance(o, BaseException) and o.changed for o in outcomes), outcomes
     rows = await ledger.own_identities()
     assert len(rows) == 1
