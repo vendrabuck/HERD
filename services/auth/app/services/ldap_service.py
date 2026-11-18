@@ -424,6 +424,14 @@ USER_FILTER_MAX_LENGTH = 4096
 # change is refused. The probes are pinned by tests: the check is only as good
 # as their makeup.
 _USER_FILTER_PROBES = ("herdprobe7q3", "herdprobe2k9", "probe*()\\\x00 =~=>=<=:=,é")
+# ldap3 strips white space from the edges of an assertion value, so a name with
+# edge white space matches as its stripped form (as a directory's own matching
+# rules treat insignificant spaces) and only the SHAPE of its tree is compared:
+# the same tags, parents, keys, attribute descriptions, matching rules, and
+# dnAttributes flags. A name that is white space alone would reshape a substring
+# assertion into a presence filter, so login refuses it before any call
+# (_bind_user_sync); this probe tests that non-blank edge white space cannot.
+_USER_FILTER_SHAPE_PROBES = (" \u3000herdprobe4m6\t",)
 
 _FILTER_VALUE_KEYS = ("value", "initial", "any", "final")
 _FILTER_NAME_KEYS = ("attr", "matchingRule")
@@ -527,17 +535,36 @@ def _value_parts(assertion: dict) -> list[bytes]:
     return parts
 
 
+def _tree_shape(nodes: list[tuple[int, int, int | None, dict]]) -> list[tuple]:
+    """A parse tree without its assertion values: tag, parent, the assertion's
+    keys, and its attribute description, matching rule, and dnAttributes."""
+    return [
+        (
+            tag,
+            parent,
+            tuple(sorted(assertion)),
+            tuple(assertion.get(key) for key in (*_FILTER_NAME_KEYS, "dnAttributes")),
+        )
+        for _index, tag, parent, assertion in nodes
+    ]
+
+
 def _structure_problem(template: str) -> tuple[str, str] | None:
     """Where {username} lands in the parsed filter, checked with the probes.
 
     Every render must parse to the same tree: the same tags and parents, the same
     attribute descriptions, matching rules, and dnAttributes flags, and assertion
     values that differ only by the probe (so no login name can add, remove, or
-    move an assertion), and the first probe may never sit in an attribute
-    description or a matching rule (USER_FILTER_OUTSIDE_VALUE). The two overlap
-    on purpose: the second states the rule, the first catches any parse a login
-    name's characters could change (none is known: escaping makes them literal).
-    No `(!...)` may hold {username}
+    move an assertion), the shape probes (_USER_FILTER_SHAPE_PROBES) must give
+    the same shape, and the first probe may never sit in an attribute description
+    or a matching rule (USER_FILTER_OUTSIDE_VALUE). The comparison and the
+    attribute check overlap for every template known: escaping makes a name's
+    characters literal, and the only characters ldap3 treats specially inside a
+    value are the edge white space the shape probe covers (a name of white space
+    alone, which would reshape `(uid=*{username})` into `(uid=*)`, is refused at
+    login). The comparison is kept as the test of that property rather than an
+    assumption of it; test_the_tree_comparison_catches_a_reshaping_name pins
+    what it does with a name that would reshape. No `(!...)` may hold {username}
     (USER_FILTER_NEGATED: it would match every entry but the named one), and an
     `(|...)` that holds {username} must hold it in every branch
     (USER_FILTER_OR_BRANCH: a branch without it matches whatever the login name,
@@ -567,6 +594,9 @@ def _structure_problem(template: str) -> tuple[str, str] | None:
                         )
                 elif assertion[key] != other[key]:
                     return USER_FILTER_OUTSIDE_VALUE, "{username} is not inside an assertion value"
+    for name in _USER_FILTER_SHAPE_PROBES:
+        if _tree_shape(_filter_nodes(render_user_filter(template, name))) != _tree_shape(base):
+            return USER_FILTER_OUTSIDE_VALUE, "a login name can change the filter's structure"
     holds_probe: dict[int, bool] = {}
     for index, _tag, _parent, assertion in base:
         for key in _FILTER_NAME_KEYS:
@@ -816,7 +846,9 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
 
     Returns the LdapIdentity on success and None for every refusal: an empty
     password (refused before any call, since an LDAP simple bind with one
-    succeeds anonymously), a password SASLprep refuses (also before any call,
+    succeeds anonymously), a login name that is white space alone (also before
+    any call: ldap3 strips assertion values, so it could reshape the filter), a
+    password SASLprep refuses (also before any call,
     _password_refused_by_saslprep), no matching entry, a refused user bind, or an
     entry without the email attribute (or with no value of it that is text,
     issue #1448).
@@ -842,6 +874,16 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
         raise LdapUnavailableError(str(filter_problem)) from filter_problem
     if not password:
         # LDAP anonymous bind succeeds with an empty password; reject early.
+        return None
+    if not username.strip():
+        # ldap3 strips white space from an assertion value, so a blank login
+        # name would turn `(uid=*{username})` into the presence filter
+        # `(uid=*)` and sign in as the first entry (issue #1446 review). Refused
+        # like an empty password: before any call, the same for every name.
+        logger.warning(
+            "LDAP login refused before any directory call: the login name is blank",
+            extra={"action": "ldap_login_name_refused"},
+        )
         return None
     if _password_refused_by_saslprep(username, password):
         return None

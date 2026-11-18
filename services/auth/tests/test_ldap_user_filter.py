@@ -266,6 +266,61 @@ def test_the_probes_keep_the_makeup_the_check_relies_on():
     assert any(not ch.isascii() for ch in nasty)
 
 
+def test_the_shape_probe_has_edge_white_space_and_is_not_blank():
+    (shape,) = ldap_service._USER_FILTER_SHAPE_PROBES
+    assert shape.strip() and shape != shape.lstrip() and shape != shape.rstrip()
+    assert any(ch.isspace() and not ch.isascii() for ch in shape)
+
+
+def test_the_tree_comparison_catches_a_reshaping_name(monkeypatch):
+    """What the comparison does with a name that would reshape the filter: a
+    blank name turns `(uid=*{username})` into the presence filter `(uid=*)`. The
+    real probes never are blank (login refuses such a name instead), so this
+    stands one in to pin the comparison's own contribution."""
+    template = "(uid=*{username})"
+    assert ldap_service.user_filter_problem(template) is None
+    monkeypatch.setattr(ldap_service, "_USER_FILTER_SHAPE_PROBES", (" ",))
+    ldap_service.user_filter_problem.cache_clear()
+    problem = ldap_service.user_filter_problem(template)
+    assert problem is not None and problem.reason == "username_outside_value"
+
+
+@pytest.mark.parametrize(
+    "template", ["(uid=*{username})", "(uid={username}*)", "(uid=*{username}*)", "(uid={username})"]
+)
+@pytest.mark.parametrize("name", [" ", "\t", "\u3000", " \u00a0 "])
+def test_a_blank_login_name_is_refused_before_any_directory_call(
+    directory, monkeypatch, caplog, template, name
+):
+    """The #1446 second review: ldap3 strips an assertion value, so the blank
+    name made `(uid=*{username})` the presence filter `(uid=*)` and signed in as
+    the first entry with that entry's password. Refused like an empty password."""
+    monkeypatch.setattr(settings, "ldap_user_filter", template)
+    with caplog.at_level(logging.INFO, logger="app.services.ldap_service"):
+        assert _outcome(name, GOOD) == "refusal"
+    assert directory.connections == []
+    assert [r.action for r in caplog.records] == ["ldap_login_name_refused"]
+
+
+@pytest.mark.parametrize("template", ["(uid={username})", "(uid={username}*)", "(uid=*{username})"])
+@pytest.mark.parametrize("name", [" alice", "alice ", "\u3000alice\t"])
+def test_edge_white_space_never_reaches_more_than_the_stripped_name(
+    directory, monkeypatch, template, name
+):
+    """ldap3 strips white space from the edges of the whole assertion value, so
+    a padded name matches either what the stripped name matches (equality, or
+    the padding at the value's edge) or a narrower set (padding kept beside a
+    `*`): never an entry the stripped name could not reach, and the filter keeps
+    its shape (the shape probe checks that for every template)."""
+    directory.add_user("bob", "bob-password")
+    monkeypatch.setattr(settings, "ldap_user_filter", template)
+    stripped = name.strip()
+    assert _outcome(stripped, GOOD) == "identity"
+    assert _outcome(name, GOOD) in ("identity", "refusal")
+    assert _outcome(name, "bob-password") == "refusal"
+    assert _outcome(name, "wrong") == "refusal"
+
+
 def test_the_check_runs_once_per_template(directory, monkeypatch):
     calls = []
     real = ldap_service._check_user_filter

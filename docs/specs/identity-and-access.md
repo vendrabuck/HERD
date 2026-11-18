@@ -648,16 +648,28 @@ account automatically.
   environment variable can carry); and, from the parse tree of three renders (two
   different plain alphanumeric probe names and one holding every escaped character,
   every operator character, a space, a comma, and a non-ASCII letter), a template whose
-  tree differs between the renders other than in the probe inside assertion values, or
-  where `{username}` falls outside an assertion value, in an attribute description or
-  a matching rule (`username_outside_value`); one with `{username}` inside a `(!...)`
+  tree differs between the renders other than in the probe inside assertion values,
+  whose tree SHAPE (tags, parents, keys, attributes, matching rules) differs for a
+  fourth probe with ASCII and non-ASCII white space at both edges, or where
+  `{username}` falls outside an assertion value, in an attribute description or a
+  matching rule (`username_outside_value`); one with `{username}` inside a `(!...)`
   (`username_negated`); and one with an `(|...)` that holds `{username}` in some branch
   but not all (`or_branch_without_username`). So the login name can never supply an
   attribute, an assertion, or a whole filter (`({username})` with the login name
   `uid=alice` is refused), and every entry the filter matches matches through an
   assertion whose value holds the login name; a filter without `{username}`, or with a
   branch without it, would match an entry whatever the name, so any name with that
-  entry's password would sign in as it. Allowed but discouraged: `{username}` in a
+  entry's password would sign in as it. White space: ldap3 strips the edges of an
+  assertion value, so a login name that is white space alone would reshape
+  `(uid=*{username})` into the presence filter `(uid=*)` and sign in as the first
+  entry; login refuses such a name (empty after `str.strip()`) with the 401 `Invalid
+  credentials` before any directory call, like an empty password (IAM-LDAP-4), the same
+  for every name, logged as `ldap_login_name_refused`. A name with white space at its
+  edges keeps the filter's shape (the fourth probe) and reaches at most what the
+  stripped name reaches: the same entries, or fewer when padding beside a `*` is kept.
+  The tree comparison and the attribute check overlap for every template known;
+  the comparison is kept as the test of that property, and a test pins that it refuses
+  a template once a name could reshape it. Allowed but discouraged: `{username}` in a
   substring, approximate, or ordering assertion (`(uid={username}*)`,
   `(uid~={username})`, `(uid>={username})`), which matches more than the named entry, so
   the first match signs in with its own password (and see issue #1447 for two matches).
@@ -669,8 +681,8 @@ account automatically.
   verdict is memoized per template string, so the check runs once per value, and a
   value saved on the config page takes effect at the next auth start. Before the fix
   `str.format` raised and the login answered 500. \
-  Enforced in: `services/auth/app/services/ldap_service.py` (`render_user_filter`, `user_filter_problem`, `_check_user_filter`, `_structure_problem`, `_filter_nodes`, `_USER_FILTER_PROBES`, `USER_FILTER_MAX_LENGTH`, `_bind_user_sync`, `_search_user`, `log_ldap_startup_problems`); `services/auth/app/main.py` (`lifespan`) \
-  Pinned by: `services/auth/tests/test_ldap_user_filter.py` (`test_every_defect_is_found_with_its_reason`, `test_a_usable_template_has_no_problem`, `test_render_never_interprets_the_login_name`, `test_a_login_gets_the_same_outage_for_every_name_and_password`, `test_a_login_name_can_never_supply_an_assertion`, `test_the_probes_keep_the_makeup_the_check_relies_on`, `test_the_check_runs_once_per_template`, `test_the_search_itself_never_raises_anything_but_unavailable`, `test_startup_reports_a_defect_once_in_ldap_mode`, `test_startup_is_silent_outside_ldap_mode`, `test_the_lifespan_reports_it_and_still_boots`, `test_the_route_answers_503_never_500`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_unusable_filter_is_503_for_every_login`)
+  Enforced in: `services/auth/app/services/ldap_service.py` (`render_user_filter`, `user_filter_problem`, `_check_user_filter`, `_structure_problem`, `_tree_shape`, `_filter_nodes`, `_USER_FILTER_PROBES`, `_USER_FILTER_SHAPE_PROBES`, `USER_FILTER_MAX_LENGTH`, `_bind_user_sync`, `_search_user`, `log_ldap_startup_problems`); `services/auth/app/main.py` (`lifespan`) \
+  Pinned by: `services/auth/tests/test_ldap_user_filter.py` (`test_every_defect_is_found_with_its_reason`, `test_a_usable_template_has_no_problem`, `test_render_never_interprets_the_login_name`, `test_a_login_gets_the_same_outage_for_every_name_and_password`, `test_a_login_name_can_never_supply_an_assertion`, `test_the_probes_keep_the_makeup_the_check_relies_on`, `test_the_shape_probe_has_edge_white_space_and_is_not_blank`, `test_the_tree_comparison_catches_a_reshaping_name`, `test_a_blank_login_name_is_refused_before_any_directory_call`, `test_edge_white_space_never_reaches_more_than_the_stripped_name`, `test_the_check_runs_once_per_template`, `test_the_search_itself_never_raises_anything_but_unavailable`, `test_startup_reports_a_defect_once_in_ldap_mode`, `test_startup_is_silent_outside_ldap_mode`, `test_the_lifespan_reports_it_and_still_boots`, `test_the_route_answers_503_never_500`); `services/auth/tests/test_ldap_service_live.py` (`test_login_endpoint_unusable_filter_is_503_for_every_login`, `test_login_endpoint_a_login_name_never_supplies_an_assertion`, `test_login_endpoint_a_blank_name_never_becomes_a_presence_filter`)
 - **IAM-LDAP-15.** A directory attribute value that is not text never becomes account
   data (issue #1448). ldap3 returns a value that is not UTF-8 as `bytes`, and every
   read of an identity attribute goes through one conversion. A value is text when it is
@@ -2372,7 +2384,7 @@ name (IAM-HASH-9). Every other error carries
 | 400 | `Token role cannot exceed the principal's role` | token role above its principal | IAM-APITOK-3 |
 | 401 | `Not authenticated` (FastAPI) | no Authorization header on a JWT-guarded route, auth or acl | IAM-JWT-3, IAM-CLAIM-1 |
 | 401 | `Could not validate credentials` | bad, expired, or subjectless token; in auth also an unknown or inactive account | IAM-JWT-3, IAM-ACCT-5, IAM-CLAIM-1 |
-| 401 | `Invalid credentials` | any login refusal, local, LDAP, or OIDC mode | IAM-LOGIN-1, IAM-LDAP-5, IAM-LDAP-9, IAM-LDAP-10, IAM-LDAP-13, IAM-LDAP-15, IAM-OIDC-21 |
+| 401 | `Invalid credentials` | any login refusal, local, LDAP, or OIDC mode | IAM-LOGIN-1, IAM-LDAP-5, IAM-LDAP-9, IAM-LDAP-10, IAM-LDAP-13, IAM-LDAP-14, IAM-LDAP-15, IAM-OIDC-21 |
 | 401 | `Single sign-on session expired; sign in again` | handoff exchange refused | IAM-OIDC-20 |
 | 401 | `Invalid or expired refresh token` | refresh refused | IAM-SESSION-2 |
 | 401 | `Invalid or expired token` | API token exchange refused | IAM-APITOK-8 |

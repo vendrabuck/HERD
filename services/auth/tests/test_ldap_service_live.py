@@ -377,6 +377,20 @@ async def test_login_endpoint_unusable_filter_is_503_for_every_login(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("name", [" ", "\t", "\u3000"])
+async def test_login_endpoint_a_blank_name_never_becomes_a_presence_filter(
+    monkeypatch, ldap_settings, http_client, name
+):
+    """The #1446 second review against a real directory: ldap3 strips the value,
+    so a blank name made `(uid=*{username})` the presence filter `(uid=*)`, and
+    the first entry's password signed in as that entry. Refused before any
+    directory call, like an empty password."""
+    monkeypatch.setattr(settings, "ldap_user_filter", "(uid=*{username})", raising=False)
+    resp = await http_client.post("/login", json={"email": name, "password": USER_PW})
+    assert (resp.status_code, resp.json()) == (401, {"detail": "Invalid credentials"})
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("template", ["({username})", "(&(objectClass=*)({username}))"])
 async def test_login_endpoint_a_login_name_never_supplies_an_assertion(
     monkeypatch, ldap_settings, http_client, template
