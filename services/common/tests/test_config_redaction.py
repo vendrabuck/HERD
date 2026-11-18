@@ -156,7 +156,11 @@ def test_known_limits_are_left_as_written():
         f"pw={secret}",  # an abbreviation that is not a keyword
         f"neighbor 192.0.2.1 remote-as 1 {secret}",  # no keyword at all
         "ZGF0YQ== cGFzc3dvcmQgTGltMXRTM2NyZXQ=",  # base64 of "password <secret>"
-        f"{{'password': '{secret}'}}",  # Python's repr of a dict
+        f"password|{secret}",  # a separator the rule does not know
+        f"mysql -u root -p {secret}",  # a flag, not a keyword
+        f"apikey={secret}",  # a joined keyword
+        f"pass\u200bword {secret}",  # a zero-width character inside the keyword
+        f"\uff50\uff41\uff53\uff53\uff57\uff4f\uff52\uff44 {secret}",  # fullwidth
         f"neighbor 1.1.1.1 ao {secret}",  # TCP-AO names a key chain, not a key
     ]
     redacted, changed = redact_config(
@@ -308,3 +312,95 @@ def test_is_keyword_token_is_the_line_rules_token():
         assert is_keyword_token(text), text
     for text in ("passwords", "keyboard", "author", "key-id", "pass"):
         assert not is_keyword_token(text), text
+
+
+# --- round 3 of the issue #1464 review ---
+
+
+def test_json_escaped_text_is_masked_like_raw_text():
+    # A run's output is JSON text (execution stores json.dumps of what the
+    # driver returned); a bare string result starts with a quote.
+    redacted, changed = redact_config({"output": json.dumps("hostname r1\npassword zebra")})
+    assert changed is True
+    assert json.loads(redacted["output"]) == f"hostname r1\npassword {REDACTED_VALUE}"
+
+
+def test_escaped_text_the_parser_cannot_read_is_masked_per_escaped_line():
+    cases = {
+        # cut by a char cap: not JSON any more
+        '{"config": "hostname r1\\npassword zebra\\nline vty': (
+            f'{{"config": "hostname r1\\npassword {REDACTED_VALUE}\\nline vty'
+        ),
+        '{"o": "{\\"password\\": \\"S3cret\\"}': f'{{"o": "{{\\"password\\": \\"{REDACTED_VALUE}',
+        '"a\\n\\tsecret S3cret\\nexit': f'"a\\n\\tsecret {REDACTED_VALUE}\\nexit',
+    }
+    for text, expected in cases.items():
+        assert redact_command_text(text) == (expected, True), text
+
+
+def test_an_escaped_line_break_ends_the_masked_value():
+    # Without it, one keyword would mask the rest of a megabyte of escaped text.
+    text = "password zebra\\nhostname r1\\r\\ninterface eth0\\rexit"
+    assert redact_command_text(text) == (
+        f"password {REDACTED_VALUE}\\nhostname r1\\r\\ninterface eth0\\rexit",
+        True,
+    )
+
+
+def test_json_over_the_parse_bound_is_still_masked_line_by_line():
+    running = "frr version 9\nhostname r1\npassword zebra\nenable password S3cret\n"
+    output = json.dumps({"success": True, "config": running + "!\n" * 140_000})
+    assert len(output) > 256 * 1024
+    redacted, changed = redact_config({"output": output})
+    assert changed is True
+    assert "zebra" not in redacted["output"]
+    assert "S3cret" not in redacted["output"]
+    assert "hostname r1" in redacted["output"]
+
+
+def test_xml_elements_named_by_a_keyword_have_their_text_masked():
+    cases = {
+        "<password>S3cret</password>": f"<password>{REDACTED_VALUE}</password>",
+        "<entry name='admin'><phash>$1$S3cret</phash><permissions/></entry>": (
+            f"<entry name='admin'><phash>{REDACTED_VALUE}</phash><permissions/></entry>"
+        ),
+        "<key>S3cret</key><name>r1</name><community>public</community>": (
+            f"<key>{REDACTED_VALUE}</key><name>r1</name><community>{REDACTED_VALUE}</community>"
+        ),
+        # NETCONF reply shape
+        "<rpc-reply><data><user><name>a</name><password>$6$S3cret</password></user>": (
+            f"<rpc-reply><data><user><name>a</name><password>{REDACTED_VALUE}</password></user>"
+        ),
+        # an attribute is the `=` form: masked to the end of the line
+        '<user name="a" password="S3cret"/><x/>': f'<user name="a" password="{REDACTED_VALUE}',
+    }
+    for text, expected in cases.items():
+        assert redact_command_text(text) == (expected, True), text
+
+
+def test_xml_elements_without_text_or_closing_tags_are_left_alone():
+    for text in ("<password></password>", "</password>", "<password/>", "<community><name>"):
+        assert redact_command_text(text) == (text, False), text
+
+
+def test_a_python_repr_is_masked_but_a_quoted_field_name_is_not():
+    cases = {
+        "{'password': 'S3cret'}": f"{{'password': '{REDACTED_VALUE}",
+        "configure failed: {'commands': ['x'], 'auth_key': 'S3cret'}": (
+            f"configure failed: {{'commands': ['x'], 'auth_key': '{REDACTED_VALUE}"
+        ),
+        "Namespace(password='S3cret')": f"Namespace(password='{REDACTED_VALUE}",
+        "password='S3cret'": f"password='{REDACTED_VALUE}",
+    }
+    for text, expected in cases.items():
+        assert redact_command_text(text) == (expected, True), text
+    for text in (
+        "config failed schema validation at ['password']: must be at most 3 characters long",
+        "config failed schema validation at ['auth'].password: must be at most 3 characters long",
+        "config failed schema validation at the top level: needs the fields 'password', 'key'",
+        "config failed schema validation at the top level: does not allow the field 'token'",
+        "config failed schema validation at the top level: field 'md5' needs the field 'key'",
+        "config failed schema validation at ['key']: must be of type integer",
+        "config failed schema validation at x['secret']: must be of type integer",
+    ):
+        assert redact_command_text(text) == (text, False), text

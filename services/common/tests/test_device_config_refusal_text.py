@@ -748,3 +748,45 @@ def test_every_refusal_the_builder_writes_is_left_alone_on_read():
             with pytest.raises(ConfigValidationError) as exc:
                 validate_device_config_with_schema("Management", config, schema=schema, role=role)
             assert withhold_legacy_refusal_text(str(exc.value)) == str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("config", "schema", "expected"),
+    [
+        (
+            {"md5": CANARY},
+            _obj(md5={"type": "string", "maxLength": 3}),
+            "at ['md5']: must be at most 3 characters long",
+        ),
+        (
+            {"auth_key": {"x": CANARY}},
+            _obj(auth_key=_obj(x={"type": "string", "maxLength": 3})),
+            "at ['auth_key'].x: must be at most 3 characters long",
+        ),
+        (
+            {"bgp": {"auth_password": CANARY}},
+            _obj(bgp=_obj(auth_password={"type": "string", "maxLength": 3})),
+            "at bgp['auth_password']: must be at most 3 characters long",
+        ),
+        (
+            {"ntp": {"md5_key": CANARY}},
+            _obj(ntp=_obj(md5_key={"type": "string", "maxLength": 3})),
+            "at ntp['md5_key']: must be at most 3 characters long",
+        ),
+    ],
+    ids=["first", "middle", "last", "last-md5"],
+)
+def test_a_keyword_path_part_is_quoted_wherever_it_sits(config, schema, expected, request):
+    """Issue #1464: any path part the mask would read as a keyword token is
+    quoted, so execution's second mask over the stored refusal leaves it whole
+    (`at bgp.auth_password: ...` was cut to `at bgp.auth_password: [redacted]`)."""
+    with pytest.raises(ConfigValidationError) as exc:
+        validate_device_config_with_schema("Management", config, schema=schema, role="r1")
+    assert exc.value.reason == f"config failed schema validation {expected}"
+    assert redact_command_text(exc.value.reason) == (exc.value.reason, False)
+    # The bare form the old rule wrote is what the mask cuts when the keyword
+    # part ends the path; a middle part is quoted too (the one predicate is
+    # applied to every part) though its bare form survived.
+    bare = expected.replace("['", ".").replace("']", "").replace("at .", "at ")
+    cut = redact_command_text(f"config failed schema validation {bare}")[1]
+    assert cut is (request.node.callspec.id != "middle")

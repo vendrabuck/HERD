@@ -303,11 +303,13 @@ def _path_text(path: Iterable[Any]) -> str:
             isinstance(part, str)
             and len(part) <= _MAX_NAME_CHARS
             and _PLAIN_KEY.fullmatch(part)
-            and (out or not is_keyword_token(part))
+            and not is_keyword_token(part)
         ):
-            # A path that STARTS with a bare credential keyword (`password: ...`)
-            # would read to the stored-error mask as a credential line; it is
-            # written quoted (`['password']`) instead (issue #1464).
+            # A part that is a credential keyword token (`password`,
+            # `auth_password`, `md5_key`) is written quoted (`['password']`,
+            # `bgp['auth_password']`), never bare: bare, `bgp.auth_password: ...`
+            # reads to the stored-error mask as a credential line (issue #1464).
+            # is_keyword_token is the mask's own token rule, so the two agree.
             out += f".{part}" if out else part
         else:
             out += f"[{_name_text(part)}]"
