@@ -1729,12 +1729,23 @@ the ONE detail for a value outside a fixed set (OPS-VALID-7).
   in any string (a value, a key, nested, in a field of any type), the read is refused
   with 422 `{"detail": [{"type": "string_unicode", "loc": [...], "msg": "Input should be
   a valid string, unable to parse raw data as a unicode string"}]}`, pydantic's own type
-  and message, one item for each of the first 10 locations in document order
-  (`MAX_REPORTED_LOCATIONS`); the search stops at the tenth, and nothing in the answer
-  marks that more were left out, by decision (each item keeps the exact
-  `{type, loc, msg}` shape; before the cap a 10 MB body of lone surrogates was answered
-  with 1,111,111 items, 155.6 MB). `loc` is `["body", ...]` ending at the string, or for
-  a key at the object that holds it; it never holds the surrogate or the value. A valid
+  and message. `loc` is `["body", ...]` ending at the string, or for a key at the object
+  that holds it; it never holds the surrogate or the value. The locations are best
+  effort and bounded, by decision (round 3 of the #1456 review): at most the first 10
+  in document order (`MAX_REPORTED_LOCATIONS`) that a search of at most 20,000 steps
+  (`LOCATION_SEARCH_BUDGET`, one step per child taken up) reaches, each kept only when
+  its parts total at most 256 characters (`MAX_LOC_CHARS`) and all kept ones together at
+  most 2,048 (`MAX_LOCS_CHARS`); a location is left out whole, never cut, since a cut
+  key would name a wrong place. With none to report the answer is one item at
+  `["body"]`. Nothing marks that locations were left out (each item keeps the exact
+  `{type, loc, msg}` shape). So a body of up to 20,000 elements whose paths are short
+  gets its exact locations, and no answer is larger than about 4 KB: before the bounds a
+  10 MB body of lone surrogates was answered with 1,111,111 items (155.6 MB), and a
+  16 MB key repeated in ten locations with 160 MB. A body that is JSON and whose text
+  holds a lone surrogate escape is refused also when that escape is in a member a later
+  duplicate key replaces (so the parsed value holds no surrogate), by the same
+  decision: no honest client sends one, and refusing it saves a second search and the
+  route's second parse; it is answered at `["body"]`. A valid
   surrogate pair written as two escapes is one code point once parsed and is accepted,
   as is all other text, NUL included. The check runs when the route reads its body, so
   an unknown route (404), a method not allowed (405), and a route that takes no body
@@ -1751,8 +1762,8 @@ the ONE detail for a value outside a fixed set (OPS-VALID-7).
   itself from an uploaded file, a CSV cell, a stored secret, or config's settings save is
   checked by that code with `holds_lone_surrogate` (`inventory.md`, `topology.md`,
   OPS-SECRET-19, OPS-CONFIG-31). \
-  Enforced in: `services/common/herd_common/validation_errors.py` (`RefuseLoneSurrogates`, `body_lone_surrogate_errors`, `lone_surrogate_locs`, `install_validation_errors`, `STRING_UNICODE_MSG`, `MAX_REPORTED_LOCATIONS`) \
-  Pinned by: `services/common/tests/test_validation_errors.py` (`test_lone_surrogate_locs`, `test_lone_surrogate_locs_is_not_limited_by_the_recursion_limit`, `test_body_lone_surrogate_errors`, `test_the_message_is_pydantics_own_for_a_constrained_string`, `test_a_lone_surrogate_anywhere_in_a_body_is_a_clean_422`, `test_the_check_does_not_depend_on_the_content_type`, `test_without_the_check_those_bodies_reach_the_route`, `test_honest_text_is_accepted`, `test_a_route_that_reads_no_body_and_an_unknown_route_are_unchanged`, `test_the_refusal_comes_before_a_dependency_as_a_malformed_body_does`, `test_a_multipart_body_is_passed_through_and_cannot_carry_a_lone_surrogate`, `test_a_multipart_body_is_handed_on_as_it_arrives_unread`, `test_a_query_path_header_cookie_and_urlencoded_form_cannot_carry_one`, `test_a_body_split_across_messages_is_checked_whole`, `test_a_read_after_the_response_started_is_not_refused`, `test_the_refusal_survives_a_base_http_middleware_in_either_order`, `test_install_adds_the_check_unless_told_not_to`, `test_a_refusal_reports_the_first_ten_locations_only`, `test_the_locator_stops_at_its_limit_and_keeps_document_order`); `services/auth/tests/test_federated_identity_routes.py` (`test_a_lone_surrogate_in_a_subject_is_the_shared_422_before_the_role_gate`); `services/acl/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`, `test_an_escaped_surrogate_pair_is_not_refused_by_the_check`); `services/ai-orchestrator/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/auth/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_login_body_is_refused`); `services/cabling/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/execution/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/integration/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/inventory/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/notifications/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/reservations/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/secrets/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/user-profile/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`)
+  Enforced in: `services/common/herd_common/validation_errors.py` (`RefuseLoneSurrogates`, `body_lone_surrogate_errors`, `lone_surrogate_locs`, `install_validation_errors`, `STRING_UNICODE_MSG`, `MAX_REPORTED_LOCATIONS`, `LOCATION_SEARCH_BUDGET`, `MAX_LOC_CHARS`, `MAX_LOCS_CHARS`, `_reportable`) \
+  Pinned by: `services/common/tests/test_validation_errors.py` (`test_lone_surrogate_locs`, `test_lone_surrogate_locs_is_not_limited_by_the_recursion_limit`, `test_body_lone_surrogate_errors`, `test_the_message_is_pydantics_own_for_a_constrained_string`, `test_a_lone_surrogate_anywhere_in_a_body_is_a_clean_422`, `test_the_check_does_not_depend_on_the_content_type`, `test_without_the_check_those_bodies_reach_the_route`, `test_honest_text_is_accepted`, `test_a_route_that_reads_no_body_and_an_unknown_route_are_unchanged`, `test_the_refusal_comes_before_a_dependency_as_a_malformed_body_does`, `test_a_multipart_body_is_passed_through_and_cannot_carry_a_lone_surrogate`, `test_a_multipart_body_is_handed_on_as_it_arrives_unread`, `test_a_query_path_header_cookie_and_urlencoded_form_cannot_carry_one`, `test_a_body_split_across_messages_is_checked_whole`, `test_a_read_after_the_response_started_is_not_refused`, `test_the_refusal_survives_a_base_http_middleware_in_either_order`, `test_install_adds_the_check_unless_told_not_to`, `test_a_refusal_reports_the_first_ten_locations_only`, `test_the_locator_stops_at_its_limit_and_keeps_document_order`, `test_the_search_is_bounded_by_its_budget`, `test_the_answer_is_bounded_in_size_and_never_cuts_a_key`, `test_a_body_whose_only_surrogate_a_duplicate_key_drops_is_refused_at_the_body`); `services/auth/tests/test_federated_identity_routes.py` (`test_a_lone_surrogate_in_a_subject_is_the_shared_422_before_the_role_gate`); `services/acl/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`, `test_an_escaped_surrogate_pair_is_not_refused_by_the_check`); `services/ai-orchestrator/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/auth/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_login_body_is_refused`); `services/cabling/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/execution/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/integration/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/inventory/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/notifications/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/reservations/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/secrets/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`); `services/user-profile/tests/test_validation_errors.py` (`test_the_body_check_is_installed`, `test_a_lone_surrogate_anywhere_in_a_body_is_refused`)
 - **OPS-VALID-7.** A detail a route builds itself for a value outside a fixed set names
   the field and the allowed values, which are the service's own data, and never the
   submitted value: `Unknown <field>; allowed: <a>, <b>`, built by the ONE helper
@@ -1765,37 +1776,39 @@ the ONE detail for a value outside a fixed set (OPS-VALID-7).
   no longer hold a lone surrogate. \
   Enforced in: `services/common/herd_common/error_details.py` (`unknown_value_detail`) \
   Pinned by: `services/common/tests/test_error_details.py` (`test_the_detail_names_the_field_and_the_allowed_values_in_order`, `test_the_allowed_values_may_be_any_iterable`, `test_an_empty_allowed_set_still_names_the_field`)
-- **OPS-VALID-8.** The check's cost grows with the body's length and its number of
-  elements, never with elements times nesting depth, and it holds no memory that grows
-  with the body unless the body holds a lone surrogate. Whether a body holds one is
-  decided from the raw text without parsing (a surrogate written as raw UTF-8 bytes, a
-  high-surrogate escape not followed by a low one, or more low-surrogate escapes than
-  pairs, each run of backslashes read by its parity); searches that run in C, which
-  allocate nothing that grows with the body. Only a body that holds one, or one whose
-  surrogate a later duplicate key replaces, or one that is not JSON, is parsed; its
-  locations are then searched by a walk with one iterator stack and one shared path,
-  whose memory grows with the depth only, that passes over runs of numbers and clean
-  strings in C, and that stops at the tenth location (OPS-VALID-6). The raw decision
-  was fuzzed against `json.loads` (2,400,000 bodies, zero mismatches). Before this rule
-  one valid escaped pair anywhere made the check parse and walk the body, and the walk
-  built a location tuple per element: a 587 KB body sent with no token to acl's
-  `POST /grants` cost 1,423 MB and 2.3 s (now 0.03 s and 5 MB, as without the check),
-  a 9.8 MB flat list 807 MB and 3.2 s (now 0.24 s and 66 MB; 0.23 s and 57 MB without the
-  check, FastAPI's own parse), and a 9.8 MB list of lone surrogates 646 MB, 4.1 s, and a
-  148 MB answer (now 0.16 s, 7 MB, and a 1,292-byte answer).
-  The check runs on the event loop, like FastAPI's own parse of the body, so while it
-  runs the service answers nothing else. Observed costs on a development host pinned to
-  one core, about 1 MB bodies, not a bound: 0.3 ms per MB for clean ASCII objects, 1 ms
-  for nested dicts or deep-and-wide lists holding a pair, 2 ms for Hangul text, and 28
-  ms for a body made of escaped surrogate pairs (the worst accepted shape, about 8 times
-  `json.loads` of it); for a refused body 3 ms (escaped backslashes), 9 ms (a list of
-  lone surrogates), 58 ms (deep and wide, the surrogate at the end), and 84 ms (nested
-  dicts, the surrogate at the end, the worst refused shape, about 4 times `json.loads`;
-  90 ms per MB at 10 MB). No HERD service limits a request body's size today, so the
-  largest body is what a client sends: a 10 MB body of the worst refused shape holds the
-  service's event loop for about one second. \
-  Enforced in: `services/common/herd_common/validation_errors.py` (`_raw_text_holds_a_lone_surrogate`, `_escapes_hold_a_lone_surrogate`, `_children`, `lone_surrogate_locs`, `holds_lone_surrogate`, `body_lone_surrogate_errors`) \
-  Pinned by: `services/common/tests/test_validation_errors.py` (`test_a_body_that_holds_no_lone_surrogate_is_never_parsed`, `test_a_deep_and_wide_body_holding_one_costs_about_one_parse`, `test_the_locator_holds_memory_for_the_depth_not_the_elements`, `test_a_body_of_many_lone_surrogates_stops_at_the_tenth`, `test_holds_lone_surrogate_costs_about_one_serialization`, `test_through_an_app_the_check_adds_nothing_to_an_unauthenticated_request`, `test_a_large_container_is_filtered_in_c_before_the_walk`, `test_lone_surrogate_locs_in_large_containers`, `test_holds_lone_surrogate_on_a_value_too_deep_to_serialize`); `services/inventory/tests/test_lone_surrogate_cost.py` (`test_a_deep_and_wide_json_import_file_costs_about_one_parse`, `test_a_deep_and_wide_csv_json_cell_costs_about_one_parse`); `services/cabling/tests/test_lone_surrogate_cost.py` (`test_a_deep_and_wide_json_import_file_costs_about_one_parse`); `services/secrets/tests/test_lone_surrogate_cost.py` (`test_deserializing_deep_and_wide_data_costs_about_one_parse`); `services/config/tests/test_lone_surrogate_cost.py` (`test_the_save_check_on_deep_and_wide_values_costs_about_one_parse`)
+- **OPS-VALID-8.** What the check adds to a request, over what the service did without
+  it, is one scan of the body's raw text, plus, for a body it refuses, a location search
+  bounded by its step budget; the parse it makes of a refused body replaces the parse
+  the route would have made. The scan decides without parsing: a surrogate written as
+  raw UTF-8 bytes, a high-surrogate escape not followed by a low one, or a low escape
+  no pair holds, each backslash run read by its parity; each is one pass in C that never
+  backtracks and allocates nothing that grows with the body. It was fuzzed against
+  `json.loads` (2,400,000 bodies, zero mismatches against the oracle of OPS-VALID-6:
+  refused exactly when the body is JSON and any member, also one a later duplicate key
+  replaces, holds a lone surrogate). The search walks with one iterator stack and one
+  shared path, at most 20,000 steps, with the cyclic garbage collector paused and the
+  parsed value released before it resumes: the parse leaves every container pending for
+  a full collection, which the search's own allocations set off, and on nested lists
+  that collection cost more than the parse. For a body that is not JSON but holds a
+  surrogate escape the check adds the scan and one failed parse, since the route then
+  parses it again. Measured through a FastAPI app whose route sits behind a dependency
+  that answers 401, pinned to one core, against the same app without the check (which
+  answers 401, or 422 `json_invalid` for the body that is not JSON), at 1, 4, and 16 MB
+  (observations, not a bound): chains of 900 nested empty lists with a surrogate at the
+  end, 14 to 18 ms added per MB (1.16 to 1.25 times); lists of empty lists, 7 to 13 ms
+  (1.25 to 1.55 times); triples of nested lists, 10 to 15 ms (1.21 to 1.38 times); the
+  duplicate-key body, 15 to 19 ms (1.17 to 1.30 times); a 1 to 16 MB key with ten lone
+  surrogates, 3 to 4 ms; a run of backslashes then a lone escape, 7 to 8 ms; escaped
+  surrogate pairs, which are accepted, 14 to 15 ms; truncated JSON holding one, 12 to 23
+  ms (1.83 to 2.01 times). The worst added cost measured is 23 ms per MB, for a body
+  that is not JSON. Before this rule's round 3 the location walk alone cost up to 737 ms
+  per MB (chains of empty lists: 11.8 s for 16 MB, against 1.4 s without the check).
+  The check runs on the event loop, like FastAPI's own parse, so while it runs the
+  service answers nothing else. The cost grows with the body's length; what the
+  service pays without the check, the parse, grows with it too, and only a bound on the
+  body's size limits either (issue #1466); no HERD service bounds it today. \
+  Enforced in: `services/common/herd_common/validation_errors.py` (`_raw_text_holds_a_lone_surrogate`, `_escapes_hold_a_lone_surrogate`, `lone_surrogate_locs`, `holds_lone_surrogate`, `body_lone_surrogate_errors`, `LOCATION_SEARCH_BUDGET`) \
+  Pinned by: `services/common/tests/test_validation_errors.py` (`test_a_body_that_holds_no_lone_surrogate_is_never_parsed`, `test_the_locator_holds_memory_for_the_depth_not_the_elements`, `test_a_body_of_many_lone_surrogates_stops_at_the_tenth`, `test_holds_lone_surrogate_costs_about_one_serialization`, `test_through_an_app_the_check_adds_nothing_to_an_unauthenticated_request`, `test_lone_surrogate_locs_in_large_containers`, `test_holds_lone_surrogate_on_a_value_too_deep_to_serialize`, `test_a_refused_body_costs_at_most_about_one_more_parse`, `test_through_an_app_a_refused_body_costs_about_what_main_pays`, `test_the_raw_scan_holds_no_memory_that_grows_with_the_body`); `services/inventory/tests/test_lone_surrogate_cost.py` (`test_a_deep_and_wide_json_import_file_costs_about_one_parse`, `test_a_deep_and_wide_csv_json_cell_costs_about_one_parse`); `services/cabling/tests/test_lone_surrogate_cost.py` (`test_a_deep_and_wide_json_import_file_costs_about_one_parse`); `services/secrets/tests/test_lone_surrogate_cost.py` (`test_deserializing_deep_and_wide_data_costs_about_one_parse`); `services/config/tests/test_lone_surrogate_cost.py` (`test_the_save_check_on_deep_and_wide_values_costs_about_one_parse`)
 
 **Out of scope.** An error body a route builds itself (`HTTPException(detail=...)`) is
 not rendered by this handler; each such detail is its area's rule (OPS-VALID-7 for a
@@ -1820,7 +1833,7 @@ IAM-REG-2, IAM-LOGIN-5 (`identity-and-access.md`), and OPS-CONFIG-8.
 | 503 | `The config data directory is not writable; the config service log names the one-time fix` | a config write (login's first auth file, change-password, save) the data directory refuses | OPS-CONFIG-29 |
 | 503 | `The config password store is unusable; the config service log names the cause` | a config change-password, from a session issued earlier, while the auth file is unreadable or not a JSON object, or while there is no auth file and `CONFIG_ADMIN_PASSWORD` holds a value OPS-CONFIG-8's rule refuses | OPS-CONFIG-7, OPS-CONFIG-5 |
 | 422 | validation list, each item exactly `{type, loc, msg}` | a config login, change-password, or save body that is not the documented shape (a field missing or of the wrong type, a body that is not a JSON object) | OPS-CONFIG-30 |
-| 422 | validation list, each item exactly `{type, loc, msg}` | any request that does not have a route's documented shape, in every service; a body holding a lone surrogate anywhere, in every service but config (`string_unicode`, at most the first 10 locations, before authentication) | OPS-VALID-1, OPS-VALID-2, OPS-VALID-5, OPS-VALID-6 |
+| 422 | validation list, each item exactly `{type, loc, msg}` | any request that does not have a route's documented shape, in every service; a body holding a lone surrogate anywhere, in every service but config (`string_unicode`, at most 10 bounded locations, or one at `["body"]`, before authentication) | OPS-VALID-1, OPS-VALID-2, OPS-VALID-5, OPS-VALID-6 |
 | 409 | `A restart is already in progress` | a restarter `POST /restart` while another runs | OPS-CONFIG-27 |
 | 404 | `Not found` | a restarter request to any path but `/restart` and `/health` | OPS-CONFIG-25 |
 | 405 | `Method not allowed`, with `Allow` | a restarter request to `/restart` with a method other than POST, or to `/health` with one other than GET | OPS-CONFIG-25 |
