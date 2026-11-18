@@ -11,7 +11,12 @@ against another service. What it proves beyond the live service suite of phase
 ASGI): the compose wiring of the OIDC settings, the auth container reaching the
 issuer by the alias `oidc-test` on the stack network, the gateway's routing and
 prefix for the three routes, the cookies' Path through the gateway, and the
-mode's refusals on the real stack.
+mode's refusals on the real stack. Since issue #1399 it also drives the two
+superadmin recovery routes through the gateway (an issuer rewrite, an identity
+relink by a typed pair, and one by a relink candidate the refused sign-in left,
+each between a refused and a successful Dex sign-in), with a superadmin API
+token as the credential, the break-glass path that needs no password login in
+OIDC mode; each leaves alice's identity as it found it.
 
 Skipped unless HERD_INTEGRATION_OIDC=1 (which the gate phase sets), so the
 ordinary `make test-integration` and nightly's integration pass, both against a
@@ -39,8 +44,10 @@ false); every password is `oidc-test-password`.
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import re
+import secrets
 import socket
 from html import unescape
 from urllib.parse import parse_qs, urljoin, urlsplit
@@ -444,3 +451,152 @@ async def test_a_provider_user_whose_email_is_unverified_is_refused():
     assert _set_cookie_values(callback, HANDOFF_COOKIE) == []
     assert _account_row(UNVERIFIED) == []
     assert _identity_count(dex_subject(UNVERIFIED_USER_ID)) == 0
+
+
+# --- recovery through the superadmin routes (issue #1399) ---
+#
+# The stack's Dex serves one issuer and fixed subjects, so each story puts the
+# stored identity where an issuer change or a reissued subject leaves it,
+# through the recovery routes themselves, then drives Dex's real sign-in.
+# The superadmin credential is the documented break-glass path that needs no
+# password login in OIDC mode: a superadmin API token, inserted through
+# Postgres for the seeded superadmin (no API path can mint one in this mode
+# without a superadmin session) and exchanged at POST /api/auth/tokens/exchange,
+# which ignores the mode (IAM-USER-9). The token row is deleted afterward.
+
+PREVIOUS_ISSUER = "http://oidc-test:5556/dex-previous"
+
+
+@pytest.fixture
+def superadmin_headers():
+    raw = "oidc-it-recovery-" + secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw.encode()).hexdigest()
+    principal = _sql(f"SELECT id FROM auth.users WHERE email = {_quote(SEED_EMAIL)}")
+    assert principal, "the seeded superadmin is missing"
+    _sql(
+        "INSERT INTO auth.api_tokens (id, name, principal_id, token_hash, role, is_active) "
+        f"VALUES (gen_random_uuid(), 'oidc-it-recovery', {_quote(principal)}, "
+        f"{_quote(token_hash)}, 'SUPERADMIN', true)"
+    )
+    try:
+        with httpx.Client(verify=False, timeout=15.0) as client:
+            resp = client.post(f"{BASE_URL}/auth/tokens/exchange", json={"token": raw})
+        assert resp.status_code == 200, resp.text
+        yield {"Authorization": f"Bearer {resp.json()['access_token']}"}
+    finally:
+        _sql(f"DELETE FROM auth.api_tokens WHERE token_hash = {_quote(token_hash)}")
+
+
+async def _admin_call(method: str, path: str, headers: dict, body: dict) -> dict:
+    async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+        resp = await client.request(method, f"{BASE_URL}/auth{path}", json=body, headers=headers)
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def _signed_in_id(email: str) -> str:
+    async with _browser() as client:
+        body = await sign_in_tokens(client, email)
+    me = await _me(body["access_token"])
+    assert me.status_code == 200, me.text
+    return me.json()["id"]
+
+
+async def _refused_sign_in(email: str) -> None:
+    async with _browser() as client:
+        callback = await begin_and_sign_in(client, email)
+    assert callback.status_code == 302
+    assert callback.headers["location"] == FAILED_LOCATION
+
+
+async def test_an_issuer_change_is_refused_then_recovered_by_the_rewrite(superadmin_headers):
+    account = await _signed_in_id(ALICE)
+    rewrite = "/admin/federated-identities/rewrite-issuer"
+    subject = dex_subject(ALICE_USER_ID)
+    try:
+        moved = await _admin_call(
+            "POST",
+            rewrite,
+            superadmin_headers,
+            {"old_issuer": ISSUER, "new_issuer": PREVIOUS_ISSUER, "dry_run": False},
+        )
+        assert moved["rewritten"] >= 1
+        await _refused_sign_in(ALICE)
+        dry = await _admin_call(
+            "POST",
+            rewrite,
+            superadmin_headers,
+            {"old_issuer": PREVIOUS_ISSUER, "new_issuer": ISSUER, "dry_run": True},
+        )
+        assert (dry["matched"], dry["conflicts"], dry["rewritten"]) == (moved["rewritten"], 0, 0)
+    finally:
+        back = await _admin_call(
+            "POST",
+            rewrite,
+            superadmin_headers,
+            {"old_issuer": PREVIOUS_ISSUER, "new_issuer": ISSUER, "dry_run": False},
+        )
+    assert back["conflicts"] == 0
+    assert await _signed_in_id(ALICE) == account
+    assert _identity_count(subject) == 1
+
+
+async def test_a_reissued_subject_is_refused_then_recovered_by_the_relink(superadmin_headers):
+    account = await _signed_in_id(ALICE)
+    path = f"/users/{account}/federated-identity"
+    subject = dex_subject(ALICE_USER_ID)
+    try:
+        await _admin_call(
+            "PUT", path, superadmin_headers, {"issuer": ISSUER, "subject": "oidc-it-stale"}
+        )
+        await _refused_sign_in(ALICE)
+    finally:
+        linked = await _admin_call(
+            "PUT", path, superadmin_headers, {"issuer": ISSUER, "subject": subject}
+        )
+    assert (linked["user_id"], linked["issuer"], linked["subject"]) == (account, ISSUER, subject)
+    assert await _signed_in_id(ALICE) == account
+    assert _identity_count(subject) == 1
+
+
+async def test_a_refused_sign_in_leaves_a_candidate_and_a_relink_by_it_recovers(
+    superadmin_headers,
+):
+    """Owner decision of 2026-11-18: a refused Dex sign-in on alice's email is
+    kept as a relink candidate against her account; the superadmin lists it and
+    relinks by its id, and her next sign-in lands in the same account. Alice's
+    identity ends as it started, her real Dex subject."""
+    account = await _signed_in_id(ALICE)
+    path = f"/users/{account}/federated-identity"
+    subject = dex_subject(ALICE_USER_ID)
+    try:
+        # A typed relink discards any candidate an earlier test left.
+        await _admin_call(
+            "PUT", path, superadmin_headers, {"issuer": ISSUER, "subject": "oidc-it-stale-2"}
+        )
+        await _refused_sign_in(ALICE)
+        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+            listed = await client.get(
+                f"{BASE_URL}/auth{path}/candidates", headers=superadmin_headers
+            )
+        assert listed.status_code == 200, listed.text
+        candidates = listed.json()["candidates"]
+        assert [c["issuer"] for c in candidates] == [ISSUER]
+        assert subject not in listed.text
+        linked = await _admin_call(
+            "PUT", path, superadmin_headers, {"candidate_id": candidates[0]["id"]}
+        )
+        assert (linked["issuer"], linked["subject"]) == (ISSUER, subject)
+    finally:
+        await _admin_call("PUT", path, superadmin_headers, {"issuer": ISSUER, "subject": subject})
+    assert await _signed_in_id(ALICE) == account
+    assert _identity_count(subject) == 1
+
+
+async def test_the_recovery_routes_refuse_an_anonymous_caller_through_the_gateway():
+    async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+        resp = await client.post(
+            f"{BASE_URL}/auth/admin/federated-identities/rewrite-issuer",
+            json={"old_issuer": ISSUER, "new_issuer": PREVIOUS_ISSUER, "dry_run": True},
+        )
+    assert resp.status_code == 401
