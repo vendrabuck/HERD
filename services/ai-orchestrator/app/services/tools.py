@@ -512,9 +512,12 @@ def _with_markers(
     has_config: bool | None = None,
     config_withheld: bool = False,
 ) -> dict[str, Any]:
-    """`record` without any marker key it carried, plus this tool's markers."""
+    """`record` without any marker key it carried, plus this tool's markers.
+
+    The markers come FIRST: dispatch() cuts a long result at the char cap, and
+    a cut must never drop the `redacted` marker or the note.
+    """
     result: dict[str, Any] = {} if has_config is None else {"has_config": has_config}
-    result.update((k, v) for k, v in record.items() if k not in _MARKER_KEYS)
     result["redacted"] = redacted
     if notes:
         result["note"] = " ".join(notes)
@@ -522,6 +525,7 @@ def _with_markers(
         result["withheld"] = withheld
     if config_withheld:
         result["config_withheld"] = True
+    result.update((k, v) for k, v in record.items() if k not in _MARKER_KEYS)
     return result
 
 

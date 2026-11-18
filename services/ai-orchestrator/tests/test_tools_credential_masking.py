@@ -653,3 +653,53 @@ def test_a_replayed_result_whose_masking_fails_is_withheld(monkeypatch):
     replaced = tools.mask_replayed_tool_result("get_device", f"enable secret {CANARY}")
     assert CANARY not in replaced
     assert json.loads(replaced)["note"] == tools.REPLAY_WITHHELD_NOTE
+
+
+# --- JSON-escaped text (round 3 of the review) ---
+
+RUNNING_CONFIG = (
+    "frr version 9\nhostname r1\npassword zebra\nenable password S3cret\n"
+    "key chain K\n key 1\n  key-string S3cret2\n"
+)
+LEAKED_WORDS = ("zebra", "S3cret", "S3cret2")
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        json.dumps("hostname r1\npassword zebra"),
+        json.dumps(RUNNING_CONFIG),
+        json.dumps({"success": True, "config": RUNNING_CONFIG + "!\n" * 140_000}),
+    ],
+    ids=["bare-string-result", "bare-running-config", "backup-over-256KiB"],
+)
+async def test_run_output_holding_escaped_text_is_masked(output):
+    result = await _runs({"items": [_run_row(output=output)], "total": 1, "skip": 0, "limit": 20})
+    assert result["is_error"] is False
+    for word in LEAKED_WORDS:
+        assert word not in result["content"], word
+    # The markers lead the result, so the char cap never cuts them off.
+    assert result["content"].startswith('{"redacted": true, "note": ')
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        # A get_device_current_config result holding running-config text, cut
+        # by the 8000-character cap.
+        json.dumps({"has_config": True, "config": {"running": RUNNING_CONFIG}})[:120]
+        + "\n... [truncated: 9000 chars omitted]",
+        # A run list whose output is JSON inside JSON, cut.
+        json.dumps({"items": [{"output": json.dumps({"password": "S3cret", "x": "y" * 50})}]})[:80]
+        + "\n... [truncated: 10 chars omitted]",
+        # An escaped line that starts with an escaped tab.
+        json.dumps({"items": [{"output": "a\n\tsecret S3cret\nexit"}]})[:60]
+        + "\n... [truncated: 10 chars omitted]",
+    ],
+    ids=["running-config", "escaped-embedded-json", "escaped-tab"],
+)
+def test_a_cut_replayed_result_is_masked_through_its_escapes(content):
+    assert any(word in content for word in LEAKED_WORDS)
+    masked = tools.mask_replayed_tool_result("list_executions_for_reservation", content)
+    for word in LEAKED_WORDS:
+        assert word not in masked, (word, masked)

@@ -1159,7 +1159,8 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   the stored text and must not be copied into a configuration. The marker keys
   (`has_config`, `redacted`, `note`, `withheld`, `config_withheld`) are the tool's own:
   every one the stored record or upstream envelope carried is removed and the tool
-  writes its own after, every time (`_with_markers`). Masking fails closed, the way AI-TOOL-4 empties `field_data`: a version detail
+  writes its own, every time, FIRST in the result, so the char cap of AI-TOOL-3 never
+  cuts them off (`_with_markers`). Masking fails closed, the way AI-TOOL-4 empties `field_data`: a version detail
   whose `config` is not an object, that is not JSON, or whose masking raises is answered
   with its masked metadata (the listing item's when the detail is not an object), no
   `config`, `config_withheld: true`, and `CONFIG_WITHHELD_NOTE`, or with the version id
@@ -1168,7 +1169,7 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   `ITEMS_WITHHELD_NOTE`. Nothing is ever passed through unmasked. The other tools relay
   no stored configuration; section 13 lists what each sends and the mask's limits. \
   Enforced in: `services/ai-orchestrator/app/services/tools.py` (`_mask_record`, `_mask_items`, `_mark_masked`, `_with_markers`, `_MARKER_KEYS`, `_config_version_result`, `_withheld_version_result`, `REDACTED_NOTE`, `CONFIG_WITHHELD_NOTE`, `ITEMS_WITHHELD_NOTE`); `services/common/herd_common/config_redaction.py` (`redact_config`, `redact_command_text`) \
-  Pinned by: `services/ai-orchestrator/tests/test_tools_credential_masking.py` (`test_current_config_masks_every_in_repo_driver_shape`, `test_current_config_masks_the_shapes_the_review_found_leaking`, `test_current_config_marker_cannot_be_overwritten_by_the_stored_record`, `test_current_config_markers_are_always_the_tools_own`, `test_run_list_envelope_cannot_set_a_marker`, `test_withheld_version_markers_replace_the_stored_ones`, `test_current_config_withholds_a_payload_that_is_not_an_object`, `test_current_config_withholds_a_detail_that_is_not_an_object`, `test_current_config_withholds_when_masking_the_payload_fails`, `test_current_config_keeps_only_the_id_when_nothing_can_be_masked`, `test_history_leaves_out_an_item_it_cannot_mask`, `test_history_leaves_out_an_item_whose_masking_fails`, `test_run_list_leaves_out_a_row_it_cannot_mask`, `test_run_list_leaves_out_a_row_whose_masking_fails`); `services/ai-orchestrator/tests/test_assistant_credential_masking_route.py` (`test_no_stored_credential_reaches_the_provider_or_the_stored_conversation`)
+  Pinned by: `services/ai-orchestrator/tests/test_tools_credential_masking.py` (`test_current_config_masks_every_in_repo_driver_shape`, `test_current_config_masks_the_shapes_the_review_found_leaking`, `test_run_output_holding_escaped_text_is_masked`, `test_current_config_marker_cannot_be_overwritten_by_the_stored_record`, `test_current_config_markers_are_always_the_tools_own`, `test_run_list_envelope_cannot_set_a_marker`, `test_withheld_version_markers_replace_the_stored_ones`, `test_current_config_withholds_a_payload_that_is_not_an_object`, `test_current_config_withholds_a_detail_that_is_not_an_object`, `test_current_config_withholds_when_masking_the_payload_fails`, `test_current_config_keeps_only_the_id_when_nothing_can_be_masked`, `test_history_leaves_out_an_item_it_cannot_mask`, `test_history_leaves_out_an_item_whose_masking_fails`, `test_run_list_leaves_out_a_row_it_cannot_mask`, `test_run_list_leaves_out_a_row_whose_masking_fails`); `services/ai-orchestrator/tests/test_assistant_credential_masking_route.py` (`test_no_stored_credential_reaches_the_provider_or_the_stored_conversation`)
 - **AI-TOOL-13.** A conversation's stored tool results are masked again each time the
   conversation is loaded for a provider call, so a conversation stored before
   AI-TOOL-12 never resends an unmasked configuration or run output (issue #1464). Each
@@ -1184,7 +1185,7 @@ in `services/ai-orchestrator/app/services/tools.py`; persistence in
   an assistant turn written before issue #1464 that quoted a credential is resent
   (section 13). The stored rows are never changed. \
   Enforced in: `services/ai-orchestrator/app/services/conversation_repo.py` (`load_messages`, `_mask_replayed_tool_results`); `services/ai-orchestrator/app/services/tools.py` (`mask_replayed_tool_result`, `REPLAY_WITHHELD_NOTE`) \
-  Pinned by: `services/ai-orchestrator/tests/test_assistant_credential_masking_route.py` (`test_a_conversation_stored_before_masking_is_masked_when_it_is_resent`); `services/ai-orchestrator/tests/test_tools_credential_masking.py` (`test_a_replayed_result_is_masked_as_a_structure_or_as_text`, `test_a_replayed_documentation_result_is_resent_as_stored`, `test_a_replayed_result_that_is_not_text_is_withheld`, `test_a_replayed_result_whose_masking_fails_is_withheld`)
+  Pinned by: `services/ai-orchestrator/tests/test_assistant_credential_masking_route.py` (`test_a_conversation_stored_before_masking_is_masked_when_it_is_resent`); `services/ai-orchestrator/tests/test_tools_credential_masking.py` (`test_a_replayed_result_is_masked_as_a_structure_or_as_text`, `test_a_cut_replayed_result_is_masked_through_its_escapes`, `test_a_replayed_documentation_result_is_resent_as_stored`, `test_a_replayed_result_that_is_not_text_is_withheld`, `test_a_replayed_result_whose_masking_fails_is_withheld`)
 - **AI-WRITE-1.** `propose_config_change` and `schedule_config_apply` are offered only when
   `AI_WRITE_TOOLS_ENABLED` is set, and a call to either while it is off is refused at
   dispatch (`write tools are disabled`) even if the model names it; read tools are
@@ -1978,13 +1979,32 @@ AI-UPLOAD-25; #1279 by AI-UPLOAD-8; #1280 by AI-TURN-9.)
   sparse member (AI-UPLOAD-16, for example a `tar --sparse` archive of a file with holes)
   is refused.
 - The credential mask of AI-TOOL-12 is CFG-EXEC-8's heuristic (`device-configuration.md`,
-  section 13, and the `config_redaction.py` module docstring): a secret under a key none
-  of whose parts is a keyword (`pw`, `otp`, `privkey`), a secret in free text with no
-  keyword before it on its line, a secret on the line or list item after its keyword, a
-  keyword glued to its value, encoded text, and a secret written as a key name itself
-  reach the provider. Issue #1464 checked every in-repo driver's configuration fields
-  and widened the mask for the FRR, IOS, EOS, PAN-OS, and SR Linux forms its review
-  found.
+  section 13, states the same list, and the `config_redaction.py` module docstring).
+  Not masked: a secret under a key none of whose parts is a keyword and that the log
+  pattern does not match (`pw`, `pass`, `otp`, `pin`, `privkey`, `keystring`, `hash`); a
+  secret with no keyword before it in its line or JSON-escaped line, including one on the
+  next line or in the next list item after a keyword (`password` then `S3cret`: masking
+  the next item would also cut the command after every `no password`), and a value after
+  a separator the rule does not know (`password|S3cret`, `-p S3cret`); a keyword glued to
+  its value (`passwordS3cret`, a mistyped device echo), split (`pass word`), abbreviated
+  (`pw=`), joined (`apikey=`), or written with zero-width or fullwidth characters; encoded
+  text (base64); a URL password over 1024 characters, or behind a user name over 256 or
+  a scheme over 32; the part of a secret after a literal two-character `\n` inside it;
+  the text of an XML element after its first child element; and a secret written as a
+  key name itself. `ao` (a TCP-AO option, which names a key chain), `priv` (SNMPv3's
+  privacy password, always after `auth`), and `pass` and `pw` (plain words in firewall
+  and pseudowire configuration) are not keywords on purpose. Such a value reaches the provider. Issue #1464 checked every in-repo
+  driver's configuration fields and widened the mask for the FRR, IOS, EOS, PAN-OS
+  (CLI and XML), NETCONF, and SR Linux forms its reviews found.
+- Masking cost is linear in the text's length
+  (`services/common/tests/test_config_redaction_cost.py` pins it with relative timings,
+  issue #1464). It runs synchronously on the event loop: execution masks a `POST /execute`
+  call's `method_kwargs`, whose request body has no size cap, and the assistant masks run
+  outputs (up to 100 rows, each unbounded) before the 8000-character cap. Pinned to one
+  core on the development host, 16 MB costs 0.1 s to 4.8 s depending on its shape (a run of `a-` after a `://` is the slowest measured). It is
+  not offloaded to a thread: execution's default pool is shared with driver runs, so
+  masking would queue behind them; a request body cap is the bound to add (CFG-EXEC-8,
+  AI-TOOL-12).
 - What the other AI surfaces send to the provider, as reviewed for issue #1464. Not
   masked because not a stored configuration or credential by design: `get_device` and
   `get_device_ports` send every `field_data` value except password-typed fields
