@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from cryptography.exceptions import InvalidTag
 from fastapi import HTTPException
 from herd_common.advisory_lock import advisory_key_from_string, xact_lock
-from herd_common.validation_errors import lone_surrogate_locs
+from herd_common.validation_errors import holds_lone_surrogate
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -270,7 +270,7 @@ def deserialize_data(plaintext: bytes) -> dict:
     """The data dict `serialize_data` stored. Raises SecretDataUnreadableError when a
     key or a value holds a lone surrogate."""
     data = json.loads(plaintext.decode())
-    if lone_surrogate_locs(data):
+    if holds_lone_surrogate(data):
         raise SecretDataUnreadableError
     return data
 

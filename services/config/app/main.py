@@ -27,7 +27,7 @@ from app.config_store import (
     verify_password,
 )
 from app.docker_ctl import restart_services
-from app.validation_errors import install_validation_errors, lone_surrogate_locs
+from app.validation_errors import holds_lone_surrogate, install_validation_errors
 from app.version import add_version_route, service_version
 
 logger = logging.getLogger(__name__)
@@ -241,7 +241,7 @@ async def update_settings(
     # A lone surrogate in a key or value is refused first, with fixed text: the
     # unknown-key detail below quotes keys, and a value would be written to the file
     # that every service reads its settings from, where it cannot be encoded.
-    if lone_surrogate_locs(req.values):
+    if holds_lone_surrogate(req.values):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, SETTINGS_NOT_UTF8_DETAIL)
     # Only CONFIG_SCHEMA keys may be written (issue #1109): a body naming any
     # other key is refused whole, before anything is resolved or written.

@@ -24,7 +24,7 @@ from typing import Any
 from fastapi import HTTPException
 from herd_common.csv_safety import csv_safe_cell, csv_unsafe_cell
 from herd_common.rehearsal import rehearsal_session
-from herd_common.validation_errors import lone_surrogate_locs
+from herd_common.validation_errors import holds_lone_surrogate
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -73,14 +73,6 @@ TEMPLATE_CSV_COLUMNS = [
 # poll_interval_seconds (formatted bool/number), and field_data/sections
 # (JSON-encoded blobs whose first character is always "{" or "[", never a
 # trigger, and which prefixing a quote onto would break json.loads on import).
-# A JSON import file, or a JSON cell of a CSV row, holding a lone surrogate (an escape
-# such as \ud800 with no pair): a value no response, database write, or later read can
-# encode. The whole JSON file is refused; a CSV row with such a cell is rejected.
-IMPORT_NOT_TEXT_DETAIL = (
-    "Import file holds a lone surrogate escape, which is not valid text; fix it and retry"
-)
-JSON_CELL_NOT_TEXT_REASON = "a JSON cell holds a lone surrogate escape, which is not valid text"
-
 DEVICE_CSV_TEXT_COLUMNS = {"name", "template_name"}
 TEMPLATE_CSV_TEXT_COLUMNS = {
     "name",
@@ -92,6 +84,14 @@ TEMPLATE_CSV_TEXT_COLUMNS = {
     "model",
     "part_number",
 }
+
+# A JSON import file, or a JSON cell of a CSV row, holding a lone surrogate (an escape
+# such as \ud800 with no pair): a value no response, database write, or later read can
+# encode. The whole JSON file is refused; a CSV row with such a cell is rejected.
+IMPORT_NOT_TEXT_DETAIL = (
+    "Import file holds a lone surrogate escape, which is not valid text; fix it and retry"
+)
+JSON_CELL_NOT_TEXT_REASON = "a JSON cell holds a lone surrogate escape, which is not valid text"
 
 
 def _empty_report(dry_run: bool) -> BulkImportReport:
@@ -224,7 +224,7 @@ def _parse_json(raw: str) -> list[dict[str, Any]]:
         doc = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}") from exc
-    if lone_surrogate_locs(doc):
+    if holds_lone_surrogate(doc):
         raise HTTPException(status_code=422, detail=IMPORT_NOT_TEXT_DETAIL)
     if isinstance(doc, dict) and "items" in doc:
         items = doc["items"]
@@ -272,7 +272,7 @@ def _coerce_json_cell(value: Any, default: Any) -> Any:
     if isinstance(value, (dict, list)):
         return value
     parsed = json.loads(value)
-    if lone_surrogate_locs(parsed):
+    if holds_lone_surrogate(parsed):
         raise ValueError(JSON_CELL_NOT_TEXT_REASON)
     return parsed
 

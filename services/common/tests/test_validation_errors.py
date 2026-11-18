@@ -18,11 +18,13 @@ import pytest
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from herd_common.validation_errors import (
+    MAX_REPORTED_LOCATIONS,
     RENDERED_KEYS,
     STRING_UNICODE_MSG,
     STRING_UNICODE_TYPE,
     RefuseLoneSurrogates,
     body_lone_surrogate_errors,
+    holds_lone_surrogate,
     install_validation_errors,
     lone_surrogate_locs,
     render_validation_errors,
@@ -340,6 +342,13 @@ def test_lone_surrogate_locs_is_not_limited_by_the_recursion_limit():
         # a UTF-16 document, which JSON detects from its NUL bytes and always parses
         ('{"a": "x\ud800"}'.encode("utf-16-le", "surrogatepass"), [["body", "a"]]),
         ('{"a": "x\ud800\u0090"}'.encode("utf-16-le", "surrogatepass"), [["body", "a"]]),
+        # a pair is one code point, but only when both halves are real escapes
+        (b'{"a": "\\\\ud83d\\ude00"}', [["body", "a"]]),
+        (b'{"a": "\\ud83d\\\\ude00"}', [["body", "a"]]),
+        (b'{"a": "\\ud83d\\ud83d\\ude00"}', [["body", "a"]]),
+        (b'{"a": "\\ud83d\\ude00\\ude00"}', [["body", "a"]]),
+        # a member a later duplicate key replaces is not in the parsed value
+        (b'{"a": "\\ud800", "a": "ok"}', []),
         # an escaped backslash followed by text that reads like an escape
         (b'{"a": "\\\\ud800"}', []),
         # a backslash pair, then a real escape
@@ -362,6 +371,11 @@ def test_lone_surrogate_locs_is_not_limited_by_the_recursion_limit():
         "raw_utf8_bytes",
         "utf16",
         "utf16_valid_utf8_lookalike",
+        "escaped_backslash_then_pair",
+        "pair_then_escaped_backslash",
+        "high_high_low",
+        "high_low_low",
+        "duplicate_key",
         "escaped_backslash",
         "backslash_pair_then_escape",
         "valid_pair",
@@ -723,3 +737,194 @@ async def test_install_after_the_app_started_is_refused():
         await client.post("/nobody")
     with pytest.raises(RuntimeError):
         install_validation_errors(app)
+
+
+# -- At most ten locations, and a cost that does not explode (review of #1456) --------
+
+
+def test_a_refusal_reports_the_first_ten_locations_only():
+    """A body of many lone surrogates was answered with one item each: a 10 MB body
+    gave 1,111,111 items and a 155.6 MB 422. The search stops at the tenth."""
+    assert MAX_REPORTED_LOCATIONS == 10
+    errors = body_lone_surrogate_errors(_esc([SUR] * 25))
+    assert errors == [{**UNICODE, "loc": ["body", i]} for i in range(10)]
+
+
+def test_the_locator_stops_at_its_limit_and_keeps_document_order():
+    value = {"a": [SUR, "ok", SUR], "b" + LOW: 1, "c": {"d": SUR}}
+    assert lone_surrogate_locs(value) == [("a", 0), ("a", 2), (), ("c", "d")]
+    assert lone_surrogate_locs(value, limit=2) == [("a", 0), ("a", 2)]
+    assert lone_surrogate_locs(value, limit=1) == [("a", 0)]
+
+
+_WIDE = 40  # past the size from which a container is filtered in C
+
+
+@pytest.mark.parametrize(
+    ("value", "locs"),
+    [
+        ([0] * _WIDE + [[1, SUR]], [(_WIDE, 1)]),  # numbers skipped, a nested hit found
+        (["ok"] * _WIDE + [None, SUR, "ok", SUR], [(_WIDE + 1,), (_WIDE + 3,)]),
+        ({**{f"k{i}": i for i in range(_WIDE)}, "z" + SUR: {"y": SUR}}, [()]),
+        ({**{f"k{i}": "ok" for i in range(_WIDE)}, "z": [SUR]}, [("z", 0)]),
+        ([1.5, True, None, "ok"] * _WIDE, []),
+        # a str subclass is not what json.loads makes: every child is looked at
+        ([0] * _WIDE + [type("S", (str,), {})("x" + SUR)], [(_WIDE,)]),
+    ],
+    ids=["numbers", "strings", "key", "dict_values", "clean", "str_subclass"],
+)
+def test_lone_surrogate_locs_in_large_containers(value, locs):
+    assert lone_surrogate_locs(value) == locs
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ({"a": ["x", {"b": "y" + SUR}]}, True),
+        ({"k" + LOW: 1}, True),
+        ({"a": [PAIR, "café", 1, None]}, False),
+        ({1, 2}, False),  # not JSON data: searched by the locator, which finds nothing
+    ],
+    ids=["nested_value", "key", "clean", "not_json"],
+)
+def test_holds_lone_surrogate(value, expected):
+    assert holds_lone_surrogate(value) is expected
+
+
+def test_holds_lone_surrogate_on_a_value_too_deep_to_serialize():
+    for leaf, expected in ((SUR, True), ("ok", False)):
+        deep: object = leaf
+        for _ in range(10_000):
+            deep = [deep]
+        with pytest.raises(RecursionError):
+            json.dumps(deep)
+        assert holds_lone_surrogate(deep) is expected
+
+
+# The reviewer's two attack bodies, scaled to about 1 MB, plus the deep-and-wide body
+# that must be parsed: before the fix the locator built a location tuple per element,
+# so memory grew with elements times depth (1,422 MB for the first) and time with it.
+_DEEP_PAIR = b"[" * 600 + b'"\\ud83d\\ude00",' + b"0," * 300_000 + b"0" + b"]" * 600
+_FLAT_PAIR = b'["\\ud83d\\ude00",' + b"0," * 500_000 + b"0]"
+_DEEP_LONE = b"[" * 600 + b"0," * 300_000 + b'"\\ud800"' + b"]" * 600
+
+
+def _peak(fn) -> int:
+    """Peak bytes allocated while `fn` runs, as tracemalloc sees it."""
+    import tracemalloc
+
+    tracemalloc.start()
+    try:
+        fn()
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def _best_time(fn, runs: int = 3) -> float:
+    """The fastest of `runs` timings: robust to a busy host and to a single core."""
+    import time
+
+    best = float("inf")
+    for _ in range(runs):
+        start = time.perf_counter()
+        fn()
+        best = min(best, time.perf_counter() - start)
+    return best
+
+
+@pytest.mark.parametrize("body", [_DEEP_PAIR, _FLAT_PAIR], ids=["deep_pair", "flat_pair"])
+def test_a_body_that_holds_no_lone_surrogate_is_never_parsed(body):
+    """A valid pair anywhere was enough to make the check parse the body and walk it.
+    It is now decided from the raw text: no parse, no allocation that grows with the
+    body, and less time than the one parse FastAPI does anyway (bounds are relative, so
+    they hold pinned to one core and on a fast host)."""
+    assert body_lone_surrogate_errors(body) == []
+    assert _peak(lambda: body_lone_surrogate_errors(body)) < 64 * 1024
+    assert _best_time(lambda: body_lone_surrogate_errors(body)) < _best_time(
+        lambda: json.loads(body)
+    )
+
+
+def test_a_deep_and_wide_body_holding_one_costs_about_one_parse():
+    """When the body does hold one it is parsed once and searched with memory that grows
+    with the depth only: the peak is the parse's own (which FastAPI would make anyway)
+    plus a fixed margin, and the time a small multiple of it."""
+    assert body_lone_surrogate_errors(_DEEP_LONE) == [
+        {**UNICODE, "loc": ["body", *([0] * 599), 300_000]}
+    ]
+    parse_peak = _peak(lambda: json.loads(_DEEP_LONE))
+    assert _peak(lambda: body_lone_surrogate_errors(_DEEP_LONE)) < parse_peak + 1024 * 1024
+    assert _best_time(lambda: body_lone_surrogate_errors(_DEEP_LONE)) < 8 * _best_time(
+        lambda: json.loads(_DEEP_LONE)
+    )
+
+
+def test_the_locator_holds_memory_for_the_depth_not_the_elements():
+    parsed = json.loads(_DEEP_LONE)
+    assert _peak(lambda: lone_surrogate_locs(parsed)) < 256 * 1024
+
+
+def test_a_body_of_many_lone_surrogates_stops_at_the_tenth():
+    body = _esc([SUR] * 200_000)
+    parse_peak = _peak(lambda: json.loads(body))
+    assert len(body_lone_surrogate_errors(body)) == 10
+    assert _peak(lambda: body_lone_surrogate_errors(body)) < parse_peak + 1024 * 1024
+    assert _best_time(lambda: body_lone_surrogate_errors(body)) < 8 * _best_time(
+        lambda: json.loads(body)
+    )
+
+
+def test_holds_lone_surrogate_costs_about_one_serialization():
+    """The other callers (the import checks, secrets' reveal, config's save) test a
+    parsed value: one serialization in C, so its peak memory is under three times the
+    parse's own and its time a small multiple of the parse's, at any depth (before,
+    the locator's per-element tuples made both grow with elements times depth)."""
+    for body, expected in ((_DEEP_LONE, True), (_DEEP_PAIR, False)):
+        parsed = json.loads(body)
+        assert holds_lone_surrogate(parsed) is expected
+
+        def check(parsed=parsed):
+            return holds_lone_surrogate(parsed)
+
+        def parse(body=body):
+            return json.loads(body)
+
+        assert _peak(check) < 3 * _peak(parse)
+        assert _best_time(check) < 8 * _best_time(parse)
+
+
+def test_through_an_app_the_check_adds_nothing_to_an_unauthenticated_request():
+    """The reviewer's measurement on the real acl app, in miniature: a route behind a
+    failing dependency, sent the deep pair body with no credentials. With the check the
+    request costs what it costs without it, and still answers the dependency's 401."""
+    import asyncio
+
+    def peak_of(refuse: bool) -> tuple[int, int]:
+        app = _open_app(refuse=refuse)
+
+        async def send() -> int:
+            async with _client(app) as client:
+                resp = await client.post("/guarded", content=_DEEP_PAIR, headers=_JSON)
+                return resp.status_code
+
+        status: list[int] = []
+        peak = _peak(lambda: status.append(asyncio.run(send())))
+        return status[0], peak
+
+    without_status, without_peak = peak_of(False)
+    with_status, with_peak = peak_of(True)
+    assert without_status == with_status == 401
+    assert with_peak < without_peak + 1024 * 1024
+
+
+def test_a_large_container_is_filtered_in_c_before_the_walk():
+    """Only the children the walk needs are yielded: containers always, strings only
+    when one of them holds a hit, every child when a key does."""
+    from herd_common.validation_errors import _children
+
+    assert list(_children([0] * _WIDE + [[1]])) == [(_WIDE, [1])]
+    assert list(_children([0] * _WIDE + ["ok", SUR])) == [(_WIDE, "ok"), (_WIDE + 1, SUR)]
+    keyed = {**{f"k{i}": i for i in range(_WIDE)}, "z" + SUR: 1}
+    assert len(list(_children(keyed))) == _WIDE + 1
+    assert list(_children([0] * 3)) == [(0, 0), (1, 0), (2, 0)]  # small: not filtered

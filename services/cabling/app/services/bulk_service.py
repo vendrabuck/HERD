@@ -51,7 +51,7 @@ from typing import Any
 from fastapi import HTTPException
 from herd_common.csv_safety import csv_safe_cell, csv_unsafe_cell
 from herd_common.rehearsal import rehearsal_session
-from herd_common.validation_errors import lone_surrogate_locs
+from herd_common.validation_errors import holds_lone_surrogate
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -63,10 +63,6 @@ from app.services.reservation_guard import find_blocking_reservations
 from app.services.version_service import commit_with_new_version
 from app.services.visible_devices import resolve_caller_visibility
 
-# Pinned reject reason when an import row would rewire a topology currently held
-# by another user's active reservation. Mirrors the reservation-scoped lock on
-# PUT /topologies/{id}: bulk import must never silently rewire a topology out
-# from under a live reservation it does not own.
 # A JSON import file holding a lone surrogate (an escape such as \ud800 with no pair):
 # a value no response, database write, or later read can encode.
 IMPORT_NOT_TEXT_DETAIL = (
@@ -85,6 +81,10 @@ def _decode_import(raw: bytes) -> str:
         raise HTTPException(status_code=422, detail=IMPORT_NOT_UTF8_DETAIL) from exc
 
 
+# Pinned reject reason when an import row would rewire a topology currently held
+# by another user's active reservation. Mirrors the reservation-scoped lock on
+# PUT /topologies/{id}: bulk import must never silently rewire a topology out
+# from under a live reservation it does not own.
 _LOCKED_TOPOLOGY_REASON = (
     "topology is in use by an active reservation owned by another user; "
     "bulk import cannot rewire it"
@@ -238,7 +238,7 @@ def parse_json_topologies(raw: bytes) -> list[dict[str, Any]]:
         doc = json.loads(_decode_import(raw))
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}") from exc
-    if lone_surrogate_locs(doc):
+    if holds_lone_surrogate(doc):
         raise HTTPException(status_code=422, detail=IMPORT_NOT_TEXT_DETAIL)
     if isinstance(doc, dict) and "items" in doc:
         items = doc["items"]
