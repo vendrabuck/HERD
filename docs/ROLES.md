@@ -65,7 +65,7 @@ is issued with the lower role.
 | List all user accounts | | yes | yes |
 | Promote a user to admin | | | yes |
 | Demote an admin to user | | | yes |
-| Rewrite the single sign-on issuer of every linked account, or relink one single sign-on account to a named identity | | | yes |
+| Rewrite the single sign-on issuer of every linked account, list one single sign-on account's relink candidates, or relink it to a named identity | | | yes |
 
 ---
 
@@ -136,8 +136,10 @@ The superadmin has all admin capabilities plus:
 - Set any user's role to `user` or `admin` (`PUT /api/auth/users/{id}/role`)
 - Recover single sign-on accounts (issue #1399, API only): rewrite the issuer of every
   linked identity under one issuer (`POST /api/auth/admin/federated-identities/rewrite-issuer`)
-  and relink one `oidc` account to a named identity
-  (`PUT /api/auth/users/{id}/federated-identity`); see Admin Management below
+  relink one `oidc` account to a named identity
+  (`PUT /api/auth/users/{id}/federated-identity`), and list the relink candidates its
+  refused sign-ins left (`GET /api/auth/users/{id}/federated-identity/candidates`); see
+  Admin Management below
 
 The superadmin's own role cannot be changed via the API. Demoting the superadmin
 requires direct database access, which is intentional.
@@ -234,9 +236,12 @@ Content-Type: application/json
 
 Moves every single sign-on identity whose issuer is exactly `old_issuer` to
 `new_issuer`, for a planned `OIDC_ISSUER` change whose provider keeps each person's
-`sub`. `dry_run` is required. Answers `{dry_run, matched, conflicts, rewritten}`; 400
-when the two issuers are equal; 409 with the count, nothing changed, when any subject
-already has an identity under `new_issuer`. The full procedure is in
+`sub`. `dry_run` is required. Answers `{dry_run, matched, conflicts, rewritten,
+collisions, collisions_truncated}`, where `collisions` lists up to 50 colliding subjects
+as account id pairs `{old_issuer_account_id, new_issuer_account_id}`; 400 when the two
+issuers are equal; 409, nothing changed, when any subject already has an identity under
+`new_issuer`, with the fixed `detail` beside `conflicts`, `collisions`, and
+`collisions_truncated`. The full procedure is in
 [OPERATIONS.md](OPERATIONS.md), "Changing the OIDC issuer".
 
 ### Relink a single sign-on account (superadmin, any auth mode)
@@ -249,14 +254,30 @@ Content-Type: application/json
 { "issuer": "https://idp.example.com/realms/herd", "subject": "<the person's new sub>" }
 ```
 
+or `{ "candidate_id": "<id from the candidates list>" }`, exactly one of the two forms.
 Replaces the `oidc` account's identity with exactly that pair, so a person whose
-provider reissued their `sub` signs in to the account they already have. Answers the
-identity `{user_id, issuer, subject, created_at, last_login_at}`; 404 for an unknown
-account; 409 for a local or LDAP account (never linked) and for a pair another account
-holds. Nothing ever links an account by email. See [OPERATIONS.md](OPERATIONS.md), "A
+provider reissued their `sub` signs in to the account they already have, and discards
+the account's relink candidates. Answers the identity `{user_id, issuer, subject,
+created_at, last_login_at}`; 404 for an unknown account or a candidate that is not a
+live candidate of this account; 409 for a local or LDAP account (never linked) and for
+a pair another account holds; 422 for both forms or neither.
+
+### List a single sign-on account's relink candidates (superadmin, any auth mode)
+
+```
+GET /api/auth/users/{user_id}/federated-identity/candidates
+Authorization: Bearer <superadmin-token>
+```
+
+Answers `{user_id, captured_total, candidates: [{id, issuer, fingerprint, created_at,
+last_seen_at, expires_at, attempts}]}`: the identities of sign-ins refused in the last
+24 hours because their email is this account's, newest first, never the subject. A
+candidate shows only that someone signed in at the provider with an account carrying
+that email; confirm with the person out of band before relinking by one (see
+[OPERATIONS.md](OPERATIONS.md)). Nothing ever links an account by email. See [OPERATIONS.md](OPERATIONS.md), "A
 user's first single sign-on login is refused as a collision".
 
-Both routes refuse an admin (403). In single sign-on mode the superadmin signs in
+All three routes refuse an admin (403). In single sign-on mode the superadmin signs in
 through `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN` or a superadmin API token.
 
 ---
@@ -1824,6 +1845,7 @@ Authorization: Bearer <admin-token>
 | `/api/auth/users` | GET | | yes | yes |
 | `/api/auth/users/{id}/role` | PUT | | | yes |
 | `/api/auth/users/{id}/federated-identity` | PUT | | | yes |
+| `/api/auth/users/{id}/federated-identity/candidates` | GET | | | yes |
 | `/api/auth/users/{id}/activate` | POST | | yes | yes |
 | `/api/auth/users/{id}/deactivate` | POST | | yes | yes |
 | `/api/auth/users/{id}/profile` | PATCH | yes (own id only) | yes | yes |
