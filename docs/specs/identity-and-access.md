@@ -34,7 +34,7 @@ numbered in section 8.
 | Unauthenticated caller | Register (local mode only), log in, refresh, log out, exchange an API token, read the login options, use the three single sign-on routes (OIDC mode only, not yet supported for operators: see section 8.19), read `/health` and `/version` | Anything else; every other route answers 401 |
 | User | Read their own account, edit their own profile (name, contact email, phone), list groups by name, read any user's group memberships, ask the acl service about their own access | Read a group's members, change any group, list users, change roles or activation, create API tokens, manage grants, ask about another user's access |
 | Admin | Everything a user may; list users; edit any account's profile, the superadmin's included; activate any account; deactivate any account other than their own and the superadmin's; manage groups and members; manage directory mappings and run directory sync; create API tokens for any principal of their rank or lower; list and revoke every API token; manage grants; ask about any user's access | Change any role; assign the superadmin role; deactivate the superadmin or themselves; mint a token above their own rank |
-| Superadmin | Everything an admin may; set any other non-superadmin account's role to user or admin; mint superadmin tokens | Change their own role or another superadmin's; assign the superadmin role; deactivate themselves |
+| Superadmin | Everything an admin may; set any other non-superadmin account's role to user or admin; mint superadmin tokens; rewrite the issuer of every single sign-on identity under one issuer, and relink one single sign-on account to a named identity (section 8.19) | Change their own role or another superadmin's; assign the superadmin role; deactivate themselves; link a local or LDAP account to an identity |
 | Another service (internal token) | List active admin ids, read a user's contact details, read an active user's groups (auth); run a permission check for a user id (acl) | Anything through the user-facing routes |
 
 ## 3. Concepts and data
@@ -52,7 +52,8 @@ numbered in section 8.
 | Directory mapping | One directory group DN mirrored into one HERD group | auth | `ldap_group_mappings` (`LdapGroupMapping` in `services/auth/app/models/ldap_group_mapping.py`) |
 | Sync run | The audit row of one directory sync pass: trigger, status, counters, capped detail | auth | `ldap_sync_runs` (`LdapSyncRun` in `services/auth/app/models/ldap_sync_run.py`) |
 | OIDC login flow | One single sign-on attempt (ADR 0016): the SHA-256 hashes of its `state`, its browser-binding secret, and, once authenticated, its handoff secret; the `nonce` as issued; the PKCE verifier until the callback claims the row; the sanitized return path; a status; the flow expiry (600 s) and the handoff expiry (60 s). Written only by the single sign-on routes, which answer only in OIDC mode (IAM-OIDC-15) | auth | `oidc_login_flows` (`OidcLoginFlow` in `services/auth/app/models/oidc_login_flow.py`) |
-| Federated identity | One identity-provider account, keyed by the ID token's (`iss`, `sub`) pair, linked to exactly one `oidc` account; never keyed by email. Holds `last_login_at` | auth | `federated_identities` (`FederatedIdentity` in `services/auth/app/models/federated_identity.py`) |
+| Federated identity | One identity-provider account, keyed by the ID token's (`iss`, `sub`) pair, linked to exactly one `oidc` account; never keyed by email. Holds `last_login_at`. Written by a first login (IAM-OIDC-9), by a returning login (`last_login_at` only), and by the two superadmin recovery routes (IAM-OIDC-30, IAM-OIDC-31) | auth | `federated_identities` (`FederatedIdentity` in `services/auth/app/models/federated_identity.py`) |
+| Relink candidate | The (issuer, subject) of a single sign-on login refused because its email belongs to an `oidc` account, kept against that account for 24 hours so a superadmin can relink the account to it after confirming with the person out of band; evidence that someone tried, never a link. With a per-account count of the distinct pairs ever captured | auth | `federated_relink_candidates`, `federated_relink_capture_totals` (`FederatedRelinkCandidate`, `FederatedRelinkCaptureTotal` in `services/auth/app/models/federated_relink_candidate.py`) |
 | Resource grant | A user group's `view` or `manage` permission on one resource. `group_id` is a bare auth id and `resource_id` a bare id of another service's resource, neither with a foreign key | acl | `resource_grants` (`ResourceGrant` in `services/acl/app/models/grant.py`) |
 | Internal token | The shared secret `INTERNAL_API_TOKEN` sent as `X-Internal-Token` on service-to-service calls with no acting user | every service | environment |
 
@@ -112,8 +113,15 @@ IAM-ACCT-4, IAM-RUN-6). Refresh consumes its token with a conditional update tha
 re-checks every liveness condition (IAM-SESSION-2). Every OIDC flow transition is one
 conditional update naming the expected status, so of concurrent claims, exchanges, or a
 completion racing a failure exactly one wins (IAM-OIDC-4 to IAM-OIDC-7); concurrent first
-logins of one identity create one account (IAM-OIDC-11). Manual activate and deactivate
-are plain ORM writes; only one sync run can execute at a time (IAM-SERIAL-1).
+logins of one identity create one account (IAM-OIDC-11). The superadmin issuer rewrite
+and identity relink are judged by the unique constraints of `federated_identities`, and
+relinks of one account apply in turn on its row lock (IAM-OIDC-34); a returning
+login's `last_login_at` write is a compare-and-swap, so a login in flight when either
+commits is refused (IAM-OIDC-39); relink candidate captures are serialized by one
+advisory lock (IAM-OIDC-36): each captured refusal holds that one global lock on a
+pooled connection, and auth sets no statement timeout, but logins that capture nothing
+never wait on it and captures are bounded by sign-ins at the provider. Manual activate and
+deactivate are plain ORM writes; only one sync run can execute at a time (IAM-SERIAL-1).
 
 **Rules.**
 
@@ -295,9 +303,12 @@ are plain ORM writes; only one sync run can execute at a time (IAM-SERIAL-1).
   Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_concurrent_first_login_of_the_same_identity_yields_one_user`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_concurrent_first_logins_of_one_identity_create_one_user`)
 - **IAM-OIDC-12.** Every refused federated login is logged once at WARNING with a fixed
   `reason` and, when an account is known, its HERD id, and with no email, username,
-  name, issuer, or subject. \
-  Enforced in: `services/auth/app/services/auth_service.py` (`_refuse_federated`) \
-  Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_refusal_logs_carry_no_claim_values`, `test_first_login_refusal_creates_nothing_and_logs_one_fixed_reason`)
+  name, issuer, or subject. A refused login's issuer and subject are never logged; the
+  only place they are kept is a relink candidate (IAM-OIDC-36), a table only the
+  superadmin routes read, and the capture's own log line names only the account and the
+  candidate. \
+  Enforced in: `services/auth/app/services/auth_service.py` (`_refuse_federated`, `_capture_relink_candidate`) \
+  Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_refusal_logs_carry_no_claim_values`, `test_first_login_refusal_creates_nothing_and_logs_one_fixed_reason`); `services/auth/tests/test_federated_identity_routes.py` (`test_a_refusal_on_an_oidc_accounts_email_captures_a_candidate`, `test_a_capture_failure_never_changes_the_refusal`)
 - **IAM-OIDC-13.** `resolve_federated_user` returns the account or nothing for every
   login and never raises on claim content. The issuer and subject are refused
   (`issuer_invalid`, `subject_invalid`) before the identity lookup when either is not a
@@ -338,6 +349,8 @@ Auth service:
 | GET | `/users` | admin, superadmin | 200 | IAM-USER-1, IAM-PROFILE-10 |
 | PATCH | `/users/{id}/profile` | any signed-in active account; a user only for their own id, admin and superadmin for any | 200 | IAM-PROFILE-1 to IAM-PROFILE-8 |
 | PUT | `/users/{id}/role` | superadmin | 200 | IAM-USER-2 to IAM-USER-7 |
+| PUT | `/users/{id}/federated-identity` | superadmin; any auth mode | 200 | IAM-OIDC-29, IAM-OIDC-31 to IAM-OIDC-35, IAM-OIDC-38 |
+| GET | `/users/{id}/federated-identity/candidates` | superadmin; any auth mode | 200 | IAM-OIDC-29, IAM-OIDC-37, IAM-OIDC-38 |
 | POST | `/users/{id}/activate` | admin, superadmin | 200 | IAM-ACCT-2 |
 | POST | `/users/{id}/deactivate` | admin, superadmin | 200 | IAM-ACCT-1 |
 | POST | `/tokens` | admin, superadmin | 201 | IAM-APITOK-1 to IAM-APITOK-5 |
@@ -355,6 +368,7 @@ Auth service:
 | POST | `/groups/{id}/members/bulk-remove` | admin, superadmin | 200 | IAM-GROUP-9 |
 | GET | `/groups/user/{user_id}` | any signed-in active account, for any user id | 200 | IAM-GROUP-10 |
 | POST | `/groups/users/groups` | any signed-in active account, for any user ids | 200 | IAM-GROUP-10 |
+| POST | `/admin/federated-identities/rewrite-issuer` | superadmin; any auth mode | 200 | IAM-OIDC-29, IAM-OIDC-30, IAM-OIDC-32 to IAM-OIDC-35 |
 | GET | `/admin/ldap-sync/status` | admin, superadmin; any auth mode | 200 | IAM-LOOP-7 |
 | POST | `/admin/ldap-sync/mappings` | admin, superadmin; LDAP mode only | 201 | IAM-MAP-1 to IAM-MAP-7 |
 | GET | `/admin/ldap-sync/mappings` | admin, superadmin; any auth mode | 200 | IAM-MAP-8 |
@@ -1777,13 +1791,25 @@ the answer arrives, and shows the pending state of IAM-OIDC-28 until then. The f
 store and provisioning rules are IAM-OIDC-1 to IAM-OIDC-14 in section 4; the design is
 [ADR 0016](../design/0016-oidc-single-sign-on.md).
 
+When a person's sign-in is refused because their provider now names them differently,
+a superadmin repairs the link through the API, with no UI page (issue #1399, decided by
+the owner on 2026-11-18): after a planned `OIDC_ISSUER` change, one call moves every
+identity under the old issuer to the new one; after the provider reissued one person's
+subject, one call relinks that person's account to the new subject. Either way the
+person's next sign-in lands in the account they already have, with its groups, grants,
+and reservations, because the account id never changes. Neither route ever matches by
+email (ADR 0016 D4 as built). The runbook is `docs/OPERATIONS.md`.
+
 **Surfaces.** Routes `GET /login-options` (`services/auth/app/routers/auth.py`) and
 `GET /oidc/login`, `GET /oidc/callback`, `POST /oidc/exchange`
 (`services/auth/app/routers/oidc.py`); `POST /login` in OIDC mode. In the browser:
 `frontend/src/pages/LoginPage.tsx`, `frontend/src/pages/OidcCompletePage.tsx` (route
 `/login/sso`), `frontend/src/lib/sso.ts`, `frontend/src/api/auth.ts`
 (`useLoginOptions`, `exchangeOidcHandoff`), `frontend/src/api/client.ts` (the refresh
-skip list).
+skip list). Recovery: `POST /admin/federated-identities/rewrite-issuer` and
+`PUT /users/{id}/federated-identity` (`services/auth/app/routers/federated_identities.py`,
+`services/auth/app/services/federated_identity_service.py`,
+`services/auth/app/schemas/federated_identity.py`).
 
 **Rules.**
 
@@ -1978,6 +2004,160 @@ skip list).
   Enforced in: `frontend/src/lib/sso.ts` (`settledLoginPageView`, `loginOptionsFailed`, `LOGIN_OPTIONS_FAILED_MESSAGE`); `frontend/src/pages/LoginPage.tsx` (`LoginPage`); `frontend/src/api/auth.ts` (`getLoginOptions`, `useLoginOptions`, `LOGIN_OPTIONS_TIMEOUT_MS`); `frontend/src/components/guards.tsx` (`GuestGuard`) \
   Pinned by: `frontend/src/test/lib/sso.test.ts` (`settledLoginPageView: pending, answered, and failed`, `no answer and no failure yet is the pending state, null: no sign-in method at all`, `loginOptionsFailed: the notice shows only for a failure with no confirmed answer`, `is the exact wording`, `%s: notice shown is %s`); `frontend/src/test/pages/LoginPageSso.test.tsx` (`LoginPage while /login-options is pending (issue #1420)`, `renders no sign-in method while the answer is pending`, `announces the pending state as a polite status, with the placeholder bars hidden from assistive technology`, `keeps the header, the version, and the configuration link while pending`, `shows the unconfigured banner while pending: it depends on the config service, not on the method`, `%s: nothing before the answer, then exactly what it states`, `OIDC mode, %s: the password form and the Register link are never in the document, from first render to the answer`, `does not move focus when the answer arrives: a focused configuration link keeps it`, `a request that never answers ends in the failure notice and today's page at the client timeout, not before`, `a signed-in visitor is sent on by GuestGuard before the page asks which method is active`, `a second visit in the same page load renders the cached answer at once, with no pending state`, `a second visit after a failure asks again, pending until the answer`, `the failure notice and Try again (issue #1420 review)`, `%s shows the notice and a Try again button above today's form`, `a browser offline at load still sends the request; its failure shows the notice`, `Try again goes back to pending, then renders the confirmed OIDC answer: form and Register gone, the button present`, `Try again that fails again returns to today's page with the notice`, `repeated clicks on Try again send one request`, `each retry gets the same client limit: a retry that never answers ends in the notice again`, `text typed into today's form survives a retry that fails again`, `a retry that confirms local mode keeps the email and the password`, `a retry that confirms single sign-on keeps the email but drops the password behind the toggle`); `frontend/src/test/api/sso.test.tsx` (`gives up after LOGIN_OPTIONS_TIMEOUT_MS, 5 seconds, so a hung request reaches the fallback`, `is sent even while the browser reports itself offline, so the page never waits on a paused query`); `tests/e2e/test_login_pending_playwright.py` (`test_no_sign_in_method_renders_until_login_options_answers`, `test_an_oidc_answer_never_lets_the_password_form_render`, `test_a_login_options_request_that_never_answers_falls_back_to_the_password_form`); `tests/e2e/test_oidc_login_playwright.py` (`test_sign_in_with_dex_lands_signed_in_and_logout_returns_to_the_button`)
 
+- **IAM-OIDC-29.** The three recovery routes,
+  `POST /admin/federated-identities/rewrite-issuer`, `PUT /users/{id}/federated-identity`,
+  and `GET /users/{id}/federated-identity/candidates`, admit only a superadmin effective
+  role (IAM-ROLE-5): 401 with no token, a bad token, or an inactive account; 403 for a
+  user, an admin, and an admin claim on a superadmin account; decided before any account
+  is read and before the body is validated, so a lower role gets the 403 whatever JSON
+  it sends. One exception, by FastAPI's order: a body that is not JSON is decoded before
+  the dependencies run, so it answers 422 `json_invalid` to any caller, the same body
+  for any id, which says nothing about an account. All three answer in every
+  `AUTH_METHOD`, so in OIDC mode the seeded local superadmin reaches them through the
+  break-glass login (IAM-OIDC-21) or a superadmin API token exchanged at
+  `POST /tokens/exchange`. \
+  Enforced in: `services/auth/app/routers/federated_identities.py` (`_superadmin_only`, `rewrite_federated_issuer`, `relink_federated_identity`, `list_federated_relink_candidates`); `services/auth/app/dependencies/auth.py` (`require_role`) \
+  Pinned by: `services/auth/tests/test_federated_identity_routes.py` (`test_only_a_superadmin_effective_role_may_call_either_route`, `test_the_role_gate_runs_before_the_body_is_validated_and_before_any_lookup`, `test_only_a_superadmin_may_read_candidates_and_the_gate_runs_before_the_lookup`, `test_a_body_that_is_not_json_is_a_422_before_the_role_gate`, `test_both_routes_answer_in_every_auth_mode`, `test_a_break_glass_local_superadmin_can_sign_in_and_recover_in_oidc_mode`, `test_a_superadmin_api_token_minted_before_the_switch_can_recover_in_oidc_mode`)
+- **IAM-OIDC-30.** The issuer rewrite takes exactly `old_issuer`, `new_issuer`, and
+  `dry_run` (a JSON boolean, required). It answers 400 `The new issuer equals the old
+  issuer` when the two strings are equal. Otherwise it counts the identities whose issuer
+  is exactly `old_issuer` (`matched`; no trailing-slash, case, or whitespace
+  normalization) and those whose subject already has an identity under `new_issuer`
+  (`conflicts`), and lists the colliding subjects as account id pairs `{old_issuer_account_id,
+  new_issuer_account_id}` (the holder under each issuer; ids only, no claim), at most 50,
+  ordered by the two ids, with `collisions_truncated` true when there were more (owner
+  decision B, 2026-11-18). A dry run answers 200 `{dry_run, matched, conflicts,
+  rewritten: 0, collisions, collisions_truncated}` and writes nothing. A real run with
+  any conflict answers 409 with `detail` the string `Rewrite refused: N federated
+  identities would collide with an identity already under the new issuer; nothing was
+  changed` (`identity` when N is 1) beside `conflicts`, `collisions`, and
+  `collisions_truncated`, and writes nothing; otherwise one UPDATE gives every
+  matched identity `new_issuer`, keeping its subject, account, row id, `created_at`, and
+  `last_login_at`, and it answers 200 with `rewritten` the rows changed (0 when nothing
+  matched). No other identity changes. \
+  Enforced in: `services/auth/app/routers/federated_identities.py` (`rewrite_federated_issuer`, `ISSUER_UNCHANGED_DETAIL`, `rewrite_conflict_detail`); `services/auth/app/services/federated_identity_service.py` (`rewrite_issuer`, `_count_matched`, `_count_conflicts`, `_list_collisions`, `COLLISIONS_LIST_CAP`); `services/auth/app/schemas/federated_identity.py` (`IssuerRewriteRequest`, `IssuerRewriteResponse`, `IssuerRewriteConflictResponse`, `CollisionPair`) \
+  Pinned by: `services/auth/tests/test_federated_identity_service.py` (`test_rewrite_moves_exactly_the_old_issuers_rows_and_keeps_everything_else`, `test_rewrite_compares_the_exact_string_with_no_trailing_slash_normalization`, `test_dry_run_counts_and_writes_nothing`, `test_a_conflict_refuses_the_whole_rewrite_with_its_count`, `test_a_subject_under_a_third_issuer_is_not_a_conflict`, `test_rewrite_of_nothing_answers_zero`); `services/auth/tests/test_federated_identity_routes.py` (`test_rewrite_dry_run_then_write_answer_the_counts`, `test_rewrite_with_a_conflict_is_refused_409_with_the_count_and_changes_nothing`, `test_rewrite_to_the_same_issuer_is_refused_400`, `test_rewrite_body_refusals_are_422_with_the_auth_shape`, `test_the_collision_list_is_capped_with_a_flag_and_the_total`); `services/auth/tests/test_federated_identity_live_pg.py` (`test_rewrite_on_a_used_ledger_moves_only_its_own_exact_issuer`)
+- **IAM-OIDC-31.** The relink takes either `issuer` and `subject`, or the `candidate_id`
+  of one of the named account's live relink candidates (IAM-OIDC-36), exactly one of the
+  two forms, and makes that pair the one identity of the account. It answers 404 `User
+  not found` for an unknown id, 404 `Relink candidate not found for this account` for a
+  candidate id that is unknown, expired, or another account's,
+  409 `Only a single sign-on account can be linked to an identity` for an account whose
+  `auth_source` is not `oidc` (a local or LDAP account, the superadmin included, is never
+  linked), and 409 `This identity is already linked to another account` when another
+  account holds the pair; each writes nothing. When the account already holds exactly
+  that pair it answers 200 and writes nothing. Otherwise it replaces the account's
+  identity (a new row id, a new `created_at`, no `last_login_at`) in one transaction and
+  answers 200 `{user_id, issuer, subject, created_at, last_login_at}`; the same
+  transaction deletes every relink candidate of the account, the one used included,
+  whichever form named the pair. The account's id,
+  email, username, role, and every other row are unchanged, so no other service sees
+  the change. It never reads an email or a claim: the superadmin names the account and
+  the pair. \
+  Enforced in: `services/auth/app/routers/federated_identities.py` (`relink_federated_identity`, `USER_NOT_FOUND_DETAIL`, `NOT_OIDC_DETAIL`, `IDENTITY_TAKEN_DETAIL`, `CANDIDATE_NOT_FOUND_DETAIL`); `services/auth/app/services/federated_identity_service.py` (`relink_identity`, `_holder_of`, `RelinkRefused`, `IdentityView`); `services/auth/app/schemas/federated_identity.py` (`FederatedIdentityLinkRequest`, `FederatedIdentityResponse`) \
+  Pinned by: `services/auth/tests/test_federated_identity_service.py` (`test_relink_replaces_the_identity_and_keeps_the_account_id`, `test_relink_reports_which_half_changed`, `test_relink_to_the_pair_already_held_writes_nothing`, `test_relink_gives_an_oidc_account_without_an_identity_one`, `test_relink_refuses_every_account_that_is_not_oidc`, `test_relink_refuses_the_local_superadmin`, `test_relink_refuses_an_unknown_account`, `test_relink_refuses_a_pair_another_account_holds`, `test_relink_takes_exactly_one_form_of_target`); `services/auth/tests/test_federated_identity_routes.py` (`test_relink_answers_the_new_identity_and_keeps_the_account`, `test_relink_refusals`, `test_relink_body_refusals_are_422`, `test_a_candidate_of_another_account_is_refused_and_changes_nothing`, `test_a_candidate_expires_after_24_hours`, `test_story_relink_by_candidate_then_the_next_login_succeeds`, `test_a_typed_relink_also_discards_the_accounts_candidates`); `services/auth/tests/test_federated_identity_live_pg.py` (`test_a_relink_refused_as_taken_on_postgres_keeps_the_old_identity`)
+- **IAM-OIDC-32.** Every issuer and subject either route takes passes exactly the
+  predicate a login's identity key passes (IAM-OIDC-13): a string that is not blank, at
+  most 255 characters, with no Cc or Cs character; nothing is trimmed or normalized, so
+  a value with edge spaces is stored as sent. Any other value (a lone surrogate sent as
+  a JSON escape included, which is a Cs character), an unknown key, and a `dry_run` that
+  is not a JSON boolean are a 422 in the auth shape (`{type, loc, msg}`), the
+  predicate's refusal with the fixed message `must be a non-blank string of at most 255
+  characters with no control character`. A relink body with both forms, neither, or half
+  a pair is a 422 `relink_target` at `["body"]` with the message `send either issuer and
+  subject, or candidate_id, and not both`; a null counts as absent. \
+  Enforced in: `services/auth/app/services/auth_service.py` (`identity_key_part_ok`, `_identity_key_refusal`, `ISSUER_MAX_LENGTH`); `services/auth/app/schemas/federated_identity.py` (`IDENTITY_KEY_MESSAGE`, `RELINK_TARGET_MESSAGE`, `Issuer`, `Subject`, `FederatedIdentityLinkRequest`) \
+  Pinned by: `services/auth/tests/test_federated_identity_service.py` (`test_the_routes_accept_exactly_the_identity_keys_a_login_accepts`, `test_identity_key_bounds_are_the_column_widths`); `services/auth/tests/test_federated_identity_routes.py` (`test_rewrite_body_refusals_are_422_with_the_auth_shape`, `test_relink_body_refusals_are_422`, `test_relink_accepts_a_subject_at_the_column_width_with_inner_spaces`, `test_the_relink_takes_exactly_one_of_the_pair_and_a_candidate_id`, `test_a_lone_surrogate_in_a_subject_is_refused_as_identity_key_invalid`)
+- **IAM-OIDC-33.** Every call to a recovery route that passes the role check writes one
+  log line from `app.routers.federated_identities` with `action` (`oidc_issuer_rewrite`,
+  `oidc_identity_relink`, or `oidc_relink_candidates_read`), `outcome`, and `caller_id`,
+  plus: for a rewrite the counts and `old_issuer_fingerprint` and
+  `new_issuer_fingerprint`; for a relink the target `user_id`, `via` (`pair` or
+  `candidate`), the `candidate_id`, whether the issuer and the subject changed,
+  `old_fingerprint` and `new_fingerprint` (IAM-OIDC-38) of the pairs before and after,
+  and `candidates_discarded`; for a read the target, the live count, and
+  `captured_total`. Writes and every relink or rewrite refusal but the 400 log at
+  WARNING; a dry run, an unchanged relink, the 400, and every read at INFO. No line holds
+  an issuer, a subject, an email, or a token. A
+  database error answers 500 `Federated identity change failed` and is logged once at
+  ERROR with the exception's class name only, no message or traceback. \
+  Enforced in: `services/auth/app/routers/federated_identities.py` (`_audit`, `_store_failed`, `REWRITE_ACTION`, `RELINK_ACTION`, `CANDIDATES_READ_ACTION`, `STORE_FAILED_DETAIL`) \
+  Pinned by: `services/auth/tests/test_federated_identity_routes.py` (`test_rewrite_dry_run_then_write_answer_the_counts`, `test_rewrite_with_a_conflict_is_refused_409_with_the_count_and_changes_nothing`, `test_relink_answers_the_new_identity_and_keeps_the_account`, `test_relink_refusals`, `test_a_database_error_answers_a_fixed_500_logged_by_class_name_only`, `test_the_route_constants_are_the_specified_wording`, `test_audit_lines_carry_fingerprints_and_never_the_pairs`)
+- **IAM-OIDC-34.** After any interleaving of the recovery routes with each other and with
+  sign-ins, each account has at most one identity and no two accounts share an (issuer,
+  subject): the unique constraints judge. A rewrite whose UPDATE meets an identity a
+  first login committed after the count is rolled back whole and answers the 409 of
+  IAM-OIDC-30 with a recount; a relink whose insert loses the pair to another writer is
+  rolled back whole (the account keeps its old identity) and answers the
+  `already linked` 409. On Postgres the relink locks the account's row `FOR UPDATE`
+  before it reads, so relinks of one account apply one after another and the last
+  wins; on SQLite the lock is a no-op. \
+  Enforced in: `services/auth/app/services/federated_identity_service.py` (`rewrite_issuer`, `relink_identity`, `IssuerRewriteConflict`); `services/auth/app/models/federated_identity.py` (`FederatedIdentity`) \
+  Pinned by: `services/auth/tests/test_federated_identity_service.py` (`test_rewrite_that_loses_to_an_insert_after_its_count_is_refused_and_writes_nothing`, `test_relink_that_loses_to_an_insert_after_its_check_is_refused_as_taken`); `services/auth/tests/test_federated_identity_live_pg.py` (`test_rewrite_after_a_first_login_committed_a_colliding_pair_writes_nothing`, `test_a_rewrite_and_a_colliding_first_login_released_together_keep_the_invariant`, `test_concurrent_relinks_of_many_accounts_to_one_pair_have_exactly_one_winner`, `test_concurrent_relinks_of_one_account_apply_in_turn`)
+- **IAM-OIDC-35.** A sign-in refused after an `OIDC_ISSUER` change (its issuer unknown,
+  its email held by the person's own account) signs in to that same account once the
+  rewrite has moved the identity; a sign-in refused because the provider reissued the
+  person's subject signs in to that same account once the relink names the new
+  subject, and the old subject is refused from then on. A provider account that holds
+  the person's email under any other subject is refused before and after either
+  route, also when its refused attempt left a candidate, until a superadmin relink names
+  that candidate; a relink by the person's own candidate makes their next sign-in land
+  in the account. \
+  Enforced in: `services/auth/app/services/auth_service.py` (`resolve_federated_user`); `services/auth/app/services/federated_identity_service.py` (`rewrite_issuer`, `relink_identity`) \
+  Pinned by: `services/auth/tests/test_federated_identity_routes.py` (`test_story_an_issuer_change_is_refused_then_recovered_by_the_rewrite`, `test_story_a_reissued_subject_is_refused_then_recovered_by_the_relink`, `test_story_a_provider_account_with_the_victims_email_never_gets_the_account`, `test_story_the_rewrite_is_refused_when_a_returning_user_was_provisioned_twice`, `test_story_relink_by_candidate_then_the_next_login_succeeds`, `test_story_a_planted_candidate_never_links_without_the_superadmin`); `services/auth/tests/test_oidc_service_live.py` (`test_an_issuer_change_is_refused_by_dex_sign_in_then_recovered_by_the_rewrite`, `test_a_reissued_subject_is_refused_by_dex_sign_in_then_recovered_by_the_relink`, `test_a_refused_dex_sign_in_leaves_a_candidate_and_a_relink_by_it_recovers_the_account`); `tests/integration/test_oidc_auth.py` (`test_an_issuer_change_is_refused_then_recovered_by_the_rewrite`, `test_a_reissued_subject_is_refused_then_recovered_by_the_relink`, `test_a_refused_sign_in_leaves_a_candidate_and_a_relink_by_it_recovers`)
+- **IAM-OIDC-36.** When a first login is refused as `email_taken` and exactly one account
+  holds that email (compared with the database's `lower()`) and it is an `oidc` account
+  whose role is not superadmin, the refused (issuer, subject) is kept as a relink
+  candidate against that account (owner decision A, 2026-11-18); no other refusal, no
+  username-only collision, no local, LDAP, or superadmin holder, and no successful login
+  leaves one. A new pair gets `created_at` now, an expiry 24 hours later
+  (`CANDIDATE_TTL`), `attempts` 1, and adds one to the account's `captured_total`, which
+  never goes down; a pair the account already has bumps only `attempts` and
+  `last_seen_at`. Each capture first deletes expired candidates, then keeps the newest 5
+  of the account (`CANDIDATES_PER_ACCOUNT`) and the newest 1000 in the table
+  (`CANDIDATES_GLOBAL_CAP`), the oldest deleted. Captures run under one
+  transaction-scoped advisory lock, so the caps and the counts hold between concurrent
+  refusals on Postgres. The capture runs after the refusal is decided and logged, in its
+  own transaction: the login answers exactly the refusal it would have, and a capture
+  failure is rolled back and logged once at WARNING (`oidc_relink_candidate_capture_failed`)
+  with the exception's class name only. Nothing links from a candidate. Limits, by
+  decision (ADR 0016 D4 as built): the refusal answers the same redirect but not in the
+  same time (second review, PostgreSQL 16 medians: 2.8 ms for a local holder, about
+  5.1 ms for an `oidc` holder and a repeated pair, 7.2 ms for a new pair), so a refused
+  caller, already authenticated at the provider with that email, can infer that it
+  belongs to an ordinary `oidc` account and whether a candidate was newly stored; the
+  global cap evicts the oldest rows of the whole table, so someone able to assert the
+  emails of 200 or more `oidc` accounts can flush other accounts' candidates (denial of
+  recovery only, visible in `captured_total`); expired rows are deleted only when a
+  later capture runs, bounded meanwhile by the caps; a token with no `email_verified`
+  claim is captured like a verified one. \
+  Enforced in: `services/auth/app/services/auth_service.py` (`resolve_federated_user`, `_capture_relink_candidate`); `services/auth/app/services/federated_identity_service.py` (`capture_relink_candidate`, `_oidc_holder_of_email`, `_evict_beyond`, `_CAPTURE_LOCK_KEY`); `services/auth/app/models/federated_relink_candidate.py` (`CANDIDATE_TTL`, `CANDIDATES_PER_ACCOUNT`, `CANDIDATES_GLOBAL_CAP`, `FederatedRelinkCandidate`, `FederatedRelinkCaptureTotal`) \
+  Pinned by: `services/auth/tests/test_federated_identity_routes.py` (`test_a_refusal_on_an_oidc_accounts_email_captures_a_candidate`, `test_no_candidate_when_the_email_holder_is_not_an_ordinary_oidc_account`, `test_no_candidate_for_a_username_only_collision_or_any_other_refusal`, `test_no_candidate_when_the_login_succeeds`, `test_a_repeated_pair_is_one_candidate_with_more_attempts`, `test_a_candidate_expires_after_24_hours`, `test_the_per_account_cap_keeps_the_newest_five_and_the_total_keeps_counting`, `test_the_global_cap_drops_the_oldest_candidates_in_the_table`, `test_a_capture_failure_never_changes_the_refusal`, `test_story_a_planted_candidate_never_links_without_the_superadmin`); `services/auth/tests/test_federated_identity_live_pg.py` (`test_concurrent_captures_of_distinct_pairs_keep_the_cap_and_count_every_pair`, `test_concurrent_captures_of_one_pair_are_one_candidate`)
+- **IAM-OIDC-37.** `GET /users/{id}/federated-identity/candidates` answers 200
+  `{user_id, captured_total, candidates}`, the account's unexpired candidates newest
+  first, each `{id, issuer, fingerprint, created_at, last_seen_at, expires_at,
+  attempts}`, where `fingerprint` is the pair's fingerprint (IAM-OIDC-38) and the subject
+  itself is never returned; 404 `User not found` for an unknown id and 409 `Only a single
+  sign-on account can be linked to an identity` for a local or LDAP account. It writes
+  nothing. \
+  Enforced in: `services/auth/app/routers/federated_identities.py` (`list_federated_relink_candidates`); `services/auth/app/services/federated_identity_service.py` (`list_relink_candidates`, `CandidateView`, `CandidateList`); `services/auth/app/schemas/federated_identity.py` (`RelinkCandidateResponse`, `RelinkCandidateListResponse`) \
+  Pinned by: `services/auth/tests/test_federated_identity_routes.py` (`test_a_refusal_on_an_oidc_accounts_email_captures_a_candidate`, `test_no_candidate_when_the_login_succeeds`, `test_only_a_superadmin_may_read_candidates_and_the_gate_runs_before_the_lookup`, `test_a_candidate_expires_after_24_hours`)
+- **IAM-OIDC-38.** A fingerprint is the first 16 hex characters of HMAC-SHA256 over the
+  JSON list of its values (`[issuer]` for an issuer, `[issuer, subject]` for a pair),
+  keyed by HMAC-SHA256 of the fixed context `herd-auth/oidc-identity-fingerprint/v1`
+  under `AUTH_SECRET_KEY` (owner decision C, 2026-11-18). The derived key is never the
+  JWT signing key itself; a different `AUTH_SECRET_KEY` gives different fingerprints. \
+  Enforced in: `services/auth/app/services/federated_identity_service.py` (`identity_fingerprint`, `FINGERPRINT_CONTEXT`, `FINGERPRINT_HEX_LENGTH`) \
+  Pinned by: `services/auth/tests/test_federated_identity_routes.py` (`test_the_fingerprint_is_a_truncated_hmac_under_a_key_derived_from_the_jwt_secret`, `test_audit_lines_carry_fingerprints_and_never_the_pairs`)
+- **IAM-OIDC-39.** A returning login writes `last_login_at` with one conditional update
+  naming the identity row as the login read it (its id, account, issuer, and subject);
+  when that matches no row, because a relink or an issuer rewrite committed in between,
+  the login is refused as `identity_changed` and nothing is issued (review finding 5 of
+  issue #1399). Neither route revokes a session: tokens issued before it live out their
+  lifetimes. \
+  Enforced in: `services/auth/app/services/auth_service.py` (`_returning_federated_login`) \
+  Pinned by: `services/auth/tests/test_federated_identity_routes.py` (`test_a_login_in_flight_when_a_relink_commits_is_refused`, `test_reactivating_an_account_restores_its_refresh_tokens`); `services/auth/tests/test_federated_identity_service.py` (`test_a_login_in_flight_when_a_rewrite_commits_is_refused`); `services/auth/tests/test_federated_identity_live_pg.py` (`test_a_login_in_flight_when_a_relink_commits_is_refused_on_postgres`)
+
 **Out of scope.** The live and stack-level tests (phase 5a's live service suite against
 the Dex lab; phase 5b's integration, load, and browser tests against a stack whose auth
 the gate recreates in OIDC mode) are described in `docs/specs/TESTING.md`, not here;
@@ -2103,6 +2283,7 @@ name (IAM-HASH-9). Every other error carries
 | 400 | `Cannot change your own role` | role change on oneself | IAM-USER-4 |
 | 400 | `Cannot change the superadmin's role` | role change on a superadmin | IAM-USER-5 |
 | 400 | `Cannot deactivate the superadmin` | deactivate a superadmin | IAM-ACCT-1 |
+| 400 | `The new issuer equals the old issuer` | issuer rewrite naming one issuer twice | IAM-OIDC-30 |
 | 400 | `Token role cannot exceed the principal's role` | token role above its principal | IAM-APITOK-3 |
 | 401 | `Not authenticated` (FastAPI) | no Authorization header on a JWT-guarded route, auth or acl | IAM-JWT-3, IAM-CLAIM-1 |
 | 401 | `Could not validate credentials` | bad, expired, or subjectless token; in auth also an unknown or inactive account | IAM-JWT-3, IAM-ACCT-5, IAM-CLAIM-1 |
@@ -2117,7 +2298,8 @@ name (IAM-HASH-9). Every other error carries
 | 403 | `Cannot query permissions for another user` | acl check, batch, or resources about someone else | IAM-ACL-8 |
 | 403 | `Invalid internal token` | an internal route with a wrong token | IAM-INTERNAL-2 |
 | 404 | `Single sign-on is not enabled` | any single sign-on route outside OIDC mode | IAM-OIDC-15 |
-| 404 | `User not found` | role change, activate, deactivate, add member, profile edit, or an internal lookup on an unknown account; internal groups on an inactive one; a user's profile edit naming any account but their own | IAM-USER-5, IAM-ACCT-1, IAM-ACCT-2, IAM-GROUP-6, IAM-INTERNAL-4, IAM-INTERNAL-5, IAM-PROFILE-1 |
+| 404 | `User not found` | role change, activate, deactivate, add member, profile edit, identity relink, candidate read, or an internal lookup on an unknown account; internal groups on an inactive one; a user's profile edit naming any account but their own | IAM-USER-5, IAM-ACCT-1, IAM-ACCT-2, IAM-GROUP-6, IAM-INTERNAL-4, IAM-INTERNAL-5, IAM-PROFILE-1, IAM-OIDC-31, IAM-OIDC-37 |
+| 404 | `Relink candidate not found for this account` | identity relink naming a candidate id that is unknown, expired, or another account's | IAM-OIDC-31 |
 | 404 | `Principal user not found` | token create for an unknown principal | IAM-APITOK-1 |
 | 404 | `Group not found` | any group route on an unknown group (admin caller) | IAM-GROUP-6, IAM-GROUP-7, IAM-GROUP-8, IAM-GROUP-9 |
 | 404 | `Member not found` | remove a non-member | IAM-GROUP-7 |
@@ -2137,8 +2319,12 @@ name (IAM-HASH-9). Every other error carries
 | 409 | `Directory sync requires auth_method=ldap` | sync-now outside LDAP mode | IAM-SERIAL-2 |
 | 409 | `A sync run is already in progress`, `A sync run is already in progress on another replica` | sync-now while a run holds the slot | IAM-SERIAL-1 |
 | 409 | `This grant already exists` | duplicate grant | IAM-ACL-2 |
-| 422 | validation list | registration, login, profile, group, bulk, mapping, token, grant, or check body out of bounds; a registration password holding a NUL or a lone surrogate, or a login password holding a lone surrogate; a profile body with a key other than the three profile fields, or a null or empty `full_name`; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-PROFILE-3, IAM-PROFILE-4, IAM-PROFILE-5, IAM-LOGIN-3, IAM-LOGIN-5, IAM-LOGIN-6, IAM-HASH-9, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2 |
+| 409 | `Rewrite refused: N federated identities would collide with an identity already under the new issuer; nothing was changed` (`identity` when N is 1), beside `conflicts`, `collisions`, and `collisions_truncated` | issuer rewrite whose subjects already have identities under the new issuer | IAM-OIDC-30, IAM-OIDC-34 |
+| 409 | `Only a single sign-on account can be linked to an identity` | identity relink or candidate read on a local or LDAP account | IAM-OIDC-31, IAM-OIDC-37 |
+| 409 | `This identity is already linked to another account` | identity relink to a pair another account holds | IAM-OIDC-31, IAM-OIDC-34 |
+| 422 | validation list | registration, login, profile, group, bulk, mapping, token, grant, check, issuer rewrite, or identity relink body out of bounds; a registration password holding a NUL or a lone surrogate, or a login password holding a lone surrogate; a profile body with a key other than the three profile fields, or a null or empty `full_name`; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-PROFILE-3, IAM-PROFILE-4, IAM-PROFILE-5, IAM-LOGIN-3, IAM-LOGIN-5, IAM-LOGIN-6, IAM-HASH-9, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2, IAM-OIDC-32 |
 | 422 | `group_dn does not resolve in the directory` | mapping DN proven absent | IAM-MAP-3 |
+| 500 | `Federated identity change failed` | a database error in an issuer rewrite, identity relink, or candidate read | IAM-OIDC-33 |
 | 503 | `Directory unavailable, credentials not checked` | LDAP-mode login while the directory cannot be asked | IAM-LDAP-12 |
 | 503 | `Directory unavailable, mapping not validated` | mapping create while the directory cannot be asked | IAM-MAP-3 |
 | 503 | `Internal API token not configured` | an internal route with no token configured | IAM-INTERNAL-2 |
@@ -2189,7 +2375,8 @@ Calls into this area are in section 7 and the forwarded-JWT group routes noted u
 | `LDAP_DISABLED_FILTER` | empty | Disabled-account filter; empty means absence only |
 | `LDAP_SYNC_DEACTIVATION_MAX_PERCENT`, `LDAP_SYNC_DEACTIVATION_MIN_COUNT` | `20`, `3` | Breaker terms |
 
-Fixed in code: LDAP connect timeout 10 s and receive timeout 30 s on the service
+Fixed in code: relink candidates live 24 hours, at most 5 per account and 1000 in all
+(IAM-OIDC-36); a rewrite lists at most 50 colliding pairs (IAM-OIDC-30). LDAP connect timeout 10 s and receive timeout 30 s on the service
 connection and on the login user bind (IAM-LDAP-12); paged search size 500; detail
 cap 20 per category; prune cadence 24 hours; bulk and batch caps 500.
 
@@ -2197,8 +2384,8 @@ cap 20 per category; prune cadence 24 hours; bulk and batch caps 500.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/auth/tests/` (in-memory SQLite, `test_profile_schema.py`, `test_user_profile_migration.py`, `test_effective_role_unit.py`, `test_api_tokens.py`, `test_ldap_service.py`, `test_ldap_sync_service.py`, `test_ldap_sync_service_scaling.py`, `test_ldap_sync_stale_run_reaper.py`, `test_ldap_sync_loop.py`, `test_oidc_flow_service.py`, `test_oidc_provisioning.py`, `test_oidc_sso_migration.py`, `test_password_hashing.py` (the 802 recorded passlib decisions), `test_validation_errors.py`); `services/acl/tests/test_grant_service_unit.py`, `test_auth_client.py`, `test_schema_validators.py`; `services/common/tests/test_auth.py`, `test_auth_settings.py`, `test_internal_auth.py`, `test_acl.py`; `services/notifications/tests/test_router.py` (its token decode); `tests/unit/test_jwt_settings_wiring.py`; `frontend/src/test/` (`api/client.test.ts`, `stores/authStore.test.ts`, `lib/roles.test.ts`, `components/guards.test.tsx`, `components/AdminGuard.test.tsx`, `routes.test.tsx`, the admin page tests; single sign-on in the browser: `lib/sso.test.ts`, `api/sso.test.tsx`, `pages/LoginPageSso.test.tsx`, `pages/OidcCompletePage.test.tsx`, msw standing in for auth) | SQLite has no advisory locks, so only the in-process half of the run slot is exercised here |
-| Functional (through the service API) | `services/auth/tests/test_auth.py`, `test_user_profile_routes.py`, `test_groups.py`, `test_internal.py`, `test_ldap_sync.py`, `test_effective_role_http.py`, `test_auth_ldap.py`, `test_oidc_routes.py` (the single sign-on routes against a fake identity provider), `test_login_options.py`, `test_oidc_break_glass.py`, `test_password_hashing.py` (logins against stored legacy hashes), `test_password_input_validation.py` (the password rule and the 422 body at the real routes); `services/acl/tests/test_grants.py`, `test_internal.py`; the live suites `services/auth/tests/test_ldap_service_live.py` (real directory) and the real-Postgres suites `services/auth/tests/test_ldap_sync_service_live_pg.py` and `services/auth/tests/test_oidc_flow_service_live_pg.py` (the OIDC flow store and provisioning races) | The live-LDAP suite runs in the gates' live-LDAP phase; the Postgres suites in `_gate-pg-live-tests`. The single sign-on routes have unit and functional (fake provider, in-memory SQLite) tests only; the flow store and provisioning beneath them have Postgres-live tests, but no route is driven against a real Postgres yet, a gap open until ADR 0016 phases 5a and 5b add the live-provider, integration (running stack), load, and browser levels |
+| Unit | `services/auth/tests/` (in-memory SQLite, `test_profile_schema.py`, `test_user_profile_migration.py`, `test_effective_role_unit.py`, `test_api_tokens.py`, `test_ldap_service.py`, `test_ldap_sync_service.py`, `test_ldap_sync_service_scaling.py`, `test_ldap_sync_stale_run_reaper.py`, `test_ldap_sync_loop.py`, `test_oidc_flow_service.py`, `test_oidc_provisioning.py`, `test_oidc_sso_migration.py`, `test_relink_candidates_migration.py`, `test_federated_identity_service.py`, `test_password_hashing.py` (the 802 recorded passlib decisions), `test_validation_errors.py`); `services/acl/tests/test_grant_service_unit.py`, `test_auth_client.py`, `test_schema_validators.py`; `services/common/tests/test_auth.py`, `test_auth_settings.py`, `test_internal_auth.py`, `test_acl.py`; `services/notifications/tests/test_router.py` (its token decode); `tests/unit/test_jwt_settings_wiring.py`; `frontend/src/test/` (`api/client.test.ts`, `stores/authStore.test.ts`, `lib/roles.test.ts`, `components/guards.test.tsx`, `components/AdminGuard.test.tsx`, `routes.test.tsx`, the admin page tests; single sign-on in the browser: `lib/sso.test.ts`, `api/sso.test.tsx`, `pages/LoginPageSso.test.tsx`, `pages/OidcCompletePage.test.tsx`, msw standing in for auth) | SQLite has no advisory locks, so only the in-process half of the run slot is exercised here |
+| Functional (through the service API) | `services/auth/tests/test_auth.py`, `test_user_profile_routes.py`, `test_groups.py`, `test_internal.py`, `test_ldap_sync.py`, `test_effective_role_http.py`, `test_auth_ldap.py`, `test_oidc_routes.py` (the single sign-on routes against a fake identity provider), `test_federated_identity_routes.py` (the recovery routes with real tokens, and the recovery stories through the single sign-on routes), `test_login_options.py`, `test_oidc_break_glass.py`, `test_password_hashing.py` (logins against stored legacy hashes), `test_password_input_validation.py` (the password rule and the 422 body at the real routes); `services/acl/tests/test_grants.py`, `test_internal.py`; the live suites `services/auth/tests/test_ldap_service_live.py` (real directory) and the real-Postgres suites `services/auth/tests/test_ldap_sync_service_live_pg.py` and `services/auth/tests/test_oidc_flow_service_live_pg.py` (the OIDC flow store and provisioning races) and `services/auth/tests/test_federated_identity_live_pg.py` (the recovery routes' races) | The live-LDAP suite runs in the gates' live-LDAP phase; the Postgres suites in `_gate-pg-live-tests`. The single sign-on routes have unit and functional (fake provider, in-memory SQLite) tests only; the flow store and provisioning beneath them have Postgres-live tests, but no route is driven against a real Postgres yet, a gap open until ADR 0016 phases 5a and 5b add the live-provider, integration (running stack), load, and browser levels |
 | Integration (running stack) | `tests/integration/test_auth_flow.py`, `test_user_profile_flow.py`, `test_acl_flow.py`, `test_ldap_auth.py`, `test_ldap_sync_admin.py` | The LDAP ones run only in the gates' LDAP-mode phase |
 | Stress and load | `tests/load/locustfile.py` (every user logs in; `ACLChecker` exercises the check route; `NotificationUser` edits its own profile name) | No load test covers refresh, the token exchange, or a sync run |
 | Browser end-to-end | `tests/e2e/test_login.py`, `test_register_and_roles.py`, `test_roles_playwright.py`, `test_user_profile_playwright.py`, `test_admin_guard_redirect_playwright.py`, `test_user_groups_playwright.py`, `test_acl_grants_playwright.py`, `test_ldap_sync_admin_playwright.py`, `test_ldap_login.py`, `test_login_pending_playwright.py`, `test_oidc_login_playwright.py` | Runs nightly and in the gates; the LDAP login tests are exempt skips on the local-mode gate stack, and `test_oidc_login_playwright.py` runs only in the gates' and nightly's OIDC stack phase (ADR 0016 phase 5b). `test_login.py` pins the local-mode page, which `GET /login-options` drives; `test_login_pending_playwright.py` holds that request in the browser to pin the pending state (IAM-OIDC-28) |
@@ -2213,13 +2400,11 @@ the integration suite, the frontend tests, and the browser suite were read, not 
 
 - Issue #1396: the identity provider's responses have no size bound, and its JWKS no
   key-count bound (hardening before OIDC mode is supported).
-- Issue #1399: a first OIDC login that collides with an existing account has no
-  recovery path, so an `OIDC_ISSUER` change locks out every single sign-on user.
 - Issue #1400: visible Unicode look-alikes of an existing email are provisioned as
   separate accounts.
 
-(#1420 is resolved by IAM-OIDC-28, #1403 by IAM-LDAP-12 and IAM-LDAP-13, and #1404 by
-IAM-LOGIN-6.)
+(#1420 is resolved by IAM-OIDC-28, #1399 by IAM-OIDC-29 to IAM-OIDC-39, #1403 by
+IAM-LDAP-12 and IAM-LDAP-13, and #1404 by IAM-LOGIN-6.)
 
 ### Limits by decision
 
@@ -2256,6 +2441,16 @@ IAM-LOGIN-6.)
 - The deactivation breaker's denominator is every LDAP account, inactive ones included
   (IAM-SWEEP-7). Recorded in ADR 0011 (as amended 2026-08-12: one pass over all LDAP
   users).
+- A single sign-on refusal whose email belongs to an ordinary `oidc` account takes
+  measurably longer than one whose email belongs to a local, LDAP, or superadmin account
+  (the relink candidate capture, IAM-OIDC-36), so the refused caller, who is already
+  authenticated at the provider with that email, can tell the two apart; before the
+  capture the paths were identical. Recorded in ADR 0016 D4 as built (document, do not
+  pad; second review of issue #1399).
+- Any one provider account carrying an `oidc` account's email can keep a second relink
+  candidate live by re-planting every 24 hours, which blocks the candidate path of
+  recovery; the typed-pair relink stays available (IAM-OIDC-31, IAM-OIDC-36). Recorded
+  in ADR 0016 D4 as built.
 - Issue #1010 corrected three documents that disagreed with the rules here: the
   handbook's superadmin promotion (IAM-USER-3), the FEATURES.md statement that superadmin
   accounts remain local (IAM-LDAP-1, IAM-USER-9), and the SECURITY.md statement that

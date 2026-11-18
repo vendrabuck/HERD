@@ -302,9 +302,11 @@ def _script_directory() -> ScriptDirectory:
     return ScriptDirectory.from_config(cfg)
 
 
-def test_auth_migration_chain_is_linear_with_0010_at_head():
+def test_auth_migration_chain_is_linear_through_0010():
+    """0010 sits on 0009 in one linear chain; the head is pinned by the newest
+    revision's own test (test_relink_candidates_migration.py)."""
     script = _script_directory()
-    assert script.get_heads() == ["0010"]
+    assert len(script.get_heads()) == 1
     revisions = list(script.walk_revisions())
     on_disk = {
         p.stem.split("_", 1)[0] for p in (_AUTH_DIR / "migrations" / "versions").glob("*.py")
