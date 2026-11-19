@@ -11,6 +11,7 @@ import { server } from "../mocks/server";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { useAuthStore } from "@/stores/authStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetOnSignOut } from "@/queryClient";
 import type { User } from "@/types/auth.types";
 import { APP_VERSION } from "@/lib/appVersion";
 
@@ -241,11 +242,27 @@ describe("AppLayout", () => {
   });
 
   it("logs out, clears preferences, and navigates to /login", async () => {
+    // resetOnSignOut owns the preferences clear on every sign-out edge, and the
+    // app wires it once at startup; without it here the clear is never observed.
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+    const stopReset = resetOnSignOut(client);
     server.use(
       http.get("/api/auth/me", () => HttpResponse.json(user())),
       http.post("/api/auth/logout", () => new HttpResponse(null, { status: 204 })),
     );
-    renderLayout("/inventory");
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/inventory"]}>
+          <Routes>
+            <Route element={<AppLayout />}>
+              <Route path="*" element={<div>page content</div>} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
 
     await screen.findByText("alice");
     fireEvent.click(screen.getByRole("button", { name: "Logout" }));
@@ -255,6 +272,7 @@ describe("AppLayout", () => {
     // isAuthenticated flipping so a re-render would blank currentUser).
     await waitFor(() => expect(useAuthStore.getState().isAuthenticated).toBe(false));
     expect(usePreferencesStore.getState().loaded).toBe(false);
+    stopReset();
   });
 
   it("disables the Logout button while the logout request is pending", async () => {
