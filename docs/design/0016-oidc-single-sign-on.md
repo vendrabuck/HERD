@@ -860,7 +860,7 @@ Not per PR: the live levels, exactly as LDAP's. Adding Dex to the advisory per-P
 | Host-header injection into redirects | no URL is derived from request headers (D11) |
 | Token leakage through URLs and logs | handoff by cookie and POST (D3); log rules (D9) |
 | Account takeover through email | email never links an existing account (D4) |
-| Unauthenticated row growth at `/oidc/login` | rows pruned at insert (D2); there is no rate limiting on any login route today (identity-and-access spec, section 8.2, Out of scope), recorded as a known limit |
+| Unauthenticated row growth at `/oidc/login` | rows pruned at insert (D2); the per-source attempt limit covers `POST /login` and `POST /register` only (identity-and-access spec, IAM-LOGIN-7), not `/oidc/login`, so the prune alone bounds the rows, recorded as a known limit |
 | Deactivated users | refused at the callback and at the exchange; refresh already refuses (D7) |
 
 ### Settings (all consulted only when `auth_method == "oidc"`)
@@ -1459,6 +1459,6 @@ a wrong `code_verifier` (`invalid_grant`), accepted the right one, and echoed th
 | D10 active-method source | auth's public `GET /login-options`; config's `GET /status` unchanged, departing from the issue's wording because of staleness | endpoint in phase 3; login page and the LDAP-mode Register link in phase 4 |
 | D12 test IdP | Dex, measured and proved first | phase 5a, then 5b |
 | D4 username, option C (added in phase 3) | the username claim when it fits `^[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}$`, else the email when it fits, else the first login is refused | phase 3 |
-| `auth_method` widened early (added in phase 5b, 2026-11-14) | auth admits `oidc` from phase 5b, since the stack tests cannot recreate auth in a mode it refuses; the config page and handbook stay phase 6; issues #1399 and #1420 block the 0.8.0 release | phase 5b |
+| `auth_method` widened early (added in phase 5b, 2026-11-14) | auth admits `oidc` from phase 5b, since the stack tests cannot recreate auth in a mode it refuses; the config page and handbook stay phase 6; issues #1399 and #1420 block the 0.8.0 release (both since settled) | phase 5b |
 | Lab redirect URIs (added in phase 5b, 2026-11-14) | templated from `HERD_GATEWAY_BIND`, no host address in a tracked file | phase 5b |
 | D4 recovery (added 2026-11-18, issue #1399) | option (a): superadmin-only routes, API only, a bulk issuer rewrite and a single-identity relink (the "unlink so the next login links afresh" done in one step that names the new subject, since a bare unlink plus the next login cannot link without matching by email); from the review the same day, (A) refused identities kept as relink candidates, confirmed out of band, (B) colliding account ids named by the rewrite, (C) keyed fingerprints in the audit lines | the recovery routes, between phases 5b and 6 |

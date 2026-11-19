@@ -33,7 +33,7 @@ One more container is not a service: the `restarter` (`infra/restarter/`), a sta
 
 - **Python 3.12** with async FastAPI + SQLAlchemy 2.x + asyncpg. Unit tests use SQLite in-memory via aiosqlite.
 - **TypeScript + React 19** for the frontend; React Flow for the topology canvas; Zustand + TanStack Query for state.
-- **uv workspace** manages Python deps; `herd-common` is the shared package with auth factory, logging, retry, and config-loader utilities, plus single copies of shared rules: `public_address` (the public-address predicate behind webhook destinations and the assistant's web documentation fetch), `config_redaction` (masking a driver call's stored keyword arguments), and `rehearsal` (the rolled-back session every bulk import dry run runs on).
+- **uv workspace** manages Python deps; `herd-common` is the shared package with auth factory, logging, retry, and config-loader utilities, plus single copies of shared rules: `public_address` (the public-address predicate behind webhook destinations and the assistant's web documentation fetch), `config_redaction` (masking a driver call's stored keyword arguments, and the stored configurations and run rows the assistant relays to the model provider), and `rehearsal` (the rolled-back session every bulk import dry run runs on).
 - **Alembic** for migrations. Unit tests use `Base.metadata.create_all` and don't run migrations; integration/prod do.
 - **Traefik v3** for TLS termination and path-prefix routing. File provider dynamic config.
 - **Docker Compose** is the target; each service has a Dockerfile.

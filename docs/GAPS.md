@@ -166,7 +166,7 @@ clients have a suite but stay below 85% lines on error and edge-case branches:
 
 ## E2E
 
-`tests/e2e/` has 72 test files and 224 tests across Selenium and Playwright (the
+`tests/e2e/` has 73 test files and 227 tests across Selenium and Playwright (the
 three in `test_oidc_login_playwright.py` run only in the OIDC-mode stack phase and
 skip as exempt elsewhere; the 2026-11-12 nightly collected 221 unseeded: 157 passed, 63 skipped, 1 failed; the v0.7.0 release gate ran 206: 148 passed and 58 skipped unseeded, 202 passed and 4 exempt skips seeded; see README.md's Testing section). Remaining UI gaps:
 
@@ -213,7 +213,7 @@ otherwise, and no GitHub workflow supplies it, so a green PR check and a green
 nightly say nothing about them.
 
 - **[MEDIUM] Live-LDAP auth suite.** `services/auth/tests/test_ldap_service_live.py`
-  (33 test functions, 41 collected items) skips through its module `pytestmark`
+  (51 test functions, 69 collected items) skips through its module `pytestmark`
   unless `HERD_TEST_LDAP_REQUIRED` is set or a directory answers at
   `HERD_TEST_LDAP_HOST`/`HERD_TEST_LDAP_PORT`. It runs only through `make
   test-auth-ldap`, which `make master` and `make everything` call through
@@ -222,7 +222,7 @@ nightly say nothing about them.
   a `make test-auth-ldap` step in `.github/workflows/nightly.yml` after the
   existing `make ldap-up` step.
 - **[MEDIUM] Live OIDC auth suite.** `services/auth/tests/test_oidc_service_live.py`
-  (8 tests, ADR 0016 phase 5a) skips through its module `pytestmark` unless
+  (11 tests, ADR 0016 phase 5a, extended by the recovery stories of #1399) skips through its module `pytestmark` unless
   `HERD_TEST_OIDC_REQUIRED` is set or a provider answers at
   `HERD_TEST_OIDC_HOST`/`HERD_TEST_OIDC_PORT`. It runs only through `make
   test-auth-oidc`, which `make master` and `make everything` call through
