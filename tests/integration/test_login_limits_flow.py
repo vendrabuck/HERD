@@ -35,6 +35,8 @@ LIMITED = {"detail": "Too many attempts; try again later"}
 # that answers this many attempts without a 429 has no working limit.
 MAX_ATTEMPTS_TO_EXHAUST = 400
 BATCH = 10
+# Tries for a probe that must be refused; see the refill note in the limit test.
+PROBE_TRIES = 5
 
 
 def _window_seconds() -> int:
@@ -61,6 +63,18 @@ async def _local_mode(client: httpx.AsyncClient) -> None:
 
 def _wrong_login() -> dict:
     return {"email": f"limit-{uuid.uuid4().hex[:12]}@herd.example", "password": "wrong-password"}
+
+
+async def _spend_until_limited(client: httpx.AsyncClient) -> None:
+    """Send lone wrong-password attempts until one is answered 429, so the caller's
+    next request arrives with the source's allowance just seen empty."""
+    for _ in range(MAX_ATTEMPTS_TO_EXHAUST):
+        answer = await client.post("/auth/login", json=_wrong_login())
+        if answer.status_code == 429:
+            assert answer.json() == LIMITED
+            return
+        assert answer.status_code == 401, answer.text
+    raise AssertionError("the source's allowance never ran out")
 
 
 async def test_other_auth_routes_answer_while_logins_are_hashing(base_url):
@@ -137,6 +151,15 @@ async def test_a_source_past_its_allowance_gets_the_fixed_429_for_every_account(
             # The answer is the same for the seeded admin with the right password,
             # for an unknown account, and for a client that names another source
             # in X-Forwarded-For: Traefik replaces it, so it never picks a bucket.
+            #
+            # The allowance refills one attempt per window/max seconds (one a
+            # second by default) while this test runs, so a probe can honestly be
+            # admitted with an attempt that refilled since the last 429. Each
+            # probe is therefore sent right after a lone attempt that was itself
+            # answered 429 (a few milliseconds apart, against a refill of about a
+            # second), and is retried when a refill still slipped between the
+            # two. A probe that is admitted on every try is not a refill: it is a
+            # request the limit does not cover.
             for body, headers in (
                 ({"email": SEED_EMAIL, "password": SEED_PASSWORD}, {}),
                 (_wrong_login(), {}),
@@ -145,8 +168,15 @@ async def test_a_source_past_its_allowance_gets_the_fixed_429_for_every_account(
                     {"X-Forwarded-For": "198.51.100.77"},
                 ),
             ):
-                resp = await client.post("/auth/login", json=body, headers=headers)
-                assert (resp.status_code, resp.json()) == (429, LIMITED)
+                seen = []
+                for _ in range(PROBE_TRIES):
+                    await _spend_until_limited(client)
+                    resp = await client.post("/auth/login", json=body, headers=headers)
+                    seen.append(resp.status_code)
+                    if resp.status_code == 429:
+                        break
+                assert resp.status_code == 429, (body["email"], headers, seen)
+                assert resp.json() == LIMITED
                 assert "access_token" not in resp.text
         finally:
             # Leave the source's allowance whole for every test that runs after
