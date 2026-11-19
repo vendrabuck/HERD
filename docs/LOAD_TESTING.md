@@ -4,7 +4,7 @@ HERD's load tests drive the HTTP API with [Locust](https://locust.io/), a Python
 
 ## What the tests do
 
-The locustfile lives at `tests/load/locustfile.py`. It defines one abstract base class and eight concrete user classes:
+The locustfile lives at `tests/load/locustfile.py`. It defines one abstract base class and nine concrete user classes in the default mix (plus the opt-in `OidcLoginUser`, which runs only in the OIDC-mode stack phase):
 
 ### `HerdUser` (base)
 
@@ -133,9 +133,18 @@ Exercises the device-configuration paths (issue #1100) on one device of its own.
   Seeded devices are never written to.
 - Think time: 1 to 3 seconds.
 
+### `LoginLimitProbe` (exactly one user)
+
+Shows auth's per-source password-attempt limit (IAM-LOGIN-7) under load.
+
+- Every user signs in from this host, which auth counts as one source address (60 attempts at once by default, refilling one a second), so `_login` treats a 429 as the limit working: it records it as `/api/auth/login [429 attempt limit]`, waits the `Retry-After`, and tries again.
+- `on_start`: waits 15 seconds so every other user has signed in.
+- Task: sends wrong-password logins for an unknown account until auth answers 429, then keeps going for 5 seconds. Every answer must be the 401 a judged attempt gets or a 429 with a whole-second `Retry-After`; any other answer, a 503 from the hashing pool included, is a recorded failure and the run exits 1.
+- It empties this host's allowance, so a suite started right after `make test-load` may meet a 429 until it refills (about a minute with the defaults). See `tests/load/README.md`.
+
 ### Class weighting
 
-Locust picks which class to spawn using the `weight` attribute. With the defaults (`ReservationUser` 3, `InventoryBrowser` 5, `BulkExporter` 1, `RoutedTopologyValidator` 1, `NotificationUser` 2, `ACLChecker` 2, `BulkConnectionAdmin` 1, `DeviceConfigUser` 1; total 16), out of every 16 virtual users you get roughly 3 reservation users, 5 inventory browsers, 1 bulk exporter, 1 routed-topology validator, 2 notification users, 2 ACL checkers, 1 bulk-connection admin, and 1 device-config user. Increase `-u` to scale all eight proportionally.
+Locust picks which class to spawn using the `weight` attribute. With the defaults (`ReservationUser` 3, `InventoryBrowser` 5, `BulkExporter` 1, `RoutedTopologyValidator` 1, `NotificationUser` 2, `ACLChecker` 2, `BulkConnectionAdmin` 1, `DeviceConfigUser` 1; total 16), out of every 16 virtual users you get roughly 3 reservation users, 5 inventory browsers, 1 bulk exporter, 1 routed-topology validator, 2 notification users, 2 ACL checkers, 1 bulk-connection admin, and 1 device-config user. `LoginLimitProbe` has no weight: it is always exactly one user. Increase `-u` to scale the eight weighted classes proportionally.
 
 ## Prerequisites
 
@@ -208,7 +217,7 @@ An "Error report" at the bottom lists exception messages for any failed requests
 
 ## What to watch for
 
-- **Auth endpoint throughput.** `/api/auth/login` runs bcrypt; it is CPU-bound and sets an upper bound on how fast you can ramp users.
+- **Auth endpoint throughput.** `/api/auth/login` runs bcrypt on auth's hashing threads (`AUTH_PASSWORD_HASH_THREADS`); it is CPU-bound and sets an upper bound on how fast you can ramp users. A 503 on login means every hashing thread was busy for 5 seconds.
 - **Reservation creation contention.** `POST /api/reservations/` takes an advisory lock per device; concurrent writes to the same device serialize.
 - **Calendar query latency.** `GET /api/reservations/calendar` scales with the number of reservations in the window; latency grows as the fixture ages.
 - **Pagination.** List endpoints (`/api/inventory/devices`, `/api/inventory/templates`, `/api/reservations/`) return `{"items": [...], "total": N, "skip": N, "limit": N}`. The locustfile unwraps `["items"]` in each `on_start`; keep that in mind if you add new tasks that parse list responses.
