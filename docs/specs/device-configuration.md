@@ -1576,7 +1576,9 @@ None at present. (#1279 is resolved by CFG-LOAD-3.)
   (`pw=`), joined (`apikey=`), or written with zero-width or fullwidth characters; encoded
   text (base64); a URL password over 1024 characters, or behind a user name over 256 or
   a scheme over 32; the part of a secret after a literal two-character `\n` inside it;
-  the text of an XML element after its first child element; and a secret written as a
+  the text of an XML element after its first child element, of an element with a
+  namespace prefix (`<ns:password>`), or inside CDATA; a tuple repr (`('password', 'x')`);
+  and a secret written as a
   key name itself. `ao` (a TCP-AO option, which names a key chain), `priv` (SNMPv3's
   privacy password, always after `auth`), and `pass` and `pw` (plain words in firewall
   and pseudowire configuration) are not keywords on purpose. No in-repo driver's configuration schema has a

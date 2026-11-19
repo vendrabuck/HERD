@@ -52,11 +52,15 @@ SHAPES = {
 
 
 def _seconds(text: str) -> float:
+    # CPU time, not wall-clock: under a shared core a short call fits one scheduler
+    # slice and runs at full speed while a long one is slowed k-fold, so a wall-clock
+    # ratio grows with the number of competing processes on every attempt (seen with
+    # two CPU hogs: ratios of 9.7 to 11.9). process_time counts only this process.
     best = float("inf")
     for _ in range(REPEATS):
-        started = time.perf_counter()
+        started = time.process_time()
         redact_config(text)
-        best = min(best, time.perf_counter() - started)
+        best = min(best, time.process_time() - started)
     return best
 
 

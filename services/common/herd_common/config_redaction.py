@@ -78,7 +78,10 @@ network CLIs produce, not a guarantee. Not masked:
 - the part of a secret after a literal two-character `\\n` inside it (the
   segment ends there);
 - an XML element whose text is further elements (`<community><name>x</name>`):
-  only the text before the first child is masked;
+  only the text before the first child is masked; an element with a namespace
+  prefix (`<ns:password>`) and text inside CDATA are not masked;
+- a tuple repr (`('password', 'S3cret')`: the closing quote is followed by a
+  comma, not `:` or `=`);
 - a secret written as a dict key itself (keys are kept as written).
 
 Words that are not keywords on purpose: `ao` (a TCP-AO option names a key
