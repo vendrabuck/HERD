@@ -97,7 +97,7 @@ CASES = [
         "published-pattern-no-keyword",
         PASSWORD_FIELD_SCHEMA,
         {"password": CANARY},
-        "at password: must match the schema's pattern",
+        "at ['password']: must match the schema's pattern",
     ),
     (
         "registry-maxLength-no-keyword",

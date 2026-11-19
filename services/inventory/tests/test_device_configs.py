@@ -939,7 +939,7 @@ def _log_text(records) -> str:
                 "properties": {"password": {"type": "string", "pattern": "^[a-z]+$"}},
             },
             {"password": _CANARY},
-            "at password: must match the schema's pattern",
+            "at ['password']: must match the schema's pattern",
         ),
         (None, {"hostname": _CANARY * 10}, "at hostname: must be at most 128 characters long"),
     ],
