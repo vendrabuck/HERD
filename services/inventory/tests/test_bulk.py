@@ -1193,3 +1193,67 @@ async def test_device_export_with_instance_device_imports_clean_on_a_fresh_stack
     assert resp.json()["rows"] == [
         {"row": 0, "action": "create", "identity": "FW-01", "reason": None}
     ]
+
+
+# A lone surrogate in an import file (issue #1456 class) ----------------------------
+#
+# The file is a multipart upload, which the shared body check passes through, and its
+# JSON is parsed here: `json.loads` turns an escape such as \ud800 into a lone
+# surrogate. A device name holding one made the report unencodable (a 500); one in
+# `field_data` was stored, and every later read of the device could not encode it.
+
+_SUR = chr(0xD800)  # built, so no source escape is decoded early
+_NOT_TEXT = "Import file holds a lone surrogate escape, which is not valid text; fix it and retry"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "items"),
+    [
+        ("/devices/import", [{"name": "d" + _SUR, "template_name": "Firewall"}]),
+        (
+            "/devices/import",
+            [
+                {
+                    "name": "d1",
+                    "template_name": "Firewall",
+                    "topology_type": "PHYSICAL",
+                    "field_data": {"model": "x" + _SUR},
+                }
+            ],
+        ),
+        ("/devices/import", {"items": [], "k" + _SUR: 1}),
+        ("/templates/import", [{"name": "t" + _SUR}]),
+    ],
+    ids=["device_name", "device_field_data", "key", "template_name"],
+)
+async def test_a_json_import_holding_a_lone_surrogate_is_a_fixed_422(client, path, items):
+    await _create_template(client, name="Firewall")
+    resp = await client.post(
+        path,
+        params={"format": "json"},
+        files={"file": ("d.json", io.BytesIO(json.dumps(items).encode()), "application/json")},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {"detail": _NOT_TEXT}
+    assert (await client.get("/devices")).json()["items"] == []
+    assert [t["name"] for t in (await client.get("/templates")).json()["items"]] == ["Firewall"]
+
+
+@pytest.mark.asyncio
+async def test_a_csv_json_cell_holding_a_lone_surrogate_rejects_that_row_only(client):
+    await _create_template(client, name="Firewall")
+    body = (
+        b"name,template_name,topology_type,field_data\n"
+        b'd1,Firewall,PHYSICAL,"{""model"": ""x\\ud800""}"\n'
+        b'd2,Firewall,PHYSICAL,"{""model"": ""ok \\ud83d\\udd11""}"\n'
+    )
+    report = await _import(client, body, "csv")
+    assert [(r["identity"], r["action"]) for r in report["rows"]] == [
+        ("d1", "reject"),
+        ("d2", "create"),
+    ]
+    assert report["rows"][0]["reason"] == (
+        "a JSON cell holds a lone surrogate escape, which is not valid text"
+    )
+    assert (await _device_by_name(client, "d2"))["field_data"] == {"model": "ok \U0001f511"}

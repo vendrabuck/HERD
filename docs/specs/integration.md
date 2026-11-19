@@ -200,9 +200,13 @@ the web interface's API does.
   also carried FastAPI's optional `input` and sometimes `ctx`; removing them within v1
   is by decision, a security fix recorded in [EXTERNAL_API.md](../EXTERNAL_API.md)
   (Versioning and deprecation policy): neither key was ever required, and `input`
-  echoed the submitted body. \
-  Enforced in: `services/integration/app/schemas/reservation.py` (`V1ReservationRequest`) \
-  Pinned by: `services/integration/tests/test_facade.py` (`test_validation_error_envelope_shape`)
+  echoed the submitted body. A body holding a lone surrogate anywhere (a field, an
+  unknown key) is the same envelope with exactly one `string_unicode` item at
+  `["body"]` (the shared body check, OPS-VALID-6), and nothing is forwarded: before issue #1459 the
+  facade passed it on, httpx could not encode the forwarded body, and the facade
+  answered 500. \
+  Enforced in: `services/integration/app/schemas/reservation.py` (`V1ReservationRequest`); `services/common/herd_common/validation_errors.py` (`RefuseLoneSurrogates`) \
+  Pinned by: `services/integration/tests/test_facade.py` (`test_validation_error_envelope_shape`, `test_a_lone_surrogate_in_a_facade_body_is_refused_before_the_upstream`); `tests/integration/test_purpose_category_flow.py` (`test_a_lone_surrogate_in_a_facade_create_is_a_422_not_a_500`)
 - **INTEG-FACADE-5.** Every reservation in a facade answer carries exactly `id`, `status`
   (a plain string, not an enumeration), `device_ids`, `topology_id`, `start_time`,
   `end_time`, `created_at`, and `purpose_category`; every other field reservations
@@ -240,9 +244,11 @@ the web interface's API does.
   Pinned by: `tests/contract/test_openapi_schema.py` (`test_openapi_signature_matches_snapshot`)
 - **INTEG-FACADE-12.** An upstream answer that is not 2xx is answered with the same
   status, and its `detail` is the upstream JSON `detail` when the body is an object that
-  has one. \
+  has one. An unknown `purpose_category` is relayed as reservations' string detail
+  `Unknown purpose_category; allowed: <list>`, which does not hold the submitted value
+  (RES-PURPOSE-1 in `reservations.md`). \
   Enforced in: `services/integration/app/routers/reservations.py` (`_propagate_if_error`) \
-  Pinned by: `services/integration/tests/test_facade.py` (`test_upstream_error_is_propagated`); `tests/integration/test_v1_facade.py` (`test_v1_propagates_not_found`)
+  Pinned by: `services/integration/tests/test_facade.py` (`test_upstream_error_is_propagated`, `test_an_unknown_purpose_category_relays_the_detail_without_the_value`); `tests/integration/test_v1_facade.py` (`test_v1_propagates_not_found`); `tests/integration/test_purpose_category_flow.py` (`test_purpose_category_unknown_value_rejected_through_facade`)
 - **INTEG-FACADE-13.** When the upstream error body is JSON without a `detail` key, the
   whole body becomes the `detail`; when it is not JSON, the raw text does, or `Upstream
   error` when the text is empty. \

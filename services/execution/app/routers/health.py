@@ -11,6 +11,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from herd_common.auth import make_auth_dependencies
+from herd_common.error_details import unknown_value_detail
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +22,9 @@ from app.schemas.health import DeviceHealthStatusResponse, PaginatedDeviceHealth
 from app.services import device_visibility
 
 logger = logging.getLogger(__name__)
+
+# The values a health snapshot's last_status takes (OPS-HEALTH-4).
+HEALTH_STATUSES = ("UNKNOWN", "HEALTHY", "DEGRADED", "UNREACHABLE")
 
 get_current_user_payload, require_admin = make_auth_dependencies(
     secret_key=settings.secret_key,
@@ -80,18 +84,13 @@ async def list_device_health(
         query = query.where(DeviceHealthStatus.last_status == last_status)
     count_q = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_q)).scalar() or 0
-    if total == 0 and last_status not in (
-        None,
-        "UNKNOWN",
-        "HEALTHY",
-        "DEGRADED",
-        "UNREACHABLE",
-    ):
+    if total == 0 and last_status is not None and last_status not in HEALTH_STATUSES:
         # Distinguishing an empty result from an invalid filter helps
-        # the frontend surface validation errors instead of "no devices".
+        # the frontend surface validation errors instead of "no devices". The
+        # detail names the allowed values, never the submitted one (OPS-HEALTH-4).
         raise HTTPException(
             status_code=422,
-            detail=f"Invalid last_status: {last_status}",
+            detail=unknown_value_detail("last_status", HEALTH_STATUSES),
         )
     result = await db.execute(
         query.order_by(DeviceHealthStatus.last_polled_at.desc().nulls_last())

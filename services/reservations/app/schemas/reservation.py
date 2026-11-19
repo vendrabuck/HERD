@@ -74,7 +74,7 @@ class ReservationCreate(BaseModel):
     # Lab purpose classification (issue #646 phase 1). Validated against the
     # configured taxonomy in the service layer (app.services.purpose_service),
     # not here: a schema-level field_validator raising ValueError would wrap
-    # the pinned "Unknown purpose_category '<value>'; allowed: ..." message in
+    # the pinned "Unknown purpose_category; allowed: ..." message in
     # pydantic's request-validation envelope instead of returning it verbatim.
     purpose_category: str | None = None
 

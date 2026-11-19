@@ -102,16 +102,23 @@ async def test_register_with_a_refused_password_is_422_through_the_gateway(base_
     """Issue #1426 through Traefik: a lone surrogate and a NUL in the password,
     sent as raw JSON escapes, reach auth unchanged and answer 422 (not 500), with
     no submitted value in the body. Validation runs before the route's mode check,
-    so the answer is the same on a local- or LDAP-mode stack, and nothing is created."""
+    so the answer is the same on a local- or LDAP-mode stack, and nothing is created.
+    The surrogate is refused by the shared body check before the schema runs, with one
+    item at `["body"]` that does not name the field (OPS-VALID-6); the NUL is auth's own
+    validator, which names the password field."""
     import httpx
 
     headers = {"content-type": "application/json"}
     cases = {
-        "\\ud800": ("string_unicode", None),
-        "\\u0000": ("value_error", "Value error, Password must not contain a NUL character"),
+        "\\ud800": ("string_unicode", ["body"], None),
+        "\\u0000": (
+            "value_error",
+            ["body", "password"],
+            "Value error, Password must not contain a NUL character",
+        ),
     }
     async with httpx.AsyncClient(base_url=base_url, verify=False, timeout=30.0) as client:
-        for escape, (error_type, msg) in cases.items():
+        for escape, (error_type, loc, msg) in cases.items():
             body = (
                 '{"email": "refused-pw@herd.example", "username": "refused-pw", '
                 '"password": "abcdefg' + escape + '"}'
@@ -119,7 +126,7 @@ async def test_register_with_a_refused_password_is_422_through_the_gateway(base_
             resp = await client.post("/auth/register", content=body, headers=headers)
             assert resp.status_code == 422, resp.text
             (error,) = resp.json()["detail"]
-            assert (error["type"], error["loc"]) == (error_type, ["body", "password"])
+            assert (error["type"], error["loc"]) == (error_type, loc)
             assert set(error) == {"type", "loc", "msg"}
             if msg is not None:
                 assert error["msg"] == msg

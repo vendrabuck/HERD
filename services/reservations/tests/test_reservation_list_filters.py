@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from app.config import settings
 from app.models.reservation import Reservation, ReservationStatus
 from app.services.reservation_service import _id_prefix_term
 from herd_common.enums import TopologyType
@@ -211,7 +212,9 @@ async def test_purpose_category_unknown_is_422_with_pinned_message(make_client, 
     async with make_client(A_USER) as c:
         resp = await c.get("/", params={"purpose_category": bad})
     assert resp.status_code == 422
-    assert resp.json()["detail"].startswith(f"Unknown purpose_category '{bad}'; allowed: ")
+    assert resp.json()["detail"] == (
+        "Unknown purpose_category; allowed: " + ", ".join(settings.purpose_categories)
+    )
 
 
 async def test_purpose_category_dropped_from_taxonomy_is_422(make_client, monkeypatch):

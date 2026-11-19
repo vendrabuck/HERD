@@ -388,6 +388,15 @@ def test_the_routes_accept_exactly_the_identity_keys_a_login_accepts(value):
         assert _schema_accepts(field, value) is _login_accepts(value, "x")
 
 
+@pytest.mark.parametrize("value", ["a\ud800b", "\udfff", "x\udbff", "\udc00\ud800"])
+def test_the_predicate_itself_still_refuses_a_lone_surrogate(value):
+    """Through the routes a lone surrogate never reaches the schema: the shared body
+    check refuses it first (OPS-VALID-6). The predicate still refuses one, for a login
+    and for any value that reaches the schema another way."""
+    assert identity_key_part_ok(value, 255) is False
+    assert identity_key_part_ok("a\U0001f511b", 255) is True
+
+
 def test_identity_key_bounds_are_the_column_widths():
     assert ISSUER_MAX_LENGTH == SUBJECT_MAX_LENGTH == 255
     assert identity_key_part_ok("y" * 255, 255) is True

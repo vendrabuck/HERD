@@ -183,7 +183,7 @@ async def test_register_with_a_lone_surrogate_is_422_string_unicode_and_creates_
     )
     assert response.status_code == 422, response.text
     (error,) = response.json()["detail"]
-    assert (error["type"], error["loc"]) == ("string_unicode", ["body", "password"])
+    assert (error["type"], error["loc"]) == ("string_unicode", ["body"])
     assert "abcdefg" not in response.text
     assert await _user_count() == 0
 
@@ -196,7 +196,7 @@ async def test_login_with_a_lone_surrogate_is_422_string_unicode(client):
     )
     assert response.status_code == 422, response.text
     (error,) = response.json()["detail"]
-    assert (error["type"], error["loc"]) == ("string_unicode", ["body", "password"])
+    assert (error["type"], error["loc"]) == ("string_unicode", ["body"])
     assert "abcdefg" not in response.text
 
 
@@ -217,7 +217,8 @@ async def test_a_surrogate_in_another_register_field_is_422_not_500(client):
         headers=JSON,
     )
     assert response.status_code == 422, response.text
-    assert [e["loc"] for e in response.json()["detail"]] == [["body", "username"]]
+    # the shared body check answers first, at the body (OPS-VALID-6)
+    assert [e["loc"] for e in response.json()["detail"]] == [["body"]]
     assert await _user_count() == 0
 
 

@@ -3,6 +3,7 @@ PATCH ownership matrix, and the null-clears-all-three semantics (issue #646
 phase 1).
 """
 
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
@@ -15,6 +16,7 @@ from app.main import app
 from app.models.reservation import Reservation, ReservationStatus, TopologyType
 from app.routers.reservations import bearer_scheme
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import func, select
 
 from tests._harness import TestSessionLocal, override_bearer, override_get_db
 
@@ -151,10 +153,11 @@ async def test_create_reservation_with_unknown_purpose_category_is_422():
                 },
             )
     assert resp.status_code == 422
+    # The field and the allowed values, never the submitted value (issue #1459).
     assert resp.json()["detail"] == (
-        "Unknown purpose_category 'not_a_real_category'; allowed: "
-        + ", ".join(settings.purpose_categories)
+        "Unknown purpose_category; allowed: " + ", ".join(settings.purpose_categories)
     )
+    assert "not_a_real_category" not in resp.text
 
 
 @pytest.mark.asyncio
@@ -243,7 +246,64 @@ async def test_patch_purpose_category_unknown_category_is_422():
             f"/{rid}/purpose-category", json={"purpose_category": "not_a_real_category"}
         )
     assert resp.status_code == 422
-    assert "Unknown purpose_category" in resp.json()["detail"]
+    assert resp.json()["detail"] == (
+        "Unknown purpose_category; allowed: " + ", ".join(settings.purpose_categories)
+    )
+    assert "not_a_real_category" not in resp.text
+
+
+# --- Issue #1459: no echo, and a lone surrogate is a 422 that writes nothing --------
+
+_SUR = chr(0xD800)  # built, so no source escape is decoded early
+
+
+def _escaped(value) -> bytes:
+    """A raw body with every non-ASCII code point escaped (`json=` cannot send a lone
+    surrogate)."""
+    return json.dumps(value, ensure_ascii=True).encode("ascii")
+
+
+_STRING_UNICODE = {
+    "type": "string_unicode",
+    "loc": ["body"],
+    "msg": "Input should be a valid string, unable to parse raw data as a unicode string",
+}
+
+
+@pytest.mark.asyncio
+async def test_create_with_a_lone_surrogate_category_is_422_not_500():
+    body = {
+        "device_ids": [DEVICE_A],
+        "purpose_category": "x" + _SUR,
+        "start_time": START,
+        "end_time": END,
+    }
+    async with _client_as(OWNER_ID) as ac:
+        resp = await ac.post(
+            "/", content=_escaped(body), headers={"content-type": "application/json"}
+        )
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {"detail": [_STRING_UNICODE]}
+    async with TestSessionLocal() as db:
+        assert (await db.execute(select(func.count()).select_from(Reservation))).scalar() == 0
+
+
+@pytest.mark.asyncio
+async def test_patch_with_a_lone_surrogate_category_is_422_and_changes_nothing():
+    rid = await _insert_reservation(purpose_category="training")
+    async with _client_as(OWNER_ID) as ac:
+        resp = await ac.patch(
+            f"/{rid}/purpose-category",
+            content=_escaped({"purpose_category": "x" + _SUR}),
+            headers={"content-type": "application/json"},
+        )
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {"detail": [_STRING_UNICODE]}
+    async with TestSessionLocal() as db:
+        res = await db.get(Reservation, rid)
+        assert res.purpose_category == "training"
+        assert res.purpose_category_set_by == uuid.UUID(OWNER_ID)
+        assert res.purpose_category_set_at.replace(tzinfo=timezone.utc) == NOW
 
 
 @pytest.mark.asyncio

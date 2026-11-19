@@ -155,6 +155,19 @@ async def test_create_hypervisor_missing_secret_422(client):
 
 
 @pytest.mark.asyncio
+async def test_create_hypervisor_with_an_unreadable_secret_is_422_not_503(client):
+    """OPS-SECRET-19: the secrets service answers 409 for a secret whose stored data
+    cannot be read until an admin replaces it. That is a fix the caller can make,
+    not an outage, so it is not the 503 every other non-200 answer gets."""
+    with patch(_SECRET_GET, new=AsyncMock(return_value=httpx.Response(409))):
+        resp = await client.post("/hypervisors", json=_hypervisor_payload())
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == (
+        "Secret data cannot be read; an admin must replace it in the secrets service"
+    )
+
+
+@pytest.mark.asyncio
 async def test_create_hypervisor_secrets_transport_error_503(client):
     with patch(_SECRET_GET, new=AsyncMock(side_effect=httpx.ConnectError("refused"))):
         resp = await client.post("/hypervisors", json=_hypervisor_payload())

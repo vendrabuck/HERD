@@ -125,10 +125,17 @@ async def test_a_refused_create_never_echoes_the_plaintext(admin_client):
     """Issue #1455, through the gateway: a create without `name` is refused before
     anything is stored, and the 422 names the missing field without sending the
     plaintext `data` back (FastAPI's default put the whole body in `input`). A lone
-    surrogate in the body is the same clean 422, never a 500."""
-    for raw in (
-        b'{"type": "password", "data": {"password": "' + CANARY.encode() + b'"}}',
-        b'{"data": {"password": "' + CANARY.encode() + b'\\ud800"}}',
+    surrogate in the body is a clean 422 too, never a 500: since issue #1456 the
+    shared body check refuses it first, with one item at the body (OPS-VALID-6)."""
+    for raw, loc in (
+        (
+            b'{"type": "password", "data": {"password": "' + CANARY.encode() + b'"}}',
+            ["body", "name"],
+        ),
+        (
+            b'{"data": {"password": "' + CANARY.encode() + b'\\ud800"}}',
+            ["body"],
+        ),
     ):
         resp = await admin_client.post(
             "/secrets/secrets", content=raw, headers={"content-type": "application/json"}
@@ -136,8 +143,33 @@ async def test_a_refused_create_never_echoes_the_plaintext(admin_client):
         assert resp.status_code == 422, resp.text
         detail = resp.json()["detail"]
         assert [set(error) for error in detail] == [{"type", "loc", "msg"}] * len(detail)
-        assert ["body", "name"] in [error["loc"] for error in detail]
+        assert loc in [error["loc"] for error in detail]
         assert CANARY.encode() not in resp.content
+
+
+async def test_a_lone_surrogate_in_data_is_refused_and_nothing_is_stored(admin_client, secret):
+    """Issue #1456, through the gateway: a lone surrogate in a `data` value or key was
+    stored with 201, and every reveal of it, the internal ones included, then answered
+    500. A create or an update holding one is the shared 422 `string_unicode`; nothing
+    is stored, and the existing secret still reveals its old data."""
+    name = _unique("int-surrogate")
+    headers = {"content-type": "application/json"}
+    for data in (b'{"password": "x\\ud800"}', b'{"pa\\udfffss": "v"}'):
+        created = await admin_client.post(
+            "/secrets/secrets",
+            content=b'{"name": "' + name.encode() + b'", "data": ' + data + b"}",
+            headers=headers,
+        )
+        assert created.status_code == 422, created.text
+        assert created.json()["detail"][0]["type"] == "string_unicode"
+        updated = await admin_client.put(
+            f"/secrets/secrets/{secret['id']}", content=b'{"data": ' + data + b"}", headers=headers
+        )
+        assert updated.status_code == 422, updated.text
+    listed = await admin_client.get("/secrets/secrets")
+    assert name not in [s["name"] for s in listed.json()]
+    resp = await admin_client.get(f"/secrets/secrets/{secret['id']}/value")
+    assert resp.json()["data"]["password"] == CANARY
 
 
 async def test_rotation_preserves_plaintext(admin_client, secret):

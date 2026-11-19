@@ -128,11 +128,23 @@ the character at fault. Until issue #1455 each item also carried FastAPI's optio
 `ctx`; both were optional in the published schema and are now gone (see Versioning
 and deprecation policy).
 
+A JSON request body that holds text which cannot be encoded as UTF-8, a lone surrogate
+(a JSON escape such as `\ud800` that is not half of a valid pair), anywhere, in any
+field or key, is answered `422` with a validation list of exactly one item,
+`{"type": "string_unicode", "loc": ["body"], "msg": "Input should be a valid string,
+unable to parse raw data as a unicode string"}`, which does not name the field, and
+nothing is forwarded. A body that is not valid JSON but holds such an escape gets the
+same answer rather than a JSON decoding error. A
+character outside the Basic Multilingual Plane written as an escaped surrogate pair
+(`\ud83d\udd11`) is one character and is accepted. Before issue #1459 such a body
+reached the facade's own call to reservations and was answered `500`.
+
 A `422` for a reason of the reservations service's own, on a request that has the
 documented shape, is not a validation list: it carries a string `detail`, relayed as
-reservations wrote it, and some such strings quote what you sent (an unknown
-`purpose_category` is answered `Unknown purpose_category '<value>'; allowed: <list>`,
-below).
+reservations wrote it. An unknown `purpose_category` is answered `Unknown
+purpose_category; allowed: <list>`, which names the configured categories and not
+the value you sent (it quoted the value before issue #1459). Other such strings can
+name a resource, such as a device that is not available.
 
 ### POST /api/v1/reservations
 
@@ -148,7 +160,7 @@ Request fields:
 - `purpose_category` (string, optional): a lab purpose classification (issue
   #646 phase 1). Must be one of the server's configured categories, a list not
   currently enumerated by any `/api/v1` endpoint; an unrecognized value is
-  rejected with `422` (`Unknown purpose_category '<value>'; allowed: <list>`).
+  rejected with `422` (`Unknown purpose_category; allowed: <list>`).
   Omit it, or pass `null`, to leave the reservation unclassified.
 
 Response (`V1ReservationResponse`): `id`, `status`, `device_ids`, `topology_id`,

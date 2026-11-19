@@ -437,9 +437,11 @@ account with an email, a username, and a password, then sign in with it.
   bytes (IAM-HASH-2). The password must also be one hashing accepts, and exactly that
   (IAM-HASH-3, issue #1426): one holding a NUL character is the 422 `value_error` at
   `["body", "password"]` with the message `Value error, Password must not contain a
-  NUL character`, and one holding a lone surrogate is the 422 `string_unicode` there.
-  No account is created. \
-  Enforced in: `services/auth/app/schemas/auth.py` (`RegisterRequest`); `services/auth/app/services/passwords.py` (`validate_password`, `PASSWORD_NUL_MESSAGE`) \
+  NUL character`. One holding a lone surrogate is the shared body check's 422, one
+  `string_unicode` item at `["body"]` (OPS-VALID-6 in `operations-and-observability.md`,
+  which answers before the schema runs, so the field is not named). No account is
+  created. \
+  Enforced in: `services/auth/app/schemas/auth.py` (`RegisterRequest`); `services/auth/app/services/passwords.py` (`validate_password`, `PASSWORD_NUL_MESSAGE`); `services/common/herd_common/validation_errors.py` (`RefuseLoneSurrogates`) \
   Pinned by: `services/auth/tests/test_auth.py` (`test_register_invalid_email`, `test_register_username_too_short`, `test_register_username_invalid_chars`, `test_register_username_max_length`, `test_register_password_too_short`, `test_register_password_too_long`); `services/auth/tests/test_password_input_validation.py` (`test_register_accepts_a_password_exactly_when_hashing_does`, `test_register_schema_names_the_password_and_the_pinned_message`, `test_register_with_a_nul_is_422_with_the_pinned_wording_and_creates_nothing`, `test_register_with_a_lone_surrogate_is_422_string_unicode_and_creates_nothing`, `test_a_register_with_an_honest_8_character_password_still_succeeds`); `tests/integration/test_auth_flow.py` (`test_register_with_a_refused_password_is_422_through_the_gateway`)
 - **IAM-REG-3.** An email or username that already exists, found by the pre-check or by
   a concurrent insert, answers one generic 409 `Email or username already exists`. \
@@ -493,12 +495,13 @@ short-lived access token and a refresh token.
   token_type: "bearer"}`. \
   Enforced in: `services/auth/app/routers/auth.py` (`login`); `services/auth/app/schemas/auth.py` (`TokenResponse`) \
   Pinned by: `services/auth/tests/test_auth.py` (`test_login`)
-- **IAM-LOGIN-5.** A login password holding a lone surrogate is the 422
-  `string_unicode` at `["body", "password"]`. The login body has no NUL check, by
+- **IAM-LOGIN-5.** A login body holding a lone surrogate, in the password or anywhere
+  else, is the shared body check's 422, one `string_unicode` item at `["body"]`
+  (OPS-VALID-6), before the schema's own refusal. The login body has no NUL check, by
   decision (issue #1426): in local mode and the break-glass login a NUL reaches
   `verify_password` and is the 401 of IAM-HASH-3; in LDAP mode it is the 401 of
   IAM-LDAP-13, before any directory call. \
-  Enforced in: `services/auth/app/schemas/auth.py` (`LoginRequest`); `services/common/herd_common/validation_errors.py` (`validation_error_handler`) \
+  Enforced in: `services/auth/app/schemas/auth.py` (`LoginRequest`); `services/common/herd_common/validation_errors.py` (`validation_error_handler`, `RefuseLoneSurrogates`) \
   Pinned by: `services/auth/tests/test_password_input_validation.py` (`test_login_with_a_lone_surrogate_is_422_string_unicode`, `test_login_with_a_nul_stays_401`, `test_login_schema_still_takes_a_nul_so_login_answers_401`); `services/auth/tests/test_login_password_bound.py` (`test_a_long_lone_surrogate_is_string_unicode_in_every_mode`, `test_ldap_mode_refuses_a_nul_before_the_directory`)
 - **IAM-LOGIN-6.** The login password bound is the bound of the mode that judges the
   password (issue #1404), read from the live `AUTH_METHOD` when the request arrives: at
@@ -2165,14 +2168,17 @@ skip list). Recovery: `POST /admin/federated-identities/rewrite-issuer` and
   role (IAM-ROLE-5): 401 with no token, a bad token, or an inactive account; 403 for a
   user, an admin, and an admin claim on a superadmin account; decided before any account
   is read and before the body is validated, so a lower role gets the 403 whatever JSON
-  it sends. One exception, by FastAPI's order: a body that is not JSON is decoded before
-  the dependencies run, so it answers 422 `json_invalid` to any caller, the same body
-  for any id, which says nothing about an account. All three answer in every
+  it sends. Two exceptions, both by the order in which a route reads its body before its
+  dependencies run (OPS-VALID-6 in `operations-and-observability.md`): a body that is
+  not JSON answers 422 `json_invalid`, and a body holding a lone surrogate anywhere
+  answers the shared 422, one `string_unicode` item at `["body"]`, each to any
+  caller, with or without a token and whatever its role, the same body for any id,
+  which says nothing about an account. All three answer in every
   `AUTH_METHOD`, so in OIDC mode the seeded local superadmin reaches them through the
   break-glass login (IAM-OIDC-21) or a superadmin API token exchanged at
   `POST /tokens/exchange`. \
   Enforced in: `services/auth/app/routers/federated_identities.py` (`_superadmin_only`, `rewrite_federated_issuer`, `relink_federated_identity`, `list_federated_relink_candidates`); `services/auth/app/dependencies/auth.py` (`require_role`) \
-  Pinned by: `services/auth/tests/test_federated_identity_routes.py` (`test_only_a_superadmin_effective_role_may_call_either_route`, `test_the_role_gate_runs_before_the_body_is_validated_and_before_any_lookup`, `test_only_a_superadmin_may_read_candidates_and_the_gate_runs_before_the_lookup`, `test_a_body_that_is_not_json_is_a_422_before_the_role_gate`, `test_both_routes_answer_in_every_auth_mode`, `test_a_break_glass_local_superadmin_can_sign_in_and_recover_in_oidc_mode`, `test_a_superadmin_api_token_minted_before_the_switch_can_recover_in_oidc_mode`)
+  Pinned by: `services/auth/tests/test_federated_identity_routes.py` (`test_only_a_superadmin_effective_role_may_call_either_route`, `test_the_role_gate_runs_before_the_body_is_validated_and_before_any_lookup`, `test_only_a_superadmin_may_read_candidates_and_the_gate_runs_before_the_lookup`, `test_a_body_that_is_not_json_is_a_422_before_the_role_gate`, `test_a_lone_surrogate_in_a_subject_is_the_shared_422_before_the_role_gate`, `test_both_routes_answer_in_every_auth_mode`, `test_a_break_glass_local_superadmin_can_sign_in_and_recover_in_oidc_mode`, `test_a_superadmin_api_token_minted_before_the_switch_can_recover_in_oidc_mode`)
 - **IAM-OIDC-30.** The issuer rewrite takes exactly `old_issuer`, `new_issuer`, and
   `dry_run` (a JSON boolean, required). It answers 400 `The new issuer equals the old
   issuer` when the two strings are equal. Otherwise it counts the identities whose issuer
@@ -2214,15 +2220,17 @@ skip list). Recovery: `POST /admin/federated-identities/rewrite-issuer` and
 - **IAM-OIDC-32.** Every issuer and subject either route takes passes exactly the
   predicate a login's identity key passes (IAM-OIDC-13): a string that is not blank, at
   most 255 characters, with no Cc or Cs character; nothing is trimmed or normalized, so
-  a value with edge spaces is stored as sent. Any other value (a lone surrogate sent as
-  a JSON escape included, which is a Cs character), an unknown key, and a `dry_run` that
-  is not a JSON boolean are a 422 in the auth shape (`{type, loc, msg}`), the
-  predicate's refusal with the fixed message `must be a non-blank string of at most 255
-  characters with no control character`. A relink body with both forms, neither, or half
+  a value with edge spaces is stored as sent. Any other value, an unknown key, and a
+  `dry_run` that is not a JSON boolean are a 422 in the auth shape (`{type, loc, msg}`),
+  the predicate's refusal with the fixed message `must be a non-blank string of at most
+  255 characters with no control character`. A lone surrogate (a Cs character) sent as
+  a JSON escape never reaches the predicate: the shared body check refuses the body
+  first, with one `string_unicode` item at `["body"]` (OPS-VALID-6); the predicate still refuses
+  one that reaches the schema another way. A relink body with both forms, neither, or half
   a pair is a 422 `relink_target` at `["body"]` with the message `send either issuer and
   subject, or candidate_id, and not both`; a null counts as absent. \
   Enforced in: `services/auth/app/services/auth_service.py` (`identity_key_part_ok`, `_identity_key_refusal`, `ISSUER_MAX_LENGTH`); `services/auth/app/schemas/federated_identity.py` (`IDENTITY_KEY_MESSAGE`, `RELINK_TARGET_MESSAGE`, `Issuer`, `Subject`, `FederatedIdentityLinkRequest`) \
-  Pinned by: `services/auth/tests/test_federated_identity_service.py` (`test_the_routes_accept_exactly_the_identity_keys_a_login_accepts`, `test_identity_key_bounds_are_the_column_widths`); `services/auth/tests/test_federated_identity_routes.py` (`test_rewrite_body_refusals_are_422_with_the_auth_shape`, `test_relink_body_refusals_are_422`, `test_relink_accepts_a_subject_at_the_column_width_with_inner_spaces`, `test_the_relink_takes_exactly_one_of_the_pair_and_a_candidate_id`, `test_a_lone_surrogate_in_a_subject_is_refused_as_identity_key_invalid`)
+  Pinned by: `services/auth/tests/test_federated_identity_service.py` (`test_the_routes_accept_exactly_the_identity_keys_a_login_accepts`, `test_identity_key_bounds_are_the_column_widths`, `test_the_predicate_itself_still_refuses_a_lone_surrogate`); `services/auth/tests/test_federated_identity_routes.py` (`test_rewrite_body_refusals_are_422_with_the_auth_shape`, `test_relink_body_refusals_are_422`, `test_relink_accepts_a_subject_at_the_column_width_with_inner_spaces`, `test_the_relink_takes_exactly_one_of_the_pair_and_a_candidate_id`, `test_a_lone_surrogate_in_a_subject_is_the_shared_422_before_the_role_gate`)
 - **IAM-OIDC-33.** Every call to a recovery route that passes the role check writes one
   log line from `app.routers.federated_identities` with `action` (`oidc_issuer_rewrite`,
   `oidc_identity_relink`, or `oidc_relink_candidates_read`), `outcome`, and `caller_id`,
@@ -2477,7 +2485,7 @@ name (IAM-HASH-9). Every other error carries
 | 409 | `Rewrite refused: N federated identities would collide with an identity already under the new issuer; nothing was changed` (`identity` when N is 1), beside `conflicts`, `collisions`, and `collisions_truncated` | issuer rewrite whose subjects already have identities under the new issuer | IAM-OIDC-30, IAM-OIDC-34 |
 | 409 | `Only a single sign-on account can be linked to an identity` | identity relink or candidate read on a local or LDAP account | IAM-OIDC-31, IAM-OIDC-37 |
 | 409 | `This identity is already linked to another account` | identity relink to a pair another account holds | IAM-OIDC-31, IAM-OIDC-34 |
-| 422 | validation list | registration, login, profile, group, bulk, mapping, token, grant, check, issuer rewrite, or identity relink body out of bounds; a registration password holding a NUL or a lone surrogate, or a login password holding a lone surrogate; a profile body with a key other than the three profile fields, or a null or empty `full_name`; unknown resource type or permission; missing internal-token header | IAM-REG-2, IAM-PROFILE-3, IAM-PROFILE-4, IAM-PROFILE-5, IAM-LOGIN-3, IAM-LOGIN-5, IAM-LOGIN-6, IAM-HASH-9, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2, IAM-OIDC-32 |
+| 422 | validation list | registration, login, profile, group, bulk, mapping, token, grant, check, issuer rewrite, or identity relink body out of bounds; a registration password holding a NUL or a lone surrogate, or a login password holding a lone surrogate; a profile body with a key other than the three profile fields, or a null or empty `full_name`; unknown resource type or permission; missing internal-token header; any body holding a lone surrogate (`string_unicode`, before the route's own checks: the shared body check in `operations-and-observability.md`) | IAM-REG-2, IAM-PROFILE-3, IAM-PROFILE-4, IAM-PROFILE-5, IAM-LOGIN-3, IAM-LOGIN-5, IAM-LOGIN-6, IAM-HASH-9, IAM-GROUP-3, IAM-GROUP-8, IAM-GROUP-9, IAM-APITOK-5, IAM-ACL-1, IAM-ACL-10, IAM-INTERNAL-2, IAM-OIDC-32 |
 | 422 | `group_dn does not resolve in the directory` | mapping DN proven absent | IAM-MAP-3 |
 | 500 | `Federated identity change failed` | a database error in an issuer rewrite, identity relink, or candidate read | IAM-OIDC-33 |
 | 503 | `Directory unavailable, credentials not checked` | LDAP-mode login while the directory cannot be asked, an unusable `LDAP_USER_FILTER` included | IAM-LDAP-12, IAM-LDAP-14 |
