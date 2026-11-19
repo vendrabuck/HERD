@@ -447,22 +447,24 @@ async def test_run_driver_action_returned_failure_keeps_driver_message(db, monke
 
 # --- run_driver_action configure validation: published schema vs registry ---
 
-# A driver-published schema shaped like the FRR Management driver's: it accepts
-# raw vtysh lines under `commands`, which the neutral registry Management schema
-# (additionalProperties:False over {vlan,ip,hostname,description}) would reject.
-_FRR_PUBLISHED_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "commands": {
-            "type": "array",
-            "items": {"type": "string", "minLength": 1},
-            "minItems": 1,
-        },
-        "command": {"type": "string", "minLength": 1},
-    },
-    "additionalProperties": False,
-    "minProperties": 1,
-}
+
+# The FRR Management driver's published schema, read from the driver as shipped
+# (issue #1457: a hand copy here had lost its length and count bounds). It
+# accepts raw vtysh lines under `commands`, which the neutral registry Management
+# schema (additionalProperties:False over {vlan,ip,hostname,description}) would
+# reject.
+def _frr_published_schema() -> dict:
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[3] / "drivers" / "frr_mgmt" / "driver.py"
+    spec = importlib.util.spec_from_file_location("frr_mgmt_schema_for_edges", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Driver.config_schema()
+
+
+_FRR_PUBLISHED_SCHEMA = _frr_published_schema()
 
 
 def _ok_method(**kwargs):

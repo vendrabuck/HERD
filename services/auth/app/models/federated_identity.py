@@ -1,10 +1,14 @@
 """A federated identity: one IdP account linked to one HERD account (ADR 0016, D4).
 
 The key is the pair (`issuer`, `subject`) from a verified ID token, never the
-email. A row is created only together with its `auth_source="oidc"` user, in one
-transaction (`auth_service.create_oidc_user`), and each user has at most one
-row. A separate table rather than columns on `users`, so a later SAML identity
-can be keyed the same way without another `users` migration.
+email. Each user has at most one row. Its writers: a first login creates it
+together with its `auth_source="oidc"` user, in one transaction
+(`auth_service.create_oidc_user`); a returning login writes `last_login_at`
+(`auth_service._returning_federated_login`); and the superadmin recovery routes
+of issue #1399 rewrite its issuer in place or replace it for an `oidc` account
+(`federated_identity_service.rewrite_issuer`, `relink_identity`). A separate
+table rather than columns on `users`, so a later SAML identity can be keyed the
+same way without another `users` migration.
 """
 
 import uuid

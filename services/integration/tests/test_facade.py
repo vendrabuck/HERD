@@ -8,6 +8,7 @@ imports AsyncClient by name, so patching it does not clobber the real httpx.Asyn
 the test itself uses to drive the ASGI app.
 """
 
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -16,6 +17,7 @@ import jwt
 import pytest
 from app.main import app
 from app.routers import reservations as facade
+from herd_common.validation_errors import STRING_UNICODE_MSG
 from httpx import ASGITransport, AsyncClient
 
 SECRET = "3fcbb4bf16b0e162be24d2eb59065316c1e84194669ebf9270203280b18e18f7"
@@ -176,6 +178,73 @@ async def test_create_purpose_category_defaults_to_none(monkeypatch):
     assert resp.status_code == 201
     assert CAPTURED["json"]["purpose_category"] is None
     assert resp.json()["purpose_category"] is None
+
+
+def _create_body(**extra) -> dict:
+    now = datetime.now(timezone.utc)
+    return {
+        "device_ids": [str(uuid.uuid4())],
+        "start_time": now.isoformat(),
+        "end_time": (now + timedelta(hours=2)).isoformat(),
+        **extra,
+    }
+
+
+async def test_an_unknown_purpose_category_relays_the_detail_without_the_value(monkeypatch):
+    """Issue #1459: reservations names the field and the allowed values, never the
+    submitted value, and the facade relays that string detail unchanged."""
+    upstream = "Unknown purpose_category; allowed: qa_regression, other"
+
+    def handler(method, url, headers, json, params):
+        return httpx.Response(422, json={"detail": upstream})
+
+    _install_handler(monkeypatch, handler)
+    async with _client() as c:
+        resp = await c.post(
+            "/reservations",
+            json=_create_body(purpose_category="not-a-category"),
+            headers=_auth(_token()),
+        )
+    assert (resp.status_code, resp.json()) == (422, {"detail": upstream})
+    assert CAPTURED["json"]["purpose_category"] == "not-a-category"
+
+
+_SUR = chr(0xD800)  # built, so no source escape is decoded early
+
+
+@pytest.mark.parametrize(
+    ("extra", "loc"),
+    [
+        ({"purpose_category": "x" + _SUR}, ["body"]),
+        ({"purpose": chr(0xDFFF) + "y"}, ["body"]),
+        ({"unknown" + _SUR: 1}, ["body"]),
+    ],
+    ids=["purpose_category", "purpose", "unknown_key"],
+)
+async def test_a_lone_surrogate_in_a_facade_body_is_refused_before_the_upstream(
+    monkeypatch, extra, loc
+):
+    """Issue #1459: httpx cannot encode a lone surrogate, so a forwarded create that
+    held one failed in the facade itself (a 500). The shared body check refuses it
+    first and nothing is forwarded."""
+
+    def handler(method, url, headers, json, params):
+        raise AssertionError("nothing may be forwarded")
+
+    _install_handler(monkeypatch, handler)
+    CAPTURED.clear()
+    raw = json.dumps(_create_body(**extra), ensure_ascii=True).encode("ascii")
+    async with _client() as c:
+        resp = await c.post(
+            "/reservations",
+            content=raw,
+            headers={**_auth(_token()), "content-type": "application/json"},
+        )
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {
+        "detail": [{"type": "string_unicode", "loc": loc, "msg": STRING_UNICODE_MSG}]
+    }
+    assert CAPTURED == {}
 
 
 async def test_list_maps_to_v1_paginated(monkeypatch):
@@ -381,8 +450,10 @@ async def test_missing_jwt_is_rejected(monkeypatch):
 
 async def test_validation_error_envelope_shape(monkeypatch):
     """A 422 from the facade's own request validation (never reaching the upstream)
-    matches FastAPI's default envelope: this is an external contract per
-    docs/EXTERNAL_API.md, so pin its shape structurally rather than by example."""
+    is the `{"detail": [...]}` envelope with each item exactly `{type, loc, msg}`:
+    this is an external contract per docs/EXTERNAL_API.md, so pin its shape
+    structurally rather than by example. Until issue #1455 each item also carried
+    pydantic's `input` (FastAPI's default), which echoed the submitted body."""
     async with _client() as c:
         resp = await c.post("/reservations", json={}, headers=_auth(_token()))
 
@@ -392,7 +463,7 @@ async def test_validation_error_envelope_shape(monkeypatch):
     assert isinstance(body["detail"], list)
     assert len(body["detail"]) > 0
     for item in body["detail"]:
-        assert set(item.keys()) == {"type", "loc", "msg", "input"}
+        assert set(item.keys()) == {"type", "loc", "msg"}
 
 
 async def test_invalid_jwt_is_401(monkeypatch):

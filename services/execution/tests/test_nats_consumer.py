@@ -1086,6 +1086,15 @@ async def test_fetch_secret_value_returns_none_on_404():
 
 
 @pytest.mark.asyncio
+async def test_fetch_secret_value_returns_none_on_an_unreadable_secret_409():
+    """OPS-SECRET-19: a secret whose stored data cannot be read answers 409 until an
+    admin replaces it. That is permanent, like a 404: the message is not NAKed and
+    retried until it reaches the DLQ, as the 500 it replaced was."""
+    with _patch_httpx_get(status_code=409):
+        assert await _fetch_secret_value("sec-1") is None
+
+
+@pytest.mark.asyncio
 async def test_fetch_secret_value_extracts_data_field_on_200():
     with _patch_httpx_get(status_code=200, json_body={"data": {"username": "admin"}}):
         assert await _fetch_secret_value("sec-1") == {"username": "admin"}

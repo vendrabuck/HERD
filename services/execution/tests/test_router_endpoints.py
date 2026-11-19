@@ -828,7 +828,9 @@ async def test_internal_execute_uses_internal_token(admin_client, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("forbidden_action", ["status", "delete", "reboot", "drain", ""])
+@pytest.mark.parametrize(
+    "forbidden_action", ["status", "delete", "reboot", "drain", "", "CANARY-action-text"]
+)
 async def test_internal_execute_rejects_non_configure_action(
     admin_client, monkeypatch, forbidden_action
 ):
@@ -857,7 +859,31 @@ async def test_internal_execute_rejects_non_configure_action(
         },
     )
     assert resp.status_code == 422
-    assert "configure" in resp.json()["detail"]
+    # Fixed text, never the submitted action (issue #1458).
+    assert resp.json()["detail"] == "internal execute is restricted to action='configure'"
+    assert "CANARY" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_internal_execute_with_a_lone_surrogate_action_is_422_and_runs_nothing(
+    admin_client, monkeypatch
+):
+    """Issue #1458: the action's echo made this a 500. The shared body check refuses
+    the body first, so nothing is fetched, run, or recorded."""
+    fetch = AsyncMock(return_value=_fake_device_data())
+    monkeypatch.setattr(ex_router, "fetch_device", fetch)
+    resp = await admin_client.post(
+        "/execute/internal",
+        content=(
+            '{"device_id": "' + DEVICE_ID + '", "action": "x\\ud800", "user_id": "' + USER_ID + '"}'
+        ).encode(),
+        headers={"content-type": "application/json"},
+    )
+    assert resp.status_code == 422, resp.text
+    (error,) = resp.json()["detail"]
+    assert (error["type"], error["loc"]) == ("string_unicode", ["body"])
+    fetch.assert_not_awaited()
+    assert (await admin_client.get("/runs")).json()["items"] == []
 
 
 # --- GET /runs owner-scoped access (iter 2 of AI assistant prereq) ---

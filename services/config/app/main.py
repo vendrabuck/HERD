@@ -27,7 +27,7 @@ from app.config_store import (
     verify_password,
 )
 from app.docker_ctl import restart_services
-from app.validation_errors import install_validation_errors
+from app.validation_errors import holds_lone_surrogate, install_validation_errors
 from app.version import add_version_route, service_version
 
 logger = logging.getLogger(__name__)
@@ -53,7 +53,9 @@ app = FastAPI(
 
 # Every 422 is rendered as {type, loc, msg}: never pydantic's input or ctx, so never
 # a submitted password, and never a 500 on a lone surrogate (app/validation_errors.py).
-install_validation_errors(app)
+# Without the shared body check for a lone surrogate: config answers one in a
+# password itself (OPS-CONFIG-8), and the check would replace those answers.
+install_validation_errors(app, refuse_lone_surrogates=False)
 
 # The wildcard origin is deliberate (this is the one service that does not use
 # herd_common's CORS helper). Credentials are never allowed: the config session
@@ -221,6 +223,10 @@ async def get_settings(_session: dict = Depends(require_config_session)):
     return {"values": redacted}
 
 
+# The answer to a save whose values hold a lone surrogate (OPS-CONFIG-31).
+SETTINGS_NOT_UTF8_DETAIL = {"errors": ["Settings must be valid UTF-8 text"]}
+
+
 @app.put("/settings")
 async def update_settings(
     req: SaveSettingsRequest,
@@ -232,6 +238,11 @@ async def update_settings(
     # environment at runtime (herd_common.config_loader.herd_settings_sources),
     # so a literal "********" would become the live credential.
     #
+    # A lone surrogate in a key or value is refused first, with fixed text: the
+    # unknown-key detail below quotes keys, and a value would be written to the file
+    # that every service reads its settings from, where it cannot be encoded.
+    if holds_lone_surrogate(req.values):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, SETTINGS_NOT_UTF8_DETAIL)
     # Only CONFIG_SCHEMA keys may be written (issue #1109): a body naming any
     # other key is refused whole, before anything is resolved or written.
     unknown = sorted(set(req.values) - SCHEMA_KEYS)

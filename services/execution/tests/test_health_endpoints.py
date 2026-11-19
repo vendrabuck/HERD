@@ -265,3 +265,8 @@ async def test_list_health_invalid_status_filter_returns_422(admin_client):
     await _seed_row(uuid.uuid4())
     resp = await admin_client.get("/device-health?last_status=NOPE")
     assert resp.status_code == 422
+    # The allowed values, never the submitted one (issue #1458 class).
+    assert resp.json() == {
+        "detail": "Unknown last_status; allowed: UNKNOWN, HEALTHY, DEGRADED, UNREACHABLE"
+    }
+    assert "NOPE" not in resp.text

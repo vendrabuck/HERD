@@ -76,6 +76,18 @@ Second most common: config service started but `config.json` was never written. 
 
 Check with `make logs` or `docker compose logs <service>`; the startup error message names the missing setting.
 
+### A service exits at startup naming config.json
+
+The log of every service but config ends with `herd_common.config_loader.ConfigFileUnusable: HERD config file /etc/herd/config.json is unusable (<reason>). It is not the first-boot copy of the environment (no config.bootstrapped beside it), so it holds the operator's own settings, and this service will not start on environment values in their place.` followed by the remedy. `<reason>` is an exception class (`JSONDecodeError`, `UnicodeDecodeError`, `RecursionError`, `ValueError`, `PermissionError`, `FileNotFoundError` for a dangling link, `OSError` for a looping one), `not a JSON object: <type>`, or `not a regular file: <kind>`. The file was saved through the config page (or predates the bootstrap marker, or was edited by hand) and has since become unreadable or stopped being a JSON object; the services refuse to fall back to `.env` because its values may differ from the saved ones, an `AUTH_METHOD` of `ldap` or `oidc` included, whose fallback `local` opens registration (issue #1451, OPS-SET-4).
+
+Under `make prod` each service crash-loops (`docker compose ps` shows `Restarting`); under `make up` the dev reloader keeps the container up with the error in its log and the healthcheck failing. Either way `docker compose logs <svc>` shows the line above on every attempt. The config service is not affected and still serves its page. Fix it one of three ways:
+
+- Save the settings again on the config page (it shows the environment's values for any key the unusable file held, so re-enter the ones you had saved), then Save and Restart. A save cannot replace a directory or a FIFO at that path: remove it first.
+- Repair the file on the `herd-config` volume (it must be one JSON object), then `docker compose restart` the services.
+- Remove it to run on `.env` alone: `docker compose exec config rm /data/herd-config/config.json`, then restart the config service (it writes a fresh bootstrap copy with the marker when `.env` holds every required key) and the others.
+
+A file with `config.bootstrapped` beside it never stops a service this way: it is a copy of the environment, so it is ignored with one WARNING and the environment applies.
+
 ### A service exits at startup with `column <table>.<name> does not exist`
 
 The stack was upgraded in place and the new release added a column that a startup read names, before `make migrate` ran (the schema is stamped at the previous release, so startup never runs `create_all`; see [OPERATIONS.md](OPERATIONS.md#upgrade-path)). The log ends with `Application startup failed. Exiting.`, the service's healthcheck never passes, and `make up` reports `dependency failed to start: container <project>-<svc>-1 is unhealthy`. Run the service's migration, then restart it:
@@ -156,15 +168,38 @@ A 503 `Directory unavailable, credentials not checked` on every login means HERD
 - The server cannot be reached, or answers too slowly (connect timeout 10 s, receive timeout 30 s): check `LDAP_SERVER_URL`, the port, and the network path from the auth container.
 - TLS handshake fails. Start with `LDAP_USE_TLS=false` and a plain `ldap://` URL against a lab server to confirm the rest of the config, then re-enable TLS once the DN / filter are known good.
 - `LDAP_USER_BASE_DN` does not exist in the directory (the search answers `noSuchObject`), or the search is refused (access rights, a referral to another server).
+- The login search stopped at a directory time or administrative limit (`timeLimitExceeded`, `adminLimitExceeded` in the message), with or without an entry: an entry from a search that did not finish does not prove it is the only match (issue #1447), so nothing is signed in. Raise the directory's limit for the service account, or narrow `LDAP_USER_BASE_DN`.
 - `LDAP_SERVER_URL` or `LDAP_USER_BASE_DN` is empty: auth logs the ERROR `LDAP not fully configured; login cannot be checked`.
+- `LDAP_USER_FILTER` is not a usable template: auth logs the ERROR `ldap_user_filter_invalid` once at startup and at every login, with the defect in `reason` (`unknown_field` for a placeholder other than `{username}`, such as `{user}` or `{0}`; `unbalanced_brace` for a single `{` or `}`, write a literal brace as `{{` or `}}`; `no_username_field` when `{username}` is missing; `too_long` over 4096 characters; `invalid_filter` when the result is not an LDAP filter, such as an unbalanced parenthesis or `({username})`, with the class in `exception_class`; `username_outside_value` when `{username}` is an attribute or matching rule, as in `({username}=x)`; `username_negated` for `{username}` inside `(!...)`; `or_branch_without_username` for an `(|...)` with a branch that does not hold `{username}`). No directory call is made. Fix the value and restart auth.
 
 A 401 `Invalid credentials` means the directory answered and refused this login, so it is the user's to fix:
 
 - User not found under `LDAP_USER_BASE_DN`, or the `LDAP_USER_FILTER` does not match (e.g. the directory uses `uid=` not `sAMAccountName=`). The log line is `ldap_user_not_found`. When EVERY user gets this, the filter is the likely cause.
+- More than one directory entry matches the login name (two people with the same `uid`, two accounts of one person, or a prefix under a substring filter such as `(uid={username}*)`). Every password is refused, nothing is bound as either entry, and auth logs the ERROR `ldap_user_ambiguous` with `setting` `LDAP_USER_FILTER`, the count, and the login name, never the entries (issue #1447). Find the entries with a search of your own for that name, then make the filter, or the directory, give one entry per name.
 - The password is wrong, or the directory refuses the account (disabled, locked, expired). The log line is `ldap_bind_failure` with the user's DN.
 - The password holds a character the LDAP client refuses before sending it (a tab, another control character, a private-use character, or mixed right-to-left and left-to-right text; RFC 4013 SASLprep). Nothing is sent to the directory; the log line is `ldap_password_refused` with the username.
-- The directory entry has no `mail` attribute (or whatever `LDAP_EMAIL_ATTRIBUTE` is set to). HERD refuses to provision a user it cannot address by email; the log line is `ldap_missing_email`.
+- The directory entry has no `mail` attribute (or whatever `LDAP_EMAIL_ATTRIBUTE` is set to). HERD refuses to provision a user it cannot address by email; the log line is `ldap_missing_email`. When it follows `ldap_attribute_not_text` for the same DN, the attribute is there but holds no text (a value that is not UTF-8, often because the setting names a binary attribute such as `jpegPhoto` or `objectGUID`, an empty value, or a control character); point the setting at the attribute that holds the address.
 - The email returned by the directory collides with an existing local account. Either delete the local row or set `AUTH_METHOD=local` temporarily.
+- The account was provisioned before issue #1448 from a binary attribute value, so its email or username is the text of a bytes repr, such as `b'\xffcarol@example.com'` (see "LDAP accounts with a bytes-repr email or username" below).
+
+### LDAP accounts with a bytes-repr email or username
+
+Before issue #1448 a directory value that was not UTF-8 was stored as the text of its Python bytes repr. HERD no longer does that, but rows created earlier stay. Find them on PostgreSQL (checked against the `auth.users` table; on SQLite `LIKE` ignores case and also matches `B'...`):
+
+```sql
+SELECT id, username, email, is_active
+FROM auth.users
+WHERE auth_source = 'ldap'
+  AND (email LIKE 'b''%' OR email LIKE 'b"%'
+       OR username LIKE 'b''%' OR username LIKE 'b"%');
+```
+
+The pattern also matches a real address or name that happens to begin with `b'` or `b"`: inspect each row (a repr shows escapes such as `\xff`) before changing it.
+
+- A repr email: the account can no longer sign in, because login finds the account by the directory's email, which is now either the real address (no account has it, so login provisions a new one, which is refused as a username collision while the old row holds the same username) or no text at all (the 401 above). If the person's directory entry now holds a text address, set it on the old row (`UPDATE auth.users SET email = '<address>' WHERE id = '<id>';`) so they keep their groups and role, or deactivate the old row. With the deactivation sweep on, such a row counts as absent unless a directory entry still holds an email value that is not text: then the sweep holds back the account whose username matches that entry's username (or, when the entry has no readable username either, every deactivation the disabled filter did not prove), records `email_unreadable` in the run's `sweep` detail with `held` and `held_passes`, and logs the ERROR `ldap_sync_deactivation_held`. A hold that lasts is a directory value to fix, not a state to leave: a user who can edit their own email attribute can cause one.
+- No usable username: when the entry's `LDAP_USERNAME_ATTRIBUTE` holds no text and the typed login name is not usable either (longer than 100 characters, or holding a refused character), a returning user still signs in, but a first login is refused (`login_failure` with reason `missing_username`), since a new account needs a username.
+- A repr username: login never updates a username, and group sync skips the member as `missing_username` while the username attribute holds no text. Once `LDAP_USERNAME_ATTRIBUTE` names a text attribute, the next sync renames the account of every mapped-group member (`ldap_sync_username_repaired`); rename any other by SQL (`UPDATE auth.users SET username = '<name>' WHERE id = '<id>';`). `full_name` started as the username and the user may change it.
+- Active Directory with `LDAP_USERNAME_ATTRIBUTE` set to `objectGUID` or `objectSid` (binary): every account provisioned before the fix has a repr username, new logins now take the typed login name as the username, and group sync skips every member as `missing_username`, which also holds back every removal, so mapped groups stop changing and every run is `partial`. Set `LDAP_USERNAME_ATTRIBUTE=sAMAccountName` (the default) or `userPrincipalName`, restart auth, and run a sync to repair the usernames of mapped-group members.
 
 ### `/register` returns 409 "Local registration is disabled"
 

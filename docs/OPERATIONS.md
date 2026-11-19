@@ -85,6 +85,34 @@ Check `AUTH_SECRET_KEY` and `AUTH_ALGORITHM` when upgrading past the access-toke
 
 Check outbound webhook subscriptions when upgrading past the webhook destination rule: a subscription whose `target_url` host resolves to a loopback, private, or other non-public address now records `failed` deliveries with `destination not allowed` and is not sent to. Under `make prod`, `WEBHOOK_ALLOWED_HOSTS` is empty; name each internal receiver there (a hostname or a CIDR) before upgrading, or re-register it at a public address. See [EXTERNAL_API.md](EXTERNAL_API.md#destination-rule).
 
+Decide what to do with older refused configure runs when upgrading past issue #1457. A `configure` run whose configuration failed schema validation stored a refusal that could quote the refused configuration, credentials included (a vtysh line with `neighbor ... password ...`), and that text is still in the run's `error`. The upgrade rewrites no row; instead execution withholds the old text whenever it answers a run (CFG-RUN-8): the run list, the run detail, and so the assistant's `list_executions_for_reservation` tool get `device '<name>': config failed schema validation (details withheld; recorded before values were removed from these messages)`. That covers the API and the assistant only, not a direct database read, a backup, or the log lines below. The old text reads `config failed schema validation:` followed by the library's message, the new text `config failed schema validation at <path>:` followed by the rule, so this finds the old rows (run it in `docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"`; under `make prod` add `-f docker-compose.yml` after `docker compose`):
+
+```sql
+SELECT id, created_at, reservation_id
+FROM execution.execution_runs
+WHERE action = 'configure'
+  AND status = 'FAILED'
+  AND error LIKE '%: config failed schema validation: %';
+```
+
+To remove the quoted text and keep the rest of each row, run the same predicate as an update. It cannot be undone, so take a backup first if the text matters to an investigation:
+
+```sql
+UPDATE execution.execution_runs
+SET error = regexp_replace(
+  error,
+  ': config failed schema validation: .*$',
+  ': config failed schema validation (text removed after issue #1457)'
+)
+WHERE action = 'configure'
+  AND status = 'FAILED'
+  AND error LIKE '%: config failed schema validation: %';
+```
+
+Two copies outside the run rows can also hold it. Inventory's apply-job rows never stored this text (issue #1093), but inventory's warning log line `config apply: execution answered HTTP 422: <body>` from before the upgrade can, until Docker's log rotation drops it. And an assistant tool result is stored with its conversation in `ai_orchestrator.assistant_messages.content_blocks`: a run list the assistant read before the upgrade stays there until the conversation has been idle for `ASSISTANT_CONVERSATION_TTL_HOURS` (24 by default, longer while the purpose-classification exemption in [ENV_VARS.md](ENV_VARS.md) keeps it), when the hourly sweeper deletes it.
+
+Since issue #1464 the assistant masks the stored configurations and run rows its tools relay to the model provider (AI-TOOL-12 in `docs/specs/ai-features.md`), and the credential mask for stored run arguments is wider: keys with a keyword part (`pre_shared_key`, `tacacsKey`), keywords with `:` or `=` attached, JSON held in a string, JSON-escaped text, XML elements, Python reprs, URL passwords, and the keywords `authentication`, `auth`, `phash`, `psk`, `token`, and `bearer`. The upgrade rewrites no row. A conversation the assistant had before the upgrade keeps its unmasked tool results in `ai_orchestrator.assistant_messages.content_blocks` until it is swept as above, but every later turn masks them again before resending them (AI-TOOL-13). Its earlier assistant replies are resent as written: one that quoted a credential goes to the provider again on each later turn of that conversation, and through purpose classification's transcripts when that is on, until the conversation is swept (24 hours idle by default, longer while the purpose-classification exemption keeps it). To end that sooner, delete the affected conversations; what the provider already received cannot be recalled. A run stored before the upgrade whose arguments hold something only the wider mask catches keeps it in clear in its row: execution's run reads answer it as stored, and only the assistant's tools mask it on read. If such a run was masked for another line, its retry may now be refused with 409 because its config version no longer masks to the stored copy; a run whose configuration holds nothing the wider mask newly matches retries as before. Start a new run instead.
+
 After the recreate, the admin-only About page (Administration, then About) is the fastest way to confirm every service actually landed on the new build: a row marked "differs" or "unreachable" names the service that still needs a rebuild. See `docs/ADMIN_HANDBOOK.md`.
 
 Since issue #593, `make build` installs every service's third-party dependencies from the workspace `uv.lock` (each Dockerfile runs `uv export --frozen --package <svc>` and installs that requirements file verbatim), not by resolving fresh from PyPI at build time. A checkout with a stale `uv.lock` (a `pyproject.toml` dependency bump with no matching `uv lock` run) fails the build outright, the same failure `uv lock --check` reports for a host install; run `uv lock` and rebuild.
@@ -256,6 +284,246 @@ secrets unrecoverable; there is no backdoor. Keep the KEK in whatever secret
 management wraps your `.env`, and note that database backups (above) are
 useless for secret recovery without the KEK from the same era, which is a
 feature.
+
+## Single sign-on recovery
+
+Applies when `AUTH_METHOD=oidc` (ADR 0016; not yet supported for operators until its
+phase 6). Every single sign-on account is linked to exactly one identity, the pair of
+the ID token's `iss` (the issuer) and `sub` (the provider's id for the person), compared
+as exact strings. HERD never links a sign-in to an account by email: a sign-in whose
+pair is unknown is a first sign-in, and it is refused when its email or username
+belongs to any account. Three superadmin routes repair the link, API only (issue
+#1399): `POST /api/auth/admin/federated-identities/rewrite-issuer`,
+`PUT /api/auth/users/{user_id}/federated-identity`, and
+`GET /api/auth/users/{user_id}/federated-identity/candidates`. None changes an account
+id, so groups, grants, reservations, and tokens are kept. The rules are IAM-OIDC-29 to
+IAM-OIDC-39 in [identity-and-access.md](specs/identity-and-access.md).
+
+The commands below run from any machine that reaches the gateway. Set `GW` to the
+address users browse to (for example `GW=https://herd.example.com`); add curl's
+`--cacert <file>` when the client does not trust the gateway's certificate. They
+use `jq`. The config page does not offer the `OIDC_*` settings until ADR 0016 phase 6,
+so change them in `.env` and recreate auth with `docker compose up -d auth` (a restart
+does not re-read `.env`).
+
+### Getting a superadmin session in OIDC mode
+
+The routes answer only a superadmin, in any `AUTH_METHOD`. In OIDC mode the superadmin
+is the local account seeded from `SUPERADMIN_EMAIL`, and password sign-in is refused
+unless `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN=true`. Use whichever of these you have:
+
+- Break-glass on: `TOKEN=$(curl -sS -X POST "$GW/api/auth/login" -H 'Content-Type: application/json' -d '{"email": "<superadmin email>", "password": "<superadmin password>"}' | jq -r .access_token)`
+- A superadmin API token minted earlier (`POST /api/auth/tokens` with `"role": "superadmin"`): `TOKEN=$(curl -sS -X POST "$GW/api/auth/tokens/exchange" -H 'Content-Type: application/json' -d '{"token": "<api token>"}' | jq -r .access_token)`
+- A superadmin session that is still signed in (its refresh token works in every mode).
+
+With none of them, set `OIDC_BREAK_GLASS_LOCAL_SUPERADMIN=true` in `.env`, recreate
+auth, and use the first line. Set it back to `false` and recreate auth again when you
+are done; auth logs a WARNING at startup and at every such sign-in while it is on. An
+access token lasts `AUTH_ACCESS_TOKEN_EXPIRE_MINUTES` (default 30); fetch a new one the
+same way when it expires.
+
+### Changing the OIDC issuer
+
+Use this when `OIDC_ISSUER` must change while the provider keeps every person's `sub`:
+a renamed provider URL, a tenant URL change, a trailing slash added or dropped to match
+a new discovery document, or a provider migration that preserves user ids. If the new
+provider issues different `sub` values, do NOT use the rewrite: it would give each
+account to whoever holds the same `sub` string at the new provider; relink people one
+at a time instead (next section).
+
+1. Get a superadmin session (above) and keep it for the whole change.
+2. Dry run, from the issuer accounts were linked under (the current `OIDC_ISSUER`,
+   exactly, trailing slash included) to the new one:
+
+   ```bash
+   curl -sS -X POST "$GW/api/auth/admin/federated-identities/rewrite-issuer" \
+     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"old_issuer": "https://idp.example.com/realms/herd", "new_issuer": "https://idp.example.com/realms/herd/", "dry_run": true}'
+   ```
+
+   The answer is `{"dry_run": true, "matched": N, "conflicts": C, "rewritten": 0,
+   "collisions": [...], "collisions_truncated": false}`. `matched` should be the number
+   of single sign-on accounts; 0 means `old_issuer` is not the stored string.
+   `conflicts` must be 0 (see "If the rewrite refuses" below when it is not).
+3. Run it: the same command with `"dry_run": false`. It answers `"rewritten": N`, or
+   409 with `detail` `Rewrite refused: ...; nothing was changed` and the same
+   `conflicts` and `collisions` fields.
+4. Change `OIDC_ISSUER` in `.env` to the new value and recreate auth:
+   `docker compose up -d auth`.
+5. Run the dry run of step 2 again, old issuer to new. If `matched` is above 0, run
+   step 3 again: those are people who signed in for the first time between steps 3 and
+   4 (below).
+6. Verify: one person signs in with single sign-on and lands in their own account.
+
+Between steps 3 and 4, while the provider still issues the old issuer, a returning
+person finds no identity and is refused as a collision, but a person signing in for the
+FIRST time is given a new account under the old issuer, which would lock them out after
+the change; step 5 moves those. While `OIDC_ISSUER` names an issuer the provider's
+discovery document does not, every sign-in answers "Single sign-on is unavailable" and
+nothing is created at all. Keep the window short and tell users. Do not swap steps 3
+and 4: with the new issuer configured and the rewrite not yet run, a returning person
+whose provider email changed since their account was created is given a second account
+under the new issuer, whose identity then makes the rewrite refuse.
+
+If the rewrite refuses (or a dry run shows `conflicts`): each entry of `collisions`
+names the two accounts of one person, `old_issuer_account_id` (the account linked under
+the old issuer, which holds the person's groups, grants, and reservations) and
+`new_issuer_account_id` (a second account created under the new issuer). Keep the first.
+For each pair, retire the second account's identity, deactivate it, then run step 3
+again:
+
+```bash
+curl -sS -X PUT "$GW/api/auth/users/<new_issuer_account_id>/federated-identity" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"issuer": "urn:herd:retired", "subject": "<new_issuer_account_id>"}'
+curl -sS -X POST "$GW/api/auth/users/<new_issuer_account_id>/deactivate" -H "Authorization: Bearer $TOKEN"
+```
+
+The relink replaces the second account's identity with (`urn:herd:retired`, its own
+account id). `urn:herd:retired` is a reserved issuer no accepted ID token ever carries
+(a token's `iss` must equal `OIDC_ISSUER`, and auth accepts only an http or https URL
+there), so nobody can sign in to that account any more, and
+the person's `sub` under the new issuer is freed; the rewrite then gives that pair to the
+first account. Never reactivate a retired account without relinking it first. Anything the person created in the second account stays there (nothing
+moves ownership between accounts, and nothing deletes an account). When
+`collisions_truncated` is true, clear the listed pairs and dry-run again for the rest.
+
+### A user's first single sign-on login is refused as a collision
+
+The person sees "Single sign-on failed. If this continues, contact an administrator."
+Auth's log says why, without any claim value:
+
+```bash
+docker compose logs --no-log-prefix auth | jq -R 'fromjson? | select(.action == "login_failure" and .source == "oidc") | {timestamp, reason, user_id}'
+```
+
+`email_taken` for a person who has signed in with single sign-on before means their
+provider now names them differently. If `OIDC_ISSUER` changed, follow the previous
+section. Otherwise the provider reissued their `sub` (their account there was deleted
+and recreated, or the provider was replaced), and their refused sign-in was normally
+kept as a relink candidate against their HERD account.
+
+A candidate proves only that SOMEONE signed in at the provider with an account carrying
+that email; anyone who can do that can plant one. A token with no `email_verified`
+claim is accepted and captured (only an explicit `false` is refused, before the
+collision check), and Microsoft Entra ID normally omits the claim, so any provider
+account carrying the email can plant a candidate. The person's own attempt may also
+leave NO candidate: their provider email may no longer equal the account's, the attempt
+may be refused as `username_invalid` or `email_unverified` before the collision check,
+or the capture may fail (logged as `oidc_relink_candidate_capture_failed`); then the
+only candidate in the minute could be someone else's. The checks below bind a candidate
+to the person by time alone, which is why every precondition in step 4 is required. The
+relink is the security step:
+
+1. Find the account id: `curl -sS "$GW/api/auth/users?limit=500" -H "Authorization: Bearer $TOKEN" | jq '.items[] | select(.email == "<their email>") | .id'` (page with `skip` past 500 accounts).
+2. Read its candidates and note `captured_total`:
+
+   ```bash
+   curl -sS "$GW/api/auth/users/<account id>/federated-identity/candidates" -H "Authorization: Bearer $TOKEN"
+   ```
+
+   The answer is `{"user_id", "captured_total", "candidates": [{"id", "issuer",
+   "fingerprint", "created_at", "last_seen_at", "expires_at", "attempts"}]}`, newest
+   first. A candidate lives 24 hours; the subject is never shown, only a fingerprint.
+3. Agree a minute with the person over a channel that AUTHENTICATES them, chosen by
+   you, not by them: in person with identification, or a call YOU place to a number
+   already on file. A call the person places to a number of their choosing is not
+   enough. Have them try to sign in once at that minute.
+4. Read the candidates again. Relink only when ALL of these hold:
+   - `captured_total` went up by exactly one, exactly one live candidate exists, and
+     its `created_at` falls in the agreed minute;
+   - at the provider you confirmed that exactly one provider account carries the email,
+     and that it is the person's;
+   - the person confirms, over the same authenticated channel, that they saw the
+     sign-in failure page at that time;
+   - auth's log has no `oidc_relink_candidate_capture_failed` line in the window
+     (`docker compose logs --no-log-prefix auth | jq -R 'fromjson? | select(.action == "oidc_relink_candidate_capture_failed")'`).
+
+   ```bash
+   curl -sS -X PUT "$GW/api/auth/users/<account id>/federated-identity" \
+     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"candidate_id": "<candidate id>"}'
+   ```
+
+   The answer is the identity, `{user_id, issuer, subject, created_at, last_login_at}`;
+   the relink discards the account's other candidates.
+5. The person signs in again and lands in their account. Their old `sub` no longer
+   signs in.
+
+When more than one candidate is live, or `captured_total` grew by more than one, or the
+only candidate's time does not match, or any other precondition fails, do NOT relink:
+someone else may be signing in with an account carrying this email. Investigate at the
+provider (which accounts hold the email, who created them). A candidate that is not the
+person's is harmless as long as nobody relinks to it.
+
+Any one provider account carrying the email can block this path indefinitely: it can
+re-plant every 24 hours so that a second candidate is always live. A route to clear
+candidates would not help, since re-planting is immediate. The way out is the typed-pair
+relink below, with a subject read at the provider, or removing the rogue provider
+account and repeating the agreed-minute check after its candidates expire.
+
+Alternative, when the provider shows the person's `sub` (Keycloak: the user's ID;
+Okta: the user's id; Dex: the unpadded base64url encoding of a protobuf message whose
+field 1 is the user id and field 2 the connector id, as `dex_subject` in
+`tests/integration/test_oidc_auth.py` computes it): relink by the typed pair, with the
+issuer exactly as `OIDC_ISSUER` holds it:
+
+```bash
+curl -sS -X PUT "$GW/api/auth/users/<account id>/federated-identity" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"issuer": "<OIDC_ISSUER value>", "subject": "<new sub>"}'
+```
+
+To check that a typed `sub` is the same as a candidate, compare the candidate's
+`fingerprint` with the pair's (next section). Microsoft Entra ID issues a different
+`sub` per application and its portal does not show it; use the candidate path there.
+
+The relink answers 404 `Relink candidate not found for this account` for a candidate
+that expired or belongs to another account, 409 `Only a single sign-on account can be
+linked to an identity` for a local or LDAP account, and 409 `This identity is already
+linked to another account` when another account holds that pair (a second account: see
+"If the rewrite refuses" above). Check the pair before every relink: whoever signs in
+with it gets the account.
+
+`email_taken` or `username_taken` for a person who never signed in with single sign-on
+means a local or LDAP account created before the switch holds that email or username.
+HERD does not link or convert such an account (ADR 0016, Out of scope), no candidate is
+kept for it, and no route changes that. The person can be given a different email or
+username at the provider, so the first sign-in provisions a new account; carrying the
+old account's groups and ownership over is a manual step.
+
+### Sessions after a relink or rewrite
+
+Neither route revokes a session. A sign-in already in flight when a relink or rewrite
+commits is refused (IAM-OIDC-39), but tokens issued before it keep working for their
+lifetimes: an access token for `AUTH_ACCESS_TOKEN_EXPIRE_MINUTES` (default 30) plus 10
+seconds, and a refresh token for up to `AUTH_REFRESH_TOKEN_EXPIRE_DAYS` (default 7)
+through rotation. If a relink may have let the wrong person in, deactivate the account
+(`POST /api/auth/users/<id>/deactivate`): while it is inactive, auth refuses its
+refresh tokens and every auth route. Deactivation revokes nothing, though: reactivating
+the account lets every unexpired refresh token work again. Keep it deactivated until
+`AUTH_REFRESH_TOKEN_EXPIRE_DAYS` have passed since the doubtful relink, then reactivate
+it and relink it correctly. Other services trust an access token until it expires
+whatever auth decides.
+
+### Comparing fingerprints
+
+Audit lines never hold an issuer or a subject. A relink line (`action`
+`oidc_identity_relink`) carries `old_fingerprint` and `new_fingerprint`, the
+fingerprints of the pairs before and after; a rewrite line (`oidc_issuer_rewrite`)
+carries `old_issuer_fingerprint` and `new_issuer_fingerprint`; a candidate's
+`fingerprint` is its pair's. To learn whether a suspect pair or issuer is the one in a
+line, compute its fingerprint inside the auth container, which holds the key:
+
+```bash
+docker compose exec auth python -c "import sys; from app.services.federated_identity_service import identity_fingerprint; print(identity_fingerprint(*sys.argv[1:]))" '<issuer>' '<subject>'
+```
+
+Pass one argument for an issuer and two for a pair. A fingerprint is HMAC-SHA256,
+truncated to 16 hex characters, under a key derived from `AUTH_SECRET_KEY`, so only a
+holder of that secret can compute or test one; rotating `AUTH_SECRET_KEY` changes every
+fingerprint, and lines from before a rotation cannot be compared with values computed
+after it.
 
 ## Backup and restore
 

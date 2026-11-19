@@ -7,12 +7,17 @@ from fastapi import FastAPI
 from herd_common.cors import add_cors_middleware
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
 from herd_common.schema_init import create_all_and_stamp
+from herd_common.validation_errors import install_validation_errors
 from herd_common.version import add_version_route, service_version
 
 from app.config import log_oidc_startup_warnings, settings
 from app.database import AsyncSessionLocal, Base, engine
 from app.models.api_token import ApiToken  # noqa: F401
 from app.models.federated_identity import FederatedIdentity  # noqa: F401
+from app.models.federated_relink_candidate import (  # noqa: F401
+    FederatedRelinkCandidate,
+    FederatedRelinkCaptureTotal,
+)
 from app.models.group import GroupMember, UserGroup  # noqa: F401
 from app.models.ldap_group_mapping import LdapGroupMapping  # noqa: F401
 from app.models.ldap_sync_run import LdapSyncRun  # noqa: F401
@@ -20,17 +25,18 @@ from app.models.oidc_login_flow import OidcLoginFlow  # noqa: F401
 from app.models.user import Role
 from app.routers.admin import router as admin_router
 from app.routers.auth import router as auth_router
+from app.routers.federated_identities import router as federated_identities_router
 from app.routers.groups import router as groups_router
 from app.routers.internal import router as internal_router
 from app.routers.ldap_sync import router as ldap_sync_router
 from app.routers.oidc import router as oidc_router
 from app.routers.tokens import router as tokens_router
+from app.services.ldap_service import log_ldap_startup_problems
 from app.tasks.ldap_sync_loop import (
     effective_interval_seconds,
     ldap_group_sync_loop_enabled,
     ldap_sync_loop,
 )
-from app.validation_errors import install_validation_errors
 
 setup_logging("auth", level=settings.log_level)
 logger = logging.getLogger(__name__)
@@ -115,6 +121,8 @@ async def lifespan(app: FastAPI):
     # ADR 0016: one WARNING each for incomplete OIDC settings, a plain-HTTP
     # lab provider, and the break-glass switch; silent outside OIDC mode.
     log_oidc_startup_warnings(settings)
+    # Issue #1446: one ERROR for an unusable LDAP_USER_FILTER; LDAP mode only.
+    log_ldap_startup_problems(settings)
 
     # ADR 0011 phase 5: the LDAP group sync interval loop, started only when
     # both auth_method == "ldap" and ldap_group_sync_enabled are true (dark
@@ -154,6 +162,7 @@ install_validation_errors(app)
 
 app.include_router(auth_router)
 app.include_router(admin_router)
+app.include_router(federated_identities_router)
 app.include_router(groups_router)
 app.include_router(internal_router)
 app.include_router(ldap_sync_router)

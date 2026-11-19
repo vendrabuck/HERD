@@ -113,7 +113,38 @@ interactive user. Upstream status codes are propagated unchanged (for example a
 `403`, `404`, `409`, or `422` from reservations reaches you as the same status),
 and an unreachable reservations service surfaces as `503`. The `{id}` in every
 `/api/v1/reservations/{id}` path must be a UUID; any other value is answered `422`
-by the facade itself (FastAPI's validation envelope) and never reaches reservations.
+by the facade itself and never reaches reservations.
+
+A request body, path, or query that does not have the documented shape (a field
+missing, a value of the wrong type, a body that is not JSON) is answered `422` with a
+validation list, by the facade or by the reservations service behind it:
+`{"detail": [{"type": ..., "loc": [...], "msg": ...}, ...]}`, each item exactly those
+three keys. `loc` names where the problem is (`["body", "start_time"]`), and it names
+the keys you sent; `msg` says what is wrong. No item carries the submitted value as a
+field of its own, but `msg` can quote part of it: an unknown webhook event type is
+named (`unknown event_types ['x']; allowed: ...`), and an invalid UUID's message names
+the character at fault. Until issue #1455 each item also carried FastAPI's optional
+`input` (the submitted value, for a missing field the whole body) and sometimes
+`ctx`; both were optional in the published schema and are now gone (see Versioning
+and deprecation policy).
+
+A JSON request body that holds text which cannot be encoded as UTF-8, a lone surrogate
+(a JSON escape such as `\ud800` that is not half of a valid pair), anywhere, in any
+field or key, is answered `422` with a validation list of exactly one item,
+`{"type": "string_unicode", "loc": ["body"], "msg": "Input should be a valid string,
+unable to parse raw data as a unicode string"}`, which does not name the field, and
+nothing is forwarded. A body that is not valid JSON but holds such an escape gets the
+same answer rather than a JSON decoding error. A
+character outside the Basic Multilingual Plane written as an escaped surrogate pair
+(`\ud83d\udd11`) is one character and is accepted. Before issue #1459 such a body
+reached the facade's own call to reservations and was answered `500`.
+
+A `422` for a reason of the reservations service's own, on a request that has the
+documented shape, is not a validation list: it carries a string `detail`, relayed as
+reservations wrote it. An unknown `purpose_category` is answered `Unknown
+purpose_category; allowed: <list>`, which names the configured categories and not
+the value you sent (it quoted the value before issue #1459). Other such strings can
+name a resource, such as a device that is not available.
 
 ### POST /api/v1/reservations
 
@@ -129,7 +160,7 @@ Request fields:
 - `purpose_category` (string, optional): a lab purpose classification (issue
   #646 phase 1). Must be one of the server's configured categories, a list not
   currently enumerated by any `/api/v1` endpoint; an unrecognized value is
-  rejected with `422` (`Unknown purpose_category '<value>'; allowed: <list>`).
+  rejected with `422` (`Unknown purpose_category; allowed: <list>`).
   Omit it, or pass `null`, to leave the reservation unclassified.
 
 Response (`V1ReservationResponse`): `id`, `status`, `device_ids`, `topology_id`,
@@ -444,6 +475,12 @@ test, so an internal refactor cannot silently change the external shape. Only
 additive, backward-compatible changes ship within v1: new optional request
 fields and new response fields. Renaming or removing a field, retyping one, or
 changing required-ness is a breaking change and does not ship under v1.
+
+One removal has shipped within v1, as a security fix: the optional `input` and `ctx`
+keys of a validation error item (issue #1455). They echoed the submitted body, which
+could hold a webhook signing secret, and neither was ever in the item's `required`
+set, so a client reading the published schema already had to handle their absence.
+The required `type`, `loc`, and `msg` are unchanged.
 
 Breaking changes ship under a new version prefix (`/api/v2`) that runs alongside
 the existing version. When a successor version reaches general availability, the

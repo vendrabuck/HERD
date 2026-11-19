@@ -5,7 +5,8 @@ Flow (when settings.auth_method == "ldap"):
 1. Open a connection to settings.ldap_server_url with TLS as configured.
 2. Bind as the service account (settings.ldap_bind_dn + bind_password).
 3. Search settings.ldap_user_base_dn with the configured filter to resolve the
-   full user DN and the email/username attributes.
+   full user DN and the email/username attributes. Exactly one entry must
+   match; a name that matches more is refused without a bind (issue #1447).
 4. Open a second connection and bind as that user DN with the submitted
    password. Success here is proof the password is correct.
 
@@ -23,14 +24,17 @@ the event loop.
 
 from __future__ import annotations
 
+import functools
 import logging
 import ssl
+import string
+import unicodedata
 from collections.abc import Sequence
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 
 import anyio
-from ldap3 import BASE, NONE, SIMPLE, SUBTREE, Connection, Server, Tls
+from ldap3 import BASE, DEREF_ALWAYS, NONE, SIMPLE, SUBTREE, Connection, Server, Tls
 from ldap3.core.exceptions import (
     LDAPCommunicationError,
     LDAPException,
@@ -41,13 +45,18 @@ from ldap3.core.exceptions import (
 from ldap3.core.results import (
     RESULT_INVALID_DN_SYNTAX,
     RESULT_NO_SUCH_OBJECT,
+    RESULT_SIZE_LIMIT_EXCEEDED,
     RESULT_SUCCESS,
 )
+from ldap3.operation.search import NOT as SEARCH_NOT
+from ldap3.operation.search import OR as SEARCH_OR
+from ldap3.operation.search import parse_filter, search_operation
 from ldap3.protocol.sasl.sasl import validate_simple_password
 from ldap3.utils.conv import escape_filter_chars
 from ldap3.utils.dn import safe_dn
 
-from app.config import settings
+from app.config import Settings, settings
+from app.models.user import User
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +101,13 @@ class LdapUnavailableError(Exception):
 
 @dataclass(frozen=True)
 class LdapIdentity:
-    username: str
+    """A directory identity. username is None only from a login whose entry has
+    no usable username and whose login name cannot stand in (IAM-LDAP-11): a
+    returning user, found by email, still signs in, and only provisioning a new
+    account needs a username (auth_service._authenticate_ldap). Member
+    resolution never returns one without a username (missing_username)."""
+
+    username: str | None
     email: str
     dn: str
 
@@ -108,11 +123,52 @@ class LdapGroupEntry:
     (return_empty_attributes defaults to True), so emptiness of member_dns is
     the only observable signal, and mapping validation warns on it (decision
     with vendra 2026-08-12: accept with warning, never refuse).
+
+    unreadable_members counts the member values that are not text (issue
+    #1448, IAM-LDAP-15): they name no DN HERD can look up, so they are not in
+    member_dns, and the reconciler records each as a `not_text` member skip,
+    which suppresses the group's removals for the pass (IAM-SYNC-5).
     """
 
     dn: str
     name: str
     member_dns: tuple[str, ...]
+    unreadable_members: int = 0
+
+
+class PresentEmails(frozenset):
+    """The enumerated emails (a frozenset of the lowercased text values) plus
+    what the enumeration could not read (issue #1448, IAM-LDAP-15,
+    IAM-SWEEP-10):
+
+    - unreadable_entries: entries with at least one email value that is not
+      text. Such an entry is a person the directory still lists, and one of
+      their addresses cannot be read, so it may be the one a HERD account
+      holds: that account must not be treated as absent.
+    - held_usernames: the casefolded username values (LDAP_USERNAME_ATTRIBUTE,
+      text by the same rule) of those entries, so the sweep can hold back only
+      the matching accounts.
+    - unidentified_entries: those of them with no username value that is text
+      either; one such entry holds back the whole sweep.
+    """
+
+    unreadable_entries: int
+    unidentified_entries: int
+    held_usernames: frozenset[str]
+
+    def __new__(
+        cls,
+        emails=(),
+        unreadable_entries: int = 0,
+        *,
+        unidentified_entries: int = 0,
+        held_usernames=frozenset(),
+    ):
+        instance = super().__new__(cls, emails)
+        instance.unreadable_entries = unreadable_entries
+        instance.unidentified_entries = unidentified_entries
+        instance.held_usernames = frozenset(held_usernames)
+        return instance
 
 
 # skip_reason vocabulary for LdapMemberResolution; the reconciler persists
@@ -120,6 +176,8 @@ class LdapGroupEntry:
 MEMBER_SKIP_NOT_FOUND = "not_found"
 MEMBER_SKIP_MISSING_EMAIL = "missing_email"
 MEMBER_SKIP_MISSING_USERNAME = "missing_username"
+# A member value of the group's member attribute that is not text (issue #1448).
+MEMBER_SKIP_NOT_TEXT = "not_text"
 
 
 @dataclass(frozen=True)
@@ -362,26 +420,380 @@ async def run_connection():
             await anyio.to_thread.run_sync(holder.close)
 
 
+# ---------------------------------------------------------------------------
+# LDAP_USER_FILTER, the login search template (issue #1446, IAM-LDAP-14). The
+# template is operator configuration, so a defect in it is the directory not
+# being askable (503), never a refusal of the user (401) and never a 500.
+# ---------------------------------------------------------------------------
+
+USER_FILTER_SETTING = "LDAP_USER_FILTER"
+# The one replacement field the template admits.
+USER_FILTER_FIELD = "username"
+
+# Defect codes (the `reason` of the ldap_user_filter_invalid log line).
+USER_FILTER_UNBALANCED_BRACE = "unbalanced_brace"
+USER_FILTER_UNKNOWN_FIELD = "unknown_field"
+USER_FILTER_NO_FIELD = "no_username_field"
+USER_FILTER_INVALID_FILTER = "invalid_filter"
+USER_FILTER_TOO_LONG = "too_long"
+USER_FILTER_OUTSIDE_VALUE = "username_outside_value"
+USER_FILTER_NEGATED = "username_negated"
+USER_FILTER_OR_BRANCH = "or_branch_without_username"
+
+# A template longer than this is refused unread (a sane bound: real filters are
+# well under 1 KB, and a 1 MB one cost seconds to check).
+USER_FILTER_MAX_LENGTH = 4096
+
+# The login names the template is checked with (never the submitted one, so the
+# verdict depends on the template alone). Two plain alphanumeric probes find
+# where {username} lands in the parse tree; the third holds every character
+# escape_filter_chars escapes plus the characters of every filter operator, a
+# space, and a non-ASCII letter, so a template whose parse a real name could
+# change is refused. The probes are pinned by tests: the check is only as good
+# as their makeup.
+_USER_FILTER_PROBES = ("herdprobe7q3", "herdprobe2k9", "probe*()\\\x00 =~=>=<=:=,é")
+# ldap3 strips white space from the edges of an assertion value, so a name with
+# edge white space matches as its stripped form (as a directory's own matching
+# rules treat insignificant spaces) and only the SHAPE of its tree is compared:
+# the same tags, parents, keys, attribute descriptions, matching rules, and
+# dnAttributes flags. A name that is white space alone would reshape a substring
+# assertion into a presence filter, so login refuses it before any call
+# (_bind_user_sync); this probe tests that non-blank edge white space cannot.
+_USER_FILTER_SHAPE_PROBES = (" \u3000herdprobe4m6\t",)
+
+_FILTER_VALUE_KEYS = ("value", "initial", "any", "final")
+_FILTER_NAME_KEYS = ("attr", "matchingRule")
+
+
+class LdapUserFilterError(ValueError):
+    """LDAP_USER_FILTER cannot be used; `reason` is one of the USER_FILTER_* codes.
+
+    The message describes the template's defect only: it never holds a login
+    name, since the check never sees one.
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def render_user_filter(template: str, username: str) -> str:
+    """The login search filter: template with every {username} replaced by the
+    filter-escaped username (RFC 4515, ldap3's escape_filter_chars).
+
+    Strict on purpose (issue #1446): the only replacement field is `{username}`,
+    with no conversion (`!r`) and no format spec; `{{` and `}}` are a literal
+    brace, as in str.format. Raises LdapUserFilterError for a single brace that
+    is not doubled (USER_FILTER_UNBALANCED_BRACE), any other field, a positional
+    or empty one (`{0}`, `{}`), and attribute or index access
+    (`{username.__class__}`, `{username[0]}`) included (USER_FILTER_UNKNOWN_FIELD),
+    and a template with no `{username}` at all, which would find the same entry
+    for every login name (USER_FILTER_NO_FIELD). The username is inserted as
+    text, never formatted, so nothing in it is interpreted. The ONE way the login
+    filter is built; `user_filter_problem` adds the structural checks.
+    """
+    try:
+        pieces = list(string.Formatter().parse(template))
+    except ValueError as exc:
+        raise LdapUserFilterError(
+            USER_FILTER_UNBALANCED_BRACE,
+            f"{USER_FILTER_SETTING} has a single brace; write a literal brace as {{{{ or }}}}",
+        ) from exc
+    rendered: list[str] = []
+    fields = 0
+    for literal, field, spec, conversion in pieces:
+        rendered.append(literal)
+        if field is None:
+            continue
+        if field != USER_FILTER_FIELD or spec or conversion:
+            raise LdapUserFilterError(
+                USER_FILTER_UNKNOWN_FIELD,
+                f"{USER_FILTER_SETTING} has a placeholder other than {{username}}; "
+                "{username} is the only one, written exactly so",
+            )
+        fields += 1
+        rendered.append(escape_filter_chars(username))
+    if not fields:
+        raise LdapUserFilterError(
+            USER_FILTER_NO_FIELD,
+            f"{USER_FILTER_SETTING} has no {{username}} placeholder, so it would find "
+            "the same entry for every login name",
+        )
+    return "".join(rendered)
+
+
+def _filter_nodes(rendered: str) -> list[tuple[int, int, int | None, dict]]:
+    """The parse tree of a rendered filter, as ldap3 builds it for the search
+    request (`search_operation`, the same parser and encoder), flattened in
+    depth-first order to (index, tag, parent index, assertion) tuples. Iterative,
+    so a deep filter cannot exhaust the stack here."""
+    search_operation(
+        "",
+        rendered,
+        SUBTREE,
+        DEREF_ALWAYS,
+        ["objectClass"],
+        0,
+        0,
+        False,
+        True,
+        True,
+        None,
+        validator=None,
+        check_names=True,
+    )
+    root = parse_filter(rendered, None, True, True, None, True)
+    nodes: list[tuple[int, int, int | None, dict]] = []
+    stack: list[tuple[object, int | None]] = [(root, None)]
+    while stack:
+        node, parent = stack.pop()
+        index = len(nodes)
+        nodes.append((index, node.tag, parent, dict(node.assertion or {})))
+        stack.extend((child, index) for child in reversed(node.elements))
+    return nodes
+
+
+def _value_parts(assertion: dict) -> list[bytes]:
+    parts: list[bytes] = []
+    for key in _FILTER_VALUE_KEYS:
+        value = assertion.get(key)
+        if value is None:
+            continue
+        parts.extend(value if isinstance(value, list) else [value])
+    return parts
+
+
+def _tree_shape(nodes: list[tuple[int, int, int | None, dict]]) -> list[tuple]:
+    """A parse tree without its assertion values: tag, parent, the assertion's
+    keys, and its attribute description, matching rule, and dnAttributes."""
+    return [
+        (
+            tag,
+            parent,
+            tuple(sorted(assertion)),
+            tuple(assertion.get(key) for key in (*_FILTER_NAME_KEYS, "dnAttributes")),
+        )
+        for _index, tag, parent, assertion in nodes
+    ]
+
+
+def _structure_problem(template: str) -> tuple[str, str] | None:
+    """Where {username} lands in the parsed filter, checked with the probes.
+
+    Every render must parse to the same tree: the same tags and parents, the same
+    attribute descriptions, matching rules, and dnAttributes flags, and assertion
+    values that differ only by the probe (so no login name can add, remove, or
+    move an assertion), the shape probes (_USER_FILTER_SHAPE_PROBES) must give
+    the same shape, and the first probe may never sit in an attribute description
+    or a matching rule (USER_FILTER_OUTSIDE_VALUE). The comparison and the
+    attribute check overlap for every template known: escaping makes a name's
+    characters literal, and the only characters ldap3 treats specially inside a
+    value are the edge white space the shape probe covers (a name of white space
+    alone, which would reshape `(uid=*{username})` into `(uid=*)`, is refused at
+    login). The comparison is kept as the test of that property rather than an
+    assumption of it; test_the_tree_comparison_catches_a_reshaping_name pins
+    what it does with a name that would reshape. No `(!...)` may hold {username}
+    (USER_FILTER_NEGATED: it would match every entry but the named one), and an
+    `(|...)` that holds {username} must hold it in every branch
+    (USER_FILTER_OR_BRANCH: a branch without it matches whatever the login name,
+    so any name with that entry's password would sign in as it). With those, an
+    entry matches only through an assertion whose value holds the login name.
+    """
+    probe = _USER_FILTER_PROBES[0]
+    trees = [_filter_nodes(render_user_filter(template, name)) for name in _USER_FILTER_PROBES]
+    base = trees[0]
+    probe_bytes = probe.encode()
+    for name, tree in zip(_USER_FILTER_PROBES[1:], trees[1:]):
+        name_bytes = escape_filter_chars(name).encode()
+        if len(tree) != len(base):
+            return USER_FILTER_OUTSIDE_VALUE, "a login name can change the filter's structure"
+        for (_, tag, parent, assertion), (_, other_tag, other_parent, other) in zip(base, tree):
+            if (tag, parent) != (other_tag, other_parent) or set(assertion) != set(other):
+                return USER_FILTER_OUTSIDE_VALUE, "a login name can change the filter's structure"
+            for key in assertion:
+                if key in _FILTER_VALUE_KEYS:
+                    mine = assertion[key] if isinstance(assertion[key], list) else [assertion[key]]
+                    theirs = other[key] if isinstance(other[key], list) else [other[key]]
+                    expected = [part.replace(probe_bytes, name_bytes) for part in mine]
+                    if expected != theirs:
+                        return (
+                            USER_FILTER_OUTSIDE_VALUE,
+                            "a login name can change the filter's structure",
+                        )
+                elif assertion[key] != other[key]:
+                    return USER_FILTER_OUTSIDE_VALUE, "{username} is not inside an assertion value"
+    for name in _USER_FILTER_SHAPE_PROBES:
+        if _tree_shape(_filter_nodes(render_user_filter(template, name))) != _tree_shape(base):
+            return USER_FILTER_OUTSIDE_VALUE, "a login name can change the filter's structure"
+    holds_probe: dict[int, bool] = {}
+    for index, _tag, _parent, assertion in base:
+        for key in _FILTER_NAME_KEYS:
+            if probe.lower() in str(assertion.get(key) or "").lower():
+                return USER_FILTER_OUTSIDE_VALUE, "{username} is not inside an assertion value"
+        holds_probe[index] = any(probe_bytes in part for part in _value_parts(assertion))
+    # Propagate "holds {username}" up the tree: children come after parents in
+    # depth-first order, so walk it backwards.
+    for index, _tag, parent, _assertion in reversed(base):
+        if parent is not None and holds_probe[index]:
+            holds_probe[parent] = True
+    for index, tag, _parent, _assertion in base:
+        if not holds_probe[index]:
+            continue
+        children = [child for child, _t, parent, _a in base if parent == index]
+        if tag == SEARCH_NOT:
+            return USER_FILTER_NEGATED, "{username} is inside a (!...) negation"
+        if tag == SEARCH_OR and not all(holds_probe[child] for child in children):
+            return (
+                USER_FILTER_OR_BRANCH,
+                "an (|...) branch without {username} matches whatever the login name",
+            )
+    return None
+
+
+def _check_user_filter(template: str) -> LdapUserFilterError | None:
+    """The uncached check behind user_filter_problem."""
+    if len(template) > USER_FILTER_MAX_LENGTH:
+        return LdapUserFilterError(
+            USER_FILTER_TOO_LONG,
+            f"{USER_FILTER_SETTING} is longer than {USER_FILTER_MAX_LENGTH} characters",
+        )
+    try:
+        found = _structure_problem(template)
+    except LdapUserFilterError as exc:
+        return exc
+    except Exception as exc:  # any failure to build the filter is a defect
+        problem = LdapUserFilterError(
+            USER_FILTER_INVALID_FILTER,
+            f"{USER_FILTER_SETTING} is not a valid LDAP filter once {{username}} is "
+            f"substituted ({type(exc).__name__})",
+        )
+        problem.__cause__ = exc
+        return problem
+    if found is None:
+        return None
+    reason, detail = found
+    return LdapUserFilterError(reason, f"{USER_FILTER_SETTING} is refused: {detail}")
+
+
+@functools.lru_cache(maxsize=16)
+def user_filter_problem(template: str) -> LdapUserFilterError | None:
+    """Why the template cannot be used as LDAP_USER_FILTER, or None when it can.
+
+    Checked, in order, with fixed probe login names and never the submitted one:
+    at most USER_FILTER_MAX_LENGTH characters (USER_FILTER_TOO_LONG); the
+    template rules of render_user_filter; then the rendered filter must build
+    into a search request exactly as `Connection.search` builds it (ldap3's
+    parser and encoder, client-side, no directory call), and any exception while
+    doing so (an LDAP syntax error, a RecursionError from a deeply nested
+    template, a UnicodeEncodeError from a lone surrogate an environment variable
+    can carry) is USER_FILTER_INVALID_FILTER with its class logged; then the
+    structural rules of _structure_problem. Escaping makes the login name a
+    literal inside an assertion value, so what is checked does not depend on it.
+
+    Not refused: a {username} inside a substring, approximate, or ordering
+    assertion (`(uid={username}*)`, `(uid~={username})`, `(uid>={username})`),
+    which matches more entries than the named one. A name it matches to one
+    entry signs in as that entry with that entry's password; a name it matches
+    to more than one is refused as ambiguous (_search_user, issue #1447).
+    Discouraged in ENV_VARS.
+
+    Memoized per template string (the verdict depends on the string alone), so a
+    login never re-runs the check after the first.
+    """
+    return _check_user_filter(template)
+
+
+def _log_user_filter_problem(problem: LdapUserFilterError, when: str) -> None:
+    """One ERROR naming the setting, the defect, and the class; never a login name."""
+    logger.error(
+        "%s; %s",
+        problem,
+        when,
+        extra={
+            "action": "ldap_user_filter_invalid",
+            "setting": USER_FILTER_SETTING,
+            "reason": problem.reason,
+            "exception_class": type(problem.__cause__ or problem).__name__,
+        },
+    )
+
+
+def log_ldap_startup_problems(config: Settings) -> list[str]:
+    """Log the LDAP settings problems found at startup and return their actions.
+
+    Fires only when config.auth_method == "ldap" (every LDAP setting is inert in
+    the other modes). Today it checks LDAP_USER_FILTER (user_filter_problem) and
+    logs one ERROR `ldap_user_filter_invalid` naming the setting and the defect,
+    never the template's value. Auth still boots, the OIDC and LDAP precedent
+    (an incomplete configuration never stops auth): every LDAP login then answers
+    the IAM-LDAP-12 503 until the setting is fixed and auth restarted.
+    `app.main.lifespan` calls this at startup.
+    """
+    if config.auth_method != "ldap":
+        return []
+    problem = user_filter_problem(config.ldap_user_filter)
+    if problem is None:
+        return []
+    _log_user_filter_problem(problem, "every LDAP login answers 503 until it is fixed")
+    return ["ldap_user_filter_invalid"]
+
+
+# The login search asks the directory for at most this many entries (issue
+# #1447, IAM-LDAP-16): two are enough to know a name matches more than one, and
+# no login fetches an unbounded result whatever the filter matches.
+_LOGIN_SEARCH_SIZE_LIMIT = 2
+
+
+class _AmbiguousLoginNameError(Exception):
+    """The login search matched more than one entry (issue #1447, IAM-LDAP-16).
+
+    `at_least` is the number of matches the answer proves: the entries returned,
+    and never fewer than two. Never holds a DN or the login name. Private to this
+    module: _bind_user_sync turns it into the refusal (None) and its ERROR."""
+
+    def __init__(self, at_least: int) -> None:
+        super().__init__(f"the login search matched at least {at_least} entries")
+        self.at_least = at_least
+
+
 def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
     """Bind as service account, then search for the user DN and attributes.
 
     Returns (user_dn, {email_attr: [values], username_attr: [values]}) when the
-    search matched, or None only when the directory PROVED there is no match: a
-    successful search with zero entries (issue #1403). Every other outcome
-    raises LdapUnavailableError: the service connection could not be opened,
-    TLS-negotiated, or bound; the search raised; or it found no entry and ended
-    with any result code but success (noSuchObject on a misconfigured base DN, a
-    referral that could not be followed, busy, access denied). A limited search
-    that returned the entry is a match (ldap3 reports a non-empty response as
-    found, whatever the result code). Like the presence probe, a
-    failed search under the configured base proves nothing about the user. The
-    search_filter is template'd with the escaped username to prevent filter
-    injection. This function is always synchronous (blocking ldap3 calls);
+    search matched exactly one entry, or None only when the directory PROVED there
+    is no match: a successful search with zero entries (issue #1403).
+
+    Raises _AmbiguousLoginNameError when the answer proves more than one entry
+    matches (issue #1447, IAM-LDAP-16): the search asks for at most
+    _LOGIN_SEARCH_SIZE_LIMIT entries, and two entries returned (with any result
+    code), or one entry with sizeLimitExceeded (the directory's own limit was
+    lower, and it says more matched than it sent), is ambiguous. Nothing is bound
+    as either entry, so no password is tried and no lockout counter is touched.
+    Only entries count: a search result reference (a continuation into another
+    server's part of the tree) is not an entry and is not followed, so a match
+    behind one is not seen (Active Directory sends such references for its
+    application partitions on many searches from the domain root).
+
+    Every other outcome raises LdapUnavailableError: the service connection
+    could not be opened, TLS-negotiated, or bound; the search raised; it found
+    no entry and ended with any result code but success (noSuchObject on a
+    misconfigured base DN, a referral that could not be followed, busy, access
+    denied); or it returned one entry and ended with any result code but success
+    or sizeLimitExceeded (a time limit, say): the search stopped before it
+    finished, so it does not prove the entry is the only match. Like the presence
+    probe, a failed search under the configured base proves nothing about the
+    user. The search_filter is built by render_user_filter with the escaped
+    username to prevent filter injection; a template user_filter_problem refuses
+    raises LdapUnavailableError before any connection (_bind_user_sync refuses
+    one first, so this is the backstop; the verdict is memoized, so asking twice
+    costs nothing). This function is always synchronous (blocking ldap3 calls);
     callers use anyio.to_thread to dispatch it.
     """
+    problem = user_filter_problem(settings.ldap_user_filter)
+    if problem is not None:
+        raise LdapUnavailableError(str(problem)) from problem
+    search_filter = render_user_filter(settings.ldap_user_filter, username)
     with _service_connection() as conn:
-        safe_username = escape_filter_chars(username)
-        search_filter = settings.ldap_user_filter.format(username=safe_username)
         found = _checked_search(
             conn,
             search_base=settings.ldap_user_base_dn,
@@ -393,10 +805,19 @@ def _search_user(username: str) -> tuple[str, dict[str, list]] | None:
             ],
             proven_absent_codes=_PRESENCE_PROVEN_ABSENT_CODES,
             description="login user search",
+            size_limit=_LOGIN_SEARCH_SIZE_LIMIT,
         )
         if not found:
             return None
-        entry = conn.entries[0]
+        entries = list(conn.entries)
+        result_code = (conn.result or {}).get("result")
+        if len(entries) > 1 or result_code == RESULT_SIZE_LIMIT_EXCEEDED:
+            raise _AmbiguousLoginNameError(max(len(entries), 2))
+        if result_code != RESULT_SUCCESS:
+            raise LdapUnavailableError(
+                f"login user search stopped before it finished: {conn.result}"
+            )
+        (entry,) = entries
         attrs = {
             settings.ldap_email_attribute: _attr_values(entry, settings.ldap_email_attribute),
             settings.ldap_username_attribute: _attr_values(entry, settings.ldap_username_attribute),
@@ -495,12 +916,20 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
 
     Returns the LdapIdentity on success and None for every refusal: an empty
     password (refused before any call, since an LDAP simple bind with one
-    succeeds anonymously), a password SASLprep refuses (also before any call,
-    _password_refused_by_saslprep), no matching entry, a refused user bind, or an
-    entry without the email attribute.
+    succeeds anonymously), a login name that is white space alone (also before
+    any call: ldap3 strips assertion values, so it could reshape the filter), a
+    password SASLprep refuses (also before any call,
+    _password_refused_by_saslprep), no matching entry, more than one matching
+    entry (issue #1447: no bind is attempted, and one ERROR, action
+    ldap_user_ambiguous, names the setting and the count, never a DN), a refused
+    user bind, or an entry without the email attribute (or with no value of it
+    that is text, issue #1448).
 
     Raises LdapUnavailableError whenever the directory could not be asked:
-    incomplete configuration (logged at ERROR), or any connection, TLS,
+    incomplete configuration (logged at ERROR), an LDAP_USER_FILTER that
+    user_filter_problem refuses (logged at ERROR, action
+    ldap_user_filter_invalid, with no login name: issue #1446; asked before
+    anything that depends on the username or password), or any connection, TLS,
     service-account bind, search, or user-bind failure (logged once at WARNING,
     action ldap_error, with the client's text in the message and the cause's
     class name in exception_class; never the password). Callers wrap this in
@@ -511,14 +940,48 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
         raise LdapUnavailableError(
             "LDAP is not fully configured (ldap_server_url or ldap_user_base_dn is empty)"
         )
+    filter_problem = user_filter_problem(settings.ldap_user_filter)
+    if filter_problem is not None:
+        _log_user_filter_problem(filter_problem, "login cannot be checked")
+        raise LdapUnavailableError(str(filter_problem)) from filter_problem
     if not password:
         # LDAP anonymous bind succeeds with an empty password; reject early.
+        return None
+    if not username.strip():
+        # ldap3 strips white space from an assertion value, so a blank login
+        # name would turn `(uid=*{username})` into the presence filter
+        # `(uid=*)` and sign in as the first entry (issue #1446 review). Refused
+        # like an empty password: before any call, the same for every name.
+        logger.warning(
+            "LDAP login refused before any directory call: the login name is blank",
+            extra={"action": "ldap_login_name_refused"},
+        )
         return None
     if _password_refused_by_saslprep(username, password):
         return None
     try:
         try:
-            found = _search_user(username)
+            try:
+                found = _search_user(username)
+            except _AmbiguousLoginNameError as exc:
+                # Issue #1447: the filter does not name one entry for this name,
+                # so no entry's password is tried. Refused like an unknown name
+                # (the same 401, one search, no user bind); the operator is told
+                # which setting to fix, and never which entries matched.
+                logger.error(
+                    "LDAP login refused: %s matches %d or more directory entries for "
+                    "this login name, so no password was tried; it must match one "
+                    "entry per name",
+                    USER_FILTER_SETTING,
+                    exc.at_least,
+                    extra={
+                        "action": "ldap_user_ambiguous",
+                        "setting": USER_FILTER_SETTING,
+                        "count": exc.at_least,
+                        "username": username,
+                    },
+                )
+                return None
             if found is None:
                 logger.info(
                     "LDAP user search returned no results",
@@ -551,16 +1014,33 @@ def _bind_user_sync(username: str, password: str) -> LdapIdentity | None:
         )
         raise
 
-    email_values = attrs.get(settings.ldap_email_attribute) or []
-    username_values = attrs.get(settings.ldap_username_attribute) or []
-    email = str(email_values[0]) if email_values else ""
-    ldap_username = str(username_values[0]) if username_values else username
+    # Issue #1448: a value that is not text, or too long for its column, counts
+    # as absent (IAM-LDAP-15), so no email is the refusal below and no username
+    # falls back to the login name (IAM-LDAP-11), which must pass the same rule.
+    # Both are read only after the user bind succeeded, so neither is reachable
+    # without the user's password.
+    email = _first_text_value(
+        attrs.get(settings.ldap_email_attribute) or [],
+        attribute=settings.ldap_email_attribute,
+        dn=user_dn,
+        max_length=EMAIL_MAX_LENGTH,
+    )
     if not email:
         logger.warning(
             "LDAP user has no email attribute; cannot provision HERD account",
             extra={"action": "ldap_missing_email", "dn": user_dn},
         )
         return None
+    # None when neither the attribute nor the login name is usable text: the
+    # caller refuses only a login that would provision a new account, since a
+    # returning user is found by email (issue #1448 review). Whether the account
+    # exists is decided after the bind, so this is no existence oracle.
+    ldap_username = _first_text_value(
+        attrs.get(settings.ldap_username_attribute) or [],
+        attribute=settings.ldap_username_attribute,
+        dn=user_dn,
+        max_length=USERNAME_MAX_LENGTH,
+    ) or _text_value(username, USERNAME_MAX_LENGTH)
     return LdapIdentity(username=ldap_username, email=email, dn=user_dn)
 
 
@@ -603,6 +1083,7 @@ def _checked_search(
     attributes: list[str],
     proven_absent_codes: frozenset[int],
     description: str,
+    size_limit: int = 0,
 ) -> bool:
     """Run a search whose outcome must be classified as proof or error.
 
@@ -612,6 +1093,9 @@ def _checked_search(
     This ladder is the module's load-bearing safety logic; every directory
     search with proof semantics must route through it so the benign-code set
     is a conscious per-call-site choice rather than a re-implementation.
+    size_limit is the most entries the directory is asked for (0, the default,
+    asks for no limit); a True result may then come with sizeLimitExceeded,
+    which the caller reads.
     """
     try:
         ok = conn.search(
@@ -619,6 +1103,7 @@ def _checked_search(
             search_filter=search_filter,
             search_scope=search_scope,
             attributes=attributes,
+            size_limit=size_limit,
         )
     except LDAPException as exc:
         raise LdapUnavailableError(f"{description} failed: {exc}") from exc
@@ -661,8 +1146,143 @@ def _base_entry(conn: Connection, dn: str, attributes: list[str]):
 
 
 def _attr_values(entry, attr: str) -> list:
-    """Values of an attribute on an ldap3 Entry, [] when absent."""
+    """Values of an attribute on an ldap3 Entry, [] when absent.
+
+    Raw: a value may be `bytes` (see _text_value). Nothing may turn one into
+    account data or a log line except through _text_value.
+    """
     return list(entry[attr].values) if attr in entry else []
+
+
+# The longest email and username a HERD account can hold (the users table's
+# columns): a longer directory value counts as absent instead of failing at the
+# database (issue #1448 review).
+EMAIL_MAX_LENGTH = User.__table__.c.email.type.length
+USERNAME_MAX_LENGTH = User.__table__.c.username.type.length
+
+# Unicode categories a text value may not hold: controls (Cc: NUL, which
+# Postgres cannot store, tab, newline, escape, DEL, C1), format characters (Cf:
+# bidi embeddings, overrides, and isolates, zero width space, word joiner, byte
+# order mark, soft hyphen; the zero width non-joiner and joiner are allowed only
+# between letters or marks, see _JOINERS), line and paragraph separators (Zl,
+# Zp), and surrogates (Cs).
+_REFUSED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
+
+
+def _is_noncharacter(code_point: int) -> bool:
+    """The 66 Unicode noncharacters: U+FDD0 to U+FDEF and the last two code
+    points of every plane (U+FFFE, U+FFFF, U+1FFFE, ...)."""
+    return 0xFDD0 <= code_point <= 0xFDEF or (code_point & 0xFFFE) == 0xFFFE
+
+
+# The zero width non-joiner and joiner: format characters (Cf) that Persian and
+# Indic text needs inside words, so they are allowed between two letters or
+# marks (Unicode categories L* and M*) and refused anywhere else.
+_JOINERS = frozenset({"\u200c", "\u200d"})
+
+
+def _is_letter_or_mark(ch: str) -> bool:
+    return unicodedata.category(ch)[0] in "LM"
+
+
+def _refused_character(value: str, index: int) -> bool:
+    """True when value[index] may not appear in a text value: a character of
+    _REFUSED_CATEGORIES or a noncharacter, except a joiner (_JOINERS) between
+    two letters or marks."""
+    ch = value[index]
+    if ch in _JOINERS:
+        return not (
+            0 < index < len(value) - 1
+            and _is_letter_or_mark(value[index - 1])
+            and _is_letter_or_mark(value[index + 1])
+        )
+    return unicodedata.category(ch) in _REFUSED_CATEGORIES or _is_noncharacter(ord(ch))
+
+
+def _text_value(value: object, max_length: int | None = None) -> str | None:
+    """A directory attribute value as text, or None when it is not text (issue
+    #1448, IAM-LDAP-15). The ONE conversion of a directory value to a string:
+    never `str()` one, which turns `bytes` into the text of its repr (`"b'...'"`).
+
+    ldap3 decodes each value as UTF-8 and, with no schema loaded (this module
+    asks for none, get_info=NONE), returns the raw `bytes` when that fails, so a
+    value that is not UTF-8 arrives as `bytes`. Text is a `str`, or `bytes` that
+    decode as strict UTF-8, that:
+
+    - is not empty once Unicode white space is stripped (a lone space or
+      no-break space is no address and no name);
+    - holds no character of _REFUSED_CATEGORIES and no noncharacter, except
+      a zero width non-joiner or joiner between two letters or marks
+      (_refused_character);
+    - is at most max_length characters, when given (the column it is bound for).
+
+    Every other value is None, including any type but `str` and `bytes` (an int
+    or a datetime, which a schema-aware ldap3 would return and this module never
+    asks for). A value that passes is returned exactly as the directory gave it:
+    nothing is stripped, folded, or normalized.
+    """
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    if any(_refused_character(value, index) for index in range(len(value))):
+        return None
+    if max_length is not None and len(value) > max_length:
+        return None
+    return value
+
+
+def _text_values(
+    values: Sequence[object], max_length: int | None = None
+) -> tuple[list[str], list[str]]:
+    """The values that are text, in the order the directory returned them, and
+    the class names of the ones that are not (for the log line; never a value)."""
+    texts: list[str] = []
+    refused: list[str] = []
+    for value in values:
+        text = _text_value(value, max_length)
+        if text is None:
+            refused.append(type(value).__name__)
+        else:
+            texts.append(text)
+    return texts, refused
+
+
+def _log_values_not_text(attribute: str, dn: str, refused: list[str]) -> None:
+    """One WARNING per attribute read that left values out: the attribute, the
+    entry (or search base) DN, the count, and the value classes, never a value."""
+    logger.warning(
+        "LDAP attribute %s of %s holds %d value(s) that are not text; they are ignored",
+        attribute,
+        dn,
+        len(refused),
+        extra={
+            "action": "ldap_attribute_not_text",
+            "attribute": attribute,
+            "dn": dn,
+            "count": len(refused),
+            "value_classes": sorted(set(refused)),
+        },
+    )
+
+
+def _first_text_value(
+    values: Sequence[object], *, attribute: str, dn: str, max_length: int | None = None
+) -> str | None:
+    """The first value of a single-valued use (an email, a username, a display
+    name) that is text, or None when none is: a value that is not text counts
+    as absent, so the caller's missing-attribute rule applies. When values are
+    left out, logs one WARNING (_log_values_not_text). Of a multi-valued
+    attribute whose first value is not text and whose second is, the second is
+    used: the first text value in the directory's order. max_length bounds the
+    value for the column it is bound for; a longer one is left out the same way."""
+    texts, refused = _text_values(values, max_length)
+    if refused:
+        _log_values_not_text(attribute, dn, refused)
+    return texts[0] if texts else None
 
 
 def _is_transport_failure(exc: LdapUnavailableError) -> bool:
@@ -717,23 +1337,33 @@ def _fetch_group_sync(
     )
     if entry is None:
         return None
-    name_values = _attr_values(entry, name_attr)
-    if not name_values:
-        # A group without its display-name attribute is still usable; the DN
-        # stands in so the cached directory_name is never empty.
+    name = _first_text_value(_attr_values(entry, name_attr), attribute=name_attr, dn=group_dn)
+    if name is None:
+        # A group without its display-name attribute (or with no text value
+        # in it) is still usable; the DN stands in so the cached
+        # directory_name is never empty.
         logger.warning(
-            "LDAP group has no %s attribute; falling back to its DN",
+            "LDAP group has no text %s value; falling back to its DN",
             name_attr,
             extra={"action": "ldap_group_missing_name", "dn": group_dn},
         )
     # An entry lacking the member attribute yields an empty tuple: AD models
     # an empty group that way, so it cannot be refused outright. Note this
     # also means fetch_group proves existence, not group-ness; mapping
-    # validation warns on an empty member_dns.
+    # validation warns on an empty member_dns. A member value that is not text
+    # names no entry HERD can look up, so it is left out of member_dns, logged,
+    # and counted: the reconciler records it as a not_text skip that suppresses
+    # the group's removals, since the directory did not prove that member gone.
+    # (Before issue #1448 the text of its bytes repr went on as a DN, which
+    # resolved as not_found, a skip that never suppressed removals.)
+    member_dns, refused = _text_values(_attr_values(entry, member_attr))
+    if refused:
+        _log_values_not_text(member_attr, group_dn, refused)
     return LdapGroupEntry(
         dn=entry.entry_dn,
-        name=str(name_values[0]) if name_values else group_dn,
-        member_dns=tuple(str(v) for v in _attr_values(entry, member_attr)),
+        name=name if name is not None else group_dn,
+        member_dns=tuple(member_dns),
+        unreadable_members=len(refused),
     )
 
 
@@ -744,19 +1374,26 @@ def _resolution_for(conn: Connection, member_dn: str) -> LdapMemberResolution:
     )
     if entry is None:
         return LdapMemberResolution(None, MEMBER_SKIP_NOT_FOUND)
-    email_values = _attr_values(entry, settings.ldap_email_attribute)
-    username_values = _attr_values(entry, settings.ldap_username_attribute)
-    if not email_values:
-        return LdapMemberResolution(None, MEMBER_SKIP_MISSING_EMAIL)
-    if not username_values:
-        return LdapMemberResolution(None, MEMBER_SKIP_MISSING_USERNAME)
-    return LdapMemberResolution(
-        LdapIdentity(
-            username=str(username_values[0]),
-            email=str(email_values[0]),
-            dn=entry.entry_dn,
-        )
+    # A value that is not text counts as absent (issue #1448, IAM-LDAP-15), so
+    # it is the missing_email or missing_username skip, which suppresses the
+    # group's removals this pass (IAM-SYNC-5).
+    email = _first_text_value(
+        _attr_values(entry, settings.ldap_email_attribute),
+        attribute=settings.ldap_email_attribute,
+        dn=entry.entry_dn,
+        max_length=EMAIL_MAX_LENGTH,
     )
+    username = _first_text_value(
+        _attr_values(entry, settings.ldap_username_attribute),
+        attribute=settings.ldap_username_attribute,
+        dn=entry.entry_dn,
+        max_length=USERNAME_MAX_LENGTH,
+    )
+    if email is None:
+        return LdapMemberResolution(None, MEMBER_SKIP_MISSING_EMAIL)
+    if username is None:
+        return LdapMemberResolution(None, MEMBER_SKIP_MISSING_USERNAME)
+    return LdapMemberResolution(LdapIdentity(username=username, email=email, dn=entry.entry_dn))
 
 
 def _resolve_member_sync(member_dn: str) -> LdapMemberResolution:
@@ -876,10 +1513,16 @@ _PAGED_COOKIE_OID = "1.2.840.113556.1.4.319"
 
 def _paged_user_emails_sync(
     search_filter: str, description: str, holder: "RunConnection | None" = None
-) -> frozenset[str]:
+) -> PresentEmails:
     """Paged SUBTREE enumeration under ldap_user_base_dn, collecting every
     value of ldap_email_attribute (lowercased) across every matching entry
-    (an entry may be multi-valued; every value is included).
+    (an entry may be multi-valued; every value is included) that is text: a
+    value that is not (_text_value) is left out, with one WARNING for the
+    whole enumeration. An entry with ANY email value left out is counted in
+    the result's unreadable_entries, and its username values (read with the
+    email attribute, by the same text rule) go into held_usernames, or, when it
+    has none that is text, it counts in unidentified_entries (issue #1448,
+    IAM-SWEEP-10).
 
     Loops the paged-results cookie, held on ONE connection for the whole
     enumeration, until the directory reports it exhausted. A missing paging
@@ -896,9 +1539,15 @@ def _paged_user_emails_sync(
     on a different connection.
     """
     email_attr = settings.ldap_email_attribute
+    username_attr = settings.ldap_username_attribute
+    attributes = list(dict.fromkeys([email_attr, username_attr]))
 
-    def _do(conn: Connection) -> frozenset[str]:
+    def _do(conn: Connection) -> PresentEmails:
         emails: set[str] = set()
+        refused: list[str] = []
+        unreadable_entries = 0
+        unidentified_entries = 0
+        held_usernames: set[str] = set()
         cookie: bytes = b""
         while True:
             try:
@@ -912,7 +1561,7 @@ def _paged_user_emails_sync(
                     search_base=settings.ldap_user_base_dn,
                     search_filter=search_filter,
                     search_scope=SUBTREE,
-                    attributes=[email_attr],
+                    attributes=attributes,
                     paged_size=_PAGED_SEARCH_SIZE,
                     paged_cookie=cookie or None,
                 )
@@ -922,8 +1571,20 @@ def _paged_user_emails_sync(
             if result_code != RESULT_SUCCESS:
                 raise LdapUnavailableError(f"{description} failed: {conn.result}")
             for entry in conn.entries:
-                for value in _attr_values(entry, email_attr):
-                    emails.add(str(value).lower())
+                texts, entry_refused = _text_values(_attr_values(entry, email_attr))
+                emails.update(text.lower() for text in texts)
+                refused.extend(entry_refused)
+                if entry_refused:
+                    # Any value left out, even beside a readable one: the
+                    # unreadable one may be the address an account holds.
+                    unreadable_entries += 1
+                    usernames, _ = _text_values(
+                        _attr_values(entry, username_attr), USERNAME_MAX_LENGTH
+                    )
+                    if usernames:
+                        held_usernames.update(name.casefold() for name in usernames)
+                    else:
+                        unidentified_entries += 1
             controls = (conn.result or {}).get("controls") or {}
             page_control = controls.get(_PAGED_COOKIE_OID)
             if not page_control:
@@ -933,18 +1594,26 @@ def _paged_user_emails_sync(
             cookie = (page_control.get("value") or {}).get("cookie") or b""
             if not cookie:
                 break
-        return frozenset(emails)
+        if refused:
+            # One line per enumeration, not per entry (issue #1448).
+            _log_values_not_text(email_attr, settings.ldap_user_base_dn, refused)
+        return PresentEmails(
+            emails,
+            unreadable_entries,
+            unidentified_entries=unidentified_entries,
+            held_usernames=held_usernames,
+        )
 
     return _call_with_connection(_do, holder)
 
 
-def _present_emails_sync(holder: "RunConnection | None" = None) -> frozenset[str]:
+def _present_emails_sync(holder: "RunConnection | None" = None) -> PresentEmails:
     return _paged_user_emails_sync(
         f"({settings.ldap_email_attribute}=*)", "present-emails enumeration", holder
     )
 
 
-def _disabled_emails_sync(holder: "RunConnection | None" = None) -> frozenset[str]:
+def _disabled_emails_sync(holder: "RunConnection | None" = None) -> PresentEmails:
     return _paged_user_emails_sync(
         f"(&({settings.ldap_email_attribute}=*){settings.ldap_disabled_filter})",
         "disabled-emails enumeration",
@@ -952,8 +1621,10 @@ def _disabled_emails_sync(holder: "RunConnection | None" = None) -> frozenset[st
     )
 
 
-async def present_emails(*, run_holder: "RunConnection | None" = None) -> frozenset[str]:
-    """Every email attribute value seen under ldap_user_base_dn, lowercased.
+async def present_emails(*, run_holder: "RunConnection | None" = None) -> PresentEmails:
+    """Every email attribute value that is text seen under ldap_user_base_dn,
+    lowercased, with the count of entries whose email could not be read
+    (PresentEmails.unreadable_entries).
 
     The deactivation sweep's absence proof: a candidate whose email is not
     in this set (and was not group-presence-credited this run) is proven
@@ -964,7 +1635,7 @@ async def present_emails(*, run_holder: "RunConnection | None" = None) -> frozen
     return await anyio.to_thread.run_sync(_present_emails_sync, run_holder)
 
 
-async def disabled_emails(*, run_holder: "RunConnection | None" = None) -> frozenset[str]:
+async def disabled_emails(*, run_holder: "RunConnection | None" = None) -> PresentEmails:
     """Every email attribute value under ldap_user_base_dn matching the
     ldap_disabled_filter setting, conjoined with the email-presence filter.
 

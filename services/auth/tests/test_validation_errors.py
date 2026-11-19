@@ -1,101 +1,34 @@
-"""Auth's request-validation handler (issue #1426).
+"""Auth installs the shared request-validation handler (issue #1426).
 
 FastAPI's default handler renders every pydantic error with its `input`, which for
 a login or registration body is the submitted password (for a missing field it is
 the whole body), and Starlette cannot encode a lone surrogate, so a surrogate in
-the input turned the 422 into a 500. Auth's handler renders each error as exactly
-`{type, loc, msg}` (the shape the specification documents) and replaces any lone
-surrogate in `loc` or `msg` with U+FFFD, so the body always encodes.
+the input turned the 422 into a 500. Auth installs `herd_common.validation_errors`,
+which renders each error as exactly `{type, loc, msg}` (the shape the specification
+documents) and replaces any lone surrogate in `loc` or `msg` with U+FFFD; the
+renderer itself is pinned in `services/common/tests/test_validation_errors.py`.
+These tests pin that auth's real app uses it. The password-specific cases are in
+`test_password_input_validation.py`.
 """
 
 from __future__ import annotations
 
 import json
 
+import pytest
 from app.main import app
-from app.validation_errors import (
+from fastapi.exceptions import RequestValidationError
+from herd_common.validation_errors import (
     RENDERED_KEYS,
-    restrict_validation_error_schema,
+    STRING_UNICODE_MSG,
+    RefuseLoneSurrogates,
     validation_error_handler,
 )
-from fastapi.exceptions import RequestValidationError
-
-
-async def _render(errors: list[dict]) -> tuple[int, object]:
-    response = await validation_error_handler(None, RequestValidationError(errors))
-    return response.status_code, json.loads(response.body)
+from httpx import ASGITransport, AsyncClient
 
 
 def test_the_handler_is_installed_for_request_validation_errors():
     assert app.exception_handlers[RequestValidationError] is validation_error_handler
-
-
-async def test_the_handler_keeps_type_loc_msg_and_drops_input_ctx_and_everything_else():
-    status, body = await _render(
-        [
-            {
-                "type": "string_too_short",
-                "loc": ("body", "password"),
-                "msg": "String should have at least 8 characters",
-                "input": "secret-pw",
-                "ctx": {"min_length": 8},
-                "url": "https://errors.pydantic.dev/",
-            },
-            {
-                "type": "missing",
-                "loc": ("body", "email"),
-                "msg": "Field required",
-                "input": {"password": "secret-pw"},
-            },
-        ]
-    )
-    assert status == 422
-    assert body == {
-        "detail": [
-            {
-                "type": "string_too_short",
-                "loc": ["body", "password"],
-                "msg": "String should have at least 8 characters",
-            },
-            {"type": "missing", "loc": ["body", "email"], "msg": "Field required"},
-        ]
-    }
-
-
-async def test_the_handler_replaces_a_lone_surrogate_in_loc_and_msg_and_keeps_integers():
-    """Defensive: no route here is known to put a surrogate in `loc` or `msg`
-    (pydantic refuses a surrogate key at the parent's loc), but a 500 is the
-    cost of being wrong, so the handler never assumes it."""
-    status, body = await _render(
-        [
-            {
-                "type": "extra_forbidden",
-                "loc": ("body", "a\ud800b", 3),
-                "msg": "found `\udfff` at 1",
-                "input": "\ud800",
-            }
-        ]
-    )
-    assert status == 422
-    assert body == {
-        "detail": [
-            {
-                "type": "extra_forbidden",
-                "loc": ["body", "a\ufffdb", 3],
-                "msg": "found `\ufffd` at 1",
-            }
-        ]
-    }
-
-
-async def test_the_handler_keeps_honest_non_ascii_text_unchanged():
-    status, body = await _render(
-        [{"type": "value_error", "loc": ("body", "full_name"), "msg": "Caf\u00e9 \U0001f511"}]
-    )
-    assert body["detail"][0]["msg"] == "Caf\u00e9 \U0001f511"
-
-
-# -- The advertised shape ---------------------------------------------------------------
 
 
 def test_the_openapi_document_advertises_exactly_the_rendered_keys():
@@ -111,12 +44,48 @@ def test_the_openapi_document_advertises_exactly_the_rendered_keys():
 
 async def test_every_rendered_error_has_exactly_the_advertised_keys():
     advertised = set(app.openapi()["components"]["schemas"]["ValidationError"]["properties"])
-    _, body = await _render(
-        [{"type": "missing", "loc": ("body", "x"), "msg": "Field required", "input": {}}]
+    response = await validation_error_handler(
+        None,
+        RequestValidationError(
+            [{"type": "missing", "loc": ("body", "x"), "msg": "Field required", "input": {}}]
+        ),
     )
+    body = json.loads(response.body)
     assert [set(error) for error in body["detail"]] == [advertised]
 
 
-def test_restrict_leaves_a_document_without_the_component_alone():
-    document = {"openapi": "3.1.0", "paths": {}}
-    assert restrict_validation_error_schema(document) == {"openapi": "3.1.0", "paths": {}}
+# -- The shared body check refuses a lone surrogate (issues #1456, #1458, #1459) -------
+#
+# The check answers first, with one `string_unicode` item at `["body"]` whatever field
+# holds the surrogate, where the constrained password field answered at
+# `["body", "password"]` (OPS-VALID-6; IAM-LOGIN-5, IAM-REG-2).
+
+SUR = chr(0xD800)  # built, so no source escape is decoded early
+LOW = chr(0xDFFF)
+_SURROGATE_BODIES = {
+    "value": ({"probe": "v" + SUR}, ["body"]),
+    "key": ({"probe" + LOW: "v"}, ["body"]),
+    "nested": ({"a": [{"b": LOW + "x"}]}, ["body"]),
+    "email": ({"email": "a" + SUR + "@example.com", "password": "pw"}, ["body"]),
+}
+
+
+def _raw(value) -> bytes:
+    return json.dumps(value, ensure_ascii=True).encode("ascii")
+
+
+def test_the_body_check_is_installed():
+    """Last in the list, so innermost: every route reads its body through it."""
+    assert app.user_middleware[-1].cls is RefuseLoneSurrogates
+
+
+@pytest.mark.parametrize(("body", "loc"), _SURROGATE_BODIES.values(), ids=_SURROGATE_BODIES.keys())
+async def test_a_lone_surrogate_anywhere_in_a_login_body_is_refused(body, loc):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/login", content=_raw(body), headers={"content-type": "application/json"}
+        )
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {
+        "detail": [{"type": "string_unicode", "loc": loc, "msg": STRING_UNICODE_MSG}]
+    }

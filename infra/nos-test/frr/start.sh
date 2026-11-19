@@ -28,10 +28,11 @@ set -e
 # BEST-EFFORT, deliberately, unlike the sshd check below: `ip link add ... type
 # vrf` needs the HOST kernel's `vrf` module (and `dummy` for the member), which
 # a container cannot load for itself. A host without them answers "Error:
-# Unknown device type." and this whole block fails; a GitHub Actions runner is
-# the known case. Killing the node there would take every NON-VRF dialect test
-# down with it over a host capability none of them need, so the failure is
-# reported loudly and the node boots anyway. The VRF tests detect the missing
+# Unknown device type." and this whole block fails (a GitHub Actions runner has
+# the modules but does not load them; both workflows run `modprobe vrf dummy`
+# before booting the lab). Killing the node on such a host would take every
+# NON-VRF dialect test down with it over a host capability none of them need, so
+# the failure is reported loudly and the node boots anyway. The VRF tests detect the missing
 # fixture and skip with this same remedy
 # (tests/nos_lab/test_frr_l3_driver_live.py); see docs/NOS_LAB.md.
 setup_vrf_fixture() {

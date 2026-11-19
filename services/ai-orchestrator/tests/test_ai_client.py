@@ -6,6 +6,7 @@ through a _FakeProvider that satisfies the LLMProvider Protocol. SDK-translation
 correctness lives in test_anthropic_provider.py.
 """
 
+import json
 from typing import Any
 
 import pytest
@@ -724,6 +725,55 @@ async def test_suggest_template_identity_returns_parsed_tool_input():
     assert out["model"] == "EX4300"
     assert out["confidence"] == "high"
     assert (usage.input_tokens, usage.output_tokens) == (10, 20)
+
+
+@pytest.mark.asyncio
+async def test_suggest_template_identity_never_sends_a_password_default():
+    """Issue #1464: a password field's default is the shared credential the
+    template's devices inherit; it never reaches the provider. A non-password
+    default and the password field itself (key, label, type) still do."""
+    canary = "Canary-S3cr3t-1464"
+    proposed = {
+        "vendor": "Nokia",
+        "model": "7220 IXR-D2L",
+        "part_number": None,
+        "confidence": "medium",
+        "reasoning": "SR Linux fields.",
+    }
+    provider = _FakeProvider(responses=[_resp([_tool_use("suggest_identity", proposed)])])
+    client = _make_client(provider)
+    sections = [
+        {
+            "name": "Access",
+            "fields": [
+                {"key": "HERD_login", "label": "Login", "type": "string", "default": "admin"},
+                {"key": "HERD_password", "label": "Pass", "type": "password", "default": canary},
+                {"key": "enable", "label": "Enable", "type": "PASSWORD", "default": canary},
+                f"password {canary}",
+            ],
+        },
+        f"secret {canary}",
+        {"name": "Odd", "fields": f"password {canary}"},
+    ]
+    await client.suggest_template_identity(name="SRL leaf", sections=sections)
+
+    sent = repr(provider.calls)
+    assert canary not in sent
+    user_text = provider.calls[0]["messages"][0].content[0].text
+    sections_json = user_text.split("<template_sections>")[1].split("</template_sections>")[0]
+    assert json.loads(sections_json) == [
+        {
+            "name": "Access",
+            "fields": [
+                {"key": "HERD_login", "label": "Login", "type": "string", "default": "admin"},
+                {"key": "HERD_password", "label": "Pass", "type": "password"},
+                {"key": "enable", "label": "Enable", "type": "PASSWORD"},
+            ],
+        },
+        {"name": "Odd", "fields": []},
+    ]
+    # The caller's sections are not changed.
+    assert sections[0]["fields"][1]["default"] == canary
 
 
 @pytest.mark.asyncio

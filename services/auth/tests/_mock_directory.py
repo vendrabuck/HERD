@@ -11,7 +11,13 @@ ldap3 refuses client-side must get the same answer for every username).
 a `MOCK_SYNC` connection over ONE shared entry store, so the service-account
 search and the user bind see the same directory. `connections` records the
 `user` of every connection ldap_service opened, so a test can prove that no
-directory call was made.
+directory call was made, and `binds` the `user` of every `bind()` called on one,
+so a test can prove that no password was tried.
+
+ldap3's `MOCK_SYNC` answers a search with a size limit with at most that many
+entries and success, never sizeLimitExceeded, on a connection without
+`raise_exceptions` (ldap_service never sets it): a directory that truncates
+silently. tests/_fake_directory.py scripts that result code.
 """
 
 from __future__ import annotations
@@ -34,24 +40,41 @@ class MockDirectory:
         seed.strategy.add_entry(BASE_DN, {"objectClass": "organizationalUnit"})
         self._seed = seed
         self.connections: list[str | None] = []
+        self.binds: list[str | None] = []
 
-    def add_user(self, uid: str, password: str) -> str:
+    def add_user(self, uid: str, password: str, **attributes) -> str:
+        """A person under BASE_DN with uid, mail `<uid>@example.com`, and the
+        password; `attributes` replace or add attributes, and a value of None
+        leaves that attribute out. A `bytes` value is stored as those octets, so
+        ldap3 decodes it the way it decodes a directory's answer (a value that is
+        not UTF-8 comes back as `bytes`)."""
         dn = f"uid={uid},{BASE_DN}"
-        self._seed.strategy.add_entry(
-            dn,
-            {
-                "uid": uid,
-                "mail": f"{uid}@example.com",
-                "userPassword": password,
-                "objectClass": "person",
-            },
-        )
+        values = {
+            "uid": uid,
+            "mail": f"{uid}@example.com",
+            "userPassword": password,
+            "objectClass": "person",
+            **attributes,
+        }
+        self.add_entry(dn, {k: v for k, v in values.items() if v is not None})
+        return dn
+
+    def add_entry(self, dn: str, attributes: dict) -> str:
+        """Any entry, such as a group (`member` holding member DNs)."""
+        self._seed.strategy.add_entry(dn, attributes)
         return dn
 
     def connection(self, _server, **kwargs) -> Connection:
         self.connections.append(kwargs.get("user"))
         conn = Connection(self.server, client_strategy=MOCK_SYNC, **kwargs)
         conn.strategy.entries = self._entries
+        bind = conn.bind
+
+        def counted_bind(*args, **bind_kwargs):
+            self.binds.append(kwargs.get("user"))
+            return bind(*args, **bind_kwargs)
+
+        conn.bind = counted_bind
         return conn
 
 

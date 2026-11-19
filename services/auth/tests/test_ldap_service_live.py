@@ -348,6 +348,65 @@ async def test_login_endpoint_unreachable_directory_is_503(monkeypatch, ldap_set
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "template",
+    [
+        "(uid={user})",
+        "(uid={0})",
+        "(uid={username}",
+        "(uid=user4)",
+        "(|(uid={username})(uid=user4))",
+        "(!(uid={username}))",
+    ],
+)
+async def test_login_endpoint_unusable_filter_is_503_for_every_login(
+    monkeypatch, ldap_settings, http_client, template
+):
+    """Issue #1446 against a real directory: an LDAP_USER_FILTER that is not a
+    usable template is the 503 for a known and an unknown login alike: never a
+    500, and, for a filter without {username}, never the sign-in as user4 that
+    such a filter would give any login name holding user4's password."""
+    monkeypatch.setattr(settings, "ldap_user_filter", template, raising=False)
+    answers = [
+        await http_client.post("/login", json={"email": login, "password": USER_PW})
+        for login in ("user4", "does-not-exist")
+    ]
+    assert [(r.status_code, r.json()) for r in answers] == [
+        (503, {"detail": "Directory unavailable, credentials not checked"})
+    ] * 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", [" ", "\t", "\u3000"])
+async def test_login_endpoint_a_blank_name_never_becomes_a_presence_filter(
+    monkeypatch, ldap_settings, http_client, name
+):
+    """The #1446 second review against a real directory: ldap3 strips the value,
+    so a blank name made `(uid=*{username})` the presence filter `(uid=*)`, and
+    the first entry's password signed in as that entry. Refused before any
+    directory call, like an empty password."""
+    monkeypatch.setattr(settings, "ldap_user_filter", "(uid=*{username})", raising=False)
+    resp = await http_client.post("/login", json={"email": name, "password": USER_PW})
+    assert (resp.status_code, resp.json()) == (401, {"detail": "Invalid credentials"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("template", ["({username})", "(&(objectClass=*)({username}))"])
+async def test_login_endpoint_a_login_name_never_supplies_an_assertion(
+    monkeypatch, ldap_settings, http_client, template
+):
+    """The #1446 review's bypass against a real directory: with the login name
+    standing for a whole assertion, `uid=user4` and user4's password signed in.
+    Such a template is refused, so the answer is the 503."""
+    monkeypatch.setattr(settings, "ldap_user_filter", template, raising=False)
+    resp = await http_client.post("/login", json={"email": "uid=user4", "password": USER_PW})
+    assert (resp.status_code, resp.json()) == (
+        503,
+        {"detail": "Directory unavailable, credentials not checked"},
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("password", ["\t", "Pass\x00word1", "Pass\ue000word1"])
 async def test_login_endpoint_answers_known_and_unknown_users_alike_for_a_saslprep_refusal(
     ldap_settings, http_client, password
@@ -1033,3 +1092,205 @@ async def test_interval_loop_produces_a_run_row_against_live_directory(
         assert emails == {f"user{n}@company.local" for n in (1, 2, 3)}
     finally:
         await file_engine.dispose()
+
+
+# -- Issue #1448: a binary attribute value never becomes account data -------------
+#
+# OpenLDAP enforces the mail and uid syntaxes, so a value that is not UTF-8 cannot
+# sit in either; the real case is a setting pointed at a binary attribute. A
+# temporary entry (added and deleted here, so the seeded layout and
+# _ALL_SEEDED_PRESENT_EMAILS stay as they are, and no `make ldap-reset` is needed)
+# carries a jpegPhoto whose octets are not UTF-8, and the tests point
+# LDAP_EMAIL_ATTRIBUTE or LDAP_USERNAME_ATTRIBUTE at it.
+
+BINARY_UID = "binary-tmp-1"
+BINARY_DN = f"uid={BINARY_UID},{PEOPLE_DN}"
+# A JPEG start-of-image and JFIF header: 0xFF is never UTF-8.
+BINARY_VALUE = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+
+
+@pytest.fixture
+def binary_person():
+    conn = _admin_conn()
+    try:
+        _safe_delete(conn, BINARY_DN)
+        conn.add(
+            BINARY_DN,
+            attributes={
+                "objectClass": ["inetOrgPerson"],
+                "uid": BINARY_UID,
+                "cn": "Binary Tmp1",
+                "sn": "Tmp1",
+                "mail": f"{BINARY_UID}@company.local",
+                "userPassword": USER_PW,
+                "jpegPhoto": BINARY_VALUE,
+            },
+        )
+        assert conn.result["result"] == 0, conn.result
+        yield BINARY_DN
+    finally:
+        _safe_delete(conn, BINARY_DN)
+        conn.unbind()
+
+
+@pytest.mark.asyncio
+async def test_bind_user_binary_username_attribute_falls_back_to_login_name(
+    monkeypatch, ldap_settings, binary_person
+):
+    monkeypatch.setattr(settings, "ldap_username_attribute", "jpegPhoto", raising=False)
+    identity = await ldap_service.bind_user(BINARY_UID, USER_PW)
+    assert identity is not None
+    assert (identity.username, identity.email) == (BINARY_UID, f"{BINARY_UID}@company.local")
+
+
+@pytest.mark.asyncio
+async def test_login_endpoint_binary_email_attribute_is_401(
+    monkeypatch, ldap_settings, http_client, binary_person
+):
+    monkeypatch.setattr(settings, "ldap_email_attribute", "jpegPhoto", raising=False)
+    resp = await http_client.post("/login", json={"email": BINARY_UID, "password": USER_PW})
+    assert (resp.status_code, resp.json()) == (401, {"detail": "Invalid credentials"})
+
+
+@pytest.mark.asyncio
+async def test_resolve_member_binary_email_attribute_is_missing_email(
+    monkeypatch, ldap_settings, binary_person
+):
+    monkeypatch.setattr(settings, "ldap_email_attribute", "jpegPhoto", raising=False)
+    resolution = await ldap_service.resolve_member(binary_person)
+    assert resolution == ldap_service.LdapMemberResolution(
+        None, ldap_service.MEMBER_SKIP_MISSING_EMAIL
+    )
+
+
+@pytest.mark.asyncio
+async def test_present_emails_leaves_out_a_binary_value(monkeypatch, ldap_settings, binary_person):
+    """The one entry with a jpegPhoto holds a value that is not text: the
+    enumeration finds the entry and collects nothing from it (before #1448 it
+    collected the text of the bytes repr)."""
+    monkeypatch.setattr(settings, "ldap_email_attribute", "jpegPhoto", raising=False)
+    present = await ldap_service.present_emails()
+    assert present == frozenset()
+    # The entry is listed but its email cannot be read; its uid can, so the
+    # sweep holds back only that account (IAM-SWEEP-10).
+    assert present.unreadable_entries == 1
+    assert present.held_usernames == {BINARY_UID}
+    assert present.unidentified_entries == 0
+
+
+# -- Issue #1447: a name that matches more than one entry is refused --------------
+#
+# Two temporary entries (added and deleted here, like the jpegPhoto entry above,
+# so the seeded layout stays as it is) share the uid `twin-tmp` under different
+# RDNs, each with its own password. The seeded user1 and user10 to user19 give a
+# prefix that matches eleven entries, so the directory's own sizeLimitExceeded
+# answer is met for real.
+
+TWIN_UID = "twin-tmp"
+TWIN_PEOPLE = {
+    f"cn=twin-tmp-a,{PEOPLE_DN}": "Twin-a-Password1",
+    f"cn=twin-tmp-b,{PEOPLE_DN}": "Twin-b-Password1",
+}
+
+
+@pytest.fixture
+def twin_people():
+    conn = _admin_conn()
+    try:
+        for dn, password in TWIN_PEOPLE.items():
+            _safe_delete(conn, dn)
+            rdn = dn.split(",")[0][3:]
+            conn.add(
+                dn,
+                attributes={
+                    "objectClass": ["inetOrgPerson"],
+                    "uid": TWIN_UID,
+                    "cn": rdn,
+                    "sn": rdn,
+                    "mail": f"{rdn}@company.local",
+                    "userPassword": password,
+                },
+            )
+            assert conn.result["result"] == 0, conn.result
+        yield TWIN_PEOPLE
+    finally:
+        for dn in TWIN_PEOPLE:
+            _safe_delete(conn, dn)
+        conn.unbind()
+
+
+@pytest.fixture
+def connection_users(monkeypatch):
+    """The `user` of every connection ldap_service opens, so a test can prove no
+    bind as a directory entry was attempted."""
+    users: list[str | None] = []
+    real = ldap_service.Connection
+
+    def recording(server, **kwargs):
+        users.append(kwargs.get("user"))
+        return real(server, **kwargs)
+
+    monkeypatch.setattr(ldap_service, "Connection", recording)
+    return users
+
+
+def _admin_search(search_filter: str) -> tuple[int, list[str]]:
+    conn = _admin_conn()
+    try:
+        conn.search(PEOPLE_DN, search_filter, attributes=["uid"], size_limit=2)
+        return conn.result["result"], [e.entry_dn for e in conn.entries]
+    finally:
+        conn.unbind()
+
+
+def test_the_directory_answers_both_ambiguous_shapes(ldap_settings, twin_people):
+    """The precondition, asked as the login search asks (at most two entries):
+    the twins are two entries and success; the prefix is two entries and
+    sizeLimitExceeded, since eleven match."""
+    code, dns = _admin_search(f"(uid={TWIN_UID})")
+    assert (code, sorted(dn.lower() for dn in dns)) == (0, sorted(TWIN_PEOPLE))
+    code, dns = _admin_search("(uid=user1*)")
+    assert (code, len(dns)) == (4, 2)
+
+
+@pytest.mark.asyncio
+async def test_login_endpoint_refuses_a_name_two_entries_match(
+    ldap_settings, http_client, twin_people, connection_users, caplog
+):
+    """Each twin's own password, and a wrong one, get exactly the answer an
+    unknown name gets, and nothing is bound as either twin."""
+    unknown = await http_client.post(
+        "/login", json={"email": "does-not-exist", "password": USER_PW}
+    )
+    refusal = (unknown.status_code, unknown.json(), dict(unknown.headers))
+    assert refusal[:2] == (401, {"detail": "Invalid credentials"})
+    for password in (*TWIN_PEOPLE.values(), "wrong-password"):
+        connection_users.clear()
+        caplog.clear()
+        with caplog.at_level("INFO", logger="app.services.ldap_service"):
+            resp = await http_client.post("/login", json={"email": TWIN_UID, "password": password})
+        assert (resp.status_code, resp.json(), dict(resp.headers)) == refusal
+        assert connection_users == [ADMIN_DN]
+        assert [
+            (r.levelname, r.action, r.count)
+            for r in caplog.records
+            if r.name == "app.services.ldap_service"
+        ] == [("ERROR", "ldap_user_ambiguous", 2)]
+        for record in caplog.records:
+            for dn in TWIN_PEOPLE:
+                assert dn not in record.getMessage().lower()
+                assert dn not in str(vars(record)).lower()
+
+
+@pytest.mark.asyncio
+async def test_bind_user_refuses_a_prefix_many_entries_match(
+    monkeypatch, ldap_settings, connection_users
+):
+    """A substring filter (allowed, IAM-LDAP-14): `user1` matches eleven entries,
+    so the directory sends two and sizeLimitExceeded, and the login is refused
+    with user1's own password; `user25` matches one and signs in."""
+    monkeypatch.setattr(settings, "ldap_user_filter", "(uid={username}*)", raising=False)
+    assert await ldap_service.bind_user("user1", USER_PW) is None
+    assert connection_users == [ADMIN_DN]
+    identity = await ldap_service.bind_user("user25", USER_PW)
+    assert identity is not None and identity.username == "user25"

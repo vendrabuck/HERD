@@ -47,6 +47,7 @@ from app.services.llm_provider import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from app.services.tools import mask_replayed_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +191,36 @@ async def load_messages(db: AsyncSession, *, conversation_id: uuid.UUID) -> list
     for row in rows:
         role = "assistant" if row.role == MessageRole.ASSISTANT else "user"
         messages.append(Message(role=role, content=_blocks_from_json(row.content_blocks)))
-    return messages
+    return _mask_replayed_tool_results(messages)
+
+
+def _mask_replayed_tool_results(messages: list[Message]) -> list[Message]:
+    """Mask every stored tool_result block before it is resent (issue #1464,
+    AI-TOOL-13): a conversation stored before the assistant's tools masked
+    configs holds them unmasked. Each result is matched to its tool by the
+    tool_use block of the same id; an unmatched result is masked too. Text
+    blocks are resent as stored (masking prose would cut ordinary chat at any
+    mention of a password). Returns new Message objects; rows are not changed.
+    """
+    tool_names: dict[str, str] = {}
+    for message in messages:
+        for block in message.content:
+            if isinstance(block, ToolUseBlock):
+                tool_names[block.id] = block.name
+    masked_messages: list[Message] = []
+    for message in messages:
+        blocks: list[ContentBlock] = []
+        for block in message.content:
+            if isinstance(block, ToolResultBlock):
+                block = dataclasses.replace(
+                    block,
+                    content=mask_replayed_tool_result(
+                        tool_names.get(block.tool_use_id), block.content
+                    ),
+                )
+            blocks.append(block)
+        masked_messages.append(Message(role=message.role, content=blocks))
+    return masked_messages
 
 
 async def set_seed_with_question(
