@@ -1680,15 +1680,16 @@ settings when the auth service starts.
   taken, the value is never judged and nothing is logged about it. A value that breaks
   a rule creates no account and logs exactly one ERROR, `SUPERADMIN_PASSWORD breaks a
   registration password rule: <rule>. The superadmin account was not created; set a
-  value that registration accepts and recreate auth.`, where `<rule>` is a fixed text
-  that never holds the value: `Password must be at least 8 characters`, `Password must
-  be at most 72 characters`, `Password must not contain a NUL character`, or `Password
-  must be encodable as UTF-8`; the fallback `Password must be one registration accepts`
-  appears only if the password field gains a rule this list does not know. Startup
-  continues, as it does when a value is missing. Recreate, not restart: the container
-  keeps the environment it was created with. \
-  Enforced in: `services/auth/app/main.py` (`_seed_superadmin`, `SEED_VALUE_REFUSED_LOG`); `services/auth/app/schemas/auth.py` (`refused_registration_rule`, `PASSWORD_TOO_SHORT_RULE`, `PASSWORD_TOO_LONG_RULE`, `PASSWORD_OTHER_RULE`) \
-  Pinned by: `services/auth/tests/test_main.py` (`test_the_refusal_log_text_is_pinned`, `test_seed_superadmin_refuses_a_value_registration_refuses`, `test_seed_superadmin_creates_at_every_accepted_bound`, `test_an_existing_superadmin_is_untouched_and_a_refused_value_logs_nothing`, `test_a_taken_email_skips_the_seed_before_the_value_is_judged`, `test_the_seed_judge_is_registration`, `test_registration_has_no_model_level_validator`); `services/auth/tests/test_seed_superadmin_login.py` (`test_a_seeded_value_signs_in_at_local_login`, `test_a_seeded_value_signs_in_at_the_break_glass_login`, `test_the_untrimmed_value_is_not_the_password`)
+  value that registration accepts and recreate auth.`, where `<rule>` is a fixed text,
+  looked up by the code the judge answers, that never holds the value: `Password must
+  be at least 8 characters`, `Password must be at most 72 characters`, `Password must
+  not contain a NUL character`, or `Password must be encodable as UTF-8`; the fallback
+  `Password must be one registration accepts` appears only if the password field gains
+  a rule this list does not know. Startup continues, as it does when a value is
+  missing. Recreate, not restart: the container keeps the environment it was created
+  with. \
+  Enforced in: `services/auth/app/main.py` (`_seed_superadmin`, `SEED_VALUE_REFUSED_LOG`, `SEED_REFUSED_RULE_TEXT`); `services/auth/app/schemas/auth.py` (`registration_refusal_code`, `REGISTRATION_REFUSAL_CODES`) \
+  Pinned by: `services/auth/tests/test_main.py` (`test_the_refusal_log_text_is_pinned`, `test_every_refusal_code_has_its_registration_text`, `test_seed_superadmin_refuses_a_value_registration_refuses`, `test_seed_superadmin_creates_at_every_accepted_bound`, `test_an_existing_superadmin_is_untouched_and_a_refused_value_logs_nothing`, `test_a_taken_email_skips_the_seed_before_the_value_is_judged`, `test_the_seed_judge_is_registration`, `test_registration_has_no_model_level_validator`); `services/auth/tests/test_seed_superadmin_login.py` (`test_a_seeded_value_signs_in_at_local_login`, `test_a_seeded_value_signs_in_at_the_break_glass_login`, `test_the_untrimmed_value_is_not_the_password`)
 - **IAM-BOOT-4.** At startup the "Not Grouped" group is created when no group of that
   name exists, tolerating a concurrent creator. \
   Enforced in: `services/auth/app/main.py` (`_seed_not_grouped`) \

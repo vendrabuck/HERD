@@ -11,7 +11,11 @@ from app.models.user import Role
 from app.schemas import auth as schemas
 from app.services.auth_service import create_user, get_user_by_email, superadmin_exists
 from app.services.group_service import get_group_by_name
-from app.services.passwords import verify_password
+from app.services.passwords import (
+    PASSWORD_NOT_UTF8_MESSAGE,
+    PASSWORD_NUL_MESSAGE,
+    verify_password,
+)
 from herd_common.logging import JSONFormatter
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -194,8 +198,29 @@ def test_the_refusal_log_text_is_pinned():
         "The superadmin account was not created; set a value that registration "
         "accepts and recreate auth."
     )
-    assert schemas.PASSWORD_TOO_SHORT_RULE == "Password must be at least 8 characters"
-    assert schemas.PASSWORD_TOO_LONG_RULE == "Password must be at most 72 characters"
+
+
+def test_every_refusal_code_has_its_registration_text():
+    """The log texts are plain literals (CodeQL, issue #1450), so they are pinned
+    here to what they restate: the registration bounds, validate_password's own
+    messages, and one text for every code the judge can answer, no more."""
+    from app.main import SEED_REFUSED_RULE_TEXT
+
+    assert set(SEED_REFUSED_RULE_TEXT) == set(schemas.REGISTRATION_REFUSAL_CODES)
+    assert len(schemas.REGISTRATION_REFUSAL_CODES) == len(set(schemas.REGISTRATION_REFUSAL_CODES))
+    assert SEED_REFUSED_RULE_TEXT["too_short"] == (
+        f"Password must be at least {schemas.PASSWORD_MIN_LENGTH} characters"
+    )
+    assert SEED_REFUSED_RULE_TEXT["too_long"] == (
+        f"Password must be at most {schemas.PASSWORD_MAX_LENGTH} characters"
+    )
+    assert SEED_REFUSED_RULE_TEXT["nul"] == PASSWORD_NUL_MESSAGE
+    assert SEED_REFUSED_RULE_TEXT["not_utf8"] == PASSWORD_NOT_UTF8_MESSAGE
+    assert SEED_REFUSED_RULE_TEXT["other"] == "Password must be one registration accepts"
+    field = schemas.RegisterRequest.model_fields["password"]
+    bounds = {type(m).__name__: m for m in field.metadata}
+    assert bounds["MinLen"].min_length == schemas.PASSWORD_MIN_LENGTH
+    assert bounds["MaxLen"].max_length == schemas.PASSWORD_MAX_LENGTH
 
 
 @pytest.mark.asyncio
@@ -312,7 +337,7 @@ async def test_a_taken_email_skips_the_seed_before_the_value_is_judged(caplog):
 
 
 def test_registration_has_no_model_level_validator():
-    """refused_registration_rule runs RegisterRequest's validator on the
+    """registration_refusal_code runs RegisterRequest's validator on the
     password field of an empty instance, so a model-level validator would not
     run (a `before` one) or would fail on the missing fields (an `after` one).
     Adding one to RegisterRequest means the seed judge must be revisited
@@ -344,19 +369,17 @@ def _register_takes(value: str) -> bool:
 
 
 def test_the_seed_judge_is_registration():
-    """refused_registration_rule refuses exactly what RegisterRequest refuses,
+    """registration_refusal_code refuses exactly what RegisterRequest refuses,
     across the space around both bounds (issue #1450: one judge, not a copy),
-    and always answers with one of the fixed rule texts."""
-    fixed = {
-        schemas.PASSWORD_TOO_SHORT_RULE,
-        schemas.PASSWORD_TOO_LONG_RULE,
-        "Password must not contain a NUL character",
-        "Password must be encodable as UTF-8",
-    }
+    and always answers with one of REGISTRATION_REFUSAL_CODES; every code but
+    the "other" fallback is reached."""
+    seen = set()
     for value in _judge_space():
-        refusal = schemas.refused_registration_rule(value)
-        assert (refusal is None) == _register_takes(value), repr(value)
-        assert refusal is None or refusal in fixed, (repr(value), refusal)
+        code = schemas.registration_refusal_code(value)
+        assert (code is None) == _register_takes(value), repr(value)
+        assert code is None or code in schemas.REGISTRATION_REFUSAL_CODES, (repr(value), code)
+        seen.add(code)
+    assert seen == {None, *schemas.REGISTRATION_REFUSAL_CODES} - {"other"}
 
 
 # --- _seed_not_grouped ---

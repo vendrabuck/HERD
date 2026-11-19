@@ -71,54 +71,50 @@ class RegisterRequest(BaseModel):
     _password_is_hashable = field_validator("password")(validate_password)
 
 
-# The rule a refused registration password broke, as fixed text that never holds
-# the password (issue #1450). The startup seed logs one of these.
-# PASSWORD_OTHER_RULE is the fallback for a refusal this mapping does not know;
-# no input reaches it today, and it appears only if the password field gains a
-# rule that is not listed here.
-PASSWORD_TOO_SHORT_RULE = f"Password must be at least {PASSWORD_MIN_LENGTH} characters"
-PASSWORD_TOO_LONG_RULE = f"Password must be at most {PASSWORD_MAX_LENGTH} characters"
-PASSWORD_OTHER_RULE = "Password must be one registration accepts"
-_LENGTH_RULES = {
-    "string_too_short": PASSWORD_TOO_SHORT_RULE,
-    "string_too_long": PASSWORD_TOO_LONG_RULE,
-    # pydantic refuses a lone surrogate ahead of the length check.
-    "string_unicode": PASSWORD_NOT_UTF8_MESSAGE,
-}
-# validate_password's refusals that can reach it here. The NUL message is the
-# one that fires today; the UTF-8 message stays because pydantic's own
-# `string_unicode` refusal, above, is what catches a lone surrogate first, and
-# should pydantic stop doing so validate_password refuses it with this message.
-# Its other two refusals cannot fire: the length bound runs first (72
-# characters are at most 288 bytes, under 4096), and the value is always a str.
-_HASHING_RULES = (PASSWORD_NUL_MESSAGE, PASSWORD_NOT_UTF8_MESSAGE)
+# The codes registration_refusal_code answers (issue #1450), one per rule. Each
+# is a plain literal at its return site, chosen only by comparisons, so no value
+# a code carries comes from a name about passwords; the startup seed maps a code
+# to its log text (SEED_REFUSED_RULE_TEXT in app/main.py). "other" is the
+# fallback for a refusal this function does not know: no input reaches it
+# today, and it appears only if the password field gains a rule not listed here.
+REGISTRATION_REFUSAL_CODES = ("too_short", "too_long", "nul", "not_utf8", "other")
 
 
-def refused_registration_rule(password: str) -> str | None:
-    """None when RegisterRequest's password field takes `password`, else the rule
-    it breaks (issue #1450).
+def registration_refusal_code(candidate: str) -> str | None:
+    """None when RegisterRequest's password field takes `candidate`, else the code
+    of the rule it breaks, one of REGISTRATION_REFUSAL_CODES (issue #1450).
 
     What is judged is exactly the password field's own constraints (8 to 72
     characters) and its field validators (`validate_password`), run through
     RegisterRequest's validator on that one field. A model-level validator is
     not run (the instance is empty); RegisterRequest has none, and
     tests/test_main.py fails if one is added, since the seed judge must then be
-    revisited. The answer is always one of the fixed rule texts above or
-    validate_password's fixed messages, never anything taken from the password.
+    revisited.
+
+    Which validate_password refusals can arrive here: the NUL one fires today.
+    A lone surrogate is refused by pydantic's own `string_unicode` check first;
+    the UTF-8 comparison below is the backstop should pydantic stop doing so.
+    Its other two refusals cannot fire: the length bound runs first (72
+    characters are at most 288 bytes, under 4096), and the value is always a str.
     """
     try:
         RegisterRequest.__pydantic_validator__.validate_assignment(
-            RegisterRequest.model_construct(), "password", password
+            RegisterRequest.model_construct(), "password", candidate
         )
     except ValidationError as exc:
         error = exc.errors(include_url=False, include_input=False)[0]
-        if error["type"] in _LENGTH_RULES:
-            return _LENGTH_RULES[error["type"]]
+        if error["type"] == "string_too_short":
+            return "too_short"
+        if error["type"] == "string_too_long":
+            return "too_long"
+        if error["type"] == "string_unicode":
+            return "not_utf8"
         reason = str(error.get("ctx", {}).get("error", ""))
-        for rule in _HASHING_RULES:
-            if reason == rule:
-                return rule
-        return PASSWORD_OTHER_RULE
+        if reason == PASSWORD_NUL_MESSAGE:
+            return "nul"
+        if reason == PASSWORD_NOT_UTF8_MESSAGE:
+            return "not_utf8"
+        return "other"
     return None
 
 

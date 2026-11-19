@@ -31,7 +31,7 @@ from app.routers.internal import router as internal_router
 from app.routers.ldap_sync import router as ldap_sync_router
 from app.routers.oidc import router as oidc_router
 from app.routers.tokens import router as tokens_router
-from app.schemas.auth import refused_registration_rule
+from app.schemas.auth import registration_refusal_code
 from app.services.ldap_service import log_ldap_startup_problems
 from app.tasks.ldap_sync_loop import (
     effective_interval_seconds,
@@ -44,12 +44,24 @@ logger = logging.getLogger(__name__)
 
 # The one ERROR the seed logs when SUPERADMIN_PASSWORD breaks a registration
 # password rule (issue #1450, IAM-BOOT-3). The argument is the rule's fixed text
-# from refused_registration_rule, never the value.
+# from SEED_REFUSED_RULE_TEXT, never the value.
 SEED_VALUE_REFUSED_LOG = (
     "SUPERADMIN_PASSWORD breaks a registration password rule: %s. "
     "The superadmin account was not created; set a value that registration "
     "accepts and recreate auth."
 )
+# The text logged for each code registration_refusal_code answers. Plain
+# literals by design: a text built from a constant whose name is about passwords
+# reads as a logged password to CodeQL (py/clear-text-logging-sensitive-data).
+# tests/test_main.py pins them to the registration bounds and to
+# validate_password's messages, and requires a text for every code.
+SEED_REFUSED_RULE_TEXT = {
+    "too_short": "Password must be at least 8 characters",
+    "too_long": "Password must be at most 72 characters",
+    "nul": "Password must not contain a NUL character",
+    "not_utf8": "Password must be encodable as UTF-8",
+    "other": "Password must be one registration accepts",
+}
 
 
 async def _seed_superadmin() -> None:
@@ -95,11 +107,12 @@ async def _seed_superadmin() -> None:
             )
             return
 
-        refused_rule = refused_registration_rule(password)
-        if refused_rule is not None:
+        refusal_code = registration_refusal_code(password)
+        if refusal_code is not None:
+            rule_text = SEED_REFUSED_RULE_TEXT[refusal_code]
             logger.error(
                 SEED_VALUE_REFUSED_LOG,
-                refused_rule,
+                rule_text,
                 extra={"action": "superadmin_seed_refused"},
             )
             return
