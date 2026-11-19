@@ -1665,25 +1665,30 @@ settings when the auth service starts.
   created and a warning is logged. \
   Enforced in: `services/auth/app/main.py` (`_seed_superadmin`) \
   Pinned by: `services/auth/tests/test_main.py` (`test_seed_superadmin_skips_when_email_already_registered`)
-- **IAM-BOOT-3.** The three values are trimmed of surrounding whitespace before use,
-  the password included, so the account's password is the trimmed value and the
-  untrimmed one is a wrong password at login. The trimmed password is held to the
-  registration password rules (issue #1450), judged by `RegisterRequest`'s own
-  validator for its password field (IAM-REG-2): 8 to 72 characters, counted as
-  characters and not UTF-8 bytes, and one hashing accepts (no NUL character, encodable
-  as UTF-8, IAM-HASH-3). So every value the seed accepts is a password `POST /login`
-  takes in local mode and at the break-glass login (IAM-LOGIN-6). The check runs only
-  when an account would be created, after the existence checks of IAM-BOOT-1 and
-  IAM-BOOT-2: with a superadmin present, or the email taken, the value is never judged
-  and nothing is logged about it. A value that breaks a rule creates no account and
-  logs exactly one ERROR, `SUPERADMIN_PASSWORD breaks a registration password rule:
-  <rule>. The superadmin account was not created; set a value that registration
-  accepts and restart auth.`, where `<rule>` is one fixed text (`Password must be at
-  least 8 characters`, `Password must be at most 72 characters`, `Password must not
-  contain a NUL character`, or `Password must be encodable as UTF-8`) and never holds
-  the value; startup continues, as it does when a value is missing. \
-  Enforced in: `services/auth/app/main.py` (`_seed_superadmin`, `SEED_VALUE_REFUSED_LOG`); `services/auth/app/schemas/auth.py` (`refused_registration_rule`, `PASSWORD_TOO_SHORT_RULE`, `PASSWORD_TOO_LONG_RULE`) \
-  Pinned by: `services/auth/tests/test_main.py` (`test_the_refusal_log_text_is_pinned`, `test_seed_superadmin_refuses_a_value_registration_refuses`, `test_seed_superadmin_creates_at_every_accepted_bound`, `test_an_existing_superadmin_is_untouched_and_a_refused_value_logs_nothing`, `test_the_seed_judge_is_registration`); `services/auth/tests/test_seed_superadmin_login.py` (`test_a_seeded_value_signs_in_at_local_login`, `test_a_seeded_value_signs_in_at_the_break_glass_login`, `test_the_untrimmed_value_is_not_the_password`)
+- **IAM-BOOT-3.** The three values are trimmed of leading and trailing white space as
+  Python's `str.strip()` defines it, the password included, so the account's password
+  is the trimmed value and the untrimmed one is a wrong password at login. The trimmed
+  password is held to the registration password rules (issue #1450): it is judged by
+  the constraints and field validators of `RegisterRequest`'s password field
+  (IAM-REG-2), run through that model's validator on that one field, so 8 to 72
+  characters, counted as characters and not UTF-8 bytes, and one hashing accepts (no
+  NUL character, encodable as UTF-8, IAM-HASH-3). A model-level validator would not be
+  run; `RegisterRequest` has none, and a test fails if one is added. So every value the
+  seed accepts is a password `POST /login` takes in local mode and at the break-glass
+  login (IAM-LOGIN-6). The check runs only when an account would be created, after the
+  existence checks of IAM-BOOT-1 and IAM-BOOT-2: with a superadmin present, or the email
+  taken, the value is never judged and nothing is logged about it. A value that breaks
+  a rule creates no account and logs exactly one ERROR, `SUPERADMIN_PASSWORD breaks a
+  registration password rule: <rule>. The superadmin account was not created; set a
+  value that registration accepts and recreate auth.`, where `<rule>` is a fixed text
+  that never holds the value: `Password must be at least 8 characters`, `Password must
+  be at most 72 characters`, `Password must not contain a NUL character`, or `Password
+  must be encodable as UTF-8`; the fallback `Password must be one registration accepts`
+  appears only if the password field gains a rule this list does not know. Startup
+  continues, as it does when a value is missing. Recreate, not restart: the container
+  keeps the environment it was created with. \
+  Enforced in: `services/auth/app/main.py` (`_seed_superadmin`, `SEED_VALUE_REFUSED_LOG`); `services/auth/app/schemas/auth.py` (`refused_registration_rule`, `PASSWORD_TOO_SHORT_RULE`, `PASSWORD_TOO_LONG_RULE`, `PASSWORD_OTHER_RULE`) \
+  Pinned by: `services/auth/tests/test_main.py` (`test_the_refusal_log_text_is_pinned`, `test_seed_superadmin_refuses_a_value_registration_refuses`, `test_seed_superadmin_creates_at_every_accepted_bound`, `test_an_existing_superadmin_is_untouched_and_a_refused_value_logs_nothing`, `test_a_taken_email_skips_the_seed_before_the_value_is_judged`, `test_the_seed_judge_is_registration`, `test_registration_has_no_model_level_validator`); `services/auth/tests/test_seed_superadmin_login.py` (`test_a_seeded_value_signs_in_at_local_login`, `test_a_seeded_value_signs_in_at_the_break_glass_login`, `test_the_untrimmed_value_is_not_the_password`)
 - **IAM-BOOT-4.** At startup the "Not Grouped" group is created when no group of that
   name exists, tolerating a concurrent creator. \
   Enforced in: `services/auth/app/main.py` (`_seed_not_grouped`) \

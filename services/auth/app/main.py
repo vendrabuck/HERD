@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 SEED_VALUE_REFUSED_LOG = (
     "SUPERADMIN_PASSWORD breaks a registration password rule: %s. "
     "The superadmin account was not created; set a value that registration "
-    "accepts and restart auth."
+    "accepts and recreate auth."
 )
 
 

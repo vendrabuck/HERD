@@ -149,7 +149,10 @@ requires direct database access, which is intentional.
 ## Setup: Creating the Superadmin
 
 Set the following three environment variables before starting the stack for the
-first time. All three must be non-empty for the account to be created.
+first time. All three must be non-empty for the account to be created, and
+the password must pass the registration password rules (8 to 72 characters, no
+NUL character); a value that breaks one creates no account, and auth logs one
+ERROR naming the rule.
 
 ```
 SUPERADMIN_EMAIL=superadmin@example.com

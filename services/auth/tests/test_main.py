@@ -12,6 +12,7 @@ from app.schemas import auth as schemas
 from app.services.auth_service import create_user, get_user_by_email, superadmin_exists
 from app.services.group_service import get_group_by_name
 from app.services.passwords import verify_password
+from herd_common.logging import JSONFormatter
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -173,13 +174,25 @@ def _fragments(value: str, size: int = 4) -> set[str]:
     return {value[i : i + size] for i in range(len(value) - size + 1)}
 
 
+def _record_texts(record: logging.LogRecord) -> list[str]:
+    """Everything a captured record could carry to an operator: its message,
+    the line the service's real JSON formatter renders (which prints every
+    `extra`, nested values included), and repr of the whole record, which keeps
+    non-ASCII characters the JSON form escapes."""
+    return [
+        record.getMessage(),
+        JSONFormatter("auth").format(record),
+        repr(record.__dict__),
+    ]
+
+
 def test_the_refusal_log_text_is_pinned():
     from app.main import SEED_VALUE_REFUSED_LOG
 
     assert SEED_VALUE_REFUSED_LOG == (
         "SUPERADMIN_PASSWORD breaks a registration password rule: %s. "
         "The superadmin account was not created; set a value that registration "
-        "accepts and restart auth."
+        "accepts and recreate auth."
     )
     assert schemas.PASSWORD_TOO_SHORT_RULE == "Password must be at least 8 characters"
     assert schemas.PASSWORD_TOO_LONG_RULE == "Password must be at most 72 characters"
@@ -229,9 +242,9 @@ async def test_seed_superadmin_refuses_a_value_registration_refuses(value, rule,
     assert errors[0].getMessage() == SEED_VALUE_REFUSED_LOG % rule
     assert errors[0].args == (rule,)
     for record in caplog.records:
-        text = record.getMessage()
-        assert value.strip() not in text
-        assert not [f for f in _fragments(value) if f in text], text
+        for text in _record_texts(record):
+            assert value.strip() not in text
+            assert not [f for f in _fragments(value) if f in text], text
 
 
 @pytest.mark.asyncio
@@ -270,7 +283,41 @@ async def test_an_existing_superadmin_is_untouched_and_a_refused_value_logs_noth
         assert user.hashed_password == original_hash
         assert user.role == Role.SUPERADMIN
         assert await get_user_by_email(db, "other@test.com") is None
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not [r for r in caplog.records if r.name == "app.main" and r.levelno >= logging.WARNING]
+
+
+@pytest.mark.asyncio
+async def test_a_taken_email_skips_the_seed_before_the_value_is_judged(caplog):
+    """IAM-BOOT-2 and IAM-BOOT-3: with no superadmin and the email held by a
+    regular user, the seed stops at the email check: the WARNING is logged and
+    a value the rules refuse is never judged, so no ERROR."""
+    async with TestSessionLocal() as db:
+        await create_user(db, "taken@test.com", "takenuser", "zq" * 4, Role.USER)
+
+    with caplog.at_level(logging.DEBUG):
+        await _run_seed("zq" * 40, email="taken@test.com")
+
+    async with TestSessionLocal() as db:
+        assert await superadmin_exists(db) is False
+    seed_records = [
+        r for r in caplog.records if r.name == "app.main" and r.levelno >= logging.WARNING
+    ]
+    assert [(r.levelno, r.getMessage()) for r in seed_records] == [
+        (
+            logging.WARNING,
+            "SUPERADMIN_EMAIL 'taken@test.com' is already registered as a regular user. "
+            "Superadmin was not created.",
+        )
+    ]
+
+
+def test_registration_has_no_model_level_validator():
+    """refused_registration_rule runs RegisterRequest's validator on the
+    password field of an empty instance, so a model-level validator would not
+    run (a `before` one) or would fail on the missing fields (an `after` one).
+    Adding one to RegisterRequest means the seed judge must be revisited
+    (issue #1450)."""
+    assert not schemas.RegisterRequest.__pydantic_decorators__.model_validators
 
 
 def _judge_space() -> list[str]:

@@ -17,10 +17,8 @@ from app.config import AuthMethod, settings
 from app.models.user import Role
 from app.schemas.pagination import Paginated
 from app.services.passwords import (
-    PASSWORD_NOT_A_STRING_MESSAGE,
     PASSWORD_NOT_UTF8_MESSAGE,
     PASSWORD_NUL_MESSAGE,
-    PASSWORD_TOO_LONG_MESSAGE,
     validate_password,
 )
 
@@ -75,6 +73,9 @@ class RegisterRequest(BaseModel):
 
 # The rule a refused registration password broke, as fixed text that never holds
 # the password (issue #1450). The startup seed logs one of these.
+# PASSWORD_OTHER_RULE is the fallback for a refusal this mapping does not know;
+# no input reaches it today, and it appears only if the password field gains a
+# rule that is not listed here.
 PASSWORD_TOO_SHORT_RULE = f"Password must be at least {PASSWORD_MIN_LENGTH} characters"
 PASSWORD_TOO_LONG_RULE = f"Password must be at most {PASSWORD_MAX_LENGTH} characters"
 PASSWORD_OTHER_RULE = "Password must be one registration accepts"
@@ -84,22 +85,26 @@ _LENGTH_RULES = {
     # pydantic refuses a lone surrogate ahead of the length check.
     "string_unicode": PASSWORD_NOT_UTF8_MESSAGE,
 }
-_HASHING_RULES = (
-    PASSWORD_NUL_MESSAGE,
-    PASSWORD_NOT_UTF8_MESSAGE,
-    PASSWORD_TOO_LONG_MESSAGE,
-    PASSWORD_NOT_A_STRING_MESSAGE,
-)
+# validate_password's refusals that can reach it here. The NUL message is the
+# one that fires today; the UTF-8 message stays because pydantic's own
+# `string_unicode` refusal, above, is what catches a lone surrogate first, and
+# should pydantic stop doing so validate_password refuses it with this message.
+# Its other two refusals cannot fire: the length bound runs first (72
+# characters are at most 288 bytes, under 4096), and the value is always a str.
+_HASHING_RULES = (PASSWORD_NUL_MESSAGE, PASSWORD_NOT_UTF8_MESSAGE)
 
 
 def refused_registration_rule(password: str) -> str | None:
-    """None when `POST /register` would take `password`, else the rule it breaks.
+    """None when RegisterRequest's password field takes `password`, else the rule
+    it breaks (issue #1450).
 
-    The judge is RegisterRequest's own validator for its password field (the
-    length bounds and `validate_password`), run on that one field, so this can
-    never be stricter or looser than registration (issue #1450). The answer is
-    always one of the fixed rule texts above or validate_password's fixed
-    messages, never anything taken from the password.
+    What is judged is exactly the password field's own constraints (8 to 72
+    characters) and its field validators (`validate_password`), run through
+    RegisterRequest's validator on that one field. A model-level validator is
+    not run (the instance is empty); RegisterRequest has none, and
+    tests/test_main.py fails if one is added, since the seed judge must then be
+    revisited. The answer is always one of the fixed rule texts above or
+    validate_password's fixed messages, never anything taken from the password.
     """
     try:
         RegisterRequest.__pydantic_validator__.validate_assignment(
