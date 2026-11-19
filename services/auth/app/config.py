@@ -156,6 +156,19 @@ class Settings(HerdBaseSettings):
     # (auth_service._authenticate_oidc_mode).
     oidc_break_glass_local_superadmin: bool = False
 
+    # Per-source limit on password attempts, POST /login in every mode and an
+    # unauthenticated POST /register (app/services/login_limits.py,
+    # IAM-LOGIN-7): each source address may make this many attempts at once,
+    # and the allowance refills evenly over the window. A value below 1 falls
+    # back to its default with a warning.
+    auth_login_max_attempts: int = 60
+    auth_login_window_seconds: int = 60
+    # Worker threads for bcrypt (app/services/passwords.py, IAM-HASH-7); 0
+    # means half the CPUs auth may use (its affinity mask, lowered to a cgroup
+    # CPU quota), at least 1 and at most 4. A value above those CPUs is lowered
+    # to them with a warning.
+    auth_password_hash_threads: int = 0
+
     log_level: str = "INFO"
 
 

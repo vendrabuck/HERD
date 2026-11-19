@@ -1,6 +1,6 @@
 """Locust load test definitions for HERD.
 
-Eight user classes simulating different usage patterns, selected by default:
+Nine user classes, selected by default:
 - ReservationUser: creates, lists, queries calendar, releases reservations
 - InventoryBrowser: browses devices, templates, and the topologies list
 - BulkExporter: exports devices, templates, and topologies; dry-runs a device import
@@ -15,7 +15,18 @@ Eight user classes simulating different usage patterns, selected by default:
 - DeviceConfigUser: writes and reads config versions, the driver config schema,
   and the apply-job list on one device of its own, deleted at the end
 
-A ninth, OidcLoginUser (ADR 0016 phase 5b), signs in through the OIDC test
+- LoginLimitProbe: exactly one user that, once every other user has signed in,
+  sends wrong-password logins from this host until auth's per-source attempt
+  limit (IAM-LOGIN-7) answers 429, and fails the run on any other answer
+
+Every user signs in once, at start, and every one does so from this host, which
+auth sees as one source address with one attempt allowance (60 at once by
+default, refilling one a second). `_login` therefore treats a 429 as the limit
+working, not as a failure: it records it under its own name, waits the
+`Retry-After`, and tries again, so the login figures under `/api/auth/login`
+stay those of real password checks.
+
+A tenth, OidcLoginUser (ADR 0016 phase 5b), signs in through the OIDC test
 provider; it is abstract unless HERD_LOAD_OIDC=1 and runs only in the
 Makefile's _gate-oidc-stack-tests phase, against a stack in OIDC mode (see its
 section at the end of this file).
@@ -33,12 +44,14 @@ the preferences read/write proxy that the /settings channel toggles drive.
 import logging
 import os
 import random
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import gevent
 import urllib3
-from locust import HttpUser, between, events, task
+from locust import HttpUser, between, constant, events, task
 from locust.clients import HttpSession
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -79,24 +92,57 @@ USER_EMAIL = os.getenv("SEED_USER_EMAIL", "user1@herd.dev")
 USER_PASSWORD = os.getenv("SEED_USER_PASSWORD", "user1user1xx")
 
 
+# A login auth refused for the per-source attempt limit (IAM-LOGIN-7) is
+# recorded under this name, apart from the logins it judged.
+LOGIN_LIMITED_NAME = "/api/auth/login [429 attempt limit]"
+LOGIN_ATTEMPTS = 20
+LOGIN_RETRY_AFTER_CAP_SECONDS = 30
+
+
+def _retry_after_seconds(resp) -> int | None:
+    """The whole seconds a 429's Retry-After states, or None when it states none."""
+    raw = (resp.headers.get("Retry-After") or "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else None
+
+
+def _login_limited(resp) -> int | None:
+    """For a 429 with a whole-second Retry-After: record it under
+    LOGIN_LIMITED_NAME as a success (the limit doing its job) and return the
+    wait. Anything else: None, and the response is judged as usual."""
+    if resp.status_code != 429:
+        return None
+    wait = _retry_after_seconds(resp)
+    if wait is None:
+        resp.failure("429 without a whole-second Retry-After")
+        return None
+    resp.request_meta["name"] = LOGIN_LIMITED_NAME
+    resp.success()
+    return wait
+
+
 class HerdUser(HttpUser):
     """Base class with login-on-start and TLS bypass."""
 
     abstract = True
 
     def _login(self, email: str, password: str) -> None:
-        resp = self.client.post(
-            "/api/auth/login",
-            json={"email": email, "password": password},
-            verify=False,
-        )
-        if resp.status_code == 200:
-            tokens = resp.json()
-            self.access_token = tokens["access_token"]
-            self.headers = {"Authorization": f"Bearer {self.access_token}"}
-        else:
-            self.access_token = None
-            self.headers = {}
+        self.access_token = None
+        self.headers = {}
+        for _ in range(LOGIN_ATTEMPTS):
+            with self.client.post(
+                "/api/auth/login",
+                json={"email": email, "password": password},
+                verify=False,
+                catch_response=True,
+            ) as resp:
+                wait = _login_limited(resp)
+                if wait is None:
+                    if resp.status_code == 200:
+                        tokens = resp.json()
+                        self.access_token = tokens["access_token"]
+                        self.headers = {"Authorization": f"Bearer {self.access_token}"}
+                    return
+            gevent.sleep(min(wait, LOGIN_RETRY_AFTER_CAP_SECONDS))
 
     def _auth_get(self, path: str, **kwargs):
         return self.client.get(path, headers=self.headers, verify=False, **kwargs)
@@ -798,6 +844,56 @@ class DeviceConfigUser(HerdUser):
             f"/api/inventory/devices/{self._device_id}/apply-jobs",
             name="/api/inventory/devices/[id]/apply-jobs",
         )
+
+
+class LoginLimitProbe(HerdUser):
+    """One user that floods wrong-password logins from this host (IAM-LOGIN-7).
+
+    It waits LOGIN_PROBE_DELAY_SECONDS first, so every other user (spawned at
+    `make test-load`'s 5 a second) has signed in, then sends logins for an
+    unknown account until auth answers 429, and keeps going for
+    LOGIN_PROBE_LIMITED_SECONDS. Every answer must be the 401 a judged attempt
+    gets or a 429 with a whole-second Retry-After; anything else, a 5xx or a 503
+    from the hashing pool included, is a failure, and locust then exits 1.
+
+    What it shows: a single source flooding the login is cut to its allowance
+    with refusals that cost auth nothing, and the other users' requests, in the
+    same report, carry on beside it. After it stops, the host's allowance
+    refills over the rest of the run (a minute with the defaults), so a test
+    suite started right after `make test-load` may still meet a 429 for a short
+    while.
+    """
+
+    fixed_count = 1
+    wait_time = constant(0.05)
+
+    LOGIN_PROBE_DELAY_SECONDS = 15
+    LOGIN_PROBE_LIMITED_SECONDS = 5
+
+    def on_start(self):
+        gevent.sleep(self.LOGIN_PROBE_DELAY_SECONDS)
+        self._limited_since = None
+        self._done = False
+
+    @task
+    def flood(self):
+        if self._done:
+            return
+        with self.client.post(
+            "/api/auth/login",
+            json={"email": f"load-probe-{uuid.uuid4().hex[:12]}@herd.dev", "password": "wrong"},
+            verify=False,
+            catch_response=True,
+        ) as resp:
+            if _login_limited(resp) is not None:
+                if self._limited_since is None:
+                    self._limited_since = time.monotonic()
+                elif time.monotonic() - self._limited_since > self.LOGIN_PROBE_LIMITED_SECONDS:
+                    self._done = True
+            elif resp.status_code == 401:
+                resp.success()
+            else:
+                resp.failure(f"HTTP {resp.status_code}, expected 401 or 429")
 
 
 # --- Single sign-on (ADR 0016 phase 5b, D12 level 4) ---------------------------

@@ -15,9 +15,17 @@ from app.models.user import Role, User
 from app.services.auth_service import create_user
 from app.services.group_service import add_member, create_group
 from fastapi import HTTPException
+from starlette.requests import Request
 
 from tests._harness import TestSessionLocal
 from tests._harness import mock_user as _mock_user
+
+
+def _request() -> Request:
+    """A bare unauthenticated request, for the route functions that read the
+    source address (IAM-LOGIN-7)."""
+    return Request({"type": "http", "headers": [], "client": ("127.0.0.1", 1)})
+
 
 # --- auth router: register ---
 
@@ -29,7 +37,7 @@ async def test_register_endpoint_success():
 
     async with TestSessionLocal() as db:
         body = RegisterRequest(email="new@test.com", username="newuser", password="password123")
-        result = await register(body, db)
+        result = await register(_request(), body, db)
         assert result.email == "new@test.com"
         assert result.username == "newuser"
         assert result.role == Role.USER
@@ -50,7 +58,7 @@ async def test_register_endpoint_duplicate_email():
         await create_user(db, "dup@test.com", "first", "password123")
         body = RegisterRequest(email="dup@test.com", username="second", password="password123")
         with pytest.raises(HTTPException) as exc:
-            await register(body, db)
+            await register(_request(), body, db)
         assert exc.value.status_code == 409
         assert exc.value.detail == _GENERIC_CONFLICT
 
@@ -64,7 +72,7 @@ async def test_register_endpoint_duplicate_username():
         await create_user(db, "first@test.com", "sameuser", "password123")
         body = RegisterRequest(email="second@test.com", username="sameuser", password="password123")
         with pytest.raises(HTTPException) as exc:
-            await register(body, db)
+            await register(_request(), body, db)
         assert exc.value.status_code == 409
         # Same message as the email collision: the response must not reveal which
         # field collided.
@@ -88,7 +96,7 @@ async def test_register_endpoint_integrity_error_fallback():
 
         with patch("app.routers.auth.create_user", side_effect=mock_create_user):
             with pytest.raises(HTTPException) as exc:
-                await register(body, db)
+                await register(_request(), body, db)
             assert exc.value.status_code == 409
 
 
@@ -103,7 +111,7 @@ async def test_login_endpoint_success():
     async with TestSessionLocal() as db:
         await create_user(db, "login@test.com", "loginuser", "password123")
         body = LoginRequest(email="login@test.com", password="password123")
-        result = await login(body, db)
+        result = await login(_request(), body, db)
         assert hasattr(result, "access_token")
         assert hasattr(result, "refresh_token")
 
@@ -117,7 +125,7 @@ async def test_login_endpoint_wrong_password():
         await create_user(db, "login@test.com", "loginuser", "password123")
         body = LoginRequest(email="login@test.com", password="wrongpassword")
         with pytest.raises(HTTPException) as exc:
-            await login(body, db)
+            await login(_request(), body, db)
         assert exc.value.status_code == 401
 
 
@@ -129,7 +137,7 @@ async def test_login_endpoint_nonexistent_email():
     async with TestSessionLocal() as db:
         body = LoginRequest(email="nobody@test.com", password="password123")
         with pytest.raises(HTTPException) as exc:
-            await login(body, db)
+            await login(_request(), body, db)
         assert exc.value.status_code == 401
 
 
