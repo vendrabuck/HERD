@@ -1,15 +1,28 @@
 """Tests for main.py: lifespan seeding functions."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from app.database import Base
 from app.models.group import UserGroup
 from app.models.user import Role
+from app.schemas import auth as schemas
 from app.services.auth_service import create_user, get_user_by_email, superadmin_exists
 from app.services.group_service import get_group_by_name
+from app.services.passwords import (
+    PASSWORD_NOT_UTF8_MESSAGE,
+    PASSWORD_NUL_MESSAGE,
+    verify_password,
+)
+from herd_common.logging import JSONFormatter
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from tests._seed_values import ACCEPTED_SEED_VALUES
+
+ACCEPTED_IDS = [name for name, _, _ in ACCEPTED_SEED_VALUES]
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
@@ -143,38 +156,230 @@ async def test_seed_superadmin_skips_partial_env_vars():
         assert await superadmin_exists(db) is False
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "password, message",
-    [
-        ("strong\x00pass1", "Password must not contain a NUL character"),
-        # A non-UTF-8 byte in the environment arrives as a lone surrogate.
-        ("strong\udcffpass1", "Password must be encodable as UTF-8"),
-    ],
-    ids=["nul", "surrogate"],
-)
-async def test_seed_superadmin_refuses_a_password_hashing_refuses(password, message):
-    """IAM-HASH-3: the seed applies the same password rule as registration
-    (`validate_password`, through `hash_password`). Startup fails loudly with
-    the fixed message, which holds no part of the password, and writes no row."""
+# --- _seed_superadmin: the registration password rules (issue #1450) ---
+
+
+async def _run_seed(value: str, email: str = "sa@test.com") -> None:
     with (
         patch("app.main.settings") as mock_settings,
         patch("app.main.AsyncSessionLocal", TestSessionLocal),
     ):
-        mock_settings.superadmin_email = "sa@test.com"
+        mock_settings.superadmin_email = email
         mock_settings.superadmin_username = "superadmin"
-        mock_settings.superadmin_password = password
+        mock_settings.superadmin_password = value
 
         from app.main import _seed_superadmin
 
-        with pytest.raises(ValueError) as caught:
-            await _seed_superadmin()
+        await _seed_superadmin()
 
-    assert str(caught.value) == message
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None or caught.value.__suppress_context__
+
+def _fragments(value: str, size: int = 4) -> set[str]:
+    """Every run of `size` consecutive characters of `value`."""
+    return {value[i : i + size] for i in range(len(value) - size + 1)}
+
+
+def _record_texts(record: logging.LogRecord) -> list[str]:
+    """Everything a captured record could carry to an operator: its message,
+    the line the service's real JSON formatter renders (which prints every
+    `extra`, nested values included), and repr of the whole record, which keeps
+    non-ASCII characters the JSON form escapes."""
+    return [
+        record.getMessage(),
+        JSONFormatter("auth").format(record),
+        repr(record.__dict__),
+    ]
+
+
+def test_the_refusal_log_text_is_pinned():
+    from app.main import SEED_VALUE_REFUSED_LOG
+
+    assert SEED_VALUE_REFUSED_LOG == (
+        "SUPERADMIN_PASSWORD breaks a registration password rule: %s. "
+        "The superadmin account was not created; set a value that registration "
+        "accepts and recreate auth."
+    )
+
+
+def test_every_refusal_code_has_its_registration_text():
+    """The log texts are plain literals (CodeQL, issue #1450), so they are pinned
+    here to what they restate: the registration bounds, validate_password's own
+    messages, and one text for every code the judge can answer, no more."""
+    from app.main import SEED_REFUSED_RULE_TEXT
+
+    assert set(SEED_REFUSED_RULE_TEXT) == set(schemas.REGISTRATION_REFUSAL_CODES)
+    assert len(schemas.REGISTRATION_REFUSAL_CODES) == len(set(schemas.REGISTRATION_REFUSAL_CODES))
+    assert SEED_REFUSED_RULE_TEXT["too_short"] == (
+        f"Password must be at least {schemas.PASSWORD_MIN_LENGTH} characters"
+    )
+    assert SEED_REFUSED_RULE_TEXT["too_long"] == (
+        f"Password must be at most {schemas.PASSWORD_MAX_LENGTH} characters"
+    )
+    assert SEED_REFUSED_RULE_TEXT["nul"] == PASSWORD_NUL_MESSAGE
+    assert SEED_REFUSED_RULE_TEXT["not_utf8"] == PASSWORD_NOT_UTF8_MESSAGE
+    assert SEED_REFUSED_RULE_TEXT["other"] == "Password must be one registration accepts"
+    field = schemas.RegisterRequest.model_fields["password"]
+    bounds = {type(m).__name__: m for m in field.metadata}
+    assert bounds["MinLen"].min_length == schemas.PASSWORD_MIN_LENGTH
+    assert bounds["MaxLen"].max_length == schemas.PASSWORD_MAX_LENGTH
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value, rule",
+    [
+        ("zq" * 3 + "z", "Password must be at least 8 characters"),
+        ("zq" * 36 + "z", "Password must be at most 72 characters"),
+        # 73 two-byte characters: refused on characters like registration.
+        ("\u00e9" * 73, "Password must be at most 72 characters"),
+        # 9 as configured, 7 once trimmed: the trimmed value is judged.
+        (" " + "zq" * 3 + "z" + " ", "Password must be at least 8 characters"),
+        # 74 as configured with no white space to trim.
+        ("zq" * 37, "Password must be at most 72 characters"),
+        ("zqzq\x00zqzq", "Password must not contain a NUL character"),
+        # A non-UTF-8 byte in the environment arrives as a lone surrogate.
+        ("zqzq\udcffzqzq", "Password must be encodable as UTF-8"),
+    ],
+    ids=[
+        "7-characters",
+        "73-characters",
+        "73-two-byte-characters",
+        "7-after-trimming",
+        "74-characters",
+        "nul",
+        "lone-surrogate",
+    ],
+)
+async def test_seed_superadmin_refuses_a_value_registration_refuses(value, rule, caplog):
+    """IAM-BOOT-3: a value registration would refuse creates no account and
+    logs exactly one ERROR naming the rule, with no run of 4 or more of the
+    value's characters in it; startup continues (the seed returns)."""
+    from app.main import SEED_VALUE_REFUSED_LOG
+
+    with caplog.at_level(logging.DEBUG):
+        await _run_seed(value)
+
     async with TestSessionLocal() as db:
         assert await superadmin_exists(db) is False
+        assert await get_user_by_email(db, "sa@test.com") is None
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert errors[0].name == "app.main"
+    assert errors[0].getMessage() == SEED_VALUE_REFUSED_LOG % rule
+    assert errors[0].args == (rule,)
+    for record in caplog.records:
+        for text in _record_texts(record):
+            assert value.strip() not in text
+            assert not [f for f in _fragments(value) if f in text], text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value, typed", [(v, t) for _, v, t in ACCEPTED_SEED_VALUES], ids=ACCEPTED_IDS
+)
+async def test_seed_superadmin_creates_at_every_accepted_bound(value, typed, caplog):
+    """IAM-BOOT-3: 8 and 72 characters, 72 multi-byte characters (more than 72
+    bytes), and a value that is 72 once trimmed all create the account, with
+    no ERROR; the stored hash is of the trimmed value."""
+    with caplog.at_level(logging.DEBUG):
+        await _run_seed(value)
+
+    async with TestSessionLocal() as db:
+        user = await get_user_by_email(db, "sa@test.com")
+    assert user is not None and user.role == Role.SUPERADMIN
+    assert verify_password(typed, user.hashed_password)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.asyncio
+async def test_an_existing_superadmin_is_untouched_and_a_refused_value_logs_nothing(caplog):
+    """IAM-BOOT-3: the rules are checked only when an account would be
+    created. With a superadmin already present, a value the rules refuse
+    leaves that account as it is and logs no ERROR on this boot or any other."""
+    async with TestSessionLocal() as db:
+        existing = await create_user(db, "first@test.com", "firstsa", "zq" * 4, Role.SUPERADMIN)
+        original_hash = existing.hashed_password
+
+    with caplog.at_level(logging.DEBUG):
+        await _run_seed("zq" * 40, email="first@test.com")
+        await _run_seed("zq" * 40, email="other@test.com")
+
+    async with TestSessionLocal() as db:
+        user = await get_user_by_email(db, "first@test.com")
+        assert user.hashed_password == original_hash
+        assert user.role == Role.SUPERADMIN
+        assert await get_user_by_email(db, "other@test.com") is None
+    assert not [r for r in caplog.records if r.name == "app.main" and r.levelno >= logging.WARNING]
+
+
+@pytest.mark.asyncio
+async def test_a_taken_email_skips_the_seed_before_the_value_is_judged(caplog):
+    """IAM-BOOT-2 and IAM-BOOT-3: with no superadmin and the email held by a
+    regular user, the seed stops at the email check: the WARNING is logged and
+    a value the rules refuse is never judged, so no ERROR."""
+    async with TestSessionLocal() as db:
+        await create_user(db, "taken@test.com", "takenuser", "zq" * 4, Role.USER)
+
+    with caplog.at_level(logging.DEBUG):
+        await _run_seed("zq" * 40, email="taken@test.com")
+
+    async with TestSessionLocal() as db:
+        assert await superadmin_exists(db) is False
+    seed_records = [
+        r for r in caplog.records if r.name == "app.main" and r.levelno >= logging.WARNING
+    ]
+    assert [(r.levelno, r.getMessage()) for r in seed_records] == [
+        (
+            logging.WARNING,
+            "SUPERADMIN_EMAIL 'taken@test.com' is already registered as a regular user. "
+            "Superadmin was not created.",
+        )
+    ]
+
+
+def test_registration_has_no_model_level_validator():
+    """registration_refusal_code runs RegisterRequest's validator on the
+    password field of an empty instance, so a model-level validator would not
+    run (a `before` one) or would fail on the missing fields (an `after` one).
+    Adding one to RegisterRequest means the seed judge must be revisited
+    (issue #1450)."""
+    assert not schemas.RegisterRequest.__pydantic_decorators__.model_validators
+
+
+def _judge_space() -> list[str]:
+    """Lengths 0 to 80 in one-, two-, and four-byte characters, and a NUL or a
+    lone surrogate at the start, middle, and end of values at the bounds."""
+    values = []
+    for n in range(81):
+        values += [("zq" * 41)[:n], "\u00e9" * n, "\U00010348" * n]
+    for n in (7, 8, 72, 73):
+        for position in (0, n // 2, n - 1):
+            for bad in ("\x00", "\udcff"):
+                chars = list(("zq" * 41)[:n])
+                chars[position] = bad
+                values.append("".join(chars))
+    return values
+
+
+def _register_takes(value: str) -> bool:
+    try:
+        schemas.RegisterRequest(email="sa@example.com", username="superadmin", password=value)
+    except ValidationError:
+        return False
+    return True
+
+
+def test_the_seed_judge_is_registration():
+    """registration_refusal_code refuses exactly what RegisterRequest refuses,
+    across the space around both bounds (issue #1450: one judge, not a copy),
+    and always answers with one of REGISTRATION_REFUSAL_CODES; every code but
+    the "other" fallback is reached."""
+    seen = set()
+    for value in _judge_space():
+        code = schemas.registration_refusal_code(value)
+        assert (code is None) == _register_takes(value), repr(value)
+        assert code is None or code in schemas.REGISTRATION_REFUSAL_CODES, (repr(value), code)
+        seen.add(code)
+    assert seen == {None, *schemas.REGISTRATION_REFUSAL_CODES} - {"other"}
 
 
 # --- _seed_not_grouped ---

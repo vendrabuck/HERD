@@ -97,6 +97,16 @@ The stack was upgraded in place and the new release added a column that a startu
 
 Since issue #1261 auth's own startup seed reads only ids, so `column users.<name> does not exist` from the superadmin or "Not Grouped" seed no longer happens; the remedy above still applies to any other startup read.
 
+### No superadmin account after the first boot
+
+Auth creates the superadmin from `SUPERADMIN_EMAIL`, `SUPERADMIN_USERNAME`, and `SUPERADMIN_PASSWORD` at startup, only while no superadmin exists (IAM-BOOT-1). Read `docker compose logs auth` for one of three causes:
+
+- `SUPERADMIN_PASSWORD breaks a registration password rule: <rule>. The superadmin account was not created; set a value that registration accepts and recreate auth.` (one ERROR, issue #1450). The password is held to the rules `POST /register` applies, so the value you set is one `POST /login` takes: 8 to 72 characters after surrounding white space is trimmed (characters, not bytes, so 72 accented letters are fine), with no NUL character. A value with an embedded newline is accepted too, but no browser password field can take it, so avoid one. `<rule>` names the rule broken (`Password must be at least 8 characters`, `Password must be at most 72 characters`, `Password must not contain a NUL character`, or `Password must be encodable as UTF-8`; `Password must be one registration accepts` appears only if registration gains a rule this list does not know); the value itself is never logged. Set a value that fits in `.env` and recreate auth (`docker compose up -d auth`; `docker compose restart auth` keeps the old environment and logs the same ERROR); if a configuration was ever saved on the config page, set it there instead, since `config.json` outranks `.env`. Auth keeps running meanwhile, and the seed tries again at every start until the account exists.
+- `SUPERADMIN_EMAIL '<email>' is already registered as a regular user. Superadmin was not created.` (a WARNING): choose another email for the superadmin.
+- Nothing about the seed at all: one of the three values is empty (or only white space), so the seed was skipped by design.
+
+Once a superadmin exists the three values are never read again, so changing them later, or leaving a value the rules would refuse, has no effect and logs nothing.
+
 ### `make up` refuses to start, or the page hangs after `make up` following `make everything`
 
 A successful `make everything` leaves its seeded gate stack (compose project `<dir>-gate`, for example `herd-public-gate`) serving `https://localhost` (or the `HERD_GATEWAY_BIND` address, issue #1256) on host ports 80 and 443. The dev stack publishes the same ports, so the two cannot run together. `make up`, `make dev`, and `make prod` therefore refuse to start while another compose project publishes host port 80 or 443, with a message such as:
