@@ -31,6 +31,7 @@ from app.routers.internal import router as internal_router
 from app.routers.ldap_sync import router as ldap_sync_router
 from app.routers.oidc import router as oidc_router
 from app.routers.tokens import router as tokens_router
+from app.schemas.auth import refused_registration_rule
 from app.services.ldap_service import log_ldap_startup_problems
 from app.tasks.ldap_sync_loop import (
     effective_interval_seconds,
@@ -41,12 +42,27 @@ from app.tasks.ldap_sync_loop import (
 setup_logging("auth", level=settings.log_level)
 logger = logging.getLogger(__name__)
 
+# The one ERROR the seed logs when SUPERADMIN_PASSWORD breaks a registration
+# password rule (issue #1450, IAM-BOOT-3). The argument is the rule's fixed text
+# from refused_registration_rule, never the value.
+SEED_VALUE_REFUSED_LOG = (
+    "SUPERADMIN_PASSWORD breaks a registration password rule: %s. "
+    "The superadmin account was not created; set a value that registration "
+    "accepts and restart auth."
+)
+
 
 async def _seed_superadmin() -> None:
     """
     Create the superadmin account on first startup if the three SUPERADMIN_*
     environment variables are all set and no superadmin already exists.
     This runs exactly once; subsequent startups are a no-op.
+
+    The password is held to registration's rules (issue #1450), so the value
+    the operator configured is one `POST /login` takes. The check runs only
+    when an account would be created: a stack that already has its superadmin
+    never judges the value and never logs about it. A refused value logs
+    SEED_VALUE_REFUSED_LOG once, creates nothing, and startup continues.
 
     Its two existence checks read ids only (issue #1261): this runs before
     `make migrate` can, so a release that adds a column to users must not
@@ -76,6 +92,15 @@ async def _seed_superadmin() -> None:
                 "SUPERADMIN_EMAIL '%s' is already registered as a regular user. "
                 "Superadmin was not created.",
                 email,
+            )
+            return
+
+        refused_rule = refused_registration_rule(password)
+        if refused_rule is not None:
+            logger.error(
+                SEED_VALUE_REFUSED_LOG,
+                refused_rule,
+                extra={"action": "superadmin_seed_refused"},
             )
             return
 

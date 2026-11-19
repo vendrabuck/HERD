@@ -70,7 +70,7 @@ Read once at startup to create the seeded superadmin. Ignored on subsequent rest
 |---|---|
 | `SUPERADMIN_EMAIL` | Email for the seeded superadmin. |
 | `SUPERADMIN_USERNAME` | Username for the seeded superadmin. |
-| `SUPERADMIN_PASSWORD` | Password (min 8 chars) for the seeded superadmin. |
+| `SUPERADMIN_PASSWORD` | Password for the seeded superadmin, held to the registration password rules (issue #1450): 8 to 72 characters after surrounding white space is trimmed (counted in characters, not bytes), with no NUL character and nothing that is not valid UTF-8. The trimmed value is the password you type at login. A value that breaks a rule creates no account and logs one ERROR naming the rule, never the value (`SUPERADMIN_PASSWORD breaks a registration password rule: ...`); auth still starts, and the seed tries again at the next start. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#no-superadmin-account-after-the-first-boot). |
 
 ## Auth
 

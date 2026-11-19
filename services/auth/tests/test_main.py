@@ -1,15 +1,23 @@
 """Tests for main.py: lifespan seeding functions."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from app.database import Base
 from app.models.group import UserGroup
 from app.models.user import Role
+from app.schemas import auth as schemas
 from app.services.auth_service import create_user, get_user_by_email, superadmin_exists
 from app.services.group_service import get_group_by_name
+from app.services.passwords import verify_password
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from tests._seed_values import ACCEPTED_SEED_VALUES
+
+ACCEPTED_IDS = [name for name, _, _ in ACCEPTED_SEED_VALUES]
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
@@ -143,38 +151,165 @@ async def test_seed_superadmin_skips_partial_env_vars():
         assert await superadmin_exists(db) is False
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "password, message",
-    [
-        ("strong\x00pass1", "Password must not contain a NUL character"),
-        # A non-UTF-8 byte in the environment arrives as a lone surrogate.
-        ("strong\udcffpass1", "Password must be encodable as UTF-8"),
-    ],
-    ids=["nul", "surrogate"],
-)
-async def test_seed_superadmin_refuses_a_password_hashing_refuses(password, message):
-    """IAM-HASH-3: the seed applies the same password rule as registration
-    (`validate_password`, through `hash_password`). Startup fails loudly with
-    the fixed message, which holds no part of the password, and writes no row."""
+# --- _seed_superadmin: the registration password rules (issue #1450) ---
+
+
+async def _run_seed(value: str, email: str = "sa@test.com") -> None:
     with (
         patch("app.main.settings") as mock_settings,
         patch("app.main.AsyncSessionLocal", TestSessionLocal),
     ):
-        mock_settings.superadmin_email = "sa@test.com"
+        mock_settings.superadmin_email = email
         mock_settings.superadmin_username = "superadmin"
-        mock_settings.superadmin_password = password
+        mock_settings.superadmin_password = value
 
         from app.main import _seed_superadmin
 
-        with pytest.raises(ValueError) as caught:
-            await _seed_superadmin()
+        await _seed_superadmin()
 
-    assert str(caught.value) == message
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None or caught.value.__suppress_context__
+
+def _fragments(value: str, size: int = 4) -> set[str]:
+    """Every run of `size` consecutive characters of `value`."""
+    return {value[i : i + size] for i in range(len(value) - size + 1)}
+
+
+def test_the_refusal_log_text_is_pinned():
+    from app.main import SEED_VALUE_REFUSED_LOG
+
+    assert SEED_VALUE_REFUSED_LOG == (
+        "SUPERADMIN_PASSWORD breaks a registration password rule: %s. "
+        "The superadmin account was not created; set a value that registration "
+        "accepts and restart auth."
+    )
+    assert schemas.PASSWORD_TOO_SHORT_RULE == "Password must be at least 8 characters"
+    assert schemas.PASSWORD_TOO_LONG_RULE == "Password must be at most 72 characters"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value, rule",
+    [
+        ("zq" * 3 + "z", "Password must be at least 8 characters"),
+        ("zq" * 36 + "z", "Password must be at most 72 characters"),
+        # 73 two-byte characters: refused on characters like registration.
+        ("\u00e9" * 73, "Password must be at most 72 characters"),
+        # 9 as configured, 7 once trimmed: the trimmed value is judged.
+        (" " + "zq" * 3 + "z" + " ", "Password must be at least 8 characters"),
+        # 74 as configured with no white space to trim.
+        ("zq" * 37, "Password must be at most 72 characters"),
+        ("zqzq\x00zqzq", "Password must not contain a NUL character"),
+        # A non-UTF-8 byte in the environment arrives as a lone surrogate.
+        ("zqzq\udcffzqzq", "Password must be encodable as UTF-8"),
+    ],
+    ids=[
+        "7-characters",
+        "73-characters",
+        "73-two-byte-characters",
+        "7-after-trimming",
+        "74-characters",
+        "nul",
+        "lone-surrogate",
+    ],
+)
+async def test_seed_superadmin_refuses_a_value_registration_refuses(value, rule, caplog):
+    """IAM-BOOT-3: a value registration would refuse creates no account and
+    logs exactly one ERROR naming the rule, with no run of 4 or more of the
+    value's characters in it; startup continues (the seed returns)."""
+    from app.main import SEED_VALUE_REFUSED_LOG
+
+    with caplog.at_level(logging.DEBUG):
+        await _run_seed(value)
+
     async with TestSessionLocal() as db:
         assert await superadmin_exists(db) is False
+        assert await get_user_by_email(db, "sa@test.com") is None
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert errors[0].name == "app.main"
+    assert errors[0].getMessage() == SEED_VALUE_REFUSED_LOG % rule
+    assert errors[0].args == (rule,)
+    for record in caplog.records:
+        text = record.getMessage()
+        assert value.strip() not in text
+        assert not [f for f in _fragments(value) if f in text], text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value, typed", [(v, t) for _, v, t in ACCEPTED_SEED_VALUES], ids=ACCEPTED_IDS
+)
+async def test_seed_superadmin_creates_at_every_accepted_bound(value, typed, caplog):
+    """IAM-BOOT-3: 8 and 72 characters, 72 multi-byte characters (more than 72
+    bytes), and a value that is 72 once trimmed all create the account, with
+    no ERROR; the stored hash is of the trimmed value."""
+    with caplog.at_level(logging.DEBUG):
+        await _run_seed(value)
+
+    async with TestSessionLocal() as db:
+        user = await get_user_by_email(db, "sa@test.com")
+    assert user is not None and user.role == Role.SUPERADMIN
+    assert verify_password(typed, user.hashed_password)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.asyncio
+async def test_an_existing_superadmin_is_untouched_and_a_refused_value_logs_nothing(caplog):
+    """IAM-BOOT-3: the rules are checked only when an account would be
+    created. With a superadmin already present, a value the rules refuse
+    leaves that account as it is and logs no ERROR on this boot or any other."""
+    async with TestSessionLocal() as db:
+        existing = await create_user(db, "first@test.com", "firstsa", "zq" * 4, Role.SUPERADMIN)
+        original_hash = existing.hashed_password
+
+    with caplog.at_level(logging.DEBUG):
+        await _run_seed("zq" * 40, email="first@test.com")
+        await _run_seed("zq" * 40, email="other@test.com")
+
+    async with TestSessionLocal() as db:
+        user = await get_user_by_email(db, "first@test.com")
+        assert user.hashed_password == original_hash
+        assert user.role == Role.SUPERADMIN
+        assert await get_user_by_email(db, "other@test.com") is None
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def _judge_space() -> list[str]:
+    """Lengths 0 to 80 in one-, two-, and four-byte characters, and a NUL or a
+    lone surrogate at the start, middle, and end of values at the bounds."""
+    values = []
+    for n in range(81):
+        values += [("zq" * 41)[:n], "\u00e9" * n, "\U00010348" * n]
+    for n in (7, 8, 72, 73):
+        for position in (0, n // 2, n - 1):
+            for bad in ("\x00", "\udcff"):
+                chars = list(("zq" * 41)[:n])
+                chars[position] = bad
+                values.append("".join(chars))
+    return values
+
+
+def _register_takes(value: str) -> bool:
+    try:
+        schemas.RegisterRequest(email="sa@example.com", username="superadmin", password=value)
+    except ValidationError:
+        return False
+    return True
+
+
+def test_the_seed_judge_is_registration():
+    """refused_registration_rule refuses exactly what RegisterRequest refuses,
+    across the space around both bounds (issue #1450: one judge, not a copy),
+    and always answers with one of the fixed rule texts."""
+    fixed = {
+        schemas.PASSWORD_TOO_SHORT_RULE,
+        schemas.PASSWORD_TOO_LONG_RULE,
+        "Password must not contain a NUL character",
+        "Password must be encodable as UTF-8",
+    }
+    for value in _judge_space():
+        refusal = schemas.refused_registration_rule(value)
+        assert (refusal is None) == _register_takes(value), repr(value)
+        assert refusal is None or refusal in fixed, (repr(value), refusal)
 
 
 # --- _seed_not_grouped ---

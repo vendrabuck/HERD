@@ -1657,7 +1657,8 @@ settings when the auth service starts.
 
 - **IAM-BOOT-1.** At startup, when all three settings are non-empty and no superadmin
   account exists, a local, active superadmin account is created from them (and joins
-  "Not Grouped" like any new account); otherwise nothing happens. \
+  "Not Grouped" like any new account), unless IAM-BOOT-2 or IAM-BOOT-3 refuses it;
+  otherwise nothing happens. \
   Enforced in: `services/auth/app/main.py` (`_seed_superadmin`, `lifespan`) \
   Pinned by: `services/auth/tests/test_main.py` (`test_seed_superadmin_creates_new_superadmin`, `test_seed_superadmin_skips_when_env_vars_empty`, `test_seed_superadmin_skips_partial_env_vars`, `test_seed_superadmin_skips_when_already_exists`, `test_lifespan_runs_seeding`)
 - **IAM-BOOT-2.** When `SUPERADMIN_EMAIL` already belongs to an account, no superadmin is
@@ -1665,9 +1666,24 @@ settings when the auth service starts.
   Enforced in: `services/auth/app/main.py` (`_seed_superadmin`) \
   Pinned by: `services/auth/tests/test_main.py` (`test_seed_superadmin_skips_when_email_already_registered`)
 - **IAM-BOOT-3.** The three values are trimmed of surrounding whitespace before use,
-  the password included, and the password is not held to the registration length rules. \
-  Enforced in: `services/auth/app/main.py` (`_seed_superadmin`) \
-  Pinned by: none
+  the password included, so the account's password is the trimmed value and the
+  untrimmed one is a wrong password at login. The trimmed password is held to the
+  registration password rules (issue #1450), judged by `RegisterRequest`'s own
+  validator for its password field (IAM-REG-2): 8 to 72 characters, counted as
+  characters and not UTF-8 bytes, and one hashing accepts (no NUL character, encodable
+  as UTF-8, IAM-HASH-3). So every value the seed accepts is a password `POST /login`
+  takes in local mode and at the break-glass login (IAM-LOGIN-6). The check runs only
+  when an account would be created, after the existence checks of IAM-BOOT-1 and
+  IAM-BOOT-2: with a superadmin present, or the email taken, the value is never judged
+  and nothing is logged about it. A value that breaks a rule creates no account and
+  logs exactly one ERROR, `SUPERADMIN_PASSWORD breaks a registration password rule:
+  <rule>. The superadmin account was not created; set a value that registration
+  accepts and restart auth.`, where `<rule>` is one fixed text (`Password must be at
+  least 8 characters`, `Password must be at most 72 characters`, `Password must not
+  contain a NUL character`, or `Password must be encodable as UTF-8`) and never holds
+  the value; startup continues, as it does when a value is missing. \
+  Enforced in: `services/auth/app/main.py` (`_seed_superadmin`, `SEED_VALUE_REFUSED_LOG`); `services/auth/app/schemas/auth.py` (`refused_registration_rule`, `PASSWORD_TOO_SHORT_RULE`, `PASSWORD_TOO_LONG_RULE`) \
+  Pinned by: `services/auth/tests/test_main.py` (`test_the_refusal_log_text_is_pinned`, `test_seed_superadmin_refuses_a_value_registration_refuses`, `test_seed_superadmin_creates_at_every_accepted_bound`, `test_an_existing_superadmin_is_untouched_and_a_refused_value_logs_nothing`, `test_the_seed_judge_is_registration`); `services/auth/tests/test_seed_superadmin_login.py` (`test_a_seeded_value_signs_in_at_local_login`, `test_a_seeded_value_signs_in_at_the_break_glass_login`, `test_the_untrimmed_value_is_not_the_password`)
 - **IAM-BOOT-4.** At startup the "Not Grouped" group is created when no group of that
   name exists, tolerating a concurrent creator. \
   Enforced in: `services/auth/app/main.py` (`_seed_not_grouped`) \
@@ -2403,13 +2419,13 @@ it on the pre-#1355 commit, is replayed by the tests
   it: `hash_password` raises ValueError and `verify_password` answers False. The rule
   is defined once, as `validate_password`, whose ValueError messages are fixed and hold
   no part of the password (issue #1426). Registration applies it before hashing, so a
-  refused password there is a 422 (IAM-REG-2); the seed fails startup with the
-  ValueError. A login with a NUL is the 401 `Invalid credentials` (under passlib it was
+  refused password there is a 422 (IAM-REG-2); the seed applies registration's rules
+  and logs the refusal without creating an account (IAM-BOOT-3). A login with a NUL is the 401 `Invalid credentials` (under passlib it was
   a 500); a login with a lone surrogate never reaches the check (IAM-LOGIN-5), and no
   password a request sends to hashing reaches 4096 bytes: registration, local login,
   and the break-glass login take at most 72 characters (IAM-REG-2, IAM-LOGIN-6). \
   Enforced in: `services/auth/app/services/passwords.py` (`validate_password`, `_encoded_password`, `_password_bytes`, `MAX_PASSWORD_BYTES`) \
-  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_a_refused_password_never_hashes`, `test_a_refused_password_is_false_after_one_dummy_check`, `test_a_refused_password_against_a_good_hash_logs_nothing`, `test_4096_bytes_is_still_accepted`, `test_a_password_passlib_refused_to_hash_is_still_refused`, `test_a_login_with_a_nul_password_is_401_not_500`); `services/auth/tests/test_password_input_validation.py` (`test_validate_password_refuses_a_nul_anywhere_with_the_pinned_message`, `test_validate_password_refuses_the_rest_with_a_message_that_holds_no_input`, `test_validate_password_returns_an_honest_password_unchanged`); `services/auth/tests/test_main.py` (`test_seed_superadmin_refuses_a_password_hashing_refuses`)
+  Pinned by: `services/auth/tests/test_password_hashing.py` (`test_a_refused_password_never_hashes`, `test_a_refused_password_is_false_after_one_dummy_check`, `test_a_refused_password_against_a_good_hash_logs_nothing`, `test_4096_bytes_is_still_accepted`, `test_a_password_passlib_refused_to_hash_is_still_refused`, `test_a_login_with_a_nul_password_is_401_not_500`); `services/auth/tests/test_password_input_validation.py` (`test_validate_password_refuses_a_nul_anywhere_with_the_pinned_message`, `test_validate_password_refuses_the_rest_with_a_message_that_holds_no_input`, `test_validate_password_returns_an_honest_password_unchanged`); `services/auth/tests/test_main.py` (`test_seed_superadmin_refuses_a_value_registration_refuses`)
 - **IAM-HASH-4.** A stored hash is usable when it reads `$<ident>$<cost>$` followed by a
   22-character salt and a 31-character checksum in bcrypt's alphabet, with ident `2`,
   `2a`, `2b`, or `2y` and a two-digit cost from 04 to 14, the ceiling `MAX_VERIFY_COST`
@@ -2580,7 +2596,7 @@ Calls into this area are in section 7 and the forwarded-JWT group routes noted u
 | `AUTH_LOGIN_MAX_ATTEMPTS`, `AUTH_LOGIN_WINDOW_SECONDS` | `60`, `60` | Per-source password attempts at once, and the seconds over which they refill (IAM-LOGIN-7) |
 | `AUTH_PASSWORD_HASH_THREADS` | `0` (half the CPUs, 1 to 4) | bcrypt worker threads (IAM-HASH-7) |
 | `INTERNAL_API_TOKEN` | empty | Shared service secret; empty makes auth's and acl's internal routes answer 503 and the shared helpers answer false |
-| `SUPERADMIN_EMAIL`, `SUPERADMIN_USERNAME`, `SUPERADMIN_PASSWORD` | empty | First-startup superadmin; any empty skips the seed |
+| `SUPERADMIN_EMAIL`, `SUPERADMIN_USERNAME`, `SUPERADMIN_PASSWORD` | empty | First-startup superadmin; any empty skips the seed, and a password registration would refuse skips it with one ERROR (IAM-BOOT-3) |
 | `AUTH_METHOD` | `local` | `local`, `ldap`, or `oidc` (not yet supported for operators, section 8.19); one backend for every login |
 | `LDAP_SERVER_URL`, `LDAP_BIND_DN`, `LDAP_BIND_PASSWORD`, `LDAP_USER_BASE_DN` | empty | Directory location and service account |
 | `LDAP_USER_FILTER` | `(sAMAccountName={username})` | Login search filter; `{username}` is its only placeholder and `{{` and `}}` are literal braces (IAM-LDAP-14) |
@@ -2723,6 +2739,5 @@ IAM-LDAP-12 and IAM-LDAP-13, #1404 by IAM-LOGIN-6, and #1447 by IAM-LDAP-16.)
 - IAM-SYNC-18: sync never changes a role.
 - IAM-SERIAL-3: the connection invalidation after a failed unlock.
 - IAM-LOOP-6: sync-now never prunes.
-- IAM-BOOT-3: trimming of the seed values.
 - IAM-BOOT-5: the seed in LDAP mode.
 - IAM-USER-9: a superadmin session in LDAP mode only from an earlier refresh token or an API token.
