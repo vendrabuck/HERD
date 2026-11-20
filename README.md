@@ -578,6 +578,10 @@ Four jobs run on push/PR to main, plus a scheduled nightly workflow:
 
 - [FRESH_SETUP.md](FRESH_SETUP.md): Clone-to-running-stack setup.
 
+## Author
+
+HERD is designed and built by Lane Nelms ([LinkedIn](https://www.linkedin.com/in/lane-nelms/), [GitHub](https://github.com/vendrabuck)).
+
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Participation is covered by the [Code of Conduct](CODE_OF_CONDUCT.md).
