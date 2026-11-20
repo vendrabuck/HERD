@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from herd_common.auth import caller_id as _caller_id
 from herd_common.auth import make_auth_dependencies
 from herd_common.internal_auth import internal_token_matches
+from herd_common.validation_errors import FORWARD_ENVELOPE_BYTES, extends_body_limit
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -51,6 +52,9 @@ async def put_preferences_endpoint(
 
 
 @router.patch("/preferences", response_model=PreferencesResponse)
+# Notifications merges a preference update it admitted with the stored
+# preferences and forwards the result here (issue #1466).
+@extends_body_limit(lambda: FORWARD_ENVELOPE_BYTES)
 async def patch_preferences_endpoint(
     body: PreferencesPatchRequest,
     db: AsyncSession = Depends(get_db),

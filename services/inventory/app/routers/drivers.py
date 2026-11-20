@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Uplo
 from fastapi.responses import Response
 from herd_common.device_config import CONFIG_SCHEMAS
 from herd_common.internal_auth import internal_token_matches
-from herd_common.validation_errors import accepts_upload
+from herd_common.validation_errors import extends_body_limit
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -92,7 +92,7 @@ async def get_driver_config_schema_proxy(
     response_model=DriverPackageInfo,
     status_code=status.HTTP_201_CREATED,
 )
-@accepts_upload(lambda: settings.driver_max_size_bytes)
+@extends_body_limit(lambda: settings.driver_max_size_bytes)
 async def create_new_driver(
     file: UploadFile,
     name: str = Form(...),
@@ -146,7 +146,7 @@ async def update_driver_metadata(
 
 
 @router.put("/drivers/{driver_id}/file", response_model=DriverPackageInfo)
-@accepts_upload(lambda: settings.driver_max_size_bytes)
+@extends_body_limit(lambda: settings.driver_max_size_bytes)
 async def replace_driver_file_endpoint(
     driver_id: uuid.UUID,
     file: UploadFile,

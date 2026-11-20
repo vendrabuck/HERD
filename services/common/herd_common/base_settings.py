@@ -13,7 +13,9 @@ merges model_config down the inheritance chain, so a subclass may still
 override or extend it locally.
 """
 
-from pydantic import Field
+from typing import Any
+
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
 from herd_common.config_loader import herd_settings_sources
@@ -22,7 +24,16 @@ from herd_common.database import (
     DEFAULT_POOL_PRE_PING,
     DEFAULT_POOL_SIZE,
 )
-from herd_common.validation_errors import DEFAULT_MAX_REQUEST_BODY_BYTES
+from herd_common.validation_errors import (
+    DEFAULT_MAX_REQUEST_BODY_BYTES,
+    MIN_MAX_REQUEST_BODY_BYTES,
+    max_body_bytes_from_text,
+)
+
+MAX_REQUEST_BODY_BYTES_RULE = (
+    "MAX_REQUEST_BODY_BYTES must be a whole number of bytes written in decimal digits, "
+    f"at least {MIN_MAX_REQUEST_BODY_BYTES}"
+)
 
 
 class HerdBaseSettings(BaseSettings):
@@ -50,9 +61,26 @@ class HerdBaseSettings(BaseSettings):
 
     # The request body limit (issue #1466), passed to
     # herd_common.validation_errors.install_validation_errors by every service's
-    # app/main.py: a body over it is a 413 before it is parsed or authenticated. An
-    # upload route adds its own file bound to it (`accepts_upload`).
-    max_request_body_bytes: int = Field(default=DEFAULT_MAX_REQUEST_BODY_BYTES, ge=1)
+    # app/main.py: a body over it is a 413 before it is parsed or authenticated. A
+    # route marked with `extends_body_limit` (an upload, or a body another service
+    # forwards) adds its own allowance to it.
+    max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES
+
+    @field_validator("max_request_body_bytes", mode="before")
+    @classmethod
+    def _max_request_body_bytes_is_decimal_digits(cls, value: Any) -> int:
+        """The same reading as the config service's (`max_body_bytes_from_text`):
+        decimal digits only, at least the floor. An int (a config.json number) is
+        held to the floor too; a bool, a float, or any other text is refused."""
+        if isinstance(value, int) and not isinstance(value, bool):
+            parsed = value if value >= MIN_MAX_REQUEST_BODY_BYTES else None
+        elif isinstance(value, str):
+            parsed = max_body_bytes_from_text(value)
+        else:
+            parsed = None
+        if parsed is None:
+            raise ValueError(MAX_REQUEST_BODY_BYTES_RULE)
+        return parsed
 
     @classmethod
     def settings_customise_sources(

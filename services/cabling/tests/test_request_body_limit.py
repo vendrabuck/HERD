@@ -11,6 +11,8 @@ first. The middleware itself is pinned in `services/common/tests/test_request_bo
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from app.config import settings
 from app.main import app
@@ -48,7 +50,7 @@ async def test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed(met
     assert at.status_code == 422, at.text[:300]
     assert at.json()["detail"][0]["type"] == "json_invalid"
     assert _refused(over), over.text[:300]
-    assert over.headers["connection"] == "close"
+    assert "connection" not in over.headers  # the connection stays usable
 
 
 @pytest.mark.parametrize(("method", "path"), _BODY_ROUTES)
@@ -117,10 +119,10 @@ async def test_the_import_route_takes_its_own_limit(monkeypatch):
     assert refused.json() == {"detail": [body_too_large_error(LIMIT + _UPLOAD_BYTES)]}
 
 
-def test_the_import_bound_is_ten_mebibytes_and_no_other_route_has_one():
+def test_the_import_and_the_two_fork_forwards_are_the_only_larger_routes():
     from app.routes import bulk
     from fastapi.routing import iter_route_contexts
-    from herd_common.validation_errors import route_body_limit
+    from herd_common.validation_errors import FORWARD_ENVELOPE_BYTES, route_body_limit
 
     limits = {
         (method, route.path): route_body_limit(route, LIMIT)
@@ -129,5 +131,33 @@ def test_the_import_bound_is_ten_mebibytes_and_no_other_route_has_one():
     }
     assert bulk.IMPORT_UPLOAD_BYTES == 10 * 1024 * 1024
     assert {k: v for k, v in limits.items() if v != LIMIT} == {
-        ("POST", "/topologies/import"): LIMIT + bulk.IMPORT_UPLOAD_BYTES
+        ("POST", "/topologies/import"): LIMIT + bulk.IMPORT_UPLOAD_BYTES,
+        ("PUT", "/internal/forks/{reservation_id}/canvas"): LIMIT + FORWARD_ENVELOPE_BYTES,
+        ("POST", "/internal/forks/{reservation_id}/save"): LIMIT + FORWARD_ENVELOPE_BYTES,
     }
+
+
+# -- A route another service forwards a body to takes the envelope (OPS-VALID-10) ---------
+#
+# reservations forwards its fork canvas PUT and fork save here.
+# The body it admitted, plus what it adds, fits under the default limit plus
+# FORWARD_ENVELOPE_BYTES.
+
+_FORWARD_ROUTES = [
+    ("PUT", f"/internal/forks/{uuid.uuid4()}/canvas"),
+    ("POST", f"/internal/forks/{uuid.uuid4()}/save"),
+]
+
+
+@pytest.mark.parametrize(("method", "path"), _FORWARD_ROUTES)
+async def test_a_forwarded_body_up_to_the_envelope_is_parsed_and_one_byte_more_is_413(method, path):
+    from herd_common.validation_errors import FORWARD_ENVELOPE_BYTES
+
+    route_limit = LIMIT + FORWARD_ENVELOPE_BYTES
+    async with _client() as client:
+        at = await client.request(method, path, content=b"x" * route_limit, headers=_JSON)
+        over = await client.request(method, path, content=b"x" * (route_limit + 1), headers=_JSON)
+    assert at.status_code == 422, at.text[:300]
+    assert at.json()["detail"][0]["type"] == "json_invalid"
+    assert over.status_code == 413, over.text[:300]
+    assert over.json() == {"detail": [body_too_large_error(route_limit)]}

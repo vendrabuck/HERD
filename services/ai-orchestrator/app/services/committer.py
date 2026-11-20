@@ -16,6 +16,7 @@ does not end up with a dangling empty topology. All upstream calls use the
 caller's JWT so existing RBAC and device-visibility rules apply.
 """
 
+import json
 import logging
 import re
 import uuid
@@ -37,6 +38,22 @@ from app.services.config_validator import (
 logger = logging.getLogger(__name__)
 
 HTTP_TIMEOUT = 15.0
+
+# The canvas a commit builds is larger than the commit request that describes it (a
+# node carries generated ids and fixed keys for each proposed device, an edge for each
+# proposed link), so it is measured before anything is written (issue #1466): cabling
+# takes the canvas PUT at its MAX_REQUEST_BODY_BYTES, the same setting this service
+# reads, and a canvas over it is refused here, never there.
+CANVAS_TOO_LARGE_DETAIL = (
+    "The topology this commit builds is {size} bytes, over the {limit}-byte request "
+    "body limit; commit fewer devices, elements, or links"
+)
+
+
+def canvas_put_bytes(canvas_data: dict[str, Any]) -> int:
+    """The size of the canvas PUT body as httpx encodes it (compact, UTF-8)."""
+    body = json.dumps({"canvas_data": canvas_data}, ensure_ascii=False, separators=(",", ":"))
+    return len(body.encode("utf-8"))
 
 
 class CommitError(Exception):
@@ -593,6 +610,12 @@ async def commit_proposal(
         # Built inside the client block: an element attachment edge needs a
         # port lookup against inventory (D2), which reuses this same client.
         canvas_data = await _build_canvas_data(client, headers, req)
+        size = canvas_put_bytes(canvas_data)
+        if size > settings.max_request_body_bytes:
+            raise CommitError(
+                413,
+                CANVAS_TOO_LARGE_DETAIL.format(size=size, limit=settings.max_request_body_bytes),
+            )
         topology_id = await _create_topology(client, headers, req.topology_name)
         try:
             await _update_topology_canvas(client, headers, topology_id, canvas_data)

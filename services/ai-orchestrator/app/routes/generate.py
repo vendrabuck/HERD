@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 from herd_common.auth import make_auth_dependencies
-from herd_common.validation_errors import accepts_upload
+from herd_common.validation_errors import extends_body_limit
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -162,7 +162,7 @@ async def _read_uploads(
 
 @router.post("", response_model=GenerateResponse)
 # The body may hold every file `_read_uploads` accepts (issue #1466).
-@accepts_upload(lambda: settings.upload_max_files * settings.upload_max_file_bytes)
+@extends_body_limit(lambda: settings.upload_max_files * settings.upload_max_file_bytes)
 async def generate(
     prompt: str = Form(..., min_length=1, max_length=20000),
     files: list[UploadFile] | None = File(None),

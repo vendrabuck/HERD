@@ -50,7 +50,7 @@ async def test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed(met
     assert at.status_code == 422, at.text[:300]
     assert at.json()["detail"][0]["type"] == "json_invalid"
     assert _refused(over), over.text[:300]
-    assert over.headers["connection"] == "close"
+    assert "connection" not in over.headers  # the connection stays usable
 
 
 @pytest.mark.parametrize(("method", "path"), _BODY_ROUTES)

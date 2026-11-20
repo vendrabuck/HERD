@@ -26,7 +26,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, File, Header, Query, UploadFile
 from fastapi.responses import Response
-from herd_common.validation_errors import accepts_upload
+from herd_common.validation_errors import extends_body_limit
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -77,7 +77,7 @@ async def export_topologies(
 
 
 @router.post("/import", response_model=BulkImportReport)
-@accepts_upload(lambda: IMPORT_UPLOAD_BYTES)
+@extends_body_limit(lambda: IMPORT_UPLOAD_BYTES)
 async def import_topologies_endpoint(
     file: UploadFile = File(...),
     format: str = Query("json", pattern="^(csv|json)$"),

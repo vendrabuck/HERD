@@ -23,7 +23,7 @@ from httpx import ASGITransport, AsyncClient
 
 LIMIT = settings.max_request_body_bytes
 _JSON = {"content-type": "application/json"}
-_BODY_ROUTES = [("PUT", "/preferences"), ("PATCH", "/preferences")]
+_BODY_ROUTES = [("PUT", "/preferences")]
 _AUTHENTICATED_ROUTE = ("PUT", "/preferences")
 
 
@@ -48,7 +48,7 @@ async def test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed(met
     assert at.status_code == 422, at.text[:300]
     assert at.json()["detail"][0]["type"] == "json_invalid"
     assert _refused(over), over.text[:300]
-    assert over.headers["connection"] == "close"
+    assert "connection" not in over.headers  # the connection stays usable
 
 
 @pytest.mark.parametrize(("method", "path"), _BODY_ROUTES)
@@ -89,3 +89,26 @@ async def test_without_credentials_the_limit_answers_before_authentication():
         over = await client.request(method, path, content=b"{}" + b" " * LIMIT, headers=_JSON)
     assert honest.status_code in (401, 403), honest.text[:300]
     assert _refused(over), over.text[:300]
+
+
+# -- A route another service forwards a body to takes the envelope (OPS-VALID-10) ---------
+#
+# notifications forwards merged notification preferences here.
+# The body it admitted, plus what it adds, fits under the default limit plus
+# FORWARD_ENVELOPE_BYTES.
+
+_FORWARD_ROUTES = [("PATCH", "/preferences")]
+
+
+@pytest.mark.parametrize(("method", "path"), _FORWARD_ROUTES)
+async def test_a_forwarded_body_up_to_the_envelope_is_parsed_and_one_byte_more_is_413(method, path):
+    from herd_common.validation_errors import FORWARD_ENVELOPE_BYTES
+
+    route_limit = LIMIT + FORWARD_ENVELOPE_BYTES
+    async with _client() as client:
+        at = await client.request(method, path, content=b"x" * route_limit, headers=_JSON)
+        over = await client.request(method, path, content=b"x" * (route_limit + 1), headers=_JSON)
+    assert at.status_code == 422, at.text[:300]
+    assert at.json()["detail"][0]["type"] == "json_invalid"
+    assert over.status_code == 413, over.text[:300]
+    assert over.json() == {"detail": [body_too_large_error(route_limit)]}

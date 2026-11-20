@@ -623,6 +623,10 @@ async def fetch_fleet_devices(auth_header: str | None) -> list[dict] | None:
     return devices
 
 
+# auth's POST /groups/users/groups takes at most 500 user ids (UserIdsRequest).
+USER_GROUPS_BATCH = 500
+
+
 async def fetch_user_groups_map(
     user_ids: list[uuid.UUID],
     auth_header: str | None,
@@ -639,19 +643,24 @@ async def fetch_user_groups_map(
     out: dict[uuid.UUID, list[tuple[uuid.UUID, str]]] = {}
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(
-                f"{settings.auth_service_url}/groups/users/groups",
-                json={"user_ids": [str(uid) for uid in user_ids]},
-                headers={"Authorization": auth_header},
-            )
-        if resp.status_code != 200:
-            logger.warning("auth /groups/users/groups returned %s", resp.status_code)
-            return empty
-        data = resp.json() or {}
-        for uid_str, groups in data.items():
-            out[uuid.UUID(uid_str)] = [
-                (uuid.UUID(g["id"]), g.get("name") or "") for g in (groups or [])
-            ]
+            # In batches of auth's own cap (issue #1466): the users of a report are
+            # not bounded, and one body naming them all could pass the request body
+            # limit or the route's 500-id cap.
+            for start in range(0, len(user_ids), USER_GROUPS_BATCH):
+                batch = user_ids[start : start + USER_GROUPS_BATCH]
+                resp = await client.post(
+                    f"{settings.auth_service_url}/groups/users/groups",
+                    json={"user_ids": [str(uid) for uid in batch]},
+                    headers={"Authorization": auth_header},
+                )
+                if resp.status_code != 200:
+                    logger.warning("auth /groups/users/groups returned %s", resp.status_code)
+                    return empty
+                data = resp.json() or {}
+                for uid_str, groups in data.items():
+                    out[uuid.UUID(uid_str)] = [
+                        (uuid.UUID(g["id"]), g.get("name") or "") for g in (groups or [])
+                    ]
     except httpx.HTTPError as exc:
         logger.warning("auth service unreachable while fetching user groups: %s", exc)
         return empty

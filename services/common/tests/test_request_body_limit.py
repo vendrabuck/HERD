@@ -26,13 +26,16 @@ from herd_common import validation_errors
 from herd_common.validation_errors import (
     BODY_TOO_LARGE_TYPE,
     DEFAULT_MAX_REQUEST_BODY_BYTES,
-    UPLOAD_BYTES_ATTRIBUTE,
+    EXTRA_BODY_BYTES_ATTRIBUTE,
+    FORWARD_ENVELOPE_BYTES,
+    MIN_MAX_REQUEST_BODY_BYTES,
     LimitRequestBody,
     RefuseLoneSurrogates,
-    accepts_upload,
     body_too_large_error,
     declares_more_than,
+    extends_body_limit,
     install_validation_errors,
+    max_body_bytes_from_text,
     route_body_limit,
 )
 from httpx import ASGITransport, AsyncClient
@@ -119,7 +122,7 @@ def test_route_body_limit():
     budget = {"bytes": 1000}
 
     class Route:
-        endpoint = accepts_upload(lambda: budget["bytes"])(_upload_endpoint)
+        endpoint = extends_body_limit(lambda: budget["bytes"])(_upload_endpoint)
 
     class Unmarked:
         async def endpoint(self):
@@ -133,13 +136,13 @@ def test_route_body_limit():
     assert route_body_limit(Route(), LIMIT) == LIMIT + 7
 
 
-def test_accepts_upload_returns_the_endpoint_unchanged():
+def test_extends_body_limit_returns_the_endpoint_unchanged():
     async def endpoint(a: int, b: str = "x"):
         return a
 
-    marked = accepts_upload(lambda: 5)(endpoint)
+    marked = extends_body_limit(lambda: 5)(endpoint)
     assert marked is endpoint
-    assert getattr(endpoint, UPLOAD_BYTES_ATTRIBUTE)() == 5
+    assert getattr(endpoint, EXTRA_BODY_BYTES_ATTRIBUTE)() == 5
 
 
 def test_the_one_item_names_the_limit_and_nothing_else():
@@ -155,6 +158,54 @@ def test_the_default_is_four_mebibytes():
     """The one place the number lives (the config copy and the compose defaults are
     pinned to it elsewhere)."""
     assert DEFAULT_MAX_REQUEST_BODY_BYTES == 4 * 1024 * 1024
+    assert MIN_MAX_REQUEST_BODY_BYTES == 64 * 1024
+    assert FORWARD_ENVELOPE_BYTES == 256 * 1024
+
+
+@pytest.mark.parametrize(
+    ("raw", "value"),
+    [
+        ("65536", 65536),
+        (" 4194304\n", 4194304),
+        ("0000065536", 65536),
+        ("99999999999999999999999", 99999999999999999999999),
+        ("65535", None),
+        ("0", None),
+        ("", None),
+        ("   ", None),
+        ("-65536", None),
+        ("+65536", None),
+        ("8388608.0", None),
+        ("1_000_000", None),
+        ("1e6", None),
+        ("0x100000", None),
+        ("4MB", None),
+        ("\u0661\u0660\u0660\u0660\u0660\u0660", None),  # Arabic-Indic digits
+    ],
+)
+def test_the_setting_is_read_as_decimal_digits_at_least_the_floor(raw, value):
+    """The one reading both the Settings field and config's reader use."""
+    assert max_body_bytes_from_text(raw) == value
+
+
+@pytest.mark.parametrize(
+    ("limit", "declared", "over"),
+    [
+        (10**18 - 1, b"1" + b"0" * 18, True),
+        (10**18, b"1" + b"0" * 18, False),
+        (10**18, b"1" + b"0" * 17 + b"1", True),
+        (10**18, b"9" * 18, False),
+        (10**30, b"9" * 30, False),
+        (10**30, b"1" + b"0" * 29 + b"1", True),
+        (10**30, b"1" + b"0" * 31, True),
+        (10**30, b"0" * 40 + b"1" + b"0" * 30, False),
+        (5, b"6", True),
+        (5, b"5", False),
+        (5, b"10", True),
+    ],
+)
+def test_declares_more_than_is_exact_for_any_limit(limit, declared, over):
+    assert declares_more_than([(b"content-length", declared)], limit) is over
 
 
 # -- The middleware, driven with scripted messages ---------------------------------------
@@ -220,7 +271,7 @@ def _assert_refused(refusal: HTTPException | None, limit: int = LIMIT) -> None:
     assert refusal is not None
     assert refusal.status_code == 413
     assert refusal.detail == [body_too_large_error(limit)]
-    assert refusal.headers == {"Connection": "close"}
+    assert refusal.headers is None  # never Connection: close
 
 
 async def test_a_declared_length_over_the_limit_is_refused_before_anything_is_read():
@@ -272,7 +323,7 @@ async def test_messages_are_handed_on_as_received_never_copied_or_joined():
 
 async def test_a_marked_route_takes_its_own_limit():
     class Route:
-        endpoint = accepts_upload(lambda: 100)(_upload_endpoint)
+        endpoint = extends_body_limit(lambda: 100)(_upload_endpoint)
 
     got, refusal, _, _ = await _drive(_chunks(150), headers=_cl(b"150"), route=Route())
     assert refusal is None and len(got[0]["body"]) == 150
@@ -286,13 +337,67 @@ async def test_after_the_response_started_nothing_is_refused_and_the_reading_sto
     """Starlette's disconnect listener can read after a route that never read its body
     has started answering: raising then would break that response, so the read that
     crosses the limit answers `http.disconnect` and hands on no byte past it."""
-    got, refusal, script, sent = await _drive(
-        _chunks(40, 40, 40), headers=_cl(b"120"), start_first=True
-    )
+    got, refusal, script, sent = await _drive(_chunks(40, 40, 40), start_first=True)
     assert refusal is None
     assert [m["type"] for m in got] == ["http.request", "http.disconnect"]
     assert script.taken == 2
     assert [m["type"] for m in sent] == ["http.response.start"]
+
+
+async def test_after_the_response_started_a_declared_length_is_not_refused():
+    """Declared over the limit, read after the response started: no refusal, nothing
+    read, the read answers `http.disconnect`, and so does every later one."""
+    got, refusal, script, sent = await _drive(
+        _chunks(40, 40, 40), headers=_cl(b"120"), start_first=True
+    )
+    assert refusal is None
+    assert got == [{"type": "http.disconnect"}]
+    assert script.taken == 0
+    assert [m["type"] for m in sent] == ["http.response.start"]
+
+
+@pytest.mark.parametrize("declared", [True, False], ids=["declared", "received"])
+async def test_a_read_racing_a_response_start_is_not_refused(declared):
+    """The read Starlette's disconnect listener makes can come before the response it
+    belongs to has sent its start, which is already scheduled. The check yields once
+    before refusing, sees the start, and answers `http.disconnect` instead of raising
+    into a response that has begun."""
+    import anyio
+
+    got: list[dict] = []
+    sent: list[dict] = []
+
+    async def app(scope, receive, send):
+        async with anyio.create_task_group() as group:
+            group.start_soon(send, {"type": "http.response.start", "status": 200, "headers": []})
+            while True:
+                message = await receive()
+                got.append(message)
+                if message["type"] != "http.request" or not message.get("more_body"):
+                    break
+
+    async def send(message):
+        sent.append(message)
+
+    script = _Script(_chunks(40, 40, 40))
+    headers = _cl(b"120") if declared else _cl()
+    scope = {"type": "http", "method": "POST", "path": "/", "headers": headers}
+    await LimitRequestBody(app, max_body_bytes=LIMIT)(scope, script, send)
+    assert got[-1] == {"type": "http.disconnect"}
+    assert sum(len(m.get("body", b"")) for m in got) <= LIMIT
+    assert [m["type"] for m in sent] == ["http.response.start"]
+
+
+async def test_a_streaming_route_that_never_reads_its_body_answers_with_a_body_over_the_limit():
+    """Through the app, with a body: the route streams without reading its body, so
+    the only reads are the disconnect listener's. Nothing is refused and nothing
+    raises; the stream may end early when the listener sees `http.disconnect`, but
+    never answers anything but 200."""
+    async with _client(_app()) as client:
+        for content in (b"x" * (LIMIT * 4), _parts(LIMIT * 4)):
+            resp = await client.post("/stream", content=content)
+            assert resp.status_code == 200
+            assert b"abc".startswith(resp.content)
 
 
 async def test_a_disconnect_and_later_reads_pass_through():
@@ -385,6 +490,7 @@ def _app(*, refuse: bool = True, limit: int = LIMIT) -> FastAPI:
     async def nobody():
         return {"ok": True}
 
+    @app.post("/stream")
     @app.get("/stream")
     async def stream():
         async def parts():
@@ -394,7 +500,7 @@ def _app(*, refuse: bool = True, limit: int = LIMIT) -> FastAPI:
         return StreamingResponse(parts(), media_type="text/event-stream")
 
     @app.post("/upload")
-    @accepts_upload(lambda: 1000)
+    @extends_body_limit(lambda: 1000)
     async def upload(name: str = Form(...), file: UploadFile = File(...)):
         return {"name": name, "size": len(await file.read())}
 
@@ -403,6 +509,12 @@ def _app(*, refuse: bool = True, limit: int = LIMIT) -> FastAPI:
         return {"name": name}
 
     return app
+
+
+async def _parts(total: int, size: int = 16):
+    chunk = b"y" * size
+    for _ in range(total // size):
+        yield chunk
 
 
 def _client(app: FastAPI) -> AsyncClient:
@@ -423,7 +535,7 @@ async def test_the_refusal_is_these_exact_bytes():
         b'"msg":"Request body is larger than 64 bytes"}]}'
     )
     assert resp.headers["content-type"] == "application/json"
-    assert resp.headers["connection"] == "close"
+    assert "connection" not in resp.headers
 
 
 async def test_over_the_limit_is_413_before_authentication():
