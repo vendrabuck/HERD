@@ -25,7 +25,11 @@ import { server } from "../mocks/server";
 import { LoginPage } from "@/pages/LoginPage";
 import { APP_VERSION } from "@/lib/appVersion";
 import { fakeJwt } from "../fixtures/jwt";
-import { expectAuthorCredit, tabToAuthorCredit } from "../authorCredit";
+import {
+  expectAuthorCredit,
+  expectCreditStackedUnderCard,
+  tabToAuthorCredit,
+} from "../authorCredit";
 
 function renderWithProviders(node: ReactNode) {
   const client = new QueryClient({
@@ -352,9 +356,9 @@ describe("LoginPage author credit", () => {
     ]) {
       expect(before).toContain(control);
     }
-    // Outside the card's form, in the page footer.
+    // Outside the card's form, in a footer stacked under the card.
     expect(link.closest("form")).toBeNull();
-    expect(link.closest("footer")).not.toBeNull();
+    expectCreditStackedUnderCard(link, "Hardware Environment Replication and Deployment");
   });
 
   it("renders while the sign-in options are pending, after the configuration link", async () => {

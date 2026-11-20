@@ -23,7 +23,11 @@ vi.mock("react-hot-toast", () => ({
 
 import { server } from "../mocks/server";
 import { RegisterPage } from "@/pages/RegisterPage";
-import { expectAuthorCredit, tabToAuthorCredit } from "../authorCredit";
+import {
+  expectAuthorCredit,
+  expectCreditStackedUnderCard,
+  tabToAuthorCredit,
+} from "../authorCredit";
 
 function renderWithProviders(node: ReactNode) {
   const client = new QueryClient({
@@ -180,6 +184,7 @@ describe("RegisterPage author credit", () => {
     renderWithProviders(<RegisterPage />);
     const link = expectAuthorCredit();
     expect(link.closest("form")).toBeNull();
+    expectCreditStackedUnderCard(link, "Create your account");
     const order = await tabToAuthorCredit();
     expect(order[0]).toBe(screen.getByLabelText("Email"));
     expect(order[order.length - 1]).toBe(link);

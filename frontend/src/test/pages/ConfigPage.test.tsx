@@ -18,7 +18,11 @@ import { server } from "../mocks/server";
 import { ConfigPage } from "@/pages/ConfigPage";
 import { useConfigStore } from "@/stores/configStore";
 import { TOAST_CLEARANCE_CLASS } from "@/lib/toastClearance";
-import { expectAuthorCredit, tabToAuthorCredit } from "../authorCredit";
+import {
+  expectAuthorCredit,
+  expectCreditStackedUnderCard,
+  tabToAuthorCredit,
+} from "../authorCredit";
 
 function renderWithProviders(node: ReactNode) {
   const client = new QueryClient({
@@ -228,6 +232,7 @@ describe("ConfigPage author credit", () => {
     renderWithProviders(<ConfigPage />);
     const link = expectAuthorCredit();
     expect(link.closest("form")).toBeNull();
+    expectCreditStackedUnderCard(link, "Enter the config password to continue");
     const order = await tabToAuthorCredit();
     expect(order[0]).toBe(screen.getByLabelText("Config Password"));
     expect(order[order.length - 1]).toBe(link);
@@ -248,6 +253,7 @@ describe("ConfigPage author credit", () => {
     fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
     await screen.findByText("Change Config Password");
     const link = expectAuthorCredit();
+    expectCreditStackedUnderCard(link, "Change Config Password");
     const order = await tabToAuthorCredit();
     expect(order[0]).toBe(screen.getByLabelText("New Password (8-32 characters)"));
     expect(order).toContain(screen.getByRole("button", { name: "Change Password" }));

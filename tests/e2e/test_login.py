@@ -4,6 +4,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+from .conftest import assert_author_credit_under_card
+
 WAIT = 15
 
 
@@ -36,26 +38,7 @@ def test_login_page_has_author_credit(browser, base_url):
     """The author credit sits under the sign-in card, clear of it, and links to
     the author's LinkedIn profile in a new tab without an opener or referrer."""
     browser.get(f"{base_url}/login")
-    wait = WebDriverWait(browser, WAIT)
-
-    link = wait.until(
-        EC.visibility_of_element_located((By.CSS_SELECTOR, "[data-testid='author-credit'] a"))
-    )
-    credit = browser.find_element(By.CSS_SELECTOR, "[data-testid='author-credit']")
-    assert " ".join(credit.text.split()) == "Designed and built by Lane Nelms"
-    assert link.get_attribute("href") == "https://www.linkedin.com/in/lane-nelms/"
-    assert link.get_attribute("target") == "_blank"
-    assert link.get_attribute("rel") == "noopener noreferrer"
-    # jsdom has no layout, so the no-overlap check lives here: the credit's
-    # footer starts below the card it follows, and the page has no sideways scroll.
-    card_bottom, footer_top, scroll_width, inner_width = browser.execute_script(
-        "const f = document.querySelector(\"[data-testid='author-credit']\").closest('footer');"
-        "const card = f.previousElementSibling.getBoundingClientRect();"
-        "return [card.bottom, f.getBoundingClientRect().top,"
-        " document.documentElement.scrollWidth, document.documentElement.clientWidth];"
-    )
-    assert footer_top >= card_bottom, (card_bottom, footer_top)
-    assert scroll_width <= inner_width, (scroll_width, inner_width)
+    assert_author_credit_under_card(browser, WAIT)
 
 
 def test_login_failure_shows_error(browser, base_url):

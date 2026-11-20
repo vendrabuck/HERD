@@ -51,3 +51,21 @@ export async function tabToAuthorCredit(limit = 20): Promise<Element[]> {
   }
   throw new Error(`the author credit link was not reached by Tab: ${order.length} stops`);
 }
+
+/**
+ * The structure that stacks the credit under a sign-in card: the link sits in
+ * a footer that directly follows the card (`cardText` is text inside it), in a
+ * page wrapper that is a flex column. jsdom has no layout, so this is as far as
+ * a unit test reaches; the e2e helper `assert_author_credit_under_card`
+ * measures the real boxes.
+ */
+export function expectCreditStackedUnderCard(link: HTMLElement, cardText: string): void {
+  const footer = link.closest("footer");
+  expect(footer).not.toBeNull();
+  const card = footer!.previousElementSibling as HTMLElement | null;
+  expect(card).not.toBeNull();
+  expect(card).toHaveTextContent(cardText);
+  expect(card!.className.split(/\s+/)).toContain("max-w-sm");
+  const page = footer!.parentElement!;
+  expect(page.className.split(/\s+/)).toEqual(expect.arrayContaining(["flex", "flex-col"]));
+}
