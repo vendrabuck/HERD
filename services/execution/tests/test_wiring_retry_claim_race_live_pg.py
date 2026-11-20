@@ -67,10 +67,12 @@ quietly corrupting a shared gate stack again.
 
 Isolation from a stack's own tick (issue #1473). Scoping narrows what THIS process's
 tick sees; it does nothing about the other direction. The gate stack's execution
-service runs its own retry tick against the same ledger, and on the 2026-11-19 nightly
-it selected a row this suite had just seeded, could not find the suite's random switch
-in the real inventory, and recorded the pinned non-retryable reason over the row while
-this suite's tick was driving it (the claim-blind failure write fixed by issue #1479).
+service runs its own retry tick against the same ledger. The 2026-11-19 nightly
+failure (a seeded row reported `not_retryable`) matches that tick selecting a row this
+suite had just seeded, not finding the suite's random switch in the real inventory, and
+recording the pinned non-retryable reason over the row while this suite's tick was
+driving it (the claim-blind failure write fixed by issue #1479); that reading comes
+from the code and the log and was not reproduced on a gate.
 Every row this suite seeds now carries HIDDEN_ATTEMPTS, above any real retry cap, so a
 stack's due selects never return it, and this process's tick runs with TEST_TICK_CAP
 above that (the issue #1190 suite's technique).
