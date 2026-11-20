@@ -1576,3 +1576,117 @@ async def test_the_holders_connect_record_locks_rows_in_the_reconciles_order(ses
         await _cleanup(session_factory, other_reservation)
 
     assert states == {x_id: "ACTIVE", y_id: "RELEASED"}
+
+
+@pytest.mark.asyncio
+async def test_the_holders_join_record_locks_rows_in_the_reconciles_order(session_factory):
+    """The L2 shape of the lock-order check: record_l2_membership_active parks a frozen
+    reservation's ACTIVE membership Z on the same port before it flips the holder's row
+    X, so the holder's record must wait on Z while X is still free."""
+    from app.services.l1_assignment_service import freeze_reservation_wiring
+    from app.services.nats_consumer import _apply_one_vlan_action
+    from app.services.wiring_claim import WiringRowClaims
+
+    reservation_id = uuid.uuid4()
+    other_reservation = uuid.uuid4()
+    async with session_factory() as db:
+        own_va = VlanAssignment(reservation_id=reservation_id, fabric_id=uuid.uuid4(), vlan_id=11)
+        other_va = VlanAssignment(
+            reservation_id=other_reservation, fabric_id=uuid.uuid4(), vlan_id=12
+        )
+        db.add_all([own_va, other_va])
+        await db.flush()
+        x = L2PortAssignment(
+            reservation_id=reservation_id,
+            vlan_assignment_id=own_va.id,
+            switch_device_id=SWITCH_ID,
+            port="0/0/95",
+            status="FAILED",
+            intended="ACTIVE",
+            attempts=HIDDEN_ATTEMPTS,
+            last_error="driver timeout",
+        )
+        z = L2PortAssignment(
+            reservation_id=other_reservation,
+            vlan_assignment_id=other_va.id,
+            switch_device_id=SWITCH_ID,
+            port="0/0/95",
+            status="ACTIVE",
+            intended="ACTIVE",
+        )
+        db.add_all([x, z])
+        await db.commit()
+        x_id, z_id, own_va_id = x.id, z.id, own_va.id
+    async with session_factory() as db:
+        await freeze_reservation_wiring(db, other_reservation)
+
+    holder = WiringRowClaims()
+    async with session_factory() as db:
+        assert await holder.claim(db, L2PortAssignment, x_id) is True
+
+    execute_fn, _calls, _entered, release, _state = _gated_driver_stub()
+    release.set()
+    patches = _patches(execute_fn, reservation_id)
+    blocker = session_factory()
+    for p in patches:
+        p.start()
+    try:
+        await blocker.execute(
+            select(L2PortAssignment.id).where(L2PortAssignment.id == z_id).with_for_update()
+        )
+
+        async def _holder():
+            async with session_factory() as db:
+                await _apply_one_vlan_action(
+                    db,
+                    "add_to_vlan",
+                    "/tmp/driver",
+                    {},
+                    set(),
+                    SWITCH_ID,
+                    DRIVER_ID,
+                    "sha256abc",
+                    reservation_id,
+                    "0/0/95",
+                    11,
+                    own_va_id,
+                    retry_row_id=x_id,
+                    claims=holder,
+                )
+
+        task = asyncio.create_task(_holder())
+        for _ in range(int(COORDINATION_TIMEOUT / 0.05)):
+            async with session_factory() as probe:
+                waiting = (
+                    await probe.execute(text("SELECT count(*) FROM pg_locks WHERE NOT granted"))
+                ).scalar_one()
+            if waiting >= 1 or task.done():
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail("the holder's record never queued on the other reservation's row")
+        assert not task.done(), "the record must wait for Z before it locks X"
+        assert await _row_lockable_now(session_factory, L2PortAssignment, x_id), (
+            "X must still be free while the record waits on Z (Z is locked first)"
+        )
+        await blocker.rollback()
+        await asyncio.wait_for(task, COORDINATION_TIMEOUT)
+        async with session_factory() as db:
+            states = {
+                r.id: (r.status, r.intended)
+                for r in (
+                    await db.execute(
+                        select(L2PortAssignment).where(L2PortAssignment.id.in_([x_id, z_id]))
+                    )
+                )
+                .scalars()
+                .all()
+            }
+    finally:
+        await blocker.close()
+        for p in patches:
+            p.stop()
+        await _cleanup(session_factory, reservation_id)
+        await _cleanup(session_factory, other_reservation)
+
+    assert states == {x_id: ("ACTIVE", "ACTIVE"), z_id: ("FAILED", "RELEASED")}
