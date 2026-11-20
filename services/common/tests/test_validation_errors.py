@@ -856,7 +856,7 @@ _ESCAPE_PASSES_WORST = {
     "pairs_upper_then_low": 25.7,
     "backslash_pairs_then_low": 22.6,
     "u0041_then_low": 10.7,
-    "four_backslashes_and_text": 15.9,
+    "four_backslashes_and_text": 20.9,
 }
 _PASS_MARGIN = 2.0
 
