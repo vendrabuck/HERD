@@ -62,6 +62,16 @@ Read by every database service (auth, inventory, reservations, cabling, acl, exe
 
 The budget: one service process opens at most `DB_POOL_SIZE + DB_MAX_OVERFLOW` connections, so the eleven database services open at most 11 x (5 + 10) = 165 with the defaults, which are SQLAlchemy's own pool defaults made explicit. The compose `postgres` service runs with `-c max_connections=200`, which leaves 200 - 165 = 35 for psql sessions, `make migrate`, and the Postgres-live test suites. Each extra execution replica (`EXECUTION_POLLER_ONLY=true`) adds another 15. Raising either variable on all eleven services by one adds 11. SQLite URLs (the services' unit tests) take only `DB_POOL_PRE_PING`: SQLAlchemy chooses their pool, and the in-memory one refuses size arguments. `tests/unit/test_compose_capacity.py` fails when the compose defaults add up to more than `max_connections`, and when this paragraph or docs/OPERATIONS.md stops stating the arithmetic the compose defaults give.
 
+## Request body limit
+
+Read by every service, config included (issue #1466). The eleven `herd_common` services read it through `HerdBaseSettings` and refuse to start on a value that is not an integer or is below 1; config reads it in `services/config/app/request_limits.py`, where a value that is not a positive integer logs a warning and is the default. `docker-compose.yml` passes it to all twelve.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MAX_REQUEST_BODY_BYTES` | `4194304` (4 MiB) | The largest request body a route accepts. A body over it is answered 413 (`body_too_large`) before it is parsed, scanned, or authenticated: refused at once when its `Content-Length` says so, or as soon as the bytes received pass it. An upload route accepts this plus the files it bounds itself: `DRIVER_MAX_SIZE_BYTES` for a driver package, `UPLOAD_MAX_FILES` times `UPLOAD_MAX_FILE_BYTES` for AI generate, the base64 length of `VALIDATE_PACKAGE_MAX_BYTES` for execution's package validator, and a fixed 10 MiB for the inventory and cabling bulk imports (OPS-VALID-10 lists them). |
+
+The default holds the largest legitimate JSON body, a topology canvas save, with room: a device node carries the whole device record, about 1.3 KB, and a link about 0.5 KB, so a canvas of 1,000 devices and 4,000 links is about 3.1 MiB. Raise it on every service together if your canvases are larger: a reservation's fork save passes the canvas from reservations to cabling, and the `/api/v1` facade forwards bodies to the services behind it, so a lower limit anywhere on that path refuses the save there. The gateway itself sets no body limit.
+
 ## Superadmin seed (first-run only)
 
 Read once at startup to create the seeded superadmin. Ignored on subsequent restarts; changing them post-seed does nothing.

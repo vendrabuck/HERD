@@ -4,7 +4,7 @@ HERD's load tests drive the HTTP API with [Locust](https://locust.io/), a Python
 
 ## What the tests do
 
-The locustfile lives at `tests/load/locustfile.py`. It defines one abstract base class and nine concrete user classes in the default mix (plus the opt-in `OidcLoginUser`, which runs only in the OIDC-mode stack phase):
+The locustfile lives at `tests/load/locustfile.py`. It defines one abstract base class and ten concrete user classes in the default mix (plus the opt-in `OidcLoginUser`, which runs only in the OIDC-mode stack phase):
 
 ### `HerdUser` (base)
 
@@ -142,9 +142,19 @@ Shows auth's per-source password-attempt limit (IAM-LOGIN-7) under load.
 - Task: sends wrong-password logins for an unknown account until auth answers 429, then keeps going for 5 seconds. Every answer must be the 401 a judged attempt gets or a 429 with a whole-second `Retry-After`; any other answer, a 503 from the hashing pool included, is a recorded failure and the run exits 1.
 - It empties this host's allowance, so a suite started right after `make test-load` may meet a 429 until it refills (about a minute with the defaults). See `tests/load/README.md`.
 
+### `OversizedBodySender` (exactly one user)
+
+Shows the request body limit (OPS-VALID-9, issue #1466) under load.
+
+- It never signs in, so it costs none of this host's login allowance, and every request it sends has no credentials.
+- Task: sends a body of `MAX_REQUEST_BODY_BYTES` + 1 bytes (read from the environment or the repo-root `.env`, 4194304 by default) that is not JSON to one route of every service in turn, the first round with a `Content-Length` and the next chunked, and so on. The routes: `POST /api/acl/grants`, `POST /api/ai/commit`, `POST /api/auth/groups`, `POST /api/cabling/topologies`, `PUT /api/config/settings`, `POST /api/execution/execute`, `POST /api/inventory/devices`, `PUT /api/notifications/notifications/preferences`, `POST /api/reservations/`, `POST /api/secrets/secrets`, `PUT /api/user-profile/preferences`, `POST /api/v1/webhooks`.
+- Every answer must be 413 with the one `body_too_large` item naming the limit; a 401 (authentication ran first), a 422 (the body was parsed), a 5xx, or any other answer is a recorded failure and the run exits 1. Its requests are named `<path> [413 over the body limit]` and `<path> [413 over the body limit, chunked]`, apart from everyone else's.
+- What to compare: the other users' p95 and p99 in the same report against a run that names the other classes on the command line and leaves this one out. A refusal costs a service at most the limit's worth of reading and never a parse, so the other rows should not move.
+- Think time: 1 to 2 seconds.
+
 ### Class weighting
 
-Locust picks which class to spawn using the `weight` attribute. With the defaults (`ReservationUser` 3, `InventoryBrowser` 5, `BulkExporter` 1, `RoutedTopologyValidator` 1, `NotificationUser` 2, `ACLChecker` 2, `BulkConnectionAdmin` 1, `DeviceConfigUser` 1; total 16), out of every 16 virtual users you get roughly 3 reservation users, 5 inventory browsers, 1 bulk exporter, 1 routed-topology validator, 2 notification users, 2 ACL checkers, 1 bulk-connection admin, and 1 device-config user. `LoginLimitProbe` has no weight: it is always exactly one user. Increase `-u` to scale the eight weighted classes proportionally.
+Locust picks which class to spawn using the `weight` attribute. With the defaults (`ReservationUser` 3, `InventoryBrowser` 5, `BulkExporter` 1, `RoutedTopologyValidator` 1, `NotificationUser` 2, `ACLChecker` 2, `BulkConnectionAdmin` 1, `DeviceConfigUser` 1; total 16), out of every 16 virtual users you get roughly 3 reservation users, 5 inventory browsers, 1 bulk exporter, 1 routed-topology validator, 2 notification users, 2 ACL checkers, 1 bulk-connection admin, and 1 device-config user. `LoginLimitProbe` and `OversizedBodySender` have no weight: each is always exactly one user. Increase `-u` to scale the eight weighted classes proportionally.
 
 ## Prerequisites
 
