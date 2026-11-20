@@ -33,6 +33,7 @@ tasks against a live Postgres.
 """
 
 import uuid
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
@@ -70,6 +71,7 @@ from app.services.wiring_claim import (
     WiringRowClaims,
     claim_budget,
     claimable_row_ids,
+    write_guard,
 )
 from app.services.wiring_retry_service import reattempt_reservation
 from sqlalchemy import select
@@ -620,6 +622,404 @@ async def test_a_pass_whose_switch_load_fails_reports_a_held_row_in_progress(lay
     assert [o["outcome"] for o in outcomes] == ["in_progress"]
     assert await _ledger_state(layer, row_id) == before
     assert driver.call_count == 0
+
+
+# --- Every retry-path write respects the claim, by the database (issue #1479) --
+#
+# The settles a retry pass makes on rows it never claimed (the stale-build parks, the
+# supersession releases, the L2 nil-allocation release, the L3 unapplied-pin release)
+# run only on a row nobody holds; on a row another pass holds they change nothing and
+# the row reads back `in_progress`. Each test runs the real pass both ways: held by
+# another pass (refused) and free (the settle happens), so it fails in either
+# direction. The holder side: whether a pass still holds a row is the row's stamp in
+# the database, so a holder whose claim expired and was taken over is refused like
+# anyone else, while one whose expired claim nobody took still writes.
+
+OTHER_RES = uuid.uuid4()
+
+
+async def _held_by_another_pass(model, row_id) -> datetime:
+    """Claim the row with a separate pass's ledger; return the stamp it wrote."""
+    other = WiringRowClaims()
+    async with TestSessionLocal() as s:
+        assert await other.claim(s, model, row_id) is True
+    return other.held[row_id]
+
+
+async def _loaded(model, row_id):
+    async with TestSessionLocal() as s:
+        return (await s.execute(select(model).where(model.id == row_id))).scalars().all()
+
+
+async def _ledger_row(model, row_id):
+    async with TestSessionLocal() as s:
+        return (await s.execute(select(model).where(model.id == row_id))).scalar_one()
+
+
+def _retry_pass_patches(**extra):
+    """The reads a retry pass makes before its writes: intent is gone (an empty fork),
+    the switch is gone (nothing reaches a driver), and the L3 derivations are empty."""
+    patches = [
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            AsyncMock(return_value=[]),
+        ),
+        patch("app.services.nats_consumer._fetch_device", AsyncMock(return_value=None)),
+        patch("app.services.nats_consumer._fetch_template", AsyncMock(return_value=None)),
+        patch("app.services.nats_consumer._derive_l3_adjacency", AsyncMock(return_value={})),
+        patch("app.services.nats_consumer._wired_ports_by_device", lambda wires: {}),
+    ]
+    patches += [patch(target, value) for target, value in extra.items()]
+    return patches
+
+
+async def _run_pass(layer, loaded, *patches):
+    from app.services.wiring_retry_service import (
+        _reattempt_l2_rows,
+        _reattempt_l3_rows,
+        _reattempt_rows,
+    )
+
+    reattempt = {"l1": _reattempt_rows, "l2": _reattempt_l2_rows, "l3": _reattempt_l3_rows}
+    with ExitStack() as stack:
+        driver = stack.enter_context(patch("app.services.driver_sandbox.execute_driver_method"))
+        for p in patches:
+            stack.enter_context(p)
+        outcomes = await reattempt[layer](loaded, _db_session_factory(), WiringRowClaims(), set())
+    assert driver.call_count == 0
+    return [o["outcome"] for o in outcomes]
+
+
+@pytest.mark.parametrize("held", [True, False], ids=["held", "free"])
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_a_stale_build_park_skips_a_row_another_pass_holds(layer, held):
+    """Finding 1 of the #1479 review: a pass whose copy of a build row is stale (the
+    fork no longer intends it) parks it FAILED intended RELEASED with attempts 0 and
+    the claim cleared. On a row another pass is driving that handed the row to a third
+    pass mid-drive; the park must be refused there."""
+    from app.services.nats_consumer import WIRING_STALE_BUILD_REASON
+
+    row_id = await _seed_layer(layer, intended="ACTIVE")
+    loaded = await _loaded(_MODEL[layer], row_id)
+    if held:
+        await _held_by_another_pass(_MODEL[layer], row_id)
+    before = await _ledger_state(layer, row_id)
+
+    outcomes = await _run_pass(layer, loaded, *_retry_pass_patches())
+
+    after = await _ledger_state(layer, row_id)
+    if held:
+        assert outcomes == ["in_progress"]
+        assert after == before, "a park refused on a held row changes nothing"
+    else:
+        assert outcomes == ["still_failed"]
+        assert after == ("FAILED", 0, WIRING_STALE_BUILD_REASON, None)
+
+
+async def _seed_l1_active_other():
+    async with TestSessionLocal() as s:
+        s.add(
+            L1ConnectionAssignment(
+                reservation_id=OTHER_RES,
+                switch_device_id=SWITCH_ID,
+                port_a="0/0/1",
+                port_b="0/0/9",
+                status="ACTIVE",
+                intended="ACTIVE",
+            )
+        )
+        await s.commit()
+
+
+async def _seed_l2_active_other():
+    async with TestSessionLocal() as s:
+        va = VlanAssignment(reservation_id=OTHER_RES, fabric_id=uuid.uuid4(), vlan_id=200)
+        s.add(va)
+        await s.flush()
+        s.add(
+            L2PortAssignment(
+                reservation_id=OTHER_RES,
+                vlan_assignment_id=va.id,
+                switch_device_id=SWITCH_ID,
+                port="0/0/1",
+                status="ACTIVE",
+                intended="ACTIVE",
+            )
+        )
+        await s.commit()
+
+
+@pytest.mark.parametrize("held", [True, False], ids=["held", "free"])
+@pytest.mark.parametrize("layer", ["l1", "l2"])
+async def test_a_supersession_settle_skips_a_row_another_pass_holds(layer, held):
+    """A release whose port another reservation now holds ACTIVE is settled RELEASED
+    with no driver call; on a row another pass is driving, it is not."""
+    row_id = await _seed_layer(layer, intended="RELEASED")
+    await (_seed_l1_active_other() if layer == "l1" else _seed_l2_active_other())
+    loaded = await _loaded(_MODEL[layer], row_id)
+    if held:
+        await _held_by_another_pass(_MODEL[layer], row_id)
+    before = await _ledger_state(layer, row_id)
+
+    outcomes = await _run_pass(layer, loaded, *_retry_pass_patches())
+
+    after = await _ledger_state(layer, row_id)
+    if held:
+        assert outcomes == ["in_progress"]
+        assert after == before
+    else:
+        assert outcomes == ["superseded"]
+        assert after[0] == "RELEASED"
+
+
+@pytest.mark.parametrize("held", [True, False], ids=["held", "free"])
+async def test_the_l2_nil_allocation_release_skips_a_row_another_pass_holds(held):
+    """A build row with no usable allocation whose intent is gone is released directly
+    (no VLAN number to remove); on a row another pass is driving, it is not."""
+    row_id = await _seed_l2_failed(uuid.UUID(int=0), intended="ACTIVE")
+    loaded = await _loaded(L2PortAssignment, row_id)
+    if held:
+        await _held_by_another_pass(L2PortAssignment, row_id)
+    before = await _ledger_state("l2", row_id)
+
+    outcomes = await _run_pass("l2", loaded, *_retry_pass_patches())
+
+    after = await _ledger_state("l2", row_id)
+    if held:
+        assert outcomes == ["in_progress"]
+        assert after == before
+    else:
+        assert outcomes == ["released"]
+        assert after[0] == "RELEASED"
+
+
+@pytest.mark.parametrize("held", [True, False], ids=["held", "free"])
+async def test_the_l3_unapplied_pin_release_skips_a_row_another_pass_holds(held):
+    """A build pin with no routes from any source is released (WIRE-L3-4); on a row
+    another pass is driving, it is not, and the pass reports it in_progress rather than
+    still_failed."""
+    async with TestSessionLocal() as s:
+        row = RouteAssignment(
+            reservation_id=RES_ID,
+            device_id=SWITCH_ID,
+            routes=[],
+            status="FAILED",
+            intended="ACTIVE",
+            attempts=0,
+            last_error="driver timeout",
+        )
+        s.add(row)
+        await s.commit()
+        row_id = row.id
+    loaded = await _loaded(RouteAssignment, row_id)
+    if held:
+        await _held_by_another_pass(RouteAssignment, row_id)
+    before = await _ledger_state("l3", row_id)
+
+    outcomes = await _run_pass(
+        "l3",
+        loaded,
+        *_retry_pass_patches(
+            **{
+                "app.services.nats_consumer._derive_l3_adjacency": AsyncMock(
+                    return_value={str(SWITCH_ID): set()}
+                ),
+                "app.services.nats_consumer._fetch_latest_config": AsyncMock(
+                    return_value={"config": {"routes": []}}
+                ),
+            }
+        ),
+    )
+
+    after = await _ledger_state("l3", row_id)
+    if held:
+        assert outcomes == ["in_progress"]
+        assert after == before
+    else:
+        assert outcomes == ["released"]
+        assert after[0] == "RELEASED"
+
+
+async def _superseded_holder(layer, intended="ACTIVE"):
+    """Pass A claims the row with a claim that is already expired; pass B takes it over.
+
+    Returns (row_id, A's ledger). A still lists the row in `held`: only the database
+    knows A no longer holds it.
+    """
+    row_id = await _seed_layer(layer, intended=intended)
+    stale = WiringRowClaims(budget=timedelta(seconds=-60))
+    async with TestSessionLocal() as s:
+        assert await stale.claim(s, _MODEL[layer], row_id) is True
+    await _held_by_another_pass(_MODEL[layer], row_id)
+    assert row_id in stale.held
+    return row_id, stale
+
+
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_a_superseded_holder_cannot_record_a_failure(db, layer):
+    """Finding 2 of the #1479 review: `held` was in-process belief. A holder whose
+    claim expired and was taken over must not free the new holder's claim."""
+    row_id, stale = await _superseded_holder(layer)
+    before = await _ledger_state(layer, row_id)
+
+    assert await _write_failure(layer, db, row_id, stale) is None
+    assert await _ledger_state(layer, row_id) == before
+    assert stale.lost == {row_id}
+
+
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_a_superseded_holder_cannot_flip_success_or_release(layer):
+    """The holder's success and release flips go through write_guard, which judges the
+    stamp the same way: a superseded holder is refused and changes nothing."""
+    row_id, stale = await _superseded_holder(layer)
+    before = await _ledger_state(layer, row_id)
+
+    async with TestSessionLocal() as s, write_guard(s, _MODEL[layer], row_id, stale) as ok:
+        assert ok is False
+    assert stale.lost == {row_id}
+    assert await _ledger_state(layer, row_id) == before
+
+
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_a_holder_whose_expired_claim_nobody_took_still_writes(db, layer):
+    """The stamp is the holder's until someone replaces it: an expired claim nobody
+    took over still matches, so the holder's own writes land."""
+    row_id = await _seed_layer(layer)
+    late = WiringRowClaims(budget=timedelta(seconds=-60))
+    assert await late.claim(db, _MODEL[layer], row_id) is True
+    async with TestSessionLocal() as s, write_guard(s, _MODEL[layer], row_id, late) as ok:
+        assert ok is True
+
+    assert await _write_failure(layer, db, row_id, late) is not None
+    assert await _ledger_state(layer, row_id) == ("FAILED", 2, "again", None)
+    assert late.lost == set()
+
+
+@pytest.mark.parametrize("layer", ["l1", "l2"])
+async def test_a_superseded_holder_drives_but_records_nothing(layer):
+    """Pass level, the per-row apply: a holder that believes it holds the row (it is in
+    `held`) but whose claim was taken over records neither its success nor its
+    failure; the new holder's stamp and the row stay as they were."""
+    from app.services.nats_consumer import _apply_one_port_action, _apply_one_vlan_action
+
+    row_id, stale = await _superseded_holder(layer)
+    before = await _ledger_state(layer, row_id)
+    va = (await _ledger_row(L2PortAssignment, row_id)).vlan_assignment_id if layer == "l2" else None
+    for result in (
+        {"success": True, "output": {}, "error": None, "duration_ms": 1},
+        {"success": False, "output": None, "error": "boom", "duration_ms": 1},
+    ):
+        stale.lost.clear()
+        with patch("app.services.driver_sandbox.execute_driver_method", return_value=result):
+            async with TestSessionLocal() as s:
+                if layer == "l1":
+                    await _apply_one_port_action(
+                        s,
+                        "connect_ports",
+                        "/tmp/d",
+                        {},
+                        set(),
+                        SWITCH_ID,
+                        uuid.uuid4(),
+                        "sha",
+                        RES_ID,
+                        "0/0/1",
+                        "0/0/2",
+                        None,
+                        retry_row_id=row_id,
+                        claims=stale,
+                    )
+                else:
+                    await _apply_one_vlan_action(
+                        s,
+                        "add_to_vlan",
+                        "/tmp/d",
+                        {},
+                        set(),
+                        SWITCH_ID,
+                        uuid.uuid4(),
+                        "sha",
+                        RES_ID,
+                        "0/0/1",
+                        100,
+                        va,
+                        retry_row_id=row_id,
+                        claims=stale,
+                    )
+        assert await _ledger_state(layer, row_id) == before, result["success"]
+        assert stale.lost == {row_id}
+
+
+@pytest.mark.parametrize("failing", [None, "login", "remove_route"])
+async def test_a_superseded_l3_holder_drives_but_records_nothing(failing):
+    """Pass level, the L3 per-switch apply: a superseded holder records neither its
+    success (the per-switch release), its login failure, nor its route failure."""
+    import httpx
+    from app.services.nats_consumer import _apply_l3_adjacency, _FetchContext
+
+    row_id, stale = await _superseded_holder("l3", intended="RELEASED")
+    before = await _ledger_state("l3", row_id)
+    switch = {
+        "id": str(SWITCH_ID),
+        "name": "l3",
+        "template_id": "t",
+        "driver_id": str(uuid.uuid4()),
+        "driver_sha256": "sha",
+        "driver_filename": "d.zip",
+        "connection_type": "Layer 3 Switch",
+        "field_data": {},
+    }
+
+    def _driver(driver_path, action, context, **kwargs):
+        if action == failing:
+            return {"success": False, "output": None, "error": "boom", "duration_ms": 1}
+        return {"success": True, "output": {}, "error": None, "duration_ms": 1}
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch("app.services.nats_consumer._fetch_device", AsyncMock(return_value=switch))
+        )
+        stack.enter_context(
+            patch(
+                "app.services.nats_consumer._fetch_template",
+                AsyncMock(return_value={"id": "t", "sections": []}),
+            )
+        )
+        stack.enter_context(
+            patch("app.services.driver_loader.load_driver", AsyncMock(return_value="/tmp/d"))
+        )
+        stack.enter_context(
+            patch("app.services.driver_loader.get_driver_metadata", AsyncMock(return_value={}))
+        )
+        driver = stack.enter_context(
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=_driver)
+        )
+        async with httpx.AsyncClient() as client:
+            await _apply_l3_adjacency(
+                str(RES_ID),
+                [{"device_id": str(SWITCH_ID), "routes": [{"destination": "10.0.0.0/24"}]}],
+                [],
+                _FetchContext(client),
+                _db_session_factory(),
+                retry_row_ids={str(SWITCH_ID): row_id},
+                claims=stale,
+            )
+
+    assert driver.call_count > 0, "the superseded holder still drives (it cannot know)"
+    assert await _ledger_state("l3", row_id) == before
+    assert stale.lost == {row_id}
+
+
+async def test_write_guard_does_nothing_without_a_ledger(db):
+    """The reconcile passes no claim ledger: the guard yields True on a row another
+    pass holds without reading the row, so every reconcile write is exactly as before."""
+    row_id = await _seed_l1_failed()
+    await _held_by_another_pass(L1ConnectionAssignment, row_id)
+    with patch.object(db, "execute", AsyncMock(side_effect=AssertionError("no read"))):
+        async with write_guard(db, L1ConnectionAssignment, row_id, None) as ok:
+            assert ok is True
+        async with write_guard(db, L1ConnectionAssignment, None, WiringRowClaims()) as ok:
+            assert ok is True
 
 
 # --- The manual channel reports in_progress ----------------------------------

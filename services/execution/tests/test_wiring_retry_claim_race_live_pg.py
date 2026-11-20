@@ -73,9 +73,15 @@ suite had just seeded, not finding the suite's random switch in the real invento
 recording the pinned non-retryable reason over the row while this suite's tick was
 driving it (the claim-blind failure write fixed by issue #1479); that reading comes
 from the code and the log and was not reproduced on a gate.
-Every row this suite seeds now carries HIDDEN_ATTEMPTS, above any real retry cap, so a
-stack's due selects never return it, and this process's tick runs with TEST_TICK_CAP
-above that (the issue #1190 suite's technique).
+Every row this suite seeds now carries HIDDEN_ATTEMPTS (1,000,000), far above the
+default retry cap of 10, so a stack's due selects never return it as long as the stack
+runs with a cap at or below that value (`WIRING_RETRY_MAX_ATTEMPTS` is an unbounded
+setting, so a stack configured above 1,000,000 would see them), and this process's tick
+runs with TEST_TICK_CAP above that (the issue #1190 suite's technique). The tick of THIS
+process selects at that raised cap through the real due selects, so each of its short
+selects takes FOR UPDATE SKIP LOCKED on up to SCOPED_SELECT_LIMIT (10,000) FAILED rows
+of the shared ledger, foreign ones included, for the length of that one select; a stack
+tick that runs in that window skips those rows for that tick.
 """
 
 from __future__ import annotations
@@ -84,6 +90,7 @@ import asyncio
 import os
 import threading
 import uuid
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -223,10 +230,11 @@ SUCCESS = {"success": True, "output": {"result": True}, "error": None, "duration
 
 # Issue #1473, the issue #1190 suite's isolation: every row this suite seeds carries
 # this many attempts. A stack's own retry tick selects only rows with
-# `attempts < wiring_retry_max_attempts` (10 by default), in the SQL of its three due
-# selects, so it never loads, claims, drives, or writes these rows. This process's own
-# tick runs with TEST_TICK_CAP (see _patches), which is above it. The manual channel
-# ignores the cap by design, so it needs nothing.
+# `attempts < wiring_retry_max_attempts` (10 by default, an unbounded setting), in the
+# SQL of its three due selects, so a stack whose cap is at or below this value never
+# loads, claims, drives, or writes these rows. This process's own tick runs with
+# TEST_TICK_CAP (see _patches), which is above it. The manual channel ignores the cap
+# by design, so it needs nothing.
 HIDDEN_ATTEMPTS = 1_000_000
 TEST_TICK_CAP = HIDDEN_ATTEMPTS + 1
 # The raised cap makes every FAILED row of a used ledger a candidate of the real due
@@ -265,12 +273,20 @@ def _gated_driver_stub():
     `state["fail_logins"]`, when true, makes a login answer a driver failure. The stub
     runs in the worker thread `nats_consumer._run_sandbox` hands it, so its waits never
     block the event loop; `release.wait` is bounded and records an expiry in
-    `state["release_timed_out"]` for the test to fail on.
+    `state["release_timed_out"]` for the test to fail on. `state["returned"]` turns true
+    only once that gated row action has finished waiting and is about to return, so a
+    test that finds it true when the loser has returned knows the stub did not hold the
+    holder (a stub that stopped blocking is detected, not trusted).
     """
     calls: list[str] = []
     entered = threading.Event()
     release = threading.Event()
-    state = {"fail_logins": False, "blocked": False, "release_timed_out": False}
+    state = {
+        "fail_logins": False,
+        "blocked": False,
+        "release_timed_out": False,
+        "returned": False,
+    }
 
     def execute_fn(driver_path, action, context, **kwargs):
         calls.append(action)
@@ -281,6 +297,7 @@ def _gated_driver_stub():
             entered.set()
             if not release.wait(COORDINATION_TIMEOUT):
                 state["release_timed_out"] = True
+            state["returned"] = True
         return SUCCESS
 
     return execute_fn, calls, entered, release, state
@@ -310,14 +327,15 @@ async def _loser_inside_holders_drive(holder_coro, run_loser, stub_state, entere
     The order is fixed by events, not timing: start the holder; wait until the stub
     reports it inside its drive (its claim committed); run the loser to completion;
     only then release the stub. Returns (holder_result, loser_result) and fails if the
-    holder had finished before the loser returned or the stub's release wait expired.
+    holder's gated row action had returned (or the holder had finished) before the
+    loser returned, or if the stub's release wait expired.
     """
     holder = asyncio.create_task(holder_coro)
     holder_was_driving = False
     try:
         await _wait_entered(entered, holder)
         loser_result = await run_loser()
-        holder_was_driving = not holder.done()
+        holder_was_driving = not stub_state["returned"] and not holder.done()
     finally:
         release.set()
         holder_result = await asyncio.wait_for(holder, COORDINATION_TIMEOUT)
@@ -443,9 +461,11 @@ def _row_calls(calls: list[str]) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_seeded_rows_are_invisible_to_a_stack_tick(session_factory):
-    """Issue #1473: the three real due selects, at the cap a stack runs with (this
-    process's unpatched setting), return none of the rows this suite seeds, while the
-    same selects at TEST_TICK_CAP do."""
+    """Issue #1473: the three real due selects, at this process's unpatched cap (the
+    default, 10, unless the environment sets another), return none of the rows this
+    suite seeds, while the same selects at TEST_TICK_CAP do. It proves the hiding for
+    a stack that runs that same cap; it does not prove it for a stack configured with a
+    cap above HIDDEN_ATTEMPTS, and it does not run a stack's tick."""
     reservation_id = uuid.uuid4()
     async with session_factory() as db:
         alloc = VlanAssignment(reservation_id=reservation_id, fabric_id=uuid.uuid4(), vlan_id=1)
@@ -843,18 +863,20 @@ async def _preselect_own_row(session_factory, row_id):
 
 @pytest.mark.asyncio
 async def test_a_load_failure_from_an_early_pass_must_not_rewrite_a_held_row(session_factory):
-    """Issue #1473: a held row must still read `in_progress` to the manual channel.
+    """Regression guard for issue #1479: a held row still reads `in_progress` to the
+    manual channel when a pass that never claimed it fails to load its switch.
 
     Three passes, ordered by explicit events, no sleeps. Pass B (a second tick, for
     example another replica or the gate stack's own execution service) selects the row
     while it is free. Pass A (this test's tick) then claims it and enters its drive,
     where the stub holds it. B now reaches its apply and cannot load the switch (404,
     so `recorded hop unresolvable: switch ... not found`, a pinned non-retryable
-    reason). B's failure write is the issue #814 row-identity compare-and-swap, whose
-    predicate is `id AND status = 'FAILED'` only: it does not consult the claim, so it
-    overwrites `last_error` and clears `claimed_until` on a row A still holds. The
-    manual call made while A still holds the drive then reports `not_retryable` (it
-    classifies by `last_error` before it looks at the claim) instead of `in_progress`.
+    reason), and records that failure by row id. Before #1479 that write matched on
+    `id AND status = 'FAILED'` only, so it overwrote `last_error` and cleared
+    `claimed_until` on the row A still held, and the manual call made during A's drive
+    answered `not_retryable` (it classifies by `last_error` before it looks at the
+    claim). The write now requires the row unclaimed, so it is refused, the row keeps
+    A's claim and reason, and the manual call answers `in_progress`.
     """
     from app.services.wiring_claim import WiringRowClaims
     from app.services.wiring_retry_service import _reattempt_rows
@@ -884,7 +906,7 @@ async def test_a_load_failure_from_an_early_pass_must_not_rewrite_a_held_row(ses
             mid_last_error, mid_claimed_until = mid.last_error, mid.claimed_until
 
         manual_result = await reattempt_reservation(reservation_id, _session_ctx(session_factory))
-        holder_still_driving = not release.is_set() and not holder.done()
+        holder_still_driving = not release.is_set() and not state["returned"] and not holder.done()
     finally:
         release.set()
         if holder is not None:
@@ -906,13 +928,14 @@ async def test_a_load_failure_from_an_early_pass_must_not_rewrite_a_held_row(ses
 
 @pytest.mark.asyncio
 async def test_a_login_failure_from_an_early_pass_must_not_free_a_held_row(session_factory):
-    """Issue #1473, the double-drive consequence of the same write.
+    """Regression guard for issue #1479, the double-drive consequence of the same write.
 
-    As above, but pass B's switch loads and its LOGIN fails (a retryable reason). B's
-    failure write clears `claimed_until` on the row A is still driving, so the row is
-    claimable again: the manual call made while A still holds the drive claims it and
-    calls the driver a SECOND time for the same row, the exact thing issue #817's
-    claim exists to forbid.
+    As above, but pass B's switch loads and its LOGIN fails (a retryable reason).
+    Before #1479 B's failure write cleared `claimed_until` on the row A was still
+    driving, so the row became claimable again and the manual call made during A's
+    drive claimed it and called the driver a SECOND time for the same row, the exact
+    thing issue #817's claim exists to forbid. B's write is now refused, A keeps its
+    claim, and the manual call drives nothing and answers `in_progress`.
     """
     from app.services.wiring_claim import WiringRowClaims
     from app.services.wiring_retry_service import _reattempt_rows
@@ -935,7 +958,7 @@ async def test_a_login_failure_from_an_early_pass_must_not_free_a_held_row(sessi
         state["fail_logins"] = False
 
         manual_result = await reattempt_reservation(reservation_id, _session_ctx(session_factory))
-        holder_still_driving = not release.is_set() and not holder.done()
+        holder_still_driving = not release.is_set() and not state["returned"] and not holder.done()
     finally:
         release.set()
         if holder is not None:
@@ -952,3 +975,264 @@ async def test_a_login_failure_from_an_early_pass_must_not_free_a_held_row(sessi
         f"{_row_calls(calls)}, manual outcome {outcomes}"
     )
     assert outcomes == {str(row_id): "in_progress"}
+
+
+# Issue #1479 review, finding 2: whether a pass still holds a row is judged by the
+# database, through the exact `claimed_until` stamp its claim wrote. That needs the
+# stamp Python computed and the timestamptz Postgres stored to compare equal in SQL.
+
+
+async def _seed_failed_row(session_factory, reservation_id, layer):
+    async with session_factory() as db:
+        if layer == "l1":
+            row = L1ConnectionAssignment(
+                reservation_id=reservation_id,
+                switch_device_id=SWITCH_ID,
+                port_a="0/0/51",
+                port_b="0/0/52",
+                status="FAILED",
+                intended="RELEASED",
+                attempts=HIDDEN_ATTEMPTS,
+                last_error="driver timeout",
+            )
+        elif layer == "l2":
+            alloc = VlanAssignment(reservation_id=reservation_id, fabric_id=uuid.uuid4(), vlan_id=7)
+            db.add(alloc)
+            await db.flush()
+            row = L2PortAssignment(
+                reservation_id=reservation_id,
+                vlan_assignment_id=alloc.id,
+                switch_device_id=SWITCH_ID,
+                port="0/0/53",
+                status="FAILED",
+                intended="RELEASED",
+                attempts=HIDDEN_ATTEMPTS,
+                last_error="driver timeout",
+            )
+        else:
+            row = RouteAssignment(
+                reservation_id=reservation_id,
+                device_id=SWITCH_ID,
+                routes=[{"destination": "198.51.100.0/24", "next_hop": "198.51.100.1"}],
+                status="FAILED",
+                intended="RELEASED",
+                attempts=HIDDEN_ATTEMPTS,
+                last_error="driver timeout",
+            )
+        db.add(row)
+        await db.commit()
+        return type(row), row.id
+
+
+async def _record_failure(layer, db, reservation_id, row_id, claims):
+    from app.services.l1_assignment_service import record_l1_failed
+    from app.services.l2_membership_service import record_l2_failed
+    from app.services.route_service import record_route_failed
+
+    if layer == "l1":
+        return await record_l1_failed(
+            db,
+            reservation_id,
+            SWITCH_ID,
+            "0/0/51",
+            "0/0/52",
+            1,
+            "again",
+            intended="RELEASED",
+            row_id=row_id,
+            claims=claims,
+        )
+    if layer == "l2":
+        return await record_l2_failed(
+            db,
+            reservation_id,
+            None,
+            SWITCH_ID,
+            "0/0/53",
+            1,
+            "again",
+            intended="RELEASED",
+            row_id=row_id,
+            claims=claims,
+        )
+    return await record_route_failed(
+        db,
+        reservation_id,
+        SWITCH_ID,
+        None,
+        1,
+        "again",
+        intended="RELEASED",
+        row_id=row_id,
+        claims=claims,
+    )
+
+
+async def _stored(session_factory, model, row_id):
+    async with session_factory() as db:
+        row = (await db.execute(select(model).where(model.id == row_id))).scalar_one()
+        return row.claimed_until, row.last_error, row.attempts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layer", ["l1", "l2", "l3"])
+async def test_the_claim_stamp_round_trips_and_decides_who_holds_on_postgres(
+    session_factory, layer
+):
+    """The stamp a claim wrote reads back equal, to the microsecond and with its time
+    zone, and the SQL equality the held clause uses matches it: a holder whose claim
+    expired but was not taken over still writes, one whose claim was taken over is
+    refused and leaves the new holder's stamp alone, and the new holder writes."""
+    from app.services.wiring_claim import WiringRowClaims, write_guard
+
+    reservation_id = uuid.uuid4()
+    model, row_id = await _seed_failed_row(session_factory, reservation_id, layer)
+    try:
+        stale = WiringRowClaims(budget=timedelta(seconds=-60))
+        async with session_factory() as db:
+            assert await stale.claim(db, model, row_id) is True
+        stored, _, _ = await _stored(session_factory, model, row_id)
+        assert stored == stale.held[row_id]
+        assert stored.tzinfo is not None
+        assert stored.microsecond == stale.held[row_id].microsecond
+
+        # Expired, but nobody took it: the stamp still matches in SQL.
+        async with session_factory() as db, write_guard(db, model, row_id, stale) as ok:
+            assert ok is True
+
+        current = WiringRowClaims()
+        async with session_factory() as db:
+            assert await current.claim(db, model, row_id) is True
+        stored, last_error, attempts = await _stored(session_factory, model, row_id)
+        assert stored == current.held[row_id] != stale.held[row_id]
+
+        # The superseded holder is refused by both kinds of write and changes nothing.
+        async with session_factory() as db, write_guard(db, model, row_id, stale) as ok:
+            assert ok is False
+        async with session_factory() as db:
+            assert await _record_failure(layer, db, reservation_id, row_id, stale) is None
+        assert await _stored(session_factory, model, row_id) == (stored, last_error, attempts)
+        assert stale.lost == {row_id}
+
+        # The current holder's stamp matches: its failure write lands and frees the row.
+        async with session_factory() as db:
+            assert await _record_failure(layer, db, reservation_id, row_id, current) is not None
+        stored, last_error, _ = await _stored(session_factory, model, row_id)
+        assert (stored, last_error) == (None, "again")
+        assert current.lost == set()
+    finally:
+        await _cleanup(session_factory, reservation_id)
+
+
+def _wires_for_pair(port_a: str, port_b: str) -> list[dict]:
+    """The two recorded hops (DUT to switch:port_a, switch:port_b to DUT) of one edge."""
+    edge = str(uuid.uuid4())
+    return [
+        {
+            "device_a_id": str(uuid.uuid4()),
+            "port_a": "eth0",
+            "device_b_id": str(SWITCH_ID),
+            "port_b": port_a,
+            "layer": "L1",
+            "physical_connection_id": None,
+            "edge_key": edge,
+        },
+        {
+            "device_a_id": str(SWITCH_ID),
+            "port_a": port_b,
+            "device_b_id": str(uuid.uuid4()),
+            "port_b": "eth0",
+            "layer": "L1",
+            "physical_connection_id": None,
+            "edge_key": edge,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_stale_tick_cannot_park_a_row_the_manual_channel_is_driving(session_factory):
+    """Issue #1479 review, finding 1, staged with events.
+
+    The manual channel M claims a FAILED build row X and enters its connect, where the
+    stub holds it. The fork is then re-saved without X's wire. A tick T that loaded X
+    before M claimed it now revalidates intent, finds X gone, and would park X (FAILED
+    intended RELEASED, attempts 0, claim cleared) under M's drive, handing X to a third
+    pass while M still drives it. T's park must be refused: X keeps M's claim, its
+    intent, attempts, and reason, and T reports X `in_progress`. M then records its
+    successful connect.
+    """
+    from app.services.wiring_claim import WiringRowClaims
+    from app.services.wiring_retry_service import _reattempt_rows
+
+    reservation_id = uuid.uuid4()
+    async with session_factory() as db:
+        row = L1ConnectionAssignment(
+            reservation_id=reservation_id,
+            switch_device_id=SWITCH_ID,
+            port_a="0/0/61",
+            port_b="0/0/62",
+            status="FAILED",
+            intended="ACTIVE",
+            attempts=HIDDEN_ATTEMPTS,
+            last_error="driver timeout",
+        )
+        db.add(row)
+        await db.commit()
+        row_id = row.id
+    stale_copy = await _preselect_own_row(session_factory, row_id)
+
+    execute_fn, calls, entered, release, state = _gated_driver_stub()
+    wires = _wires_for_pair("0/0/61", "0/0/62")
+
+    async def _intent(reservation, client=None):
+        # The re-save lands while M is inside its drive: from then on X is not intended.
+        return [] if entered.is_set() else wires
+
+    foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    patches = _patches(execute_fn, reservation_id) + [
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(side_effect=_intent),
+        )
+    ]
+
+    async def _stale_tick_then_read():
+        outcomes = await _reattempt_rows(
+            [stale_copy], _session_ctx(session_factory), WiringRowClaims(), set()
+        )
+        async with session_factory() as db:
+            mid = (
+                await db.execute(
+                    select(L1ConnectionAssignment).where(L1ConnectionAssignment.id == row_id)
+                )
+            ).scalar_one()
+        return outcomes, (mid.status, mid.intended, mid.attempts, mid.last_error, mid.claimed_until)
+
+    for p in patches:
+        p.start()
+    try:
+        manual_result, (tick_outcomes, mid) = await _loser_inside_holders_drive(
+            reattempt_reservation(reservation_id, _session_ctx(session_factory)),
+            _stale_tick_then_read,
+            state,
+            entered,
+            release,
+        )
+    finally:
+        for p in patches:
+            p.stop()
+        await _cleanup(session_factory, reservation_id)
+
+    assert [o["outcome"] for o in tick_outcomes] == ["in_progress"]
+    status, intended, attempts, last_error, claimed_until = mid
+    assert (status, intended, attempts, last_error) == (
+        "FAILED",
+        "ACTIVE",
+        HIDDEN_ATTEMPTS,
+        "driver timeout",
+    ), "the stale tick's park must change nothing on a row M is driving"
+    assert claimed_until is not None, "M's claim must survive the stale tick"
+    assert [r["outcome"] for r in manual_result["results"]] == ["reconnected"]
+    assert _row_calls(calls) == ["connect_ports"]
+    foreign_after = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    assert foreign_after == foreign_before
