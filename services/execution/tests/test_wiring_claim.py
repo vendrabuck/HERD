@@ -868,27 +868,12 @@ async def test_a_superseded_holder_cannot_record_a_failure(db, layer):
 
 
 @pytest.mark.parametrize("layer", LAYERS)
-async def test_a_superseded_holder_cannot_flip_success_or_release(layer):
-    """The holder's success and release flips go through write_guard, which judges the
-    stamp the same way: a superseded holder is refused and changes nothing."""
-    row_id, stale = await _superseded_holder(layer)
-    before = await _ledger_state(layer, row_id)
-
-    async with TestSessionLocal() as s, write_guard(s, _MODEL[layer], row_id, stale) as ok:
-        assert ok is False
-    assert stale.lost == {row_id}
-    assert await _ledger_state(layer, row_id) == before
-
-
-@pytest.mark.parametrize("layer", LAYERS)
 async def test_a_holder_whose_expired_claim_nobody_took_still_writes(db, layer):
     """The stamp is the holder's until someone replaces it: an expired claim nobody
     took over still matches, so the holder's own writes land."""
     row_id = await _seed_layer(layer)
     late = WiringRowClaims(budget=timedelta(seconds=-60))
     assert await late.claim(db, _MODEL[layer], row_id) is True
-    async with TestSessionLocal() as s, write_guard(s, _MODEL[layer], row_id, late) as ok:
-        assert ok is True
 
     assert await _write_failure(layer, db, row_id, late) is not None
     assert await _ledger_state(layer, row_id) == ("FAILED", 2, "again", None)
@@ -1020,6 +1005,28 @@ async def test_write_guard_does_nothing_without_a_ledger(db):
             assert ok is True
         async with write_guard(db, L1ConnectionAssignment, None, WiringRowClaims()) as ok:
             assert ok is True
+
+
+async def test_write_guard_ends_its_transaction_and_rolls_back_on_an_error():
+    """The guard's lock lives in the caller's session, which for a holder is the
+    per-switch session that goes on to the switch's next driver call. Exiting commits
+    even when the body wrote nothing, so the row is not left locked; an error inside
+    rolls the body's writes back and propagates."""
+    row_id = await _seed_l1_failed()
+    async with TestSessionLocal() as s:
+        async with write_guard(s, L1ConnectionAssignment, row_id, WiringRowClaims()) as ok:
+            assert ok is True
+            assert s.in_transaction()
+        assert not s.in_transaction()
+
+        with pytest.raises(RuntimeError):
+            async with write_guard(s, L1ConnectionAssignment, row_id, WiringRowClaims()) as ok:
+                row = await s.get(L1ConnectionAssignment, row_id)
+                row.last_error = "never committed"
+                await s.flush()
+                raise RuntimeError("boom")
+        assert not s.in_transaction()
+    assert (await _ledger_state("l1", row_id))[2] == "driver timeout"
 
 
 # --- The manual channel reports in_progress ----------------------------------

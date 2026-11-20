@@ -93,6 +93,7 @@ import uuid
 from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from app.config import settings
 from app.models.execution_run import ExecutionRun
@@ -1081,9 +1082,9 @@ async def test_the_claim_stamp_round_trips_and_decides_who_holds_on_postgres(
 ):
     """The stamp a claim wrote reads back equal, to the microsecond and with its time
     zone, and the SQL equality the held clause uses matches it: a holder whose claim
-    expired but was not taken over still writes, one whose claim was taken over is
-    refused and leaves the new holder's stamp alone, and the new holder writes."""
-    from app.services.wiring_claim import WiringRowClaims, write_guard
+    was taken over is refused and leaves the new holder's stamp alone, and the new
+    holder, whose stamp matches, writes."""
+    from app.services.wiring_claim import WiringRowClaims
 
     reservation_id = uuid.uuid4()
     model, row_id = await _seed_failed_row(session_factory, reservation_id, layer)
@@ -1096,19 +1097,13 @@ async def test_the_claim_stamp_round_trips_and_decides_who_holds_on_postgres(
         assert stored.tzinfo is not None
         assert stored.microsecond == stale.held[row_id].microsecond
 
-        # Expired, but nobody took it: the stamp still matches in SQL.
-        async with session_factory() as db, write_guard(db, model, row_id, stale) as ok:
-            assert ok is True
-
         current = WiringRowClaims()
         async with session_factory() as db:
             assert await current.claim(db, model, row_id) is True
         stored, last_error, attempts = await _stored(session_factory, model, row_id)
         assert stored == current.held[row_id] != stale.held[row_id]
 
-        # The superseded holder is refused by both kinds of write and changes nothing.
-        async with session_factory() as db, write_guard(db, model, row_id, stale) as ok:
-            assert ok is False
+        # The superseded holder's failure write is refused and changes nothing.
         async with session_factory() as db:
             assert await _record_failure(layer, db, reservation_id, row_id, stale) is None
         assert await _stored(session_factory, model, row_id) == (stored, last_error, attempts)
@@ -1236,3 +1231,348 @@ async def test_a_stale_tick_cannot_park_a_row_the_manual_channel_is_driving(sess
     assert _row_calls(calls) == ["connect_ports"]
     foreign_after = await _foreign_ledger_snapshot(session_factory, reservation_id)
     assert foreign_after == foreign_before
+
+
+# Issue #1479, round 3: a driver action that succeeded on the device is never lost from
+# the ledger. Only another retry pass's LIVE claim makes the holder record nothing; a
+# claim the reconcile or a teardown cleared does not.
+
+
+@pytest.mark.asyncio
+async def test_teardown_during_a_held_l3_provision_leaves_its_routes_recorded_for_removal(
+    session_factory,
+):
+    """Review finding (round 3, HIGH), staged with events.
+
+    A retry pass holds L3 pin X and is inside its configure of route R when the
+    reservation ends: the real teardown freezes the wiring, parks X
+    (TEARDOWN_PENDING_REMOVAL, which clears the claim), deprovisions it, and leaves it
+    RELEASED. The holder's configure then succeeds on the switch. The record must not be
+    refused for the cleared claim: the writer's own record-time freeze branch (issue
+    #461) records R FAILED intended RELEASED, so the release channel removes it.
+    """
+    from app.services.l1_assignment_service import freeze_reservation_wiring
+    from app.services.nats_consumer import (
+        _apply_l3_adjacency,
+        _FetchContext,
+        _teardown_from_ledgers,
+    )
+    from app.services.route_service import FROZEN_PROVISION_PENDING_REMOVAL
+    from app.services.wiring_claim import WiringRowClaims
+
+    reservation_id = uuid.uuid4()
+    route = {"destination": "203.0.113.0/24", "next_hop": "203.0.113.1"}
+    async with session_factory() as db:
+        row = RouteAssignment(
+            reservation_id=reservation_id,
+            device_id=SWITCH_ID,
+            routes=[route],
+            status="FAILED",
+            intended="ACTIVE",
+            attempts=HIDDEN_ATTEMPTS,
+            last_error="driver timeout",
+        )
+        db.add(row)
+        await db.commit()
+        row_id = row.id
+
+    execute_fn, calls, entered, release, state = _gated_driver_stub()
+    patches = _patches(execute_fn, reservation_id) + [
+        patch("app.services.driver_loader.get_driver_metadata", new=AsyncMock(return_value={}))
+    ]
+
+    async def _held_provision():
+        async with httpx.AsyncClient() as client:
+            await _apply_l3_adjacency(
+                str(reservation_id),
+                [],
+                [{"device_id": str(SWITCH_ID), "routes": [route]}],
+                _FetchContext(client),
+                _session_ctx(session_factory),
+                retry_row_ids={str(SWITCH_ID): row_id},
+                claims=WiringRowClaims(),
+            )
+
+    async def _teardown():
+        async with session_factory() as db:
+            await freeze_reservation_wiring(db, reservation_id)
+        async with httpx.AsyncClient() as client:
+            await _teardown_from_ledgers(
+                str(reservation_id), _FetchContext(client), _session_ctx(session_factory)
+            )
+
+    foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    for p in patches:
+        p.start()
+    try:
+        await _loser_inside_holders_drive(_held_provision(), _teardown, state, entered, release)
+        async with session_factory() as db:
+            rows = (
+                (
+                    await db.execute(
+                        select(RouteAssignment).where(
+                            RouteAssignment.reservation_id == reservation_id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+    finally:
+        for p in patches:
+            p.stop()
+        await _cleanup(session_factory, reservation_id)
+
+    assert _row_calls(calls) == ["configure_route", "remove_route"]
+    by_id = {r.id: r for r in rows}
+    assert by_id[row_id].status == "RELEASED", "teardown released the pin it parked"
+    parked = [r for r in rows if r.id != row_id]
+    assert len(parked) == 1, "the holder's configure must be recorded"
+    assert (parked[0].status, parked[0].intended, parked[0].last_error) == (
+        "FAILED",
+        "RELEASED",
+        FROZEN_PROVISION_PENDING_REMOVAL,
+    )
+    assert [r["destination"] for r in parked[0].routes] == ["203.0.113.0/24"]
+    foreign_after = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    assert foreign_after == foreign_before
+
+
+@pytest.mark.asyncio
+async def test_a_reconcile_failure_write_during_a_held_l1_connect_still_records_it(
+    session_factory,
+):
+    """Review finding (round 3), staged with events.
+
+    The manual channel holds build row X and is inside its connect. The reconcile drives
+    the same pair, fails, and records its failure by key, which clears X's claim. The
+    holder's connect then succeeds on the switch: X must read ACTIVE and the manual call
+    `reconnected`, not FAILED with the reconcile's reason and `in_progress`.
+    """
+    from app.services.l1_assignment_service import record_l1_failed
+
+    reservation_id = uuid.uuid4()
+    async with session_factory() as db:
+        row = L1ConnectionAssignment(
+            reservation_id=reservation_id,
+            switch_device_id=SWITCH_ID,
+            port_a="0/0/71",
+            port_b="0/0/72",
+            status="FAILED",
+            intended="ACTIVE",
+            attempts=HIDDEN_ATTEMPTS,
+            last_error="driver timeout",
+        )
+        db.add(row)
+        await db.commit()
+        row_id = row.id
+
+    execute_fn, calls, entered, release, state = _gated_driver_stub()
+    patches = _patches(execute_fn, reservation_id) + [
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(return_value=_wires_for_pair("0/0/71", "0/0/72")),
+        )
+    ]
+
+    async def _reconcile_failure_then_read():
+        async with session_factory() as db:
+            await record_l1_failed(
+                db,
+                reservation_id,
+                SWITCH_ID,
+                "0/0/71",
+                "0/0/72",
+                1,
+                "reconcile failure",
+                intended="ACTIVE",
+            )
+        async with session_factory() as db:
+            mid = await db.get(L1ConnectionAssignment, row_id)
+            return mid.claimed_until
+
+    foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    for p in patches:
+        p.start()
+    try:
+        manual_result, cleared = await _loser_inside_holders_drive(
+            reattempt_reservation(reservation_id, _session_ctx(session_factory)),
+            _reconcile_failure_then_read,
+            state,
+            entered,
+            release,
+        )
+        async with session_factory() as db:
+            final = await db.get(L1ConnectionAssignment, row_id)
+            final_state = (final.status, final.intended, final.last_error)
+    finally:
+        for p in patches:
+            p.stop()
+        await _cleanup(session_factory, reservation_id)
+
+    assert cleared is None, "the reconcile's key-based failure write cleared the claim"
+    assert final_state == ("ACTIVE", "ACTIVE", None)
+    assert [r["outcome"] for r in manual_result["results"]] == ["reconnected"]
+    assert _row_calls(calls) == ["connect_ports"]
+    foreign_after = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    assert foreign_after == foreign_before
+
+
+async def _row_lockable_now(session_factory, model, row_id) -> bool:
+    """True iff another connection can lock the row this instant (FOR UPDATE NOWAIT)."""
+    from sqlalchemy.exc import DBAPIError
+
+    async with session_factory() as other:
+        try:
+            await other.execute(
+                select(model.id).where(model.id == row_id).with_for_update(nowait=True)
+            )
+        except DBAPIError:
+            return False
+        finally:
+            await other.rollback()
+    return True
+
+
+@pytest.mark.asyncio
+async def test_the_record_releases_the_row_lock_when_it_writes_nothing(session_factory):
+    """Both guards lock the row in the caller's session, which for a holder is the
+    per-switch session that goes on to the switch's next driver call. The lock is held
+    inside and released on exit even when nothing was written, with the session still
+    open, so the row is never left locked across later driver calls."""
+    from app.services.wiring_claim import WiringRowClaims, holder_record, write_guard
+
+    reservation_id = uuid.uuid4()
+    row_id = await _seed_failed_l1_release(session_factory, reservation_id, "0/0/81", "0/0/82")
+    holder = WiringRowClaims()
+    try:
+        async with session_factory() as db:
+            assert await holder.claim(db, L1ConnectionAssignment, row_id) is True
+            async with holder_record(
+                db, L1ConnectionAssignment, row_id, holder, added=False, succeeded=True
+            ):
+                assert not await _row_lockable_now(session_factory, L1ConnectionAssignment, row_id)
+            assert await _row_lockable_now(session_factory, L1ConnectionAssignment, row_id)
+
+            async with write_guard(db, L1ConnectionAssignment, row_id, None) as ok:
+                assert ok is True  # no ledger: no lock taken at all
+                assert await _row_lockable_now(session_factory, L1ConnectionAssignment, row_id)
+            async with write_guard(db, L1ConnectionAssignment, row_id, holder) as ok:
+                assert ok is True
+                assert not await _row_lockable_now(session_factory, L1ConnectionAssignment, row_id)
+            assert await _row_lockable_now(session_factory, L1ConnectionAssignment, row_id)
+    finally:
+        await _cleanup(session_factory, reservation_id)
+
+
+@pytest.mark.asyncio
+async def test_the_holders_connect_record_locks_rows_in_the_reconciles_order(session_factory):
+    """Lock order (round 3 review, LOW): record_l1_connect may supersede another
+    reservation's ACTIVE row Y on the pair before it flips the holder's row X, so a
+    reconcile running it locks Y then X. The holder's record must lock in the same order,
+    or the two can deadlock. With Y held elsewhere, the holder's record waits on Y while X
+    is still free; once Y is released it supersedes Y and records X ACTIVE.
+    """
+    from app.services.nats_consumer import _apply_one_port_action
+    from app.services.wiring_claim import WiringRowClaims
+
+    reservation_id = uuid.uuid4()
+    other_reservation = uuid.uuid4()
+    async with session_factory() as db:
+        x = L1ConnectionAssignment(
+            reservation_id=reservation_id,
+            switch_device_id=SWITCH_ID,
+            port_a="0/0/91",
+            port_b="0/0/92",
+            status="FAILED",
+            intended="ACTIVE",
+            attempts=HIDDEN_ATTEMPTS,
+            last_error="driver timeout",
+        )
+        y = L1ConnectionAssignment(
+            reservation_id=other_reservation,
+            switch_device_id=SWITCH_ID,
+            port_a="0/0/91",
+            port_b="0/0/92",
+            status="ACTIVE",
+            intended="ACTIVE",
+        )
+        db.add_all([x, y])
+        await db.commit()
+        x_id, y_id = x.id, y.id
+
+    holder = WiringRowClaims()
+    async with session_factory() as db:
+        assert await holder.claim(db, L1ConnectionAssignment, x_id) is True
+
+    execute_fn, calls, _entered, release, _state = _gated_driver_stub()
+    release.set()  # nothing to hold here: the driver answers at once
+    patches = _patches(execute_fn, reservation_id)
+    blocker = session_factory()
+    for p in patches:
+        p.start()
+    try:
+        await blocker.execute(
+            select(L1ConnectionAssignment.id)
+            .where(L1ConnectionAssignment.id == y_id)
+            .with_for_update()
+        )
+
+        async def _holder():
+            async with session_factory() as db:
+                await _apply_one_port_action(
+                    db,
+                    "connect_ports",
+                    "/tmp/driver",
+                    {},
+                    set(),
+                    SWITCH_ID,
+                    DRIVER_ID,
+                    "sha256abc",
+                    reservation_id,
+                    "0/0/91",
+                    "0/0/92",
+                    None,
+                    retry_row_id=x_id,
+                    claims=holder,
+                )
+
+        task = asyncio.create_task(_holder())
+        # Bounded wait for the holder to queue on Y's lock; fails loudly if it never does.
+        for _ in range(int(COORDINATION_TIMEOUT / 0.05)):
+            async with session_factory() as probe:
+                waiting = (
+                    await probe.execute(text("SELECT count(*) FROM pg_locks WHERE NOT granted"))
+                ).scalar_one()
+            if waiting >= 1 or task.done():
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail("the holder's record never queued on the other reservation's row")
+        assert not task.done(), "the record must wait for Y before it locks X"
+        assert await _row_lockable_now(session_factory, L1ConnectionAssignment, x_id), (
+            "X must still be free while the record waits on Y (Y is locked first)"
+        )
+        await blocker.rollback()
+        await asyncio.wait_for(task, COORDINATION_TIMEOUT)
+        async with session_factory() as db:
+            states = {
+                r.id: r.status
+                for r in (
+                    await db.execute(
+                        select(L1ConnectionAssignment).where(
+                            L1ConnectionAssignment.id.in_([x_id, y_id])
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            }
+    finally:
+        await blocker.close()
+        for p in patches:
+            p.stop()
+        await _cleanup(session_factory, reservation_id)
+        await _cleanup(session_factory, other_reservation)
+
+    assert states == {x_id: "ACTIVE", y_id: "RELEASED"}
