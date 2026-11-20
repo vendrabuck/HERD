@@ -1684,9 +1684,11 @@ OPS-VALID-5). A body holding text that cannot be encoded as UTF-8 (a lone surrog
 written as an escape such as `\ud800` with no pair) is refused the same way in every
 service, whatever field holds it, so no such text is stored, forwarded, or echoed
 (OPS-VALID-6). A body larger than the service's limit (`MAX_REQUEST_BODY_BYTES`, 4 MiB
-by default; an upload route adds the files it accepts) is refused with 413 before it is
+by default; an upload route adds the files it accepts, and a route another service
+forwards a body to adds an envelope) is refused with 413 before it is
 parsed, scanned, or authenticated, in every service, config included (OPS-VALID-9 to
-OPS-VALID-11).
+OPS-VALID-12); a body one service admitted is not refused for its size by the
+service it forwards it to (OPS-VALID-12).
 
 **Surfaces.** `services/common/herd_common/validation_errors.py`, the ONE handler,
 body check, and body limit, which each service's `app/main.py` installs; the config
@@ -1865,74 +1867,135 @@ fixed set (OPS-VALID-7).
   a 9.8 MB list (58 MB of memory, 0.23 s of the event loop) before its 401.
   `install_validation_errors` adds `LimitRequestBody`, a pure ASGI middleware, just
   outside `RefuseLoneSurrogates` (in config, which installs without that check, it is
-  the innermost middleware), with the service's `MAX_REQUEST_BODY_BYTES`: the Settings
-  field `max_request_body_bytes` of `HerdBaseSettings` (at least 1; a service refuses to
-  start on any other value), default 4194304 (4 MiB). Config, which has no Settings
-  model, reads the same variable in `app/request_limits.py`; there a value that is not
-  a positive integer logs a warning and is the default, as config's login limits are.
-  The limit is judged at the first read of the body, after routing. A `Content-Length`
-  declaring more than the limit is refused before one byte of the body is read.
-  Otherwise each `http.request` message is counted as it is handed on, unchanged, and
-  the read that takes the count past the limit is refused instead of handed on, so a
-  chunked body, or one longer than its `Content-Length`, never reaches the route past
-  the limit. A body of exactly the limit is accepted. A `Content-Length` that is not a
-  whole number (empty, negative, signed, decimal, text) declares nothing, and the count
-  alone bounds that body; when there are several, each is judged. The answer is
-  `{"detail": [{"type": "body_too_large", "loc": ["body"], "msg": "Request body is
-  larger than <limit> bytes"}]}` with `Connection: close`: the one-item shape of
-  OPS-VALID-6's refusal, naming the limit and never anything of the body. Every route
-  with a body (JSON or a form) reads it before its dependencies, so the refusal comes
-  before authentication and any role gate, to any caller with or without a token, and
-  the surrogate check reads through the limit, so a body over it is refused before it
-  is scanned or parsed. A route that never reads its body, an unknown route (404), and
-  a method not allowed (405) answer as before, and nothing of their body is read. A
-  read made after the response has started (Starlette's disconnect listener) is never
-  refused; the one that takes the count past the limit answers `http.disconnect`
-  instead of handing the bytes on. A websocket and the lifespan pass through
-  untouched. Each refusal logs one INFO line (`action` `request_body_too_large`, the
-  limit, and `declared` or `received`), never any of the body. The one raw read of a
-  body in HERD, integration's test-stack webhook sink `POST /echo`, takes the default. \
-  Enforced in: `services/common/herd_common/validation_errors.py` (`LimitRequestBody`, `declares_more_than`, `route_body_limit`, `body_too_large_error`, `BODY_TOO_LARGE_TYPE`, `DEFAULT_MAX_REQUEST_BODY_BYTES`, `install_validation_errors`, `_refuse_body`); `services/common/herd_common/base_settings.py` (`HerdBaseSettings`); `services/config/app/request_limits.py` (`max_request_body_bytes`); `tests/unit/test_request_body_limit_wiring.py` (`built_app`) \
-  Pinned by: `services/common/tests/test_request_body_limit.py` (`test_declares_more_than`, `test_the_one_item_names_the_limit_and_nothing_else`, `test_the_default_is_four_mebibytes`, `test_a_declared_length_over_the_limit_is_refused_before_anything_is_read`, `test_a_body_of_exactly_the_limit_is_handed_on`, `test_a_chunked_body_is_refused_at_the_read_that_crosses_the_limit`, `test_a_body_longer_than_its_content_length_is_refused_by_the_count`, `test_an_invalid_content_length_leaves_the_count_to_bound_the_body`, `test_after_the_response_started_nothing_is_refused_and_the_reading_stops`, `test_a_disconnect_and_later_reads_pass_through`, `test_a_websocket_or_lifespan_scope_is_passed_through_untouched`, `test_a_request_whose_body_is_never_read_judges_nothing`, `test_a_refusal_logs_the_limit_and_the_reason_never_the_body`, `test_the_refusal_is_these_exact_bytes`, `test_over_the_limit_is_413_before_authentication`, `test_a_body_over_the_limit_is_never_parsed`, `test_a_body_over_the_limit_is_never_scanned_for_a_lone_surrogate`, `test_a_chunked_body_over_the_limit_is_refused_before_the_surrogate_check_buffers_it`, `test_a_chunked_body_over_the_limit_is_413_through_the_app`, `test_every_content_type_is_bounded`, `test_a_route_that_reads_no_body_an_unknown_route_and_a_stream_are_unchanged`, `test_the_limit_holds_without_the_surrogate_check`, `test_install_puts_the_limit_just_outside_the_surrogate_check`, `test_install_refuses_a_limit_that_is_not_a_positive_int`, `test_install_requires_the_limit`, `test_the_refusal_survives_a_base_http_middleware_in_either_order`); `services/common/tests/test_validation_errors.py` (`test_install_adds_the_check_unless_told_not_to`); `services/acl/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/ai-orchestrator/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/auth/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/cabling/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/execution/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/integration/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/inventory/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/notifications/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/reservations/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/secrets/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/user-profile/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/config/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_innermost_without_the_surrogate_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_without_a_session_the_limit_answers_before_the_session_check`, `test_the_reader_takes_a_positive_integer_or_the_default`, `test_a_value_that_is_not_a_positive_integer_is_the_default_with_a_warning`); `tests/unit/test_request_body_limit_wiring.py` (`test_every_service_is_found`, `test_the_limit_sits_just_outside_the_surrogate_check`, `test_the_limit_is_the_services_setting`, `test_compose_passes_the_setting_with_the_shared_default`); `tests/integration/test_request_body_limit.py` (`test_a_body_over_the_limit_is_413_through_the_gateway`, `test_a_chunked_body_over_the_limit_is_413_through_the_gateway`, `test_a_body_at_the_limit_reaches_the_parser_through_the_gateway`)
-- **OPS-VALID-10.** A route that takes an upload declares it, and its limit is the
-  default plus the files it accepts: its endpoint is marked with
-  `accepts_upload(upload_bytes)`, the ONE way to raise a route's limit, and its limit is
-  `MAX_REQUEST_BODY_BYTES + upload_bytes()`, where `upload_bytes` reads, at each
-  request, the bound the route itself enforces on its files (so the two cannot drift),
-  and the default covers the form's other fields. Every route that takes a form (a `File` or `Form`
-  parameter) carries the mark, and the one marked route that takes JSON carries a file
-  as base64; a guard builds every service's app and fails on an unmarked form route, a
-  marked route outside this table, or a value that does not follow the route's
-  setting. The routes, with the default totals:
+  the innermost middleware), with the service's `MAX_REQUEST_BODY_BYTES`, default
+  4194304 (4 MiB): the Settings field `max_request_body_bytes` of `HerdBaseSettings`, or
+  in config, which has no Settings model, `app/request_limits.py`. Both read the value
+  with `max_body_bytes_from_text`: ASCII decimal digits, surrounding whitespace
+  ignored, at least `MIN_MAX_REQUEST_BODY_BYTES` (65536); a sign, a decimal point, an
+  exponent, or an underscore is refused. A service refuses to start on a value it
+  refuses (a number in `config.json` is held to the same floor); config logs a warning
+  and uses the default instead, as it does for its login limits, and reads only its
+  environment, so a key written into `config.json` by hand does not reach it. The
+  limit is judged at the first read of the body, after routing. A `Content-Length`
+  declaring more than the limit is refused before one byte of the body is read; the
+  digits are compared exactly, whatever their number. Otherwise each `http.request`
+  message is counted as it is handed on, unchanged, and the read that takes the count
+  past the limit is refused instead of handed on, so a chunked body, or one longer than
+  its `Content-Length`, never reaches the route past the limit. A body of exactly the
+  limit is accepted. A `Content-Length` that is not a whole number (empty, negative,
+  signed, decimal, text) declares nothing, and the count alone bounds that body; when
+  there are several, each is judged. The answer is `{"detail": [{"type":
+  "body_too_large", "loc": ["body"], "msg": "Request body is larger than <limit>
+  bytes"}]}`: the one-item shape of OPS-VALID-6's refusal, naming the limit and never
+  anything of the body. It does not close the connection (the first version did, and a
+  client still writing its body, httpx or the gateway, then met a connection reset
+  instead of the 413). What is left of the body is read and discarded by uvicorn, in
+  both its h11 and its httptools protocol, which drop body data that arrives once the
+  response is complete, and the connection then serves the next request. So memory and
+  parse work stay bounded (refusing a 64 MiB chunked body peaked at 5.8 MiB of Python
+  allocations in the process, client included, the same as for 16 MiB), but the bytes
+  still cross the network and cost the reading: this check bounds memory and parsing,
+  not bandwidth. Every route with a body (JSON or a form) reads it before its
+  dependencies, so the refusal comes before authentication and any role gate, to any
+  caller with or without a token, and the surrogate check reads through the limit, so a
+  body over it is refused before it is scanned or parsed. A route that never reads its
+  body, an unknown route (404), and a method not allowed (405) answer as before, and the
+  route reads nothing of the body; when such a route answers with a streaming response,
+  Starlette's disconnect listener does read the body (and discards it). Nothing is
+  refused once the response has started. Because the listener's first read can come
+  while that response's start is still scheduled, the check yields to the event loop
+  once before it refuses: if the response has started by then, the read answers
+  `http.disconnect` instead, as does every read after it, which the listener takes as
+  the client leaving and which may end the stream early; no byte past the limit is
+  handed on. A websocket and the lifespan pass through untouched. Each refusal logs one
+  INFO line (`action` `request_body_too_large`, the limit, and `declared` or
+  `received`), never any of the body. The one raw read of a body in HERD, integration's
+  test-stack webhook sink `POST /echo`, takes the default. \
+  Enforced in: `services/common/herd_common/validation_errors.py` (`LimitRequestBody`, `declares_more_than`, `route_body_limit`, `body_too_large_error`, `BODY_TOO_LARGE_TYPE`, `DEFAULT_MAX_REQUEST_BODY_BYTES`, `MIN_MAX_REQUEST_BODY_BYTES`, `max_body_bytes_from_text`, `install_validation_errors`, `_log_refusal`); `services/common/herd_common/base_settings.py` (`HerdBaseSettings`, `MAX_REQUEST_BODY_BYTES_RULE`); `services/config/app/request_limits.py` (`max_request_body_bytes`); `tests/unit/test_request_body_limit_wiring.py` (`built_app`, `MIDDLEWARE`) \
+  Pinned by: `services/common/tests/test_request_body_limit.py` (`test_declares_more_than`, `test_declares_more_than_is_exact_for_any_limit`, `test_the_one_item_names_the_limit_and_nothing_else`, `test_the_default_is_four_mebibytes`, `test_the_setting_is_read_as_decimal_digits_at_least_the_floor`, `test_a_declared_length_over_the_limit_is_refused_before_anything_is_read`, `test_a_body_of_exactly_the_limit_is_handed_on`, `test_a_chunked_body_is_refused_at_the_read_that_crosses_the_limit`, `test_a_body_longer_than_its_content_length_is_refused_by_the_count`, `test_an_invalid_content_length_leaves_the_count_to_bound_the_body`, `test_after_the_response_started_nothing_is_refused_and_the_reading_stops`, `test_after_the_response_started_a_declared_length_is_not_refused`, `test_a_read_racing_a_response_start_is_not_refused`, `test_a_streaming_route_that_never_reads_its_body_answers_with_a_body_over_the_limit`, `test_a_disconnect_and_later_reads_pass_through`, `test_a_websocket_or_lifespan_scope_is_passed_through_untouched`, `test_a_request_whose_body_is_never_read_judges_nothing`, `test_a_refusal_logs_the_limit_and_the_reason_never_the_body`, `test_the_refusal_is_these_exact_bytes`, `test_over_the_limit_is_413_before_authentication`, `test_a_body_over_the_limit_is_never_parsed`, `test_a_body_over_the_limit_is_never_scanned_for_a_lone_surrogate`, `test_a_chunked_body_over_the_limit_is_refused_before_the_surrogate_check_buffers_it`, `test_a_chunked_body_over_the_limit_is_413_through_the_app`, `test_every_content_type_is_bounded`, `test_a_route_that_reads_no_body_an_unknown_route_and_a_stream_are_unchanged`, `test_the_limit_holds_without_the_surrogate_check`, `test_install_puts_the_limit_just_outside_the_surrogate_check`, `test_install_refuses_a_limit_that_is_not_a_positive_int`, `test_install_requires_the_limit`, `test_the_refusal_survives_a_base_http_middleware_in_either_order`); `services/common/tests/test_request_body_limit_socket.py` (`test_every_refusal_reaches_the_client_and_the_connection_serves_the_next_request`, `test_a_body_at_the_limit_still_reaches_the_route`, `test_refusing_a_64_mib_chunked_body_holds_no_more_than_the_limit`); `services/common/tests/test_base_settings.py` (`test_the_body_limit_defaults_to_four_mebibytes`, `test_the_body_limit_reads_decimal_digits_from_env_and_numbers_from_the_file`, `test_the_body_limit_refuses_what_config_also_refuses`); `services/common/tests/test_validation_errors.py` (`test_install_adds_the_check_unless_told_not_to`); `services/acl/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/ai-orchestrator/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/auth/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/cabling/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/execution/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/integration/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/inventory/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/notifications/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/reservations/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/secrets/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/user-profile/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/config/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_innermost_without_the_surrogate_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_without_a_session_the_limit_answers_before_the_session_check`, `test_the_reader_takes_decimal_digits_at_least_the_floor`, `test_a_value_the_services_refuse_is_the_default_with_a_warning`, `test_the_reader_is_the_copy_of_the_shared_reading`); `tests/unit/test_request_body_limit_wiring.py` (`test_every_service_is_found`, `test_the_installed_middleware_is_exactly_the_declared_list`, `test_the_middleware_table_names_every_service`, `test_the_limit_is_the_services_setting`, `test_compose_passes_the_setting_with_the_shared_default`); `tests/integration/test_request_body_limit.py` (`test_a_body_over_the_limit_is_413_through_the_gateway`, `test_a_chunked_body_over_the_limit_is_413_through_the_gateway`, `test_a_body_at_the_limit_reaches_the_parser_through_the_gateway`, `test_the_connection_serves_a_request_after_each_refusal`)
+- **OPS-VALID-10.** A route whose body may hold more than the default declares it: its
+  endpoint is marked with `extends_body_limit(extra_bytes)`, the ONE way to raise a
+  route's limit, and its limit is `MAX_REQUEST_BODY_BYTES + extra_bytes()`, where
+  `extra_bytes` is read at each request. It is used for two reasons only. An upload
+  route adds the files it bounds itself, read from the route's own setting so the two
+  cannot drift, and the default covers the form's other fields. A route another HERD
+  service forwards a body to adds `FORWARD_ENVELOPE_BYTES` (262144), what the sender adds
+  to the body it admitted (OPS-VALID-12). Every route that takes a form (a `File` or
+  `Form` parameter) carries the mark unless it is named, with a reason, in the guard's
+  `FORM_EXEMPT` (none is: no HERD route takes a small form); a guard builds every
+  service's app and fails on an unmarked form route, a marked route outside this
+  table, or a value that does not follow the route's setting. The routes, with the
+  default totals:
 
-  | Route | Service | Upload bytes | Limit with the defaults |
+  | Route | Service | Extra bytes | Limit with the defaults |
   |---|---|---|---|
   | `POST /drivers`, `PUT /drivers/{driver_id}/file` | inventory | `DRIVER_MAX_SIZE_BYTES` (10485760) | 14680064 |
   | `POST /devices/import`, `POST /templates/import` | inventory | `IMPORT_UPLOAD_BYTES`, 10485760 fixed in `app/routers/bulk.py`: the routes read the whole upload with no bound of their own (issue #1417, open), so this is the only bound on an import file | 14680064 |
   | `POST /topologies/import` | cabling | `IMPORT_UPLOAD_BYTES`, 10485760 fixed in `app/routes/bulk.py`, for the same reason | 14680064 |
   | `POST /generate` | ai-orchestrator | `UPLOAD_MAX_FILES` times `UPLOAD_MAX_FILE_BYTES` (5 times 5242880), the aggregate `_read_uploads` enforces | 30408704 |
   | `POST /internal/validate-package` | execution | the base64 length of `VALIDATE_PACKAGE_MAX_BYTES` (13981016 for 10485760), the JSON `package_b64` the validator decodes | 18175320 |
+  | `PUT /internal/forks/{reservation_id}/canvas`, `POST /internal/forks/{reservation_id}/save` | cabling | `FORWARD_ENVELOPE_BYTES` | 4456448 |
+  | `POST /execute`, `POST /execute/internal` | execution | `FORWARD_ENVELOPE_BYTES` | 4456448 |
+  | `POST /` | reservations | `FORWARD_ENVELOPE_BYTES` | 4456448 |
+  | `PATCH /preferences` | user-profile | `FORWARD_ENVELOPE_BYTES` | 4456448 |
 
-  Where the route bounds its files itself (every row but the imports), a file just over
-  that bound still gets the route's own answer, its status and wording, since the body
-  that holds it is under the route's limit; a body past the files and the default is
-  the 413 naming the route's limit. \
-  Enforced in: `services/common/herd_common/validation_errors.py` (`accepts_upload`, `route_body_limit`, `UPLOAD_BYTES_ATTRIBUTE`); `services/inventory/app/routers/drivers.py` (`create_new_driver`, `replace_driver_file_endpoint`); `services/inventory/app/routers/bulk.py` (`IMPORT_UPLOAD_BYTES`, `import_devices_endpoint`, `import_templates_endpoint`); `services/cabling/app/routes/bulk.py` (`IMPORT_UPLOAD_BYTES`, `import_topologies_endpoint`); `services/ai-orchestrator/app/routes/generate.py` (`generate`); `services/execution/app/routers/validation.py` (`base64_length`, `validate_package_endpoint`); `tests/unit/test_request_body_limit_wiring.py` (`UPLOAD_ROUTES`, `JSON_UPLOAD_ROUTES`) \
-  Pinned by: `services/common/tests/test_request_body_limit.py` (`test_route_body_limit`, `test_accepts_upload_returns_the_endpoint_unchanged`, `test_a_marked_route_takes_its_own_limit`, `test_an_upload_route_takes_its_own_limit_and_another_form_does_not`); `services/inventory/tests/test_request_body_limit.py` (`test_an_upload_route_takes_its_own_limit`, `test_the_upload_routes_follow_the_driver_setting_and_the_import_bound`); `services/cabling/tests/test_request_body_limit.py` (`test_the_import_route_takes_its_own_limit`, `test_the_import_bound_is_ten_mebibytes_and_no_other_route_has_one`); `services/ai-orchestrator/tests/test_request_body_limit.py` (`test_the_generate_route_takes_its_own_limit`, `test_the_generate_route_is_the_only_one_with_its_own_limit`); `services/execution/tests/test_request_body_limit.py` (`test_base64_length_is_the_padded_length`, `test_the_package_validator_takes_its_own_limit`); `tests/unit/test_request_body_limit_wiring.py` (`test_every_form_route_carries_an_upload_limit_and_the_table_is_complete`, `test_the_upload_tables_name_only_existing_services_and_routes`, `test_the_specification_names_every_upload_route`)
+  Where an upload route bounds its files itself (every upload row but the imports), a
+  file just over that bound still gets the route's own answer, its status and wording,
+  since the body that holds it is under the route's limit; a body past the files and
+  the default is the 413 naming the route's limit. The routes that take the envelope
+  are also called from outside HERD (the browser, the facade's callers), so the
+  envelope raises what any caller may send them by 256 KiB. \
+  Enforced in: `services/common/herd_common/validation_errors.py` (`extends_body_limit`, `route_body_limit`, `EXTRA_BODY_BYTES_ATTRIBUTE`, `FORWARD_ENVELOPE_BYTES`); `services/inventory/app/routers/drivers.py` (`create_new_driver`, `replace_driver_file_endpoint`); `services/inventory/app/routers/bulk.py` (`IMPORT_UPLOAD_BYTES`, `import_devices_endpoint`, `import_templates_endpoint`); `services/cabling/app/routes/bulk.py` (`IMPORT_UPLOAD_BYTES`, `import_topologies_endpoint`); `services/ai-orchestrator/app/routes/generate.py` (`generate`); `services/execution/app/routers/validation.py` (`base64_length`, `validate_package_endpoint`); `services/cabling/app/routes/forks.py` (`update_fork_canvas_internal`, `save_fork_internal`); `services/execution/app/routers/executions.py` (`manual_execute`, `internal_execute`); `services/reservations/app/routers/reservations.py` (`create_new_reservation`); `services/user-profile/app/routers/preferences.py` (`patch_preferences_endpoint`); `tests/unit/test_request_body_limit_wiring.py` (`UPLOAD_ROUTES`, `JSON_UPLOAD_ROUTES`, `FORWARD_ROUTES`, `FORM_EXEMPT`) \
+  Pinned by: `services/common/tests/test_request_body_limit.py` (`test_route_body_limit`, `test_extends_body_limit_returns_the_endpoint_unchanged`, `test_a_marked_route_takes_its_own_limit`, `test_an_upload_route_takes_its_own_limit_and_another_form_does_not`); `services/inventory/tests/test_request_body_limit.py` (`test_an_upload_route_takes_its_own_limit`, `test_the_upload_routes_follow_the_driver_setting_and_the_import_bound`); `services/cabling/tests/test_request_body_limit.py` (`test_the_import_route_takes_its_own_limit`, `test_the_import_and_the_two_fork_forwards_are_the_only_larger_routes`); `services/ai-orchestrator/tests/test_request_body_limit.py` (`test_the_generate_route_takes_its_own_limit`, `test_the_generate_route_is_the_only_one_with_its_own_limit`); `services/execution/tests/test_request_body_limit.py` (`test_base64_length_is_the_padded_length`, `test_the_package_validator_takes_its_own_limit`); `services/cabling/tests/test_request_body_limit.py` (`test_a_forwarded_body_up_to_the_envelope_is_parsed_and_one_byte_more_is_413`); `services/execution/tests/test_request_body_limit.py` (`test_a_forwarded_body_up_to_the_envelope_is_parsed_and_one_byte_more_is_413`); `services/reservations/tests/test_request_body_limit.py` (`test_a_forwarded_body_up_to_the_envelope_is_parsed_and_one_byte_more_is_413`); `services/user-profile/tests/test_request_body_limit.py` (`test_a_forwarded_body_up_to_the_envelope_is_parsed_and_one_byte_more_is_413`); `tests/unit/test_request_body_limit_wiring.py` (`test_every_marked_route_is_in_the_tables_and_every_form_is_marked`, `test_the_route_tables_name_only_existing_services_and_routes`, `test_the_specification_names_every_marked_route`)
 - **OPS-VALID-11.** The limit's cost is constant per message, on the event loop like
   everything else in the request: per request two small closures; at the first read
   one pass over the headers and the route lookup; per `http.request` message one
-  addition and one comparison. It never copies, joins, or scans the body: the messages
-  it hands on are the ones it received. Measured pinned to one core through an ASGI
-  client against the same app without it (observations, not a bound): 4.9 microseconds
-  more per small JSON request (1.02 times), 20 more for a 1 MB body in one message, 84
-  more for a 1 MB body in 256 messages (about 0.3 a message). A declared body over
-  the limit costs no read at all: a 9 MB structural body to a route behind a 401
-  dependency costs 0.4 ms refused against 300 ms parsed. A chunked body over the limit
-  costs reading up to the limit and one message past it. \
+  addition and one comparison; one extra pass of the event loop before a refusal. It
+  never copies, joins, or scans the body: the messages it hands on are the ones it
+  received. Measured pinned to one core through an ASGI client against the same app
+  without it (observations, not a bound): 4.9 microseconds more per small JSON request
+  (1.02 times), 20 more for a 1 MB body in one message, 84 more for a 1 MB body in 256
+  messages (about 0.3 a message). A declared body over the limit costs no read by the
+  app: a 9 MB structural body to a route behind a 401 dependency costs 0.4 ms refused
+  against 300 ms parsed. A chunked body over the limit costs the app reading up to the
+  limit and one message past it; after the 413 the server still reads and discards the
+  rest (OPS-VALID-9), which over loopback cost about 0.09 s of CPU for 64 MiB. \
   Enforced in: `services/common/herd_common/validation_errors.py` (`LimitRequestBody`) \
-  Pinned by: `services/common/tests/test_request_body_limit.py` (`test_messages_are_handed_on_as_received_never_copied_or_joined`, `test_handing_on_a_body_allocates_nothing_that_grows_with_it`, `test_the_cost_per_message_does_not_grow_with_its_size`, `test_through_an_app_an_over_limit_body_costs_less_than_parsing_it`)
+  Pinned by: `services/common/tests/test_request_body_limit.py` (`test_messages_are_handed_on_as_received_never_copied_or_joined`, `test_handing_on_a_body_allocates_nothing_that_grows_with_it`, `test_the_cost_per_message_does_not_grow_with_its_size`, `test_through_an_app_an_over_limit_body_costs_less_than_parsing_it`); `services/common/tests/test_request_body_limit_socket.py` (`test_refusing_a_64_mib_chunked_body_holds_no_more_than_the_limit`)
+- **OPS-VALID-12.** A body one HERD service admitted is not refused for its size by the
+  service it forwards it to, by decision of the #1466 review. Every outbound call that
+  sends a body (39 call sites in `app/` and `herd_common`, found by a source scan) is
+  classified in the guard's `FORWARDS` table, and a new one fails the guard until it
+  is:
 
+  | Sender | Receiver | What travels | How it fits |
+  |---|---|---|---|
+  | reservations fork canvas PUT and fork save | cabling `PUT /internal/forks/{reservation_id}/canvas`, `POST /internal/forks/{reservation_id}/save` | the canvas the user sent; the save adds `created_by` and at most 250 member device ids (about 10 KB) | envelope |
+  | inventory immediate apply; ai-orchestrator commit with `apply_configs` | execution `POST /execute` | a stored or submitted device configuration inside `method_kwargs`, plus ids (under 1 KB) | envelope |
+  | inventory apply scheduler | execution `POST /execute/internal` | a stored device configuration inside `method_kwargs`, plus ids | envelope |
+  | the `/api/v1` facade; ai-orchestrator commit | reservations `POST /` | a subset of the admitted body with defaults and normalized datetimes (about 150 bytes more at most) | envelope |
+  | notifications preference PUT | user-profile `PATCH /preferences` | the update merged with the stored preferences (a blob of at most 64 KiB in user-profile) | envelope |
+  | ai-orchestrator commit | cabling `PUT /topologies/{topology_id}` | a canvas built from the commit, larger than the commit itself | capped: measured before anything is written (`canvas_put_bytes`); over the committing service's limit it is a 413 naming both numbers, and nothing is created |
+  | cabling topology import | inventory `POST /devices/resolve-by-name` | the device names an import file holds | capped: batches of at most 32 KiB (`name_batches`); a name longer than a device name may be is not sent |
+  | reservations utilization report | auth `POST /groups/users/groups` | every user of the report | capped: batches of 500 ids, auth's own cap (before, more than 500 users answered 422 and the report showed every user Ungrouped) |
+  | ai-orchestrator recipe drafting | execution `POST /internal/validate-package` | a drafted package as base64 | an upload route (OPS-VALID-10) |
+  | every other call: id lists of at most 500, a 2,000-character purpose, a status, a name, a pathfinding pair | auth, inventory, cabling, acl, reservations, ai-orchestrator | bounded by schemas and caps | under `MIN_MAX_REQUEST_BODY_BYTES`, so no setting can make it fail |
+
+  Two bodies are bounded by something other than a schema: the assistant's
+  configuration proposal to inventory, by the model's output tokens (`AI_MAX_TOKENS`),
+  and a dynamic device's `field_data` from execution to inventory, by what the
+  hypervisor driver returns. The rest go to services outside HERD (webhooks, chat, the
+  identity provider) or to the restarter. Should a receiving service still answer 413
+  (a different `MAX_REQUEST_BODY_BYTES` there, or a crafted body that grows when it is
+  parsed and written again: a number such as `1e15` is written `1000000000000000.0`,
+  up to 3.8 times its text), the sender answers a 4xx, never a 503 that says the other
+  service is down: reservations relays cabling's 413 and its item as they are, the
+  facade relays reservations' status and detail, ai-orchestrator's commit answers
+  cabling's or reservations' status, inventory's apply records `execution answered HTTP
+  413`, and notifications answers 413 `The merged notification preferences are too
+  large to store`. \
+  Enforced in: `tests/unit/test_request_body_limit_wiring.py` (`FORWARDS`, `body_calls`, `outbound_body_calls`); `services/ai-orchestrator/app/services/committer.py` (`canvas_put_bytes`, `CANVAS_TOO_LARGE_DETAIL`, `commit_proposal`); `services/cabling/app/services/device_resolver.py` (`name_batches`, `RESOLVE_BATCH_BYTES`, `DEVICE_NAME_MAX_LENGTH`); `services/reservations/app/services/reporting_service.py` (`fetch_user_groups_map`, `USER_GROUPS_BATCH`); `services/notifications/app/routers/notifications.py` (`PREFERENCES_TOO_LARGE_DETAIL`) \
+  Pinned by: `tests/unit/test_request_body_limit_wiring.py` (`test_every_outbound_body_is_classified_and_every_entry_exists`, `test_each_classified_call_is_covered`, `test_every_forward_route_has_a_sender`, `test_the_body_call_scan_both_ways`); `services/ai-orchestrator/tests/test_committer_error_paths.py` (`test_a_canvas_over_the_limit_is_refused_before_anything_is_written`, `test_a_canvas_at_or_under_the_limit_goes_on_to_cabling`, `test_canvas_put_bytes_is_the_httpx_encoding`); `services/cabling/tests/test_route_handlers_direct.py` (`test_device_resolver_batches_stay_under_the_batch_bytes`, `test_device_resolver_drops_a_name_no_device_can_have`, `test_device_resolver_sends_every_batch_and_merges_the_answers`); `services/reservations/tests/test_reporting_edges.py` (`test_fetch_user_groups_map_sends_batches_of_auth_s_own_cap`, `test_fetch_user_groups_map_one_failed_batch_fails_soft_for_all`); `services/reservations/tests/test_fork_endpoints.py` (`test_a_cabling_413_is_relayed_as_413_with_its_detail`); `services/notifications/tests/test_router.py` (`test_put_preferences_relays_a_user_profile_413_as_413`)
 **Out of scope.** An error body a route builds itself (`HTTPException(detail=...)`) is
 not rendered by this handler; each such detail is its area's rule (OPS-VALID-7 for a
 value outside a fixed set). What auth's and config's password fields refuse is
@@ -1962,7 +2025,8 @@ IAM-REG-2, IAM-LOGIN-5 (`identity-and-access.md`), and OPS-CONFIG-8.
 | 405 | `Method not allowed`, with `Allow` | a restarter request to `/restart` with a method other than POST, or to `/health` with one other than GET | OPS-CONFIG-25 |
 | 400 | `Transfer-Encoding is not accepted`, `Content-Length must be one whole number` | a restarter request with a chunked body or a Content-Length that is not one whole number | OPS-CONFIG-25 |
 | 413 | `Request body too large` | a restarter request body over 4096 bytes | OPS-CONFIG-25 |
-| 413 | `{"detail": [{"type": "body_too_large", "loc": ["body"], "msg": "Request body is larger than <limit> bytes"}]}`, with `Connection: close` | any request whose body is read and is over its route's limit (`MAX_REQUEST_BODY_BYTES`, plus the files an upload route accepts), in every service, before authentication | OPS-VALID-9, OPS-VALID-10 |
+| 413 | `{"detail": [{"type": "body_too_large", "loc": ["body"], "msg": "Request body is larger than <limit> bytes"}]}`; the connection stays open | any request whose body is read and is over its route's limit (`MAX_REQUEST_BODY_BYTES`, plus the files an upload route accepts or the envelope of a forward route), in every service, before authentication | OPS-VALID-9, OPS-VALID-10 |
+| 413 | the receiving service's own 413 detail, relayed (reservations' fork routes, the `/api/v1` facade), or `The merged notification preferences are too large to store` (notifications), or `The topology this commit builds is <n> bytes, over the <limit>-byte request body limit; ...` (ai-orchestrator commit) | a body forwarded to another service that refuses it for its size, or a commit whose canvas would be | OPS-VALID-12 |
 | 403 | `Admin or superadmin role required` | a non-admin lists health snapshots, reads a report, or writes a secret | OPS-HEALTH-3, OPS-REPORT-1, OPS-SECRET-1 |
 | 422 | `Unknown last_status; allowed: UNKNOWN, HEALTHY, DEGRADED, UNREACHABLE` | an unknown health filter that matches nothing | OPS-HEALTH-4 |
 | 500 | `Internal API token not configured` | a device check while execution has no internal token | OPS-HEALTH-6 |
@@ -2027,7 +2091,7 @@ Startup refusals (no HTTP answer; the container exits or waits):
 | Setting | Default | Effect |
 |---|---|---|
 | `LOG_LEVEL` (every service but config) | `INFO` | Root log level (OPS-LOG-8) |
-| `MAX_REQUEST_BODY_BYTES` (every service, config included) | `4194304` | Request body limit; an upload route adds its files (OPS-VALID-9, OPS-VALID-10) |
+| `MAX_REQUEST_BODY_BYTES` (every service, config included) | `4194304` | Request body limit, decimal digits, at least 65536; an upload route adds its files, a forward route the envelope (OPS-VALID-9, OPS-VALID-10) |
 | `HERD_BUILD`, `HERD_BUILD_DATE` | `dev`, empty | Build identity reported by `/version` (OPS-VER-3) |
 | `HERD_CONFIG_FILE` | `/etc/herd/config.json` | Where services read the config file (OPS-SET-7) |
 | `HERD_CONFIG_DATA_DIR` (config) | `/data/herd-config` | Where the config service keeps `config.json`, the marker, and the auth file |
@@ -2086,7 +2150,8 @@ the host with the installed NATS client against a closed local port. The restart
 (OPS-CONFIG-13 to OPS-CONFIG-16, OPS-CONFIG-24 to OPS-CONFIG-29) were written at
 `86765c9e` from their unit and functional suites, which were run; their integration test
 and the nightly browser step were not run against a stack. The body limit rules
-(OPS-VALID-9 to OPS-VALID-11) were written from their unit and functional suites and
+(OPS-VALID-9 to OPS-VALID-12) were written from their unit and functional suites, the
+real-socket suite against uvicorn on an ephemeral port, and
 the `tests/unit/` guard, which were run; `tests/integration/test_request_body_limit.py`
 and the `OversizedBodySender` load user were written against their neighbours and not
 run against a stack.
@@ -2148,8 +2213,14 @@ None at present.
 - The body limit lives in each service, not the gateway (issue #1466, the owner's
   option (b)): Traefik still forwards a body of any size, and each service refuses it
   at its first read (OPS-VALID-9). A route that never reads its body is not refused,
-  since nothing of it is read. Recorded in the module docstring of
-  `herd_common.validation_errors`.
+  since the route reads nothing of it. The limit bounds memory and parsing, not
+  bandwidth: the server reads and discards what is left of a refused body, so a
+  client may still send any number of bytes over a connection. Recorded in the module
+  docstring of `herd_common.validation_errors`.
+- A crafted body that grows when it is parsed and written again (numbers in exponent
+  form) can still be refused by the service it is forwarded to, which answers 413 and
+  the sender relays a 4xx (OPS-VALID-12); the envelope covers what the senders add, not
+  that growth. Recorded in issue #1466.
 - The bulk import routes of inventory and cabling read the whole upload with no bound
   of their own, so the body limit's 10 MiB import file bound is their only one
   (OPS-VALID-10). Recorded in issue #1417.
