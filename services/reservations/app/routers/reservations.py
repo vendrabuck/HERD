@@ -8,7 +8,11 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from herd_common.internal_auth import internal_token_matches
-from herd_common.validation_errors import FORWARD_ENVELOPE_BYTES, extends_body_limit
+from herd_common.validation_errors import (
+    FORWARD_ENVELOPE_BYTES,
+    LARGE_JSON_BODY_BYTES,
+    extends_body_limit,
+)
 from pydantic import AwareDatetime, BaseModel
 from sqlalchemy import and_, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1009,6 +1013,8 @@ async def get_reservation_fork(
 
 
 @router.put("/{reservation_id}/fork/canvas")
+# A canvas: a large JSON body (issue #1484).
+@extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)
 async def update_reservation_fork_canvas(
     reservation_id: uuid.UUID,
     body: ForkCanvasBody,
@@ -1041,6 +1047,8 @@ async def update_reservation_fork_canvas(
 
 
 @router.post("/{reservation_id}/fork/save")
+# A canvas: a large JSON body (issue #1484).
+@extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)
 async def save_reservation_fork(
     reservation_id: uuid.UUID,
     body: ForkSaveBody,

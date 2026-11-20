@@ -150,3 +150,52 @@ def test_the_upload_routes_follow_the_driver_setting_and_the_import_bound():
     assert limits[("POST", "/devices/import")] == LIMIT + bulk.IMPORT_UPLOAD_BYTES
     assert limits[("POST", "/templates/import")] == LIMIT + bulk.IMPORT_UPLOAD_BYTES
     assert limits[("POST", "/devices")] == LIMIT
+
+
+# -- The large-JSON routes take the allowance (OPS-VALID-10, issue #1484) ----------------
+#
+# A device configuration version: the default limit plus LARGE_JSON_BODY_BYTES. A body
+# that is not JSON at that
+# limit is handed on whole and parsed (json_invalid); one byte more is the 413 naming the
+# route's limit; a body just over the default reaches the route's authentication.
+
+_LARGE_JSON_ROUTES = [("POST", f"/devices/{uuid.uuid4()}/config-versions")]
+
+
+@pytest.mark.parametrize(("method", "path"), _LARGE_JSON_ROUTES)
+async def test_a_large_json_route_takes_the_allowance(method, path):
+    from herd_common.validation_errors import LARGE_JSON_BODY_BYTES
+
+    route_limit = LIMIT + LARGE_JSON_BODY_BYTES
+    async with _client() as client:
+        over_default = await client.request(
+            method, path, content=b"{}" + b" " * LIMIT, headers=_JSON
+        )
+        at = await client.request(method, path, content=b"x" * route_limit, headers=_JSON)
+        over = await client.request(method, path, content=b"x" * (route_limit + 1), headers=_JSON)
+    assert over_default.status_code in (401, 403), over_default.text[:300]
+    assert at.status_code == 422, at.text[:300]
+    assert at.json()["detail"][0]["type"] == "json_invalid"
+    assert over.status_code == 413, over.text[:300]
+    assert over.json() == {"detail": [body_too_large_error(route_limit)]}
+    assert "connection" not in over.headers
+
+
+def test_the_larger_routes_are_exactly_the_uploads_and_the_config_version_create():
+    from app.routers import bulk
+    from fastapi.routing import iter_route_contexts
+    from herd_common.validation_errors import LARGE_JSON_BODY_BYTES, route_body_limit
+
+    limits = {
+        (method, route.path): route_body_limit(route, LIMIT)
+        for route in iter_route_contexts(app.routes)
+        for method in route.methods or ()
+    }
+    driver = LIMIT + settings.driver_max_size_bytes
+    assert {k: v for k, v in limits.items() if v != LIMIT} == {
+        ("POST", "/drivers"): driver,
+        ("PUT", "/drivers/{driver_id}/file"): driver,
+        ("POST", "/devices/import"): LIMIT + bulk.IMPORT_UPLOAD_BYTES,
+        ("POST", "/templates/import"): LIMIT + bulk.IMPORT_UPLOAD_BYTES,
+        ("POST", "/devices/{device_id}/config-versions"): LIMIT + LARGE_JSON_BODY_BYTES,
+    }

@@ -23,8 +23,9 @@ from httpx import ASGITransport, AsyncClient
 
 LIMIT = settings.max_request_body_bytes
 _JSON = {"content-type": "application/json"}
-_BODY_ROUTES = [("POST", "/commit")]
-_AUTHENTICATED_ROUTE = ("POST", "/commit")
+# Not the commit: since issue #1484 it takes the large-JSON allowance (below).
+_BODY_ROUTES = [("POST", "/templates/suggest-identity"), ("POST", "/recipes/draft")]
+_AUTHENTICATED_ROUTE = ("POST", "/templates/suggest-identity")
 
 
 def _client() -> AsyncClient:
@@ -116,9 +117,9 @@ async def test_the_generate_route_takes_its_own_limit(monkeypatch):
     assert refused.json() == {"detail": [body_too_large_error(LIMIT + upload)]}
 
 
-def test_the_generate_route_is_the_only_one_with_its_own_limit():
+def test_the_larger_routes_are_exactly_generate_and_commit():
     from fastapi.routing import iter_route_contexts
-    from herd_common.validation_errors import route_body_limit
+    from herd_common.validation_errors import LARGE_JSON_BODY_BYTES, route_body_limit
 
     limits = {
         (method, route.path): route_body_limit(route, LIMIT)
@@ -126,5 +127,30 @@ def test_the_generate_route_is_the_only_one_with_its_own_limit():
         for method in route.methods or ()
     }
     assert {k: v for k, v in limits.items() if v != LIMIT} == {
-        ("POST", "/generate"): LIMIT + settings.upload_max_files * settings.upload_max_file_bytes
+        ("POST", "/generate"): LIMIT + settings.upload_max_files * settings.upload_max_file_bytes,
+        ("POST", "/commit"): LIMIT + LARGE_JSON_BODY_BYTES,
     }
+
+
+# -- The commit takes the large-JSON allowance (OPS-VALID-10, issue #1484) ----------------
+#
+# A commit describes a whole topology and builds a canvas from it: the default limit plus
+# LARGE_JSON_BODY_BYTES. A body that is not JSON at that limit is handed on whole and
+# parsed (json_invalid); one byte more is the 413 naming the route's limit; a body just
+# over the default reaches the route's authentication.
+
+
+async def test_a_large_json_route_takes_the_allowance():
+    from herd_common.validation_errors import LARGE_JSON_BODY_BYTES
+
+    route_limit = LIMIT + LARGE_JSON_BODY_BYTES
+    async with _client() as client:
+        over_default = await client.post("/commit", content=b"{}" + b" " * LIMIT, headers=_JSON)
+        at = await client.post("/commit", content=b"x" * route_limit, headers=_JSON)
+        over = await client.post("/commit", content=b"x" * (route_limit + 1), headers=_JSON)
+    assert over_default.status_code in (401, 403), over_default.text[:300]
+    assert at.status_code == 422, at.text[:300]
+    assert at.json()["detail"][0]["type"] == "json_invalid"
+    assert over.status_code == 413, over.text[:300]
+    assert over.json() == {"detail": [body_too_large_error(route_limit)]}
+    assert "connection" not in over.headers

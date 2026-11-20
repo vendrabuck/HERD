@@ -2,6 +2,7 @@ import logging
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from herd_common.auth import make_auth_dependencies
+from herd_common.validation_errors import LARGE_JSON_BODY_BYTES, extends_body_limit
 
 from app.config import settings
 from app.schemas.generate import CommitRequest, CommitResponse
@@ -24,6 +25,9 @@ async def _bearer_token(authorization: str = Header(...)) -> str:
 
 
 @router.post("", response_model=CommitResponse)
+# A commit describes a whole topology (its devices with their configurations, its
+# links and elements) and builds a canvas from it: a large JSON body (issue #1484).
+@extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)
 async def commit(
     req: CommitRequest,
     user=Depends(get_current_user),
