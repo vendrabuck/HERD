@@ -2584,16 +2584,9 @@ async def _apply_one_port_action(
         update_execution_run,
     )
     from app.services.l1_assignment_service import (
-        canonical_port_pair,
         record_l1_connect,
         record_l1_failed,
         release_l1_connection,
-    )
-    from app.services.wiring_claim import (
-        SETTLED_ROW_PENDING_RELEASE,
-        HolderRecord,
-        holder_record,
-        reopen_rebuilt_row,
     )
 
     if claims is not None and not await claims.claim(db, L1ConnectionAssignment, retry_row_id):
@@ -2627,50 +2620,10 @@ async def _apply_one_port_action(
             started_at=started,
             completed_at=datetime.now(timezone.utc),
         )
-        # Issue #1479: the connect or disconnect happened on the device, so it is
-        # recorded unless another retry pass holds a live claim on the row (that pass
-        # re-drives and records); a claim the reconcile or a teardown cleared, or one
-        # that expired, does not stop the record. holder_record decides the form from
-        # the row as it is now (wiring_claim.decide_holder_record). It first locks
-        # another reservation's ACTIVE row on the pair, which record_l1_connect may
-        # supersede, so every writer takes those locks in the same order. The
-        # reconcile passes no claims: WRITE, exactly as before.
-        build = action == "connect_ports"
-        ca, cb = canonical_port_pair(port_a, port_b)
-        other_active = select(L1ConnectionAssignment.id).where(
-            L1ConnectionAssignment.switch_device_id == switch_uuid,
-            L1ConnectionAssignment.port_a == ca,
-            L1ConnectionAssignment.port_b == cb,
-            L1ConnectionAssignment.status == "ACTIVE",
-            L1ConnectionAssignment.reservation_id != res_uuid,
-        )
-        async with holder_record(
-            db,
-            L1ConnectionAssignment,
-            retry_row_id,
-            claims,
-            added=build,
-            succeeded=True,
-            lock_first=other_active if build else None,
-        ) as plan:
-            if plan.kind is HolderRecord.WRITE and build:
-                await record_l1_connect(db, res_uuid, switch_uuid, port_a, port_b, phys)
-            elif plan.kind is HolderRecord.WRITE:
-                await release_l1_connection(db, res_uuid, switch_uuid, port_a, port_b)
-            elif plan.kind is HolderRecord.PARK:
-                await record_l1_failed(
-                    db,
-                    res_uuid,
-                    switch_uuid,
-                    port_a,
-                    port_b,
-                    0,
-                    SETTLED_ROW_PENDING_RELEASE,
-                    phys,
-                    intended="RELEASED",
-                )
-            elif plan.kind is HolderRecord.REOPEN:
-                await reopen_rebuilt_row(db, L1ConnectionAssignment, retry_row_id)
+        if action == "connect_ports":
+            await record_l1_connect(db, res_uuid, switch_uuid, port_a, port_b, phys)
+        else:
+            await release_l1_connection(db, res_uuid, switch_uuid, port_a, port_b)
     else:
         await update_execution_run(
             db,
@@ -3650,12 +3603,6 @@ async def _apply_one_vlan_action(
         record_l2_membership_active,
         release_l2_membership,
     )
-    from app.services.wiring_claim import (
-        SETTLED_ROW_PENDING_RELEASE,
-        HolderRecord,
-        holder_record,
-        reopen_rebuilt_row,
-    )
 
     if claims is not None and not await claims.claim(db, L2PortAssignment, retry_row_id):
         return
@@ -3691,44 +3638,10 @@ async def _apply_one_vlan_action(
             started_at=started,
             completed_at=datetime.now(timezone.utc),
         )
-        # Issue #1479: the _apply_one_port_action record, for a membership. The
-        # first lock covers another reservation's ACTIVE membership on the port, which
-        # record_l2_membership_active may park.
-        join = action == "add_to_vlan"
-        other_active = select(L2PortAssignment.id).where(
-            L2PortAssignment.switch_device_id == switch_uuid,
-            L2PortAssignment.port == port,
-            L2PortAssignment.status == "ACTIVE",
-            L2PortAssignment.reservation_id != res_uuid,
-        )
-        async with holder_record(
-            db,
-            L2PortAssignment,
-            retry_row_id,
-            claims,
-            added=join,
-            succeeded=True,
-            lock_first=other_active if join else None,
-        ) as plan:
-            if plan.kind is HolderRecord.WRITE and join:
-                await record_l2_membership_active(
-                    db, res_uuid, vlan_assignment_id, switch_uuid, port
-                )
-            elif plan.kind is HolderRecord.WRITE:
-                await release_l2_membership(db, res_uuid, switch_uuid, port)
-            elif plan.kind is HolderRecord.PARK:
-                await record_l2_failed(
-                    db,
-                    res_uuid,
-                    vlan_assignment_id,
-                    switch_uuid,
-                    port,
-                    0,
-                    SETTLED_ROW_PENDING_RELEASE,
-                    intended="RELEASED",
-                )
-            elif plan.kind is HolderRecord.REOPEN:
-                await reopen_rebuilt_row(db, L2PortAssignment, retry_row_id)
+        if action == "add_to_vlan":
+            await record_l2_membership_active(db, res_uuid, vlan_assignment_id, switch_uuid, port)
+        else:
+            await release_l2_membership(db, res_uuid, switch_uuid, port)
     else:
         await update_execution_run(
             db,
@@ -4416,12 +4329,6 @@ async def _apply_l3_adjacency(
         routes_not_in,
         union_routes,
     )
-    from app.services.wiring_claim import (
-        SETTLED_ROW_PENDING_RELEASE,
-        HolderRecord,
-        holder_record,
-        reopen_rebuilt_row,
-    )
 
     res_uuid = uuid.UUID(reservation_id)
     retry_ids = retry_row_ids or {}
@@ -4642,9 +4549,6 @@ async def _apply_l3_adjacency(
             # Removals that did not confirm (issue #1001): with the routes this pass
             # configured, they are what may still be installed if the switch fails.
             unremoved: list[dict] = []
-            # Issue #1479: the routes this pass confirmed configured, which is what it
-            # added to the switch; recorded for removal if the pin was settled meanwhile.
-            configured: list[dict] = []
             for op_method, route in drive_sequence:
                 ok, attempts, err = await _drive_l3_route(
                     db,
@@ -4666,8 +4570,6 @@ async def _apply_l3_adjacency(
                     switch_last_error = err
                     if op_method == "remove_route":
                         unremoved.append(route)
-                elif op_method == "configure_route":
-                    configured.append(route)
 
             logout_run = await create_execution_run(
                 db,
@@ -4726,59 +4628,29 @@ async def _apply_l3_adjacency(
                             routes_not_in(previous_routes, removed), add_routes
                         ),
                     )
+            elif switch_ok:
+                if direction == "provision":
+                    await record_route_active(db, res_uuid, switch_id, routes)
+                else:
+                    await release_route_membership(db, res_uuid, switch_id)
             else:
-                # Issue #1479: the switch's route calls happened on the device, so they
-                # are recorded unless another retry pass holds a live claim on the pin
-                # (holder_record, as in _apply_one_port_action). A FAILED switch is
-                # recorded the same way, because a failed provision may have configured
-                # part of its set (issue #1001): what may now be installed is its own
-                # routes plus any residue whose removal did not confirm; a failed
-                # deprovision drives no residue, so that is its `routes` unchanged.
-                provision = direction == "provision"
-                possibly = union_routes(routes, unremoved if provision else [])
-                retry_id = retry_ids.get(switch_id)
-                async with holder_record(
+                # A failed provision keeps its own routes plus any residue whose removal
+                # did not confirm (issue #1001); a failed deprovision drives no residue,
+                # so this is its `routes` unchanged. Route calls before the failure may
+                # have changed the switch and only this write records them, so it lands
+                # as on main unless another retry pass holds a live claim (#1479).
+                await record_route_failed(
                     db,
-                    RouteAssignment,
-                    retry_id,
-                    claims,
-                    added=provision,
-                    succeeded=switch_ok,
-                ) as plan:
-                    if plan.kind is HolderRecord.WRITE and switch_ok and provision:
-                        await record_route_active(db, res_uuid, switch_id, routes)
-                    elif plan.kind is HolderRecord.WRITE and switch_ok:
-                        await release_route_membership(db, res_uuid, switch_id)
-                    elif plan.kind is HolderRecord.WRITE:
-                        await record_route_failed(
-                            db,
-                            res_uuid,
-                            switch_id,
-                            possibly,
-                            switch_attempts or 1,
-                            switch_last_error,
-                            intended=intended,
-                            row_id=retry_id,
-                            # The row is this pass's, or nobody's now (the plan checked,
-                            # under the lock): the write needs no stamp in that case.
-                            claims=claims if plan.mine else None,
-                        )
-                    elif plan.kind is HolderRecord.PARK and configured:
-                        # Only what this pass confirmed configured is new on the switch
-                        # (a configure the driver refused applied nothing); with none,
-                        # the settled pin already records everything there is.
-                        kept = plan.row.routes if plan.row.status != "RELEASED" else []
-                        await record_route_failed(
-                            db,
-                            res_uuid,
-                            switch_id,
-                            union_routes(kept, configured),
-                            0,
-                            SETTLED_ROW_PENDING_RELEASE,
-                            intended="RELEASED",
-                        )
-                    elif plan.kind is HolderRecord.REOPEN:
-                        await reopen_rebuilt_row(db, RouteAssignment, retry_id)
+                    res_uuid,
+                    switch_id,
+                    union_routes(routes, unremoved if direction == "provision" else []),
+                    switch_attempts or 1,
+                    switch_last_error,
+                    intended=intended,
+                    row_id=retry_ids.get(switch_id),
+                    claims=claims,
+                    holder_or_unclaimed=True,
+                )
 
 
 def _route_set_identity_keys(routes: list[dict]) -> set[str]:

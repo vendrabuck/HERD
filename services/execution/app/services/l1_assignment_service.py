@@ -19,12 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
 from app.services._uuid_utils import as_uuid as _as_uuid
-from app.services.wiring_claim import (
-    WiringRowClaims,
-    claim_write_clauses,
-    note_refused_write,
-    unclaimed,
-)
+from app.services.wiring_claim import WiringRowClaims, claim_write_clauses, unclaimed
 from app.services.wiring_due import tick_would_drive
 
 logger = logging.getLogger(__name__)
@@ -687,8 +682,7 @@ async def _record_l1_failed_for_row(
     (issue #814). One atomic `UPDATE ... WHERE id AND status`, plus the claim clause
     of wiring_claim.claim_write_clauses (issue #1479), no insert branch:
     rowcount zero means a concurrent writer moved the row or another pass holds its
-    drive claim, so this failure is not written (and, when another pass holds the
-    row, it joins `claims.lost`).
+    drive claim, so this failure is not written and the row joins `claims.lost`.
     """
     values: dict = {
         "status": "FAILED",
@@ -709,7 +703,8 @@ async def _record_l1_failed_for_row(
     )
     if result.rowcount == 0:
         await db.rollback()
-        await note_refused_write(db, L1ConnectionAssignment, row_id, claims)
+        if claims is not None:
+            claims.lost.add(row_id)
         logger.warning(
             "Ignoring stale L1 %s failure for switch %s pair (%s, %s), reservation %s: "
             "row %s is no longer %s or another pass holds its drive claim "
@@ -793,8 +788,7 @@ async def record_l1_failed(
     or one nobody holds (wiring_claim.claim_write_clauses), so neither a pass that
     loaded the row before another pass claimed it nor a holder whose claim expired and
     was taken over can rewrite the row under the current holder's drive. A refused
-    write changes nothing on the row and returns None; the row joins `claims.lost`
-    when another retry pass holds it (`note_refused_write`).
+    write changes nothing on the row, returns None, and adds the row to `claims.lost`.
     The key-based upsert ignores `claims`.
     """
     res_uuid = _as_uuid(reservation_id)

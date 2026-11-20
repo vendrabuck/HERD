@@ -880,89 +880,79 @@ async def test_a_holder_whose_expired_claim_nobody_took_still_writes(db, layer):
     assert late.lost == set()
 
 
-@pytest.mark.parametrize("layer", ["l1", "l2"])
-async def test_a_superseded_holder_drives_but_records_nothing(layer):
-    """Pass level, the per-row apply: a holder that believes it holds the row (it is in
-    `held`) but whose claim was taken over records neither its success nor its
-    failure; the new holder's stamp and the row stay as they were."""
+SUCCESS = {"success": True, "output": {}, "error": None, "duration_ms": 1}
+FAILURE = {"success": False, "output": None, "error": "boom", "duration_ms": 1}
+L3_SWITCH = {
+    "id": str(SWITCH_ID),
+    "name": "l3",
+    "template_id": "t",
+    "driver_id": str(uuid.uuid4()),
+    "driver_sha256": "sha",
+    "driver_filename": "d.zip",
+    "connection_type": "Layer 3 Switch",
+    "field_data": {},
+}
+
+
+async def _drive_one(layer, row_id, claims, result, *, build=True):
+    """The holder's own per-row apply (L1, L2) with the sandbox answering `result`."""
     from app.services.nats_consumer import _apply_one_port_action, _apply_one_vlan_action
 
-    row_id, stale = await _superseded_holder(layer)
-    before = await _ledger_state(layer, row_id)
     va = (await _ledger_row(L2PortAssignment, row_id)).vlan_assignment_id if layer == "l2" else None
-    for result in (
-        {"success": True, "output": {}, "error": None, "duration_ms": 1},
-        {"success": False, "output": None, "error": "boom", "duration_ms": 1},
-    ):
-        stale.lost.clear()
-        with patch("app.services.driver_sandbox.execute_driver_method", return_value=result):
-            async with TestSessionLocal() as s:
-                if layer == "l1":
-                    await _apply_one_port_action(
-                        s,
-                        "connect_ports",
-                        "/tmp/d",
-                        {},
-                        set(),
-                        SWITCH_ID,
-                        uuid.uuid4(),
-                        "sha",
-                        RES_ID,
-                        "0/0/1",
-                        "0/0/2",
-                        None,
-                        retry_row_id=row_id,
-                        claims=stale,
-                    )
-                else:
-                    await _apply_one_vlan_action(
-                        s,
-                        "add_to_vlan",
-                        "/tmp/d",
-                        {},
-                        set(),
-                        SWITCH_ID,
-                        uuid.uuid4(),
-                        "sha",
-                        RES_ID,
-                        "0/0/1",
-                        100,
-                        va,
-                        retry_row_id=row_id,
-                        claims=stale,
-                    )
-        assert await _ledger_state(layer, row_id) == before, result["success"]
-        assert stale.lost == {row_id}
+    with patch("app.services.driver_sandbox.execute_driver_method", return_value=result):
+        async with TestSessionLocal() as s:
+            if layer == "l1":
+                await _apply_one_port_action(
+                    s,
+                    "connect_ports" if build else "disconnect_ports",
+                    "/tmp/d",
+                    {},
+                    set(),
+                    SWITCH_ID,
+                    uuid.uuid4(),
+                    "sha",
+                    RES_ID,
+                    "0/0/1",
+                    "0/0/2",
+                    None,
+                    retry_row_id=row_id,
+                    claims=claims,
+                )
+            else:
+                await _apply_one_vlan_action(
+                    s,
+                    "add_to_vlan" if build else "remove_from_vlan",
+                    "/tmp/d",
+                    {},
+                    set(),
+                    SWITCH_ID,
+                    uuid.uuid4(),
+                    "sha",
+                    RES_ID,
+                    "0/0/1",
+                    100,
+                    va,
+                    retry_row_id=row_id,
+                    claims=claims,
+                )
 
 
-@pytest.mark.parametrize("failing", [None, "login", "remove_route"])
-async def test_a_superseded_l3_holder_drives_but_records_nothing(failing):
-    """Pass level, the L3 per-switch apply: a superseded holder records neither its
-    success (the per-switch release), its login failure, nor its route failure."""
+async def _drive_l3(row_id, claims, *, provision, routes, failing=()):
+    """The holder's own L3 per-switch apply; `failing` names actions or route
+    destinations whose driver call fails."""
     import httpx
     from app.services.nats_consumer import _apply_l3_adjacency, _FetchContext
 
-    row_id, stale = await _superseded_holder("l3", intended="RELEASED")
-    before = await _ledger_state("l3", row_id)
-    switch = {
-        "id": str(SWITCH_ID),
-        "name": "l3",
-        "template_id": "t",
-        "driver_id": str(uuid.uuid4()),
-        "driver_sha256": "sha",
-        "driver_filename": "d.zip",
-        "connection_type": "Layer 3 Switch",
-        "field_data": {},
-    }
-
     def _driver(driver_path, action, context, **kwargs):
-        if action == failing:
-            return {"success": False, "output": None, "error": "boom", "duration_ms": 1}
-        return {"success": True, "output": {}, "error": None, "duration_ms": 1}
+        mk = kwargs.get("method_kwargs") or {}
+        if action in failing or mk.get("destination") in failing:
+            return FAILURE
+        return SUCCESS
 
+    item = {"device_id": str(SWITCH_ID), "routes": routes}
     with ExitStack() as stack:
         stack.enter_context(
-            patch("app.services.nats_consumer._fetch_device", AsyncMock(return_value=switch))
+            patch("app.services.nats_consumer._fetch_device", AsyncMock(return_value=L3_SWITCH))
         )
         stack.enter_context(
             patch(
@@ -982,17 +972,145 @@ async def test_a_superseded_l3_holder_drives_but_records_nothing(failing):
         async with httpx.AsyncClient() as client:
             await _apply_l3_adjacency(
                 str(RES_ID),
-                [{"device_id": str(SWITCH_ID), "routes": [{"destination": "10.0.0.0/24"}]}],
-                [],
+                [] if provision else [item],
+                [item] if provision else [],
                 _FetchContext(client),
                 _db_session_factory(),
                 retry_row_ids={str(SWITCH_ID): row_id},
-                claims=stale,
+                claims=claims,
             )
+    assert driver.call_count > 0
+    return driver
 
-    assert driver.call_count > 0, "the superseded holder still drives (it cannot know)"
-    assert await _ledger_state("l3", row_id) == before
+
+@pytest.mark.parametrize("layer", ["l1", "l2"])
+async def test_a_superseded_holders_failure_is_refused_but_its_success_is_recorded(layer):
+    """A holder that believes it holds the row (it is in `held`) but whose claim another
+    pass took over: its FAILURE write needs its own stamp and is refused (the row and the
+    new holder's claim stay, the row reads in_progress); its SUCCESS flip is the
+    unconditional writer, exactly as on main (issue #1481), so it is recorded."""
+    row_id, stale = await _superseded_holder(layer)
+    before = await _ledger_state(layer, row_id)
+
+    await _drive_one(layer, row_id, stale, FAILURE)
+    assert await _ledger_state(layer, row_id) == before
     assert stale.lost == {row_id}
+
+    await _drive_one(layer, row_id, stale, SUCCESS)
+    assert (await _ledger_state(layer, row_id))[0] == "ACTIVE", "the success flip is main's"
+
+
+@pytest.mark.parametrize("failing", ["login", "remove_route", None])
+async def test_a_superseded_l3_holder_records_only_its_success(failing):
+    """The L3 per-switch apply, the same rule: a superseded holder's login failure and
+    route failure are refused (another pass holds a live claim, so even the partial-
+    failure write, which lands over a merely cleared claim, is refused); its successful
+    release is main's unconditional writer."""
+    row_id, stale = await _superseded_holder("l3", intended="RELEASED")
+    before = await _ledger_state("l3", row_id)
+
+    await _drive_l3(
+        row_id,
+        stale,
+        provision=False,
+        routes=[{"destination": "10.0.0.0/24"}],
+        failing=(failing,) if failing else (),
+    )
+    if failing:
+        assert await _ledger_state("l3", row_id) == before
+        assert stale.lost == {row_id}
+    else:
+        assert (await _ledger_state("l3", row_id))[0] == "RELEASED"
+
+
+async def _cleared_by_the_reconcile(layer, row_id, how):
+    """A writer that never claims clears the holder's claim: the reconcile's key-based
+    failure write (`failure`) or its stale-build park (`park`)."""
+    from app.services.nats_consumer import WIRING_STALE_BUILD_REASON
+
+    async with TestSessionLocal() as s:
+        if how == "park":
+            park = {
+                "l1": park_stale_l1_build,
+                "l2": park_stale_l2_build,
+                "l3": park_stale_route_build,
+            }[layer]
+            await park(s, row_id, WIRING_STALE_BUILD_REASON)
+        elif layer == "l1":
+            await record_l1_failed(
+                s, RES_ID, SWITCH_ID, "0/0/1", "0/0/2", 1, "reconcile", intended="ACTIVE"
+            )
+        elif layer == "l2":
+            await record_l2_failed(
+                s, RES_ID, None, SWITCH_ID, "0/0/1", 1, "reconcile", intended="ACTIVE"
+            )
+        else:
+            await record_route_failed(s, RES_ID, SWITCH_ID, None, 1, "reconcile", intended="ACTIVE")
+    assert await _claimed_until(_MODEL[layer], row_id) is None
+
+
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_after_the_reconcile_clears_the_claim_the_holders_success_is_recorded(layer):
+    """Main's behaviour, pinned (issue #1481 owns any change): the holder's successful
+    connect, join, or provision is recorded ACTIVE by the unconditional writer even
+    though the reconcile's failure write cleared its claim during the drive."""
+    row_id = await _seed_layer(layer, intended="ACTIVE")
+    holder = WiringRowClaims()
+    async with TestSessionLocal() as s:
+        assert await holder.claim(s, _MODEL[layer], row_id) is True
+    await _cleared_by_the_reconcile(layer, row_id, "failure")
+
+    if layer == "l3":
+        await _drive_l3(row_id, holder, provision=True, routes=[{"destination": "10.0.0.0/24"}])
+    else:
+        await _drive_one(layer, row_id, holder, SUCCESS)
+
+    assert (await _ledger_state(layer, row_id))[0] == "ACTIVE"
+    assert holder.lost == set()
+
+
+@pytest.mark.parametrize("how", ["failure", "park"])
+@pytest.mark.parametrize("layer", ["l1", "l2"])
+async def test_after_the_reconcile_clears_the_claim_the_holders_failure_is_refused(layer, how):
+    """The one difference from main on the holder's side: an L1 or L2 driver call that
+    failed changed nothing on the device, so its failure write needs the holder's own
+    stamp. After the reconcile's failure write or stale park cleared it, the reconcile's
+    record stands (main overwrote it: a park became intended ACTIVE again)."""
+    row_id = await _seed_layer(layer, intended="ACTIVE")
+    holder = WiringRowClaims()
+    async with TestSessionLocal() as s:
+        assert await holder.claim(s, _MODEL[layer], row_id) is True
+    await _cleared_by_the_reconcile(layer, row_id, how)
+    after_reconcile = await _ledger_state(layer, row_id)
+
+    await _drive_one(layer, row_id, holder, FAILURE)
+
+    assert await _ledger_state(layer, row_id) == after_reconcile
+
+
+@pytest.mark.parametrize("how", ["failure", "park"])
+async def test_after_the_reconcile_clears_the_claim_an_l3_partial_failure_is_recorded(how):
+    """An L3 switch whose route calls partly failed may have configured routes only its
+    failure write records (#1001), so that write lands as on main over a claim the
+    reconcile cleared: FAILED intended ACTIVE, with every route it may have installed."""
+    row_id = await _seed_layer("l3", intended="ACTIVE")
+    holder = WiringRowClaims()
+    async with TestSessionLocal() as s:
+        assert await holder.claim(s, RouteAssignment, row_id) is True
+    await _cleared_by_the_reconcile("l3", row_id, how)
+
+    await _drive_l3(
+        row_id,
+        holder,
+        provision=True,
+        routes=[{"destination": "10.0.1.0/24"}, {"destination": "10.0.2.0/24"}],
+        failing=("10.0.2.0/24",),
+    )
+
+    row = await _ledger_row(RouteAssignment, row_id)
+    assert (row.status, row.intended, row.last_error) == ("FAILED", "ACTIVE", "boom")
+    assert {r["destination"] for r in row.routes} >= {"10.0.1.0/24", "10.0.2.0/24"}
+    assert holder.lost == set()
 
 
 async def test_write_guard_does_nothing_without_a_ledger(db):
