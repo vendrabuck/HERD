@@ -7,15 +7,16 @@ the URL pattern's quantifiers were bounded, `" " + "a-" * n` took 11 s at 64 KB.
 
 Each case times redact_config at three sizes, n, 4n, and 16n, and requires each
 step to cost at most RATIO_BOUND times the one before: linear work gives about 4
-(at most 4.7 in 160 measured runs on the development host), quadratic about 16.
-The bound is RELATIVE, so the test holds on a slow, busy, or single-core host (it
-must pass under `taskset -c 0`). The timing is `growth_ratios` in `tests/_cost.py`,
-the one clock every herd_common cost test reads (#1477): CPU time, n first grown
-until one call takes at least MIN_BASE_SECONDS, each size the fastest of REPEATS
-calls, and a case over the bound measured once more keeping each size's fastest
-time across both attempts, so a burst of load on a shared host cannot fail it while
-a real quadratic (which fails every attempt) still does. The URL-shaped cases carry
-a `://`, because the URL pattern only runs on a line that has one.
+(the worst step measured in the #1477 review was 7.3, over about 200 runs pinned,
+unpinned, beside CPU hogs, and under coverage), a dominant quadratic about 16. The
+bound is RELATIVE, so the test holds on a slow, busy, or single-core host (it must
+pass under `taskset -c 0`). The timing is `growth_ratios` in `tests/_cost.py`, the
+one clock every herd_common cost test reads (#1477): CPU time, n first grown until
+one call takes at least MIN_BASE_SECONDS, the sizes timed in REPEATS alternating
+rounds keeping each size's fastest call, and a case over the bound measured once more
+keeping each size's fastest time across both attempts; `tests/_cost.py` says which
+growth that catches and which it does not. The URL-shaped cases carry a `://`,
+because the URL pattern only runs on a line that has one.
 """
 
 import json

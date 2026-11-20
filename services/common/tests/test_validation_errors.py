@@ -34,7 +34,7 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from tests._cost import cpu_seconds, growth_ratios
+from tests._cost import cpu_ratio, growth_ratios
 
 MARKER = "canary-Secret-7q"
 
@@ -792,16 +792,17 @@ async def test_install_after_the_app_started_is_refused():
 # -- The cost: one scan of the raw bytes (round 4 of the #1456 review) ----------------
 #
 # Every time is CPU time read through `tests/_cost.py` (#1477), and every bound is
-# relative, so it holds on a fast host, on a shared CI runner, pinned to one core, under
-# coverage, and beside a CPU hog: the escape-heavy scan against itself at four and
-# sixteen times the size (linear work), and where the comparison is the property, the
-# scan against `json.loads` of the same body (the parse it saves) or `bytes.lower` (one
-# C pass), with the margin each docstring records.
+# relative, with margin over the worst measurement, and re-measured once before it
+# fails. Bounds: the escape-heavy scan against itself at 4 and 16 times the size
+# (linear work) and against one `bytes.lower` pass per shape (a constant factor); the
+# structural scan and the parsed-value check against the parse they stand beside; the
+# no-marker exit against one `bytes.lower` pass; a refused request against the same
+# request without the check.
 
 _MB = 1 << 20
 # Each fourfold step in size may cost at most this many times the one before: linear
-# work costs about 4 (3.9 to 5.3 measured over 50 runs in each of the four conditions
-# above), a quadratic scan about 16.
+# work costs about 4, a dominant quadratic about 16 (`tests/_cost.py` says what else it
+# does and does not catch).
 _GROWTH_BOUND = 8.0
 
 
@@ -842,6 +843,22 @@ _ESCAPE_HEAVY = {
     "u0041_then_low": lambda size=_MB: _fill(_BS + "u0041", '{"name":"', _BS + 'udc00"}', size),
     "four_backslashes_and_text": lambda size=_MB: _fill(_BS * 4 + "ude00", '{"name":"', '"}', size),
 }
+# Per shape, the worst CPU-time ratio of the scan of the 1 MB body to one `bytes.lower`
+# pass over it, measured in #1477 (PROVISIONAL, development host only: AMD Threadripper
+# PRO 5955WX; 20 to 50 rounds in each of unpinned, `taskset -c 0`, pinned beside CPU
+# hogs, under coverage, and beside a spinning or memory-bound process on the SMT
+# sibling core). The bound is _PASS_MARGIN times it, so a scan that does more than
+# about twice its usual work on that shape fails. The ratio differs per shape (by its
+# escape density) far more than per run, which is why each shape has its own bound: one
+# bound for all of them would let the cheapest shape slow down sevenfold.
+_ESCAPE_PASSES_WORST = {
+    "pairs": 27.0,
+    "pairs_upper_then_low": 25.7,
+    "backslash_pairs_then_low": 22.6,
+    "u0041_then_low": 10.7,
+    "four_backslashes_and_text": 15.9,
+}
+_PASS_MARGIN = 2.0
 
 
 @pytest.mark.parametrize("make", _STRUCTURAL.values(), ids=_STRUCTURAL.keys())
@@ -849,31 +866,43 @@ def test_a_structural_body_costs_a_small_part_of_its_parse(make):
     """The body is refused without a parse: the scan costs under a fifth of what
     `json.loads` of it costs, and its memory does not grow with the millions of
     elements (at most two copies of the bytes). The comparison with the parse is the
-    property, so this one keeps a ratio: measured 0.01 to 0.07 in CPU time over 50 runs
-    in each of the four conditions, almost three times under the bound."""
+    property. The costliest shapes to scan (`empty_lists`, `nested_dicts`) measured
+    about 0.07 at worst, so the bound catches a scan about three times slower."""
     body = make()
     assert _raw_text_holds_a_lone_surrogate(body) is True
-    scan = cpu_seconds(lambda: _raw_text_holds_a_lone_surrogate(body))
-    assert scan < cpu_seconds(lambda: json.loads(body)) / 5
+    ratio = cpu_ratio(
+        lambda: _raw_text_holds_a_lone_surrogate(body), lambda: json.loads(body), bound=0.2
+    )
+    assert ratio < 0.2
     assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 2.2 * len(body)
 
 
-@pytest.mark.parametrize("make", _ESCAPE_HEAVY.values(), ids=_ESCAPE_HEAVY.keys())
-def test_an_escape_heavy_body_costs_linear_work_in_two_copies(make):
+@pytest.mark.parametrize("shape", _ESCAPE_HEAVY)
+def test_an_escape_heavy_body_costs_linear_work_in_two_copies(shape):
     """A body of nothing but escapes is the scan's worst: a few C passes (two copies, a
-    search, eight counts), so its cost is linear in the body's length. Each fourfold
-    step in size costs at most `_GROWTH_BOUND` times the one before (about 4 measured;
-    a quadratic scan costs about 16), and memory is at most two copies of the bytes.
+    search, eight counts). Three bounds, none of which the others replace:
 
-    The bound compares the scan only with itself. It replaced a bound of 12 times
-    `json.loads` of the same body (#1477): that ratio was 2 to 8 on the development
-    host, but `json.loads` runs at its own speed on each runner's CPU, and read with a
-    wall clock it reached 18.5 on a shared CI runner."""
+    - growth: each fourfold step in size costs at most `_GROWTH_BOUND` times the one
+      before, so the cost is linear (a quadratic scan fails);
+    - passes: the scan of the 1 MB body costs under `_PASS_MARGIN` times the worst ratio
+      to one `bytes.lower` pass measured for this shape, so a linear scan that does
+      about twice its work, or one whose cost follows the number of escapes, fails;
+    - memory: at most two copies of the bytes.
+
+    These replaced a bound of 12 times `json.loads` of the same body (#1477), which a
+    wall clock read at 18.5 on a shared CI runner: `json.loads` runs at its own speed
+    on each CPU, while `bytes.lower` is one plain C pass like the scan's own."""
+    make = _ESCAPE_HEAVY[shape]
     n, times, ratios = growth_ratios(
         make, _raw_text_holds_a_lone_surrogate, bound=_GROWTH_BOUND, start=64 * 1024
     )
     assert max(ratios) <= _GROWTH_BOUND, (n, times, ratios)
     body = make()
+    bound = _PASS_MARGIN * _ESCAPE_PASSES_WORST[shape]
+    passes = cpu_ratio(
+        lambda: _raw_text_holds_a_lone_surrogate(body), lambda: body.lower(), bound=bound
+    )
+    assert passes < bound, (shape, passes)
     assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 2.2 * len(body)
 
 
@@ -892,46 +921,44 @@ def test_a_body_with_no_surrogate_marker_is_passed_after_two_searches(body):
     The memory bound is what proves the exit: without it the scan copies the body.
     The time bound is loose on purpose (two substring searches cost about one
     `bytes.lower` pass, and a 1x wall-clock bound failed once on a CI runner under
-    coverage: 0.82 ms against 0.74 ms); it only catches a scan that does several passes.
-    In CPU time the ratio measured 0.6 to 0.9 over 50 runs in each of the four
-    conditions."""
+    coverage: 0.82 ms against 0.74 ms); at 4 it sits over three times above the worst
+    ratio measured (about 1.1) and catches a scan that does several passes."""
     assert _raw_text_holds_a_lone_surrogate(body) is False
     assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 64 * 1024
-    assert cpu_seconds(lambda: _raw_text_holds_a_lone_surrogate(body)) < 4 * cpu_seconds(
-        lambda: body.lower()
-    )
+    ratio = cpu_ratio(lambda: _raw_text_holds_a_lone_surrogate(body), lambda: body.lower(), bound=4)
+    assert ratio < 4
 
 
 def test_through_an_app_a_refused_structural_body_costs_less_than_without_the_check():
     """A route behind a failing dependency, with no credentials: without the check
     FastAPI parses the body and answers 401; with it the body is refused (422) after
-    the scan alone, which costs less than that parse (measured 0.02 to 0.04 of the
-    request without the check, in CPU time)."""
+    the scan alone, which costs less than that parse (under a twentieth of it in every
+    measurement, so this bound only catches a check that parses or walks the body)."""
     import asyncio
 
     body = _STRUCTURAL["chain900"]()
+    apps = {refuse: _open_app(refuse=refuse) for refuse in (False, True)}
+    statuses: dict[bool, set[int]] = {False: set(), True: set()}
 
-    def timed(refuse: bool) -> tuple[float, int]:
-        app = _open_app(refuse=refuse)
-        statuses: list[int] = []
-
+    def request(refuse: bool) -> None:
         async def send() -> None:
-            async with _client(app) as client:
+            async with _client(apps[refuse]) as client:
                 resp = await client.post("/guarded", content=body, headers=_JSON)
-                statuses.append(resp.status_code)
+                statuses[refuse].add(resp.status_code)
 
-        return cpu_seconds(lambda: asyncio.run(send()), repeats=3), statuses[-1]
+        asyncio.run(send())
 
-    main_time, main_status = timed(False)
-    branch_time, branch_status = timed(True)
-    assert (main_status, branch_status) == (401, 422)
-    assert branch_time < main_time
+    ratio = cpu_ratio(lambda: request(True), lambda: request(False), bound=1.0, repeats=3)
+    assert (statuses[False], statuses[True]) == ({401}, {422})
+    assert ratio < 1.0
 
 
 def test_holds_lone_surrogate_costs_about_one_serialization():
     """The callers that test a PARSED value (the import checks, secrets' reveal,
     config's save): one serialization in C, peak memory under three times the parse's
-    own, time under three times the parse's (measured 0.6 to 1.5 in CPU time)."""
+    own, time under three times the parse's (about 1.2 typically, 1.9 the worst single
+    measurement in the #1477 review), which catches a check about twice as costly, and
+    the Python walk the check falls back to."""
     deep_lone = b"[" * 600 + b"0," * 300_000 + b'"\\ud800"' + b"]" * 600
     deep_pair = b"[" * 600 + b'"\\ud83d\\ude00",' + b"0," * 300_000 + b"0" + b"]" * 600
     for body, expected in ((deep_lone, True), (deep_pair, False)):
@@ -945,4 +972,4 @@ def test_holds_lone_surrogate_costs_about_one_serialization():
             return json.loads(body)
 
         assert _peak(check) < 3 * _peak(parse)
-        assert cpu_seconds(check) < 3 * cpu_seconds(parse)
+        assert cpu_ratio(check, parse, bound=3) < 3
