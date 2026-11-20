@@ -22,6 +22,7 @@ from herd_common.database import (
     DEFAULT_POOL_PRE_PING,
     DEFAULT_POOL_SIZE,
 )
+from herd_common.validation_errors import DEFAULT_MAX_REQUEST_BODY_BYTES
 
 
 class HerdBaseSettings(BaseSettings):
@@ -46,6 +47,12 @@ class HerdBaseSettings(BaseSettings):
     db_pool_size: int = Field(default=DEFAULT_POOL_SIZE, ge=1)
     db_max_overflow: int = Field(default=DEFAULT_MAX_OVERFLOW, ge=0)
     db_pool_pre_ping: bool = DEFAULT_POOL_PRE_PING
+
+    # The request body limit (issue #1466), passed to
+    # herd_common.validation_errors.install_validation_errors by every service's
+    # app/main.py: a body over it is a 413 before it is parsed or authenticated. An
+    # upload route adds its own file bound to it (`accepts_upload`).
+    max_request_body_bytes: int = Field(default=DEFAULT_MAX_REQUEST_BODY_BYTES, ge=1)
 
     @classmethod
     def settings_customise_sources(

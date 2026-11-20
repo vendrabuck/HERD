@@ -10,8 +10,10 @@ import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
+from herd_common.validation_errors import accepts_upload
 from pydantic import BaseModel, Field
 
+from app.config import settings
 from app.routers.executions import _require_internal_token
 from app.services.package_validator import (
     SUPPORTED_CONNECTION_TYPES,
@@ -22,6 +24,11 @@ from app.services.package_validator import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["validation"])
+
+
+def base64_length(size: int) -> int:
+    """The length of the padded base64 text of `size` bytes."""
+    return 4 * ((size + 2) // 3)
 
 
 class ValidatePackageRequest(BaseModel):
@@ -77,6 +84,9 @@ class ValidationReport(BaseModel):
     response_model=ValidationReport,
     response_model_by_alias=True,
 )
+# The body carries the package as base64, so it may hold the base64 length of the
+# largest package `_decode_package` accepts (issue #1466): 4 bytes for every 3.
+@accepts_upload(lambda: base64_length(settings.validate_package_max_bytes))
 async def validate_package_endpoint(
     body: ValidatePackageRequest,
     _: None = Depends(_require_internal_token),

@@ -103,7 +103,9 @@ app.add_middleware(RequestLoggingMiddleware)
 
 # Every 422 is `{type, loc, msg}`: never the submitted `input` or `ctx`, and never
 # a 500 on a lone surrogate (herd_common.validation_errors).
-install_validation_errors(app)
+# Every request body is bounded at MAX_REQUEST_BODY_BYTES (a 413 before it is read
+# past the limit, before authentication; upload routes add their own bound).
+install_validation_errors(app, max_body_bytes=settings.max_request_body_bytes)
 
 app.include_router(bulk_router)
 app.include_router(apply_jobs_router)
