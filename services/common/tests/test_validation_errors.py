@@ -800,7 +800,7 @@ async def test_install_after_the_app_started_is_refused():
 
 _MB = 1 << 20
 # Each fourfold step in size may cost at most this many times the one before: linear
-# work costs about 4 (3.9 to 4.2 measured over 50 runs in each of the four conditions
+# work costs about 4 (3.9 to 5.3 measured over 50 runs in each of the four conditions
 # above), a quadratic scan about 16.
 _GROWTH_BOUND = 8.0
 
@@ -905,7 +905,7 @@ def test_a_body_with_no_surrogate_marker_is_passed_after_two_searches(body):
 def test_through_an_app_a_refused_structural_body_costs_less_than_without_the_check():
     """A route behind a failing dependency, with no credentials: without the check
     FastAPI parses the body and answers 401; with it the body is refused (422) after
-    the scan alone, which costs less than that parse (measured 0.02 to 0.03 of the
+    the scan alone, which costs less than that parse (measured 0.02 to 0.04 of the
     request without the check, in CPU time)."""
     import asyncio
 
@@ -931,7 +931,7 @@ def test_through_an_app_a_refused_structural_body_costs_less_than_without_the_ch
 def test_holds_lone_surrogate_costs_about_one_serialization():
     """The callers that test a PARSED value (the import checks, secrets' reveal,
     config's save): one serialization in C, peak memory under three times the parse's
-    own, time under three times the parse's (measured 1.0 to 1.3 in CPU time)."""
+    own, time under three times the parse's (measured 0.6 to 1.5 in CPU time)."""
     deep_lone = b"[" * 600 + b"0," * 300_000 + b'"\\ud800"' + b"]" * 600
     deep_pair = b"[" * 600 + b'"\\ud83d\\ude00",' + b"0," * 300_000 + b"0" + b"]" * 600
     for body, expected in ((deep_lone, True), (deep_pair, False)):
