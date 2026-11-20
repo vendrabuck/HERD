@@ -59,6 +59,16 @@ than the only row in it, and drives only its own preselected row forward. Every 
 also snapshots every OTHER reservation's ledger rows before and after the race and
 asserts nothing about them changed, so a regression here fails loudly instead of
 quietly corrupting a shared gate stack again.
+
+Isolation from a stack's own tick (issue #1473). Scoping narrows what THIS process's
+tick sees; it does nothing about the other direction. The gate stack's execution
+service runs its own retry tick against the same ledger, and on the 2026-11-19 nightly
+it selected a row this suite had just seeded, could not find the suite's random switch
+in the real inventory, and recorded the pinned non-retryable reason over the row while
+this suite's tick was driving it (the claim-blind failure write fixed by issue #1479).
+Every row this suite seeds now carries HIDDEN_ATTEMPTS, above any real retry cap, so a
+stack's due selects never return it, and this process's tick runs with TEST_TICK_CAP
+above that (the issue #1190 suite's technique).
 """
 
 from __future__ import annotations
@@ -71,6 +81,7 @@ import uuid
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from app.config import settings
 from app.models.execution_run import ExecutionRun
 from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.l2_port_assignment import L2PortAssignment
@@ -204,6 +215,20 @@ SWITCH_DATA = {
 TEMPLATE_DATA = {"id": "tmpl-1", "name": "Template", "sections": []}
 SUCCESS = {"success": True, "output": {"result": True}, "error": None, "duration_ms": 1}
 
+# Issue #1473, the issue #1190 suite's isolation: every row this suite seeds carries
+# this many attempts. A stack's own retry tick selects only rows with
+# `attempts < wiring_retry_max_attempts` (10 by default), in the SQL of its three due
+# selects, so it never loads, claims, drives, or writes these rows. This process's own
+# tick runs with TEST_TICK_CAP (see _patches), which is above it. The manual channel
+# ignores the cap by design, so it needs nothing.
+HIDDEN_ATTEMPTS = 1_000_000
+TEST_TICK_CAP = HIDDEN_ATTEMPTS + 1
+# The raised cap makes every FAILED row of a used ledger a candidate of the real due
+# selects, oldest first, so the scoped selects (and the direct preselects) use a limit
+# no gate ledger reaches instead of the production batch size, or older foreign rows
+# could push this test's own newest row out of the result.
+SCOPED_SELECT_LIMIT = 10000
+
 # Long enough that the loser provably runs while the winner holds the row, short
 # enough to keep the suite quick. The driver stub blocks in a worker thread
 # (nats_consumer._run_sandbox wraps it in asyncio.to_thread), not on the loop.
@@ -245,7 +270,7 @@ def _scope_to_reservation(real_fn, reservation_id: uuid.UUID):
     """
 
     async def _scoped(db, limit, max_attempts, now=None):
-        rows = await real_fn(db, limit, max_attempts, now)
+        rows = await real_fn(db, max(limit, SCOPED_SELECT_LIMIT), max_attempts, now)
         return [r for r in rows if r.reservation_id == reservation_id]
 
     return _scoped
@@ -270,6 +295,8 @@ def _patches(execute_fn, reservation_id: uuid.UUID):
         ),
         patch("app.services.driver_loader.load_driver", new=AsyncMock(return_value="/tmp/driver")),
         patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn),
+        # issue #1473: this process's tick must still select the hidden rows.
+        patch.object(settings, "wiring_retry_max_attempts", TEST_TICK_CAP),
         # issue #819: scope the background channel's ledger view to this test's own
         # reservation, on every test, so a used gate ledger's foreign FAILED rows are
         # never selected, driven, or counted by this test's tick.
@@ -347,6 +374,69 @@ def _row_calls(calls: list[str]) -> list[str]:
 
 
 @pytest.mark.asyncio
+async def test_seeded_rows_are_invisible_to_a_stack_tick(session_factory):
+    """Issue #1473: the three real due selects, at the cap a stack runs with (this
+    process's unpatched setting), return none of the rows this suite seeds, while the
+    same selects at TEST_TICK_CAP do."""
+    reservation_id = uuid.uuid4()
+    async with session_factory() as db:
+        alloc = VlanAssignment(reservation_id=reservation_id, fabric_id=uuid.uuid4(), vlan_id=1)
+        db.add(alloc)
+        await db.flush()
+        rows = [
+            L1ConnectionAssignment(
+                reservation_id=reservation_id,
+                switch_device_id=SWITCH_ID,
+                port_a="0/0/31",
+                port_b="0/0/32",
+                status="FAILED",
+                intended="RELEASED",
+                attempts=HIDDEN_ATTEMPTS,
+                last_error="driver timeout",
+            ),
+            L2PortAssignment(
+                reservation_id=reservation_id,
+                vlan_assignment_id=alloc.id,
+                switch_device_id=SWITCH_ID,
+                port="0/0/33",
+                status="FAILED",
+                intended="RELEASED",
+                attempts=HIDDEN_ATTEMPTS,
+                last_error="driver timeout",
+            ),
+            RouteAssignment(
+                reservation_id=reservation_id,
+                device_id=SWITCH_ID,
+                routes=[{"destination": "198.51.100.0/24", "next_hop": "198.51.100.1"}],
+                status="FAILED",
+                intended="RELEASED",
+                attempts=HIDDEN_ATTEMPTS,
+                last_error="driver timeout",
+            ),
+        ]
+        db.add_all(rows)
+        await db.commit()
+        own = {r.id for r in rows}
+
+    stack_cap = settings.wiring_retry_max_attempts
+    assert stack_cap < HIDDEN_ATTEMPTS
+    selects = (_real_due_failed_rows, _real_due_failed_l2_rows, _real_due_failed_route_rows)
+    try:
+        async with session_factory() as db:
+            seen_by_stack = set()
+            seen_by_test = set()
+            for due in selects:
+                seen_by_stack |= {r.id for r in await due(db, SCOPED_SELECT_LIMIT, stack_cap)}
+                seen_by_test |= {r.id for r in await due(db, SCOPED_SELECT_LIMIT, TEST_TICK_CAP)}
+            await db.rollback()
+    finally:
+        await _cleanup(session_factory, reservation_id)
+
+    assert seen_by_stack & own == set(), "a stack's tick must never select this suite's rows"
+    assert own <= seen_by_test, "this process's tick, at TEST_TICK_CAP, still selects them"
+
+
+@pytest.mark.asyncio
 async def test_l1_row_is_driven_exactly_once_across_both_channels(session_factory):
     """One FAILED L1 cross-connect, both channels racing: one disconnect_ports call."""
     reservation_id = uuid.uuid4()
@@ -358,7 +448,7 @@ async def test_l1_row_is_driven_exactly_once_across_both_channels(session_factor
             port_b="0/0/2",
             status="FAILED",
             intended="RELEASED",
-            attempts=1,
+            attempts=HIDDEN_ATTEMPTS,
             last_error="driver timeout",
         )
         db.add(row)
@@ -420,7 +510,7 @@ async def test_l2_row_is_driven_exactly_once_across_both_channels(session_factor
             port="0/0/5",
             status="FAILED",
             intended="RELEASED",
-            attempts=1,
+            attempts=HIDDEN_ATTEMPTS,
             last_error="driver timeout",
         )
         db.add(row)
@@ -467,7 +557,7 @@ async def test_l3_pin_is_driven_exactly_once_across_both_channels(session_factor
             routes=[{"destination": "198.51.100.0/24", "next_hop": "198.51.100.1"}],
             status="FAILED",
             intended="RELEASED",
-            attempts=1,
+            attempts=HIDDEN_ATTEMPTS,
             last_error="driver timeout",
         )
         db.add(row)
@@ -516,7 +606,7 @@ async def test_the_manual_channel_reports_in_progress_when_the_tick_wins(session
             port_b="0/0/8",
             status="FAILED",
             intended="RELEASED",
-            attempts=1,
+            attempts=HIDDEN_ATTEMPTS,
             last_error="driver timeout",
         )
         db.add(row)
@@ -583,7 +673,7 @@ async def test_a_row_selected_before_it_was_claimed_loses_the_drive_time_cas(ses
             port_b="0/0/12",
             status="FAILED",
             intended="RELEASED",
-            attempts=1,
+            attempts=HIDDEN_ATTEMPTS,
             last_error="driver timeout",
         )
         db.add(row)
@@ -597,10 +687,10 @@ async def test_a_row_selected_before_it_was_claimed_loses_the_drive_time_cas(ses
     # test's row is somewhere in that real result and unclaimed, not that it is the
     # only row, and drive only this test's own preselected row forward.
     async with session_factory() as db:
-        # 10000, not the production batch size: created_at ascending means older
-        # foreign rows sort first, so a small limit could push this test's own row
-        # out of the result on a gate ledger holding more due rows than that.
-        preselected = await due_failed_rows(db, 10000, 10)
+        # SCOPED_SELECT_LIMIT, not the production batch size: created_at ascending
+        # means older foreign rows sort first, so a small limit could push this test's
+        # own row out of the result on a gate ledger holding more due rows than that.
+        preselected = await due_failed_rows(db, SCOPED_SELECT_LIMIT, TEST_TICK_CAP)
     preselected_by_id = {r.id: r for r in preselected}
     assert row_id in preselected_by_id, (
         "the background channel must have loaded the row while it was still unclaimed"
@@ -697,7 +787,7 @@ async def _seed_failed_l1_release(session_factory, reservation_id, port_a, port_
             port_b=port_b,
             status="FAILED",
             intended="RELEASED",
-            attempts=1,
+            attempts=HIDDEN_ATTEMPTS,
             last_error="driver timeout",
         )
         db.add(row)
@@ -710,7 +800,7 @@ async def _preselect_own_row(session_factory, row_id):
     from app.services.l1_assignment_service import due_failed_rows
 
     async with session_factory() as db:
-        preselected = await due_failed_rows(db, 10000, 10)
+        preselected = await due_failed_rows(db, SCOPED_SELECT_LIMIT, TEST_TICK_CAP)
     by_id = {r.id: r for r in preselected}
     assert row_id in by_id, "the early pass must have loaded the row while it was unclaimed"
     assert by_id[row_id].claimed_until is None
