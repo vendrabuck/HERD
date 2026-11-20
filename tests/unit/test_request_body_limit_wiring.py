@@ -186,27 +186,27 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
     (
         "services/ai-orchestrator/app/services/cabling_client.py",
         "fetch_pathfind_batch",
-        "post POST f'{settings.cabling_service_url.rstrip('/')}/pathfind/batch'",
+        'post POST f"{settings.cabling_service_url.rstrip("/")}/pathfind/batch"',
     ): ("bounded", (24000, "PATHFIND_BATCH_CHUNK (200) pairs of two device ids")),
     (
         "services/ai-orchestrator/app/services/committer.py",
         "_apply_configs",
-        "post POST f'{settings.execution_service_url.rstrip('/')}/execute'",
+        'post POST f"{settings.execution_service_url.rstrip("/")}/execute"',
     ): ("envelope", [("execution", "POST", "/execute")]),
     (
         "services/ai-orchestrator/app/services/committer.py",
         "_create_reservation",
-        "post POST f'{settings.reservations_service_url.rstrip('/')}/'",
+        'post POST f"{settings.reservations_service_url.rstrip("/")}/"',
     ): ("envelope", [("reservations", "POST", "/")]),
     (
         "services/ai-orchestrator/app/services/committer.py",
         "_create_topology",
-        "post POST f'{settings.cabling_service_url.rstrip('/')}/topologies'",
+        'post POST f"{settings.cabling_service_url.rstrip("/")}/topologies"',
     ): ("bounded", (1300, "a topology name of at most 200 characters")),
     (
         "services/ai-orchestrator/app/services/committer.py",
         "_update_topology_canvas",
-        "put PUT f'{settings.cabling_service_url.rstrip('/')}/topologies/{topology_id}'",
+        'put PUT f"{settings.cabling_service_url.rstrip("/")}/topologies/{topology_id}"',
     ): (
         "capped",
         "commit_proposal measures the canvas (canvas_put_bytes) against MAX_REQUEST_BODY_BYTES"
@@ -220,29 +220,29 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
     (
         "services/ai-orchestrator/app/services/purpose_signals.py",
         "_fetch_devices_batch_preview",
-        "post POST f'{base}/devices/batch'",
+        'post POST f"{base}/devices/batch"',
     ): ("bounded", (10000, "a reservation's device ids, at most 200 plus 50 dynamic")),
     (
         "services/ai-orchestrator/app/services/recipe_author.py",
         "validate_with_execution",
-        "post POST f'{settings.execution_service_url}/internal/validate-package'",
+        'post POST f"{settings.execution_service_url}/internal/validate-package"',
     ): ("marked", [("execution", "POST", "/internal/validate-package")]),
     (
         "services/ai-orchestrator/app/services/tools.py",
         "ToolDispatcher._tool_find_path",
-        "post POST f'{settings.cabling_service_url.rstrip('/')}/pathfind'",
+        'post POST f"{settings.cabling_service_url.rstrip("/")}/pathfind"',
     ): ("bounded", (200, "two device ids")),
     (
         "services/ai-orchestrator/app/services/tools.py",
         "ToolDispatcher._tool_propose_config_change",
-        "post POST f'{settings.inventory_service_url.rstrip('"
-        "/')}/devices/{device_id}/config-versions'",
+        'post POST f"{settings.inventory_service_url.rstrip("'
+        '/")}/devices/{device_id}/config-versions"',
     ): ("bounded", (None, "the model's tool arguments, bounded by AI_MAX_TOKENS output tokens")),
     (
         "services/ai-orchestrator/app/services/tools.py",
         "ToolDispatcher._tool_schedule_config_apply",
-        "post POST f'{settings.inventory_service_url.rstrip('/')}/devices"
-        "/{device_id}/config-versions/{version_id}/schedule'",
+        'post POST f"{settings.inventory_service_url.rstrip("/")}/devices'
+        '/{device_id}/config-versions/{version_id}/schedule"',
     ): ("bounded", (300, "a timestamp, a flag, and a reservation id")),
     ("services/auth/app/services/oidc_service.py", "_exchange_code", "post POST token_endpoint"): (
         "external",
@@ -251,7 +251,7 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
     (
         "services/cabling/app/services/device_resolver.py",
         "resolve_device_names",
-        "post POST f'{settings.inventory_service_url.rstrip('/')}/devices/resolve-by-name'",
+        'post POST f"{settings.inventory_service_url.rstrip("/")}/devices/resolve-by-name"',
     ): ("capped", "name_batches keeps each body under RESOLVE_BATCH_BYTES (32 KiB)"),
     (
         "services/cabling/app/services/l3_validation.py",
@@ -270,7 +270,7 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
     (
         "services/common/herd_common/internal_client.py",
         "call_service",
-        "request METHOD f'{base_url}{path}'",
+        'request METHOD f"{base_url}{path}"',
     ): ("transport", "the shared service-to-service transport; its callers are classified"),
     ("services/config/app/docker_ctl.py", "restart_services", "request POST RESTART_PATH"): (
         "external",
@@ -279,7 +279,7 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
     (
         "services/execution/app/services/nats_consumer.py",
         "_create_dynamic_device",
-        "post POST f'{settings.inventory_service_url}/devices/internal'",
+        'post POST f"{settings.inventory_service_url}/devices/internal"',
     ): (
         "bounded",
         (None, "a template id, a reservation id, and the hypervisor driver's field_data"),
@@ -287,13 +287,13 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
     (
         "services/execution/app/services/nats_consumer.py",
         "_post_provision_result",
-        "post POST f'{settings.reservations_service_url}"
-        "/internal/{reservation_id}/provision-result'",
+        'post POST f"{settings.reservations_service_url}'
+        '/internal/{reservation_id}/provision-result"',
     ): ("bounded", (4000, "at most 50 device ids and a class-name error")),
     (
         "services/integration/app/routers/reservations.py",
         "_forward",
-        "request METHOD f'{settings.reservations_service_url}{path}'",
+        'request METHOD f"{settings.reservations_service_url}{path}"',
     ): ("transport", "the /api/v1 facade's forwarder; its callers are classified"),
     ("services/integration/app/routers/reservations.py", "create_reservation", "_forward POST /"): (
         "envelope",
@@ -307,17 +307,17 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
     (
         "services/inventory/app/routers/device_configs.py",
         "apply_config_version",
-        "post POST f'{settings.execution_service_url.rstrip('/')}/execute'",
+        'post POST f"{settings.execution_service_url.rstrip("/")}/execute"',
     ): ("envelope", [("execution", "POST", "/execute")]),
     (
         "services/inventory/app/services/apply_scheduler.py",
         "_post_internal_execute",
-        "post POST f'{settings.execution_service_url.rstrip('/')}/execute/internal'",
+        'post POST f"{settings.execution_service_url.rstrip("/")}/execute/internal"',
     ): ("envelope", [("execution", "POST", "/execute/internal")]),
     (
         "services/notifications/app/routers/notifications.py",
         "put_preferences",
-        "patch PATCH f'{settings.user_profile_service_url.rstrip('/')}/preferences'",
+        'patch PATCH f"{settings.user_profile_service_url.rstrip("/")}/preferences"',
     ): ("envelope", [("user-profile", "PATCH", "/preferences")]),
     (
         "services/notifications/app/services/dispatchers/chat.py",
@@ -332,12 +332,12 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
     (
         "services/reservations/app/routers/reservations.py",
         "save_reservation_fork",
-        "_cabling_fork_call POST f'/internal/forks/{reservation_id}/save'",
+        '_cabling_fork_call POST f"/internal/forks/{reservation_id}/save"',
     ): ("envelope", [("cabling", "POST", "/internal/forks/{reservation_id}/save")]),
     (
         "services/reservations/app/routers/reservations.py",
         "update_reservation_fork_canvas",
-        "_cabling_fork_call PUT f'/internal/forks/{reservation_id}/canvas'",
+        '_cabling_fork_call PUT f"/internal/forks/{reservation_id}/canvas"',
     ): ("envelope", [("cabling", "PUT", "/internal/forks/{reservation_id}/canvas")]),
     (
         "services/reservations/app/services/purpose_service.py",
@@ -352,7 +352,7 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
     (
         "services/reservations/app/services/reporting_service.py",
         "fetch_user_groups_map",
-        "post POST f'{settings.auth_service_url}/groups/users/groups'",
+        'post POST f"{settings.auth_service_url}/groups/users/groups"',
     ): ("capped", "batches of USER_GROUPS_BATCH (500) user ids, about 20 KB each"),
     (
         "services/reservations/app/services/reservation_service.py",
@@ -362,7 +362,7 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
     (
         "services/reservations/app/services/reservation_service.py",
         "_create_reservation_fork",
-        "post POST f'{settings.cabling_service_url}/internal/forks'",
+        'post POST f"{settings.cabling_service_url}/internal/forks"',
     ): ("bounded", (11000, "three ids and at most 250 member device ids")),
     (
         "services/reservations/app/services/reservation_service.py",
@@ -372,7 +372,7 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
     (
         "services/reservations/app/services/reservation_service.py",
         "_fetch_devices",
-        "post POST f'{settings.inventory_service_url}/devices/batch'",
+        'post POST f"{settings.inventory_service_url}/devices/batch"',
     ): ("bounded", (10000, "a reservation's device ids, at most 250")),
     (
         "services/reservations/app/services/reservation_service.py",
@@ -382,12 +382,12 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
     (
         "services/reservations/app/services/reservation_service.py",
         "_prune_removed_devices_from_fork",
-        "_cabling_fork_call POST f'/internal/forks/{reservation_id}/prune-devices'",
+        '_cabling_fork_call POST f"/internal/forks/{reservation_id}/prune-devices"',
     ): ("bounded", (10000, "at most 250 device ids")),
     (
         "services/reservations/app/services/reservation_service.py",
         "_update_device_statuses.update_one",
-        "post POST f'{settings.inventory_service_url}/devices/{device_id}/status'",
+        'post POST f"{settings.inventory_service_url}/devices/{device_id}/status"',
     ): ("bounded", (100, "a status word")),
 }
 FORWARD_KINDS = {"envelope", "marked", "capped", "bounded", "transport", "external"}
@@ -594,17 +594,72 @@ def _sends_body(call: ast.Call, name: str | None) -> bool:
     return False
 
 
+_OPERATORS = {
+    ast.Add: "+",
+    ast.Sub: "-",
+    ast.Mult: "*",
+    ast.Div: "/",
+    ast.FloorDiv: "//",
+    ast.Mod: "%",
+    ast.Pow: "**",
+}
+
+
+def render(node: ast.AST | None) -> str:
+    """A text for an expression built from the AST alone, the same on every Python.
+
+    `ast.unparse` is not used: its quoting of f-strings changed between patch releases
+    of 3.12 (3.12.3 and 3.12.16 render the same f-string differently), so a key built
+    from it is not portable. Here a string is its value in double quotes, an f-string
+    is its literal parts with each formatted expression in braces, and the other
+    shapes a URL or method argument takes (names, attributes, calls, subscripts,
+    arithmetic) are written out the same way; anything else is `<NodeType>`."""
+    if node is None:
+        return "?"
+    if isinstance(node, ast.Constant):
+        return f'"{node.value}"' if isinstance(node.value, str) else str(node.value)
+    if isinstance(node, ast.JoinedStr):
+        return 'f"' + "".join(_fstring_part(part) for part in node.values) + '"'
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return f"{render(node.value)}.{node.attr}"
+    if isinstance(node, ast.Call):
+        args = [render(arg) for arg in node.args]
+        args += [
+            f"{k.arg}={render(k.value)}" if k.arg else f"**{render(k.value)}" for k in node.keywords
+        ]
+        return f"{render(node.func)}({', '.join(args)})"
+    if isinstance(node, ast.Subscript):
+        return f"{render(node.value)}[{render(node.slice)}]"
+    if isinstance(node, ast.BinOp) and type(node.op) in _OPERATORS:
+        return f"{render(node.left)} {_OPERATORS[type(node.op)]} {render(node.right)}"
+    return f"<{type(node).__name__}>"
+
+
+def _fstring_part(part: ast.AST) -> str:
+    if isinstance(part, ast.Constant) and isinstance(part.value, str):
+        return part.value
+    if isinstance(part, ast.FormattedValue):
+        conversion = f"!{chr(part.conversion)}" if part.conversion != -1 else ""
+        spec = ""
+        if part.format_spec is not None:
+            spec = ":" + "".join(_fstring_part(p) for p in part.format_spec.values)
+        return "{" + render(part.value) + conversion + spec + "}"
+    return f"<{type(part).__name__}>"
+
+
 def _text(node: ast.AST | None, assigned: dict[str, list[ast.expr]]) -> str:
     """A stable text for a method or URL argument: a string literal's value, a local
     name assigned exactly once in the same function resolved to what it holds, any
-    other expression as source text, `?` when absent."""
+    other expression rendered by `render`, `?` when absent."""
     if node is None:
         return "?"
     if isinstance(node, ast.Name) and len(assigned.get(node.id, [])) == 1:
         node = assigned[node.id][0]
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
-    return ast.unparse(node)
+    return render(node)
 
 
 def _receiver(call: ast.Call, name: str | None, assigned: dict[str, list[ast.expr]]) -> str:
@@ -834,7 +889,7 @@ def test_moving_a_call_without_changing_it_keeps_its_key(refactor):
     [
         (
             "async def f():\n    url = f'{base}/x'\n    await c.post(url, json=b)\n",
-            "post POST f'{base}/x'",
+            'post POST f"{base}/x"',
         ),
         (
             "async def f():\n    await call_service(u, 'POST', '/p', json_body=b)\n",
@@ -851,6 +906,47 @@ def test_moving_a_call_without_changing_it_keeps_its_key(refactor):
 )
 def test_the_receiver_is_the_method_and_the_url_as_written(source, receiver):
     assert body_calls(source) == [("f", receiver)]
+
+
+# Literal expected keys, so a change in how any Python renders an expression fails
+# here, loudly, on every version (3.12.3 and 3.12.16 render the same f-string
+# differently through `ast.unparse`, which is why the keys do not use it).
+_RENDERED = {
+    "plain_string": ("'/internal/forks'", '"/internal/forks"'),
+    "f_string": (
+        "f'{settings.inventory_service_url}/devices/batch'",
+        'f"{settings.inventory_service_url}/devices/batch"',
+    ),
+    "f_string_with_nested_quotes": (
+        "f'{settings.cabling_service_url.rstrip(\"/\")}/topologies/{topology_id}'",
+        'f"{settings.cabling_service_url.rstrip("/")}/topologies/{topology_id}"',
+    ),
+    "f_string_double_quoted_with_nested_single_quotes": (
+        "f\"{settings.execution_service_url.rstrip('/')}/execute\"",
+        'f"{settings.execution_service_url.rstrip("/")}/execute"',
+    ),
+    "conversion_and_format_spec": ("f'{a!r}-{b:>4}'", 'f"{a!r}-{b:>4}"'),
+    "arithmetic_and_subscript": ("base + paths[0]", "base + paths[0]"),
+    "other_expression": ("[u for u in urls]", "<ListComp>"),
+}
+
+
+@pytest.mark.parametrize(("expression", "expected"), _RENDERED.values(), ids=_RENDERED.keys())
+def test_render_gives_the_same_text_on_every_python(expression, expected):
+    assert render(ast.parse(expression, mode="eval").body) == expected
+
+
+def test_an_f_string_receiver_key_is_pinned_literally():
+    source = (
+        "async def f(settings):\n"
+        "    url = f\"{settings.execution_service_url.rstrip('/')}/execute\"\n"
+        "    await client.post(url, json=body)\n"
+        "    await call_service(settings.x, 'POST', '/internal/check', json_body=body)\n"
+    )
+    assert body_calls(source) == [
+        ("f", 'post POST f"{settings.execution_service_url.rstrip("/")}/execute"'),
+        ("f", "call_service POST /internal/check"),
+    ]
 
 
 def test_a_repeated_call_gets_an_ordinal():
