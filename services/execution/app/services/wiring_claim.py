@@ -46,7 +46,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import or_, select, update
@@ -150,21 +151,28 @@ async def claimable_row_ids(
 
 
 class WiringRowClaims:
-    """The per-row claims one retry pass took, and the rows it could not claim.
+    """The per-row claims one retry pass took, and the rows it could not claim or write.
 
     One instance is created per retry pass and handed to the shared applies, which
-    call `claim` immediately before each retried row's own driver call. The caller
-    reads `lost` afterwards to report those rows `in_progress` instead of
-    `still_failed`: the row is not a failure, it is somebody else's work in flight.
+    call `claim` immediately before each retried row's own driver call. `held` maps
+    each row this pass claimed to the exact `claimed_until` stamp the claim wrote, so
+    whether the pass STILL holds a row is judged by the database (the row's stamp is
+    still this one), never by in-process belief: a claim that expired and was taken by
+    another pass no longer matches (issue #1479). The caller reads `lost` afterwards to
+    report those rows `in_progress` instead of `still_failed`: the row is not a
+    failure, it is somebody else's work in flight. A row joins `lost` when its claim
+    is lost and when a write this pass attempted on it is refused by
+    `claim_write_clauses` (directly, or through `write_guard`).
 
-    The ordinary consumer path never constructs one of these and never claims: a
-    reconcile drives the intended set, not a loaded FAILED row, and has no second
-    channel to contend with.
+    The ordinary consumer path never constructs one of these and never claims or
+    checks a claim, so a reconcile can still write a row a retry pass holds (its
+    key-based failure write and its stale park clear `claimed_until`); see
+    `claim_write_clauses` for exactly what is and is not covered.
     """
 
     def __init__(self, budget: timedelta | None = None) -> None:
         self.budget = budget if budget is not None else claim_budget()
-        self.held: set[uuid.UUID] = set()
+        self.held: dict[uuid.UUID, datetime] = {}
         self.lost: set[uuid.UUID] = set()
 
     async def claim(self, db: AsyncSession, model, row_id: uuid.UUID | None) -> bool:
@@ -181,6 +189,7 @@ class WiringRowClaims:
         if row_id in self.held:
             return True
         now = datetime.now(timezone.utc)
+        stamp = now + self.budget
         result = await db.execute(
             update(model)
             .where(
@@ -188,7 +197,7 @@ class WiringRowClaims:
                 model.status == "FAILED",
                 unclaimed(model, now),
             )
-            .values(claimed_until=now + self.budget)
+            .values(claimed_until=stamp)
             .execution_options(synchronize_session=False)
         )
         await db.commit()
@@ -201,27 +210,79 @@ class WiringRowClaims:
                 model.__tablename__,
             )
             return False
-        self.held.add(row_id)
+        self.held[row_id] = stamp
         return True
 
 
-def failure_write_claim_clauses(model, row_id: uuid.UUID, claims: WiringRowClaims | None) -> list:
-    """The claim half of a retry pass's row-identity failure write (issue #1479).
+def claim_write_clauses(model, row_id: uuid.UUID, claims: WiringRowClaims | None) -> list:
+    """The claim condition every write a retry pass makes to a wiring row must meet.
 
-    A retry pass may record a failure only on a row it holds itself or on one nobody
-    holds. The pass says which through `claims`: a row in `claims.held` is this pass's
-    own (it won `WiringRowClaims.claim` before its driver call), so no claim clause is
-    added. Any other row, including every row when `claims` is None, gets the
-    `unclaimed` predicate, so a failure a pass recorded before it ever claimed the row
-    (a switch, template, or driver load failure, a failed login, a VLAN define or
-    allocation failure, an L3 gate refusal) cannot overwrite `last_error`, add
-    attempts, or clear `claimed_until` on a row another pass is driving.
+    Issue #1479: a write made by a retry pass (tick or manual) never changes or frees a
+    row another pass holds, judged by the database. The pass hands over its ledger:
 
-    The clauses join the writer's existing `UPDATE ... WHERE id AND status`; this adds
-    no query. A write they refuse matches zero rows, and the writer adds the row to
-    `claims.lost` so the pass reports it `in_progress`, as `claim` does for a lost
-    claim.
+      - a row in `claims.held` is written only while its `claimed_until` still equals
+        the stamp this pass's claim wrote (a claim that expired and was taken over by
+        another pass no longer matches, so the stale holder is refused);
+      - any other row, and every row when `claims` is None, is written only while it
+        is unclaimed (`claimed_until` null or in the past).
+
+    The failure writes by row id (`record_l1_failed`, `record_l2_failed`,
+    `record_route_failed` given `row_id`) add these clauses to their own single
+    `UPDATE`, so the check adds no query. Every other write a retry pass makes on a
+    loaded row (the stale parks, the supersession releases, the nil-allocation and
+    unapplied-pin releases, and the holder's success and release flips) goes through
+    `write_guard`, which locks the row under the same clauses first. A refused write
+    changes nothing and adds the row to `claims.lost`.
+
+    Not covered, by design: the reconcile's writes (`claims` is never passed on that
+    path), and an ACTIVE row (a claim is only ever taken on a FAILED row, and every
+    flip out of FAILED clears it, so no ACTIVE row is held).
     """
-    if claims is not None and row_id in claims.held:
-        return []
+    if claims is not None:
+        stamp = claims.held.get(row_id)
+        if stamp is not None:
+            return [model.claimed_until == stamp]
     return [unclaimed(model, datetime.now(timezone.utc))]
+
+
+@asynccontextmanager
+async def write_guard(
+    db: AsyncSession, model, row_id: uuid.UUID | None, claims: WiringRowClaims | None
+) -> AsyncIterator[bool]:
+    """Lock a row for a retry pass's write, or refuse it; yields True iff it may write.
+
+    With `claims` None (the reconcile) or no row identity this does nothing and yields
+    True, so the reconcile's writes are untouched. Otherwise it runs `SELECT id ... WHERE
+    id AND claim_write_clauses(...) FOR UPDATE` in `db`'s transaction: a match locks the
+    row, so no other pass can claim it between this check and the write the caller
+    makes in the same session; no match adds the row to `claims.lost` and yields False.
+    The transaction is committed on exit (a no-op commit when the writer already
+    committed), which releases the lock; on an exception it is rolled back. The writer
+    called inside must use `db` and must not roll back before it writes. SQLite ignores
+    FOR UPDATE; there the check and the write simply run back to back on one
+    connection.
+    """
+    if claims is None or row_id is None:
+        yield True
+        return
+    found = (
+        await db.execute(
+            select(model.id)
+            .where(model.id == row_id, *claim_write_clauses(model, row_id, claims))
+            .with_for_update()
+        )
+    ).first()
+    if found is None:
+        claims.lost.add(row_id)
+        logger.info(
+            "wiring retry: write to row %s of %s refused: another pass holds its drive "
+            "claim, or the row is gone (issue #1479)",
+            row_id,
+            model.__tablename__,
+        )
+    try:
+        yield found is not None
+    except BaseException:
+        await db.rollback()
+        raise
+    await db.commit()

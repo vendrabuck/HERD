@@ -291,7 +291,7 @@ async def test_claim_stamps_the_budget_and_a_second_claimant_loses(db):
     async with TestSessionLocal() as other:
         assert await second.claim(other, L1ConnectionAssignment, row_id) is False
     assert second.lost == {row_id}
-    assert first.held == {row_id}
+    assert set(first.held) == {row_id}
     # The loser must not move the winner's stamp.
     assert await _claimed_until(L1ConnectionAssignment, row_id) == stamp
 
@@ -310,7 +310,7 @@ async def test_claim_of_none_row_id_is_always_granted(db):
     """The reconcile path has no row identity to claim and is never blocked."""
     claims = WiringRowClaims()
     assert await claims.claim(db, L1ConnectionAssignment, None) is True
-    assert claims.held == set()
+    assert claims.held == {}
 
 
 async def test_a_row_no_longer_failed_cannot_be_claimed(db):

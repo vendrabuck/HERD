@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
 from app.services._uuid_utils import as_uuid as _as_uuid
-from app.services.wiring_claim import WiringRowClaims, failure_write_claim_clauses, unclaimed
+from app.services.wiring_claim import WiringRowClaims, claim_write_clauses, unclaimed
 from app.services.wiring_due import tick_would_drive
 
 logger = logging.getLogger(__name__)
@@ -680,7 +680,7 @@ async def _record_l1_failed_for_row(
 
     See record_l1_failed's docstring for why the retry channels write by row id
     (issue #814). One atomic `UPDATE ... WHERE id AND status`, plus the claim clause
-    of wiring_claim.failure_write_claim_clauses (issue #1479), no insert branch:
+    of wiring_claim.claim_write_clauses (issue #1479), no insert branch:
     rowcount zero means a concurrent writer moved the row or another pass holds its
     drive claim, so this failure is not written and the row joins `claims.lost`.
     """
@@ -697,7 +697,7 @@ async def _record_l1_failed_for_row(
         .where(
             L1ConnectionAssignment.id == row_id,
             L1ConnectionAssignment.status == expected_status,
-            *failure_write_claim_clauses(L1ConnectionAssignment, row_id, claims),
+            *claim_write_clauses(L1ConnectionAssignment, row_id, claims),
         )
         .values(**values)
     )
@@ -784,11 +784,12 @@ async def record_l1_failed(
 
     `claims` (issue #1479) is the calling retry pass's claim ledger, and it only
     matters on the `row_id` path. The compare-and-swap also requires that the row be
-    one this pass holds (in `claims.held`) or one nobody holds
-    (wiring_claim.failure_write_claim_clauses), so a pass that loaded the row before
-    another pass claimed it cannot rewrite the row under that pass's drive. A refused
-    write changes nothing on the row, returns None, and adds the row to `claims.lost`,
-    which the pass reports `in_progress`. The key-based upsert ignores `claims`.
+    one this pass still holds (its `claimed_until` equals the stamp in `claims.held`)
+    or one nobody holds (wiring_claim.claim_write_clauses), so neither a pass that
+    loaded the row before another pass claimed it nor a holder whose claim expired and
+    was taken over can rewrite the row under the current holder's drive. A refused
+    write changes nothing on the row, returns None, and adds the row to `claims.lost`.
+    The key-based upsert ignores `claims`.
     """
     res_uuid = _as_uuid(reservation_id)
     switch_uuid = _as_uuid(switch_device_id)

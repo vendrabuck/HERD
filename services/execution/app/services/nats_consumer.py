@@ -2588,6 +2588,7 @@ async def _apply_one_port_action(
         record_l1_failed,
         release_l1_connection,
     )
+    from app.services.wiring_claim import write_guard
 
     if claims is not None and not await claims.claim(db, L1ConnectionAssignment, retry_row_id):
         return
@@ -2620,10 +2621,15 @@ async def _apply_one_port_action(
             started_at=started,
             completed_at=datetime.now(timezone.utc),
         )
-        if action == "connect_ports":
-            await record_l1_connect(db, res_uuid, switch_uuid, port_a, port_b, phys)
-        else:
-            await release_l1_connection(db, res_uuid, switch_uuid, port_a, port_b)
+        # Issue #1479: a retry holder records its success only while the database
+        # still shows its own claim stamp on the row (write_guard); a holder whose claim
+        # expired and was taken over is refused and the row reads back in_progress. The
+        # reconcile passes no claims, so this is a no-op there.
+        async with write_guard(db, L1ConnectionAssignment, retry_row_id, claims) as writable:
+            if writable and action == "connect_ports":
+                await record_l1_connect(db, res_uuid, switch_uuid, port_a, port_b, phys)
+            elif writable:
+                await release_l1_connection(db, res_uuid, switch_uuid, port_a, port_b)
     else:
         await update_execution_run(
             db,
@@ -3603,6 +3609,7 @@ async def _apply_one_vlan_action(
         record_l2_membership_active,
         release_l2_membership,
     )
+    from app.services.wiring_claim import write_guard
 
     if claims is not None and not await claims.claim(db, L2PortAssignment, retry_row_id):
         return
@@ -3638,10 +3645,14 @@ async def _apply_one_vlan_action(
             started_at=started,
             completed_at=datetime.now(timezone.utc),
         )
-        if action == "add_to_vlan":
-            await record_l2_membership_active(db, res_uuid, vlan_assignment_id, switch_uuid, port)
-        else:
-            await release_l2_membership(db, res_uuid, switch_uuid, port)
+        # Issue #1479: the _apply_one_port_action guard, for a membership.
+        async with write_guard(db, L2PortAssignment, retry_row_id, claims) as writable:
+            if writable and action == "add_to_vlan":
+                await record_l2_membership_active(
+                    db, res_uuid, vlan_assignment_id, switch_uuid, port
+                )
+            elif writable:
+                await release_l2_membership(db, res_uuid, switch_uuid, port)
     else:
         await update_execution_run(
             db,
@@ -4329,6 +4340,7 @@ async def _apply_l3_adjacency(
         routes_not_in,
         union_routes,
     )
+    from app.services.wiring_claim import write_guard
 
     res_uuid = uuid.UUID(reservation_id)
     retry_ids = retry_row_ids or {}
@@ -4629,10 +4641,15 @@ async def _apply_l3_adjacency(
                         ),
                     )
             elif switch_ok:
-                if direction == "provision":
-                    await record_route_active(db, res_uuid, switch_id, routes)
-                else:
-                    await release_route_membership(db, res_uuid, switch_id)
+                # Issue #1479: the _apply_one_port_action guard, for a pin; the reconcile
+                # branch above never reaches it and passes no claims anyway.
+                async with write_guard(
+                    db, RouteAssignment, retry_ids.get(switch_id), claims
+                ) as writable:
+                    if writable and direction == "provision":
+                        await record_route_active(db, res_uuid, switch_id, routes)
+                    elif writable:
+                        await release_route_membership(db, res_uuid, switch_id)
             else:
                 # A failed provision keeps its own routes plus any residue whose removal
                 # did not confirm (issue #1001); a failed deprovision drives no residue,
