@@ -1,16 +1,35 @@
 # Decision: The Wiring Reconcile Respects the Drive Claim, Issue #1481
 
-Status: Proposed 2026-11-20. The owner has decided the shape: option 2 of issue #1481
-(the reconcile takes the #817 drive claim for the rows it writes or drives, and skips a
-row a retry pass holds). Option 1 alone and option 3 are rejected (see Options
-rejected). Decisions D1 to D10 below are this record's recommendations for the parts
-the issue left open; each waits for the owner's read, and Open questions lists what
-could not be settled from the code. Deciders: the owner. No code in this document.
-Context verified by reading the HERD-public tree at `9a231984` on 2026-11-20; symbols
-are the stable reference and line numbers are as of that commit. Nothing here was
-executed: every trace below is a reading of the code, and the test plan names the
-interleavings that have to prove it. This area has been fixed and reverted three times,
-so a trace that is only read is marked as such.
+Status: Proposed 2026-11-20, revision 2 (after an adversarial review of revision 1,
+commit `6a6b912e`). The owner chose option 2 of issue #1481: the reconcile takes a
+drive claim, skips what a retry pass holds instead of waiting, and what it skipped is
+settled later. This revision keeps those three commitments and changes one thing the
+owner has not ruled on: the claim is taken per reservation (a drive lease), not per
+row. Revision 1's row-granular design did not survive review, and Options rejected
+records what it would need to be sound. That change of granularity is open question 1.
+Deciders: the owner. No code in this document. Context verified by reading the
+HERD-public tree at `9a231984` on 2026-11-20; symbols are the stable reference and line
+numbers are as of that commit. Three behaviours of main cited below (R1, R2, R3) were
+reproduced during the review with SQLite tests kept outside the repository. Every other
+trace is a reading of the code, not an execution, and the test plan names what has to
+prove it. This area has now been designed wrong four times, so each trace says which
+kind it is.
+
+## Smallest safe first step
+
+The owner may stop after any phase. Each row says what is closed and what stays as it
+is on main today.
+
+| Stop after | What ships | Closes | Stays open |
+|---|---|---|---|
+| Phase 1 | One predicate on the existing row claim: it also requires the row's `intended` to equal what the pass read. No schema | R1: a retry pass build-drives a row another pass parked | The three effects of #1481; R2; R3; overlapping reconciles across replicas |
+| Phase 2 | The reservation drive lease, the settle mark, and the settle step, used by the reconcile, the teardown, and the settle step only | Two reconciles, or a reconcile and a teardown, driving one reservation at once from two replicas | The three effects of #1481; R2; R3 (retry passes still run outside the lease) |
+| Phase 3, per layer | Retry passes take the lease and plan under it | For that layer: the three effects of #1481, R2, R3. With all three layers, #1481 is closed | The row claim is still present, now redundant; a dead L3 retry holder still blocks retries of its pin for the row budget of PR #1490 |
+| Phase 4 | The row claim is removed | A dead holder frees its reservation within the lease's two minutes, whatever the route count | Only the limits listed under "Where it does not converge" |
+
+Phase 1 was confirmed safe alone by the review. It is worth shipping whatever the owner
+decides about the rest, because R1 is reproduced and the change is one predicate. It
+does not close R3 and is not a substitute for phase 3.
 
 ## Context
 
@@ -21,9 +40,10 @@ A wiring ledger row (`l1_connection_assignments`, `l2_port_assignments`,
 compare-and-swap immediately before the row's own driver call
 (`WiringRowClaims.claim` in `services/execution/app/services/wiring_claim.py`): the
 update matches the row id, status `FAILED`, and a stamp that is null or in the past,
-and writes now plus `claim_budget()` (5 minutes at the defaults). Issue #817 added it so
-the retry tick and the manual retry never drive one row at once. Issue #1479 (PR #1486)
-made every failure write and every settle a retry pass makes respect it
+and writes now plus a budget (5 minutes at the defaults; PR #1490, for issue #1482,
+sizes an L3 pin's budget from its drive sequence). Issue #817 added it so the retry
+tick and the manual retry never drive one row at once. Issue #1479 (PR #1486) made
+every failure write and every settle a retry pass makes respect it
 (`claim_write_clauses`, `write_guard`), judged by the stamp in the database
 (WIRE-CLAIM-8, WIRE-CLAIM-9).
 
@@ -39,15 +59,13 @@ Three kinds of writer still ignore it; WIRE-CLAIM-8 and the docstring of
 ### Terms
 
 - A **pass** is one run of: a `wiring_changed` apply, a terminal teardown, the retry
-  tick, a manual retry, or the settle pass this record adds.
-- A row is **held** at time t when `claimed_until` is later than t. Its **holder** is
-  the pass whose claim wrote that exact stamp (`WiringRowClaims.held`). Only a `FAILED`
-  row can be held: the claim requires `FAILED`, and every flip out of `FAILED` clears
-  the stamp (WIRE-CLAIM-2).
+  tick's work on one reservation, a manual retry, or the settle pass this record adds.
+- The **lease** is one reservation's drive lease (D1). Its **holder** is the pass whose
+  token is on it while it is live.
+- To **defer** is what a consumer pass does when it meets a live lease: it records that
+  a settle is owed and returns without doing its wiring work.
 - A row's **key** is (switch, canonical port pair) for L1, (switch, port) for L2, and
   (switch) for L3, always within one reservation.
-- To **skip** a row is to make no park, no driver call, and no ledger write for its
-  key in this pass.
 
 ### What the reconcile does to a FAILED row today
 
@@ -64,419 +82,415 @@ Three kinds of writer still ignore it; WIRE-CLAIM-8 and the docstring of
 | L3 | provision over a FAILED pin, deprovision, failure writes | `_apply_l3_adjacency` (`:4224`; claim at `:4478`), key branch of `record_route_failed` (`route_service.py:584`, `:680`) | no |
 | Teardown | park of each FAILED intended-`ACTIVE` pin, release of a pin with no routes, deprovision | `_teardown_from_ledgers` (`:5063`; park `:5171`, release `:5175`, apply `:5179`) | no |
 
-Four things in the code differ from the issue's description, and each one changes the
-design:
+### What the code shows that the issue does not
 
 1. The reconcile is not uniformly blind to the claim: `release_unapplied_route_pin`
-   already leaves a held pin alone. That call has no way to say it skipped, so today
-   the skip is silent.
+   already leaves a held pin alone, silently.
 2. The L1 stale park exists only on the full-reconcile path. On the carried-delta path
-   (`fork_version` exactly one above the last applied, with a delta) a released pair
-   whose row is `FAILED` intended `ACTIVE` is not parked at all: `pair_needs_release`
-   answers false for it and `_apply_wiring_pairs` moves on. L2 and L3 always run the
-   full reconcile (WIRE-ORDER-8).
+   a released pair whose row is `FAILED` intended `ACTIVE` is not parked:
+   `pair_needs_release` answers false and `_apply_wiring_pairs` moves on. L2 and L3
+   always run the full reconcile (WIRE-ORDER-8).
 3. The issue says that after #1479 the retry holder no longer undoes the reconcile's
    park. That holds for the holder's failure writes other than the L3 partial failure.
-   Its success flip is unconditional: `record_l1_connect`,
-   `record_l2_membership_active`, and `record_route_active` flip the parked row `ACTIVE`
-   by a compare-and-swap on status alone, or insert a new `ACTIVE` row when the
-   reconcile already released it. The L3 partial-failure write also lands
-   (`holder_or_unclaimed`) and turns the parked pin back to intended `ACTIVE`.
-   `test_wiring_claim.py`
+   Its success flip is unconditional and flips the parked row `ACTIVE`, or inserts a
+   new `ACTIVE` row when the reconcile already released it; the L3 partial-failure
+   write also lands (`holder_or_unclaimed`). `test_wiring_claim.py`
    (`test_after_the_reconcile_clears_the_claim_the_holders_success_is_recorded`,
    `test_after_the_reconcile_clears_the_claim_an_l3_partial_failure_is_recorded`) pins
    both.
-4. The claim does not check direction. A retry pass that loaded a row as a build, and
-   whose row another pass then parked intended `RELEASED`, still wins the claim (the row
-   is `FAILED` and unclaimed) and drives the build it planned. This is reachable today
-   between two retry passes and is not in the issue. It is derived by reading, not
-   reproduced.
+4. **R1, reproduced.** The claim does not check direction. A retry pass that loaded a
+   row as a build, and whose row another pass then parked intended `RELEASED`, wins the
+   claim and connects; the row ends `ACTIVE`.
+5. **R2, reproduced.** A retry pass validates intent, the owner removes the wire, the
+   carried-delta apply passes over the row and stamps the version, the retry pass
+   connects, and the row is `ACTIVE` for a wire nobody intends with nothing left to
+   release it.
+6. **R3, reproduced.** A plan can be stale in content, not only in direction. The tick
+   plans an L3 provision of routes r0; a newer reconcile provisions the same pin with
+   r1 and fails, leaving it `FAILED` intended `ACTIVE` with r1; the tick claims the pin
+   and pins r0 `ACTIVE`. No retry channel reads `ACTIVE` rows. The same class exists
+   for an L2 row planned with a stale `vlan_assignment_id`.
 
-### Facts about the consumer that bound "run again later"
+R2 and R3 show that the defect is wider than "the reconcile ignores the claim": a pass
+acts on a plan that another pass has since made untrue. A claim on the row closes that
+only if the plan is made after the claim.
+
+### Facts about the consumer and the replicas
 
 - One durable pull consumer, `max_deliver` 5, no `backoff` (`start_nats_consumer`,
   `NATS_MAX_DELIVER`). A transient failure is `msg.nak(delay=...)` with the schedule
   `NATS_NAK_BACKOFF_SECONDS`, default `1,5,15,60,120` (`services/execution/app/config.py`,
   `nak_delay` in `services/common/herd_common/jetstream.py`). The fifth failing delivery
-  is dead-lettered and acked (`process_reservation_message`). So a message has at most
-  four redeliveries, spread over 1 + 5 + 15 + 60 = 81 seconds; the fifth entry is never
-  reached. A claim lasts 300 seconds.
-- A dead-lettered `wiring_changed` is not staged again. Reservations' sweep heals only
+  is dead-lettered and acked (`process_reservation_message`): at most four redeliveries
+  over 1 + 5 + 15 + 60 = 81 seconds.
+- A dead-lettered `wiring_changed` is not staged again: reservations' sweep heals only
   when cabling's fork version is above its own `fork_wiring_ledger`
-  (`_heal_wiring_staging` in `services/reservations/app/tasks/expiration.py`,
-  RES-FORK-13), and that ledger advanced when the event was staged.
-- The loop fetches one message per pull and handles it to completion
-  (`_consumer_loop`, WIRE-CONSUME-2). A handler that waits blocks every reservation's
-  events on that replica, terminal events included.
-- A redelivered event whose version was stamped is a no-op
-  (`handle_wiring_changed`, WIRE-ORDER-3), so a redelivery only helps if the version is
-  left unstamped. Later messages of the same reservation are not held back behind a
-  nacked one (JetStream's behaviour for a consumer config that sets no
-  `max_ack_pending`; stated from the config, not exercised here); the version check and
-  the gap rule (WIRE-ORDER-4) are what keep that safe.
-- Execution has a transactional outbox (`services/execution/app/models/outbox.py`), used
-  for `herd.health.status_changed`. `OutboxMixin` has no not-before column, and
-  execution consumes only `herd.reservations.*`, a subject reservations owns
-  (RES-EVENT-2: the event exists if and only if reservations' ledger advanced).
-- The retry loop (`run_wiring_retry_loop` in
-  `services/execution/app/services/wiring_retry_service.py`) already runs every
-  `WIRING_RETRY_INTERVAL_SECONDS` (60) in every replica that enables it, off the
-  consumer, on durable rows, with no delivery count.
+  (`_heal_wiring_staging` in `services/reservations/app/tasks/expiration.py`).
+- The loop fetches one message per pull and handles it to completion (`_consumer_loop`,
+  WIRE-CONSUME-2). A handler that waits stalls every reservation's events on that
+  replica, terminal events included.
+- Every replica starts the consumer (`lifespan` in `services/execution/app/main.py`);
+  the retry tick starts wherever `WIRING_RETRY_ENABLED` is true. `docs/ENV_VARS.md`
+  documents a poller fleet (`EXECUTION_POLLER_ONLY`). So two reconciles of one
+  reservation, a reconcile and a teardown, or two ticks can run at once in different
+  processes today, and anything exclusive has to live in the database.
+- Every wiring driver call goes through `_run_driver_with_retry`, and the ledger writers
+  are reached only from four entry points: `handle_wiring_changed`,
+  `_teardown_from_ledgers`, `run_wiring_retry_tick`, and `reattempt_reservation` (a grep
+  for the writers finds callers only in `nats_consumer.py` and
+  `wiring_retry_service.py`).
+- `reservation_wiring_state` may have no row for a reservation (`get_wiring_state`
+  returns None; `stamp_last_applied` and `freeze_reservation_wiring` insert it).
+- A redelivered event whose version was stamped is a no-op (WIRE-ORDER-3). An event at
+  exactly one above the last applied version with a delta is applied as that delta, not
+  as a full reconcile (WIRE-ORDER-4).
 
-### Three attempts that failed
+### Four attempts that failed
 
 | Attempt | What it did | What broke |
 |---|---|---|
-| #1479 round 1 | Added the claim condition to the retry failure writes by row id only | The guarantee was narrower than stated: a retry pass's settles on rows it never claimed, and a holder whose claim had expired and been retaken, still wrote (commit `f5a98551` records the finding) |
-| #1479 round 2 | Put the holder's success and release flips behind the stamp too | A writer that never claims (the teardown park) cleared the stamp during a held L3 provision; the holder's success was refused and the configured routes stayed on the switch with no ledger row (commit `fd9ccbf2` records it) |
-| #1479 round 3, `holder_record` (as of commit `a8b14242`) | The holder decided from the row as it found it: PARK an addition that landed on a row settled toward release, REOPEN a removal that landed on a row rebuilt `ACTIVE` | PARK wrote by key. When held row X had been released during the drive and the key rebuilt as a new row Y, PARK flipped Y to `FAILED` intended `RELEASED`, and the release channel would tear down a wire the fork intends (commit `b8e728b2` records it) |
+| #1479 round 1 | Added the claim condition to the retry failure writes by row id only | The guarantee was narrower than stated: a retry pass's settles on rows it never claimed, and a holder whose claim had expired and been retaken, still wrote (commit `f5a98551`) |
+| #1479 round 2 | Put the holder's success and release flips behind the stamp too | A writer that never claims (the teardown park) cleared the stamp during a held L3 provision; the holder's success was refused and the configured routes stayed on the switch with no ledger row (commit `fd9ccbf2`) |
+| #1479 round 3, `holder_record` (as of commit `a8b14242`) | The holder decided from the row as it found it: PARK an addition that landed on a row settled toward release, REOPEN a removal that landed on a row rebuilt `ACTIVE` | PARK wrote by key. When held row X had been released during the drive and the key rebuilt as a new row Y, PARK flipped Y to `FAILED` intended `RELEASED`, and the release channel would tear down a wire the fork intends (commit `b8e728b2`) |
+| This record, revision 1 (commit `6a6b912e`) | The reconcile took the row claim, skipped held rows inside its pass, and owed a settle paid by a step in the retry tick | A row that is `ACTIVE`, or a key with no row, cannot be claimed, so two settle passes on two replicas both drove it; a pass that skips part of a reservation leaked a VLAN allocation, could loop, and requested its settle too late; the claim compared direction but not content (R3); an in-process lock stalled the consumer |
 
 `a8b14242` is in main's history: the #1486 branch was merged by a merge commit, and
-`b8e728b2` removed `holder_record` later on the same branch. The design is read with
-`git show a8b14242:<path>`, or as the reverse of `git show b8e728b2`.
+`b8e728b2` removed `holder_record` later on the same branch.
 
-Rounds 2 and 3 share one cause: each tried to make the holder cope with a row that
-another writer had changed under it. This record removes the other writer instead.
-Round 1's lesson is separate: a guarantee built writer by writer misses writers.
+Rounds 2 and 3 tried to make the holder cope with a row another writer had changed
+under it. Revision 1 removed that writer for one row at a time, and every defect the
+review found came from the same place: a pass that does part of a reservation's work
+while another pass does another part. This revision makes a pass all or nothing for
+its reservation.
 
 ### The two invariants
 
-Let live(X, t) mean row X's `claimed_until` is later than t, and holds(P, X, t) mean
-live(X, t) and the stamp equals the one pass P's claim wrote.
-
-- **EXCLUSION.** For every row X and time t: (E1) at most one pass has a driver call
-  in flight for X; (E2) while live(X, t), a write to X is made only by the P with
-  holds(P, X, t). One exception to E2 is kept from main on purpose: a pass that changed
-  the device always records it (the unconditional success and release flips, and the L3
-  partial-failure write). E1 makes that exception unreachable while each drive ends
-  inside its claim.
-- **CONSERVATION.** No row is left in a state no pass will ever settle. Call a row
-  owed when its status and direction disagree with what its reservation's current
-  intent and freeze require. Every owed row is covered by at least one of: (a) the
-  tick's selects return it (WIRE-RETRY-13, WIRE-RETRY-14); (b) a wiring or terminal
-  event for the reservation is unconsumed; (c) the reservation's settle mark (D5) is
-  unpaid; (d) the row is held, so its holder will write it; or the row is terminal by an
-  existing decision (a pinned reason, a row at the attempts cap, a failed L1 or L2 build
-  on a frozen reservation). Every intended change is eventually applied or recorded
-  `FAILED`.
-
-On main, effects 1 to 3 of the issue break E1 and E2. The harder half is CONSERVATION:
-once the reconcile skips, something must be owed (c), because a holder that succeeds
-leaves an `ACTIVE` row, and no retry channel reads `ACTIVE` rows.
+- **EXCLUSION.** (E1) At most one pass has a wiring driver call in flight for one
+  reservation. (E2) A ledger write for a reservation's rows is made only by the pass
+  that holds its lease. Two exceptions to E2 are kept from main on purpose: a pass
+  always records an action it made that changed the device (the unconditional success
+  and release flips, and the L3 partial-failure write), and the two cross-reservation
+  writers still flip another reservation's `ACTIVE` row (WIRE-LEDGER-11,
+  WIRE-LEDGER-12).
+- **CONSERVATION.** No intended change is dropped. Every `wiring_changed` and terminal
+  event that reaches its handler is either applied by the pass that received it or
+  leaves an owed settle in the database before the message is acked. An owed settle is
+  paid only by a full pass that held the lease and completed. After such a pass every
+  row is `ACTIVE` and intended, `RELEASED`, `FAILED` in the retry channels' hands, or
+  terminal by an existing decision (a pinned reason, a row at the attempts cap, a
+  failed L1 or L2 build on a frozen reservation).
 
 ## Decision
 
-### D1. Every pass that writes or drives wiring owns a claim ledger
+### D1. One drive lease per reservation, and every pass holds it
 
-The reconcile and the terminal teardown each construct one `WiringRowClaims` per pass
-and hand it, with a map from key to the id of this reservation's `FAILED` row for that
-key, to `_apply_wiring_pairs`, `_apply_l2_memberships`, and `_apply_l3_adjacency`. The
-map is built from the per-reservation FAILED reads the reconcile already makes
-(`failed_assignments_for_reservation`, `failed_memberships_for_reservation`,
-`failed_route_assignments_for_reservation`); the carried-delta path gains the L1 read.
+`reservation_wiring_state` gains a lease: a token and an expiry. A pass takes the
+reservation's lease before it reads anything it plans from, holds it until its last
+write, and releases it. Every kind of pass takes it: the `wiring_changed` apply, the
+terminal teardown, the settle pass, the retry tick for each reservation it works on,
+and the manual retry.
 
-This reuses what #817 and #1479 built for the retry channels, unchanged: the applies
-claim a mapped row immediately before its own driver call (an L3 pin once, before its
-switch's login) and drop a row whose claim is lost with no run, no call, and no write
-(WIRE-CLAIM-4, WIRE-CLAIM-5); a failure write for a mapped key goes by row id under
-`claim_write_clauses`, so a load or login failure recorded before any claim is refused
-on a row another pass holds. A key with no `FAILED` row (a fresh build, or the release
-of an `ACTIVE` row) has nothing to claim and keeps today's path.
+The reservation is the smallest unit that can be claimed for everything a pass does.
+A row claim cannot cover a release of an `ACTIVE` row or a build of a key that has no
+row yet, and those are exactly the drives two reconciles collide on.
 
-After the last phase no caller passes `claims=None`, and the branches that exist only
-for it (`write_guard`'s early yield, the retry-only wording) are deleted. A guard test
-pins that every call of a ledger writer and of the three applies passes a ledger.
+The reconcile path stays as it is on main inside the lease: no row claim, no key-to-row
+map, no guard on its parks or its key-based failure writes. The lease is what makes
+those safe. The retry channels keep their row claims untouched until phase 4; under the
+lease they are redundant, not wrong.
 
-### D2. Reads stay unfiltered; the gate is at the write and at the drive
+The keyed writers assume one non-`RELEASED` row per key, and no index enforces that for
+`FAILED` rows. Under the lease two passes cannot insert a row for one key of one
+reservation at once: from phase 2 for the key branch of the failure writers, which only
+the consumer's passes use (a retry failure write goes by row id and has no insert
+branch), and from phase 3 for every insert. So the assumption becomes a consequence,
+with no schema change.
 
-The three per-reservation FAILED reads keep returning every FAILED row, held or not.
-Two reasons, the second new:
+### D2. The lease: taking, renewing, losing
 
-- the reason `wiring_claim.py` records: the stale-build widening must see every FAILED
-  row, or a row it is responsible for drops out of the release side silently;
-- a held row hidden from the read would make its key look like a key with no row, and
-  the reconcile would start a fresh build by key next to the holder's drive. Under D1
-  the read is what maps the key to the row that must be claimed, so filtering it would
-  break E1.
+- **Take.** One upsert on `reservation_wiring_state` (the row may not exist) that
+  writes the pass's fresh token and an expiry one lease term ahead, and matches only
+  when the row is absent or its expiry is null or not in the future. One row written
+  means taken.
+- **Renew.** One update that moves the expiry one term ahead where the token is still
+  the pass's own. No row written means the lease was lost.
+- **Release.** One update that clears the expiry where the token is the pass's own, in
+  a `finally`.
+- **No in-process belief.** A lease object is made per pass per reservation with a
+  fresh token. Taken, renewed, and lost are each decided by a statement's row count;
+  nothing is answered from memory, unlike `WiringRowClaims.claim`, which answers True
+  for a row already in its `held` map. The settle step builds no `WiringRowClaims`.
+- **Where a pass renews.** Before every driver attempt and before every upstream read,
+  inside the two functions every such step already goes through:
+  `_run_driver_with_retry` and `_get_internal` (and the fabric lookup in
+  `vlan_service.py`). The lease travels in a context variable, so no apply signature
+  changes; the consumer's task, the tick's task, and a request's task each have their
+  own context. `_run_driver_with_retry` refuses a wiring driver call with no lease in
+  context, which makes "no wiring driver call outside a lease" one check at one choke
+  point instead of a rule about many writers. A driver attempt starts only when a
+  renewal committed within a short gap, measured on the holder's monotonic clock. A
+  ledger write that records no device change (a failure write, a park, a release with
+  no driver call) renews first and is not made when the renewal fails.
+- **The term.** Sized for one step, not for a pass: the longest of one driver attempt
+  (`EXECUTION_TIMEOUT_SECONDS`, plus the 60 second `pip install` when
+  `ALLOW_DRIVER_PIP_INSTALL` is on) and one upstream read (10 seconds), plus the gap
+  and an allowance for the kill and reap, rounded up to whole minutes: 2 minutes at the
+  defaults. It is an allowance, not a measured bound, the same honesty PR #1490 uses. A
+  pass of any length keeps the lease by renewing; a holder that dies frees its
+  reservation within one term, whatever the reservation's size.
+- **Losing it.** A renewal that writes no row raises out of the pass. The pass makes no
+  further driver call, failure write, or park. A success or release flip for an action
+  already made is written before the next renewal point, as the code orders it today.
+  L3 needs one addition, because it records a switch only after its whole route
+  sequence: a lost lease stops the sequence, and the pass writes what it may have
+  installed (the partial-failure write) before it leaves. A consumer pass that loses
+  the lease defers (D4); a retry pass stops and its rows read back by status.
+- **The clock.** The expiry is written and compared by the database, in the statement,
+  with `clock_timestamp()` and not `now()` (which is the transaction's start and can be
+  stale in a session that has already read). No process compares a stamp with its own
+  wall clock, so the design tolerates any wall-clock offset between replicas. It does
+  not tolerate one step outlasting the term (a stall between a renewal and the end of
+  the attempt it covers), or the database clock jumping forward by more than the term's
+  slack; either lets a second pass in for the length of one driver attempt.
 
-A predicate on a read is also a check-then-act race; a compare-and-swap at the write
-and at the drive is the only point where held or not held is decided atomically.
+### D3. A pass plans under the lease
 
-### D3. What a pass does at each site, and what skip means
+Every read a pass plans from is made after it took the lease: the wiring state row
+(frozen, last applied version), the fork's intended set, and the ledger rows. A retry
+pass re-reads the rows it selected, by id, after it takes their reservation's lease; a
+row that is no longer `FAILED` is dropped, and the pass uses the `intended`, `routes`,
+and `vlan_assignment_id` it re-read, then validates build intent against the fork as it
+does today.
 
-| Site | Rule | If the row is held by another pass |
-|---|---|---|
-| Stale-build park (`park_stale_l1_build`, `park_stale_l2_build`, `park_stale_route_build`), reconcile and teardown | Runs inside `write_guard` with the pass's ledger, as a retry pass's park already does (`_reattempt_rows`) | Refused: the row is not added to the release side, and it joins `claims.lost` |
-| Release with no driver call (the L2 nil or unknown allocation release, `release_unapplied_route_pin`, teardown's pin with no routes) | Inside `write_guard` by row id | Refused; joins `lost`. `release_unapplied_route_pin` keeps its own check and gains the report |
-| Drive over a FAILED row (a build over a failed row of either direction, the release of a parked row, an L3 provision over a failed pin) | Claim by row id immediately before the driver call | No run, no driver call, no write; joins `lost` |
-| Failure write for a key that maps to a FAILED row (load, login, op, gate refusal, `create_vlan` failure) | By row id under `claim_write_clauses` | Refused; joins `lost` |
-| Failure write for a key with no mapped row | Key branch, as today | See the backstop below |
+This is what closes R1 and R3, and it is why a claim that only compares direction is
+not enough: nothing a pass decided before the lease is used after it.
 
-The backstop answers how a writer that has no row id finds and respects a held row. The
-key branches of `record_l1_failed`, `record_l2_failed`, and `record_route_failed` already
-select this reservation's non-`RELEASED` row for the key. They gain one test on the row
-they found: when it is `FAILED` and carries a live stamp that is not the calling pass's
-own, they write nothing, add its id to `claims.lost`, and return None. The select takes
-`FOR UPDATE`, so the test and the write are one critical section. The map of D1 is what
-lets a pass claim before it drives; the backstop is what makes E2 true at the write site
-whatever the caller knew, including a row that appeared after the pass's read.
+### D4. A pass that meets the lease never waits
 
-The backstop is on failure writes and settles only. It is never put on a success or
-release flip (see D6): a refused failure write loses an attempt count and an error
-text, while a refused success loses the record of a device change, which is round 2's
-defect.
+| Pass | When another pass holds the lease |
+|---|---|
+| `wiring_changed` apply | After the frozen check and the stale-version check (both read values that only move one way, so they are safe to read without the lease): requests a settle carrying its fork version (D5), does not stamp, returns. The message is acked |
+| Terminal teardown | Freezes first, as today (WIRE-TEARDOWN-1), then requests a settle and skips the ledger teardown. Dynamic-instance teardown runs as today. The message is acked |
+| Settle pass | Passes over the reservation. Requests nothing, writes nothing |
+| Retry tick | Passes over the reservation's rows: they stay `FAILED`, no attempt is counted, and they count `in_progress`. Its three selects leave out rows of a reservation whose lease is live, so such rows do not fill a batch (the #1190 lesson) |
+| Manual retry | After the `not_retryable` and `frozen` classification (WIRE-RETRY-11), reports the reservation's other rows `in_progress` |
 
-A park never ends in a drive by a pass that does not hold the row: the parking pass
-claims the parked row before it drives the removal, like any other release-direction
-row.
+Only the first two request a settle, and each does it once, before any wiring work
+(the teardown after its freeze). So a request exists for a deferred event and for
+nothing else: a settle pass that meets a lease cannot request another, which is what
+makes the loop the review found in revision 1 impossible.
 
-### D4. A claim is a compare-and-swap on what the pass read
+The retry channels also pass over a reservation that owes a settle whose attempts have
+not failed (D6), for at most the overdue threshold of D8. The settle pass does a full
+reconcile, which rebuilds and releases everything a retry would; letting retries take
+the lease first would only delay it.
 
-`WiringRowClaims.claim` gains one predicate: the row's `intended` still equals the value
-the pass read when it planned the drive. A pass whose row another pass parked in the
-meantime loses the claim and drives nothing.
+### D5. The settle mark
 
-This is what makes a successful park final against every stale build plan. A park
-(under `write_guard`) and a claim are both conditional writes on one row, so Postgres
-orders them:
+`reservation_wiring_state` gains a request counter, a paid counter, the largest fork
+version among deferred events, a failure count, and the time of the last attempt
+(recommended names: `settle_requested_seq`, `settle_paid_seq`, `settle_fork_version`,
+`settle_failures`, `settle_attempted_at`). A settle is owed while requested is above
+paid. A partial index on that predicate keeps the settle step's select to the owed
+rows.
 
-- the claim commits first: the guard's select does not match and the park is refused
-  (the row is held), so the parking pass skips and owes a settle (D5);
-- the park commits first: the row is intended `RELEASED`, and a pass that read it as a
-  build can no longer claim it. Only a pass that read the parked state (the parking pass
-  itself, or a release-direction retry) can claim it, and that pass drives the removal.
+A request is one upsert (the state row may not exist) that raises the request counter
+and the deferred version, committed before the handler returns. A deferred pass does
+no wiring work before it, so there is no moment at which a pass has skipped work and
+could still raise without having recorded it.
 
-There is no third order. Without D4 the second case leaves a hole: the parking pass's
-removal fails, the row sits `FAILED` intended `RELEASED` and unclaimed, a stale retry
-pass claims it and connects, and the row goes `ACTIVE` for a wire nobody intends with
-nothing owed.
+### D6. The settle step
 
-A claim lost this way is not another pass's work in flight. The pass's read-back reports
-such a row by its status and claim: still `FAILED` and not held reads `still_failed`,
-not `in_progress`.
+**Where it runs.** In the consumer's own loop (`_consumer_loop`), after each fetch
+whatever its outcome: at most one settle pass between fetches. Three consequences:
 
-### D5. Who settles a skipped row: a durable settle mark, paid by a settle pass
+- the consumer never waits for a settle pass, because it is the one running it, between
+  messages, on its own task; there is no second task and no in-process lock;
+- a settle step runs in every process that can make a request, since only consumer
+  passes request; it does not depend on `WIRING_RETRY_ENABLED`;
+- when idle it runs within `NATS_FETCH_TIMEOUT_SECONDS` (5 seconds) of the request.
 
-The reconcile does not wait and does not ask for a redelivery. It finishes everything
-else, records that it owes a settle, stamps the version, and acks.
+**What it does.** It selects one reservation that owes a settle, is not parked, and
+whose spacing has elapsed, least recently attempted first, with `FOR UPDATE SKIP
+LOCKED`; then takes the lease (a held lease: pass over). Under the lease it reads the
+request counter as s, the deferred version as m, and the freeze, then:
 
-**The mark.** `reservation_wiring_state` gains a monotonic request counter and a paid
-counter (recommended: `settle_requested_seq`, `settle_paid_seq`, plus
-`settle_requested_at` and `settle_attempted_at` for ordering and age). A settle is owed
-while requested is above paid. A pass requests one by incrementing the request counter
-in one committed update, before it stamps the version and before the message is acked.
-A crash between the skip and the request leaves the message unacked and the version
-unstamped, so the redelivery repeats the pass.
+1. frozen: runs `_teardown_from_ledgers` (idempotent, WIRE-TEARDOWN-5);
+2. not frozen: runs the full three-layer reconcile from cabling's current intended set,
+   the body of `handle_wiring_changed`'s full-reconcile branch with the L2 and L3
+   passes, factored into one function both callers use.
 
-A reconcile, a teardown, or a settle pass requests one when (a retry pass never does:
-a row it lost is another pass's work, and the tick selects it again):
+**Paying.** When the pass completes it stamps the last applied version (below), sets
+paid to s by an update that only raises it, and clears the failure count. A request
+made during the pass is above s and stays owed. An event-driven full reconcile or
+teardown that completes under the lease pays the same way, with the s it read under the
+lease. A carried-delta apply pays nothing.
 
-- its ledger's `lost` is not empty at the end of the pass (any refused park, release,
-  claim, or failure write; this also covers a row that left `FAILED` under the pass's
-  stale copy); or
-- it is an L1 carried-delta apply and a released pair has a `FAILED` intended-`ACTIVE`
-  row (D9).
+**The version.** A deferred event is not stamped, so a later event above it is not
+contiguous and takes the full-reconcile path (WIRE-ORDER-4). When a full pass
+completes it stamps the largest version it can prove it applied, through
+`stamp_last_applied`, which never lowers: m (and its own version, for an event),
+because the fork was read after every deferred event up to m was staged. A nacked
+event at or below m then arrives stale and is a no-op (WIRE-ORDER-3).
 
-**The settle pass.** A fourth step of `run_wiring_retry_tick`, after the three layer
-retries, isolated the way each layer is (WIRE-RETRY-15). It selects up to
-`WIRING_RETRY_BATCH_SIZE` reservations that owe a settle, least recently attempted
-first, and for each:
+That is the real mechanism, and it has one remaining gap, which is main's today and not
+new: a full reconcile reads the fork as it is now, which can be above the version it
+stamps. An event between the stamp and the fork's version then arrives contiguous and
+its carried delta is applied over newer state; if a later version removed a wire that
+delta built, the wire is rebuilt until the later event lands. A gap or heal reconcile
+on main has the same exposure. Stamping the fork's own version would close it for all
+three; open question 3.
 
-1. reads the request counter as s and stamps the attempt time;
-2. if the reservation's wiring is frozen, runs `_teardown_from_ledgers` again (it is
-   idempotent, WIRE-TEARDOWN-5); otherwise asks reservations for the status, exactly as
-   the corroboration gate does for a `wiring_changed` (WIRE-GATE-1), and on `ACTIVE`
-   runs the full three-layer reconcile from cabling's current intended set. Any other
-   answer, or no answer, leaves the mark for the next tick (fail closed);
-3. if the pass raised nothing and its own `lost` is empty, sets paid to s by a
-   compare-and-swap that only raises it. A request made after step 1 is above s and
-   stays owed. A settle pass that skips requests again like any pass.
+**When the pass raises.** The failure count goes up, the lease is released, and the
+mark stays owed. Attempts are spaced, doubling from `WIRING_RETRY_INTERVAL_SECONDS` to
+the retry loop's cap. After `NATS_MAX_DELIVER` (5) consecutive failures the settle of
+a reservation that is not frozen is parked: no automatic attempt, one ERROR line with
+the fixed action `wiring_settle_parked`, the retry channels resume, and any later full
+pass under the lease (the next save, or the teardown once the reservation ends) pays
+it. This is the dead-letter analogue, reached only by a
+pass that keeps failing, never by waiting. Without it a reconcile that fails on one
+switch's inventory read would re-drive another switch's failing rows on every attempt,
+with no attempts cap. A frozen reservation's settle is never parked: a teardown drives
+only `ACTIVE` rows, and each failure turns its row `FAILED` for the capped retry
+channel, so repeating it cannot loop on a row.
 
-The full reconcile is the body of `handle_wiring_changed`'s full-reconcile branch plus
-the L2 and L3 passes, factored into one function both callers use. The settle pass does
-not stamp a fork version: it applies the fork's current intent, which is what a heal
-does, and the ordering stream stays the events'. An event that arrives later for a
-version the settle pass already applied is absorbed by the existing gates
-(`is_pair_active`, `pair_needs_release`, and the L2 and L3 full diffs). An event-driven
-full reconcile or teardown that skips nothing may pay the mark the same way.
+### D7. The holder's writes do not change, and the row claim stays for now
 
-No new setting: the settle pass runs wherever `WIRING_RETRY_ENABLED` runs the tick. A
-deployment that disables the tick on every replica gets no settle pass, the same
-condition under which FAILED rows are left to manual retry today.
+A holder's success and release flips stay unconditional, exactly as on main. No other
+pass changes a reservation's rows during the hold, so the holder finds each row as it
+left it. `holder_record` is not revived in any form, and no write moves a row out of
+`ACTIVE` toward a rebuild.
 
-**Attack: can it loop forever?** The mark is re-requested only by a skip, never by a
-failure. A settle pass that drives and fails records `FAILED` rows and pays the mark;
-those rows are the tick's (capped by `WIRING_RETRY_MAX_ATTEMPTS`). A skip needs a live
-claim, or a row that moved since the pass's read, which the next pass reads fresh. So an
-endless run of settle passes needs an endless run of claims on that reservation's rows.
+`WiringRowClaims`, `claim_write_clauses`, `write_guard`, `holder_or_unclaimed`, and the
+L3 budget of PR #1490 are not touched before phase 4. PR #1490 fixes a defect on main
+and merges on its own; this record neither needs it nor conflicts with it. Revision 1
+moved the L3 residue read behind the row claim, while PR #1490 sizes that claim's stamp
+from the sequence built before it; that collision is gone, because the residue read
+stays where PR #1490 has it, no lease stamp is sized from a drive sequence, and from
+phase 3 no other pass can change the pin between the read and the row claim.
 
-**Attack: can it starve?** Let B be the claim budget and I the tick interval. One skip
-is settled within B + I plus the pass's own duration, provided nobody claims the row
-again. Each further claim adds at most B + I. The tick claims one row at most
-`WIRING_RETRY_MAX_ATTEMPTS` times (10): a claim is followed by a drive, and a failed
-drive adds at least one attempt (`_run_driver_with_retry` uses all three attempts before
-it reports failure; an L3 switch records `switch_attempts or 1`). At the defaults that
-is at most 10 x (300 + 60) seconds, one hour, for a row every automatic retry of which
-collides with a settle pass; in a single replica the settle pass runs after the tick's
-own drives have ended, so the tick's own claims have normally been cleared when it
-looks. Two cases are not bounded by the system: manual retries (each press holds a row
-for at most B), and a holder that dies mid-drive (its claim expires after B with no
-attempt counted). After #1482 the L3 budget grows with the pin: (R + 2) driver actions
-of 90.6 seconds worst case each for R route operations, rounded up to minutes, 19
-minutes for R = 10. B in the bounds above is then the largest budget in play.
+### D8. Bounds and alarms
 
-**Observability.** The tick line gains `settle_owed`, `settle_run`, `settle_paid`, and
-the oldest owed age. A mark older than twice the largest budget plus two intervals logs
-one WARNING with the fixed action `wiring_settle_overdue`. It is an alarm, not a stop:
-giving up would break CONSERVATION.
+- **A dead holder** frees the reservation within one lease term: 2 minutes at the
+  defaults, independent of how many rows or routes it was driving. Until phase 4 a dead
+  L3 retry holder also leaves its pin's row claim standing for the row budget, which
+  blocks retries of that pin (not the reconcile, not the settle pass): 19 minutes for
+  10 route operations at the defaults, and unbounded in the route count until issue
+  #1493's limit.
+- **A live holder** holds the lease for its whole pass. That has no constant bound: a
+  pass is one login, one logout, and one action per row or route for each switch, each
+  action at most 90.6 seconds at the defaults. One L3 pin of 10 route operations is at
+  most about 18 minutes; with #1493's proposed limit of 1,000 routes, about 25 hours.
+- **A deferred event** is applied by the first full pass that takes the lease after
+  the holder ends. While the settle is owed and its attempts have not failed, the retry
+  channels pass over the reservation. An event that takes the lease first is either a
+  full reconcile, which pays the mark, or one carried delta, which leaves it owed; each
+  is one event, so neither can starve the settle step. The delay is the holder's
+  remaining pass (or one lease term if it died), plus one iteration of some replica's
+  consumer loop (5 seconds when idle, or the message it is handling). There is no
+  smaller true bound, and the bound is per reservation, which is the unit a settle
+  pays.
+- **No loop.** A settle is requested only by a deferred event or teardown, and a settle
+  pass never requests, so the settle passes that complete are at most the deferred
+  events. A pass that fails is tried again at most five times on a reservation that is
+  not frozen, and without limit on a frozen one, where no row is driven twice (D6).
+- **Alarms.** The retry tick, which runs on a different loop from the settle step,
+  reports `settle_owed`, `settle_parked`, and the oldest owed age in its tick line, and
+  logs one WARNING with the fixed action `wiring_settle_overdue` for a mark that has
+  been owed for more than ten minutes while its reservation's lease is free: owed, and
+  nobody is working on it. Age alone is not the test, because a long L3 drive
+  legitimately holds a lease for longer. A lease renewed by one token for more than
+  thirty minutes logs `wiring_lease_long_held` once, at INFO.
 
-Least-recently-attempted order is the #1190 lesson applied here: a batch of reservations
-that keep skipping must not hide a newer one.
+## Traces
 
-### D6. The holder's writes do not change
+All read from the functions named, not executed, unless marked reproduced.
 
-A retry holder's success and release flips stay unconditional, exactly as on main, and
-so do the reconcile's now that it is a holder. This is the answer to the first question
-of the issue's design comment: no new rule for the holder, because under D1 to D4 no
-other pass changes a held row, so the holder finds the row as it left it. `holder_record`
-is not revived in any form, and no write moves a row out of `ACTIVE` toward a rebuild.
+### The owner removes the intent while a retry pass is driving
 
-`holder_or_unclaimed` (the L3 partial-failure write that also lands on a row whose claim
-is null or past) stays until #1482 lands. Its stated reason, a claim cleared by a writer
-that never claims, disappears with this record; what remains is an expired claim.
-
-### D7. A pass that skipped an L2 membership releases no allocation
-
-`_apply_l2_memberships` ends with `_release_orphaned_allocations` over the allocations
-its removes touched. On main the reconcile drives every intended join itself, earlier
-in the same apply, so a join that succeeds is `ACTIVE` before the orphan check. With a
-skipped join that is no longer true: the pass could remove the last `ACTIVE` membership
-and release the allocation while the holder is still joining a port to it, which is the
-state issue #1413 already describes (an `ACTIVE` membership on a `RELEASED` allocation,
-the VLAN undefined, the number free for another reservation).
-
-So a pass whose ledger lost any L2 row of the reservation releases no allocation of that
-reservation in that pass. The settle pass's L2 reconcile then runs the orphan check over
-every `ACTIVE` allocation of the reservation, not only the ones its own removes touched;
-the release is already a compare-and-swap on "no `ACTIVE` membership references it"
-(WIRE-VLAN-4), so the wider check is safe. The skipped row's own allocation id is not a
-reliable key for a narrower rule: a FAILED build row may carry a nil or stale allocation
-until its retry re-resolves it (WIRE-RETRY-8).
-
-### D8. L3: skip is per pin, teardown respects the claim, and #1482 comes first
-
-An L3 row is one reservation's pin on one switch, and one claim covers the switch's
-whole route session. So skip is all or nothing per (reservation, switch): no login, no
-route call, no write. If more than one non-`RELEASED` row of the reservation exists for
-the switch, the switch is skipped when any of them is held. Another reservation's pin on
-the same switch is a different row and is not affected; L3 pins never displace each
-other (WIRE-LEDGER-16). On L1 and L2 skip is per row: the pass still logs in and drives
-the switch's other rows.
-
-The teardown follows D1 and D3. Its park of a `FAILED` intended-`ACTIVE` pin
-(`TEARDOWN_PENDING_REMOVAL`) runs under the guard. A held pin is skipped and the
-teardown requests a settle; because the wiring is frozen by then (WIRE-TEARDOWN-1), the
-settle pass re-runs the teardown, which is why D5 step 2 has a frozen branch: a
-`wiring_changed` is a no-op on a frozen reservation and could never pay that mark.
-
-Before the L3 phase ships, the L3 claim must cover its drive (issue #1482; its option
-1 is assumed here, and its option 2 would serve as well). E1 holds only while a drive
-ends inside its claim; an L3 pin with two or more route operations can outlive today's
-budget, and a pass that respects the claim would then park or provision under a holder
-that is still driving.
-
-The residue read (`possibly_installed_routes`) moves after the claim, so a provision
-never plans from routes another holder was still changing.
-
-### D9. The L1 carried-delta path flags; it does not park
-
-On the carried-delta path a released pair with a `FAILED` intended-`ACTIVE` row is left
-as it is today, and the pass requests a settle. The settle pass's full reconcile then
-judges the row against the fork's whole intended set and parks it under the guard. The
-delta path gains no park site and no extra disconnect; the cost is one full reconcile,
-within one interval, for a save that removes a wire whose build is failing.
-
-Without the flag this path has a hole that the claim cannot see, because the reconcile
-writes nothing: a retry pass validates intent, the owner removes the wire, the delta
-apply passes over the row, the retry pass connects, and the row is `ACTIVE` for a wire
-nobody intends with nothing owed. Read from `_reattempt_rows`, `_apply_wiring_pairs`,
-and `record_l1_connect`; not reproduced.
-
-### D10. Two reconcile-type passes of one reservation do not overlap in one replica
-
-The settle pass adds a second way to start a reconcile in a process. The claim excludes
-two passes on a row that exists as `FAILED`; it cannot exclude them on a key with no row
-(a fresh build) or on an `ACTIVE` row (a release, an L3 route delta). A per-reservation
-`asyncio.Lock` in the consumer module is taken by `handle_wiring_changed`, by the
-terminal teardown, and by the settle pass. The settle pass does not wait for it: a
-reservation whose lock is taken is left for the next tick. The consumer does wait, for
-at most the rest of one settle pass of that same reservation, which is the same order
-of time as the reconcile it is about to run; the in-progress signal keeps the message
-from being redelivered meanwhile (WIRE-CONSUME-6). This is the one place the consumer
-waits, and it never waits on a claim.
-
-Across replicas two reconciles of one reservation can already overlap today:
-`docs/ENV_VARS.md` documents a poller fleet (`EXECUTION_POLLER_ONLY`) in which every
-replica runs the consumer, and `record_route_reconciled`'s docstring names the case.
-This record does not close that; it stays a limit, and Open questions proposes where
-it goes.
-
-## Convergence, traced per layer
-
-The case: a retry pass P holds row X and is mid-drive; the owner removes the intent; the
-reconcile skips X and requests a settle; P finishes. Each row of the table is read from
-the functions named, not executed.
+Retry pass P holds the lease and is mid-drive on row X. The save's event meets the
+lease, requests a settle, and is acked. P finishes and releases. The settle pass takes
+the lease and runs the full reconcile.
 
 | Layer | P's outcome | Ledger after P | What the settle pass does |
 |---|---|---|---|
-| L1 | success | X `ACTIVE` (`record_l1_connect` flips the FAILED row in place) | The key is `ACTIVE` and not desired, so it is on the release side (`ACTIVE` minus desired); `disconnect_ports`; `release_l1_connection` flips it `RELEASED`. A failed disconnect lands `FAILED` intended `RELEASED` for the retry channels (WIRE-STALE-4) |
-| L1 | failure | X `FAILED` intended `ACTIVE`, stamp cleared by P's own write | The key is stale: guarded park, release side, `pair_needs_release` true, claim, `disconnect_ports`, `RELEASED`. The tick reaches the same park first if it runs first (WIRE-RETRY-6) |
-| L1 | P dies | X `FAILED` intended `ACTIVE`, stamp expires | As failure, once the stamp is in the past |
-| L2 | success | X `ACTIVE` (`record_l2_membership_active`) | (switch, port) is in `remove_keys`; `remove_from_vlan`; `release_l2_membership`; then the orphan check of D7 frees the allocation and undefines the VLAN when no `ACTIVE` membership is left |
-| L2 | failure or death | X `FAILED` intended `ACTIVE` | Stale: guarded park and `remove_from_vlan`, or the direct release when the allocation is nil or unknown |
-| L3 | success | X `ACTIVE` with the routes P drove (`record_route_active`) | The switch is in `remove_switches`; `remove_route` for the stored routes; `release_route_membership` |
-| L3 | partial failure | X `FAILED` intended `ACTIVE`; routes are P's set plus residue it could not remove | Stale: guarded park, then `remove_route` for every stored route |
-| L3, still adjacent, routing intent changed | success | X `ACTIVE` with P's older set | The switch is in `stay_switches` with a differing pin: the delta reconcile removes and adds, `record_route_reconciled` |
-| L3 at teardown | success | The freeze branch of `record_route_active` parks X `FAILED` intended `RELEASED` with the union of stored and driven routes | Nothing left for the teardown re-run; the release-direction tick removes the routes while frozen (WIRE-TEARDOWN-4) |
-| L3 at teardown | partial failure | X `FAILED` intended `ACTIVE` on a frozen reservation | The re-run teardown parks it `TEARDOWN_PENDING_REMOVAL` and deprovisions its stored routes (WIRE-TEARDOWN-6) |
+| L1 | success | X `ACTIVE` (`record_l1_connect`) | The key is `ACTIVE` and not desired: release side of the diff, `disconnect_ports`, `release_l1_connection`. A failed disconnect lands `FAILED` intended `RELEASED` for the retry channels (WIRE-STALE-4) |
+| L1 | failure, or P dies | X `FAILED` intended `ACTIVE` | The key is stale: `park_stale_l1_build`, release side, `pair_needs_release` true, `disconnect_ports`, `RELEASED` |
+| L2 | success | X `ACTIVE` (`record_l2_membership_active`) | In `remove_keys`: `remove_from_vlan`, `release_l2_membership`; then `_release_orphaned_allocations` frees the allocation when no `ACTIVE` membership is left, as on main |
+| L2 | failure, or P dies | X `FAILED` intended `ACTIVE` | Stale: park and `remove_from_vlan`, or the direct release when the allocation is nil or unknown |
+| L3 | success | X `ACTIVE` with the routes P drove | In `remove_switches`: `remove_route` for the stored routes, `release_route_membership` |
+| L3 | partial failure | X `FAILED` intended `ACTIVE`; routes are P's set plus residue it could not remove | Stale: `park_stale_route_build`, then `remove_route` for every stored route |
+| L3, still adjacent, routing intent changed | success | X `ACTIVE` with P's older set | In `stay_switches` with a differing pin: the delta reconcile, `record_route_reconciled` |
+| Any, at teardown | any | The teardown was deferred; P's success after the freeze is parked `FAILED` intended `RELEASED` by the record-time freeze branch (WIRE-LEDGER-4) | Frozen: `_teardown_from_ledgers` releases every `ACTIVE` row and parks and deprovisions every `FAILED` intended-`ACTIVE` pin (WIRE-TEARDOWN-6); the release-direction retries finish the rest |
 
-The reverse case (P is removing, the owner re-adds the wire): the reconcile's build
-loses the claim and skips. P succeeds and the row is `RELEASED`, so the settle pass sees
-a desired key with no row and builds it fresh; P fails and the row is `FAILED` intended
-`RELEASED` and unclaimed, so the settle pass claims it (it read that direction) and
-builds over it, as the reconcile does today.
+### The review's traces against this design
 
-Where it does not converge, or converges only with a condition:
+- **Two settle passes, two replicas, an `ACTIVE` row for a removed wire.** A takes the
+  lease; B's take writes no row, so B passes over and requests nothing. A disconnects,
+  releases, pays. B's next step finds nothing owed. One driver call.
+- **The endless settle loop.** A's settle pass drives a failing row for 270 seconds. B
+  meets the lease and does nothing: no `lost` set exists to turn into a request. A
+  records the failure and pays; the row is the retry tick's, under its cap.
+- **A settle pass against a terminal teardown.** The teardown holds the lease for its
+  whole pass; a settle pass on another replica that sees frozen cannot take it. If the
+  settle pass got there first, the teardown defers and the settle pass, on a frozen
+  reservation, runs the teardown.
+- **The allocation leak.** Allocation A has `ACTIVE` membership M1 and a `FAILED` join
+  X that P is retrying. The owner removes both wires: the event is deferred whole, so
+  M1 is not removed while P joins. P fails. The reservation completes: the teardown
+  takes the lease, removes M1, and `_release_orphaned_allocations` frees A in that same
+  pass, because A is among the allocations its removes touched. The owed wiring settle
+  then runs on a frozen reservation, finds nothing `ACTIVE`, and pays. If the settle
+  pass runs before the reservation ends, its own full reconcile removes M1 and X and
+  frees A. No pass removes a membership without also running the orphan check for its
+  allocation, because no pass is partial.
+- **R1.** P re-reads X under the lease, finds it intended `RELEASED`, and treats it as
+  a release-direction row.
+- **R3.** The tick takes the lease, re-reads the pin (routes r1) and the fork's intent
+  (r1), and drives r1. If the tick held the lease first and drove r0, the save of r1 is
+  deferred and the settle pass's delta reconcile moves the pin to r1.
+- **R2.** The carried-delta apply meets P's lease and is deferred; the settle pass
+  releases the row P left `ACTIVE`.
+- **The nacked version.** Last applied is 3; v4 is nacked for an upstream failure; v5
+  is deferred. The settle pass applies the fork at v5 and stamps 5; v4 arrives stale
+  and is a no-op. If instead v4 had been deferred and v5 nacked, the stamp is 4 and v5
+  arrives contiguous, its delta a set of no-ops against state already at v5; the
+  exposure that remains is the one named under D6.
 
-- **L2 allocation and VLAN definition.** Without D7 a skipped join can end `ACTIVE` on a
-  released allocation. With D7 the membership and the allocation converge; issue #1413's
-  original window (a join uncommitted at the instant of the release's update) is
-  unchanged and stays open.
-- **L3 route content after an expired claim.** If a claim expires mid-drive and another
-  pass takes the pin, routes the superseded holder configured outside the recorded pin
-  are recorded nowhere (the open cell of the issue's design comment). The settle pass
-  compares pins to intent and cannot see them. Only #1482 prevents it.
-- **A failed L1 or L2 build on a frozen reservation.** The row stays `FAILED` intended
-  `ACTIVE`; the tick excludes it and the teardown does not read it (WIRE-TEARDOWN-6,
-  last sentence). If the failed call did land on the device, nothing removes it.
-  Existing decision, unchanged.
-- **A frozen park keeps the attempt count** (WIRE-LEDGER-4). A row at or above the cap
-  that the freeze branch parks is not selected by the tick; it is visible and waits for
-  a manual retry. Existing behaviour, unchanged.
+### Where it does not converge, or converges only with a condition
 
-## Why this does not repeat the three failures
+- **A parked settle on an active reservation** (five failed attempts). The deferred
+  save's changes are not applied until the next save or an operator acts. Visible in
+  the tick line and the ERROR log. The same class as a dead-lettered event today.
+- **One step outlasting the lease term.** A second pass can take the lease and drive
+  the same reservation for the length of one driver attempt. On L3 the two passes'
+  routes can then differ, and routes the superseded holder configured outside the pin
+  the new holder records are recorded nowhere (the open cell of the issue's design
+  comment). The lease term's allowance is the only defence.
+- **The stamp below the fork's version** (D6): a wire can be rebuilt until a later
+  event lands. As on main.
+- **A failed L1 or L2 build on a frozen reservation** stays `FAILED` intended `ACTIVE`;
+  if the failed call did land on the device, nothing removes it (WIRE-TEARDOWN-6, last
+  sentence). Existing decision.
+- **A frozen park keeps the attempt count** (WIRE-LEDGER-4): a row at the cap waits for
+  a manual retry. Existing behaviour.
+- **The cross-reservation writers** (WIRE-LEDGER-11, WIRE-LEDGER-12) act on another
+  reservation's `ACTIVE` row without its lease, as today, and two reservations' passes
+  can drive one switch at once, as today. The lease is per reservation.
+
+## Why this does not repeat the failures
 
 | Failure | Invariant it broke | Its precondition | Why it cannot recur here |
 |---|---|---|---|
-| Round 1: a guarantee narrower than stated | E2: writers outside the guarded set wrote a held row | Writers were guarded one by one, and some were missed | D1 is a rule about passes, not about writers: every pass owns a ledger and every failure write and settle refuses a row it does not hold, with the key branch as the backstop (D3). The guard test fails on a ledger writer or apply called without a ledger |
-| Round 2: stamp guard on the holder's success flips | CONSERVATION: routes configured, record refused, nothing owed | A writer that never claims cleared the holder's stamp (the teardown park) | No pass clears a live stamp it does not hold any more (D1, D3, D8), so the trigger is gone; and the flips are not guarded at all (D6), so even a holder whose claim expired still records what it did. The teardown skips the held pin and owes a settle; both of P's outcomes are traced above |
-| Round 3: `holder_record` PARK and REOPEN | E2 in effect: PARK wrote, by key, a row Y the holder never held, and released a wire the fork intends | Held row X was released during the drive and its key was rebuilt as a new row Y | While X is `FAILED` its key maps to X (D1, D2). A pass that wants to release X or build its key must claim X first and loses, so X is not released and Y is never created during the hold. Nothing decides from "the row as the holder finds it"; there is no PARK or REOPEN write |
-| Main today (#1481) | E1 and E2 | The reconcile and teardown never claim | D1 |
+| Round 1: a guarantee narrower than stated | E2: writers outside the guarded set wrote | Writers were guarded one by one, and some were missed | The lease is not a property of writers. Every writer is reached from four entry points, each of which takes the lease first, and every wiring driver call passes one function that refuses to run without it |
+| Round 2: stamp guard on the holder's success flips | CONSERVATION: routes configured, record refused | A writer that never claims cleared the holder's stamp (the teardown park) | The teardown cannot run while a retry pass holds the lease; it defers and is run by the settle pass afterwards. The flips are not guarded at all (D7) |
+| Round 3: `holder_record` PARK and REOPEN | E2: PARK wrote, by key, a row Y the holder never held | Held row X was released during the drive and its key rebuilt as Y | No other pass writes the reservation's rows during the hold, so X is not released and Y is not created. Nothing decides from "the row as the holder finds it" |
+| Revision 1: row claims plus a settle mark | E1 across replicas; CONSERVATION for allocations and for a request made too late | A pass skipped some rows and went on with others | A pass is all or nothing for its reservation: it holds the lease or it defers before doing anything |
+| Main today (#1481, R2, R3) | E1, E2, and a plan made before the claim | The reconcile and teardown never claim; retry plans predate the claim | D1 and D3 |
 
 The second comment on the issue (a frozen reservation, a parked pin whose deprovision
 failed, then a holder's partial-failure write turning it back to intended `ACTIVE`)
-needs the teardown to park a held pin, which D8 forbids, or a retry pass to claim a pin
-parked before its claim, which D4 forbids.
+needs a teardown and a retry pass on one reservation at once, which D1 excludes.
 
 ## Invariants and what will pin them
 
@@ -484,231 +498,252 @@ Test names are proposals for the implementing pull requests; none exists yet.
 
 | Invariant | To be pinned by |
 |---|---|
-| A reconcile over a row another pass holds changes nothing on it (`status`, `intended`, `attempts`, `last_error`, `claimed_until`) and makes no driver call for its key, per layer and per site of D3 | unit, `test_wiring_claim.py`: one test per site per layer; Postgres-live, one staged interleaving per layer |
-| The key branch of each failure writer refuses a FAILED row with a live stamp that is not the caller's, and writes one whose stamp is null, past, or the caller's | unit, per layer, five claim states |
-| A claim fails when `intended` changed since the pass's read, and the read-back reports `still_failed` for a row nobody holds | unit; Postgres-live for the park against claim order |
-| A skip requests a settle before the version is stamped; a pass with no skip requests none | unit on `handle_wiring_changed` and `_teardown_from_ledgers` |
-| Paying is a compare-and-swap on the request counter read at the start of the pass | unit; Postgres-live with a request staged during the settle pass |
-| The settle pass runs the teardown on a frozen reservation, the full reconcile on an `ACTIVE` one, and nothing on any other or unreadable status | unit |
-| A pass that lost an L2 row releases no allocation; the settle pass checks every `ACTIVE` allocation of the reservation | unit, `test_nats_consumer_vlan_definitions.py` pattern |
-| No call of a ledger writer or of the three applies omits the ledger | AST scan, with its limits in its docstring |
+| Two takes of one lease: exactly one writes a row; an expired lease is retaken; a missing state row is inserted by the take | unit; Postgres-live with two connections |
+| A renewal by a superseded token writes no row, and the pass then makes no driver call, failure write, or park | unit, with a lease retaken between two attempts |
+| No wiring driver call without a lease in context | unit on `_run_driver_with_retry`; an AST scan that every caller of the three applies is one of the four entry points, with its limits in its docstring |
+| The expiry is written and compared with the database clock | Postgres-live: a process whose own clock is set an hour off still excludes and is excluded |
+| A consumer pass that meets a lease makes no wiring write but the request, and returns; it never waits | unit on `handle_wiring_changed` and the terminal handler, asserting the statements made |
+| A request on a reservation with no state row inserts it | unit |
+| A settle pass that meets a lease requests nothing | unit; Postgres-live with two settle steps |
+| Paying is an update that only raises, to the s read under the lease | unit; Postgres-live with a request staged during the settle pass |
+| A full pass stamps the deferred version; a nacked event at or below it is then a no-op | unit |
+| A retry pass plans from rows re-read under the lease | unit: R1 and R3 as written by the review, failing on main and passing here |
+| An active reservation's settle parks after five failures and a frozen one's does not | unit |
 | The holder's success and release flips are unchanged | the existing `test_a_superseded_holders_failure_is_refused_but_its_success_is_recorded` and `test_a_superseded_l3_holder_records_only_its_success` stay green |
 
 ## Options rejected
 
-| Option | Complexity | What it covers | Why not |
-|---|---|---|---|
-| Issue option 1 alone: the parks keep `claimed_until` | Low | Effect 1 only | The key-based failure write still rewrites and frees a held row, and the reconcile still drives a held row's key. The owner rejected it. Its useful part is kept by D3: a parked row is claimed before it is driven |
-| Issue option 3: the reconcile waits for the holder | Low | All three effects | The consumer handles one message at a time, so one held row would stall every reservation's events on that replica for up to a claim budget, terminal events included. The owner rejected it |
-| Settle by delayed redelivery of the same event (the owner's first example) | Medium | The reconcile's skips | Four redeliveries per message, shared with real upstream failures; the default schedule spans 81 seconds against a 300 second claim; the fifth failing delivery dead-letters a healthy event, and a dead-lettered `wiring_changed` is not staged again, so at exhaustion CONSERVATION fails. It also cannot serve the teardown: deferring a terminal event risks dead-lettering it. A dedicated longer delay does not change the count |
-| Settle by a follow-up event through execution's outbox (the owner's second example) | Medium | The reconcile's skips | The outbox has no delay, so the follow-up arrives while the row is still held and repeats every few seconds, each time a full reconcile. Execution would have to publish on a subject reservations owns, breaking RES-EVENT-2, or grow a new subject and consumer filter. A follow-up at a stamped version is a no-op, so the version would have to stay unstamped |
-| Ask reservations to stage a heal | Medium | The reconcile's skips | A new internal route and a cross-service round trip for state execution holds itself; the same version problem; and it cannot pay a frozen reservation's mark |
-| The holder settles what the reconcile skipped (`holder_record` again) | High | The reconcile's skips | Round 3. The holder would again decide from a row it cannot fully interpret |
-| Filter held rows out of the reconcile's reads | Low | Effect 1 | Breaks E1: the key looks empty and the reconcile builds it fresh (D2) |
+| Option | Complexity | Why not, with the trace |
+|---|---|---|
+| Revision 1: the reconcile takes the row claim and skips held rows inside its pass | High | The review's eleven defects. To be sound it needs: a reservation lease anyway, for `ACTIVE` rows and keys with no row; a durable flag for an allocation whose release was deferred, honoured by the teardown and by any pass that pays; a content or version compare on the claim (R3); a stamp re-sized after the L3 residue read (the read moves behind the claim while PR #1490 sizes the stamp before it); a request at the first skip instead of the end of the pass; a ledger per reservation; a partial unique index so a key cannot have two non-`RELEASED` rows; and the database clock. With the reservation lease in place, all the row machinery buys is letting a reconcile work on a reservation's other rows while a retry pass drives one |
+| The holder re-checks intent after its drive, with no settle pass | Medium | CONSERVATION stays open in two traces. The holder's fork read fails after its success flip (cabling answers 5xx): it cannot judge, the row is `ACTIVE`, nothing is owed. Or the holder dies between the flip and the re-check: the same end state |
+| Issue option 1 (parks keep the stamp) plus a guard on the key-based failure write | Low | EXCLUSION stays open on an unrelated save: the build diff is desired minus `ACTIVE`, so a save that touches nothing near row X still puts X's still-desired key on the build side and the reconcile drives it beside the holder (effect 3). The owner rejected option 1 alone |
+| Issue option 3: the reconcile waits for the holder | Low | The consumer handles one message at a time, so one held reservation stalls every reservation's events on that replica. The owner rejected it. Revision 1's in-process lock was the same stall and is withdrawn |
+| Settle by delayed redelivery of the same event | Medium | Four redeliveries over 81 seconds, shared with real upstream failures; the fifth failure dead-letters a healthy event that is not staged again. It cannot serve a terminal event at all |
+| Settle by a follow-up event through execution's outbox | Medium | The outbox has no delay; execution would publish on a subject reservations owns (RES-EVENT-2) or grow a subject and a filter; a follow-up at a stamped version is a no-op |
+| Ask reservations to stage a heal | Medium | A new internal route and a cross-service round trip for state execution holds itself, and it cannot settle a frozen reservation |
+| The settle step in the retry tick | Low | It needs an in-process guard against the consumer (the stall above, and a lock that is not reentrant when the settle pass calls the teardown), it runs only where `WIRING_RETRY_ENABLED` is true while requests are made wherever a consumer runs, and it settles up to a minute late instead of within seconds |
+| One lease stamp sized for the whole pass | Low | A pass has no bound, so neither does the stamp: a holder that dies would block its reservation for the stamp's length, hours for a large L3 pin. Renewal per step bounds a dead holder to one term |
+| `holder_record` again | High | Round 3: the holder decides from a row it cannot fully interpret |
 
-The trade the recommended mechanism makes: the settle pass costs one schema change and a
-second caller of the reconcile body, and it delays the settlement of a skipped row by up
-to one interval after the claim ends. In return it has no delivery count, survives a
-restart, is the same idiom as the retry tick it runs in, and one mechanism serves the
-reconcile and the teardown.
+The trade the lease makes against revision 1: a save that lands while any pass is
+driving its reservation is applied whole by the settle step, seconds after that pass
+ends, instead of being applied at once except for the held rows. In return there is one
+mechanism, enforced at one choke point, with no partial pass to reason about.
 
 ## Spec rule edits for the implementing pull requests
 
-`docs/specs/provisioning-and-wiring.md`; not edited by this record.
+`docs/specs/provisioning-and-wiring.md`; not edited by this record. Each phase changes
+the rules it makes untrue in its own pull request; this is the union.
 
 - **Header.** Add ADR 0018 to the Design records row.
-- **Section 4, claim stamp table.** The "any to null" row loses "and every key-based
-  failure write and park the reconcile makes" and its guard "none"; those writes move to
-  the guarded row, whose first column becomes "the writing pass's own stamp, null, or in
-  the past" for every pass. The wiring state table gains the settle counters and their
-  two transitions (request, pay).
-- **Section 4, Concurrency.** "the two retry channels exclude each other with the claim
-  stamp" becomes "every pass that drives a FAILED row excludes every other with the
-  claim stamp".
-- **WIRE-CLAIM-1.** Add: the update also requires the row's `intended` to equal the
-  value the pass read.
-- **WIRE-CLAIM-2.** "(a failure write by row id only when WIRE-CLAIM-8 lets it write)"
-  becomes "(a failure write or a settle only when WIRE-CLAIM-8 lets it write)".
-- **WIRE-CLAIM-4.** Proposed wording: "A row that exists as `FAILED` is claimed
-  immediately before its own driver call (an L3 pin once, before its switch's login),
-  never at selection, by whichever pass drives it: the retry tick, a manual retry, the
-  reconcile, the terminal teardown, or the settle pass. A key with no `FAILED` row has
-  nothing to claim."
-- **WIRE-CLAIM-5.** "in that pass" stays; add that the pass requests a settle
-  (WIRE-SETTLE-1) unless it is a retry pass.
-- **WIRE-CLAIM-7.** Keep the rule; add the second reason of D2.
-- **WIRE-CLAIM-8.** "a retry pass (tick or manual)" becomes "a pass"; the key branch
-  backstop is added; the limit about the reconcile is removed; the limit about the
-  holder's flips stays, reworded as a decision of this record.
-- **WIRE-CLAIM-9.** Remove "or whose claim a writer that does not claim cleared".
-- **New WIRE-CLAIM-10.** Every pass owns one `WiringRowClaims`; no ledger writer or apply
-  is called without one.
-- **WIRE-LEDGER-6.** A reconcile failure write for a key that has a `FAILED` row goes by
-  row id; the key branch refuses a held row.
-- **WIRE-LEDGER-13.** A park by any pass runs under the guard.
-- **WIRE-STALE-1 to WIRE-STALE-3.** A held stale row is skipped and a settle is
-  requested.
-- **WIRE-ORDER-10.** The version is stamped even when rows were skipped; the settle
-  request commits first.
-- **WIRE-ORDER-4 or a new rule.** The carried-delta flag of D9.
-- **WIRE-TEARDOWN-6.** The park runs under the guard; a held pin is skipped and settled
-  by a re-run of the teardown.
-- **WIRE-VLAN-4.** The deferral and the wider orphan check of D7.
-- **WIRE-RETRY-16.** The settle counters in the tick line.
-- **New section 8.16, WIRE-SETTLE-1 to WIRE-SETTLE-5.** Requesting; the settle pass's
-  selection and order; what it runs by reservation state; paying; the overdue warning.
-- **Section 13.** Remove the two #1481 limits; add the limits listed under Convergence
-  and the cross-replica overlap of D10.
+- **Section 4.** The wiring state table gains the lease (take, renew, release) and the
+  settle counters (request, pay) with their guards. Concurrency: "the two retry
+  channels exclude each other with the claim stamp" becomes "every pass excludes every
+  other pass of its reservation with the drive lease; the retry channels also carry the
+  row claim until it is retired".
+- **WIRE-CLAIM-1** (phase 1). Add: the update also requires the row's `intended` to
+  equal the value the pass read.
+- **WIRE-CLAIM-3**, as rewritten by PR #1490. Add that the row budget is what excludes
+  two retry passes on one row, and that since the lease it is not what excludes a
+  reconcile; removed in phase 4.
+- **WIRE-CLAIM-4.** Proposed wording: "A retried row is claimed immediately before its
+  own driver call (an L3 pin once, before its switch's login, with the budget of
+  WIRE-CLAIM-3), never at selection. The reconcile, the terminal teardown, and the
+  settle pass take no row claim: each holds its reservation's drive lease for the whole
+  pass (WIRE-LEASE-1), and so does a retry pass, which claims its rows under it."
+- **WIRE-CLAIM-8.** The limit about the reconcile becomes: "the reconcile, the
+  teardown, and the settle pass write a reservation's rows only while they hold its
+  lease, and no retry pass holds a row of that reservation meanwhile (WIRE-LEASE-1)".
+  The limit about the holder's flips stays, as a decision of this record.
+- **WIRE-CLAIM-9.** "or whose claim a writer that does not claim cleared" is removed
+  once phase 3 has shipped for all three layers.
+- **New section 8.16, WIRE-LEASE-1 to WIRE-LEASE-6.** Who takes the lease; take, renew,
+  release; the term; where a pass renews and the refusal with no lease in context; what
+  a pass does when it loses it; the database clock.
+- **New section 8.17, WIRE-SETTLE-1 to WIRE-SETTLE-7.** The request; where the settle
+  step runs; selection; what it runs by reservation state; paying and the stamp;
+  spacing and parking; the alarms.
+- **WIRE-CONSUME-2.** One settle pass at most between fetches.
+- **WIRE-ORDER-3, WIRE-ORDER-4, WIRE-ORDER-10.** A `wiring_changed` that meets the
+  lease requests a settle and is not stamped; a full pass stamps the deferred version.
+- **WIRE-DISPATCH-3, WIRE-TEARDOWN-1 to WIRE-TEARDOWN-3.** A terminal event that meets
+  the lease freezes, requests a settle, and leaves the ledger teardown to the settle
+  pass.
+- **WIRE-RETRY-5, WIRE-RETRY-6, WIRE-RETRY-11, WIRE-RETRY-13, WIRE-RETRY-14,
+  WIRE-RETRY-16, WIRE-RETRY-19.** A retry pass takes the lease per reservation and
+  re-reads its rows under it; `in_progress` also means the reservation is leased or
+  owes a settle; the selects' third exclusion; the tick line's new counters.
+- **Section 13.** Remove the two #1481 limits; add the limits under "Where it does not
+  converge".
 
-Also `CHANGELOG.md`, the module docstring of `wiring_claim.py` (it says the reconcile
-never claims), and the docstrings of the three applies ("the reconcile path passes
-neither").
+Also `CHANGELOG.md`, `docs/specs/CONVENTIONS.md` (the lease as the one helper), the
+module docstring of `wiring_claim.py`, the docstrings of the three applies, and the
+docstring of `record_route_reconciled` (its multi-process case becomes unreachable).
 
 ## Test plan
 
 At HERD's five levels.
 
-1. **Unit** (SQLite, `services/execution/tests/`). The invariants table above. Existing
-   tests that pin main and flip on purpose:
-   `test_l1_key_upsert_failure_write_clears_the_claim`,
-   `test_l1_stale_build_park_clears_the_claim`,
-   `test_l2_stale_build_park_clears_the_claim`, the three
-   `test_after_the_reconcile_clears_the_claim_*` tests (their premise, a reconcile
-   clearing a live claim, becomes the thing that must not happen), and in the
-   last phase `test_write_guard_does_nothing_without_a_ledger`.
-   `test_claim_of_none_row_id_is_always_granted` stays: a key with no row is still
-   drivable.
+1. **Unit** (SQLite, `services/execution/tests/`). The invariants table. Phase 1: the
+   claim per `intended` state, and the read-back answer `still_failed` for a row that
+   is `FAILED` and unheld. R1, R2, and R3 enter the suite as written by the review:
+   each fails on main and passes at its phase (R1 at phase 1, R2 and R3 at phase 3).
+   The allocation trace under freeze. The upsert on a missing state row, for the take
+   and for the request. A pass that raises after taking the lease releases it and the
+   message is nacked as today; a pass that meets the lease has made its request before
+   anything that can raise. Tests that pin main and change on purpose: at phase 3, the
+   three `test_after_the_reconcile_clears_the_claim_*` tests (a reconcile can no longer
+   run beside the holder); at phase 4, the row-claim tests go with the code.
 2. **Functional** (the service's real surface, in process). The internal retry route
-   `POST /internal/reservations/{reservation_id}/wiring/retry` while a reconcile holds a
-   row answers `in_progress` for it, a new reachable answer; the wiring status payload is
-   unchanged. `handle_reservation_event` driven with a real payload for the skip, the
-   stamp, and the mark.
-3. **Postgres-live** (`test_wiring_retry_claim_race_live_pg.py` pattern:
-   `_gated_driver_stub`, `_loser_inside_holders_drive`; every overlap staged with events,
-   every wait bounded, no sleep). The interleavings:
-   - a reconcile lands while a retry pass is inside its drive, once each for an L1
-     connect, an L2 join, and an L3 provision: the driver is called once for the row, the
-     row is unchanged until the holder writes, the mark is owed, the version is stamped;
-   - the holder succeeds after the wire was removed: the settle pass releases the row,
-     per layer, and for L2 the allocation is freed only then;
-   - the holder fails after the wire was removed: the settle pass parks and releases;
-   - the claim expires while the reconcile is skipping (the holder never returns; the
-     stamp is moved into the past by the test, not waited for): the settle pass settles
-     the row;
-   - two reconciles in a row both skip: one settle pass pays both requests;
+   answers `in_progress` for a reservation whose lease a reconcile holds, and for one
+   that owes a settle. `handle_reservation_event` with a real payload for a deferred
+   save and a deferred terminal event. The consumer stall: with a lease held by another
+   pass, the handler returns after one statement, and a second reservation's event is
+   handled without delay.
+3. **Postgres-live** (the `_gated_driver_stub` and `_loser_inside_holders_drive`
+   pattern of `test_wiring_retry_claim_race_live_pg.py`; every overlap staged with
+   events, every wait bounded, no sleep):
+   - a save lands while a retry pass is inside its drive, once each for an L1 connect,
+     an L2 join, and an L3 provision: one driver call for the row, a request recorded,
+     the version not stamped;
+   - the holder then succeeds, and separately fails: the settle pass releases the row;
+     the version is stamped only then;
+   - the lease expires while the save is deferred (the test moves the expiry into the
+     past; it does not wait): the settle pass takes it;
+   - two saves in a row are both deferred: one settle pass pays both and stamps the
+     larger version;
    - a request arrives during a settle pass: the mark stays owed;
-   - a park and a build claim on one row, both orders: exactly one wins, and a build
-     never follows a park;
-   - a terminal teardown lands while a retry pass is inside an L3 provision, with both
-     holder outcomes.
+   - two settle steps on two connections for one reservation: one runs, the other
+     writes nothing;
+   - a settle step against a terminal teardown, both orders: one ledger teardown runs;
+   - a terminal event lands while a retry pass is inside an L3 provision, with both
+     holder outcomes;
+   - a drive longer than the lease term keeps the lease by renewing (a virtual clock,
+     as PR #1490's tests use), and a holder that stops renewing is replaced after one
+     term, at which point its next renewal fails and it makes no further call;
+   - an L3 provision whose residue is read under the lease: the residue it drives is
+     the residue at lease time.
    The two live tests that pin main,
    `test_teardown_during_a_held_l3_provision_leaves_its_routes_recorded_for_removal` and
    `test_a_reconcile_failure_write_during_a_held_l1_connect_still_records_it`, are
-   rewritten to the new behaviour. Each fixed test carries its mutation proof: the guard
-   removed per site, the claim's `intended` predicate removed, the pay made
-   unconditional, the request moved after the stamp.
+   rewritten at phase 3. Each fixed test carries its mutation proof: the take made
+   unconditional, the renewal check removed, the request moved after the handler's
+   first read, the pay made unconditional, the re-read under the lease removed.
 4. **Integration** (running stack, mock drivers). The L1, L2, L3, and ledger teardown
-   suites stay green; no API changes. One convergence test is possible with the mock
-   drivers' `HERD_mock_sleep_ms` knob, asserting the end state by polling the wiring
-   status, never by timing; it proves the settle pass runs in a real stack and is the
-   only level that does. If that knob proves too coarse, the nightly's Postgres-live step
-   is the stack-level proof, as it was for #1486.
-5. **Load** and **browser end to end**: not applicable as new suites. There is no new
-   route and no UI change: the retry summary already counts `in_progress` and words it
-   "already retrying" (`frontend/src/api/reservations.ts`), which stays true of a row
-   the reconcile is driving; only code comments that name the background retry channel
-   change. The settle pass's cost when nothing is owed is one indexed select per tick,
-   pinned by a unit test that counts statements, not by a wall-clock bound.
-   `make test-load` and the nightly e2e run unchanged and must stay green.
+   suites stay green; no API changes. One convergence test with the mock drivers'
+   `HERD_mock_sleep_ms` knob holding a retry open while a save lands, asserting the end
+   state by polling the wiring status, never by timing. It is the only level that
+   proves the settle step runs in a real consumer loop.
+5. **Load** and **browser end to end**: no new suites. No new route and no UI change:
+   the retry summary already counts `in_progress` and words it "already retrying"
+   (`frontend/src/api/reservations.ts`). The settle step's cost when nothing is owed is
+   one indexed select per fetch, pinned by a unit test that counts statements, not by a
+   wall-clock bound. `make test-load` and the nightly e2e run unchanged and must stay
+   green; the load suite's concurrent saves now exercise deferral, and the deferral
+   count is asserted to be reported, not to be zero.
 
 ## Delivery phases
 
-Each phase is one pull request, mergeable alone, and leaves main correct.
+Each phase is one pull request (phase 3 is three), mergeable alone, and leaves main
+correct.
 
-0. **Issue #1482** (its own issue and decision). Required before phase 5.
-1. **The settle mark and the settle pass, inert.** The migration, request and pay
-   helpers, the reconcile body factored into one function, the settle step in the tick
-   with its frozen branch, corroboration, order, stats, and the per-reservation lock of
-   D10. Nothing requests a settle yet, so the step selects nothing.
-2. **The claim reads `intended` (D4)** for the retry channels, with the read-back change.
-   Closes the stale-build-plan hole between retry passes on its own.
-3. **L1.** The reconcile owns a ledger and maps keys to rows; guarded park; the key
-   branch backstop in `record_l1_failed`; the carried-delta flag (D9); the request
-   before the stamp. L2 and L3 behave as on main.
-4. **L2**, with D7.
-5. **L3 and the teardown**, with D8.
-6. **Clean-up.** Remove `claims=None` and its branches, add the AST guard, and remove
-   `holder_or_unclaimed` if the owner agrees.
+1. **The row claim reads `intended`.** `WiringRowClaims.claim` and its three call
+   sites, with the read-back change. The in-process `held` shortcut is unchanged: a
+   pass claims a row once. Closes R1.
+2. **The lease, the mark, and the settle step, for the consumer's passes.** The
+   migration; take, renew, release; the context variable and the renewal points; the
+   reconcile body factored into one function; deferral in `handle_wiring_changed` and
+   the terminal handler; the settle step in the consumer loop with its stamp, spacing,
+   and parking; the tick line's counters and the overdue warning. Retry passes are not
+   touched: against a reconcile they behave as on main.
+3. **Retry passes take the lease and plan under it**, one layer per pull request (L1,
+   L2, L3): the take before the re-read of the reservation's rows, held through the
+   apply; the selects' new exclusion; the manual retry's `in_progress`. Closes #1481,
+   R2, and R3 for that layer. The refusal of a wiring driver call with no lease in
+   context is switched on with the last layer, when every caller has one.
+4. **The row claim is retired.** `claimed_until`, `WiringRowClaims`,
+   `claim_write_clauses`, `write_guard`, `holder_or_unclaimed`, and the L3 row budget
+   go. A separate decision; see open question 4.
 
-Every phase changes the spec rules, docstrings, and CHANGELOG lines it makes untrue in
-the same pull request, as the repository requires; the list above under Spec rule edits
-is the union.
-
-Phases 3 to 5 each convert one layer; an unconverted layer keeps today's behaviour, so
-the order among them is free. Phase 1 must precede them: a skip with no settle pass
-would be the conservation defect this record exists to avoid.
+Phase 2 must precede phase 3. Phase 1 is independent of the others and can ship today.
+PR #1490 is independent of all of them. In a deployment with one consumer replica,
+phase 2 defers nothing in normal running (the consumer is serial, and retry passes do
+not hold the lease yet); the one case is a redelivery that meets the lease of a pass
+that died, which is then settled after one lease term.
 
 ## Consequences
 
-- A save that touches a row a retry pass is driving no longer acts on that row at once;
-  it is settled up to one interval after the claim ends. Everything else in the save is
-  applied as before.
-- A manual retry can now answer `in_progress` for a row the reconcile is driving, and a
-  retry pass's claim can be lost to the reconcile.
-- The reconcile makes one short update per FAILED row it drives and one locked select
-  per park. Rows with no FAILED history cost nothing extra.
-- One migration on `reservation_wiring_state`; no new setting, route, event, or subject.
-- The reconcile body gains a second caller, and a reconcile can start from the retry
-  loop. That is new concurrency in one process; D10 bounds it.
-- Several tests that pin main's behaviour flip deliberately; the test plan lists them.
+- A save, or a reservation's end, that lands while any pass is driving that
+  reservation is applied by the settle step after that pass ends, not at once. Idle,
+  that is within seconds.
+- A manual retry answers `in_progress` for a whole reservation that is leased or owes a
+  settle, not for single rows.
+- One migration on `reservation_wiring_state`. No new setting, route, event, or
+  subject.
+- The consumer loop gains a step between fetches, and the reconcile body gains a second
+  caller on the same task.
+- Every driver attempt and upstream read costs one short update on the lease.
+- A reservation whose settle keeps failing is parked after five attempts and needs a
+  save or an operator, as a dead-lettered event does today.
+- Tests that pin main's behaviour change deliberately; the test plan lists them.
 
 ## Open questions for the owner
 
 Each has this record's recommendation.
 
-1. **The settle mechanism.** D5 recommends a durable mark and a settle pass in the retry
-   loop, which is neither of the two examples in the starting position. Recommendation:
-   accept D5; the delivery count makes redelivery unable to guarantee CONSERVATION, and
-   the outbox has no delay and no subject of execution's own to publish to.
-2. **Order against #1482.** That issue is not decided. Recommendation: decide it and
-   land its option 1 before phase 5; until then the L3 guarantee is "within the budget".
-3. **D4, the claim reading `intended`.** It changes `WiringRowClaims.claim` for the
-   retry channels too. Recommendation: yes; without it a successful park is not final,
-   and the hole exists on main between two retry passes.
-4. **D7 and issue #1413.** D7 is derived from reading `_apply_l2_memberships` and
-   WIRE-VLAN-4; the fix shape chosen for #1413 may make it simpler or redundant.
-   Recommendation: adopt D7 as written unless #1413 lands first, then re-read it.
-5. **Overlapping reconciles.** D10 serializes within one process only, and makes the
-   consumer wait for a settle pass of the same reservation. A reservation-level claim
-   stamp on `reservation_wiring_state` (a reconcile that cannot take it requests a
-   settle and acks) would cover the documented poller fleet in the same idiom, with no
-   wait, but it sends more work through the new settle pass. Recommendation: the lock
-   in phase 1, and a separate issue for the cross-replica overlap, which exists today
-   whatever this record decides.
-6. **`holder_or_unclaimed` after #1482.** Recommendation: remove it in phase 6; once no
-   pass clears a stamp it does not hold and the budget covers the drive, the strict
-   stamp is always the holder's.
-7. **At most one non-`RELEASED` row per key.** The traces assume it. It holds through
-   the keyed writers in one process, but no index enforces it for `FAILED` rows, and two
-   replicas inserting a failure for one key at once could create two. Recommendation:
-   out of scope; file it separately. D8's "any of them is held" rule is written so L3
-   stays safe either way.
-8. **Should a holder that finds its stamp gone at its success flip request a settle?**
-   It would let an expired-claim double drive converge on L1, L2, and L3 adjacency (not
-   on L3 route content). Recommendation: defer; decide after #1482, when the case should
-   be unreachable.
-9. **A stuck mark.** A reservation that reservations never reports `ACTIVE` again and
-   that execution never freezes keeps its mark, with the overdue warning. Recommendation:
-   accept; it means a terminal event was lost, which is its own defect.
+1. **Granularity.** The claim is per reservation, not per row, which changes the shape
+   the owner chose. Recommendation: accept. The row-granular form needs a reservation
+   lease anyway and seven further mechanisms (Options rejected, first row), and its
+   only gain is applying the rest of a save while one row is being retried.
+2. **Parking.** After five failed settle attempts on an active reservation: park
+   (recommended, the `max_deliver` analogue) or keep trying at the capped spacing,
+   which re-drives failing rows with no attempts cap for as long as the failure lasts.
+3. **The stamp.** Cabling's internal fork answer carries the fork's versions
+   (`ForkDetailResponse.versions`). If the latest version row and the connections it
+   returns are committed together by a save (`fork_save_service.py`; not verified
+   here), every full reconcile could stamp the fork's own version and close the
+   rebuilt-wire gap named under D6, which exists on main for gap and heal reconciles.
+   Recommendation: verify it, and if it holds, do it in phase 2; otherwise stamp the
+   deferred version and keep the limit.
+4. **Phase 4.** Retiring the row claim deletes the #817, #1479, and #1482 machinery and
+   makes a dead holder cost two minutes instead of the row budget. Recommendation: yes,
+   after one release has run with phase 3. Issue #1493's limit is still worth having
+   for the consumer's sake: a drive of thousands of routes is hours of work whoever
+   holds what.
+5. **The tick's lease scope.** Per reservation (recommended): the lease is held only
+   while that reservation's rows are driven. Or once for the tick's whole batch, which
+   is a smaller code change and defers saves for every reservation in the batch for the
+   batch's whole length.
+6. **Deferral latency.** A save is delayed whenever anything is driving its
+   reservation, where revision 1 delayed only the held rows. Recommendation: accept,
+   and watch the deferral count the tick line reports; if it matters, the holder can
+   run the settle pass itself before it releases, as a later change.
+7. **Should a build pass stop when a renewal shows its reservation frozen?** It would
+   save driver calls whose results the freeze branch then parks. Recommendation: not
+   now; it is not needed for correctness.
+8. **Issue #1413.** The interleaving it describes needs two passes of one reservation
+   at once, which the lease excludes after phase 3. Recommendation: have that issue's
+   owner confirm it against this record before closing it.
+9. **The lease term's allowance.** Two minutes at the defaults is this record's
+   proposal, not a measurement. Recommendation: decide it in phase 2's review with the
+   virtual-clock tests in hand.
 
 ## Revisit when
 
-- the consumer handles more than one message at a time, or a deployment relies on
-  several consumer replicas for wiring throughput (D10's limit becomes the common case);
-- a driver call can outlive its claim by design (a new layer, or a driver action with no
-  timeout), which removes the premise of E1;
-- the retry tick is disabled as a supported configuration, since the settle pass lives
-  in it;
-- issue #1413 changes how an allocation is released (D7);
-- a fourth ledger is added: it needs the same three things, a claim before the drive, a
-  guarded settle, and the settle request.
+- a step that a pass makes can outlast the lease term by design (a driver action with
+  no timeout, an upstream read with a longer one);
+- the consumer handles more than one message at a time (the settle step then needs its
+  own place);
+- wiring gains a writer that is not one of the four entry points;
+- deferrals become common enough to notice (open question 6);
+- two reservations driving one switch at once becomes a problem: the lease is per
+  reservation and says nothing about it.
+
+## Revision history
+
+- Revision 1, commit `6a6b912e`: row-granular claim for the reconcile, a settle mark,
+  and a settle step in the retry tick.
+- Revision 2: reservation drive lease for every pass, the settle step in the consumer
+  loop, the plan made under the lease. Revision 1's decisions D1 to D10 are withdrawn;
+  its reading of main, which the review confirmed, is kept.
