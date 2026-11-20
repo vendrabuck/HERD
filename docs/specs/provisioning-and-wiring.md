@@ -306,24 +306,36 @@ compare-and-swap too, so of two passes releasing one allocation exactly one driv
   rounded up to the next whole minute strictly after that sum, computed in whole
   milliseconds; there is no setting of its own. An L1 or L2 row is three actions (its
   switch's login, its own op, its switch's logout): 5 minutes at the defaults, and for
-  every whole-second timeout the plain round-up it was before #1482. An L3 pin is
-  claimed once for its whole drive, so `_apply_l3_adjacency` counts the route
-  operations R it is about to drive (the residue removals plus one call per route, or a
-  reconcile's removals plus additions) before it claims, and passes
-  `l3_pin_claim_budget(R)`, the budget of R plus 2 actions and never less than the
-  three-action budget, to `WiringRowClaims.claim` as a per-call budget; the stamp is
-  the claim instant plus that budget. Pinned at the defaults: 5 minutes for R of 0 or
-  1, 7 for 2, 19 for 10. The sum counts every attempt's sandbox timeout and every
-  backoff sleep, so the stamp is strictly later than the end of the drive's last
-  driver action when each action takes that worst case; the time outside the sum (the
-  execution-run writes, process start, waiting for a worker thread) is covered only by
-  the rounding's slack, at least 0.2 seconds and at most one minute. Nothing caps the
-  budget, because nothing caps a pin's route count: a pin of R route operations is
-  held for at most one minute more than the worst case of R plus 2 actions or of 3
-  actions, whichever is longer, and a holder that dies mid-drive leaves it unclaimable
-  for no longer than that (#1482). \
+  every whole-second timeout the plain round-up it was before #1482, with at least
+  1.2 seconds of slack. An L3 pin is claimed once for its whole drive, so
+  `_apply_l3_adjacency` counts the route operations R it is about to drive (the residue
+  removals plus one call per route, or a reconcile's removals plus additions) after the
+  driver load and immediately before the login, then claims with
+  `l3_pin_claim_budget(R)` as a per-call budget of `WiringRowClaims.claim`; the stamp is
+  the claim instant plus that budget. That budget is the sum for N = R plus 2 actions
+  plus an allowance of 1 second per action (`L3_ACTION_UNTIMED_OVERHEAD_ALLOWANCE_MS`,
+  an allowance, not a measured bound), rounded the same way, and never less than the
+  three-action budget. Pinned at the defaults: 5 minutes for R of 0 or 1, 7 for 2, 19
+  for 10, 75 for 47, 309 for 200, and 76,337 (about 53 days) for 50,000. The sum
+  counts every attempt's sandbox timeout and every backoff sleep; time outside it is
+  each action's time outside its sandbox timers (the two execution-run writes, the
+  worker-thread hop, the sandbox's temp-file I/O, the child's fork and exec before the
+  subprocess timer starts, the kill and reap after a timeout) and, with
+  `ALLOW_DRIVER_PIP_INSTALL` on, the `pip install` the sandbox runs before the driver
+  child, with its own 60-second timeout, on every attempt while a package with a
+  `requirements.txt` has no `_deps/` directory (no budget counts the install, L1 and L2
+  included). The guarantee for an L3 pin: its claim outlives the drive when every
+  attempt runs to its timeout as long as the drive's time outside the sum stays under N
+  seconds (the allowance) plus the rounding slack; the slack is a multiple of 0.2
+  seconds and at least 0.2 seconds at any whole-second timeout, and at the default
+  timeout at least 0.4 seconds, first at R of 129 and every 150 after. A larger overhead
+  lets a second pass claim the pin before its logout ends (a pinned known limit).
+  Nothing caps the budget, because nothing caps a pin's route count: a pin is held for
+  at most one minute more than the larger of its sum plus N seconds and the
+  three-action sum, and a holder that dies mid-drive leaves it unclaimable for no
+  longer than that (#1482). \
   Enforced in: `services/execution/app/services/wiring_claim.py` (`claim_budget`, `l3_pin_claim_budget`, `WiringRowClaims`); `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`) \
-  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_claim_budget_covers_one_row_worst_case_drive`, `test_claim_budget_scales_with_the_driver_timeout`, `test_the_one_row_budget_is_unchanged_for_l1_and_l2`, `test_l3_pin_claim_budget_is_r_plus_two_actions_rounded_up`, `test_l3_pin_claim_budget_outlives_every_drive_and_by_at_most_a_minute`, `test_an_l3_pins_claim_is_still_held_when_its_last_driver_action_finishes`, `test_a_raised_driver_timeout_still_keeps_an_l3_pins_claim_through_its_drive`, `test_l1_and_l2_rows_still_claim_with_the_one_row_budget`, `test_a_per_call_budget_sets_only_that_claims_stamp`, `test_a_sized_l3_claim_still_expires_at_its_stamp`)
+  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_claim_budget_covers_one_row_worst_case_drive`, `test_claim_budget_scales_with_the_driver_timeout`, `test_the_one_row_budget_is_unchanged_for_l1_and_l2`, `test_l3_pin_claim_budget_is_r_plus_two_actions_rounded_up`, `test_l3_pin_claim_budget_outlives_every_drive_and_by_at_most_a_minute`, `test_an_l3_pins_claim_is_still_held_when_its_last_driver_action_finishes`, `test_a_raised_driver_timeout_still_keeps_an_l3_pins_claim_through_its_drive`, `test_l1_and_l2_rows_still_claim_with_the_one_row_budget`, `test_a_per_call_budget_sets_only_that_claims_stamp`, `test_a_sized_l3_claim_still_expires_at_its_stamp`, `test_the_smallest_l3_slack_at_the_default_timeout_is_four_tenths_of_a_second`, `test_an_l3_pins_claim_outlives_its_drive_with_overhead_just_under_the_allowance`, `test_known_limit_overhead_far_over_the_allowance_lets_a_rival_claim`)
 
 ## 5. API surface
 

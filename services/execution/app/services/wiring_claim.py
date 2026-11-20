@@ -62,6 +62,45 @@ logger = logging.getLogger(__name__)
 # op, and the per-switch logout. The default claim budget is sized for this many.
 ROW_DRIVER_ACTIONS = 3
 
+# Issue #1482: an ALLOWANCE, not a measured bound, added per driver action to an L3
+# pin's claim budget only, for the time each action spends outside its sandbox
+# timeouts and backoff sleeps: the two execution-run writes around it, the worker
+# thread hop, the sandbox's temp-file I/O, the child's fork and exec before the
+# subprocess timer starts, and the kill and reap after a timeout. That time grows with
+# the number of actions while the rounding slack does not, so a pin of many routes
+# needs it; one second per action is far above what those steps take on a healthy
+# host. L1 and L2 budgets do not include it.
+L3_ACTION_UNTIMED_OVERHEAD_ALLOWANCE_MS = 1000
+
+
+def _worst_case_ms(driver_actions: int, extra_ms_per_action: int = 0) -> int:
+    """The summed worst case of `driver_actions` actions, in whole milliseconds:
+    every attempt running to the sandbox timeout, every backoff sleep, plus
+    `extra_ms_per_action` per action."""
+    from app.services.nats_consumer import (
+        WIRING_DRIVER_ATTEMPTS,
+        WIRING_DRIVER_BACKOFF_FACTOR,
+        WIRING_DRIVER_INITIAL_DELAY,
+        WIRING_DRIVER_MAX_DELAY,
+    )
+
+    backoff_ms_per_action = 0
+    delay = WIRING_DRIVER_INITIAL_DELAY
+    for _ in range(max(0, WIRING_DRIVER_ATTEMPTS - 1)):
+        backoff_ms_per_action += round(min(delay, WIRING_DRIVER_MAX_DELAY) * 1000)
+        delay *= WIRING_DRIVER_BACKOFF_FACTOR
+
+    per_action_ms = (
+        WIRING_DRIVER_ATTEMPTS * max(1, settings.execution_timeout_seconds) * 1000
+        + backoff_ms_per_action
+        + extra_ms_per_action
+    )
+    return driver_actions * per_action_ms
+
+
+def _next_whole_minute_after(total_ms: int) -> timedelta:
+    return timedelta(minutes=total_ms // 60_000 + 1)
+
 
 def claim_budget(driver_actions: int = ROW_DRIVER_ACTIONS) -> timedelta:
     """How long a drive of `driver_actions` driver actions may take, in whole minutes.
@@ -70,8 +109,8 @@ def claim_budget(driver_actions: int = ROW_DRIVER_ACTIONS) -> timedelta:
     new setting, deliberately (issue #817):
 
       - `nats_consumer.WIRING_DRIVER_ATTEMPTS` (3) sandbox attempts per driver
-        action, each capped at `settings.execution_timeout_seconds` (30s) by
-        `driver_sandbox.execute_driver_method`.
+        action, each a driver child that `driver_sandbox.execute_driver_method`
+        stops at `settings.execution_timeout_seconds` (30s).
       - The in-line backoff between attempts:
         `WIRING_DRIVER_INITIAL_DELAY` (0.2s) then doubled by
         `WIRING_DRIVER_BACKOFF_FACTOR`, capped at `WIRING_DRIVER_MAX_DELAY`, for
@@ -81,13 +120,24 @@ def claim_budget(driver_actions: int = ROW_DRIVER_ACTIONS) -> timedelta:
     the next whole minute strictly after it. Rounding up is what keeps the expiry
     safely clear of a drive that is still running, and the whole-minute figure
     matches the health scheduler's flat five-minute CLAIM_WINDOW, the same idiom one
-    layer up. Strictly after (issue #1482): a bound that is already a whole number of
-    minutes, as 100 L3 actions at the default timeout are (9,060s), gets the next
-    minute, because a claim whose stamp equals the drive's end is reclaimable at that
-    instant (`unclaimed` is `claimed_until <= now`). The sum is exact, in whole
-    milliseconds, so no float error decides which minute that is. For one row (three
-    actions) at any whole-second timeout the bound is never a whole number of minutes
-    (it ends in .8 seconds), so this budget is the plain round-up it always was.
+    layer up. Strictly after (issue #1482): a sum that is already a whole number of
+    minutes gets the next minute, because a claim whose stamp equals the drive's end is
+    reclaimable at that instant (`unclaimed` is `claimed_until <= now`). The sum is
+    exact, in whole milliseconds, so no float error decides which minute that is. For
+    one row (three actions) at any whole-second timeout the sum is never a whole number
+    of minutes (it ends in .8 seconds), so this budget is the plain round-up it always
+    was.
+
+    Time outside the sum, which this budget does not count: each action's time
+    outside its sandbox timers (the execution-run writes, the worker thread hop, the
+    sandbox's temp-file I/O, the child's fork and exec, the kill and reap after a
+    timeout), covered only by the rounding's slack; and, with
+    `ALLOW_DRIVER_PIP_INSTALL` on, the `pip install` `execute_driver_method` runs
+    before the driver child, with its own 60s timeout, on every attempt while a
+    package that has a `requirements.txt` has no `_deps/` directory yet (an install
+    that fails or times out before pip writes that directory leaves none, so it runs
+    again on the next attempt), which makes that attempt's worst case 60s plus the
+    timeout.
 
     The default, `ROW_DRIVER_ACTIONS` (3), is one L1 or L2 row: the per-switch
     `login`, the row's own connect/disconnect or add/remove op, and the per-switch
@@ -100,26 +150,7 @@ def claim_budget(driver_actions: int = ROW_DRIVER_ACTIONS) -> timedelta:
     A deployment that raises `execution_timeout_seconds` gets a proportionally
     longer budget for free, which is the point of deriving it rather than pinning it.
     """
-    from app.services.nats_consumer import (
-        WIRING_DRIVER_ATTEMPTS,
-        WIRING_DRIVER_BACKOFF_FACTOR,
-        WIRING_DRIVER_INITIAL_DELAY,
-        WIRING_DRIVER_MAX_DELAY,
-    )
-
-    driver_ms = (
-        WIRING_DRIVER_ATTEMPTS * driver_actions * max(1, settings.execution_timeout_seconds) * 1000
-    )
-
-    backoff_ms_per_action = 0
-    delay = WIRING_DRIVER_INITIAL_DELAY
-    for _ in range(max(0, WIRING_DRIVER_ATTEMPTS - 1)):
-        backoff_ms_per_action += round(min(delay, WIRING_DRIVER_MAX_DELAY) * 1000)
-        delay *= WIRING_DRIVER_BACKOFF_FACTOR
-
-    total_ms = driver_ms + driver_actions * backoff_ms_per_action
-    whole_minutes = total_ms // 60_000 + 1  # the next whole minute strictly after
-    return timedelta(minutes=whole_minutes)
+    return _next_whole_minute_after(_worst_case_ms(driver_actions))
 
 
 def l3_pin_claim_budget(route_operations: int) -> timedelta:
@@ -130,19 +161,33 @@ def l3_pin_claim_budget(route_operations: int) -> timedelta:
     route operation (the residue removals and one call per route of the pin, or a
     reconcile's removals and additions), and the logout, `route_operations + 2`
     driver actions in all. The caller counts the exact sequence it is about to drive,
-    before it claims. The budget is never shorter than the one-row budget
+    before it claims.
+
+    The budget is N = `route_operations + 2` actions' worst case (`claim_budget`'s
+    sum) plus `L3_ACTION_UNTIMED_OVERHEAD_ALLOWANCE_MS` per action, rounded up to the
+    next whole minute strictly after, and never shorter than the one-row budget
     (`claim_budget()`), so a pin of zero or one route operation keeps the budget it
-    always had (5 minutes at the defaults) and only a pin of two or more gets longer.
+    always had (5 minutes at the defaults). The guarantee: the claim outlives the drive
+    as long as the time the drive spends outside its sandbox timers and backoff sleeps
+    stays under N times the allowance plus the rounding slack (at least 0.4s at the
+    default timeout, first at 129 route operations; at least 0.2s at any whole-second
+    timeout), that is, under one second per action on average plus that slack. The
+    `pip install` named in `claim_budget` is outside it.
 
     No cap, deliberately: a cap below the worst-case drive would let a second pass
     claim the pin while this one is still inside the driver, which is the double
     drive the claim exists to prevent. So a claim lasts at most one minute more than
-    the worst case of `route_operations + 2` actions or of 3 actions, whichever is
-    longer, and nothing in execution bounds a pin's route count, so nothing bounds the
-    longest claim either (a pin of 50,000 routes: about 52 days at the defaults). A
-    holder that dies mid-drive leaves the pin unclaimable for at most that long.
+    N actions' worst case plus N seconds, or the one-row budget if that is longer,
+    and nothing in execution bounds a pin's route count, so nothing bounds the longest
+    claim either (a pin of 50,000 routes: 76,337 minutes, about 53 days, at the
+    defaults). A holder that dies mid-drive leaves the pin unclaimable for at most that
+    long.
     """
-    return claim_budget(max(ROW_DRIVER_ACTIONS, route_operations + 2))
+    driver_actions = route_operations + 2
+    sized = _next_whole_minute_after(
+        _worst_case_ms(driver_actions, L3_ACTION_UNTIMED_OVERHEAD_ALLOWANCE_MS)
+    )
+    return max(sized, claim_budget())
 
 
 def unclaimed(model, now: datetime):
@@ -230,7 +275,9 @@ class WiringRowClaims:
         `budget`, when given, replaces this pass's `self.budget` for this one claim:
         the stamp written is now plus `budget`. Only the L3 apply passes it, sized
         by `l3_pin_claim_budget` from the pin's drive sequence (issue #1482); the L1
-        and L2 applies claim with `self.budget`.
+        and L2 applies claim with `self.budget`. A row this pass already holds is
+        answered True without a write, so a later, larger `budget` for it is not
+        applied: its stamp stays the one the first claim wrote.
         """
         if row_id is None:
             return True

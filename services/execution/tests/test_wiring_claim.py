@@ -11,8 +11,11 @@ Covered here, at all three layers against in-memory SQLite:
 
   - the claim budget's derivation from the existing driver-timeout values, and an
     L3 pin's claim sized for its whole drive (issue #1482): on a virtual clock, every
-    driver action at its worst case, the claim is still held when the logout ends,
-    for 0 to 200 route operations, and a sized claim still expires at its stamp,
+    driver action at its worst case, the claim is still held when the logout ends
+    (sampled at 0, 1, 2, 10, and 200 route operations through the retry pass and a
+    provision of 4 through the apply; with 999 ms of overhead per action, at every
+    count from 0 to 300), a far larger overhead is a pinned known limit, and a sized
+    claim still expires at its stamp,
   - a claimed row is invisible to the other channel's per-tick select, and an
     expired claim is reclaimable,
   - the claim compare-and-swap itself: a second claimant loses, a row that is no
@@ -38,6 +41,7 @@ tasks against a live Postgres.
 import uuid
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -71,6 +75,7 @@ from app.services.route_service import (
     release_route_membership,
 )
 from app.services.wiring_claim import (
+    L3_ACTION_UNTIMED_OVERHEAD_ALLOWANCE_MS,
     ROW_DRIVER_ACTIONS,
     WiringRowClaims,
     claim_budget,
@@ -243,7 +248,8 @@ def test_claim_budget_scales_with_the_driver_timeout():
     """A deployment that raises the driver timeout gets a longer budget for free: the
     point of deriving it from execution_timeout_seconds instead of pinning a knob."""
     with patch.object(settings, "execution_timeout_seconds", 120):
-        # 3 attempts x 3 actions x 120s = 1080s, plus 5.4s of backoff, rounded up.
+        # 3 attempts x 3 actions x 120s = 1080s, plus 3 x 0.6s = 1.8s of backoff,
+        # rounded up.
         assert claim_budget() == timedelta(minutes=19)
     with patch.object(settings, "execution_timeout_seconds", 1):
         # Never degenerate: the floor is one whole minute.
@@ -281,34 +287,50 @@ def test_the_one_row_budget_is_unchanged_for_l1_and_l2():
     with patch.object(settings, "execution_timeout_seconds", 120):
         assert claim_budget() == timedelta(minutes=19)
         assert WiringRowClaims().budget == timedelta(minutes=19)
+    slacks = []
     for timeout in range(1, 3601):
         with patch.object(settings, "execution_timeout_seconds", timeout):
             before = -(-(3 * _worst_case_action_ms(timeout)) // 60_000)  # ceil
             assert claim_budget() == timedelta(minutes=before), timeout
+            slacks.append(before * 60_000 - 3 * _worst_case_action_ms(timeout))
+    # The slack WIRE-CLAIM-3 states for one row: never under 1.2s.
+    assert min(slacks) == 1200
+
+
+# The per-action allowance for time outside the sandbox timers, added to an L3 pin's
+# budget only (issue #1482); a literal here, so a change to the constant is seen.
+ALLOWANCE_MS = 1000
 
 
 @pytest.mark.parametrize(
     ("route_operations", "timeout", "minutes"),
     [
-        # (R + 2) x 90.6s at the default timeout, never under the 3-action 5 minutes.
-        (0, 30, 5),  # login, logout: 181.2s, held at the one-row 5 minutes
-        (1, 30, 5),  # 271.8s, exactly the old budget's case
-        (2, 30, 7),  # 362.4s, the issue's first overrun of 300s
-        (3, 30, 8),  # 453.0s
-        (10, 30, 19),  # 1087.2s, the issue's second example
-        # 100 actions are 9,060s, exactly 151 minutes: a stamp at the drive's end would
-        # be reclaimable at that instant, so the budget is the minute after.
-        (98, 30, 152),
-        (50_000, 30, 75_504),  # 4,530,181.2s: nothing caps a pin's route count
-        # The same arithmetic at a raised timeout: (R + 2) x 360.6s.
+        # (R + 2) x (90.6s + the 1s allowance) at the default timeout, never under the
+        # 3-action 5 minutes.
+        (0, 30, 5),  # login, logout: 183.2s, held at the one-row 5 minutes
+        (1, 30, 5),  # 274.8s
+        (2, 30, 7),  # 366.4s, the issue's first overrun of 300s
+        (3, 30, 8),  # 458.0s
+        (10, 30, 19),  # 1099.2s, the issue's second example
+        (47, 30, 75),  # 4488.4s
+        # 131 actions are 11,999.6s: the smallest slack at this timeout, 0.4s.
+        (129, 30, 200),
+        # 150 actions are 13,740s, exactly 229 minutes: a stamp at the drive's end
+        # would be reclaimable at that instant, so the budget is the minute after.
+        (148, 30, 230),
+        (200, 30, 309),  # 18,503.2s
+        (50_000, 30, 76_337),  # 4,580,183.2s, about 53 days: nothing caps a route count
+        # The same arithmetic at a raised timeout: (R + 2) x 361.6s.
         (0, 120, 19),
-        (2, 120, 25),  # 1442.4s
-        (10, 120, 73),  # 4327.2s
+        (2, 120, 25),  # 1446.4s
+        (10, 120, 73),  # 4339.2s
     ],
 )
 def test_l3_pin_claim_budget_is_r_plus_two_actions_rounded_up(route_operations, timeout, minutes):
     """An L3 pin's one claim covers the login, every route operation, and the logout:
-    (R + 2) worst-case actions, rounded up to the next whole minute (issue #1482)."""
+    (R + 2) worst-case actions plus the per-action allowance, rounded up to the next
+    whole minute, never under the one-row budget (issue #1482)."""
+    assert L3_ACTION_UNTIMED_OVERHEAD_ALLOWANCE_MS == ALLOWANCE_MS
     with patch.object(settings, "execution_timeout_seconds", timeout):
         assert l3_pin_claim_budget(route_operations) == timedelta(minutes=minutes)
 
@@ -317,18 +339,32 @@ def test_l3_pin_claim_budget_is_r_plus_two_actions_rounded_up(route_operations, 
 def test_l3_pin_claim_budget_outlives_every_drive_and_by_at_most_a_minute(timeout):
     """The invariant, enumerated: for every route-operation count R from 0 to 300 and
     a few far larger ones, the budget is strictly longer than the worst case of the
-    whole drive (R + 2 actions), never under the one-row budget, and at most one
-    minute longer than the worst case of R + 2 actions or of 3, whichever is longer:
-    the bound on how long a dead holder can keep a pin."""
+    whole drive (R + 2 actions) plus the allowance for each action, never under the
+    one-row budget, and at most one minute longer than that sum or the one-row worst
+    case, whichever is longer: the bound on how long a dead holder can keep a pin."""
     per_action = _worst_case_action_ms(timeout)
     with patch.object(settings, "execution_timeout_seconds", timeout):
         one_row = claim_budget() // timedelta(milliseconds=1)
         for route_operations in [*range(301), 1_000, 10_000, 50_000]:
             budget = l3_pin_claim_budget(route_operations) // timedelta(milliseconds=1)
-            drive = (route_operations + 2) * per_action
+            drive = (route_operations + 2) * (per_action + ALLOWANCE_MS)
             assert budget > drive, route_operations
             assert budget >= one_row, route_operations
             assert budget <= max(drive, 3 * per_action) + 60_000, route_operations
+
+
+def test_the_smallest_l3_slack_at_the_default_timeout_is_four_tenths_of_a_second():
+    """The rounding slack left over the drive plus the allowance, at the default
+    timeout, over every R up to 30,000: never under 0.4s, reached first at R = 129
+    and then every 150 route operations, as WIRE-CLAIM-3 states."""
+    per_action = _worst_case_action_ms(30) + ALLOWANCE_MS
+    slack = {
+        r: l3_pin_claim_budget(r) // timedelta(milliseconds=1) - (r + 2) * per_action
+        for r in range(30_001)
+    }
+    smallest = min(slack.values())
+    assert smallest == 400
+    assert [r for r, ms in slack.items() if ms == smallest][:3] == [129, 279, 429]
 
 
 # --- A claimed row is invisible to the other channel's per-tick select --------
@@ -1434,7 +1470,10 @@ async def test_l2_success_flip_cas_loser_with_attached_row_returns_the_winner(ca
 # every sandbox attempt advances it by the full driver timeout, and every in-line
 # backoff sleep advances it by its delay. So a drive takes its exact worst case,
 # (R + 2) x 90.6s at the defaults, in no wall-clock time, and the tests hold pinned
-# to one core with no timing bound at all.
+# to one core with no timing bound at all. The switch and template reads and the
+# driver load before the claim take virtual time too, so a claim taken before them
+# shows in its stamp, and a test can add a fixed overhead to every driver action
+# (time outside the sandbox timers, which the per-action allowance covers).
 
 
 class _VirtualClock:
@@ -1474,10 +1513,20 @@ def _virtual_clock_patches(clock: _VirtualClock, stack: ExitStack) -> None:
     stack.enter_context(patch("app.services.nats_consumer.asyncio", _AsyncioWithVirtualSleep()))
 
 
-async def _drive_l3_worst_case(row_id, holder, *, provision, routes, through_retry=False):
+# Virtual seconds the reads before the claim take: the switch and the template reads,
+# then the driver load (a package download has a 30s timeout).
+DEVICE_READ_S = 10
+TEMPLATE_READ_S = 10
+DRIVER_LOAD_S = 30
+
+
+async def _drive_l3_worst_case(
+    row_id, holder, *, provision, routes, through_retry=False, overhead_ms=0, record_runs=True
+):
     """Drive one L3 pin with `holder`'s claim, every driver action taking its worst
-    case: three attempts, each running to the driver
-    timeout, with both backoff sleeps between them. The login succeeds on its third
+    case: three attempts, each running to the driver timeout, with both backoff
+    sleeps between them, plus `overhead_ms` of virtual time when its execution run is
+    created (time outside the sandbox timers). The login succeeds on its third
     attempt so the route operations run; every route operation and the logout fail
     all three. When the logout's run is recorded (the drive's last driver action has
     finished), a second retry pass tries to claim the pin at that instant.
@@ -1485,9 +1534,13 @@ async def _drive_l3_worst_case(row_id, holder, *, provision, routes, through_ret
     `through_retry` drives a removal the way the retry channels do, through
     `_reattempt_l3_rows` on the loaded FAILED row (which drives the row's own
     `routes`); otherwise `_apply_l3_adjacency` is called directly with `routes`.
+    `record_runs` False stands in a bare object for each execution run instead of
+    writing it, so the sweep over every route count stays fast; the claim and ledger
+    writes are real either way.
 
-    Returns what was observed: the claim instant, the virtual time the logout
-    finished, whether the rival's claim succeeded, and the driver calls made."""
+    Returns what was observed: the virtual time the driver load finished, the first
+    driver call, the logout finished, whether the rival's claim succeeded, and the
+    driver calls made."""
     import httpx
     from app.services import execution_service
     from app.services.nats_consumer import (
@@ -1511,10 +1564,24 @@ async def _drive_l3_worst_case(row_id, holder, *, provision, routes, through_ret
             return SUCCESS
         return FAILURE
 
+    def _after(seconds, value, key=None):
+        clock.advance(seconds)
+        if key is not None:
+            observed[key] = clock.now
+        return value
+
+    real_create = execution_service.create_execution_run
+
+    async def _create(*args, **kwargs):
+        clock.advance(overhead_ms / 1000)
+        if not record_runs:
+            return SimpleNamespace(action=args[4])
+        return await real_create(*args, **kwargs)
+
     real_update = execution_service.update_execution_run
 
     async def _update(db, run, status, **kwargs):
-        result = await real_update(db, run, status, **kwargs)
+        result = await real_update(db, run, status, **kwargs) if record_runs else run
         if run.action == "logout":
             observed["logout_finished_at"] = clock.now
             rival = WiringRowClaims()
@@ -1526,22 +1593,36 @@ async def _drive_l3_worst_case(row_id, holder, *, provision, routes, through_ret
     with ExitStack() as stack:
         _virtual_clock_patches(clock, stack)
         stack.enter_context(
-            patch("app.services.nats_consumer._fetch_device", AsyncMock(return_value=L3_SWITCH))
+            patch(
+                "app.services.nats_consumer._fetch_device",
+                AsyncMock(side_effect=lambda *a, **k: _after(DEVICE_READ_S, L3_SWITCH)),
+            )
         )
         stack.enter_context(
             patch(
                 "app.services.nats_consumer._fetch_template",
-                AsyncMock(return_value={"id": "t", "sections": []}),
+                AsyncMock(
+                    side_effect=lambda *a, **k: _after(TEMPLATE_READ_S, {"id": "t", "sections": []})
+                ),
             )
         )
         stack.enter_context(
-            patch("app.services.driver_loader.load_driver", AsyncMock(return_value="/tmp/d"))
+            patch(
+                "app.services.driver_loader.load_driver",
+                AsyncMock(side_effect=lambda *a, **k: _after(DRIVER_LOAD_S, "/tmp/d", "loaded_at")),
+            )
         )
         stack.enter_context(
             patch("app.services.driver_loader.get_driver_metadata", AsyncMock(return_value={}))
         )
+        # The sandbox seam itself, not the worker thread behind it: these drives make up
+        # to 906 driver calls each, and the thread hop is time outside the sandbox
+        # timers, which `overhead_ms` stands for on the virtual clock.
         stack.enter_context(
-            patch("app.services.driver_sandbox.execute_driver_method", side_effect=_driver)
+            patch("app.services.nats_consumer._run_sandbox", AsyncMock(side_effect=_driver))
+        )
+        stack.enter_context(
+            patch("app.services.execution_service.create_execution_run", side_effect=_create)
         )
         stack.enter_context(
             patch("app.services.execution_service.update_execution_run", side_effect=_update)
@@ -1611,14 +1692,19 @@ async def test_an_l3_pins_claim_is_still_held_when_its_last_driver_action_finish
 
     actions = route_operations + 2
     assert len(observed["calls"]) == 3 * actions, "every action made all three attempts"
-    drive = observed["logout_finished_at"] - observed["clock_started"]
+    drive = observed["logout_finished_at"] - observed["loaded_at"]
     assert drive == timedelta(milliseconds=actions * _worst_case_action_ms(30))
     assert observed["rival_claimed"] is False, "a second pass claimed the pin mid-drive"
-    # The claim is taken before the login, so nothing ran on the clock before it.
-    assert observed["first_call_at"] == observed["clock_started"]
+    # The claim is taken after the driver load and immediately before the login: the
+    # reads and the load took virtual time, and none passed between the load and the
+    # first driver call.
+    assert observed["loaded_at"] == observed["clock_started"] + timedelta(
+        seconds=DEVICE_READ_S + TEMPLATE_READ_S + DRIVER_LOAD_S
+    )
+    assert observed["first_call_at"] == observed["loaded_at"]
     stamp = holder.held[row_id]
     assert stamp > observed["logout_finished_at"]
-    assert stamp == observed["clock_started"] + l3_pin_claim_budget(route_operations)
+    assert stamp == observed["loaded_at"] + l3_pin_claim_budget(route_operations)
     assert await _claimed_until(RouteAssignment, row_id) is None
     if through_retry:
         # A removal with no route calls succeeds; one whose route calls all failed
@@ -1637,12 +1723,12 @@ async def test_a_raised_driver_timeout_still_keeps_an_l3_pins_claim_through_its_
             row_id, holder, provision=False, routes=_routes(5), through_retry=False
         )
         expected_budget = l3_pin_claim_budget(5)
-    assert expected_budget == timedelta(minutes=43)  # 7 x 360.6s = 2524.2s, rounded up
-    drive = observed["logout_finished_at"] - observed["clock_started"]
+    assert expected_budget == timedelta(minutes=43)  # 7 x 361.6s = 2531.2s, rounded up
+    drive = observed["logout_finished_at"] - observed["loaded_at"]
     assert drive == timedelta(milliseconds=7 * _worst_case_action_ms(120))
     assert observed["rival_claimed"] is False, "a second pass claimed the pin mid-drive"
     assert holder.held[row_id] > observed["logout_finished_at"]
-    assert holder.held[row_id] == observed["clock_started"] + expected_budget
+    assert holder.held[row_id] == observed["loaded_at"] + expected_budget
 
 
 @pytest.mark.parametrize("layer", ["l1", "l2"])
@@ -1683,7 +1769,7 @@ async def test_a_sized_l3_claim_still_expires_at_its_stamp(db):
     dead = WiringRowClaims()
     clock = _VirtualClock()
     budget = l3_pin_claim_budget(50)
-    assert budget == timedelta(minutes=79)  # 52 x 90.6s = 4711.2s, rounded up
+    assert budget == timedelta(minutes=80)  # 52 x 91.6s = 4763.2s, rounded up
     with ExitStack() as stack:
         _virtual_clock_patches(clock, stack)
         assert await dead.claim(db, RouteAssignment, row_id, budget=budget)
@@ -1694,3 +1780,54 @@ async def test_a_sized_l3_claim_still_expires_at_its_stamp(db):
         assert clock.now == dead.held[row_id]
         async with TestSessionLocal() as s:
             assert await WiringRowClaims().claim(s, RouteAssignment, row_id) is True
+
+
+@pytest.mark.parametrize("route_operations", range(301))
+async def test_an_l3_pins_claim_outlives_its_drive_with_overhead_just_under_the_allowance(
+    route_operations,
+):
+    """The guarantee the per-action allowance buys, driven for every R from 0 to 300:
+    each driver action spends 999 ms outside its sandbox timers on top of its worst
+    case, and the second pass that tries to claim the pin when the logout ends still
+    loses (issue #1482). Without the allowance R = 47 already loses its claim at 13 ms
+    per action (0.6s of rounding slack over 49 actions)."""
+    row_id = await _seed_l3_failed(intended="RELEASED", routes=_routes(route_operations))
+    holder = WiringRowClaims()
+
+    observed = await _drive_l3_worst_case(
+        row_id,
+        holder,
+        provision=False,
+        routes=_routes(route_operations),
+        through_retry=True,
+        overhead_ms=ALLOWANCE_MS - 1,
+        record_runs=False,
+    )
+
+    actions = route_operations + 2
+    drive = observed["logout_finished_at"] - observed["loaded_at"]
+    assert drive == timedelta(milliseconds=actions * (_worst_case_action_ms(30) + 999))
+    assert observed["rival_claimed"] is False, "a second pass claimed the pin mid-drive"
+    assert holder.held[row_id] > observed["logout_finished_at"]
+
+
+async def test_known_limit_overhead_far_over_the_allowance_lets_a_rival_claim():
+    """KNOWN LIMIT, pinned so it stays visible: the allowance is an allowance, not a
+    bound. When each of the 49 actions of a 47-route pin spends 5s outside its sandbox
+    timers, 4s over the allowance, the drive overruns the stamp by far more than the
+    rounding slack (11.6s) and a second pass claims the pin before the logout ends.
+    This is what shows the allowance, and nothing else, is what holds the claim."""
+    row_id = await _seed_l3_failed(intended="RELEASED", routes=_routes(47))
+    holder = WiringRowClaims()
+
+    observed = await _drive_l3_worst_case(
+        row_id,
+        holder,
+        provision=False,
+        routes=_routes(47),
+        through_retry=True,
+        overhead_ms=5000,
+    )
+
+    assert holder.held[row_id] < observed["logout_finished_at"]
+    assert observed["rival_claimed"] is True
