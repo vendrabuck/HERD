@@ -445,9 +445,10 @@ def _answer(sent: list[dict]) -> tuple[list[int], bytes]:
 
 
 async def test_known_limit_a_streaming_route_that_never_reads_its_body_fails_behind_the_logger():
-    """Documents a known limit (OPS-VALID-9, limits by decision; a follow-up issue
-    tracks it). No HERD route is affected today: the one streaming route reads its
-    JSON body before it streams.
+    """Documents a known limit (OPS-VALID-9; issue #1483 kept it, by decision, and
+    guards against it instead). No HERD route is affected: the one streaming route
+    takes its JSON body as a parameter, and `tests/unit/test_request_body_limit_wiring.py`
+    fails on a streaming route that does not, unless it is listed there.
 
     Behind the request logger (a BaseHTTPMiddleware, as in every HERD service), the
     disconnect listener of a streaming response makes the first read of a body whose
@@ -456,8 +457,7 @@ async def test_known_limit_a_streaming_route_that_never_reads_its_body_fails_beh
     ends with the response never started, the logger has nothing to return, and
     Starlette raises `RuntimeError: No response returned.`: the client gets a 500 (a
     server that cannot send one resets the connection). What is pinned: the failure
-    is a server error, never a served response, and nothing of the body is read. A
-    streaming route must read or drain its body before it streams (CONVENTIONS)."""
+    is a server error, never a served response, and nothing of the body is read."""
     script = _Script(_chunks(256))
     sent: list[dict] = []
 

@@ -1,6 +1,7 @@
 """Every service app bounds its request bodies, with its setting; every route whose
-body may hold more declares it; and every body one HERD service sends another fits
-the receiving route (issue #1466).
+body may hold more declares it; every body one HERD service sends another fits the
+receiving route (issue #1466); and every streaming route reads its body before it
+streams, or is listed (issue #1483).
 
 `herd_common.validation_errors.install_validation_errors` installs `LimitRequestBody`
 just outside `RefuseLoneSurrogates`; config installs its standalone copy's. The AST
@@ -41,7 +42,36 @@ and the upload settings set to values no default has. For each built app:
   `${MAX_REQUEST_BODY_BYTES:-<default>}` with the shared default (the Settings-based
   services are also held by `test_compose_settings_wiring.py`; config is not, since
   it has no Settings model);
-- the area specification names every marked route.
+- the area specification names every marked route;
+- every route that answers with a streaming response takes its body as a parameter,
+  or is listed in `STREAMING_WITHOUT_BODY` with a reason (issue #1483, below).
+
+Streaming routes. A streaming response (Starlette's `StreamingResponse`, or
+sse-starlette's `EventSourceResponse`) runs a disconnect listener beside its stream,
+and when the route never read its body that listener makes the first read; behind the
+request logger a body over the limit then ends in a 500 or a stream cut short
+(OPS-VALID-9). The invariant: every streaming route either has FastAPI read its body
+before the route runs (`body_field` is set: a JSON or form body parameter), or is
+listed by decision. `streaming_reasons` decides that a built route streams in three
+ways, each a class whose MRO holds a class named `StreamingResponse` or
+`EventSourceResponse` (so a subclass counts):
+
+- its `response_class`, declared on the route or inherited from its router or the app;
+- its endpoint's return annotation, also inside a union, `Optional`, or `Annotated`;
+- a `return` in the endpoint's own body (not in a function, lambda, or class defined
+  inside it) of a call to such a class, directly or through a local name assigned once
+  in the endpoint; the callee is resolved in the endpoint's module (a name, or an
+  attribute of one), and a callee the module does not hold counts when its own name
+  is one of the two.
+
+The scan does not see: a streaming response built in another function and returned
+(`return make_stream()`), returned from a dependency, raised, or sent through the ASGI
+`send`; a local name assigned more than once; a response class with a disconnect
+listener of another name that does not derive from either; an endpoint whose source
+`inspect` cannot read; and a route FastAPI does not enumerate (see Limits). A route
+that reads its body by hand (`await request.body()`) before it streams has no body
+parameter, so it is flagged and must be listed. Fixture sources in this module prove
+each way both directions.
 
 The forwarding table. `outbound_body_calls` scans every module under a service's
 `app/` and `herd_common`, and finds each call that sends a body:
@@ -99,10 +129,15 @@ to be marked, not checked to be the URL the code calls.
 from __future__ import annotations
 
 import ast
+import builtins
+import importlib.util
+import inspect
 import json
 import os
 import subprocess
 import sys
+import textwrap
+import typing
 from functools import lru_cache
 from pathlib import Path
 
@@ -153,6 +188,11 @@ FORWARD_ROUTES = {
 # A route that takes a form and needs no larger limit (a small form, not an upload):
 # (service, method, path) to the reason. None today.
 FORM_EXEMPT: dict[tuple[str, str, str], str] = {}
+
+# A route that answers with a streaming response and has no body parameter, so the
+# response's disconnect listener, not FastAPI, makes the first read of its body (issue
+# #1483, OPS-VALID-9): (service, method, path) to the reason it is allowed. None today.
+STREAMING_WITHOUT_BODY: dict[tuple[str, str, str], str] = {}
 
 _STANDARD = [
     "RequestLoggingMiddleware",
@@ -403,14 +443,25 @@ _ENV = {
     "HERD_CONFIG_FILE": "/nonexistent/herd-config.json",
 }
 
+_GUARD_ENV = "HERD_BODY_LIMIT_GUARD"
+
 _INTROSPECT = """
 import importlib
+import importlib.util
 import json
+import os
 
 from fastapi import params
 from fastapi.routing import iter_route_contexts
 
 from app.main import app
+
+# This module, loaded by path, for `streaming_reasons` (one implementation for the
+# built apps and the fixtures).
+guard_path = os.environ["HERD_BODY_LIMIT_GUARD"]
+spec = importlib.util.spec_from_file_location("body_limit_guard", guard_path)
+guard = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(guard)
 
 middleware = [(m.cls.__module__, m.cls.__qualname__, m.kwargs) for m in app.user_middleware]
 limit_module = next(module for module, name, _ in middleware if name == "LimitRequestBody")
@@ -425,6 +476,8 @@ for route in iter_route_contexts(app.routes):
             "path": route.path,
             "form": body_field is not None and isinstance(body_field.field_info, params.Form),
             "extra_bytes": None if mark is None else mark(),
+            "body": body_field is not None,
+            "streaming": guard.streaming_reasons(route),
         }
     )
 print(
@@ -456,6 +509,7 @@ def expected_module(service: str) -> str:
 def built_app(service: str) -> dict:
     env = dict(os.environ)
     env.update(_ENV)
+    env[_GUARD_ENV] = str(Path(__file__).resolve())
     env.pop("VIRTUAL_ENV", None)
     result = subprocess.run(
         [sys.executable, "-c", _INTROSPECT],
@@ -547,6 +601,359 @@ def test_the_specification_names_every_marked_route():
     text = SPEC.read_text(encoding="utf-8")
     for service, method, path in [*UPLOAD_ROUTES, *FORWARD_ROUTES]:
         assert f"`{method} {path}`" in text, (service, method, path)
+
+
+# -- Streaming routes (issue #1483) -------------------------------------------------
+
+# The response classes whose `__call__` reads the request (a disconnect listener beside
+# the stream): Starlette's `StreamingResponse`, and sse-starlette's
+# `EventSourceResponse` (not installed in HERD, so known by name). A class is one of
+# them when any class in its MRO has one of these names, so a subclass counts.
+STREAMING_CLASS_NAMES = {"StreamingResponse", "EventSourceResponse"}
+
+
+def _is_streaming_class(value: object) -> bool:
+    return inspect.isclass(value) and any(
+        base.__name__ in STREAMING_CLASS_NAMES for base in value.__mro__
+    )
+
+
+def _annotation_streams(annotation: object) -> bool:
+    """A class, or a union, `Optional`, or `Annotated` with a streaming member."""
+    if _is_streaming_class(annotation):
+        return True
+    return any(_annotation_streams(arg) for arg in typing.get_args(annotation))
+
+
+def _return_annotation(endpoint: object) -> object:
+    try:
+        return typing.get_type_hints(endpoint, include_extras=True).get("return")
+    except Exception:  # an unresolvable name: fall back to the raw annotation
+        return getattr(endpoint, "__annotations__", {}).get("return")
+
+
+def _resolve(node: ast.AST, namespace: dict) -> object:
+    """The object a callee names in the endpoint's module, or None."""
+    if isinstance(node, ast.Name):
+        return namespace.get(node.id, getattr(builtins, node.id, None))
+    if isinstance(node, ast.Attribute):
+        owner = _resolve(node.value, namespace)
+        return None if owner is None else getattr(owner, node.attr, None)
+    return None
+
+
+def _own_statements(function: ast.AST) -> list[ast.AST]:
+    """Every node of the function's own body, not of a function, lambda, or class
+    defined inside it."""
+    found: list[ast.AST] = []
+    stack = list(ast.iter_child_nodes(function))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        found.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    return found
+
+
+def _returned_streaming_calls(endpoint: object) -> bool:
+    """Whether the endpoint's own body returns a call to a streaming class, directly
+    (`return StreamingResponse(...)`) or through a local name assigned once
+    (`response = StreamingResponse(...)`, then `return response`)."""
+    function = inspect.unwrap(endpoint)
+    try:
+        source = textwrap.dedent(inspect.getsource(function))
+    except (OSError, TypeError):
+        return False
+    tree = ast.parse(source)
+    definition = next(
+        (n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None
+    )
+    if definition is None:
+        return False
+    nodes = _own_statements(definition)
+    assigned: dict[str, list[ast.expr]] = {}
+    for node in nodes:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assigned.setdefault(target.id, []).append(node.value)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and isinstance(node.target, ast.Name):
+            assigned.setdefault(node.target.id, []).append(node.value or node)
+    namespace = getattr(function, "__globals__", {})
+    for node in nodes:
+        if not isinstance(node, ast.Return) or node.value is None:
+            continue
+        value = node.value
+        if isinstance(value, ast.Name) and len(assigned.get(value.id, [])) == 1:
+            value = assigned[value.id][0]
+        if not isinstance(value, ast.Call):
+            continue
+        resolved = _resolve(value.func, namespace)
+        if resolved is not None:
+            if _is_streaming_class(resolved):
+                return True
+            continue
+        if _callee(value) in STREAMING_CLASS_NAMES:  # a name the module does not hold
+            return True
+    return False
+
+
+def streaming_reasons(route: object) -> list[str]:
+    """Why a route answers with a streaming response, by what the scan sees: its
+    `response_class` (declared on the route, its router, or the app), its endpoint's
+    return annotation, and a returned call in the endpoint's own body. Empty when
+    none of the three shows one."""
+    reasons = []
+    response_class = getattr(route, "response_class", None)
+    response_class = getattr(response_class, "value", response_class)  # a DefaultPlaceholder
+    if _is_streaming_class(response_class):
+        reasons.append("response_class")
+    endpoint = getattr(route, "endpoint", None)
+    if endpoint is None:
+        return reasons
+    if _annotation_streams(_return_annotation(endpoint)):
+        reasons.append("return annotation")
+    if _returned_streaming_calls(endpoint):
+        reasons.append("returned call")
+    return reasons
+
+
+def streaming_without_body(routes: list[dict]) -> set[tuple[str, str]]:
+    """(method, path) of every streaming route that has no body parameter."""
+    return {
+        (method, r["path"])
+        for r in routes
+        if r["streaming"] and not r["body"]
+        for method in r["methods"]
+    }
+
+
+def streaming_problems(
+    service: str, routes: list[dict], table: dict[tuple[str, str, str], str]
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    """(unlisted, stale): the service's streaming routes with no body parameter that
+    `table` does not list, and the routes `table` lists for it that are not one."""
+    found = streaming_without_body(routes)
+    listed = {(m, p) for s, m, p in table if s == service}
+    return found - listed, listed - found
+
+
+@pytest.mark.parametrize("service", SERVICES)
+def test_every_streaming_route_reads_its_body_first_or_is_listed(service):
+    """A streaming route with no body parameter, given a body over the limit, fails
+    behind the request logger (a 500, or a stream cut short; OPS-VALID-9). Each one
+    must take its body as a parameter, so FastAPI reads it before the route runs, or
+    be listed in STREAMING_WITHOUT_BODY with a reason; a listed route that no longer
+    streams without a body fails too."""
+    unlisted, stale = streaming_problems(
+        service, built_app(service)["routes"], STREAMING_WITHOUT_BODY
+    )
+    assert unlisted == set(), f"{service}: streaming routes with no body parameter"
+    assert stale == set(), f"{service}: stale STREAMING_WITHOUT_BODY entries"
+
+
+def test_the_streaming_exemptions_name_only_existing_services_with_reasons():
+    assert {s for s, _, _ in STREAMING_WITHOUT_BODY} <= set(SERVICES)
+    assert all(reason.strip() for reason in STREAMING_WITHOUT_BODY.values())
+
+
+def test_the_scan_sees_the_one_streaming_route_herd_has():
+    """Not vacuous on the real code: the reservation assistant's stream is seen twice
+    over (its annotation and its returned call) and takes its body as a parameter."""
+    routes = built_app("ai-orchestrator")["routes"]
+    streaming = {
+        (m, r["path"]): (r["streaming"], r["body"])
+        for r in routes
+        if r["streaming"]
+        for m in r["methods"]
+    }
+    assert streaming == {
+        ("POST", "/reservations/{reservation_id}/assistant/stream"): (
+            ["return annotation", "returned call"],
+            True,
+        )
+    }
+
+
+# Fixture endpoints, each in a module of its own written to disk (the scan reads the
+# endpoint's source). BROKEN must be flagged; HONEST must not.
+_FIXTURE_HEAD = """
+from typing import Annotated, Optional
+
+from fastapi import APIRouter, Body, FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
+from starlette import responses
+
+
+class Ask(BaseModel):
+    text: str
+
+
+class Feed(StreamingResponse):
+    pass
+
+
+class EventSourceResponse(JSONResponse):
+    # sse-starlette's class, known by name: this stand-in is not a StreamingResponse.
+    pass
+
+
+def chunks():
+    yield b"abc"
+
+
+app = FastAPI()
+"""
+
+_BROKEN = {
+    "a_returned_call": """
+@app.post("/r")
+async def route():
+    return StreamingResponse(chunks())
+""",
+    "a_return_annotation": """
+@app.get("/r")
+async def route() -> StreamingResponse:
+    return make_it()
+
+
+def make_it():
+    return StreamingResponse(chunks())
+""",
+    "an_optional_return_annotation": """
+@app.get("/r", response_model=None)
+async def route() -> Optional[StreamingResponse]:
+    return None
+""",
+    "a_response_class": """
+@app.post("/r", response_class=StreamingResponse)
+async def route():
+    return chunks()
+""",
+    "a_router_default_response_class": """
+router = APIRouter(default_response_class=StreamingResponse)
+
+
+@router.post("/r")
+async def route():
+    return chunks()
+
+
+app.include_router(router)
+""",
+    "a_subclass": """
+@app.post("/r")
+async def route():
+    return Feed(chunks())
+""",
+    "a_module_attribute": """
+@app.post("/r")
+async def route():
+    return responses.StreamingResponse(chunks())
+""",
+    "an_event_source_response_by_name": """
+@app.post("/r")
+async def route():
+    return EventSourceResponse({})
+""",
+    "an_event_source_response_the_module_does_not_hold": """
+@app.post("/r")
+async def route():
+    from sse_starlette import sse  # never run: not installed, and not in the module
+
+    return sse.EventSourceResponse(chunks())
+""",
+    "an_assigned_response": """
+@app.post("/r")
+async def route(request: Request):
+    response = StreamingResponse(chunks())
+    response.headers["x-a"] = "b"
+    return response
+""",
+    "a_body_read_by_hand": """
+@app.post("/r")
+async def route(request: Request):
+    await request.body()
+    return StreamingResponse(chunks())
+""",
+}
+
+_HONEST = {
+    "a_body_parameter": """
+@app.post("/r")
+async def route(body: Ask) -> StreamingResponse:
+    return StreamingResponse(chunks())
+""",
+    "a_body_by_keyword": """
+@app.post("/r")
+async def route(payload: Annotated[dict, Body()]):
+    return StreamingResponse(chunks())
+""",
+    "json_with_no_body": """
+@app.post("/r")
+async def route():
+    return {"a": 1}
+""",
+    "a_json_response_with_no_body": """
+@app.post("/r")
+async def route() -> JSONResponse:
+    return JSONResponse({"a": 1})
+""",
+    "a_stream_only_in_a_nested_function": """
+@app.post("/r")
+async def route():
+    def later():
+        return StreamingResponse(chunks())
+
+    return {"a": 1}
+""",
+}
+
+
+def _fixture_routes(tmp_path: Path, name: str, source: str) -> list[dict]:
+    path = tmp_path / f"streaming_fixture_{name}.py"
+    path.write_text(_FIXTURE_HEAD + source, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    from fastapi.routing import iter_route_contexts
+
+    return [
+        {
+            "methods": sorted(route.methods or ()),
+            "path": route.path,
+            "body": getattr(route, "body_field", None) is not None,
+            "streaming": streaming_reasons(route),
+        }
+        for route in iter_route_contexts(module.app.routes)
+        if route.path == "/r"
+    ]
+
+
+@pytest.mark.parametrize("name", sorted(_BROKEN))
+def test_a_streaming_route_with_no_body_parameter_is_flagged(tmp_path, name):
+    routes = _fixture_routes(tmp_path, name, _BROKEN[name])
+    assert len(routes) == 1
+    assert len(streaming_without_body(routes)) == 1, routes
+
+
+@pytest.mark.parametrize("name", sorted(_HONEST))
+def test_an_honest_route_is_not_flagged(tmp_path, name):
+    routes = _fixture_routes(tmp_path, name, _HONEST[name])
+    assert len(routes) == 1
+    assert streaming_without_body(routes) == set(), routes
+
+
+def test_a_flagged_route_passes_only_while_it_is_listed():
+    flagged = [{"methods": ["POST"], "path": "/r", "body": False, "streaming": ["returned call"]}]
+    honest = [{**flagged[0], "body": True}]
+    entry = {("svc", "POST", "/r"): "an export whose client sends no body"}
+    assert streaming_problems("svc", flagged, {}) == ({("POST", "/r")}, set())
+    assert streaming_problems("svc", flagged, entry) == (set(), set())
+    assert streaming_problems("svc", honest, entry) == (set(), {("POST", "/r")})
+    assert streaming_problems("other", flagged, entry) == ({("POST", "/r")}, set())
 
 
 # -- The forwarding table ----------------------------------------------------------

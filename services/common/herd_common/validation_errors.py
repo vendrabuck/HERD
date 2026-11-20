@@ -116,16 +116,22 @@ outside the surrogate check. What it guarantees, exactly:
   work stay bounded, but the bytes still cross the network: this check does not bound
   bandwidth. One INFO log line names the limit and whether the body was declared or
   received over it; never any of its content.
-- It refuses when the body is read, so a route that never reads its body, an unknown
-  route, and a method not allowed answer as before (nothing of the body is read, so
-  nothing is buffered). One known limit: a route that STREAMS its response without
-  reading its body has the body read by the response's disconnect listener, and
-  behind the request logger a declared over-limit body then ends in a server error
-  instead of the stream (OPS-VALID-9; no HERD route does this, and a streaming route
-  must read or drain its body first). Every route with a body (JSON or a form) reads it before its
-  dependencies run, so the refusal comes before authentication, as the surrogate
-  check's does; and the surrogate check reads through this one, so a body over the
-  limit is refused before it is scanned, and the scan never holds more than the limit.
+- It refuses when the body is read. An unknown route, a method not allowed, and a
+  route that never reads its body and answers without streaming are unchanged
+  (nothing of the body is read, so nothing is buffered). A route that STREAMS its
+  answer (a `StreamingResponse`) without reading its body does not, a known limit
+  (OPS-VALID-9, issue #1483): the response's disconnect listener reads the body while
+  the stream runs, and behind the request logger, which holds the response's start, a
+  body whose `Content-Length` is over the limit ends in `RuntimeError: No response
+  returned.` (a 500, or a reset) instead of the stream, and a chunked one over it cuts
+  the stream short; nothing of the body reaches the route either way. So a streaming
+  route takes its body as a parameter, and
+  `tests/unit/test_request_body_limit_wiring.py` fails on one that does not unless it
+  is listed there by decision (none is). Every route with a body (JSON or a form)
+  reads it before its dependencies run, so the refusal comes before authentication,
+  as the surrogate check's does; and the surrogate check reads through this one, so a
+  body over the limit is refused before it is scanned, and the scan never holds more
+  than the limit.
 - Nothing is refused once the response has started, since the answer cannot change by
   then. Starlette's disconnect listener (a streaming response to a route that never
   read its body) can make the first read while the response is being started
