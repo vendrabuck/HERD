@@ -9,7 +9,10 @@ compare-and-swap immediately before each retried row's own driver call.
 
 Covered here, at all three layers against in-memory SQLite:
 
-  - the claim budget's derivation from the existing driver-timeout values,
+  - the claim budget's derivation from the existing driver-timeout values, and an
+    L3 pin's claim sized for its whole drive (issue #1482): on a virtual clock, every
+    driver action at its worst case, the claim is still held when the logout ends,
+    for 0 to 200 route operations, and a sized claim still expires at its stamp,
   - a claimed row is invisible to the other channel's per-tick select, and an
     expired claim is reclaimable,
   - the claim compare-and-swap itself: a second claimant loses, a row that is no
@@ -68,9 +71,11 @@ from app.services.route_service import (
     release_route_membership,
 )
 from app.services.wiring_claim import (
+    ROW_DRIVER_ACTIONS,
     WiringRowClaims,
     claim_budget,
     claimable_row_ids,
+    l3_pin_claim_budget,
     write_guard,
 )
 from app.services.wiring_retry_service import reattempt_reservation
@@ -187,12 +192,15 @@ async def _seed_l3_failed(
     attempts=0,
     claimed_until=None,
     device_id=None,
+    routes=None,
 ) -> uuid.UUID:
     async with TestSessionLocal() as db:
         row = RouteAssignment(
             reservation_id=RES_ID,
             device_id=device_id or SWITCH_ID,
-            routes=[{"destination": "10.0.0.0/24", "next_hop": "10.0.0.1"}],
+            routes=routes
+            if routes is not None
+            else [{"destination": "10.0.0.0/24", "next_hop": "10.0.0.1"}],
             status="FAILED",
             intended=intended,
             attempts=attempts,
@@ -240,6 +248,87 @@ def test_claim_budget_scales_with_the_driver_timeout():
     with patch.object(settings, "execution_timeout_seconds", 1):
         # Never degenerate: the floor is one whole minute.
         assert claim_budget() >= timedelta(minutes=1)
+
+
+def _worst_case_action_ms(timeout: int) -> int:
+    """One driver action's worst case in milliseconds, computed here rather than by
+    the code under test: three attempts each running to the timeout, plus the 0.2s
+    and 0.4s backoff sleeps between them."""
+    from app.services.nats_consumer import (
+        WIRING_DRIVER_ATTEMPTS,
+        WIRING_DRIVER_BACKOFF_FACTOR,
+        WIRING_DRIVER_INITIAL_DELAY,
+        WIRING_DRIVER_MAX_DELAY,
+    )
+
+    assert (
+        WIRING_DRIVER_ATTEMPTS,
+        WIRING_DRIVER_INITIAL_DELAY,
+        WIRING_DRIVER_BACKOFF_FACTOR,
+        WIRING_DRIVER_MAX_DELAY,
+    ) == (3, 0.2, 2.0, 2.0), "the literal arithmetic below assumes these constants"
+    return 3 * timeout * 1000 + 200 + 400
+
+
+def test_the_one_row_budget_is_unchanged_for_l1_and_l2():
+    """Issue #1482 must not move the L1 and L2 budget: the default is still three
+    actions (login, op, logout), 5 minutes at the default timeout and 19 at 120s,
+    and for every whole-second timeout up to an hour it is the plain round-up of
+    3 x (3 x timeout + 0.6s) it was before."""
+    assert ROW_DRIVER_ACTIONS == 3
+    assert claim_budget() == claim_budget(3) == timedelta(minutes=5)
+    assert WiringRowClaims().budget == timedelta(minutes=5)
+    with patch.object(settings, "execution_timeout_seconds", 120):
+        assert claim_budget() == timedelta(minutes=19)
+        assert WiringRowClaims().budget == timedelta(minutes=19)
+    for timeout in range(1, 3601):
+        with patch.object(settings, "execution_timeout_seconds", timeout):
+            before = -(-(3 * _worst_case_action_ms(timeout)) // 60_000)  # ceil
+            assert claim_budget() == timedelta(minutes=before), timeout
+
+
+@pytest.mark.parametrize(
+    ("route_operations", "timeout", "minutes"),
+    [
+        # (R + 2) x 90.6s at the default timeout, never under the 3-action 5 minutes.
+        (0, 30, 5),  # login, logout: 181.2s, held at the one-row 5 minutes
+        (1, 30, 5),  # 271.8s, exactly the old budget's case
+        (2, 30, 7),  # 362.4s, the issue's first overrun of 300s
+        (3, 30, 8),  # 453.0s
+        (10, 30, 19),  # 1087.2s, the issue's second example
+        # 100 actions are 9,060s, exactly 151 minutes: a stamp at the drive's end would
+        # be reclaimable at that instant, so the budget is the minute after.
+        (98, 30, 152),
+        (50_000, 30, 75_504),  # 4,530,181.2s: nothing caps a pin's route count
+        # The same arithmetic at a raised timeout: (R + 2) x 360.6s.
+        (0, 120, 19),
+        (2, 120, 25),  # 1442.4s
+        (10, 120, 73),  # 4327.2s
+    ],
+)
+def test_l3_pin_claim_budget_is_r_plus_two_actions_rounded_up(route_operations, timeout, minutes):
+    """An L3 pin's one claim covers the login, every route operation, and the logout:
+    (R + 2) worst-case actions, rounded up to the next whole minute (issue #1482)."""
+    with patch.object(settings, "execution_timeout_seconds", timeout):
+        assert l3_pin_claim_budget(route_operations) == timedelta(minutes=minutes)
+
+
+@pytest.mark.parametrize("timeout", [1, 30, 120])
+def test_l3_pin_claim_budget_outlives_every_drive_and_by_at_most_a_minute(timeout):
+    """The invariant, enumerated: for every route-operation count R from 0 to 300 and
+    a few far larger ones, the budget is strictly longer than the worst case of the
+    whole drive (R + 2 actions), never under the one-row budget, and at most one
+    minute longer than the worst case of R + 2 actions or of 3, whichever is longer:
+    the bound on how long a dead holder can keep a pin."""
+    per_action = _worst_case_action_ms(timeout)
+    with patch.object(settings, "execution_timeout_seconds", timeout):
+        one_row = claim_budget() // timedelta(milliseconds=1)
+        for route_operations in [*range(301), 1_000, 10_000, 50_000]:
+            budget = l3_pin_claim_budget(route_operations) // timedelta(milliseconds=1)
+            drive = (route_operations + 2) * per_action
+            assert budget > drive, route_operations
+            assert budget >= one_row, route_operations
+            assert budget <= max(drive, 3 * per_action) + 60_000, route_operations
 
 
 # --- A claimed row is invisible to the other channel's per-tick select --------
@@ -1337,3 +1426,271 @@ async def test_l2_success_flip_cas_loser_with_attached_row_returns_the_winner(ca
     async with TestSessionLocal() as s:
         fresh = await s.get(L2PortAssignment, row_id)
         assert (fresh.status, fresh.vlan_assignment_id) == ("ACTIVE", winner_va)
+
+
+# --- An L3 pin's one claim outlives its whole drive (issue #1482) -------------
+#
+# The tests below run on a virtual clock: `wiring_claim`'s `datetime.now` reads it,
+# every sandbox attempt advances it by the full driver timeout, and every in-line
+# backoff sleep advances it by its delay. So a drive takes its exact worst case,
+# (R + 2) x 90.6s at the defaults, in no wall-clock time, and the tests hold pinned
+# to one core with no timing bound at all.
+
+
+class _VirtualClock:
+    def __init__(self) -> None:
+        self.now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self.started = self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+    def datetime_class(self):
+        clock = self
+
+        class _ClockDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock.now
+
+        return _ClockDatetime
+
+
+def _virtual_clock_patches(clock: _VirtualClock, stack: ExitStack) -> None:
+    """Route `wiring_claim`'s clock and `nats_consumer`'s backoff sleeps through
+    `clock`. Only `nats_consumer` sees the virtual sleep: its `asyncio` name is
+    swapped for a proxy, so the event loop's own sleeps are untouched."""
+    import asyncio
+
+    class _AsyncioWithVirtualSleep:
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+        async def sleep(self, delay, *args, **kwargs):
+            clock.advance(delay)
+            await asyncio.sleep(0)
+
+    stack.enter_context(patch("app.services.wiring_claim.datetime", clock.datetime_class()))
+    stack.enter_context(patch("app.services.nats_consumer.asyncio", _AsyncioWithVirtualSleep()))
+
+
+async def _drive_l3_worst_case(row_id, holder, *, provision, routes, through_retry=False):
+    """Drive one L3 pin with `holder`'s claim, every driver action taking its worst
+    case: three attempts, each running to the driver
+    timeout, with both backoff sleeps between them. The login succeeds on its third
+    attempt so the route operations run; every route operation and the logout fail
+    all three. When the logout's run is recorded (the drive's last driver action has
+    finished), a second retry pass tries to claim the pin at that instant.
+
+    `through_retry` drives a removal the way the retry channels do, through
+    `_reattempt_l3_rows` on the loaded FAILED row (which drives the row's own
+    `routes`); otherwise `_apply_l3_adjacency` is called directly with `routes`.
+
+    Returns what was observed: the claim instant, the virtual time the logout
+    finished, whether the rival's claim succeeded, and the driver calls made."""
+    import httpx
+    from app.services import execution_service
+    from app.services.nats_consumer import (
+        WIRING_DRIVER_ATTEMPTS,
+        _apply_l3_adjacency,
+        _FetchContext,
+    )
+
+    clock = _VirtualClock()
+    observed: dict = {"calls": [], "first_call_at": None}
+    attempts: dict = {}
+
+    def _driver(driver_path, action, context, **kwargs):
+        key = (action, (kwargs.get("method_kwargs") or {}).get("destination"))
+        attempts[key] = attempts.get(key, 0) + 1
+        if observed["first_call_at"] is None:
+            observed["first_call_at"] = clock.now
+        clock.advance(settings.execution_timeout_seconds)
+        observed["calls"].append(action)
+        if action == "login" and attempts[key] == WIRING_DRIVER_ATTEMPTS:
+            return SUCCESS
+        return FAILURE
+
+    real_update = execution_service.update_execution_run
+
+    async def _update(db, run, status, **kwargs):
+        result = await real_update(db, run, status, **kwargs)
+        if run.action == "logout":
+            observed["logout_finished_at"] = clock.now
+            rival = WiringRowClaims()
+            async with TestSessionLocal() as s:
+                observed["rival_claimed"] = await rival.claim(s, RouteAssignment, row_id)
+        return result
+
+    item = {"device_id": str(SWITCH_ID), "routes": routes}
+    with ExitStack() as stack:
+        _virtual_clock_patches(clock, stack)
+        stack.enter_context(
+            patch("app.services.nats_consumer._fetch_device", AsyncMock(return_value=L3_SWITCH))
+        )
+        stack.enter_context(
+            patch(
+                "app.services.nats_consumer._fetch_template",
+                AsyncMock(return_value={"id": "t", "sections": []}),
+            )
+        )
+        stack.enter_context(
+            patch("app.services.driver_loader.load_driver", AsyncMock(return_value="/tmp/d"))
+        )
+        stack.enter_context(
+            patch("app.services.driver_loader.get_driver_metadata", AsyncMock(return_value={}))
+        )
+        stack.enter_context(
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=_driver)
+        )
+        stack.enter_context(
+            patch("app.services.execution_service.update_execution_run", side_effect=_update)
+        )
+        if through_retry:
+            from app.services.wiring_retry_service import _reattempt_l3_rows
+
+            assert not provision, "the retry drives a build only after an intent fetch"
+            observed["outcomes"] = await _reattempt_l3_rows(
+                await _loaded(RouteAssignment, row_id), _db_session_factory(), holder, set()
+            )
+        else:
+            async with httpx.AsyncClient() as client:
+                await _apply_l3_adjacency(
+                    str(RES_ID),
+                    [] if provision else [item],
+                    [item] if provision else [],
+                    _FetchContext(client),
+                    _db_session_factory(),
+                    retry_row_ids={str(SWITCH_ID): row_id},
+                    claims=holder,
+                )
+    observed["clock_started"] = clock.started
+    return observed
+
+
+def _routes(count: int) -> list[dict]:
+    return [
+        {"destination": f"10.{i // 250 + 1}.{i % 250}.0/24", "next_hop": "10.0.0.1"}
+        for i in range(count)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("provision", "through_retry", "route_count", "route_operations"),
+    [
+        # The retry channels' own removal pass: login and logout only for a pin that
+        # records no routes, then one remove_route per pinned route.
+        (False, True, 0, 0),
+        (False, True, 1, 1),
+        (False, True, 2, 2),
+        (False, True, 10, 10),
+        (False, True, 200, 200),
+        # A provision over the seeded FAILED pin also removes that pin's one route its
+        # own set drops (the #1001 residue): three configures plus one removal.
+        (True, False, 3, 4),
+    ],
+)
+async def test_an_l3_pins_claim_is_still_held_when_its_last_driver_action_finishes(
+    provision, through_retry, route_count, route_operations
+):
+    """The invariant, driven: with every action at its worst case, the stamp the L3
+    apply writes is the claim instant plus the budget of its exact drive sequence,
+    the drive's last action (the logout) finishes before that stamp, and a second
+    pass that tries to claim the pin at that instant loses (issue #1482). Afterwards
+    the holder's own record clears the claim, the normal release path."""
+    routes = _routes(route_count)
+    row_id = await _seed_l3_failed(
+        intended="ACTIVE" if provision else "RELEASED",
+        routes=None if provision else routes,
+    )
+    holder = WiringRowClaims()
+
+    observed = await _drive_l3_worst_case(
+        row_id, holder, provision=provision, routes=routes, through_retry=through_retry
+    )
+
+    actions = route_operations + 2
+    assert len(observed["calls"]) == 3 * actions, "every action made all three attempts"
+    drive = observed["logout_finished_at"] - observed["clock_started"]
+    assert drive == timedelta(milliseconds=actions * _worst_case_action_ms(30))
+    assert observed["rival_claimed"] is False, "a second pass claimed the pin mid-drive"
+    # The claim is taken before the login, so nothing ran on the clock before it.
+    assert observed["first_call_at"] == observed["clock_started"]
+    stamp = holder.held[row_id]
+    assert stamp > observed["logout_finished_at"]
+    assert stamp == observed["clock_started"] + l3_pin_claim_budget(route_operations)
+    assert await _claimed_until(RouteAssignment, row_id) is None
+    if through_retry:
+        # A removal with no route calls succeeds; one whose route calls all failed
+        # stays FAILED. Never in_progress: the holder kept its claim to the end.
+        expected = "released" if route_operations == 0 else "still_failed"
+        assert [o["outcome"] for o in observed["outcomes"]] == [expected]
+
+
+async def test_a_raised_driver_timeout_still_keeps_an_l3_pins_claim_through_its_drive():
+    """The budget scales with EXECUTION_TIMEOUT_SECONDS and so does the drive: at 120s
+    a pin of five routes is still held when its logout finishes."""
+    row_id = await _seed_l3_failed(intended="RELEASED")
+    holder = WiringRowClaims()
+    with patch.object(settings, "execution_timeout_seconds", 120):
+        observed = await _drive_l3_worst_case(
+            row_id, holder, provision=False, routes=_routes(5), through_retry=False
+        )
+        expected_budget = l3_pin_claim_budget(5)
+    assert expected_budget == timedelta(minutes=43)  # 7 x 360.6s = 2524.2s, rounded up
+    drive = observed["logout_finished_at"] - observed["clock_started"]
+    assert drive == timedelta(milliseconds=7 * _worst_case_action_ms(120))
+    assert observed["rival_claimed"] is False, "a second pass claimed the pin mid-drive"
+    assert holder.held[row_id] > observed["logout_finished_at"]
+    assert holder.held[row_id] == observed["clock_started"] + expected_budget
+
+
+@pytest.mark.parametrize("layer", ["l1", "l2"])
+async def test_l1_and_l2_rows_still_claim_with_the_one_row_budget(layer):
+    """The L1 and L2 applies pass no per-call budget: the stamp is the claim instant
+    plus the unchanged 5-minute one-row budget, on the virtual clock exactly."""
+    row_id = await _seed_layer(layer)
+    holder = WiringRowClaims()
+    clock = _VirtualClock()
+    with ExitStack() as stack:
+        _virtual_clock_patches(clock, stack)
+        await _drive_one(layer, row_id, holder, FAILURE)
+    assert holder.held[row_id] == clock.started + timedelta(minutes=5)
+
+
+async def test_a_per_call_budget_sets_only_that_claims_stamp(db):
+    """`claim(..., budget=)` stamps now plus that budget; the ledger's own budget is
+    untouched for the next claim, and a row the pass already holds keeps its stamp."""
+    sized = await _seed_l3_failed(device_id=uuid.uuid4())
+    plain = await _seed_l3_failed(device_id=uuid.uuid4())
+    holder = WiringRowClaims()
+    clock = _VirtualClock()
+    with ExitStack() as stack:
+        _virtual_clock_patches(clock, stack)
+        assert await holder.claim(db, RouteAssignment, sized, budget=timedelta(minutes=42))
+        assert await holder.claim(db, RouteAssignment, plain)
+        assert await holder.claim(db, RouteAssignment, sized, budget=timedelta(minutes=1))
+    assert holder.held[sized] == clock.started + timedelta(minutes=42)
+    assert holder.held[plain] == clock.started + timedelta(minutes=5)
+    assert holder.budget == timedelta(minutes=5)
+
+
+async def test_a_sized_l3_claim_still_expires_at_its_stamp(db):
+    """Conservation: a longer claim is still a claim that ends. A holder that dies
+    after claiming a pin of 50 routes leaves it unclaimable until exactly its stamp
+    and no longer; at the stamp a new pass takes it, with no reaper."""
+    row_id = await _seed_l3_failed()
+    dead = WiringRowClaims()
+    clock = _VirtualClock()
+    budget = l3_pin_claim_budget(50)
+    assert budget == timedelta(minutes=79)  # 52 x 90.6s = 4711.2s, rounded up
+    with ExitStack() as stack:
+        _virtual_clock_patches(clock, stack)
+        assert await dead.claim(db, RouteAssignment, row_id, budget=budget)
+        clock.advance(budget.total_seconds() - 1)
+        async with TestSessionLocal() as s:
+            assert await WiringRowClaims().claim(s, RouteAssignment, row_id) is False
+        clock.advance(1)
+        assert clock.now == dead.held[row_id]
+        async with TestSessionLocal() as s:
+            assert await WiringRowClaims().claim(s, RouteAssignment, row_id) is True
