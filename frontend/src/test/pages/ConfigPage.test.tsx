@@ -18,6 +18,7 @@ import { server } from "../mocks/server";
 import { ConfigPage } from "@/pages/ConfigPage";
 import { useConfigStore } from "@/stores/configStore";
 import { TOAST_CLEARANCE_CLASS } from "@/lib/toastClearance";
+import { expectAuthorCredit, tabToAuthorCredit } from "../authorCredit";
 
 function renderWithProviders(node: ReactNode) {
   const client = new QueryClient({
@@ -217,6 +218,40 @@ describe("ConfigPage (editor)", () => {
     const save = await screen.findByRole("button", { name: "Save and Restart" });
     const page = save.closest(".min-h-screen") as HTMLElement;
     expect(page.className.split(/\s+/)).toContain(TOAST_CLEARANCE_CLASS);
+    // The author credit is on the config sign-in cards only, not the editor.
+    expect(screen.queryByTestId("author-credit")).toBeNull();
+  });
+});
+
+describe("ConfigPage author credit", () => {
+  it("renders under the config sign-in card, after its controls in tab order", async () => {
+    renderWithProviders(<ConfigPage />);
+    const link = expectAuthorCredit();
+    expect(link.closest("form")).toBeNull();
+    const order = await tabToAuthorCredit();
+    expect(order[0]).toBe(screen.getByLabelText("Config Password"));
+    expect(order[order.length - 1]).toBe(link);
+    expect(order).toContain(screen.getByRole("button", { name: "Sign in" }));
+    expect(order).toContain(screen.getByRole("link", { name: "Back to login" }));
+  });
+
+  it("renders under the change-password card", async () => {
+    server.use(
+      http.post("/api/config/login", () =>
+        HttpResponse.json({ token: "ct", password_changed: false }),
+      ),
+    );
+    renderWithProviders(<ConfigPage />);
+    fireEvent.change(screen.getByLabelText("Config Password"), {
+      target: { value: "password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await screen.findByText("Change Config Password");
+    const link = expectAuthorCredit();
+    const order = await tabToAuthorCredit();
+    expect(order[0]).toBe(screen.getByLabelText("New Password (8-32 characters)"));
+    expect(order).toContain(screen.getByRole("button", { name: "Change Password" }));
+    expect(order[order.length - 1]).toBe(link);
   });
 });
 

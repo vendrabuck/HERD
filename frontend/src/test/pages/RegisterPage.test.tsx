@@ -23,6 +23,7 @@ vi.mock("react-hot-toast", () => ({
 
 import { server } from "../mocks/server";
 import { RegisterPage } from "@/pages/RegisterPage";
+import { expectAuthorCredit, tabToAuthorCredit } from "../authorCredit";
 
 function renderWithProviders(node: ReactNode) {
   const client = new QueryClient({
@@ -171,5 +172,25 @@ describe("RegisterPage", () => {
     fireEvent.change(screen.getByLabelText("Password"), { target: { value: "password" } });
     fireEvent.click(screen.getByRole("button", { name: "Create account" }));
     await waitFor(() => expect(toastError).toHaveBeenCalledWith("Registration failed"));
+  });
+});
+
+describe("RegisterPage author credit", () => {
+  it("renders under the card and follows every form control in tab order", async () => {
+    renderWithProviders(<RegisterPage />);
+    const link = expectAuthorCredit();
+    expect(link.closest("form")).toBeNull();
+    const order = await tabToAuthorCredit();
+    expect(order[0]).toBe(screen.getByLabelText("Email"));
+    expect(order[order.length - 1]).toBe(link);
+    for (const control of [
+      screen.getByLabelText("Username"),
+      screen.getByLabelText("Name"),
+      screen.getByLabelText("Password"),
+      screen.getByRole("button", { name: "Create account" }),
+      screen.getByRole("link", { name: "Sign in" }),
+    ]) {
+      expect(order.slice(0, -1)).toContain(control);
+    }
   });
 });
