@@ -2893,3 +2893,37 @@ async def test_device_resolver_sends_every_batch_and_merges_the_answers():
     batches = device_resolver.name_batches(names)
     assert client.post.await_count == len(batches)
     assert result == {batch[0]: str(i) for i, batch in enumerate(batches)}
+
+
+def _names_measuring(total: int) -> list[str]:
+    """Unique ASCII names whose counted size (each name's encoded length plus a comma,
+    plus the envelope) is exactly `total`."""
+    from app.services import device_resolver
+
+    left = total - device_resolver._ENVELOPE_BYTES
+    names = []
+    while left > 0:
+        length = min(200, left - 3)
+        names.append(f"{len(names):04d}" + "n" * (length - 4))
+        left -= length + 3
+    assert left == 0
+    return names
+
+
+@pytest.mark.parametrize(
+    ("over", "batches"), [(0, 1), (1, 2)], ids=["exactly_the_bytes", "one_byte_over"]
+)
+def test_device_resolver_batch_edge_is_exact(over, batches):
+    """A set that counts exactly RESOLVE_BATCH_BYTES is one batch; one byte more
+    splits it. The count includes a comma after every name, so a body is at most the
+    budget less one byte."""
+    import json
+
+    from app.services import device_resolver
+
+    names = _names_measuring(device_resolver.RESOLVE_BATCH_BYTES + over)
+    found = device_resolver.name_batches(names)
+    assert len(found) == batches
+    for batch in found:
+        body = json.dumps({"names": batch}, ensure_ascii=False, separators=(",", ":"))
+        assert len(body.encode("utf-8")) <= device_resolver.RESOLVE_BATCH_BYTES - 1

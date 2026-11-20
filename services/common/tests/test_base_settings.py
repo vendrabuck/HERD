@@ -175,3 +175,21 @@ def test_the_body_limit_refuses_what_config_also_refuses(tmp_path, monkeypatch):
             assert raw not in str(refused.value)
     monkeypatch.setenv("MAX_REQUEST_BODY_BYTES", "65536")
     assert settings_cls().max_request_body_bytes == 65536
+
+
+def test_the_body_limit_floor_holds_for_a_number_in_the_config_file(tmp_path, monkeypatch):
+    """A `config.json` number reaches the field as an int, not as text: the floor and
+    the refusal of a bool or a float hold on that path too. 65536 is accepted."""
+    import pydantic
+    import pytest
+
+    monkeypatch.delenv("MAX_REQUEST_BODY_BYTES", raising=False)
+    config = tmp_path / "config.json"
+    for value in (65535, 1024, 0, -1, True, 131072.0):
+        config.write_text(json.dumps({"MAX_REQUEST_BODY_BYTES": value}))
+        base_settings = _reload_base_settings(monkeypatch, str(config))
+        with pytest.raises(pydantic.ValidationError, match="decimal digits"):
+            _representative_settings_cls(base_settings)()
+    config.write_text(json.dumps({"MAX_REQUEST_BODY_BYTES": 65536}))
+    base_settings = _reload_base_settings(monkeypatch, str(config))
+    assert _representative_settings_cls(base_settings)().max_request_body_bytes == 65536

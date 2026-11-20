@@ -388,16 +388,105 @@ async def test_a_read_racing_a_response_start_is_not_refused(declared):
     assert [m["type"] for m in sent] == ["http.response.start"]
 
 
-async def test_a_streaming_route_that_never_reads_its_body_answers_with_a_body_over_the_limit():
-    """Through the app, with a body: the route streams without reading its body, so
-    the only reads are the disconnect listener's. Nothing is refused and nothing
-    raises; the stream may end early when the listener sees `http.disconnect`, but
-    never answers anything but 200."""
+async def test_a_streaming_route_that_never_reads_its_body_answers_with_no_middleware_around():
+    """With no BaseHTTPMiddleware around the app: the route streams without reading
+    its body, so the only reads are the disconnect listener's. Nothing is refused and
+    nothing raises; the stream may end early when the listener sees
+    `http.disconnect`, but never answers anything but 200. HERD's services are not
+    built this way; see the known limit below."""
     async with _client(_app()) as client:
         for content in (b"x" * (LIMIT * 4), _parts(LIMIT * 4)):
             resp = await client.post("/stream", content=content)
             assert resp.status_code == 200
             assert b"abc".startswith(resp.content)
+
+
+def _logged_streaming_app() -> FastAPI:
+    """Built like a HERD service (the request logger, a BaseHTTPMiddleware, around
+    the install), with a route that streams without reading its body."""
+    from herd_common.logging import RequestLoggingMiddleware
+
+    app = FastAPI()
+    app.add_middleware(RequestLoggingMiddleware)
+    install_validation_errors(app, max_body_bytes=LIMIT)
+
+    @app.post("/stream")
+    async def stream():
+        async def parts():
+            for part in (b"a", b"b", b"c"):
+                yield part
+
+        return StreamingResponse(parts(), media_type="text/event-stream")
+
+    return app
+
+
+def _stream_scope(headers: list) -> dict:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/stream",
+        "raw_path": b"/stream",
+        "root_path": "",
+        "query_string": b"",
+        "headers": headers,
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", 80),
+    }
+
+
+def _answer(sent: list[dict]) -> tuple[list[int], bytes]:
+    starts = [m["status"] for m in sent if m["type"] == "http.response.start"]
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return starts, body
+
+
+async def test_known_limit_a_streaming_route_that_never_reads_its_body_fails_behind_the_logger():
+    """Documents a known limit (OPS-VALID-9, limits by decision; a follow-up issue
+    tracks it). No HERD route is affected today: the one streaming route reads its
+    JSON body before it streams.
+
+    Behind the request logger (a BaseHTTPMiddleware, as in every HERD service), the
+    disconnect listener of a streaming response makes the first read of a body whose
+    `Content-Length` is over the limit while the response's start is still held in the
+    logger's stream. The check sees no start and refuses; the listener's task group
+    ends with the response never started, the logger has nothing to return, and
+    Starlette raises `RuntimeError: No response returned.`: the client gets a 500 (a
+    server that cannot send one resets the connection). What is pinned: the failure
+    is a server error, never a served response, and nothing of the body is read. A
+    streaming route must read or drain its body before it streams (CONVENTIONS)."""
+    script = _Script(_chunks(256))
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    with pytest.raises(RuntimeError, match="No response returned"):
+        await _logged_streaming_app()(_stream_scope(_cl(b"256")), script, send)
+    assert script.taken == 0
+    assert _answer(sent) == ([500], b"Internal Server Error")
+
+
+async def test_known_limit_the_same_route_with_a_chunked_body_over_the_limit_is_cut_short():
+    """Documents the same limit for a body with no `Content-Length`: the read that
+    takes the count past the limit comes after the response started, so it answers
+    `http.disconnect`; the listener takes that as the client leaving and ends the
+    stream, which is cut short (here after its first part). The message that crossed
+    the limit is read and not handed on, so nothing of the body reaches the route."""
+    script = _Script([{"type": "http.request", "body": b"x" * 256, "more_body": False}])
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    await _logged_streaming_app()(_stream_scope(_cl()), script, send)
+    assert script.taken == 1
+    starts, body = _answer(sent)
+    assert starts == [200]
+    assert b"abc".startswith(body) and body != b"abc"
 
 
 async def test_a_disconnect_and_later_reads_pass_through():
