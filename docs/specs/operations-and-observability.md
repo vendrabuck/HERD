@@ -1560,13 +1560,18 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
 
 **Out of scope.** Setting or classifying a purpose (`reservations.md`, `ai-features.md`).
 
-### 8.15 In-app help link
+### 8.15 In-app help link and author credit
 
 **What it does.** The `?` icon in the header opens the published user manual in a new
-tab.
+tab. A one-line author credit, `Designed and built by Lane Nelms`, sits under the
+sign-in, Register, config sign-in, and config change-password cards and in the About
+page's Frontend card; the name links to the author's LinkedIn profile in a new tab.
 
 **Surfaces.** `frontend/src/lib/links.ts`, `frontend/src/components/layout/HeaderHelpLink.tsx`,
-`frontend/src/components/layout/AppLayout.tsx` (AppLayout renders the link).
+`frontend/src/components/layout/AppLayout.tsx` (AppLayout renders the link),
+`frontend/src/components/layout/AuthorCredit.tsx` (rendered by `LoginPage.tsx`,
+`RegisterPage.tsx`, `ConfigPage.tsx`, and `admin/AboutPage.tsx` under
+`frontend/src/pages/`).
 
 **Rules.**
 
@@ -1574,6 +1579,14 @@ tab.
   once. \
   Enforced in: `frontend/src/lib/links.ts` (`MANUAL_URL`); `frontend/src/components/layout/HeaderHelpLink.tsx` (`MANUAL_URL`) \
   Pinned by: `frontend/src/test/components/AppLayout.test.tsx` (`renders a Settings link and a help link to the published manual`); `frontend/src/test/components/HeaderHelpLink.test.tsx` (`is a link named Help that points at the published manual`)
+- **OPS-CREDIT-1.** The author credit's wording and profile address are defined once,
+  in `links.ts`, and every surface renders them through `AuthorCredit`. The link opens
+  in a new tab with `rel="noopener noreferrer"`, names itself `Lane Nelms on LinkedIn
+  (opens in a new tab)`, and follows every sign-in control in tab order: it sits in a
+  footer after the card, never before the first field. On About it closes the Frontend
+  card, after the Version, Build, and Build date list. \
+  Enforced in: `frontend/src/lib/links.ts` (`AUTHOR_CREDIT_PREFIX`, `AUTHOR_NAME`, `AUTHOR_LINKEDIN_URL`); `frontend/src/components/layout/AuthorCredit.tsx` (`AuthorCredit`); `frontend/src/pages/LoginPage.tsx` (`AuthorCredit`); `frontend/src/pages/RegisterPage.tsx` (`AuthorCredit`); `frontend/src/pages/ConfigPage.tsx` (`AuthorCredit`); `frontend/src/pages/admin/AboutPage.tsx` (`AuthorCredit`) \
+  Pinned by: `frontend/src/test/pages/LoginPage.test.tsx` (`renders under the card in local mode and follows every form control in tab order`, `renders while the sign-in options are pending, after the configuration link`, `renders with single sign-on only, after the Sign in with button`, `renders with the Administrator sign-in toggle, after the opened form's submit`, `renders with the LDAP answer, whose form is the local one`); `frontend/src/test/pages/RegisterPage.test.tsx` (`renders under the card and follows every form control in tab order`); `frontend/src/test/pages/ConfigPage.test.tsx` (`renders under the config sign-in card, after its controls in tab order`, `renders under the change-password card`); `frontend/src/test/pages/AboutPage.test.tsx` (`shows the author credit inside the Frontend card, after its Version, Build, and Build date`); `tests/e2e/test_login.py` (`test_login_page_has_author_credit`); `tests/e2e/test_register_and_roles.py` (`test_register_page_has_author_credit`); `tests/e2e/test_config.py` (`test_config_login_card_has_author_credit`)
 
 **Out of scope.** The manual's content (`docs/manual/`).
 
@@ -2163,11 +2176,11 @@ to 500; the 10 MiB import file bound of the inventory and cabling import routes
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/common/tests/` (`test_logging.py`, `test_config_loader.py`, `test_base_settings.py`, `test_schema_init.py`, `test_consumer_schema_gate.py`, `test_outbox.py`, `test_jetstream.py`, `test_version.py`, `test_validation_errors.py`, `test_request_body_limit.py`, `test_error_details.py`); `services/execution/tests/test_health_scheduler*.py`; `services/config/tests/`; `services/secrets/tests/test_crypto.py`, `test_keyring.py`; `services/reservations/tests/test_reporting_*.py`, `test_fleet_report.py`, `test_transit_gear_rollup.py`; `infra/restarter/tests/` (the restarter against a fake Docker daemon on a Unix socket, and its HTTP surface in process); the `tests/unit/` guards (`test_validation_errors_wiring.py`, `test_request_body_limit_wiring.py`, `test_restarter_compose_guard.py`, `test_dockerfile_users.py`, `test_compose_settings_wiring.py`, `test_compose_ports.py`, `test_build_args_wiring.py`, `test_consumer_heartbeat_wiring.py`, `test_docs_nats_cli_form.py`, `test_check_image_matches_lock.py`); the frontend tests named in sections 8.3, 8.6, 8.11, and 8.14 | SQLite in memory; the scheduler's concurrency is driven within one process |
+| Unit | `services/common/tests/` (`test_logging.py`, `test_config_loader.py`, `test_base_settings.py`, `test_schema_init.py`, `test_consumer_schema_gate.py`, `test_outbox.py`, `test_jetstream.py`, `test_version.py`, `test_validation_errors.py`, `test_request_body_limit.py`, `test_error_details.py`); `services/execution/tests/test_health_scheduler*.py`; `services/config/tests/`; `services/secrets/tests/test_crypto.py`, `test_keyring.py`; `services/reservations/tests/test_reporting_*.py`, `test_fleet_report.py`, `test_transit_gear_rollup.py`; `infra/restarter/tests/` (the restarter against a fake Docker daemon on a Unix socket, and its HTTP surface in process); the `tests/unit/` guards (`test_validation_errors_wiring.py`, `test_request_body_limit_wiring.py`, `test_restarter_compose_guard.py`, `test_dockerfile_users.py`, `test_compose_settings_wiring.py`, `test_compose_ports.py`, `test_build_args_wiring.py`, `test_consumer_heartbeat_wiring.py`, `test_docs_nats_cli_form.py`, `test_check_image_matches_lock.py`); the frontend tests named in sections 8.3, 8.6, 8.11, 8.14, and 8.15 | SQLite in memory; the scheduler's concurrency is driven within one process |
 | Functional (through the service API) | each service's `test_version.py`, `test_validation_errors.py`, and `test_request_body_limit.py`; `services/execution/tests/test_health_endpoints.py`; the device check tests in `services/execution/tests/test_api_endpoints.py`, `test_router_endpoints.py`, and `test_router_direct.py`; `services/config/tests/test_config.py`, `test_config_passwords.py`; `services/secrets/tests/test_api.py`, `test_unencodable_data.py`; `services/user-profile/tests/test_preferences*.py`; the report route tests in `test_fleet_report.py` | httpx against the app |
 | Integration (running stack) | `tests/integration/test_restarter_isolation.py` (no socket in config, config not root, the restarter answering on `herd-ctl` and unresolvable from `herd-net`; it never restarts; the absence of a gateway route is pinned statically by OPS-GUARD-6, since Traefik could not reach `herd-ctl` even with labels), `tests/integration/test_device_check_internal_fetch.py`, `test_outbox_durability.py`, `test_nats_consumer_configs_live.py`, `test_health_alerting_flow.py`, `test_secrets_flow.py`, `test_reporting.py`, `test_dlq_and_idempotency.py`, `test_request_body_limit.py` (the 413 through the gateway, without signing in); the live-Postgres suite `services/common/tests/test_outbox_wake_live_pg.py` | No running-stack integration test sends a restart (the nightly browser step does), covers a scheduler poll end to end (the alerting test publishes its own events), or covers a JetStream store surviving a recreate |
 | Stress and load | `tests/load/locustfile.py` ([LOAD_TESTING.md](../LOAD_TESTING.md)) | The load test drives reservations, inventory, ACL, export, validation, notifications, and bulk cabling, and `OversizedBodySender` sends bodies over the limit to one route of every service beside them (OPS-VALID-9); none of its users polls health, reads reports, or touches secrets or the config service. Save and Restart cannot be load tested, since a restart bounces the stack under test; its concurrency property (one pass at a time under twenty concurrent calls) is pinned at the unit level (OPS-CONFIG-27). Scheduler fleet scale is covered only by the unit bounds in section 8.10 |
-| Browser end-to-end | `tests/e2e/test_about_page_playwright.py`, `tests/e2e/test_config_playwright.py` (Save and Restart runs only with `HERD_E2E_RESTART=1`, which nightly.yml sets in its last test step), `tests/e2e/test_config.py`, `tests/e2e/test_reporting_page.py` | No browser test covers the health badge or the help link |
+| Browser end-to-end | `tests/e2e/test_about_page_playwright.py`, `tests/e2e/test_config_playwright.py` (Save and Restart runs only with `HERD_E2E_RESTART=1`, which nightly.yml sets in its last test step), `tests/e2e/test_config.py`, `tests/e2e/test_reporting_page.py`; the author credit's placement under its card (OPS-CREDIT-1) in `tests/e2e/test_login.py`, `tests/e2e/test_register_and_roles.py`, and `tests/e2e/test_config.py` | No browser test covers the health badge or the help link |
 
 Not run for this document: nothing was checked against a running stack. The
 integration, live-Postgres, load, and browser suites were read, not run; `tests/unit/`
@@ -2180,7 +2193,8 @@ and the nightly browser step were not run against a stack. The body limit rules
 real-socket suite against uvicorn on an ephemeral port, and
 the `tests/unit/` guard, which were run; `tests/integration/test_request_body_limit.py`
 and the `OversizedBodySender` load user were written against their neighbours and not
-run against a stack.
+run against a stack. OPS-CREDIT-1 was added on
+2026-11-20 with its unit tests run; its three browser tests were written, not run.
 
 ## 13. Known limits and gaps
 

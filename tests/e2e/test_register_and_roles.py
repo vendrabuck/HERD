@@ -17,8 +17,9 @@ cannot be torn down; it uses a unique timestamped email and username so it
 stays inert (same approach as the LDAP JIT-provisioning test).
 
 The tests in this module run in file order against the shared module-scoped
-`browser`: registration first, then login, then the gating checks, then
-logout last (the same sequential style test_login.py already uses).
+`browser`: the register page's author credit first (signed out), then
+registration, then login, then the gating checks, then logout last (the same
+sequential style test_login.py already uses).
 """
 
 import time
@@ -28,7 +29,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .conftest import _do_login
+from .conftest import _do_login, assert_author_credit_under_card
 
 WAIT = 15
 
@@ -72,6 +73,15 @@ def registered_user(browser, base_url):
             pytest.skip("local registration is disabled; this deployment uses LDAP")
         time.sleep(0.5)
     pytest.skip(f"registration did not complete; still on {browser.current_url}")
+
+
+def test_register_page_has_author_credit(browser, base_url):
+    """The register card has the author credit under it, clear of it. First in
+    the file, so it runs before registered_user signs this browser in and
+    GuestGuard would send /register away; it needs no account and no login."""
+    browser.get(f"{base_url}/register")
+    WebDriverWait(browser, WAIT).until(EC.presence_of_element_located((By.ID, "reg-email")))
+    assert_author_credit_under_card(browser, WAIT)
 
 
 def test_register_lands_on_login_page(registered_user, browser):

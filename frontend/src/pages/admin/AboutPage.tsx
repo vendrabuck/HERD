@@ -8,6 +8,7 @@ import {
   formatBuildDate,
 } from "@/lib/appVersion";
 import { useServiceVersions, InvalidVersionResponseError } from "@/api/about";
+import { AuthorCredit } from "@/components/layout/AuthorCredit";
 
 export function AboutPage() {
   const rows = useServiceVersions();
@@ -49,6 +50,9 @@ export function AboutPage() {
               <dd className="text-gray-900 font-medium">{formatBuildDate(APP_BUILD_DATE)}</dd>
             </div>
           </dl>
+          {/* Inside the white card: gray-500 text on the gray-100 page
+              background would fall below WCAG AA contrast. */}
+          <AuthorCredit className="mt-4 pt-3 border-t border-gray-100" />
         </div>
 
         <h3 className="text-base font-semibold text-gray-900 mb-3">Services</h3>

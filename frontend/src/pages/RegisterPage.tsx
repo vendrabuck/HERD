@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
 import { useRegister } from "@/api/auth";
+import { AuthorCredit } from "@/components/layout/AuthorCredit";
 import { Button } from "@/components/ui/Button";
 import { profileSaveErrorText } from "@/lib/errors";
 import { FULL_NAME_MAX_LENGTH } from "@/lib/profileEdit";
@@ -33,7 +34,7 @@ export function RegisterPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-50">
+    <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50">
       <div className="w-full max-w-sm bg-white rounded-xl shadow-sm border border-gray-200 p-8">
         <div className="mb-6 text-center">
           <div className="flex items-center justify-center gap-3">
@@ -120,6 +121,10 @@ export function RegisterPage() {
           </Link>
         </p>
       </div>
+
+      <footer className="mt-4 px-4 text-center">
+        <AuthorCredit />
+      </footer>
     </div>
   );
 }

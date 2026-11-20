@@ -25,6 +25,11 @@ import { server } from "../mocks/server";
 import { LoginPage } from "@/pages/LoginPage";
 import { APP_VERSION } from "@/lib/appVersion";
 import { fakeJwt } from "../fixtures/jwt";
+import {
+  expectAuthorCredit,
+  expectCreditStackedUnderCard,
+  tabToAuthorCredit,
+} from "../authorCredit";
 
 function renderWithProviders(node: ReactNode) {
   const client = new QueryClient({
@@ -323,4 +328,73 @@ describe("LoginPage return path (issue #1333)", () => {
       );
     },
   );
+});
+
+// The author credit sits under the sign-in card in every sign-in state, after
+// every sign-in control in tab order, so it never takes the first Tab press.
+describe("LoginPage author credit", () => {
+  const OIDC = { auth_method: "oidc", registration_open: false, sso: { provider_name: "Acme SSO" } };
+
+  function answerLoginOptions(body: object) {
+    server.use(http.get("/api/auth/login-options", () => HttpResponse.json(body)));
+  }
+
+  it("renders under the card in local mode and follows every form control in tab order", async () => {
+    renderWithProviders(<LoginPage />);
+    const email = await screen.findByLabelText("Email");
+    const link = expectAuthorCredit();
+    const order = await tabToAuthorCredit();
+    expect(order[0]).toBe(email);
+    expect(order[order.length - 1]).toBe(link);
+    const before = order.slice(0, -1);
+    for (const control of [
+      email,
+      screen.getByLabelText("Password"),
+      screen.getByRole("button", { name: "Sign in" }),
+      screen.getByRole("link", { name: "Register" }),
+      screen.getByRole("link", { name: "System configuration" }),
+    ]) {
+      expect(before).toContain(control);
+    }
+    // Outside the card's form, in a footer stacked under the card.
+    expect(link.closest("form")).toBeNull();
+    expectCreditStackedUnderCard(link, "Hardware Environment Replication and Deployment");
+  });
+
+  it("renders while the sign-in options are pending, after the configuration link", async () => {
+    server.use(http.get("/api/auth/login-options", () => new Promise<never>(() => {}) as never));
+    renderWithProviders(<LoginPage />);
+    const link = expectAuthorCredit();
+    const order = await tabToAuthorCredit();
+    expect(order).toEqual([screen.getByRole("link", { name: "System configuration" }), link]);
+  });
+
+  it("renders with single sign-on only, after the Sign in with button", async () => {
+    answerLoginOptions({ ...OIDC, password_login: false });
+    renderWithProviders(<LoginPage />);
+    const sso = await screen.findByRole("button", { name: "Sign in with Acme SSO" });
+    const link = expectAuthorCredit();
+    const order = await tabToAuthorCredit();
+    expect(order[0]).toBe(sso);
+    expect(order[order.length - 1]).toBe(link);
+  });
+
+  it("renders with the Administrator sign-in toggle, after the opened form's submit", async () => {
+    answerLoginOptions({ ...OIDC, password_login: true });
+    renderWithProviders(<LoginPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "Administrator sign-in" }));
+    const link = expectAuthorCredit();
+    const submit = screen.getByRole("button", { name: "Sign in" });
+    const order = await tabToAuthorCredit();
+    expect(order).toContain(submit);
+    expect(order.indexOf(submit)).toBeLessThan(order.indexOf(link));
+  });
+
+  it("renders with the LDAP answer, whose form is the local one", async () => {
+    answerLoginOptions({ auth_method: "ldap", registration_open: false, password_login: true, sso: null });
+    renderWithProviders(<LoginPage />);
+    await screen.findByLabelText("Email");
+    expectAuthorCredit();
+    expect(screen.queryByRole("link", { name: "Register" })).toBeNull();
+  });
 });
