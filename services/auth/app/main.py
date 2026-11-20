@@ -196,7 +196,9 @@ app.add_middleware(RequestLoggingMiddleware)
 # Every 422 is `{type, loc, msg}`: no `input` or `ctx`, so no submitted password,
 # and it always encodes (issue #1426). `msg` and `loc` can still quote part of an
 # email, a UUID, or a key name (see app/validation_errors.py).
-install_validation_errors(app)
+# Every request body is bounded at MAX_REQUEST_BODY_BYTES (a 413 before it is read
+# past the limit, before authentication; upload routes add their own bound).
+install_validation_errors(app, max_body_bytes=settings.max_request_body_bytes)
 
 app.include_router(auth_router)
 app.include_router(admin_router)

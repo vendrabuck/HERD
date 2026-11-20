@@ -10,6 +10,7 @@ from herd_common.acl import user_has_grant
 from herd_common.auth import make_auth_dependencies
 from herd_common.config_redaction import redact_config
 from herd_common.internal_auth import internal_token_matches
+from herd_common.validation_errors import FORWARD_ENVELOPE_BYTES, extends_body_limit
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -402,6 +403,9 @@ async def device_check(
 
 
 @router.post("/execute", response_model=ExecutionRunResponse, status_code=status.HTTP_201_CREATED)
+# Inventory's immediate apply and ai-orchestrator's commit forward a stored or
+# admitted device configuration here inside `method_kwargs` (issue #1466).
+@extends_body_limit(lambda: FORWARD_ENVELOPE_BYTES)
 async def manual_execute(
     body: ManualExecuteRequest,
     payload: dict = Depends(get_current_user_payload),
@@ -463,6 +467,9 @@ async def manual_execute(
     response_model=ExecutionRunResponse,
     status_code=status.HTTP_201_CREATED,
 )
+# Inventory's apply scheduler forwards a stored device configuration here inside
+# `method_kwargs` (issue #1466).
+@extends_body_limit(lambda: FORWARD_ENVELOPE_BYTES)
 async def internal_execute(
     body: ManualExecuteRequest,
     _: None = Depends(_require_internal_token),

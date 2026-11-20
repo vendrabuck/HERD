@@ -27,6 +27,7 @@ from app.config_store import (
     verify_password,
 )
 from app.docker_ctl import restart_services
+from app.request_limits import max_request_body_bytes
 from app.validation_errors import holds_lone_surrogate, install_validation_errors
 from app.version import add_version_route, service_version
 
@@ -53,9 +54,12 @@ app = FastAPI(
 
 # Every 422 is rendered as {type, loc, msg}: never pydantic's input or ctx, so never
 # a submitted password, and never a 500 on a lone surrogate (app/validation_errors.py).
-# Without the shared body check for a lone surrogate: config answers one in a
-# password itself (OPS-CONFIG-8), and the check would replace those answers.
-install_validation_errors(app, refuse_lone_surrogates=False)
+# Every request body is bounded at MAX_REQUEST_BODY_BYTES (a 413 before the route
+# reads it). Without the shared body check for a lone surrogate: config answers one
+# in a password itself (OPS-CONFIG-8), and the check would replace those answers.
+install_validation_errors(
+    app, max_body_bytes=max_request_body_bytes(), refuse_lone_surrogates=False
+)
 
 # The wildcard origin is deliberate (this is the one service that does not use
 # herd_common's CORS helper). Credentials are never allowed: the config session

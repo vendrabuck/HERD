@@ -47,6 +47,7 @@ locust -f locustfile.py \
 | InventoryBrowser | 5 | List devices, get device detail, list templates |
 | ACLChecker | 2 | Single and batch permission checks |
 | LoginLimitProbe | exactly 1 user | After 15 s, floods wrong-password logins from this host until auth's per-source attempt limit answers 429; any answer but 401 or 429 fails the run |
+| OversizedBodySender | exactly 1 user | Never signs in; sends bodies one byte over `MAX_REQUEST_BODY_BYTES` to one route of every service, with a Content-Length or chunked; any answer but the 413 `body_too_large` fails the run |
 
 ## Logins and the per-source attempt limit
 

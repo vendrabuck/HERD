@@ -1,6 +1,6 @@
 """Locust load test definitions for HERD.
 
-Nine user classes, selected by default:
+Ten user classes, selected by default:
 - ReservationUser: creates, lists, queries calendar, releases reservations
 - InventoryBrowser: browses devices, templates, and the topologies list
 - BulkExporter: exports devices, templates, and topologies; dry-runs a device import
@@ -18,6 +18,10 @@ Nine user classes, selected by default:
 - LoginLimitProbe: exactly one user that, once every other user has signed in,
   sends wrong-password logins from this host until auth's per-source attempt
   limit (IAM-LOGIN-7) answers 429, and fails the run on any other answer
+- OversizedBodySender: exactly one user, never signed in, that sends bodies one
+  byte over MAX_REQUEST_BODY_BYTES to one route of every service, with a
+  Content-Length or chunked, and fails the run on any answer but the 413
+  (OPS-VALID-9)
 
 Every user signs in once, at start, and every one does so from this host, which
 auth sees as one source address with one attempt allowance (60 at once by
@@ -26,7 +30,7 @@ working, not as a failure: it records it under its own name, waits the
 `Retry-After`, and tries again, so the login figures under `/api/auth/login`
 stay those of real password checks.
 
-A tenth, OidcLoginUser (ADR 0016 phase 5b), signs in through the OIDC test
+An eleventh, OidcLoginUser (ADR 0016 phase 5b), signs in through the OIDC test
 provider; it is abstract unless HERD_LOAD_OIDC=1 and runs only in the
 Makefile's _gate-oidc-stack-tests phase, against a stack in OIDC mode (see its
 section at the end of this file).
@@ -894,6 +898,99 @@ class LoginLimitProbe(HerdUser):
                 resp.success()
             else:
                 resp.failure(f"HTTP {resp.status_code}, expected 401 or 429")
+
+
+# The request body limit every service applies (issue #1466, OPS-VALID-9); a run
+# against a stack with another MAX_REQUEST_BODY_BYTES reads it from the environment
+# or the repo-root .env, like the stack does.
+MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES") or 4 * 1024 * 1024)
+
+# One JSON route per service, through the gateway, none of them a route that takes a
+# larger body (OPS-VALID-10): each would parse its body before its authentication
+# runs.
+OVERSIZED_BODY_ROUTES = (
+    ("POST", "/api/acl/grants"),
+    ("POST", "/api/ai/commit"),
+    ("POST", "/api/auth/groups"),
+    ("POST", "/api/cabling/topologies"),
+    ("PUT", "/api/config/settings"),
+    ("POST", "/api/execution/device-check"),
+    ("POST", "/api/inventory/devices"),
+    ("PUT", "/api/notifications/notifications/preferences"),
+    ("PATCH", "/api/reservations/00000000-0000-0000-0000-000000000000"),
+    ("POST", "/api/secrets/secrets"),
+    ("PUT", "/api/user-profile/preferences"),
+    ("POST", "/api/v1/webhooks"),
+)
+
+
+class OversizedBodySender(HerdUser):
+    """One user that sends request bodies one byte over the limit, beside the others.
+
+    It never signs in, so it costs no login attempts. Each task sends a body of
+    MAX_REQUEST_BODY_BYTES + 1 bytes that is not JSON to one route of every
+    service in turn, half the time with a Content-Length (refused before the
+    service reads a byte) and half the time chunked (refused when the count passes
+    the limit). Every answer must be 413 with the one `body_too_large` item naming
+    the limit; any other answer (a 401, which would mean authentication ran first,
+    a 422, which would mean the body was parsed, a 5xx, a timeout) is a recorded
+    failure and the run exits 1.
+
+    What it shows: each refusal costs the service a few chunks of reading, not a
+    parse, so the other users' latencies in the same report stay where they are
+    without it (compare a run that names the other classes on the command line,
+    leaving this one out).
+    """
+
+    fixed_count = 1
+    wait_time = between(1, 2)
+
+    _body = b"x" * (MAX_REQUEST_BODY_BYTES + 1)
+    _expected = {
+        "detail": [
+            {
+                "type": "body_too_large",
+                "loc": ["body"],
+                "msg": f"Request body is larger than {MAX_REQUEST_BODY_BYTES} bytes",
+            }
+        ]
+    }
+
+    def on_start(self):
+        self._next = 0
+
+    def _chunks(self):
+        step = 256 * 1024
+        for start in range(0, len(self._body), step):
+            yield self._body[start : start + step]
+
+    @task
+    def send_oversized_body(self):
+        method, path = OVERSIZED_BODY_ROUTES[self._next % len(OVERSIZED_BODY_ROUTES)]
+        chunked = (self._next // len(OVERSIZED_BODY_ROUTES)) % 2 == 1
+        self._next += 1
+        name = f"{path} [413 over the body limit{', chunked' if chunked else ''}]"
+        with self.client.request(
+            method,
+            path,
+            data=self._chunks() if chunked else self._body,
+            headers={"content-type": "application/json"},
+            verify=False,
+            name=name,
+            catch_response=True,
+        ) as resp:
+            if resp.status_code != 413:
+                resp.failure(f"HTTP {resp.status_code}, expected 413")
+                return
+            try:
+                body = resp.json()
+            except ValueError:
+                resp.failure("413 without a JSON body")
+                return
+            if body != self._expected:
+                resp.failure("413 body is not the one body_too_large item")
+            else:
+                resp.success()
 
 
 # --- Single sign-on (ADR 0016 phase 5b, D12 level 4) ---------------------------

@@ -83,13 +83,69 @@ exactly:
   OPS-VALID-8 (`docs/specs/operations-and-observability.md`); they are observations,
   not a bound.
 
+A request body is bounded in size, for every body and every service, config included
+(issue #1466). Nothing else bounds one: the gateway has no body limit, uvicorn has none,
+and FastAPI reads and parses a whole JSON body before a route's dependencies run, so
+before authentication. So `install_validation_errors` also installs `LimitRequestBody`,
+outside the surrogate check. What it guarantees, exactly:
+
+- A route's limit is `max_body_bytes` (each service passes its
+  `MAX_REQUEST_BODY_BYTES` setting), or, for a route whose endpoint is marked with
+  `extends_body_limit(extra_bytes)`, `max_body_bytes + extra_bytes()`. The mark is the
+  one way to raise a route's limit; it is used for two reasons only: an upload (the
+  files the route itself already bounds) and a route another HERD service forwards a
+  body to (`FORWARD_ENVELOPE_BYTES`, what the forwarding service adds to a body it
+  admitted).
+- It judges a body when the app first reads it, after routing, so it knows the route.
+  A request whose `Content-Length` declares more than the limit is refused at that
+  first read, before one byte of the body is read. Otherwise each `http.request`
+  message is counted as it is handed on, and the read that takes the count past the
+  limit is refused instead of handed on: a chunked body, or one longer than its
+  `Content-Length` said, never reaches the app past the limit. A body of exactly the
+  limit is accepted. A `Content-Length` that is not a whole number is ignored (an HTTP
+  server refuses one before the app runs); the count still bounds that body. Several
+  `Content-Length` headers are each judged; any length of digits is compared exactly.
+- The refusal is 413 with the one item `body_too_large_error(limit)`,
+  `{"type": "body_too_large", "loc": ["body"], "msg": "Request body is larger than
+  <limit> bytes"}`. It names the limit, never the body, and never grows with it. It
+  does not close the connection: closing with the client still sending makes the
+  kernel reset the connection, and a client that is still writing (httpx, the
+  gateway) then sees the reset instead of the 413. What is left of the body is read
+  and discarded by the HTTP server (uvicorn drops body data that arrives after the
+  response is complete, in both its h11 and httptools protocols), so memory and parse
+  work stay bounded, but the bytes still cross the network: this check does not bound
+  bandwidth. One INFO log line names the limit and whether the body was declared or
+  received over it; never any of its content.
+- It refuses when the body is read, so a route that never reads its body, an unknown
+  route, and a method not allowed answer as before (nothing of the body is read, so
+  nothing is buffered). One known limit: a route that STREAMS its response without
+  reading its body has the body read by the response's disconnect listener, and
+  behind the request logger a declared over-limit body then ends in a server error
+  instead of the stream (OPS-VALID-9; no HERD route does this, and a streaming route
+  must read or drain its body first). Every route with a body (JSON or a form) reads it before its
+  dependencies run, so the refusal comes before authentication, as the surrogate
+  check's does; and the surrogate check reads through this one, so a body over the
+  limit is refused before it is scanned, and the scan never holds more than the limit.
+- Nothing is refused once the response has started, since the answer cannot change by
+  then. Starlette's disconnect listener (a streaming response to a route that never
+  read its body) can make the first read while the response is being started
+  concurrently, so before raising a refusal the check yields to the event loop once
+  and looks again; if the response started meanwhile, or had started before, the read
+  that would be refused, or that takes the count past the limit, answers
+  `http.disconnect` instead of handing the bytes on, which the listener takes as the
+  client leaving.
+- Its cost is constant per message and per request: no copy of the body, no second
+  pass, one scan of the headers at the first read. A websocket, the lifespan, and a
+  request whose body is never read pass through with nothing judged.
+
 Every service installs it from its `app/main.py`; `tests/unit/test_validation_errors_wiring.py`
 fails when one does not. The config service, which must not import herd_common,
 installs a standalone copy (`services/config/app/validation_errors.py`) whose code is
 pinned identical to this module's by `services/config/tests/test_validation_errors.py`,
 and installs it with `refuse_lone_surrogates=False`: config already judges a lone
 surrogate in each password with an answer of its own (OPS-CONFIG-8), which the body
-check would replace. The wiring guard allows that keyword to config alone.
+check would replace. The wiring guard allows that keyword to config alone. Config
+installs the body limit like every other service.
 First written for auth (issue #1426), copied for config (issue #1428).
 """
 
@@ -97,13 +153,18 @@ from __future__ import annotations
 
 import email.message
 import json
+import logging
 import re
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
+import anyio.lowlevel
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.middleware import Middleware
+
+logger = logging.getLogger(__name__)
 
 _LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 
@@ -320,24 +381,207 @@ class RefuseLoneSurrogates:
         await self.app(scope, receive_checked, send_tracking_start)
 
 
-def install_validation_errors(app: FastAPI, *, refuse_lone_surrogates: bool = True) -> None:
-    """Use `validation_error_handler` for every 422 and advertise its shape, and,
-    unless `refuse_lone_surrogates` is False (the config service alone), refuse a
-    request body holding a lone surrogate with `RefuseLoneSurrogates`.
+# The default of every service's MAX_REQUEST_BODY_BYTES setting (issue #1466): the
+# largest legitimate JSON body is a topology canvas save, whose device nodes carry the
+# whole device record, about 1.3 KB a device and 0.5 KB a link, so 1,000 devices and
+# 4,000 links come to about 3.1 MiB. Changing the default is this one line; the copy
+# test and the compose wiring tests make the other places follow.
+DEFAULT_MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
+
+# The smallest MAX_REQUEST_BODY_BYTES a service accepts: every body one HERD service
+# sends another that carries neither a request body nor a stored document (lists of
+# at most 500 ids, a 2,000-character purpose) is smaller than this, so no setting can
+# make those internal calls fail (the forwarding table in
+# tests/unit/test_request_body_limit_wiring.py states each one's bound).
+MIN_MAX_REQUEST_BODY_BYTES = 64 * 1024
+
+# What a HERD service adds to a body it admitted, or to a stored document, when it
+# forwards it to another service; the receiving route is marked with
+# `extends_body_limit(lambda: FORWARD_ENVELOPE_BYTES)`. The largest addition is the
+# notifications preference merge (the stored preferences, at most a 64 KiB blob in
+# user-profile, plus the update); the others add at most about 10 KB (250 device ids
+# on a fork save).
+FORWARD_ENVELOPE_BYTES = 256 * 1024
+
+BODY_TOO_LARGE_TYPE = "body_too_large"
+
+# The attribute `extends_body_limit` sets on a route's endpoint.
+EXTRA_BODY_BYTES_ATTRIBUTE = "herd_extra_body_bytes"
+
+_Endpoint = TypeVar("_Endpoint", bound=Callable[..., Any])
+
+
+def body_too_large_error(limit: int) -> dict[str, Any]:
+    """The one item of the 413: it names the limit, never anything of the body."""
+    return {
+        "type": BODY_TOO_LARGE_TYPE,
+        "loc": ["body"],
+        "msg": f"Request body is larger than {limit} bytes",
+    }
+
+
+def max_body_bytes_from_text(raw: str) -> int | None:
+    """`MAX_REQUEST_BODY_BYTES` read from text the one way both readers use: ASCII
+    decimal digits, surrounding whitespace ignored, at least
+    `MIN_MAX_REQUEST_BODY_BYTES`. Anything else (a sign, a decimal point, an exponent,
+    an underscore, a value below the floor) is None."""
+    digits = raw.strip()
+    if not (digits.isascii() and digits.isdigit()):
+        return None
+    value = int(digits)
+    return value if value >= MIN_MAX_REQUEST_BODY_BYTES else None
+
+
+def extends_body_limit(extra_bytes: Callable[[], int]) -> Callable[[_Endpoint], _Endpoint]:
+    """Mark a route endpoint whose body may hold `extra_bytes()` more than the default
+    limit: an upload route (the files it bounds itself) or a route another HERD
+    service forwards a body to (`FORWARD_ENVELOPE_BYTES`). `extra_bytes` is called at
+    each request, so it reads the bound the route enforces (a setting) rather than a
+    copy of it. Place it under the route decorator; the endpoint is returned
+    unchanged."""
+
+    def mark(endpoint: _Endpoint) -> _Endpoint:
+        setattr(endpoint, EXTRA_BODY_BYTES_ATTRIBUTE, extra_bytes)
+        return endpoint
+
+    return mark
+
+
+def route_body_limit(route: Any, max_body_bytes: int) -> int:
+    """The body limit of a route: `max_body_bytes`, plus its extra bytes when its
+    endpoint is marked with `extends_body_limit`. Any other route (none matched yet, a
+    route with no endpoint) takes `max_body_bytes`."""
+    extra_bytes = getattr(getattr(route, "endpoint", None), EXTRA_BODY_BYTES_ATTRIBUTE, None)
+    if extra_bytes is None:
+        return max_body_bytes
+    return max_body_bytes + extra_bytes()
+
+
+def declares_more_than(headers: Any, limit: int) -> bool:
+    """Whether any `Content-Length` header declares more than `limit` bytes. A value
+    that is not a whole number (empty, negative, text) declares nothing. The digits
+    are compared by length first, so a value of any length is judged exactly and none
+    longer than the limit's own digits is converted."""
+    limit_digits = len(str(limit))
+    for name, value in headers:
+        if name == b"content-length":
+            digits = value.strip()
+            if not digits.isdigit():
+                continue
+            significant = digits.lstrip(b"0")
+            if len(significant) > limit_digits or (
+                len(significant) == limit_digits and int(significant) > limit
+            ):
+                return True
+    return False
+
+
+def _log_refusal(limit: int, reason: str) -> None:
+    logger.info(
+        "Request body refused: %s over the limit of %d bytes",
+        reason,
+        limit,
+        extra={"action": "request_body_too_large", "limit_bytes": limit, "reason": reason},
+    )
+
+
+class LimitRequestBody:
+    """ASGI middleware: a request body over its route's limit is a 413.
+
+    For an HTTP request it wraps `receive`. At the first read (after routing, so
+    `scope["route"]` names the route) it takes the route's limit
+    (`route_body_limit`), and a `Content-Length` declaring more is refused before
+    anything is read. Each `http.request` message is then counted, and the read that
+    takes the count past the limit raises `HTTPException(413)` (FastAPI's body reader
+    passes it on, as for the surrogate check) instead of handing the message on.
+    Before raising, it yields to the event loop once: if the response has started by
+    then (a streaming response whose disconnect listener made the read), or had
+    started before, nothing is refused and the read answers `http.disconnect`, as
+    does every later read. Messages are handed on as received, never copied or
+    joined.
+    """
+
+    def __init__(self, app: Any, max_body_bytes: int) -> None:
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        limit = -1  # judged at the first read
+        received = 0
+        over = False
+        started = False
+
+        async def send_tracking_start(message: Any) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        async def refuse(reason: str) -> Any:
+            nonlocal over
+            over = True
+            # A read the route makes is never concurrent with a response it has not
+            # returned yet; a read made by a streaming response's disconnect listener
+            # is, and that response's start may be one scheduling step away.
+            if not started:
+                await anyio.lowlevel.checkpoint()
+            if started:
+                return {"type": "http.disconnect"}
+            _log_refusal(limit, reason)
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail=[body_too_large_error(limit)],
+            )
+
+        async def receive_limited() -> Any:
+            nonlocal limit, received
+            if over:
+                return await refuse("received")
+            if limit < 0:
+                limit = route_body_limit(scope.get("route"), self.max_body_bytes)
+                if declares_more_than(scope.get("headers", ()), limit):
+                    return await refuse("declared")
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    return await refuse("received")
+            return message
+
+        await self.app(scope, receive_limited, send_tracking_start)
+
+
+def install_validation_errors(
+    app: FastAPI, *, max_body_bytes: int, refuse_lone_surrogates: bool = True
+) -> None:
+    """Use `validation_error_handler` for every 422 and advertise its shape; bound
+    every request body with `LimitRequestBody` at `max_body_bytes` (the service's
+    `MAX_REQUEST_BODY_BYTES`); and, unless `refuse_lone_surrogates` is False (the
+    config service alone), refuse a request body holding a lone surrogate with
+    `RefuseLoneSurrogates`, inside the limit.
 
     The OpenAPI override is FastAPI's documented one: replace `app.openapi`
     with a function that builds the default document once, adjusts it, and
     caches it in `app.openapi_schema`.
     """
+    if isinstance(max_body_bytes, bool) or not isinstance(max_body_bytes, int):
+        raise TypeError("max_body_bytes must be an int")
+    if max_body_bytes < 1:
+        raise ValueError("max_body_bytes must be at least 1")
     app.add_exception_handler(RequestValidationError, validation_error_handler)
+    # Innermost, next to the routes, whatever the order of the app's other
+    # middleware: `add_middleware` would put them outermost, and a
+    # BaseHTTPMiddleware (the request logger) runs the `receive` it passes on in a
+    # task group, which wraps a refusal in an ExceptionGroup that FastAPI's body
+    # reader turns into a 400. The limit goes first, so the surrogate check reads
+    # through it. The same guard as `add_middleware`.
+    if app.middleware_stack is not None:
+        raise RuntimeError("Cannot add middleware after an application has started")
+    app.user_middleware.append(Middleware(LimitRequestBody, max_body_bytes=max_body_bytes))
     if refuse_lone_surrogates:
-        # Innermost, next to the routes, whatever the order of the app's other
-        # middleware: `add_middleware` would put it outermost, and a
-        # BaseHTTPMiddleware (the request logger) runs the `receive` it passes on in a
-        # task group, which wraps the refusal in an ExceptionGroup that FastAPI's body
-        # reader turns into a 400. The same guard as `add_middleware`.
-        if app.middleware_stack is not None:
-            raise RuntimeError("Cannot add middleware after an application has started")
         app.user_middleware.append(Middleware(RefuseLoneSurrogates))
 
     def openapi() -> dict[str, Any]:
