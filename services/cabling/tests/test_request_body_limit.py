@@ -180,70 +180,107 @@ async def test_a_large_json_route_takes_the_allowance(method, path):
 
 
 def _editor_canvas(devices: int, links: int) -> dict:
-    """A canvas in the shape the topology editor saves (persistableCanvasNodes: a device
-    node carries the seven allowlisted device keys; a link carries its layer and port
-    names), with realistic names."""
-    nodes = [
-        {
-            "id": f"node-{i}",
+    """A canvas in the shape the topology editor's Save sends (`persistableCanvas` in
+    `frontend/src/pages/TopologyEditorPage.tsx`), field by field, with realistic values.
+    The body is `{"canvas_data": canvas}` as JSON.stringify writes it (compact)."""
+
+    def node(i: int) -> dict:
+        return {
+            # genId() in frontend/src/lib/id.ts: crypto.randomUUID().
+            "id": str(uuid.UUID(int=i + 1)),
+            # TopologyEditorPage.tsx onDrop: type "deviceNode", the drop position (a
+            # dragged node's coordinates are doubles with up to 17 digits).
             "type": "deviceNode",
-            "position": {"x": 1234.5678 + i, "y": 987.6543 + i},
+            "position": {"x": 1234.5678901234567, "y": 987.6543210987654},
             "data": {
+                # persistableDevice in frontend/src/lib/canvasNodes.ts: the seven
+                # PERSISTABLE_DEVICE_KEYS of the device record.
                 "device": {
-                    "id": str(uuid.UUID(int=i)),
+                    "id": str(uuid.UUID(int=10**6 + i)),
                     "name": f"lab-rack{i // 40:02d}-leaf-switch-{i:04d}",
                     "topology_type": "PHYSICAL",
                     "connection_type": "Layer 2 Switch",
                     "status": "AVAILABLE",
                     "template_name": "Arista 7050SX3-48YC8 Leaf Switch",
                     "template_icon": "switch",
-                }
+                },
+                # TopologyEditorPage.tsx onDrop: label and topologyType beside device.
+                "label": f"lab-rack{i // 40:02d}-leaf-switch-{i:04d}",
+                "topologyType": "PHYSICAL",
             },
+            # @xyflow/react 12 keeps these on every node in the store, and
+            # persistableCanvasNodes passes the node through whole.
+            "measured": {"width": 196, "height": 72},
+            "selected": False,
+            "dragging": False,
         }
-        for i in range(devices)
-    ]
-    edges = [
-        {
-            "id": f"edge-{j}",
-            "source": f"node-{j % devices}",
-            "target": f"node-{(j * 7 + 1) % devices}",
+
+    def edge(j: int) -> dict:
+        return {
+            # buildEnrichedEdge in frontend/src/stores/topologyStore.ts: genId(), the
+            # two node ids, the DeviceNode handle ids, type "layerEdge".
+            "id": str(uuid.UUID(int=2 * 10**6 + j)),
+            "source": str(uuid.UUID(int=j % devices + 1)),
+            "target": str(uuid.UUID(int=(j * 7 + 1) % devices + 1)),
             "sourceHandle": "bottom",
             "targetHandle": "top",
             "type": "layerEdge",
+            # handleWiringConfirm in TopologyEditorPage.tsx (the wiring dialog's
+            # per-line data, the same keys QuickConnectPopover.tsx sends), then
+            # pathValid and pathHopCount from the store's path updates
+            # (topologyStore.ts); stripTransientEdgeFields drops only selected,
+            # animated, style, zIndex, and serverInvalidReason.
             "data": {
                 "layer": "L1",
+                "source_port_id": str(uuid.UUID(int=3 * 10**6 + j)),
                 "source_port_name": f"Ethernet{j % 48 + 1}/1",
+                "target_port_id": str(uuid.UUID(int=4 * 10**6 + j)),
                 "target_port_name": f"Ethernet{j % 52 + 1}/1",
-                "isProposal": False,
+                "portsCabled": True,
+                "pathValid": True,
+                "pathHopCount": 1,
             },
         }
-        for j in range(links)
-    ]
-    return {"nodes": nodes, "edges": edges, "selectedEdgeLayer": "L1"}
+
+    return {
+        "nodes": [node(i) for i in range(devices)],
+        "edges": [edge(j) for j in range(links)],
+        "selectedEdgeLayer": "L1",
+    }
+
+
+# The measures, pinned: 1,000 devices and 4,000 links; a 250-device reservation's canvas
+# with 1,000 links; and the most devices, with four links each, the canvas routes' limit
+# at the defaults (4456448 bytes) holds (1,776 within the 4 MiB allowance alone).
+CANVAS_1000_4000_BYTES = 2_361_613
+CANVAS_250_1000_BYTES = 590_443
+CANVAS_CAPACITY = 1_887
+
+
+def _canvas_put_bytes(devices: int, links: int) -> int:
+    import json
+
+    body = json.dumps({"canvas_data": _editor_canvas(devices, links)}, separators=(",", ":"))
+    return len(body.encode("utf-8"))
 
 
 def test_a_generated_large_canvas_is_over_the_default_and_under_the_allowance():
-    """The measure behind the canvas routes' mark: 1,000 devices and 4,000 links in the
-    editor's save shape need more than the default and fit the large-JSON limit, with
-    room for what #1466 measured with whole device records (about 3.1 MiB)."""
-    import json
-
+    """The measure behind the canvas routes' mark, in the editor's save shape: 1,000
+    devices and 4,000 links need more than the default and fit the large-JSON limit;
+    a 250-device reservation's canvas with 1,000 links is already over the default;
+    and the limit holds up to 1,887 devices with four links each."""
     from herd_common.validation_errors import (
         DEFAULT_MAX_REQUEST_BODY_BYTES,
         LARGE_JSON_BODY_BYTES,
     )
 
-    body = json.dumps({"canvas_data": _editor_canvas(1000, 4000)}, separators=(",", ":"))
-    size = len(body.encode("utf-8"))
-    assert (
-        DEFAULT_MAX_REQUEST_BODY_BYTES
-        < size
-        < DEFAULT_MAX_REQUEST_BODY_BYTES + LARGE_JSON_BODY_BYTES
-    )
-    assert size == 1_272_167
-    # A reservation holds at most 250 devices; that canvas alone passes the default.
-    reservation = json.dumps({"canvas_data": _editor_canvas(250, 1000)}, separators=(",", ":"))
-    assert len(reservation) > DEFAULT_MAX_REQUEST_BODY_BYTES
+    large_limit = DEFAULT_MAX_REQUEST_BODY_BYTES + LARGE_JSON_BODY_BYTES
+    size = _canvas_put_bytes(1000, 4000)
+    assert DEFAULT_MAX_REQUEST_BODY_BYTES < size < large_limit
+    assert size == CANVAS_1000_4000_BYTES
+    assert _canvas_put_bytes(250, 1000) == CANVAS_250_1000_BYTES > DEFAULT_MAX_REQUEST_BODY_BYTES
+    assert _canvas_put_bytes(CANVAS_CAPACITY, 4 * CANVAS_CAPACITY) <= large_limit
+    assert _canvas_put_bytes(CANVAS_CAPACITY + 1, 4 * CANVAS_CAPACITY + 4) > large_limit
 
 
 def _largest_pathfind_batch() -> bytes:

@@ -10,6 +10,12 @@ device, so the test needs no seeded inventory), opens it in the editor, clicks S
 and asserts the editor's own PUT carried more than the default and answered 200, then
 reads the canvas back.
 
+What it sends: 300 network element nodes (`networkElementNode`, about 1.4 KB each
+with their descriptive `attrs`, about 413 KB seeded) and no edges, as the editor
+saves them (it persists an element node as it holds it). It is not the editor's
+device-node shape (`services/cabling/tests/test_request_body_limit.py` pins that
+one); the body limit judges bytes, not shape.
+
 Self-seeding: one topology under a per-run name, no device, cable, port, or
 reservation, so teardown deletes the topology and checks it is gone.
 """

@@ -1040,12 +1040,18 @@ class LargeCanvasSaver(HerdUser):
     OversizedBodySender (issue #1484).
 
     on_start signs in once and creates one topology; each task saves the same canvas,
-    MAX_REQUEST_BODY_BYTES plus a quarter of the large-JSON allowance (about 1.3 MiB at
-    the defaults: a topology of several hundred devices), to
+    MAX_REQUEST_BODY_BYTES plus a quarter of the large-JSON allowance (1310720 bytes at
+    the defaults), to
     `PUT /api/cabling/topologies/{id}`. Every save must answer 200; a 413 means the
     route lost its mark, and anything else fails the run too. The canvas does not
     change between saves, so after the first save no version row is written: the load
     is the parse and the compare, not storage. on_stop deletes the topology.
+
+    What it sends: network element nodes (`networkElementNode`, about 700 bytes each
+    with their descriptive `attrs`, about 1,880 of them) and no edges, which cabling
+    stores as sent and which need no seeded device. It is not the editor's device-node
+    shape (`services/cabling/tests/test_request_body_limit.py` pins that one); the
+    body limit judges bytes, not shape, so the save costs the same parse.
 
     What it shows: its latency next to OversizedBodySender's refusals, and, in a run
     that leaves the sender out (name the other classes on the command line), how much

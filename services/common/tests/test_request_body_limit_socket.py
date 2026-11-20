@@ -219,10 +219,11 @@ async def test_a_body_at_a_large_json_routes_limit_reaches_it(http):
 async def test_refusing_a_64_mib_chunked_body_holds_no_more_than_the_limit(http):
     """The server reads the body up to the limit (the route's own body reader and the
     surrogate check each join what they read), refuses, and then discards the other
-    60 MiB as they arrive. Sent to the large-JSON route, whose limit (4.25 MiB) is the
-    most a JSON refusal reads: the peak of everything this process allocates while
-    that happens, client and server, stays under three times that limit, so under a
-    fifth of the body: nothing holds the discarded part."""
+    60 MiB as they arrive. Sent to a large-JSON route, whose limit (4.25 MiB) is what
+    most large JSON refusals read (a forward route reads up to 4.5 MiB, the package
+    validator about 13.6 MiB of base64): the peak of everything this process
+    allocates while that happens, client and server, stays under three times that
+    limit, so under a fifth of the body: nothing holds the discarded part."""
     total = 64 * _MIB
     async with _serving(_app([]), http) as base_url, _client(base_url) as client:
         await client.get("/ok")  # the connection and the app are warm before measuring

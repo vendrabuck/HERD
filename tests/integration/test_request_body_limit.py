@@ -20,12 +20,18 @@ A route that legitimately takes a large JSON body (a canvas save, issue #1484) t
 the limit plus `LARGE_JSON_BODY_BYTES`: one test signs in once as the admin (the
 session fixture every stack suite shares) and saves a canvas of exactly that limit,
 then one byte more; another sends such a route a body one byte over the default
-without signing in and sees authentication answer, not the 413.
+without signing in and sees authentication answer, not the 413. The fork path, the
+only large body forwarded twice over (reservations admits it at the large-JSON limit
+and forwards it to cabling's internal fork routes, which add the envelope), is driven
+end to end with a fork canvas of about 1 MiB, following
+`test_reservation_fork_flow.py`: one reserved device, its reservation released and
+the topology deleted through the checked helper.
 """
 
 import json
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -207,3 +213,83 @@ async def test_a_large_json_route_reads_a_body_over_the_default_to_authenticatio
     async with _client(base_url) as client:
         resp = await client.request(method, path, content=body, headers=JSON)
     assert resp.status_code in (401, 403), resp.text[:300]
+
+
+FORK_CANVAS_BYTES = 1024 * 1024
+
+
+def _fork_canvas(device_id: str, size: int) -> dict:
+    """The reserved device's node plus network element nodes whose descriptive attrs
+    pad the canvas PUT body to `size` bytes (no edge, so the save builds no wire)."""
+    canvas = json.loads(_canvas_body(size - 200))["canvas_data"]
+    canvas["nodes"].insert(
+        0,
+        {
+            "id": "n-device",
+            "type": "deviceNode",
+            "position": {"x": 0, "y": 0},
+            "data": {"device": {"id": device_id}},
+        },
+    )
+    return canvas
+
+
+async def test_a_fork_canvas_over_the_default_is_saved_through_reservations_to_cabling(
+    admin_client, fresh_devices
+):
+    """Signed in (the shared session login): a fork canvas of about 1 MiB, over the
+    default and under the large-JSON limit, is accepted by reservations'
+    `PUT /{id}/fork/canvas` and `POST /{id}/fork/save` and by the cabling internal
+    fork routes they forward it to (the large-JSON allowance plus the envelope), and
+    reads back whole. Teardown: release the reservation, then delete the topology
+    through the checked helper; the device fixture deletes the device."""
+    devices = await fresh_devices(1)
+    device_id = devices[0]["id"]
+    created = await admin_client.post(
+        "/cabling/topologies", json={"name": f"body-limit-fork-{uuid.uuid4().hex[:8]}"}
+    )
+    assert created.status_code == 201, created.text[:300]
+    topology_id = created.json()["id"]
+    reservation_id = None
+    try:
+        seeded = await admin_client.put(
+            f"/cabling/topologies/{topology_id}",
+            json={"canvas_data": _fork_canvas(device_id, 4096)},
+        )
+        assert seeded.status_code == 200, seeded.text[:300]
+        now = datetime.now(timezone.utc)
+        reserved = await admin_client.post(
+            "/reservations/",
+            json={
+                "device_ids": [device_id],
+                "topology_id": topology_id,
+                "purpose": "fork body limit integration",
+                "start_time": now.isoformat(),
+                "end_time": (now + timedelta(hours=1)).isoformat(),
+            },
+        )
+        assert reserved.status_code == 201, reserved.text[:300]
+        reservation_id = reserved.json()["id"]
+
+        canvas = _fork_canvas(device_id, FORK_CANVAS_BYTES)
+        body = json.dumps({"canvas_data": canvas}, separators=(",", ":")).encode()
+        assert LIMIT < len(body) < LARGE_LIMIT
+        drafted = await admin_client.put(
+            f"/reservations/{reservation_id}/fork/canvas", content=body, headers=JSON
+        )
+        assert drafted.status_code == 200, drafted.text[:300]
+        saved = await admin_client.post(
+            f"/reservations/{reservation_id}/fork/save", content=body, headers=JSON
+        )
+        assert saved.status_code == 200, saved.text[:300]
+        assert saved.json()["built"] == []
+
+        fork = await admin_client.get(f"/reservations/{reservation_id}/fork")
+        assert fork.status_code == 200, fork.text[:300]
+        ids = [n["id"] for n in fork.json()["canvas_data"]["nodes"]]
+        assert ids == [n["id"] for n in canvas["nodes"]]
+    finally:
+        if reservation_id:
+            released = await admin_client.put(f"/reservations/{reservation_id}/release")
+            assert released.status_code == 200, released.text[:300]
+        await delete_topology_checked(admin_client, topology_id)

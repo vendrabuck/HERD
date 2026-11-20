@@ -682,7 +682,7 @@ async def test_a_canvas_one_byte_over_the_limit_is_refused(monkeypatch):
 def test_the_canvas_limit_is_the_setting_plus_the_large_json_allowance():
     """Cabling's canvas PUT is marked with `LARGE_JSON_BODY_BYTES`, which adds to the
     setting both services read; at the defaults a canvas well over the default limit
-    (a 1,000-device topology is about 3.1 MiB) is not refused here."""
+    (a 1,000-device canvas in the editor's shape is 2361613 bytes) is not refused here."""
     from herd_common.validation_errors import (
         DEFAULT_MAX_REQUEST_BODY_BYTES,
         LARGE_JSON_BODY_BYTES,

@@ -194,7 +194,8 @@ async def create_connection_endpoint(
 
 
 @router.post("/bulk", response_model=ConnectionBulkReport)
-# Up to 200 items of up to 2,724 bytes each by the schema's bounds, about 545 KB
+# Up to 200 items of up to 2,723 bytes each of ASCII by the schema's bounds, 544811
+# bytes in all
 # (issue #1484): a large JSON body.
 @extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)
 async def create_connections_bulk_endpoint(

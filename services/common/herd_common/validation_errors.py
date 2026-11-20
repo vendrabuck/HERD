@@ -401,8 +401,9 @@ DEFAULT_MAX_REQUEST_BODY_BYTES = 256 * 1024
 
 # What a route that legitimately takes a large JSON body adds to MAX_REQUEST_BODY_BYTES
 # (issue #1484), marked with `extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)`: a
-# topology canvas (as #1466 measured it, about 1.3 KB a device and 0.5 KB a link, so
-# 1,000 devices and 4,000 links come to about 3.1 MiB), a device configuration, a
+# topology canvas (in the editor's save shape about 520 bytes a device node and 460 a
+# link, so 1,000 devices and 4,000 links come to 2361613 bytes, and the routes' limit at
+# the defaults holds 1,887 devices with four links each), a device configuration, a
 # commit, and a bulk connection create. Like every mark it adds to the setting, so an
 # operator who raises MAX_REQUEST_BODY_BYTES raises these routes by as much.
 LARGE_JSON_BODY_BYTES = 4 * 1024 * 1024

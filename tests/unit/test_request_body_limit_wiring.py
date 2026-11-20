@@ -43,15 +43,17 @@ and the upload settings set to values no default has. For each built app:
   enforce (`DRIVER_MAX_SIZE_BYTES`, `UPLOAD_MAX_FILES` times `UPLOAD_MAX_FILE_BYTES`,
   the base64 length of `VALIDATE_PACKAGE_MAX_BYTES`), set here to odd values to prove
   it;
-- every JSON route whose schema admits a body larger than the shipped default
-  (`schema_body_estimate` over the app's OpenAPI document: compact JSON, every declared
-  property present, a bounded string at one byte a character) carries a mark. A
-  schema that bounds nothing (a free-form mapping, a string or list with no bound,
-  `Any`, a bound a validator checks in code) is not judged: whether such a route takes
-  a large body is the reviewed decision `LARGE_JSON_ROUTES` records, and the routes
-  measured to fit the default are in `MEASURED_UNDER_THE_DEFAULT`, whose bodies the
-  services' suites build and send. A route left out of the OpenAPI document is not
-  estimated;
+- every JSON route whose schema admits a body larger than the shipped default carries
+  a mark. `schema_body_estimate` reads the app's OpenAPI document and gives an upper
+  bound on the compact body a standard encoder writes (its docstring states every
+  assumption: canonical UUIDs and timestamps, 6 bytes a character of a free string, 24
+  a number). A schema that bounds nothing (a free-form mapping, a model that keeps
+  extra keys, a string or list with no bound, `Any`, a bound a validator checks in
+  code) has no estimate: every unmarked JSON route with none is listed, both ways, in
+  `UNBOUNDED_AT_THE_DEFAULT` with why its body is small, or measured in
+  `MEASURED_UNDER_THE_DEFAULT`, whose bodies the services' suites build and send. So
+  a new unbounded field on an unmarked route fails until someone decides. A route
+  left out of the OpenAPI document is not estimated;
 - `docker-compose.yml` passes `MAX_REQUEST_BODY_BYTES` to all twelve services as
   `${MAX_REQUEST_BODY_BYTES:-<default>}` with the shared default (the Settings-based
   services are also held by `test_compose_settings_wiring.py`; config is not, since
@@ -70,22 +72,40 @@ listed by decision. `streaming_reasons` decides that a built route streams in th
 ways, each a class whose MRO holds a class named `StreamingResponse` or
 `EventSourceResponse` (so a subclass counts):
 
-- its `response_class`, declared on the route or inherited from its router or the app;
+- its `response_class`, declared on the route or inherited from its router, an
+  `include_router` default, or the app (also on a route added with `add_api_route`);
 - its endpoint's return annotation, also inside a union, `Optional`, or `Annotated`;
-- a `return` in the endpoint's own body (not in a function, lambda, or class defined
-  inside it) of a call to such a class, directly or through a local name assigned once
-  in the endpoint; the callee is resolved in the endpoint's module (a name, or an
-  attribute of one), and a callee the module does not hold counts when its own name
-  is one of the two.
+  an annotation left as text (a string or a forward reference that does not resolve)
+  counts when any name in it is one of the two;
+- a returned call of such a class (`_returned_streaming_calls`). Read from the source
+  of the endpoint (unwrapped through `__wrapped__`), of every function its closure
+  holds (so the real endpoint under a decorator without `functools.wraps`), and of a
+  lambda endpoint (its body). In a function's own body, not in a function, lambda, or
+  class defined inside it, each `return` value is followed through both branches of
+  a conditional expression, every operand of `and` and `or`, `await`, a walrus, and a
+  local name bound exactly once (by `=`, `: T =`, `+=`, a walrus, or a tuple or list
+  unpacking matched element by element). The callee is resolved in the function's
+  module (a name, or an attribute of one), a `functools.partial` object or a local
+  `partial(...)` call is unwrapped to the class it wraps, and a callee the module does
+  not hold counts when its own name is one of the two or an alias an import gives one
+  of them (`from sse_starlette.sse import EventSourceResponse as Sse`, in the function
+  or anywhere in its module, installed or not).
 
-The scan does not see: a streaming response built in another function and returned
-(`return make_stream()`), returned from a dependency, raised, or sent through the ASGI
-`send`; a local name assigned more than once; a response class with a disconnect
-listener of another name that does not derive from either; an endpoint whose source
-`inspect` cannot read; and a route FastAPI does not enumerate (see Limits). A route
-that reads its body by hand (`await request.body()`) before it streams has no body
-parameter, so it is flagged and must be listed. Fixture sources in this module prove
-each way both directions.
+Limits of the streaming scan. It does not see: a streaming response built in another
+function and returned (`return make_stream()`, `return await make_stream()`), returned
+from a dependency, raised, or sent through the ASGI `send`; a local name bound more
+than once, or bound by a `for` or `with` target; a value unpacked from anything but a
+tuple or list literal of the same length; a partial built by another helper than
+`functools.partial`; an alias made by plain assignment (`Sse = EventSourceResponse`
+when the module lacks the class); a response class with a disconnect listener of
+another name that does not derive from either (a `Response` subclass whose `__call__`
+reads `receive`); a decorator that keeps the endpoint somewhere other than
+`__wrapped__` or its closure; an endpoint, or a lambda spread over several lines,
+whose source `inspect` cannot read or parse; and a route FastAPI does not enumerate
+(see Limits). A route that reads its body by hand (`await request.body()`) before it
+streams has no body parameter, so it is flagged and must be listed; so is a `GET`
+route that streams, since a client may still send it a body. Fixture sources in this
+module prove each spelling both ways.
 
 The forwarding table. `outbound_body_calls` scans every module under a service's
 `app/` and `herd_common`, and finds each call that sends a body:
@@ -148,10 +168,12 @@ from __future__ import annotations
 
 import ast
 import builtins
+import functools
 import importlib.util
 import inspect
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -240,6 +262,98 @@ MEASURED_UNDER_THE_DEFAULT = {
         139_319,
         "the same three fields as the PUT, each optional",
     ),
+}
+
+
+# Every unmarked JSON route whose schema bounds nothing (`schema_body_estimate` is
+# None), each with why its legitimate body stays far under the default (issue #1484):
+# the routes that stay at the default by decision. A route measured instead is in
+# MEASURED_UNDER_THE_DEFAULT. The guard fails on an unbounded unmarked route missing
+# here, and on a row whose route is gone, marked, or bounded now.
+_IDS = "ids and short words (a resource type, a permission)"
+_SHORT = "a few short strings; a token, an email, a password, or a name"
+UNBOUNDED_AT_THE_DEFAULT = {
+    ("acl", "POST", "/grants"): _IDS,
+    ("acl", "POST", "/check"): _IDS,
+    ("acl", "POST", "/check/batch"): "at most 500 resource ids (about 20 KB) and short words",
+    ("acl", "POST", "/internal/check"): _IDS,
+    ("ai-orchestrator", "POST", "/templates/suggest-identity"): (
+        "a template's name, description, and field sections, as inventory's template"
+        " create takes them (a form's fields)"
+    ),
+    ("ai-orchestrator", "POST", "/classify-purpose/preview"): (
+        "a 2,000-character purpose, at most 64 category names, 200 device ids, and the"
+        " capped dynamic requests"
+    ),
+    ("ai-orchestrator", "POST", "/internal/classify-purpose"): (
+        "reservations' bounded call: a 2,000-character purpose, 64 categories, 200 ids"
+    ),
+    ("auth", "POST", "/register"): _SHORT,
+    ("auth", "POST", "/refresh"): "one refresh token",
+    ("auth", "POST", "/logout"): "one refresh token",
+    ("auth", "PATCH", "/me/profile"): "a name, a contact email, and a phone number",
+    ("auth", "PATCH", "/users/{user_id}/profile"): "a name, a contact email, and a phone number",
+    ("auth", "POST", "/admin/federated-identities/rewrite-issuer"): "two issuer URLs and a flag",
+    ("auth", "PUT", "/users/{user_id}/federated-identity"): "an issuer, a subject, and an id",
+    ("auth", "POST", "/tokens/exchange"): "one token",
+    ("cabling", "POST", "/internal/forks"): (
+        "reservations' bounded call: three ids and at most 250 member device ids (11 KB)"
+    ),
+    ("cabling", "POST", "/internal/forks/{reservation_id}/prune-devices"): (
+        "reservations' bounded call: at most 250 device ids (10 KB)"
+    ),
+    ("cabling", "POST", "/templates/{template_id}/instantiate"): (
+        "a name and one device id per role of the template: about 80 bytes a role, so"
+        " about 150 KB for the 1,800 devices the canvas allowance holds"
+    ),
+    ("config", "POST", "/login"): "one password",
+    ("config", "POST", "/change-password"): "one password",
+    ("config", "PUT", "/settings"): "the values of CONFIG_SCHEMA's keys, a few kilobytes",
+    ("integration", "POST", "/reservations"): (
+        "a reservation create: at most 200 device ids, a 2,000-character purpose, times"
+    ),
+    ("integration", "POST", "/webhooks"): "a URL, a secret, a description, and event type names",
+    ("inventory", "POST", "/devices/{device_id}/config-versions/{version_id}/restore"): (
+        "one description"
+    ),
+    ("inventory", "POST", "/devices"): (
+        "by decision: a device's name and field_data, the values of its template's"
+        " typed fields (a form's values)"
+    ),
+    ("inventory", "POST", "/devices/internal"): (
+        "execution's call: two ids and the field_data a hypervisor driver returns"
+    ),
+    ("inventory", "POST", "/devices/resolve-by-name"): (
+        "cabling's import sends names in batches of at most 32 KiB (RESOLVE_BATCH_BYTES)"
+    ),
+    ("inventory", "PUT", "/devices/{device_id}"): "by decision: as the device create",
+    ("inventory", "PUT", "/drivers/{driver_id}"): "a name, a description, a connection type",
+    ("inventory", "POST", "/hypervisors"): "a name, an endpoint, a type, and ids",
+    ("inventory", "PUT", "/hypervisors/{hypervisor_id}"): "a name, an endpoint, a type, and ids",
+    ("inventory", "POST", "/devices/{device_id}/ports"): "a port's name and field_data",
+    ("inventory", "POST", "/devices/{device_id}/ports/bulk"): (
+        "one name prefix, two counts, and one field_data copied to every port"
+    ),
+    ("inventory", "PUT", "/ports/{port_id}"): "a port's name and field_data",
+    ("inventory", "POST", "/templates"): (
+        "by decision: a template's identity and field sections (a form's fields)"
+    ),
+    ("inventory", "PUT", "/templates/{template_id}"): "by decision: as the template create",
+    ("notifications", "PUT", "/notifications/preferences"): (
+        "channel settings and one flag per event type"
+    ),
+    ("reservations", "POST", "/internal/{reservation_id}/provision-result"): (
+        "execution's call: at most 50 device ids and a class-name error"
+    ),
+    ("reservations", "PATCH", "/{reservation_id}/purpose-category"): "one category name",
+    ("reservations", "POST", "/admin/purpose-review/{reservation_id}/accept"): (
+        "one category name"
+    ),
+    ("secrets", "POST", "/secrets"): (
+        "by decision: a key, a password, a token, or a generic secret; 256 KiB holds a"
+        " full public CA bundle in PEM"
+    ),
+    ("secrets", "PUT", "/secrets/{secret_id}"): "by decision: as the secret create",
 }
 
 
@@ -762,43 +876,98 @@ def test_the_route_tables_name_only_existing_services_and_routes():
 
 # -- The largest body a bounded schema admits (issue #1484) --------------------------
 
-# Fixed lengths of a JSON value of each string format, quotes included.
+# Bytes of a JSON string of each format, quotes included, in the canonical form every
+# HERD client sends: a hyphenated UUID (pydantic also takes the braced form and the
+# `urn:uuid:` form, up to 45 characters), and RFC 3339 dates and times with
+# microseconds and an offset (pydantic also takes any number of fraction digits).
 _FORMAT_BYTES = {"uuid": 38, "date-time": 34, "date": 12, "time": 23}
+# Bytes one character of a string may take in a body: 4 for a character outside the
+# Basic Multilingual Plane written as raw UTF-8, 6 for a control character, which a
+# JSON encoder must write as a `\u00XX` escape.
+_CHAR_BYTES = 6
+# Bytes of a number as JSON.stringify or Python's json writes a double (the longest
+# is -1.7976931348623157e+308, 24 characters).
+_NUMBER_BYTES = 24
+
+
+def _ascii_pattern_bytes(pattern: str) -> int | None:
+    """Bytes per character of a string whose `pattern` admits only ASCII characters
+    that JSON writes as themselves: 1, or 2 when `"` or a backslash is among them;
+    None when the pattern may admit any other character (a `.`, a negated class, a
+    class escape such as `\\w`, `\\d`, or `\\S`, which match beyond ASCII, a
+    hex or Unicode escape, or a non-ASCII or control-character literal)."""
+    if not pattern.isascii() or any(ord(c) < 0x20 for c in pattern):
+        return None
+    literal = re.sub(r"\\[^A-Za-z0-9]", "", pattern)
+    if "." in literal or "[^" in literal or re.search(r"\\[A-Za-z0-9]", literal):
+        return None
+    return 2 if '"' in pattern or "\\\\" in pattern else 1
 
 
 def schema_body_estimate(
     schema: dict, components: dict, seen: frozenset[str] = frozenset()
 ) -> int | None:
-    """The bytes of the largest compact JSON body `schema` admits, or None when nothing
-    in the schema bounds it. Every declared property is counted as present (an
-    optional one may be sent), each character of a bounded string as one byte, a
-    number as 20 bytes unless both its bounds are declared, a union as its largest
-    member. A free-form mapping, a string or list with no bound, and `Any` are
-    unbounded, and so is a model that refers to itself. A validator's own bound (a
-    serialized size checked in code) is not in the schema, so such a route is
-    unbounded here; MEASURED_UNDER_THE_DEFAULT records those that were measured."""
+    """An upper bound on the bytes of a compact JSON body (no whitespace between
+    tokens) that a standard encoder (JSON.stringify, or Python's json with
+    `ensure_ascii=False`) writes for any value `schema` admits, or None when the
+    schema bounds nothing. What it assumes, exactly:
+
+    - every declared property is present (an optional one may be sent); a key the
+      model ignores (pydantic's default `extra="ignore"`) is not counted, while a model
+      that keeps extra keys (`extra="allow"`, so `additionalProperties` is true or a
+      schema) is unbounded;
+    - a string with `maxLength` takes 6 bytes a character (`_CHAR_BYTES`), unless its
+      alphabet is fixed: a `format` in `_FORMAT_BYTES` (in its canonical form; the
+      other forms pydantic accepts are longer and not counted), an `enum` or `const`
+      (its longest value as written), or a `pattern` that admits only ASCII
+      (`_ascii_pattern_bytes`: 1 byte a character, 2 when `"` or a backslash is
+      allowed); a string with neither is unbounded;
+    - an integer with both bounds takes the longer bound's digits; any other number 24
+      bytes (`_NUMBER_BYTES`), as an encoder writes a double;
+    - a union (`anyOf`, `oneOf`) is its largest member, an `allOf` its smallest
+      bounded member (the body satisfies every member); a list needs `maxItems`; a
+      model that refers to itself is unbounded.
+
+    A validator's own bound (a serialized size checked in code) is not in the schema,
+    so such a route is unbounded here; MEASURED_UNDER_THE_DEFAULT records those that
+    were measured, and UNBOUNDED_AT_THE_DEFAULT why each other unbounded route is
+    small. Not counted: whitespace a client adds (pretty-printed JSON), escapes a
+    client writes where an encoder would not, and numbers written with more digits
+    than an encoder writes."""
     if "$ref" in schema:
         name = schema["$ref"].rsplit("/", 1)[-1]
         if name in seen:
             return None
         return schema_body_estimate(components[name], components, seen | {name})
-    for key in ("anyOf", "oneOf", "allOf"):
+    for key in ("anyOf", "oneOf"):
         if key in schema:
             sizes = [schema_body_estimate(s, components, seen) for s in schema[key]]
             return None if None in sizes else max(sizes)
+    if "allOf" in schema:
+        sizes = [schema_body_estimate(s, components, seen) for s in schema["allOf"]]
+        bounded = [size for size in sizes if size is not None]
+        return min(bounded) if bounded else None
     if "const" in schema:
-        return len(json.dumps(schema["const"], separators=(",", ":")))
+        return len(json.dumps(schema["const"], separators=(",", ":"), ensure_ascii=False).encode())
     if "enum" in schema:
-        return max(len(json.dumps(v, separators=(",", ":"))) for v in schema["enum"])
+        return max(
+            len(json.dumps(v, separators=(",", ":"), ensure_ascii=False).encode())
+            for v in schema["enum"]
+        )
     kind = schema.get("type")
     if kind == "string":
         if schema.get("format") in _FORMAT_BYTES:
             return _FORMAT_BYTES[schema["format"]]
-        return None if "maxLength" not in schema else schema["maxLength"] + 2
+        if "maxLength" not in schema:
+            return None
+        per_char = _CHAR_BYTES
+        if "pattern" in schema:
+            per_char = _ascii_pattern_bytes(schema["pattern"]) or _CHAR_BYTES
+        return schema["maxLength"] * per_char + 2
+    if kind == "integer" and "minimum" in schema and "maximum" in schema:
+        return max(len(str(schema["minimum"])), len(str(schema["maximum"])))
     if kind in ("integer", "number"):
-        if "minimum" in schema and "maximum" in schema:
-            return max(len(str(schema["minimum"])), len(str(schema["maximum"])))
-        return 20
+        return _NUMBER_BYTES
     if kind == "boolean":
         return 5
     if kind == "null":
@@ -806,17 +975,22 @@ def schema_body_estimate(
     if kind == "array":
         if "maxItems" not in schema:
             return None
-        item = schema_body_estimate(schema.get("items", {}), components, seen)
         count = schema["maxItems"]
-        return None if item is None else 2 + count * item + max(count - 1, 0)
+        if count == 0:
+            return 2
+        item = schema_body_estimate(schema.get("items", {}), components, seen)
+        return None if item is None else 2 + count * item + count - 1
     if kind == "object" or "properties" in schema:
+        extra = schema.get("additionalProperties")
+        if extra is not None and extra is not False:
+            return None  # a free-form mapping, or a model that keeps extra keys
         properties = schema.get("properties", {})
         if not properties:
-            return None  # a free-form mapping
+            return None if extra is None else 2
         sizes = [schema_body_estimate(s, components, seen) for s in properties.values()]
         if None in sizes:
             return None
-        keys = sum(len(json.dumps(k)) + 1 for k in properties)
+        keys = sum(len(json.dumps(k, ensure_ascii=False).encode()) + 1 for k in properties)
         return 2 + keys + sum(sizes) + len(properties) - 1
     return None
 
@@ -848,6 +1022,70 @@ def test_every_bounded_json_route_over_the_default_is_marked(service):
     assert set(over) <= marked, f"{service}: unmarked JSON routes over the default {over}"
 
 
+def unbounded_problems(
+    service: str,
+    estimates: dict[tuple[str, str], int | None],
+    marked: set[tuple[str, str]],
+    table: dict[tuple[str, str, str], str],
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    """(unlisted, stale) for a service: the unmarked JSON routes whose schema bounds
+    nothing that neither `table` nor MEASURED_UNDER_THE_DEFAULT names, and the routes
+    `table` names that are not such a route (gone, marked, or bounded now)."""
+    unbounded = {route for route, size in estimates.items() if size is None} - marked
+    listed = {(m, p) for s, m, p in table if s == service}
+    measured = {(m, p) for s, m, p in MEASURED_UNDER_THE_DEFAULT if s == service}
+    return unbounded - listed - measured, listed - unbounded
+
+
+def _marked(service: str) -> set[tuple[str, str]]:
+    return {
+        (m, r["path"])
+        for r in built_app(service)["routes"]
+        if r["extra_bytes"] is not None
+        for m in r["methods"]
+    }
+
+
+@pytest.mark.parametrize("service", SERVICES)
+def test_every_unbounded_unmarked_json_route_is_listed_with_a_reason(service):
+    """A route whose schema bounds nothing stays at the default only by decision: it
+    is in UNBOUNDED_AT_THE_DEFAULT with why its body is small (or measured). A new
+    unbounded field on an unmarked route (a canvas added to a create) fails here until
+    someone decides."""
+    unlisted, stale = unbounded_problems(
+        service, json_body_estimates(service), _marked(service), UNBOUNDED_AT_THE_DEFAULT
+    )
+    assert unlisted == set(), f"{service}: unbounded unmarked JSON routes not listed"
+    assert stale == set(), f"{service}: stale UNBOUNDED_AT_THE_DEFAULT rows"
+
+
+def test_the_unbounded_table_names_existing_services_with_reasons():
+    assert {s for s, _, _ in UNBOUNDED_AT_THE_DEFAULT} <= set(SERVICES)
+    assert all(reason.strip() for reason in UNBOUNDED_AT_THE_DEFAULT.values())
+    assert not set(UNBOUNDED_AT_THE_DEFAULT) & set(MEASURED_UNDER_THE_DEFAULT)
+    assert not set(UNBOUNDED_AT_THE_DEFAULT) & set(LARGE_JSON_ROUTES)
+
+
+def test_the_unbounded_check_fails_both_ways():
+    table = {("svc", "POST", "/a"): "small"}
+    estimates = {("POST", "/a"): None, ("POST", "/b"): 100, ("PUT", "/c"): None}
+    marked = {("PUT", "/c")}
+    assert unbounded_problems("svc", estimates, marked, table) == (set(), set())
+    # A new unbounded route, unmarked and unlisted.
+    grown = {**estimates, ("POST", "/b"): None}
+    assert unbounded_problems("svc", grown, marked, table) == ({("POST", "/b")}, set())
+    # A listed route that became bounded, was marked, or is gone.
+    assert unbounded_problems("svc", {**estimates, ("POST", "/a"): 9}, marked, table) == (
+        set(),
+        {("POST", "/a")},
+    )
+    assert unbounded_problems("svc", estimates, {*marked, ("POST", "/a")}, table) == (
+        set(),
+        {("POST", "/a")},
+    )
+    assert unbounded_problems("svc", {("POST", "/b"): 1}, set(), table) == (set(), {("POST", "/a")})
+
+
 def test_the_estimate_matches_each_bounded_measure():
     """The pathfinding batch, the one bounded schema the measures list, is estimated at
     exactly its measured worst body, which cabling's suite builds and sends; the bulk
@@ -869,17 +1107,41 @@ _COMPONENTS = {
     "Loop": {"type": "object", "properties": {"next": {"$ref": "#/components/schemas/Loop"}}},
 }
 _ESTIMATES = {
-    "bounded_string": ({"type": "string", "maxLength": 10}, 12),
+    # Six bytes a character: a control character is written as a \u00XX escape.
+    "bounded_string": ({"type": "string", "maxLength": 10}, 62),
     "unbounded_string": ({"type": "string"}, None),
     "uuid": ({"type": "string", "format": "uuid"}, 38),
+    "unknown_format_with_a_bound": ({"type": "string", "format": "email", "maxLength": 5}, 32),
+    "unknown_format_without_a_bound": ({"type": "string", "format": "email"}, None),
+    "ascii_pattern": ({"type": "string", "maxLength": 10, "pattern": "^[a-zA-Z0-9_-]+$"}, 12),
+    "ascii_pattern_with_a_quote": ({"type": "string", "maxLength": 10, "pattern": '^[a"]+$'}, 22),
+    "dot_pattern": ({"type": "string", "maxLength": 10, "pattern": "^.+$"}, 62),
+    "word_class_pattern": ({"type": "string", "maxLength": 10, "pattern": "^\\w+$"}, 62),
+    "negated_class_pattern": ({"type": "string", "maxLength": 10, "pattern": "^[^ ]+$"}, 62),
     "enum": ({"enum": ["ab", "abcd"]}, 6),
+    "non_ascii_enum": ({"enum": ["\u00e9t\u00e9"]}, 7),
     "bounded_integer": ({"type": "integer", "minimum": -3, "maximum": 1000}, 4),
-    "integer": ({"type": "integer"}, 20),
-    "optional": ({"anyOf": [{"type": "string", "maxLength": 3}, {"type": "null"}]}, 5),
+    "integer": ({"type": "integer"}, 24),
+    "bounded_number_is_still_a_double": ({"type": "number", "minimum": 0, "maximum": 1}, 24),
+    "optional": ({"anyOf": [{"type": "string", "maxLength": 3}, {"type": "null"}]}, 20),
     "union_with_an_unbounded_member": ({"anyOf": [{"type": "string"}, {"type": "null"}]}, None),
+    "all_of_takes_its_smallest_bounded_member": (
+        {"allOf": [{"type": "string"}, {"type": "boolean"}, {"type": "integer"}]},
+        5,
+    ),
     "array": ({"type": "array", "maxItems": 3, "items": {"type": "boolean"}}, 2 + 15 + 2),
+    "empty_array": ({"type": "array", "maxItems": 0}, 2),
     "unbounded_array": ({"type": "array", "items": {"type": "boolean"}}, None),
     "free_form_mapping": ({"type": "object", "additionalProperties": True}, None),
+    "model_that_keeps_extra_keys": (
+        {"type": "object", "properties": {"a": {"type": "boolean"}}, "additionalProperties": True},
+        None,
+    ),
+    "model_that_forbids_extra_keys": (
+        {"type": "object", "properties": {"a": {"type": "boolean"}}, "additionalProperties": False},
+        11,
+    ),
+    "empty_closed_object": ({"type": "object", "additionalProperties": False}, 2),
     "any": ({}, None),
     # {"a":"<36>","n":500}: 2 + 4 + 38 + 1 + 4 + 3 = 52.
     "model": ({"$ref": "#/components/schemas/Pair"}, 52),
@@ -942,10 +1204,30 @@ def _is_streaming_class(value: object) -> bool:
     )
 
 
+def _names_a_streaming_class(text: str) -> bool:
+    """Whether an annotation written as text names a streaming class: any name or
+    attribute in it whose last part is one of STREAMING_CLASS_NAMES."""
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError:
+        return False
+    return any(
+        (isinstance(n, ast.Name) and n.id in STREAMING_CLASS_NAMES)
+        or (isinstance(n, ast.Attribute) and n.attr in STREAMING_CLASS_NAMES)
+        for n in ast.walk(tree)
+    )
+
+
 def _annotation_streams(annotation: object) -> bool:
-    """A class, or a union, `Optional`, or `Annotated` with a streaming member."""
+    """A class, or a union, `Optional`, or `Annotated` with a streaming member; an
+    annotation left as text (a string, or a forward reference no namespace resolves)
+    counts when it names one."""
     if _is_streaming_class(annotation):
         return True
+    if isinstance(annotation, str):
+        return _names_a_streaming_class(annotation)
+    if isinstance(annotation, typing.ForwardRef):
+        return _names_a_streaming_class(annotation.__forward_arg__)
     return any(_annotation_streams(arg) for arg in typing.get_args(annotation))
 
 
@@ -980,53 +1262,186 @@ def _own_statements(function: ast.AST) -> list[ast.AST]:
     return found
 
 
-def _returned_streaming_calls(endpoint: object) -> bool:
-    """Whether the endpoint's own body returns a call to a streaming class, directly
-    (`return StreamingResponse(...)`) or through a local name assigned once
-    (`response = StreamingResponse(...)`, then `return response`)."""
-    function = inspect.unwrap(endpoint)
+def _bind(target: ast.AST, value: ast.AST | None, assigned: dict[str, list]) -> None:
+    """Record what an assignment binds: a name to its value, each name of a tuple or
+    list target to the matching element of a tuple or list value, and any other name
+    in the target to an unknown value (None), so it counts as a binding."""
+    if isinstance(target, ast.Name):
+        assigned.setdefault(target.id, []).append(value)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        elements = value.elts if isinstance(value, (ast.Tuple, ast.List)) else None
+        if elements is not None and len(elements) == len(target.elts):
+            for part, element in zip(target.elts, elements):
+                _bind(part, element, assigned)
+        else:
+            for part in target.elts:
+                _bind(part, None, assigned)
+    elif isinstance(target, ast.Starred):
+        _bind(target.value, None, assigned)
+
+
+def _bindings(nodes: list[ast.AST]) -> dict[str, list]:
+    """Every name the nodes bind, to the values bound: `=`, `: T =`, `+=`, a walrus
+    (`:=`), a `for` target, and a `with ... as` target."""
+    assigned: dict[str, list] = {}
+    for node in nodes:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                _bind(target, node.value, assigned)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            _bind(node.target, getattr(node, "value", None), assigned)
+        elif isinstance(node, ast.NamedExpr):
+            _bind(node.target, node.value, assigned)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            _bind(node.target, None, assigned)
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            _bind(node.optional_vars, None, assigned)
+    return assigned
+
+
+def _streaming_aliases(nodes: list[ast.AST]) -> set[str]:
+    """Names an import binds to a streaming class (`from x import EventSourceResponse
+    as Sse`), so a call of the alias counts when the module cannot be imported."""
+    return {
+        alias.asname
+        for node in nodes
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+        if alias.asname and alias.name in STREAMING_CLASS_NAMES
+    }
+
+
+def _streaming_value(
+    value: ast.AST | None,
+    namespace: dict,
+    assigned: dict[str, list],
+    aliases: set[str],
+    depth: int = 0,
+) -> bool:
+    """Whether a returned expression is a call of a streaming class: through both
+    branches of a conditional expression and every operand of `and`/`or`, a local name
+    bound once, and `functools.partial` (a partial object in the module, or a local
+    `partial(...)` call) unwrapped to the class it wraps."""
+    if value is None or depth > 20:
+        return False
+    if isinstance(value, ast.IfExp):
+        return any(
+            _streaming_value(v, namespace, assigned, aliases, depth + 1)
+            for v in (value.body, value.orelse)
+        )
+    if isinstance(value, ast.BoolOp):
+        return any(
+            _streaming_value(v, namespace, assigned, aliases, depth + 1) for v in value.values
+        )
+    if isinstance(value, ast.Await):
+        return _streaming_value(value.value, namespace, assigned, aliases, depth + 1)
+    if isinstance(value, ast.NamedExpr):
+        return _streaming_value(value.value, namespace, assigned, aliases, depth + 1)
+    if isinstance(value, ast.Name) and len(assigned.get(value.id, [])) == 1:
+        return _streaming_value(assigned[value.id][0], namespace, assigned, aliases, depth + 1)
+    if not isinstance(value, ast.Call):
+        return False
+    return _streaming_callee(value.func, namespace, assigned, aliases, depth + 1)
+
+
+def _streaming_callee(
+    func: ast.AST, namespace: dict, assigned: dict[str, list], aliases: set[str], depth: int
+) -> bool:
+    if depth > 20:
+        return False
+    if isinstance(func, ast.Name) and len(assigned.get(func.id, [])) == 1:
+        bound = assigned[func.id][0]
+        if isinstance(bound, ast.Call) and _is_partial_call(bound, namespace) and bound.args:
+            return _streaming_callee(bound.args[0], namespace, assigned, aliases, depth + 1)
+        if isinstance(bound, (ast.Name, ast.Attribute)):
+            return _streaming_callee(bound, namespace, assigned, aliases, depth + 1)
+    if isinstance(func, ast.Call) and _is_partial_call(func, namespace) and func.args:
+        return _streaming_callee(func.args[0], namespace, assigned, aliases, depth + 1)
+    resolved = _resolve(func, namespace)
+    while isinstance(resolved, functools.partial):
+        resolved = resolved.func
+    if resolved is not None:
+        return _is_streaming_class(resolved)
+    name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+    return name in STREAMING_CLASS_NAMES or name in aliases  # a name the module lacks
+
+
+def _is_partial_call(call: ast.Call, namespace: dict) -> bool:
+    return _resolve(call.func, namespace) is functools.partial or (_callee(call) == "partial")
+
+
+def _scanned_functions(endpoint: object) -> list[object]:
+    """The endpoint, unwrapped through `__wrapped__`, and every function its closure
+    holds, followed through closures again: a decorator that does not use
+    `functools.wraps` leaves the real endpoint in its wrapper's closure."""
+    found: list[object] = []
+    stack = [inspect.unwrap(endpoint)]
+    while stack and len(found) < 20:
+        function = stack.pop()
+        if function in found or not callable(function):
+            continue
+        found.append(function)
+        for cell in getattr(function, "__closure__", None) or ():
+            try:
+                content = cell.cell_contents
+            except ValueError:  # an empty cell
+                continue
+            if inspect.isfunction(content):
+                stack.append(inspect.unwrap(content))
+    return found
+
+
+def _function_returns_a_stream(function: object) -> bool:
     try:
         source = textwrap.dedent(inspect.getsource(function))
     except (OSError, TypeError):
         return False
-    tree = ast.parse(source)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:  # a lambda inside an expression that spans lines
+        return False
+    namespace = getattr(function, "__globals__", {})
+    module_aliases: set[str] = set()
+    try:
+        module_source = Path(inspect.getsourcefile(function) or "").read_text(encoding="utf-8")
+        module_aliases = _streaming_aliases(list(ast.walk(ast.parse(module_source))))
+    except (OSError, TypeError, SyntaxError):
+        pass
+    if getattr(function, "__name__", "") == "<lambda>":
+        # The source is the line that holds the lambda: its body is what it returns.
+        aliases = module_aliases
+        return any(
+            _streaming_value(node.body, namespace, {}, aliases)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Lambda)
+        )
     definition = next(
         (n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None
     )
     if definition is None:
         return False
     nodes = _own_statements(definition)
-    assigned: dict[str, list[ast.expr]] = {}
-    for node in nodes:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    assigned.setdefault(target.id, []).append(node.value)
-        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and isinstance(node.target, ast.Name):
-            assigned.setdefault(node.target.id, []).append(node.value or node)
-    namespace = getattr(function, "__globals__", {})
-    for node in nodes:
-        if not isinstance(node, ast.Return) or node.value is None:
-            continue
-        value = node.value
-        if isinstance(value, ast.Name) and len(assigned.get(value.id, [])) == 1:
-            value = assigned[value.id][0]
-        if not isinstance(value, ast.Call):
-            continue
-        resolved = _resolve(value.func, namespace)
-        if resolved is not None:
-            if _is_streaming_class(resolved):
-                return True
-            continue
-        if _callee(value) in STREAMING_CLASS_NAMES:  # a name the module does not hold
-            return True
-    return False
+    assigned = _bindings(nodes)
+    aliases = module_aliases | _streaming_aliases(nodes)
+    return any(
+        _streaming_value(node.value, namespace, assigned, aliases)
+        for node in nodes
+        if isinstance(node, ast.Return)
+    )
+
+
+def _returned_streaming_calls(endpoint: object) -> bool:
+    """Whether the endpoint returns a call of a streaming class from its own body (see
+    the module docstring for each spelling followed), or a lambda endpoint's body is
+    one, or a function the endpoint's closure holds does (a decorator without
+    `functools.wraps`)."""
+    return any(_function_returns_a_stream(f) for f in _scanned_functions(endpoint))
 
 
 def streaming_reasons(route: object) -> list[str]:
     """Why a route answers with a streaming response, by what the scan sees: its
     `response_class` (declared on the route, its router, or the app), its endpoint's
-    return annotation, and a returned call in the endpoint's own body. Empty when
+    return annotation, and a returned call (`_returned_streaming_calls`). Empty when
     none of the three shows one."""
     reasons = []
     response_class = getattr(route, "response_class", None)
@@ -1189,6 +1604,84 @@ async def route():
 
     return sse.EventSourceResponse(chunks())
 """,
+    "a_conditional_expression": """
+@app.post("/r")
+async def route(flag: bool = False):
+    return StreamingResponse(chunks()) if flag else JSONResponse({})
+""",
+    "the_other_branch_of_a_conditional_expression": """
+@app.post("/r")
+async def route(flag: bool = False):
+    return JSONResponse({}) if flag else StreamingResponse(chunks())
+""",
+    "an_or_expression": """
+@app.post("/r")
+async def route():
+    return None or StreamingResponse(chunks())
+""",
+    "a_tuple_unpacking": """
+@app.post("/r")
+async def route():
+    response, status = StreamingResponse(chunks()), 200
+    return response
+""",
+    "a_walrus": """
+@app.post("/r")
+async def route():
+    if (response := StreamingResponse(chunks())) is not None:
+        return response
+""",
+    "a_module_partial": """
+import functools
+
+Stream = functools.partial(StreamingResponse, media_type="text/event-stream")
+
+
+@app.post("/r")
+async def route():
+    return Stream(chunks())
+""",
+    "a_local_partial": """
+from functools import partial
+
+
+@app.post("/r")
+async def route():
+    stream = partial(StreamingResponse, media_type="text/event-stream")
+    return stream(chunks())
+""",
+    "a_lambda_endpoint": """
+app.add_api_route("/r", lambda: StreamingResponse(chunks()), methods=["POST"])
+""",
+    "a_decorator_without_wraps": """
+def logged(endpoint):
+    async def wrapper():
+        return await endpoint()
+
+    return wrapper
+
+
+@app.post("/r")
+@logged
+async def route():
+    return StreamingResponse(chunks())
+""",
+    "an_unresolvable_string_annotation": """
+@app.post("/r", response_model=None)
+async def route() -> "Missing | StreamingResponse":
+    return None
+""",
+    "an_aliased_import_that_is_not_installed": """
+try:
+    from sse_starlette.sse import EventSourceResponse as Sse
+except ImportError:
+    Sse = None
+
+
+@app.post("/r")
+async def route():
+    return Sse(chunks())
+""",
     "an_assigned_response": """
 @app.post("/r")
 async def route(request: Request):
@@ -1214,6 +1707,27 @@ async def route(body: Ask) -> StreamingResponse:
 @app.post("/r")
 async def route(payload: Annotated[dict, Body()]):
     return StreamingResponse(chunks())
+""",
+    "a_conditional_expression_of_json": """
+@app.post("/r")
+async def route(flag: bool = False):
+    return JSONResponse({}) if flag else {"a": 1}
+""",
+    "a_decorator_without_wraps_around_json": """
+def logged(endpoint):
+    async def wrapper():
+        return await endpoint()
+
+    return wrapper
+
+
+@app.post("/r")
+@logged
+async def route():
+    return {"a": 1}
+""",
+    "a_lambda_endpoint_of_json": """
+app.add_api_route("/r", lambda: {"a": 1}, methods=["POST"])
 """,
     "json_with_no_body": """
 @app.post("/r")
