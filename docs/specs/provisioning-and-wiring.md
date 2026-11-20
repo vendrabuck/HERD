@@ -109,7 +109,7 @@ These are the only two status writes on an allocation; no transition leaves `REL
 
 | From | To | Performed by | Guard | Stages | Rule |
 |---|---|---|---|---|---|
-| null or in the past | now plus the claim budget | `WiringRowClaims.claim` | row status `FAILED` | nothing | WIRE-CLAIM-1, WIRE-CLAIM-3 |
+| null or in the past | now plus the claim budget (an L3 pin's sized for its whole drive) | `WiringRowClaims.claim` | row status `FAILED` | nothing | WIRE-CLAIM-1, WIRE-CLAIM-3 |
 | any | null | every success flip and release (the reconcile's and a retry holder's alike), and every key-based failure write and park the reconcile makes | none | nothing | WIRE-CLAIM-2 |
 | the writing retry pass's own stamp, null, or in the past | null | a retry pass's failure write by row id, stale park, or supersession, nil-allocation, or unapplied-pin release | the row's `claimed_until` equals the stamp in the pass's `WiringRowClaims.held`, or (for a row the pass does not hold) is null or in the past; for the L3 holder's write after a partly failed switch, the stamp or null or in the past | nothing | WIRE-CLAIM-2, WIRE-CLAIM-8, WIRE-CLAIM-9 |
 
@@ -288,7 +288,8 @@ compare-and-swap too, so of two passes releasing one allocation exactly one driv
   Enforced in: `services/execution/app/services/l1_assignment_service.py` (`freeze_reservation_wiring`) \
   Pinned by: `services/execution/tests/test_l1_assignment_service.py` (`test_freeze_inserts_row_when_absent`, `test_freeze_is_idempotent`, `test_freeze_loses_race_flips_winners_row_frozen`)
 - **WIRE-CLAIM-1.** A claim is one `UPDATE` setting `claimed_until` to now plus the
-  budget where the row id matches, status is `FAILED`, and `claimed_until` is null or in
+  budget (the pass's own, or the per-call budget the L3 apply passes, WIRE-CLAIM-3)
+  where the row id matches, status is `FAILED`, and `claimed_until` is null or in
   the past; zero rows means the claim is lost. An expired stamp is reclaimable with no
   reaper. \
   Enforced in: `services/execution/app/services/wiring_claim.py` (`WiringRowClaims`, `unclaimed`) \
@@ -300,11 +301,41 @@ compare-and-swap too, so of two passes releasing one allocation exactly one driv
   writes. \
   Enforced in: `services/execution/app/services/l1_assignment_service.py` (`record_l1_connect`, `release_l1_connection`, `record_l1_failed`, `park_stale_l1_build`); `services/execution/app/services/l2_membership_service.py` (`record_l2_membership_active`, `release_l2_membership`, `record_l2_failed`, `park_stale_l2_build`); `services/execution/app/services/route_service.py` (`record_route_active`, `release_route_membership`, `record_route_failed`, `park_stale_route_build`) \
   Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_l1_success_flip_clears_the_claim`, `test_l1_release_clears_the_claim`, `test_l1_row_identity_failure_write_clears_the_claim`, `test_l1_key_upsert_failure_write_clears_the_claim`, `test_l2_stale_build_park_clears_the_claim`, `test_l3_success_flip_clears_the_claim`, `test_l3_release_clears_the_claim`)
-- **WIRE-CLAIM-3.** The claim budget is three attempts times three driver actions times
-  `EXECUTION_TIMEOUT_SECONDS`, plus the in-line backoff, rounded up to whole minutes
-  (5 minutes at the defaults); there is no setting of its own. \
-  Enforced in: `services/execution/app/services/wiring_claim.py` (`claim_budget`) \
-  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_claim_budget_covers_one_row_worst_case_drive`, `test_claim_budget_scales_with_the_driver_timeout`)
+- **WIRE-CLAIM-3.** The claim budget of a drive of N driver actions is three attempts
+  times N times `EXECUTION_TIMEOUT_SECONDS`, plus N times the in-line backoff (0.6 s),
+  rounded up to the next whole minute strictly after that sum, computed in whole
+  milliseconds; there is no setting of its own. An L1 or L2 row is three actions (its
+  switch's login, its own op, its switch's logout): 5 minutes at the defaults, and for
+  every whole-second timeout the plain round-up it was before #1482, with at least
+  1.2 seconds of slack. An L3 pin is claimed once for its whole drive, so
+  `_apply_l3_adjacency` counts the route operations R it is about to drive (the residue
+  removals plus one call per route, or a reconcile's removals plus additions) after the
+  driver load and immediately before the login, then claims with
+  `l3_pin_claim_budget(R)` as a per-call budget of `WiringRowClaims.claim`; the stamp is
+  the claim instant plus that budget. That budget is the sum for N = R plus 2 actions
+  plus an allowance of 1 second per action (`L3_ACTION_UNTIMED_OVERHEAD_ALLOWANCE_MS`,
+  an allowance, not a measured bound), rounded the same way, and never less than the
+  three-action budget. Pinned at the defaults: 5 minutes for R of 0 or 1, 7 for 2, 19
+  for 10, 75 for 47, 309 for 200, and 76,337 (about 53 days) for 50,000. The sum
+  counts every attempt's sandbox timeout and every backoff sleep; time outside it is
+  each action's time outside its sandbox timers (the two execution-run writes, the
+  worker-thread hop, the sandbox's temp-file I/O, the child's fork and exec before the
+  subprocess timer starts, the kill and reap after a timeout) and, with
+  `ALLOW_DRIVER_PIP_INSTALL` on, the `pip install` the sandbox runs before the driver
+  child, with its own 60-second timeout, on every attempt while a package with a
+  `requirements.txt` has no `_deps/` directory (no budget counts the install, L1 and L2
+  included). The guarantee for an L3 pin: its claim outlives the drive when every
+  attempt runs to its timeout as long as the drive's time outside the sum stays under N
+  seconds (the allowance) plus the rounding slack; the slack is a multiple of 0.2
+  seconds and at least 0.2 seconds at any whole-second timeout, and at the default
+  timeout at least 0.4 seconds, first at R of 129 and every 150 after. A larger overhead
+  lets a second pass claim the pin before its logout ends (a pinned known limit).
+  Nothing caps the budget, because nothing caps a pin's route count: a pin is held for
+  at most one minute more than the larger of its sum plus N seconds and the
+  three-action sum, and a holder that dies mid-drive leaves it unclaimable for no
+  longer than that (#1482). \
+  Enforced in: `services/execution/app/services/wiring_claim.py` (`claim_budget`, `l3_pin_claim_budget`, `WiringRowClaims`); `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`) \
+  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_claim_budget_covers_one_row_worst_case_drive`, `test_claim_budget_scales_with_the_driver_timeout`, `test_the_one_row_budget_is_unchanged_for_l1_and_l2`, `test_l3_pin_claim_budget_is_r_plus_two_actions_rounded_up`, `test_l3_pin_claim_budget_outlives_every_drive_and_by_at_most_a_minute`, `test_an_l3_pins_claim_is_still_held_when_its_last_driver_action_finishes`, `test_a_raised_driver_timeout_still_keeps_an_l3_pins_claim_through_its_drive`, `test_l1_and_l2_rows_still_claim_with_the_one_row_budget`, `test_a_per_call_budget_sets_only_that_claims_stamp`, `test_a_sized_l3_claim_still_expires_at_its_stamp`, `test_the_smallest_l3_slack_at_the_default_timeout_is_four_tenths_of_a_second`, `test_an_l3_pins_claim_outlives_its_drive_with_overhead_just_under_the_allowance`, `test_known_limit_overhead_far_over_the_allowance_lets_a_rival_claim`)
 
 ## 5. API surface
 
@@ -1308,8 +1339,9 @@ RES-FORK-18).
 ### 8.14 Keeping two retry channels off the same row
 
 **What it does.** The automatic retry and the owner's Retry button never send the same
-command to a switch at the same time: whichever reaches a row first holds it for a few
-minutes, and the other skips it.
+command to a switch at the same time: whichever reaches a row first holds it for as long
+as its drive can take (a few minutes for one row, longer for a switch with many routes),
+and the other skips it.
 
 **Surfaces.** `services/execution/app/services/wiring_claim.py`; the claim calls in
 `_apply_one_port_action`, `_apply_one_vlan_action`, and `_apply_l3_adjacency`. The stamp
