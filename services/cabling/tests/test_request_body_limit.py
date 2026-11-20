@@ -63,8 +63,20 @@ async def test_a_chunked_body_over_the_limit_is_413(method, path):
 
 
 @pytest.mark.parametrize(("method", "path"), _BODY_ROUTES)
-async def test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422(method, path):
-    body = b'["\\ud800"' + b" " * LIMIT + b"]"
+@pytest.mark.parametrize("chunked", [False, True], ids=["declared", "chunked"])
+async def test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422(
+    method, path, chunked
+):
+    """Chunked, there is no Content-Length to refuse early: only a limit outside the
+    surrogate check stops it from reading the whole body and answering its 422."""
+    head = b'["\\ud800"'
+
+    async def parts():
+        yield head
+        for _ in range(5):
+            yield b" " * (LIMIT // 4)
+
+    body = parts() if chunked else head + b" " * LIMIT + b"]"
     async with _client() as client:
         resp = await client.request(method, path, content=body, headers=_JSON)
     assert _refused(resp), resp.text[:300]

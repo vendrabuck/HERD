@@ -463,6 +463,33 @@ async def test_a_body_over_the_limit_is_never_scanned_for_a_lone_surrogate(monke
     assert scanned == [LIMIT]
 
 
+async def test_a_chunked_body_over_the_limit_is_refused_before_the_surrogate_check_buffers_it(
+    monkeypatch,
+):
+    """With no Content-Length the order is what decides: the surrogate check reads the
+    whole body before it scans, so only a limit outside it stops that read at the
+    limit. Placed inside, the check would buffer and scan the whole body first."""
+    scanned: list[int] = []
+    original = validation_errors._raw_text_holds_a_lone_surrogate
+
+    def counting(body: bytes) -> bool:
+        scanned.append(len(body))
+        return original(body)
+
+    monkeypatch.setattr(validation_errors, "_raw_text_holds_a_lone_surrogate", counting)
+
+    async def parts():
+        yield SUR_ESCAPE
+        for _ in range(4):
+            yield b" " * 20
+
+    async with _client(_app()) as client:
+        resp = await client.post("/open", content=parts(), headers=_JSON)
+    assert resp.status_code == 413
+    assert resp.json() == {"detail": [body_too_large_error(LIMIT)]}
+    assert scanned == []
+
+
 async def test_a_chunked_body_over_the_limit_is_413_through_the_app():
     async def parts():
         for _ in range(4):
