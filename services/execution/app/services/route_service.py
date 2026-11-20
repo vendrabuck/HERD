@@ -21,7 +21,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.route_assignment import RouteAssignment
 from app.services._uuid_utils import as_uuid as _as_uuid
 from app.services.l1_assignment_service import get_wiring_state
-from app.services.wiring_claim import WiringRowClaims, claim_write_clauses, unclaimed
+from app.services.wiring_claim import (
+    WiringRowClaims,
+    claim_write_clauses,
+    note_refused_write,
+    unclaimed,
+)
 from app.services.wiring_due import tick_would_drive
 
 logger = logging.getLogger(__name__)
@@ -536,7 +541,8 @@ async def _record_route_failed_for_row(
     (issue #814). One atomic `UPDATE ... WHERE id AND status`, plus the claim clause
     of wiring_claim.claim_write_clauses (issue #1479), no insert branch:
     rowcount zero means a concurrent writer moved the row or another pass holds its
-    drive claim, so this failure is not written and the row joins `claims.lost`.
+    drive claim, so this failure is not written (and, when another pass holds the
+    row, it joins `claims.lost`).
     """
     values: dict = {
         "status": "FAILED",
@@ -559,8 +565,7 @@ async def _record_route_failed_for_row(
     )
     if result.rowcount == 0:
         await db.rollback()
-        if claims is not None:
-            claims.lost.add(row_id)
+        await note_refused_write(db, RouteAssignment, row_id, claims)
         logger.warning(
             "Ignoring stale L3 %s failure for switch %s, reservation %s: "
             "row %s is no longer %s or another pass holds its drive claim "
@@ -624,8 +629,8 @@ async def record_route_failed(
     `claims` (issue #1479) is the calling retry pass's claim ledger, the
     record_l1_failed shape: on the `row_id` path the compare-and-swap also requires a
     row this pass still holds (its stamp unchanged) or one nobody holds; a refused
-    write changes nothing, returns None, and adds the row to `claims.lost`. The
-    key-based upsert ignores `claims`.
+    write changes nothing and returns None; the row joins `claims.lost` when another
+    retry pass holds it. The key-based upsert ignores `claims`.
     """
     res_uuid = _as_uuid(reservation_id)
     dev_uuid = _as_uuid(device_id)

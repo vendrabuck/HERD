@@ -44,13 +44,15 @@ want "rows nobody else is driving", so they are the only ones that filter.
 
 from __future__ import annotations
 
+import enum
 import logging
 import uuid
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import case, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -161,8 +163,8 @@ class WiringRowClaims:
     another pass no longer matches (issue #1479). The caller reads `lost` afterwards to
     report those rows `in_progress` instead of `still_failed`: the row is not a
     failure, it is somebody else's work in flight. A row joins `lost` when its claim
-    is lost and when a write this pass attempted on it is refused by
-    `claim_write_clauses` (directly, or through `write_guard`).
+    is lost, and when a write this pass attempted on it is refused because another
+    retry pass holds a live claim on it (`note_refused_write`, `holder_record`).
 
     The ordinary consumer path never constructs one of these and never claims or
     checks a claim, so a reconcile can still write a row a retry pass holds (its
@@ -215,7 +217,7 @@ class WiringRowClaims:
 
 
 def claim_write_clauses(model, row_id: uuid.UUID, claims: WiringRowClaims | None) -> list:
-    """The claim condition every write a retry pass makes to a wiring row must meet.
+    """The claim condition of a retry pass's failure write and of its settles.
 
     Issue #1479: a write made by a retry pass (tick or manual) never changes or frees a
     row another pass holds, judged by the database. The pass hands over its ledger:
@@ -226,13 +228,12 @@ def claim_write_clauses(model, row_id: uuid.UUID, claims: WiringRowClaims | None
       - any other row, and every row when `claims` is None, is written only while it
         is unclaimed (`claimed_until` null or in the past).
 
-    The failure writes by row id (`record_l1_failed`, `record_l2_failed`,
-    `record_route_failed` given `row_id`) add these clauses to their own single
-    `UPDATE`, so the check adds no query. Every other write a retry pass makes on a
-    loaded row (the stale parks, the supersession releases, the nil-allocation and
-    unapplied-pin releases, and the holder's success and release flips) goes through
-    `write_guard`, which locks the row under the same clauses first. A refused write
-    changes nothing and adds the row to `claims.lost`.
+    Used by the failure writes by row id (`record_l1_failed`, `record_l2_failed`,
+    `record_route_failed` given `row_id`), inside their own single `UPDATE`, and by
+    `write_guard` for the settles a pass makes on rows it never claimed (the stale
+    parks, the supersession releases, the nil-allocation and unapplied-pin releases).
+    A holder's record of a driver action that SUCCEEDED does not use it: a successful
+    action must reach the ledger even when its claim was cleared, see `holder_record`.
 
     Not covered, by design: the reconcile's writes (`claims` is never passed on that
     path), and an ACTIVE row (a claim is only ever taken on a FAILED row, and every
@@ -245,22 +246,44 @@ def claim_write_clauses(model, row_id: uuid.UUID, claims: WiringRowClaims | None
     return [unclaimed(model, datetime.now(timezone.utc))]
 
 
+async def note_refused_write(
+    db: AsyncSession, model, row_id: uuid.UUID, claims: WiringRowClaims | None
+) -> None:
+    """After a refused retry write: report the row `in_progress` only if it is held.
+
+    A refusal has three causes: another retry pass holds a live claim on the row (the
+    only one where work is in flight, so the row joins `claims.lost` and reads back
+    `in_progress`), the row left FAILED (the read-back reports its new status anyway),
+    or the row's claim was cleared by a writer that does not claim (the reconcile, a
+    teardown park), in which case nothing is running on it and it reads back by its
+    own status, `still_failed` for a FAILED row. One short select, on refusal only.
+    """
+    if claims is None:
+        return
+    now = datetime.now(timezone.utc)
+    live = (
+        await db.execute(select(model.id).where(model.id == row_id, ~unclaimed(model, now)))
+    ).first()
+    if live is not None:
+        claims.lost.add(row_id)
+
+
 @asynccontextmanager
 async def write_guard(
     db: AsyncSession, model, row_id: uuid.UUID | None, claims: WiringRowClaims | None
 ) -> AsyncIterator[bool]:
-    """Lock a row for a retry pass's write, or refuse it; yields True iff it may write.
+    """Lock a row for a retry pass's settle, or refuse it; yields True iff it may write.
 
     With `claims` None (the reconcile) or no row identity this does nothing and yields
     True, so the reconcile's writes are untouched. Otherwise it runs `SELECT id ... WHERE
     id AND claim_write_clauses(...) FOR UPDATE` in `db`'s transaction: a match locks the
     row, so no other pass can claim it between this check and the write the caller
-    makes in the same session; no match adds the row to `claims.lost` and yields False.
-    The transaction is committed on exit (a no-op commit when the writer already
-    committed), which releases the lock; on an exception it is rolled back. The writer
-    called inside must use `db` and must not roll back before it writes. SQLite ignores
-    FOR UPDATE; there the check and the write simply run back to back on one
-    connection.
+    makes in the same session; no match yields False and, when another pass holds the
+    row, adds it to `claims.lost` (`note_refused_write`). The transaction is committed on
+    exit, which releases the lock even when the body wrote nothing; on an exception it
+    is rolled back and the exception propagates. The writer called inside must use
+    `db` and must not roll back before it writes. SQLite ignores FOR UPDATE; there the
+    check and the write simply run back to back on one connection.
     """
     if claims is None or row_id is None:
         yield True
@@ -273,7 +296,7 @@ async def write_guard(
         )
     ).first()
     if found is None:
-        claims.lost.add(row_id)
+        await note_refused_write(db, model, row_id, claims)
         logger.info(
             "wiring retry: write to row %s of %s refused: another pass holds its drive "
             "claim, or the row is gone (issue #1479)",
@@ -286,3 +309,197 @@ async def write_guard(
         await db.rollback()
         raise
     await db.commit()
+
+
+# --- Recording a holder's driver action (issue #1479, round 3) ----------------
+#
+# A driver action that changed the device is never lost from the ledger. The holder of
+# a row records the outcome of its own action through `holder_record`, which decides
+# from the row as it is NOW (after whatever other writers did during the drive) how the
+# hardware truth is recorded. Only another retry pass's LIVE claim makes the holder
+# record nothing: that pass re-drives the row and records its own result.
+
+#: The reason on a row parked because a holder's action may have left something on the
+#: device after another writer had already settled the row toward release. Retryable
+#: (no pinned prefix), so the release channels drive it.
+SETTLED_ROW_PENDING_RELEASE = "applied after the row was settled for release; pending release"
+#: The reason on a row reopened because a holder's removal landed while another writer
+#: rebuilt the row ACTIVE: the device may no longer carry what the row says.
+REBUILT_ROW_PENDING_BUILD = "removed after the row was rebuilt; pending rebuild"
+
+
+class HolderRecord(enum.Enum):
+    """How a holder records a driver action; see `decide_holder_record`."""
+
+    WRITE = "write"
+    REFUSE = "refuse"
+    PARK = "park"
+    REOPEN = "reopen"
+    KEEP = "keep"
+
+
+def decide_holder_record(
+    *,
+    exists: bool,
+    mine: bool,
+    held_by_other: bool,
+    status: str | None,
+    intended: str | None,
+    frozen: bool,
+    added: bool,
+    succeeded: bool,
+) -> HolderRecord:
+    """The record a holder makes for one driver action, from the row as it is now.
+
+    `added` is the action's possible effect on the device: True for a connect, a VLAN
+    join, or a route configure (and for a failed route provision, which may have
+    configured part of its set), False for their removals. `succeeded` is whether the
+    driver confirmed it.
+
+      - The row is gone, or still carries this pass's stamp: WRITE, the usual record.
+      - Another retry pass holds a live claim: REFUSE; that pass re-drives the row and
+        records its own result (the one case where this action is not recorded).
+      - Otherwise the claim was cleared (by the reconcile or a teardown park) or has
+        expired, and the record follows what the row now says:
+          - FAILED and intended in this action's direction: WRITE.
+          - an addition on an ACTIVE row: KEEP, the row already records the device as
+            carrying it.
+          - an addition on a row settled toward release (FAILED intended RELEASED, or
+            RELEASED): a success on a frozen reservation is the writer's own record-time
+            freeze branch (WRITE, issue #461), anything else is PARK, recorded FAILED
+            intended RELEASED with what the action may have added, so the release
+            channels remove it; never ACTIVE over a release decision.
+          - a removal on an ACTIVE row (rebuilt meanwhile): REOPEN, FAILED intended
+            ACTIVE with attempts 0, so the build channels re-apply it whichever of the
+            two device calls landed last.
+          - a removal on a RELEASED row: KEEP.
+          - a removal on a FAILED intended ACTIVE row: on a frozen reservation a success
+            is WRITE (released, the device no longer carries it); otherwise KEEP, the
+            build channels re-apply it.
+    """
+    if not exists or mine:
+        return HolderRecord.WRITE
+    if held_by_other:
+        return HolderRecord.REFUSE
+    want = "ACTIVE" if added else "RELEASED"
+    if status == "FAILED" and intended == want:
+        return HolderRecord.WRITE
+    if added:
+        if status == "ACTIVE":
+            return HolderRecord.KEEP
+        return HolderRecord.WRITE if (frozen and succeeded) else HolderRecord.PARK
+    if status == "ACTIVE":
+        return HolderRecord.REOPEN
+    if status == "RELEASED":
+        return HolderRecord.KEEP
+    return HolderRecord.WRITE if (frozen and succeeded) else HolderRecord.KEEP
+
+
+@dataclass
+class HolderPlan:
+    """What `holder_record` decided, and the row it decided on (locked, or None)."""
+
+    kind: HolderRecord
+    row: object | None
+    mine: bool
+
+
+@asynccontextmanager
+async def holder_record(
+    db: AsyncSession,
+    model,
+    row_id: uuid.UUID | None,
+    claims: WiringRowClaims | None,
+    *,
+    added: bool,
+    succeeded: bool,
+    lock_first=None,
+) -> AsyncIterator[HolderPlan]:
+    """Lock the holder's row and yield the plan for recording its driver action.
+
+    With `claims` None (the reconcile) or no row identity this yields WRITE and touches
+    nothing. Otherwise, in `db`'s transaction, it first locks the rows `lock_first`
+    selects (the other rows the writer will touch, so every writer takes the locks in
+    the same order: those rows, then the holder's row), then selects the holder's row
+    `FOR UPDATE` with two flags computed in SQL (the row still carries this pass's
+    stamp; another pass holds a live claim), reads the reservation's freeze, and
+    yields `decide_holder_record`'s plan. REFUSE adds the row to `claims.lost`. The
+    caller performs the plan in the same session; the transaction is committed on exit,
+    releasing the locks even when nothing was written, and rolled back on an exception.
+    """
+    if claims is None or row_id is None:
+        yield HolderPlan(HolderRecord.WRITE, None, False)
+        return
+    from app.services.l1_assignment_service import get_wiring_state
+
+    if lock_first is not None:
+        await db.execute(lock_first.with_for_update())
+    now = datetime.now(timezone.utc)
+    stamp = claims.held.get(row_id)
+    mine_expr = (
+        case((model.claimed_until == stamp, True), else_=False)
+        if stamp is not None
+        else literal(False)
+    )
+    held_expr = case((~unclaimed(model, now), True), else_=False)
+    found = (
+        await db.execute(
+            select(model, mine_expr, held_expr).where(model.id == row_id).with_for_update()
+        )
+    ).first()
+    if found is None:
+        plan = HolderPlan(HolderRecord.WRITE, None, False)
+    else:
+        row, mine, held = found[0], bool(found[1]), bool(found[2])
+        state = await get_wiring_state(db, row.reservation_id)
+        kind = decide_holder_record(
+            exists=True,
+            mine=mine,
+            held_by_other=held and not mine,
+            status=row.status,
+            intended=row.intended,
+            frozen=state is not None and state.frozen,
+            added=added,
+            succeeded=succeeded,
+        )
+        plan = HolderPlan(kind, row, mine)
+        if kind is HolderRecord.REFUSE:
+            claims.lost.add(row_id)
+        if kind is not HolderRecord.WRITE:
+            logger.info(
+                "wiring retry: holder of row %s of %s records %s (row is %s intended %s)",
+                row_id,
+                model.__tablename__,
+                kind.value,
+                row.status,
+                row.intended,
+            )
+    try:
+        yield plan
+    except BaseException:
+        await db.rollback()
+        raise
+    await db.commit()
+
+
+async def reopen_rebuilt_row(db: AsyncSession, model, row_id: uuid.UUID) -> None:
+    """REOPEN: a holder's removal landed on a row another writer rebuilt ACTIVE.
+
+    The device may or may not still carry the row's content (the two device calls'
+    order is unknown), so the row goes back to FAILED intended ACTIVE with attempts 0
+    and a retryable reason, and the build channels re-apply it within one tick; a
+    re-apply of what is already there is idempotent. The one write in the codebase
+    that moves a row out of ACTIVE toward a rebuild; only `holder_record` asks for it.
+    """
+    await db.execute(
+        update(model)
+        .where(model.id == row_id, model.status == "ACTIVE")
+        .values(
+            status="FAILED",
+            intended="ACTIVE",
+            attempts=0,
+            last_error=REBUILT_ROW_PENDING_BUILD,
+            claimed_until=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
