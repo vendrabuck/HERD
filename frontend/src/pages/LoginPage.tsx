@@ -4,6 +4,7 @@ import toast from "react-hot-toast";
 import { ChevronRight, Wrench } from "lucide-react";
 import { useLogin, useLoginOptions } from "@/api/auth";
 import { useConfigStatus } from "@/api/config";
+import { AuthorCredit } from "@/components/layout/AuthorCredit";
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { APP_VERSION } from "@/lib/appVersion";
@@ -151,7 +152,7 @@ export function LoginPage() {
   );
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-50">
+    <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50">
       <div className="w-full max-w-sm bg-white rounded-xl shadow-sm border border-gray-200 p-8 relative">
         <div className="mb-6 text-center">
           <div className="flex items-center justify-center gap-3">
@@ -274,6 +275,12 @@ export function LoginPage() {
           <Wrench className="w-5 h-5" aria-hidden="true" />
         </Link>
       </div>
+
+      {/* Outside the card and after it in the DOM, so it follows every
+          sign-in control in tab order and renders in every sign-in state. */}
+      <footer className="mt-4 px-4 text-center">
+        <AuthorCredit />
+      </footer>
     </div>
   );
 }

@@ -4,6 +4,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+from .conftest import assert_author_credit_under_card
+
 WAIT = 15
 
 
@@ -37,6 +39,15 @@ def test_config_login_form_renders(browser, base_url):
         By.XPATH, "//button[normalize-space()='Sign in']"
     )
     assert btn.is_displayed()
+
+
+def test_config_login_card_has_author_credit(browser, base_url):
+    """The config sign-in card has the author credit under it, clear of it.
+    No config login: this module's browser never holds a config token (it lives
+    in sessionStorage), so /config always opens on the sign-in card here."""
+    browser.get(f"{base_url}/config")
+    WebDriverWait(browser, WAIT).until(EC.presence_of_element_located((By.ID, "config-password")))
+    assert_author_credit_under_card(browser, WAIT)
 
 
 def test_config_wrong_password_shows_toast(browser, base_url):
