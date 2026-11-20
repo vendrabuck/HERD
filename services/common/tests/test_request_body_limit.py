@@ -28,6 +28,7 @@ from herd_common.validation_errors import (
     DEFAULT_MAX_REQUEST_BODY_BYTES,
     EXTRA_BODY_BYTES_ATTRIBUTE,
     FORWARD_ENVELOPE_BYTES,
+    LARGE_JSON_BODY_BYTES,
     MIN_MAX_REQUEST_BODY_BYTES,
     LimitRequestBody,
     RefuseLoneSurrogates,
@@ -154,12 +155,44 @@ def test_the_one_item_names_the_limit_and_nothing_else():
     assert BODY_TOO_LARGE_TYPE == "body_too_large"
 
 
-def test_the_default_is_four_mebibytes():
-    """The one place the number lives (the config copy and the compose defaults are
-    pinned to it elsewhere)."""
-    assert DEFAULT_MAX_REQUEST_BODY_BYTES == 4 * 1024 * 1024
+def test_the_default_and_the_allowances_are_pinned():
+    """The one place each number lives (the config copy and the compose defaults are
+    pinned to it elsewhere). The default is 256 KiB since issue #1484; the large-JSON
+    allowance keeps the 4 MiB every route took before it."""
+    assert DEFAULT_MAX_REQUEST_BODY_BYTES == 256 * 1024 == 262144
+    assert LARGE_JSON_BODY_BYTES == 4 * 1024 * 1024 == 4194304
     assert MIN_MAX_REQUEST_BODY_BYTES == 64 * 1024
     assert FORWARD_ENVELOPE_BYTES == 256 * 1024
+    assert MIN_MAX_REQUEST_BODY_BYTES <= DEFAULT_MAX_REQUEST_BODY_BYTES < LARGE_JSON_BODY_BYTES
+
+
+@pytest.mark.parametrize(
+    "setting", [MIN_MAX_REQUEST_BODY_BYTES, DEFAULT_MAX_REQUEST_BODY_BYTES, 8 * 1024 * 1024]
+)
+def test_route_body_limit_of_a_large_json_route_adds_the_allowance_to_any_setting(setting):
+    """A mark adds to the setting, so an operator who raises MAX_REQUEST_BODY_BYTES
+    past the allowance raises the large-JSON routes too: the limit is never below
+    max(setting, LARGE_JSON_BODY_BYTES). A forward of a large body adds the envelope."""
+
+    async def canvas_save(body: dict = Body(...)):
+        return body
+
+    async def forwarded_canvas_save(body: dict = Body(...)):
+        return body
+
+    class LargeJson:
+        endpoint = extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)(canvas_save)
+
+    class LargeForward:
+        endpoint = extends_body_limit(lambda: LARGE_JSON_BODY_BYTES + FORWARD_ENVELOPE_BYTES)(
+            forwarded_canvas_save
+        )
+
+    large = route_body_limit(LargeJson(), setting)
+    assert large == setting + LARGE_JSON_BODY_BYTES
+    assert large > max(setting, LARGE_JSON_BODY_BYTES)
+    assert route_body_limit(LargeForward(), setting) == large + FORWARD_ENVELOPE_BYTES
+    assert route_body_limit(None, setting) == setting
 
 
 @pytest.mark.parametrize(

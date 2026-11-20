@@ -112,3 +112,40 @@ async def test_a_forwarded_body_up_to_the_envelope_is_parsed_and_one_byte_more_i
     assert at.json()["detail"][0]["type"] == "json_invalid"
     assert over.status_code == 413, over.text[:300]
     assert over.json() == {"detail": [body_too_large_error(route_limit)]}
+
+
+# -- The largest preferences body fits the default (issue #1484) ---------------------------
+#
+# Measured, not marked: two blobs at their 64 KiB cap as the validator serializes them
+# (json.dumps), and 200 page sizes. The schema bounds no page size key's length, so the
+# keys are taken at 32 characters, longer than any page key the frontend writes.
+
+
+def _largest_preferences_body() -> bytes:
+    import json
+
+    from app.schemas.preferences import _MAX_BLOB_BYTES, _MAX_KEYS, _MAX_PAGE_SIZE
+
+    blob = {"f": "x" * (_MAX_BLOB_BYTES - len(json.dumps({"f": ""})))}
+    assert len(json.dumps(blob)) == _MAX_BLOB_BYTES
+    page_sizes = {f"{i:032d}": _MAX_PAGE_SIZE for i in range(_MAX_KEYS)}
+    body = {"saved_filters": blob, "page_sizes": page_sizes, "extras": blob}
+    return json.dumps(body).encode()
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH"])
+async def test_the_largest_preferences_body_fits_the_default_and_is_valid(method):
+    """139319 bytes (the measure the wiring guard records), under the default: it is
+    valid against the schema, and it reaches the route's authentication, not the 413."""
+    import json
+
+    from app.schemas.preferences import PreferencesPatchRequest, PreferencesReplaceRequest
+
+    body = _largest_preferences_body()
+    assert len(body) == 139_319
+    assert len(body) <= LIMIT
+    PreferencesReplaceRequest.model_validate(json.loads(body))
+    PreferencesPatchRequest.model_validate(json.loads(body))
+    async with _client() as client:
+        resp = await client.request(method, "/preferences", content=body, headers=_JSON)
+    assert resp.status_code in (401, 403), resp.text[:300]

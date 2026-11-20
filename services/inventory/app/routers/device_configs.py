@@ -10,6 +10,7 @@ from herd_common.device_config import (
     validate_device_config_with_schema,
 )
 from herd_common.internal_auth import internal_token_matches
+from herd_common.validation_errors import LARGE_JSON_BODY_BYTES, extends_body_limit
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -301,6 +302,9 @@ async def _commit_new_version(
     response_model=DeviceConfigVersionDetail,
     status_code=status.HTTP_201_CREATED,
 )
+# A device configuration, which may be a whole running configuration: a large
+# JSON body (issue #1484).
+@extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)
 async def create_config_version(
     device_id: uuid.UUID,
     body: DeviceConfigVersionCreate,

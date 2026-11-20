@@ -139,10 +139,11 @@ def test_pool_settings_refuse_an_empty_pool_or_negative_overflow(tmp_path, monke
 # --- Request body limit (issue #1466) ---------------------------------------------
 
 
-def test_the_body_limit_defaults_to_four_mebibytes(tmp_path, monkeypatch):
+def test_the_body_limit_defaults_to_256_kibibytes(tmp_path, monkeypatch):
+    """256 KiB since issue #1484 (4 MiB before); the large-JSON routes add 4 MiB."""
     monkeypatch.delenv("MAX_REQUEST_BODY_BYTES", raising=False)
     base_settings = _reload_base_settings(monkeypatch, str(tmp_path / "absent.json"))
-    assert _representative_settings_cls(base_settings)().max_request_body_bytes == 4194304
+    assert _representative_settings_cls(base_settings)().max_request_body_bytes == 262144
 
 
 def test_the_body_limit_reads_decimal_digits_from_env_and_numbers_from_the_file(

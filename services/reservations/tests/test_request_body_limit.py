@@ -93,6 +93,38 @@ async def test_without_credentials_the_limit_answers_before_authentication():
     assert _refused(over), over.text[:300]
 
 
+# -- The large-JSON routes take the allowance (OPS-VALID-10, issue #1484) ----------------
+#
+# The fork canvas PUT and the fork save carry a canvas: the default limit plus
+# LARGE_JSON_BODY_BYTES. A body that is not JSON at that
+# limit is handed on whole and parsed (json_invalid); one byte more is the 413 naming the
+# route's limit; a body just over the default reaches the route's authentication.
+
+_LARGE_JSON_ROUTES = [
+    ("PUT", f"/{uuid.uuid4()}/fork/canvas"),
+    ("POST", f"/{uuid.uuid4()}/fork/save"),
+]
+
+
+@pytest.mark.parametrize(("method", "path"), _LARGE_JSON_ROUTES)
+async def test_a_large_json_route_takes_the_allowance(method, path):
+    from herd_common.validation_errors import LARGE_JSON_BODY_BYTES
+
+    route_limit = LIMIT + LARGE_JSON_BODY_BYTES
+    async with _client() as client:
+        over_default = await client.request(
+            method, path, content=b"{}" + b" " * LIMIT, headers=_JSON
+        )
+        at = await client.request(method, path, content=b"x" * route_limit, headers=_JSON)
+        over = await client.request(method, path, content=b"x" * (route_limit + 1), headers=_JSON)
+    assert over_default.status_code in (401, 403), over_default.text[:300]
+    assert at.status_code == 422, at.text[:300]
+    assert at.json()["detail"][0]["type"] == "json_invalid"
+    assert over.status_code == 413, over.text[:300]
+    assert over.json() == {"detail": [body_too_large_error(route_limit)]}
+    assert "connection" not in over.headers
+
+
 # -- A route another service forwards a body to takes the envelope (OPS-VALID-10) ---------
 #
 # the /api/v1 facade and ai-orchestrator's commit build a create body here.

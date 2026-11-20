@@ -609,32 +609,43 @@ def _many_edges_req(count: int) -> CommitRequest:
     )
 
 
+# Cabling takes the canvas PUT at MAX_REQUEST_BODY_BYTES plus LARGE_JSON_BODY_BYTES (its
+# large-JSON mark, issue #1484); the allowance is shrunk here to keep the canvases small.
+_SMALL_ALLOWANCE = 1_000
+
+
 @respx.mock
 async def test_a_canvas_over_the_limit_is_refused_before_anything_is_written(monkeypatch):
     """The commit request is far under the limit, the canvas it builds is not: the 413
-    names both numbers, and cabling, reservations, and execution see no call at all."""
+    names both numbers, the limit being the setting plus the large-JSON allowance, and
+    cabling, reservations, and execution see no call at all."""
     monkeypatch.setattr(config_module.settings, "max_request_body_bytes", 65_536)
+    monkeypatch.setattr(committer, "LARGE_JSON_BODY_BYTES", _SMALL_ALLOWANCE)
     req = _many_edges_req(1_000)
     assert len(req.model_dump_json()) < 65_536
     calls = respx.route(host__regex=".*").mock(return_value=httpx.Response(500))
     with pytest.raises(CommitError) as refused:
         await committer.commit_proposal(req, "tok", str(uuid.uuid4()))
     assert refused.value.status_code == 413
-    assert "over the 65536-byte request body limit" in str(refused.value.message)
+    assert "over the 66536-byte request body limit" in str(refused.value.message)
     assert calls.call_count == 0
+
+
+async def _canvas_bytes(req: CommitRequest) -> int:
+    async with httpx.AsyncClient() as client:
+        canvas = await _build_canvas_data(client, {}, req)
+    # Every generated id has the same length, so the committer's canvas measures the same.
+    return committer.canvas_put_bytes(canvas)
 
 
 @respx.mock
 async def test_a_canvas_at_or_under_the_limit_goes_on_to_cabling(monkeypatch):
-    """The measure is the PUT body's own encoding: a canvas of exactly the limit is
-    sent."""
+    """The measure is the PUT body's own encoding: a canvas of exactly the setting plus
+    the allowance is sent."""
     req = _many_edges_req(10)
-    async with httpx.AsyncClient() as client:
-        canvas = await _build_canvas_data(client, {}, req)
-    # Every generated id has the same length, so the committer's canvas measures the same.
-    monkeypatch.setattr(
-        config_module.settings, "max_request_body_bytes", committer.canvas_put_bytes(canvas)
-    )
+    size = await _canvas_bytes(req)
+    monkeypatch.setattr(committer, "LARGE_JSON_BODY_BYTES", _SMALL_ALLOWANCE)
+    monkeypatch.setattr(config_module.settings, "max_request_body_bytes", size - _SMALL_ALLOWANCE)
     respx.post(f"{CABLING_URL}/topologies").mock(
         return_value=httpx.Response(201, json={"id": TOPOLOGY_ID})
     )
@@ -647,7 +658,41 @@ async def test_a_canvas_at_or_under_the_limit_goes_on_to_cabling(monkeypatch):
     assert put.called
     assert failed.value.status_code == 413  # cabling's own refusal, relayed as a 4xx
     sent = put.calls.last.request
-    assert len(sent.content) == config_module.settings.max_request_body_bytes
+    assert len(sent.content) == size == committer.canvas_put_limit()
+
+
+@respx.mock
+async def test_a_canvas_one_byte_over_the_limit_is_refused(monkeypatch):
+    req = _many_edges_req(10)
+    size = await _canvas_bytes(req)
+    monkeypatch.setattr(committer, "LARGE_JSON_BODY_BYTES", _SMALL_ALLOWANCE)
+    monkeypatch.setattr(
+        config_module.settings, "max_request_body_bytes", size - _SMALL_ALLOWANCE - 1
+    )
+    calls = respx.route(host__regex=".*").mock(return_value=httpx.Response(500))
+    with pytest.raises(CommitError) as refused:
+        await committer.commit_proposal(req, "tok", str(uuid.uuid4()))
+    assert refused.value.status_code == 413
+    assert f"is {size} bytes, over the {size - 1}-byte request body limit" in str(
+        refused.value.message
+    )
+    assert calls.call_count == 0
+
+
+def test_the_canvas_limit_is_the_setting_plus_the_large_json_allowance():
+    """Cabling's canvas PUT is marked with `LARGE_JSON_BODY_BYTES`, which adds to the
+    setting both services read; at the defaults a canvas well over the default limit
+    (a 1,000-device topology is about 3.1 MiB) is not refused here."""
+    from herd_common.validation_errors import (
+        DEFAULT_MAX_REQUEST_BODY_BYTES,
+        LARGE_JSON_BODY_BYTES,
+    )
+
+    assert committer.LARGE_JSON_BODY_BYTES == LARGE_JSON_BODY_BYTES
+    assert committer.canvas_put_limit() == (
+        config_module.settings.max_request_body_bytes + LARGE_JSON_BODY_BYTES
+    )
+    assert committer.canvas_put_limit() > 3 * 1024 * 1024 + DEFAULT_MAX_REQUEST_BODY_BYTES
 
 
 def test_canvas_put_bytes_is_the_httpx_encoding():

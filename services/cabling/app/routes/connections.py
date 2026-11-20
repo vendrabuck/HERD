@@ -3,6 +3,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from herd_common.internal_auth import internal_token_matches
+from herd_common.validation_errors import LARGE_JSON_BODY_BYTES, extends_body_limit
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -193,6 +194,9 @@ async def create_connection_endpoint(
 
 
 @router.post("/bulk", response_model=ConnectionBulkReport)
+# Up to 200 items of up to 2,724 bytes each by the schema's bounds, about 545 KB
+# (issue #1484): a large JSON body.
+@extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)
 async def create_connections_bulk_endpoint(
     body: ConnectionBulkCreate,
     payload: dict = Depends(require_admin),

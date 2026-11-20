@@ -3,6 +3,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from herd_common.validation_errors import LARGE_JSON_BODY_BYTES, extends_body_limit
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -172,6 +173,8 @@ async def list_templates(
 
 
 @router.post("", response_model=TemplateDetail, status_code=status.HTTP_201_CREATED)
+# A template carries a canvas: a large JSON body (issue #1484).
+@extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)
 async def create_template(
     body: TemplateCreate,
     payload: dict = Depends(get_current_user_payload),
@@ -254,6 +257,8 @@ async def get_template(
 
 
 @router.put("/{template_id}", response_model=TemplateDetail)
+# A template carries a canvas: a large JSON body (issue #1484).
+@extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)
 async def update_template(
     template_id: uuid.UUID,
     body: TemplateUpdate,

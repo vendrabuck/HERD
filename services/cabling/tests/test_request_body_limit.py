@@ -119,10 +119,14 @@ async def test_the_import_route_takes_its_own_limit(monkeypatch):
     assert refused.json() == {"detail": [body_too_large_error(LIMIT + _UPLOAD_BYTES)]}
 
 
-def test_the_import_and_the_two_fork_forwards_are_the_only_larger_routes():
+def test_the_larger_routes_are_exactly_the_import_the_large_json_routes_and_the_fork_forwards():
     from app.routes import bulk
     from fastapi.routing import iter_route_contexts
-    from herd_common.validation_errors import FORWARD_ENVELOPE_BYTES, route_body_limit
+    from herd_common.validation_errors import (
+        FORWARD_ENVELOPE_BYTES,
+        LARGE_JSON_BODY_BYTES,
+        route_body_limit,
+    )
 
     limits = {
         (method, route.path): route_body_limit(route, LIMIT)
@@ -130,17 +134,165 @@ def test_the_import_and_the_two_fork_forwards_are_the_only_larger_routes():
         for method in route.methods or ()
     }
     assert bulk.IMPORT_UPLOAD_BYTES == 10 * 1024 * 1024
+    large = LIMIT + LARGE_JSON_BODY_BYTES
     assert {k: v for k, v in limits.items() if v != LIMIT} == {
         ("POST", "/topologies/import"): LIMIT + bulk.IMPORT_UPLOAD_BYTES,
-        ("PUT", "/internal/forks/{reservation_id}/canvas"): LIMIT + FORWARD_ENVELOPE_BYTES,
-        ("POST", "/internal/forks/{reservation_id}/save"): LIMIT + FORWARD_ENVELOPE_BYTES,
+        ("PUT", "/topologies/{topology_id}"): large,
+        ("POST", "/templates"): large,
+        ("PUT", "/templates/{template_id}"): large,
+        ("POST", "/connections/bulk"): large,
+        ("PUT", "/internal/forks/{reservation_id}/canvas"): large + FORWARD_ENVELOPE_BYTES,
+        ("POST", "/internal/forks/{reservation_id}/save"): large + FORWARD_ENVELOPE_BYTES,
     }
+
+
+# -- The large-JSON routes take the allowance (OPS-VALID-10, issue #1484) ----------------
+#
+# A canvas save, a template's canvas, and a bulk connection create: the default limit
+# plus LARGE_JSON_BODY_BYTES. A body that is not JSON at that limit is handed on whole
+# and parsed (json_invalid); one byte more is the 413 naming the route's limit.
+
+_LARGE_JSON_ROUTES = [
+    ("PUT", f"/topologies/{uuid.uuid4()}"),
+    ("POST", "/templates"),
+    ("PUT", f"/templates/{uuid.uuid4()}"),
+    ("POST", "/connections/bulk"),
+]
+
+
+@pytest.mark.parametrize(("method", "path"), _LARGE_JSON_ROUTES)
+async def test_a_large_json_route_takes_the_allowance(method, path):
+    from herd_common.validation_errors import LARGE_JSON_BODY_BYTES
+
+    route_limit = LIMIT + LARGE_JSON_BODY_BYTES
+    async with _client() as client:
+        over_default = await client.request(
+            method, path, content=b"{}" + b" " * LIMIT, headers=_JSON
+        )
+        at = await client.request(method, path, content=b"x" * route_limit, headers=_JSON)
+        over = await client.request(method, path, content=b"x" * (route_limit + 1), headers=_JSON)
+    assert over_default.status_code in (401, 403), over_default.text[:300]
+    assert at.status_code == 422, at.text[:300]
+    assert at.json()["detail"][0]["type"] == "json_invalid"
+    assert over.status_code == 413, over.text[:300]
+    assert over.json() == {"detail": [body_too_large_error(route_limit)]}
+    assert "connection" not in over.headers
+
+
+def _editor_canvas(devices: int, links: int) -> dict:
+    """A canvas in the shape the topology editor saves (persistableCanvasNodes: a device
+    node carries the seven allowlisted device keys; a link carries its layer and port
+    names), with realistic names."""
+    nodes = [
+        {
+            "id": f"node-{i}",
+            "type": "deviceNode",
+            "position": {"x": 1234.5678 + i, "y": 987.6543 + i},
+            "data": {
+                "device": {
+                    "id": str(uuid.UUID(int=i)),
+                    "name": f"lab-rack{i // 40:02d}-leaf-switch-{i:04d}",
+                    "topology_type": "PHYSICAL",
+                    "connection_type": "Layer 2 Switch",
+                    "status": "AVAILABLE",
+                    "template_name": "Arista 7050SX3-48YC8 Leaf Switch",
+                    "template_icon": "switch",
+                }
+            },
+        }
+        for i in range(devices)
+    ]
+    edges = [
+        {
+            "id": f"edge-{j}",
+            "source": f"node-{j % devices}",
+            "target": f"node-{(j * 7 + 1) % devices}",
+            "sourceHandle": "bottom",
+            "targetHandle": "top",
+            "type": "layerEdge",
+            "data": {
+                "layer": "L1",
+                "source_port_name": f"Ethernet{j % 48 + 1}/1",
+                "target_port_name": f"Ethernet{j % 52 + 1}/1",
+                "isProposal": False,
+            },
+        }
+        for j in range(links)
+    ]
+    return {"nodes": nodes, "edges": edges, "selectedEdgeLayer": "L1"}
+
+
+def test_a_generated_large_canvas_is_over_the_default_and_under_the_allowance():
+    """The measure behind the canvas routes' mark: 1,000 devices and 4,000 links in the
+    editor's save shape need more than the default and fit the large-JSON limit, with
+    room for what #1466 measured with whole device records (about 3.1 MiB)."""
+    import json
+
+    from herd_common.validation_errors import (
+        DEFAULT_MAX_REQUEST_BODY_BYTES,
+        LARGE_JSON_BODY_BYTES,
+    )
+
+    body = json.dumps({"canvas_data": _editor_canvas(1000, 4000)}, separators=(",", ":"))
+    size = len(body.encode("utf-8"))
+    assert (
+        DEFAULT_MAX_REQUEST_BODY_BYTES
+        < size
+        < DEFAULT_MAX_REQUEST_BODY_BYTES + LARGE_JSON_BODY_BYTES
+    )
+    assert size == 1_272_167
+    # A reservation holds at most 250 devices; that canvas alone passes the default.
+    reservation = json.dumps({"canvas_data": _editor_canvas(250, 1000)}, separators=(",", ":"))
+    assert len(reservation) > DEFAULT_MAX_REQUEST_BODY_BYTES
+
+
+def _largest_pathfind_batch() -> bytes:
+    import json
+
+    from app.schemas.pathfind import MAX_BATCH_PAIRS
+
+    pair = {"source_device_id": str(uuid.uuid4()), "target_device_id": str(uuid.uuid4())}
+    body = {"pairs": [pair] * MAX_BATCH_PAIRS}
+    return json.dumps(body, separators=(",", ":")).encode()
+
+
+async def test_the_largest_pathfind_batch_fits_the_default_and_is_not_marked():
+    """2,000 pairs (MAX_BATCH_PAIRS) is 236011 bytes as compact JSON (the measure the
+    wiring guard records), under the default: the route stays unmarked, and that body
+    reaches its authentication."""
+    body = _largest_pathfind_batch()
+    assert len(body) == 236_011
+    assert len(body) <= LIMIT
+    async with _client() as client:
+        resp = await client.post("/pathfind/batch", content=body, headers=_JSON)
+    assert resp.status_code in (401, 403), resp.text[:300]
+
+
+def test_the_largest_bulk_connection_create_is_over_the_default():
+    """200 items at every bound of ConnectionCreate: the measure behind the mark on
+    POST /connections/bulk."""
+    import json
+
+    from app.schemas.connection import ConnectionBulkCreate, ConnectionCreate
+
+    item = ConnectionCreate(
+        device_a_id=uuid.uuid4(),
+        port_a="p" * 255,
+        device_b_id=uuid.uuid4(),
+        port_b="q" * 255,
+        connection_type="t" * 50,
+        notes="n" * 2000,
+    )
+    body = ConnectionBulkCreate(items=[item] * 200)
+    size = len(json.dumps(body.model_dump(mode="json"), separators=(",", ":")))
+    assert size == 544_811
+    assert size > LIMIT
 
 
 # -- A route another service forwards a body to takes the envelope (OPS-VALID-10) ---------
 #
-# reservations forwards its fork canvas PUT and fork save here.
-# The body it admitted, plus what it adds, fits under the default limit plus
+# reservations forwards its fork canvas PUT and fork save here, each admitted by a
+# large-JSON route there, so these take the large-JSON allowance plus
 # FORWARD_ENVELOPE_BYTES.
 
 _FORWARD_ROUTES = [
@@ -151,9 +303,9 @@ _FORWARD_ROUTES = [
 
 @pytest.mark.parametrize(("method", "path"), _FORWARD_ROUTES)
 async def test_a_forwarded_body_up_to_the_envelope_is_parsed_and_one_byte_more_is_413(method, path):
-    from herd_common.validation_errors import FORWARD_ENVELOPE_BYTES
+    from herd_common.validation_errors import FORWARD_ENVELOPE_BYTES, LARGE_JSON_BODY_BYTES
 
-    route_limit = LIMIT + FORWARD_ENVELOPE_BYTES
+    route_limit = LIMIT + LARGE_JSON_BODY_BYTES + FORWARD_ENVELOPE_BYTES
     async with _client() as client:
         at = await client.request(method, path, content=b"x" * route_limit, headers=_JSON)
         over = await client.request(method, path, content=b"x" * (route_limit + 1), headers=_JSON)

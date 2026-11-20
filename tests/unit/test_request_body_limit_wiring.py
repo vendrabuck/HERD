@@ -28,16 +28,30 @@ and the upload settings set to values no default has. For each built app:
 - the limit it was given is the environment's `MAX_REQUEST_BODY_BYTES`, so the
   setting reaches the middleware in every service (config through
   `app/request_limits.py`, the others through `HerdBaseSettings`);
-- the routes marked with `extends_body_limit`, with each one's extra bytes, equal
-  `UPLOAD_ROUTES` plus `FORWARD_ROUTES` below. Every route that takes a form body
-  (any `File(...)` or `Form(...)` parameter, as FastAPI decides it:
+- the routes marked with `extends_body_limit` are exactly the routes named in
+  `UPLOAD_ROUTES`, `LARGE_JSON_ROUTES` (issue #1484), and `FORWARD_ROUTES` below, both
+  ways (a mark no table names fails, and so does a row whose route carries no mark),
+  and each one's extra bytes are the sum of its rows: a route that legitimately takes
+  a large JSON body adds `LARGE_JSON_BODY_BYTES`, a forward route
+  `FORWARD_ENVELOPE_BYTES`, and a forward route whose sender admitted the body through
+  a large-JSON route both. Neither JSON table names a form route. Every route that
+  takes a form body (any `File(...)` or `Form(...)` parameter, as FastAPI decides it:
   `body_field.field_info` is a `params.Form`) is marked, unless it is named in
   `FORM_EXEMPT` with a reason (none today: no HERD route takes a small form); a
   marked upload route that takes no form is one of `JSON_UPLOAD_ROUTES` (a JSON body
   that carries a file as base64). The upload bytes follow the settings the routes
   enforce (`DRIVER_MAX_SIZE_BYTES`, `UPLOAD_MAX_FILES` times `UPLOAD_MAX_FILE_BYTES`,
   the base64 length of `VALIDATE_PACKAGE_MAX_BYTES`), set here to odd values to prove
-  it; a forward route's extra bytes are `FORWARD_ENVELOPE_BYTES`;
+  it;
+- every JSON route whose schema admits a body larger than the shipped default
+  (`schema_body_estimate` over the app's OpenAPI document: compact JSON, every declared
+  property present, a bounded string at one byte a character) carries a mark. A
+  schema that bounds nothing (a free-form mapping, a string or list with no bound,
+  `Any`, a bound a validator checks in code) is not judged: whether such a route takes
+  a large body is the reviewed decision `LARGE_JSON_ROUTES` records, and the routes
+  measured to fit the default are in `MEASURED_UNDER_THE_DEFAULT`, whose bodies the
+  services' suites build and send. A route left out of the OpenAPI document is not
+  estimated;
 - `docker-compose.yml` passes `MAX_REQUEST_BODY_BYTES` to all twelve services as
   `${MAX_REQUEST_BODY_BYTES:-<default>}` with the shared default (the Settings-based
   services are also held by `test_compose_settings_wiring.py`; config is not, since
@@ -94,8 +108,11 @@ function, even to the same receiver, is a new key. That set must equal `FORWARDS
 below, both ways, so a new outbound body fails until it is classified:
 
 - "envelope": it forwards a body the sending service admitted, or a stored document,
-  with something added; every receiving route it names must be in `FORWARD_ROUTES`
-  (marked with `FORWARD_ENVELOPE_BYTES`);
+  with something added; every receiving route it names must be in `FORWARD_ROUTES`,
+  and each is paired with its source, the route that admitted what travels (or None
+  when the sender builds a body of the receiver's own schema from fields it bounded):
+  the receiver must add at least what its source adds plus `FORWARD_ENVELOPE_BYTES`,
+  both read from the tables (`envelope_shortfalls`);
 - "marked": its receiver is an upload route in `UPLOAD_ROUTES`;
 - "capped": the sender bounds what it sends itself (named in the reason);
 - "bounded": the body is bounded by schemas and caps; the stated bound must be at
@@ -122,8 +139,9 @@ the `Request(...)` or `build_request(...)` that built it is in a scanned module.
 receiver in a key is the text the code wrote, not the URL it resolves to at run time
 (a URL held in an attribute or computed by a helper is keyed by that expression); the
 classification of each call (its kind and its bound) is a reviewed statement, not
-something the scan computes; and a receiver named in an "envelope" entry is checked
-to be marked, not checked to be the URL the code calls.
+something the scan computes; a receiver named in an "envelope" entry is checked
+to be marked, not checked to be the URL the code calls; and its source is checked to
+be a route of its service, not checked to be where the forwarded body came from.
 """
 
 from __future__ import annotations
@@ -146,6 +164,7 @@ import yaml
 from herd_common.validation_errors import (
     DEFAULT_MAX_REQUEST_BODY_BYTES,
     FORWARD_ENVELOPE_BYTES,
+    LARGE_JSON_BODY_BYTES,
     MIN_MAX_REQUEST_BODY_BYTES,
 )
 
@@ -175,6 +194,24 @@ UPLOAD_ROUTES = {
 # The marked upload routes whose body is JSON, not a form: each carries a file as base64.
 JSON_UPLOAD_ROUTES = {("execution", "POST", "/internal/validate-package")}
 
+# Every route that legitimately takes a large JSON body (issue #1484), each with the
+# large-JSON allowance. A route that is also a forward route takes both: its mark adds
+# LARGE_JSON_BODY_BYTES and FORWARD_ENVELOPE_BYTES.
+LARGE_JSON_ROUTES = {
+    ("ai-orchestrator", "POST", "/commit"): LARGE_JSON_BODY_BYTES,
+    ("cabling", "PUT", "/topologies/{topology_id}"): LARGE_JSON_BODY_BYTES,
+    ("cabling", "POST", "/templates"): LARGE_JSON_BODY_BYTES,
+    ("cabling", "PUT", "/templates/{template_id}"): LARGE_JSON_BODY_BYTES,
+    ("cabling", "POST", "/connections/bulk"): LARGE_JSON_BODY_BYTES,
+    ("cabling", "PUT", "/internal/forks/{reservation_id}/canvas"): LARGE_JSON_BODY_BYTES,
+    ("cabling", "POST", "/internal/forks/{reservation_id}/save"): LARGE_JSON_BODY_BYTES,
+    ("execution", "POST", "/execute"): LARGE_JSON_BODY_BYTES,
+    ("execution", "POST", "/execute/internal"): LARGE_JSON_BODY_BYTES,
+    ("inventory", "POST", "/devices/{device_id}/config-versions"): LARGE_JSON_BODY_BYTES,
+    ("reservations", "PUT", "/{reservation_id}/fork/canvas"): LARGE_JSON_BODY_BYTES,
+    ("reservations", "POST", "/{reservation_id}/fork/save"): LARGE_JSON_BODY_BYTES,
+}
+
 # Every route another HERD service forwards a body to, each with the envelope allowance.
 FORWARD_ROUTES = {
     ("cabling", "PUT", "/internal/forks/{reservation_id}/canvas"): FORWARD_ENVELOPE_BYTES,
@@ -184,6 +221,32 @@ FORWARD_ROUTES = {
     ("reservations", "POST", "/"): FORWARD_ENVELOPE_BYTES,
     ("user-profile", "PATCH", "/preferences"): FORWARD_ENVELOPE_BYTES,
 }
+
+# The routes whose largest legitimate body was measured to fit under the default (issue
+# #1484), each with that measure in bytes and where it comes from. Each service's
+# `test_request_body_limit.py` builds that body and sends it.
+MEASURED_UNDER_THE_DEFAULT = {
+    ("cabling", "POST", "/pathfind/batch"): (
+        236_011,
+        "MAX_BATCH_PAIRS (2,000) pairs of two device ids, compact JSON",
+    ),
+    ("user-profile", "PUT", "/preferences"): (
+        139_319,
+        "two blobs at their 64 KiB cap by the validator's own json.dumps, and 200 page"
+        " sizes under 32-character keys (the schema bounds no key's length), as json.dumps"
+        " writes it",
+    ),
+    ("user-profile", "PATCH", "/preferences"): (
+        139_319,
+        "the same three fields as the PUT, each optional",
+    ),
+}
+
+
+def route_extra_bytes(route: tuple[str, str, str]) -> int:
+    """What the tables say a route adds to the default: the sum of its rows."""
+    return sum(table.get(route, 0) for table in (UPLOAD_ROUTES, LARGE_JSON_ROUTES, FORWARD_ROUTES))
+
 
 # A route that takes a form and needs no larger limit (a small form, not an upload):
 # (service, method, path) to the reason. None today.
@@ -220,7 +283,11 @@ MIDDLEWARE.update(
 MIDDLEWARE["config"] = ["CORSMiddleware", "LimitRequestBody"]
 
 # Every outbound call that sends a body, keyed by (module, function): (kind, detail).
-# For "envelope" the detail is the receiving routes; for "bounded" it is (bytes, why).
+# For "envelope" the detail is a list of (receiving route, source), the source being
+# the route that admitted what travels (a body, or a stored document written through
+# it), or None when the sender builds a body of the receiver's own schema from fields
+# it bounded itself; for "bounded" it is (bytes, why).
+_CONFIG_VERSIONS = ("inventory", "POST", "/devices/{device_id}/config-versions")
 _ENVELOPE = "envelope"
 FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
     (
@@ -232,12 +299,12 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
         "services/ai-orchestrator/app/services/committer.py",
         "_apply_configs",
         'post POST f"{settings.execution_service_url.rstrip("/")}/execute"',
-    ): ("envelope", [("execution", "POST", "/execute")]),
+    ): ("envelope", [(("execution", "POST", "/execute"), ("ai-orchestrator", "POST", "/commit"))]),
     (
         "services/ai-orchestrator/app/services/committer.py",
         "_create_reservation",
         'post POST f"{settings.reservations_service_url.rstrip("/")}/"',
-    ): ("envelope", [("reservations", "POST", "/")]),
+    ): ("envelope", [(("reservations", "POST", "/"), None)]),
     (
         "services/ai-orchestrator/app/services/committer.py",
         "_create_topology",
@@ -249,7 +316,8 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
         'put PUT f"{settings.cabling_service_url.rstrip("/")}/topologies/{topology_id}"',
     ): (
         "capped",
-        "commit_proposal measures the canvas (canvas_put_bytes) against MAX_REQUEST_BODY_BYTES"
+        "commit_proposal measures the canvas (canvas_put_bytes) against cabling's limit for"
+        " the route, MAX_REQUEST_BODY_BYTES plus LARGE_JSON_BODY_BYTES (canvas_put_limit),"
         " and answers 413 before anything is written",
     ),
     (
@@ -337,7 +405,7 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
     ): ("transport", "the /api/v1 facade's forwarder; its callers are classified"),
     ("services/integration/app/routers/reservations.py", "create_reservation", "_forward POST /"): (
         "envelope",
-        [("reservations", "POST", "/")],
+        [(("reservations", "POST", "/"), ("integration", "POST", "/reservations"))],
     ),
     (
         "services/integration/app/services/delivery.py",
@@ -348,17 +416,25 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
         "services/inventory/app/routers/device_configs.py",
         "apply_config_version",
         'post POST f"{settings.execution_service_url.rstrip("/")}/execute"',
-    ): ("envelope", [("execution", "POST", "/execute")]),
+    ): ("envelope", [(("execution", "POST", "/execute"), _CONFIG_VERSIONS)]),
     (
         "services/inventory/app/services/apply_scheduler.py",
         "_post_internal_execute",
         'post POST f"{settings.execution_service_url.rstrip("/")}/execute/internal"',
-    ): ("envelope", [("execution", "POST", "/execute/internal")]),
+    ): ("envelope", [(("execution", "POST", "/execute/internal"), _CONFIG_VERSIONS)]),
     (
         "services/notifications/app/routers/notifications.py",
         "put_preferences",
         'patch PATCH f"{settings.user_profile_service_url.rstrip("/")}/preferences"',
-    ): ("envelope", [("user-profile", "PATCH", "/preferences")]),
+    ): (
+        "envelope",
+        [
+            (
+                ("user-profile", "PATCH", "/preferences"),
+                ("notifications", "PUT", "/notifications/preferences"),
+            )
+        ],
+    ),
     (
         "services/notifications/app/services/dispatchers/chat.py",
         "ChatDispatcher.send._do_send",
@@ -373,12 +449,28 @@ FORWARDS: dict[tuple[str, str, str], tuple[str, object]] = {
         "services/reservations/app/routers/reservations.py",
         "save_reservation_fork",
         '_cabling_fork_call POST f"/internal/forks/{reservation_id}/save"',
-    ): ("envelope", [("cabling", "POST", "/internal/forks/{reservation_id}/save")]),
+    ): (
+        "envelope",
+        [
+            (
+                ("cabling", "POST", "/internal/forks/{reservation_id}/save"),
+                ("reservations", "POST", "/{reservation_id}/fork/save"),
+            )
+        ],
+    ),
     (
         "services/reservations/app/routers/reservations.py",
         "update_reservation_fork_canvas",
         '_cabling_fork_call PUT f"/internal/forks/{reservation_id}/canvas"',
-    ): ("envelope", [("cabling", "PUT", "/internal/forks/{reservation_id}/canvas")]),
+    ): (
+        "envelope",
+        [
+            (
+                ("cabling", "PUT", "/internal/forks/{reservation_id}/canvas"),
+                ("reservations", "PUT", "/{reservation_id}/fork/canvas"),
+            )
+        ],
+    ),
     (
         "services/reservations/app/services/purpose_service.py",
         "classify_purpose_one",
@@ -480,6 +572,13 @@ for route in iter_route_contexts(app.routes):
             "streaming": guard.streaming_reasons(route),
         }
     )
+document = app.openapi()
+json_bodies = {}
+for path, operations in document.get("paths", {}).items():
+    for method, operation in operations.items():
+        content = (operation.get("requestBody") or {}).get("content", {})
+        if "application/json" in content:
+            json_bodies[method.upper() + " " + path] = content["application/json"]["schema"]
 print(
     json.dumps(
         {
@@ -488,6 +587,8 @@ print(
                 for module, name, kwargs in middleware
             ],
             "routes": routes,
+            "json_bodies": json_bodies,
+            "components": document.get("components", {}).get("schemas", {}),
         }
     )
 )
@@ -575,20 +676,243 @@ def test_every_marked_route_is_in_the_tables_and_every_form_is_marked(service):
     assert forms - exempt <= set(marked), f"{service}: unmarked forms {sorted(forms - set(marked))}"
     assert not exempt & set(marked), f"{service}: an exempt form is marked"
     assert exempt <= forms, f"{service}: a stale form exemption"
-    uploads = {(m, p): b for (s, m, p), b in UPLOAD_ROUTES.items() if s == service}
-    forwards = {(m, p): b for (s, m, p), b in FORWARD_ROUTES.items() if s == service}
+    assert marked_route_problems(service, routes) == []
+
+
+def marked_route_problems(service: str, routes: list[dict]) -> list[str]:
+    """What is wrong with a service's marks against the tables: a marked route no table
+    names, a table row whose route carries no mark, a mark whose bytes are not the sum
+    of its rows, or a JSON-only row on a form route. Empty when the two agree."""
+    forms = {(m, r["path"]) for r in routes if r["form"] for m in r["methods"]}
+    marked = {
+        (m, r["path"]): r["extra_bytes"]
+        for r in routes
+        if r["extra_bytes"] is not None
+        for m in r["methods"]
+    }
+    tabled = {
+        (m, p)
+        for table in (UPLOAD_ROUTES, LARGE_JSON_ROUTES, FORWARD_ROUTES)
+        for s, m, p in table
+        if s == service
+    }
+    problems = [f"marked, in no table: {r}" for r in sorted(set(marked) - tabled)]
+    problems += [f"in a table, not marked: {r}" for r in sorted(tabled - set(marked))]
+    for route in sorted(set(marked) & tabled):
+        expected = route_extra_bytes((service, *route))
+        if marked[route] != expected:
+            problems.append(f"{route} adds {marked[route]}, its rows add {expected}")
+    uploads = {(m, p) for s, m, p in UPLOAD_ROUTES if s == service}
     json_uploads = {(m, p) for s, m, p in JSON_UPLOAD_ROUTES if s == service}
-    assert set(uploads) - forms == json_uploads
-    assert not set(forwards) & forms
-    assert marked == {**uploads, **forwards}
-    assert all(b > 0 for b in marked.values())
+    if uploads - forms != json_uploads:
+        problems.append(f"JSON uploads {sorted(uploads - forms)} are not {sorted(json_uploads)}")
+    for name, table in (
+        ("LARGE_JSON_ROUTES", LARGE_JSON_ROUTES),
+        ("FORWARD_ROUTES", FORWARD_ROUTES),
+    ):
+        on_forms = {(m, p) for s, m, p in table if s == service} & forms
+        if on_forms:
+            problems.append(f"{name} names a form route: {sorted(on_forms)}")
+    return problems
+
+
+def test_the_mark_check_fails_both_ways():
+    """A mark with no row, a row with no mark, and a mark that adds the wrong bytes each
+    fail; the real tables against routes built from them pass."""
+    canvas = ("PUT", "/topologies/{topology_id}")
+    honest = [
+        {
+            "methods": [m],
+            "path": p,
+            "form": False,
+            "extra_bytes": route_extra_bytes(("cabling", m, p)),
+        }
+        for s, m, p in {*LARGE_JSON_ROUTES, *FORWARD_ROUTES, *UPLOAD_ROUTES}
+        if s == "cabling"
+    ]
+    for r in honest:
+        if r["path"] == "/topologies/import":
+            r["form"] = True
+    assert marked_route_problems("cabling", honest) == []
+    unmarked = [r for r in honest if (r["methods"][0], r["path"]) != canvas]
+    assert marked_route_problems("cabling", unmarked) == [f"in a table, not marked: {canvas}"]
+    extra = [*honest, {"methods": ["POST"], "path": "/x", "form": False, "extra_bytes": 5}]
+    assert marked_route_problems("cabling", extra) == ["marked, in no table: ('POST', '/x')"]
+    short = [
+        {**r, "extra_bytes": FORWARD_ENVELOPE_BYTES} if r["path"].endswith("/canvas") else r
+        for r in honest
+    ]
+    assert marked_route_problems("cabling", short) == [
+        f"('PUT', '/internal/forks/{{reservation_id}}/canvas') adds {FORWARD_ENVELOPE_BYTES},"
+        f" its rows add {LARGE_JSON_BODY_BYTES + FORWARD_ENVELOPE_BYTES}"
+    ]
 
 
 def test_the_route_tables_name_only_existing_services_and_routes():
     assert {s for s, _, _ in UPLOAD_ROUTES} <= set(SERVICES)
+    assert {s for s, _, _ in LARGE_JSON_ROUTES} <= set(SERVICES)
     assert {s for s, _, _ in FORWARD_ROUTES} <= set(SERVICES)
     assert JSON_UPLOAD_ROUTES <= set(UPLOAD_ROUTES)
     assert not set(UPLOAD_ROUTES) & set(FORWARD_ROUTES)
+    assert not set(UPLOAD_ROUTES) & set(LARGE_JSON_ROUTES)
+    assert set(LARGE_JSON_ROUTES.values()) == {LARGE_JSON_BODY_BYTES}
+    assert set(FORWARD_ROUTES.values()) == {FORWARD_ENVELOPE_BYTES}
+    assert all(b > 0 for b in UPLOAD_ROUTES.values())
+
+
+# -- The largest body a bounded schema admits (issue #1484) --------------------------
+
+# Fixed lengths of a JSON value of each string format, quotes included.
+_FORMAT_BYTES = {"uuid": 38, "date-time": 34, "date": 12, "time": 23}
+
+
+def schema_body_estimate(
+    schema: dict, components: dict, seen: frozenset[str] = frozenset()
+) -> int | None:
+    """The bytes of the largest compact JSON body `schema` admits, or None when nothing
+    in the schema bounds it. Every declared property is counted as present (an
+    optional one may be sent), each character of a bounded string as one byte, a
+    number as 20 bytes unless both its bounds are declared, a union as its largest
+    member. A free-form mapping, a string or list with no bound, and `Any` are
+    unbounded, and so is a model that refers to itself. A validator's own bound (a
+    serialized size checked in code) is not in the schema, so such a route is
+    unbounded here; MEASURED_UNDER_THE_DEFAULT records those that were measured."""
+    if "$ref" in schema:
+        name = schema["$ref"].rsplit("/", 1)[-1]
+        if name in seen:
+            return None
+        return schema_body_estimate(components[name], components, seen | {name})
+    for key in ("anyOf", "oneOf", "allOf"):
+        if key in schema:
+            sizes = [schema_body_estimate(s, components, seen) for s in schema[key]]
+            return None if None in sizes else max(sizes)
+    if "const" in schema:
+        return len(json.dumps(schema["const"], separators=(",", ":")))
+    if "enum" in schema:
+        return max(len(json.dumps(v, separators=(",", ":"))) for v in schema["enum"])
+    kind = schema.get("type")
+    if kind == "string":
+        if schema.get("format") in _FORMAT_BYTES:
+            return _FORMAT_BYTES[schema["format"]]
+        return None if "maxLength" not in schema else schema["maxLength"] + 2
+    if kind in ("integer", "number"):
+        if "minimum" in schema and "maximum" in schema:
+            return max(len(str(schema["minimum"])), len(str(schema["maximum"])))
+        return 20
+    if kind == "boolean":
+        return 5
+    if kind == "null":
+        return 4
+    if kind == "array":
+        if "maxItems" not in schema:
+            return None
+        item = schema_body_estimate(schema.get("items", {}), components, seen)
+        count = schema["maxItems"]
+        return None if item is None else 2 + count * item + max(count - 1, 0)
+    if kind == "object" or "properties" in schema:
+        properties = schema.get("properties", {})
+        if not properties:
+            return None  # a free-form mapping
+        sizes = [schema_body_estimate(s, components, seen) for s in properties.values()]
+        if None in sizes:
+            return None
+        keys = sum(len(json.dumps(k)) + 1 for k in properties)
+        return 2 + keys + sum(sizes) + len(properties) - 1
+    return None
+
+
+def json_body_estimates(service: str) -> dict[tuple[str, str], int | None]:
+    built = built_app(service)
+    return {
+        tuple(key.split(" ", 1)): schema_body_estimate(schema, built["components"])
+        for key, schema in built["json_bodies"].items()
+    }
+
+
+@pytest.mark.parametrize("service", SERVICES)
+def test_every_bounded_json_route_over_the_default_is_marked(service):
+    """A JSON route whose schema admits a body larger than the shipped default must
+    carry a mark (a large-JSON or a forward row); one whose schema bounds nothing is a
+    reviewed decision instead (OPS-VALID-10)."""
+    marked = {
+        (m, r["path"])
+        for r in built_app(service)["routes"]
+        if r["extra_bytes"] is not None
+        for m in r["methods"]
+    }
+    over = {
+        route: size
+        for route, size in json_body_estimates(service).items()
+        if size is not None and size > DEFAULT_MAX_REQUEST_BODY_BYTES
+    }
+    assert set(over) <= marked, f"{service}: unmarked JSON routes over the default {over}"
+
+
+def test_the_estimate_matches_each_bounded_measure():
+    """The pathfinding batch, the one bounded schema the measures list, is estimated at
+    exactly its measured worst body, which cabling's suite builds and sends; the bulk
+    connection create, the one bounded schema over the default, is estimated over it."""
+    cabling = json_body_estimates("cabling")
+    size, _ = MEASURED_UNDER_THE_DEFAULT[("cabling", "POST", "/pathfind/batch")]
+    assert cabling[("POST", "/pathfind/batch")] == size
+    assert cabling[("POST", "/connections/bulk")] > DEFAULT_MAX_REQUEST_BODY_BYTES
+
+
+_COMPONENTS = {
+    "Pair": {
+        "type": "object",
+        "properties": {
+            "a": {"type": "string", "format": "uuid"},
+            "n": {"type": "integer", "minimum": 1, "maximum": 500},
+        },
+    },
+    "Loop": {"type": "object", "properties": {"next": {"$ref": "#/components/schemas/Loop"}}},
+}
+_ESTIMATES = {
+    "bounded_string": ({"type": "string", "maxLength": 10}, 12),
+    "unbounded_string": ({"type": "string"}, None),
+    "uuid": ({"type": "string", "format": "uuid"}, 38),
+    "enum": ({"enum": ["ab", "abcd"]}, 6),
+    "bounded_integer": ({"type": "integer", "minimum": -3, "maximum": 1000}, 4),
+    "integer": ({"type": "integer"}, 20),
+    "optional": ({"anyOf": [{"type": "string", "maxLength": 3}, {"type": "null"}]}, 5),
+    "union_with_an_unbounded_member": ({"anyOf": [{"type": "string"}, {"type": "null"}]}, None),
+    "array": ({"type": "array", "maxItems": 3, "items": {"type": "boolean"}}, 2 + 15 + 2),
+    "unbounded_array": ({"type": "array", "items": {"type": "boolean"}}, None),
+    "free_form_mapping": ({"type": "object", "additionalProperties": True}, None),
+    "any": ({}, None),
+    # {"a":"<36>","n":500}: 2 + 4 + 38 + 1 + 4 + 3 = 52.
+    "model": ({"$ref": "#/components/schemas/Pair"}, 52),
+    "self_reference": ({"$ref": "#/components/schemas/Loop"}, None),
+}
+
+
+@pytest.mark.parametrize(("schema", "expected"), _ESTIMATES.values(), ids=_ESTIMATES.keys())
+def test_schema_body_estimate(schema, expected):
+    assert schema_body_estimate(schema, _COMPONENTS) == expected
+
+
+def test_the_estimate_is_the_compact_json_of_the_largest_body():
+    pair = {"a": "00000000-0000-0000-0000-000000000000", "n": 500}
+    body = {"pairs": [pair] * 7}
+    schema = {
+        "type": "object",
+        "properties": {
+            "pairs": {
+                "type": "array",
+                "maxItems": 7,
+                "items": {"$ref": "#/components/schemas/Pair"},
+            }
+        },
+    }
+    assert schema_body_estimate(schema, _COMPONENTS) == len(json.dumps(body, separators=(",", ":")))
+
+
+def test_each_measured_route_fits_the_default_and_is_not_a_large_json_route():
+    for route, (size, reason) in MEASURED_UNDER_THE_DEFAULT.items():
+        assert reason
+        assert size <= DEFAULT_MAX_REQUEST_BODY_BYTES, route
+        assert route not in LARGE_JSON_ROUTES, route
 
 
 @pytest.mark.parametrize("service", SERVICES)
@@ -599,7 +923,7 @@ def test_compose_passes_the_setting_with_the_shared_default(service):
 
 def test_the_specification_names_every_marked_route():
     text = SPEC.read_text(encoding="utf-8")
-    for service, method, path in [*UPLOAD_ROUTES, *FORWARD_ROUTES]:
+    for service, method, path in [*UPLOAD_ROUTES, *LARGE_JSON_ROUTES, *FORWARD_ROUTES]:
         assert f"`{method} {path}`" in text, (service, method, path)
 
 
@@ -1159,7 +1483,8 @@ def test_each_classified_call_is_covered(call):
     kind, detail = FORWARDS[call]
     assert kind in FORWARD_KINDS
     if kind == "envelope":
-        assert detail and all(route in FORWARD_ROUTES for route in detail), detail
+        assert detail and all(route in FORWARD_ROUTES for route, _ in detail), detail
+        assert envelope_shortfalls(detail) == [], detail
     elif kind == "marked":
         assert detail and all(route in UPLOAD_ROUTES for route in detail), detail
     elif kind == "bounded":
@@ -1170,11 +1495,53 @@ def test_each_classified_call_is_covered(call):
         assert isinstance(detail, str) and detail
 
 
+def envelope_shortfalls(detail: list) -> list[tuple]:
+    """Each (receiver, source) of an "envelope" entry whose receiver does not take what
+    its source admitted plus the envelope: the receiver's extra bytes must be at least
+    the source's plus FORWARD_ENVELOPE_BYTES (a source of None adds nothing). Both
+    read from the tables, which the built apps are checked against. So a forward of a
+    body a large-JSON route admitted needs the large allowance plus the envelope."""
+    return [
+        (receiver, source)
+        for receiver, source in detail
+        if route_extra_bytes(receiver)
+        < (0 if source is None else route_extra_bytes(source)) + FORWARD_ENVELOPE_BYTES
+    ]
+
+
+def test_the_envelope_check_fails_both_ways():
+    canvas = ("cabling", "PUT", "/internal/forks/{reservation_id}/canvas")
+    fork_canvas = ("reservations", "PUT", "/{reservation_id}/fork/canvas")
+    create = ("reservations", "POST", "/")
+    assert envelope_shortfalls([(canvas, fork_canvas), (create, None)]) == []
+    # A large-JSON source into a receiver with the envelope alone falls short.
+    assert envelope_shortfalls([(create, fork_canvas)]) == [(create, fork_canvas)]
+    facade = ("integration", "POST", "/reservations")
+    assert envelope_shortfalls([(create, facade)]) == []
+
+
 def test_every_forward_route_has_a_sender():
     receivers = {
-        route for kind, detail in FORWARDS.values() if kind == "envelope" for route in detail
+        route for kind, detail in FORWARDS.values() if kind == "envelope" for route, _ in detail
     }
     assert receivers == set(FORWARD_ROUTES)
+
+
+def test_every_envelope_source_is_a_route_of_its_service():
+    sources = {
+        source
+        for kind, detail in FORWARDS.values()
+        if kind == "envelope"
+        for _, source in detail
+        if source is not None
+    }
+    for service, method, path in sorted(sources):
+        routes = built_app(service)["routes"]
+        assert any(r["path"] == path and method in r["methods"] for r in routes), (
+            service,
+            method,
+            path,
+        )
 
 
 @pytest.mark.parametrize(

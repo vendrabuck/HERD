@@ -19,6 +19,7 @@ from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, 
 from fastapi.exceptions import RequestValidationError
 from herd_common.validation_errors import (
     DEFAULT_MAX_REQUEST_BODY_BYTES,
+    LARGE_JSON_BODY_BYTES,
     LONE_SURROGATE_BODY_ERROR,
     RENDERED_KEYS,
     STRING_UNICODE_MSG,
@@ -404,10 +405,14 @@ class _Strict(BaseModel):
 
 def _open_app(*, refuse: bool = True) -> FastAPI:
     """Routes whose types accept a lone surrogate: a plain str, a free-form mapping,
-    Any, a raw `Request`, plus routes that take no body, a form, and a query."""
+    Any, a raw `Request`, plus routes that take no body, a form, and a query. Its limit
+    is a large-JSON route's (issue #1484): the cost tests send bodies of about 1 MB,
+    which the 256 KiB default would refuse before the scan they measure."""
     app = FastAPI()
     install_validation_errors(
-        app, max_body_bytes=DEFAULT_MAX_REQUEST_BODY_BYTES, refuse_lone_surrogates=refuse
+        app,
+        max_body_bytes=DEFAULT_MAX_REQUEST_BODY_BYTES + LARGE_JSON_BODY_BYTES,
+        refuse_lone_surrogates=refuse,
     )
 
     @app.post("/str")

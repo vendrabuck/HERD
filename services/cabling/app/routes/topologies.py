@@ -4,6 +4,7 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from herd_common.internal_auth import internal_token_matches
+from herd_common.validation_errors import LARGE_JSON_BODY_BYTES, extends_body_limit
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -168,6 +169,8 @@ async def get_topology(
 
 
 @router.put("/{topology_id}", response_model=TopologyDetail)
+# A canvas save: a large JSON body (issue #1484).
+@extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)
 async def update_topology(
     topology_id: uuid.UUID,
     body: TopologyUpdate,
