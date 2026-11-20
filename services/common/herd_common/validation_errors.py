@@ -118,7 +118,11 @@ outside the surrogate check. What it guarantees, exactly:
   received over it; never any of its content.
 - It refuses when the body is read, so a route that never reads its body, an unknown
   route, and a method not allowed answer as before (nothing of the body is read, so
-  nothing is buffered). Every route with a body (JSON or a form) reads it before its
+  nothing is buffered). One known limit: a route that STREAMS its response without
+  reading its body has the body read by the response's disconnect listener, and
+  behind the request logger a declared over-limit body then ends in a server error
+  instead of the stream (OPS-VALID-9; no HERD route does this, and a streaming route
+  must read or drain its body first). Every route with a body (JSON or a form) reads it before its
   dependencies run, so the refusal comes before authentication, as the surrogate
   check's does; and the surrogate check reads through this one, so a body over the
   limit is refused before it is scanned, and the scan never holds more than the limit.
