@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.l2_port_assignment import L2PortAssignment
 from app.services._uuid_utils import as_uuid as _as_uuid
 from app.services.l1_assignment_service import get_wiring_state
-from app.services.wiring_claim import unclaimed
+from app.services.wiring_claim import WiringRowClaims, claim_write_clauses, unclaimed
 from app.services.wiring_due import tick_would_drive
 
 logger = logging.getLogger(__name__)
@@ -347,13 +347,15 @@ async def _record_l2_failed_for_row(
     last_error: str,
     vlan_uuid: uuid.UUID | None,
     intended: str,
+    claims: WiringRowClaims | None,
 ) -> L2PortAssignment | None:
     """The row-identity compare-and-swap behind record_l2_failed's `row_id` path.
 
     See record_l2_failed's docstring for why the retry channels write by row id
-    (issue #814). One atomic `UPDATE ... WHERE id AND status`, no insert branch:
-    rowcount zero means a concurrent writer moved the row and this failure is stale
-    information about a row that no longer exists in the state it was loaded in.
+    (issue #814). One atomic `UPDATE ... WHERE id AND status`, plus the claim clause
+    of wiring_claim.claim_write_clauses (issue #1479), no insert branch:
+    rowcount zero means a concurrent writer moved the row or another pass holds its
+    drive claim, so this failure is not written and the row joins `claims.lost`.
     """
     values: dict = {
         "status": "FAILED",
@@ -367,14 +369,21 @@ async def _record_l2_failed_for_row(
         values["vlan_assignment_id"] = vlan_uuid
     result = await db.execute(
         update(L2PortAssignment)
-        .where(L2PortAssignment.id == row_id, L2PortAssignment.status == expected_status)
+        .where(
+            L2PortAssignment.id == row_id,
+            L2PortAssignment.status == expected_status,
+            *claim_write_clauses(L2PortAssignment, row_id, claims),
+        )
         .values(**values)
     )
     if result.rowcount == 0:
         await db.rollback()
+        if claims is not None:
+            claims.lost.add(row_id)
         logger.warning(
             "Ignoring stale L2 %s failure for switch %s port %s, reservation %s: "
-            "row %s is no longer %s (a concurrent writer won)",
+            "row %s is no longer %s or another pass holds its drive claim "
+            "(a concurrent writer won)",
             "build" if intended == "ACTIVE" else "release",
             switch_uuid,
             port,
@@ -401,6 +410,7 @@ async def record_l2_failed(
     intended: str,
     row_id: uuid.UUID | None = None,
     expected_status: str = "FAILED",
+    claims: WiringRowClaims | None = None,
 ) -> L2PortAssignment | None:
     """Write (or update) a FAILED membership row for a port op that could not be applied.
 
@@ -433,6 +443,12 @@ async def record_l2_failed(
     resurrecting a dead membership as a fresh FAILED intended-ACTIVE zombie row. The
     fresh-build path passes no `row_id` and keeps the upsert: a build after a release
     is a legitimate re-add.
+
+    `claims` (issue #1479) is the calling retry pass's claim ledger, the
+    record_l1_failed shape: on the `row_id` path the compare-and-swap also requires a
+    row this pass still holds (its stamp unchanged) or one nobody holds; a refused
+    write changes nothing, returns None, and adds the row to `claims.lost`. The
+    key-based upsert ignores `claims`.
     """
     res_uuid = _as_uuid(reservation_id)
     switch_uuid = _as_uuid(switch_device_id)
@@ -450,6 +466,7 @@ async def record_l2_failed(
             last_error=last_error,
             vlan_uuid=vlan_uuid,
             intended=intended,
+            claims=claims,
         )
 
     result = await db.execute(
