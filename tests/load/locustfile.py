@@ -905,18 +905,19 @@ class LoginLimitProbe(HerdUser):
 # or the repo-root .env, like the stack does.
 MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES") or 4 * 1024 * 1024)
 
-# One JSON route per service, through the gateway: each would parse its body
-# before its authentication runs.
+# One JSON route per service, through the gateway, none of them a route that takes a
+# larger body (OPS-VALID-10): each would parse its body before its authentication
+# runs.
 OVERSIZED_BODY_ROUTES = (
     ("POST", "/api/acl/grants"),
     ("POST", "/api/ai/commit"),
     ("POST", "/api/auth/groups"),
     ("POST", "/api/cabling/topologies"),
     ("PUT", "/api/config/settings"),
-    ("POST", "/api/execution/execute"),
+    ("POST", "/api/execution/device-check"),
     ("POST", "/api/inventory/devices"),
     ("PUT", "/api/notifications/notifications/preferences"),
-    ("POST", "/api/reservations/"),
+    ("PATCH", "/api/reservations/00000000-0000-0000-0000-000000000000"),
     ("POST", "/api/secrets/secrets"),
     ("PUT", "/api/user-profile/preferences"),
     ("POST", "/api/v1/webhooks"),
