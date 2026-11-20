@@ -359,9 +359,22 @@ async def test_l1_release_clears_the_claim(db):
 
 
 async def test_l1_row_identity_failure_write_clears_the_claim(db):
-    row_id = await _seed_l1_failed(claimed_until=_future())
+    """The holder's own failure write ends its drive and clears its stamp. Since
+    issue #1479 the holder says it holds the row by passing its claim ledger."""
+    row_id = await _seed_l1_failed()
+    claims = WiringRowClaims()
+    assert await claims.claim(db, L1ConnectionAssignment, row_id) is True
     await record_l1_failed(
-        db, RES_ID, SWITCH_ID, "0/0/1", "0/0/2", 1, "again", intended="ACTIVE", row_id=row_id
+        db,
+        RES_ID,
+        SWITCH_ID,
+        "0/0/1",
+        "0/0/2",
+        1,
+        "again",
+        intended="ACTIVE",
+        row_id=row_id,
+        claims=claims,
     )
     assert await _claimed_until(L1ConnectionAssignment, row_id) is None
 
@@ -394,9 +407,20 @@ async def test_l2_release_clears_the_claim(db):
 
 async def test_l2_row_identity_failure_write_clears_the_claim(db):
     va = await _seed_alloc()
-    row_id = await _seed_l2_failed(va, claimed_until=_future())
+    row_id = await _seed_l2_failed(va)
+    claims = WiringRowClaims()
+    assert await claims.claim(db, L2PortAssignment, row_id) is True
     await record_l2_failed(
-        db, RES_ID, va, SWITCH_ID, "0/0/1", 1, "again", intended="ACTIVE", row_id=row_id
+        db,
+        RES_ID,
+        va,
+        SWITCH_ID,
+        "0/0/1",
+        1,
+        "again",
+        intended="ACTIVE",
+        row_id=row_id,
+        claims=claims,
     )
     assert await _claimed_until(L2PortAssignment, row_id) is None
 
@@ -428,9 +452,11 @@ async def test_l3_release_clears_the_claim(db):
 
 
 async def test_l3_row_identity_failure_write_clears_the_claim(db):
-    row_id = await _seed_l3_failed(claimed_until=_future())
+    row_id = await _seed_l3_failed()
+    claims = WiringRowClaims()
+    assert await claims.claim(db, RouteAssignment, row_id) is True
     await record_route_failed(
-        db, RES_ID, SWITCH_ID, None, 1, "again", intended="ACTIVE", row_id=row_id
+        db, RES_ID, SWITCH_ID, None, 1, "again", intended="ACTIVE", row_id=row_id, claims=claims
     )
     assert await _claimed_until(RouteAssignment, row_id) is None
 

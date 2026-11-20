@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
 from app.services._uuid_utils import as_uuid as _as_uuid
-from app.services.wiring_claim import unclaimed
+from app.services.wiring_claim import WiringRowClaims, failure_write_claim_clauses, unclaimed
 from app.services.wiring_due import tick_would_drive
 
 logger = logging.getLogger(__name__)
@@ -674,13 +674,15 @@ async def _record_l1_failed_for_row(
     last_error: str,
     physical_connection_id: uuid.UUID | str | None,
     intended: str,
+    claims: WiringRowClaims | None,
 ) -> L1ConnectionAssignment | None:
     """The row-identity compare-and-swap behind record_l1_failed's `row_id` path.
 
     See record_l1_failed's docstring for why the retry channels write by row id
-    (issue #814). One atomic `UPDATE ... WHERE id AND status`, no insert branch:
-    rowcount zero means a concurrent writer moved the row and this failure is stale
-    information about a row that no longer exists in the state it was loaded in.
+    (issue #814). One atomic `UPDATE ... WHERE id AND status`, plus the claim clause
+    of wiring_claim.failure_write_claim_clauses (issue #1479), no insert branch:
+    rowcount zero means a concurrent writer moved the row or another pass holds its
+    drive claim, so this failure is not written and the row joins `claims.lost`.
     """
     values: dict = {
         "status": "FAILED",
@@ -695,14 +697,18 @@ async def _record_l1_failed_for_row(
         .where(
             L1ConnectionAssignment.id == row_id,
             L1ConnectionAssignment.status == expected_status,
+            *failure_write_claim_clauses(L1ConnectionAssignment, row_id, claims),
         )
         .values(**values)
     )
     if result.rowcount == 0:
         await db.rollback()
+        if claims is not None:
+            claims.lost.add(row_id)
         logger.warning(
             "Ignoring stale L1 %s failure for switch %s pair (%s, %s), reservation %s: "
-            "row %s is no longer %s (a concurrent writer won)",
+            "row %s is no longer %s or another pass holds its drive claim "
+            "(a concurrent writer won)",
             "build" if intended == "ACTIVE" else "release",
             switch_uuid,
             ca,
@@ -740,6 +746,7 @@ async def record_l1_failed(
     intended: str,
     row_id: uuid.UUID | None = None,
     expected_status: str = "FAILED",
+    claims: WiringRowClaims | None = None,
 ) -> L1ConnectionAssignment | None:
     """Write (or update) a FAILED row for a cross-connect that could not be applied.
 
@@ -774,6 +781,14 @@ async def record_l1_failed(
     of the bug; this path shares the upsert, so it shares the fix). The fresh-build
     path passes no `row_id` and keeps the upsert: a build after a release is a
     legitimate re-add.
+
+    `claims` (issue #1479) is the calling retry pass's claim ledger, and it only
+    matters on the `row_id` path. The compare-and-swap also requires that the row be
+    one this pass holds (in `claims.held`) or one nobody holds
+    (wiring_claim.failure_write_claim_clauses), so a pass that loaded the row before
+    another pass claimed it cannot rewrite the row under that pass's drive. A refused
+    write changes nothing on the row, returns None, and adds the row to `claims.lost`,
+    which the pass reports `in_progress`. The key-based upsert ignores `claims`.
     """
     res_uuid = _as_uuid(reservation_id)
     switch_uuid = _as_uuid(switch_device_id)
@@ -792,6 +807,7 @@ async def record_l1_failed(
             last_error=last_error,
             physical_connection_id=physical_connection_id,
             intended=intended,
+            claims=claims,
         )
 
     result = await db.execute(

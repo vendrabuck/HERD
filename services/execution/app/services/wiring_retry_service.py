@@ -773,6 +773,7 @@ async def _reattempt_l2_rows(
                             f"{WIRING_UNRESOLVABLE_REASON}: no VLAN allocation for fabric",
                             intended="ACTIVE",
                             row_id=row.id,
+                            claims=claims,
                         )
                     continue
                 va_id, vlan_id = alloc
@@ -1045,6 +1046,7 @@ async def _reattempt_l3_rows(
                                 reason,
                                 intended="ACTIVE",
                                 row_id=row.id,
+                                claims=claims,
                             )
                         continue
                     entry = {"device_id": switch_id, "routes": clean}

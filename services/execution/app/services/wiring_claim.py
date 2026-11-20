@@ -203,3 +203,25 @@ class WiringRowClaims:
             return False
         self.held.add(row_id)
         return True
+
+
+def failure_write_claim_clauses(model, row_id: uuid.UUID, claims: WiringRowClaims | None) -> list:
+    """The claim half of a retry pass's row-identity failure write (issue #1479).
+
+    A retry pass may record a failure only on a row it holds itself or on one nobody
+    holds. The pass says which through `claims`: a row in `claims.held` is this pass's
+    own (it won `WiringRowClaims.claim` before its driver call), so no claim clause is
+    added. Any other row, including every row when `claims` is None, gets the
+    `unclaimed` predicate, so a failure a pass recorded before it ever claimed the row
+    (a switch, template, or driver load failure, a failed login, a VLAN define or
+    allocation failure, an L3 gate refusal) cannot overwrite `last_error`, add
+    attempts, or clear `claimed_until` on a row another pass is driving.
+
+    The clauses join the writer's existing `UPDATE ... WHERE id AND status`; this adds
+    no query. A write they refuse matches zero rows, and the writer adds the row to
+    `claims.lost` so the pass reports it `in_progress`, as `claim` does for a lost
+    claim.
+    """
+    if claims is not None and row_id in claims.held:
+        return []
+    return [unclaimed(model, datetime.now(timezone.utc))]

@@ -2378,6 +2378,7 @@ async def _apply_wiring_pairs(
                         phys,
                         intended="ACTIVE",
                         row_id=_retry_id(switch_id, port_a, port_b),
+                        claims=claims,
                     )
                 for port_a, port_b, phys in release_pairs:
                     if await pair_needs_release(db, res_uuid, switch_uuid, port_a, port_b):
@@ -2392,6 +2393,7 @@ async def _apply_wiring_pairs(
                             phys,
                             intended="RELEASED",
                             row_id=_retry_id(switch_id, port_a, port_b),
+                            claims=claims,
                         )
             continue
 
@@ -2442,6 +2444,7 @@ async def _apply_wiring_pairs(
                         phys,
                         intended="ACTIVE",
                         row_id=_retry_id(switch_id, port_a, port_b),
+                        claims=claims,
                     )
                 for port_a, port_b, phys in release_pairs:
                     if await pair_needs_release(db, res_uuid, switch_uuid, port_a, port_b):
@@ -2456,6 +2459,7 @@ async def _apply_wiring_pairs(
                             phys,
                             intended="RELEASED",
                             row_id=_retry_id(switch_id, port_a, port_b),
+                            claims=claims,
                         )
                 continue
 
@@ -2640,6 +2644,7 @@ async def _apply_one_port_action(
             phys,
             intended="ACTIVE" if action == "connect_ports" else "RELEASED",
             row_id=retry_row_id,
+            claims=claims,
         )
 
 
@@ -3341,6 +3346,7 @@ async def _apply_l2_memberships(
                     park_error,
                     intended="ACTIVE",
                     row_id=_retry_id(a["switch_device_id"], a["port"]),
+                    claims=claims,
                 )
 
     removes_by_switch: dict[str, list[dict]] = {}
@@ -3404,6 +3410,7 @@ async def _apply_l2_memberships(
                         load_error,
                         intended="ACTIVE",
                         row_id=_retry_id(switch_id, a["port"]),
+                        claims=claims,
                     )
                 for r in switch_removes:
                     if await membership_needs_remove(db, res_uuid, switch_uuid, r["port"]):
@@ -3417,6 +3424,7 @@ async def _apply_l2_memberships(
                             load_error,
                             intended="RELEASED",
                             row_id=_retry_id(switch_id, r["port"]),
+                            claims=claims,
                         )
             continue
 
@@ -3461,6 +3469,7 @@ async def _apply_l2_memberships(
                         f"driver login failed: {login_err}",
                         intended="ACTIVE",
                         row_id=_retry_id(switch_id, a["port"]),
+                        claims=claims,
                     )
                 for r in switch_removes:
                     if await membership_needs_remove(db, res_uuid, switch_uuid, r["port"]):
@@ -3474,6 +3483,7 @@ async def _apply_l2_memberships(
                             f"driver login failed: {login_err}",
                             intended="RELEASED",
                             row_id=_retry_id(switch_id, r["port"]),
+                            claims=claims,
                         )
                 continue
 
@@ -3651,6 +3661,7 @@ async def _apply_one_vlan_action(
             err,
             intended="ACTIVE" if action == "add_to_vlan" else "RELEASED",
             row_id=retry_row_id,
+            claims=claims,
         )
 
 
@@ -4457,6 +4468,7 @@ async def _apply_l3_adjacency(
                         load_error,
                         intended=intended,
                         row_id=retry_ids.get(switch_id),
+                        claims=claims,
                     )
             continue
 
@@ -4517,6 +4529,7 @@ async def _apply_l3_adjacency(
                         f"driver login failed: {login_err}",
                         intended=intended,
                         row_id=retry_ids.get(switch_id),
+                        claims=claims,
                     )
                 continue
 
@@ -4633,6 +4646,7 @@ async def _apply_l3_adjacency(
                     switch_last_error,
                     intended=intended,
                     row_id=retry_ids.get(switch_id),
+                    claims=claims,
                 )
 
 
