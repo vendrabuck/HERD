@@ -12,6 +12,7 @@ suite pins it through that service's real app.
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 
 import pytest
@@ -387,14 +388,144 @@ def test_holds_lone_surrogate(value, expected):
     assert holds_lone_surrogate(value) is expected
 
 
+# Where `json.dumps` stops is the interpreter's, not HERD's (issue #1487). Python 3.12
+# and 3.13 count C recursion against a fixed limit: 3.12 serializes a list nested 9,997
+# deep and refuses 9,998, 3.13 serializes 9,998 and refuses 9,999. Python 3.14 checks
+# the real stack instead, so the depth varies by build and by stack size; 3.14.3 on
+# 64-bit Linux, for example, refuses about 58,000 in 8 MiB, about 7,000 in 1 MiB, and
+# serializes 2,000,000 in an unlimited main-thread stack. So no fixed depth is too deep
+# everywhere; these tests find the depth on the interpreter that runs them, in a thread
+# whose stack size they set, so the depth found does not depend on `ulimit -s` either.
+_STACK_BYTES = 8 * 1024 * 1024
+# The deepest nesting the search tries: far above any depth an 8 MiB thread reaches on
+# the interpreters measured (under 75,000), so reaching it means `json.dumps` stopped
+# refusing deep values, and the search fails instead of going further.
+_DEEPEST_SEARCHED = 2_048_000
+
+
+def _nested(leaf: object, depth: int) -> object:
+    deep = leaf
+    for _ in range(depth):
+        deep = [deep]
+    return deep
+
+
+def _serializes(value: object) -> bool:
+    try:
+        json.dumps(value, ensure_ascii=False)
+    except RecursionError:
+        return False
+    return True
+
+
+def _shallowest_depth_too_deep_to_serialize() -> int:
+    """The smallest nesting depth `json.dumps` refuses with RecursionError, here."""
+    fits, too_deep = 0, 1_000
+    while _serializes(_nested("ok", too_deep)):
+        fits, too_deep = too_deep, too_deep * 2
+        assert too_deep <= _DEEPEST_SEARCHED, "json.dumps serialized every depth searched"
+    while too_deep - fits > 1:
+        middle = (fits + too_deep) // 2
+        if _serializes(_nested("ok", middle)):
+            fits = middle
+        else:
+            too_deep = middle
+    return too_deep
+
+
+def _in_a_thread_with_a_fixed_stack(check: Any) -> None:
+    """Run `check()` in a thread with a `_STACK_BYTES` stack; re-raise what it raised."""
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            check()
+        except BaseException as exc:  # handed back to the test's own thread
+            raised.append(exc)
+
+    previous = threading.stack_size(_STACK_BYTES)
+    try:
+        thread = threading.Thread(target=run)
+        thread.start()
+    finally:
+        threading.stack_size(previous)
+    thread.join()
+    if raised:
+        raise raised[0]
+
+
 def test_holds_lone_surrogate_on_a_value_too_deep_to_serialize():
-    for leaf, expected in ((SUR, True), ("ok", False)):
-        deep: object = leaf
-        for _ in range(10_000):
-            deep = [deep]
-        with pytest.raises(RecursionError):
-            json.dumps(deep)
-        assert holds_lone_surrogate(deep) is expected
+    """At twice the depth `json.dumps` refuses, only the walk can answer: the value is
+    asserted unserializable first, so a pass here is the walk's answer."""
+
+    def check() -> None:
+        depth = 2 * _shallowest_depth_too_deep_to_serialize()
+        for leaf, expected in ((SUR, True), ("ok", False)):
+            deep = _nested(leaf, depth)
+            with pytest.raises(RecursionError):
+                json.dumps(deep, ensure_ascii=False)
+            assert holds_lone_surrogate(deep) is expected
+
+    _in_a_thread_with_a_fixed_stack(check)
+
+
+def test_holds_lone_surrogate_answers_at_every_depth_where_serializing_stops():
+    """For every depth on both sides of where `json.dumps` stops on this interpreter, and
+    on both sides of the fixed limits of 3.12 and 3.13, the answer is right, whichever of
+    the serialization and the walk gives it."""
+
+    def check() -> None:
+        edge = _shallowest_depth_too_deep_to_serialize()
+        assert not _serializes(_nested("ok", edge))
+        assert _serializes(_nested("ok", edge - 1))
+        for depth in (*range(edge - 3, edge + 4), *range(9_996, 10_001)):
+            for leaf, expected in ((SUR, True), ("ok", False)):
+                assert holds_lone_surrogate(_nested(leaf, depth)) is expected, (depth, leaf)
+
+    _in_a_thread_with_a_fixed_stack(check)
+
+
+def _spine(kind: str, depth: int) -> object:
+    """A value nested `depth` deep holding no string but dict keys `"k"`: lists, dicts
+    (`{"k": ...}`), or the two alternating."""
+    deep: object = 0
+    for level in range(depth):
+        as_dict = kind == "dict" or (kind == "mixed" and level % 2 == 1)
+        deep = {"k": deep} if as_dict else [deep]
+    return deep
+
+
+# Where the lone surrogate sits beside a spine too deep to serialize. Each shape is a
+# place the walk must reach: a dict key, a dict value, a list's second item, a list's
+# first item, and a string after a clean one (whichever end the walk starts from, a
+# clean string comes first, so an answer decided by the first string is wrong).
+_WALK_SHAPES = {
+    "dict_key_over_a_dict_spine": lambda text, depth: {text: _spine("dict", depth)},
+    "dict_value_beside_a_mixed_spine": lambda text, depth: {
+        "spine": _spine("mixed", depth),
+        "leaf": text,
+    },
+    "second_list_item_after_a_list_spine": lambda text, depth: [_spine("list", depth), text],
+    "first_list_item_before_a_mixed_spine": lambda text, depth: [text, _spine("mixed", depth)],
+    "between_clean_strings": lambda text, depth: ["ok", _spine("list", depth), text, "ok"],
+}
+
+
+@pytest.mark.parametrize("shape", _WALK_SHAPES.values(), ids=_WALK_SHAPES.keys())
+def test_the_walk_finds_a_lone_surrogate_wherever_it_sits(shape):
+    """Past the depth `json.dumps` refuses, the walk answers for every shape: True with
+    a lone surrogate, False for the same value with clean text in its place. The value
+    is asserted unserializable first, so the answer is the walk's."""
+
+    def check() -> None:
+        depth = 2 * _shallowest_depth_too_deep_to_serialize()
+        for text, expected in ((SUR, True), ("clean", False)):
+            value = shape(text, depth)
+            with pytest.raises(RecursionError):
+                json.dumps(value, ensure_ascii=False)
+            assert holds_lone_surrogate(value) is expected, text
+
+    _in_a_thread_with_a_fixed_stack(check)
 
 
 class _Strict(BaseModel):
