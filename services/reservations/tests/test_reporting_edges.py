@@ -353,3 +353,41 @@ def test_report_to_csv_decimal_formatting_four_places():
     device_csv = report_to_csv(report, "device")
     assert ",1.5000," in user_csv
     assert ",0.3333," in device_csv
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_groups_map_sends_batches_of_auth_s_own_cap():
+    """Issue #1466: a report's users are not bounded, so they go to auth in batches of
+    500, its route's cap, each body about 20 KB; every user's groups come back."""
+    from app.services.reporting_service import USER_GROUPS_BATCH
+
+    users = [uuid.uuid4() for _ in range(1_201)]
+    group = {"id": str(uuid.uuid4()), "name": "lab"}
+    sent: list[list[str]] = []
+
+    async def post(url, json, headers):
+        sent.append(json["user_ids"])
+        return httpx.Response(200, json={uid: [group] for uid in json["user_ids"]})
+
+    with patch("httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value.__aenter__.return_value.post = post
+        result = await fetch_user_groups_map(users, "Bearer tok")
+    assert USER_GROUPS_BATCH == 500
+    assert [len(batch) for batch in sent] == [500, 500, 201]
+    assert result == {uid: [(uuid.UUID(group["id"]), "lab")] for uid in users}
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_groups_map_one_failed_batch_fails_soft_for_all():
+    calls = 0
+
+    async def post(url, json, headers):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200 if calls == 1 else 503, json={})
+
+    users = [uuid.uuid4() for _ in range(600)]
+    with patch("httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value.__aenter__.return_value.post = post
+        result = await fetch_user_groups_map(users, "Bearer tok")
+    assert result == {uid: [] for uid in users}

@@ -535,3 +535,32 @@ async def test_cabling_fork_call_sends_on_behalf_of_beside_internal_token(monkey
     )
     await reservation_service._cabling_fork_call("POST", "/internal/forks/x/archive")
     assert [(a.token, a.on_behalf_of) for a in seen] == [("tok", "Bearer u"), ("tok", None)]
+
+
+# --- A cabling 413 is the client's error, relayed as one (issue #1466) ----------------
+
+_CABLING_413 = {
+    "detail": [
+        {"type": "body_too_large", "loc": ["body"], "msg": "Request body is larger than 1 bytes"}
+    ]
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "suffix"), [("PUT", "fork/canvas"), ("POST", "fork/save")], ids=["canvas", "save"]
+)
+async def test_a_cabling_413_is_relayed_as_413_with_its_detail(method, suffix):
+    """Cabling's fork routes take what reservations admitted plus the envelope
+    (OPS-VALID-10); should one still answer 413 (a body re-serialized larger, a
+    different MAX_REQUEST_BODY_BYTES there), the user gets that 413 and its item, never
+    a 503 that says cabling is down."""
+    rid = await _insert_reservation(status=ReservationStatus.ACTIVE)
+    with patch(
+        "app.routers.reservations._cabling_fork_call",
+        new=AsyncMock(return_value=_resp(413, _CABLING_413)),
+    ):
+        async with _client_as(OWNER_ID) as ac:
+            resp = await ac.request(method, f"/{rid}/{suffix}", json={"canvas_data": {}})
+    assert resp.status_code == 413
+    assert resp.json() == _CABLING_413

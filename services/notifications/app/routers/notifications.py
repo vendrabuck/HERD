@@ -61,6 +61,8 @@ def get_bearer_credentials(
 
 router = APIRouter(tags=["notifications"])
 
+PREFERENCES_TOO_LARGE_DETAIL = "The merged notification preferences are too large to store"
+
 
 def _auth_header(credentials: HTTPAuthorizationCredentials) -> dict[str, str]:
     return {"Authorization": f"Bearer {credentials.credentials}"}
@@ -159,6 +161,10 @@ async def put_preferences(
         logger.warning("Failed to write preferences", exc_info=True)
         raise HTTPException(status_code=503, detail="user-profile unreachable") from exc
 
+    if resp.status_code == 413:
+        # The merged preferences were over user-profile's request body limit (issue
+        # #1466): a client error, relayed as one, never as the service being down.
+        raise HTTPException(status_code=413, detail=PREFERENCES_TOO_LARGE_DETAIL)
     if resp.status_code >= 400:
         raise HTTPException(status_code=503, detail=f"user-profile error: {resp.status_code}")
 

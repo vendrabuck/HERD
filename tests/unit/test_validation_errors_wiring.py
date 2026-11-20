@@ -14,11 +14,18 @@ has no `app/`). For each one:
 - `app/main.py` must exist and bind, at module level, at least one name to a
   `FastAPI(...)` call (`FastAPI` imported from `fastapi`, or `fastapi.FastAPI`).
 - Every such name must be passed to the install function in a module-level
-  statement of its own (`install_validation_errors(app)`), after the assignment,
-  with no other argument. The install also adds the body check that refuses a lone
-  surrogate (`RefuseLoneSurrogates`); only the config service may turn it off, and
-  only with exactly `refuse_lone_surrogates=False` (it answers a surrogate in a
-  password itself, OPS-CONFIG-8). Any other keyword, in any service, fails.
+  statement of its own, after the assignment, with the app as its one positional
+  argument and the body limit as `max_body_bytes=` (issue #1466):
+  `install_validation_errors(app, max_body_bytes=settings.max_request_body_bytes)`,
+  where `settings` is bound once, by `from app.config import settings`. The config
+  service, which has no Settings model, passes `max_body_bytes=max_request_body_bytes()`
+  with the function bound once by `from app.request_limits import
+  max_request_body_bytes`. Any other value (a literal, another setting, another
+  object's attribute) fails. The install also adds the body check that refuses a
+  lone surrogate (`RefuseLoneSurrogates`); only the config service may turn it off,
+  and only with exactly `refuse_lone_surrogates=False` (it answers a surrogate in a
+  password itself, OPS-CONFIG-8). Any other keyword, or a keyword given twice or
+  through `**`, in any service, fails.
   The install function must be bound, at module level and exactly once, by an
   import from the expected module: `from <module> import install_validation_errors`
   (any alias), or `from <package> import validation_errors` (any alias) or
@@ -51,20 +58,22 @@ Limits. The scan reads source; it executes nothing:
   that rewrites 422 bodies; the body check removed, or a middleware placed inside
   it, by editing `app.user_middleware` after install (each service suite's
   `test_the_body_check_is_installed` proves the check is the innermost middleware of
-  the built app); a custom `APIRoute` subclass (a router's `route_class`) whose
-  route handler wraps FastAPI's and could catch `RequestValidationError` and answer
-  a body of its own (auth's `_SingleSignOnRoute` in `app/routers/oidc.py` is
-  such a wrapper; it is benign: outside OIDC mode it answers a fixed 404 before
-  validation runs, and otherwise it calls FastAPI's handler unchanged); a handler
-  registered for a base class of
+  the built app, and `tests/unit/test_request_body_limit_wiring.py` proves the limit
+  sits just outside it with the service's setting); a custom `APIRoute` subclass (a
+  router's `route_class`) whose route handler wraps FastAPI's and could catch
+  `RequestValidationError` and answer a body of its own (auth's
+  `_SingleSignOnRoute` in `app/routers/oidc.py` is such a wrapper; it is benign:
+  outside OIDC mode it answers a fixed 404 before validation runs, and otherwise it
+  calls FastAPI's handler unchanged); a handler registered for a base class of
   `RequestValidationError` (`ValidationException`, `Exception`) or under an alias of
   the class name; `setattr(app, "openapi", ...)`; the shared module itself monkeypatched;
   an app object created by a factory or `type(...)` rather than a `FastAPI(...)` call;
   an ASGI app that is not FastAPI (Starlette, a bare callable) anywhere;
 - read conservatively (refused though it may be sound): an install call inside a
   function, an `if`, or a `try`; an install whose argument is an expression other
-  than the app's name; an app name bound twice (even to the same app); an install
-  function bound twice in the module.
+  than the app's name; a limit read any other way than the one expression above
+  (an alias of `settings`, a `get_settings()` call); an app name bound twice (even to
+  the same app); an install function bound twice in the module.
 """
 
 from __future__ import annotations
@@ -88,6 +97,14 @@ INSTALL = "install_validation_errors"
 BODY_CHECK_EXEMPT = {"config"}
 OPT_OUT_KEYWORD = "refuse_lone_surrogates"
 
+# The body limit keyword every install passes (issue #1466), and where its value must
+# come from: (module, name, form). "attribute" is `<name>.max_request_body_bytes`,
+# "call" is `<name>()`; the name must be bound once, by `from <module> import <name>`.
+LIMIT_KEYWORD = "max_body_bytes"
+LIMIT_SETTING = "max_request_body_bytes"
+DEFAULT_LIMIT_SOURCE = ("app.config", "settings", "attribute")
+LIMIT_SOURCES = {"config": ("app.request_limits", LIMIT_SETTING, "call")}
+
 
 def service_dirs(services_dir: Path = SERVICES_DIR) -> list[Path]:
     """Every service directory: a directory under `services/` with an `app/` package."""
@@ -96,6 +113,10 @@ def service_dirs(services_dir: Path = SERVICES_DIR) -> list[Path]:
 
 def expected_module(service: str) -> str:
     return STANDALONE_COPY.get(service, SHARED_MODULE)
+
+
+def expected_limit_source(service: str) -> tuple[str, str, str]:
+    return LIMIT_SOURCES.get(service, DEFAULT_LIMIT_SOURCE)
 
 
 def _module_bindings(tree: ast.Module) -> dict[str, list[ast.stmt]]:
@@ -178,20 +199,70 @@ def fastapi_calls(source: str) -> list[int]:
     return sorted(node.lineno for node in ast.walk(tree) if _is_fastapi_call(node, names, modules))
 
 
-def _opts_out(keywords: list[ast.keyword]) -> bool:
-    """Whether the keywords are exactly `refuse_lone_surrogates=False`."""
+def _names_the_setting(
+    value: ast.expr, bindings: dict[str, list[ast.stmt]], source: tuple[str, str, str]
+) -> bool:
+    """Whether `value` reads the body limit from `source` (see LIMIT_SOURCES)."""
+    module, name, form = source
+    if form == "attribute":
+        shaped = (
+            isinstance(value, ast.Attribute)
+            and value.attr == LIMIT_SETTING
+            and isinstance(value.value, ast.Name)
+            and value.value.id == name
+        )
+    else:
+        shaped = (
+            isinstance(value, ast.Call)
+            and not value.args
+            and not value.keywords
+            and isinstance(value.func, ast.Name)
+            and value.func.id == name
+        )
+    if not shaped:
+        return False
+    stmts = bindings.get(name, [])
     return (
-        len(keywords) == 1
-        and keywords[0].arg == OPT_OUT_KEYWORD
-        and isinstance(keywords[0].value, ast.Constant)
-        and keywords[0].value.value is False
+        len(stmts) == 1
+        and isinstance(stmts[0], ast.ImportFrom)
+        and stmts[0].level == 0
+        and stmts[0].module == module
+        and any(a.name == name and a.asname is None for a in stmts[0].names)
     )
 
 
-def install_problems(source: str, module: str, may_opt_out: bool = False) -> list[str]:
+def _keywords_ok(
+    keywords: list[ast.keyword],
+    bindings: dict[str, list[ast.stmt]],
+    may_opt_out: bool,
+    limit_source: tuple[str, str, str],
+) -> bool:
+    """Whether the keywords are exactly `max_body_bytes=<the setting>`, plus, where
+    `may_opt_out`, optionally `refuse_lone_surrogates=False`."""
+    given: dict[str, ast.expr] = {}
+    for keyword in keywords:
+        if keyword.arg is None or keyword.arg in given:
+            return False
+        given[keyword.arg] = keyword.value
+    allowed = {LIMIT_KEYWORD} | ({OPT_OUT_KEYWORD} if may_opt_out else set())
+    if LIMIT_KEYWORD not in given or not set(given) <= allowed:
+        return False
+    opt_out = given.get(OPT_OUT_KEYWORD)
+    if opt_out is not None and not (isinstance(opt_out, ast.Constant) and opt_out.value is False):
+        return False
+    return _names_the_setting(given[LIMIT_KEYWORD], bindings, limit_source)
+
+
+def install_problems(
+    source: str,
+    module: str,
+    may_opt_out: bool = False,
+    limit_source: tuple[str, str, str] = DEFAULT_LIMIT_SOURCE,
+) -> list[str]:
     """Why a service's `app/main.py` source does not install the handler from `module`
-    on every app it builds; empty when it does. Only when `may_opt_out` may the call
-    carry `refuse_lone_surrogates=False`, and no other keyword."""
+    on every app it builds; empty when it does. The call must pass the body limit
+    from `limit_source`; only when `may_opt_out` may it also carry
+    `refuse_lone_surrogates=False`, and no other keyword."""
     tree = ast.parse(source)
     bindings = _module_bindings(tree)
     names, modules = _fastapi_import_names(tree)
@@ -254,7 +325,7 @@ def install_problems(source: str, module: str, may_opt_out: bool = False) -> lis
         if (
             is_install
             and len(call.args) == 1
-            and (not call.keywords or (may_opt_out and _opts_out(call.keywords)))
+            and _keywords_ok(call.keywords, bindings, may_opt_out, limit_source)
             and isinstance(call.args[0], ast.Name)
         ):
             installed.setdefault(call.args[0].id, index)
@@ -341,6 +412,7 @@ def service_problems(service: Path) -> list[str]:
         main.read_text(encoding="utf-8"),
         expected_module(service.name),
         may_opt_out=service.name in BODY_CHECK_EXEMPT,
+        limit_source=expected_limit_source(service.name),
     )
 
 
@@ -367,22 +439,33 @@ def test_no_other_module_builds_an_app_or_registers_another_handler(service):
 
 # -- The guard against fixtures: an honest change passes, a broken one fails ------------
 
-GOOD = """\
+CALL = "install_validation_errors(app, max_body_bytes=settings.max_request_body_bytes)"
+
+GOOD = f"""\
 from fastapi import FastAPI
 from herd_common.cors import add_cors_middleware
 from herd_common.validation_errors import install_validation_errors
 
+from app.config import settings
+
 app = FastAPI(title="x")
 add_cors_middleware(app, "")
-install_validation_errors(app)
+{CALL}
 app.include_router(router)
 """
+
+
+def _with_call(call: str) -> str:
+    """GOOD with its install line replaced by `call`."""
+    return GOOD.replace(CALL, call)
+
 
 PASSING = {
     "good": GOOD,
     "reordered_after_routers": """\
 from herd_common.validation_errors import install_validation_errors
 from fastapi import FastAPI
+from app.config import settings
 
 app = FastAPI(
     title="x",
@@ -397,40 +480,40 @@ async def health():
 
 
 install_validation_errors(  # every 422 is {type, loc, msg}
-    app
+    app,
+    max_body_bytes=settings.max_request_body_bytes,
 )
 """,
     "aliased": """\
 from fastapi import FastAPI
 from herd_common.validation_errors import install_validation_errors as _install
+from app.config import settings
 
 service = FastAPI()
-_install(service)
+_install(service, max_body_bytes=settings.max_request_body_bytes)
 """,
     "module_attribute": """\
 import fastapi
 from herd_common import validation_errors as ve
+from app.config import settings
 
 app = fastapi.FastAPI()
-ve.install_validation_errors(app)
+ve.install_validation_errors(app, max_body_bytes=settings.max_request_body_bytes)
 """,
     "annotated": """\
 from fastapi import FastAPI
 from herd_common.validation_errors import install_validation_errors
+from app.config import settings
 
 app: FastAPI = FastAPI()
-install_validation_errors(app)
+install_validation_errors(app, max_body_bytes=settings.max_request_body_bytes)
 """,
 }
 
 FAILING = {
-    "removed": GOOD.replace("install_validation_errors(app)\n", ""),
-    "commented_out": GOOD.replace(
-        "install_validation_errors(app)", "# install_validation_errors(app)"
-    ),
-    "only_imported": GOOD.replace(
-        "install_validation_errors(app)\n", "install_validation_errors\n"
-    ),
+    "removed": GOOD.replace(CALL + "\n", ""),
+    "commented_out": _with_call("# " + CALL),
+    "only_imported": _with_call("install_validation_errors"),
     "wrong_module": GOOD.replace("herd_common.validation_errors", "app.validation_errors"),
     "lookalike_local_def": GOOD.replace(
         "app = FastAPI", "def install_validation_errors(app):\n    pass\n\n\napp = FastAPI"
@@ -438,30 +521,28 @@ FAILING = {
     "name_rebound": GOOD.replace(
         "app = FastAPI", "install_validation_errors = print\napp = FastAPI"
     ),
-    "under_if": GOOD.replace(
-        "install_validation_errors(app)", "if False:\n    install_validation_errors(app)"
+    "under_if": _with_call("if False:\n    " + CALL),
+    "inside_a_function": _with_call("def setup():\n    " + CALL),
+    "other_object": _with_call(CALL.replace("(app,", "(other,")),
+    "keyword_argument": _with_call(CALL.replace("(app,", "(app=app,")),
+    "opts_out_of_the_body_check": _with_call(CALL[:-1] + ", refuse_lone_surrogates=False)"),
+    "a_second_positional_argument": _with_call(CALL.replace("(app,", "(app, False,")),
+    "keyword_splat": _with_call("install_validation_errors(app, **options)"),
+    "no_body_limit": _with_call("install_validation_errors(app)"),
+    "a_literal_body_limit": _with_call("install_validation_errors(app, max_body_bytes=10**9)"),
+    "another_setting_as_the_limit": _with_call(
+        "install_validation_errors(app, max_body_bytes=settings.driver_max_size_bytes)"
     ),
-    "inside_a_function": GOOD.replace(
-        "install_validation_errors(app)", "def setup():\n    install_validation_errors(app)"
+    "the_limit_of_another_object": _with_call(
+        "install_validation_errors(app, max_body_bytes=other.max_request_body_bytes)"
     ),
-    "other_object": GOOD.replace(
-        "install_validation_errors(app)", "install_validation_errors(other)"
+    "settings_not_from_app_config": GOOD.replace(
+        "from app.config import settings", "from app.other import settings"
     ),
-    "keyword_argument": GOOD.replace(
-        "install_validation_errors(app)", "install_validation_errors(app=app)"
-    ),
-    "opts_out_of_the_body_check": GOOD.replace(
-        "install_validation_errors(app)",
-        "install_validation_errors(app, refuse_lone_surrogates=False)",
-    ),
-    "a_second_positional_argument": GOOD.replace(
-        "install_validation_errors(app)", "install_validation_errors(app, False)"
-    ),
-    "keyword_splat": GOOD.replace(
-        "install_validation_errors(app)", "install_validation_errors(app, **options)"
-    ),
+    "settings_rebound": GOOD.replace("app = FastAPI", "settings = make()\napp = FastAPI"),
+    "the_limit_given_twice": _with_call(CALL[:-1] + ", max_body_bytes=1)"),
     "before_the_app": GOOD.replace('app = FastAPI(title="x")\n', "").replace(
-        "install_validation_errors(app)\n", "install_validation_errors(app)\napp = FastAPI()\n"
+        CALL + "\n", CALL + "\napp = FastAPI()\n"
     ),
     "app_rebound_after_install": GOOD + "app = FastAPI()\n",
     "second_app_not_installed": GOOD + "admin = FastAPI()\n",
@@ -480,9 +561,7 @@ def test_fixture_mains_that_fail(source):
     assert install_problems(source, SHARED_MODULE) != []
 
 
-OPTED_OUT = GOOD.replace(
-    "install_validation_errors(app)", "install_validation_errors(app, refuse_lone_surrogates=False)"
-)
+OPTED_OUT = _with_call(CALL[:-1] + ", refuse_lone_surrogates=False)")
 
 
 def test_only_an_exempt_service_may_opt_out_of_the_body_check():
@@ -494,25 +573,58 @@ def test_only_an_exempt_service_may_opt_out_of_the_body_check():
 @pytest.mark.parametrize(
     "call",
     [
-        "install_validation_errors(app, refuse_lone_surrogates=0)",
-        "install_validation_errors(app, refuse_lone_surrogates=None)",
-        "install_validation_errors(app, refuse_lone_surrogates=flag)",
-        "install_validation_errors(app, refuse_lone_surrogates=False, other=1)",
-        "install_validation_errors(app, other=False)",
-        "install_validation_errors(app, **{'refuse_lone_surrogates': False})",
-        "install_validation_errors(app, False)",
+        CALL[:-1] + ", refuse_lone_surrogates=0)",
+        CALL[:-1] + ", refuse_lone_surrogates=None)",
+        CALL[:-1] + ", refuse_lone_surrogates=flag)",
+        CALL[:-1] + ", refuse_lone_surrogates=False, other=1)",
+        CALL[:-1] + ", other=False)",
+        CALL[:-1] + ", **{'refuse_lone_surrogates': False})",
+        CALL.replace("(app,", "(app, False,"),
+        "install_validation_errors(app, refuse_lone_surrogates=False)",
     ],
 )
 def test_an_exempt_service_may_opt_out_only_with_exactly_that_keyword(call):
-    source = GOOD.replace("install_validation_errors(app)", call)
+    source = _with_call(call)
     assert install_problems(source, SHARED_MODULE, may_opt_out=True) != []
+
+
+CONFIG_MAIN = """\
+from fastapi import FastAPI
+from app.request_limits import max_request_body_bytes
+from app.validation_errors import install_validation_errors
+
+app = FastAPI()
+install_validation_errors(
+    app, max_body_bytes=max_request_body_bytes(), refuse_lone_surrogates=False
+)
+"""
+CONFIG_MODULE = expected_module("config")
+CONFIG_LIMIT = expected_limit_source("config")
 
 
 def test_config_must_install_its_copy_not_the_shared_module():
     copy_main = GOOD.replace("herd_common.validation_errors", "app.validation_errors")
-    assert install_problems(copy_main, expected_module("config")) == []
-    assert install_problems(GOOD, expected_module("config")) != []
+    assert install_problems(copy_main, CONFIG_MODULE) == []
+    assert install_problems(GOOD, CONFIG_MODULE) != []
     assert install_problems(copy_main, expected_module("secrets")) != []
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        CONFIG_MAIN.replace("max_request_body_bytes()", "max_request_body_bytes"),
+        CONFIG_MAIN.replace("max_request_body_bytes()", "max_request_body_bytes(1)"),
+        CONFIG_MAIN.replace("from app.request_limits", "from app.login_limits"),
+        CONFIG_MAIN.replace("max_body_bytes=max_request_body_bytes(), ", ""),
+    ],
+    ids=["not_called", "called_with_an_argument", "another_module", "no_limit"],
+)
+def test_config_passes_the_limit_its_environment_reader_returns(broken):
+    """Config has no Settings model: its limit is `max_request_body_bytes()` from
+    `app.request_limits`, and only config may read it that way."""
+    assert install_problems(CONFIG_MAIN, CONFIG_MODULE, True, CONFIG_LIMIT) == []
+    assert install_problems(CONFIG_MAIN, CONFIG_MODULE, True) != []
+    assert install_problems(broken, CONFIG_MODULE, True, CONFIG_LIMIT) != []
 
 
 @pytest.mark.parametrize(
@@ -560,13 +672,12 @@ def test_a_new_service_without_the_line_fails(tmp_path):
 
 
 def test_only_config_may_opt_out_by_service_name(tmp_path):
-    """The exemption follows the directory name: the same opted-out line passes in
-    config (with its copy's module) and fails in any other service."""
-    copy_opted_out = OPTED_OUT.replace("herd_common.validation_errors", "app.validation_errors")
+    """The exemption follows the directory name: config's own line passes in config,
+    and the opted-out line fails in any other service, with either limit source."""
     for name, source in [
-        ("config", copy_opted_out),
+        ("config", CONFIG_MAIN),
         ("secrets", OPTED_OUT),
-        ("brand-new", OPTED_OUT),
+        ("brand-new", CONFIG_MAIN.replace("app.validation_errors", SHARED_MODULE)),
     ]:
         (tmp_path / name / "app").mkdir(parents=True)
         (tmp_path / name / "app" / "main.py").write_text(source)

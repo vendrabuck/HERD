@@ -592,3 +592,65 @@ async def test_commit_validate_body_missing_valid_key_fails_closed_with_503(body
     )
     assert not reserve.called
     assert rollback.called
+
+
+# --- the canvas is measured before anything is written (issue #1466) ---
+
+
+def _many_edges_req(count: int) -> CommitRequest:
+    """Two devices and `count` links between them: the canvas grows by a generated id
+    and fixed keys per link, far faster than the request does."""
+    return _req(
+        devices=[
+            CommitDevice(role="a", device_id=DEVICE_A),
+            CommitDevice(role="b", device_id=str(uuid.uuid4())),
+        ],
+        edges=[CommitEdge(source_role="a", target_role="b") for _ in range(count)],
+    )
+
+
+@respx.mock
+async def test_a_canvas_over_the_limit_is_refused_before_anything_is_written(monkeypatch):
+    """The commit request is far under the limit, the canvas it builds is not: the 413
+    names both numbers, and cabling, reservations, and execution see no call at all."""
+    monkeypatch.setattr(config_module.settings, "max_request_body_bytes", 65_536)
+    req = _many_edges_req(1_000)
+    assert len(req.model_dump_json()) < 65_536
+    calls = respx.route(host__regex=".*").mock(return_value=httpx.Response(500))
+    with pytest.raises(CommitError) as refused:
+        await committer.commit_proposal(req, "tok", str(uuid.uuid4()))
+    assert refused.value.status_code == 413
+    assert "over the 65536-byte request body limit" in str(refused.value.message)
+    assert calls.call_count == 0
+
+
+@respx.mock
+async def test_a_canvas_at_or_under_the_limit_goes_on_to_cabling(monkeypatch):
+    """The measure is the PUT body's own encoding: a canvas of exactly the limit is
+    sent."""
+    req = _many_edges_req(10)
+    async with httpx.AsyncClient() as client:
+        canvas = await _build_canvas_data(client, {}, req)
+    # Every generated id has the same length, so the committer's canvas measures the same.
+    monkeypatch.setattr(
+        config_module.settings, "max_request_body_bytes", committer.canvas_put_bytes(canvas)
+    )
+    respx.post(f"{CABLING_URL}/topologies").mock(
+        return_value=httpx.Response(201, json={"id": TOPOLOGY_ID})
+    )
+    put = respx.put(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").mock(
+        return_value=httpx.Response(413, json={"detail": "too large"})
+    )
+    respx.delete(f"{CABLING_URL}/topologies/{TOPOLOGY_ID}").mock(return_value=httpx.Response(204))
+    with pytest.raises(CommitError) as failed:
+        await committer.commit_proposal(req, "tok", str(uuid.uuid4()))
+    assert put.called
+    assert failed.value.status_code == 413  # cabling's own refusal, relayed as a 4xx
+    sent = put.calls.last.request
+    assert len(sent.content) == config_module.settings.max_request_body_bytes
+
+
+def test_canvas_put_bytes_is_the_httpx_encoding():
+    canvas = {"nodes": [{"label": "café", "n": 1.5}], "edges": []}
+    request = httpx.Request("PUT", "http://x", json={"canvas_data": canvas})
+    assert committer.canvas_put_bytes(canvas) == len(request.read())

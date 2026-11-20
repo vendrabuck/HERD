@@ -18,10 +18,12 @@ import pytest
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from herd_common.validation_errors import (
+    DEFAULT_MAX_REQUEST_BODY_BYTES,
     LONE_SURROGATE_BODY_ERROR,
     RENDERED_KEYS,
     STRING_UNICODE_MSG,
     STRING_UNICODE_TYPE,
+    LimitRequestBody,
     RefuseLoneSurrogates,
     _raw_text_holds_a_lone_surrogate,
     holds_lone_surrogate,
@@ -133,7 +135,7 @@ class _Body(BaseModel):
 
 def _app() -> FastAPI:
     app = FastAPI()
-    install_validation_errors(app)
+    install_validation_errors(app, max_body_bytes=DEFAULT_MAX_REQUEST_BODY_BYTES)
 
     @app.post("/things")
     async def create(body: _Body):
@@ -219,7 +221,9 @@ def _quoting_app(*, refuse: bool = False) -> FastAPI:
     validator's message, which the check now keeps a request body from reaching
     (OPS-VALID-5 stays the rule for any other data a validator sees)."""
     app = FastAPI()
-    install_validation_errors(app, refuse_lone_surrogates=refuse)
+    install_validation_errors(
+        app, max_body_bytes=DEFAULT_MAX_REQUEST_BODY_BYTES, refuse_lone_surrogates=refuse
+    )
 
     @app.post("/q")
     async def q(body: _Quoting):
@@ -402,7 +406,9 @@ def _open_app(*, refuse: bool = True) -> FastAPI:
     """Routes whose types accept a lone surrogate: a plain str, a free-form mapping,
     Any, a raw `Request`, plus routes that take no body, a form, and a query."""
     app = FastAPI()
-    install_validation_errors(app, refuse_lone_surrogates=refuse)
+    install_validation_errors(
+        app, max_body_bytes=DEFAULT_MAX_REQUEST_BODY_BYTES, refuse_lone_surrogates=refuse
+    )
 
     @app.post("/str")
     async def plain(body: _Strict):
@@ -745,8 +751,8 @@ def test_install_adds_the_check_unless_told_not_to():
     def middleware(app):
         return [m.cls for m in app.user_middleware]
 
-    assert middleware(_open_app()) == [RefuseLoneSurrogates]
-    assert middleware(_open_app(refuse=False)) == []
+    assert middleware(_open_app()) == [LimitRequestBody, RefuseLoneSurrogates]
+    assert middleware(_open_app(refuse=False)) == [LimitRequestBody]
 
 
 class _Logger(BaseHTTPMiddleware):
@@ -764,7 +770,7 @@ async def test_the_refusal_survives_a_base_http_middleware_in_either_order(order
     app = FastAPI()
     if order == "logger_first":
         app.add_middleware(_Logger)
-    install_validation_errors(app)
+    install_validation_errors(app, max_body_bytes=DEFAULT_MAX_REQUEST_BODY_BYTES)
     if order == "logger_after":
         app.add_middleware(_Logger)
 
@@ -786,7 +792,7 @@ async def test_install_after_the_app_started_is_refused():
     async with _client(app) as client:
         await client.post("/nobody")
     with pytest.raises(RuntimeError):
-        install_validation_errors(app)
+        install_validation_errors(app, max_body_bytes=DEFAULT_MAX_REQUEST_BODY_BYTES)
 
 
 # -- The cost: one scan of the raw bytes (round 4 of the #1456 review) ----------------

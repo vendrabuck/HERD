@@ -13,6 +13,7 @@ import uuid
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from fastapi.security import HTTPAuthorizationCredentials
 from herd_common.internal_auth import internal_token_matches
+from herd_common.validation_errors import FORWARD_ENVELOPE_BYTES, extends_body_limit
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -604,6 +605,8 @@ async def restore_fork_version_internal(
 
 
 @router.put("/{reservation_id}/canvas", response_model=ForkCanvasUpdateResponse)
+# Reservations forwards its fork canvas PUT here and adds to it (issue #1466).
+@extends_body_limit(lambda: FORWARD_ENVELOPE_BYTES)
 async def update_fork_canvas_internal(
     reservation_id: uuid.UUID,
     body: ForkCanvasUpdate,
@@ -651,6 +654,8 @@ async def update_fork_canvas_internal(
 
 
 @router.post("/{reservation_id}/save", response_model=ForkSaveResponse)
+# Reservations forwards its fork save here and adds to it (issue #1466).
+@extends_body_limit(lambda: FORWARD_ENVELOPE_BYTES)
 async def save_fork_internal(
     reservation_id: uuid.UUID,
     body: ForkSaveRequest,

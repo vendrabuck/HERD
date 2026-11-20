@@ -14,6 +14,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile
 from fastapi.responses import Response
+from herd_common.validation_errors import extends_body_limit
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,6 +38,11 @@ from app.services.bulk_service import (
 )
 
 router = APIRouter(tags=["bulk"])
+
+# The import file bound for the request body limit (issue #1466). The import routes
+# read the whole upload with no bound of their own (issue #1417, still open), so this
+# is the only bound on the file: a body may hold it plus MAX_REQUEST_BODY_BYTES.
+IMPORT_UPLOAD_BYTES = 10 * 1024 * 1024
 
 _CSV_MEDIA = "text/csv"
 _JSON_MEDIA = "application/json"
@@ -78,6 +84,7 @@ async def export_devices(
 
 
 @router.post("/devices/import", response_model=BulkImportReport)
+@extends_body_limit(lambda: IMPORT_UPLOAD_BYTES)
 async def import_devices_endpoint(
     file: UploadFile = File(...),
     format: str = Query("json", pattern="^(csv|json)$"),
@@ -118,6 +125,7 @@ async def export_templates(
 
 
 @router.post("/templates/import", response_model=BulkImportReport)
+@extends_body_limit(lambda: IMPORT_UPLOAD_BYTES)
 async def import_templates_endpoint(
     file: UploadFile = File(...),
     format: str = Query("json", pattern="^(csv|json)$"),
