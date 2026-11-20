@@ -1371,8 +1371,10 @@ transitions are WIRE-CLAIM-1 to WIRE-CLAIM-3.
   `claimed_until` stamp it wrote, and the pass's later failure writes to that row
   require the row to still carry that stamp. A holder whose claim expired and was taken
   over by another pass, or whose claim a writer that does not claim cleared, is refused
-  like any other pass (an L1 or L2 driver call, or an L3 login, that the driver refused
-  changed nothing on the device), except for the L3 partial-failure write of
+  like any other pass (the refusal keeps the direction the other writer set and drops
+  only this holder's attempt count and error text; a login or load failure changed
+  nothing on the device, while an L1 or L2 call that timed out may still have landed,
+  which the other writer's record already covers), except for the L3 partial-failure write of
   WIRE-CLAIM-8; a holder whose expired claim nobody took over still writes. The stamp
   round-trips exactly through Postgres `timestamptz` (microseconds and time zone). The
   holder's success and release flips do not consult the stamp (WIRE-CLAIM-8 limits). A

@@ -710,14 +710,15 @@ async def _reattempt_l2_rows(
                             await release_l2_membership(
                                 db, row.reservation_id, row.switch_device_id, row.port
                             )
-                    logger.warning(
-                        "wiring retry: build intent gone for reservation %s switch %s "
-                        "port %s with no resolvable allocation; released directly "
-                        "with no driver call (issue #491)",
-                        res_str,
-                        row.switch_device_id,
-                        row.port,
-                    )
+                    if writable:
+                        logger.warning(
+                            "wiring retry: build intent gone for reservation %s switch %s "
+                            "port %s with no resolvable allocation; released directly "
+                            "with no driver call (issue #491)",
+                            res_str,
+                            row.switch_device_id,
+                            row.port,
+                        )
                 else:
                     async with (
                         get_db_session() as db,
