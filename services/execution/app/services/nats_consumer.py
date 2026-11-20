@@ -4304,7 +4304,10 @@ async def _apply_l3_adjacency(
     with `retry_row_ids`. An L3 row IS the per-switch pin, so its claim is taken once
     per work item, immediately before that switch's login and route drive: a pin the
     other retry channel already holds is skipped with no driver call and no ledger
-    write. A reconcile item never carries a retry row id, so it never claims.
+    write. A reconcile item never carries a retry row id, so it never claims. The
+    claim's budget is `l3_pin_claim_budget` of the switch's drive sequence, counted
+    before the claim, so the one claim outlives the login, every route operation, and
+    the logout (issue #1482).
 
     """
     from datetime import datetime, timezone
@@ -4329,6 +4332,7 @@ async def _apply_l3_adjacency(
         routes_not_in,
         union_routes,
     )
+    from app.services.wiring_claim import l3_pin_claim_budget
 
     res_uuid = uuid.UUID(reservation_id)
     retry_ids = retry_row_ids or {}
@@ -4472,12 +4476,29 @@ async def _apply_l3_adjacency(
                     )
             continue
 
+        # The route operations this switch's drive makes between its login and logout,
+        # fixed here, before the claim, so the claim is sized from the exact sequence
+        # driven below (issue #1482).
+        if direction == "reconcile":
+            drive_sequence = [("remove_route", r) for r in remove_routes] + [
+                ("configure_route", r) for r in add_routes
+            ]
+        else:
+            drive_sequence = [("remove_route", r) for r in residue] + [(method, r) for r in routes]
+
         # Per-row drive claim (issue #817): an L3 row is the whole per-switch pin, so
         # the claim is taken here, immediately before this switch's first driver call,
-        # and a pin the other retry channel holds is left entirely alone.
+        # and a pin the other retry channel holds is left entirely alone. The one
+        # claim covers the login, every route operation, and the logout, so its
+        # budget is sized for all of them (issue #1482).
         if claims is not None:
             async with get_db_session() as db:
-                if not await claims.claim(db, RouteAssignment, retry_ids.get(switch_id)):
+                if not await claims.claim(
+                    db,
+                    RouteAssignment,
+                    retry_ids.get(switch_id),
+                    budget=l3_pin_claim_budget(len(drive_sequence)),
+                ):
                     continue
 
         redacted = redact_context_for_logging(context, password_keys)
@@ -4536,15 +4557,6 @@ async def _apply_l3_adjacency(
             switch_ok = True
             switch_attempts = 0
             switch_last_error: str | None = None
-
-            if direction == "reconcile":
-                drive_sequence = [("remove_route", r) for r in remove_routes] + [
-                    ("configure_route", r) for r in add_routes
-                ]
-            else:
-                drive_sequence = [("remove_route", r) for r in residue] + [
-                    (method, r) for r in routes
-                ]
 
             # Removals that did not confirm (issue #1001): with the routes this pass
             # configured, they are what may still be installed if the switch fails.
