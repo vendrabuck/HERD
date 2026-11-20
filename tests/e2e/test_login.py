@@ -4,6 +4,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+from .conftest import assert_author_credit_under_card
+
 WAIT = 15
 
 
@@ -30,6 +32,13 @@ def test_login_page_has_register_link(browser, base_url):
     register_link = wait.until(EC.presence_of_element_located((By.LINK_TEXT, "Register")))
     assert register_link.is_displayed()
     assert "/register" in register_link.get_attribute("href")
+
+
+def test_login_page_has_author_credit(browser, base_url):
+    """The author credit sits under the sign-in card, clear of it, and links to
+    the author's LinkedIn profile in a new tab without an opener or referrer."""
+    browser.get(f"{base_url}/login")
+    assert_author_credit_under_card(browser, WAIT)
 
 
 def test_login_failure_shows_error(browser, base_url):
