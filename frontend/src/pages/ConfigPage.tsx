@@ -10,6 +10,7 @@ import {
   structuredDetail,
 } from "@/lib/errors";
 import { ArrowLeft, Eye, EyeOff, ChevronDown, ChevronRight } from "lucide-react";
+import { AuthorCredit } from "@/components/layout/AuthorCredit";
 import { useConfigStore } from "@/stores/configStore";
 import { configPasswordLengthOk } from "@/lib/configPassword";
 import {
@@ -520,8 +521,11 @@ export function ConfigPage() {
   // Not authenticated to config
   if (!configToken) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+      <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50">
         <ConfigLogin onLoginSuccess={handleLoginSuccess} />
+        <footer className="mt-4 px-4 text-center">
+          <AuthorCredit />
+        </footer>
       </div>
     );
   }
@@ -529,8 +533,11 @@ export function ConfigPage() {
   // Must change password first
   if (passwordChanged === false) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+      <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50">
         <PasswordChange onChanged={() => setPasswordChanged(true)} />
+        <footer className="mt-4 px-4 text-center">
+          <AuthorCredit />
+        </footer>
       </div>
     );
   }

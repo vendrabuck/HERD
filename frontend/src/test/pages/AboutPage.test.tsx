@@ -25,6 +25,7 @@ vi.mock("@/lib/appVersion", async () => {
 
 import { AboutPage } from "@/pages/admin/AboutPage";
 import { SERVICES } from "@/api/about";
+import { expectAuthorCredit } from "../authorCredit";
 import { APP_VERSION, APP_BUILD } from "@/lib/appVersion";
 
 function renderWithProviders(node: ReactNode) {
@@ -68,6 +69,26 @@ describe("AboutPage", () => {
     expect(screen.getByText(APP_BUILD)).toBeInTheDocument();
     // UTC and labeled, never the viewer's locale: see formatBuildDate.
     expect(screen.getByText("2026-09-10 00:00 UTC")).toBeInTheDocument();
+  });
+
+  it("shows the author credit inside the Frontend card, after its Version, Build, and Build date", () => {
+    mockAllServicesOk();
+    renderWithProviders(<AboutPage />);
+    const link = expectAuthorCredit();
+    const card = screen.getByRole("heading", { name: "Frontend" }).parentElement!;
+    expect(card).toContainElement(link);
+    // The credit closes the card: the element right after the card's dl.
+    const dl = card.querySelector("dl")!;
+    expect(dl).not.toBeNull();
+    expect(
+      Array.from(dl.querySelectorAll("dt")).map((dt) => dt.textContent),
+    ).toEqual(["Version", "Build", "Build date"]);
+    const credit = screen.getByTestId("author-credit");
+    expect(dl.nextElementSibling).toBe(credit);
+    expect(dl.compareDocumentPosition(credit) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Not a heading: the e2e test finds the page by its "About" heading.
+    const headings = screen.getAllByRole("heading").map((h) => h.textContent ?? "");
+    expect(headings.filter((text) => /Lane|built/.test(text))).toEqual([]);
   });
 
   it("renders all 12 services once every /version call answers", async () => {

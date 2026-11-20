@@ -627,6 +627,44 @@ def _wait_for_selenium(url, retries=12, delay=5):
     raise RuntimeError(f"Selenium Hub not reachable at {status_url} after {retries} attempts")
 
 
+AUTHOR_CREDIT_TEXT = "Designed and built by Lane Nelms"
+AUTHOR_LINKEDIN_URL = "https://www.linkedin.com/in/lane-nelms/"
+_AUTHOR_CREDIT_SELECTOR = "[data-testid='author-credit']"
+
+# The card's bottom and the credit footer's top, from the footer's previous
+# sibling (the card it follows), and the page's scroll and client widths.
+_AUTHOR_CREDIT_LAYOUT_JS = (
+    f"const f = document.querySelector({json.dumps(_AUTHOR_CREDIT_SELECTOR)}).closest('footer');"
+    "const card = f.previousElementSibling.getBoundingClientRect();"
+    "return [card.bottom, f.getBoundingClientRect().top,"
+    " document.documentElement.scrollWidth, document.documentElement.clientWidth];"
+)
+
+
+def assert_author_credit_under_card(driver, wait_seconds=15):
+    """On a page the driver has open, assert the author credit (AuthorCredit)
+    renders under the page's card, clear of it, with no sideways scroll, and
+    links to the author's LinkedIn profile in a new tab without an opener or
+    referrer. jsdom has no layout, so the placement is proven here only."""
+    link = WebDriverWait(driver, wait_seconds).until(
+        EC.visibility_of_element_located((By.CSS_SELECTOR, f"{_AUTHOR_CREDIT_SELECTOR} a"))
+    )
+    credit = driver.find_element(By.CSS_SELECTOR, _AUTHOR_CREDIT_SELECTOR)
+    assert " ".join(credit.text.split()) == AUTHOR_CREDIT_TEXT
+    assert link.get_attribute("href") == AUTHOR_LINKEDIN_URL
+    assert link.get_attribute("target") == "_blank"
+    assert link.get_attribute("rel") == "noopener noreferrer"
+    card_bottom, footer_top, scroll_width, client_width = driver.execute_script(
+        _AUTHOR_CREDIT_LAYOUT_JS
+    )
+    assert footer_top >= card_bottom, (
+        f"the author credit overlaps its card: footer top {footer_top}, card bottom {card_bottom}"
+    )
+    assert scroll_width <= client_width, (
+        f"the page scrolls sideways: scroll width {scroll_width}, client width {client_width}"
+    )
+
+
 LOGIN_FORM_TIMEOUT_MESSAGE = "the login form (#login-email) did not render"
 
 # The HTTP status of every `POST /api/auth/login` the page has an answer for,

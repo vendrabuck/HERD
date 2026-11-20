@@ -166,7 +166,7 @@ clients have a suite but stay below 85% lines on error and edge-case branches:
 
 ## E2E
 
-`tests/e2e/` has 73 test files and 227 tests across Selenium and Playwright (the
+`tests/e2e/` has 73 test files and 230 tests across Selenium and Playwright (the
 three in `test_oidc_login_playwright.py` run only in the OIDC-mode stack phase and
 skip as exempt elsewhere; the 2026-11-12 nightly collected 221 unseeded: 157 passed, 63 skipped, 1 failed; the v0.7.0 release gate ran 206: 148 passed and 58 skipped unseeded, 202 passed and 4 exempt skips seeded; see README.md's Testing section). Remaining UI gaps:
 
