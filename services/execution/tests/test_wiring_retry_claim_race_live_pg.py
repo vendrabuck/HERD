@@ -14,14 +14,19 @@ one event loop with one connection. This file is the missing other half. Each te
 
   - seeds ONE FAILED row for one throwaway reservation, in the real `execution`
     schema, through the real ORM models;
-  - starts `reattempt_reservation` and `run_wiring_retry_tick` as two REAL
-    concurrent asyncio tasks over SEPARATE Postgres sessions;
-  - serves them a SLOW driver stub (a blocking sleep, which the production code runs
-    off the event loop through `asyncio.to_thread`, so the loser really does get
-    scheduled while the winner is mid-drive);
+  - runs the claim holder as a REAL asyncio task and the other channel in the same
+    loop, over SEPARATE Postgres sessions;
+  - serves them a GATED driver stub (issue #1473): the holder's first row action
+    signals that it is inside its drive and then blocks, in the worker thread the
+    production code runs it in (`asyncio.to_thread`), until the test releases it.
+    The test starts the losing channel only after that signal and releases the
+    holder only after the loser has returned, so the loser runs strictly inside the
+    holder's claim on any runner speed; no fixed sleep decides an outcome, and every
+    wait is bounded and fails loudly;
   - asserts the driver was called EXACTLY ONCE for the row, and that the channel
     that lost the claim reported the row rather than dropping it: `in_progress` for
-    the manual channel, the `in_progress` tick stat for the background one.
+    the manual channel; for the tick, either the row is not a candidate at all
+    (`rows_due` 0) or, when it selected the row before the claim, `in_progress`.
 
 The rows are RELEASE-direction (intended RELEASED) on purpose. A release needs no
 cabling fork fetch and no intent revalidation, so the test exercises the claim and
@@ -76,7 +81,6 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
-import time
 import uuid
 from unittest.mock import AsyncMock, patch
 
@@ -229,11 +233,6 @@ TEST_TICK_CAP = HIDDEN_ATTEMPTS + 1
 # could push this test's own newest row out of the result.
 SCOPED_SELECT_LIMIT = 10000
 
-# Long enough that the loser provably runs while the winner holds the row, short
-# enough to keep the suite quick. The driver stub blocks in a worker thread
-# (nats_consumer._run_sandbox wraps it in asyncio.to_thread), not on the loop.
-DRIVE_SECONDS = 2.0
-
 # Driver actions that mean "this row was actually driven". login/logout are
 # per-switch bookkeeping and say nothing about the row.
 _ROW_ACTIONS = (
@@ -245,18 +244,84 @@ _ROW_ACTIONS = (
     "remove_route",
 )
 
+# Issue #1473: the races are staged with explicit coordination, never a fixed sleep.
+# A generous bound for every wait on the coordination events: a wait that expires
+# fails the test loudly, it never lets the test proceed on a guess. A healthy run
+# never waits anywhere near it.
+COORDINATION_TIMEOUT = 30.0
+_LOGIN_REFUSED = {"success": False, "output": None, "error": "login refused", "duration_ms": 1}
 
-def _slow_driver_stub():
-    """A sandbox stub that records every action and sleeps on the row's own op."""
+
+def _gated_driver_stub():
+    """A sandbox stub whose FIRST row action blocks until the test releases it.
+
+    `entered` is set when that first row action begins: the claim holder is inside its
+    drive, and its claim is committed (every layer claims before its row's first driver
+    call). The stub then waits on `release`, which the test sets only after the losing
+    channel has returned, so the holder cannot finish its drive before the loser has
+    run, on any runner speed. Every later row action returns at once.
+    `state["fail_logins"]`, when true, makes a login answer a driver failure. The stub
+    runs in the worker thread `nats_consumer._run_sandbox` hands it, so its waits never
+    block the event loop; `release.wait` is bounded and records an expiry in
+    `state["release_timed_out"]` for the test to fail on.
+    """
     calls: list[str] = []
+    entered = threading.Event()
+    release = threading.Event()
+    state = {"fail_logins": False, "blocked": False, "release_timed_out": False}
 
     def execute_fn(driver_path, action, context, **kwargs):
         calls.append(action)
-        if action in _ROW_ACTIONS:
-            time.sleep(DRIVE_SECONDS)
+        if action == "login" and state["fail_logins"]:
+            return _LOGIN_REFUSED
+        if action in _ROW_ACTIONS and not state["blocked"]:
+            state["blocked"] = True
+            entered.set()
+            if not release.wait(COORDINATION_TIMEOUT):
+                state["release_timed_out"] = True
         return SUCCESS
 
-    return execute_fn, calls
+    return execute_fn, calls, entered, release, state
+
+
+async def _wait_entered(entered: threading.Event, holder: asyncio.Task | None = None) -> None:
+    """Wait, off the loop, until the holder is inside its drive; fail loudly otherwise.
+
+    With `holder` given, a holder that finishes without ever entering its drive fails
+    at once instead of after the full timeout.
+    """
+    waiter = asyncio.ensure_future(asyncio.to_thread(entered.wait, COORDINATION_TIMEOUT))
+    if holder is not None:
+        await asyncio.wait({waiter, holder}, return_when=asyncio.FIRST_COMPLETED)
+        if not waiter.done():
+            entered.set()  # free the waiting thread
+            await waiter
+            holder.result()  # surface the holder's own exception, if it raised
+            pytest.fail("the claim holder finished without entering its drive")
+    if not await waiter:
+        pytest.fail(f"the claim holder never entered its drive in {COORDINATION_TIMEOUT}s")
+
+
+async def _loser_inside_holders_drive(holder_coro, run_loser, stub_state, entered, release):
+    """Run `run_loser()` strictly inside the drive of the task `holder_coro` starts.
+
+    The order is fixed by events, not timing: start the holder; wait until the stub
+    reports it inside its drive (its claim committed); run the loser to completion;
+    only then release the stub. Returns (holder_result, loser_result) and fails if the
+    holder had finished before the loser returned or the stub's release wait expired.
+    """
+    holder = asyncio.create_task(holder_coro)
+    holder_was_driving = False
+    try:
+        await _wait_entered(entered, holder)
+        loser_result = await run_loser()
+        holder_was_driving = not holder.done()
+    finally:
+        release.set()
+        holder_result = await asyncio.wait_for(holder, COORDINATION_TIMEOUT)
+    assert holder_was_driving, "the loser must have run while the holder was still driving"
+    assert not stub_state["release_timed_out"], "the stub's release wait expired"
+    return holder_result, loser_result
 
 
 def _scope_to_reservation(real_fn, reservation_id: uuid.UUID):
@@ -351,22 +416,23 @@ async def _cleanup(session_factory, reservation_id: uuid.UUID) -> None:
         await db.commit()
 
 
-async def _race(session_factory, reservation_id):
-    """Run both channels as real concurrent tasks; return (manual_result, tick_stats).
+async def _race(session_factory, reservation_id, entered, release, state):
+    """The manual channel holds the claim; the whole tick runs inside its drive.
 
-    Each channel gets its OWN session factory instance so neither shares a
-    connection or a transaction with the other: the serialization under test has to
-    come from the database, not from a shared session.
+    Returns (manual_result, tick_stats). The manual call runs as a task until the stub
+    reports it inside its drive (its claim committed), the tick then runs to
+    completion, and only then is the manual call's drive released
+    (_loser_inside_holders_drive). Each channel gets its OWN session factory instance
+    so neither shares a connection or a transaction with the other: the serialization
+    under test has to come from the database, not from a shared session.
     """
-    manual = asyncio.create_task(
-        reattempt_reservation(reservation_id, _session_ctx(session_factory))
+    return await _loser_inside_holders_drive(
+        reattempt_reservation(reservation_id, _session_ctx(session_factory)),
+        lambda: run_wiring_retry_tick(_session_ctx(session_factory)),
+        state,
+        entered,
+        release,
     )
-    # A short head start makes the ordering deterministic enough to assert on while
-    # still leaving both channels genuinely in flight: the manual channel is inside
-    # its (slow) driver call by the time the tick selects.
-    await asyncio.sleep(0.4)
-    tick = asyncio.create_task(run_wiring_retry_tick(_session_ctx(session_factory)))
-    return await asyncio.gather(manual, tick)
 
 
 def _row_calls(calls: list[str]) -> list[str]:
@@ -455,13 +521,13 @@ async def test_l1_row_is_driven_exactly_once_across_both_channels(session_factor
         await db.commit()
         row_id = row.id
 
-    execute_fn, calls = _slow_driver_stub()
+    execute_fn, calls, entered, release, state = _gated_driver_stub()
     foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
     patches = _patches(execute_fn, reservation_id)
     for p in patches:
         p.start()
     try:
-        manual, stats = await _race(session_factory, reservation_id)
+        manual, stats = await _race(session_factory, reservation_id, entered, release, state)
     finally:
         for p in patches:
             p.stop()
@@ -472,11 +538,12 @@ async def test_l1_row_is_driven_exactly_once_across_both_channels(session_factor
     )
     outcomes = {r["id"]: r["outcome"] for r in manual["results"]}
     assert outcomes == {str(row_id): "released"}, "the winner reports the real outcome"
-    # With the head start the manual channel already holds the claim by the time the
-    # tick selects, so the tick's own claim predicate excludes the row before its
+    # The manual channel holds the claim for the whole tick (the tick runs only after
+    # the stub reports the manual drive entered, and the drive is released only after
+    # the tick returns), so the tick's own claim predicate excludes the row before its
     # drive-time compare-and-swap is even reached: nothing due, nothing driven,
     # nothing counted as failed. The drive-time loss is proved by
-    # test_a_simultaneous_start_makes_the_loser_report_in_progress below. rows_due is
+    # test_a_row_selected_before_it_was_claimed_loses_the_drive_time_cas below. rows_due is
     # scoped to this reservation (issue #819), so a used gate ledger's foreign FAILED
     # rows never make this assertion fail.
     assert stats["rows_due"] == 0, (
@@ -517,13 +584,13 @@ async def test_l2_row_is_driven_exactly_once_across_both_channels(session_factor
         await db.commit()
         row_id = row.id
 
-    execute_fn, calls = _slow_driver_stub()
+    execute_fn, calls, entered, release, state = _gated_driver_stub()
     foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
     patches = _patches(execute_fn, reservation_id)
     for p in patches:
         p.start()
     try:
-        manual, stats = await _race(session_factory, reservation_id)
+        manual, stats = await _race(session_factory, reservation_id, entered, release, state)
     finally:
         for p in patches:
             p.stop()
@@ -564,13 +631,13 @@ async def test_l3_pin_is_driven_exactly_once_across_both_channels(session_factor
         await db.commit()
         row_id = row.id
 
-    execute_fn, calls = _slow_driver_stub()
+    execute_fn, calls, entered, release, state = _gated_driver_stub()
     foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
     patches = _patches(execute_fn, reservation_id)
     for p in patches:
         p.start()
     try:
-        manual, stats = await _race(session_factory, reservation_id)
+        manual, stats = await _race(session_factory, reservation_id, entered, release, state)
     finally:
         for p in patches:
             p.stop()
@@ -594,9 +661,10 @@ async def test_l3_pin_is_driven_exactly_once_across_both_channels(session_factor
 
 @pytest.mark.asyncio
 async def test_the_manual_channel_reports_in_progress_when_the_tick_wins(session_factory):
-    """The mirror ordering: the tick gets the head start, so the MANUAL call is the
-    one that loses the claim and must report `in_progress` rather than omitting the
-    row (an absent row would read to the caller as one that was already fixed)."""
+    """The mirror ordering: the tick holds the claim, so the MANUAL call is the one
+    that loses it and must report `in_progress` rather than omitting the row (an
+    absent row would read to the caller as one that was already fixed). The manual
+    call runs start to finish while the tick's drive is held open by the stub."""
     reservation_id = uuid.uuid4()
     async with session_factory() as db:
         row = L1ConnectionAssignment(
@@ -613,18 +681,19 @@ async def test_the_manual_channel_reports_in_progress_when_the_tick_wins(session
         await db.commit()
         row_id = row.id
 
-    execute_fn, calls = _slow_driver_stub()
+    execute_fn, calls, entered, release, state = _gated_driver_stub()
     foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
     patches = _patches(execute_fn, reservation_id)
     for p in patches:
         p.start()
     try:
-        tick = asyncio.create_task(run_wiring_retry_tick(_session_ctx(session_factory)))
-        await asyncio.sleep(0.4)
-        manual = asyncio.create_task(
-            reattempt_reservation(reservation_id, _session_ctx(session_factory))
+        stats, manual_result = await _loser_inside_holders_drive(
+            run_wiring_retry_tick(_session_ctx(session_factory)),
+            lambda: reattempt_reservation(reservation_id, _session_ctx(session_factory)),
+            state,
+            entered,
+            release,
         )
-        stats, manual_result = await asyncio.gather(tick, manual)
     finally:
         for p in patches:
             p.stop()
@@ -657,8 +726,9 @@ async def test_a_row_selected_before_it_was_claimed_loses_the_drive_time_cas(ses
     That window is reproduced exactly here rather than left to task-start luck: the
     row is loaded through the tick's own real selection query (`due_failed_rows`,
     which sees it unclaimed and hands back the ORM rows the tick would drive), the
-    manual channel is then allowed to claim and start its slow driver call, and only
-    then is the tick's real drive entered with those pre-loaded rows. Its per-row
+    manual channel is then allowed to claim and enter its driver call, where the stub
+    holds it, and only then is the tick's real drive entered with those pre-loaded
+    rows; the manual drive is released after the tick's drive returns. Its per-row
     claim must lose, so it must drive nothing and report `in_progress`.
     """
     from app.services.l1_assignment_service import due_failed_rows
@@ -698,31 +768,24 @@ async def test_a_row_selected_before_it_was_claimed_loses_the_drive_time_cas(ses
     own_row = preselected_by_id[row_id]
     assert own_row.claimed_until is None, "the row must have been unclaimed at selection time"
 
-    execute_fn, calls = _slow_driver_stub()
+    execute_fn, calls, entered, release, state = _gated_driver_stub()
     foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
     patches = _patches(execute_fn, reservation_id)
     for p in patches:
         p.start()
     try:
-        manual = asyncio.create_task(
-            reattempt_reservation(reservation_id, _session_ctx(session_factory))
+        # The manual channel's claim is committed before its driver call, so once the
+        # stub reports the drive entered the interleave under test is the intended one.
+        # The background channel then reaches its driver call with ONLY the row it
+        # itself preselected for this test, never any foreign row the same real query
+        # might have also returned (issue #819).
+        manual_result, outcomes = await _loser_inside_holders_drive(
+            reattempt_reservation(reservation_id, _session_ctx(session_factory)),
+            lambda: _reattempt_rows([own_row], _session_ctx(session_factory)),
+            state,
+            entered,
+            release,
         )
-        # Wait for the manual channel's claim to actually land, so the interleave under
-        # test is the one intended rather than whatever the scheduler happened to do.
-        for _ in range(100):
-            await asyncio.sleep(0.05)
-            async with session_factory() as db:
-                fresh = await db.get(L1ConnectionAssignment, row_id)
-                if fresh is not None and fresh.claimed_until is not None:
-                    break
-        else:
-            pytest.fail("the manual channel never took the claim")
-
-        # Now the background channel reaches its driver call with ONLY the row it
-        # itself preselected for this test, never any foreign row the same real
-        # query might have also returned (issue #819).
-        outcomes = await _reattempt_rows([own_row], _session_ctx(session_factory))
-        manual_result = await manual
     finally:
         for p in patches:
             p.stop()
@@ -743,39 +806,8 @@ async def test_a_row_selected_before_it_was_claimed_loses_the_drive_time_cas(ses
     )
 
 
-# Issue #1473, product path demonstrations. A generous bound for every wait on the
-# coordination events below: a wait that expires fails the test loudly, it never
-# lets the test proceed on a guess.
-COORDINATION_TIMEOUT = 30.0
-_LOGIN_REFUSED = {"success": False, "output": None, "error": "login refused", "duration_ms": 1}
-
-
-def _gated_driver_stub():
-    """A sandbox stub whose FIRST row action blocks until the test releases it.
-
-    `entered` is set when that first row action begins (the claim holder is inside its
-    drive, its claim committed); the stub then waits on `release`. Every later row
-    action returns at once. `state["fail_logins"]`, when true, makes a login answer a
-    driver failure. Runs in the worker thread `nats_consumer._run_sandbox` hands it,
-    so the waits here never block the event loop.
-    """
-    calls: list[str] = []
-    entered = threading.Event()
-    release = threading.Event()
-    state = {"fail_logins": False, "blocked": False, "release_timed_out": False}
-
-    def execute_fn(driver_path, action, context, **kwargs):
-        calls.append(action)
-        if action == "login" and state["fail_logins"]:
-            return _LOGIN_REFUSED
-        if action in _ROW_ACTIONS and not state["blocked"]:
-            state["blocked"] = True
-            entered.set()
-            if not release.wait(COORDINATION_TIMEOUT):
-                state["release_timed_out"] = True
-        return SUCCESS
-
-    return execute_fn, calls, entered, release, state
+# Issues #1473 and #1479: a retry pass that loaded a row before another pass claimed
+# it must not rewrite that row under the holder's drive.
 
 
 async def _seed_failed_l1_release(session_factory, reservation_id, port_a, port_b):
@@ -805,11 +837,6 @@ async def _preselect_own_row(session_factory, row_id):
     assert row_id in by_id, "the early pass must have loaded the row while it was unclaimed"
     assert by_id[row_id].claimed_until is None
     return by_id[row_id]
-
-
-async def _wait_entered(entered: threading.Event) -> None:
-    if not await asyncio.to_thread(entered.wait, COORDINATION_TIMEOUT):
-        pytest.fail("the claim holder never entered its drive")
 
 
 @pytest.mark.asyncio
