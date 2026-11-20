@@ -34,6 +34,8 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from tests._cost import cpu_seconds, growth_ratios
+
 MARKER = "canary-Secret-7q"
 
 
@@ -789,11 +791,18 @@ async def test_install_after_the_app_started_is_refused():
 
 # -- The cost: one scan of the raw bytes (round 4 of the #1456 review) ----------------
 #
-# Bounds are relative, never wall clock, so they hold pinned to one core and on a fast
-# host: the scan against `json.loads` of the same body (what FastAPI does with it
-# anyway) and against `bytes.lower` (one C pass over the body).
+# Every time is CPU time read through `tests/_cost.py` (#1477), and every bound is
+# relative, so it holds on a fast host, on a shared CI runner, pinned to one core, under
+# coverage, and beside a CPU hog: the escape-heavy scan against itself at four and
+# sixteen times the size (linear work), and where the comparison is the property, the
+# scan against `json.loads` of the same body (the parse it saves) or `bytes.lower` (one
+# C pass), with the margin each docstring records.
 
 _MB = 1 << 20
+# Each fourfold step in size may cost at most this many times the one before: linear
+# work costs about 4 (3.9 to 4.2 measured over 50 runs in each of the four conditions
+# above), a quadratic scan about 16.
+_GROWTH_BOUND = 8.0
 
 
 def _fill(unit: str, head: str, tail: str, size: int = _MB) -> bytes:
@@ -813,18 +822,6 @@ def _peak(fn) -> int:
         tracemalloc.stop()
 
 
-def _best_time(fn, runs: int = 5) -> float:
-    """The fastest of `runs` timings: robust to a busy host and to a single core."""
-    import time
-
-    best = float("inf")
-    for _ in range(runs):
-        start = time.perf_counter()
-        fn()
-        best = min(best, time.perf_counter() - start)
-    return best
-
-
 _LONE_TEXT = '"\\ud800"'
 _BS = "\\"
 # Structural bodies, a lone surrogate at the end: millions of elements, cheap to scan.
@@ -834,40 +831,49 @@ _STRUCTURAL = {
     "triples": lambda: _fill("[[[]]],", '{"name":"a","z":[', _LONE_TEXT + "]}"),
     "nested_dicts": lambda: _fill('{"a":{"b":1}},', "[", _LONE_TEXT + "]"),
 }
-# Escape-heavy string bodies, the scan's own worst: json.loads decodes them fast.
+# Escape-heavy string bodies, the scan's own worst: json.loads decodes them fast. Each
+# takes the body's size, so the cost test can grow it.
 _ESCAPE_HEAVY = {
-    "pairs": lambda: _fill(_BS + "ud83d" + _BS + "ude00", '{"name":"', '"}'),
-    "pairs_upper_then_low": lambda: _fill(
-        _BS + "uD83D" + _BS + "uDE00", '{"name":"', _BS + 'udc00"}'
+    "pairs": lambda size=_MB: _fill(_BS + "ud83d" + _BS + "ude00", '{"name":"', '"}', size),
+    "pairs_upper_then_low": lambda size=_MB: _fill(
+        _BS + "uD83D" + _BS + "uDE00", '{"name":"', _BS + 'udc00"}', size
     ),
-    "backslash_pairs_then_low": lambda: _fill(_BS * 2, '{"name":"', _BS + 'udc00"}'),
-    "u0041_then_low": lambda: _fill(_BS + "u0041", '{"name":"', _BS + 'udc00"}'),
-    "four_backslashes_and_text": lambda: _fill(_BS * 4 + "ude00", '{"name":"', '"}'),
+    "backslash_pairs_then_low": lambda size=_MB: _fill(_BS * 2, '{"name":"', _BS + 'udc00"}', size),
+    "u0041_then_low": lambda size=_MB: _fill(_BS + "u0041", '{"name":"', _BS + 'udc00"}', size),
+    "four_backslashes_and_text": lambda size=_MB: _fill(_BS * 4 + "ude00", '{"name":"', '"}', size),
 }
 
 
 @pytest.mark.parametrize("make", _STRUCTURAL.values(), ids=_STRUCTURAL.keys())
 def test_a_structural_body_costs_a_small_part_of_its_parse(make):
     """The body is refused without a parse: the scan costs under a fifth of what
-    `json.loads` of it costs (measured 0.01 to 0.04), and its memory does not grow with
-    the millions of elements (at most two copies of the bytes)."""
+    `json.loads` of it costs, and its memory does not grow with the millions of
+    elements (at most two copies of the bytes). The comparison with the parse is the
+    property, so this one keeps a ratio: measured 0.01 to 0.07 in CPU time over 50 runs
+    in each of the four conditions, almost three times under the bound."""
     body = make()
     assert _raw_text_holds_a_lone_surrogate(body) is True
-    scan = _best_time(lambda: _raw_text_holds_a_lone_surrogate(body))
-    assert scan < _best_time(lambda: json.loads(body)) / 5
+    scan = cpu_seconds(lambda: _raw_text_holds_a_lone_surrogate(body))
+    assert scan < cpu_seconds(lambda: json.loads(body)) / 5
     assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 2.2 * len(body)
 
 
 @pytest.mark.parametrize("make", _ESCAPE_HEAVY.values(), ids=_ESCAPE_HEAVY.keys())
-def test_an_escape_heavy_body_costs_a_bounded_number_of_passes(make):
+def test_an_escape_heavy_body_costs_linear_work_in_two_copies(make):
     """A body of nothing but escapes is the scan's worst: a few C passes (two copies, a
-    search, eight counts), measured 9 to 28 times one `bytes.lower` pass and 2 to 8
-    times `json.loads`, which decodes such a body at about 1 ms per MB. Memory is at
-    most two copies of the bytes."""
+    search, eight counts), so its cost is linear in the body's length. Each fourfold
+    step in size costs at most `_GROWTH_BOUND` times the one before (about 4 measured;
+    a quadratic scan costs about 16), and memory is at most two copies of the bytes.
+
+    The bound compares the scan only with itself. It replaced a bound of 12 times
+    `json.loads` of the same body (#1477): that ratio was 2 to 8 on the development
+    host, but `json.loads` runs at its own speed on each runner's CPU, and read with a
+    wall clock it reached 18.5 on a shared CI runner."""
+    n, times, ratios = growth_ratios(
+        make, _raw_text_holds_a_lone_surrogate, bound=_GROWTH_BOUND, start=64 * 1024
+    )
+    assert max(ratios) <= _GROWTH_BOUND, (n, times, ratios)
     body = make()
-    scan = _best_time(lambda: _raw_text_holds_a_lone_surrogate(body))
-    assert scan < 40 * _best_time(lambda: body.lower())
-    assert scan < 12 * _best_time(lambda: json.loads(body))
     assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 2.2 * len(body)
 
 
@@ -885,11 +891,13 @@ def test_a_body_with_no_surrogate_marker_is_passed_after_two_searches(body):
 
     The memory bound is what proves the exit: without it the scan copies the body.
     The time bound is loose on purpose (two substring searches cost about one
-    `bytes.lower` pass, and a 1x bound failed once on a CI runner under coverage:
-    0.82 ms against 0.74 ms); it only catches a scan that does several passes."""
+    `bytes.lower` pass, and a 1x wall-clock bound failed once on a CI runner under
+    coverage: 0.82 ms against 0.74 ms); it only catches a scan that does several passes.
+    In CPU time the ratio measured 0.6 to 0.9 over 50 runs in each of the four
+    conditions."""
     assert _raw_text_holds_a_lone_surrogate(body) is False
     assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 64 * 1024
-    assert _best_time(lambda: _raw_text_holds_a_lone_surrogate(body)) < 4 * _best_time(
+    assert cpu_seconds(lambda: _raw_text_holds_a_lone_surrogate(body)) < 4 * cpu_seconds(
         lambda: body.lower()
     )
 
@@ -897,26 +905,22 @@ def test_a_body_with_no_surrogate_marker_is_passed_after_two_searches(body):
 def test_through_an_app_a_refused_structural_body_costs_less_than_without_the_check():
     """A route behind a failing dependency, with no credentials: without the check
     FastAPI parses the body and answers 401; with it the body is refused (422) after
-    the scan alone, which costs less than that parse."""
+    the scan alone, which costs less than that parse (measured 0.02 to 0.03 of the
+    request without the check, in CPU time)."""
     import asyncio
-    import time
 
     body = _STRUCTURAL["chain900"]()
 
     def timed(refuse: bool) -> tuple[float, int]:
         app = _open_app(refuse=refuse)
+        statuses: list[int] = []
 
-        async def send() -> int:
+        async def send() -> None:
             async with _client(app) as client:
                 resp = await client.post("/guarded", content=body, headers=_JSON)
-                return resp.status_code
+                statuses.append(resp.status_code)
 
-        best, status = float("inf"), 0
-        for _ in range(3):
-            start = time.perf_counter()
-            status = asyncio.run(send())
-            best = min(best, time.perf_counter() - start)
-        return best, status
+        return cpu_seconds(lambda: asyncio.run(send()), repeats=3), statuses[-1]
 
     main_time, main_status = timed(False)
     branch_time, branch_status = timed(True)
@@ -927,7 +931,7 @@ def test_through_an_app_a_refused_structural_body_costs_less_than_without_the_ch
 def test_holds_lone_surrogate_costs_about_one_serialization():
     """The callers that test a PARSED value (the import checks, secrets' reveal,
     config's save): one serialization in C, peak memory under three times the parse's
-    own, time a small multiple of it."""
+    own, time under three times the parse's (measured 1.0 to 1.3 in CPU time)."""
     deep_lone = b"[" * 600 + b"0," * 300_000 + b'"\\ud800"' + b"]" * 600
     deep_pair = b"[" * 600 + b'"\\ud83d\\ude00",' + b"0," * 300_000 + b"0" + b"]" * 600
     for body, expected in ((deep_lone, True), (deep_pair, False)):
@@ -941,4 +945,4 @@ def test_holds_lone_surrogate_costs_about_one_serialization():
             return json.loads(body)
 
         assert _peak(check) < 3 * _peak(parse)
-        assert _best_time(check) < 3 * _best_time(parse)
+        assert cpu_seconds(check) < 3 * cpu_seconds(parse)
