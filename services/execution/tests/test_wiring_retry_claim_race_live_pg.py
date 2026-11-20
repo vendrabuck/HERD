@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 import uuid
 from unittest.mock import AsyncMock, patch
@@ -650,3 +651,185 @@ async def test_a_row_selected_before_it_was_claimed_loses_the_drive_time_cas(ses
     assert foreign_after == foreign_before, (
         "a scoped tick must never change another reservation's ledger rows"
     )
+
+
+# Issue #1473, product path demonstrations. A generous bound for every wait on the
+# coordination events below: a wait that expires fails the test loudly, it never
+# lets the test proceed on a guess.
+COORDINATION_TIMEOUT = 30.0
+_LOGIN_REFUSED = {"success": False, "output": None, "error": "login refused", "duration_ms": 1}
+
+
+def _gated_driver_stub():
+    """A sandbox stub whose FIRST row action blocks until the test releases it.
+
+    `entered` is set when that first row action begins (the claim holder is inside its
+    drive, its claim committed); the stub then waits on `release`. Every later row
+    action returns at once. `state["fail_logins"]`, when true, makes a login answer a
+    driver failure. Runs in the worker thread `nats_consumer._run_sandbox` hands it,
+    so the waits here never block the event loop.
+    """
+    calls: list[str] = []
+    entered = threading.Event()
+    release = threading.Event()
+    state = {"fail_logins": False, "blocked": False, "release_timed_out": False}
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        calls.append(action)
+        if action == "login" and state["fail_logins"]:
+            return _LOGIN_REFUSED
+        if action in _ROW_ACTIONS and not state["blocked"]:
+            state["blocked"] = True
+            entered.set()
+            if not release.wait(COORDINATION_TIMEOUT):
+                state["release_timed_out"] = True
+        return SUCCESS
+
+    return execute_fn, calls, entered, release, state
+
+
+async def _seed_failed_l1_release(session_factory, reservation_id, port_a, port_b):
+    async with session_factory() as db:
+        row = L1ConnectionAssignment(
+            reservation_id=reservation_id,
+            switch_device_id=SWITCH_ID,
+            port_a=port_a,
+            port_b=port_b,
+            status="FAILED",
+            intended="RELEASED",
+            attempts=1,
+            last_error="driver timeout",
+        )
+        db.add(row)
+        await db.commit()
+        return row.id
+
+
+async def _preselect_own_row(session_factory, row_id):
+    """The tick's real selection, run before any claim exists (see the CAS test above)."""
+    from app.services.l1_assignment_service import due_failed_rows
+
+    async with session_factory() as db:
+        preselected = await due_failed_rows(db, 10000, 10)
+    by_id = {r.id: r for r in preselected}
+    assert row_id in by_id, "the early pass must have loaded the row while it was unclaimed"
+    assert by_id[row_id].claimed_until is None
+    return by_id[row_id]
+
+
+async def _wait_entered(entered: threading.Event) -> None:
+    if not await asyncio.to_thread(entered.wait, COORDINATION_TIMEOUT):
+        pytest.fail("the claim holder never entered its drive")
+
+
+@pytest.mark.asyncio
+async def test_a_load_failure_from_an_early_pass_must_not_rewrite_a_held_row(session_factory):
+    """Issue #1473: a held row must still read `in_progress` to the manual channel.
+
+    Three passes, ordered by explicit events, no sleeps. Pass B (a second tick, for
+    example another replica or the gate stack's own execution service) selects the row
+    while it is free. Pass A (this test's tick) then claims it and enters its drive,
+    where the stub holds it. B now reaches its apply and cannot load the switch (404,
+    so `recorded hop unresolvable: switch ... not found`, a pinned non-retryable
+    reason). B's failure write is the issue #814 row-identity compare-and-swap, whose
+    predicate is `id AND status = 'FAILED'` only: it does not consult the claim, so it
+    overwrites `last_error` and clears `claimed_until` on a row A still holds. The
+    manual call made while A still holds the drive then reports `not_retryable` (it
+    classifies by `last_error` before it looks at the claim) instead of `in_progress`.
+    """
+    from app.services.wiring_claim import WiringRowClaims
+    from app.services.wiring_retry_service import _reattempt_rows
+
+    reservation_id = uuid.uuid4()
+    row_id = await _seed_failed_l1_release(session_factory, reservation_id, "0/0/21", "0/0/22")
+    early_row = await _preselect_own_row(session_factory, row_id)
+
+    execute_fn, calls, entered, release, state = _gated_driver_stub()
+    patches = _patches(execute_fn, reservation_id)
+    for p in patches:
+        p.start()
+    holder = None
+    try:
+        holder = asyncio.create_task(run_wiring_retry_tick(_session_ctx(session_factory)))
+        await _wait_entered(entered)
+
+        # Pass B: the switch is gone for it (only B fetches from here on; A fetched
+        # before it entered the drive).
+        with patch("app.services.nats_consumer._fetch_device", new=AsyncMock(return_value=None)):
+            await _reattempt_rows(
+                [early_row], _session_ctx(session_factory), WiringRowClaims(), set()
+            )
+
+        async with session_factory() as db:
+            mid = await db.get(L1ConnectionAssignment, row_id)
+            mid_last_error, mid_claimed_until = mid.last_error, mid.claimed_until
+
+        manual_result = await reattempt_reservation(reservation_id, _session_ctx(session_factory))
+        holder_still_driving = not release.is_set() and not holder.done()
+    finally:
+        release.set()
+        if holder is not None:
+            await holder
+        for p in patches:
+            p.stop()
+        await _cleanup(session_factory, reservation_id)
+
+    assert not state["release_timed_out"]
+    assert holder_still_driving, "the manual call must have run inside the holder's drive"
+    outcomes = {r["id"]: r["outcome"] for r in manual_result["results"]}
+    assert outcomes == {str(row_id): "in_progress"}, (
+        "the manual call made while the holder drives must REPORT the row as in_progress; "
+        "the row it read had been rewritten by a pass that never claimed it: "
+        f"last_error={mid_last_error!r}, claimed_until={mid_claimed_until!r}"
+    )
+    assert mid_claimed_until is not None and mid_last_error == "driver timeout"
+
+
+@pytest.mark.asyncio
+async def test_a_login_failure_from_an_early_pass_must_not_free_a_held_row(session_factory):
+    """Issue #1473, the double-drive consequence of the same write.
+
+    As above, but pass B's switch loads and its LOGIN fails (a retryable reason). B's
+    failure write clears `claimed_until` on the row A is still driving, so the row is
+    claimable again: the manual call made while A still holds the drive claims it and
+    calls the driver a SECOND time for the same row, the exact thing issue #817's
+    claim exists to forbid.
+    """
+    from app.services.wiring_claim import WiringRowClaims
+    from app.services.wiring_retry_service import _reattempt_rows
+
+    reservation_id = uuid.uuid4()
+    row_id = await _seed_failed_l1_release(session_factory, reservation_id, "0/0/23", "0/0/24")
+    early_row = await _preselect_own_row(session_factory, row_id)
+
+    execute_fn, calls, entered, release, state = _gated_driver_stub()
+    patches = _patches(execute_fn, reservation_id)
+    for p in patches:
+        p.start()
+    holder = None
+    try:
+        holder = asyncio.create_task(run_wiring_retry_tick(_session_ctx(session_factory)))
+        await _wait_entered(entered)
+
+        state["fail_logins"] = True
+        await _reattempt_rows([early_row], _session_ctx(session_factory), WiringRowClaims(), set())
+        state["fail_logins"] = False
+
+        manual_result = await reattempt_reservation(reservation_id, _session_ctx(session_factory))
+        holder_still_driving = not release.is_set() and not holder.done()
+    finally:
+        release.set()
+        if holder is not None:
+            await holder
+        for p in patches:
+            p.stop()
+        await _cleanup(session_factory, reservation_id)
+
+    assert not state["release_timed_out"]
+    assert holder_still_driving, "the manual call must have run inside the holder's drive"
+    outcomes = {r["id"]: r["outcome"] for r in manual_result["results"]}
+    assert _row_calls(calls) == ["disconnect_ports"], (
+        "a row the holder is still driving reached the driver again: "
+        f"{_row_calls(calls)}, manual outcome {outcomes}"
+    )
+    assert outcomes == {str(row_id): "in_progress"}
