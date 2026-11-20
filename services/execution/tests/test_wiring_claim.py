@@ -16,6 +16,9 @@ Covered here, at all three layers against in-memory SQLite:
     longer FAILED cannot be claimed at all,
   - every record path clears the stamp (success, the row-identity failure write,
     the key upsert, release, and the stale-intent park),
+  - the row-identity failure write respects the claim (issue #1479): it writes on a
+    row the calling pass holds, an unclaimed row, or an expired claim, and on a row
+    another pass holds it changes nothing and the pass reports `in_progress`,
   - the manual channel reports `in_progress`, not `still_failed`, for a row the
     tick already holds, and drives nothing for it,
   - the L1 and L2 FAILED-to-ACTIVE success flips return the WINNER's row when
@@ -471,6 +474,152 @@ async def test_l3_stale_build_park_clears_the_claim(db):
     row_id = await _seed_l3_failed(claimed_until=_future())
     await park_stale_route_build(db, row_id, "intent gone")
     assert await _claimed_until(RouteAssignment, row_id) is None
+
+
+# --- A retry failure write respects another pass's claim (issue #1479) --------
+#
+# The row-identity failure write is a compare-and-swap on (id, status FAILED) plus
+# the claim clause: it writes on a row the calling pass holds (its ledger's `held`)
+# or on a row nobody holds (never claimed, or the claim expired). On a row another
+# pass holds it writes nothing at all and the row joins the caller's `lost`, which
+# the pass reports `in_progress`.
+
+LAYERS = ("l1", "l2", "l3")
+_MODEL = {"l1": L1ConnectionAssignment, "l2": L2PortAssignment, "l3": RouteAssignment}
+
+
+async def _seed_layer(layer: str, claimed_until=None, intended="ACTIVE") -> uuid.UUID:
+    if layer == "l1":
+        return await _seed_l1_failed(intended=intended, claimed_until=claimed_until)
+    if layer == "l2":
+        va = await _seed_alloc()
+        return await _seed_l2_failed(va, intended=intended, claimed_until=claimed_until)
+    return await _seed_l3_failed(intended=intended, claimed_until=claimed_until)
+
+
+async def _write_failure(layer: str, db, row_id, claims):
+    """The layer's retry-path failure write: 2 attempts, reason "again"."""
+    if layer == "l1":
+        return await record_l1_failed(
+            db,
+            RES_ID,
+            SWITCH_ID,
+            "0/0/1",
+            "0/0/2",
+            2,
+            "again",
+            intended="ACTIVE",
+            row_id=row_id,
+            claims=claims,
+        )
+    if layer == "l2":
+        return await record_l2_failed(
+            db,
+            RES_ID,
+            None,
+            SWITCH_ID,
+            "0/0/1",
+            2,
+            "again",
+            intended="ACTIVE",
+            row_id=row_id,
+            claims=claims,
+        )
+    return await record_route_failed(
+        db, RES_ID, SWITCH_ID, None, 2, "again", intended="ACTIVE", row_id=row_id, claims=claims
+    )
+
+
+async def _ledger_state(layer: str, row_id):
+    model = _MODEL[layer]
+    async with TestSessionLocal() as s:
+        row = (await s.execute(select(model).where(model.id == row_id))).scalar_one()
+        return row.status, row.attempts, row.last_error, row.claimed_until
+
+
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_failure_write_on_a_row_this_pass_holds_is_written(db, layer):
+    row_id = await _seed_layer(layer)
+    mine = WiringRowClaims()
+    assert await mine.claim(db, _MODEL[layer], row_id) is True
+
+    assert await _write_failure(layer, db, row_id, mine) is not None
+    assert await _ledger_state(layer, row_id) == ("FAILED", 2, "again", None)
+    assert mine.lost == set()
+
+
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_failure_write_on_a_row_another_pass_holds_changes_nothing(db, layer):
+    """The issue #1479 defect: this write used to overwrite last_error, add attempts,
+    and clear the holder's stamp while the holder was still driving the row."""
+    row_id = await _seed_layer(layer)
+    other = WiringRowClaims()
+    async with TestSessionLocal() as s:
+        assert await other.claim(s, _MODEL[layer], row_id) is True
+    before = await _ledger_state(layer, row_id)
+    assert before[3] is not None
+
+    mine = WiringRowClaims()
+    assert await _write_failure(layer, db, row_id, mine) is None
+    assert await _ledger_state(layer, row_id) == before, "a refused write changes nothing"
+    assert mine.lost == {row_id}, "the refused row is reported in_progress by the pass"
+
+    # A caller with no ledger at all holds nothing, so it is refused the same way.
+    assert await _write_failure(layer, db, row_id, None) is None
+    assert await _ledger_state(layer, row_id) == before
+
+
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_failure_write_on_an_unclaimed_row_is_written(db, layer):
+    row_id = await _seed_layer(layer)
+    mine = WiringRowClaims()
+    assert await _write_failure(layer, db, row_id, mine) is not None
+    assert await _ledger_state(layer, row_id) == ("FAILED", 2, "again", None)
+    assert mine.lost == set()
+
+
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_failure_write_on_an_expired_claim_is_written(db, layer):
+    """A dead holder's stale stamp blocks nothing, the same expiry rule as the claim."""
+    row_id = await _seed_layer(layer, claimed_until=_past())
+    mine = WiringRowClaims()
+    assert await _write_failure(layer, db, row_id, mine) is not None
+    assert await _ledger_state(layer, row_id) == ("FAILED", 2, "again", None)
+    assert mine.lost == set()
+
+
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_a_pass_whose_switch_load_fails_reports_a_held_row_in_progress(layer):
+    """Pass level: a retry pass handed a row it loaded before another pass claimed it
+    cannot load the switch (inventory 404). Its failure write is refused, the row the
+    holder is driving keeps its reason, attempts, and stamp, and the pass reports the
+    row `in_progress`, not `still_failed`."""
+    from app.services.wiring_retry_service import (
+        _reattempt_l2_rows,
+        _reattempt_l3_rows,
+        _reattempt_rows,
+    )
+
+    row_id = await _seed_layer(layer, intended="RELEASED")
+    model = _MODEL[layer]
+    async with TestSessionLocal() as s:
+        loaded = (await s.execute(select(model).where(model.id == row_id))).scalars().all()
+    holder = WiringRowClaims()
+    async with TestSessionLocal() as s:
+        assert await holder.claim(s, model, row_id) is True
+    before = await _ledger_state(layer, row_id)
+
+    reattempt = {"l1": _reattempt_rows, "l2": _reattempt_l2_rows, "l3": _reattempt_l3_rows}
+    with (
+        patch("app.services.nats_consumer._fetch_device", AsyncMock(return_value=None)),
+        patch("app.services.nats_consumer._fetch_template", AsyncMock(return_value=None)),
+        patch("app.services.driver_sandbox.execute_driver_method") as driver,
+    ):
+        outcomes = await reattempt[layer](loaded, _db_session_factory(), WiringRowClaims(), set())
+
+    assert [o["outcome"] for o in outcomes] == ["in_progress"]
+    assert await _ledger_state(layer, row_id) == before
+    assert driver.call_count == 0
 
 
 # --- The manual channel reports in_progress ----------------------------------
