@@ -1170,6 +1170,10 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # added for issue #817 (the wiring retry drive claim) is in that same category:
 # it runs both retry channels as real concurrent tasks against the gate's
 # execution ledger tables, proving one row reaches the driver exactly once.
+# Since issue #1473 its rows carry 1,000,000 attempts so the stack's own retry
+# tick (default cap 10) never selects them, and its own tick runs at a raised
+# cap: each of that tick's short due selects takes FOR UPDATE SKIP LOCKED on up
+# to 10,000 FAILED ledger rows, foreign ones included, for that select only.
 # The execution suite added for issue #1190 (the retry tick's selection
 # predicate) needs the migrated execution schema too. It never runs a tick: it
 # calls the three due queries on rows it inserts inside a rolled-back
