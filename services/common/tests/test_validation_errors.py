@@ -844,20 +844,30 @@ _ESCAPE_HEAVY = {
     "four_backslashes_and_text": lambda size=_MB: _fill(_BS * 4 + "ude00", '{"name":"', '"}', size),
 }
 # Per shape, the worst CPU-time ratio of the scan of the 1 MB body to one `bytes.lower`
-# pass over it, measured in #1477 (PROVISIONAL, development host only: AMD Threadripper
-# PRO 5955WX; 20 to 50 rounds in each of unpinned, `taskset -c 0`, pinned beside CPU
-# hogs, under coverage, and beside a spinning or memory-bound process on the SMT
-# sibling core). The bound is _PASS_MARGIN times it, so a scan that does more than
-# about twice its usual work on that shape fails. The ratio differs per shape (by its
-# escape density) far more than per run, which is why each shape has its own bound: one
-# bound for all of them would let the cheapest shape slow down sevenfold.
+# pass over it: the maximum over three CPU models, each value one attempt with no
+# re-measure, measured for #1477. Development host, AMD Threadripper PRO 5955WX: 20 to
+# 50 rounds in each of unpinned, `taskset -c 0`, pinned beside CPU hogs, under coverage,
+# and beside a spinning or memory-bound process on the SMT sibling core. GitHub runner
+# ubuntu-latest, 4 CPUs (run 44692177551): 20 rounds on Intel Xeon 6975P-C unpinned and
+# under `taskset -c 0`, and 20 on AMD EPYC 9V74 under coverage. The ratio moves about
+# 1.2 times between CPU models on the pairs shapes (Xeon 30.1, host 27.0, EPYC 24.9), so
+# a new CPU model may need its entry raised: that is the cost of a constant-factor bound.
+# The ratio differs per shape (by its escape density) far more than per run, which is
+# why each shape has its own bound: one bound for all of them would let the cheapest
+# shape slow down sevenfold. The bound is _PASS_MARGIN times the entry; the comment on
+# each entry is the slowdown that fails it, the bound over the larger median of the
+# three CPU models.
 _ESCAPE_PASSES_WORST = {
-    "pairs": 27.0,
-    "pairs_upper_then_low": 25.7,
-    "backslash_pairs_then_low": 22.6,
-    "u0041_then_low": 10.7,
-    "four_backslashes_and_text": 20.9,
+    "pairs": 30.1,  # median 29.8 on the Xeon: fails at 2.0 times slower
+    "pairs_upper_then_low": 30.1,  # median 29.6 on the Xeon: 2.0 times
+    "backslash_pairs_then_low": 22.6,  # median 20.4 on the host: 2.2 times
+    "u0041_then_low": 10.7,  # median 10.3 on the EPYC: 2.1 times
+    "four_backslashes_and_text": 20.9,  # median 17.3 on the Xeon: 2.4 times
 }
+# Twice the worst: room for another CPU-model shift of 1.2 times on top of the largest
+# worst-to-median spread seen within one machine (1.4 times, four_backslashes on the
+# host), 1.7 in all, while a scan three times slower fails every shape on all three
+# CPU models (the largest threshold, bound over the smallest median, is 2.8).
 _PASS_MARGIN = 2.0
 
 
@@ -886,7 +896,8 @@ def test_an_escape_heavy_body_costs_linear_work_in_two_copies(shape):
       before, so the cost is linear (a quadratic scan fails);
     - passes: the scan of the 1 MB body costs under `_PASS_MARGIN` times the worst ratio
       to one `bytes.lower` pass measured for this shape, so a linear scan that does
-      about twice its work, or one whose cost follows the number of escapes, fails;
+      two to three times its work (the table says where for each shape), or one whose
+      cost follows the number of escapes, fails;
     - memory: at most two copies of the bytes.
 
     These replaced a bound of 12 times `json.loads` of the same body (#1477), which a
@@ -906,27 +917,39 @@ def test_an_escape_heavy_body_costs_linear_work_in_two_copies(shape):
     assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 2.2 * len(body)
 
 
-@pytest.mark.parametrize(
-    "body",
-    [
-        _fill('{"name":"device-1","rack":"r1"},', "[", "0]"),
-        _fill("日本", '["', '"]'),
-        _fill('"' + "\\n" * 8 + '",', "[", "0]"),
-    ],
-    ids=["ascii_objects", "cjk_text", "other_escapes_only"],
-)
-def test_a_body_with_no_surrogate_marker_is_passed_after_two_searches(body):
+# Bodies with no surrogate marker, each with its bound on the scan's CPU time over one
+# `bytes.lower` pass: about twice the worst ratio measured for that body over the three
+# CPU models of `_ESCAPE_PASSES_WORST` (#1477), and under the ratio of the full escape
+# scan, which is what the scan costs without its early exit (measured on the
+# development host: 4.1 for `ascii_objects`, 4.6 for `cjk_text`, 7.7 for
+# `other_escapes_only`). `other_escapes_only` (a backslash every other byte) needs the
+# larger bound: 0.84 on the host, 0.95 on the EPYC, 2.0 to 2.03 on the Xeon.
+_NO_MARKER = {
+    # worst 1.01 (EPYC, under coverage), host 0.62
+    "ascii_objects": (_fill('{"name":"device-1","rack":"r1"},', "[", "0]"), 2.0),
+    # worst 0.78 (Xeon), host 0.73
+    "cjk_text": (_fill("日本", '["', '"]'), 2.0),
+    # worst 2.03 (Xeon), host 1.11
+    "other_escapes_only": (_fill('"' + "\\n" * 8 + '",', "[", "0]"), 4.0),
+}
+
+
+@pytest.mark.parametrize("shape", _NO_MARKER)
+def test_a_body_with_no_surrogate_marker_is_passed_after_two_searches(shape):
     """No `\\u` and no 0xED byte: two `in` searches and no copy (the early exit).
 
-    The memory bound is what proves the exit: without it the scan copies the body.
-    The time bound is loose on purpose (two substring searches cost about one
-    `bytes.lower` pass, and a 1x wall-clock bound failed once on a CI runner under
-    coverage: 0.82 ms against 0.74 ms); at 4 it sits over three times above the worst
-    ratio measured (about 1.1) and catches a scan that does several passes."""
+    The memory bound is what proves the exit on every CPU: without it the scan copies
+    the body. The time bound (a backstop, per body in `_NO_MARKER`, re-measured before
+    it fails) catches the full escape scan running instead, with about twice the margin
+    on each side measured on the development host; it is not a 1x bound, which failed
+    once on a CI runner under coverage read with a wall clock (0.82 ms against 0.74)."""
+    body, bound = _NO_MARKER[shape]
     assert _raw_text_holds_a_lone_surrogate(body) is False
     assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 64 * 1024
-    ratio = cpu_ratio(lambda: _raw_text_holds_a_lone_surrogate(body), lambda: body.lower(), bound=4)
-    assert ratio < 4
+    ratio = cpu_ratio(
+        lambda: _raw_text_holds_a_lone_surrogate(body), lambda: body.lower(), bound=bound
+    )
+    assert ratio < bound, (shape, ratio)
 
 
 def test_through_an_app_a_refused_structural_body_costs_less_than_without_the_check():
