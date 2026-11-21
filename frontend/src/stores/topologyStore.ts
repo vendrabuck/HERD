@@ -1,13 +1,11 @@
 import { create } from "zustand";
 import {
   addEdge,
-  applyEdgeChanges,
-  applyNodeChanges,
   type Connection,
   type Edge,
-  type EdgeChange,
+  type EdgeChangeset,
   type Node,
-  type NodeChange,
+  type NodeChangeset,
 } from "@xyflow/react";
 import type {
   CanvasData,
@@ -93,8 +91,12 @@ interface TopologyState {
   edges: Edge<LayerEdgeData>[];
   selectedEdgeLayer: EdgeLayerType;
 
-  onNodesChange: (changes: NodeChange[]) => void;
-  onEdgesChange: (changes: EdgeChange[]) => void;
+  // @xyflow/react 13 hands change handlers a changeset (NodeChangeset /
+  // EdgeChangeset), not an array; the store applies it with the changeset's
+  // own applyTo, which replaced the removed applyNodeChanges /
+  // applyEdgeChanges exports.
+  onNodesChange: (changes: NodeChangeset<Node<CanvasNodeData>>) => void;
+  onEdgesChange: (changes: EdgeChangeset<Edge<LayerEdgeData>>) => void;
   onConnect: (connection: Connection) => void;
   addEnrichedEdge: (connection: Connection, data: LayerEdgeData) => void;
   addEnrichedEdges: (items: Array<{ connection: Connection; data: LayerEdgeData }>) => void;
@@ -144,11 +146,9 @@ export const useTopologyStore = create<TopologyState>()((set) => ({
   edges: [],
   selectedEdgeLayer: "L2",
 
-  onNodesChange: (changes) =>
-    set((state) => ({ nodes: applyNodeChanges(changes, state.nodes) as Node<CanvasNodeData>[] })),
+  onNodesChange: (changes) => set((state) => ({ nodes: changes.applyTo(state.nodes) })),
 
-  onEdgesChange: (changes) =>
-    set((state) => ({ edges: applyEdgeChanges(changes, state.edges) as Edge<LayerEdgeData>[] })),
+  onEdgesChange: (changes) => set((state) => ({ edges: changes.applyTo(state.edges) })),
 
   onConnect: (connection) =>
     set((state) => ({

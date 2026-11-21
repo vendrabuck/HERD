@@ -18,7 +18,7 @@
   "dependencies": {
     "@tanstack/react-query": "^5.108.0",
     "@tanstack/react-query-devtools": "^5.108.0",
-    "@xyflow/react": "^12.12.1",
+    "@xyflow/react": "^13.0.2",
     "axios": "^1.21.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.75.0",
