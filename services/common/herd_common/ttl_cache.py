@@ -104,6 +104,7 @@ class TTLCache(Generic[K, V]):
         self._ttl = ttl_seconds
         self._clock = clock
         self._cache: dict[K, tuple[float, V]] = {}
+        self._inflight: dict[K, asyncio.Future] = {}
         self._lock = asyncio.Lock()
 
     def _cache_hit(self, key: K) -> tuple[bool, V | None]:
@@ -120,15 +121,37 @@ class TTLCache(Generic[K, V]):
         if hit:
             return value  # type: ignore[return-value]
 
+        # The in-flight fetch is shared, a failure included: the callers already
+        # queued on the key get the answer the first one paid for instead of each
+        # running their own fetch, which during an outage meant N sequential
+        # upstream attempts and the k-th caller waiting for k timeouts. Nothing
+        # is stored for a failure, so a caller arriving after it still asks.
         async with self._lock:
             hit, value = self._cache_hit(key)
             if hit:
                 return value  # type: ignore[return-value]
+            shared = self._inflight.get(key)
+            leader = shared is None
+            if leader:
+                shared = asyncio.get_running_loop().create_future()
+                self._inflight[key] = shared
+
+        if not leader:
+            return await shared
+
+        try:
             fetched = await self._fetch(key)
             if isinstance(fetched, Uncached):
+                shared.set_result(fetched.value)
                 return fetched.value
             self._cache[key] = (self._clock() + self._ttl, fetched)
+            shared.set_result(fetched)
             return fetched
+        except BaseException as exc:
+            shared.set_exception(exc)
+            raise
+        finally:
+            self._inflight.pop(key, None)
 
     def invalidate(self, key: K) -> None:
         self._cache.pop(key, None)
@@ -154,6 +177,7 @@ class SingletonTTLCache(Generic[V]):
         self._clock = clock
         self._cached_until: float = 0.0
         self._cached: V | None = None
+        self._inflight: asyncio.Future | None = None
         self._lock = asyncio.Lock()
 
     def _cache_hit(self) -> tuple[bool, V | None]:
@@ -165,16 +189,36 @@ class SingletonTTLCache(Generic[V]):
         hit, value = self._cache_hit()
         if hit:
             return value  # type: ignore[return-value]
+
+        # Same shared in-flight fetch as TTLCache, for the same reason: one
+        # failed fetch answers everyone already waiting on it.
         async with self._lock:
             hit, value = self._cache_hit()
             if hit:
                 return value  # type: ignore[return-value]
+            shared = self._inflight
+            leader = shared is None
+            if leader:
+                shared = asyncio.get_running_loop().create_future()
+                self._inflight = shared
+
+        if not leader:
+            return await shared
+
+        try:
             fetched = await self._fetch()
             if isinstance(fetched, Uncached):
+                shared.set_result(fetched.value)
                 return fetched.value
             self._cached = fetched
             self._cached_until = self._clock() + self._ttl
+            shared.set_result(fetched)
             return fetched
+        except BaseException as exc:
+            shared.set_exception(exc)
+            raise
+        finally:
+            self._inflight = None
 
     def invalidate(self) -> None:
         self._cached_until = 0.0
