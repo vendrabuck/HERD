@@ -75,11 +75,13 @@ export const LOGIN_RATE_LIMITED = "Too many sign-in attempts. Wait a moment, the
  * a credential refusal (IAM-LOGIN-1, IAM-LDAP-5). No answer at all (network
  * error, the client timeout LOGIN_TIMEOUT_MS), a 404 (the gateway has no route while auth is down), and
  * any 5xx (a gateway 502 or 504 included) mean HERD could not be reached. A
- * 422 is the request schema's length limits (IAM-LOGIN-3). Auth sends no 429
- * or 403 on login today; a 429 from anything in front of it gets the rate
- * limit wording (with the `Retry-After` wait when it is a whole number of
- * seconds), and any other status the unexpected-answer wording. No
- * server text is ever shown.
+ * 422 is the request schema's length limits (IAM-LOGIN-3). A 429 is auth's
+ * per-source attempt limit (IAM-LOGIN-7) and gets the rate limit wording (with
+ * the `Retry-After` wait when it is a whole number of seconds); auth's 503s
+ * (the directory could not be asked, IAM-LDAP-12, or password checking is at
+ * capacity, IAM-HASH-7) are a 5xx like any other. Auth sends no 403 on login;
+ * any other status gets the unexpected-answer wording. No server text is ever
+ * shown.
  */
 export function loginErrorText(err: unknown): string {
   const status = (err as { response?: { status?: unknown } } | null | undefined)?.response?.status;

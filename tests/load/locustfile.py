@@ -1,6 +1,6 @@
 """Locust load test definitions for HERD.
 
-Eight user classes simulating different usage patterns, selected by default:
+Eleven user classes, selected by default:
 - ReservationUser: creates, lists, queries calendar, releases reservations
 - InventoryBrowser: browses devices, templates, and the topologies list
 - BulkExporter: exports devices, templates, and topologies; dry-runs a device import
@@ -15,7 +15,25 @@ Eight user classes simulating different usage patterns, selected by default:
 - DeviceConfigUser: writes and reads config versions, the driver config schema,
   and the apply-job list on one device of its own, deleted at the end
 
-A ninth, OidcLoginUser (ADR 0016 phase 5b), signs in through the OIDC test
+- LoginLimitProbe: exactly one user that, once every other user has signed in,
+  sends wrong-password logins from this host until auth's per-source attempt
+  limit (IAM-LOGIN-7) answers 429, and fails the run on any other answer
+- OversizedBodySender: exactly one user, never signed in, that sends bodies one
+  byte over MAX_REQUEST_BODY_BYTES to one route of every service, with a
+  Content-Length or chunked, and fails the run on any answer but the 413
+  (OPS-VALID-9)
+- LargeCanvasSaver: exactly one user that saves one canvas over the default
+  body limit to a large-JSON route (PUT /api/cabling/topologies/{id}, issue
+  #1484) beside OversizedBodySender, and fails the run on any answer but 200
+
+Every user signs in once, at start, and every one does so from this host, which
+auth sees as one source address with one attempt allowance (60 at once by
+default, refilling one a second). `_login` therefore treats a 429 as the limit
+working, not as a failure: it records it under its own name, waits the
+`Retry-After`, and tries again, so the login figures under `/api/auth/login`
+stay those of real password checks.
+
+A twelfth, OidcLoginUser (ADR 0016 phase 5b), signs in through the OIDC test
 provider; it is abstract unless HERD_LOAD_OIDC=1 and runs only in the
 Makefile's _gate-oidc-stack-tests phase, against a stack in OIDC mode (see its
 section at the end of this file).
@@ -30,15 +48,18 @@ path (polled by the bell on an interval, so the hottest read in the service) and
 the preferences read/write proxy that the /settings channel toggles drive.
 """
 
+import json
 import logging
 import os
 import random
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import gevent
 import urllib3
-from locust import HttpUser, between, events, task
+from locust import HttpUser, between, constant, events, task
 from locust.clients import HttpSession
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -79,24 +100,57 @@ USER_EMAIL = os.getenv("SEED_USER_EMAIL", "user1@herd.dev")
 USER_PASSWORD = os.getenv("SEED_USER_PASSWORD", "user1user1xx")
 
 
+# A login auth refused for the per-source attempt limit (IAM-LOGIN-7) is
+# recorded under this name, apart from the logins it judged.
+LOGIN_LIMITED_NAME = "/api/auth/login [429 attempt limit]"
+LOGIN_ATTEMPTS = 20
+LOGIN_RETRY_AFTER_CAP_SECONDS = 30
+
+
+def _retry_after_seconds(resp) -> int | None:
+    """The whole seconds a 429's Retry-After states, or None when it states none."""
+    raw = (resp.headers.get("Retry-After") or "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else None
+
+
+def _login_limited(resp) -> int | None:
+    """For a 429 with a whole-second Retry-After: record it under
+    LOGIN_LIMITED_NAME as a success (the limit doing its job) and return the
+    wait. Anything else: None, and the response is judged as usual."""
+    if resp.status_code != 429:
+        return None
+    wait = _retry_after_seconds(resp)
+    if wait is None:
+        resp.failure("429 without a whole-second Retry-After")
+        return None
+    resp.request_meta["name"] = LOGIN_LIMITED_NAME
+    resp.success()
+    return wait
+
+
 class HerdUser(HttpUser):
     """Base class with login-on-start and TLS bypass."""
 
     abstract = True
 
     def _login(self, email: str, password: str) -> None:
-        resp = self.client.post(
-            "/api/auth/login",
-            json={"email": email, "password": password},
-            verify=False,
-        )
-        if resp.status_code == 200:
-            tokens = resp.json()
-            self.access_token = tokens["access_token"]
-            self.headers = {"Authorization": f"Bearer {self.access_token}"}
-        else:
-            self.access_token = None
-            self.headers = {}
+        self.access_token = None
+        self.headers = {}
+        for _ in range(LOGIN_ATTEMPTS):
+            with self.client.post(
+                "/api/auth/login",
+                json={"email": email, "password": password},
+                verify=False,
+                catch_response=True,
+            ) as resp:
+                wait = _login_limited(resp)
+                if wait is None:
+                    if resp.status_code == 200:
+                        tokens = resp.json()
+                        self.access_token = tokens["access_token"]
+                        self.headers = {"Authorization": f"Bearer {self.access_token}"}
+                    return
+            gevent.sleep(min(wait, LOGIN_RETRY_AFTER_CAP_SECONDS))
 
     def _auth_get(self, path: str, **kwargs):
         return self.client.get(path, headers=self.headers, verify=False, **kwargs)
@@ -798,6 +852,248 @@ class DeviceConfigUser(HerdUser):
             f"/api/inventory/devices/{self._device_id}/apply-jobs",
             name="/api/inventory/devices/[id]/apply-jobs",
         )
+
+
+class LoginLimitProbe(HerdUser):
+    """One user that floods wrong-password logins from this host (IAM-LOGIN-7).
+
+    It waits LOGIN_PROBE_DELAY_SECONDS first, so every other user (spawned at
+    `make test-load`'s 5 a second) has signed in, then sends logins for an
+    unknown account until auth answers 429, and keeps going for
+    LOGIN_PROBE_LIMITED_SECONDS. Every answer must be the 401 a judged attempt
+    gets or a 429 with a whole-second Retry-After; anything else, a 5xx or a 503
+    from the hashing pool included, is a failure, and locust then exits 1.
+
+    What it shows: a single source flooding the login is cut to its allowance
+    with refusals that cost auth nothing, and the other users' requests, in the
+    same report, carry on beside it. After it stops, the host's allowance
+    refills over the rest of the run (a minute with the defaults), so a test
+    suite started right after `make test-load` may still meet a 429 for a short
+    while.
+    """
+
+    fixed_count = 1
+    wait_time = constant(0.05)
+
+    LOGIN_PROBE_DELAY_SECONDS = 15
+    LOGIN_PROBE_LIMITED_SECONDS = 5
+
+    def on_start(self):
+        gevent.sleep(self.LOGIN_PROBE_DELAY_SECONDS)
+        self._limited_since = None
+        self._done = False
+
+    @task
+    def flood(self):
+        if self._done:
+            return
+        with self.client.post(
+            "/api/auth/login",
+            json={"email": f"load-probe-{uuid.uuid4().hex[:12]}@herd.dev", "password": "wrong"},
+            verify=False,
+            catch_response=True,
+        ) as resp:
+            if _login_limited(resp) is not None:
+                if self._limited_since is None:
+                    self._limited_since = time.monotonic()
+                elif time.monotonic() - self._limited_since > self.LOGIN_PROBE_LIMITED_SECONDS:
+                    self._done = True
+            elif resp.status_code == 401:
+                resp.success()
+            else:
+                resp.failure(f"HTTP {resp.status_code}, expected 401 or 429")
+
+
+# The request body limit every service applies (issue #1466, OPS-VALID-9); a run
+# against a stack with another MAX_REQUEST_BODY_BYTES reads it from the environment
+# or the repo-root .env, like the stack does.
+MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES") or 256 * 1024)
+
+# One JSON route per service, through the gateway, none of them a route that takes a
+# larger body (OPS-VALID-10; the AI commit does since issue #1484): each would parse its
+# body before its authentication runs.
+OVERSIZED_BODY_ROUTES = (
+    ("POST", "/api/acl/grants"),
+    ("POST", "/api/ai/templates/suggest-identity"),
+    ("POST", "/api/auth/groups"),
+    ("POST", "/api/cabling/topologies"),
+    ("PUT", "/api/config/settings"),
+    ("POST", "/api/execution/device-check"),
+    ("POST", "/api/inventory/devices"),
+    ("PUT", "/api/notifications/notifications/preferences"),
+    ("PATCH", "/api/reservations/00000000-0000-0000-0000-000000000000"),
+    ("POST", "/api/secrets/secrets"),
+    ("PUT", "/api/user-profile/preferences"),
+    ("POST", "/api/v1/webhooks"),
+)
+
+
+class OversizedBodySender(HerdUser):
+    """One user that sends request bodies one byte over the limit, beside the others.
+
+    It never signs in, so it costs no login attempts. Each task sends a body of
+    MAX_REQUEST_BODY_BYTES + 1 bytes that is not JSON to one route of every
+    service in turn, half the time with a Content-Length (refused before the
+    service reads a byte) and half the time chunked (refused when the count passes
+    the limit). Every answer must be 413 with the one `body_too_large` item naming
+    the limit; any other answer (a 401, which would mean authentication ran first,
+    a 422, which would mean the body was parsed, a 5xx, a timeout) is a recorded
+    failure and the run exits 1.
+
+    What it shows: each refusal costs the service a few chunks of reading, not a
+    parse, so the other users' latencies in the same report stay where they are
+    without it (compare a run that names the other classes on the command line,
+    leaving this one out).
+    """
+
+    fixed_count = 1
+    wait_time = between(1, 2)
+
+    _body = b"x" * (MAX_REQUEST_BODY_BYTES + 1)
+    _expected = {
+        "detail": [
+            {
+                "type": "body_too_large",
+                "loc": ["body"],
+                "msg": f"Request body is larger than {MAX_REQUEST_BODY_BYTES} bytes",
+            }
+        ]
+    }
+
+    def on_start(self):
+        self._next = 0
+
+    def _chunks(self):
+        step = 256 * 1024
+        for start in range(0, len(self._body), step):
+            yield self._body[start : start + step]
+
+    @task
+    def send_oversized_body(self):
+        method, path = OVERSIZED_BODY_ROUTES[self._next % len(OVERSIZED_BODY_ROUTES)]
+        chunked = (self._next // len(OVERSIZED_BODY_ROUTES)) % 2 == 1
+        self._next += 1
+        name = f"{path} [413 over the body limit{', chunked' if chunked else ''}]"
+        with self.client.request(
+            method,
+            path,
+            data=self._chunks() if chunked else self._body,
+            headers={"content-type": "application/json"},
+            verify=False,
+            name=name,
+            catch_response=True,
+        ) as resp:
+            if resp.status_code != 413:
+                resp.failure(f"HTTP {resp.status_code}, expected 413")
+                return
+            try:
+                body = resp.json()
+            except ValueError:
+                resp.failure("413 without a JSON body")
+                return
+            if body != self._expected:
+                resp.failure("413 body is not the one body_too_large item")
+            else:
+                resp.success()
+
+
+# What a large-JSON route adds to the limit (herd_common.validation_errors
+# LARGE_JSON_BODY_BYTES, issue #1484); the canvas saves below sit between the two.
+LARGE_JSON_BODY_BYTES = 4 * 1024 * 1024
+LARGE_CANVAS_BYTES = MAX_REQUEST_BODY_BYTES + LARGE_JSON_BODY_BYTES // 4
+
+
+def _large_canvas(size: int) -> bytes:
+    """A canvas PUT body of exactly `size` bytes: network element nodes (stored as sent)
+    whose descriptive attrs carry realistic text, the last one padded to the size."""
+
+    def node(i: int) -> dict:
+        return {
+            "id": f"n-{i}",
+            "type": "networkElementNode",
+            "position": {"x": 40 * (i % 50), "y": 40 * (i // 50)},
+            "data": {
+                "element": {
+                    "id": str(uuid.UUID(int=i)),
+                    "element_type": "vlan_segment",
+                    "label": f"VLAN {100 + i}",
+                    "attrs": {"description": "lab segment " * 40},
+                }
+            },
+        }
+
+    def encode(nodes: list) -> str:
+        return json.dumps({"canvas_data": {"nodes": nodes, "edges": []}}, separators=(",", ":"))
+
+    per_node = len(json.dumps(node(10_000), separators=(",", ":"))) + 1
+    nodes = [node(i) for i in range(max(size // per_node - 1, 1))]
+    while len(encode(nodes)) > size:
+        nodes.pop()
+    nodes[-1]["data"]["element"]["attrs"]["description"] += "x" * (size - len(encode(nodes)))
+    body = encode(nodes).encode()
+    assert len(body) == size
+    return body
+
+
+class LargeCanvasSaver(HerdUser):
+    """Saves a canvas larger than the default limit to a large-JSON route, beside
+    OversizedBodySender (issue #1484).
+
+    on_start signs in once and creates one topology; each task saves the same canvas,
+    MAX_REQUEST_BODY_BYTES plus a quarter of the large-JSON allowance (1310720 bytes at
+    the defaults), to
+    `PUT /api/cabling/topologies/{id}`. Every save must answer 200; a 413 means the
+    route lost its mark, and anything else fails the run too. The canvas does not
+    change between saves, so after the first save no version row is written: the load
+    is the parse and the compare, not storage. on_stop deletes the topology.
+
+    What it sends: network element nodes (`networkElementNode`, about 700 bytes each
+    with their descriptive `attrs`, about 1,880 of them) and no edges, which cabling
+    stores as sent and which need no seeded device. It is not the editor's device-node
+    shape (`services/cabling/tests/test_request_body_limit.py` pins that one); the
+    body limit judges bytes, not shape, so the save costs the same parse.
+
+    What it shows: its latency next to OversizedBodySender's refusals, and, in a run
+    that leaves the sender out (name the other classes on the command line), how much
+    those refusals cost a legitimate large save.
+    """
+
+    fixed_count = 1
+    wait_time = between(2, 4)
+
+    _body = _large_canvas(LARGE_CANVAS_BYTES)
+
+    def on_start(self):
+        self._topology_id = None
+        self._login(ADMIN_EMAIL, ADMIN_PASSWORD)
+        if not self.access_token:
+            return
+        resp = self._auth_post(
+            "/api/cabling/topologies", json={"name": f"load-large-canvas-{uuid.uuid4().hex[:8]}"}
+        )
+        if resp.status_code == 201:
+            self._topology_id = resp.json()["id"]
+
+    def on_stop(self):
+        if self._topology_id:
+            self._auth_delete(f"/api/cabling/topologies/{self._topology_id}")
+
+    @task
+    def save_large_canvas(self):
+        if not self._topology_id:
+            return
+        with self.client.put(
+            f"/api/cabling/topologies/{self._topology_id}",
+            data=self._body,
+            headers={**self.headers, "content-type": "application/json"},
+            verify=False,
+            name="/api/cabling/topologies/[id] [large canvas save]",
+            catch_response=True,
+        ) as resp:
+            if resp.status_code == 200:
+                resp.success()
+            else:
+                resp.failure(f"HTTP {resp.status_code}, expected 200 for a large canvas save")
 
 
 # --- Single sign-on (ADR 0016 phase 5b, D12 level 4) ---------------------------

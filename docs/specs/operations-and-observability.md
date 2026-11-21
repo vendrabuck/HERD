@@ -1560,13 +1560,18 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
 
 **Out of scope.** Setting or classifying a purpose (`reservations.md`, `ai-features.md`).
 
-### 8.15 In-app help link
+### 8.15 In-app help link and author credit
 
 **What it does.** The `?` icon in the header opens the published user manual in a new
-tab.
+tab. A one-line author credit, `Designed and built by Lane Nelms`, sits under the
+sign-in, Register, config sign-in, and config change-password cards and in the About
+page's Frontend card; the name links to the author's LinkedIn profile in a new tab.
 
 **Surfaces.** `frontend/src/lib/links.ts`, `frontend/src/components/layout/HeaderHelpLink.tsx`,
-`frontend/src/components/layout/AppLayout.tsx` (AppLayout renders the link).
+`frontend/src/components/layout/AppLayout.tsx` (AppLayout renders the link),
+`frontend/src/components/layout/AuthorCredit.tsx` (rendered by `LoginPage.tsx`,
+`RegisterPage.tsx`, `ConfigPage.tsx`, and `admin/AboutPage.tsx` under
+`frontend/src/pages/`).
 
 **Rules.**
 
@@ -1574,6 +1579,14 @@ tab.
   once. \
   Enforced in: `frontend/src/lib/links.ts` (`MANUAL_URL`); `frontend/src/components/layout/HeaderHelpLink.tsx` (`MANUAL_URL`) \
   Pinned by: `frontend/src/test/components/AppLayout.test.tsx` (`renders a Settings link and a help link to the published manual`); `frontend/src/test/components/HeaderHelpLink.test.tsx` (`is a link named Help that points at the published manual`)
+- **OPS-CREDIT-1.** The author credit's wording and profile address are defined once,
+  in `links.ts`, and every surface renders them through `AuthorCredit`. The link opens
+  in a new tab with `rel="noopener noreferrer"`, names itself `Lane Nelms on LinkedIn
+  (opens in a new tab)`, and follows every sign-in control in tab order: it sits in a
+  footer after the card, never before the first field. On About it closes the Frontend
+  card, after the Version, Build, and Build date list. \
+  Enforced in: `frontend/src/lib/links.ts` (`AUTHOR_CREDIT_PREFIX`, `AUTHOR_NAME`, `AUTHOR_LINKEDIN_URL`); `frontend/src/components/layout/AuthorCredit.tsx` (`AuthorCredit`); `frontend/src/pages/LoginPage.tsx` (`AuthorCredit`); `frontend/src/pages/RegisterPage.tsx` (`AuthorCredit`); `frontend/src/pages/ConfigPage.tsx` (`AuthorCredit`); `frontend/src/pages/admin/AboutPage.tsx` (`AuthorCredit`) \
+  Pinned by: `frontend/src/test/pages/LoginPage.test.tsx` (`renders under the card in local mode and follows every form control in tab order`, `renders while the sign-in options are pending, after the configuration link`, `renders with single sign-on only, after the Sign in with button`, `renders with the Administrator sign-in toggle, after the opened form's submit`, `renders with the LDAP answer, whose form is the local one`); `frontend/src/test/pages/RegisterPage.test.tsx` (`renders under the card and follows every form control in tab order`); `frontend/src/test/pages/ConfigPage.test.tsx` (`renders under the config sign-in card, after its controls in tab order`, `renders under the change-password card`); `frontend/src/test/pages/AboutPage.test.tsx` (`shows the author credit inside the Frontend card, after its Version, Build, and Build date`); `tests/e2e/test_login.py` (`test_login_page_has_author_credit`); `tests/e2e/test_register_and_roles.py` (`test_register_page_has_author_credit`); `tests/e2e/test_config.py` (`test_config_login_card_has_author_credit`)
 
 **Out of scope.** The manual's content (`docs/manual/`).
 
@@ -1683,13 +1696,21 @@ toast, and no body that fails validation turns the 422 into a 500 (OPS-VALID-2,
 OPS-VALID-5). A body holding text that cannot be encoded as UTF-8 (a lone surrogate,
 written as an escape such as `\ud800` with no pair) is refused the same way in every
 service, whatever field holds it, so no such text is stored, forwarded, or echoed
-(OPS-VALID-6).
+(OPS-VALID-6). A body larger than the service's limit (`MAX_REQUEST_BODY_BYTES`, 256
+KiB by default; a route that takes a large JSON body, a canvas or a device
+configuration, adds 4 MiB, an upload route adds the files it accepts, and a route
+another service forwards a body to adds an envelope) is refused with 413 before it is
+parsed, scanned, or authenticated, in every service, config included (OPS-VALID-9 to
+OPS-VALID-12); a body one service admitted is not refused for its size by the
+service it forwards it to (OPS-VALID-12).
 
-**Surfaces.** `services/common/herd_common/validation_errors.py`, the ONE handler and
-body check, which each service's `app/main.py` installs; the config service's
-standalone copy, `services/config/app/validation_errors.py` (OPS-CONFIG-30); the wiring
-guard `tests/unit/test_validation_errors_wiring.py`; `services/common/herd_common/error_details.py`,
-the ONE detail for a value outside a fixed set (OPS-VALID-7).
+**Surfaces.** `services/common/herd_common/validation_errors.py`, the ONE handler,
+body check, and body limit, which each service's `app/main.py` installs; the config
+service's standalone copy, `services/config/app/validation_errors.py` (OPS-CONFIG-30),
+and its limit reader `services/config/app/request_limits.py`; the wiring guards
+`tests/unit/test_validation_errors_wiring.py` and `tests/unit/test_request_body_limit_wiring.py`;
+`services/common/herd_common/error_details.py`, the ONE detail for a value outside a
+fixed set (OPS-VALID-7).
 
 **Rules.**
 
@@ -1728,9 +1749,12 @@ the ONE detail for a value outside a fixed set (OPS-VALID-7).
   Pinned by: `services/common/tests/test_validation_errors.py` (`test_an_installed_app_still_names_a_refused_key_in_loc`); `services/secrets/tests/test_validation_errors.py` (`test_loc_still_names_a_data_key_but_never_its_value_by_documented_limit`); `services/inventory/tests/test_validation_errors.py` (`test_msg_can_still_quote_a_dropdown_default_by_documented_limit`); `services/auth/tests/test_password_input_validation.py` (`test_msg_and_loc_can_still_quote_submitted_text`)
 - **OPS-VALID-4.** Every service app installs the handler: each `app/main.py` passes
   every app it builds to `install_validation_errors` from `herd_common.validation_errors`
-  in a module-level statement with no other argument, which also installs the body check
-  (OPS-VALID-6), except the config service, which installs its standalone copy because
-  it must not import `herd_common`, and passes exactly `refuse_lone_surrogates=False`
+  in a module-level statement whose only other argument is the body limit,
+  `max_body_bytes=settings.max_request_body_bytes` (OPS-VALID-9), which also installs
+  the body check (OPS-VALID-6), except the config service, which installs its standalone
+  copy because it must not import `herd_common`, passes
+  `max_body_bytes=max_request_body_bytes()` from `app/request_limits.py`, and passes
+  exactly `refuse_lone_surrogates=False`
   (by decision: it answers a lone surrogate in a password itself, OPS-CONFIG-8, and its
   settings save refuses one, OPS-CONFIG-31); the copy's code, docstrings aside, is
   identical to the shared module's. No module under a service's `app/` builds another
@@ -1738,7 +1762,7 @@ the ONE detail for a value outside a fixed set (OPS-VALID-7).
   `openapi`. The guard finds the services from the `services/` directory, so a new
   service is checked with no edit; its limits are in its module docstring. \
   Enforced in: `services/acl/app/main.py` (`install_validation_errors`); `services/ai-orchestrator/app/main.py` (`install_validation_errors`); `services/auth/app/main.py` (`install_validation_errors`); `services/cabling/app/main.py` (`install_validation_errors`); `services/execution/app/main.py` (`install_validation_errors`); `services/integration/app/main.py` (`install_validation_errors`); `services/inventory/app/main.py` (`install_validation_errors`); `services/notifications/app/main.py` (`install_validation_errors`); `services/reservations/app/main.py` (`install_validation_errors`); `services/secrets/app/main.py` (`install_validation_errors`); `services/user-profile/app/main.py` (`install_validation_errors`); `services/config/app/main.py` (`install_validation_errors`); `tests/unit/test_validation_errors_wiring.py` (`service_dirs`, `service_problems`, `install_problems`, `foreign_registrations`, `STANDALONE_COPY`, `BODY_CHECK_EXEMPT`) \
-  Pinned by: `tests/unit/test_validation_errors_wiring.py` (`test_every_service_app_installs_the_shared_handler`, `test_no_other_module_builds_an_app_or_registers_another_handler`, `test_services_are_discovered_from_the_directory`, `test_fixture_mains_that_pass`, `test_fixture_mains_that_fail`, `test_config_must_install_its_copy_not_the_shared_module`, `test_a_new_service_without_the_line_fails`, `test_only_an_exempt_service_may_opt_out_of_the_body_check`, `test_an_exempt_service_may_opt_out_only_with_exactly_that_keyword`, `test_only_config_may_opt_out_by_service_name`); `services/config/tests/test_validation_errors.py` (`test_the_code_is_identical_to_the_shared_module`, `test_the_code_comparison_sees_a_one_character_change`, `test_config_installs_its_copy_without_the_body_check`)
+  Pinned by: `tests/unit/test_validation_errors_wiring.py` (`test_every_service_app_installs_the_shared_handler`, `test_no_other_module_builds_an_app_or_registers_another_handler`, `test_services_are_discovered_from_the_directory`, `test_fixture_mains_that_pass`, `test_fixture_mains_that_fail`, `test_config_must_install_its_copy_not_the_shared_module`, `test_config_passes_the_limit_its_environment_reader_returns`, `test_a_new_service_without_the_line_fails`, `test_only_an_exempt_service_may_opt_out_of_the_body_check`, `test_an_exempt_service_may_opt_out_only_with_exactly_that_keyword`, `test_only_config_may_opt_out_by_service_name`); `services/config/tests/test_validation_errors.py` (`test_the_code_is_identical_to_the_shared_module`, `test_the_code_comparison_sees_a_one_character_change`, `test_config_installs_its_copy_without_the_body_check`)
 
 - **OPS-VALID-5.** A service's own validator never puts a submitted string into its
   error message as is; it quotes it with `repr` (or a list's `str`, which is the `repr`
@@ -1843,13 +1867,226 @@ the ONE detail for a value outside a fixed set (OPS-VALID-7).
   times). The check runs on the event loop, like FastAPI's own parse, so while it runs
   the service answers nothing else. Its cost grows with the body's length; what the
   service pays without it, the parse, grows with it too, and only a bound on the body's
-  size limits either (issue #1466); no HERD service bounds it today. Before round 4 of
+  size limits either: since OPS-VALID-9 the scan never sees more than the limit. Before round 4 of
   the review the check parsed every body that was not multipart, `text/plain`
   included (a 16 MB chain cost 1,693 ms and 802 MB against 1.8 ms and 17 MB), and
   searched it for locations. \
   Enforced in: `services/common/herd_common/validation_errors.py` (`_raw_text_holds_a_lone_surrogate`, `_escapes_hold_a_lone_surrogate`, `_HIGH_NOT_PAIRED`, `_LOW_ESCAPES`, `_HIGH_ESCAPES`, `holds_lone_surrogate`) \
-  Pinned by: `services/common/tests/test_validation_errors.py` (`test_a_structural_body_costs_a_small_part_of_its_parse`, `test_an_escape_heavy_body_costs_a_bounded_number_of_passes`, `test_a_body_with_no_surrogate_marker_is_passed_after_two_searches`, `test_through_an_app_a_refused_structural_body_costs_less_than_without_the_check`, `test_holds_lone_surrogate_costs_about_one_serialization`, `test_holds_lone_surrogate`, `test_holds_lone_surrogate_on_a_value_too_deep_to_serialize`); `services/inventory/tests/test_lone_surrogate_cost.py` (`test_a_deep_and_wide_json_import_file_costs_about_one_parse`, `test_a_deep_and_wide_csv_json_cell_costs_about_one_parse`); `services/cabling/tests/test_lone_surrogate_cost.py` (`test_a_deep_and_wide_json_import_file_costs_about_one_parse`); `services/secrets/tests/test_lone_surrogate_cost.py` (`test_deserializing_deep_and_wide_data_costs_about_one_parse`); `services/config/tests/test_lone_surrogate_cost.py` (`test_the_save_check_on_deep_and_wide_values_costs_about_one_parse`)
+  Pinned by: `services/common/tests/test_validation_errors.py` (`test_a_structural_body_costs_a_small_part_of_its_parse`, `test_an_escape_heavy_body_costs_linear_work_in_two_copies`, `test_a_body_with_no_surrogate_marker_is_passed_after_two_searches`, `test_through_an_app_a_refused_structural_body_costs_less_than_without_the_check`, `test_holds_lone_surrogate_costs_about_one_serialization`, `test_holds_lone_surrogate`, `test_holds_lone_surrogate_on_a_value_too_deep_to_serialize`, `test_holds_lone_surrogate_answers_at_every_depth_where_serializing_stops`, `test_the_walk_finds_a_lone_surrogate_wherever_it_sits`); `services/inventory/tests/test_lone_surrogate_cost.py` (`test_a_deep_and_wide_json_import_file_costs_about_one_parse`, `test_a_deep_and_wide_csv_json_cell_costs_about_one_parse`); `services/cabling/tests/test_lone_surrogate_cost.py` (`test_a_deep_and_wide_json_import_file_costs_about_one_parse`); `services/secrets/tests/test_lone_surrogate_cost.py` (`test_deserializing_deep_and_wide_data_costs_about_one_parse`); `services/config/tests/test_lone_surrogate_cost.py` (`test_the_save_check_on_deep_and_wide_values_costs_about_one_parse`)
 
+- **OPS-VALID-9.** Every service, config included, refuses a request body larger than
+  its route's limit with 413 (issue #1466). Before this rule nothing bounded a body:
+  the gateway has no body limit, uvicorn has none, and FastAPI reads and parses a whole
+  JSON body before a route's dependencies run, so a client with no token made acl parse
+  a 9.8 MB list (58 MB of memory, 0.23 s of the event loop) before its 401.
+  `install_validation_errors` adds `LimitRequestBody`, a pure ASGI middleware, just
+  outside `RefuseLoneSurrogates` (in config, which installs without that check, it is
+  the innermost middleware), with the service's `MAX_REQUEST_BODY_BYTES`, default
+  262144 (256 KiB since issue #1484; 4194304 before it, when every route took what a
+  canvas needs, so every unauthenticated route parsed up to 4 MiB): the Settings
+  field `max_request_body_bytes` of `HerdBaseSettings`, or
+  in config, which has no Settings model, `app/request_limits.py`. Both read the value
+  with `max_body_bytes_from_text`: ASCII decimal digits, surrounding whitespace
+  ignored, at least `MIN_MAX_REQUEST_BODY_BYTES` (65536); a sign, a decimal point, an
+  exponent, or an underscore is refused. A service refuses to start on a value it
+  refuses (a number in `config.json` is held to the same floor); config logs a warning
+  and uses the default instead, as it does for its login limits, and reads only its
+  environment, so a key written into `config.json` by hand does not reach it. The
+  limit is judged at the first read of the body, after routing. A `Content-Length`
+  declaring more than the limit is refused before one byte of the body is read; the
+  digits are compared exactly, whatever their number. Otherwise each `http.request`
+  message is counted as it is handed on, unchanged, and the read that takes the count
+  past the limit is refused instead of handed on, so a chunked body, or one longer than
+  its `Content-Length`, never reaches the route past the limit. A body of exactly the
+  limit is accepted. A `Content-Length` that is not a whole number (empty, negative,
+  signed, decimal, text) declares nothing, and the count alone bounds that body; when
+  there are several, each is judged. The answer is `{"detail": [{"type":
+  "body_too_large", "loc": ["body"], "msg": "Request body is larger than <limit>
+  bytes"}]}`: the one-item shape of OPS-VALID-6's refusal, naming the limit and never
+  anything of the body. It does not close the connection (the first version did, and a
+  client still writing its body, httpx or the gateway, then met a connection reset
+  instead of the 413). What is left of the body is read and discarded by uvicorn, in
+  both its h11 and its httptools protocol, which drop body data that arrives once the
+  response is complete, and the connection then serves the next request. So memory and
+  parse work stay bounded (refusing a 64 MiB chunked body at a 4 MiB limit peaked at 5.8 MiB of Python
+  allocations in the process, client included, the same as for 16 MiB), but the bytes
+  still cross the network and cost the reading: this check bounds memory and parsing,
+  not bandwidth. Every route with a body (JSON or a form) reads it before its
+  dependencies, so the refusal comes before authentication and any role gate, to any
+  caller with or without a token, and the surrogate check reads through the limit, so a
+  body over it is refused before it is scanned or parsed. A route that never reads its
+  body, an unknown route (404), and a method not allowed (405) answer as before, and the
+  route reads nothing of the body, with one exception, a known limit: a route that
+  answers with a streaming response without reading its body. Starlette's disconnect
+  listener then reads the body. Nothing is refused once the response has started, and
+  because the listener's first read can come while that response's start is still
+  scheduled, the check yields to the event loop once before it refuses: if the response
+  has started by then, the read answers `http.disconnect` instead, as does every read
+  after it, which the listener takes as the client leaving. In a HERD service, built
+  with the request logger (a BaseHTTPMiddleware) around the app, the start is still
+  held in the logger's stream at that point, so: a body whose `Content-Length` is over
+  the limit is refused, the response never starts, and Starlette raises `RuntimeError:
+  No response returned.`, a 500 to the client (or a reset when the server cannot send
+  it); a chunked body is read until the count passes the limit after the start, and the
+  stream is cut short. In both cases nothing of the body reaches the route and no byte
+  past the limit is handed on, but the route does not answer as before. So a route that
+  streams takes its body as a parameter, which FastAPI reads before the route runs, or
+  is listed by decision, with a reason, in the wiring guard's `STREAMING_WITHOUT_BODY`
+  (none is; issue #1483 chose this guard over changing the limit). The guard finds a
+  streaming route (a class named `StreamingResponse` or `EventSourceResponse` in the
+  MRO of its `response_class`, of its endpoint's return annotation, or of a call its
+  endpoint returns, directly or through a local name assigned once) in every built app
+  and fails on one with no body parameter that is not listed; it does not see a stream
+  built in another function, returned from a dependency, or sent through the ASGI
+  `send`. No HERD route is affected: the one streaming route, the reservation
+  assistant, takes its JSON body as a parameter. A client that sends `Expect: 100-continue` with a `Content-Length` over
+  the limit gets the 413 without a `100 Continue`, since the check refuses before the
+  first read that would send it; such a client must not send the body, and the server
+  then waits for that body on the connection, so a client that reused the connection
+  for its next request would have that request read and discarded as the refused
+  body. HTTP clients close such a connection instead of reusing it, so this is a
+  limit, not a defect. A websocket and the lifespan pass through untouched. Each refusal logs one
+  INFO line (`action` `request_body_too_large`, the limit, and `declared` or
+  `received`), never any of the body. The one raw read of a body in HERD, integration's
+  test-stack webhook sink `POST /echo`, takes the default. \
+  Enforced in: `services/common/herd_common/validation_errors.py` (`LimitRequestBody`, `declares_more_than`, `route_body_limit`, `body_too_large_error`, `BODY_TOO_LARGE_TYPE`, `DEFAULT_MAX_REQUEST_BODY_BYTES`, `MIN_MAX_REQUEST_BODY_BYTES`, `max_body_bytes_from_text`, `install_validation_errors`, `_log_refusal`); `services/common/herd_common/base_settings.py` (`HerdBaseSettings`, `MAX_REQUEST_BODY_BYTES_RULE`); `services/config/app/request_limits.py` (`max_request_body_bytes`); `tests/unit/test_request_body_limit_wiring.py` (`built_app`, `MIDDLEWARE`, `streaming_reasons`, `STREAMING_WITHOUT_BODY`) \
+  Pinned by: `services/common/tests/test_request_body_limit.py` (`test_declares_more_than`, `test_declares_more_than_is_exact_for_any_limit`, `test_the_one_item_names_the_limit_and_nothing_else`, `test_the_default_and_the_allowances_are_pinned`, `test_the_setting_is_read_as_decimal_digits_at_least_the_floor`, `test_a_declared_length_over_the_limit_is_refused_before_anything_is_read`, `test_a_body_of_exactly_the_limit_is_handed_on`, `test_a_chunked_body_is_refused_at_the_read_that_crosses_the_limit`, `test_a_body_longer_than_its_content_length_is_refused_by_the_count`, `test_an_invalid_content_length_leaves_the_count_to_bound_the_body`, `test_after_the_response_started_nothing_is_refused_and_the_reading_stops`, `test_after_the_response_started_a_declared_length_is_not_refused`, `test_a_read_racing_a_response_start_is_not_refused`, `test_a_streaming_route_that_never_reads_its_body_answers_with_no_middleware_around`, `test_known_limit_a_streaming_route_that_never_reads_its_body_fails_behind_the_logger`, `test_known_limit_the_same_route_with_a_chunked_body_over_the_limit_is_cut_short`, `test_a_disconnect_and_later_reads_pass_through`, `test_a_websocket_or_lifespan_scope_is_passed_through_untouched`, `test_a_request_whose_body_is_never_read_judges_nothing`, `test_a_refusal_logs_the_limit_and_the_reason_never_the_body`, `test_the_refusal_is_these_exact_bytes`, `test_over_the_limit_is_413_before_authentication`, `test_a_body_over_the_limit_is_never_parsed`, `test_a_body_over_the_limit_is_never_scanned_for_a_lone_surrogate`, `test_a_chunked_body_over_the_limit_is_refused_before_the_surrogate_check_buffers_it`, `test_a_chunked_body_over_the_limit_is_413_through_the_app`, `test_every_content_type_is_bounded`, `test_a_route_that_reads_no_body_an_unknown_route_and_a_stream_are_unchanged`, `test_the_limit_holds_without_the_surrogate_check`, `test_install_puts_the_limit_just_outside_the_surrogate_check`, `test_install_refuses_a_limit_that_is_not_a_positive_int`, `test_install_requires_the_limit`, `test_the_refusal_survives_a_base_http_middleware_in_either_order`); `services/common/tests/test_request_body_limit_socket.py` (`test_every_refusal_reaches_the_client_and_the_connection_serves_the_next_request`, `test_a_body_at_the_limit_still_reaches_the_route`, `test_refusing_a_64_mib_chunked_body_holds_no_more_than_the_limit`); `services/common/tests/test_base_settings.py` (`test_the_body_limit_defaults_to_256_kibibytes`, `test_the_body_limit_reads_decimal_digits_from_env_and_numbers_from_the_file`, `test_the_body_limit_refuses_what_config_also_refuses`, `test_the_body_limit_floor_holds_for_a_number_in_the_config_file`); `services/common/tests/test_validation_errors.py` (`test_install_adds_the_check_unless_told_not_to`); `services/acl/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/ai-orchestrator/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/auth/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/cabling/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/execution/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/integration/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/inventory/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/notifications/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/reservations/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/secrets/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/user-profile/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_just_outside_the_body_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_a_lone_surrogate_over_the_limit_is_the_413_not_the_surrogate_422`, `test_without_credentials_the_limit_answers_before_authentication`); `services/config/tests/test_request_body_limit.py` (`test_the_body_limit_is_installed_innermost_without_the_surrogate_check`, `test_a_body_at_the_limit_is_parsed_and_one_over_it_is_413_unparsed`, `test_a_chunked_body_over_the_limit_is_413`, `test_without_a_session_the_limit_answers_before_the_session_check`, `test_the_reader_takes_decimal_digits_at_least_the_floor`, `test_a_value_the_services_refuse_is_the_default_with_a_warning`, `test_the_reader_is_the_copy_of_the_shared_reading`); `tests/unit/test_request_body_limit_wiring.py` (`test_every_service_is_found`, `test_the_installed_middleware_is_exactly_the_declared_list`, `test_the_middleware_table_names_every_service`, `test_the_limit_is_the_services_setting`, `test_compose_passes_the_setting_with_the_shared_default`, `test_every_streaming_route_reads_its_body_first_or_is_listed`, `test_the_streaming_exemptions_name_only_existing_services_with_reasons`, `test_the_scan_sees_the_one_streaming_route_herd_has`, `test_a_streaming_route_with_no_body_parameter_is_flagged`, `test_an_honest_route_is_not_flagged`, `test_a_flagged_route_passes_only_while_it_is_listed`); `tests/integration/test_request_body_limit.py` (`test_a_body_over_the_limit_is_413_through_the_gateway`, `test_a_chunked_body_over_the_limit_is_413_through_the_gateway`, `test_a_body_at_the_limit_reaches_the_parser_through_the_gateway`, `test_the_connection_serves_a_request_after_each_refusal`)
+- **OPS-VALID-10.** A route whose body may hold more than the default declares it: its
+  endpoint is marked with `extends_body_limit(extra_bytes)`, the ONE way to raise a
+  route's limit, and its limit is `MAX_REQUEST_BODY_BYTES + extra_bytes()`, where
+  `extra_bytes` is read at each request. The extra bytes add to the setting, so an
+  operator who raises `MAX_REQUEST_BODY_BYTES` raises every marked route by as much (a
+  large-JSON route takes the setting plus 4 MiB, never less than either). It is used
+  for three reasons only. An upload route adds the files it bounds itself, read from
+  the route's own setting so the two cannot drift, and the default covers the form's
+  other fields. A route that legitimately takes a large JSON body adds
+  `LARGE_JSON_BODY_BYTES` (4194304, issue #1484): a canvas, a device configuration, an
+  AI commit that builds a canvas, and a bulk connection create, the routes whose
+  largest legitimate body was measured over the default (or has no bound in its schema
+  and can pass it in honest use). A route another HERD service forwards a body to adds
+  `FORWARD_ENVELOPE_BYTES` (262144), what the sender adds to the body it admitted
+  (OPS-VALID-12), on top of `LARGE_JSON_BODY_BYTES` when the sender admitted that body
+  through a large-JSON route. Every route that takes a form (a `File` or `Form`
+  parameter) carries the mark unless it is named, with a reason, in the guard's
+  `FORM_EXEMPT` (none is: no HERD route takes a small form). A guard builds every
+  service's app and fails on an unmarked form route, on a marked route outside this
+  table or a row whose route is not marked, on extra bytes that are not the sum of the
+  route's rows or do not follow its setting, and on a JSON route whose schema admits a
+  body over the shipped default without a mark. That estimate (`schema_body_estimate`,
+  read from the OpenAPI document) is an upper bound on the compact body a standard
+  encoder writes, assuming canonical UUIDs and timestamps, 6 bytes a character of a
+  free string, and 24 a number; it does not count whitespace a client adds. A schema
+  that bounds nothing (a free-form mapping, a model that keeps extra keys, a string
+  or list with no bound) has no estimate, and the guard fails on such an unmarked
+  route unless its `UNBOUNDED_AT_THE_DEFAULT` table names it or it is measured, as below. The routes,
+  with the default totals:
+
+  | Route | Service | Extra bytes | Limit with the defaults |
+  |---|---|---|---|
+  | `POST /drivers`, `PUT /drivers/{driver_id}/file` | inventory | `DRIVER_MAX_SIZE_BYTES` (10485760) | 10747904 |
+  | `POST /devices/import`, `POST /templates/import` | inventory | `IMPORT_UPLOAD_BYTES`, 10485760 fixed in `app/routers/bulk.py`: the routes read the whole upload with no bound of their own (issue #1417, open), so this is the only bound on an import file | 10747904 |
+  | `POST /topologies/import` | cabling | `IMPORT_UPLOAD_BYTES`, 10485760 fixed in `app/routes/bulk.py`, for the same reason | 10747904 |
+  | `POST /generate` | ai-orchestrator | `UPLOAD_MAX_FILES` times `UPLOAD_MAX_FILE_BYTES` (5 times 5242880), the aggregate `_read_uploads` enforces | 26476544 |
+  | `POST /internal/validate-package` | execution | the base64 length of `VALIDATE_PACKAGE_MAX_BYTES` (13981016 for 10485760), the JSON `package_b64` the validator decodes | 14243160 |
+  | `PUT /topologies/{topology_id}`, `POST /templates`, `PUT /templates/{template_id}` | cabling | `LARGE_JSON_BODY_BYTES`: a canvas. In the shape the topology editor's Save sends (UUID node and edge ids, the seven persisted device keys plus `label` and `topologyType`, React Flow's `measured`, `selected`, and `dragging`, and each link's port ids, port names, `portsCabled`, `pathValid`, and `pathHopCount`) a device node is about 520 bytes and a link about 460: 1,000 devices and 4,000 links are 2361613 bytes, a 250-device reservation's canvas with 1,000 links is 590443, already over the default, and this limit holds 1,887 devices with four links each (1,776 within the 4 MiB allowance alone) | 4456448 |
+  | `POST /connections/bulk` | cabling | `LARGE_JSON_BODY_BYTES`: 200 items at the schema's bounds, 2,723 bytes each of ASCII text, 544811 bytes in all (3104811 at the guard's 6 bytes a character) | 4456448 |
+  | `PUT /{reservation_id}/fork/canvas`, `POST /{reservation_id}/fork/save` | reservations | `LARGE_JSON_BODY_BYTES`: the fork's canvas | 4456448 |
+  | `POST /commit` | ai-orchestrator | `LARGE_JSON_BODY_BYTES`: a whole topology's devices with their configurations, links, and elements, from which the commit builds a canvas (no bound in its schema) | 4456448 |
+  | `POST /devices/{device_id}/config-versions` | inventory | `LARGE_JSON_BODY_BYTES`: a device configuration (no bound in its schema), which may be a whole running configuration | 4456448 |
+  | `PUT /internal/forks/{reservation_id}/canvas`, `POST /internal/forks/{reservation_id}/save` | cabling | `LARGE_JSON_BODY_BYTES` plus `FORWARD_ENVELOPE_BYTES`: the fork canvas reservations admitted | 4718592 |
+  | `POST /execute`, `POST /execute/internal` | execution | `LARGE_JSON_BODY_BYTES` plus `FORWARD_ENVELOPE_BYTES`: a configuration inventory's config-versions route or ai-orchestrator's commit admitted | 4718592 |
+  | `POST /` | reservations | `FORWARD_ENVELOPE_BYTES` | 524288 |
+  | `PATCH /preferences` | user-profile | `FORWARD_ENVELOPE_BYTES` | 524288 |
+
+  The routes measured to fit the default stay unmarked: `POST /pathfind/batch`
+  (cabling), whose largest body, 2,000 pairs of two device ids, is 236011 bytes as
+  compact JSON (244011 with Python's default separators, 288019 indented by two
+  spaces, so a pretty-printing client near the bound gets the 413); and user-profile's `PUT /preferences` and `PATCH /preferences`, whose
+  largest is 139319 bytes (two blobs at their 64 KiB cap as the validator serializes
+  them, and 200 page sizes under 32-character keys; the schema does not bound a page
+  size key's length). Every other unmarked JSON route whose schema bounds nothing
+  stays at the default by decision, and the guard's `UNBOUNDED_AT_THE_DEFAULT` table
+  is that decision: it names each such route with why its legitimate body is small
+  (among them inventory's device and template create and update, whose `field_data`
+  and field sections are a form's values, and the secrets create and update, where
+  256 KiB holds a full public CA bundle in PEM), and the guard fails on an unmarked
+  route with no bound that the table does not name and on a row whose route is gone,
+  marked, or bounded now. Raising `MAX_REQUEST_BODY_BYTES` is the remedy for a larger
+  body. Where an upload route bounds its files itself (every
+  upload row but the imports), a file just over that bound still gets the route's own
+  answer, its status and wording, since the body that holds it is under the route's
+  limit; a body past the files and the default is the 413 naming the route's limit.
+  The routes that take the envelope are also called from outside HERD (the browser,
+  the facade's callers), so the envelope raises what any caller may send them by 256
+  KiB. A large-JSON route parses up to its limit before authentication runs, like any
+  route; so the default bounds what an unauthenticated caller can make every other
+  route parse. An operator who set `MAX_REQUEST_BODY_BYTES=4194304` explicitly keeps 4 MiB on every route, gaining nothing, and the large-JSON routes then take 8 MiB and the routes they forward to 8.25 MiB; remove an explicit 4194304 to take the new default. \
+  Enforced in: `services/common/herd_common/validation_errors.py` (`extends_body_limit`, `route_body_limit`, `EXTRA_BODY_BYTES_ATTRIBUTE`, `FORWARD_ENVELOPE_BYTES`, `LARGE_JSON_BODY_BYTES`); `services/cabling/app/routes/topologies.py` (`update_topology`); `services/cabling/app/routes/templates.py` (`create_template`, `update_template`); `services/cabling/app/routes/connections.py` (`create_connections_bulk_endpoint`); `services/ai-orchestrator/app/routes/commit.py` (`commit`); `services/inventory/app/routers/device_configs.py` (`create_config_version`); `services/inventory/app/routers/drivers.py` (`create_new_driver`, `replace_driver_file_endpoint`); `services/inventory/app/routers/bulk.py` (`IMPORT_UPLOAD_BYTES`, `import_devices_endpoint`, `import_templates_endpoint`); `services/cabling/app/routes/bulk.py` (`IMPORT_UPLOAD_BYTES`, `import_topologies_endpoint`); `services/ai-orchestrator/app/routes/generate.py` (`generate`); `services/execution/app/routers/validation.py` (`base64_length`, `validate_package_endpoint`); `services/cabling/app/routes/forks.py` (`update_fork_canvas_internal`, `save_fork_internal`); `services/execution/app/routers/executions.py` (`manual_execute`, `internal_execute`); `services/reservations/app/routers/reservations.py` (`create_new_reservation`, `update_reservation_fork_canvas`, `save_reservation_fork`); `services/user-profile/app/routers/preferences.py` (`patch_preferences_endpoint`); `tests/unit/test_request_body_limit_wiring.py` (`UPLOAD_ROUTES`, `JSON_UPLOAD_ROUTES`, `LARGE_JSON_ROUTES`, `FORWARD_ROUTES`, `FORM_EXEMPT`, `MEASURED_UNDER_THE_DEFAULT`, `UNBOUNDED_AT_THE_DEFAULT`, `marked_route_problems`, `schema_body_estimate`, `unbounded_problems`) \
+  Pinned by: `services/common/tests/test_request_body_limit.py` (`test_route_body_limit`, `test_route_body_limit_of_a_large_json_route_adds_the_allowance_to_any_setting`, `test_extends_body_limit_returns_the_endpoint_unchanged`, `test_a_marked_route_takes_its_own_limit`, `test_an_upload_route_takes_its_own_limit_and_another_form_does_not`); `services/inventory/tests/test_request_body_limit.py` (`test_an_upload_route_takes_its_own_limit`, `test_the_upload_routes_follow_the_driver_setting_and_the_import_bound`, `test_a_large_json_route_takes_the_allowance`, `test_the_larger_routes_are_exactly_the_uploads_and_the_config_version_create`); `services/reservations/tests/test_request_body_limit.py` (`test_a_large_json_route_takes_the_allowance`); `services/user-profile/tests/test_request_body_limit.py` (`test_the_largest_preferences_body_fits_the_default_and_is_valid`); `services/common/tests/test_request_body_limit_socket.py` (`test_a_large_json_route_refuses_one_byte_over_its_own_limit_and_keeps_the_connection`, `test_a_body_at_a_large_json_routes_limit_reaches_it`); `services/cabling/tests/test_request_body_limit.py` (`test_the_import_route_takes_its_own_limit`, `test_the_larger_routes_are_exactly_the_import_the_large_json_routes_and_the_fork_forwards`, `test_a_large_json_route_takes_the_allowance`, `test_a_generated_large_canvas_is_over_the_default_and_under_the_allowance`, `test_the_largest_pathfind_batch_fits_the_default_and_is_not_marked`, `test_the_largest_bulk_connection_create_is_over_the_default`); `services/ai-orchestrator/tests/test_request_body_limit.py` (`test_the_generate_route_takes_its_own_limit`, `test_the_larger_routes_are_exactly_generate_and_commit`, `test_a_large_json_route_takes_the_allowance`); `services/execution/tests/test_request_body_limit.py` (`test_base64_length_is_the_padded_length`, `test_the_package_validator_takes_its_own_limit`); `services/cabling/tests/test_request_body_limit.py` (`test_a_forwarded_body_up_to_the_envelope_is_parsed_and_one_byte_more_is_413`); `services/execution/tests/test_request_body_limit.py` (`test_a_forwarded_body_up_to_the_envelope_is_parsed_and_one_byte_more_is_413`); `services/reservations/tests/test_request_body_limit.py` (`test_a_forwarded_body_up_to_the_envelope_is_parsed_and_one_byte_more_is_413`); `services/user-profile/tests/test_request_body_limit.py` (`test_a_forwarded_body_up_to_the_envelope_is_parsed_and_one_byte_more_is_413`); `tests/unit/test_request_body_limit_wiring.py` (`test_every_marked_route_is_in_the_tables_and_every_form_is_marked`, `test_the_mark_check_fails_both_ways`, `test_the_route_tables_name_only_existing_services_and_routes`, `test_each_measured_route_fits_the_default_and_is_not_a_large_json_route`, `test_every_bounded_json_route_over_the_default_is_marked`, `test_the_estimate_matches_each_bounded_measure`, `test_schema_body_estimate`, `test_the_estimate_is_the_compact_json_of_the_largest_body`, `test_every_unbounded_unmarked_json_route_is_listed_with_a_reason`, `test_the_unbounded_table_names_existing_services_with_reasons`, `test_the_unbounded_check_fails_both_ways`, `test_the_specification_names_every_marked_route`); `tests/integration/test_request_body_limit.py` (`test_a_canvas_save_at_the_large_json_limit_succeeds_and_one_byte_more_is_413`, `test_a_large_json_route_reads_a_body_over_the_default_to_authentication`, `test_a_fork_canvas_over_the_default_is_saved_through_reservations_to_cabling`)
+- **OPS-VALID-11.** The limit's cost is constant per message, on the event loop like
+  everything else in the request: per request two small closures; at the first read
+  one pass over the headers and the route lookup; per `http.request` message one
+  addition and one comparison; one extra pass of the event loop before a refusal. It
+  never copies, joins, or scans the body: the messages it hands on are the ones it
+  received. Measured pinned to one core through an ASGI client against the same app
+  without it (observations, not a bound): 4.9 microseconds more per small JSON request
+  (1.02 times), 20 more for a 1 MB body in one message, 84 more for a 1 MB body in 256
+  messages (about 0.3 a message). A declared body over the limit costs no read by the
+  app: a 9 MB structural body to a route behind a 401 dependency costs 0.4 ms refused
+  against 300 ms parsed. A chunked body over the limit costs the app reading up to the
+  limit and one message past it; after the 413 the server still reads and discards the
+  rest (OPS-VALID-9), which over loopback cost about 0.09 s of CPU for 64 MiB. \
+  Enforced in: `services/common/herd_common/validation_errors.py` (`LimitRequestBody`) \
+  Pinned by: `services/common/tests/test_request_body_limit.py` (`test_messages_are_handed_on_as_received_never_copied_or_joined`, `test_handing_on_a_body_allocates_nothing_that_grows_with_it`, `test_the_cost_per_message_does_not_grow_with_its_size`, `test_through_an_app_an_over_limit_body_costs_less_than_parsing_it`); `services/common/tests/test_request_body_limit_socket.py` (`test_refusing_a_64_mib_chunked_body_holds_no_more_than_the_limit`)
+- **OPS-VALID-12.** A body one HERD service admitted is not refused for its size by the
+  service it forwards it to, by decision of the #1466 review. Every outbound call that
+  sends a body (40 call sites in `app/` and `herd_common`, found by a source scan) is
+  classified in the guard's `FORWARDS` table, and a new one fails the guard until it
+  is. The scan finds a call with a `json=` or non-`None` `json_body=` keyword; an
+  httpx method, `client.request`, `client.stream`, `client.build_request`, or
+  `httpx.Request` with a body keyword or a `**` splat; and a call to one of HERD's own
+  forwarders (`call_service`, `_cabling_fork_call`, `_execution_wiring_call`, the
+  facade's `_forward`) with a body by keyword or by position. Each call site is keyed
+  by its function and its receiver (the method and the URL or path as written, with an
+  ordinal for a repeat), never by its line, so a second body call in a classified
+  function fails until it is classified and moving a call does not. It does not see a
+  body sent through a forwarder not yet named in the guard, a client method of another
+  name or a non-httpx client, or a call made through `getattr` or a function held
+  under another name; the receiver in a key is the text the code wrote, not the URL it
+  resolves to. Each forward that takes the envelope names its source, the route that
+  admitted what travels (or none, when the sender builds a body of the receiver's own
+  schema from fields it bounded), and the receiver must add at least what its source
+  adds plus `FORWARD_ENVELOPE_BYTES`, so a body a large-JSON route admitted is
+  forwarded to a route with the large-JSON allowance plus the envelope (issue #1484):
+
+  | Sender | Receiver | What travels | How it fits |
+  |---|---|---|---|
+  | reservations fork canvas PUT and fork save | cabling `PUT /internal/forks/{reservation_id}/canvas`, `POST /internal/forks/{reservation_id}/save` | the canvas the user sent, admitted by a large-JSON route; the save adds `created_by` and at most 250 member device ids (about 10 KB) | large-JSON allowance plus envelope |
+  | inventory immediate apply; ai-orchestrator commit with `apply_configs` | execution `POST /execute` | a stored or submitted device configuration inside `method_kwargs`, admitted by inventory's config-versions route or the commit, both large-JSON routes, plus ids (under 1 KB) | large-JSON allowance plus envelope |
+  | inventory apply scheduler | execution `POST /execute/internal` | a stored device configuration inside `method_kwargs`, admitted by inventory's config-versions route, plus ids | large-JSON allowance plus envelope |
+  | the `/api/v1` facade; ai-orchestrator commit | reservations `POST /` | a reservation create body: the facade's admitted body with defaults and normalized datetimes (about 150 bytes more at most), or one the commit builds from its own bounded fields | envelope |
+  | notifications preference PUT | user-profile `PATCH /preferences` | the update merged with the stored preferences (a blob of at most 64 KiB in user-profile) | envelope |
+  | ai-orchestrator commit | cabling `PUT /topologies/{topology_id}` | a canvas built from the commit, larger than the commit itself | capped: measured before anything is written (`canvas_put_bytes`) against cabling's limit for that large-JSON route, the setting plus `LARGE_JSON_BODY_BYTES` (`canvas_put_limit`); over it the commit is a 413 naming both numbers, and nothing is created |
+  | cabling topology import | inventory `POST /devices/resolve-by-name` | the device names an import file holds | capped: batches of at most 32 KiB (`name_batches`); a name longer than a device name may be is not sent |
+  | reservations utilization report | auth `POST /groups/users/groups` | every user of the report | capped: batches of 500 ids, auth's own cap (before, more than 500 users answered 422 and the report showed every user Ungrouped) |
+  | ai-orchestrator recipe drafting | execution `POST /internal/validate-package` | a drafted package as base64 | an upload route (OPS-VALID-10) |
+  | every other call: id lists of at most 500, a 2,000-character purpose, a status, a name, a pathfinding pair | auth, inventory, cabling, acl, reservations, ai-orchestrator | bounded by schemas and caps | under `MIN_MAX_REQUEST_BODY_BYTES`, so no setting can make it fail |
+
+  Two bodies are bounded by something other than a schema: the assistant's
+  configuration proposal to inventory, by the model's output tokens (`AI_MAX_TOKENS`),
+  and a dynamic device's `field_data` from execution to inventory, by what the
+  hypervisor driver returns. The rest go to services outside HERD (webhooks, chat, the
+  identity provider) or to the restarter. Should a receiving service still answer 413
+  (a different `MAX_REQUEST_BODY_BYTES` there, or a crafted body that grows when it is
+  parsed and written again: a number such as `1e15` is written `1000000000000000.0`,
+  up to 3.8 times its text), the sender answers a 4xx, never a 503 that says the other
+  service is down: reservations relays cabling's 413 and its item as they are, the
+  facade relays reservations' status and detail, ai-orchestrator's commit answers
+  cabling's or reservations' status, inventory's apply records `execution answered HTTP
+  413`, and notifications answers 413 `The merged notification preferences are too
+  large to store`. \
+  Enforced in: `tests/unit/test_request_body_limit_wiring.py` (`FORWARDS`, `body_calls`, `outbound_body_calls`, `envelope_shortfalls`); `services/ai-orchestrator/app/services/committer.py` (`canvas_put_bytes`, `canvas_put_limit`, `CANVAS_TOO_LARGE_DETAIL`, `commit_proposal`); `services/cabling/app/services/device_resolver.py` (`name_batches`, `RESOLVE_BATCH_BYTES`, `DEVICE_NAME_MAX_LENGTH`); `services/reservations/app/services/reporting_service.py` (`fetch_user_groups_map`, `USER_GROUPS_BATCH`); `services/notifications/app/routers/notifications.py` (`PREFERENCES_TOO_LARGE_DETAIL`) \
+  Pinned by: `tests/unit/test_request_body_limit_wiring.py` (`test_every_outbound_body_is_classified_and_every_entry_exists`, `test_each_classified_call_is_covered`, `test_every_forward_route_has_a_sender`, `test_the_envelope_check_fails_both_ways`, `test_every_envelope_source_is_a_route_of_its_service`, `test_the_body_call_scan_both_ways`, `test_the_real_module_has_no_unclassified_body_call`, `test_each_bypass_the_review_found_is_an_unclassified_call`, `test_moving_a_call_without_changing_it_keeps_its_key`, `test_the_receiver_is_the_method_and_the_url_as_written`, `test_a_repeated_call_gets_an_ordinal`, `test_a_transport_call_without_a_body_is_not_a_body_call`); `services/ai-orchestrator/tests/test_committer_error_paths.py` (`test_a_canvas_over_the_limit_is_refused_before_anything_is_written`, `test_a_canvas_at_or_under_the_limit_goes_on_to_cabling`, `test_a_canvas_one_byte_over_the_limit_is_refused`, `test_the_canvas_limit_is_the_setting_plus_the_large_json_allowance`, `test_canvas_put_bytes_is_the_httpx_encoding`); `services/cabling/tests/test_route_handlers_direct.py` (`test_device_resolver_batches_stay_under_the_batch_bytes`, `test_device_resolver_drops_a_name_no_device_can_have`, `test_device_resolver_sends_every_batch_and_merges_the_answers`, `test_device_resolver_batch_edge_is_exact`); `services/reservations/tests/test_reporting_edges.py` (`test_fetch_user_groups_map_sends_batches_of_auth_s_own_cap`, `test_fetch_user_groups_map_one_failed_batch_fails_soft_for_all`); `services/reservations/tests/test_fork_endpoints.py` (`test_a_cabling_413_is_relayed_as_413_with_its_detail`); `services/notifications/tests/test_router.py` (`test_put_preferences_relays_a_user_profile_413_as_413`)
 **Out of scope.** An error body a route builds itself (`HTTPException(detail=...)`) is
 not rendered by this handler; each such detail is its area's rule (OPS-VALID-7 for a
 value outside a fixed set). What auth's and config's password fields refuse is
@@ -1879,6 +2116,8 @@ IAM-REG-2, IAM-LOGIN-5 (`identity-and-access.md`), and OPS-CONFIG-8.
 | 405 | `Method not allowed`, with `Allow` | a restarter request to `/restart` with a method other than POST, or to `/health` with one other than GET | OPS-CONFIG-25 |
 | 400 | `Transfer-Encoding is not accepted`, `Content-Length must be one whole number` | a restarter request with a chunked body or a Content-Length that is not one whole number | OPS-CONFIG-25 |
 | 413 | `Request body too large` | a restarter request body over 4096 bytes | OPS-CONFIG-25 |
+| 413 | `{"detail": [{"type": "body_too_large", "loc": ["body"], "msg": "Request body is larger than <limit> bytes"}]}`; the connection stays open | any request whose body is read and is over its route's limit (`MAX_REQUEST_BODY_BYTES`, plus the files an upload route accepts, the large-JSON allowance of a large-JSON route, or the envelope of a forward route), in every service, before authentication | OPS-VALID-9, OPS-VALID-10 |
+| 413 | the receiving service's own 413 detail, relayed (reservations' fork routes, the `/api/v1` facade), or `The merged notification preferences are too large to store` (notifications), or `The topology this commit builds is <n> bytes, over the <limit>-byte request body limit; ...` (ai-orchestrator commit) | a body forwarded to another service that refuses it for its size, or a commit whose canvas would be | OPS-VALID-12 |
 | 403 | `Admin or superadmin role required` | a non-admin lists health snapshots, reads a report, or writes a secret | OPS-HEALTH-3, OPS-REPORT-1, OPS-SECRET-1 |
 | 422 | `Unknown last_status; allowed: UNKNOWN, HEALTHY, DEGRADED, UNREACHABLE` | an unknown health filter that matches nothing | OPS-HEALTH-4 |
 | 500 | `Internal API token not configured` | a device check while execution has no internal token | OPS-HEALTH-6 |
@@ -1943,6 +2182,7 @@ Startup refusals (no HTTP answer; the container exits or waits):
 | Setting | Default | Effect |
 |---|---|---|
 | `LOG_LEVEL` (every service but config) | `INFO` | Root log level (OPS-LOG-8) |
+| `MAX_REQUEST_BODY_BYTES` (every service, config included) | `262144` | Request body limit, decimal digits, at least 65536; a large-JSON route adds 4 MiB, an upload route its files, a forward route the envelope (OPS-VALID-9, OPS-VALID-10) |
 | `HERD_BUILD`, `HERD_BUILD_DATE` | `dev`, empty | Build identity reported by `/version` (OPS-VER-3) |
 | `HERD_CONFIG_FILE` | `/etc/herd/config.json` | Where services read the config file (OPS-SET-7) |
 | `HERD_CONFIG_DATA_DIR` (config) | `/data/herd-config` | Where the config service keeps `config.json`, the marker, and the auth file |
@@ -1981,17 +2221,18 @@ timeout, its 10 s list and 60 s restart deadlines, and the config client's 720 s
 failures, then 1 s doubling to 60 s, a source forgotten after 15 quiet minutes, at most
 10,000 sources kept); the 500-reservation transit chunk and the
 100,000-device fleet stop; the preference caps of 200 keys, 64 KB, and page sizes of 1
-to 500.
+to 500; the 10 MiB import file bound of the inventory and cabling import routes
+(OPS-VALID-10).
 
 ## 12. Test coverage map
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/common/tests/` (`test_logging.py`, `test_config_loader.py`, `test_base_settings.py`, `test_schema_init.py`, `test_consumer_schema_gate.py`, `test_outbox.py`, `test_jetstream.py`, `test_version.py`, `test_validation_errors.py`, `test_error_details.py`); `services/execution/tests/test_health_scheduler*.py`; `services/config/tests/`; `services/secrets/tests/test_crypto.py`, `test_keyring.py`; `services/reservations/tests/test_reporting_*.py`, `test_fleet_report.py`, `test_transit_gear_rollup.py`; `infra/restarter/tests/` (the restarter against a fake Docker daemon on a Unix socket, and its HTTP surface in process); the `tests/unit/` guards (`test_validation_errors_wiring.py`, `test_restarter_compose_guard.py`, `test_dockerfile_users.py`, `test_compose_settings_wiring.py`, `test_compose_ports.py`, `test_build_args_wiring.py`, `test_consumer_heartbeat_wiring.py`, `test_docs_nats_cli_form.py`, `test_check_image_matches_lock.py`); the frontend tests named in sections 8.3, 8.6, 8.11, and 8.14 | SQLite in memory; the scheduler's concurrency is driven within one process |
-| Functional (through the service API) | each service's `test_version.py` and `test_validation_errors.py`; `services/execution/tests/test_health_endpoints.py`; the device check tests in `services/execution/tests/test_api_endpoints.py`, `test_router_endpoints.py`, and `test_router_direct.py`; `services/config/tests/test_config.py`, `test_config_passwords.py`; `services/secrets/tests/test_api.py`, `test_unencodable_data.py`; `services/user-profile/tests/test_preferences*.py`; the report route tests in `test_fleet_report.py` | httpx against the app |
-| Integration (running stack) | `tests/integration/test_restarter_isolation.py` (no socket in config, config not root, the restarter answering on `herd-ctl` and unresolvable from `herd-net`; it never restarts; the absence of a gateway route is pinned statically by OPS-GUARD-6, since Traefik could not reach `herd-ctl` even with labels), `tests/integration/test_device_check_internal_fetch.py`, `test_outbox_durability.py`, `test_nats_consumer_configs_live.py`, `test_health_alerting_flow.py`, `test_secrets_flow.py`, `test_reporting.py`, `test_dlq_and_idempotency.py`; the live-Postgres suite `services/common/tests/test_outbox_wake_live_pg.py` | No running-stack integration test sends a restart (the nightly browser step does), covers a scheduler poll end to end (the alerting test publishes its own events), or covers a JetStream store surviving a recreate |
-| Stress and load | `tests/load/locustfile.py` ([LOAD_TESTING.md](../LOAD_TESTING.md)) | The load test drives reservations, inventory, ACL, export, validation, notifications, and bulk cabling; none of its users polls health, reads reports, or touches secrets or the config service. Save and Restart cannot be load tested, since a restart bounces the stack under test; its concurrency property (one pass at a time under twenty concurrent calls) is pinned at the unit level (OPS-CONFIG-27). Scheduler fleet scale is covered only by the unit bounds in section 8.10 |
-| Browser end-to-end | `tests/e2e/test_about_page_playwright.py`, `tests/e2e/test_config_playwright.py` (Save and Restart runs only with `HERD_E2E_RESTART=1`, which nightly.yml sets in its last test step), `tests/e2e/test_config.py`, `tests/e2e/test_reporting_page.py` | No browser test covers the health badge or the help link |
+| Unit | `services/common/tests/` (`test_logging.py`, `test_config_loader.py`, `test_base_settings.py`, `test_schema_init.py`, `test_consumer_schema_gate.py`, `test_outbox.py`, `test_jetstream.py`, `test_version.py`, `test_validation_errors.py`, `test_request_body_limit.py`, `test_error_details.py`); `services/execution/tests/test_health_scheduler*.py`; `services/config/tests/`; `services/secrets/tests/test_crypto.py`, `test_keyring.py`; `services/reservations/tests/test_reporting_*.py`, `test_fleet_report.py`, `test_transit_gear_rollup.py`; `infra/restarter/tests/` (the restarter against a fake Docker daemon on a Unix socket, and its HTTP surface in process); the `tests/unit/` guards (`test_validation_errors_wiring.py`, `test_request_body_limit_wiring.py`, `test_restarter_compose_guard.py`, `test_dockerfile_users.py`, `test_compose_settings_wiring.py`, `test_compose_ports.py`, `test_build_args_wiring.py`, `test_consumer_heartbeat_wiring.py`, `test_docs_nats_cli_form.py`, `test_check_image_matches_lock.py`); the frontend tests named in sections 8.3, 8.6, 8.11, 8.14, and 8.15 | SQLite in memory; the scheduler's concurrency is driven within one process |
+| Functional (through the service API) | each service's `test_version.py`, `test_validation_errors.py`, and `test_request_body_limit.py`; `services/execution/tests/test_health_endpoints.py`; the device check tests in `services/execution/tests/test_api_endpoints.py`, `test_router_endpoints.py`, and `test_router_direct.py`; `services/config/tests/test_config.py`, `test_config_passwords.py`; `services/secrets/tests/test_api.py`, `test_unencodable_data.py`; `services/user-profile/tests/test_preferences*.py`; the report route tests in `test_fleet_report.py` | httpx against the app |
+| Integration (running stack) | `tests/integration/test_restarter_isolation.py` (no socket in config, config not root, the restarter answering on `herd-ctl` and unresolvable from `herd-net`; it never restarts; the absence of a gateway route is pinned statically by OPS-GUARD-6, since Traefik could not reach `herd-ctl` even with labels), `tests/integration/test_device_check_internal_fetch.py`, `test_outbox_durability.py`, `test_nats_consumer_configs_live.py`, `test_health_alerting_flow.py`, `test_secrets_flow.py`, `test_reporting.py`, `test_dlq_and_idempotency.py`, `test_request_body_limit.py` (the 413 through the gateway, without signing in, a canvas save at the large-JSON limit and one byte over it, and a 1 MiB fork canvas saved through reservations to cabling, signed in); the live-Postgres suite `services/common/tests/test_outbox_wake_live_pg.py` | No running-stack integration test sends a restart (the nightly browser step does), covers a scheduler poll end to end (the alerting test publishes its own events), or covers a JetStream store surviving a recreate |
+| Stress and load | `tests/load/locustfile.py` ([LOAD_TESTING.md](../LOAD_TESTING.md)) | The load test drives reservations, inventory, ACL, export, validation, notifications, and bulk cabling, and `OversizedBodySender` sends bodies over the limit to one route of every service beside them (OPS-VALID-9) while `LargeCanvasSaver` saves a canvas over the default to a large-JSON route (OPS-VALID-10); none of its users polls health, reads reports, or touches secrets or the config service. Save and Restart cannot be load tested, since a restart bounces the stack under test; its concurrency property (one pass at a time under twenty concurrent calls) is pinned at the unit level (OPS-CONFIG-27). Scheduler fleet scale is covered only by the unit bounds in section 8.10 |
+| Browser end-to-end | `tests/e2e/test_about_page_playwright.py`, `tests/e2e/test_config_playwright.py` (Save and Restart runs only with `HERD_E2E_RESTART=1`, which nightly.yml sets in its last test step), `tests/e2e/test_config.py`, `tests/e2e/test_reporting_page.py`, `tests/e2e/test_large_canvas_save_playwright.py` (the editor's Save of a canvas over the default, OPS-VALID-10); the author credit's placement under its card (OPS-CREDIT-1) in `tests/e2e/test_login.py`, `tests/e2e/test_register_and_roles.py`, and `tests/e2e/test_config.py` | No browser test covers the health badge or the help link |
 
 Not run for this document: nothing was checked against a running stack. The
 integration, live-Postgres, load, and browser suites were read, not run; `tests/unit/`
@@ -1999,7 +2240,15 @@ was run. The startup behavior with an unreachable broker (OPS-NATS-1) was reprod
 the host with the installed NATS client against a closed local port. The restarter rules
 (OPS-CONFIG-13 to OPS-CONFIG-16, OPS-CONFIG-24 to OPS-CONFIG-29) were written at
 `86765c9e` from their unit and functional suites, which were run; their integration test
-and the nightly browser step were not run against a stack.
+and the nightly browser step were not run against a stack. The body limit rules
+(OPS-VALID-9 to OPS-VALID-12) were written from their unit and functional suites, the
+real-socket suite against uvicorn on an ephemeral port, and
+the `tests/unit/` guard, which were run; `tests/integration/test_request_body_limit.py`
+and the `OversizedBodySender` load user were written against their neighbours and not
+run against a stack; so were the large canvas save and the 1 MiB fork canvas save added to that integration test, the
+`LargeCanvasSaver` load user, and the browser test of a large canvas save, for issue
+#1484, whose unit and functional suites were run. OPS-CREDIT-1 was added on
+2026-11-20 with its unit tests run; its three browser tests were written, not run.
 
 ## 13. Known limits and gaps
 
@@ -2055,6 +2304,32 @@ None at present.
 - A secret stored with a lone surrogate before OPS-SECRET-1 refused one answers a 409 on
   every reveal until an admin replaces its data; there is no sweep that lists such
   secrets (OPS-SECRET-19). Recorded in issue #1456.
+- The body limit lives in each service, not the gateway (issue #1466, the owner's
+  option (b)): Traefik still forwards a body of any size, and each service refuses it
+  at its first read (OPS-VALID-9). A route that never reads its body is not refused,
+  since the route reads nothing of it. The limit bounds memory and parsing, not
+  bandwidth: the server reads and discards what is left of a refused body, so a
+  client may still send any number of bytes over a connection. Recorded in the module
+  docstring of `herd_common.validation_errors`.
+- A route that streams its answer without reading its body, given a body over the
+  limit, does not answer as before: behind the request logger a declared body ends in
+  a 500 (`RuntimeError: No response returned.`) and a chunked one cuts the stream
+  short; nothing of the body reaches the route (OPS-VALID-9). No HERD route streams
+  without a body parameter, and the wiring guard fails on one that is not listed by
+  decision (issue #1483 kept the limit and added the guard). Recorded in the tests
+  named for it in `services/common/tests/test_request_body_limit.py` and in issue
+  #1483.
+- A client that sends `Expect: 100-continue` with an over-limit `Content-Length` gets
+  the 413 without a `100 Continue`; reusing that connection without sending the body
+  would have its next request read as the refused body (OPS-VALID-9). Recorded in
+  OPS-VALID-9.
+- A crafted body that grows when it is parsed and written again (numbers in exponent
+  form) can still be refused by the service it is forwarded to, which answers 413 and
+  the sender relays a 4xx (OPS-VALID-12); the envelope covers what the senders add, not
+  that growth. Recorded in issue #1466.
+- The bulk import routes of inventory and cabling read the whole upload with no bound
+  of their own, so the body limit's 10 MiB import file bound is their only one
+  (OPS-VALID-10). Recorded in issue #1417.
 
 ### Rules with no test
 

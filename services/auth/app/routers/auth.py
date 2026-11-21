@@ -1,11 +1,15 @@
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+import uuid
+
+import jwt
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.security.utils import get_authorization_scheme_param
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
-from app.dependencies.auth import get_current_user
-from app.models.user import User
+from app.dependencies.auth import effective_role, get_current_user
+from app.models.user import Role, User
 from app.schemas.auth import (
     LoginOptionsResponse,
     LoginRequest,
@@ -17,17 +21,20 @@ from app.schemas.auth import (
     TokenResponse,
     UserResponse,
 )
+from app.services import login_limits, passwords
 from app.services.auth_service import (
     authenticate_user,
     create_tokens_for_user,
     create_user,
     get_user_by_email,
+    get_user_by_id,
     get_user_by_username,
     revoke_refresh_token,
     rotate_refresh_token,
     update_user_profile,
 )
 from app.services.ldap_service import LdapUnavailableError
+from app.utils.jwt import verify_access_token
 
 router = APIRouter(tags=["auth"])
 
@@ -40,6 +47,87 @@ REGISTER_DISABLED_LDAP_DETAIL = (
 REGISTER_DISABLED_OIDC_DETAIL = (
     "Local registration is disabled; this deployment uses single sign-on."
 )
+
+# Fixed 429 detail for a source past its attempt allowance (IAM-LOGIN-7), the
+# same for every account, known or unknown, and for login and registration.
+ATTEMPTS_LIMITED_DETAIL = "Too many attempts; try again later"
+# Fixed 503 detail when no hashing slot came free in time (IAM-HASH-7).
+HASHING_BUSY_DETAIL = "Too many password checks in progress; try again shortly"
+
+_LIMITED_RESPONSE = {
+    "description": "Too many attempts from this source address (IAM-LOGIN-7); "
+    "`Retry-After` gives the whole seconds to wait",
+}
+_REGISTER_RESPONSES: dict[int | str, dict] = {
+    429: _LIMITED_RESPONSE,
+    503: {"description": "Password checking is at capacity (IAM-HASH-7)"},
+}
+_LOGIN_RESPONSES: dict[int | str, dict] = {
+    429: _LIMITED_RESPONSE,
+    503: {
+        "description": "Password checking is at capacity (IAM-HASH-7), or in LDAP mode "
+        "the directory could not be asked (IAM-LDAP-12)",
+    },
+}
+
+
+def _check_attempt_allowance(request: Request) -> None:
+    """Count one password attempt against the request's source address; 429 with
+    `Retry-After` when it has none left (IAM-LOGIN-7). Itself it queries nothing.
+    A login calls it before any query, bcrypt, or directory call, so a refused
+    login costs nothing; a registration calls it after `_registered_by_an_admin`,
+    which reads one account first when the request carries a bearer token that
+    verifies (none for an absent or invalid token)."""
+    wait = login_limits.LIMITER.acquire(login_limits.request_source(request))
+    if wait is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=ATTEMPTS_LIMITED_DETAIL,
+            headers={"Retry-After": str(wait)},
+        )
+
+
+def _hashing_busy() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=HASHING_BUSY_DETAIL,
+        headers={"Retry-After": str(passwords.HASH_RETRY_AFTER_SECONDS)},
+    )
+
+
+async def _registered_by_an_admin(request: Request, db: AsyncSession) -> bool:
+    """True when the request carries a bearer access token of an active account
+    whose effective role (IAM-ROLE-5) is admin or superadmin.
+
+    Such a registration is not counted against the source's allowance
+    (IAM-LOGIN-7): `make seed` registers about a thousand accounts this way from
+    one address. Nothing else changes for it. Any other header, a token that does
+    not verify, or a lower role answers False, never an error.
+
+    Cost: an absent header or a token that does not verify costs no query. A
+    token that verifies costs one account read, whatever its role, because the
+    effective role needs the stored role; a non-admin token cannot be turned
+    away before that read without trusting the claim alone. `GET /me` already
+    gives any token holder the same read. The transaction the read opened is
+    ended here, so the connection goes back to the pool before the
+    registration's allowance is counted and before it waits for a hashing slot.
+    """
+    scheme, token = get_authorization_scheme_param(request.headers.get("Authorization"))
+    if scheme.lower() != "bearer" or not token:
+        return False
+    try:
+        payload = verify_access_token(token)
+        user_id = uuid.UUID(str(payload.get("sub")))
+    except (jwt.PyJWTError, ValueError):
+        return False
+    user = await get_user_by_id(db, user_id)
+    admitted = (
+        user is not None
+        and user.is_active
+        and effective_role(payload.get("role"), user.role) in (Role.ADMIN, Role.SUPERADMIN)
+    )
+    await db.rollback()
+    return admitted
 
 
 @router.get("/login-options", response_model=LoginOptionsResponse)
@@ -69,8 +157,13 @@ async def login_options(response: Response):
     )
 
 
-@router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
+@router.post(
+    "/register",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=_REGISTER_RESPONSES,
+)
+async def register(request: Request, body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     if settings.auth_method == "ldap":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=REGISTER_DISABLED_LDAP_DETAIL
@@ -79,25 +172,46 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=REGISTER_DISABLED_OIDC_DETAIL
         )
-    # Single generic 409 for any collision (email OR username, pre-check OR the
-    # IntegrityError race below). Distinct messages let an unauthenticated caller
-    # enumerate which emails and usernames already exist by reading which one
-    # comes back. Keep this wording identical across all three paths.
-    if await get_user_by_email(db, body.email) or await get_user_by_username(db, body.username):
-        raise HTTPException(status_code=409, detail="Email or username already exists")
+    # Registration hashes the password, so one without an admin's token counts
+    # against the source's attempt allowance (IAM-LOGIN-7). A bearer token that
+    # verifies costs one account read first (released before the count and the
+    # slot); an absent or invalid one costs no query.
+    if not await _registered_by_an_admin(request, db):
+        _check_attempt_allowance(request)
     try:
-        user = await create_user(
-            db, body.email, body.username, body.password, full_name=body.full_name
-        )
-    except IntegrityError:
-        raise HTTPException(status_code=409, detail="Email or username already exists")
+        # The slot is entered before the duplicate check's query, and the token
+        # check's read (if any) was released above, so a registration waiting
+        # for a slot holds no database connection (IAM-HASH-7).
+        async with passwords.hashing_slot():
+            # Single generic 409 for any collision (email OR username, pre-check
+            # OR the IntegrityError race below). Distinct messages let an
+            # unauthenticated caller enumerate which emails and usernames already
+            # exist by reading which one comes back. Keep this wording identical
+            # across all three paths.
+            if await get_user_by_email(db, body.email) or await get_user_by_username(
+                db, body.username
+            ):
+                raise HTTPException(status_code=409, detail="Email or username already exists")
+            try:
+                user = await create_user(
+                    db, body.email, body.username, body.password, full_name=body.full_name
+                )
+            except IntegrityError:
+                raise HTTPException(status_code=409, detail="Email or username already exists")
+    except passwords.HashingBusyError:
+        raise _hashing_busy()
     return user
 
 
-@router.post("/login", response_model=TokenResponse)
-async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
+@router.post("/login", response_model=TokenResponse, responses=_LOGIN_RESPONSES)
+async def login(request: Request, body: LoginRequest, db: AsyncSession = Depends(get_db)):
+    # Before anything that costs: no query, bcrypt, or directory call runs for a
+    # refused attempt, and the answer is the same for every account (IAM-LOGIN-7).
+    _check_attempt_allowance(request)
     try:
         user = await authenticate_user(db, body.email, body.password)
+    except passwords.HashingBusyError:
+        raise _hashing_busy()
     except LdapUnavailableError:
         # Issue #1403: LDAP mode could not ask the directory, so the credentials
         # were never judged; a 401 would tell the user their password is wrong.

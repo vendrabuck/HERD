@@ -8,6 +8,11 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from herd_common.internal_auth import internal_token_matches
+from herd_common.validation_errors import (
+    FORWARD_ENVELOPE_BYTES,
+    LARGE_JSON_BODY_BYTES,
+    extends_body_limit,
+)
 from pydantic import AwareDatetime, BaseModel
 from sqlalchemy import and_, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -96,6 +101,9 @@ def _as_utc(value: datetime | None) -> datetime | None:
 
 
 @router.post("/", response_model=ReservationResponse, status_code=status.HTTP_201_CREATED)
+# The /api/v1 facade and ai-orchestrator's commit build this body from one they
+# admitted, adding defaults and normalized datetimes (issue #1466).
+@extends_body_limit(lambda: FORWARD_ENVELOPE_BYTES)
 async def create_new_reservation(
     body: ReservationCreate,
     request: Request,
@@ -1005,6 +1013,8 @@ async def get_reservation_fork(
 
 
 @router.put("/{reservation_id}/fork/canvas")
+# A canvas: a large JSON body (issue #1484).
+@extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)
 async def update_reservation_fork_canvas(
     reservation_id: uuid.UUID,
     body: ForkCanvasBody,
@@ -1037,6 +1047,8 @@ async def update_reservation_fork_canvas(
 
 
 @router.post("/{reservation_id}/fork/save")
+# A canvas: a large JSON body (issue #1484).
+@extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)
 async def save_reservation_fork(
     reservation_id: uuid.UUID,
     body: ForkSaveBody,

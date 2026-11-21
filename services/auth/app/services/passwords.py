@@ -43,15 +43,42 @@ Every `verify_password` call runs exactly one bcrypt computation: against the st
 hash, at that hash's own cost, when it is usable and the password is acceptable, else
 against `DUMMY_HASH`, at cost 12, the ident and cost new hashes get. Every hash HERD
 wrote is cost 12, so a refusal costs what a check of a real account costs
-(IAM-LOGIN-2). Both functions are synchronous and CPU-bound; callers run them
-on the event loop today, as they did with passlib.
+(IAM-LOGIN-2). Both functions are synchronous and CPU-bound.
+
+Off the event loop (IAM-HASH-7). A cost-12 check holds a core for about a fifth
+of a second, and auth runs one process with one event loop, so a request path
+never calls the two functions above directly: it enters `hashing_slot()` and runs
+them through `run_hashing`, which uses a worker thread (bcrypt releases the GIL
+while it computes). The thread count is `effective_hash_threads`, never more than
+`available_cpus()` (the affinity mask, lowered to a cgroup CPU quota). Two
+limiters, both of that size, keep the work bounded:
+
+- the slot limiter admits at most that many requests to the hashing section at a
+  time. A request waits for a slot at most `HASH_WAIT_SECONDS`, and at most
+  `HASH_MAX_WAITING_PER_THREAD` requests per thread wait at once; beyond either
+  bound `hashing_slot()` raises `HashingBusyError`, which the routes answer 503
+  with `Retry-After: HASH_RETRY_AFTER_SECONDS`. A request waiting for a slot holds
+  no database connection: the routes enter the slot before their first query.
+- the worker limiter is what `run_hashing` hands `anyio.to_thread.run_sync`, so
+  bcrypt never takes a thread from anyio's shared default pool (40 threads, used
+  by every LDAP call), and never runs on more than that many threads at
+  once, slot or no slot (the startup seed calls `run_hashing` without one).
+
+The work per answer is unchanged: still exactly one bcrypt per login answer.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+import os
 import re
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import TypeVar
 
+import anyio
 import bcrypt
 
 logger = logging.getLogger(__name__)
@@ -172,3 +199,210 @@ def verify_password(password: str, stored_hash: str | None) -> bool:
             extra={"action": "password_hash_unusable", "error": type(exc).__name__},
         )
         return _refuse_after_dummy_check()
+
+
+# -- Off the event loop (IAM-HASH-7) ---------------------------------------------
+
+# How long a request waits for a hashing slot before it is answered 503, and the
+# Retry-After that answer carries. Fixed in code: the thread count is the knob.
+HASH_WAIT_SECONDS = 5.0
+HASH_RETRY_AFTER_SECONDS = 5
+# Requests that may wait for a slot at once, per hashing thread. A cost-12 check
+# takes about 0.2 s, so one thread clears about 25 in HASH_WAIT_SECONDS; a request
+# further back would time out anyway, so it is refused at once instead of being
+# held in memory for five seconds.
+HASH_MAX_WAITING_PER_THREAD = 25
+# The automatic thread count never exceeds this: auth shares its host with eleven
+# other services and Postgres.
+MAX_AUTO_HASH_THREADS = 4
+
+_T = TypeVar("_T")
+
+
+class HashingBusyError(Exception):
+    """No hashing slot came free within the wait bound (IAM-HASH-7)."""
+
+
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+PROC_SELF_CGROUP = Path("/proc/self/cgroup")
+
+
+def _read(path: Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _quota_cpus(quota: str, period: str) -> int | None:
+    """CPUs a quota of `quota` per `period` microseconds allows, rounded up; None
+    for no quota ("max", or v1's -1) or a value that does not parse."""
+    try:
+        quota_us, period_us = int(quota), int(period)
+    except ValueError:
+        return None
+    if quota_us <= 0 or period_us <= 0:
+        return None
+    return max(1, math.ceil(quota_us / period_us))
+
+
+def cgroup_cpu_limit(
+    root: Path = CGROUP_ROOT, proc_self_cgroup: Path = PROC_SELF_CGROUP
+) -> int | None:
+    """The CPU count a cgroup CPU quota allows this process, rounded up, or None
+    when no quota applies or none can be read.
+
+    cgroup v2: `cpu.max` ("<quota> <period>" or "max <period>") in this process's
+    own cgroup (the path in /proc/self/cgroup, under `root`), else at `root`
+    itself, which inside a container's cgroup namespace is the container's own.
+    cgroup v1: `cpu.cfs_quota_us` and `cpu.cfs_period_us` under `root/cpu` or
+    `root/cpu,cpuacct` (-1 is no quota). Anything absent, unreadable, or
+    malformed reads as no quota, so the caller falls back to the affinity mask.
+    """
+    candidates = []
+    own = _read(proc_self_cgroup) or ""
+    for line in own.splitlines():
+        if line.startswith("0::"):
+            relative = line[3:].strip().lstrip("/")
+            if relative:
+                candidates.append(root / relative / "cpu.max")
+    candidates.append(root / "cpu.max")
+    for path in candidates:
+        text = _read(path)
+        if text is not None:
+            parts = text.split()
+            return _quota_cpus(parts[0], parts[1]) if len(parts) == 2 else None
+    for v1 in (root / "cpu", root / "cpu,cpuacct"):
+        quota = _read(v1 / "cpu.cfs_quota_us")
+        period = _read(v1 / "cpu.cfs_period_us")
+        if quota is not None and period is not None:
+            return _quota_cpus(quota, period)
+    return None
+
+
+def available_cpus() -> int:
+    """The CPUs this process can use: its affinity mask, lowered to a cgroup CPU
+    quota rounded up when one applies (a container limited to half a CPU counts
+    as 1, to 2.5 CPUs as 3)."""
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except AttributeError:  # pragma: no cover - not Linux
+        cpus = os.cpu_count() or 1
+    quota = cgroup_cpu_limit()
+    return min(cpus, quota) if quota is not None else cpus
+
+
+def auto_hash_threads(cpus: int) -> int:
+    """The thread count when AUTH_PASSWORD_HASH_THREADS is 0: half the CPUs, at
+    least 1 and at most MAX_AUTO_HASH_THREADS."""
+    return max(1, min(MAX_AUTO_HASH_THREADS, cpus // 2))
+
+
+def effective_hash_threads(configured: int, cpus: int) -> int:
+    """`configured` when it is positive, else the automatic count; never more
+    than `cpus`.
+
+    A configured count above the CPUs auth can use is lowered to that count
+    with a WARNING: more bcrypt threads than CPUs adds no throughput, and the
+    threads then crowd the event loop off the CPU (16 threads on one core held
+    a cheap route at over a second).
+    """
+    if configured <= 0:
+        return auto_hash_threads(cpus)
+    if configured > cpus:
+        logger.warning(
+            "AUTH_PASSWORD_HASH_THREADS=%d is more than the %d CPUs auth can use; using %d",
+            configured,
+            cpus,
+            cpus,
+            extra={
+                "action": "password_hash_threads_lowered",
+                "configured": configured,
+                "cpus": cpus,
+            },
+        )
+        return cpus
+    return configured
+
+
+class HashingPool:
+    """The slot and worker limiters, sized once (see the module docstring)."""
+
+    def __init__(
+        self,
+        threads: int,
+        *,
+        wait_seconds: float = HASH_WAIT_SECONDS,
+        max_waiting: int | None = None,
+    ) -> None:
+        if threads < 1:
+            raise ValueError("a hashing pool needs at least one thread")
+        self.threads = threads
+        self.wait_seconds = wait_seconds
+        self.max_waiting = (
+            threads * HASH_MAX_WAITING_PER_THREAD if max_waiting is None else max_waiting
+        )
+        self._slots = anyio.CapacityLimiter(threads)
+        self._workers = anyio.CapacityLimiter(threads)
+
+    @asynccontextmanager
+    async def slot(self) -> AsyncIterator[None]:
+        if self._slots.statistics().tasks_waiting >= self.max_waiting:
+            raise HashingBusyError
+        borrower = object()
+        acquired = False
+        with anyio.move_on_after(self.wait_seconds):
+            await self._slots.acquire_on_behalf_of(borrower)
+            acquired = True
+        if not acquired:
+            raise HashingBusyError
+        try:
+            yield
+        finally:
+            self._slots.release_on_behalf_of(borrower)
+
+    async def run(self, func: Callable[..., _T], *args: object) -> _T:
+        return await anyio.to_thread.run_sync(func, *args, limiter=self._workers)
+
+    def busy_slots(self) -> int:
+        return int(self._slots.borrowed_tokens)
+
+    def busy_threads(self) -> int:
+        return int(self._workers.borrowed_tokens)
+
+
+_pool: HashingPool | None = None
+
+
+def hashing_pool() -> HashingPool:
+    """The process's pool, built on first use from AUTH_PASSWORD_HASH_THREADS."""
+    global _pool
+    if _pool is None:
+        from app.config import settings
+
+        _pool = HashingPool(
+            effective_hash_threads(settings.auth_password_hash_threads, available_cpus())
+        )
+        logger.info(
+            "Password hashing runs on %d worker threads",
+            _pool.threads,
+            extra={"action": "password_hash_threads", "threads": _pool.threads},
+        )
+    return _pool
+
+
+def set_hashing_pool(pool: HashingPool | None) -> None:
+    """Replace the process's pool (tests); None rebuilds it from settings on next use."""
+    global _pool
+    _pool = pool
+
+
+def hashing_slot():
+    """`async with hashing_slot():` around a request's hashing section; raises
+    HashingBusyError when no slot comes free in time (IAM-HASH-7)."""
+    return hashing_pool().slot()
+
+
+async def run_hashing(func: Callable[..., _T], *args: object) -> _T:
+    """`func(*args)` on one of the pool's worker threads, never on the event loop."""
+    return await hashing_pool().run(func, *args)

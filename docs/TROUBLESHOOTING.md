@@ -21,6 +21,30 @@ The config service runs as a non-root user since issue #1326, and the `herd-conf
 
 The config service could not get an answer from the `restarter` container. Check it is up and healthy with `docker compose ps restarter` and read `docker compose logs restarter`. A stack upgraded with `make restart` instead of `make up` or `make prod` has no restarter yet (and still runs the old config image): run `make up` (`make prod` on a production host). `A restart is already in progress` means another Save and Restart is still running; wait for its result.
 
+### Sign-in says `Too many sign-in attempts`, or a script gets `429 Too many attempts; try again later`
+
+Auth counts every password attempt, successful or not, against the source address it
+comes from: a login in any mode, and a registration without an admin's access token
+(IAM-LOGIN-7). Each address may make `AUTH_LOGIN_MAX_ATTEMPTS` attempts at once (default
+60), refilling evenly over `AUTH_LOGIN_WINDOW_SECONDS` (default 60, so one a second).
+Past that the answer is HTTP 429 with a `Retry-After` header in seconds, before the
+password is checked, and the login page shows `Too many sign-in attempts. Try again in N
+seconds.` The limit is per address, never per account, so it does not mean the account
+is locked and it says nothing about the password: wait the stated seconds and sign in
+again. Everyone behind one NAT, VPN, or proxy shares one address and one allowance;
+`docker compose logs auth` shows one WARNING with action `auth_login_limited` and the
+address when an address starts being refused. If that address is a whole office,
+raise the two settings in `.env` and recreate auth (`docker compose up -d auth`); if it
+is one client, look for a script or a client stuck retrying. A test or seed script that
+signs in or registers in a burst meets the same limit from the test host: reuse one
+token, space the logins, or register through an admin's token as `make seed` does.
+Restarting auth clears every count.
+
+A `503 Too many password checks in progress; try again shortly` (the login page:
+`Could not reach HERD. Try again in a moment.`) is different: auth's bcrypt threads
+were all busy for 5 seconds (IAM-HASH-7). See the auth entry under Scaling and sizing
+in [OPERATIONS.md](OPERATIONS.md#scaling-and-sizing).
+
 ### The config page says `Too many failed login attempts`
 
 The config login limits failed attempts. A waiting login is answered HTTP 429 `Too many
@@ -73,6 +97,16 @@ The stack was upgraded in place and the new release added a column that a startu
 
 Since issue #1261 auth's own startup seed reads only ids, so `column users.<name> does not exist` from the superadmin or "Not Grouped" seed no longer happens; the remedy above still applies to any other startup read.
 
+### No superadmin account after the first boot
+
+Auth creates the superadmin from `SUPERADMIN_EMAIL`, `SUPERADMIN_USERNAME`, and `SUPERADMIN_PASSWORD` at startup, only while no superadmin exists (IAM-BOOT-1). Read `docker compose logs auth` for one of three causes:
+
+- `SUPERADMIN_PASSWORD breaks a registration password rule: <rule>. The superadmin account was not created; set a value that registration accepts and recreate auth.` (one ERROR, issue #1450). The password is held to the rules `POST /register` applies, so the value you set is one `POST /login` takes: 8 to 72 characters after surrounding white space is trimmed (characters, not bytes, so 72 accented letters are fine), with no NUL character. A value with an embedded newline is accepted too, but no browser password field can take it, so avoid one. `<rule>` names the rule broken (`Password must be at least 8 characters`, `Password must be at most 72 characters`, `Password must not contain a NUL character`, or `Password must be encodable as UTF-8`; `Password must be one registration accepts` appears only if registration gains a rule this list does not know); the value itself is never logged. Set a value that fits in `.env` and recreate auth (`docker compose up -d auth`; `docker compose restart auth` keeps the old environment and logs the same ERROR); if a configuration was ever saved on the config page, set it there instead, since `config.json` outranks `.env`. Auth keeps running meanwhile, and the seed tries again at every start until the account exists.
+- `SUPERADMIN_EMAIL '<email>' is already registered as a regular user. Superadmin was not created.` (a WARNING): choose another email for the superadmin.
+- Nothing about the seed at all: one of the three values is empty (or only white space), so the seed was skipped by design.
+
+Once a superadmin exists the three values are never read again, so changing them later, or leaving a value the rules would refuse, has no effect and logs nothing.
+
 ### `make up` refuses to start, or the page hangs after `make up` following `make everything`
 
 A successful `make everything` leaves its seeded gate stack (compose project `<dir>-gate`, for example `herd-public-gate`) serving `https://localhost` (or the `HERD_GATEWAY_BIND` address, issue #1256) on host ports 80 and 443. The dev stack publishes the same ports, so the two cannot run together. `make up`, `make dev`, and `make prod` therefore refuse to start while another compose project publishes host port 80 or 443, with a message such as:
@@ -106,6 +140,15 @@ Either:
 - The `AUTH_SECRET_KEY` changed after tokens were issued. Access tokens signed with the old key are refused everywhere, but refresh tokens do not depend on the key, so the client's silent refresh normally recovers on its own; a user needs to log in again only when the refresh fails too. See [SECURITY.md](../SECURITY.md) for ending sessions after a rotation.
 - Clock skew between the auth service (which signs the token) and another backend service (which verifies it) is more than 10 seconds: every service accepts a token up to 10 seconds past its expiry and refuses one issued more than 10 seconds in its future.
 - The bearer token expired (30 min default). The auth client refreshes it automatically, and every open tab shares the refreshed session (issue #1316); when the refresh itself is refused, the client signs the user out and the sign-in page returns them, with the same account, to the page that needed it.
+
+### A request answers `413` with `body_too_large`
+
+The body was larger than the route accepts (issues #1466, #1484): `{"detail": [{"type": "body_too_large", "loc": ["body"], "msg": "Request body is larger than <limit> bytes"}]}`. Every service, config included, refuses a body over `MAX_REQUEST_BODY_BYTES` (256 KiB by default; 4 MiB before #1484) before it parses it or checks the caller's token, so a client gets this 413 even without credentials. Each refusal logs one INFO line in the service that refused it, with `action` `request_body_too_large`, the limit, and `declared` (the `Content-Length` said so) or `received` (the bytes passed the limit); the log never holds any of the body. The service keeps the connection open and discards the rest of the body, so the client sees the 413 even while it is still sending, and its next request can use the same connection.
+
+- A route that takes a large JSON body (a topology or template canvas save, a reservation's fork canvas or fork save, an AI commit, a device configuration version, a bulk connection create, and the execution and cabling routes those are forwarded to) accepts the default plus 4 MiB, so the number in the message is larger; that holds a canvas of about 1,880 devices with four links each, as the editor saves it. Raise `MAX_REQUEST_BODY_BYTES` in `.env` and recreate every service (`make up`, or `docker compose up -d` for each): every marked route rises by as much, and since a canvas passes through reservations and cabling, the smallest limit on the path wins.
+- Any other route (a device or template create, a secret, preferences, and every route a caller reaches without a token): its limit is the default. A client that sent more than 256 KiB to such a route before #1484 now gets this 413; raise `MAX_REQUEST_BODY_BYTES` on every service together if the body is legitimate, and report the route, since a route that legitimately takes more belongs in the large-JSON table. An operator who set `MAX_REQUEST_BODY_BYTES=4194304` explicitly keeps 4 MiB on every route, gaining nothing, and the large-JSON routes then take 8 MiB and the routes they forward to 8.25 MiB; remove an explicit 4194304 to take the new default.
+- A body near a route's bound, sent pretty-printed: the bounds are measured as compact JSON. A `POST /pathfind/batch` of its 2,000 pairs is 236011 bytes compact but 288019 indented by two spaces, over the default; send compact JSON (what `JSON.stringify` and httpx write).
+- An upload (a driver package, a bulk import file, AI generate files, the package validator): its limit is the default plus the files the route accepts, so the number in the message is larger. Raise the route's own setting (`DRIVER_MAX_SIZE_BYTES`, `UPLOAD_MAX_FILES` and `UPLOAD_MAX_FILE_BYTES`, `VALIDATE_PACKAGE_MAX_BYTES`); the bulk imports' 10 MiB file bound is fixed in code. The table is in [docs/specs/operations-and-observability.md](specs/operations-and-observability.md) (OPS-VALID-10).
 
 ### One local account always gets `Invalid credentials` after an upgrade (bcrypt cost above 14)
 

@@ -99,13 +99,10 @@ def retryable_reason(model):
     return or_(col.is_(None), col == "", starts_with_none)
 
 
-def frozen_build(model):
-    """SQL for "a BUILD-direction row whose reservation's wiring is frozen".
-
-    The freeze is direction-scoped (issue #369): a release-direction row is never a
-    frozen build, whatever its reservation's state. No state row means not frozen.
-    """
-    frozen_state = (
+def reservation_frozen(model):
+    """SQL for "this row's reservation's wiring is frozen": a correlated EXISTS over
+    `reservation_wiring_state`. No state row means not frozen."""
+    return (
         select(literal(1))
         .where(
             ReservationWiringState.reservation_id == model.reservation_id,
@@ -113,7 +110,15 @@ def frozen_build(model):
         )
         .exists()
     )
-    return and_(model.intended != "RELEASED", frozen_state)
+
+
+def frozen_build(model):
+    """SQL for "a BUILD-direction row whose reservation's wiring is frozen".
+
+    The freeze is direction-scoped (issue #369): a release-direction row is never a
+    frozen build, whatever its reservation's state. No state row means not frozen.
+    """
+    return and_(model.intended != "RELEASED", reservation_frozen(model))
 
 
 def tick_would_drive(model):

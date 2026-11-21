@@ -37,7 +37,7 @@ AUTH_REFRESH_TOKEN_EXPIRE_DAYS=7
 
 SUPERADMIN_EMAIL=admin@example.com
 SUPERADMIN_USERNAME=admin
-SUPERADMIN_PASSWORD=<choose a strong password, min 8 chars>
+SUPERADMIN_PASSWORD=<choose a strong password, 8 to 72 characters>
 
 INVENTORY_SERVICE_URL=http://inventory:8000
 AUTH_SERVICE_URL=http://auth:8000
@@ -52,7 +52,7 @@ NATS_URL=nats://nats:4222
 ```
 
 The `AUTH_SECRET_KEY` and `INTERNAL_API_TOKEN` should be unique random strings. Every backend service except config refuses to start while `AUTH_SECRET_KEY` is blank, still a `<...>` placeholder, or not usable as an HMAC key (a PEM block or ssh key, a truncated or lone `-----BEGIN` line included, or a JSON Web Key), and `AUTH_ALGORITHM` must be `HS256`, `HS384`, or `HS512`.
-The superadmin account is created on first startup only; these values are ignored on subsequent restarts.
+The superadmin account is created on first startup only; these values are ignored on subsequent restarts. `SUPERADMIN_PASSWORD` must pass the registration password rules (8 to 72 characters, no NUL character); a value that breaks one creates no account, and `docker compose logs auth` shows one ERROR naming the rule (see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#no-superadmin-account-after-the-first-boot)).
 
 By default Traefik publishes the gateway (ports 80 and 443) on every IPv4 interface, so the stack answers at `https://localhost` and at each address the host has. To serve it on one address only, for example the wired NIC of a host that also has wifi, add `HERD_GATEWAY_BIND=<that address>` to `.env` (issue #1256; `.env.example` carries a commented example). `localhost` and every other interface are then refused, and the Makefile's seed, test, and gate targets address the stack at `https://<that address>` instead of `https://localhost`; `make gateway-url` prints the URL it derived. `make certs` (step 3) names that address in the gateway's certificate, so a browser there stops warning once the certificate is trusted.
 

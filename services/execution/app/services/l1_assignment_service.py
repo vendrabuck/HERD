@@ -19,7 +19,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
 from app.services._uuid_utils import as_uuid as _as_uuid
-from app.services.wiring_claim import unclaimed
+from app.services.wiring_claim import (
+    WiringRowClaims,
+    claim_write_clauses,
+    direction_guarded_values,
+    unclaimed,
+)
 from app.services.wiring_due import tick_would_drive
 
 logger = logging.getLogger(__name__)
@@ -674,13 +679,30 @@ async def _record_l1_failed_for_row(
     last_error: str,
     physical_connection_id: uuid.UUID | str | None,
     intended: str,
+    claims: WiringRowClaims | None,
 ) -> L1ConnectionAssignment | None:
     """The row-identity compare-and-swap behind record_l1_failed's `row_id` path.
 
     See record_l1_failed's docstring for why the retry channels write by row id
-    (issue #814). One atomic `UPDATE ... WHERE id AND status`, no insert branch:
-    rowcount zero means a concurrent writer moved the row and this failure is stale
-    information about a row that no longer exists in the state it was loaded in.
+    (issue #814). One atomic `UPDATE ... WHERE id AND status`, plus the claim clause
+    of wiring_claim.claim_write_clauses (issue #1479), no insert branch:
+    rowcount zero means a concurrent writer moved the row or another pass holds its
+    drive claim, so this failure is not written and the row joins `claims.lost`.
+
+    Issue #1496: on a row this pass does not hold (`claims` None, or the row not in
+    `claims.held`), every value is written only where
+    `wiring_claim.direction_admits(model, intended)` holds, in the same UPDATE: the
+    row still intends the direction this failure records, or the failure is a release
+    and the reservation is frozen. Such a write runs before any per-row claim (a
+    switch read, template read, driver load, or login failure, an L2 create_vlan or
+    re-allocation failure, or an L3 drive-gate refusal), so the row may have been
+    parked since the pass planned it. The value CASE (`direction_guarded_values`) and
+    `RETURNING intended` tell an admitted write from a refused one; a refused write is
+    rolled back, which is what leaves every value as it was, returns None, and adds the
+    row to `claims.wrong_direction`. A row this pass holds takes no compare: its claim
+    compared the direction already. Known gap: with `claims` None a refused write is
+    recorded nowhere and logs nothing (no retry caller passes `row_id` without
+    `claims` today).
     """
     values: dict = {
         "status": "FAILED",
@@ -690,19 +712,34 @@ async def _record_l1_failed_for_row(
         # The drive this failure records is over, so release the claim (issue #817).
         "claimed_until": None,
     }
+    if claims is None or row_id not in claims.held:
+        values = direction_guarded_values(L1ConnectionAssignment, values, intended)
     result = await db.execute(
         update(L1ConnectionAssignment)
         .where(
             L1ConnectionAssignment.id == row_id,
             L1ConnectionAssignment.status == expected_status,
+            *claim_write_clauses(L1ConnectionAssignment, row_id, claims),
         )
         .values(**values)
+        .returning(L1ConnectionAssignment.intended)
     )
-    if result.rowcount == 0:
+    found = result.first()
+    if found is not None and found[0] != intended:
+        # The direction is not admitted (issue #1496): every value was written back
+        # as it was.
         await db.rollback()
+        if claims is not None:
+            claims.refuse_wrong_direction(L1ConnectionAssignment, row_id, intended)
+        return None
+    if found is None:
+        await db.rollback()
+        if claims is not None:
+            claims.lost.add(row_id)
         logger.warning(
             "Ignoring stale L1 %s failure for switch %s pair (%s, %s), reservation %s: "
-            "row %s is no longer %s (a concurrent writer won)",
+            "row %s is no longer %s or another pass holds its drive claim "
+            "(a concurrent writer won)",
             "build" if intended == "ACTIVE" else "release",
             switch_uuid,
             ca,
@@ -740,6 +777,7 @@ async def record_l1_failed(
     intended: str,
     row_id: uuid.UUID | None = None,
     expected_status: str = "FAILED",
+    claims: WiringRowClaims | None = None,
 ) -> L1ConnectionAssignment | None:
     """Write (or update) a FAILED row for a cross-connect that could not be applied.
 
@@ -774,6 +812,15 @@ async def record_l1_failed(
     of the bug; this path shares the upsert, so it shares the fix). The fresh-build
     path passes no `row_id` and keeps the upsert: a build after a release is a
     legitimate re-add.
+
+    `claims` (issue #1479) is the calling retry pass's claim ledger, and it only
+    matters on the `row_id` path. The compare-and-swap also requires that the row be
+    one this pass still holds (its `claimed_until` equals the stamp in `claims.held`)
+    or one nobody holds (wiring_claim.claim_write_clauses), so neither a pass that
+    loaded the row before another pass claimed it nor a holder whose claim expired and
+    was taken over can rewrite the row under the current holder's drive. A refused
+    write changes nothing on the row, returns None, and adds the row to `claims.lost`.
+    The key-based upsert ignores `claims`.
     """
     res_uuid = _as_uuid(reservation_id)
     switch_uuid = _as_uuid(switch_device_id)
@@ -792,6 +839,7 @@ async def record_l1_failed(
             last_error=last_error,
             physical_connection_id=physical_connection_id,
             intended=intended,
+            claims=claims,
         )
 
     result = await db.execute(

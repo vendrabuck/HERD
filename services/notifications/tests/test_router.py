@@ -700,3 +700,32 @@ async def test_put_preferences_returns_503_on_upstream_4xx(user_client):
             "/notifications/preferences", json={"events": {"reservation.completed": False}}
         )
     assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_put_preferences_relays_a_user_profile_413_as_413(user_client):
+    """Issue #1466: user-profile refusing the merged preferences for their size is the
+    client's error, not user-profile being down: the answer is 413, never 503."""
+    from app.routers.notifications import PREFERENCES_TOO_LARGE_DETAIL
+
+    get_resp = AsyncMock()
+    get_resp.status_code = 200
+    get_resp.json = lambda: _prefs_upstream({"channels": {"in_app": True}, "events": {}})
+    refused = AsyncMock()
+    refused.status_code = 413
+
+    async def _get(*args, **kwargs):
+        return get_resp
+
+    async def _patch(url, **kwargs):
+        return refused
+
+    with patch("app.routers.notifications.httpx.AsyncClient") as MockClient:
+        inst = MockClient.return_value.__aenter__.return_value
+        inst.get = _get
+        inst.patch = _patch
+        resp = await user_client.put(
+            "/notifications/preferences", json={"events": {"reservation.completed": False}}
+        )
+    assert resp.status_code == 413
+    assert resp.json() == {"detail": PREFERENCES_TOO_LARGE_DETAIL}

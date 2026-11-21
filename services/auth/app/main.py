@@ -31,6 +31,7 @@ from app.routers.internal import router as internal_router
 from app.routers.ldap_sync import router as ldap_sync_router
 from app.routers.oidc import router as oidc_router
 from app.routers.tokens import router as tokens_router
+from app.schemas.auth import registration_refusal_code
 from app.services.ldap_service import log_ldap_startup_problems
 from app.tasks.ldap_sync_loop import (
     effective_interval_seconds,
@@ -41,12 +42,39 @@ from app.tasks.ldap_sync_loop import (
 setup_logging("auth", level=settings.log_level)
 logger = logging.getLogger(__name__)
 
+# The one ERROR the seed logs when SUPERADMIN_PASSWORD breaks a registration
+# password rule (issue #1450, IAM-BOOT-3). The argument is the rule's fixed text
+# from SEED_REFUSED_RULE_TEXT, never the value.
+SEED_VALUE_REFUSED_LOG = (
+    "SUPERADMIN_PASSWORD breaks a registration password rule: %s. "
+    "The superadmin account was not created; set a value that registration "
+    "accepts and recreate auth."
+)
+# The text logged for each code registration_refusal_code answers. Plain
+# literals by design: a text built from a constant whose name is about passwords
+# reads as a logged password to CodeQL (py/clear-text-logging-sensitive-data).
+# tests/test_main.py pins them to the registration bounds and to
+# validate_password's messages, and requires a text for every code.
+SEED_REFUSED_RULE_TEXT = {
+    "too_short": "Password must be at least 8 characters",
+    "too_long": "Password must be at most 72 characters",
+    "nul": "Password must not contain a NUL character",
+    "not_utf8": "Password must be encodable as UTF-8",
+    "other": "Password must be one registration accepts",
+}
+
 
 async def _seed_superadmin() -> None:
     """
     Create the superadmin account on first startup if the three SUPERADMIN_*
     environment variables are all set and no superadmin already exists.
     This runs exactly once; subsequent startups are a no-op.
+
+    The password is held to registration's rules (issue #1450), so the value
+    the operator configured is one `POST /login` takes. The check runs only
+    when an account would be created: a stack that already has its superadmin
+    never judges the value and never logs about it. A refused value logs
+    SEED_VALUE_REFUSED_LOG once, creates nothing, and startup continues.
 
     Its two existence checks read ids only (issue #1261): this runs before
     `make migrate` can, so a release that adds a column to users must not
@@ -76,6 +104,16 @@ async def _seed_superadmin() -> None:
                 "SUPERADMIN_EMAIL '%s' is already registered as a regular user. "
                 "Superadmin was not created.",
                 email,
+            )
+            return
+
+        refusal_code = registration_refusal_code(password)
+        if refusal_code is not None:
+            rule_text = SEED_REFUSED_RULE_TEXT[refusal_code]
+            logger.error(
+                SEED_VALUE_REFUSED_LOG,
+                rule_text,
+                extra={"action": "superadmin_seed_refused"},
             )
             return
 
@@ -158,7 +196,9 @@ app.add_middleware(RequestLoggingMiddleware)
 # Every 422 is `{type, loc, msg}`: no `input` or `ctx`, so no submitted password,
 # and it always encodes (issue #1426). `msg` and `loc` can still quote part of an
 # email, a UUID, or a key name (see app/validation_errors.py).
-install_validation_errors(app)
+# Every request body is bounded at MAX_REQUEST_BODY_BYTES (a 413 before it is read
+# past the limit, before authentication; upload routes add their own bound).
+install_validation_errors(app, max_body_bytes=settings.max_request_body_bytes)
 
 app.include_router(auth_router)
 app.include_router(admin_router)

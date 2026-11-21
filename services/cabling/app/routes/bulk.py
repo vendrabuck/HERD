@@ -26,6 +26,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, File, Header, Query, UploadFile
 from fastapi.responses import Response
+from herd_common.validation_errors import extends_body_limit
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,6 +42,12 @@ from app.services.bulk_service import (
 )
 
 router = APIRouter(prefix="/topologies", tags=["topology-bulk"])
+
+# The import file bound for the request body limit (issue #1466). The import route
+# reads the whole upload with no bound of its own (as inventory's do, issue #1417),
+# so this is the only bound on the file: a body may hold it plus
+# MAX_REQUEST_BODY_BYTES.
+IMPORT_UPLOAD_BYTES = 10 * 1024 * 1024
 
 
 @router.get("/export")
@@ -70,6 +77,7 @@ async def export_topologies(
 
 
 @router.post("/import", response_model=BulkImportReport)
+@extends_body_limit(lambda: IMPORT_UPLOAD_BYTES)
 async def import_topologies_endpoint(
     file: UploadFile = File(...),
     format: str = Query("json", pattern="^(csv|json)$"),

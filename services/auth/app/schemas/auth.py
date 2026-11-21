@@ -2,13 +2,25 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    StringConstraints,
+    ValidationError,
+    field_validator,
+)
 from pydantic_core import PydanticCustomError
 
 from app.config import AuthMethod, settings
 from app.models.user import Role
 from app.schemas.pagination import Paginated
-from app.services.passwords import validate_password
+from app.services.passwords import (
+    PASSWORD_NOT_UTF8_MESSAGE,
+    PASSWORD_NUL_MESSAGE,
+    validate_password,
+)
 
 # Password bounds in characters (issue #1404, IAM-REG-2, IAM-LOGIN-3). A
 # password checked against a bcrypt hash (registration, local login, the OIDC
@@ -16,6 +28,7 @@ from app.services.passwords import validate_password
 # mode the password goes to the directory in a bind and never reaches bcrypt,
 # so the login bound is only a ceiling on the request: 1024 characters, which
 # are at most 4096 UTF-8 bytes (MAX_PASSWORD_BYTES in passwords.py).
+PASSWORD_MIN_LENGTH = 8
 PASSWORD_MAX_LENGTH = 72
 LDAP_LOGIN_PASSWORD_MAX_LENGTH = 1024
 
@@ -48,7 +61,7 @@ def _blank_to_none(value: Any) -> Any:
 class RegisterRequest(BaseModel):
     email: EmailStr
     username: str = Field(min_length=3, max_length=32, pattern=r"^[a-zA-Z0-9_-]+$")
-    password: str = Field(min_length=8, max_length=PASSWORD_MAX_LENGTH)
+    password: str = Field(min_length=PASSWORD_MIN_LENGTH, max_length=PASSWORD_MAX_LENGTH)
     # Optional display name (issue #1252): omitted or null stores the username.
     full_name: FullName | None = None
 
@@ -56,6 +69,53 @@ class RegisterRequest(BaseModel):
     # answers 422, not a 500 from create_user (issue #1426). LoginRequest has no
     # such check by decision: a NUL at login is the 401 of IAM-HASH-3.
     _password_is_hashable = field_validator("password")(validate_password)
+
+
+# The codes registration_refusal_code answers (issue #1450), one per rule. Each
+# is a plain literal at its return site, chosen only by comparisons, so no value
+# a code carries comes from a name about passwords; the startup seed maps a code
+# to its log text (SEED_REFUSED_RULE_TEXT in app/main.py). "other" is the
+# fallback for a refusal this function does not know: no input reaches it
+# today, and it appears only if the password field gains a rule not listed here.
+REGISTRATION_REFUSAL_CODES = ("too_short", "too_long", "nul", "not_utf8", "other")
+
+
+def registration_refusal_code(candidate: str) -> str | None:
+    """None when RegisterRequest's password field takes `candidate`, else the code
+    of the rule it breaks, one of REGISTRATION_REFUSAL_CODES (issue #1450).
+
+    What is judged is exactly the password field's own constraints (8 to 72
+    characters) and its field validators (`validate_password`), run through
+    RegisterRequest's validator on that one field. A model-level validator is
+    not run (the instance is empty); RegisterRequest has none, and
+    tests/test_main.py fails if one is added, since the seed judge must then be
+    revisited.
+
+    Which validate_password refusals can arrive here: the NUL one fires today.
+    A lone surrogate is refused by pydantic's own `string_unicode` check first;
+    the UTF-8 comparison below is the backstop should pydantic stop doing so.
+    Its other two refusals cannot fire: the length bound runs first (72
+    characters are at most 288 bytes, under 4096), and the value is always a str.
+    """
+    try:
+        RegisterRequest.__pydantic_validator__.validate_assignment(
+            RegisterRequest.model_construct(), "password", candidate
+        )
+    except ValidationError as exc:
+        error = exc.errors(include_url=False, include_input=False)[0]
+        if error["type"] == "string_too_short":
+            return "too_short"
+        if error["type"] == "string_too_long":
+            return "too_long"
+        if error["type"] == "string_unicode":
+            return "not_utf8"
+        reason = str(error.get("ctx", {}).get("error", ""))
+        if reason == PASSWORD_NUL_MESSAGE:
+            return "nul"
+        if reason == PASSWORD_NOT_UTF8_MESSAGE:
+            return "not_utf8"
+        return "other"
+    return None
 
 
 def login_password_max_length(auth_method: AuthMethod) -> int:

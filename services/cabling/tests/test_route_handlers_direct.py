@@ -2842,3 +2842,88 @@ async def test_prune_fork_devices_scrubs_draft_only_device_without_a_version():
         node_ids = {n["id"] for n in fork_row.canvas_data["nodes"]}
         assert node_ids == {"nA"}
         assert fork_row.canvas_data["edges"] == []
+
+
+# --- the resolve-by-name batches (issue #1466) -------------------------------------
+
+
+def test_device_resolver_batches_stay_under_the_batch_bytes():
+    """An import may name more devices than one body to inventory should hold: the
+    names go in batches whose encoded body is at most RESOLVE_BATCH_BYTES, half the
+    smallest request body limit a service accepts, whatever the names hold."""
+    import json
+
+    from app.services import device_resolver
+
+    names = [f"device-{i:06d}-" + "é" * 200 for i in range(2_000)]
+    names += ["\x01" * 255, '"' * 255]  # the escapes that grow most when encoded
+    batches = device_resolver.name_batches(names)
+    assert sorted(n for batch in batches for n in batch) == sorted(set(names))
+    for batch in batches:
+        body = json.dumps({"names": batch}, ensure_ascii=False, separators=(",", ":"))
+        assert len(body.encode("utf-8")) <= device_resolver.RESOLVE_BATCH_BYTES
+    assert device_resolver.RESOLVE_BATCH_BYTES * 2 <= 64 * 1024
+
+
+def test_device_resolver_drops_a_name_no_device_can_have():
+    from app.services import device_resolver
+
+    too_long = "x" * (device_resolver.DEVICE_NAME_MAX_LENGTH + 1)
+    assert device_resolver.name_batches([too_long, "", "a"]) == [["a"]]
+
+
+@pytest.mark.asyncio
+async def test_device_resolver_sends_every_batch_and_merges_the_answers():
+    from app.services import device_resolver
+
+    names = [f"n{i:05d}-" + "y" * 240 for i in range(300)]
+    assert len(device_resolver.name_batches(names)) > 1
+    factory, client, _ = _mock_httpx_client(json_data={"resolved": {}})
+
+    def answer(i: int, batch: list[str]) -> MagicMock:
+        response = MagicMock()
+        response.json = MagicMock(return_value={"resolved": {batch[0]: str(i)}})
+        response.raise_for_status = MagicMock()
+        return response
+
+    answers = iter(answer(i, batch) for i, batch in enumerate(device_resolver.name_batches(names)))
+    client.post.side_effect = lambda *a, **k: next(answers)
+    with patch.object(device_resolver.httpx, "AsyncClient", factory):
+        result = await device_resolver.resolve_device_names(names)
+    batches = device_resolver.name_batches(names)
+    assert client.post.await_count == len(batches)
+    assert result == {batch[0]: str(i) for i, batch in enumerate(batches)}
+
+
+def _names_measuring(total: int) -> list[str]:
+    """Unique ASCII names whose counted size (each name's encoded length plus a comma,
+    plus the envelope) is exactly `total`."""
+    from app.services import device_resolver
+
+    left = total - device_resolver._ENVELOPE_BYTES
+    names = []
+    while left > 0:
+        length = min(200, left - 3)
+        names.append(f"{len(names):04d}" + "n" * (length - 4))
+        left -= length + 3
+    assert left == 0
+    return names
+
+
+@pytest.mark.parametrize(
+    ("over", "batches"), [(0, 1), (1, 2)], ids=["exactly_the_bytes", "one_byte_over"]
+)
+def test_device_resolver_batch_edge_is_exact(over, batches):
+    """A set that counts exactly RESOLVE_BATCH_BYTES is one batch; one byte more
+    splits it. The count includes a comma after every name, so a body is at most the
+    budget less one byte."""
+    import json
+
+    from app.services import device_resolver
+
+    names = _names_measuring(device_resolver.RESOLVE_BATCH_BYTES + over)
+    found = device_resolver.name_batches(names)
+    assert len(found) == batches
+    for batch in found:
+        body = json.dumps({"names": batch}, ensure_ascii=False, separators=(",", ":"))
+        assert len(body.encode("utf-8")) <= device_resolver.RESOLVE_BATCH_BYTES - 1

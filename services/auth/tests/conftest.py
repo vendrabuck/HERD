@@ -30,10 +30,27 @@ from app.database import Base, get_db
 from app.dependencies.auth import get_current_user
 from app.main import app
 from app.models.user import User
-from app.services import ldap_sync_service
+from app.services import ldap_sync_service, login_limits, passwords
 from httpx import ASGITransport, AsyncClient
 
 from tests._harness import engine, override_get_db
+
+
+@pytest.fixture(autouse=True)
+def fresh_login_limits():
+    """A fresh per-source attempt limiter and hashing pool for every test.
+
+    Every test client reaches auth from the same address, so one process-wide
+    allowance (IAM-LOGIN-7) shared by the whole suite would turn the suite's own
+    logins into 429s; and a pool left holding a slot by a failed test must not
+    starve the next one (IAM-HASH-7). Tests of the limits themselves install
+    their own.
+    """
+    login_limits.reset_for_tests()
+    passwords.set_hashing_pool(None)
+    yield
+    login_limits.reset_for_tests()
+    passwords.set_hashing_pool(None)
 
 
 @pytest.fixture

@@ -374,7 +374,11 @@ CONFIG_SCHEMA = [
         "required": False,
         "group": "Superadmin",
         "secret": True,
-        "description": "Password for the initial superadmin account",
+        "description": (
+            "Password for the initial superadmin account. It must pass the registration "
+            "rules (8 to 72 characters, no NUL character); a value outside them creates "
+            "no account"
+        ),
     },
     # Security
     {

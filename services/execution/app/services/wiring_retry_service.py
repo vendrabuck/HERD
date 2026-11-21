@@ -146,7 +146,7 @@ from app.services.route_service import (
     failed_route_assignments_for_reservation,
     park_stale_route_build,
 )
-from app.services.wiring_claim import WiringRowClaims, claimable_row_ids
+from app.services.wiring_claim import WiringRowClaims, claimable_row_ids, write_guard
 from app.services.wiring_due import count_tick_excluded
 
 logger = logging.getLogger(__name__)
@@ -384,6 +384,13 @@ async def _reattempt_rows(
     which claims each row immediately before its own driver call. A row the OTHER
     channel claimed first is not driven at all and reads back "in_progress", not
     "still_failed": nothing failed, another channel is mid-drive on it.
+
+    Direction (issue #1496): the claim also requires the row to still intend the
+    direction this pass planned for it. A build row another pass parked (intended
+    RELEASED) after this pass revalidated it, or a release row whose intent became
+    ACTIVE, is not driven, is left exactly as it is, and reads back by its status,
+    "still_failed" while FAILED: it is work for the next pass in its true direction,
+    not another channel's work in flight.
     """
     from app.services.nats_consumer import (
         WIRING_STALE_BUILD_REASON,
@@ -406,11 +413,17 @@ async def _reattempt_rows(
     # Supersession guard (shared by both channels): a release whose port a newer build
     # on another reservation already reclaimed needs no driver call. Flip it RELEASED
     # up front and keep its id so the read-back reports "superseded", not "released".
+    # Issue #1479: the settle is a write on a row this pass never claimed, so it runs
+    # only on a row nobody holds (write_guard); a row another pass holds joins
+    # claims.lost, is not driven here, and reads back in_progress.
     superseded_ids: set[uuid.UUID] = set()
     async with get_db_session() as db:
         for row in rows:
-            if row.intended == "RELEASED" and await supersede_release_if_reclaimed(db, row):
-                superseded_ids.add(row.id)
+            if row.intended != "RELEASED":
+                continue
+            async with write_guard(db, L1ConnectionAssignment, row.id, claims) as writable:
+                if writable and await supersede_release_if_reclaimed(db, row):
+                    superseded_ids.add(row.id)
 
     # reservation -> switch -> [(port_a, port_b, physical_connection_id)] for the
     # release direction; build-direction rows are kept whole per reservation so the
@@ -425,7 +438,7 @@ async def _reattempt_rows(
     # the same (switch, pair): the ACTIVE-only partial-unique index does not stop them.
     retry_ids_by_res: dict[str, dict[tuple[str, str, str], uuid.UUID]] = {}
     for row in rows:
-        if row.id in superseded_ids:
+        if row.id in superseded_ids or row.id in claims.lost:
             continue
         res_str = str(row.reservation_id)
         retry_ids_by_res.setdefault(res_str, {})[
@@ -468,8 +481,12 @@ async def _reattempt_rows(
                     *canonical_port_pair(row.port_a, row.port_b),
                 )
                 if key not in intended_keys:
-                    async with get_db_session() as db:
-                        await park_stale_l1_build(db, row.id, WIRING_STALE_BUILD_REASON)
+                    async with (
+                        get_db_session() as db,
+                        write_guard(db, L1ConnectionAssignment, row.id, claims) as writable,
+                    ):
+                        if writable:
+                            await park_stale_l1_build(db, row.id, WIRING_STALE_BUILD_REASON)
                     continue
                 phys = str(row.physical_connection_id) if row.physical_connection_id else None
                 by_res_build.setdefault(res_str, {}).setdefault(
@@ -529,6 +546,8 @@ async def _reattempt_rows(
             # finished, its real outcome is the honest answer.
             outcome = "in_progress"
         else:
+            # Includes a row whose claim was refused for its direction (issue #1496,
+            # claims.wrong_direction): nobody else is driving it, so it reads by status.
             outcome = "still_failed"
         outcomes.append(_outcome(row, outcome))
     if upstream_skips is not None:
@@ -633,7 +652,12 @@ async def _reattempt_l2_rows(
     superseded_va_ids: set[uuid.UUID] = set()
     async with get_db_session() as db:
         for row in rows:
-            if row.intended == "RELEASED" and await supersede_l2_release_if_reclaimed(db, row):
+            if row.intended != "RELEASED":
+                continue
+            # Issue #1479: only on a row nobody holds, as in _reattempt_rows.
+            async with write_guard(db, L2PortAssignment, row.id, claims) as writable:
+                superseded = writable and await supersede_l2_release_if_reclaimed(db, row)
+            if superseded:
                 superseded_ids.add(row.id)
                 # A superseded row never rides _apply_l2_memberships, whose tail is
                 # the ONLY live allocation-release site, so its allocation must be
@@ -687,21 +711,30 @@ async def _reattempt_l2_rows(
                 if _add_needs_resolution(row):
                     # Nil or dangling allocation: no VLAN number to remove and no
                     # driver call ever happened for this join; settle directly.
-                    async with get_db_session() as db:
-                        await release_l2_membership(
-                            db, row.reservation_id, row.switch_device_id, row.port
+                    async with (
+                        get_db_session() as db,
+                        write_guard(db, L2PortAssignment, row.id, claims) as writable,
+                    ):
+                        if writable:
+                            await release_l2_membership(
+                                db, row.reservation_id, row.switch_device_id, row.port
+                            )
+                    if writable:
+                        logger.warning(
+                            "wiring retry: build intent gone for reservation %s switch %s "
+                            "port %s with no resolvable allocation; released directly "
+                            "with no driver call (issue #491)",
+                            res_str,
+                            row.switch_device_id,
+                            row.port,
                         )
-                    logger.warning(
-                        "wiring retry: build intent gone for reservation %s switch %s "
-                        "port %s with no resolvable allocation; released directly "
-                        "with no driver call (issue #491)",
-                        res_str,
-                        row.switch_device_id,
-                        row.port,
-                    )
                 else:
-                    async with get_db_session() as db:
-                        await park_stale_l2_build(db, row.id, WIRING_STALE_BUILD_REASON)
+                    async with (
+                        get_db_session() as db,
+                        write_guard(db, L2PortAssignment, row.id, claims) as writable,
+                    ):
+                        if writable:
+                            await park_stale_l2_build(db, row.id, WIRING_STALE_BUILD_REASON)
 
         # Re-resolve allocations per reservation for the add rows that need it, so the
         # retry never drives add_to_vlan against the nil/vlan-0 placeholder.
@@ -739,7 +772,7 @@ async def _reattempt_l2_rows(
         retry_ids_by_res: dict[str, dict[tuple[str, str], uuid.UUID]] = {}
         unresolved_ids: set[uuid.UUID] = set()
         for row in rows:
-            if row.id in superseded_ids or row.id in blocked_build_ids:
+            if row.id in superseded_ids or row.id in blocked_build_ids or row.id in claims.lost:
                 continue
             res_str = str(row.reservation_id)
             if res_str in upstream_failed:
@@ -773,6 +806,7 @@ async def _reattempt_l2_rows(
                             f"{WIRING_UNRESOLVABLE_REASON}: no VLAN allocation for fabric",
                             intended="ACTIVE",
                             row_id=row.id,
+                            claims=claims,
                         )
                     continue
                 va_id, vlan_id = alloc
@@ -836,6 +870,7 @@ async def _reattempt_l2_rows(
                 # The other channel claimed this row before our driver call (issue #817).
                 outcome = "in_progress"
             else:
+                # Includes a row refused for its direction (issue #1496).
                 outcome = "still_failed"
             outcomes.append(_l2_outcome(row, outcome, vlan_by_va.get(row.vlan_assignment_id)))
         if upstream_skips is not None:
@@ -1006,8 +1041,12 @@ async def _reattempt_l3_rows(
             for row in res_rows:
                 switch_id = str(row.device_id)
                 if switch_id not in intended_adjacency:
-                    async with get_db_session() as db:
-                        await park_stale_route_build(db, row.id, WIRING_STALE_BUILD_REASON)
+                    async with (
+                        get_db_session() as db,
+                        write_guard(db, RouteAssignment, row.id, claims) as writable,
+                    ):
+                        if writable:
+                            await park_stale_route_build(db, row.id, WIRING_STALE_BUILD_REASON)
                     continue
                 intent_routes = l3_intent_by_switch.get(switch_id)
                 if intent_routes:
@@ -1045,6 +1084,7 @@ async def _reattempt_l3_rows(
                                 reason,
                                 intended="ACTIVE",
                                 row_id=row.id,
+                                claims=claims,
                             )
                         continue
                     entry = {"device_id": switch_id, "routes": clean}
@@ -1070,8 +1110,14 @@ async def _reattempt_l3_rows(
                     configured = ((detail or {}).get("config") or {}).get("routes") or []
                     if not configured:
                         # Nothing installed and nothing due: settle the row (WIRE-L3-4).
-                        async with get_db_session() as db:
-                            await release_unapplied_route_pin(db, res_str, switch_id, row_id=row.id)
+                        async with (
+                            get_db_session() as db,
+                            write_guard(db, RouteAssignment, row.id, claims) as writable,
+                        ):
+                            if writable:
+                                await release_unapplied_route_pin(
+                                    db, res_str, switch_id, row_id=row.id
+                                )
                         continue
                     entry = {"device_id": switch_id, "routes": configured}
                 by_res.setdefault(res_str, {"deprovisions": [], "provisions": []})[
@@ -1116,6 +1162,7 @@ async def _reattempt_l3_rows(
             # The other channel claimed this pin before our driver call (issue #817).
             outcome = "in_progress"
         else:
+            # Includes a pin refused for its direction (issue #1496).
             outcome = "still_failed"
         outcomes.append(_l3_outcome(row, outcome))
     if upstream_skips is not None:

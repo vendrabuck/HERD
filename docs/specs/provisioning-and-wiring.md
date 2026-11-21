@@ -109,12 +109,15 @@ These are the only two status writes on an allocation; no transition leaves `REL
 
 | From | To | Performed by | Guard | Stages | Rule |
 |---|---|---|---|---|---|
-| null or in the past | now plus the claim budget | `WiringRowClaims.claim` | row status `FAILED` | nothing | WIRE-CLAIM-1, WIRE-CLAIM-3 |
-| any | null | every record and park write | none | nothing | WIRE-CLAIM-2 |
+| null or in the past | now plus the claim budget (an L3 pin's sized for its whole drive) | `WiringRowClaims.claim` | row status `FAILED`, and the direction the call site drives is admitted (the row intends it, or it is a release on a frozen reservation) | nothing | WIRE-CLAIM-1, WIRE-CLAIM-3 |
+| any | null | every success flip and release (the reconcile's and a retry holder's alike), and every key-based failure write and park the reconcile makes | none | nothing | WIRE-CLAIM-2 |
+| the writing retry pass's own stamp, null, or in the past | null | a retry pass's failure write by row id, stale park, or supersession, nil-allocation, or unapplied-pin release | the row's `claimed_until` equals the stamp in the pass's `WiringRowClaims.held`, or (for a row the pass does not hold) is null or in the past, and the failure write's direction is admitted (WIRE-CLAIM-10); for the L3 holder's write after a partly failed switch, the stamp or null or in the past | nothing | WIRE-CLAIM-2, WIRE-CLAIM-8, WIRE-CLAIM-9, WIRE-CLAIM-10 |
 
 **Concurrency.** Inside one replica the consumer handles one message at a time; the
 background retry tick runs in the same process and can interleave with it. Successful
-build flips and retry failure writes are SQL compare-and-swaps on status; the two L3
+build flips and retry failure writes are SQL compare-and-swaps on status (a retry
+failure write also on the claim stamp, and a retry pass's settles run under a row lock
+taken on the same condition, WIRE-CLAIM-8); the two L3
 reconcile writers compare the pinned routes under a row lock; a partial-unique index per
 ledger is the final arbiter for ACTIVE rows (WIRE-LEDGER-3); the two retry channels
 exclude each other with the claim stamp (WIRE-CLAIM-1). Freeze is monotonic, and every
@@ -284,23 +287,99 @@ compare-and-swap too, so of two passes releasing one allocation exactly one driv
   absent (an insert race flips the winner's row); no code sets it back to false. \
   Enforced in: `services/execution/app/services/l1_assignment_service.py` (`freeze_reservation_wiring`) \
   Pinned by: `services/execution/tests/test_l1_assignment_service.py` (`test_freeze_inserts_row_when_absent`, `test_freeze_is_idempotent`, `test_freeze_loses_race_flips_winners_row_frozen`)
-- **WIRE-CLAIM-1.** A claim is one `UPDATE` setting `claimed_until` to now plus the
-  budget where the row id matches, status is `FAILED`, and `claimed_until` is null or in
-  the past; zero rows means the claim is lost. An expired stamp is reclaimable with no
-  reaper. \
-  Enforced in: `services/execution/app/services/wiring_claim.py` (`WiringRowClaims`, `unclaimed`) \
-  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_claim_stamps_the_budget_and_a_second_claimant_loses`, `test_a_row_no_longer_failed_cannot_be_claimed`, `test_claim_expiry_lets_a_new_pass_take_a_dead_holders_row`)
+- **WIRE-CLAIM-1.** A claim is one `UPDATE` matching the row id, status `FAILED`, and
+  `claimed_until` null or in the past, which sets `claimed_until` to now plus the
+  budget (the pass's own, or the per-call budget the L3 apply passes, WIRE-CLAIM-3)
+  only when the direction its call site is about to drive is admitted, and returns the
+  row's `claimed_until` (#1496). The directions are ACTIVE for `connect_ports`,
+  `add_to_vlan`, and an L3 provision, and RELEASED for `disconnect_ports`,
+  `remove_from_vlan`, and an L3 deprovision. A direction is admitted when the row's
+  `intended` equals it, and RELEASED is also admitted when the row's reservation is
+  frozen (`direction_admits`): a frozen reservation's wiring only ever leaves, so a
+  release planned before a writer that does not compare direction moved the row to
+  intended ACTIVE is still admitted, and it drives what the pass PLANNED. For L1 (one
+  wire per row) that settles the row. For L3 and L2, content that writer added in the
+  window (a newer route a key-based failure write recorded, a re-pointed allocation)
+  is neither driven nor kept in the record, as before #1496: the pin is recorded
+  RELEASED over a route that was never removed, or the stale VLAN's membership is
+  removed and the re-pointed one is not. That is the stale-content window #1481 tracks (pinned as known limits). A
+  build never gets the frozen exception. The frozen fact is a correlated EXISTS on
+  `reservation_wiring_state` inside the same statement; freezing is forward-only
+  (WIRE-FREEZE-1, WIRE-ORDER-1), so the one stale read is a freeze committed after the
+  statement's snapshot, including one that commits while the claim waits on the row's
+  lock (the re-check after the wait sees the row's new version, not the new freeze).
+  It reads as not frozen and the release is refused: safe for exclusion (it never
+  drives), but on a frozen reservation that refusal is the unsettled case, and the row
+  waits FAILED intended ACTIVE like the rows below. No row returned means the claim is lost (the row joins
+  `lost`). A row returned with a stamp other than this claim's is refused for
+  direction: no value changes (the UPDATE still runs, so on Postgres it writes a new
+  row version and holds the row lock until its commit, with the stamp written back as
+  it was), no execution run and no driver call follow for it (an L1 or L2 switch's
+  shared login and logout still run; an L3 pin is claimed before its login, so nothing
+  runs for it), and the row joins `wrong_direction`, not `lost`, so it reads back by
+  its status (`still_failed` while FAILED). The compare and the classification come
+  from that one statement, so neither refusal can be mistaken for the other. A refused
+  row stays claimable in the direction it then intends, and a later retry drives it
+  there, except a FAILED intended-ACTIVE row on a frozen reservation, which no retry
+  drives (the tick leaves it out as a frozen build and the manual retry reports it
+  `frozen`, as before #1496). On L3 the teardown's read of FAILED pins parks and
+  removes such a pin, unless it became FAILED intended ACTIVE after that read (a
+  key-based reconcile failure write landing after it, or a freeze committed during a
+  release claim's lock wait), and then nothing drives it; on L1 and L2 the teardown
+  releases ACTIVE rows only, so nothing settles such a row, as before. This closes a retry pass that planned a build from an
+  older read claiming and connecting, adding, or provisioning a row another pass parked
+  intended RELEASED since (the #1496 reproduction), and, with WIRE-CLAIM-10, that pass
+  undoing the park with a failure it records before its claim; it also refuses a
+  planned release over a row that intends ACTIVE again on a reservation that is not
+  frozen. It does not close the two windows #1481 tracks, in which the direction still
+  matches: a retry pass that validated intent before a save and connects after the
+  carried-delta apply passed over the row without parking it, and a retry planned from
+  older content that drives it over a newer failed attempt. An expired stamp is
+  reclaimable with no reaper. \
+  Enforced in: `services/execution/app/services/wiring_claim.py` (`WiringRowClaims`, `unclaimed`, `direction_admits`); `services/execution/app/services/wiring_due.py` (`reservation_frozen`); `services/execution/app/services/nats_consumer.py` (`_apply_one_port_action`, `_apply_one_vlan_action`, `_apply_l3_adjacency`) \
+  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_claim_stamps_the_budget_and_a_second_claimant_loses`, `test_a_row_no_longer_failed_cannot_be_claimed`, `test_claim_expiry_lets_a_new_pass_take_a_dead_holders_row`); `services/execution/tests/test_wiring_claim_direction.py` (`test_the_claim_holds_a_row_only_in_the_direction_it_intends`, `test_a_row_another_pass_holds_is_lost_in_either_direction`, `test_a_row_no_longer_failed_is_lost_in_either_direction`, `test_an_apply_drives_a_row_only_in_the_direction_it_intends`, `test_a_build_planned_before_a_park_is_not_driven_over_it`, `test_the_manual_endpoint_reports_a_direction_refusal_still_failed`, `test_the_tick_counts_a_direction_refusal_still_failed_not_in_progress`, `test_on_a_frozen_reservation_a_release_is_claimed_whatever_the_row_intends`, `test_a_release_planned_before_a_flip_to_active_settles_only_when_frozen`, `test_a_build_over_a_released_row_is_refused_on_a_frozen_reservation`, `test_a_frozen_release_refused_by_a_flip_to_active_no_longer_strands_the_pin`, `test_known_limit_a_frozen_l3_release_removes_only_the_routes_it_planned`); `services/execution/tests/test_wiring_retry_claim_race_live_pg.py` (`test_a_park_between_a_pass_plan_and_its_claim_refuses_the_build`, `test_the_direction_compare_and_its_frozen_exception_on_postgres`)
 - **WIRE-CLAIM-2.** Every success flip, release, failure write (by key or by row id),
-  stale park, and frozen park of an own FAILED row sets `claimed_until` to null.
+  stale park, and frozen park of an own FAILED row sets `claimed_until` to null (a
+  failure write by row id only when WIRE-CLAIM-8 lets it write).
   `record_route_reconciled`'s frozen branch does not, and no retry claims the rows it
   writes. \
   Enforced in: `services/execution/app/services/l1_assignment_service.py` (`record_l1_connect`, `release_l1_connection`, `record_l1_failed`, `park_stale_l1_build`); `services/execution/app/services/l2_membership_service.py` (`record_l2_membership_active`, `release_l2_membership`, `record_l2_failed`, `park_stale_l2_build`); `services/execution/app/services/route_service.py` (`record_route_active`, `release_route_membership`, `record_route_failed`, `park_stale_route_build`) \
   Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_l1_success_flip_clears_the_claim`, `test_l1_release_clears_the_claim`, `test_l1_row_identity_failure_write_clears_the_claim`, `test_l1_key_upsert_failure_write_clears_the_claim`, `test_l2_stale_build_park_clears_the_claim`, `test_l3_success_flip_clears_the_claim`, `test_l3_release_clears_the_claim`)
-- **WIRE-CLAIM-3.** The claim budget is three attempts times three driver actions times
-  `EXECUTION_TIMEOUT_SECONDS`, plus the in-line backoff, rounded up to whole minutes
-  (5 minutes at the defaults); there is no setting of its own. \
-  Enforced in: `services/execution/app/services/wiring_claim.py` (`claim_budget`) \
-  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_claim_budget_covers_one_row_worst_case_drive`, `test_claim_budget_scales_with_the_driver_timeout`)
+- **WIRE-CLAIM-3.** The claim budget of a drive of N driver actions is three attempts
+  times N times `EXECUTION_TIMEOUT_SECONDS`, plus N times the in-line backoff (0.6 s),
+  rounded up to the next whole minute strictly after that sum, computed in whole
+  milliseconds; there is no setting of its own. An L1 or L2 row is three actions (its
+  switch's login, its own op, its switch's logout): 5 minutes at the defaults, and for
+  every whole-second timeout the plain round-up it was before #1482, with at least
+  1.2 seconds of slack. An L3 pin is claimed once for its whole drive, so
+  `_apply_l3_adjacency` counts the route operations R it is about to drive (the residue
+  removals plus one call per route, or a reconcile's removals plus additions) after the
+  driver load and immediately before the login, then claims with
+  `l3_pin_claim_budget(R)` as a per-call budget of `WiringRowClaims.claim`; the stamp is
+  the claim instant plus that budget. That budget is the sum for N = R plus 2 actions
+  plus an allowance of 1 second per action (`L3_ACTION_UNTIMED_OVERHEAD_ALLOWANCE_MS`,
+  an allowance, not a measured bound), rounded the same way, and never less than the
+  three-action budget. Pinned at the defaults: 5 minutes for R of 0 or 1, 7 for 2, 19
+  for 10, 75 for 47, 309 for 200, and 76,337 (about 53 days) for 50,000. The sum
+  counts every attempt's sandbox timeout and every backoff sleep; time outside it is
+  each action's time outside its sandbox timers (the two execution-run writes, the
+  worker-thread hop, the sandbox's temp-file I/O, the child's fork and exec before the
+  subprocess timer starts, the kill and reap after a timeout) and, with
+  `ALLOW_DRIVER_PIP_INSTALL` on, the `pip install` the sandbox runs before the driver
+  child, with its own 60-second timeout, on every attempt while a package with a
+  `requirements.txt` has no `_deps/` directory (no budget counts the install, L1 and L2
+  included). The guarantee for an L3 pin: its claim outlives the drive when every
+  attempt runs to its timeout as long as the drive's time outside the sum stays under N
+  seconds (the allowance) plus the rounding slack; the slack is a multiple of 0.2
+  seconds and at least 0.2 seconds at any whole-second timeout, and at the default
+  timeout at least 0.4 seconds, first at R of 129 and every 150 after. A larger overhead
+  lets a second pass claim the pin before its logout ends (a pinned known limit).
+  Nothing caps the budget, because nothing caps a pin's route count: a pin is held for
+  at most one minute more than the larger of its sum plus N seconds and the
+  three-action sum, and a holder that dies mid-drive leaves it unclaimable for no
+  longer than that (#1482). \
+  Enforced in: `services/execution/app/services/wiring_claim.py` (`claim_budget`, `l3_pin_claim_budget`, `WiringRowClaims`); `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`) \
+  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_claim_budget_covers_one_row_worst_case_drive`, `test_claim_budget_scales_with_the_driver_timeout`, `test_the_one_row_budget_is_unchanged_for_l1_and_l2`, `test_l3_pin_claim_budget_is_r_plus_two_actions_rounded_up`, `test_l3_pin_claim_budget_outlives_every_drive_and_by_at_most_a_minute`, `test_an_l3_pins_claim_is_still_held_when_its_last_driver_action_finishes`, `test_a_raised_driver_timeout_still_keeps_an_l3_pins_claim_through_its_drive`, `test_l1_and_l2_rows_still_claim_with_the_one_row_budget`, `test_a_per_call_budget_sets_only_that_claims_stamp`, `test_a_sized_l3_claim_still_expires_at_its_stamp`, `test_the_smallest_l3_slack_at_the_default_timeout_is_four_tenths_of_a_second`, `test_an_l3_pins_claim_outlives_its_drive_with_overhead_just_under_the_allowance`, `test_known_limit_overhead_far_over_the_allowance_lets_a_rival_claim`)
 
 ## 5. API surface
 
@@ -1304,8 +1383,9 @@ RES-FORK-18).
 ### 8.14 Keeping two retry channels off the same row
 
 **What it does.** The automatic retry and the owner's Retry button never send the same
-command to a switch at the same time: whichever reaches a row first holds it for a few
-minutes, and the other skips it.
+command to a switch at the same time: whichever reaches a row first holds it for as long
+as its drive can take (a few minutes for one row, longer for a switch with many routes),
+and the other skips it.
 
 **Surfaces.** `services/execution/app/services/wiring_claim.py`; the claim calls in
 `_apply_one_port_action`, `_apply_one_vlan_action`, and `_apply_l3_adjacency`. The stamp
@@ -1322,14 +1402,96 @@ transitions are WIRE-CLAIM-1 to WIRE-CLAIM-3.
   no ledger write in that pass. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_apply_one_port_action`, `_apply_one_vlan_action`, `_apply_l3_adjacency`) \
   Pinned by: `services/execution/tests/test_wiring_retry_claim_race_live_pg.py` (`test_l1_row_is_driven_exactly_once_across_both_channels`, `test_l2_row_is_driven_exactly_once_across_both_channels`, `test_l3_pin_is_driven_exactly_once_across_both_channels`, `test_the_manual_channel_reports_in_progress_when_the_tick_wins`)
-- **WIRE-CLAIM-6.** A pass that reaches a row it already holds keeps its claim. \
+- **WIRE-CLAIM-6.** A pass that reaches a row it already holds, in the direction it
+  claimed it for, keeps its claim with no write; reached in the other direction, the
+  row is refused into `wrong_direction` with no write and its stamp stays (#1496). The
+  row's current `intended` is not re-read for a held row. \
   Enforced in: `services/execution/app/services/wiring_claim.py` (`WiringRowClaims`) \
-  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_claim_is_idempotent_within_one_pass`)
+  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_claim_is_idempotent_within_one_pass`); `services/execution/tests/test_wiring_claim_direction.py` (`test_a_held_row_reached_in_the_other_direction_is_refused_without_a_write`)
 - **WIRE-CLAIM-7.** Only the retry-only reads filter out claimed rows; the
   per-reservation FAILED reads, shared by the reconcile's stale settlement and the manual
   retry's report, return every FAILED row. \
   Enforced in: `services/execution/app/services/wiring_claim.py` (`unclaimed`, `claimable_row_ids`); `services/execution/app/services/l1_assignment_service.py` (`failed_assignments_for_reservation`) \
   Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_claimable_row_ids_answers_only_the_free_rows`, `test_manual_retry_reports_in_progress_for_a_row_the_tick_holds`)
+- **WIRE-CLAIM-8.** No failure write and no settle a retry pass (tick or manual) makes
+  changes or frees a wiring row another pass holds, and holding is judged by the
+  database (WIRE-CLAIM-9). The pass hands its `WiringRowClaims` ledger to each such
+  write, and `claim_write_clauses` gives the condition: the row's `claimed_until` equals
+  this pass's stamp for it, or, for a row this pass does not hold, is null or in the
+  past. The failure writes by row id (`record_l1_failed`, `record_l2_failed`,
+  `record_route_failed` given `row_id`) add that condition to their own `UPDATE`, so it
+  costs no extra query. The settles a pass makes on rows it loaded but never claimed
+  run inside `write_guard`, which first selects the row `FOR UPDATE` under the same
+  condition in the writer's transaction (one extra short select) and commits on exit,
+  releasing the lock even when nothing was written: the stale-build parks, the L1 and
+  L2 supersession releases, the L2 nil-allocation release, and the L3 unapplied-pin
+  release. A refused write changes nothing on the row (`status`, `intended`,
+  `attempts`, `last_error`, and `claimed_until` stay as they were) and adds the row to
+  the ledger's `lost`. The pass's read-back reports each row by its status first: an
+  ACTIVE row reads `reconnected` and a RELEASED row `released` (also when the write was
+  refused because the row had left FAILED), a FAILED row in `lost` reads `in_progress`,
+  any other FAILED row reads `still_failed` (a row whose claim was refused for its
+  direction is in `wrong_direction`, not `lost`, WIRE-CLAIM-1), and a row that was
+  deleted is left out of the report. One write is wider: the L3
+  holder's failure write after a switch whose route calls partly failed also lands when
+  the row's claim is null or in the past (`holder_or_unclaimed`), because those calls
+  may have configured routes only that write records (#1001); it is refused only while
+  another retry pass holds a live claim. Limits: a retry holder's success and release
+  flips after its drive (`record_l1_connect`, `release_l1_connection`,
+  `record_l2_membership_active`, `release_l2_membership`, `record_route_active`,
+  `release_route_membership`) are unconditional, exactly as before #1479, so a holder
+  whose claim was taken over still records its success (issue #1481); the reconcile
+  passes no ledger, so its key-based failure write, its stale and frozen parks, and its
+  success and release flips still change and free a row a retry pass holds (issue
+  #1481); and no ACTIVE row is ever held, since a claim is taken only on a FAILED row
+  and every flip out of FAILED clears it (#1479). \
+  Enforced in: `services/execution/app/services/wiring_claim.py` (`claim_write_clauses`, `write_guard`); `services/execution/app/services/l1_assignment_service.py` (`record_l1_failed`); `services/execution/app/services/l2_membership_service.py` (`record_l2_failed`); `services/execution/app/services/route_service.py` (`record_route_failed`); `services/execution/app/services/wiring_retry_service.py` (`_reattempt_rows`, `_reattempt_l2_rows`, `_reattempt_l3_rows`); `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`) \
+  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_failure_write_on_a_row_this_pass_holds_is_written`, `test_failure_write_on_a_row_another_pass_holds_changes_nothing`, `test_failure_write_on_an_unclaimed_row_is_written`, `test_failure_write_on_an_expired_claim_is_written`, `test_a_pass_whose_switch_load_fails_reports_a_held_row_in_progress`, `test_a_stale_build_park_skips_a_row_another_pass_holds`, `test_a_supersession_settle_skips_a_row_another_pass_holds`, `test_the_l2_nil_allocation_release_skips_a_row_another_pass_holds`, `test_the_l3_unapplied_pin_release_skips_a_row_another_pass_holds`, `test_write_guard_does_nothing_without_a_ledger`, `test_write_guard_ends_its_transaction_and_rolls_back_on_an_error`, `test_after_the_reconcile_clears_the_claim_the_holders_success_is_recorded`, `test_after_the_reconcile_clears_the_claim_an_l3_partial_failure_is_recorded`, `test_l1_key_upsert_failure_write_clears_the_claim`, `test_l1_stale_build_park_clears_the_claim`); `services/execution/tests/test_wiring_retry_claim_race_live_pg.py` (`test_a_load_failure_from_an_early_pass_must_not_rewrite_a_held_row`, `test_a_login_failure_from_an_early_pass_must_not_free_a_held_row`, `test_a_stale_tick_cannot_park_a_row_the_manual_channel_is_driving`, `test_teardown_during_a_held_l3_provision_leaves_its_routes_recorded_for_removal`, `test_a_reconcile_failure_write_during_a_held_l1_connect_still_records_it`, `test_the_record_releases_the_row_lock_when_it_writes_nothing`)
+- **WIRE-CLAIM-9.** Whether a pass still holds a row is judged by the database, not by
+  the pass's memory: `WiringRowClaims.claim` records in `held` the exact
+  `claimed_until` stamp it wrote, and the pass's later failure writes to that row
+  require the row to still carry that stamp. A holder whose claim expired and was taken
+  over by another pass, or whose claim a writer that does not claim cleared, is refused
+  like any other pass (the refusal keeps the direction the other writer set and drops
+  only this holder's attempt count and error text; a login or load failure changed
+  nothing on the device, while an L1 or L2 call that timed out may still have landed,
+  which the other writer's record already covers), except for the L3 partial-failure write of
+  WIRE-CLAIM-8; a holder whose expired claim nobody took over still writes. The stamp
+  round-trips exactly through Postgres `timestamptz` (microseconds and time zone). The
+  holder's success and release flips do not consult the stamp (WIRE-CLAIM-8 limits). A
+  superseded holder still makes the driver calls it had started: one row call on L1 and
+  L2, and on L3 the rest of the switch's route sequence and its logout. \
+  Enforced in: `services/execution/app/services/wiring_claim.py` (`WiringRowClaims`, `claim_write_clauses`) \
+  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_a_superseded_holder_cannot_record_a_failure`, `test_a_holder_whose_expired_claim_nobody_took_still_writes`, `test_a_superseded_holders_failure_is_refused_but_its_success_is_recorded`, `test_a_superseded_l3_holder_records_only_its_success`, `test_after_the_reconcile_clears_the_claim_the_holders_failure_is_refused`); `services/execution/tests/test_wiring_retry_claim_race_live_pg.py` (`test_the_claim_stamp_round_trips_and_decides_who_holds_on_postgres`)
+- **WIRE-CLAIM-10.** A retry pass's failure write by row id on a row it does not hold
+  writes only where its direction is admitted, the WIRE-CLAIM-1 compare in the write's
+  own `UPDATE`: the row still intends the direction the failure records, or the
+  failure is a release and the reservation is frozen (#1496). These are the writes a
+  pass makes before any per-row claim, on a row it planned from an older read, so the
+  row may have been parked since: on L1 and on L2, in both directions, the switch
+  read, the template read, the driver load, and the login, plus on L2 the
+  create_vlan pre-pass and the re-allocation of a nil-allocation row; on L3 the switch
+  read, the template read, and the driver load, and the retry's drive-gate refusal (an
+  L3 login failure comes after the pin's claim). For a build-planned L1 or L2 row the
+  apply's switch read answers from the pass's memoized revalidation read, so its
+  switch-not-found write cannot follow a park in this window; a release-planned row is
+  not revalidated, so its switch read can be fresh. Each value is written as
+  `CASE WHEN admitted THEN value ELSE column END` and the write returns `intended`,
+  which tells an admitted write from a refused one in the same statement. A refused
+  write is rolled back before the writer returns, and that rollback is what leaves
+  every value as it was; the CASE on the columns other than `intended` is a second line
+  that no test can tell apart while the rollback is there. The writer returns None and
+  adds the row to `wrong_direction`, not `lost` (with no ledger, `claims` None, a
+  refused write is recorded nowhere and logs nothing, a known gap; no retry caller
+  passes a row id without a ledger). The park it would have undone stands, and a later
+  retry releases the row, on an active and a frozen reservation alike. A release
+  failure write admitted on a frozen reservation records the pass's own routes (L3) or
+  allocation (L2), so content a non-comparing writer added in the window leaves the
+  record, as before #1496 (the WIRE-CLAIM-1 stale-content limit). A write on a row the pass holds takes no direction compare (its
+  claim compared it; WIRE-CLAIM-8 and WIRE-CLAIM-9 still decide whether it lands), and
+  the key-based writes (no row id, the reconcile's) are unchanged. \
+  Enforced in: `services/execution/app/services/wiring_claim.py` (`direction_admits`, `direction_guarded_values`); `services/execution/app/services/l1_assignment_service.py` (`_record_l1_failed_for_row`); `services/execution/app/services/l2_membership_service.py` (`_record_l2_failed_for_row`); `services/execution/app/services/route_service.py` (`_record_route_failed_for_row`) \
+  Pinned by: `services/execution/tests/test_wiring_claim_direction.py` (`test_a_failure_recorded_before_the_claim_does_not_undo_a_park`, `test_a_teardown_park_survives_a_provision_load_failure_on_a_frozen_reservation`, `test_a_failure_write_on_a_row_the_pass_does_not_hold_compares_the_direction`, `test_a_failure_write_on_a_row_the_pass_holds_takes_no_direction_compare`, `test_a_refused_failure_write_is_rolled_back_in_the_callers_session`, `test_a_frozen_join_on_the_nil_row_survives_the_reallocation_failure`, `test_known_limit_an_admitted_frozen_release_failure_records_only_its_routes`); `services/execution/tests/test_wiring_retry_claim_race_live_pg.py` (`test_a_refused_failure_write_is_rolled_back_on_postgres`)
 
 **Out of scope.** The L2 `create_vlan` pre-pass of a retry runs before any row claim (see
 section 13).
