@@ -1289,6 +1289,16 @@ is the user guide.
   escaped pair is imported. \
   Enforced in: `services/cabling/app/services/bulk_service.py` (`_decode_import`, `parse_json_topologies`, `parse_csv_topologies`, `IMPORT_NOT_UTF8_DETAIL`, `IMPORT_NOT_TEXT_DETAIL`); `services/common/herd_common/validation_errors.py` (`holds_lone_surrogate`) \
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_non_utf8_import_file_is_422_naming_the_encoding`, `test_a_json_import_holding_a_lone_surrogate_is_a_fixed_422`, `test_a_json_import_with_a_surrogate_pair_escape_is_not_refused`)
+- **TOPO-BULK-20.** A topology import upload larger than `IMPORT_UPLOAD_BYTES` (10 MiB)
+  answers 413 with the body limit's one item, `{"type": "body_too_large", "loc": ["body"],
+  "msg": "Request body is larger than <limit> bytes"}`, and nothing is parsed or written.
+  The route's own `extends_body_limit` bound covers the whole multipart envelope; this is
+  the exact per-file bound, applied to the bytes read: the read asks for one byte past
+  the bound, so a file one byte over it is refused. Starlette has already received and
+  spooled the upload by then, so the chunking bounds what is copied into memory and not
+  the upload itself. The same rule on inventory is INV-BULK-23. \
+  Enforced in: `services/cabling/app/routes/bulk.py` (`IMPORT_UPLOAD_BYTES`, `_read_capped`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_topology_upload_over_the_bound_is_a_413`)
 
 **Out of scope.** Device and inventory template import is `inventory.md`.
 
