@@ -15,9 +15,15 @@ failure each path already had:
 
 The stalled peer is an ``httpx.MockTransport`` whose body drips one byte every 20 ms,
 far under any per-phase timeout, forever; the deadline is patched to a fraction of a
-second. Each test is wrapped in a hang guard (``asyncio.wait_for``) so a regression
-fails instead of hanging, and every elapsed-time bound is loose in the safe direction
-(a regression never finishes at all).
+second. Every await of the code under test runs under a hang guard
+(``asyncio.wait_for``) so a regression fails instead of hanging, and every
+elapsed-time bound is loose in the safe direction (a regression never finishes at
+all).
+
+A deadline must not swallow a cancellation that is not its own: a task cancelled
+while it waits, or an OUTER ``asyncio.timeout`` shorter than the inner deadline,
+surfaces at the outer scope as ``CancelledError`` or the outer ``TimeoutError``, never
+as the transient error (the cancellation tests at the end of each section).
 """
 
 import asyncio
@@ -106,6 +112,15 @@ class DripPeer:
         return RealAsyncClient(transport=httpx.MockTransport(self.handler), **kwargs)
 
 
+async def _wait_until_streaming(peer: DripPeer) -> None:
+    """Return once the peer has started its body, so a cancellation lands mid-read."""
+    for _ in range(HANG_GUARD_SECONDS * 100):
+        if peer.sent >= 1:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("the peer never started its body")
+
+
 def _per_phase(seconds: float) -> dict:
     return {"connect": seconds, "read": seconds, "write": seconds, "pool": seconds}
 
@@ -142,7 +157,8 @@ async def test_download_under_the_deadline_returns_the_body():
         "app.services.driver_loader.httpx.AsyncClient",
         side_effect=lambda *a, **k: RealAsyncClient(transport=httpx.MockTransport(handler), **k),
     ):
-        assert await download_driver_package(uuid.uuid4()) == b"zip-bytes"
+        body = await asyncio.wait_for(download_driver_package(uuid.uuid4()), HANG_GUARD_SECONDS)
+        assert body == b"zip-bytes"
 
 
 async def test_load_driver_maps_a_download_deadline_to_the_transient_failure(tmp_path):
@@ -158,6 +174,7 @@ async def test_load_driver_maps_a_download_deadline_to_the_transient_failure(tmp
         patch("app.services.driver_loader.httpx.AsyncClient", side_effect=peer.client),
         patch("app.services.driver_loader.settings") as mock_settings,
     ):
+        mock_settings.allow_driver_pip_install = False
         mock_settings.driver_cache_path = str(cache_root)
         mock_settings.inventory_service_url = "http://inventory"
         mock_settings.internal_api_token = "token"
@@ -174,6 +191,49 @@ async def test_load_driver_maps_a_download_deadline_to_the_transient_failure(tmp
     assert list(cache_root.iterdir()) == []
     async with TestSessionLocal() as db:
         assert (await db.execute(select(DriverCache))).scalars().all() == []
+
+
+async def test_cancelling_a_download_propagates_and_is_not_a_deadline():
+    """A cancellation from outside reaches the canceller as CancelledError; the
+    download's own deadline (still 120 s here) never turns it into TimeoutError."""
+    peer = DripPeer()
+    with patch("app.services.driver_loader.httpx.AsyncClient", side_effect=peer.client):
+        task = asyncio.create_task(download_driver_package(uuid.uuid4()))
+        await _wait_until_streaming(peer)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, HANG_GUARD_SECONDS)
+
+
+async def test_an_outer_timeout_shorter_than_the_download_deadline_is_the_outer_one(tmp_path):
+    """An outer asyncio.timeout that expires first surfaces as its own TimeoutError at
+    the outer scope, through load_driver, never as the download's TimeoutError or the
+    transient RuntimeError load_driver makes of one."""
+    peer = DripPeer()
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+
+    async def load_under_outer_timeout():
+        async with TestSessionLocal() as db:
+            async with asyncio.timeout(SHORT_DEADLINE):
+                await load_driver(db, uuid.uuid4(), "sha", "driver.zip", "Layer 1 Switch")
+
+    with (
+        patch("app.services.driver_loader.httpx.AsyncClient", side_effect=peer.client),
+        patch("app.services.driver_loader.settings") as mock_settings,
+    ):
+        mock_settings.allow_driver_pip_install = False
+        mock_settings.driver_cache_path = str(cache_root)
+        mock_settings.inventory_service_url = "http://inventory"
+        mock_settings.internal_api_token = "token"
+        with pytest.raises(TimeoutError) as exc:
+            await asyncio.wait_for(load_under_outer_timeout(), HANG_GUARD_SECONDS)
+
+    assert type(exc.value) is TimeoutError
+    assert "no complete download" not in str(exc.value)
+    assert isinstance(exc.value.__cause__, asyncio.CancelledError)
+    assert peer.sent >= 2
+    assert list(cache_root.iterdir()) == []
 
 
 # --- the internal reads -----------------------------------------------------
@@ -205,7 +265,10 @@ async def test_get_internal_under_the_deadline_returns_the_response():
         return httpx.Response(404, json={"detail": "Not found"})
 
     async with RealAsyncClient(transport=httpx.MockTransport(handler)) as client:
-        resp = await _get_internal(client, "http://inventory/x", what="probe", timeout=10.0)
+        resp = await asyncio.wait_for(
+            _get_internal(client, "http://inventory/x", what="probe", timeout=10.0),
+            HANG_GUARD_SECONDS,
+        )
     assert resp.status_code == 404
 
 
@@ -250,6 +313,38 @@ async def test_a_stalled_corroboration_read_naks_the_message():
     msg.nak.assert_awaited_once_with(delay=NATS_NAK_BACKOFF_SECONDS[0])
     msg.ack.assert_not_awaited()
     handler.assert_not_awaited()
+
+
+async def test_cancelling_an_internal_read_propagates_and_is_not_transient():
+    peer = DripPeer()
+    async with peer.client() as client:
+        task = asyncio.create_task(
+            _get_internal(client, "http://inventory/devices/x/internal", what="probe", timeout=10.0)
+        )
+        await _wait_until_streaming(peer)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, HANG_GUARD_SECONDS)
+
+
+async def test_an_outer_timeout_shorter_than_the_read_deadline_is_the_outer_one():
+    """The inner deadline is still 20 s; the outer scope's 0.3 s expires first and
+    surfaces as its own TimeoutError, not as TransientUpstreamError."""
+    peer = DripPeer()
+
+    async def read_under_outer_timeout(client):
+        async with asyncio.timeout(SHORT_DEADLINE):
+            await _get_internal(
+                client, "http://inventory/devices/x/internal", what="probe", timeout=10.0
+            )
+
+    async with peer.client() as client:
+        with pytest.raises(TimeoutError) as exc:
+            await asyncio.wait_for(read_under_outer_timeout(client), HANG_GUARD_SECONDS)
+
+    assert type(exc.value) is TimeoutError
+    assert isinstance(exc.value.__cause__, asyncio.CancelledError)
+    assert peer.sent >= 2
 
 
 # --- functional: the manual wiring retry route ------------------------------
@@ -333,6 +428,7 @@ async def test_wiring_retry_with_a_stalled_download_returns_the_transient_outcom
             patch.object(driver_loader, "DRIVER_DOWNLOAD_DEADLINE_SECONDS", SHORT_DEADLINE)
         )
         mock_settings = stack.enter_context(patch("app.services.driver_loader.settings"))
+        mock_settings.allow_driver_pip_install = False
         mock_settings.driver_cache_path = str(cache_root)
         mock_settings.inventory_service_url = "http://inventory"
         mock_settings.internal_api_token = "token"

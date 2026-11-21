@@ -17,13 +17,24 @@ What moving it to a thread changes, and what these tests pin:
   once, after the worker is done, and never left behind (the cancellation tests and the
   state-machine tests of ``_SchemaExtraction``).
 
-No test here waits on wall-clock time for its verdict: each blocking stub waits on a
-threading primitive with a generous timeout that only a regression reaches.
+Every wait is bounded, so a regression fails within seconds instead of hanging CI:
+each blocking stub waits on a threading primitive with a timeout, every load and
+every await of a cancelled task runs under ``asyncio.wait_for``, and every direct call
+into ``_SchemaExtraction.run`` or ``abandon`` runs on a helper thread joined with a
+timeout (``_call_bounded``), because a lock held too long would otherwise block the
+test's own thread for good. A wait that runs on the event loop's thread cannot fire
+while synchronous code blocks the loop; the stubs' own timeouts cover that case. No
+verdict depends on how long anything took.
+
+ALLOW_DRIVER_PIP_INSTALL is set to a real bool in every load here (``settings`` is a
+MagicMock, whose attributes are truthy by accident), and the tests a pip-dependent
+regression could hide behind run with it both off and on.
 """
 
 import asyncio
 import io
 import os
+import shutil
 import threading
 import uuid
 import zipfile
@@ -42,6 +53,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 # Long enough that only a regression waits it out; short enough that one fails fast.
 STUB_WAIT_SECONDS = 5
+# The bound on a whole load, or on the await of a cancelled task.
+LOAD_GUARD_SECONDS = 15
 
 VALID_L1_DRIVER = """
 class Driver:
@@ -81,10 +94,11 @@ def cache_root(tmp_path):
 
 
 @contextmanager
-def _cold_load(cache_root: Path, extraction):
+def _cold_load(cache_root: Path, extraction, *, pip_install: bool = False):
     """A cold-cache load of a valid L1 package with the schema extraction replaced."""
     with ExitStack() as stack:
         mock_settings = stack.enter_context(patch("app.services.driver_loader.settings"))
+        mock_settings.allow_driver_pip_install = pip_install
         mock_settings.driver_cache_path = str(cache_root)
         mock_settings.inventory_service_url = "http://test"
         mock_settings.internal_api_token = "token"
@@ -100,10 +114,32 @@ def _cold_load(cache_root: Path, extraction):
         yield
 
 
-async def _load(sessions, driver_id, cache_root, extraction):
-    with _cold_load(cache_root, extraction):
+async def _load(sessions, driver_id, cache_root, extraction, *, pip_install: bool = False):
+    with _cold_load(cache_root, extraction, pip_install=pip_install):
         async with sessions() as session:
             return await load_driver(session, driver_id, "sha-1", "driver.zip", "Layer 1 Switch")
+
+
+def _call_bounded(fn, *, name: str = "bounded-call", timeout: float = STUB_WAIT_SECONDS):
+    """Run fn on a daemon thread, join it with a timeout, and return its result.
+
+    A regression that blocks (a lock never released, a lock taken twice on one
+    thread) fails here after `timeout` seconds instead of hanging the test run."""
+    outcome: dict = {}
+
+    def target():
+        try:
+            outcome["value"] = fn()
+        except BaseException as exc:  # handed back to the test thread below
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=target, name=name, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+    assert not thread.is_alive(), f"{name} still blocked after {timeout} s"
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
 
 
 async def _rows(sessions, driver_id):
@@ -130,8 +166,9 @@ async def _wait_until_empty(root: Path) -> bool:
 # --- the loop keeps running -------------------------------------------------
 
 
+@pytest.mark.parametrize("pip_install", [False, True], ids=["pip-off", "pip-on"])
 async def test_load_driver_keeps_the_event_loop_running_during_schema_extraction(
-    sessions, cache_root
+    sessions, cache_root, pip_install
 ):
     """The stub blocks until a second coroutine has ticked three times. On the loop
     (the code before #1498) the ticker cannot run, the wait times out, and the stub
@@ -155,7 +192,10 @@ async def test_load_driver_keeps_the_event_loop_running_during_schema_extraction
     tick_task = asyncio.create_task(ticker())
     try:
         driver_id = uuid.uuid4()
-        path = await _load(sessions, driver_id, cache_root, slow_extraction)
+        path = await asyncio.wait_for(
+            _load(sessions, driver_id, cache_root, slow_extraction, pip_install=pip_install),
+            LOAD_GUARD_SECONDS,
+        )
     finally:
         tick_task.cancel()
         with suppress(asyncio.CancelledError):
@@ -202,8 +242,9 @@ async def test_two_first_loads_extract_concurrently_and_both_succeed(sessions, c
 # --- cancellation -----------------------------------------------------------
 
 
+@pytest.mark.parametrize("pip_install", [False, True], ids=["pip-off", "pip-on"])
 async def test_cancel_while_the_worker_runs_removes_the_directory_after_the_worker(
-    sessions, cache_root
+    sessions, cache_root, pip_install
 ):
     """The load is cancelled while the stub is inside the worker. The stub then
     writes `_deps` into the attempt's directory, as pip does. Removing the directory
@@ -225,12 +266,12 @@ async def test_cancel_while_the_worker_runs_removes_the_directory_after_the_work
 
     driver_id = uuid.uuid4()
     load_task = asyncio.create_task(
-        _load(sessions, driver_id, cache_root, extraction_that_writes_late)
+        _load(sessions, driver_id, cache_root, extraction_that_writes_late, pip_install=pip_install)
     )
     assert await asyncio.to_thread(entered.wait, STUB_WAIT_SECONDS)
     load_task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await load_task
+        await asyncio.wait_for(load_task, LOAD_GUARD_SECONDS)
     # The worker is still running: its directory has not been pulled from under it.
     assert seen_dir[0].is_dir()
 
@@ -247,6 +288,8 @@ async def test_cancel_while_queued_removes_the_directory_and_never_runs_the_extr
     """The loop's default executor has one worker, held busy, so the extraction job
     waits in its queue. Cancelling the load cancels the queued job: the extraction
     never runs, so the coroutine itself must remove the directory at once."""
+    # Coupled to today's mechanism (asyncio.to_thread on the loop's default executor):
+    # an honest move to a dedicated executor (#1498 item 4) fails this test as written.
     executor = ThreadPoolExecutor(max_workers=1)
     loop = asyncio.get_running_loop()
     loop.set_default_executor(executor)
@@ -273,7 +316,7 @@ async def test_cancel_while_queued_removes_the_directory_and_never_runs_the_extr
             await asyncio.wait_for(queued.wait(), STUB_WAIT_SECONDS)
             load_task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await load_task
+                await asyncio.wait_for(load_task, LOAD_GUARD_SECONDS)
         assert list(cache_root.iterdir()) == []
     finally:
         blocker_release.set()
@@ -294,12 +337,17 @@ async def test_an_extraction_that_raises_removes_the_directory_and_reraises(sess
         raise boom
 
     with pytest.raises(RuntimeError) as exc:
-        await _load(sessions, uuid.uuid4(), cache_root, raising_extraction)
+        await asyncio.wait_for(
+            _load(sessions, uuid.uuid4(), cache_root, raising_extraction), LOAD_GUARD_SECONDS
+        )
     assert exc.value is boom
     assert list(cache_root.iterdir()) == []
 
 
 # --- the handoff's state machine, every ordering ----------------------------
+#
+# Every run() and abandon() below goes through _call_bounded, so a lock that is
+# never released, or taken twice on one thread, fails the test instead of hanging it.
 
 
 def _attempt_dir(tmp_path) -> Path:
@@ -312,7 +360,7 @@ def _attempt_dir(tmp_path) -> Path:
 def test_handoff_completed_unabandoned_keeps_the_directory(tmp_path):
     d = _attempt_dir(tmp_path)
     with patch.object(driver_loader, "extract_config_schema_json", return_value="{}"):
-        assert _SchemaExtraction(d).run() == "{}"
+        assert _call_bounded(_SchemaExtraction(d).run) == "{}"
     assert d.is_dir()
 
 
@@ -320,36 +368,45 @@ def test_handoff_abandon_after_the_worker_finished_removes_the_directory(tmp_pat
     d = _attempt_dir(tmp_path)
     handoff = _SchemaExtraction(d)
     with patch.object(driver_loader, "extract_config_schema_json", return_value=None):
-        handoff.run()
+        _call_bounded(handoff.run)
     assert d.is_dir()
-    handoff.abandon()
+    _call_bounded(handoff.abandon)
     assert not d.exists()
 
 
 def test_handoff_abandon_before_the_worker_starts_removes_it_and_skips_the_extraction(tmp_path):
     d = _attempt_dir(tmp_path)
     handoff = _SchemaExtraction(d)
-    handoff.abandon()
+    _call_bounded(handoff.abandon)
     assert not d.exists()
     with patch.object(driver_loader, "extract_config_schema_json") as extraction:
-        assert handoff.run() is None
+        assert _call_bounded(handoff.run) is None
     extraction.assert_not_called()
     assert not d.exists()
 
 
 def test_handoff_abandon_while_the_worker_runs_leaves_removal_to_the_worker(tmp_path):
+    """abandon() is called from ANOTHER thread while the extraction runs, as the
+    coroutine does, and must return at once: a regression that holds the lock across
+    the extraction blocks it, and the bounded join fails the test."""
     d = _attempt_dir(tmp_path)
     handoff = _SchemaExtraction(d)
+    abandoner_returned: list[bool] = []
     during: list[bool] = []
 
     def extraction(driver_dir):
-        handoff.abandon()
+        abandoner = threading.Thread(target=handoff.abandon, name="abandoner", daemon=True)
+        abandoner.start()
+        abandoner.join(timeout=STUB_WAIT_SECONDS)
+        abandoner_returned.append(not abandoner.is_alive())
         during.append(Path(driver_dir).is_dir())
         os.makedirs(Path(driver_dir) / "_deps", exist_ok=True)
         return None
 
     with patch.object(driver_loader, "extract_config_schema_json", side_effect=extraction):
-        handoff.run()
+        # Longer than the stub's own join, so a blocked abandon is reported as such.
+        _call_bounded(handoff.run, name="runner", timeout=STUB_WAIT_SECONDS * 2)
+    assert abandoner_returned == [True], "abandon() blocked while the worker ran"
     assert during == [True], "abandon must not remove the directory under a running worker"
     assert not d.exists()
 
@@ -361,7 +418,109 @@ def test_handoff_worker_exception_still_marks_it_done(tmp_path):
     handoff = _SchemaExtraction(d)
     with patch.object(driver_loader, "extract_config_schema_json", side_effect=ValueError("x")):
         with pytest.raises(ValueError):
-            handoff.run()
+            _call_bounded(handoff.run)
     assert d.is_dir()
-    handoff.abandon()
+    _call_bounded(handoff.abandon)
+    assert not d.exists()
+
+
+# --- the lock: run's check-then-start and abandon exclude each other ---------
+
+
+class _ReportingLock:
+    """Wraps the handoff's own lock and reports, through `blocked`, the moment a
+    thread finds it held; a lock-like object with no `acquire` (a mutation such as
+    `contextlib.nullcontext()`) is entered as it is, and never blocks."""
+
+    def __init__(self, inner, blocked: threading.Event) -> None:
+        self._inner = inner
+        self._blocked = blocked
+
+    def __enter__(self):
+        acquire = getattr(self._inner, "acquire", None)
+        if acquire is None:
+            self._inner.__enter__()
+            return self
+        if not acquire(blocking=False):
+            self._blocked.set()
+            assert acquire(timeout=STUB_WAIT_SECONDS), "the lock was never released"
+        return self
+
+    def __exit__(self, *exc_info):
+        if getattr(self._inner, "acquire", None) is None:
+            return self._inner.__exit__(*exc_info)
+        self._inner.release()
+        return False
+
+
+class _PausingExtraction(_SchemaExtraction):
+    """The handoff with one test seam and no change to its code: the runner's FIRST
+    read of `_abandoned` (run's check before it records RUNNING) returns the value it
+    read, then waits until the abandoner has either finished or found the lock held.
+    That forces the interleaving the lock exists to prevent: run reads
+    not-abandoned, abandon runs, run proceeds."""
+
+    def __init__(self, driver_dir: Path, abandoner_progressed: threading.Event) -> None:
+        self.__dict__["_paused"] = False
+        self.__dict__["_progressed"] = abandoner_progressed
+        self.__dict__["runner_read"] = threading.Event()
+        super().__init__(driver_dir)
+
+    @property
+    def _abandoned(self) -> bool:
+        value = self.__dict__["_abandoned_value"]
+        if threading.current_thread().name == "runner" and not self.__dict__["_paused"]:
+            self.__dict__["_paused"] = True
+            self.__dict__["runner_read"].set()
+            self.__dict__["_progressed"].wait(timeout=STUB_WAIT_SECONDS)
+        return value
+
+    @_abandoned.setter
+    def _abandoned(self, value: bool) -> None:
+        self.__dict__["_abandoned_value"] = value
+
+
+def test_abandon_between_runs_check_and_start_waits_for_the_lock(tmp_path):
+    """With the lock, an abandon that arrives after run has read not-abandoned blocks
+    until run has recorded RUNNING, so it leaves removal to the worker: the extraction
+    runs on an intact directory and the directory is removed exactly once, after it.
+    Without the lock, abandon removes the directory in that gap, run still starts the
+    extraction on the removed directory, and the directory is removed twice."""
+    d = _attempt_dir(tmp_path)
+    progressed = threading.Event()
+    handoff = _PausingExtraction(d, progressed)
+    handoff.__dict__["_lock"] = _ReportingLock(handoff._lock, progressed)
+
+    during: list[bool] = []
+
+    def extraction(driver_dir):
+        during.append(Path(driver_dir).is_dir())
+        os.makedirs(Path(driver_dir) / "_deps", exist_ok=True)
+        return None
+
+    def abandon_then_report():
+        handoff.abandon()
+        progressed.set()
+
+    real_rmtree = shutil.rmtree
+    removals: list[Path] = []
+
+    def counting_rmtree(path, *args, **kwargs):
+        if Path(path) == d:
+            removals.append(Path(path))
+        return real_rmtree(path, *args, **kwargs)
+
+    with (
+        patch.object(driver_loader, "extract_config_schema_json", side_effect=extraction),
+        patch.object(driver_loader.shutil, "rmtree", side_effect=counting_rmtree),
+    ):
+        runner = threading.Thread(target=handoff.run, name="runner", daemon=True)
+        runner.start()
+        assert handoff.runner_read.wait(timeout=STUB_WAIT_SECONDS), "run never read the flag"
+        _call_bounded(abandon_then_report, name="abandoner")
+        runner.join(timeout=STUB_WAIT_SECONDS)
+        assert not runner.is_alive(), "run still blocked"
+
+    assert during == [True], "the extraction ran on a directory abandon had removed"
+    assert removals == [d], f"the directory was removed {len(removals)} times"
     assert not d.exists()

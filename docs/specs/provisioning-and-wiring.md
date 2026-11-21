@@ -537,14 +537,16 @@ support.
   and a reason; no other answer does (WIRE-GATE-3). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_verify_reservation_event`, `process_reservation_message`) \
   Pinned by: `services/execution/tests/test_nats_consumer_event_verification.py` (`test_unverified_terminal_event_acks_without_running_the_handler`, `test_gate_404_acks_without_running_the_handler`, `test_created_for_a_cancelled_reservation_is_unverified`); `tests/integration/test_event_verification_gate.py` (`test_forged_cancelled_event_for_an_active_reservation_is_ignored`); `tests/integration/test_wiring_changed_reconcile.py` (`test_wiring_changed_for_completed_reservation_does_not_reconnect`)
-- **WIRE-GATE-3.** A transport error (a read still unanswered at the 20 second total
+- **WIRE-GATE-3.** A transport error (a read still incomplete at the 20 second total
   deadline, `INTERNAL_READ_DEADLINE_SECONDS`, included; issue #1498) or any other
   answer from that check (a 5xx, and since #1215 a 401 or 403 during an
   `INTERNAL_API_TOKEN` rotation, a 409, or a 422 for a malformed id) raises `TransientUpstreamError`, so the message is nacked and retried,
   and dead-lettered after the backoff schedule when the answer persists (fail closed:
-  the handler never runs on it, and the event is never acked unrun). \
+  the handler never runs on it, and the event is never acked unrun). A cancellation
+  from outside the read, an outer deadline that expires first included, propagates as
+  itself and is never turned into `TransientUpstreamError`. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_get_internal`, `INTERNAL_READ_DEADLINE_SECONDS`, `_internal_record_found`, `_verify_reservation_event`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_event_verification.py` (`test_5xx_raises_transient_upstream_error`, `test_transport_error_raises_transient_upstream_error`, `test_gate_transport_failure_naks_like_any_other_transient_error`, `test_verifier_raises_transient_on_every_status_but_200_and_404`, `test_gate_auth_error_naks_and_never_runs_or_drops_the_event`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_cancelled_event_whose_check_is_refused_naks_then_tears_down`); `services/execution/tests/test_upstream_total_deadlines.py` (`test_get_internal_drip_is_cut_at_the_total_deadline`, `test_get_internal_under_the_deadline_returns_the_response`, `test_a_stalled_corroboration_read_naks_the_message`)
+  Pinned by: `services/execution/tests/test_nats_consumer_event_verification.py` (`test_5xx_raises_transient_upstream_error`, `test_transport_error_raises_transient_upstream_error`, `test_gate_transport_failure_naks_like_any_other_transient_error`, `test_verifier_raises_transient_on_every_status_but_200_and_404`, `test_gate_auth_error_naks_and_never_runs_or_drops_the_event`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_cancelled_event_whose_check_is_refused_naks_then_tears_down`); `services/execution/tests/test_upstream_total_deadlines.py` (`test_get_internal_drip_is_cut_at_the_total_deadline`, `test_get_internal_under_the_deadline_returns_the_response`, `test_a_stalled_corroboration_read_naks_the_message`, `test_cancelling_an_internal_read_propagates_and_is_not_transient`, `test_an_outer_timeout_shorter_than_the_read_deadline_is_the_outer_one`)
 - **WIRE-GATE-4.** An event with no table entry, or with no `reservation_id`, makes no
   call and goes straight to its handler. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_verify_reservation_event`) \
@@ -661,7 +663,7 @@ state transitions are WIRE-ORDER-1 and WIRE-FREEZE-1.
   object, and a transport failure raise `TransientUpstreamError` with the text
   `fetch device <id>: upstream <status>` (or `fetch template <id>: ...`,
   `...: upstream answered with a malformed body`, `...: transport error: <message>`;
-  a read still unanswered at its 20 second total deadline is a transport failure,
+  a read still incomplete at its 20 second total deadline is a transport failure,
   `...: transport error: TimeoutError`, issue #1498),
   so the event is nacked and no row is pinned with `WIRING_UNRESOLVABLE_REASON`: a
   `wiring_changed` leaves the version unstamped and records nothing for the switch,
@@ -1606,10 +1608,14 @@ full list.
 
 Fixed in code, not configurable: `max_deliver` 5; one message per fetch with a 5 second
 wait; three in-line driver attempts with 0.2 s doubling to 2 s; 10 s per phase for every
-inventory, cabling, and reservations call, and 20 s in total for each read through
-`_get_internal` (the event check, and the device, template, latest config, hypervisor,
-secret, and fork reads; `INTERNAL_READ_DEADLINE_SECONDS`, issue #1498); 120 s in total
-for a driver package download (CFG-LOAD-2); VLAN range 2 to 4094 with five allocation
+call the consumer and the retry channels make to inventory, cabling, reservations, and
+secrets, except two that take 30 s per phase: the dynamic device create
+(`POST /devices/internal`) and the driver package download, which also ends at 120 s in
+total (CFG-LOAD-2); 20 s in total for each read through `_get_internal` (the event
+check, and the device, template, latest config, hypervisor, secret, and fork reads;
+`INTERNAL_READ_DEADLINE_SECONDS`, issue #1498), while the other calls (the fabric
+lookup, the dynamic device create and delete, and the provision-result post) have no
+total bound; VLAN range 2 to 4094 with five allocation
 attempts; the claim budget (WIRE-CLAIM-3).
 
 ## 12. Test coverage map

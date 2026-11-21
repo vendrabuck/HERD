@@ -507,7 +507,7 @@ both services.
   or whose extraction raises, removes it at once, and the exception reaches the caller
   unchanged. \
   Enforced in: `services/execution/app/services/driver_loader.py` (`extract_config_schema_json`, `_SchemaExtraction`, `load_driver`); `services/execution/app/services/driver_sandbox.py` (`extract_config_schema`); `services/execution/app/services/_runner.py` (`main`) \
-  Pinned by: `services/execution/tests/test_config_schema_extraction.py` (`test_extract_valid_schema_from_fixture`, `test_extract_no_schema_from_fixture`, `test_extract_schema_returning_non_dict`, `test_extract_schema_that_raises_is_failed_run`, `test_extract_does_not_instantiate_credential_dependent_init`, `test_extract_schema_timeout_surfaces_as_failed_run`); `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_persists_published_config_schema`, `test_load_driver_no_schema_leaves_column_null`, `test_load_driver_broken_config_schema_loads_and_stores_null`); `services/execution/tests/test_driver_load_off_loop.py` (`test_load_driver_keeps_the_event_loop_running_during_schema_extraction`, `test_cancel_while_the_worker_runs_removes_the_directory_after_the_worker`, `test_cancel_while_queued_removes_the_directory_and_never_runs_the_extraction`, `test_an_extraction_that_raises_removes_the_directory_and_reraises`, `test_handoff_completed_unabandoned_keeps_the_directory`, `test_handoff_abandon_after_the_worker_finished_removes_the_directory`, `test_handoff_abandon_before_the_worker_starts_removes_it_and_skips_the_extraction`, `test_handoff_abandon_while_the_worker_runs_leaves_removal_to_the_worker`, `test_handoff_worker_exception_still_marks_it_done`)
+  Pinned by: `services/execution/tests/test_config_schema_extraction.py` (`test_extract_valid_schema_from_fixture`, `test_extract_no_schema_from_fixture`, `test_extract_schema_returning_non_dict`, `test_extract_schema_that_raises_is_failed_run`, `test_extract_does_not_instantiate_credential_dependent_init`, `test_extract_schema_timeout_surfaces_as_failed_run`); `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_persists_published_config_schema`, `test_load_driver_no_schema_leaves_column_null`, `test_load_driver_broken_config_schema_loads_and_stores_null`); `services/execution/tests/test_driver_load_off_loop.py` (`test_load_driver_keeps_the_event_loop_running_during_schema_extraction`, `test_cancel_while_the_worker_runs_removes_the_directory_after_the_worker`, `test_cancel_while_queued_removes_the_directory_and_never_runs_the_extraction`, `test_an_extraction_that_raises_removes_the_directory_and_reraises`, `test_handoff_completed_unabandoned_keeps_the_directory`, `test_handoff_abandon_after_the_worker_finished_removes_the_directory`, `test_handoff_abandon_before_the_worker_starts_removes_it_and_skips_the_extraction`, `test_handoff_abandon_while_the_worker_runs_leaves_removal_to_the_worker`, `test_handoff_worker_exception_still_marks_it_done`, `test_abandon_between_runs_check_and_start_waits_for_the_lock`)
 - **CFG-SCHEMA-12.** Execution validates a `configure` call's keyword arguments after
   the driver load, so the schema of the SHA256 being run applies, with the same
   fallback to the registry. \
@@ -1215,9 +1215,11 @@ is WIRE-DRIVER-7 in `provisioning-and-wiring.md`.
   that keeps dripping under the per-phase timeout still ends; a failure, the deadline
   included, raises a `RuntimeError` naming only the cause's class (`TimeoutError` for
   the deadline), which callers treat as transient. The archive is read into memory, so
-  a download cut off leaves nothing on disk and no cache row. \
+  a download cut off leaves nothing on disk and no cache row. A cancellation from
+  outside, an outer deadline that expires first included, propagates as itself and is
+  never turned into that failure. \
   Enforced in: `services/execution/app/services/driver_loader.py` (`download_driver_package`, `DRIVER_DOWNLOAD_DEADLINE_SECONDS`, `load_driver`) \
-  Pinned by: `services/execution/tests/test_driver_loader_load.py` (`test_download_driver_package_success`, `test_download_driver_package_failure`, `test_load_driver_download_failure`, `test_load_driver_download_failure_sanitizes_foreign_text`); `services/execution/tests/test_upstream_total_deadlines.py` (`test_deadlines_are_the_documented_constants`, `test_download_drip_is_cut_at_the_total_deadline`, `test_download_under_the_deadline_returns_the_body`, `test_load_driver_maps_a_download_deadline_to_the_transient_failure`)
+  Pinned by: `services/execution/tests/test_driver_loader_load.py` (`test_download_driver_package_success`, `test_download_driver_package_failure`, `test_load_driver_download_failure`, `test_load_driver_download_failure_sanitizes_foreign_text`); `services/execution/tests/test_upstream_total_deadlines.py` (`test_deadlines_are_the_documented_constants`, `test_download_drip_is_cut_at_the_total_deadline`, `test_download_under_the_deadline_returns_the_body`, `test_load_driver_maps_a_download_deadline_to_the_transient_failure`, `test_cancelling_a_download_propagates_and_is_not_a_deadline`, `test_an_outer_timeout_shorter_than_the_download_deadline_is_the_outer_one`)
 - **CFG-LOAD-3.** The archive is extracted into a directory of the load's own,
   `DRIVER_CACHE_PATH/<driver id>-<random hex>`, never shared with another load: a
   `.zip`, or a `.tar.gz` or `.tgz` through the tar `data` filter; entries cannot land
@@ -1635,6 +1637,10 @@ None at present. (#1279 is resolved by CFG-LOAD-3.)
   again by extraction, synchronously inside the async `load_driver`, so up to about
   twice the 100 MiB ceiling of gunzip work blocks the event loop (the
   `extract_driver_package` docstring) (CFG-LOAD-3).
+- A cache-miss load's config-schema extraction waits for a worker in the default
+  thread pool, which it shares with every other driver call (the wiring consumer's,
+  health polls, manual runs), package validation, and asyncio's `getaddrinfo`, and no
+  timer counts that wait (issue #1498, item 4, open) (CFG-SCHEMA-11).
 - The validator reports a raised step's message, which a driver run never stores (the
   `_validation_error_text` docstring) (CFG-VAL-8).
 - The published-schema lookup fails open to the registry (ADR 0002 and the
