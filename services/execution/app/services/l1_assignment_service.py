@@ -693,11 +693,16 @@ async def _record_l1_failed_for_row(
     `claims.held`), every value is written only where
     `wiring_claim.direction_admits(model, intended)` holds, in the same UPDATE: the
     row still intends the direction this failure records, or the failure is a release
-    and the reservation is frozen. Such a write runs before any per-row claim (a load,
-    login, create_vlan, re-allocation, or L3 gate failure), so the row may have been
-    parked since the pass planned it; a refused write changes no value, returns None,
-    and adds the row to `claims.wrong_direction`. A row this pass holds takes no
-    compare: its claim compared the direction already.
+    and the reservation is frozen. Such a write runs before any per-row claim (a
+    switch read, template read, driver load, or login failure, an L2 create_vlan or
+    re-allocation failure, or an L3 drive-gate refusal), so the row may have been
+    parked since the pass planned it. The value CASE (`direction_guarded_values`) and
+    `RETURNING intended` tell an admitted write from a refused one; a refused write is
+    rolled back, which is what leaves every value as it was, returns None, and adds the
+    row to `claims.wrong_direction`. A row this pass holds takes no compare: its claim
+    compared the direction already. Known gap: with `claims` None a refused write is
+    recorded nowhere and logs nothing (no retry caller passes `row_id` without
+    `claims` today).
     """
     values: dict = {
         "status": "FAILED",

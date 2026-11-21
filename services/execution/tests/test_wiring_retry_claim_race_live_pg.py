@@ -1402,6 +1402,49 @@ async def test_the_direction_compare_and_its_frozen_exception_on_postgres(sessio
         await _cleanup(session_factory, reservation_id)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layer", ["l1", "l2", "l3"])
+async def test_a_refused_failure_write_is_rolled_back_on_postgres(session_factory, layer):
+    """Issue #1496 review 2: a refused row-id failure write leaves its values as they
+    were because the writer rolls the caller's session back, not because of the value
+    CASE alone. On Postgres the refused UPDATE still locks the row; after the writer
+    returns, the caller's session has no transaction open, another connection can lock
+    the row at once, and the row reads unchanged from both sessions."""
+    from app.services.l1_assignment_service import record_l1_failed
+    from app.services.l2_membership_service import record_l2_failed
+    from app.services.route_service import record_route_failed
+    from app.services.wiring_claim import WiringRowClaims
+
+    reservation_id = uuid.uuid4()
+    model, row_id = await _seed_failed_row(session_factory, reservation_id, layer)
+    try:
+        before = await _stored(session_factory, model, row_id)
+        common = {"intended": "ACTIVE", "row_id": row_id, "claims": WiringRowClaims()}
+        async with session_factory() as db:
+            if layer == "l1":
+                written = await record_l1_failed(
+                    db, reservation_id, SWITCH_ID, "0/0/51", "0/0/52", 1, "again", **common
+                )
+            elif layer == "l2":
+                written = await record_l2_failed(
+                    db, reservation_id, None, SWITCH_ID, "0/0/53", 1, "again", **common
+                )
+            else:
+                written = await record_route_failed(
+                    db, reservation_id, SWITCH_ID, None, 1, "again", **common
+                )
+            assert written is None
+            assert common["claims"].wrong_direction == {row_id}
+            assert not db.in_transaction(), "the refused write left the session open"
+            assert await _row_lockable_now(session_factory, model, row_id)
+            row = (await db.execute(select(model).where(model.id == row_id))).scalar_one()
+            assert (row.claimed_until, row.last_error, row.attempts) == before
+            assert row.intended == "RELEASED"
+        assert await _stored(session_factory, model, row_id) == before
+    finally:
+        await _cleanup(session_factory, reservation_id)
+
+
 # Issue #1479: a retry holder's success and release flips stay unconditional, exactly
 # as on main (any change belongs to issue #1481), so a driver action that succeeded is
 # recorded even after a writer that does not claim cleared the holder's claim. These

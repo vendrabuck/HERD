@@ -726,17 +726,22 @@ async def test_the_tick_counts_a_direction_refusal_still_failed_not_in_progress(
 # before the write used to be overwritten: the write set intended back to ACTIVE.
 # The sites, each the seam the park lands in here:
 #
-#   L1 `_apply_wiring_pairs`: the template read, the driver load, the login.
-#   L2 `_apply_l2_memberships`: the template read, the driver load, the login, and the
-#      create_vlan definition pre-pass; `_reattempt_l2_rows`: the re-allocation of a
-#      row whose allocation is the nil placeholder.
+#   L1 `_apply_wiring_pairs`: the switch read, the template read, the driver load, the
+#      login, in both directions.
+#   L2 `_apply_l2_memberships`: the same four in both directions, and the create_vlan
+#      definition pre-pass (adds); `_reattempt_l2_rows`: the re-allocation of a row
+#      whose allocation is the nil placeholder.
 #   L3 `_apply_l3_adjacency`: the switch read, the template read, the driver load (an
 #      L3 login failure comes after the pin's claim); `_reattempt_l3_rows`: the drive
 #      gate's refusal.
 #
-# The L1 and L2 switch reads are not seams here: the pass's fetch context memoizes the
-# switch from the revalidation that admitted the build, so the apply reads the same
-# answer. Their failure writes are guarded the same way.
+# The L1 and L2 switch reads are not seams for a BUILD-planned row: the pass's fetch
+# context memoizes the switch from the revalidation that admitted the build, so the
+# apply reads the same answer. A RELEASE-planned row has no revalidation, so its switch
+# read can be fresh and its switch-not-found failure write is a pre-claim write too,
+# guarded the same way. This matrix stages build rows parked mid-pass; the writer's
+# compare in both directions is the grid in
+# test_a_failure_write_on_a_row_the_pass_does_not_hold_compares_the_direction.
 
 PRE_CLAIM_SITES = (
     ("l1", "template_missing"),
@@ -918,8 +923,13 @@ async def test_a_failure_recorded_before_the_claim_does_not_undo_a_park(layer, s
     assert (p1_claims.wrong_direction, p1_claims.lost) == ({row_id}, set())
 
     if site == "reallocation_failure":
-        # The park writers never park a nil-allocation row (it is released directly,
-        # it has no VLAN number to remove); this site only pins the write's guard.
+        # The stale-build park stands in here for the writer that really moves a nil
+        # row's direction in this window: a frozen join's record-time park
+        # (`record_l2_membership_active`), which reuses the reservation's FAILED row
+        # for the (switch, port) and gives it the join's allocation. That path, and
+        # its conservation, is the real case:
+        # test_a_frozen_join_on_the_nil_row_survives_the_reallocation_failure. A
+        # stale-build park leaves the nil allocation, so this case drives no release.
         return
     # Conservation: the parked row is release work, and the next tick takes it, frozen
     # or not (a release-direction row is never a frozen build).
@@ -1156,3 +1166,196 @@ async def test_a_failure_write_on_a_row_the_pass_holds_takes_no_direction_compar
     assert await _write_failure_by_row_id(layer, row_id, holder, "ACTIVE") is None
     assert (holder.lost, holder.wrong_direction) == ({row_id}, set())
     assert (await _state(layer, row_id))[1] == "RELEASED"
+
+
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_a_refused_failure_write_is_rolled_back_in_the_callers_session(layer):
+    """What leaves a refused failure write's values as they were is its rollback: the
+    write's UPDATE runs (each value under `CASE WHEN admitted`), and the writer rolls
+    the caller's session back before it returns. Pinned here: after the refusal the
+    caller's session has no transaction open, and the row reads unchanged from that
+    session and from a second one."""
+    row_id = await _seed(layer, "RELEASED", claimed_until=_expired())
+    before = await _state(layer, row_id)
+    model = MODEL[layer]
+    from app.services.l1_assignment_service import record_l1_failed
+    from app.services.l2_membership_service import record_l2_failed
+    from app.services.route_service import record_route_failed
+
+    common = {"intended": "ACTIVE", "row_id": row_id, "claims": WiringRowClaims()}
+    async with TestSessionLocal() as s:
+        if layer == "l1":
+            written = await record_l1_failed(
+                s, RES_ID, SWITCH_ID, PORT_A, PORT_B, 1, "again", **common
+            )
+        elif layer == "l2":
+            written = await record_l2_failed(
+                s, RES_ID, None, SWITCH_ID, L2_PORT, 1, "again", **common
+            )
+        else:
+            written = await record_route_failed(s, RES_ID, SWITCH_ID, None, 1, "again", **common)
+        assert written is None
+        assert not s.in_transaction(), "the refused write left the caller's session open"
+        row = (await s.execute(select(model).where(model.id == row_id))).scalar_one()
+        same_session = (row.status, row.intended, row.attempts, row.last_error, row.claimed_until)
+    assert same_session == before
+    assert await _state(layer, row_id) == before
+
+
+async def test_a_frozen_join_on_the_nil_row_survives_the_reallocation_failure():
+    """The real path behind the L2 re-allocation site. P1 loads a FAILED build row whose
+    allocation is the nil placeholder and revalidates it. While P1 re-allocates, the
+    reservation freezes and a join for the same (switch, port) succeeds:
+    `record_l2_membership_active`'s record-time freeze branch reuses the reservation's
+    FAILED row for the port (this nil row), gives it the join's allocation, and parks it
+    FAILED intended RELEASED (FROZEN_JOIN_PENDING_REMOVAL). P1's re-allocation then
+    fails and its build failure write by row id is refused for direction, so the park
+    stands, and the next tick removes the membership from the join's real VLAN."""
+    from app.services.l2_membership_service import (
+        FROZEN_JOIN_PENDING_REMOVAL,
+        record_l2_membership_active,
+    )
+    from app.services.wiring_retry_service import run_wiring_retry_tick
+
+    row_id = await _seed_for_site("l2", "reallocation_failure")
+    async with TestSessionLocal() as s:
+        join_va = (
+            await s.execute(
+                select(VlanAssignment.id).where(VlanAssignment.reservation_id == RES_ID)
+            )
+        ).scalar_one()
+    p1_rows = await _loaded("l2", row_id)
+    p1_claims = WiringRowClaims()
+
+    async def _frozen_join():
+        await _freeze()
+        async with TestSessionLocal() as s:
+            await record_l2_membership_active(s, RES_ID, join_va, SWITCH_ID, L2_PORT)
+
+    with ExitStack() as stack:
+        seen, calls = _stage_pre_claim_failure("l2", "reallocation_failure", _frozen_join, stack)
+        outcomes = await _reattempt("l2")(p1_rows, _db_session_factory(), p1_claims)
+
+    assert seen.get("done")
+    assert "add_to_vlan" not in calls
+    assert [o["outcome"] for o in outcomes] == ["still_failed"]
+    async with TestSessionLocal() as s:
+        row = await s.get(L2PortAssignment, row_id)
+        parked = (row.status, row.intended, row.last_error, row.vlan_assignment_id)
+    assert parked == ("FAILED", "RELEASED", FROZEN_JOIN_PENDING_REMOVAL, join_va)
+    assert (p1_claims.wrong_direction, p1_claims.lost) == ({row_id}, set())
+
+    removed: list = []
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        if action == "remove_from_vlan":
+            removed.append((kwargs.get("method_kwargs") or {}).get("vlan_id"))
+        return SUCCESS
+
+    with ExitStack() as stack:
+        _staged_park("l2", [], AsyncMock(return_value=[]), stack)
+        stack.enter_context(
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn)
+        )
+        stats = await run_wiring_retry_tick(_db_session_factory())
+    assert removed == [VLAN]
+    assert stats["released"] == 1
+    assert (await _state("l2", row_id))[0] == "RELEASED"
+
+
+# --- Known limit: a frozen release drives what it planned ---------------------
+#
+# On a frozen reservation a release is admitted whatever the row intends, and it drives
+# the content the pass PLANNED. For L1 (one wire per row) that settles the row
+# correctly. For L3 (a pin's route set) and L2 (a membership's allocation), content a
+# writer that does not compare direction added in the window (a newer route, a
+# re-pointed allocation) is neither driven nor kept in the record. Main behaves the
+# same (its claim and writers compare nothing). This is the stale-content window issue
+# #1481 tracks; these tests pin today's behaviour so a fix there shows up here.
+
+R2 = {"destination": "10.77.0.0/24", "next_hop": "10.77.0.1"}
+
+
+async def _key_based_provision_failure(routes):
+    """A reconcile provision that passed its frozen check before the freeze, configured
+    `routes`, and failed: the key-based write, which compares no direction."""
+    from app.services.route_service import record_route_failed
+
+    async with TestSessionLocal() as s:
+        await record_route_failed(
+            s, RES_ID, str(SWITCH_ID), routes, 1, "driver timeout", intended="ACTIVE"
+        )
+
+
+async def test_known_limit_a_frozen_l3_release_removes_only_the_routes_it_planned():
+    """Known limit (#1481). A frozen reservation's pin is FAILED intended RELEASED with
+    routes [R1]. The tick selects it and plans the deprovision of [R1]. Inside the
+    tick's driver load a key-based provision failure records [R2, R1] intended ACTIVE.
+    The tick's release claim is admitted (frozen), it removes R1 only, and the pin is
+    recorded RELEASED with [R2, R1]: R2 stays on the switch under a RELEASED pin."""
+    from app.services.wiring_retry_service import run_wiring_retry_tick
+
+    row_id = await _seed("l3", "RELEASED", attempts=1)
+    await _freeze()
+    flipped: dict = {}
+
+    async def _load(*args, **kwargs):
+        if "done" not in flipped:
+            flipped["done"] = True
+            await _key_based_provision_failure([R2, ROUTE])
+        return "/tmp/d"
+
+    removed: list = []
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        if action == "remove_route":
+            removed.append((kwargs.get("method_kwargs") or {}).get("destination"))
+        return SUCCESS
+
+    with ExitStack() as stack:
+        _staged_park("l3", [], AsyncMock(return_value=[]), stack)
+        stack.enter_context(
+            patch("app.services.driver_loader.load_driver", AsyncMock(side_effect=_load))
+        )
+        stack.enter_context(
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn)
+        )
+        await run_wiring_retry_tick(_db_session_factory())
+
+    assert flipped.get("done")
+    assert removed == [ROUTE["destination"]], "only the planned route is removed"
+    async with TestSessionLocal() as s:
+        row = await s.get(RouteAssignment, row_id)
+        final = (row.status, sorted(r["destination"] for r in row.routes))
+    assert final == ("RELEASED", sorted([R2["destination"], ROUTE["destination"]]))
+
+
+async def test_known_limit_an_admitted_frozen_release_failure_records_only_its_routes():
+    """Known limit (#1481), the failure-write form. Same frozen pin and the same
+    key-based write of [R2, R1] intended ACTIVE; the release pass then fails before its
+    claim (for example its driver load) and records its failure by row id with the
+    routes it planned, [R1]. The write is admitted (a release on a frozen reservation),
+    so the pin is FAILED intended RELEASED with [R1] only: R2 is gone from the record,
+    and the next release removes R1 alone."""
+    from app.services.route_service import record_route_failed
+
+    row_id = await _seed("l3", "RELEASED", attempts=1)
+    await _freeze()
+    await _key_based_provision_failure([R2, ROUTE])
+    async with TestSessionLocal() as s:
+        written = await record_route_failed(
+            s,
+            RES_ID,
+            str(SWITCH_ID),
+            [ROUTE],
+            1,
+            "driver load failed: RuntimeError",
+            intended="RELEASED",
+            row_id=row_id,
+            claims=WiringRowClaims(),
+        )
+    assert written is not None
+    async with TestSessionLocal() as s:
+        row = await s.get(RouteAssignment, row_id)
+        final = (row.status, row.intended, [r["destination"] for r in row.routes])
+    assert final == ("FAILED", "RELEASED", [ROUTE["destination"]])

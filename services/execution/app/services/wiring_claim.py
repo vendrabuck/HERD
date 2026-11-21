@@ -31,21 +31,25 @@ Shape, and why it is this shape:
     provision; RELEASED for a disconnect, a remove, or a deprovision), and the stamp is
     written only where `direction_admits` holds: the row's `intended` equals that
     direction, or the direction is RELEASED and the row's reservation is frozen (a
-    frozen reservation's wiring only ever leaves, so a release is never refused there;
-    a build never gets this exception). `SET claimed_until = CASE WHEN <admits> THEN
-    :stamp ELSE claimed_until END ... RETURNING claimed_until`. A matching row the
+    frozen reservation's wiring only ever leaves, so a release is admitted there
+    whatever the row intends; a build never gets this exception).
+    `SET claimed_until = CASE WHEN <admits> THEN :stamp ELSE claimed_until END ...
+    RETURNING claimed_until`. A matching row the
     direction does not admit keeps every value (the UPDATE still runs, so on Postgres
     it writes a new row version and holds the row lock until its commit), and the
     returned stamp tells the two refusals apart from the same statement, with no second
     read: no row returned is "lost" (another holder, or no longer FAILED, read back
     `in_progress` when still FAILED), a row whose returned stamp is not this claim's is
     "wrong direction" (read back by its status, `still_failed` while FAILED).
-  - A retry pass's failure write by row id on a row it does NOT hold (the load, login,
-    create_vlan, re-allocation, and L3 gate failures recorded before any per-row
-    claim) takes the same `direction_admits` compare in its own UPDATE, because the
-    row it planned may have been parked since: an admitted write lands as before, a
-    refused one changes no value and joins `wrong_direction`. A write on a row the
-    pass holds takes no compare (its claim compared already).
+  - A retry pass's failure write by row id on a row it does NOT hold (the failures
+    recorded before any per-row claim: the switch read, the template read, the driver
+    load, and the login on L1 and L2, L2's create_vlan pre-pass and re-allocation, and
+    the switch read, template read, driver load, and drive-gate refusal on L3) takes
+    the same `direction_admits` compare in its own UPDATE, because the row it planned
+    may have been parked since: an admitted write lands as before; a refused one is
+    rolled back, which is what leaves every value as it was, and joins
+    `wrong_direction`. A write on a row the pass holds takes no compare (its claim
+    compared already).
   - What this closes: a pass that planned a build from an older read can no longer
     claim and connect, add, or provision a row another pass parked (intended RELEASED)
     in between, nor undo that park with a failure it records before its claim; and a
@@ -57,10 +61,17 @@ Shape, and why it is this shape:
     drives it over a newer failed attempt). A refused row is retried by a later pass in
     the direction it then intends, with one exception, as on main: a FAILED
     intended-ACTIVE row on a frozen reservation is driven by no retry (the tick leaves
-    it out as a frozen build, the manual retry reports it `frozen`). The frozen fact is
-    read inside the statement and freezing is forward-only, so a freeze that commits
-    after the statement's snapshot reads as not frozen and the release is refused like
-    any other mismatch: it errs toward refusal, never toward a drive.
+    it out as a frozen build, the manual retry reports it `frozen`). On a frozen
+    reservation an admitted release drives the content the pass PLANNED: for L1 (one
+    wire per row) that settles the row, but for L3 and L2, content a writer that does
+    not compare direction added in the window (a newer route, a re-pointed allocation)
+    is neither driven nor kept in the record, as on main; that is the stale-content
+    window issue #1481 tracks. The frozen fact is read inside the statement and
+    freezing is forward-only, so a freeze that commits after the statement's snapshot
+    (for example while the claim waits on the row's lock) reads as not frozen and the
+    release is refused like any other mismatch. That is safe for exclusion (it never
+    drives), but on a frozen reservation the refused row is the unsettled case: it
+    waits FAILED intended ACTIVE like any such row (see `direction_admits`).
 
 Who may use these readers, and who may not. `claimable_row_ids` and `unclaimed`
 are for the RETRY CHANNELS ONLY. The wiring_changed reconcile in `nats_consumer`
@@ -242,19 +253,32 @@ def direction_admits(model, intended: str):
 
     Issue #1496. True when the row's `intended` equals the direction, and, for the
     RELEASED direction only, also when the row's reservation is frozen: a frozen
-    reservation's wiring only ever leaves (its build rows are never driven again), so a
-    release refused there would strand the row, while a release over a row that
-    intends ACTIVE is exactly what the freeze wants. The BUILD direction never gets
-    this exception.
+    reservation's wiring only ever leaves (no retry drives its build rows), so a
+    release refused there would strand the row. The BUILD direction never gets this
+    exception.
+
+    What an admitted frozen release drives is the content the pass planned from its
+    earlier read, not the row's current content. For L1 (one wire per row) that settles
+    the row. For L3 and L2 it does not cover content a writer that does not compare
+    direction added in the window: a key-based failure write that recorded a newer
+    route (L3) or re-pointed the allocation (L2) after the pass planned its release is
+    neither driven nor kept in the record (the release flip, or an admitted release
+    failure write with the pass's own routes, overwrites it), exactly as on main. That
+    is the stale-content window issue #1481 tracks.
 
     The frozen fact is a correlated EXISTS over `reservation_wiring_state`
     (`wiring_due.reservation_frozen`), evaluated inside the caller's own statement,
-    so no caller passes it and it is never older than that statement. Freezing is
-    forward-only (`freeze_reservation_wiring` is the only writer of `frozen` and only
-    sets it true; `stamp_last_applied` never clears it, WIRE-ORDER-1, WIRE-FREEZE-1),
-    so the one way the read can be out of date is a freeze that commits after the
-    statement's snapshot: it reads not frozen, and the release is refused like any
-    other mismatch. It errs toward refusal, never toward a drive.
+    so no caller passes it and it is never older than that statement's snapshot.
+    Freezing is forward-only (`freeze_reservation_wiring` is the only writer of
+    `frozen` and only sets it true; `stamp_last_applied` never clears it, WIRE-ORDER-1,
+    WIRE-FREEZE-1), so the one way the read can be out of date is a freeze that
+    commits after that snapshot, including one that commits while the statement waits
+    on the row's lock (the re-check after the wait sees the row's new version, not the
+    new freeze). It reads as not frozen, and the release is refused like any other
+    mismatch. That is safe for exclusion (it never drives), but on a frozen reservation
+    a refusal is the unsettled case: the row is left FAILED intended ACTIVE, which no
+    retry drives. On L3 the teardown's read of FAILED pins parks and removes it unless
+    the flip lands after that read; on L1 and L2 nothing settles it, as on main.
     """
     if intended == "RELEASED":
         return or_(model.intended == "RELEASED", reservation_frozen(model))
@@ -262,10 +286,17 @@ def direction_admits(model, intended: str):
 
 
 def direction_guarded_values(model, values: dict, intended: str) -> dict:
-    """Wrap each value of a row-id failure write so it lands only where the direction
-    is admitted (issue #1496): `col = CASE WHEN direction_admits THEN value ELSE col
-    END`. A refused write then changes no value. Python values are bound with their
-    column's type."""
+    """Wrap each value of a row-id failure write in `CASE WHEN direction_admits THEN
+    value ELSE column END` (issue #1496). Python values are bound with their column's
+    type.
+
+    What each part does. The CASE on `intended` is what tells an admitted write from a
+    refused one inside the same statement: the writer returns `intended`, which equals
+    the direction it records only when the write was admitted. What leaves a refused
+    write's values as they were is the writer's rollback, before it returns. The CASE
+    on the other columns is a second line behind that rollback; no test can tell it
+    from a plain value while the rollback is there.
+    """
     admits = direction_admits(model, intended)
     guarded = {}
     for name, value in values.items():
