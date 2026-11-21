@@ -73,6 +73,7 @@ from __future__ import annotations
 
 from sqlalchemy import and_, case, func, literal, not_, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.models.reservation_wiring_state import ReservationWiringState
 
@@ -99,17 +100,71 @@ def retryable_reason(model):
     return or_(col.is_(None), col == "", starts_with_none)
 
 
-def reservation_frozen(model):
+def reservation_frozen(model, reservation_id=None):
     """SQL for "this row's reservation's wiring is frozen": a correlated EXISTS over
-    `reservation_wiring_state`. No state row means not frozen."""
+    `reservation_wiring_state`. No state row means not frozen.
+
+    `reservation_id`, when given, is compared instead of the row's own column: an
+    INSERT has no row to correlate with (issue #1501, the key-based failure writers'
+    insert branch)."""
+    if reservation_id is None:
+        target = model.reservation_id
+    else:
+        target = literal(reservation_id, type_=model.reservation_id.type)
     return (
         select(literal(1))
         .where(
-            ReservationWiringState.reservation_id == model.reservation_id,
+            ReservationWiringState.reservation_id == target,
             ReservationWiringState.frozen.is_(true()),
         )
         .exists()
     )
+
+
+def frozen_build_failure_values(
+    model,
+    attempts,
+    reservation_id=None,
+    *,
+    last_error: str | None = None,
+    frozen_last_error: str | None = None,
+) -> dict:
+    """The `intended` and `attempts` of a key-based BUILD failure write (issue #1501).
+
+    On a reservation whose wiring is frozen, a build failure is recorded the way the
+    terminal teardown parks a FAILED intended-ACTIVE row: intended RELEASED, attempts
+    0, so the release-direction retry channels, which run while frozen, drive the
+    removal of whatever the failed build may have left. Otherwise the write is the
+    ordinary build failure: intended ACTIVE, `attempts` as the caller computed it.
+
+    Both values are CASE expressions on `reservation_frozen`, so the frozen fact is
+    read inside the write's own statement (no window between the check and the
+    write) and is never older than that statement's snapshot. Freezing is
+    forward-only (WIRE-FREEZE-1), so the one stale read is a freeze that commits
+    after that snapshot. `reservation_id` is for the insert branch (see
+    `reservation_frozen`); an update correlates with the row it writes.
+
+    `frozen_last_error`, when given, also returns `last_error` as the same CASE: the
+    teardown park's reason on a frozen reservation, `last_error` otherwise (L3, whose
+    teardown park replaces the reason with the retryable `TEARDOWN_PENDING_REMOVAL`,
+    so a converted pin is always one the tick drives).
+    """
+    frozen = reservation_frozen(model, reservation_id)
+    if not isinstance(attempts, ColumnElement):
+        attempts = literal(attempts, type_=model.attempts.type)
+    values = {
+        "intended": case(
+            (frozen, literal("RELEASED", type_=model.intended.type)),
+            else_=literal("ACTIVE", type_=model.intended.type),
+        ),
+        "attempts": case((frozen, literal(0, type_=model.attempts.type)), else_=attempts),
+    }
+    if frozen_last_error is not None:
+        values["last_error"] = case(
+            (frozen, literal(frozen_last_error, type_=model.last_error.type)),
+            else_=literal(last_error, type_=model.last_error.type),
+        )
+    return values
 
 
 def frozen_build(model):

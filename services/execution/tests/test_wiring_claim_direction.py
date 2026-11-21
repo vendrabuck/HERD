@@ -1065,18 +1065,18 @@ async def test_a_build_over_a_released_row_is_refused_on_a_frozen_reservation(la
 
 
 async def test_a_frozen_release_refused_by_a_flip_to_active_no_longer_strands_the_pin():
-    """The review's reproduction. A frozen reservation's FAILED intended-RELEASED pin (a
-    teardown removal that failed). The tick selects it and plans the deprovision. Inside
-    the tick's driver load a writer that does not compare direction records a build
-    failure for the pin by key (a reconcile provision that passed its frozen check
-    before the freeze): FAILED intended ACTIVE. The tick's release claim is admitted on
-    the frozen reservation, the routes are removed, and the pin is RELEASED. Refused,
-    the pin would stay FAILED intended ACTIVE, which no later tick selects."""
+    """The review's reproduction. A FAILED intended-RELEASED pin. The tick selects it and
+    plans the deprovision. Inside the tick's driver load a writer that does not compare
+    direction records a build failure for the pin by key (a reconcile provision) while
+    the reservation is not frozen yet: FAILED intended ACTIVE. Then the reservation
+    freezes. The tick's release claim is admitted on the frozen reservation, the routes
+    are removed, and the pin is RELEASED. Refused, the pin would stay FAILED intended
+    ACTIVE, which no later tick selects. (Since #1501 a key-based build failure written
+    after the freeze records intended RELEASED, so the flip must come before it.)"""
     from app.services.route_service import record_route_failed
     from app.services.wiring_retry_service import run_wiring_retry_tick
 
     row_id = await _seed("l3", "RELEASED", attempts=1)
-    await _freeze()
     flipped: dict = {}
 
     async def _load(*args, **kwargs):
@@ -1086,6 +1086,8 @@ async def test_a_frozen_release_refused_by_a_flip_to_active_no_longer_strands_th
                 await record_route_failed(
                     s, RES_ID, str(SWITCH_ID), [ROUTE], 1, "driver timeout", intended="ACTIVE"
                 )
+            assert (await _state("l3", row_id))[1] == "ACTIVE"
+            await _freeze()
         return "/tmp/d"
 
     execute_fn, calls = _recorder()
@@ -1290,9 +1292,12 @@ async def _key_based_provision_failure(routes):
 async def test_known_limit_a_frozen_l3_release_removes_only_the_routes_it_planned():
     """Known limit (#1481). A frozen reservation's pin is FAILED intended RELEASED with
     routes [R1]. The tick selects it and plans the deprovision of [R1]. Inside the
-    tick's driver load a key-based provision failure records [R2, R1] intended ACTIVE.
-    The tick's release claim is admitted (frozen), it removes R1 only, and the pin is
-    recorded RELEASED with [R2, R1]: R2 stays on the switch under a RELEASED pin."""
+    tick's driver load a key-based provision failure records [R2, R1]; since #1501 it
+    records them intended RELEASED on the frozen reservation (WIRE-LEDGER-17), so the
+    tick's release claim is admitted because the pin intends RELEASED. The tick removes
+    R1 only, the content it planned, and the pin is recorded RELEASED with [R2, R1]: R2
+    stays on the switch under a RELEASED pin. Pinned: a frozen release drives the routes
+    its pass planned, not the row's current ones."""
     from app.services.wiring_retry_service import run_wiring_retry_tick
 
     row_id = await _seed("l3", "RELEASED", attempts=1)
@@ -1332,11 +1337,13 @@ async def test_known_limit_a_frozen_l3_release_removes_only_the_routes_it_planne
 
 async def test_known_limit_an_admitted_frozen_release_failure_records_only_its_routes():
     """Known limit (#1481), the failure-write form. Same frozen pin and the same
-    key-based write of [R2, R1] intended ACTIVE; the release pass then fails before its
-    claim (for example its driver load) and records its failure by row id with the
-    routes it planned, [R1]. The write is admitted (a release on a frozen reservation),
-    so the pin is FAILED intended RELEASED with [R1] only: R2 is gone from the record,
-    and the next release removes R1 alone."""
+    key-based write of [R2, R1], which since #1501 records intended RELEASED on the
+    frozen reservation (WIRE-LEDGER-17); the release pass then fails before its claim
+    (for example its driver load) and records its failure by row id with the routes it
+    planned, [R1]. The write is admitted (the pin intends RELEASED), so the pin is FAILED
+    intended RELEASED with [R1] only: R2 is gone from the record, and the next release
+    removes R1 alone. Pinned: an admitted release failure records the routes its pass
+    planned, not the row's current ones."""
     from app.services.route_service import record_route_failed
 
     row_id = await _seed("l3", "RELEASED", attempts=1)
@@ -1359,3 +1366,64 @@ async def test_known_limit_an_admitted_frozen_release_failure_records_only_its_r
         row = await s.get(RouteAssignment, row_id)
         final = (row.status, row.intended, [r["destination"] for r in row.routes])
     assert final == ("FAILED", "RELEASED", [ROUTE["destination"]])
+
+
+async def test_known_limit_a_teardown_deprovision_removes_only_the_routes_it_read():
+    """Known limit (#1481), the teardown form; it flips when #1481 is fixed. A frozen
+    reservation's ACTIVE pin holds [R1]. The terminal teardown reads it and plans the
+    deprovision of [R1]. Inside the teardown's driver load an intent-delta reconcile
+    that passed its frozen gate before the freeze records its failure on the pin
+    (`record_route_reconcile_failed`, possibly installed [R1, R2]): since #1501 that is a
+    pending release on the frozen reservation (WIRE-LEDGER-17), so the teardown's
+    removal gate still admits the pin. The teardown removes R1 only, the routes it read,
+    and records the pin RELEASED with [R1, R2]: R2 stays on the switch under a RELEASED
+    pin. Before #1501 the failure recorded intended ACTIVE, the gate skipped the pin, and
+    it stayed FAILED intended ACTIVE with nothing removed."""
+    from app.services.nats_consumer import _FetchContext, _teardown_from_ledgers
+    from app.services.route_service import record_route_reconcile_failed
+
+    row_id = await _seed("l3", "ACTIVE", attempts=0, last_error=None)
+    async with TestSessionLocal() as s:
+        row = await s.get(RouteAssignment, row_id)
+        row.status = "ACTIVE"
+        await s.commit()
+    await _freeze()
+    landed: dict = {}
+
+    async def _load(*args, **kwargs):
+        if "done" not in landed:
+            landed["done"] = True
+            async with TestSessionLocal() as s:
+                landed["row"] = await record_route_reconcile_failed(
+                    s, RES_ID, str(SWITCH_ID), 3, "boom", [ROUTE], possibly_installed=[ROUTE, R2]
+                )
+        return "/tmp/d"
+
+    removed: list = []
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        if action == "remove_route":
+            removed.append((kwargs.get("method_kwargs") or {}).get("destination"))
+        return SUCCESS
+
+    async def _device(device_id, client=None):
+        return _switch("l3") if str(device_id) == str(SWITCH_ID) else None
+
+    with ExitStack() as stack:
+        for target, value in (
+            ("app.services.nats_consumer._fetch_device", AsyncMock(side_effect=_device)),
+            ("app.services.nats_consumer._fetch_template", AsyncMock(return_value=TEMPLATE)),
+            ("app.services.driver_loader.load_driver", AsyncMock(side_effect=_load)),
+        ):
+            stack.enter_context(patch(target, value))
+        stack.enter_context(
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn)
+        )
+        await _teardown_from_ledgers(str(RES_ID), _FetchContext(None), _db_session_factory())
+
+    assert landed.get("row") is not None and landed["row"].intended == "RELEASED"
+    assert removed == [ROUTE["destination"]], "only the routes the teardown read are removed"
+    async with TestSessionLocal() as s:
+        row = await s.get(RouteAssignment, row_id)
+        final = (row.status, sorted(r["destination"] for r in row.routes))
+    assert final == ("RELEASED", sorted([R2["destination"], ROUTE["destination"]]))
