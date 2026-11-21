@@ -48,6 +48,7 @@ locust -f locustfile.py \
 | ACLChecker | 2 | Single and batch permission checks |
 | LoginLimitProbe | exactly 1 user | After 15 s, floods wrong-password logins from this host until auth's per-source attempt limit answers 429; any answer but 401 or 429 fails the run |
 | OversizedBodySender | exactly 1 user | Never signs in; sends bodies one byte over `MAX_REQUEST_BODY_BYTES` to one route of every service, with a Content-Length or chunked; any answer but the 413 `body_too_large` fails the run |
+| LargeCanvasSaver | exactly 1 user | Signs in as the admin and saves one canvas over the default body limit (about 1.3 MiB) to `PUT /api/cabling/topologies/{id}`, a large-JSON route (issue #1484); any answer but 200 fails the run |
 
 ## Logins and the per-source attempt limit
 

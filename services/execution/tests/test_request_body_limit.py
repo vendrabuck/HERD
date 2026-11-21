@@ -131,17 +131,17 @@ async def test_the_package_validator_takes_its_own_limit(monkeypatch):
 #
 # inventory's immediate apply and ai-orchestrator's commit forward a device
 # configuration to `/execute`, inventory's apply scheduler to `/execute/internal`.
-# The body it admitted, plus what it adds, fits under the default limit plus
-# FORWARD_ENVELOPE_BYTES.
+# Each sender admitted the configuration through a large-JSON route (issue #1484), so
+# these take the default limit plus LARGE_JSON_BODY_BYTES plus FORWARD_ENVELOPE_BYTES.
 
 _FORWARD_ROUTES = [("POST", "/execute"), ("POST", "/execute/internal")]
 
 
 @pytest.mark.parametrize(("method", "path"), _FORWARD_ROUTES)
 async def test_a_forwarded_body_up_to_the_envelope_is_parsed_and_one_byte_more_is_413(method, path):
-    from herd_common.validation_errors import FORWARD_ENVELOPE_BYTES
+    from herd_common.validation_errors import FORWARD_ENVELOPE_BYTES, LARGE_JSON_BODY_BYTES
 
-    route_limit = LIMIT + FORWARD_ENVELOPE_BYTES
+    route_limit = LIMIT + LARGE_JSON_BODY_BYTES + FORWARD_ENVELOPE_BYTES
     async with _client() as client:
         at = await client.request(method, path, content=b"x" * route_limit, headers=_JSON)
         over = await client.request(method, path, content=b"x" * (route_limit + 1), headers=_JSON)

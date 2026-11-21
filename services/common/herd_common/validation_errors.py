@@ -92,10 +92,13 @@ outside the surrogate check. What it guarantees, exactly:
 - A route's limit is `max_body_bytes` (each service passes its
   `MAX_REQUEST_BODY_BYTES` setting), or, for a route whose endpoint is marked with
   `extends_body_limit(extra_bytes)`, `max_body_bytes + extra_bytes()`. The mark is the
-  one way to raise a route's limit; it is used for two reasons only: an upload (the
-  files the route itself already bounds) and a route another HERD service forwards a
-  body to (`FORWARD_ENVELOPE_BYTES`, what the forwarding service adds to a body it
-  admitted).
+  one way to raise a route's limit; it is used for three reasons only: an upload (the
+  files the route itself already bounds), a route that legitimately takes a large
+  JSON body (`LARGE_JSON_BODY_BYTES`: a canvas, a device configuration), and a route
+  another HERD service forwards a body to (`FORWARD_ENVELOPE_BYTES`, what the
+  forwarding service adds to a body it admitted, on top of `LARGE_JSON_BODY_BYTES`
+  when that body came through a large-JSON route). The extra bytes add to the
+  setting, so raising `MAX_REQUEST_BODY_BYTES` raises every marked route by as much.
 - It judges a body when the app first reads it, after routing, so it knows the route.
   A request whose `Content-Length` declares more than the limit is refused at that
   first read, before one byte of the body is read. Otherwise each `http.request`
@@ -116,16 +119,22 @@ outside the surrogate check. What it guarantees, exactly:
   work stay bounded, but the bytes still cross the network: this check does not bound
   bandwidth. One INFO log line names the limit and whether the body was declared or
   received over it; never any of its content.
-- It refuses when the body is read, so a route that never reads its body, an unknown
-  route, and a method not allowed answer as before (nothing of the body is read, so
-  nothing is buffered). One known limit: a route that STREAMS its response without
-  reading its body has the body read by the response's disconnect listener, and
-  behind the request logger a declared over-limit body then ends in a server error
-  instead of the stream (OPS-VALID-9; no HERD route does this, and a streaming route
-  must read or drain its body first). Every route with a body (JSON or a form) reads it before its
-  dependencies run, so the refusal comes before authentication, as the surrogate
-  check's does; and the surrogate check reads through this one, so a body over the
-  limit is refused before it is scanned, and the scan never holds more than the limit.
+- It refuses when the body is read. An unknown route, a method not allowed, and a
+  route that never reads its body and answers without streaming are unchanged
+  (nothing of the body is read, so nothing is buffered). A route that STREAMS its
+  answer (a `StreamingResponse`) without reading its body does not, a known limit
+  (OPS-VALID-9, issue #1483): the response's disconnect listener reads the body while
+  the stream runs, and behind the request logger, which holds the response's start, a
+  body whose `Content-Length` is over the limit ends in `RuntimeError: No response
+  returned.` (a 500, or a reset) instead of the stream, and a chunked one over it cuts
+  the stream short; nothing of the body reaches the route either way. So a streaming
+  route takes its body as a parameter, and
+  `tests/unit/test_request_body_limit_wiring.py` fails on one that does not unless it
+  is listed there by decision (none is). Every route with a body (JSON or a form)
+  reads it before its dependencies run, so the refusal comes before authentication,
+  as the surrogate check's does; and the surrogate check reads through this one, so a
+  body over the limit is refused before it is scanned, and the scan never holds more
+  than the limit.
 - Nothing is refused once the response has started, since the answer cannot change by
   then. Starlette's disconnect listener (a streaming response to a route that never
   read its body) can make the first read while the response is being started
@@ -381,12 +390,23 @@ class RefuseLoneSurrogates:
         await self.app(scope, receive_checked, send_tracking_start)
 
 
-# The default of every service's MAX_REQUEST_BODY_BYTES setting (issue #1466): the
-# largest legitimate JSON body is a topology canvas save, whose device nodes carry the
-# whole device record, about 1.3 KB a device and 0.5 KB a link, so 1,000 devices and
-# 4,000 links come to about 3.1 MiB. Changing the default is this one line; the copy
-# test and the compose wiring tests make the other places follow.
-DEFAULT_MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
+# The default of every service's MAX_REQUEST_BODY_BYTES setting (issues #1466, #1484):
+# what every route takes, including every route a caller with no token can reach, so it
+# is the parse a client can cost a service before authentication. The largest body an
+# unmarked route takes is a pathfinding batch at its 2,000 pairs (about 236 KB as
+# compact JSON); the routes that legitimately take more are marked with
+# `LARGE_JSON_BODY_BYTES`. Changing the default is this one line; the copy test and
+# the compose wiring tests make the other places follow.
+DEFAULT_MAX_REQUEST_BODY_BYTES = 256 * 1024
+
+# What a route that legitimately takes a large JSON body adds to MAX_REQUEST_BODY_BYTES
+# (issue #1484), marked with `extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)`: a
+# topology canvas (in the editor's save shape about 520 bytes a device node and 460 a
+# link, so 1,000 devices and 4,000 links come to 2361613 bytes, and the routes' limit at
+# the defaults holds 1,887 devices with four links each), a device configuration, a
+# commit, and a bulk connection create. Like every mark it adds to the setting, so an
+# operator who raises MAX_REQUEST_BODY_BYTES raises these routes by as much.
+LARGE_JSON_BODY_BYTES = 4 * 1024 * 1024
 
 # The smallest MAX_REQUEST_BODY_BYTES a service accepts: every body one HERD service
 # sends another that carries neither a request body nor a stored document (lists of
@@ -397,10 +417,11 @@ MIN_MAX_REQUEST_BODY_BYTES = 64 * 1024
 
 # What a HERD service adds to a body it admitted, or to a stored document, when it
 # forwards it to another service; the receiving route is marked with
-# `extends_body_limit(lambda: FORWARD_ENVELOPE_BYTES)`. The largest addition is the
-# notifications preference merge (the stored preferences, at most a 64 KiB blob in
-# user-profile, plus the update); the others add at most about 10 KB (250 device ids
-# on a fork save).
+# `extends_body_limit(lambda: FORWARD_ENVELOPE_BYTES)`, or, when what it receives was
+# admitted by a large-JSON route, with `LARGE_JSON_BODY_BYTES + FORWARD_ENVELOPE_BYTES`.
+# The largest addition is the notifications preference merge (the stored preferences,
+# at most a 64 KiB blob in user-profile, plus the update); the others add at most about
+# 10 KB (250 device ids on a fork save).
 FORWARD_ENVELOPE_BYTES = 256 * 1024
 
 BODY_TOO_LARGE_TYPE = "body_too_large"
@@ -434,11 +455,13 @@ def max_body_bytes_from_text(raw: str) -> int | None:
 
 def extends_body_limit(extra_bytes: Callable[[], int]) -> Callable[[_Endpoint], _Endpoint]:
     """Mark a route endpoint whose body may hold `extra_bytes()` more than the default
-    limit: an upload route (the files it bounds itself) or a route another HERD
-    service forwards a body to (`FORWARD_ENVELOPE_BYTES`). `extra_bytes` is called at
-    each request, so it reads the bound the route enforces (a setting) rather than a
-    copy of it. Place it under the route decorator; the endpoint is returned
-    unchanged."""
+    limit: an upload route (the files it bounds itself), a route that legitimately
+    takes a large JSON body (`LARGE_JSON_BODY_BYTES`), or a route another HERD
+    service forwards a body to (`FORWARD_ENVELOPE_BYTES`, added to
+    `LARGE_JSON_BODY_BYTES` when what it forwards came through a large-JSON route).
+    `extra_bytes` is called at each request, so it reads the bound the route enforces
+    (a setting) rather than a copy of it. Place it under the route decorator; the
+    endpoint is returned unchanged."""
 
     def mark(endpoint: _Endpoint) -> _Endpoint:
         setattr(endpoint, EXTRA_BODY_BYTES_ATTRIBUTE, extra_bytes)

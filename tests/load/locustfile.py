@@ -1,6 +1,6 @@
 """Locust load test definitions for HERD.
 
-Ten user classes, selected by default:
+Eleven user classes, selected by default:
 - ReservationUser: creates, lists, queries calendar, releases reservations
 - InventoryBrowser: browses devices, templates, and the topologies list
 - BulkExporter: exports devices, templates, and topologies; dry-runs a device import
@@ -22,6 +22,9 @@ Ten user classes, selected by default:
   byte over MAX_REQUEST_BODY_BYTES to one route of every service, with a
   Content-Length or chunked, and fails the run on any answer but the 413
   (OPS-VALID-9)
+- LargeCanvasSaver: exactly one user that saves one canvas over the default
+  body limit to a large-JSON route (PUT /api/cabling/topologies/{id}, issue
+  #1484) beside OversizedBodySender, and fails the run on any answer but 200
 
 Every user signs in once, at start, and every one does so from this host, which
 auth sees as one source address with one attempt allowance (60 at once by
@@ -30,7 +33,7 @@ working, not as a failure: it records it under its own name, waits the
 `Retry-After`, and tries again, so the login figures under `/api/auth/login`
 stay those of real password checks.
 
-An eleventh, OidcLoginUser (ADR 0016 phase 5b), signs in through the OIDC test
+A twelfth, OidcLoginUser (ADR 0016 phase 5b), signs in through the OIDC test
 provider; it is abstract unless HERD_LOAD_OIDC=1 and runs only in the
 Makefile's _gate-oidc-stack-tests phase, against a stack in OIDC mode (see its
 section at the end of this file).
@@ -45,6 +48,7 @@ path (polled by the bell on an interval, so the hottest read in the service) and
 the preferences read/write proxy that the /settings channel toggles drive.
 """
 
+import json
 import logging
 import os
 import random
@@ -903,14 +907,14 @@ class LoginLimitProbe(HerdUser):
 # The request body limit every service applies (issue #1466, OPS-VALID-9); a run
 # against a stack with another MAX_REQUEST_BODY_BYTES reads it from the environment
 # or the repo-root .env, like the stack does.
-MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES") or 4 * 1024 * 1024)
+MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES") or 256 * 1024)
 
 # One JSON route per service, through the gateway, none of them a route that takes a
-# larger body (OPS-VALID-10): each would parse its body before its authentication
-# runs.
+# larger body (OPS-VALID-10; the AI commit does since issue #1484): each would parse its
+# body before its authentication runs.
 OVERSIZED_BODY_ROUTES = (
     ("POST", "/api/acl/grants"),
-    ("POST", "/api/ai/commit"),
+    ("POST", "/api/ai/templates/suggest-identity"),
     ("POST", "/api/auth/groups"),
     ("POST", "/api/cabling/topologies"),
     ("PUT", "/api/config/settings"),
@@ -991,6 +995,105 @@ class OversizedBodySender(HerdUser):
                 resp.failure("413 body is not the one body_too_large item")
             else:
                 resp.success()
+
+
+# What a large-JSON route adds to the limit (herd_common.validation_errors
+# LARGE_JSON_BODY_BYTES, issue #1484); the canvas saves below sit between the two.
+LARGE_JSON_BODY_BYTES = 4 * 1024 * 1024
+LARGE_CANVAS_BYTES = MAX_REQUEST_BODY_BYTES + LARGE_JSON_BODY_BYTES // 4
+
+
+def _large_canvas(size: int) -> bytes:
+    """A canvas PUT body of exactly `size` bytes: network element nodes (stored as sent)
+    whose descriptive attrs carry realistic text, the last one padded to the size."""
+
+    def node(i: int) -> dict:
+        return {
+            "id": f"n-{i}",
+            "type": "networkElementNode",
+            "position": {"x": 40 * (i % 50), "y": 40 * (i // 50)},
+            "data": {
+                "element": {
+                    "id": str(uuid.UUID(int=i)),
+                    "element_type": "vlan_segment",
+                    "label": f"VLAN {100 + i}",
+                    "attrs": {"description": "lab segment " * 40},
+                }
+            },
+        }
+
+    def encode(nodes: list) -> str:
+        return json.dumps({"canvas_data": {"nodes": nodes, "edges": []}}, separators=(",", ":"))
+
+    per_node = len(json.dumps(node(10_000), separators=(",", ":"))) + 1
+    nodes = [node(i) for i in range(max(size // per_node - 1, 1))]
+    while len(encode(nodes)) > size:
+        nodes.pop()
+    nodes[-1]["data"]["element"]["attrs"]["description"] += "x" * (size - len(encode(nodes)))
+    body = encode(nodes).encode()
+    assert len(body) == size
+    return body
+
+
+class LargeCanvasSaver(HerdUser):
+    """Saves a canvas larger than the default limit to a large-JSON route, beside
+    OversizedBodySender (issue #1484).
+
+    on_start signs in once and creates one topology; each task saves the same canvas,
+    MAX_REQUEST_BODY_BYTES plus a quarter of the large-JSON allowance (1310720 bytes at
+    the defaults), to
+    `PUT /api/cabling/topologies/{id}`. Every save must answer 200; a 413 means the
+    route lost its mark, and anything else fails the run too. The canvas does not
+    change between saves, so after the first save no version row is written: the load
+    is the parse and the compare, not storage. on_stop deletes the topology.
+
+    What it sends: network element nodes (`networkElementNode`, about 700 bytes each
+    with their descriptive `attrs`, about 1,880 of them) and no edges, which cabling
+    stores as sent and which need no seeded device. It is not the editor's device-node
+    shape (`services/cabling/tests/test_request_body_limit.py` pins that one); the
+    body limit judges bytes, not shape, so the save costs the same parse.
+
+    What it shows: its latency next to OversizedBodySender's refusals, and, in a run
+    that leaves the sender out (name the other classes on the command line), how much
+    those refusals cost a legitimate large save.
+    """
+
+    fixed_count = 1
+    wait_time = between(2, 4)
+
+    _body = _large_canvas(LARGE_CANVAS_BYTES)
+
+    def on_start(self):
+        self._topology_id = None
+        self._login(ADMIN_EMAIL, ADMIN_PASSWORD)
+        if not self.access_token:
+            return
+        resp = self._auth_post(
+            "/api/cabling/topologies", json={"name": f"load-large-canvas-{uuid.uuid4().hex[:8]}"}
+        )
+        if resp.status_code == 201:
+            self._topology_id = resp.json()["id"]
+
+    def on_stop(self):
+        if self._topology_id:
+            self._auth_delete(f"/api/cabling/topologies/{self._topology_id}")
+
+    @task
+    def save_large_canvas(self):
+        if not self._topology_id:
+            return
+        with self.client.put(
+            f"/api/cabling/topologies/{self._topology_id}",
+            data=self._body,
+            headers={**self.headers, "content-type": "application/json"},
+            verify=False,
+            name="/api/cabling/topologies/[id] [large canvas save]",
+            catch_response=True,
+        ) as resp:
+            if resp.status_code == 200:
+                resp.success()
+            else:
+                resp.failure(f"HTTP {resp.status_code}, expected 200 for a large canvas save")
 
 
 # --- Single sign-on (ADR 0016 phase 5b, D12 level 4) ---------------------------
