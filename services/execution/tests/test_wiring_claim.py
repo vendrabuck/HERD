@@ -223,6 +223,14 @@ async def _claimed_until(model, row_id):
         return row.claimed_until
 
 
+async def _true_direction(model, row_id) -> str:
+    """The direction the row intends now: what a pass that wants to drive it passes to
+    `claim` (issue #1496), so a refusal in a test means the claim is held, never a
+    direction mismatch."""
+    async with TestSessionLocal() as db:
+        return (await db.execute(select(model.intended).where(model.id == row_id))).scalar_one()
+
+
 def _future(seconds=600):
     return datetime.now(timezone.utc) + timedelta(seconds=seconds)
 
@@ -411,12 +419,12 @@ async def test_claim_stamps_the_budget_and_a_second_claimant_loses(db):
     first = WiringRowClaims()
     second = WiringRowClaims()
 
-    assert await first.claim(db, L1ConnectionAssignment, row_id) is True
+    assert await first.claim(db, L1ConnectionAssignment, row_id, intended="ACTIVE") is True
     stamp = await _claimed_until(L1ConnectionAssignment, row_id)
     assert stamp is not None
 
     async with TestSessionLocal() as other:
-        assert await second.claim(other, L1ConnectionAssignment, row_id) is False
+        assert await second.claim(other, L1ConnectionAssignment, row_id, intended="ACTIVE") is False
     assert second.lost == {row_id}
     assert set(first.held) == {row_id}
     # The loser must not move the winner's stamp.
@@ -428,15 +436,15 @@ async def test_claim_is_idempotent_within_one_pass(db):
     it to itself."""
     row_id = await _seed_l1_failed()
     claims = WiringRowClaims()
-    assert await claims.claim(db, L1ConnectionAssignment, row_id) is True
-    assert await claims.claim(db, L1ConnectionAssignment, row_id) is True
+    assert await claims.claim(db, L1ConnectionAssignment, row_id, intended="ACTIVE") is True
+    assert await claims.claim(db, L1ConnectionAssignment, row_id, intended="ACTIVE") is True
     assert claims.lost == set()
 
 
 async def test_claim_of_none_row_id_is_always_granted(db):
     """The reconcile path has no row identity to claim and is never blocked."""
     claims = WiringRowClaims()
-    assert await claims.claim(db, L1ConnectionAssignment, None) is True
+    assert await claims.claim(db, L1ConnectionAssignment, None, intended="ACTIVE") is True
     assert claims.held == {}
 
 
@@ -449,7 +457,7 @@ async def test_a_row_no_longer_failed_cannot_be_claimed(db):
         row.status = "ACTIVE"
         await s.commit()
     claims = WiringRowClaims()
-    assert await claims.claim(db, L1ConnectionAssignment, row_id) is False
+    assert await claims.claim(db, L1ConnectionAssignment, row_id, intended="ACTIVE") is False
     assert claims.lost == {row_id}
 
 
@@ -458,7 +466,7 @@ async def test_claim_expiry_lets_a_new_pass_take_a_dead_holders_row(db):
     a later pass simply outlives."""
     row_id = await _seed_l1_failed(claimed_until=_past())
     claims = WiringRowClaims()
-    assert await claims.claim(db, L1ConnectionAssignment, row_id) is True
+    assert await claims.claim(db, L1ConnectionAssignment, row_id, intended="ACTIVE") is True
 
 
 async def test_claimable_row_ids_answers_only_the_free_rows(db):
@@ -493,7 +501,7 @@ async def test_l1_row_identity_failure_write_clears_the_claim(db):
     issue #1479 the holder says it holds the row by passing its claim ledger."""
     row_id = await _seed_l1_failed()
     claims = WiringRowClaims()
-    assert await claims.claim(db, L1ConnectionAssignment, row_id) is True
+    assert await claims.claim(db, L1ConnectionAssignment, row_id, intended="ACTIVE") is True
     await record_l1_failed(
         db,
         RES_ID,
@@ -539,7 +547,7 @@ async def test_l2_row_identity_failure_write_clears_the_claim(db):
     va = await _seed_alloc()
     row_id = await _seed_l2_failed(va)
     claims = WiringRowClaims()
-    assert await claims.claim(db, L2PortAssignment, row_id) is True
+    assert await claims.claim(db, L2PortAssignment, row_id, intended="ACTIVE") is True
     await record_l2_failed(
         db,
         RES_ID,
@@ -584,7 +592,7 @@ async def test_l3_release_clears_the_claim(db):
 async def test_l3_row_identity_failure_write_clears_the_claim(db):
     row_id = await _seed_l3_failed()
     claims = WiringRowClaims()
-    assert await claims.claim(db, RouteAssignment, row_id) is True
+    assert await claims.claim(db, RouteAssignment, row_id, intended="ACTIVE") is True
     await record_route_failed(
         db, RES_ID, SWITCH_ID, None, 1, "again", intended="ACTIVE", row_id=row_id, claims=claims
     )
@@ -668,7 +676,7 @@ async def _ledger_state(layer: str, row_id):
 async def test_failure_write_on_a_row_this_pass_holds_is_written(db, layer):
     row_id = await _seed_layer(layer)
     mine = WiringRowClaims()
-    assert await mine.claim(db, _MODEL[layer], row_id) is True
+    assert await mine.claim(db, _MODEL[layer], row_id, intended="ACTIVE") is True
 
     assert await _write_failure(layer, db, row_id, mine) is not None
     assert await _ledger_state(layer, row_id) == ("FAILED", 2, "again", None)
@@ -682,7 +690,7 @@ async def test_failure_write_on_a_row_another_pass_holds_changes_nothing(db, lay
     row_id = await _seed_layer(layer)
     other = WiringRowClaims()
     async with TestSessionLocal() as s:
-        assert await other.claim(s, _MODEL[layer], row_id) is True
+        assert await other.claim(s, _MODEL[layer], row_id, intended="ACTIVE") is True
     before = await _ledger_state(layer, row_id)
     assert before[3] is not None
 
@@ -733,7 +741,7 @@ async def test_a_pass_whose_switch_load_fails_reports_a_held_row_in_progress(lay
         loaded = (await s.execute(select(model).where(model.id == row_id))).scalars().all()
     holder = WiringRowClaims()
     async with TestSessionLocal() as s:
-        assert await holder.claim(s, model, row_id) is True
+        assert await holder.claim(s, model, row_id, intended="RELEASED") is True
     before = await _ledger_state(layer, row_id)
 
     reattempt = {"l1": _reattempt_rows, "l2": _reattempt_l2_rows, "l3": _reattempt_l3_rows}
@@ -767,7 +775,10 @@ async def _held_by_another_pass(model, row_id) -> datetime:
     """Claim the row with a separate pass's ledger; return the stamp it wrote."""
     other = WiringRowClaims()
     async with TestSessionLocal() as s:
-        assert await other.claim(s, model, row_id) is True
+        assert (
+            await other.claim(s, model, row_id, intended=await _true_direction(model, row_id))
+            is True
+        )
     return other.held[row_id]
 
 
@@ -974,7 +985,7 @@ async def _superseded_holder(layer, intended="ACTIVE"):
     row_id = await _seed_layer(layer, intended=intended)
     stale = WiringRowClaims(budget=timedelta(seconds=-60))
     async with TestSessionLocal() as s:
-        assert await stale.claim(s, _MODEL[layer], row_id) is True
+        assert await stale.claim(s, _MODEL[layer], row_id, intended=intended) is True
     await _held_by_another_pass(_MODEL[layer], row_id)
     assert row_id in stale.held
     return row_id, stale
@@ -998,7 +1009,7 @@ async def test_a_holder_whose_expired_claim_nobody_took_still_writes(db, layer):
     took over still matches, so the holder's own writes land."""
     row_id = await _seed_layer(layer)
     late = WiringRowClaims(budget=timedelta(seconds=-60))
-    assert await late.claim(db, _MODEL[layer], row_id) is True
+    assert await late.claim(db, _MODEL[layer], row_id, intended="ACTIVE") is True
 
     assert await _write_failure(layer, db, row_id, late) is not None
     assert await _ledger_state(layer, row_id) == ("FAILED", 2, "again", None)
@@ -1182,7 +1193,7 @@ async def test_after_the_reconcile_clears_the_claim_the_holders_success_is_recor
     row_id = await _seed_layer(layer, intended="ACTIVE")
     holder = WiringRowClaims()
     async with TestSessionLocal() as s:
-        assert await holder.claim(s, _MODEL[layer], row_id) is True
+        assert await holder.claim(s, _MODEL[layer], row_id, intended="ACTIVE") is True
     await _cleared_by_the_reconcile(layer, row_id, "failure")
 
     if layer == "l3":
@@ -1204,7 +1215,7 @@ async def test_after_the_reconcile_clears_the_claim_the_holders_failure_is_refus
     row_id = await _seed_layer(layer, intended="ACTIVE")
     holder = WiringRowClaims()
     async with TestSessionLocal() as s:
-        assert await holder.claim(s, _MODEL[layer], row_id) is True
+        assert await holder.claim(s, _MODEL[layer], row_id, intended="ACTIVE") is True
     await _cleared_by_the_reconcile(layer, row_id, how)
     after_reconcile = await _ledger_state(layer, row_id)
 
@@ -1221,7 +1232,7 @@ async def test_after_the_reconcile_clears_the_claim_an_l3_partial_failure_is_rec
     row_id = await _seed_layer("l3", intended="ACTIVE")
     holder = WiringRowClaims()
     async with TestSessionLocal() as s:
-        assert await holder.claim(s, RouteAssignment, row_id) is True
+        assert await holder.claim(s, RouteAssignment, row_id, intended="ACTIVE") is True
     await _cleared_by_the_reconcile("l3", row_id, how)
 
     await _drive_l3(
@@ -1586,7 +1597,12 @@ async def _drive_l3_worst_case(
             observed["logout_finished_at"] = clock.now
             rival = WiringRowClaims()
             async with TestSessionLocal() as s:
-                observed["rival_claimed"] = await rival.claim(s, RouteAssignment, row_id)
+                observed["rival_claimed"] = await rival.claim(
+                    s,
+                    RouteAssignment,
+                    row_id,
+                    intended=await _true_direction(RouteAssignment, row_id),
+                )
         return result
 
     item = {"device_id": str(SWITCH_ID), "routes": routes}
@@ -1753,9 +1769,13 @@ async def test_a_per_call_budget_sets_only_that_claims_stamp(db):
     clock = _VirtualClock()
     with ExitStack() as stack:
         _virtual_clock_patches(clock, stack)
-        assert await holder.claim(db, RouteAssignment, sized, budget=timedelta(minutes=42))
-        assert await holder.claim(db, RouteAssignment, plain)
-        assert await holder.claim(db, RouteAssignment, sized, budget=timedelta(minutes=1))
+        assert await holder.claim(
+            db, RouteAssignment, sized, intended="ACTIVE", budget=timedelta(minutes=42)
+        )
+        assert await holder.claim(db, RouteAssignment, plain, intended="ACTIVE")
+        assert await holder.claim(
+            db, RouteAssignment, sized, intended="ACTIVE", budget=timedelta(minutes=1)
+        )
     assert holder.held[sized] == clock.started + timedelta(minutes=42)
     assert holder.held[plain] == clock.started + timedelta(minutes=5)
     assert holder.budget == timedelta(minutes=5)
@@ -1772,14 +1792,19 @@ async def test_a_sized_l3_claim_still_expires_at_its_stamp(db):
     assert budget == timedelta(minutes=80)  # 52 x 91.6s = 4763.2s, rounded up
     with ExitStack() as stack:
         _virtual_clock_patches(clock, stack)
-        assert await dead.claim(db, RouteAssignment, row_id, budget=budget)
+        assert await dead.claim(db, RouteAssignment, row_id, intended="ACTIVE", budget=budget)
         clock.advance(budget.total_seconds() - 1)
         async with TestSessionLocal() as s:
-            assert await WiringRowClaims().claim(s, RouteAssignment, row_id) is False
+            assert (
+                await WiringRowClaims().claim(s, RouteAssignment, row_id, intended="ACTIVE")
+                is False
+            )
         clock.advance(1)
         assert clock.now == dead.held[row_id]
         async with TestSessionLocal() as s:
-            assert await WiringRowClaims().claim(s, RouteAssignment, row_id) is True
+            assert (
+                await WiringRowClaims().claim(s, RouteAssignment, row_id, intended="ACTIVE") is True
+            )
 
 
 @pytest.mark.parametrize("route_operations", range(301))

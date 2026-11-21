@@ -263,8 +263,12 @@ COORDINATION_TIMEOUT = 30.0
 _LOGIN_REFUSED = {"success": False, "output": None, "error": "login refused", "duration_ms": 1}
 
 
-def _gated_driver_stub():
+def _gated_driver_stub(gate_actions=_ROW_ACTIONS):
     """A sandbox stub whose FIRST row action blocks until the test releases it.
+
+    `gate_actions` names the actions that can be the gated one (the row actions by
+    default; issue #1496 gates the per-switch `login` instead, the window between a
+    pass's plan and its per-row claim).
 
     `entered` is set when that first row action begins: the claim holder is inside its
     drive, and its claim is committed (every layer claims before its row's first driver
@@ -293,7 +297,7 @@ def _gated_driver_stub():
         calls.append(action)
         if action == "login" and state["fail_logins"]:
             return _LOGIN_REFUSED
-        if action in _ROW_ACTIONS and not state["blocked"]:
+        if action in gate_actions and not state["blocked"]:
             state["blocked"] = True
             entered.set()
             if not release.wait(COORDINATION_TIMEOUT):
@@ -1091,7 +1095,7 @@ async def test_the_claim_stamp_round_trips_and_decides_who_holds_on_postgres(
     try:
         stale = WiringRowClaims(budget=timedelta(seconds=-60))
         async with session_factory() as db:
-            assert await stale.claim(db, model, row_id) is True
+            assert await stale.claim(db, model, row_id, intended="RELEASED") is True
         stored, _, _ = await _stored(session_factory, model, row_id)
         assert stored == stale.held[row_id]
         assert stored.tzinfo is not None
@@ -1099,7 +1103,7 @@ async def test_the_claim_stamp_round_trips_and_decides_who_holds_on_postgres(
 
         current = WiringRowClaims()
         async with session_factory() as db:
-            assert await current.claim(db, model, row_id) is True
+            assert await current.claim(db, model, row_id, intended="RELEASED") is True
         stored, last_error, attempts = await _stored(session_factory, model, row_id)
         assert stored == current.held[row_id] != stale.held[row_id]
 
@@ -1231,6 +1235,214 @@ async def test_a_stale_tick_cannot_park_a_row_the_manual_channel_is_driving(sess
     assert _row_calls(calls) == ["connect_ports"]
     foreign_after = await _foreign_ledger_snapshot(session_factory, reservation_id)
     assert foreign_after == foreign_before
+
+
+@pytest.mark.asyncio
+async def test_a_park_between_a_pass_plan_and_its_claim_refuses_the_build(session_factory):
+    """Issue #1496, staged with events, two passes on separate Postgres sessions.
+
+    Pass P1 loads a FAILED build row X and revalidates it against the fork (the wire is
+    still intended), then logs in to X's switch, where the stub holds it: P1 has
+    planned the connect and has not yet claimed X. The owner removes the wire, and pass
+    P2, which loaded X too, revalidates, finds the wire gone, and parks X (FAILED
+    intended RELEASED, attempts 0, the stale reason, the claim cleared) through its
+    write guard; X is unclaimed, so the park lands. P1 is released and reaches its
+    claim: X no longer intends ACTIVE, so the claim is refused in the same UPDATE that
+    would have stamped it, P1 makes no connect_ports call, and it reads X back
+    `still_failed`. Before #1496 P1 claimed X, connected it, and recorded it ACTIVE
+    intended ACTIVE. The next pass then releases X.
+    """
+    from app.services.nats_consumer import WIRING_STALE_BUILD_REASON
+    from app.services.wiring_claim import WiringRowClaims
+    from app.services.wiring_retry_service import _reattempt_rows
+
+    reservation_id = uuid.uuid4()
+    async with session_factory() as db:
+        row = L1ConnectionAssignment(
+            reservation_id=reservation_id,
+            switch_device_id=SWITCH_ID,
+            port_a="0/0/91",
+            port_b="0/0/92",
+            status="FAILED",
+            intended="ACTIVE",
+            attempts=HIDDEN_ATTEMPTS,
+            last_error="driver timeout",
+        )
+        db.add(row)
+        await db.commit()
+        row_id = row.id
+    p1_copy = await _preselect_own_row(session_factory, row_id)
+    p2_copy = await _preselect_own_row(session_factory, row_id)
+
+    execute_fn, calls, entered, release, state = _gated_driver_stub(gate_actions=("login",))
+    wires = _wires_for_pair("0/0/91", "0/0/92")
+
+    async def _intent(reservation, client=None):
+        # The owner removes the wire while P1 is inside its login.
+        return [] if entered.is_set() else wires
+
+    foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    patches = _patches(execute_fn, reservation_id) + [
+        patch(
+            "app.services.nats_consumer._fetch_fork_intended_wires",
+            new=AsyncMock(side_effect=_intent),
+        )
+    ]
+    p1_claims = WiringRowClaims()
+
+    async def _park_then_read():
+        outcomes = await _reattempt_rows(
+            [p2_copy], _session_ctx(session_factory), WiringRowClaims(), set()
+        )
+        async with session_factory() as db:
+            mid = await db.get(L1ConnectionAssignment, row_id)
+            return outcomes, (mid.status, mid.intended, mid.attempts, mid.last_error)
+
+    for p in patches:
+        p.start()
+    try:
+        p1_outcomes, (p2_outcomes, mid) = await _loser_inside_holders_drive(
+            _reattempt_rows([p1_copy], _session_ctx(session_factory), p1_claims),
+            _park_then_read,
+            state,
+            entered,
+            release,
+        )
+        async with session_factory() as db:
+            after = await db.get(L1ConnectionAssignment, row_id)
+            after_state = (
+                after.status,
+                after.intended,
+                after.attempts,
+                after.last_error,
+                after.claimed_until,
+            )
+        p1_calls = list(calls)
+
+        # Conservation: the next pass takes X in its true direction.
+        async with session_factory() as db:
+            next_copy = await db.get(L1ConnectionAssignment, row_id)
+        next_outcomes = await _reattempt_rows([next_copy], _session_ctx(session_factory))
+    finally:
+        for p in patches:
+            p.stop()
+        await _cleanup(session_factory, reservation_id)
+
+    assert [o["outcome"] for o in p2_outcomes] == ["still_failed"]
+    assert mid == ("FAILED", "RELEASED", 0, WIRING_STALE_BUILD_REASON), "P2's park landed"
+    assert "connect_ports" not in p1_calls, f"P1 connected a parked row: {p1_calls}"
+    assert _row_calls(p1_calls) == [], "P1 made no row call at all"
+    assert after_state == ("FAILED", "RELEASED", 0, WIRING_STALE_BUILD_REASON, None)
+    assert [o["outcome"] for o in p1_outcomes] == ["still_failed"]
+    assert (p1_claims.wrong_direction, p1_claims.lost) == ({row_id}, set())
+    assert [o["outcome"] for o in next_outcomes] == ["released"]
+    assert _row_calls(calls) == ["disconnect_ports"]
+    foreign_after = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    assert foreign_after == foreign_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layer", ["l1", "l2", "l3"])
+async def test_the_direction_compare_and_its_frozen_exception_on_postgres(session_factory, layer):
+    """Issue #1496 on real Postgres: the claim's CASE over the correlated EXISTS on
+    `reservation_wiring_state`, and the same compare in the row-id failure write.
+
+    A FAILED row that intends ACTIVE: a release claim is refused while the reservation
+    is not frozen (no value changes, the expired stamp included, and the row is in
+    `wrong_direction`), and a release failure write by row id is refused the same way;
+    once the reservation is frozen, the release claim is granted with the exact stamp
+    it wrote, and a second pass's release failure write on a fresh copy lands."""
+    from datetime import datetime, timezone
+
+    from app.services.wiring_claim import WiringRowClaims
+
+    reservation_id = uuid.uuid4()
+    model, row_id = await _seed_failed_row(session_factory, reservation_id, layer)
+    expired = datetime.now(timezone.utc) - timedelta(minutes=10)
+    try:
+        async with session_factory() as db:
+            row = await db.get(model, row_id)
+            row.intended = "ACTIVE"
+            row.claimed_until = expired
+            await db.commit()
+
+        def _state():
+            return _stored(session_factory, model, row_id)
+
+        before = await _state()
+        refused = WiringRowClaims()
+        async with session_factory() as db:
+            assert await refused.claim(db, model, row_id, intended="RELEASED") is False
+        assert (refused.wrong_direction, refused.lost) == ({row_id}, set())
+        async with session_factory() as db:
+            assert await _record_failure(layer, db, reservation_id, row_id, refused) is None
+        assert await _state() == before
+        async with session_factory() as db:
+            assert (await db.get(model, row_id)).intended == "ACTIVE"
+
+        async with session_factory() as db:
+            db.add(ReservationWiringState(reservation_id=reservation_id, frozen=True))
+            await db.commit()
+
+        writer = WiringRowClaims()
+        async with session_factory() as db:
+            assert await _record_failure(layer, db, reservation_id, row_id, writer) is not None
+        async with session_factory() as db:
+            landed = await db.get(model, row_id)
+            assert (landed.intended, landed.claimed_until) == ("RELEASED", None)
+            landed.intended = "ACTIVE"
+            await db.commit()
+
+        granted = WiringRowClaims()
+        async with session_factory() as db:
+            assert await granted.claim(db, model, row_id, intended="RELEASED") is True
+        stored, _, _ = await _state()
+        assert stored == granted.held[row_id]
+    finally:
+        await _cleanup(session_factory, reservation_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layer", ["l1", "l2", "l3"])
+async def test_a_refused_failure_write_is_rolled_back_on_postgres(session_factory, layer):
+    """Issue #1496 review 2: a refused row-id failure write leaves its values as they
+    were because the writer rolls the caller's session back, not because of the value
+    CASE alone. On Postgres the refused UPDATE still locks the row; after the writer
+    returns, the caller's session has no transaction open, another connection can lock
+    the row at once, and the row reads unchanged from both sessions."""
+    from app.services.l1_assignment_service import record_l1_failed
+    from app.services.l2_membership_service import record_l2_failed
+    from app.services.route_service import record_route_failed
+    from app.services.wiring_claim import WiringRowClaims
+
+    reservation_id = uuid.uuid4()
+    model, row_id = await _seed_failed_row(session_factory, reservation_id, layer)
+    try:
+        before = await _stored(session_factory, model, row_id)
+        common = {"intended": "ACTIVE", "row_id": row_id, "claims": WiringRowClaims()}
+        async with session_factory() as db:
+            if layer == "l1":
+                written = await record_l1_failed(
+                    db, reservation_id, SWITCH_ID, "0/0/51", "0/0/52", 1, "again", **common
+                )
+            elif layer == "l2":
+                written = await record_l2_failed(
+                    db, reservation_id, None, SWITCH_ID, "0/0/53", 1, "again", **common
+                )
+            else:
+                written = await record_route_failed(
+                    db, reservation_id, SWITCH_ID, None, 1, "again", **common
+                )
+            assert written is None
+            assert common["claims"].wrong_direction == {row_id}
+            assert not db.in_transaction(), "the refused write left the session open"
+            assert await _row_lockable_now(session_factory, model, row_id)
+            row = (await db.execute(select(model).where(model.id == row_id))).scalar_one()
+            assert (row.claimed_until, row.last_error, row.attempts) == before
+            assert row.intended == "RELEASED"
+        assert await _stored(session_factory, model, row_id) == before
+    finally:
+        await _cleanup(session_factory, reservation_id)
 
 
 # Issue #1479: a retry holder's success and release flips stay unconditional, exactly

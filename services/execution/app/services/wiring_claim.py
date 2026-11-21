@@ -21,11 +21,57 @@ Shape, and why it is this shape:
     of a batch can reach its driver call minutes after the batch was selected; one
     stamp taken at selection time would have expired by then, which is exactly the
     window the claim exists to close.
-  - `claim_row` is a compare-and-swap: `UPDATE ... WHERE id AND status = 'FAILED'
-    AND (claimed_until IS NULL OR claimed_until <= now)`. A rowcount of zero means
-    another channel holds the row (or a concurrent writer already moved it out of
-    FAILED), so the caller drives nothing for it. The manual channel reports such a
+  - `WiringRowClaims.claim` is a compare-and-swap: `UPDATE ... WHERE id AND status =
+    'FAILED' AND (claimed_until IS NULL OR claimed_until <= now)`. No matching row
+    means another channel holds the row (or a concurrent writer already moved it out
+    of FAILED), so the caller drives nothing for it. The manual channel reports such a
     row as `in_progress`, the seventh retry outcome; the tick logs and skips it.
+  - The same UPDATE also compares the direction (issue #1496). Each call site passes
+    the direction it is about to drive (`intended`: ACTIVE for a connect, an add, or a
+    provision; RELEASED for a disconnect, a remove, or a deprovision), and the stamp is
+    written only where `direction_admits` holds: the row's `intended` equals that
+    direction, or the direction is RELEASED and the row's reservation is frozen (a
+    frozen reservation's wiring only ever leaves, so a release is admitted there
+    whatever the row intends; a build never gets this exception).
+    `SET claimed_until = CASE WHEN <admits> THEN :stamp ELSE claimed_until END ...
+    RETURNING claimed_until`. A matching row the
+    direction does not admit keeps every value (the UPDATE still runs, so on Postgres
+    it writes a new row version and holds the row lock until its commit), and the
+    returned stamp tells the two refusals apart from the same statement, with no second
+    read: no row returned is "lost" (another holder, or no longer FAILED, read back
+    `in_progress` when still FAILED), a row whose returned stamp is not this claim's is
+    "wrong direction" (read back by its status, `still_failed` while FAILED).
+  - A retry pass's failure write by row id on a row it does NOT hold (the failures
+    recorded before any per-row claim: the switch read, the template read, the driver
+    load, and the login on L1 and L2, L2's create_vlan pre-pass and re-allocation, and
+    the switch read, template read, driver load, and drive-gate refusal on L3) takes
+    the same `direction_admits` compare in its own UPDATE, because the row it planned
+    may have been parked since: an admitted write lands as before; a refused one is
+    rolled back, which is what leaves every value as it was, and joins
+    `wrong_direction`. A write on a row the pass holds takes no compare (its claim
+    compared already).
+  - What this closes: a pass that planned a build from an older read can no longer
+    claim and connect, add, or provision a row another pass parked (intended RELEASED)
+    in between, nor undo that park with a failure it records before its claim; and a
+    pass that planned a release can no longer claim a row whose intent became ACTIVE
+    again on a reservation that is not frozen. What it does not close: the two windows
+    issue #1481 tracks, in which the direction still matches (a retry pass that
+    validated intent before a save and connects after the carried-delta apply passed
+    over the row without parking it, and a retry planned from older content that
+    drives it over a newer failed attempt). A refused row is retried by a later pass in
+    the direction it then intends, with one exception, as on main: a FAILED
+    intended-ACTIVE row on a frozen reservation is driven by no retry (the tick leaves
+    it out as a frozen build, the manual retry reports it `frozen`). On a frozen
+    reservation an admitted release drives the content the pass PLANNED: for L1 (one
+    wire per row) that settles the row, but for L3 and L2, content a writer that does
+    not compare direction added in the window (a newer route, a re-pointed allocation)
+    is neither driven nor kept in the record, as on main; that is the stale-content
+    window issue #1481 tracks. The frozen fact is read inside the statement and
+    freezing is forward-only, so a freeze that commits after the statement's snapshot
+    (for example while the claim waits on the row's lock) reads as not frozen and the
+    release is refused like any other mismatch. That is safe for exclusion (it never
+    drives), but on a frozen reservation the refused row is the unsettled case: it
+    waits FAILED intended ACTIVE like any such row (see `direction_admits`).
 
 Who may use these readers, and who may not. `claimable_row_ids` and `unclaimed`
 are for the RETRY CHANNELS ONLY. The wiring_changed reconcile in `nats_consumer`
@@ -50,10 +96,12 @@ from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import case, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ClauseElement
 
 from app.config import settings
+from app.services.wiring_due import reservation_frozen
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +248,75 @@ def unclaimed(model, now: datetime):
     return or_(model.claimed_until.is_(None), model.claimed_until <= now)
 
 
+def direction_admits(model, intended: str):
+    """SQL: a retry pass may claim, or record a failure on, this row in `intended`.
+
+    Issue #1496. True when the row's `intended` equals the direction, and, for the
+    RELEASED direction only, also when the row's reservation is frozen: a frozen
+    reservation's wiring only ever leaves (no retry drives its build rows), so a
+    release refused there would strand the row. The BUILD direction never gets this
+    exception.
+
+    What an admitted frozen release drives is the content the pass planned from its
+    earlier read, not the row's current content. For L1 (one wire per row) that settles
+    the row. For L3 and L2 it does not cover content a writer that does not compare
+    direction added in the window: a key-based failure write that recorded a newer
+    route (L3) or re-pointed the allocation (L2) after the pass planned its release is
+    neither driven nor kept in the record (the release flip, or an admitted release
+    failure write with the pass's own routes, overwrites it), exactly as on main. That
+    is the stale-content window issue #1481 tracks.
+
+    The frozen fact is a correlated EXISTS over `reservation_wiring_state`
+    (`wiring_due.reservation_frozen`), evaluated inside the caller's own statement,
+    so no caller passes it and it is never older than that statement's snapshot.
+    Freezing is forward-only (`freeze_reservation_wiring` is the only writer of
+    `frozen` and only sets it true; `stamp_last_applied` never clears it, WIRE-ORDER-1,
+    WIRE-FREEZE-1), so the one way the read can be out of date is a freeze that
+    commits after that snapshot, including one that commits while the statement waits
+    on the row's lock (the re-check after the wait sees the row's new version, not the
+    new freeze). It reads as not frozen, and the release is refused like any other
+    mismatch. That is safe for exclusion (it never drives), but on a frozen reservation
+    a refusal is the unsettled case: the row is left FAILED intended ACTIVE, which no
+    retry drives. On L3 the teardown's read of FAILED pins parks and removes it unless
+    the flip lands after that read; on L1 and L2 nothing settles it, as on main.
+    """
+    if intended == "RELEASED":
+        return or_(model.intended == "RELEASED", reservation_frozen(model))
+    return model.intended == intended
+
+
+def direction_guarded_values(model, values: dict, intended: str) -> dict:
+    """Wrap each value of a row-id failure write in `CASE WHEN direction_admits THEN
+    value ELSE column END` (issue #1496). Python values are bound with their column's
+    type.
+
+    What each part does. The CASE on `intended` is what tells an admitted write from a
+    refused one inside the same statement: the writer returns `intended`, which equals
+    the direction it records only when the write was admitted. What leaves a refused
+    write's values as they were is the writer's rollback, before it returns. The CASE
+    on the other columns is a second line behind that rollback; no test can tell it
+    from a plain value while the rollback is there.
+    """
+    admits = direction_admits(model, intended)
+    guarded = {}
+    for name, value in values.items():
+        column = getattr(model, name)
+        if not isinstance(value, ClauseElement):
+            value = literal(value, type_=column.type)
+        guarded[name] = case((admits, value), else_=column)
+    return guarded
+
+
+def _same_instant(stored: datetime | None, stamp: datetime) -> bool:
+    """True when a `claimed_until` read back from the database is `stamp`. SQLite
+    drops the time zone a Postgres `timestamptz` keeps; both are UTC here."""
+    if stored is None:
+        return False
+    if stored.tzinfo is None:
+        return stored == stamp.astimezone(timezone.utc).replace(tzinfo=None)
+    return stored == stamp
+
+
 async def claimable_row_ids(
     db: AsyncSession,
     model,
@@ -246,6 +363,14 @@ class WiringRowClaims:
     is lost and when a write this pass attempted on it is refused by
     `claim_write_clauses` (directly, or through `write_guard`).
 
+    `wrong_direction` (issue #1496) holds the rows whose claim, or whose failure write
+    by row id on a row this pass does not hold, was refused because the direction is
+    not admitted (`direction_admits`). Such a row is not another pass's work in flight,
+    so it is kept out of `lost` and the pass reads it back by its status:
+    `still_failed` while it is FAILED. A later pass retries it in the direction it then
+    intends, except a FAILED intended-ACTIVE row on a frozen reservation, which no
+    retry drives (as on main).
+
     The ordinary consumer path never constructs one of these and never claims or
     checks a claim, so a reconcile can still write a row a retry pass holds (its
     key-based failure write and its stale park clear `claimed_until`); see
@@ -255,34 +380,75 @@ class WiringRowClaims:
     def __init__(self, budget: timedelta | None = None) -> None:
         self.budget = budget if budget is not None else claim_budget()
         self.held: dict[uuid.UUID, datetime] = {}
+        # The direction each held row was claimed for (issue #1496).
+        self.held_direction: dict[uuid.UUID, str] = {}
         self.lost: set[uuid.UUID] = set()
+        self.wrong_direction: set[uuid.UUID] = set()
 
     async def claim(
         self,
         db: AsyncSession,
         model,
         row_id: uuid.UUID | None,
+        *,
+        intended: str,
         budget: timedelta | None = None,
     ) -> bool:
         """Claim one row for this pass's driver call. True iff we may drive it.
 
+        `intended` is the direction the call site is about to drive: "ACTIVE" for
+        connect_ports, add_to_vlan, or an L3 provision; "RELEASED" for
+        disconnect_ports, remove_from_vlan, or an L3 deprovision. The claim is one
+        UPDATE matching the row id, status FAILED, and an unclaimed stamp, which
+        writes the stamp only when `direction_admits(model, intended)` holds (the
+        row's `intended` equals this direction, or this direction is RELEASED and the
+        row's reservation is frozen) and returns the row's `claimed_until` (issue
+        #1496). So:
+
+          - no row returned: the claim is lost (another pass holds the row, or it is
+            no longer FAILED, or it is gone); the row joins `lost`;
+          - a row returned with a stamp other than this claim's: the direction is not
+            admitted, no value on the row changes (the stamp is written back as it
+            was), no driver call follows, and the row joins `wrong_direction`, not
+            `lost`;
+          - a row returned with this claim's stamp: the row joins `held`.
+
+        The direction compare and the stamp are one statement, so no writer can
+        change `intended` between them, and the classification comes from the same
+        statement: there is no window in which the two refusals can be told apart
+        wrongly.
+
         `row_id` None means the caller is not a retry channel (no row identity to
         claim), which is always drivable: the reconcile path. A row already claimed
-        by THIS pass is drivable without a second UPDATE, so a row driven twice
-        inside one apply (it cannot happen today, but nothing enforces that) never
-        loses its own claim.
+        by THIS pass is answered without a second UPDATE, from the direction it was
+        claimed for: the same direction is drivable, so a row driven twice inside one
+        apply (it cannot happen today, but nothing enforces that) never loses its own
+        claim; the other direction is refused into `wrong_direction` with no write.
+        A pass reaches a held row in the other direction only when it loaded two FAILED
+        rows of one reservation with the same key, one per direction: the retry maps
+        the key to one row id, and the release-before-build apply reaches that id in
+        both directions. The ledger's keyed writers update an existing non-RELEASED
+        row for a key rather than insert a second, so that is not expected. The row's
+        current `intended` is not re-read for a held row: the claim compared it
+        atomically, and while this pass holds the row only a writer that never claims
+        (the reconcile, issue #1481) can change it.
 
         `budget`, when given, replaces this pass's `self.budget` for this one claim:
         the stamp written is now plus `budget`. Only the L3 apply passes it, sized
         by `l3_pin_claim_budget` from the pin's drive sequence (issue #1482); the L1
         and L2 applies claim with `self.budget`. A row this pass already holds is
-        answered True without a write, so a later, larger `budget` for it is not
+        answered without a write, so a later, larger `budget` for it is not
         applied: its stamp stays the one the first claim wrote.
         """
+        if intended not in ("ACTIVE", "RELEASED"):
+            raise ValueError(f"claim direction must be ACTIVE or RELEASED, got {intended!r}")
         if row_id is None:
             return True
         if row_id in self.held:
-            return True
+            if self.held_direction.get(row_id) == intended:
+                return True
+            self.refuse_wrong_direction(model, row_id, intended)
+            return False
         now = datetime.now(timezone.utc)
         stamp = now + (budget if budget is not None else self.budget)
         result = await db.execute(
@@ -292,11 +458,21 @@ class WiringRowClaims:
                 model.status == "FAILED",
                 unclaimed(model, now),
             )
-            .values(claimed_until=stamp)
+            .values(
+                claimed_until=case(
+                    (
+                        direction_admits(model, intended),
+                        literal(stamp, type_=model.claimed_until.type),
+                    ),
+                    else_=model.claimed_until,
+                )
+            )
+            .returning(model.claimed_until)
             .execution_options(synchronize_session=False)
         )
+        found = result.first()
         await db.commit()
-        if (result.rowcount or 0) == 0:
+        if found is None:
             self.lost.add(row_id)
             logger.info(
                 "wiring retry: row %s of %s is claimed by another channel (or no longer "
@@ -305,8 +481,25 @@ class WiringRowClaims:
                 model.__tablename__,
             )
             return False
+        # The row was unclaimed (null or a past stamp) and this stamp is in the future,
+        # so the returned stamp equals this one exactly when the CASE wrote it.
+        if not _same_instant(found[0], stamp):
+            self.refuse_wrong_direction(model, row_id, intended)
+            return False
         self.held[row_id] = stamp
+        self.held_direction[row_id] = intended
         return True
+
+    def refuse_wrong_direction(self, model, row_id: uuid.UUID, intended: str) -> None:
+        """Record a claim or a failure write refused for its direction (issue #1496)."""
+        self.wrong_direction.add(row_id)
+        logger.info(
+            "wiring retry: row %s of %s no longer intends %s; not driving it in that "
+            "direction this pass (issue #1496)",
+            row_id,
+            model.__tablename__,
+            intended,
+        )
 
 
 def claim_write_clauses(

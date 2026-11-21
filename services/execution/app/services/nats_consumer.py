@@ -2572,7 +2572,9 @@ async def _apply_one_port_action(
     `claims` (issue #817) claims `retry_row_id` immediately before the driver call:
     a row the other retry channel already holds returns without an execution_run, a
     driver call, or a ledger write, so the two channels can never drive one row at
-    once. The claim is per row and taken HERE, not at selection, because a selected
+    once. A row that no longer intends this action's direction (a build row another
+    pass parked intended RELEASED since this pass planned it, issue #1496) returns the
+    same way. The claim is per row and taken HERE, not at selection, because a selected
     batch is driven sequentially behind a per-switch login and the last row of a
     batch can reach its driver call minutes after selection.
     """
@@ -2589,7 +2591,12 @@ async def _apply_one_port_action(
         release_l1_connection,
     )
 
-    if claims is not None and not await claims.claim(db, L1ConnectionAssignment, retry_row_id):
+    # The direction this call drives (issue #1496): the claim requires the row to
+    # intend it, and a failure write records it (WIRE-LEDGER-5).
+    intended = "ACTIVE" if action == "connect_ports" else "RELEASED"
+    if claims is not None and not await claims.claim(
+        db, L1ConnectionAssignment, retry_row_id, intended=intended
+    ):
         return
 
     redacted = redact_context_for_logging(context, password_keys)
@@ -2642,7 +2649,7 @@ async def _apply_one_port_action(
             attempts,
             err,
             phys,
-            intended="ACTIVE" if action == "connect_ports" else "RELEASED",
+            intended=intended,
             row_id=retry_row_id,
             claims=claims,
         )
@@ -3588,7 +3595,8 @@ async def _apply_one_vlan_action(
 
     `claims` (issue #817) claims `retry_row_id` immediately before the driver call: a
     row the other retry channel already holds returns without an execution_run, a
-    driver call, or a ledger write. Taken here rather than at selection because a
+    driver call, or a ledger write, and so does a row that no longer intends this
+    action's direction (issue #1496). Taken here rather than at selection because a
     selected batch is driven sequentially behind a per-switch login.
     """
     from datetime import datetime, timezone
@@ -3604,7 +3612,12 @@ async def _apply_one_vlan_action(
         release_l2_membership,
     )
 
-    if claims is not None and not await claims.claim(db, L2PortAssignment, retry_row_id):
+    # The direction this call drives (issue #1496): the claim requires the row to
+    # intend it, and a failure write records it (WIRE-LEDGER-5).
+    intended = "ACTIVE" if action == "add_to_vlan" else "RELEASED"
+    if claims is not None and not await claims.claim(
+        db, L2PortAssignment, retry_row_id, intended=intended
+    ):
         return
 
     redacted = redact_context_for_logging(context, password_keys)
@@ -3659,7 +3672,7 @@ async def _apply_one_vlan_action(
             port,
             attempts,
             err,
-            intended="ACTIVE" if action == "add_to_vlan" else "RELEASED",
+            intended=intended,
             row_id=retry_row_id,
             claims=claims,
         )
@@ -4304,7 +4317,8 @@ async def _apply_l3_adjacency(
     with `retry_row_ids`. An L3 row IS the per-switch pin, so its claim is taken once
     per work item, immediately before that switch's login and route drive: a pin the
     other retry channel already holds is skipped with no driver call and no ledger
-    write. A reconcile item never carries a retry row id, so it never claims. The
+    write, and so is a pin that no longer intends the item's direction (issue #1496). A
+    reconcile item never carries a retry row id, so it never claims. The
     claim's budget is `l3_pin_claim_budget` of the switch's drive sequence, counted
     before the claim, so the one claim outlives the login, every route operation, and
     the logout (issue #1482).
@@ -4490,13 +4504,17 @@ async def _apply_l3_adjacency(
         # the claim is taken here, immediately before this switch's first driver call,
         # and a pin the other retry channel holds is left entirely alone. The one
         # claim covers the login, every route operation, and the logout, so its
-        # budget is sized for all of them (issue #1482).
+        # budget is sized for all of them (issue #1482). The claim also requires the pin
+        # to still intend this item's direction (issue #1496): RELEASED for a
+        # deprovision, ACTIVE for a provision. A reconcile item has no retry row id, so
+        # its claim is always granted and its `intended` is never compared.
         if claims is not None:
             async with get_db_session() as db:
                 if not await claims.claim(
                     db,
                     RouteAssignment,
                     retry_ids.get(switch_id),
+                    intended=intended,
                     budget=l3_pin_claim_budget(len(drive_sequence)),
                 ):
                     continue

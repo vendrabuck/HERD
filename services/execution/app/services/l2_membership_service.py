@@ -30,7 +30,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.l2_port_assignment import L2PortAssignment
 from app.services._uuid_utils import as_uuid as _as_uuid
 from app.services.l1_assignment_service import get_wiring_state
-from app.services.wiring_claim import WiringRowClaims, claim_write_clauses, unclaimed
+from app.services.wiring_claim import (
+    WiringRowClaims,
+    claim_write_clauses,
+    direction_guarded_values,
+    unclaimed,
+)
 from app.services.wiring_due import tick_would_drive
 
 logger = logging.getLogger(__name__)
@@ -356,6 +361,21 @@ async def _record_l2_failed_for_row(
     of wiring_claim.claim_write_clauses (issue #1479), no insert branch:
     rowcount zero means a concurrent writer moved the row or another pass holds its
     drive claim, so this failure is not written and the row joins `claims.lost`.
+
+    Issue #1496: on a row this pass does not hold (`claims` None, or the row not in
+    `claims.held`), every value is written only where
+    `wiring_claim.direction_admits(model, intended)` holds, in the same UPDATE: the
+    row still intends the direction this failure records, or the failure is a release
+    and the reservation is frozen. Such a write runs before any per-row claim (a
+    switch read, template read, driver load, or login failure, an L2 create_vlan or
+    re-allocation failure, or an L3 drive-gate refusal), so the row may have been
+    parked since the pass planned it. The value CASE (`direction_guarded_values`) and
+    `RETURNING intended` tell an admitted write from a refused one; a refused write is
+    rolled back, which is what leaves every value as it was, returns None, and adds the
+    row to `claims.wrong_direction`. A row this pass holds takes no compare: its claim
+    compared the direction already. Known gap: with `claims` None a refused write is
+    recorded nowhere and logs nothing (no retry caller passes `row_id` without
+    `claims` today).
     """
     values: dict = {
         "status": "FAILED",
@@ -367,6 +387,8 @@ async def _record_l2_failed_for_row(
     }
     if vlan_uuid is not None:
         values["vlan_assignment_id"] = vlan_uuid
+    if claims is None or row_id not in claims.held:
+        values = direction_guarded_values(L2PortAssignment, values, intended)
     result = await db.execute(
         update(L2PortAssignment)
         .where(
@@ -375,8 +397,17 @@ async def _record_l2_failed_for_row(
             *claim_write_clauses(L2PortAssignment, row_id, claims),
         )
         .values(**values)
+        .returning(L2PortAssignment.intended)
     )
-    if result.rowcount == 0:
+    found = result.first()
+    if found is not None and found[0] != intended:
+        # The direction is not admitted (issue #1496): every value was written back
+        # as it was.
+        await db.rollback()
+        if claims is not None:
+            claims.refuse_wrong_direction(L2PortAssignment, row_id, intended)
+        return None
+    if found is None:
         await db.rollback()
         if claims is not None:
             claims.lost.add(row_id)
