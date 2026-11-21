@@ -121,7 +121,14 @@ def reservation_frozen(model, reservation_id=None):
     )
 
 
-def frozen_build_failure_values(model, attempts, reservation_id=None) -> dict:
+def frozen_build_failure_values(
+    model,
+    attempts,
+    reservation_id=None,
+    *,
+    last_error: str | None = None,
+    frozen_last_error: str | None = None,
+) -> dict:
     """The `intended` and `attempts` of a key-based BUILD failure write (issue #1501).
 
     On a reservation whose wiring is frozen, a build failure is recorded the way the
@@ -136,17 +143,28 @@ def frozen_build_failure_values(model, attempts, reservation_id=None) -> dict:
     forward-only (WIRE-FREEZE-1), so the one stale read is a freeze that commits
     after that snapshot. `reservation_id` is for the insert branch (see
     `reservation_frozen`); an update correlates with the row it writes.
+
+    `frozen_last_error`, when given, also returns `last_error` as the same CASE: the
+    teardown park's reason on a frozen reservation, `last_error` otherwise (L3, whose
+    teardown park replaces the reason with the retryable `TEARDOWN_PENDING_REMOVAL`,
+    so a converted pin is always one the tick drives).
     """
     frozen = reservation_frozen(model, reservation_id)
     if not isinstance(attempts, ColumnElement):
         attempts = literal(attempts, type_=model.attempts.type)
-    return {
+    values = {
         "intended": case(
             (frozen, literal("RELEASED", type_=model.intended.type)),
             else_=literal("ACTIVE", type_=model.intended.type),
         ),
         "attempts": case((frozen, literal(0, type_=model.attempts.type)), else_=attempts),
     }
+    if frozen_last_error is not None:
+        values["last_error"] = case(
+            (frozen, literal(frozen_last_error, type_=model.last_error.type)),
+            else_=literal(last_error, type_=model.last_error.type),
+        )
+    return values
 
 
 def frozen_build(model):

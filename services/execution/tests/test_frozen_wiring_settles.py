@@ -7,18 +7,22 @@ late-write way on L3:
 
   - the terminal teardown parks every FAILED intended-ACTIVE L1 and L2 row (the L3 pin
     park of #1001) intended RELEASED and removes it with the ACTIVE rows; on L2 a nil
-    or dangling allocation is released with no driver call; pinned-reason rows are
-    left as the reconcile's stale settlement leaves them;
+    or dangling allocation is released with no driver call; pinned-reason rows, rows
+    under another pass's live claim, and rows twinned by an ACTIVE row of the same key
+    are left as they are;
   - a key-based BUILD failure written on a frozen reservation (the reconcile's, from a
     pass that passed its frozen gate before the freeze) records intended RELEASED and
-    attempts 0 in its own UPDATE or INSERT, the state the teardown's park leaves, so
-    the next tick removes whatever the build may have left.
+    attempts 0 in its own UPDATE or INSERT, the state the teardown's park leaves (on L3
+    with the park's reason too), so the next tick removes whatever the build may have
+    left.
 
 The invariant these tests enumerate: after the freeze, the teardown, and a tick, every
 row of the reservation is RELEASED unless its reason is pinned (non-retryable by
-decision, WIRE-RETRY-4); nothing is configured under a RELEASED row that a pass
-planned; and other reservations' rows are untouched. In-memory SQLite; the Postgres
-staging of the late write is tests/test_frozen_wiring_settles_live_pg.py.
+decision, WIRE-RETRY-4) or a retry pass held it at the teardown (then it is left as
+before #1501); nothing is configured under a RELEASED row that a pass planned; and
+other reservations' rows are untouched. In-memory SQLite; the Postgres staging of the
+late write and of the in-statement frozen read is in
+tests/test_wiring_retry_claim_race_live_pg.py.
 """
 
 import uuid
@@ -143,13 +147,16 @@ async def _freeze(reservation=RES) -> None:
         await freeze_reservation_wiring(s, reservation)
 
 
-async def _allocation(reservation=RES, vlan=VLAN) -> uuid.UUID:
+async def _allocation(reservation=RES, vlan=VLAN, *, defined: bool = False) -> uuid.UUID:
+    """An ACTIVE allocation; `defined` records the VLAN as defined on the L2 switch, so
+    releasing it drives a `delete_vlan` the tests can see."""
     async with TestSessionLocal() as s:
         va = VlanAssignment(
             reservation_id=reservation,
             fabric_id=uuid.uuid4(),
             vlan_id=vlan,
             switch_device_ids=[str(SWITCH["l2"])],
+            defined_switch_ids=[str(SWITCH["l2"])] if defined else [],
             status="ACTIVE",
         )
         s.add(va)
@@ -167,6 +174,7 @@ async def _seed(
     attempts: int = 3,
     allocation: uuid.UUID | None = None,
     port: str | None = None,
+    claimed_until=None,
 ) -> uuid.UUID:
     common = {
         "reservation_id": reservation,
@@ -174,6 +182,7 @@ async def _seed(
         "intended": intended,
         "attempts": attempts,
         "last_error": last_error,
+        "claimed_until": claimed_until,
     }
     if layer == "l1":
         # Stored canonical (port_a sorts first), as every writer stores a pair.
@@ -408,7 +417,8 @@ async def test_a_redelivered_teardown_is_a_no_op(layer, removal_fails):
 @pytest.mark.parametrize("layer", ["l1", "l2"])
 async def test_teardown_leaves_a_pinned_reason_build_row_alone(layer):
     """A pinned-reason build row (WIRE-STALE-1, WIRE-RETRY-4) is not parked or driven:
-    on L1 it is keyed on raw hop endpoints, and its recovery is a re-save."""
+    an unresolvable hop keyed on raw hop endpoints, or a switch whose driver package
+    cannot load (#1199); neither can be driven."""
     reason = f"{WIRING_UNRESOLVABLE_REASON}: switch gone"
     row_id = await _seed(layer, "FAILED", "ACTIVE", last_error=reason)
     execute_fn, calls = _recorder()
@@ -451,7 +461,10 @@ async def test_teardown_removes_a_failed_and_an_active_l1_row_in_one_login():
 @pytest.mark.parametrize("layer", ["l1", "l2", "l3"])
 async def test_a_key_based_build_failure_after_the_freeze_records_a_pending_release(layer, branch):
     """The write reads the freeze in its own statement and records the state the
-    teardown's park leaves: FAILED intended RELEASED, attempts 0, its own reason."""
+    teardown's park leaves: FAILED intended RELEASED, attempts 0; on L1 and L2 its own
+    reason, on L3 the park's TEARDOWN_PENDING_REMOVAL."""
+    from app.services.route_service import TEARDOWN_PENDING_REMOVAL
+
     allocation = await _allocation() if layer == "l2" else None
     if branch == "update":
         await _seed(layer, "FAILED", "ACTIVE", allocation=allocation)
@@ -459,13 +472,14 @@ async def test_a_key_based_build_failure_after_the_freeze_records_a_pending_rele
 
     written = await _key_based_build_failure(layer, allocation=allocation)
 
+    reason = TEARDOWN_PENDING_REMOVAL if layer == "l3" else "driver timeout"
     assert (written.status, written.intended, written.attempts, written.last_error) == (
         "FAILED",
         "RELEASED",
         0,
-        "driver timeout",
+        reason,
     )
-    assert [r[1:] for r in await _rows(layer)] == [("FAILED", "RELEASED", 0, "driver timeout")]
+    assert [r[1:] for r in await _rows(layer)] == [("FAILED", "RELEASED", 0, reason)]
 
 
 @pytest.mark.parametrize("branch", ["update", "insert"])
@@ -537,10 +551,25 @@ async def test_a_pinned_reason_build_failure_after_the_freeze_is_unchanged(layer
 
 
 async def test_an_l3_pinned_reason_build_failure_after_the_freeze_is_a_pending_release():
-    """On L3 the teardown parks every FAILED intended-ACTIVE pin, so the write does too."""
+    """On L3 the teardown parks every FAILED intended-ACTIVE pin, whatever its reason,
+    under the retryable TEARDOWN_PENDING_REMOVAL, so the write records the same: the
+    tick selects the pin (a kept pinned reason would exclude it), removes its routes,
+    and the pin ends RELEASED."""
+    from app.services.route_service import TEARDOWN_PENDING_REMOVAL
+
     await _freeze()
     written = await _key_based_build_failure("l3", error=f"{WIRING_UNRESOLVABLE_REASON}: gone")
-    assert (written.intended, written.attempts) == ("RELEASED", 0)
+    assert (written.intended, written.attempts, written.last_error) == (
+        "RELEASED",
+        0,
+        TEARDOWN_PENDING_REMOVAL,
+    )
+
+    execute_fn, calls = _recorder()
+    stats = await _tick(execute_fn)
+    assert calls == ["login", "remove_route", "logout"]
+    assert stats["released"] == 1
+    assert [r[1:3] for r in await _rows("l3")] == [("RELEASED", "RELEASED")]
 
 
 @pytest.mark.parametrize("branch", ["update", "insert"])
@@ -750,3 +779,185 @@ async def test_after_the_teardown_and_a_tick_every_row_is_released():
         state = await s.get(ReservationWiringState, RES)
     assert state.frozen is True
     assert await _foreign_snapshot() == foreign_before
+
+
+# --- A row a retry pass holds at the teardown is left as before #1501 -------------
+
+
+async def _hold_build(layer: str, row_id):
+    """A retry pass claims the build row before the freeze and is inside its drive."""
+    from app.services.wiring_claim import WiringRowClaims
+
+    holder = WiringRowClaims()
+    async with TestSessionLocal() as s:
+        assert await holder.claim(s, MODEL[layer], row_id, intended="ACTIVE") is True
+    return holder
+
+
+async def _held_failure(layer: str, row_id, holder, allocation=None):
+    """The holder's connect or join failed (it may have timed out and landed): its
+    failure write by row id, under its own claim."""
+    from app.services.l1_assignment_service import record_l1_failed
+    from app.services.l2_membership_service import record_l2_failed
+
+    async with TestSessionLocal() as s:
+        if layer == "l1":
+            return await record_l1_failed(
+                s,
+                RES,
+                SWITCH["l1"],
+                PORT_A,
+                PORT_B,
+                3,
+                "holder timeout",
+                intended="ACTIVE",
+                row_id=row_id,
+                claims=holder,
+            )
+        return await record_l2_failed(
+            s,
+            RES,
+            allocation,
+            SWITCH["l2"],
+            L2_PORT,
+            3,
+            "holder timeout",
+            intended="ACTIVE",
+            row_id=row_id,
+            claims=holder,
+        )
+
+
+async def _held_success(layer: str, allocation=None):
+    """The holder's connect or join succeeded after the freeze: its success record."""
+    from app.services.l1_assignment_service import record_l1_connect
+    from app.services.l2_membership_service import record_l2_membership_active
+
+    async with TestSessionLocal() as s:
+        if layer == "l1":
+            return await record_l1_connect(s, RES, SWITCH["l1"], PORT_A, PORT_B)
+        return await record_l2_membership_active(s, RES, allocation, SWITCH["l2"], L2_PORT)
+
+
+async def _allocation_status(allocation) -> str:
+    async with TestSessionLocal() as s:
+        return (await s.get(VlanAssignment, allocation)).status
+
+
+@pytest.mark.parametrize("layer", ["l1", "l2"])
+async def test_a_held_build_whose_failure_lands_late_is_left_failed_as_before(layer):
+    """A retry pass holds a live claim on a FAILED intended-ACTIVE row when the
+    reservation ends. The teardown leaves the row exactly as it is (no park, no driver
+    call; on L2 its allocation is not released and no delete_vlan runs, since the join
+    may still land). The holder's failure then lands under its own claim: the row reads
+    FAILED intended ACTIVE with the holder's failure, as before #1501, never RELEASED
+    over a connect or join that may have landed."""
+    allocation = await _allocation(defined=True) if layer == "l2" else None
+    row_id = await _seed(layer, "FAILED", "ACTIVE", allocation=allocation)
+    holder = await _hold_build(layer, row_id)
+
+    execute_fn, calls = _recorder()
+    await _terminal_event(execute_fn)
+    assert calls == []
+
+    written = await _held_failure(layer, row_id, holder, allocation)
+    assert written is not None
+    assert await _row(layer, row_id) == ("FAILED", "ACTIVE", 6, "holder timeout")
+    if layer == "l2":
+        assert await _allocation_status(allocation) == "ACTIVE"
+        assert "delete_vlan" not in calls
+
+
+@pytest.mark.parametrize("layer", ["l1", "l2"])
+async def test_a_held_build_whose_success_lands_late_is_a_pending_release(layer):
+    """The holder's connect or join succeeds after the teardown left its row alone: the
+    record-time freeze check parks it FAILED intended RELEASED (WIRE-LEDGER-4), and the
+    tick removes it."""
+    allocation = await _allocation(defined=True) if layer == "l2" else None
+    row_id = await _seed(layer, "FAILED", "ACTIVE", allocation=allocation)
+    await _hold_build(layer, row_id)
+
+    nothing, calls = _recorder()
+    await _terminal_event(nothing)
+    assert calls == []
+
+    recorded = await _held_success(layer, allocation)
+    assert (recorded.id, recorded.status, recorded.intended) == (row_id, "FAILED", "RELEASED")
+
+    execute_fn, calls = _recorder()
+    stats = await _tick(execute_fn)
+    assert RELEASE_ACTION[layer] in calls
+    assert stats["released"] == 1
+    assert (await _row(layer, row_id))[:2] == ("RELEASED", "RELEASED")
+
+
+@pytest.mark.parametrize("layer", ["l1", "l2"])
+async def test_a_build_whose_claim_expired_is_parked_and_removed(layer):
+    """An expired claim is no claim: the teardown parks and removes the row as any
+    unclaimed FAILED build."""
+    from datetime import datetime, timedelta, timezone
+
+    expired = datetime.now(timezone.utc) - timedelta(minutes=10)
+    row_id = await _seed(layer, "FAILED", "ACTIVE", claimed_until=expired)
+    execute_fn, calls = _recorder()
+    await _terminal_event(execute_fn)
+    assert calls == ["login", RELEASE_ACTION[layer], "logout"]
+    assert (await _row(layer, row_id))[:2] == ("RELEASED", "RELEASED")
+
+
+# --- Twin rows: a FAILED build beside an ACTIVE row of the same key ----------------
+
+
+@pytest.mark.parametrize("layer", ["l1", "l2"])
+async def test_a_failed_build_twinned_by_an_active_row_of_its_key_is_left_alone(layer):
+    """An ACTIVE row and a FAILED intended-ACTIVE row of the same key (L1: switch and
+    pair; L2: switch, port, and allocation). The teardown drives one removal, through
+    the ACTIVE row, and does not park the twin (on L1 a second row of the pair would
+    make release_l1_connection raise). The removal is made to fail here so the outcome
+    does not depend on which of the two rows a keyed release matches."""
+    allocation = await _allocation() if layer == "l2" else None
+    await _seed(layer, "ACTIVE", "ACTIVE", allocation=allocation, attempts=0, last_error=None)
+    twin = await _seed(layer, "FAILED", "ACTIVE", allocation=allocation)
+
+    execute_fn, calls = _recorder(fail={RELEASE_ACTION[layer]})
+    await _teardown(execute_fn)
+    # One removal, made of its three in-line attempts (WIRE-DRIVER-2).
+    assert calls.count(RELEASE_ACTION[layer]) == 3
+    assert await _row(layer, twin) == ("FAILED", "ACTIVE", 3, "driver timeout")
+
+
+async def test_an_l2_failed_build_on_another_allocation_of_an_active_port_is_removed():
+    """ACTIVE on VLAN 100 and a FAILED join of the same (switch, port) on VLAN 200: not
+    a twin of the same key, so the teardown parks the FAILED join and removes both
+    VLANs from the port; both rows and both allocations end RELEASED."""
+    removed: list = []
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        if action == "remove_from_vlan":
+            removed.append((kwargs.get("method_kwargs") or {}).get("vlan_id"))
+        return SUCCESS
+
+    first = await _allocation(vlan=100)
+    second = await _allocation(vlan=200)
+    await _seed("l2", "ACTIVE", "ACTIVE", allocation=first, attempts=0, last_error=None)
+    await _seed("l2", "FAILED", "ACTIVE", allocation=second)
+
+    await _teardown(execute_fn)
+    assert sorted(removed) == [100, 200]
+    assert {r[1] for r in await _rows("l2")} == {"RELEASED"}
+    assert {await _allocation_status(first), await _allocation_status(second)} == {"RELEASED"}
+
+
+async def test_an_l2_build_failure_with_no_new_allocation_keeps_the_rows_own():
+    """A key-based build failure that names no allocation keeps the row's real one, so
+    after the freeze it is a pending release like any other (the eligibility reads the
+    row's allocation, not only the write's)."""
+    allocation = await _allocation()
+    await _seed("l2", "FAILED", "ACTIVE", allocation=allocation)
+    await _freeze()
+    written = await _key_based_build_failure("l2", allocation=None)
+    assert (written.intended, written.attempts, written.vlan_assignment_id) == (
+        "RELEASED",
+        0,
+        allocation,
+    )

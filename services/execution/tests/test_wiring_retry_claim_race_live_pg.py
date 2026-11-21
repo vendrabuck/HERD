@@ -1956,3 +1956,136 @@ async def test_the_frozen_read_of_a_key_based_build_failure_is_the_rows_own_on_p
     finally:
         await _cleanup(session_factory, reservation_id)
         await _cleanup(session_factory, foreign)
+
+
+_IN_STATEMENT_CASES = [
+    ("l1", "update"),
+    ("l1", "insert"),
+    ("l2", "update"),
+    ("l2", "insert"),
+    ("l3", "update"),
+    ("l3", "insert"),
+    ("l3_reconcile", "update"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("writer", "branch"), _IN_STATEMENT_CASES)
+async def test_a_freeze_committed_after_the_writers_read_is_seen_by_its_write(
+    session_factory, writer, branch
+):
+    """Issue #1501, WIRE-LEDGER-17's in-statement read, on Postgres. Each key-based build
+    failure writer reads its row (or finds none) first and writes it at its commit. The
+    freeze is committed from a second session AFTER that read and BEFORE the write
+    statement runs (the writer session's `commit` is wrapped: it commits the freeze,
+    then flushes and commits the write). The write still records intended RELEASED,
+    attempts 0, because the frozen fact is read inside the UPDATE or INSERT itself, at
+    READ COMMITTED a fresh snapshot per statement. A frozen read taken with the writer's
+    earlier read (a Python check of the wiring state) would record intended ACTIVE. On a
+    used ledger: the other frozen reservation's rows and every foreign row unchanged."""
+    from app.services.l1_assignment_service import record_l1_failed
+    from app.services.l2_membership_service import record_l2_failed
+    from app.services.route_service import record_route_failed, record_route_reconcile_failed
+
+    reservation_id = uuid.uuid4()
+    layer = "l3" if writer == "l3_reconcile" else writer
+    model = _LEDGER[layer]
+    foreign = await _seed_frozen_foreign(session_factory)
+    foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    frozen_foreign_before = await _every_ledger_row(session_factory, foreign)
+
+    alloc_id = None
+    async with session_factory() as db:
+        if layer == "l2":
+            alloc = VlanAssignment(reservation_id=reservation_id, fabric_id=uuid.uuid4(), vlan_id=9)
+            db.add(alloc)
+            await db.flush()
+            alloc_id = alloc.id
+        if branch == "update":
+            common = {
+                "reservation_id": reservation_id,
+                "status": "ACTIVE" if writer == "l3_reconcile" else "FAILED",
+                "intended": "ACTIVE",
+                "attempts": HIDDEN_ATTEMPTS,
+                "last_error": "driver timeout",
+            }
+            if layer == "l1":
+                db.add(
+                    L1ConnectionAssignment(
+                        switch_device_id=SWITCH_ID, port_a="0/0/91", port_b="0/0/92", **common
+                    )
+                )
+            elif layer == "l2":
+                db.add(
+                    L2PortAssignment(
+                        vlan_assignment_id=alloc_id,
+                        switch_device_id=SWITCH_ID,
+                        port="0/0/93",
+                        **common,
+                    )
+                )
+            else:
+                db.add(RouteAssignment(device_id=SWITCH_ID, routes=[_LATE_ROUTE], **common))
+        await db.commit()
+
+    async def _freeze_elsewhere():
+        async with session_factory() as other:
+            other.add(ReservationWiringState(reservation_id=reservation_id, frozen=True))
+            await other.commit()
+
+    try:
+        db = session_factory()
+        real_commit = db.commit
+        frozen_at: dict = {}
+
+        async def _commit():
+            if "done" not in frozen_at:
+                frozen_at["done"] = True
+                await _freeze_elsewhere()
+            await real_commit()
+
+        db.commit = _commit
+        try:
+            if writer == "l1":
+                written = await record_l1_failed(
+                    db,
+                    reservation_id,
+                    SWITCH_ID,
+                    "0/0/91",
+                    "0/0/92",
+                    3,
+                    "boom",
+                    intended="ACTIVE",
+                )
+            elif writer == "l2":
+                written = await record_l2_failed(
+                    db,
+                    reservation_id,
+                    alloc_id,
+                    SWITCH_ID,
+                    "0/0/93",
+                    3,
+                    "boom",
+                    intended="ACTIVE",
+                )
+            elif writer == "l3":
+                written = await record_route_failed(
+                    db, reservation_id, SWITCH_ID, [_LATE_ROUTE], 3, "boom", intended="ACTIVE"
+                )
+            else:
+                written = await record_route_reconcile_failed(
+                    db, reservation_id, SWITCH_ID, 3, "boom", [_LATE_ROUTE]
+                )
+            row_id = written.id
+        finally:
+            await db.close()
+        assert frozen_at.get("done"), "the freeze must commit inside the writer's commit"
+
+        rows = await _reservation_rows(session_factory, model, reservation_id)
+        assert [r[1:] for r in rows] == [("FAILED", "RELEASED", 0)]
+        await _hide(session_factory, model, row_id)
+        assert await _foreign_ledger_snapshot(session_factory, reservation_id) == foreign_before
+        assert await _every_ledger_row(session_factory, foreign) == frozen_foreign_before
+    finally:
+        await _cleanup(session_factory, reservation_id)
+        await _cleanup(session_factory, foreign)

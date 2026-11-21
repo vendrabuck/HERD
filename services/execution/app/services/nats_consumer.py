@@ -5115,10 +5115,11 @@ async def _teardown_from_ledgers(
 
     A FAILED intended-ACTIVE row on any layer is a build that did not confirm, which may
     still have landed (a timed-out driver call), so it is parked intended RELEASED and
-    removed with the ACTIVE rows (L3 since issue #1001, L1 and L2 since issue #1501);
-    rows with a pinned reason are left as they are on L1 and L2, and an L2 row with a
-    nil or dangling allocation, or an L3 pin with no routes, is released with no driver
-    call.
+    removed with the ACTIVE rows (L3 since issue #1001, L1 and L2 since issue #1501).
+    On L1 and L2, rows with a pinned reason, rows another retry pass holds a live claim
+    on, and rows whose key also has an ACTIVE row are left as they are; an L2 row with
+    a nil or dangling allocation, or an L3 pin with no routes, is released with no
+    driver call (WIRE-TEARDOWN-6).
 
     Ordering mirrors ADR 0009 Decision 4 in release form: L1 disconnects, then L2
     membership removes plus allocation frees, then L3 pin removals. Empty ledgers no-op
@@ -5152,6 +5153,7 @@ async def _teardown_from_ledgers(
         park_stale_route_build,
         release_route_membership,
     )
+    from app.services.wiring_claim import WiringRowClaims, write_guard
 
     res_str = str(reservation_id)
 
@@ -5173,9 +5175,14 @@ async def _teardown_from_ledgers(
     # the disconnect fail or this pass die, the release-direction retry channels finish
     # it; a disconnect of a pair that never connected is the idempotent no-op the #491
     # stale settlement relies on. Pinned-reason rows are left as they are, as in the
-    # reconcile's stale settlement (WIRE-STALE-1): keyed on raw hop endpoints, never
+    # reconcile's stale settlement (WIRE-STALE-1): an unresolvable hop keyed on raw hop
+    # endpoints, or a switch whose driver package cannot load (#1199); neither can be
     # driven. FAILED intended-RELEASED rows are already release-direction work. A pair
-    # that also has an ACTIVE row is released through that row, as in the reconcile.
+    # that also has an ACTIVE row is left to that row's release (a second row for the
+    # pair would make release_l1_connection raise). A row a retry pass holds a live
+    # claim on is left as it is (the holder's own record settles it, as before #1501):
+    # the park runs only inside write_guard with an empty claim ledger, which locks the
+    # row only while it is unclaimed, so a claim taken after the read is respected too.
     active_l1_keys = {
         (str(row.switch_device_id), *canonical_port_pair(row.port_a, row.port_b)) for row in l1_rows
     }
@@ -5187,8 +5194,13 @@ async def _teardown_from_ledgers(
         key = (str(row.switch_device_id), *canonical_port_pair(row.port_a, row.port_b))
         if key in active_l1_keys:
             continue
-        async with get_db_session() as db:
-            parked = await park_stale_l1_build(db, row.id, TEARDOWN_PENDING_DISCONNECT)
+        parked = None
+        async with (
+            get_db_session() as db,
+            write_guard(db, L1ConnectionAssignment, row.id, WiringRowClaims()) as unclaimed_now,
+        ):
+            if unclaimed_now:
+                parked = await park_stale_l1_build(db, row.id, TEARDOWN_PENDING_DISCONNECT)
         if parked is None or parked.status != "FAILED":
             continue
         phys = str(parked.physical_connection_id) if parked.physical_connection_id else None
@@ -5234,21 +5246,40 @@ async def _teardown_from_ledgers(
         # allocation is then checked for release with theirs); a nil or dangling
         # allocation has no VLAN number to remove and never reached add_to_vlan, so the
         # row is released with no driver call, whatever its reason. Other pinned-reason
-        # rows are left as they are, and a (switch, port) that also has an ACTIVE row
-        # is removed through that row, as in the reconcile.
-        active_l2_keys = {(str(row.switch_device_id), row.port) for row in l2_rows}
+        # rows are left as they are, and so is a row whose (switch, port, allocation)
+        # also has an ACTIVE row (that row's removal drives the same VLAN). The direct
+        # release matches by (switch, port) only, so it is not made where any ACTIVE row
+        # holds the port. A row a retry pass holds a live claim on is left as it is, as
+        # on L1 (write_guard with an empty claim ledger), and its allocation does not
+        # join the emptied-allocation check, so its VLAN is not deleted under the join.
+        active_l2_ports = {(str(row.switch_device_id), row.port) for row in l2_rows}
+        active_l2_keys = {
+            (str(row.switch_device_id), row.port, row.vlan_assignment_id) for row in l2_rows
+        }
         for row in l2_failed:
-            if (str(row.switch_device_id), row.port) in active_l2_keys:
-                continue
+            port_key = (str(row.switch_device_id), row.port)
             va_id = row.vlan_assignment_id
+            if (*port_key, va_id) in active_l2_keys:
+                continue
             if va_id is None or va_id == _nil or va_id not in vlan_by_alloc:
-                async with get_db_session() as db:
-                    await release_l2_membership(db, res_str, row.switch_device_id, row.port)
+                if port_key in active_l2_ports:
+                    continue
+                async with (
+                    get_db_session() as db,
+                    write_guard(db, L2PortAssignment, row.id, WiringRowClaims()) as unclaimed_now,
+                ):
+                    if unclaimed_now:
+                        await release_l2_membership(db, res_str, row.switch_device_id, row.port)
                 continue
             if (row.last_error or "").startswith(NON_RETRYABLE_REASON_PREFIXES):
                 continue
-            async with get_db_session() as db:
-                parked = await park_stale_l2_build(db, row.id, TEARDOWN_PENDING_VLAN_REMOVAL)
+            parked = None
+            async with (
+                get_db_session() as db,
+                write_guard(db, L2PortAssignment, row.id, WiringRowClaims()) as unclaimed_now,
+            ):
+                if unclaimed_now:
+                    parked = await park_stale_l2_build(db, row.id, TEARDOWN_PENDING_VLAN_REMOVAL)
             if parked is None or parked.status != "FAILED":
                 continue
             removes.append(

@@ -280,10 +280,12 @@ def direction_admits(model, intended: str):
     a refusal is the unsettled case: the row is left FAILED intended ACTIVE, which no
     retry drives. The terminal teardown's read of FAILED rows parks and removes it on
     every layer (L3 since issue #1001, L1 and L2 since issue #1501), unless the flip
-    to intended ACTIVE landed after that read. A key-based build failure written after
-    the freeze no longer makes that flip (issue #1501: it records intended RELEASED on
-    a frozen reservation), so what remains is a flip by a writer whose statement read
-    the reservation as not frozen.
+    to intended ACTIVE landed after that read, and except an L1 or L2 row with a
+    pinned reason or under another pass's live claim; and an L3 holder's
+    partial-failure write can land over a pin the teardown parked (WIRE-TEARDOWN-6).
+    A key-based build failure written after the freeze no longer makes that flip
+    (issue #1501: it records intended RELEASED on a frozen reservation), so what
+    remains is a flip by a writer whose statement read the reservation as not frozen.
     """
     if intended == "RELEASED":
         return or_(model.intended == "RELEASED", reservation_frozen(model))

@@ -867,8 +867,9 @@ async def record_l1_failed(
 
     # Issue #1501: a build failure written on a frozen reservation is recorded as the
     # terminal teardown parks such a row (intended RELEASED, attempts 0), for exactly
-    # the rows the teardown parks: a hardware-retryable reason. A pinned-reason row is
-    # keyed on raw hop endpoints, never reached a driver, and stays as before.
+    # the rows the teardown parks: a hardware-retryable reason. A pinned-reason row (an
+    # unresolvable hop keyed on raw hop endpoints, or a switch whose driver package
+    # cannot load, #1199) cannot be driven, and stays as before.
     frozen_parks = intended == "ACTIVE" and is_retryable_failure(last_error)
 
     result = await db.execute(

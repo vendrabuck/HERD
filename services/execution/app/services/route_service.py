@@ -478,8 +478,9 @@ async def record_route_reconcile_failed(
 
     Issue #1501, the record_route_failed rule: on a reservation whose wiring is
     frozen (read inside this UPDATE, `wiring_due.frozen_build_failure_values`) the
-    failure is recorded intended RELEASED with attempts 0, keeping the routes above,
-    so the release-direction retry channels remove everything the failed delta may
+    failure is recorded intended RELEASED with attempts 0 and the reason
+    `TEARDOWN_PENDING_REMOVAL` (what the teardown's park records), keeping the routes
+    above, so the release-direction retry channels remove everything the failed delta may
     have left (the record_route_reconciled frozen branch's direction for the failure
     case). Otherwise, as before, intended ACTIVE with the attempts added.
     """
@@ -511,14 +512,17 @@ async def record_route_reconcile_failed(
         )
         return None
     row.status = "FAILED"
-    # Issue #1501: on a frozen reservation, intended RELEASED and attempts 0, decided in
-    # this UPDATE's own statement (see the docstring).
+    # Issue #1501: on a frozen reservation, the teardown park's state (intended RELEASED,
+    # attempts 0, TEARDOWN_PENDING_REMOVAL), decided in this UPDATE's own statement.
     frozen_values = frozen_build_failure_values(
-        RouteAssignment, func.coalesce(RouteAssignment.attempts, 0) + attempts
+        RouteAssignment,
+        func.coalesce(RouteAssignment.attempts, 0) + attempts,
+        last_error=last_error,
+        frozen_last_error=TEARDOWN_PENDING_REMOVAL,
     )
     row.intended = frozen_values["intended"]
     row.attempts = frozen_values["attempts"]
-    row.last_error = last_error
+    row.last_error = frozen_values["last_error"]
     if possibly_installed is not None:
         row.routes = possibly_installed
     # The drive this failure records is over, so release the claim (issue #817).
@@ -677,12 +681,14 @@ async def record_route_failed(
 
     Issue #1501, the key-based path only, the record_l1_failed rule: a BUILD failure
     landing on a reservation whose wiring is frozen is recorded intended RELEASED with
-    attempts 0, whatever its reason, the state the terminal teardown parks every
-    FAILED intended-ACTIVE pin in (`TEARDOWN_PENDING_REMOVAL`), so the
-    release-direction retry channels remove the routes it records (removing an absent
-    route is idempotent by driver contract). The frozen fact is read inside the
-    UPDATE or INSERT itself (`wiring_due.frozen_build_failure_values`). The stored
-    routes are written as before. A release failure and every write on a reservation
+    attempts 0 and the reason `TEARDOWN_PENDING_REMOVAL`, whatever its own reason, the
+    state the terminal teardown parks every FAILED intended-ACTIVE pin in, so the
+    release-direction retry channels select it and remove the routes it records
+    (removing an absent route is idempotent by driver contract). A pinned reason is not
+    kept: the teardown's park does not keep it either, and a removal that then fails
+    for the same cause records it again, release-direction (#1199). The frozen fact is
+    read inside the UPDATE or INSERT itself (`wiring_due.frozen_build_failure_values`).
+    The stored routes are written as before. A release failure and every write on a reservation
     that is not frozen are unchanged; the row-id path is unchanged.
     """
     res_uuid = _as_uuid(reservation_id)
@@ -729,14 +735,18 @@ async def record_route_failed(
         if intended == "ACTIVE":
             # Issue #1501: decided in this UPDATE's own statement.
             frozen_values = frozen_build_failure_values(
-                RouteAssignment, func.coalesce(RouteAssignment.attempts, 0) + attempts
+                RouteAssignment,
+                func.coalesce(RouteAssignment.attempts, 0) + attempts,
+                last_error=last_error,
+                frozen_last_error=TEARDOWN_PENDING_REMOVAL,
             )
             row.intended = frozen_values["intended"]
             row.attempts = frozen_values["attempts"]
+            row.last_error = frozen_values["last_error"]
         else:
             row.intended = intended
             row.attempts = (row.attempts or 0) + attempts
-        row.last_error = last_error
+            row.last_error = last_error
         # The drive this failure records is over, so release the claim (issue #817).
         row.claimed_until = None
         if routes is not None:
@@ -757,10 +767,15 @@ async def record_route_failed(
     if intended == "ACTIVE":
         # Issue #1501: decided in this INSERT's own statement.
         frozen_values = frozen_build_failure_values(
-            RouteAssignment, attempts, reservation_id=res_uuid
+            RouteAssignment,
+            attempts,
+            reservation_id=res_uuid,
+            last_error=last_error,
+            frozen_last_error=TEARDOWN_PENDING_REMOVAL,
         )
         row.intended = frozen_values["intended"]
         row.attempts = frozen_values["attempts"]
+        row.last_error = frozen_values["last_error"]
     db.add(row)
     await db.commit()
     await db.refresh(row)
