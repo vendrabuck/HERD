@@ -29,6 +29,13 @@ class Settings(HerdBaseSettings):
     minio_use_ssl: bool = False
     driver_max_size_bytes: int = 10_485_760
     driver_storage_path: str = "/data/drivers"
+    # Ceiling for a bulk device or template import upload (issue #1417). The
+    # export of a real lab inventory is orders of magnitude smaller; a mistaken
+    # upload (the wrong file, or an export of a huge table) is held in memory
+    # several times over — bytes, decoded string, parsed objects — and then
+    # parsed on the event loop, the loop every reservation and topology read
+    # depends on.
+    bulk_import_max_bytes: int = 10_485_760
 
     log_level: str = "INFO"
 

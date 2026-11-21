@@ -12,11 +12,12 @@ may carry secrets).
 
 import uuid
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import get_db
 from app.dependencies.auth import require_admin
 from app.models.device import Device
@@ -40,6 +41,42 @@ router = APIRouter(tags=["bulk"])
 
 _CSV_MEDIA = "text/csv"
 _JSON_MEDIA = "application/json"
+
+# A chunk well under the ceiling, so the read loop stops soon after passing it
+# rather than reading a whole extra megabyte before noticing.
+_UPLOAD_READ_CHUNK_BYTES = 64 * 1024
+
+_BULK_TOO_LARGE_DETAIL = (
+    "Import file exceeds the {limit} byte limit; export a smaller set and retry"
+)
+
+
+async def _read_capped(file: UploadFile, limit: int) -> bytes:
+    """Read an upload in chunks, refusing anything past ``limit`` (issue #1417).
+
+    ``await file.read()`` had no bound: Starlette spools a multipart file to a
+    temporary file and limits only non-file fields, and the gateway had no
+    body-size limit either. The whole file therefore landed in memory, was
+    decoded, and was parsed on the event loop — the loop every reservation and
+    topology read depends on.
+
+    Reading in chunks means an over-ceiling upload stops being read as soon as
+    the ceiling is passed, and the refusal happens before any decode.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_UPLOAD_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(
+                status_code=413,
+                detail=_BULK_TOO_LARGE_DETAIL.format(limit=limit),
+            )
+    return b"".join(chunks)
 
 
 def _export_response(records, columns, resource, fmt, text_columns=None):
@@ -91,7 +128,7 @@ async def import_devices_endpoint(
     with a reason without aborting the batch. With dry_run=true nothing is
     written and the full create/update/skip/reject report is returned.
     """
-    raw = await file.read()
+    raw = await _read_capped(file, settings.bulk_import_max_bytes)
     actor_id = uuid.UUID(payload["sub"])
     actor_name = payload.get("username", "")
     return await import_devices(db, raw, format, dry_run, actor_id, actor_name)
@@ -131,6 +168,6 @@ async def import_templates_endpoint(
     their template_name references. Per-row error handling and dry_run match the
     device import endpoint.
     """
-    raw = await file.read()
+    raw = await _read_capped(file, settings.bulk_import_max_bytes)
     actor_id = uuid.UUID(payload["sub"])
     return await import_templates(db, raw, format, dry_run, actor_id)

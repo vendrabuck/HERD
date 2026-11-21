@@ -1257,3 +1257,88 @@ async def test_a_csv_json_cell_holding_a_lone_surrogate_rejects_that_row_only(cl
         "a JSON cell holds a lone surrogate escape, which is not valid text"
     )
     assert (await _device_by_name(client, "d2"))["field_data"] == {"model": "ok \U0001f511"}
+
+
+@pytest.mark.asyncio
+async def test_a_bulk_upload_over_the_ceiling_is_refused_before_any_parse(client, monkeypatch):
+    """Issue #1417: `await file.read()` had no bound, so a mistaken upload was
+    held in memory several times over and then parsed on the event loop."""
+    from unittest.mock import patch
+
+    from app.routers import bulk as bulk_router
+
+    ceiling = 16
+    monkeypatch.setattr(bulk_router.settings, "bulk_import_max_bytes", ceiling)
+    # A payload that would be a valid import if it were parsed: the refusal must
+    # come from the size bound, not from the content.
+    body = json.dumps([{"name": "d1", "template_name": "Firewall"}]).encode()
+    assert len(body) > ceiling
+
+    with patch(
+        "app.services.bulk_service.import_devices", side_effect=AssertionError("parsed")
+    ) as parse:
+        resp = await client.post(
+            "/devices/import",
+            params={"format": "json"},
+            files={"file": ("big.json", io.BytesIO(body), "application/json")},
+        )
+
+    assert resp.status_code == 413
+    assert str(ceiling) in resp.json()["detail"]
+    parse.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_an_upload_at_the_ceiling_is_accepted(client, monkeypatch):
+    from app.routers import bulk as bulk_router
+
+    await _create_template(client, name="Firewall")
+    items = (await client.get("/templates/export", params={"format": "json"})).json()["items"]
+    body = json.dumps(items).encode()
+    monkeypatch.setattr(bulk_router.settings, "bulk_import_max_bytes", len(body))
+
+    resp = await client.post(
+        "/devices/import",
+        params={"format": "json"},
+        files={"file": ("d.json", io.BytesIO(body), "application/json")},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_the_chunked_read_stops_at_the_ceiling(monkeypatch):
+    """The read must stop as soon as the ceiling is passed, not read a whole
+    extra chunk past it."""
+    from app.routers import bulk as bulk_router
+
+    reads: list[int] = []
+
+    class _File:
+        """Yields fixed-size chunks and records how much was asked for."""
+
+        def __init__(self, chunk_size: int, total: int) -> None:
+            self._chunk = b"x" * chunk_size
+            self._remaining = total
+
+        async def read(self, size: int = -1) -> bytes:
+            reads.append(size)
+            if self._remaining <= 0:
+                return b""
+            taken = min(len(self._chunk), self._remaining)
+            self._remaining -= taken
+            return self._chunk[:taken]
+
+    chunk = bulk_router._UPLOAD_READ_CHUNK_BYTES
+    file = _File(chunk, chunk * 2 + 1)
+    monkeypatch.setattr(bulk_router.settings, "bulk_import_max_bytes", chunk)
+
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as raised:
+        await bulk_router._read_capped(file, chunk)
+
+    assert raised.value.status_code == 413
+    # Two full chunks were read: the second one is what passes the ceiling, and
+    # the loop stops there rather than reading the rest of the file.
+    assert sum(1 for size in reads if size == chunk) == 2
+    assert file._remaining > 0
