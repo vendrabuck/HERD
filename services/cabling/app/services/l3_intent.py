@@ -48,6 +48,11 @@ overwriting the first):
   only by fork-on-activation (``fork_service.create_fork``), which must never gate
   the reservation on drift a topology edit introduced after the booking was already
   judged valid.
+
+A switch whose merged, deduplicated routes number more than
+``herd_common.l3_route_limit.MAX_ROUTES_PER_SWITCH`` (issue #1493) is malformed in
+every one of its nodes, judged once in ``walk_l3_nodes``, so both entry points and
+the validation pass treat it like any other malformed node.
 """
 
 from __future__ import annotations
@@ -59,6 +64,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from herd_common.l3_route_identity import route_identity_key
+from herd_common.l3_route_limit import MAX_ROUTES_PER_SWITCH, route_limit_exceeded
 
 from app.services.canvas_nodes import node_to_device_map
 
@@ -159,6 +165,10 @@ def _parse_node_l3_full(node_id: str, l3_data: Any) -> tuple[list[RouteSpec], li
     ``l3_validation.py`` to report as informational ``l3_duplicate_route``
     entries. ``parse_node_l3`` (the public, widely-used entry point) discards
     the second element for callers that only want the deduped routes.
+
+    Shape only: the per-switch route limit (issue #1493) is judged after the
+    merge across nodes, in ``walk_l3_nodes``, since one node cannot see the
+    other nodes naming its switch.
     """
     if not isinstance(l3_data, dict) or set(l3_data.keys()) != {"routes"}:
         raise L3IntentMalformed(node_id, "'l3' must be an object with exactly one key: 'routes'")
@@ -221,6 +231,11 @@ def parse_node_l3(node_id: str, l3_data: Any) -> list[RouteSpec]:
     after a collapsed duplicate does not silently shift (S12). Callers that also
     need the collapsed indices (to report them) use ``_parse_node_l3_full`` via
     ``walk_l3_nodes``.
+
+    No production path calls this: every canvas parse goes through
+    ``walk_l3_nodes``, which also applies the per-switch route limit (issue
+    #1493) to the routes merged across all of a switch's nodes. This function
+    sees one node only, so it checks the shape and nothing else.
     """
     routes, _duplicate_indices = _parse_node_l3_full(node_id, l3_data)
     return routes
@@ -263,6 +278,14 @@ def walk_l3_nodes(canvas: dict | None) -> tuple[list[L3NodeCandidate], list[L3No
     (an element or dynamic-placeholder node, or a node whose device id fails to
     parse as a UUID), is silently skipped, same as every other reader of
     ``node_to_device_map``.
+
+    The per-switch route limit (issue #1493) is applied here, after the
+    per-node parse, by ``_refuse_switches_over_the_route_limit``: a switch whose
+    merged, deduplicated routes number more than
+    ``herd_common.l3_route_limit.MAX_ROUTES_PER_SWITCH`` has every one of its
+    nodes moved from ``candidates`` to ``malformed``. Every reader of this walk
+    (save, both validate routes, fork-on-activation) therefore refuses it the
+    same way it refuses a malformed shape.
     """
     if not canvas:
         return [], []
@@ -270,6 +293,9 @@ def walk_l3_nodes(canvas: dict | None) -> tuple[list[L3NodeCandidate], list[L3No
     device_map = node_to_device_map(canvas)
     candidates: list[L3NodeCandidate] = []
     malformed: list[L3NodeMalformed] = []
+    # Canvas node order of every entry, so the per-switch limit below can turn a
+    # candidate into a malformed entry without breaking "first in canvas order".
+    order: dict[str, int] = {}
     for node in nodes:
         node_id = node.get("id")
         if node_id is None:
@@ -280,6 +306,7 @@ def walk_l3_nodes(canvas: dict | None) -> tuple[list[L3NodeCandidate], list[L3No
         l3_data = (node.get("data") or {}).get("l3")
         if l3_data is None:
             continue
+        order.setdefault(node_id, len(order))
         try:
             routes, duplicate_indices = _parse_node_l3_full(node_id, l3_data)
         except L3IntentMalformed as exc:
@@ -288,7 +315,56 @@ def walk_l3_nodes(canvas: dict | None) -> tuple[list[L3NodeCandidate], list[L3No
         if not routes:
             continue
         candidates.append((node_id, device_id, routes, duplicate_indices))
-    return candidates, malformed
+    return _refuse_switches_over_the_route_limit(candidates, malformed, order)
+
+
+def route_limit_message(device_id: uuid.UUID, count: int) -> str:
+    """The refusal text for a switch over the route limit (issue #1493): names the
+    switch by its device id, the distinct route count, and the limit."""
+    return (
+        f"switch {device_id} has {count} distinct routes; "
+        f"a switch carries at most {MAX_ROUTES_PER_SWITCH}"
+    )
+
+
+def _refuse_switches_over_the_route_limit(
+    candidates: list[L3NodeCandidate],
+    malformed: list[L3NodeMalformed],
+    order: dict[str, int],
+) -> tuple[list[L3NodeCandidate], list[L3NodeMalformed]]:
+    """The per-switch route limit (issue #1493), judged on what a save would store.
+
+    A switch's routes are counted the way ``merge_candidates_by_device`` stores them:
+    every well-formed node naming the switch, merged, deduplicated on ``route_key``,
+    so a duplicate never counts twice and two nodes cannot each stay under the limit
+    while their switch goes over it. That is the same set execution's drive gate
+    later counts (``herd_common.l3_route_limit``), so this pre-check equals the
+    judge. Every node of an over-limit switch becomes a malformed entry with the
+    same message, in canvas node order: the save answers 422
+    ``l3_intent_malformed``, validation reports ``l3_malformed`` on each node, and
+    fork-on-activation drops the switch's intent with a warning, exactly like any
+    other malformed node.
+    """
+    keys_by_device: dict[uuid.UUID, set[str]] = {}
+    for _node_id, device_id, routes, _duplicate_indices in candidates:
+        keys_by_device.setdefault(device_id, set()).update(r.route_key for r in routes)
+    over = {
+        device_id: len(keys)
+        for device_id, keys in keys_by_device.items()
+        if route_limit_exceeded(len(keys))
+    }
+    if not over:
+        return candidates, malformed
+    kept: list[L3NodeCandidate] = []
+    for candidate in candidates:
+        node_id, device_id, _routes, _duplicate_indices = candidate
+        if device_id in over:
+            message = route_limit_message(device_id, over[device_id])
+            malformed.append((node_id, device_id, L3IntentMalformed(node_id, message)))
+        else:
+            kept.append(candidate)
+    malformed.sort(key=lambda entry: order[entry[0]])
+    return kept, malformed
 
 
 def merge_candidates_by_device(
@@ -380,5 +456,6 @@ __all__ = [
     "parse_l3_intent",
     "parse_l3_intent_tolerant",
     "parse_node_l3",
+    "route_limit_message",
     "walk_l3_nodes",
 ]

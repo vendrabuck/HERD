@@ -36,6 +36,7 @@ from app.services.nats_consumer import (
 )
 from app.services.route_service import record_route_active, record_route_failed
 from herd_common.l3_route_identity import route_identity_key
+from herd_common.l3_route_limit import MAX_ROUTES_PER_SWITCH
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -2069,3 +2070,146 @@ async def test_manual_retry_config_read_token_refusal_reports_still_failed(statu
     assert [r["outcome"] for r in result["results"]] == ["reconnected"]
     assert {d for a, d in calls if a == "configure_route"} == {r["destination"] for r in ROUTES}
     assert unexpected == []
+
+
+# --- Issue #1493: the per-switch route limit at drive time --------------------
+# Cabling refuses a save over the limit, so these are the paths it cannot see: intent
+# stored before the limit existed (the gate), a switch's configured routes and a pin
+# reused verbatim (the provision choke point in `_apply_l3_adjacency`), and a retry
+# of either. Every refusal is the fixed reason, before any driver call.
+
+
+def _limit_routes(count, start=0):
+    return [
+        {"destination": f"10.{i // 256}.{i % 256}.0/24", "next_hop": None, "interface": "eth0"}
+        for i in range(start, start + count)
+    ]
+
+
+def _limit_intent(count):
+    return [_intent_route(r["destination"], r["interface"]) for r in _limit_routes(count)]
+
+
+def _counting_config_fetch(config_by_switch):
+    reads = []
+
+    async def _fetch(device_id, client=None):
+        reads.append(str(device_id))
+        return config_by_switch.get(str(device_id))
+
+    return _fetch, reads
+
+
+async def test_gate_refuses_an_over_limit_stored_intent_with_no_driver_call_or_read():
+    """An intent of 1,001 routes stored before the limit existed lands the newly
+    adjacent switch FAILED `l3_too_many_routes` recording nothing installed, with no
+    driver call and not even the gate's config read."""
+    config_fetch, reads = _counting_config_fetch(CONFIG_BY_SWITCH)
+    calls = await _reconcile(
+        L3_WIRES,
+        l3_routes={SW_L3: _limit_intent(MAX_ROUTES_PER_SWITCH + 1)},
+        config_fetch=config_fetch,
+    )
+    assert calls == []
+    assert reads == []
+    [row] = await _rows()
+    assert (row.status, row.intended, row.last_error) == ("FAILED", "ACTIVE", "l3_too_many_routes")
+    assert row.routes == []
+    assert row.attempts == 0
+
+
+async def test_gate_refuses_an_over_limit_delta_and_keeps_the_previous_pin():
+    await _reconcile(L3_WIRES, fork_version=1, l3_routes={SW_L3: [_intent_route(ROUTE_A, "eth1")]})
+    execute_fn, calls = _l3_recorder()
+    await _reconcile(
+        L3_WIRES,
+        fork_version=2,
+        l3_routes={SW_L3: _limit_intent(MAX_ROUTES_PER_SWITCH + 1)},
+        execute_fn=execute_fn,
+        calls=calls,
+    )
+    assert calls == []
+    [row] = await _rows()
+    assert (row.status, row.last_error) == ("FAILED", "l3_too_many_routes")
+    assert [r["destination"] for r in row.routes] == [ROUTE_A]
+
+
+async def test_gate_passes_an_intent_at_the_limit_counting_a_duplicate_once():
+    from app.services.nats_consumer import _gate_l3_drive_routes
+
+    intent = _limit_intent(MAX_ROUTES_PER_SWITCH)
+    intent_with_duplicate = intent + [dict(intent[0])]
+    with patch(
+        "app.services.nats_consumer._fetch_latest_config",
+        new=AsyncMock(side_effect=_config_fetch),
+    ):
+        clean, reason = await _gate_l3_drive_routes(
+            SW_L3,
+            intent_with_duplicate,
+            _FetchContext(None),
+            _db_session_factory(),
+            wired_ports=set(),
+        )
+        assert reason is None
+        assert clean == intent_with_duplicate
+        clean, reason = await _gate_l3_drive_routes(
+            SW_L3,
+            _limit_intent(MAX_ROUTES_PER_SWITCH + 1),
+            _FetchContext(None),
+            _db_session_factory(),
+            wired_ports=set(),
+        )
+        assert (clean, reason) == ([], "l3_too_many_routes")
+
+
+async def test_configured_routes_over_the_limit_are_refused_with_no_driver_call():
+    """The inventory-config path: no intent, and the switch's latest config carries
+    1,001 routes. The provision is refused at the choke point; nothing is recorded as
+    installed, so a config edit under the limit is driven by the next pass."""
+    config = {
+        SW_L3: {"id": DEFAULT_CFG_VERSION_ID, "config": {"routes": _limit_routes(1001)}},
+    }
+    config_fetch, _reads = _counting_config_fetch(config)
+    calls = await _reconcile(L3_WIRES, l3_routes={}, config_fetch=config_fetch)
+    assert calls == []
+    [row] = await _rows()
+    assert (row.status, row.intended, row.last_error) == ("FAILED", "ACTIVE", "l3_too_many_routes")
+    assert row.routes == []
+
+    config[SW_L3]["config"]["routes"] = _limit_routes(2)
+    calls = await _reconcile(L3_WIRES, fork_version=2, l3_routes={}, config_fetch=config_fetch)
+    assert {d for a, d in calls if a == "configure_route"} == {"10.0.0.0/24", "10.0.1.0/24"}
+    assert await _active_switches() == {SW_L3}
+
+
+async def test_configured_routes_at_the_limit_drive_once_each_even_when_duplicated():
+    """1,000 distinct configured routes plus a duplicate of each are at the limit, and
+    the drive configures each distinct route exactly once and pins the 1,000."""
+    routes = _limit_routes(MAX_ROUTES_PER_SWITCH)
+    config = {SW_L3: {"id": DEFAULT_CFG_VERSION_ID, "config": {"routes": routes + routes}}}
+    config_fetch, _reads = _counting_config_fetch(config)
+    calls = await _reconcile(L3_WIRES, l3_routes={}, config_fetch=config_fetch)
+    configured = [d for a, d in calls if a == "configure_route"]
+    assert len(configured) == MAX_ROUTES_PER_SWITCH
+    assert len(set(configured)) == MAX_ROUTES_PER_SWITCH
+    [row] = await _rows("ACTIVE")
+    assert row.routes == routes
+
+
+async def test_a_retry_refuses_a_pin_stored_over_the_limit_and_keeps_it():
+    """A FAILED intended-ACTIVE pin recorded before the limit, with no intent: the
+    retry channel would drive the row's own routes verbatim, and the choke point
+    refuses them, keeps them recorded (they may be installed), and counts one attempt
+    so the tick's attempts cap ends the retries."""
+    stored = _limit_routes(MAX_ROUTES_PER_SWITCH + 1)
+    async with TestSessionLocal() as db:
+        await record_route_failed(db, RES_ID, SW_L3, stored, 1, "boom", intended="ACTIVE")
+
+    execute_fn, calls = _l3_recorder()
+    stats = await _retry_tick(execute_fn)
+    assert calls == []
+    assert stats["reconnected"] == 0
+    [row] = await _rows()
+    assert (row.status, row.intended, row.last_error) == ("FAILED", "ACTIVE", "l3_too_many_routes")
+    assert row.routes == stored
+    assert row.attempts == 2

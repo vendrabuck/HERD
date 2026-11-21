@@ -19,6 +19,7 @@ from herd_common.jetstream import (
     process_batch_with_heartbeat,
 )
 from herd_common.l3_route_identity import route_identity_key
+from herd_common.l3_route_limit import distinct_route_count, route_limit_exceeded
 from herd_common.l3_validation import (
     usable_interface_attachments,
     usable_interfaces,
@@ -4059,6 +4060,21 @@ async def _l3_driver_supports_vrf(switch_id: str, ctx: "_FetchContext", get_db_s
     return bool(metadata.get("supports_vrf", False))
 
 
+# Issue #1493: the reason a switch whose route set is over the per-switch limit
+# (herd_common.l3_route_limit.MAX_ROUTES_PER_SWITCH) is recorded FAILED with, before
+# any driver call. A fixed code like the gate's other reasons: no driver or route text.
+# Retryable (outside NON_RETRYABLE_REASON_PREFIXES): a config edit can bring the
+# switch's configured routes under the limit, and a retry then drives them; the tick's
+# attempts cap ends the retries otherwise.
+L3_TOO_MANY_ROUTES_REASON = "l3_too_many_routes"
+
+
+def _l3_route_set_over_limit(routes: list[dict]) -> bool:
+    """Whether a switch's route set is over the per-switch limit (issue #1493),
+    counted as cabling counts it: distinct routes by the shared identity key."""
+    return route_limit_exceeded(distinct_route_count(routes))
+
+
 async def _gate_l3_drive_routes(
     switch_id: str,
     routes: list[dict],
@@ -4115,7 +4131,17 @@ async def _gate_l3_drive_routes(
     prevents. Like the rest of X-A it applies only on the re-validating path; a
     route whose validation stamp is current is trusted verbatim, the S6
     amendment's deliberate gap, unchanged here.
+
+    The per-switch route limit (issue #1493) runs before everything else: a route
+    set with more distinct routes than
+    ``herd_common.l3_route_limit.MAX_ROUTES_PER_SWITCH`` refuses the whole switch
+    with ``l3_too_many_routes``, with no driver load and no inventory read. Cabling
+    refuses the same set at save, by the same count, so this only ever fires for
+    intent stored before the limit existed.
     """
+    if _l3_route_set_over_limit(routes):
+        return [], L3_TOO_MANY_ROUTES_REASON
+
     if any(route.get("virtual_router") for route in routes):
         if not await _l3_driver_supports_vrf(switch_id, ctx, get_db_session):
             return [], "l3_vrf_unsupported"
@@ -4323,6 +4349,15 @@ async def _apply_l3_adjacency(
     before the claim, so the one claim outlives the login, every route operation, and
     the logout (issue #1482).
 
+    A provision's route set is deduplicated by route identity and then held to the
+    per-switch route limit (issue #1493) before anything else is read: over the limit,
+    the switch is recorded FAILED `l3_too_many_routes` with its existing routes kept
+    and no claim, load, or driver call. So a drive configures at most
+    `MAX_ROUTES_PER_SWITCH` routes. A reconcile item needs no check here: its only
+    producer builds it from intent that passed `_gate_l3_drive_routes`, which applies
+    the same limit. Removals are never limited (a deprovision, a delta's removals, a
+    provision's residue): refusing one would leave routes installed.
+
     """
     from datetime import datetime, timezone
 
@@ -4414,6 +4449,36 @@ async def _apply_l3_adjacency(
                         switch_id,
                         reservation_id,
                     )
+                    continue
+                # Issue #1493: the per-switch route limit, here because every provision
+                # passes this point whatever its route source (gated intent, a reused
+                # pin, the switch's configured routes, a retry's pinned set). Duplicates
+                # are dropped first, so the count is exactly the configure calls the
+                # drive would make. Refused before the claim and the driver load, with
+                # no route call; `None` keeps whatever an existing FAILED row records as
+                # possibly installed and stores nothing for a fresh switch (WIRE-L3-13's
+                # shape).
+                routes = union_routes(routes)
+                if _l3_route_set_over_limit(routes):
+                    logger.warning(
+                        "L3 provision for switch %s in reservation %s carries %d routes, "
+                        "over the per-switch limit; refused with no driver call",
+                        switch_id,
+                        reservation_id,
+                        len(routes),
+                    )
+                    async with get_db_session() as db:
+                        await record_route_failed(
+                            db,
+                            res_uuid,
+                            switch_id,
+                            None,
+                            1 if switch_id in retry_ids else 0,
+                            L3_TOO_MANY_ROUTES_REASON,
+                            intended=intended,
+                            row_id=retry_ids.get(switch_id),
+                            claims=claims,
+                        )
                     continue
                 # A provision over a FAILED pin (a reconcile-time rebuild or a retry)
                 # must first remove what that pin may have left installed and the new
