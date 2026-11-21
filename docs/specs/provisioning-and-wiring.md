@@ -537,13 +537,14 @@ support.
   and a reason; no other answer does (WIRE-GATE-3). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_verify_reservation_event`, `process_reservation_message`) \
   Pinned by: `services/execution/tests/test_nats_consumer_event_verification.py` (`test_unverified_terminal_event_acks_without_running_the_handler`, `test_gate_404_acks_without_running_the_handler`, `test_created_for_a_cancelled_reservation_is_unverified`); `tests/integration/test_event_verification_gate.py` (`test_forged_cancelled_event_for_an_active_reservation_is_ignored`); `tests/integration/test_wiring_changed_reconcile.py` (`test_wiring_changed_for_completed_reservation_does_not_reconnect`)
-- **WIRE-GATE-3.** A transport error or any other answer from that check (a 5xx, and
-  since #1215 a 401 or 403 during an `INTERNAL_API_TOKEN` rotation, a 409, or a 422 for
-  a malformed id) raises `TransientUpstreamError`, so the message is nacked and retried,
+- **WIRE-GATE-3.** A transport error (a read still unanswered at the 20 second total
+  deadline, `INTERNAL_READ_DEADLINE_SECONDS`, included; issue #1498) or any other
+  answer from that check (a 5xx, and since #1215 a 401 or 403 during an
+  `INTERNAL_API_TOKEN` rotation, a 409, or a 422 for a malformed id) raises `TransientUpstreamError`, so the message is nacked and retried,
   and dead-lettered after the backoff schedule when the answer persists (fail closed:
   the handler never runs on it, and the event is never acked unrun). \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_get_internal`, `_internal_record_found`, `_verify_reservation_event`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_event_verification.py` (`test_5xx_raises_transient_upstream_error`, `test_transport_error_raises_transient_upstream_error`, `test_gate_transport_failure_naks_like_any_other_transient_error`, `test_verifier_raises_transient_on_every_status_but_200_and_404`, `test_gate_auth_error_naks_and_never_runs_or_drops_the_event`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_cancelled_event_whose_check_is_refused_naks_then_tears_down`)
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_get_internal`, `INTERNAL_READ_DEADLINE_SECONDS`, `_internal_record_found`, `_verify_reservation_event`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_event_verification.py` (`test_5xx_raises_transient_upstream_error`, `test_transport_error_raises_transient_upstream_error`, `test_gate_transport_failure_naks_like_any_other_transient_error`, `test_verifier_raises_transient_on_every_status_but_200_and_404`, `test_gate_auth_error_naks_and_never_runs_or_drops_the_event`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_cancelled_event_whose_check_is_refused_naks_then_tears_down`); `services/execution/tests/test_upstream_total_deadlines.py` (`test_get_internal_drip_is_cut_at_the_total_deadline`, `test_get_internal_under_the_deadline_returns_the_response`, `test_a_stalled_corroboration_read_naks_the_message`)
 - **WIRE-GATE-4.** An event with no table entry, or with no `reservation_id`, makes no
   call and goes straight to its handler. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_verify_reservation_event`) \
@@ -659,7 +660,9 @@ state transitions are WIRE-ORDER-1 and WIRE-FREEZE-1.
   `INTERNAL_API_TOKEN` rotation, a 409, a 422, a 5xx), a 200 whose body is not a JSON
   object, and a transport failure raise `TransientUpstreamError` with the text
   `fetch device <id>: upstream <status>` (or `fetch template <id>: ...`,
-  `...: upstream answered with a malformed body`, `...: transport error: <message>`),
+  `...: upstream answered with a malformed body`, `...: transport error: <message>`;
+  a read still unanswered at its 20 second total deadline is a transport failure,
+  `...: transport error: TimeoutError`, issue #1498),
   so the event is nacked and no row is pinned with `WIRING_UNRESOLVABLE_REASON`: a
   `wiring_changed` leaves the version unstamped and records nothing for the switch,
   and a terminal teardown leaves the ACTIVE rows of the failing layer and of every
@@ -668,8 +671,8 @@ state transitions are WIRE-ORDER-1 and WIRE-FREEZE-1.
   (#1001), and the release-direction retry tick finishes it. The read of a switch or its
   template for an allocation's `delete_vlan` is the other exception: it stops only that
   allocation's deletes and is not re-raised (WIRE-VLAN-12). \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_device`, `_fetch_template`, `_inventory_record_or_none`) \
-  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_returns_the_body_on_200`, `test_inventory_read_returns_none_only_on_404`, `test_inventory_read_raises_transient_on_every_other_status`, `test_inventory_read_raises_transient_on_a_malformed_200_body`, `test_inventory_read_raises_transient_on_transport_error`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_inventory_auth_error_naks_and_never_pins`); `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_inventory_auth_error_on_switch_read_raises_and_pins_nothing`)
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_device`, `_fetch_template`, `_inventory_record_or_none`, `_get_internal`, `INTERNAL_READ_DEADLINE_SECONDS`) \
+  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_returns_the_body_on_200`, `test_inventory_read_returns_none_only_on_404`, `test_inventory_read_raises_transient_on_every_other_status`, `test_inventory_read_raises_transient_on_a_malformed_200_body`, `test_inventory_read_raises_transient_on_transport_error`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_inventory_auth_error_naks_and_never_pins`); `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_inventory_auth_error_on_switch_read_raises_and_pins_nothing`); `services/execution/tests/test_upstream_total_deadlines.py` (`test_switch_device_read_deadline_is_the_transient_error_not_absent`, `test_wiring_retry_with_a_stalled_switch_read_answers_503`)
 - **WIRE-ORDER-12.** Within one fetch context each device, each switch's latest config,
   and each template read through `get_template` is fetched at most once when the read
   answers (a 404 included). A context lives for one reservation event, or for one
@@ -1116,13 +1119,14 @@ it fails, and counted as done only when the driver's own answer says so.
   by `driver load failed: DriverPackageError`, with no attempt counted, and neither retry
   channel retries it (WIRE-RETRY-4). Any other load failure, a failed package download
   in particular, is transient: the reason is `driver load failed: <ClassName>` (the
-  wrapped cause's class, for example `ConnectError`), with one attempt counted, and both
+  wrapped cause's class, for example `ConnectError`, or `TimeoutError` for a download
+  past its total deadline, CFG-LOAD-2), with one attempt counted, and both
   retry channels drive the row again in its direction, builds and releases (a teardown's
   included) alike. A transient failure in the L2 `create_vlan` pre-pass parks the
   dependent joins under `create_vlan failed: driver load failed: <ClassName>`. The stored
   text never carries the exception's message, which goes only to the log. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_wiring_load_failure`, `_apply_wiring_pairs`, `_run_vlan_definition_op`, `_apply_l2_memberships`, `_apply_l3_adjacency`); `services/execution/app/services/driver_loader.py` (`is_permanent_load_failure`, `driver_load_failure_text`); `services/execution/app/services/wiring_retry_service.py` (`is_retryable_failure`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_driver_load_raise_parks_pairs_failed_without_nak`); `services/execution/tests/test_wiring_driver_load_classification.py` (`test_wiring_load_failure_reason_and_attempts_by_kind`, `test_l1_transient_download_failure_parks_build_and_release_retryable`, `test_l1_broken_package_parks_build_and_release_permanent`, `test_l2_transient_download_failure_parks_add_and_remove_retryable`, `test_l2_transient_failure_during_vlan_define_parks_the_add_retryable`, `test_l3_transient_download_failure_parks_provision_and_deprovision_retryable`, `test_l3_broken_package_parks_provision_and_deprovision_permanent`, `test_l1_transient_rows_converge_on_the_next_retry_tick`, `test_l2_transient_remove_converges_on_the_next_retry_tick`, `test_l3_transient_rows_converge_on_the_next_retry_tick`, `test_l1_broken_package_rows_are_not_retried_by_the_tick`, `test_teardown_l1_removal_with_transient_download_failure_stays_retryable`); `services/execution/tests/test_wiring_retry_service.py` (`test_is_retryable_classifies_pinned_reasons_not_retryable`)
+  Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_driver_load_raise_parks_pairs_failed_without_nak`); `services/execution/tests/test_wiring_driver_load_classification.py` (`test_wiring_load_failure_reason_and_attempts_by_kind`, `test_l1_transient_download_failure_parks_build_and_release_retryable`, `test_l1_broken_package_parks_build_and_release_permanent`, `test_l2_transient_download_failure_parks_add_and_remove_retryable`, `test_l2_transient_failure_during_vlan_define_parks_the_add_retryable`, `test_l3_transient_download_failure_parks_provision_and_deprovision_retryable`, `test_l3_broken_package_parks_provision_and_deprovision_permanent`, `test_l1_transient_rows_converge_on_the_next_retry_tick`, `test_l2_transient_remove_converges_on_the_next_retry_tick`, `test_l3_transient_rows_converge_on_the_next_retry_tick`, `test_l1_broken_package_rows_are_not_retried_by_the_tick`, `test_teardown_l1_removal_with_transient_download_failure_stays_retryable`); `services/execution/tests/test_upstream_total_deadlines.py` (`test_wiring_retry_with_a_stalled_download_returns_the_transient_outcome`); `services/execution/tests/test_wiring_retry_service.py` (`test_is_retryable_classifies_pinned_reasons_not_retryable`)
 
 **Out of scope.** Driver package loading, caching, and validation (`inventory.md`,
 `device-configuration.md`); the driver method contract (`DRIVERS.md`).
@@ -1601,8 +1605,11 @@ full list.
 | `INTERNAL_API_TOKEN` | empty | Token for the internal routes and every outgoing internal call; empty makes the internal routes answer 500 |
 
 Fixed in code, not configurable: `max_deliver` 5; one message per fetch with a 5 second
-wait; three in-line driver attempts with 0.2 s doubling to 2 s; 10 s for every
-inventory, cabling, and reservations call; VLAN range 2 to 4094 with five allocation
+wait; three in-line driver attempts with 0.2 s doubling to 2 s; 10 s per phase for every
+inventory, cabling, and reservations call, and 20 s in total for each read through
+`_get_internal` (the event check, and the device, template, latest config, hypervisor,
+secret, and fork reads; `INTERNAL_READ_DEADLINE_SECONDS`, issue #1498); 120 s in total
+for a driver package download (CFG-LOAD-2); VLAN range 2 to 4094 with five allocation
 attempts; the claim budget (WIRE-CLAIM-3).
 
 ## 12. Test coverage map

@@ -1,11 +1,13 @@
 """Driver package loader: download, extract, validate, and cache driver packages."""
 
+import asyncio
 import gzip
 import io
 import json
 import logging
 import shutil
 import tarfile
+import threading
 import uuid
 import zipfile
 from pathlib import Path
@@ -108,17 +110,42 @@ async def get_cached_driver(
     return cache_entry.local_path
 
 
+# The total time one driver package download may take, connect to last byte (issue
+# #1498). httpx applies its own 30 second timeout per phase (connect, each read, write,
+# pool), so a response that delivers a byte at least every 30 seconds never trips it,
+# and the consumer, which handles one message at a time, would wait on it without
+# bound. A constant by decision, beside the per-phase literal it bounds, not a setting.
+DRIVER_DOWNLOAD_DEADLINE_SECONDS = 120.0
+
+
 async def download_driver_package(driver_id: uuid.UUID) -> bytes:
-    """Download driver package from the inventory service."""
+    """Download driver package from the inventory service.
+
+    The whole download, the client's setup and teardown included, runs under
+    DRIVER_DOWNLOAD_DEADLINE_SECONDS; past it the request is cancelled, the client
+    is closed, and this raises ``TimeoutError``, which load_driver turns into the
+    same transient ``RuntimeError`` as any other download failure (row text
+    ``driver load failed: TimeoutError``). The body is read into memory, so a
+    download cut off at the deadline leaves nothing on disk.
+    """
     url = f"{settings.inventory_service_url}/drivers/{driver_id}/internal-download"
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            url,
-            headers={"X-Internal-Token": settings.internal_api_token},
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-        return resp.content
+    try:
+        async with asyncio.timeout(DRIVER_DOWNLOAD_DEADLINE_SECONDS):
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    url,
+                    headers={"X-Internal-Token": settings.internal_api_token},
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                return resp.content
+    except TimeoutError as exc:
+        # The deadline's own TimeoutError has no message; this one names the bound
+        # for the log line load_driver writes. The class name, which is all a row
+        # or a response ever carries, is unchanged.
+        raise TimeoutError(
+            f"no complete download within {DRIVER_DOWNLOAD_DEADLINE_SECONDS:g} seconds"
+        ) from exc
 
 
 # Fixed ceilings on what extracting one driver package may write (issue #1115). The
@@ -268,6 +295,11 @@ def read_driver_metadata(driver_dir: Path) -> dict:
 def extract_config_schema_json(driver_dir: Path) -> str | None:
     """Extract the driver-published config schema and return it JSON-encoded.
 
+    Synchronous: it waits on the sandbox's ``subprocess.run`` (and, with
+    ALLOW_DRIVER_PIP_INSTALL on, a ``pip install`` before it), so load_driver runs
+    it on a worker thread through _SchemaExtraction, never on the event loop
+    (issue #1498).
+
     Runs the `__config_schema__` sentinel in the sandbox (which reads
     Driver.config_schema() on the class object, never instantiating it). Returns
     the JSON-encoded schema dict, or None when the driver published no schema,
@@ -311,6 +343,76 @@ def extract_config_schema_json(driver_dir: Path) -> str | None:
         )
         return None
     return json.dumps(schema)
+
+
+class _SchemaExtraction:
+    """One config-schema extraction on a worker thread, and who removes its directory.
+
+    load_driver awaits the extraction through ``asyncio.to_thread`` (issue #1498),
+    and a cancelled coroutine cannot stop the thread. The sandbox may still be
+    using the attempt's directory then, and with ALLOW_DRIVER_PIP_INSTALL on it
+    writes ``_deps`` into it, so removing the directory at once could leave a
+    recreated ``_deps`` tree that nothing ever removes. Exactly one side removes
+    it instead, decided under a lock from two facts: the worker's state (not
+    started, running, done) and whether the coroutine abandoned the extraction.
+
+    - ``abandon`` (the coroutine, on any exception out of the await) removes the
+      directory unless the worker is running; a running worker removes it when it
+      finishes.
+    - ``run`` (the worker) skips the extraction when it starts after an abandon
+      (a queued job whose cancellation did not reach the executor), and removes
+      the directory when it finishes after one.
+
+    Each side reads the other's fact and records its own under the one lock, so
+    the two decisions exclude each other and exactly one side removes the
+    directory. A completed, unabandoned extraction removes nothing: the directory
+    then belongs to load_driver.
+    """
+
+    _NOT_STARTED = "not_started"
+    _RUNNING = "running"
+    _DONE = "done"
+
+    def __init__(self, driver_dir: Path) -> None:
+        self._dir = driver_dir
+        self._lock = threading.Lock()
+        self._state = self._NOT_STARTED
+        self._abandoned = False
+
+    def run(self) -> str | None:
+        with self._lock:
+            if self._abandoned:
+                return None
+            self._state = self._RUNNING
+        try:
+            return extract_config_schema_json(self._dir)
+        finally:
+            with self._lock:
+                self._state = self._DONE
+                remove = self._abandoned
+            if remove:
+                shutil.rmtree(self._dir, ignore_errors=True)
+
+    def abandon(self) -> None:
+        with self._lock:
+            self._abandoned = True
+            remove = self._state != self._RUNNING
+        if remove:
+            shutil.rmtree(self._dir, ignore_errors=True)
+
+    async def result(self) -> str | None:
+        """Run the extraction on a worker thread and return its result.
+
+        Any exception out of the await (a cancellation, an exception the
+        extraction raised, an executor that refused the job) abandons the
+        extraction, so the directory is removed by whichever side is last to
+        touch it, and is re-raised unchanged.
+        """
+        try:
+            return await asyncio.to_thread(self.run)
+        except BaseException:
+            self.abandon()
+            raise
 
 
 async def get_driver_config_schema(db: AsyncSession, driver_id: uuid.UUID) -> dict | None:
@@ -366,9 +468,12 @@ async def load_driver(
     """Load a driver package: check cache, download if needed, extract, validate, cache.
 
     Returns the local path to the extracted driver directory.
-    Raises RuntimeError on a download failure (transient: inventory unreachable),
+    Raises RuntimeError on a download failure (transient: inventory unreachable, or
+    the download still incomplete at DRIVER_DOWNLOAD_DEADLINE_SECONDS),
     DriverPackageError on a structurally invalid archive or a validation failure
-    (permanent: the package can never load as-is).
+    (permanent: the package can never load as-is). An exception out of the
+    config-schema extraction, a cancellation included, reaches the caller
+    unchanged once _SchemaExtraction has settled who removes the directory.
     """
     # Check cache first
     cached_path = await get_cached_driver(db, driver_id, driver_sha256)
@@ -422,14 +527,18 @@ async def load_driver(
         # if missing so the cache always reflects "we looked and this is what we saw".
         metadata = read_driver_metadata(dest_dir)
         metadata_json = json.dumps(metadata)
-
-        # Capture the driver-published config schema (issue #23). Fail-open: a
-        # driver that omits config_schema(), ships a broken one, or times out
-        # yields None and we degrade to the registry at validation time.
-        config_schema_json = extract_config_schema_json(dest_dir)
     except BaseException:
         shutil.rmtree(dest_dir, ignore_errors=True)
         raise
+
+    # Capture the driver-published config schema (issue #23). Fail-open: a driver
+    # that omits config_schema(), ships a broken one, or times out yields None and
+    # we degrade to the registry at validation time. The extraction waits on a
+    # sandbox subprocess, so it runs on a worker thread (issue #1498); on any
+    # exception, a cancellation included, _SchemaExtraction removes the directory
+    # once the worker is done with it, and the exception reaches the caller
+    # unchanged.
+    config_schema_json = await _SchemaExtraction(dest_dir).result()
 
     # Record the cache row (issue #1097): a real insert-or-nothing on the unique
     # driver_id, then a re-read, so a concurrent first load of the same driver
