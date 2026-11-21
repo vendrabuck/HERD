@@ -71,6 +71,46 @@ def settled_row(wiring_status, row_id: str, outcome: str) -> dict | None:
     return None
 
 
+async def retire_failed_rows_from_the_tick(
+    client,
+    reservation_id: str,
+    *,
+    cap: int = 10,
+    settle: float = 3.0,
+    timeout: float = 45.0,
+    interval: float = 0.5,
+):
+    """Push every FAILED row of a reservation past the tick's attempts cap; return them.
+
+    For a test that ends a reservation while builds are FAILED (issue #1501): the
+    terminal teardown leaves a row alone while a retry pass holds its live claim, and
+    the background tick (every `WIRING_RETRY_INTERVAL_SECONDS`) drives FAILED builds
+    of an ACTIVE reservation, so a cancel that lands inside a tick's drive would see
+    the held-row outcome instead of the parked one. Each manual retry adds its driver
+    attempts to every row it drives, and the tick never selects a row whose attempts
+    reached `WIRING_RETRY_MAX_ATTEMPTS` (`cap`, 10 by default, the stack default). So
+    this POSTs wiring/retry, with the failure knobs still armed, until every row it
+    names reads `still_failed` with attempts at or over `cap` (an `in_progress` row is
+    another pass's drive: ask again), then waits `settle` seconds, so a tick that
+    selected a row before the last retry has finished its drive. Returns the last
+    result rows, or None on timeout.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        resp = await client.post(f"/reservations/{reservation_id}/wiring/retry")
+        if resp.status_code == 200:
+            rows = resp.json().get("results", [])
+            if rows and all(
+                row.get("outcome") == "still_failed" and int(row.get("attempts", 0)) >= cap
+                for row in rows
+            ):
+                await asyncio.sleep(settle)
+                return rows
+        await asyncio.sleep(interval)
+    return None
+
+
 async def poll_wiring_retry(
     client,
     reservation_id: str,

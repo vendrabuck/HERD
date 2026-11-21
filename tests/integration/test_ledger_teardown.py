@@ -35,7 +35,7 @@ import pytest
 from ._device_teardown import delete_device_checked, delete_devices_checked
 from ._nats_helpers import probe_nats
 from ._topology_teardown import delete_topology_checked
-from ._wiring_retry import poll_wiring_retry
+from ._wiring_retry import poll_wiring_retry, retire_failed_rows_from_the_tick
 
 pytestmark = pytest.mark.asyncio
 
@@ -369,6 +369,7 @@ async def test_cancel_releases_all_three_ledgers(
         await delete_devices_checked(admin_client, [sw["id"] for sw in switches])
 
 
+@pytest.mark.timeout(150)
 async def test_cancel_while_every_build_is_failed_releases_every_row(
     base_url, admin_token, admin_client, fresh_devices, teardown_drivers
 ):
@@ -446,6 +447,13 @@ async def test_cancel_while_every_build_is_failed_releases_every_row(
         assert _failed_builds(status), f"every build must land FAILED first: {status}"
         assert await _count_runs(admin_client, rid, "connect_ports") == 0
         assert await _count_runs(admin_client, rid, "add_to_vlan") == 0
+
+        # The teardown leaves a row alone while a retry pass holds a live claim on it,
+        # so push every FAILED row past the background tick's attempts cap first: a
+        # cancel inside a tick's drive would otherwise see that documented outcome.
+        retired = await retire_failed_rows_from_the_tick(admin_client, rid)
+        assert retired is not None, "the FAILED builds never passed the tick's attempts cap"
+        assert {r["layer"] for r in retired} == {"l1", "l2", "l3"}
 
         cancelled = await admin_client.delete(f"/reservations/{rid}")
         assert cancelled.status_code == 204, cancelled.text
