@@ -44,7 +44,8 @@ Shape, and why it is this shape:
   - A retry pass's failure write by row id on a row it does NOT hold (the failures
     recorded before any per-row claim: the switch read, the template read, the driver
     load, and the login on L1 and L2, L2's create_vlan pre-pass and re-allocation, and
-    the switch read, template read, driver load, and drive-gate refusal on L3) takes
+    the switch read, template read, driver load, drive-gate refusal, and route-limit
+    refusal on L3) takes
     the same `direction_admits` compare in its own UPDATE, because the row it planned
     may have been parked since: an admitted write lands as before; a refused one is
     rolled back, which is what leaves every value as it was, and joins
@@ -225,11 +226,20 @@ def l3_pin_claim_budget(route_operations: int) -> timedelta:
     No cap, deliberately: a cap below the worst-case drive would let a second pass
     claim the pin while this one is still inside the driver, which is the double
     drive the claim exists to prevent. So a claim lasts at most one minute more than
-    N actions' worst case plus N seconds, or the one-row budget if that is longer,
-    and nothing in execution bounds a pin's route count, so nothing bounds the longest
-    claim either (a pin of 50,000 routes: 76,337 minutes, about 53 days, at the
-    defaults). A holder that dies mid-drive leaves the pin unclaimable for at most that
-    long.
+    N actions' worst case plus N seconds, or the one-row budget if that is longer.
+    What bounds `route_operations` is the per-switch route limit (issue #1493,
+    `herd_common.l3_route_limit.MAX_ROUTES_PER_SWITCH`, 1,000): a drive configures at
+    most that many routes, so at the defaults a drive with no removals is held at most
+    1,530 minutes (about 25.5 hours), and a delta removing a full pin and adding a
+    disjoint full set at most 3,057 minutes (about 51 hours). Removals are not limited,
+    since refusing one would leave routes installed, so a drive that removes more than
+    a full pin is bounded only by what it removes. That happens in two ways: a pin
+    stored before the limit existed (removed by a delta or a deprovision), and a
+    FAILED pin's recorded routes (removed first as a provision's residue, or whole by a
+    deprovision), which can grow past the limit, since each failed provision records
+    its own set plus the removals that did not confirm. At 50,000 route operations the
+    budget is 76,337 minutes, about 53 days. A holder that dies mid-drive leaves the pin
+    unclaimable for at most its budget.
     """
     driver_actions = route_operations + 2
     sized = _next_whole_minute_after(

@@ -677,6 +677,59 @@ async def test_route_on_an_unwired_interface_is_refused_at_save(
             await admin_client.delete(f"/cabling/connections/{connection['id']}")
 
 
+async def test_a_fork_save_over_the_route_limit_is_refused_through_the_gateway(
+    admin_client, l3_switch, fresh_device
+):
+    """Issue #1493: a fork save giving one switch 1,001 distinct routes is refused by
+    cabling through reservations and the gateway with the 422 that names the switch and
+    the limit, and changes nothing: the fork keeps the route it activated with."""
+    nats_err = await probe_nats()
+    if nats_err:
+        pytest.skip(nats_err)
+    connection = None
+    topology_id = None
+    reservation_id = None
+    try:
+        connection = await _create_connection(
+            admin_client, fresh_device["id"], l3_switch["id"], "ge-0/0/1"
+        )
+        topology_id = await _create_topology(
+            admin_client, _canvas_with_l3(fresh_device["id"], l3_switch["id"], [ROUTE_A])
+        )
+        reservation = await _reserve(
+            admin_client, [fresh_device["id"], l3_switch["id"]], topology_id
+        )
+        reservation_id = reservation["id"]
+        assert await _poll_active(admin_client, reservation_id), "reservation never activated"
+
+        over_limit = [
+            {"destination": f"10.{100 + i // 256}.{i % 256}.0/24", "interface": "eth0"}
+            for i in range(1001)
+        ]
+        saved = await _save_fork(
+            admin_client,
+            reservation_id,
+            _canvas_with_l3(fresh_device["id"], l3_switch["id"], over_limit),
+        )
+        assert saved.status_code == 422, saved.text
+        assert saved.json()["detail"] == {
+            "error": "l3_intent_malformed",
+            "node_id": "nSwitch",
+            "message": (
+                f"switch {l3_switch['id']} has 1001 distinct routes; a switch carries at most 1000"
+            ),
+        }
+        fork = await _get_fork(admin_client, reservation_id)
+        assert {r["destination"] for r in fork["l3_routes"]} == {ROUTE_A["destination"]}
+    finally:
+        if reservation_id:
+            await admin_client.delete(f"/reservations/{reservation_id}")
+        if topology_id:
+            await delete_topology_checked(admin_client, topology_id)
+        if connection:
+            await admin_client.delete(f"/cabling/connections/{connection['id']}")
+
+
 async def test_reservation_create_is_refused_for_an_unwired_interface(
     admin_client, l3_switch, fresh_device
 ):

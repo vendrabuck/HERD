@@ -550,8 +550,8 @@ async def _record_route_failed_for_row(
     row still intends the direction this failure records, or the failure is a release
     and the reservation is frozen. Such a write runs before any per-row claim (a
     switch read, template read, driver load, or login failure, an L2 create_vlan or
-    re-allocation failure, or an L3 drive-gate refusal), so the row may have been
-    parked since the pass planned it. The value CASE (`direction_guarded_values`) and
+    re-allocation failure, or an L3 drive-gate or route-limit refusal), so the row may
+    have been parked since the pass planned it. The value CASE (`direction_guarded_values`) and
     `RETURNING intended` tell an admitted write from a refused one; a refused write is
     rolled back, which is what leaves every value as it was, returns None, and adds the
     row to `claims.wrong_direction`. A row this pass holds takes no compare: its claim
@@ -891,10 +891,11 @@ async def get_effective_pinned_routes(
 
     Also None when the row records no routes (issue #1004). A provision never pins an
     empty set (a switch whose route source yields nothing is not provisioned), so an
-    empty `routes` list is only ever a drive-gate refusal recorded before anything was
-    applied: it records that nothing is installed, not an applied empty set, and the
-    caller falls back to the configured routes exactly as for a fresh provision (ADR
-    0014 Decision 2). Addendum X4's "keeps its applied set" needs an applied set.
+    empty `routes` list is only ever a drive-gate or route-limit refusal (issue #1493)
+    recorded before anything was applied: it records that nothing is installed, not an
+    applied empty set, and the caller falls back to the configured routes exactly as
+    for a fresh provision (ADR 0014 Decision 2). Addendum X4's "keeps its applied set"
+    needs an applied set.
     """
     res_uuid = _as_uuid(reservation_id)
     dev_uuid = _as_uuid(device_id)

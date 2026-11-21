@@ -327,7 +327,11 @@ ALLOWANCE_MS = 1000
         # would be reclaimable at that instant, so the budget is the minute after.
         (148, 30, 230),
         (200, 30, 309),  # 18,503.2s
-        (50_000, 30, 76_337),  # 4,580,183.2s, about 53 days: nothing caps a route count
+        (1_000, 30, 1_530),  # the per-switch route limit (#1493): about 25.5 hours
+        (2_000, 30, 3_057),  # a delta replacing a full pin with a disjoint full set
+        # 4,580,183.2s, about 53 days: the arithmetic only; since #1493 only an
+        # unlimited removal (a pin's residue) can reach a count like this.
+        (50_000, 30, 76_337),
         # The same arithmetic at a raised timeout: (R + 2) x 361.6s.
         (0, 120, 19),
         (2, 120, 25),  # 1446.4s
@@ -359,6 +363,19 @@ def test_l3_pin_claim_budget_outlives_every_drive_and_by_at_most_a_minute(timeou
             assert budget > drive, route_operations
             assert budget >= one_row, route_operations
             assert budget <= max(drive, 3 * per_action) + 60_000, route_operations
+
+
+def test_the_route_limit_puts_a_number_on_the_longest_claim_at_the_defaults():
+    """Issue #1493: a drive configures at most MAX_ROUTES_PER_SWITCH routes, so a drive
+    with no removals holds its claim at most 1,530 minutes at the default timeout, and
+    a delta that removes a full pin and adds a disjoint full one at most 3,057 minutes
+    (WIRE-CLAIM-3). Tied to the shared constant, so a new limit fails here until the
+    stated numbers move with it."""
+    from herd_common.l3_route_limit import MAX_ROUTES_PER_SWITCH
+
+    with patch.object(settings, "execution_timeout_seconds", 30):
+        assert l3_pin_claim_budget(MAX_ROUTES_PER_SWITCH) == timedelta(minutes=1_530)
+        assert l3_pin_claim_budget(2 * MAX_ROUTES_PER_SWITCH) == timedelta(minutes=3_057)
 
 
 def test_the_smallest_l3_slack_at_the_default_timeout_is_four_tenths_of_a_second():

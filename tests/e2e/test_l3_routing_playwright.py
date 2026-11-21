@@ -403,3 +403,62 @@ def test_add_route_saves_then_edit_to_bad_destination_shows_red_badge_and_toast(
         assert "border-red-400" not in iface_class, iface_class
     finally:
         pw_api(page, "DELETE", f"/cabling/topologies/{topology['id']}", allow_errors=True)
+
+
+def test_a_switch_over_the_route_limit_shows_the_refusal_after_save(pw_page, l3_switch_setup):
+    """Issue #1493: a switch carrying 1,001 distinct routes is refused by validation
+    as l3_malformed, and the editor shows it: the save's routing toast names the
+    reason, and the Routing panel shows the message naming the switch and the limit.
+    The routes are written through the API (entering 1,001 through the form is not
+    the point); Save and the panel are exercised through the UI."""
+    page = pw_page
+    setup = l3_switch_setup
+    switch_id = setup["switch"]["id"]
+    switch_name = setup["switch"]["name"]
+
+    canvas = _canvas_with_switch_and_dut(setup["dut"]["id"], switch_id)
+    routes = [
+        {
+            "destination": f"10.{100 + i // 256}.{i % 256}.0/24",
+            "next_hop": None,
+            "interface": "eth0",
+            "virtual_router": None,
+        }
+        for i in range(1001)
+    ]
+    for node in canvas["nodes"]:
+        if node["id"] == "n-switch":
+            node["data"]["l3"] = {"routes": routes}
+
+    topology = pw_api(
+        page,
+        "POST",
+        "/cabling/topologies",
+        json={"name": f"e2e-l3-route-limit-{uuid.uuid4().hex[:8]}"},
+    ).json()
+    try:
+        put_resp = pw_api(
+            page, "PUT", f"/cabling/topologies/{topology['id']}", json={"canvas_data": canvas}
+        )
+        assert put_resp.status_code == 200, put_resp.text
+
+        page.goto(f"{HOST_BASE_URL}/topology/{topology['id']}")
+        expect(page.locator(".react-flow")).to_be_visible(timeout=15_000)
+        switch_node = page.locator(".react-flow__node").filter(has_text=switch_name)
+        expect(switch_node).to_be_visible(timeout=15_000)
+
+        _click_save(page)
+        expect(page.get_by_text("Routing intent has 1 problem", exact=False)).to_be_visible(
+            timeout=15_000
+        )
+
+        switch_node.click()
+        expect(
+            page.get_by_text(
+                f"l3_malformed: switch {switch_id} has 1001 distinct routes; "
+                "a switch carries at most 1000",
+                exact=True,
+            )
+        ).to_be_visible(timeout=15_000)
+    finally:
+        pw_api(page, "DELETE", f"/cabling/topologies/{topology['id']}", allow_errors=True)

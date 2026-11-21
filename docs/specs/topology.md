@@ -868,6 +868,18 @@ editor's Routing panel (section 8.16).
   12 s deadline fails the whole pass closed with 503 `{"error": "l3_config_unavailable"}`. \
   Enforced in: `services/cabling/app/services/l3_validation.py` (`validate_canvas_l3`, `L3ConfigUnavailable`) \
   Pinned by: `services/cabling/tests/test_l3_validation.py` (`test_503_on_device_batch_transport_error`, `test_503_on_device_batch_5xx`, `test_503_on_config_fetch_5xx`, `test_503_on_missing_internal_token_short_circuits_to_l3_config_unavailable`, `test_l3_pass_deadline_trips_into_503`)
+- **TOPO-L3-12.** A switch carries at most 1,000 distinct routes (#1493), counted over
+  every node naming it, merged and deduplicated by the TOPO-L3-3 identity as TOPO-L3-5
+  stores them, so a duplicate counts once and two nodes cannot each stay under the
+  limit while their switch goes over it. Every node of a switch over the limit is
+  malformed with the message `switch <device id> has <count> distinct routes; a switch
+  carries at most 1000`, in canvas node order with the shape refusals, so TOPO-L3-6
+  applies to it: save answers 422 (TOPO-FORK-14), validation reports `l3_malformed`
+  with no inventory call, and fork create drops the switch's intent. The limit is one
+  constant shared with execution's drive-time check (WIRE-L3-20), compared through one
+  function, so this check is exactly as strict as execution's. \
+  Enforced in: `services/cabling/app/services/l3_intent.py` (`walk_l3_nodes`, `_refuse_switches_over_the_route_limit`, `route_limit_message`); `services/common/herd_common/l3_route_limit.py` (`MAX_ROUTES_PER_SWITCH`, `route_limit_exceeded`) \
+  Pinned by: `services/cabling/tests/test_l3_intent.py` (`test_a_switch_at_the_route_limit_parses`, `test_a_switch_one_route_over_the_limit_is_malformed_with_the_exact_message`, `test_duplicates_do_not_count_against_the_route_limit`, `test_the_route_limit_counts_a_switch_merged_across_its_nodes`, `test_routes_two_nodes_of_one_switch_share_count_once_toward_the_limit`, `test_a_shape_malformed_node_after_an_over_limit_switch_keeps_canvas_order`, `test_the_tolerant_parser_drops_an_over_limit_switch_and_keeps_the_others`); `services/cabling/tests/test_l3_validation.py` (`test_a_switch_over_the_route_limit_reports_l3_malformed_naming_it`); `services/cabling/tests/test_fork_l3_routes.py` (`test_save_route_422_when_a_switch_is_over_the_route_limit`, `test_save_route_stores_a_switch_at_the_route_limit`)
 
 **Out of scope.** Driving routes onto switches and drive-time re-validation are
 execution's (`provisioning-and-wiring.md`). Switch configuration versions are
@@ -955,7 +967,7 @@ RES-FORK-17). Fork status, versions, and the restore marker are section 4.
 - **TOPO-FORK-14.** Save refuses malformed routing intent with 422
   `{"error": "l3_intent_malformed", "node_id", "message"}` before any inventory call. \
   Enforced in: `services/cabling/app/routes/forks.py` (`save_fork_internal`) \
-  Pinned by: `services/cabling/tests/test_fork_l3_routes.py` (`test_save_route_422_on_malformed_intent`)
+  Pinned by: `services/cabling/tests/test_fork_l3_routes.py` (`test_save_route_422_on_malformed_intent`, `test_save_route_422_when_a_switch_is_over_the_route_limit`)
 - **TOPO-FORK-15.** The resolver turns each committed edge between two device nodes into
   the first shortest path and records each cable on it as one hop with its backing
   connection id and the canvas edge id; a hop two edges share is recorded once, under the
