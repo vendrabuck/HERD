@@ -250,7 +250,8 @@ compare-and-swap too, so of two passes releasing one allocation exactly one driv
   key is never rewritten (WIRE-LEDGER-10): a late build failure for that key inserts a
   new pending-release row. A row released between that read and the `UPDATE` (which
   matches the row id only, as before #1501) keeps status `RELEASED` and intended
-  `RELEASED` but takes the write's `last_error` and attempts 0. An ACTIVE row is still
+  `RELEASED` but takes the write's `last_error` and attempts 0; on L3 it also takes
+  the write's routes when the write passes any, and its claim stamp is cleared. An ACTIVE row is still
   immutable to a build failure (WIRE-LEDGER-7). The other
   writes are unchanged: a release failure, every write on a reservation that is not
   frozen, a pinned-reason or nil-allocation L1 or L2 failure, and every failure write
@@ -358,8 +359,10 @@ compare-and-swap too, so of two passes releasing one allocation exactly one driv
   FAILED intended ACTIVE after that read, and then nothing drives it. The teardown's
   exceptions, each left FAILED intended ACTIVE: an L1 or L2 row with a pinned reason,
   an L1 or L2 row under another retry pass's live claim (a failed holder leaves it so),
-  and an L3 pin the teardown parked over which a retry holder's partial-failure write
-  then lands (section 13). A key-based build
+  an L1 or L2 row whose key (and, on L2, allocation) also has an ACTIVE row, an L2 row
+  with a nil or dangling allocation on a port that has an ACTIVE row, and an L3 pin the
+  teardown parked over which a retry holder's partial-failure write then lands
+  (section 13). A key-based build
   failure written after the freeze no longer makes that flip (WIRE-LEDGER-17), so what
   remains is a key-based failure write whose own statement read the reservation as not
   frozen and that commits after the teardown's read (section 13); a release claim
@@ -1247,9 +1250,11 @@ WIRE-FREEZE-1.
   stores no routes. On L1 and L2 it leaves three kinds of row as they are. (a) A
   pinned-reason row (WIRE-STALE-1): an unresolvable hop keyed on raw hop endpoints, or
   a switch whose driver package cannot load (#1199); neither can be driven. (b) A row
-  whose key also has an ACTIVE row of the reservation (L1: switch and pair, whose
-  second row would make `release_l1_connection` raise; L2: switch, port, and
-  allocation, whose ACTIVE row's removal drives the same VLAN). An L2 row on another
+  whose key also has an ACTIVE row of the reservation (L1: switch and pair, where the
+  skip only stops the FAILED twin from being parked, and such a twin, which only a
+  concurrent-insert race creates, makes the ACTIVE row's own `release_l1_connection`
+  raise `MultipleResultsFound`, aborting the teardown before L2 and L3, as before #1501;
+  L2: switch, port, and allocation, whose ACTIVE row's removal drives the same VLAN). An L2 row on another
   allocation of an ACTIVE port is parked and removed, and the direct release of a nil
   or dangling one is not made where any ACTIVE row holds the port. (c) A row another
   retry pass holds a live claim on (`claimed_until` in the future): the park and the
@@ -1258,9 +1263,9 @@ WIRE-FREEZE-1.
   respected too. Such a row is left as before #1501: the holder's success is parked
   by the record-time freeze check (WIRE-LEDGER-4), its failure records FAILED intended
   `ACTIVE`, and a holder that dies leaves FAILED intended `ACTIVE`, which no pass drives
-  (section 13). The row does not bring its allocation into the emptied-allocation
-  check, so its VLAN is not deleted under a join that may still land (an ACTIVE row of
-  the reservation on the same allocation still brings it in, as before #1501). An
+  (section 13). The row does not itself bring its allocation into the emptied-allocation
+  check (an ACTIVE row, or a parked FAILED row, of the reservation on the same
+  allocation still does, and the VLAN is then deleted as before #1501). An
   expired claim is no claim. On L3
   the teardown parks every FAILED intended-`ACTIVE` pin, held or not, as before #1501
   (section 13). A failed removal stays
@@ -1747,6 +1752,15 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
     join that timed out may have landed under it. Keeping the claim through a park and
     recording a frozen build failure by row id as a pending release would settle it;
     not done here.
+  - An L1 pair with two non-RELEASED rows of one reservation (a FAILED intended-`ACTIVE`
+    twin of an ACTIVE row, which only a concurrent-insert race creates) is not parked by
+    the teardown, but the ACTIVE row's own `release_l1_connection` then raises
+    `MultipleResultsFound`, which aborts the teardown before L2 and L3 and leaves the
+    message to be redelivered, as before #1501.
+  - Two defensive guards in the teardown are not pinned by a test: the claim guard around
+    the direct release of a nil or dangling L2 row, and the skip of a nil or dangling row
+    on a port with an ACTIVE row. A held nil row is not reachable through the retry tick,
+    which never claims a pinned-reason row.
   - The teardown claims nothing on L3 (issue #1481), as before #1501: it parks and
     removes a pin a retry pass holds. The holder's success is re-recorded as a pending
     release (WIRE-LEDGER-4), and its partial-failure write still lands over the parked

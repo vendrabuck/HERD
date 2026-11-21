@@ -5178,8 +5178,10 @@ async def _teardown_from_ledgers(
     # reconcile's stale settlement (WIRE-STALE-1): an unresolvable hop keyed on raw hop
     # endpoints, or a switch whose driver package cannot load (#1199); neither can be
     # driven. FAILED intended-RELEASED rows are already release-direction work. A pair
-    # that also has an ACTIVE row is left to that row's release (a second row for the
-    # pair would make release_l1_connection raise). A row a retry pass holds a live
+    # that also has an ACTIVE row is not parked: the skip only stops the FAILED twin
+    # from being parked. Such a twin (only a concurrent-insert race creates one) makes
+    # the ACTIVE row's own release_l1_connection raise MultipleResultsFound, which
+    # aborts the teardown before L2 and L3, as before #1501. A row a retry pass holds a live
     # claim on is left as it is (the holder's own record settles it, as before #1501):
     # the park runs only inside write_guard with an empty claim ledger, which locks the
     # row only while it is unclaimed, so a claim taken after the read is respected too.
@@ -5250,8 +5252,10 @@ async def _teardown_from_ledgers(
         # also has an ACTIVE row (that row's removal drives the same VLAN). The direct
         # release matches by (switch, port) only, so it is not made where any ACTIVE row
         # holds the port. A row a retry pass holds a live claim on is left as it is, as
-        # on L1 (write_guard with an empty claim ledger), and its allocation does not
-        # join the emptied-allocation check, so its VLAN is not deleted under the join.
+        # on L1 (write_guard with an empty claim ledger), and it does not itself bring
+        # its allocation into the emptied-allocation check (an ACTIVE row, or a parked
+        # FAILED row, of the reservation on the same allocation still does, and the VLAN
+        # is then deleted as before #1501).
         active_l2_ports = {(str(row.switch_device_id), row.port) for row in l2_rows}
         active_l2_keys = {
             (str(row.switch_device_id), row.port, row.vlan_assignment_id) for row in l2_rows

@@ -281,7 +281,9 @@ def direction_admits(model, intended: str):
     retry drives. The terminal teardown's read of FAILED rows parks and removes it on
     every layer (L3 since issue #1001, L1 and L2 since issue #1501), unless the flip
     to intended ACTIVE landed after that read, and except an L1 or L2 row with a
-    pinned reason or under another pass's live claim; and an L3 holder's
+    pinned reason or under another pass's live claim, an L1 or L2 row whose key (and,
+    on L2, allocation) also has an ACTIVE row, and an L2 row with a nil or dangling
+    allocation on a port that has an ACTIVE row; and an L3 holder's
     partial-failure write can land over a pin the teardown parked (WIRE-TEARDOWN-6).
     A key-based build failure written after the freeze no longer makes that flip
     (issue #1501: it records intended RELEASED on a frozen reservation), so what
