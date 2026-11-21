@@ -3,7 +3,7 @@ import { render, screen, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Node } from "@xyflow/react";
+import { EdgeChangeset, NodeChangeset, type Node } from "@xyflow/react";
 
 const { toastError, toastSuccess, toastCustom, toastDismiss } = vi.hoisted(() => ({
   toastError: vi.fn(),
@@ -204,22 +204,24 @@ describe("TopologyEditorPage with a device-less node (issue #989)", () => {
 
   it("selecting, moving, and deleting the node and its edges does not throw", async () => {
     await openHalfWiredChain();
-    const onNodesChange = rfProps.current?.onNodesChange as (c: unknown[]) => void;
-    const onEdgesChange = rfProps.current?.onEdgesChange as (c: unknown[]) => void;
+    const onNodesChange = rfProps.current?.onNodesChange as (c: NodeChangeset) => void;
+    const onEdgesChange = rfProps.current?.onEdgesChange as (c: EdgeChangeset) => void;
     act(() => {
-      onNodesChange([{ type: "select", id: "n1", selected: true }]);
+      onNodesChange(new NodeChangeset([{ type: "select", id: "n1", selected: true }]));
     });
     act(() => {
-      onNodesChange([{ type: "position", id: "n1", position: { x: 300, y: 50 } }]);
+      onNodesChange(new NodeChangeset([{ type: "position", id: "n1", position: { x: 300, y: 50 } }]));
     });
     act(() => {
-      onEdgesChange([
-        { type: "remove", id: "e0" },
-        { type: "remove", id: "e1" },
-      ]);
+      onEdgesChange(
+        new EdgeChangeset([
+          { type: "remove", id: "e0" },
+          { type: "remove", id: "e1" },
+        ]),
+      );
     });
     act(() => {
-      onNodesChange([{ type: "remove", id: "n1" }]);
+      onNodesChange(new NodeChangeset([{ type: "remove", id: "n1" }]));
     });
     await waitFor(() => expect(useTopologyStore.getState().nodes).toHaveLength(2));
     expect(useTopologyStore.getState().edges).toHaveLength(0);
