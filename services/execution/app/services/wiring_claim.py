@@ -21,11 +21,29 @@ Shape, and why it is this shape:
     of a batch can reach its driver call minutes after the batch was selected; one
     stamp taken at selection time would have expired by then, which is exactly the
     window the claim exists to close.
-  - `claim_row` is a compare-and-swap: `UPDATE ... WHERE id AND status = 'FAILED'
-    AND (claimed_until IS NULL OR claimed_until <= now)`. A rowcount of zero means
-    another channel holds the row (or a concurrent writer already moved it out of
-    FAILED), so the caller drives nothing for it. The manual channel reports such a
+  - `WiringRowClaims.claim` is a compare-and-swap: `UPDATE ... WHERE id AND status =
+    'FAILED' AND (claimed_until IS NULL OR claimed_until <= now)`. No matching row
+    means another channel holds the row (or a concurrent writer already moved it out
+    of FAILED), so the caller drives nothing for it. The manual channel reports such a
     row as `in_progress`, the seventh retry outcome; the tick logs and skips it.
+  - The same UPDATE also compares the direction (issue #1496). Each call site passes
+    the direction it is about to drive (`intended`: ACTIVE for a connect, an add, or a
+    provision; RELEASED for a disconnect, a remove, or a deprovision), and the stamp is
+    written only where the row's `intended` equals it: `SET claimed_until = CASE WHEN
+    intended = :direction THEN :stamp ELSE claimed_until END ... RETURNING intended`.
+    A matching row whose intent is the other direction is therefore left with every
+    value as it was, and the returned `intended` tells the two refusals apart from the
+    same statement, with no second read: no row returned is "lost" (another holder, or
+    no longer FAILED, read back `in_progress` when still FAILED), a row returned with
+    the other direction is "wrong direction" (read back by its status, `still_failed`
+    while FAILED). This closes the issue #1496 reproduction: a pass that planned a
+    build from an older read can no longer claim and connect, add, or provision a row
+    another pass parked (intended RELEASED) in between, and a pass that planned a
+    release can no longer claim a row whose intent has since become ACTIVE. It does
+    not close the two windows issue #1481 tracks, because in both the row's direction
+    still matches: a retry pass that validated intent before a save and connects after
+    the carried-delta apply passed over the row without parking it, and a retry
+    planned from older content that drives it over a newer failed attempt.
 
 Who may use these readers, and who may not. `claimable_row_ids` and `unclaimed`
 are for the RETRY CHANNELS ONLY. The wiring_changed reconcile in `nats_consumer`
@@ -50,7 +68,7 @@ from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import case, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -246,6 +264,12 @@ class WiringRowClaims:
     is lost and when a write this pass attempted on it is refused by
     `claim_write_clauses` (directly, or through `write_guard`).
 
+    `wrong_direction` (issue #1496) holds the rows whose claim was refused because the
+    row now intends the other direction than the call site was about to drive. Such a
+    row is not another pass's work in flight, so it is kept out of `lost` and the pass
+    reads it back by its status: `still_failed` while it is FAILED, and the next pass
+    retries it in the direction it now intends.
+
     The ordinary consumer path never constructs one of these and never claims or
     checks a claim, so a reconcile can still write a row a retry pass holds (its
     key-based failure write and its stale park clear `claimed_until`); see
@@ -255,34 +279,73 @@ class WiringRowClaims:
     def __init__(self, budget: timedelta | None = None) -> None:
         self.budget = budget if budget is not None else claim_budget()
         self.held: dict[uuid.UUID, datetime] = {}
+        # The direction each held row was claimed for (issue #1496).
+        self.held_direction: dict[uuid.UUID, str] = {}
         self.lost: set[uuid.UUID] = set()
+        self.wrong_direction: set[uuid.UUID] = set()
 
     async def claim(
         self,
         db: AsyncSession,
         model,
         row_id: uuid.UUID | None,
+        *,
+        intended: str,
         budget: timedelta | None = None,
     ) -> bool:
         """Claim one row for this pass's driver call. True iff we may drive it.
 
+        `intended` is the direction the call site is about to drive: "ACTIVE" for
+        connect_ports, add_to_vlan, or an L3 provision; "RELEASED" for
+        disconnect_ports, remove_from_vlan, or an L3 deprovision. The claim is one
+        UPDATE matching the row id, status FAILED, and an unclaimed stamp, which
+        writes the stamp only when the row's `intended` equals this direction and
+        returns the row's `intended` (issue #1496). So:
+
+          - no row returned: the claim is lost (another pass holds the row, or it is
+            no longer FAILED, or it is gone); the row joins `lost`;
+          - a row returned whose `intended` is the other direction: nothing on the row
+            changes (the stamp is written back as it was), no driver call follows,
+            and the row joins `wrong_direction`, not `lost`;
+          - a row returned in this direction: the stamp is written; the row joins
+            `held`.
+
+        The direction compare and the stamp are one statement, so no writer can
+        change `intended` between them, and the classification comes from the same
+        statement: there is no window in which the two refusals can be told apart
+        wrongly.
+
         `row_id` None means the caller is not a retry channel (no row identity to
         claim), which is always drivable: the reconcile path. A row already claimed
-        by THIS pass is drivable without a second UPDATE, so a row driven twice
-        inside one apply (it cannot happen today, but nothing enforces that) never
-        loses its own claim.
+        by THIS pass is answered without a second UPDATE, from the direction it was
+        claimed for: the same direction is drivable, so a row driven twice inside one
+        apply (it cannot happen today, but nothing enforces that) never loses its own
+        claim; the other direction is refused into `wrong_direction` with no write.
+        A pass reaches a held row in the other direction only when it loaded two FAILED
+        rows of one reservation with the same key, one per direction: the retry maps
+        the key to one row id, and the release-before-build apply reaches that id in
+        both directions. The ledger's keyed writers update an existing non-RELEASED
+        row for a key rather than insert a second, so that is not expected. The row's
+        current `intended` is not re-read for a held row: the claim compared it
+        atomically, and while this pass holds the row only a writer that never claims
+        (the reconcile, issue #1481) can change it.
 
         `budget`, when given, replaces this pass's `self.budget` for this one claim:
         the stamp written is now plus `budget`. Only the L3 apply passes it, sized
         by `l3_pin_claim_budget` from the pin's drive sequence (issue #1482); the L1
         and L2 applies claim with `self.budget`. A row this pass already holds is
-        answered True without a write, so a later, larger `budget` for it is not
+        answered without a write, so a later, larger `budget` for it is not
         applied: its stamp stays the one the first claim wrote.
         """
+        if intended not in ("ACTIVE", "RELEASED"):
+            raise ValueError(f"claim direction must be ACTIVE or RELEASED, got {intended!r}")
         if row_id is None:
             return True
         if row_id in self.held:
-            return True
+            if self.held_direction.get(row_id) == intended:
+                return True
+            self._refuse_wrong_direction(model, row_id, intended)
+            return False
         now = datetime.now(timezone.utc)
         stamp = now + (budget if budget is not None else self.budget)
         result = await db.execute(
@@ -292,11 +355,21 @@ class WiringRowClaims:
                 model.status == "FAILED",
                 unclaimed(model, now),
             )
-            .values(claimed_until=stamp)
+            .values(
+                claimed_until=case(
+                    (
+                        model.intended == intended,
+                        literal(stamp, type_=model.claimed_until.type),
+                    ),
+                    else_=model.claimed_until,
+                )
+            )
+            .returning(model.intended)
             .execution_options(synchronize_session=False)
         )
+        found = result.first()
         await db.commit()
-        if (result.rowcount or 0) == 0:
+        if found is None:
             self.lost.add(row_id)
             logger.info(
                 "wiring retry: row %s of %s is claimed by another channel (or no longer "
@@ -305,8 +378,22 @@ class WiringRowClaims:
                 model.__tablename__,
             )
             return False
+        if found[0] != intended:
+            self._refuse_wrong_direction(model, row_id, intended)
+            return False
         self.held[row_id] = stamp
+        self.held_direction[row_id] = intended
         return True
+
+    def _refuse_wrong_direction(self, model, row_id: uuid.UUID, intended: str) -> None:
+        self.wrong_direction.add(row_id)
+        logger.info(
+            "wiring retry: row %s of %s no longer intends %s; not driving it in that "
+            "direction this pass (issue #1496)",
+            row_id,
+            model.__tablename__,
+            intended,
+        )
 
 
 def claim_write_clauses(
