@@ -1065,18 +1065,18 @@ async def test_a_build_over_a_released_row_is_refused_on_a_frozen_reservation(la
 
 
 async def test_a_frozen_release_refused_by_a_flip_to_active_no_longer_strands_the_pin():
-    """The review's reproduction. A frozen reservation's FAILED intended-RELEASED pin (a
-    teardown removal that failed). The tick selects it and plans the deprovision. Inside
-    the tick's driver load a writer that does not compare direction records a build
-    failure for the pin by key (a reconcile provision that passed its frozen check
-    before the freeze): FAILED intended ACTIVE. The tick's release claim is admitted on
-    the frozen reservation, the routes are removed, and the pin is RELEASED. Refused,
-    the pin would stay FAILED intended ACTIVE, which no later tick selects."""
+    """The review's reproduction. A FAILED intended-RELEASED pin. The tick selects it and
+    plans the deprovision. Inside the tick's driver load a writer that does not compare
+    direction records a build failure for the pin by key (a reconcile provision) while
+    the reservation is not frozen yet: FAILED intended ACTIVE. Then the reservation
+    freezes. The tick's release claim is admitted on the frozen reservation, the routes
+    are removed, and the pin is RELEASED. Refused, the pin would stay FAILED intended
+    ACTIVE, which no later tick selects. (Since #1501 a key-based build failure written
+    after the freeze records intended RELEASED, so the flip must come before it.)"""
     from app.services.route_service import record_route_failed
     from app.services.wiring_retry_service import run_wiring_retry_tick
 
     row_id = await _seed("l3", "RELEASED", attempts=1)
-    await _freeze()
     flipped: dict = {}
 
     async def _load(*args, **kwargs):
@@ -1086,6 +1086,8 @@ async def test_a_frozen_release_refused_by_a_flip_to_active_no_longer_strands_th
                 await record_route_failed(
                     s, RES_ID, str(SWITCH_ID), [ROUTE], 1, "driver timeout", intended="ACTIVE"
                 )
+            assert (await _state("l3", row_id))[1] == "ACTIVE"
+            await _freeze()
         return "/tmp/d"
 
     execute_fn, calls = _recorder()

@@ -5113,6 +5113,13 @@ async def _teardown_from_ledgers(
     on a gated driver success), so reading the ACTIVE set gives the issue #244
     applied-state-only guarantee directly.
 
+    A FAILED intended-ACTIVE row on any layer is a build that did not confirm, which may
+    still have landed (a timed-out driver call), so it is parked intended RELEASED and
+    removed with the ACTIVE rows (L3 since issue #1001, L1 and L2 since issue #1501);
+    rows with a pinned reason are left as they are on L1 and L2, and an L2 row with a
+    nil or dangling allocation, or an L3 pin with no routes, is released with no driver
+    call.
+
     Ordering mirrors ADR 0009 Decision 4 in release form: L1 disconnects, then L2
     membership removes plus allocation frees, then L3 pin removals. Empty ledgers no-op
     with no driver call. The wiring freeze is deliberately NOT consulted here: the freeze
@@ -5123,8 +5130,20 @@ async def _teardown_from_ledgers(
     its direction-scoped build skip cover the whole teardown window. Because this pass
     ignores frozen, the reorder does not change what it releases.
     """
-    from app.services.l1_assignment_service import active_assignments_for_reservation
-    from app.services.l2_membership_service import active_memberships_for_reservation
+    from app.services.l1_assignment_service import (
+        TEARDOWN_PENDING_DISCONNECT,
+        active_assignments_for_reservation,
+        canonical_port_pair,
+        failed_assignments_for_reservation,
+        park_stale_l1_build,
+    )
+    from app.services.l2_membership_service import (
+        TEARDOWN_PENDING_VLAN_REMOVAL,
+        active_memberships_for_reservation,
+        failed_memberships_for_reservation,
+        park_stale_l2_build,
+        release_l2_membership,
+    )
     from app.services.route_service import (
         TEARDOWN_PENDING_REMOVAL,
         failed_route_assignments_for_reservation,
@@ -5141,11 +5160,40 @@ async def _teardown_from_ledgers(
     # a moved-then-stranded pair is idempotently skipped by the pair_needs_release gate.
     async with get_db_session() as db:
         l1_rows = await active_assignments_for_reservation(db, res_str)
+        l1_failed = await failed_assignments_for_reservation(db, res_str)
     release_by_switch: dict[str, list[tuple[str, str, str | None]]] = {}
     for row in l1_rows:
         phys = str(row.physical_connection_id) if row.physical_connection_id else None
         release_by_switch.setdefault(str(row.switch_device_id), []).append(
             (row.port_a, row.port_b, phys)
+        )
+    # Issue #1501, the L3 park below for L1: a FAILED intended-ACTIVE row is a connect
+    # that did not confirm, and a driver call that timed out may still have landed. It
+    # is parked intended RELEASED first, so pair_needs_release admits it and, should
+    # the disconnect fail or this pass die, the release-direction retry channels finish
+    # it; a disconnect of a pair that never connected is the idempotent no-op the #491
+    # stale settlement relies on. Pinned-reason rows are left as they are, as in the
+    # reconcile's stale settlement (WIRE-STALE-1): keyed on raw hop endpoints, never
+    # driven. FAILED intended-RELEASED rows are already release-direction work. A pair
+    # that also has an ACTIVE row is released through that row, as in the reconcile.
+    active_l1_keys = {
+        (str(row.switch_device_id), *canonical_port_pair(row.port_a, row.port_b)) for row in l1_rows
+    }
+    for row in l1_failed:
+        if row.intended != "ACTIVE":
+            continue
+        if (row.last_error or "").startswith(NON_RETRYABLE_REASON_PREFIXES):
+            continue
+        key = (str(row.switch_device_id), *canonical_port_pair(row.port_a, row.port_b))
+        if key in active_l1_keys:
+            continue
+        async with get_db_session() as db:
+            parked = await park_stale_l1_build(db, row.id, TEARDOWN_PENDING_DISCONNECT)
+        if parked is None or parked.status != "FAILED":
+            continue
+        phys = str(parked.physical_connection_id) if parked.physical_connection_id else None
+        release_by_switch.setdefault(str(parked.switch_device_id), []).append(
+            (parked.port_a, parked.port_b, phys)
         )
     if release_by_switch:
         await _apply_wiring_pairs(res_str, release_by_switch, {}, [], ctx, get_db_session)
@@ -5157,8 +5205,19 @@ async def _teardown_from_ledgers(
     # delete-failure is log-and-continue with accepted bounded lingering).
     async with get_db_session() as db:
         l2_rows = await active_memberships_for_reservation(db, res_str)
-    if l2_rows:
+        l2_failed = [
+            row
+            for row in await failed_memberships_for_reservation(db, res_str)
+            if row.intended == "ACTIVE"
+        ]
+    if l2_rows or l2_failed:
+        _nil = uuid.UUID(int=0)
         remove_alloc_ids = {row.vlan_assignment_id for row in l2_rows}
+        remove_alloc_ids.update(
+            row.vlan_assignment_id
+            for row in l2_failed
+            if row.vlan_assignment_id is not None and row.vlan_assignment_id != _nil
+        )
         vlan_by_alloc = await _vlan_ids_for(remove_alloc_ids, get_db_session)
         removes = [
             {
@@ -5169,7 +5228,39 @@ async def _teardown_from_ledgers(
             }
             for row in l2_rows
         ]
-        await _apply_l2_memberships(res_str, removes, [], ctx, get_db_session)
+        # Issue #1501, the L1 park above for L2, in the reconcile's stale-settlement
+        # form (WIRE-STALE-2): a FAILED intended-ACTIVE membership with a resolvable
+        # allocation is parked intended RELEASED and removed with the ACTIVE ones (its
+        # allocation is then checked for release with theirs); a nil or dangling
+        # allocation has no VLAN number to remove and never reached add_to_vlan, so the
+        # row is released with no driver call, whatever its reason. Other pinned-reason
+        # rows are left as they are, and a (switch, port) that also has an ACTIVE row
+        # is removed through that row, as in the reconcile.
+        active_l2_keys = {(str(row.switch_device_id), row.port) for row in l2_rows}
+        for row in l2_failed:
+            if (str(row.switch_device_id), row.port) in active_l2_keys:
+                continue
+            va_id = row.vlan_assignment_id
+            if va_id is None or va_id == _nil or va_id not in vlan_by_alloc:
+                async with get_db_session() as db:
+                    await release_l2_membership(db, res_str, row.switch_device_id, row.port)
+                continue
+            if (row.last_error or "").startswith(NON_RETRYABLE_REASON_PREFIXES):
+                continue
+            async with get_db_session() as db:
+                parked = await park_stale_l2_build(db, row.id, TEARDOWN_PENDING_VLAN_REMOVAL)
+            if parked is None or parked.status != "FAILED":
+                continue
+            removes.append(
+                {
+                    "switch_device_id": str(row.switch_device_id),
+                    "port": row.port,
+                    "vlan_assignment_id": va_id,
+                    "vlan_id": vlan_by_alloc[va_id],
+                }
+            )
+        if removes:
+            await _apply_l2_memberships(res_str, removes, [], ctx, get_db_session)
 
     # L3: remove every ACTIVE pin using the PINNED route set verbatim (issue #20:
     # get_effective_pinned_routes, never a re-derived config). The adjacency-aware nuance
