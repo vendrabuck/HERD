@@ -232,15 +232,31 @@ class PermanentEventError(RuntimeError):
     """
 
 
+# The total time one _get_internal read may take, connect to last byte (issue #1498).
+# Its callers pass httpx's per-phase timeout (10 seconds for each of connect, each
+# read, write, and pool), which a response that drips a byte at least every 10 seconds
+# never trips. A constant by decision, beside the per-phase literals it bounds, not a
+# setting.
+INTERNAL_READ_DEADLINE_SECONDS = 20.0
+
+
 async def _get_internal(client, url, *, what, **kwargs):
     """GET an internal service URL, raising TransientUpstreamError on a failure
     that retry might fix (5xx or transport error). Returns the httpx.Response
     so the caller can handle 404 / other non-200 statuses itself.
+
+    The read runs under INTERNAL_READ_DEADLINE_SECONDS in total; past it the
+    request is cancelled and this raises the transport-error form,
+    "<what>: transport error: TimeoutError", so every caller takes the path it
+    already takes for a transport error (issue #1498).
     """
     try:
-        resp = await client.get(url, **kwargs)
+        async with asyncio.timeout(INTERNAL_READ_DEADLINE_SECONDS):
+            resp = await client.get(url, **kwargs)
     except httpx.HTTPError as exc:
         raise TransientUpstreamError(f"{what}: transport error: {exc}") from exc
+    except TimeoutError as exc:
+        raise TransientUpstreamError(f"{what}: transport error: {type(exc).__name__}") from exc
     if resp.status_code >= 500:
         raise TransientUpstreamError(f"{what}: upstream {resp.status_code}")
     return resp
