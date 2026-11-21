@@ -922,6 +922,40 @@ async def test_each_discovery_failure_is_unavailable_and_not_cached(name, idp, c
     assert idp.counts["discovery"] == 2
 
 
+async def test_a_discovery_outage_is_one_request_for_every_queued_sign_in(idp, caplog, monkeypatch):
+    """Issue #1397: the failed discovery fetch is shared with the callers already
+    queued, so an outage costs one upstream attempt rather than one per waiter.
+
+    Before, each waiter acquired the lock in turn, found nothing stored, and ran
+    its own fetch: ten users pressing "Sign in with SSO" at once meant ten
+    sequential attempts at a provider that was already down, and the last one
+    waited for ten timeouts."""
+    attempts = {"discovery": 0}
+
+    async def slow_outage(request: httpx.Request) -> httpx.Response:
+        # Suspend first: a handler that raises synchronously lets the first
+        # caller finish before the next one is ever scheduled, so nothing queues
+        # behind it and the count would be 8 either way.
+        attempts["discovery"] += 1
+        await asyncio.sleep(0.05)
+        raise httpx.ConnectError(IDP_BODY_TEXT, request=request)
+
+    monkeypatch.setattr(oidc_service, "transport", httpx.MockTransport(slow_outage))
+
+    results = await asyncio.gather(
+        *(oidc_service.build_authorization_request() for _ in range(8)),
+        return_exceptions=True,
+    )
+
+    assert all(isinstance(result, OidcUnavailableError) for result in results)
+    assert attempts["discovery"] == 1
+
+    # Nothing was stored, so a later sign-in asks the provider again.
+    monkeypatch.setattr(oidc_service, "transport", httpx.MockTransport(idp.handler))
+    await oidc_service.build_authorization_request()
+    assert idp.counts["discovery"] == 1
+
+
 async def test_a_discovery_document_naming_no_pkce_methods_is_accepted(idp):
     idp.discovery.pop("code_challenge_methods_supported")
     request = await oidc_service.build_authorization_request()

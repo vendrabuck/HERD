@@ -361,10 +361,14 @@ async def test_uncached_falsy_answer_is_still_cached_when_not_wrapped():
 
 
 @pytest.mark.asyncio
-async def test_concurrent_callers_during_a_failure_each_ask_again():
-    """With nothing stored, a waiter that gets the lock after a failed fetch
-    finds no entry and fetches itself: failures are not shared. Pinned so a
-    later change to that tradeoff is deliberate."""
+async def test_a_failed_fetch_is_shared_with_the_callers_queued_behind_it():
+    """A failure is an answer for the callers already waiting on it.
+
+    The lock used to hand the failed fetch back to the caller that made it only,
+    so each waiter then ran its own fetch: during an outage N callers made N
+    sequential upstream attempts and the k-th waited for k timeouts. The
+    in-flight fetch is now shared, `Uncached` included, while nothing is stored
+    for later callers."""
     started = asyncio.Event()
     release = asyncio.Event()
     calls = {"n": 0}
@@ -378,9 +382,85 @@ async def test_concurrent_callers_during_a_failure_each_ask_again():
     cache: TTLCache[str, str] = TTLCache(fetch=fetch, ttl_seconds=60)
     first = asyncio.create_task(cache.get("k"))
     await started.wait()
-    second = asyncio.create_task(cache.get("k"))
+    queued = [asyncio.create_task(cache.get("k")) for _ in range(4)]
     await asyncio.sleep(0)
     release.set()
 
+    assert await asyncio.gather(first, *queued) == ["fallback"] * 5
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_call_arriving_after_a_shared_failure_fetches_again():
+    """Sharing the failure does not cache it: ADR 0016 D8 and issue #1075 hold."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def fetch(key: str):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            started.set()
+            await release.wait()
+            return Uncached("fallback")
+        return "answer"
+
+    cache: TTLCache[str, str] = TTLCache(fetch=fetch, ttl_seconds=60)
+    first = asyncio.create_task(cache.get("k"))
+    await started.wait()
+    second = asyncio.create_task(cache.get("k"))
+    await asyncio.sleep(0)
+    release.set()
     assert await asyncio.gather(first, second) == ["fallback", "fallback"]
+
+    assert await cache.get("k") == "answer"
     assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_singleton_a_failed_fetch_is_shared_with_waiters():
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def fetch():
+        calls["n"] += 1
+        started.set()
+        await release.wait()
+        return Uncached([])
+
+    cache: SingletonTTLCache[list[str]] = SingletonTTLCache(fetch=fetch, ttl_seconds=60)
+    first = asyncio.create_task(cache.get())
+    await started.wait()
+    queued = [asyncio.create_task(cache.get()) for _ in range(3)]
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await asyncio.gather(first, *queued) == [[], [], [], []]
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failure_on_one_key_does_not_charge_another_key():
+    """Per-key futures: one key's outage is not another key's fetch."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def fetch(key: str):
+        calls.append(key)
+        if key == "down":
+            started.set()
+            await release.wait()
+            return Uncached(None)
+        return f"answer-{key}"
+
+    cache: TTLCache[str, str | None] = TTLCache(fetch=fetch, ttl_seconds=60)
+    down = asyncio.create_task(cache.get("down"))
+    await started.wait()
+    up = asyncio.create_task(cache.get("up"))
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await asyncio.gather(down, up) == [None, "answer-up"]
+    assert calls == ["down", "up"]
