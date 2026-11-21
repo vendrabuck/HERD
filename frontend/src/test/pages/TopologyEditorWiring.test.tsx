@@ -667,10 +667,56 @@ describe("TopologyEditorPage bundle-safe edge changes (review item 3)", () => {
     const nodes = useTopologyStore.getState().nodes;
     expect(nodes.map((n) => [n.id, n.selected, n.position])).toEqual([["n-src", true, { x: 120, y: 40 }]]);
   });
+
+  // A changeset keeps the changes of one id in the order they were added, and
+  // applying it runs them in that order, so the last select on an id wins.
+  // React Flow does not put two changes for one edge into a single batch on
+  // this canvas (it emits one select or one remove per edge per gesture), so
+  // this order cannot arise from the editor today; the test pins that
+  // handleEdgesChange preserves the per-id order as the library defines it,
+  // for a bundle (whose members inherit the bundle's order) and a lone edge.
+  it("keeps the order of several changes on one id, for a bundle and for a lone edge", async () => {
+    server.use(...baseHandlers());
+    await renderPageWithCanvas([
+      deviceNode("n-src", SOURCE_DEVICE, "switch-a"),
+      deviceNode("n-tgt", TARGET_DEVICE, "switch-b"),
+      deviceNode("n-c", "dev-c", "switch-c"),
+    ]);
+    act(() => {
+      useTopologyStore.setState({
+        edges: [
+          { id: "e1", source: "n-src", target: "n-tgt", type: "layerEdge", data: { layer: "L1" } },
+          { id: "e2", source: "n-src", target: "n-tgt", type: "layerEdge", data: { layer: "L2" } },
+          { id: "e3", source: "n-tgt", target: "n-c", type: "layerEdge", data: { layer: "L3" } },
+        ],
+      });
+    });
+    const bundleId = "bundle-n-src::n-tgt";
+    expect((rfProps.current?.edges as Array<{ id: string }>).map((e) => e.id)).toEqual([bundleId, "e3"]);
+
+    const onEdgesChange = rfProps.current?.onEdgesChange as (changes: EdgeChangeset) => void;
+    act(() =>
+      onEdgesChange(
+        new EdgeChangeset([
+          { id: bundleId, type: "select", selected: true },
+          { id: "e3", type: "select", selected: false },
+          { id: bundleId, type: "select", selected: false },
+          { id: "e3", type: "select", selected: true },
+        ]),
+      ),
+    );
+
+    expect(useTopologyStore.getState().edges.map((e) => [e.id, e.selected])).toEqual([
+      ["e1", false],
+      ["e2", false],
+      ["e3", true],
+    ]);
+  });
 });
 
-// Owner decision for the @xyflow/react 12 to 13 migration: every default v13
-// changed is pinned back to its v12 value on the canvas (lib/reactFlowDefaults.ts).
+// Owner decision for the @xyflow/react 12 to 13 migration: every changed
+// default v13 still exposes as a prop is pinned back to its v12 value on the
+// canvas (lib/reactFlowDefaults.ts).
 describe("TopologyEditorPage pins the v12 React Flow defaults", () => {
   it("passes forceColorMode light, elevateEdgesOnSelect false, and the v12 fit-view padding to the canvas and its Controls", async () => {
     server.use(...baseHandlers());
