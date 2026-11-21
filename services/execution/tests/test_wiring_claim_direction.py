@@ -5,27 +5,43 @@ the row immediately before that row's own driver call, which can be minutes late
 another pass parks the row in between (intended RELEASED, the stale-build settlement
 of #491), the claim used to match anyway (id, FAILED, unclaimed) and the planning pass
 connected, added, or provisioned a row whose intent was gone. The claim now also
-requires the row's `intended` to equal the direction its call site drives, in the same
-UPDATE: ACTIVE for connect_ports, add_to_vlan, and an L3 provision; RELEASED for
-disconnect_ports, remove_from_vlan, and an L3 deprovision.
+requires the direction its call site drives to be admitted, in the same UPDATE
+(`direction_admits`): the row's `intended` equals it (ACTIVE for connect_ports,
+add_to_vlan, and an L3 provision; RELEASED for disconnect_ports, remove_from_vlan, and
+an L3 deprovision), or the direction is RELEASED and the reservation is frozen. A
+retry pass's failure write by row id on a row it does not hold, which runs before any
+per-row claim, takes the same compare.
 
 The space is 3 layers times 2 directions times the row's 2 intended values. Covered
 here against in-memory SQLite:
 
   - the claim itself, every cell: a matching direction stamps and holds the row; a
-    mismatched one changes nothing on the row (status, intended, attempts, last_error,
-    claimed_until), joins `wrong_direction` and not `lost`, and leaves the row
-    claimable by another pass in its true direction (conservation);
+    mismatched one changes no value on the row (status, intended, attempts,
+    last_error, and an expired claimed_until it was seeded with), joins
+    `wrong_direction` and not `lost`, and leaves the row claimable by another pass in
+    its true direction (conservation);
   - the two refusals told apart: a row another pass holds, or one no longer FAILED, is
     `lost` whatever its direction; a held row reached again in the other direction;
   - every cell through the real per-row applies (`_apply_one_port_action`,
     `_apply_one_vlan_action`) and the L3 per-switch apply (`_apply_l3_adjacency`),
     with a stub driver: a mismatch makes no driver call, no execution run, and no
-    ledger write, and the same apply then drives the row in its true direction;
+    value change, and the same apply then drives the row in its true direction. The L1
+    and L2 cells pre-arrange the row's direction and call the per-row apply directly:
+    they test the predicate, not a reachable interleaving (in the retry pass the
+    release gate reads the row right before the claim, with only database time
+    between). The L3 cells move `intended` inside the driver load, a real point in the
+    window between the deprovision gate and the claim;
   - the issue's reproduction through the retry service at all three layers: a pass
     revalidates a build, a second real retry pass parks the row (intent gone) between
     that revalidation and the first pass's claim, and the first pass makes no build
     call and reads the row back `still_failed`; the next pass releases it;
+  - every failure write a pass makes before its claim (the switch or template read,
+    the driver load, the login, L2's create_vlan and re-allocation, L3's drive gate),
+    with the row parked in between: the park survives each one, and an unparked row
+    still gets that failure recorded;
+  - a frozen reservation: a release is admitted over a row that intends ACTIVE (at the
+    claim and at the failure write, every layer), a build is not, and an unfrozen
+    reservation still refuses that release;
   - what the manual endpoint and the tick report for such a row: `still_failed`, not
     `in_progress`.
 
@@ -36,6 +52,8 @@ tests/test_wiring_retry_claim_race_live_pg.py.
 
 import uuid
 from contextlib import ExitStack
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -44,9 +62,10 @@ from app.database import Base
 from app.models.execution_run import ExecutionRun
 from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.l2_port_assignment import L2PortAssignment
+from app.models.reservation_wiring_state import ReservationWiringState
 from app.models.route_assignment import RouteAssignment
 from app.models.vlan_assignment import VlanAssignment
-from app.services.nats_consumer import WIRING_STALE_BUILD_REASON
+from app.services.nats_consumer import WIRING_STALE_BUILD_REASON, WIRING_UNRESOLVABLE_REASON
 from app.services.wiring_claim import WiringRowClaims
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -121,8 +140,11 @@ def _switch(layer: str) -> dict:
     }
 
 
-async def _seed(layer: str, intended: str, *, attempts=2, last_error="driver timeout"):
-    """One FAILED unclaimed row of `layer` intending `intended`; returns its id."""
+async def _seed(
+    layer: str, intended: str, *, attempts=2, last_error="driver timeout", claimed_until=None
+):
+    """One FAILED row of `layer` intending `intended`, unclaimed (`claimed_until` None
+    or a past stamp); returns its id."""
     async with TestSessionLocal() as s:
         if layer == "l1":
             row = L1ConnectionAssignment(
@@ -134,6 +156,7 @@ async def _seed(layer: str, intended: str, *, attempts=2, last_error="driver tim
                 intended=intended,
                 attempts=attempts,
                 last_error=last_error,
+                claimed_until=claimed_until,
             )
         elif layer == "l2":
             va = VlanAssignment(
@@ -155,6 +178,7 @@ async def _seed(layer: str, intended: str, *, attempts=2, last_error="driver tim
                 intended=intended,
                 attempts=attempts,
                 last_error=last_error,
+                claimed_until=claimed_until,
             )
         else:
             row = RouteAssignment(
@@ -165,6 +189,7 @@ async def _seed(layer: str, intended: str, *, attempts=2, last_error="driver tim
                 intended=intended,
                 attempts=attempts,
                 last_error=last_error,
+                claimed_until=claimed_until,
             )
         s.add(row)
         await s.commit()
@@ -176,6 +201,18 @@ async def _state(layer: str, row_id):
     async with TestSessionLocal() as s:
         row = (await s.execute(select(model).where(model.id == row_id))).scalar_one()
         return (row.status, row.intended, row.attempts, row.last_error, row.claimed_until)
+
+
+def _expired():
+    """A claim stamp in the past: unclaimed, but not null, so a refusal that wrote the
+    stamp (to null or to anything) is visible."""
+    return datetime.now(timezone.utc) - timedelta(minutes=10)
+
+
+async def _freeze() -> None:
+    async with TestSessionLocal() as s:
+        s.add(ReservationWiringState(reservation_id=RES_ID, frozen=True))
+        await s.commit()
 
 
 def _naive(stamp):
@@ -208,7 +245,7 @@ async def test_the_claim_holds_a_row_only_in_the_direction_it_intends(
     """The claim's predicate, cell by cell: `direction` is what the call site would
     drive, `row_intended` what the row intends when the claim runs."""
     model = MODEL[layer]
-    row_id = await _seed(layer, row_intended)
+    row_id = await _seed(layer, row_intended, claimed_until=_expired())
     before = await _state(layer, row_id)
     claims = WiringRowClaims()
 
@@ -228,7 +265,9 @@ async def test_the_claim_holds_a_row_only_in_the_direction_it_intends(
     assert claims.held == {}
     assert claims.wrong_direction == {row_id}
     assert claims.lost == set(), "a direction refusal is not another holder's work"
-    assert await _state(layer, row_id) == before, "a refused claim writes nothing"
+    assert await _state(layer, row_id) == before, (
+        "a refused claim changes no value, the expired stamp included"
+    )
 
     # Conservation: the refusal neither stamps nor strands the row; a pass driving it
     # in its true direction claims it at once.
@@ -430,11 +469,12 @@ async def test_an_apply_drives_a_row_only_in_the_direction_it_intends(
     gate) and moved to `row_intended` inside the driver load, before the claim."""
     action = ROW_ACTION[(layer, direction)]
     if layer == "l3":
-        row_id = await _seed(layer, direction)
+        row_id = await _seed(layer, direction, claimed_until=_expired())
         flip_to = row_intended
     else:
-        row_id = await _seed(layer, row_intended)
+        row_id = await _seed(layer, row_intended, claimed_until=_expired())
         flip_to = None
+    _status, _intended, attempts, last_error, stamp = await _state(layer, row_id)
     claims = WiringRowClaims()
 
     calls = await _apply_one(layer, direction, row_id, claims, flip_to=flip_to)
@@ -447,8 +487,8 @@ async def test_an_apply_drives_a_row_only_in_the_direction_it_intends(
 
     assert calls == [], f"a mismatched claim makes no driver call, got {calls}"
     assert await _execution_runs() == 0, "and writes no execution run"
-    assert await _state(layer, row_id) == ("FAILED", row_intended, 2, "driver timeout", None), (
-        "and no ledger write: status, intended, attempts, last_error, claimed_until"
+    assert await _state(layer, row_id) == ("FAILED", row_intended, attempts, last_error, stamp), (
+        "and no value change: status, intended, attempts, last_error, the expired stamp"
     )
     assert claims.wrong_direction == {row_id}
     assert claims.lost == set()
@@ -677,3 +717,442 @@ async def test_the_tick_counts_a_direction_refusal_still_failed_not_in_progress(
     assert (stats["l1_rows_retried"], stats["still_failed"], stats["in_progress"]) == (1, 1, 0)
     assert stats["reconnected"] == 0
     assert "connect_ports" not in calls
+
+
+# --- A failure recorded before the claim does not undo a park -----------------
+#
+# Every failure write a retry pass makes on a row before that row's per-row claim. The
+# planning pass P1 revalidated the build, so a park that lands after that point and
+# before the write used to be overwritten: the write set intended back to ACTIVE.
+# The sites, each the seam the park lands in here:
+#
+#   L1 `_apply_wiring_pairs`: the template read, the driver load, the login.
+#   L2 `_apply_l2_memberships`: the template read, the driver load, the login, and the
+#      create_vlan definition pre-pass; `_reattempt_l2_rows`: the re-allocation of a
+#      row whose allocation is the nil placeholder.
+#   L3 `_apply_l3_adjacency`: the switch read, the template read, the driver load (an
+#      L3 login failure comes after the pin's claim); `_reattempt_l3_rows`: the drive
+#      gate's refusal.
+#
+# The L1 and L2 switch reads are not seams here: the pass's fetch context memoizes the
+# switch from the revalidation that admitted the build, so the apply reads the same
+# answer. Their failure writes are guarded the same way.
+
+PRE_CLAIM_SITES = (
+    ("l1", "template_missing"),
+    ("l1", "load_failure"),
+    ("l1", "login_failure"),
+    ("l2", "template_missing"),
+    ("l2", "load_failure"),
+    ("l2", "login_failure"),
+    ("l2", "create_vlan_failure"),
+    ("l2", "reallocation_failure"),
+    ("l3", "switch_missing"),
+    ("l3", "template_missing"),
+    ("l3", "load_failure"),
+    ("l3", "gate_refusal"),
+)
+# The reason each site records on a row nobody parked (a prefix).
+SITE_REASON = {
+    "switch_missing": WIRING_UNRESOLVABLE_REASON,
+    "template_missing": WIRING_UNRESOLVABLE_REASON,
+    "load_failure": "driver load failed: RuntimeError",
+    "login_failure": "driver login failed: auth refused",
+    "create_vlan_failure": "create_vlan failed: boom",
+    "reallocation_failure": f"{WIRING_UNRESOLVABLE_REASON}: no VLAN allocation",
+    "gate_refusal": "gate refused",
+}
+
+
+async def _park(layer: str, row_id) -> None:
+    """The stale-build park another retry pass makes through its write guard."""
+    from app.services.l1_assignment_service import park_stale_l1_build
+    from app.services.l2_membership_service import park_stale_l2_build
+    from app.services.route_service import park_stale_route_build
+
+    park = {"l1": park_stale_l1_build, "l2": park_stale_l2_build, "l3": park_stale_route_build}
+    async with TestSessionLocal() as s:
+        await park[layer](s, row_id, WIRING_STALE_BUILD_REASON)
+
+
+async def _seed_for_site(layer: str, site: str):
+    row_id = await _seed(layer, "ACTIVE", attempts=3)
+    if site in ("create_vlan_failure", "reallocation_failure"):
+        async with TestSessionLocal() as s:
+            row = await s.get(L2PortAssignment, row_id)
+            if site == "create_vlan_failure":
+                va = await s.get(VlanAssignment, row.vlan_assignment_id)
+                va.defined_switch_ids = []
+            else:
+                row.vlan_assignment_id = uuid.UUID(int=0)
+            await s.commit()
+    return row_id
+
+
+def _stage_pre_claim_failure(layer: str, site: str, before_write, stack: ExitStack):
+    """Patch a retry pass's reads so `site` fails, after awaiting `before_write()` at
+    the seam (once): after the revalidation, before the failure write."""
+    seen: dict = {}
+    calls: list[str] = []
+
+    async def _seam():
+        if "done" not in seen:
+            seen["done"] = True
+            await before_write()
+
+    async def _intent(reservation, client=None):
+        if layer == "l1":
+            return _l1_wires()
+        if layer == "l2":
+            return _l2_wires()
+        gated = site == "gate_refusal"
+        return SimpleNamespace(l3_routes={str(SWITCH_ID): [ROUTE]} if gated else {})
+
+    async def _device(device_id, client=None):
+        if str(device_id) == str(SWITCH_ID):
+            if site == "switch_missing":
+                await _seam()
+                return None
+            return _switch(layer)
+        return {"id": str(device_id), "name": "dut", "connection_type": "Server", "field_data": {}}
+
+    async def _template(*args, **kwargs):
+        if site == "template_missing":
+            await _seam()
+            return None
+        return TEMPLATE
+
+    async def _load(*args, **kwargs):
+        if site in ("load_failure", "login_failure"):
+            await _seam()
+        if site == "load_failure":
+            raise RuntimeError("package store unreachable")
+        return "/tmp/d"
+
+    async def _define(*args, **kwargs):
+        await _seam()
+        return False, 1, "boom"
+
+    async def _resolve(*args, **kwargs):
+        await _seam()
+        return {}
+
+    async def _gate(*args, **kwargs):
+        await _seam()
+        return None, "gate refused: test"
+
+    def execute_fn(driver_path, action, context, **kwargs):
+        calls.append(action)
+        if action == "login" and site == "login_failure":
+            return {"success": False, "output": None, "error": "auth refused", "duration_ms": 1}
+        return SUCCESS
+
+    for target, value in (
+        ("app.services.nats_consumer._fetch_fork_intended_wires", AsyncMock(side_effect=_intent)),
+        ("app.services.nats_consumer._fetch_device", AsyncMock(side_effect=_device)),
+        ("app.services.nats_consumer._fetch_template", AsyncMock(side_effect=_template)),
+        (
+            "app.services.nats_consumer._derive_l3_adjacency",
+            AsyncMock(return_value={str(SWITCH_ID): set()}),
+        ),
+        ("app.services.nats_consumer._wired_ports_by_device", lambda wires: {}),
+        ("app.services.nats_consumer._run_vlan_definition_op", AsyncMock(side_effect=_define)),
+        ("app.services.nats_consumer._resolve_add_allocations", AsyncMock(side_effect=_resolve)),
+        ("app.services.nats_consumer._gate_l3_drive_routes", AsyncMock(side_effect=_gate)),
+        ("app.services.driver_loader.load_driver", AsyncMock(side_effect=_load)),
+        ("app.services.driver_loader.get_driver_metadata", AsyncMock(return_value={})),
+    ):
+        stack.enter_context(patch(target, value))
+    stack.enter_context(
+        patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn)
+    )
+    return seen, calls
+
+
+@pytest.mark.parametrize("variant", ["unparked", "parked", "parked_frozen"])
+@pytest.mark.parametrize(("layer", "site"), PRE_CLAIM_SITES)
+async def test_a_failure_recorded_before_the_claim_does_not_undo_a_park(layer, site, variant):
+    """P1 loads a FAILED build row and revalidates it. At the site's seam, after that
+    revalidation, another pass parks the row (intended RELEASED, attempts 0, the stale
+    reason, claim cleared; `parked_frozen` freezes the reservation first, the teardown
+    order). Then the site fails and P1 records the failure by row id, before any
+    claim. The write's direction compare refuses it: the park survives with every
+    value, P1 reads the row back `still_failed`, and the next tick releases it, on an
+    active and a frozen reservation alike. Unparked, the failure is recorded as
+    before: FAILED intended ACTIVE with the site's reason."""
+    from app.services.wiring_retry_service import run_wiring_retry_tick
+
+    row_id = await _seed_for_site(layer, site)
+    p1_rows = await _loaded(layer, row_id)
+    p1_claims = WiringRowClaims()
+
+    async def _before_write():
+        if variant == "parked_frozen":
+            await _freeze()
+        if variant != "unparked":
+            await _park(layer, row_id)
+
+    with ExitStack() as stack:
+        seen, calls = _stage_pre_claim_failure(layer, site, _before_write, stack)
+        outcomes = await _reattempt(layer)(p1_rows, _db_session_factory(), p1_claims)
+
+    assert seen.get("done"), f"the {site} seam was never reached"
+    assert ROW_ACTION[(layer, "ACTIVE")] not in calls
+    assert [o["outcome"] for o in outcomes] == ["still_failed"]
+    status, intended, attempts, last_error, stamp = await _state(layer, row_id)
+
+    if variant == "unparked":
+        assert (status, intended, stamp) == ("FAILED", "ACTIVE", None)
+        assert last_error.startswith(SITE_REASON[site]), last_error
+        assert attempts >= 3
+        assert p1_claims.wrong_direction == set()
+        return
+
+    assert (status, intended, attempts, last_error, stamp) == (
+        "FAILED",
+        "RELEASED",
+        0,
+        WIRING_STALE_BUILD_REASON,
+        None,
+    ), f"P1's {site} failure undid the park"
+    assert (p1_claims.wrong_direction, p1_claims.lost) == ({row_id}, set())
+
+    if site == "reallocation_failure":
+        # The park writers never park a nil-allocation row (it is released directly,
+        # it has no VLAN number to remove); this site only pins the write's guard.
+        return
+    # Conservation: the parked row is release work, and the next tick takes it, frozen
+    # or not (a release-direction row is never a frozen build).
+    with ExitStack() as stack:
+        _staged_park(layer, [], AsyncMock(return_value=[]), stack)
+        execute_fn, release_calls = _recorder()
+        stack.enter_context(
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn)
+        )
+        stats = await run_wiring_retry_tick(_db_session_factory())
+    assert ROW_ACTION[(layer, "RELEASED")] in release_calls
+    assert stats["released"] == 1
+    assert (await _state(layer, row_id))[0] == "RELEASED"
+
+
+async def test_a_teardown_park_survives_a_provision_load_failure_on_a_frozen_reservation():
+    """The review's frozen trace. Tick T1 plans an L3 provision before the freeze.
+    Inside T1's driver load the reservation ends: the wiring freezes and the teardown
+    parks the FAILED intended-ACTIVE pin (TEARDOWN_PENDING_REMOVAL). T1's load then
+    fails and its failure write by row id is refused for direction, so the pin stays
+    parked, and the teardown's deprovision removes its routes. Without the write's
+    direction compare, T1's write put the pin back to intended ACTIVE, the deprovision
+    found nothing to remove, and no retry ever drove it (a frozen build)."""
+    from app.services.nats_consumer import _apply_l3_adjacency, _FetchContext
+    from app.services.route_service import TEARDOWN_PENDING_REMOVAL, park_stale_route_build
+
+    row_id = await _seed("l3", "ACTIVE", attempts=1)
+    t1_rows = await _loaded("l3", row_id)
+
+    async def _teardown_park():
+        await _freeze()
+        async with TestSessionLocal() as s:
+            await park_stale_route_build(s, row_id, TEARDOWN_PENDING_REMOVAL)
+
+    t1_claims = WiringRowClaims()
+    with ExitStack() as stack:
+        seen, _calls = _stage_pre_claim_failure("l3", "load_failure", _teardown_park, stack)
+        await _reattempt("l3")(t1_rows, _db_session_factory(), t1_claims)
+    assert seen.get("done")
+    assert await _state("l3", row_id) == ("FAILED", "RELEASED", 0, TEARDOWN_PENDING_REMOVAL, None)
+    assert t1_claims.wrong_direction == {row_id}
+
+    execute_fn, calls = _recorder()
+    with ExitStack() as stack:
+        _staged_park("l3", [], AsyncMock(return_value=[]), stack)
+        stack.enter_context(
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn)
+        )
+        item = {"device_id": str(SWITCH_ID), "routes": [ROUTE]}
+        async with httpx.AsyncClient() as client:
+            await _apply_l3_adjacency(
+                str(RES_ID), [item], [], _FetchContext(client), _db_session_factory()
+            )
+    assert calls == ["login", "remove_route", "logout"]
+    assert (await _state("l3", row_id))[0] == "RELEASED"
+
+
+# --- A frozen reservation's wiring only leaves --------------------------------
+
+
+@pytest.mark.parametrize("row_intended", DIRECTIONS)
+@pytest.mark.parametrize("direction", DIRECTIONS)
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_on_a_frozen_reservation_a_release_is_claimed_whatever_the_row_intends(
+    layer, direction, row_intended
+):
+    """The 12 cells again on a frozen reservation: a release is granted over a row
+    that intends either direction; a build is granted only over a row that intends
+    ACTIVE (the record-time freeze check, WIRE-LEDGER-4, still parks what it builds)."""
+    await _freeze()
+    model = MODEL[layer]
+    row_id = await _seed(layer, row_intended, claimed_until=_expired())
+    before = await _state(layer, row_id)
+    claims = WiringRowClaims()
+    async with TestSessionLocal() as s:
+        granted = await claims.claim(s, model, row_id, intended=direction)
+
+    if direction == "RELEASED" or row_intended == "ACTIVE":
+        assert granted is True
+        assert set(claims.held) == {row_id}
+        return
+    assert granted is False, "a build never gets the frozen exception"
+    assert claims.wrong_direction == {row_id}
+    assert await _state(layer, row_id) == before
+
+
+@pytest.mark.parametrize("frozen", [True, False], ids=["frozen", "active"])
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_a_release_planned_before_a_flip_to_active_settles_only_when_frozen(layer, frozen):
+    """A release pass planned the row (it intended RELEASED); before the claim another
+    writer records a build for it (FAILED intended ACTIVE). On a frozen reservation the
+    release still claims and removes it, because no retry will build or drive that row
+    again; on an active reservation it is refused, and the build channel owns the row.
+    L1 and L2 pre-arrange the row and call the per-row apply (their window is database
+    time only); L3 flips the pin inside the driver load."""
+    if frozen:
+        await _freeze()
+    if layer == "l3":
+        row_id = await _seed(layer, "RELEASED")
+        flip_to = "ACTIVE"
+    else:
+        row_id = await _seed(layer, "ACTIVE")
+        flip_to = None
+    claims = WiringRowClaims()
+    calls = await _apply_one(layer, "RELEASED", row_id, claims, flip_to=flip_to)
+
+    if frozen:
+        assert ROW_ACTION[(layer, "RELEASED")] in calls
+        assert (await _state(layer, row_id))[0] == "RELEASED"
+        assert claims.wrong_direction == set()
+        return
+    assert calls == []
+    assert await _state(layer, row_id) == ("FAILED", "ACTIVE", 2, "driver timeout", None)
+    assert claims.wrong_direction == {row_id}
+
+
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_a_build_over_a_released_row_is_refused_on_a_frozen_reservation(layer):
+    """The exception is the release direction's only: a build planned before the row
+    was parked is refused on a frozen reservation as on an active one."""
+    await _freeze()
+    if layer == "l3":
+        row_id = await _seed(layer, "ACTIVE")
+        flip_to = "RELEASED"
+    else:
+        row_id = await _seed(layer, "RELEASED")
+        flip_to = None
+    claims = WiringRowClaims()
+    calls = await _apply_one(layer, "ACTIVE", row_id, claims, flip_to=flip_to)
+    assert calls == []
+    assert (await _state(layer, row_id))[:2] == ("FAILED", "RELEASED")
+    assert claims.wrong_direction == {row_id}
+
+
+async def test_a_frozen_release_refused_by_a_flip_to_active_no_longer_strands_the_pin():
+    """The review's reproduction. A frozen reservation's FAILED intended-RELEASED pin (a
+    teardown removal that failed). The tick selects it and plans the deprovision. Inside
+    the tick's driver load a writer that does not compare direction records a build
+    failure for the pin by key (a reconcile provision that passed its frozen check
+    before the freeze): FAILED intended ACTIVE. The tick's release claim is admitted on
+    the frozen reservation, the routes are removed, and the pin is RELEASED. Refused,
+    the pin would stay FAILED intended ACTIVE, which no later tick selects."""
+    from app.services.route_service import record_route_failed
+    from app.services.wiring_retry_service import run_wiring_retry_tick
+
+    row_id = await _seed("l3", "RELEASED", attempts=1)
+    await _freeze()
+    flipped: dict = {}
+
+    async def _load(*args, **kwargs):
+        if "done" not in flipped:
+            flipped["done"] = True
+            async with TestSessionLocal() as s:
+                await record_route_failed(
+                    s, RES_ID, str(SWITCH_ID), [ROUTE], 1, "driver timeout", intended="ACTIVE"
+                )
+        return "/tmp/d"
+
+    execute_fn, calls = _recorder()
+    with ExitStack() as stack:
+        _staged_park("l3", [], AsyncMock(return_value=[]), stack)
+        stack.enter_context(
+            patch("app.services.driver_loader.load_driver", AsyncMock(side_effect=_load))
+        )
+        stack.enter_context(
+            patch("app.services.driver_sandbox.execute_driver_method", side_effect=execute_fn)
+        )
+        stats = await run_wiring_retry_tick(_db_session_factory())
+
+    assert flipped.get("done")
+    assert calls == ["login", "remove_route", "logout"]
+    assert stats["released"] == 1
+    assert (await _state("l3", row_id))[0] == "RELEASED"
+
+
+async def _write_failure_by_row_id(layer: str, row_id, claims, intended: str):
+    from app.services.l1_assignment_service import record_l1_failed
+    from app.services.l2_membership_service import record_l2_failed
+    from app.services.route_service import record_route_failed
+
+    common = {"intended": intended, "row_id": row_id, "claims": claims}
+    async with TestSessionLocal() as s:
+        if layer == "l1":
+            return await record_l1_failed(
+                s, RES_ID, SWITCH_ID, PORT_A, PORT_B, 1, "again", **common
+            )
+        if layer == "l2":
+            return await record_l2_failed(s, RES_ID, None, SWITCH_ID, L2_PORT, 1, "again", **common)
+        return await record_route_failed(s, RES_ID, SWITCH_ID, None, 1, "again", **common)
+
+
+@pytest.mark.parametrize("frozen", [False, True], ids=["active", "frozen"])
+@pytest.mark.parametrize("row_intended", DIRECTIONS)
+@pytest.mark.parametrize("direction", DIRECTIONS)
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_a_failure_write_on_a_row_the_pass_does_not_hold_compares_the_direction(
+    layer, direction, row_intended, frozen
+):
+    """The row-id failure writer's own compare, every cell: on a row the pass does not
+    hold the write lands only where the direction is admitted (the row intends it, or
+    it is a release on a frozen reservation); a refused write changes no value (the
+    expired stamp included) and joins `wrong_direction`."""
+    if frozen:
+        await _freeze()
+    row_id = await _seed(layer, row_intended, claimed_until=_expired())
+    before = await _state(layer, row_id)
+    claims = WiringRowClaims()
+
+    written = await _write_failure_by_row_id(layer, row_id, claims, direction)
+
+    if direction == row_intended or (frozen and direction == "RELEASED"):
+        assert written is not None
+        assert await _state(layer, row_id) == ("FAILED", direction, 3, "again", None)
+        assert claims.wrong_direction == set()
+        return
+    assert written is None
+    assert await _state(layer, row_id) == before
+    assert (claims.wrong_direction, claims.lost) == ({row_id}, set())
+
+
+@pytest.mark.parametrize("layer", LAYERS)
+async def test_a_failure_write_on_a_row_the_pass_holds_takes_no_direction_compare(layer):
+    """A holder's failure write is not compared for direction: its claim compared it.
+    Here a writer that never claims (a stale park) moved the row while the holder drove
+    it and cleared the holder's stamp, so WIRE-CLAIM-8 refuses the write as `lost`,
+    never as `wrong_direction`, exactly as before #1496."""
+    model = MODEL[layer]
+    row_id = await _seed(layer, "ACTIVE")
+    holder = WiringRowClaims()
+    async with TestSessionLocal() as s:
+        assert await holder.claim(s, model, row_id, intended="ACTIVE") is True
+    await _park(layer, row_id)
+
+    assert await _write_failure_by_row_id(layer, row_id, holder, "ACTIVE") is None
+    assert (holder.lost, holder.wrong_direction) == ({row_id}, set())
+    assert (await _state(layer, row_id))[1] == "RELEASED"

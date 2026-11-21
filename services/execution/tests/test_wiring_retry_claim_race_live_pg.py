@@ -1341,6 +1341,67 @@ async def test_a_park_between_a_pass_plan_and_its_claim_refuses_the_build(sessio
     assert foreign_after == foreign_before
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layer", ["l1", "l2", "l3"])
+async def test_the_direction_compare_and_its_frozen_exception_on_postgres(session_factory, layer):
+    """Issue #1496 on real Postgres: the claim's CASE over the correlated EXISTS on
+    `reservation_wiring_state`, and the same compare in the row-id failure write.
+
+    A FAILED row that intends ACTIVE: a release claim is refused while the reservation
+    is not frozen (no value changes, the expired stamp included, and the row is in
+    `wrong_direction`), and a release failure write by row id is refused the same way;
+    once the reservation is frozen, the release claim is granted with the exact stamp
+    it wrote, and a second pass's release failure write on a fresh copy lands."""
+    from datetime import datetime, timezone
+
+    from app.services.wiring_claim import WiringRowClaims
+
+    reservation_id = uuid.uuid4()
+    model, row_id = await _seed_failed_row(session_factory, reservation_id, layer)
+    expired = datetime.now(timezone.utc) - timedelta(minutes=10)
+    try:
+        async with session_factory() as db:
+            row = await db.get(model, row_id)
+            row.intended = "ACTIVE"
+            row.claimed_until = expired
+            await db.commit()
+
+        def _state():
+            return _stored(session_factory, model, row_id)
+
+        before = await _state()
+        refused = WiringRowClaims()
+        async with session_factory() as db:
+            assert await refused.claim(db, model, row_id, intended="RELEASED") is False
+        assert (refused.wrong_direction, refused.lost) == ({row_id}, set())
+        async with session_factory() as db:
+            assert await _record_failure(layer, db, reservation_id, row_id, refused) is None
+        assert await _state() == before
+        async with session_factory() as db:
+            assert (await db.get(model, row_id)).intended == "ACTIVE"
+
+        async with session_factory() as db:
+            db.add(ReservationWiringState(reservation_id=reservation_id, frozen=True))
+            await db.commit()
+
+        writer = WiringRowClaims()
+        async with session_factory() as db:
+            assert await _record_failure(layer, db, reservation_id, row_id, writer) is not None
+        async with session_factory() as db:
+            landed = await db.get(model, row_id)
+            assert (landed.intended, landed.claimed_until) == ("RELEASED", None)
+            landed.intended = "ACTIVE"
+            await db.commit()
+
+        granted = WiringRowClaims()
+        async with session_factory() as db:
+            assert await granted.claim(db, model, row_id, intended="RELEASED") is True
+        stored, _, _ = await _state()
+        assert stored == granted.held[row_id]
+    finally:
+        await _cleanup(session_factory, reservation_id)
+
+
 # Issue #1479: a retry holder's success and release flips stay unconditional, exactly
 # as on main (any change belongs to issue #1481), so a driver action that succeeded is
 # recorded even after a writer that does not claim cleared the holder's claim. These

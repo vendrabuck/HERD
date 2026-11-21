@@ -19,7 +19,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
 from app.services._uuid_utils import as_uuid as _as_uuid
-from app.services.wiring_claim import WiringRowClaims, claim_write_clauses, unclaimed
+from app.services.wiring_claim import (
+    WiringRowClaims,
+    claim_write_clauses,
+    direction_guarded_values,
+    unclaimed,
+)
 from app.services.wiring_due import tick_would_drive
 
 logger = logging.getLogger(__name__)
@@ -683,6 +688,16 @@ async def _record_l1_failed_for_row(
     of wiring_claim.claim_write_clauses (issue #1479), no insert branch:
     rowcount zero means a concurrent writer moved the row or another pass holds its
     drive claim, so this failure is not written and the row joins `claims.lost`.
+
+    Issue #1496: on a row this pass does not hold (`claims` None, or the row not in
+    `claims.held`), every value is written only where
+    `wiring_claim.direction_admits(model, intended)` holds, in the same UPDATE: the
+    row still intends the direction this failure records, or the failure is a release
+    and the reservation is frozen. Such a write runs before any per-row claim (a load,
+    login, create_vlan, re-allocation, or L3 gate failure), so the row may have been
+    parked since the pass planned it; a refused write changes no value, returns None,
+    and adds the row to `claims.wrong_direction`. A row this pass holds takes no
+    compare: its claim compared the direction already.
     """
     values: dict = {
         "status": "FAILED",
@@ -692,6 +707,8 @@ async def _record_l1_failed_for_row(
         # The drive this failure records is over, so release the claim (issue #817).
         "claimed_until": None,
     }
+    if claims is None or row_id not in claims.held:
+        values = direction_guarded_values(L1ConnectionAssignment, values, intended)
     result = await db.execute(
         update(L1ConnectionAssignment)
         .where(
@@ -700,8 +717,17 @@ async def _record_l1_failed_for_row(
             *claim_write_clauses(L1ConnectionAssignment, row_id, claims),
         )
         .values(**values)
+        .returning(L1ConnectionAssignment.intended)
     )
-    if result.rowcount == 0:
+    found = result.first()
+    if found is not None and found[0] != intended:
+        # The direction is not admitted (issue #1496): every value was written back
+        # as it was.
+        await db.rollback()
+        if claims is not None:
+            claims.refuse_wrong_direction(L1ConnectionAssignment, row_id, intended)
+        return None
+    if found is None:
         await db.rollback()
         if claims is not None:
             claims.lost.add(row_id)
