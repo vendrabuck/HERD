@@ -12,9 +12,9 @@ may carry secrets).
 
 import uuid
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
-from herd_common.validation_errors import extends_body_limit
+from herd_common.validation_errors import body_too_large_error, extends_body_limit
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -43,6 +43,33 @@ router = APIRouter(tags=["bulk"])
 # read the whole upload with no bound of their own (issue #1417, still open), so this
 # is the only bound on the file: a body may hold it plus MAX_REQUEST_BODY_BYTES.
 IMPORT_UPLOAD_BYTES = 10 * 1024 * 1024
+
+
+async def _read_capped(file: UploadFile, limit: int) -> bytes:
+    """Read an upload in chunks, refusing anything past ``limit`` (issue #1417).
+
+    The route's ``extends_body_limit`` bound is on the request body, which is the
+    whole multipart envelope: a file may be that size plus the form overhead. This
+    is the exact per-file bound, applied to the file itself.
+
+    By the time a route calls ``file.read()`` Starlette has already received the
+    upload and spooled it to a temporary file, so this does not stop the upload
+    early. It bounds what is copied into memory, which is the part that mattered:
+    the whole file used to be held several times over (bytes, decoded string,
+    parsed objects) before being parsed on the event loop. Reading one byte past
+    the bound is what makes the check exact rather than reading in chunks.
+
+    The 413 is the one the body-limit middleware builds, so a client cannot tell
+    the two apart.
+    """
+    raw = await file.read(limit + 1)
+    if len(raw) > limit:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=[body_too_large_error(limit)],
+        )
+    return raw
+
 
 _CSV_MEDIA = "text/csv"
 _JSON_MEDIA = "application/json"
@@ -98,7 +125,7 @@ async def import_devices_endpoint(
     with a reason without aborting the batch. With dry_run=true nothing is
     written and the full create/update/skip/reject report is returned.
     """
-    raw = await file.read()
+    raw = await _read_capped(file, IMPORT_UPLOAD_BYTES)
     actor_id = uuid.UUID(payload["sub"])
     actor_name = payload.get("username", "")
     return await import_devices(db, raw, format, dry_run, actor_id, actor_name)
@@ -139,6 +166,6 @@ async def import_templates_endpoint(
     their template_name references. Per-row error handling and dry_run match the
     device import endpoint.
     """
-    raw = await file.read()
+    raw = await _read_capped(file, IMPORT_UPLOAD_BYTES)
     actor_id = uuid.UUID(payload["sub"])
     return await import_templates(db, raw, format, dry_run, actor_id)

@@ -24,9 +24,9 @@ POST /topologies/{id}/validate does.
 
 import uuid
 
-from fastapi import APIRouter, Depends, File, Header, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
-from herd_common.validation_errors import extends_body_limit
+from herd_common.validation_errors import body_too_large_error, extends_body_limit
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -48,6 +48,26 @@ router = APIRouter(prefix="/topologies", tags=["topology-bulk"])
 # so this is the only bound on the file: a body may hold it plus
 # MAX_REQUEST_BODY_BYTES.
 IMPORT_UPLOAD_BYTES = 10 * 1024 * 1024
+
+
+async def _read_capped(file: UploadFile, limit: int) -> bytes:
+    """Read an upload in chunks, refusing anything past ``limit`` (issue #1417).
+
+    The route's ``extends_body_limit`` bound is on the request body, the whole
+    multipart envelope, so this is the exact per-file bound applied while the
+    file is read. The 413 is the one the body-limit middleware builds.
+
+    Starlette has already received the upload and spooled it to a temporary file
+    by the time a route reads it, so this bounds what is copied into memory and
+    not the upload itself. Reading one byte past the bound makes the check exact.
+    """
+    raw = await file.read(limit + 1)
+    if len(raw) > limit:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=[body_too_large_error(limit)],
+        )
+    return raw
 
 
 @router.get("/export")
@@ -109,7 +129,7 @@ async def import_topologies_endpoint(
     never trigger the visibility lookup. An unanswerable visibility lookup
     fails CLOSED with a 503; nothing is written for that request.
     """
-    raw = await file.read()
+    raw = await _read_capped(file, IMPORT_UPLOAD_BYTES)
     actor_id = uuid.UUID(payload["sub"])
     actor_name = payload.get("username", "")
     actor_role = payload.get("role", "user")
