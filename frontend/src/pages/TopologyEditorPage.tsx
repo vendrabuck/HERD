@@ -7,6 +7,7 @@ import {
   Controls,
   MiniMap,
   ConnectionMode,
+  EdgeChangeset,
   useReactFlow,
   type Connection,
   type Edge,
@@ -92,7 +93,12 @@ import { DynamicPlaceholderNode } from "@/components/topology-editor/nodes/Dynam
 import { NetworkElementNode } from "@/components/topology-editor/nodes/NetworkElementNode";
 import { LayerEdge } from "@/components/topology-editor/edges/LayerEdge";
 import { BundledEdge } from "@/components/topology-editor/edges/BundledEdge";
-import { groupEdgesForRender, isAnnotationEdge } from "@/components/topology-editor/edges/groupEdgesForRender";
+import {
+  groupEdgesForRender,
+  isAnnotationEdge,
+  type RenderEdge,
+} from "@/components/topology-editor/edges/groupEdgesForRender";
+import { V12_FIT_VIEW_OPTIONS } from "@/lib/reactFlowDefaults";
 import { LAYER_OPTIONS } from "@/components/topology-editor/edges/layerStyles";
 import { resolveEdgeStroke } from "@/components/topology-editor/edges/edgeStatus";
 import { genId } from "@/lib/id";
@@ -437,26 +443,37 @@ function TopologyEditorInner() {
   // OBJECT (the `{ members: [...] }` shape from groupEdgesForRender), never
   // a real per-member edge. Expanding it would write that synthetic shape
   // into a real store edge's slot, corrupting it. Passed through untouched
-  // instead: applyEdgeChanges looks the change up by id, finds no matching
-  // store edge (bundle ids are synthetic and never appear in the store), and
-  // no-ops harmlessly.
+  // instead: applying the changeset looks the change up by id, finds no
+  // matching store edge (bundle ids are synthetic and never appear in the
+  // store), and no-ops harmlessly.
+  //
+  // @xyflow/react 13 hands this handler an EdgeChangeset, not an array. A
+  // changeset groups its changes by element id (insertion order kept within
+  // each id), and applying one walks the ELEMENTS, reading each element's own
+  // change list, so only the per-id order can affect the result. Iterating
+  // the incoming changeset and adding each change, expanded or not, to a new
+  // one keeps that per-id order, so the store gets what the v12 array gave it.
   const handleEdgesChange = useCallback(
-    (changes: EdgeChange[]) => {
-      const expanded = changes.flatMap((change): EdgeChange[] => {
-        if ("id" in change && bundleMembers.has(change.id)) {
+    (changes: EdgeChangeset<RenderEdge>) => {
+      const expanded: EdgeChange<Edge<LayerEdgeData>>[] = [];
+      for (const change of changes) {
+        if (bundleMembers.has(change.id)) {
           if (change.type === "select" || change.type === "remove") {
-            return bundleMembers.get(change.id)!.map((id) => ({ ...change, id }));
+            for (const id of bundleMembers.get(change.id)!) expanded.push({ ...change, id });
+          } else {
+            expanded.push(change as EdgeChange<Edge<LayerEdgeData>>);
           }
-          return [change];
+          continue;
         }
         // Issue #1066: a replace carries a render copy, which may hold the
         // render-only server reason; it must not reach the store.
         if (change.type === "replace") {
-          return [{ ...change, item: stripServerEdgeProblem(change.item as Edge<LayerEdgeData>) }];
+          expanded.push({ ...change, item: stripServerEdgeProblem(change.item as Edge<LayerEdgeData>) });
+          continue;
         }
-        return [change];
-      });
-      onEdgesChange(expanded);
+        expanded.push(change as EdgeChange<Edge<LayerEdgeData>>);
+      }
+      onEdgesChange(new EdgeChangeset(expanded));
     },
     [onEdgesChange, bundleMembers],
   );
@@ -1837,11 +1854,18 @@ function TopologyEditorInner() {
             nodesDraggable={!isReadOnly && canvasReady}
             nodesConnectable={!isReadOnly && canvasReady}
             elementsSelectable={!isReadOnly && canvasReady}
+            // @xyflow/react 13 changed these defaults; each is pinned to its
+            // v12 value (lib/reactFlowDefaults.ts): the light theme instead
+            // of the system color scheme, selected edges not raised above the
+            // others, and the v12 fit-view padding (on Controls' button too).
+            forceColorMode="light"
+            elevateEdgesOnSelect={false}
             fitView
+            fitViewOptions={V12_FIT_VIEW_OPTIONS}
             deleteKeyCode={isReadOnly || !canvasReady ? null : "Delete"}
           >
             <Background gap={16} size={1} color="#e5e7eb" />
-            <Controls />
+            <Controls fitViewOptions={V12_FIT_VIEW_OPTIONS} />
             <MiniMap
               nodeColor={(node) => {
                 if (node.type === "dynamicPlaceholderNode") return "#a855f7";

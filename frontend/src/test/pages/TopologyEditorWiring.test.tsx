@@ -3,7 +3,7 @@ import { render, screen, waitFor, fireEvent, act } from "@testing-library/react"
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Node } from "@xyflow/react";
+import { EdgeChangeset, NodeChangeset, type Edge, type Node } from "@xyflow/react";
 
 const { toastError, toastSuccess, toastCustom, toastDismiss } = vi.hoisted(() => ({
   toastError: vi.fn(),
@@ -23,6 +23,7 @@ vi.mock("react-hot-toast", () => ({
 // onNodesDelete) so the wiring entry-point decision and the bundle-expansion
 // safety nets are exercised for real.
 const rfProps = vi.hoisted(() => ({ current: null as Record<string, unknown> | null }));
+const controlsProps = vi.hoisted(() => ({ current: null as Record<string, unknown> | null }));
 vi.mock("@xyflow/react", async () => {
   const actual = await vi.importActual<typeof import("@xyflow/react")>("@xyflow/react");
   return {
@@ -32,7 +33,10 @@ vi.mock("@xyflow/react", async () => {
       return <div data-testid="react-flow">{props.children as React.ReactNode}</div>;
     },
     Background: () => <div data-testid="rf-background" />,
-    Controls: () => <div data-testid="rf-controls" />,
+    Controls: (props: Record<string, unknown>) => {
+      controlsProps.current = props;
+      return <div data-testid="rf-controls" />;
+    },
     MiniMap: () => <div data-testid="rf-minimap" />,
   };
 });
@@ -171,6 +175,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.clearAllMocks();
   rfProps.current = null;
+  controlsProps.current = null;
   useTopologyStore.setState({ nodes: [], edges: [], selectedEdgeLayer: "L2" });
 });
 
@@ -402,10 +407,8 @@ describe("TopologyEditorPage bundle-safe edge changes (review item 3)", () => {
     expect(renderEdges).toHaveLength(1); // bundled on the canvas
     const bundleId = renderEdges[0].id;
 
-    const onEdgesChange = rfProps.current?.onEdgesChange as (
-      changes: Array<{ id: string; type: string }>,
-    ) => void;
-    act(() => onEdgesChange([{ id: bundleId, type: "remove" }]));
+    const onEdgesChange = rfProps.current?.onEdgesChange as (changes: EdgeChangeset) => void;
+    act(() => onEdgesChange(new EdgeChangeset([{ id: bundleId, type: "remove" }])));
 
     expect(useTopologyStore.getState().edges).toHaveLength(0);
   });
@@ -426,17 +429,21 @@ describe("TopologyEditorPage bundle-safe edge changes (review item 3)", () => {
     });
     const bundleId = (rfProps.current?.edges as Array<{ id: string }>)[0].id;
 
-    const onEdgesChange = rfProps.current?.onEdgesChange as (
-      changes: Array<{ id: string; type: string; item?: unknown }>,
-    ) => void;
+    const onEdgesChange = rfProps.current?.onEdgesChange as (changes: EdgeChangeset) => void;
     // The `item` here is exactly the shape React Flow would try to write:
     // the SYNTHETIC bundle object (data.members), never a real per-member
     // edge. If this were expanded per-member, it would corrupt both store
     // edges with that shape.
     act(() =>
-      onEdgesChange([
-        { id: bundleId, type: "replace", item: { id: bundleId, data: { members: [] } } },
-      ]),
+      onEdgesChange(
+        new EdgeChangeset([
+          {
+            id: bundleId,
+            type: "replace",
+            item: { id: bundleId, source: "n-src", target: "n-tgt", data: { members: [] } },
+          },
+        ]),
+      ),
     );
 
     expect(useTopologyStore.getState().edges).toHaveLength(2);
@@ -470,14 +477,12 @@ describe("TopologyEditorPage bundle-safe edge changes (review item 3)", () => {
     });
     const bundleId = (rfProps.current?.edges as Array<{ id: string }>)[0].id;
 
-    const onEdgesChange = rfProps.current?.onEdgesChange as (
-      changes: Array<{ id: string; type: string; selected?: boolean }>,
-    ) => void;
+    const onEdgesChange = rfProps.current?.onEdgesChange as (changes: EdgeChangeset) => void;
 
     // 1. Select the bundle: both store members flip, AND the freshly
     // recomputed bundle in the render view reflects it (this is the part
     // that was broken).
-    act(() => onEdgesChange([{ id: bundleId, type: "select", selected: true }]));
+    act(() => onEdgesChange(new EdgeChangeset([{ id: bundleId, type: "select", selected: true }])));
     expect(useTopologyStore.getState().edges.every((e) => e.selected)).toBe(true);
     const bundleAfterSelect = (rfProps.current?.edges as Array<{ id: string; selected?: boolean }>)[0];
     expect(bundleAfterSelect.id).toBe(bundleId);
@@ -485,15 +490,15 @@ describe("TopologyEditorPage bundle-safe edge changes (review item 3)", () => {
 
     // 2. Deselect the bundle the same way (a second click, in the real UI):
     // both members clear, and the render view reflects that too.
-    act(() => onEdgesChange([{ id: bundleId, type: "select", selected: false }]));
+    act(() => onEdgesChange(new EdgeChangeset([{ id: bundleId, type: "select", selected: false }])));
     expect(useTopologyStore.getState().edges.every((e) => e.selected === false)).toBe(true);
     const bundleAfterDeselect = (rfProps.current?.edges as Array<{ selected?: boolean }>)[0];
     expect(bundleAfterDeselect.selected).toBe(false);
 
     // 3. Select again, then Delete: both members are gone, driven entirely
     // through the React Flow change stream.
-    act(() => onEdgesChange([{ id: bundleId, type: "select", selected: true }]));
-    act(() => onEdgesChange([{ id: bundleId, type: "remove" }]));
+    act(() => onEdgesChange(new EdgeChangeset([{ id: bundleId, type: "select", selected: true }])));
+    act(() => onEdgesChange(new EdgeChangeset([{ id: bundleId, type: "remove" }])));
     expect(useTopologyStore.getState().edges).toHaveLength(0);
   });
 
@@ -515,10 +520,8 @@ describe("TopologyEditorPage bundle-safe edge changes (review item 3)", () => {
         edges: [{ id: "e1", source: "n-src", target: "n-tgt", type: "layerEdge", data: { layer: "L1" } }],
       });
     });
-    const onEdgesChange = rfProps.current?.onEdgesChange as (
-      changes: Array<{ id: string; type: string; selected?: boolean }>,
-    ) => void;
-    act(() => onEdgesChange([{ id: "e1", type: "select", selected: true }]));
+    const onEdgesChange = rfProps.current?.onEdgesChange as (changes: EdgeChangeset) => void;
+    act(() => onEdgesChange(new EdgeChangeset([{ id: "e1", type: "select", selected: true }])));
     expect(useTopologyStore.getState().edges[0].selected).toBe(true);
 
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -550,5 +553,133 @@ describe("TopologyEditorPage bundle-safe edge changes (review item 3)", () => {
     act(() => onNodesDelete([{ id: "n-src" }]));
 
     expect(useTopologyStore.getState().edges).toHaveLength(0);
+  });
+
+  // @xyflow/react 13: the handler receives one EdgeChangeset holding every
+  // change of a gesture, grouped by element id. One changeset here mixes all
+  // three bundle cases and the #1066 strip, so each rule is shown to hold for
+  // a real changeset, not only for a one-change batch.
+  it("one changeset mixing select, remove, and replace on bundles expands select and remove, passes the bundle replace through, and strips a replaced edge's server reason", async () => {
+    server.use(...baseHandlers());
+    await renderPageWithCanvas([
+      deviceNode("n-src", SOURCE_DEVICE, "switch-a"),
+      deviceNode("n-tgt", TARGET_DEVICE, "switch-b"),
+      deviceNode("n-c", "dev-c", "switch-c"),
+    ]);
+    act(() => {
+      useTopologyStore.setState({
+        edges: [
+          { id: "e1", source: "n-src", target: "n-tgt", type: "layerEdge", data: { layer: "L1" } },
+          { id: "e2", source: "n-src", target: "n-tgt", type: "layerEdge", data: { layer: "L2" } },
+          { id: "e3", source: "n-src", target: "n-c", type: "layerEdge", data: { layer: "L1" } },
+          { id: "e4", source: "n-src", target: "n-c", type: "layerEdge", data: { layer: "L2" } },
+          { id: "e5", source: "n-tgt", target: "n-c", type: "layerEdge", data: { layer: "L3" } },
+        ],
+      });
+    });
+    const renderIds = (rfProps.current?.edges as Array<{ id: string }>).map((e) => e.id);
+    const selectBundle = "bundle-n-src::n-tgt";
+    const removeBundle = "bundle-n-c::n-src";
+    expect(renderIds).toEqual([selectBundle, removeBundle, "e5"]);
+
+    const onEdgesChange = rfProps.current?.onEdgesChange as (changes: EdgeChangeset) => void;
+    const changes = new EdgeChangeset([
+      { id: selectBundle, type: "select", selected: true },
+      { id: removeBundle, type: "remove" },
+      // The synthetic bundle object React Flow would write into the slot.
+      {
+        id: selectBundle,
+        type: "replace",
+        item: { id: selectBundle, source: "n-src", target: "n-tgt", data: { members: [] } },
+      },
+      // A render copy of a lone edge, carrying the render-only server reason.
+      {
+        id: "e5",
+        type: "replace",
+        item: {
+          id: "e5",
+          source: "n-tgt",
+          target: "n-c",
+          type: "layerEdge",
+          data: { layer: "L3", serverInvalidReason: "no_port_path" },
+        } as Edge,
+      },
+    ]);
+    act(() => onEdgesChange(changes));
+
+    const edges = useTopologyStore.getState().edges;
+    // remove on the bundle removed both of its members, nothing else.
+    expect(edges.map((e) => e.id)).toEqual(["e1", "e2", "e5"]);
+    // select on the bundle reached both members; the bundle replace did not
+    // overwrite either member with the synthetic shape.
+    expect(edges.map((e) => [e.id, e.selected, e.data])).toEqual([
+      ["e1", true, { layer: "L1" }],
+      ["e2", true, { layer: "L2" }],
+      ["e5", undefined, { layer: "L3" }],
+    ]);
+    // The replace on the real edge landed, without the server reason.
+    expect(edges[2].data).not.toHaveProperty("serverInvalidReason");
+  });
+
+  it("a replace on a real edge strips the render-only server reason before the store sees it (issue #1066)", async () => {
+    server.use(...baseHandlers());
+    await renderPageWithCanvas([
+      deviceNode("n-src", SOURCE_DEVICE, "switch-a"),
+      deviceNode("n-tgt", TARGET_DEVICE, "switch-b"),
+    ]);
+    act(() => {
+      useTopologyStore.setState({
+        edges: [{ id: "e1", source: "n-src", target: "n-tgt", type: "layerEdge", data: { layer: "L1" } }],
+      });
+    });
+    const onEdgesChange = rfProps.current?.onEdgesChange as (changes: EdgeChangeset) => void;
+    const item = {
+      id: "e1",
+      source: "n-src",
+      target: "n-tgt",
+      type: "layerEdge",
+      label: "replaced",
+      data: { layer: "L2", serverInvalidReason: "no_port_path" },
+    } as Edge;
+    act(() => onEdgesChange(new EdgeChangeset([{ id: "e1", type: "replace", item }])));
+
+    const [edge] = useTopologyStore.getState().edges;
+    expect(edge.label).toBe("replaced");
+    expect(edge.data).toEqual({ layer: "L2" });
+  });
+
+  it("onNodesChange hands the changeset to the store, which applies every change in it", async () => {
+    server.use(...baseHandlers());
+    await renderPageWithCanvas([
+      deviceNode("n-src", SOURCE_DEVICE, "switch-a"),
+      deviceNode("n-tgt", TARGET_DEVICE, "switch-b"),
+    ]);
+    const onNodesChange = rfProps.current?.onNodesChange as (changes: NodeChangeset) => void;
+    act(() =>
+      onNodesChange(
+        new NodeChangeset([
+          { id: "n-src", type: "select", selected: true },
+          { id: "n-src", type: "position", position: { x: 120, y: 40 } },
+          { id: "n-tgt", type: "remove" },
+        ]),
+      ),
+    );
+    const nodes = useTopologyStore.getState().nodes;
+    expect(nodes.map((n) => [n.id, n.selected, n.position])).toEqual([["n-src", true, { x: 120, y: 40 }]]);
+  });
+});
+
+// Owner decision for the @xyflow/react 12 to 13 migration: every default v13
+// changed is pinned back to its v12 value on the canvas (lib/reactFlowDefaults.ts).
+describe("TopologyEditorPage pins the v12 React Flow defaults", () => {
+  it("passes forceColorMode light, elevateEdgesOnSelect false, and the v12 fit-view padding to the canvas and its Controls", async () => {
+    server.use(...baseHandlers());
+    await renderPageWithCanvas([deviceNode("n-src", SOURCE_DEVICE, "switch-a")]);
+
+    expect(rfProps.current?.forceColorMode).toBe("light");
+    expect(rfProps.current?.elevateEdgesOnSelect).toBe(false);
+    expect(rfProps.current?.fitView).toBe(true);
+    expect(rfProps.current?.fitViewOptions).toEqual({ padding: "4.545454545454546%" });
+    expect(controlsProps.current?.fitViewOptions).toEqual({ padding: "4.545454545454546%" });
   });
 });
