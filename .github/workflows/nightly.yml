@@ -72,7 +72,7 @@ jobs:
         uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           # The same uv release the service images copy (tests/unit/test_uv_pins.py).
-          version: "0.13.8"
+          version: "0.13.9"
 
       - name: Cache uv
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
