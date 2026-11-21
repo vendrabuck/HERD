@@ -40,10 +40,10 @@ markers = [
 
 [dependency-groups]
 dev = [
-    "ruff>=0.17.4",
+    "ruff>=0.17.5",
     "pip-audit>=2.10.1",
-    "selenium>=4.52.0",
-    "playwright>=1.65.0",
+    "selenium>=4.53.0",
+    "playwright>=1.65.2",
     "pytest-timeout>=2.4.0",
     "locust>=2.47.0",
 ]
