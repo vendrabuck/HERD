@@ -1,4 +1,9 @@
-"""The most static routes one Layer 3 switch may carry (issue #1493).
+"""The most distinct static routes routing intent may give one Layer 3 switch, and one
+provision may configure on it, per reservation pin (issue #1493).
+
+It bounds what a drive configures, not what a switch holds: a pin stored before the
+limit keeps its routes, a FAILED pin's record of possibly installed routes can grow
+past it, and inventory's config schema and config-apply jobs do not apply it.
 
 ONE limit, shared by definition between cabling and execution. Cabling refuses
 routing intent that gives a switch more than ``MAX_ROUTES_PER_SWITCH`` distinct

@@ -4063,9 +4063,13 @@ async def _l3_driver_supports_vrf(switch_id: str, ctx: "_FetchContext", get_db_s
 # Issue #1493: the reason a switch whose route set is over the per-switch limit
 # (herd_common.l3_route_limit.MAX_ROUTES_PER_SWITCH) is recorded FAILED with, before
 # any driver call. A fixed code like the gate's other reasons: no driver or route text.
-# Retryable (outside NON_RETRYABLE_REASON_PREFIXES): a config edit can bring the
-# switch's configured routes under the limit, and a retry then drives them; the tick's
-# attempts cap ends the retries otherwise.
+# Retryable (outside NON_RETRYABLE_REASON_PREFIXES). What a retry drives depends on the
+# row: a refused row that records no routes falls back to the switch's configured
+# routes (WIRE-L3-3), so a config trimmed under the limit is driven by the next
+# reconcile, a manual retry, or the tick while the row is under its attempts cap; a
+# refused row that records routes is re-driven from those routes, so a config trim
+# does not help it; new intent under the limit, the switch leaving the fork's wiring
+# (the stale-build release), or the teardown settles it.
 L3_TOO_MANY_ROUTES_REASON = "l3_too_many_routes"
 
 

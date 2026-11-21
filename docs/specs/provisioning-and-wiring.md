@@ -378,15 +378,18 @@ compare-and-swap too, so of two passes releasing one allocation exactly one driv
   Nothing caps the budget itself: a pin is held for at most one minute more than the
   larger of its sum plus N seconds and the three-action sum, and a holder that dies
   mid-drive leaves it unclaimable for no longer than that (#1482). What bounds R is
-  the per-switch route limit (WIRE-L3-20, #1493): a drive configures at most 1,000
-  routes, so a drive with no removals is held at most 1,530 minutes (about 25.5 hours)
-  at the defaults, and a delta that removes a full pin and adds a disjoint full set at
-  most 3,057 minutes (about 51 hours). Removals are never limited, so a drive that
-  removes more than a full pin is bounded only by what it removes: a pin stored before
-  the limit existed, or a FAILED pin's recorded routes (a provision's residue, or a
-  deprovision's whole set), which can grow past the limit because each failed
-  provision records its own set plus the removals that did not confirm (a known
-  limit). \
+  the per-switch route limit (WIRE-L3-20, #1493): one provision configures at most
+  1,000 distinct routes. Only a retry pass claims (the reconcile's own drives, deltas
+  included, take no claim), driving a provision (its residue removals, then its route
+  set) or a deprovision (the row's recorded routes). So at the defaults a retry
+  provision that removes nothing holds its claim at most 1,530 minutes (about 25.5
+  hours), and one that removes a residue of 1,000 routes and configures a disjoint
+  1,000 at most 3,057 minutes (about 51 hours). Removals are never limited, so a
+  claimed drive that removes more is bounded only by what it removes: a FAILED pin's
+  recorded routes (a provision's residue, or a deprovision's whole set) exceed the
+  limit when the pin was stored before the limit existed, and can grow past it because
+  each failed provision records its own set plus the removals that did not confirm (a
+  known limit). \
   Enforced in: `services/execution/app/services/wiring_claim.py` (`claim_budget`, `l3_pin_claim_budget`, `WiringRowClaims`); `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`) \
   Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_claim_budget_covers_one_row_worst_case_drive`, `test_claim_budget_scales_with_the_driver_timeout`, `test_the_one_row_budget_is_unchanged_for_l1_and_l2`, `test_l3_pin_claim_budget_is_r_plus_two_actions_rounded_up`, `test_l3_pin_claim_budget_outlives_every_drive_and_by_at_most_a_minute`, `test_an_l3_pins_claim_is_still_held_when_its_last_driver_action_finishes`, `test_a_raised_driver_timeout_still_keeps_an_l3_pins_claim_through_its_drive`, `test_l1_and_l2_rows_still_claim_with_the_one_row_budget`, `test_a_per_call_budget_sets_only_that_claims_stamp`, `test_a_sized_l3_claim_still_expires_at_its_stamp`, `test_the_smallest_l3_slack_at_the_default_timeout_is_four_tenths_of_a_second`, `test_an_l3_pins_claim_outlives_its_drive_with_overhead_just_under_the_allowance`, `test_known_limit_overhead_far_over_the_allowance_lets_a_rival_claim`, `test_the_route_limit_puts_a_number_on_the_longest_claim_at_the_defaults`)
 
@@ -1075,25 +1078,36 @@ removes exactly that when the switch is no longer needed.
   that fails leaves the switch FAILED and keeps that route stored next to the route set. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`); `services/execution/app/services/route_service.py` (`possibly_installed_routes`, `routes_not_in`, `union_routes`) \
   Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_save_after_failed_delta_removes_the_routes_its_intent_drops`, `test_retry_after_failed_delta_removes_the_routes_its_intent_drops`, `test_rebuild_whose_residue_removal_fails_keeps_the_residue_recorded`); `services/execution/tests/test_route_service.py` (`test_possibly_installed_routes_reads_a_failed_row_of_either_direction`, `test_possibly_installed_routes_ignores_an_active_pin`, `test_union_routes_dedups_by_route_identity_keeping_first_occurrence`, `test_routes_not_in_compares_by_identity_not_raw_dict_equality`)
-- **WIRE-L3-20.** A switch carries at most 1,000 distinct routes
-  (`MAX_ROUTES_PER_SWITCH`, one constant shared with cabling's save check, TOPO-L3-12;
-  #1493), counted by the WIRE-L3-8 identity so a duplicate counts once. Execution
-  refuses a route set over it before any driver call, with the fixed reason
-  `l3_too_many_routes`, in two places. The drive gate checks it first, before the
-  VRF check and any inventory read, so intent stored before the limit existed is
+- **WIRE-L3-20.** One provision configures at most 1,000 distinct routes on a switch,
+  per reservation pin (`MAX_ROUTES_PER_SWITCH`, one constant shared with cabling's
+  save check, TOPO-L3-12; #1493), counted by the WIRE-L3-8 identity so a duplicate
+  counts once. This bounds what a drive configures, not what a switch holds: a pin
+  stored before the limit keeps its routes, a FAILED pin's record can grow past it
+  (WIRE-L3-19), and inventory's config schema and config-apply jobs are not limited.
+  Execution refuses a route set over the limit before any driver call, with the fixed
+  reason `l3_too_many_routes`, in two places. The drive gate checks it first, before
+  the VRF check and any inventory read, so intent stored before the limit existed is
   refused like any gate failure (WIRE-L3-13), from the reconcile and from a build
   retry. Every provision, whatever its route source (intent, a reused pin, the
   switch's configured routes, a retry's stored set), is first deduplicated by identity
-  and then checked before its residue read, claim, or driver load; a refusal records
-  FAILED intended `ACTIVE` keeping any routes an existing FAILED row records, or an
-  empty list for a fresh switch, with no attempt from the reconcile and one from a
-  retry. So a drive configures at most 1,000 routes. Removals are never limited: a
-  deprovision, a delta's removals, and a provision's residue (WIRE-L3-19) are driven
-  whatever their count, since refusing one would leave routes installed. The reason is
-  retryable, so a configured route set brought under the limit is driven by the next
-  retry; the tick's attempts cap ends the retries otherwise. \
+  and then checked before its residue read, claim, switch read, or driver load; a
+  refusal records FAILED intended `ACTIVE` keeping any routes an existing FAILED row
+  records, or an empty list for a fresh switch, with no attempt from the reconcile and
+  one from a retry. On the retry path the write is the row-id compare-and-swap of
+  WIRE-CLAIM-10: a row that no longer intends `ACTIVE`, is no longer FAILED, or is held
+  by another pass is not written. On the reconcile path it is the key-based write the
+  gate's refusals use, which does not re-check a freeze, so a refusal that lands after
+  the teardown parked the row sets it back to intended `ACTIVE` (a known limit of that
+  writer). Removals are never limited: a deprovision, a delta's removals, and a
+  provision's residue (WIRE-L3-19) are driven whatever their count, since refusing one
+  would leave routes installed. The reason is retryable. A refused row that records no
+  routes falls back to the configured routes (WIRE-L3-3), so a config trimmed under
+  the limit is driven by the next reconcile, a manual retry, or the background retry
+  while the row is under `WIRING_RETRY_MAX_ATTEMPTS`; a refused row that records
+  routes is re-driven from them, so a config trim does not help it, and new intent
+  under the limit, the switch leaving the fork's wiring, or the teardown settles it. \
   Enforced in: `services/common/herd_common/l3_route_limit.py` (`MAX_ROUTES_PER_SWITCH`, `route_limit_exceeded`, `distinct_route_count`); `services/execution/app/services/nats_consumer.py` (`_gate_l3_drive_routes`, `_apply_l3_adjacency`, `_l3_route_set_over_limit`, `L3_TOO_MANY_ROUTES_REASON`) \
-  Pinned by: `services/common/tests/test_l3_route_limit.py` (`test_the_limit_is_the_owners_one_thousand`, `test_at_the_limit_is_allowed_and_one_over_is_refused`, `test_distinct_route_count_counts_a_duplicate_once`, `test_distinct_route_count_uses_the_shared_identity_not_raw_dicts`, `test_limit_plus_duplicates_is_still_at_the_limit`); `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_gate_refuses_an_over_limit_stored_intent_with_no_driver_call_or_read`, `test_gate_refuses_an_over_limit_delta_and_keeps_the_previous_pin`, `test_gate_passes_an_intent_at_the_limit_counting_a_duplicate_once`, `test_configured_routes_over_the_limit_are_refused_with_no_driver_call`, `test_configured_routes_at_the_limit_drive_once_each_even_when_duplicated`, `test_a_retry_refuses_a_pin_stored_over_the_limit_and_keeps_it`)
+  Pinned by: `services/common/tests/test_l3_route_limit.py` (`test_the_limit_is_the_owners_one_thousand`, `test_at_the_limit_is_allowed_and_one_over_is_refused`, `test_distinct_route_count_counts_a_duplicate_once`, `test_distinct_route_count_uses_the_shared_identity_not_raw_dicts`, `test_limit_plus_duplicates_is_still_at_the_limit`); `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_gate_refuses_an_over_limit_stored_intent_with_no_driver_call_or_read`, `test_gate_refuses_an_over_limit_delta_and_keeps_the_previous_pin`, `test_gate_passes_an_intent_at_the_limit_counting_a_duplicate_once`, `test_configured_routes_over_the_limit_are_refused_with_no_driver_call`, `test_configured_routes_at_the_limit_drive_once_each_even_when_duplicated`, `test_a_retry_refuses_a_pin_stored_over_the_limit_and_keeps_it`, `test_a_reconcile_refusal_keeps_the_routes_a_failed_row_records`, `test_a_retry_refusal_writes_nothing_on_a_row_parked_since_it_was_planned`, `test_a_retry_refusal_writes_nothing_on_a_row_another_pass_holds`, `test_a_retry_refusal_writes_nothing_on_a_row_released_since_and_inserts_none`, `test_the_route_limit_refusal_comes_before_the_residue_read_claim_and_load`)
 
 **Out of scope.** What makes routing intent valid at save time (`topology.md`); config
 versions (`device-configuration.md`).

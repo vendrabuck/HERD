@@ -2213,3 +2213,153 @@ async def test_a_retry_refuses_a_pin_stored_over_the_limit_and_keeps_it():
     assert (row.status, row.intended, row.last_error) == ("FAILED", "ACTIVE", "l3_too_many_routes")
     assert row.routes == stored
     assert row.attempts == 2
+
+
+async def test_a_reconcile_refusal_keeps_the_routes_a_failed_row_records():
+    """The reconcile path (no retry row id, the key-based write): a switch with no
+    intent whose FAILED pin records more routes than the limit (stored before it) is
+    rebuilt from those routes (WIRE-L3-3) and refused at the choke point. The refusal
+    keeps what the row records as possibly installed; it must never overwrite it with
+    an empty list, which would forget routes that may be on the switch."""
+    stored = _limit_routes(MAX_ROUTES_PER_SWITCH + 1)
+    async with TestSessionLocal() as db:
+        await record_route_failed(db, RES_ID, SW_L3, stored, 1, "boom", intended="ACTIVE")
+
+    calls = await _reconcile(L3_WIRES, l3_routes={})
+    assert calls == []
+    [row] = await _rows()
+    assert (row.status, row.intended, row.last_error) == ("FAILED", "ACTIVE", "l3_too_many_routes")
+    assert row.routes == stored
+    assert row.attempts == 1, "the reconcile path counts no attempt"
+
+
+def _row_state(row):
+    return (
+        row.status,
+        row.intended,
+        row.attempts,
+        row.last_error,
+        row.claimed_until,
+        row.routes,
+    )
+
+
+async def _seed_retry_row(routes):
+    async with TestSessionLocal() as db:
+        row = await record_route_failed(db, RES_ID, SW_L3, routes, 1, "boom", intended="ACTIVE")
+        return row.id
+
+
+async def _retry_refusal(row_id, claims):
+    """Drive one over-limit provision through `_apply_l3_adjacency` the way a retry
+    pass does (its loaded row id and its claim ledger), as if the pass planned it
+    before the row changed."""
+    item = {"device_id": SW_L3, "routes": _limit_routes(MAX_ROUTES_PER_SWITCH + 1)}
+    with patch("app.services.driver_sandbox.execute_driver_method") as sandbox:
+        await _apply_l3_adjacency(
+            RES_ID,
+            [],
+            [item],
+            _FetchContext(None),
+            _db_session_factory(),
+            retry_row_ids={SW_L3: row_id},
+            claims=claims,
+        )
+    sandbox.assert_not_called()
+
+
+async def test_a_retry_refusal_writes_nothing_on_a_row_parked_since_it_was_planned():
+    """WIRE-CLAIM-10: a retry's route-limit refusal is a compare-and-swap on the row id,
+    taken before any claim, so a row parked intended RELEASED after the pass planned
+    its build keeps every value, and the refusal is classed as wrong direction."""
+    from app.services.route_service import park_stale_route_build
+    from app.services.wiring_claim import WiringRowClaims
+
+    row_id = await _seed_retry_row(_limit_routes(3))
+    async with TestSessionLocal() as db:
+        await park_stale_route_build(db, row_id, "build intent gone; pending release")
+    [before] = await _rows()
+    assert before.intended == "RELEASED"
+
+    claims = WiringRowClaims()
+    await _retry_refusal(row_id, claims)
+    [after] = await _rows()
+    assert _row_state(after) == _row_state(before)
+    assert claims.wrong_direction == {row_id}
+
+
+async def test_a_retry_refusal_writes_nothing_on_a_row_another_pass_holds():
+    from datetime import datetime, timedelta, timezone
+
+    from app.services.wiring_claim import WiringRowClaims
+
+    row_id = await _seed_retry_row(_limit_routes(3))
+    async with TestSessionLocal() as db:
+        row = await db.get(RouteAssignment, row_id)
+        row.claimed_until = datetime.now(timezone.utc) + timedelta(hours=1)
+        await db.commit()
+    [before] = await _rows()
+
+    claims = WiringRowClaims()
+    await _retry_refusal(row_id, claims)
+    [after] = await _rows()
+    assert _row_state(after) == _row_state(before)
+    assert claims.lost == {row_id}
+
+
+async def test_a_retry_refusal_writes_nothing_on_a_row_released_since_and_inserts_none():
+    from app.services.wiring_claim import WiringRowClaims
+
+    row_id = await _seed_retry_row(_limit_routes(3))
+    async with TestSessionLocal() as db:
+        row = await db.get(RouteAssignment, row_id)
+        row.status = "RELEASED"
+        row.intended = "RELEASED"
+        await db.commit()
+    [before] = await _rows()
+
+    await _retry_refusal(row_id, WiringRowClaims())
+    rows = await _rows()
+    assert len(rows) == 1, "a refusal on a released row must not resurrect the pin"
+    assert _row_state(rows[0]) == _row_state(before)
+
+
+async def test_the_route_limit_refusal_comes_before_the_residue_read_claim_and_load():
+    """WIRE-L3-20's order: an over-limit provision is refused before the residue read,
+    the drive claim, the switch read, the template read, and the driver load, so none
+    of them runs. Driven as a retry, the one caller that claims."""
+    from app.services import route_service
+    from app.services.wiring_claim import WiringRowClaims
+
+    row_id = await _seed_retry_row(_limit_routes(3))
+
+    class _SpyClaims(WiringRowClaims):
+        def __init__(self):
+            super().__init__()
+            self.claim_calls = 0
+
+        async def claim(self, *args, **kwargs):
+            self.claim_calls += 1
+            return await super().claim(*args, **kwargs)
+
+    claims = _SpyClaims()
+    residue_read = AsyncMock(side_effect=route_service.possibly_installed_routes)
+    device_read = AsyncMock(side_effect=_device_fetch)
+    template_read = AsyncMock(return_value=TEMPLATE_DATA)
+    driver_load = AsyncMock(return_value="/tmp/driver")
+    with (
+        patch("app.services.route_service.possibly_installed_routes", new=residue_read),
+        patch("app.services.nats_consumer._fetch_device", new=device_read),
+        patch("app.services.nats_consumer._fetch_template", new=template_read),
+        patch("app.services.driver_loader.load_driver", new=driver_load),
+    ):
+        await _retry_refusal(row_id, claims)
+
+    assert claims.claim_calls == 0
+    residue_read.assert_not_awaited()
+    device_read.assert_not_awaited()
+    template_read.assert_not_awaited()
+    driver_load.assert_not_awaited()
+    [row] = await _rows()
+    assert (row.status, row.intended, row.last_error) == ("FAILED", "ACTIVE", "l3_too_many_routes")
+    assert row.attempts == 2

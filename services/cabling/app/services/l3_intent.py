@@ -61,6 +61,7 @@ import ipaddress
 import logging
 import uuid
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any, Callable
 
 from herd_common.l3_route_identity import route_identity_key
@@ -118,7 +119,12 @@ class RouteSpec:
     virtual_router: str | None
     source_index: int = -1
 
-    @property
+    # Computed once per spec and kept (issue #1493 review): the parse, the per-switch
+    # route limit, and the merge each read it, and each computation parses the
+    # destination again. `cached_property` stores into the instance `__dict__`
+    # directly, so it works on this frozen dataclass and is not a field (equality and
+    # hashing are unchanged). The value is the same function of the same four fields.
+    @cached_property
     def route_key(self) -> str:
         """The reconcile/uniqueness identity: all four fields, JSON-packed (S4
         review fix, round 2): two routes differing only by ``virtual_router`` are

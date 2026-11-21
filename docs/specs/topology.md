@@ -868,12 +868,14 @@ editor's Routing panel (section 8.16).
   12 s deadline fails the whole pass closed with 503 `{"error": "l3_config_unavailable"}`. \
   Enforced in: `services/cabling/app/services/l3_validation.py` (`validate_canvas_l3`, `L3ConfigUnavailable`) \
   Pinned by: `services/cabling/tests/test_l3_validation.py` (`test_503_on_device_batch_transport_error`, `test_503_on_device_batch_5xx`, `test_503_on_config_fetch_5xx`, `test_503_on_missing_internal_token_short_circuits_to_l3_config_unavailable`, `test_l3_pass_deadline_trips_into_503`)
-- **TOPO-L3-12.** A switch carries at most 1,000 distinct routes (#1493), counted over
-  every node naming it, merged and deduplicated by the TOPO-L3-3 identity as TOPO-L3-5
-  stores them, so a duplicate counts once and two nodes cannot each stay under the
-  limit while their switch goes over it. Every node of a switch over the limit is
-  malformed with the message `switch <device id> has <count> distinct routes; a switch
-  carries at most 1000`, in canvas node order with the shape refusals, so TOPO-L3-6
+- **TOPO-L3-12.** Routing intent gives one switch at most 1,000 distinct routes (#1493),
+  counted over every node naming it, merged and deduplicated by the TOPO-L3-3 identity
+  as TOPO-L3-5 stores them, so a duplicate counts once and two nodes cannot each stay
+  under the limit while their switch goes over it. A plain topology save does not
+  parse routing intent, so a topology can still be stored over the limit; validating
+  or reserving it, or saving its fork, refuses it. Every node of a switch over the
+  limit is malformed with the message `switch <device id> has <count> distinct
+  routes; a switch carries at most 1000`, in canvas node order with the shape refusals, so TOPO-L3-6
   applies to it: save answers 422 (TOPO-FORK-14), validation reports `l3_malformed`
   with no inventory call, and fork create drops the switch's intent. The limit is one
   constant shared with execution's drive-time check (WIRE-L3-20), compared through one

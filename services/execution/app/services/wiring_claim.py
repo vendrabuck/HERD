@@ -228,16 +228,19 @@ def l3_pin_claim_budget(route_operations: int) -> timedelta:
     drive the claim exists to prevent. So a claim lasts at most one minute more than
     N actions' worst case plus N seconds, or the one-row budget if that is longer.
     What bounds `route_operations` is the per-switch route limit (issue #1493,
-    `herd_common.l3_route_limit.MAX_ROUTES_PER_SWITCH`, 1,000): a drive configures at
-    most that many routes, so at the defaults a drive with no removals is held at most
-    1,530 minutes (about 25.5 hours), and a delta removing a full pin and adding a
-    disjoint full set at most 3,057 minutes (about 51 hours). Removals are not limited,
-    since refusing one would leave routes installed, so a drive that removes more than
-    a full pin is bounded only by what it removes. That happens in two ways: a pin
-    stored before the limit existed (removed by a delta or a deprovision), and a
-    FAILED pin's recorded routes (removed first as a provision's residue, or whole by a
-    deprovision), which can grow past the limit, since each failed provision records
-    its own set plus the removals that did not confirm. At 50,000 route operations the
+    `herd_common.l3_route_limit.MAX_ROUTES_PER_SWITCH`, 1,000): one provision
+    configures at most that many routes. Only a retry pass claims (the reconcile's own
+    drives, deltas included, take no claim), and it drives a provision (the residue
+    removals, then its route set) or a deprovision (the row's recorded routes). So at
+    the defaults a retry provision that removes nothing holds its claim at most 1,530
+    minutes (about 25.5 hours), and one that removes a residue of 1,000 routes and
+    configures a disjoint 1,000 at most 3,057 minutes (about 51 hours). Removals are not
+    limited, since refusing one would leave routes installed, so a claimed drive that
+    removes more is bounded only by what it removes: a FAILED pin's recorded routes,
+    removed first as a provision's residue or whole by a deprovision, exceed the limit
+    when the pin was stored before the limit existed, and can grow past it, since each
+    failed provision records its own set plus the removals that did not confirm. At
+    50,000 route operations the
     budget is 76,337 minutes, about 53 days. A holder that dies mid-drive leaves the pin
     unclaimable for at most its budget.
     """

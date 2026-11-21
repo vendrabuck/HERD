@@ -408,9 +408,14 @@ def test_add_route_saves_then_edit_to_bad_destination_shows_red_badge_and_toast(
 def test_a_switch_over_the_route_limit_shows_the_refusal_after_save(pw_page, l3_switch_setup):
     """Issue #1493: a switch carrying 1,001 distinct routes is refused by validation
     as l3_malformed, and the editor shows it: the save's routing toast names the
-    reason, and the Routing panel shows the message naming the switch and the limit.
-    The routes are written through the API (entering 1,001 through the form is not
-    the point); Save and the panel are exercised through the UI."""
+    reason, and the validate response the editor itself requested (captured from the
+    browser, not re-asked through the API) carries the message naming the switch and
+    the limit. The routes are written through the API (entering 1,001 through the form
+    is not the point). The Routing panel is deliberately NOT opened on this switch: it
+    would mount 1,001 editable rows, a slow render on a slow runner that this test does
+    not need; the panel's rendering of a switch-level detail is pinned by
+    `RoutingPanel.test.tsx` (`appends the detail message for l3_malformed-style
+    switch-level reasons`)."""
     page = pw_page
     setup = l3_switch_setup
     switch_id = setup["switch"]["id"]
@@ -447,18 +452,28 @@ def test_a_switch_over_the_route_limit_shows_the_refusal_after_save(pw_page, l3_
         switch_node = page.locator(".react-flow__node").filter(has_text=switch_name)
         expect(switch_node).to_be_visible(timeout=15_000)
 
-        _click_save(page)
-        expect(page.get_by_text("Routing intent has 1 problem", exact=False)).to_be_visible(
-            timeout=15_000
-        )
-
-        switch_node.click()
-        expect(
-            page.get_by_text(
-                f"l3_malformed: switch {switch_id} has 1001 distinct routes; "
-                "a switch carries at most 1000",
-                exact=True,
+        # The editor validates after the save (only a canvas with routing intent);
+        # wait for that very response rather than asking the API again.
+        with page.expect_response(
+            lambda r: (
+                r.request.method == "POST"
+                and r.url.endswith(f"/api/cabling/topologies/{topology['id']}/validate")
+            ),
+            timeout=30_000,
+        ) as validated:
+            _click_save(page)
+        assert validated.value.status == 200, validated.value.status
+        assert [(r["reason"], r["detail"]) for r in validated.value.json()["invalid_routes"]] == [
+            (
+                "l3_malformed",
+                f"switch {switch_id} has 1001 distinct routes; a switch carries at most 1000",
             )
-        ).to_be_visible(timeout=15_000)
+        ]
+
+        toast = page.locator("[data-rht-toaster] [role='status']").filter(
+            has_text="Routing intent has 1 problem"
+        )
+        expect(toast).to_be_visible(timeout=15_000)
+        expect(toast).to_contain_text("l3_malformed")
     finally:
         pw_api(page, "DELETE", f"/cabling/topologies/{topology['id']}", allow_errors=True)
