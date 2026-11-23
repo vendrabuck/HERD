@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+from collections import Counter
 from typing import Any
 
 import pytest
@@ -39,7 +40,7 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from tests._cost import cpu_ratio, growth_ratios
+from tests._cost import CallProfile, call_profile, cpu_ratio, growth_ratios
 
 MARKER = "canary-Secret-7q"
 
@@ -934,13 +935,14 @@ async def test_install_after_the_app_started_is_refused():
 
 # -- The cost: one scan of the raw bytes (round 4 of the #1456 review) ----------------
 #
-# Every time is CPU time read through `tests/_cost.py` (#1477), and every bound is
+# Every time is CPU time read through `tests/_cost.py` (#1477), and every time bound is
 # relative, with margin over the worst measurement, and re-measured once before it
-# fails. Bounds: the escape-heavy scan against itself at 4 and 16 times the size
-# (linear work) and, like the no-marker exit and the UTF-16 body, against a frozen
-# budget of C passes (a constant factor, `_scan_cost_budget`); the structural scan and
-# the parsed-value check against the parse they stand beside; a refused request
-# against the same request without the check.
+# fails. Bounds: the escape-heavy and UTF-16 scans against themselves at 4 and 16 times
+# the size (linear work); the structural scan and the parsed-value check against the
+# parse they stand beside; a refused request against the same request without the
+# check. The escape-heavy, UTF-16, and no-marker bodies are also held to a frozen
+# budget of C passes (a constant factor, `_scan_cost_budget`), by call counts that read
+# no clock (`call_profile` in `tests/_cost.py`, `_within_budget` below, #1512).
 #
 # Every measured figure below is a CPU-time ratio, one attempt with no re-measure, from
 # the #1477 measurements, sources (a) to (c), and the #1492 ones, sources (d) and (e):
@@ -1033,22 +1035,15 @@ _UTF16 = {
 # The constant-factor budget (#1492): the C passes the scan of a body was made of when
 # #1492 measured it (OPS-VALID-8), the same calls in the same order with the same early
 # exits, frozen here. It does not follow the scan: a cheaper scan leaves it alone, and
-# it is raised only when a change to the scan measures over the bound, as a reviewed
-# decision recorded with the new ratio. Its patterns are copied, not imported, so a
-# costlier pattern in the scan shows as a larger ratio. It leaves out
+# it changes only when a change to the scan makes a call it does not, as a reviewed
+# decision. Its patterns are copied, not imported, so its answer, which the tests
+# compare with the scan's, does not come from the scan's own code. It leaves out
 # `json.detect_encoding`, a constant cost (it reads at most four bytes); the caller
-# passes the encoding instead. Against a budget of the same primitives the scan's
-# ratio moved little across the seven interpreter builds of source (d) (CPU models
-# other than the host's are not measured). A reference of another kind moves with the
-# build: a two-byte substring search (`in`, `find`, `count`, `replace`) costs about
-# 4.6 times as much on the python-build-standalone 3.12 builds as on the distro
-# 3.12.3, while `bytes.lower` costs the same on both, so the scan's ratio to one
-# `bytes.lower` pass, the reference
-# before #1492, had medians of 8.6 on 3.12.3 and 28.0 on 3.12.12 for `u0041_then_low`
-# (bound 22.48: every run on 3.12.12 failed); and a single two-byte `bytes.count` is not
-# enough either, because each shape's mix of substring searches, regex searches, and
-# copies differs: the scan's ratio to one `body.count(b"\\u")` had medians of 3.8 on
-# 3.12.16 and 14.5 on 3.13.12 for `backslash_pairs_then_low` (source (d)).
+# passes the encoding instead, and `_within_budget` allows the scan that one call.
+# Until #1512 the scan was held to it by a CPU-time ratio under 1.5, whose true value
+# is 1.00 (the two make the same C calls), so the bound read noise: a shared CI runner
+# measured 1.548 and 1.524 on 2026-11-21 with no change to the scan. Since #1512 the two
+# are compared by `call_profile` counts (`tests/_cost.py`), which read no clock.
 _BUDGET_RAW_SURROGATE_BYTES = re.compile(rb"\xed[\xa0-\xbf]")
 _BUDGET_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 _BUDGET_HIGH_NOT_PAIRED = re.compile(rb"\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f][0-9a-f]{2})")
@@ -1085,36 +1080,75 @@ def _scan_cost_budget(body: bytes, encoding: str = "utf-8") -> bool:
     return _budget_escape_passes(text.encode("utf-8"))
 
 
-# The scan of a body may cost at most this many times `_scan_cost_budget` of it, on
-# every escape-heavy, no-marker, and UTF-16 body. Unmutated, in source (e), the ratio
-# measured 0.913 to 1.108 over 3,960 attempts on 3.12.3, 3.12.16, and 3.13.18 (30 runs
-# in each of unpinned, pinned, pinned beside two CPU hogs, and under coverage; worst
-# 1.108 on 3.12.3 under coverage, 1.055 on 3.12.16, 1.047 on 3.13.18), 0.959 to 1.091
-# in 10 pinned runs on each of 3.12.12, 3.13.12, 3.14.0, and 3.14.3, and 0.942 to 1.077
-# in the review's 1,920 attempts. So the bound has about 1.35 times headroom over the
-# worst run. What it catches, from 10 runs of each mutation of the product scan on
-# 3.12.3 and on 3.12.16 (a failure is by this ratio unless named):
-# - the scan run twice (1.96 to 2.03) or three times fails on every body;
-# - the same regex search run twice sits at the edge (the review measured 1.52 to 1.62
-#   on one body);
-# - a Python callback per `\u` escape (`re.sub` with a function) fails `pairs`,
-#   `pairs_upper_then_low`, `u0041_then_low`, `lone_highs`, and the UTF-16 body on both
-#   builds, and passes the rest (0.98 to 1.11): after the pair replacement,
-#   `backslash_pairs_then_low` and `four_backslashes_and_text` hold at most one `\u`;
-#   a list of every `\u` match fails the same four escape bodies on both builds, and
-#   the UTF-16 body on 3.12.3 only (1.39 to 1.42 on 3.12.16);
-# - a Python loop over every backslash fails every body but `korean_text` on 3.12.3;
-#   on 3.12.16, where the budget's substring searches cost about 4.6 times as much, it
-#   fails only the bodies dense in backslashes (the pairs shapes at 1.56 to 1.62, near
-#   the bound) and passes `korean_text`, the UTF-16 body, and the bodies with none
-#   (1.03 to 1.39); a list of every backslash match also fails `other_escapes_only` on
-#   both builds, and the UTF-16 body on 3.12.16, by memory;
-# - the early exit removed fails every no-marker body, by memory;
-# - a Python loop over every 0xED byte fails `korean_text` (5.0 to 10.3), `findall` in
-#   place of `search` fails `lone_highs` (9.3 to 16.3), and a Python loop over the
-#   decoded UTF-16 text fails the UTF-16 body (3.5 to 5.6).
-# The GitHub runners were not measured for this ratio; CI is the final check.
-_BUDGET_BOUND = 1.5
+# The scan's Python functions under the names of the budget's that stand for them, and
+# the one call the budget leaves out, which the scan is allowed.
+_BUDGET_NAMES = {
+    "_raw_text_holds_a_lone_surrogate": "_scan_cost_budget",
+    "_escapes_hold_a_lone_surrogate": "_budget_escape_passes",
+}
+_SCAN_ONLY_CALLS = Counter({"detect_encoding": 1})
+
+# The scan of every escape-heavy, UTF-16, and no-marker body is held to the budget by
+# `_within_budget`: call counts, no clock, the same counts on Python 3.12.3, 3.12.12,
+# 3.13.12, 3.14.0, and 3.14.3, plain and under `coverage run` (#1512). Unmutated, the
+# scan's C calls equal the budget's callable by callable on all 11 bodies, its Python
+# functions are the budget's plus `json.detect_encoding`, and its steps are the same at
+# 256 KiB and 1 MB. What it catches, from one run of each mutation of the product scan
+# on 3.12.3 and on 3.14.3 (the counts are exact, so one run decides):
+# - the escape passes run twice or three times, and a `bytes.lower` pass run twice in
+#   place, fail every escape-heavy body and the UTF-16 body;
+# - a Python callback per `\u` escape (`Pattern.sub` with a function), a loop of
+#   `bytes.find` per backslash, `findall` in place of `search`, and a scan made
+#   quadratic by counting each 4 KiB prefix fail the same eight bodies by their calls
+#   (in the test, the growth bound, checked first, fails the quadratic one);
+# - a Python loop over every backslash with no call in it, on several lines or as a
+#   comprehension on one, fails those eight bodies by its steps;
+# - a loop of `bytes.find` per 0xED byte fails every escape-heavy body (its first
+#   `find` is a call the budget never makes); a Python loop over the decoded UTF-16 text
+#   fails the UTF-16 body by its steps;
+# - the early exit removed fails every no-marker body, by its calls (in the test, the
+#   memory bound fails it as well).
+# A scan made cheaper (one low escape dropped from the counts) passes every body. What
+# it cannot see: the work inside one C call (`_HIGH_NOT_PAIRED` rewritten as an
+# alternation of itself, the same calls with a search 1.92 times as costly on `pairs`,
+# one pinned measurement on 3.12.3, passes), and operators (three more `in` searches
+# pass), which are not call events. The growth bound and the memory bounds stay.
+
+
+def _within_budget(make, encoding: str = "utf-8") -> tuple[CallProfile, CallProfile]:
+    """Hold the scan of `make()` (1 MB) to `_scan_cost_budget` of it, by call counts.
+
+    Fails when the scan calls any C callable more times than the budget does (one it
+    never calls counts as zero), when it starts any Python function more times than
+    the budget does (its own functions under `_BUDGET_NAMES`, plus `_SCAN_ONLY_CALLS`),
+    or when its Python steps (`call_profile`) at 1 MB exceed those at a quarter of
+    that; and when either profile does not hold exactly one start of its own entry
+    function, so a profile that saw nothing cannot pass. The message carries both
+    sides' counts. Returns (scan, budget)."""
+    body = make()
+    scan = call_profile(_raw_text_holds_a_lone_surrogate, body)
+    budget = call_profile(_scan_cost_budget, body, encoding)
+    quarter = call_profile(_raw_text_holds_a_lone_surrogate, make(_MB // 4))
+    scan_python: Counter[str] = Counter()
+    for name, count in scan.python_calls.items():
+        scan_python[_BUDGET_NAMES.get(name, name)] += count
+    allowed_python = budget.python_calls + _SCAN_ONLY_CALLS
+    over_c = {k: (v, budget.c_calls[k]) for k, v in scan.c_calls.items() if v > budget.c_calls[k]}
+    over_python = {
+        k: (v, allowed_python[k]) for k, v in scan_python.items() if v > allowed_python[k]
+    }
+    report = (
+        f"over the budget, (scan, budget): C {over_c}, Python {over_python}; "
+        f"scan C calls {dict(sorted(scan.c_calls.items()))}, "
+        f"budget's {dict(sorted(budget.c_calls.items()))}; "
+        f"scan Python calls {dict(sorted(scan_python.items()))}, "
+        f"budget's with {dict(_SCAN_ONLY_CALLS)} {dict(sorted(allowed_python.items()))}; "
+        f"scan steps {quarter.steps} at {_MB // 4} bytes, {scan.steps} at {_MB}"
+    )
+    assert scan_python["_scan_cost_budget"] == budget.python_calls["_scan_cost_budget"] == 1, report
+    assert not over_c and not over_python, report
+    assert scan.steps <= quarter.steps, report
+    return scan, budget
 
 
 @pytest.mark.parametrize("make", _STRUCTURAL.values(), ids=_STRUCTURAL.keys())
@@ -1148,14 +1182,17 @@ def test_an_escape_heavy_body_costs_linear_work_in_two_copies(shape):
 
     - growth: each fourfold step in size costs at most `_GROWTH_BOUND` times the one
       before, so the cost is linear (a quadratic scan fails);
-    - budget: the scan of the 1 MB body costs under `_BUDGET_BOUND` times
-      `_scan_cost_budget` of it; `_BUDGET_BOUND` says what that catches;
+    - budget: the scan of the 1 MB body makes no C call and starts no Python function
+      more times than `_scan_cost_budget` of it, and takes no more Python steps than
+      at a quarter of the size (`_within_budget`, call counts, no clock); the comment
+      above `_within_budget` says what that catches and what it cannot see;
     - memory: at most two copies of the bytes.
 
     These replaced a bound of 12 times `json.loads` of the same body (#1477), which a
-    wall clock read at 18.5 on a shared CI runner, and then a bound against one
+    wall clock read at 18.5 on a shared CI runner, then a bound against one
     `bytes.lower` pass per shape, which every python-build-standalone 3.12 failed
-    (#1492): a reference of another kind runs at its own speed on each build and CPU."""
+    (#1492), then a CPU-time ratio under 1.5 against the budget, whose true value is
+    1.00, which a shared CI runner read at 1.548 and 1.524 (#1512)."""
     make = _ESCAPE_HEAVY[shape]
     n, times, ratios = growth_ratios(
         make, _raw_text_holds_a_lone_surrogate, bound=_GROWTH_BOUND, start=64 * 1024
@@ -1163,12 +1200,8 @@ def test_an_escape_heavy_body_costs_linear_work_in_two_copies(shape):
     assert max(ratios) <= _GROWTH_BOUND, (n, times, ratios)
     body = make()
     assert _scan_cost_budget(body) is _raw_text_holds_a_lone_surrogate(body)
-    ratio = cpu_ratio(
-        lambda: _raw_text_holds_a_lone_surrogate(body),
-        lambda: _scan_cost_budget(body),
-        bound=_BUDGET_BOUND,
-    )
-    assert ratio < _BUDGET_BOUND, (shape, ratio)
+    _, budget = _within_budget(make)
+    assert budget.c_calls["Pattern.search"] > 0, budget
     assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 2.2 * len(body)
 
 
@@ -1188,22 +1221,18 @@ def test_a_utf16_body_costs_its_decode_and_the_escape_passes(shape):
     assert max(ratios) <= _GROWTH_BOUND, (n, times, ratios)
     assert _raw_text_holds_a_lone_surrogate(body) is False
     assert _scan_cost_budget(body, "utf-16-le") is False
-    ratio = cpu_ratio(
-        lambda: _raw_text_holds_a_lone_surrogate(body),
-        lambda: _scan_cost_budget(body, "utf-16-le"),
-        bound=_BUDGET_BOUND,
-    )
-    assert ratio < _BUDGET_BOUND, (shape, ratio)
+    _, budget = _within_budget(make, "utf-16-le")
+    assert budget.c_calls["bytes.decode"] > 0, budget
     assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 3 * len(body)
 
 
-# Bodies with no surrogate marker. On each, `_scan_cost_budget` is the two searches of
-# the early exit, so the time bound is the escape test's: the scan may cost at most
-# `_BUDGET_BOUND` times those two searches.
+# Bodies with no surrogate marker. On each, `_scan_cost_budget` is the two `in`
+# searches of the early exit, operators that make no call, so the budget's profile
+# holds no C call and the scan's may hold none.
 _NO_MARKER = {
-    "ascii_objects": _fill('{"name":"device-1","rack":"r1"},', "[", "0]"),
-    "cjk_text": _fill("日本", '["', '"]'),
-    "other_escapes_only": _fill('"' + "\\n" * 8 + '",', "[", "0]"),
+    "ascii_objects": lambda size=_MB: _fill('{"name":"device-1","rack":"r1"},', "[", "0]", size),
+    "cjk_text": lambda size=_MB: _fill("日本", '["', '"]', size),
+    "other_escapes_only": lambda size=_MB: _fill('"' + "\\n" * 8 + '",', "[", "0]", size),
 }
 
 
@@ -1211,21 +1240,21 @@ _NO_MARKER = {
 def test_a_body_with_no_surrogate_marker_is_passed_after_two_searches(shape):
     """No `\\u` and no 0xED byte: two `in` searches and no copy (the early exit).
 
-    The memory bound proves the exit: without it the scan copies the body. The time
-    bound (re-measured before it fails) catches the full escape scan running instead,
-    which costs about 4.3 to 11.3 times the two searches (sources (d) and (e)); in the
-    test the memory bound, checked first, fails it. It is not a 1x bound, which failed
-    once on a CI runner under coverage read with a wall clock (0.82 ms against 0.74)."""
-    body = _NO_MARKER[shape]
+    The budget's profile holds no C call, so the scan may make none: the full escape
+    scan running instead (its regex search, its copies, its counts) fails the call
+    counts, and the memory bound fails it too, since the scan then copies the body. The
+    memory bound also proves the exit against a copy made without a call (a slice). The
+    two `in` searches themselves are operators, not calls, so a third one, or a costlier
+    one, passes. Before #1512 this was a CPU-time ratio under 1.5 against the two
+    searches; before that a 1x bound, which failed once on a CI runner under coverage
+    read with a wall clock (0.82 ms against 0.74)."""
+    make = _NO_MARKER[shape]
+    body = make()
     assert _raw_text_holds_a_lone_surrogate(body) is False
     assert _scan_cost_budget(body) is False
+    _, budget = _within_budget(make)
+    assert budget.c_calls == Counter(), budget
     assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 64 * 1024
-    ratio = cpu_ratio(
-        lambda: _raw_text_holds_a_lone_surrogate(body),
-        lambda: _scan_cost_budget(body),
-        bound=_BUDGET_BOUND,
-    )
-    assert ratio < _BUDGET_BOUND, (shape, ratio)
 
 
 def test_through_an_app_a_refused_structural_body_costs_less_than_without_the_check():
