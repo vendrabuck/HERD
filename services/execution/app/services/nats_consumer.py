@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import TYPE_CHECKING, NamedTuple
 
 import httpx
@@ -3070,12 +3070,19 @@ async def _vlan_ids_for(
 
 
 async def _release_orphaned_allocations(
-    vlan_assignment_ids: set[uuid.UUID],
+    vlan_assignment_ids: Iterable[uuid.UUID],
     get_db_session,
     ctx: "_FetchContext",
+    *,
+    reservation_wide: bool = False,
 ) -> None:
     """Release each vlan_assignment left with zero ACTIVE memberships (Decision 4),
     then undefine the freed VLAN on each switch it was defined on (issue #442).
+
+    `reservation_wide` is passed only by _release_reservation_orphaned_allocations
+    (issue #1497, ADR 0018 D11): the guarded release then also requires that
+    vlan_service.held_by_a_pending_join is false for the allocation, and an allocation
+    that fails that guard in the UPDATE is a lost race like any other.
 
     Runs AFTER the whole membership pass (removes and adds both applied), so a port moved
     to a different port on the same fabric leaves the fabric with one member and its
@@ -3160,10 +3167,17 @@ async def _release_orphaned_allocations(
             ).scalar_one_or_none()
             if row is None:
                 continue
-            if not await release_allocation_if_orphaned(db, va_id):
+            released = await (
+                release_allocation_if_orphaned(db, va_id, reservation_wide=True)
+                if reservation_wide
+                else release_allocation_if_orphaned(db, va_id)
+            )
+            if not released:
                 # Issue #1357: the row changed between the reads above and the guarded
-                # write (another pass released it, or a membership joined it). The
-                # winner owns whatever comes next; this pass drives nothing for it.
+                # write (another pass released it, or a membership joined it; on the
+                # reservation-wide check, #1497, also a join of its reservation that
+                # failed since). The winner owns whatever comes next; this pass drives
+                # nothing for it.
                 logger.info(
                     "Skipped releasing VLAN allocation %s: it was released or joined "
                     "by a concurrent writer after the orphan check",
@@ -3264,6 +3278,42 @@ async def _release_orphaned_allocations(
                 if fresh is not None:
                     fresh.defined_switch_ids = remaining
                     await db.commit()
+
+
+async def _release_reservation_orphaned_allocations(
+    reservation_id: str,
+    ctx: "_FetchContext",
+    get_db_session,
+) -> None:
+    """The reservation-wide allocation check (issue #1497, ADR 0018 D11).
+
+    _apply_l2_memberships checks only the allocations its own removes touched, and only
+    when it reaches its last statement. A pass that raises after removing a membership
+    on one switch (a switch or template read for the next switch failing) leaves that
+    membership's allocation ACTIVE with no member, and the redelivered pass no longer
+    sees the removed membership, so no later pass would touch the allocation. So every
+    full L2 reconcile (_reconcile_l2_memberships, its no-delta early return included)
+    and the terminal teardown (_teardown_from_ledgers) end with this check, in addition
+    to the per-pass one, over every ACTIVE allocation of the reservation.
+
+    An allocation is released when no ACTIVE membership references it and
+    vlan_service.held_by_a_pending_join is false: on a reservation that is not frozen,
+    the reservation has no FAILED intended-ACTIVE membership at all; on a frozen one,
+    none of its FAILED intended-ACTIVE memberships holds a live drive claim (a retry
+    pass that claimed it before the freeze may still land its join, the case the
+    teardown leaves alone, WIRE-TEARDOWN-6). The candidates are one read
+    (vlan_service.reservation_orphaned_allocations); the release is the
+    compare-and-swap of WIRE-VLAN-4 through _release_orphaned_allocations, which
+    re-checks both conditions in its guarded UPDATE and drives delete_vlan for the
+    winner. A read that fails raises before anything is released (fail closed), and
+    the caller's message is retried.
+    """
+    from app.services.vlan_service import reservation_orphaned_allocations
+
+    async with get_db_session() as db:
+        candidates = await reservation_orphaned_allocations(db, reservation_id)
+    if candidates:
+        await _release_orphaned_allocations(candidates, get_db_session, ctx, reservation_wide=True)
 
 
 async def _apply_l2_memberships(
@@ -3765,6 +3815,9 @@ async def _reconcile_l2_memberships(
         )
         if alloc_ids:
             await _define_pending_for_allocations(set(alloc_ids), ctx, get_db_session)
+        # The reservation-wide check (issue #1497): an allocation an earlier, raised
+        # pass left with no member is released here too, delta or not.
+        await _release_reservation_orphaned_allocations(reservation_id, ctx, get_db_session)
         return
 
     # One memoized fabric resolver for the whole pass (issue #1003): each switch's
@@ -3869,6 +3922,8 @@ async def _reconcile_l2_memberships(
         get_db_session,
         define_allocation_ids=define_allocation_ids,
     )
+    # The reservation-wide check (issue #1497), after the per-pass one above.
+    await _release_reservation_orphaned_allocations(reservation_id, ctx, get_db_session)
 
 
 # --- L3 layered reconcile (ADR 0009 phase 5, issue #416) ---------------------
@@ -5312,6 +5367,10 @@ async def _teardown_from_ledgers(
             )
         if removes:
             await _apply_l2_memberships(res_str, removes, [], ctx, get_db_session)
+    # The reservation-wide check (issue #1497, ADR 0018 D11), run even when the ledger
+    # held no L2 row: a teardown that raised after removing a membership is redelivered
+    # with that membership already RELEASED, and its allocation is released here.
+    await _release_reservation_orphaned_allocations(res_str, ctx, get_db_session)
 
     # L3: remove every ACTIVE pin using the PINNED route set verbatim (issue #20:
     # get_effective_pinned_routes, never a re-derived config). The adjacency-aware nuance
