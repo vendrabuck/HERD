@@ -448,9 +448,10 @@ async def test_a_teardown_that_raised_between_switches_leaks_no_allocation_on_re
 
 
 async def test_a_teardown_with_no_l2_rows_left_still_releases_the_leaked_allocation():
-    """The redelivered teardown may find no L2 row at all (the raise came after the last
-    ACTIVE membership was removed, on a switch with only failed rows' work, or the
-    leaked allocation's only member was the one removed). The check runs anyway."""
+    """The redelivered teardown can find no ACTIVE or FAILED L2 row at all: the leaked
+    allocation's only membership is already RELEASED (an earlier delivery removed it
+    and raised before its release). Before #1497 the teardown then skipped its L2 step
+    entirely; the check runs anyway and releases the allocation and its definition."""
     alloc = await _add_allocation(RES, SEEDED_VLAN, FABRIC_1, [S1], defined=[S1])
     await _add_membership(RES, alloc, S1, "0/0/1", status="RELEASED", intended="RELEASED")
     await _freeze()
