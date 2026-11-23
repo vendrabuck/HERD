@@ -11,6 +11,7 @@ suite pins it through that service's real app.
 
 from __future__ import annotations
 
+import encodings.utf_16_le
 import json
 import re
 import threading
@@ -1082,15 +1083,23 @@ def _scan_cost_budget(body: bytes, encoding: str = "utf-8") -> bool:
     return _budget_escape_passes(text.encode("utf-8"))
 
 
-# The scan's Python functions under the names of the budget's that stand for them, and
-# the one call the budget leaves out, which the scan is allowed. A helper of the scan
-# renamed, split, or added is a name the budget never starts, so it fails loudly until
-# it is mapped here as a reviewed decision.
+# The scan's Python functions under the names of the budget's that stand for them. A
+# helper of the scan renamed, split, or added is a name the budget never starts, so it
+# fails loudly until it is mapped here as a reviewed decision. Names are compared only
+# for functions in each side's home (`call_profile`), whose calls and steps are counted.
 _BUDGET_NAMES = {
     "_raw_text_holds_a_lone_surrogate": "_scan_cost_budget",
     "_escapes_hold_a_lone_surrogate": "_budget_escape_passes",
 }
-_SCAN_ONLY_CALLS = Counter({"detect_encoding": 1})
+# Python functions outside a profile's home, whose C calls and steps are not counted,
+# are compared by code object, one entry per start: a function of another name, or of
+# the same name defined anywhere else, is a different code object. The budget may start
+# only `_BUDGET_OUTSIDE_STARTS`: the codec's Python wrapper that `bytes.decode` starts
+# for "utf-16-le" (CPython has no C fast path for that name), once on the UTF-16 body.
+# The scan may start only what the budget's profile of the same body started, plus
+# `_SCAN_ONLY_OUTSIDE_STARTS`, the one call the budget leaves out.
+_BUDGET_OUTSIDE_STARTS = (encodings.utf_16_le.decode.__code__,)
+_SCAN_ONLY_OUTSIDE_STARTS = (json.detect_encoding.__code__,)
 # How many more Python steps (`call_profile`: lines, jumps, generator resumes, counted
 # in the profiled function's package) the scan may take than the budget on the same
 # body, by encoding. Measured unmutated: exactly 1 more on every UTF-8 body (the scan's
@@ -1104,13 +1113,16 @@ _STEP_ALLOWANCE = {"utf-8": 1, "utf-16-le": 2}
 # The scan of every escape-heavy, UTF-16, and no-marker body is held to the budget by
 # `_within_budget` and `test_the_scans_patterns_are_the_budgets_copies`: counts, no
 # clock, the same counts on Python 3.12.3, 3.12.12, 3.13.12, 3.14.0, and 3.14.3, plain
-# and under `coverage run` (#1512). Unmutated, the scan's C calls and regex patterns
-# equal the budget's on all 11 bodies, its Python functions are the budget's plus
-# `json.detect_encoding`, and its steps are the budget's plus `_STEP_ALLOWANCE` and the
-# same at 256 KiB and 1 MB. What it catches, from one run of each mutation of the
-# product scan with the check alone on 3.12.12 and 3.14.0 and the tests on 3.12.3 (the
-# counts are exact, so one run decides; E is the 7 escape-heavy bodies, U the UTF-16
-# body, N the 3 no-marker bodies):
+# and under `coverage run` (#1512). Unmutated, the scan's C calls and regex calls (by
+# method, pattern, and flags) equal the budget's on all 11 bodies, its functions in
+# `herd_common` are the budget's under `_BUDGET_NAMES`, outside `herd_common` it starts
+# `json.detect_encoding` once plus what the budget starts outside `tests/` (the UTF-16
+# codec's Python decode wrapper, on the UTF-16 body only), and its steps are the
+# budget's plus `_STEP_ALLOWANCE` and the same at 256 KiB and 1 MB. What it catches,
+# from one run of each mutation of the product scan: the tests on 3.12.3, and the check
+# alone on 3.12.12 and 3.14.0, or for the pattern-count and outside-start mutations the
+# tests on 3.12.12 and 3.14.3 (the counts are exact, so one run decides; E is the 7
+# escape-heavy bodies, U the UTF-16 body, N the 3 no-marker bodies):
 # - by calls, on E and U: the escape passes run twice or three times, a `bytes.lower`
 #   run twice in place, a Python callback per `\u` escape, a loop of `bytes.find` per
 #   backslash, `findall` in place of `search`, a quadratic scan that counts each 4 KiB
@@ -1126,14 +1138,31 @@ _STEP_ALLOWANCE = {"utf-8": 1, "utf-16-le": 2}
 #   the line);
 # - by pattern: a regex rewritten as an alternation of itself (its search 1.92 times as
 #   costly on `pairs`, one pinned measurement on 3.12.3), and a new costlier pattern
-#   used in place of `_HIGH_NOT_PAIRED` (E and U).
+#   used in place of `_HIGH_NOT_PAIRED` (E and U); by its count, `_HIGH_NOT_PAIRED`
+#   searched in place of `_RAW_SURROGATE_BYTES` (6 of E: the same number of regex
+#   calls, 1.6 times the CPU time on `pairs`, pinned on 3.12.3, fastest of five calls,
+#   as for every figure in the list below; `lone_highs` returns at that search,
+#   cheaper, and U does not run it);
+# - by a start outside `herd_common`: the escape passes moved to a top-level module
+#   outside the package under their own name, with three more regex passes (E and U),
+#   a stand-in `detect_encoding` outside the package that runs 1,000 `in` scans (all
+#   11), a function outside it named `_raw_text_holds_a_lone_surrogate` called from the
+#   scan (E), and a bytes-like object outside it whose Python `__buffer__` runs when
+#   `bytes.count` reads it, a C call calling back into Python (6 of E and U).
 # The helper moved unchanged to another module of `herd_common`, and a scan made
 # cheaper (one low escape dropped from the counts), pass every body. A helper renamed
 # or split fails loudly, naming the function the budget never starts, until it is
-# mapped in `_BUDGET_NAMES`. What still passes the counts (the complete list found by
-# attacking this check):
+# mapped in `_BUDGET_NAMES`. What still passes the counts (the list found by attacking
+# this check):
 # - operators added to a line the scan already runs (`in`, `==`, slicing, `+`): a
-#   third `in` search on the early exit's own line passes every body;
+#   third `in` search on the early exit's own line passes every body; so does an
+#   operator there that drives work built before the call: `True in G`, `G` a
+#   module-level `map(operator.contains, ...)` over a cycle of 1,000 substrings, runs
+#   1,000 C searches of the body, one C function calling another (14 times the scan's
+#   CPU time on `pairs`), and `0 in GEN`, `GEN` a generator outside `herd_common`
+#   started before the call, whose resumes are not counted, ran 1,000 `in` scans (13.5
+#   times); a `for` loop resumes it the same way, while `next` or `send` is a C call
+#   the budget never makes;
 # - more work inside a call the budget makes as often, with the same pattern: a larger
 #   argument (searching `body + body` passes 10 bodies; the memory bound catches it on
 #   `lone_highs`), another substring, codec, or error handler;
@@ -1142,9 +1171,28 @@ _STEP_ALLOWANCE = {"utf-8": 1, "utf-16-le": 2}
 #   handed to a thread already running, garbage left for the collector (off during the
 #   profile);
 # - the work inside `json.detect_encoding`, the one call the scan makes beyond the
-#   budget's: it runs outside `herd_common`, so only its start is counted (today it
-#   reads at most four bytes).
+#   budget's, and inside the UTF-16 codec's Python decode wrapper, which both sides
+#   start: they run outside both homes, so only their starts are counted (today the
+#   first reads at most four bytes and the second is the one C decode both sides pay).
 # The growth bound and the memory bounds stay.
+
+
+def _where(code) -> str:
+    return f"{code.co_qualname} ({code.co_filename}:{code.co_firstlineno})"
+
+
+def _starts_beyond(starts: tuple, allowed: tuple) -> list[str]:
+    """Each of `starts` (code objects) that `allowed` does not cover, by identity: each
+    entry of `allowed` covers one start of that very code object."""
+    left = list(allowed)
+    beyond = []
+    for code in starts:
+        index = next((i for i, entry in enumerate(left) if entry is code), None)
+        if index is None:
+            beyond.append(_where(code))
+        else:
+            del left[index]
+    return beyond
 
 
 def _within_budget(make, encoding: str = "utf-8") -> tuple[CallProfile, CallProfile]:
@@ -1155,10 +1203,16 @@ def _within_budget(make, encoding: str = "utf-8") -> tuple[CallProfile, CallProf
       profile holds no CALL event at all (every path of the scan calls
       `json.detect_encoding`), or the budget makes C calls and the scan none, so a
       profile that saw nothing cannot pass;
-    - the scan runs a regex whose pattern and flags the budget does not run;
+    - the budget starts a Python function outside its home beyond
+      `_BUDGET_OUTSIDE_STARTS`, or the scan (at either size) one beyond what the
+      budget's profile started plus `_SCAN_ONLY_OUTSIDE_STARTS`, compared by code
+      object, one entry per start (outside the home, a name proves nothing);
+    - the scan runs a regex whose pattern and flags the budget does not run, or runs
+      any (method, pattern, flags) more times than the budget does, so a pattern run in
+      place of another fails even when the number of regex calls is unchanged;
     - the scan calls any C callable more times than the budget does (one the budget
-      never calls counts as zero), or starts any Python function more times than the
-      budget does (its own functions under `_BUDGET_NAMES`, plus `_SCAN_ONLY_CALLS`);
+      never calls counts as zero), or starts any Python function in its home more times
+      than the budget does (its own functions under `_BUDGET_NAMES`);
     - the scan takes more Python steps than the budget's on the same body plus
       `_STEP_ALLOWANCE` for its encoding, or more steps at 1 MB than at a quarter of
       that.
@@ -1170,18 +1224,21 @@ def _within_budget(make, encoding: str = "utf-8") -> tuple[CallProfile, CallProf
     scan_python: Counter[str] = Counter()
     for name, count in scan.python_calls.items():
         scan_python[_BUDGET_NAMES.get(name, name)] += count
-    allowed_python = budget.python_calls + _SCAN_ONLY_CALLS
     over_c = {k: (v, budget.c_calls[k]) for k, v in scan.c_calls.items() if v > budget.c_calls[k]}
     over_python = {
-        k: (v, allowed_python[k]) for k, v in scan_python.items() if v > allowed_python[k]
+        k: (v, budget.python_calls[k]) for k, v in scan_python.items() if v > budget.python_calls[k]
+    }
+    over_patterns = {
+        k: (v, budget.patterns[k]) for k, v in scan.patterns.items() if v > budget.patterns[k]
     }
     allowance = _STEP_ALLOWANCE[encoding]
     report = (
-        f"over the budget, (scan, budget): C {over_c}, Python {over_python}; "
+        f"over the budget, (scan, budget): C {over_c}, Python {over_python}, "
+        f"regex {over_patterns}; "
         f"scan C calls {dict(sorted(scan.c_calls.items()))}, "
         f"budget's {dict(sorted(budget.c_calls.items()))}; "
         f"scan Python calls {dict(sorted(scan_python.items()))}, "
-        f"budget's with {dict(_SCAN_ONLY_CALLS)} {dict(sorted(allowed_python.items()))}; "
+        f"budget's {dict(sorted(budget.python_calls.items()))}; "
         f"steps: scan {scan.steps}, budget {budget.steps} (allowance {allowance}), "
         f"scan at {_MB // 4} bytes {quarter.steps}; "
         f"CALL events: scan {scan.call_events}, budget {budget.call_events}"
@@ -1190,13 +1247,27 @@ def _within_budget(make, encoding: str = "utf-8") -> tuple[CallProfile, CallProf
         pytest.fail(f"a profile did not see its entry function start once: {report}")
     if scan.call_events == 0 or (budget.c_calls and not scan.c_calls):
         pytest.fail(f"the scan's profile saw no calls: {report}")
-    if not scan.patterns <= budget.patterns:
+    scan_may_start = budget.outside_starts + _SCAN_ONLY_OUTSIDE_STARTS
+    for side, profile, allowed in (
+        ("budget", budget, _BUDGET_OUTSIDE_STARTS),
+        ("scan", scan, scan_may_start),
+        ("quarter-size scan", quarter, scan_may_start),
+    ):
+        beyond = _starts_beyond(profile.outside_starts, allowed)
+        if beyond:
+            pytest.fail(
+                f"the {side} started Python code outside its home beyond what it may "
+                f"start (its calls and steps are not counted): {beyond}; "
+                f"it may start: {[_where(code) for code in allowed]}"
+            )
+    new_patterns = sorted((k for k in over_patterns if not budget.patterns[k]), key=repr)
+    if new_patterns:
         pytest.fail(
             "pattern changed: measure the new pattern and update the budget copy; "
-            f"the scan ran {sorted(scan.patterns - budget.patterns, key=repr)}, "
+            f"the scan ran {new_patterns}, "
             f"the budget runs {sorted(budget.patterns, key=repr)}"
         )
-    if over_c or over_python:
+    if over_c or over_python or over_patterns:
         pytest.fail(report)
     if scan.steps > budget.steps + allowance or scan.steps > quarter.steps:
         pytest.fail(report)
@@ -1207,9 +1278,10 @@ def test_the_scans_patterns_are_the_budgets_copies():
     """Each regex the scan runs is the budget's copy, pattern text and flags (#1512).
 
     The call counts see one `Pattern.search` whatever the pattern costs, so a costlier
-    or swapped pattern would pass them; this pins the named patterns, and
-    `_within_budget` fails a pattern the budget never runs. Changing a pattern is a
-    reviewed decision: measure the new one and update the budget's copy."""
+    pattern under the same name would pass them; this pins the named patterns, and
+    `_within_budget` fails a pattern the budget never runs, or one run more times than
+    the budget runs it (one of the scan's patterns run in place of another). Changing a
+    pattern is a reviewed decision: measure the new one and update the budget's copy."""
     import herd_common.validation_errors as scan_module
 
     copies = {
