@@ -1342,3 +1342,54 @@ async def test_the_bound_is_exact_one_byte_over_is_refused(client, monkeypatch):
             "msg": f"Request body is larger than {len(body) - 1} bytes",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_the_templates_import_is_held_to_the_same_bound(client, monkeypatch):
+    """INV-BULK-23 says "an import upload", which covers templates too.
+
+    Mutation-checked: reverting `import_templates_endpoint` to
+    `await file.read()` makes this fail.
+    """
+    from unittest.mock import patch
+
+    from app.routers import bulk as bulk_router
+
+    monkeypatch.setattr(bulk_router, "IMPORT_UPLOAD_BYTES", 16)
+    # A valid template body, so the only thing that can refuse it is the size.
+    body = json.dumps([{"name": "Firewall"}]).encode()
+    assert len(body) > 16
+
+    with patch("app.routers.bulk.import_templates", side_effect=AssertionError("parsed")) as parse:
+        resp = await client.post(
+            "/templates/import",
+            params={"format": "json"},
+            files={"file": ("big.json", io.BytesIO(body), "application/json")},
+        )
+
+    assert resp.status_code == 413
+    detail = resp.json()["detail"][0]
+    assert detail["type"] == "body_too_large"
+    assert "Request body is larger than 16 bytes" in detail["msg"]
+    parse.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_read_asks_for_exactly_one_byte_past_the_bound(monkeypatch):
+    """The bound is exact because the read asks for one byte past it.
+
+    Mutation-checked: replacing `file.read(limit + 1)` with `file.read()` while
+    keeping the length check makes this fail.
+    """
+    from app.routers import bulk as bulk_router
+
+    asked: list[int] = []
+
+    class _File:
+        async def read(self, size: int = -1) -> bytes:
+            asked.append(size)
+            return b""
+
+    await bulk_router._read_capped(_File(), 4096)
+
+    assert asked == [4097]

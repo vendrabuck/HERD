@@ -39,25 +39,28 @@ from app.services.bulk_service import (
 
 router = APIRouter(tags=["bulk"])
 
-# The import file bound for the request body limit (issue #1466). The import routes
-# read the whole upload with no bound of their own (issue #1417, still open), so this
-# is the only bound on the file: a body may hold it plus MAX_REQUEST_BODY_BYTES.
+# The import file bound, and the extra the route declares for the request body
+# limit (issue #1466). It caps the file itself: `_read_capped` reads one byte
+# past it and refuses the rest, so unlike the envelope this cap does not grow
+# when an operator raises MAX_REQUEST_BODY_BYTES.
 IMPORT_UPLOAD_BYTES = 10 * 1024 * 1024
 
 
 async def _read_capped(file: UploadFile, limit: int) -> bytes:
-    """Read an upload in chunks, refusing anything past ``limit`` (issue #1417).
+    """Read one upload, up to ``limit``, and refuse a longer one (issue #1417).
 
-    The route's ``extends_body_limit`` bound is on the request body, which is the
-    whole multipart envelope: a file may be that size plus the form overhead. This
-    is the exact per-file bound, applied to the file itself.
+    A single ``file.read(limit + 1)``, then a length check: reading one byte past
+    the bound is what makes the refusal exact at the byte. The route's
+    ``extends_body_limit`` bound is on the request body, the whole multipart
+    envelope, so a file may be that size plus the form overhead; this is the
+    per-file bound, and it does not grow when an operator raises
+    ``MAX_REQUEST_BODY_BYTES``.
 
-    By the time a route calls ``file.read()`` Starlette has already received the
-    upload and spooled it to a temporary file, so this does not stop the upload
-    early. It bounds what is copied into memory, which is the part that mattered:
-    the whole file used to be held several times over (bytes, decoded string,
-    parsed objects) before being parsed on the event loop. Reading one byte past
-    the bound is what makes the check exact rather than reading in chunks.
+    Starlette has already received the upload and spooled it to a temporary file
+    by the time a route reads it, so this does not stop the upload early. It
+    bounds what is copied out of the spool into memory. A file up to 10 MiB is
+    still decoded and parsed on the event loop, the loop every reservation and
+    topology read depends on; step 2 of #1417 is not done here.
 
     The 413 is the one the body-limit middleware builds, so a client cannot tell
     the two apart.

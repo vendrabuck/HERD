@@ -1225,13 +1225,15 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   "Request body is larger than <limit> bytes"}`, and nothing is parsed or written. The
   route's own `extends_body_limit` bound covers the whole multipart envelope; this is the
   exact per-file bound, applied to the bytes read. The read asks for one byte past the
-  bound, so the check is exact and a file one byte over it is refused.
+  bound, so the check is exact and a file one byte over it is refused, and the cap does
+  not grow when an operator raises `MAX_REQUEST_BODY_BYTES` the way the envelope does.
   Note that Starlette has already received the whole upload and spooled it to a
-  temporary file by the time the route reads it, so the chunking bounds what is copied
-  into memory and not the upload itself. The same bound and answer apply to cabling's
+  temporary file by the time the route reads it, so this bounds what is copied out of
+  the spool into memory and not the upload itself; a file up to 10 MiB is still decoded
+  and parsed on the event loop. The same bound and answer apply to cabling's
   topology import (`TOPO-BULK-20`). \
   Enforced in: `services/inventory/app/routers/bulk.py` (`IMPORT_UPLOAD_BYTES`, `_read_capped`); `services/cabling/app/routes/bulk.py` (`_read_capped`) \
-  Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_bulk_upload_over_the_bound_is_refused_before_any_parse`, `test_an_upload_at_the_bound_is_accepted`, `test_the_bound_is_exact_one_byte_over_is_refused`); `services/cabling/tests/test_bulk.py` (`test_a_topology_upload_over_the_bound_is_a_413`)
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_bulk_upload_over_the_bound_is_refused_before_any_parse`, `test_an_upload_at_the_bound_is_accepted`, `test_the_bound_is_exact_one_byte_over_is_refused`, `test_the_templates_import_is_held_to_the_same_bound`, `test_the_read_asks_for_exactly_one_byte_past_the_bound`); `services/cabling/tests/test_bulk.py` (`test_a_topology_upload_over_the_bound_is_a_413`, `test_the_bound_is_exact_one_byte_over_is_refused`, `test_the_read_asks_for_exactly_one_byte_past_the_bound`)
 - **INV-BULK-21.** A device export, CSV or JSON, leaves out every dynamic-instance device
   (a device carrying a `request_id`); every other device is exported. An instance device
   lives only as long as its reservation, and its dynamic template cannot hold a device,
