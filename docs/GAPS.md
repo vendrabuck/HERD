@@ -166,7 +166,7 @@ clients have a suite but stay below 85% lines on error and edge-case branches:
 
 ## E2E
 
-`tests/e2e/` has 73 test files and 230 tests across Selenium and Playwright (the
+`tests/e2e/` has 74 test files and 232 tests across Selenium and Playwright (the
 three in `test_oidc_login_playwright.py` run only in the OIDC-mode stack phase and
 skip as exempt elsewhere; the 2026-11-12 nightly collected 221 unseeded: 157 passed, 63 skipped, 1 failed; the v0.7.0 release gate ran 206: 148 passed and 58 skipped unseeded, 202 passed and 4 exempt skips seeded; see README.md's Testing section). Remaining UI gaps:
 
@@ -194,15 +194,18 @@ templates list, ACL check, bulk export (devices/templates/topologies, JSON and C
 plus a dry-run import), notifications (unread-count, list, preferences write), a
 routed-topology validation task, bulk connection creation (`POST /connections/bulk`),
 and device configuration (`DeviceConfigUser`: config versions, the config-schema
-proxy, and the apply-job list on a device of its own; no apply or schedule).
+proxy, and the apply-job list on a device of its own; no apply or schedule), the
+login attempt limit (`LoginLimitProbe`), bodies over the request body limit
+(`OversizedBodySender`), and a canvas save over the default limit (`LargeCanvasSaver`:
+it creates one topology, saves the same large canvas to it, and deletes it).
 `OidcLoginUser` (ADR 0016 phase 5b) drives the single sign-on chain through the OIDC
 test provider, only in the OIDC-mode stack phase (`HERD_LOAD_OIDC=1`); a 30 s run of
 five users, so it shows the chain holds under concurrency and the flow table is
 pruned, not a throughput figure.
 Missing coverage:
 
-- [MEDIUM] Topology write endpoints (create, update, canvas save, versions) beyond
-  the bulk export path.
+- [MEDIUM] Topology write endpoints (update other than `LargeCanvasSaver`'s repeated
+  save of one unchanged canvas, versions) beyond the bulk export path.
 - [MEDIUM] Drivers: list, upload, download.
 - [LOW] Reporting, pathfinding, AI.
 
