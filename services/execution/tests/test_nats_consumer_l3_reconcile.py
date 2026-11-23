@@ -36,6 +36,7 @@ from app.services.nats_consumer import (
 )
 from app.services.route_service import record_route_active, record_route_failed
 from herd_common.l3_route_identity import route_identity_key
+from herd_common.l3_route_limit import MAX_ROUTES_PER_SWITCH
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -2069,3 +2070,344 @@ async def test_manual_retry_config_read_token_refusal_reports_still_failed(statu
     assert [r["outcome"] for r in result["results"]] == ["reconnected"]
     assert {d for a, d in calls if a == "configure_route"} == {r["destination"] for r in ROUTES}
     assert unexpected == []
+
+
+# --- Issue #1493: the per-switch route limit at drive time --------------------
+# Cabling refuses a save over the limit, so these are the paths it cannot see: intent
+# stored before the limit existed (the gate), a switch's configured routes and a pin
+# reused verbatim (the provision choke point in `_apply_l3_adjacency`), and a retry
+# of either. Every refusal is the fixed reason, before any driver call.
+
+
+def _limit_routes(count, start=0):
+    return [
+        {"destination": f"10.{i // 256}.{i % 256}.0/24", "next_hop": None, "interface": "eth0"}
+        for i in range(start, start + count)
+    ]
+
+
+def _limit_intent(count):
+    return [_intent_route(r["destination"], r["interface"]) for r in _limit_routes(count)]
+
+
+def _counting_config_fetch(config_by_switch):
+    reads = []
+
+    async def _fetch(device_id, client=None):
+        reads.append(str(device_id))
+        return config_by_switch.get(str(device_id))
+
+    return _fetch, reads
+
+
+async def test_gate_refuses_an_over_limit_stored_intent_with_no_driver_call_or_read():
+    """An intent of 1,001 routes stored before the limit existed lands the newly
+    adjacent switch FAILED `l3_too_many_routes` recording nothing installed, with no
+    driver call and not even the gate's config read."""
+    config_fetch, reads = _counting_config_fetch(CONFIG_BY_SWITCH)
+    calls = await _reconcile(
+        L3_WIRES,
+        l3_routes={SW_L3: _limit_intent(MAX_ROUTES_PER_SWITCH + 1)},
+        config_fetch=config_fetch,
+    )
+    assert calls == []
+    assert reads == []
+    [row] = await _rows()
+    assert (row.status, row.intended, row.last_error) == ("FAILED", "ACTIVE", "l3_too_many_routes")
+    assert row.routes == []
+    assert row.attempts == 0
+
+
+async def test_gate_refuses_an_over_limit_delta_and_keeps_the_previous_pin():
+    await _reconcile(L3_WIRES, fork_version=1, l3_routes={SW_L3: [_intent_route(ROUTE_A, "eth1")]})
+    execute_fn, calls = _l3_recorder()
+    await _reconcile(
+        L3_WIRES,
+        fork_version=2,
+        l3_routes={SW_L3: _limit_intent(MAX_ROUTES_PER_SWITCH + 1)},
+        execute_fn=execute_fn,
+        calls=calls,
+    )
+    assert calls == []
+    [row] = await _rows()
+    assert (row.status, row.last_error) == ("FAILED", "l3_too_many_routes")
+    assert [r["destination"] for r in row.routes] == [ROUTE_A]
+
+
+async def test_gate_passes_an_intent_at_the_limit_counting_a_duplicate_once():
+    from app.services.nats_consumer import _gate_l3_drive_routes
+
+    intent = _limit_intent(MAX_ROUTES_PER_SWITCH)
+    intent_with_duplicate = intent + [dict(intent[0])]
+    with patch(
+        "app.services.nats_consumer._fetch_latest_config",
+        new=AsyncMock(side_effect=_config_fetch),
+    ):
+        clean, reason = await _gate_l3_drive_routes(
+            SW_L3,
+            intent_with_duplicate,
+            _FetchContext(None),
+            _db_session_factory(),
+            wired_ports=set(),
+        )
+        assert reason is None
+        assert clean == intent_with_duplicate
+        clean, reason = await _gate_l3_drive_routes(
+            SW_L3,
+            _limit_intent(MAX_ROUTES_PER_SWITCH + 1),
+            _FetchContext(None),
+            _db_session_factory(),
+            wired_ports=set(),
+        )
+        assert (clean, reason) == ([], "l3_too_many_routes")
+
+
+async def test_configured_routes_over_the_limit_are_refused_with_no_driver_call():
+    """The inventory-config path: no intent, and the switch's latest config carries
+    1,001 routes. The provision is refused at the choke point; nothing is recorded as
+    installed, so a config edit under the limit is driven by the next pass."""
+    config = {
+        SW_L3: {"id": DEFAULT_CFG_VERSION_ID, "config": {"routes": _limit_routes(1001)}},
+    }
+    config_fetch, _reads = _counting_config_fetch(config)
+    calls = await _reconcile(L3_WIRES, l3_routes={}, config_fetch=config_fetch)
+    assert calls == []
+    [row] = await _rows()
+    assert (row.status, row.intended, row.last_error) == ("FAILED", "ACTIVE", "l3_too_many_routes")
+    assert row.routes == []
+
+    config[SW_L3]["config"]["routes"] = _limit_routes(2)
+    calls = await _reconcile(L3_WIRES, fork_version=2, l3_routes={}, config_fetch=config_fetch)
+    assert {d for a, d in calls if a == "configure_route"} == {"10.0.0.0/24", "10.0.1.0/24"}
+    assert await _active_switches() == {SW_L3}
+
+
+async def test_configured_routes_at_the_limit_drive_once_each_even_when_duplicated():
+    """1,000 distinct configured routes plus a duplicate of each are at the limit, and
+    the drive configures each distinct route exactly once and pins the 1,000."""
+    routes = _limit_routes(MAX_ROUTES_PER_SWITCH)
+    config = {SW_L3: {"id": DEFAULT_CFG_VERSION_ID, "config": {"routes": routes + routes}}}
+    config_fetch, _reads = _counting_config_fetch(config)
+    calls = await _reconcile(L3_WIRES, l3_routes={}, config_fetch=config_fetch)
+    configured = [d for a, d in calls if a == "configure_route"]
+    assert len(configured) == MAX_ROUTES_PER_SWITCH
+    assert len(set(configured)) == MAX_ROUTES_PER_SWITCH
+    [row] = await _rows("ACTIVE")
+    assert row.routes == routes
+
+
+async def test_a_retry_refuses_a_pin_stored_over_the_limit_and_keeps_it():
+    """A FAILED intended-ACTIVE pin recorded before the limit, with no intent: the
+    retry channel would drive the row's own routes verbatim, and the choke point
+    refuses them, keeps them recorded (they may be installed), and counts one attempt
+    so the tick's attempts cap ends the retries."""
+    stored = _limit_routes(MAX_ROUTES_PER_SWITCH + 1)
+    async with TestSessionLocal() as db:
+        await record_route_failed(db, RES_ID, SW_L3, stored, 1, "boom", intended="ACTIVE")
+
+    execute_fn, calls = _l3_recorder()
+    stats = await _retry_tick(execute_fn)
+    assert calls == []
+    assert stats["reconnected"] == 0
+    [row] = await _rows()
+    assert (row.status, row.intended, row.last_error) == ("FAILED", "ACTIVE", "l3_too_many_routes")
+    assert row.routes == stored
+    assert row.attempts == 2
+
+
+async def test_a_reconcile_refusal_keeps_the_routes_a_failed_row_records():
+    """The reconcile path (no retry row id, the key-based write): a switch with no
+    intent whose FAILED pin records more routes than the limit (stored before it) is
+    rebuilt from those routes (WIRE-L3-3) and refused at the choke point. The refusal
+    keeps what the row records as possibly installed; it must never overwrite it with
+    an empty list, which would forget routes that may be on the switch."""
+    stored = _limit_routes(MAX_ROUTES_PER_SWITCH + 1)
+    async with TestSessionLocal() as db:
+        await record_route_failed(db, RES_ID, SW_L3, stored, 1, "boom", intended="ACTIVE")
+
+    calls = await _reconcile(L3_WIRES, l3_routes={})
+    assert calls == []
+    [row] = await _rows()
+    assert (row.status, row.intended, row.last_error) == ("FAILED", "ACTIVE", "l3_too_many_routes")
+    assert row.routes == stored
+    assert row.attempts == 1, "the reconcile path counts no attempt"
+
+
+def _row_state(row):
+    return (
+        row.status,
+        row.intended,
+        row.attempts,
+        row.last_error,
+        row.claimed_until,
+        row.routes,
+    )
+
+
+async def _seed_retry_row(routes):
+    async with TestSessionLocal() as db:
+        row = await record_route_failed(db, RES_ID, SW_L3, routes, 1, "boom", intended="ACTIVE")
+        return row.id
+
+
+async def _retry_refusal(row_id, claims):
+    """Drive one over-limit provision through `_apply_l3_adjacency` the way a retry
+    pass does (its loaded row id and its claim ledger), as if the pass planned it
+    before the row changed."""
+    item = {"device_id": SW_L3, "routes": _limit_routes(MAX_ROUTES_PER_SWITCH + 1)}
+    with patch("app.services.driver_sandbox.execute_driver_method") as sandbox:
+        await _apply_l3_adjacency(
+            RES_ID,
+            [],
+            [item],
+            _FetchContext(None),
+            _db_session_factory(),
+            retry_row_ids={SW_L3: row_id},
+            claims=claims,
+        )
+    sandbox.assert_not_called()
+
+
+async def test_a_retry_refusal_writes_nothing_on_a_row_parked_since_it_was_planned():
+    """WIRE-CLAIM-10: a retry's route-limit refusal is a compare-and-swap on the row id,
+    taken before any claim, so a row parked intended RELEASED after the pass planned
+    its build keeps every value, and the refusal is classed as wrong direction."""
+    from app.services.route_service import park_stale_route_build
+    from app.services.wiring_claim import WiringRowClaims
+
+    row_id = await _seed_retry_row(_limit_routes(3))
+    async with TestSessionLocal() as db:
+        await park_stale_route_build(db, row_id, "build intent gone; pending release")
+    [before] = await _rows()
+    assert before.intended == "RELEASED"
+
+    claims = WiringRowClaims()
+    await _retry_refusal(row_id, claims)
+    [after] = await _rows()
+    assert _row_state(after) == _row_state(before)
+    assert claims.wrong_direction == {row_id}
+
+
+async def test_a_retry_refusal_writes_nothing_on_a_row_another_pass_holds():
+    from datetime import datetime, timedelta, timezone
+
+    from app.services.wiring_claim import WiringRowClaims
+
+    row_id = await _seed_retry_row(_limit_routes(3))
+    async with TestSessionLocal() as db:
+        row = await db.get(RouteAssignment, row_id)
+        row.claimed_until = datetime.now(timezone.utc) + timedelta(hours=1)
+        await db.commit()
+    [before] = await _rows()
+
+    claims = WiringRowClaims()
+    await _retry_refusal(row_id, claims)
+    [after] = await _rows()
+    assert _row_state(after) == _row_state(before)
+    assert claims.lost == {row_id}
+
+
+async def test_a_retry_refusal_writes_nothing_on_a_row_released_since_and_inserts_none():
+    from app.services.wiring_claim import WiringRowClaims
+
+    row_id = await _seed_retry_row(_limit_routes(3))
+    async with TestSessionLocal() as db:
+        row = await db.get(RouteAssignment, row_id)
+        row.status = "RELEASED"
+        row.intended = "RELEASED"
+        await db.commit()
+    [before] = await _rows()
+
+    await _retry_refusal(row_id, WiringRowClaims())
+    rows = await _rows()
+    assert len(rows) == 1, "a refusal on a released row must not resurrect the pin"
+    assert _row_state(rows[0]) == _row_state(before)
+
+
+async def test_the_route_limit_refusal_comes_before_the_residue_read_claim_and_load():
+    """WIRE-L3-20's order: an over-limit provision is refused before the residue read,
+    the drive claim, the switch read, the template read, and the driver load, so none
+    of them runs. Driven as a retry, the one caller that claims."""
+    from app.services import route_service
+    from app.services.wiring_claim import WiringRowClaims
+
+    row_id = await _seed_retry_row(_limit_routes(3))
+
+    class _SpyClaims(WiringRowClaims):
+        def __init__(self):
+            super().__init__()
+            self.claim_calls = 0
+
+        async def claim(self, *args, **kwargs):
+            self.claim_calls += 1
+            return await super().claim(*args, **kwargs)
+
+    claims = _SpyClaims()
+    residue_read = AsyncMock(side_effect=route_service.possibly_installed_routes)
+    device_read = AsyncMock(side_effect=_device_fetch)
+    template_read = AsyncMock(return_value=TEMPLATE_DATA)
+    driver_load = AsyncMock(return_value="/tmp/driver")
+    with (
+        patch("app.services.route_service.possibly_installed_routes", new=residue_read),
+        patch("app.services.nats_consumer._fetch_device", new=device_read),
+        patch("app.services.nats_consumer._fetch_template", new=template_read),
+        patch("app.services.driver_loader.load_driver", new=driver_load),
+    ):
+        await _retry_refusal(row_id, claims)
+
+    assert claims.claim_calls == 0
+    residue_read.assert_not_awaited()
+    device_read.assert_not_awaited()
+    template_read.assert_not_awaited()
+    driver_load.assert_not_awaited()
+    [row] = await _rows()
+    assert (row.status, row.intended, row.last_error) == ("FAILED", "ACTIVE", "l3_too_many_routes")
+    assert row.attempts == 2
+
+
+async def test_a_reconcile_route_limit_refusal_after_the_freeze_keeps_the_teardown_park():
+    """WIRE-L3-20 with WIRE-LEDGER-17: a reconcile planned, before the freeze, to
+    rebuild a FAILED pin stored over the limit verbatim (WIRE-L3-3). The reservation
+    then ends: the teardown parks the pin intended RELEASED and its removal fails (the
+    login), so the pin is release-direction work that only the retry channels finish.
+    The late reconcile then reaches the route-limit refusal, which is the key-based
+    write (no retry row id). On the frozen reservation that write records the
+    teardown's park, so the pin stays intended RELEASED with the routes it records, and
+    the refusal makes no driver call. Before #1501 it set the pin back to intended
+    ACTIVE, which no pass drives on a frozen reservation, stranding its routes."""
+    from app.models.reservation_wiring_state import ReservationWiringState
+    from app.services.route_service import TEARDOWN_PENDING_REMOVAL
+
+    stored = _limit_routes(MAX_ROUTES_PER_SWITCH + 1)
+    async with TestSessionLocal() as db:
+        await record_route_failed(db, RES_ID, SW_L3, stored, 1, "boom", intended="ACTIVE")
+        db.add(ReservationWiringState(reservation_id=uuid.UUID(RES_ID), frozen=True))
+        await db.commit()
+
+    execute_fn, calls = _l3_recorder(fail={"login"})
+    await _teardown(execute_fn)
+    assert not any(a == "remove_route" for a, _d in calls)
+    [parked] = await _rows()
+    assert (parked.status, parked.intended) == ("FAILED", "RELEASED")
+    assert parked.routes == stored
+
+    with patch("app.services.driver_sandbox.execute_driver_method") as sandbox:
+        await _apply_l3_adjacency(
+            RES_ID,
+            [],
+            [{"device_id": SW_L3, "routes": stored}],
+            _FetchContext(None),
+            _db_session_factory(),
+        )
+    sandbox.assert_not_called()
+
+    [row] = await _rows()
+    assert row.id == parked.id
+    assert (row.status, row.intended, row.attempts, row.last_error) == (
+        "FAILED",
+        "RELEASED",
+        0,
+        TEARDOWN_PENDING_REMOVAL,
+    ), "the refusal must not set the parked pin back to a build"
+    assert row.routes == stored
+    assert row.claimed_until is None

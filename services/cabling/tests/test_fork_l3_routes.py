@@ -43,6 +43,7 @@ from app.services.fork_service import create_fork
 from app.services.l3_intent import RouteSpec, parse_l3_intent, walk_l3_nodes
 from app.services.l3_validation import L3ValidationResult
 from fastapi import HTTPException
+from herd_common.l3_route_limit import MAX_ROUTES_PER_SWITCH
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -792,6 +793,74 @@ async def test_save_route_422_on_malformed_intent(client):
     )
     assert save_resp.status_code == 422
     assert save_resp.json()["detail"]["error"] == "l3_intent_malformed"
+
+
+# --- issue #1493: the per-switch route limit at the real /save route ---
+
+
+def _numbered_routes(count: int) -> list[dict]:
+    return [
+        {"destination": f"10.{i // 256}.{i % 256}.0/24", "interface": "eth0"} for i in range(count)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_save_route_422_when_a_switch_is_over_the_route_limit(client):
+    """One route over the per-switch limit answers 422 l3_intent_malformed naming the
+    switch and the limit, before any inventory call, and stores no route."""
+    switch = uuid.uuid4()
+    rid = uuid.uuid4()
+    resp = await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": [str(switch)]},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 201, resp.text
+    fork_id = uuid.UUID(resp.json()["fork_id"])
+
+    canvas = _l3_canvas([(switch, {"routes": _numbered_routes(MAX_ROUTES_PER_SWITCH + 1)})])
+    with patch("app.services.l3_validation.call_service") as call_service_mock:
+        save_resp = await client.post(
+            f"/internal/forks/{rid}/save",
+            json={"canvas_data": canvas, "member_device_ids": [str(switch)]},
+            headers=_hdr(),
+        )
+    assert save_resp.status_code == 422, save_resp.text
+    assert save_resp.json()["detail"] == {
+        "error": "l3_intent_malformed",
+        "node_id": "n0",
+        "message": f"switch {switch} has 1001 distinct routes; a switch carries at most 1000",
+    }
+    call_service_mock.assert_not_called()
+    assert await _l3_rows(fork_id) == []
+
+
+@pytest.mark.asyncio
+async def test_save_route_stores_a_switch_at_the_route_limit(client):
+    """Exactly the limit, plus a duplicate of one route, saves and stores the limit."""
+    switch = uuid.uuid4()
+    rid = uuid.uuid4()
+    resp = await client.post(
+        "/internal/forks",
+        json={"reservation_id": str(rid), "member_device_ids": [str(switch)]},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 201, resp.text
+    fork_id = uuid.UUID(resp.json()["fork_id"])
+
+    routes = _numbered_routes(MAX_ROUTES_PER_SWITCH)
+    canvas = _l3_canvas([(switch, {"routes": routes + routes[:1]})])
+    with patch(
+        "app.services.fork_save_service.validate_canvas_l3",
+        new=AsyncMock(return_value=_no_invalid()),
+    ):
+        save_resp = await client.post(
+            f"/internal/forks/{rid}/save",
+            json={"canvas_data": canvas, "member_device_ids": [str(switch)]},
+            headers=_hdr(),
+        )
+    assert save_resp.status_code == 200, save_resp.text
+    assert len(await _l3_rows(fork_id)) == MAX_ROUTES_PER_SWITCH
 
 
 # --- R3: lock ordering at the real /save route ---

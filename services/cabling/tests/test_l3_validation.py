@@ -189,6 +189,28 @@ async def test_malformed_shape_reports_l3_malformed_and_suppresses_per_route():
     assert calls == []
 
 
+@pytest.mark.asyncio
+async def test_a_switch_over_the_route_limit_reports_l3_malformed_naming_it():
+    """Issue #1493: the per-switch route limit reaches the validate routes (and so
+    reservation create) as an l3_malformed entry carrying the limit message, with no
+    inventory call."""
+    await _seed_physical_connection()
+    routes = [
+        {"destination": f"10.{i // 256}.{i % 256}.0/24", "interface": "eth1"} for i in range(1001)
+    ]
+    mock, calls = _mock_call_service()
+    with patch.object(l3_validation, "call_service", mock):
+        result = await _validate(_canvas({"routes": routes}))
+    assert result.valid is False
+    [entry] = result.invalid_routes
+    assert entry.reason == "l3_malformed"
+    assert entry.device_id == SWITCH
+    assert (
+        entry.detail == f"switch {SWITCH} has 1001 distinct routes; a switch carries at most 1000"
+    )
+    assert calls == []
+
+
 # --- l3_not_a_router ---
 
 
