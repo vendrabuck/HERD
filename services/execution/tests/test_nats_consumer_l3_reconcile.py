@@ -2363,3 +2363,51 @@ async def test_the_route_limit_refusal_comes_before_the_residue_read_claim_and_l
     [row] = await _rows()
     assert (row.status, row.intended, row.last_error) == ("FAILED", "ACTIVE", "l3_too_many_routes")
     assert row.attempts == 2
+
+
+async def test_a_reconcile_route_limit_refusal_after_the_freeze_keeps_the_teardown_park():
+    """WIRE-L3-20 with WIRE-LEDGER-17: a reconcile planned, before the freeze, to
+    rebuild a FAILED pin stored over the limit verbatim (WIRE-L3-3). The reservation
+    then ends: the teardown parks the pin intended RELEASED and its removal fails (the
+    login), so the pin is release-direction work that only the retry channels finish.
+    The late reconcile then reaches the route-limit refusal, which is the key-based
+    write (no retry row id). On the frozen reservation that write records the
+    teardown's park, so the pin stays intended RELEASED with the routes it records, and
+    the refusal makes no driver call. Before #1501 it set the pin back to intended
+    ACTIVE, which no pass drives on a frozen reservation, stranding its routes."""
+    from app.models.reservation_wiring_state import ReservationWiringState
+    from app.services.route_service import TEARDOWN_PENDING_REMOVAL
+
+    stored = _limit_routes(MAX_ROUTES_PER_SWITCH + 1)
+    async with TestSessionLocal() as db:
+        await record_route_failed(db, RES_ID, SW_L3, stored, 1, "boom", intended="ACTIVE")
+        db.add(ReservationWiringState(reservation_id=uuid.UUID(RES_ID), frozen=True))
+        await db.commit()
+
+    execute_fn, calls = _l3_recorder(fail={"login"})
+    await _teardown(execute_fn)
+    assert not any(a == "remove_route" for a, _d in calls)
+    [parked] = await _rows()
+    assert (parked.status, parked.intended) == ("FAILED", "RELEASED")
+    assert parked.routes == stored
+
+    with patch("app.services.driver_sandbox.execute_driver_method") as sandbox:
+        await _apply_l3_adjacency(
+            RES_ID,
+            [],
+            [{"device_id": SW_L3, "routes": stored}],
+            _FetchContext(None),
+            _db_session_factory(),
+        )
+    sandbox.assert_not_called()
+
+    [row] = await _rows()
+    assert row.id == parked.id
+    assert (row.status, row.intended, row.attempts, row.last_error) == (
+        "FAILED",
+        "RELEASED",
+        0,
+        TEARDOWN_PENDING_REMOVAL,
+    ), "the refusal must not set the parked pin back to a build"
+    assert row.routes == stored
+    assert row.claimed_until is None

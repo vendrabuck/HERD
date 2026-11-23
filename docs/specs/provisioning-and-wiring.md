@@ -1141,18 +1141,21 @@ removes exactly that when the switch is no longer needed.
   one from a retry. On the retry path the write is the row-id compare-and-swap of
   WIRE-CLAIM-10: a row that no longer intends `ACTIVE`, is no longer FAILED, or is held
   by another pass is not written. On the reconcile path it is the key-based write the
-  gate's refusals use, which does not re-check a freeze, so a refusal that lands after
-  the teardown parked the row sets it back to intended `ACTIVE` (a known limit of that
-  writer). Removals are never limited: a deprovision, a delta's removals, and a
-  provision's residue (WIRE-L3-19) are driven whatever their count, since refusing one
-  would leave routes installed. The reason is retryable. A refused row that records no
+  gate's refusals use, so on a frozen reservation it records the teardown's park
+  instead (WIRE-LEDGER-17): `FAILED` intended `RELEASED`, attempts 0, the reason
+  `TEARDOWN_PENDING_REMOVAL`, the routes stored as above. A refusal that lands after the
+  teardown parked the row therefore leaves it intended `RELEASED` with the routes it
+  records, for the release-direction retry channels, apart from the stale read that
+  section 13 states for every key-based write. Removals are never limited: a
+  deprovision, a delta's removals, and a provision's residue (WIRE-L3-19) are driven
+  whatever their count, since refusing one would leave routes installed. The reason is retryable. A refused row that records no
   routes falls back to the configured routes (WIRE-L3-3), so a config trimmed under
   the limit is driven by the next reconcile, a manual retry, or the background retry
   while the row is under `WIRING_RETRY_MAX_ATTEMPTS`; a refused row that records
   routes is re-driven from them, so a config trim does not help it, and new intent
   under the limit, the switch leaving the fork's wiring, or the teardown settles it. \
   Enforced in: `services/common/herd_common/l3_route_limit.py` (`MAX_ROUTES_PER_SWITCH`, `route_limit_exceeded`, `distinct_route_count`); `services/execution/app/services/nats_consumer.py` (`_gate_l3_drive_routes`, `_apply_l3_adjacency`, `_l3_route_set_over_limit`, `L3_TOO_MANY_ROUTES_REASON`) \
-  Pinned by: `services/common/tests/test_l3_route_limit.py` (`test_the_limit_is_the_owners_one_thousand`, `test_at_the_limit_is_allowed_and_one_over_is_refused`, `test_distinct_route_count_counts_a_duplicate_once`, `test_distinct_route_count_uses_the_shared_identity_not_raw_dicts`, `test_limit_plus_duplicates_is_still_at_the_limit`); `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_gate_refuses_an_over_limit_stored_intent_with_no_driver_call_or_read`, `test_gate_refuses_an_over_limit_delta_and_keeps_the_previous_pin`, `test_gate_passes_an_intent_at_the_limit_counting_a_duplicate_once`, `test_configured_routes_over_the_limit_are_refused_with_no_driver_call`, `test_configured_routes_at_the_limit_drive_once_each_even_when_duplicated`, `test_a_retry_refuses_a_pin_stored_over_the_limit_and_keeps_it`, `test_a_reconcile_refusal_keeps_the_routes_a_failed_row_records`, `test_a_retry_refusal_writes_nothing_on_a_row_parked_since_it_was_planned`, `test_a_retry_refusal_writes_nothing_on_a_row_another_pass_holds`, `test_a_retry_refusal_writes_nothing_on_a_row_released_since_and_inserts_none`, `test_the_route_limit_refusal_comes_before_the_residue_read_claim_and_load`)
+  Pinned by: `services/common/tests/test_l3_route_limit.py` (`test_the_limit_is_the_owners_one_thousand`, `test_at_the_limit_is_allowed_and_one_over_is_refused`, `test_distinct_route_count_counts_a_duplicate_once`, `test_distinct_route_count_uses_the_shared_identity_not_raw_dicts`, `test_limit_plus_duplicates_is_still_at_the_limit`); `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_gate_refuses_an_over_limit_stored_intent_with_no_driver_call_or_read`, `test_gate_refuses_an_over_limit_delta_and_keeps_the_previous_pin`, `test_gate_passes_an_intent_at_the_limit_counting_a_duplicate_once`, `test_configured_routes_over_the_limit_are_refused_with_no_driver_call`, `test_configured_routes_at_the_limit_drive_once_each_even_when_duplicated`, `test_a_retry_refuses_a_pin_stored_over_the_limit_and_keeps_it`, `test_a_reconcile_refusal_keeps_the_routes_a_failed_row_records`, `test_a_retry_refusal_writes_nothing_on_a_row_parked_since_it_was_planned`, `test_a_retry_refusal_writes_nothing_on_a_row_another_pass_holds`, `test_a_retry_refusal_writes_nothing_on_a_row_released_since_and_inserts_none`, `test_the_route_limit_refusal_comes_before_the_residue_read_claim_and_load`, `test_a_reconcile_route_limit_refusal_after_the_freeze_keeps_the_teardown_park`)
 
 **Out of scope.** What makes routing intent valid at save time (`topology.md`); config
 versions (`device-configuration.md`).
