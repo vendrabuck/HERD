@@ -38,7 +38,7 @@ still refused, with a structured 409 `driver_cannot_configure` detail naming the
 connection type and driver.
 
 This gate has two independent layers. Inventory's `_assert_driver_can_configure`
-(`services/manage_guard.py`) checks it first, before any call reaches execution or a job
+(`services/inventory/app/services/manage_guard.py`) checks it first, before any call reaches execution or a job
 row is created. Execution carries its own copy of the same check (`_assert_action_permitted`
 in `services/execution/app/services/execution_service.py`, issue #870): both
 `POST /execute` and `POST /execute/internal` refuse a `configure` action against a
