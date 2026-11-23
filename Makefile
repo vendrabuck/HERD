@@ -1235,6 +1235,8 @@ _gate-pg-live-tests:
 		uv run pytest tests/test_wiring_retry_due_predicate_live_pg.py -v) && \
 	(cd services/execution && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_vlan_release_cas_live_pg.py -v) && \
+	(cd services/execution && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_reservation_wide_allocation_check_live_pg.py -v) && \
 	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_reservation_status_cas_live_pg.py -v) && \
 	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
