@@ -4078,7 +4078,9 @@ async def _l3_driver_supports_vrf(switch_id: str, ctx: "_FetchContext", get_db_s
 
 # Issue #1493: the reason a switch whose route set is over the per-switch limit
 # (herd_common.l3_route_limit.MAX_ROUTES_PER_SWITCH) is recorded FAILED with, before
-# any driver call. A fixed code like the gate's other reasons: no driver or route text.
+# any driver call (on a frozen reservation the reconcile path's key-based write records
+# the teardown park instead: FAILED intended RELEASED, TEARDOWN_PENDING_REMOVAL,
+# WIRE-LEDGER-17). A fixed code like the gate's other reasons: no driver or route text.
 # Retryable (outside NON_RETRYABLE_REASON_PREFIXES). What a retry drives depends on the
 # row: a refused row that records no routes falls back to the switch's configured
 # routes (WIRE-L3-3), so a config trimmed under the limit is driven by the next
@@ -4372,7 +4374,9 @@ async def _apply_l3_adjacency(
     A provision's route set is deduplicated by route identity and then held to the
     per-switch route limit (issue #1493) before anything else is read: over the limit,
     the switch is recorded FAILED `l3_too_many_routes` with its existing routes kept
-    and no claim, load, or driver call. So a drive configures at most
+    and no claim, load, or driver call (on a frozen reservation the reconcile path's
+    key-based write records the teardown park instead: FAILED intended RELEASED,
+    `TEARDOWN_PENDING_REMOVAL`, WIRE-LEDGER-17). So a drive configures at most
     `MAX_ROUTES_PER_SWITCH` routes. A reconcile item needs no check here: its only
     producer builds it from intent that passed `_gate_l3_drive_routes`, which applies
     the same limit. Removals are never limited (a deprovision, a delta's removals, a
