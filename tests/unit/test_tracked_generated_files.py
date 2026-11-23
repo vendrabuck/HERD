@@ -3,9 +3,10 @@
 The repository's `.gitignore` is deliberately untracked, so a clone or a fork has no
 ignore rules at all, and `git add -A` there stages whatever the host generated. On
 2026-11-23 an external pull request (#1503, head bc274d23) committed 154 compiled
-`__pycache__` files across twelve directories under `services/` and the repo-root
-`tests/`. Its only red check was the format step, and nothing that step skipped would
-have refused a tracked generated file either. This guard does.
+`__pycache__` files in 28 directories: in eleven of the twelve services (all but
+`config`), in `services/common/`, and in the repo-root `tests/`. Its only red check
+was the format step, and nothing that step skipped would have refused a tracked
+generated file either. This guard does.
 
 The invariant: no path that `git ls-files` lists is a generated artifact. A path is
 one when it matches a rule of `RULES`, judged on whole path components and exact
@@ -13,13 +14,16 @@ names, never on substrings:
 
 - a path component (a directory, or the file name itself) named exactly
   `__pycache__`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `node_modules`,
-  `.venv`, or `htmlcov`;
+  `.venv`, `.env`, or `htmlcov` (so a `.env` file at any depth, and a virtualenv
+  named `.env`, are both refused);
 - a path component ending in `.egg-info`;
 - a file name ending in `.pyc`, `.pyo`, or `.pyd`;
 - a file named exactly `.coverage`, or `.coverage.` followed by at least one more
   character (the parallel-mode data files), at any depth;
-- a file named exactly `.env` at any depth;
 - a file named exactly `.DS_Store` at any depth.
+
+The last three rules read the file name only: a directory named `x.pyc`, `.coverage`,
+`.coverage.ci`, or `.DS_Store` is not refused for its name.
 
 So `docs/pyc_notes.md`, `services/x/cache/y.py`, `.env.example`, `my.pycx`,
 `node_modules_notes.md`, `services/inventory/.coveragerc`, and a file named `build`
@@ -46,6 +50,9 @@ Limits:
   compiled extension other than `.pyd` such as `.so`, an editor swap file), and a
   generated file committed and then removed, which history keeps but the index does
   not;
+- not refused by design: `.env.local`, `.env.production`, `.env.example`, and every
+  other `.env.<name>` file, since only a component named exactly `.env` is a rule;
+- names are matched case-sensitively, so `x.PYC`, `.ENV`, and `__PYCACHE__` pass;
 - the git environment of the caller is used as given, so `GIT_DIR` or
   `GIT_INDEX_FILE` set by a hook changes which index is read.
 """
@@ -68,6 +75,7 @@ GENERATED_DIRECTORY_NAMES = (
     ".mypy_cache",
     "node_modules",
     ".venv",
+    ".env",
     "htmlcov",
 )
 BYTECODE_SUFFIXES = (".pyc", ".pyo", ".pyd")
@@ -76,9 +84,11 @@ LISTED_OFFENDERS_CAP = 50
 
 REMEDY = (
     "Remove them from the index with `git rm -r --cached <path>` (the files stay on "
-    "disk) and amend the commit that added them, or commit the removal. This "
-    "repository tracks no ignore file, so add local patterns such as `__pycache__/` "
-    "to `.git/info/exclude` in your clone to keep them from being staged again."
+    "disk) and amend the commit that added them (then `git push --force-with-lease` "
+    "if it was already pushed), or commit the removal. This repository tracks no "
+    "`.gitignore`, so add local patterns such as `__pycache__/` to `.git/info/exclude` "
+    "in your clone (in a linked worktree, the path `git rev-parse --git-path "
+    "info/exclude` prints) to keep them from being staged again."
 )
 
 
@@ -111,7 +121,6 @@ RULES: tuple[tuple[str, Callable[[list[str]], bool]], ...] = (
     *((f"a `{suffix}` file", _file_suffix(suffix)) for suffix in BYTECODE_SUFFIXES),
     ("a `.coverage` data file", _file_name_is(COVERAGE_DATA_NAME)),
     ("a `.coverage.<suffix>` data file", _parallel_coverage_data),
-    ("a `.env` file", _file_name_is(".env")),
     ("a `.DS_Store` file", _file_name_is(".DS_Store")),
 )
 
@@ -217,8 +226,10 @@ def test_no_tracked_path_is_a_generated_artifact():
         ("services/auth/.coverage", "a `.coverage` data file"),
         (".coverage.host.1234.567890", "a `.coverage.<suffix>` data file"),
         ("services/auth/.coverage.x", "a `.coverage.<suffix>` data file"),
-        (".env", "a `.env` file"),
-        ("services/auth/.env", "a `.env` file"),
+        (".env", "a `.env` component"),
+        ("services/auth/.env", "a `.env` component"),
+        (".env/lib/python3.12/site-packages/x.py", "a `.env` component"),
+        ("services/auth/.env/bin/python", "a `.env` component"),
         (".DS_Store", "a `.DS_Store` file"),
         ("frontend/src/.DS_Store", "a `.DS_Store` file"),
     ],
@@ -256,6 +267,13 @@ def test_each_rule_refuses_its_generated_path(path, label):
         "app/a.pyi",
         "doc.pyo.txt",
         "pyd",
+        # the file-name rules read the file name only, never a directory's
+        "x.pyc/notes.md",
+        "x.pyo/notes.md",
+        "x.pyd/notes.md",
+        ".coverage/x",
+        ".coverage.ci/x",
+        ".DS_Store/x",
         # near misses of the coverage data files
         "services/inventory/.coveragerc",
         ".coverage.",
@@ -270,6 +288,13 @@ def test_each_rule_refuses_its_generated_path(path, label):
         "env",
         "services/auth/app/.envrc",
         "docs/.env-notes.md",
+        ".env.local",
+        ".env.production",
+        "services/auth/.env.test",
+        # names are matched case-sensitively
+        "x.PYC",
+        ".ENV",
+        "__PYCACHE__/x.py",
         # near misses of `.DS_Store`
         "DS_Store",
         ".DS_Store.md",
@@ -291,7 +316,7 @@ def test_every_offender_is_reported_in_order():
     paths = ["a/__pycache__/x.pyc", "ok.py", ".env", "b/m.pyc", ".env.example"]
     assert generated_artifacts(paths) == [
         ("a/__pycache__/x.pyc", "a `__pycache__` component"),
-        (".env", "a `.env` file"),
+        (".env", "a `.env` component"),
         ("b/m.pyc", "a `.pyc` file"),
     ]
 
@@ -311,12 +336,26 @@ def test_failure_message_caps_the_list_and_gives_the_total_and_the_remedy():
 
 
 def test_failure_message_lists_a_short_list_whole():
-    message = failure_message([(".env", "a `.env` file")])
+    message = failure_message([(".env", "a `.env` component")])
     assert message.splitlines()[:2] == [
         "1 tracked path(s) are generated artifacts:",
-        "  .env  (a `.env` file)",
+        "  .env  (a `.env` component)",
     ]
     assert "more" not in message
+
+
+def test_the_cap_is_fifty_as_documented():
+    assert LISTED_OFFENDERS_CAP == 50
+
+
+@pytest.mark.parametrize(("count", "listed", "more_line"), [(50, 50, None), (51, 50, "1 more")])
+def test_failure_message_lists_up_to_the_cap_exactly(count, listed, more_line):
+    offenders = [(f"p{i}.pyc", "a `.pyc` file") for i in range(count)]
+    lines = failure_message(offenders).splitlines()
+    path_lines = [line for line in lines if line.startswith("  p")]
+    assert path_lines == [f"  p{i}.pyc  (a `.pyc` file)" for i in range(listed)]
+    more = [line for line in lines if line.startswith("  ... and ")]
+    assert more == ([] if more_line is None else [f"  ... and {more_line}"])
 
 
 # Reading the tracked paths: a throwaway repository in tmp_path, with a git
@@ -360,6 +399,41 @@ def test_guard_refuses_a_tracked_pyc_in_a_real_repository(tmp_path):
     assert sorted(generated_artifacts(paths)) == [
         ("dir with spaces/café.pyc", "a `.pyc` file"),
         ("pkg/__pycache__/mod.cpython-314.pyc", "a `__pycache__` component"),
+    ]
+
+
+def test_a_tracked_name_that_is_not_utf8_is_judged_and_named_exactly(tmp_path):
+    # A Latin-1 name, put in the index without creating it on disk. Strict decoding
+    # would crash the guard; replacement decoding would still refuse the `.pyc` but
+    # report a name that is not the tracked one, so the test reads the bytes back.
+    env = _git_env(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, env, "init", "-q")
+    blob = (
+        subprocess.run(
+            ["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+            input=b"x",
+            env=env,
+            check=True,
+            capture_output=True,
+        )
+        .stdout.decode()
+        .strip()
+    )
+    raw = b"pkg/caf\xe9.pyc"
+    subprocess.run(
+        [b"git", b"-C", os.fsencode(repo), b"update-index", b"--add", b"--cacheinfo"]
+        + [b"100644," + blob.encode() + b"," + raw],
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+    _write(repo, "ok.py")
+    _git(repo, env, "add", "--", "ok.py")
+    offenders = generated_artifacts(tracked_paths(repo, env=env))
+    assert [(path.encode("utf-8", "surrogateescape"), label) for path, label in offenders] == [
+        (raw, "a `.pyc` file")
     ]
 
 
@@ -434,3 +508,22 @@ def test_the_repository_check_fails_rather_than_skips_when_it_cannot_list(monkey
         test_no_tracked_path_is_a_generated_artifact()
     assert raised.type is pytest.fail.Exception, f"got {raised.type.__name__}, not a failure"
     assert "the tracked-files guard cannot run: simulated" in str(raised.value)
+
+
+def test_the_repository_check_fails_on_an_offender_anywhere_in_the_listing(monkeypatch):
+    monkeypatch.setattr(
+        f"{__name__}.tracked_paths", lambda root, **kwargs: ["ok.py", "x/__pycache__/m.pyc"]
+    )
+    with pytest.raises(AssertionError) as raised:
+        test_no_tracked_path_is_a_generated_artifact()
+    message = str(raised.value)
+    assert "1 tracked path(s) are generated artifacts:" in message
+    assert "  x/__pycache__/m.pyc  (a `__pycache__` component)" in message
+    assert REMEDY in message
+
+
+def test_the_repository_check_passes_a_clean_listing(monkeypatch):
+    monkeypatch.setattr(
+        f"{__name__}.tracked_paths", lambda root, **kwargs: ["ok.py", ".env.example"]
+    )
+    test_no_tracked_path_is_a_generated_artifact()
