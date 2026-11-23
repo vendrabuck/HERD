@@ -44,7 +44,8 @@ Shape, and why it is this shape:
   - A retry pass's failure write by row id on a row it does NOT hold (the failures
     recorded before any per-row claim: the switch read, the template read, the driver
     load, and the login on L1 and L2, L2's create_vlan pre-pass and re-allocation, and
-    the switch read, template read, driver load, and drive-gate refusal on L3) takes
+    the switch read, template read, driver load, drive-gate refusal, and route-limit
+    refusal on L3) takes
     the same `direction_admits` compare in its own UPDATE, because the row it planned
     may have been parked since: an admitted write lands as before; a refused one is
     rolled back, which is what leaves every value as it was, and joins
@@ -226,11 +227,23 @@ def l3_pin_claim_budget(route_operations: int) -> timedelta:
     No cap, deliberately: a cap below the worst-case drive would let a second pass
     claim the pin while this one is still inside the driver, which is the double
     drive the claim exists to prevent. So a claim lasts at most one minute more than
-    N actions' worst case plus N seconds, or the one-row budget if that is longer,
-    and nothing in execution bounds a pin's route count, so nothing bounds the longest
-    claim either (a pin of 50,000 routes: 76,337 minutes, about 53 days, at the
-    defaults). A holder that dies mid-drive leaves the pin unclaimable for at most that
-    long.
+    N actions' worst case plus N seconds, or the one-row budget if that is longer.
+    What bounds `route_operations` is the per-switch route limit (issue #1493,
+    `herd_common.l3_route_limit.MAX_ROUTES_PER_SWITCH`, 1,000): one provision
+    configures at most that many routes. Only a retry pass claims (the reconcile's own
+    drives, deltas included, take no claim), and it drives a provision (the residue
+    removals, then its route set) or a deprovision (the row's recorded routes). So at
+    the defaults a retry provision that removes nothing holds its claim at most 1,530
+    minutes (about 25.5 hours), and one that removes a residue of 1,000 routes and
+    configures a disjoint 1,000 at most 3,057 minutes (about 51 hours). Removals are not
+    limited, since refusing one would leave routes installed, so a claimed drive that
+    removes more is bounded only by what it removes: a FAILED pin's recorded routes,
+    removed first as a provision's residue or whole by a deprovision, exceed the limit
+    when the pin was stored before the limit existed, and can grow past it, since each
+    failed provision records its own set plus the removals that did not confirm. At
+    50,000 route operations the
+    budget is 76,337 minutes, about 53 days. A holder that dies mid-drive leaves the pin
+    unclaimable for at most its budget.
     """
     driver_actions = route_operations + 2
     sized = _next_whole_minute_after(
