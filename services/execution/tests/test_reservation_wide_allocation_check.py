@@ -470,14 +470,19 @@ PATHS = ("reconcile_delta", "reconcile_no_delta", "teardown")
 @pytest.mark.parametrize("failed", ["real", "nil", "absent"])
 @pytest.mark.parametrize("frozen", [True, False], ids=["frozen", "not_frozen"])
 @pytest.mark.parametrize("path", PATHS)
-async def test_the_check_releases_exactly_when_the_condition_holds(path, frozen, failed, member):
+async def test_the_check_releases_exactly_when_the_condition_holds(
+    path, frozen, failed, member, caplog
+):
     """At each site, allocation A of R (ACTIVE, defined on S1, VLAN SEEDED_VLAN) is
     released by the check iff no ACTIVE membership references it and (R is frozen or
     R has no FAILED intended-ACTIVE membership). The FAILED join, A's member, and the
     freeze are written just before the check runs (module docstring). Another
     reservation's rows never change, and the per-pass check of the site's own work
     still runs (the delta's new allocation keeps its member; the teardown's removed
-    allocation is released)."""
+    allocation is released). The candidate read already applies the condition, so no
+    release loses a race here (no `vlan_release_lost_race` line)."""
+    import logging
+
     other = await _seed_foreign()
     target = await _add_allocation(RES, SEEDED_VLAN, FABRIC_1, [S1], defined=[S1])
     up = _Upstreams()
@@ -503,9 +508,12 @@ async def test_the_check_releases_exactly_when_the_condition_holds(path, frozen,
             await _freeze()
         await real(reservation_id, ctx, get_db_session)
 
-    with patch(
-        "app.services.nats_consumer._release_reservation_orphaned_allocations",
-        new=_seed_then_check,
+    with (
+        patch(
+            "app.services.nats_consumer._release_reservation_orphaned_allocations",
+            new=_seed_then_check,
+        ),
+        caplog.at_level(logging.INFO, logger="app.services.nats_consumer"),
     ):
         if path == "teardown":
             await _teardown(up)
@@ -523,6 +531,9 @@ async def test_the_check_releases_exactly_when_the_condition_holds(path, frozen,
         assert rows[new_id].status == "ACTIVE", "the delta's own join keeps its allocation"
     if path == "teardown":
         assert rows[worked].status == "RELEASED", "the per-pass check still runs"
+    assert [
+        r for r in caplog.records if getattr(r, "action", None) == "vlan_release_lost_race"
+    ] == []
     assert await _snapshot(OTHER) == other
 
 
