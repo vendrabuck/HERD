@@ -1,7 +1,8 @@
 import { useTopologyStore } from "@/stores/topologyStore";
 import { useAuthStore } from "@/stores/authStore";
-import type { Node, Edge } from "@xyflow/react";
+import { EdgeChangeset, NodeChangeset, type Node, type Edge } from "@xyflow/react";
 import type {
+  CanvasNodeData,
   DeviceNodeData,
   L3RouteIntent,
   LayerEdgeData,
@@ -109,11 +110,16 @@ describe("topologyStore", () => {
     expect(state.selectedEdgeLayer).toBe("L2");
   });
 
+  // @xyflow/react 13 hands onNodesChange / onEdgesChange a changeset, so these
+  // build the library's own NodeChangeset / EdgeChangeset, never an array or a
+  // hand-rolled object shaped like one.
   it("onNodesChange applies a position change", () => {
     useTopologyStore.getState().addDeviceNode(makeNode("a"));
-    useTopologyStore.getState().onNodesChange([
-      { id: "a", type: "position", position: { x: 42, y: 99 }, dragging: false },
-    ]);
+    useTopologyStore
+      .getState()
+      .onNodesChange(
+        new NodeChangeset([{ id: "a", type: "position", position: { x: 42, y: 99 }, dragging: false }]),
+      );
     const node = useTopologyStore.getState().nodes[0];
     expect(node.position).toEqual({ x: 42, y: 99 });
   });
@@ -121,7 +127,7 @@ describe("topologyStore", () => {
   it("onNodesChange applies a remove change", () => {
     useTopologyStore.getState().addDeviceNode(makeNode("a"));
     useTopologyStore.getState().addDeviceNode(makeNode("b"));
-    useTopologyStore.getState().onNodesChange([{ id: "a", type: "remove" }]);
+    useTopologyStore.getState().onNodesChange(new NodeChangeset([{ id: "a", type: "remove" }]));
     const ids = useTopologyStore.getState().nodes.map((n) => n.id);
     expect(ids).toEqual(["b"]);
   });
@@ -132,8 +138,53 @@ describe("topologyStore", () => {
       edges: [makeEdge("e1", "a", "b")],
       selectedEdgeLayer: "L2",
     });
-    useTopologyStore.getState().onEdgesChange([{ id: "e1", type: "remove" }]);
+    useTopologyStore.getState().onEdgesChange(new EdgeChangeset([{ id: "e1", type: "remove" }]));
     expect(useTopologyStore.getState().edges).toEqual([]);
+  });
+
+  it("onNodesChange applies a whole changeset: every change, every node, order and untouched nodes kept", () => {
+    const store = useTopologyStore.getState();
+    store.addDeviceNode(makeNode("a"));
+    store.addDeviceNode(makeNode("b"));
+    store.addDeviceNode(makeNode("c"));
+    store.addDeviceNode(makeNode("d"));
+    const untouched = useTopologyStore.getState().nodes[3];
+    const changes = new NodeChangeset<Node<CanvasNodeData>>([
+      { id: "c", type: "select", selected: true },
+      { id: "a", type: "position", position: { x: 5, y: 6 } },
+      { id: "b", type: "remove" },
+      // Two changes on one node apply in the order given, the later one last.
+      { id: "c", type: "position", position: { x: 1, y: 1 } },
+      { id: "c", type: "position", position: { x: 7, y: 8 } },
+    ]);
+    useTopologyStore.getState().onNodesChange(changes);
+    const nodes = useTopologyStore.getState().nodes;
+    expect(nodes.map((n) => n.id)).toEqual(["a", "c", "d"]);
+    expect(nodes[0].position).toEqual({ x: 5, y: 6 });
+    expect(nodes[1].selected).toBe(true);
+    expect(nodes[1].position).toEqual({ x: 7, y: 8 });
+    // A node with no change is passed through by reference, as v12 did.
+    expect(nodes[2]).toBe(untouched);
+  });
+
+  it("onEdgesChange applies a whole changeset: select one edge, remove another, keep the rest", () => {
+    useTopologyStore.getState().loadCanvas({
+      nodes: [makeNode("a"), makeNode("b")],
+      edges: [makeEdge("e1", "a", "b"), makeEdge("e2", "a", "b"), makeEdge("e3", "a", "b")],
+      selectedEdgeLayer: "L2",
+    });
+    const changes = new EdgeChangeset<Edge<LayerEdgeData>>([
+      { id: "e3", type: "select", selected: true },
+      { id: "e1", type: "remove" },
+    ]);
+    useTopologyStore.getState().onEdgesChange(changes);
+    const edges = useTopologyStore.getState().edges;
+    expect(edges.map((e) => [e.id, e.selected])).toEqual([
+      ["e2", undefined],
+      ["e3", true],
+    ]);
+    // The edge data rides along untouched.
+    expect(edges[1].data).toEqual({ layer: "L2" });
   });
 
   it("addEnrichedEdge adds an edge carrying the supplied layer data", () => {

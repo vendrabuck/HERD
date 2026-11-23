@@ -76,8 +76,9 @@ Four small state machines live here. Only this section states their transitions.
 | `ACTIVE` | `FAILED`, intended `RELEASED` | the failure writers on a failed removal | release direction only | nothing | WIRE-LEDGER-7 |
 | `ACTIVE` | `FAILED`, intended `RELEASED` | `record_l2_membership_active` of another reservation | the row's own reservation is frozen | nothing | WIRE-LEDGER-12 |
 | `ACTIVE` | `FAILED`, intended `RELEASED` | `record_route_reconciled` | routes unchanged since the delta was computed; wiring frozen | nothing | WIRE-LEDGER-14 |
-| `ACTIVE` | `FAILED`, intended `ACTIVE` | `record_route_reconcile_failed` | routes unchanged since the delta was computed | nothing | WIRE-LEDGER-15 |
-| `FAILED`, intended `ACTIVE` | `FAILED`, intended `RELEASED` | `park_stale_route_build` at terminal teardown | the row is still `FAILED` | nothing | WIRE-TEARDOWN-6 |
+| `ACTIVE` | `FAILED`, intended `ACTIVE` | `record_route_reconcile_failed` | routes unchanged since the delta was computed; wiring not frozen | nothing | WIRE-LEDGER-15 |
+| (none), `ACTIVE`, or `FAILED` | `FAILED`, intended `RELEASED`, attempts 0 | a build failure written by `record_l1_failed`, `record_l2_failed`, `record_route_failed` (reconcile path) or `record_route_reconcile_failed` | wiring frozen, read in the write's own statement; L1 and L2: a retryable reason; L2: a real allocation; from `ACTIVE` only `record_route_reconcile_failed` | nothing | WIRE-LEDGER-17 |
+| `FAILED`, intended `ACTIVE` | `FAILED`, intended `RELEASED` | `park_stale_l1_build`, `park_stale_l2_build`, `park_stale_route_build` at terminal teardown | the row is still `FAILED` | nothing | WIRE-TEARDOWN-6 |
 | `ACTIVE` | `ACTIVE` (new route list) | `record_route_reconciled` | routes unchanged since the delta was computed; wiring not frozen | nothing | WIRE-LEDGER-14 |
 | `ACTIVE` or `FAILED` | `RELEASED` | `release_l1_connection`, `release_l2_membership`, `release_route_membership` after a successful removal or a settlement | row is this reservation's, not RELEASED | nothing | WIRE-LEDGER-9 |
 | `ACTIVE` | `RELEASED` | `record_l1_connect` of another reservation | same switch and canonical pair | nothing | WIRE-LEDGER-11 |
@@ -211,7 +212,8 @@ compare-and-swap too, so of two passes releasing one allocation exactly one driv
   Enforced in: `services/execution/app/services/route_service.py` (`record_route_reconciled`) \
   Pinned by: `services/execution/tests/test_route_service.py` (`test_record_route_reconciled_advances_the_pin_on_an_active_row`, `test_record_route_reconciled_stale_previous_routes_is_a_noop`, `test_record_route_reconciled_frozen_parks_failed_intended_released`, `test_record_route_reconciled_returns_none_when_no_active_row`)
 - **WIRE-LEDGER-15.** `record_route_reconcile_failed` flips an ACTIVE pin, under the same
-  locked routes comparison, to `FAILED` intended `ACTIVE`, adding the attempts; it has no
+  locked routes comparison, to `FAILED` intended `ACTIVE`, adding the attempts (on a
+  frozen reservation intended `RELEASED`, attempts 0, WIRE-LEDGER-17); it has no
   build-direction guard. The stored routes become what may still be installed: unchanged
   when nothing was driven (a gate refusal, a load failure, a failed login), otherwise the
   previous routes whose removal did not confirm plus every route the delta tried to add.
@@ -227,6 +229,36 @@ compare-and-swap too, so of two passes releasing one allocation exactly one driv
   route pins are per reservation and never displace each other. \
   Enforced in: `services/execution/app/services/l1_assignment_service.py` (`supersede_release_if_reclaimed`); `services/execution/app/services/l2_membership_service.py` (`supersede_l2_release_if_reclaimed`); `services/execution/app/services/wiring_retry_service.py` (`_reattempt_l3_rows`) \
   Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_retry_supersession_flips_release_row_without_driver_call`, `test_retry_no_supersession_when_active_row_same_reservation_fires_driver`); `services/execution/tests/test_l2_membership_service.py` (`test_supersede_when_other_reservation_active_on_same_port`, `test_supersede_false_when_no_other_reservation`); `services/execution/tests/test_wiring_retry_l3.py` (`test_l3_release_is_not_superseded_by_another_reservation_on_same_switch`)
+- **WIRE-LEDGER-17.** A build failure written by key (the reconcile path: `record_l1_failed`,
+  `record_l2_failed`, `record_route_failed` with no row id, and
+  `record_route_reconcile_failed`) on a reservation whose wiring is frozen is recorded
+  `FAILED` intended `RELEASED` with attempts 0, the state the terminal teardown parks
+  such a row in (WIRE-TEARDOWN-6), so the release-direction retry channels remove
+  whatever the build may have left (#1501). It covers exactly the rows the teardown
+  parks: on L1 a failure whose reason is retryable, on L2 a retryable reason on a row
+  whose allocation is not the nil placeholder (the write's allocation, or the row's
+  own when the write names none), on L3 every build failure. L1 and L2 keep the
+  failure's own `last_error`; L3 records the park's retryable reason,
+  `TEARDOWN_PENDING_REMOVAL`, whatever the failure's reason, as the teardown's park
+  does, so the tick selects the pin (a pinned reason would exclude it); a removal that
+  then fails for the same cause records it again, release-direction (#1199). The
+  frozen fact is read inside the write's own `UPDATE` or `INSERT` (a `CASE` on the
+  correlated EXISTS of `reservation_frozen`, the reservation id bound in an insert), so
+  no window opens between the check and the write; freezing is forward-only
+  (WIRE-FREEZE-1), so the one stale read is a freeze that commits after the
+  statement's snapshot (section 13). A row that is RELEASED when the write reads its
+  key is never rewritten (WIRE-LEDGER-10): a late build failure for that key inserts a
+  new pending-release row. A row released between that read and the `UPDATE` (which
+  matches the row id only, as before #1501) keeps status `RELEASED` and intended
+  `RELEASED` but takes the write's `last_error` and attempts 0; on L3 it also takes
+  the write's routes when the write passes any, and its claim stamp is cleared. An ACTIVE row is still
+  immutable to a build failure (WIRE-LEDGER-7). The other
+  writes are unchanged: a release failure, every write on a reservation that is not
+  frozen, a pinned-reason or nil-allocation L1 or L2 failure, and every failure write
+  by row id. Before #1501 such a write recorded intended `ACTIVE`, which no pass drives
+  on a frozen reservation, and over a parked row it undid the park. \
+  Enforced in: `services/execution/app/services/wiring_due.py` (`frozen_build_failure_values`, `reservation_frozen`); `services/execution/app/services/l1_assignment_service.py` (`record_l1_failed`); `services/execution/app/services/l2_membership_service.py` (`record_l2_failed`); `services/execution/app/services/route_service.py` (`record_route_failed`, `record_route_reconcile_failed`) \
+  Pinned by: `services/execution/tests/test_frozen_wiring_settles.py` (`test_a_key_based_build_failure_after_the_freeze_records_a_pending_release`, `test_a_key_based_build_failure_on_a_reservation_not_frozen_is_unchanged`, `test_a_key_based_release_failure_after_the_freeze_is_unchanged`, `test_the_412_guard_still_holds_after_the_freeze`, `test_a_pinned_reason_build_failure_after_the_freeze_is_unchanged`, `test_an_l3_pinned_reason_build_failure_after_the_freeze_is_a_pending_release`, `test_an_l2_nil_allocation_build_failure_after_the_freeze_is_unchanged`, `test_a_late_build_failure_does_not_undo_a_teardown_park`, `test_a_late_build_failure_never_rewrites_a_released_row`, `test_a_late_reconcile_delta_failure_after_the_freeze_is_a_pending_release`, `test_a_reconcile_delta_failure_not_frozen_is_unchanged`, `test_a_build_failure_landing_after_the_teardown_is_released_by_the_next_tick`, `test_an_l2_build_failure_with_no_new_allocation_keeps_the_rows_own`); `services/execution/tests/test_wiring_retry_claim_race_live_pg.py` (`test_a_build_failure_landing_after_the_freeze_and_teardown_is_released`, `test_the_frozen_read_of_a_key_based_build_failure_is_the_rows_own_on_postgres`, `test_a_freeze_committed_after_the_writers_read_is_seen_by_its_write`)
 - **WIRE-VLAN-1.** `find_or_assign_allocation` returns the existing ACTIVE allocation of
   the reservation that reaches the component being allocated for (WIRE-VLAN-2's
   reachability test), the oldest when several do, so a cable change never gives one
@@ -322,11 +354,19 @@ compare-and-swap too, so of two passes releasing one allocation exactly one driv
   row stays claimable in the direction it then intends, and a later retry drives it
   there, except a FAILED intended-ACTIVE row on a frozen reservation, which no retry
   drives (the tick leaves it out as a frozen build and the manual retry reports it
-  `frozen`, as before #1496). On L3 the teardown's read of FAILED pins parks and
-  removes such a pin, unless it became FAILED intended ACTIVE after that read (a
-  key-based reconcile failure write landing after it, or a freeze committed during a
-  release claim's lock wait), and then nothing drives it; on L1 and L2 the teardown
-  releases ACTIVE rows only, so nothing settles such a row, as before. This closes a retry pass that planned a build from an
+  `frozen`, as before #1496). On every layer the teardown's read of FAILED rows parks
+  and removes such a row (WIRE-TEARDOWN-6; L1 and L2 since #1501), unless it became
+  FAILED intended ACTIVE after that read, and then nothing drives it. The teardown's
+  exceptions, each left FAILED intended ACTIVE: an L1 or L2 row with a pinned reason,
+  an L1 or L2 row under another retry pass's live claim (a failed holder leaves it so),
+  an L1 or L2 row whose key (and, on L2, allocation) also has an ACTIVE row, an L2 row
+  with a nil or dangling allocation on a port that has an ACTIVE row, and an L3 pin the
+  teardown parked over which a retry holder's partial-failure write then lands
+  (section 13). A key-based build
+  failure written after the freeze no longer makes that flip (WIRE-LEDGER-17), so what
+  remains is a key-based failure write whose own statement read the reservation as not
+  frozen and that commits after the teardown's read (section 13); a release claim
+  refused during a lock wait, above, is refused over such a write. This closes a retry pass that planned a build from an
   older read claiming and connecting, adding, or provisioning a row another pass parked
   intended RELEASED since (the #1496 reproduction), and, with WIRE-CLAIM-10, that pass
   undoing the park with a failure it records before its claim; it also refuses a
@@ -337,7 +377,7 @@ compare-and-swap too, so of two passes releasing one allocation exactly one driv
   older content that drives it over a newer failed attempt. An expired stamp is
   reclaimable with no reaper. \
   Enforced in: `services/execution/app/services/wiring_claim.py` (`WiringRowClaims`, `unclaimed`, `direction_admits`); `services/execution/app/services/wiring_due.py` (`reservation_frozen`); `services/execution/app/services/nats_consumer.py` (`_apply_one_port_action`, `_apply_one_vlan_action`, `_apply_l3_adjacency`) \
-  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_claim_stamps_the_budget_and_a_second_claimant_loses`, `test_a_row_no_longer_failed_cannot_be_claimed`, `test_claim_expiry_lets_a_new_pass_take_a_dead_holders_row`); `services/execution/tests/test_wiring_claim_direction.py` (`test_the_claim_holds_a_row_only_in_the_direction_it_intends`, `test_a_row_another_pass_holds_is_lost_in_either_direction`, `test_a_row_no_longer_failed_is_lost_in_either_direction`, `test_an_apply_drives_a_row_only_in_the_direction_it_intends`, `test_a_build_planned_before_a_park_is_not_driven_over_it`, `test_the_manual_endpoint_reports_a_direction_refusal_still_failed`, `test_the_tick_counts_a_direction_refusal_still_failed_not_in_progress`, `test_on_a_frozen_reservation_a_release_is_claimed_whatever_the_row_intends`, `test_a_release_planned_before_a_flip_to_active_settles_only_when_frozen`, `test_a_build_over_a_released_row_is_refused_on_a_frozen_reservation`, `test_a_frozen_release_refused_by_a_flip_to_active_no_longer_strands_the_pin`, `test_known_limit_a_frozen_l3_release_removes_only_the_routes_it_planned`); `services/execution/tests/test_wiring_retry_claim_race_live_pg.py` (`test_a_park_between_a_pass_plan_and_its_claim_refuses_the_build`, `test_the_direction_compare_and_its_frozen_exception_on_postgres`)
+  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_claim_stamps_the_budget_and_a_second_claimant_loses`, `test_a_row_no_longer_failed_cannot_be_claimed`, `test_claim_expiry_lets_a_new_pass_take_a_dead_holders_row`); `services/execution/tests/test_wiring_claim_direction.py` (`test_the_claim_holds_a_row_only_in_the_direction_it_intends`, `test_a_row_another_pass_holds_is_lost_in_either_direction`, `test_a_row_no_longer_failed_is_lost_in_either_direction`, `test_an_apply_drives_a_row_only_in_the_direction_it_intends`, `test_a_build_planned_before_a_park_is_not_driven_over_it`, `test_the_manual_endpoint_reports_a_direction_refusal_still_failed`, `test_the_tick_counts_a_direction_refusal_still_failed_not_in_progress`, `test_on_a_frozen_reservation_a_release_is_claimed_whatever_the_row_intends`, `test_a_release_planned_before_a_flip_to_active_settles_only_when_frozen`, `test_a_build_over_a_released_row_is_refused_on_a_frozen_reservation`, `test_a_frozen_release_refused_by_a_flip_to_active_no_longer_strands_the_pin`, `test_known_limit_a_frozen_l3_release_removes_only_the_routes_it_planned`, `test_known_limit_a_teardown_deprovision_removes_only_the_routes_it_read`); `services/execution/tests/test_wiring_retry_claim_race_live_pg.py` (`test_a_park_between_a_pass_plan_and_its_claim_refuses_the_build`, `test_the_direction_compare_and_its_frozen_exception_on_postgres`)
 - **WIRE-CLAIM-2.** Every success flip, release, failure write (by key or by row id),
   stale park, and frozen park of an own FAILED row sets `claimed_until` to null (a
   failure write by row id only when WIRE-CLAIM-8 lets it write).
@@ -549,13 +589,16 @@ support.
   and a reason; no other answer does (WIRE-GATE-3). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_verify_reservation_event`, `process_reservation_message`) \
   Pinned by: `services/execution/tests/test_nats_consumer_event_verification.py` (`test_unverified_terminal_event_acks_without_running_the_handler`, `test_gate_404_acks_without_running_the_handler`, `test_created_for_a_cancelled_reservation_is_unverified`); `tests/integration/test_event_verification_gate.py` (`test_forged_cancelled_event_for_an_active_reservation_is_ignored`); `tests/integration/test_wiring_changed_reconcile.py` (`test_wiring_changed_for_completed_reservation_does_not_reconnect`)
-- **WIRE-GATE-3.** A transport error or any other answer from that check (a 5xx, and
-  since #1215 a 401 or 403 during an `INTERNAL_API_TOKEN` rotation, a 409, or a 422 for
-  a malformed id) raises `TransientUpstreamError`, so the message is nacked and retried,
+- **WIRE-GATE-3.** A transport error (a read still incomplete at the 20 second total
+  deadline, `INTERNAL_READ_DEADLINE_SECONDS`, included; issue #1498) or any other
+  answer from that check (a 5xx, and since #1215 a 401 or 403 during an
+  `INTERNAL_API_TOKEN` rotation, a 409, or a 422 for a malformed id) raises `TransientUpstreamError`, so the message is nacked and retried,
   and dead-lettered after the backoff schedule when the answer persists (fail closed:
-  the handler never runs on it, and the event is never acked unrun). \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_get_internal`, `_internal_record_found`, `_verify_reservation_event`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_event_verification.py` (`test_5xx_raises_transient_upstream_error`, `test_transport_error_raises_transient_upstream_error`, `test_gate_transport_failure_naks_like_any_other_transient_error`, `test_verifier_raises_transient_on_every_status_but_200_and_404`, `test_gate_auth_error_naks_and_never_runs_or_drops_the_event`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_cancelled_event_whose_check_is_refused_naks_then_tears_down`)
+  the handler never runs on it, and the event is never acked unrun). A cancellation
+  from outside the read, an outer deadline that expires first included, propagates as
+  itself and is never turned into `TransientUpstreamError`. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_get_internal`, `INTERNAL_READ_DEADLINE_SECONDS`, `_internal_record_found`, `_verify_reservation_event`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_event_verification.py` (`test_5xx_raises_transient_upstream_error`, `test_transport_error_raises_transient_upstream_error`, `test_gate_transport_failure_naks_like_any_other_transient_error`, `test_verifier_raises_transient_on_every_status_but_200_and_404`, `test_gate_auth_error_naks_and_never_runs_or_drops_the_event`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_cancelled_event_whose_check_is_refused_naks_then_tears_down`); `services/execution/tests/test_upstream_total_deadlines.py` (`test_get_internal_drip_is_cut_at_the_total_deadline`, `test_get_internal_under_the_deadline_returns_the_response`, `test_a_stalled_corroboration_read_naks_the_message`, `test_cancelling_an_internal_read_propagates_and_is_not_transient`, `test_an_outer_timeout_shorter_than_the_read_deadline_is_the_outer_one`)
 - **WIRE-GATE-4.** An event with no table entry, or with no `reservation_id`, makes no
   call and goes straight to its handler. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_verify_reservation_event`) \
@@ -671,7 +714,9 @@ state transitions are WIRE-ORDER-1 and WIRE-FREEZE-1.
   `INTERNAL_API_TOKEN` rotation, a 409, a 422, a 5xx), a 200 whose body is not a JSON
   object, and a transport failure raise `TransientUpstreamError` with the text
   `fetch device <id>: upstream <status>` (or `fetch template <id>: ...`,
-  `...: upstream answered with a malformed body`, `...: transport error: <message>`),
+  `...: upstream answered with a malformed body`, `...: transport error: <message>`;
+  a read still incomplete at its 20 second total deadline is a transport failure,
+  `...: transport error: TimeoutError`, issue #1498),
   so the event is nacked and no row is pinned with `WIRING_UNRESOLVABLE_REASON`: a
   `wiring_changed` leaves the version unstamped and records nothing for the switch,
   and a terminal teardown leaves the ACTIVE rows of the failing layer and of every
@@ -680,8 +725,8 @@ state transitions are WIRE-ORDER-1 and WIRE-FREEZE-1.
   (#1001), and the release-direction retry tick finishes it. The read of a switch or its
   template for an allocation's `delete_vlan` is the other exception: it stops only that
   allocation's deletes and is not re-raised (WIRE-VLAN-12). \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_device`, `_fetch_template`, `_inventory_record_or_none`) \
-  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_returns_the_body_on_200`, `test_inventory_read_returns_none_only_on_404`, `test_inventory_read_raises_transient_on_every_other_status`, `test_inventory_read_raises_transient_on_a_malformed_200_body`, `test_inventory_read_raises_transient_on_transport_error`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_inventory_auth_error_naks_and_never_pins`); `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_inventory_auth_error_on_switch_read_raises_and_pins_nothing`)
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_fetch_device`, `_fetch_template`, `_inventory_record_or_none`, `_get_internal`, `INTERNAL_READ_DEADLINE_SECONDS`) \
+  Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_inventory_read_returns_the_body_on_200`, `test_inventory_read_returns_none_only_on_404`, `test_inventory_read_raises_transient_on_every_other_status`, `test_inventory_read_raises_transient_on_a_malformed_200_body`, `test_inventory_read_raises_transient_on_transport_error`); `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_inventory_auth_error_naks_and_never_pins`); `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_inventory_auth_error_on_switch_read_raises_and_pins_nothing`); `services/execution/tests/test_upstream_total_deadlines.py` (`test_switch_device_read_deadline_is_the_transient_error_not_absent`, `test_wiring_retry_with_a_stalled_switch_read_answers_503`)
 - **WIRE-ORDER-12.** Within one fetch context each device, each switch's latest config,
   and each template read through `get_template` is fetched at most once when the read
   answers (a 404 included). A context lives for one reservation event, or for one
@@ -1159,13 +1204,14 @@ it fails, and counted as done only when the driver's own answer says so.
   by `driver load failed: DriverPackageError`, with no attempt counted, and neither retry
   channel retries it (WIRE-RETRY-4). Any other load failure, a failed package download
   in particular, is transient: the reason is `driver load failed: <ClassName>` (the
-  wrapped cause's class, for example `ConnectError`), with one attempt counted, and both
+  wrapped cause's class, for example `ConnectError`, or `TimeoutError` for a download
+  past its total deadline, CFG-LOAD-2), with one attempt counted, and both
   retry channels drive the row again in its direction, builds and releases (a teardown's
   included) alike. A transient failure in the L2 `create_vlan` pre-pass parks the
   dependent joins under `create_vlan failed: driver load failed: <ClassName>`. The stored
   text never carries the exception's message, which goes only to the log. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_wiring_load_failure`, `_apply_wiring_pairs`, `_run_vlan_definition_op`, `_apply_l2_memberships`, `_apply_l3_adjacency`); `services/execution/app/services/driver_loader.py` (`is_permanent_load_failure`, `driver_load_failure_text`); `services/execution/app/services/wiring_retry_service.py` (`is_retryable_failure`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_driver_load_raise_parks_pairs_failed_without_nak`); `services/execution/tests/test_wiring_driver_load_classification.py` (`test_wiring_load_failure_reason_and_attempts_by_kind`, `test_l1_transient_download_failure_parks_build_and_release_retryable`, `test_l1_broken_package_parks_build_and_release_permanent`, `test_l2_transient_download_failure_parks_add_and_remove_retryable`, `test_l2_transient_failure_during_vlan_define_parks_the_add_retryable`, `test_l3_transient_download_failure_parks_provision_and_deprovision_retryable`, `test_l3_broken_package_parks_provision_and_deprovision_permanent`, `test_l1_transient_rows_converge_on_the_next_retry_tick`, `test_l2_transient_remove_converges_on_the_next_retry_tick`, `test_l3_transient_rows_converge_on_the_next_retry_tick`, `test_l1_broken_package_rows_are_not_retried_by_the_tick`, `test_teardown_l1_removal_with_transient_download_failure_stays_retryable`); `services/execution/tests/test_wiring_retry_service.py` (`test_is_retryable_classifies_pinned_reasons_not_retryable`)
+  Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_driver_load_raise_parks_pairs_failed_without_nak`); `services/execution/tests/test_wiring_driver_load_classification.py` (`test_wiring_load_failure_reason_and_attempts_by_kind`, `test_l1_transient_download_failure_parks_build_and_release_retryable`, `test_l1_broken_package_parks_build_and_release_permanent`, `test_l2_transient_download_failure_parks_add_and_remove_retryable`, `test_l2_transient_failure_during_vlan_define_parks_the_add_retryable`, `test_l3_transient_download_failure_parks_provision_and_deprovision_retryable`, `test_l3_broken_package_parks_provision_and_deprovision_permanent`, `test_l1_transient_rows_converge_on_the_next_retry_tick`, `test_l2_transient_remove_converges_on_the_next_retry_tick`, `test_l3_transient_rows_converge_on_the_next_retry_tick`, `test_l1_broken_package_rows_are_not_retried_by_the_tick`, `test_teardown_l1_removal_with_transient_download_failure_stays_retryable`); `services/execution/tests/test_upstream_total_deadlines.py` (`test_wiring_retry_with_a_stalled_download_returns_the_transient_outcome`); `services/execution/tests/test_wiring_retry_service.py` (`test_is_retryable_classifies_pinned_reasons_not_retryable`)
 
 **Out of scope.** Driver package loading, caching, and validation (`inventory.md`,
 `device-configuration.md`); the driver method contract (`DRIVERS.md`).
@@ -1217,9 +1263,10 @@ WIRE-FREEZE-1.
   failed freeze raises, the message is nacked, and nothing is torn down. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`handle_reservation_event`) \
   Pinned by: `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_freeze_lands_before_teardown_releases`, `test_frozen_is_durable_before_first_teardown_driver_call`, `test_freeze_failure_raises_and_blocks_teardown`)
-- **WIRE-TEARDOWN-2.** Teardown removes exactly this reservation's ACTIVE rows: L1 pairs
-  first, then L2 memberships (freeing and undefining their emptied allocations), then L3
-  pins with their stored routes. \
+- **WIRE-TEARDOWN-2.** Teardown removes exactly this reservation's ACTIVE rows, and the
+  FAILED intended-`ACTIVE` rows of WIRE-TEARDOWN-6: L1 pairs first, then L2 memberships
+  (freeing and undefining their emptied allocations), then L3 pins with their stored
+  routes. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_from_ledgers`) \
   Pinned by: `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_terminal_event_releases_all_three_ledgers`, `test_partial_ledger_only_l2_tears_down_cleanly`, `test_partial_ledger_only_l3_pin_tears_down_cleanly`, `test_teardown_scoped_to_the_reservation`); `tests/integration/test_ledger_teardown.py` (`test_cancel_releases_all_three_ledgers`)
 - **WIRE-TEARDOWN-3.** Teardown ignores the frozen flag, and empty ledgers make no driver
@@ -1232,19 +1279,54 @@ WIRE-FREEZE-1.
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_from_ledgers`) \
   Pinned by: `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_l1_teardown_driver_failure_lands_failed_intended_released`, `test_failed_teardown_row_converges_on_manual_retry`); `tests/integration/test_ledger_teardown.py` (`test_cancel_teardown_failure_converges_on_terminal_retry`); `tests/integration/test_wiring_changed_reconcile.py` (`test_cancelled_disconnect_failure_direction_aware_retry`)
 - **WIRE-TEARDOWN-5.** An upstream failure during teardown nacks the message, rows not
-  yet released stay ACTIVE, and the redelivery releases only what is left. \
+  yet released stay ACTIVE (a FAILED build row already parked stays a pending release
+  for the retry channels, WIRE-TEARDOWN-6), and the redelivery releases only what is
+  left. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_from_ledgers`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_upstream_error_naks_and_keeps_rows_active`, `test_redelivered_terminal_event_is_idempotent`); `tests/integration/test_failed_teardown.py` (`test_l3_failed_event_removes_pinned_routes_and_redelivery_is_idempotent`, `test_l1_failed_event_disconnects_only_applied_pairs`)
-- **WIRE-TEARDOWN-6.** Teardown also removes what a FAILED intended-`ACTIVE` L3 pin
-  records (a failed provision or delta, WIRE-L3-10, WIRE-LEDGER-15), since those routes
-  may be installed. Before any driver call it parks each such pin `FAILED` intended
-  `RELEASED` under `TEARDOWN_PENDING_REMOVAL`, then deprovisions its stored routes with
-  the ACTIVE pins; a pin that stores no routes is released with no driver call. A failed
-  removal stays release-direction, which the retry channels drive while frozen
-  (WIRE-TEARDOWN-4). L1 and L2 FAILED intended-`ACTIVE` rows are not read: a failed L1
-  connect or L2 join has nothing confirmed to undo. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_from_ledgers`); `services/execution/app/services/route_service.py` (`park_stale_route_build`, `TEARDOWN_PENDING_REMOVAL`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_teardown_removes_every_route_a_failed_delta_may_have_left`, `test_teardown_removal_failure_parks_release_direction_and_tick_finishes_it`, `test_teardown_parks_failed_build_with_the_teardown_reason_before_driving`, `test_teardown_releases_a_failed_build_with_no_routes_without_a_driver_call`); `tests/integration/test_l3_intent_execution.py` (`test_cancel_after_a_failed_route_change_removes_every_route_ever_configured`)
+  Pinned by: `services/execution/tests/test_nats_consumer_ledger_teardown.py` (`test_teardown_upstream_error_naks_and_keeps_rows_active`, `test_redelivered_terminal_event_is_idempotent`); `tests/integration/test_failed_teardown.py` (`test_l3_failed_event_removes_pinned_routes_and_redelivery_is_idempotent`, `test_l1_failed_event_disconnects_applied_pairs_and_failed_builds`)
+- **WIRE-TEARDOWN-6.** Teardown also removes what a FAILED intended-`ACTIVE` row may have
+  left, on every layer: a build that did not confirm may still have landed (a driver
+  call that timed out, WIRE-CLAIM-9), and an L3 pin records the routes a failed
+  provision or delta may have installed (WIRE-L3-10, WIRE-LEDGER-15). Before any driver
+  call of its layer it parks each such row `FAILED` intended `RELEASED`, attempts 0
+  (`park_stale_l1_build` under `TEARDOWN_PENDING_DISCONNECT`, `park_stale_l2_build`
+  under `TEARDOWN_PENDING_VLAN_REMOVAL`, `park_stale_route_build` under
+  `TEARDOWN_PENDING_REMOVAL`), then removes it with the ACTIVE rows: a disconnect, a
+  `remove_from_vlan` against the row's own allocation (which then joins the emptied
+  allocation check, WIRE-VLAN-4), or a deprovision of the stored routes. A removal of
+  something that was never built is the idempotent no-op the stale settlement already
+  relies on (WIRE-STALE-1 to WIRE-STALE-3). With no driver call it releases an L2 row
+  whose allocation is the nil placeholder or no longer exists, whatever its reason (no
+  VLAN number to remove, and no join ever ran, as WIRE-STALE-2), and an L3 pin that
+  stores no routes. On L1 and L2 it leaves three kinds of row as they are. (a) A
+  pinned-reason row (WIRE-STALE-1): an unresolvable hop keyed on raw hop endpoints, or
+  a switch whose driver package cannot load (#1199); neither can be driven. (b) A row
+  whose key also has an ACTIVE row of the reservation (L1: switch and pair, where the
+  skip only stops the FAILED twin from being parked, and such a twin, which only a
+  concurrent-insert race creates, makes the ACTIVE row's own `release_l1_connection`
+  raise `MultipleResultsFound`, aborting the teardown before L2 and L3, as before #1501;
+  L2: switch, port, and allocation, whose ACTIVE row's removal drives the same VLAN). An L2 row on another
+  allocation of an ACTIVE port is parked and removed, and the direct release of a nil
+  or dangling one is not made where any ACTIVE row holds the port. (c) A row another
+  retry pass holds a live claim on (`claimed_until` in the future): the park and the
+  direct release run inside `write_guard` with an empty claim ledger, which locks the
+  row only while it is unclaimed, so a claim taken after the teardown's read is
+  respected too. Such a row is left as before #1501: the holder's success is parked
+  by the record-time freeze check (WIRE-LEDGER-4), its failure records FAILED intended
+  `ACTIVE`, and a holder that dies leaves FAILED intended `ACTIVE`, which no pass drives
+  (section 13). The row does not itself bring its allocation into the emptied-allocation
+  check (an ACTIVE row, or a parked FAILED row, of the reservation on the same
+  allocation still does, and the VLAN is then deleted as before #1501). An
+  expired claim is no claim. On L3
+  the teardown parks every FAILED intended-`ACTIVE` pin, held or not, as before #1501
+  (section 13). A failed removal stays
+  release-direction, which the retry channels drive while frozen (WIRE-TEARDOWN-4); a
+  redelivered teardown reads a parked row as release-direction work and leaves it to
+  them, so it makes no driver call for it. L1 and L2 rows are covered since #1501;
+  before, they stayed FAILED intended `ACTIVE`, which no pass drives on a frozen
+  reservation. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_teardown_from_ledgers`); `services/execution/app/services/l1_assignment_service.py` (`park_stale_l1_build`, `TEARDOWN_PENDING_DISCONNECT`); `services/execution/app/services/l2_membership_service.py` (`park_stale_l2_build`, `release_l2_membership`, `TEARDOWN_PENDING_VLAN_REMOVAL`); `services/execution/app/services/route_service.py` (`park_stale_route_build`, `TEARDOWN_PENDING_REMOVAL`); `services/execution/app/services/wiring_claim.py` (`write_guard`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_l3_reconcile.py` (`test_teardown_removes_every_route_a_failed_delta_may_have_left`, `test_teardown_removal_failure_parks_release_direction_and_tick_finishes_it`, `test_teardown_parks_failed_build_with_the_teardown_reason_before_driving`, `test_teardown_releases_a_failed_build_with_no_routes_without_a_driver_call`); `services/execution/tests/test_frozen_wiring_settles.py` (`test_teardown_releases_a_failed_build_row`, `test_teardown_park_before_the_driver_call_is_durable`, `test_a_failed_teardown_removal_counts_only_its_own_attempts`, `test_teardown_park_survives_an_undrivable_switch`, `test_a_failed_teardown_removal_is_finished_by_the_tick`, `test_a_redelivered_teardown_is_a_no_op`, `test_teardown_leaves_a_pinned_reason_build_row_alone`, `test_teardown_releases_an_unresolvable_allocation_join_without_a_driver_call`, `test_teardown_removes_a_failed_and_an_active_l1_row_in_one_login`, `test_after_the_teardown_and_a_tick_every_row_is_released`, `test_a_held_build_whose_failure_lands_late_is_left_failed_as_before`, `test_a_held_build_whose_success_lands_late_is_a_pending_release`, `test_a_build_whose_claim_expired_is_parked_and_removed`, `test_a_failed_build_twinned_by_an_active_row_of_its_key_is_left_alone`, `test_an_l2_failed_build_on_another_allocation_of_an_active_port_is_removed`); `tests/integration/test_l3_intent_execution.py` (`test_cancel_after_a_failed_route_change_removes_every_route_ever_configured`); `tests/integration/test_ledger_teardown.py` (`test_cancel_while_every_build_is_failed_releases_every_row`); `tests/integration/test_failed_teardown.py` (`test_l1_failed_event_disconnects_applied_pairs_and_failed_builds`)
 
 **Out of scope.** Dynamic-instance teardown, which runs after this (`dynamic-resources.md`);
 the fork archive (`reservations.md`, RES-FORK-11).
@@ -1532,7 +1614,9 @@ transitions are WIRE-CLAIM-1 to WIRE-CLAIM-3.
   allocation (L2), so content a non-comparing writer added in the window leaves the
   record, as before #1496 (the WIRE-CLAIM-1 stale-content limit). A write on a row the pass holds takes no direction compare (its
   claim compared it; WIRE-CLAIM-8 and WIRE-CLAIM-9 still decide whether it lands), and
-  the key-based writes (no row id, the reconcile's) are unchanged. \
+  the key-based writes (no row id, the reconcile's) take no direction compare; on a
+  frozen reservation they record a build failure as a pending release instead
+  (WIRE-LEDGER-17), so a late one no longer undoes a park either. \
   Enforced in: `services/execution/app/services/wiring_claim.py` (`direction_admits`, `direction_guarded_values`); `services/execution/app/services/l1_assignment_service.py` (`_record_l1_failed_for_row`); `services/execution/app/services/l2_membership_service.py` (`_record_l2_failed_for_row`); `services/execution/app/services/route_service.py` (`_record_route_failed_for_row`) \
   Pinned by: `services/execution/tests/test_wiring_claim_direction.py` (`test_a_failure_recorded_before_the_claim_does_not_undo_a_park`, `test_a_teardown_park_survives_a_provision_load_failure_on_a_frozen_reservation`, `test_a_failure_write_on_a_row_the_pass_does_not_hold_compares_the_direction`, `test_a_failure_write_on_a_row_the_pass_holds_takes_no_direction_compare`, `test_a_refused_failure_write_is_rolled_back_in_the_callers_session`, `test_a_frozen_join_on_the_nil_row_survives_the_reallocation_failure`, `test_known_limit_an_admitted_frozen_release_failure_records_only_its_routes`); `services/execution/tests/test_wiring_retry_claim_race_live_pg.py` (`test_a_refused_failure_write_is_rolled_back_on_postgres`)
 
@@ -1644,15 +1728,22 @@ full list.
 | `INTERNAL_API_TOKEN` | empty | Token for the internal routes and every outgoing internal call; empty makes the internal routes answer 500 |
 
 Fixed in code, not configurable: `max_deliver` 5; one message per fetch with a 5 second
-wait; three in-line driver attempts with 0.2 s doubling to 2 s; 10 s for every
-inventory, cabling, and reservations call; VLAN range 2 to 4094 with five allocation
+wait; three in-line driver attempts with 0.2 s doubling to 2 s; 10 s per phase for every
+call the consumer and the retry channels make to inventory, cabling, reservations, and
+secrets, except two that take 30 s per phase: the dynamic device create
+(`POST /devices/internal`) and the driver package download, which also ends at 120 s in
+total (CFG-LOAD-2); 20 s in total for each read through `_get_internal` (the event
+check, and the device, template, latest config, hypervisor, secret, and fork reads;
+`INTERNAL_READ_DEADLINE_SECONDS`, issue #1498), while the other calls (the fabric
+lookup, the dynamic device create and delete, and the provision-result post) have no
+total bound; VLAN range 2 to 4094 with five allocation
 attempts; the claim budget (WIRE-CLAIM-3).
 
 ## 12. Test coverage map
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/execution/tests/` (in-memory SQLite): `test_nats_consumer*.py`, `test_l1_assignment_service.py`, `test_l2_membership_service.py`, `test_route_service.py`, `test_vlan_service*.py`, `test_wiring_retry*.py`, `test_wiring_claim.py`; `services/common/tests/test_jetstream.py`; `tests/unit/test_consumer_heartbeat_wiring.py`; `frontend/src/test/components/ReservationWiringTab.test.tsx`, `frontend/src/test/api/reservationWiring.test.tsx` | Driver calls are recorded fakes; `FOR UPDATE SKIP LOCKED` and row locks are no-ops on SQLite |
+| Unit | `services/execution/tests/` (in-memory SQLite): `test_nats_consumer*.py`, `test_l1_assignment_service.py`, `test_l2_membership_service.py`, `test_route_service.py`, `test_vlan_service*.py`, `test_wiring_retry*.py`, `test_wiring_claim.py`, `test_frozen_wiring_settles.py`; `services/common/tests/test_jetstream.py`; `tests/unit/test_consumer_heartbeat_wiring.py`; `frontend/src/test/components/ReservationWiringTab.test.tsx`, `frontend/src/test/api/reservationWiring.test.tsx` | Driver calls are recorded fakes; `FOR UPDATE SKIP LOCKED` and row locks are no-ops on SQLite |
 | Functional (through the service API) | `services/execution/tests/test_router_wiring_endpoints.py` (httpx against the app); `services/execution/tests/test_wiring_retry_claim_race_live_pg.py` and `services/execution/tests/test_wiring_retry_due_predicate_live_pg.py` against a real Postgres | The two live suites run in the `make master` and `make everything` gates |
 | Integration (running stack) | `tests/integration/test_wiring_changed_reconcile.py`, `test_l1_provisioning.py`, `test_l2_reconcile.py`, `test_vlan_assignment.py`, `test_l3_reconcile.py`, `test_l3_route_provisioning.py`, `test_l3_intent_execution.py`, `test_l2_l3_result_gating.py`, `test_ledger_teardown.py`, `test_failed_teardown.py`, `test_event_verification_gate.py`, `test_dlq_and_idempotency.py`, `test_device_set_patch_wiring.py`, `test_nats_consumer_configs_live.py` | Drive the checked-in mock drivers; the NOS lab tiers (`tests/nos_lab/`) drive real FRR and SR Linux and are covered in `device-configuration.md` |
 | Stress and load | None | No load test drives fork saves, wiring retries, or teardown; `tests/load/locustfile.py` covers reservations and topology validation only |
@@ -1663,7 +1754,8 @@ live-Postgres claim suite, the integration suite, and the browser suite were rea
 run. The exception is WIRE-RETRY-13, WIRE-RETRY-14, WIRE-RETRY-19, and WIRE-RETRY-20
 (issue #1190), whose live-Postgres suite
 `test_wiring_retry_due_predicate_live_pg.py` was run against a used execution schema
-and against an empty one.
+and against an empty one, and WIRE-LEDGER-17 (issue #1501), whose two tests in the
+live-Postgres claim suite were run the same way on a throwaway Postgres 16.
 The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
 
 ## 13. Known limits and gaps
@@ -1697,6 +1789,41 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
   re-save, which needs an ACTIVE reservation (an ended reservation's release rows are the
   open defect above, issue #1199). Recorded in ADR 0007 (Decision 5) and the comment on
   `NON_RETRYABLE_REASON_PREFIXES`.
+- What is left of a frozen reservation's unsettled wiring after #1501 (WIRE-LEDGER-17,
+  WIRE-TEARDOWN-6), each recorded in issue #1501:
+  - A key-based build failure whose statement's snapshot predates the freeze and that
+    commits after the teardown's read of FAILED rows records intended `ACTIVE`, which no
+    pass drives (the frozen read inside the statement cannot see a freeze committed
+    after its snapshot). It needs a reconcile and a terminal event handled
+    concurrently, so more than one consumer process (WIRE-CONSUME-1).
+  - A frozen release drives the content its pass planned (WIRE-CLAIM-1, issue #1481,
+    ADR 0018 draft): content a key-based write added after the plan is neither driven
+    nor kept, now also when that write records a pending release. The teardown form:
+    the teardown reads an ACTIVE pin, an intent-delta failure then lands on it as a
+    pending release with an added route, and the teardown removes only the routes it
+    read and records the pin RELEASED with the added route still installed (before
+    #1501 nothing was removed and the pin stayed FAILED intended `ACTIVE`). Pinned by
+    `test_known_limit_a_teardown_deprovision_removes_only_the_routes_it_read`.
+  - An L1 or L2 build row a retry pass holds a live claim on at the teardown is left as
+    before #1501 (WIRE-TEARDOWN-6): a holder that fails or dies leaves it FAILED
+    intended `ACTIVE`, which no pass drives on a frozen reservation, and a connect or
+    join that timed out may have landed under it. Keeping the claim through a park and
+    recording a frozen build failure by row id as a pending release would settle it;
+    not done here.
+  - An L1 pair with two non-RELEASED rows of one reservation (a FAILED intended-`ACTIVE`
+    twin of an ACTIVE row, which only a concurrent-insert race creates) is not parked by
+    the teardown, but the ACTIVE row's own `release_l1_connection` then raises
+    `MultipleResultsFound`, which aborts the teardown before L2 and L3 and leaves the
+    message to be redelivered, as before #1501.
+  - Two defensive guards in the teardown are not pinned by a test: the claim guard around
+    the direct release of a nil or dangling L2 row, and the skip of a nil or dangling row
+    on a port with an ACTIVE row. A held nil row is not reachable through the retry tick,
+    which never claims a pinned-reason row.
+  - The teardown claims nothing on L3 (issue #1481), as before #1501: it parks and
+    removes a pin a retry pass holds. The holder's success is re-recorded as a pending
+    release (WIRE-LEDGER-4), and its partial-failure write still lands over the parked
+    pin (WIRE-CLAIM-8's wider condition, intended `ACTIVE`), where a deprovision not
+    yet driven then skips it.
 - Only an event's status is corroborated, not its device ids (WIRE-GATE-5), and NATS
   itself has no authentication. Recorded in the comment above
   `_EVENT_CORROBORATION_RULES` and in [SECURITY.md](../../SECURITY.md).

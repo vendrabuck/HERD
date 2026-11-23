@@ -591,9 +591,9 @@ reservation in the batch is still driven. A known limit by decision, WIRE-RETRY-
   needs an `ACTIVE` reservation. A row that was going to RELEASE (`intended` is `RELEASED`)
   may mean the hardware was left connected: the disconnect never ran, and no retry channel
   will run it later (an open defect, issue #1199). Re-publishing the reservation's terminal
-  event does not recover these rows either: the teardown pass reads only `ACTIVE` L1 and L2
-  rows and, for L3, `ACTIVE` pins and `FAILED` pins intended `ACTIVE`, never a `FAILED` row
-  intended `RELEASED` (`_teardown_from_ledgers`). Read the row with
+  event does not recover these rows either: the teardown pass reads `ACTIVE` rows and
+  `FAILED` rows intended `ACTIVE` (on L1 and L2 only those with a retryable reason, since
+  issue #1501), never a `FAILED` row intended `RELEASED` (`_teardown_from_ledgers`). Read the row with
   `GET /api/reservations/{id}/wiring-status` (any status, owner or admin), which lists each
   row's switch, and its ports for L1 and L2. For a reason such as a missing template or `driver load failed:
   DriverPackageError` the switch is still in inventory: check on the switch whether the
@@ -608,9 +608,10 @@ reservation in the batch is still driven. A known limit by decision, WIRE-RETRY-
   `INTERNAL_API_TOKEN` rotation (every service must hold the new value, or
   service-to-service calls answer 403 until they do), or any other answer that is not a
   200 carrying a JSON object or a 404, is transient: the event is NAKed with backoff and
-  the ACTIVE rows keep their status, attempts, and reason (a `FAILED` L3 pin intended
+  the ACTIVE rows keep their status, attempts, and reason (a `FAILED` row intended
   `ACTIVE` is the exception: teardown parks it intended `RELEASED` before it reads the
-  switch, issue #1001, and the retry tick finishes it). In a retry, the tick leaves the
+  switch, issue #1001 for L3 pins and #1501 for L1 and L2 rows with a retryable reason,
+  and the retry tick finishes it). In a retry, the tick leaves the
   rows of a reservation whose apply hit the error unchanged and counts them in
   `skipped_upstream`; a build row whose endpoint read fails while the tick re-checks its
   intent reads back `still_failed` only, and a manual retry answers 503. An L3 row that

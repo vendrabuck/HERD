@@ -72,7 +72,8 @@ Shape, and why it is this shape:
     (for example while the claim waits on the row's lock) reads as not frozen and the
     release is refused like any other mismatch. That is safe for exclusion (it never
     drives), but on a frozen reservation the refused row is the unsettled case: it
-    waits FAILED intended ACTIVE like any such row (see `direction_admits`).
+    waits FAILED intended ACTIVE, and is settled only if the terminal teardown reads
+    it after that (see `direction_admits`).
 
 Who may use these readers, and who may not. `claimable_row_ids` and `unclaimed`
 are for the RETRY CHANNELS ONLY. The wiring_changed reconcile in `nats_consumer`
@@ -290,8 +291,16 @@ def direction_admits(model, intended: str):
     new freeze). It reads as not frozen, and the release is refused like any other
     mismatch. That is safe for exclusion (it never drives), but on a frozen reservation
     a refusal is the unsettled case: the row is left FAILED intended ACTIVE, which no
-    retry drives. On L3 the teardown's read of FAILED pins parks and removes it unless
-    the flip lands after that read; on L1 and L2 nothing settles it, as on main.
+    retry drives. The terminal teardown's read of FAILED rows parks and removes it on
+    every layer (L3 since issue #1001, L1 and L2 since issue #1501), unless the flip
+    to intended ACTIVE landed after that read, and except an L1 or L2 row with a
+    pinned reason or under another pass's live claim, an L1 or L2 row whose key (and,
+    on L2, allocation) also has an ACTIVE row, and an L2 row with a nil or dangling
+    allocation on a port that has an ACTIVE row; and an L3 holder's
+    partial-failure write can land over a pin the teardown parked (WIRE-TEARDOWN-6).
+    A key-based build failure written after the freeze no longer makes that flip
+    (issue #1501: it records intended RELEASED on a frozen reservation), so what
+    remains is a flip by a writer whose statement read the reservation as not frozen.
     """
     if intended == "RELEASED":
         return or_(model.intended == "RELEASED", reservation_frozen(model))

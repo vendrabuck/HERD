@@ -500,9 +500,14 @@ both services.
 - **CFG-SCHEMA-11.** At load, execution reads `Driver.config_schema()` in the sandbox
   through the `__config_schema__` action, on the class without instantiating it and
   under the status timeout; no such method, a raise, a timeout, or a non-object answer
-  stores no schema, and the load still succeeds. \
-  Enforced in: `services/execution/app/services/driver_loader.py` (`extract_config_schema_json`, `load_driver`); `services/execution/app/services/driver_sandbox.py` (`extract_config_schema`); `services/execution/app/services/_runner.py` (`main`) \
-  Pinned by: `services/execution/tests/test_config_schema_extraction.py` (`test_extract_valid_schema_from_fixture`, `test_extract_no_schema_from_fixture`, `test_extract_schema_returning_non_dict`, `test_extract_schema_that_raises_is_failed_run`, `test_extract_does_not_instantiate_credential_dependent_init`, `test_extract_schema_timeout_surfaces_as_failed_run`); `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_persists_published_config_schema`, `test_load_driver_no_schema_leaves_column_null`, `test_load_driver_broken_config_schema_loads_and_stores_null`)
+  stores no schema, and the load still succeeds. The extraction (and the optional
+  `pip install` before it) runs on a worker thread, never on the event loop (issue
+  #1498). A load cancelled while the worker runs leaves the attempt's directory to the
+  worker, which removes it when it finishes; a load cancelled before the worker starts,
+  or whose extraction raises, removes it at once, and the exception reaches the caller
+  unchanged. \
+  Enforced in: `services/execution/app/services/driver_loader.py` (`extract_config_schema_json`, `_SchemaExtraction`, `load_driver`); `services/execution/app/services/driver_sandbox.py` (`extract_config_schema`); `services/execution/app/services/_runner.py` (`main`) \
+  Pinned by: `services/execution/tests/test_config_schema_extraction.py` (`test_extract_valid_schema_from_fixture`, `test_extract_no_schema_from_fixture`, `test_extract_schema_returning_non_dict`, `test_extract_schema_that_raises_is_failed_run`, `test_extract_does_not_instantiate_credential_dependent_init`, `test_extract_schema_timeout_surfaces_as_failed_run`); `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_persists_published_config_schema`, `test_load_driver_no_schema_leaves_column_null`, `test_load_driver_broken_config_schema_loads_and_stores_null`); `services/execution/tests/test_driver_load_off_loop.py` (`test_load_driver_keeps_the_event_loop_running_during_schema_extraction`, `test_cancel_while_the_worker_runs_removes_the_directory_after_the_worker`, `test_cancel_while_queued_removes_the_directory_and_never_runs_the_extraction`, `test_an_extraction_that_raises_removes_the_directory_and_reraises`, `test_handoff_completed_unabandoned_keeps_the_directory`, `test_handoff_abandon_after_the_worker_finished_removes_the_directory`, `test_handoff_abandon_before_the_worker_starts_removes_it_and_skips_the_extraction`, `test_handoff_abandon_while_the_worker_runs_leaves_removal_to_the_worker`, `test_handoff_worker_exception_still_marks_it_done`, `test_abandon_between_runs_check_and_start_waits_for_the_lock`)
 - **CFG-SCHEMA-12.** Execution validates a `configure` call's keyword arguments after
   the driver load, so the schema of the SHA256 being run applies, with the same
   fallback to the registry. \
@@ -1205,10 +1210,16 @@ is WIRE-DRIVER-7 in `provisioning-and-wiring.md`.
   Enforced in: `services/execution/app/services/driver_loader.py` (`get_cached_driver`) \
   Pinned by: `services/execution/tests/test_driver_loader_advanced.py` (`test_cache_miss`, `test_cache_hit`, `test_cache_sha256_mismatch`, `test_cache_path_missing`); `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_cache_hit`)
 - **CFG-LOAD-2.** A miss downloads the archive from inventory's internal download route
-  with the internal token and 30 seconds; a failure raises a `RuntimeError` naming only
-  the cause's class, which callers treat as transient. \
-  Enforced in: `services/execution/app/services/driver_loader.py` (`download_driver_package`, `load_driver`) \
-  Pinned by: `services/execution/tests/test_driver_loader_load.py` (`test_download_driver_package_success`, `test_download_driver_package_failure`, `test_load_driver_download_failure`, `test_load_driver_download_failure_sanitizes_foreign_text`)
+  with the internal token, httpx's 30 second timeout per phase, and a 120 second total
+  deadline (`DRIVER_DOWNLOAD_DEADLINE_SECONDS`, a constant, issue #1498), so a response
+  that keeps dripping under the per-phase timeout still ends; a failure, the deadline
+  included, raises a `RuntimeError` naming only the cause's class (`TimeoutError` for
+  the deadline), which callers treat as transient. The archive is read into memory, so
+  a download cut off leaves nothing on disk and no cache row. A cancellation from
+  outside, an outer deadline that expires first included, propagates as itself and is
+  never turned into that failure. \
+  Enforced in: `services/execution/app/services/driver_loader.py` (`download_driver_package`, `DRIVER_DOWNLOAD_DEADLINE_SECONDS`, `load_driver`) \
+  Pinned by: `services/execution/tests/test_driver_loader_load.py` (`test_download_driver_package_success`, `test_download_driver_package_failure`, `test_load_driver_download_failure`, `test_load_driver_download_failure_sanitizes_foreign_text`); `services/execution/tests/test_upstream_total_deadlines.py` (`test_deadlines_are_the_documented_constants`, `test_download_drip_is_cut_at_the_total_deadline`, `test_download_under_the_deadline_returns_the_body`, `test_load_driver_maps_a_download_deadline_to_the_transient_failure`, `test_cancelling_a_download_propagates_and_is_not_a_deadline`, `test_an_outer_timeout_shorter_than_the_download_deadline_is_the_outer_one`)
 - **CFG-LOAD-3.** The archive is extracted into a directory of the load's own,
   `DRIVER_CACHE_PATH/<driver id>-<random hex>`, never shared with another load: a
   `.zip`, or a `.tar.gz` or `.tgz` through the tar `data` filter; entries cannot land
@@ -1278,11 +1289,12 @@ is WIRE-DRIVER-7 in `provisioning-and-wiring.md`.
   Enforced in: `services/execution/app/services/driver_loader.py` (`load_driver`, `_record_cache_row`) \
   Pinned by: `services/execution/tests/test_driver_loader_load.py` (`test_load_driver_download_and_cache`, `test_load_driver_updates_existing_cache`, `test_load_driver_updates_existing_row_under_concurrent_insert`, `test_load_driver_replaces_row_of_another_package_and_removes_its_directory`)
 - **CFG-LOAD-6.** Concurrent first loads of one driver both succeed: each extracts into
-  its own directory (CFG-LOAD-3), the insert that loses the unique driver id does
+  its own directory (CFG-LOAD-3), their schema extractions may run at the same time on
+  worker threads (CFG-SCHEMA-11), the insert that loses the unique driver id does
   nothing, and the loser, finding the winner's row for the same SHA256 with its
   directory present, returns the winner's directory and removes its own. \
   Enforced in: `services/execution/app/services/driver_loader.py` (`load_driver`, `_record_cache_row`); `services/execution/app/models/driver_cache.py` (`DriverCache`) \
-  Pinned by: `services/execution/tests/test_driver_loader_load.py` (`test_concurrent_first_loads_of_one_driver_both_succeed`, `test_load_driver_adopts_row_written_after_its_own_read`)
+  Pinned by: `services/execution/tests/test_driver_loader_load.py` (`test_concurrent_first_loads_of_one_driver_both_succeed`, `test_load_driver_adopts_row_written_after_its_own_read`); `services/execution/tests/test_driver_load_off_loop.py` (`test_two_first_loads_extract_concurrently_and_both_succeed`)
 
 **Out of scope.** Driver upload, replacement, and storage (`inventory.md`, INV-DRV-1 to
 INV-DRV-18); the method contract of each connection type ([DRIVERS.md](../DRIVERS.md)).
@@ -1519,7 +1531,7 @@ status.
 | execution to inventory | inventory | `GET /devices/{id}/config-versions/{vid}` with the admin's token, 10 s | a retry of a masked run | 404 is 409, anything else unreadable is 503 (CFG-RUN-7) |
 | execution to inventory | inventory | `GET /device-groups/visible-devices?user_id` with the caller's token, 10 s | a non-admin's run list and transcript read | fail closed: 503 (CFG-RUN-3, CFG-TX-5) |
 | execution to inventory | inventory | `GET /devices/{id}/internal`, `GET /templates/{id}/internal` (`X-Internal-Token`, 10 s) | the device and template of an action | 404 is relayed; anything else, a body that is not a JSON object included, 503 (CFG-EXEC-4) |
-| execution to inventory | inventory | `GET /drivers/{id}/internal-download` (`X-Internal-Token`, 30 s) | the driver archive on a cache miss | the run is `FAILED` with `driver load failed: <ClassName>` (CFG-LOAD-2, CFG-EXEC-9) |
+| execution to inventory | inventory | `GET /drivers/{id}/internal-download` (`X-Internal-Token`, 30 s per phase, 120 s total) | the driver archive on a cache miss | the run is `FAILED` with `driver load failed: <ClassName>` (CFG-LOAD-2, CFG-EXEC-9) |
 | execution to a driver | the driver package | a sandboxed subprocess | every driver method | the run records the failure (CFG-SBX-5, CFG-SBX-7, CFG-RUNSTATE-4) |
 
 The calls other services make to this area are section 7 and, for ai-orchestrator's
@@ -1548,7 +1560,7 @@ See [ENV_VARS.md](../ENV_VARS.md) for the rest.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/common/tests/test_device_config.py`, `services/common/tests/test_acl.py`, `services/common/tests/test_bounded_tar.py`; `services/inventory/tests/test_published_schema.py`, `test_apply_scheduler.py`; `services/execution/tests/test_driver_loader*.py`, `test_driver_sandbox*.py`, `test_driver_structure.py`, `test_driver_load_sanitize_run.py`, `test_runner.py`, `test_sandbox_isolation.py`, `test_dry_run.py`, `test_driver_transcript.py`, `test_config_schema_extraction.py`, `test_configure_capability_parity.py`, `test_package_validator.py`; `tests/unit/test_checked_in_drivers_structure.py`; frontend `frontend/src/test/components/DeviceConfigSection.test.tsx`, `ApplyJobsPanel.test.tsx`, `AIApplyConfirmModal.test.tsx`, `frontend/src/test/lib/errors.test.ts`, `frontend/src/test/api/deviceConfig.test.tsx`, `deviceConfigJobs.test.tsx` | SQLite in memory; the sandbox suites start real child processes |
+| Unit | `services/common/tests/test_device_config.py`, `services/common/tests/test_acl.py`, `services/common/tests/test_bounded_tar.py`; `services/inventory/tests/test_published_schema.py`, `test_apply_scheduler.py`; `services/execution/tests/test_driver_loader*.py`, `test_driver_sandbox*.py`, `test_driver_structure.py`, `test_driver_load_sanitize_run.py`, `test_driver_load_off_loop.py`, `test_upstream_total_deadlines.py`, `test_runner.py`, `test_sandbox_isolation.py`, `test_dry_run.py`, `test_driver_transcript.py`, `test_config_schema_extraction.py`, `test_configure_capability_parity.py`, `test_package_validator.py`; `tests/unit/test_checked_in_drivers_structure.py`; frontend `frontend/src/test/components/DeviceConfigSection.test.tsx`, `ApplyJobsPanel.test.tsx`, `AIApplyConfirmModal.test.tsx`, `frontend/src/test/lib/errors.test.ts`, `frontend/src/test/api/deviceConfig.test.tsx`, `deviceConfigJobs.test.tsx` | SQLite in memory; the sandbox suites start real child processes |
 | Functional (through the service API) | `services/inventory/tests/test_device_configs.py`, `test_device_configs_rbac.py`, `test_apply_jobs_reservation_owner.py`, `test_apply_jobs_reservation_scope.py`, `test_device_config_write_rules.py`, `test_dry_run_gate.py`, `test_confirm_dry_run.py`, `test_configure_capability_gate.py`, `test_device_config_restore_reservation_guard.py`, `test_device_read_visibility_gate.py`, `test_apply_jobs_internal_summary.py`, `test_router_edge_cases.py`; `services/execution/tests/test_router_endpoints.py`, `test_router_direct.py`, `test_api_endpoints.py`, `test_command_log*.py`, `test_config_schema_endpoint.py`, `test_configure_capability_gate.py`, `test_execution_service_edges.py`, `test_manual_execute_reservation_scope.py` | acl, reservations, and execution are patched |
 | Integration (running stack) | `tests/integration/test_config_apply_flow.py` (a config version validated through the schema proxy, a scheduled dry run fired by the scheduler on `drivers/frr_mgmt`, its transcript, the confirm, and the schedule's reservation check), `test_execution_configure_gate.py`, `test_execution_result_gating.py`, `test_execution_device_scope.py`, `test_package_validation.py`; the NOS lab tiers under `tests/nos_lab/` (`test_frr_mgmt_driver_live.py` drives the Management driver's `configure`) | The immediate apply and a real (not dry-run) scheduled push are not driven by this suite; the browser tests below drive both, to a device with no host; the dev and gate stacks run the scheduler every 2 seconds (`docker-compose.override.yml`) |
 | Stress and load | `tests/load/locustfile.py` (`DeviceConfigUser`: version list, create, detail, and diff, the driver config-schema proxy, and the apply-job list, on one device of its own) | No load task applies, schedules, cancels, or confirms: a push would reach execution and a driver |
@@ -1620,11 +1632,15 @@ None at present. (#1279 is resolved by CFG-LOAD-3.)
   methods are missing, and a `driver.py` that parses but does not compile, which that
   check refused ([DRIVERS.md](../DRIVERS.md), "Package structure") (CFG-LOAD-4).
 - The extraction ceilings and the tar read bound are constants, not settings
-  (CFG-LOAD-3).
+  (CFG-LOAD-3), and so is the download's total deadline (CFG-LOAD-2).
 - A tar package is decompressed twice on a cache miss, once by the ceiling scan and
   again by extraction, synchronously inside the async `load_driver`, so up to about
   twice the 100 MiB ceiling of gunzip work blocks the event loop (the
   `extract_driver_package` docstring) (CFG-LOAD-3).
+- A cache-miss load's config-schema extraction waits for a worker in the default
+  thread pool, which it shares with every other driver call (the wiring consumer's,
+  health polls, manual runs), package validation, and asyncio's `getaddrinfo`, and no
+  timer counts that wait (issue #1498, item 4, open) (CFG-SCHEMA-11).
 - The validator reports a raised step's message, which a driver run never stores (the
   `_validation_error_text` docstring) (CFG-VAL-8).
 - The published-schema lookup fails open to the registry (ADR 0002 and the
