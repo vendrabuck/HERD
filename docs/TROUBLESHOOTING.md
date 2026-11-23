@@ -641,8 +641,12 @@ reservation in the batch is still driven. A known limit by decision, WIRE-RETRY-
   on a stack whose configuration was saved in the config UI, `INTERNAL_API_TOKEN` is
   read from that `config.json`, not from `.env`, so change it in the config UI.
 - `excluded_frozen`: build-direction rows of reservations that have ended. A connection
-  is never built for an ended reservation, so these rows stay as a record of a build that
-  did not finish. No action is needed.
+  is never built for an ended reservation, so these rows stay as they are. A build that
+  did not confirm may still have landed (a driver call that timed out); since issue #1501
+  the teardown removes what such a row may have left, except on a row another retry pass
+  held while the teardown ran and whose holder then failed or died (WIRE-TEARDOWN-6 in
+  `docs/specs/provisioning-and-wiring.md`). For such a row, check the switch as described
+  for `excluded_not_retryable` above.
 
 `null` in place of a number means the count could not be read on that tick; the execution
 log carries a warning with the cause, and the tick still retried what it selected.
