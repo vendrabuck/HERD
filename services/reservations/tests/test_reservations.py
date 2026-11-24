@@ -660,11 +660,15 @@ async def _insert_reservation_row(
     start_offset: timedelta = timedelta(minutes=-30),
     end_offset: timedelta = timedelta(hours=1),
     topology_id: uuid.UUID | None = None,
+    user_id: str = USER_ID,
+    device_ids: tuple[str, ...] = (DEVICE_A,),
 ) -> str:
     """Insert a reservation row directly, bypassing the create router.
 
     Lets each test pin status + window precisely without invoking the inventory
-    mocks that `_create_test_reservation` requires.
+    mocks that `_create_test_reservation` requires. The owner and device set are
+    parameters so a lookup test can seed a reservation that must NOT match
+    (another owner, another device) beside the one that must (#1529).
     """
     rid = uuid.uuid4()
     now = datetime.now(timezone.utc)
@@ -672,9 +676,9 @@ async def _insert_reservation_row(
         session.add(
             Reservation(
                 id=rid,
-                user_id=uuid.UUID(USER_ID),
+                user_id=uuid.UUID(user_id),
                 owner_name="testuser",
-                device_ids=[DEVICE_A],
+                device_ids=list(device_ids),
                 topology_id=topology_id,
                 topology_type=TopologyType.PHYSICAL,
                 purpose="internal-status-test",
@@ -1037,6 +1041,86 @@ async def test_internal_active_no_collision_with_int_status_path(internal_client
     # before even reaching the handler. We get a 200 with our own schema body.
     assert resp.status_code == 200
     assert "owns_active" in resp.json()
+
+
+# --- Device lookups answer only from the reservation holding the device (#1529) ---
+#
+# RES-INTERNAL-3, -4, and -5 each test membership with an EXISTS over
+# reservation_devices that must be correlated to the outer reservation. A lookup
+# for a device that no reservation holds is false with or without that
+# correlation, so every test below seeds two reservations, both live and in
+# window: USER_ID holds only DEVICE_A and OTHER_USER_ID holds only DEVICE_B. Each
+# device is then queried, and the answer must come from its holder alone.
+
+HOLDER = {DEVICE_A: USER_ID, DEVICE_B: OTHER_USER_ID}
+QUERIED_DEVICE = pytest.mark.parametrize(
+    "device_id", [DEVICE_A, DEVICE_B], ids=["device_a", "device_b"]
+)
+
+
+async def _seed_one_holder_per_device(
+    status: ReservationStatus = ReservationStatus.ACTIVE,
+) -> dict[str, str]:
+    """Seed one reservation per device in HOLDER; map each device to its row's id."""
+    return {
+        device: await _insert_reservation_row(status=status, user_id=owner, device_ids=(device,))
+        for device, owner in HOLDER.items()
+    }
+
+
+@pytest.mark.asyncio
+@QUERIED_DEVICE
+@pytest.mark.parametrize("user_id", [USER_ID, OTHER_USER_ID], ids=["user", "other_user"])
+async def test_internal_active_answers_only_from_the_users_reservation_holding_the_device(
+    internal_client, device_id, user_id
+):
+    """RES-INTERNAL-3: each user owns an ACTIVE in-window reservation, but only one
+    of them holds the queried device; the other user's answer is false."""
+    await _seed_one_holder_per_device()
+    resp = await internal_client.get(
+        "/internal/active",
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+        params={"user_id": user_id, "device_id": device_id},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"owns_active": HOLDER[device_id] == user_id}
+
+
+@pytest.mark.asyncio
+@QUERIED_DEVICE
+async def test_active_users_lists_only_the_owner_of_the_reservation_holding_the_device(
+    internal_client, device_id
+):
+    """RES-INTERNAL-4: the owner of an ACTIVE in-window reservation on another
+    device is not a holder of the queried one."""
+    await _seed_one_holder_per_device()
+    resp = await internal_client.get(
+        "/internal/active-users",
+        params={"device_id": device_id},
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == [HOLDER[device_id]]
+
+
+@pytest.mark.asyncio
+@QUERIED_DEVICE
+@pytest.mark.parametrize("status", list(ReservationStatus), ids=lambda s: s.value)
+async def test_internal_by_device_returns_only_the_reservation_holding_the_device(
+    internal_client, device_id, status
+):
+    """RES-INTERNAL-5: by-device returns the reservation holding the device in every
+    status, and never a reservation in that same status on another device."""
+    rids = await _seed_one_holder_per_device(status)
+    resp = await internal_client.get(
+        f"/internal/by-device/{device_id}", headers={"X-Internal-Token": INTERNAL_TOKEN}
+    )
+    assert resp.status_code == 200
+    items = resp.json()
+    assert [item["id"] for item in items] == [rids[device_id]]
+    assert items[0]["user_id"] == HOLDER[device_id]
+    assert items[0]["device_id"] == device_id
+    assert items[0]["status"] == status.value
 
 
 # --- Cancel edge cases ---
