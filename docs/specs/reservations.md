@@ -50,7 +50,7 @@ numbered rules in section 8; section 5 names the caller condition for each route
 | Fork wiring ledger | The last fork version for which this service staged a `reservation.wiring_changed` event | reservations | `fork_wiring_ledger` (`ForkWiringLedger`) |
 | Outbox event | A lifecycle event written in the same transaction as the state change, published to NATS later | reservations | `outbox` (`OutboxEvent`) |
 | Purpose suggestion | The AI orchestrator's classification of a finished reservation, stored verbatim and reviewed by an admin | reservations (produced by ai-orchestrator) | `reservations.purpose_suggestion` |
-| Pending prune marker | Device ids removed from an ACTIVE reservation whose fork wiring release has not yet converged | reservations | `reservations.pending_fork_prune_device_ids` |
+| Pending prune marker | Device ids removed from an ACTIVE reservation whose fork wiring release has not yet converged; SQL NULL when nothing is pending, otherwise a non-empty list (RES-FORK-20) | reservations | `reservations.pending_fork_prune_device_ids` |
 | Provision clock | When the row last entered `PENDING_PROVISION`, written in the same statement as each entry (the create path's insert, the sweep's claim) and never cleared; the two provisioning backstops measure their timeout from it. Null on rows that predate migration 0017, which fall back to `updated_at` | reservations | `reservations.provision_started_at` |
 
 ## 4. State model
@@ -1046,9 +1046,28 @@ reconcile on the expiration loop.
   Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_wrapper_no_fork_keeps_marker_while_fork_may_appear`, `test_wrapper_archived_409_clears_marker`, `test_wrapper_failure_keeps_marker`); `services/reservations/tests/test_wiring_changed_staging.py` (`test_patch_remove_calls_prune_devices_and_stages_released_delta`)
 - **RES-FORK-17.** Each tick retries up to 20 reservations with a pending prune marker,
   oldest `updated_at` first, one attempt each; a marker on a non-ACTIVE reservation is
-  cleared without a prune. \
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_pending_prune_reconcile`, `_PENDING_PRUNE_BATCH`) \
-  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_sweep_retries_pending_prune_and_clears_on_success`, `test_sweep_terminal_reservation_clears_marker_without_prune`)
+  cleared without a prune, and one holding nothing actionable is healed (RES-FORK-20). \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_pending_prune_reconcile`, `_pending_prune_stmt`, `_PENDING_PRUNE_BATCH`) \
+  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_sweep_retries_pending_prune_and_clears_on_success`, `test_sweep_terminal_reservation_clears_marker_without_prune`, `test_each_tick_retries_the_oldest_batch_oldest_first_and_the_rest_next_tick`)
+- **RES-FORK-20.** The pending prune marker is SQL NULL exactly when nothing is pending,
+  held by three parts. Every writer stores SQL NULL or a non-empty list, whichever path
+  empties the marker (a full clear, a partial clear followed by a full one, a terminal or
+  corrupt-entry clear by the sweep) or never sets it. Migration 0018 repaired the stored
+  rows once: JSON `null` and an empty list, from before issue #1522, became SQL NULL (its
+  downgrade is a no-op). And the reconciler of RES-FORK-17 heals any marker it selects
+  that holds nothing actionable (anything but a non-empty list: JSON `null`, an empty
+  list, a corrupt non-list value, as a process on the previous code could still write) to
+  SQL NULL in the same tick, in any status, without iterating it, so a corrupt value
+  never stops the rows after it; the heal reads the marker again under the row lock,
+  which it holds until its UPDATE commits (so a concurrent write waits for the heal and
+  is never nulled by it), and leaves the marker if a concurrent write made it a
+  non-empty list. The heal's write also moves `updated_at` (the model's `onupdate`), as
+  the ORM clear always has. A non-list value is logged at
+  ERROR by type name only. So the reconciler never keeps a row with nothing pending in
+  its batch for more than one tick, and a backlog of emptied rows cannot keep a new
+  marker out of it. \
+  Enforced in: `services/reservations/app/models/reservation.py` (`Reservation`); `services/reservations/app/services/reservation_service.py` (`_clear_pending_fork_prune`, `_prune_marker_actionable`, `_heal_non_actionable_prune_marker`); `services/reservations/app/tasks/expiration.py` (`_run_pending_prune_reconcile`); `services/reservations/migrations/versions/0018_pending_fork_prune_sql_null.py` (`upgrade`) \
+  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_every_emptying_path_stores_sql_null_and_is_never_selected`, `test_union_during_an_inflight_prune_keeps_a_list_then_clears_to_sql_null`, `test_a_new_marker_is_pruned_behind_more_than_a_batch_of_emptied_rows`, `test_a_non_actionable_marker_is_healed_and_the_rows_behind_it_still_run`, `test_a_corrupt_marker_is_logged_at_error_by_type_only`, `test_a_real_marker_written_between_the_select_and_the_heal_survives`, `test_the_heal_leaves_sql_null_and_real_markers_unwritten`); `services/reservations/tests/test_pending_fork_prune_sql_null_migration.py` (`test_upgrade_leaves_exactly_sql_null_or_a_non_empty_list_and_runs_twice`, `test_upgrade_honours_db_schema`); `services/reservations/tests/test_pending_fork_prune_live_pg.py` (`test_every_orm_emptying_write_stores_sql_null_on_postgres`, `test_the_heal_stores_sql_null_for_json_null_and_a_corrupt_marker_on_postgres`, `test_the_heal_holds_the_row_lock_from_its_re_read_to_its_update`, `test_migration_0018_rewrites_empty_markers_to_sql_null_on_postgres`)
 - **RES-FORK-18.** Wiring status is readable in any status; wiring retry is refused with
   409 on `PENDING` and `PENDING_PROVISION`; execution's 4xx is relayed and its 5xx or
   absence is 503. \
@@ -1324,7 +1343,7 @@ before the missing-fork backstop gives up; 20 pending prunes per tick.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/reservations/tests/` (in-memory SQLite); `frontend/src/test/lib/reservationStatus.test.ts`, `frontend/src/test/lib/reservationBulk.test.ts`, `frontend/src/test/lib/reservationFilters.test.ts` | Advisory locks and `SKIP LOCKED` are no-ops on SQLite, so concurrency below the status CAS is not exercised here |
-| Functional (through the service API) | `services/reservations/tests/test_reservations.py`, `test_fork_endpoints.py`, `test_dynamic_requests.py`, `test_reservation_list_filters.py` (httpx against the app); the `*_live_pg.py` suites against a real Postgres: `test_reservation_status_cas_live_pg.py`, `test_reservation_sort_live_pg.py`, `test_reservation_list_filters_live_pg.py`, `test_sweep_claim_cancel_race_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
+| Functional (through the service API) | `services/reservations/tests/test_reservations.py`, `test_fork_endpoints.py`, `test_dynamic_requests.py`, `test_reservation_list_filters.py` (httpx against the app); the `*_live_pg.py` suites against a real Postgres: `test_reservation_status_cas_live_pg.py`, `test_reservation_sort_live_pg.py`, `test_reservation_list_filters_live_pg.py`, `test_sweep_claim_cancel_race_live_pg.py`, `test_pending_fork_prune_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
 | Integration (running stack) | `tests/integration/test_reservation_lifecycle.py`, `test_reservation_patch.py`, `test_reservation_list_filters.py`, `test_provisioning_failed.py`, `test_dynamic_resources.py`, `test_reservation_fork_flow.py`, `test_device_set_patch_wiring.py`, `test_purpose_category_flow.py`, `test_purpose_review_flow.py` | `test_overlapping_reservation_is_rejected` accepts 409 or 422; the purpose review flow needs an AI provider and never runs in CI |
 | Stress and load | `tests/load/locustfile.py` (`ReservationUser`: list, calendar, create, release) | Create contention on one device is intended; no load test covers the sweep, PATCH, or the fork routes |
 | Browser end-to-end | `tests/e2e/test_reservations.py`, `test_reservation_cancel_ui.py`, `test_reservation_detail.py`, `test_reservations_bulk_playwright.py`, `test_reservations_filters_playwright.py`, `test_reservations_sort_playwright.py`, `test_live_edit_reservation_topology.py` | E2E runs nightly and in the `make master` and `make everything` gates, not per pull request |
