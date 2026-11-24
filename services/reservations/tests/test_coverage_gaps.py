@@ -9,7 +9,11 @@ exception handling, and a few small schema/reporting validators. All external
 HTTP is mocked; NATS publishing is stubbed; no real DB or network is used.
 """
 
+import ast
+import inspect
+import textwrap
 import uuid
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1093,49 +1097,84 @@ class _StopLoop(Exception):
     pass
 
 
-@pytest.mark.asyncio
-async def test_expiration_loop_runs_both_cycles_and_handles_errors(caplog):
-    """One loop iteration runs the expiration cycle and the reminder cycle, logs
-    an error from each when they raise, then sleeps. We break out of the
-    otherwise-infinite loop by having the post-iteration sleep raise."""
+# RES-SWEEP-10 (issue #1531): every tick runs every step, and a step that raises
+# skips none of the others. The step list is the loop's own source: the test below
+# reads every bare-name call the while body awaits, so a fifth step added to the loop
+# fails it until the step and its error line are added here, and the parametrized
+# test then runs it, alone and with every other step raising.
+_LOOP_STEPS = {
+    "_run_expiration_cycle": "Expiration cycle failed",
+    "_run_reminder_cycle": "Expiry reminder cycle failed",
+    "_run_fork_archive_reconcile": "Fork archive reconcile cycle failed",
+    "_run_pending_prune_reconcile": "Pending fork-prune reconcile cycle failed",
+}
+
+
+def _steps_awaited_in_the_loop_body() -> list[str]:
+    """Every awaited call of a bare name inside expiration_loop's while body, in
+    source order. asyncio.sleep is an attribute call, so it is not a step."""
     from app.tasks import expiration
 
-    expiration_cycle = AsyncMock(side_effect=RuntimeError("cycle boom"))
-    reminder_cycle = AsyncMock(side_effect=RuntimeError("reminder boom"))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(expiration.expiration_loop)))
+    (loop,) = [node for node in ast.walk(tree) if isinstance(node, ast.While)]
+    awaited = [
+        node.value
+        for node in ast.walk(loop)
+        if isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+    ]
+    awaited.sort(key=lambda call: (call.lineno, call.col_offset))
+    return [call.func.id for call in awaited]
 
-    with (
-        patch.object(expiration, "_run_expiration_cycle", new=expiration_cycle),
-        patch.object(expiration, "_run_reminder_cycle", new=reminder_cycle),
-        patch.object(expiration.asyncio, "sleep", new=AsyncMock(side_effect=_StopLoop())),
-        caplog.at_level("ERROR", logger="app.tasks.expiration"),
-    ):
-        with pytest.raises(_StopLoop):
-            await expiration.expiration_loop(interval_seconds=1)
 
-    expiration_cycle.assert_awaited_once()
-    reminder_cycle.assert_awaited_once()
-    messages = [r.getMessage() for r in caplog.records]
-    assert any("Expiration cycle failed" in m for m in messages)
-    assert any("Expiry reminder cycle failed" in m for m in messages)
+def test_expiration_loop_awaits_exactly_the_four_named_steps():
+    assert _steps_awaited_in_the_loop_body() == list(_LOOP_STEPS)
+
+
+_FAILING_SETS = {
+    "none_raise": (),
+    **{f"{name}_raises": (name,) for name in _LOOP_STEPS},
+    "all_raise": tuple(_LOOP_STEPS),
+}
 
 
 @pytest.mark.asyncio
-async def test_expiration_loop_happy_path_single_iteration():
-    """Both cycles succeed; the loop still breaks on the patched sleep."""
+@pytest.mark.parametrize("case", list(_FAILING_SETS))
+async def test_expiration_loop_runs_every_step_and_a_failing_step_skips_none(case, caplog):
+    """One tick awaits each step exactly once whichever steps raise, logs one error
+    line per raising step carrying that step's exception, and reaches the sleep. The
+    otherwise-infinite loop ends because the patched sleep raises; no real clock."""
     from app.tasks import expiration
 
-    expiration_cycle = AsyncMock()
-    reminder_cycle = AsyncMock()
-    with (
-        patch.object(expiration, "_run_expiration_cycle", new=expiration_cycle),
-        patch.object(expiration, "_run_reminder_cycle", new=reminder_cycle),
-        patch.object(expiration.asyncio, "sleep", new=AsyncMock(side_effect=_StopLoop())),
-    ):
-        with pytest.raises(_StopLoop):
-            await expiration.expiration_loop(interval_seconds=5)
+    failing = _FAILING_SETS[case]
+    ran: list[str] = []
 
-    expiration_cycle.assert_awaited_once()
-    reminder_cycle.assert_awaited_once()
+    def step(name):
+        async def run():
+            ran.append(name)
+            if name in failing:
+                raise RuntimeError(name)
+
+        return run
+
+    sleep = AsyncMock(side_effect=_StopLoop())
+    with ExitStack() as stack:
+        for name in _LOOP_STEPS:
+            stack.enter_context(patch.object(expiration, name, new=step(name)))
+        stack.enter_context(patch.object(expiration.asyncio, "sleep", new=sleep))
+        stack.enter_context(caplog.at_level("ERROR", logger="app.tasks.expiration"))
+        with pytest.raises(_StopLoop):
+            await expiration.expiration_loop(interval_seconds=7)
+
+    assert ran == list(_LOOP_STEPS)
+    sleep.assert_awaited_once_with(7)
+    errors = [
+        (r.getMessage(), str(r.exc_info[1]))
+        for r in caplog.records
+        if r.name == "app.tasks.expiration" and r.levelname == "ERROR"
+    ]
+    assert errors == [(_LOOP_STEPS[name], name) for name in _LOOP_STEPS if name in failing]
 
 
 @pytest.mark.asyncio
