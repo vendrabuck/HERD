@@ -3,7 +3,6 @@ Reservations service tests.
 The inventory service HTTP calls are mocked with respx.
 """
 
-import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,11 +18,12 @@ from app.schemas.reservation import ProvisionResultRequest
 from app.services.reporting_service import _fetch_transit_devices as _real_fetch_transit_devices
 from app.services.reservation_service import TopologyDeviceNotMember, TopologyRoutingIntentInvalid
 from fastapi import FastAPI
-from fastapi.routing import RouteContext, iter_route_contexts
+from fastapi.routing import RouteContext
 from herd_common.enums import TopologyType
 from httpx import ASGITransport, AsyncClient
 
 from tests._harness import TestSessionLocal, override_bearer, override_get_db
+from tests._route_table import otherwise_valid_request, path_segments, routes_where
 
 USER_ID = str(uuid.uuid4())
 OTHER_USER_ID = str(uuid.uuid4())
@@ -1251,20 +1251,12 @@ KNOWN_INTERNAL_ROUTES = {
 
 
 def _is_internal_path(path: str) -> bool:
-    return "internal" in path.strip("/").split("/")
+    return "internal" in path_segments(path)
 
 
 def _internal_routes(routes=None) -> list[tuple[str, RouteContext]]:
     """(method, route) for every internal route of `routes` (the app's by default)."""
-    return sorted(
-        (
-            (method, route)
-            for route in iter_route_contexts(app.routes if routes is None else routes)
-            if route.methods is not None and _is_internal_path(route.path)
-            for method in route.methods - {"HEAD", "OPTIONS"}
-        ),
-        key=lambda pair: (pair[1].path, pair[0]),
-    )
+    return routes_where(_is_internal_path, routes)
 
 
 EVERY_INTERNAL_ROUTE = pytest.mark.parametrize(
@@ -1276,29 +1268,12 @@ EVERY_INTERNAL_ROUTE = pytest.mark.parametrize(
 
 def _otherwise_valid_request(route: RouteContext) -> dict:
     """The URL, query, and body that pass validation for `route`."""
-    where = "_otherwise_valid_request in services/reservations/tests/test_reservations.py"
-    values = {}
-    for kind, params in (
-        ("path", route.dependant.path_params),
-        ("query", route.dependant.query_params),
-    ):
-        for param in params:
-            annotation = param.field_info.annotation
-            assert annotation is uuid.UUID and param.field_info.is_required(), (
-                f"{route.path}: {kind} parameter {param.alias!r} is {annotation!r}, "
-                f"not a required UUID; add a valid value for it in {where}"
-            )
-            values[(kind, param.alias)] = str(uuid.uuid4())
-    url = re.sub(r"\{([^}:]+)[^}]*\}", lambda m: values[("path", m.group(1))], route.path)
-    query = {name: value for (kind, name), value in values.items() if kind == "query"}
-    request: dict = {"url": url, "params": query}
-    for body in route.dependant.body_params:
-        model = body.field_info.annotation
-        assert model in INTERNAL_BODIES, (
-            f"{route.path}: add a minimal valid {model.__name__} body to INTERNAL_BODIES"
-        )
-        request["json"] = INTERNAL_BODIES[model]
-    return request
+    return otherwise_valid_request(
+        route,
+        bodies=INTERNAL_BODIES,
+        bodies_name="INTERNAL_BODIES",
+        where="_otherwise_valid_request in services/reservations/tests/test_reservations.py",
+    )
 
 
 def test_internal_routes_are_read_from_the_app():

@@ -2,15 +2,19 @@
 
 These cover the ownership/gating matrix and the cabling forwarding + error mapping.
 The cabling HTTP calls are stubbed by patching the two service helpers the router
-imports (_cabling_fork_call, _lazy_create_reservation_fork), so no cabling stack runs.
+imports (_cabling_fork_call, _lazy_create_reservation_fork), so no cabling stack runs,
+except in the lazy-create section at the end, which fakes only the network under httpx
+(#1532). test_fork_and_wiring_routes.py does the same for every fork and wiring route.
 """
 
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import ANY, AsyncMock, patch
 
 import httpx
 import pytest
+import respx
 from app.database import get_db
 from app.dependencies.auth import get_current_user_payload
 from app.main import app
@@ -564,3 +568,117 @@ async def test_a_cabling_413_is_relayed_as_413_with_its_detail(method, suffix):
             resp = await ac.request(method, f"/{rid}/{suffix}", json={"canvas_data": {}})
     assert resp.status_code == 413
     assert resp.json() == _CABLING_413
+
+
+# --- The lazy create, unmocked (#1532, RES-FORK-5) ------------------------------------
+#
+# Nothing in the service is patched: respx stands in for cabling under httpx, so
+# get_reservation_fork, _lazy_create_reservation_fork, _cabling_fork_call, and
+# call_service all run. The fork read answers 404 and then the fork, so a create
+# that was not treated as refused shows as a 200.
+
+LAZY_TOKEN = "lazy-create-internal-token"
+FORKS_URL = f"{reservation_service.settings.cabling_service_url}/internal/forks"
+
+
+@pytest.fixture
+def cabling(monkeypatch):
+    monkeypatch.setattr(reservation_service.settings, "internal_api_token", LAZY_TOKEN)
+    with respx.mock(assert_all_called=False) as router:
+        yield router
+
+
+def _mock_fork_read(cabling, rid: uuid.UUID, fork_body: dict):
+    return cabling.get(f"{FORKS_URL}/{rid}").mock(side_effect=[_resp(404), _resp(200, fork_body)])
+
+
+async def _device_ids_of(rid: uuid.UUID) -> list[str]:
+    async with TestSessionLocal() as db:
+        return [str(d) for d in (await db.get(Reservation, rid)).device_ids]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_topology", [True, False], ids=["topology", "no-topology"])
+@pytest.mark.parametrize(
+    ("sub", "role"), [(OWNER_ID, "user"), (ADMIN_ID, "admin")], ids=["owner", "admin"]
+)
+@pytest.mark.parametrize("create_status", [200, 201])
+async def test_lazy_create_posts_the_reservations_own_parent_topology_and_rereads(
+    cabling, has_topology, sub, role, create_status
+):
+    """The create carries the reservation's parent topology, JSON null only when it has
+    none, and its own devices. Another owner's ACTIVE reservation with a topology of
+    its own is inserted first, so an admin load of the wrong row would send its values."""
+    await _insert_reservation(owner=OTHER_ID, topology_id=uuid.uuid4())
+    topology_id = uuid.uuid4() if has_topology else None
+    rid = await _insert_reservation(topology_id=topology_id)
+    fork_body = {"reservation_id": str(rid), "status": "ACTIVE"}
+    read = _mock_fork_read(cabling, rid, fork_body)
+    create = cabling.post(FORKS_URL).mock(return_value=_resp(create_status, {"id": "f"}))
+    async with _client_as(sub, role) as ac:
+        resp = await ac.get(f"/{rid}/fork")
+    assert resp.status_code == 200
+    assert resp.json() == fork_body
+    assert read.call_count == 2
+    assert create.call_count == 1
+    sent = create.calls.last.request
+    assert sent.headers["X-Internal-Token"] == LAZY_TOKEN
+    assert json.loads(sent.content) == {
+        "reservation_id": str(rid),
+        "parent_topology_id": str(topology_id) if has_topology else None,
+        "parent_version_id": None,
+        "created_by": OWNER_ID,
+        "member_device_ids": await _device_ids_of(rid),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("create_status", [400, 404, 409, 422, 499, 500, 503])
+async def test_a_refused_or_failed_lazy_create_answers_503_with_cablings_status(
+    cabling, create_status
+):
+    """400 is the lowest refusal; the 409 RES-FORK-5 names is among them. The re-read
+    would return the fork, so a refusal that fell through would answer 200."""
+    rid = await _insert_reservation(topology_id=uuid.uuid4())
+    _mock_fork_read(cabling, rid, {"reservation_id": str(rid)})
+    cabling.post(FORKS_URL).mock(
+        return_value=_resp(create_status, {"detail": "fork create refused"})
+    )
+    async with _client_as(OWNER_ID) as ac:
+        resp = await ac.get(f"/{rid}/fork")
+    assert resp.status_code == 503
+    assert resp.json()["detail"].startswith(f"Cabling fork-create returned {create_status}: ")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError],
+    ids=lambda e: e.__name__,
+)
+async def test_a_lazy_create_that_cannot_reach_cabling_answers_503(cabling, error):
+    rid = await _insert_reservation(topology_id=uuid.uuid4())
+    _mock_fork_read(cabling, rid, {"reservation_id": str(rid)})
+    cabling.post(FORKS_URL).mock(side_effect=error)
+    async with _client_as(OWNER_ID) as ac:
+        resp = await ac.get(f"/{rid}/fork")
+    assert resp.status_code == 503
+    assert resp.json()["detail"].startswith("Failed to contact cabling service: ")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [s for s in ReservationStatus if s != ReservationStatus.ACTIVE],
+    ids=lambda s: s.value,
+)
+async def test_a_fork_miss_outside_active_is_404_fork_not_found_with_no_create(cabling, status):
+    rid = await _insert_reservation(status=status, topology_id=uuid.uuid4())
+    read = _mock_fork_read(cabling, rid, {"reservation_id": str(rid)})
+    create = cabling.post(FORKS_URL).mock(return_value=_resp(201, {"id": "f"}))
+    async with _client_as(OWNER_ID) as ac:
+        resp = await ac.get(f"/{rid}/fork")
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Fork not found"}
+    assert read.call_count == 1
+    assert create.call_count == 0
