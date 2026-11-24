@@ -1100,7 +1100,7 @@ RES-FORK-17). Fork status, versions, and the restore marker are section 4.
   Pinned by: `services/cabling/tests/test_fork_devices_batch.py` (`test_batch_returns_sorted_distinct_ids_active_and_archived`, `test_batch_id_with_no_fork_is_absent`, `test_batch_empty_list_is_422`, `test_batch_over_cap_is_422`, `test_batch_exactly_at_cap_is_accepted`)
 
 **Out of scope.** When reservations creates, saves, prunes, or archives a fork, and the
-user-facing forwarding, are `reservations.md` (RES-FORK-1 to RES-FORK-19). What execution
+user-facing forwarding, are `reservations.md` (RES-FORK-1 to RES-FORK-20). What execution
 builds from the wires and routes is `provisioning-and-wiring.md`.
 
 ### 8.13 Topology templates
