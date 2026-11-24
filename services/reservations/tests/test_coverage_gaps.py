@@ -1124,8 +1124,6 @@ _LOOP_STEPS = {
 }
 _LOOP_AWAITS = [*_LOOP_STEPS, "asyncio.sleep"]
 
-_NEW_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
-
 
 def _dotted(node: ast.AST) -> str:
     """A key for an expression, built from the AST (never `ast.unparse`): a name, an
@@ -1139,28 +1137,54 @@ def _dotted(node: ast.AST) -> str:
     return f"<{type(node).__name__}>"
 
 
+def _run_in_this_scope(node: ast.AST) -> list[ast.AST]:
+    """The child nodes of `node` that run where `node` runs. A nested function, lambda,
+    or class contributes only what is evaluated at its definition (decorators, default
+    values, annotations, a class's bases and keywords), never its body."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        args = node.args
+        parts: list[ast.AST | None] = [*args.defaults, *args.kw_defaults]
+        if not isinstance(node, ast.Lambda):
+            parts += [*node.decorator_list, node.returns]
+            every_arg = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+            every_arg += [arg for arg in (args.vararg, args.kwarg) if arg is not None]
+            parts += [arg.annotation for arg in every_arg]
+        return [part for part in parts if part is not None]
+    if isinstance(node, ast.ClassDef):
+        return [*node.decorator_list, *node.bases, *node.keywords]
+    return list(ast.iter_child_nodes(node))
+
+
 def _awaits_in(node: ast.AST) -> list[str]:
     keys: list[str] = []
-    for child in ast.iter_child_nodes(node):
-        if isinstance(child, _NEW_SCOPES):
-            continue
-        if isinstance(child, ast.Await):
-            value = child.value
-            if isinstance(value, ast.Call):
-                keys.append(_dotted(value.func))
-            else:
-                keys.append(f"<awaited non-call {_dotted(value)}>")
+    if isinstance(node, ast.Await):
+        value = node.value
+        if isinstance(value, ast.Call):
+            keys.append(_dotted(value.func))
+        else:
+            keys.append(f"<awaited non-call {_dotted(value)}>")
+    elif isinstance(node, ast.AsyncWith):
+        keys += [f"async with {_dotted(item.context_expr)}" for item in node.items]
+    elif isinstance(node, ast.AsyncFor) or (isinstance(node, ast.comprehension) and node.is_async):
+        keys.append(f"async for {_dotted(node.iter)}")
+    for child in _run_in_this_scope(node):
         keys.extend(_awaits_in(child))
     return keys
 
 
 def _per_tick_awaits(source: str) -> list[str]:
-    """Every `await` inside the one top-level `while` loop of the async function in
-    `source`, keyed by what it awaits: a call by its callee's dotted name
-    (`_run_reminder_cycle`, `asyncio.sleep`, `asyncio.gather`, `mod._run_x`), anything
-    else as `<awaited non-call ...>`. Awaits in the loop's condition, its body at any
-    depth (inside `try`, `if`, `with`, nested loops, comprehensions, another await's
-    arguments), and its `else` are counted.
+    """Every await inside the one top-level `while` loop of the async function in
+    `source`, keyed by what it awaits. An `await` of a call is keyed by its callee's
+    dotted name (`_run_reminder_cycle`, `asyncio.sleep`, `asyncio.gather`,
+    `mod._run_x`), any other `await` as `<awaited non-call ...>`. The implicit awaits
+    are keyed too: each `async with` item as `async with <its expression>`, and each
+    `async for` statement or comprehension as `async for <its iterable>`. Awaits in the
+    loop's condition, its body at any depth (inside `try`, `if`, `with`, nested loops,
+    comprehensions, another await's arguments), and its `else` are counted, and so are
+    those in the parts of a nested `def`, `async def`, lambda, or class that run in the
+    loop's scope: decorators, default values, annotations (Python 3.12 evaluates them
+    where the def runs; Python 3.14 refuses an await in one), and a class's bases and
+    keywords.
 
     The function's body must hold exactly one top-level `while` statement; zero or two
     fail with a message naming the count.
@@ -1170,8 +1194,8 @@ def _per_tick_awaits(source: str) -> list[str]:
     - a call that is not awaited (a coroutine created and dropped, or work started
       with `asyncio.create_task` and never awaited) is not seen;
     - an await outside the `while` (before the loop, so it runs once) is not seen;
-    - an await inside a nested `def`, `async def`, or class in the loop body is not
-      seen, whether or not it runs; the call of a nested helper, if awaited, is;
+    - the BODY of a nested `def`, `async def`, lambda, or class in the loop is not
+      read, whether or not it runs; the call of a nested helper, if awaited, is;
     - a step passed un-awaited to an awaited wrapper (`asyncio.gather`,
       `asyncio.wait_for`, any awaited call) is seen only as the wrapper, so a step
       moved into the argument list of another awaited step passes;
@@ -1276,6 +1300,58 @@ _SCAN_SEES = {
         _before_sleep("[await _run_new_step() for _ in ()]"),
         _with("_run_new_step"),
     ),
+    "async_with": (
+        _before_sleep("async with _tick_guard():\n            pass"),
+        _with("async with _tick_guard()"),
+    ),
+    "async_with_two_items": (
+        _before_sleep("async with lock, _tick_guard() as guard:\n            pass"),
+        _with("async with lock", "async with _tick_guard()"),
+    ),
+    "async_for": (
+        _before_sleep("async for _ in _run_new_gen():\n            pass"),
+        _with("async for _run_new_gen()"),
+    ),
+    "async_comprehension": (
+        _before_sleep("[x async for x in _run_new_gen()]"),
+        _with("async for _run_new_gen()"),
+    ),
+    "await_in_a_nested_def_decorator": (
+        _before_sleep("@deco(await _run_new_step())\n        def later():\n            pass"),
+        _with("_run_new_step"),
+    ),
+    "await_in_a_nested_def_default": (
+        _before_sleep("async def later(x=await _run_new_step()):\n            pass"),
+        _with("_run_new_step"),
+    ),
+    "await_in_a_nested_def_keyword_only_default": (
+        _before_sleep("def later(*, x=await _run_new_step()):\n            pass"),
+        _with("_run_new_step"),
+    ),
+    "await_in_a_nested_def_annotation": (
+        _before_sleep("def later(x: await _run_new_step()):\n            pass"),
+        _with("_run_new_step"),
+    ),
+    "await_in_a_nested_def_return_annotation": (
+        _before_sleep("def later() -> (await _run_new_step()):\n            pass"),
+        _with("_run_new_step"),
+    ),
+    "await_in_a_lambda_default": (
+        _before_sleep("later = lambda x=await _run_new_step(): x"),
+        _with("_run_new_step"),
+    ),
+    "await_in_a_class_base": (
+        _before_sleep("class Later(await _run_new_step()):\n            pass"),
+        _with("_run_new_step"),
+    ),
+    "await_in_a_class_keyword": (
+        _before_sleep("class Later(metaclass=await _run_new_step()):\n            pass"),
+        _with("_run_new_step"),
+    ),
+    "await_in_a_class_decorator": (
+        _before_sleep("@deco(await _run_new_step())\n        class Later:\n            pass"),
+        _with("_run_new_step"),
+    ),
     "steps_from_a_table": (
         (
             _REMINDER,
@@ -1294,6 +1370,9 @@ _SCAN_LIMITS = {
         "    await _run_new_step()\n    while True:\n",
     ),
     "await_in_a_nested_def": _before_sleep("async def later():\n            await _run_new_step()"),
+    "await_in_a_nested_sync_def": _before_sleep("def later():\n            await _run_new_step()"),
+    "await_in_a_lambda_body": _before_sleep("later = lambda: (await _run_new_step())"),
+    "await_in_a_class_body": _before_sleep("class Later:\n            x = await _run_new_step()"),
     "step_inside_an_awaited_wrapper": (
         _REMINDER,
         "            await _run_reminder_cycle(_run_new_step())\n",
@@ -1380,7 +1459,10 @@ async def test_expiration_loop_runs_every_step_and_a_failing_step_skips_none(cas
     def step(name):
         async def run():
             if name in ran:
-                raise _StepRanTwice(name)
+                raise _StepRanTwice(
+                    f"{name} ran twice in one tick: the sleep is missing or the step is "
+                    "awaited twice; if intended, update _LOOP_AWAITS and _LOOP_STEPS"
+                )
             ran.append(name)
             if name in raised:
                 raise raised[name]

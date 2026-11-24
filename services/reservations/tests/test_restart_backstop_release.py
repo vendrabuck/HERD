@@ -269,7 +269,7 @@ async def test_restart_backstop_leaves_a_dynamic_row_that_appears_after_the_dyna
     adding the row on the sweep's own session and flushing it, on the dynamic
     backstop's first compare-and-swap (the only claim to FAILED this tick), after
     that backstop's SELECT and before the restart backstop's. A stranded physical-only
-    row is the control: the restart backstop does run after the late row appears."""
+    row is the control: the restart backstop does run this tick."""
     trigger_dev, stranded_dev, late_dev = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     trigger = await _insert(
         ReservationStatus.PENDING_PROVISION, [trigger_dev], updated_at=STALE, dynamic=1
