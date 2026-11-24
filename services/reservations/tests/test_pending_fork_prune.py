@@ -21,7 +21,11 @@ Covers, at the reservations boundary:
   emptied rows ahead of it a new marker is still pruned; the batch is the oldest
   20 markers, oldest first. Stored state is read at the SQL level (`IS NULL` and the
   raw JSON text), never by comparing the loaded value with None: a JSON "null" also
-  loads as None, which is how the earlier assertions here missed the defect.
+  loads as None, which is how the earlier assertions here missed the defect;
+- the reconciler's heal: a selected marker holding nothing actionable (JSON "null",
+  an empty list, or a corrupt non-list value, seeded as raw stored text) is SQL NULL
+  after one tick in any status, a corrupt one never stops the rows after it, and a
+  real list written between the SELECT and the heal survives.
 
 stage_wiring_changed, the wrapper, and the sweep open their own AsyncSessionLocal
 against the app engine, so this suite shares that engine (mirrors
@@ -42,6 +46,7 @@ from app.models.reservation import Reservation, ReservationStatus, TopologyType
 from app.routers.reservations import bearer_scheme
 from app.services.reservation_service import (
     _clear_pending_fork_prune,
+    _heal_non_actionable_prune_marker,
     _prune_removed_devices_from_fork_best_effort,
 )
 from app.tasks.expiration import (
@@ -51,7 +56,7 @@ from app.tasks.expiration import (
 )
 from fastapi.security import HTTPAuthorizationCredentials
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import Text, select, type_coerce, update
+from sqlalchemy import Text, literal, select, type_coerce, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
@@ -676,3 +681,169 @@ async def test_each_tick_retries_the_oldest_batch_oldest_first_and_the_rest_next
 
     assert ticks == [oldest_first[:_PENDING_PRUNE_BATCH], oldest_first[_PENDING_PRUNE_BATCH:]]
     assert await _selected() == []
+
+
+# --- The reconciler heals a selected marker with nothing actionable (#1522) -----------
+#
+# Current writers never store these forms, but a process still on the previous code (or
+# a rollback, or a hand edit) can, and the reconciler selects every non-NULL marker. The
+# shapes are written as raw stored text, bypassing the model's JSON serializer.
+
+_NON_ACTIONABLE = {
+    "json_null": "null",
+    "empty_list": "[]",
+    "empty_string": '""',
+    "zero": "0",
+    "false": "false",
+    "empty_object": "{}",
+    "true": "true",
+    "five": "5",
+}
+
+
+async def _store_raw(reservation_id: uuid.UUID, raw: str) -> None:
+    async with TestSessionLocal() as db:
+        await db.execute(
+            update(Reservation)
+            .where(Reservation.id == reservation_id)
+            .values(pending_fork_prune_device_ids=literal(raw, Text))
+        )
+        await db.commit()
+
+
+def _recording_cabling(calls: list):
+    async def fork_call(method, path, json_body=None):
+        calls.append((method, path, json_body))
+        return _prune_resp(200, _changed_false_body())
+
+    return patch(
+        "app.services.reservation_service._cabling_fork_call",
+        new=AsyncMock(side_effect=fork_call),
+    )
+
+
+async def _seed_non_actionable(raw: str, status: ReservationStatus) -> uuid.UUID:
+    rid = await _insert(status, pending=[str(uuid.uuid4())])
+    await _store_raw(rid, raw)
+    await _set_updated_at(rid, NOW - timedelta(days=1))
+    assert await _stored(rid) != SQL_NULL
+    assert rid in await _selected()
+    return rid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [ReservationStatus.ACTIVE, ReservationStatus.COMPLETED])
+@pytest.mark.parametrize("shape", sorted(_NON_ACTIONABLE))
+async def test_a_non_actionable_marker_is_healed_and_the_rows_behind_it_still_run(shape, status):
+    """Seeded OLDEST, so it is first in the batch: one tick stores SQL NULL for it (it
+    leaves the selection) and still prunes the real marker behind it."""
+    bad = await _seed_non_actionable(_NON_ACTIONABLE[shape], status)
+    dut = uuid.uuid4()
+    real = await _insert(ReservationStatus.ACTIVE, pending=[str(dut)])
+    await _set_updated_at(real, NOW)
+    calls: list = []
+
+    with _recording_cabling(calls):
+        await _run_pending_prune_reconcile()
+
+    assert await _stored(bad) == SQL_NULL
+    assert calls == [("POST", f"/internal/forks/{real}/prune-devices", {"device_ids": [str(dut)]})]
+    assert await _stored(real) == SQL_NULL
+    assert await _selected() == []
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_marker_is_logged_at_error_by_type_only(caplog):
+    caplog.set_level("WARNING", logger="app.tasks.expiration")
+    bad = await _insert(ReservationStatus.ACTIVE, pending=[str(uuid.uuid4())])
+    await _store_raw(bad, '{"leak": "marker-text"}')
+    empty = await _insert(ReservationStatus.ACTIVE, pending=[str(uuid.uuid4())])
+    await _store_raw(empty, "null")
+
+    with _recording_cabling([]):
+        await _run_pending_prune_reconcile()
+        await _run_pending_prune_reconcile()
+
+    corrupt = [
+        r
+        for r in caplog.records
+        if getattr(r, "action", "") == "pending_prune_corrupt_marker_healed"
+    ]
+    healed_empty = [
+        r for r in caplog.records if getattr(r, "action", "") == "pending_prune_empty_marker_healed"
+    ]
+    assert [(r.levelname, r.reservation_id, r.marker_type) for r in corrupt] == [
+        ("ERROR", str(bad), "dict")
+    ]
+    assert [(r.levelname, r.reservation_id) for r in healed_empty] == [("WARNING", str(empty))]
+    for record in corrupt + healed_empty:
+        assert "marker-text" not in record.getMessage()
+        assert "marker-text" not in repr(vars(record))
+    assert await _stored(bad) == SQL_NULL
+    assert await _stored(empty) == SQL_NULL
+
+
+@pytest.mark.asyncio
+async def test_a_real_marker_written_between_the_select_and_the_heal_survives():
+    """A device-set PATCH may union real ids into the marker after the reconciler's
+    SELECT read it as JSON "null": the heal reads it again under the row lock and
+    leaves it, and the next tick prunes it."""
+    rid = await _seed_non_actionable("null", ReservationStatus.ACTIVE)
+    unioned = str(uuid.uuid4())
+
+    async def write_then_heal(reservation_id):
+        async with TestSessionLocal() as db:
+            await db.execute(
+                update(Reservation)
+                .where(Reservation.id == reservation_id)
+                .values(pending_fork_prune_device_ids=[unioned])
+            )
+            await db.commit()
+        return await _heal_non_actionable_prune_marker(reservation_id)
+
+    calls: list = []
+    with (
+        _recording_cabling(calls),
+        patch(
+            "app.tasks.expiration._heal_non_actionable_prune_marker",
+            new=AsyncMock(side_effect=write_then_heal),
+        ) as heal,
+    ):
+        await _run_pending_prune_reconcile()
+
+    heal.assert_awaited_once_with(rid)
+    assert calls == []
+    assert json.loads(await _stored(rid)) == [unioned]
+    assert await _selected() == [rid]
+
+    with _recording_cabling(calls):
+        await _run_pending_prune_reconcile()
+
+    assert calls == [("POST", f"/internal/forks/{rid}/prune-devices", {"device_ids": [unioned]})]
+    assert await _stored(rid) == SQL_NULL
+
+
+@pytest.mark.asyncio
+async def test_the_heal_leaves_sql_null_and_real_markers_unwritten():
+    """The heal writes only a stored non-actionable value: a row already SQL NULL or
+    holding a real list is not updated (its updated_at does not move)."""
+    stamp = NOW - timedelta(days=3)
+    already_null = await _insert(ReservationStatus.ACTIVE, pending=_OMIT)
+    real = await _insert(ReservationStatus.ACTIVE, pending=[str(uuid.uuid4())])
+    for rid in (already_null, real):
+        await _set_updated_at(rid, stamp)
+
+    assert await _heal_non_actionable_prune_marker(already_null) is False
+    assert await _heal_non_actionable_prune_marker(real) is False
+
+    async with TestSessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(Reservation.id, Reservation.updated_at).where(
+                    Reservation.id.in_([already_null, real])
+                )
+            )
+        ).all()
+    assert {r.updated_at.replace(tzinfo=None) for r in rows} == {stamp.replace(tzinfo=None)}
+    assert await _stored(already_null) == SQL_NULL
+    assert await _stored(real) != SQL_NULL

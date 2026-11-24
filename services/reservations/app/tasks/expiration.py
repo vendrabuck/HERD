@@ -29,7 +29,9 @@ from app.services.reservation_service import (
     _create_reservation_fork_best_effort,
     _fetch_active_forks,
     _fetch_devices_best_effort,
+    _heal_non_actionable_prune_marker,
     _provision_requested_event,
+    _prune_marker_actionable,
     _prune_removed_devices_from_fork_best_effort,
     _release_exclusive_devices_best_effort,
     _reservation_created_event,
@@ -898,8 +900,9 @@ def _pending_prune_stmt():
 
     `IS NOT NULL` is the whole "something is pending" test, so it holds only because
     the column stores SQL NULL, never a JSON "null", when nothing is pending
-    (`none_as_null=True` on the model, migration 0018; issue #1522). Split out so the
-    tests run the REAL statement against rows produced by every write path.
+    (`none_as_null=True` on the model, migration 0018, and the reconciler's heal of
+    any non-actionable marker it still selects; issue #1522). Split out so the tests
+    run the REAL statement against rows produced by every write path.
     """
     return (
         select(
@@ -932,14 +935,44 @@ async def _run_pending_prune_reconcile() -> None:
     fork archive settles the port claims, so there is nothing left for a prune to do
     (cabling would answer the ARCHIVED 409 anyway). ACTIVE is the only status that
     writes the marker, so non-ACTIVE here means terminal.
+
+    A selected marker with nothing actionable (not a non-empty list) is healed to SQL
+    NULL in any status, under its row lock, before the status branch (issue #1522).
     """
     async with AsyncSessionLocal() as db:
         rows = (await db.execute(_pending_prune_stmt())).all()
 
     for row in rows:
-        # The `or []` is defense only: the statement selects SQL non-NULL markers,
-        # and every writer stores either SQL NULL or a non-empty list (issue #1522).
-        pending = row.pending_fork_prune_device_ids or []
+        pending = row.pending_fork_prune_device_ids
+        if not _prune_marker_actionable(pending):
+            # Nothing to retry (issue #1522): a JSON "null" or an empty list from a
+            # writer older than the fix, or a corrupt non-list value. Healed to SQL
+            # NULL so the row leaves the batch; never iterated, so a corrupt value
+            # cannot raise and stop the rows after it.
+            if await _heal_non_actionable_prune_marker(row.id):
+                if pending is None or isinstance(pending, list):
+                    logger.warning(
+                        "Pending prune reconcile: reservation %s held an empty marker; "
+                        "stored SQL NULL",
+                        row.id,
+                        extra={
+                            "action": "pending_prune_empty_marker_healed",
+                            "reservation_id": str(row.id),
+                        },
+                    )
+                else:
+                    logger.error(
+                        "Pending prune reconcile: reservation %s held a corrupt marker "
+                        "of type %s; stored SQL NULL",
+                        row.id,
+                        type(pending).__name__,
+                        extra={
+                            "action": "pending_prune_corrupt_marker_healed",
+                            "reservation_id": str(row.id),
+                            "marker_type": type(pending).__name__,
+                        },
+                    )
+            continue
         if row.status != ReservationStatus.ACTIVE:
             await _clear_pending_fork_prune(row.id, pending)
             logger.info(

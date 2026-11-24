@@ -23,7 +23,7 @@ from herd_common.internal_client import InternalTokenAuth, call_service
 from herd_common.outbox import enqueue_event
 from herd_common.pagination import paginate
 from herd_common.retry import retry_with_backoff
-from sqlalchemy import String, and_, cast, exists, false, func, or_, select, update
+from sqlalchemy import String, and_, cast, exists, false, func, null, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -870,6 +870,64 @@ async def _clear_pending_fork_prune(
             },
             exc_info=True,
         )
+
+
+def _prune_marker_actionable(marker: object) -> bool:
+    """Whether a pending fork-prune marker holds something to prune: a non-empty list.
+
+    The ONE predicate for "this marker is pending" beside the column's SQL NULL. Every
+    other stored value (the JSON "null" a writer older than issue #1522 stored, an
+    empty list, any non-list shape) holds nothing to retry and is healed to SQL NULL by
+    `_heal_non_actionable_prune_marker`.
+    """
+    return isinstance(marker, list) and len(marker) > 0
+
+
+async def _heal_non_actionable_prune_marker(reservation_id: uuid.UUID) -> bool:
+    """Store SQL NULL for a marker that holds nothing actionable (issue #1522).
+
+    The pending-prune reconciler selects `IS NOT NULL` markers, so a JSON "null", an
+    empty list, or a corrupt non-list value stays in its oldest-first batch forever
+    unless something writes SQL NULL. Current writers never store those forms and
+    migration 0018 repaired the stored ones once; this repairs any the reconciler
+    still selects (a process on the previous code, an image rollback, a hand edit).
+
+    Under the row lock the marker is read again, and nulled only if it is still not
+    actionable: a device-set PATCH may have unioned real ids into it since the
+    reconciler's SELECT, and those must survive. The write is a Core UPDATE of
+    `sql.null()` guarded by `IS NOT NULL`, never an attribute assignment: a JSON
+    "null" loads as None, so assigning None is no change and the ORM would emit no
+    UPDATE at all. Returns True when it nulled the marker. Best-effort like the clear:
+    a failure is logged and the next tick retries.
+    """
+    col = Reservation.pending_fork_prune_device_ids
+    try:
+        async with AsyncSessionLocal() as db:
+            current = (
+                await db.execute(
+                    select(col).where(Reservation.id == reservation_id).with_for_update()
+                )
+            ).first()
+            if current is None or _prune_marker_actionable(current[0]):
+                return False
+            result = await db.execute(
+                update(Reservation)
+                .where(Reservation.id == reservation_id, col.is_not(None))
+                .values(pending_fork_prune_device_ids=null())
+            )
+            await db.commit()
+            return result.rowcount == 1
+    except Exception:
+        logger.error(
+            "Healing the pending fork-prune marker failed for reservation %s",
+            reservation_id,
+            extra={
+                "action": "reservation_fork_prune_marker_heal_failed",
+                "reservation_id": str(reservation_id),
+            },
+            exc_info=True,
+        )
+        return False
 
 
 async def _fork_may_still_appear(reservation_id: uuid.UUID) -> bool:

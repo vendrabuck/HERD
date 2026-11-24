@@ -153,7 +153,9 @@ class Reservation(Base):
     # which matches the reconciler's `is_not(None)` filter, so every cleared row
     # stayed in its oldest-first batch of 20 forever and starved new markers. A JSON
     # "null" also loads as Python None, so compare at the SQL level (`IS NULL`) in
-    # tests, never the loaded value. Migration 0018 rewrote rows stored before this.
+    # tests, never the loaded value. Migration 0018 rewrote rows stored before this,
+    # and the reconciler heals any non-actionable marker it still selects
+    # (_heal_non_actionable_prune_marker).
     pending_fork_prune_device_ids: Mapped[list | None] = mapped_column(
         JSON(none_as_null=True), nullable=True
     )

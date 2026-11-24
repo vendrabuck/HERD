@@ -1202,9 +1202,10 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # holds a federated_identities table lock that blocks writes (never reads), or
 # one of its own account rows FOR UPDATE, for well under a second per race.
 # The reservations suite added for issue #1522 (the pending fork-prune marker's
-# SQL NULL and migration 0018's rewrite) needs the migrated reservations schema.
-# It commits nothing: each test inserts its rows, runs the production clear and
-# the migration's upgrade inside one REPEATABLE READ transaction, and rolls it
+# SQL NULL, the reconciler's heal, and migration 0018's rewrite) needs the
+# migrated reservations schema. It commits nothing: each test inserts its rows,
+# runs the production clear, the heal, or the migration's upgrade inside one
+# REPEATABLE READ transaction, and rolls it
 # back; the upgrade row-locks any foreign row holding an empty marker until then.
 # tests/unit/test_pg_live_gate_wiring.py fails if a new *_live_pg.py file is
 # written and then wired into nothing.

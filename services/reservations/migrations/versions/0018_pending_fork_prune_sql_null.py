@@ -13,11 +13,15 @@ non-empty list. Both empty forms become SQL NULL: the JSON "null" every clear
 wrote, and an empty list "[]", which no code path writes (the PATCH unions at
 least one id, a clear writes `remaining or None`) but which the reconciler would
 also select forever without pruning anything. The match is by JSON value on
-Postgres (a jsonb comparison, so spacing in the stored text does not matter) and
-by normalized JSON text elsewhere (SQLite, the unit tests' engine).
+Postgres, through `json_typeof` and `json_array_length` inside a CASE, so spacing
+in the stored text does not matter and no row is converted to jsonb (Postgres
+`json` accepts text such as `["\\u0000"]` that a `::jsonb` cast refuses, and one
+such row would abort the whole upgrade); elsewhere (SQLite, the unit tests'
+engine) by normalized JSON text.
 
 Data-only and safe to run twice: a second run matches no row. Rows holding SQL
-NULL or a non-empty list are not touched.
+NULL, a non-empty list, or any other value are not touched; the reconciler heals a
+corrupt non-list marker at run time (`_heal_non_actionable_prune_marker`).
 
 Revision ID: 0018
 Revises: 0017
@@ -43,7 +47,12 @@ def _qualified(table: str) -> str:
 def upgrade() -> None:
     bind = op.get_bind()
     if bind.dialect.name == "postgresql":
-        empty = "pending_fork_prune_device_ids::jsonb IN ('null'::jsonb, '[]'::jsonb)"
+        empty = (
+            "CASE json_typeof(pending_fork_prune_device_ids)"
+            " WHEN 'null' THEN true"
+            " WHEN 'array' THEN json_array_length(pending_fork_prune_device_ids) = 0"
+            " ELSE false END"
+        )
     else:
         empty = "json(pending_fork_prune_device_ids) IN ('null', '[]')"
     op.execute(

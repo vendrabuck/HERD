@@ -132,8 +132,13 @@ provisioning backstops measure those from `updated_at` as before.
 every `reservations.pending_fork_prune_device_ids` holding the JSON literal `null`
 or an empty list becomes SQL NULL, so the expiration sweep stops selecting
 reservations with no pending fork prune and reaches the ones that have one. It is
-safe to rerun, and `downgrade` is a no-op. Until it runs, a reservation whose
-marker was cleared before the upgrade still occupies the sweep's batch of 20.
+safe to rerun, and `downgrade` is a no-op. Restart or rebuild the reservations
+service onto the new code before the migration or right after it: a process still
+running the previous code writes the JSON `null` form again on its next clear (the
+dev reloader does not fire on a git-driven file swap, so `docker compose restart
+reservations`). From this version the expiration sweep also repairs such a marker,
+and any corrupt one, to SQL NULL on its next tick, so a row written that way leaves
+the sweep's batch of 20 after one tick rather than occupying it forever.
 
 `make migrate-cabling` (part of a plain `make migrate`) includes a one-time data
 scrub (revision 0013, hardening): every stored canvas across `topologies`,

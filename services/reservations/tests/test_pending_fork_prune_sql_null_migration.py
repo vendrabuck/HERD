@@ -44,6 +44,11 @@ _ROWS = [
         '["2d1f6c1e-0d7c-4b5e-9a51-0f3c1b2a4d5e"]',
     ),
     ("two-ids", '["a",  "b"]', '["a",  "b"]'),
+    ("nul-escape", '["\\u0000"]', '["\\u0000"]'),
+    # Corrupt non-list shapes are left for the reconciler's heal at run time.
+    ("object", "{}", "{}"),
+    ("string", '""', '""'),
+    ("true", "true", "true"),
 ]
 
 
@@ -63,23 +68,28 @@ def make_engine():
 
 
 def _engine(schema: str | None = None) -> sa.Engine:
+    """One `reservations` table seeded with _ROWS. With `schema`, the table lives in
+    an attached database of that name AND a decoy `main.reservations` holds the same
+    rows: SQLite resolves an unqualified name in `main` first, so an upgrade that
+    forgot the schema would rewrite the decoy instead."""
     engine = sa.create_engine("sqlite://")
-    prefix = f"{schema}." if schema else ""
+    prefixes = ["main.", f"{schema}."] if schema else [""]
     with engine.begin() as conn:
         if schema:
             conn.exec_driver_sql(f"ATTACH DATABASE ':memory:' AS {schema}")
-        conn.exec_driver_sql(
-            f"CREATE TABLE {prefix}reservations "
-            "(id TEXT PRIMARY KEY, pending_fork_prune_device_ids JSON)"
-        )
-        for row_id, stored, _expected in _ROWS:
-            conn.execute(
-                sa.text(
-                    f"INSERT INTO {prefix}reservations (id, pending_fork_prune_device_ids)"
-                    " VALUES (:id, :v)"
-                ),
-                {"id": row_id, "v": stored},
+        for prefix in prefixes:
+            conn.exec_driver_sql(
+                f"CREATE TABLE {prefix}reservations "
+                "(id TEXT PRIMARY KEY, pending_fork_prune_device_ids JSON)"
             )
+            for row_id, stored, _expected in _ROWS:
+                conn.execute(
+                    sa.text(
+                        f"INSERT INTO {prefix}reservations (id, pending_fork_prune_device_ids)"
+                        " VALUES (:id, :v)"
+                    ),
+                    {"id": row_id, "v": stored},
+                )
     return engine
 
 
@@ -119,13 +129,16 @@ def test_upgrade_leaves_exactly_sql_null_or_a_non_empty_list_and_runs_twice(make
 
 def test_upgrade_honours_db_schema(monkeypatch, make_engine):
     """The chain qualifies the table with DB_SCHEMA (read at import as `_schema`), as
-    the stack runs it; an attached SQLite database stands in for the schema."""
+    the stack runs it; an attached SQLite database stands in for the schema, and a
+    decoy `main.reservations` with the same rows must come through untouched."""
     monkeypatch.setattr(_migration, "_schema", "reservations")
     engine = make_engine(schema="reservations")
+    assert _states(engine, schema="main") == _BEFORE
 
     _run(engine, _migration.upgrade)
 
     assert _states(engine, schema="reservations") == _EXPECTED
+    assert _states(engine, schema="main") == _BEFORE
 
 
 def test_downgrade_is_a_no_op(make_engine):
@@ -140,7 +153,8 @@ def test_downgrade_is_a_no_op(make_engine):
 @pytest.mark.parametrize("dialect", ["postgresql", "sqlite"])
 def test_upgrade_sql_per_dialect_touches_only_the_marker_column(dialect):
     """Offline SQL of the upgrade: one UPDATE that sets only the marker to NULL, only
-    where it is not already NULL, matched by JSON value on Postgres."""
+    where it is not already NULL, matched by JSON value on Postgres without any jsonb
+    conversion (a `::jsonb` cast refuses `["\\u0000"]`, which `json` stores)."""
     buf = io.StringIO()
     ctx = MigrationContext.configure(
         dialect_name=dialect, opts={"as_sql": True, "output_buffer": buf}
@@ -153,8 +167,20 @@ def test_upgrade_sql_per_dialect_touches_only_the_marker_column(dialect):
     sql = statements[0]
     assert sql.startswith("UPDATE reservations SET pending_fork_prune_device_ids = NULL WHERE ")
     assert "pending_fork_prune_device_ids IS NOT NULL" in sql
+    assert "jsonb" not in sql
     if dialect == "postgresql":
-        assert "::jsonb IN ('null'::jsonb, '[]'::jsonb)" in sql
+        assert sql.endswith(
+            "pending_fork_prune_device_ids IS NOT NULL AND"
+            " CASE json_typeof(pending_fork_prune_device_ids)"
+            " WHEN 'null' THEN true"
+            " WHEN 'array' THEN json_array_length(pending_fork_prune_device_ids) = 0"
+            " ELSE false END"
+        )
+    else:
+        assert sql.endswith(
+            "pending_fork_prune_device_ids IS NOT NULL AND"
+            " json(pending_fork_prune_device_ids) IN ('null', '[]')"
+        )
 
 
 def test_reservations_chain_is_linear_and_0018_revises_0017():
