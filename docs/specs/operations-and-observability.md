@@ -338,7 +338,7 @@ name looks like a credential.
 - **OPS-LOG-1.** Each line carries `timestamp`, `level`, `service`, `logger`, and
   `message`, plus `exception` when the record has exception info. \
   Enforced in: `services/common/herd_common/logging.py` (`JSONFormatter`) \
-  Pinned by: `services/common/tests/test_logging.py` (`test_json_formatter_basic_output`, `test_json_formatter_includes_exception`)
+  Pinned by: `services/common/tests/test_logging.py` (`test_json_formatter_basic_output`, `test_json_formatter_includes_exception`); `services/reservations/tests/test_service_wiring_as_deployed.py` (`test_every_request_logs_one_access_line_through_the_json_handler`)
 - **OPS-LOG-2.** Every `extra=` key that is not one of the standard library's own
   record attributes is emitted, and an extra whose value is None is omitted. \
   Enforced in: `services/common/herd_common/logging.py` (`RESERVED_LOG_RECORD_ATTRS`, `JSONFormatter`) \
@@ -367,17 +367,17 @@ name looks like a credential.
 - **OPS-LOG-7.** Every request logs one `herd.access` line with `method`, `path` (no
   query string), `status_code`, and `duration_ms`; no header or body is logged. \
   Enforced in: `services/common/herd_common/logging.py` (`RequestLoggingMiddleware`) \
-  Pinned by: `services/common/tests/test_logging.py` (`test_request_logging_middleware_emits_access_record`); `services/secrets/tests/test_api.py` (`test_plaintext_never_hits_the_logs`)
+  Pinned by: `services/common/tests/test_logging.py` (`test_request_logging_middleware_emits_access_record`); `services/secrets/tests/test_api.py` (`test_plaintext_never_hits_the_logs`); `services/reservations/tests/test_service_wiring_as_deployed.py` (`test_every_request_logs_one_access_line_through_the_json_handler`)
 - **OPS-LOG-8.** `setup_logging` installs the one JSON handler on the root logger at
   `LOG_LEVEL` (INFO when the name is unknown) and holds `uvicorn.access`,
   `uvicorn.error`, and `sqlalchemy.engine` at WARNING. \
   Enforced in: `services/common/herd_common/logging.py` (`setup_logging`) \
-  Pinned by: `services/common/tests/test_logging.py` (`test_setup_logging_configures_root_logger`)
+  Pinned by: `services/common/tests/test_logging.py` (`test_setup_logging_configures_root_logger`); `services/reservations/tests/test_service_wiring_as_deployed.py` (`test_the_root_logger_is_the_json_handler_at_log_level`); `tests/unit/test_schema_placement_and_logging_wiring.py` (`test_the_root_logger_is_the_json_handler_at_log_level`)
 - **OPS-LOG-9.** The config service does not use this formatter: it logs through the
   standard library with no handler of its own, so its lines are plain text and its INFO
   lines are not emitted. `FEATURES.md` and `docs/ENV_VARS.md` (`LOG_LEVEL`) say so. \
   Enforced in: `services/config/app/main.py` (`logger`) \
-  Pinned by: none
+  Pinned by: `tests/unit/test_schema_placement_and_logging_wiring.py` (`test_config_logs_through_the_standard_library_with_no_handler_of_its_own`)
 - **OPS-LOG-10.** Key-name redaction cannot see inside a string value, so a driver run's
   start line logs the names of the context and method arguments, never their values. By
   decision; issues #872 and #905. \
@@ -2348,7 +2348,6 @@ None at present.
 ### Rules with no test
 
 - OPS-BUILD-1: the Makefile's build identifier and date.
-- OPS-LOG-9: the config service's plain-text logging.
 - OPS-SET-9: settings read once at import.
 - OPS-OUTBOX-14: the relay does not republish an acknowledged event.
 - OPS-NATS-13: JetStream store durability under `make prod`.
