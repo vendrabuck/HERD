@@ -1257,3 +1257,139 @@ async def test_a_csv_json_cell_holding_a_lone_surrogate_rejects_that_row_only(cl
         "a JSON cell holds a lone surrogate escape, which is not valid text"
     )
     assert (await _device_by_name(client, "d2"))["field_data"] == {"model": "ok \U0001f511"}
+
+
+@pytest.mark.asyncio
+async def test_a_bulk_upload_over_the_bound_is_refused_before_any_parse(client, monkeypatch):
+    """Issue #1417: `await file.read()` held the whole upload in memory several
+    times over before it was parsed on the event loop."""
+    from unittest.mock import patch
+
+    from app.routers import bulk as bulk_router
+
+    monkeypatch.setattr(bulk_router, "IMPORT_UPLOAD_BYTES", 16)
+    # A payload that would be a valid import if it were parsed: the refusal must
+    # come from the size bound, not from the content.
+    body = json.dumps([{"name": "d1", "template_name": "Firewall"}]).encode()
+    assert len(body) > 16
+
+    # The router imports this name directly, so patching it on the service module
+    # would never reach the router (issue #1417 review).
+    with patch("app.routers.bulk.import_devices", side_effect=AssertionError("parsed")) as parse:
+        resp = await client.post(
+            "/devices/import",
+            params={"format": "json"},
+            files={"file": ("big.json", io.BytesIO(body), "application/json")},
+        )
+
+    assert resp.status_code == 413
+    assert resp.json()["detail"] == [
+        {
+            "type": "body_too_large",
+            "loc": ["body"],
+            "msg": "Request body is larger than 16 bytes",
+        }
+    ]
+    parse.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_an_upload_at_the_bound_is_accepted(client, monkeypatch):
+    from app.routers import bulk as bulk_router
+
+    await _create_template(client, name="Firewall")
+    items = (await client.get("/templates/export", params={"format": "json"})).json()["items"]
+    body = json.dumps(items).encode()
+    monkeypatch.setattr(bulk_router, "IMPORT_UPLOAD_BYTES", len(body))
+
+    resp = await client.post(
+        "/devices/import",
+        params={"format": "json"},
+        files={"file": ("d.json", io.BytesIO(body), "application/json")},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_the_bound_is_exact_one_byte_over_is_refused(client, monkeypatch):
+    """The bound is a byte count, not a chunk count: a file at the bound is
+    accepted and one a single byte over it is refused."""
+    from app.routers import bulk as bulk_router
+
+    await _create_template(client, name="Firewall")
+    items = (await client.get("/templates/export", params={"format": "json"})).json()["items"]
+    body = json.dumps(items).encode()
+
+    monkeypatch.setattr(bulk_router, "IMPORT_UPLOAD_BYTES", len(body))
+    at_bound = await client.post(
+        "/devices/import",
+        params={"format": "json"},
+        files={"file": ("at.json", io.BytesIO(body), "application/json")},
+    )
+    assert at_bound.status_code == 200, at_bound.text
+
+    monkeypatch.setattr(bulk_router, "IMPORT_UPLOAD_BYTES", len(body) - 1)
+    over = await client.post(
+        "/devices/import",
+        params={"format": "json"},
+        files={"file": ("over.json", io.BytesIO(body), "application/json")},
+    )
+    assert over.status_code == 413
+    assert over.json()["detail"] == [
+        {
+            "type": "body_too_large",
+            "loc": ["body"],
+            "msg": f"Request body is larger than {len(body) - 1} bytes",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_templates_import_is_held_to_the_same_bound(client, monkeypatch):
+    """INV-BULK-23 says "an import upload", which covers templates too.
+
+    Mutation-checked: reverting `import_templates_endpoint` to
+    `await file.read()` makes this fail.
+    """
+    from unittest.mock import patch
+
+    from app.routers import bulk as bulk_router
+
+    monkeypatch.setattr(bulk_router, "IMPORT_UPLOAD_BYTES", 16)
+    # A valid template body, so the only thing that can refuse it is the size.
+    body = json.dumps([{"name": "Firewall"}]).encode()
+    assert len(body) > 16
+
+    with patch("app.routers.bulk.import_templates", side_effect=AssertionError("parsed")) as parse:
+        resp = await client.post(
+            "/templates/import",
+            params={"format": "json"},
+            files={"file": ("big.json", io.BytesIO(body), "application/json")},
+        )
+
+    assert resp.status_code == 413
+    detail = resp.json()["detail"][0]
+    assert detail["type"] == "body_too_large"
+    assert "Request body is larger than 16 bytes" in detail["msg"]
+    parse.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_read_asks_for_exactly_one_byte_past_the_bound(monkeypatch):
+    """The bound is exact because the read asks for one byte past it.
+
+    Mutation-checked: replacing `file.read(limit + 1)` with `file.read()` while
+    keeping the length check makes this fail.
+    """
+    from app.routers import bulk as bulk_router
+
+    asked: list[int] = []
+
+    class _File:
+        async def read(self, size: int = -1) -> bytes:
+            asked.append(size)
+            return b""
+
+    await bulk_router._read_capped(_File(), 4096)
+
+    assert asked == [4097]

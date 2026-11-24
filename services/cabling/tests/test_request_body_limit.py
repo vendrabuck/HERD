@@ -95,9 +95,9 @@ async def test_without_credentials_the_limit_answers_before_authentication():
 
 # -- The topology import takes its own limit -------------------------------------------
 #
-# The default plus the import file bound `IMPORT_UPLOAD_BYTES` (the route's own read is
-# still unbounded, as inventory's are in issue #1417). It is read at each request, so
-# it is shrunk here to keep the bodies small.
+# The default plus the import file bound `IMPORT_UPLOAD_BYTES`, which the route now
+# enforces itself (#1417). It is read at each request, so it is shrunk here to keep
+# the bodies small.
 
 _UPLOAD_BYTES = 2000
 
