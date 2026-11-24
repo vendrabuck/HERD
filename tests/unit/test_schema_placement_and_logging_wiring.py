@@ -11,7 +11,8 @@ once, so none can see a `setup_logging` call that is missing.
 
 What is checked. The services are the directories under `services/` with an
 `app/main.py` (today twelve); the database services are those with an
-`app/database.py` (today eleven, all but config). Each service's `app.main` is
+`app/database.py` (today eleven); every other service must be named, with the reason
+it has no database, in `WITHOUT_DATABASE` (today config alone). Each service's `app.main` is
 imported in a subprocess of its own (every service's package is named `app`; the
 reason is spelled out in `test_compose_settings_wiring._load_settings_fields`), with
 `LOG_LEVEL=WARNING` (a value no default has), no config file, a `DATABASE_URL`
@@ -29,7 +30,23 @@ under `app.models` (every database service has that package today) are imported:
 - for every service but config, the root logger is at `LOG_LEVEL` and has exactly
   one handler, whose formatter is `herd_common.logging.JSONFormatter`, and
   `uvicorn.access`, `uvicorn.error`, and `sqlalchemy.engine` are set to WARNING
-  (OPS-LOG-8); for config, the root logger has no handler (OPS-LOG-9).
+  (OPS-LOG-8);
+- for config (OPS-LOG-9), no logger the import created uses `JSONFormatter`, the root
+  logger has no handler, no `app` or `app.*` logger has a handler of its own, and none
+  of those would emit an INFO record: the record is enabled at the logger's effective
+  level and some handler on its propagation path has a level at or below INFO (with no
+  handler on that path, the standard library's last-resort handler writes WARNING and
+  above only).
+
+What a new service needs. A database service has `app/database.py` exposing `Base`
+(from `herd_common.database.make_database`), `app.config.settings.db_schema`, its
+models in an `app.models` package (every module there is imported, so a model
+nothing else imports is still read), a service of the same name in
+`docker-compose.yml` passing `DB_SCHEMA` as a literal, and that schema's
+`CREATE SCHEMA` line in `infra/postgres/init.sql`. A database service with no table
+yet is named in `NO_TABLES_YET` with the reason. A service with no database is named
+in `WITHOUT_DATABASE`. Each of these, when missing, fails with a message naming the
+service and the step.
 
 The placement check is the pure function `placement_problems`, tested below on
 fixture reports in both directions.
@@ -57,7 +74,10 @@ The others follow from what the guard reads.
   `services/reservations/tests/test_service_wiring_as_deployed.py` applies uvicorn's
   setup first and checks the lines written). This proves the handler's formatter
   class and the levels, not the content of a line, whose rules (OPS-LOG-1 to
-  OPS-LOG-7) are pinned elsewhere.
+  OPS-LOG-7) are pinned elsewhere. For config, a logger first created after the
+  import (inside a function or the lifespan), a handler added later, and a filter on a
+  handler or logger are not seen; config writes no line here, so that its lines are
+  plain text is inferred from no handler using `JSONFormatter`.
 """
 
 from __future__ import annotations
@@ -115,6 +135,41 @@ report = {
     "held": {name: logging.getLogger(name).level for name in %(held)r},
     "database": None,
 }
+
+
+def info_emitted(logger):
+    # The standard library's own decision (Logger.callHandlers), filters aside.
+    if not logger.isEnabledFor(logging.INFO):
+        return False
+    current = logger
+    while current is not None:
+        if any(handler.level <= logging.INFO for handler in current.handlers):
+            return True
+        if not current.propagate:
+            break
+        current = current.parent
+    return False
+
+
+loggers = [root] + [
+    logger
+    for logger in logging.root.manager.loggerDict.values()
+    if isinstance(logger, logging.Logger)
+]
+report["json_formatter_loggers"] = sorted(
+    logger.name
+    for logger in loggers
+    if any(
+        handler.formatter is not None
+        and qualified(handler.formatter) == "herd_common.logging.JSONFormatter"
+        for handler in logger.handlers
+    )
+)
+report["app_loggers"] = sorted(
+    [logger.name, [qualified(h) for h in logger.handlers], info_emitted(logger)]
+    for logger in loggers
+    if logger.name == "app" or logger.name.startswith("app.")
+)
 database = None
 if importlib.util.find_spec("app.database") is not None:
     database = importlib.import_module("app.database")
@@ -125,9 +180,11 @@ if database is not None:
             importlib.import_module(module.name)
     from app.config import settings
 
-    tables = database.Base.metadata.tables
+    base = getattr(database, "Base", None)
+    tables = base.metadata.tables if base is not None else {}
     report["database"] = {
-        "db_schema": settings.db_schema,
+        "has_base": base is not None,
+        "db_schema": getattr(settings, "db_schema", None),
         "tables": [[key, table.schema] for key, table in sorted(tables.items())],
         "foreign_keys": sorted(
             [key, fk.target_fullname] for key, table in tables.items() for fk in table.foreign_keys
@@ -154,6 +211,21 @@ def database_service_names() -> list[str]:
 SERVICES = service_names()
 DATABASE_SERVICES = database_service_names()
 
+# Services with no app/database.py, each with the reason it has no database.
+WITHOUT_DATABASE = {
+    "config": "the first-startup web UI keeps its settings in files, not in Postgres",
+}
+# Database services with no table yet, each with the reason. None today.
+NO_TABLES_YET: dict[str, str] = {}
+
+_NEW_DATABASE_SERVICE = (
+    "a database service needs app/database.py exposing Base (from "
+    "herd_common.database.make_database), app.config.settings.db_schema, its models "
+    "in an app.models package, a docker-compose.yml service of the same name passing "
+    "DB_SCHEMA as a literal, and that schema's CREATE SCHEMA line in "
+    "infra/postgres/init.sql"
+)
+
 
 def init_sql_schemas() -> list[str]:
     return re.findall(r"^CREATE SCHEMA IF NOT EXISTS (\w+);$", INIT_SQL.read_text(), re.M)
@@ -164,7 +236,8 @@ def compose_environment(service: str) -> dict:
     services = yaml.safe_load(COMPOSE_PATH.read_text())["services"]
     assert service in services, (
         f"{service}: no service of that name in docker-compose.yml; this guard reads the "
-        "service's DB_SCHEMA from the compose service named like its directory"
+        "service's DB_SCHEMA from the compose service named like its directory, so add "
+        f"one; {_NEW_DATABASE_SERVICE}"
     )
     environment = services[service].get("environment") or {}
     assert isinstance(environment, dict), (
@@ -245,12 +318,27 @@ def test_every_service_is_found():
         "secrets",
         "user-profile",
     }
-    assert set(DATABASE_SERVICES) == set(SERVICES) - {"config"}
+    no_database = set(SERVICES) - set(DATABASE_SERVICES)
+    unlisted = sorted(no_database - set(WITHOUT_DATABASE))
+    assert not unlisted, (
+        f"{unlisted}: has app/main.py but no app/database.py. If it has no database, "
+        f"name it in WITHOUT_DATABASE with the reason; otherwise {_NEW_DATABASE_SERVICE}"
+    )
+    stale = sorted(set(WITHOUT_DATABASE) - no_database)
+    assert not stale, (
+        f"{stale}: named in WITHOUT_DATABASE but it has app/database.py or no longer "
+        "exists; remove the entry"
+    )
+    stale = sorted(set(NO_TABLES_YET) - set(DATABASE_SERVICES))
+    assert not stale, f"{stale}: named in NO_TABLES_YET but not a database service; remove it"
 
 
 @pytest.mark.parametrize("service", DATABASE_SERVICES)
 def test_the_deployed_schema_is_one_init_sql_creates(service):
     schema = imported(service)["database"]["db_schema"]
+    assert schema, (
+        f"{service}: app.config.settings.db_schema is missing or empty; {_NEW_DATABASE_SERVICE}"
+    )
     assert schema in init_sql_schemas(), (
         f"{service}: DB_SCHEMA {schema!r} is not created by infra/postgres/init.sql; a new "
         "service adds its CREATE SCHEMA line there (docs/specs/CONVENTIONS.md)"
@@ -260,8 +348,24 @@ def test_the_deployed_schema_is_one_init_sql_creates(service):
 @pytest.mark.parametrize("service", DATABASE_SERVICES)
 def test_every_model_table_is_in_the_deployed_schema(service):
     report = imported(service)["database"]
-    assert report["tables"], f"{service}: no table was found on app.database.Base.metadata"
-    assert placement_problems(report) == []
+    assert report["has_base"], f"{service}: app.database has no Base; {_NEW_DATABASE_SERVICE}"
+    if service in NO_TABLES_YET:
+        assert not report["tables"], f"{service}: it has tables now; remove it from NO_TABLES_YET"
+    else:
+        assert report["tables"], (
+            f"{service}: no table on app.database.Base.metadata after importing app.main "
+            "and every module under app.models. Declare the models in the app.models "
+            "package; a database service with no table yet is named in NO_TABLES_YET "
+            "with the reason"
+        )
+    problems = placement_problems(report)
+    assert not problems, (
+        f"{service}: " + "; ".join(problems) + ". Take the schema from "
+        "settings.db_schema: `__table_args__ = {'schema': settings.db_schema or None}` "
+        "on the model, `Enum(..., schema=...)` for a native enum type, and a foreign "
+        "key target written `<schema>.<table>.<column>` (the reservations models show "
+        "the idiom)"
+    )
 
 
 @pytest.mark.parametrize("service", [s for s in SERVICES if s != "config"])
@@ -275,10 +379,21 @@ def test_the_root_logger_is_the_json_handler_at_log_level(service):
     assert report["held"] == dict.fromkeys(HELD_AT_WARNING, logging.WARNING)
 
 
-def test_config_installs_no_log_handler():
-    """OPS-LOG-9: the config service logs through the standard library with no
-    handler of its own."""
-    assert imported("config")["handlers"] == []
+def test_config_logs_through_the_standard_library_with_no_handler_of_its_own():
+    """OPS-LOG-9, as far as the import shows it: no logger uses the JSON formatter,
+    the root logger and config's own `app` loggers have no handler, and none of
+    those loggers would emit an INFO record."""
+    report = imported("config")
+    assert report["json_formatter_loggers"] == [], (
+        "config must not use herd_common.logging.JSONFormatter (OPS-LOG-9)"
+    )
+    assert report["handlers"] == [], "config must not add a root handler (OPS-LOG-9)"
+    own = report["app_loggers"]
+    assert own, "config: no app logger exists after import; this check sees nothing"
+    with_handlers = [name for name, handlers, _ in own if handlers]
+    assert with_handlers == [], f"config loggers with a handler of their own: {with_handlers}"
+    emitting_info = [name for name, _, info in own if info]
+    assert emitting_info == [], f"config loggers that would emit INFO: {emitting_info}"
 
 
 # Fixture reports for placement_problems: the honest shape, then each broken one.

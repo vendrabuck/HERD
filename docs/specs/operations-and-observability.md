@@ -377,7 +377,7 @@ name looks like a credential.
   standard library with no handler of its own, so its lines are plain text and its INFO
   lines are not emitted. `FEATURES.md` and `docs/ENV_VARS.md` (`LOG_LEVEL`) say so. \
   Enforced in: `services/config/app/main.py` (`logger`) \
-  Pinned by: `tests/unit/test_schema_placement_and_logging_wiring.py` (`test_config_installs_no_log_handler`)
+  Pinned by: `tests/unit/test_schema_placement_and_logging_wiring.py` (`test_config_logs_through_the_standard_library_with_no_handler_of_its_own`)
 - **OPS-LOG-10.** Key-name redaction cannot see inside a string value, so a driver run's
   start line logs the names of the context and method arguments, never their values. By
   decision; issues #872 and #905. \
