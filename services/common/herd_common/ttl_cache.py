@@ -56,10 +56,10 @@ A failure is not an answer (issue #1075). When `fetch` could not ask the
 upstream (transport error, unexpected status, unreadable body, no token) it
 returns its fallback wrapped in `Uncached(value)`: `get` hands every caller
 queued on the fetch the bare value and stores nothing, so the next call asks
-again instead of
-replaying the outage for the whole TTL. Only the caller can tell a failure
-from an answer (an empty admin list or default preferences can be either),
-which is why the marking happens in `fetch` and the not-storing happens here.
+again instead of replaying the outage for the whole TTL. Only the caller can
+tell a failure from an answer (an empty admin list or default preferences can
+be either), which is why the marking happens in `fetch` and the not-storing
+happens here.
 
     async def _fetch(self, key):
         try:

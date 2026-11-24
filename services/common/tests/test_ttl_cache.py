@@ -364,11 +364,11 @@ async def test_uncached_falsy_answer_is_still_cached_when_not_wrapped():
 async def test_a_failed_fetch_is_shared_with_the_callers_queued_behind_it():
     """A failure is an answer for the callers already waiting on it.
 
-    The lock used to hand the failed fetch back to the caller that made it only,
-    so each waiter then ran its own fetch: during an outage N callers made N
-    sequential upstream attempts and the k-th waited for k timeouts. The
-    in-flight fetch is now shared, `Uncached` included, while nothing is stored
-    for later callers."""
+    If a failed fetch went only to the caller that made it, each waiter would
+    run its own fetch: during an outage N callers would make N sequential
+    upstream attempts and the k-th would wait for k timeouts. The in-flight
+    fetch is shared, `Uncached` included, while nothing is stored for later
+    callers."""
     started = asyncio.Event()
     release = asyncio.Event()
     calls = {"n": 0}
@@ -478,11 +478,10 @@ async def test_a_failure_on_one_key_does_not_charge_another_key():
 async def test_cancelling_a_waiter_does_not_cancel_the_shared_fetch():
     """A caller that goes away must not take the fetch down with it.
 
-    Awaiting a bare future propagates the caller's cancellation into that
-    future, so a waiter that times out would cancel the fetch for everyone.
-    Every caller awaits the task through `asyncio.shield` instead, so a
-    cancelled caller is answered with `CancelledError` while the others get
-    the fetch's value.
+    Awaiting the task directly would pass the caller's cancellation into it,
+    so a waiter that times out would cancel the fetch for everyone. Every
+    caller awaits the task through `asyncio.shield`, so a cancelled caller is
+    answered with `CancelledError` while the others get the fetch's value.
     """
     started = asyncio.Event()
     release = asyncio.Event()
