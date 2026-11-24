@@ -3,6 +3,7 @@ Reservations service tests.
 The inventory service HTTP calls are mocked with respx.
 """
 
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,8 +15,10 @@ from app.dependencies.auth import get_current_user_payload, require_admin
 from app.main import app
 from app.models.reservation import Reservation, ReservationStatus
 from app.routers.reservations import bearer_scheme
+from app.schemas.reservation import ProvisionResultRequest
 from app.services.reporting_service import _fetch_transit_devices as _real_fetch_transit_devices
 from app.services.reservation_service import TopologyDeviceNotMember, TopologyRoutingIntentInvalid
+from fastapi.routing import RouteContext, iter_route_contexts
 from herd_common.enums import TopologyType
 from httpx import ASGITransport, AsyncClient
 
@@ -1046,11 +1049,13 @@ async def test_internal_active_no_collision_with_int_status_path(internal_client
 # --- Device lookups answer only from the reservation holding the device (#1529) ---
 #
 # RES-INTERNAL-3, -4, and -5 each test membership with an EXISTS over
-# reservation_devices that must be correlated to the outer reservation. A lookup
-# for a device that no reservation holds is false with or without that
-# correlation, so every test below seeds two reservations, both live and in
-# window: USER_ID holds only DEVICE_A and OTHER_USER_ID holds only DEVICE_B. Each
-# device is then queried, and the answer must come from its holder alone.
+# reservation_devices that must be correlated to the outer reservation. Without
+# the correlation, a reservation that passes the lookup's other filters matches
+# as soon as ANY reservation holds the queried device, so every test below seeds
+# two reservations, both in window and ACTIVE unless the by-device test sets
+# another status: USER_ID holds only DEVICE_A and OTHER_USER_ID holds only
+# DEVICE_B. Each device is then queried, and the answer must come from its
+# holder alone.
 
 HOLDER = {DEVICE_A: USER_ID, DEVICE_B: OTHER_USER_ID}
 QUERIED_DEVICE = pytest.mark.parametrize(
@@ -1121,6 +1126,179 @@ async def test_internal_by_device_returns_only_the_reservation_holding_the_devic
     assert items[0]["user_id"] == HOLDER[device_id]
     assert items[0]["device_id"] == device_id
     assert items[0]["status"] == status.value
+
+
+# --- owns_active and active-users: the status and the window, enumerated (#1529) ---
+#
+# RES-INTERNAL-3 and -4 answer only from an ACTIVE reservation whose window
+# contains now. The row under test is USER_ID's on DEVICE_A, in the status and
+# window each case sets. Beside it OTHER_USER_ID holds DEVICE_A through an ACTIVE
+# reservation in window, the row that must match, so the row under test is
+# decided by its own status or window alone. "ended" is a reservation still ACTIVE
+# after its end (the sweep has not completed it yet); a released one is
+# COMPLETED with its window unchanged, which the status cases cover. Each bound
+# is missed by a minute, never at the boundary instant.
+
+WINDOWS = {
+    "current": (timedelta(minutes=-30), timedelta(hours=1)),
+    "ended": (timedelta(hours=-2), timedelta(minutes=-1)),
+    "not_started": (timedelta(minutes=1), timedelta(hours=2)),
+}
+EVERY_STATUS = pytest.mark.parametrize("status", list(ReservationStatus), ids=lambda s: s.value)
+EVERY_WINDOW = pytest.mark.parametrize("window", list(WINDOWS))
+
+
+async def _seed_row_under_test_beside_a_holder(
+    *, status: ReservationStatus = ReservationStatus.ACTIVE, window: str = "current"
+) -> None:
+    start_offset, end_offset = WINDOWS[window]
+    await _insert_reservation_row(
+        status=status,
+        start_offset=start_offset,
+        end_offset=end_offset,
+        user_id=USER_ID,
+        device_ids=(DEVICE_A,),
+    )
+    await _insert_reservation_row(user_id=OTHER_USER_ID, device_ids=(DEVICE_A,))
+
+
+async def _owns_active(client: AsyncClient, user_id: str) -> dict:
+    resp = await client.get(
+        "/internal/active",
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+        params={"user_id": user_id, "device_id": DEVICE_A},
+    )
+    assert resp.status_code == 200
+    return resp.json()
+
+
+async def _active_users(client: AsyncClient) -> list[str]:
+    resp = await client.get(
+        "/internal/active-users",
+        params={"device_id": DEVICE_A},
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+    )
+    assert resp.status_code == 200
+    return sorted(resp.json())
+
+
+@pytest.mark.asyncio
+@EVERY_STATUS
+async def test_internal_active_is_true_only_for_an_active_reservation(internal_client, status):
+    await _seed_row_under_test_beside_a_holder(status=status)
+    assert await _owns_active(internal_client, USER_ID) == {
+        "owns_active": status is ReservationStatus.ACTIVE
+    }
+    assert await _owns_active(internal_client, OTHER_USER_ID) == {"owns_active": True}
+
+
+@pytest.mark.asyncio
+@EVERY_WINDOW
+async def test_internal_active_is_true_only_while_the_window_contains_now(internal_client, window):
+    await _seed_row_under_test_beside_a_holder(window=window)
+    assert await _owns_active(internal_client, USER_ID) == {"owns_active": window == "current"}
+    assert await _owns_active(internal_client, OTHER_USER_ID) == {"owns_active": True}
+
+
+@pytest.mark.asyncio
+@EVERY_STATUS
+async def test_active_users_lists_only_owners_of_active_reservations(internal_client, status):
+    await _seed_row_under_test_beside_a_holder(status=status)
+    expected = [OTHER_USER_ID] + ([USER_ID] if status is ReservationStatus.ACTIVE else [])
+    assert await _active_users(internal_client) == sorted(expected)
+
+
+@pytest.mark.asyncio
+@EVERY_WINDOW
+async def test_active_users_lists_only_owners_whose_window_contains_now(internal_client, window):
+    await _seed_row_under_test_beside_a_holder(window=window)
+    expected = [OTHER_USER_ID] + ([USER_ID] if window == "current" else [])
+    assert await _active_users(internal_client) == sorted(expected)
+
+
+# --- RES-INTERNAL-1 on every internal route (#1529) ---
+#
+# The routes are read from the app (every path containing /internal, through
+# FastAPI's iter_route_contexts, which flattens included routers), so a new
+# internal route is covered without editing this list. Each request is otherwise
+# valid: every path and query parameter is a fresh UUID and a body is the
+# smallest valid one for its model, so the token is the only thing wrong. The
+# token is checked before any lookup, so no row is needed.
+
+INTERNAL_BODIES = {ProvisionResultRequest: {"succeeded": True, "device_ids": [], "error": None}}
+KNOWN_INTERNAL_ROUTES = {
+    ("GET", "/internal/{reservation_id}"),
+    ("GET", "/internal/active"),
+    ("GET", "/internal/active-users"),
+    ("GET", "/internal/held-devices"),
+    ("GET", "/internal/by-topology/{topology_id}"),
+    ("GET", "/internal/by-device/{device_id}"),
+    ("POST", "/internal/{reservation_id}/provision-result"),
+}
+
+
+def _internal_routes() -> list[tuple[str, RouteContext]]:
+    return sorted(
+        (
+            (method, route)
+            for route in iter_route_contexts(app.routes)
+            if "/internal" in route.path
+            for method in route.methods
+        ),
+        key=lambda pair: (pair[1].path, pair[0]),
+    )
+
+
+EVERY_INTERNAL_ROUTE = pytest.mark.parametrize(
+    ("method", "route"),
+    _internal_routes(),
+    ids=[f"{method} {route.path}" for method, route in _internal_routes()],
+)
+
+
+def _otherwise_valid_request(route: RouteContext) -> dict:
+    """The URL, query, and body that pass validation for `route`."""
+    url = re.sub(r"\{[^}]+\}", lambda _: str(uuid.uuid4()), route.path)
+    params = {}
+    for param in route.dependant.query_params:
+        assert param.field_info.annotation is uuid.UUID, (route.path, param.name)
+        params[param.alias] = str(uuid.uuid4())
+    request: dict = {"url": url, "params": params}
+    for body in route.dependant.body_params:
+        model = body.field_info.annotation
+        assert model in INTERNAL_BODIES, f"add a minimal valid {model.__name__} body"
+        request["json"] = INTERNAL_BODIES[model]
+    return request
+
+
+def test_internal_routes_are_read_from_the_app():
+    """The derived list is not vacuous: it holds every route in the spec's table."""
+    derived = {(method, route.path) for method, route in _internal_routes()}
+    assert KNOWN_INTERNAL_ROUTES <= derived
+
+
+@pytest.mark.asyncio
+@EVERY_INTERNAL_ROUTE
+async def test_every_internal_route_answers_422_without_the_token_header(
+    internal_client, method, route
+):
+    resp = await internal_client.request(method, **_otherwise_valid_request(route))
+    assert resp.status_code == 422
+    errors = resp.json()["detail"]
+    assert all({"loc", "msg", "type"} <= error.keys() for error in errors)
+    assert [(error["loc"], error["type"]) for error in errors] == [
+        (["header", "x-internal-token"], "missing")
+    ]
+
+
+@pytest.mark.asyncio
+@EVERY_INTERNAL_ROUTE
+async def test_every_internal_route_answers_403_to_a_wrong_token(internal_client, method, route):
+    resp = await internal_client.request(
+        method, headers={"X-Internal-Token": "wrong-token"}, **_otherwise_valid_request(route)
+    )
+    assert resp.status_code == 403
+    assert resp.json() == {"detail": "Invalid internal token"}
 
 
 # --- Cancel edge cases ---
