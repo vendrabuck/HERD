@@ -361,10 +361,14 @@ async def test_uncached_falsy_answer_is_still_cached_when_not_wrapped():
 
 
 @pytest.mark.asyncio
-async def test_concurrent_callers_during_a_failure_each_ask_again():
-    """With nothing stored, a waiter that gets the lock after a failed fetch
-    finds no entry and fetches itself: failures are not shared. Pinned so a
-    later change to that tradeoff is deliberate."""
+async def test_a_failed_fetch_is_shared_with_the_callers_queued_behind_it():
+    """A failure is an answer for the callers already waiting on it.
+
+    The lock used to hand the failed fetch back to the caller that made it only,
+    so each waiter then ran its own fetch: during an outage N callers made N
+    sequential upstream attempts and the k-th waited for k timeouts. The
+    in-flight fetch is now shared, `Uncached` included, while nothing is stored
+    for later callers."""
     started = asyncio.Event()
     release = asyncio.Event()
     calls = {"n": 0}
@@ -378,9 +382,303 @@ async def test_concurrent_callers_during_a_failure_each_ask_again():
     cache: TTLCache[str, str] = TTLCache(fetch=fetch, ttl_seconds=60)
     first = asyncio.create_task(cache.get("k"))
     await started.wait()
-    second = asyncio.create_task(cache.get("k"))
+    queued = [asyncio.create_task(cache.get("k")) for _ in range(4)]
     await asyncio.sleep(0)
     release.set()
 
+    assert await asyncio.gather(first, *queued) == ["fallback"] * 5
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_call_arriving_after_a_shared_failure_fetches_again():
+    """Sharing the failure does not cache it: ADR 0016 D8 and issue #1075 hold."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def fetch(key: str):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            started.set()
+            await release.wait()
+            return Uncached("fallback")
+        return "answer"
+
+    cache: TTLCache[str, str] = TTLCache(fetch=fetch, ttl_seconds=60)
+    first = asyncio.create_task(cache.get("k"))
+    await started.wait()
+    second = asyncio.create_task(cache.get("k"))
+    await asyncio.sleep(0)
+    release.set()
     assert await asyncio.gather(first, second) == ["fallback", "fallback"]
+
+    assert await cache.get("k") == "answer"
     assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_singleton_a_failed_fetch_is_shared_with_waiters():
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def fetch():
+        calls["n"] += 1
+        started.set()
+        await release.wait()
+        return Uncached([])
+
+    cache: SingletonTTLCache[list[str]] = SingletonTTLCache(fetch=fetch, ttl_seconds=60)
+    first = asyncio.create_task(cache.get())
+    await started.wait()
+    queued = [asyncio.create_task(cache.get()) for _ in range(3)]
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await asyncio.gather(first, *queued) == [[], [], [], []]
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failure_on_one_key_does_not_charge_another_key():
+    """Per-key futures: one key's outage is not another key's fetch."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def fetch(key: str):
+        calls.append(key)
+        if key == "down":
+            started.set()
+            await release.wait()
+            return Uncached(None)
+        return f"answer-{key}"
+
+    cache: TTLCache[str, str | None] = TTLCache(fetch=fetch, ttl_seconds=60)
+    down = asyncio.create_task(cache.get("down"))
+    await started.wait()
+    up = asyncio.create_task(cache.get("up"))
+
+    # Assert the overlap the name claims: "up" finishes while "down" is still
+    # blocked, without a wall-clock wait. Ten loop turns let "up" run to
+    # completion while "down" is still parked on its event.
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert up.done(), "'up' must have finished"
+    assert up.result() == "answer-up"
+    assert not down.done(), "'down' must still be waiting on its own fetch"
+    release.set()
+
+    assert await down is None
+    assert calls == ["down", "up"]
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_waiter_does_not_cancel_the_shared_fetch():
+    """A caller that goes away must not take the fetch down with it.
+
+    Awaiting a bare future propagates the caller's cancellation into that
+    future, so a waiter that times out would cancel the fetch for everyone.
+    Every caller awaits the task through `asyncio.shield` instead, so a
+    cancelled caller is answered with `CancelledError` while the others get
+    the fetch's value.
+    """
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def fetch(key: str):
+        calls["n"] += 1
+        started.set()
+        await release.wait()
+        return "value"
+
+    cache: TTLCache[str, str] = TTLCache(fetch=fetch, ttl_seconds=60)
+    leader = asyncio.create_task(cache.get("k"))
+    await started.wait()
+    waiter = asyncio.create_task(cache.get("k"))
+    bystander = asyncio.create_task(cache.get("k"))
+    await asyncio.sleep(0)
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    release.set()
+    assert await asyncio.gather(leader, bystander) == ["value", "value"]
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_leader_still_answers_the_waiters():
+    """The first caller is a waiter like any other, so losing it costs nothing."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fetch(key: str):
+        started.set()
+        await release.wait()
+        return "value"
+
+    cache: TTLCache[str, str] = TTLCache(fetch=fetch, ttl_seconds=60)
+    leader = asyncio.create_task(cache.get("k"))
+    await started.wait()
+    waiter = asyncio.create_task(cache.get("k"))
+    await asyncio.sleep(0)
+
+    leader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+
+    release.set()
+    assert await waiter == "value"
+
+
+@pytest.mark.asyncio
+async def test_an_exception_in_the_fetch_reaches_every_waiter_and_none_hangs():
+    """The failure is shared as an exception too, and nobody is left waiting."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def fetch(key: str):
+        calls["n"] += 1
+        n = calls["n"]
+        if n == 1:
+            started.set()
+            await release.wait()
+            raise RuntimeError("upstream is down")
+        return f"answer-{n}"
+
+    cache: TTLCache[str, str] = TTLCache(fetch=fetch, ttl_seconds=60)
+    callers = [asyncio.create_task(cache.get("k")) for _ in range(3)]
+    await started.wait()
+    await asyncio.sleep(0)
+    release.set()
+
+    results = await asyncio.gather(*callers, return_exceptions=True)
+    assert all(isinstance(r, RuntimeError) for r in results)
+    assert calls["n"] == 1
+    # A failed shared fetch is not cached: the next caller makes one new attempt.
+    assert await cache.get("k") == "answer-2"
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_the_singleton_shares_a_fetch_without_propagating_cancellation():
+    """SingletonTTLCache has the same shape and the same property."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fetch():
+        started.set()
+        await release.wait()
+        return []
+
+    cache: SingletonTTLCache[list[str]] = SingletonTTLCache(fetch=fetch, ttl_seconds=60)
+    leader = asyncio.create_task(cache.get())
+    await started.wait()
+    waiter = asyncio.create_task(cache.get())
+    await asyncio.sleep(0)
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    release.set()
+    assert await leader == []
+
+
+@pytest.mark.asyncio
+async def test_the_singleton_answers_a_waiter_when_its_leader_is_cancelled():
+    """The singleton's first caller is a waiter like any other."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fetch():
+        started.set()
+        await release.wait()
+        return []
+
+    cache: SingletonTTLCache[list[str]] = SingletonTTLCache(fetch=fetch, ttl_seconds=60)
+    leader = asyncio.create_task(cache.get())
+    await started.wait()
+    waiter = asyncio.create_task(cache.get())
+    await asyncio.sleep(0)
+
+    leader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+
+    release.set()
+    assert await waiter == []
+
+
+@pytest.mark.asyncio
+async def test_an_exception_in_the_singleton_fetch_reaches_every_waiter():
+    """The singleton shares a raising fetch instead of hanging its callers."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def fetch():
+        calls["n"] += 1
+        n = calls["n"]
+        if n == 1:
+            started.set()
+            await release.wait()
+            raise RuntimeError("upstream is down")
+        return [f"answer-{n}"]
+
+    cache: SingletonTTLCache[list[str]] = SingletonTTLCache(fetch=fetch, ttl_seconds=60)
+    callers = [asyncio.create_task(cache.get()) for _ in range(3)]
+    await started.wait()
+    await asyncio.sleep(0)
+    release.set()
+
+    results = await asyncio.gather(*callers, return_exceptions=True)
+    assert all(isinstance(r, RuntimeError) for r in results)
+    assert calls["n"] == 1
+    assert await cache.get() == ["answer-2"]
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_failed_fetch_no_one_awaited_is_not_logged_as_unretrieved():
+    """`_discard` reads a failed task after its last caller is cancelled.
+
+    On Python 3.12 an unread task exception surfaces as "Task exception was
+    never retrieved". On 3.14 `asyncio.shield` also logs "exception in
+    shielded future" in this same case, whatever `_discard` does, so only the
+    never-retrieved wording is pinned.
+    """
+    loop = asyncio.get_running_loop()
+    logged: list[str] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(
+        lambda _loop, context: logged.append(str(context.get("message", "")))
+    )
+    try:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fetch(key: str):
+            started.set()
+            await release.wait()
+            raise RuntimeError("upstream is down")
+
+        cache: TTLCache[str, str] = TTLCache(fetch=fetch, ttl_seconds=60)
+        caller = asyncio.create_task(cache.get("k"))
+        await started.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+        release.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous)
+
+    assert not [message for message in logged if "never retrieved" in message]
