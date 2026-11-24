@@ -46,8 +46,12 @@ async def test_lifespan_creates_and_cancels_expiration_and_purpose_classify_task
                 await expiration_started.wait()
                 await purpose_classify_started.wait()
 
-    # If shutdown cancellation ever regresses to a hang, fail the test instead
-    # of hanging the whole run.
+    # This bound catches a hang before the lifespan yields: wait_for cancels _run()
+    # and raises TimeoutError. It cannot catch a shutdown hang (issue #1527): the
+    # cancellation lands in the lifespan's `await` of a task, which cancels that
+    # task as well, the lifespan's own `except asyncio.CancelledError` swallows
+    # it, and _run() returns normally. Shutdown is pinned without a clock by
+    # test_shutdown_cancels_and_awaits_every_task_the_lifespan_starts below.
     await asyncio.wait_for(_run(), timeout=10)
 
     assert expiration_started.is_set()
@@ -178,3 +182,228 @@ async def test_lifespan_names_a_failed_stream_ensure_apart_from_a_failed_connect
     assert "NATS unavailable" not in caplog.text
     assert "restarted" not in caplog.text
     nc.close.assert_awaited_once()
+
+
+# Shutdown (issue #1527). The tests below never read a clock: every bound is a count
+# of event-loop iterations (`asyncio.sleep(0)` passes control to the loop exactly
+# once), so they fail fast instead of hanging when cancellation is broken, give the
+# same result on a loaded or single-core host, and the pytest-timeout marker is only
+# a backstop for a hang in the clean-up itself. A correct shutdown of the three
+# faked tasks takes a few iterations; the budget is far above that.
+_LOOP_BUDGET = 200
+
+
+async def _spin(iterations: int = _LOOP_BUDGET) -> None:
+    for _ in range(iterations):
+        await asyncio.sleep(0)
+
+
+class _NoBrokerHere(Exception):
+    """The fake `connect_nats` raises this, so the lifespan starts without NATS."""
+
+
+class _LifespanLoops:
+    """Fakes for the three loops the lifespan starts, keyed by the name it imports.
+
+    Each fake records its task, blocks until cancelled, and on cancellation waits for
+    its own release event before it ends cancelled. A fake built with `held=<name>`
+    keeps that one task mid-cancellation until the test sets its event, so a
+    shutdown that returns before the task has ended is visible.
+    """
+
+    NAMES = ("expiration_loop", "purpose_classify_loop", "run_outbox_relay")
+
+    def __init__(self, held: str | None = None) -> None:
+        self.tasks: dict[str, asyncio.Task] = {}
+        self.cancel_seen: set[str] = set()
+        self.release = {name: asyncio.Event() for name in self.NAMES}
+        for name in self.NAMES:
+            if name != held:
+                self.release[name].set()
+
+    def fake(self, name: str):
+        async def run(*args, **kwargs):
+            self.tasks[name] = asyncio.current_task()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancel_seen.add(name)
+                await self.release[name].wait()
+                raise
+
+        return run
+
+    def patches(self):
+        return (
+            patch("app.tasks.expiration.expiration_loop", new=self.fake("expiration_loop")),
+            patch(
+                "app.tasks.expiration.purpose_classify_loop",
+                new=self.fake("purpose_classify_loop"),
+            ),
+            patch("app.main.run_outbox_relay", new=self.fake("run_outbox_relay")),
+        )
+
+
+async def _shut_down_holding(held: str) -> None:
+    """Run the real lifespan with every loop faked, hold `held` mid-cancellation at
+    shutdown, and check that shutdown waits for it and then returns."""
+    from app.main import lifespan
+
+    loops = _LifespanLoops(held=held)
+    started: set[asyncio.Task] = set()
+    exit_task: asyncio.Task | None = None
+    expiration_patch, classify_patch, relay_patch = loops.patches()
+    with (
+        patch("app.main.create_all_and_stamp", new=AsyncMock()),
+        patch("app.main.connect_nats", new=AsyncMock(side_effect=_NoBrokerHere())),
+        expiration_patch,
+        classify_patch,
+        relay_patch,
+    ):
+        before = asyncio.all_tasks()
+        context = lifespan(MagicMock())
+        await context.__aenter__()
+        try:
+            await _spin()
+            started = asyncio.all_tasks() - before
+            # The tasks are enumerated from the lifespan itself: every task it left
+            # running must be one of the fakes, so a task added to the lifespan
+            # later fails here until it is faked in _LifespanLoops.
+            assert started == set(loops.tasks.values()), (
+                "the lifespan started a task this test does not fake; add a fake for "
+                f"it to _LifespanLoops (faked: {sorted(loops.tasks)})"
+            )
+            assert set(loops.tasks) == set(_LifespanLoops.NAMES), sorted(loops.tasks)
+
+            exit_task = asyncio.create_task(context.__aexit__(None, None, None))
+            await _spin()
+            assert held in loops.cancel_seen, f"shutdown never cancelled {held}"
+            assert not exit_task.done(), (
+                f"shutdown returned while {held} was still ending: it must await the task"
+            )
+            assert not loops.tasks[held].done()
+
+            loops.release[held].set()
+            await _spin()
+            assert exit_task.done(), (
+                f"shutdown did not return within {_LOOP_BUDGET} event-loop iterations "
+                f"after {held} ended; a task it awaits was not cancelled"
+            )
+            assert await exit_task is False  # re-raises anything shutdown raised
+            for name, task in loops.tasks.items():
+                assert task.done() and task.cancelled(), name
+        finally:
+            for event in loops.release.values():
+                event.set()
+            for task in started:
+                task.cancel()
+            if exit_task is None:
+                exit_task = asyncio.create_task(context.__aexit__(None, None, None))
+            await _spin()
+            if not exit_task.done():
+                exit_task.cancel()
+            await asyncio.gather(*started, exit_task, return_exceptions=True)
+
+
+@pytest.mark.timeout(60)
+async def test_shutdown_cancels_and_awaits_every_task_the_lifespan_starts():
+    """Issue #1527: at shutdown the lifespan cancels every background task it started
+    (the expiration loop, the purpose-classify loop, and the outbox relay, each
+    blocking until cancelled here, the relay included) and returns only after each
+    one has ended, and then within a fixed number of event-loop iterations. Each
+    task in turn is held mid-cancellation, so a task that is cancelled but not
+    awaited is caught wherever it sits in the shutdown order, and a task that is
+    awaited but never cancelled leaves shutdown waiting past the budget."""
+    for held in _LifespanLoops.NAMES:
+        await _shut_down_holding(held)
+
+
+@pytest.mark.timeout(60)
+async def test_startup_creates_the_schema_from_the_services_metadata():
+    """The lifespan builds or checks the schema at startup with this service's
+    metadata and its `DB_SCHEMA` setting (the unit suite's empty one here)."""
+    from app.database import Base, engine
+    from app.main import lifespan
+
+    loops = _LifespanLoops()
+    create_all = AsyncMock()
+    expiration_patch, classify_patch, relay_patch = loops.patches()
+    with (
+        patch("app.main.create_all_and_stamp", new=create_all),
+        patch("app.main.connect_nats", new=AsyncMock(side_effect=_NoBrokerHere())),
+        expiration_patch,
+        classify_patch,
+        relay_patch,
+    ):
+        async with lifespan(MagicMock()):
+            create_all.assert_awaited_once()
+            args, kwargs = create_all.await_args
+            assert args == (engine, Base.metadata)
+            assert kwargs["schema"] == settings.db_schema
+
+
+_EXPIRATION_STEPS = (
+    "_run_expiration_cycle",
+    "_run_reminder_cycle",
+    "_run_fork_archive_reconcile",
+    "_run_pending_prune_reconcile",
+)
+_CLASSIFY_STEPS = ("_run_purpose_classify_reconcile",)
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize(
+    ("loop_name", "steps", "blocking"),
+    [
+        pytest.param(loop_name, steps, blocking, id=f"{loop_name}-{blocking or 'sleep'}")
+        for loop_name, steps in (
+            ("expiration_loop", _EXPIRATION_STEPS),
+            ("purpose_classify_loop", _CLASSIFY_STEPS),
+        )
+        for blocking in (*steps, None)
+    ],
+)
+async def test_each_real_loop_ends_when_cancelled_in_a_step_or_in_its_sleep(
+    loop_name, steps, blocking
+):
+    """The shutdown above fakes the loops; this runs the real ones. A cancel that
+    lands while a step is running (the step blocks until cancelled) or while the
+    loop sleeps (`blocking` None: every step returns at once and the loop reaches its
+    real `asyncio.sleep` of an hour) ends the task cancelled within the iteration
+    budget: each step's `except Exception` must not catch the cancellation. The
+    steps are the four RES-SWEEP-10 names and the purpose-classify reconciler."""
+    from contextlib import ExitStack
+
+    from app.tasks import expiration
+
+    calls: list[str] = []
+    reached = asyncio.Event()
+
+    def step(name):
+        async def run():
+            calls.append(name)
+            if name == blocking:
+                reached.set()
+                await asyncio.Event().wait()
+
+        return run
+
+    with ExitStack() as stack:
+        for name in steps:
+            stack.enter_context(patch.object(expiration, name, new=step(name)))
+        task = asyncio.create_task(getattr(expiration, loop_name)(interval_seconds=3600))
+        try:
+            await _spin()
+            if blocking is None:
+                assert sorted(calls) == sorted(steps)  # one tick ran; now in the sleep
+            else:
+                assert reached.is_set() and calls[-1] == blocking
+            task.cancel()
+            await _spin()
+            assert task.done() and task.cancelled(), (
+                f"{loop_name} did not end cancelled after a cancel in {blocking or 'its sleep'}"
+            )
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
