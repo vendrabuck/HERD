@@ -18,6 +18,7 @@ from app.routers.reservations import bearer_scheme
 from app.schemas.reservation import ProvisionResultRequest
 from app.services.reporting_service import _fetch_transit_devices as _real_fetch_transit_devices
 from app.services.reservation_service import TopologyDeviceNotMember, TopologyRoutingIntentInvalid
+from fastapi import FastAPI
 from fastapi.routing import RouteContext, iter_route_contexts
 from herd_common.enums import TopologyType
 from httpx import ASGITransport, AsyncClient
@@ -1133,8 +1134,10 @@ async def test_internal_by_device_returns_only_the_reservation_holding_the_devic
 # RES-INTERNAL-3 and -4 answer only from an ACTIVE reservation whose window
 # contains now. The row under test is USER_ID's on DEVICE_A, in the status and
 # window each case sets. Beside it OTHER_USER_ID holds DEVICE_A through an ACTIVE
-# reservation in window, the row that must match, so the row under test is
-# decided by its own status or window alone. "ended" is a reservation still ACTIVE
+# reservation in window. That row must match for active-users and for owns_active
+# asked as OTHER_USER_ID; for owns_active asked as USER_ID it must NOT match, and
+# it differs from a matching row only in its owner. Either way the row under test
+# is decided by its own status or window alone. "ended" is a reservation still ACTIVE
 # after its end (the sweep has not completed it yet); a released one is
 # COMPLETED with its window unchanged, which the status cases cover. Each bound
 # is missed by a minute, never at the boundary instant.
@@ -1218,12 +1221,22 @@ async def test_active_users_lists_only_owners_whose_window_contains_now(internal
 
 # --- RES-INTERNAL-1 on every internal route (#1529) ---
 #
-# The routes are read from the app (every path containing /internal, through
-# FastAPI's iter_route_contexts, which flattens included routers), so a new
-# internal route is covered without editing this list. Each request is otherwise
-# valid: every path and query parameter is a fresh UUID and a body is the
-# smallest valid one for its model, so the token is the only thing wrong. The
-# token is checked before any lookup, so no row is needed.
+# The routes are read from the app through FastAPI's iter_route_contexts, which
+# flattens included routers: every route with a path segment equal to "internal",
+# for each method it declares except HEAD and OPTIONS. A new internal route is
+# covered without editing this section only when its path and query parameters
+# are all required UUIDs and its body model, if any, is in INTERNAL_BODIES; any
+# other parameter fails both tests with a message naming what to add, and so does
+# an unknown body model. Each request is otherwise valid, so the token is the
+# only thing wrong, and the token is checked before any lookup, so no row is
+# needed.
+#
+# Limits: a route whose path has no "internal" segment is not read, however it is
+# guarded; a mounted sub-application is not read (iter_route_contexts does not
+# descend into a Mount, and an entry without methods is skipped); HEAD and OPTIONS
+# are not requested; a header, cookie, or dependency the route needs besides the
+# token is not supplied, so such a route fails on the error list rather than
+# with a hint.
 
 INTERNAL_BODIES = {ProvisionResultRequest: {"succeeded": True, "device_ids": [], "error": None}}
 KNOWN_INTERNAL_ROUTES = {
@@ -1237,13 +1250,18 @@ KNOWN_INTERNAL_ROUTES = {
 }
 
 
-def _internal_routes() -> list[tuple[str, RouteContext]]:
+def _is_internal_path(path: str) -> bool:
+    return "internal" in path.strip("/").split("/")
+
+
+def _internal_routes(routes=None) -> list[tuple[str, RouteContext]]:
+    """(method, route) for every internal route of `routes` (the app's by default)."""
     return sorted(
         (
             (method, route)
-            for route in iter_route_contexts(app.routes)
-            if "/internal" in route.path
-            for method in route.methods
+            for route in iter_route_contexts(app.routes if routes is None else routes)
+            if route.methods is not None and _is_internal_path(route.path)
+            for method in route.methods - {"HEAD", "OPTIONS"}
         ),
         key=lambda pair: (pair[1].path, pair[0]),
     )
@@ -1258,15 +1276,27 @@ EVERY_INTERNAL_ROUTE = pytest.mark.parametrize(
 
 def _otherwise_valid_request(route: RouteContext) -> dict:
     """The URL, query, and body that pass validation for `route`."""
-    url = re.sub(r"\{[^}]+\}", lambda _: str(uuid.uuid4()), route.path)
-    params = {}
-    for param in route.dependant.query_params:
-        assert param.field_info.annotation is uuid.UUID, (route.path, param.name)
-        params[param.alias] = str(uuid.uuid4())
-    request: dict = {"url": url, "params": params}
+    where = "_otherwise_valid_request in services/reservations/tests/test_reservations.py"
+    values = {}
+    for kind, params in (
+        ("path", route.dependant.path_params),
+        ("query", route.dependant.query_params),
+    ):
+        for param in params:
+            annotation = param.field_info.annotation
+            assert annotation is uuid.UUID and param.field_info.is_required(), (
+                f"{route.path}: {kind} parameter {param.alias!r} is {annotation!r}, "
+                f"not a required UUID; add a valid value for it in {where}"
+            )
+            values[(kind, param.alias)] = str(uuid.uuid4())
+    url = re.sub(r"\{([^}:]+)[^}]*\}", lambda m: values[("path", m.group(1))], route.path)
+    query = {name: value for (kind, name), value in values.items() if kind == "query"}
+    request: dict = {"url": url, "params": query}
     for body in route.dependant.body_params:
         model = body.field_info.annotation
-        assert model in INTERNAL_BODIES, f"add a minimal valid {model.__name__} body"
+        assert model in INTERNAL_BODIES, (
+            f"{route.path}: add a minimal valid {model.__name__} body to INTERNAL_BODIES"
+        )
         request["json"] = INTERNAL_BODIES[model]
     return request
 
@@ -1275,6 +1305,22 @@ def test_internal_routes_are_read_from_the_app():
     """The derived list is not vacuous: it holds every route in the spec's table."""
     derived = {(method, route.path) for method, route in _internal_routes()}
     assert KNOWN_INTERNAL_ROUTES <= derived
+
+
+def test_internal_routes_match_a_segment_and_skip_head_and_mounts():
+    """The selection rules in the block comment, on a small app of their edge cases."""
+    probe = FastAPI()
+
+    @probe.api_route("/internal/x", methods=["GET", "HEAD"])
+    async def internal_x():
+        return {}
+
+    @probe.get("/x/{item_id}/internal-notes")
+    async def notes(item_id: uuid.UUID):
+        return {}
+
+    probe.mount("/internal/sub", FastAPI())
+    assert [(m, r.path) for m, r in _internal_routes(probe.routes)] == [("GET", "/internal/x")]
 
 
 @pytest.mark.asyncio
