@@ -39,10 +39,9 @@ TLS verified (`OIDC_CA_CERT` as the bundle when set), and an overall deadline of
 httpx's timeouts bound each operation and a server that drips bytes never trips
 them. Callers already waiting on the in-flight request share its result, and a
 caller that is cancelled does not cancel it. A caller that joins a request in
-flight now waits only for the rest of that request; a caller can still wait
-longer than 10 s in total because one sign-in can need more than one request
-(for example, the JWKS fetch reads discovery first), but the shared wait is
-bounded to the remainder of the in-flight request.
+flight waits only for the rest of that request; a caller can still wait longer
+than 10 s in total because one sign-in can need more than one request (for
+example, the JWKS fetch reads discovery first).
 
 ID-token rules, every one required: the token is printable ASCII; its header
 names a `kid` and an `alg` equal to `OIDC_ID_TOKEN_ALGORITHM`, and its `typ`,

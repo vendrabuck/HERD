@@ -750,11 +750,10 @@ everyone with a live reservation on it is told.
 - **INTEG-HEALTH-8.** The admin list is cached for the TTL, and concurrent misses share
   one in-flight fetch, that fetch's failure included: the callers already queued get the
   answer the first one paid for, so an outage costs one upstream attempt rather than one
-  per waiter. A fetch that raises hands its exception to every waiter and each waiter receives the same exception
-  any of them. The fetch runs as its own task and every caller awaits it shielded, so a
-  caller being cancelled gets `CancelledError` without cancelling the fetch or the other
-  waiters. Nothing is stored for a failure, so a caller arriving after it asks again
-  (INTEG-HEALTH-4). \
+  per waiter. A fetch that raises hands its exception to every waiter. The fetch runs as
+  its own task and every caller awaits it shielded, so a caller being cancelled gets
+  `CancelledError` without cancelling the fetch or the other waiters. Nothing is stored
+  for a failure, so a caller arriving after it asks again (INTEG-HEALTH-4). \
   Enforced in: `services/notifications/app/services/health_recipients.py` (`AdminListClient`); `services/common/herd_common/ttl_cache.py` (`SingletonTTLCache`, `_inflight`, `_fetch_and_store`, `_discard`) \
   Pinned by: `services/notifications/tests/test_health_recipients.py` (`test_admin_list_caches_within_ttl`, `test_admin_list_concurrent_callers_fetch_once`, `test_admin_list_refetches_after_invalidate`); `services/common/tests/test_ttl_cache.py` (`test_a_failed_fetch_is_shared_with_the_callers_queued_behind_it`, `test_a_call_arriving_after_a_shared_failure_fetches_again`, `test_singleton_a_failed_fetch_is_shared_with_waiters`, `test_an_exception_in_the_fetch_reaches_every_waiter_and_none_hangs`, `test_cancelling_a_waiter_does_not_cancel_the_shared_fetch`, `test_cancelling_the_leader_still_answers_the_waiters`, `test_the_singleton_shares_a_fetch_without_propagating_cancellation`, `test_the_singleton_answers_a_waiter_when_its_leader_is_cancelled`, `test_an_exception_in_the_singleton_fetch_reaches_every_waiter`, `test_a_failed_fetch_no_one_awaited_is_not_logged_as_unretrieved`)
 

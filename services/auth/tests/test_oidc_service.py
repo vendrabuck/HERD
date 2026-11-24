@@ -922,7 +922,7 @@ async def test_each_discovery_failure_is_unavailable_and_not_cached(name, idp, c
     assert idp.counts["discovery"] == 2
 
 
-async def test_a_discovery_outage_is_one_request_for_every_queued_sign_in(idp, caplog, monkeypatch):
+async def test_a_discovery_outage_is_one_request_for_every_queued_sign_in(idp, monkeypatch):
     """Issue #1397: the failed discovery fetch is shared with the callers already
     queued, so an outage costs one upstream attempt rather than one per waiter.
 
