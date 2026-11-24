@@ -3,10 +3,14 @@
 The router tests of the sibling files (test_fork_endpoints.py,
 test_fork_version_endpoints.py, test_wiring_proxy_endpoints.py) patch
 `_cabling_fork_call` or `_execution_wiring_call`, so the transport helpers do not run
-in them. Here no function of the service is patched (the `network` fixture sets only
-the internal token setting): respx stands in for the network under httpx, so the
-router, both helpers, and `call_service` all run, and every request that leaves the
-service is recorded.
+in them. Here nothing on these routes' path between the router and the network is
+patched: the router, both helpers, and `call_service` run, and respx answers under
+httpx and records every request that leaves the service. What is replaced: the
+dependency overrides of `get_db` (the test database), `get_current_user_payload` (the
+caller's claims), and `bearer_scheme` (a fixed bearer, `fake-token`); the internal
+token setting, which the `network` fixture sets; and the directory's autouse patch of
+`reporting_service._fetch_transit_devices` (tests/conftest.py), which these routes do
+not call.
 
 The routes are read from the app (tests/_route_table.py): every route whose FIRST
 path segment is a path parameter and whose SECOND segment is exactly `fork`,
@@ -15,11 +19,17 @@ The reservation's id goes in the first segment's parameter and VERSION_ID in a
 `version_id`; any other path or query parameter must be a required UUID, and a body
 model must be in FORK_BODIES, or the test fails with a message naming what to add.
 The non-owner test needs nothing beyond that, so it tests a new route in the family
-unedited. The owner-or-admin, 4xx, 5xx, and transport tests also need the route's
-upstream call from UPSTREAM: a route missing from it fails each of them, and
+unedited.
+
+The other route tests assume each route, asked by its owner about an ACTIVE
+reservation, makes exactly one call, to cabling or execution, at the path its
+UPSTREAM entry names, whose only parameters are the reservation's id and
+`version_id`. A route missing from UPSTREAM fails each of them, and
 `test_every_fork_and_wiring_route_has_an_upstream_entry`, with a message naming
-UPSTREAM. The non-JSON 5xx test takes its cabling routes from UPSTREAM, so it leaves
-such a route out.
+UPSTREAM; a route that breaks one of those assumptions needs its own tests and goes
+in OWN_TESTS with the reason, which takes it out of every test here but the
+non-owner one. An entry for a route the app no longer has fails with a message to
+remove it.
 
 Limits: a fork or wiring route of any other shape (`/{id}/forks`,
 `/{id}/fork-preview`, `/x/{id}/fork`, `/fork/{id}`) is not read, however it is
@@ -109,6 +119,16 @@ UPSTREAM = {
 }
 FAMILY_SEGMENTS = {"fork", "wiring", "wiring-status"}
 
+# Routes of the family that break the assumptions in the module docstring, each with
+# the reason and the file of its own tests. The non-owner test still covers them.
+OWN_TESTS: dict[tuple[str, str], str] = {}
+
+# The routes whose upstream call carries the caller's bearer: `docs/specs/CONVENTIONS.md`
+# (reservations) says reservations forwards it beside the internal token on the fork
+# GET ONLY and never from the wiring path (TOPO-FORK-25 is the read it redacts).
+FORWARDS_BEARER = {("GET", "/{reservation_id}/fork")}
+CALLER_BEARER = "Bearer fake-token"  # tests._harness.override_bearer
+
 
 def _is_path_param(segment: str) -> bool:
     return re.fullmatch(r"\{[^{}]+\}", segment) is not None
@@ -130,9 +150,20 @@ EVERY_FORK_AND_WIRING_ROUTE = pytest.mark.parametrize(
 )
 
 
-_CABLING_ROUTES = [
+_UPSTREAM_ROUTES = [
     (method, route)
     for method, route in _fork_and_wiring_routes()
+    if (method, route.path) not in OWN_TESTS
+]
+EVERY_UPSTREAM_ROUTE = pytest.mark.parametrize(
+    ("method", "route"),
+    _UPSTREAM_ROUTES,
+    ids=[f"{method} {route.path}" for method, route in _UPSTREAM_ROUTES],
+)
+
+_CABLING_ROUTES = [
+    (method, route)
+    for method, route in _UPSTREAM_ROUTES
     if UPSTREAM.get((method, route.path), ("",))[0] == "cabling"
 ]
 # The routes UPSTREAM sends to cabling; one missing from UPSTREAM is left out here and
@@ -160,15 +191,32 @@ def _upstream_of(method: str, route) -> tuple:
     entry = UPSTREAM.get((method, route.path))
     assert entry is not None, (
         f"{method} {route.path}: add its upstream call to UPSTREAM in "
-        "services/reservations/tests/test_fork_and_wiring_routes.py"
+        "services/reservations/tests/test_fork_and_wiring_routes.py; if, asked by its "
+        "owner about an ACTIVE reservation, it makes no upstream call or more than one, "
+        "give it its own tests and add it to OWN_TESTS with the reason"
     )
     return entry
 
 
 def _base_url(service: str) -> str:
-    return {"cabling": settings.cabling_service_url, "execution": settings.execution_service_url}[
-        service
-    ]
+    urls = {"cabling": settings.cabling_service_url, "execution": settings.execution_service_url}
+    assert service in urls, (
+        f"UPSTREAM names service {service!r}; these tests know cabling and execution "
+        "only, so give the route its own tests and add it to OWN_TESTS with the reason"
+    )
+    return urls[service]
+
+
+def _upstream_url(service: str, path: str, reservation_id: uuid.UUID) -> str:
+    try:
+        return _base_url(service) + path.format(
+            reservation_id=reservation_id, version_id=VERSION_ID
+        )
+    except KeyError as exc:
+        raise AssertionError(
+            f"{path}: names {exc}, which has no fixed value here; add one to the "
+            "path_values of _request_for and to this format call"
+        ) from exc
 
 
 def _client_as(sub: str, role: str) -> AsyncClient:
@@ -216,12 +264,18 @@ def network(monkeypatch):
 def test_every_fork_and_wiring_route_has_an_upstream_entry():
     """The derived list is the spec's seven routes: not vacuous, and none unaccounted for."""
     derived = {(method, route.path) for method, route in _fork_and_wiring_routes()}
-    missing = derived - set(UPSTREAM)
+    missing = derived - set(UPSTREAM) - set(OWN_TESTS)
     assert not missing, (
         f"{sorted(missing)}: add each route's upstream call to UPSTREAM in "
-        "services/reservations/tests/test_fork_and_wiring_routes.py"
+        "services/reservations/tests/test_fork_and_wiring_routes.py, or, if it breaks "
+        "the assumptions in the module docstring, add it to OWN_TESTS with the reason"
     )
-    assert derived == set(UPSTREAM)
+    stale = (set(UPSTREAM) | set(OWN_TESTS)) - derived
+    assert not stale, (
+        f"{sorted(stale)}: the app has no such route any more; remove its entry from "
+        "UPSTREAM or OWN_TESTS"
+    )
+    assert not set(UPSTREAM) & set(OWN_TESTS)
 
 
 def test_fork_and_wiring_routes_match_segments_and_skip_head_and_mounts():
@@ -269,13 +323,16 @@ def test_fork_and_wiring_routes_match_segments_and_skip_head_and_mounts():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", list(ReservationStatus), ids=lambda s: s.value)
 @EVERY_FORK_AND_WIRING_ROUTE
 async def test_a_caller_who_is_neither_owner_nor_admin_gets_404_and_no_upstream_call(
-    network, method, route
+    network, method, route, status
 ):
-    """The target is ACTIVE, so no status rule answers first. The caller owns an
-    ACTIVE reservation of their own, a row a load that ignored the id would find."""
-    target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
+    """In every status of the target: a status rule that answered before the owner
+    gate (a 409 on a reservation that is not ACTIVE) would tell this caller the
+    reservation exists. The caller owns an ACTIVE reservation of their own, a row a
+    load that ignored the id would find."""
+    target = await _insert_reservation(owner=OWNER_ID, status=status)
     await _insert_reservation(owner=OTHER_ID, status=ReservationStatus.ACTIVE)
     network.route().mock(return_value=httpx.Response(200, json={"version_number": 1}))
     async with _client_as(OTHER_ID, "user") as ac:
@@ -291,7 +348,7 @@ async def test_a_caller_who_is_neither_owner_nor_admin_gets_404_and_no_upstream_
     [(OWNER_ID, "user"), (ADMIN_ID, "admin"), (ADMIN_ID, "superadmin")],
     ids=["owner", "admin", "superadmin"],
 )
-@EVERY_FORK_AND_WIRING_ROUTE
+@EVERY_UPSTREAM_ROUTE
 async def test_the_owner_or_any_admin_reaches_the_upstream_for_the_reservation_named(
     network, method, route, sub, role
 ):
@@ -301,7 +358,9 @@ async def test_the_owner_or_any_admin_reaches_the_upstream_for_the_reservation_n
     refuses PENDING) and would send its devices on save; the three reads with no
     status rule build the upstream path from the path's id, so there only the two
     rows show. The answer relayed is the upstream's body, and the one upstream
-    request names the target."""
+    request names the target. It carries the caller's bearer exactly on the routes in
+    FORWARDS_BEARER (the fork GET, per `docs/specs/CONVENTIONS.md`) and no
+    `Authorization` header on any other."""
     await _insert_reservation(owner=OTHER_ID, status=ReservationStatus.PENDING)
     target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
     service, up_method, up_path, body_kind = _upstream_of(method, route)
@@ -313,9 +372,10 @@ async def test_the_owner_or_any_admin_reaches_the_upstream_for_the_reservation_n
     assert resp.json() == answer
     assert network.calls.call_count == 1
     sent = network.calls.last.request
-    expected_path = up_path.format(reservation_id=target.id, version_id=VERSION_ID)
-    assert (sent.method, str(sent.url)) == (up_method, _base_url(service) + expected_path)
+    assert (sent.method, str(sent.url)) == (up_method, _upstream_url(service, up_path, target.id))
     assert sent.headers["X-Internal-Token"] == TOKEN
+    forwards = (method, route.path) in FORWARDS_BEARER
+    assert sent.headers.get("Authorization") == (CALLER_BEARER if forwards else None)
     expected_body = {
         None: None,
         "canvas": {"canvas_data": CANVAS},
@@ -337,7 +397,7 @@ TRANSPORT_ERRORS = [httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolE
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", RELAYED_4XX)
-@EVERY_FORK_AND_WIRING_ROUTE
+@EVERY_UPSTREAM_ROUTE
 async def test_an_upstream_4xx_is_relayed_with_its_status_and_unwrapped_detail(
     network, method, route, status
 ):
@@ -357,13 +417,17 @@ async def test_an_upstream_4xx_is_relayed_with_its_status_and_unwrapped_detail(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", MAPPED_5XX)
-@EVERY_FORK_AND_WIRING_ROUTE
+@EVERY_UPSTREAM_ROUTE
 async def test_an_upstream_5xx_is_503(network, method, route, status):
-    """RES-FORK-10 also carries cabling's JSON detail on a 5xx; RES-FORK-18 states
-    only the 503 for execution, so only the status is asserted for a wiring route."""
+    """RES-FORK-10 carries cabling's JSON detail on a 5xx. RES-FORK-18 states only the
+    503 for execution and, unlike RES-FORK-10, names no detail, so on a wiring route
+    what is pinned is that execution's own detail is not passed on: its text appears
+    nowhere in the answer. The wording that replaces it is in no rule and is not
+    asserted."""
     target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
     service = _upstream_of(method, route)[0]
-    detail = {"error": "upstream_down", "status": status}
+    marker = f"upstream-detail-{uuid.uuid4()}"
+    detail = {"error": marker, "status": status}
     network.route().mock(return_value=httpx.Response(status, json={"detail": detail}))
     async with _client_as(OWNER_ID, "user") as ac:
         resp = await ac.request(method, **_request_for(route, target.id))
@@ -372,6 +436,8 @@ async def test_an_upstream_5xx_is_503(network, method, route, status):
     assert str(network.calls.last.request.url).startswith(_base_url(service) + "/")
     if service == "cabling":
         assert resp.json() == {"detail": detail}
+    else:
+        assert marker not in resp.text
 
 
 @pytest.mark.asyncio
@@ -385,15 +451,19 @@ async def test_a_cabling_5xx_without_a_json_body_is_503_cabling_service_is_unava
         resp = await ac.request(method, **_request_for(route, target.id))
     assert resp.status_code == 503
     assert resp.json() == {"detail": "Cabling service is unavailable"}
+    assert network.calls.call_count == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error", TRANSPORT_ERRORS, ids=lambda e: e.__name__)
-@EVERY_FORK_AND_WIRING_ROUTE
+@EVERY_UPSTREAM_ROUTE
 async def test_an_upstream_transport_error_is_503_failed_to_contact(network, method, route, error):
     """The fake raises the httpx exception itself, under call_service, so each helper's
-    own translation to RuntimeError runs (one error of each httpx branch: connect,
-    timeout, protocol)."""
+    own translation to RuntimeError runs. The three are all `httpx.TransportError`s (a
+    connect failure, a timeout, a protocol error): what RES-FORK-10 calls a transport
+    failure and RES-FORK-18 an absence. An httpx error outside TransportError (`DecodingError`,
+    `TooManyRedirects`) is not tried: no rule says what it becomes, so an `except`
+    narrowed to TransportError passes here."""
     target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
     service = _upstream_of(method, route)[0]
     network.route().mock(side_effect=error)

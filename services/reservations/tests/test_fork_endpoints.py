@@ -572,10 +572,14 @@ async def test_a_cabling_413_is_relayed_as_413_with_its_detail(method, suffix):
 
 # --- The lazy create, unmocked (#1532, RES-FORK-5) ------------------------------------
 #
-# Nothing in the service is patched: respx stands in for cabling under httpx, so
+# Nothing on the fork read's path between the router and the network is patched:
 # get_reservation_fork, _lazy_create_reservation_fork, _cabling_fork_call, and
-# call_service all run. The fork read answers 404 and then the fork, so a create
-# that was not treated as refused shows as a 200.
+# call_service all run, and respx answers for cabling under httpx. What is replaced:
+# the dependency overrides of get_db, get_current_user_payload, and bearer_scheme
+# (_client_as, a fixed bearer `fake-token`), the internal token setting (the cabling
+# fixture), and the directory's autouse patch of _fetch_transit_devices
+# (tests/conftest.py), which this route does not call. The fork read answers 404 and
+# then the fork, so a create that was not treated as refused shows as a 200.
 
 LAZY_TOKEN = "lazy-create-internal-token"
 FORKS_URL = f"{reservation_service.settings.cabling_service_url}/internal/forks"
@@ -608,7 +612,9 @@ async def test_lazy_create_posts_the_reservations_own_parent_topology_and_reread
 ):
     """The create carries the reservation's parent topology, JSON null only when it has
     none, and its own devices. Another owner's ACTIVE reservation with a topology of
-    its own is inserted first, so an admin load of the wrong row would send its values."""
+    its own is inserted first, so an admin load of the wrong row would send its values.
+    Both fork reads carry the caller's bearer and the create carries none:
+    `docs/specs/CONVENTIONS.md` (reservations) forwards it on the fork GET ONLY."""
     await _insert_reservation(owner=OTHER_ID, topology_id=uuid.uuid4())
     topology_id = uuid.uuid4() if has_topology else None
     rid = await _insert_reservation(topology_id=topology_id)
@@ -620,9 +626,14 @@ async def test_lazy_create_posts_the_reservations_own_parent_topology_and_reread
     assert resp.status_code == 200
     assert resp.json() == fork_body
     assert read.call_count == 2
+    assert [c.request.headers.get("Authorization") for c in read.calls] == [
+        "Bearer fake-token",
+        "Bearer fake-token",
+    ]
     assert create.call_count == 1
     sent = create.calls.last.request
     assert sent.headers["X-Internal-Token"] == LAZY_TOKEN
+    assert "Authorization" not in sent.headers
     assert json.loads(sent.content) == {
         "reservation_id": str(rid),
         "parent_topology_id": str(topology_id) if has_topology else None,
@@ -657,6 +668,9 @@ async def test_a_refused_or_failed_lazy_create_answers_503_with_cablings_status(
     ids=lambda e: e.__name__,
 )
 async def test_a_lazy_create_that_cannot_reach_cabling_answers_503(cabling, error):
+    """The three are all `httpx.TransportError`s, what RES-FORK-10 calls a transport
+    failure. An httpx error outside TransportError (`DecodingError`) is not tried: no
+    rule says what it becomes, so an `except` narrowed to TransportError passes here."""
     rid = await _insert_reservation(topology_id=uuid.uuid4())
     _mock_fork_read(cabling, rid, {"reservation_id": str(rid)})
     cabling.post(FORKS_URL).mock(side_effect=error)
