@@ -988,13 +988,13 @@ reconcile on the expiration loop.
 - **RES-FORK-4.** Every fork and wiring route is owner-or-admin; any other caller gets
   404 and no upstream call is made. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`_load_owned_or_admin`) \
-  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_other_user_404_and_no_cabling_call`, `test_get_fork_admin_allowed_for_other_owner`); `services/reservations/tests/test_fork_version_endpoints.py` (`test_restore_other_user_404_and_no_cabling_call`)
+  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_other_user_404_and_no_cabling_call`, `test_get_fork_admin_allowed_for_other_owner`, `test_lazy_create_posts_the_reservations_own_parent_topology_and_rereads`); `services/reservations/tests/test_fork_version_endpoints.py` (`test_restore_other_user_404_and_no_cabling_call`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_a_caller_who_is_neither_owner_nor_admin_gets_404_and_no_upstream_call`, `test_the_owner_or_any_admin_reaches_the_upstream_for_the_reservation_named`)
 - **RES-FORK-5.** Reading the fork works in any status; on a cabling 404 an `ACTIVE`
   reservation lazily creates the fork (also with no parent topology) and re-reads, while
   any other status answers 404 `Fork not found`. A failed or refused lazy create,
   including a cabling 409, answers 503. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_fork`); `services/reservations/app/services/reservation_service.py` (`_lazy_create_reservation_fork`) \
-  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_lazy_creates_on_active_miss`, `test_get_fork_lazy_creates_with_no_parent_topology`, `test_get_fork_ended_reservation_no_fork_404_and_no_lazy_create`)
+  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_lazy_creates_on_active_miss`, `test_get_fork_lazy_creates_with_no_parent_topology`, `test_get_fork_ended_reservation_no_fork_404_and_no_lazy_create`, `test_lazy_create_posts_the_reservations_own_parent_topology_and_rereads`, `test_a_refused_or_failed_lazy_create_answers_503_with_cablings_status`, `test_a_lazy_create_that_cannot_reach_cabling_answers_503`, `test_a_fork_miss_outside_active_is_404_fork_not_found_with_no_create`)
 - **RES-FORK-6.** Canvas PUT, save, and restore require `ACTIVE`; otherwise 409 and no
   upstream call. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`FORK_EDIT_REQUIRES_ACTIVE`, `FORK_SAVE_REQUIRES_ACTIVE`, `FORK_RESTORE_REQUIRES_ACTIVE`) \
@@ -1016,7 +1016,7 @@ reconcile on the expiration loop.
   becomes 503 carrying cabling's JSON detail when there is one, else `Cabling service is
   unavailable`; a transport failure is 503. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`_relay_cabling_fork_response`, `_cabling_detail`) \
-  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_save_port_conflict_409_structured_passthrough`, `test_get_fork_cabling_5xx_with_structured_json_relays_detail`, `test_get_fork_cabling_5xx_with_non_json_body_keeps_generic_message`, `test_get_fork_cabling_unreachable_maps_to_503`)
+  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_save_port_conflict_409_structured_passthrough`, `test_get_fork_cabling_5xx_with_structured_json_relays_detail`, `test_get_fork_cabling_5xx_with_non_json_body_keeps_generic_message`, `test_get_fork_cabling_unreachable_maps_to_503`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_an_upstream_4xx_is_relayed_with_its_status_and_unwrapped_detail`, `test_an_upstream_5xx_is_503`, `test_a_cabling_5xx_without_a_json_body_is_503_cabling_service_is_unavailable`, `test_an_upstream_transport_error_is_503_failed_to_contact`)
 - **RES-FORK-11.** Every transition into `COMPLETED`, `CANCELLED`, or `FAILED` except
   the create-path flip failure and the elapsed-window failure asks cabling to archive the
   fork, three attempts, after the commit; failure is logged and never undoes the
@@ -1078,7 +1078,7 @@ reconcile on the expiration loop.
   409 on `PENDING` and `PENDING_PROVISION`; execution's 4xx is relayed and its 5xx or
   absence is 503. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_wiring_status`, `retry_reservation_wiring`, `_relay_execution_response`) \
-  Pinned by: `services/reservations/tests/test_wiring_proxy_endpoints.py` (`test_status_allowed_for_completed_reservation`, `test_retry_pre_provision_409_pinned_wording`, `test_retry_execution_frozen_409_passthrough`, `test_retry_execution_unreachable_maps_to_503`)
+  Pinned by: `services/reservations/tests/test_wiring_proxy_endpoints.py` (`test_status_allowed_for_completed_reservation`, `test_retry_pre_provision_409_pinned_wording`, `test_retry_execution_frozen_409_passthrough`, `test_retry_execution_unreachable_maps_to_503`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_an_upstream_4xx_is_relayed_with_its_status_and_unwrapped_detail`, `test_an_upstream_5xx_is_503`, `test_an_upstream_transport_error_is_503_failed_to_contact`)
 - **RES-FORK-19.** The detail modal offers Edit topology (an `ACTIVE` reservation) and
   View as-built (an ended one) only to the owner, and only when the reservation has a
   `topology_id`; an admin who does not own the reservation sees neither, although the
