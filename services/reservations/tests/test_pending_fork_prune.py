@@ -14,7 +14,8 @@ Covers, at the reservations boundary:
 - wrapper outcomes: success clears, failure keeps, ARCHIVED converges, a 404 keeps
   the marker only while a fork can still appear (ACTIVE with a parent topology);
 - the sweep reconciler: retry-and-clear on success, keep-and-retry on repeated
-  failure, terminal-meanwhile clears without a cabling call;
+  failure, terminal-meanwhile clears without a cabling call, entries that do not parse
+  as a UUID are cleared while the valid entries beside them are kept and retried;
 - the stored-state invariant (issue #1522): the column holds SQL NULL exactly when
   nothing is pending, whatever path emptied the marker or never set it, so the
   reconciler's real statement never selects such a row; with more than a batch of
@@ -680,6 +681,54 @@ async def test_each_tick_retries_the_oldest_batch_oldest_first_and_the_rest_next
             await _run_pending_prune_reconcile()
 
     assert ticks == [oldest_first[:_PENDING_PRUNE_BATCH], oldest_first[_PENDING_PRUNE_BATCH:]]
+    assert await _selected() == []
+
+
+@pytest.mark.asyncio
+async def test_non_uuid_entries_are_cleared_and_every_valid_entry_is_kept_and_pruned():
+    """RES-FORK-17 (issue #1531): an ACTIVE row's marker entries that do not parse as a
+    UUID are cleared on the tick that meets them, with no prune, while the valid entries
+    on the same row and on another row are pruned and kept until a prune converges. The
+    entries here are a non-UUID string, a number, and a JSON null. The first
+    tick's cabling is down, so what remains after it is exactly what the bad-entry
+    clear left; the second tick converges and both rows leave the selection."""
+    v1, v2, v3 = (str(uuid.uuid4()) for _ in range(3))
+    mixed = await _insert(ReservationStatus.ACTIVE, pending=["not-a-uuid", v1, 7, None, v2])
+    valid_only = await _insert(ReservationStatus.ACTIVE, pending=[v3])
+    await _set_updated_at(mixed, NOW - timedelta(minutes=2))
+    await _set_updated_at(valid_only, NOW - timedelta(minutes=1))
+    expected_calls = [
+        ("POST", f"/internal/forks/{mixed}/prune-devices", {"device_ids": [v1, v2]}),
+        ("POST", f"/internal/forks/{valid_only}/prune-devices", {"device_ids": [v3]}),
+    ]
+    calls: list = []
+
+    async def cabling_down(method, path, json_body=None):
+        calls.append((method, path, json_body))
+        raise RuntimeError("cabling down")
+
+    with patch(
+        "app.services.reservation_service._cabling_fork_call",
+        new=AsyncMock(side_effect=cabling_down),
+    ):
+        await _run_pending_prune_reconcile()
+
+    async def entries(rid):
+        stored = await _stored(rid)
+        return stored if stored == SQL_NULL else json.loads(stored)
+
+    assert calls == expected_calls
+    assert await entries(mixed) == [v1, v2]
+    assert await entries(valid_only) == [v3]
+    assert set(await _selected()) == {mixed, valid_only}
+
+    calls.clear()
+    with _recording_cabling(calls):
+        await _run_pending_prune_reconcile()
+
+    assert sorted(calls) == sorted(expected_calls)
+    assert await _stored(mixed) == SQL_NULL
+    assert await _stored(valid_only) == SQL_NULL
     assert await _selected() == []
 
 

@@ -186,13 +186,14 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_timeout_backstop_fails_stuck_dynamic_reservation`, `test_timeout_backstop_leaves_fresh_dynamic_reservation`); `services/reservations/tests/test_fork_archive_reconcile.py` (`test_timeout_backstop_failed_archives_fork`); `services/reservations/tests/test_provision_clock.py` (`test_purpose_category_patch_does_not_move_the_backstop_deadline`, `test_backstop_reads_provision_started_at_not_updated_at`, `test_backstop_falls_back_to_updated_at_when_unstamped`, `test_create_stamps_provision_started_at_when_it_enters_pending_provision`, `test_create_leaves_provision_started_at_null_for_pending_and_active`, `test_sweep_claim_stamps_provision_started_at`, `test_every_entry_into_pending_provision_stamps_provision_started_at`, `test_cas_into_pending_provision_is_only_the_self_transition_guard`)
 - **RES-SWEEP-7.** A physical-only `PENDING_PROVISION` row stranded past the same
   deadline (measured the same way) is moved back to `PENDING` by compare-and-swap, so a later tick re-activates
-  it; nothing is torn down. Only the writer whose compare-and-swap won then releases
+  it; nothing is torn down. Physical-only is judged by the row's own dynamic requests:
+  another reservation's request does not hide it. Only the writer whose compare-and-swap won then releases
   the row's exclusive devices through the holder-aware filter (RES-HOLD-1: a `PENDING`
   row holds nothing, and a later cancel or elapsed-window failure writes no inventory
   status), after the commit and before the tick's claimed rows activate; a device
   another live row holds is skipped. A later claim re-flips the devices. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`); `services/reservations/app/services/reservation_service.py` (`_release_exclusive_devices_best_effort`, `release_devices_not_held_by_others`) \
-  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_restart_backstop_reverts_stranded_physical_reservation`, `test_restart_backstop_reclaims_and_reactivates_across_cycles`, `test_restart_backstop_skips_row_activated_concurrently`); `services/reservations/tests/test_restart_backstop_release.py` (`test_restart_backstop_revert_releases_the_rows_devices`, `test_restart_backstop_revert_then_elapsed_window_releases_exactly_once`, `test_restart_backstop_revert_then_cancel_leaves_nothing_reserved`, `test_restart_backstop_release_skips_a_device_another_live_row_holds`, `test_restart_backstop_lost_cas_releases_nothing`)
+  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_restart_backstop_reverts_stranded_physical_reservation`, `test_restart_backstop_reclaims_and_reactivates_across_cycles`, `test_restart_backstop_skips_row_activated_concurrently`); `services/reservations/tests/test_restart_backstop_release.py` (`test_restart_backstop_revert_releases_the_rows_devices`, `test_restart_backstop_revert_then_elapsed_window_releases_exactly_once`, `test_restart_backstop_revert_then_cancel_leaves_nothing_reserved`, `test_restart_backstop_release_skips_a_device_another_live_row_holds`, `test_restart_backstop_lost_cas_releases_nothing`, `test_restart_backstop_judges_each_row_by_its_own_dynamic_requests`, `test_restart_backstop_leaves_a_dynamic_row_that_appears_after_the_dynamic_select`)
 - **RES-SWEEP-8.** `PROVISION_TIMEOUT_SECONDS=0` disables both provisioning backstops. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_timeout_backstop_disabled_when_zero`, `test_restart_backstop_disabled_when_timeout_zero`)
@@ -637,10 +638,12 @@ pending-prune reconcile.
   transaction; 0 disables reminders. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_reminder_cycle`) \
   Pinned by: `services/reservations/tests/test_expiry_reminder.py` (`test_reminder_not_repeated_across_ticks`, `test_reminder_stamp_and_event_commit_together`, `test_lead_window_zero_disables_reminder`)
-- **RES-SWEEP-10.** A failure in one step of a tick does not stop the loop or the
-  following steps. \
+- **RES-SWEEP-10.** Every tick runs four steps, each once: `_run_expiration_cycle`,
+  `_run_reminder_cycle`, `_run_fork_archive_reconcile`, `_run_pending_prune_reconcile`.
+  A failure in one step is logged at ERROR and does not stop the loop or skip any
+  other step. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`expiration_loop`) \
-  Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_expiration_loop_runs_both_cycles_and_handles_errors`)
+  Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_expiration_loop_awaits_exactly_the_four_named_steps_and_the_sleep`, `test_expiration_loop_runs_every_step_and_a_failing_step_skips_none`)
 - **RES-SWEEP-11.** Purpose classification runs on its own task and interval, never
   inside the expiration loop. \
   Enforced in: `services/reservations/app/main.py` (`lifespan`); `services/reservations/app/tasks/expiration.py` (`purpose_classify_loop`) \
@@ -990,13 +993,13 @@ reconcile on the expiration loop.
 - **RES-FORK-4.** Every fork and wiring route is owner-or-admin; any other caller gets
   404 and no upstream call is made. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`_load_owned_or_admin`) \
-  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_other_user_404_and_no_cabling_call`, `test_get_fork_admin_allowed_for_other_owner`); `services/reservations/tests/test_fork_version_endpoints.py` (`test_restore_other_user_404_and_no_cabling_call`)
+  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_other_user_404_and_no_cabling_call`, `test_get_fork_admin_allowed_for_other_owner`, `test_lazy_create_posts_the_reservations_own_parent_topology_and_rereads`); `services/reservations/tests/test_fork_version_endpoints.py` (`test_restore_other_user_404_and_no_cabling_call`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_a_caller_who_is_neither_owner_nor_admin_gets_404_and_no_upstream_call`, `test_the_owner_or_any_admin_reaches_the_upstream_for_the_reservation_named`)
 - **RES-FORK-5.** Reading the fork works in any status; on a cabling 404 an `ACTIVE`
   reservation lazily creates the fork (also with no parent topology) and re-reads, while
   any other status answers 404 `Fork not found`. A failed or refused lazy create,
   including a cabling 409, answers 503. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_fork`); `services/reservations/app/services/reservation_service.py` (`_lazy_create_reservation_fork`) \
-  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_lazy_creates_on_active_miss`, `test_get_fork_lazy_creates_with_no_parent_topology`, `test_get_fork_ended_reservation_no_fork_404_and_no_lazy_create`)
+  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_lazy_creates_on_active_miss`, `test_get_fork_lazy_creates_with_no_parent_topology`, `test_get_fork_ended_reservation_no_fork_404_and_no_lazy_create`, `test_lazy_create_posts_the_reservations_own_parent_topology_and_rereads`, `test_a_refused_or_failed_lazy_create_answers_503_with_cablings_status`, `test_a_lazy_create_that_cannot_reach_cabling_answers_503`, `test_a_fork_miss_outside_active_is_404_fork_not_found_with_no_create`)
 - **RES-FORK-6.** Canvas PUT, save, and restore require `ACTIVE`; otherwise 409 and no
   upstream call. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`FORK_EDIT_REQUIRES_ACTIVE`, `FORK_SAVE_REQUIRES_ACTIVE`, `FORK_RESTORE_REQUIRES_ACTIVE`) \
@@ -1018,7 +1021,7 @@ reconcile on the expiration loop.
   becomes 503 carrying cabling's JSON detail when there is one, else `Cabling service is
   unavailable`; a transport failure is 503. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`_relay_cabling_fork_response`, `_cabling_detail`) \
-  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_save_port_conflict_409_structured_passthrough`, `test_get_fork_cabling_5xx_with_structured_json_relays_detail`, `test_get_fork_cabling_5xx_with_non_json_body_keeps_generic_message`, `test_get_fork_cabling_unreachable_maps_to_503`)
+  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_save_port_conflict_409_structured_passthrough`, `test_get_fork_cabling_5xx_with_structured_json_relays_detail`, `test_get_fork_cabling_5xx_with_non_json_body_keeps_generic_message`, `test_get_fork_cabling_unreachable_maps_to_503`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_an_upstream_4xx_is_relayed_with_its_status_and_unwrapped_detail`, `test_an_upstream_5xx_is_503`, `test_a_cabling_5xx_without_a_json_body_is_503_cabling_service_is_unavailable`, `test_an_upstream_transport_error_is_503_failed_to_contact`)
 - **RES-FORK-11.** Every transition into `COMPLETED`, `CANCELLED`, or `FAILED` except
   the create-path flip failure and the elapsed-window failure asks cabling to archive the
   fork, three attempts, after the commit; failure is logged and never undoes the
@@ -1051,9 +1054,12 @@ reconcile on the expiration loop.
   Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_wrapper_no_fork_keeps_marker_while_fork_may_appear`, `test_wrapper_archived_409_clears_marker`, `test_wrapper_failure_keeps_marker`); `services/reservations/tests/test_wiring_changed_staging.py` (`test_patch_remove_calls_prune_devices_and_stages_released_delta`)
 - **RES-FORK-17.** Each tick retries up to 20 reservations with a pending prune marker,
   oldest `updated_at` first, one attempt each; a marker on a non-ACTIVE reservation is
-  cleared without a prune, and one holding nothing actionable is healed (RES-FORK-20). \
+  cleared without a prune, and one holding nothing actionable is healed (RES-FORK-20).
+  On an `ACTIVE` row, marker entries that do not parse as a UUID are cleared in the
+  same tick without a prune, and the row's other entries are retried as usual
+  (RES-FORK-16). \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_pending_prune_reconcile`, `_pending_prune_stmt`, `_PENDING_PRUNE_BATCH`) \
-  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_sweep_retries_pending_prune_and_clears_on_success`, `test_sweep_terminal_reservation_clears_marker_without_prune`, `test_each_tick_retries_the_oldest_batch_oldest_first_and_the_rest_next_tick`)
+  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_sweep_retries_pending_prune_and_clears_on_success`, `test_sweep_terminal_reservation_clears_marker_without_prune`, `test_each_tick_retries_the_oldest_batch_oldest_first_and_the_rest_next_tick`, `test_non_uuid_entries_are_cleared_and_every_valid_entry_is_kept_and_pruned`)
 - **RES-FORK-20.** The pending prune marker is SQL NULL exactly when nothing is pending,
   held by three parts. Every writer stores SQL NULL or a non-empty list, whichever path
   empties the marker (a full clear, a partial clear followed by a full one, a terminal or
@@ -1077,7 +1083,7 @@ reconcile on the expiration loop.
   409 on `PENDING` and `PENDING_PROVISION`; execution's 4xx is relayed and its 5xx or
   absence is 503. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_wiring_status`, `retry_reservation_wiring`, `_relay_execution_response`) \
-  Pinned by: `services/reservations/tests/test_wiring_proxy_endpoints.py` (`test_status_allowed_for_completed_reservation`, `test_retry_pre_provision_409_pinned_wording`, `test_retry_execution_frozen_409_passthrough`, `test_retry_execution_unreachable_maps_to_503`)
+  Pinned by: `services/reservations/tests/test_wiring_proxy_endpoints.py` (`test_status_allowed_for_completed_reservation`, `test_retry_pre_provision_409_pinned_wording`, `test_retry_execution_frozen_409_passthrough`, `test_retry_execution_unreachable_maps_to_503`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_an_upstream_4xx_is_relayed_with_its_status_and_unwrapped_detail`, `test_an_upstream_5xx_is_503`, `test_an_upstream_transport_error_is_503_failed_to_contact`)
 - **RES-FORK-19.** The detail modal offers Edit topology (an `ACTIVE` reservation) and
   View as-built (an ended one) only to the owner, and only when the reservation has a
   `topology_id`; an admin who does not own the reservation sees neither, although the
