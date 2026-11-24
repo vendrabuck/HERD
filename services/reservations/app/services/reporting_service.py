@@ -3,7 +3,7 @@ import io
 import logging
 import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 import httpx
 from herd_common.csv_safety import csv_safe_cell
@@ -84,13 +84,19 @@ def _split_hours_per_day(start: datetime, end: datetime) -> list[tuple[str, floa
     out: list[tuple[str, float]] = []
     cursor = start
     while cursor < end:
-        # Next UTC midnight strictly after cursor: cursor is UTC, so its date
-        # fields are the UTC date and this midnight is always after it.
-        day_end = datetime(cursor.year, cursor.month, cursor.day, tzinfo=timezone.utc) + timedelta(
-            days=1
-        )
-        slice_end = min(day_end, end)
-        out.append((cursor.strftime("%Y-%m-%d"), (slice_end - cursor).total_seconds() / 3600.0))
+        day = cursor.date()
+        if day == date.max:
+            # 9999-12-31 has no next midnight (computing it overflows), and end is
+            # a UTC datetime, so it falls on this day too: the slice runs to end.
+            slice_end = end
+        else:
+            # Next UTC midnight strictly after cursor: cursor is UTC, so its date
+            # fields are the UTC date and this midnight is always after it.
+            next_midnight = datetime.combine(day + timedelta(days=1), time(), tzinfo=timezone.utc)
+            slice_end = min(next_midnight, end)
+        # isoformat, not strftime("%Y-%m-%d"): on Python 3.12 strftime does not pad
+        # a year before 1000 ("1-01-01"); isoformat always writes four digits.
+        out.append((day.isoformat(), (slice_end - cursor).total_seconds() / 3600.0))
         cursor = slice_end
     return out
 

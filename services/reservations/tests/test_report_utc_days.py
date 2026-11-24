@@ -114,6 +114,31 @@ def test_split_hours_naive_bounds_are_utc():
     assert _split_hours_per_day(start, end) == [("2026-04-01", 2.0), ("2026-04-02", 1.0)]
 
 
+def test_split_hours_naive_bounds_are_utc_under_a_minus_eight_host_zone(host_zone_minus_eight):
+    """The same naive bounds with the host at -08:00: astimezone() would read them
+    as 06:00Z and 09:00Z on 2026-04-02; the helper must still take them as UTC."""
+    assert datetime(2026, 4, 1, 22, 0).astimezone().utcoffset() == timedelta(hours=-8)
+    test_split_hours_naive_bounds_are_utc()
+
+
+def test_split_hours_last_representable_day_has_no_next_midnight():
+    """A slice on 9999-12-31 runs to end; computing that day's next midnight overflows."""
+    start = datetime(9999, 12, 30, 20, 0, tzinfo=UTC)
+    end = datetime(9999, 12, 31, 13, 0, tzinfo=_tz(-5))  # 18:00Z
+    assert _split_hours_per_day(start, end) == [("9999-12-30", 4.0), ("9999-12-31", 18.0)]
+    last = datetime.max.replace(tzinfo=UTC)
+    got = _split_hours_per_day(datetime(9999, 12, 31, tzinfo=UTC), last)
+    assert [label for label, _ in got] == ["9999-12-31"]
+    assert got[0][1] == pytest.approx(24.0)
+
+
+def test_split_hours_labels_a_year_before_1000_with_four_digits():
+    """strftime("%Y") gives "1-01-01" on Python 3.12; the label is ISO on every version."""
+    start = datetime(1, 1, 1, 1, 0, tzinfo=_tz(1))  # 0001-01-01T00:00Z, the first instant
+    end = datetime(1, 1, 2, 2, 0, tzinfo=UTC)
+    assert _split_hours_per_day(start, end) == [("0001-01-01", 24.0), ("0001-01-02", 2.0)]
+
+
 def test_split_hours_naive_start_with_an_offset_end():
     """A naive start is UTC; comparing it with an aware end must not raise."""
     start = datetime(2026, 4, 1, 22, 0)
@@ -432,3 +457,153 @@ async def test_report_routes_take_a_naive_bound_as_utc_not_the_host_zone(
     assert csv_resp.headers["content-disposition"] == (
         'attachment; filename="utilization-user-2026-03-31-to-2026-04-01.csv"'
     )
+
+
+# --- functional: bounds near datetime's limits answer 422, never 500 ---
+
+REPORT_ROUTES = ("/reports/utilization", "/reports/utilization.csv")
+
+
+def _no_utc_equivalent(name: str) -> str:
+    return (
+        f"{name} must fall between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z "
+        "once converted to UTC"
+    )
+
+
+@pytest.mark.parametrize("route", REPORT_ROUTES)
+@pytest.mark.parametrize(
+    ("start", "end", "bad"),
+    [
+        # The review's two inputs: these answered 422 (the 366-day cap) before the
+        # routes converted to UTC, then 500 (OverflowError) until the guard.
+        ("0001-01-01T00:00:00+05:00", "2026-04-01T00:00:00Z", "start"),
+        ("2026-04-01T00:00:00Z", "9999-12-31T23:00:00-05:00", "end"),
+        # One microsecond outside the range at each end, in a short window.
+        ("0001-01-01T00:59:59.999999+01:00", "0001-01-02T00:00:00Z", "start"),
+        ("9999-12-31T00:00:00Z", "9999-12-31T19:00:00-05:00", "end"),
+        # The largest offsets Python admits; start is checked first.
+        ("0001-01-01T00:00:00+23:59", "9999-12-31T23:59:59-23:59", "start"),
+        ("0001-01-02T00:00:00Z", "9999-12-31T23:59:59-23:59", "end"),
+    ],
+)
+async def test_report_routes_answer_422_for_a_bound_with_no_utc_equivalent(
+    admin_client, route, start, end, bad
+):
+    resp = await admin_client.get(route, params={"start": start, "end": end})
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {"detail": _no_utc_equivalent(bad)}
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "seed", "by_day", "total"),
+    [
+        # A positive offset on the first day landing exactly on 0001-01-01T00:00Z, a
+        # negative one on the end (11:00Z).
+        (
+            "0001-01-01T01:00:00+01:00",
+            "0001-01-01T06:00:00-05:00",
+            (datetime(1, 1, 1, tzinfo=UTC), datetime(1, 1, 3, tzinfo=UTC)),
+            [("0001-01-01", 11.0)],
+            11.0,
+        ),
+        # A positive offset on the start (9999-12-30T20:00Z), a negative one on the
+        # end (9999-12-31T18:00Z): the last day's slice is cut at end, not midnight.
+        (
+            "9999-12-30T22:00:00+02:00",
+            "9999-12-31T13:00:00-05:00",
+            (datetime(9999, 12, 30, tzinfo=UTC), datetime(9999, 12, 31, 23, 0, tzinfo=UTC)),
+            [("9999-12-30", 4.0), ("9999-12-31", 18.0)],
+            22.0,
+        ),
+    ],
+)
+async def test_report_routes_answer_a_window_at_the_edges_of_the_range(
+    admin_client, start, end, seed, by_day, total
+):
+    await _seed(*seed)
+    resp = await admin_client.get("/reports/utilization", params={"start": start, "end": end})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert [(b["day"], b["hours"]) for b in data["by_day"]] == by_day
+    assert data["total_hours"] == total
+    csv_resp = await admin_client.get(
+        "/reports/utilization.csv", params={"start": start, "end": end, "section": "user"}
+    )
+    assert csv_resp.status_code == 200, csv_resp.text
+    first, last = by_day[0][0], by_day[-1][0]
+    assert csv_resp.headers["content-disposition"] == (
+        f'attachment; filename="utilization-user-{first}-to-{last}.csv"'
+    )
+
+
+# Minutes east of UTC; None renders the bound naive (UTC).
+_EXTREME_OFFSETS = (None, 0, -60, 60, -300, 300, -14 * 60, 14 * 60, -(23 * 60 + 59), 23 * 60 + 59)
+
+
+def _extreme_bound(rng: random.Random, low: bool) -> datetime:
+    """A wall clock within three days of one end of datetime's range, any offset."""
+    if low:
+        wall = datetime.min + timedelta(seconds=rng.randrange(0, 3 * 86400))
+    else:
+        wall = datetime.max - timedelta(seconds=rng.randrange(0, 3 * 86400))
+    offset = rng.choice(_EXTREME_OFFSETS)
+    return wall if offset is None else wall.replace(tzinfo=timezone(timedelta(minutes=offset)))
+
+
+def _expected_detail(start: datetime, end: datetime) -> str | None:
+    """The out-of-range detail the routes owe for this pair, or None when both convert."""
+    for name, value in (("start", start), ("end", end)):
+        try:
+            if value.tzinfo is not None:
+                value.astimezone(UTC)
+        except OverflowError:
+            return _no_utc_equivalent(name)
+    return None
+
+
+async def test_report_routes_never_answer_5xx_for_extreme_bounds_seeded_sweep(admin_client):
+    """Seeded pairs near year 1 and year 9999 in every offset, on both routes.
+
+    Reservations sit on both edge days so an accepted window really splits hours there.
+    Every answer is 200 or a 422 with a string detail; a bound with no UTC equivalent
+    gets exactly its named detail, and the sample must hold each outcome.
+    """
+    await _seed(datetime(1, 1, 1, tzinfo=UTC), datetime(1, 1, 4, tzinfo=UTC))
+    await _seed(datetime(9999, 12, 29, tzinfo=UTC), datetime(9999, 12, 31, 23, 0, tzinfo=UTC))
+    rng = random.Random(15232)
+    outcomes = {"ok": 0, "no_utc_equivalent": 0, "other_422": 0}
+    edge_days = {"0001-01-01": 0, "9999-12-31": 0}
+    for i in range(240):
+        low = rng.random() < 0.5
+        start = _extreme_bound(rng, low)
+        # Mostly the same edge (a window of up to three days, either order); sometimes
+        # the other edge (far over the 366-day cap) or a bound in an ordinary year.
+        pick = rng.random()
+        if pick < 0.7:
+            end = _extreme_bound(rng, low)
+        elif pick < 0.85:
+            end = _extreme_bound(rng, not low)
+        else:
+            end = datetime(2026, 4, 1, tzinfo=_tz(rng.choice((-8, 0, 5))))
+        route = REPORT_ROUTES[i % 2]
+        params = {"start": start.isoformat(), "end": end.isoformat()}
+        resp = await admin_client.get(route, params=params)
+        assert resp.status_code in (200, 422), (route, params, resp.status_code, resp.text)
+        expected = _expected_detail(start, end)
+        if expected is not None:
+            assert resp.status_code == 422, (route, params, resp.text)
+            assert resp.json() == {"detail": expected}, (route, params)
+            outcomes["no_utc_equivalent"] += 1
+        elif resp.status_code == 422:
+            assert isinstance(resp.json()["detail"], str), (route, params, resp.text)
+            outcomes["other_422"] += 1
+        else:
+            outcomes["ok"] += 1
+            if route == REPORT_ROUTES[0]:
+                days = {b["day"] for b in resp.json()["by_day"]}
+                edge_days["0001-01-01"] += "0001-01-01" in days
+                edge_days["9999-12-31"] += "9999-12-31" in days
+    assert all(count >= 20 for count in outcomes.values()), outcomes
+    # Accepted windows really split hours on the first and the last representable day.
+    assert all(count >= 3 for count in edge_days.values()), edge_days

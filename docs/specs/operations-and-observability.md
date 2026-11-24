@@ -1471,9 +1471,13 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
 
 - **OPS-REPORT-1.** Both report routes are admin only; `start` and `end` are required, an
   `end` not after `start` is 422, and a window longer than `UTILIZATION_MAX_SPAN_DAYS`
-  (default 366; 0 disables) is 422 naming the limit. \
-  Enforced in: `services/reservations/app/services/reporting_service.py` (`build_utilization_report`); `services/reservations/app/routers/reservations.py` (`get_utilization_report`, `get_utilization_report_csv`) \
-  Pinned by: `services/reservations/tests/test_rbac_denial.py` (`test_non_admin_denied`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_rejects_inverted_window`, `test_build_report_span_over_max_raises`, `test_build_report_span_at_max_succeeds`, `test_build_report_span_guard_disabled_when_zero`); `services/reservations/tests/test_coverage_gaps.py` (`test_csv_report_inverted_window_returns_422`); `tests/integration/test_reporting.py` (`test_utilization_report_non_admin_forbidden`)
+  (default 366; 0 disables) is 422 naming the limit. A bound whose instant has no UTC
+  equivalent (an offset near year 1 or year 9999, such as `0001-01-01T00:00:00+05:00`)
+  is 422 `<start or end> must fall between 0001-01-01T00:00:00Z and
+  9999-12-31T23:59:59.999999Z once converted to UTC`, checked `start` first; no value of
+  `start` or `end` answers 5xx (issue #1523). \
+  Enforced in: `services/reservations/app/services/reporting_service.py` (`build_utilization_report`); `services/reservations/app/routers/reservations.py` (`_as_utc`, `get_utilization_report`, `get_utilization_report_csv`) \
+  Pinned by: `services/reservations/tests/test_rbac_denial.py` (`test_non_admin_denied`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_rejects_inverted_window`, `test_build_report_span_over_max_raises`, `test_build_report_span_at_max_succeeds`, `test_build_report_span_guard_disabled_when_zero`); `services/reservations/tests/test_coverage_gaps.py` (`test_csv_report_inverted_window_returns_422`); `services/reservations/tests/test_report_utc_days.py` (`test_report_routes_answer_422_for_a_bound_with_no_utc_equivalent`, `test_report_routes_never_answer_5xx_for_extreme_bounds_seeded_sweep`); `tests/integration/test_reporting.py` (`test_utilization_report_non_admin_forbidden`)
 - **OPS-REPORT-2.** A reservation counts for the hours it overlaps the window, clipped to
   the window; one with no overlap is skipped. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`build_utilization_report`) \
@@ -1488,10 +1492,13 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
   `start` and `end` may carry any UTC offset, and a value without one is UTC (never the
   host's zone): both routes convert the bounds to UTC before anything reads them, and
   the split converts on its own, so its slices are positive, contiguous, and sum to the
-  overlap, the day hours sum to `total_hours`, and the report echoes the window in UTC
-  (issue #1523). \
+  overlap, the day hours sum to `total_hours` within the four-decimal rounding of each
+  value (each day bucket and the total are rounded on their own), and the report echoes
+  the window in UTC (issue #1523). The split also holds on the first and the last
+  representable UTC day: a slice on 9999-12-31 runs to the window's end, and a day
+  before year 1000 is labeled with four digits (`0001-01-01`). \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`_split_hours_per_day`, `_as_utc`, `build_utilization_report`); `services/reservations/app/routers/reservations.py` (`_as_utc`, `get_utilization_report`, `get_utilization_report_csv`) \
-  Pinned by: `services/reservations/tests/test_reporting_edges.py` (`test_split_hours_across_midnight`, `test_split_hours_three_days_full_middle`, `test_build_report_day_buckets_count_unique_reservations_per_day`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_aggregates_by_day_across_midnight`); `services/reservations/tests/test_report_utc_days.py` (`test_split_hours_negative_offset_start_late_in_local_day`, `test_split_hours_positive_offset_labels_the_utc_dates`, `test_split_hours_mixed_offsets_crossing_several_utc_midnights`, `test_split_hours_start_exactly_at_utc_midnight_in_an_offset`, `test_split_hours_naive_start_with_an_offset_end`, `test_split_hours_property_any_offsets_any_window`, `test_build_report_by_day_sums_to_total_for_any_offset_window`, `test_build_report_takes_a_naive_and_an_offset_bound_and_echoes_utc`, `test_report_route_by_day_is_split_at_utc_midnight_for_any_offset`, `test_report_route_hands_utc_bounds_downstream`, `test_report_routes_take_a_naive_bound_as_utc_not_the_host_zone`); `tests/integration/test_reporting.py` (`test_utilization_report_by_day_sums_to_total_with_an_offset_start`)
+  Pinned by: `services/reservations/tests/test_reporting_edges.py` (`test_split_hours_across_midnight`, `test_split_hours_three_days_full_middle`, `test_build_report_day_buckets_count_unique_reservations_per_day`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_aggregates_by_day_across_midnight`); `services/reservations/tests/test_report_utc_days.py` (`test_split_hours_negative_offset_start_late_in_local_day`, `test_split_hours_positive_offset_labels_the_utc_dates`, `test_split_hours_mixed_offsets_crossing_several_utc_midnights`, `test_split_hours_start_exactly_at_utc_midnight_in_an_offset`, `test_split_hours_naive_bounds_are_utc_under_a_minus_eight_host_zone`, `test_split_hours_last_representable_day_has_no_next_midnight`, `test_split_hours_labels_a_year_before_1000_with_four_digits`, `test_split_hours_naive_start_with_an_offset_end`, `test_split_hours_property_any_offsets_any_window`, `test_build_report_by_day_sums_to_total_for_any_offset_window`, `test_build_report_takes_a_naive_and_an_offset_bound_and_echoes_utc`, `test_report_route_by_day_is_split_at_utc_midnight_for_any_offset`, `test_report_route_hands_utc_bounds_downstream`, `test_report_routes_take_a_naive_bound_as_utc_not_the_host_zone`, `test_report_routes_answer_a_window_at_the_edges_of_the_range`); `tests/integration/test_reporting.py` (`test_utilization_report_by_day_sums_to_total_with_an_offset_start`)
 - **OPS-REPORT-5.** The group section rolls each user's hours into every group the user
   belongs to (a user in two groups counts in both) and a user in none into `Ungrouped`;
   when auth cannot answer, every user is `Ungrouped` and the report still answers 200. \
