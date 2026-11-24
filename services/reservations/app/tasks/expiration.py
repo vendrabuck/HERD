@@ -893,6 +893,26 @@ async def _backstop_missing_forks(known_fork_ids: set[uuid.UUID]) -> None:
 _PENDING_PRUNE_BATCH = 20
 
 
+def _pending_prune_stmt():
+    """The pending-prune reconciler's selection: marked rows, oldest updated_at first.
+
+    `IS NOT NULL` is the whole "something is pending" test, so it holds only because
+    the column stores SQL NULL, never a JSON "null", when nothing is pending
+    (`none_as_null=True` on the model, migration 0018; issue #1522). Split out so the
+    tests run the REAL statement against rows produced by every write path.
+    """
+    return (
+        select(
+            Reservation.id,
+            Reservation.status,
+            Reservation.pending_fork_prune_device_ids,
+        )
+        .where(Reservation.pending_fork_prune_device_ids.is_not(None))
+        .order_by(Reservation.updated_at)
+        .limit(_PENDING_PRUNE_BATCH)
+    )
+
+
 async def _run_pending_prune_reconcile() -> None:
     """Retry pending device-removal fork prunes each tick (issue #462).
 
@@ -914,20 +934,11 @@ async def _run_pending_prune_reconcile() -> None:
     writes the marker, so non-ACTIVE here means terminal.
     """
     async with AsyncSessionLocal() as db:
-        rows = (
-            await db.execute(
-                select(
-                    Reservation.id,
-                    Reservation.status,
-                    Reservation.pending_fork_prune_device_ids,
-                )
-                .where(Reservation.pending_fork_prune_device_ids.is_not(None))
-                .order_by(Reservation.updated_at)
-                .limit(_PENDING_PRUNE_BATCH)
-            )
-        ).all()
+        rows = (await db.execute(_pending_prune_stmt())).all()
 
     for row in rows:
+        # The `or []` is defense only: the statement selects SQL non-NULL markers,
+        # and every writer stores either SQL NULL or a non-empty list (issue #1522).
         pending = row.pending_fork_prune_device_ids or []
         if row.status != ReservationStatus.ACTIVE:
             await _clear_pending_fork_prune(row.id, pending)

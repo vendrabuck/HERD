@@ -128,6 +128,12 @@ upgrade, non-admins cannot see or book any dynamic template until an admin sets
 `make migrate-reservations` revision 0017 (issue #997) adds
 `reservations.provision_started_at`; rows that predate it have no stamp, and the
 provisioning backstops measure those from `updated_at` as before.
+`make migrate-reservations` revision 0018 (issue #1522) is a one-time data pass:
+every `reservations.pending_fork_prune_device_ids` holding the JSON literal `null`
+or an empty list becomes SQL NULL, so the expiration sweep stops selecting
+reservations with no pending fork prune and reaches the ones that have one. It is
+safe to rerun, and `downgrade` is a no-op. Until it runs, a reservation whose
+marker was cleared before the upgrade still occupies the sweep's batch of 20.
 
 `make migrate-cabling` (part of a plain `make migrate`) includes a one-time data
 scrub (revision 0013, hardening): every stored canvas across `topologies`,

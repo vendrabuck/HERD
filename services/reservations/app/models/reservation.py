@@ -146,8 +146,17 @@ class Reservation(Base):
     # converged. Written in the SAME transaction as the device-set edit, cleared per
     # id when cabling's prune-devices call succeeds, and retried each tick by the
     # expiration sweep's pending-prune reconciler while it is non-null. Null means
-    # nothing pending.
-    pending_fork_prune_device_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # nothing pending. Stored states are exactly two: SQL NULL (nothing pending) or a
+    # non-empty list. `none_as_null=True` is load-bearing (issue #1522): the generic
+    # JSON type otherwise persists a Python None (an explicit None at insert, and
+    # _clear_pending_fork_prune's `remaining or None`) as the JSON literal "null",
+    # which matches the reconciler's `is_not(None)` filter, so every cleared row
+    # stayed in its oldest-first batch of 20 forever and starved new markers. A JSON
+    # "null" also loads as Python None, so compare at the SQL level (`IS NULL`) in
+    # tests, never the loaded value. Migration 0018 rewrote rows stored before this.
+    pending_fork_prune_device_ids: Mapped[list | None] = mapped_column(
+        JSON(none_as_null=True), nullable=True
+    )
 
     # Devices live in the `reservation_devices` join table (single source of truth).
     # selectin eager-loads them with the parent so reading `device_ids` during async
