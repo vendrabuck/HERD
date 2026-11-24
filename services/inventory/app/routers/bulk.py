@@ -52,8 +52,8 @@ async def _read_capped(file: UploadFile, limit: int) -> bytes:
     A single ``file.read(limit + 1)``, then a length check: reading one byte past
     the bound is what makes the refusal exact at the byte. The route's
     ``extends_body_limit`` bound is on the request body, the whole multipart
-    envelope, so a file may be that size plus the form overhead; this is the
-    per-file bound, and it does not grow when an operator raises
+    envelope, so a file can be at most that size less the form overhead; this is
+    the per-file bound, and it does not grow when an operator raises
     ``MAX_REQUEST_BODY_BYTES``.
 
     Starlette has already received the upload and spooled it to a temporary file
@@ -62,8 +62,8 @@ async def _read_capped(file: UploadFile, limit: int) -> bytes:
     still decoded and parsed on the event loop, the loop every reservation and
     topology read depends on; step 2 of #1417 is not done here.
 
-    The 413 is the one the body-limit middleware builds, so a client cannot tell
-    the two apart.
+    The 413 has the shape the body-limit middleware builds; only the byte count
+    in its message tells a client which of the two bounds refused the request.
     """
     raw = await file.read(limit + 1)
     if len(raw) > limit:
