@@ -435,6 +435,28 @@ async def test_held_devices_lists_only_the_users_live_reservations(internal_clie
     assert resp.json() == {"device_ids": sorted([str(live_active), str(live_provision)])}
 
 
+HOLDING_STATUSES = {ReservationStatus.PENDING_PROVISION, ReservationStatus.ACTIVE}
+
+
+@pytest.mark.parametrize("status", list(ReservationStatus), ids=lambda s: s.value)
+async def test_held_devices_lists_a_row_by_its_own_status_alone(internal_client, status):
+    """RES-INTERNAL-8 for each status on its own (#1529): the user's one row holds a
+    device no other row holds, so only that row's status can list it, and another
+    user's row in the same status on another device is never listed."""
+    own, foreign = uuid.uuid4(), uuid.uuid4()
+    await _insert_row(OWNER, status, [own])
+    await _insert_row(uuid.uuid4(), status, [foreign])
+
+    resp = await internal_client.get(
+        "/internal/held-devices",
+        params={"user_id": str(OWNER)},
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+    )
+    assert resp.status_code == 200
+    expected = [str(own)] if status in HOLDING_STATUSES else []
+    assert resp.json() == {"device_ids": expected}
+
+
 async def test_held_devices_for_a_user_with_nothing_live_is_empty(internal_client):
     resp = await internal_client.get(
         "/internal/held-devices",
